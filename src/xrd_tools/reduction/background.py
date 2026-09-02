@@ -347,6 +347,20 @@ class FrameBackgroundResult:
                              or _json(json.loads(self.descriptor_bytes.decode("utf-8", "strict"))) != self.descriptor_bytes or hashlib.sha256(self.descriptor_bytes).hexdigest() != self.fingerprint) \
                 or not active and any(v is not None for v in (self.background, self.descriptor_bytes, self.fingerprint)):
             raise ValueError("frame-background result is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSingleFrameBackground:
+    """One immutable decoded Single-BG result with exact source receipts."""
+
+    plan: FrameBackgroundPlan
+    result: FrameBackgroundResult
+    frame_shape: tuple[int, int]
+    target_normalization: tuple[str, object]
+    source_receipt: bytes
+    metadata_items_receipt: bytes
+    metadata_source_receipt: bytes
+
 def _cancelled(value: Event | Callable[[], bool] | None) -> bool:
     if value is None: return False
     if isinstance(value, Event): return bool(value.is_set())
@@ -358,13 +372,17 @@ def _array_digest(value, cancelled, dtype=None) -> str:
     contiguous = np.ascontiguousarray(value, dtype=dtype); _poll(cancelled); view = memoryview(contiguous).cast("B"); digest = hashlib.sha256()
     for start in range(0, len(view), 1024 ** 2): _poll(cancelled); digest.update(view[start:start + 1024 ** 2])
     _poll(cancelled); return digest.hexdigest()
-def _digest(path: Path, cancelled) -> tuple[tuple[int, ...], str]:
+def _source_state(path: Path, cancelled) -> tuple[int, ...]:
     if _cancelled(cancelled): raise InterruptedError
     current = path.stat()
     if not stat.S_ISREG(current.st_mode) or current.st_size > _MAX_FILE:
         raise ValueError("background source is not a bounded regular file")
     identity = (current.st_dev, current.st_ino, current.st_mode, current.st_size,
                 current.st_mtime_ns, current.st_ctime_ns)
+    _poll(cancelled)
+    return identity
+def _digest(path: Path, cancelled) -> tuple[tuple[int, ...], str]:
+    identity = _source_state(path, cancelled)
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         while True:
@@ -449,6 +467,173 @@ def _metadata(path: Path, plan: FrameBackgroundPlan, keys: tuple[str, ...], canc
     if len(projected) != len(keys) or len(_json(projected)) > 12_288:
         raise ValueError("required Background metadata is invalid")
     return projected, {"locator": str(source), "state": list(before[0]), "sha256": before[1]}
+
+
+def _prepare_single_frame_background(
+    plan: FrameBackgroundPlan,
+    frame_fact: tuple[object, ...],
+    result: FrameBackgroundResult,
+) -> _PreparedSingleFrameBackground | None:
+    """Freeze a valid cold Single-BG result for later exact rebinds."""
+
+    if (
+        type(plan) is not FrameBackgroundPlan
+        or plan.mode != "Single BG File"
+        or type(result) is not FrameBackgroundResult
+        or result.disposition != "RESOLVED"
+        or result.background is None
+        or result.descriptor_bytes is None
+    ):
+        return None
+    try:
+        _label, _target, _selector, _index, shape, target_items = _frame(
+            frame_fact
+        )
+        body = json.loads(result.descriptor_bytes.decode("utf-8", "strict"))
+        source = body["source"]
+        metadata_items = body["metadata_items"]
+        metadata_source = body["metadata_source"]
+        if (
+            body.get("version") != 1
+            or body.get("mode") != "Single BG File"
+            or body.get("policy") != json.loads(_json(plan.to_mapping()))
+            or body.get("frame_fact") != json.loads(_json(frame_fact))
+            or type(source) is not dict
+            or body.get("decoded") != source.get("decoded")
+            or type(source.get("locator")) is not str
+            or type(source.get("state")) is not list
+            or len(source["state"]) != 6
+            or any(type(value) is not int for value in source["state"])
+            or type(source.get("sha256")) is not str
+            or len(source["sha256"]) != 64
+        ):
+            return None
+        target_normalization = _tag(
+            _target_metadata(target_items, plan.normalization_key)
+        )
+        if plan.normalization_key is None:
+            if metadata_items != [] or metadata_source is not None:
+                return None
+        elif (
+            type(metadata_items) is not list
+            or len(metadata_items) != 1
+            or metadata_items[0][0] != plan.normalization_key
+            or type(metadata_source) is not dict
+        ):
+            return None
+        source_receipt = _json(source)
+        metadata_items_receipt = _json(metadata_items)
+        metadata_source_receipt = _json(metadata_source)
+    except (
+        TypeError,
+        ValueError,
+        KeyError,
+        IndexError,
+        AttributeError,
+        json.JSONDecodeError,
+    ):
+        return None
+    return _PreparedSingleFrameBackground(
+        plan,
+        result,
+        shape,
+        target_normalization,
+        source_receipt,
+        metadata_items_receipt,
+        metadata_source_receipt,
+    )
+
+
+def _rebind_single_frame_background(
+    prepared: _PreparedSingleFrameBackground,
+    plan: FrameBackgroundPlan,
+    frame_fact: tuple[object, ...],
+    *,
+    cancelled: Event | Callable[[], bool] | None = None,
+) -> FrameBackgroundResult | None:
+    """Reuse one decoded Single-BG result after a full content proof."""
+
+    if type(prepared) is not _PreparedSingleFrameBackground:
+        raise TypeError("prepared frame-background capsule must be exact")
+    if type(plan) is not FrameBackgroundPlan:
+        raise TypeError("frame-background plan must be exact")
+    if plan != prepared.plan or plan.mode != "Single BG File":
+        return None
+    try:
+        if _cancelled(cancelled):
+            raise InterruptedError
+        _label, _target, _selector, _index, shape, target_items = _frame(
+            frame_fact
+        )
+        active_keys = tuple(
+            sorted(
+                set(
+                    key
+                    for key in (plan.metadata_key, plan.normalization_key)
+                    if key
+                )
+            )
+        )
+        if (
+            shape != prepared.frame_shape
+            or tuple(name for name, _tagged in target_items) != active_keys
+            or _tag(_target_metadata(target_items, plan.normalization_key))
+            != prepared.target_normalization
+        ):
+            return None
+        source = json.loads(prepared.source_receipt.decode("utf-8", "strict"))
+        path = Path(source["locator"])
+        state, digest = _digest(path, cancelled)
+        if (
+            list(state) != source["state"]
+            or digest != source["sha256"]
+        ):
+            return None
+        if plan.normalization_key is not None:
+            metadata, metadata_source = _metadata(
+                path, plan, (plan.normalization_key,), cancelled
+            )
+            if (
+                _json(metadata) != prepared.metadata_items_receipt
+                or _json(metadata_source) != prepared.metadata_source_receipt
+            ):
+                return None
+        if _source_state(path, cancelled) != state:
+            return None
+        _poll(cancelled)
+        body = json.loads(
+            prepared.result.descriptor_bytes.decode("utf-8", "strict")
+        )
+        body["frame_fact"] = frame_fact
+        raw = _json(body)
+        if len(raw) > _MAX_DESCRIPTOR:
+            return None
+        return FrameBackgroundResult(
+            "RESOLVED",
+            prepared.result.background,
+            raw,
+            hashlib.sha256(raw).hexdigest(),
+            prepared.result.diagnostics,
+        )
+    except InterruptedError:
+        return FrameBackgroundResult(
+            "CANCELLED", None, None, None, ("cancelled",)
+        )
+    except (
+        FileNotFoundError,
+        PermissionError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        KeyError,
+        IndexError,
+        AttributeError,
+        json.JSONDecodeError,
+    ):
+        return None
+
+
 def _hdf_proof(path: Path, selector: str, frame: int, shape: tuple[int, int], cancelled) -> dict:
     from xrd_tools.io.processed_scan_id import (
         has_processed_output_markers_file,

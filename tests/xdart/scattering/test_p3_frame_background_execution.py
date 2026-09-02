@@ -113,6 +113,149 @@ def test_batch_prequalifies_array_free_map_before_effects(monkeypatch, tmp_path:
     assert route_source.index("prepare_admission(") < route_source.index("run.display.configure(")
 
 
+def test_batch_single_background_capsule_decodes_once_and_releases(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    from xdart.gui.tabs.scattering.adapters import dynamic_output, run_executor
+    from xdart.gui.tabs.scattering.events import CleanupStatus, RunIdentity
+    from xrd_tools.reduction import background as background_module
+
+    configuration, scan, plan, item, decision = _composition(tmp_path)
+    background_path = Path(configuration.background.locator)
+    background_path.write_bytes(b"background")
+    decoder_calls = []
+
+    def decode(path, **_kwargs):
+        decoder_calls.append(Path(path).resolve())
+        return np.arange(4, dtype=np.uint16).reshape(2, 2)
+
+    monkeypatch.setattr(background_module, "read_image", decode)
+    owner = SimpleNamespace(background_capsule=None)
+    adapter = dynamic_output.DynamicOutputAdapter(configuration)
+    stop = Event()
+    preparation = adapter.prepare_admission(
+        scan,
+        plan,
+        item,
+        decision,
+        stop,
+        qualify=lambda policy, prior: run_executor._qualify_background_bindings(
+            configuration,
+            scan,
+            item,
+            decision,
+            policy,
+            prior,
+            stop,
+            owner,
+        ),
+    )
+    bindings = preparation.effective.background_bindings
+    assert tuple(value[0] for value in bindings) == (1, 2, 3)
+    assert owner.background_capsule is not None
+    assert decoder_calls == [background_path.resolve()]
+    roots = []
+    for frame, binding in zip(scan.frames, bindings, strict=True):
+        assert run_executor._resolve_background_before_submit(
+            frame,
+            configuration.background,
+            binding,
+            cancelled=stop,
+            capsule_owner=owner,
+        )
+        roots.append(frame.background)
+        frame.background = None
+        frame.background_dependency_bytes = None
+        frame.background_dependency_fingerprint = None
+    assert decoder_calls == [background_path.resolve()]
+    assert all(value is roots[0] for value in roots)
+    assert all(
+        not any(isinstance(item, np.ndarray) for item in binding)
+        for binding in bindings
+    )
+
+    class PendingSource:
+        def close(self) -> None:
+            raise RuntimeError("still owned")
+
+    run = run_executor._StandardRun(
+        None,
+        RunIdentity(1, "f" * 64),
+        None,
+        PendingSource(),
+        None,
+        None,
+        Path("out.nexus"),
+    )
+    run.background_capsule = owner.background_capsule
+    receipt = run_executor.StandardRunExecutor()._cleanup(run)
+    assert receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING
+    assert run.background_capsule is None
+
+
+def test_live_single_background_capsule_reuses_and_refuses_old_binding(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    from xdart.gui.tabs.scattering.adapters import dynamic_output, run_executor
+    from xdart.gui.tabs.scattering.output_preflight import SourceRevisionChanged
+    from xrd_tools.reduction import background as background_module
+
+    configuration, scan, plan, item, decision = _composition(
+        tmp_path, live=True, count=3,
+    )
+    background_path = Path(configuration.background.locator)
+    background_path.write_bytes(b"background-a")
+    decoder_calls = []
+
+    def decode(path, **_kwargs):
+        decoder_calls.append(Path(path).read_bytes())
+        fill = 1 if decoder_calls[-1] == b"background-a" else 2
+        return np.full((2, 2), fill, dtype=np.uint16)
+
+    monkeypatch.setattr(background_module, "read_image", decode)
+    captured, session = _fake_graph_io(monkeypatch, dynamic_output)
+    adapter = dynamic_output.DynamicOutputAdapter(configuration)
+    stop = Event()
+    preparation = adapter.prepare_admission(
+        scan, plan, item, decision, stop,
+        qualify=lambda _policy, prior: prior,
+    )
+    active, created = adapter.activate(
+        preparation,
+        record_store=object(),
+        run_provenance=_provenance(configuration),
+    )
+    assert active is session and created
+    run = SimpleNamespace(
+        configuration=configuration,
+        stop_signal=stop,
+        background_capsule=None,
+    )
+
+    assert run_executor._background_ready(run, adapter, scan.frames[0])
+    first_binding = adapter.background_binding(1)
+    assert run_executor._background_ready(run, adapter, scan.frames[1])
+    assert decoder_calls == [b"background-a"]
+    assert adapter.background_binding(2)[2] != first_binding[2]
+
+    background_path.write_bytes(b"background-b")
+    assert run_executor._background_ready(run, adapter, scan.frames[2])
+    current_capsule = run.background_capsule
+    assert decoder_calls == [b"background-a", b"background-b"]
+    assert adapter.background_binding(3)[2] != first_binding[2]
+
+    with __import__("pytest").raises(SourceRevisionChanged):
+        run_executor._background_ready(run, adapter, scan.frames[0])
+    assert run.background_capsule is current_capsule
+    assert adapter.background_binding(1) is first_binding
+    assert scan.frames[0].background is None
+
+    run.background_capsule = None
+    with __import__("pytest").raises(SourceRevisionChanged):
+        run_executor._background_ready(run, adapter, scan.frames[0])
+    assert run.background_capsule is None
+
+
 def test_exact_append_noop_defers_policy_to_locked_skip(
     monkeypatch,
     tmp_path: Path,

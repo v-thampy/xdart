@@ -116,6 +116,226 @@ def test_headless_single_stable_float64_scale_and_descriptor(
     assert not any(name.startswith(("PyQt", "PySide", "qtpy", "xdart")) for name in imports)
     assert sum(isinstance(node, ast.FunctionDef) and node.name == "resolve_frame_background"
                for node in tree.body) == 1
+
+
+def test_prepared_single_rebind_matches_cold_tiff_and_hdf(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    from xrd_tools.reduction import background as module
+
+    source, first_target, second_target = _files(
+        tmp_path, ("background.tif", "first.tif", "second.tif")
+    )
+    real_decoder = module.read_image
+    calls = _decoder(
+        monkeypatch,
+        {source.name: np.arange(4, dtype=np.uint16).reshape(2, 2)},
+    )
+    plan = FrameBackgroundPlan(mode="Single BG File", locator=str(source))
+    first_fact = _fact(first_target, label=1)
+    second_fact = _fact(second_target, label=2)
+    first = resolve_frame_background(plan, first_fact)
+    expected = resolve_frame_background(plan, second_fact)
+    prepared = module._prepare_single_frame_background(
+        plan, first_fact, first,
+    )
+    assert prepared is not None and len(calls) == 2
+    rebound = module._rebind_single_frame_background(
+        prepared, plan, second_fact,
+    )
+    assert rebound is not None and rebound.disposition == "RESOLVED"
+    assert rebound.descriptor_bytes == expected.descriptor_bytes
+    assert rebound.fingerprint == expected.fingerprint
+    assert rebound.background is first.background
+
+    master = tmp_path / "background.h5"
+    with h5py.File(master, "w") as handle:
+        handle.create_dataset(
+            "entry/data/data_000001",
+            data=np.arange(4, dtype=np.uint16).reshape(1, 2, 2),
+        )
+    monkeypatch.setattr(module, "read_image", real_decoder)
+    direct_plan = FrameBackgroundPlan(
+        mode="Single BG File",
+        locator=str(master),
+        dataset_path="/entry/data/data_000001",
+        frame_index=0,
+    )
+    direct_first = resolve_frame_background(direct_plan, first_fact)
+    direct_expected = resolve_frame_background(direct_plan, second_fact)
+    direct_prepared = module._prepare_single_frame_background(
+        direct_plan, first_fact, direct_first,
+    )
+    assert direct_prepared is not None
+    direct_rebound = module._rebind_single_frame_background(
+        direct_prepared, direct_plan, second_fact,
+    )
+    assert direct_rebound is not None
+    assert direct_rebound.descriptor_bytes == direct_expected.descriptor_bytes
+    assert direct_rebound.fingerprint == direct_expected.fingerprint
+    assert direct_rebound.background is direct_first.background
+
+
+def test_prepared_single_reuses_one_decode_and_detects_content_drift(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    from xrd_tools.reduction import background as module
+
+    source, target = _files(tmp_path, ("background.tif", "target.tif"))
+    calls = _decoder(
+        monkeypatch,
+        {source.name: np.arange(4, dtype=np.uint16).reshape(2, 2)},
+    )
+    plan = FrameBackgroundPlan(mode="Single BG File", locator=str(source))
+    first_fact = _fact(target, label=1)
+    first = resolve_frame_background(plan, first_fact)
+    prepared = module._prepare_single_frame_background(
+        plan, first_fact, first,
+    )
+    assert prepared is not None
+
+    extra_fact = _fact(
+        target,
+        label=51,
+        metadata=(("unexpected", ("number", float(1.0).hex())),),
+    )
+    assert resolve_frame_background(plan, extra_fact).disposition == "REFUSED"
+    assert module._rebind_single_frame_background(
+        prepared, plan, extra_fact,
+    ) is None
+
+    descriptors = set()
+    for label in range(2, 51):
+        fact = _fact(target, label=label)
+        rebound = module._rebind_single_frame_background(
+            prepared, plan, fact,
+        )
+        assert rebound is not None and rebound.disposition == "RESOLVED"
+        assert rebound.background is first.background
+        assert _payload(rebound)["frame_fact"][0] == label
+        descriptors.add(rebound.descriptor_bytes)
+    assert len(calls) == 1 and len(descriptors) == 49
+
+    cancelled = Event()
+    cancelled.set()
+    stopped = module._rebind_single_frame_background(
+        prepared, plan, _fact(target, label=51), cancelled=cancelled,
+    )
+    assert stopped is not None and stopped.disposition == "CANCELLED"
+
+    real_digest = module._digest
+    original_state = real_digest(source.resolve(), None)[0]
+    prior = source.stat()
+    source.write_bytes(b"changed-0")
+    os.utime(source, ns=(prior.st_atime_ns, prior.st_mtime_ns))
+    monkeypatch.setattr(
+        module,
+        "_digest",
+        lambda path, signal: (
+            original_state,
+            real_digest(path, signal)[1],
+        ),
+    )
+    assert module._rebind_single_frame_background(
+        prepared, plan, _fact(target, label=52),
+    ) is None
+    assert len(calls) == 1
+
+
+def test_prepared_single_rejects_same_content_path_replacement(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    from xrd_tools.reduction import background as module
+
+    source, target = _files(tmp_path, ("background.tif", "target.tif"))
+    _decoder(
+        monkeypatch,
+        {source.name: np.arange(4, dtype=np.uint16).reshape(2, 2)},
+    )
+    plan = FrameBackgroundPlan(mode="Single BG File", locator=str(source))
+    first_fact = _fact(target, label=1)
+    first = resolve_frame_background(plan, first_fact)
+    prepared = module._prepare_single_frame_background(
+        plan, first_fact, first,
+    )
+    assert prepared is not None
+
+    real_digest = module._digest
+    replaced = False
+
+    def replace_after_digest(path, cancelled):
+        nonlocal replaced
+        receipt = real_digest(path, cancelled)
+        if not replaced:
+            replacement = path.with_name("replacement.tif")
+            replacement.write_bytes(path.read_bytes())
+            replacement.replace(path)
+            replaced = True
+        return receipt
+
+    monkeypatch.setattr(module, "_digest", replace_after_digest)
+    assert module._rebind_single_frame_background(
+        prepared, plan, _fact(target, label=2),
+    ) is None
+
+
+def test_prepared_single_normalization_and_sidecar_are_exact(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    from xrd_tools.reduction import background as module
+
+    source, target = _files(tmp_path, ("background.tif", "target.tif"))
+    sidecar = source.with_suffix(".txt")
+    sidecar.write_text("monitor=2")
+    calls = _decoder(monkeypatch, {source.name: np.ones((2, 2))})
+    monkeypatch.setattr(
+        module,
+        "read_image_metadata_observed",
+        lambda *_args, **_kwargs: ImageMetadataRead(
+            {"monitor": 2.0}, sidecar,
+        ),
+    )
+    plan = FrameBackgroundPlan(
+        mode="Single BG File",
+        locator=str(source),
+        normalization_key="monitor",
+        metadata_format="txt",
+    )
+    same = (("monitor", ("number", float(4.0).hex())),)
+    different = (("monitor", ("number", float(8.0).hex())),)
+    first_fact = _fact(target, label=1, metadata=same)
+    first = resolve_frame_background(plan, first_fact)
+    prepared = module._prepare_single_frame_background(
+        plan, first_fact, first,
+    )
+    assert prepared is not None
+    rebound = module._rebind_single_frame_background(
+        prepared, plan, _fact(target, label=2, metadata=same),
+    )
+    assert rebound is not None and rebound.background is first.background
+    extra = same + (("unexpected", ("number", float(1.0).hex())),)
+    extra_fact = _fact(target, label=3, metadata=extra)
+    assert resolve_frame_background(plan, extra_fact).disposition == "REFUSED"
+    assert module._rebind_single_frame_background(
+        prepared, plan, extra_fact,
+    ) is None
+    case_fact = _fact(
+        target,
+        label=4,
+        metadata=(("Monitor", ("number", float(4.0).hex())),),
+    )
+    assert resolve_frame_background(plan, case_fact).disposition == "REFUSED"
+    assert module._rebind_single_frame_background(
+        prepared, plan, case_fact,
+    ) is None
+    assert module._rebind_single_frame_background(
+        prepared, plan, _fact(target, label=5, metadata=different),
+    ) is None
+    sidecar.write_text("monitor=2 changed")
+    assert module._rebind_single_frame_background(
+        prepared, plan, _fact(target, label=6, metadata=same),
+    ) is None
+    assert len(calls) == 1
 def test_series_any_anchor_complete_order_streaming_finite_mean(
     monkeypatch, tmp_path: Path,
 ) -> None:

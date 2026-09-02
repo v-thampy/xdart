@@ -16,6 +16,11 @@ from xdart.modules.frame_publication import (
 )
 from xrd_tools.core.scan import SourceKind
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
+from xrd_tools.reduction.background import (
+    _PreparedSingleFrameBackground,
+    _prepare_single_frame_background,
+    _rebind_single_frame_background,
+)
 from xrd_tools.integrate.calibration import (
     apply_sensor_parallax,
     detector_calibration_record,
@@ -90,7 +95,8 @@ _SOURCE_SUBMISSION_END = object()
 
 
 def _resolve_background_before_submit(frame, plan: FrameBackgroundPlan, binding,
-                                      *, cancelled, retryable=False, frame_fact=None) -> bool:
+                                      *, cancelled, retryable=False,
+                                      frame_fact=None, capsule_owner=None) -> bool:
     """The sole immediate-pre-submit Background array insertion seam."""
     if type(plan) is not FrameBackgroundPlan: raise TypeError("Background plan must be exact")
     frame.background = None; frame.background_dependency_bytes = None
@@ -98,7 +104,24 @@ def _resolve_background_before_submit(frame, plan: FrameBackgroundPlan, binding,
     if plan.mode == "None": return True
     fact = binding[1] if binding is not None else frame_fact
     if fact is None: raise RuntimeError("Background resolution lost its frame fact")
-    result = resolve_frame_background(plan, fact, cancelled=cancelled)
+    prepared = (
+        None
+        if capsule_owner is None
+        else getattr(capsule_owner, "background_capsule", None)
+    )
+    result = (
+        _rebind_single_frame_background(
+            prepared, plan, fact, cancelled=cancelled,
+        )
+        if type(prepared) is _PreparedSingleFrameBackground
+        else None
+    )
+    candidate = None
+    if result is None:
+        if capsule_owner is not None:
+            capsule_owner.background_capsule = None
+        result = resolve_frame_background(plan, fact, cancelled=cancelled)
+        candidate = _prepare_single_frame_background(plan, fact, result)
     if result.disposition == "RETRYABLE" and retryable: return False
     if result.disposition == "CANCELLED": raise RuntimeError("admission cancelled")
     if result.disposition != "RESOLVED" or result.background is None:
@@ -107,13 +130,15 @@ def _resolve_background_before_submit(frame, plan: FrameBackgroundPlan, binding,
     if binding is not None:
         if pair != binding[2:]: raise SourceRevisionChanged("Background dependency changed after qualification")
         pair = binding[2], binding[3]
+    if candidate is not None and capsule_owner is not None:
+        capsule_owner.background_capsule = candidate
     frame.background = result.background
     frame.background_dependency_bytes, frame.background_dependency_fingerprint = pair
     return True
 
 
 def _qualify_background_bindings(configuration, scan, item, decision, policy,
-                                  prior, stop_signal):
+                                  prior, stop_signal, capsule_owner=None):
     plan = configuration.background
     if plan.mode == "None": return prior
     requirements = policy.allocation.requirements
@@ -138,7 +163,8 @@ def _qualify_background_bindings(configuration, scan, item, decision, policy,
         expected = next((value for value in bindings if value[0] == label), None)
         try:
             if not _resolve_background_before_submit(frame, plan, expected,
-                    cancelled=stop_signal, retryable=configuration.live_mode, frame_fact=fact):
+                    cancelled=stop_signal, retryable=configuration.live_mode,
+                    frame_fact=fact, capsule_owner=capsule_owner):
                 raise SourceRevisionChanged("Live Background dependency is retryable")
             binding = (label, fact, frame.background_dependency_bytes,
                        frame.background_dependency_fingerprint)
@@ -165,7 +191,8 @@ def _background_ready(run, output, frame) -> bool:
             try:
                 if not _resolve_background_before_submit(
                         frame, plan, None, cancelled=run.stop_signal,
-                        retryable=True, frame_fact=fact):
+                        retryable=True, frame_fact=fact,
+                        capsule_owner=run):
                     run.stop_signal.wait(_LIVE_DIRECTORY_POLL_S); continue
                 binding = output.admit_background_binding((int(frame.index), fact,
                     frame.background_dependency_bytes, frame.background_dependency_fingerprint)); frame.background_dependency_bytes, frame.background_dependency_fingerprint = binding[2:]
@@ -175,7 +202,8 @@ def _background_ready(run, output, frame) -> bool:
                 raise
             return True
         if _resolve_background_before_submit(frame, plan, binding,
-                cancelled=run.stop_signal, retryable=run.configuration.live_mode): return True
+                cancelled=run.stop_signal, retryable=run.configuration.live_mode,
+                capsule_owner=run): return True
         run.stop_signal.wait(_LIVE_DIRECTORY_POLL_S)
 _QUARTILE_STAGE_NAMES = (
     "reducer_compute",
@@ -450,6 +478,7 @@ class _StandardRun:
     resource_facts: list[Any] = field(default_factory=list)
     pending_partition_count: int = 1
     terminal_commit_identity: StreamTerminal | None = None
+    background_capsule: _PreparedSingleFrameBackground | None = None
 
     def __post_init__(self) -> None:
         self.perf_quartiles_enabled = (
@@ -1450,7 +1479,7 @@ class StandardRunExecutor:
             run.scan, plan, item, decision, run.stop_signal,
             qualify=lambda policy, prior: _qualify_background_bindings(
                 configuration, run.scan, item, decision, policy, prior,
-                run.stop_signal))
+                run.stop_signal, run))
         if configuration.output_mode == "Overwrite" and not target_state_matches(preparation.effective):
             raise RuntimeError(f"output target changed after Background qualification: {item.target}")
         run.display.set_factories(FrameRecordStore, PublicationStore)
@@ -2700,6 +2729,7 @@ class StandardRunExecutor:
                     ))
                 else:
                     output_finished = True
+            run.background_capsule = None
             try:
                 self._finish_display_projection(run)
             except Exception as error:
