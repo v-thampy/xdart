@@ -3348,6 +3348,130 @@ def _b1_acquisition(tmp_path, labels):
     return runtime, state, artifact, context, keys, raw_path, events
 
 
+def test_b1_light_publish_and_full_admission_share_one_lock_order(
+    monkeypatch, tmp_path,
+):
+    """A writer publication cannot deadlock full-resolution admission.
+
+    Full admission owns the light-admission and transport locks while deriving
+    under the display lock.  The writer must therefore wait for light
+    admission *before* taking the display lock, leaving derivation able to
+    finish and release the shared admission seam.
+    """
+    _runtime, state, artifact, context, keys, _raw, _events = _b1_acquisition(
+        tmp_path, (1, 2, 3),
+    )
+    key = keys[3]
+    record = artifact.records.get(3)
+    before = artifact.publications.get(3)
+    assert record is not None and before is not None
+    assert not artifact.publications.has_raw(3)
+
+    derive_entered = threading.Event()
+    release_derive = threading.Event()
+    writer_attempted_admission = threading.Event()
+    original_derive = state.transport._derive
+    original_admission_lock = state._light_admission_lock
+
+    class ObservedAdmissionLock:
+        def acquire(self, *args, **kwargs):
+            if threading.current_thread().name == "b1-light-writer":
+                writer_attempted_admission.set()
+            return original_admission_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            return original_admission_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            self.release()
+
+    def held_derive(request):
+        assert request.read_key.frame_identity == 3
+        assert request.read_key.purpose is HydrationPurpose.FULL
+        derive_entered.set()
+        assert release_derive.wait(timeout=10.0)
+        return original_derive(request)
+
+    monkeypatch.setattr(
+        state, "_light_admission_lock", ObservedAdmissionLock(),
+    )
+    monkeypatch.setattr(state.transport, "_derive", held_derive)
+
+    admitted = []
+    published = []
+    errors = []
+
+    def admit_full():
+        try:
+            admitted.append(state.request_full(
+                key,
+                1,
+                owner=context.hydration_owner,
+                commit_gate=context.commit_gate,
+            ))
+        except BaseException as error:  # pragma: no cover - asserted below
+            errors.append(("admission", error))
+
+    def publish_light():
+        try:
+            published.append(state.publish_light_1d(
+                artifact, record, source_identity=before.source_identity,
+            ))
+        except BaseException as error:  # pragma: no cover - asserted below
+            errors.append(("publication", error))
+
+    gui = threading.Thread(
+        target=admit_full, name="b1-full-admission", daemon=True,
+    )
+    writer = threading.Thread(
+        target=publish_light, name="b1-light-writer", daemon=True,
+    )
+    gui.start()
+    assert derive_entered.wait(timeout=5.0)
+    writer.start()
+    assert writer_attempted_admission.wait(timeout=5.0)
+    release_derive.set()
+
+    deadline = time.monotonic() + 5.0
+    for thread in (gui, writer):
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    assert not gui.is_alive() and not writer.is_alive()
+    assert errors == []
+
+    assert len(admitted) == 1 and admitted[0] is not None
+    token = admitted[0]
+    assert token.read_key.artifact_identity == str(artifact.artifact)
+    assert token.read_key.frame_identity == 3
+    assert token.read_key.purpose is HydrationPurpose.FULL
+    assert token.presentation_generation == 1
+    assert len(published) == 1
+    assert published[0].source_identity == before.source_identity
+    assert published[0].scan_key == artifact.source_scan
+
+    assert _wait_transport_idle(state)
+    completions = tuple(
+        completion
+        for completion in state.transport.completions()
+        if completion.token is token
+    )
+    assert len(completions) == 1
+    assert completions[0].outcome is HydrationOutcome.HYDRATED
+    current = artifact.publications.get(3)
+    assert current is not None and artifact.publications.has_raw(3)
+    assert current.source_identity == before.source_identity
+    assert current.scan_key == artifact.source_scan
+    assert np.array_equal(
+        current.view.axis_1d.values, record.active_view().axis_1d.values,
+    )
+    assert np.array_equal(
+        current.view.intensity_1d, record.active_view().intensity_1d,
+    )
+
+
 def test_b1_full_demand_latest_current_lru8_and_thumbnail_clear(monkeypatch, tmp_path):
     labels = tuple(range(1, 10))
     runtime, state, artifact, context, keys, _raw, events = _b1_acquisition(

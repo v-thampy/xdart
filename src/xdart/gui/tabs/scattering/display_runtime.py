@@ -690,7 +690,7 @@ class RunDisplayState:
         return self.catalog.max_items
 
     def publish_light_1d(self, owner: DisplayArtifact, record: FrameRecord, *, source_identity: str) -> FramePublication:
-        with self._lock, self._light_admission_lock:
+        with self._light_admission_lock, self._lock:
             lease = owner.light_lease
             if type(lease) is not Light1DRetentionLease \
                     or lease.state is not Light1DLeaseState.ACTIVE:
