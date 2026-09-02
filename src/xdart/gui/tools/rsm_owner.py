@@ -17,17 +17,51 @@ from xdart.gui.pages.operation_owner import (
 from xdart.gui.pages.values import CloseReceipt, PageCleanup
 from xrd_tools.analysis.rsm_operation import (
     RSMOperationCleanupPending,
+    RSMOperationCleanupPendingV2,
     RSMOperationExecution,
+    RSMOperationExecutionV2,
     RSMOperationResult,
+    RSMOperationResultV2,
     RSMOperationVerificationError,
+    RSMOperationVerificationErrorV2,
 )
 
 from .rsm_values import (
     RSMToolForm,
+    RSMToolFormV2,
     RSMToolPreflight,
+    RSMToolPreflightV2,
     RSMToolPreflightRefused,
     prepare_rsm_tool,
+    prepare_rsm_tool_v2,
 )
+
+
+_RSMForm = RSMToolForm | RSMToolFormV2
+_RSMPreflight = RSMToolPreflight | RSMToolPreflightV2
+_RSMExecution = RSMOperationExecution | RSMOperationExecutionV2
+_RSMResult = RSMOperationResult | RSMOperationResultV2
+
+
+def _profile_types(generation: int):
+    if generation == 1:
+        return RSMToolForm, RSMToolPreflight, RSMOperationExecution, RSMOperationResult
+    if generation == 2:
+        return (
+            RSMToolFormV2,
+            RSMToolPreflightV2,
+            RSMOperationExecutionV2,
+            RSMOperationResultV2,
+        )
+    raise TypeError("RSM owner generation is invalid")
+
+
+def _profile_finalization_errors(generation: int):
+    if generation == 1:
+        return RSMOperationCleanupPending, RSMOperationVerificationError
+    if generation == 2:
+        return RSMOperationCleanupPendingV2, RSMOperationVerificationErrorV2
+    raise TypeError("RSM owner generation is invalid")
 
 
 class RSMOwnerAction(str, Enum):
@@ -54,8 +88,8 @@ class RSMOwnerFinalization(str, Enum):
 @dataclass(frozen=True, slots=True)
 class RSMOwnerOutcome:
     kind: RSMOwnerOutcomeKind
-    preflight: RSMToolPreflight | None = None
-    result: RSMOperationResult | None = None
+    preflight: _RSMPreflight | None = None
+    result: _RSMResult | None = None
     refusal_code: str = ""
     refusal_message: str = ""
     diagnostics: tuple[str, ...] = ()
@@ -65,11 +99,11 @@ class RSMOwnerOutcome:
             type(self.kind) is not RSMOwnerOutcomeKind
             or (
                 self.preflight is not None
-                and type(self.preflight) is not RSMToolPreflight
+                and type(self.preflight) not in (RSMToolPreflight, RSMToolPreflightV2)
             )
             or (
                 self.result is not None
-                and type(self.result) is not RSMOperationResult
+                and type(self.result) not in (RSMOperationResult, RSMOperationResultV2)
             )
             or type(self.refusal_code) is not str
             or type(self.refusal_message) is not str
@@ -195,28 +229,33 @@ class RSMOwnerUpdate:
 
 @dataclass(frozen=True, slots=True)
 class _WorkerCommand:
+    generation: int
     action: RSMOwnerAction
     form_fingerprint: str
     form_revision: int
-    form: RSMToolForm | None = None
-    preflight: RSMToolPreflight | None = None
-    execution: RSMOperationExecution | None = None
+    form: _RSMForm | None = None
+    preflight: _RSMPreflight | None = None
+    execution: _RSMExecution | None = None
 
     def __post_init__(self) -> None:
+        form_type, preflight_type, execution_type, _result_type = _profile_types(
+            self.generation
+        )
         if (
-            type(self.action) is not RSMOwnerAction
+            type(self.generation) is not int
+            or type(self.action) is not RSMOwnerAction
             or type(self.form_fingerprint) is not str
             or not self.form_fingerprint
             or type(self.form_revision) is not int
             or self.form_revision < 1
-            or (self.form is not None and type(self.form) is not RSMToolForm)
+            or (self.form is not None and type(self.form) is not form_type)
             or (
                 self.preflight is not None
-                and type(self.preflight) is not RSMToolPreflight
+                and type(self.preflight) is not preflight_type
             )
             or (
                 self.execution is not None
-                and type(self.execution) is not RSMOperationExecution
+                and type(self.execution) is not execution_type
             )
         ):
             raise TypeError("RSM worker command is invalid")
@@ -238,8 +277,8 @@ class _WorkerCommand:
             raise TypeError("RSM worker command fields disagree")
 
 
-PreflightRunner = Callable[..., RSMToolPreflight]
-ExecutionFactory = Callable[..., RSMOperationExecution]
+PreflightRunner = Callable[..., _RSMPreflight]
+ExecutionFactory = Callable[..., _RSMExecution]
 
 
 class RSMToolOwner:
@@ -252,27 +291,49 @@ class RSMToolOwner:
         preflight_runner: PreflightRunner = prepare_rsm_tool,
         execution_factory: ExecutionFactory = RSMOperationExecution,
         join_timeout: float = 0.0,
+        _generation: int = 1,
     ) -> None:
         if not callable(preflight_runner) or not callable(execution_factory):
             raise TypeError("RSM owner adapters must be callable")
+        _profile_types(_generation)
+        self._generation = _generation
         self._coordinator = coordinator
         self._preflight_runner = preflight_runner
         self._execution_factory = execution_factory
         self._worker = SingleWorkerOwner(self._run_command, join_timeout=join_timeout)
         self._lock = Lock()
-        self._form: RSMToolForm | None = None
+        self._form: _RSMForm | None = None
         self._form_revision = 0
-        self._prepared: RSMToolPreflight | None = None
+        self._prepared: _RSMPreflight | None = None
         self._prepared_revision: int | None = None
-        self._execution: RSMOperationExecution | None = None
-        self._execution_preflight: RSMToolPreflight | None = None
+        self._execution: _RSMExecution | None = None
+        self._execution_preflight: _RSMPreflight | None = None
         self._execution_form_revision: int | None = None
-        self._last_result: RSMOperationResult | None = None
+        self._last_result: _RSMResult | None = None
         self._finalization = RSMOwnerFinalization.NONE
         self._active_identity: OperationIdentity | None = None
         self._active_action: RSMOwnerAction | None = None
         self._closing = False
         self._clean_receipt: CloseReceipt | None = None
+
+    @classmethod
+    def v2(
+        cls,
+        *,
+        coordinator=None,
+        preflight_runner: PreflightRunner = prepare_rsm_tool_v2,
+        execution_factory: ExecutionFactory = RSMOperationExecutionV2,
+        join_timeout: float = 0.0,
+    ) -> "RSMToolOwner":
+        """Build one exact RSM v2 owner without weakening the R1 default."""
+
+        return cls(
+            coordinator=coordinator,
+            preflight_runner=preflight_runner,
+            execution_factory=execution_factory,
+            join_timeout=join_timeout,
+            _generation=2,
+        )
 
     def __copy__(self):
         raise TypeError("RSM tool owner is not copyable")
@@ -286,12 +347,12 @@ class RSMToolOwner:
             return self._active_identity is not None
 
     @property
-    def form(self) -> RSMToolForm | None:
+    def form(self) -> _RSMForm | None:
         with self._lock:
             return self._form
 
     @property
-    def prepared(self) -> RSMToolPreflight | None:
+    def prepared(self) -> _RSMPreflight | None:
         with self._lock:
             return self._prepared
 
@@ -308,7 +369,7 @@ class RSMToolOwner:
             return self._finalization
 
     @property
-    def last_result(self) -> RSMOperationResult | None:
+    def last_result(self) -> _RSMResult | None:
         with self._lock:
             return self._last_result
 
@@ -317,9 +378,12 @@ class RSMToolOwner:
         with self._lock:
             return self._active_identity
 
-    def set_form(self, form: RSMToolForm) -> bool:
-        if type(form) is not RSMToolForm:
-            raise TypeError("RSM owner form must be exact RSMToolForm")
+    def set_form(self, form: _RSMForm) -> bool:
+        form_type, _preflight_type, _execution_type, _result_type = _profile_types(
+            self._generation
+        )
+        if type(form) is not form_type:
+            raise TypeError("RSM owner form does not match its exact generation")
         with self._lock:
             if self._closing:
                 return False
@@ -355,6 +419,7 @@ class RSMToolOwner:
             ):
                 return None
             command = _WorkerCommand(
+                self._generation,
                 RSMOwnerAction.PREFLIGHT,
                 self._form.fingerprint,
                 self._form_revision,
@@ -380,14 +445,18 @@ class RSMToolOwner:
                 preflight.request,
                 coordinator=self._coordinator,
             )
+            _form_type, _preflight_type, execution_type, _result_type = _profile_types(
+                self._generation
+            )
             if (
-                type(execution) is not RSMOperationExecution
+                type(execution) is not execution_type
                 or execution.request is not preflight.request
             ):
                 raise TypeError(
                     "execution factory must return the exact prepared RSM execution"
                 )
             command = _WorkerCommand(
+                self._generation,
                 RSMOwnerAction.RUN,
                 preflight.form.fingerprint,
                 self._prepared_revision,
@@ -422,6 +491,7 @@ class RSMToolOwner:
             return None
         return self._begin_locked(
             _WorkerCommand(
+                self._generation,
                 action,
                 preflight.form.fingerprint,
                 form_revision,
@@ -472,7 +542,10 @@ class RSMToolOwner:
                     refusal_message=str(error),
                     diagnostics=error.diagnostics,
                 )
-            if type(preflight) is not RSMToolPreflight:
+            _form_type, preflight_type, _execution_type, _result_type = _profile_types(
+                request.generation
+            )
+            if type(preflight) is not preflight_type:
                 raise TypeError("preflight adapter returned an invalid value")
             if preflight.form.fingerprint != request.form_fingerprint:
                 raise ValueError("preflight adapter changed the form identity")
@@ -504,16 +577,36 @@ class RSMToolOwner:
                 publish("verification", 1, 1)
             else:  # pragma: no cover
                 raise RuntimeError("unknown RSM owner action")
-        except RSMOperationCleanupPending as error:
+        except (RSMOperationCleanupPending, RSMOperationCleanupPendingV2) as error:
+            cleanup_type, _verification_type = _profile_finalization_errors(
+                request.generation
+            )
+            if type(error) is not cleanup_type:
+                raise TypeError(
+                    "cleanup exception does not match the RSM owner generation"
+                )
             if error.execution is not execution:
                 raise RuntimeError("cleanup exception changed RSM execution owner")
             return RSMOwnerOutcome(RSMOwnerOutcomeKind.CLEANUP_PENDING)
-        except RSMOperationVerificationError as error:
+        except (
+            RSMOperationVerificationError,
+            RSMOperationVerificationErrorV2,
+        ) as error:
+            _cleanup_type, verification_type = _profile_finalization_errors(
+                request.generation
+            )
+            if type(error) is not verification_type:
+                raise TypeError(
+                    "verification exception does not match the RSM owner generation"
+                )
             if error.execution is not execution:
                 raise RuntimeError("verification changed RSM execution owner")
             return RSMOwnerOutcome(RSMOwnerOutcomeKind.VERIFICATION_PENDING)
+        _form_type, _preflight_type, _execution_type, result_type = _profile_types(
+            request.generation
+        )
         if (
-            type(result) is not RSMOperationResult
+            type(result) is not result_type
             or result.request is not execution.request
         ):
             raise TypeError("RSM execution returned an invalid result")
