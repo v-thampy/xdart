@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import threading
 from types import MappingProxyType, SimpleNamespace
+from unittest.mock import Mock
 
 import h5py
 import numpy as np
@@ -738,17 +739,22 @@ def test_prepared_manifest_receipt_is_factory_owned_and_dimension_bound(
         replace(receipt)
 
 
+@pytest.mark.parametrize("dimension", ("1d", "2d"))
 def test_prepared_successor_uses_detached_facts_and_one_click_manifest(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, dimension,
 ):
+    import xrd_tools.io.nexus as nexus_module
+    import xrd_tools.io.record_writer as writer_module
     from xrd_tools.io.record_writer import NexusRecordWriter
     from xrd_tools.reduction import run_reintegrate_successor
     import xrd_tools.reduction.reintegrate_successor as module
 
-    seeded = _seed_existing(tmp_path, labels=(2, 5), name="prepared-run")
+    seeded = _seed_existing(
+        tmp_path, labels=(2, 5), name=f"prepared-run-{dimension}",
+    )
+    _offer, plan = _prepared_plan(seeded, dimension=dimension)
     before = seeded.target.read_bytes()
-    _offer, plan = _prepared_plan(seeded)
-    before = seeded.target.read_bytes()
+    assert plan.resource_allocation.reduction_inflight == 1
     recipe = plan.as_recipe()
     _stub_integrators(monkeypatch)
     monkeypatch.setattr(
@@ -771,13 +777,68 @@ def test_prepared_successor_uses_detached_facts_and_one_click_manifest(
     monkeypatch.setattr(
         NexusRecordWriter, "_replacement_manifest_digest", counted,
     )
+    outer = Mock(wraps=writer_module.validate_integrated_stack_write)
+    inner = Mock(wraps=nexus_module.validate_integrated_stack_write)
+    write_stack = Mock(wraps=writer_module.write_integrated_stack)
+    close_handle = NexusRecordWriter._close_handle
+    closed = []
+
+    def close_and_observe(writer):
+        close_handle(writer)
+        closed.append(writer._prepared_stack_authority)
+
+    monkeypatch.setattr(writer_module, "validate_integrated_stack_write", outer)
+    monkeypatch.setattr(nexus_module, "validate_integrated_stack_write", inner)
+    monkeypatch.setattr(writer_module, "write_integrated_stack", write_stack)
+    monkeypatch.setattr(NexusRecordWriter, "_close_handle", close_and_observe)
     result = run_reintegrate_successor(plan)
 
     assert result.disposition == "COMMITTED"
     assert result.committed_labels == seeded.labels
     assert len(calls) == 1
+    assert (outer.call_count, inner.call_count, write_stack.call_count) == (1, 1, 1)
+    assert closed == [None]
     assert seeded.target.read_bytes() == before
     assert recipe["plan"]["route"] == "prepared"
+
+
+def test_prepared_stack_authority_refuses_a_relinked_dataset(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.io.record_writer import NexusRecordWriter, WriterStateError
+    from xrd_tools.reduction import run_reintegrate_successor
+
+    seeded = _seed_existing(tmp_path, labels=(2, 5), name="prepared-relink")
+    _offer, plan = _prepared_plan(seeded)
+    before = seeded.target.read_bytes()
+    capture = NexusRecordWriter._capture_prepared_stack_authority
+    relinked = False
+
+    def relink_after_capture(writer, records):
+        nonlocal relinked
+        capture(writer, records)
+        if relinked:
+            return
+        group = writer._entry_group()["integrated_1d"]
+        original = group["frame_index"]
+        values, chunks, maximum = original[()], original.chunks, original.maxshape
+        del group["frame_index"]
+        group.create_dataset(
+            "frame_index", data=values, maxshape=maximum, chunks=chunks,
+        )
+        relinked = True
+
+    monkeypatch.setattr(
+        NexusRecordWriter, "_capture_prepared_stack_authority",
+        relink_after_capture,
+    )
+    _stub_integrators(monkeypatch)
+    with pytest.raises(WriterStateError, match="prepared stack authority changed"):
+        run_reintegrate_successor(plan)
+    assert relinked
+    assert seeded.target.read_bytes() == before
+    assert not Path(plan.output_artifact).exists()
+    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
 
 
 @pytest.mark.parametrize("recipe", (False, True), ids=("direct", "recipe"))
@@ -2952,19 +3013,22 @@ def test_candidate_preservation_binds_hard_link_alias_equivalence(
 @pytest.mark.parametrize(
     ("dropped", "disposition", "committed"),
     [
-        ((5,), "COMMITTED", (2,)),
-        ((2, 5), "ABORTED", ()),
+        ((5,), "COMMITTED", (2, 9)),
+        ((2, 5, 9), "ABORTED", ()),
     ],
     ids=("partial", "all"),
 )
+@pytest.mark.parametrize("route", ("bounded-legacy", "prepared"))
 def test_publication_drop_matrix_has_one_finite_outcome(
-    tmp_path, monkeypatch, dropped, disposition, committed,
+    tmp_path, monkeypatch, dropped, disposition, committed, route,
 ):
     from xrd_tools.reduction import run_reintegrate_successor
 
-    seeded = _seed_existing(tmp_path, labels=(2, 5), name=f"drop-{disposition}")
+    seeded = _seed_existing(
+        tmp_path, labels=(2, 5, 9), name=f"{route}-drop-{disposition}",
+    )
+    plan = _plan(seeded) if route == "bounded-legacy" else _prepared_plan(seeded)[1]
     before = seeded.target.read_bytes()
-    plan = _plan(seeded)
     _stub_integrators(monkeypatch, dropped=dropped)
     result = run_reintegrate_successor(plan)
 
@@ -2972,7 +3036,7 @@ def test_publication_drop_matrix_has_one_finite_outcome(
     assert result.committed_labels == committed
     assert result.publication_dropped_labels == dropped
     assert seeded.target.read_bytes() == before
-    assert (seeded.target.parent / "immutable-successor.nexus").exists() is (
+    assert Path(plan.output_artifact).exists() is (
         disposition == "COMMITTED"
     )
 

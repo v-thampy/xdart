@@ -2047,6 +2047,7 @@ class NexusRecordWriter:
         self._pending_metadata_labels: set[int] = set()
         self._source_paths: list[str] = []
         self._row_cursors: dict[str, dict[int, int]] = {}
+        self._prepared_stack_authority: Mapping[str, Any] | None = None
         self._primary_mode_1d = DEFAULT_MODE_KEY
         self._primary_mode_2d = DEFAULT_MODE_KEY
         self._since_flush = 0
@@ -4128,9 +4129,221 @@ class NexusRecordWriter:
             raise ValueError(f"unknown {dimension} mode {mode!r}")
         return f"{top}/{mode_subgroup_name(mode)}"
 
+    def _prepared_stack_records(self, records: tuple[RecordWrite, ...]):
+        """Select only the manifest-admitted immutable-successor primary."""
+        if (
+            self._prepared_manifest_admission is None
+            or self._finite_request is None
+            or self._finite_candidate_binding is None
+            or self._seeded_document is not self._h5
+            or self._transaction_binding is not None
+            or self._append_decision is not None
+            or self._replacement_configuration is None
+        ):
+            return None
+        dimension = self._replacement_configuration[0]
+        primary = (
+            self._primary_mode_1d if dimension == "1d"
+            else self._primary_mode_2d
+        )
+        selected = []
+        for record in records:
+            result = record.result_1d if dimension == "1d" else record.result_2d
+            other = record.result_2d if dimension == "1d" else record.result_1d
+            mode = record.mode_1d if dimension == "1d" else record.mode_2d
+            if record.write_frame_record or other is not None:
+                return None
+            if result is not None:
+                if canonical_gi_mode_key(mode, dimension) != primary:
+                    return None
+                selected.append(record)
+        return dimension, f"integrated_{dimension}", primary, tuple(selected)
+
+    def _capture_prepared_stack_authority(
+        self, records: tuple[RecordWrite, ...],
+    ) -> None:
+        """Retain the first fully validated stack objects as a private capability."""
+        qualified = self._prepared_stack_records(records)
+        if qualified is None:
+            self._prepared_stack_authority = None
+            return
+        dimension, group_name, primary, selected = qualified
+        if not selected:
+            return
+        results = tuple(
+            record.result_1d if dimension == "1d" else record.result_2d
+            for record in selected
+        )
+        group = _replacement_hard_group(self._entry_group(), group_name)
+        if not isinstance(group, h5py.Group):
+            raise WriterStateError("prepared stack admission lost its exact group")
+        names = ("intensity", "frame_index", "q") + (
+            ("chi",) if dimension == "2d" else ()
+        )
+        datasets = {
+            name: _replacement_hard_group(group, name, h5py.Dataset)
+            for name in names
+        }
+        if not isinstance(group, h5py.Group) or any(
+            not isinstance(node, h5py.Dataset) for node in datasets.values()
+        ):
+            raise WriterStateError("prepared stack admission lost its exact schema")
+        cursor = self._row_cursors[group_name]
+        row_count = int(datasets["frame_index"].shape[0])
+        if (
+            row_count < 1 or len(cursor) != row_count
+            or set(cursor.values()) != set(range(row_count))
+        ):
+            raise WriterStateError("prepared stack cursor is not a complete row authority")
+        last_label = int(datasets["frame_index"][row_count - 1])
+        if cursor.get(last_label) != row_count - 1:
+            raise WriterStateError("prepared stack tail differs from its row authority")
+        observed_primary = self._text_value(
+            group.attrs.get(PRIMARY_MODE_ATTR, DEFAULT_MODE_KEY)
+        )
+        if observed_primary != primary:
+            raise WriterStateError("prepared stack primary mode changed")
+        first = results[0]
+        axes = [np.asarray(datasets["q"][()], np.float32).copy()]
+        units = [str(first.unit or "")]
+        if dimension == "2d":
+            axes.append(np.asarray(datasets["chi"][()], np.float32).copy())
+            units.append(str(first.azimuthal_unit or ""))
+            expected_kind = two_d_kind_from_units(*units).value
+            if self._text_value(group.attrs.get("two_d_kind", "")) != expected_kind:
+                raise WriterStateError("prepared 2-D stack kind changed")
+        sigma = _replacement_hard_group(group, "sigma", h5py.Dataset)
+        if sigma is not None:
+            datasets["sigma"] = sigma
+        self._prepared_stack_authority = MappingProxyType({
+            "dimension": dimension, "group_name": group_name, "primary": primary,
+            "cursor": cursor, "group": group,
+            "datasets": MappingProxyType(datasets),
+            "axes": tuple(axes), "units": tuple(units),
+            "row_shape": tuple(datasets["intensity"].shape[1:]),
+            "last_label": last_label,
+        })
+
+    def _prepare_prepared_stack_append(
+        self, records: tuple[RecordWrite, ...],
+    ) -> dict[str, Any] | None:
+        """Prebuild an append after O(1) identity checks, without HDF mutation."""
+        authority = self._prepared_stack_authority
+        qualified = self._prepared_stack_records(records)
+        if authority is None or qualified is None:
+            return None
+        dimension, group_name, primary, selected = qualified
+        if not selected or (
+            dimension, group_name, primary
+        ) != (
+            authority["dimension"], authority["group_name"], authority["primary"],
+        ):
+            return None
+        cursor = authority["cursor"]
+        labels = tuple(int(record.label) for record in selected)
+        if any(right <= left for left, right in zip(labels, labels[1:])):
+            raise ValueError("prepared stack labels must be strictly increasing")
+        if any(label in cursor for label in labels) or labels[0] <= authority["last_label"]:
+            return None
+        group = _replacement_hard_group(self._entry_group(), group_name)
+        if not isinstance(group, h5py.Group):
+            raise WriterStateError("prepared stack authority changed before append")
+        datasets = authority["datasets"]
+        current = {
+            name: _replacement_hard_group(group, name, h5py.Dataset)
+            for name in datasets
+        }
+        row_count = len(cursor)
+        row_shape = authority["row_shape"]
+        if (
+            group.id != authority["group"].id
+            or self._row_cursors.get(group_name) is not cursor
+            or any(
+                not isinstance(current[name], h5py.Dataset)
+                or current[name].id != dataset.id
+                for name, dataset in datasets.items()
+            )
+            or datasets["frame_index"].shape != (row_count,)
+            or datasets["intensity"].shape != (row_count,) + row_shape
+            or cursor.get(authority["last_label"]) != row_count - 1
+            or int(datasets["frame_index"][row_count - 1]) != authority["last_label"]
+            or self._text_value(group.attrs.get(PRIMARY_MODE_ATTR, DEFAULT_MODE_KEY))
+            != authority["primary"]
+            or (
+                _replacement_hard_group(group, "sigma", h5py.Dataset) is None
+            ) != ("sigma" not in datasets)
+            or any(
+                self._text_value(datasets[name].attrs.get("units", "")) != unit
+                for name, unit in zip(("q", "chi"), authority["units"])
+            )
+        ):
+            raise WriterStateError("prepared stack authority changed before append")
+        for offset, axis in enumerate(authority["axes"]):
+            name = "q" if offset == 0 else "chi"
+            if tuple(datasets[name].shape) != tuple(axis.shape):
+                raise WriterStateError("prepared stack axis shape changed before append")
+        sigma_node = datasets.get("sigma")
+        if sigma_node is not None and sigma_node.shape != (row_count,) + row_shape:
+            raise WriterStateError("prepared stack sigma shape changed before append")
+        intensity_rows, sigma_rows = [], []
+        for record in selected:
+            result = record.result_1d if dimension == "1d" else record.result_2d
+            incoming_axes = (np.asarray(result.radial, np.float32),)
+            incoming_units = (str(result.unit or ""),)
+            intensity = np.asarray(result.intensity, np.float32)
+            sigma = None if result.sigma is None else np.asarray(result.sigma, np.float32)
+            if dimension == "2d":
+                incoming_axes += (np.asarray(result.azimuthal, np.float32),)
+                incoming_units += (str(result.azimuthal_unit or ""),)
+                intensity = intensity.T
+                sigma = None if sigma is None else sigma.T
+            if incoming_units != authority["units"] or any(
+                incoming.shape != expected.shape
+                or not np.allclose(incoming, expected, rtol=1e-5, atol=1e-8)
+                for incoming, expected in zip(incoming_axes, authority["axes"])
+            ):
+                raise ValueError("prepared stack axis or unit differs from its authority")
+            if intensity.shape != row_shape or (
+                sigma is not None and sigma.shape != row_shape
+            ):
+                raise ValueError("prepared stack result row shape changed")
+            if sigma is not None and sigma_node is None:
+                return None
+            intensity_rows.append(intensity)
+            if sigma_node is not None:
+                sigma_rows.append(
+                    np.full(row_shape, np.nan, np.float32)
+                    if sigma is None else sigma
+                )
+        return {
+            "authority": authority, "labels": np.asarray(labels, np.int64),
+            "intensity": np.stack(intensity_rows).astype(np.float32, copy=False),
+            "sigma": None if sigma_node is None else
+            np.stack(sigma_rows).astype(np.float32, copy=False),
+        }
+
+    def _append_prepared_stack(self, prepared: Mapping[str, Any]) -> None:
+        authority = prepared["authority"]
+        datasets, cursor = authority["datasets"], authority["cursor"]
+        start, stop = len(cursor), len(cursor) + len(prepared["labels"])
+        intensity, frame_index = datasets["intensity"], datasets["frame_index"]
+        intensity.resize((stop,) + authority["row_shape"])
+        intensity[start:stop] = prepared["intensity"]
+        frame_index.resize((stop,))
+        frame_index[start:stop] = prepared["labels"]
+        if "sigma" in datasets:
+            datasets["sigma"].resize((stop,) + authority["row_shape"])
+            datasets["sigma"][start:stop] = prepared["sigma"]
+        cursor.update({int(label): start + offset for offset, label in enumerate(prepared["labels"])})
+        self._prepared_stack_authority = MappingProxyType({
+            **authority, "last_label": int(prepared["labels"][-1]),
+        })
+
     def _validate_records(
         self,
         records: tuple[RecordWrite, ...],
+        *,
+        trusted_group: str | None = None,
     ) -> dict[int, _PreparedThumbnail]:
         labels = [int(record.label) for record in records]
         prepared_thumbnails: dict[int, _PreparedThumbnail] = {}
@@ -4145,12 +4358,14 @@ class NexusRecordWriter:
         for record in one_d:
             name = self._mode_cursor_name("1d", record.mode_1d)
             self._row_cursors.setdefault(name, {})
-            self._verify_cursor(name, int(record.label))
+            if name != trusted_group:
+                self._verify_cursor(name, int(record.label))
             groups_1d.setdefault(name, []).append(record)
         for record in two_d:
             name = self._mode_cursor_name("2d", record.mode_2d)
             self._row_cursors.setdefault(name, {})
-            self._verify_cursor(name, int(record.label))
+            if name != trusted_group:
+                self._verify_cursor(name, int(record.label))
             groups_2d.setdefault(name, []).append(record)
         for name, grouped in (*groups_1d.items(), *groups_2d.items()):
             grouped_labels = tuple(int(record.label) for record in grouped)
@@ -4166,7 +4381,7 @@ class NexusRecordWriter:
             new_labels = tuple(
                 label for label in grouped_labels if label not in cursor
             )
-            if new_labels and cursor and new_labels[0] <= max(cursor):
+            if name != trusted_group and new_labels and cursor and new_labels[0] <= max(cursor):
                 raise ValueError(
                     f"new labels for {name} must be strictly increasing "
                     "after its persisted cursor"
@@ -4189,12 +4404,16 @@ class NexusRecordWriter:
                         f"named modes require an established {top} primary group"
                     )
         for name, grouped in groups_1d.items():
+            if name == trusted_group:
+                continue
             validate_integrated_stack_write(
                 entry, frame_indices=[int(r.label) for r in grouped],
                 results_1d=[r.result_1d for r in grouped],
                 group_name_1d=name, allow_rebuild=False,
             )
         for name, grouped in groups_2d.items():
+            if name == trusted_group:
+                continue
             validate_integrated_stack_write(
                 entry, frame_indices=[int(r.label) for r in grouped],
                 results_2d=[r.result_2d for r in grouped],
@@ -4338,12 +4557,21 @@ class NexusRecordWriter:
         validation_complete = False
         try:
             with self._boundary():
-                prepared_thumbnails = self._validate_records(batch)
+                prepared_stack = self._prepare_prepared_stack_append(batch)
+                prepared_thumbnails = self._validate_records(
+                    batch,
+                    trusted_group=(
+                        None if prepared_stack is None else
+                        prepared_stack["authority"]["group_name"]
+                    ),
+                )
                 validation_complete = True
                 self._authorize_transaction_mutation()
                 labels_1d = [int(r.label) for r in primary_1d]
                 labels_2d = [int(r.label) for r in primary_2d]
-                if primary_1d and primary_2d and labels_1d == labels_2d:
+                if prepared_stack is not None:
+                    self._append_prepared_stack(prepared_stack)
+                elif primary_1d and primary_2d and labels_1d == labels_2d:
                     write_integrated_stack(
                         self._entry_group(), frame_indices=labels_1d,
                         results_1d=[r.result_1d for r in primary_1d],
@@ -4371,7 +4599,7 @@ class NexusRecordWriter:
                             compression=self.compression,
                             known_rows_2d=self._row_cursors["integrated_2d"],
                         )
-                if extra_1d or extra_2d:
+                if prepared_stack is None and (extra_1d or extra_2d):
                     write_integrated_stack(
                         self._entry_group(), frame_indices=[],
                         extra_modes_1d={
@@ -4406,6 +4634,8 @@ class NexusRecordWriter:
                             for mode in extra_2d
                         },
                     )
+                if prepared_stack is None and (one_d or two_d):
+                    self._capture_prepared_stack_authority(batch)
                 if primary_1d:
                     self._entry_group().attrs.setdefault(
                         "default", "integrated_1d",
@@ -4598,6 +4828,7 @@ class NexusRecordWriter:
         self._clear_dirty_evidence()
 
     def _close_handle(self) -> None:
+        self._prepared_stack_authority = None
         allow_unverified = self._pending_owner == "abort"
         binding = self._transaction_binding
         if self._h5 is not None and self._h5 is self._seeded_document:
@@ -4711,6 +4942,7 @@ class NexusRecordWriter:
 
     def _drop_mode_row(self, label: int, mode: ResultMode) -> None:
         """Remove one exact indexed result row without disturbing GI siblings."""
+        self._prepared_stack_authority = None
         label = int(label)
         if self._replacement_configuration is not None and mode.kind != self._replacement_configuration[0]: raise WriterStateError("replacement publication drop escaped its selected dimension")
         group_name = self._mode_cursor_name(mode.kind, mode.key)
