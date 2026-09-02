@@ -201,7 +201,7 @@ def test_overlay_footer_moves_anchor_without_mutating_accumulator() -> None:
         assert len(items) == 1
         assert items[0] is first_curve
         assert len(view.legend.items) == 1
-        assert all(item.opts["symbol"] == "o" for item in items)
+        assert all(item.opts["symbol"] is None for item in items)
         assert all(item.opts["pen"].widthF() == 1.4 for item in items)
         assert view.cursor_position is cursor
 
@@ -238,7 +238,7 @@ def test_overlay_footer_moves_anchor_without_mutating_accumulator() -> None:
         items = view.curve.listDataItems()
         assert len(items) == 1
         assert len(view.legend.items) == 1
-        assert all(item.opts["symbol"] == "o" for item in items)
+        assert all(item.opts["symbol"] is None for item in items)
         assert all(item.opts["pen"].widthF() == 1.4 for item in items)
         assert view.cursor_position is cursor
 
@@ -309,9 +309,12 @@ def test_single_compatible_update_reuses_curve_item(
         assert args[0] is expected.axis.values
         assert args[1] is expected.intensity
         assert kwargs == {"name": expected.title, "connect": "finite"}
+        assert item.opts["pen"] == installed_style["pen"]
         assert all(
-            item.opts[key] is value
-            for key, value in installed_style.items()
+            item.opts[key] is installed_style[key]
+            for key in (
+                "symbol", "symbolBrush", "symbolPen", "symbolSize",
+            )
         )
         x_values, y_values = item.getData()
         np.testing.assert_array_equal(x_values, expected.axis.values)
@@ -336,14 +339,130 @@ def test_single_compatible_update_reuses_curve_item(
             ),
             next_navigation,
         )
-        assert calls["clear"] == 1
-        assert calls["plot"] == 1
-        assert view.curve.listDataItems()[0] is not item
+        assert calls["clear"] == 0
+        assert calls["plot"] == 0
+        assert len(calls["set_data"]) == 1
+        assert view.curve.listDataItems()[0] is item
+        assert (
+            view.curve.getPlotItem().getAxis("bottom").labelText
+            == "2θ"
+        )
     finally:
         _dispose(view)
 
 
-def test_viewer_single_steady_scope_reuses_exact_curve_then_axis_rebuilds(
+def test_mode_switch_retains_trace_items_history_and_axis_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    overlay = make_shell_projection(
+        frame_count=5,
+        selected_index=4,
+        heavy_indices=(4,),
+        plot_mode="Overlay",
+    )
+    frames = overlay.navigation.frames
+    view = ScientificView()
+    try:
+        _reconcile(view, overlay.scientific, overlay.navigation)
+        retained = tuple(view.curve.listDataItems())
+        assert len(retained) == 5
+        calls = {"clear": 0, "plot": 0, "labels": []}
+        original_clear = view.curve.clear
+        original_plot = view.curve.plot
+        original_set_label = view.curve.setLabel
+
+        def counted_clear(*args, **kwargs):
+            calls["clear"] += 1
+            return original_clear(*args, **kwargs)
+
+        def counted_plot(*args, **kwargs):
+            calls["plot"] += 1
+            return original_plot(*args, **kwargs)
+
+        def counted_set_label(*args, **kwargs):
+            calls["labels"].append((args, kwargs))
+            return original_set_label(*args, **kwargs)
+
+        monkeypatch.setattr(view.curve, "clear", counted_clear)
+        monkeypatch.setattr(view.curve, "plot", counted_plot)
+        monkeypatch.setattr(view.curve, "setLabel", counted_set_label)
+
+        single_navigation = FrameNavigationProjection(
+            frames,
+            frames[-1],
+            (frames[-1],),
+        )
+        single = replace(
+            overlay.scientific,
+            plot_mode="Single",
+            traces=(overlay.scientific.traces[-1],),
+        )
+        _reconcile(view, single, single_navigation)
+
+        assert view.curve.listDataItems() == [retained[-1]]
+        assert len(view._curve_items_by_key) == len(frames)
+        assert calls == {"clear": 0, "plot": 0, "labels": []}
+
+        # A complete returning projection remounts the exact existing
+        # PlotDataItems rather than clearing and recreating them.
+        returning = replace(overlay.scientific, plot_mode="Overlay")
+        _reconcile(view, returning, overlay.navigation)
+
+        assert tuple(view.curve.listDataItems()) == retained
+        assert len(view.legend.items) == len(retained)
+        assert calls == {"clear": 0, "plot": 0, "labels": []}
+    finally:
+        _dispose(view)
+
+
+def test_curve_axis_labels_update_only_when_semantics_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    projection = make_shell_projection(plot_mode="Overlay")
+    view = ScientificView()
+    try:
+        _reconcile(view, projection.scientific, projection.navigation)
+        calls = []
+        original = view.curve.setLabel
+
+        def counted(*args, **kwargs):
+            calls.append((args, kwargs))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(view.curve, "setLabel", counted)
+        _reconcile(view, projection.scientific, projection.navigation)
+        assert calls == []
+
+        normalized = replace(
+            projection.scientific,
+            norm_channel="I0",
+        )
+        _reconcile(view, normalized, projection.navigation)
+        assert [args[0] for args, _kwargs in calls] == ["left"]
+
+        calls.clear()
+        axis = replace(
+            projection.scientific.traces[0].axis,
+            label="2theta",
+            unit="2th_deg",
+        )
+        changed_axis = replace(
+            normalized,
+            plot_axis="2theta",
+            traces=tuple(
+                replace(trace, axis=axis)
+                for trace in normalized.traces
+            ),
+        )
+        _reconcile(view, changed_axis, projection.navigation)
+        assert [args[0] for args, _kwargs in calls] == ["bottom"]
+    finally:
+        _dispose(view)
+
+
+def test_viewer_single_steady_scope_reuses_exact_curve_through_axis_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -429,9 +548,12 @@ def test_viewer_single_steady_scope_reuses_exact_curve_then_axis_rebuilds(
             next_navigation,
         )
 
-        assert len(clear_calls) == 1
-        assert len(plot_calls) == 2
-        assert view.curve.listDataItems()[0] is not item
+        assert clear_calls == []
+        assert len(plot_calls) == 1
+        # Only the axis presentation changed; the exact numeric arrays stay
+        # installed on the retained item.
+        assert len(set_data_calls) == 1
+        assert view.curve.listDataItems()[0] is item
         assert view.trace_history_projections == (changed_trace,)
         assert view._trace_history_keys == (frames[1],)
     finally:

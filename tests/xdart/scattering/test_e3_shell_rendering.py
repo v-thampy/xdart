@@ -1101,21 +1101,30 @@ def test_waterfall_to_curve_switch_waits_for_replacement_curve(
         shell.apply_state(state)
         view = shell.scientific
         assert view.bottom_stack.currentWidget() is view.waterfall
-        active_during_clear = []
+        active_during_plot = []
+        clear_calls = []
         clear_curve = view.curve.clear
+        plot_curve = view.curve.plot
 
         def clear_replacement_curve():
-            active_during_clear.append(view.bottom_stack.currentWidget())
+            clear_calls.append(view.bottom_stack.currentWidget())
             return clear_curve()
 
+        def plot_replacement_curve(*args, **kwargs):
+            active_during_plot.append(view.bottom_stack.currentWidget())
+            return plot_curve(*args, **kwargs)
+
         monkeypatch.setattr(view.curve, "clear", clear_replacement_curve)
+        monkeypatch.setattr(view.curve, "plot", plot_replacement_curve)
         shell.apply_state(replace(
             state,
             revision=state.revision + 1,
             scientific=replace(state.scientific, plot_mode="Overlay"),
         ))
 
-        assert active_during_clear == [view.waterfall]
+        assert clear_calls == []
+        assert active_during_plot
+        assert all(active is view.waterfall for active in active_during_plot)
         assert view.bottom_stack.currentWidget() is view.curve
         assert len(view.curve.listDataItems()) == len(state.scientific.traces)
     finally:

@@ -462,6 +462,14 @@ def test_3621_runtime_projection_is_two_phase_and_prefix_delta_only(
 
     requested.clear()
     controller.project_navigation(
+        preferences=replace(preferences, plot_mode="Waterfall"),
+        processing_mode="Int 2D",
+        live_update=True,
+    )
+    assert requested == [appended.appended, appended.appended]
+
+    requested.clear()
+    controller.project_navigation(
         preferences=replace(preferences, plot_mode="Average"),
         processing_mode="Int 2D",
         live_update=True,
@@ -469,8 +477,8 @@ def test_3621_runtime_projection_is_two_phase_and_prefix_delta_only(
     assert tuple(requested[:-1]) == target
     assert requested[-1] is target[-1]
 
-    # Re-entering an accumulating mode cannot reuse the ledger of the view
-    # that Average just replaced.
+    # Non-accumulating modes retain their complete-projection API contract;
+    # re-entry therefore reseeds the selected domain.
     requested.clear()
     controller.project_navigation(
         preferences=preferences,

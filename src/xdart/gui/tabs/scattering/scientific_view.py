@@ -244,6 +244,14 @@ class ScientificView(QtWidgets.QFrame):
             tuple[object, ...], TraceProjection
         ] = {}
         self._rendered_trace_keys: tuple[tuple[object, ...], ...] = ()
+        self._curve_mounted_keys: tuple[tuple[object, ...], ...] = ()
+        self._curve_items_by_key: dict[tuple[object, ...], object] = {}
+        self._curve_item_contracts: dict[
+            tuple[object, ...], tuple[object, ...]
+        ] = {}
+        self._rendered_axis_labels: tuple[
+            str, str | None, str
+        ] | None = None
         self._rendered_plot_mode = ""
         self._rendered_plot_options: ScientificPlotOptions | None = None
         self._rendered_overlay_step: float | None = None
@@ -489,6 +497,9 @@ class ScientificView(QtWidgets.QFrame):
             else:
                 self.curve.clear(); self.waterfall.clear(); self._trace_history_by_identity.clear(); self._pinned_trace_by_id.clear()
                 self._rendered_trace_keys = self._trace_history_keys = self._waterfall_source_keys = ()
+                self._curve_mounted_keys = ()
+                self._curve_items_by_key.clear(); self._curve_item_contracts.clear()
+                self._rendered_axis_labels = None
                 self._trace_row_count = 0
                 self._rendered_browse_science_contract = None
             self._rendered_background_key = self._expected_background_key = None
@@ -1106,6 +1117,8 @@ class ScientificView(QtWidgets.QFrame):
             ("_rendered_detector_source", "none"),
             ("_selected_keys", ()),
             ("_trace_selection_keys", ()), ("_trace_history_keys", ()), ("_rendered_trace_keys", ()),
+            ("_curve_mounted_keys", ()), ("_curve_items_by_key", {}),
+            ("_curve_item_contracts", {}), ("_rendered_axis_labels", None),
             ("_trace_row_count", 0),
             ("_waterfall_y_values", ()), ("_waterfall_source_keys", ()), ("_label_indices", {}),
             ("_heavy_available", frozenset()), ("_trace_history_scope", None), ("_pinned_trace_scope", None),
@@ -1384,6 +1397,17 @@ class ScientificView(QtWidgets.QFrame):
         self._rendered_trace_keys = tuple(
             rekey(key) for key in self._rendered_trace_keys
         )
+        self._curve_mounted_keys = tuple(
+            rekey(key) for key in self._curve_mounted_keys
+        )
+        self._curve_items_by_key = {
+            rekey(key): item
+            for key, item in self._curve_items_by_key.items()
+        }
+        self._curve_item_contracts = {
+            rekey(key): value
+            for key, value in self._curve_item_contracts.items()
+        }
         self._waterfall_source_keys = tuple(
             rekey(key) for key in self._waterfall_source_keys
         )
@@ -1493,6 +1517,8 @@ class ScientificView(QtWidgets.QFrame):
         axis = current_traces[0].axis
         label, unit = _axis_presentation(axis.label, axis.unit)
         active_plot.setLabel("bottom", label, units=unit)
+        if active_plot is self.curve:
+            self._rendered_axis_labels = None
         del blocker
         return self.plot_axis.currentData() == plot_choice
 
@@ -1622,7 +1648,11 @@ class ScientificView(QtWidgets.QFrame):
         if state.plot_mode in {"Average", "Sum"}:
             source_keys = keys
             traces = aggregate_traces(traces, state.plot_mode)
-            keys = (("aggregate", state.plot_mode, *source_keys),)
+            keys = (
+                (("aggregate", state.plot_mode, *source_keys),)
+                if traces
+                else ()
+            )
         axis_keys = {
             self._axis_key(trace.axis)
             for trace in traces
@@ -1698,95 +1728,30 @@ class ScientificView(QtWidgets.QFrame):
             if stacked_selection
             else 0.0
         )
-        incremental = (
-            state.plot_mode in {"Overlay", "Waterfall"}
-            and state.plot_mode == self._rendered_plot_mode
-            and state.plot_options == self._rendered_plot_options
-            and self._rendered_overlay_step == overlay_step
-            and len(keys) >= len(self._rendered_trace_keys)
-            and all(
-                key == self._rendered_trace_keys[index]
-                for index, key in enumerate(self._rendered_trace_keys)
-            )
+        self._reconcile_curve_items(
+            keys,
+            traces,
+            overlay_step=(overlay_step if stacked_selection else 0.0),
+            allow_single_rebind=(
+                state.plot_mode == "Single"
+                and state.plot_options == self._rendered_plot_options
+                and self._rendered_trace_axis_key == prior_trace_axis_key
+                and not state.share_axis
+                and self.bottom_stack.currentWidget() is self.curve
+            ),
         )
-        existing_items = tuple(self.curve.listDataItems())
-        if incremental and len(existing_items) != len(
-            self._rendered_trace_keys
-        ):
-            incremental = False
-        reuse_single = (
-            not incremental
-            and state.plot_mode == "Single"
-            and len(keys) == 1
-            and keys[0][0] == "live"
-            and len(existing_items) == 1
-            and len(self._rendered_trace_keys) == 1
-            and self._rendered_plot_mode == "Single"
-            and state.plot_options == self._rendered_plot_options
-            and self._rendered_trace_axis_key == prior_trace_axis_key
-            and not state.share_axis
-            and self.bottom_stack.currentWidget() is self.curve
-        )
-        start = len(self._rendered_trace_keys) if incremental else 0
-        if reuse_single:
-            trace = traces[0]
-            title = trace.title or str(trace.frame.local_frame_label)
-            item = existing_items[0]
-            item.setData(
-                trace.axis.values,
-                trace.intensity,
-                name=title,
-                connect="finite",
-            )
-            label = self.legend.getLabel(item)
-            if label is not None:
-                label.setText(title)
-            start = 1
-        elif not incremental:
-            self.curve.clear()
-            legend = self.curve.getPlotItem().legend
-            self.legend = (
-                self.curve.addLegend()
-                if legend is None
-                else legend
-            )
-        for index, trace in enumerate(traces[start:], start):
-            y_values = _offset_intensity(
-                trace.intensity,
-                index,
-                (
-                    overlay_step
-                    if stacked_selection
-                    else 0.0
-                ),
-            )
-            color = _TRACE_COLORS[index % len(_TRACE_COLORS)]
-            self.curve.plot(
-                trace.axis.values,
-                y_values,
-                name=trace.title or str(trace.frame.local_frame_label),
-                pen=pg.mkPen(
-                    color=color,
-                    width=1.4,
-                    style=QtCore.Qt.PenStyle.SolidLine,
-                ),
-                symbol="o",
-                symbolBrush=color,
-                symbolPen=color,
-                symbolSize=4,
-                connect="finite",
-            )
         if traces:
             axis = traces[0].axis
-            label, unit = _axis_presentation(axis.label, axis.unit)
-            self.curve.setLabel(
-                "bottom",
-                label,
-                units=unit,
+            bottom_label, bottom_unit = _axis_presentation(
+                axis.label, axis.unit
             )
         else:
-            self.curve.setLabel("bottom", "", units="")
-        self.curve.setLabel("left", f"{intensity} (a.u.)")
+            bottom_label, bottom_unit = "", ""
+        self._update_curve_axis_labels(
+            bottom_label,
+            bottom_unit,
+            f"{intensity} (a.u.)",
+        )
         # Keep an accepted waterfall visible until the replacement curve is
         # fully populated; changing the stack first exposes an empty/stale
         # curve during the synchronous rebuild.
@@ -1802,6 +1767,157 @@ class ScientificView(QtWidgets.QFrame):
             else None
         )
 
+    def _reconcile_curve_items(
+        self,
+        keys: tuple[tuple[object, ...], ...],
+        traces: tuple[TraceProjection, ...],
+        *,
+        overlay_step: float,
+        allow_single_rebind: bool,
+    ) -> None:
+        """Diff one curve presentation without recreating retained items."""
+
+        if len(keys) != len(traces) or len(set(keys)) != len(keys):
+            raise ValueError("curve rows do not have unique presentation keys")
+        mounted = tuple(self.curve.listDataItems())
+        expected_mounted = tuple(
+            self._curve_items_by_key.get(key)
+            for key in self._curve_mounted_keys
+        )
+        if (
+            len(expected_mounted) != len(mounted)
+            or any(
+                expected is not actual
+                for expected, actual in zip(
+                    expected_mounted, mounted, strict=True
+                )
+            )
+        ):
+            self.curve.clear()
+            self._curve_mounted_keys = ()
+            self._curve_items_by_key.clear()
+            self._curve_item_contracts.clear()
+            self._rendered_axis_labels = None
+            mounted = ()
+
+        if (
+            allow_single_rebind
+            and len(keys) == 1
+            and keys[0][0] == "live"
+            and keys[0] not in self._curve_items_by_key
+            and len(self._curve_mounted_keys) == 1
+        ):
+            prior_key = self._curve_mounted_keys[0]
+            item = self._curve_items_by_key.pop(prior_key)
+            self._curve_item_contracts.pop(prior_key, None)
+            self._curve_items_by_key[keys[0]] = item
+
+        desired_items = []
+        for index, (key, trace) in enumerate(
+            zip(keys, traces, strict=True)
+        ):
+            title = trace.title or str(trace.frame.local_frame_label)
+            offset = 0.0 if index == 0 else index * overlay_step
+            data_contract = (
+                id(trace.axis.values),
+                id(trace.intensity),
+                offset,
+                title,
+            )
+            style_contract = _TRACE_COLORS[index % len(_TRACE_COLORS)]
+            contract = (data_contract, style_contract)
+            y_values = _offset_intensity(
+                trace.intensity,
+                index,
+                overlay_step,
+            )
+            item = self._curve_items_by_key.get(key)
+            prior_contract = self._curve_item_contracts.get(key)
+            if item is None:
+                pen = pg.mkPen(
+                    color=style_contract,
+                    width=1.4,
+                    style=QtCore.Qt.PenStyle.SolidLine,
+                )
+                item = self.curve.plot(
+                    trace.axis.values,
+                    y_values,
+                    name=title,
+                    pen=pen,
+                    connect="finite",
+                )
+                self._curve_items_by_key[key] = item
+            else:
+                if (
+                    prior_contract is None
+                    or prior_contract[0] != data_contract
+                ):
+                    item.setData(
+                        trace.axis.values,
+                        y_values,
+                        name=title,
+                        connect="finite",
+                    )
+                if (
+                    prior_contract is None
+                    or prior_contract[1] != style_contract
+                ):
+                    item.setPen(
+                        pg.mkPen(
+                            color=style_contract,
+                            width=1.4,
+                            style=QtCore.Qt.PenStyle.SolidLine,
+                        )
+                    )
+                if (
+                    prior_contract is None
+                    or prior_contract[0][-1] != title
+                ):
+                    label = self.legend.getLabel(item)
+                    if label is not None:
+                        label.setText(title)
+            item.setVisible(True)
+            self._curve_item_contracts[key] = contract
+            desired_items.append(item)
+
+        desired = tuple(desired_items)
+        current = tuple(self.curve.listDataItems())
+        if current != desired:
+            for item in current:
+                self.curve.removeItem(item)
+            for item in desired:
+                self.curve.addItem(item)
+        self._curve_mounted_keys = keys
+
+        desired_keys = set(keys)
+        for key in tuple(self._curve_items_by_key):
+            if (
+                len(self._curve_items_by_key)
+                <= _MAX_RETAINED_CURVE_ITEMS
+                or key in desired_keys
+            ):
+                continue
+            self._curve_items_by_key.pop(key, None)
+            self._curve_item_contracts.pop(key, None)
+
+    def _update_curve_axis_labels(
+        self,
+        bottom_label: str,
+        bottom_unit: str | None,
+        left_label: str,
+    ) -> None:
+        labels = (bottom_label, bottom_unit, left_label)
+        prior = self._rendered_axis_labels
+        if prior is None or prior[:2] != labels[:2]:
+            self.curve.setLabel(
+                "bottom",
+                bottom_label,
+                units=bottom_unit,
+            )
+        if prior is None or prior[2] != left_label:
+            self.curve.setLabel("left", left_label)
+        self._rendered_axis_labels = labels
+
     def _merge_trace_history(
         self,
         state: ScientificProjection,
@@ -1810,7 +1926,9 @@ class ScientificView(QtWidgets.QFrame):
         """Merge exact selected identities into detached 1-D history."""
 
         scope = (
-            state.plot_mode,
+            # Plot mode changes only the presentation of these numeric trace
+            # projections.  Keep the detached history warm across
+            # Single/Overlay/Average/Sum switches.
             state.processing_mode,
             state.plot_axis,
             state.slice_enabled,
@@ -2636,6 +2754,7 @@ _TRACE_COLORS = (
     (188, 189, 34),
     (23, 190, 207),
 )
+_MAX_RETAINED_CURVE_ITEMS = 32
 
 
 __all__ = ["ScientificView"]

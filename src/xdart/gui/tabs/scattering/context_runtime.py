@@ -1025,9 +1025,9 @@ class _ContextRuntime:
         else:
             if preferences is not None:
                 # Leaving an accumulating mode invalidates its projection
-                # ledger.  Re-entry must seed the full exact selection rather
-                # than mistake an older Overlay/Waterfall prefix for the view
-                # that was just replaced by Single/Sum/Average.
+                # ledger.  Non-view consumers still require a complete
+                # Single/Average/Sum projection; changing that API to a delta
+                # would need a separate projection-owner redesign.
                 self._reset_trace_projection()
             else:
                 self._pending_trace_projection = None
@@ -1668,7 +1668,8 @@ class _ContextRuntime:
             id(identity),
             None if selection is None else selection.kind,
             None if selection is None else selection.context_token,
-            getattr(preferences, "plot_mode", None),
+            # Plot mode is a presentation choice; the per-frame scientific
+            # projection is the same in Single, Overlay, Average, and Sum.
             processing_mode,
             getattr(preferences, "plot_axis", None),
             getattr(preferences, "share_axis", None),
