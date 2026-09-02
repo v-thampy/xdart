@@ -37,6 +37,7 @@ from .browse_values import (
 )
 from .display_values import DisplayFrameKey
 from .events import RunIdentity, detached_exception_strings
+from .operation_values import OperationContextStamp, OperationIdentity
 
 
 _LOG = logging.getLogger(__name__)
@@ -119,6 +120,110 @@ class ReintegrateReloadDirective:
             )
         ):
             raise ValueError("Reintegrate reload directive is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ReintegrateSuccessorDirective:
+    """One exact predecessor-to-immutable-successor adoption authority."""
+
+    predecessor: LoadedBrowseCapture
+    successor_path: str
+    entry: str
+    committed_labels: tuple[int, ...]
+    terminal_commit_identity: StreamTerminal
+    version_identity: str
+    publication_identity: str
+    result_operation_identity: str
+    commit_identity: str
+    owner_identity: OperationIdentity
+    context_stamp: OperationContextStamp
+
+    def __post_init__(self) -> None:
+        hashes = (
+            self.version_identity,
+            self.publication_identity,
+            self.result_operation_identity,
+            self.commit_identity,
+        )
+        if (
+            type(self.predecessor) is not LoadedBrowseCapture
+            or type(self.successor_path) is not str
+            or not self.successor_path
+            or os.path.normcase(os.path.abspath(os.path.expanduser(
+                self.successor_path
+            ))) != self.successor_path
+            or self.successor_path == self.predecessor.target
+            or type(self.entry) is not str
+            or self.entry != self.predecessor.entry
+            or type(self.committed_labels) is not tuple
+            or not self.committed_labels
+            or self.committed_labels
+            != tuple(sorted(set(self.committed_labels)))
+            or any(
+                type(label) is not int or label < 0
+                for label in self.committed_labels
+            )
+            or not set(self.committed_labels).issubset(
+                self.predecessor.labels
+            )
+            or type(self.terminal_commit_identity) is not StreamTerminal
+            or stream_terminal_object_revision(
+                self.terminal_commit_identity
+            ) is None
+            or self.terminal_commit_identity.target != self.successor_path
+            or any(
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef"
+                       for character in value)
+                for value in hashes
+            )
+            or type(self.owner_identity) is not OperationIdentity
+            or type(self.context_stamp) is not OperationContextStamp
+            or self.context_stamp.context_token
+            != self.predecessor.selection.context_token
+            or self.context_stamp.display_generation
+            != self.predecessor.selection.display_generation
+        ):
+            raise ValueError("Reintegrate successor directive is invalid")
+        self.context_stamp.__post_init__()
+
+
+class ReintegrateSuccessorPhase(Enum):
+    """Exact GUI custody phase for one immutable successor load."""
+
+    PENDING = "pending"
+    LOADING = "loading"
+    CANCELLING = "cancelling"
+
+
+@dataclass(frozen=True, slots=True)
+class ReintegrateSuccessorAdoption:
+    """Exact successor directive, load request, and cancellation custody."""
+
+    directive: ReintegrateSuccessorDirective
+    phase: ReintegrateSuccessorPhase = ReintegrateSuccessorPhase.PENDING
+    request: BrowseLoadRequest | None = None
+
+    def __post_init__(self) -> None:
+        directive = self.directive
+        request = self.request
+        if (
+            type(directive) is not ReintegrateSuccessorDirective
+            or type(self.phase) is not ReintegrateSuccessorPhase
+            or (self.phase is ReintegrateSuccessorPhase.PENDING)
+            != (request is None)
+            or request is not None
+            and (
+                type(request) is not BrowseLoadRequest
+                or request.source_path != directive.successor_path
+                or request.terminal_commit_identity
+                is not directive.terminal_commit_identity
+                or request.source_root
+                != directive.predecessor.request.source_root
+            )
+        ):
+            raise ValueError("Reintegrate successor adoption is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,6 +540,7 @@ class ProcessedBrowserOwner:
         self._transient_frame: DisplayFrameKey | None = None
         self._transient_clear_token: int | None = None
         self._reload: BrowserReloadDirective | None = None
+        self._reintegrate_successor: ReintegrateSuccessorAdoption | None = None
         self._terminal_handoff: TerminalBrowseHandoff | None = None
         self._terminal_presentation: TerminalBrowsePresentation | None = None
         self._terminal_rebind: TerminalRebindAuthorization | None = None
@@ -507,8 +613,14 @@ class ProcessedBrowserOwner:
         return directive if type(directive) is AverageReloadDirective else None
 
     @property
+    def pending_reintegrate_successor(
+        self,
+    ) -> ReintegrateSuccessorAdoption | None:
+        return self._reintegrate_successor
+
+    @property
     def busy(self) -> bool:
-        return self._reload is not None
+        return self._reload is not None or self._reintegrate_successor is not None
 
     @property
     def polling_needed(self) -> bool:
@@ -862,6 +974,8 @@ class ProcessedBrowserOwner:
                 "seal=%s records=%d mode=%s | "
                 "worker=%.3fs initial-seal=%.3fs scan-open=%.3fs "
                 "record-iteration=%.3fs presentation-read=%.3fs "
+                "prepared-capsule=%.3fs prepared-bytes=%d "
+                "prepared-1d=%s prepared-2d=%s "
                 "final-seal=%.3fs context-build=%.3fs | "
                 "gui-total=%.3fs poll/adopt=%.3fs(n=%d) "
                 "settle=%.3fs presentation=%.3fs",
@@ -876,6 +990,10 @@ class ProcessedBrowserOwner:
                 worker.scan_open_s,
                 worker.record_iteration_s,
                 worker.presentation_read_s,
+                worker.prepared_capsule_s,
+                worker.prepared_bundle_bytes,
+                worker.prepared_1d_status,
+                worker.prepared_2d_status,
                 worker.final_seal_s,
                 worker.context_build_s,
                 max(0.0, ended - perf.started_at),
@@ -926,6 +1044,7 @@ class ProcessedBrowserOwner:
             or self._closed
             or type(directive)
             not in {ReintegrateReloadDirective, AverageReloadDirective}
+            or self._reintegrate_successor is not None
         ):
             raise RuntimeError("processed Browser cannot adopt reload")
         current = self._reload
@@ -941,6 +1060,73 @@ class ProcessedBrowserOwner:
         if self._reload is not directive:
             return False
         self._reload = None
+        return True
+
+    def adopt_reintegrate_successor(
+        self, directive: ReintegrateSuccessorDirective,
+    ) -> ReintegrateSuccessorAdoption:
+        if (
+            self._closing
+            or self._closed
+            or type(directive) is not ReintegrateSuccessorDirective
+            or self._reload is not None
+        ):
+            raise RuntimeError("processed Browser cannot adopt successor")
+        current = self._reintegrate_successor
+        if current is not None:
+            if current.directive is directive:
+                return current
+            raise RuntimeError("processed Browser already owns a successor")
+        adoption = ReintegrateSuccessorAdoption(directive)
+        self._reintegrate_successor = adoption
+        return adoption
+
+    def begin_reintegrate_successor_load(
+        self,
+        adoption: ReintegrateSuccessorAdoption,
+        request: BrowseLoadRequest,
+    ) -> ReintegrateSuccessorAdoption:
+        if (
+            self._reintegrate_successor is not adoption
+            or adoption.request is not None
+        ):
+            raise RuntimeError("Reintegrate successor adoption is not current")
+        updated = ReintegrateSuccessorAdoption(
+            adoption.directive,
+            ReintegrateSuccessorPhase.LOADING,
+            request,
+        )
+        self._reintegrate_successor = updated
+        return updated
+
+    def mark_reintegrate_successor_cancelling(
+        self,
+        adoption: ReintegrateSuccessorAdoption,
+    ) -> ReintegrateSuccessorAdoption:
+        current = self._reintegrate_successor
+        if current is not adoption:
+            raise RuntimeError("Reintegrate successor adoption is not current")
+        if adoption.phase is ReintegrateSuccessorPhase.CANCELLING:
+            return adoption
+        if (
+            adoption.phase is not ReintegrateSuccessorPhase.LOADING
+            or adoption.request is None
+        ):
+            raise RuntimeError("Reintegrate successor load is not cancellable")
+        updated = ReintegrateSuccessorAdoption(
+            adoption.directive,
+            ReintegrateSuccessorPhase.CANCELLING,
+            adoption.request,
+        )
+        self._reintegrate_successor = updated
+        return updated
+
+    def retire_reintegrate_successor(
+        self, adoption: ReintegrateSuccessorAdoption,
+    ) -> bool:
+        if self._reintegrate_successor is not adoption:
+            return False
+        self._reintegrate_successor = None
         return True
 
     def set_directory(
@@ -1181,6 +1367,7 @@ class ProcessedBrowserOwner:
             self._closing = True
             self._terminal_timing_start = None
             self._reload = None
+            self._reintegrate_successor = None
             self.retire_terminal(force=True)
             self._queued = None
             self._token += 1
@@ -1221,6 +1408,9 @@ __all__ = [
     "ProcessedBrowserProjection",
     "ProcessedBrowserTransition",
     "ReintegrateReloadDirective",
+    "ReintegrateSuccessorAdoption",
+    "ReintegrateSuccessorDirective",
+    "ReintegrateSuccessorPhase",
     "TerminalBrowseHandoff",
     "TerminalBrowsePaintReceipt",
     "TerminalBrowsePaintRequest",

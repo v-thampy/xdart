@@ -2162,8 +2162,6 @@ def _preflight_legacy_plan(plan, token):
         or inspected.mask_spec != expected_mask
         or _legacy._plain(inspected.persisted_shared_science)
         != _legacy._plain(plan.requested_shared_science)
-        or _legacy._plain(inspected.persisted_selected_plan)
-        != _legacy._plain(plan.selected_plan)
         or evidence != _legacy._plain(plan.source_graph_evidence)
         or plan.gi_bootstrap_incidence is not None
         and inspected.gi_values.get(plan.labels[0])

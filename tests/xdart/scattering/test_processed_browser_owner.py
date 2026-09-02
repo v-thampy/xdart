@@ -18,12 +18,18 @@ from xdart.gui.tabs.scattering.browse_values import (
 )
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
 from xdart.gui.tabs.scattering.events import RunIdentity
+from xdart.gui.tabs.scattering.operation_values import (
+    OperationContextStamp,
+    OperationIdentity,
+)
 from xdart.gui.tabs.scattering.processed_browser import (
     AverageReloadDirective,
     BrowserCatalogWake,
     BrowserRefreshEffect,
     ProcessedBrowserOwner,
     ReintegrateReloadDirective,
+    ReintegrateSuccessorDirective,
+    ReintegrateSuccessorPhase,
     TerminalBrowsePaintReceipt,
     TerminalPaintMode,
     TerminalRebindAuthorization,
@@ -60,7 +66,13 @@ def _loaded_capture(
     size: int = 17,
     digest: str = "d" * 64,
 ) -> LoadedBrowseCapture:
+    from xrd_tools.reduction import prepare_reintegrate_bundle
+
     context = object.__new__(BrowseContext)
+    offer = prepare_reintegrate_bundle(
+        None, entry="entry", labels=(0, 1),
+    )
+    object.__setattr__(context, "prepared_reintegrate_offer", offer)
     selection = DisplaySelection(
         ContextKind.BROWSE,
         HydrationOwner(request.token, "scan", request.source_path, 1),
@@ -74,6 +86,7 @@ def _loaded_capture(
         "entry",
         TargetSnapshot(True, size, 4, 2, 3, digest),
         (0, 1),
+        offer,
     )
 
 
@@ -375,6 +388,50 @@ def test_reload_custody_is_one_exact_union_slot() -> None:
         with pytest.raises(RuntimeError, match="already owns"):
             owner.adopt_reload(average)
         assert owner.retire_reload(reintegrate)
+
+        predecessor_request = BrowseLoadRequest(
+            "predecessor", 2, "/processed/source.nexus", source_root="/project"
+        )
+        predecessor = _loaded_capture(predecessor_request)
+        successor_seal = StreamTerminal(
+            target, 17, "e" * 64, 2, 2, 3, 4, 5
+        )
+        directive = ReintegrateSuccessorDirective(
+            predecessor,
+            target,
+            predecessor.entry,
+            predecessor.labels,
+            successor_seal,
+            "a" * 64,
+            "b" * 64,
+            "c" * 64,
+            "d" * 64,
+            OperationIdentity(9),
+            OperationContextStamp(
+                3,
+                predecessor.selection.context_token,
+                predecessor.selection.display_generation,
+            ),
+        )
+        pending = owner.adopt_reintegrate_successor(directive)
+        assert pending.phase is ReintegrateSuccessorPhase.PENDING
+        assert owner.busy and owner.preserve_science
+        with pytest.raises(RuntimeError, match="cannot adopt reload"):
+            owner.adopt_reload(average)
+        successor_request = BrowseLoadRequest(
+            "successor", 3, target, successor_seal, source_root="/project"
+        )
+        loading = owner.begin_reintegrate_successor_load(
+            pending, successor_request,
+        )
+        assert loading.phase is ReintegrateSuccessorPhase.LOADING
+        assert not owner.retire_reintegrate_successor(pending)
+        cancelling = owner.mark_reintegrate_successor_cancelling(loading)
+        assert cancelling.phase is ReintegrateSuccessorPhase.CANCELLING
+        assert owner.busy and owner.polling_needed and owner.preserve_science
+        assert owner.mark_reintegrate_successor_cancelling(cancelling) is cancelling
+        assert owner.retire_reintegrate_successor(cancelling)
+
         assert owner.adopt_reload(average) is average
         assert owner.pending_average_reload is average
         assert average.source_root == "/project"

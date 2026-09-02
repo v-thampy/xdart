@@ -45,6 +45,10 @@ class BrowseLoadTiming:
     final_seal_s: float
     context_build_s: float
     worker_total_s: float
+    prepared_capsule_s: float = 0.0
+    prepared_bundle_bytes: int = 0
+    prepared_1d_status: str = "UNMEASURED"
+    prepared_2d_status: str = "UNMEASURED"
 
     def __post_init__(self) -> None:
         durations = (
@@ -55,6 +59,7 @@ class BrowseLoadTiming:
             self.final_seal_s,
             self.context_build_s,
             self.worker_total_s,
+            self.prepared_capsule_s,
         )
         if (
             type(self.canonical_path) is not str
@@ -62,6 +67,15 @@ class BrowseLoadTiming:
             or self.seal_mode not in {"terminal", "snapshot"}
             or type(self.record_count) is not int
             or self.record_count < 0
+            or type(self.prepared_bundle_bytes) is not int
+            or self.prepared_bundle_bytes < 0
+            or self.prepared_bundle_bytes > 48 * 1024 * 1024
+            or self.prepared_1d_status not in {
+                "READY", "MISS", "UNMEASURED",
+            }
+            or self.prepared_2d_status not in {
+                "READY", "MISS", "UNMEASURED",
+            }
             or not all(
                 type(value) is float
                 and math.isfinite(value)
@@ -117,6 +131,7 @@ class LoadedBrowseCapture:
     entry: str
     target_snapshot: TargetSnapshot
     labels: tuple[int, ...]
+    prepared_reintegrate_offer: object = None
 
     def __post_init__(self) -> None:
         valid = (
@@ -135,6 +150,9 @@ class LoadedBrowseCapture:
             and bool(self.labels)
             and self.labels == tuple(sorted(set(self.labels)))
             and all(type(label) is int and label >= 0 for label in self.labels)
+            and self.prepared_reintegrate_offer is not None
+            and self.context.prepared_reintegrate_offer
+            is self.prepared_reintegrate_offer
         )
         if not valid:
             raise ValueError("loaded Browse capture is invalid")
@@ -151,6 +169,8 @@ class LoadedBrowseCapture:
             and other.entry == self.entry
             and other.target_snapshot == self.target_snapshot
             and other.labels == self.labels
+            and other.prepared_reintegrate_offer
+            is self.prepared_reintegrate_offer
         )
 
 @dataclass(frozen=True, slots=True)

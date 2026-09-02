@@ -40,9 +40,9 @@ from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot
 from xrd_tools.reduction import (
     AverageFiniteCountsEvidence,
     AverageScanResult,
-    ReintegrateResult,
+    ReintegrateSuccessorResult,
 )
-from xrd_tools.reduction import reintegrate as reintegrate_core
+from xrd_tools.reduction import reintegrate_successor as successor_core
 from xrd_tools.session.run_configuration import RunIntent
 
 
@@ -53,10 +53,16 @@ def _seal(target: str, ordinal: int = 1) -> StreamTerminal:
 
 
 def _capture(target: str = "/detached/scan.nexus") -> LoadedBrowseCapture:
+    from xrd_tools.reduction import prepare_reintegrate_bundle
+
     request = BrowseLoadRequest(
         "capture-token", 1, target, source_root="/detached"
     )
     context = object.__new__(BrowseContext)
+    offer = prepare_reintegrate_bundle(
+        None, entry="entry", labels=(0, 1, 2),
+    )
+    object.__setattr__(context, "prepared_reintegrate_offer", offer)
     selection = DisplaySelection(
         ContextKind.BROWSE,
         HydrationOwner("capture-token", "scan", target, 1),
@@ -70,6 +76,7 @@ def _capture(target: str = "/detached/scan.nexus") -> LoadedBrowseCapture:
         "entry",
         TargetSnapshot(True, 17, 4, 2, 3, "f" * 64),
         (0, 1, 2),
+        offer,
     )
 
 
@@ -78,18 +85,40 @@ def _reintegrate_result(
     *,
     disposition: str = "COMMITTED",
     seal: StreamTerminal | None = None,
-) -> ReintegrateResult:
-    return reintegrate_core._value(
-        ReintegrateResult,
+    diagnostics: tuple[str, ...] = (),
+    hidden_orphan: str | None = None,
+) -> ReintegrateSuccessorResult:
+    output = capture.target.replace(".nexus", "-vnext.nexus")
+    if disposition in {"COMMITTED", "ALREADY_COMMITTED"} and seal is None:
+        seal = _seal(output)
+    committed = disposition in {"COMMITTED", "ALREADY_COMMITTED"}
+    return successor_core._value(
+        ReintegrateSuccessorResult,
         disposition,
+        capture.target,
+        output,
         capture.labels,
-        capture.labels if disposition == "COMMITTED" else (),
+        capture.labels if committed else (),
         (),
-        (),
+        diagnostics,
         "b" * 64,
         "a" * 64,
         "c" * 64,
-        seal,
+        "d" * 64,
+        "e" * 64 if committed else None,
+        "f" * 64 if committed else None,
+        seal if committed else None,
+        hidden_orphan,
+    )
+
+
+def _stamp(
+    capture: LoadedBrowseCapture, revision: int = 1,
+) -> OperationContextStamp:
+    return OperationContextStamp(
+        revision,
+        capture.selection.context_token,
+        capture.selection.display_generation,
     )
 
 
@@ -145,7 +174,7 @@ class _Slot:
     def current_identity(self) -> OperationIdentity | None:
         return self._identity
 
-    def begin_reintegrate(self, **kwargs):
+    def begin_reintegrate_successor(self, **kwargs):
         self.reintegrate_calls.append(kwargs)
         self._identity = self.next_identity
         return self.next_identity
@@ -211,16 +240,17 @@ def test_reintegrate_begin_transfers_exact_capture_without_reload_custody(
         capture,
         dimension="2d",
         preparation_values=preparation,
-        stamp=OperationContextStamp(3, "context", 4),
+        stamp=_stamp(capture, 3),
     ) is identity
     assert owner.reintegrate_identity is identity
     assert owner.reintegrate_capture is capture
     call = slot.reintegrate_calls[-1]
-    assert call["target"] == capture.target
+    assert call["source_artifact"] == capture.target
     assert call["entry"] == capture.entry
     assert call["expected_target_snapshot"] is capture.target_snapshot
     assert call["expected_labels"] is capture.labels
     assert call["source_root"] == capture.request.source_root
+    assert call["prepared_offer"] is capture.prepared_reintegrate_offer
     assert call["dimension"] == "2d"
     assert call["preparation_values"] is preparation
 
@@ -229,7 +259,7 @@ def test_reintegrate_begin_transfers_exact_capture_without_reload_custody(
         capture,
         dimension="1d",
         preparation_values=preparation,
-        stamp=OperationContextStamp(3),
+        stamp=_stamp(capture, 3),
     ) is None
     assert refused.reintegrate_state is None
     assert not refused.busy
@@ -246,7 +276,7 @@ def test_reintegrate_progress_transition_is_exact_monotonic_and_cancel_fenced(
         capture,
         dimension="1d",
         preparation_values={"api_version": 1},
-        stamp=OperationContextStamp(1),
+        stamp=_stamp(capture),
     ) is identity
 
     first = OperationProgress(identity, "integrate", 2, 5, 2)
@@ -295,7 +325,7 @@ def test_reintegrate_progress_transition_is_exact_monotonic_and_cancel_fenced(
     assert owner.reintegrate_state.progress is latest
 
 
-def test_reintegrate_terminal_and_lost_owner_always_require_full_reload() -> None:
+def test_reintegrate_terminal_adopts_successor_and_lost_owner_keeps_predecessor() -> None:
     capture = _capture()
     owner, slot = _owner_with_slot()
     identity = OperationIdentity(11)
@@ -304,9 +334,10 @@ def test_reintegrate_terminal_and_lost_owner_always_require_full_reload() -> Non
         capture,
         dimension="1d",
         preparation_values={"api_version": 1},
-        stamp=OperationContextStamp(1),
+        stamp=_stamp(capture),
     ) is identity
-    seal = _seal(capture.target)
+    successor = capture.target.replace(".nexus", "-vnext.nexus")
+    seal = _seal(successor)
     result = _reintegrate_result(capture, seal=seal)
     transition = owner.consume_reintegrate_update(OperationUpdate(
         identity,
@@ -314,10 +345,13 @@ def test_reintegrate_terminal_and_lost_owner_always_require_full_reload() -> Non
             identity, OperationTerminalStatus.RETURNED, payload=result
         ),
     ))
-    assert transition.effect is WorkspaceRefreshEffect.FULL
+    assert transition.effect is WorkspaceRefreshEffect.CONTROLS
     assert owner.reintegrate_state is None
-    assert transition.reintegrate_reload is not None
-    assert transition.reintegrate_reload.terminal_commit_identity is seal
+    assert transition.reintegrate_reload is None
+    assert transition.reintegrate_successor is not None
+    assert transition.reintegrate_successor.predecessor is capture
+    assert transition.reintegrate_successor.successor_path == successor
+    assert transition.reintegrate_successor.terminal_commit_identity is seal
     assert owner.reintegrate_state is None
 
     lost, lost_slot = _owner_with_slot()
@@ -327,14 +361,94 @@ def test_reintegrate_terminal_and_lost_owner_always_require_full_reload() -> Non
         capture,
         dimension="2d",
         preparation_values={"api_version": 1},
-        stamp=OperationContextStamp(1),
+        stamp=_stamp(capture),
     ) is lost_identity
     transition = lost.consume_lost_owner(lost_identity)
-    assert transition.effect is WorkspaceRefreshEffect.FULL
+    assert transition.effect is WorkspaceRefreshEffect.CONTROLS
     assert "before terminal publication" in transition.notice
     assert lost.reintegrate_state is None
-    assert transition.reintegrate_reload is not None
-    assert transition.reintegrate_reload.request is capture.request
+    assert transition.reintegrate_reload is None
+    assert transition.reintegrate_successor is None
+
+
+def test_reintegrate_stop_race_keeps_current_owner_but_abandonment_does_not() -> None:
+    capture = _capture()
+
+    stopped, stopped_slot = _owner_with_slot()
+    stopped_identity = OperationIdentity(13)
+    stopped_slot.next_identity = stopped_identity
+    assert stopped.begin_reintegrate(
+        capture,
+        dimension="1d",
+        preparation_values={"api_version": 1},
+        stamp=_stamp(capture),
+    ) is stopped_identity
+    assert stopped.cancel_reintegrate("1d")
+    committed = _reintegrate_result(capture)
+    transition = stopped.consume_reintegrate_update(OperationUpdate(
+        stopped_identity,
+        terminal=OperationTerminal(
+            stopped_identity,
+            OperationTerminalStatus.RETURNED,
+            payload=committed,
+        ),
+    ))
+    assert transition.reintegrate_successor is not None
+    assert transition.request_catalog
+
+    abandoned, abandoned_slot = _owner_with_slot()
+    abandoned_identity = OperationIdentity(14)
+    abandoned_slot.next_identity = abandoned_identity
+    assert abandoned.begin_reintegrate(
+        capture,
+        dimension="2d",
+        preparation_values={"api_version": 1},
+        stamp=_stamp(capture),
+    ) is abandoned_identity
+    assert abandoned.abandon_reintegrate(abandoned_identity)
+    assert abandoned.reintegrate_state.owner_abandoned
+    transition = abandoned.consume_reintegrate_update(OperationUpdate(
+        abandoned_identity,
+        terminal=OperationTerminal(
+            abandoned_identity,
+            OperationTerminalStatus.RETURNED,
+            payload=committed,
+        ),
+    ))
+    assert transition.reintegrate_successor is None
+    assert transition.request_catalog
+    assert "display owner changed" in transition.notice
+
+
+def test_reintegrate_surfaces_fallback_and_hidden_orphan_diagnostics() -> None:
+    capture = _capture()
+    owner, slot = _owner_with_slot()
+    identity = OperationIdentity(15)
+    slot.next_identity = identity
+    assert owner.begin_reintegrate(
+        capture,
+        dimension="1d",
+        preparation_values={"api_version": 1},
+        stamp=_stamp(capture),
+    ) is identity
+    hidden = "/detached/.xdart-orphan"
+    aborted = _reintegrate_result(
+        capture,
+        disposition="ABORTED",
+        diagnostics=("PREPARED_CAPSULE_MISS:SOURCE_TOPOLOGY_UNSUPPORTED",),
+        hidden_orphan=hidden,
+    )
+    transition = owner.consume_reintegrate_update(OperationUpdate(
+        identity,
+        terminal=OperationTerminal(
+            identity,
+            OperationTerminalStatus.RETURNED,
+            payload=aborted,
+        ),
+    ))
+    assert "PREPARED_CAPSULE_MISS:SOURCE_TOPOLOGY_UNSUPPORTED" in transition.notice
+    assert hidden in transition.notice
+    assert transition.reintegrate_successor is None
 
 
 def test_average_pending_retry_cancel_and_stamp_remain_exact() -> None:

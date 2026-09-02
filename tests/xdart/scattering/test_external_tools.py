@@ -65,6 +65,8 @@ def _status(registry: ExternalToolRegistry, tool: ExternalToolId, target=None):
 
 
 def _loaded_capture(path: Path) -> LoadedBrowseCapture:
+    from xrd_tools.reduction import prepare_reintegrate_bundle
+
     target = str(path.resolve())
     state = path.stat()
     request = BrowseLoadRequest(
@@ -72,6 +74,8 @@ def _loaded_capture(path: Path) -> LoadedBrowseCapture:
         source_root=str(path.parent.resolve()),
     )
     context = object.__new__(BrowseContext)
+    offer = prepare_reintegrate_bundle(None, entry="entry", labels=(1,))
+    object.__setattr__(context, "prepared_reintegrate_offer", offer)
     selection = DisplaySelection(
         ContextKind.BROWSE,
         HydrationOwner("external-viewer-capture", "scan", target, 1),
@@ -92,6 +96,7 @@ def _loaded_capture(path: Path) -> LoadedBrowseCapture:
             "f" * 64,
         ),
         (1,),
+        offer,
     )
 
 

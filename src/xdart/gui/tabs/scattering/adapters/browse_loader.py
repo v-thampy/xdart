@@ -465,6 +465,7 @@ class BrowseLoader:
             if context is not None and (
                 type(context.scalar_catalog) is not FrameScalarCatalog
                 or type(context.browse_1d_cache) is not Browse1DCache
+                or context.prepared_reintegrate_offer is None
             ):
                 return None
             return context
@@ -492,6 +493,7 @@ class BrowseLoader:
             if context is not None and (
                 type(context.scalar_catalog) is not FrameScalarCatalog
                 or type(context.browse_1d_cache) is not Browse1DCache
+                or context.prepared_reintegrate_offer is None
             ):
                 return None
             operation.context = None
@@ -874,7 +876,13 @@ class BrowseLoader:
             self._timing_now() if operation.perf_enabled else None
         )
         timing_fields: dict[str, object] | None = (
-            {"valid": True}
+            {
+                "valid": True,
+                "prepared_capsule_s": 0.0,
+                "prepared_bundle_bytes": 0,
+                "prepared_1d_status": "UNMEASURED",
+                "prepared_2d_status": "UNMEASURED",
+            }
             if operation.perf_enabled and worker_started is not None
             else None
         )
@@ -943,6 +951,10 @@ class BrowseLoader:
                         float(timing_fields["final_seal_s"]),
                         float(timing_fields["context_build_s"]),
                         max(0.0, ended - worker_started),
+                        float(timing_fields["prepared_capsule_s"]),
+                        int(timing_fields["prepared_bundle_bytes"]),
+                        str(timing_fields["prepared_1d_status"]),
+                        str(timing_fields["prepared_2d_status"]),
                     )
                 )
             except BaseException:
@@ -1071,6 +1083,94 @@ class BrowseLoader:
         stage_finish("presentation_read_s", started)
         if cancelled.is_set():
             return None
+        # Prepare the fixed dual-dimension, handle-free Reintegration offer on
+        # this Browse worker while the existing before/after target bracket is
+        # still open.  No array, HDF handle, writer, or GUI-owned plan escapes.
+        started = stage_start()
+        from xrd_tools.io.finite_artifact import capture_finite_source
+        from xrd_tools.reduction.reintegrate_prepared import (
+            MAX_PREPARED_BUNDLE_BYTES,
+            PreparedReintegrateBundle,
+            PreparedReintegrateOffer,
+            prepare_reintegrate_bundle,
+            prepared_bundle_mapping,
+        )
+        finite_source = capture_finite_source(path)
+        finite_snapshot = finite_source.snapshot
+        finite_target_snapshot = TargetSnapshot(
+            True,
+            finite_snapshot.size,
+            finite_snapshot.mtime_ns,
+            finite_snapshot.device,
+            finite_snapshot.inode,
+            finite_snapshot.digest,
+        )
+        same_object = (
+            finite_target_snapshot.exists == before.exists
+            and finite_target_snapshot.size == before.size
+            and finite_target_snapshot.mtime_ns == before.mtime_ns
+            and finite_target_snapshot.device == before.device
+            and finite_target_snapshot.inode == before.inode
+        )
+        # Snapshot Browse uses the same whole-file digest domain.  A sealed
+        # fast-writer terminal intentionally carries a bounded writer-evidence
+        # digest instead, so its object/stat identity is the admissible join;
+        # prepare_reintegrate_bundle revalidates the exact terminal itself.
+        if (
+            not same_object
+            or sealed_terminal is None
+            and finite_target_snapshot.digest != before.digest
+        ):
+            raise ValueError("processed browse target changed before preparation")
+        prepared_offer = prepare_reintegrate_bundle(
+            finite_source,
+            entry=target_entry,
+            labels=labels,
+            expected_terminal=sealed_terminal,
+            source_root=request.source_root,
+            cancel_token=cancelled,
+        )
+        if type(prepared_offer) is not PreparedReintegrateOffer:
+            raise TypeError("Browse preparation returned a foreign offer")
+        if prepared_offer.disposition == "READY":
+            bundle = prepared_offer.bundle
+            if type(bundle) is not PreparedReintegrateBundle:
+                raise TypeError("Browse preparation lost its exact bundle")
+            one_d_status = bundle.one_d.disposition
+            two_d_status = bundle.two_d.disposition
+            bundle_bytes = (
+                0
+                if _timing is None
+                else len(json.dumps(
+                    prepared_bundle_mapping(bundle),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8"))
+            )
+        elif (
+            prepared_offer.disposition == "MISS"
+            and prepared_offer.bundle is None
+            and prepared_offer.miss_code is not None
+        ):
+            one_d_status = two_d_status = "MISS"
+            bundle_bytes = 0
+        else:
+            raise TypeError("Browse preparation returned an invalid offer")
+        if one_d_status not in {"READY", "MISS"} or two_d_status not in {
+            "READY", "MISS",
+        }:
+            raise TypeError("Browse preparation returned an invalid dimension")
+        if bundle_bytes > MAX_PREPARED_BUNDLE_BYTES:
+            raise ValueError("Browse prepared bundle exceeded its byte ceiling")
+        stage_finish("prepared_capsule_s", started)
+        if _timing is not None:
+            _timing["prepared_bundle_bytes"] = bundle_bytes
+            _timing["prepared_1d_status"] = one_d_status
+            _timing["prepared_2d_status"] = two_d_status
+        if cancelled.is_set():
+            return None
         started = stage_start()
         after = (
             capture_target_snapshot(path)
@@ -1114,6 +1214,7 @@ class BrowseLoader:
                 target_entry=target_entry,
                 loaded_labels=labels,
                 target_snapshot=after,
+                prepared_reintegrate_offer=prepared_offer,
             )
             context.adopt_load_request(request)
             context.stamp_provenance(

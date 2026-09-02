@@ -70,6 +70,13 @@ _Viewer1DIntent = namedtuple(
     "_Viewer1DIntent",
     "paths current_path policy generation provider",
 )
+_ReintegrateSuccessorBrowsePending = namedtuple(
+    "_ReintegrateSuccessorBrowsePending",
+    "capture request owner expected_entry expected_labels",
+)
+_RetiredBrowseCleanup = namedtuple(
+    "_RetiredBrowseCleanup", "context owner"
+)
 class _OneDViewerOwner:
     __slots__ = ("controller", "owner_identity", "owner_request_claim", "context", "policy",
         "provider", "request", "request_token", "holder", "batch_identity", "loading", "diagnostic",
@@ -364,6 +371,8 @@ class ContextController:
         self._viewer_2d = _TwoDViewerOwner(self)
         self._viewer_2d_standalone: HydrationTransport | None = None
         self._browse_request: BrowseLoadRequest | None = None
+        self._reintegrate_successor_browse = None
+        self._retired_browse_cleanup = None
         self._browse_hydration_owner: _BrowseHydrationOwner | None = None
         self._cleanup_receipt: BrowseCleanupReceipt | None = None
         self._load_generation = 0
@@ -444,7 +453,11 @@ class ContextController:
 
     @property
     def browse_pending(self) -> bool:
-        return self._browse_request is not None or self._cleanup_receipt is not None
+        return bool(
+            self._browse_request is not None
+            or self._cleanup_receipt is not None
+            or self._retired_browse_cleanup is not None
+        )
 
     def owns_browse_request(self, request: BrowseLoadRequest) -> bool:
         """Whether an exact Browse request is still live in any owner."""
@@ -452,10 +465,15 @@ class ContextController:
         if type(request) is not BrowseLoadRequest:
             return False
         cleanup = self._cleanup_receipt
+        retired = self._retired_browse_cleanup
         context = self._runtime.browse_context
         return bool(
             self._browse_request is request
             or (cleanup is not None and cleanup.request is request)
+            or (
+                retired is not None
+                and retired.context.load_request is request
+            )
             or (
                 context is not None
                 and context.load_request is request
@@ -492,10 +510,20 @@ class ContextController:
     def capture_loaded_browse(
         self, request: BrowseLoadRequest,
     ) -> LoadedBrowseCapture | None:
+        return self._capture_loaded_browse(
+            request, allowed_pending_request=None,
+        )
+
+    def _capture_loaded_browse(
+        self,
+        request: BrowseLoadRequest,
+        *,
+        allowed_pending_request: BrowseLoadRequest | None,
+    ) -> LoadedBrowseCapture | None:
         context, selection = self._runtime.browse_context, self._runtime.selection
         owned_request = None if context is None else context.load_request
         labels = () if context is None else context.loaded_labels
-        stable = (not self._closed and self._close is None and self._cleanup_receipt is None and self._browse_request is None and type(context) is BrowseContext and context.loaded and not context.invalidated and not context.released and type(request) is BrowseLoadRequest and owned_request is request and request is context.operation and type(selection) is DisplaySelection and selection.kind is ContextKind.BROWSE and selection.names(context) and request.source_path == context.requested_path == selection.source_path and type(context.target_entry) is str and bool(context.target_entry) and type(context.target_snapshot) is TargetSnapshot and context.target_snapshot.exists and type(labels) is tuple and bool(labels) and labels == tuple(sorted(set(labels))) and tuple(context.frame_ids) == labels and all(type(value) is int and value >= 0 for value in labels))
+        stable = (not self._closed and self._close is None and self._cleanup_receipt is None and self._browse_request is allowed_pending_request and type(context) is BrowseContext and context.loaded and not context.invalidated and not context.released and type(request) is BrowseLoadRequest and owned_request is request and request is context.operation and type(selection) is DisplaySelection and selection.kind is ContextKind.BROWSE and selection.names(context) and request.source_path == context.requested_path == selection.source_path and type(context.target_entry) is str and bool(context.target_entry) and type(context.target_snapshot) is TargetSnapshot and context.target_snapshot.exists and type(labels) is tuple and bool(labels) and labels == tuple(sorted(set(labels))) and tuple(context.frame_ids) == labels and all(type(value) is int and value >= 0 for value in labels))
         return LoadedBrowseCapture(
             context,
             request,
@@ -504,7 +532,31 @@ class ContextController:
             context.target_entry,
             context.target_snapshot,
             labels,
+            context.prepared_reintegrate_offer,
         ) if stable else None
+
+    def reintegrate_successor_predecessor_is_current(
+        self,
+        capture: LoadedBrowseCapture,
+        successor_request: BrowseLoadRequest | None = None,
+    ) -> bool:
+        """Whether one exact predecessor still owns the presented Browse.
+
+        A successor request may read in the background without disqualifying
+        the predecessor.  No other pending Browse request is admitted here.
+        """
+
+        if (
+            type(capture) is not LoadedBrowseCapture
+            or successor_request is not None
+            and type(successor_request) is not BrowseLoadRequest
+        ):
+            return False
+        current = self._capture_loaded_browse(
+            capture.request,
+            allowed_pending_request=successor_request,
+        )
+        return bool(current is not None and capture.is_exactly(current))
 
     def invalidate_reintegrate_browse(
         self, capture: LoadedBrowseCapture,
@@ -1513,12 +1565,64 @@ class ContextController:
         terminal_commit_identity: StreamTerminal | None = None,
         source_root: str | None = None,
     ) -> BrowseLoadRequest:
+        request = self._begin_browse_loader(
+            source_path,
+            terminal_commit_identity=terminal_commit_identity,
+            source_root=source_root,
+        )
+        self._reintegrate_successor_browse = None
+        browse = self._runtime.browse_context
+        if browse is not None:
+            hold_presentation = (
+                self._runtime.selection is not None
+                and self._runtime.selection.names(browse)
+            )
+            receipt = self._release_browse(
+                browse,
+                preserve_pending_repaint=not browse.invalidated,
+            )
+            if (
+                type(receipt) is not BrowseCleanupReceipt
+                or receipt.request is not browse.load_request
+                or receipt.cleanup_status is not CleanupStatus.CLEANED
+            ):
+                self._retain_cancel(request)
+                raise RuntimeError("previous Browse cleanup is pending")
+            if hold_presentation:
+                self._runtime.begin_replacement(request)
+            else:
+                self._runtime.clear_browse(select_acquisition=False)
+        elif (
+            self._browse_request is not None
+            and self._runtime.selection is not None
+            and self._runtime.selection.kind is ContextKind.BROWSE
+            and not (
+            self._runtime.retarget_replacement(
+                self._browse_request, request
+            )
+            )
+        ):
+            self._retain_cancel(request)
+            self._browse_request = None
+            raise RuntimeError("Browse replacement identity drifted")
+        self._browse_request = request
+        return request
+
+    def _begin_browse_loader(
+        self,
+        source_path: str,
+        *,
+        terminal_commit_identity: StreamTerminal | None,
+        source_root: str | None,
+    ) -> BrowseLoadRequest:
         if self.viewer_1d_owned:
             raise RuntimeError("1D Viewer cleanup remains pending")
         if self.viewer_2d_owned:
             raise RuntimeError("2D Viewer cleanup remains pending")
         if self._cleanup_receipt is not None:
             raise RuntimeError("Browse cleanup remains pending")
+        if self._retired_browse_cleanup is not None:
+            raise RuntimeError("retired Browse cleanup remains pending")
         if (
             self._closed
             or self._close is not None
@@ -1568,45 +1672,87 @@ class ContextController:
             self._retain_cancel(request)
             raise RuntimeError("Browse loader did not accept exact request")
         self._load_generation = generation
-        browse = self._runtime.browse_context
-        if browse is not None:
-            hold_presentation = (
-                self._runtime.selection is not None
-                and self._runtime.selection.names(browse)
-            )
-            receipt = self._release_browse(
-                browse,
-                preserve_pending_repaint=not browse.invalidated,
-            )
-            if (
-                type(receipt) is not BrowseCleanupReceipt
-                or receipt.request is not browse.load_request
-                or receipt.cleanup_status is not CleanupStatus.CLEANED
-            ):
-                self._retain_cancel(request)
-                raise RuntimeError("previous Browse cleanup is pending")
-            if hold_presentation:
-                self._runtime.begin_replacement(request)
-            else:
-                self._runtime.clear_browse(select_acquisition=False)
-        elif (
-            self._browse_request is not None
-            and self._runtime.selection is not None
-            and self._runtime.selection.kind is ContextKind.BROWSE
-            and not (
-            self._runtime.retarget_replacement(
-                self._browse_request, request
-            )
-            )
-        ):
-            self._retain_cancel(request)
-            self._browse_request = None
-            raise RuntimeError("Browse replacement identity drifted")
-        self._browse_request = request
         return request
 
-    def poll_browse(self):
+    def begin_reintegrate_successor_browse(
+        self,
+        capture: LoadedBrowseCapture,
+        successor_path: str,
+        terminal_commit_identity: StreamTerminal,
+        *,
+        owner: object,
+        expected_entry: str,
+        expected_labels: tuple[int, ...],
+    ) -> BrowseLoadRequest:
+        """Begin a sealed successor load without releasing its predecessor."""
+
+        if (
+            type(capture) is not LoadedBrowseCapture
+            or type(successor_path) is not str
+            or not successor_path
+            or type(terminal_commit_identity) is not StreamTerminal
+            or owner is None
+            or type(expected_entry) is not str
+            or expected_entry != capture.entry
+            or type(expected_labels) is not tuple
+            or not expected_labels
+            or expected_labels != tuple(sorted(set(expected_labels)))
+            or any(
+                type(label) is not int or label < 0
+                for label in expected_labels
+            )
+            or not set(expected_labels).issubset(capture.labels)
+            or self._browse_request is not None
+            or successor_path == capture.target
+            or not self.reintegrate_successor_predecessor_is_current(capture)
+        ):
+            raise RuntimeError("Reintegrate successor Browse is not current")
+        request = self._begin_browse_loader(
+            successor_path,
+            terminal_commit_identity=terminal_commit_identity,
+            source_root=capture.request.source_root,
+        )
+        self._browse_request = request
+        self._reintegrate_successor_browse = (
+            _ReintegrateSuccessorBrowsePending(
+                capture, request, owner, expected_entry, expected_labels,
+            )
+        )
+        if not self.reintegrate_successor_predecessor_is_current(
+            capture, request,
+        ):
+            self._browse_request = None
+            self._reintegrate_successor_browse = None
+            self._retain_cancel(request)
+            raise RuntimeError("Reintegrate successor predecessor drifted")
+        return request
+
+    def cancel_reintegrate_successor_browse(
+        self, request: BrowseLoadRequest,
+    ) -> BrowseCleanupReceipt:
+        """Cancel only the exact pending successor while retaining Browse."""
+
+        if type(request) is not BrowseLoadRequest:
+            return BrowseCleanupReceipt(request, CleanupStatus.CLEANUP_PENDING)
+        cleanup = self._cleanup_receipt
+        if cleanup is not None and cleanup.request is request:
+            return self._retain_cancel(request)
+        if self._browse_request is not request:
+            return BrowseCleanupReceipt(request, CleanupStatus.CLEANUP_PENDING)
+        self._browse_request = None
+        pending = self._reintegrate_successor_browse
+        if pending is not None and pending.request is request:
+            self._reintegrate_successor_browse = None
+        return self._retain_cancel(request)
+
+    def poll_browse(self, *, reintegrate_successor_owner: object = None):
         if self._close is not None:
+            return None
+        retired_receipt = self._retry_retired_browse_cleanup()
+        if (
+            type(retired_receipt) is BrowseCleanupReceipt
+            and retired_receipt.cleanup_status is not CleanupStatus.CLEANED
+        ):
             return None
         cleanup = self._cleanup_receipt
         if cleanup is not None:
@@ -1632,6 +1778,9 @@ class ContextController:
             ):
                 self._runtime.finish_replacement(request)
                 self._browse_request = None
+                pending = self._reintegrate_successor_browse
+                if pending is not None and pending.request is request:
+                    self._reintegrate_successor_browse = None
             return None
         admissible = (
             not self._closed
@@ -1650,56 +1799,120 @@ class ContextController:
                 request.token, request.load_generation
             )
             or not candidate.loaded
+            or type(candidate.requested_path) is not str
+            or candidate.requested_path != request.source_path
             or type(candidate.target_snapshot) is not TargetSnapshot
             or not candidate.target_snapshot.exists
             or type(candidate.target_entry) is not str or not candidate.target_entry
+            or type(candidate.loaded_labels) is not tuple
+            or candidate.loaded_labels
+            != tuple(sorted(set(candidate.loaded_labels)))
+            or any(
+                type(label) is not int or label < 0
+                for label in candidate.loaded_labels
+            )
             or candidate.loaded_labels != tuple(candidate.frame_ids)
             or not candidate.loaded_labels
         ):
             self._browse_request = None
+            pending = self._reintegrate_successor_browse
+            if pending is not None and pending.request is request:
+                self._reintegrate_successor_browse = None
             receipt = self._retain_cancel(request)
             if receipt.cleanup_status is CleanupStatus.CLEANED:
                 self._runtime.finish_replacement(request)
             return None
-        prior = self._runtime.browse_context
-        if outcome.status is BrowseLoadStatus.READY and prior is not None:
-            receipt = self._release_browse(
-                prior, preserve_pending_repaint=True
+        pending = self._reintegrate_successor_browse
+        if (
+            outcome.status is BrowseLoadStatus.READY
+            and pending is not None
+            and pending.request is request
+            and (
+                reintegrate_successor_owner is not pending.owner
+                or not self.reintegrate_successor_predecessor_is_current(
+                    pending.capture, request,
+                )
+                or candidate.target_entry != pending.expected_entry
+                or candidate.loaded_labels != pending.expected_labels
             )
-            if (
-                type(receipt) is not BrowseCleanupReceipt
-                or receipt.request is not prior.load_request
-                or receipt.cleanup_status is not CleanupStatus.CLEANED
-            ):
-                self._invalidate_browse_request()
-                return None
-        context = self._browse_loader.consume(outcome)
+        ):
+            # Keep the exact predecessor live.  The candidate remains
+            # loader-owned while cancellation performs failure-total cleanup.
+            self.cancel_reintegrate_successor_browse(request)
+            return None
         if outcome.status is not BrowseLoadStatus.READY:
+            self._browse_loader.consume(outcome)
             self._runtime.finish_replacement(request)
             self._browse_request = None
+            if pending is not None and pending.request is request:
+                self._reintegrate_successor_browse = None
             return outcome
-        if (
-            context is not candidate
-            or type(context) is not BrowseContext
-        ):
-            return None
+        prior = self._runtime.browse_context
+        prior_owner = self._browse_hydration_owner
+        if prior is not None and type(prior_owner) is not _BrowseHydrationOwner:
+            self.cancel_reintegrate_successor_browse(request)
+            raise RuntimeError("Browse predecessor lost its hydration owner")
         acquisition = self._runtime.acquisition_context
         display = (
             None if acquisition is None else acquisition.publication_store
         )
-        owner = _BrowseHydrationOwner(
-            context,
-            borrowed_transport=getattr(display, "transport", None),
-        )
-        self._runtime.adopt_browse(context, request)
+        try:
+            owner = _BrowseHydrationOwner(
+                candidate,
+                borrowed_transport=getattr(display, "transport", None),
+            )
+            prepared = self._runtime.prepare_browse_adoption(
+                candidate, request,
+            )
+        except BaseException:
+            self.cancel_reintegrate_successor_browse(request)
+            self._runtime.finish_replacement(request)
+            return None
+        context = self._browse_loader.consume(outcome)
+        if (
+            context is not candidate
+            or type(context) is not BrowseContext
+        ):
+            if self._browse_loader.owns_request(request):
+                self.cancel_reintegrate_successor_browse(request)
+                return None
+            # A defensive loader may transfer the READY context yet refuse
+            # the exact return value.  It no longer owns cancellation, so
+            # retire the unadopted candidate through the context-release lane
+            # instead of manufacturing an unfinishable cancel receipt.
+            self._browse_request = None
+            if pending is not None and pending.request is request:
+                self._reintegrate_successor_browse = None
+            self._runtime.finish_replacement(request)
+            self._retired_browse_cleanup = _RetiredBrowseCleanup(
+                candidate, owner,
+            )
+            self._retry_retired_browse_cleanup()
+            return None
+        self._runtime.commit_browse_adoption(prepared)
+        if prior is not None:
+            self._retired_browse_cleanup = _RetiredBrowseCleanup(
+                prior, prior_owner,
+            )
         self._browse_hydration_owner = owner
         self._browse_request = None
+        if pending is not None and pending.request is request:
+            self._reintegrate_successor_browse = None
+        if prior is not None:
+            self._retry_retired_browse_cleanup()
         return outcome
 
     def close(self) -> BrowseCleanupReceipt:
         if self._closed:
             assert self._close is not None
             return self._close
+        self._reintegrate_successor_browse = None
+        retired = self._retry_retired_browse_cleanup()
+        if (
+            type(retired) is BrowseCleanupReceipt
+            and retired.cleanup_status is not CleanupStatus.CLEANED
+        ):
+            return retired
         browse = self._runtime.browse_context
         pending = self._close or self._cleanup_receipt
         expected = pending.request if pending is not None else (
@@ -1818,6 +2031,9 @@ class ContextController:
         self._browse_request = None
         if request is None:
             return False
+        pending = self._reintegrate_successor_browse
+        if pending is not None and pending.request is request:
+            self._reintegrate_successor_browse = None
         finished = self._runtime.finish_replacement(request)
         self._retain_cancel(request)
         return finished
@@ -1838,6 +2054,37 @@ class ContextController:
             and owner._owns(browse)
         ):
             self._browse_hydration_owner = None
+        return receipt
+
+    def _retry_retired_browse_cleanup(
+        self,
+    ) -> BrowseCleanupReceipt | None:
+        retired = self._retired_browse_cleanup
+        if retired is None:
+            return None
+        context = retired.context
+        try:
+            if not context.invalidated and not context.released:
+                context.invalidate()
+            receipt = release_browse(
+                self._browse_loader,
+                context,
+                retired.owner,
+                preserve_pending_repaint=False,
+            )
+        except BaseException as error:
+            receipt = BrowseCleanupReceipt(
+                context.load_request,
+                CleanupStatus.CLEANUP_PENDING,
+                (detach_exception(error, "browse.retired_release"),),
+            )
+        if (
+            type(receipt) is BrowseCleanupReceipt
+            and receipt.request is context.load_request
+            and receipt.cleanup_status is CleanupStatus.CLEANED
+            and self._retired_browse_cleanup is retired
+        ):
+            self._retired_browse_cleanup = None
         return receipt
 
     def _retain_cancel(self, request: BrowseLoadRequest) -> BrowseCleanupReceipt:

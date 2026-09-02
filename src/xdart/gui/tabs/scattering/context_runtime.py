@@ -61,6 +61,20 @@ class _PendingTraceProjection:
     target: tuple[DisplayFrameKey, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedBrowseAdoption:
+    context: BrowseContext
+    request: BrowseLoadRequest
+    identity: RunIdentity
+    navigation: FrameNavigationProjection
+    frame_by_id: dict[int, DisplayFrameKey]
+    selection: DisplaySelection
+    display_generation: int
+    prior_browse: BrowseContext | None
+    prior_selection: DisplaySelection | None
+    prior_pending: _PendingBrowseReplacement | None
+
+
 def _qualified_browse_resolution(resolution, identity, current, generation,
                                  browse):
     """THE one typed-resolution qualifier (§22.3): an exactly valid payload,
@@ -1412,9 +1426,9 @@ class _ContextRuntime:
             projection, request, browse_hydration_owner
         )
 
-    def adopt_browse(
+    def prepare_browse_adoption(
         self, context: BrowseContext, request: BrowseLoadRequest
-    ) -> DisplaySelection:
+    ) -> _PreparedBrowseAdoption:
         pending = self._pending_replacement
         if (
             type(context) is not BrowseContext
@@ -1442,13 +1456,47 @@ class _ContextRuntime:
         navigation = FrameNavigationProjection(frames, current, selected)
         generation = self._display_generation + 1
         selection = DisplaySelection.for_context(context, generation)
-        self._display_generation = generation
-        self._browse = context
-        self._browse_projection_identity = identity
-        self._set_browse_navigation(navigation)
-        self._selection = selection
+        return _PreparedBrowseAdoption(
+            context,
+            request,
+            identity,
+            navigation,
+            {id(frame): frame for frame in frames},
+            selection,
+            generation,
+            self._browse,
+            self._selection,
+            pending,
+        )
+
+    def commit_browse_adoption(
+        self, prepared: _PreparedBrowseAdoption,
+    ) -> DisplaySelection:
+        if (
+            type(prepared) is not _PreparedBrowseAdoption
+            or self._browse is not prepared.prior_browse
+            or self._selection is not prepared.prior_selection
+            or self._pending_replacement is not prepared.prior_pending
+            or self._display_generation + 1
+            != prepared.display_generation
+        ):
+            raise RuntimeError("prepared Browse adoption identity drifted")
+        self._display_generation = prepared.display_generation
+        self._browse = prepared.context
+        self._browse_projection_identity = prepared.identity
+        self.invalidate_browse_pass()
+        self._browse_navigation = prepared.navigation
+        self._browse_frame_by_id = prepared.frame_by_id
+        self._selection = prepared.selection
         self._pending_replacement = None
-        return selection
+        return prepared.selection
+
+    def adopt_browse(
+        self, context: BrowseContext, request: BrowseLoadRequest
+    ) -> DisplaySelection:
+        return self.commit_browse_adoption(
+            self.prepare_browse_adoption(context, request)
+        )
 
     def begin_replacement(
         self, request: BrowseLoadRequest

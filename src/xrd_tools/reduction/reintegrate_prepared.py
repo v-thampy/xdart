@@ -2324,11 +2324,10 @@ def prepare_reintegrate_bundle(
         or next(iter(inspections.values()))._replace(labels=labels)
     )
     if requested_root is not None and requested_root != base.source_base:
-        whole_miss = PreparedCapsuleMissCode.SOURCE_ROOT_CHANGED
-    elif _is_self_external_topology(base.topology):
+        return miss(PreparedCapsuleMissCode.SOURCE_ROOT_CHANGED)
+    if _is_self_external_topology(base.topology):
         return miss(PreparedCapsuleMissCode.SOURCE_TOPOLOGY_UNSUPPORTED)
-    else:
-        whole_miss = _initial_artifact_miss(base)
+    whole_miss = _initial_artifact_miss(base)
     for inspection in inspections.values():
         neutral = (
             tuple(inspection.detector_shape),

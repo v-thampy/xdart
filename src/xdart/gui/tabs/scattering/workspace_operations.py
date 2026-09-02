@@ -17,7 +17,6 @@ from xrd_tools.io.output_transaction import (
     StreamTerminal,
     stream_terminal_object_revision,
 )
-from xrd_tools.reduction import ReintegrateResult
 from xrd_tools.session.run_configuration import FrozenRunConfiguration
 
 from .adapters.external_operation import OperationSlot
@@ -35,6 +34,7 @@ from .operation_values import (
 from .processed_browser import (
     AverageReloadDirective,
     ReintegrateReloadDirective,
+    ReintegrateSuccessorDirective,
 )
 
 
@@ -54,6 +54,7 @@ class WorkspaceOperationTransition:
     effect: WorkspaceRefreshEffect
     notice: str = ""
     reintegrate_reload: ReintegrateReloadDirective | None = None
+    reintegrate_successor: ReintegrateSuccessorDirective | None = None
     average_reload: AverageReloadDirective | None = None
     request_catalog: bool = False
     reintegrate_progress: OperationProgress | None = None
@@ -69,6 +70,7 @@ class WorkspaceOperationTransition:
                     type(self.reintegrate_progress) is not OperationProgress
                     or self.effect is not WorkspaceRefreshEffect.NONE
                     or self.reintegrate_reload is not None
+                    or self.reintegrate_successor is not None
                     or self.average_reload is not None
                     or self.request_catalog
                 )
@@ -79,11 +81,23 @@ class WorkspaceOperationTransition:
                 is not ReintegrateReloadDirective
             )
             or (
+                self.reintegrate_successor is not None
+                and type(self.reintegrate_successor)
+                is not ReintegrateSuccessorDirective
+            )
+            or (
                 self.average_reload is not None
                 and type(self.average_reload) is not AverageReloadDirective
             )
             or (
                 self.reintegrate_reload is not None
+                and (
+                    self.reintegrate_successor is not None
+                    or self.average_reload is not None
+                )
+            )
+            or (
+                self.reintegrate_successor is not None
                 and self.average_reload is not None
             )
         ):
@@ -92,19 +106,26 @@ class WorkspaceOperationTransition:
 
 @dataclass(frozen=True, slots=True)
 class ReintegrateOperationState:
-    """Active Reintegrate identity and its invalidated Browse owner."""
+    """Active immutable Reintegrate identity and its live predecessor."""
 
     identity: OperationIdentity
     capture: LoadedBrowseCapture
     dimension: str
+    stamp: OperationContextStamp
     progress: OperationProgress | None = None
     cancel_accepted: bool = False
+    owner_abandoned: bool = False
 
     def __post_init__(self) -> None:
         if (
             type(self.identity) is not OperationIdentity
             or type(self.capture) is not LoadedBrowseCapture
             or self.dimension not in {"1d", "2d"}
+            or type(self.stamp) is not OperationContextStamp
+            or self.stamp.context_token
+            != self.capture.selection.context_token
+            or self.stamp.display_generation
+            != self.capture.selection.display_generation
             or (
                 self.progress is not None
                 and (
@@ -113,8 +134,10 @@ class ReintegrateOperationState:
                 )
             )
             or type(self.cancel_accepted) is not bool
+            or type(self.owner_abandoned) is not bool
         ):
             raise ValueError("Reintegrate operation state is invalid")
+        self.stamp.__post_init__()
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +193,32 @@ def _terminal_identity_for_target(
         return None
     normalized = os.path.normcase(os.path.abspath(os.path.expanduser(target)))
     return value if value.target == normalized else None
+
+
+def _reintegrate_result_notice_suffix(result: object) -> str:
+    """Surface bounded fallback and private-cleanup diagnostics verbatim."""
+
+    parts: list[str] = []
+    diagnostics = getattr(result, "diagnostics", ())
+    if type(diagnostics) is tuple:
+        fallback = next(
+            (
+                value
+                for value in diagnostics
+                if type(value) is str
+                and value.startswith("PREPARED_CAPSULE_MISS:")
+            ),
+            None,
+        )
+        if fallback is not None:
+            parts.append(f" Prepared-data fallback: {fallback}.")
+    hidden_orphan = getattr(result, "hidden_orphan", None)
+    if type(hidden_orphan) is str and hidden_orphan:
+        parts.append(
+            " Manual cleanup is required for hidden candidate: "
+            f"{hidden_orphan}."
+        )
+    return "".join(parts)
 
 
 class WorkspaceOperationOwner:
@@ -264,14 +313,17 @@ class WorkspaceOperationOwner:
     ) -> OperationIdentity | None:
         if type(capture) is not LoadedBrowseCapture:
             return None
-        identity = self._slot.begin_reintegrate(
-            target=capture.target,
+        if capture.prepared_reintegrate_offer is None:
+            return None
+        identity = self._slot.begin_reintegrate_successor(
+            source_artifact=capture.target,
             entry=capture.entry,
             source_root=capture.request.source_root,
             expected_target_snapshot=capture.target_snapshot,
             expected_labels=capture.labels,
             dimension=dimension,
             preparation_values=preparation_values,
+            prepared_offer=capture.prepared_reintegrate_offer,
             stamp=stamp,
             expected_terminal_identity=(
                 capture.request.terminal_commit_identity
@@ -285,7 +337,7 @@ class WorkspaceOperationOwner:
         if identity is None:
             return None
         self._reintegrate = ReintegrateOperationState(
-            identity, capture, dimension
+            identity, capture, dimension, stamp,
         )
         return identity
 
@@ -346,6 +398,25 @@ class WorkspaceOperationOwner:
             self._reintegrate = replace(state, cancel_accepted=True)
         return bool(accepted)
 
+    def abandon_reintegrate(self, identity: object) -> bool:
+        """Withdraw GUI adoption authority and best-effort stop exact work."""
+
+        state = self._reintegrate
+        if state is None or identity is not state.identity:
+            return False
+        accepted = (
+            False
+            if state.cancel_accepted
+            else self._slot.cancel(state.identity)
+        )
+        if self._reintegrate is state:
+            self._reintegrate = replace(
+                state,
+                cancel_accepted=state.cancel_accepted or bool(accepted),
+                owner_abandoned=True,
+            )
+        return True
+
     def retry_average(self) -> bool:
         state = self._average
         if state is None or state.pending is None:
@@ -361,6 +432,27 @@ class WorkspaceOperationOwner:
         *,
         intent_revision: int,
     ) -> None:
+        reintegrate = self._reintegrate
+        if (
+            reintegrate is not None
+            and self._slot.current_identity is reintegrate.identity
+        ):
+            self._slot.observe_stamp(stamp)
+            if reintegrate.stamp != stamp:
+                accepted = (
+                    False
+                    if reintegrate.cancel_accepted
+                    else self._slot.cancel(reintegrate.identity)
+                )
+                if self._reintegrate is reintegrate:
+                    self._reintegrate = replace(
+                        reintegrate,
+                        cancel_accepted=(
+                            reintegrate.cancel_accepted or bool(accepted)
+                        ),
+                        owner_abandoned=True,
+                    )
+            return
         state = self._average
         if (
             state is not None
@@ -420,41 +512,111 @@ class WorkspaceOperationOwner:
         capture = state.capture
         self._reintegrate = None
         result = terminal.payload
-        notice = (
-            f"Reintegrate {shown} {result.disposition.lower()}; "
-            "reloading persisted results."
-            if (
-                terminal.status is OperationTerminalStatus.RETURNED
-                and type(result) is ReintegrateResult
+        if terminal.status is OperationTerminalStatus.CANCELLED:
+            return WorkspaceOperationTransition(
+                WorkspaceRefreshEffect.CONTROLS,
+                f"Reintegrate {shown} stopped; the selected artifact is unchanged.",
             )
-            else f"Reintegrate {shown} cancelled; reloading persisted results."
-            if terminal.status is OperationTerminalStatus.CANCELLED
-            else f"Reintegrate {shown} failed: {terminal.diagnostic}"
-        )
-        committed = (
-            terminal.status is OperationTerminalStatus.RETURNED
-            and type(result) is ReintegrateResult
-            and result.disposition == "COMMITTED"
-        )
-        commit_identity = (
-            _terminal_identity_for_target(
-                result.commit_identity, capture.target
+        if terminal.status is not OperationTerminalStatus.RETURNED:
+            return WorkspaceOperationTransition(
+                WorkspaceRefreshEffect.CONTROLS,
+                f"Reintegrate {shown} failed: {terminal.diagnostic}",
             )
-            if committed
-            else None
-        )
-        if committed and commit_identity is None:
-            notice = (
-                f"Reintegrate {shown} returned an invalid commit identity; "
-                "reloading the persisted artifact without its terminal seal."
+        # The worker imported and exact-gated the heavy successor result.  At
+        # terminal this import is already resident and performs no file work.
+        from xrd_tools.reduction import ReintegrateSuccessorResult
+        if type(result) is not ReintegrateSuccessorResult:
+            return WorkspaceOperationTransition(
+                WorkspaceRefreshEffect.CONTROLS,
+                f"Reintegrate {shown} returned an invalid result.",
             )
-        directive = ReintegrateReloadDirective(
-            capture.request, capture.target, commit_identity
+        if result.disposition == "ABORTED":
+            return WorkspaceOperationTransition(
+                WorkspaceRefreshEffect.CONTROLS,
+                f"Reintegrate {shown} stopped; the selected artifact is unchanged."
+                f"{_reintegrate_result_notice_suffix(result)}",
+            )
+        committed = result.disposition in {"COMMITTED", "ALREADY_COMMITTED"}
+        terminal_identity = result.terminal
+        valid = (
+            committed
+            and result.source_artifact == capture.target
+            and result.output_artifact != capture.target
+            and result.input_labels == capture.labels
+            and type(result.committed_labels) is tuple
+            and bool(result.committed_labels)
+            and result.committed_labels
+            == tuple(sorted(set(result.committed_labels)))
+            and all(
+                type(label) is int and label >= 0
+                for label in result.committed_labels
+            )
+            and type(result.publication_dropped_labels) is tuple
+            and result.publication_dropped_labels
+            == tuple(sorted(set(result.publication_dropped_labels)))
+            and all(
+                type(label) is int and label >= 0
+                for label in result.publication_dropped_labels
+            )
+            and not set(result.committed_labels).intersection(
+                result.publication_dropped_labels
+            )
+            and tuple(sorted((
+                *result.committed_labels,
+                *result.publication_dropped_labels,
+            ))) == capture.labels
+            and type(result.audit_identity) is str
+            and len(result.audit_identity) == 64
+            and all(
+                character in "0123456789abcdef"
+                for character in result.audit_identity
+            )
+            and result.hidden_orphan is None
+            and type(terminal_identity) is StreamTerminal
+            and stream_terminal_object_revision(terminal_identity) is not None
+            and terminal_identity.target == result.output_artifact
+            and type(result.commit_identity) is str
+            and len(result.commit_identity) == 64
+            and state.stamp is not None
+        )
+        if not valid:
+            return WorkspaceOperationTransition(
+                WorkspaceRefreshEffect.CONTROLS,
+                f"Reintegrate {shown} returned invalid successor authority; "
+                "the selected artifact is unchanged.",
+            )
+        if update.stale or state.owner_abandoned:
+            return WorkspaceOperationTransition(
+                WorkspaceRefreshEffect.CONTROLS,
+                f"Reintegrate {shown} published a new version after its "
+                "display owner changed; it was cataloged without switching."
+                f"{_reintegrate_result_notice_suffix(result)}",
+                request_catalog=True,
+            )
+        directive = ReintegrateSuccessorDirective(
+            capture,
+            result.output_artifact,
+            capture.entry,
+            result.committed_labels,
+            terminal_identity,
+            result.version_identity,
+            result.publication_identity,
+            result.operation_identity,
+            result.commit_identity,
+            state.identity,
+            state.stamp,
+        )
+        action = (
+            "reused the existing exact version"
+            if result.disposition == "ALREADY_COMMITTED"
+            else "published a new version"
         )
         return WorkspaceOperationTransition(
-            WorkspaceRefreshEffect.FULL,
-            notice,
-            reintegrate_reload=directive,
+            WorkspaceRefreshEffect.CONTROLS,
+            f"Reintegrate {shown} {action}; validating it before switching."
+            f"{_reintegrate_result_notice_suffix(result)}",
+            reintegrate_successor=directive,
+            request_catalog=True,
         )
 
     def consume_average_update(
@@ -602,15 +764,11 @@ class WorkspaceOperationOwner:
             shown = {"1d": "1-D", "2d": "2-D"}.get(
                 reintegrate.dimension, "operation"
             )
-            directive = ReintegrateReloadDirective(
-                reintegrate.capture.request,
-                reintegrate.capture.target,
-            )
             self._reintegrate = None
             return WorkspaceOperationTransition(
-                WorkspaceRefreshEffect.FULL,
-                f"Reintegrate {shown} failed before terminal publication.",
-                reintegrate_reload=directive,
+                WorkspaceRefreshEffect.CONTROLS,
+                f"Reintegrate {shown} failed before terminal publication; "
+                "the selected artifact is unchanged.",
             )
         average = self._average
         if average is not None and average.identity is identity:

@@ -212,6 +212,7 @@ def _browse(
     axes_1d: tuple[tuple[str, str, str, bool], ...] = (),
 ):
     _, _, browse_values = _api()
+    from xrd_tools.reduction import prepare_reintegrate_bundle
     request = request or browse_values.BrowseLoadRequest(
         context_token, generation, f"/processed/{scan_key}.nxs"
     )
@@ -235,6 +236,9 @@ def _browse(
         (catalog_row,),
         axes_1d=axes_1d,
     )
+    prepared_offer = prepare_reintegrate_bundle(
+        None, entry=catalog.entry, labels=catalog.labels,
+    )
     context = BrowseContext(
         context_token=context_token,
         load_generation=generation,
@@ -254,6 +258,7 @@ def _browse(
         target_entry=catalog.entry,
         loaded_labels=catalog.labels,
         target_snapshot=TargetSnapshot(True, 1, 1, 1, 1, "a" * 64),
+        prepared_reintegrate_offer=prepared_offer,
     )
     context.adopt_load_request(request)
     context.mark_loaded()

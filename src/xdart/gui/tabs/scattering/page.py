@@ -224,6 +224,9 @@ from .processed_browser import (
     ProcessedBrowserOwner,
     ProcessedBrowserTransition,
     ReintegrateReloadDirective,
+    ReintegrateSuccessorAdoption,
+    ReintegrateSuccessorDirective,
+    ReintegrateSuccessorPhase,
     TerminalBrowseHandoff,
     TerminalBrowsePaintReceipt,
     TerminalBrowsePaintRequest,
@@ -255,6 +258,22 @@ _NEXUS_ONLY_PERFORMANCE_KEYS = (
 )
 _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
 _DEFERRED_DELETE_RETRY_INTERVAL_MS = 25
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredBrowseSelection:
+    blocked_by: BrowseLoadRequest
+    value: str
+    is_directory: bool
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.blocked_by) is not BrowseLoadRequest
+            or type(self.value) is not str
+            or not self.value
+            or type(self.is_directory) is not bool
+        ):
+            raise ValueError("deferred Browse selection is invalid")
 
 
 def _live_plot_interval_ms() -> int:
@@ -651,6 +670,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ),
             clock=browse_clock,
         )
+        self._deferred_browse_selection: _DeferredBrowseSelection | None = None
         self._admission_state: _AdmissionPageOwner | None = None
         self._closing = False
         self._closed = False
@@ -2137,6 +2157,243 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         browser.retire_reload(directive)
         return True
 
+    def _begin_pending_reintegrate_successor(
+        self,
+        adoption: ReintegrateSuccessorAdoption | None = None,
+    ) -> bool:
+        browser = self._processed_browser
+        current = browser.pending_reintegrate_successor
+        if adoption is None:
+            adoption = current
+        if (
+            type(adoption) is not ReintegrateSuccessorAdoption
+            or current is not adoption
+            or adoption.phase is not ReintegrateSuccessorPhase.PENDING
+            or adoption.request is not None
+        ):
+            return False
+        directive = adoption.directive
+        stamp = self._operation_context_stamp()
+        if (
+            stamp != directive.context_stamp
+            or not self._context_controller
+            .reintegrate_successor_predecessor_is_current(
+                directive.predecessor
+            )
+        ):
+            browser.retire_reintegrate_successor(adoption)
+            self._request_browser_catalog()
+            self._notice(
+                "Reintegrate published a new version, but its display owner "
+                "changed; the version was cataloged without switching."
+            )
+            return True
+        if not self._release_browse_1d_debt():
+            self._ensure_timer()
+            return False
+        request = None
+        try:
+            request = (
+                self._context_controller.begin_reintegrate_successor_browse(
+                    directive.predecessor,
+                    directive.successor_path,
+                    directive.terminal_commit_identity,
+                    owner=directive,
+                    expected_entry=directive.entry,
+                    expected_labels=directive.committed_labels,
+                )
+            )
+            browser.begin_reintegrate_successor_load(adoption, request)
+        except RuntimeError as error:
+            if type(request) is BrowseLoadRequest:
+                self._context_controller.cancel_reintegrate_successor_browse(
+                    request
+                )
+            browser.retire_reintegrate_successor(adoption)
+            self._request_browser_catalog()
+            self._notice(
+                "Reintegrate successor could not begin Browse validation: "
+                f"{error}. The predecessor remains selected."
+            )
+            return True
+        self._ensure_timer()
+        return True
+
+    def _reintegrate_successor_owner_for_poll(self) -> object | None:
+        adoption = self._processed_browser.pending_reintegrate_successor
+        if adoption is None:
+            return None
+        if adoption.phase is ReintegrateSuccessorPhase.PENDING:
+            self._begin_pending_reintegrate_successor(adoption)
+            adoption = self._processed_browser.pending_reintegrate_successor
+            if adoption is None or adoption.request is None:
+                return None
+        if adoption.phase is ReintegrateSuccessorPhase.CANCELLING:
+            self._retire_cancelled_reintegrate_successor(adoption)
+            return None
+        if adoption.phase is not ReintegrateSuccessorPhase.LOADING:
+            return None
+        directive = adoption.directive
+        request = adoption.request
+        assert request is not None
+        if (
+            self._operation_context_stamp() != directive.context_stamp
+            or not self._context_controller
+            .reintegrate_successor_predecessor_is_current(
+                directive.predecessor, request,
+            )
+        ):
+            self._cancel_reintegrate_successor_adoption(adoption)
+            self._request_browser_catalog()
+            self._notice(
+                "Reintegrate successor was cataloged without switching "
+                "because its display owner changed."
+            )
+            return None
+        return directive
+
+    def _settle_reintegrate_successor_browse(
+        self,
+        outcome: BrowseLoadOutcome,
+        adoption: ReintegrateSuccessorAdoption,
+    ) -> bool:
+        request = adoption.request
+        if (
+            adoption.phase is not ReintegrateSuccessorPhase.LOADING
+            or request is None
+            or outcome.request is not request
+        ):
+            return False
+        directive = adoption.directive
+        self._processed_browser.retire_reintegrate_successor(adoption)
+        self._request_browser_catalog()
+        if outcome.status is BrowseLoadStatus.READY:
+            capture = self._context_controller.capture_loaded_browse(request)
+            if (
+                capture is None
+                or capture.target != directive.successor_path
+                or capture.entry != directive.entry
+                or capture.labels != directive.committed_labels
+                or request.terminal_commit_identity
+                is not directive.terminal_commit_identity
+            ):
+                raise RuntimeError(
+                    "Reintegrate successor Browse lost terminal ownership"
+                )
+            self._notice(
+                "Reintegrate successor validated; now viewing "
+                f"{directive.successor_path}."
+            )
+            return True
+        detail = outcome.detail.strip()
+        suffix = f" ({detail})" if detail else ""
+        self._notice(
+            "Reintegrate successor was not selected; the predecessor remains "
+            f"visible. Successor: {directive.successor_path}{suffix}"
+        )
+        return True
+
+    def _abandon_reintegrate_successor(self) -> bool:
+        adoption = self._processed_browser.pending_reintegrate_successor
+        if adoption is None:
+            return False
+        self._cancel_reintegrate_successor_adoption(adoption)
+        self._request_browser_catalog()
+        return True
+
+    def _cancel_reintegrate_successor_adoption(
+        self,
+        adoption: ReintegrateSuccessorAdoption,
+    ) -> bool:
+        browser = self._processed_browser
+        if browser.pending_reintegrate_successor is not adoption:
+            return False
+        if adoption.phase is ReintegrateSuccessorPhase.PENDING:
+            browser.retire_reintegrate_successor(adoption)
+            return True
+        if adoption.phase is ReintegrateSuccessorPhase.LOADING:
+            adoption = browser.mark_reintegrate_successor_cancelling(adoption)
+        if adoption.phase is not ReintegrateSuccessorPhase.CANCELLING:
+            return False
+        request = adoption.request
+        assert request is not None
+        self._context_controller.cancel_reintegrate_successor_browse(request)
+        if not self._retire_cancelled_reintegrate_successor(adoption):
+            self._ensure_timer()
+        return True
+
+    def _retire_cancelled_reintegrate_successor(
+        self,
+        adoption: ReintegrateSuccessorAdoption | None = None,
+    ) -> bool:
+        browser = self._processed_browser
+        current = browser.pending_reintegrate_successor
+        if adoption is None:
+            adoption = current
+        if (
+            type(adoption) is not ReintegrateSuccessorAdoption
+            or current is not adoption
+            or adoption.phase is not ReintegrateSuccessorPhase.CANCELLING
+            or adoption.request is None
+            or self._context_controller.owns_browse_request(adoption.request)
+        ):
+            return False
+        request = adoption.request
+        if not browser.retire_reintegrate_successor(adoption):
+            return False
+        self._request_browser_catalog()
+        deferred = self._deferred_browse_selection
+        if deferred is not None and deferred.blocked_by is request:
+            self._deferred_browse_selection = None
+            self._select_scan(
+                deferred.value,
+                is_directory=deferred.is_directory,
+            )
+        return True
+
+    def _retire_lost_reintegrate_successor(
+        self,
+        adoption: ReintegrateSuccessorAdoption | None = None,
+    ) -> bool:
+        """Retire a load whose controller ownership ended without an outcome."""
+
+        browser = self._processed_browser
+        current = browser.pending_reintegrate_successor
+        if adoption is None:
+            adoption = current
+        if (
+            type(adoption) is not ReintegrateSuccessorAdoption
+            or current is not adoption
+            or adoption.phase is not ReintegrateSuccessorPhase.LOADING
+            or adoption.request is None
+            or self._context_controller.owns_browse_request(adoption.request)
+        ):
+            return False
+        request = adoption.request
+        if not browser.retire_reintegrate_successor(adoption):
+            return False
+        self._request_browser_catalog()
+        self._notice(
+            "Reintegrate successor validation ended without switching; "
+            "the predecessor remains selected."
+        )
+        deferred = self._deferred_browse_selection
+        if deferred is not None and deferred.blocked_by is request:
+            self._deferred_browse_selection = None
+            self._select_scan(
+                deferred.value,
+                is_directory=deferred.is_directory,
+            )
+        return True
+
+    def _abandon_reintegrate_display_owner(self) -> bool:
+        changed = False
+        operations = self._workspace_operations
+        identity = operations.reintegrate_identity
+        if identity is not None:
+            changed = operations.abandon_reintegrate(identity) or changed
+        return self._abandon_reintegrate_successor() or changed
+
     def _reintegrate_action(self, dimension) -> None:
         operations = self._workspace_operations
         active = operations.reintegrate_identity
@@ -2156,7 +2413,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             accepted = operations.cancel_reintegrate(dimension)
             if not accepted:
                 return
-            notice = f"Cancelling Reintegrate {dimension[0]}-D…"
+            notice = f"Stopping Reintegrate {dimension[0]}-D…"
             self._notice(notice)
             if (
                 operations.current_identity is active
@@ -2167,6 +2424,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         if self._authored_assets.busy:
             self._notice("Reintegrate is unavailable while authored-asset confirmation is pending.")
+            self._refresh_shell(); return
+        if self._context_controller.browse_pending:
+            self._notice(
+                "Reintegrate is unavailable while Browse cleanup is pending."
+            )
             self._refresh_shell(); return
         if not self._commit_focused_control_edit_for_run(): return
         snapshot = self._intents.snapshot()
@@ -2191,7 +2453,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         same_browse = (
             recaptured is not None and captured.is_exactly(recaptured)
         )
-        if current.revision != snapshot.revision or current_preparation != preparation or not same_browse or not self._context_controller.invalidate_reintegrate_browse(captured):
+        if current.revision != snapshot.revision or current_preparation != preparation or not same_browse:
             self._notice("Reintegrate context changed before dispatch."); self._refresh_shell(); return
         identity = operations.begin_reintegrate(
             captured,
@@ -2200,14 +2462,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             stamp=stamp,
         )
         if identity is None:
-            self._processed_browser.adopt_reload(
-                ReintegrateReloadDirective(
-                    captured.request,
-                    captured.target,
-                )
+            self._notice(
+                f"Reintegrate {dimension[0]}-D was not started; "
+                "the selected artifact is unchanged."
             )
-            self._retry_pending_reintegrate_reload(); self._notice(f"Reintegrate {dimension[0]}-D was not started; Browse is reloading."); self._refresh_shell(); return
-        self._notice(f"Reintegrating {dimension[0]}-D from authenticated loaded artifact science…"); self._refresh_shell(); self._ensure_timer()
+            self._refresh_shell(); return
+        self._notice(
+            f"Reintegrating {dimension[0]}-D into a new immutable version…"
+        ); self._refresh_shell(); self._ensure_timer()
 
     def _consume_reintegrate_update(
         self, update: object,
@@ -2235,6 +2497,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._processed_browser.adopt_reload(
                 transition.reintegrate_reload
             )
+        if transition.reintegrate_successor is not None:
+            adoption = self._processed_browser.adopt_reintegrate_successor(
+                transition.reintegrate_successor
+            )
+            self._begin_pending_reintegrate_successor(adoption)
+        if transition.request_catalog:
+            self._request_browser_catalog()
         if transition.effect is WorkspaceRefreshEffect.FULL:
             self._retry_pending_reintegrate_reload()
         return transition.effect
@@ -2398,6 +2667,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         first = not self._closing
         if first:
             self._closing = True
+            self._deferred_browse_selection = None
+            self._abandon_reintegrate_display_owner()
             self._retire_native_plot_axis_transition()
             self._retire_batch_presentation(force=True)
             self._apply_authored_asset_transition(
@@ -2871,6 +3142,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._choose_browser_directory()
             return
         if kind is ShellCommandKind.REFRESH_BROWSER:
+            self._deferred_browse_selection = None
+            self._abandon_reintegrate_display_owner()
             self._processed_browser.clear_directory_cache()
             self._request_browser_catalog()
             return
@@ -3873,6 +4146,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         if type(is_directory) is not bool:
             return
+        self._abandon_reintegrate_display_owner()
+        successor = self._processed_browser.pending_reintegrate_successor
+        if (
+            successor is not None
+            and successor.phase is ReintegrateSuccessorPhase.CANCELLING
+            and successor.request is not None
+        ):
+            self._deferred_browse_selection = _DeferredBrowseSelection(
+                successor.request, value, is_directory,
+            )
+            self._ensure_timer()
+            return
         terminal_request = self._processed_browser.terminal_request
         if is_directory:
             self._set_browser_directory(value, explicit=True)
@@ -4028,6 +4313,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if not self._settle_browse_1d_before_drain():
             return
+        successor = self._processed_browser.pending_reintegrate_successor
+        if (
+            successor is not None
+            and successor.phase is ReintegrateSuccessorPhase.PENDING
+        ):
+            self._begin_pending_reintegrate_successor(successor)
         pending_reintegrate_reload_changed = bool(
             pending_reintegrate_reload
             and self._processed_browser.pending_reintegrate_reload is None
@@ -4052,6 +4343,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if self._context_controller.poll_browse_preview():
             changed = True
         if self._context_controller.browse_pending:
+            successor_owner = self._reintegrate_successor_owner_for_poll()
+            successor_adoption = (
+                self._processed_browser.pending_reintegrate_successor
+            )
             handoff = self._processed_browser.terminal_handoff
             terminal_request = (
                 None if handoff is None else handoff.request
@@ -4064,7 +4359,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
             )
             try:
-                outcome = self._context_controller.poll_browse()
+                outcome = self._context_controller.poll_browse(
+                    reintegrate_successor_owner=successor_owner,
+                )
             except Exception as error:
                 self._error_notice("Browse failed", error)
                 outcome = None
@@ -4077,6 +4374,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 load_outcome = (
                     outcome if type(outcome) is BrowseLoadOutcome else None
                 )
+                successor_settled = bool(
+                    load_outcome is not None
+                    and type(successor_adoption)
+                    is ReintegrateSuccessorAdoption
+                    and self._settle_reintegrate_successor_browse(
+                        load_outcome, successor_adoption,
+                    )
+                )
                 settle_started = (
                     None
                     if terminal_request is None
@@ -4084,8 +4389,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         terminal_request
                     )
                 )
-                reuse_terminal_science = self._settle_terminal_browse(
-                    outcome
+                reuse_terminal_science = (
+                    False
+                    if successor_settled
+                    else self._settle_terminal_browse(outcome)
                 )
                 if (
                     terminal_request is not None
@@ -4108,11 +4415,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 ):
                     browse_presentation_ready = presentation
                 changed = True
-                detail = getattr(outcome, "detail", "")
-                self._notice(detail)
+                if not successor_settled:
+                    detail = getattr(outcome, "detail", "")
+                    self._notice(detail)
                 current = self._context_controller.navigation.current
                 if current is not None:
                     self._follow_processed_artifact(current)
+            if self._retire_cancelled_reintegrate_successor():
+                changed = True
+        if self._retire_lost_reintegrate_successor():
+            changed = True
         handoff = self._processed_browser.terminal_handoff
         if (
             handoff is not None
@@ -6182,6 +6494,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             mask_active=mask_active,
             reintegrate_available=(not self._closing and not self._closed
                 and self._admission_state is None
+                and not self._context_controller.browse_pending
                 and intent.processing_mode != "Int 1D (XYE)"
                 and (phase is RunPhase.IDLE or phase is RunPhase.FAILED
                      and self._lifecycle.reset_permitted)
@@ -6189,6 +6502,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             reintegrate_active=reintegrate_active,
             reintegrate_dimension=(
                 self._workspace_operations.reintegrate_dimension
+            ),
+            reintegrate_stop_accepted=(
+                self._workspace_operations.reintegrate_cancel_accepted
             ),
         )
         if self._analysis_operation_busy():

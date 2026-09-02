@@ -1177,6 +1177,25 @@ def test_self_external_hdf_graph_is_one_typed_preparation_miss(tmp_path):
     assert offer.miss_code.value == "SOURCE_TOPOLOGY_UNSUPPORTED"
 
 
+def test_prepared_source_root_change_is_one_whole_offer_miss(tmp_path):
+    from xrd_tools.reduction import prepare_reintegrate_bundle
+
+    seeded = _seed_existing(
+        tmp_path, labels=(2, 5), name="prepared-source-root-change",
+    )
+    source = _prepared_eligible_source(seeded)
+    offer = prepare_reintegrate_bundle(
+        source,
+        entry="entry",
+        labels=seeded.labels,
+        source_root=str(seeded.target.parent / "different-source-root"),
+    )
+
+    assert offer.disposition == "MISS"
+    assert offer.bundle is None
+    assert offer.miss_code.value == "SOURCE_ROOT_CHANGED"
+
+
 @pytest.mark.parametrize("regression", ("source", "member"))
 def test_prepared_append_recipe_refuses_revision_regression(
     tmp_path, regression,
@@ -2394,6 +2413,40 @@ def test_capsule_miss_is_one_visible_result_diagnostic_across_recipe_reuse(
         expected_terminal=None,
     )
     assert run_reintegrate_successor(direct).diagnostics == ()
+
+
+@pytest.mark.parametrize("dimension", ("1d", "2d"))
+def test_capsule_miss_allows_changed_click_integration_settings(
+    tmp_path, monkeypatch, dimension,
+):
+    from xrd_tools.reduction import (
+        ReintegrateSuccessorPlan,
+        run_reintegrate_successor,
+    )
+
+    seeded = _seed_existing(
+        tmp_path, labels=(2, 5), name=f"miss-changed-science-{dimension}",
+    )
+    preparation = _dimension_preparation(seeded, dimension)
+    key = "npt" if dimension == "1d" else "npt_rad"
+    preparation["selected_plan"]["bai_args"][key] += 1
+    output = seeded.target.parent / f"miss-changed-{dimension}.nexus"
+    plan = ReintegrateSuccessorPlan.from_prepared_or_artifact(
+        None,
+        seeded.target,
+        entry="entry",
+        dimension=dimension,
+        preparation=preparation,
+        source_root=str(seeded.target.parent),
+        expected_labels=seeded.labels,
+        explicit_output=output,
+    )
+
+    _stub_integrators(monkeypatch)
+    result = run_reintegrate_successor(plan)
+    assert result.disposition == "COMMITTED"
+    assert result.output_artifact == str(output.resolve())
+    assert seeded.target.exists()
 
 
 @pytest.mark.parametrize(

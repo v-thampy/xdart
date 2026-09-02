@@ -47,6 +47,7 @@ def _loaded_capture(request, *, context=None, labels=(0, 1, 2)):
         HydrationOwner,
     )
     from xrd_tools.io.output_transaction import TargetSnapshot
+    from xrd_tools.reduction import prepare_reintegrate_bundle
 
     if context is not None:
         return LoadedBrowseCapture(
@@ -57,8 +58,13 @@ def _loaded_capture(request, *, context=None, labels=(0, 1, 2)):
             context.target_entry,
             context.target_snapshot,
             context.loaded_labels,
+            context.prepared_reintegrate_offer,
         )
     detached = object.__new__(BrowseContext)
+    offer = prepare_reintegrate_bundle(
+        None, entry="entry", labels=tuple(labels),
+    )
+    object.__setattr__(detached, "prepared_reintegrate_offer", offer)
     return LoadedBrowseCapture(
         detached,
         request,
@@ -71,6 +77,7 @@ def _loaded_capture(request, *, context=None, labels=(0, 1, 2)):
         "entry",
         TargetSnapshot(True, 17, 4, 2, 3, "d" * 64),
         tuple(labels),
+        offer,
     )
 
 
@@ -119,7 +126,7 @@ def test_browse_worker_reports_one_frozen_stage_aggregate(
         def __exit__(self, exc_type, exc, tb):
             return self._reader.__exit__(exc_type, exc, tb)
 
-    clock = _StepClock(range(14))
+    clock = _StepClock(range(16))
     loader = module.BrowseLoader(
         clock=clock,
         perf_enabled=lambda: gate_calls.append(True) or gate[0],
@@ -154,10 +161,14 @@ def test_browse_worker_reports_one_frozen_stage_aggregate(
         1.0,
         1.0,
         1.0,
-        13.0,
+        15.0,
+        prepared_capsule_s=1.0,
+        prepared_bundle_bytes=0,
+        prepared_1d_status="MISS",
+        prepared_2d_status="MISS",
     )
     assert gate_calls == [True]
-    assert clock.calls == 14
+    assert clock.calls == 16
     assert catalog_passes == [str(seeded.target.resolve())]
     with pytest.raises(FrozenInstanceError):
         outcome.timing.record_count = 0
@@ -223,7 +234,7 @@ def test_terminal_browse_log_uses_worker_canonical_path_for_symlink_alias(
     request = BrowseLoadRequest("alias-terminal", 7, str(alias))
     assert request.source_path != canonical
     loader = module.BrowseLoader(
-        clock=_StepClock(range(14)),
+        clock=_StepClock(range(16)),
         perf_enabled=lambda: True,
     )
     loader.begin(request)
@@ -297,7 +308,7 @@ def test_terminal_browse_log_uses_worker_canonical_path_for_symlink_alias(
         assert owner.retry_close()
 
 
-@pytest.mark.parametrize("fail_at", (1, 14), ids=("start", "final"))
+@pytest.mark.parametrize("fail_at", (1, 16), ids=("start", "final"))
 def test_browse_worker_clock_failure_drops_timing_not_ready_context(
     tmp_path, fail_at: int,
 ) -> None:
@@ -684,7 +695,8 @@ def test_terminal_browse_loading_status_restores_complete_after_repaint(
         request, BrowseLoadStatus.READY, timing=timing,
     )
 
-    def poll_browse():
+    def poll_browse(*, reintegrate_successor_owner=None):
+        assert reintegrate_successor_owner is None
         pending[0] = False
         return outcome
 

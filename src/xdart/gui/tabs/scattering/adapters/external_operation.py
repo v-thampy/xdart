@@ -24,7 +24,12 @@ from ..operation_values import (
 )
 from ..presentation_background import PresentationBackgroundOwner
 from xrd_tools.reduction.background import DisplayBackgroundPlan
-from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot
+from xrd_tools.io.bounded_json import BoundedJsonError, bounded_json_snapshot
+from xrd_tools.io.output_transaction import (
+    StreamTerminal,
+    TargetSnapshot,
+    stream_terminal_object_revision,
+)
 from xrd_tools.reduction import ReintegratePlan, ReintegrateProgress, ReintegrateResult, run_reintegrate
 from xrd_tools.reduction.reintegrate import ReintegrateCancelled
 from xrd_tools.session.run_configuration import FrozenRunConfiguration
@@ -44,6 +49,17 @@ class _ReintegrateRequest:
     expected_labels: tuple[int, ...]
     dimension: str
     preparation_json: str
+@dataclass(frozen=True, slots=True)
+class _ReintegrateSuccessorRequest:
+    source_artifact: str
+    entry: str
+    source_root: str | None
+    expected_target_snapshot: TargetSnapshot
+    expected_terminal_identity: StreamTerminal | None
+    expected_labels: tuple[int, ...]
+    dimension: str
+    preparation_json: str
+    prepared_offer: object
 @dataclass(frozen=True, slots=True)
 class _AverageRequest:
     configuration: FrozenRunConfiguration
@@ -327,6 +343,272 @@ class OperationSlot:
             raise TypeError("reintegration runner returned an invalid result")
         return OperationTerminal(identity, OperationTerminalStatus.RETURNED,
                                  payload=result)
+
+    def begin_reintegrate_successor(
+        self,
+        *,
+        source_artifact: str,
+        entry: str,
+        source_root: str | None,
+        expected_target_snapshot: TargetSnapshot,
+        expected_labels: tuple[int, ...],
+        dimension: str,
+        preparation_values: Mapping[str, object],
+        prepared_offer: object,
+        stamp: OperationContextStamp,
+        expected_terminal_identity: StreamTerminal | None = None,
+    ) -> OperationIdentity | None:
+        offer_type = type(prepared_offer)
+        offer_valid = (
+            offer_type.__module__
+            == "xrd_tools.reduction.reintegrate_prepared"
+            and offer_type.__name__ == "PreparedReintegrateOffer"
+            and self._is_frozen_dataclass(prepared_offer)
+        )
+        valid = (
+            type(source_artifact) is str
+            and bool(source_artifact)
+            and type(entry) is str
+            and bool(entry)
+            and (
+                source_root is None
+                or (
+                    type(source_root) is str
+                    and bool(source_root)
+                    and os.path.isabs(source_root)
+                    and os.path.normcase(os.path.normpath(source_root))
+                    == source_root
+                )
+            )
+            and type(expected_target_snapshot) is TargetSnapshot
+            and expected_target_snapshot.exists
+            and (
+                expected_terminal_identity is None
+                or type(expected_terminal_identity) is StreamTerminal
+            )
+            and type(expected_labels) is tuple
+            and bool(expected_labels)
+            and expected_labels == tuple(sorted(set(expected_labels)))
+            and all(
+                type(value) is int and value >= 0
+                for value in expected_labels
+            )
+            and dimension in {"1d", "2d"}
+            and isinstance(preparation_values, Mapping)
+            and offer_valid
+        )
+        if not valid:
+            return None
+        try:
+            detached, _encoded_bytes = bounded_json_snapshot(
+                preparation_values,
+                role="GUI reintegration preparation",
+                max_encoded_bytes=64 * 1024 * 1024,
+                max_key_bytes=8 * 1024 * 1024,
+                max_string_bytes=8 * 1024 * 1024,
+                max_depth=24,
+                max_nodes=262_144,
+                max_children=16_384,
+            )
+            preparation_json = json.dumps(
+                detached,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            replay = json.loads(preparation_json)
+            if type(detached) is not dict or replay != detached:
+                return None
+        except (BoundedJsonError, TypeError, ValueError, OverflowError):
+            return None
+        request = _ReintegrateSuccessorRequest(
+            source_artifact,
+            entry,
+            source_root,
+            expected_target_snapshot,
+            expected_terminal_identity,
+            expected_labels,
+            dimension,
+            preparation_json,
+            prepared_offer,
+        )
+        return self._begin(
+            request, stamp, self._run_reintegrate_successor_request,
+        )
+
+    @staticmethod
+    def _valid_reintegrate_successor_result(result, plan, result_type) -> bool:
+        if type(result) is not result_type:
+            return False
+        committed = result.disposition in {"COMMITTED", "ALREADY_COMMITTED"}
+        committed_labels = result.committed_labels
+        dropped_labels = result.publication_dropped_labels
+        labels_are_partition = bool(
+            type(committed_labels) is tuple
+            and committed_labels == tuple(sorted(set(committed_labels)))
+            and all(
+                type(label) is int and label >= 0
+                for label in committed_labels
+            )
+            and type(dropped_labels) is tuple
+            and dropped_labels == tuple(sorted(set(dropped_labels)))
+            and all(
+                type(label) is int and label >= 0
+                for label in dropped_labels
+            )
+            and not set(committed_labels).intersection(dropped_labels)
+            and set((*committed_labels, *dropped_labels)).issubset(
+                plan.labels
+            )
+            and (
+                (
+                    committed
+                    and bool(committed_labels)
+                    and tuple(sorted((
+                        *committed_labels, *dropped_labels,
+                    ))) == plan.labels
+                )
+                or (not committed and committed_labels == ())
+            )
+        )
+        audit_identity = result.audit_identity
+        valid_audit_identity = bool(
+            (
+                committed
+                and type(audit_identity) is str
+                and len(audit_identity) == 64
+                and all(
+                    character in "0123456789abcdef"
+                    for character in audit_identity
+                )
+            )
+            or (
+                not committed
+                and audit_identity is None
+            )
+        )
+        terminal = result.terminal
+        diagnostics = result.diagnostics
+        hidden_orphan = result.hidden_orphan
+        return bool(
+            result.source_artifact == plan.source_artifact
+            and result.output_artifact == plan.output_artifact
+            and type(result.input_labels) is tuple
+            and all(type(label) is int for label in result.input_labels)
+            and result.input_labels == plan.labels
+            and labels_are_partition
+            and valid_audit_identity
+            and result.science_identity == plan.science_identity
+            and result.version_identity == plan.version_identity
+            and result.publication_identity == plan.publication_identity
+            and result.operation_identity == plan.operation_identity
+            and result.disposition in {
+                "COMMITTED", "ALREADY_COMMITTED", "ABORTED",
+            }
+            and type(diagnostics) is tuple
+            and len(diagnostics) <= 16
+            and all(
+                type(value) is str
+                and len(value.encode("utf-8")) <= 4096
+                for value in diagnostics
+            )
+            and (
+                hidden_orphan is None
+                or type(hidden_orphan) is str
+                and bool(hidden_orphan)
+                and os.path.normcase(os.path.abspath(os.path.expanduser(
+                    hidden_orphan
+                ))) == hidden_orphan
+            )
+            and (not committed or hidden_orphan is None)
+            and committed == (type(terminal) is StreamTerminal)
+            and (
+                not committed
+                or stream_terminal_object_revision(terminal) is not None
+            )
+            and committed
+            == (
+                type(result.commit_identity) is str
+                and len(result.commit_identity) == 64
+                and all(character in "0123456789abcdef"
+                        for character in result.commit_identity)
+            )
+            and (
+                not committed
+                or terminal.target == result.output_artifact
+            )
+            and (
+                committed
+                or (
+                    result.terminal is None
+                    and result.commit_identity is None
+                )
+            )
+        )
+
+    def _run_reintegrate_successor_request(
+        self, request, identity, cancelled, publish,
+    ):
+        # These imports intentionally occur on scattering-operation-* only.
+        from xrd_tools.reduction import (
+            ReintegrateSuccessorPlan,
+            ReintegrateSuccessorProgress,
+            ReintegrateSuccessorResult,
+            run_reintegrate_successor,
+        )
+        from xrd_tools.reduction.reintegrate import ReintegrateCancelled
+
+        publish("prepare", 0, 1)
+        try:
+            plan = ReintegrateSuccessorPlan.from_prepared_or_artifact(
+                request.prepared_offer,
+                request.source_artifact,
+                entry=request.entry,
+                dimension=request.dimension,
+                preparation=json.loads(request.preparation_json),
+                source_root=request.source_root,
+                expected_target_snapshot=request.expected_target_snapshot,
+                expected_terminal_identity=request.expected_terminal_identity,
+                expected_labels=request.expected_labels,
+                cancel_token=cancelled,
+            )
+        except ReintegrateCancelled:
+            return OperationTerminal(
+                identity, OperationTerminalStatus.CANCELLED,
+            )
+        publish("prepare", 1, 1)
+        headless_revision = 0
+
+        def progress(value):
+            nonlocal headless_revision
+            try:
+                if (
+                    type(value) is not ReintegrateSuccessorProgress
+                    or value.operation_identity != plan.operation_identity
+                    or value.revision <= headless_revision
+                ):
+                    return
+                headless_revision = value.revision
+                if value.stage == "qualify":
+                    return
+                if value.stage == "publish" and value.completed == 0:
+                    return
+                publish(value.stage, value.completed, value.total)
+            except BaseException:
+                return
+
+        result = run_reintegrate_successor(
+            plan, cancel_token=cancelled, progress_cb=progress,
+        )
+        if not self._valid_reintegrate_successor_result(
+            result, plan, ReintegrateSuccessorResult,
+        ):
+            raise TypeError(
+                "immutable reintegration runner returned an invalid result"
+            )
+        return OperationTerminal(
+            identity, OperationTerminalStatus.RETURNED, payload=result,
+        )
 
     def begin_average(self, configuration: object, target: object, *,
                       entry: str = "entry",
