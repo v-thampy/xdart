@@ -180,11 +180,16 @@ def _seed_existing(tmp_path, *, labels=(2, 5, 9), append=False, gi=None, monitor
     selected_args = _integration_1d_args(one, gi); selected_args.pop("gi_mode_1d", None)
     selected = {"version": 1, "dimension": "1d", "bai_args": selected_args,
                 "gi_mode": None if gi is None else gi.mode_1d.value}
+    shared_gi = {key: provenance["gi"][key] for key in (
+        "enabled", "incidence_motor", "resolved_motor", "th_val",
+        "sample_orientation", "tilt_angle")}
+    if shared_gi["enabled"]:
+        shared_gi["gi_exit_angle_convention"] = provenance["gi"][
+            "gi_exit_angle_convention"
+        ]
     shared = {
         "version": 1,
-        "gi": {key: provenance["gi"][key] for key in (
-            "enabled", "incidence_motor", "resolved_motor", "th_val",
-            "sample_orientation", "tilt_angle")},
+        "gi": shared_gi,
         "threshold": provenance["threshold"], "poni_values": poni.to_dict(),
         "accepted_scientific_assets": assets, "geometry": None,
         "background": provenance.get("background", {"version": 1, "mode": "None"}),
@@ -2558,9 +2563,9 @@ def test_terminal_settlement_cleanup_retry_is_identity_stable_without_recompute(
     assert first.audit_identity == second.audit_identity and counts == (len(reads), len(reductions))
 
 
-def test_v1_science_audit_is_readmitted_by_v2_plan(tmp_path, monkeypatch):
+def test_v1_science_audit_is_readmitted_by_v3_plan(tmp_path, monkeypatch):
     module = _module()
-    seeded = _seed_existing(tmp_path, name="v1-science-v2-plan")
+    seeded = _seed_existing(tmp_path, name="v1-science-v3-plan")
     plan = module.ReintegratePlan.from_artifact(
         seeded.target, entry="entry", dimension="1d",
         preparation=seeded.preparation)
@@ -2569,7 +2574,7 @@ def test_v1_science_audit_is_readmitted_by_v2_plan(tmp_path, monkeypatch):
         "selected_plan": plan.selected_plan,
         "requested_shared_science": plan.requested_shared_science,
     })
-    assert plan.api_version == 2
+    assert plan.api_version == 3
     assert plan.science_identity == expected_science
     _stub_integrators(monkeypatch)
     assert module.run_reintegrate(plan).disposition == "COMMITTED"
@@ -2582,7 +2587,7 @@ def test_v1_science_audit_is_readmitted_by_v2_plan(tmp_path, monkeypatch):
     replay = module.ReintegratePlan.from_artifact(
         seeded.target, entry="entry", dimension="1d",
         preparation=seeded.preparation)
-    assert replay.api_version == 2
+    assert replay.api_version == 3
     assert replay.science_identity == expected_science
 
 
@@ -2594,8 +2599,8 @@ def test_plan_preparation_recipe_roundtrip_share_one_runner_and_writer(tmp_path,
         seeded.target, entry="entry", dimension="1d", preparation=seeded.preparation)
     recipe = plan.as_recipe(); values = recipe["plan"]; session = values["session_policy"]; allocation = session["allocation"]
     assert set(recipe) == {"schema", "version", "plan"} and recipe["schema"] == "xrd_tools.reintegrate.plan"
-    assert recipe["version"] == values["api_version"] == plan.api_version == 2
-    plan_keys = {"api_version", "target", "entry", "expected_target_snapshot", "dimension", "labels", "detector_shape", "native_dtype", "selected_plan", "requested_shared_science", "gi_bootstrap_incidence", "retained_mask_bytes", "mask_decode_bytes", "session_policy", "rollback_policy", "science_identity", "operation_identity"}
+    assert recipe["version"] == values["api_version"] == plan.api_version == 3
+    plan_keys = {"api_version", "target", "entry", "source_root", "expected_target_snapshot", "dimension", "labels", "detector_shape", "native_dtype", "selected_plan", "requested_shared_science", "gi_bootstrap_incidence", "retained_mask_bytes", "mask_decode_bytes", "session_policy", "rollback_policy", "science_identity", "operation_identity"}
     requirement_keys = {"height", "width", "native_itemsize", "background_bytes", "modes_1d", "modes_2d", "npt_1d", "npt_rad", "npt_azim", "sigma_1d", "sigma_2d", "resolver_background_bytes", "worker_background_bytes", "background_binding_bytes"}
     count_keys = {"workers", "reduction_inflight", "queue_depth", "owner_block_bytes", "staging_items", "record_heavy_items", "publication_heavy_items", "thumbnail_items", "record_items", "publication_items"}; category_keys = {"source_native", "staging", "records", "publication", "worker"}
     nodes = ((values, plan_keys), (values["expected_target_snapshot"], {"exists", "size", "mtime_ns", "device", "inode", "digest"}), (session, {"flush", "allocation"}), (session["flush"], {"interval", "cap", "margin"}), (allocation, {"requirements", "envelope_bytes", "counts", "categories", "minimum_bytes", "floor_bytes", "assigned_bytes", "origin", "oversize_excess_bytes"}), (allocation["requirements"], requirement_keys), (allocation["counts"], count_keys), (allocation["categories"], category_keys), (values["selected_plan"], {"version", "dimension", "bai_args", "gi_mode"}), (values["requested_shared_science"], {"version", "gi", "threshold", "poni_values", "accepted_scientific_assets", "geometry", "background"}))
@@ -2606,7 +2611,7 @@ def test_plan_preparation_recipe_roundtrip_share_one_runner_and_writer(tmp_path,
     explicit_plan = module.ReintegratePlan.from_artifact(seeded.target, entry="entry", dimension="1d", preparation=explicit)
     assert explicit_plan.resource_allocation == plan.resource_allocation and explicit_plan.operation_identity == plan.operation_identity and set(seeded.preparation["resource_policy"]) == {"version", "kind", "envelope_bytes", "requests"}
     named_seed = _seed_existing(tmp_path, gi=GIMode(incidence_motor="theta"), name="recipe-bootstrap"); named_plan = module.ReintegratePlan.from_artifact(named_seed.target, entry="entry", dimension="1d", preparation=named_seed.preparation)
-    facts = (named_plan.target, named_plan.entry, named_plan.dimension, named_plan.labels, named_plan.detector_shape, named_plan.native_dtype, module._plain(named_plan.selected_plan), module._plain(named_plan.requested_shared_science)); first = module._make_plan(*facts, named_plan.gi_bootstrap_incidence, named_plan.retained_mask_bytes, named_plan.mask_decode_bytes, named_plan.session_policy, snapshot=named_plan.expected_target_snapshot); second = module._make_plan(*facts, .3, named_plan.retained_mask_bytes, named_plan.mask_decode_bytes, named_plan.session_policy, snapshot=named_plan.expected_target_snapshot)
+    facts = (named_plan.target, named_plan.entry, named_plan.source_root, named_plan.dimension, named_plan.labels, named_plan.detector_shape, named_plan.native_dtype, module._plain(named_plan.selected_plan), module._plain(named_plan.requested_shared_science)); first = module._make_plan(*facts, named_plan.gi_bootstrap_incidence, named_plan.retained_mask_bytes, named_plan.mask_decode_bytes, named_plan.session_policy, snapshot=named_plan.expected_target_snapshot); second = module._make_plan(*facts, .3, named_plan.retained_mask_bytes, named_plan.mask_decode_bytes, named_plan.session_policy, snapshot=named_plan.expected_target_snapshot)
     assert first.science_identity == second.science_identity == named_plan.science_identity and first.operation_identity == named_plan.operation_identity != second.operation_identity
     with monkeypatch.context() as patch:
         patch.setattr(module, "capture_target_snapshot", lambda *_: pytest.fail("recipe touched artifact"))
