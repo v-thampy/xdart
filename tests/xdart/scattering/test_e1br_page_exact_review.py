@@ -138,6 +138,7 @@ def _dispose(page: ScatteringWorkspace, qapp: QtWidgets.QApplication) -> None:
 
 def test_throwing_drain_exception_text_is_contained_at_page_boundary(
     qapp: QtWidgets.QApplication,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     executor = _Executor()
     page, lifecycle, _identity = _active_page(executor)
@@ -148,6 +149,14 @@ def test_throwing_drain_exception_text_is_contained_at_page_boundary(
         page._drain_executor()
         assert lifecycle.phase is RunPhase.RUNNING
         assert shell.scientific.status.text()
+        records = [
+            record for record in caplog.records
+            if record.name == "xdart.gui.tabs.scattering.page"
+            and record.getMessage() == "Standard event drain failed"
+        ]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert records[0].exc_info[0] is _UnprintableError
     finally:
         executor.drain_error = None
         _dispose(page, qapp)
@@ -156,6 +165,7 @@ def test_throwing_drain_exception_text_is_contained_at_page_boundary(
 def test_throwing_shell_apply_is_contained_at_page_boundary(
     qapp: QtWidgets.QApplication,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     executor = _Executor()
     page, lifecycle, _identity = _active_page(executor)
@@ -180,6 +190,14 @@ def test_throwing_shell_apply_is_contained_at_page_boundary(
             "Passive shell render failed: <unprintable>"
         )
         assert commits == []
+        records = [
+            record for record in caplog.records
+            if record.name == "xdart.gui.tabs.scattering.page"
+            and record.getMessage() == "Passive shell render failed"
+        ]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert records[0].exc_info[0] is _UnprintableError
     finally:
         monkeypatch.undo()
         _dispose(page, qapp)

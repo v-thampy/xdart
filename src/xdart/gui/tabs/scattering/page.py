@@ -6333,6 +6333,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
                 self._scientific_repaint_pending = not rebound
         except Exception as error:
+            _LOG.exception("Passive shell render failed")
             if cache_trace_snapshot is not None:
                 self._last_scientific_projection = None
                 self._scientific_repaint_pending = True
@@ -7815,6 +7816,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _error_notice(
         self, prefix: str, error: Exception
     ) -> None:
+        _LOG.exception(prefix)
         self._notice(
             f"{prefix}: {detached_exception_strings(error)[2]}"
         )
