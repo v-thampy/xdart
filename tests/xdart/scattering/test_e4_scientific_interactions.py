@@ -351,6 +351,78 @@ def test_single_compatible_update_reuses_curve_item(
         _dispose(view)
 
 
+def test_single_live_view_clipping_requires_an_increasing_finite_axis() -> None:
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    view = ScientificView()
+    projection = make_shell_projection(plot_mode="Single")
+    try:
+        _reconcile(view, projection.scientific, projection.navigation)
+        item = view.curve.listDataItems()[0]
+        trace = projection.scientific.traces[0]
+        assert item.opts["clipToView"] is True
+        original_x, original_y = item.getOriginalDataset()
+        np.testing.assert_array_equal(original_x, trace.axis.values)
+        np.testing.assert_array_equal(original_y, trace.intensity)
+
+        overlay = replace(projection.scientific, plot_mode="Overlay")
+        _reconcile(view, overlay, projection.navigation)
+        assert view.curve.listDataItems() == [item]
+        assert item.opts["clipToView"] is False
+
+        descending_axis = replace(
+            trace.axis,
+            values=trace.axis.values[::-1].copy(),
+        )
+        descending = replace(
+            projection.scientific,
+            traces=(replace(trace, axis=descending_axis),),
+        )
+        _reconcile(view, descending, projection.navigation)
+        assert view.curve.listDataItems() == [item]
+        assert item.opts["clipToView"] is False
+
+        nonfinite_values = trace.axis.values.copy()
+        nonfinite_values[1] = np.nan
+        nonfinite = replace(
+            projection.scientific,
+            traces=(replace(
+                trace,
+                axis=replace(trace.axis, values=nonfinite_values),
+            ),),
+        )
+        _reconcile(view, nonfinite, projection.navigation)
+        assert view.curve.listDataItems() == [item]
+        assert item.opts["clipToView"] is False
+    finally:
+        _dispose(view)
+
+
+def test_unchanged_overlay_does_not_rebuild_offset_arrays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    projection = make_shell_projection(
+        frame_count=5,
+        selected_index=4,
+        heavy_indices=(4,),
+        plot_mode="Overlay",
+    )
+    view = ScientificView()
+    try:
+        _reconcile(view, projection.scientific, projection.navigation)
+        retained = tuple(view.curve.listDataItems())
+        monkeypatch.setattr(
+            "xdart.gui.tabs.scattering.scientific_view._offset_intensity",
+            lambda *_args, **_kwargs: pytest.fail(
+                "unchanged retained curves rebuilt their offset arrays"
+            ),
+        )
+        _reconcile(view, projection.scientific, projection.navigation)
+        assert tuple(view.curve.listDataItems()) == retained
+    finally:
+        _dispose(view)
+
+
 def test_mode_switch_retains_trace_items_history_and_axis_labels(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

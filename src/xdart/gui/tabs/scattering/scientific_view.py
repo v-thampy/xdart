@@ -1732,6 +1732,7 @@ class ScientificView(QtWidgets.QFrame):
             keys,
             traces,
             overlay_step=(overlay_step if stacked_selection else 0.0),
+            clip_single_live=state.plot_mode == "Single",
             allow_single_rebind=(
                 state.plot_mode == "Single"
                 and state.plot_options == self._rendered_plot_options
@@ -1773,6 +1774,7 @@ class ScientificView(QtWidgets.QFrame):
         traces: tuple[TraceProjection, ...],
         *,
         overlay_step: float,
+        clip_single_live: bool,
         allow_single_rebind: bool,
     ) -> None:
         """Diff one curve presentation without recreating retained items."""
@@ -1825,14 +1827,20 @@ class ScientificView(QtWidgets.QFrame):
                 title,
             )
             style_contract = _TRACE_COLORS[index % len(_TRACE_COLORS)]
-            contract = (data_contract, style_contract)
-            y_values = _offset_intensity(
-                trace.intensity,
-                index,
-                overlay_step,
-            )
             item = self._curve_items_by_key.get(key)
             prior_contract = self._curve_item_contracts.get(key)
+            clip_eligible = (
+                prior_contract[2]
+                if prior_contract is not None
+                and prior_contract[0][0] == data_contract[0]
+                else _axis_supports_view_clipping(trace.axis.values)
+            )
+            contract = (data_contract, style_contract, clip_eligible)
+            data_changed = (
+                item is None
+                or prior_contract is None
+                or prior_contract[0] != data_contract
+            )
             if item is None:
                 pen = pg.mkPen(
                     color=style_contract,
@@ -1841,20 +1849,25 @@ class ScientificView(QtWidgets.QFrame):
                 )
                 item = self.curve.plot(
                     trace.axis.values,
-                    y_values,
+                    _offset_intensity(
+                        trace.intensity,
+                        index,
+                        overlay_step,
+                    ),
                     name=title,
                     pen=pen,
                     connect="finite",
                 )
                 self._curve_items_by_key[key] = item
             else:
-                if (
-                    prior_contract is None
-                    or prior_contract[0] != data_contract
-                ):
+                if data_changed:
                     item.setData(
                         trace.axis.values,
-                        y_values,
+                        _offset_intensity(
+                            trace.intensity,
+                            index,
+                            overlay_step,
+                        ),
                         name=title,
                         connect="finite",
                     )
@@ -1884,9 +1897,19 @@ class ScientificView(QtWidgets.QFrame):
         current = tuple(self.curve.listDataItems())
         if current != desired:
             for item in current:
+                if bool(item.opts.get("clipToView", False)):
+                    item.setClipToView(False)
                 self.curve.removeItem(item)
             for item in desired:
                 self.curve.addItem(item)
+        for key, item in zip(keys, desired, strict=True):
+            desired_clip = bool(
+                clip_single_live
+                and key[0] == "live"
+                and self._curve_item_contracts[key][2]
+            )
+            if bool(item.opts.get("clipToView", False)) != desired_clip:
+                item.setClipToView(desired_clip)
         self._curve_mounted_keys = keys
 
         desired_keys = set(keys)
@@ -2724,6 +2747,21 @@ def _offset_intensity(
     if index == 0 or offset_step == 0.0:
         return values
     return values + index * offset_step
+
+
+def _axis_supports_view_clipping(values: np.ndarray) -> bool:
+    """Return whether pyqtgraph may safely clip this ordered x domain."""
+
+    axis = np.asarray(values)
+    try:
+        return bool(
+            axis.ndim == 1
+            and axis.size > 1
+            and np.isfinite(axis).all()
+            and np.all(axis[1:] > axis[:-1])
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _overlay_step(
