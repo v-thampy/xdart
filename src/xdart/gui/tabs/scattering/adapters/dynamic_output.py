@@ -1380,7 +1380,6 @@ class DynamicOutputAdapter:
                 dynamic_nexus_checkpoint=bool(
                     nexus is not None
                     and policy is not None
-                    and not self.configuration.live_mode
                 ),
                 dynamic_nexus_checkpoint_threshold=(
                     pipeline_v2.semantic_checkpoint_frame_cap

@@ -2282,6 +2282,7 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
     resolve = dynamic_output.resolve_session_policy
     open_session = dynamic_output.open_headless_scan_session
     observed = []
+    checkpoint_observed = []
     v2_observed = []
 
     def fixed_envelope(requirements, **kwargs):
@@ -2290,6 +2291,12 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
 
     def capture_session(*args, **kwargs):
         session = open_session(*args, **kwargs)
+        checkpoint_observed.append((
+            kwargs["dynamic_nexus_checkpoint"],
+            kwargs["dynamic_nexus_checkpoint_threshold"],
+            session._dynamic_nexus_checkpoint_threshold,
+            session._policy.flush.hard_threshold(),
+        ))
         observed.append((
             kwargs["sink"].writer_batch_size, kwargs["inflight_max"],
             kwargs["dynamic_nexus_checkpoint_threshold"],
@@ -2328,6 +2335,12 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
         assert terminal.kind is StandardEventKind.FINISHED
         assert _nexus_rows(target) == (1,)
         assert observed == [expected]
+        assert checkpoint_observed == [(
+            True,
+            expected_pipeline[3],
+            expected_pipeline[3],
+            expected_pipeline[4] - 8,
+        )]
         assert v2_observed == ([] if len(expected_pipeline) == 3 else [
             (
                 expected_pipeline[0],
@@ -2379,6 +2392,74 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
             ) in v2_facts[0]
     finally:
         executor.close(identity)
+
+
+def test_live_gui_checkpoint_uses_the_exact_policy_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir()
+    raw = raw_root / "live_checkpoint_0001.tif"
+    poni = tmp_path / "live_checkpoint.poni"
+    _write_tiff(raw, 7)
+    write_poni(poni)
+    intent = _live_directory_intent(
+        raw_root,
+        tmp_path / "processed",
+        poni,
+        processing_mode="Int 1D",
+    )
+    resolve = dynamic_output.resolve_session_policy
+    open_session = dynamic_output.open_headless_scan_session
+    observed = []
+
+    def fixed_envelope(requirements, **kwargs):
+        kwargs["envelope_bytes"] = 64 * 1024 ** 3
+        return resolve(requirements, **kwargs)
+
+    def capture_session(*args, **kwargs):
+        session = open_session(*args, **kwargs)
+        observed.append((
+            kwargs["dynamic_nexus_checkpoint"],
+            kwargs["dynamic_nexus_checkpoint_threshold"],
+            session._dynamic_nexus_checkpoint_threshold,
+            session._policy.flush.hard_threshold(),
+        ))
+        return session
+
+    monkeypatch.setattr(
+        dynamic_output, "resolve_session_policy", fixed_envelope,
+    )
+    monkeypatch.setattr(
+        dynamic_output, "open_headless_scan_session", capture_session,
+    )
+    executor = StandardRunExecutor(join_timeout=2.0)
+    identity = _start(executor, intent, request_value=1715)
+    try:
+        _drain_until(
+            executor,
+            lambda values: any(
+                event.kind is StandardEventKind.FRAME_READY
+                for event in values
+            ),
+        )
+        assert observed == [(True, None, 56, 56)]
+    finally:
+        executor.stop(identity)
+        terminal_events = _drain_until(
+            executor,
+            lambda values: any(event.kind in _TERMINAL for event in values),
+        )
+        assert next(
+            event for event in terminal_events if event.kind in _TERMINAL
+        ).kind is StandardEventKind.STOPPED
+        assert (
+            executor.close(identity).cleanup_status
+            is CleanupStatus.CLEANED
+        )
 
 
 def test_post_g2_funded_staging_partial_grant_refuses_before_output_and_retries(

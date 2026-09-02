@@ -1251,6 +1251,107 @@ def test_c2_dynamic_nexus_checkpoints_policy_threshold_on_settled_batches(
     assert len(accounting.snapshot().durable) == frame_count
 
 
+def test_c2_dynamic_checkpoint_failure_restores_prior_and_revokes_pending_durable(
+    tmp_path,
+):
+    from xrd_tools.reduction import (
+        Integration1DPlan,
+        NexusSink,
+        NexusTerminalDisposition,
+        ReductionPlan,
+    )
+    from xrd_tools.session import (
+        FlushPolicy,
+        SessionResourceRequirements,
+        open_headless_scan_session,
+        resolve_session_policy,
+    )
+
+    target = tmp_path / "checkpoint-failure-rollback.nexus"
+    prior = b"immutable prior checkpoint target"
+    target.write_bytes(prior)
+    _ledger, accounting, mode, target_name = accounting_for(
+        target, max_attempts=2, max_outstanding=3,
+    )
+    tokens = [_armed_submission(accounting, label=label) for label in range(3)]
+
+    class FailThirdIntegrator(DeterministicIntegrator):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def integrate1d(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 3:
+                raise RuntimeError("injected post-checkpoint reduction failure")
+            return super().integrate1d(*args, **kwargs)
+
+    integrator = FailThirdIntegrator()
+    live = tuple(SimpleNamespace(
+        idx=label,
+        map_raw=np.ones((2, 2)),
+        bg_raw=None,
+        scan_info={},
+        source_file=str(tmp_path / f"checkpoint-failure-{label}.tif"),
+        source_frame_idx=0,
+        mask=None,
+        poni=None,
+        integrator=integrator,
+    ) for label in range(3))
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(npt=8), integration_2d=None,
+    )
+    policy = resolve_session_policy(
+        SessionResourceRequirements(
+            height=2, width=2, native_itemsize=8, modes_1d=1, npt_1d=8,
+        ),
+        envelope_bytes=64 * 1024 ** 3,
+        requested_workers=1,
+        requests={"reduction_inflight": 2},
+        flush=FlushPolicy(interval=3, cap=3, margin=1),
+        env={},
+    )
+    session = open_headless_scan_session(
+        _exact_scan(live, name="checkpoint-failure"),
+        plan,
+        sink=NexusSink(
+            target, overwrite=True, atomic=False, flush_every=None,
+        ),
+        accounting=accounting,
+        executor=policy.allocation.workers,
+        inflight_max=policy.allocation.reduction_inflight,
+        nexus_target=target_name,
+        policy=policy,
+        dynamic_nexus_checkpoint=True,
+    )
+    for frame, (_key, token) in zip(session.scan.frames[:2], tokens[:2]):
+        assert session.submit(frame, attempt_token=token)
+    assert session.pause(timeout=5.0)
+
+    staged = accounting.snapshot()
+    assert session._dynamic_nexus_checkpoint_threshold == 2
+    assert session._dynamic_nexus_checkpoint_count == 0
+    assert staged.pending_durable == frozenset(
+        (key, mode, target_name) for key, _token in tokens[:2]
+    )
+    assert staged.durable == frozenset()
+    assert _rows(target) == (0, 1)
+
+    session.resume()
+    assert session.submit(session.scan.frames[2], attempt_token=tokens[2][1])
+    result = session.finish(raise_on_failure=False)
+    assert result.failed and not result.cancelled
+    assert result.error == "injected post-checkpoint reduction failure"
+    assert (
+        session.terminal_result.disposition
+        is NexusTerminalDisposition.ABORTED
+    )
+    assert target.read_bytes() == prior
+    settled = accounting.snapshot()
+    assert settled.pending_durable == settled.durable == frozenset()
+    assert settled.state.value == "aborted"
+
+
 def test_c2_dynamic_submit_refuses_every_invalid_capability_before_engine(tmp_path):
     from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import Frame, NexusSink
