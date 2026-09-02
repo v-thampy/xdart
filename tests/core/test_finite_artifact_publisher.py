@@ -10,6 +10,7 @@ from pathlib import Path
 import pickle
 import stat
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,14 +18,19 @@ import xrd_tools.io.finite_artifact as finite_module
 from xrd_tools.io.finite_artifact import (
     FINITE_LINEAGE_MAX_BYTES,
     FiniteArtifactCollision,
+    FiniteArtifactCapacityError,
     FiniteArtifactDisposition,
     FiniteArtifactIntegrityError,
+    FiniteArtifactPublicationHeld,
     FiniteArtifactPublisher,
     FiniteArtifactRequest,
+    FiniteArtifactResult,
     FiniteCandidateBinding,
     FiniteCandidateValidation,
     FiniteCommittedInspection,
     FiniteDocumentAdapter,
+    FiniteSeedBinding,
+    FiniteSeededDocumentAdapter,
     FiniteOperationContext,
     FinitePredecessorReceipt,
     FiniteSourceAdmission,
@@ -160,6 +166,7 @@ def _publish(
     writer=None,
     validate=None,
     prepublish=None,
+    inspect_committed=None,
 ):
     selected = publisher or FiniteArtifactPublisher(request)
     adapter = FiniteDocumentAdapter(
@@ -170,7 +177,7 @@ def _publish(
     )
     return selected.publish(
         adapter,
-        inspect_committed=_inspect_payload,
+        inspect_committed=inspect_committed or _inspect_payload,
         seed=seed,
         prepublish=prepublish,
     )
@@ -532,6 +539,76 @@ def test_seed_receipt_proves_exact_copy_and_source_immutability(tmp_path: Path) 
         type(admitted)(admitted.snapshot)
 
 
+def test_seeded_adapter_receives_only_publisher_owned_copy_binding(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.nexus"
+    original = os.urandom(4097)
+    source.write_bytes(original)
+    admitted = capture_finite_source(source)
+    request = _request(tmp_path, source)
+    observed: dict[str, object] = {}
+
+    def writer(
+        candidate: FiniteCandidateBinding,
+        seed_binding: FiniteSeedBinding,
+        admitted_candidate: FiniteCandidateBinding,
+    ) -> None:
+        assert type(seed_binding) is FiniteSeedBinding
+        assert seed_binding.request is request
+        assert seed_binding.receipt.source_snapshot is admitted.snapshot
+        assert seed_binding.candidate_identity == candidate.candidate_identity
+        assert admitted_candidate is candidate
+        assert seed_binding.authorizes(admitted_candidate)
+        candidate.seek(0)
+        assert candidate.read(len(original) + 1) == original
+        candidate.seek(0)
+        candidate.truncate(0)
+        candidate.write(_payload(request))
+        observed["binding"] = seed_binding
+
+    adapter = FiniteSeededDocumentAdapter(
+        lambda binding: nullcontext(binding),
+        writer,
+        lambda binding: nullcontext(binding),
+        _validate_payload(request),
+    )
+    result = FiniteArtifactPublisher(request).publish(
+        adapter,
+        inspect_committed=_inspect_payload,
+        seed=admitted,
+    )
+
+    assert result.disposition is FiniteArtifactDisposition.COMMITTED
+    assert observed["binding"].receipt is result.seed_receipt
+    assert observed["binding"].active is False
+    with pytest.raises(TypeError, match="factory-owned"):
+        replace(result.seed_receipt)
+    with pytest.raises(TypeError, match="publisher-owned"):
+        FiniteSeedBinding(request, result.seed_receipt, "0" * 64, object())
+    for action in (copy.copy, copy.deepcopy, pickle.dumps):
+        with pytest.raises(TypeError):
+            action(observed["binding"])
+
+
+def test_seeded_adapter_refuses_unseeded_publication(tmp_path: Path) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    adapter = FiniteSeededDocumentAdapter(
+        lambda binding: nullcontext(binding),
+        lambda _document, _binding, _candidate: None,
+        lambda binding: nullcontext(binding),
+        _validate_payload(request),
+    )
+
+    with pytest.raises(TypeError, match="requires one source admission"):
+        FiniteArtifactPublisher(request).publish(
+            adapter,
+            inspect_committed=_inspect_payload,
+        )
+
+
 def test_seed_publication_does_not_rehash_the_admitted_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -587,10 +664,14 @@ def test_seed_substitution_is_detected_before_foreign_file_truncation(
     assert not Path(request.output_artifact).exists()
 
 
-@pytest.mark.parametrize("cancel_seam", ("before", "after-writer", "prepublish"))
+@pytest.mark.parametrize(
+    "cancel_seam",
+    ("before", "after-writer", "prepublish", "last-source-fence"),
+)
 def test_cancellation_before_publication_aborts_without_mutating_input(
     tmp_path: Path,
     cancel_seam: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "source.nexus"
     original = b"immutable source"
@@ -600,6 +681,20 @@ def test_cancellation_before_publication_aborts_without_mutating_input(
     calls: list[str] = []
     if cancel_seam == "before":
         token.set()
+    source_checks = 0
+    original_source_check = FiniteArtifactPublisher._require_request_source
+
+    def source_check(publisher):
+        nonlocal source_checks
+        observed = original_source_check(publisher)
+        source_checks += 1
+        if cancel_seam == "last-source-fence" and source_checks == 2:
+            token.set()
+        return observed
+
+    monkeypatch.setattr(
+        FiniteArtifactPublisher, "_require_request_source", source_check,
+    )
 
     def writer(binding: FiniteCandidateBinding) -> None:
         calls.append("writer")
@@ -624,13 +719,19 @@ def test_cancellation_before_publication_aborts_without_mutating_input(
     assert not Path(request.output_artifact).exists()
     assert source.read_bytes() == original
     assert calls == ([] if cancel_seam == "before" else ["writer"] + (
-        ["prepublish"] if cancel_seam == "prepublish" else []
+        ["prepublish"]
+        if cancel_seam in {"prepublish", "last-source-fence"}
+        else []
     ))
 
 
-@pytest.mark.parametrize("seam", ("writer", "validator", "prepublish", "source-drift"))
+@pytest.mark.parametrize(
+    "seam",
+    ("writer", "validator", "candidate-fsync", "prepublish", "source-drift"),
+)
 def test_prepublish_failures_preserve_primary_source_and_absent_final(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     seam: str,
 ) -> None:
     source = tmp_path / "source.nexus"
@@ -658,7 +759,18 @@ def test_prepublish_failures_preserve_primary_source_and_absent_final(
         if seam == "source-drift":
             source.write_bytes(b"changed")
 
-    expected = FiniteArtifactIntegrityError if seam == "source-drift" else LookupError
+    if seam == "candidate-fsync":
+        monkeypatch.setattr(
+            finite_module,
+            "_fsync",
+            lambda _descriptor: (_ for _ in ()).throw(
+                OSError("file durability unavailable")
+            ),
+        )
+    expected = {
+        "source-drift": FiniteArtifactIntegrityError,
+        "candidate-fsync": OSError,
+    }.get(seam, LookupError)
     with pytest.raises(expected):
         _publish(
             request,
@@ -674,7 +786,11 @@ def test_prepublish_failures_preserve_primary_source_and_absent_final(
 
 @pytest.mark.parametrize(
     "seam",
-    ("changed-before-publish", "changed-without-seed-before-link"),
+    (
+        "changed-before-publish",
+        "changed-without-seed-before-link",
+        "changed-during-existing-inspection",
+    ),
 )
 def test_request_source_snapshot_is_revalidated_without_rehashing(
     tmp_path: Path,
@@ -686,6 +802,23 @@ def test_request_source_snapshot_is_revalidated_without_rehashing(
     request = _request(tmp_path, source, admission=admitted)
     calls: list[str] = []
     seed = None
+
+    if seam == "changed-during-existing-inspection":
+        _publish(request)
+
+        def inspect(path, selected):
+            terminal = _inspect_payload(path, selected)
+            source.write_bytes(b"changed during inspection")
+            return terminal
+
+        with pytest.raises(
+            FiniteArtifactIntegrityError,
+            match="request source changed",
+        ):
+            _publish(request, inspect_committed=inspect)
+        assert Path(request.output_artifact).exists()
+        assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+        return
 
     if seam == "changed-before-publish":
         source.write_bytes(b"later source")
@@ -952,41 +1085,29 @@ def test_postpublication_parent_fsync_failure_commits_with_bounded_warning(
     assert Path(request.output_artifact).read_bytes() == _payload(request)
 
 
-def test_candidate_file_fsync_failure_is_prepublish_and_leaves_no_final(
+@pytest.mark.parametrize(
+    "seam",
+    ("semantic-inspection", "final-observation", "link-after-effect"),
+)
+def test_linked_publication_uncertainty_is_typed_held(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    seam: str,
 ) -> None:
     source = tmp_path / "source.nexus"
     source.write_bytes(b"source")
     request = _request(tmp_path, source)
-
-    def fail_file(_descriptor: int) -> None:
-        raise OSError("file durability unavailable")
-
-    monkeypatch.setattr(finite_module, "_fsync", fail_file)
-    with pytest.raises(OSError, match="file durability unavailable"):
-        _publish(request)
-    assert not Path(request.output_artifact).exists()
-    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
-
-
-def test_postlink_semantic_failure_preserves_public_object_and_never_replays(
-    tmp_path: Path,
-) -> None:
-    source = tmp_path / "source.nexus"
-    source.write_bytes(b"source")
-    request = _request(tmp_path, source)
+    target = Path(request.output_artifact)
     calls: list[str] = []
+    if seam == "semantic-inspection":
+        def inspect(
+            _path: Path,
+            _request: FiniteArtifactRequest,
+        ) -> FiniteCommittedInspection:
+            calls.append("inspect")
+            raise ValueError("terminal semantic mismatch")
 
-    def inspect(
-        _path: Path,
-        _request: FiniteArtifactRequest,
-    ) -> FiniteCommittedInspection:
-        calls.append("inspect")
-        raise ValueError("terminal semantic mismatch")
-
-    with pytest.raises(FiniteArtifactIntegrityError):
-        FiniteArtifactPublisher(request).publish(
+        action = lambda: FiniteArtifactPublisher(request).publish(
             FiniteDocumentAdapter(
                 lambda binding: nullcontext(binding),
                 _write_payload(request),
@@ -995,9 +1116,59 @@ def test_postlink_semantic_failure_preserves_public_object_and_never_replays(
             ),
             inspect_committed=inspect,
         )
-    assert calls == ["inspect"]
-    assert Path(request.output_artifact).read_bytes() == _payload(request)
+    else:
+        observe = finite_module._try_observe_at
+
+        def fail_final_observation(parent, name, shown):
+            if Path(shown) == target and target.exists():
+                raise FiniteArtifactIntegrityError(
+                    "final observation unavailable"
+                )
+            return observe(parent, name, shown)
+
+        monkeypatch.setattr(
+            finite_module, "_try_observe_at", fail_final_observation,
+        )
+        if seam == "link-after-effect":
+            link = finite_module._link
+
+            def link_then_raise(*args, **kwargs):
+                link(*args, **kwargs)
+                raise OSError("uncertain after link")
+
+            monkeypatch.setattr(finite_module, "_link", link_then_raise)
+        action = lambda: _publish(request)
+
+    with pytest.raises(FiniteArtifactPublicationHeld) as captured:
+        action()
+    assert captured.value.request is request
+    assert isinstance(
+        captured.value.cause,
+        FiniteArtifactIntegrityError
+        if seam == "semantic-inspection" else FiniteArtifactCollision,
+    )
+    assert calls == (["inspect"] if seam == "semantic-inspection" else [])
+    assert target.read_bytes() == _payload(request)
     assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+
+
+def test_publication_result_cannot_be_forged_by_a_session_caller(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+
+    with pytest.raises(TypeError, match="result is invalid"):
+        FiniteArtifactResult(
+            FiniteArtifactDisposition.ABORTED,
+            request,
+            None,
+            None,
+            None,
+            None,
+            (),
+        )
 
 
 def test_candidate_capabilities_are_pathless_revoked_and_validator_read_only(
@@ -1165,11 +1336,154 @@ def test_publisher_is_one_shot_even_after_abort(tmp_path: Path) -> None:
         _publish(request, publisher=publisher)
 
 
-@pytest.mark.parametrize("published", (False, True))
+def test_cancelled_exact_reuse_is_aborted_without_touching_prior_publication(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    first = _publish(request)
+    target = Path(request.output_artifact)
+    before = target.read_bytes()
+    token = threading.Event()
+    token.set()
+
+    second = _publish(
+        request,
+        publisher=FiniteArtifactPublisher(request, cancel_token=token),
+    )
+
+    assert first.disposition is FiniteArtifactDisposition.COMMITTED
+    assert second.disposition is FiniteArtifactDisposition.ABORTED
+    assert second.terminal is None
+    assert target.read_bytes() == before
+    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+
+
+@pytest.mark.parametrize("shortfall", (0, 1))
+def test_candidate_capacity_has_one_exact_boundary_and_no_hidden_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shortfall: int,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    required = source.stat().st_size + max(
+        finite_module._CANDIDATE_SPACE_MARGIN_BYTES,
+        (source.stat().st_size + 9) // 10,
+    )
+    available = required - shortfall
+    monkeypatch.setattr(
+        finite_module.os,
+        "fstatvfs",
+        lambda _descriptor: SimpleNamespace(
+            f_frsize=1,
+            f_bavail=available,
+        ),
+    )
+    if shortfall == 0:
+        result = _publish(request)
+        assert result.disposition is FiniteArtifactDisposition.COMMITTED
+    else:
+        with pytest.raises(FiniteArtifactCapacityError) as captured:
+            _publish(request)
+        error = captured.value
+        assert error.required_bytes == required
+        assert error.available_bytes == available
+        assert error.cleanup_directory == str(tmp_path)
+        assert str(tmp_path) in str(error)
+        assert not Path(request.output_artifact).exists()
+        assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+
+
+@pytest.mark.parametrize(
+    "seam",
+    ("reservation", "writer-primary", "parent-commit", "parent-abort"),
+)
+def test_descriptor_close_faults_are_single_attempt_and_never_replace_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    seam: str,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    real_close = finite_module._close_descriptor_once
+    armed = seam != "writer-primary"
+    injected = 0
+
+    def close_once(descriptor: int):
+        nonlocal armed, injected
+        observed = os.fstat(descriptor)
+        is_parent = stat.S_ISDIR(observed.st_mode)
+        is_candidate = any(
+            path.stat().st_ino == observed.st_ino
+            and path.stat().st_dev == observed.st_dev
+            for path in tmp_path.glob(".xdart-finite-*.candidate")
+        )
+        error = real_close(descriptor)
+        should_fail = armed and (
+            seam == "reservation" and is_candidate
+            or seam.startswith("parent-") and is_parent
+            or seam == "writer-primary" and is_candidate
+        )
+        if should_fail and injected == 0:
+            injected += 1
+            armed = False
+            return OSError(f"synthetic {seam} close ambiguity")
+        return error
+
+    monkeypatch.setattr(finite_module, "_close_descriptor_once", close_once)
+    if seam == "reservation":
+        with pytest.raises(
+            FiniteArtifactIntegrityError,
+            match="reservation close",
+        ):
+            _publish(request)
+    elif seam == "writer-primary":
+        def writer(_binding):
+            nonlocal armed
+            armed = True
+            raise LookupError("writer remains primary across close")
+
+        with pytest.raises(LookupError, match="writer remains primary") as captured:
+            _publish(request, writer=writer)
+        assert any(
+            "DESCRIPTOR_CLOSE_INCOMPLETE" in note
+            for note in captured.value.__notes__
+        )
+    elif seam == "parent-commit":
+        result = _publish(request)
+        assert result.disposition is FiniteArtifactDisposition.COMMITTED
+        assert any(
+            "DESCRIPTOR_CLOSE_INCOMPLETE" in item
+            for item in result.diagnostics
+        )
+    else:
+        token = threading.Event()
+        token.set()
+        result = _publish(
+            request,
+            publisher=FiniteArtifactPublisher(request, cancel_token=token),
+        )
+        assert result.disposition is FiniteArtifactDisposition.ABORTED
+        assert any(
+            "DESCRIPTOR_CLOSE_INCOMPLETE" in item
+            for item in result.diagnostics
+        )
+    assert injected == 1
+    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ("aborted", "committed", "held-transient", "held-persistent"),
+)
 def test_candidate_cleanup_failure_reports_exact_hidden_orphan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    published: bool,
+    outcome: str,
 ) -> None:
     source = tmp_path / "source.nexus"
     source.write_bytes(b"source")
@@ -1177,17 +1491,20 @@ def test_candidate_cleanup_failure_reports_exact_hidden_orphan(
     real_unlink = finite_module._unlink_candidate
     paths: list[Path] = []
 
-    def fail_cleanup(_parent_descriptor: int, path: Path, *args, **kwargs) -> None:
+    def fail_cleanup(parent_descriptor: int, path: Path, *args, **kwargs) -> None:
         paths.append(path)
+        if outcome == "held-transient" and len(paths) == 2:
+            real_unlink(parent_descriptor, path, *args, **kwargs)
+            return
         raise PermissionError("candidate cleanup denied")
 
     monkeypatch.setattr(finite_module, "_unlink_candidate", fail_cleanup)
-    if published:
+    if outcome == "committed":
         result = _publish(request)
         assert result.disposition is FiniteArtifactDisposition.COMMITTED
         assert Path(request.output_artifact).exists()
         assert result.hidden_orphan == str(paths[0])
-    else:
+    elif outcome == "aborted":
         token = threading.Event()
 
         def writer(binding: FiniteCandidateBinding) -> None:
@@ -1203,9 +1520,27 @@ def test_candidate_cleanup_failure_reports_exact_hidden_orphan(
         assert result.disposition is FiniteArtifactDisposition.ABORTED
         assert not Path(request.output_artifact).exists()
         assert result.hidden_orphan == str(paths[0])
-    assert Path(result.hidden_orphan).exists()
+    else:
+        def inspect(_path, _request):
+            raise ValueError("post-link inspection failed")
+
+        with pytest.raises(FiniteArtifactPublicationHeld) as captured:
+            _publish(request, inspect_committed=inspect)
+        held = captured.value
+        assert Path(request.output_artifact).exists()
+        assert held.hidden_orphan == (
+            None if outcome == "held-transient" else str(paths[0])
+        )
+        assert any(
+            "CANDIDATE_CLEANUP_INCOMPLETE" in item
+            for item in held.diagnostics
+        )
+        result = held
+    if result.hidden_orphan is not None:
+        assert Path(result.hidden_orphan).exists()
     monkeypatch.setattr(finite_module, "_unlink_candidate", real_unlink)
-    Path(result.hidden_orphan).unlink()
+    if result.hidden_orphan is not None:
+        Path(result.hidden_orphan).unlink()
 
 
 def test_writer_failure_remains_primary_when_private_cleanup_also_fails(
@@ -1263,6 +1598,8 @@ def test_types_are_public_lazy_exports() -> None:
     assert io_api.FiniteArtifactRequest is FiniteArtifactRequest
     assert io_api.FiniteArtifactDisposition is FiniteArtifactDisposition
     assert io_api.FiniteDocumentAdapter is FiniteDocumentAdapter
+    assert io_api.FiniteSeededDocumentAdapter is FiniteSeededDocumentAdapter
+    assert io_api.FiniteSeedBinding is FiniteSeedBinding
     assert io_api.FiniteOperationContext is FiniteOperationContext
     assert io_api.FiniteCandidateValidation is FiniteCandidateValidation
     assert io_api.FiniteCommittedInspection is FiniteCommittedInspection

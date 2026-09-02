@@ -3705,6 +3705,8 @@ def test_kernel_is_qt_free_and_has_only_headless_transaction_mounts() -> None:
         "xrd_tools/reduction/average.py",
         "xrd_tools/reduction/core.py",
         "xrd_tools/reduction/reintegrate.py",
+        "xrd_tools/reduction/reintegrate_prepared.py",
+        "xrd_tools/reduction/reintegrate_successor.py",
     ])
 
 
@@ -3738,6 +3740,8 @@ def test_c2_headless_transaction_kernel_purity_and_mount_split() -> None:
         "xrd_tools/reduction/average.py",
         "xrd_tools/reduction/core.py",
         "xrd_tools/reduction/reintegrate.py",
+        "xrd_tools/reduction/reintegrate_prepared.py",
+        "xrd_tools/reduction/reintegrate_successor.py",
     }
     observed: set[str] = set()
     for base in (source_root / "xrd_tools", source_root / "xdart/modules"):

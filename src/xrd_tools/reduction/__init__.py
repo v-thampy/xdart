@@ -62,6 +62,19 @@ __all__ = [
 ]
 __all__ += ["ReintegratePlan", "ReintegrateProgress", "ReintegrateResult", "ReintegrateRunner", "run_reintegrate"]
 __all__ += [
+    "ReintegrateRecipeMigrationRequired",
+    "ReintegrateSuccessorPlan", "ReintegrateSuccessorProgress",
+    "ReintegrateSuccessorResult", "run_reintegrate_successor",
+]
+__all__ += [
+    "AdmissionCommitment", "LegacyRouteReason", "PreparedCapsuleMiss",
+    "PreparedCapsuleMissCode", "PreparedDimensionAdmission",
+    "PreparedDimensionPayload", "PreparedReintegrateBundle",
+    "PreparedReintegrateExecution", "PreparedReintegrateOffer",
+    "PreparedRouteChanged", "PreparedRouteRejected",
+    "prepare_reintegrate_bundle",
+]
+__all__ += [
     "AverageCommand", "AverageContributor",
     "AverageFiniteCounts", "AverageFiniteCountsEvidence",
     "AveragePendingPhase", "AverageRunnerPhase", "AverageScanPending",
@@ -119,6 +132,19 @@ _STRICTNESS_EXPORTS = {
 _BACKGROUND_EXPORTS = {"DisplayBackgroundPlan", "DisplayBackgroundResult", "run_display_background"}
 _BACKGROUND_EXPORTS.update({"FrameBackgroundPlan", "FrameBackgroundResult", "resolve_frame_background"})
 _REINTEGRATE_EXPORTS = {"ReintegratePlan", "ReintegrateProgress", "ReintegrateResult", "ReintegrateRunner", "run_reintegrate"}
+_REINTEGRATE_SUCCESSOR_EXPORTS = {
+    "ReintegrateRecipeMigrationRequired",
+    "ReintegrateSuccessorPlan", "ReintegrateSuccessorProgress",
+    "ReintegrateSuccessorResult", "run_reintegrate_successor",
+}
+_REINTEGRATE_PREPARED_EXPORTS = {
+    "AdmissionCommitment", "LegacyRouteReason", "PreparedCapsuleMiss",
+    "PreparedCapsuleMissCode", "PreparedDimensionAdmission",
+    "PreparedDimensionPayload", "PreparedReintegrateBundle",
+    "PreparedReintegrateExecution", "PreparedReintegrateOffer",
+    "PreparedRouteChanged", "PreparedRouteRejected",
+    "prepare_reintegrate_bundle",
+}
 _AVERAGE_EXPORTS = {
     "AverageCommand", "AverageContributor",
     "AverageFiniteCounts", "AverageFiniteCountsEvidence",
@@ -135,6 +161,14 @@ def __getattr__(name: str) -> Any:
         value = getattr(import_module("xrd_tools.reduction.background"), name)
     elif name in _REINTEGRATE_EXPORTS:
         value = getattr(import_module("xrd_tools.reduction.reintegrate"), name)
+    elif name in _REINTEGRATE_SUCCESSOR_EXPORTS:
+        value = getattr(
+            import_module("xrd_tools.reduction.reintegrate_successor"), name,
+        )
+    elif name in _REINTEGRATE_PREPARED_EXPORTS:
+        value = getattr(
+            import_module("xrd_tools.reduction.reintegrate_prepared"), name,
+        )
     elif name in _AVERAGE_EXPORTS:
         value = getattr(import_module("xrd_tools.reduction.average"), name)
     elif name in _CORE_EXPORTS:

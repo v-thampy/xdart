@@ -59,7 +59,13 @@ import numpy as np
 
 from xrd_tools.core import DEFAULT_MODE_KEY, FrameRecord, FrameView
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from xrd_tools.io import AppendDecision, AppendIntent
+from xrd_tools.io import (
+    AppendDecision,
+    AppendIntent,
+    FiniteArtifactDisposition,
+    FiniteArtifactPublicationHeld,
+    FiniteArtifactResult,
+)
 from xrd_tools.reduction import (
     Frame,
     FrameOutcome,
@@ -92,6 +98,30 @@ from .stage_accounting import (
 
 logger = logging.getLogger(__name__)
 _ATTEMPT_MISSING = object()
+_EXTERNAL_PUBLICATION_CLAIM = object()
+
+
+class ExternalPublicationSeal:
+    """Opaque one-session authority for settling an immutable publication."""
+
+    __slots__ = ("_session",)
+
+    def __init__(self, session: "ScanSession", claim: object) -> None:
+        if claim is not _EXTERNAL_PUBLICATION_CLAIM:
+            raise TypeError("external publication seals are session-owned")
+        self._session = session
+
+    def __copy__(self):
+        raise TypeError("external publication seal is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("external publication seal is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("external publication seal is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("external publication seal is not serializable")
 
 
 class _StageBoundaryFacade:
@@ -581,6 +611,14 @@ class ScanSession:
         self._terminal_result: NexusTerminalResult | None = None
         self._dynamic_graph_terminal_settled = False
         self._dynamic_terminal_settled = False
+        self._dynamic_external_publication_pending = False
+        self._dynamic_external_publication_seal = None
+        self._dynamic_external_publication_result = None
+        self._dynamic_external_publication_error = None
+        self._dynamic_external_publication_transition = None
+        self._dynamic_external_publication_boundary_settled = False
+        self._dynamic_external_candidate_aborted = False
+        self._dynamic_external_publication_lock = threading.RLock()
         self._terminal_state_emitted = False
         self._dynamic_extend_live = None
         self._dynamic_extension_owner = None
@@ -679,8 +717,21 @@ class ScanSession:
                         nexus.bind_session(prior_facade)
                 if nexus is not None:
                     terminal = nexus._terminal_result
-                    if (type(terminal) is not NexusTerminalResult
-                            or terminal.disposition is not NexusTerminalDisposition.ABORTED):
+                    if nexus._finite_candidate is not None:
+                        writer = nexus._writer
+                        if (
+                            terminal is not None
+                            or writer is not None
+                            and writer.phase.value != "aborted"
+                        ):
+                            raise RuntimeError(
+                                "construction cleanup did not abort finite candidate"
+                            )
+                    elif (
+                        type(terminal) is not NexusTerminalResult
+                        or terminal.disposition
+                        is not NexusTerminalDisposition.ABORTED
+                    ):
                         raise RuntimeError("construction cleanup did not abort Nexus")
             except BaseException as cleanup:
                 raise primary from cleanup
@@ -954,9 +1005,440 @@ class ScanSession:
         self._dynamic_graph_terminal_settled = True
         return self._terminal_result
 
+    def _require_external_publication_sink(self):
+        nexus = self._dynamic_nexus_sink
+        if (
+            self._dynamic_accounting is None
+            or nexus is None
+            or self._user_sink is not nexus
+            or nexus._finite_candidate is None
+            or self._dynamic_transactional_xye_sink is not None
+            or self._dynamic_nexus_checkpoint_threshold is not None
+            or self._dynamic_epoch_seal is not None
+            or self._dynamic_epoch_notified
+        ):
+            raise RuntimeError(
+                "external publication requires one exact finite-candidate Nexus run"
+            )
+        return nexus
+
+    def _require_external_publication_seal(
+        self, seal: ExternalPublicationSeal,
+    ) -> None:
+        if (
+            type(seal) is not ExternalPublicationSeal
+            or seal._session is not self
+            or seal is not self._dynamic_external_publication_seal
+            or not self._dynamic_external_publication_pending
+            or self._dynamic_finish_seal is None
+        ):
+            raise RuntimeError("external publication requires its exact active seal")
+
+    def _settle_external_publication_boundary(
+        self,
+        kind: str,
+        action: Callable[[], None],
+        terminal_state: DynamicRunState,
+    ) -> None:
+        prior = self._dynamic_external_publication_transition
+        if prior is not None and prior != kind:
+            raise RuntimeError(
+                "external publication terminal transition cannot change kind"
+            )
+        if (
+            prior == kind
+            and self._dynamic_boundary.terminal_boundary_complete(terminal_state)
+        ):
+            self._dynamic_external_publication_boundary_settled = True
+            return
+        self._dynamic_external_publication_transition = kind
+        if self._dynamic_external_publication_boundary_settled:
+            return
+        try:
+            action()
+        except BaseException:
+            # A wrapper may raise after the accounting boundary completed and
+            # dropped its owners.  Observe terminal truth before allowing an
+            # exact same-kind retry; never attempt the opposite transition.
+            if self._dynamic_boundary.terminal_boundary_complete(terminal_state):
+                self._dynamic_external_publication_boundary_settled = True
+            raise
+        else:
+            self._dynamic_external_publication_boundary_settled = True
+
+    def _abort_external_publication_preparation(
+        self,
+        nexus,
+        error: BaseException,
+    ) -> None:
+        prior = self._dynamic_external_publication_error
+        if prior is None:
+            self._dynamic_external_publication_error = error
+        elif prior is not error:
+            raise RuntimeError(
+                "external publication preparation retry changed its failure"
+            )
+        primary = self._dynamic_external_publication_error
+        cleanup: BaseException | None = None
+        if not self._dynamic_external_candidate_aborted:
+            try:
+                nexus._abort_external_publication()
+            except BaseException as failure:
+                cleanup = failure
+            else:
+                self._dynamic_external_candidate_aborted = True
+                self._dynamic_graph_terminal_settled = True
+        if cleanup is None:
+            try:
+                self._settle_external_publication_boundary(
+                    "ABORT",
+                    lambda: self._dynamic_boundary.epoch_aborted(
+                        self, self._dynamic_owner_token, str(primary),
+                    ),
+                    DynamicRunState.ABORTED,
+                )
+            except BaseException as failure:
+                try:
+                    recovery_error = (
+                        self._dynamic_boundary.recover_external_terminal(
+                            self,
+                            self._dynamic_owner_token,
+                            self._dynamic_finish_seal,
+                            DynamicRunState.ABORTED,
+                            primary,
+                        )
+                    )
+                except BaseException as recovery_failure:
+                    cleanup = recovery_failure
+                    try:
+                        cleanup.add_note(str(failure)[:1024])
+                    except BaseException:
+                        pass
+                else:
+                    self._dynamic_external_publication_transition = "ABORT"
+                    self._dynamic_external_publication_boundary_settled = True
+                    if recovery_error is not None:
+                        try:
+                            primary.add_note(str(recovery_error)[:1024])
+                        except BaseException:
+                            pass
+        if cleanup is None:
+            try:
+                self._finalize_external_publication()
+            except BaseException as failure:
+                cleanup = failure
+        if cleanup is not None:
+            raise primary from cleanup
+        raise primary
+
+    def _finalize_external_publication(self) -> None:
+        # Immutable publication truth is already fixed by the accounting
+        # boundary.  Latch it before best-effort UI/store teardown so a stale
+        # projection or observer cannot replace COMMIT/ABORT/HOLD.
+        self._dynamic_terminal_settled = True
+        self._dynamic_external_publication_pending = False
+        first: BaseException | None = None
+        try:
+            if self._record_store is not None:
+                with self._projection_lock:
+                    self._reconcile_locked(self._record_store.labels())
+                    self._record_store.clear_checkpoint_recoverable()
+        except BaseException as error:
+            first = error
+        try:
+            self._final_sweep()
+        except BaseException as error:
+            first = error if first is None else first
+            if first is not error:
+                try:
+                    first.add_note(str(error)[:1024])
+                except BaseException:
+                    pass
+        try:
+            if not self._terminal_state_emitted:
+                self._terminal_state_emitted = True
+                self._emit_state()
+        except BaseException as error:
+            first = error if first is None else first
+            if first is not error:
+                try:
+                    first.add_note(str(error)[:1024])
+                except BaseException:
+                    pass
+        if first is not None:
+            raise first
+
+    def prepare_external_publication(
+        self, *, join_timeout: float | None = None,
+    ) -> ExternalPublicationSeal:
+        """Close one private finite candidate without promoting its receipts."""
+
+        nexus = self._require_external_publication_sink()
+        if self._dynamic_external_publication_pending:
+            return self._dynamic_external_publication_seal
+        if (
+            self._dynamic_external_publication_error is not None
+            and self._dynamic_external_publication_transition != "HOLD"
+            and not self._dynamic_terminal_settled
+        ):
+            self._abort_external_publication_preparation(
+                nexus, self._dynamic_external_publication_error,
+            )
+        if self._dynamic_terminal_settled:
+            raise RuntimeError("external publication is already terminal")
+        result = self._freeze_dynamic_result(join_timeout)
+        if not self._session.sink_terminal_safe:
+            raise self._dynamic_primary_error or RuntimeError(
+                "dynamic writer remains able to call the finite candidate"
+            )
+        stopped = bool(
+            self._dynamic_stop_requested
+            or result.cancelled
+            or _cancel_requested(self._session.cancel_token)
+        )
+        if result.failed or stopped:
+            error = self._dynamic_primary_error or RuntimeError(
+                "finite candidate stopped before external publication"
+            )
+            self._abort_external_publication_preparation(nexus, error)
+        try:
+            self._event_sink.flush(force=True)
+            outcome = nexus._prepare_external_publication(result)
+            if (
+                outcome.target != nexus.path
+                or outcome.partial_path is not None
+                or outcome.stream_terminal is not None
+            ):
+                raise RuntimeError(
+                    "finite candidate preparation returned public terminal truth"
+                )
+            self._dynamic_graph_terminal_settled = True
+            self._dynamic_finish_seal = (
+                self._dynamic_boundary.prepare_session_finish(
+                    self, self._dynamic_owner_token, stopped=False,
+                )
+            )
+        except BaseException as error:
+            self._abort_external_publication_preparation(nexus, error)
+        seal = ExternalPublicationSeal(self, _EXTERNAL_PUBLICATION_CLAIM)
+        self._dynamic_external_publication_seal = seal
+        self._dynamic_external_publication_pending = True
+        return seal
+
+    def _commit_external_publication_locked(
+        self,
+        seal: ExternalPublicationSeal,
+        publication: FiniteArtifactResult,
+    ) -> None:
+        nexus = self._require_external_publication_sink()
+        self._require_external_publication_seal(seal)
+        request = nexus._finite_candidate[1]
+        if (
+            type(publication) is not FiniteArtifactResult
+            or publication.request is not request
+            or publication.disposition not in {
+                FiniteArtifactDisposition.COMMITTED,
+                FiniteArtifactDisposition.ALREADY_COMMITTED,
+            }
+            or publication.terminal is None
+            or publication.commit_identity is None
+        ):
+            raise TypeError("external publication commit truth is not exact")
+        prior = self._dynamic_external_publication_result
+        if prior is not None and publication is not prior:
+            raise RuntimeError("external publication retry changed its result")
+        if self._dynamic_external_publication_error is not None:
+            raise RuntimeError(
+                "external publication commit conflicts with a prior failure"
+            )
+        self._dynamic_external_publication_result = publication
+        self._settle_external_publication_boundary(
+            "COMMIT",
+            lambda: self._dynamic_boundary.session_finished(
+                self,
+                self._dynamic_owner_token,
+                self._dynamic_finish_seal,
+                publication.commit_identity,
+            ),
+            DynamicRunState.FINISHED,
+        )
+        self._finalize_external_publication()
+
+    def commit_external_publication(
+        self,
+        seal: ExternalPublicationSeal,
+        publication: FiniteArtifactResult,
+    ) -> None:
+        """Promote staged receipts after exact immutable publication succeeds."""
+
+        with self._dynamic_external_publication_lock:
+            self._commit_external_publication_locked(seal, publication)
+
+    def _hold_external_publication_locked(
+        self,
+        seal: ExternalPublicationSeal,
+        error: FiniteArtifactPublicationHeld,
+    ) -> None:
+        nexus = self._require_external_publication_sink()
+        self._require_external_publication_seal(seal)
+        if (
+            type(error) is not FiniteArtifactPublicationHeld
+            or error.request is not nexus._finite_candidate[1]
+        ):
+            raise TypeError("external publication hold is not exact")
+        prior = self._dynamic_external_publication_error
+        if prior is not None and error is not prior:
+            raise RuntimeError("external publication hold changed its failure")
+        if self._dynamic_external_publication_result is not None:
+            raise RuntimeError("committed external publication cannot become held")
+        self._dynamic_external_publication_error = error
+        self._settle_external_publication_boundary(
+            "HOLD",
+            lambda: self._dynamic_boundary.publication_held(
+                self,
+                self._dynamic_owner_token,
+                str(error),
+            ),
+            DynamicRunState.HELD,
+        )
+        self._finalize_external_publication()
+
+    def hold_external_publication(
+        self,
+        seal: ExternalPublicationSeal,
+        error: FiniteArtifactPublicationHeld,
+    ) -> None:
+        """Retain the finish seal when a visible link lacks terminal proof."""
+
+        with self._dynamic_external_publication_lock:
+            self._hold_external_publication_locked(seal, error)
+
+    def _abort_external_publication_locked(
+        self,
+        seal: ExternalPublicationSeal,
+        outcome: FiniteArtifactResult | BaseException,
+    ) -> None:
+        nexus = self._require_external_publication_sink()
+        self._require_external_publication_seal(seal)
+        if (
+            type(outcome) is FiniteArtifactPublicationHeld
+            or type(self._dynamic_external_publication_error)
+            is FiniteArtifactPublicationHeld
+            or self._dynamic_external_publication_result is not None
+        ):
+            raise RuntimeError("a visible publication cannot be aborted")
+        if type(outcome) is FiniteArtifactResult:
+            if (
+                outcome.request is not nexus._finite_candidate[1]
+                or outcome.disposition is not FiniteArtifactDisposition.ABORTED
+                or outcome.terminal is not None
+            ):
+                raise TypeError("external publication abort truth is not exact")
+        elif not isinstance(outcome, BaseException):
+            raise TypeError("external publication abort requires a result or error")
+        prior = self._dynamic_external_publication_error
+        if prior is not None and outcome is not prior:
+            raise RuntimeError("external publication retry changed its abort")
+        self._dynamic_external_publication_error = outcome
+        self._settle_external_publication_boundary(
+            "ABORT",
+            lambda: self._dynamic_boundary.epoch_aborted(
+                self, self._dynamic_owner_token, str(outcome),
+            ),
+            DynamicRunState.ABORTED,
+        )
+        self._finalize_external_publication()
+
+    def abort_external_publication(
+        self,
+        seal: ExternalPublicationSeal,
+        outcome: FiniteArtifactResult | BaseException,
+    ) -> None:
+        """Discard staged receipts after a proven pre-link failure or abort."""
+
+        with self._dynamic_external_publication_lock:
+            self._abort_external_publication_locked(seal, outcome)
+
+    def _recover_external_publication_settlement(
+        self,
+        seal: ExternalPublicationSeal,
+        outcome: FiniteArtifactResult | BaseException,
+    ) -> None:
+        """Retry the exact latched transition below an interrupted public wrapper."""
+
+        with self._dynamic_external_publication_lock:
+            try:
+                if type(outcome) is FiniteArtifactPublicationHeld:
+                    self._hold_external_publication_locked(seal, outcome)
+                elif (
+                    type(outcome) is FiniteArtifactResult
+                    and outcome.disposition in {
+                        FiniteArtifactDisposition.COMMITTED,
+                        FiniteArtifactDisposition.ALREADY_COMMITTED,
+                    }
+                ):
+                    self._commit_external_publication_locked(seal, outcome)
+                else:
+                    self._abort_external_publication_locked(seal, outcome)
+            except BaseException as primary:
+                if self._dynamic_terminal_settled:
+                    raise
+                if type(outcome) is FiniteArtifactPublicationHeld:
+                    kind = "HOLD"
+                    state = DynamicRunState.HELD
+                    value = outcome
+                elif (
+                    type(outcome) is FiniteArtifactResult
+                    and outcome.disposition in {
+                        FiniteArtifactDisposition.COMMITTED,
+                        FiniteArtifactDisposition.ALREADY_COMMITTED,
+                    }
+                ):
+                    kind = "COMMIT"
+                    state = DynamicRunState.FINISHED
+                    value = outcome.commit_identity
+                else:
+                    kind = "ABORT"
+                    state = DynamicRunState.ABORTED
+                    value = outcome
+                recovery_error = self._dynamic_boundary.recover_external_terminal(
+                    self,
+                    self._dynamic_owner_token,
+                    self._dynamic_finish_seal,
+                    state,
+                    value,
+                )
+                self._dynamic_external_publication_transition = kind
+                self._dynamic_external_publication_boundary_settled = True
+                try:
+                    self._finalize_external_publication()
+                except BaseException as finalization_error:
+                    if recovery_error is not None:
+                        try:
+                            finalization_error.add_note(
+                                str(recovery_error)[:1024]
+                            )
+                        except BaseException:
+                            pass
+                    raise
+                if recovery_error is not None:
+                    try:
+                        primary.add_note(str(recovery_error)[:1024])
+                    except BaseException:
+                        pass
+                raise primary
+
     def _finish_dynamic(
         self, *, raise_on_failure: bool, join_timeout: float | None,
     ) -> ReductionResult:
+        if (
+            self._dynamic_nexus_sink is not None
+            and self._dynamic_nexus_sink._finite_candidate is not None
+            and not self._dynamic_terminal_settled
+        ):
+            raise RuntimeError(
+                "finite candidate requires prepare_external_publication()"
+            )
         if self._dynamic_transactional_xye_sink is not None:
             return self._finish_dynamic_xye(
                 raise_on_failure=raise_on_failure,
@@ -1217,6 +1699,8 @@ class ScanSession:
             return self._commit_dynamic_xye_epoch()
         if self._dynamic_accounting is None or self._dynamic_nexus_sink is None:
             raise RuntimeError("commit_epoch requires one dynamic Nexus owner")
+        if self._dynamic_nexus_sink._finite_candidate is not None:
+            raise RuntimeError("finite candidate does not support epoch commit")
         if self._dynamic_frozen_result is not None or self._dynamic_stop_requested:
             raise RuntimeError("terminal dynamic session cannot commit another epoch")
         if self._dynamic_epoch_notified:

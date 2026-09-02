@@ -44,6 +44,7 @@ _OPERATION_KIND = re.compile(r"[a-z0-9][a-z0-9-]{0,39}\Z")
 _ARTIFACT_FAMILY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
 _SCHEMA_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _COPY_BLOCK_BYTES = 1024 * 1024
+_CANDIDATE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024
 _MAX_PATH_BYTES = 4096
 _MAX_ENTRY_BYTES = 4096
 _MAX_CANONICAL_BYTES = 64 * 1024
@@ -60,6 +61,7 @@ FINITE_PARENT_DIRECTORY_FSYNC_WARNING = (
     "FINITE_PARENT_DIRECTORY_FSYNC_UNCONFIRMED"
 )
 FINITE_CANDIDATE_CLEANUP_WARNING = "FINITE_CANDIDATE_CLEANUP_INCOMPLETE"
+FINITE_DESCRIPTOR_CLOSE_WARNING = "FINITE_DESCRIPTOR_CLOSE_INCOMPLETE"
 
 # Narrow deterministic fault seams.  Production uses the standard library.
 _link = os.link
@@ -82,9 +84,77 @@ class FiniteArtifactIntegrityError(FiniteArtifactError):
     """An admitted source, candidate, or public terminal lost exact identity."""
 
 
+class FiniteArtifactCapacityError(FiniteArtifactError):
+    """The exact candidate directory lacks the frozen finite-space budget."""
+
+    def __init__(
+        self,
+        request: "FiniteArtifactRequest",
+        *,
+        required_bytes: int,
+        available_bytes: int,
+    ) -> None:
+        if (
+            type(request) is not FiniteArtifactRequest
+            or type(required_bytes) is not int
+            or required_bytes < 0
+            or type(available_bytes) is not int
+            or available_bytes < 0
+        ):
+            raise TypeError("finite capacity refusal requires exact byte counts")
+        self.request = request
+        self.required_bytes = required_bytes
+        self.available_bytes = available_bytes
+        self.cleanup_directory = str(Path(request.output_artifact).parent)
+        super().__init__(
+            "finite candidate needs "
+            f"{required_bytes} bytes but only {available_bytes} bytes are "
+            "available in the exact manual-cleanup directory: "
+            f"{self.cleanup_directory}"
+        )
+
+
+class FiniteArtifactPublicationHeld(FiniteArtifactIntegrityError):
+    """The publisher linked its candidate but final inspection is unresolved."""
+
+    def __init__(
+        self,
+        request: "FiniteArtifactRequest",
+        cause: BaseException,
+        *,
+        hidden_orphan: str | None = None,
+        diagnostics: tuple[str, ...] = (),
+    ) -> None:
+        if (
+            type(request) is not FiniteArtifactRequest
+            or not isinstance(cause, BaseException)
+            or hidden_orphan is not None
+            and (type(hidden_orphan) is not str or not hidden_orphan)
+            or type(diagnostics) is not tuple
+            or any(
+                type(item) is not str or len(item) > 1024
+                for item in diagnostics
+            )
+        ):
+            raise TypeError("held finite publication requires an exact request")
+        self.request = request
+        self.cause = cause
+        self.hidden_orphan = hidden_orphan
+        self.diagnostics = diagnostics
+        super().__init__(
+            "finite publication is visible but exact terminal inspection is held"
+        )
+
+
 class FiniteArtifactDisposition(str, Enum):
     COMMITTED = "COMMITTED"
     ALREADY_COMMITTED = "ALREADY_COMMITTED"
+    ABORTED = "ABORTED"
+
+
+class FiniteCandidateWriteDisposition(str, Enum):
+    """One exact adapter-to-publisher private-candidate outcome."""
+
     ABORTED = "ABORTED"
 
 
@@ -155,6 +225,39 @@ class FiniteSourceSeedReceipt:
     byte_count: int
     copy_strategy: str
     receipt_digest: str
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        payload = {
+            "byte_count": self.byte_count,
+            "candidate_digest": self.candidate_digest,
+            "candidate_inode": self.candidate_snapshot.inode,
+            "candidate_path": self.candidate_snapshot.path,
+            "copy_strategy": self.copy_strategy,
+            "domain": "xdart.finite-source-seed-receipt.v1",
+            "source_digest": self.source_digest,
+            "source_inode": self.source_snapshot.inode,
+            "source_path": self.source_snapshot.path,
+        }
+        try:
+            _canonical_receipt, expected_digest = _identity(payload)
+        except (TypeError, ValueError) as error:
+            raise TypeError("finite source seed receipt is invalid") from error
+        if (
+            _claim is not _FACTORY
+            or type(self.source_snapshot) is not FiniteFileSnapshot
+            or type(self.candidate_snapshot) is not FiniteFileSnapshot
+            or self.source_snapshot.path == self.candidate_snapshot.path
+            or self.source_snapshot.digest != self.candidate_snapshot.digest
+            or self.source_digest != self.source_snapshot.digest
+            or self.candidate_digest != self.candidate_snapshot.digest
+            or type(self.byte_count) is not int
+            or self.byte_count != self.source_snapshot.size
+            or self.byte_count != self.candidate_snapshot.size
+            or self.copy_strategy != "bounded-copy-v1"
+            or self.receipt_digest != expected_digest
+        ):
+            raise TypeError("finite source seed receipt is not factory-owned")
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,14 +538,14 @@ class _BindingOwner:
         self.lock = threading.RLock()
         self.writable = writable
 
-    def revoke(self) -> None:
+    def revoke(self) -> BaseException | None:
         with self.lock:
             if not self.active:
-                return
+                return None
             self.active = False
             descriptor = self.descriptor
             self.descriptor = -1
-            os.close(descriptor)
+            return _close_descriptor_once(descriptor)
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -547,6 +650,60 @@ class FiniteCandidateBinding:
         raise TypeError("finite candidate binding is not serializable")
 
 
+@dataclass(eq=False, frozen=True, slots=True)
+class FiniteSeedBinding:
+    """Publisher-owned proof joining one byte-exact seed to its candidate."""
+
+    request: FiniteArtifactRequest
+    receipt: FiniteSourceSeedReceipt
+    candidate_identity: str
+    _owner: _BindingOwner
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if (
+            _claim is not _FACTORY
+            or type(self.request) is not FiniteArtifactRequest
+            or type(self.receipt) is not FiniteSourceSeedReceipt
+            or self.receipt.source_snapshot
+            != self.request.operation_context.source_snapshot
+            or type(self.candidate_identity) is not str
+            or not _LOWER_HEX_64.fullmatch(self.candidate_identity)
+            or type(self._owner) is not _BindingOwner
+            or not self._owner.active
+        ):
+            raise TypeError("finite seed binding is not publisher-owned")
+
+    @property
+    def active(self) -> bool:
+        with self._owner.lock:
+            return self._owner.active
+
+    def authorizes(self, candidate: FiniteCandidateBinding) -> bool:
+        """Prove one candidate capability shares this exact publisher owner."""
+
+        return (
+            type(candidate) is FiniteCandidateBinding
+            and candidate.request is self.request
+            and candidate.candidate_identity == self.candidate_identity
+            and candidate._owner is self._owner
+            and self.active
+            and not candidate.closed
+        )
+
+    def __copy__(self):
+        raise TypeError("finite seed binding is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("finite seed binding is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("finite seed binding is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("finite seed binding is not serializable")
+
+
 @dataclass(frozen=True, slots=True)
 class FiniteDocumentAdapter:
     """Trusted publisher-owned sessions over one revocable private file.
@@ -578,6 +735,30 @@ class FiniteDocumentAdapter:
 
 
 @dataclass(frozen=True, slots=True)
+class FiniteSeededDocumentAdapter:
+    """Seed-aware adapter whose writer receives publisher-minted seed proof."""
+
+    open_writer: Callable[[FiniteCandidateBinding], ContextManager[object]]
+    write: Callable[
+        [object, FiniteSeedBinding, FiniteCandidateBinding], object
+    ]
+    open_reader: Callable[[FiniteCandidateBinding], ContextManager[object]]
+    validate: Callable[[object], FiniteCandidateValidation]
+
+    def __post_init__(self) -> None:
+        if any(
+            not callable(value)
+            for value in (
+                self.open_writer,
+                self.write,
+                self.open_reader,
+                self.validate,
+            )
+        ):
+            raise TypeError("finite seeded document adapter fields must be callable")
+
+
+@dataclass(frozen=True, slots=True)
 class FiniteArtifactResult:
     disposition: FiniteArtifactDisposition
     request: FiniteArtifactRequest
@@ -586,19 +767,27 @@ class FiniteArtifactResult:
     commit_identity: str | None
     hidden_orphan: str | None
     diagnostics: tuple[str, ...]
+    _claim: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _claim: object) -> None:
         committed = self.disposition in {
             FiniteArtifactDisposition.COMMITTED,
             FiniteArtifactDisposition.ALREADY_COMMITTED,
         }
         if (
-            type(self.request) is not FiniteArtifactRequest
+            _claim is not _FACTORY
+            or type(self.request) is not FiniteArtifactRequest
             or committed != (type(self.terminal) is StreamTerminal)
             or committed != (
                 type(self.commit_identity) is str
                 and bool(_LOWER_HEX_64.fullmatch(self.commit_identity or ""))
             )
+            or committed
+            and self.commit_identity != _commit_identity(
+                self.request, self.terminal,
+            )
+            or self.seed_receipt is not None
+            and type(self.seed_receipt) is not FiniteSourceSeedReceipt
             or type(self.diagnostics) is not tuple
             or any(type(item) is not str or len(item) > 1024 for item in self.diagnostics)
             or self.hidden_orphan is not None
@@ -997,14 +1186,23 @@ def write_finite_artifact_lineage(document, request: FiniteArtifactRequest) -> N
 def require_finite_artifact_lineage(
     document,
     request: FiniteArtifactRequest | None = None,
+    *,
+    entry: str | None = None,
 ) -> FiniteArtifactLineage:
     """Read one exact local scalar lineage node and optionally match a request."""
 
     import h5py
 
-    if request is not None and type(request) is not FiniteArtifactRequest:
+    if (
+        request is not None
+        and type(request) is not FiniteArtifactRequest
+        or request is not None
+        and entry is not None
+    ):
         raise TypeError("finite lineage reader request is invalid")
-    entry_name = request.entry if request is not None else None
+    if entry is not None:
+        finite_lineage_hdf_path(entry)
+    entry_name = request.entry if request is not None else entry
     if entry_name is None:
         candidates = []
         for name in document:
@@ -1202,6 +1400,109 @@ def finite_artifact_request(
     )
 
 
+def _replay_finite_artifact_request(
+    *,
+    source_admission: FiniteSourceAdmission,
+    operation_context: FiniteOperationContext,
+    predecessor: FinitePredecessorReceipt,
+    output_artifact: Path | str,
+    artifact_family: str,
+    operation_kind: str,
+    source_graph_identity: str,
+    entry: str,
+    scientific_identity: str,
+    output_schema: str,
+    algorithm_identity: str,
+    preservation_identity: str,
+    expected_lineage: FiniteArtifactLineage,
+    expected_version_identity: str,
+    expected_publication_identity: str,
+    expected_operation_identity: str,
+) -> FiniteArtifactRequest:
+    """Reconstruct one frozen request without re-running occupied-path policy."""
+
+    if (
+        type(source_admission) is not FiniteSourceAdmission
+        or type(operation_context) is not FiniteOperationContext
+        or type(predecessor) is not FinitePredecessorReceipt
+        or type(expected_lineage) is not FiniteArtifactLineage
+        or operation_context.source_snapshot != source_admission.snapshot
+        or predecessor.source_snapshot != source_admission.snapshot
+    ):
+        raise TypeError("finite request replay requires exact custody receipts")
+    source = source_admission.path
+    output = _resolved_parent_path(output_artifact)
+    if not Path(output).parent.is_dir():
+        raise ValueError("finite replay output directory must already exist")
+    family = artifact_family_from_source(source, artifact_family)
+    source_graph = _hex_identity(source_graph_identity, "source graph identity")
+    science = _hex_identity(scientific_identity, "scientific identity")
+    algorithm = _hex_identity(algorithm_identity, "algorithm identity")
+    preservation = _hex_identity(preservation_identity, "preservation identity")
+    version_json, version = _identity({
+        "algorithm_identity": algorithm,
+        "domain": "xdart.finite-artifact-version.v1",
+        "entry": entry,
+        "operation_kind": operation_kind,
+        "output_schema": output_schema,
+        "preservation_identity": preservation,
+        "scientific_identity": science,
+        "source_graph_identity": source_graph,
+    })
+    _publication_json, publication = _identity({
+        "domain": "xdart.finite-artifact-publication.v1",
+        "output_artifact": output,
+        "version_identity": version,
+    })
+    _operation_json, operation = _identity({
+        "domain": "xdart.finite-artifact-operation.v1",
+        "operation_context_identity": operation_context.context_identity,
+        "output_artifact": output,
+        "publication_identity": publication,
+        "source_artifact": source,
+        "version_identity": version,
+    })
+    lineage = _lineage_for_request_fields(
+        artifact_family=family,
+        operation_kind=operation_kind,
+        source_graph_identity=source_graph,
+        entry=entry,
+        scientific_identity=science,
+        output_schema=output_schema,
+        algorithm_identity=algorithm,
+        preservation_identity=preservation,
+        publication_identity=publication,
+        version_identity=version,
+        predecessor=predecessor,
+    )
+    if (
+        version != expected_version_identity
+        or publication != expected_publication_identity
+        or operation != expected_operation_identity
+        or lineage != expected_lineage
+    ):
+        raise ValueError("finite request replay identities changed")
+    return FiniteArtifactRequest(
+        source,
+        output,
+        family,
+        operation_kind,
+        source_graph,
+        entry,
+        science,
+        output_schema,
+        algorithm,
+        preservation,
+        operation_context,
+        predecessor,
+        lineage,
+        version_json,
+        version,
+        publication,
+        operation,
+    )
+
+
 def _state(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
     return (
         int(value.st_dev),
@@ -1262,6 +1563,9 @@ def _capture_regular(
             f"finite file is unavailable: {normalized}"
         ) from error
     digest = hashlib.sha256() if hash_content else None
+    primary: BaseException | None = None
+    opened: os.stat_result | None = None
+    finished: os.stat_result | None = None
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
@@ -1273,8 +1577,21 @@ def _capture_regular(
                     break
                 digest.update(block)
         finished = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
+    except BaseException as error:
+        primary = error
+    close_error = _close_descriptor_once(descriptor)
+    if primary is not None:
+        if close_error is not None:
+            _attach_secondary_close(
+                primary, close_error, "finite regular-file observation",
+            )
+        raise primary.with_traceback(primary.__traceback__)
+    if close_error is not None:
+        raise FiniteArtifactIntegrityError(
+            f"finite file close is incomplete: {normalized}"
+        ) from close_error
+    if opened is None or finished is None:
+        raise RuntimeError("finite file observation lost its descriptor state")
     try:
         lexical_after = _entry_stat(normalized, parent_descriptor, name)
     except OSError as error:
@@ -1458,6 +1775,30 @@ def _bounded_diagnostic(prefix: str, error: BaseException) -> str:
     return f"{prefix}:{name}:{detail}"[:1024]
 
 
+def _close_descriptor_once(descriptor: int) -> BaseException | None:
+    """Close exactly once; POSIX close errors have ambiguous descriptor state."""
+
+    try:
+        os.close(descriptor)
+    except BaseException as error:
+        return error
+    return None
+
+
+def _attach_secondary_close(
+    primary: BaseException,
+    close_error: BaseException,
+    role: str,
+) -> None:
+    try:
+        primary.add_note(
+            _bounded_diagnostic(FINITE_DESCRIPTOR_CLOSE_WARNING, close_error)
+            + f":{role}"
+        )
+    except BaseException:
+        pass
+
+
 def _commit_identity(
     request: FiniteArtifactRequest,
     terminal: StreamTerminal,
@@ -1531,9 +1872,13 @@ class FiniteArtifactPublisher:
         try:
             opened = os.fstat(descriptor)
             named_after = os.lstat(parent)
-        except BaseException:
-            os.close(descriptor)
-            raise
+        except BaseException as primary:
+            close_error = _close_descriptor_once(descriptor)
+            if close_error is not None:
+                _attach_secondary_close(
+                    primary, close_error, "output parent admission",
+                )
+            raise primary.with_traceback(primary.__traceback__)
         if (
             stat.S_ISLNK(named_after.st_mode)
             or not stat.S_ISDIR(opened.st_mode)
@@ -1541,8 +1886,15 @@ class FiniteArtifactPublisher:
             or _state(named_before)[:3] != _state(opened)[:3]
             or _state(opened)[:3] != _state(named_after)[:3]
         ):
-            os.close(descriptor)
-            raise FiniteArtifactIntegrityError("finite output parent changed during admission")
+            primary = FiniteArtifactIntegrityError(
+                "finite output parent changed during admission"
+            )
+            close_error = _close_descriptor_once(descriptor)
+            if close_error is not None:
+                _attach_secondary_close(
+                    primary, close_error, "output parent admission",
+                )
+            raise primary
         return descriptor, _state(opened)
 
     def _require_parent(
@@ -1564,6 +1916,34 @@ class FiniteArtifactPublisher:
         ):
             raise FiniteArtifactIntegrityError("finite output parent changed")
 
+    def _require_candidate_capacity(
+        self,
+        parent_descriptor: int,
+        source: FiniteFileSnapshot,
+    ) -> None:
+        # A finite replacement starts as one complete source-sized private
+        # copy.  Reserve ten percent for replacement metadata/results, with a
+        # fixed 64 MiB floor so small inputs do not pass on a nearly full
+        # filesystem.  Existing exact public versions bypass this budget.
+        margin = max(
+            _CANDIDATE_SPACE_MARGIN_BYTES,
+            (source.size + 9) // 10,
+        )
+        required = source.size + margin
+        observed = os.fstatvfs(parent_descriptor)
+        fragment = int(observed.f_frsize)
+        available = int(observed.f_bavail) * fragment
+        if fragment <= 0 or available < 0:
+            raise FiniteArtifactIntegrityError(
+                "finite candidate filesystem capacity is unavailable"
+            )
+        if available < required:
+            raise FiniteArtifactCapacityError(
+                self.request,
+                required_bytes=required,
+                available_bytes=available,
+            )
+
     def _reserve_candidate(self, parent_descriptor: int) -> FiniteFileSnapshot:
         name = (
             f".xdart-finite-{self.request.version_identity}-"
@@ -1582,12 +1962,11 @@ class FiniteArtifactPublisher:
                 f"finite private candidate already exists: {name}"
             ) from error
         path = Path(self.request.output_artifact).parent / name
+        provisional: FiniteFileSnapshot | None = None
+        primary: BaseException | None = None
+        close_cause: BaseException | None = None
         try:
             state = os.fstat(descriptor)
-            if not stat.S_ISREG(state.st_mode):
-                raise FiniteArtifactIntegrityError(
-                    "finite candidate reservation is not regular"
-                )
             provisional = FiniteFileSnapshot(
                 str(path),
                 int(state.st_size),
@@ -1598,8 +1977,46 @@ class FiniteArtifactPublisher:
                 int(state.st_mtime_ns),
                 int(state.st_ctime_ns),
             )
-        finally:
-            os.close(descriptor)
+            if not stat.S_ISREG(state.st_mode):
+                raise FiniteArtifactIntegrityError(
+                    "finite candidate reservation is not regular"
+                )
+        except BaseException as error:
+            primary = error
+        close_error = _close_descriptor_once(descriptor)
+        if close_error is not None:
+            if primary is None:
+                primary = FiniteArtifactIntegrityError(
+                    "finite candidate reservation close is incomplete"
+                )
+                close_cause = close_error
+            else:
+                _attach_secondary_close(
+                    primary, close_error, "candidate reservation",
+                )
+        if primary is not None:
+            if provisional is not None:
+                try:
+                    _unlink_candidate(parent_descriptor, path, provisional)
+                except BaseException as cleanup_error:
+                    try:
+                        primary.add_note(_bounded_diagnostic(
+                            FINITE_CANDIDATE_CLEANUP_WARNING, cleanup_error
+                        ) + f":{path}")
+                    except BaseException:
+                        pass
+            else:
+                try:
+                    primary.add_note(
+                        f"{FINITE_CANDIDATE_CLEANUP_WARNING}:{path}"
+                    )
+                except BaseException:
+                    pass
+            if close_cause is not None:
+                raise primary from close_cause
+            raise primary.with_traceback(primary.__traceback__)
+        if provisional is None:
+            raise RuntimeError("finite reservation lost its provisional identity")
         try:
             captured = _snapshot_at(parent_descriptor, name, path)
             if not _same_object(captured, provisional):
@@ -1652,9 +2069,13 @@ class FiniteArtifactPublisher:
                 raise FiniteArtifactIntegrityError(
                     "finite candidate changed before capability open"
                 )
-        except BaseException:
-            os.close(descriptor)
-            raise
+        except BaseException as primary:
+            close_error = _close_descriptor_once(descriptor)
+            if close_error is not None:
+                _attach_secondary_close(
+                    primary, close_error, "candidate capability admission",
+                )
+            raise primary.with_traceback(primary.__traceback__)
         owner = _BindingOwner(descriptor, writable=writable)
         _candidate_json, candidate_identity = _identity({
             "device": expected.device,
@@ -1688,11 +2109,69 @@ class FiniteArtifactPublisher:
             expected,
             writable=writable,
         )
+        primary: BaseException | None = None
+        result: object | None = None
         try:
             with opener(binding) as document:
                 result = action(document)
-        finally:
-            owner.revoke()
+        except BaseException as error:
+            primary = error
+        close_error = owner.revoke()
+        if primary is not None:
+            if close_error is not None:
+                _attach_secondary_close(
+                    primary, close_error, "candidate capability",
+                )
+            raise primary.with_traceback(primary.__traceback__)
+        if close_error is not None:
+            raise FiniteArtifactIntegrityError(
+                "finite candidate capability close is incomplete"
+            ) from close_error
+        return binding, result
+
+    def _run_seeded_document_session(
+        self,
+        parent_descriptor: int,
+        candidate: Path,
+        expected: FiniteFileSnapshot,
+        *,
+        opener: Callable[[FiniteCandidateBinding], ContextManager[object]],
+        action: Callable[
+            [object, FiniteSeedBinding, FiniteCandidateBinding], object
+        ],
+        receipt: FiniteSourceSeedReceipt,
+    ) -> tuple[FiniteCandidateBinding, object]:
+        binding, owner = self._open_binding(
+            parent_descriptor,
+            candidate,
+            expected,
+            writable=True,
+        )
+        seed_binding = FiniteSeedBinding(
+            self.request,
+            receipt,
+            binding.candidate_identity,
+            owner,
+            _FACTORY,
+        )
+        primary: BaseException | None = None
+        result: object | None = None
+        try:
+            with opener(binding) as document:
+                result = action(document, seed_binding, binding)
+        except BaseException as error:
+            primary = error
+        close_error = owner.revoke()
+        if primary is not None:
+            if close_error is not None:
+                _attach_secondary_close(
+                    primary, close_error, "seeded candidate capability",
+                )
+            raise primary.with_traceback(primary.__traceback__)
+        if close_error is not None:
+            raise FiniteArtifactIntegrityError(
+                "finite seeded candidate capability close is incomplete"
+            ) from close_error
         return binding, result
 
     def _seed_candidate(
@@ -1710,45 +2189,65 @@ class FiniteArtifactPublisher:
         source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         target_flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
         source_descriptor = os.open(source.path, source_flags)
+        target_descriptor: int | None = None
+        primary: BaseException | None = None
+        close_cause: BaseException | None = None
         try:
             target_descriptor = os.open(
                 candidate_path.name,
                 target_flags,
                 dir_fd=parent_descriptor,
             )
-            try:
-                opened_source = os.fstat(source_descriptor)
-                opened_target = os.fstat(target_descriptor)
-                if (
-                    (int(opened_source.st_dev), int(opened_source.st_ino))
-                    != (source.device, source.inode)
-                    or (int(opened_target.st_dev), int(opened_target.st_ino))
-                    != (reservation.device, reservation.inode)
-                ):
-                    raise FiniteArtifactIntegrityError(
-                        "finite seed descriptor identity changed"
-                    )
-                os.ftruncate(target_descriptor, 0)
-                digest = hashlib.sha256()
-                copied = 0
-                while True:
-                    block = os.read(source_descriptor, _COPY_BLOCK_BYTES)
-                    if not block:
-                        break
-                    digest.update(block)
-                    view = memoryview(block)
-                    offset = 0
-                    while offset < len(view):
-                        written = os.write(target_descriptor, view[offset:])
-                        if written <= 0:
-                            raise OSError("finite seed copy made no progress")
-                        offset += written
-                    copied += len(block)
-                _fsync(target_descriptor)
-            finally:
-                os.close(target_descriptor)
-        finally:
-            os.close(source_descriptor)
+            opened_source = os.fstat(source_descriptor)
+            opened_target = os.fstat(target_descriptor)
+            if (
+                (int(opened_source.st_dev), int(opened_source.st_ino))
+                != (source.device, source.inode)
+                or (int(opened_target.st_dev), int(opened_target.st_ino))
+                != (reservation.device, reservation.inode)
+            ):
+                raise FiniteArtifactIntegrityError(
+                    "finite seed descriptor identity changed"
+                )
+            os.ftruncate(target_descriptor, 0)
+            digest = hashlib.sha256()
+            copied = 0
+            while True:
+                block = os.read(source_descriptor, _COPY_BLOCK_BYTES)
+                if not block:
+                    break
+                digest.update(block)
+                view = memoryview(block)
+                offset = 0
+                while offset < len(view):
+                    written = os.write(target_descriptor, view[offset:])
+                    if written <= 0:
+                        raise OSError("finite seed copy made no progress")
+                    offset += written
+                copied += len(block)
+            _fsync(target_descriptor)
+        except BaseException as error:
+            primary = error
+        for descriptor, role in (
+            (target_descriptor, "seed target"),
+            (source_descriptor, "seed source"),
+        ):
+            if descriptor is None:
+                continue
+            close_error = _close_descriptor_once(descriptor)
+            if close_error is None:
+                continue
+            if primary is None:
+                primary = FiniteArtifactIntegrityError(
+                    f"finite {role} close is incomplete"
+                )
+                close_cause = close_error
+            else:
+                _attach_secondary_close(primary, close_error, role)
+        if primary is not None:
+            if close_cause is not None:
+                raise primary from close_cause
+            raise primary.with_traceback(primary.__traceback__)
         _require_source(admission)
         candidate = _snapshot_at(
             parent_descriptor,
@@ -1782,6 +2281,7 @@ class FiniteArtifactPublisher:
             copied,
             "bounded-copy-v1",
             receipt_digest,
+            _FACTORY,
         )
 
     def _fsync_candidate(
@@ -1792,6 +2292,7 @@ class FiniteArtifactPublisher:
     ) -> None:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        primary: BaseException | None = None
         try:
             state = os.fstat(descriptor)
             if (int(state.st_dev), int(state.st_ino)) != (
@@ -1802,8 +2303,19 @@ class FiniteArtifactPublisher:
                     "finite candidate changed before file fsync"
                 )
             _fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        except BaseException as error:
+            primary = error
+        close_error = _close_descriptor_once(descriptor)
+        if primary is not None:
+            if close_error is not None:
+                _attach_secondary_close(
+                    primary, close_error, "candidate fsync descriptor",
+                )
+            raise primary.with_traceback(primary.__traceback__)
+        if close_error is not None:
+            raise FiniteArtifactIntegrityError(
+                "finite candidate fsync descriptor close is incomplete"
+            ) from close_error
 
     def _inspect_exact(
         self,
@@ -1877,6 +2389,7 @@ class FiniteArtifactPublisher:
             commit,
             hidden_orphan,
             diagnostics,
+            _FACTORY,
         )
 
     def _cleanup(
@@ -1907,7 +2420,7 @@ class FiniteArtifactPublisher:
 
     def publish(
         self,
-        adapter: FiniteDocumentAdapter,
+        adapter: FiniteDocumentAdapter | FiniteSeededDocumentAdapter,
         *,
         inspect_committed: Callable[
             [Path, FiniteArtifactRequest],
@@ -1924,7 +2437,10 @@ class FiniteArtifactPublisher:
         protocol proves closure for conforming file-object adapters; it is not
         a sandbox for arbitrary hostile same-process Python.
         """
-        if type(adapter) is not FiniteDocumentAdapter:
+        if type(adapter) not in {
+            FiniteDocumentAdapter,
+            FiniteSeededDocumentAdapter,
+        }:
             raise TypeError("finite publisher requires an exact document adapter")
         if not callable(inspect_committed):
             raise TypeError("finite committed inspector must be callable")
@@ -1932,6 +2448,8 @@ class FiniteArtifactPublisher:
             raise TypeError("finite prepublication check must be callable")
         if seed is not None and type(seed) is not FiniteSourceAdmission:
             raise TypeError("finite seed must be an exact source admission")
+        if type(adapter) is FiniteSeededDocumentAdapter and seed is None:
+            raise TypeError("finite seeded adapter requires one source admission")
         with self._lock:
             if self._used:
                 raise RuntimeError("finite publisher is one-shot")
@@ -1942,6 +2460,25 @@ class FiniteArtifactPublisher:
             reservation: FiniteFileSnapshot | None = None
             seed_receipt: FiniteSourceSeedReceipt | None = None
             diagnostics: list[str] = []
+            hidden_orphan: str | None = None
+            own_link_observed = False
+            parent_closed = False
+
+            def close_parent(primary: BaseException | None = None) -> None:
+                nonlocal parent_closed
+                if parent_closed:
+                    return
+                parent_closed = True
+                close_error = _close_descriptor_once(parent_descriptor)
+                if close_error is None:
+                    return
+                diagnostics.append(_bounded_diagnostic(
+                    FINITE_DESCRIPTOR_CLOSE_WARNING, close_error,
+                ))
+                if primary is not None:
+                    _attach_secondary_close(
+                        primary, close_error, "output parent",
+                    )
 
             def cleanup_result(
                 disposition: FiniteArtifactDisposition,
@@ -1959,6 +2496,7 @@ class FiniteArtifactPublisher:
                         FINITE_CANDIDATE_CLEANUP_WARNING,
                         cleanup_error,
                     ))
+                close_parent()
                 return self._result(
                     disposition,
                     terminal=None,
@@ -1974,6 +2512,8 @@ class FiniteArtifactPublisher:
                     raise FiniteArtifactIntegrityError(
                         "finite seed admission does not match the request source snapshot"
                     )
+                if self._cancelled():
+                    return cleanup_result(FiniteArtifactDisposition.ABORTED)
                 try:
                     existing = _try_observe_at(
                         parent_descriptor,
@@ -2000,14 +2540,35 @@ class FiniteArtifactPublisher:
                         parent_state=parent_state,
                         collision=True,
                     )
+                    if self._cancelled():
+                        return cleanup_result(
+                            FiniteArtifactDisposition.ABORTED
+                        )
+                    if prepublish is not None:
+                        prepublish()
+                    self._require_request_source()
+                    if seed is not None and _require_source(seed) != request_source:
+                        raise FiniteArtifactIntegrityError(
+                            "finite seed admission changed during committed reuse"
+                        )
+                    if self._cancelled():
+                        return cleanup_result(
+                            FiniteArtifactDisposition.ABORTED
+                        )
+                    close_parent()
                     return self._result(
                         FiniteArtifactDisposition.ALREADY_COMMITTED,
                         terminal=terminal,
                         seed_receipt=None,
+                        diagnostics=tuple(diagnostics),
                     )
                 if self._cancelled():
                     return cleanup_result(FiniteArtifactDisposition.ABORTED)
 
+                self._require_candidate_capacity(
+                    parent_descriptor,
+                    request_source,
+                )
                 reservation = self._reserve_candidate(parent_descriptor)
                 candidate = Path(reservation.path)
                 if seed is not None:
@@ -2020,14 +2581,30 @@ class FiniteArtifactPublisher:
                 if self._cancelled():
                     return cleanup_result(FiniteArtifactDisposition.ABORTED)
 
-                self._run_document_session(
-                    parent_descriptor,
-                    candidate,
-                    reservation,
-                    opener=adapter.open_writer,
-                    action=adapter.write,
-                    writable=True,
-                )
+                if type(adapter) is FiniteSeededDocumentAdapter:
+                    if seed_receipt is None:
+                        raise FiniteArtifactIntegrityError(
+                            "finite seeded adapter lost its copy receipt"
+                        )
+                    _binding, write_result = self._run_seeded_document_session(
+                        parent_descriptor,
+                        candidate,
+                        reservation,
+                        opener=adapter.open_writer,
+                        action=adapter.write,
+                        receipt=seed_receipt,
+                    )
+                else:
+                    _binding, write_result = self._run_document_session(
+                        parent_descriptor,
+                        candidate,
+                        reservation,
+                        opener=adapter.open_writer,
+                        action=adapter.write,
+                        writable=True,
+                    )
+                if write_result is FiniteCandidateWriteDisposition.ABORTED:
+                    return cleanup_result(FiniteArtifactDisposition.ABORTED)
                 written = _snapshot_at(
                     parent_descriptor,
                     candidate.name,
@@ -2092,6 +2669,8 @@ class FiniteArtifactPublisher:
                         "finite candidate changed before publication"
                     )
                 self._require_parent(parent_descriptor, parent_state)
+                if self._cancelled():
+                    return cleanup_result(FiniteArtifactDisposition.ABORTED)
                 link_error: BaseException | None = None
                 try:
                     _link(
@@ -2103,6 +2682,12 @@ class FiniteArtifactPublisher:
                     )
                 except BaseException as error:
                     link_error = error
+                else:
+                    # A successful no-clobber link syscall is already the
+                    # public visibility point.  Later namespace inspection may
+                    # fail, but accounting must retain HELD state rather than
+                    # treating the visible effect as a pre-link abort.
+                    own_link_observed = True
                 try:
                     final_state = _try_observe_at(
                         parent_descriptor,
@@ -2118,6 +2703,15 @@ class FiniteArtifactPublisher:
                         )
                     except FileNotFoundError:
                         raise observation_error
+                    if (
+                        link_error is not None
+                        and not isinstance(link_error, FileExistsError)
+                    ):
+                        # The no-clobber syscall may have installed the link
+                        # before reporting failure.  An occupied final plus an
+                        # unavailable exact observation is therefore an
+                        # unresolved public effect, never proven pre-link abort.
+                        own_link_observed = True
                     raise FiniteArtifactCollision(
                         "finite publication found a foreign public occupant"
                     ) from observation_error
@@ -2132,6 +2726,7 @@ class FiniteArtifactPublisher:
                     )
                 ):
                     disposition = FiniteArtifactDisposition.COMMITTED
+                    own_link_observed = True
                 elif final_state is not None:
                     disposition = FiniteArtifactDisposition.ALREADY_COMMITTED
                 elif link_error is not None:
@@ -2140,7 +2735,7 @@ class FiniteArtifactPublisher:
                     raise FiniteArtifactIntegrityError(
                         "finite publication effect cannot be established"
                     )
-                hidden, cleanup_error = self._cleanup(
+                hidden_orphan, cleanup_error = self._cleanup(
                     parent_descriptor,
                     candidate,
                     validated,
@@ -2171,45 +2766,62 @@ class FiniteArtifactPublisher:
                         else None
                     ),
                 )
+                close_parent()
                 return self._result(
                     disposition,
                     terminal=terminal,
                     seed_receipt=seed_receipt,
-                    hidden_orphan=hidden,
+                    hidden_orphan=hidden_orphan,
                     diagnostics=tuple(diagnostics),
                 )
             except BaseException as primary:
                 if candidate is not None and reservation is not None:
-                    hidden, cleanup_error = self._cleanup(
+                    retry_hidden, cleanup_error = self._cleanup(
                         parent_descriptor,
                         candidate,
                         reservation,
                     )
+                    hidden_orphan = retry_hidden
                     if cleanup_error is not None:
+                        diagnostic = _bounded_diagnostic(
+                            FINITE_CANDIDATE_CLEANUP_WARNING, cleanup_error
+                        )
+                        diagnostics.append(diagnostic)
                         try:
-                            primary.add_note(_bounded_diagnostic(
-                                FINITE_CANDIDATE_CLEANUP_WARNING, cleanup_error
-                            ) + f":{hidden}")
+                            primary.add_note(
+                                diagnostic + f":{hidden_orphan}"
+                            )
                         except BaseException:
                             pass
+                close_parent(primary)
                 # Once a public link is observable it is intentionally retained.
                 # An exact terminal failure is an integrity error, never abort.
+                if own_link_observed and not isinstance(
+                    primary, FiniteArtifactPublicationHeld,
+                ):
+                    raise FiniteArtifactPublicationHeld(
+                        self.request,
+                        primary,
+                        hidden_orphan=hidden_orphan,
+                        diagnostics=tuple(diagnostics),
+                    ) from primary
                 raise primary.with_traceback(primary.__traceback__)
-            finally:
-                os.close(parent_descriptor)
 
 
 __all__ = [
     "FINITE_CANDIDATE_CLEANUP_WARNING",
+    "FINITE_DESCRIPTOR_CLOSE_WARNING",
     "FINITE_LINEAGE_NODE_NAME",
     "FINITE_LINEAGE_MAX_BYTES",
     "FINITE_LINEAGE_SCHEMA",
     "FINITE_PARENT_DIRECTORY_FSYNC_WARNING",
     "FINITE_PUBLICATION_POLICY",
     "FiniteArtifactCollision",
+    "FiniteArtifactCapacityError",
     "FiniteArtifactDisposition",
     "FiniteArtifactError",
     "FiniteArtifactIntegrityError",
+    "FiniteArtifactPublicationHeld",
     "FiniteArtifactPublisher",
     "FiniteArtifactRequest",
     "FiniteArtifactResult",
@@ -2218,9 +2830,11 @@ __all__ = [
     "FiniteCandidateValidation",
     "FiniteCommittedInspection",
     "FiniteDocumentAdapter",
+    "FiniteSeededDocumentAdapter",
     "FiniteFileSnapshot",
     "FiniteSourceAdmission",
     "FiniteSourceSeedReceipt",
+    "FiniteSeedBinding",
     "FiniteOperationContext",
     "FinitePredecessorReceipt",
     "admit_finite_artifact_lineage",

@@ -128,6 +128,7 @@ class DynamicRunState(str, Enum):
     CLEANUP_PENDING = "cleanup-pending"
     FINISHED = "finished"
     ABORTED = "aborted"
+    HELD = "held"
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,6 +292,19 @@ class _DynamicWriterBoundary:
 
     def epoch_aborted(self, session, owner_token, reason) -> None:
         self._accounting._abort_bound(session, owner_token, str(reason))
+
+    def publication_held(self, session, owner_token, reason) -> None:
+        self._accounting._hold_bound(session, owner_token, str(reason))
+
+    def terminal_boundary_complete(self, state: DynamicRunState) -> bool:
+        return self._accounting._terminal_boundary_complete(state)
+
+    def recover_external_terminal(
+        self, session, owner_token, seal, state, value,
+    ) -> BaseException | None:
+        return self._accounting._recover_external_terminal(
+            session, owner_token, seal, state, value,
+        )
 
 
 class DynamicRunAccounting:
@@ -1348,6 +1362,132 @@ class DynamicRunAccounting:
         self._active_seal = None
         self._sealed_promoted = False
 
+    def _terminal_boundary_complete(self, state: DynamicRunState) -> bool:
+        if state not in {
+            DynamicRunState.FINISHED,
+            DynamicRunState.STOPPED,
+            DynamicRunState.ABORTED,
+            DynamicRunState.HELD,
+        }:
+            raise ValueError("dynamic terminal completion state is invalid")
+        with self._lock:
+            return bool(
+                self._state is state
+                and self._live_session_ref is None
+                and self._live_owner_token is None
+                and self._light_lease is None
+                and self._light_cleanup_hooks is None
+                and self._light_custody_slot is None
+                and self._light_action is None
+                and self._light_retry_token is None
+                and self._active_seal is None
+                and not self._sealed_promoted
+            )
+
+    def _recover_external_terminal(
+        self,
+        session,
+        owner_token,
+        seal,
+        state: DynamicRunState,
+        value,
+    ) -> BaseException | None:
+        """Recover exact finite-publication truth below fallible wrappers.
+
+        The ordinary transition is tried first.  The final branch is limited
+        to finite runs with no light-retention owner; it drops only in-memory
+        accounting custody after the immutable public result has already
+        established COMMIT, ABORT, or HOLD truth.
+        """
+
+        primary: BaseException | None = None
+        try:
+            if state is DynamicRunState.FINISHED:
+                self._finish_bound(
+                    session, owner_token, seal, str(value),
+                )
+            elif state is DynamicRunState.ABORTED:
+                self._abort_bound(session, owner_token, str(value))
+            elif state is DynamicRunState.HELD:
+                self._hold_bound(session, owner_token, str(value))
+            else:
+                raise ValueError("external recovery state is unsupported")
+        except BaseException as error:
+            primary = error
+        else:
+            return None
+
+        with self._lock:
+            if primary is None:
+                raise RuntimeError(
+                    "external terminal recovery lost its primary failure"
+                )
+            self._require_bound(session, owner_token)
+            if any(value is not None for value in (
+                self._light_lease,
+                self._light_cleanup_hooks,
+                self._light_custody_slot,
+                self._light_action,
+                self._light_retry_token,
+            )):
+                raise primary
+            if state is DynamicRunState.FINISHED:
+                self._require_seal(
+                    session, owner_token, seal, kind="finish",
+                )
+                if seal.terminal_state is not DynamicRunState.FINISHED:
+                    raise RuntimeError(
+                        "external commit recovery has the wrong finish seal"
+                    ) from primary
+                if self._terminal_intent not in {
+                    None, DynamicRunState.FINISHED,
+                }:
+                    raise RuntimeError(
+                        "external commit recovery changed terminal intent"
+                    ) from primary
+                self._terminal_intent = DynamicRunState.FINISHED
+                for token in self._epoch_tokens:
+                    self._records[token].epoch_finalized = True
+                self._clear_epoch()
+                self._last_epoch_identity = str(value)
+            else:
+                if self._terminal_intent not in {None, state}:
+                    raise RuntimeError(
+                        "external recovery changed terminal intent"
+                    ) from primary
+                self._terminal_intent = state
+                reason = str(value)
+                for token in self._epoch_tokens:
+                    record = self._records[token]
+                    if record.state in {
+                        DynamicAttemptState.ACCEPTED,
+                        DynamicAttemptState.COMPLETED,
+                    }:
+                        record.error = reason
+                        record.state = DynamicAttemptState.CANCELLED
+                    elif record.state is DynamicAttemptState.FAILED_RETRYABLE:
+                        record.retryable = False
+                        record.state = DynamicAttemptState.FAILED
+                    record.epoch_finalized = True
+                    record.epoch_aborted = True
+                for record in self._records.values():
+                    if record.state in {
+                        DynamicAttemptState.PROVISIONAL,
+                        DynamicAttemptState.ENQUEUED,
+                    }:
+                        record.error = reason
+                        record.state = DynamicAttemptState.CANCELLED
+                    elif record.state is DynamicAttemptState.FAILED_RETRYABLE:
+                        record.retryable = False
+                        record.state = DynamicAttemptState.FAILED
+                self._clear_epoch(discard_all=True)
+            self._cleanup_receipt = DynamicCleanupReceipt(
+                state, None, None, True,
+            )
+            self._state = state
+            self._drop_terminal_owners()
+        return primary
+
     def _finish_bound(self, session, owner_token, seal, identity) -> None:
         with self._lock:
             self._require_seal(session, owner_token, seal, kind="finish")
@@ -1409,6 +1549,17 @@ class DynamicRunAccounting:
                 self._sealed_promoted = self._active_seal is not None
                 terminal = DynamicRunState.ABORTED
         self._release_light(terminal)
+        with self._lock:
+            self._drop_terminal_owners()
+
+    def _hold_bound(self, session, owner_token, reason: str) -> None:
+        with self._lock:
+            self._require_bound(session, owner_token)
+            if self._terminal_intent not in {None, DynamicRunState.HELD}:
+                raise RuntimeError("terminal hold retry changed its intent")
+            self._terminal_intent = DynamicRunState.HELD
+            self._discard_epoch(reason)
+        self._release_light(DynamicRunState.HELD)
         with self._lock:
             self._drop_terminal_owners()
 

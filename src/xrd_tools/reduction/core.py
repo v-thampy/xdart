@@ -51,6 +51,11 @@ from xrd_tools.core.strictness import (
     StrictPolicy,
 )
 from xrd_tools.io.export import write_xye
+from xrd_tools.io.finite_artifact import (
+    FiniteArtifactRequest,
+    FiniteCandidateBinding,
+    FiniteSeedBinding,
+)
 from xrd_tools.io.image import read_image
 from xrd_tools.io.nexus import (
     open_nexus_writer,
@@ -62,7 +67,9 @@ from xrd_tools.io.record_writer import (
     RecordWrite,
     ResultMode,
     WriterFinalization,
+    WriterOutcome,
     WriterTransactionBinding,
+    PreparedManifestAdmission,
 )
 from xrd_tools.io.append import (
     AppendCommittedPrefix,
@@ -1546,6 +1553,9 @@ class NexusSink:
     )
     _existing_append_pending: bool = field(default=False, init=False, repr=False)
     _replacement: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
+    _finite_candidate: tuple[Any, ...] | None = field(
+        default=None, init=False, repr=False,
+    )
     _perf_nexus_write: float = field(default=0.0, init=False, repr=False)
     _perf_nexus_flush: float = field(default=0.0, init=False, repr=False)
     _perf_nexus_enabled: bool = field(default=False, init=False, repr=False)
@@ -1602,6 +1612,83 @@ class NexusSink:
         sink = cls(path, overwrite=False, **sink_values)
         sink._replacement = (
             expected_target_snapshot, dimension, tuple(labels), bytes(audit_bytes), dict(selected_plan), selected_gi_mode, cancel_token, dict(source_execution), append_lineage,
+        )
+        return sink
+
+    @classmethod
+    def for_finite_replacement(
+        cls,
+        path: Path | str,
+        document: h5py.File,
+        request: FiniteArtifactRequest,
+        seed_binding: FiniteSeedBinding,
+        candidate_binding: FiniteCandidateBinding,
+        prepared_manifest_admission: PreparedManifestAdmission | None = None,
+        *,
+        dimension: str,
+        labels: tuple[int, ...],
+        audit_bytes: bytes,
+        selected_plan: Mapping[str, Any],
+        selected_gi_mode: str | None,
+        source_execution: Mapping[str, Any],
+        append_lineage: bytes | None,
+        cancel_token: threading.Event | None = None,
+        **sink_values: Any,
+    ) -> "NexusSink":
+        """Bind selected replacement to one publisher-owned private document."""
+
+        if (
+            type(document) is not h5py.File
+            or not document.id.valid
+            or document.mode != "r+"
+            or type(request) is not FiniteArtifactRequest
+            or type(seed_binding) is not FiniteSeedBinding
+            or type(candidate_binding) is not FiniteCandidateBinding
+            or seed_binding.request is not request
+            or not seed_binding.authorizes(candidate_binding)
+            or prepared_manifest_admission is not None
+            and type(prepared_manifest_admission) is not PreparedManifestAdmission
+            or dimension not in {"1d", "2d"}
+            or request.output_artifact != str(Path(path))
+            or request.operation_kind != f"reintegrate-{dimension}"
+            or type(source_execution) is not dict
+            or append_lineage is not None
+            and type(append_lineage) is not bytes
+            or cancel_token is not None
+            and type(cancel_token) is not threading.Event
+        ):
+            raise TypeError(
+                "finite replacement requires exact document/request/source objects"
+            )
+        if any(
+            name in sink_values
+            for name in (
+                "overwrite",
+                "append_preflight",
+                "same_run_intent",
+                "allow_unbound_same_run",
+                "atomic",
+            )
+        ):
+            raise ValueError("finite replacement owns its output policy")
+        sink = cls(path, overwrite=False, atomic=False, **sink_values)
+        sink._replacement = (
+            None,
+            dimension,
+            tuple(labels),
+            bytes(audit_bytes),
+            dict(selected_plan),
+            selected_gi_mode,
+            cancel_token,
+            dict(source_execution),
+            append_lineage,
+        )
+        sink._finite_candidate = (
+            document,
+            request,
+            seed_binding,
+            candidate_binding,
+            prepared_manifest_admission,
         )
         return sink
 
@@ -1942,34 +2029,82 @@ class NexusSink:
         self._pending_record_writes.clear()
         self._settled_buffered_drop_labels.clear()
         self._primary_mode_1d, self._primary_mode_2d = _plan_mode_keys(plan)
-        append_decision = self._prepare_transaction()
+        finite_candidate = self._finite_candidate
+        append_decision = (
+            None if finite_candidate is not None else self._prepare_transaction()
+        )
         try:
             replacement = self._replacement
-            writer = NexusRecordWriter(
-                self.path,
-                entry=self.entry,
-                compression=self.compression,
-                overwrite=self.overwrite,
-                atomic=False,
-                flush_every=self.flush_every,
-                complete_record=self.complete_record,
-                source_base=self.source_base,
-                file_lock=self.file_lock,
-                opener=open_nexus_writer,
-                transaction_binding=WriterTransactionBinding(
-                    self._transaction, self._attempt, self._lease,
-                ),
-                append_decision=append_decision,
-                fast_regenerable=self._fast_regenerable,
-                defer_epoch_durability=self.rollback_until_commit,
-                replacement_dimension=None if replacement is None else replacement[1],
-                replacement_labels=None if replacement is None else replacement[2],
-                replacement_audit=None if replacement is None else replacement[3],
-                replacement_selected_plan=None if replacement is None else replacement[4],
-                replacement_gi_mode=None if replacement is None else replacement[5],
-                replacement_source_execution=None if replacement is None else replacement[7],
-                replacement_append_lineage=None if replacement is None else replacement[8],
-            )
+            if finite_candidate is None:
+                writer = NexusRecordWriter(
+                    self.path,
+                    entry=self.entry,
+                    compression=self.compression,
+                    overwrite=self.overwrite,
+                    atomic=False,
+                    flush_every=self.flush_every,
+                    complete_record=self.complete_record,
+                    source_base=self.source_base,
+                    file_lock=self.file_lock,
+                    opener=open_nexus_writer,
+                    transaction_binding=WriterTransactionBinding(
+                        self._transaction, self._attempt, self._lease,
+                    ),
+                    append_decision=append_decision,
+                    fast_regenerable=self._fast_regenerable,
+                    defer_epoch_durability=self.rollback_until_commit,
+                    replacement_dimension=(
+                        None if replacement is None else replacement[1]
+                    ),
+                    replacement_labels=(
+                        None if replacement is None else replacement[2]
+                    ),
+                    replacement_audit=(
+                        None if replacement is None else replacement[3]
+                    ),
+                    replacement_selected_plan=(
+                        None if replacement is None else replacement[4]
+                    ),
+                    replacement_gi_mode=(
+                        None if replacement is None else replacement[5]
+                    ),
+                    replacement_source_execution=(
+                        None if replacement is None else replacement[7]
+                    ),
+                    replacement_append_lineage=(
+                        None if replacement is None else replacement[8]
+                    ),
+                )
+            else:
+                if replacement is None:
+                    raise RuntimeError("finite candidate lost replacement facts")
+                (
+                    document,
+                    request,
+                    seed_binding,
+                    candidate_binding,
+                    prepared_manifest_admission,
+                ) = finite_candidate
+                writer = NexusRecordWriter.for_seeded_replacement(
+                    self.path,
+                    document,
+                    request,
+                    seed_binding,
+                    candidate_binding,
+                    entry=self.entry,
+                    source_base=self.source_base,
+                    file_lock=self.file_lock,
+                    replacement_dimension=replacement[1],
+                    replacement_labels=replacement[2],
+                    replacement_audit=replacement[3],
+                    replacement_selected_plan=replacement[4],
+                    replacement_gi_mode=replacement[5],
+                    replacement_source_execution=replacement[7],
+                    replacement_append_lineage=replacement[8],
+                    prepared_manifest_admission=prepared_manifest_admission,
+                    compression=self.compression,
+                    flush_every=self.flush_every,
+                )
             self._writer = writer
             if self._session_facade is not None:
                 writer.bind_session(self._session_facade)
@@ -1986,7 +2121,15 @@ class NexusSink:
                 self._extension_owner = OwnerToken("same-run-extension")
         except BaseException as primary:
             try:
-                self._abort_composed()
+                if finite_candidate is not None:
+                    if self._writer is not None and self._writer.phase.value not in {
+                        "aborted", "finished",
+                    }:
+                        self._writer.abort()
+                    self._scan = None
+                    self._plan = None
+                else:
+                    self._abort_composed()
             except BaseException as cleanup:
                 raise primary from cleanup
             raise
@@ -2485,6 +2628,8 @@ class NexusSink:
         self._queue_append_decision(decision)
 
     def commit_epoch(self, result: ReductionResult):
+        if self._finite_candidate is not None:
+            raise RuntimeError("finite candidate does not support epoch commit")
         if getattr(result, "cancelled", False):
             raise RuntimeError("a cancelled result cannot commit a live epoch")
         if self._writer is None:
@@ -2503,7 +2648,68 @@ class NexusSink:
             self.append_preflight._commit_epoch(anchor)
         return anchor
 
-    def finish(self, result: ReductionResult) -> NexusTerminalResult:
+    def _finish_finite_candidate(self, result: ReductionResult) -> None:
+        if getattr(result, "failed", False):
+            self._abort_external_publication()
+            raise RuntimeError("failed finite candidate cannot be prepared")
+        self._drain_pending_record_writes(force=True)
+        writer = self._writer
+        replacement = self._replacement
+        if writer is None or replacement is None:
+            raise RuntimeError("finite Nexus finish lost its candidate writer")
+        cancelled = bool(
+            getattr(result, "cancelled", False)
+            or replacement[6] is not None
+            and replacement[6].is_set()
+        )
+        has_rows = bool(
+            writer._row_cursors.get(f"integrated_{replacement[1]}", {})
+        )
+        if cancelled or not has_rows:
+            if writer.phase.value not in {"aborted", "finished"}:
+                writer.abort()
+            self._scan = None
+            self._plan = None
+            return None
+        writer.finish()
+        self._scan = None
+        self._plan = None
+        return None
+
+    def _prepare_external_publication(
+        self, result: ReductionResult,
+    ) -> WriterOutcome:
+        if self._finite_candidate is None:
+            raise RuntimeError("ordinary Nexus output cannot prepare external publication")
+        self._finish_finite_candidate(result)
+        writer = self._writer
+        if writer is None:
+            raise RuntimeError("finite publication preparation lost its writer")
+        outcome = writer.finish()
+        if (
+            outcome.phase.value != "finished"
+            or outcome.target != self.path
+            or outcome.partial_path is not None
+            or outcome.stream_terminal is not None
+        ):
+            raise RuntimeError("finite candidate did not reach a private finished state")
+        return outcome
+
+    def _abort_external_publication(self) -> WriterOutcome | None:
+        if self._finite_candidate is None:
+            raise RuntimeError("ordinary Nexus output has no external publication")
+        writer = self._writer
+        if writer is None:
+            return None
+        if writer.phase.value == "finished":
+            return writer.finish()
+        return writer.abort()
+
+    def finish(self, result: ReductionResult) -> NexusTerminalResult | None:
+        if self._finite_candidate is not None:
+            raise RuntimeError(
+                "finite candidate requires private external publication preparation"
+            )
         if self._terminal_result is not None:
             return self._terminal_result
         self._apply_pending_extension()
@@ -2574,6 +2780,19 @@ class NexusSink:
         return self._typed_terminal(snapshot)
 
     def abort(self, result: ReductionResult | None) -> NexusTerminalResult | None:
+        if self._finite_candidate is not None:
+            if self._nexus_record_batch_size is not None:
+                self._pending_record_writes.clear()
+                self._settled_buffered_drop_labels.clear()
+                self._deferred_publication_drops.clear()
+            writer = self._writer
+            if writer is not None and writer.phase.value not in {
+                "aborted", "finished",
+            }:
+                writer.abort()
+            self._scan = None
+            self._plan = None
+            return None
         if self._terminal_result is not None:
             return self._terminal_result
         if self._nexus_record_batch_size is not None:

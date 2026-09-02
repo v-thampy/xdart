@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, field, replace
+from dataclasses import InitVar, dataclass, field, replace
 from enum import Enum
 import hashlib
 import json
+import math
 from numbers import Integral
 import os
 from pathlib import Path
@@ -63,6 +64,14 @@ from xrd_tools.io.output_transaction import (
     StreamAttempt,
     StreamTerminal,
     TargetLease,
+)
+from xrd_tools.io.finite_artifact import (
+    FiniteArtifactRequest,
+    FiniteCandidateBinding,
+    FiniteFileSnapshot,
+    FiniteSeedBinding,
+    finite_lineage_hdf_path,
+    write_finite_artifact_lineage,
 )
 from xrd_tools.io.processed_scan_id import (
     require_current_output_path,
@@ -580,6 +589,10 @@ class WriterStateError(RuntimeError):
     pass
 
 
+class ReplacementManifestTargetChanged(WriterStateError):
+    """Manifest preparation lost the exact named source object."""
+
+
 # Headless vNext replacement supports at most one million persisted frame rows.
 # This value is intentionally independent of GUI admission modules.
 _MAX_REPLACEMENT_FRAME_ROWS = 1_000_000
@@ -744,6 +757,1101 @@ def _bounded_replacement_config_text(value: str, role: str) -> str:
     return value
 
 
+_MANIFEST_FACTORY = object()
+_LOWER_HEX_64 = frozenset("0123456789abcdef")
+
+
+def _replacement_signature_projection(value):
+    if value is None or type(value) in {str, bool, int, float}:
+        return value
+    if type(value) is bytes:
+        return {"bytes": value.hex()}
+    if type(value) is tuple:
+        return {"tuple": [_replacement_signature_projection(item) for item in value]}
+    if type(value) is list:
+        return {"list": [_replacement_signature_projection(item) for item in value]}
+    if type(value) is dict and all(type(key) is str for key in value):
+        return {
+            "dict": {
+                key: _replacement_signature_projection(value[key])
+                for key in sorted(value)
+            }
+        }
+    raise WriterStateError(
+        f"replacement signature contains unsupported {type(value).__name__}"
+    )
+
+
+def _replacement_signature_digest(value) -> str:
+    payload = json.dumps(
+        _replacement_signature_projection(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8", errors="strict")
+    return hashlib.sha256(
+        b"xrd-tools-replacement-node-signature-v1\0" + payload
+    ).hexdigest()
+
+
+def _replacement_node_signature_value(node, *, max_bytes=None):
+    if node is None:
+        return None
+    if not isinstance(node, h5py.Dataset):
+        return ("invalid",)
+    return (
+        _replacement_dtype_signature(node.dtype),
+        node.shape,
+        node.maxshape,
+        node.chunks,
+        node.compression,
+        node.compression_opts,
+        tuple(
+            (
+                name,
+                _replacement_value_signature(
+                    _read_replacement_attribute_value(
+                        node,
+                        name,
+                        f"replacement config {node.name}@{name}",
+                    ),
+                    node.attrs.get_id(name).dtype,
+                ),
+            )
+            for name in sorted(node.attrs)
+        ),
+        _replacement_value_signature(
+            _replacement_utf8_scalar(
+                node,
+                f"replacement config {node.name}",
+                max_bytes=max_bytes,
+            ),
+            node.dtype,
+        ),
+    )
+
+
+_FINITE_RESULT_HASH_SLAB_BYTES = 4 << 20
+_FINITE_RESULT_MAX_NODES = 128
+_FINITE_RESULT_SEAL_SCHEMA = "xrd_tools.finite_replacement_result_seal"
+_REPLACEMENT_MANIFEST_MAX_NODES = 262_144
+_REPLACEMENT_MANIFEST_MAX_VLEN_ELEMENTS = 262_144
+_REPLACEMENT_MANIFEST_MAX_STRING_BYTES = 8 << 20
+
+
+def _finite_result_dataset_blocks(
+    dataset: h5py.Dataset,
+    *,
+    max_bytes: int = _FINITE_RESULT_HASH_SLAB_BYTES,
+):
+    if (
+        not isinstance(dataset, h5py.Dataset)
+        or type(max_bytes) is not int
+        or max_bytes < 1
+        or dataset.dtype.hasobject
+        or dataset.dtype.itemsize < 1
+    ):
+        raise WriterStateError("finite result dataset is not bounded numeric data")
+    if dataset.ndim == 0:
+        value = np.asarray(dataset[()])
+        if value.nbytes > max_bytes:
+            raise WriterStateError("finite result scalar exceeds its hash slab")
+        yield value.tobytes(order="C")
+        return
+    if any(type(value) is not int or value < 0 for value in dataset.shape):
+        raise WriterStateError("finite result dataset shape is invalid")
+    if any(value == 0 for value in dataset.shape):
+        return
+    maximum_elements = max(1, max_bytes // dataset.dtype.itemsize)
+    split = dataset.ndim - 1
+    trailing = 1
+    while split > 0 and trailing * dataset.shape[split] <= maximum_elements:
+        trailing *= dataset.shape[split]
+        split -= 1
+    step = max(1, maximum_elements // trailing)
+    prefixes = np.ndindex(dataset.shape[:split]) if split else ((),)
+    for prefix in prefixes:
+        for start in range(0, dataset.shape[split], step):
+            selection = (
+                *prefix,
+                slice(start, min(start + step, dataset.shape[split])),
+                *(slice(None) for _ in dataset.shape[split + 1:]),
+            )
+            value = np.asarray(dataset[selection])
+            if value.nbytes > max_bytes:
+                raise WriterStateError("finite result hash slab exceeded its bound")
+            yield value.tobytes(order="C")
+
+
+def _finite_selected_result_digest(
+    document: h5py.File,
+    entry: str,
+    dimension: str,
+) -> str:
+    if dimension not in {"1d", "2d"}:
+        raise WriterStateError("finite result dimension is invalid")
+    root = _replacement_hard_group(
+        document, f"{entry}/integrated_{dimension}", h5py.Group,
+    )
+    if not isinstance(root, h5py.Group):
+        raise WriterStateError("finite selected result is absent or nonlocal")
+    digest = hashlib.sha256(b"xrd-tools-finite-selected-result-v1\0")
+    nodes = 0
+
+    def update(role: str, value) -> None:
+        payload = json.dumps(
+            _replacement_signature_projection(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8", errors="strict")
+        digest.update(
+            len(role.encode("utf-8")).to_bytes(8, "big")
+            + role.encode("utf-8")
+            + len(payload).to_bytes(8, "big")
+            + payload
+        )
+
+    def walk(group: h5py.Group, role: str, active=()) -> None:
+        nonlocal nodes
+        nodes += 1
+        if nodes > _FINITE_RESULT_MAX_NODES:
+            raise WriterStateError("finite selected result exceeds its node bound")
+        update(role, ("group", group.name))
+        for name in sorted(group.attrs):
+            update(
+                f"{role}@{name}",
+                _replacement_value_signature(
+                    _read_replacement_attribute_value(
+                        group, name, f"finite result {group.name}@{name}",
+                    ),
+                    group.attrs.get_id(name).dtype,
+                ),
+            )
+        for name in sorted(group):
+            link = group.get(name, getlink=True)
+            child = group.get(name)
+            child_role = f"{role}/{name}"
+            if type(link) is not h5py.HardLink:
+                raise WriterStateError("finite selected result contains a nonlocal link")
+            if isinstance(child, h5py.Group):
+                if any(child.id == owner for owner in (*active, group.id)):
+                    raise WriterStateError("finite selected result contains a hard cycle")
+                walk(child, child_role, (*active, group.id))
+                continue
+            if not isinstance(child, h5py.Dataset):
+                raise WriterStateError("finite selected result contains an invalid node")
+            nodes += 1
+            if nodes > _FINITE_RESULT_MAX_NODES:
+                raise WriterStateError("finite selected result exceeds its node bound")
+            update(
+                child_role,
+                (
+                    "dataset",
+                    _replacement_dtype_signature(child.dtype),
+                    child.shape,
+                    child.maxshape,
+                    child.chunks,
+                    child.compression,
+                    child.compression_opts,
+                    child.shuffle,
+                    child.fletcher32,
+                    child.scaleoffset,
+                ),
+            )
+            for attr in sorted(child.attrs):
+                update(
+                    f"{child_role}@{attr}",
+                    _replacement_value_signature(
+                        _read_replacement_attribute_value(
+                            child, attr, f"finite result {child.name}@{attr}",
+                        ),
+                        child.attrs.get_id(attr).dtype,
+                    ),
+                )
+            for block in _finite_result_dataset_blocks(child):
+                digest.update(len(block).to_bytes(8, "big") + block)
+
+    walk(root, f"integrated_{dimension}")
+    return digest.hexdigest()
+
+
+def require_finite_replacement_result_seal(
+    document: h5py.File,
+    *,
+    entry: str,
+    dimension: str,
+    audit_identity: str,
+) -> str:
+    if (
+        type(document) is not h5py.File
+        or not document.id.valid
+        or dimension not in {"1d", "2d"}
+        or type(audit_identity) is not str
+        or len(audit_identity) != 64
+        or not set(audit_identity) <= _LOWER_HEX_64
+    ):
+        raise WriterStateError("finite result seal inputs are invalid")
+    config = _replacement_hard_group(document, f"{entry}/reduction/config")
+    name = f"dimension_replacement_{dimension}_result_seal"
+    node = _replacement_hard_group(config, name, h5py.Dataset)
+    if not isinstance(node, h5py.Dataset):
+        raise WriterStateError("finite result seal is absent or nonlocal")
+    raw = _replacement_utf8_scalar(
+        node, "finite replacement result seal",
+        max_bytes=_MAX_REPLACEMENT_CONFIG_UTF8_BYTES,
+    )
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise WriterStateError("finite result seal is malformed") from error
+    if (
+        type(value) is not dict
+        or set(value) != {
+            "schema", "version", "dimension", "audit_identity",
+            "result_sha256",
+        }
+        or value["schema"] != _FINITE_RESULT_SEAL_SCHEMA
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["dimension"] != dimension
+        or value["audit_identity"] != audit_identity
+        or type(value["result_sha256"]) is not str
+        or len(value["result_sha256"]) != 64
+        or not set(value["result_sha256"]) <= _LOWER_HEX_64
+        or raw != json.dumps(value, sort_keys=True, separators=(",", ":"))
+    ):
+        raise WriterStateError("finite result seal is noncanonical")
+    observed = _finite_selected_result_digest(document, entry, dimension)
+    if observed != value["result_sha256"]:
+        raise WriterStateError("finite selected result changed after sealing")
+    return observed
+
+
+def _replacement_exclusion_paths(
+    entry_name: str,
+    dimension: str,
+    *,
+    include_finite_lineage: bool,
+) -> tuple[str, ...]:
+    if (
+        type(entry_name) is not str
+        or not entry_name
+        or dimension not in {"1d", "2d"}
+    ):
+        raise WriterStateError("replacement exclusion domain is invalid")
+    root = "/" + "/".join(
+        part for part in entry_name.split("/") if part
+    )
+    if root == "/":
+        raise WriterStateError("replacement exclusion entry is invalid")
+    values = (
+        f"{root}/integrated_{dimension}",
+        f"{root}/reduction/config/bai_{dimension}_args",
+        f"{root}/reduction/config/gi_config",
+        f"{root}/reduction/config/dimension_replacement_{dimension}",
+        f"{root}/reduction/config/source_execution",
+        f"{root}/reduction/config/append_lineage",
+    )
+    if include_finite_lineage:
+        values += (
+            finite_lineage_hdf_path(root.lstrip("/")),
+            f"{root}/reduction/config/"
+            f"dimension_replacement_{dimension}_result_seal",
+        )
+    return values
+
+
+def _replacement_exclusions_for(
+    entry: h5py.Group,
+    dimension: str,
+    *,
+    include_finite_lineage: bool,
+) -> tuple[str, ...]:
+    if not isinstance(entry, h5py.Group):
+        raise WriterStateError("replacement exclusion domain is invalid")
+    return _replacement_exclusion_paths(
+        entry.name,
+        dimension,
+        include_finite_lineage=include_finite_lineage,
+    )
+
+
+def _replacement_manifest_digest_for(
+    root: h5py.File,
+    entry_name: str,
+    exclude: tuple[str, ...],
+    *,
+    ignore_source_base: bool,
+    ignore_file_name: bool,
+) -> str:
+    digest = hashlib.sha256(b"xrd-tools-replacement-manifest-v2\0")
+    config = _replacement_hard_group(root, f"{entry_name}/reduction/config")
+    config_prefix = "" if config is None else f"{config.name.rstrip('/')}/"
+    entry_path = "/" + "/".join(
+        part for part in entry_name.split("/") if part
+    )
+
+    nodes = 1
+    first_roles: dict[int, str] = {}
+
+    def update(role, value):
+        payload = value if isinstance(value, bytes) else repr(value).encode()
+        encoded_role = role.encode("utf-8", errors="strict")
+        digest.update(
+            len(encoded_role).to_bytes(8, "big")
+            + encoded_role
+            + len(payload).to_bytes(8, "big")
+            + payload
+        )
+
+    def string_value(dataset, index, role):
+        info = h5py.check_string_dtype(dataset.dtype)
+        if info is None or info.length is not None:
+            raise WriterStateError(
+                f"replacement manifest {role} has unsupported object data"
+            )
+        capacity = min(64 << 10, _REPLACEMENT_MANIFEST_MAX_STRING_BYTES + 1)
+        while True:
+            destination = np.empty((), dtype=f"S{capacity}")
+            try:
+                dataset.read_direct(destination, source_sel=index)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                raise WriterStateError(
+                    f"replacement manifest {role} string could not be read"
+                ) from error
+            raw = bytes(destination[()])
+            if len(raw) < capacity:
+                break
+            if capacity == _REPLACEMENT_MANIFEST_MAX_STRING_BYTES + 1:
+                raise WriterStateError(
+                    f"replacement manifest {role} string exceeds its byte bound"
+                )
+            capacity = min(
+                capacity * 2, _REPLACEMENT_MANIFEST_MAX_STRING_BYTES + 1,
+            )
+        if info.encoding == "utf-8":
+            try:
+                raw.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as error:
+                raise WriterStateError(
+                    f"replacement manifest {role} string is not UTF-8"
+                ) from error
+        return raw
+
+    def hash_dataset(dataset, role):
+        if not dataset.dtype.hasobject:
+            for block in _finite_result_dataset_blocks(dataset):
+                update(f"{role}@data", block)
+            return
+        if h5py.check_string_dtype(dataset.dtype) is None:
+            raise WriterStateError(
+                f"replacement manifest {role} has unsupported variable data"
+            )
+        if dataset.size > _REPLACEMENT_MANIFEST_MAX_VLEN_ELEMENTS:
+            raise WriterStateError(
+                f"replacement manifest {role} exceeds its string cardinality bound"
+            )
+        indices = ((),) if dataset.ndim == 0 else np.ndindex(dataset.shape)
+        for index in indices:
+            update(f"{role}@data", string_value(dataset, index, role))
+
+    def walk(group, prefix, active=()):
+        nonlocal nodes
+        for name in sorted(group.attrs):
+            if ignore_source_base and group.name == entry_path and name == SOURCE_BASE_ATTR:
+                continue
+            if ignore_file_name and group.name == "/" and name == "file_name":
+                continue
+            update(
+                f"{prefix}@{name}",
+                _replacement_value_signature(
+                    _read_replacement_attribute_value(
+                        group,
+                        name,
+                        f"replacement manifest {group.name}@{name}",
+                    ),
+                    group.attrs.get_id(name).dtype,
+                ),
+            )
+        for name in sorted(group):
+            path = f"{group.name.rstrip('/')}/{name}"
+            if path in exclude:
+                continue
+            link = group.get(name, getlink=True)
+            role = f"{prefix}/{name}"
+            update(
+                f"{role}@link",
+                (
+                    type(link).__name__,
+                    getattr(link, "filename", None),
+                    getattr(link, "path", None),
+                ),
+            )
+            if type(link) is not h5py.HardLink:
+                continue
+            child = group.get(name)
+            if isinstance(child, h5py.Group):
+                nodes += 1
+                if nodes > _REPLACEMENT_MANIFEST_MAX_NODES:
+                    raise WriterStateError(
+                        "replacement manifest exceeds its node bound"
+                    )
+                update(role, b"group")
+                if any(child.id == owner for owner in (*active, group.id)):
+                    raise WriterStateError(
+                        "replacement manifest contains a hard cycle"
+                    )
+                address = int(h5py.h5o.get_info(child.id).addr)
+                prior_role = first_roles.get(address)
+                if prior_role is not None:
+                    update(f"{role}@alias", prior_role)
+                    continue
+                first_roles[address] = role
+                walk(child, role, (*active, group.id))
+            elif isinstance(child, h5py.Dataset):
+                nodes += 1
+                if nodes > _REPLACEMENT_MANIFEST_MAX_NODES:
+                    raise WriterStateError(
+                        "replacement manifest exceeds its node bound"
+                    )
+                address = int(h5py.h5o.get_info(child.id).addr)
+                prior_role = first_roles.get(address)
+                if prior_role is not None:
+                    update(f"{role}@alias", prior_role)
+                    continue
+                first_roles[address] = role
+                update(
+                    f"{role}@layout",
+                    (
+                        _replacement_dtype_signature(child.dtype),
+                        child.shape,
+                        child.maxshape,
+                        child.chunks,
+                        child.compression,
+                        child.compression_opts,
+                        child.shuffle,
+                        child.fletcher32,
+                        child.scaleoffset,
+                        tuple(child.external or ()),
+                        bool(child.is_virtual),
+                    ),
+                )
+                hash_dataset(child, role)
+                for attr in sorted(child.attrs):
+                    update(
+                        f"{role}@{attr}",
+                        _replacement_value_signature(
+                            _read_replacement_attribute_value(
+                                child,
+                                attr,
+                                f"replacement manifest {child.name}@{attr}",
+                            ),
+                            child.attrs.get_id(attr).dtype,
+                        ),
+                    )
+            else:
+                raise WriterStateError(
+                    f"unsupported replacement manifest node {role}"
+                )
+
+    walk(root, "file")
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalNodeSignatureDigest:
+    schema: str
+    version: int
+    present: bool
+    sha256: str | None
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if (
+            _claim is not _MANIFEST_FACTORY
+            or self.schema != "xrd_tools.canonical_node_signature_digest"
+            or type(self.version) is not int
+            or self.version != 1
+            or type(self.present) is not bool
+            or self.present
+            and (
+                type(self.sha256) is not str
+                or len(self.sha256) != 64
+                or not set(self.sha256) <= _LOWER_HEX_64
+            )
+            or not self.present
+            and self.sha256 is not None
+        ):
+            raise TypeError("node signature digest is not factory-owned")
+
+
+def _canonical_signature_value(value):
+    if type(value) is bytes:
+        return {"kind": "bytes", "hex": value.hex()}
+    if type(value) is tuple:
+        return {
+            "kind": "tuple",
+            "items": [_canonical_signature_value(item) for item in value],
+        }
+    if type(value) is list:
+        return {
+            "kind": "list",
+            "items": [_canonical_signature_value(item) for item in value],
+        }
+    if type(value) in {str, int, float, bool} or value is None:
+        if type(value) is float and not math.isfinite(value):
+            raise WriterStateError("replacement signature float is non-finite")
+        return {"kind": type(value).__name__, "value": value}
+    raise WriterStateError(
+        f"replacement signature contains unsupported {type(value).__name__}"
+    )
+
+
+def _canonical_node_signature_digest(value) -> CanonicalNodeSignatureDigest:
+    if value is None:
+        return CanonicalNodeSignatureDigest(
+            "xrd_tools.canonical_node_signature_digest",
+            1,
+            False,
+            None,
+            _MANIFEST_FACTORY,
+        )
+    payload = _canonical_signature_value(value)
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8", errors="strict")
+    return CanonicalNodeSignatureDigest(
+        "xrd_tools.canonical_node_signature_digest",
+        1,
+        True,
+        hashlib.sha256(encoded).hexdigest(),
+        _MANIFEST_FACTORY,
+    )
+
+
+def _node_digest_mapping(
+    value: CanonicalNodeSignatureDigest,
+) -> dict[str, Any]:
+    if type(value) is not CanonicalNodeSignatureDigest:
+        raise TypeError("node signature projection requires an exact receipt")
+    return {
+        "schema": value.schema,
+        "version": value.version,
+        "present": value.present,
+        "sha256": value.sha256,
+    }
+
+
+def _admit_node_digest(value: Mapping[str, Any]) -> CanonicalNodeSignatureDigest:
+    if type(value) is not dict or set(value) != {
+        "schema", "version", "present", "sha256",
+    }:
+        raise TypeError("node signature receipt is noncanonical")
+    return CanonicalNodeSignatureDigest(
+        value["schema"],
+        value["version"],
+        value["present"],
+        value["sha256"],
+        _MANIFEST_FACTORY,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ReplacementManifestReceipt:
+    schema: str
+    version: int
+    manifest_algorithm_version: int
+    source_snapshot: FiniteFileSnapshot
+    entry: str
+    dimension: str
+    exclusions: tuple[str, ...]
+    manifest_digest: str
+    gi_name: str
+    gi_node_signature: CanonicalNodeSignatureDigest
+    gi_structure_signature: CanonicalNodeSignatureDigest
+    selected_bai_signature: CanonicalNodeSignatureDigest
+    selected_audit_signature: CanonicalNodeSignatureDigest
+    source_execution_signature: CanonicalNodeSignatureDigest
+    append_lineage_signature: CanonicalNodeSignatureDigest
+    gi_preserved_json: str
+    gi_preserved_digest: str
+    facts_digest: str
+    receipt_digest: str
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        try:
+            payload = _replacement_manifest_receipt_preimage(self)
+            encoded = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8", errors="strict")
+            expected = hashlib.sha256(encoded).hexdigest()
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise TypeError("replacement manifest receipt is invalid") from error
+        node_receipts = (
+            self.gi_node_signature,
+            self.gi_structure_signature,
+            self.selected_bai_signature,
+            self.selected_audit_signature,
+            self.source_execution_signature,
+            self.append_lineage_signature,
+        )
+        digests = (
+            self.manifest_digest,
+            self.gi_preserved_digest,
+            self.facts_digest,
+            self.receipt_digest,
+        )
+        if (
+            _claim is not _MANIFEST_FACTORY
+            or self.schema != "xrd_tools.replacement_manifest_receipt"
+            or type(self.version) is not int
+            or self.version != 1
+            or type(self.manifest_algorithm_version) is not int
+            or self.manifest_algorithm_version != 2
+            or type(self.source_snapshot) is not FiniteFileSnapshot
+            or type(self.entry) is not str
+            or not self.entry
+            or self.dimension not in {"1d", "2d"}
+            or type(self.exclusions) is not tuple
+            or any(type(value) is not str for value in self.exclusions)
+            or self.gi_name != f"gi_mode_{self.dimension}"
+            or any(
+                type(value) is not CanonicalNodeSignatureDigest
+                for value in node_receipts
+            )
+            or type(self.gi_preserved_json) is not str
+            or hashlib.sha256(
+                self.gi_preserved_json.encode("utf-8", errors="strict")
+            ).hexdigest() != self.gi_preserved_digest
+            or any(
+                type(value) is not str
+                or len(value) != 64
+                or not set(value) <= _LOWER_HEX_64
+                for value in digests
+            )
+            or self.receipt_digest != expected
+        ):
+            raise TypeError("replacement manifest receipt is not factory-owned")
+
+
+def _replacement_manifest_receipt_preimage(
+    receipt: ReplacementManifestReceipt,
+) -> dict[str, Any]:
+    snapshot = receipt.source_snapshot
+    return {
+        "schema": receipt.schema,
+        "version": receipt.version,
+        "manifest_algorithm_version": receipt.manifest_algorithm_version,
+        "source_snapshot": {
+            name: getattr(snapshot, name)
+            for name in FiniteFileSnapshot.__dataclass_fields__
+        },
+        "entry": receipt.entry,
+        "dimension": receipt.dimension,
+        "exclusions": list(receipt.exclusions),
+        "manifest_digest": receipt.manifest_digest,
+        "gi_name": receipt.gi_name,
+        "gi_node_signature": _node_digest_mapping(
+            receipt.gi_node_signature
+        ),
+        "gi_structure_signature": _node_digest_mapping(
+            receipt.gi_structure_signature
+        ),
+        "selected_bai_signature": _node_digest_mapping(
+            receipt.selected_bai_signature
+        ),
+        "selected_audit_signature": _node_digest_mapping(
+            receipt.selected_audit_signature
+        ),
+        "source_execution_signature": _node_digest_mapping(
+            receipt.source_execution_signature
+        ),
+        "append_lineage_signature": _node_digest_mapping(
+            receipt.append_lineage_signature
+        ),
+        "gi_preserved_json": receipt.gi_preserved_json,
+        "gi_preserved_digest": receipt.gi_preserved_digest,
+        "facts_digest": receipt.facts_digest,
+    }
+
+
+def _require_replacement_manifest_source(
+    document: h5py.File,
+    source_snapshot: FiniteFileSnapshot,
+) -> None:
+    """Fence an open manifest document against its exact named source."""
+
+    try:
+        descriptor = document.id.get_vfd_handle()
+        observed = os.fstat(descriptor)
+        named = os.stat(source_snapshot.path, follow_symlinks=False)
+        shown = os.path.normcase(os.path.abspath(os.fspath(document.filename)))
+    except (OSError, TypeError, ValueError, RuntimeError) as error:
+        raise ReplacementManifestTargetChanged(
+            "replacement manifest document identity is unavailable"
+        ) from error
+    expected_state = (
+        source_snapshot.device,
+        source_snapshot.inode,
+        source_snapshot.mode,
+        source_snapshot.size,
+        source_snapshot.mtime_ns,
+        source_snapshot.ctime_ns,
+    )
+    if (
+        type(descriptor) is not int
+        or shown != os.path.normcase(os.path.abspath(source_snapshot.path))
+        or tuple(
+            int(getattr(observed, name))
+            for name in (
+                "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        ) != expected_state
+        or tuple(
+            int(getattr(named, name))
+            for name in (
+                "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        ) != expected_state
+    ):
+        raise ReplacementManifestTargetChanged(
+            "replacement manifest document differs from its source snapshot"
+        )
+
+
+def prepare_replacement_manifest_receipt(
+    document: h5py.File,
+    source_snapshot: FiniteFileSnapshot,
+    *,
+    entry: str,
+    dimension: str,
+    facts_digest: str,
+) -> ReplacementManifestReceipt:
+    if (
+        type(document) is not h5py.File
+        or not document.id.valid
+        or document.mode != "r"
+        or type(source_snapshot) is not FiniteFileSnapshot
+        or type(facts_digest) is not str
+        or len(facts_digest) != 64
+        or not set(facts_digest) <= _LOWER_HEX_64
+    ):
+        raise TypeError("replacement manifest preparation requires exact inputs")
+    _require_replacement_manifest_source(document, source_snapshot)
+    entry_group = _replacement_hard_group(document, entry)
+    config = _replacement_hard_group(entry_group, "reduction/config")
+    if not isinstance(entry_group, h5py.Group) or not isinstance(config, h5py.Group):
+        raise WriterStateError("replacement manifest entry/config is not local")
+    exclusions = _replacement_exclusions_for(
+        entry_group,
+        dimension,
+        include_finite_lineage=True,
+    )
+    gi_name = f"gi_mode_{dimension}"
+    gi_node = _replacement_hard_group(config, "gi_config", h5py.Dataset)
+    gi_values = _replacement_json_node(
+        config,
+        "gi_config",
+        "replacement GI config",
+        required=False,
+    )
+    gi_values = {} if gi_values is None else gi_values
+    if type(gi_values) is not dict:
+        raise WriterStateError("replacement GI config is malformed")
+    signature = _replacement_node_signature_value(gi_node)
+    bai_signature = _replacement_node_signature_value(
+        _replacement_hard_group(
+            config, f"bai_{dimension}_args", h5py.Dataset,
+        ),
+        max_bytes=_MAX_REPLACEMENT_CONFIG_UTF8_BYTES,
+    )
+    audit_signature = _replacement_node_signature_value(
+        _replacement_hard_group(
+            config, f"dimension_replacement_{dimension}", h5py.Dataset,
+        ),
+        max_bytes=_MAX_REPLACEMENT_CONFIG_UTF8_BYTES,
+    )
+    execution_signature = _replacement_node_signature_value(
+        _replacement_hard_group(config, "source_execution", h5py.Dataset),
+        max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES,
+    )
+    lineage_signature = _replacement_node_signature_value(
+        _replacement_hard_group(config, "append_lineage", h5py.Dataset),
+        max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES,
+    )
+    preserved = json.dumps(
+        {key: value for key, value in gi_values.items() if key != gi_name},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    manifest_digest = _replacement_manifest_digest_for(
+        document,
+        entry,
+        exclusions,
+        ignore_source_base=True,
+        ignore_file_name=True,
+    )
+    gi_node_receipt = _canonical_node_signature_digest(signature)
+    gi_structure_receipt = _canonical_node_signature_digest(
+        None if signature is None else signature[:-1]
+    )
+    bai_receipt = _canonical_node_signature_digest(bai_signature)
+    audit_receipt = _canonical_node_signature_digest(audit_signature)
+    execution_receipt = _canonical_node_signature_digest(execution_signature)
+    lineage_receipt = _canonical_node_signature_digest(lineage_signature)
+    preserved_digest = hashlib.sha256(
+        preserved.encode("utf-8", errors="strict")
+    ).hexdigest()
+    payload = {
+        "schema": "xrd_tools.replacement_manifest_receipt",
+        "version": 1,
+        "manifest_algorithm_version": 2,
+        "source_snapshot": {
+            name: getattr(source_snapshot, name)
+            for name in FiniteFileSnapshot.__dataclass_fields__
+        },
+        "entry": entry,
+        "dimension": dimension,
+        "exclusions": list(exclusions),
+        "manifest_digest": manifest_digest,
+        "gi_name": gi_name,
+        "gi_node_signature": _node_digest_mapping(gi_node_receipt),
+        "gi_structure_signature": _node_digest_mapping(gi_structure_receipt),
+        "selected_bai_signature": _node_digest_mapping(bai_receipt),
+        "selected_audit_signature": _node_digest_mapping(audit_receipt),
+        "source_execution_signature": _node_digest_mapping(execution_receipt),
+        "append_lineage_signature": _node_digest_mapping(lineage_receipt),
+        "gi_preserved_json": preserved,
+        "gi_preserved_digest": preserved_digest,
+        "facts_digest": facts_digest,
+    }
+    receipt_digest = hashlib.sha256(json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8", errors="strict")).hexdigest()
+    receipt = ReplacementManifestReceipt(
+        "xrd_tools.replacement_manifest_receipt",
+        1,
+        2,
+        source_snapshot,
+        entry,
+        dimension,
+        exclusions,
+        manifest_digest,
+        gi_name,
+        gi_node_receipt,
+        gi_structure_receipt,
+        bai_receipt,
+        audit_receipt,
+        execution_receipt,
+        lineage_receipt,
+        preserved,
+        preserved_digest,
+        facts_digest,
+        receipt_digest,
+        _MANIFEST_FACTORY,
+    )
+    _require_replacement_manifest_source(document, source_snapshot)
+    return receipt
+
+
+def replacement_manifest_receipt_mapping(
+    receipt: ReplacementManifestReceipt,
+) -> dict[str, Any]:
+    """Project one authenticated receipt onto its exact JSON boundary."""
+
+    if type(receipt) is not ReplacementManifestReceipt:
+        raise TypeError("replacement manifest projection requires an exact receipt")
+    return {
+        **_replacement_manifest_receipt_preimage(receipt),
+        "receipt_digest": receipt.receipt_digest,
+    }
+
+
+def admit_replacement_manifest_receipt(
+    value: Mapping[str, Any],
+) -> ReplacementManifestReceipt:
+    """Authenticate a detached JSON receipt without touching the filesystem."""
+
+    expected = {
+        "schema", "version", "manifest_algorithm_version",
+        "source_snapshot", "entry", "dimension", "exclusions",
+        "manifest_digest", "gi_name", "gi_node_signature",
+        "gi_structure_signature", "selected_bai_signature",
+        "selected_audit_signature", "source_execution_signature",
+        "append_lineage_signature", "gi_preserved_json",
+        "gi_preserved_digest", "facts_digest", "receipt_digest",
+    }
+    if type(value) is not dict or set(value) != expected:
+        raise TypeError("replacement manifest receipt has a noncanonical keyset")
+    snapshot_value = value["source_snapshot"]
+    snapshot_fields = set(FiniteFileSnapshot.__dataclass_fields__)
+    if type(snapshot_value) is not dict or set(snapshot_value) != snapshot_fields:
+        raise TypeError("replacement manifest source snapshot is noncanonical")
+    exclusions = value["exclusions"]
+    if type(exclusions) is not list:
+        raise TypeError("replacement manifest exclusions are not a JSON array")
+    if (
+        value["schema"] != "xrd_tools.replacement_manifest_receipt"
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or type(value["manifest_algorithm_version"]) is not int
+        or value["manifest_algorithm_version"] != 2
+    ):
+        raise TypeError("replacement manifest receipt schema is unsupported")
+    return ReplacementManifestReceipt(
+        value["schema"],
+        value["version"],
+        value["manifest_algorithm_version"],
+        FiniteFileSnapshot(**snapshot_value),
+        value["entry"],
+        value["dimension"],
+        tuple(exclusions),
+        value["manifest_digest"],
+        value["gi_name"],
+        _admit_node_digest(value["gi_node_signature"]),
+        _admit_node_digest(value["gi_structure_signature"]),
+        _admit_node_digest(value["selected_bai_signature"]),
+        _admit_node_digest(value["selected_audit_signature"]),
+        _admit_node_digest(value["source_execution_signature"]),
+        _admit_node_digest(value["append_lineage_signature"]),
+        value["gi_preserved_json"],
+        value["gi_preserved_digest"],
+        value["facts_digest"],
+        value["receipt_digest"],
+        _MANIFEST_FACTORY,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedManifestAdmission:
+    receipt: ReplacementManifestReceipt
+    facts_digest: str
+    version_identity: str
+    operation_identity: str
+    route_identity: str
+    seed_receipt_digest: str
+    candidate_identity: str
+    admission_digest: str
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        payload = {
+            "candidate_identity": self.candidate_identity,
+            "domain": "xrd-tools-prepared-manifest-admission-v1",
+            "facts_digest": self.facts_digest,
+            "operation_identity": self.operation_identity,
+            "receipt_digest": self.receipt.receipt_digest,
+            "route_identity": self.route_identity,
+            "seed_receipt_digest": self.seed_receipt_digest,
+            "version_identity": self.version_identity,
+        }
+        try:
+            expected = hashlib.sha256(json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8", errors="strict")).hexdigest()
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise TypeError("prepared manifest admission is invalid") from error
+        digests = (
+            self.facts_digest,
+            self.version_identity,
+            self.operation_identity,
+            self.route_identity,
+            self.seed_receipt_digest,
+            self.candidate_identity,
+            self.admission_digest,
+        )
+        if (
+            _claim is not _MANIFEST_FACTORY
+            or type(self.receipt) is not ReplacementManifestReceipt
+            or self.receipt.facts_digest != self.facts_digest
+            or any(
+                type(value) is not str
+                or len(value) != 64
+                or not set(value) <= _LOWER_HEX_64
+                for value in digests
+            )
+            or self.admission_digest != expected
+        ):
+            raise TypeError("prepared manifest admission is not factory-owned")
+
+
+def bind_prepared_manifest_receipt(
+    receipt: ReplacementManifestReceipt,
+    *,
+    facts_digest: str,
+    request: FiniteArtifactRequest,
+    seed_binding: FiniteSeedBinding,
+    candidate_binding: FiniteCandidateBinding,
+) -> PreparedManifestAdmission:
+    """Join prepared facts to one exact publisher-owned seeded candidate."""
+
+    if (
+        type(receipt) is not ReplacementManifestReceipt
+        or type(request) is not FiniteArtifactRequest
+        or type(seed_binding) is not FiniteSeedBinding
+        or type(candidate_binding) is not FiniteCandidateBinding
+        or seed_binding.request is not request
+        or not seed_binding.authorizes(candidate_binding)
+        or receipt.source_snapshot != seed_binding.receipt.source_snapshot
+        or receipt.source_snapshot != request.operation_context.source_snapshot
+        or receipt.facts_digest != facts_digest
+    ):
+        raise ValueError("prepared manifest cannot bind to this finite candidate")
+    values = (
+        receipt,
+        facts_digest,
+        request.version_identity,
+        request.operation_identity,
+        request.operation_context.route_identity,
+        seed_binding.receipt.receipt_digest,
+        candidate_binding.candidate_identity,
+    )
+    payload = {
+        "candidate_identity": values[6],
+        "domain": "xrd-tools-prepared-manifest-admission-v1",
+        "facts_digest": values[1],
+        "operation_identity": values[3],
+        "receipt_digest": receipt.receipt_digest,
+        "route_identity": values[4],
+        "seed_receipt_digest": values[5],
+        "version_identity": values[2],
+    }
+    digest = hashlib.sha256(json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8", errors="strict")).hexdigest()
+    return PreparedManifestAdmission(
+        *values, digest, _MANIFEST_FACTORY,
+    )
+
+
 class WriterIncomplete(RuntimeError):
     def __init__(self, message: str, outcome: WriterOutcome) -> None:
         super().__init__(message)
@@ -791,6 +1899,11 @@ class NexusRecordWriter:
         replacement_gi_mode: str | None = None,
         replacement_source_execution: Mapping[str, Any] | None = None,
         replacement_append_lineage: bytes | None = None,
+        seeded_document: h5py.File | None = None,
+        finite_request: FiniteArtifactRequest | None = None,
+        finite_seed_binding: FiniteSeedBinding | None = None,
+        finite_candidate_binding: FiniteCandidateBinding | None = None,
+        prepared_manifest_admission: PreparedManifestAdmission | None = None,
     ) -> None:
         if flush_every is not None and int(flush_every) <= 0:
             raise ValueError(f"flush_every must be > 0 or None; got {flush_every}")
@@ -813,13 +1926,86 @@ class NexusRecordWriter:
         self._replace_attempts = int(replace_attempts)
         self._opener = opener
         self._transaction_binding = transaction_binding
+        if seeded_document is not None and (
+            type(seeded_document) is not h5py.File
+            or not seeded_document.id.valid
+            or seeded_document.mode != "r+"
+        ):
+            raise TypeError("seeded replacement document must be one open h5py.File")
+        if not (
+            (seeded_document is None)
+            == (finite_request is None)
+            == (finite_seed_binding is None)
+            == (finite_candidate_binding is None)
+        ):
+            raise ValueError(
+                "seeded document, finite request, and seed binding must be supplied together"
+            )
+        if finite_request is not None and (
+            type(finite_request) is not FiniteArtifactRequest
+            or type(finite_seed_binding) is not FiniteSeedBinding
+            or type(finite_candidate_binding) is not FiniteCandidateBinding
+            or finite_seed_binding.request is not finite_request
+            or not finite_seed_binding.authorizes(finite_candidate_binding)
+            or not finite_seed_binding.active
+            or replacement_dimension not in {"1d", "2d"}
+            or finite_request.output_artifact != str(self.target)
+            or finite_request.entry != self.entry
+            or finite_request.operation_kind
+            != f"reintegrate-{replacement_dimension}"
+        ):
+            raise ValueError("seeded replacement finite request is inconsistent")
+        if prepared_manifest_admission is not None and (
+            type(prepared_manifest_admission) is not PreparedManifestAdmission
+            or finite_seed_binding is None
+            or finite_candidate_binding is None
+            or prepared_manifest_admission.receipt.source_snapshot
+            != finite_seed_binding.receipt.source_snapshot
+            or prepared_manifest_admission.receipt.entry != self.entry
+            or prepared_manifest_admission.receipt.dimension
+            != replacement_dimension
+            or prepared_manifest_admission.version_identity
+            != finite_request.version_identity
+            or prepared_manifest_admission.operation_identity
+            != finite_request.operation_identity
+            or prepared_manifest_admission.route_identity
+            != finite_request.operation_context.route_identity
+            or prepared_manifest_admission.seed_receipt_digest
+            != finite_seed_binding.receipt.receipt_digest
+            or prepared_manifest_admission.candidate_identity
+            != finite_candidate_binding.candidate_identity
+        ):
+            raise ValueError("prepared replacement manifest admission is inconsistent")
+        if seeded_document is not None and (
+            transaction_binding is not None
+            or self.overwrite
+            or atomic not in {None, False}
+        ):
+            raise ValueError(
+                "seeded replacement cannot use a transaction, overwrite, or atomic path"
+            )
+        self._seeded_document = seeded_document
+        self._finite_request = finite_request
+        self._finite_seed_binding = finite_seed_binding
+        self._finite_candidate_binding = finite_candidate_binding
+        self._prepared_manifest_admission = prepared_manifest_admission
+        self._prepared_manifest_receipt = (
+            None
+            if prepared_manifest_admission is None
+            else prepared_manifest_admission.receipt
+        )
         self._fast_regenerable = fast_regenerable
         if type(defer_epoch_durability) is not bool: raise TypeError("defer_epoch_durability must be an exact bool")
         self._defer_epoch_durability = defer_epoch_durability
         self._append_decision = append_decision
         replacement_values = (replacement_dimension, replacement_labels, replacement_audit, replacement_selected_plan)
-        if any(value is not None for value in replacement_values) and (not all(value is not None for value in replacement_values) or transaction_binding is None or fast_regenerable or replacement_source_execution is None or not self.source_base): raise ValueError("selected-dimension replacement configuration is incomplete or unbound")
+        replacement_owner_count = int(transaction_binding is not None) + int(
+            seeded_document is not None
+        )
+        if any(value is not None for value in replacement_values) and (not all(value is not None for value in replacement_values) or replacement_owner_count != 1 or fast_regenerable or replacement_source_execution is None or not self.source_base): raise ValueError("selected-dimension replacement configuration is incomplete or unbound")
         if replacement_dimension is None and (replacement_source_execution is not None or replacement_append_lineage is not None): raise ValueError("replacement source context requires a selected dimension")
+        if seeded_document is not None and replacement_dimension is None:
+            raise ValueError("seeded document mode is replacement-only")
         if replacement_dimension is not None:
             try:
                 source_execution = dict(_validate_replacement_execution(dict(replacement_source_execution)))
@@ -842,6 +2028,8 @@ class NexusRecordWriter:
             raise ValueError("writer requires a WRITE Append decision")
         if append_decision is not None and transaction_binding is None:
             raise ValueError("Append writer requires a live transaction binding")
+        if append_decision is not None and seeded_document is not None:
+            raise ValueError("seeded finite replacement cannot Append")
         if transaction_binding is not None and atomic:
             raise ValueError("transaction-bound writer cannot replace its owned inode")
         self.phase = WriterPhase.NEW
@@ -890,6 +2078,55 @@ class NexusRecordWriter:
         self._durable_frame_proofs: dict[
             int, _DurableFrameProof | _DurableAverageFrameProof
         ] = {}
+
+    @classmethod
+    def for_seeded_replacement(
+        cls,
+        logical_target: Path | str,
+        document: h5py.File,
+        request: FiniteArtifactRequest,
+        seed_binding: FiniteSeedBinding,
+        candidate_binding: FiniteCandidateBinding,
+        *,
+        entry: str,
+        source_base: Path | str,
+        file_lock: Any | None,
+        replacement_dimension: str,
+        replacement_labels: tuple[int, ...],
+        replacement_audit: bytes,
+        replacement_selected_plan: Mapping[str, Any],
+        replacement_gi_mode: str | None,
+        replacement_source_execution: Mapping[str, Any],
+        replacement_append_lineage: bytes | None,
+        prepared_manifest_admission: PreparedManifestAdmission | None = None,
+        compression: str | None = "gzip",
+        flush_every: int | None = None,
+    ) -> "NexusRecordWriter":
+        """Own selected-dimension writes inside one publisher-owned seed."""
+
+        return cls(
+            logical_target,
+            entry=entry,
+            compression=compression,
+            overwrite=False,
+            atomic=False,
+            flush_every=flush_every,
+            complete_record=True,
+            source_base=source_base,
+            file_lock=file_lock,
+            replacement_dimension=replacement_dimension,
+            replacement_labels=replacement_labels,
+            replacement_audit=replacement_audit,
+            replacement_selected_plan=replacement_selected_plan,
+            replacement_gi_mode=replacement_gi_mode,
+            replacement_source_execution=replacement_source_execution,
+            replacement_append_lineage=replacement_append_lineage,
+            seeded_document=document,
+            finite_request=request,
+            finite_seed_binding=seed_binding,
+            finite_candidate_binding=candidate_binding,
+            prepared_manifest_admission=prepared_manifest_admission,
+        )
 
     @property
     def active_path(self) -> Path | None:
@@ -1813,33 +3050,14 @@ class NexusRecordWriter:
             raise WriterStateError("Average count durability census is invalid")
         return observed_digest, read_bytes
     def _replacement_manifest_digest(self, exclude, handle=None) -> str:
-        digest = hashlib.sha256(b"xrd-tools-replacement-manifest-v1\0"); root = self._h5 if handle is None else handle; config = _replacement_hard_group(root, f"{self.entry}/reduction/config"); config_prefix = "" if config is None else f"{config.name.rstrip('/')}/"
-        def update(role, value): payload = value if isinstance(value, bytes) else repr(value).encode(); digest.update(len(role).to_bytes(8, "big") + role.encode() + len(payload).to_bytes(8, "big") + payload)
-        def walk(group, prefix, active=()):
-            entry_path = "/" + "/".join(
-                part for part in self.entry.split("/") if part
-            )
-            for name in sorted(group.attrs):
-                if (self._replacement_configuration is not None
-                        and group.name == entry_path
-                        and name == SOURCE_BASE_ATTR):
-                    continue
-                update(f"{prefix}@{name}", _replacement_value_signature(_read_replacement_attribute_value(group, name, f"replacement manifest {group.name}@{name}"), group.attrs.get_id(name).dtype))
-            for name in sorted(group):
-                path = f"{group.name.rstrip('/')}/{name}"
-                if path in exclude: continue
-                link = group.get(name, getlink=True); role = f"{prefix}/{name}"; update(f"{role}@link", (type(link).__name__, getattr(link, "filename", None), getattr(link, "path", None)))
-                if type(link) is not h5py.HardLink: continue
-                child = group.get(name)
-                if isinstance(child, h5py.Group): update(role, b"group"); (None if any(child.id == owner for owner in (*active, group.id)) else walk(child, role, (*active, group.id)))
-                elif isinstance(child, h5py.Dataset):
-                    update(f"{role}@layout", (_replacement_dtype_signature(child.dtype), child.shape, child.maxshape, child.chunks, child.compression, child.compression_opts))
-                    if config_prefix and child.ndim == 0 and child.name.startswith(config_prefix):
-                        ceiling = (_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES if child.name.rsplit("/", 1)[-1] in {"source_execution", "append_lineage"} else _MAX_REPLACEMENT_CONFIG_UTF8_BYTES)
-                        update(role, _replacement_value_signature(_replacement_utf8_scalar(child, f"replacement config {child.name}", max_bytes=ceiling), child.dtype))
-                    for attr in sorted(child.attrs): update(f"{role}@{attr}", _replacement_value_signature(_read_replacement_attribute_value(child, attr, f"replacement manifest {child.name}@{attr}"), child.attrs.get_id(attr).dtype))
-                else: raise WriterStateError(f"unsupported replacement manifest node {role}")
-        walk(root, "file"); return digest.hexdigest()
+        root = self._h5 if handle is None else handle
+        return _replacement_manifest_digest_for(
+            root,
+            self.entry,
+            tuple(exclude),
+            ignore_source_base=self._replacement_configuration is not None,
+            ignore_file_name=self._seeded_document is not None,
+        )
     def _verify_indexed_row(
         self,
         evidence: _EvidenceBuilder,
@@ -2412,8 +3630,23 @@ class NexusRecordWriter:
     def _load_cursor(self, name: str) -> dict[int, int]:
         return self._load_cursor_from(self._entry_group(), name)
 
-    def _validate_existing_contract(self) -> dict[str, dict[int, int]]:
-        with h5py.File(self.target, "r") as h5:
+    def _replacement_exclusions(
+        self,
+        entry: h5py.Group,
+        dimension: str,
+    ) -> tuple[str, ...]:
+        return _replacement_exclusions_for(
+            entry,
+            dimension,
+            include_finite_lineage=self._seeded_document is not None,
+        )
+
+    def _validate_existing_contract(
+        self,
+        handle: h5py.File | None = None,
+    ) -> dict[str, dict[int, int]]:
+        owner = h5py.File(self.target, "r") if handle is None else nullcontext(handle)
+        with owner as h5:
             admitted = None
             if self._replacement_configuration is not None:
                 entry = _replacement_hard_group(h5, self.entry)
@@ -2425,9 +3658,69 @@ class NexusRecordWriter:
                 )
                 entry = admitted.entry
             if self._replacement_configuration is not None:
-                dimension = self._replacement_configuration[0]; root = entry.name if isinstance(entry, h5py.Group) else f"/{self.entry.strip('/')}"; excluded = (f"{root}/integrated_{dimension}", f"{root}/reduction/config/bai_{dimension}_args", f"{root}/reduction/config/gi_config", f"{root}/reduction/config/dimension_replacement_{dimension}", f"{root}/reduction/config/source_execution", f"{root}/reduction/config/append_lineage"); config = _replacement_hard_group(entry, "reduction/config"); (None if isinstance(entry, h5py.Group) and isinstance(config, h5py.Group) else (_ for _ in ()).throw(WriterStateError("replacement entry/config is not local"))); gi_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); gi_link = config.get("gi_config", getlink=True); (None if gi_link is None or type(gi_link) is h5py.HardLink else (_ for _ in ()).throw(WriterStateError("replacement GI config is not local"))); gi_values = _replacement_json_node(config, "gi_config", "replacement GI config", required=False)
+                dimension = self._replacement_configuration[0]; excluded = self._replacement_exclusions(entry, dimension); config = _replacement_hard_group(entry, "reduction/config"); (None if isinstance(entry, h5py.Group) and isinstance(config, h5py.Group) else (_ for _ in ()).throw(WriterStateError("replacement entry/config is not local"))); gi_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); gi_link = config.get("gi_config", getlink=True); (None if gi_link is None or type(gi_link) is h5py.HardLink else (_ for _ in ()).throw(WriterStateError("replacement GI config is not local"))); gi_values = _replacement_json_node(config, "gi_config", "replacement GI config", required=False)
                 gi_values = {} if gi_values is None else gi_values
-                gi_name = f"gi_mode_{dimension}"; (None if type(gi_values) is dict else (_ for _ in ()).throw(WriterStateError("replacement GI config is malformed"))); self._replacement_manifest = excluded, self._replacement_manifest_digest(excluded, h5), gi_name, self._replacement_node_signature(gi_node), json.dumps({key: value for key, value in gi_values.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode()
+                gi_name = f"gi_mode_{dimension}"; (None if type(gi_values) is dict else (_ for _ in ()).throw(WriterStateError("replacement GI config is malformed")))
+                gi_signature = self._replacement_node_signature(gi_node)
+                gi_preserved = json.dumps({key: value for key, value in gi_values.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode()
+                receipt = self._prepared_manifest_receipt
+                if receipt is not None:
+                    bai_signature = self._replacement_node_signature(
+                        _replacement_hard_group(
+                            config, f"bai_{dimension}_args", h5py.Dataset,
+                        ),
+                        max_bytes=_MAX_REPLACEMENT_CONFIG_UTF8_BYTES,
+                    )
+                    audit_signature = self._replacement_node_signature(
+                        _replacement_hard_group(
+                            config,
+                            f"dimension_replacement_{dimension}",
+                            h5py.Dataset,
+                        ),
+                        max_bytes=_MAX_REPLACEMENT_CONFIG_UTF8_BYTES,
+                    )
+                    execution_signature = self._replacement_node_signature(
+                        _replacement_hard_group(
+                            config, "source_execution", h5py.Dataset,
+                        ),
+                        max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES,
+                    )
+                    lineage_signature = self._replacement_node_signature(
+                        _replacement_hard_group(
+                            config, "append_lineage", h5py.Dataset,
+                        ),
+                        max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES,
+                    )
+                    if (
+                        receipt.exclusions != excluded
+                        or receipt.gi_name != gi_name
+                        or receipt.gi_node_signature
+                        != _canonical_node_signature_digest(gi_signature)
+                        or receipt.gi_structure_signature
+                        != _canonical_node_signature_digest(
+                            None if gi_signature is None else gi_signature[:-1]
+                        )
+                        or receipt.selected_bai_signature
+                        != _canonical_node_signature_digest(bai_signature)
+                        or receipt.selected_audit_signature
+                        != _canonical_node_signature_digest(audit_signature)
+                        or receipt.source_execution_signature
+                        != _canonical_node_signature_digest(execution_signature)
+                        or receipt.append_lineage_signature
+                        != _canonical_node_signature_digest(lineage_signature)
+                        or receipt.gi_preserved_json.encode("utf-8") != gi_preserved
+                        or receipt.gi_preserved_digest
+                        != hashlib.sha256(gi_preserved).hexdigest()
+                    ):
+                        raise WriterStateError(
+                            "prepared replacement manifest receipt changed"
+                        )
+                    manifest_digest = receipt.manifest_digest
+                else:
+                    manifest_digest = self._replacement_manifest_digest(excluded, h5)
+                self._replacement_manifest = (
+                    excluded, manifest_digest, gi_name, gi_signature, gi_preserved,
+                )
             if entry is None:
                 return {
                     name: {} for name in (
@@ -2545,13 +3838,15 @@ class NexusRecordWriter:
         try:
             with self._boundary():
                 binding = self._transaction_binding
-                exists = self.target.exists()
+                seeded = self._seeded_document
+                exists = False if seeded is not None else self.target.exists()
                 logical_exists = (
-                    bool(binding.transaction.stream_base_snapshot.exists)
-                    if binding is not None
-                    else exists
+                    True
+                    if seeded is not None
+                    else bool(binding.transaction.stream_base_snapshot.exists)
+                    if binding is not None else exists
                 )
-                use_atomic = False if binding is not None else (
+                use_atomic = False if binding is not None or seeded is not None else (
                     bool(self.atomic)
                     if self.atomic is not None
                     else (self.overwrite or not exists)
@@ -2566,26 +3861,29 @@ class NexusRecordWriter:
                         f".{self.target.stem}.{os.getpid()}."
                         f"{uuid.uuid4().hex}.tmp{self.target.suffix}"
                     )
-                if binding is None:
+                if binding is None and seeded is None:
                     self._pool.pause(self.target)
                     self._pool_owned = True
                 existing_cursors = None
                 if logical_exists and not self.overwrite:
-                    existing_cursors = self._validate_existing_contract()
+                    existing_cursors = self._validate_existing_contract(seeded)
                 if use_atomic:
                     self.target.parent.mkdir(parents=True, exist_ok=True)
                     if preserve_existing:
                         shutil.copyfile(self.target, self._active_path)
-                self._authorize_transaction_mutation()
-                self._h5 = self._opener(
-                    self._active_path, metadata=metadata, entry=self.entry,
-                    compression=self.compression,
-                    overwrite=(
-                        not preserve_existing
-                        if use_atomic
-                        else bool(self.overwrite or (binding is not None and not logical_exists))
-                    ),
-                )
+                if seeded is None:
+                    self._authorize_transaction_mutation()
+                    self._h5 = self._opener(
+                        self._active_path, metadata=metadata, entry=self.entry,
+                        compression=self.compression,
+                        overwrite=(
+                            not preserve_existing
+                            if use_atomic
+                            else bool(self.overwrite or (binding is not None and not logical_exists))
+                        ),
+                    )
+                else:
+                    self._h5 = seeded
                 disable_terminal_admission = getattr(
                     self._h5,
                     "_disable_terminal_admission",
@@ -2597,8 +3895,15 @@ class NexusRecordWriter:
                 # provenance names the logical record, never that temporary
                 # implementation detail; an Append also refreshes a relocated
                 # legacy file's path to its current truthful location.
-                if self._replacement_configuration is None:
-                    self._h5.attrs["file_name"] = str(self.target.resolve())
+                if (
+                    self._replacement_configuration is None
+                    or seeded is not None
+                ):
+                    self._h5.attrs["file_name"] = (
+                        self._finite_request.output_artifact
+                        if self._finite_request is not None
+                        else str(self.target.resolve())
+                    )
                 if self._replacement_configuration is None and self.complete_record and self.source_base:
                     stamp_source_base(self._entry_group(), self.source_base)
                 if self._append_decision is not None:
@@ -2639,6 +3944,12 @@ class NexusRecordWriter:
                     dimension, labels, audit, selected_plan=selected,
                     selected_gi_mode=gi_mode,
                 )
+            if self._finite_request is not None:
+                with self._boundary():
+                    self._authorize_transaction_mutation()
+                    write_finite_artifact_lineage(
+                        self._h5, self._finite_request,
+                    )
         except BaseException as exc:
             self._pending_owner = "begin"
             self.phase = WriterPhase.PARTIAL
@@ -2669,9 +3980,9 @@ class NexusRecordWriter:
         with self._boundary():
             entry = self._entry_group()
             if tuple(self._load_cursor_from(entry, top, local_hard=True)) != labels: raise WriterStateError("replacement label inventory changed")
-            root = entry.name; excluded = (f"{root}/{top}", f"{root}/reduction/config/bai_{dimension}_args", f"{root}/reduction/config/gi_config", f"{root}/reduction/config/dimension_replacement_{dimension}", f"{root}/reduction/config/source_execution", f"{root}/reduction/config/append_lineage")
+            excluded = self._replacement_exclusions(entry, dimension)
             frozen = self._replacement_manifest
-            if frozen is None or frozen[0] != excluded or self._replacement_manifest_digest(excluded) != frozen[1]: raise WriterStateError("replacement opener changed preserved artifact")
+            if frozen is None or frozen[0] != excluded or self._prepared_manifest_receipt is None and self._replacement_manifest_digest(excluded) != frozen[1]: raise WriterStateError("replacement opener changed preserved artifact")
             config = _replacement_hard_group(entry, "reduction/config"); gi_config = _replacement_hard_group(config, "gi_config", h5py.Dataset); gi_link = None if config is None else config.get("gi_config", getlink=True)
             if (gi_link is not None and type(gi_link) is not h5py.HardLink) or self._replacement_node_signature(gi_config) != frozen[3]: raise WriterStateError("replacement opener changed physical GI config")
             self._authorize_transaction_mutation()
@@ -2696,11 +4007,61 @@ class NexusRecordWriter:
             if gi_values: config.create_dataset("gi_config", data=_bounded_replacement_config_text(json.dumps(gi_values, sort_keys=True, separators=(",", ":")), "replacement GI config"))
             stored_node = _replacement_hard_group(config, "gi_config", h5py.Dataset); stored_gi = {} if stored_node is None else json.loads(_replacement_utf8_scalar(stored_node, "replacement GI config")); stored_signature = self._replacement_node_signature(stored_node); (None if json.dumps({key: value for key, value in stored_gi.items() if key != gi_name}, sort_keys=True, separators=(",", ":")).encode() == gi_preserved and (None if stored_signature is None else stored_signature[:-1]) == (None if frozen[3] is None else frozen[3][:-1]) else (_ for _ in ()).throw(WriterStateError("replacement changed sibling GI config")))
             audit_name = f"dimension_replacement_{dimension}"; (config.__delitem__(audit_name) if audit_name in config else None); config.create_dataset(audit_name, data=audit_text)
+            result_seal_name = f"{audit_name}_result_seal"
+            if result_seal_name in config:
+                del config[result_seal_name]
             self._row_cursors = {name: cursor for name, cursor in self._row_cursors.items() if name != top and not name.startswith(f"{top}/")}; self._row_cursors[top] = {}
             self._replacement_labels = labels; self._replacement_manifest = frozen; self._replacement_expected = (bai_name, self._replacement_node_signature(config.get(bai_name)), "gi_config", self._replacement_node_signature(config.get("gi_config")), audit_name, self._replacement_node_signature(config.get(audit_name)), gi_name, gi_preserved, os.fspath(self.source_base), self._replacement_node_signature(config.get("source_execution"), max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES), self._replacement_node_signature(config.get("append_lineage"), max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES))
-    def _replacement_node_signature(self, node, *, max_bytes=None): return None if node is None else (_replacement_dtype_signature(node.dtype), node.shape, node.maxshape, node.chunks, node.compression, node.compression_opts, tuple((name, _replacement_value_signature(_read_replacement_attribute_value(node, name, f"replacement config {node.name}@{name}"), node.attrs.get_id(name).dtype)) for name in sorted(node.attrs)), _replacement_value_signature(_replacement_utf8_scalar(node, f"replacement config {node.name}", max_bytes=max_bytes), node.dtype)) if isinstance(node, h5py.Dataset) else ("invalid",)
+    def _replacement_node_signature(self, node, *, max_bytes=None):
+        return _replacement_node_signature_value(node, max_bytes=max_bytes)
+    def _seal_finite_replacement_result(self) -> None:
+        if self._finite_request is None:
+            return
+        if self._replacement_configuration is None:
+            raise WriterStateError("finite result seal lost replacement facts")
+        dimension = self._replacement_configuration[0]
+        audit_bytes = self._replacement_configuration[2]
+        audit_identity = hashlib.sha256(audit_bytes).hexdigest()
+        config = _replacement_hard_group(
+            self._entry_group(), "reduction/config",
+        )
+        if not isinstance(config, h5py.Group):
+            raise WriterStateError("finite result seal lost replacement config")
+        name = f"dimension_replacement_{dimension}_result_seal"
+        self._authorize_transaction_mutation()
+        if name in config:
+            del config[name]
+        payload = {
+            "schema": _FINITE_RESULT_SEAL_SCHEMA,
+            "version": 1,
+            "dimension": dimension,
+            "audit_identity": audit_identity,
+            "result_sha256": _finite_selected_result_digest(
+                self._h5, self.entry, dimension,
+            ),
+        }
+        config.create_dataset(
+            name,
+            data=json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+        require_finite_replacement_result_seal(
+            self._h5,
+            entry=self.entry,
+            dimension=dimension,
+            audit_identity=audit_identity,
+        )
     def _verify_replacement_manifest(self) -> None:
         entry, selected_expected = self._entry_group(), self._replacement_expected; excluded, manifest_expected, _gi_name, gi_original, _gi_preserved = self._replacement_manifest
+        if self._finite_request is not None:
+            dimension = self._replacement_configuration[0]
+            require_finite_replacement_result_seal(
+                self._h5,
+                entry=self.entry,
+                dimension=dimension,
+                audit_identity=hashlib.sha256(
+                    self._replacement_configuration[2]
+                ).hexdigest(),
+            )
         if self._replacement_manifest_digest(excluded) != manifest_expected: raise WriterStateError("replacement final verification changed preserved artifact")
         config = _replacement_hard_group(entry, "reduction/config"); bai, bai_expected, gi, gi_expected, audit, audit_expected, gi_name, gi_preserved, source_base, execution_expected, lineage_expected = selected_expected; nodes = {name: _replacement_hard_group(config, name, h5py.Dataset) for name in (bai, gi, audit)}
         if config is None or any(config.get(name, getlink=True) is not None and type(config.get(name, getlink=True)) is not h5py.HardLink for name in nodes): raise WriterStateError("replacement selected science/audit link changed")
@@ -3193,6 +4554,12 @@ class NexusRecordWriter:
     def _close_handle(self) -> None:
         allow_unverified = self._pending_owner == "abort"
         binding = self._transaction_binding
+        if self._h5 is not None and self._h5 is self._seeded_document:
+            # The finite publisher owns this HDF5 context.  Quiesce and detach
+            # the writer, but leave the actual close to that enclosing context
+            # so descriptor revocation remains single-owner and pathless.
+            self._h5 = None
+            return
         verification_path = (
             Path(self._h5.filename)
             if self._h5 is not None and binding is not None
@@ -3784,6 +5151,8 @@ class NexusRecordWriter:
 
     def finish(self, finalization: WriterFinalization | None = None) -> WriterOutcome:
         if self.phase is WriterPhase.FINISHED:
+            if self._seeded_document is not None:
+                return self._outcome()
             with h5py.File(self.target, "r") as finished:
                 require_current_writable_processed_groups(
                     finished,
@@ -3818,9 +5187,29 @@ class NexusRecordWriter:
         try:
             with self._boundary():
                 if self._transaction_binding is None:
-                    steps = (
+                    common = (
                         ("metadata", lambda: self._write_finalization(self._finalization)),
                         ("flush", self._flush_handle),
+                    )
+                    if self._seeded_document is not None:
+                        steps = (
+                            common[0],
+                            ("result-seal", self._seal_finite_replacement_result),
+                            common[1],
+                            ("verify", self._verify_replacement_manifest),
+                            ("admission", require_terminal_admission),
+                            ("checkpoint", lambda: checkpoint(publish_receipts=False)),
+                            ("close", self._close_handle),
+                            ("receipt", self._commit_receipts),
+                            (
+                                "publication-drop",
+                                lambda: self._commit_publication_drops(
+                                    self._current_publication_drops(),
+                                ),
+                            ),
+                        )
+                    else:
+                        steps = common + (
                         ("admission", require_terminal_admission),
                         ("checkpoint", lambda: checkpoint(publish_receipts=False)),
                         ("close", self._close_handle),
@@ -3833,7 +5222,7 @@ class NexusRecordWriter:
                                 self._current_publication_drops(),
                             ),
                         ),
-                    )
+                        )
                 else:
                     binding = self._transaction_binding
 
@@ -3885,6 +5274,7 @@ class NexusRecordWriter:
                 partial = None
                 if (
                     self._transaction_binding is None
+                    and self._seeded_document is None
                     and self._active_path is not None
                     and self._active_path != self.target
                 ):
@@ -3896,7 +5286,10 @@ class NexusRecordWriter:
                             f"writer abort preserved non-final data at {partial}",
                             RuntimeWarning, stacklevel=2,
                         )
-                if self._transaction_binding is None:
+                if (
+                    self._transaction_binding is None
+                    and self._seeded_document is None
+                ):
                     self._resume_pool()
             self._pending.clear()
             self._pending_owner = None
@@ -3909,9 +5302,17 @@ class NexusRecordWriter:
 
     def _outcome(self) -> WriterOutcome:
         partial = None
-        if self.phase is WriterPhase.PARTIAL and self._active_path is not None:
+        if (
+            self._seeded_document is None
+            and self.phase is WriterPhase.PARTIAL
+            and self._active_path is not None
+        ):
             partial = self._active_path
-        elif self.phase is WriterPhase.ABORTED and self._active_path != self.target:
+        elif (
+            self._seeded_document is None
+            and self.phase is WriterPhase.ABORTED
+            and self._active_path != self.target
+        ):
             partial = self._active_path
         return WriterOutcome(
             phase=self.phase, target=self.target, partial_path=partial,
@@ -3923,6 +5324,7 @@ class NexusRecordWriter:
 
 __all__ = [
     "NexusRecordWriter", "RecordWrite", "WriterFinalization",
+    "ReplacementManifestTargetChanged",
     "WriterIncomplete", "WriterOperationVector", "WriterOutcome",
     "WriterPhase", "WriterStateError", "WriterTransactionBinding",
 ]
