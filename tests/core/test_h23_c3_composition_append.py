@@ -1842,6 +1842,224 @@ def test_existing_stream_startup_full_hashes_prior_exactly_three_times(
     _release(transaction, lease, owners)
 
 
+def test_preserved_stream_seed_hashes_during_copy_and_keeps_destination_readback(
+    tmp_path, monkeypatch,
+):
+    module = importlib.import_module("xrd_tools.io.output_transaction")
+    prior = b"P" * (2 * module._HASH_CHUNK_BYTES + 17)
+    (_coordinator, transaction, target, transaction_owner, target_owner,
+     owners, lease) = _transaction(tmp_path, prior=prior)
+    prior_identity = (
+        transaction.admission.snapshot.device,
+        transaction.admission.snapshot.inode,
+    )
+    real_hash = module._sha256_handle
+    real_read = module.os.read
+    real_seal = module._descriptor_content_receipt
+    hashed_objects = []
+    copied_bytes = 0
+    source_seals = []
+
+    def observe_hash(handle):
+        observed = os.fstat(handle.fileno())
+        hashed_objects.append((
+            (observed.st_dev, observed.st_ino),
+            observed.st_size,
+        ))
+        return real_hash(handle)
+
+    def observe_read(descriptor, size):
+        nonlocal copied_bytes
+        block = real_read(descriptor, size)
+        observed = os.fstat(descriptor)
+        if (observed.st_dev, observed.st_ino) == prior_identity:
+            copied_bytes += len(block)
+        return block
+
+    def observe_seal(descriptor, path, role, **kwargs):
+        if role == "stream-seed-source":
+            source_seals.append((
+                kwargs.get("evidence_digest"),
+                kwargs.get("expected_stat"),
+            ))
+        return real_seal(descriptor, path, role, **kwargs)
+
+    monkeypatch.setattr(module, "_sha256_handle", observe_hash)
+    monkeypatch.setattr(module.os, "read", observe_read)
+    monkeypatch.setattr(module, "_descriptor_content_receipt", observe_seal)
+    attempt = transaction.begin_stream(
+        admission=transaction.admission,
+        transaction_owner=transaction_owner,
+        target_owner=target_owner,
+        lease=lease,
+        pool=_Pool(),
+        file_lock=threading.RLock(),
+    )
+
+    destination_identity = (
+        transaction._stream_reservation.identity.device,
+        transaction._stream_reservation.identity.inode,
+    )
+    assert [identity for identity, size in hashed_objects if size == len(prior)] == [
+        prior_identity,
+        prior_identity,
+        destination_identity,
+    ]
+    assert copied_bytes == len(prior)
+    assert len(source_seals) == 1
+    assert source_seals[0][0] == hashlib.sha256(prior).hexdigest()
+    assert source_seals[0][1][:4] == (
+        prior_identity[0],
+        prior_identity[1],
+        len(prior),
+        transaction.admission.snapshot.mtime_ns,
+    )
+    assert type(source_seals[0][1][4]) is int
+    assert transaction._stream_checkpoint.evidence_digest == hashlib.sha256(
+        prior,
+    ).hexdigest()
+    assert target.read_bytes() == prior
+    assert transaction.abort_stream(
+        attempt, lease=lease,
+    ).phase is TransactionPhase.ABORTED
+    assert target.read_bytes() == prior
+    _release(transaction, lease, owners)
+
+
+def test_preserved_stream_seed_mutation_holds_then_retries_exact_rollback(
+    tmp_path, monkeypatch,
+):
+    module = importlib.import_module("xrd_tools.io.output_transaction")
+    prior = b"Q" * (2 * module._HASH_CHUNK_BYTES + 17)
+    (_coordinator, transaction, target, transaction_owner, target_owner,
+     owners, lease) = _transaction(tmp_path, prior=prior)
+    pool = _Pool()
+    prior_identity = (
+        transaction.admission.snapshot.device,
+        transaction.admission.snapshot.inode,
+    )
+    real_read = module.os.read
+    mutated = False
+
+    def mutate_after_first_copy_read(descriptor, size):
+        nonlocal mutated
+        block = real_read(descriptor, size)
+        observed = os.fstat(descriptor)
+        if (
+            block
+            and not mutated
+            and (observed.st_dev, observed.st_ino) == prior_identity
+        ):
+            with transaction.backup.open("r+b") as handle:
+                handle.seek(-1, os.SEEK_END)
+                handle.write(b"R")
+                handle.flush()
+                os.fsync(handle.fileno())
+            mutated = True
+        return block
+
+    monkeypatch.setattr(module.os, "read", mutate_after_first_copy_read)
+    with pytest.raises(TargetChanged, match="stream-seed-source"):
+        transaction.begin_stream(
+            admission=transaction.admission,
+            transaction_owner=transaction_owner,
+            target_owner=target_owner,
+            lease=lease,
+            pool=pool,
+            file_lock=threading.RLock(),
+        )
+
+    held = transaction.snapshot()
+    assert mutated
+    assert held.phase is TransactionPhase.ROLLBACK_PENDING
+    assert RetryAction.ROLLBACK in held.pending_actions
+    assert RetryAction.POOL_RESUME in held.pending_actions
+    assert held.cleanup_token is not None
+    assert not target.exists()
+    assert transaction.backup.read_bytes().endswith(b"R")
+
+    mutated_stat = transaction.backup.stat()
+    with transaction.backup.open("r+b") as handle:
+        handle.seek(-1, os.SEEK_END)
+        handle.write(b"Q")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.utime(
+        transaction.backup,
+        ns=(
+            mutated_stat.st_atime_ns,
+            transaction.admission.snapshot.mtime_ns,
+        ),
+    )
+    recovered = transaction.retry_cleanup(held.cleanup_token)
+    assert recovered.phase is TransactionPhase.READY_TO_RETRY
+    assert recovered.pending_actions == ()
+    assert target.read_bytes() == prior
+    assert not transaction.backup.exists()
+    assert transaction.abandon(lease).phase is TransactionPhase.ABORTED
+    _release(transaction, lease, owners)
+
+
+def test_existing_replacement_uses_transaction_admission_without_recapture(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.core.scan import Scan
+    from xrd_tools.io.output_transaction import capture_target_snapshot
+    from xrd_tools.reduction import NexusSink, ReductionPlan
+
+    core = importlib.import_module("xrd_tools.reduction.core")
+    target = tmp_path / "receipt-qualified.nexus"
+    _seed_existing_append_target(
+        target,
+        tmp_path,
+        _intent(
+            tmp_path,
+            extent=1,
+            labels=(0,),
+            modes=("1d:default",),
+        ),
+    )
+    expected = capture_target_snapshot(target)
+    before = target.read_bytes()
+    sink = NexusSink.for_existing_replacement(
+        target,
+        expected_target_snapshot=expected,
+        dimension="1d",
+        labels=(0,),
+        audit_bytes=b"{}",
+        selected_plan={},
+        selected_gi_mode=None,
+        source_execution={},
+        append_lineage=None,
+        source_base=tmp_path,
+        file_lock=threading.RLock(),
+        flush_every=None,
+    )
+
+    monkeypatch.setattr(
+        core,
+        "capture_target_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("replacement admission recaptured the full target")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        core,
+        "NexusRecordWriter",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("stop after receipt qualification")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="receipt qualification"):
+        sink.begin(Scan("receipt", []), ReductionPlan(integration_2d=None))
+
+    assert sink._transaction.admission.snapshot == expected
+    assert sink._transaction.snapshot().phase is TransactionPhase.ABORTED
+    assert target.read_bytes() == before
+    _assert_lease_available(target)
+
+
 @pytest.mark.parametrize(
     ("provenance", "overwrite", "fast"),
     (

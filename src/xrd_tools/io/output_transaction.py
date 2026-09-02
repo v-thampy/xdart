@@ -593,6 +593,64 @@ def _descriptor_receipt(descriptor: int, path: Path, role: str) -> _ObjectReceip
     )
 
 
+def _bind_descriptor_to_receipt(
+    descriptor: int,
+    path: Path,
+    receipt: _ObjectReceipt,
+) -> tuple[int, int, int, int, int]:
+    """Bind an open pathname to prior exact authority without rereading it.
+
+    The receipt already owns the complete digest from admission/staging.  This
+    seam binds the newly opened descriptor and its pathname to that receipt's
+    immutable object/stat identity.  The caller must still supply content
+    evidence gathered while performing its required read and seal against the
+    returned full stat tuple.
+    """
+    normalized = _normalize_target(path)
+    if receipt.path != normalized:
+        raise TargetChanged(
+            f"{receipt.role} receipt does not own descriptor path {path}"
+        )
+    snapshot = receipt.snapshot
+    if (
+        not snapshot.exists
+        or snapshot.size is None
+        or snapshot.mtime_ns is None
+        or snapshot.device is None
+        or snapshot.inode is None
+        or snapshot.digest is None
+        or receipt.identity != _identity(snapshot)
+    ):
+        raise TransactionStateError(
+            f"{receipt.role} receipt lacks exact immutable authority"
+        )
+    before = os.fstat(descriptor)
+    try:
+        named = os.stat(path)
+    except FileNotFoundError as exc:
+        raise TargetChanged(
+            f"{receipt.role} pathname disappeared before descriptor binding: {path}"
+        ) from exc
+    after = os.fstat(descriptor)
+    identities = {
+        _stat_identity(before),
+        _stat_identity(named),
+        _stat_identity(after),
+    }
+    expected_prefix = (
+        receipt.identity.device,
+        receipt.identity.inode,
+        int(snapshot.size),
+        int(snapshot.mtime_ns),
+    )
+    observed = _stat_identity(after)
+    if len(identities) != 1 or observed[:4] != expected_prefix:
+        raise TargetChanged(
+            f"{receipt.role} descriptor does not match its exact receipt: {path}"
+        )
+    return observed
+
+
 def _descriptor_content_receipt(
     descriptor: int,
     path: Path,
@@ -2291,22 +2349,19 @@ class OutputTransaction:
                 seed_mode is StreamSeedMode.PRESERVE_BASE
                 and self._prior_receipt is not None
             ):
+                prior = self._prior_receipt
                 source_descriptor = os.open(self.backup, os.O_RDONLY)
-                source_before = _descriptor_content_receipt(
+                source_expected_stat = _bind_descriptor_to_receipt(
                     source_descriptor,
                     self.backup,
-                    "stream-seed-source",
-                    durable_fsync=self._durable_fsync,
+                    prior,
                 )
-                if source_before.snapshot != self.stream_base_snapshot:
-                    raise TargetChanged(
-                        "stream seed source differs from the admitted prior"
-                    )
-                os.lseek(source_descriptor, 0, os.SEEK_SET)
+                source_digest = hashlib.sha256()
                 while True:
                     block = os.read(source_descriptor, _HASH_CHUNK_BYTES)
                     if not block:
                         break
+                    source_digest.update(block)
                     view = memoryview(block)
                     while view:
                         written = os.write(destination, view)
@@ -2316,8 +2371,13 @@ class OutputTransaction:
                     self.backup,
                     "stream-seed-source",
                     durable_fsync=self._durable_fsync,
+                    evidence_digest=source_digest.hexdigest(),
+                    expected_stat=source_expected_stat,
                 )
-                if source_after != source_before:
+                if (
+                    source_after.identity != prior.identity
+                    or source_after.snapshot != prior.snapshot
+                ):
                     raise TargetChanged("staged prior changed while seeding stream")
             if seed_mode is StreamSeedMode.EMPTY_REPLACEMENT:
                 receipt = _descriptor_receipt(

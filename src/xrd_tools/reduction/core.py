@@ -90,7 +90,6 @@ from xrd_tools.io.output_transaction import (
     TransactionPhase,
     TransactionSnapshot,
     XyeSnapshot,
-    capture_target_snapshot,
     get_output_transaction_coordinator,
 )
 from xrd_tools.io.processed_scan_id import (
@@ -1863,7 +1862,8 @@ class NexusSink:
             self._transaction_owners = (transaction_owner, target_owner, owners)
             if self._replacement is not None:
                 try:
-                    if capture_target_snapshot(self.path) != self._replacement[0]: raise ValueError("TARGET_SNAPSHOT_CHANGED")
+                    if transaction.admission.snapshot != self._replacement[0]:
+                        raise ValueError("TARGET_SNAPSHOT_CHANGED")
                 except BaseException as primary:
                     try: self._settle_unstarted_transaction()
                     except BaseException as cleanup: raise primary from cleanup
