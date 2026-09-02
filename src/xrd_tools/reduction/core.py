@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from numbers import Real
 from types import MappingProxyType
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Protocol, runtime_checkable
@@ -5174,6 +5175,96 @@ def _wait_pending_futures(pending: list[tuple[Frame, Any]], *, worker: Any | Non
             pass
 
 
+_FLOAT32_CSR_ERROR_MODELS = frozenset((None, "no", "poisson", "azimuthal", "hybrid"))
+_FLOAT32_CSR_EXTRAS = frozenset(("correctSolidAngle", "dummy", "delta_dummy", "safe"))
+
+
+def _float32_csr_options_are_safe(
+    integration: Integration1DPlan | Integration2DPlan,
+) -> bool:
+    if type(integration.method) is not str or integration.method != "csr":
+        return False
+    error_model = integration.error_model
+    if (
+        error_model is not None
+        and (
+            type(error_model) is not str
+            or error_model not in _FLOAT32_CSR_ERROR_MODELS
+        )
+    ):
+        return False
+    extra = integration.extra
+    if type(extra) is not dict or not set(extra).issubset(_FLOAT32_CSR_EXTRAS):
+        return False
+    if any(type(extra[key]) is not bool for key in ("correctSolidAngle", "safe") if key in extra):
+        return False
+    for key in ("dummy", "delta_dummy"):
+        value = extra.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, Real) or isinstance(value, (bool, np.bool_)):
+            return False
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (not np.isfinite(number)
+                or abs(number) > np.finfo(np.float32).max
+                or float(np.float32(number)) != number):
+            return False
+    return True
+
+
+def _stock_pyfai_float32_input_semantics(ai: Any) -> bool:
+    if (
+        type(ai).__module__ != "pyFAI.integrator.azimuthal"
+        or type(ai).__name__ != "AzimuthalIntegrator"
+    ):
+        return False
+    try:
+        from pyFAI.detectors import Detector
+        from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+    except ImportError: return False
+
+    detector = getattr(ai, "detector", None)
+    return (
+        type(ai) is AzimuthalIntegrator
+        and detector is not None
+        and getattr(type(detector), "get_dummies", None) is Detector.get_dummies
+        and not any(name in getattr(ai, "__dict__", {})
+                    for name in ("integrate1d", "integrate2d"))
+        and "get_dummies" not in getattr(detector, "__dict__", {})
+    )
+
+
+def _can_use_owned_float32_csr(
+    raw_image: np.ndarray,
+    background: np.ndarray | float | None,
+    plan: ReductionPlan,
+    *,
+    integrator_input_safe: bool,
+) -> bool:
+    enabled = tuple(item for item in (
+        plan.integration_1d, plan.integration_2d) if item is not None)
+    return (
+        raw_image.ndim == 2
+        and raw_image.dtype.type in (np.uint8, np.uint16, np.uint32)
+        and raw_image.dtype.isnative
+        and raw_image.flags.c_contiguous
+        and plan.gi is None
+        and background is None
+        and plan.threshold_min is None
+        and plan.threshold_max is None
+        and integrator_input_safe is True
+        and bool(enabled)
+        and not (
+            plan.integration_1d is not None
+            and str(plan.integration_1d.unit or "").lower() == "chi_deg"
+        )
+        and all(_float32_csr_options_are_safe(item) for item in enabled)
+    )
+
+
 def _reduce_frame(
     frame: Frame,
     raw_image: np.ndarray | None,
@@ -5194,7 +5285,19 @@ def _reduce_frame(
     if raw_image is not None:
         frame.image = np.asarray(raw_image)
     raw_image_arr = np.asarray(frame.load_image())  # pre-float: integer dtype for the saturation ceiling
-    image = raw_image_arr.astype(float)
+    use_float32_csr = _can_use_owned_float32_csr(
+        raw_image_arr,
+        frame.background,
+        plan,
+        integrator_input_safe=_stock_pyfai_float32_input_semantics(
+            getattr(integrators, "ai", None),
+        ),
+    )
+    image = (
+        np.array(raw_image_arr, dtype=np.float32, order="C", copy=True)
+        if use_float32_csr
+        else raw_image_arr.astype(float)
+    )
     if _cancel_requested(cancel_token):
         raise _ReductionCancelled
     if image.ndim != 2:
@@ -5205,8 +5308,9 @@ def _reduce_frame(
         if include_corrected_image
         else None
     )
-    image = _apply_thresholds_owned(image, plan)
-    image = _subtract_background(image, frame.background)
+    if not use_float32_csr:
+        image = _apply_thresholds_owned(image, plan)
+        image = _subtract_background(image, frame.background)
     plan_mask = _cached_mask_for_shape(
         plan.mask,
         image.shape,
