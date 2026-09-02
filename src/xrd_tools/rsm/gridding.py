@@ -28,7 +28,6 @@ import weakref
 from dataclasses import InitVar, dataclass, field
 
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
 
 from xrd_tools.core.geometry import DetectorHeader, PixelQMap
 from xrd_tools.core.physical_memory import physical_root_fact
@@ -1245,6 +1244,8 @@ def combine_grids(
     """
     if not volumes:
         raise ValueError("volumes must not be empty")
+
+    from scipy.interpolate import RegularGridInterpolator  # noqa: PLC0415
 
     h, k, l = get_common_grid(volumes, bins)
     combined = np.zeros((len(h), len(k), len(l)), dtype=float)

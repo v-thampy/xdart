@@ -639,7 +639,6 @@ def test_two_member_science_uses_one_grid_and_persists_exact_attestation(
     for name in (
         "combine_grids",
         "get_common_grid",
-        "RegularGridInterpolator",
     ):
         monkeypatch.setattr(
             rsm_gridding,
