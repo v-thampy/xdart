@@ -41,9 +41,8 @@ from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
 from xdart.gui.tabs.scattering.events import CleanupStatus, RunIdentity
 from xdart.gui.tabs.scattering.metadata_operations import MetadataLifecycle
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
-from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
 from xdart.gui.tabs.scattering.processed_browser import (
-    ReintegrateReloadDirective,
+    AverageReloadDirective,
 )
 from xdart.gui.tabs.scattering.workspace_operations import (
     WorkspaceRefreshEffect,
@@ -62,22 +61,26 @@ from xrd_tools.analysis.display_fit_operations import (
     DisplayedPhaseFitPlan, DisplayedPhaseFitResult,
 )
 from xrd_tools.core.roi import RoiSpec
+from xrd_tools.io.output_transaction import StreamTerminal
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 
 
-def _set_pending_reintegrate_reload(
+def _set_pending_processed_browser_mutation(
     page, target: str = "/tmp/current.nexus",
-) -> ReintegrateReloadDirective:
-    request = BrowseLoadRequest("pending-reintegrate", 1, target)
-    directive = ReintegrateReloadDirective(request, target)
+) -> AverageReloadDirective:
+    directive = AverageReloadDirective(
+        target,
+        "entry",
+        StreamTerminal(target, 1, "a" * 64, 1, 1, 1, 1, 1),
+    )
     assert page._processed_browser.adopt_reload(directive) is directive
     return directive
 
 
-def _clear_pending_reintegrate_reload(page) -> None:
-    directive = page._processed_browser.pending_reintegrate_reload
+def _clear_pending_processed_browser_mutation(page) -> None:
+    directive = page._processed_browser.pending_average_reload
     if directive is not None:
         assert page._processed_browser.retire_reload(directive)
 
@@ -786,7 +789,7 @@ def test_metadata_analysis_owner_accepts_a_real_control_edit(
         _close_page(page, qapp)
 
 
-def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
+def test_pending_processed_browser_mutation_uses_one_busy_truth(
     monkeypatch, qapp,
 ) -> None:
     import xdart.gui.tabs.scattering.page as page_module
@@ -850,7 +853,7 @@ def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
     try:
         page._open_analysis_mount("metadata")
         assert not page._workspace_operations.owned
-        _set_pending_reintegrate_reload(page)
+        _set_pending_processed_browser_mutation(page)
         assert page._experiment_operation_busy()
         assert not analysis_start_allowed(page)
         assert page._submit_metadata(
@@ -892,7 +895,7 @@ def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
         assert "browser" not in refreshes
         assert "scientific" not in refreshes
 
-        _clear_pending_reintegrate_reload(page)
+        _clear_pending_processed_browser_mutation(page)
         page._refresh_shell(
             preserve_display=True,
             preserve_scientific=True,
@@ -911,11 +914,11 @@ def test_pending_reintegrate_reload_uses_one_mutating_busy_truth(
         assert action_enabled["reintegrate_2d"]
         assert page._shell.scientific.background.isEnabled()
     finally:
-        _clear_pending_reintegrate_reload(page)
+        _clear_pending_processed_browser_mutation(page)
         _close_page(page, qapp)
 
 
-def test_pending_reintegrate_reload_dominates_active_background_mutation(
+def test_pending_processed_browser_mutation_dominates_active_background(
     monkeypatch, qapp,
 ) -> None:
     page = _page()
@@ -954,7 +957,7 @@ def test_pending_reintegrate_reload_dominates_active_background_mutation(
                 reconcile_scientific,
             )
 
-            _set_pending_reintegrate_reload(page)
+            _set_pending_processed_browser_mutation(page)
             assert not page._workspace_operations.owned
 
             page._handle_shell_command(
@@ -975,7 +978,7 @@ def test_pending_reintegrate_reload_dominates_active_background_mutation(
                 }),
             ]
 
-            _clear_pending_reintegrate_reload(page)
+            _clear_pending_processed_browser_mutation(page)
             page._handle_shell_command(
                 ShellCommand(ShellCommandKind.SET_BACKGROUND)
             )
@@ -987,7 +990,7 @@ def test_pending_reintegrate_reload_dominates_active_background_mutation(
                 current_identity=identity,
                 observe_stamp=lambda _stamp: None,
             )
-            _set_pending_reintegrate_reload(page)
+            _set_pending_processed_browser_mutation(page)
             page._background_identity = identity
             patch.setattr(page._workspace_operations, "_slot", active_slot)
             page._handle_shell_command(
@@ -995,7 +998,7 @@ def test_pending_reintegrate_reload_dominates_active_background_mutation(
             )
             assert releases == [True, True]
     finally:
-        _clear_pending_reintegrate_reload(page)
+        _clear_pending_processed_browser_mutation(page)
         page._background_identity = None
         _close_page(page, qapp)
 

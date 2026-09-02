@@ -223,7 +223,6 @@ from .processed_browser import (
     BrowserRefreshEffect,
     ProcessedBrowserOwner,
     ProcessedBrowserTransition,
-    ReintegrateReloadDirective,
     ReintegrateSuccessorAdoption,
     ReintegrateSuccessorDirective,
     ReintegrateSuccessorPhase,
@@ -2116,47 +2115,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 return refusal
         return ExternalNexusQualification.ready(capture.target)
 
-    def _retry_pending_reintegrate_reload(self) -> bool:
-        browser = self._processed_browser
-        directive = browser.pending_reintegrate_reload
-        if directive is None:
-            return False
-        if self._closing or self._closed:
-            browser.retire_reload(directive)
-            return False
-        if not self._release_browse_1d_debt():
-            self._ensure_timer()
-            return False
-        request = directive.request
-        target = directive.target
-        terminal_commit_identity = directive.terminal_commit_identity
-        reloaded = (
-            self._context_controller.reload_reintegrate_browse(
-                request, target,
-            )
-            if terminal_commit_identity is None
-            else self._context_controller.reload_reintegrate_browse(
-                request,
-                target,
-                terminal_commit_identity=terminal_commit_identity,
-            )
-        )
-        if reloaded is None:
-            if self._context_controller.reintegrate_reload_retryable(
-                request, target,
-            ):
-                self._ensure_timer()
-                return False
-            browser.retire_reload(directive)
-            self._request_browser_catalog()
-            self._notice(
-                "Reintegrate Browse reload lost its exact context; "
-                "refresh the persisted artifact from the browser."
-            )
-            return True
-        browser.retire_reload(directive)
-        return True
-
     def _begin_pending_reintegrate_successor(
         self,
         adoption: ReintegrateSuccessorAdoption | None = None,
@@ -2493,10 +2451,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._shell.scientific.reconcile_operation_status(
                 transition.notice
             )
-        if transition.reintegrate_reload is not None:
-            self._processed_browser.adopt_reload(
-                transition.reintegrate_reload
-            )
         if transition.reintegrate_successor is not None:
             adoption = self._processed_browser.adopt_reintegrate_successor(
                 transition.reintegrate_successor
@@ -2504,8 +2458,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._begin_pending_reintegrate_successor(adoption)
         if transition.request_catalog:
             self._request_browser_catalog()
-        if transition.effect is WorkspaceRefreshEffect.FULL:
-            self._retry_pending_reintegrate_reload()
         return transition.effect
 
     def _consume_average_update(
@@ -4303,11 +4255,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         # Cache borrow debt is page-owned, not selected-context-owned.  Settle
         # it before draining any event that could replace Browse with an
-        # acquisition context, and retry exact deferred operation reloads
-        # immediately after their blocking owner reaches terminal release.
-        pending_reintegrate_reload = (
-            self._processed_browser.pending_reintegrate_reload is not None
-        )
+        # acquisition context.
         pending_average_reload = (
             self._processed_browser.pending_average_reload is not None
         )
@@ -4319,10 +4267,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and successor.phase is ReintegrateSuccessorPhase.PENDING
         ):
             self._begin_pending_reintegrate_successor(successor)
-        pending_reintegrate_reload_changed = bool(
-            pending_reintegrate_reload
-            and self._processed_browser.pending_reintegrate_reload is None
-        )
         pending_average_reload_changed = bool(
             pending_average_reload
             and self._processed_browser.pending_average_reload is None
@@ -4332,9 +4276,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         reuse_terminal_science = False
         hold_batch_terminal_science = False
         browse_presentation_ready: TerminalBrowsePresentation | None = None
-        changed = (
-            self._poll_admission() or pending_reintegrate_reload_changed
-        )
+        changed = self._poll_admission()
         poll_viewer_1d = getattr(self._context_controller, "poll_viewer_1d", None)
         if poll_viewer_1d is not None and poll_viewer_1d():
             changed = True
@@ -4708,10 +4650,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 transition = operations.consume_lost_owner(
                     operation_identity
                 )
-                if transition.reintegrate_reload is not None:
-                    self._processed_browser.adopt_reload(
-                        transition.reintegrate_reload
-                    )
                 if transition.average_reload is not None:
                     self._processed_browser.adopt_reload(
                         transition.average_reload
@@ -4721,7 +4659,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if transition.effect is WorkspaceRefreshEffect.CONTROLS:
                     controls_refresh = True
                 elif transition.effect is WorkspaceRefreshEffect.FULL:
-                    self._retry_pending_reintegrate_reload()
                     changed = True
                     force_scientific = True
 
@@ -5729,7 +5666,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
         if not self._release_browse_1d_debt():
             return False
-        self._retry_pending_reintegrate_reload()
         self._retry_pending_average_reload()
         return self._browse_1d_release_debt is None
 

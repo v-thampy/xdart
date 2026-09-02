@@ -33,7 +33,6 @@ from .operation_values import (
 )
 from .processed_browser import (
     AverageReloadDirective,
-    ReintegrateReloadDirective,
     ReintegrateSuccessorDirective,
 )
 
@@ -53,7 +52,6 @@ class WorkspaceOperationTransition:
 
     effect: WorkspaceRefreshEffect
     notice: str = ""
-    reintegrate_reload: ReintegrateReloadDirective | None = None
     reintegrate_successor: ReintegrateSuccessorDirective | None = None
     average_reload: AverageReloadDirective | None = None
     request_catalog: bool = False
@@ -69,16 +67,10 @@ class WorkspaceOperationTransition:
                 and (
                     type(self.reintegrate_progress) is not OperationProgress
                     or self.effect is not WorkspaceRefreshEffect.NONE
-                    or self.reintegrate_reload is not None
                     or self.reintegrate_successor is not None
                     or self.average_reload is not None
                     or self.request_catalog
                 )
-            )
-            or (
-                self.reintegrate_reload is not None
-                and type(self.reintegrate_reload)
-                is not ReintegrateReloadDirective
             )
             or (
                 self.reintegrate_successor is not None
@@ -88,13 +80,6 @@ class WorkspaceOperationTransition:
             or (
                 self.average_reload is not None
                 and type(self.average_reload) is not AverageReloadDirective
-            )
-            or (
-                self.reintegrate_reload is not None
-                and (
-                    self.reintegrate_successor is not None
-                    or self.average_reload is not None
-                )
             )
             or (
                 self.reintegrate_successor is not None

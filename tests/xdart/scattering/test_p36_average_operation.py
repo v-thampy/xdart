@@ -1713,17 +1713,13 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
         return identity, update
 
     page, store = _page(tmp_path, monkeypatch)
-    reloads = []; reintegrate_reloads = []; catalog = []; notices = []
+    reloads = []; catalog = []; notices = []
     refreshes = []
     monkeypatch.setattr(
         page._context_controller,
         "begin_browse",
         lambda value, *, terminal_commit_identity=None, source_root=None:
             reloads.append((value, terminal_commit_identity, source_root)),
-    )
-    monkeypatch.setattr(
-        page._context_controller, "reload_reintegrate_browse",
-        lambda *args: reintegrate_reloads.append(args),
     )
     monkeypatch.setattr(page, "_request_browser_catalog", lambda: catalog.append(1))
     monkeypatch.setattr(page, "_notice", lambda value: notices.append(value))
@@ -1758,7 +1754,6 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
         committed.target, committed.commit_identity, str(tmp_path),
     )]
     assert len(catalog) == before_catalog + 1
-    assert reintegrate_reloads == []
     assert len(refreshes) == before_refreshes
     assert page._workspace_operations.average_state is None
 

@@ -27,7 +27,6 @@ from xdart.gui.tabs.scattering.processed_browser import (
     BrowserCatalogWake,
     BrowserRefreshEffect,
     ProcessedBrowserOwner,
-    ReintegrateReloadDirective,
     ReintegrateSuccessorDirective,
     ReintegrateSuccessorPhase,
     TerminalBrowsePaintReceipt,
@@ -358,12 +357,8 @@ def test_close_is_nonblocking_and_late_wake_is_inert() -> None:
     assert not owner.pool_open
 
 
-def test_reload_custody_is_one_exact_union_slot() -> None:
+def test_average_reload_and_successor_custody_are_mutually_exclusive() -> None:
     target = "/processed/result.nexus"
-    request = BrowseLoadRequest(
-        "reintegrate-reload", 1, target, source_root="/project"
-    )
-    reintegrate = ReintegrateReloadDirective(request, target)
     average_target = "/processed/average.nexus"
     seal = StreamTerminal(
         average_target, 17, "d" * 64, 1, 2, 3, 4, 5
@@ -378,16 +373,26 @@ def test_reload_custody_is_one_exact_union_slot() -> None:
         catalog_reader=lambda _directory, **_kwargs: (),
     )
     try:
-        assert owner.adopt_reload(reintegrate) is reintegrate
-        assert owner.pending_reintegrate_reload is reintegrate
-        assert owner.pending_average_reload is None
+        assert owner.adopt_reload(average) is average
+        assert owner.pending_average_reload is average
         assert owner.busy and owner.polling_needed and owner.preserve_science
         assert not owner.retire_reload(
-            ReintegrateReloadDirective(request, target)
+            AverageReloadDirective(
+                average_target, "entry", seal, "/project"
+            )
+        )
+        foreign_target = "/processed/other-average.nexus"
+        foreign = AverageReloadDirective(
+            foreign_target,
+            "entry",
+            StreamTerminal(
+                foreign_target, 19, "e" * 64, 2, 2, 3, 4, 5
+            ),
+            "/project",
         )
         with pytest.raises(RuntimeError, match="already owns"):
-            owner.adopt_reload(average)
-        assert owner.retire_reload(reintegrate)
+            owner.adopt_reload(foreign)
+        assert owner.retire_reload(average)
 
         predecessor_request = BrowseLoadRequest(
             "predecessor", 2, "/processed/source.nexus", source_root="/project"

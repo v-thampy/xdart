@@ -482,31 +482,6 @@ class ContextController:
             or self._browse_loader.owns_request(request)
         )
 
-    def reintegrate_reload_retryable(
-        self, request: BrowseLoadRequest, target: str,
-    ) -> bool:
-        """Whether one deferred reload still names the selected exact context."""
-
-        context = self._runtime.browse_context
-        selection = self._runtime.selection
-        return bool(
-            type(request) is BrowseLoadRequest
-            and type(target) is str
-            and target
-            and self._close is None
-            and self._browse_request is None
-            and type(context) is BrowseContext
-            and context.load_request is request
-            and context.operation is request
-            and context.requested_path == target == request.source_path
-            and context.invalidated
-            and not context.released
-            and type(selection) is DisplaySelection
-            and selection.kind is ContextKind.BROWSE
-            and selection.names(context)
-            and selection.source_path == target
-        )
-
     def capture_loaded_browse(
         self, request: BrowseLoadRequest,
     ) -> LoadedBrowseCapture | None:
@@ -557,33 +532,6 @@ class ContextController:
             allowed_pending_request=successor_request,
         )
         return bool(current is not None and capture.is_exactly(current))
-
-    def invalidate_reintegrate_browse(
-        self, capture: LoadedBrowseCapture,
-    ) -> bool:
-        if type(capture) is not LoadedBrowseCapture:
-            return False
-        current = self.capture_loaded_browse(capture.request)
-        if current is None or not capture.is_exactly(current):
-            return False
-        self._runtime.invalidate_browse(); return True
-
-    def reload_reintegrate_browse(
-        self,
-        request,
-        target,
-        *,
-        terminal_commit_identity: StreamTerminal | None = None,
-    ):
-        context, selection = self._runtime.browse_context, self._runtime.selection
-        if (type(request) is not BrowseLoadRequest or type(target) is not str or type(context) is not BrowseContext or context.load_request is not request or context.requested_path != target or not context.invalidated or context.released or type(selection) is not DisplaySelection or not selection.names(context) or self._browse_request is not None): return None
-        try:
-            return self.begin_browse(
-                target,
-                terminal_commit_identity=terminal_commit_identity,
-                source_root=request.source_root,
-            )
-        except RuntimeError: return None
 
     @property
     def browse_preview_polling_needed(self) -> bool:

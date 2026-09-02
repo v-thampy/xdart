@@ -95,34 +95,6 @@ class BrowserCatalogWake:
 
 
 @dataclass(frozen=True, slots=True)
-class ReintegrateReloadDirective:
-    """Exact invalidated Browse target that must be loaded again."""
-
-    request: BrowseLoadRequest
-    target: str
-    terminal_commit_identity: StreamTerminal | None = None
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.request) is not BrowseLoadRequest
-            or type(self.target) is not str
-            or not self.target
-            or self.request.source_path != self.target
-            or (
-                self.terminal_commit_identity is not None
-                and (
-                    stream_terminal_object_revision(
-                        self.terminal_commit_identity
-                    )
-                    is None
-                    or self.terminal_commit_identity.target != self.target
-                )
-            )
-        ):
-            raise ValueError("Reintegrate reload directive is invalid")
-
-
-@dataclass(frozen=True, slots=True)
 class ReintegrateSuccessorDirective:
     """One exact predecessor-to-immutable-successor adoption authority."""
 
@@ -256,9 +228,6 @@ class AverageReloadDirective:
             )
         ):
             raise ValueError("Average reload directive is invalid")
-
-
-BrowserReloadDirective = ReintegrateReloadDirective | AverageReloadDirective
 
 
 class TerminalPaintMode(Enum):
@@ -539,7 +508,7 @@ class ProcessedBrowserOwner:
         self._seen_artifacts: set[str] = set()
         self._transient_frame: DisplayFrameKey | None = None
         self._transient_clear_token: int | None = None
-        self._reload: BrowserReloadDirective | None = None
+        self._reload: AverageReloadDirective | None = None
         self._reintegrate_successor: ReintegrateSuccessorAdoption | None = None
         self._terminal_handoff: TerminalBrowseHandoff | None = None
         self._terminal_presentation: TerminalBrowsePresentation | None = None
@@ -597,20 +566,8 @@ class ProcessedBrowserOwner:
         return self._closed
 
     @property
-    def pending_reintegrate_reload(
-        self,
-    ) -> ReintegrateReloadDirective | None:
-        directive = self._reload
-        return (
-            directive
-            if type(directive) is ReintegrateReloadDirective
-            else None
-        )
-
-    @property
     def pending_average_reload(self) -> AverageReloadDirective | None:
-        directive = self._reload
-        return directive if type(directive) is AverageReloadDirective else None
+        return self._reload
 
     @property
     def pending_reintegrate_successor(
@@ -1037,13 +994,12 @@ class ProcessedBrowserOwner:
 
     def adopt_reload(
         self,
-        directive: BrowserReloadDirective,
-    ) -> BrowserReloadDirective:
+        directive: AverageReloadDirective,
+    ) -> AverageReloadDirective:
         if (
             self._closing
             or self._closed
-            or type(directive)
-            not in {ReintegrateReloadDirective, AverageReloadDirective}
+            or type(directive) is not AverageReloadDirective
             or self._reintegrate_successor is not None
         ):
             raise RuntimeError("processed Browser cannot adopt reload")
@@ -1055,7 +1011,7 @@ class ProcessedBrowserOwner:
 
     def retire_reload(
         self,
-        directive: BrowserReloadDirective,
+        directive: AverageReloadDirective,
     ) -> bool:
         if self._reload is not directive:
             return False
@@ -1400,14 +1356,12 @@ class ProcessedBrowserOwner:
 
 __all__ = [
     "AverageReloadDirective",
-    "BrowserReloadDirective",
     "BrowserCatalogRequest",
     "BrowserCatalogWake",
     "BrowserRefreshEffect",
     "ProcessedBrowserOwner",
     "ProcessedBrowserProjection",
     "ProcessedBrowserTransition",
-    "ReintegrateReloadDirective",
     "ReintegrateSuccessorAdoption",
     "ReintegrateSuccessorDirective",
     "ReintegrateSuccessorPhase",

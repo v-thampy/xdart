@@ -28,7 +28,6 @@ from xdart.gui.tabs.scattering.workspace_operations import (
 )
 from xdart.gui.tabs.scattering.processed_browser import (
     AverageReloadDirective,
-    ReintegrateReloadDirective,
 )
 from xdart.modules.display_context import (
     BrowseContext,
@@ -218,13 +217,9 @@ def test_typed_capture_requires_live_identity_but_compares_value_facts() -> None
     assert "__bool__" not in WorkspaceRefreshEffect.__dict__
 
 
-def test_reload_directives_require_the_seal_to_name_the_exact_target() -> None:
+def test_average_reload_requires_the_seal_to_name_the_exact_target() -> None:
     capture = _capture()
     foreign = _seal("/detached/foreign.nexus")
-    with pytest.raises(ValueError, match="Reintegrate reload directive"):
-        ReintegrateReloadDirective(
-            capture.request, capture.target, foreign
-        )
     with pytest.raises(ValueError, match="Average reload directive"):
         AverageReloadDirective(capture.target, capture.entry, foreign)
 
@@ -347,7 +342,6 @@ def test_reintegrate_terminal_adopts_successor_and_lost_owner_keeps_predecessor(
     ))
     assert transition.effect is WorkspaceRefreshEffect.CONTROLS
     assert owner.reintegrate_state is None
-    assert transition.reintegrate_reload is None
     assert transition.reintegrate_successor is not None
     assert transition.reintegrate_successor.predecessor is capture
     assert transition.reintegrate_successor.successor_path == successor
@@ -367,7 +361,6 @@ def test_reintegrate_terminal_adopts_successor_and_lost_owner_keeps_predecessor(
     assert transition.effect is WorkspaceRefreshEffect.CONTROLS
     assert "before terminal publication" in transition.notice
     assert lost.reintegrate_state is None
-    assert transition.reintegrate_reload is None
     assert transition.reintegrate_successor is None
 
 

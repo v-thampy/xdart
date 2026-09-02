@@ -819,100 +819,6 @@ def test_cache_poll_policy_distinguishes_terminal_refusal(
     ) is expected
 
 
-def test_reintegrate_reload_retains_exact_intent_until_debt_and_owner_settle(
-) -> None:
-    from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
-    from xdart.gui.tabs.scattering.page import ScatteringWorkspace
-    from xdart.gui.tabs.scattering.processed_browser import (
-        ProcessedBrowserOwner,
-        ReintegrateReloadDirective,
-    )
-    from xrd_tools.io.output_transaction import StreamTerminal
-
-    target = "/detached/result.nxs"
-    seal = StreamTerminal(target, 1, "a" * 64, 1, 1, 1, 1, 1)
-    request = BrowseLoadRequest("reload", 1, target, seal)
-
-    class Controller:
-        def __init__(self):
-            self.calls = []
-            self.results = [None, object()]
-            self.retryable = True
-
-        def reload_reintegrate_browse(
-            self, candidate, path, *, terminal_commit_identity=None,
-        ):
-            self.calls.append((candidate, path, terminal_commit_identity))
-            return self.results.pop(0)
-
-        def owns_browse_request(self, candidate):
-            return candidate is request
-
-        def reintegrate_reload_retryable(self, candidate, path):
-            return (
-                self.retryable
-                and candidate is request
-                and path == target
-            )
-
-    class Page:
-        _closing = False
-        _closed = False
-
-        def __init__(self):
-            self._processed_browser = ProcessedBrowserOwner(
-                save_path="/detached",
-                processing_mode="Int 2D",
-                deliver=lambda _wake: None,
-                catalog_reader=lambda _directory, **_kwargs: (),
-            )
-            directive = ReintegrateReloadDirective(request, target, seal)
-            assert self._processed_browser.adopt_reload(directive) is directive
-            self._context_controller = Controller()
-            self.releases = [False, True, True]
-            self.timer_starts = 0
-            self.catalog_requests = 0
-
-        def _release_browse_1d_debt(self):
-            return self.releases.pop(0)
-
-        def _ensure_timer(self):
-            self.timer_starts += 1
-
-        def _request_browser_catalog(self):
-            self.catalog_requests += 1
-
-        def _notice(self, _message):
-            pass
-
-    page = Page()
-    retry = ScatteringWorkspace._retry_pending_reintegrate_reload
-    assert not retry(page)
-    assert page._processed_browser.pending_reintegrate_reload is not None
-    assert page._context_controller.calls == []
-    assert not retry(page)
-    assert page._processed_browser.pending_reintegrate_reload is not None
-    assert page._context_controller.calls == [(request, target, seal)]
-    assert retry(page)
-    assert page._processed_browser.pending_reintegrate_reload is None
-    assert page._context_controller.calls == [
-        (request, target, seal),
-        (request, target, seal),
-    ]
-    assert page.catalog_requests == 0
-
-    lost = Page()
-    lost.releases = [True]
-    lost._context_controller.results = [None]
-    # Broad loader/cleanup ownership may remain true after selection drift;
-    # only the exact selected invalidated context can keep retry intent live.
-    assert lost._context_controller.owns_browse_request(request)
-    lost._context_controller.retryable = False
-    assert retry(lost)
-    assert lost._processed_browser.pending_reintegrate_reload is None
-    assert lost.catalog_requests == 1
-
-
 def test_drain_gate_settles_page_debt_before_retry_or_context_mutation(
 ) -> None:
     from xdart.gui.tabs.scattering.page import ScatteringWorkspace
@@ -921,7 +827,6 @@ def test_drain_gate_settles_page_debt_before_retry_or_context_mutation(
         def __init__(self):
             self.releases = [False, True]
             self._browse_1d_release_debt = object()
-            self.reintegrate_retries = 0
             self.average_retries = 0
 
         def _release_browse_1d_debt(self):
@@ -930,16 +835,13 @@ def test_drain_gate_settles_page_debt_before_retry_or_context_mutation(
                 self._browse_1d_release_debt = None
             return released
 
-        def _retry_pending_reintegrate_reload(self):
-            self.reintegrate_retries += 1
-
         def _retry_pending_average_reload(self):
             self.average_retries += 1
 
     page = Page()
     settle = ScatteringWorkspace._settle_browse_1d_before_drain
     assert not settle(page)
-    assert page.reintegrate_retries == page.average_retries == 0
+    assert page.average_retries == 0
     assert settle(page)
-    assert page.reintegrate_retries == page.average_retries == 1
+    assert page.average_retries == 1
     assert page._browse_1d_release_debt is None
