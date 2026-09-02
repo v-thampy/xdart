@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from collections import Counter, OrderedDict
+import logging
 import os
 import threading
 
 import h5py
+
+
+logger = logging.getLogger(__name__)
 
 
 def _pool_key(path):
@@ -41,11 +45,16 @@ class H5FilePool:
                     return handle
                 del self._files[key]
             while len(self._files) >= self._max:
-                _, old_handle = self._files.popitem(last=False)
+                old_key, old_handle = self._files.popitem(last=False)
                 try:
                     old_handle.close()
                 except Exception:
-                    pass
+                    logger.warning(
+                        "HDF5 read-handle close failed during LRU eviction "
+                        "for %s",
+                        old_key,
+                        exc_info=True,
+                    )
             handle = h5py.File(key, "r")
             self._files[key] = handle
             return handle
@@ -58,7 +67,12 @@ class H5FilePool:
                 try:
                     self._files.pop(key).close()
                 except Exception:
-                    pass
+                    logger.warning(
+                        "HDF5 read-handle close failed during explicit close "
+                        "for %s",
+                        key,
+                        exc_info=True,
+                    )
 
     def pause(self, path):
         """Close the cached handle and prevent reopening until resumed."""
@@ -69,7 +83,12 @@ class H5FilePool:
                 try:
                     self._files.pop(key).close()
                 except Exception:
-                    pass
+                    logger.warning(
+                        "HDF5 read-handle close failed during writer pause "
+                        "for %s",
+                        key,
+                        exc_info=True,
+                    )
 
     def resume(self, path):
         """Drop one pause depth; an unbalanced resume is a safe no-op."""
@@ -84,11 +103,15 @@ class H5FilePool:
     def close_all(self):
         """Best-effort close of every cached read handle."""
         with self._lock:
-            for handle in self._files.values():
+            for key, handle in self._files.items():
                 try:
                     handle.close()
                 except Exception:
-                    pass
+                    logger.warning(
+                        "HDF5 read-handle close failed during close-all for %s",
+                        key,
+                        exc_info=True,
+                    )
             self._files.clear()
 
 
