@@ -474,19 +474,29 @@ def test_3621_runtime_projection_is_two_phase_and_prefix_delta_only(
         processing_mode="Int 2D",
         live_update=True,
     )
-    assert tuple(requested[:-1]) == target
-    assert requested[-1] is target[-1]
+    assert requested == [target[-1], target[-1]]
+    assert controller.commit_navigation_projection(target)
 
-    # Non-accumulating modes retain their complete-projection API contract;
-    # re-entry therefore reseeds the selected domain.
+    # Average, Sum, Overlay, and Waterfall share one numeric trace scope.
+    # Switching presentation modes therefore retains the acknowledged
+    # history and resolves only the current heavy anchor.
+    requested.clear()
+    controller.project_navigation(
+        preferences=replace(preferences, plot_mode="Sum"),
+        processing_mode="Int 2D",
+        live_update=True,
+    )
+    assert requested == [target[-1], target[-1]]
+    assert controller.commit_navigation_projection(target)
+
     requested.clear()
     controller.project_navigation(
         preferences=preferences,
         processing_mode="Int 2D",
         live_update=True,
     )
-    assert tuple(requested[:-1]) == target
-    assert requested[-1] is target[-1]
+    assert requested == [target[-1], target[-1]]
+    assert controller.commit_navigation_projection(target)
 
     requested.clear()
     controller.project_navigation(

@@ -992,7 +992,7 @@ class _ContextRuntime:
         accumulating = (not viewer_1d and
             preferences is not None
             and getattr(preferences, "plot_mode", None)
-            in {"Overlay", "Waterfall"}
+            in {"Overlay", "Average", "Sum", "Waterfall"}
         )
         pending: _PendingTraceProjection | None = None
         if viewer_1d:
@@ -1039,9 +1039,9 @@ class _ContextRuntime:
         else:
             if preferences is not None:
                 # Leaving an accumulating mode invalidates its projection
-                # ledger.  Non-view consumers still require a complete
-                # Single/Average/Sum projection; changing that API to a delta
-                # would need a separate projection-owner redesign.
+                # ledger.  Single still requires exact-current projection;
+                # the multi-frame presentation modes share the acknowledged
+                # detached-history delta contract above.
                 self._reset_trace_projection()
             else:
                 self._pending_trace_projection = None
