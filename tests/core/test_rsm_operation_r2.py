@@ -42,6 +42,10 @@ from xrd_tools.analysis.rsm_operation import (
     prepare_rsm_operation_v2,
     run_rsm_operation_v2,
 )
+from xrd_tools.core.allocator_pressure import (
+    AllocatorPressureCallFailed,
+    AllocatorPressureUnavailable,
+)
 from xrd_tools.core.geometry import Diffractometer, PixelQMap
 from xrd_tools.core.geometry.xu_runtime import XuRuntimeUnsupported
 from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
@@ -918,6 +922,238 @@ def test_science_release_failure_never_admits_or_writes(tmp_path, monkeypatch):
     assert result.terminal.disposition is ModuleDisposition.REFUSED
     assert result.terminal.code == "RSM_CHUNK_RELEASE_FAILED"
     assert not Path(prepared.module.output.target).exists()
+
+
+def test_allocator_pressure_unavailable_refuses_before_science_or_output(
+    tmp_path,
+    monkeypatch,
+):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    prepared = prepare_rsm_tool_v2(
+        _form(tmp_path, (_write_member(tmp_path, 0),))
+    ).request
+    monkeypatch.setattr(
+        rsm_operation,
+        "bind_darwin_allocator_pressure_relief",
+        lambda: (_ for _ in ()).throw(AllocatorPressureUnavailable()),
+    )
+    monkeypatch.setattr(
+        rsm_operation,
+        "StreamingGridder",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unavailable allocator pressure must stop before science")
+        ),
+    )
+
+    result = run_rsm_operation_v2(prepared)
+
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "RSM_ALLOCATOR_PRESSURE_UNAVAILABLE"
+    assert not Path(prepared.module.output.target).exists()
+
+
+def test_xu_platform_refusal_precedes_darwin_allocator_binding(
+    tmp_path,
+    monkeypatch,
+):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+    import xrd_tools.core.geometry.xu_runtime as xu_runtime
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    prepared = prepare_rsm_tool_v2(
+        _form(tmp_path, (_write_member(tmp_path, 0),))
+    ).request
+
+    class UnsupportedRuntime:
+        execution_record = None
+
+        def __enter__(self):
+            raise XuRuntimeUnsupported("XU_PLATFORM_UNVALIDATED")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        xu_runtime,
+        "xu_runtime_session",
+        lambda *_args, **_kwargs: UnsupportedRuntime(),
+    )
+    monkeypatch.setattr(
+        rsm_operation,
+        "bind_darwin_allocator_pressure_relief",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("unvalidated platform must refuse before Darwin binding")
+        ),
+    )
+
+    result = run_rsm_operation_v2(prepared)
+
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "XU_PLATFORM_UNVALIDATED"
+    assert not Path(prepared.module.output.target).exists()
+
+
+@pytest.mark.parametrize("fail_at_call", (1, 2))
+def test_allocator_pressure_call_failure_is_bounded_and_writes_nothing(
+    tmp_path,
+    monkeypatch,
+    fail_at_call,
+):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    prepared = prepare_rsm_tool_v2(
+        _form(tmp_path, (_write_member(tmp_path, 0),))
+    ).request
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda _self, index: np.full(
+            (195, 487),
+            10 + int(index),
+            dtype=np.float64,
+        ),
+    )
+    calls = []
+
+    class FailingPressure:
+        def relieve(self) -> None:
+            calls.append(len(calls) + 1)
+            if len(calls) == fail_at_call:
+                raise AllocatorPressureCallFailed()
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "bind_darwin_allocator_pressure_relief",
+        lambda: FailingPressure(),
+    )
+    monkeypatch.setattr(
+        rsm_operation,
+        "admit_module_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("allocator-pressure failure must stop before admission")
+        ),
+    )
+
+    result = run_rsm_operation_v2(prepared)
+
+    assert result.terminal.disposition is ModuleDisposition.FAILED
+    assert result.terminal.code == "RSM_ALLOCATOR_PRESSURE_FAILED"
+    assert calls == list(range(1, fail_at_call + 1))
+    assert not Path(prepared.module.output.target).exists()
+
+
+def test_allocator_pressure_runs_at_two_root_death_fences_only(
+    tmp_path,
+    monkeypatch,
+):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    members = (_write_member(tmp_path, 0), _write_member(tmp_path, 1))
+    prepared = prepare_rsm_tool_v2(_form(tmp_path, members)).request
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda self, index: np.full(
+            (195, 487),
+            10
+            + int(str(self.name).split(" [", 1)[0].rsplit("_", 1)[-1])
+            + int(index),
+            dtype=np.float64,
+        ),
+    )
+    real_make_lease = rsm_operation._make_rsm_v2_chunk_lease
+    lease_root_refs = []
+
+    def capture_lease_roots(*args, **kwargs):
+        lease = real_make_lease(*args, **kwargs)
+        lease_root_refs.extend(
+            (lease._raw_root_ref, lease._conditioned_root_ref)
+        )
+        return lease
+
+    real_to_volume = rsm_operation.StreamingGridder.to_volume
+    gridder_refs = []
+    volume_root_refs = []
+
+    def capture_final_roots(gridder):
+        gridder_refs.append(weakref.ref(gridder))
+        volume = real_to_volume(gridder)
+        volume_root_refs.append(weakref.ref(volume.intensity))
+        return volume
+
+    calls = []
+
+    class RecordingPressure:
+        __slots__ = ()
+
+        def relieve(self) -> None:
+            assert lease_root_refs
+            assert all(reference() is None for reference in lease_root_refs)
+            if not volume_root_refs:
+                calls.append("pre-finalization")
+                return
+            assert all(reference() is None for reference in volume_root_refs)
+            assert all(reference() is None for reference in gridder_refs)
+            calls.append("post-projection")
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_make_rsm_v2_chunk_lease",
+        capture_lease_roots,
+    )
+    monkeypatch.setattr(
+        rsm_operation.StreamingGridder,
+        "to_volume",
+        capture_final_roots,
+    )
+    monkeypatch.setattr(
+        rsm_operation,
+        "bind_darwin_allocator_pressure_relief",
+        lambda: RecordingPressure(),
+    )
+
+    result = run_rsm_operation_v2(prepared)
+
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED
+    assert calls == ["pre-finalization", "post-projection"]
+    assert len(lease_root_refs) == 8
+    assert len(gridder_refs) == len(volume_root_refs) == 1
 
 
 @pytest.mark.parametrize(
