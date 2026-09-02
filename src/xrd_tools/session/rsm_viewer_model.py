@@ -373,6 +373,26 @@ def make_rsm_viewer_state(
     l_index: int | None = None,
 ) -> RSMViewerState:
     fingerprint = _require_digest(result_fingerprint)
+    indices = _resolve_rsm_viewer_indices(
+        shape,
+        h_index=h_index,
+        k_index=k_index,
+        l_index=l_index,
+    )
+    return RSMViewerState(
+        fingerprint,
+        *indices,
+        _RSM_VIEWER_FACTORY,
+    )
+
+
+def _resolve_rsm_viewer_indices(
+    shape: tuple[int, int, int],
+    *,
+    h_index: int | None = None,
+    k_index: int | None = None,
+    l_index: int | None = None,
+) -> tuple[int, int, int]:
     if (
         type(shape) is not tuple
         or len(shape) != 3
@@ -389,11 +409,7 @@ def make_rsm_viewer_state(
         for value, size in zip(indices, shape, strict=True)
     ):
         raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
-    return RSMViewerState(
-        fingerprint,
-        *indices,
-        _RSM_VIEWER_FACTORY,
-    )
+    return indices
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -932,33 +948,50 @@ class RSMViewerModel:
             and self._values is not values
         ):
             raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
-        state = make_rsm_viewer_state(
-            result,
-            values.shape,
-            h_index=h_index,
-            k_index=k_index,
-            l_index=l_index,
-        )
-        snapshot_key = (result, state.fingerprint)
-        cached_snapshot = self._snapshots.get(snapshot_key)
-        if cached_snapshot is not None:
-            component_pairs = tuple(zip(
-                _component_keys(state),
-                cached_snapshot.products,
-                strict=True,
-            ))
-            for component_key, product in component_pairs:
-                if self._components.get(component_key) is not product:
-                    raise RuntimeError("RSM viewer cache snapshot is orphaned")
-            self._snapshots.move_to_end(snapshot_key)
-            for component_key, _product in component_pairs:
-                self._components.move_to_end(component_key)
-            self._current = cached_snapshot
-            self._result_fingerprint = result
-            self._values = values
-            return cached_snapshot
-
         try:
+            result = _require_digest(result)
+            indices = _resolve_rsm_viewer_indices(
+                values.shape,
+                h_index=h_index,
+                k_index=k_index,
+                l_index=l_index,
+            )
+            cached_key: _SnapshotKey | None = None
+            cached_snapshot: RSMViewerSnapshot | None = None
+            if self._result_fingerprint == result:
+                for key, snapshot in self._snapshots.items():
+                    cached_state = snapshot.state
+                    if (
+                        cached_state.result_fingerprint == result
+                        and cached_state.h_index == indices[0]
+                        and cached_state.k_index == indices[1]
+                        and cached_state.l_index == indices[2]
+                    ):
+                        cached_key = key
+                        cached_snapshot = snapshot
+                        break
+            if cached_key is not None and cached_snapshot is not None:
+                component_pairs = tuple(zip(
+                    _component_keys(cached_snapshot.state),
+                    cached_snapshot.products,
+                    strict=True,
+                ))
+                for component_key, product in component_pairs:
+                    if self._components.get(component_key) is not product:
+                        raise RuntimeError("RSM viewer cache snapshot is orphaned")
+                self._snapshots.move_to_end(cached_key)
+                for component_key, _product in component_pairs:
+                    self._components.move_to_end(component_key)
+                self._current = cached_snapshot
+                self._result_fingerprint = result
+                self._values = values
+                return cached_snapshot
+
+            state = RSMViewerState(
+                result,
+                *indices,
+                _RSM_VIEWER_FACTORY,
+            )
             required_bytes = _snapshot_shape_bytes(values.shape)
             if required_bytes > _MAX_RSM_VIEWER_CACHE_BYTES:
                 raise RSMViewerRefused("RSM_VIEW_PRODUCT_TOO_LARGE")

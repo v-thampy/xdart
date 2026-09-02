@@ -470,9 +470,29 @@ def test_snapshot_hit_reads_no_source_and_performs_no_calculation(monkeypatch):
     monkeypatch.setattr(module, "_freeze_float32", forbidden)
     monkeypatch.setattr(module, "_snapshot_fingerprint", forbidden)
     monkeypatch.setattr(module, "_finite_count", forbidden)
+    monkeypatch.setattr(module, "analysis_canonical_fingerprint", forbidden)
     monkeypatch.setattr(RSMViewerValues, "axes", property(forbidden))
     monkeypatch.setattr(RSMViewerValues, "intensity", property(forbidden))
     assert model.snapshot() is snapshot
+
+
+def test_state_fingerprint_memory_failure_is_stable_and_nonmutating(monkeypatch):
+    values = _values((4, 4, 4))
+    model = RSMViewerModel()
+    baseline = model.snapshot(values)
+    facts = _cache_facts(model)
+    real_fingerprint = module.analysis_canonical_fingerprint
+
+    def fail_state(domain, payload):
+        if domain == "rsm-viewer-state-v1":
+            raise MemoryError("injected state fingerprint allocation")
+        return real_fingerprint(domain, payload)
+
+    monkeypatch.setattr(module, "analysis_canonical_fingerprint", fail_state)
+    with pytest.raises(RSMViewerRefused, match="RSM_VIEW_PRODUCT_TOO_LARGE"):
+        model.snapshot(l_index=0)
+    assert _cache_facts(model) == facts
+    assert model.current_snapshot is baseline
 
 
 @pytest.mark.parametrize(
