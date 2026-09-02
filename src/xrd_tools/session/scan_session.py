@@ -82,6 +82,7 @@ from xrd_tools.reduction.core import (
     WriterBatchSettlementReceipt,
     _cancel_requested,
     _request_cancel,
+    _worker_process_requires_corrected_image,
 )
 from .dynamic_accounting import (
     DynamicAttemptState,
@@ -186,10 +187,11 @@ class _EventSink:
     ``write``/``replace`` fire the completion callback on the writer thread.
 
     Forwarding the *optional* hooks (``replace``/``abort``/``worker_process``/
-    ``flush``) is essential — defining them unconditionally would otherwise make
-    the engine treat a plain sink as replace/abort-capable, or (if omitted)
-    disable the parallel ``worker_process`` thumbnail path.  Each forwards to the
-    inner sink only when the inner sink actually provides it.
+    ``flush``) and the worker corrected-image capability is essential — defining
+    hooks unconditionally would otherwise make the engine treat a plain sink as
+    replace/abort-capable, while dropping the capability would restore a
+    discarded full-frame copy.  Each forwards only when the inner sink provides
+    the corresponding hook.
     """
 
     def __init__(self, inner, on_completed: Callable[[Frame, Any], None], *,
@@ -201,6 +203,9 @@ class _EventSink:
         worker_process = getattr(inner, "worker_process", None)
         if callable(worker_process):
             self.worker_process = worker_process
+            self.worker_process_requires_corrected_image = (
+                _worker_process_requires_corrected_image(inner)
+            )
 
     def begin(self, scan, plan) -> None:
         if self._inner is not None:

@@ -609,6 +609,16 @@ class ReductionPlan:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkerThumbnailPrep:
+    """Transient worker-only thumbnail facts resolved during reduction."""
+
+    resolved_mask: np.ndarray | None
+
+
+_THUMBNAIL_MASK_UNSET = object()
+
+
 @dataclass(slots=True)
 class FrameReduction:
     """Reduction products for one frame."""
@@ -626,6 +636,12 @@ class FrameReduction:
     )
     thumbnail: np.ndarray | None = field(default=None, repr=False, compare=False)
     _thumbnail_mask_baked: bool = field(default=False, repr=False, compare=False)
+    _worker_thumbnail_prep: _WorkerThumbnailPrep | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
     write_frame_record: bool = True
 
 
@@ -756,7 +772,10 @@ class ReductionSink(Protocol):
       ``finish``.
     * ``worker_process(frame, reduction)`` — per-frame prep run on the POOL
       worker thread (NOT the writer), e.g. a thumbnail; lets expensive per-frame
-      work fan out instead of serializing on the writer.
+      work fan out instead of serializing on the writer.  Hooks receive the
+      transient float32 ``corrected_image`` by default.  A hook that can build
+      its result from the frame may expose the exact boolean capability
+      ``worker_process_requires_corrected_image = False`` to skip that copy.
     * ``flush(*, force=False)`` — force pending buffered output to its backing
       store (pause / end-of-run).  The save *cadence* (when to call it) is the
       caller's policy (e.g. xdart's ``FlushPolicy``), not the sink's — see
@@ -788,12 +807,23 @@ class MemorySink:
         return None
 
 
+def _worker_process_requires_corrected_image(sink: object) -> bool:
+    """Conservatively probe the optional worker corrected-image capability."""
+    value = getattr(sink, "worker_process_requires_corrected_image", True)
+    return value if type(value) is bool else True
+
+
 @dataclass(frozen=True, slots=True)
 class CompositeSink:
     """Fan out reduction products to multiple sinks."""
 
     sinks: tuple[ReductionSink, ...]
     worker_process: Any = field(default=None, init=False, repr=False)
+    worker_process_requires_corrected_image: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+    )
     output_receipt_capabilities: frozenset[OutputReceiptCapability] = field(
         default_factory=frozenset, init=False,
     )
@@ -827,14 +857,22 @@ class CompositeSink:
         sizes = (_sink_writer_batch_size(sink) for sink in self.sinks)
         object.__setattr__(self, "writer_batch_size", max(sizes, default=1))
         workers = tuple(
-            hook for sink in self.sinks
+            (sink, hook) for sink in self.sinks
             if callable(hook := getattr(sink, "worker_process", None))
         )
         if workers:
             def process(frame, reduction):
-                for hook in workers:
+                for _sink, hook in workers:
                     hook(frame, reduction)
             object.__setattr__(self, "worker_process", process)
+            object.__setattr__(
+                self,
+                "worker_process_requires_corrected_image",
+                any(
+                    _worker_process_requires_corrected_image(sink)
+                    for sink, _hook in workers
+                ),
+            )
 
     def begin(self, scan: Scan, plan: ReductionPlan) -> None:
         self._begin(scan, plan, self._p0_order()[1])
@@ -1473,6 +1511,8 @@ class NexusSink:
     contract rather than claiming cross-session exclusion.  H23-C3 supplies
     the canonical GUI lock at its composition boundary.
     """
+
+    worker_process_requires_corrected_image = False
 
     path: Path | str
     entry: str = "entry"
@@ -2417,8 +2457,15 @@ class NexusSink:
         """Prepare the persisted thumbnail on the parallel reduction worker."""
         if reduction.thumbnail is not None:
             return
+        worker_prep = reduction._worker_thumbnail_prep
         prepared = self._prepare_frame_thumbnail(
-            frame, corrected_image=reduction.corrected_image,
+            frame,
+            corrected_image=reduction.corrected_image,
+            resolved_mask=(
+                _THUMBNAIL_MASK_UNSET
+                if worker_prep is None
+                else worker_prep.resolved_mask
+            ),
         )
         reduction.thumbnail, reduction._thumbnail_mask_baked = prepared
 
@@ -2430,6 +2477,7 @@ class NexusSink:
         frame: Frame,
         *,
         corrected_image: np.ndarray | None = None,
+        resolved_mask: np.ndarray | None | object = _THUMBNAIL_MASK_UNSET,
     ) -> tuple[np.ndarray | None, bool]:
         from xrd_tools.io.nexus_record import make_thumbnail_array
 
@@ -2437,37 +2485,39 @@ class NexusSink:
             return None, False
         raw = np.asarray(frame.image)
         if corrected_image is None:
-            image = np.asarray(raw, dtype=np.float32)
             background = frame.background
             if background is not None:
-                bg = np.asarray(background, dtype=np.float32)
-                if bg.shape == () or bg.shape == image.shape:
-                    image = image - bg
+                bg = np.asarray(background)
+                if bg.shape != () and bg.shape != raw.shape:
+                    background = None
+            image = _thumbnail_corrected_image(raw, background)
+            owns_image = True
         else:
             image = np.asarray(corrected_image, dtype=np.float32)
-        plan = self._plan
-        static_mask = None
-        if plan is not None:
-            static_mask = _as_bool_mask(
-                plan.mask, "ReductionPlan.mask", image_shape=raw.shape,
+            owns_image = False
+        if resolved_mask is _THUMBNAIL_MASK_UNSET:
+            plan = self._plan
+            static_mask = None
+            if plan is not None:
+                static_mask = _as_bool_mask(
+                    plan.mask, "ReductionPlan.mask", image_shape=raw.shape,
+                )
+                static_mask = _combined_mask(static_mask, frame.mask, raw.shape)
+            run_mask = self._run_saturation_mask
+            resolved_mask = (
+                run_mask.combine(static_mask, raw.shape)
+                if run_mask is not None and run_mask.seeded
+                else detector_value_mask(
+                    static_mask,
+                    raw,
+                    enabled=bool(plan is not None and plan.mask_saturation),
+                )
             )
-            static_mask = _combined_mask(static_mask, frame.mask, raw.shape)
-        run_mask = self._run_saturation_mask
-        resolved_mask = (
-            run_mask.combine(static_mask, raw.shape)
-            if run_mask is not None and run_mask.seeded
-            else detector_value_mask(
-                static_mask,
-                raw,
-                enabled=bool(plan is not None and plan.mask_saturation),
-            )
-        )
         return (
             make_thumbnail_array(
                 image,
-                mask_flat=(
-                    None if resolved_mask is None else np.flatnonzero(resolved_mask)
-                ),
+                mask=resolved_mask,
+                _owned=owns_image,
                 max_size=self.thumbnail_max,
             ),
             resolved_mask is not None,
@@ -3612,6 +3662,7 @@ class ReductionSession:
         """
         label = int(frame.index)
         worker_process = getattr(self._sink, "worker_process", None)
+        has_worker_process = callable(worker_process)
         _admission_trace("reduction_begin", label=label)
         compute_started = (
             time.perf_counter() if self._perf_quartiles_enabled else 0.0
@@ -3621,7 +3672,11 @@ class ReductionSession:
                 frame, image, self.plan, self._integrators, self._plan_masks,
                 self._frame_masks,
                 self.cancel_token, self._warned_monitor_keys,
-                include_corrected_image=callable(worker_process),
+                include_corrected_image=(
+                    has_worker_process
+                    and _worker_process_requires_corrected_image(self._sink)
+                ),
+                include_worker_thumbnail_prep=has_worker_process,
                 run_saturation_mask=self._run_saturation_mask,
                 strict=self.strict,
             )
@@ -3634,7 +3689,7 @@ class ReductionSession:
         _admission_trace("reduction_end", label=label)
         prep_error: BaseException | None = None
         try:
-            if callable(worker_process):
+            if has_worker_process:
                 _admission_trace("worker_process_begin", label=label)
                 worker_process(frame, reduction)
                 _admission_trace("worker_process_end", label=label)
@@ -3642,6 +3697,7 @@ class ReductionSession:
             prep_error = exc
         finally:
             reduction.corrected_image = None
+            reduction._worker_thumbnail_prep = None
         return reduction, prep_error
 
     def _emit_accepted(self, frame: Frame, publish_acceptance:
@@ -5129,6 +5185,7 @@ def _reduce_frame(
     warned_monitor_keys: set[str] | None = None,
     *,
     include_corrected_image: bool = False,
+    include_worker_thumbnail_prep: bool = False,
     run_saturation_mask: _RunSaturationMask | None = None,
     strict: StrictPolicy | None = None,
 ) -> FrameReduction:
@@ -5292,7 +5349,7 @@ def _reduce_frame(
             "per-frame instead of raising."
         )
     mode_1d, mode_2d = _plan_mode_keys(plan)
-    return FrameReduction(
+    reduction = FrameReduction(
         frame_index=frame.index,
         result_1d=r1d,
         result_2d=r2d,
@@ -5301,6 +5358,9 @@ def _reduce_frame(
         metadata=dict(frame.metadata),
         corrected_image=corrected_image,
     )
+    if include_worker_thumbnail_prep:
+        reduction._worker_thumbnail_prep = _WorkerThumbnailPrep(mask)
+    return reduction
 
 
 def _thumbnail_corrected_image(
@@ -5309,12 +5369,14 @@ def _thumbnail_corrected_image(
 ) -> np.ndarray:
     """Return a float32 raw-minus-background image for transient thumbnails."""
     raw = np.asarray(raw_image)
+    corrected = np.array(raw, dtype=np.float32, copy=True)
     if background is None:
-        return np.array(raw, dtype=np.float32, copy=True)
+        return corrected
     bg = np.asarray(background, dtype=np.float32)
     if bg.ndim == 0 and float(bg) == 0.0:
-        return np.array(raw, dtype=np.float32, copy=True)
-    return np.asarray(raw, dtype=np.float32) - bg
+        return corrected
+    np.subtract(corrected, bg, out=corrected)
+    return corrected
 
 
 def _apply_thresholds(image: np.ndarray, plan: ReductionPlan) -> np.ndarray:

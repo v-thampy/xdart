@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from xrd_tools.io import nexus_record
 
@@ -42,3 +43,45 @@ def test_make_thumbnail_array_single_mask_skips_sort_and_concatenate(
     assert np.isnan(thumbnail.flat[0])
     assert np.isnan(thumbnail.flat[8])
     assert np.count_nonzero(np.isnan(thumbnail)) == 2
+
+
+@pytest.mark.parametrize("max_size", [8, 4])
+def test_make_thumbnail_array_boolean_mask_matches_legacy_without_aliasing(
+    max_size,
+):
+    image = np.arange(48, dtype=np.float32).reshape(6, 8)
+    original = image.copy()
+    mask = np.zeros(image.shape, dtype=bool)
+    mask[1, 2] = True
+    mask[4, 6] = True
+    legacy = nexus_record.make_thumbnail_array(
+        image, mask_flat=np.flatnonzero(mask), max_size=max_size,
+    )
+
+    safe = nexus_record.make_thumbnail_array(
+        image, mask=mask, max_size=max_size,
+    )
+    scratch = image.copy()
+    owned = nexus_record.make_thumbnail_array(
+        scratch, mask=mask, max_size=max_size, _owned=True,
+    )
+
+    np.testing.assert_array_equal(image, original)
+    np.testing.assert_array_equal(safe, legacy)
+    np.testing.assert_array_equal(owned, legacy)
+    if max_size == 8:
+        assert owned is scratch
+
+
+def test_make_thumbnail_array_owned_contract_is_narrow_and_fail_closed():
+    image = np.arange(16, dtype=np.float32).reshape(4, 4)
+    mask = np.zeros(image.shape, dtype=bool)
+
+    with pytest.raises(TypeError, match="exact bool"):
+        nexus_record.make_thumbnail_array(image, mask=mask, _owned=1)
+    with pytest.raises(ValueError, match="writable owning float32"):
+        nexus_record.make_thumbnail_array(image[:, :2], mask=mask[:, :2], _owned=True)
+    with pytest.raises(ValueError, match="thumbnail mask"):
+        nexus_record.make_thumbnail_array(image, mask=np.zeros((2, 2), bool))
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        nexus_record.make_thumbnail_array(image, mask=mask, mask_flat=[0])

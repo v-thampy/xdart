@@ -318,26 +318,54 @@ def merge_frame_records(existing: FrameRecord, incoming: FrameRecord) -> FrameRe
 # Thumbnails
 # ---------------------------------------------------------------------------
 
-def make_thumbnail_array(image, *, mask_flat=None, global_mask_flat=None,
-                         max_size: int = THUMBNAIL_MAX):
+def make_thumbnail_array(image, *, mask=None, mask_flat=None,
+                         global_mask_flat=None, max_size: int = THUMBNAIL_MAX,
+                         _owned: bool = False):
     """Downsample a 2D image to at most ``(max_size, max_size)``.
 
-    Masked pixels (flat indices) become NaN *before* downsampling so the
-    mask is baked into the preview — viewers need no full-resolution mask.
-    Returns float32, or ``None`` for invalid input.
+    Masked pixels become NaN *before* downsampling so the mask is baked into
+    the preview — viewers need no full-resolution mask.  The legacy flat-index
+    inputs remain copy-safe.  ``_owned=True`` is an internal fast path for one
+    private, writable float32 scratch that may be consumed in place.  Returns
+    float32, or ``None`` for invalid input.
     """
     if image is None:
         return None
     source = np.asarray(image)
     if source.ndim != 2:
         return None
+    if type(_owned) is not bool:
+        raise TypeError("owned thumbnail input flag must be an exact bool")
+    if _owned and (
+        not isinstance(image, np.ndarray)
+        or source is not image
+        or source.dtype != np.dtype(np.float32)
+        or not source.flags.owndata
+        or not source.flags.writeable
+    ):
+        raise ValueError(
+            "owned thumbnail input must be a writable owning float32 ndarray"
+        )
+    if mask is not None and (mask_flat is not None or global_mask_flat is not None):
+        raise ValueError("boolean and flat thumbnail masks are mutually exclusive")
+    if _owned and (mask_flat is not None or global_mask_flat is not None):
+        raise ValueError("owned thumbnail input requires a boolean mask")
 
-    all_mask = []
-    if mask_flat is not None and len(mask_flat) > 0:
-        all_mask.append(np.asarray(mask_flat, dtype=np.intp).ravel())
-    if global_mask_flat is not None and len(global_mask_flat) > 0:
-        all_mask.append(np.asarray(global_mask_flat, dtype=np.intp).ravel())
-    if all_mask:
+    if mask is not None:
+        bool_mask = np.asarray(mask)
+        if bool_mask.dtype != np.dtype(bool) or bool_mask.shape != source.shape:
+            raise ValueError(
+                "boolean thumbnail mask must match the 2D image shape"
+            )
+        arr = source if _owned else np.array(source, dtype=np.float32, copy=True)
+        arr[bool_mask] = np.nan
+    else:
+        all_mask = []
+        if mask_flat is not None and len(mask_flat) > 0:
+            all_mask.append(np.asarray(mask_flat, dtype=np.intp).ravel())
+        if global_mask_flat is not None and len(global_mask_flat) > 0:
+            all_mask.append(np.asarray(global_mask_flat, dtype=np.intp).ravel())
+    if mask is None and all_mask:
         # Flat-index assignment is already idempotent, so sorting and
         # uniquing detector-sized masks only adds work to every frame.
         flat_mask = (
@@ -348,8 +376,8 @@ def make_thumbnail_array(image, *, mask_flat=None, global_mask_flat=None,
         ]
         arr = np.array(source, dtype=np.float32, copy=True)
         arr.ravel()[flat_mask] = np.nan
-    else:
-        arr = np.asarray(source, dtype=np.float32)
+    elif mask is None:
+        arr = source if _owned else np.asarray(source, dtype=np.float32)
 
     h, w = arr.shape
     if h <= max_size and w <= max_size:

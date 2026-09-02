@@ -13,6 +13,7 @@ from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.reduction import (
     CancelToken,
     Frame,
+    FrameReduction,
     GIMode,
     Integration1DPlan,
     Integration2DPlan,
@@ -1297,27 +1298,55 @@ def test_composite_nexus_sink_prepares_thumbnails_off_writer_thread(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    integration_masks: dict[int, np.ndarray | None] = {}
+
+    def observed_integrate(image, _ai, **kwargs):
+        integration_masks[int(image[0, 0]) - 1] = kwargs.get("mask")
+        return _r1d(float(np.sum(image)))
+
     monkeypatch.setattr(
         reduction_core,
         "integrate_1d",
-        lambda image, ai, **kwargs: _r1d(float(np.sum(image))),
+        observed_integrate,
     )
     prepare_threads: list[int] = []
     write_threads: list[int] = []
+    prepared_masks: dict[int, np.ndarray | None] = {}
+    prepared_images: list[np.ndarray] = []
     original_prepare = NexusSink._prepare_frame_thumbnail
     original_write = NexusSink._write_frame_record
 
-    def observed_prepare(self, frame, *, corrected_image=None):
+    def observed_prepare(
+        self, frame, *, corrected_image=None, resolved_mask=None,
+    ):
         prepare_threads.append(threading.get_ident())
-        return original_prepare(self, frame, corrected_image=corrected_image)
+        assert corrected_image is None
+        prepared_masks[int(frame.index)] = resolved_mask
+        return original_prepare(
+            self,
+            frame,
+            corrected_image=corrected_image,
+            resolved_mask=resolved_mask,
+        )
 
-    def observed_write(self, frame, reduction, *, prepared=None):
+    def observed_write(self, frame, reduction, **kwargs):
         write_threads.append(threading.get_ident())
-        return original_write(self, frame, reduction, prepared=prepared)
+        return original_write(self, frame, reduction, **kwargs)
 
     monkeypatch.setattr(NexusSink, "_prepare_frame_thumbnail", observed_prepare)
     monkeypatch.setattr(NexusSink, "_write_frame_record", observed_write)
+    from xrd_tools.io import nexus_record
+    original_thumbnail = nexus_record.make_thumbnail_array
+
+    def observed_thumbnail(image, **kwargs):
+        prepared_images.append(image)
+        assert kwargs["_owned"] is True
+        return original_thumbnail(image, **kwargs)
+
+    monkeypatch.setattr(nexus_record, "make_thumbnail_array", observed_thumbnail)
     out = tmp_path / "parallel-thumbnails.nexus"
+    mask = np.zeros((32, 24), dtype=bool)
+    mask[0, 1] = True
     frames = [
         Frame(index, image=np.full((32, 24), index + 1.0))
         for index in range(4)
@@ -1325,7 +1354,7 @@ def test_composite_nexus_sink_prepares_thumbnails_off_writer_thread(
     nexus = NexusSink(out, overwrite=True)
 
     result = run_reduction(
-        ReductionPlan(integration_2d=None),
+        ReductionPlan(integration_2d=None, mask=mask),
         Scan("scan", frames, integrator=object()),
         (nexus, MemorySink()),
         executor=2,
@@ -1334,9 +1363,78 @@ def test_composite_nexus_sink_prepares_thumbnails_off_writer_thread(
     assert result.n_processed == 4
     assert len(prepare_threads) == len(write_threads) == 4
     assert set(prepare_threads).isdisjoint(write_threads)
+    assert all(
+        prepared_masks[index] is integration_masks[index]
+        for index in range(4)
+    )
+    assert all(
+        image.dtype == np.float32
+        and image.flags.owndata
+        and image.flags.writeable
+        for image in prepared_images
+    )
     with h5py.File(out, "r") as h5:
         for index in range(4):
             assert f"entry/frames/frame_{index:04d}/thumbnail" in h5
+
+
+def test_nexus_disabled_thumbnails_allocate_no_corrected_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **kwargs: _r1d(float(np.sum(image))),
+    )
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("disabled thumbnails must allocate no scratch")
+
+    monkeypatch.setattr(reduction_core, "_thumbnail_corrected_image", fail)
+    result = run_reduction(
+        ReductionPlan(integration_2d=None),
+        Scan(
+            "scan",
+            [Frame(0, image=np.ones((8, 8), dtype=np.uint16))],
+            integrator=object(),
+        ),
+        NexusSink(
+            tmp_path / "no-thumbnails.nexus",
+            overwrite=True,
+            write_thumbnails=False,
+        ),
+        executor=1,
+    )
+
+    assert result.n_processed == 1
+
+
+def test_nexus_direct_thumbnail_fallback_is_copy_safe_on_zoom_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scipy.ndimage
+
+    raw = np.arange(64, dtype=np.uint16).reshape(8, 8)
+    original = raw.copy()
+    reduction = FrameReduction(0)
+    sink = NexusSink(tmp_path / "unused.nexus", thumbnail_max=2)
+    sink._plan = ReductionPlan(
+        integration_2d=None,
+        mask=np.eye(8, dtype=bool),
+    )
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("zoom failed")
+
+    monkeypatch.setattr(scipy.ndimage, "zoom", fail)
+    with pytest.raises(RuntimeError, match="zoom failed"):
+        sink.worker_process(Frame(0, image=raw), reduction)
+
+    np.testing.assert_array_equal(raw, original)
+    assert reduction.corrected_image is None
+    assert reduction.thumbnail is None
 
 
 def test_xye_sink_writes_on_bounded_owned_worker(

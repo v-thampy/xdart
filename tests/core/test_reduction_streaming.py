@@ -18,6 +18,7 @@ import pytest
 from xrd_tools.core.containers import IntegrationResult1D
 from xrd_tools.reduction import (
     CancelToken,
+    CompositeSink,
     Frame,
     MemorySink,
     NexusSink,
@@ -159,6 +160,91 @@ def test_worker_process_gets_transient_corrected_image(monkeypatch):
         np.asarray(frame.image, dtype=np.float32) - 1.0,
     )
     assert sink.frames[0].corrected_image is None
+
+
+@pytest.mark.parametrize("capability", [None, 0, "false"])
+def test_malformed_worker_copy_capability_fails_closed(monkeypatch, capability):
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **kw: _r1d(float(np.sum(image))),
+    )
+
+    class ThumbnailSink(MemorySink):
+        def __init__(self):
+            super().__init__()
+            self.worker_process_requires_corrected_image = capability
+            self.saw_corrected = False
+
+        def worker_process(self, _frame, reduction):
+            self.saw_corrected = reduction.corrected_image is not None
+
+    sink = ThumbnailSink()
+    _stream(_plan(), _frames(1), sink, executor=1)
+
+    assert sink.saw_corrected is True
+    assert sink.frames[0].corrected_image is None
+
+
+def test_composite_worker_copy_capability_is_recursive_and_conservative():
+    class CopyFreeSink(MemorySink):
+        worker_process_requires_corrected_image = False
+
+        def worker_process(self, _frame, _reduction):
+            return None
+
+    class LegacySink(MemorySink):
+        def worker_process(self, _frame, _reduction):
+            return None
+
+    class MalformedSink(LegacySink):
+        worker_process_requires_corrected_image = 0
+
+    copy_free = CompositeSink((CopyFreeSink(),))
+    assert copy_free.worker_process_requires_corrected_image is False
+    assert (
+        CompositeSink((copy_free, MemorySink()))
+        .worker_process_requires_corrected_image
+        is False
+    )
+    assert (
+        CompositeSink((copy_free, LegacySink()))
+        .worker_process_requires_corrected_image
+        is True
+    )
+    assert (
+        CompositeSink((copy_free, MalformedSink()))
+        .worker_process_requires_corrected_image
+        is True
+    )
+
+
+def test_worker_thumbnail_capsule_is_cleared_when_hook_raises(monkeypatch):
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **kw: _r1d(float(np.sum(image))),
+    )
+
+    class FailingSink(MemorySink):
+        worker_process_requires_corrected_image = False
+
+        def __init__(self):
+            super().__init__()
+            self.reduction = None
+
+        def worker_process(self, _frame, reduction):
+            self.reduction = reduction
+            assert reduction._worker_thumbnail_prep is not None
+            raise RuntimeError("thumbnail prep failed")
+
+    sink = FailingSink()
+    with pytest.raises(RuntimeError, match="thumbnail prep failed"):
+        _stream(_plan(), _frames(1), sink, executor=1)
+
+    assert sink.reduction is not None
+    assert sink.reduction._worker_thumbnail_prep is None
+    assert sink.reduction.corrected_image is None
 
 
 def test_run_reduction_defaults_to_streaming_for_durable_sink(monkeypatch):

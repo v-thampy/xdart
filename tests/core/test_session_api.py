@@ -1141,6 +1141,7 @@ def test_event_sink_exposes_worker_process_only_when_inner_sink_owns_it():
 
     plain = _EventSink(SimpleNamespace(), lambda _frame, _reduction: None)
     assert getattr(plain, "worker_process", None) is None
+    assert not hasattr(plain, "worker_process_requires_corrected_image")
 
     calls = []
     hooked = _EventSink(
@@ -1153,3 +1154,22 @@ def test_event_sink_exposes_worker_process_only_when_inner_sink_owns_it():
     assert callable(worker_process)
     worker_process("frame", "reduction")
     assert calls == [("frame", "reduction")]
+    assert hooked.worker_process_requires_corrected_image is True
+
+    copy_free = _EventSink(
+        SimpleNamespace(
+            worker_process=lambda _frame, _reduction: None,
+            worker_process_requires_corrected_image=False,
+        ),
+        lambda _frame, _reduction: None,
+    )
+    assert copy_free.worker_process_requires_corrected_image is False
+
+    malformed = _EventSink(
+        SimpleNamespace(
+            worker_process=lambda _frame, _reduction: None,
+            worker_process_requires_corrected_image=0,
+        ),
+        lambda _frame, _reduction: None,
+    )
+    assert malformed.worker_process_requires_corrected_image is True
