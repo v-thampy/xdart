@@ -487,7 +487,7 @@ def test_all_short_eiger_standard_outputs_match_explicit_mask(
     master = EIGER_ROOT / master_name
     poni = PONI.from_poni_file(EIGER_PONI)
     plan = _plan()
-    output = tmp_path / f"{master.stem}.nxs"
+    output = tmp_path / f"{master.stem}.nexus"
     source = _source(master, poni)
     result = run_reduction(
         plan,
@@ -564,7 +564,7 @@ def test_five_file_gi_directory_outputs_match_explicit_mask(
     source_path = GI_DIRECTORY / source_name
     poni = PONI.from_poni_file(GI_PONI)
     plan = _plan(gi=True)
-    output = tmp_path / f"{source_path.stem}.processed.nxs"
+    output = tmp_path / f"{source_path.stem}.processed.nexus"
     source = _source(source_path, poni)
     result = run_reduction(
         plan,

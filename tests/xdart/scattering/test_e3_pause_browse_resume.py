@@ -30,7 +30,7 @@ from xdart.gui.tabs.scattering.events import CleanupStatus
 from xdart.gui.tabs.scattering.start_outcomes import StartLaunched
 from xdart.gui.tabs.scattering.start_pipeline import StartPipeline
 from xdart.modules.display_context import ContextKind, new_context_token
-from xrd_tools.core import TwoDKind
+from xrd_tools.core import SourceKind, TwoDKind
 from xrd_tools.core.containers import IntegrationResult1D
 import xrd_tools.reduction.core as reduction_core
 from xrd_tools.session.intent_store import RunIntentStore
@@ -39,7 +39,7 @@ from xrd_tools.session.run_configuration import (
     RunIntent,
 )
 from xrd_tools.sources.selection import image_series_spec
-from xrd_tools.sources.discover import enumerate_candidates
+from xrd_tools.sources.discover import discover_scans, enumerate_candidates
 from xrd_tools.io import (
     FrameScalarCatalog,
     FrameScalarRow,
@@ -399,7 +399,16 @@ def test_explicit_processed_nexus_browse_reload_does_not_enter_raw_discovery(
     )
 
     discovered = enumerate_candidates(path.parent)
-    assert path not in {candidate.path for candidate in discovered}
+    candidate = next(item for item in discovered if item.path == path)
+    assert candidate.adapter_id == "nexus_hdf5"
+    assert path not in {
+        Path(item.uri)
+        for item in discover_scans(path.parent, SourceKind.NEXUS_STACK)
+    }
+    assert path in {
+        Path(item.uri)
+        for item in discover_scans(path.parent, SourceKind.PROCESSED_NEXUS)
+    }
 
     loader = BrowseLoader(max_items=32)
     contexts = []
@@ -418,9 +427,9 @@ def test_explicit_processed_nexus_browse_reload_does_not_enter_raw_discovery(
         assert context.load_generation == generation
         assert context.requested_path == str(path)
         assert context.scan_key == path.stem
-        assert path not in {
-            candidate.path
-            for candidate in enumerate_candidates(path.parent)
+        assert path in {
+            Path(item.uri)
+            for item in discover_scans(path.parent, SourceKind.PROCESSED_NEXUS)
         }
         loader.release_context(context)
         assert context.released is True
