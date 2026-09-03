@@ -48,7 +48,7 @@ from typing import Mapping, Sequence
 import h5py
 import numpy as np
 
-from .read import _decode, _entry, _frame_index, _resolve_positions
+from .read import _decode, _frame_index, _processed, _resolve_positions
 from .schema import SCHEMA
 
 __all__ = ["Aggregated1D", "Aggregated2D", "aggregate_1d", "aggregate_2d"]
@@ -130,7 +130,8 @@ def _aggregate_stack(scan_file, group_name, axis_names, *, method, frame, extra,
     units: list = [None] * len(axis_names)
 
     with h5py.File(Path(scan_file), "r") as f:
-        e = _entry(f, entry)
+        processed = _processed(f, entry, container=Path(scan_file))
+        e = processed.entry
         if group_name not in e:
             raise KeyError(f"{scan_file} has no {group_name} group")
         g = e[group_name]
@@ -138,7 +139,7 @@ def _aggregate_stack(scan_file, group_name, axis_names, *, method, frame, extra,
             axes[i] = np.asarray(g[name][()])
             units[i] = (_decode(g[name].attrs.get("units"))
                         if "units" in g[name].attrs else None)
-        frame_index = _frame_index(e, prefer=group_name)
+        frame_index = _frame_index(processed, prefer=group_name)
         positions, frames, _ = _resolve_positions(frame_index, frame)
         # Drop the on-disk rows the tail supersedes (dedup by LABEL), so a freshly
         # flushed-yet-resident frame is counted once, from the tail.

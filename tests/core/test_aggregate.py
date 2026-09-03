@@ -8,14 +8,13 @@ on-disk ⊕ in-memory-tail combine (deduped by label), and NaN handling.
 
 from __future__ import annotations
 
-import os
 import warnings
 
-import h5py
 import numpy as np
 import pytest
 
-from xrd_tools.io import aggregate_1d, aggregate_2d, get_1d
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.io import aggregate_1d, aggregate_2d, get_1d, write_nexus
 
 N_FRAMES = 100          # > the 64 store bound, on purpose (the Round-12 gate)
 N_Q = 12
@@ -25,7 +24,7 @@ LABELS = np.arange(1, N_FRAMES + 1, dtype=np.int32)   # 1-based
 
 @pytest.fixture
 def scan_file(tmp_path):
-    p = tmp_path / "agg_100frame.nxs"
+    p = tmp_path / "agg_100frame.nexus"
     q = np.linspace(0.5, 5.0, N_Q).astype(np.float32)
     q2 = np.linspace(0.5, 4.0, N_Q).astype(np.float32)
     chi = np.linspace(-180.0, 180.0, N_CHI, endpoint=False).astype(np.float32)
@@ -37,18 +36,27 @@ def scan_file(tmp_path):
     intensity_2d = np.tile(
         (np.arange(N_FRAMES) + 1.0)[:, None, None], (1, N_CHI, N_Q)).astype(np.float32)
 
-    with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        e.attrs["NX_class"] = "NXentry"
-        g1 = e.create_group("integrated_1d")
-        g1.create_dataset("intensity", data=intensity_1d)
-        qd = g1.create_dataset("q", data=q); qd.attrs["units"] = "1/angstrom"
-        g1.create_dataset("frame_index", data=LABELS)
-        g2 = e.create_group("integrated_2d")
-        g2.create_dataset("intensity", data=intensity_2d)
-        q2d = g2.create_dataset("q", data=q2); q2d.attrs["units"] = "1/angstrom"
-        cd = g2.create_dataset("chi", data=chi); cd.attrs["units"] = "deg"
-        g2.create_dataset("frame_index", data=LABELS)
+    results_1d = {
+        int(label): IntegrationResult1D(q, row, unit="q_A^-1")
+        for label, row in zip(LABELS, intensity_1d)
+    }
+    results_2d = {
+        int(label): IntegrationResult2D(
+            q2,
+            chi,
+            row.T,
+            unit="q_A^-1",
+            azimuthal_unit="chi_deg",
+        )
+        for label, row in zip(LABELS, intensity_2d)
+    }
+    write_nexus(
+        p,
+        results_1d=results_1d,
+        results_2d=results_2d,
+        compression=None,
+        overwrite=True,
+    )
     return p
 
 
@@ -58,7 +66,7 @@ def test_aggregate_1d_covers_all_frames_average_and_sum(scan_file):
     assert avg.n_frames == N_FRAMES
     np.testing.assert_allclose(avg.intensity[1:], np.mean(np.arange(1, N_FRAMES + 1)))  # 50.5
     assert np.isnan(avg.intensity[0])                       # all-NaN bin -> gap
-    assert avg.q_unit == "1/angstrom"
+    assert avg.q_unit == "q_A^-1"
     s = aggregate_1d(scan_file, method="sum")
     np.testing.assert_allclose(s.intensity[1:], np.sum(np.arange(1, N_FRAMES + 1)))  # 5050
     assert s.intensity[0] == 0.0                            # nansum of all-NaN -> 0
@@ -125,14 +133,14 @@ def test_aggregate_chunk_size_invariant(scan_file, chunk_size):
     np.testing.assert_allclose(a2.intensity, 50.5)
 
 
-def test_aggregate_normalizes_each_frame_before_reducing():
+def test_aggregate_normalizes_each_frame_before_reducing(tmp_path):
     # §2.B: the legacy display divides each frame by its normChannel BEFORE
     # collapsing; a naive disk-stacked nansum/nanmean is silently wrong with
     # normalization on.  norm={label: divisor} must divide per-row pre-reduce.
     n, nq = 20, 4
     intensity = np.tile((np.arange(n) + 1.0)[:, None], (1, nq)).astype(np.float32)
     labels = np.arange(1, n + 1, dtype=np.int32)
-    p = _write_1d_only(intensity, labels)
+    p = _write_1d_only(tmp_path / "normalized.nexus", intensity, labels)
     # divisor == the frame's own value -> every normalized row is 1.0 exactly.
     norm = {int(lbl): float(lbl) for lbl in labels}
     avg = aggregate_1d(p, method="average", norm=norm)
@@ -148,14 +156,14 @@ def test_aggregate_normalizes_each_frame_before_reducing():
     np.testing.assert_allclose(s_partial.intensity, 1.0 + np.sum(np.arange(2, n + 1)))
 
 
-def test_aggregate_average_uses_per_bin_finite_count():
+def test_aggregate_average_uses_per_bin_finite_count(tmp_path):
     # Average must divide each bin by the number of FINITE contributors, not N
     # (a nanmean-of-chunk-means would be wrong when NaN counts differ per chunk).
     n, nq = 10, 2
     intensity = np.tile((np.arange(n) + 1.0)[:, None], (1, nq)).astype(np.float32)
     intensity[0:5, 1] = np.nan                    # bin 1 finite only for frames 5..9
     labels = np.arange(1, n + 1, dtype=np.int32)
-    p = _write_1d_only(intensity, labels)
+    p = _write_1d_only(tmp_path / "finite-counts.nexus", intensity, labels)
     avg = aggregate_1d(p, method="average", chunk_size=3)   # chunk crosses the NaN edge
     np.testing.assert_allclose(avg.intensity[0], 5.5)        # mean(1..10)
     np.testing.assert_allclose(avg.intensity[1], 8.0)        # mean(6..10), not mean/10
@@ -163,13 +171,13 @@ def test_aggregate_average_uses_per_bin_finite_count():
     np.testing.assert_allclose(s.intensity[1], 40.0)         # 6+7+8+9+10
 
 
-def test_aggregate_post_divide_nonfinite_is_treated_as_missing():
+def test_aggregate_post_divide_nonfinite_is_treated_as_missing(tmp_path):
     # A zero/missing-monitor frame divides to inf/NaN; it must be dropped from
     # the fold (treated as missing), never poison the whole-bin aggregate.
     n, nq = 4, 2
     intensity = np.tile((np.arange(n) + 1.0)[:, None], (1, nq)).astype(np.float32)
     labels = np.arange(1, n + 1, dtype=np.int32)
-    p = _write_1d_only(intensity, labels)
+    p = _write_1d_only(tmp_path / "post-divide.nexus", intensity, labels)
     norm = {1: 0.0, 2: 1.0, 3: 1.0, 4: 1.0}       # frame 1 has a zero monitor
     s = aggregate_1d(p, method="sum", norm=norm)
     assert np.isfinite(s.intensity).all()
@@ -178,17 +186,17 @@ def test_aggregate_post_divide_nonfinite_is_treated_as_missing():
     np.testing.assert_allclose(avg.intensity, 3.0)             # mean(2,3,4)
 
 
-def _write_1d_only(intensity, labels):
-    """Write a minimal 1D-only processed file under a unique tmp path."""
-    import tempfile
+def _write_1d_only(path, intensity, labels):
+    """Write a 1D-only current processed file through the public writer."""
     q = np.linspace(0.5, 5.0, intensity.shape[1]).astype(np.float32)
-    fd, name = tempfile.mkstemp(suffix=".nxs")
-    os.close(fd)
-    with h5py.File(name, "w") as f:
-        e = f.create_group("entry")
-        e.attrs["NX_class"] = "NXentry"
-        g1 = e.create_group("integrated_1d")
-        g1.create_dataset("intensity", data=np.asarray(intensity, dtype=np.float32))
-        qd = g1.create_dataset("q", data=q); qd.attrs["units"] = "1/angstrom"
-        g1.create_dataset("frame_index", data=np.asarray(labels, dtype=np.int32))
-    return name
+    results = {
+        int(label): IntegrationResult1D(q, row, unit="q_A^-1")
+        for label, row in zip(labels, np.asarray(intensity, dtype=np.float32))
+    }
+    write_nexus(
+        path,
+        results_1d=results,
+        compression=None,
+        overwrite=True,
+    )
+    return path
