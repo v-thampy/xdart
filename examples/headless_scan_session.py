@@ -77,7 +77,7 @@ def main() -> int:
     states: list[StateChangeEvent] = []
 
     with tempfile.TemporaryDirectory() as tmp:
-        nxs = Path(tmp) / "session_demo.nxs"
+        nxs = Path(tmp) / "session_demo.nexus"
 
         with ScanSession(plan, scan, sink=NexusSink(nxs, overwrite=True),
                          executor=2) as session:
@@ -94,7 +94,7 @@ def main() -> int:
             session.resume()
             for fr in frames[N_FRAMES // 2:]:
                 session.submit(fr)
-        # __exit__ -> finish(): writer drained, .nxs finalized.
+        # __exit__ -> finish(): writer drained, .nexus finalized.
 
     # --- assert the contract -------------------------------------------------
     assert len(completed) == N_FRAMES, len(completed)

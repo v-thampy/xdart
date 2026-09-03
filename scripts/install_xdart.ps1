@@ -71,7 +71,7 @@ if ($LASTEXITCODE -ne 0) { throw "pixi install failed" }
 
 # Sanity: h5py from the pixi env AND a real LZ4 write/read round-trip through
 # hdf5plugin — a broken hdf5plugin makes the xdart writer silently fall back to
-# UNCOMPRESSED stacks (~4x bigger .nxs files).
+# UNCOMPRESSED stacks (~4x bigger .nexus files).
 $SanityPy = @"
 import h5py, hdf5plugin, numpy as np, os, tempfile
 assert '.pixi' in h5py.__file__, f'h5py not from the pixi env: {h5py.__file__}'

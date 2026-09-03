@@ -66,7 +66,7 @@ def discover_processed_scans(
 ) -> list[Path]:
     """Return naturally sorted processed 1-D NeXus files under ``directory``.
 
-    Acquisition NeXus files and unrelated ``.nxs`` files can live beside
+    Acquisition NeXus files and unrelated HDF5/NeXus files can live beside
     processed results.  Inspect only their lightweight metadata here; the 1-D
     stacks remain untouched until :func:`load_time_resolved_series` is called.
 
@@ -293,7 +293,7 @@ def load_time_resolved_series(
     Parameters
     ----------
     paths
-        A processed file, a directory of ``*.nxs`` files, or explicit files.
+        A processed ``.nexus`` file, a directory of them, or explicit files.
     frame_period_s
         Scalar period for every file, a mapping keyed by full path/name/stem,
         or ``None``. It is used only when explicit persisted timing is not

@@ -13,7 +13,7 @@ script.  A reader should be able to see, one-to-one, that:
     backend / corrections — is the ``StitchPlan`` cell.
 
 It then RUNS the plan (``run_stitch`` → an ``AnalysisResult`` whose ``.payload``
-is an ``IntegrationResult1D``), PERSISTS it to a temp ``.nxs``
+is an ``IntegrationResult1D``), PERSISTS it to a temp ``.nexus``
 (``write_stitched`` + ``StitchPlan.provenance()``), READS it back
 (``read_stitched``), and proves the section-3 RELOAD path
 (``StitchPlan.from_provenance``) reconstructs the processing options.
@@ -38,7 +38,7 @@ from xrd_tools.core.geometry import DetectorCalibration, Diffractometer
 from xrd_tools.core.scan import ScanFrame
 from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
 from xrd_tools.corrections.stack import CorrectionStack
-from xrd_tools.io.nexus import read_stitched, write_stitched
+from xrd_tools.io.nexus import read_stitched, write_nexus, write_stitched
 from xrd_tools.sources import MemoryFrameSource
 
 # A small Pilatus-100k-shaped detector for the whole demo.
@@ -82,7 +82,7 @@ def _data_source() -> MemoryFrameSource:
 # onto the motor names in Section 1 (psic: rot1<-nu, rot2<-del, incidence<-eta).
 # Wrapping the PONI in a DetectorCalibration is what lets the histogram backend
 # build a calibrated per-frame integrator instead of a hardwired deg2rad guess.
-# This whole object is what persists under /entry/diffractometer in the .nxs.
+# This whole object is what persists under /entry/diffractometer in the .nexus.
 def _instrument() -> Diffractometer:
     base = PONI(
         dist=0.2,
@@ -209,14 +209,22 @@ def main() -> int:
     )
 
     with tempfile.TemporaryDirectory() as tmp:
-        nxs = Path(tmp) / "stitched_demo.nxs"
+        nxs = Path(tmp) / "stitched_demo.nexus"
 
         # --- PERSIST: write the pyfai_hist result + its plan provenance ----
         import h5py
 
         prov = plan_hist.provenance()
-        with h5py.File(nxs, "w") as f:
-            entry = f.create_group("entry")
+        # Seed the container through the public processed-record writer so the
+        # file carries the current schema identity and a genuine result graph.
+        write_nexus(
+            nxs,
+            results_1d={0: stitched_hist},
+            overwrite=True,
+            compression=None,
+        )
+        with h5py.File(nxs, "r+") as f:
+            entry = f["entry"]
             write_stitched(entry, stitched_1d=stitched_hist, provenance=prov)
 
         # --- READ BACK: intensity + provenance round-trip ------------------

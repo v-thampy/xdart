@@ -3,7 +3,7 @@
 
 Plot per-frame scan metadata: any column vs any column, several overlaid to
 compare, with an optional normalization column (y / norm).  NOT tied to the
-loaded ``.nxs`` — a source picker opens any "scan" the headless source layer
+loaded processed ``.nexus`` — a source picker opens any "scan" the headless source layer
 classifies (processed NeXus / Eiger / TIFF-or-RAW sequence / SPEC) via
 ``xrd_tools.sources``; the per-frame columns come from
 ``xrd_tools.io.read_scan_data`` (processed NeXus) or the source's own metadata.
@@ -107,8 +107,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
         # picked source IS the loaded scan), or None.
         self._mask_provider = mask_provider
         # ``lock_provider(uri)`` returns the writer-coordinating file_lock when
-        # the picked source IS the loaded (possibly live-writing) scan's .nxs,
-        # else None — the dialog's .nxs reads enter it so they cannot race the
+        # the picked source IS the loaded (possibly live-writing) processed
+        # .nexus, else None — the dialog's processed reads enter it so they cannot race the
         # live writer's `r+` saves (the display readers' _locked_scan_read rule).
         self._lock_provider = lock_provider
         self._source_spec = None
@@ -309,7 +309,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self._update_roi_button()
 
     def _read_locked(self, uri):
-        """Context for a ``.nxs`` read of ``uri`` — the provider's
+        """Context for a processed ``.nexus`` read of ``uri`` — the provider's
         writer-coordinating lock when ``uri`` is the loaded scan's data file,
         else a no-op."""
         from contextlib import nullcontext

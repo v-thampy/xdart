@@ -208,7 +208,7 @@ class StitchPlan:
     ) -> "StitchPlan":
         """Rebuild a StitchPlan from a :meth:`provenance` dict — the reload half of
         the round-trip (e.g. to repopulate the GUI processing panel from a saved
-        ``.nxs``).
+        ``.nexus``).
 
         Only the **processing options** round-trip through provenance; the
         geometry (``diffractometer``/``base_poni``) + the binary ``mask`` are NOT

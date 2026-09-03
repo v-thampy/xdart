@@ -27,7 +27,7 @@ def main():
     # 1. Load your integrated 1-D pattern (q in Å⁻¹, intensity).
     # -----------------------------------------------------------------
     # [Placeholder] Replace with your real data (e.g. xrd_tools.io.get_1d on a
-    # processed .nxs).  The dummy noise below just lets the script run end-to-end.
+    # processed .nexus).  The dummy noise below just lets the script run end-to-end.
     q_array = np.linspace(1.5, 4.5, 1000)
     intensity_array = np.random.normal(10, 1, size=1000)
 

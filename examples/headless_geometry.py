@@ -222,7 +222,7 @@ def main() -> int:
                       cal.poni.rot2 + np.deg2rad(motors["del"][-1]))
 
     # Persist + round-trip the SECTION-2 instrument record (the /entry/
-    # diffractometer blob): JSON is the round-trippable form the .nxs carries.
+    # diffractometer blob): JSON is the round-trippable form the .nexus carries.
     with tempfile.TemporaryDirectory() as tmp:
         blob = Path(tmp) / "diffractometer.json"
         blob.write_text(diff.to_json())

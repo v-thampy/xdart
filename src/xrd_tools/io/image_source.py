@@ -15,7 +15,7 @@ primitives (:func:`get_raw_frame`, :func:`get_thumbnail`) and
   a resolvable raw source or a thumbnail exists.
 * :func:`load_image_frame` — a genuine raw detector frame (master / tiff /
   eiger), by 0-based index.
-* :func:`load_processed_raw_or_thumbnail` — for a processed ``.nxs``: the
+* :func:`load_processed_raw_or_thumbnail` — for a processed ``.nexus``: the
   full-resolution raw via the per-frame source pointer, else the dequantized
   thumbnail; the result records which one it returned so the caller never has
   to re-open the file to find out (and never re-applies a flat detector mask
@@ -62,8 +62,8 @@ _RAW_DATASET_CANDIDATES = (
 class ImageSourceKind(str, Enum):
     """What a file is, for image display."""
     RAW_MASTER = "raw_master"            # genuine raw detector data (master/tiff/eiger)
-    PROCESSED_XDART = "processed_xdart"  # processed v2 .nxs with a resolvable raw source
-    THUMBNAIL_ONLY = "thumbnail_only"    # processed v2 .nxs, only dequantizable thumbnails
+    PROCESSED_XDART = "processed_xdart"  # current .nexus with a resolvable raw source
+    THUMBNAIL_ONLY = "thumbnail_only"    # current .nexus, only dequantizable thumbnails
     UNKNOWN = "unknown"                  # can't tell / unreadable
 
 

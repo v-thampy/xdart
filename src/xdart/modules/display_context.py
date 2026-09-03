@@ -209,7 +209,7 @@ class CommitGate:
 
     So the gate is held around the INSERT and nothing else.  ``cancel()`` runs
     on the GUI thread and therefore waits, at worst, for one bounded store
-    upsert — never for an ``.nxs`` open.  A request carries the epoch it was
+    upsert — never for a processed ``.nexus`` open.  A request carries the epoch it was
     minted under; once the epoch moves or the gate is cancelled, the request may
     read to completion but may insert nowhere.
 

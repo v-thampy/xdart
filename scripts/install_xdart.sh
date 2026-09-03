@@ -86,7 +86,7 @@ echo "==> Solving + installing (conda-forge stack + xdart[gui], one solve)"
 # Sanity: h5py from the pixi env AND a real LZ4 write/read round-trip through
 # hdf5plugin — import alone is not enough; a broken hdf5plugin makes the xdart
 # writer silently fall back to UNCOMPRESSED stacks (seen live: "Integrated-stack
-# compression = None" → ~4x bigger .nxs + I/O pressure on subsequent runs).
+# compression = None" → ~4x bigger .nexus + I/O pressure on subsequent runs).
 "$PIXI" run --manifest-path "$APP_ROOT/pixi.toml" python - <<'EOF'
 import h5py, hdf5plugin, numpy as np, os, tempfile
 assert '.pixi' in h5py.__file__, f"h5py not from the pixi env: {h5py.__file__}"

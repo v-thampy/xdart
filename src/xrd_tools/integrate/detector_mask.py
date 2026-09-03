@@ -6,7 +6,7 @@ module gaps, i.e. NON-pixels with no sensor behind them) only when an
 ``integrate*`` call receives ``mask=None``; an explicit mask **replaces** it.
 xrd-tools/xdart always pass an explicit mask (an empty index array means
 "mask nothing"), which silently disabled the geometric mask wherever the
-wrangler-built ``global_mask`` was absent — reintegrating an old ``.nxs`` with
+wrangler-built ``global_mask`` was absent — reintegrating an old processed file with
 no persisted mask, a PONI whose detector name doesn't resolve, or data whose
 gap pixels are zero-filled rather than sentinel-valued (smooth 1-D dips at the
 gap radii; bl17-2, 2026-07-12).

@@ -1763,7 +1763,7 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
     # 2D-raw panel: the raw-vs-thumbnail-vs-none decision (mask only on full
     # raw — §8 invariant).  UNIVERSAL raw-display policy: the Int 2D raw panel is
     # display-only, so ALWAYS prefer the (cheap, ~70x smaller) thumbnail and fall
-    # back to full-res RAW ONLY when no thumbnail exists (e.g. a no-.nxs run).  This
+    # back to full-res RAW ONLY when no thumbnail exists (e.g. a no-output run).  This
     # is the single consistent policy across Single/Overlay/Waterfall/Sum/Average,
     # and it keeps the live raw repaint cheap (thumbnail copy/levels/upload instead
     # of the full detector).  raw_image rect-scales the thumbnail to the true

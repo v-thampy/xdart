@@ -262,10 +262,10 @@ This only affects raw-frame read speed — pyFAI integration and the writer are
 unchanged. A pure-pip install works correctly, just slower on compressed
 detector data.
 
-### Output compression (lz4 default — reading `.nxs` outside xdart)
+### Output compression (lz4 default — reading `.nexus` outside xdart)
 
 xdart writes the integrated 1D/2D stacks with **lz4+shuffle** by default (fast,
-hdf5plugin filter 32004; ~gzip-class size). **Reading those `.nxs` files requires
+hdf5plugin filter 32004; ~gzip-class size). **Reading those `.nexus` files requires
 `hdf5plugin`** — a base dependency, so any xdart environment reads them
 fine. To read them with **stock h5py elsewhere** (a collaborator's plain notebook,
 a third-party tool, long-term archival) either install `hdf5plugin`, or write
@@ -435,7 +435,7 @@ see `xrd_tools.rsm` for the current parameters. Requires the `[rsm]` extra.)
 ### Reading processed scan files
 
 Once a scan has been reduced (by xdart or the headless pipeline) the results
-live in a v2 NeXus `.nxs` file. The `get_*` convenience readers pull 1D / 2D
+live in a current NeXus `.nexus` file. The `get_*` convenience readers pull 1D / 2D
 patterns, thumbnails, and metadata back out in one line — no xarray knowledge
 required. A processed file is a **scan**; each reader takes a **frame** index
 (or `None` for all frames).
@@ -445,13 +445,13 @@ from xrd_tools.io import (
     get_frames, get_metadata, get_1d, get_2d, get_thumbnail, open_scan,
 )
 
-get_frames("scan.nxs")              # frame labels
-meta = get_metadata("scan.nxs")     # sample, energy, wavelength, axes, motors
-q, intensity, sigma, unit, frames = get_1d("scan.nxs")    # all frames
-cake = get_2d("scan.nxs", 2)        # frame 2 — (chi, q) oriented
+get_frames("scan.nexus")              # frame labels
+meta = get_metadata("scan.nexus")     # sample, energy, wavelength, axes, motors
+q, intensity, sigma, unit, frames = get_1d("scan.nexus")    # all frames
+cake = get_2d("scan.nexus", 2)        # frame 2 — (chi, q) oriented
 
 # object-style sugar
-scan = open_scan("scan.nxs")
+scan = open_scan("scan.nexus")
 scan.frames, len(scan), scan.get_1d(2), scan.metadata
 ```
 
@@ -534,7 +534,7 @@ visualization of synchrotron X-ray diffraction data, built with PySide6 and
 pyqtgraph for high-performance interactive plotting. Live **and** batch
 acquisition stream through the **same** headless reduction spine (parallel
 pyFAI workers, single writer thread, fail-loud writes); the GUI reloads from
-the `.nxs` at end-of-batch.
+the `.nexus` artifact at end-of-batch.
 
 ### Key capabilities
 
@@ -601,14 +601,14 @@ complete datasets acquired in a single experiment.
 4. Adjust processing parameters as needed.
 5. Click Start.
 
-Results are saved as NeXus HDF5 files (`.nxs`) in the output directory. Batch
+Results are saved as NeXus HDF5 files (`.nexus`) in the output directory. Batch
 mode is a performance switch: it runs silently (no per-frame display refresh),
-then the GUI reloads from the `.nxs` at end-of-batch.
+then the GUI reloads from the `.nexus` artifact at end-of-batch.
 
 #### Append vs Replace
 
 The write-mode toggle (Cmd+Shift+A) controls whether a run **appends** new
-frames to the existing processed `.nxs` or **replaces** it. Re-running Append
+frames to the existing processed `.nexus` or **replaces** it. Re-running Append
 on an already-processed scan is near-instant: frames already in the output are
 skipped without re-reading the raw data. If the current processing
 configuration no longer matches the existing scan (e.g. you switched Standard
@@ -730,7 +730,7 @@ Masks are saved with your results in the NeXus file for reproducibility.
 
 #### Data export and saving
 
-- **Automatic export**: processed 1D/2D data is saved as NeXus HDF5 (`.nxs`)
+- **Automatic export**: processed 1D/2D data is saved as NeXus HDF5 (`.nexus`)
   during batch processing.
 - **Manual export**: use the **Save** button in the display area to export the
   currently displayed pattern.

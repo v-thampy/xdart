@@ -376,7 +376,7 @@ class ScanSession:
     ``record_store.mark_persisted(labels)`` from its flush completion.
 
     ``obligations`` (H10-C1) declares the run's frozen output obligation /
-    target identities (e.g. ``("nexus:/data/run42.nxs",)``) for the composed
+    target identities (e.g. ``("nexus:/data/run42.nexus",)``) for the composed
     :attr:`accounting` ledger.  Persisted/durable state advances only on
     explicit :class:`~xrd_tools.session.stage_accounting.StageReceipt`\\ s for
     those targets; with no declared obligation nothing is ever reported

@@ -762,7 +762,7 @@ def write_contributing_frames(entry_grp: h5py.Group, records, *,
                               source_base=None) -> int:
     """Write the per-frame **source records** for a Stitch/RSM result — the
     enabler for the raw-image popup (resolve a contributing frame from the saved
-    ``.nxs``).  ``records`` is an iterable of mappings with ``frame_index`` and
+    ``.nexus``).  ``records`` is an iterable of mappings with ``frame_index`` and
     optionally ``scan_label`` / ``source_path`` / ``source_frame_index`` /
     ``thumbnail``.  Multi-scan records (a ``scan_label``) nest under
     ``scan_<label>/``; single-scan stays flat.  Returns the count written.

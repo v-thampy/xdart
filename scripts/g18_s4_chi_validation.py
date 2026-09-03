@@ -62,9 +62,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poni", type=Path, default=base / DEFAULT_PONI,
                         help="calibration .poni for the image")
     parser.add_argument("--out-dir", type=Path, default=None,
-                        help="directory for written validation .nxs files")
+                        help="directory for written validation .nexus files")
     parser.add_argument("--keep-output", action="store_true",
-                        help="keep temporary .nxs files when --out-dir is not set")
+                        help="keep temporary .nexus files when --out-dir is not set")
     parser.add_argument("--shape", type=int, nargs=2, default=None,
                         metavar=("ROWS", "COLS"),
                         help="raw binary shape; defaults to the PONI detector shape")
@@ -310,8 +310,8 @@ def _run_with_output_dir(args, out_dir: Path) -> int:
         return skipped
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    chi_path = out_dir / "g18_s4_chi_axis.nxs"
-    q_path = out_dir / "g18_s4_q_wedge.nxs"
+    chi_path = out_dir / "g18_s4_chi_axis.nexus"
+    q_path = out_dir / "g18_s4_q_wedge.nexus"
 
     _write_scan(chi_path, "g18-s4-chi", image, ai, _plan_chi(args))
     _write_scan(q_path, "g18-s4-q-wedge", image, ai, _plan_q_wedge(args))

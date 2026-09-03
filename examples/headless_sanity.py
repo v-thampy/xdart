@@ -10,8 +10,8 @@ What it exercises:
   * build a small in-memory ``Scan`` of synthetic frames + a real pyFAI
     integrator (no GUI, no detector files);
   * ``run_reduction(plan, scan, sink=[NexusSink, XYESink, MemorySink])`` --
-    one spine, three outputs (a .nxs, per-frame .xye, and an in-memory dict);
-  * round-trip the .nxs through the public read API: ``read_scan`` (xarray),
+    one spine, three outputs (a .nexus, per-frame .xye, and an in-memory dict);
+  * round-trip the .nexus through the public read API: ``read_scan`` (xarray),
     ``get_1d`` / ``get_2d`` / ``get_metadata``, and the per-frame ``Scan``
     accessor object.
 
@@ -81,7 +81,7 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        nxs = tmp / "headless_demo.nxs"
+        nxs = tmp / "headless_demo.nexus"
         xye_dir = tmp / "xye"
         memory = MemorySink()
 
@@ -101,7 +101,7 @@ def main() -> int:
         print(f"reduced {result.n_processed} frames -> "
               f"{nxs.name}, {len(xye_files)} .xye files, {len(memory.frames)} in memory")
 
-        # --- read the .nxs back through the public API ----------------------
+        # --- read the .nexus back through the public API --------------------
         ds = read_scan(nxs)
         assert list(ds["frame"].values) == list(range(N_FRAMES))
         assert ds["intensity_1d"].shape[0] == N_FRAMES

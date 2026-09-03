@@ -51,7 +51,7 @@ _PROCESSING_COMPARED_FIELDS: tuple[tuple[str, str], ...] = (
     # the modal and the axis backstop -> mixed provenance under a /entry/reduction
     # that claims the first run's config.  Compared BACKWARD-TOLERANTLY: a field
     # absent from a pre-upgrade stored config is _UNSET and skipped (no
-    # false-positive modal on every existing .nxs).
+    # false-positive modal on every existing processed artifact).
     ("chi_offset_1d", "1D chi offset"),
     ("chi_offset_2d", "2D chi offset"),
     ("monitor_1d", "1D monitor"),
@@ -449,7 +449,7 @@ def append_config_mismatch_check(
 
     # S-3 backward-tolerant: skip any field that is _UNSET on EITHER side (a
     # pre-upgrade stored config that never recorded it, or a run that doesn't set
-    # it) -- comparing it would raise a false modal on every existing .nxs.
+    # it) -- comparing it would raise a false modal on every existing processed artifact.
     mismatches = tuple(
         label for attr, label in _PROCESSING_COMPARED_FIELDS
         if getattr(processed, attr) is not _UNSET
