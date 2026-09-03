@@ -17,9 +17,15 @@ from xrd_tools.io.append import AppendIntent, science_fingerprint
 from xrd_tools.io.image import load_mask, read_detector_image_layout
 from xrd_tools.io.nexus_record import _average_count_chunks, _average_count_digest
 from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot, capture_target_snapshot
-from xrd_tools.io.output_path import OVERWRITE_MODE, resolve_output_target
+from xrd_tools.io.output_path import (
+    OVERWRITE_MODE,
+    artifact_family_from_source,
+    resolve_finite_output_target,
+    resolve_output_target,
+)
 from xrd_tools.io.read import _read_average_lineage, get_average_finite_counts, resolve_source_master
 from xrd_tools.io.record_writer import WriterIncomplete
+from xrd_tools.io.schema import PROCESSED_SCHEMA_VERSION
 from xrd_tools.reduction.background import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.reduction.core import GIMode, Integration1DPlan, Integration2DPlan, NexusSink, ReductionPlan, run_reduction
 from xrd_tools.session.experiment_state import CalibrationState, FactStatus, MaskState, PoniValues
@@ -228,12 +234,13 @@ def _recipe_payload(recipe: AverageScanRecipe) -> dict[str, Any]:
 @dataclass(frozen=True, slots=True)
 class AverageScanPlan:
     recipe: AverageScanRecipe; source_graph_digest: str; contributor_extent: int
-    detector_shape: tuple[int, int]; native_dtype: str; expected_target_snapshot: TargetSnapshot
+    detector_shape: tuple[int, int]; native_dtype: str; output_artifact: str
+    version_identity: str; expected_target_snapshot: TargetSnapshot
     numeric_metadata_keys: tuple[str, ...]; invariant_metadata_keys: tuple[str, ...]; allocation: SessionResourceAllocation
     direct_eiger_eligible: bool; science_identity: str; operation_identity: str
     logical_labels: tuple[int, ...] = (1,)
     def __post_init__(self) -> None:
-        _reject(type(self.recipe) is not AverageScanRecipe or type(self.contributor_extent) is not int or (not 1 <= self.contributor_extent <= _MAX_CONTRIBUTORS) or (type(self.detector_shape) is not tuple) or (len(self.detector_shape) != 2) or any((type(item) is not int or item <= 0 for item in self.detector_shape)) or (type(self.expected_target_snapshot) is not TargetSnapshot) or (type(self.allocation) is not SessionResourceAllocation) or type(self.direct_eiger_eligible) is not bool or (self.logical_labels != (1,)), 'Average scan plan is invalid')
+        _reject(type(self.recipe) is not AverageScanRecipe or type(self.contributor_extent) is not int or (not 1 <= self.contributor_extent <= _MAX_CONTRIBUTORS) or (type(self.detector_shape) is not tuple) or (len(self.detector_shape) != 2) or any((type(item) is not int or item <= 0 for item in self.detector_shape)) or (type(self.output_artifact) is not str or not os.path.isabs(self.output_artifact)) or _COUNT_DIGEST.fullmatch(self.version_identity) is None or (type(self.expected_target_snapshot) is not TargetSnapshot) or (type(self.allocation) is not SessionResourceAllocation) or type(self.direct_eiger_eligible) is not bool or (self.logical_labels != (1,)), 'Average scan plan is invalid')
 @dataclass(frozen=True, slots=True)
 class AverageScanProgress:
     operation_identity: str; stage: str; completed: int; total: int; revision: int
@@ -282,15 +289,16 @@ class AverageScanPending:
 
 @dataclass(frozen=True, slots=True)
 class AverageScanResult:
-    disposition: str; target: str; entry: str; operation_identity: str; science_identity: str
+    disposition: str; target: str; entry: str; version_identity: str
+    operation_identity: str; science_identity: str
     contributor_extent: int; logical_labels: tuple[int, ...]; committed_labels: tuple[int, ...]
     metadata_denominators: tuple[tuple[str, int], ...]; finite_counts: AverageFiniteCountsEvidence | None
     diagnostic_code: str; diagnostic: str; h23_phase: str | None; commit_identity: StreamTerminal | None
     def __post_init__(self):
         terminal = self.disposition in {'COMMITTED', 'REFUSED', 'CANCELLED', 'ABORTED'}
         denominators = self.metadata_denominators; logical = self.logical_labels; committed_labels = self.committed_labels
-        base = all(type(value) is str for value in (self.disposition, self.target, self.entry, self.operation_identity, self.science_identity, self.diagnostic_code, self.diagnostic)) and type(self.contributor_extent) is int and 0 <= self.contributor_extent <= _MAX_CONTRIBUTORS and type(logical) is tuple and logical == (1,) and all(type(value) is int for value in logical) and type(denominators) is tuple and all(type(value) is tuple and len(value) == 2 and type(value[0]) is str and bool(value[0]) and type(value[1]) is int and value[1] >= 0 for value in denominators) and len({value[0] for value in denominators}) == len(denominators)
-        committed = type(committed_labels) is tuple and committed_labels == (1,) and all(type(value) is int for value in committed_labels) and type(self.finite_counts) is AverageFiniteCountsEvidence and self.finite_counts.contributor_extent == self.contributor_extent and self.h23_phase == 'committed' and type(self.commit_identity) is StreamTerminal and not self.diagnostic_code and not self.diagnostic
+        base = all(type(value) is str for value in (self.disposition, self.target, self.entry, self.version_identity, self.operation_identity, self.science_identity, self.diagnostic_code, self.diagnostic)) and (not self.version_identity or _COUNT_DIGEST.fullmatch(self.version_identity) is not None) and type(self.contributor_extent) is int and 0 <= self.contributor_extent <= _MAX_CONTRIBUTORS and type(logical) is tuple and logical == (1,) and all(type(value) is int for value in logical) and type(denominators) is tuple and all(type(value) is tuple and len(value) == 2 and type(value[0]) is str and bool(value[0]) and type(value[1]) is int and value[1] >= 0 for value in denominators) and len({value[0] for value in denominators}) == len(denominators)
+        committed = type(committed_labels) is tuple and committed_labels == (1,) and all(type(value) is int for value in committed_labels) and _COUNT_DIGEST.fullmatch(self.version_identity) is not None and type(self.finite_counts) is AverageFiniteCountsEvidence and self.finite_counts.contributor_extent == self.contributor_extent and self.h23_phase == 'committed' and type(self.commit_identity) is StreamTerminal and not self.diagnostic_code and not self.diagnostic
         empty = type(committed_labels) is tuple and committed_labels == () and self.finite_counts is None and self.commit_identity is None
         valid = committed if self.disposition == 'COMMITTED' else empty and self.h23_phase is None
         _reject(not terminal or not base or not valid, 'Average result contract is invalid')
@@ -461,7 +469,32 @@ def _allocation_payload(value: SessionResourceAllocation) -> dict[str, Any]:
     return {'requirements': {item.name: getattr(value.requirements, item.name) for item in fields(value.requirements)}, 'envelope_bytes': value.envelope_bytes, 'counts': dict(value.counts), 'categories': dict(value.categories), 'minimum_bytes': value.minimum_bytes, 'floor_bytes': value.floor_bytes, 'assigned_bytes': value.assigned_bytes, 'origin': value.origin, 'oversize_excess_bytes': value.oversize_excess_bytes}
 def _operation_payload(plan: AverageScanPlan) -> dict[str, Any]:
     recipe = plan.recipe
-    return {'api_version': _COUNT_POLICY, 'source_graph_digest': plan.source_graph_digest, 'science_identity': plan.science_identity, 'target': recipe.target, 'entry': recipe.entry, 'source_base': recipe.source_base or '', 'output_mode': recipe.output_mode, 'live_mode': recipe.live_mode, 'save_xye': recipe.save_xye, 'batch_mode': recipe.batch_mode, 'contributor_extent': plan.contributor_extent, 'detector_shape': plan.detector_shape, 'native_dtype': plan.native_dtype, 'numeric_metadata_keys': plan.numeric_metadata_keys, 'invariant_metadata_keys': plan.invariant_metadata_keys, 'logical_labels': plan.logical_labels, 'direct_eiger_eligible': plan.direct_eiger_eligible, 'expected_target_snapshot': {item.name: getattr(plan.expected_target_snapshot, item.name) for item in fields(plan.expected_target_snapshot)}, 'resource_inputs': {'envelope_bytes': recipe.envelope_bytes, 'resource_requests': recipe.resource_requests, 'resource_env': recipe.resource_env}, 'allocation': _allocation_payload(plan.allocation)}
+    return {'api_version': _COUNT_POLICY, 'source_graph_digest': plan.source_graph_digest, 'science_identity': plan.science_identity, 'target_anchor': recipe.target, 'output_artifact': plan.output_artifact, 'version_identity': plan.version_identity, 'entry': recipe.entry, 'source_base': recipe.source_base or '', 'output_mode': recipe.output_mode, 'live_mode': recipe.live_mode, 'save_xye': recipe.save_xye, 'batch_mode': recipe.batch_mode, 'contributor_extent': plan.contributor_extent, 'detector_shape': plan.detector_shape, 'native_dtype': plan.native_dtype, 'numeric_metadata_keys': plan.numeric_metadata_keys, 'invariant_metadata_keys': plan.invariant_metadata_keys, 'logical_labels': plan.logical_labels, 'direct_eiger_eligible': plan.direct_eiger_eligible, 'expected_target_snapshot': {item.name: getattr(plan.expected_target_snapshot, item.name) for item in fields(plan.expected_target_snapshot)}, 'resource_inputs': {'envelope_bytes': recipe.envelope_bytes, 'resource_requests': recipe.resource_requests, 'resource_env': recipe.resource_env}, 'allocation': _allocation_payload(plan.allocation)}
+
+
+def _average_version_identity(
+    *, source_graph_digest: str, science_identity: str, entry: str,
+) -> str:
+    payload = {
+        'policy': 'average_create_new_v1',
+        'source_graph_digest': source_graph_digest,
+        'science_identity': science_identity,
+        'entry': entry,
+        'processed_schema_version': PROCESSED_SCHEMA_VERSION,
+    }
+    return hashlib.sha256(
+        b'xdart.average-version.v1\x00' + _canonical(payload)
+    ).hexdigest()
+
+
+def _average_output_artifact(anchor: str, version_identity: str) -> str:
+    requested = Path(anchor)
+    return str(resolve_finite_output_target(
+        requested.parent,
+        artifact_family_from_source(requested),
+        operation_token='average',
+        version_identity=version_identity,
+    ).resolve())
 def _derived_reduction(recipe: AverageScanRecipe) -> ReductionPlan:
     value = _thaw_reduction(recipe)
     value.mask = None
@@ -500,12 +533,23 @@ def _plan_from_prepared_graph(
         direct_eiger_eligible=direct_eiger_eligible,
     )
     graph_digest = source_graph_digest(graph)
-    snapshot = capture_target_snapshot(recipe.target)
-    provisional = AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, snapshot, numeric, invariant, allocation, direct_eiger_eligible, '', '')
-    science = hashlib.sha256(b'xdart.average-science.v1\x00' + _canonical(_science_payload(provisional))).hexdigest()
-    prospective = AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, '')
+    science_payload_owner = SimpleNamespace(
+        recipe=recipe,
+        numeric_metadata_keys=numeric,
+        invariant_metadata_keys=invariant,
+    )
+    science = hashlib.sha256(b'xdart.average-science.v1\x00' + _canonical(_science_payload(science_payload_owner))).hexdigest()
+    version = _average_version_identity(
+        source_graph_digest=graph_digest,
+        science_identity=science,
+        entry=recipe.entry,
+    )
+    output = _average_output_artifact(recipe.target, version)
+    snapshot = capture_target_snapshot(output)
+    _reject(snapshot.exists, 'AVERAGE_OUTPUT_EXISTS')
+    prospective = AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, output, version, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, '')
     operation = hashlib.sha256(b'xdart.average-operation.v1\x00' + _canonical(_operation_payload(prospective))).hexdigest()
-    return AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, operation)
+    return AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, output, version, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, operation)
 
 
 class _AverageCancelled(RuntimeError): pass
