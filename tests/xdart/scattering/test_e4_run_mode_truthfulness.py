@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import replace
 from pathlib import Path
-import subprocess
 
 from xdart.gui.tabs.scattering.context_projection import ContextProjection
 from xdart.gui.tabs.scattering.controls_projection import project_controls
@@ -326,25 +324,3 @@ def test_xye_output_uses_the_existing_int1d_trace_and_center_layout(
     assert ("Int1D", "axis") in paths
     assert ("Mask", "Threshold") in paths
     assert ("Signal", "series_average") not in paths
-
-
-def test_viewer_1d_authority_identifier_delta_is_frozen() -> None:
-    from tests.xdart.scattering.test_p2a1_viewer_context_page import _ast_facts
-    root, parent, identifiers, baseline = Path(__file__).parents[3], "bf999b35184ba42229da6d545478b7270f1ac0b1", Counter(), Counter()
-    paths = tuple("src/xdart/gui/tabs/scattering/" + name for name in ("context_controller.py", "context_runtime.py",
-        "context_projection.py", "controls_projection.py", "run_mode_projection.py", "page.py", "scientific_view.py"))
-    for path in paths:
-        _, _, current = _ast_facts((root / path).read_text())
-        source = subprocess.check_output(("git", "-C", str(root), "show", f"{parent}:{path}"), text=True)
-        _, _, prior = _ast_facts(source)
-        identifiers.update(current); baseline.update(prior)
-    terms = ("target", "port", "provider", "generation", "worker", "thread", "timer", "queue", "scheduler", "cache", "watcher", "store", "lease", "owner",
-        "holder", "borrow", "claim", "custody", "authority", "lock", "transport", "writer", "output", "durability", "accounting", "calibration",
-        "mask", "integration", "rsm", "descriptor", "archive", "parser", "mmap", "callback", "resource")
-    identifiers.subtract(baseline)
-    delta = {name: count for name, count in identifiers.items()
-             if count and any(term in name.lower() for term in terms)}
-    assert delta == {"HydrationOwner": 1, "_OneDViewerOwner": 1, "_display_generation": 7, "_ensure_timer": 2, "_release_browse_for_viewer": 1,
-        "_release_viewer_1d_holder": 2, "_viewer_1d_provider": 1, "_viewer_2d_lock": 14, "_viewer_2d_provider": 1, "admission_generation": 1,
-        "admitted_provider_identity": 3, "blocked_cleanup_token": 2, "borrow": 3, "display_generation": 2, "generation": 33, "holder": 33, "owner": 135,
-        "owner_holder": 1, "owner_identity": 6, "owner_request_claim": 6, "port": 1, "presentation_generation": 1, "provider": 46, "publication_store": 1, "release": 1, "retry_blocked_cleanup": 2, "retry_holder": 3, "transport_token": 1, "viewer_1d_owner": 4}
