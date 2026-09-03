@@ -8,6 +8,7 @@ import pytest
 import xarray as xr
 
 from xrd_tools.analysis.plans import PeakFitPlan
+from xrd_tools.core import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.analysis.time_resolved import (
     LinearThermalExpansion,
     TabulatedThermalExpansion,
@@ -25,6 +26,7 @@ from xrd_tools.analysis.time_resolved import (
     normalize_reference_band,
     select_time_zero,
 )
+from xrd_tools.io.nexus import write_nexus
 from xrd_tools.viz.plotly import (
     plot_peak_fit_frame,
     plot_thermal_history,
@@ -43,15 +45,42 @@ def _write_scan(
     q_unit: str = "q_A^-1",
 ) -> Path:
     frames = np.arange(frame_start, frame_start + len(intensity), dtype=np.int64)
-    with h5py.File(path, "w") as h5:
-        entry = h5.create_group("entry")
-        g1 = entry.create_group("integrated_1d")
-        g1.create_dataset("frame_index", data=frames)
-        q_ds = g1.create_dataset("q", data=np.asarray(q, dtype=np.float32))
-        q_ds.attrs["units"] = q_unit
-        g1.create_dataset("intensity", data=np.asarray(intensity, dtype=np.float32))
-        g1.create_dataset(
-            "sigma", data=np.sqrt(np.maximum(intensity, 0)).astype(np.float32))
+    q = np.asarray(q, dtype=np.float32)
+    intensity = np.asarray(intensity, dtype=np.float32)
+    results_1d = {
+        int(frame): IntegrationResult1D(
+            radial=q,
+            intensity=row,
+            sigma=np.sqrt(np.maximum(row, 0)).astype(np.float32),
+            unit=q_unit,
+        )
+        for frame, row in zip(frames, intensity, strict=True)
+    }
+    results_2d = None
+    if include_2d:
+        chi = np.linspace(-20, 20, 5, dtype=np.float32)
+        q2 = np.linspace(q.min(), q.max(), 6, dtype=np.float32)
+        cake = np.arange(len(frames) * len(chi) * len(q2), dtype=np.float32)
+        cakes = cake.reshape(len(frames), len(chi), len(q2))
+        results_2d = {
+            int(frame): IntegrationResult2D(
+                radial=q2,
+                azimuthal=chi,
+                intensity=row.T,
+                unit="q_A^-1",
+                azimuthal_unit="chi_deg",
+            )
+            for frame, row in zip(frames, cakes, strict=True)
+        }
+    write_nexus(
+        path,
+        results_1d=results_1d,
+        results_2d=results_2d,
+        overwrite=True,
+        compression=None,
+    )
+    with h5py.File(path, "r+") as h5:
+        entry = h5["entry"]
 
         if scan_data:
             scan_group = entry.create_group("scan_data")
@@ -61,18 +90,6 @@ def _write_scan(
                 if values.shape != frames.shape:
                     raise ValueError(f"scan_data {name!r} does not match frame count")
                 scan_group.create_dataset(name, data=values)
-
-        if include_2d:
-            chi = np.linspace(-20, 20, 5, dtype=np.float32)
-            q2 = np.linspace(q.min(), q.max(), 6, dtype=np.float32)
-            g2 = entry.create_group("integrated_2d")
-            g2.create_dataset("frame_index", data=frames)
-            q2_ds = g2.create_dataset("q", data=q2)
-            q2_ds.attrs["units"] = "q_A^-1"
-            chi_ds = g2.create_dataset("chi", data=chi)
-            chi_ds.attrs["units"] = "chi_deg"
-            cake = np.arange(len(frames) * len(chi) * len(q2), dtype=np.float32)
-            g2.create_dataset("intensity", data=cake.reshape(len(frames), len(chi), len(q2)))
 
         frame_group = entry.create_group("frames")
         for frame in frames:
@@ -90,14 +107,14 @@ def scan_pair(tmp_path):
     q = np.linspace(1.0, 5.0, 81)
     y1 = np.vstack([np.full_like(q, value) for value in (2.0, 3.0, 4.0)])
     y2 = np.vstack([np.full_like(q, value) for value in (5.0, 6.0)])
-    a = _write_scan(tmp_path / "scan_2.nxs", q=q, intensity=y1, include_2d=True)
-    b = _write_scan(tmp_path / "scan_10.nxs", q=q, intensity=y2)
+    a = _write_scan(tmp_path / "scan_2.nexus", q=q, intensity=y1, include_2d=True)
+    b = _write_scan(tmp_path / "scan_10.nexus", q=q, intensity=y2)
     return a, b
 
 
 def test_discover_and_load_time_resolved_series(scan_pair, tmp_path):
     paths = discover_processed_scans(tmp_path)
-    assert [p.name for p in paths] == ["scan_2.nxs", "scan_10.nxs"]
+    assert [p.name for p in paths] == ["scan_2.nexus", "scan_10.nexus"]
 
     series = load_time_resolved_series(paths, frame_period_s=0.002)
     ds = series.dataset
@@ -118,8 +135,8 @@ def test_discover_and_load_time_resolved_series(scan_pair, tmp_path):
 def test_load_q_grid_policy_interpolates_or_fails(tmp_path):
     q1 = np.linspace(1.0, 5.0, 81)
     q2 = np.linspace(2.0, 4.0, 61)
-    a = _write_scan(tmp_path / "a.nxs", q=q1, intensity=np.ones((1, len(q1))))
-    b = _write_scan(tmp_path / "b.nxs", q=q2, intensity=np.ones((1, len(q2))) * 2)
+    a = _write_scan(tmp_path / "a.nexus", q=q1, intensity=np.ones((1, len(q1))))
+    b = _write_scan(tmp_path / "b.nexus", q=q2, intensity=np.ones((1, len(q2))) * 2)
 
     with pytest.raises(ValueError, match="q grid"):
         load_time_resolved_series([a, b], q_policy="strict")
@@ -136,7 +153,7 @@ def test_load_q_grid_policy_interpolates_or_fails(tmp_path):
 def test_discovery_ignores_raw_and_monitor_metadata_is_aligned(tmp_path):
     q = np.linspace(1.0, 5.0, 9)
     processed = _write_scan(
-        tmp_path / "scan_10.nxs",
+        tmp_path / "scan_10.nexus",
         q=q,
         intensity=np.vstack([np.ones_like(q) * 2, np.ones_like(q) * 4]),
         scan_data={"i0": np.array([2.0, 4.0])},
@@ -155,13 +172,13 @@ def test_discovery_ignores_raw_and_monitor_metadata_is_aligned(tmp_path):
 def test_mixed_timing_is_explicit_and_rate_requires_seconds(tmp_path):
     q = np.linspace(1.0, 5.0, 9)
     timed = _write_scan(
-        tmp_path / "timed.nxs",
+        tmp_path / "timed.nexus",
         q=q,
         intensity=np.ones((2, len(q))),
         scan_data={"elapsed_time": np.array([4.0, 4.2])},
     )
     untimed = _write_scan(
-        tmp_path / "untimed.nxs", q=q, intensity=np.ones((2, len(q))))
+        tmp_path / "untimed.nexus", q=q, intensity=np.ones((2, len(q))))
     ds = load_time_resolved_series(
         [timed, untimed],
         time_key={timed.name: "elapsed_time"},
@@ -186,7 +203,7 @@ def test_mixed_timing_is_explicit_and_rate_requires_seconds(tmp_path):
 def test_time_columns_require_selected_units_and_one_frame_does_not_invent_cadence(tmp_path):
     q = np.linspace(1.0, 5.0, 9)
     milliseconds = _write_scan(
-        tmp_path / "milliseconds.nxs",
+        tmp_path / "milliseconds.nexus",
         q=q,
         intensity=np.ones((2, len(q))),
         scan_data={"elapsed": np.array([10.0, 12.0])},
@@ -207,11 +224,11 @@ def test_time_columns_require_selected_units_and_one_frame_does_not_invent_caden
         "scan_data:elapsed[ms]", "scan_data:elapsed[ms]"]
 
     first = _write_scan(
-        tmp_path / "first.nxs", q=q, intensity=np.ones((1, len(q))),
+        tmp_path / "first.nexus", q=q, intensity=np.ones((1, len(q))),
         scan_data={"clock": np.array([50.0])},
     )
     second = _write_scan(
-        tmp_path / "second.nxs", q=q, intensity=np.ones((1, len(q))),
+        tmp_path / "second.nexus", q=q, intensity=np.ones((1, len(q))),
         scan_data={"clock": np.array([100.0])},
     )
     one_frame_scans = load_time_resolved_series(
@@ -224,10 +241,10 @@ def test_time_columns_require_selected_units_and_one_frame_does_not_invent_caden
 def test_stacked_q_units_are_complete_compatible_and_canonical(tmp_path):
     q = np.linspace(1.0, 5.0, 9)
     intensity = np.ones((2, len(q)))
-    canonical = _write_scan(tmp_path / "canonical.nxs", q=q, intensity=intensity, q_unit="q_A^-1")
-    alias = _write_scan(tmp_path / "alias.nxs", q=q, intensity=intensity, q_unit="angstrom^-1")
-    missing = _write_scan(tmp_path / "missing.nxs", q=q, intensity=intensity, q_unit="")
-    inverse_nm = _write_scan(tmp_path / "inverse_nm.nxs", q=q, intensity=intensity, q_unit="q_nm^-1")
+    canonical = _write_scan(tmp_path / "canonical.nexus", q=q, intensity=intensity, q_unit="q_A^-1")
+    alias = _write_scan(tmp_path / "alias.nexus", q=q, intensity=intensity, q_unit="angstrom^-1")
+    missing = _write_scan(tmp_path / "missing.nexus", q=q, intensity=intensity, q_unit="")
+    inverse_nm = _write_scan(tmp_path / "inverse_nm.nexus", q=q, intensity=intensity, q_unit="q_nm^-1")
 
     compatible = load_time_resolved_series([canonical, alias]).dataset
     assert compatible.coords["q"].attrs["units"] == "q_A^-1"
@@ -297,7 +314,7 @@ def test_peak_series_lattice_temperature_and_rate(tmp_path):
         peak_111 = 100 * np.exp(-0.5 * ((q - center) / 0.012) ** 2)
         peak_200 = 60 * np.exp(-0.5 * ((q - center * np.sqrt(4 / 3)) / 0.014) ** 2)
         intensity.append(peak_111 + peak_200 + 2 + 0.2 * q)
-    path = _write_scan(tmp_path / "peaks.nxs", q=q, intensity=np.asarray(intensity))
+    path = _write_scan(tmp_path / "peaks.nexus", q=q, intensity=np.asarray(intensity))
     ds = load_time_resolved_series(path, frame_period_s=0.001).dataset
 
     plan = PeakFitPlan(

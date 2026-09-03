@@ -590,16 +590,16 @@ def test_eiger_external_link_anchor_keeps_master_identity_and_opens_once(
     assert np.all(result.raw == expected)
 
 
-def test_unmarked_nonmonotonic_legacy_map_uses_bounded_scan(tmp_path):
+def test_unmarked_nonmonotonic_legacy_map_is_rejected(tmp_path):
     processed = tmp_path / "legacy.nxs"
     with h5py.File(processed, "w") as handle:
         scan_data = handle.create_group("entry/scan_data")
         scan_data["frame_index"] = np.array([17, 3, 9], dtype=np.int64)
         scan_data["motor"] = np.array([123.0, 3.0, 9.0])
-    result = _api().read_frame_preview(
-        _read_key(processed, _hydration().HydrationPurpose.PREVIEW)
-    )
-    assert result.view.metadata_raw["motor"] == 123.0
+    with pytest.raises(ValueError, match="current xdart .nexus record"):
+        _api().read_frame_preview(
+            _read_key(processed, _hydration().HydrationPurpose.PREVIEW)
+        )
 
 
 @pytest.mark.parametrize("source_kind", ["hdf", "fabio"])

@@ -67,15 +67,20 @@ def _imageless(path):
 
 def _processed(path):
     from xrd_tools.core import IntegrationResult1D
-    from xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.nexus import write_nexus
 
-    with h5py.File(path, "w") as h5:
-        entry = h5.create_group("entry")
-        entry.attrs["NX_class"] = "NXentry"
-        r1d = IntegrationResult1D(
-            radial=np.linspace(0.5, 2.5, 5), intensity=np.linspace(10.0, 50.0, 5),
-            sigma=np.ones(5), unit="q_A^-1")
-        write_integrated_stack(entry, frame_indices=[0, 1], results_1d=[r1d, r1d])
+    r1d = IntegrationResult1D(
+        radial=np.linspace(0.5, 2.5, 5),
+        intensity=np.linspace(10.0, 50.0, 5),
+        sigma=np.ones(5),
+        unit="q_A^-1",
+    )
+    write_nexus(
+        path,
+        results_1d={0: r1d, 1: r1d},
+        overwrite=True,
+        compression=None,
+    )
     return path
 
 
@@ -157,7 +162,7 @@ def test_imageless_container(tmp_path):
 
 
 def test_processed_never_resolves_a_detector_dataset(tmp_path):
-    p = _processed(tmp_path / "processed.nxs")
+    p = _processed(tmp_path / "processed.nexus")
     d = describe_container(p)
     assert d.state is ProbeState.PROCESSED_OUTPUT
     assert d.kind is SourceKind.PROCESSED_NEXUS

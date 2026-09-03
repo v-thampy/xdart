@@ -1,9 +1,8 @@
 """Tests for the image-source classification + loading boundary
 (``io.image_source``) that the xdart Image Viewer consumes.
 
-Hand-builds small files with pure h5py: a processed v2 ``.nxs`` whose
-frames point back to a raw master, a thumbnail-only processed ``.nxs``
-(source master missing), a raw detector master, and an unknown file.
+Builds small current processed ``.nexus`` records whose frames point back to a
+raw master or carry only a thumbnail, plus raw and unknown HDF5 inputs.
 """
 
 from __future__ import annotations
@@ -12,6 +11,7 @@ import h5py
 import numpy as np
 import pytest
 
+from xrd_tools.core import IntegrationResult1D
 from xrd_tools.core.strictness import StrictPolicy
 from xrd_tools.io import (
     ImageSourceKind,
@@ -19,55 +19,72 @@ from xrd_tools.io import (
     load_image_frame,
     load_processed_raw_or_thumbnail,
 )
+from xrd_tools.io.nexus import write_nexus
+from xrd_tools.io.nexus_record import (
+    ensure_frames_container,
+    stamp_source_base,
+    write_frame_record,
+)
 
 
-def _write_thumbnail(group, name, data):
-    """Store a uint8-quantized thumbnail with the dequantize attrs."""
-    vmin, vmax = float(data.min()), float(data.max())
-    span = (vmax - vmin) or 1.0
-    q = np.clip((data - vmin) / span, 0, 1) * 255.0
-    ds = group.create_dataset(name, data=q.astype(np.uint8))
-    ds.attrs["vmin"] = vmin
-    ds.attrs["vmax"] = vmax
-    ds.attrs["dtype"] = "uint8"
+def _seed_processed(path, frames):
+    q = np.linspace(0.1, 0.5, 5)
+    write_nexus(
+        path,
+        results_1d={
+            int(frame): IntegrationResult1D(
+                radial=q,
+                intensity=np.zeros_like(q),
+                unit="q_A^-1",
+            )
+            for frame in frames
+        },
+        overwrite=True,
+        compression=None,
+    )
+    return path
 
 
 @pytest.fixture
 def processed_with_master(tmp_path):
-    """Processed .nxs whose frame 0 resolves to a sibling raw master."""
+    """Processed .nexus whose frame 0 resolves to a sibling raw master."""
     master = tmp_path / "scan_master.h5"
     raw = np.arange(2 * 8 * 8, dtype=float).reshape(2, 8, 8)
     with h5py.File(master, "w") as f:
         f.create_dataset("entry/data/data", data=raw)
 
-    nxs = tmp_path / "scan.nxs"
+    nxs = _seed_processed(tmp_path / "scan.nexus", (0,))
     thumb = np.linspace(0, 100, 16 * 16).reshape(16, 16)
-    with h5py.File(nxs, "w") as f:
-        e = f.create_group("entry")
-        g = e.create_group("integrated_1d")
-        g.create_dataset("intensity", data=np.zeros((1, 5)))
-        g.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
-        s = e.create_group("frames/frame_0000/source")
-        s.create_dataset("path", data=np.bytes_(b"scan_master.h5"))
-        s.create_dataset("frame_index", data=1)   # -> master frame 1
-        _write_thumbnail(e["frames/frame_0000"], "thumbnail", thumb)
+    with h5py.File(nxs, "r+") as f:
+        e = f["entry"]
+        base = stamp_source_base(e, tmp_path)
+        write_frame_record(
+            ensure_frames_container(e),
+            "frame_0000",
+            source_path=master,
+            source_frame_index=1,
+            source_base=base,
+            thumbnail=thumb,
+        )
     return nxs, raw, thumb
 
 
 @pytest.fixture
 def thumbnail_only(tmp_path):
-    """Processed .nxs whose source master is missing — only the thumbnail."""
-    nxs = tmp_path / "thumb_only.nxs"
+    """Processed .nexus whose source master is missing — only the thumbnail."""
+    nxs = _seed_processed(tmp_path / "thumb_only.nexus", (0,))
     thumb = np.linspace(5, 50, 16 * 16).reshape(16, 16)
-    with h5py.File(nxs, "w") as f:
-        e = f.create_group("entry")
-        g = e.create_group("integrated_1d")
-        g.create_dataset("intensity", data=np.zeros((1, 5)))
-        g.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
-        s = e.create_group("frames/frame_0000/source")
-        s.create_dataset("path", data=np.bytes_(b"does_not_exist.h5"))
-        s.create_dataset("frame_index", data=0)
-        _write_thumbnail(e["frames/frame_0000"], "thumbnail", thumb)
+    with h5py.File(nxs, "r+") as f:
+        e = f["entry"]
+        base = stamp_source_base(e, tmp_path)
+        write_frame_record(
+            ensure_frames_container(e),
+            "frame_0000",
+            source_path=tmp_path / "does_not_exist.h5",
+            source_frame_index=0,
+            source_base=base,
+            thumbnail=thumb,
+        )
     return nxs, thumb
 
 
@@ -199,10 +216,10 @@ def test_load_processed_falls_back_to_thumbnail(thumbnail_only):
 
 
 def test_load_processed_none_when_nothing_available(tmp_path):
-    nxs = tmp_path / "barren.nxs"
-    with h5py.File(nxs, "w") as f:
-        e = f.create_group("entry")
-        e.create_group("frames/frame_0000")     # frame group, no source, no thumbnail
+    nxs = _seed_processed(tmp_path / "barren.nexus", (0,))
+    with h5py.File(nxs, "r+") as f:
+        e = f["entry"]
+        ensure_frames_container(e).create_group("frame_0000")
     res = load_processed_raw_or_thumbnail(nxs, 0)
     assert res.source == "none"
     assert res.image is None
@@ -243,7 +260,7 @@ def test_strict_thumbnail_fallback_loud_raises_graceful_degrades(thumbnail_only)
 
 @pytest.fixture
 def processed_gapped(tmp_path):
-    """Processed .nxs whose integrated frame_index is a SUPERSET of the
+    """Processed .nexus whose integrated frame_index is a SUPERSET of the
     frame groups that actually carry a thumbnail/source — the eiger-style
     case that blanked the Image Viewer (union labels lack a frame group)."""
     master = tmp_path / "scan_master.h5"
@@ -251,20 +268,23 @@ def processed_gapped(tmp_path):
     with h5py.File(master, "w") as f:
         f.create_dataset("entry/data/data", data=raw)
 
-    nxs = tmp_path / "gapped.nxs"
+    nxs = _seed_processed(tmp_path / "gapped.nexus", (0, 1, 2))
     thumb = np.linspace(0, 100, 16 * 16).reshape(16, 16)
-    with h5py.File(nxs, "w") as f:
-        e = f.create_group("entry")
-        g = e.create_group("integrated_1d")
-        g.create_dataset("intensity", data=np.zeros((3, 5)))
+    with h5py.File(nxs, "r+") as f:
+        e = f["entry"]
+        base = stamp_source_base(e, tmp_path)
+        frames = ensure_frames_container(e)
         # integrated lists labels 0,1,2 ...
-        g.create_dataset("frame_index", data=np.array([0, 1, 2], dtype=np.int64))
         # ... but only frames 1 and 2 have a displayable group.
         for lbl, src_idx in ((1, 0), (2, 1)):
-            s = e.create_group(f"frames/frame_{lbl:04d}/source")
-            s.create_dataset("path", data=np.bytes_(b"scan_master.h5"))
-            s.create_dataset("frame_index", data=src_idx)
-            _write_thumbnail(e[f"frames/frame_{lbl:04d}"], "thumbnail", thumb)
+            write_frame_record(
+                frames,
+                f"frame_{lbl:04d}",
+                source_path=master,
+                source_frame_index=src_idx,
+                source_base=base,
+                thumbnail=thumb,
+            )
     return nxs, raw
 
 

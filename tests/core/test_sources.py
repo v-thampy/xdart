@@ -318,16 +318,26 @@ def test_raw_series_from_directory_threads_binary_read_parameters(tmp_path):
 
 
 def test_processed_nexus_source_reads_frame_views(tmp_path):
+    from xrd_tools.core import IntegrationResult1D
+    from xrd_tools.io.nexus import write_nexus
     from xrd_tools.sources import ProcessedNexusSource, open_source
 
-    path = tmp_path / "processed.nxs"
-    with h5py.File(path, "w") as h5:
-        entry = h5.create_group("entry")
-        g1 = entry.create_group("integrated_1d")
-        g1.create_dataset("frame_index", data=np.array([7], dtype=np.int64))
-        q = g1.create_dataset("q", data=np.linspace(0.1, 1.0, 5))
-        q.attrs["units"] = "q_A^-1"
-        g1.create_dataset("intensity", data=np.arange(5, dtype=np.float32)[None, :])
+    path = tmp_path / "processed.nexus"
+    q = np.linspace(0.1, 1.0, 5)
+    write_nexus(
+        path,
+        results_1d={
+            7: IntegrationResult1D(
+                radial=q,
+                intensity=np.arange(5, dtype=np.float32),
+                unit="q_A^-1",
+            )
+        },
+        overwrite=True,
+        compression=None,
+    )
+    with h5py.File(path, "r+") as h5:
+        entry = h5["entry"]
         sd = entry.create_group("scan_data")
         sd.create_dataset("frame_index", data=np.array([7], dtype=np.int64))
         sd.create_dataset("i0", data=np.array([11.0], dtype=np.float32))

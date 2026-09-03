@@ -52,12 +52,22 @@ def _nxs_imageless(path: Path) -> Path:
 
 
 def _nxs_processed_output(path: Path) -> Path:
-    with h5py.File(path, "w") as f:
-        entry = f.create_group("entry")
-        g1 = entry.create_group("integrated_1d")
-        g1.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
-        g1.create_dataset("q", data=np.linspace(0.1, 1.0, 5))
-        g1.create_dataset("intensity", data=np.arange(5, dtype=np.float32)[None, :])
+    from xrd_tools.core import IntegrationResult1D
+    from xrd_tools.io.nexus import write_nexus
+
+    q = np.linspace(0.1, 1.0, 5)
+    write_nexus(
+        path,
+        results_1d={
+            0: IntegrationResult1D(
+                radial=q,
+                intensity=np.arange(5, dtype=np.float32),
+                unit="q_A^-1",
+            )
+        },
+        overwrite=True,
+        compression=None,
+    )
     return path
 
 
@@ -96,11 +106,11 @@ def test_ready_via_real_nexus_adapter(tmp_path):
 
 
 def test_processed_output_via_real_nexus_adapter(tmp_path):
-    _nxs_processed_output(tmp_path / "processed.nxs")
+    _nxs_processed_output(tmp_path / "processed.nexus")
     index = DirectoryIndex(tmp_path, clock=_FakeClock())
     index.poll()
 
-    result = index.probe_candidate(_candidate_for(tmp_path, "processed.nxs"))
+    result = index.probe_candidate(_candidate_for(tmp_path, "processed.nexus"))
     assert result.state is ProbeState.PROCESSED_OUTPUT
 
 
