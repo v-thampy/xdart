@@ -140,9 +140,21 @@ def test_factory_output_is_schema_conformant(tmp_path):
         assert_v2_conformant, make_v2_entry,
     )
 
-    with h5py.File(tmp_path / "v2.nxs", "w") as f:
+    path = tmp_path / "v2.nexus"
+    with h5py.File(path, "w") as f:
         e = make_v2_entry(f)
         assert_v2_conformant(e)
+
+    from xrd_tools.io.processed_scan_id import (
+        is_current_processed_xdart_path,
+        require_current_processed_groups,
+    )
+
+    assert is_current_processed_xdart_path(path)
+    with h5py.File(path, "r") as handle:
+        assert require_current_processed_groups(
+            handle, container=path
+        ).entry.name == "/entry"
 
 
 def test_validator_flags_declared_drift(tmp_path):

@@ -13,6 +13,15 @@ from xrd_tools.io.nexus import write_integrated_stack
 from xrd_tools.io.schema import SCHEMA
 
 
+def current_entry(h5f, *, entry="entry"):
+    """Return a current processed entry stamped from the schema authority."""
+    value = h5f.require_group(entry)
+    value.attrs["NX_class"] = "NXentry"
+    value.attrs[SCHEMA.name_attr] = SCHEMA.name
+    value.attrs[SCHEMA.version_attr] = SCHEMA.version
+    return value
+
+
 def make_v2_entry(h5f, *, frame_indices=(0, 1, 2), n_q=8, n_chi=4,
                   with_2d=True, with_sigma=True, entry="entry", seed=3):
     """Populate ``h5f`` with a schema-conformant v2 entry via the REAL
@@ -22,7 +31,7 @@ def make_v2_entry(h5f, *, frame_indices=(0, 1, 2), n_q=8, n_chi=4,
     writer+schema produce — that is the point.
     """
     rng = np.random.default_rng(seed)
-    e = h5f.require_group(entry)
+    e = current_entry(h5f, entry=entry)
     fis = [int(i) for i in frame_indices]
     r1d = [
         IntegrationResult1D(
