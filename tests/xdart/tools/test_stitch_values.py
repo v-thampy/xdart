@@ -30,6 +30,11 @@ def test_form_is_canonical_fingerprinted_and_keeps_2d_held(stitch_form):
     assert replace(stitch_form, threshold=700_000).fingerprint != stitch_form.fingerprint
     with pytest.raises(ValueError, match="2-D Stitch remains held"):
         replace(stitch_form, mode="2d")
+    with pytest.raises(ValueError, match="new immutable artifact"):
+        replace(
+            stitch_form,
+            overwrite=AnalysisArtifactOverwrite.REPLACE,
+        )
 
     monitor = stitch_form.monitor_selector
     legacy = (

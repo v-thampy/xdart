@@ -34,7 +34,6 @@ from xrd_tools.analysis.stitch_operation import (
     StitchContribution,
     StitchOperationPlan,
     XuStitchOperationPlan,
-    StitchOperationCleanupPending,
     StitchOperationRefused,
     StitchOperationVerificationError,
     capture_stitch_geometry,
@@ -1168,12 +1167,7 @@ def test_transient_strict_reload_retry_does_not_replay_science_or_writer(
     assert science == ["science"]
 
 
-def test_cleanup_pending_retains_execution_and_retries_without_replay(
-    tmp_path,
-    monkeypatch,
-):
-    import xrd_tools.io.output_transaction as transaction_api
-
+def test_stitch_refuses_replace_output_policy_without_mutating_target(tmp_path):
     initial = _prepared(tmp_path)
     target = Path(initial.module.output.target)
     target.write_bytes(b"prior operator output")
@@ -1182,45 +1176,15 @@ def test_cleanup_pending_retains_execution_and_retries_without_replay(
         AnalysisArtifactKind.STITCH_1D,
         AnalysisArtifactOverwrite.REPLACE,
     )
-    request = prepare_stitch_operation(
-        initial.module.source,
-        replacement,
-        initial.plan,
-        project_root=tmp_path,
-    )
-    real_unlink = transaction_api._unlink
-    real_write = stitch_operation.write_stitched
-    real_science = stitch_operation.run_stitch
-    failures = []
-    writes = []
-    science = []
-
-    def fail_backup_once(path):
-        if ".xdart-replacing-" in Path(path).name and not failures:
-            failures.append("backup")
-            raise OSError("backup cleanup fault")
-        return real_unlink(path)
-
-    def write_once(*args, **kwargs):
-        writes.append("write")
-        return real_write(*args, **kwargs)
-
-    def science_once(*args, **kwargs):
-        science.append("science")
-        return real_science(*args, **kwargs)
-
-    monkeypatch.setattr(transaction_api, "_unlink", fail_backup_once)
-    monkeypatch.setattr(stitch_operation, "write_stitched", write_once)
-    monkeypatch.setattr(stitch_operation, "run_stitch", science_once)
-    with pytest.raises(StitchOperationCleanupPending) as pending:
-        run_stitch_operation(request)
-    recovered = pending.value.retry_cleanup()
-    assert recovered.terminal.disposition is ModuleDisposition.COMMITTED
-    assert recovered.payload is not None
-    assert pending.value.execution.retry_cleanup() is recovered
-    assert failures == ["backup"]
-    assert writes == ["write"]
-    assert science == ["science"]
+    with pytest.raises(StitchOperationRefused) as refused:
+        prepare_stitch_operation(
+            initial.module.source,
+            replacement,
+            initial.plan,
+            project_root=tmp_path,
+        )
+    assert refused.value.code == "STITCH_OUTPUT_POLICY_UNSUPPORTED"
+    assert target.read_bytes() == b"prior operator output"
 
 
 def test_create_new_output_conflict_is_late_refusal_without_overwrite(tmp_path):

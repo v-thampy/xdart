@@ -28,6 +28,7 @@ from xdart.gui.tools.stitch_owner import (
 from xdart.gui.tools.stitch_tool import StitchToolDialog, build_stitch_tool
 from xdart.gui.tools.stitch_values import prepare_stitch_tool
 from xrd_tools.analysis.module_transaction import ModuleDisposition
+from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
 
 
 @pytest.fixture(scope="module")
@@ -119,6 +120,11 @@ def test_source_picker_and_form_projection_do_no_source_io(
         assert form.detector_shape == (195, 1475)
         assert form.threshold == 800_000.0
         assert form.mode == "1d"
+        assert form.overwrite is AnalysisArtifactOverwrite.CREATE_NEW
+        assert dialog.output_policy_label.text() == (
+            "Create new (refuse if present)"
+        )
+        assert dialog.findChild(QtWidgets.QComboBox, "stitchOverwrite") is None
     finally:
         assert dialog.shutdown().status is PageCleanup.CLEAN
     assert owner.closed == 1

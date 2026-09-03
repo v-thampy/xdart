@@ -265,15 +265,11 @@ class StitchToolDialog(QtWidgets.QDialog):
         self.output_edit.setObjectName("stitchOutput")
         form.addRow("Output", output_row)
 
-        self.overwrite_combo = QtWidgets.QComboBox()
-        self.overwrite_combo.setObjectName("stitchOverwrite")
-        self.overwrite_combo.addItem(
-            "Create new (refuse if present)", AnalysisArtifactOverwrite.CREATE_NEW
+        self.output_policy_label = QtWidgets.QLabel(
+            "Create new (refuse if present)"
         )
-        self.overwrite_combo.addItem(
-            "Replace transactionally", AnalysisArtifactOverwrite.REPLACE
-        )
-        form.addRow("Output policy", self.overwrite_combo)
+        self.output_policy_label.setObjectName("stitchOutputPolicy")
+        form.addRow("Output policy", self.output_policy_label)
 
         hold = QtWidgets.QLabel(
             "Mode: 1-D only · 2-D held pending the scan-14 orientation parity oracle"
@@ -446,7 +442,6 @@ class StitchToolDialog(QtWidgets.QDialog):
             self.backend_combo,
             self.geometry_kind_combo,
             self.rotation_combo,
-            self.overwrite_combo,
             self.source_widget.dtype_combo,
         ):
             combo.currentIndexChanged.connect(self._form_changed)
@@ -616,10 +611,7 @@ class StitchToolDialog(QtWidgets.QDialog):
             ),
             use_detector_mask=self.detector_mask_check.isChecked(),
             output_path=self.output_edit.text().strip(),
-            overwrite=(
-                AnalysisArtifactOverwrite.CREATE_NEW,
-                AnalysisArtifactOverwrite.REPLACE,
-            )[self.overwrite_combo.currentIndex()],
+            overwrite=AnalysisArtifactOverwrite.CREATE_NEW,
             max_frame_bytes=self.max_frame_mib.value() * 1024 * 1024,
             mode="1d",
             backend=self.backend_combo.currentData(),

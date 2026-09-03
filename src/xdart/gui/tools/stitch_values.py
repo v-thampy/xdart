@@ -340,6 +340,8 @@ class StitchToolForm:
             raise TypeError("detector mask toggle must be an exact bool")
         if type(self.overwrite) is not AnalysisArtifactOverwrite:
             raise TypeError("overwrite policy must be exact AnalysisArtifactOverwrite")
+        if self.overwrite is not AnalysisArtifactOverwrite.CREATE_NEW:
+            raise ValueError("Stitch must create one new immutable artifact")
         if (
             type(self.max_frame_bytes) is not int
             or not 1 <= self.max_frame_bytes <= 4 * 1024 * 1024 * 1024
@@ -581,7 +583,7 @@ class StitchPreflightSummary:
                 and type(self.monitor_selector) is not MetadataColumnSelector
             )
             or type(self.use_detector_mask) is not bool
-            or type(self.overwrite) is not AnalysisArtifactOverwrite
+            or self.overwrite is not AnalysisArtifactOverwrite.CREATE_NEW
             or type(self.holds) is not tuple
             or any(type(item) is not str or not item for item in self.holds)
             or self.backend not in {"multigeometry", "xu_hist"}

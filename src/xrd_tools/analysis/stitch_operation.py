@@ -63,6 +63,7 @@ from xrd_tools.core.scan import SourceKind
 from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactCleanupPending,
     AnalysisArtifactKind,
+    AnalysisArtifactOverwrite,
     AnalysisArtifactPayload,
     AnalysisArtifactProjectionInvalid,
     _project_analysis_artifact_result_v1_compat,
@@ -1867,6 +1868,11 @@ def prepare_stitch_operation(
         or type(plan) not in {StitchOperationPlan, XuStitchOperationPlan}
     ):
         raise TypeError("stitch preparation requires exact Stitch module values")
+    if output.overwrite is not AnalysisArtifactOverwrite.CREATE_NEW:
+        raise StitchOperationRefused(
+            "STITCH_OUTPUT_POLICY_UNSUPPORTED",
+            "Stitch must create one new immutable artifact",
+        )
     if source.analysis.resolved_kind not in {
         SourceKind.SPEC,
         SourceKind.TIFF_SERIES,
