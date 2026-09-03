@@ -50,6 +50,12 @@ all of the following before it enters production:
 5. an identified owner and a removal condition so temporary safeguards do not
    become permanent ceremony.
 
+Evidence may nominate a threat, but the project owner must explicitly approve
+that threat as credible and material before it can authorize production design,
+implementation, or a permanent test matrix.  Reviewer concern, a theoretical
+possibility, or the mere existence of a prototype is not implicit approval.
+Until that decision is recorded, the proposed safeguard remains unimplemented.
+
 The burden of proof belongs to the extra mechanism.  A rare edge case does not
 justify a large permanent state machine by default.  Cheap, local guards may
 still be worthwhile; complexity must remain proportional to the demonstrated
