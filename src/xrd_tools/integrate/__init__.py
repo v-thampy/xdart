@@ -1,11 +1,4 @@
-"""
-Azimuthal integration, GID, calibration, and batch processing.
-"""
-from xrd_tools.integrate.batch import (
-    DirectoryWatcher,
-    process_scan,
-    process_series,
-)
+"""Azimuthal integration, GID, calibration, and stitching."""
 from xrd_tools.integrate.gid import (
     create_fiber_integrator,
     integrate_gi_1d,
@@ -50,7 +43,6 @@ from xrd_tools.integrate.refine import (
 )
 
 __all__ = [
-    "DirectoryWatcher",
     "create_fiber_integrator",
     "create_multigeometry_integrators",
     "create_multigeometry_integrators_from_geometry",
@@ -76,8 +68,6 @@ __all__ = [
     "load_poni",
     "poni_to_fiber_integrator",
     "poni_to_integrator",
-    "process_scan",
-    "process_series",
     "save_poni",
     "ControlFrame",
     "RefineResult",

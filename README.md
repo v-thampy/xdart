@@ -299,7 +299,7 @@ plan = ReductionPlan(
 )
 scan = Scan("scan1", frames, integrator=ai)        # frames: list[ScanFrame]
 run_reduction(plan, scan,
-              sink=NexusSink("processed/scan1.nxs",
+              sink=NexusSink("processed/scan1.nexus",
                              source_base="/path/to/project"))
 ```
 
@@ -310,10 +310,10 @@ scan metadata, and per-frame geometry. Reading back:
 ```python
 from xrd_tools.io import get_1d, get_raw_frame, open_scan, read_frame_view
 
-scan = open_scan("processed/scan1.nxs")            # notebook sugar
-q, intensity, sigma, unit, frames = get_1d("processed/scan1.nxs")
-view = read_frame_view("processed/scan1.nxs", 0)   # one frame, display-ready
-raw = get_raw_frame("processed/scan1.nxs", 0)      # resolves the source pointer
+scan = open_scan("processed/scan1.nexus")          # notebook sugar
+q, intensity, sigma, unit, frames = get_1d("processed/scan1.nexus")
+view = read_frame_view("processed/scan1.nexus", 0) # one frame, display-ready
+raw = get_raw_frame("processed/scan1.nexus", 0)    # resolves the source pointer
 ```
 
 ---
@@ -381,7 +381,7 @@ img = read_image("path/to/image.h5")
 result_1d = integrate_1d(img, ai, npt=1000, unit="q_A^-1")
 
 # Save to NeXus
-write_nexus("output.h5", result_1d)
+write_nexus("output.nexus", result_1d)
 ```
 
 ### Unit conversion
@@ -397,21 +397,12 @@ d = q_to_d(q)                              # Q (A^-1) -> d-spacing (A)
 q = d_to_q(d)                              # d-spacing (A) -> Q (A^-1)
 ```
 
-### Batch processing
+### Multiple scans and live ingestion
 
-```python
-from xrd_tools.integrate import process_series
-
-# Process a sequence of scans with one configured integrator;
-# each writes <output_dir>/<scan_stem>_processed.h5
-outputs = process_series(
-    scan_paths=["./raw_data/scan1", "./raw_data/scan2"],
-    ai=ai,
-    output_dir="./processed",
-)
-```
-
-For directory-watched live ingestion see `integrate.DirectoryWatcher`.
+Drive each scan through the same `run_reduction(..., NexusSink(...))` path shown
+in the headless quick start. The xdart GUI owns directory watching and live
+ingestion; the former `integrate.process_series` / `DirectoryWatcher` flat-HDF5
+pipeline was retired because it did not produce the current processed schema.
 
 ### Grazing incidence
 
@@ -842,8 +833,7 @@ need Qt belongs in `xrd_tools` ("keep xdart thin").
   budgets used by the GUI.
 - **`integrate/`** — pyFAI integration + GI (`integrate_1d/2d`,
   `create_fiber_integrator`, `integrate_gi_*`, `stitch_1d/2d`,
-  calibration: `load_poni` / `poni_to_integrator` / `poni_to_fiber_integrator`),
-  batch (`process_series`, `DirectoryWatcher`).
+  calibration: `load_poni` / `poni_to_integrator` / `poni_to_fiber_integrator`).
 - **`transforms/`** — unit conversions (`tth_to_q`, `q_to_tth`, `q_to_d`,
   `d_to_q`, `energy_to_wavelength`) and angular calculations.
 - **`rsm/`** — reciprocal-space mapping (`ExperimentConfig`, `RSMVolume`,

@@ -103,11 +103,13 @@ def write_h5(
     chi: np.ndarray | list[float],
 ) -> None:
     """
-    Write per-frame integration results to HDF5.
+    Write per-frame integration results to a generic ``.h5``/``.hdf5`` file.
 
     The output layout matches the workflow described in ``CLAUDE.md`` and the
     existing experimental notebooks: each frame is stored in a group named by
     ``frame`` and contains datasets ``q``, ``I``, ``IQChi``, ``Q``, and ``Chi``.
+    It is not the current processed NeXus schema and therefore refuses NeXus
+    suffixes; use :class:`xrd_tools.reduction.NexusSink` for ``.nexus`` output.
 
     Parameters
     ----------
@@ -127,6 +129,11 @@ def write_h5(
         Azimuthal axis associated with ``iqchi``.
     """
     out_path = _as_path(path)
+    if out_path.suffix.casefold() not in {".h5", ".hdf5"}:
+        raise ValueError(
+            "generic HDF5 export target must end in .h5 or .hdf5; "
+            "use NexusSink for current .nexus output"
+        )
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     q_arr = _as_1d_array(q)

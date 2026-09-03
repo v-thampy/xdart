@@ -58,6 +58,8 @@ The shim is scheduled for removal; update imports.
 | `io.read.Scan` (removed) | `io.read.ProcessedScan` | use the explicit read-side type; the old name collided with the reduction-input `Scan` |
 | `reduction/core.py` legacy `Frame/MaskSpec/FrameSource/Scan` block | deleted | the names remain as aliases to the `xrd_tools.core.scan` contracts (same runtime classes) |
 | `NexusSink.swmr` | removed | was dead: `open_nexus_writer(swmr=True)` has refused since 0.41 |
+| `xrd_tools.integrate.process_scan`, `process_series`, `DirectoryWatcher` | removed | the legacy flat-HDF5 pipeline duplicated the current reduction engine and did not write the current processed schema; use `run_reduction(..., sink=NexusSink("output.nexus"))` and the GUI's directory/live ingestion |
+| `io.write_h5("name.nxs" or "name.nexus", ...)` | rejected | `write_h5` is a generic flat-HDF5 export and now requires `.h5`/`.hdf5`; use `NexusSink` for current `.nexus` records |
 | — | `Scan.geometry` (new field) | `DiffractometerGeometry`; lets the headless `NexusSink` derive `/entry/per_frame_geometry` at finish |
 | — | `xrd_tools.io.schema` (new) | schema-as-code: the processed-scan layout declared once (`SCHEMA`), consumed by writers/validators/readers |
 | — | `xrd_tools.io.nexus_record` (new) | per-frame record primitives (source refs, thumbnails, `@source_base`, row surgery) shared by the headless sink and the GUI writer |
@@ -107,6 +109,11 @@ pre-migration reference signature.  Two additive notes:
 
 ## Behavior changes to know about
 
+* **Current processed artifacts use `.nexus` exclusively.** New writers and
+  ordinary processed readers require both the `.nexus` suffix and the current
+  schema/layout. Raw acquisition inputs retain `.h5`, `.hdf5`, `.nxs`, `.nexus`,
+  and `.cxi` support. Historical processed-looking HDF5 is not silently opened
+  as raw data; regenerate it through the current reduction path when needed.
 
 * **Auto χ / χGI ranges are now deterministic (v1.0):** with the 1-D axis set to χ or χGI and
   Auto range enabled, integrations previously used pyFAI's implicit geometry-derived azimuth

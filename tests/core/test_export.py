@@ -98,6 +98,22 @@ def test_write_h5_overwrite_frame(tmp_path):
         np.testing.assert_allclose(g0["IQChi"][:], second_iqchi, rtol=1e-12, atol=1e-12)
 
 
+@pytest.mark.parametrize("suffix", (".nexus", ".nxs", ".cxi"))
+def test_write_h5_refuses_ne_xus_suffixes(tmp_path, suffix):
+    out = tmp_path / f"mislabelled{suffix}"
+    with pytest.raises(ValueError, match="generic HDF5 export target"):
+        write_h5(
+            out,
+            frame=0,
+            q=[0.0],
+            intensity=[1.0],
+            iqchi=np.ones((1, 1)),
+            q_2d=[0.0],
+            chi=[0.0],
+        )
+    assert not out.exists()
+
+
 def test_write_xye_shape_mismatch(tmp_path):
     out = tmp_path / "bad.xye"
     with pytest.raises(ValueError, match="matching shapes"):

@@ -169,61 +169,6 @@ def test_row2_append_prefers_an_existing_nexus(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Row 3 — headless series and watcher output names use ``.nexus``
-# ---------------------------------------------------------------------------
-
-def test_row3_process_series_names_outputs_nexus(monkeypatch, tmp_path):
-    """``process_series`` derives ``<stem>_processed.nexus`` per input scan.
-
-    ``process_scan`` is substituted at the module boundary so this row pins the
-    *name derivation* only — the reduction itself is covered by
-    ``tests/core/test_batch.py``.
-    """
-    from xrd_tools.integrate import batch
-
-    seen: list[Path] = []
-
-    def _fake_process_scan(scan_path, ai, out_h5, **kwargs):
-        seen.append(Path(out_h5))
-        return Path(out_h5)
-
-    monkeypatch.setattr(batch, "process_scan", _fake_process_scan)
-
-    raw_dir = tmp_path / "raw"
-    raw_dir.mkdir()
-    for name in ("scan_1.h5", "scan_2.h5"):
-        _write_raw_master(raw_dir / name)
-
-    batch.process_series(
-        sorted(raw_dir.iterdir()), object(), tmp_path / "out")
-
-    assert [p.name for p in seen] == [
-        "scan_1_processed.nexus", "scan_2_processed.nexus"]
-
-
-def test_row3_directory_watcher_names_outputs_nexus(monkeypatch, tmp_path):
-    from xrd_tools.integrate import batch
-
-    seen: list[Path] = []
-
-    def _fake_process_scan(path, ai, out_h5, **kwargs):
-        seen.append(Path(out_h5))
-        return Path(out_h5)
-
-    monkeypatch.setattr(batch, "process_scan", _fake_process_scan)
-
-    watch = tmp_path / "watch"
-    watch.mkdir()
-    out = tmp_path / "out"
-    source = _write_raw_master(watch / "live_007.h5")
-
-    watcher = batch.DirectoryWatcher(watch, object(), out)
-    watcher._process_new_file(source)
-
-    assert [p.name for p in seen] == ["live_007_processed.nexus"]
-
-
-# ---------------------------------------------------------------------------
 # Row 5 — time-resolved discovery naturally orders a mixed set
 # ---------------------------------------------------------------------------
 
@@ -407,16 +352,20 @@ def test_row12_enumerate_candidates_includes_nexus_for_probe(tmp_path):
     assert "out.nexus" in names
 
 
-def test_row12_discover_scans_includes_nexus_for_structure_probe(tmp_path):
+def test_row12_discover_scans_partitions_raw_and_processed_nexus(tmp_path):
     from xrd_tools.sources.discover import discover_scans
 
     _write_raw_master(tmp_path / "raw.nxs")
     _write_processed(tmp_path / "out.nexus")
 
-    names = {Path(spec.uri).name
-             for spec in discover_scans(tmp_path, "nexus_stack")}
-    assert "raw.nxs" in names
-    assert "out.nexus" in names
+    raw_names = {Path(spec.uri).name
+                 for spec in discover_scans(tmp_path, "nexus_stack")}
+    processed_names = {
+        Path(spec.uri).name
+        for spec in discover_scans(tmp_path, "processed_nexus")
+    }
+    assert raw_names == {"raw.nxs"}
+    assert processed_names == {"out.nexus"}
 
 
 def test_row12_nexus_is_not_a_supported_raw_image_extension():
@@ -705,76 +654,12 @@ def test_pd_row6_non_file_entries_are_never_returned_as_siblings(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Correction round 2 — collision preflight on the headless writer path
-#
-# ``source_architecture.md`` and handoff §2 rule 8 require the suffix-independent
-# guard before EVERY writer open.  ``process_series`` and ``DirectoryWatcher``
-# inherit it by calling through ``process_scan``; there is no second guard.
-# ---------------------------------------------------------------------------
-
-def test_c2row10_process_scan_rejects_a_same_inode_container_target(tmp_path):
-    """C2 row 10 — a hardlink alias of the container source is refused."""
-    from xrd_tools.integrate.batch import process_scan
-    from xrd_tools.io.output_safety import OutputCollisionError
-
-    source = _write_raw_master(tmp_path / "raw.h5")
-    before = source.read_bytes()
-    alias = tmp_path / "raw_alias.h5"
-    os.link(source, alias)
-
-    with pytest.raises(OutputCollisionError):
-        process_scan(source, object(), alias, npt=2, npt_rad=2, npt_azim=2)
-
-    assert source.read_bytes() == before
-
-
-def test_c2row11_process_scan_rejects_a_target_aliasing_a_directory_member(
-        tmp_path):
-    """C2 row 11 — the guard covers every member of an image directory."""
-    from xrd_tools.integrate.batch import process_scan
-    from xrd_tools.io.output_safety import OutputCollisionError
-
-    scan_dir = tmp_path / "images"
-    scan_dir.mkdir()
-    member = scan_dir / "frame_0002.tif"
-    member.write_bytes(b"\x49\x49\x2a\x00not-a-real-tif")
-    (scan_dir / "frame_0001.tif").write_bytes(b"\x49\x49\x2a\x00other")
-    before = member.read_bytes()
-
-    alias = tmp_path / "out.h5"
-    os.link(member, alias)
-
-    with pytest.raises(OutputCollisionError):
-        process_scan(scan_dir, object(), alias, npt=2, npt_rad=2, npt_azim=2)
-
-    assert member.read_bytes() == before
-
-
-def test_c2row10_a_safe_headless_target_is_still_accepted(tmp_path):
-    """Retained: the preflight must not reject an ordinary separate target."""
-    from xrd_tools.integrate.batch import process_scan
-
-    source = _write_raw_master(tmp_path / "raw.h5")
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
-
-    # ``ai=object()`` fails per frame and is logged, but the run must reach the
-    # loop at all — the guard is what this row proves does NOT fire.
-    result = process_scan(source, object(), out_dir / "raw_processed.nexus",
-                          npt=2, npt_rad=2, npt_azim=2)
-
-    assert Path(result).name == "raw_processed.nexus"
-
-
-# ---------------------------------------------------------------------------
 # Row 15 (headless half) — function-scoped owner census
 # ---------------------------------------------------------------------------
 
 #: (relative source path, qualified function name) for every authorized
 #: HEADLESS generated-output constructor.  Each MUST consume the shared owner.
 HEADLESS_PRODUCERS = (
-    ("xrd_tools/integrate/batch.py", "process_series"),
-    ("xrd_tools/integrate/batch.py", "DirectoryWatcher._process_new_file"),
     ("xrd_tools/analysis/time_resolved.py", "discover_processed_scans"),
 )
 
