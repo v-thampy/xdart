@@ -126,6 +126,7 @@ def _average_result(target: str) -> AverageScanResult:
         disposition="COMMITTED",
         target=target,
         entry="entry",
+        version_identity="e" * 64,
         operation_identity="a" * 64,
         science_identity="b" * 64,
         contributor_extent=2,

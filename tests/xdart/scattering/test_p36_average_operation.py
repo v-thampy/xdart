@@ -80,6 +80,7 @@ def _result(disposition: str, target: str = "/detached/average.nxs") -> AverageS
     code, diagnostic = diagnostics[disposition]
     return AverageScanResult(
         disposition=disposition, target=target, entry="entry",
+        version_identity="e" * 64,
         operation_identity="a" * 64, science_identity="b" * 64,
         contributor_extent=2, logical_labels=(1,),
         committed_labels=(1,) if committed else (),

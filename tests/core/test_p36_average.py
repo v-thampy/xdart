@@ -23,6 +23,14 @@ from xrd_tools.reduction import (
     ReductionPlan,
 )
 from xrd_tools.reduction import average as module
+
+def _science_of(plan):
+    """Science payload for a prepared plan (the helper takes explicit inputs)."""
+    return module._science_payload(
+        plan.recipe, plan.numeric_metadata_keys, plan.invariant_metadata_keys,
+    )
+
+
 from xrd_tools.session.experiment_state import (
     CalibrationState, FactStatus, MaskState, PoniValues,
 )
@@ -446,7 +454,7 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
         accepted.append(result)
         assert runner.close() is result
     plans = tuple(plans)
-    assert module._science_payload(plans[0]) == module._science_payload(plans[1])
+    assert _science_of(plans[0]) == _science_of(plans[1])
     assert plans[0].science_identity == plans[1].science_identity
     operation_payloads = [module._operation_payload(plan) for plan in plans]
     assert [payload["batch_mode"] for payload in operation_payloads] == [False, True]
@@ -516,7 +524,7 @@ def test_average_background_none_is_canonical_and_active_refuses_pre_effect(
     assert plans[0].allocation == plans[1].allocation
     assert plans[0].science_identity == plans[1].science_identity
     assert plans[0].operation_identity == plans[1].operation_identity
-    assert module._science_payload(plans[0])["background"] is None
+    assert _science_of(plans[0])["background"] is None
 
     active = AverageScanRecipe(
         source, target, reduction,
@@ -712,7 +720,7 @@ def test_recipe_deep_snapshot_survives_all_caller_mutation(tmp_path) -> None:
     variant_prepared = _prepare_average_scan(
         replace(variant, background=None),
     )
-    assert tuple(module._science_payload(prepared)["calibration"]
+    assert tuple(_science_of(prepared)["calibration"]
                  ["detector_config"]["nested"]["labels"]) == ("fast", True, None)
     assert prepared.science_identity != variant_prepared.science_identity
     source_options["files"].append(str(tmp_path / "late.tif"))
@@ -1815,7 +1823,7 @@ def test_average_fail_loud_monitor_policy_is_identical_in_science_provenance_and
                          ))
             recipe = AverageScanRecipe(source, target, reduction, numeric_metadata_keys=("I0",))
             plan = _prepare_average_scan(recipe)
-            assert module._science_payload(plan)["reduction_strict_policy"] == strict
+            assert _science_of(plan)["reduction_strict_policy"] == strict
             result = _run_average_scan(recipe)
             gui = gui_run(source, gui_target, reduction)
             assert (result.disposition, result.diagnostic_code) == (
@@ -1890,7 +1898,7 @@ def test_average_fail_loud_all_dummy_2d_refuses_before_commit(tmp_path, monkeypa
     plan = _prepare_average_scan(recipe)
     strict = {"policy": "average_reduction_strict_v1", "missing_normalization": True,
               "gi_all_dummy": True, "thumbnail_fallback": True}
-    assert module._science_payload(plan)["reduction_strict_policy"] == strict
+    assert _science_of(plan)["reduction_strict_policy"] == strict
     result = _run_average_scan(recipe)
     slot = OperationSlot()
     identity = slot.begin_average(

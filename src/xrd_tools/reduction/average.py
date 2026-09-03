@@ -460,11 +460,14 @@ def _average_direct_chunk_policy(
     return EigerDirectChunkPolicy.from_owner_grant(
         native_frame, 2 * native_frame,
     )
-def _science_payload(plan: AverageScanPlan) -> dict[str, Any]:
-    recipe = plan.recipe
+def _science_payload(
+    recipe: AverageScanRecipe,
+    numeric_metadata_keys: tuple[str, ...],
+    invariant_metadata_keys: tuple[str, ...],
+) -> dict[str, Any]:
     payload = _recipe_payload(recipe)
     modes = required_result_modes(_derived_reduction(recipe))
-    return {'api_version': _COUNT_POLICY, 'integration_1d': payload['integration_1d'], 'integration_2d': payload['integration_2d'], 'integrator_gi': payload['integrator_gi'], 'threshold_min': recipe.threshold_min, 'threshold_max': recipe.threshold_max, 'mask_saturation': recipe.mask_saturation, 'reduction_extra': payload['reduction_extra'], 'calibration': payload['calibration'], 'background': payload['background'], 'pixel_accumulator_policy': 'float64_ordered_inplace_v1', 'finite_count_policy': 'uint32_per_pixel_extent_1000000_v1', 'zero_count_policy': 'nan_and_all_zero_refusal_v1', 'overflow_policy': 'post_add_nonfinite_refusal_v1', 'numeric_metadata_keys': plan.numeric_metadata_keys, 'invariant_metadata_keys': plan.invariant_metadata_keys, 'numeric_metadata_policy': 'binary64_neumaier_per_key_denominator_v1', 'invariant_metadata_policy': 'canonical_json_scalar_exact_all_v1', 'metadata_row_policy': 'graph_bound_complete_scalar_row_256_names_65536_bytes_v1', 'metadata_source_policy': 'container_metadata_inputs_and_tiff_preparse_bounded_v2', 'configured_metadata_lookup_policy': 'exact_first_unique_casefold_single_output_domain_v2', 'default_optional_lookup_policy': 'exact_source_spelling_omit_configured_alias_v2', 'conditioning_order': ['threshold', 'frame_background', 'static_frame_mask', 'detector_value_mask', 'finite_accumulate'], 'result_modes': [f'{mode.kind}:{mode.key}' for mode in modes], 'reduction_strict_policy': {'policy': 'average_reduction_strict_v1', 'missing_normalization': True, 'gi_all_dummy': True, 'thumbnail_fallback': True}}
+    return {'api_version': _COUNT_POLICY, 'integration_1d': payload['integration_1d'], 'integration_2d': payload['integration_2d'], 'integrator_gi': payload['integrator_gi'], 'threshold_min': recipe.threshold_min, 'threshold_max': recipe.threshold_max, 'mask_saturation': recipe.mask_saturation, 'reduction_extra': payload['reduction_extra'], 'calibration': payload['calibration'], 'background': payload['background'], 'pixel_accumulator_policy': 'float64_ordered_inplace_v1', 'finite_count_policy': 'uint32_per_pixel_extent_1000000_v1', 'zero_count_policy': 'nan_and_all_zero_refusal_v1', 'overflow_policy': 'post_add_nonfinite_refusal_v1', 'numeric_metadata_keys': numeric_metadata_keys, 'invariant_metadata_keys': invariant_metadata_keys, 'numeric_metadata_policy': 'binary64_neumaier_per_key_denominator_v1', 'invariant_metadata_policy': 'canonical_json_scalar_exact_all_v1', 'metadata_row_policy': 'graph_bound_complete_scalar_row_256_names_65536_bytes_v1', 'metadata_source_policy': 'container_metadata_inputs_and_tiff_preparse_bounded_v2', 'configured_metadata_lookup_policy': 'exact_first_unique_casefold_single_output_domain_v2', 'default_optional_lookup_policy': 'exact_source_spelling_omit_configured_alias_v2', 'conditioning_order': ['threshold', 'frame_background', 'static_frame_mask', 'detector_value_mask', 'finite_accumulate'], 'result_modes': [f'{mode.kind}:{mode.key}' for mode in modes], 'reduction_strict_policy': {'policy': 'average_reduction_strict_v1', 'missing_normalization': True, 'gi_all_dummy': True, 'thumbnail_fallback': True}}
 def _allocation_payload(value: SessionResourceAllocation) -> dict[str, Any]:
     return {'requirements': {item.name: getattr(value.requirements, item.name) for item in fields(value.requirements)}, 'envelope_bytes': value.envelope_bytes, 'counts': dict(value.counts), 'categories': dict(value.categories), 'minimum_bytes': value.minimum_bytes, 'floor_bytes': value.floor_bytes, 'assigned_bytes': value.assigned_bytes, 'origin': value.origin, 'oversize_excess_bytes': value.oversize_excess_bytes}
 def _operation_payload(plan: AverageScanPlan) -> dict[str, Any]:
@@ -533,12 +536,7 @@ def _plan_from_prepared_graph(
         direct_eiger_eligible=direct_eiger_eligible,
     )
     graph_digest = source_graph_digest(graph)
-    science_payload_owner = SimpleNamespace(
-        recipe=recipe,
-        numeric_metadata_keys=numeric,
-        invariant_metadata_keys=invariant,
-    )
-    science = hashlib.sha256(b'xdart.average-science.v1\x00' + _canonical(_science_payload(science_payload_owner))).hexdigest()
+    science = hashlib.sha256(b'xdart.average-science.v1\x00' + _canonical(_science_payload(recipe, numeric, invariant))).hexdigest()
     version = _average_version_identity(
         source_graph_digest=graph_digest,
         science_identity=science,
@@ -563,9 +561,23 @@ def _diagnostic(value: BaseException | str) -> str:
         return type(value).__name__
 def _result(plan: AverageScanPlan, disposition: str, *, code: str='', diagnostic: str='', denominators=(), evidence=None, h23_phase=None, commit=None) -> AverageScanResult:
     committed = (1,) if disposition == 'COMMITTED' else ()
-    return AverageScanResult(disposition, plan.recipe.target, plan.recipe.entry, plan.operation_identity, plan.science_identity, plan.contributor_extent, plan.logical_labels, committed, tuple(denominators), evidence if disposition == 'COMMITTED' else None, code, diagnostic, 'committed' if disposition == 'COMMITTED' else h23_phase, commit if disposition == 'COMMITTED' else None)
+    return AverageScanResult(disposition, plan.output_artifact, plan.recipe.entry, plan.version_identity, plan.operation_identity, plan.science_identity, plan.contributor_extent, plan.logical_labels, committed, tuple(denominators), evidence if disposition == 'COMMITTED' else None, code, diagnostic, 'committed' if disposition == 'COMMITTED' else h23_phase, commit if disposition == 'COMMITTED' else None)
 def _committed_average_mismatch(result: AverageScanResult, target: str | Path, entry: str) -> str | None:
-    expected = _average_target(target); commit = result.commit_identity
+    """Verify a committed Average by RECOMPUTING its deterministic successor.
+
+    ``target`` is only the caller's directory/naming anchor: Average never writes
+    it.  Recomputing the successor from that anchor plus the result's own version
+    identity refuses a wrong directory, a wrong artifact family and a wrong
+    version in one equality, and compares two already ``resolve()``d paths so a
+    symlinked project root cannot make an honest successor look foreign.
+    """
+    commit = result.commit_identity
+    if _COUNT_DIGEST.fullmatch(result.version_identity) is None:
+        return 'version'
+    try:
+        expected = _average_output_artifact(_average_target(target), result.version_identity)
+    except Exception:
+        return 'target'
     if result.target != expected or result.entry != entry: return 'target' if result.target != expected else 'entry'
     if type(commit) is not StreamTerminal or commit.target != expected or type(commit.ordinal) is not int or commit.ordinal <= 0: return 'commit'
     try: persisted = read_provenance(expected, entry=entry)['config'][_COUNT_POLICY]; snapshot = capture_target_snapshot(expected)
@@ -576,7 +588,7 @@ def _recipe_refusal(
     recipe: AverageScanRecipe, code: str, *, diagnostic: str | None = None,
 ) -> AverageScanResult:
     return AverageScanResult(
-        'REFUSED', recipe.target, recipe.entry, '', '', 0, (1,), (), (), None,
+        'REFUSED', recipe.target, recipe.entry, '', '', '', 0, (1,), (), (), None,
         code, code if diagnostic is None else diagnostic, None, None,
     )
 def _error_result(plan: AverageScanPlan, error: BaseException, *, h23: bool=False, denominators=()) -> AverageScanResult:
@@ -970,8 +982,8 @@ def _reduce_average(plan: AverageScanPlan, science: dict[str, Any], token: threa
                 calibration, integrator=integrator,
             )
     frame = ScanFrame(1, image=science['average'], metadata=dict(science['metadata']), source_path=None, source_frame_index=0, background=None, mask=science['zero'])
-    provenance = {**_science_payload(plan), 'science_identity': plan.science_identity, 'operation_identity': plan.operation_identity, 'source_graph_digest': plan.source_graph_digest, 'contributor_extent': plan.contributor_extent, 'metadata_denominators': science['denominators'], 'direct_eiger_eligible': plan.direct_eiger_eligible, 'direct_eiger_execution': science['direct_eiger_execution']}
-    scan = Scan('average', [frame], poni=poni, integrator=integrator, output_path=plan.recipe.target, extra={'average_finite_counts': science['finite'], 'average_scan_provenance': provenance, 'detector_shape': plan.detector_shape, **({'detector_calibration': detector_values} if detector_values is not None else {})})
+    provenance = {**_science_payload(plan.recipe, plan.numeric_metadata_keys, plan.invariant_metadata_keys), 'science_identity': plan.science_identity, 'operation_identity': plan.operation_identity, 'source_graph_digest': plan.source_graph_digest, 'contributor_extent': plan.contributor_extent, 'metadata_denominators': science['denominators'], 'direct_eiger_eligible': plan.direct_eiger_eligible, 'direct_eiger_execution': science['direct_eiger_execution']}
+    scan = Scan('average', [frame], poni=poni, integrator=integrator, output_path=plan.output_artifact, extra={'average_finite_counts': science['finite'], 'average_scan_provenance': provenance, 'detector_shape': plan.detector_shape, **({'detector_calibration': detector_values} if detector_values is not None else {})})
     progress('reduce', 0, 1)
     reduced = run_reduction(_derived_reduction(plan.recipe), scan, cancel_token=token, execution='chunked', retain_products=True, strict=StrictPolicy(True, True, True))
     progress('reduce', 1, 1)
@@ -980,12 +992,12 @@ def _reduce_average(plan: AverageScanPlan, science: dict[str, Any], token: threa
     return (scan, frame, reduced.frames[1], provenance)
 def _append_intent(plan: AverageScanPlan, graph: PreparedSourceExecutionGraph) -> AppendIntent:
     modes = required_result_modes(_derived_reduction(plan.recipe))
-    return AppendIntent(plan.recipe.entry, plan.recipe.source_base or '', science_fingerprint(stable_lineage_projection(graph, target=plan.recipe.target)), plan.science_identity, tuple((f'{item.kind}:{item.key}' for item in modes)), append_source_from_execution_graph(graph, generation=1), (1,))
+    return AppendIntent(plan.recipe.entry, plan.recipe.source_base or '', science_fingerprint(stable_lineage_projection(graph, target=plan.output_artifact)), plan.science_identity, tuple((f'{item.kind}:{item.key}' for item in modes)), append_source_from_execution_graph(graph, generation=1), (1,))
 def _average_sink(plan: AverageScanPlan, graph: PreparedSourceExecutionGraph):
     run_configuration = _recipe_payload(plan.recipe)
     if plan.recipe.background is None:
         run_configuration.pop('background')
-    return NexusSink(plan.recipe.target, entry=plan.recipe.entry, overwrite=True, source_base=plan.recipe.source_base, run_configuration_provenance=run_configuration, source_execution_provenance=source_execution_projection(graph), source_snapshots_provenance=source_snapshots_projection(graph, writer=True), same_run_intent=_append_intent(plan, graph), rollback_until_commit=True)
+    return NexusSink(plan.output_artifact, entry=plan.recipe.entry, overwrite=True, create_new=True, source_base=plan.recipe.source_base, run_configuration_provenance=run_configuration, source_execution_provenance=source_execution_projection(graph), source_snapshots_provenance=source_snapshots_projection(graph, writer=True), same_run_intent=_append_intent(plan, graph), rollback_until_commit=True)
 def _resolved_lineage_path(stored: str, artifact: str | Path, source_base: str) -> str:
     value = resolve_source_master(stored, scan_file=artifact, source_base=source_base)
     _reject(value is None, 'Average lineage source is unavailable')
@@ -1085,7 +1097,7 @@ class AverageScanRunner:
 
     def _preparation_cancelled(self) -> AverageScanResult:
         return self._terminal(AverageScanResult(
-            'CANCELLED', self.recipe.target, self.recipe.entry, '', '', 0,
+            'CANCELLED', self.recipe.target, self.recipe.entry, '', '', '', 0,
             (1,), (), (), None, 'AVERAGE_CANCELLED',
             'Average preparation cancelled', None, None,
         ))
@@ -1439,7 +1451,7 @@ class AverageScanRunner:
             raise SourceRevisionChanged('AVERAGE_SOURCE_DRIFT') from error
 
     def _target_sweep(self, expected: TargetSnapshot) -> None:
-        _reject(capture_target_snapshot(self.plan.recipe.target) != expected,
+        _reject(capture_target_snapshot(self.plan.output_artifact) != expected,
                 'AVERAGE_TARGET_DRIFT')
 
     def _terminal_abort(self, error: BaseException, disposition: str):
@@ -1533,7 +1545,7 @@ class AverageScanRunner:
     def _writer_pending(self):
         try:
             self._h23_target_snapshot = capture_target_snapshot(
-                self.plan.recipe.target,
+                self.plan.output_artifact,
             )
         except BaseException as error:
             return self._abort(error)
@@ -1567,7 +1579,7 @@ class AverageScanRunner:
             writer = self._sink._writer
             writer.finish(self._sink._writer_finalization(writer))
             self._h23_target_snapshot = capture_target_snapshot(
-                self.plan.recipe.target,
+                self.plan.output_artifact,
             )
             self._progress('write', 1, 1)
         except WriterIncomplete:
@@ -1643,7 +1655,7 @@ class AverageScanRunner:
             return self._abort(error)
         try:
             self._h23_target_snapshot = capture_target_snapshot(
-                self.plan.recipe.target,
+                self.plan.output_artifact,
             )
         except BaseException as error:
             return self._abort(error)

@@ -705,14 +705,30 @@ class WorkspaceOperationOwner:
                 WorkspaceRefreshEffect.CONTROLS,
                 "Average returned an invalid terminal disposition.",
             )
-        if result.target != target or result.entry != entry:
+        # Average never writes `target`: it is only this operation's directory
+        # and naming anchor.  Recompute the deterministic successor from that
+        # anchor plus the result's own version identity, so a wrong directory,
+        # family or version cannot be adopted.  Path math only -- the worker
+        # already did the full provenance verification.
+        from xrd_tools.reduction.average import (
+            _average_output_artifact,
+            _average_target,
+        )
+
+        try:
+            successor = _average_output_artifact(
+                _average_target(target), result.version_identity
+            )
+        except Exception:
+            successor = None
+        if successor is None or result.target != successor or result.entry != entry:
             self._average = None
             return WorkspaceOperationTransition(
                 WorkspaceRefreshEffect.CONTROLS,
                 "Average terminal target mismatch; Browse was not reloaded.",
             )
         commit_identity = _terminal_identity_for_target(
-            result.commit_identity, target
+            result.commit_identity, successor
         )
         if commit_identity is None:
             self._average = None
@@ -728,7 +744,7 @@ class WorkspaceOperationOwner:
                 request_catalog=True,
             )
         directive = AverageReloadDirective(
-            target,
+            successor,
             entry,
             commit_identity,
             state.source_root,
