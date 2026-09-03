@@ -1984,70 +1984,37 @@ def test_module_commit_refuses_genuine_artifact_with_foreign_provenance(tmp_path
         ModuleCommitReceipt.from_artifact(request, artifact)
 
 
-def test_module_committed_cleanup_retry_returns_one_exact_terminal(tmp_path, monkeypatch):
-    import xrd_tools.io.output_transaction as transaction_api
-
-    initial = _request(tmp_path)
+@pytest.mark.parametrize(
+    ("kind", "artifact_kind"),
+    (
+        (ModuleKind.STITCH, AnalysisArtifactKind.STITCH_1D),
+        (ModuleKind.RSM, AnalysisArtifactKind.RSM),
+    ),
+)
+def test_public_module_request_refuses_replace_without_mutating_target(
+    tmp_path,
+    kind,
+    artifact_kind,
+):
+    initial = _request(tmp_path, kind=kind, artifact_kind=artifact_kind)
     target = Path(initial.output.target)
-    target.write_bytes(b"prior")
+    original = b"prior operator output"
+    target.write_bytes(original)
     output_request = ModuleOutputRequest(
         target,
-        initial.output.kind,
+        artifact_kind,
         AnalysisArtifactOverwrite.REPLACE,
     )
-    request = ModuleOperationRequest(
-        initial.source,
-        output_request,
-        initial.plan_fingerprint,
-        initial.provenance_digest,
-    )
-    provenance = _provenance(request)
-    bound = module_artifact_request(request, provenance)
-    output = admit_module_artifact(
-        request,
-        provenance,
-        coordinator=OutputTransactionCoordinator(),
-    )
-    backup = output._output._transaction.backup
-    real_unlink = transaction_api._unlink
-    failed = []
-    writes = []
 
-    def fail_backup_once(path):
-        if Path(path) == backup and not failed:
-            failed.append("backup")
-            raise OSError("backup cleanup fault")
-        return real_unlink(path)
-
-    def write_once(entry):
-        writes.append("writer")
-        write_stitched(
-            entry,
-            stitched_1d=IntegrationResult1D(
-                radial=np.linspace(0.1, 1.0, 8),
-                intensity=np.linspace(2.0, 3.0, 8),
-                unit="q_A^-1",
-            ),
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
+    with pytest.raises(ValueError, match="must create one new immutable artifact"):
+        ModuleOperationRequest(
+            initial.source,
+            output_request,
+            initial.plan_fingerprint,
+            initial.provenance_digest,
         )
 
-    monkeypatch.setattr(transaction_api, "_unlink", fail_backup_once)
-    with pytest.raises(AnalysisArtifactCleanupPending):
-        output.publish(write_once)
-    assert output.snapshot.phase is TransactionPhase.CLEANUP_PENDING
-    assert output.snapshot.receipt is None
-    assert output.snapshot.remaining_lease_owners == tuple(LeaseOwner)
-    recovered = output.retry_cleanup()
-    assert recovered.disposition is ModuleDisposition.COMMITTED
-    assert recovered.request is request
-    assert recovered.commit is not None
-    assert recovered.commit.request is request
-    assert recovered.commit.output is request.output
-    assert recovered.commit.result_fingerprint
-    assert output.snapshot.remaining_lease_owners == ()
-    assert output.retry_cleanup() is recovered
-    assert writes == ["writer"]
+    assert target.read_bytes() == original
 
 
 def test_repeated_module_postcommit_readback_retry_does_not_replay_writer(

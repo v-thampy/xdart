@@ -589,21 +589,14 @@ def test_prepare_is_image_free_and_binds_exact_spec_science(tmp_path, monkeypatc
     assert request.module.plan_fingerprint == plan.fingerprint
 
 
-@pytest.mark.parametrize(
-    "overwrite",
-    (
-        AnalysisArtifactOverwrite.CREATE_NEW,
-        AnalysisArtifactOverwrite.REPLACE,
-    ),
-)
-def test_prepare_refuses_symbolic_link_output_target(tmp_path, overwrite):
+def test_prepare_refuses_symbolic_link_output_target(tmp_path):
     source, _output, plan, _frames = _synthetic_spec_source(tmp_path)
     target = tmp_path / "output" / "rsm.nexus"
     target.symlink_to(tmp_path / "operator-owned.nexus")
     output = ModuleOutputRequest(
         target,
         AnalysisArtifactKind.RSM,
-        overwrite,
+        AnalysisArtifactOverwrite.CREATE_NEW,
     )
 
     with pytest.raises(RSMOperationRefused) as refused:
@@ -1138,56 +1131,27 @@ def test_strict_reload_rejects_writer_corrupted_fixed_grid_without_replay(
     assert counts == {"science": 1, "writer": 1}
 
 
-def test_cleanup_pending_retries_without_replaying_science_or_writer(
-    tmp_path, monkeypatch
-):
-    import xrd_tools.io.output_transaction as transaction_api
-
+def test_legacy_prepare_refuses_replace_without_mutating_target(tmp_path):
     initial, _frames = _prepared_rsm(tmp_path)
     target = Path(initial.module.output.target)
-    target.write_bytes(b"prior operator output")
+    original = b"prior operator output"
+    target.write_bytes(original)
     replacement = ModuleOutputRequest(
         target,
         AnalysisArtifactKind.RSM,
         AnalysisArtifactOverwrite.REPLACE,
     )
-    request = prepare_rsm_operation(
-        initial.module.source,
-        replacement,
-        initial.plan,
-        project_root=tmp_path,
-    )
-    original_unlink = transaction_api._unlink
-    original_write = rsm_operation.write_rsm
-    original_run = rsm_operation.run_rsm
-    failures = []
-    counts = {"science": 0, "writer": 0}
 
-    def fail_backup_once(path):
-        if ".xdart-replacing-" in Path(path).name and not failures:
-            failures.append("backup")
-            raise OSError("backup cleanup fault")
-        return original_unlink(path)
+    with pytest.raises(RSMOperationRefused) as refused:
+        prepare_rsm_operation(
+            initial.module.source,
+            replacement,
+            initial.plan,
+            project_root=tmp_path,
+        )
 
-    def counted_write(*args, **kwargs):
-        counts["writer"] += 1
-        return original_write(*args, **kwargs)
-
-    def counted_run(*args, **kwargs):
-        counts["science"] += 1
-        return original_run(*args, **kwargs)
-
-    monkeypatch.setattr(transaction_api, "_unlink", fail_backup_once)
-    monkeypatch.setattr(rsm_operation, "write_rsm", counted_write)
-    monkeypatch.setattr(rsm_operation, "run_rsm", counted_run)
-    with pytest.raises(RSMOperationCleanupPending) as pending:
-        run_rsm_operation(request)
-    recovered = pending.value.retry_cleanup()
-    assert recovered.terminal.disposition is ModuleDisposition.COMMITTED
-    assert recovered.payload is not None
-    assert pending.value.execution.retry_cleanup() is recovered
-    assert failures == ["backup"]
-    assert counts == {"science": 1, "writer": 1}
+    assert refused.value.code == "RSM_OUTPUT_POLICY_UNSUPPORTED"
+    assert target.read_bytes() == original
 
 
 def test_existing_create_new_output_is_late_refusal_without_overwrite(tmp_path):

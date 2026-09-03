@@ -430,6 +430,10 @@ class ModuleOperationRequest:
         )
         if not compatible:
             raise ValueError("module source and artifact kinds do not match")
+        if self.output.overwrite is not AnalysisArtifactOverwrite.CREATE_NEW:
+            raise ValueError(
+                "standalone module output must create one new immutable artifact"
+            )
         if xu_bound and (
             self.source.kind is not ModuleKind.STITCH
             or self.output.kind is not AnalysisArtifactKind.STITCH_1D

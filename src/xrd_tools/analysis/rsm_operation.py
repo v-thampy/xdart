@@ -4045,6 +4045,11 @@ def prepare_rsm_operation(
             "OUTPUT_KIND_MISMATCH",
             "RSM requires an RSM analysis artifact output",
         )
+    if output.overwrite is not AnalysisArtifactOverwrite.CREATE_NEW:
+        raise RSMOperationRefused(
+            "RSM_OUTPUT_POLICY_UNSUPPORTED",
+            "RSM must create one new immutable artifact",
+        )
     root = _project_root(project_root)
     output = _bind_project_output(output, root)
     output_authority = _capture_output_authority(output, root)
