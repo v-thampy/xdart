@@ -125,6 +125,26 @@ def test_projection_owns_modes_and_refuses_run_readiness_for_unowned_mode() -> N
     assert unsupported.readiness == "Ready · Int 1D (XYE)"
 
 
+def test_retired_analysis_mode_remains_visible_and_fail_loud() -> None:
+    expected = {
+        "Stitch 1D": "open Analysis > Stitching",
+        "Stitch 2D": "open Analysis > Stitching",
+        "RSM": "open Analysis > Reciprocal Space Map",
+    }
+    for mode, guidance in expected.items():
+        projected = _run_strip(
+            _configured_intent(mode), executor_available=True,
+        )
+        assert projected.mode == mode
+        assert projected.modes == (*RUN_MODE_CHOICES, mode)
+        assert dict(projected.disabled_modes) == {
+            mode: projected.readiness,
+        }
+        assert guidance in projected.readiness
+        assert not projected.ready
+        assert not projected.run_enabled
+
+
 def test_directory_strip_qualifies_paused_and_failed_file_progress() -> None:
     base = make_shell_projection(plot_mode="Single")
 

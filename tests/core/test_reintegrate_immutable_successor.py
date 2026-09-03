@@ -2549,6 +2549,40 @@ def test_capsule_miss_is_one_visible_result_diagnostic_across_recipe_reuse(
     assert run_reintegrate_successor(direct).diagnostics == ()
 
 
+def test_intentionally_unprepared_offer_is_a_quiet_direct_route(
+    tmp_path, monkeypatch,
+):
+    import xrd_tools.reduction.reintegrate_successor as module
+    from xrd_tools.reduction import (
+        ReintegrateSuccessorPlan,
+        unprepared_reintegrate_offer,
+    )
+
+    seeded = _seed_existing(tmp_path, labels=(2, 5), name="lazy-direct")
+    calls = []
+    sentinel = object()
+
+    def direct(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(module, "_legacy_successor_plan", direct)
+    result = ReintegrateSuccessorPlan.from_prepared_or_artifact(
+        unprepared_reintegrate_offer(),
+        seeded.target,
+        entry="entry",
+        dimension="1d",
+        preparation=_dimension_preparation(seeded, "1d"),
+        source_root=str(seeded.target.parent),
+        expected_labels=seeded.labels,
+    )
+
+    assert result is sentinel
+    assert len(calls) == 1
+    assert calls[0][1]["legacy_reason"].value == "DIRECT_FROM_ARTIFACT"
+    assert calls[0][1]["miss_code"] is None
+
+
 @pytest.mark.parametrize("dimension", ("1d", "2d"))
 def test_capsule_miss_allows_changed_click_integration_settings(
     tmp_path, monkeypatch, dimension,

@@ -63,6 +63,16 @@ def build_run_strip_projection(
     if not intent.save_path and not viewer:
         missing.append("output")
     mode_blocker = dict(UNOWNED_RUN_MODE_REASONS).get(mode)
+    if tool is Tool.STITCH:
+        mode_blocker = (
+            "Stitching is a standalone Analysis tool; open Analysis > "
+            "Stitching, or choose a current Run mode."
+        )
+    elif tool is Tool.RSM:
+        mode_blocker = (
+            "RSM is a standalone Analysis tool; open Analysis > Reciprocal "
+            "Space Map, or choose a current Run mode."
+        )
     if mode not in _NATIVE_RUN_MODES and mode_blocker is None:
         mode_blocker = (
             f"{mode or 'Selected mode'} has no mounted vNext operation "
@@ -70,6 +80,14 @@ def build_run_strip_projection(
         )
     if viewer:
         mode_blocker = None
+    modes = RUN_MODE_CHOICES
+    disabled_modes = UNOWNED_RUN_MODE_REASONS
+    if mode and mode not in modes:
+        # Preserve a retired/foreign saved value visibly.  Silently selecting
+        # the first current row would make the combo disagree with the intent
+        # that admission actually evaluates.
+        modes = (*modes, mode)
+        disabled_modes = (*disabled_modes, (mode, mode_blocker or "Unsupported"))
     if mode_blocker is not None:
         readiness = mode_blocker
     elif not executor_available and not viewer:
@@ -104,8 +122,8 @@ def build_run_strip_projection(
     )
     return RunStripProjection(
         phase=_shell_phase(phase),
-        modes=RUN_MODE_CHOICES,
-        disabled_modes=UNOWNED_RUN_MODE_REASONS,
+        modes=modes,
+        disabled_modes=disabled_modes,
         mode=mode,
         batch=intent.batch_mode,
         cores=max(1, intent.max_cores),

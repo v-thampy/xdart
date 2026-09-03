@@ -780,6 +780,28 @@ class ReintegrateSuccessorPlan:
                         raise PreparedCapsuleMiss(
                             PreparedCapsuleMissCode.CAPSULE_SCHEMA_UNSUPPORTED
                         )
+                    if (
+                        offered.miss_code
+                        is PreparedCapsuleMissCode.CAPSULE_NOT_SUPPLIED
+                    ):
+                        # The GUI's typed lazy offer deliberately defers all
+                        # admission until the operator clicks Reintegration.
+                        # This is the normal direct route, not a failed
+                        # prepared-capsule attempt and therefore not a warning.
+                        return cls.from_artifact(
+                            source_artifact,
+                            entry=entry,
+                            dimension=dimension,
+                            preparation=preparation,
+                            source_root=source_root,
+                            expected_target_snapshot=expected_target_snapshot,
+                            expected_terminal_identity=expected_terminal_identity,
+                            expected_labels=expected_labels,
+                            destination_directory=destination_directory,
+                            explicit_output=explicit_output,
+                            artifact_family=artifact_family,
+                            cancel_token=cancel_token,
+                        )
                     raise PreparedCapsuleMiss(offered.miss_code)
                 if offered.disposition != "READY" or offered.bundle is None:
                     raise PreparedCapsuleMiss(
