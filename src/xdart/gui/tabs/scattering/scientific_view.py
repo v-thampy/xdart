@@ -1985,8 +1985,10 @@ class ScientificView(QtWidgets.QFrame):
         ):
             prior_key = self._curve_mounted_keys[0]
             item = self._curve_items_by_key.pop(prior_key)
-            self._curve_item_contracts.pop(prior_key, None)
+            prior_contract = self._curve_item_contracts.pop(prior_key, None)
             self._curve_items_by_key[keys[0]] = item
+            if prior_contract is not None:
+                self._curve_item_contracts[keys[0]] = prior_contract
 
         desired_items = []
         for index, (key, trace) in enumerate(
@@ -2030,6 +2032,10 @@ class ScientificView(QtWidgets.QFrame):
                     ),
                     name=title,
                     pen=pen,
+                    symbol="o",
+                    symbolBrush=style_contract,
+                    symbolPen=style_contract,
+                    symbolSize=4,
                     connect="finite",
                 )
                 self._curve_items_by_key[key] = item
@@ -2056,6 +2062,8 @@ class ScientificView(QtWidgets.QFrame):
                             style=QtCore.Qt.PenStyle.SolidLine,
                         )
                     )
+                    item.setSymbolBrush(style_contract)
+                    item.setSymbolPen(style_contract)
                 if (
                     prior_contract is None
                     or prior_contract[0][-1] != title

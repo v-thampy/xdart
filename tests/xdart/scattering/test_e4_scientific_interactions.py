@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import numpy as np
+import pyqtgraph as pg
 import pytest
 from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
@@ -201,7 +202,8 @@ def test_overlay_footer_moves_anchor_without_mutating_accumulator() -> None:
         assert len(items) == 1
         assert items[0] is first_curve
         assert len(view.legend.items) == 1
-        assert all(item.opts["symbol"] is None for item in items)
+        assert all(item.opts["symbol"] == "o" for item in items)
+        assert all(item.opts["symbolSize"] == 4 for item in items)
         assert all(item.opts["pen"].widthF() == 1.4 for item in items)
         assert view.cursor_position is cursor
 
@@ -238,7 +240,8 @@ def test_overlay_footer_moves_anchor_without_mutating_accumulator() -> None:
         items = view.curve.listDataItems()
         assert len(items) == 1
         assert len(view.legend.items) == 1
-        assert all(item.opts["symbol"] is None for item in items)
+        assert all(item.opts["symbol"] == "o" for item in items)
+        assert all(item.opts["symbolSize"] == 4 for item in items)
         assert all(item.opts["pen"].widthF() == 1.4 for item in items)
         assert view.cursor_position is cursor
 
@@ -475,6 +478,17 @@ def test_mode_switch_retains_trace_items_history_and_axis_labels(
         assert view.curve.listDataItems() == [retained[-1]]
         assert len(view._curve_items_by_key) == len(frames)
         assert calls == {"clear": 0, "plot": 0, "labels": []}
+        single_item = view.curve.listDataItems()[0]
+        assert single_item.opts["symbol"] == "o"
+        assert single_item.opts["symbolSize"] == 4
+        assert (
+            pg.mkBrush(single_item.opts["symbolBrush"]).color()
+            == single_item.opts["pen"].color()
+        )
+        assert (
+            pg.mkPen(single_item.opts["symbolPen"]).color()
+            == single_item.opts["pen"].color()
+        )
 
         # A complete returning projection remounts the exact existing
         # PlotDataItems rather than clearing and recreating them.
@@ -484,6 +498,15 @@ def test_mode_switch_retains_trace_items_history_and_axis_labels(
         assert tuple(view.curve.listDataItems()) == retained
         assert len(view.legend.items) == len(retained)
         assert calls == {"clear": 0, "plot": 0, "labels": []}
+        assert all(item.opts["symbol"] == "o" for item in retained)
+        assert all(item.opts["symbolSize"] == 4 for item in retained)
+        assert all(
+            pg.mkBrush(item.opts["symbolBrush"]).color()
+            == item.opts["pen"].color()
+            and pg.mkPen(item.opts["symbolPen"]).color()
+            == item.opts["pen"].color()
+            for item in retained
+        )
     finally:
         _dispose(view)
 

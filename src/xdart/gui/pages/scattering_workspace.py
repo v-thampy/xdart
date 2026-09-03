@@ -51,6 +51,7 @@ class _WorkspaceMenus:
         return AppMenuHosts(
             _tool_button_menu(self.widget, "configMenuButton"),
             _tool_button_menu(self.widget, "helpMenuButton"),
+            _tool_button_menu(self.widget, "analysisMenuButton"),
         )
 
 

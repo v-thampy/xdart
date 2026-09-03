@@ -407,6 +407,7 @@ class BrowserView(QtWidgets.QFrame):
                 "configMenuButton",
                 ("Save", "Load", "Advanced", "Performance Diagnostics…"),
             ),
+            ("Analysis", "analysisMenuButton", ()),
             ("Help", "helpMenuButton", ("Help",)),
         ):
             button = QtWidgets.QToolButton()

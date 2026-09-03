@@ -31,21 +31,10 @@ _EXPECTED_MODES = (
     "Int 1D",
     "Int 2D",
     "Int 1D (XYE)",
-    "Stitch 1D",
-    "Stitch 2D",
     "2D Viewer",
     "1D Viewer",
 )
-_EXPECTED_DISABLED_REASONS = (
-    (
-        "Stitch 1D",
-        "Stitching has no mounted vNext operation service yet.",
-    ),
-    (
-        "Stitch 2D",
-        "Stitching has no mounted vNext operation service yet.",
-    ),
-)
+_EXPECTED_DISABLED_REASONS = ()
 
 
 def _configured_intent(mode: str) -> RunIntent:

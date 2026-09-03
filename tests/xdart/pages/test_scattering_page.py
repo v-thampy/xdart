@@ -147,10 +147,16 @@ def test_builtin_stitch_action_constructs_one_idle_tool_only_when_opened(
             "Stitching",
             "Reciprocal Space Map",
         ]
+        in_window = window.page_handle.app_menus.mount_points().analysis_menu
+        assert in_window is not None
+        assert tuple(in_window.actions()) == tuple(
+            window.ui.menuAnalysis.actions()
+        )
         assert window.ui.menuAnalysis.actions()[0].objectName() == (
             "actionAnalysisTool_stitch"
         )
-        assert window.open_tool(STITCH_TOOL.key) == ActionCompleted("stitch")
+        in_window.actions()[0].trigger()
+        qapp.processEvents()
         handle = window._tool_handles[STITCH_TOOL.key]
         assert handle.widget.objectName() == "stitchToolDialog"
         assert handle.widget.source_widget._external_execution is True

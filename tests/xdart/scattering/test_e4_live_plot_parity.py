@@ -28,7 +28,8 @@ def test_one_d_plot_restores_labels_legend_and_connected_lines() -> None:
         assert len(items) == 5
         assert scientific.legend is not None
         assert len(scientific.legend.items) == 5
-        assert all(item.opts["symbol"] is None for item in items)
+        assert all(item.opts["symbol"] == "o" for item in items)
+        assert all(item.opts["symbolSize"] == 4 for item in items)
         assert all(item.opts["pen"].widthF() == 1.4 for item in items)
         axis = scientific.curve.getPlotItem().getAxis("left")
         assert axis.labelText == "I / Monitor (a.u.)"

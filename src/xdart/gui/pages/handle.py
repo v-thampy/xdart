@@ -42,6 +42,7 @@ class RunActivityPort(Protocol):
 class AppMenuHosts:
     config_menu: "QtWidgets.QMenu"
     help_menu: "QtWidgets.QMenu"
+    analysis_menu: "QtWidgets.QMenu | None" = None
 
 
 class AppMenusPort(Protocol):

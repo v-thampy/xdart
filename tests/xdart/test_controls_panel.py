@@ -160,7 +160,7 @@ def test_controls_panel_viewer_mode_shows_only_project(qapp):
                 section=SectionId.PROJECT,
                 label="Folder",
                 path=("Project", "project_folder"),
-                value="",
+                value="/data",
                 browse=True,
             ),
             ControlFormField(
@@ -193,6 +193,63 @@ def test_controls_panel_viewer_mode_shows_only_project(qapp):
     panel.reconcile(state)
 
     assert not panel.project_card.isHidden()
+    assert panel.source_card.isHidden()
+    assert panel.experiment_card.isHidden()
+    assert panel.processing_card.isHidden()
+
+
+def test_controls_panel_hides_setup_cards_until_project_is_selected(qapp):
+    def projection(project_root):
+        return ControlsProjection(
+            processing_page=ProcessingPage.INT_2D,
+            fields=(
+                ControlFormField(
+                    section=SectionId.PROJECT,
+                    label="Folder",
+                    path=("Project", "project_folder"),
+                    value=project_root,
+                    browse=True,
+                ),
+                ControlFormField(
+                    section=SectionId.SOURCE,
+                    label="Source",
+                    path=("Signal", "inp_type"),
+                    value="Image Series",
+                    kind=ControlFieldKind.COMBO,
+                ),
+                ControlFormField(
+                    section=SectionId.EXPERIMENT,
+                    label="Poni",
+                    path=("Signal", "poni_file"),
+                    value="",
+                    browse=True,
+                ),
+                ControlFormField(
+                    section=SectionId.PROCESSING,
+                    label="Background",
+                    path=("BG", "bg_type"),
+                    value="None",
+                    kind=ControlFieldKind.COMBO,
+                ),
+            ),
+            section_actions={},
+            detector_summary="",
+        )
+
+    panel = ControlsPanel()
+    panel.reconcile(projection(""))
+
+    assert not panel.project_card.isHidden()
+    assert panel.source_card.isHidden()
+    assert panel.experiment_card.isHidden()
+    assert panel.processing_card.isHidden()
+
+    assert panel.reconcile(projection("/data"))
+    assert not panel.source_card.isHidden()
+    assert not panel.experiment_card.isHidden()
+    assert not panel.processing_card.isHidden()
+
+    assert panel.reconcile(projection(""))
     assert panel.source_card.isHidden()
     assert panel.experiment_card.isHidden()
     assert panel.processing_card.isHidden()
@@ -463,7 +520,8 @@ def test_reconcile_updates_action_buttons_without_spurious_repolish(
         assert after is before
         assert panel.findChildren(FormRow)[0] is row_before
         assert row_before.editor is editor_before
-        assert "Replaces selected 1-D results" in after.toolTip()
+        assert "Creates a new immutable 1-D version" in after.toolTip()
+        assert "selected artifact remains unchanged" in after.toolTip()
 
         style = after.style()
         original_unpolish = style.unpolish

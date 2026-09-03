@@ -471,12 +471,13 @@ QPushButton#e3BrowserCompactButton,
 QToolButton#e3RefreshBrowser {
     padding: $control_browse_padding;
 }
-/* File / Config / Help open their menu on click (InstantPopup).  Paint one
+/* File / Config / Analysis / Help open their menu on click (InstantPopup). Paint one
    deliberately small theme-coloured caret rather than Qt's oversized native
    menu glyph.  Plain/checkable tool buttons have no matching selector, so
    toggles remain indicator-free. */
 QToolButton#fileMenuButton::menu-indicator,
 QToolButton#configMenuButton::menu-indicator,
+QToolButton#analysisMenuButton::menu-indicator,
 QToolButton#helpMenuButton::menu-indicator {
     image: none;
     width: 0px;
@@ -490,6 +491,7 @@ QToolButton#helpMenuButton::menu-indicator {
 }
 QToolButton#fileMenuButton,
 QToolButton#configMenuButton,
+QToolButton#analysisMenuButton,
 QToolButton#helpMenuButton {
     font-size: $control_panel_browse_font;
     padding-right: 12px;

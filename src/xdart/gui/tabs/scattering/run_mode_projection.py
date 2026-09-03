@@ -15,21 +15,14 @@ RUN_MODE_CHOICES = (
     "Int 1D",
     "Int 2D",
     "Int 1D (XYE)",
-    "Stitch 1D",
-    "Stitch 2D",
     "2D Viewer",
     "1D Viewer",
 )
-UNOWNED_RUN_MODE_REASONS = (
-    (
-        "Stitch 1D",
-        "Stitching has no mounted vNext operation service yet.",
-    ),
-    (
-        "Stitch 2D",
-        "Stitching has no mounted vNext operation service yet.",
-    ),
-)
+# Stitch and RSM are standalone Analysis tools with their own source, geometry,
+# output, progress, and lifecycle controls.  Keeping stale disabled entries in
+# the ordinary reduction selector made complete tools look unavailable and
+# would route them through the wrong Controls/Run owner if enabled.
+UNOWNED_RUN_MODE_REASONS: tuple[tuple[str, str], ...] = ()
 _NATIVE_RUN_MODES = frozenset(("Int 1D", "Int 2D", "Int 1D (XYE)"))
 
 

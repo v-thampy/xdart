@@ -125,6 +125,7 @@ _SOURCE_ENERGY_OPTIONS = (("PONI", "poni"), ("Metadata", "metadata"))
 _FULL_PATH_DISPLAY_PATHS = {
     ("Project", "project_folder"),
 }
+_PROJECT_ROOT_PATH = ("Project", "project_folder")
 
 
 class ActionButton(QtWidgets.QPushButton):
@@ -1639,12 +1640,19 @@ class ControlsPanel(QtWidgets.QWidget):
 
     def _apply_card_visibility(self, state: ControlsProjection) -> None:
         viewer_mode = state.processing_page is ProcessingPage.VIEWER
-        self.project_card.show()
-        self.source_card.setVisible(not viewer_mode)
-        self.experiment_card.setVisible(
-            bool(state.fields_for(SectionId.EXPERIMENT)) and not viewer_mode
+        project_root = state.value_for(_PROJECT_ROOT_PATH, None)
+        project_ready = (
+            project_root is None
+            or type(project_root) is str and bool(project_root.strip())
         )
-        self.processing_card.setVisible(not viewer_mode)
+        self.project_card.show()
+        self.source_card.setVisible(not viewer_mode and project_ready)
+        self.experiment_card.setVisible(
+            bool(state.fields_for(SectionId.EXPERIMENT))
+            and not viewer_mode
+            and project_ready
+        )
+        self.processing_card.setVisible(not viewer_mode and project_ready)
 
     def _render_plain_bound_section(
         self,

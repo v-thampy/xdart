@@ -506,13 +506,16 @@ class Main(QMainWindow):
         )
         self._attached_config_menu = None
         self._attached_help_menu = None
+        self._attached_analysis_menu = None
 
     def _attach_application_menus(self):
         if PageCapability.APP_MENU_HOSTS in self.page_descriptor.capabilities:
             points = self.page_handle.app_menus.mount_points()
             config_menu, help_menu = points.config_menu, points.help_menu
+            analysis_menu = points.analysis_menu
         else:
             config_menu, help_menu = self.host_config_menu, self.host_help_menu
+            analysis_menu = None
         try:
             if self._attached_config_menu is not None:
                 for action in self.application_config_actions:
@@ -520,6 +523,9 @@ class Main(QMainWindow):
             if self._attached_help_menu is not None:
                 for action in self.application_help_actions:
                     self._attached_help_menu.removeAction(action)
+            if self._attached_analysis_menu is not None:
+                for action in self._tool_actions.values():
+                    self._attached_analysis_menu.removeAction(action)
         except RuntimeError:
             pass  # a CLEAN page may already have destroyed its menu host
         for action in self.application_config_actions:
@@ -528,8 +534,13 @@ class Main(QMainWindow):
         for action in self.application_help_actions:
             help_menu.addAction(action)
             action.setEnabled(True)
+        if analysis_menu is not None:
+            for action in self._tool_actions.values():
+                analysis_menu.addAction(action)
+                action.setEnabled(True)
         self._attached_config_menu = config_menu
         self._attached_help_menu = help_menu
+        self._attached_analysis_menu = analysis_menu
 
     def _open_log_location(self):
         """Help ▸ Open Log Location — reveal the rotating log file in the OS file
