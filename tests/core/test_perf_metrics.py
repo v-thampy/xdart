@@ -133,7 +133,7 @@ def test_run_metrics_add_folds_observed_counts_and_opens():
                          frames_durable=3)
     a.open_counts.update(source=7, other=100, output=1, verification=2)
     rm.add(a)
-    rm.add(ContainerMetrics(path="b.nxs", state="processed_output",
+    rm.add(ContainerMetrics(path="b.nexus", state="processed_output",
                             skip_reason="processed xdart output"))
     assert rm.frames_reduced == 3 and rm.frames_written == 3 and rm.frames_durable == 3
     assert rm.open_counts["source"] == 7 and rm.open_counts["other"] == 100
@@ -342,7 +342,7 @@ def test_open_counter_categorizes_and_restores_on_exception(tmp_path):
     src = tmp_path / "src"; src.mkdir()
     master = _write_raw_container(src / "m_00001.nxs", nframes=1)
     out_root = tmp_path / "out"; out_root.mkdir()
-    out_file = out_root / "gen.nxs"
+    out_file = out_root / "gen.nexus"
     _write_raw_container(out_file, nframes=1)          # stand-in generated output
     bad = tmp_path / "bad.nxs"; bad.write_bytes(b"not hdf5")
 
@@ -414,7 +414,7 @@ def test_duplicate_scan_stems_rejected_before_reduction(tmp_path):
     assert d["runs"][0]["frames_written"] == 0
 
 
-@pytest.mark.parametrize("pre", ["repeat_dir", "generated_nxs"])
+@pytest.mark.parametrize("pre", ["repeat_dir", "generated_nexus"])
 def test_preexisting_output_rejected_via_cli(tmp_path, pre):
     # R2 correction: existing-output rejection must go through the REAL CLI path
     # (run_once's mkdir(exist_ok=False) previously raised before the guard).
@@ -425,8 +425,8 @@ def test_preexisting_output_rejected_via_cli(tmp_path, pre):
     out_root = tmp_path / "out"
     (out_root / "repeat_00").mkdir(parents=True)
     guarded = None
-    if pre == "generated_nxs":
-        gen = out_root / "repeat_00" / "scan_00001.nxs"
+    if pre == "generated_nexus":
+        gen = out_root / "repeat_00" / "scan_00001.nexus"
         gen.write_bytes(b"pre-existing bytes")
         guarded = (gen, _sha(gen))
     before_raw = _sha(raw)
@@ -449,8 +449,8 @@ def test_repeats_use_unique_destinations(tmp_path):
     rc, d = _run_cli(h, src, poni, out_root, cores=1, repeat=2,
                      json_out=tmp_path / "o.json")
     assert rc == 0
-    assert (out_root / "repeat_00" / "scan_00001.nxs").exists()
-    assert (out_root / "repeat_01" / "scan_00001.nxs").exists()
+    assert (out_root / "repeat_00" / "scan_00001.nexus").exists()
+    assert (out_root / "repeat_01" / "scan_00001.nexus").exists()
     # both repeats produced durable output; neither overwrote the other.
     assert all(run["frames_durable"] == 1 for run in d["runs"])
 
@@ -469,7 +469,7 @@ def test_partial_run_writes_valid_and_reports_invalid_truthfully(tmp_path):
     conts = {c["scan_name"]: c for c in d["runs"][0]["containers"]}
     good, bad = conts["good_00001"], conts["zz_bad_00001"]
     assert good["state"] == "ready" and good["frames_durable"] == 2
-    assert (out_root / "repeat_00" / "good_00001.nxs").exists()
+    assert (out_root / "repeat_00" / "good_00001.nexus").exists()
     assert bad["state"] == "invalid"
     assert bad["frames_written"] == 0 and bad["frames_durable"] == 0
     assert d["runs"][0]["frames_durable"] == 2   # only the valid container's
@@ -536,7 +536,7 @@ def test_later_failure_preserves_observed_writes(tmp_path, monkeypatch):
 
 # --- --json-out colliding with a planned generated output / root / repeat ----
 
-@pytest.mark.parametrize("which", ["generated_nxs", "output_root", "repeat_dir"])
+@pytest.mark.parametrize("which", ["generated_nexus", "output_root", "repeat_dir"])
 def test_json_out_collides_with_planned_output_refused(tmp_path, which):
     h = _load_harness()
     src = tmp_path / "src"; src.mkdir()
@@ -544,7 +544,7 @@ def test_json_out_collides_with_planned_output_refused(tmp_path, which):
     poni = _write_poni(tmp_path / "cal.poni")
     out_root = tmp_path / "out"
     target = {
-        "generated_nxs": out_root / "repeat_00" / "scan_00001.nxs",
+        "generated_nexus": out_root / "repeat_00" / "scan_00001.nexus",
         "output_root": out_root,
         "repeat_dir": out_root / "repeat_00",
     }[which]
@@ -583,7 +583,7 @@ def test_per_container_guard_receives_real_poni_path(tmp_path, monkeypatch):
     h._bench_container(master, poni_obj, poni_path, repeat_dir, out_root, plan,
                        1, "entry", 1, src, [str(master)], False)
 
-    per_container = [c for c in calls if c[0].endswith("scan_00001.nxs")]
+    per_container = [c for c in calls if c[0].endswith("scan_00001.nexus")]
     assert per_container, "per-container destination guard was not invoked"
     inputs = per_container[0][1]
     assert str(poni_path) in inputs                      # the real PONI PATH

@@ -353,7 +353,7 @@ def _bench_container(path, poni, poni_path, repeat_dir, output_root, plan, cores
 
             # destination safety BEFORE any write (M0-R4); the real PONI PATH is
             # checked here, not the loaded calibration object.
-            out_path = repeat_dir / f"{scan_name}.nxs"
+            out_path = repeat_dir / f"{scan_name}.nexus"
             try:
                 _validate_destination(out_path, sources=source_paths,
                                       poni=poni_path, source_dir=source_dir,
@@ -513,7 +513,7 @@ def run_once(args, poni, plan, repeat_index) -> "object":
             rel = fw - run_start
             if first_write_latency is None or rel < first_write_latency:
                 first_write_latency = rel
-        out_path = repeat_dir / f"{name}.nxs"
+        out_path = repeat_dir / f"{name}.nexus"
         if cm.state == "ready" and out_path.exists():
             rm.outputs.append(str(out_path))
 
@@ -602,15 +602,15 @@ def main(argv=None) -> int:
     scan_names = sorted({_scan_name(p) for p in candidates})
 
     # Plan EVERY destination for EVERY repeat before the first writer opens
-    # (M0-R4): the output root, each repeat directory, and each generated .nxs.
+    # (M0-R4): the output root, each repeat directory, and each generated .nexus.
     repeat_dirs = [output_root / f"repeat_{i:02d}" for i in range(args.repeat)]
-    generated = [rd / f"{n}.nxs" for rd in repeat_dirs for n in scan_names]
+    generated = [rd / f"{n}.nexus" for rd in repeat_dirs for n in scan_names]
 
     # 1. output root + every generated output must be OUTSIDE the source tree
     #    (recursive=True, so a source subdirectory is refused too) and must not
     #    clobber a source or the PONI path.
     try:
-        for dest in [output_root / "probe.nxs", *generated]:
+        for dest in [output_root / "probe.nexus", *generated]:
             check_output_not_source(
                 str(dest), input_files=[str(poni_path), *source_paths],
                 watched_dirs=[str(source_dir)], recursive=True,
@@ -620,7 +620,7 @@ def main(argv=None) -> int:
         return 2
 
     # 2. --json-out must not equal the output root, a planned repeat directory,
-    #    any planned generated .nxs, a source, or the PONI — nor sit in the
+    #    any planned generated .nexus, a source, or the PONI — nor sit in the
     #    source tree.  A clean refusal writes nothing.
     if args.json_out:
         jo = Path(args.json_out)
