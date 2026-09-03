@@ -24,6 +24,7 @@ from xrd_tools.io import (
     write_frame_records,
 )
 from xrd_tools.io import frame_view as module
+from tests.core.v2_fixture_factory import current_entry
 
 
 def _view(
@@ -79,7 +80,7 @@ def _catalog_file(path: Path) -> None:
         records.append(record)
 
     with h5py.File(path, "w") as handle:
-        entry = handle.create_group("entry")
+        entry = current_entry(handle)
         write_frame_records(entry, records)
         geometry = entry.create_group("per_frame_geometry")
         geometry.create_dataset("frame_index", data=np.asarray(labels, np.int64))
@@ -158,7 +159,7 @@ def _assert_array_free(value: object) -> None:
 def test_scalar_catalog_projects_all_rows_modes_and_deeply_frozen_facts(
     tmp_path,
 ) -> None:
-    path = tmp_path / "catalog.nxs"
+    path = tmp_path / "catalog.nexus"
     _catalog_file(path)
     with FrameViewReader(
         path, resolve_source=False, include_thumbnail=False,
@@ -226,10 +227,10 @@ def test_scalar_catalog_projects_all_rows_modes_and_deeply_frozen_facts(
 
 
 def test_scalar_catalog_marks_current_average_capability(tmp_path) -> None:
-    path = tmp_path / "average.nxs"
+    path = tmp_path / "average.nexus"
     record = FrameRecord.from_view(_view(1, 1.0))
     with h5py.File(path, "w") as handle:
-        entry = handle.create_group("entry")
+        entry = current_entry(handle)
         write_frame_records(entry, (record,))
         frame = entry.create_group("frames").create_group("frame_0001")
         frame.create_dataset(
@@ -265,7 +266,7 @@ def test_scalar_catalog_marks_current_average_capability(tmp_path) -> None:
 def test_scalar_catalog_never_reads_scientific_or_thumbnail_payloads(
     tmp_path, monkeypatch,
 ) -> None:
-    path = tmp_path / "payload_free.nxs"
+    path = tmp_path / "payload_free.nexus"
     _catalog_file(path)
     forbidden: list[tuple[str, str]] = []
     direct_reads: dict[str, int] = {}
@@ -321,7 +322,7 @@ def test_scalar_catalog_never_reads_scientific_or_thumbnail_payloads(
 def test_scalar_catalog_mid_vlen_cancellation_rolls_back_and_retries(
     tmp_path, monkeypatch,
 ) -> None:
-    path = tmp_path / "cancel.nxs"
+    path = tmp_path / "cancel.nexus"
     _catalog_file(path)
     sample_reads = 0
     cancelling = True
@@ -363,7 +364,7 @@ def test_scalar_catalog_mid_vlen_cancellation_rolls_back_and_retries(
 def test_scalar_catalog_uses_exact_persisted_source_without_path_probes(
     tmp_path, monkeypatch,
 ) -> None:
-    path = tmp_path / "persisted_source.nxs"
+    path = tmp_path / "persisted_source.nexus"
     _catalog_file(path)
     probes: list[str] = []
 
@@ -389,7 +390,7 @@ def test_scalar_catalog_uses_exact_persisted_source_without_path_probes(
 def test_scalar_catalog_projection_preflight_refuses_before_inventory_or_rows(
     tmp_path,
 ) -> None:
-    path = tmp_path / "projection_bound.nxs"
+    path = tmp_path / "projection_bound.nexus"
     _catalog_file(path)
     module._validate_scalar_catalog_projection(
         label_count=651,
@@ -418,7 +419,7 @@ def test_scalar_catalog_projection_preflight_refuses_before_inventory_or_rows(
 
 
 def test_scalar_catalog_normalizes_nonfinite_persisted_geometry(tmp_path) -> None:
-    path = tmp_path / "nonfinite_geometry.nxs"
+    path = tmp_path / "nonfinite_geometry.nexus"
     _catalog_file(path)
     with h5py.File(path, "r+") as handle:
         group = handle["entry/per_frame_geometry"]
@@ -437,7 +438,7 @@ def test_scalar_catalog_normalizes_nonfinite_persisted_geometry(tmp_path) -> Non
 def test_scalar_catalog_explicitly_refuses_partial_target_frame_reader(
     tmp_path,
 ) -> None:
-    path = tmp_path / "target_frame.nxs"
+    path = tmp_path / "target_frame.nexus"
     _catalog_file(path)
     with FrameViewReader(path, target_frame=2) as reader:
         baseline = {key: id(value) for key, value in reader._read_cache.items()}
@@ -450,7 +451,7 @@ def test_scalar_catalog_explicitly_refuses_partial_target_frame_reader(
 def test_scalar_catalog_cancel_callback_is_lock_free_and_reentry_refuses(
     tmp_path,
 ) -> None:
-    path = tmp_path / "callback.nxs"
+    path = tmp_path / "callback.nexus"
     _catalog_file(path)
     observations: list[tuple[bool, bool]] = []
     nested: list[str] = []
@@ -476,7 +477,7 @@ def test_scalar_catalog_cancel_callback_is_lock_free_and_reentry_refuses(
 def test_live_scalar_catalog_read_blocks_close_before_hdf_mutation(
     tmp_path,
 ) -> None:
-    path = tmp_path / "close_busy.nxs"
+    path = tmp_path / "close_busy.nexus"
     _catalog_file(path)
     reader = FrameViewReader(path, resolve_source=False).__enter__()
     entered = Event()
@@ -580,7 +581,7 @@ def test_scalar_catalog_rejects_negative_duplicate_and_malformed_projections(
 def test_scalar_catalog_callback_baseexception_publishes_nothing_and_retries(
     tmp_path,
 ) -> None:
-    path = tmp_path / "baseexception.nxs"
+    path = tmp_path / "baseexception.nexus"
     _catalog_file(path)
     raised = False
     with FrameViewReader(path, resolve_source=False) as reader:

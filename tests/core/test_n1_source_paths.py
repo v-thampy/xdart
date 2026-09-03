@@ -16,10 +16,12 @@ import h5py
 import numpy as np
 import pytest
 
+from xrd_tools.core import IntegrationResult1D
 from xrd_tools.io import (
     get_raw_frame,
     relative_source_path,
     resolve_source_master,
+    write_nexus,
 )
 
 
@@ -109,34 +111,29 @@ def _write_master(path, raw):
 def _write_processed(nxs, *, source_path, source_base=None, frame_label=0,
                      master_frame=1, thumbnail=None):
     """Minimal processed file built with the REAL record primitives
-    (stamp_source_base / write_frame_record), so these tests exercise the
-    same write path as NexusSink and the GUI writer.  Only the
-    ``integrated_1d`` frame->row map is a hand stub (it is reader plumbing,
-    not part of the N1 record; the full real path is covered end-to-end by
-    test_complete_record_roundtrip)."""
+    (write_nexus / stamp_source_base / write_frame_record), so these tests
+    exercise the same write path as NexusSink and the GUI writer."""
     from xrd_tools.io.nexus_record import (
         ensure_frames_container,
         stamp_source_base,
         write_frame_record,
     )
-    with h5py.File(nxs, "w") as f:
-        e = f.create_group("entry")
-        from xrd_tools.io.schema import (
-            PROCESSED_SCHEMA_NAME,
-            PROCESSED_SCHEMA_VERSION,
-            SCHEMA_NAME_ATTR,
-            SCHEMA_VERSION_ATTR,
-        )
-        e.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
-        e.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+    q = np.arange(5, dtype=np.float32)
+    write_nexus(
+        nxs,
+        results_1d={
+            int(frame_label): IntegrationResult1D(
+                q,
+                np.zeros(5, dtype=np.float32),
+                unit="q_A^-1",
+            ),
+        },
+        compression=None,
+        overwrite=True,
+    )
+    with h5py.File(nxs, "r+") as f:
+        e = f["entry"]
         norm_base = stamp_source_base(e, source_base)
-        g = e.create_group("integrated_1d")
-        g.attrs["NX_class"] = "NXdata"
-        g.attrs["signal"] = "intensity"
-        g.attrs["axes"] = ("frame_index", "q")
-        g.create_dataset("intensity", data=np.zeros((1, 5), np.float32))
-        g.create_dataset("q", data=np.arange(5, dtype=np.float32))
-        g.create_dataset("frame_index", data=np.array([frame_label], dtype=np.int64))
         write_frame_record(
             ensure_frames_container(e), f"frame_{frame_label:04d}",
             thumbnail=thumbnail, source_path=source_path,
@@ -324,30 +321,33 @@ def test_open_scan_iter_chunks_reuses_processed_file_handle(tmp_path, monkeypatc
     nxs = tmp_path / "processed" / "scan.nexus"
     nxs.parent.mkdir(parents=True)
 
-    with h5py.File(nxs, "w") as f:
-        e = f.create_group("entry")
-        from xrd_tools.io.schema import (
-            PROCESSED_SCHEMA_NAME,
-            PROCESSED_SCHEMA_VERSION,
-            SCHEMA_NAME_ATTR,
-            SCHEMA_VERSION_ATTR,
-        )
-        e.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
-        e.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
-        e.attrs["source_base"] = str(root)
-        g = e.create_group("integrated_1d")
-        g.attrs["NX_class"] = "NXdata"
-        g.attrs["signal"] = "intensity"
-        g.attrs["axes"] = ("frame_index", "q")
-        g.create_dataset("intensity", data=np.zeros((3, 5), np.float32))
-        g.create_dataset("q", data=np.arange(5, dtype=np.float32))
-        g.create_dataset("frame_index", data=np.array([0, 1, 2], dtype=np.int64))
-        frames = e.create_group("frames")
+    q = np.arange(5, dtype=np.float32)
+    write_nexus(
+        nxs,
+        results_1d={
+            idx: IntegrationResult1D(q, np.zeros(5), unit="q_A^-1")
+            for idx in range(3)
+        },
+        compression=None,
+        overwrite=True,
+    )
+    from xrd_tools.io.nexus_record import (
+        ensure_frames_container,
+        stamp_source_base,
+        write_frame_record,
+    )
+    with h5py.File(nxs, "r+") as f:
+        e = f["entry"]
+        norm_base = stamp_source_base(e, root)
+        frames = ensure_frames_container(e)
         for idx in range(3):
-            fg = frames.create_group(f"frame_{idx:04d}")
-            src = fg.create_group("source")
-            src.create_dataset("path", data=np.bytes_("raw/m.h5"))
-            src.create_dataset("frame_index", data=idx)
+            write_frame_record(
+                frames,
+                f"frame_{idx:04d}",
+                source_path=master,
+                source_frame_index=idx,
+                source_base=norm_base,
+            )
 
     scan = open_scan(nxs)
     assert scan.frame_indices == [0, 1, 2]  # warm the small frame-index cache
