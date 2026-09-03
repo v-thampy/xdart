@@ -1,0 +1,142 @@
+{
+  "version": 1,
+  "corpus_id": "xdart-private-promotion-v1-20260902",
+  "expected_tests": 16,
+  "pytest_nodes": [
+    "tests/core/test_e2sci_saturation_mask.py::test_all_short_eiger_standard_outputs_match_explicit_mask",
+    "tests/core/test_e2sci_saturation_mask.py::test_five_file_gi_directory_outputs_match_explicit_mask",
+    "tests/core/test_rsm_operation_r2_real_data.py::test_rsm_v2_matches_independent_authenticated_oracle",
+    "tests/core/test_stitch_operation_real_data.py::test_scan14_quick_stitch_commits_with_calibrated_geometry",
+    "tests/core/test_stitch_operation_real_data.py::test_scan14_full_287_streams_and_persists_diagnostics",
+    "tests/xdart/scattering/test_e3_pause_browse_resume.py::test_explicit_processed_nexus_browse_reload_does_not_enter_raw_discovery"
+  ],
+  "files": [
+    {
+      "path": "eiger/LaB6_detxn26_detyn6p5_eta4p5.poni",
+      "size": 537,
+      "sha256": "c428fc29342842c3bcb9abbf6610bea638b1c90ce2ca87b7badb9d198db2e86e"
+    },
+    {
+      "path": "eiger/Eiger_NbN_1_thin_test__200mdeg_scan001_master.h5",
+      "size": 36205225,
+      "sha256": "440b9eb831aa7b86074802ca1c997b0e6c607800effd2d580934374b80a1fb06"
+    },
+    {
+      "path": "eiger/Eiger_NbN_1_thin_test__200mdeg_scan001_data_000001.h5",
+      "size": 14296343,
+      "sha256": "cbee2cc6109ef4ace199d37754c1db0fef766f19122dfe93f3ceed6bdaff198a"
+    },
+    {
+      "path": "eiger/Eiger_NbN_2_thin_test__200mdeg_scan001_master.h5",
+      "size": 36205225,
+      "sha256": "0c380e5a24d2a9fa8977b6368d587f912a49bdc79fb45b6e95df10822ce7a7e6"
+    },
+    {
+      "path": "eiger/Eiger_NbN_2_thin_test__200mdeg_scan001_data_000001.h5",
+      "size": 13864361,
+      "sha256": "041e62481ba395637ed1ea8d3812869a13fdece3c0e1eb64a54697ca977e9e71"
+    },
+    {
+      "path": "eiger/eiger_w2s3_test_2_scan001_master.h5",
+      "size": 36205931,
+      "sha256": "13a4f6eedeabe16b8f7c0d4202640198a82060f6c1cd4ca42b7af8f0bdba76cb"
+    },
+    {
+      "path": "eiger/eiger_w2s3_test_2_scan001_data_000001.h5",
+      "size": 12778439,
+      "sha256": "c9c80cd230285507329f27bf0f73a8747a2c613478ac8eb3bc794f268c58152d"
+    },
+    {
+      "path": "eiger/eiger_w2s4_1_eta_0p118_scan002_master.h5",
+      "size": 36205986,
+      "sha256": "1e7e91e1de7458258d9f1330213be0e1a8bb8f2f91efa71ed211de359922283f"
+    },
+    {
+      "path": "eiger/eiger_w2s4_1_eta_0p118_scan002_data_000001.h5",
+      "size": 1652390,
+      "sha256": "6f3646ee4af38af077d5bbfc196fa1ba85996c2f866b50a269007960eda047ca"
+    },
+    {
+      "path": "nexus/bluesky_data/LaB6_align61_0003_SR.poni",
+      "size": 500,
+      "sha256": "25dfb94bdab760ff91f3534dbba152d3885a1305e7c2ad29ee0ff9d14136126b"
+    },
+    {
+      "path": "nexus/bluesky_data/num_2_716V_5ms_sfpx_70p28_halpha_0p04_00001.nxs",
+      "size": 29260157,
+      "sha256": "9ff101d282312217594d7aefe6fd19895248528d444b18bfd555c667756c8f86"
+    },
+    {
+      "path": "nexus/bluesky_data/num_2_716V_5ms_sfpx_70p62_halpha_0p04_00001.nxs",
+      "size": 29227343,
+      "sha256": "e105bed0a552ad94d43847951a76a60c57e46832fe8df55d7f3c08c09b5ea41f"
+    },
+    {
+      "path": "nexus/bluesky_data/num_2_716V_5ms_sfpx_70p97_halpha_0p04_00001.nxs",
+      "size": 29274592,
+      "sha256": "a2ed4e975de247af3ad43cf99f1dc4857f152c9465d92a64ba39b60e00810331"
+    },
+    {
+      "path": "nexus/bluesky_data/num_2_716V_5ms_sfpx_71p31_halpha_0p04_00001.nxs",
+      "size": 28862214,
+      "sha256": "912d4766439748a0131a7a0f977b2e82f35066f478a08a7a5ac37b72777096bc"
+    },
+    {
+      "path": "nexus/bluesky_data/num_2_716V_5ms_sfpx_71p66_halpha_0p04_00001.nxs",
+      "size": 20793165,
+      "sha256": "70ec67c3ab4a64bd852cf01405022fe399b0735090be834062cfee067bf4c8f4"
+    },
+    {
+      "path": "stitching/data/calibration/LaB6_17keV",
+      "size": 217272,
+      "sha256": "dbec5be7cb8bbde76b942ce477e10830ddb6bac1b6fc1965fe67df63bb0e3db8"
+    },
+    {
+      "path": "stitching/data/calibration/MG_gonio_object_5images.json",
+      "size": 1105,
+      "sha256": "c74676659d821b6460f37e8b42af02767d127263a0079da67fe6e0d291edbdea"
+    },
+    {
+      "path": "RSM/STO_align",
+      "size": 23411880,
+      "sha256": "12e0d05219cb0309f7fb5f170c8fb12c507e7603dcd71b3954721d1b6e0c90b1"
+    },
+    {
+      "path": "eiger/xdart_processed_data/Combi4_Angledependence_samz_4p9_03271005.nexus",
+      "size": 10449060,
+      "sha256": "f41fcbdc0f341ded301987662a508427ed14981ee05134a71ee9a86b6a59a4b9"
+    }
+  ],
+  "file_groups": [
+    {
+      "glob": "stitching/data/images/b_thampy_LaB6_17keV_scan14_*.raw",
+      "count": 287,
+      "total_bytes": 330193500,
+      "manifest_sha256": "888105870f6720b8e4fca14b5b50de73594f1327d5b94375cb746a548e4e5823"
+    },
+    {
+      "glob": "RSM/images/b_thampy_STO_align_scan42_*.raw",
+      "count": 161,
+      "total_bytes": 61157460,
+      "manifest_sha256": "0601dce480607ac3183d76827900c7d1c33a666afef8a9d0952e173f0b56e0b6"
+    },
+    {
+      "glob": "RSM/images/b_thampy_STO_align_scan42_*.raw.pdi",
+      "count": 162,
+      "total_bytes": 247698,
+      "manifest_sha256": "d74ced3e8c2409ebcaea67baad20fd94e96af814afa380c265dbaba2da9a7190"
+    },
+    {
+      "glob": "RSM/images/b_thampy_STO_align_scan43_*.raw",
+      "count": 61,
+      "total_bytes": 23171460,
+      "manifest_sha256": "07740c4e0001e0e5db9b266423e9e0e00e261fce17f58a57425123d0cab56142"
+    },
+    {
+      "glob": "RSM/images/b_thampy_STO_align_scan43_*.raw.pdi",
+      "count": 61,
+      "total_bytes": 93269,
+      "manifest_sha256": "55a5d75b32dce4dae2d2d2b102270ef342bda857b61042bc746742f934e76f28"
+    }
+  ]
+}

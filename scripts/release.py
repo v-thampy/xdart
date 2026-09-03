@@ -7,6 +7,9 @@ the monorepo enforces them by script.  Run everything before tagging:
     python scripts/release.py check          # all pre-flight checks
     python scripts/release.py check vX.Y.Z   # + tag consistency
     python scripts/release.py build          # checks, then build + twine
+    XDART_TEST_DATA=/absolute/corpus python scripts/release.py promotion \
+        --policy tests/promotion/real_data_gate_v1.json \
+        --report /absolute/evidence/promotion-report.json
 
 Checks (each prints PASS/FAIL; any FAIL exits 1):
 
@@ -22,6 +25,8 @@ Checks (each prints PASS/FAIL; any FAIL exits 1):
              Qt is absent.  NOTE: this is a smoke, not the full GUI suite —
              the complete tests/xdart offscreen run is the CI gate (pr.yml).
   deps       pyFAI's audited project, Pixi, conda-recipe, and uv pins agree.
+  promotion  authenticate the finite private corpus, run the exact real-data
+             science selection, and fail on any skip or collection drift.
 
 There is intentionally NO publish subcommand: the maintainer uploads
 manually (see .github/workflows/release.yml, which runs `check` before
@@ -30,12 +35,17 @@ building the artifacts).
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -188,14 +198,235 @@ def build() -> bool:
     return _ok("build + twine check")
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _corpus_path(root: Path, relative: str) -> Path:
+    candidate = Path(relative)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError(f"corpus path is not a safe relative path: {relative!r}")
+    resolved = (root / candidate).resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError(f"corpus path escapes its root: {relative!r}")
+    return resolved
+
+
+def _verify_promotion_corpus(root: Path, policy: dict) -> dict:
+    verified_files: list[str] = []
+    verified_groups: list[dict] = []
+    for expected in policy.get("files", ()):
+        relative = str(expected["path"])
+        path = _corpus_path(root, relative)
+        if not path.is_file():
+            raise ValueError(f"required corpus file is missing: {relative}")
+        size = path.stat().st_size
+        if size != int(expected["size"]):
+            raise ValueError(
+                f"corpus size mismatch for {relative}: {size} != {expected['size']}"
+            )
+        actual = _sha256(path)
+        if actual != str(expected["sha256"]):
+            raise ValueError(f"corpus SHA-256 mismatch for {relative}")
+        verified_files.append(relative)
+
+    for expected in policy.get("file_groups", ()):
+        pattern = str(expected["glob"])
+        pattern_path = Path(pattern)
+        if pattern_path.is_absolute() or ".." in pattern_path.parts:
+            raise ValueError(f"corpus glob is not safe: {pattern!r}")
+        paths = tuple(
+            sorted(
+                (path.resolve() for path in root.glob(pattern) if path.is_file()),
+                key=lambda path: path.relative_to(root).as_posix(),
+            )
+        )
+        if any(not path.is_relative_to(root) for path in paths):
+            raise ValueError(f"corpus glob escapes its root: {pattern!r}")
+        rows: list[str] = []
+        total_bytes = 0
+        for path in paths:
+            relative = path.relative_to(root).as_posix()
+            size = path.stat().st_size
+            total_bytes += size
+            rows.append(f"{relative}\0{size}\0{_sha256(path)}")
+        manifest = hashlib.sha256("\n".join(rows).encode()).hexdigest()
+        if len(paths) != int(expected["count"]):
+            raise ValueError(
+                f"corpus count mismatch for {pattern}: "
+                f"{len(paths)} != {expected['count']}"
+            )
+        if total_bytes != int(expected["total_bytes"]):
+            raise ValueError(f"corpus byte total mismatch for {pattern}")
+        if manifest != str(expected["manifest_sha256"]):
+            raise ValueError(f"corpus manifest mismatch for {pattern}")
+        verified_groups.append(
+            {
+                "glob": pattern,
+                "count": len(paths),
+                "total_bytes": total_bytes,
+                "manifest_sha256": manifest,
+            }
+        )
+    return {"files": verified_files, "file_groups": verified_groups}
+
+
+def _junit_summary(path: Path) -> dict:
+    root = ET.parse(path).getroot()
+    suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+    counts = {
+        name: sum(int(suite.attrib.get(name, 0)) for suite in suites)
+        for name in ("tests", "failures", "errors", "skipped")
+    }
+    node_ids: list[str] = []
+    for case in root.iter("testcase"):
+        classname = case.attrib.get("classname", "")
+        name = case.attrib.get("name", "")
+        module = classname.replace(".", "/")
+        if module and not module.endswith(".py"):
+            module += ".py"
+        node_ids.append(f"{module}::{name}" if module else name)
+    return {**counts, "node_ids": node_ids}
+
+
+def run_promotion(policy_path: Path, report_path: Path) -> bool:
+    started = datetime.now(timezone.utc)
+    policy_path = policy_path.resolve()
+    report_path = report_path.resolve()
+    junit_path = report_path.with_name(f"{report_path.stem}.junit.xml")
+    if report_path.exists() or junit_path.exists():
+        return _fail("promotion report target already exists")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report: dict = {
+        "started_at": started.isoformat(),
+        "policy_path": str(policy_path),
+        "report_path": str(report_path),
+        "junit_path": str(junit_path),
+        "python": sys.version,
+        "platform": platform.platform(),
+        "verdict": "failed",
+    }
+    ok = False
+    try:
+        if not policy_path.is_file():
+            raise ValueError(f"promotion policy is missing: {policy_path}")
+        policy = json.loads(policy_path.read_text())
+        if int(policy.get("version", 0)) != 1:
+            raise ValueError("unsupported promotion policy version")
+        nodes = tuple(str(item) for item in policy.get("pytest_nodes", ()))
+        expected_tests = int(policy.get("expected_tests", 0))
+        if not nodes or expected_tests <= 0:
+            raise ValueError("promotion policy has no finite pytest selection")
+
+        configured = os.environ.get("XDART_TEST_DATA")
+        if not configured:
+            raise ValueError("XDART_TEST_DATA must be set explicitly")
+        configured_path = Path(configured)
+        if not configured_path.is_absolute():
+            raise ValueError("XDART_TEST_DATA must be an absolute path")
+        corpus_root = configured_path.resolve()
+        if not corpus_root.is_dir():
+            raise ValueError(f"XDART_TEST_DATA is not a directory: {corpus_root}")
+
+        report.update(
+            {
+                "corpus_id": str(policy["corpus_id"]),
+                "corpus_root": str(corpus_root),
+                "policy_sha256": _sha256(policy_path),
+                "git_commit": subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=ROOT,
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip(),
+                "git_tree": subprocess.run(
+                    ["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT,
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip(),
+            }
+        )
+        print(f"corpus: {policy['corpus_id']}")
+        report["corpus_verification"] = _verify_promotion_corpus(
+            corpus_root, policy,
+        )
+        _ok("authenticated promotion corpus")
+
+        argv = [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--strict-markers",
+            f"--junitxml={junit_path}",
+            *nodes,
+        ]
+        env = dict(os.environ)
+        prior_pythonpath = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = str(ROOT / "src") + (
+            os.pathsep + prior_pythonpath if prior_pythonpath else ""
+        )
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        env["TMPDIR"] = str(report_path.parent)
+        report["pytest_argv"] = argv
+        process = subprocess.run(argv, cwd=ROOT, env=env)
+        report["pytest_exit_code"] = process.returncode
+        if not junit_path.is_file():
+            raise ValueError("pytest did not write the promotion JUnit report")
+        summary = _junit_summary(junit_path)
+        report["pytest"] = summary
+        ok = (
+            process.returncode == 0
+            and summary["tests"] == expected_tests
+            and summary["failures"] == 0
+            and summary["errors"] == 0
+            and summary["skipped"] == 0
+            and len(summary["node_ids"]) == expected_tests
+        )
+        if not ok:
+            raise ValueError(
+                "promotion tests require exact count, zero failures/errors/skips, "
+                "and a zero process exit"
+            )
+        report["verdict"] = "passed"
+        _ok(f"authenticated real-data science gate ({expected_tests} tests)")
+    except Exception as error:
+        report["error"] = f"{type(error).__name__}: {error}"
+        _fail(str(error))
+    finally:
+        report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    return ok
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("command", choices=["check", "build"])
+    ap.add_argument("command", choices=["check", "build", "promotion"])
     ap.add_argument("tag", nargs="?", default=None,
                     help="expected vX.Y.Z tag (default: tag on HEAD if any)")
     ap.add_argument("--strict-tree", action="store_true",
                     help="fail (not warn) on uncommitted changes")
+    ap.add_argument(
+        "--policy", type=Path,
+        help="checked-in real-data policy (required for promotion)",
+    )
+    ap.add_argument(
+        "--report", type=Path,
+        help="new JSON evidence path (required for promotion)",
+    )
     args = ap.parse_args(argv)
+
+    if args.command == "promotion":
+        if args.tag is not None:
+            ap.error("promotion does not accept a tag")
+        if args.policy is None or args.report is None:
+            ap.error("promotion requires --policy and --report")
+        ok = run_promotion(args.policy, args.report)
+        print("\npromotion gate:", "OK" if ok else "FAILED")
+        return 0 if ok else 1
 
     ok = run_checks(args.tag, args.strict_tree)
     if ok and args.command == "build":
