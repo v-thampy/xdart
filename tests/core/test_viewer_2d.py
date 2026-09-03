@@ -1028,6 +1028,206 @@ def test_eiger_frame_read_uses_stat_fences_and_rehashes_only_after_drift(
     assert calls == [str(segments[0].resolve())]
 
 
+def _non_hdf_stat_case(tmp_path, family):
+    values = np.arange(2 * 3 * 5, dtype=np.uint16).reshape(2, 3, 5)
+    policy = api.Viewer2DFormatPolicy()
+    if family == "raw":
+        path = tmp_path / "selected.raw"
+        expected, label = values[1], 0
+        path.write_bytes(expected.tobytes())
+        policy = api.Viewer2DFormatPolicy(
+            raw_detector_shape=expected.shape,
+            raw_dtype=expected.dtype.str,
+        )
+    elif family == "npy":
+        path, expected, label = tmp_path / "selected.npy", values[1], 1
+        np.save(path, values, allow_pickle=False)
+    elif family == "npz":
+        path, expected, label = tmp_path / "selected.npz", values[1], 1
+        _npz(
+            path,
+            [("image.npy", _npy_bytes(values))],
+            compression=zipfile.ZIP_STORED,
+        )
+    elif family == "tiff":
+        path, expected, label = tmp_path / "selected.tiff", values[1], 1
+        pytest.importorskip("tifffile").imwrite(
+            path, values, photometric="minisblack",
+        )
+    else:
+        path, expected, label = tmp_path / "selected.edf", values[0], 0
+        pytest.importorskip("fabio").edfimage.EdfImage(data=expected).write(path)
+    return path, api.catalog_viewer_2d(path, policy=policy), label, expected, policy
+
+
+@pytest.mark.parametrize("family", ["raw", "npy", "npz", "tiff"])
+def test_non_hdf_frame_read_keeps_catalog_hash_but_does_not_rehash_stable_file(
+        tmp_path, monkeypatch, family):
+    path, catalog, label, expected, policy = _non_hdf_stat_case(tmp_path, family)
+    calls = []
+    original = api._stable_revision
+
+    def stable(candidate):
+        calls.append(str(Path(candidate).resolve()))
+        return original(candidate)
+
+    monkeypatch.setattr(api, "_stable_revision", stable)
+    frame = api.read_viewer_2d_frame(catalog, label, policy=policy)
+
+    _assert_canonical(frame, expected)
+    assert calls == []
+    assert catalog.primary_revision.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert frame.provenance.primary_revision is catalog.primary_revision
+
+
+def test_tiff_parent_swap_and_restore_reads_certified_descriptor(
+        tmp_path, monkeypatch):
+    tifffile = pytest.importorskip("tifffile")
+    admitted = np.arange(2 * 3 * 5, dtype=np.uint16).reshape(2, 3, 5)
+    foreign = admitted + 1000
+    active_dir, foreign_dir = tmp_path / "active", tmp_path / "foreign"
+    held_dir = tmp_path / "held"
+    active_dir.mkdir()
+    foreign_dir.mkdir()
+    path = active_dir / "selected.tiff"
+    tifffile.imwrite(path, admitted, photometric="minisblack")
+    tifffile.imwrite(
+        foreign_dir / path.name, foreign, photometric="minisblack",
+    )
+    foreign_sha256 = hashlib.sha256(
+        (foreign_dir / path.name).read_bytes(),
+    ).hexdigest()
+    catalog = api.catalog_viewer_2d(path)
+    calls, swapped = [], []
+    original_asarray, original_stable = tifffile.TiffPage.asarray, api._stable_revision
+
+    def asarray(page, *args, **kwargs):
+        active_dir.rename(held_dir)
+        foreign_dir.rename(active_dir)
+        try:
+            swapped.append(hashlib.sha256(path.read_bytes()).hexdigest())
+            return original_asarray(page, *args, **kwargs)
+        finally:
+            active_dir.rename(foreign_dir)
+            held_dir.rename(active_dir)
+
+    def stable(candidate):
+        calls.append(str(Path(candidate).resolve()))
+        return original_stable(candidate)
+
+    monkeypatch.setattr(tifffile.TiffPage, "asarray", asarray)
+    monkeypatch.setattr(api, "_stable_revision", stable)
+    frame = api.read_viewer_2d_frame(catalog, 1)
+
+    _assert_canonical(frame, admitted[1])
+    assert swapped == [foreign_sha256]
+    assert calls == []
+
+
+def test_fabio_selected_read_keeps_prior_full_revision_rechecks(
+        tmp_path, monkeypatch):
+    path, catalog, label, expected, policy = _non_hdf_stat_case(
+        tmp_path, "fabio",
+    )
+    calls = []
+    original = api._stable_revision
+
+    def stable(candidate):
+        calls.append(str(Path(candidate).resolve()))
+        return original(candidate)
+
+    monkeypatch.setattr(api, "_stable_revision", stable)
+    _assert_canonical(
+        api.read_viewer_2d_frame(catalog, label, policy=policy), expected,
+    )
+    assert calls == [str(path.resolve()), str(path.resolve())]
+
+
+@pytest.mark.parametrize("drift", ["in-place", "replacement"])
+def test_non_hdf_stat_fence_rejects_same_size_restored_mtime_drift(
+        tmp_path, monkeypatch, drift):
+    initial = np.arange(30, dtype=np.uint16).reshape(2, 3, 5)
+    changed = initial + 100
+    path, replacement = tmp_path / "selected.npy", tmp_path / "replacement.npy"
+    np.save(path, initial, allow_pickle=False)
+    np.save(replacement, changed, allow_pickle=False)
+    catalog = api.catalog_viewer_2d(path)
+    admitted = path.stat()
+    assert replacement.stat().st_size == admitted.st_size
+    if drift == "in-place":
+        path.write_bytes(replacement.read_bytes())
+        os.utime(path, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
+    else:
+        os.utime(replacement, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
+        os.replace(replacement, path)
+    current = path.stat()
+    assert current.st_size == admitted.st_size
+    assert current.st_mtime_ns == admitted.st_mtime_ns
+
+    calls = []
+    original = api._stable_revision
+
+    def stable(candidate):
+        calls.append(str(Path(candidate).resolve()))
+        return original(candidate)
+
+    monkeypatch.setattr(api, "_stable_revision", stable)
+    _assert_changed(api.read_viewer_2d_frame, catalog, 1)
+    assert calls == [str(path.resolve())]
+
+
+def test_non_hdf_stat_fence_recertifies_drift_during_selected_read(
+        tmp_path, monkeypatch):
+    initial = np.arange(30, dtype=np.uint16).reshape(2, 3, 5)
+    changed = initial + 100
+    path, replacement = tmp_path / "selected.npy", tmp_path / "replacement.npy"
+    np.save(path, initial, allow_pickle=False)
+    np.save(replacement, changed, allow_pickle=False)
+    catalog = api.catalog_viewer_2d(path)
+    admitted = path.stat()
+    calls, mutated = [], []
+    original_header, original_stable = api._npy_header, api._stable_revision
+
+    def header(stream):
+        result = original_header(stream)
+        if not mutated:
+            mutated.append(True)
+            path.write_bytes(replacement.read_bytes())
+            os.utime(path, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
+        return result
+
+    def stable(candidate):
+        calls.append(str(Path(candidate).resolve()))
+        return original_stable(candidate)
+
+    monkeypatch.setattr(api, "_npy_header", header)
+    monkeypatch.setattr(api, "_stable_revision", stable)
+    _assert_changed(api.read_viewer_2d_frame, catalog, 1)
+    assert mutated == [True]
+    assert calls == [str(path.resolve())]
+
+
+def test_non_hdf_selected_read_failure_closes_fenced_descriptor(
+        tmp_path, monkeypatch):
+    path, catalog, _label, _expected, _policy = _non_hdf_stat_case(tmp_path, "npy")
+    real_open = open
+    opened = []
+
+    def tracked(candidate, *args, **kwargs):
+        stream = real_open(candidate, *args, **kwargs)
+        if Path(candidate) == path:
+            opened.append(stream)
+        return stream
+
+    def fail_header(_stream):
+        raise OSError("injected selected-read failure")
+
+    monkeypatch.setattr(api, "open", tracked, raising=False)
+    monkeypatch.setattr(api, "_npy_header", fail_header)
+    _assert_changed(api.read_viewer_2d_frame, catalog, 1)
+    assert len(opened) == 1 and opened[0].closed
+
+
 def _independent_ledger(canonical, *, encoded=17, reservation=_EXPECTED_R,
                         budget=_EXPECTED_B):
     reader = max(3 * canonical, encoded + 4 * canonical)

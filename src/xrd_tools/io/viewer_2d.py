@@ -487,6 +487,48 @@ def _path_stat(path):
     return tuple(int(getattr(info, name)) for name in _REVISION_STAT_FIELDS)
 
 
+def _recertify_drift(revision, message):
+    """Refuse a changed source after refreshing its content identity once.
+
+    The refresh is diagnostic/custodial only: a stat mismatch has already made
+    the admitted catalog stale, so a path that races back to its old contents
+    must still be refused rather than silently inheriting that admission.
+    """
+
+    try:
+        _stable_revision(Path(revision.canonical_path))
+    except (OSError, Viewer2DReadError):
+        pass
+    _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, message)
+
+
+def _cert_stat_revision(revision, *, stream=None, message):
+    """Fence one admitted revision without rereading its whole payload.
+
+    When *stream* is supplied, both the still-open descriptor and its pathname
+    must retain the exact catalog stat tuple.  Stable selected-frame reads are
+    therefore O(1) in artifact size; any drift takes the slow recertification
+    path before refusing the stale catalog.
+    """
+
+    descriptor = None
+    if stream is not None:
+        try:
+            info = os.fstat(stream.fileno())
+        except (OSError, ValueError):
+            _recertify_drift(revision, message)
+        descriptor = tuple(
+            int(getattr(info, name)) for name in _REVISION_STAT_FIELDS
+        )
+    try:
+        pathname = _path_stat(Path(revision.canonical_path))
+    except Viewer2DReadError:
+        pathname = None
+    expected = _revision_stat(revision)
+    if pathname != expected or descriptor is not None and descriptor != expected:
+        _recertify_drift(revision, message)
+
+
 def _descriptor_revision(path, stream, sha256=None):
     before = os.fstat(stream.fileno())
     if sha256 is None:
@@ -1773,11 +1815,11 @@ def _read_numpy(catalog, index):
     path = Path(catalog.canonical_path)
     if catalog.format_name == "npy":
         with open(path, "rb", buffering=0) as stream:
-            opened = _revision(path, catalog.primary_revision.sha256,
-                               os.fstat(stream.fileno()))
-            if opened != catalog.primary_revision:
-                _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
-                        "NPY descriptor does not match catalog")
+            _cert_stat_revision(
+                catalog.primary_revision,
+                stream=stream,
+                message="NPY descriptor does not match catalog",
+            )
             shape, dtype, offset, payload = _npy_header(stream)
             if shape != catalog.source_shape or dtype.str != catalog.source_dtype:
                 _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "NPY header changed")
@@ -1787,12 +1829,18 @@ def _read_numpy(catalog, index):
             raw = stream.read(frame_bytes)
             if len(raw) != frame_bytes:
                 _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "NPY frame truncated")
-            if _descriptor_revision(path, stream) != catalog.primary_revision:
-                _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "NPY source changed")
+            _cert_stat_revision(
+                catalog.primary_revision,
+                stream=stream,
+                message="NPY source changed",
+            )
         return np.frombuffer(raw, dtype=dtype).reshape(h, w), hashlib.sha256(raw).hexdigest()
     with open(path, "rb", buffering=0) as stream:
-        if _descriptor_revision(path, stream) != catalog.primary_revision:
-            _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "NPZ source changed")
+        _cert_stat_revision(
+            catalog.primary_revision,
+            stream=stream,
+            message="NPZ source changed",
+        )
         members = _zip_members(stream)
         member = next((value for value in members if value.name == catalog.member_name), None)
         if member is None:
@@ -1804,8 +1852,11 @@ def _read_numpy(catalog, index):
         frame_bytes = h * w * dtype.itemsize
         raw = _zip_scan(stream, member,
             capture_start=offset + index * frame_bytes, capture_size=frame_bytes)
-        if _descriptor_revision(path, stream) != catalog.primary_revision:
-            _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "NPZ source changed")
+        _cert_stat_revision(
+            catalog.primary_revision,
+            stream=stream,
+            message="NPZ source changed",
+        )
     return np.frombuffer(raw, dtype=dtype).reshape(h, w), hashlib.sha256(raw).hexdigest()
 
 
@@ -1971,28 +2022,50 @@ def _read_detector_frame(catalog, index, policy):
     if catalog.format_name == "raw":
         dtype = _source_dtype(policy.raw_dtype)
         with open(path, "rb", buffering=0) as stream:
-            opened = _revision(path, catalog.primary_revision.sha256,
-                               os.fstat(stream.fileno()))
+            _cert_stat_revision(
+                catalog.primary_revision,
+                stream=stream,
+                message="RAW descriptor does not match catalog",
+            )
             stream.seek(policy.raw_header_skip)
             expected = math.prod(catalog.source_shape[-2:]) * dtype.itemsize
             raw = stream.read(expected)
-            current = _descriptor_revision(path, stream)
-        if (len(raw) != expected or opened != catalog.primary_revision
-                or current != catalog.primary_revision):
+            _cert_stat_revision(
+                catalog.primary_revision,
+                stream=stream,
+                message="RAW source changed",
+            )
+        if len(raw) != expected:
             _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "RAW source changed")
         return np.frombuffer(raw, dtype=dtype).reshape(catalog.source_shape[-2:]), \
             hashlib.sha256(raw).hexdigest()
-    _assert_primary(catalog)
+    descriptor_bound_tiff = catalog.format_name == "tiff"
+    # Fabio's public file-like API copies the whole input while identifying the
+    # codec, and individual codecs impose extra stream semantics.  Keep its
+    # previous full-revision path until a supported descriptor-bound API exists.
+    if not descriptor_bound_tiff:
+        _assert_primary(catalog)
     try:
-        if catalog.format_name == "tiff":
-            import tifffile
-            with tifffile.TiffFile(path) as handle:
-                page = handle.pages[index]
-                if (tuple(page.shape) != catalog.source_shape[-2:]
-                        or np.dtype(page.dtype).str != catalog.source_dtype):
-                    _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
-                            "selected TIFF metadata changed")
-                array = page.asarray()
+        if descriptor_bound_tiff:
+            with open(path, "rb", buffering=0) as stream:
+                _cert_stat_revision(
+                    catalog.primary_revision,
+                    stream=stream,
+                    message="TIFF source changed before selected frame read",
+                )
+                import tifffile
+                with tifffile.TiffFile(stream) as handle:
+                    page = handle.pages[index]
+                    if (tuple(page.shape) != catalog.source_shape[-2:]
+                            or np.dtype(page.dtype).str != catalog.source_dtype):
+                        _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
+                                "selected TIFF metadata changed")
+                    array = page.asarray()
+                _cert_stat_revision(
+                    catalog.primary_revision,
+                    stream=stream,
+                    message="TIFF source changed during selected frame read",
+                )
         else:
             import fabio
             if path.stat().st_size > _MAX_FABIO:
@@ -2032,7 +2105,8 @@ def _read_detector_frame(catalog, index, policy):
         raise
     except Exception as error:
         _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, str(error))
-    _assert_primary(catalog)
+    if not descriptor_bound_tiff:
+        _assert_primary(catalog)
     return array, ""
 
 
