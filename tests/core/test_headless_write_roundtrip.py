@@ -160,6 +160,53 @@ def test_write_integrated_stack_bulk_then_incremental(tmp_path):
     np.testing.assert_allclose(ds2["intensity_1d"].values[1], 9.0)  # row 1 updated
 
 
+def test_owned_new_rows_append_as_one_batch(tmp_path, monkeypatch):
+    """A validated writer cursor can append a batch without routing
+    every new row through the general upsert path."""
+    import h5py
+    from xrd_tools.io import nexus
+
+    p = tmp_path / "owned-batch.nexus"
+    rows_1d: dict[int, int] = {}
+    rows_2d: dict[int, int] = {}
+    with h5py.File(p, "w") as f:
+        entry = _current_entry(f)
+        nexus.write_integrated_stack(
+            entry,
+            frame_indices=[0, 1],
+            results_1d=[_r1d(0), _r1d(1)],
+            results_2d=[_r2d(0), _r2d(1)],
+            known_rows_1d=rows_1d,
+            known_rows_2d=rows_2d,
+            bulk_new_rows=True,
+        )
+
+        def forbid_per_row(*_args, **_kwargs):
+            raise AssertionError("owned new-row batch used the per-row appender")
+
+        monkeypatch.setattr(nexus, "_append_stacked_1d", forbid_per_row)
+        monkeypatch.setattr(nexus, "_append_stacked_2d", forbid_per_row)
+        nexus.write_integrated_stack(
+            entry,
+            frame_indices=[2, 3],
+            results_1d=[_r1d(2), _r1d(3)],
+            results_2d=[_r2d(2), _r2d(3)],
+            known_rows_1d=rows_1d,
+            known_rows_2d=rows_2d,
+            bulk_new_rows=True,
+        )
+
+        assert rows_1d == rows_2d == {0: 0, 1: 1, 2: 2, 3: 3}
+        np.testing.assert_array_equal(
+            entry["integrated_1d/frame_index"][()], [0, 1, 2, 3],
+        )
+        np.testing.assert_array_equal(
+            entry["integrated_2d/frame_index"][()], [0, 1, 2, 3],
+        )
+        assert entry["integrated_1d/intensity"].shape == (4, N_Q)
+        assert entry["integrated_2d/intensity"].shape == (4, N_CHI, N_Q)
+
+
 def test_monotonic_append_refuses_a_late_new_frame_without_mutation(tmp_path):
     import h5py
     from xrd_tools.io.nexus import write_integrated_stack

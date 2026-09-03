@@ -2250,7 +2250,10 @@ class NexusSink:
                     self._transaction, self._attempt, self._lease,
                 ),
                 append_decision=decision,
-                fast_regenerable=self._fast_regenerable,
+                # A successor epoch extends an already committed artifact;
+                # only the initial fresh finite Overwrite owns the terminal
+                # science fast path.
+                fast_regenerable=False,
                 defer_epoch_durability=self.rollback_until_commit,
             )
             self._writer = writer

@@ -25,6 +25,8 @@ from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
 from xrd_tools.core.frame_view import two_d_kind_from_units
 from xrd_tools.core.provenance import write_provenance
 from xrd_tools.io.nexus import (
+    _axis_kind_1d,
+    _axis_kind_from_group_1d,
     open_nexus_writer,
     upsert_per_frame_geometry,
     upsert_positioners,
@@ -91,6 +93,7 @@ from xrd_tools.io.schema import (
     local_hard_dataset,
     local_hard_group_path,
     mode_subgroup_name,
+    read_current_mode_layout,
 )
 from xrd_tools.session import ResultMode, StageReceipt, get_pool
 
@@ -450,15 +453,58 @@ class _DurableModeProof:
 
 
 @dataclass(frozen=True, slots=True)
+class _FastArrayProof:
+    """Shape plus value digest; never retains a scientific ndarray."""
+
+    shape: tuple[int, ...]
+    digest: str
+
+
+@dataclass(slots=True)
+class _FastModeGroupProof:
+    """Compact scientific identity for one append-only finite result mode."""
+
+    group_name: str
+    dimension: str
+    mode: str
+    radial: _FastArrayProof
+    azimuthal: _FastArrayProof | None
+    unit: str
+    axis_kind: str | None
+    azimuthal_unit: str | None
+    two_d_kind: str | None
+    row_shape: tuple[int, ...]
+    row_count: int
+    sigma_presence: bytearray
+    row_digest: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _FastModeRowKey:
+    """Ephemeral selector used only for one bounded terminal read."""
+
+    group_name: str
+    label: int
+    row: int
+    dimension: str
+
+
+@dataclass(frozen=True, slots=True)
 class _CloseModeGroupContext:
     group_name: str
     group_path: str
     top_path: str
     dimension: str
     primary_mode: str
+    frame_index_shape: tuple[int, ...]
     frame_index_dtype: np.dtype
+    intensity_shape: tuple[int, ...]
+    intensity_dtype: np.dtype
+    sigma_shape: tuple[int, ...] | None
+    sigma_dtype: np.dtype | None
     radial: np.ndarray
     unit: str
+    axis_kind: str | None
     azimuthal: np.ndarray | None
     azimuthal_unit: str | None
     two_d_kind: str | None
@@ -1910,6 +1956,10 @@ class NexusRecordWriter:
             raise ValueError(f"flush_every must be > 0 or None; got {flush_every}")
         if int(replace_attempts) < 1:
             raise ValueError("replace_attempts must be >= 1")
+        if type(fast_regenerable) is not bool:
+            raise TypeError("fast_regenerable must be an exact bool")
+        if type(defer_epoch_durability) is not bool:
+            raise TypeError("defer_epoch_durability must be an exact bool")
         self.target = require_current_output_path(target)
         self.entry = str(entry)
         self.compression = compression
@@ -1996,10 +2046,22 @@ class NexusRecordWriter:
             else prepared_manifest_admission.receipt
         )
         self._fast_regenerable = fast_regenerable
-        if type(defer_epoch_durability) is not bool: raise TypeError("defer_epoch_durability must be an exact bool")
         self._defer_epoch_durability = defer_epoch_durability
         self._append_decision = append_decision
         replacement_values = (replacement_dimension, replacement_labels, replacement_audit, replacement_selected_plan)
+        if fast_regenerable and (
+            transaction_binding is None
+            or type(transaction_binding) is not WriterTransactionBinding
+            or transaction_binding.transaction.fast_regenerable is not True
+            or not self.overwrite
+            or append_decision is not None
+            or defer_epoch_durability
+            or seeded_document is not None
+            or any(value is not None for value in replacement_values)
+        ):
+            raise ValueError(
+                "fast regenerable writes require a fresh transaction-bound Overwrite"
+            )
         replacement_owner_count = int(transaction_binding is not None) + int(
             seeded_document is not None
         )
@@ -2035,6 +2097,7 @@ class NexusRecordWriter:
             raise ValueError("transaction-bound writer cannot replace its owned inode")
         self.phase = WriterPhase.NEW
         self._h5 = None
+        self._fast_entry_group: h5py.Group | None = None
         self._active_path: Path | None = None
         self._pool_owned = False
         self._in_boundary = False
@@ -2074,6 +2137,7 @@ class NexusRecordWriter:
         self._durable_mode_proofs: dict[
             tuple[str, int], _DurableModeProof
         ] = {}
+        self._fast_mode_groups: dict[str, _FastModeGroupProof] = {}
         self._durable_absence_proofs: dict[
             tuple[str, int], _DurableAbsenceProof
         ] = {}
@@ -2269,9 +2333,22 @@ class NexusRecordWriter:
                 top.name,
                 first.dimension,
                 self._text_value(top.attrs.get(PRIMARY_MODE_ATTR, DEFAULT_MODE_KEY)),
+                tuple(int(size) for size in labels.shape),
                 labels.dtype,
+                tuple(int(size) for size in intensity.shape),
+                intensity.dtype,
+                (
+                    None
+                    if sigma is None
+                    else tuple(int(size) for size in sigma.shape)
+                ),
+                None if sigma is None else sigma.dtype,
                 np.asarray(radial[()]),
                 self._text_value(radial.attrs.get("units", "")),
+                (
+                    _axis_kind_from_group_1d(group)
+                    if first.dimension == "1d" else None
+                ),
                 None if chi is None else np.asarray(chi[()]),
                 None if chi is None else self._text_value(chi.attrs.get("units", "")),
                 None if chi is None else self._text_value(
@@ -2418,6 +2495,155 @@ class NexusRecordWriter:
             two_d_kind=two_d_kind,
             source_shape=tuple(np.asarray(result.intensity).shape),
         )
+        self._dirty_absent_modes.discard((group_name, label))
+        self._durable_absence_proofs.pop((group_name, label), None)
+
+    @staticmethod
+    def _fast_array_proof(value: Any, *, transpose: bool = False) -> _FastArrayProof:
+        array = np.asarray(value, dtype=np.float32)
+        if transpose:
+            array = array.T
+        contiguous = np.ascontiguousarray(array)
+        return _FastArrayProof(
+            tuple(int(size) for size in contiguous.shape),
+            hashlib.sha256(memoryview(contiguous).cast("B")).hexdigest(),
+        )
+
+    @staticmethod
+    def _update_fast_row_digest(
+        digest,
+        label: int,
+        intensity: Any,
+        sigma: Any | None,
+        *,
+        transpose: bool = False,
+    ) -> None:
+        """Append one canonical stored row to a rolling finite digest."""
+
+        def update_array(value: Any) -> None:
+            array = np.asarray(value, dtype=np.float32)
+            if transpose:
+                array = array.T
+            array = np.ascontiguousarray(array)
+            digest.update(struct.pack("<I", array.ndim))
+            for size in array.shape:
+                digest.update(struct.pack("<Q", int(size)))
+            digest.update(memoryview(array).cast("B"))
+
+        digest.update(b"row\0")
+        digest.update(struct.pack("<q", int(label)))
+        update_array(intensity)
+        if sigma is None:
+            digest.update(b"sigma-absent\0")
+        else:
+            digest.update(b"sigma-present\0")
+            update_array(sigma)
+
+    def _remember_fast_mode_proof(
+        self,
+        record: RecordWrite,
+        *,
+        dimension: str,
+    ) -> None:
+        """Roll one successful append into compact terminal proof state."""
+        result = record.result_1d if dimension == "1d" else record.result_2d
+        if result is None:
+            return
+        mode = str(
+            (record.mode_1d if dimension == "1d" else record.mode_2d)
+            or DEFAULT_MODE_KEY
+        )
+        group_name = self._mode_cursor_name(dimension, mode)
+        label = int(record.label)
+        row = self._row_cursors[group_name].get(label)
+        if row is None:
+            raise WriterStateError(
+                f"{group_name} did not install a cursor for finite label {label}"
+            )
+        two_d = dimension == "2d"
+        group_proof = self._fast_mode_groups.get(group_name)
+        if group_proof is None:
+            unit = str(result.unit or "")
+            group_proof = _FastModeGroupProof(
+                group_name=group_name,
+                dimension=dimension,
+                mode=mode,
+                radial=self._fast_array_proof(result.radial),
+                azimuthal=(
+                    self._fast_array_proof(result.azimuthal) if two_d else None
+                ),
+                unit=unit,
+                axis_kind=(_axis_kind_1d(unit) if not two_d else None),
+                azimuthal_unit=(
+                    str(result.azimuthal_unit or "") if two_d else None
+                ),
+                two_d_kind=(
+                    two_d_kind_from_units(
+                        result.unit, result.azimuthal_unit,
+                    ).value
+                    if two_d else None
+                ),
+                row_shape=tuple(int(size) for size in (
+                    np.asarray(result.intensity).T.shape
+                    if two_d else np.asarray(result.intensity).shape
+                )),
+                row_count=0,
+                sigma_presence=bytearray(),
+                row_digest=hashlib.sha256(),
+            )
+            self._fast_mode_groups[group_name] = group_proof
+        elif (
+            group_proof.dimension != dimension
+            or group_proof.mode != mode
+            or group_proof.radial.shape
+            != tuple(int(size) for size in np.asarray(result.radial).shape)
+            or group_proof.unit != str(result.unit or "")
+            or (
+                two_d
+                and (
+                    group_proof.azimuthal is None
+                    or group_proof.azimuthal.shape
+                    != tuple(
+                        int(size) for size in np.asarray(result.azimuthal).shape
+                    )
+                    or group_proof.azimuthal_unit
+                    != str(result.azimuthal_unit or "")
+                    or group_proof.two_d_kind
+                    != two_d_kind_from_units(
+                        result.unit, result.azimuthal_unit,
+                    ).value
+                )
+            )
+            or group_proof.row_shape
+            != tuple(int(size) for size in (
+                np.asarray(result.intensity).T.shape
+                if two_d else np.asarray(result.intensity).shape
+            ))
+            or (
+                result.sigma is not None
+                and group_proof.row_shape
+                != tuple(int(size) for size in (
+                    np.asarray(result.sigma).T.shape
+                    if two_d else np.asarray(result.sigma).shape
+                ))
+            )
+        ):
+            raise WriterStateError(
+                f"finite mode identity changed for {group_name}"
+            )
+        if int(row) != group_proof.row_count:
+            raise WriterStateError(
+                f"finite mode row order changed for {group_name}"
+            )
+        self._update_fast_row_digest(
+            group_proof.row_digest,
+            label,
+            result.intensity,
+            result.sigma,
+            transpose=two_d,
+        )
+        group_proof.sigma_presence.append(int(result.sigma is not None))
+        group_proof.row_count += 1
         self._dirty_absent_modes.discard((group_name, label))
         self._durable_absence_proofs.pop((group_name, label), None)
 
@@ -2623,9 +2849,18 @@ class NexusRecordWriter:
         prepared_thumbnails: Mapping[int, _PreparedThumbnail],
     ) -> None:
         for record in records:
-            self._remember_mode_row(record, dimension="1d")
-            self._remember_mode_row(record, dimension="2d")
-            if record.write_frame_record:
+            # A finite regenerable Overwrite starts from an empty working
+            # artifact.  Retaining another owned copy of every result row
+            # solely to reread it at each checkpoint adds memory and GIL
+            # pressure.  Compact proofs are checked at terminal close rather
+            # than at each checkpoint.
+            if self._fast_regenerable:
+                self._remember_fast_mode_proof(record, dimension="1d")
+                self._remember_fast_mode_proof(record, dimension="2d")
+            else:
+                self._remember_mode_row(record, dimension="1d")
+                self._remember_mode_row(record, dimension="2d")
+            if record.write_frame_record and not self._fast_regenerable:
                 self._remember_frame_row(
                     record,
                     prepared_thumbnails.get(int(record.label)),
@@ -3181,9 +3416,7 @@ class NexusRecordWriter:
             self._text_value(dataset[()]),
         )
 
-    def _verify_dirty_evidence(
-        self,
-    ) -> tuple[
+    def _verify_dirty_evidence(self) -> tuple[
         str,
         int,
         int,
@@ -3202,7 +3435,9 @@ class NexusRecordWriter:
             aggregate.text(role, digest, digest)
             read_bytes += evidence.read_bytes
 
-        mode_rows = tuple(self._dirty_modes[key] for key in sorted(self._dirty_modes))
+        mode_rows = tuple(
+            self._dirty_modes[key] for key in sorted(self._dirty_modes)
+        )
         for rows in self._semantic_groups(mode_rows):
             grouped = self._read_grouped_mode(rows, "checkpoint")
             for offset, expected in enumerate(rows):
@@ -3237,8 +3472,7 @@ class NexusRecordWriter:
             self._verify_lineage(evidence)
             absorb("append-lineage", evidence)
         rows = (
-            len(self._dirty_modes)
-            + len(self._dirty_absent_modes)
+            len(self._dirty_modes) + len(self._dirty_absent_modes)
             + len(self._dirty_frames)
             + len(self._dirty_indexed)
         )
@@ -3566,41 +3800,287 @@ class NexusRecordWriter:
                 os.close(verification_descriptor)
                 self._close_verification_descriptor = None
 
-    def _verify_fast_close_structure(self) -> None:
-        """Check bounded schema facts; regenerable history is not reread."""
+    def _verify_fast_mode_inventory(
+        self,
+        entry: h5py.Group,
+        evidence: _EvidenceBuilder,
+    ) -> None:
+        """Bind every expected mode key to its persisted NeXus group."""
+        for dimension in ("1d", "2d"):
+            groups = tuple(
+                proof for proof in self._fast_mode_groups.values()
+                if proof.dimension == dimension
+            )
+            top_name = f"integrated_{dimension}"
+            top = local_hard_group_path(entry, top_name, role=top_name)
+            if not groups:
+                if top is not None:
+                    raise WriterStateError(
+                        f"fast close found unexpected finite {dimension} output"
+                    )
+                evidence.absent(f"finite-{dimension}-mode-inventory", True)
+                continue
+            if not isinstance(top, h5py.Group):
+                raise WriterStateError(
+                    f"fast close lost finite {dimension} mode inventory"
+                )
+            wanted_primary = (
+                self._primary_mode_1d
+                if dimension == "1d" else self._primary_mode_2d
+            )
+            path_by_mode = {proof.mode: proof.group_name for proof in groups}
+            if len(path_by_mode) != len(groups):
+                raise WriterStateError(
+                    f"fast close found duplicate {dimension} mode identity"
+                )
+            expected_modes = (
+                wanted_primary,
+                *(mode for mode in path_by_mode if mode != wanted_primary),
+            )
+            expected_paths = tuple(
+                (mode, path_by_mode[mode]) for mode in expected_modes
+            )
+            try:
+                observed_primary, observed_modes, observed_pairs = (
+                    read_current_mode_layout(top, dimension)
+                )
+            except (TypeError, ValueError) as error:
+                raise WriterStateError(
+                    f"fast close found invalid {dimension} mode inventory"
+                ) from error
+            observed_paths = tuple(
+                (mode, group.name.removeprefix(f"{entry.name}/"))
+                for mode, group in observed_pairs
+            )
+            if (
+                observed_primary != wanted_primary
+                or observed_modes != expected_modes
+                or observed_paths != expected_paths
+            ):
+                raise WriterStateError(
+                    f"fast close changed {dimension} mode inventory"
+                )
+            evidence.text(
+                f"finite-{dimension}-mode-inventory",
+                json.dumps(expected_paths, separators=(",", ":")),
+                json.dumps(observed_paths, separators=(",", ":")),
+            )
+
+    def _verify_fast_group_context(
+        self,
+        evidence: _EvidenceBuilder,
+        proof: _FastModeGroupProof,
+        context: _CloseModeGroupContext,
+    ) -> int:
+        """Verify shared axes and units once for one persisted mode."""
+        wanted_primary = (
+            self._primary_mode_1d
+            if proof.dimension == "1d" else self._primary_mode_2d
+        )
+        observed_radial = self._fast_array_proof(context.radial)
+        sigma_expected = any(proof.sigma_presence)
+        expected_shape = (proof.row_count, *proof.row_shape)
+        if (
+            context.group_name != proof.group_name
+            or context.dimension != proof.dimension
+            or context.primary_mode != wanted_primary
+            or context.frame_index_shape != (proof.row_count,)
+            or context.frame_index_dtype != np.dtype(np.int64)
+            or context.intensity_shape != expected_shape
+            or observed_radial != proof.radial
+            or context.radial.dtype != np.dtype(np.float32)
+            or context.unit != proof.unit
+            or context.axis_kind != proof.axis_kind
+            or context.intensity_dtype != np.dtype(np.float32)
+            or context.sigma_present != sigma_expected
+            or (
+                context.sigma_shape is not None
+                and context.sigma_shape != expected_shape
+            )
+            or (
+                context.sigma_dtype is not None
+                and context.sigma_dtype != np.dtype(np.float32)
+            )
+        ):
+            raise WriterStateError(
+                f"fast close changed shared science for {proof.group_name}"
+            )
+        evidence.text(
+            f"{proof.group_name}/q",
+            proof.radial.digest,
+            observed_radial.digest,
+        )
+        schema = json.dumps(
+            {
+                "dimension": proof.dimension,
+                "mode": proof.mode,
+                "primary_mode": wanted_primary,
+                "frame_index_shape": context.frame_index_shape,
+                "frame_index_dtype": str(context.frame_index_dtype),
+                "intensity_shape": context.intensity_shape,
+                "intensity_dtype": str(context.intensity_dtype),
+                "sigma_present": context.sigma_present,
+                "sigma_shape": context.sigma_shape,
+                "sigma_dtype": (
+                    None
+                    if context.sigma_dtype is None else str(context.sigma_dtype)
+                ),
+                "q_shape": observed_radial.shape,
+                "q_dtype": str(context.radial.dtype),
+                "q_unit": context.unit,
+                "axis_kind": context.axis_kind,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        evidence.text(f"{proof.group_name}/schema", schema, schema)
+        read_bytes = int(context.radial.nbytes)
+        if proof.dimension == "2d":
+            observed_azimuthal = (
+                None
+                if context.azimuthal is None
+                else self._fast_array_proof(context.azimuthal)
+            )
+            if (
+                observed_azimuthal != proof.azimuthal
+                or context.azimuthal.dtype != np.dtype(np.float32)
+                or context.azimuthal_unit != proof.azimuthal_unit
+                or context.two_d_kind != proof.two_d_kind
+            ):
+                raise WriterStateError(
+                    f"fast close changed azimuthal science for {proof.group_name}"
+                )
+            evidence.text(
+                f"{proof.group_name}/chi",
+                proof.azimuthal.digest,
+                observed_azimuthal.digest,
+            )
+            angular = json.dumps(
+                {
+                    "chi_shape": observed_azimuthal.shape,
+                    "chi_dtype": str(context.azimuthal.dtype),
+                    "chi_unit": context.azimuthal_unit,
+                    "two_d_kind": context.two_d_kind,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            evidence.text(f"{proof.group_name}/angular-schema", angular, angular)
+            read_bytes += int(context.azimuthal.nbytes)
+        return read_bytes
+
+    def _update_observed_fast_rows(
+        self,
+        proof: _FastModeGroupProof,
+        rows: tuple[_FastModeRowKey, ...],
+        observation: _CloseModeObservation,
+        digest,
+    ) -> int:
+        """Add one bounded persisted slab to its mode-level digest."""
+        observed_labels = np.asarray(observation.frame_indices)
+        expected_labels = np.asarray(
+            [row.label for row in rows], dtype=np.int64,
+        )
+        if not np.array_equal(observed_labels, expected_labels):
+            raise WriterStateError(
+                f"fast close changed frame labels for {proof.group_name}"
+            )
+        read_bytes = int(observed_labels.nbytes + observation.intensities.nbytes)
+        if observation.sigmas is not None:
+            read_bytes += int(observation.sigmas.nbytes)
+        for offset, row in enumerate(rows):
+            sigma_row = (
+                None
+                if observation.sigmas is None else observation.sigmas[offset]
+            )
+            sigma_expected = bool(proof.sigma_presence[row.row])
+            if not sigma_expected:
+                if sigma_row is not None and not np.isnan(sigma_row).all():
+                    raise WriterStateError(
+                        f"fast close changed absent sigma for {proof.group_name} "
+                        f"label {row.label}"
+                    )
+            elif sigma_row is None:
+                raise WriterStateError(
+                    f"fast close lost sigma for {proof.group_name} "
+                    f"label {row.label}"
+                )
+            self._update_fast_row_digest(
+                digest,
+                row.label,
+                observation.intensities[offset],
+                sigma_row if sigma_expected else None,
+            )
+        return read_bytes
+
+    def _verify_fast_integrated_results(self) -> tuple[str, int]:
+        """Verify integrated-result stacks and Average counts once at close."""
+        evidence = _EvidenceBuilder(observed_only=True)
         entry = self._h5.get(self.entry)
         if not isinstance(entry, h5py.Group) or self._text_value(
-            entry.attrs.get("NX_class", "")) != "NXentry":
+            entry.attrs.get("NX_class", "")
+        ) != "NXentry":
             raise WriterStateError("fast close lost its NXentry metadata")
-        for name, cursor in self._row_cursors.items():
-            if not cursor or not name.startswith("integrated_"):
-                continue
-            group = local_hard_group_path(entry, name, role=name)
-            two_d = name.startswith("integrated_2d")
-            keys = ("frame_index", "intensity", *(("chi",) if two_d else ()), "q")
-            arrays = tuple(
-                local_hard_dataset(group, key, role=f"{name}/{key}")
-                for key in keys
-            ) \
-                if isinstance(group, h5py.Group) else ()
-            if not arrays or not all(isinstance(value, h5py.Dataset)
-                                     for value in arrays):
-                raise WriterStateError(f"fast close lost arrays for {name}")
-            labels, intensity, *axes = arrays
-            sigma = local_hard_dataset(
-                group, "sigma", role=f"{name}/sigma",
-            )
-            expected = (len(cursor), *(axis.shape[0] for axis in axes))
+        evidence.text(f"/{self.entry}/NX_class", "NXentry", "NXentry")
+        self._verify_fast_mode_inventory(entry, evidence)
+        if not self._fast_mode_groups:
+            evidence.absent("finite-result-science", True)
+        read_bytes = 0
+        for group_name, proof in self._fast_mode_groups.items():
+            cursor = self._row_cursors.get(group_name, {})
+            labels: list[int | None] = [None] * proof.row_count
+            for label, row in cursor.items():
+                if (
+                    isinstance(row, (bool, np.bool_))
+                    or not isinstance(row, (int, np.integer))
+                    or int(row) < 0
+                    or int(row) >= proof.row_count
+                    or labels[int(row)] is not None
+                ):
+                    raise WriterStateError(
+                        f"fast close lost finite cursor coverage for {group_name}"
+                    )
+                labels[int(row)] = int(label)
             if (
-                labels.shape != (len(cursor),)
-                or any(axis.ndim != 1 for axis in axes)
-                or intensity.shape != expected
-                or (sigma is not None and (
-                    not isinstance(sigma, h5py.Dataset)
-                    or sigma.shape != expected
-                ))
+                proof.row_count < 1
+                or len(cursor) != proof.row_count
+                or len(proof.sigma_presence) != proof.row_count
+                or any(label is None for label in labels)
             ):
-                raise WriterStateError(f"fast close found invalid row shape for {name}")
+                raise WriterStateError(
+                    f"fast close lost finite proof coverage for {group_name}"
+                )
+            rows = tuple(
+                _FastModeRowKey(group_name, int(label), row, proof.dimension)
+                for row, label in enumerate(labels)
+            )
+            observed_digest = hashlib.sha256()
+            first_slab = True
+            for slab, observation in self._close_mode_groups(rows):
+                if first_slab:
+                    read_bytes += self._verify_fast_group_context(
+                        evidence, proof, observation.context,
+                    )
+                    first_slab = False
+                read_bytes += self._update_observed_fast_rows(
+                    proof, slab, observation, observed_digest,
+                )
+            expected = proof.row_digest.copy().hexdigest()
+            observed = observed_digest.hexdigest()
+            if observed != expected:
+                raise WriterStateError(
+                    f"fast close changed result rows for {group_name}"
+                )
+            evidence.text(f"{group_name}/rows", expected, observed)
+        counts = self._finalization.average_finite_counts
+        if counts is not None:
+            expected = getattr(counts, "evidence", None)
+            count_digest, count_bytes = self._verify_average_finite_counts(
+                expected,
+            )
+            evidence.text("average-counts:1", expected.sha256, count_digest)
+            read_bytes += count_bytes
+        return evidence.hexdigest(), read_bytes
 
     def _clear_dirty_evidence(self) -> None:
         self._dirty_modes.clear()
@@ -3610,6 +4090,13 @@ class NexusRecordWriter:
         self._lineage_dirty = False
 
     def _entry_group(self):
+        if self._fast_regenerable:
+            cached = self._fast_entry_group
+            if cached is not None:
+                return cached
+            cached = self._h5.require_group(self.entry)
+            self._fast_entry_group = cached
+            return cached
         return self._h5.require_group(self.entry)
 
     def _bump(self, name: str, value: int = 1) -> None:
@@ -4340,6 +4827,70 @@ class NexusRecordWriter:
             **authority, "last_label": int(prepared["labels"][-1]),
         })
 
+    def _validate_fresh_fast_records(
+        self,
+        records: tuple[RecordWrite, ...],
+    ) -> dict[int, _PreparedThumbnail]:
+        """Validate source rows for a fresh finite artifact before mutation."""
+        prepared: dict[int, _PreparedThumbnail] = {}
+        for record in records:
+            if record.replace_existing or not record.write_frame_record:
+                raise WriterStateError(
+                    "fresh finite Overwrite requires new frame records"
+                )
+            thumbnail = (
+                None
+                if record.thumbnail is None
+                else np.asarray(record.thumbnail)
+            )
+            if thumbnail is not None and thumbnail.ndim != 2:
+                raise ValueError("record thumbnail must be exactly 2-D")
+            if record.thumbnail_mask is not None:
+                mask = np.asarray(record.thumbnail_mask)
+                if thumbnail is None:
+                    raise ValueError("thumbnail_mask requires a thumbnail")
+                if mask.shape != thumbnail.shape:
+                    raise ValueError(
+                        "record thumbnail_mask shape must equal thumbnail shape"
+                    )
+            if record.source_path is not None:
+                relative_source_path(record.source_path, self.source_base)
+            if thumbnail is not None and self.complete_record:
+                prepared[int(record.label)] = _prepare_thumbnail(
+                    thumbnail,
+                    thumbnail_mask=record.thumbnail_mask,
+                )
+            label = int(record.label)
+            if label in self._append_written_labels:
+                supplied_groups = []
+                if record.result_1d is not None:
+                    supplied_groups.append(
+                        self._mode_cursor_name("1d", record.mode_1d)
+                    )
+                if record.result_2d is not None:
+                    supplied_groups.append(
+                        self._mode_cursor_name("2d", record.mode_2d)
+                    )
+                if (
+                    not supplied_groups
+                    or any(
+                        label in self._row_cursors.get(group_name, {})
+                        for group_name in supplied_groups
+                    )
+                ):
+                    raise WriterStateError(
+                        f"fresh finite output already owns frame label {label}"
+                    )
+                # A GI frame can legitimately arrive once for its primary
+                # modes and again for new sibling modes.  Bind that second
+                # result to the exact already-written frame fact; otherwise a
+                # repeated ordinary write could silently replace provenance.
+                self._verify_frame_row(
+                    _EvidenceBuilder(),
+                    self._expected_frame_row(record, prepared.get(label)),
+                )
+        return prepared
+
     def _validate_records(
         self,
         records: tuple[RecordWrite, ...],
@@ -4368,6 +4919,9 @@ class NexusRecordWriter:
             if name != trusted_group:
                 self._verify_cursor(name, int(record.label))
             groups_2d.setdefault(name, []).append(record)
+        write_validated_groups = (
+            {trusted_group} if trusted_group is not None else set()
+        )
         for name, grouped in (*groups_1d.items(), *groups_2d.items()):
             grouped_labels = tuple(int(record.label) for record in grouped)
             if any(
@@ -4405,7 +4959,7 @@ class NexusRecordWriter:
                         f"named modes require an established {top} primary group"
                     )
         for name, grouped in groups_1d.items():
-            if name == trusted_group:
+            if name in write_validated_groups:
                 continue
             validate_integrated_stack_write(
                 entry, frame_indices=[int(r.label) for r in grouped],
@@ -4413,13 +4967,15 @@ class NexusRecordWriter:
                 group_name_1d=name, allow_rebuild=False,
             )
         for name, grouped in groups_2d.items():
-            if name == trusted_group:
+            if name in write_validated_groups:
                 continue
             validate_integrated_stack_write(
                 entry, frame_indices=[int(r.label) for r in grouped],
                 results_2d=[r.result_2d for r in grouped],
                 group_name_2d=name, allow_rebuild=False,
             )
+        if self._fast_regenerable:
+            return self._validate_fresh_fast_records(records)
         existing_scan_data = _replacement_hard_group(self._entry_group(), "scan_data") if self._replacement_configuration is not None else self._entry_group().get("scan_data")
         existing_columns = (
             {str(name) for name in existing_scan_data if name != "frame_index"}
@@ -4582,6 +5138,7 @@ class NexusRecordWriter:
                         compression=self.compression,
                         known_rows_1d=self._row_cursors["integrated_1d"],
                         known_rows_2d=self._row_cursors["integrated_2d"],
+                        bulk_new_rows=self._fast_regenerable,
                     )
                 else:
                     if primary_1d:
@@ -4591,6 +5148,7 @@ class NexusRecordWriter:
                             primary_mode_1d=self._primary_mode_1d,
                             compression=self.compression,
                             known_rows_1d=self._row_cursors["integrated_1d"],
+                            bulk_new_rows=self._fast_regenerable,
                         )
                     if primary_2d:
                         write_integrated_stack(
@@ -4599,6 +5157,7 @@ class NexusRecordWriter:
                             primary_mode_2d=self._primary_mode_2d,
                             compression=self.compression,
                             known_rows_2d=self._row_cursors["integrated_2d"],
+                            bulk_new_rows=self._fast_regenerable,
                         )
                 if prepared_stack is None and (extra_1d or extra_2d):
                     write_integrated_stack(
@@ -4634,6 +5193,7 @@ class NexusRecordWriter:
                             ]
                             for mode in extra_2d
                         },
+                        bulk_new_rows=self._fast_regenerable,
                     )
                 if prepared_stack is None and (one_d or two_d):
                     self._capture_prepared_stack_authority(batch)
@@ -4754,11 +5314,37 @@ class NexusRecordWriter:
         revoke = getattr(self._facade, "revoke_checkpoint_recovery", None)
         if callable(revoke): revoke()
 
+    @staticmethod
+    def _fast_checkpoint_evidence():
+        """Seal only the current inode boundary; make no row durability claim.
+
+        A finite regenerable Overwrite publishes no receipts until terminal
+        integrated-science verification succeeds.  Re-reading thumbnails,
+        source provenance, and indexed presentation metadata at every flush
+        therefore added no recoverable guarantee; the incomplete new artifact
+        is disposable.  Keep dirty owners bounded, and leave those non-result
+        values to the normal HDF5 write/schema path.
+        """
+        digest = hashlib.sha256(
+            b"xrd-tools-fast-regenerable-checkpoint-v1\0"
+        ).hexdigest()
+        return digest, 0, 0, {}, {}
+
     def _seal_checkpoint_and_receipts(self, *, publish_receipts: bool = True, verified=None) -> None:
-        batch = self._current_receipts() if publish_receipts else ()
-        dropped = self._current_publication_drops() if publish_receipts else ()
-        (digest, read_bytes, rows, mode_proofs,
-         frame_proofs) = self._verify_dirty_evidence() if verified is None else verified
+        publish_checkpoint_receipts = (
+            publish_receipts and not self._fast_regenerable
+        )
+        batch = self._current_receipts() if publish_checkpoint_receipts else ()
+        dropped = (
+            self._current_publication_drops()
+            if publish_checkpoint_receipts else ()
+        )
+        if verified is None:
+            if self._fast_regenerable:
+                verified = self._fast_checkpoint_evidence()
+            else:
+                verified = self._verify_dirty_evidence()
+        (digest, read_bytes, rows, mode_proofs, frame_proofs) = verified
         binding = self._transaction_binding
         # A dynamic same-run lineage facade cannot publish additive H10
         # durability until H23 has committed that rollback-capable epoch.  It
@@ -4804,11 +5390,18 @@ class NexusRecordWriter:
         if batch:
             self._commit_receipts(batch)
         recover = getattr(self._facade, "commit_checkpoint_recoverable", None)
-        checkpoint_recovered = checkpoint is not None and callable(recover)
+        checkpoint_recovered = (
+            not self._fast_regenerable
+            and checkpoint is not None
+            and callable(recover)
+        )
         if checkpoint_recovered:
             frame_labels = tuple(sorted(
                 set(frame_proofs)
-                | {int(receipt.label) for receipt in (*batch, *dropped)}
+                | {
+                    int(receipt.label)
+                    for receipt in (*batch, *dropped)
+                }
             ))
             recover(
                 checkpoint, batch, dropped,
@@ -4830,8 +5423,10 @@ class NexusRecordWriter:
 
     def _close_handle(self) -> None:
         self._prepared_stack_authority = None
+        self._fast_entry_group = None
         allow_unverified = self._pending_owner == "abort"
         binding = self._transaction_binding
+        fast_evidence = None
         if self._h5 is not None and self._h5 is self._seeded_document:
             # The finite publisher owns this HDF5 context.  Quiesce and detach
             # the writer, but leave the actual close to that enclosing context
@@ -4877,7 +5472,7 @@ class NexusRecordWriter:
                     return
             if self._fast_regenerable and self._stream_close_attempt is not None:
                 try:
-                    self._verify_fast_close_structure()
+                    fast_evidence = self._verify_fast_integrated_results()
                 except BaseException:
                     binding.transaction.hold_stream_close(
                         binding.attempt, self._stream_close_attempt,
@@ -4912,6 +5507,12 @@ class NexusRecordWriter:
                     binding.attempt,
                     self._stream_close_attempt,
                     lease=binding.lease,
+                    evidence_digest=(
+                        None if fast_evidence is None else fast_evidence[0]
+                    ),
+                    evidence_bytes=(
+                        None if fast_evidence is None else fast_evidence[1]
+                    ),
                 )
             self._stream_close_attempt = None
 
@@ -5050,6 +5651,10 @@ class NexusRecordWriter:
         """Refuse a last-row removal before authorizing any mutation."""
         group_name = self._mode_cursor_name(mode.kind, mode.key)
         cursor = self._row_cursors.setdefault(group_name, {})
+        if self._fast_regenerable and int(label) in cursor:
+            raise WriterStateError(
+                "finite append-only output cannot drop an already-written row"
+            )
         group = local_hard_group_path(
             self._entry_group(), group_name, role=group_name,
         )
@@ -5450,7 +6055,11 @@ class NexusRecordWriter:
             raise WriterStateError("retry must use the frozen finalization values")
         def checkpoint(*, publish_receipts=True):
             counts = self._finalization.average_finite_counts
-            verified = None if counts is None else self._verify_average_dirty_evidence(counts)
+            verified = (
+                None
+                if counts is None or self._fast_regenerable
+                else self._verify_average_dirty_evidence(counts)
+            )
             self._seal_checkpoint_and_receipts(publish_receipts=publish_receipts, verified=verified)
         def require_terminal_admission() -> None:
             handle = self._h5
@@ -5523,8 +6132,34 @@ class NexusRecordWriter:
                             )
                         self._stream_terminal = terminal
 
-                    steps = (("metadata", lambda: self._write_finalization(self._finalization)), ("flush", self._flush_handle)) + ((("verify", self._verify_replacement_manifest),) if self._replacement_configuration is not None else ())
-                    steps += (("admission", require_terminal_admission), ("checkpoint", checkpoint), ("close", self._close_handle), ("terminal", seal_terminal))
+                    steps = (
+                        (
+                            "metadata",
+                            lambda: self._write_finalization(self._finalization),
+                        ),
+                        ("flush", self._flush_handle),
+                    ) + (
+                        (("verify", self._verify_replacement_manifest),)
+                        if self._replacement_configuration is not None else ()
+                    )
+                    steps += (
+                        ("admission", require_terminal_admission),
+                        ("checkpoint", checkpoint),
+                        ("close", self._close_handle),
+                        ("terminal", seal_terminal),
+                    )
+                    if self._fast_regenerable:
+                        # Fast result receipts remain pending until terminal
+                        # science and the exact stream terminal are both sealed.
+                        steps += (
+                            ("receipt", self._commit_receipts),
+                            (
+                                "publication-drop",
+                                lambda: self._commit_publication_drops(
+                                    self._current_publication_drops(),
+                                ),
+                            ),
+                        )
                 while self._finish_step < len(steps):
                     owner, action = steps[self._finish_step]
                     self._pending_owner = owner

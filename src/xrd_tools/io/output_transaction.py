@@ -1038,6 +1038,11 @@ class OutputTransaction:
         return self._admission
 
     @property
+    def fast_regenerable(self) -> bool:
+        """Whether this transaction admitted the finite regenerable route."""
+        return self._fast_regenerable
+
+    @property
     def stream_base_snapshot(self) -> TargetSnapshot:
         """Exact rollback base for the current owned stream epoch."""
         receipt = self._stream_epoch_receipt

@@ -31,6 +31,7 @@ from xrd_tools.session import (
     StageReceipt,
 )
 from xrd_tools.io.schema import (
+    MULTI_RESULT_MODES_ATTR,
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
     PRIMARY_MODE_ATTR,
@@ -170,6 +171,39 @@ def _bound_writer(tmp_path, *, prior=None, complete_record=False, facade_type=_F
     return writer, transaction, attempt, lease, owners, pool, facade, target
 
 
+def _begin_finite_overwrite_sink(
+    tmp_path,
+    filename,
+    scan_name,
+    *,
+    extra=None,
+    plan=None,
+    bind_session=False,
+):
+    """Build the common fresh finite-Overwrite product route used below."""
+    from xrd_tools.core.scan import Scan
+    from xrd_tools.reduction import NexusSink, ReductionPlan
+
+    target = tmp_path / filename
+    sink = NexusSink(
+        target,
+        overwrite=True,
+        flush_every=None,
+        run_configuration_provenance={
+            "output_mode": "Overwrite",
+            "live_mode": False,
+        },
+    )
+    facade = _Facade(target) if bind_session else None
+    if facade is not None:
+        sink.bind_session(facade)
+    sink.begin(
+        Scan(scan_name, [], extra={} if extra is None else extra),
+        ReductionPlan(integration_2d=None) if plan is None else plan,
+    )
+    return target, sink, facade
+
+
 def test_grouped_semantic_reads_preserve_order_axes_sigma_and_two_observations(
     tmp_path, monkeypatch,
 ):
@@ -216,7 +250,8 @@ def test_grouped_semantic_reads_preserve_order_axes_sigma_and_two_observations(
 
     def trace_close_reads(dataset, item):
         if (
-            "/integrated_" in dataset.name
+            writer._pending_owner == "close"
+            and "/integrated_" in dataset.name
             and dataset.name.rsplit("/", 1)[-1]
             in {"frame_index", "q", "intensity", "sigma", "chi"}
         ):
@@ -414,7 +449,11 @@ def test_grouped_close_rejects_rank_drift_in_frame_index(tmp_path, monkeypatch):
 
     def rank_drift(dataset, item):
         observed = real_getitem(dataset, item)
-        if dataset.name.endswith("/integrated_1d/frame_index") and isinstance(item, slice):
+        if (
+            writer._pending_owner == "close"
+            and dataset.name.endswith("/integrated_1d/frame_index")
+            and isinstance(item, slice)
+        ):
             return np.asarray(observed).reshape(-1, 1)
         return observed
 
@@ -2099,6 +2138,9 @@ def test_frozen_provenance_routes_only_exact_overwrite_to_fast_regenerable(
         overwrite=overwrite,
         run_configuration_provenance=provenance,
     )
+    assert sink._fast_regenerable is fast
+    if not overwrite:
+        return
     with pytest.raises(RuntimeError, match="transaction routing"):
         sink.begin(Scan("route", []), ReductionPlan(integration_2d=None))
 
@@ -2108,16 +2150,65 @@ def test_frozen_provenance_routes_only_exact_overwrite_to_fast_regenerable(
     assert sink._transaction.snapshot().phase is TransactionPhase.ABORTED
     _assert_lease_available(target)
 
+@pytest.mark.parametrize("fast", (1, np.bool_(True)))
+def test_fast_regenerable_capability_requires_an_exact_bool(tmp_path, fast):
+    from xrd_tools.io.record_writer import NexusRecordWriter
 
-def test_fast_regenerable_finish_keeps_checkpoint_fsync_and_structure_without_scans(
+    with pytest.raises(TypeError, match="exact bool"):
+        NexusRecordWriter(tmp_path / "unbound.nexus", fast_regenerable=fast)
+
+
+def test_fast_regenerable_capability_cannot_be_used_unbound(tmp_path):
+    from xrd_tools.io.record_writer import NexusRecordWriter
+
+    with pytest.raises(ValueError, match="transaction-bound Overwrite"):
+        NexusRecordWriter(
+            tmp_path / "unbound.nexus",
+            overwrite=True,
+            fast_regenerable=True,
+        )
+
+
+def test_fast_regenerable_writer_requires_matching_transaction_capability(
+    tmp_path,
+):
+    from xrd_tools.io.record_writer import (
+        NexusRecordWriter,
+        WriterTransactionBinding,
+    )
+
+    (
+        _coordinator,
+        transaction,
+        target,
+        _transaction_owner,
+        _target_owner,
+        owners,
+        lease,
+    ) = _transaction(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="transaction-bound Overwrite"):
+            NexusRecordWriter(
+                target,
+                overwrite=True,
+                atomic=False,
+                fast_regenerable=True,
+                transaction_binding=WriterTransactionBinding(
+                    transaction, object(), lease,
+                ),
+            )
+    finally:
+        transaction.abandon(lease)
+        _release(transaction, lease, owners)
+
+
+def test_fast_regenerable_finish_skips_checkpoint_payload_scans_but_verifies_science_at_close(
     tmp_path, monkeypatch,
 ):
-    from xrd_tools.core.scan import Scan, ScanFrame
+    from xrd_tools.core.scan import ScanFrame
     from xrd_tools.reduction import (
         FrameReduction,
-        NexusSink,
         NexusTerminalDisposition,
-        ReductionPlan,
         ReductionResult,
     )
 
@@ -2136,40 +2227,45 @@ def test_fast_regenerable_finish_keeps_checkpoint_fsync_and_structure_without_sc
 
     monkeypatch.setattr(transaction_module, "_sha256_handle", forbidden_hash)
     monkeypatch.setattr(transaction_module.os, "fsync", observe_fsync)
-    sink = NexusSink(
-        target,
-        overwrite=True,
-        flush_every=None,
-        run_configuration_provenance={
-            "output_mode": "Overwrite",
-            "live_mode": False,
-        },
+    target, sink, facade = _begin_finite_overwrite_sink(
+        tmp_path,
+        "fast-finish.nexus",
+        "fast",
+        bind_session=True,
     )
-    sink.begin(Scan("fast", []), ReductionPlan(integration_2d=None))
+    recoveries = []
+    facade.commit_checkpoint_recoverable = (
+        lambda *values: recoveries.append(values)
+    )
     writer = sink._writer
-    checkpoints = []
-    close_reads = []
-    real_verify = writer._verify_dirty_evidence
-    real_grouped = writer._read_grouped_mode
 
-    def observe_checkpoint():
-        checkpoints.append(True)
-        return real_verify()
-
-    def forbid_close_history(rows, phase, *args, **kwargs):
-        if phase == "close":
-            close_reads.append(tuple(row.label for row in rows))
-            raise AssertionError("fast close reread historical result rows")
-        return real_grouped(rows, phase, *args, **kwargs)
-
-    monkeypatch.setattr(writer, "_verify_dirty_evidence", observe_checkpoint)
-    monkeypatch.setattr(writer, "_read_grouped_mode", forbid_close_history)
+    monkeypatch.setattr(
+        writer,
+        "_verify_dirty_evidence",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("fast checkpoint reread persisted rows")
+        ),
+    )
     sink.write(ScanFrame(0), FrameReduction(0, result_1d=_r1(3)))
     terminal = sink.finish(ReductionResult("fast", {}, 1))
 
     assert terminal.disposition is NexusTerminalDisposition.COMMITTED
-    assert checkpoints == [True]
-    assert close_reads == []
+    assert len(facade.durable) == 1
+    assert writer.checkpoint_read_volume == (0, 0)
+    assert writer.grouped_semantic_read_volume["checkpoint"] == (0, 0)
+    assert writer.grouped_semantic_read_volume["close"] == (1, 1)
+    assert writer._durable_frame_proofs == {}
+    assert writer._dirty_frames == {}
+    assert writer._dirty_indexed == {}
+    assert writer._dirty_absent_modes == set()
+    assert recoveries == []
+    assert all(
+        proof.row_count == 1
+        and len(proof.sigma_presence) == 1
+        and not isinstance(proof.radial, np.ndarray)
+        and not isinstance(proof.azimuthal, np.ndarray)
+        for proof in writer._fast_mode_groups.values()
+    )
     assert fsync_calls
     assert not sink._transaction.backup.exists()
     with h5py.File(target, "r") as handle:
@@ -2179,43 +2275,424 @@ def test_fast_regenerable_finish_keeps_checkpoint_fsync_and_structure_without_sc
         np.testing.assert_array_equal(group["intensity"][0], _r1(3).intensity)
 
 
-def test_fast_regenerable_close_rejects_broken_stack_shape_after_checkpoint(
-    tmp_path, monkeypatch,
+@pytest.mark.parametrize(
+    "changed",
+    (
+        "frame-index",
+        "q",
+        "q-unit",
+        "intensity",
+        "sigma",
+        "chi",
+        "chi-unit",
+        "two-d-kind",
+        "axis-kind",
+        "mode-inventory",
+        "stack-shape-after-checkpoint",
+    ),
+)
+def test_fast_regenerable_close_rejects_changed_scientific_value(
+    tmp_path, monkeypatch, changed,
 ):
-    from xrd_tools.core.scan import Scan, ScanFrame
+    from xrd_tools.core.scan import ScanFrame
     from xrd_tools.io.record_writer import WriterIncomplete
     from xrd_tools.reduction import (
         FrameReduction,
-        NexusSink,
+        ReductionResult,
+    )
+
+    _target, sink, facade = _begin_finite_overwrite_sink(
+        tmp_path,
+        "fast-science.nexus",
+        "science",
+        bind_session=True,
+    )
+    sink.write(
+        ScanFrame(0),
+        FrameReduction(0, result_1d=_r1(5), result_2d=_r2(5)),
+    )
+    writer = sink._writer
+    one_d = writer._h5["entry/integrated_1d"]
+    two_d = writer._h5["entry/integrated_2d"]
+    if changed == "frame-index":
+        one_d["frame_index"][0] = np.int64(9)
+    elif changed == "q":
+        one_d["q"][0] += np.float32(1)
+    elif changed == "q-unit":
+        one_d["q"].attrs["units"] = "changed"
+    elif changed == "intensity":
+        one_d["intensity"][0, 0] += np.float32(1)
+    elif changed == "sigma":
+        two_d["sigma"][0, 0, 0] += np.float32(1)
+    elif changed == "chi":
+        two_d["chi"][0] += np.float32(1)
+    elif changed == "chi-unit":
+        two_d["chi"].attrs["units"] = "changed"
+    elif changed == "two-d-kind":
+        two_d.attrs["two_d_kind"] = "changed"
+    elif changed == "axis-kind":
+        one_d.attrs["axis_kind"] = "azimuthal"
+    elif changed == "stack-shape-after-checkpoint":
+        real_close = writer._close_handle
+
+        def break_shape_after_checkpoint():
+            intensity = writer._h5["entry/integrated_1d/intensity"]
+            intensity.resize((0, intensity.shape[1]))
+            writer._h5.flush()
+            return real_close()
+
+        monkeypatch.setattr(writer, "_close_handle", break_shape_after_checkpoint)
+    else:
+        one_d.attrs[PRIMARY_MODE_ATTR] = "chi_q"
+    with pytest.raises(
+        WriterIncomplete,
+        match="fast close|processed input|row|shape|durability",
+    ):
+        sink.finish(ReductionResult("science", {}, 1))
+    phase = sink._transaction.snapshot().phase
+    assert phase is (
+        TransactionPhase.EXECUTING
+        if changed == "mode-inventory"
+        else TransactionPhase.INTEGRITY_HOLD
+    )
+    assert facade.durable == []
+
+
+def test_fast_terminal_science_accepts_allclose_axes_and_mixed_sigma(tmp_path):
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.reduction import (
+        FrameReduction,
+        NexusTerminalDisposition,
+        ReductionResult,
+    )
+
+    target, sink, _facade = _begin_finite_overwrite_sink(
+        tmp_path,
+        "fast-both.nexus",
+        "both",
+    )
+    for label in range(3):
+        base_1d = _r1(label + 1)
+        base_2d = _r2(label + 1)
+        delta = np.float64(label) * 1e-7
+        result_1d = IntegrationResult1D(
+            radial=base_1d.radial + delta,
+            intensity=base_1d.intensity,
+            sigma=base_1d.sigma if label == 1 else None,
+            unit=base_1d.unit,
+        )
+        result_2d = IntegrationResult2D(
+            radial=base_2d.radial + delta,
+            azimuthal=base_2d.azimuthal + delta,
+            intensity=base_2d.intensity,
+            sigma=base_2d.sigma if label == 1 else None,
+            unit=base_2d.unit,
+            azimuthal_unit=base_2d.azimuthal_unit,
+        )
+        sink.write(
+            ScanFrame(label),
+            FrameReduction(
+                label,
+                result_1d=result_1d,
+                result_2d=result_2d,
+            ),
+        )
+
+    terminal = sink.finish(ReductionResult("both", {}, 3))
+    writer = sink._writer
+    assert terminal.disposition is NexusTerminalDisposition.COMMITTED
+    assert writer.grouped_semantic_read_volume["close"] == (2, 6)
+    with h5py.File(target, "r") as handle:
+        one_d = handle["entry/integrated_1d"]
+        two_d = handle["entry/integrated_2d"]
+        np.testing.assert_array_equal(
+            one_d["q"][()], np.asarray(_r1(1).radial, np.float32),
+        )
+        np.testing.assert_array_equal(
+            two_d["q"][()], np.asarray(_r2(1).radial, np.float32),
+        )
+        assert np.isnan(one_d["sigma"][[0, 2]]).all()
+        assert np.isnan(two_d["sigma"][[0, 2]]).all()
+
+
+def test_fast_later_batch_rejects_divergent_axis_before_mutation(tmp_path):
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.reduction import FrameReduction, ReductionResult
+
+    _target, sink, _facade = _begin_finite_overwrite_sink(
+        tmp_path,
+        "fast-axis-authority.nexus",
+        "axis-authority",
+    )
+    first = _r1(1)
+    sink.write(ScanFrame(0), FrameReduction(0, result_1d=first))
+    changed = IntegrationResult1D(
+        radial=first.radial + 1.0,
+        intensity=first.intensity,
+        sigma=first.sigma,
+        unit=first.unit,
+    )
+
+    with pytest.raises(ValueError, match="axis/unit or row shape"):
+        sink.write(ScanFrame(1), FrameReduction(1, result_1d=changed))
+
+    writer = sink._writer
+    assert writer._row_cursors["integrated_1d"] == {0: 0}
+    assert writer._h5["entry/integrated_1d/intensity"].shape == (1, 8)
+    with pytest.warns(RuntimeWarning, match="preserved non-final data"):
+        sink.abort(ReductionResult("axis-authority", {}, 1, failed=True))
+
+
+def test_fast_regenerable_rejects_accidental_repeat_before_mutation(tmp_path):
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.io.record_writer import WriterStateError
+    from xrd_tools.reduction import FrameReduction
+
+    _target, sink, _facade = _begin_finite_overwrite_sink(
+        tmp_path,
+        "fast-repeat.nexus",
+        "repeat",
+    )
+    frame = ScanFrame(0, metadata={"timestamp": "first"})
+    sink.write(frame, FrameReduction(0, result_1d=_r1(1)))
+    writer = sink._writer
+    before = np.asarray(
+        writer._h5["entry/integrated_1d/intensity"][0]
+    ).copy()
+
+    with pytest.raises(WriterStateError, match="already owns frame label 0"):
+        sink.write(
+            ScanFrame(0, metadata={"timestamp": "second"}),
+            FrameReduction(0, result_1d=_r1(2)),
+        )
+
+    np.testing.assert_array_equal(
+        writer._h5["entry/integrated_1d/intensity"][0], before,
+    )
+    assert writer._h5["entry/frames/frame_0000/timestamp"].asstr()[()] == "first"
+    with pytest.warns(RuntimeWarning, match="preserved non-final data"):
+        sink.abort(None)
+
+
+@pytest.mark.parametrize("corrupt", (False, True))
+def test_fast_average_counts_are_authenticated_once_at_terminal_close(
+    tmp_path, monkeypatch, corrupt,
+):
+    from tests.core.test_h23_record_writer import _average_counts
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.io.record_writer import WriterIncomplete
+    from xrd_tools.reduction import (
+        FrameReduction,
+        NexusTerminalDisposition,
+        ReductionResult,
+    )
+
+    counts = _average_counts(np.array([[3, 2, 0], [1, 3, 2]]), 3)
+    _target, sink, facade = _begin_finite_overwrite_sink(
+        tmp_path,
+        f"fast-average-{corrupt}.nexus",
+        "avg",
+        extra={"average_finite_counts": counts},
+        bind_session=True,
+    )
+    sink.write(ScanFrame(1), FrameReduction(1, result_1d=_r1(2)))
+    writer = sink._writer
+    if corrupt:
+        real_flush = writer._flush_handle
+
+        def corrupt_after_flush():
+            real_flush()
+            writer._h5[
+                "entry/frames/frame_0001/finite_counts"
+            ][0, 0] = np.uint32(1)
+
+        monkeypatch.setattr(writer, "_flush_handle", corrupt_after_flush)
+        with pytest.raises(WriterIncomplete, match="Average count"):
+            sink.finish(ReductionResult("avg", {}, 1))
+        assert sink._transaction.snapshot().phase is TransactionPhase.INTEGRITY_HOLD
+        assert facade.durable == []
+        return
+
+    terminal = sink.finish(ReductionResult("avg", {}, 1))
+    assert terminal.disposition is NexusTerminalDisposition.COMMITTED
+    assert writer.checkpoint_read_volume == (0, 0)
+    assert writer.grouped_semantic_read_volume["checkpoint"] == (0, 0)
+
+
+def test_fast_terminal_science_reads_result_rows_in_bounded_exact_slabs(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.reduction import (
+        FrameReduction,
+        ReductionResult,
+    )
+
+    _target, sink, _facade = _begin_finite_overwrite_sink(
+        tmp_path,
+        "fast-close-slabs.nexus",
+        "slice",
+    )
+    for label in range(10):
+        sink.write(
+            ScanFrame(label),
+            FrameReduction(
+                label,
+                result_1d=_r1(label + 1),
+                result_2d=_r2(label + 1),
+            ),
+        )
+    writer = sink._writer
+    reads = {}
+    real_getitem = h5py.Dataset.__getitem__
+
+    def trace(dataset, item):
+        if (
+            writer._pending_owner == "close"
+            and "/integrated_" in dataset.name
+            and dataset.name.rsplit("/", 1)[-1]
+            in {"frame_index", "intensity", "sigma", "q", "chi"}
+        ):
+            reads.setdefault(dataset.name, []).append(item)
+        return real_getitem(dataset, item)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", trace)
+    sink.finish(ReductionResult("slice", {}, 10))
+
+    slabs = [slice(0, 8), slice(8, 10)]
+    for name in ("integrated_1d", "integrated_2d"):
+        root = f"/entry/{name}"
+        assert reads[root + "/q"] == [()]
+        for leaf in ("frame_index", "intensity", "sigma"):
+            assert reads[root + "/" + leaf] == slabs
+    assert reads["/entry/integrated_2d/chi"] == [()]
+    assert writer.grouped_semantic_read_volume["close"] == (4, 20)
+
+
+@pytest.mark.parametrize("changed", ("unexpected-sigma", "unexpected-dimension"))
+def test_fast_terminal_science_rejects_unrequested_result_storage(
+    tmp_path, changed,
+):
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.io.record_writer import WriterIncomplete
+    from xrd_tools.reduction import (
+        FrameReduction,
+        ReductionResult,
+    )
+
+    _target, sink, _facade = _begin_finite_overwrite_sink(
+        tmp_path,
+        "fast-unexpected-sigma.nexus",
+        "unexpected-sigma",
+    )
+    result = _r1(2)
+    result = IntegrationResult1D(
+        radial=result.radial,
+        intensity=result.intensity,
+        sigma=None,
+        unit=result.unit,
+    )
+    sink.write(ScanFrame(0), FrameReduction(0, result_1d=result))
+    one_d = sink._writer._h5["entry/integrated_1d"]
+    if changed == "unexpected-sigma":
+        one_d.create_dataset(
+            "sigma",
+            data=np.full((1, result.radial.size), np.nan, dtype=np.float32),
+            maxshape=(None, result.radial.size),
+        )
+    else:
+        from xrd_tools.io.nexus import write_integrated_stack
+
+        write_integrated_stack(
+            sink._writer._h5["entry"],
+            frame_indices=[0],
+            results_2d=[_r2(2)],
+        )
+    with pytest.raises(WriterIncomplete, match="fast close"):
+        sink.finish(ReductionResult("unrequested", {}, 1))
+    assert sink._transaction.snapshot().phase is TransactionPhase.INTEGRITY_HOLD
+
+
+@pytest.mark.parametrize("remove_extra_mode", (False, True))
+def test_fast_terminal_science_authenticates_named_mode_inventory(
+    tmp_path, remove_extra_mode,
+):
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.io.record_writer import WriterIncomplete
+    from xrd_tools.reduction import (
+        FrameReduction,
+        GIMode,
+        NexusTerminalDisposition,
         ReductionPlan,
         ReductionResult,
     )
 
-    target = tmp_path / "fast-shape.nexus"
-    sink = NexusSink(
-        target,
-        overwrite=True,
-        flush_every=None,
-        run_configuration_provenance={
-            "output_mode": "Overwrite",
-            "live_mode": False,
-        },
+    target, sink, _facade = _begin_finite_overwrite_sink(
+        tmp_path,
+        "fast-named-modes.nexus",
+        "named",
+        plan=ReductionPlan(
+            gi=GIMode(mode_1d="q_total", mode_2d="qip_qoop")
+        ),
     )
-    sink.begin(Scan("shape", []), ReductionPlan(integration_2d=None))
-    sink.write(ScanFrame(0), FrameReduction(0, result_1d=_r1(5)))
-    writer = sink._writer
-    real_close = writer._close_handle
+    frame = ScanFrame(0)
+    primary_2d = _r2(1)
+    sink.write(
+        frame,
+        FrameReduction(
+            0,
+            result_1d=_r1(1),
+            result_2d=IntegrationResult2D(
+                radial=primary_2d.radial,
+                azimuthal=primary_2d.azimuthal,
+                intensity=primary_2d.intensity,
+                sigma=primary_2d.sigma,
+                unit="qip_A^-1",
+                azimuthal_unit="qoop_A^-1",
+            ),
+            mode_1d="q_total",
+            mode_2d="qip_qoop",
+        ),
+    )
+    q_ip = _r1(2)
+    sink.write(
+        frame,
+        FrameReduction(
+            0,
+            result_1d=IntegrationResult1D(
+                radial=q_ip.radial,
+                intensity=q_ip.intensity,
+                sigma=q_ip.sigma,
+                unit="qip_A^-1",
+            ),
+            result_2d=_r2(2),
+            mode_1d="q_ip",
+            mode_2d="q_chi",
+        ),
+    )
+    if remove_extra_mode:
+        one_d = sink._writer._h5["entry/integrated_1d"]
+        del one_d["q_ip"]
+        one_d.attrs[MULTI_RESULT_MODES_ATTR] = ["q_total"]
+        if "q_ip" in sink._writer._row_cursors:
+            raise AssertionError("mode cursor must use its full group path")
+        with pytest.raises(WriterIncomplete, match="fast close"):
+            sink.finish(ReductionResult("named", {}, 1))
+        assert sink._transaction.snapshot().phase is TransactionPhase.INTEGRITY_HOLD
+        return
 
-    def break_shape_after_checkpoint():
-        intensity = writer._h5["entry/integrated_1d/intensity"]
-        intensity.resize((0, intensity.shape[1]))
-        writer._h5.flush()
-        return real_close()
-
-    monkeypatch.setattr(writer, "_close_handle", break_shape_after_checkpoint)
-    with pytest.raises(WriterIncomplete, match="row|shape|durability"):
-        sink.finish(ReductionResult("shape", {}, 1))
-    assert sink._transaction.snapshot().phase is TransactionPhase.INTEGRITY_HOLD
+    terminal = sink.finish(ReductionResult("named", {}, 1))
+    assert terminal.disposition is NexusTerminalDisposition.COMMITTED
+    assert sink._writer.grouped_semantic_read_volume["close"] == (4, 4)
+    with h5py.File(target, "r") as handle:
+        np.testing.assert_array_equal(
+            handle["entry/integrated_1d"].attrs[MULTI_RESULT_MODES_ATTR],
+            ["q_total", "q_ip"],
+        )
+        np.testing.assert_array_equal(
+            handle["entry/integrated_2d"].attrs[MULTI_RESULT_MODES_ATTR],
+            ["qip_qoop", "q_chi"],
+        )
 
 
 def test_same_stat_mutation_during_pool_pause_refuses_before_target_move(

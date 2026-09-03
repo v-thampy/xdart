@@ -2865,6 +2865,7 @@ def write_integrated_stack(
     known_rows_2d: dict[int, int] | None = None,
     known_rows_extra_1d: Mapping[str, dict[int, int]] | None = None,
     known_rows_extra_2d: Mapping[str, dict[int, int]] | None = None,
+    bulk_new_rows: bool = False,
 ) -> None:
     """Write/extend the stacked ``integrated_1d`` / ``integrated_2d`` NXdata
     groups from aligned lists of IntegrationResult + their frame labels.
@@ -2890,16 +2891,21 @@ def write_integrated_stack(
     implementation owns the on-disk layout ``read_scan`` consumes.
 
     First save (group absent) creates the whole stack in one write — O(N),
-    with multi-frame chunks.  Subsequent calls fall back to the per-frame
+    with multi-frame chunks.  Subsequent general calls use the per-frame
     upsert appenders (:func:`_append_stacked_1d` / ``_2d``), so re-saving a
-    frame label replaces its row rather than duplicating it.  ``int64``
-    frame_index; ``compression`` applies to the intensity/sigma stacks.
+    frame label replaces its row rather than duplicating it.  A transaction-
+    qualified finite writer may request ``bulk_new_rows`` to resize once for
+    a validated all-new batch; this changes batching only and never bypasses
+    the ordinary scientific validation above.
+    ``int64`` frame_index; ``compression`` applies to intensity/sigma stacks.
 
     Reintegration shape change (C3): if the incoming row size differs from
     what's on disk (a different ``npt`` / ``npt_rad`` / ``npt_azim``), the
     existing group is dropped and rewritten from this batch so the q/chi
     axes refresh — pass *all* frames in that case, not a subset.
     """
+    if type(bulk_new_rows) is not bool:
+        raise TypeError("bulk_new_rows must be an exact bool")
     frozen = _freeze_integrated_stack_write(
         entry_grp,
         frame_indices=frame_indices,
@@ -3056,6 +3062,74 @@ def write_integrated_stack(
             _schema_dataset(g, "integrated_2d", "sigma", sig,
                             ck=ck, row_chunk=(rows_2d, n_chi, n_q))
 
+    def _bulk_append_owned_rows(
+        group,
+        results,
+        labels,
+        known_rows,
+        *,
+        dimension,
+    ):
+        """Append one already-admitted batch with one resize per stack.
+
+        The validated cursor is complete for the lifetime of one writer.  A
+        scalar tail check binds it back to the open HDF5 datasets;
+        the configured writer batch bounds the temporary stacked copy and lets
+        HDF5 compress/write the batch in one call.  Mixed or upsert batches and
+        a late introduction of sigma retain the general per-row path below.
+        """
+        if not bulk_new_rows or known_rows is None or not labels:
+            return False
+        frame_index = group["frame_index"]
+        intensity = group["intensity"]
+        start = int(frame_index.shape[0])
+        if (
+            int(intensity.shape[0]) != start
+            or len(known_rows) != start
+            or set(known_rows.values()) != set(range(start))
+            or any(label in known_rows for label in labels)
+        ):
+            return False
+        if start:
+            last_label = max(known_rows)
+            if (
+                known_rows.get(last_label) != start - 1
+                or int(frame_index[start - 1]) != last_label
+                or labels[0] <= last_label
+            ):
+                return False
+        sigma = group.get("sigma")
+        if sigma is None and any(result.sigma is not None for result in results):
+            return False
+        stop = start + len(labels)
+        intensity.resize((stop,) + tuple(intensity.shape[1:]))
+        frame_index.resize((stop,))
+        frame_index[start:stop] = np.asarray(labels, np.int64)
+        if sigma is not None:
+            sigma.resize((stop,) + tuple(sigma.shape[1:]))
+
+        def stored(value):
+            array = np.asarray(value, np.float32)
+            return array.T if dimension == "2d" else array
+
+        intensity[start:stop] = np.stack([
+            stored(result.intensity) for result in results
+        ])
+        if sigma is not None:
+            sigma[start:stop] = np.stack([
+                (
+                    np.full(intensity.shape[1:], np.nan, np.float32)
+                    if result.sigma is None
+                    else stored(result.sigma)
+                )
+                for result in results
+            ])
+        group.attrs[MONOTONIC_ATTR] = True
+        known_rows.update({
+            int(label): start + offset for offset, label in enumerate(labels)
+        })
+        return True
+
     if results_1d is not None and len(results_1d):
         if len(results_1d) != len(fis):
             raise ValueError("results_1d length must match frame_indices")
@@ -3067,6 +3141,8 @@ def write_integrated_stack(
         g = local_hard_group_path(
             entry_grp, group_name_1d, role=group_name_1d,
         )
+        if g is not None and not isinstance(g, h5py.Group):
+            raise ValueError(f"{group_name_1d} is not an HDF5 group")
         # Rebuild trigger: reintegration that changes the npt (row size) OR
         # the radial axis / unit (e.g. q_A^-1 → 2th_deg, or a different
         # radial range at the same bin count).  The per-frame upsert path
@@ -3085,7 +3161,9 @@ def write_integrated_stack(
             if known_rows_1d is not None:
                 known_rows_1d.clear()
                 known_rows_1d.update({label: row for row, label in enumerate(fis)})
-        else:
+        elif not _bulk_append_owned_rows(
+            g, results_1d, fis, known_rows_1d, dimension="1d",
+        ):
             for fi, r in zip(fis, results_1d):
                 prior_n = int(g["frame_index"].shape[0])
                 _append_stacked_1d(
@@ -3103,6 +3181,8 @@ def write_integrated_stack(
         g = local_hard_group_path(
             entry_grp, group_name_2d, role=group_name_2d,
         )
+        if g is not None and not isinstance(g, h5py.Group):
+            raise ValueError(f"{group_name_2d} is not an HDF5 group")
         new_2d_shape = np.asarray(results_2d[0].intensity).T.shape  # (n_chi, n_q)
         # Rebuild on a row-shape change OR a q/chi axis / unit change (see
         # the 1D block) — the upsert path can't refresh the stored axes.
@@ -3118,7 +3198,9 @@ def write_integrated_stack(
             if known_rows_2d is not None:
                 known_rows_2d.clear()
                 known_rows_2d.update({label: row for row, label in enumerate(fis)})
-        else:
+        elif not _bulk_append_owned_rows(
+            g, results_2d, fis, known_rows_2d, dimension="2d",
+        ):
             for fi, r in zip(fis, results_2d):
                 prior_n = int(g["frame_index"].shape[0])
                 _append_stacked_2d(
@@ -3164,7 +3246,9 @@ def write_integrated_stack(
             if known_rows is not None:
                 known_rows.clear()
                 known_rows.update({label: row for row, label in enumerate(fis_)})
-        else:
+        elif not _bulk_append_owned_rows(
+            g, results, fis_, known_rows, dimension="1d",
+        ):
             for fi, r in zip(fis_, results):
                 prior_n = int(g["frame_index"].shape[0])
                 _append_stacked_1d(
@@ -3200,7 +3284,9 @@ def write_integrated_stack(
             if known_rows is not None:
                 known_rows.clear()
                 known_rows.update({label: row for row, label in enumerate(fis_)})
-        else:
+        elif not _bulk_append_owned_rows(
+            g, results, fis_, known_rows, dimension="2d",
+        ):
             for fi, r in zip(fis_, results):
                 prior_n = int(g["frame_index"].shape[0])
                 _append_stacked_2d(
