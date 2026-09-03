@@ -179,6 +179,7 @@ def _begin_finite_overwrite_sink(
     extra=None,
     plan=None,
     bind_session=False,
+    same_run_intent=None,
 ):
     """Build the common fresh finite-Overwrite product route used below."""
     from xrd_tools.core.scan import Scan
@@ -193,6 +194,8 @@ def _begin_finite_overwrite_sink(
             "output_mode": "Overwrite",
             "live_mode": False,
         },
+        **({} if same_run_intent is None
+           else {"same_run_intent": same_run_intent}),
     )
     facade = _Facade(target) if bind_session else None
     if facade is not None:
@@ -2273,6 +2276,50 @@ def test_fast_regenerable_finish_skips_checkpoint_payload_scans_but_verifies_sci
         assert group["frame_index"].shape == (1,)
         assert group["intensity"].shape == (1, 8)
         np.testing.assert_array_equal(group["intensity"][0], _r1(3).intensity)
+
+
+def test_fast_regenerable_finite_overwrite_carries_product_same_run_lineage(
+    tmp_path,
+):
+    """The GUI's ordinary Run always binds a same-run intent.
+
+    Regression: the fresh finite Overwrite fast path is exactly the route the
+    non-Live, non-Append GUI Run takes, and that route always constructs the
+    sink with ``same_run_intent``.  A guard that rejects any non-None append
+    decision therefore fails every ordinary Run before its first frame.
+    """
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.reduction import (
+        FrameReduction,
+        NexusTerminalDisposition,
+        ReductionResult,
+    )
+
+    intent = _intent(tmp_path, extent=1, labels=(0,))
+    target, sink, _facade = _begin_finite_overwrite_sink(
+        tmp_path,
+        "fast-same-run.nexus",
+        "fast-same-run",
+        same_run_intent=intent,
+    )
+    writer = sink._writer
+
+    assert writer._fast_regenerable is True
+    assert writer._append_decision is not None
+    assert sink._transaction.fast_regenerable is True
+
+    sink.write(ScanFrame(0), FrameReduction(0, result_1d=_r1(5)))
+    terminal = sink.finish(ReductionResult("fast-same-run", {}, 1))
+
+    assert terminal.disposition is NexusTerminalDisposition.COMMITTED
+    with h5py.File(target, "r") as handle:
+        group = handle["entry/integrated_1d"]
+        assert group["frame_index"].shape == (1,)
+        np.testing.assert_array_equal(group["intensity"][0], _r1(5).intensity)
+        lineage = json.loads(
+            handle["entry/reduction/config/append_lineage"][()]
+        )
+    assert lineage["epochs"][-1]["labels"] == [0]
 
 
 @pytest.mark.parametrize(

@@ -2049,12 +2049,19 @@ class NexusRecordWriter:
         self._defer_epoch_durability = defer_epoch_durability
         self._append_decision = append_decision
         replacement_values = (replacement_dimension, replacement_labels, replacement_audit, replacement_selected_plan)
+        # The ordinary non-Live, non-Append Run binds a same-run intent, so a
+        # fresh finite Overwrite legitimately carries an append decision that
+        # records its first lineage epoch.  A successor epoch that extends an
+        # already committed artifact is excluded by overwrite plus the
+        # transaction's own fast_regenerable admission: NexusSink refuses an
+        # Append preflight under Overwrite and hard-codes fast_regenerable=False
+        # on the successor-epoch writer.  Rejecting every non-None decision here
+        # instead disabled the exact route this fast path exists for.
         if fast_regenerable and (
             transaction_binding is None
             or type(transaction_binding) is not WriterTransactionBinding
             or transaction_binding.transaction.fast_regenerable is not True
             or not self.overwrite
-            or append_decision is not None
             or defer_epoch_durability
             or seeded_document is not None
             or any(value is not None for value in replacement_values)
