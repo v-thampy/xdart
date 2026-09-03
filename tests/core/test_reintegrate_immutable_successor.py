@@ -777,6 +777,33 @@ def test_prepared_successor_uses_detached_facts_and_one_click_manifest(
     monkeypatch.setattr(
         NexusRecordWriter, "_replacement_manifest_digest", counted,
     )
+    selected_digest = writer_module._finite_selected_result_digest
+    selected_digest_calls = []
+
+    def counted_selected_digest(*args, **kwargs):
+        selected_digest_calls.append(args[2])
+        return selected_digest(*args, **kwargs)
+
+    monkeypatch.setattr(
+        writer_module, "_finite_selected_result_digest", counted_selected_digest,
+    )
+    dirty_evidence = NexusRecordWriter._verify_dirty_evidence
+    dirty_evidence_calls = []
+
+    def counted_dirty_evidence(writer, *args, **kwargs):
+        dirty_evidence_calls.append((writer._pending_owner, writer._finish_step))
+        return dirty_evidence(writer, *args, **kwargs)
+
+    monkeypatch.setattr(
+        NexusRecordWriter, "_verify_dirty_evidence", counted_dirty_evidence,
+    )
+    monkeypatch.setattr(
+        module,
+        "_inspect_committed",
+        lambda *_args, **_kwargs: pytest.fail(
+            "fresh prepared commit reopened the public HDF5 artifact"
+        ),
+    )
     outer = Mock(wraps=writer_module.validate_integrated_stack_write)
     inner = Mock(wraps=nexus_module.validate_integrated_stack_write)
     write_stack = Mock(wraps=writer_module.write_integrated_stack)
@@ -795,11 +822,51 @@ def test_prepared_successor_uses_detached_facts_and_one_click_manifest(
 
     assert result.disposition == "COMMITTED"
     assert result.committed_labels == seeded.labels
-    assert len(calls) == 1
+    assert calls == []
+    assert len(selected_digest_calls) == 2
+    assert dirty_evidence_calls.count(("checkpoint", 4)) == 1
     assert (outer.call_count, inner.call_count, write_stack.call_count) == (1, 1, 1)
     assert closed == [None]
     assert seeded.target.read_bytes() == before
     assert recipe["plan"]["route"] == "prepared"
+
+
+def test_prepared_candidate_validation_rejects_post_checkpoint_result_damage(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.io.finite_artifact import FiniteArtifactIntegrityError
+    from xrd_tools.io.record_writer import NexusRecordWriter
+    from xrd_tools.reduction import run_reintegrate_successor
+
+    seeded = _seed_existing(
+        tmp_path, labels=(2, 5), name="prepared-result-damage",
+    )
+    _offer, plan = _prepared_plan(seeded)
+    before = seeded.target.read_bytes()
+    close_handle = NexusRecordWriter._close_handle
+    damaged = False
+
+    def damage_after_checkpoint(writer):
+        nonlocal damaged
+        if not damaged and writer._prepared_manifest_admission is not None:
+            selected = writer._h5["entry/integrated_1d/intensity"]
+            selected[0, 0] = float(selected[0, 0]) + 1.0
+            writer._h5.flush()
+            damaged = True
+        close_handle(writer)
+
+    monkeypatch.setattr(NexusRecordWriter, "_close_handle", damage_after_checkpoint)
+    _stub_integrators(monkeypatch)
+    with pytest.raises(
+        FiniteArtifactIntegrityError,
+        match="selected result seal changed",
+    ):
+        run_reintegrate_successor(plan)
+
+    assert damaged
+    assert seeded.target.read_bytes() == before
+    assert not Path(plan.output_artifact).exists()
+    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
 
 
 def test_prepared_stack_authority_refuses_a_relinked_dataset(
@@ -2225,18 +2292,24 @@ def test_cross_route_science_and_preservation_are_exactly_equal(
     assert observations[0] == observations[1]
 
 
+@pytest.mark.parametrize("prepared", (False, True), ids=("legacy", "prepared"))
 def test_candidate_readonly_validation_recomputes_preservation(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, prepared,
 ):
     import xrd_tools.io.record_writer as writer_module
     from xrd_tools.io.finite_artifact import FiniteArtifactIntegrityError
     from xrd_tools.reduction import run_reintegrate_successor
 
     seeded = _seed_existing(
-        tmp_path, labels=(2, 5), name="candidate-preservation",
+        tmp_path,
+        labels=(2, 5),
+        name=f"candidate-preservation-{'prepared' if prepared else 'legacy'}",
     )
+    if prepared:
+        _offer, plan = _prepared_plan(seeded)
+    else:
+        plan = _plan(seeded)
     before = seeded.target.read_bytes()
-    plan = _plan(seeded)
     _stub_integrators(monkeypatch)
     original = writer_module._replacement_manifest_digest_for
     candidate_reads = 0
@@ -2267,7 +2340,7 @@ def test_candidate_readonly_validation_recomputes_preservation(
         run_reintegrate_successor(plan)
     assert candidate_reads == 1
     assert seeded.target.read_bytes() == before
-    assert not (seeded.target.parent / "immutable-successor.nexus").exists()
+    assert not Path(plan.output_artifact).exists()
     assert not tuple(seeded.target.parent.glob(".xdart-finite-*.candidate"))
 
 

@@ -2201,6 +2201,8 @@ class _SuccessorRuntime:
         self.expected_preservation = None
         self.candidate_result_digest = None
         self.candidate_labels = None
+        self.candidate_audit_identity = None
+        self.candidate_validation = None
         self.observed_committed_labels = None
         self.observed_audit_identity = None
         self.observed_result_digest = None
@@ -2664,7 +2666,9 @@ class _SuccessorRuntime:
             )
         self.committed_labels = labels
         self.candidate_labels = labels
+        self.candidate_audit_identity = audit_identity
         self.candidate_result_digest = result_digest
+        self.candidate_validation = validation
         self._report("validate", 1, 1)
         self.candidate_preservation_validated = True
         return validation
@@ -2687,6 +2691,23 @@ class _SuccessorRuntime:
             self.observed_audit_identity,
             self.observed_result_digest,
         ) = observed
+
+    def _accept_validated_commit(self, validation) -> None:
+        if (
+            validation is not self.candidate_validation
+            or self.candidate_labels is None
+            or self.candidate_audit_identity is None
+            or self.candidate_result_digest is None
+            or not self.candidate_preservation_validated
+        ):
+            raise FiniteArtifactIntegrityError(
+                "prepared successor lost its validated commit receipt"
+            )
+        self._capture_committed_observation(
+            self.candidate_labels,
+            self.candidate_audit_identity,
+            self.candidate_result_digest,
+        )
 
     def close(self):
         source = self.source
@@ -2803,6 +2824,11 @@ class _SuccessorRuntime:
                 seed=admission,
                 prepublish=lambda: _require_terminal_source_topology(
                     self.preflight_inspection,
+                ),
+                accept_validated_commit=(
+                    self._accept_validated_commit
+                    if self.plan._prepared is not None
+                    else None
                 ),
             )
         except FiniteArtifactPublicationHeld as error:

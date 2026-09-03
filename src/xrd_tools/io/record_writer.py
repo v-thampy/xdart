@@ -4069,12 +4069,13 @@ class NexusRecordWriter:
             name,
             data=json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
-        require_finite_replacement_result_seal(
-            self._h5,
-            entry=self.entry,
-            dimension=dimension,
-            audit_identity=audit_identity,
-        )
+        if self._prepared_manifest_admission is None:
+            require_finite_replacement_result_seal(
+                self._h5,
+                entry=self.entry,
+                dimension=dimension,
+                audit_identity=audit_identity,
+            )
     def _verify_replacement_manifest(self) -> None:
         entry, selected_expected = self._entry_group(), self._replacement_expected; excluded, manifest_expected, _gi_name, gi_original, _gi_preserved = self._replacement_manifest
         if self._finite_request is not None:
@@ -5470,11 +5471,16 @@ class NexusRecordWriter:
                         ("flush", self._flush_handle),
                     )
                     if self._seeded_document is not None:
+                        verification = (
+                            ()
+                            if self._prepared_manifest_admission is not None
+                            else (("verify", self._verify_replacement_manifest),)
+                        )
                         steps = (
                             common[0],
                             ("result-seal", self._seal_finite_replacement_result),
                             common[1],
-                            ("verify", self._verify_replacement_manifest),
+                        ) + verification + (
                             ("admission", require_terminal_admission),
                             ("checkpoint", lambda: checkpoint(publish_receipts=False)),
                             ("close", self._close_handle),

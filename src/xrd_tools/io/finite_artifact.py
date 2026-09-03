@@ -380,6 +380,26 @@ class FiniteCandidateValidation:
 
 
 @dataclass(frozen=True, slots=True)
+class _ValidatedCandidateReceipt:
+    """Attempt-local proof joining exact bytes to semantic validation."""
+
+    snapshot: FiniteFileSnapshot
+    validation: FiniteCandidateValidation
+    operation_identity: str
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if (
+            _claim is not _FACTORY
+            or type(self.snapshot) is not FiniteFileSnapshot
+            or type(self.validation) is not FiniteCandidateValidation
+            or type(self.operation_identity) is not str
+            or not _LOWER_HEX_64.fullmatch(self.operation_identity)
+        ):
+            raise TypeError("validated candidate receipt is not factory-owned")
+
+
+@dataclass(frozen=True, slots=True)
 class FiniteCommittedInspection:
     terminal: StreamTerminal
     lineage: FiniteArtifactLineage
@@ -2371,6 +2391,89 @@ class FiniteArtifactPublisher:
                 "finite public occupant is not the exact requested version"
             ) from error
 
+    def _accept_validated_own_link(
+        self,
+        path: Path,
+        receipt: _ValidatedCandidateReceipt,
+        accept_validated_commit: Callable[[FiniteCandidateValidation], object],
+        *,
+        parent_descriptor: int,
+        parent_state: tuple[int, int, int, int, int, int],
+    ) -> StreamTerminal:
+        """Seal one newly linked validated inode with one public-name hash."""
+
+        try:
+            if (
+                type(receipt) is not _ValidatedCandidateReceipt
+                or receipt.operation_identity != self.request.operation_identity
+                or receipt.validation.lineage != self.request.lineage
+            ):
+                raise FiniteArtifactIntegrityError(
+                    "finite validated candidate receipt changed"
+                )
+            self._require_parent(parent_descriptor, parent_state)
+            public = _snapshot_at(parent_descriptor, path.name, path)
+            candidate = receipt.snapshot
+            # Linking and removing the private alias changes ctime.  Every
+            # content-bearing fact, including mtime and the whole-file digest,
+            # must still be identical to the post-fsync validated candidate.
+            if (
+                (
+                    public.device,
+                    public.inode,
+                    public.mode,
+                    public.size,
+                    public.mtime_ns,
+                    public.digest,
+                )
+                != (
+                    candidate.device,
+                    candidate.inode,
+                    candidate.mode,
+                    candidate.size,
+                    candidate.mtime_ns,
+                    candidate.digest,
+                )
+            ):
+                raise FiniteArtifactIntegrityError(
+                    "finite public link does not match its validated candidate"
+                )
+            terminal = StreamTerminal(
+                str(path),
+                public.size,
+                public.digest,
+                1,
+                public.device,
+                public.inode,
+                public.mtime_ns,
+                public.ctime_ns,
+            )
+            self._require_parent(parent_descriptor, parent_state)
+            if _observe_regular_at(
+                parent_descriptor, path.name, path,
+            ) != _snapshot_state(public):
+                raise FiniteArtifactIntegrityError(
+                    "finite public link changed after final hashing"
+                )
+            if accept_validated_commit(receipt.validation) is not None:
+                raise TypeError("validated commit callback must return None")
+            self._require_parent(parent_descriptor, parent_state)
+            revalidate_stream_terminal(path, terminal)
+            self._require_parent(parent_descriptor, parent_state)
+            if _observe_regular_at(
+                parent_descriptor, path.name, path,
+            ) != _snapshot_state(public):
+                raise FiniteArtifactIntegrityError(
+                    "finite public link changed during commit acceptance"
+                )
+            return terminal
+        except BaseException as error:
+            if isinstance(error, FiniteArtifactIntegrityError):
+                raise
+            raise FiniteArtifactIntegrityError(
+                "finite validated public link cannot be accepted"
+            ) from error
+
     def _result(
         self,
         disposition: FiniteArtifactDisposition,
@@ -2428,6 +2531,9 @@ class FiniteArtifactPublisher:
         ],
         seed: FiniteSourceAdmission | None = None,
         prepublish: Callable[[], object] | None = None,
+        accept_validated_commit: Callable[
+            [FiniteCandidateValidation], object
+        ] | None = None,
     ) -> FiniteArtifactResult:
         """Publish through one trusted adapter without mutating the source.
 
@@ -2436,6 +2542,10 @@ class FiniteArtifactPublisher:
         must not inspect or duplicate the private backing descriptor.  This
         protocol proves closure for conforming file-object adapters; it is not
         a sandbox for arbitrary hostile same-process Python.
+
+        A seeded caller may accept its exact attempt-local validation after the
+        newly linked public name receives one matching whole-file hash.  That
+        shortcut never applies to an existing occupant, replay, or collision.
         """
         if type(adapter) not in {
             FiniteDocumentAdapter,
@@ -2446,10 +2556,21 @@ class FiniteArtifactPublisher:
             raise TypeError("finite committed inspector must be callable")
         if prepublish is not None and not callable(prepublish):
             raise TypeError("finite prepublication check must be callable")
+        if accept_validated_commit is not None and not callable(
+            accept_validated_commit
+        ):
+            raise TypeError("finite validated commit callback must be callable")
         if seed is not None and type(seed) is not FiniteSourceAdmission:
             raise TypeError("finite seed must be an exact source admission")
         if type(adapter) is FiniteSeededDocumentAdapter and seed is None:
             raise TypeError("finite seeded adapter requires one source admission")
+        if (
+            accept_validated_commit is not None
+            and type(adapter) is not FiniteSeededDocumentAdapter
+        ):
+            raise TypeError(
+                "finite validated commit callback requires a seeded adapter"
+            )
         with self._lock:
             if self._used:
                 raise RuntimeError("finite publisher is one-shot")
@@ -2649,7 +2770,12 @@ class FiniteArtifactPublisher:
                     raise FiniteArtifactIntegrityError(
                         "finite candidate changed during semantic validation"
                     )
-                validated = written
+                validated = _ValidatedCandidateReceipt(
+                    written,
+                    validation,
+                    self.request.operation_identity,
+                    _FACTORY,
+                )
                 if prepublish is not None:
                     prepublish()
                 if self._cancelled():
@@ -2718,11 +2844,11 @@ class FiniteArtifactPublisher:
                 if (
                     final_state is not None
                     and final_state[:5] == (
-                        validated.device,
-                        validated.inode,
-                        validated.mode,
-                        validated.size,
-                        validated.mtime_ns,
+                        validated.snapshot.device,
+                        validated.snapshot.inode,
+                        validated.snapshot.mode,
+                        validated.snapshot.size,
+                        validated.snapshot.mtime_ns,
                     )
                 ):
                     disposition = FiniteArtifactDisposition.COMMITTED
@@ -2738,7 +2864,7 @@ class FiniteArtifactPublisher:
                 hidden_orphan, cleanup_error = self._cleanup(
                     parent_descriptor,
                     candidate,
-                    validated,
+                    validated.snapshot,
                 )
                 if cleanup_error is not None:
                     diagnostics.append(_bounded_diagnostic(
@@ -2751,21 +2877,33 @@ class FiniteArtifactPublisher:
                         diagnostics.append(_bounded_diagnostic(
                             FINITE_PARENT_DIRECTORY_FSYNC_WARNING, error
                         ))
-                terminal = self._inspect_exact(
-                    target,
-                    inspect_committed,
-                    parent_descriptor=parent_descriptor,
-                    parent_state=parent_state,
-                    collision=(
-                        disposition
-                        is FiniteArtifactDisposition.ALREADY_COMMITTED
-                    ),
-                    expected=(
-                        validated
-                        if disposition is FiniteArtifactDisposition.COMMITTED
-                        else None
-                    ),
-                )
+                if (
+                    disposition is FiniteArtifactDisposition.COMMITTED
+                    and accept_validated_commit is not None
+                ):
+                    terminal = self._accept_validated_own_link(
+                        target,
+                        validated,
+                        accept_validated_commit,
+                        parent_descriptor=parent_descriptor,
+                        parent_state=parent_state,
+                    )
+                else:
+                    terminal = self._inspect_exact(
+                        target,
+                        inspect_committed,
+                        parent_descriptor=parent_descriptor,
+                        parent_state=parent_state,
+                        collision=(
+                            disposition
+                            is FiniteArtifactDisposition.ALREADY_COMMITTED
+                        ),
+                        expected=(
+                            validated.snapshot
+                            if disposition is FiniteArtifactDisposition.COMMITTED
+                            else None
+                        ),
+                    )
                 close_parent()
                 return self._result(
                     disposition,

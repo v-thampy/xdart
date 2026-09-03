@@ -183,6 +183,30 @@ def _publish(
     )
 
 
+def _publish_validated_seed(
+    request: FiniteArtifactRequest,
+    admission: FiniteSourceAdmission,
+    accept,
+    *,
+    publisher: FiniteArtifactPublisher | None = None,
+    inspect=None,
+    prepublish=None,
+):
+    adapter = FiniteSeededDocumentAdapter(
+        lambda binding: nullcontext(binding),
+        lambda document, _seed, _candidate: _write_payload(request)(document),
+        lambda binding: nullcontext(binding),
+        _validate_payload(request),
+    )
+    return (publisher or FiniteArtifactPublisher(request)).publish(
+        adapter,
+        inspect_committed=inspect or _inspect_payload,
+        seed=admission,
+        prepublish=prepublish,
+        accept_validated_commit=accept,
+    )
+
+
 def test_trusted_adapter_authority_boundary_is_explicit() -> None:
     adapter_contract = FiniteDocumentAdapter.__doc__ or ""
     publisher_contract = FiniteArtifactPublisher.publish.__doc__ or ""
@@ -541,6 +565,7 @@ def test_seed_receipt_proves_exact_copy_and_source_immutability(tmp_path: Path) 
 
 def test_seeded_adapter_receives_only_publisher_owned_copy_binding(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "source.nexus"
     original = os.urandom(4097)
@@ -548,6 +573,22 @@ def test_seeded_adapter_receives_only_publisher_owned_copy_binding(
     admitted = capture_finite_source(source)
     request = _request(tmp_path, source)
     observed: dict[str, object] = {}
+    accepted: list[FiniteCandidateValidation] = []
+    inspected: list[Path] = []
+    target_hashes: list[Path] = []
+    snapshot_at = finite_module._snapshot_at
+
+    def capture_snapshot(parent_descriptor, name, shown_path):
+        shown = Path(shown_path)
+        if shown == Path(request.output_artifact):
+            target_hashes.append(shown)
+        return snapshot_at(parent_descriptor, name, shown_path)
+
+    def inspect(path, selected):
+        inspected.append(path)
+        return _inspect_payload(path, selected)
+
+    monkeypatch.setattr(finite_module, "_snapshot_at", capture_snapshot)
 
     def writer(
         candidate: FiniteCandidateBinding,
@@ -575,13 +616,27 @@ def test_seeded_adapter_receives_only_publisher_owned_copy_binding(
     )
     result = FiniteArtifactPublisher(request).publish(
         adapter,
-        inspect_committed=_inspect_payload,
+        inspect_committed=inspect,
         seed=admitted,
+        accept_validated_commit=accepted.append,
     )
 
     assert result.disposition is FiniteArtifactDisposition.COMMITTED
     assert observed["binding"].receipt is result.seed_receipt
     assert observed["binding"].active is False
+    assert len(accepted) == 1
+    assert accepted[0].lineage == request.lineage
+    assert inspected == []
+    assert target_hashes == [Path(request.output_artifact)]
+    replay = FiniteArtifactPublisher(request).publish(
+        adapter,
+        inspect_committed=inspect,
+        seed=admitted,
+        accept_validated_commit=accepted.append,
+    )
+    assert replay.disposition is FiniteArtifactDisposition.ALREADY_COMMITTED
+    assert inspected == [Path(request.output_artifact)]
+    assert len(accepted) == 1
     with pytest.raises(TypeError, match="factory-owned"):
         replace(result.seed_receipt)
     with pytest.raises(TypeError, match="publisher-owned"):
@@ -607,6 +662,210 @@ def test_seeded_adapter_refuses_unseeded_publication(tmp_path: Path) -> None:
             adapter,
             inspect_committed=_inspect_payload,
         )
+
+
+def test_validated_commit_callback_refuses_an_unseeded_adapter(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    adapter = FiniteDocumentAdapter(
+        lambda binding: nullcontext(binding),
+        _write_payload(request),
+        lambda binding: nullcontext(binding),
+        _validate_payload(request),
+    )
+
+    with pytest.raises(TypeError, match="requires a seeded adapter"):
+        FiniteArtifactPublisher(request).publish(
+            adapter,
+            inspect_committed=_inspect_payload,
+            accept_validated_commit=lambda _validation: None,
+        )
+
+
+def test_validated_commit_hash_mismatch_is_held_after_visibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    admitted = capture_finite_source(source)
+    request = _request(tmp_path, source)
+    target = Path(request.output_artifact)
+    accepted: list[FiniteCandidateValidation] = []
+    snapshot_at = finite_module._snapshot_at
+    target_hashes = 0
+
+    def mutate_before_public_hash(parent_descriptor, name, shown_path):
+        nonlocal target_hashes
+        shown = Path(shown_path)
+        if shown == target:
+            target_hashes += 1
+            state = shown.stat()
+            payload = bytearray(shown.read_bytes())
+            payload[0] ^= 1
+            with shown.open("r+b") as stream:
+                stream.write(payload)
+            os.utime(
+                shown,
+                ns=(state.st_atime_ns, state.st_mtime_ns),
+                follow_symlinks=False,
+            )
+        return snapshot_at(parent_descriptor, name, shown_path)
+
+    monkeypatch.setattr(
+        finite_module, "_snapshot_at", mutate_before_public_hash,
+    )
+
+    with pytest.raises(FiniteArtifactPublicationHeld) as captured:
+        _publish_validated_seed(
+            request, admitted, accepted.append,
+        )
+
+    assert isinstance(captured.value.cause, FiniteArtifactIntegrityError)
+    assert target.exists()
+    assert target_hashes == 1
+    assert accepted == []
+    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+
+
+@pytest.mark.parametrize(
+    "failure", ("post-hash-mutation", "callback-mutation", "callback"),
+)
+def test_validated_commit_late_failure_is_held_after_visibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    admitted = capture_finite_source(source)
+    request = _request(tmp_path, source)
+    target = Path(request.output_artifact)
+    callbacks: list[FiniteCandidateValidation] = []
+    snapshot_at = finite_module._snapshot_at
+
+    def mutate_target() -> None:
+        state = target.stat()
+        payload = bytearray(target.read_bytes())
+        payload[-1] ^= 1
+        with target.open("r+b") as stream:
+            stream.write(payload)
+        os.utime(
+            target,
+            ns=(state.st_atime_ns, state.st_mtime_ns),
+            follow_symlinks=False,
+        )
+
+    def hash_then_mutate(parent_descriptor, name, shown_path):
+        snapshot = snapshot_at(parent_descriptor, name, shown_path)
+        if Path(shown_path) == target:
+            mutate_target()
+        return snapshot
+
+    def accept(validation):
+        callbacks.append(validation)
+        if failure == "callback":
+            raise LookupError("domain acceptance unavailable")
+        if failure == "callback-mutation":
+            mutate_target()
+
+    if failure == "post-hash-mutation":
+        monkeypatch.setattr(
+            finite_module, "_snapshot_at", hash_then_mutate,
+        )
+    with pytest.raises(FiniteArtifactPublicationHeld) as captured:
+        _publish_validated_seed(
+            request,
+            admitted,
+            accept,
+            inspect=lambda *_args: pytest.fail(
+                "validated own link entered replay inspection"
+            ),
+        )
+
+    assert isinstance(captured.value.cause, FiniteArtifactIntegrityError)
+    assert target.exists()
+    assert len(callbacks) == (0 if failure == "post-hash-mutation" else 1)
+    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+
+
+def test_validated_candidate_same_size_mutation_is_refused_before_visibility(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    admitted = capture_finite_source(source)
+    request = _request(tmp_path, source)
+    accepted: list[FiniteCandidateValidation] = []
+
+    def mutate_candidate() -> None:
+        candidate, = tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+        state = candidate.stat()
+        payload = bytearray(candidate.read_bytes())
+        payload[-1] ^= 1
+        with candidate.open("r+b") as stream:
+            stream.write(payload)
+        os.utime(
+            candidate,
+            ns=(state.st_atime_ns, state.st_mtime_ns),
+            follow_symlinks=False,
+        )
+
+    with pytest.raises(
+        FiniteArtifactIntegrityError,
+        match="candidate changed before publication",
+    ):
+        _publish_validated_seed(
+            request,
+            admitted,
+            accepted.append,
+            prepublish=mutate_candidate,
+        )
+
+    assert accepted == []
+    assert not Path(request.output_artifact).exists()
+    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+
+
+@pytest.mark.parametrize("late_effect", ("link-error", "stop"))
+def test_validated_commit_keeps_an_observed_own_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    late_effect: str,
+) -> None:
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    admitted = capture_finite_source(source)
+    request = _request(tmp_path, source)
+    token = threading.Event()
+    accepted: list[FiniteCandidateValidation] = []
+    link = finite_module._link
+
+    def link_with_late_effect(*args, **kwargs):
+        link(*args, **kwargs)
+        if late_effect == "stop":
+            token.set()
+        else:
+            raise OSError("uncertain after exact link")
+
+    monkeypatch.setattr(finite_module, "_link", link_with_late_effect)
+    result = _publish_validated_seed(
+        request,
+        admitted,
+        accepted.append,
+        publisher=FiniteArtifactPublisher(request, cancel_token=token),
+        inspect=lambda *_args: pytest.fail(
+            "validated own link entered replay inspection"
+        ),
+    )
+
+    assert result.disposition is FiniteArtifactDisposition.COMMITTED
+    assert Path(request.output_artifact).read_bytes() == _payload(request)
+    assert len(accepted) == 1
+    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
 
 
 def test_seed_publication_does_not_rehash_the_admitted_source(
