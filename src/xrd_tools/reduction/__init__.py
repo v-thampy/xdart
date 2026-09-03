@@ -72,7 +72,7 @@ __all__ += [
     "PreparedDimensionPayload", "PreparedReintegrateBundle",
     "PreparedReintegrateExecution", "PreparedReintegrateOffer",
     "PreparedRouteChanged", "PreparedRouteRejected",
-    "prepare_reintegrate_bundle",
+    "prepare_reintegrate_bundle", "unprepared_reintegrate_offer",
 ]
 __all__ += [
     "AverageCommand", "AverageContributor",
@@ -143,7 +143,7 @@ _REINTEGRATE_PREPARED_EXPORTS = {
     "PreparedDimensionPayload", "PreparedReintegrateBundle",
     "PreparedReintegrateExecution", "PreparedReintegrateOffer",
     "PreparedRouteChanged", "PreparedRouteRejected",
-    "prepare_reintegrate_bundle",
+    "prepare_reintegrate_bundle", "unprepared_reintegrate_offer",
 }
 _AVERAGE_EXPORTS = {
     "AverageCommand", "AverageContributor",

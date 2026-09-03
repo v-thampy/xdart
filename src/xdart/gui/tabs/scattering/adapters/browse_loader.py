@@ -1083,87 +1083,27 @@ class BrowseLoader:
         stage_finish("presentation_read_s", started)
         if cancelled.is_set():
             return None
-        # Prepare the fixed dual-dimension, handle-free Reintegration offer on
-        # this Browse worker while the existing before/after target bracket is
-        # still open.  No array, HDF handle, writer, or GUI-owned plan escapes.
+        # Ordinary Browse must not prepay Reintegration admission.  Install one
+        # typed lazy-fallback offer; the operation worker reads and authenticates
+        # the artifact only if the user actually requests Reintegration.
         started = stage_start()
-        from xrd_tools.io.finite_artifact import capture_finite_source
         from xrd_tools.reduction.reintegrate_prepared import (
-            MAX_PREPARED_BUNDLE_BYTES,
-            PreparedReintegrateBundle,
             PreparedReintegrateOffer,
-            prepare_reintegrate_bundle,
-            prepared_bundle_mapping,
+            PreparedCapsuleMissCode,
+            unprepared_reintegrate_offer,
         )
-        finite_source = capture_finite_source(path)
-        finite_snapshot = finite_source.snapshot
-        finite_target_snapshot = TargetSnapshot(
-            True,
-            finite_snapshot.size,
-            finite_snapshot.mtime_ns,
-            finite_snapshot.device,
-            finite_snapshot.inode,
-            finite_snapshot.digest,
-        )
-        same_object = (
-            finite_target_snapshot.exists == before.exists
-            and finite_target_snapshot.size == before.size
-            and finite_target_snapshot.mtime_ns == before.mtime_ns
-            and finite_target_snapshot.device == before.device
-            and finite_target_snapshot.inode == before.inode
-        )
-        # Snapshot Browse uses the same whole-file digest domain.  A sealed
-        # fast-writer terminal intentionally carries a bounded writer-evidence
-        # digest instead, so its object/stat identity is the admissible join;
-        # prepare_reintegrate_bundle revalidates the exact terminal itself.
-        if (
-            not same_object
-            or sealed_terminal is None
-            and finite_target_snapshot.digest != before.digest
-        ):
-            raise ValueError("processed browse target changed before preparation")
-        prepared_offer = prepare_reintegrate_bundle(
-            finite_source,
-            entry=target_entry,
-            labels=labels,
-            expected_terminal=sealed_terminal,
-            source_root=request.source_root,
-            cancel_token=cancelled,
-        )
+        prepared_offer = unprepared_reintegrate_offer()
         if type(prepared_offer) is not PreparedReintegrateOffer:
-            raise TypeError("Browse preparation returned a foreign offer")
-        if prepared_offer.disposition == "READY":
-            bundle = prepared_offer.bundle
-            if type(bundle) is not PreparedReintegrateBundle:
-                raise TypeError("Browse preparation lost its exact bundle")
-            one_d_status = bundle.one_d.disposition
-            two_d_status = bundle.two_d.disposition
-            bundle_bytes = (
-                0
-                if _timing is None
-                else len(json.dumps(
-                    prepared_bundle_mapping(bundle),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                    allow_nan=False,
-                ).encode("utf-8"))
-            )
-        elif (
-            prepared_offer.disposition == "MISS"
-            and prepared_offer.bundle is None
-            and prepared_offer.miss_code is not None
+            raise TypeError("Browse lazy fallback returned a foreign offer")
+        if (
+            prepared_offer.disposition != "MISS"
+            or prepared_offer.bundle is not None
+            or prepared_offer.miss_code
+            is not PreparedCapsuleMissCode.CAPSULE_NOT_SUPPLIED
         ):
-            one_d_status = two_d_status = "MISS"
-            bundle_bytes = 0
-        else:
-            raise TypeError("Browse preparation returned an invalid offer")
-        if one_d_status not in {"READY", "MISS"} or two_d_status not in {
-            "READY", "MISS",
-        }:
-            raise TypeError("Browse preparation returned an invalid dimension")
-        if bundle_bytes > MAX_PREPARED_BUNDLE_BYTES:
-            raise ValueError("Browse prepared bundle exceeded its byte ceiling")
+            raise TypeError("Browse lazy fallback returned an invalid offer")
+        one_d_status = two_d_status = "MISS"
+        bundle_bytes = 0
         stage_finish("prepared_capsule_s", started)
         if _timing is not None:
             _timing["prepared_bundle_bytes"] = bundle_bytes

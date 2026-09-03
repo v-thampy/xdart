@@ -2122,6 +2122,12 @@ def _offer_miss(code: PreparedCapsuleMissCode) -> PreparedReintegrateOffer:
     return _value(PreparedReintegrateOffer, "MISS", None, code)
 
 
+def unprepared_reintegrate_offer() -> PreparedReintegrateOffer:
+    """Return the typed lazy fallback used when Browse does no preparation."""
+
+    return _offer_miss(PreparedCapsuleMissCode.CAPSULE_NOT_SUPPLIED)
+
+
 def _prepared_dimension_inventories(
     path: Path,
     entry: str,
@@ -2576,4 +2582,5 @@ __all__ = [
     "preflight_prepared_execution",
     "select_prepared_execution",
     "source_topology_identity",
+    "unprepared_reintegrate_offer",
 ]

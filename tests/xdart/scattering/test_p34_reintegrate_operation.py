@@ -2255,7 +2255,11 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
     from xdart.gui.tabs.scattering.browse_values import (
         BrowseLoadRequest, BrowseLoadStatus,
     )
+    from xrd_tools.io import finite_artifact
     from xrd_tools.io import output_transaction as transaction
+    from xrd_tools.reduction.reintegrate_prepared import (
+        PreparedCapsuleMissCode,
+    )
 
     seeded = _seed_existing(tmp_path)
     target = seeded.target.resolve()
@@ -2282,6 +2286,13 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
     monkeypatch.setattr(module, "capture_target_snapshot", capture)
     monkeypatch.setattr(module, "revalidate_stream_terminal", revalidate)
     monkeypatch.setattr(transaction, "_sha256_handle", sha256_handle)
+    monkeypatch.setattr(
+        finite_artifact,
+        "capture_finite_source",
+        lambda *_args, **_kwargs: pytest.fail(
+            "ordinary Browse prepared Reintegration eagerly"
+        ),
+    )
 
     terminal_loader = module.BrowseLoader()
     terminal_request = BrowseLoadRequest(
@@ -2298,6 +2309,11 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
         terminal_context.target_snapshot.size,
         terminal_context.target_snapshot.digest,
     ) == (seal.size, seal.digest)
+    assert terminal_context.prepared_reintegrate_offer.disposition == "MISS"
+    assert (
+        terminal_context.prepared_reintegrate_offer.miss_code
+        is PreparedCapsuleMissCode.CAPSULE_NOT_SUPPLIED
+    )
     assert full_captures == hashed_bytes == []
     assert revalidations == ["scattering-browse"] * 2
     assert terminal_loader.release_context(
