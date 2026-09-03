@@ -1549,6 +1549,7 @@ class NexusSink:
     incremental_finalization: bool = False
     durable_fsync: bool = True
     rollback_until_commit: bool = False
+    create_new: bool = False
     _writer: NexusRecordWriter | None = field(default=None, init=False, repr=False)
     _transaction: Any | None = field(default=None, init=False, repr=False)
     _lease: Any | None = field(default=None, init=False, repr=False)
@@ -1773,6 +1774,10 @@ class NexusSink:
             raise TypeError("Nexus durable_fsync must be an exact bool")
         if type(self.rollback_until_commit) is not bool:
             raise TypeError("Nexus rollback_until_commit must be an exact bool")
+        if type(self.create_new) is not bool:
+            raise TypeError("Nexus create_new must be an exact bool")
+        if self.create_new and self.append_preflight is not None:
+            raise ValueError("create-new output cannot consume an Append preflight")
         if not self.durable_fsync and self.append_preflight is not None:
             raise ValueError(
                 "diagnostic no-fsync is unavailable for Append"
@@ -1988,6 +1993,8 @@ class NexusSink:
                 durable_fsync=self.durable_fsync,
                 fast_regenerable=self._fast_regenerable,
             )
+            if self.create_new and transaction.admission.snapshot.exists:
+                raise ValueError("CREATE_NEW_TARGET_EXISTS")
             lease = transaction.acquire_lease(
                 admission=transaction.admission,
                 transaction_owner=transaction_owner,

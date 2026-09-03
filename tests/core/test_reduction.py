@@ -1258,6 +1258,36 @@ def test_nexus_sink_atomic_overwrite_preserves_target_on_failure(
     assert not list(tmp_path.glob(".scan.*.tmp.nexus"))
 
 
+def test_nexus_sink_create_new_refuses_an_existing_target_without_touching_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out = tmp_path / "scan.nexus"
+    original = b"existing scientific artifact"
+    out.write_bytes(original)
+    writer_started = False
+
+    def observe_writer(*args, **kwargs):
+        nonlocal writer_started
+        writer_started = True
+        raise AssertionError("create-new refusal reached the writer")
+
+    monkeypatch.setattr(reduction_core, "NexusRecordWriter", observe_writer)
+    sink = NexusSink(out, overwrite=True, create_new=True)
+
+    with pytest.raises(ValueError, match="CREATE_NEW_TARGET_EXISTS"):
+        sink.begin(Scan("scan", []), ReductionPlan())
+
+    assert writer_started is False
+    assert out.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [out]
+
+
+def test_nexus_sink_create_new_requires_an_exact_boolean(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="create_new"):
+        NexusSink(tmp_path / "scan.nexus", create_new=1)
+
+
 def test_reduction_validation_for_shapes_and_duplicate_frames() -> None:
     with pytest.raises(ValueError, match="duplicate"):
         Scan(
