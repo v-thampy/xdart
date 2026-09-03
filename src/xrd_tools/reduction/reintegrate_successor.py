@@ -274,8 +274,6 @@ def _predecessor(
         ) from error
     if lineage is None:
         return capture_finite_predecessor(admission, terminal=terminal)
-    if terminal is None:
-        raise ValueError("finite predecessor lineage requires an exact terminal")
     payload = json.loads(lineage.canonical_json)
     return capture_finite_predecessor(
         admission,
@@ -421,7 +419,22 @@ def _request_from_values(
     legacy_reason: LegacyRouteReason | None,
     miss_code: PreparedCapsuleMissCode | None,
 ) -> FiniteArtifactRequest:
-    family = artifact_family_from_source(admission.path, artifact_family)
+    predecessor = _predecessor(
+        admission,
+        _exact_predecessor_terminal(admission, terminal),
+        qualified.entry,
+    )
+    persisted_family = predecessor.artifact_family_v1
+    if (
+        persisted_family is not None
+        and artifact_family is not None
+        and artifact_family != persisted_family
+    ):
+        raise ValueError("explicit artifact family conflicts with predecessor lineage")
+    family = artifact_family_from_source(
+        admission.path,
+        persisted_family if persisted_family is not None else artifact_family,
+    )
     identities = _derived_request_inputs(
         snapshot=admission.snapshot,
         terminal=terminal,
@@ -445,11 +458,7 @@ def _request_from_values(
     return finite_artifact_request(
         source_admission=admission,
         operation_context=context,
-        predecessor=_predecessor(
-            admission,
-            _exact_predecessor_terminal(admission, terminal),
-            qualified.entry,
-        ),
+        predecessor=predecessor,
         destination_directory=destination_directory,
         explicit_target=explicit_target,
         artifact_family=family,

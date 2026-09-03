@@ -3319,6 +3319,60 @@ def test_recipe_predecessor_identity_is_joined_to_the_admitted_parent(
     assert not tuple(seeded.target.parent.glob(".xdart-finite-*.candidate"))
 
 
+def test_cold_successor_reintegrates_with_stable_automatic_family(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.io.finite_artifact import require_finite_artifact_lineage
+    from xrd_tools.reduction import (
+        ReintegrateSuccessorPlan,
+        run_reintegrate_successor,
+    )
+
+    seeded = _seed_existing(tmp_path, labels=(2,), name="cold-generation")
+    _stub_integrators(monkeypatch)
+    common = {
+        "entry": "entry",
+        "dimension": "1d",
+        "preparation": _dimension_preparation(seeded, "1d"),
+        "expected_labels": seeded.labels,
+        "destination_directory": seeded.target.parent,
+        "explicit_output": None,
+    }
+    first_plan = ReintegrateSuccessorPlan.from_artifact(
+        seeded.target,
+        expected_terminal_identity=seeded.terminal.commit_identity,
+        **common,
+    )
+    first = run_reintegrate_successor(first_plan)
+    assert first.disposition == "COMMITTED"
+
+    # Model a new process: only the published artifact and persisted lineage
+    # remain; no in-memory terminal receipt is available.
+    with pytest.raises(ValueError, match="conflicts with predecessor lineage"):
+        ReintegrateSuccessorPlan.from_artifact(
+            first.output_artifact,
+            expected_terminal_identity=None,
+            artifact_family="other-family",
+            **common,
+        )
+    second_plan = ReintegrateSuccessorPlan.from_artifact(
+        first.output_artifact,
+        expected_terminal_identity=None,
+        **common,
+    )
+    second = run_reintegrate_successor(second_plan)
+
+    assert second.disposition == "COMMITTED"
+    assert first_plan.artifact_family == second_plan.artifact_family == "existing"
+    assert Path(second.output_artifact).name.startswith("existing.reintegrate-1d-")
+    assert not Path(second.output_artifact).name.startswith("artifact-")
+    with h5py.File(second.output_artifact, "r") as document:
+        lineage = require_finite_artifact_lineage(document)
+    payload = json.loads(lineage.canonical_json)
+    assert payload["artifact_family_v1"] == "existing"
+    assert payload["predecessor"]["terminal"] is None
+
+
 @pytest.mark.parametrize(
     "seam", ("soft-link", "oversized", "malformed", "source-swap"),
 )

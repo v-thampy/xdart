@@ -344,8 +344,6 @@ class FinitePredecessorReceipt:
                 )
             ):
                 raise ValueError("finite predecessor terminal does not match source")
-        if finite_parent and self.terminal is None:
-            raise ValueError("finite predecessor lineage requires a terminal")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1130,7 +1128,6 @@ def admit_finite_artifact_lineage(value: str | bytes) -> FiniteArtifactLineage:
             or terminal.get("digest") != predecessor.get("source_digest")
             or terminal.get("size") != source_size
         )
-        or all(item is not None for item in predecessor_finite) and terminal is None
         or _canonical(payload) != canonical
     ):
         raise ValueError("finite lineage schema or canonical form is invalid")
