@@ -605,57 +605,36 @@ class TestReadSphereMetadata:
 
     @pytest.fixture
     def synth_v2_sphere(self, tmp_path):
-        """Hand-craft a minimal v2 NXroot with frame_index, q/chi,
-        positioners, and an ``integrated_2d`` that is intentionally
+        """Build a current record with frame_index, q/chi, positioners,
+        and an ``integrated_2d`` that is intentionally
         big so 'metadata-only' has something to refuse to load."""
         p = tmp_path / "sphere.nexus"
-        with h5py.File(p, "w") as f:
-            e = f.create_group("entry")
-            e.attrs["NX_class"] = "NXentry"
-            e.attrs["ssrl_schema"] = "xrd_tools.processed_scan"
-            e.attrs["ssrl_schema_version"] = 2
+        frames = range(1, 101)
+        q = np.linspace(0.5, 5.0, 32, dtype=np.float32)
+        chi = np.linspace(
+            -180.0, 180.0, 16, endpoint=False, dtype=np.float32,
+        )
+        one_d = IntegrationResult1D(
+            radial=q,
+            intensity=np.ones(32, dtype=np.float32),
+            unit="1/angstrom",
+        )
+        two_d = IntegrationResult2D(
+            radial=q,
+            azimuthal=chi,
+            intensity=np.ones((32, 16), dtype=np.float32),
+            unit="1/angstrom",
+            azimuthal_unit="deg",
+        )
+        write_nexus(
+            p,
+            results_1d={frame: one_d for frame in frames},
+            results_2d={frame: two_d for frame in frames},
+            compression=None,
+        )
 
-            # 1D stack — 100 frames × 32 q.  Frame IDs 1-based to
-            # mimic SPEC (the C4 alignment case).
-            g1 = e.create_group("integrated_1d")
-            g1.attrs["NX_class"] = "NXdata"
-            g1.attrs["signal"] = "intensity"
-            g1.attrs["axes"] = ("frame_index", "q")
-            g1.create_dataset(
-                "intensity",
-                data=np.ones((100, 32), dtype=np.float32),
-            )
-            g1.create_dataset(
-                "frame_index",
-                data=np.arange(1, 101, dtype=np.int64),
-            )
-            q = g1.create_dataset("q",
-                                  data=np.linspace(0.5, 5.0, 32,
-                                                   dtype=np.float32))
-            q.attrs["units"] = b"1/angstrom"
-
-            # 2D stack — 100 × 16 × 32.  Bigger ndim; this is the
-            # one the metadata loader must NOT pull into memory.
-            g2 = e.create_group("integrated_2d")
-            g2.attrs["NX_class"] = "NXdata"
-            g2.attrs["signal"] = "intensity"
-            g2.attrs["axes"] = ("frame_index", "chi", "q")
-            g2.create_dataset(
-                "intensity",
-                data=np.ones((100, 16, 32), dtype=np.float32),
-            )
-            g2.create_dataset("q",
-                              data=np.linspace(0.5, 5.0, 32,
-                                               dtype=np.float32))
-            chi = g2.create_dataset(
-                "chi", data=np.linspace(-180.0, 180.0, 16,
-                                        endpoint=False,
-                                        dtype=np.float32),
-            )
-            chi.attrs["units"] = b"deg"
-            g2.create_dataset(
-                "frame_index", data=np.arange(1, 101, dtype=np.int64),
-            )
+        with h5py.File(p, "r+") as f:
+            e = f["entry"]
 
             # Positioner.
             samp = e.create_group("sample")
@@ -771,21 +750,21 @@ class TestReadNexusMissingFields:
 
 class TestWriteNexus:
     def test_returns_path(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "out.h5", results_1d={0: result_1d})
-        assert p == tmp_path / "out.h5"
+        p = write_nexus(tmp_path / "out.nexus", results_1d={0: result_1d})
+        assert p == tmp_path / "out.nexus"
         assert p.exists()
 
     def test_creates_parent_dirs(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "subdir" / "deep" / "out.h5", results_1d={0: result_1d})
+        p = write_nexus(tmp_path / "subdir" / "deep" / "out.nexus", results_1d={0: result_1d})
         assert p.exists()
 
     def test_nxentry_class(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "a.h5", results_1d={0: result_1d})
+        p = write_nexus(tmp_path / "a.nexus", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
             assert f["entry"].attrs["NX_class"] == "NXentry"
 
     def test_reduction_group(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "a.h5", results_1d={0: result_1d})
+        p = write_nexus(tmp_path / "a.nexus", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
             assert "reduction" in f["entry"]
             assert f["entry/reduction"].attrs["NX_class"] == "NXprocess"
@@ -794,7 +773,7 @@ class TestWriteNexus:
             assert f["entry/reduction"].attrs["program"] == "ssrl_xrd_tools"
 
     def test_overwrite(self, tmp_path, result_1d):
-        p = tmp_path / "over.h5"
+        p = tmp_path / "over.nexus"
         write_nexus(p, results_1d={0: result_1d})
         write_nexus(p, results_1d={1: result_1d}, overwrite=True)
         with h5py.File(p, "r") as f:
@@ -802,7 +781,7 @@ class TestWriteNexus:
         assert frames == [1]  # old frame gone
 
     def test_append_default(self, tmp_path, result_1d):
-        p = tmp_path / "app.h5"
+        p = tmp_path / "app.nexus"
         write_nexus(p, results_1d={0: result_1d})
         write_nexus(p, results_1d={1: result_1d})  # append
         with h5py.File(p, "r") as f:
@@ -810,7 +789,7 @@ class TestWriteNexus:
         assert frames == [0, 1]
 
     def test_compression_none(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "nc.h5", results_1d={0: result_1d}, compression=None)
+        p = write_nexus(tmp_path / "nc.nexus", results_1d={0: result_1d}, compression=None)
         with h5py.File(p, "r") as f:
             assert f["entry/integrated_1d/intensity"].compression is None
 
@@ -818,7 +797,7 @@ class TestWriteNexus:
         # Converged policy: lzf is never emitted (h5py-only filter, ARM64-macOS
         # bus error) -- it is a backward-compatible alias for gzip on EVERY
         # platform, so the written file is always gzip and stock-h5py readable.
-        p = write_nexus(tmp_path / "lzf.h5", results_1d={0: result_1d}, compression="lzf")
+        p = write_nexus(tmp_path / "lzf.nexus", results_1d={0: result_1d}, compression="lzf")
         with h5py.File(p, "r") as f:
             assert f["entry/integrated_1d/intensity"].compression == "gzip"
 
@@ -922,7 +901,7 @@ class TestResolveStackCompression:
         pytest.importorskip("hdf5plugin")
         if _nexus_io._native_filter_unsafe():
             pytest.skip("hdf5plugin not importable here")
-        p = write_nexus(tmp_path / "lz4.h5", results_1d={0: result_1d}, compression="lz4")
+        p = write_nexus(tmp_path / "lz4.nexus", results_1d={0: result_1d}, compression="lz4")
         with h5py.File(p, "r") as f:
             ds = f["entry/integrated_1d/intensity"]
             # h5py reports plugin filters as 'unknown'; the LZ4 filter id 32004 is
@@ -933,14 +912,14 @@ class TestResolveStackCompression:
             np.testing.assert_allclose(ds[0], result_1d.intensity, rtol=1e-6)
 
     def test_compression_gzip(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "gz.h5", results_1d={0: result_1d}, compression="gzip")
+        p = write_nexus(tmp_path / "gz.nexus", results_1d={0: result_1d}, compression="gzip")
         with h5py.File(p, "r") as f:
             ds = f["entry/integrated_1d/intensity"]
             assert ds.compression == "gzip"
             assert ds.shuffle is True            # shuffle filter engaged (better ratio)
 
     def test_custom_entry_name(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "e.h5", results_1d={0: result_1d}, entry="scan_1")
+        p = write_nexus(tmp_path / "e.nexus", results_1d={0: result_1d}, entry="scan_1")
         with h5py.File(p, "r") as f:
             assert "scan_1" in f
             assert "entry" not in f
@@ -954,13 +933,13 @@ class TestWriteNexusResult1D:
     """Stacked /entry/integrated_1d layout (read_scan-compatible)."""
 
     def test_group_created(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "a.h5", results_1d={0: result_1d})
+        p = write_nexus(tmp_path / "a.nexus", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
             assert "integrated_1d" in f["entry"]
             assert "intensity" in f["entry/integrated_1d"]
 
     def test_nxdata_class(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "a.h5", results_1d={0: result_1d})
+        p = write_nexus(tmp_path / "a.nexus", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
             grp = f["entry/integrated_1d"]
             assert grp.attrs["NX_class"] == "NXdata"
@@ -968,21 +947,21 @@ class TestWriteNexusResult1D:
             assert list(grp.attrs["axes"]) == ["frame_index", "q"]
 
     def test_q_axis_values(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "a.h5", results_1d={0: result_1d})
+        p = write_nexus(tmp_path / "a.nexus", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
             np.testing.assert_allclose(
                 f["entry/integrated_1d/q"][()], result_1d.radial, rtol=1e-6,
             )
 
     def test_intensity_values_stacked(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "a.h5", results_1d={0: result_1d})
+        p = write_nexus(tmp_path / "a.nexus", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
             stored = f["entry/integrated_1d/intensity"][()]
         assert stored.shape == (1, result_1d.intensity.shape[0])
         np.testing.assert_allclose(stored[0], result_1d.intensity, rtol=1e-6)
 
     def test_sigma_written_when_present(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "a.h5", results_1d={0: result_1d})
+        p = write_nexus(tmp_path / "a.nexus", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
             assert "sigma" in f["entry/integrated_1d"]
             np.testing.assert_allclose(
@@ -993,22 +972,22 @@ class TestWriteNexusResult1D:
         r = IntegrationResult1D(
             radial=np.linspace(0, 5, 50), intensity=np.ones(50), unit="q_A^-1",
         )
-        p = write_nexus(tmp_path / "a.h5", results_1d={0: r})
+        p = write_nexus(tmp_path / "a.nexus", results_1d={0: r})
         with h5py.File(p, "r") as f:
             assert "sigma" not in f["entry/integrated_1d"]
 
     def test_unit_on_q_axis(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "a.h5", results_1d={0: result_1d})
+        p = write_nexus(tmp_path / "a.nexus", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
             assert f["entry/integrated_1d/q"].attrs["units"] == "q_A^-1"
 
     def test_non_integer_frame_key_raises(self, tmp_path, result_1d):
         # The stacked frame_index requires integer frame labels.
         with pytest.raises(ValueError):
-            write_nexus(tmp_path / "a.h5", results_1d={"frame_5": result_1d})
+            write_nexus(tmp_path / "a.nexus", results_1d={"frame_5": result_1d})
 
     def test_multiple_frames_stacked(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "a.h5", results_1d={i: result_1d for i in range(5)})
+        p = write_nexus(tmp_path / "a.nexus", results_1d={i: result_1d for i in range(5)})
         with h5py.File(p, "r") as f:
             assert list(f["entry/integrated_1d/frame_index"][()]) == [0, 1, 2, 3, 4]
             assert f["entry/integrated_1d/intensity"].shape[0] == 5
@@ -1022,12 +1001,12 @@ class TestWriteNexusResult2D:
     """Stacked /entry/integrated_2d layout (read_scan-compatible)."""
 
     def test_group_created(self, tmp_path, result_2d):
-        p = write_nexus(tmp_path / "a.h5", results_2d={0: result_2d})
+        p = write_nexus(tmp_path / "a.nexus", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
             assert "integrated_2d" in f["entry"]
 
     def test_nxdata_class(self, tmp_path, result_2d):
-        p = write_nexus(tmp_path / "a.h5", results_2d={0: result_2d})
+        p = write_nexus(tmp_path / "a.nexus", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
             grp = f["entry/integrated_2d"]
             assert grp.attrs["NX_class"] == "NXdata"
@@ -1035,7 +1014,7 @@ class TestWriteNexusResult2D:
             assert list(grp.attrs["axes"]) == ["frame_index", "chi", "q"]
 
     def test_axes_values(self, tmp_path, result_2d):
-        p = write_nexus(tmp_path / "a.h5", results_2d={0: result_2d})
+        p = write_nexus(tmp_path / "a.nexus", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
             np.testing.assert_allclose(
                 f["entry/integrated_2d/q"][()], result_2d.radial, rtol=1e-6,
@@ -1046,7 +1025,7 @@ class TestWriteNexusResult2D:
 
     def test_intensity_shape_and_orientation(self, tmp_path, result_2d):
         # IntegrationResult2D.intensity is (n_q, n_chi); stored (frame, chi, q).
-        p = write_nexus(tmp_path / "a.h5", results_2d={0: result_2d})
+        p = write_nexus(tmp_path / "a.nexus", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
             stored = f["entry/integrated_2d/intensity"][()]
         n_q, n_chi = result_2d.intensity.shape
@@ -1054,7 +1033,7 @@ class TestWriteNexusResult2D:
         np.testing.assert_allclose(stored[0], result_2d.intensity.T, rtol=1e-6)
 
     def test_intensity_chunked(self, tmp_path, result_2d):
-        p = write_nexus(tmp_path / "a.h5", results_2d={0: result_2d}, compression="lzf")
+        p = write_nexus(tmp_path / "a.nexus", results_2d={0: result_2d}, compression="lzf")
         with h5py.File(p, "r") as f:
             assert f["entry/integrated_2d/intensity"].chunks is not None
 
@@ -1063,12 +1042,12 @@ class TestWriteNexusResult2D:
         chi = np.linspace(-90, 90, 20)
         r = IntegrationResult2D(radial=q, azimuthal=chi, intensity=np.ones((30, 20)),
                                 sigma=np.ones((30, 20)) * 0.1, unit="q_A^-1")
-        p = write_nexus(tmp_path / "a.h5", results_2d={0: r})
+        p = write_nexus(tmp_path / "a.nexus", results_2d={0: r})
         with h5py.File(p, "r") as f:
             assert "sigma" in f["entry/integrated_2d"]
 
     def test_unit_on_q_axis(self, tmp_path, result_2d):
-        p = write_nexus(tmp_path / "a.h5", results_2d={0: result_2d})
+        p = write_nexus(tmp_path / "a.nexus", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
             assert f["entry/integrated_2d/q"].attrs["units"] == "q_A^-1"
 
@@ -1078,77 +1057,114 @@ class TestWriteNexusResult2D:
 # ---------------------------------------------------------------------------
 
 class TestWriteNexusMetadata:
-    def test_energy_written(self, tmp_path, sample_metadata):
-        p = write_nexus(tmp_path / "a.h5", metadata=sample_metadata)
+    def test_energy_written(self, tmp_path, sample_metadata, result_1d):
+        p = write_nexus(
+            tmp_path / "a.nexus", metadata=sample_metadata,
+            results_1d={0: result_1d},
+        )
         with h5py.File(p, "r") as f:
             e = f["entry/instrument/monochromator/energy"][()]
         assert float(e) == pytest.approx(12.0)
 
-    def test_wavelength_written(self, tmp_path, sample_metadata):
-        p = write_nexus(tmp_path / "a.h5", metadata=sample_metadata)
+    def test_wavelength_written(self, tmp_path, sample_metadata, result_1d):
+        p = write_nexus(
+            tmp_path / "a.nexus", metadata=sample_metadata,
+            results_1d={0: result_1d},
+        )
         with h5py.File(p, "r") as f:
             wl = f["entry/instrument/monochromator/wavelength"][()]
         assert float(wl) == pytest.approx(1.033)
 
-    def test_sample_name_written(self, tmp_path, sample_metadata):
-        p = write_nexus(tmp_path / "a.h5", metadata=sample_metadata)
+    def test_sample_name_written(self, tmp_path, sample_metadata, result_1d):
+        p = write_nexus(
+            tmp_path / "a.nexus", metadata=sample_metadata,
+            results_1d={0: result_1d},
+        )
         with h5py.File(p, "r") as f:
             raw = f["entry/sample/name"][()]
         name = raw.decode() if isinstance(raw, bytes) else str(raw)
         assert name == "my_film"
 
-    def test_ub_matrix_written(self, tmp_path, sample_metadata):
-        p = write_nexus(tmp_path / "a.h5", metadata=sample_metadata)
+    def test_ub_matrix_written(self, tmp_path, sample_metadata, result_1d):
+        p = write_nexus(
+            tmp_path / "a.nexus", metadata=sample_metadata,
+            results_1d={0: result_1d},
+        )
         with h5py.File(p, "r") as f:
             ub = f["entry/sample/ub_matrix"][()]
         np.testing.assert_allclose(ub, np.eye(3))
 
-    def test_scan_id_attribute(self, tmp_path, sample_metadata):
-        p = write_nexus(tmp_path / "a.h5", metadata=sample_metadata)
+    def test_scan_id_attribute(self, tmp_path, sample_metadata, result_1d):
+        p = write_nexus(
+            tmp_path / "a.nexus", metadata=sample_metadata,
+            results_1d={0: result_1d},
+        )
         with h5py.File(p, "r") as f:
             assert f["entry"].attrs["scan_id"] == "scan_042"
 
-    def test_motor_arrays_written(self, tmp_path, sample_metadata):
-        p = write_nexus(tmp_path / "a.h5", metadata=sample_metadata)
+    def test_motor_arrays_written(self, tmp_path, sample_metadata, result_1d):
+        p = write_nexus(
+            tmp_path / "a.nexus", metadata=sample_metadata,
+            results_1d={0: result_1d},
+        )
         with h5py.File(p, "r") as f:
             np.testing.assert_allclose(
                 f["entry/data/th"][()], sample_metadata.angles["th"]
             )
 
-    def test_counter_arrays_written(self, tmp_path, sample_metadata):
-        p = write_nexus(tmp_path / "a.h5", metadata=sample_metadata)
+    def test_counter_arrays_written(self, tmp_path, sample_metadata, result_1d):
+        p = write_nexus(
+            tmp_path / "a.nexus", metadata=sample_metadata,
+            results_1d={0: result_1d},
+        )
         with h5py.File(p, "r") as f:
             np.testing.assert_allclose(
                 f["entry/data/i0"][()], sample_metadata.counters["i0"]
             )
 
-    def test_no_ub_matrix_skipped(self, tmp_path):
+    def test_no_ub_matrix_skipped(self, tmp_path, result_1d):
         meta = ScanMetadata(
             scan_id="x", energy=12.0, wavelength=1.033,
             angles={}, counters={}, ub_matrix=None,
         )
-        p = write_nexus(tmp_path / "a.h5", metadata=meta)
+        p = write_nexus(
+            tmp_path / "a.nexus", metadata=meta,
+            results_1d={0: result_1d},
+        )
         with h5py.File(p, "r") as f:
             assert "ub_matrix" not in f["entry/sample"]
 
-    def test_empty_sample_name_skipped(self, tmp_path):
+    def test_empty_sample_name_skipped(self, tmp_path, result_1d):
         meta = ScanMetadata(
             scan_id="x", energy=12.0, wavelength=1.033,
             angles={}, counters={}, sample_name="",
         )
-        p = write_nexus(tmp_path / "a.h5", metadata=meta)
+        p = write_nexus(
+            tmp_path / "a.nexus", metadata=meta,
+            results_1d={0: result_1d},
+        )
         with h5py.File(p, "r") as f:
             assert "name" not in f["entry/sample"]
 
-    def test_roundtrip_metadata(self, tmp_path, sample_metadata):
-        """write_nexus + read_nexus should recover metadata."""
-        p = write_nexus(tmp_path / "scan_042.h5", metadata=sample_metadata)
-        recovered = read_nexus(p)
-        assert recovered.scan_id == "scan_042"
-        np.testing.assert_allclose(recovered.energy, sample_metadata.energy)
-        np.testing.assert_allclose(recovered.wavelength, sample_metadata.wavelength)
-        assert recovered.sample_name == sample_metadata.sample_name
-        np.testing.assert_allclose(recovered.ub_matrix, sample_metadata.ub_matrix)
+    def test_roundtrip_metadata(self, tmp_path, sample_metadata, result_1d):
+        """write_nexus + the processed reader should recover metadata."""
+        from xrd_tools.io import get_metadata
+
+        p = write_nexus(
+            tmp_path / "scan_042.nexus", metadata=sample_metadata,
+            results_1d={0: result_1d},
+        )
+        recovered = get_metadata(p)
+        np.testing.assert_allclose(
+            recovered["energy_keV"], sample_metadata.energy,
+        )
+        np.testing.assert_allclose(
+            recovered["wavelength_A"], sample_metadata.wavelength,
+        )
+        assert recovered["sample_name"] == sample_metadata.sample_name
+        np.testing.assert_allclose(
+            recovered["ub_matrix"], sample_metadata.ub_matrix,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1156,39 +1172,47 @@ class TestWriteNexusMetadata:
 # ---------------------------------------------------------------------------
 
 class TestOpenNexusWriter:
-    def test_returns_open_file(self, tmp_path):
-        h5 = open_nexus_writer(tmp_path / "live.h5")
+    def test_returns_open_file(self, tmp_path, result_1d):
+        h5 = open_nexus_writer(tmp_path / "live.nexus")
         try:
             assert isinstance(h5, h5py.File)
             assert h5.id.valid
+            write_nexus_frame(h5, 0, result_1d=result_1d)
         finally:
             h5.close()
 
-    def test_nxentry_created(self, tmp_path):
-        h5 = open_nexus_writer(tmp_path / "live.h5")
+    def test_nxentry_created(self, tmp_path, result_1d):
+        h5 = open_nexus_writer(tmp_path / "live.nexus")
         try:
             assert "entry" in h5
             assert h5["entry"].attrs["NX_class"] == "NXentry"
+            write_nexus_frame(h5, 0, result_1d=result_1d)
         finally:
             h5.close()
 
-    def test_reduction_group_created(self, tmp_path):
-        h5 = open_nexus_writer(tmp_path / "live.h5")
+    def test_reduction_group_created(self, tmp_path, result_1d):
+        h5 = open_nexus_writer(tmp_path / "live.nexus")
         try:
             assert "entry/reduction" in h5
+            write_nexus_frame(h5, 0, result_1d=result_1d)
         finally:
             h5.close()
 
-    def test_metadata_written_on_open(self, tmp_path, sample_metadata):
-        h5 = open_nexus_writer(tmp_path / "live.h5", metadata=sample_metadata)
+    def test_metadata_written_on_open(
+        self, tmp_path, sample_metadata, result_1d,
+    ):
+        h5 = open_nexus_writer(
+            tmp_path / "live.nexus", metadata=sample_metadata,
+        )
         try:
             assert "entry/instrument/monochromator/energy" in h5
             assert float(h5["entry/instrument/monochromator/energy"][()]) == pytest.approx(12.0)
+            write_nexus_frame(h5, 0, result_1d=result_1d)
         finally:
             h5.close()
 
     def test_overwrite(self, tmp_path, result_1d):
-        p = tmp_path / "live.h5"
+        p = tmp_path / "live.nexus"
         h5 = open_nexus_writer(p)
         write_nexus_frame(h5, 0, result_1d=result_1d)
         h5.close()
@@ -1196,20 +1220,22 @@ class TestOpenNexusWriter:
         h5 = open_nexus_writer(p, overwrite=True)
         try:
             assert "0" not in h5.get("entry/reduction", {})
+            write_nexus_frame(h5, 1, result_1d=result_1d)
         finally:
             h5.close()
 
-    def test_custom_entry(self, tmp_path):
-        h5 = open_nexus_writer(tmp_path / "live.h5", entry="run_1")
+    def test_custom_entry(self, tmp_path, result_1d):
+        h5 = open_nexus_writer(tmp_path / "live.nexus", entry="run_1")
         try:
             assert "run_1" in h5
+            write_nexus_frame(h5, 0, result_1d=result_1d, entry="run_1")
         finally:
             h5.close()
 
 
 class TestWriteNexusFrame:
     def test_writes_1d_result(self, tmp_path, result_1d):
-        p = tmp_path / "live.h5"
+        p = tmp_path / "live.nexus"
         h5 = open_nexus_writer(p)
         try:
             write_nexus_frame(h5, 0, result_1d=result_1d)
@@ -1221,7 +1247,7 @@ class TestWriteNexusFrame:
             )
 
     def test_writes_2d_result(self, tmp_path, result_2d):
-        p = tmp_path / "live.h5"
+        p = tmp_path / "live.nexus"
         h5 = open_nexus_writer(p)
         try:
             write_nexus_frame(h5, 0, result_2d=result_2d)
@@ -1232,7 +1258,7 @@ class TestWriteNexusFrame:
         np.testing.assert_allclose(stored, result_2d.intensity.T, rtol=1e-6)
 
     def test_writes_multiple_frames(self, tmp_path, result_1d):
-        p = tmp_path / "live.h5"
+        p = tmp_path / "live.nexus"
         h5 = open_nexus_writer(p)
         try:
             for i in range(4):
@@ -1251,7 +1277,7 @@ class TestWriteNexusFrame:
         for the case where it differs."""
         r_new = IntegrationResult1D(
             radial=result_1d.radial, intensity=np.full(200, 2.0), unit="q_A^-1")
-        p = tmp_path / "live.h5"
+        p = tmp_path / "live.nexus"
         h5 = open_nexus_writer(p)
         try:
             write_nexus_frame(h5, 0, result_1d=result_1d)
@@ -1269,7 +1295,7 @@ class TestWriteNexusFrame:
         so a frame whose radial grid/unit differs from disk is rejected
         rather than stored under the stale axis (silent corruption)."""
         import pytest
-        p = tmp_path / "live.h5"
+        p = tmp_path / "live.nexus"
         h5 = open_nexus_writer(p)
         try:
             write_nexus_frame(h5, 0, result_1d=result_1d)        # q_A^-1
@@ -1282,7 +1308,7 @@ class TestWriteNexusFrame:
             h5.close()
 
     def test_frame_with_both_1d_and_2d(self, tmp_path, result_1d, result_2d):
-        p = tmp_path / "live.h5"
+        p = tmp_path / "live.nexus"
         h5 = open_nexus_writer(p)
         try:
             write_nexus_frame(h5, 0, result_1d=result_1d, result_2d=result_2d)
@@ -1293,7 +1319,7 @@ class TestWriteNexusFrame:
             assert "integrated_2d" in f["entry"]
 
     def test_flush_does_not_corrupt(self, tmp_path, result_1d):
-        p = tmp_path / "live.h5"
+        p = tmp_path / "live.nexus"
         h5 = open_nexus_writer(p)
         try:
             write_nexus_frame(h5, 0, result_1d=result_1d)
@@ -1306,23 +1332,22 @@ class TestWriteNexusFrame:
             assert list(f["entry/integrated_1d/frame_index"][()]) == [0, 1]
 
     def test_non_integer_frame_key_raises(self, tmp_path, result_1d):
-        p = tmp_path / "live.h5"
+        p = tmp_path / "live.nexus"
         h5 = open_nexus_writer(p)
         try:
             with pytest.raises(ValueError):
                 write_nexus_frame(h5, "frame_007", result_1d=result_1d)
+            write_nexus_frame(h5, 7, result_1d=result_1d)
         finally:
             h5.close()
 
-    def test_no_result_is_noop(self, tmp_path):
-        p = tmp_path / "live.h5"
+    def test_no_result_is_noop_but_terminal_file_is_refused(self, tmp_path):
+        p = tmp_path / "live.nexus"
         h5 = open_nexus_writer(p)
-        try:
-            write_nexus_frame(h5, 0)  # no result_1d, no result_2d
-        finally:
+        write_nexus_frame(h5, 0)  # no result_1d, no result_2d
+        assert "integrated_1d" not in h5["entry"]
+        with pytest.raises(ValueError, match="current xdart .nexus record"):
             h5.close()
-        with h5py.File(p, "r") as f:
-            assert "integrated_1d" not in f["entry"]
 
 
 # ---------------------------------------------------------------------------
@@ -1332,7 +1357,7 @@ class TestWriteNexusFrame:
 class TestRoundtrip:
     def test_1d_full_roundtrip(self, tmp_path, sample_metadata, result_1d):
         p = write_nexus(
-            tmp_path / "scan_042.h5",
+            tmp_path / "scan_042.nexus",
             metadata=sample_metadata,
             results_1d={0: result_1d, 1: result_1d},
         )
@@ -1346,7 +1371,7 @@ class TestRoundtrip:
             assert g["q"].attrs["units"] == "q_A^-1"
 
     def test_2d_full_roundtrip(self, tmp_path, result_2d):
-        p = write_nexus(tmp_path / "scan.h5", results_2d={0: result_2d})
+        p = write_nexus(tmp_path / "scan.nexus", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
             g = f["entry/integrated_2d"]
             np.testing.assert_allclose(g["q"][()], result_2d.radial, rtol=1e-6)
@@ -1354,17 +1379,21 @@ class TestRoundtrip:
             np.testing.assert_allclose(g["intensity"][0], result_2d.intensity.T, rtol=1e-6)
 
     def test_list_entries_after_write(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "scan.h5", results_1d={0: result_1d}, entry="entry_001")
+        p = write_nexus(
+            tmp_path / "scan.nexus",
+            results_1d={0: result_1d},
+            entry="entry_001",
+        )
         entries = list_entries(p)
         assert "entry_001" in entries
 
     def test_incremental_same_as_batch(self, tmp_path, result_1d, result_2d):
         """open_nexus_writer + write_nexus_frame produces the same stacked
         structure as a single write_nexus call."""
-        p_batch = tmp_path / "batch.h5"
+        p_batch = tmp_path / "batch.nexus"
         write_nexus(p_batch, results_1d={0: result_1d}, results_2d={0: result_2d})
 
-        p_incr = tmp_path / "incr.h5"
+        p_incr = tmp_path / "incr.nexus"
         h5 = open_nexus_writer(p_incr)
         try:
             write_nexus_frame(h5, 0, result_1d=result_1d, result_2d=result_2d)
