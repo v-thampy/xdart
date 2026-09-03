@@ -47,7 +47,19 @@ def guess_source_kind(uri: str | Path) -> SourceKind:
     info = classify_image_source(path)
     if info.kind is ImageSourceKind.PROCESSED_XDART or info.kind is ImageSourceKind.THUMBNAIL_ONLY:
         return SourceKind.PROCESSED_NEXUS
-    if path.suffix.lower() in {".h5", ".hdf5", ".nxs", ".nexus", ".cxi"}:
+    hdf_suffix = path.suffix.lower() in {
+        ".h5", ".hdf5", ".nxs", ".nexus", ".cxi",
+    }
+    if info.kind is ImageSourceKind.UNKNOWN and hdf_suffix:
+        # Keep unreadable/partially-landed raw containers on the historical
+        # name-only fallback, but never relabel a schema-marked historical
+        # processed artifact as a raw NeXus stack.
+        from xrd_tools.io.processed_scan_id import (
+            has_processed_output_markers_path,
+        )
+        if has_processed_output_markers_path(path):
+            return SourceKind.UNKNOWN
+    if hdf_suffix:
         return SourceKind.NEXUS_STACK
     if path.suffix.lower() in {".tif", ".tiff"}:
         return SourceKind.IMAGE_FILE

@@ -125,7 +125,15 @@ def test_historical_integrated_nxs_is_negative_only(tmp_path: Path) -> None:
     path = _processed(tmp_path / "historical.nxs", stamp=False, results=True)
     assert has_processed_output_markers_path(path) is True
     assert is_current_processed_xdart_path(path) is False
+    assert guess_source_kind(path) is SourceKind.UNKNOWN
     assert describe_container(path).state is ProbeState.INVALID
+
+
+def test_partially_landed_hdf_keeps_raw_name_only_kind(tmp_path: Path) -> None:
+    path = tmp_path / "landing.h5"
+    path.write_bytes(b"")
+    assert has_processed_output_markers_path(path) is False
+    assert guess_source_kind(path) is SourceKind.NEXUS_STACK
 
 
 def test_current_stamped_nexus_is_positive_processed(tmp_path: Path) -> None:

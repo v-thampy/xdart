@@ -1,4 +1,7 @@
 """Headless scan grouping + composite source + directory discovery."""
+import shutil
+
+import h5py
 import numpy as np
 import pytest
 
@@ -162,6 +165,63 @@ def test_discover_scans_nexus_and_images(tmp_path):
     assert len(img) == 1 and img[0].kind is SourceKind.TIFF_SERIES
 
     assert discover_scans(tmp_path / "nope", "nexus_stack") == []
+
+
+def test_discover_scans_partitions_current_raw_and_historical_processed(
+    tmp_path,
+):
+    from xrd_tools.io.schema import (
+        PROCESSED_SCHEMA_NAME,
+        PROCESSED_SCHEMA_VERSION,
+        SCHEMA_NAME_ATTR,
+        SCHEMA_VERSION_ATTR,
+    )
+
+    def raw(path):
+        with h5py.File(path, "w") as handle:
+            handle.create_dataset(
+                "entry/instrument/detector/data",
+                data=np.ones((2, 4, 5), dtype=np.uint16),
+            )
+        return path
+
+    for suffix in (".h5", ".hdf5", ".nxs"):
+        raw(tmp_path / f"raw{suffix}")
+    (tmp_path / "landing.h5").write_bytes(b"")
+
+    current = tmp_path / "current.nexus"
+    with h5py.File(current, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+        entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+        result = entry.create_group("integrated_2d")
+        result.attrs["NX_class"] = "NXdata"
+        result.attrs["signal"] = "intensity"
+        result.attrs["axes"] = ("frame_index", "chi", "q")
+        result.create_dataset(
+            "frame_index", data=np.arange(2, dtype=np.int64),
+            chunks=(2,), maxshape=(None,),
+        )
+        result.create_dataset(
+            "intensity", data=np.ones((2, 3, 4), dtype=np.float32),
+            chunks=(1, 3, 4), maxshape=(None, 3, 4),
+        )
+        result.create_dataset("chi", data=np.arange(3, dtype=np.float32))
+        result.create_dataset("q", data=np.arange(4, dtype=np.float32))
+    shutil.copyfile(current, tmp_path / "historical.nxs")
+    shutil.copyfile(current, tmp_path / "historical.h5")
+    shutil.copyfile(current, tmp_path / "historical.hdf5")
+
+    processed = discover_scans(tmp_path, SourceKind.PROCESSED_NEXUS)
+    assert [(spec.uri.name, spec.kind) for spec in processed] == [
+        ("current.nexus", SourceKind.PROCESSED_NEXUS),
+    ]
+
+    raw_specs = discover_scans(tmp_path, SourceKind.NEXUS_STACK)
+    assert [spec.uri.name for spec in raw_specs] == [
+        "landing.h5", "raw.h5", "raw.hdf5", "raw.nxs",
+    ]
+    assert all(spec.kind is SourceKind.NEXUS_STACK for spec in raw_specs)
 
 
 def test_discover_scans_uses_natural_file_order(tmp_path):

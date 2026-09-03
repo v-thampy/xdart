@@ -179,6 +179,34 @@ def test_widget_directory_mode_discovers_scans(qapp, tmp_path):
         w.deleteLater()
 
 
+def test_file_picker_includes_current_and_raw_scan_suffixes(
+    qapp, monkeypatch,
+):
+    from pyqtgraph.Qt import QtWidgets
+    from xdart.gui.analysis.scan_source_widget import ScanSourceWidget
+
+    captured = []
+
+    def choose(*args):
+        captured.append(args[-1])
+        return "", ""
+
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", choose)
+    w = ScanSourceWidget(mode="roi")
+    try:
+        w._choose()
+    finally:
+        w.deleteLater()
+
+    sections = captured[0].split(";;")
+    assert sections[0] == "All files (*)"
+    for suffix in (
+        "*.nexus", "*.nxs", "*.h5", "*.hdf5", "*.cxi",
+        "*.tif", "*.tiff", "*.raw",
+    ):
+        assert suffix in sections[1]
+
+
 def test_widget_async_probe_emits_latest_selection(qapp, tmp_path):
     from xdart.gui.analysis.scan_source_widget import (
         ImagePreview, ScanSourceWidget)

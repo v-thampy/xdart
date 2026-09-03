@@ -54,7 +54,7 @@ def discover_scans(directory, kind, *, recursive: bool = False,
     * **SPEC** — every SPEC file (content-detected) × each of its scans →
       ``SourceSpec(spec_file, SPEC, options={"scan": "N.1", ...})``.
     * **NeXus / Eiger / processed NeXus** — every ``.nxs``/``.h5``/``.hdf5``/
-      ``.cxi`` master → one spec each.
+      ``.nexus``/``.cxi`` master → one spec each.
     * **TIFF / RAW image series** — the directory itself as one image series
       (`TiffSeriesSource.from_directory`); per-``_scanN_`` splitting is a future
       refinement.
@@ -93,18 +93,20 @@ def discover_scans(directory, kind, *, recursive: bool = False,
                 out.append(SourceSpec(f, SourceKind.EIGER_MASTER,
                                       options=dict(options)))
                 continue
-            # raw / processed NeXus: skip exact Eiger data sidecars, and classify
-            # each master to its REAL kind so a processed .nxs opens as
-            # PROCESSED_NEXUS (linked raw + scan_data), not a raw stack.
+            # Raw / processed NeXus: skip exact Eiger data sidecars, classify
+            # each master to its real kind, and keep the requested lanes
+            # disjoint.  Only a current .nexus record enters the processed lane;
+            # historical processed markers never fall back to a raw stack.
             if not _nexus_is_candidate(f):
                 continue
             try:
                 actual = guess_source_kind(f)
             except Exception:
-                actual = kind
-            if actual not in (SourceKind.NEXUS_STACK, SourceKind.PROCESSED_NEXUS,
-                              SourceKind.EIGER_MASTER):
-                actual = kind
+                # Name-only/partially-landed raw HDF remains discoverable, but
+                # a processed request never gains authority from a failed probe.
+                actual = SourceKind.NEXUS_STACK
+            if actual is not kind:
+                continue
             out.append(SourceSpec(f, actual, options=dict(options)))
         return out
 

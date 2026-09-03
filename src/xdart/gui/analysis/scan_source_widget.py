@@ -318,7 +318,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
             # All files first/default — SPEC scan files are extensionless.
             path, _ = QtWidgets.QFileDialog.getOpenFileName(
                 self, "Choose a scan", start,
-                "All files (*);;Scans (*.nxs *.h5 *.hdf5 *.cxi *.tif *.tiff *.raw)")
+                "All files (*);;Scans (*.nexus *.nxs *.h5 *.hdf5 *.cxi *.tif *.tiff *.raw)")
         if path:
             remember_browse_path(path)
             self.path_edit.setText(path)
