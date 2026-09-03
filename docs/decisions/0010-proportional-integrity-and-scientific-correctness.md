@@ -56,6 +56,18 @@ implementation, or a permanent test matrix.  Reviewer concern, a theoretical
 possibility, or the mere existence of a prototype is not implicit approval.
 Until that decision is recorded, the proposed safeguard remains unimplemented.
 
+A nomination to the project owner must name the supported workflow, concrete
+evidence, plausible likelihood and impact, why the normal immutable-source
+model is insufficient, the smallest proposed safeguard, and its code, test,
+performance, and maintenance cost.  The recorded owner disposition is one of
+approve, reject, or defer; silence is not approval.
+
+Existing mechanisms are not grandfathered.  During simplification, a mechanism
+that cannot be justified as scientific correctness, ordinary bounded-resource
+ownership, or a cheap local guard must be presented through the same owner gate.
+Without an explicit approval record, it is a removal candidate together with
+its mechanism-specific tests.
+
 The burden of proof belongs to the extra mechanism.  A rare edge case does not
 justify a large permanent state machine by default.  Cheap, local guards may
 still be worthwhile; complexity must remain proportional to the demonstrated
