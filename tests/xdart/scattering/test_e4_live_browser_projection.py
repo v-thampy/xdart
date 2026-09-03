@@ -7,6 +7,7 @@ from threading import Event, Thread
 import time
 from types import SimpleNamespace
 
+import numpy as np
 from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 import pytest
 
@@ -46,6 +47,35 @@ from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 
 from tests.xdart.scattering.e3_shell_support import make_shell_projection
+
+
+def _one_frame_dynamic_admission(tmp_path):
+    from xdart.gui.tabs.scattering.contracts import (
+        AdmittedOutput, OutputDisposition, OutputFact, PlannedOutput,
+    )
+    from xrd_tools.core.scan import Scan, ScanFrame, SourceKind
+    from xrd_tools.sources.descriptor import ContainerDescriptor
+    from xrd_tools.sources.execution_graph import SourceExecutionStamp, SourceFileState
+    from xrd_tools.sources.selection import image_series_spec
+
+    source = tmp_path / "frame_0001.tif"
+    source.write_bytes(b"raw")
+    spec = image_series_spec(source, metadata_format=None)
+    state = SourceFileState.capture(source)
+    stamp = SourceExecutionStamp(state, "tiff_series", 1, 1, members=(state,))
+    descriptor = ContainerDescriptor(
+        source, kind=SourceKind.TIFF_SERIES, frame_count=1,
+        frame_shape=(4, 4), dtype=np.dtype("uint16"),
+    )
+    item = PlannedOutput(
+        spec, source, tmp_path / "result.nexus", stamp, descriptor=descriptor,
+    )
+    decision = AdmittedOutput(
+        item, OutputDisposition.WRITE, (1,), OutputFact(False),
+    )
+    return Scan(
+        "scan", [ScanFrame(1, source_path=source, source_frame_index=0)],
+    ), item, decision
 
 
 def test_heavy_residency_menu_is_exclusive_and_edits_only_next_intent():
@@ -105,7 +135,10 @@ def test_explicit_heavy_residency_requests_all_three_bounds_without_env_mutation
     descriptor = SimpleNamespace(
         frame_shape=(4, 4), dtype=dynamic_output.np.dtype("uint16")
     )
-    item = SimpleNamespace(descriptor=descriptor)
+    item = SimpleNamespace(
+        descriptor=descriptor,
+        source_stamp=SimpleNamespace(frame_count=1),
+    )
     scan = SimpleNamespace(frames=(SimpleNamespace(index=1, image=None),))
     plan = SimpleNamespace(integration_1d=None, integration_2d=None, gi=None)
     policy, *_ = dynamic_output._light_policy_layout(
@@ -147,7 +180,10 @@ def test_dynamic_policy_widens_only_standard_four_worker_grants(monkeypatch):
     descriptor = SimpleNamespace(
         frame_shape=(2167, 2070), dtype=dynamic_output.np.dtype("uint32")
     )
-    item = SimpleNamespace(descriptor=descriptor, source_stamp=None)
+    item = SimpleNamespace(
+        descriptor=descriptor,
+        source_stamp=SimpleNamespace(frame_count=1),
+    )
     scan = SimpleNamespace(frames=(SimpleNamespace(index=1, image=None),))
     plan = ReductionPlan(
         integration_1d=Integration1DPlan(npt=1000),
@@ -386,7 +422,10 @@ def test_post_g2_output_diagnostics_are_exact_private_v2_values():
         )
 
 
-def test_post_g2_pipeline_refuses_before_dynamic_activation_effects(monkeypatch):
+def test_post_g2_pipeline_refuses_before_dynamic_activation_effects(
+    monkeypatch,
+    tmp_path,
+):
     from xdart.gui.tabs.scattering.adapters import dynamic_output
 
     touched = []
@@ -415,13 +454,18 @@ def test_post_g2_pipeline_refuses_before_dynamic_activation_effects(monkeypatch)
             },
         }).freeze(),
     )
+    scan, item, decision = _one_frame_dynamic_admission(tmp_path)
+    plan = SimpleNamespace(integration_1d=None, integration_2d=None, gi=None)
     for configuration in configurations:
         adapter = dynamic_output.DynamicOutputAdapter(configuration)
         with pytest.raises((TypeError, ValueError)):
-            adapter.activate(
-                SimpleNamespace(frames=()), SimpleNamespace(),
-                SimpleNamespace(), SimpleNamespace(),
-                record_store=object(), run_provenance={},
+            adapter.prepare_admission(
+                scan,
+                plan,
+                item,
+                decision,
+                Event(),
+                qualify=lambda _policy, prior: prior,
             )
         assert adapter._science_identity is None
         assert adapter._graphs == {}
@@ -450,21 +494,30 @@ def test_auto_fact_survives_post_allocation_failure_and_reaches_terminal(
     monkeypatch.setattr(dynamic_output, "_stable_lineage", lambda *_: ("auto",))
     monkeypatch.setattr(dynamic_output, "_append_intent", lambda *_a, **_k: SimpleNamespace(modes=()))
     monkeypatch.setattr(dynamic_output, "required_result_modes", lambda *_: ())
-    frame = SimpleNamespace(index=1, image=None)
-    item = SimpleNamespace(target=tmp_path / "auto.nxs", descriptor=SimpleNamespace(frame_shape=(4, 4), dtype=dynamic_output.np.dtype("uint16")), source_stamp=SimpleNamespace(frame_count=1, first_label=1))
+    scan, item, decision = _one_frame_dynamic_admission(tmp_path)
     plan = SimpleNamespace(integration_1d=None, integration_2d=SimpleNamespace(npt_rad=2, npt_azim=2, error_model=None), gi=None); facts = []
     bound = []
     def fail_bind(allocation):
         bound.append(allocation)
         raise RuntimeError("injected post-allocation failure")
     caplog.set_level(logging.INFO)
+    adapter = dynamic_output.DynamicOutputAdapter(configuration)
+    preparation = adapter.prepare_admission(
+        scan,
+        plan,
+        item,
+        decision,
+        Event(),
+        qualify=lambda _policy, prior: prior,
+    )
     try:
-        dynamic_output.DynamicOutputAdapter(configuration).activate(
-            SimpleNamespace(frames=(frame,)), plan, item, object(),
+        adapter.activate(
+            preparation,
             record_store=object(), run_provenance={}, publication_store=object(), display_owner=object(),
             display_state=state, source_owner=SimpleNamespace(bind_allocation=fail_bind), gui_thread_id=1,
             light_cancel=lambda: None, light_drain=lambda: None, light_verify=lambda: None,
             on_frame_completed=lambda _event: None, resource_fact_sink=facts.append,
+            on_checkpoint_recoverable=lambda _event: None,
         )
     except RuntimeError as error: assert str(error) == "injected post-allocation failure"
     else: raise AssertionError("post-allocation failure was not injected")
