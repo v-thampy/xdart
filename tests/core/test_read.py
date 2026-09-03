@@ -1,6 +1,6 @@
 """Tests for the notebook-friendly convenience readers (``io.read``).
 
-Hand-crafts a small v2 NXroot with pure h5py (no xdart dependency) and
+Creates a small current record through the production NeXus writer and
 round-trips it through ``get_1d`` / ``get_2d`` / ``get_thumbnail`` /
 ``get_metadata`` / ``get_frames`` and the ``ProcessedScan`` sugar.
 
@@ -15,6 +15,7 @@ import h5py
 import numpy as np
 import pytest
 
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.io import (
     Integrated1D,
     Integrated2D,
@@ -26,6 +27,7 @@ from xrd_tools.io import (
     get_thumbnail,
     open_scan,
 )
+from xrd_tools.io.nexus import write_nexus
 
 N_FRAMES = 5
 N_Q = 64
@@ -35,32 +37,65 @@ FRAME_LABELS = np.array([1, 2, 4, 7, 8], dtype=np.int64)  # gapped, 1-based
 ENERGY_KEV = 12.0
 
 
-def _stamp_current_entry(entry):
-    entry.attrs["NX_class"] = "NXentry"
-    entry.attrs["ssrl_schema"] = "xrd_tools.processed_scan"
-    entry.attrs["ssrl_schema_version"] = 2
+def _write_current_scan(
+    path,
+    *,
+    labels=(0,),
+    q=None,
+    intensity_1d=None,
+    sigma_1d=None,
+    labels_2d=None,
+    q_2d=None,
+    chi=None,
+    intensity_2d=None,
+):
+    """Create a current processed record through the production writer."""
+    labels = [int(value) for value in labels]
+    q = np.asarray(
+        np.linspace(0.5, 1.0, 2) if q is None else q,
+        dtype=float,
+    )
+    if intensity_1d is None:
+        intensity_1d = np.zeros((len(labels), len(q)), dtype=np.float32)
+    intensity_1d = np.asarray(intensity_1d)
+    if sigma_1d is not None:
+        sigma_1d = np.asarray(sigma_1d)
+    results_1d = {
+        label: IntegrationResult1D(
+            radial=q,
+            intensity=intensity_1d[row],
+            sigma=None if sigma_1d is None else sigma_1d[row],
+            unit="q_A^-1",
+        )
+        for row, label in enumerate(labels)
+    }
 
+    results_2d = None
+    if labels_2d is not None:
+        labels_2d = [int(value) for value in labels_2d]
+        q_2d = np.asarray(q if q_2d is None else q_2d, dtype=float)
+        chi = np.asarray(chi, dtype=float)
+        intensity_2d = np.asarray(intensity_2d)
+        results_2d = {
+            label: IntegrationResult2D(
+                radial=q_2d,
+                azimuthal=chi,
+                # Containers use (q, chi); the persisted/read form is
+                # (chi, q).
+                intensity=intensity_2d[row].T,
+                unit="q_A^-1",
+                azimuthal_unit="chi_deg",
+            )
+            for row, label in enumerate(labels_2d)
+        }
 
-def _stamp_current_1d(group):
-    group.attrs["NX_class"] = "NXdata"
-    group.attrs["signal"] = "intensity"
-    group.attrs["axes"] = ("frame_index", "q")
-
-
-def _stamp_current_2d(group):
-    group.attrs["NX_class"] = "NXdata"
-    group.attrs["signal"] = "intensity"
-    group.attrs["axes"] = ("frame_index", "chi", "q")
-
-
-def _add_minimal_current_1d(entry, labels):
-    labels = np.asarray(labels, dtype=np.int64)
-    group = entry.create_group("integrated_1d")
-    _stamp_current_1d(group)
-    group.create_dataset("intensity", data=np.zeros((len(labels), 2), dtype=np.float32))
-    group.create_dataset("q", data=np.linspace(0.5, 1.0, 2, dtype=np.float32))
-    group.create_dataset("frame_index", data=labels)
-    return group
+    write_nexus(
+        path,
+        results_1d=results_1d,
+        results_2d=results_2d,
+        compression=None,
+        overwrite=True,
+    )
 
 
 @pytest.fixture
@@ -77,33 +112,19 @@ def scan_file(tmp_path):
     thumbs = rng.random((N_FRAMES, N_THUMB, N_THUMB), dtype=np.float32)
     eta = np.linspace(0.0, 1.0, N_FRAMES, dtype=np.float32)
 
-    with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        e.attrs["NX_class"] = "NXentry"
-        e.attrs["ssrl_schema"] = "xrd_tools.processed_scan"
-        e.attrs["ssrl_schema_version"] = 2
-
-        g1 = e.create_group("integrated_1d")
-        g1.attrs["NX_class"] = "NXdata"
-        g1.attrs["signal"] = "intensity"
-        g1.attrs["axes"] = ("frame_index", "q")
-        g1.create_dataset("intensity", data=intensity_1d)
-        g1.create_dataset("sigma", data=sigma_1d)
-        qd = g1.create_dataset("q", data=q)
-        qd.attrs["units"] = "1/angstrom"
-        g1.create_dataset("frame_index", data=FRAME_LABELS)
-
-        g2 = e.create_group("integrated_2d")
-        g2.attrs["NX_class"] = "NXdata"
-        g2.attrs["signal"] = "intensity"
-        g2.attrs["axes"] = ("frame_index", "chi", "q")
-        g2.create_dataset("intensity", data=intensity_2d)
-        q2d = g2.create_dataset("q", data=q2)
-        q2d.attrs["units"] = "1/angstrom"
-        cd = g2.create_dataset("chi", data=chi)
-        cd.attrs["units"] = "deg"
-        g2.create_dataset("frame_index", data=FRAME_LABELS)
-
+    _write_current_scan(
+        p,
+        labels=FRAME_LABELS,
+        q=q,
+        intensity_1d=intensity_1d,
+        sigma_1d=sigma_1d,
+        labels_2d=FRAME_LABELS,
+        q_2d=q2,
+        chi=chi,
+        intensity_2d=intensity_2d,
+    )
+    with h5py.File(p, "r+") as f:
+        e = f["entry"]
         sp = e.create_group("sample/positioners")
         pg = sp.create_group("eta")
         pg.attrs["NX_class"] = "NXpositioner"
@@ -139,7 +160,7 @@ def test_get_1d_single_frame_by_label(scan_file):
     assert r.intensity.shape == (N_Q,)
     np.testing.assert_array_equal(r.intensity, ref["intensity_1d"][2])
     np.testing.assert_array_equal(r.sigma, ref["sigma_1d"][2])
-    assert r.q_unit == "1/angstrom"
+    assert r.q_unit == "q_A^-1"
 
 
 def test_get_1d_all_frames(scan_file):
@@ -166,7 +187,7 @@ def test_get_2d_single_frame(scan_file):
     assert r.intensity.shape == (N_CHI, N_Q)
     np.testing.assert_array_equal(r.intensity, ref["intensity_2d"][4])
     assert r.chi.shape == (N_CHI,)
-    assert r.chi_unit == "deg"
+    assert r.chi_unit == "chi_deg"
 
 
 def test_get_2d_all_frames(scan_file):
@@ -216,14 +237,13 @@ def test_get_metadata_positioners_vs_scan_data_split(tmp_path):
          "mon": [33.0, 34.0, 35.0]},
         index=[0, 1, 2],
     )
-    with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        _stamp_current_entry(e)
-        g = e.create_group("integrated_1d")
-        _stamp_current_1d(g)
-        g.create_dataset("intensity", data=np.zeros((3, 4), dtype=np.float32))
-        g.create_dataset("q", data=np.linspace(0.5, 5.0, 4, dtype=np.float32))
-        g.create_dataset("frame_index", data=np.array([0, 1, 2], dtype=np.int64))
+    _write_current_scan(
+        p,
+        labels=[0, 1, 2],
+        q=np.linspace(0.5, 5.0, 4, dtype=np.float32),
+    )
+    with h5py.File(p, "r+") as f:
+        e = f["entry"]
         write_scan_metadata(e, sd, [0, 1, 2])          # full table → /entry/scan_data
         pg = e.create_group("sample/positioners/th")   # th ALSO a geometry motor
         pg.attrs["NX_class"] = "NXpositioner"
@@ -247,10 +267,9 @@ def test_read_scan_data_all_and_aligned(tmp_path):
     p = tmp_path / "sd.nexus"
     sd = pd.DataFrame(
         {"th": [0.1, 0.2, 0.3], "i0": [1e6, 1.1e6, 1.2e6]}, index=[0, 1, 2])
-    with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        _stamp_current_entry(e)
-        _add_minimal_current_1d(e, [0, 1, 2])
+    _write_current_scan(p, labels=[0, 1, 2])
+    with h5py.File(p, "r+") as f:
+        e = f["entry"]
         write_scan_metadata(e, sd, [0, 1, 2])
 
     # frames=None -> all columns incl frame_index, natural order
@@ -266,10 +285,7 @@ def test_read_scan_data_all_and_aligned(tmp_path):
 
     # no scan_data -> {}
     p2 = tmp_path / "empty.nexus"
-    with h5py.File(p2, "w") as f:
-        e = f.create_group("entry")
-        _stamp_current_entry(e)
-        _add_minimal_current_1d(e, [0])
+    _write_current_scan(p2, labels=[0])
     assert read_scan_data(p2) == {}
 
 
@@ -279,13 +295,14 @@ def test_mismatched_positioner_length_is_skipped_not_fatal(tmp_path):
     with a warning, not crash the whole reader."""
     from xrd_tools.io.nexus import read_scan, read_scan_metadata
 
-    p = tmp_path / "mismatch.nxs"
-    with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        g1 = e.create_group("integrated_1d")
-        g1.create_dataset("intensity", data=np.zeros((4, 8), dtype="f4"))
-        g1.create_dataset("q", data=np.linspace(1, 5, 8))
-        g1.create_dataset("frame_index", data=np.arange(4, dtype="i4"))
+    p = tmp_path / "mismatch.nexus"
+    _write_current_scan(
+        p,
+        labels=range(4),
+        q=np.linspace(1, 5, 8),
+    )
+    with h5py.File(p, "r+") as f:
+        e = f["entry"]
         # 'th' positioner with only 2 values for a 4-frame scan.
         sp = e.create_group("sample/positioners")
         pg = sp.create_group("th")
@@ -320,24 +337,17 @@ def test_get_2d_resolves_against_its_own_frame_labels(tmp_path):
     """When 1D and 2D were reduced over different frame labels, get_2d must
     index integrated_2d's own frame_index (not integrated_1d's)."""
     p = tmp_path / "diff_labels.nexus"
-    with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        _stamp_current_entry(e)
-        g1 = e.create_group("integrated_1d")
-        _stamp_current_1d(g1)
-        g1.create_dataset("intensity", data=np.zeros((3, 5), dtype="f4"))
-        g1.create_dataset("q", data=np.linspace(1, 5, 5, dtype=np.float32))
-        g1.create_dataset("frame_index", data=np.array([0, 1, 2], dtype=np.int64))
-        g2 = e.create_group("integrated_2d")
-        _stamp_current_2d(g2)
-        # distinct value per 2D row so we can tell which one we got
-        i2 = np.stack([np.full((4, 5), float(k)) for k in range(3)]).astype("f4")
-        g2.create_dataset("intensity", data=i2)
-        g2.create_dataset("q", data=np.linspace(1, 5, 5, dtype=np.float32))
-        g2.create_dataset(
-            "chi", data=np.linspace(-180, 180, 4, endpoint=False, dtype=np.float32)
-        )
-        g2.create_dataset("frame_index", data=np.array([10, 11, 12], dtype=np.int64))
+    # Distinct value per 2D row so we can tell which one we got.
+    i2 = np.stack([np.full((4, 5), float(k)) for k in range(3)]).astype("f4")
+    _write_current_scan(
+        p,
+        labels=[0, 1, 2],
+        q=np.linspace(1, 5, 5, dtype=np.float32),
+        labels_2d=[10, 11, 12],
+        q_2d=np.linspace(1, 5, 5, dtype=np.float32),
+        chi=np.linspace(-180, 180, 4, endpoint=False, dtype=np.float32),
+        intensity_2d=i2,
+    )
 
     # 2D label 11 → row 1 (value 1.0 everywhere); must NOT raise or pick row 0.
     r = get_2d(p, frame=11)
@@ -377,14 +387,13 @@ def test_get_raw_frame_resolves_source_pointer(tmp_path):
         f.create_dataset("entry/data/data", data=raw)
 
     nxs = tmp_path / "scan.nexus"
-    with h5py.File(nxs, "w") as f:
-        e = f.create_group("entry")
-        _stamp_current_entry(e)
-        g = e.create_group("integrated_1d")
-        _stamp_current_1d(g)
-        g.create_dataset("intensity", data=np.zeros((1, 5), dtype=np.float32))
-        g.create_dataset("q", data=np.linspace(0.5, 2.0, 5, dtype=np.float32))
-        g.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
+    _write_current_scan(
+        nxs,
+        labels=[0],
+        q=np.linspace(0.5, 2.0, 5, dtype=np.float32),
+    )
+    with h5py.File(nxs, "r+") as f:
+        e = f["entry"]
         s = e.create_group("frames/frame_0000/source")
         s.create_dataset("path", data=np.bytes_(b"scan_master.h5"))
         s.create_dataset("frame_index", data=1)  # → master frame 1
@@ -407,14 +416,13 @@ def test_get_raw_frame_resolves_absolute_source_pointer(tmp_path):
         f.create_dataset("entry/data/data", data=raw)
 
     nxs = processed_dir / "scan.nexus"
-    with h5py.File(nxs, "w") as f:
-        e = f.create_group("entry")
-        _stamp_current_entry(e)
-        g = e.create_group("integrated_1d")
-        _stamp_current_1d(g)
-        g.create_dataset("intensity", data=np.zeros((1, 5), dtype=np.float32))
-        g.create_dataset("q", data=np.linspace(0.5, 2.0, 5, dtype=np.float32))
-        g.create_dataset("frame_index", data=np.array([3], dtype=np.int64))
+    _write_current_scan(
+        nxs,
+        labels=[3],
+        q=np.linspace(0.5, 2.0, 5, dtype=np.float32),
+    )
+    with h5py.File(nxs, "r+") as f:
+        e = f["entry"]
         s = e.create_group("frames/frame_0003/source")
         s.create_dataset("path", data=np.bytes_(str(master).encode()))
         s.create_dataset("frame_index", data=1)
@@ -433,24 +441,13 @@ def test_get_raw_frame_does_not_guess_sibling_basename(tmp_path):
         f.create_dataset("entry/data/data", data=raw)
 
     nxs = processed_dir / "scan.nexus"
-    with h5py.File(nxs, "w") as f:
-        e = f.create_group("entry")
-        _stamp_current_entry(e)
-        g = e.create_group("integrated_1d")
-        _stamp_current_1d(g)
-        g.create_dataset(
-            "intensity",
-            data=np.zeros((1, 5), dtype=np.float32),
-            chunks=True,
-            maxshape=(None, 5),
-        )
-        g.create_dataset("q", data=np.linspace(0.5, 2.0, 5, dtype=np.float32))
-        g.create_dataset(
-            "frame_index",
-            data=np.array([7], dtype=np.int64),
-            chunks=True,
-            maxshape=(None,),
-        )
+    _write_current_scan(
+        nxs,
+        labels=[7],
+        q=np.linspace(0.5, 2.0, 5, dtype=np.float32),
+    )
+    with h5py.File(nxs, "r+") as f:
+        e = f["entry"]
         s = e.create_group("frames/frame_0007/source")
         s.create_dataset("path", data=np.bytes_(b"old/raw/scan_master.h5"))
         s.create_dataset("frame_index", data=0)
@@ -465,14 +462,13 @@ def test_get_raw_frame_falls_back_to_thumbnail(tmp_path):
     from xrd_tools.io import get_raw_frame
 
     nxs = tmp_path / "scan.nexus"
-    with h5py.File(nxs, "w") as f:
-        e = f.create_group("entry")
-        _stamp_current_entry(e)
-        g = e.create_group("integrated_1d")
-        _stamp_current_1d(g)
-        g.create_dataset("intensity", data=np.zeros((1, 5), dtype=np.float32))
-        g.create_dataset("q", data=np.linspace(0.5, 2.0, 5, dtype=np.float32))
-        g.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
+    _write_current_scan(
+        nxs,
+        labels=[0],
+        q=np.linspace(0.5, 2.0, 5, dtype=np.float32),
+    )
+    with h5py.File(nxs, "r+") as f:
+        e = f["entry"]
         s = e.create_group("frames/frame_0000/source")
         s.create_dataset("path", data=np.bytes_(b"does_not_exist.h5"))
         s.create_dataset("frame_index", data=0)
@@ -493,14 +489,13 @@ def test_open_scan_strict_raw_does_not_use_thumbnail(tmp_path):
     from xrd_tools.io import get_raw_frame, open_scan
 
     nxs = tmp_path / "scan.nexus"
-    with h5py.File(nxs, "w") as f:
-        e = f.create_group("entry")
-        _stamp_current_entry(e)
-        g1 = e.create_group("integrated_1d")
-        _stamp_current_1d(g1)
-        g1.create_dataset("intensity", data=np.zeros((1, 5), dtype=np.float32))
-        g1.create_dataset("q", data=np.linspace(0.5, 2.0, 5, dtype=np.float32))
-        g1.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
+    _write_current_scan(
+        nxs,
+        labels=[0],
+        q=np.linspace(0.5, 2.0, 5, dtype=np.float32),
+    )
+    with h5py.File(nxs, "r+") as f:
+        e = f["entry"]
         s = e.create_group("frames/frame_0000/source")
         s.create_dataset("path", data=np.bytes_(b"missing_master.h5"))
         s.create_dataset("frame_index", data=0)
@@ -518,20 +513,19 @@ def test_open_scan_frame_source_uses_union_labels_and_scan_data(tmp_path):
     from xrd_tools.io import open_scan
 
     nxs = tmp_path / "mixed_outputs.nexus"
-    with h5py.File(nxs, "w") as f:
-        e = f.create_group("entry")
-        _stamp_current_entry(e)
-        g1 = e.create_group("integrated_1d")
-        _stamp_current_1d(g1)
-        g1.create_dataset("intensity", data=np.zeros((2, 5), dtype=np.float32))
-        g1.create_dataset("q", data=np.linspace(0.5, 2.0, 5, dtype=np.float32))
-        g1.create_dataset("frame_index", data=np.array([0, 2], dtype=np.int64))
-        g2 = e.create_group("integrated_2d")
-        _stamp_current_2d(g2)
-        g2.create_dataset("intensity", data=np.zeros((2, 3, 5), dtype=np.float32))
-        g2.create_dataset("q", data=np.linspace(0.5, 2.0, 5, dtype=np.float32))
-        g2.create_dataset("chi", data=np.linspace(-1.0, 1.0, 3, dtype=np.float32))
-        g2.create_dataset("frame_index", data=np.array([1, 2], dtype=np.int64))
+    q = np.linspace(0.5, 2.0, 5, dtype=np.float32)
+    chi = np.linspace(-1.0, 1.0, 3, dtype=np.float32)
+    _write_current_scan(
+        nxs,
+        labels=[0, 2],
+        q=q,
+        labels_2d=[1, 2],
+        q_2d=q,
+        chi=chi,
+        intensity_2d=np.zeros((2, 3, 5), dtype=np.float32),
+    )
+    with h5py.File(nxs, "r+") as f:
+        e = f["entry"]
         sd = e.create_group("scan_data")
         sd.create_dataset("frame_index", data=np.array([0, 1, 2, 99], dtype=np.int64))
         sd.create_dataset("th", data=np.array([0.1, 0.2, 0.3, 9.9]))
@@ -550,6 +544,7 @@ def test_read_image_rejects_processed_file(tmp_path):
     """read_image must not mis-read a processed scan's integrated_1d as a
     raw detector image — it raises pointing at get_raw_frame instead."""
     from xrd_tools.io.image import read_image
+    from xrd_tools.io.processed_scan_id import ProcessedXdartInputError
 
     nxs = tmp_path / "processed.nxs"
     with h5py.File(nxs, "w") as f:
@@ -558,13 +553,13 @@ def test_read_image_rejects_processed_file(tmp_path):
         g.create_dataset("intensity", data=np.zeros((1, 2000)))  # (1, n_q)
         g.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
 
-    with pytest.raises(ValueError, match="processed xdart"):
+    with pytest.raises(ProcessedXdartInputError, match="processed-output markers"):
         read_image(nxs, frame=0)
 
     from xrd_tools.io.image import read_image_stack
-    with pytest.raises(ValueError, match="processed xdart"):
+    with pytest.raises(ProcessedXdartInputError, match="processed-output markers"):
         read_image_stack(nxs)
-    with pytest.raises(ValueError, match="processed xdart"):
+    with pytest.raises(ProcessedXdartInputError, match="processed-output markers"):
         read_image_stack(nxs, reduce="mean")
 
 
@@ -651,19 +646,19 @@ def test_scan_metadata_full_table_round_trips(tmp_path):
     import pandas as pd
     from xrd_tools.io import write_scan_metadata, read_scan, read_scan_metadata
 
-    p = tmp_path / "meta.nxs"
+    p = tmp_path / "meta.nexus"
     sd = pd.DataFrame(
         {"i0": [1e6, 1.1e6, 1.2e6], "mon": [33.6, 34.1, 35.0],
          "th": [0.1, 0.15, 0.2], "TEMP": [300.0, 301.0, 302.0]},
         index=[0, 2, 5],  # gapped labels
     )
-    with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        g = e.create_group("integrated_1d")
-        g.attrs["NX_class"] = "NXdata"; g.attrs["signal"] = "intensity"
-        g.create_dataset("intensity", data=np.zeros((3, 10)))
-        g.create_dataset("q", data=np.linspace(0.5, 5.0, 10))
-        g.create_dataset("frame_index", data=np.array([0, 2, 5], dtype=np.int64))
+    _write_current_scan(
+        p,
+        labels=[0, 2, 5],
+        q=np.linspace(0.5, 5.0, 10),
+    )
+    with h5py.File(p, "r+") as f:
+        e = f["entry"]
         write_scan_metadata(e, sd, [0, 2, 5])
 
     ds = read_scan(p, groups=("1d",))
@@ -681,15 +676,15 @@ def test_scan_metadata_dedupes_positioners(tmp_path):
     import pandas as pd
     from xrd_tools.io import write_scan_metadata, read_scan
 
-    p = tmp_path / "dedup.nxs"
+    p = tmp_path / "dedup.nexus"
     sd = pd.DataFrame({"th": [0.1, 0.2], "i0": [1e6, 2e6]}, index=[0, 1])
-    with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        g = e.create_group("integrated_1d")
-        g.attrs["NX_class"] = "NXdata"; g.attrs["signal"] = "intensity"
-        g.create_dataset("intensity", data=np.zeros((2, 4)))
-        g.create_dataset("q", data=np.linspace(0.5, 5.0, 4))
-        g.create_dataset("frame_index", data=np.array([0, 1], dtype=np.int64))
+    _write_current_scan(
+        p,
+        labels=[0, 1],
+        q=np.linspace(0.5, 5.0, 4),
+    )
+    with h5py.File(p, "r+") as f:
+        e = f["entry"]
         write_scan_metadata(e, sd, [0, 1])
         # a positioners group that also carries th (geometry motor)
         pg = e.create_group("sample/positioners/th")
@@ -708,14 +703,14 @@ def test_stale_scan_data_column_falls_back_to_positioner(tmp_path):
     import h5py
     from xrd_tools.io import write_scan_metadata, read_scan
 
-    p = tmp_path / "stale.nxs"
-    with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        g = e.create_group("integrated_1d")
-        g.attrs["NX_class"] = "NXdata"; g.attrs["signal"] = "intensity"
-        g.create_dataset("intensity", data=np.zeros((3, 4)))   # 3 frames
-        g.create_dataset("q", data=np.linspace(0.5, 5.0, 4))
-        g.create_dataset("frame_index", data=np.array([0, 1, 2], dtype=np.int64))
+    p = tmp_path / "stale.nexus"
+    _write_current_scan(
+        p,
+        labels=[0, 1, 2],
+        q=np.linspace(0.5, 5.0, 4),
+    )
+    with h5py.File(p, "r+") as f:
+        e = f["entry"]
         # scan_data 'th' is STALE — only 2 rows for 3 frames (length mismatch).
         sd_grp = e.create_group("scan_data")
         sd_grp.attrs["NX_class"] = "NXcollection"
@@ -742,14 +737,14 @@ def test_scan_data_aligned_by_label_not_position(tmp_path):
     import h5py
     from xrd_tools.io import read_scan
 
-    p = tmp_path / "reorder.nxs"
-    with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        g = e.create_group("integrated_1d")
-        g.attrs["NX_class"] = "NXdata"; g.attrs["signal"] = "intensity"
-        g.create_dataset("intensity", data=np.zeros((2, 4)))
-        g.create_dataset("q", data=np.linspace(0.5, 5.0, 4))
-        g.create_dataset("frame_index", data=np.array([0, 2], dtype=np.int64))
+    p = tmp_path / "reorder.nexus"
+    _write_current_scan(
+        p,
+        labels=[0, 2],
+        q=np.linspace(0.5, 5.0, 4),
+    )
+    with h5py.File(p, "r+") as f:
+        e = f["entry"]
         # scan_data covers the same labels {0, 2} but stored 2-then-0.
         sd = e.create_group("scan_data")
         sd.attrs["NX_class"] = "NXcollection"
@@ -766,13 +761,14 @@ def test_partial_thumbnails_use_independent_frame_coordinate(tmp_path):
     import h5py
     from xrd_tools.io import read_scan
 
-    p = tmp_path / "partial_thumbnails.nxs"
-    with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        g = e.create_group("integrated_1d")
-        g.create_dataset("intensity", data=np.zeros((2, 4)))
-        g.create_dataset("q", data=np.linspace(0.5, 5.0, 4))
-        g.create_dataset("frame_index", data=np.array([2, 0], dtype=np.int64))
+    p = tmp_path / "partial_thumbnails.nexus"
+    _write_current_scan(
+        p,
+        labels=[0, 2],
+        q=np.linspace(0.5, 5.0, 4),
+    )
+    with h5py.File(p, "r+") as f:
+        e = f["entry"]
         fg = e.create_group("frames/frame_0002")
         fg.create_dataset("thumbnail", data=np.ones((3, 4), dtype=np.uint8))
 
@@ -786,13 +782,14 @@ def test_scan_data_duplicate_labels_rejected(tmp_path):
     import pytest
     from xrd_tools.io import read_scan
 
-    p = tmp_path / "duplicate_metadata.nxs"
-    with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        g = e.create_group("integrated_1d")
-        g.create_dataset("intensity", data=np.zeros((2, 4)))
-        g.create_dataset("q", data=np.linspace(0.5, 5.0, 4))
-        g.create_dataset("frame_index", data=np.array([0, 1], dtype=np.int64))
+    p = tmp_path / "duplicate_metadata.nexus"
+    _write_current_scan(
+        p,
+        labels=[0, 1],
+        q=np.linspace(0.5, 5.0, 4),
+    )
+    with h5py.File(p, "r+") as f:
+        e = f["entry"]
         sd = e.create_group("scan_data")
         sd.create_dataset("frame_index", data=np.array([0, 0], dtype=np.int64))
         sd.create_dataset("th", data=np.array([1.0, 2.0]))
@@ -802,17 +799,15 @@ def test_scan_data_duplicate_labels_rejected(tmp_path):
 
 
 def _provenance_record(path, groups):
-    with h5py.File(path, "w") as handle:
-        entry = handle.create_group("entry")
-        _stamp_current_entry(entry)
-        frames = entry.create_group("frames")
-        labels = []
+    labels = [int(name.removeprefix("frame_")) for name, _ in groups]
+    _write_current_scan(path, labels=sorted(labels))
+    with h5py.File(path, "r+") as handle:
+        entry = handle["entry"]
+        frames = entry.require_group("frames")
         for name, source_path in groups:
-            labels.append(int(name.removeprefix("frame_")))
             source = frames.create_group(name).create_group("source")
             source.create_dataset("path", data=np.bytes_(str(source_path)))
             source.create_dataset("frame_index", data=0)
-        _add_minimal_current_1d(entry, sorted(labels))
 
 
 def test_resolved_raw_source_handles_unpadded_and_five_digit_labels(tmp_path):
