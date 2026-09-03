@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import h5py
 import numpy as np
 import pytest
@@ -205,18 +207,18 @@ def test_tiff_series_overlays_exact_admitted_motor_values(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ):
+    from xrd_tools.io.metadata import ImageMetadataRead
     from xrd_tools.sources import image as image_module
     from xrd_tools.sources import TiffSeriesSource
 
     files = tuple(tmp_path / f"scan_{index:04d}.tif" for index in (1, 2))
     monkeypatch.setattr(
         image_module,
-        "read_image_metadata",
-        lambda *_args, **_kwargs: {
-            "TH": 9.0,
-            "th": 99.0,
-            "exposure": 3.0,
-        },
+        "read_image_metadata_observed",
+        lambda path, *_args, **_kwargs: ImageMetadataRead(
+            {"TH": 9.0, "th": 99.0, "exposure": 3.0},
+            Path(path).with_suffix(".txt"),
+        ),
     )
     source = TiffSeriesSource(
         files,

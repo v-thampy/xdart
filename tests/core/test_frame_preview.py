@@ -170,7 +170,7 @@ def test_raw_absent_thumbnail_preview_keeps_portable_projection(
     assert result.view.intensity_2d.flags.writeable is False
 
 
-def test_flattened_basename_preview_uses_exact_resolver_winner(
+def test_flattened_basename_preview_is_not_accepted_as_exact_source(
     tmp_path, monkeypatch
 ):
     processed, raw_path = _write_processed(tmp_path, thumbnail=True)
@@ -186,11 +186,12 @@ def test_flattened_basename_preview_uses_exact_resolver_winner(
     assert result.thumbnail is not None and result.raw is None
     assert result.raw_locator == "raw/image.tif"
     assert result.source_base == str(tmp_path)
-    assert result.view.source_path == str(first.resolve())
+    assert result.view.source_path == "raw/image.tif"
     assert api._source_projection_matches(
         result.raw_locator,
         result.view.source_path,
         source_base=result.source_base,
+        source_root=None,
         artifact=processed,
     ) == (True, False)
 
@@ -200,6 +201,7 @@ def test_flattened_basename_preview_uses_exact_resolver_winner(
         result.raw_locator,
         str(later.resolve()),
         source_base=result.source_base,
+        source_root=None,
         artifact=processed,
     ) == (False, False)
 
@@ -445,28 +447,28 @@ def test_one_frame_preview_reads_only_target_maps_and_metadata_row(
         scan_data["frame_index"] = np.arange(4096, dtype=np.int64)
         scan_data["motor"] = np.arange(4096, dtype=np.float64)
     frame_view = import_module("xrd_tools.io.frame_view")
-    original_values = frame_view._dataset_values
+    original_getitem = h5py.Dataset.__getitem__
     original_map = frame_view._frame_map
-    full_column_reads = []
+    metadata_reads = []
     map_targets = []
 
-    def observed_values(dataset):
-        if dataset.shape == (4096,):
-            full_column_reads.append(dataset.name)
-        return original_values(dataset)
+    def observed_getitem(dataset, key):
+        if dataset.name == "/entry/scan_data/motor":
+            metadata_reads.append(key)
+        return original_getitem(dataset, key)
 
     def observed_map(group, *args, **kwargs):
         target = args[0] if args else kwargs.get("target_frame")
         map_targets.append(target)
         return original_map(group, *args, **kwargs)
 
-    monkeypatch.setattr(frame_view, "_dataset_values", observed_values)
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", observed_getitem)
     monkeypatch.setattr(frame_view, "_frame_map", observed_map)
     result = _api().read_frame_preview(
         _read_key(processed, _hydration().HydrationPurpose.PREVIEW)
     )
     assert result.view.metadata_raw["motor"] == 17
-    assert full_column_reads == []
+    assert metadata_reads == [17]
     assert map_targets and set(map_targets) == {17}
 
 
