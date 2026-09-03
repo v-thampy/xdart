@@ -55,6 +55,7 @@ from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactKind,
     AnalysisArtifactOverwrite,
 )
+from xrd_tools.io.output_transaction import OutputTransactionCoordinator
 from xrd_tools.sources.spec import SpecSource
 
 
@@ -1163,6 +1164,48 @@ def test_existing_create_new_output_is_late_refusal_without_overwrite(tmp_path):
     assert result.terminal.disposition is ModuleDisposition.REFUSED
     assert result.terminal.code == "OUTPUT_EXISTS"
     assert target.read_bytes() == original
+
+
+def test_create_new_cleanup_retry_does_not_replay_science_or_writer(
+    tmp_path,
+    monkeypatch,
+):
+    request, _frames = _prepared_rsm(tmp_path)
+    coordinator = OutputTransactionCoordinator()
+    real_release = coordinator._release
+    real_write = rsm_operation.write_rsm
+    real_science = rsm_operation.run_rsm
+    failures = []
+    writes = []
+    science = []
+
+    def fail_release_once(lease, role, owner):
+        if not failures:
+            failures.append(role)
+            raise OSError("module release transient")
+        return real_release(lease, role, owner)
+
+    def write_once(*args, **kwargs):
+        writes.append("write")
+        return real_write(*args, **kwargs)
+
+    def science_once(*args, **kwargs):
+        science.append("science")
+        return real_science(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator, "_release", fail_release_once)
+    monkeypatch.setattr(rsm_operation, "write_rsm", write_once)
+    monkeypatch.setattr(rsm_operation, "run_rsm", science_once)
+    with pytest.raises(RSMOperationCleanupPending) as pending:
+        run_rsm_operation(request, coordinator=coordinator)
+
+    recovered = pending.value.retry_cleanup()
+    assert recovered.terminal.disposition is ModuleDisposition.COMMITTED
+    assert recovered.payload is not None
+    assert pending.value.execution.retry_cleanup() is recovered
+    assert len(failures) == 1
+    assert writes == ["write"]
+    assert science == ["science"]
 
 
 def test_callback_failure_is_inert_and_execution_is_one_shot(tmp_path):

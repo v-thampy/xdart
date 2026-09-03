@@ -33,6 +33,7 @@ from xrd_tools.analysis.stitch_operation import (
     StitchManifestFile,
     StitchContribution,
     StitchOperationPlan,
+    StitchOperationCleanupPending,
     XuStitchOperationPlan,
     StitchOperationRefused,
     StitchOperationVerificationError,
@@ -52,6 +53,7 @@ from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactKind,
     AnalysisArtifactOverwrite,
 )
+from xrd_tools.io.output_transaction import OutputTransactionCoordinator
 from xrd_tools.sources.selection import image_series_spec
 
 
@@ -1196,6 +1198,48 @@ def test_create_new_output_conflict_is_late_refusal_without_overwrite(tmp_path):
     assert result.terminal.disposition is ModuleDisposition.REFUSED
     assert result.terminal.code == "OUTPUT_EXISTS"
     assert target.read_bytes() == original
+
+
+def test_create_new_cleanup_retry_does_not_replay_science_or_writer(
+    tmp_path,
+    monkeypatch,
+):
+    request = _prepared(tmp_path)
+    coordinator = OutputTransactionCoordinator()
+    real_release = coordinator._release
+    real_write = stitch_operation.write_stitched
+    real_science = stitch_operation.run_stitch
+    failures = []
+    writes = []
+    science = []
+
+    def fail_release_once(lease, role, owner):
+        if not failures:
+            failures.append(role)
+            raise OSError("module release transient")
+        return real_release(lease, role, owner)
+
+    def write_once(*args, **kwargs):
+        writes.append("write")
+        return real_write(*args, **kwargs)
+
+    def science_once(*args, **kwargs):
+        science.append("science")
+        return real_science(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator, "_release", fail_release_once)
+    monkeypatch.setattr(stitch_operation, "write_stitched", write_once)
+    monkeypatch.setattr(stitch_operation, "run_stitch", science_once)
+    with pytest.raises(StitchOperationCleanupPending) as pending:
+        run_stitch_operation(request, coordinator=coordinator)
+
+    recovered = pending.value.retry_cleanup()
+    assert recovered.terminal.disposition is ModuleDisposition.COMMITTED
+    assert recovered.payload is not None
+    assert pending.value.execution.retry_cleanup() is recovered
+    assert len(failures) == 1
+    assert writes == ["write"]
+    assert science == ["science"]
 
 
 def test_plan_rejects_unbounded_or_unsupported_science(tmp_path):
