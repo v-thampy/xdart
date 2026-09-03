@@ -1662,14 +1662,42 @@ def _catalog_hdf5(path, policy, walk=None, preferred=None, admission=None):
     admission = _Viewer2DAdmission() if admission is None else admission
     try:
         with h5py.File(path, "r") as handle:
+            from xrd_tools.io.processed_scan_id import (
+                has_processed_output_markers_file,
+                require_current_processed_groups,
+            )
+
             if preferred:
+                # An exact source dataset hint avoids the bounded generic HDF
+                # walk, but it cannot turn a processed artifact into raw data.
+                if has_processed_output_markers_file(handle):
+                    _refuse(
+                        Viewer2DRefusalCode.FORMAT_INVALID,
+                        "processed source cannot be selected as raw detector data",
+                    )
                 dataset_path, dataset = _hdf_dataset(handle, walk, preferred)
             else:
                 entry = _hdf_entry(handle, walk)
-                if entry is not None:
+                entry_name = (
+                    entry.name.lstrip("/") if entry is not None else "entry"
+                )
+                if has_processed_output_markers_file(handle, entry_name):
+                    try:
+                        current = require_current_processed_groups(
+                            handle, entry_name, container=path,
+                        )
+                    except ValueError as error:
+                        _refuse(Viewer2DRefusalCode.FORMAT_INVALID, str(error))
                     processed = _processed_catalog(
-                        path, policy, handle, entry, walk, admission)
-                    if processed is not None: return processed
+                        path, policy, handle, current.entry, walk, admission,
+                    )
+                    if processed is None:
+                        _refuse(
+                            Viewer2DRefusalCode.FORMAT_INVALID,
+                            "current processed record has no displayable raw frame or thumbnail",
+                        )
+                    return processed
+                if entry is not None:
                     eiger = _hdf_segments(path, entry, walk, admission)
                     if eiger is not None:
                         shape, dtype, dependencies, dataset_path = eiger

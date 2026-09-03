@@ -98,8 +98,11 @@ def _mount_source(tmp_path, family):
         a0._write_hdf_stack(raw, base[np.newaxis])
         thumb = base.astype(np.uint8)
         with h5py.File(path, "w") as handle:
-            a0._processed_source(handle, 2, raw.name, 0, "/entry/data/data")
+            a0._processed_source(
+                handle, 2, str(raw.resolve()), 0, "/entry/data/data",
+            )
             a0._processed_thumbnail(handle, 7, thumb, vmin=0.0, vmax=255.0)
+            a0._finalize_processed(handle)
         policy = viewer_api.Viewer2DFormatPolicy(
             source_root=str(tmp_path)
         )

@@ -5,6 +5,7 @@ import hashlib
 import io
 import mmap
 import os
+import shutil
 import struct
 import sys
 import zipfile
@@ -50,7 +51,6 @@ def _write_hdf_stack(path, value, dataset="entry/data/data"):
 
 def _processed_source(handle, label, locator, frame, dataset=None):
     entry = handle.require_group("entry")
-    entry.require_group("integrated_1d")
     source = entry.require_group(f"frames/frame_{label:04d}/source")
     source.create_dataset("path", data=np.bytes_(locator))
     source.create_dataset("frame_index", data=frame)
@@ -60,13 +60,49 @@ def _processed_source(handle, label, locator, frame, dataset=None):
 
 def _processed_thumbnail(handle, label, value, *, vmin, vmax, mask=None):
     entry = handle.require_group("entry")
-    entry.require_group("integrated_1d")
     frame = entry.require_group(f"frames/frame_{label:04d}")
     thumbnail = frame.create_dataset("thumbnail", data=value)
     thumbnail.attrs.update(dtype=str(value.dtype), vmin=vmin, vmax=vmax)
     if mask is not None:
         frame.create_dataset("thumbnail_mask", data=mask)
     return thumbnail
+
+
+def _write_current_result(entry, labels):
+    from xrd_tools.io.schema import (
+        PROCESSED_SCHEMA_NAME,
+        PROCESSED_SCHEMA_VERSION,
+        SCHEMA_NAME_ATTR,
+        SCHEMA_VERSION_ATTR,
+    )
+
+    entry.attrs["NX_class"] = "NXentry"
+    entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+    entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+    labels = tuple(int(label) for label in labels)
+    result = entry.create_group("integrated_1d")
+    result.attrs["NX_class"] = "NXdata"
+    result.attrs["signal"] = "intensity"
+    result.attrs["axes"] = ("frame_index", "q")
+    result.create_dataset(
+        "frame_index", data=np.asarray(labels, dtype=np.int64),
+        chunks=(min(len(labels), 1024),), maxshape=(None,),
+    )
+    result.create_dataset(
+        "intensity", data=np.zeros((len(labels), 1), dtype=np.float32),
+        chunks=(min(len(labels), 64), 1), maxshape=(None, 1),
+    )
+    result.create_dataset("q", data=np.zeros(1, dtype=np.float32))
+
+
+def _finalize_processed(handle):
+    entry = handle["entry"]
+    labels = sorted(
+        int(name.removeprefix("frame_"))
+        for name in entry["frames"]
+        if name.startswith("frame_")
+    )
+    _write_current_result(entry, labels)
 
 
 def _external_master(path, links):
@@ -598,9 +634,12 @@ def test_selected_hdf_lookup_charges_before_materialization(tmp_path, monkeypatc
         catalog = api.catalog_viewer_2d(path)
         selected_path = catalog.dataset_path
         if selected == "pointer":
-            raw, path = path, tmp_path / "pointer.nxs"
+            raw, path = path, tmp_path / "pointer.nexus"
             with h5py.File(path, "w") as handle:
-                _processed_source(handle, 0, raw.name, 0, "/entry/data/data")
+                _processed_source(
+                    handle, 0, str(raw.resolve()), 0, "/entry/data/data",
+                )
+                _finalize_processed(handle)
             catalog = api.catalog_viewer_2d(path)
             selected_path = "/entry/frames/frame_0000/source/path"
     elif selected == "eiger_link":
@@ -610,10 +649,12 @@ def test_selected_hdf_lookup_charges_before_materialization(tmp_path, monkeypatc
         catalog = api.catalog_viewer_2d(path)
         selected_path = catalog.dependencies[0].logical_path
     elif selected in {"thumbnail", "thumbnail_mask"}:
+        path = path.with_suffix(".nexus")
         with h5py.File(path, "w") as handle:
             _processed_thumbnail(
                 handle, 0, np.arange(6, dtype=np.uint8).reshape(2, 3),
                 vmin=0.0, vmax=5.0, mask=np.zeros((2, 3), dtype=bool))
+            _finalize_processed(handle)
         catalog = api.catalog_viewer_2d(path)
         selected_path = ("/entry/frames/frame_0000/thumbnail" if selected == "thumbnail"
                          else "/entry/frames/frame_0000/thumbnail_mask")
@@ -750,12 +791,15 @@ def test_processed_gapped_labels_preserve_raw_or_explicit_thumbnail_provenance(t
     raw = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
     _write_hdf_stack(raw_path, raw)
 
-    processed = tmp_path / "processed.nxs"
+    processed = tmp_path / "processed.nexus"
     with h5py.File(processed, "w") as handle:
-        _processed_source(handle, 2, raw_path.name, 1, "/entry/data/data")
+        _processed_source(
+            handle, 2, str(raw_path.resolve()), 1, "/entry/data/data",
+        )
         quantized = np.array([[0, 64, 128], [255, 32, 16]], dtype=np.uint8)
         mask = np.array([[False, True, False], [False, False, False]], dtype=bool)
         _processed_thumbnail(handle, 7, quantized, vmin=10.0, vmax=20.0, mask=mask)
+        _finalize_processed(handle)
 
     catalog = api.catalog_viewer_2d(processed)
     assert catalog.frame_labels == (2, 7)
@@ -783,15 +827,94 @@ def test_processed_gapped_labels_preserve_raw_or_explicit_thumbnail_provenance(t
     assert thumb_result.provenance.diagnostic == "Thumbnail preview; raw source unavailable."
 
 
+@pytest.mark.parametrize("suffix", (".h5", ".hdf5", ".nxs", ".nexus"))
+def test_historical_processed_markers_never_fall_through_to_raw_dataset(
+    tmp_path, suffix,
+):
+    h5py = pytest.importorskip("h5py")
+    path = tmp_path / f"historical{suffix}"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset(
+            "entry/integrated_2d/intensity",
+            data=np.ones((2, 3, 4), dtype=np.float32),
+        )
+
+    _assert_refusal(
+        api.Viewer2DRefusalCode.FORMAT_INVALID,
+        api.catalog_viewer_2d,
+        path,
+    )
+
+
+def test_wrong_suffix_current_bytes_are_not_processed_or_raw(tmp_path):
+    h5py = pytest.importorskip("h5py")
+    current = tmp_path / "current.nexus"
+    with h5py.File(current, "w") as handle:
+        _processed_thumbnail(
+            handle, 0, np.arange(6, dtype=np.uint8).reshape(2, 3),
+            vmin=0.0, vmax=5.0,
+        )
+        _finalize_processed(handle)
+    historical = tmp_path / "current.nxs"
+    shutil.copyfile(current, historical)
+
+    _assert_refusal(
+        api.Viewer2DRefusalCode.FORMAT_INVALID,
+        api.catalog_viewer_2d,
+        historical,
+    )
+
+
+def test_current_integrated_only_record_never_becomes_raw_intensity(tmp_path):
+    h5py = pytest.importorskip("h5py")
+    path = tmp_path / "integrated-only.nexus"
+    with h5py.File(path, "w") as handle:
+        entry = handle.create_group("entry")
+        _write_current_result(entry, (0,))
+
+    _assert_refusal(
+        api.Viewer2DRefusalCode.FORMAT_INVALID,
+        api.catalog_viewer_2d,
+        path,
+    )
+
+
+def test_current_thumbnail_catalog_uses_one_primary_hdf_open(
+    tmp_path, monkeypatch,
+):
+    h5py = pytest.importorskip("h5py")
+    path = tmp_path / "thumbnail.nexus"
+    with h5py.File(path, "w") as handle:
+        _processed_thumbnail(
+            handle, 0, np.arange(6, dtype=np.uint8).reshape(2, 3),
+            vmin=0.0, vmax=5.0,
+        )
+        _finalize_processed(handle)
+
+    original = h5py.File
+    opens = []
+
+    def tracked(*args, **kwargs):
+        opens.append(Path(args[0]).resolve())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(h5py, "File", tracked)
+    catalog = api.catalog_viewer_2d(path)
+
+    assert catalog.source_kind is api.Viewer2DSourceKind.PROCESSED_THUMBNAIL
+    assert opens == [path.resolve()]
+
+
 @pytest.mark.parametrize("family", ["raw", "tiff", "edf", "cbf"])
 def test_processed_raw_keeps_non_hdf_detector_parity(tmp_path, family):
     h5py = pytest.importorskip("h5py")
     value = np.arange(12, dtype=np.int32).reshape(3, 4)
     source = tmp_path / f"source.{family}"
     _write_selected_source(source, "fabio" if family == "edf" else family, value)
-    processed = tmp_path / f"processed-{family}.nxs"
+    processed = tmp_path / f"processed-{family}.nexus"
     with h5py.File(processed, "w") as handle:
-        _processed_source(handle, 5, source.name, 0)
+        _processed_source(handle, 5, str(source.resolve()), 0)
+        _finalize_processed(handle)
     policy = api.Viewer2DFormatPolicy(raw_detector_shape=(3, 4), raw_dtype="int32")
     catalog = api.catalog_viewer_2d(processed, policy=policy)
     result = api.read_viewer_2d_frame(catalog, 5, policy=policy)
@@ -834,9 +957,12 @@ def test_one_hdf_census_spans_processed_recursion_and_pre_read_post(tmp_path, mo
     h5py = pytest.importorskip("h5py")
     raw = tmp_path / "raw.nxs"
     _write_hdf_stack(raw, np.arange(6).reshape(1, 2, 3))
-    processed = tmp_path / "processed.nxs"
+    processed = tmp_path / "processed.nexus"
     with h5py.File(processed, "w") as handle:
-        _processed_source(handle, 0, raw.name, 0, "/entry/data/data")
+        _processed_source(
+            handle, 0, str(raw.resolve()), 0, "/entry/data/data",
+        )
+        _finalize_processed(handle)
 
     catalog = api.catalog_viewer_2d(processed)
     seen = set()
@@ -863,6 +989,7 @@ def test_processed_651_catalog_uses_owned_frame_bound_and_hashes_each_file_once(
             _processed_source(
                 handle, label, str(master.resolve()), label,
                 "/entry/data/data_000001")
+        _finalize_processed(handle)
 
     calls = []
     original = api._stable_revision
@@ -890,6 +1017,7 @@ def test_processed_651_pure_thumbnail_catalog_uses_owned_field_budget(tmp_path):
         for label in range(651):
             _processed_thumbnail(
                 handle, label, thumbnail, vmin=0.0, vmax=5.0)
+        _finalize_processed(handle)
 
     catalog = api.catalog_viewer_2d(processed)
 
@@ -911,6 +1039,7 @@ def test_processed_651_missing_source_falls_back_to_all_thumbnails(tmp_path):
                 "/entry/data/data")
             _processed_thumbnail(
                 handle, label, thumbnail, vmin=0.0, vmax=5.0)
+        _finalize_processed(handle)
 
     catalog = api.catalog_viewer_2d(processed)
 
@@ -929,13 +1058,13 @@ def test_processed_fixed_name_misses_do_not_consume_frame_catalog_cap(
     processed = tmp_path / "processed.nexus"
     with h5py.File(processed, "w") as handle:
         entry = handle.require_group("entry")
-        entry.require_group("integrated_1d")
         for label in (1, 2, 3):
             source = entry.require_group(
                 f"frames/frame_{label:05d}/source")
             source.create_dataset("path", data=np.bytes_(str(raw.resolve())))
             source.create_dataset("frame_index", data=0)
             source.attrs["dataset_path"] = "/entry/data/data"
+        _write_current_result(entry, (1, 2, 3))
     monkeypatch.setattr(api, "_MAX_FRAMES", 3)
 
     catalog = api.catalog_viewer_2d(processed)
@@ -978,6 +1107,7 @@ def test_processed_external_preferred_path_bypasses_foreign_master_census(tmp_pa
     with h5py.File(processed, "w") as handle:
         _processed_source(
             handle, 7, str(master.resolve()), 1, "/selected")
+        _finalize_processed(handle)
 
     catalog = api.catalog_viewer_2d(processed)
     frame = api.read_viewer_2d_frame(catalog, 7)
@@ -1291,6 +1421,7 @@ def _write_selected_source(path, family, value):
         with h5py.File(path, "w") as handle:
             _processed_thumbnail(
                 handle, 0, value, vmin=0.0, vmax=float(value.max()))
+            _finalize_processed(handle)
 
 
 def _block_selected_materialization(monkeypatch, family, target, materialized):
@@ -1371,11 +1502,12 @@ def test_r30_hdf_dependency_grammar_is_locator_local(tmp_path, axis):
             tmp_path / stem, [("data_000001", np.arange(12).reshape(shape) + offset)])[0]
         for stem, offset in (("a", 0), ("b", 100))
     ]
-    processed = tmp_path / "processed.nxs"
+    processed = tmp_path / "processed.nexus"
     with h5py.File(processed, "w") as handle:
         _processed_source(handle, 1, str(bases[0].resolve()), 1)
         if axis == "cross-chain-overlap":
             _processed_source(handle, 2, str(bases[1].resolve()), 1)
+        _finalize_processed(handle)
     if axis == "cross-chain-overlap":
         # Both source catalogs use numeric interval [0, 2); this is valid
         # because each interval belongs to a distinct base-master chain.
@@ -1467,7 +1599,7 @@ def test_r30_selected_metadata_mismatch_refuses_before_materialization(tmp_path,
     materialized = []
     family, drift = axis.split("-", 1)
     suffix = {"hdf": "nxs", "tiff": "tiff", "fabio": "edf",
-              "thumbnail": "nxs"}[family]
+              "thumbnail": "nexus"}[family]
     path = tmp_path / f"selected.{suffix}"
     source_dtype = np.uint8 if family == "thumbnail" else np.int16
     initial = np.arange(6, dtype=source_dtype).reshape(2, 3)
@@ -1553,9 +1685,10 @@ def test_r30_catalog_revision_brackets_valid_metadata(tmp_path, monkeypatch, axi
             root, [("data_000001", np.arange(6).reshape(1, 2, 3))])
         replacement = root / "replacement.nxs"
         _external_master(replacement, [("data_000001", root / "data_000001")])
-        path = tmp_path / "processed-base-race.nxs"
+        path = tmp_path / "processed-base-race.nexus"
         with h5py.File(path, "w") as handle:
             _processed_source(handle, 0, str(master.resolve()), 0)
+            _finalize_processed(handle)
         monkeypatch.setattr(api, "_catalog_resolved", _after_call(
             api._catalog_resolved, lambda: os.replace(replacement, master), entered,
             predicate=lambda candidate, *a, **k: Path(candidate) == master.resolve()))
@@ -1667,11 +1800,12 @@ def test_memory_ledger_rejects_each_isolated_invariant(canonical, reservation, b
 def test_rehashed_catalog_rejects_each_isolated_cross_field(tmp_path, axis):
     if axis == "fact-summary":
         h5py = pytest.importorskip("h5py")
-        path = tmp_path / "processed.nxs"
+        path = tmp_path / "processed.nexus"
         with h5py.File(path, "w") as handle:
             _processed_thumbnail(
                 handle, 0, np.arange(6, dtype=np.uint8).reshape(2, 3),
                 vmin=0.0, vmax=5.0)
+            _finalize_processed(handle)
         catalog = api.catalog_viewer_2d(path)
         change = {"source_kind": api.Viewer2DSourceKind.PROCESSED_RAW}
     else:
@@ -1694,9 +1828,10 @@ def test_processed_eiger_selection_is_interval_local(tmp_path, monkeypatch, axis
     raw = np.arange(2 * 3, dtype=np.uint16).reshape(1, 2, 3)
     master, segments, arrays = _eiger_master(tmp_path / axis, [
         (f"data_{number:06d}.h5", raw + number * 100) for number in (1, 2)])
-    processed = tmp_path / f"{axis}.nxs"
+    processed = tmp_path / f"{axis}.nexus"
     with h5py.File(processed, "w") as handle:
         _processed_source(handle, 7, str(master.resolve()), 1)
+        _finalize_processed(handle)
     catalog = api.catalog_viewer_2d(processed)
     base, earlier, selected = catalog.dependencies
     touched, opened, read = [], [], []
