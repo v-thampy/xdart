@@ -18,6 +18,7 @@ from xrd_tools.analysis.canonical_fingerprint import (
 )
 from xrd_tools.io.analysis_artifact import (
     ANALYSIS_SCHEMA_VERSION_V2,
+    ANALYSIS_SCHEMA_VERSION_V3,
     AnalysisArtifactKind,
     AnalysisArtifactInspection,
     AnalysisArtifactPayload,
@@ -33,6 +34,14 @@ from xrd_tools.session.rsm_viewer_model import (
     RSM_K,
     RSM_KL,
     RSM_L,
+    RSM_QX,
+    RSM_QX_QY,
+    RSM_QX_QZ,
+    RSM_QY,
+    RSM_QY_QZ,
+    RSM_QZ,
+    RSM_Q_VIEWER_LAYOUT,
+    RSM_Q_VIEWER_PANEL_ORDER,
     RSM_VIEWER_LAYOUT,
     RSM_VIEWER_PANEL_ORDER,
     RSMViewerModel,
@@ -41,6 +50,7 @@ from xrd_tools.session.rsm_viewer_model import (
     make_rsm_viewer_state,
     make_rsm_viewer_values,
 )
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 
 
 def _projection(
@@ -87,6 +97,45 @@ def _values(
 ) -> RSMViewerValues:
     return make_rsm_viewer_values(
         _projection(shape, intensity=intensity, offset=offset)
+    )
+
+
+def _q_projection(
+    shape: tuple[int, int, int] = (3, 4, 5),
+    *,
+    intensity: np.ndarray | None = None,
+    offset: float = 0.0,
+):
+    frame = RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    axes = tuple(
+        (
+            name,
+            np.linspace(
+                offset + index,
+                offset + index + 1.0,
+                size,
+                dtype=np.float64,
+            ),
+        )
+        for index, (name, size) in enumerate(
+            zip(frame.axis_names, shape, strict=True)
+        )
+    )
+    if intensity is None:
+        intensity = (
+            np.arange(np.prod(shape), dtype=np.float64).reshape(shape)
+            + offset
+        )
+    return project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.RSM,
+        axes=axes,
+        axis_units=tuple(
+            zip(frame.axis_names, frame.axis_units, strict=True)
+        ),
+        intensity=intensity,
+        sigma=None,
+        coverage=None,
+        normalization=None,
     )
 
 
@@ -202,6 +251,89 @@ def test_exact_layout_has_six_repeated_role_keys_in_frozen_order():
         (PanelRole.PROJ_1D, "L"),
     )
     assert len(set(RSM_VIEWER_PANEL_ORDER)) == 6
+
+
+def test_cartesian_q_uses_distinct_six_panel_layout_and_cache_identity():
+    assert RSM_Q_VIEWER_LAYOUT == (
+        (RSM_QX_QY, RSM_QX_QZ, RSM_QY_QZ),
+        (RSM_QX, RSM_QY, RSM_QZ),
+    )
+    assert RSM_Q_VIEWER_PANEL_ORDER == (
+        RSM_QX_QY,
+        RSM_QX_QZ,
+        RSM_QY_QZ,
+        RSM_QX,
+        RSM_QY,
+        RSM_QZ,
+    )
+    assert module.rsm_viewer_layout(RSMCoordinateFrame.HKL) is RSM_VIEWER_LAYOUT
+    assert (
+        module.rsm_viewer_layout(RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU)
+        is RSM_Q_VIEWER_LAYOUT
+    )
+
+    q_values = make_rsm_viewer_values(_q_projection())
+    assert q_values.coordinate_frame is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    q_model = RSMViewerModel()
+    q_snapshot = q_model.snapshot(q_values, h_index=1, k_index=2, l_index=3)
+    assert q_snapshot.state.coordinate_frame is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    assert tuple(product.panel_key for product in q_snapshot.products) == (
+        RSM_Q_VIEWER_PANEL_ORDER
+    )
+    assert q_model.component_keys == (
+        (q_values.result_fingerprint, "slice", "qz", 3),
+        (q_values.result_fingerprint, "slice", "qy", 2),
+        (q_values.result_fingerprint, "slice", "qx", 1),
+        (q_values.result_fingerprint, "projection", "qx"),
+        (q_values.result_fingerprint, "projection", "qy"),
+        (q_values.result_fingerprint, "projection", "qz"),
+    )
+
+    hkl_values = _values()
+    hkl_snapshot = q_model.snapshot(hkl_values)
+    assert hkl_snapshot.state.coordinate_frame is RSMCoordinateFrame.HKL
+    assert all(
+        key[0] == hkl_values.result_fingerprint
+        for key in (*q_model.component_keys, *q_model.snapshot_keys)
+    )
+    assert q_snapshot.state.fingerprint != hkl_snapshot.state.fingerprint
+
+
+def test_factory_accepts_exact_resident_cartesian_q_v3_payload():
+    projection = _q_projection((2, 3, 4))
+    inspection = AnalysisArtifactInspection(
+        path="/resident/not-read",
+        storage_revision=(1, 2, 3, 4, 5),
+        kind=AnalysisArtifactKind.RSM,
+        group="rsm",
+        shape=projection.intensity.shape,
+        axes=tuple((name, values.size) for name, values in projection.axes),
+        axis_units=(("qx", "q_A^-1"), ("qy", "q_A^-1"), ("qz", "q_A^-1")),
+        has_sigma=False,
+        has_stitch_diagnostics=False,
+        request_fingerprint="1" * 64,
+        source_fingerprint="2" * 64,
+        plan_fingerprint="3" * 64,
+        provenance_digest="4" * 64,
+        provenance_json="{}",
+        provenance_sha256="5" * 64,
+        result_fingerprint=projection.result_fingerprint,
+        schema_version=ANALYSIS_SCHEMA_VERSION_V3,
+        execution_attestation_digest="6" * 64,
+        execution_attestation_json="{}",
+    )
+    payload = AnalysisArtifactPayload(
+        inspection,
+        projection.axes,
+        projection.intensity,
+        None,
+        None,
+        None,
+        artifact_module._ANALYSIS_PAYLOAD_FACTORY,
+    )
+    values = make_rsm_viewer_values(payload)
+    assert values.coordinate_frame is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    assert tuple(name for name, _values in values.axes) == ("qx", "qy", "qz")
 
 
 def test_values_require_factory_owned_rsm_projection_and_reissue_is_distinct():
@@ -394,6 +526,41 @@ def test_three_slice_orientation_projection_and_canonical_empty_nan_contracts(
     assert snapshot.finite_counts == tuple(
         int(np.count_nonzero(np.isfinite(product.values)))
         for product in snapshot.products
+    )
+
+
+def test_cartesian_q_slice_values_preserve_axis_order_and_orientation():
+    shape = (3, 4, 5)
+    intensity = np.arange(np.prod(shape), dtype=np.float64).reshape(shape)
+    intensity[0, :, :] = np.nan
+    intensity[1, 2, 3] = np.nan
+    values = make_rsm_viewer_values(
+        _q_projection(shape, intensity=intensity)
+    )
+    source = values.intensity
+    snapshot = RSMViewerModel().snapshot(
+        values,
+        h_index=1,
+        k_index=2,
+        l_index=3,
+    )
+    qx_qy, qx_qz, qy_qz, qx, qy, qz = snapshot.products
+    assert tuple(product.panel_key for product in snapshot.products) == (
+        RSM_Q_VIEWER_PANEL_ORDER
+    )
+    np.testing.assert_array_equal(qx_qy.values, source[:, :, 3].T)
+    np.testing.assert_array_equal(qx_qz.values, source[:, 2, :].T)
+    np.testing.assert_array_equal(qy_qz.values, source[1, :, :].T)
+    np.testing.assert_array_equal(qx.values, _finite_projection(source, 0))
+    np.testing.assert_array_equal(qy.values, _finite_projection(source, 1))
+    np.testing.assert_array_equal(qz.values, _finite_projection(source, 2))
+    assert tuple(product.values.shape for product in snapshot.products) == (
+        (4, 3),
+        (5, 3),
+        (5, 4),
+        (3,),
+        (4,),
+        (5,),
     )
 
 

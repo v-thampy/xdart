@@ -21,6 +21,7 @@ from xrd_tools.core.geometry import (
     DiffractometerConfig,
     PixelQMap,
 )
+from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
 
 
 def _header():
@@ -86,3 +87,158 @@ def test_canonical_psic_diffractometer_drives_pixel_q():
         angles, 10000.0, UB=np.eye(3))
     assert qx.shape == (2, h.Nch1, h.Nch2)
     assert np.isfinite(qx).all() and np.isfinite(qz).all()
+
+
+def test_pixel_q_omitted_ub_forwards_explicit_contiguous_float64_identity():
+    observed = []
+
+    class Ang2Q:
+        def init_area(self, *_args, **_kwargs):
+            return None
+
+        def area(self, *_angles, UB=None, **_kwargs):
+            observed.append(UB)
+            shape = (1, 2, 3)
+            return tuple(np.zeros(shape, dtype=np.float64) for _ in range(3))
+
+    class HXRD:
+        pass
+
+    hxrd = HXRD()
+    hxrd.Ang2Q = Ang2Q()
+
+    class Diff:
+        init_area_detrot = "x+"
+        init_area_tiltazimuth = "z+"
+        ang2q_kwargs = {}
+
+        def make_hxrd(self, _energy):
+            return hxrd
+
+    header = DetectorHeader(
+        cch1=1.0,
+        cch2=1.0,
+        pwidth1=0.1,
+        pwidth2=0.1,
+        distance=1.0,
+        Nch1=2,
+        Nch2=3,
+    )
+    PixelQMap(Diff(), header).pixel_q((np.array([0.0]),), 10_000.0)
+    assert len(observed) == 1
+    assert observed[0].dtype == np.dtype(np.float64)
+    assert observed[0].flags.c_contiguous
+    np.testing.assert_array_equal(observed[0], np.eye(3, dtype=np.float64))
+
+
+def _direct_point_and_area(cfg, header, energy, angles, *, UB_marker):
+    hxrd = cfg.make_hxrd(energy)
+    point_kwargs = dict(cfg.ang2q_kwargs)
+    area_kwargs = dict(cfg.ang2q_kwargs)
+    if UB_marker is not None:
+        point_kwargs["UB"] = UB_marker
+        area_kwargs["UB"] = UB_marker
+    point = tuple(
+        np.asarray(value, dtype=np.float64)
+        for value in hxrd.Ang2Q.point(*angles, **point_kwargs)
+    )
+    hxrd.Ang2Q.init_area(
+        cfg.init_area_detrot,
+        cfg.init_area_tiltazimuth,
+        cch1=float(header.cch1),
+        cch2=float(header.cch2),
+        pwidth1=float(header.pwidth1),
+        pwidth2=float(header.pwidth2),
+        distance=float(header.distance),
+        Nch1=int(header.Nch1),
+        Nch2=int(header.Nch2),
+    )
+    area = tuple(
+        np.asarray(value, dtype=np.float64)
+        for value in hxrd.Ang2Q.area(
+            *(np.asarray([angle], dtype=np.float64) for angle in angles),
+            **area_kwargs,
+        )
+    )
+    return point, area
+
+
+def test_pinned_xu_omitted_ub_equals_identity_and_q_norm_is_analytic():
+    pytest.importorskip("xrayutilities")
+    cfg = DiffractometerConfig()
+    header = _header()
+    energy_eV = 10_000.0
+    angles = (1.5, -2.0, 0.75, 24.0)
+    with xu_runtime_session():
+        omitted_point, omitted_area = _direct_point_and_area(
+            cfg,
+            header,
+            energy_eV,
+            angles,
+            UB_marker=None,
+        )
+        identity_point, identity_area = _direct_point_and_area(
+            cfg,
+            header,
+            energy_eV,
+            angles,
+            UB_marker=np.eye(3, dtype=np.float64),
+        )
+    for omitted, identity in zip(
+        (*omitted_point, *omitted_area),
+        (*identity_point, *identity_area),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(omitted, identity)
+
+    wavelength_angstrom = 12_398.419843320026 / energy_eV
+    expected_q = (
+        4.0
+        * np.pi
+        * np.sin(np.deg2rad(abs(angles[-1])) / 2.0)
+        / wavelength_angstrom
+    )
+    observed_q = float(np.linalg.norm(np.asarray(identity_point)))
+    assert observed_q == pytest.approx(expected_q, rel=5e-13, abs=5e-13)
+
+
+def test_pinned_xu_nonorthogonal_matrix_maps_hkl_back_to_cartesian_q():
+    pytest.importorskip("xrayutilities")
+    cfg = DiffractometerConfig()
+    header = _header()
+    matrix = np.array(
+        (
+            (1.2, 0.15, -0.08),
+            (0.04, 0.91, 0.23),
+            (-0.17, 0.06, 1.08),
+        ),
+        dtype=np.float64,
+    )
+    angles = (2.0, -1.0, 0.5, 17.0)
+    with xu_runtime_session():
+        q_point, q_area = _direct_point_and_area(
+            cfg,
+            header,
+            12_000.0,
+            angles,
+            UB_marker=np.eye(3, dtype=np.float64),
+        )
+        hkl_point, hkl_area = _direct_point_and_area(
+            cfg,
+            header,
+            12_000.0,
+            angles,
+            UB_marker=matrix,
+        )
+    for q_values, hkl_values in (
+        (q_point, hkl_point),
+        (q_area, hkl_area),
+    ):
+        q = np.stack(q_values)
+        hkl = np.stack(hkl_values)
+        np.testing.assert_allclose(
+            np.einsum("ij,j...->i...", matrix, hkl),
+            q,
+            rtol=2e-13,
+            atol=2e-13,
+        )

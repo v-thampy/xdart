@@ -43,6 +43,7 @@ ANALYSIS_SCHEMA_NAME = "xrd_tools.analysis_artifact"
 ANALYSIS_SCHEMA_VERSION_ATTR = "ssrl_schema_version"
 ANALYSIS_SCHEMA_VERSION = 1
 ANALYSIS_SCHEMA_VERSION_V2 = 2
+ANALYSIS_SCHEMA_VERSION_V3 = 3
 ANALYSIS_KIND_ATTR = "analysis_kind"
 _ENTRY = "entry"
 _PROVENANCE = "provenance_json"
@@ -389,6 +390,11 @@ def _validated_execution_attestation(
             "member_masks",
             "xu_runtime",
         }
+        attestation_version = parsed.get("schema_version")
+        if attestation_version == "rsm-execution-attestation-v2":
+            rsm_top_keys.update(
+                {"coordinate_frame", "axis_names", "axis_units", "matrix_policy"}
+            )
         mask_keys = {
             "ordinal",
             "member_preflight_fingerprint",
@@ -479,10 +485,28 @@ def _validated_execution_attestation(
                 and _SHA256.fullmatch(item["cropped_raw_digest"]) is not None
             )
 
+        valid_frame = attestation_version == "rsm-execution-attestation-v1"
+        if attestation_version == "rsm-execution-attestation-v2":
+            from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
+
+            try:
+                coordinate_frame = RSMCoordinateFrame(parsed.get("coordinate_frame"))
+            except (TypeError, ValueError):
+                coordinate_frame = None
+            valid_frame = (
+                coordinate_frame is not None
+                and parsed.get("axis_names") == list(coordinate_frame.axis_names)
+                and parsed.get("axis_units") == list(coordinate_frame.axis_units)
+                and parsed.get("matrix_policy") == coordinate_frame.matrix_policy
+            )
         if (
             set(parsed) != rsm_top_keys
-            or parsed.get("schema_version")
-            != "rsm-execution-attestation-v1"
+            or attestation_version
+            not in {
+                "rsm-execution-attestation-v1",
+                "rsm-execution-attestation-v2",
+            }
+            or not valid_frame
             or parsed.get("module_request_fingerprint") != request_fingerprint
             or parsed.get("result_projection_policy")
             != _STORED_RESULT_PROJECTION_POLICY
@@ -594,13 +618,40 @@ def analysis_execution_attestation_digest(
         domain = "analysis-artifact-execution-attestation-v1"
     elif kind is AnalysisArtifactKind.RSM:
         module_kind = ModuleKind.RSM
-        domain = "analysis-artifact-rsm-execution-attestation-v1"
+        domain = (
+            "analysis-artifact-rsm-execution-attestation-v2"
+            if parsed.get("schema_version") == "rsm-execution-attestation-v2"
+            else "analysis-artifact-rsm-execution-attestation-v1"
+        )
     else:  # guarded by the exact validator above
         raise ValueError("analysis execution attestation kind is unsupported")
     return analysis_canonical_fingerprint(
         domain,
         (module_kind, parsed),
     )
+
+
+def _rsm_frame_provenance_matches(
+    provenance_json: str,
+    attestation: Mapping[str, object],
+) -> bool:
+    """Return whether a frame-aware RSM attestation matches provenance."""
+
+    if attestation.get("schema_version") != "rsm-execution-attestation-v2":
+        return True
+    from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
+
+    try:
+        frame = RSMCoordinateFrame(attestation.get("coordinate_frame"))
+        provenance = json.loads(provenance_json)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return type(provenance) is dict and provenance.get("coordinate_frame") == {
+        "name": frame.value,
+        "axis_names": list(frame.axis_names),
+        "axis_units": list(frame.axis_units),
+        "matrix_policy": frame.matrix_policy,
+    }
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -649,6 +700,7 @@ class AnalysisArtifactRequest:
         if type(self.schema_version) is not int or self.schema_version not in {
             ANALYSIS_SCHEMA_VERSION,
             ANALYSIS_SCHEMA_VERSION_V2,
+            ANALYSIS_SCHEMA_VERSION_V3,
         }:
             raise TypeError("analysis artifact schema version is unsupported")
         if self.schema_version == ANALYSIS_SCHEMA_VERSION:
@@ -662,7 +714,7 @@ class AnalysisArtifactRequest:
             type(self.execution_attestation_digest) is not str
             or execution_attestation is None
         ):
-            raise ValueError("analysis artifact v2 requires an execution attestation")
+            raise ValueError("attested analysis artifact requires an execution attestation")
         _sha256(
             self.execution_attestation_digest,
             "execution attestation digest",
@@ -679,6 +731,35 @@ class AnalysisArtifactRequest:
         )
         if observed != self.execution_attestation_digest:
             raise ValueError("analysis execution attestation digest changed")
+        if (
+            self.schema_version == ANALYSIS_SCHEMA_VERSION_V3
+            and (
+                self.kind is not AnalysisArtifactKind.RSM
+                or parsed.get("schema_version") != "rsm-execution-attestation-v2"
+                or parsed.get("coordinate_frame") != "q_sample_cartesian_xu"
+            )
+        ):
+            raise ValueError("analysis artifact v3 requires the RSM frame contract")
+        if (
+            self.schema_version == ANALYSIS_SCHEMA_VERSION_V2
+            and self.kind is AnalysisArtifactKind.RSM
+            and not (
+                parsed.get("schema_version") == "rsm-execution-attestation-v1"
+                or (
+                    parsed.get("schema_version")
+                    == "rsm-execution-attestation-v2"
+                    and parsed.get("coordinate_frame") == "hkl"
+                )
+            )
+        ):
+            raise ValueError("analysis artifact v2 requires an HKL contract")
+        if (
+            self.kind is AnalysisArtifactKind.RSM
+            and not _rsm_frame_provenance_matches(self.provenance_json, parsed)
+        ):
+            raise ValueError(
+                "analysis RSM frame provenance and attestation disagree"
+            )
         object.__setattr__(self, "execution_attestation_json", text)
 
 
@@ -1514,8 +1595,22 @@ def project_analysis_artifact_result(
     expected_axis_names = {
         AnalysisArtifactKind.STITCH_1D: ("q",),
         AnalysisArtifactKind.STITCH_2D: ("q", "chi"),
-        AnalysisArtifactKind.RSM: ("h", "k", "l"),
-    }[kind]
+    }.get(kind)
+    if kind is AnalysisArtifactKind.RSM:
+        axis_name_candidate = (
+            tuple(item[0] for item in axes)
+            if type(axes) is tuple
+            and all(type(item) is tuple and len(item) == 2 for item in axes)
+            else ()
+        )
+        allowed_rsm_axes = {
+            ("h", "k", "l"): (None, None, None),
+            ("qx", "qy", "qz"): ("q_A^-1", "q_A^-1", "q_A^-1"),
+        }
+        expected_axis_names = axis_name_candidate
+        expected_rsm_units = allowed_rsm_axes.get(axis_name_candidate)
+    else:
+        expected_rsm_units = None
 
     def bounded_unit(value: object) -> bool:
         if type(value) is not str or not value or "\x00" in value:
@@ -1527,6 +1622,8 @@ def project_analysis_artifact_result(
 
     if (
         type(axes) is not tuple
+        or expected_axis_names is None
+        or not expected_axis_names
         or len(axes) != len(expected_axis_names)
         or any(
             type(item) is not tuple
@@ -1549,7 +1646,13 @@ def project_analysis_artifact_result(
                 }
                 and not bounded_unit(item[1])
             )
-            or (kind is AnalysisArtifactKind.RSM and item[1] is not None)
+            or (
+                kind is AnalysisArtifactKind.RSM
+                and (
+                    expected_rsm_units is None
+                    or item[1] != expected_rsm_units[index]
+                )
+            )
             for index, item in enumerate(axis_units)
         )
         or (coverage is None) is not (normalization is None)
@@ -1817,6 +1920,7 @@ def inspect_analysis_artifact(
             if version not in {
                 ANALYSIS_SCHEMA_VERSION,
                 ANALYSIS_SCHEMA_VERSION_V2,
+                ANALYSIS_SCHEMA_VERSION_V3,
             }:
                 raise AnalysisArtifactInvalid(
                     "analysis artifact schema version is unsupported"
@@ -1832,7 +1936,7 @@ def inspect_analysis_artifact(
                 "provenance_digest",
                 "file_name",
             }
-            if version == ANALYSIS_SCHEMA_VERSION_V2:
+            if version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
                 expected_entry_attrs.add(_EXECUTION_ATTESTATION_DIGEST_ATTR)
             if len(entry.attrs) != len(expected_entry_attrs) or any(
                 name not in expected_entry_attrs for name in entry.attrs
@@ -1848,6 +1952,13 @@ def inspect_analysis_artifact(
                 kind = AnalysisArtifactKind(_bounded_attr_text(entry, ANALYSIS_KIND_ATTR))
             except ValueError as error:
                 raise AnalysisArtifactInvalid("analysis artifact kind is invalid") from error
+            if (
+                version == ANALYSIS_SCHEMA_VERSION_V3
+                and kind is not AnalysisArtifactKind.RSM
+            ):
+                raise AnalysisArtifactInvalid(
+                    "analysis artifact v3 is reserved for frame-aware RSM"
+                )
             expected = expected_request.kind if expected_request is not None else expected_kind
             if expected is not None and kind is not expected:
                 raise AnalysisArtifactInvalid("analysis artifact kind does not match request")
@@ -1871,7 +1982,7 @@ def inspect_analysis_artifact(
                 if expected_request is not None and value != getattr(expected_request, request_attr):
                     raise AnalysisArtifactInvalid(f"analysis artifact {attr} changed")
             execution_attestation_digest = None
-            if version == ANALYSIS_SCHEMA_VERSION_V2:
+            if version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
                 execution_attestation_digest = _sha256(
                     _exact_sha256_attr_text(
                         entry, _EXECUTION_ATTESTATION_DIGEST_ATTR
@@ -1895,7 +2006,7 @@ def inspect_analysis_artifact(
             if final_name != expected_name:
                 raise AnalysisArtifactInvalid("analysis artifact records a private candidate path")
             expected_entry_children = 2 + int(
-                version == ANALYSIS_SCHEMA_VERSION_V2
+                version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}
             )
             if len(entry) != expected_entry_children:
                 raise AnalysisArtifactInvalid(
@@ -1912,7 +2023,7 @@ def inspect_analysis_artifact(
             # source identity meanwhile; an unbound raw-popup graph must not
             # acquire artifact authority merely by being local-hard HDF5.
             allowed = {kind.group, _PROVENANCE}
-            if version == ANALYSIS_SCHEMA_VERSION_V2:
+            if version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
                 allowed.add(_EXECUTION_ATTESTATION)
             if any(name not in allowed for name in entry):
                 raise AnalysisArtifactInvalid("analysis artifact contains an unknown entry graph")
@@ -1920,7 +2031,7 @@ def inspect_analysis_artifact(
             if expected_request is not None and provenance != expected_request.provenance_json:
                 raise AnalysisArtifactInvalid("analysis artifact provenance changed")
             execution_attestation_json = None
-            if version == ANALYSIS_SCHEMA_VERSION_V2:
+            if version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
                 execution_attestation_json = _read_scalar_execution_attestation(
                     entry,
                     _EXECUTION_ATTESTATION,
@@ -1938,8 +2049,33 @@ def inspect_analysis_artifact(
                     raise AnalysisArtifactInvalid(
                         "analysis artifact execution attestation changed"
                     )
+                parsed_attestation = json.loads(execution_attestation_json)
+                if (
+                    kind is AnalysisArtifactKind.RSM
+                    and not _rsm_frame_provenance_matches(
+                        provenance,
+                        parsed_attestation,
+                    )
+                ):
+                    raise AnalysisArtifactInvalid(
+                        "analysis RSM frame provenance and attestation disagree"
+                    )
+                if version == ANALYSIS_SCHEMA_VERSION_V2 and kind is AnalysisArtifactKind.RSM:
+                    valid_hkl_attestation = parsed_attestation.get(
+                        "schema_version"
+                    ) == "rsm-execution-attestation-v1" or (
+                        parsed_attestation.get("schema_version")
+                        == "rsm-execution-attestation-v2"
+                        and parsed_attestation.get("coordinate_frame") == "hkl"
+                    )
+                    if not valid_hkl_attestation:
+                        raise AnalysisArtifactInvalid(
+                            "analysis artifact v2 requires an HKL attestation"
+                        )
             result = _direct(entry, kind.group, h5py.Group)
             expected_result_attrs = {"NX_class", "signal", "axes"}
+            if version == ANALYSIS_SCHEMA_VERSION_V3:
+                expected_result_attrs.add("coordinate_frame")
             if len(result.attrs) != len(expected_result_attrs) or any(
                 name not in expected_result_attrs for name in result.attrs
             ):
@@ -1953,11 +2089,29 @@ def inspect_analysis_artifact(
             group_provenance = _read_scalar_text(result, _PROVENANCE)
             if group_provenance != provenance:
                 raise AnalysisArtifactInvalid("result and artifact provenance differ")
-            axis_names = {
-                AnalysisArtifactKind.STITCH_1D: ("q",),
-                AnalysisArtifactKind.STITCH_2D: ("q", "chi"),
-                AnalysisArtifactKind.RSM: ("h", "k", "l"),
-            }[kind]
+            coordinate_frame = None
+            if version == ANALYSIS_SCHEMA_VERSION_V3:
+                from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
+
+                try:
+                    coordinate_frame = RSMCoordinateFrame(
+                        _bounded_attr_text(result, "coordinate_frame")
+                    )
+                except ValueError as error:
+                    raise AnalysisArtifactInvalid(
+                        "analysis RSM coordinate frame is invalid"
+                    ) from error
+                if coordinate_frame is not RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU:
+                    raise AnalysisArtifactInvalid(
+                        "analysis artifact v3 requires Cartesian-Q coordinates"
+                    )
+                axis_names = coordinate_frame.axis_names
+            else:
+                axis_names = {
+                    AnalysisArtifactKind.STITCH_1D: ("q",),
+                    AnalysisArtifactKind.STITCH_2D: ("q", "chi"),
+                    AnalysisArtifactKind.RSM: ("h", "k", "l"),
+                }[kind]
             if _bounded_attr_texts(result, "axes") != axis_names:
                 raise AnalysisArtifactInvalid("analysis result axes are invalid")
             allowed_result = {"intensity", _PROVENANCE, *axis_names}
@@ -1991,14 +2145,22 @@ def inspect_analysis_artifact(
             axes = tuple((name, _axis(result, name)) for name in axis_names)
             for name, _values in axes:
                 axis = _direct(result, name, h5py.Dataset)
-                expected_axis_attrs = (
-                    {"units"}
-                    if kind in {
-                        AnalysisArtifactKind.STITCH_1D,
-                        AnalysisArtifactKind.STITCH_2D,
-                    }
-                    else set()
-                )
+                expected_axis_attrs = set()
+                if kind in {
+                    AnalysisArtifactKind.STITCH_1D,
+                    AnalysisArtifactKind.STITCH_2D,
+                } or (
+                    coordinate_frame is not None
+                    and dict(
+                        zip(
+                            coordinate_frame.axis_names,
+                            coordinate_frame.axis_units,
+                            strict=True,
+                        )
+                    )[name]
+                    is not None
+                ):
+                    expected_axis_attrs.add("units")
                 if len(axis.attrs) != len(expected_axis_attrs) or any(
                     attr not in expected_axis_attrs for attr in axis.attrs
                 ):
@@ -2023,6 +2185,25 @@ def inspect_analysis_artifact(
                 if not chi_units:
                     raise AnalysisArtifactInvalid("stitched chi units are invalid")
                 axis_units[1] = ("chi", chi_units)
+            if coordinate_frame is not None:
+                for index, (name, expected_units) in enumerate(
+                    zip(
+                        coordinate_frame.axis_names,
+                        coordinate_frame.axis_units,
+                        strict=True,
+                    )
+                ):
+                    if expected_units is None:
+                        continue
+                    observed_units = _bounded_attr_text(
+                        _direct(result, name, h5py.Dataset),
+                        "units",
+                    )
+                    if observed_units != expected_units:
+                        raise AnalysisArtifactInvalid(
+                            f"analysis RSM axis {name} units are invalid"
+                        )
+                    axis_units[index] = (name, observed_units)
             if version == ANALYSIS_SCHEMA_VERSION_V2:
                 if kind is AnalysisArtifactKind.STITCH_1D:
                     if (
@@ -2048,6 +2229,45 @@ def inspect_analysis_artifact(
                 else:
                     raise AnalysisArtifactInvalid(
                         "analysis artifact v2 kind is unsupported"
+                    )
+            elif version == ANALYSIS_SCHEMA_VERSION_V3:
+                try:
+                    provenance_value = json.loads(provenance)
+                    attestation_value = json.loads(execution_attestation_json)
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise AnalysisArtifactInvalid(
+                        "analysis artifact v3 frame identity is malformed"
+                    ) from error
+                if (
+                    coordinate_frame is None
+                    or tuple(axis_units)
+                    != tuple(
+                        zip(
+                            coordinate_frame.axis_names,
+                            coordinate_frame.axis_units,
+                            strict=True,
+                        )
+                    )
+                    or has_sigma
+                    or has_stitch_diagnostics
+                    or provenance_value.get("coordinate_frame")
+                    != {
+                        "name": coordinate_frame.value,
+                        "axis_names": list(coordinate_frame.axis_names),
+                        "axis_units": list(coordinate_frame.axis_units),
+                        "matrix_policy": coordinate_frame.matrix_policy,
+                    }
+                    or attestation_value.get("coordinate_frame")
+                    != coordinate_frame.value
+                    or attestation_value.get("axis_names")
+                    != list(coordinate_frame.axis_names)
+                    or attestation_value.get("axis_units")
+                    != list(coordinate_frame.axis_units)
+                    or attestation_value.get("matrix_policy")
+                    != coordinate_frame.matrix_policy
+                ):
+                    raise AnalysisArtifactInvalid(
+                        "analysis artifact v3 requires the exact frame-aware RSM schema"
                     )
             intensity = _direct(result, "intensity", h5py.Dataset)
             if len(intensity.attrs) != 0:
@@ -2308,6 +2528,21 @@ def read_analysis_artifact(
                     raise AnalysisArtifactInvalid(
                         "analysis chi units changed after admission"
                     )
+            if (
+                inspection.kind is AnalysisArtifactKind.RSM
+                and inspection.schema_version == ANALYSIS_SCHEMA_VERSION_V3
+            ):
+                for name, expected_units in inspection.axis_units:
+                    axis = _direct(result, name, h5py.Dataset)
+                    if expected_units is None:
+                        if "units" in axis.attrs:
+                            raise AnalysisArtifactInvalid(
+                                f"analysis RSM axis {name} units changed after admission"
+                            )
+                    elif _bounded_attr_text(axis, "units") != expected_units:
+                        raise AnalysisArtifactInvalid(
+                            f"analysis RSM axis {name} units changed after admission"
+                        )
             try:
                 projection = project_analysis_artifact_result(
                     kind=inspection.kind,
@@ -2469,7 +2704,10 @@ class AnalysisArtifactOutput:
                 ("file_name", self.request.target),
             ):
                 entry.attrs.create(name, np.bytes_(value.encode("utf-8")))
-            if self.request.schema_version == ANALYSIS_SCHEMA_VERSION_V2:
+            if self.request.schema_version in {
+                ANALYSIS_SCHEMA_VERSION_V2,
+                ANALYSIS_SCHEMA_VERSION_V3,
+            }:
                 entry.attrs.create(
                     _EXECUTION_ATTESTATION_DIGEST_ATTR,
                     np.bytes_(
@@ -2482,7 +2720,10 @@ class AnalysisArtifactOutput:
                 _PROVENANCE,
                 data=np.bytes_(self.request.provenance_json.encode("utf-8")),
             )
-            if self.request.schema_version == ANALYSIS_SCHEMA_VERSION_V2:
+            if self.request.schema_version in {
+                ANALYSIS_SCHEMA_VERSION_V2,
+                ANALYSIS_SCHEMA_VERSION_V3,
+            }:
                 entry.create_dataset(
                     _EXECUTION_ATTESTATION,
                     data=np.bytes_(
@@ -2821,6 +3062,7 @@ __all__ = [
     "ANALYSIS_SCHEMA_NAME",
     "ANALYSIS_SCHEMA_VERSION",
     "ANALYSIS_SCHEMA_VERSION_V2",
+    "ANALYSIS_SCHEMA_VERSION_V3",
     "ANALYSIS_SCHEMA_VERSION_ATTR",
     "AnalysisArtifactCleanupPending",
     "AnalysisArtifactError",

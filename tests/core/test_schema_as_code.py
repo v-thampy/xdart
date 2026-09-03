@@ -53,10 +53,12 @@ def test_row_aligned_and_axis_declarations():
 
 def test_writer_stamp_matches_schema(tmp_path):
     from xrd_tools.io import open_nexus_writer
+    from tests.core.v2_fixture_factory import make_v2_entry
 
-    p = tmp_path / "s.nxs"
+    p = tmp_path / "s.nexus"
     f = open_nexus_writer(p, overwrite=True)
     try:
+        make_v2_entry(f)
         e = f["entry"]
         assert e.attrs[SCHEMA_NAME_ATTR] == SCHEMA.name
         assert int(e.attrs[SCHEMA_VERSION_ATTR]) == SCHEMA.version
@@ -282,11 +284,11 @@ def test_capabilities_detected_on_real_files(tmp_path):
 def test_get_metadata_reports_capabilities(tmp_path):
     """The additive 'capabilities' key: notebooks can ask a file what
     optional features it carries instead of probing datasets."""
-    from xrd_tools.io import get_metadata
+    from xrd_tools.io import get_metadata, open_nexus_writer
     from tests.core.v2_fixture_factory import make_v2_entry
 
-    p = tmp_path / "caps.nxs"
-    with h5py.File(p, "w") as f:
+    p = tmp_path / "caps.nexus"
+    with open_nexus_writer(p, overwrite=True) as f:
         make_v2_entry(f)
     caps = get_metadata(p)["capabilities"]
     assert "sigma_1d" in caps and "two_d_kind" in caps

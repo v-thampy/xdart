@@ -16,12 +16,12 @@ objects this script builds:
                                      (CorrectionStack) — the section-3 fields.
 
 It then RUNs the grid (Σ(raw·w)/Σ(w) accumulator over real ``xrayutilities``),
-PERSISTs the volume to a temp ``.nxs`` with the plan provenance, READS it back,
+PERSISTs the volume to a temp ``.nexus`` with the plan provenance, READS it back,
 and round-trips the plan through ``RSMPlan.from_provenance`` — the reload half of
 the section-3 contract.
 
 No Qt / GUI imports.  Synthetic data is generated in-script (no external files);
-the only file written is a tempfile ``.nxs`` that is cleaned up on exit.  Run it
+the only file written is a tempfile ``.nexus`` that is cleaned up on exit.  Run it
 in an environment where importing ``xdart`` or Qt would fail — it must still
 pass::
 
@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import json
 from pathlib import Path
 
 import h5py
@@ -49,6 +50,7 @@ from xrd_tools.core.geometry import (
     PixelQMap,
 )
 from xrd_tools.io.nexus import read_rsm, write_rsm
+from xrd_tools.rsm import RSMCoordinateFrame
 from xrd_tools.rsm.corrections import rsm_correction_weight
 from xrd_tools.rsm.gridding import grid_img_data_streaming
 
@@ -131,6 +133,7 @@ def main() -> int:
     DIFF_MOTORS = ("phi", "chi", "eta", "tth")   # one name per circle (4)
     BINS = (24, 24, 24)
     CHUNK_SIZE = 3
+    COORDINATE_FRAME = RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
 
     # Section-3 "Corrections" group — the per-pixel CorrectionStack folded into
     # the Σ(raw·w)/Σ(w) grid as the SAME weight stitching uses.
@@ -139,7 +142,7 @@ def main() -> int:
     # Compute the grid bounds up front from the real per-pixel q (the GUI's
     # "auto-scout" alternative to typing q_bounds by hand).
     qx, qy, qz = mapper.pixel_q(
-        angles, energy_eV, UB=np.eye(3), image_shape=img.shape)
+        angles, energy_eV, UB=None, image_shape=img.shape)
     q_bounds = (
         (float(qx.min()), float(qx.max())),
         (float(qy.min()), float(qy.max())),
@@ -154,14 +157,16 @@ def main() -> int:
         mapper=mapper,
         diff_motors=DIFF_MOTORS,
         bins=BINS,
-        UB=np.eye(3),
+        UB=None,
+        coordinate_frame=COORDINATE_FRAME,
         energy=energy_eV,
         chunk_size=CHUNK_SIZE,
         q_bounds=q_bounds,
         corrections=corrections,
     )
     print(f"[SECTION 3: PLAN]   RSMPlan bins={plan.bins} "
-          f"diff_motors={plan.diff_motors} chunk_size={plan.chunk_size}")
+          f"diff_motors={plan.diff_motors} chunk_size={plan.chunk_size} "
+          f"frame={plan.coordinate_frame.value}")
     print(f"[SECTION 3: PLAN]   q_bounds="
           f"{[(round(lo, 3), round(hi, 3)) for lo, hi in plan.q_bounds]}, "
           f"corrections.solid_angle={plan.corrections.solid_angle}")
@@ -180,6 +185,7 @@ def main() -> int:
         mapper, img, angles, energy=plan.energy,
         UB=plan.UB, bins=plan.bins, chunk_size=plan.chunk_size,
         q_bounds=plan.q_bounds, weight=weight,
+        coordinate_frame=plan.coordinate_frame,
     )
     assert volume.shape == BINS, volume.shape
     n_filled = int(np.isfinite(volume.intensity).sum())
@@ -192,26 +198,37 @@ def main() -> int:
     # ===== DISPLAY =========================================================
     # ========================================================================
     # The display layer would slice the volume; here we just summarise an
-    # H-K-L projection so the run has a sane, inspectable output.
+    # Qx projection so the run has a sane, inspectable output.
     finite = np.isfinite(volume.intensity)
     proj = np.nansum(np.where(finite, volume.intensity, 0.0), axis=(1, 2))
-    print(f"[DISPLAY] H-axis projection peak at h={volume.h[int(np.argmax(proj))]:.4f}, "
+    print(f"[DISPLAY] Qx-axis projection peak at qx="
+          f"{volume.qx[int(np.argmax(proj))]:.4f} Å⁻¹, "
           f"I_total={float(np.nansum(volume.intensity[finite])):.1f}")
 
     # ========================================================================
     # ===== PERSIST + READ-BACK + RELOAD ROUND-TRIP =========================
     # ========================================================================
     with tempfile.TemporaryDirectory() as tmp:
-        nxs = Path(tmp) / "headless_rsm.nxs"
+        nxs = Path(tmp) / "headless_rsm.nexus"
 
         # Persist: /entry/rsm = the volume + the plan provenance blob.
         with h5py.File(nxs, "w") as f:
             entry = f.create_group("entry")
-            write_rsm(entry, volume, provenance=plan.provenance())
+            write_rsm(
+                entry,
+                volume,
+                provenance=json.dumps(
+                    plan.provenance(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                bounded_artifact=True,
+            )
 
         # Read the volume back through the public API.
         reloaded = read_rsm(nxs)
         assert reloaded.shape == volume.shape, reloaded.shape
+        assert reloaded.coordinate_frame is COORDINATE_FRAME
         np.testing.assert_allclose(reloaded.intensity, volume.intensity,
                                    rtol=1e-5, atol=1e-5, equal_nan=True)
         assert reloaded.provenance is not None, "provenance blob missing on read-back"
@@ -227,6 +244,7 @@ def main() -> int:
         assert back.q_bounds == plan.q_bounds, (back.q_bounds, plan.q_bounds)
         assert back.diff_motors == plan.diff_motors, (back.diff_motors, plan.diff_motors)
         assert back.energy == plan.energy
+        assert back.coordinate_frame is plan.coordinate_frame
         assert back.corrections is not None and back.corrections.solid_angle is True
         assert back.mapper is mapper          # reattached, not from provenance
         print(f"[RELOAD]  provenance round-trip OK: bins/q_bounds/diff_motors match, "

@@ -125,6 +125,13 @@ def get_energy_and_UB(spec_file: Path | str, scan_num: str) -> tuple[float, np.n
     return energy, UB
 
 
+def get_energy(spec_file: Path | str, scan_num: str) -> float:
+    """Return scan energy without requiring or parsing a ``#G3`` UB header."""
+
+    scan_data = _get_spec_scan(spec_file, scan_num)
+    return float(scan_data.motor_position_by_name("energy"))
+
+
 def get_spec_scan_type(spec_file: Path | str, scan_num: str) -> str | list[str]:
     scan_data = _get_spec_scan(spec_file, scan_num)
     scan_hdr = scan_data.scan_header_dict["S"].split()

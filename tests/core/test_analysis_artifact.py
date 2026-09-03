@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
 from pathlib import Path
 import pickle
@@ -19,6 +20,7 @@ from xrd_tools.io.analysis_artifact import (
     ANALYSIS_SCHEMA_ATTR,
     ANALYSIS_SCHEMA_NAME,
     ANALYSIS_SCHEMA_VERSION_V2,
+    ANALYSIS_SCHEMA_VERSION_V3,
     AnalysisArtifactCleanupPending,
     AnalysisArtifactError,
     AnalysisArtifactInvalid,
@@ -56,6 +58,7 @@ from xrd_tools.io.processed_scan_id import (
     require_raw_input,
 )
 from xrd_tools.rsm.volume import RSMVolume
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 from xrd_tools.sources.descriptor import describe_container
 from xrd_tools.sources.probe import ProbeState
 
@@ -184,6 +187,50 @@ def _rsm_execution_attestation(
             "nthreads_effective": 1,
             "nthreads_restored": 0,
             "restore_passed": True,
+        },
+    }
+
+
+def _rsm_frame_execution_attestation(
+    request_fingerprint: str,
+    result_fingerprint: str,
+    frame: RSMCoordinateFrame,
+) -> dict[str, object]:
+    value = _rsm_execution_attestation(
+        request_fingerprint,
+        result_fingerprint,
+    )
+    value.update(
+        {
+            "schema_version": "rsm-execution-attestation-v2",
+            "coordinate_frame": frame.value,
+            "axis_names": list(frame.axis_names),
+            "axis_units": list(frame.axis_units),
+            "matrix_policy": frame.matrix_policy,
+        }
+    )
+    return value
+
+
+def _rsm_q_execution_attestation(
+    request_fingerprint: str,
+    result_fingerprint: str,
+) -> dict[str, object]:
+    return _rsm_frame_execution_attestation(
+        request_fingerprint,
+        result_fingerprint,
+        RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU,
+    )
+
+
+def _rsm_frame_provenance(frame: RSMCoordinateFrame) -> dict[str, object]:
+    return {
+        "schema_version": "rsm-operation-v3-intent",
+        "coordinate_frame": {
+            "name": frame.value,
+            "axis_names": list(frame.axis_names),
+            "axis_units": list(frame.axis_units),
+            "matrix_policy": frame.matrix_policy,
         },
     }
 
@@ -754,6 +801,342 @@ def test_analysis_artifact_v2_rsm_round_trip_is_a_closed_exact_branch(
         }
         assert set(result) == {"h", "k", "l", "intensity", "provenance_json"}
         assert all(len(result[name].attrs) == 0 for name in ("h", "k", "l"))
+
+
+def test_analysis_artifact_v2_frame_aware_hkl_binds_provenance_and_attestation(
+    tmp_path,
+):
+    frame = RSMCoordinateFrame.HKL
+    projection = project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.RSM,
+        axes=(
+            ("h", np.linspace(-1.0, 1.0, 3)),
+            ("k", np.linspace(-2.0, 2.0, 4)),
+            ("l", np.linspace(0.0, 3.0, 5)),
+        ),
+        axis_units=tuple(zip(frame.axis_names, frame.axis_units, strict=True)),
+        intensity=np.arange(60, dtype=np.float64).reshape(3, 4, 5),
+        sigma=None,
+        coverage=None,
+        normalization=None,
+    )
+    request_fingerprint = _digest("rsm-v2-frame-aware-hkl-request")
+    attestation = _rsm_frame_execution_attestation(
+        request_fingerprint,
+        projection.result_fingerprint,
+        frame,
+    )
+    attestation_digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.RSM,
+        attestation,
+        request_fingerprint=request_fingerprint,
+    )
+    provenance = _rsm_frame_provenance(frame)
+    request = AnalysisArtifactRequest(
+        tmp_path / "rsm-artifact-v2-frame-aware-hkl.nexus",
+        AnalysisArtifactKind.RSM,
+        AnalysisArtifactOverwrite.CREATE_NEW,
+        request_fingerprint,
+        _digest("rsm-v2-frame-aware-hkl-source"),
+        _digest("rsm-v2-frame-aware-hkl-plan"),
+        _digest("rsm-v2-frame-aware-hkl-provenance"),
+        provenance,
+        schema_version=ANALYSIS_SCHEMA_VERSION_V2,
+        execution_attestation_digest=attestation_digest,
+        execution_attestation=attestation,
+    )
+    receipt = admit_analysis_artifact(
+        request,
+        coordinator=OutputTransactionCoordinator(),
+    ).publish(
+        lambda entry: write_rsm(
+            entry,
+            result_projection=projection,
+            provenance=request.provenance_json,
+            bounded_artifact=True,
+        )
+    )
+    payload = read_analysis_artifact(request.target, expected_receipt=receipt)
+    assert payload.schema_version == ANALYSIS_SCHEMA_VERSION_V2
+    assert json.loads(payload.execution_attestation_json) == attestation
+
+    mismatched = copy.deepcopy(provenance)
+    mismatched["coordinate_frame"]["matrix_policy"] = (
+        "authenticated-source-ub-f8-v2"
+    )
+    with pytest.raises(
+        ValueError,
+        match="frame provenance and attestation disagree",
+    ):
+        AnalysisArtifactRequest(
+            tmp_path / "refused-rsm-v2-frame-aware-hkl.nexus",
+            AnalysisArtifactKind.RSM,
+            AnalysisArtifactOverwrite.CREATE_NEW,
+            request_fingerprint,
+            _digest("rsm-v2-frame-aware-hkl-source"),
+            _digest("rsm-v2-frame-aware-hkl-plan"),
+            _digest("rsm-v2-frame-aware-hkl-provenance"),
+            mismatched,
+            schema_version=ANALYSIS_SCHEMA_VERSION_V2,
+            execution_attestation_digest=attestation_digest,
+            execution_attestation=attestation,
+        )
+
+    mismatched_json = canonical_analysis_provenance(mismatched)
+    assert len(mismatched_json) == len(request.provenance_json)
+    with h5py.File(request.target, "r+") as handle:
+        handle["entry/provenance_json"][()] = np.bytes_(
+            mismatched_json.encode("utf-8")
+        )
+        handle["entry/rsm/provenance_json"][()] = np.bytes_(
+            mismatched_json.encode("utf-8")
+        )
+    with pytest.raises(
+        AnalysisArtifactInvalid,
+        match="frame provenance and attestation disagree",
+    ):
+        inspect_analysis_artifact(request.target)
+
+
+def test_analysis_artifact_v3_cartesian_q_round_trip_is_a_closed_exact_branch(
+    tmp_path,
+):
+    frame = RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    projection = project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.RSM,
+        axes=(
+            ("qx", np.linspace(-1.0, 1.0, 3)),
+            ("qy", np.linspace(-2.0, 2.0, 4)),
+            ("qz", np.linspace(0.0, 3.0, 5)),
+        ),
+        axis_units=tuple(
+            zip(frame.axis_names, frame.axis_units, strict=True)
+        ),
+        intensity=np.arange(60, dtype=np.float64).reshape(3, 4, 5),
+        sigma=None,
+        coverage=None,
+        normalization=None,
+    )
+    request_fingerprint = _digest("rsm-v3-q-request")
+    attestation = _rsm_q_execution_attestation(
+        request_fingerprint,
+        projection.result_fingerprint,
+    )
+    attestation_digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.RSM,
+        attestation,
+        request_fingerprint=request_fingerprint,
+    )
+    provenance = {
+        "schema_version": "rsm-operation-v3-intent",
+        "coordinate_frame": {
+            "name": frame.value,
+            "axis_names": list(frame.axis_names),
+            "axis_units": list(frame.axis_units),
+            "matrix_policy": frame.matrix_policy,
+        },
+    }
+    request = AnalysisArtifactRequest(
+        tmp_path / "rsm-artifact-v3-q.nexus",
+        AnalysisArtifactKind.RSM,
+        AnalysisArtifactOverwrite.CREATE_NEW,
+        request_fingerprint,
+        _digest("rsm-v3-q-source-group"),
+        _digest("rsm-v3-q-plan"),
+        _digest("rsm-v3-q-provenance"),
+        provenance,
+        schema_version=ANALYSIS_SCHEMA_VERSION_V3,
+        execution_attestation_digest=attestation_digest,
+        execution_attestation=attestation,
+    )
+    receipt = admit_analysis_artifact(
+        request,
+        coordinator=OutputTransactionCoordinator(),
+    ).publish(
+        lambda entry: write_rsm(
+            entry,
+            result_projection=projection,
+            provenance=request.provenance_json,
+            bounded_artifact=True,
+            coordinate_frame=frame,
+        )
+    )
+    payload = read_analysis_artifact(request.target, expected_receipt=receipt)
+    assert payload.kind is AnalysisArtifactKind.RSM
+    assert payload.schema_version == ANALYSIS_SCHEMA_VERSION_V3
+    assert payload.execution_attestation_digest == attestation_digest
+    assert payload.result_fingerprint == projection.result_fingerprint
+    assert payload.inspection.axis_units == (
+        ("qx", "q_A^-1"),
+        ("qy", "q_A^-1"),
+        ("qz", "q_A^-1"),
+    )
+    with h5py.File(request.target, "r") as handle:
+        entry = handle["entry"]
+        result = entry["rsm"]
+        assert int(entry.attrs["ssrl_schema_version"]) == 3
+        assert result.attrs["coordinate_frame"] == b"q_sample_cartesian_xu"
+        assert tuple(result.attrs["axes"]) == (b"qx", b"qy", b"qz")
+        assert set(result) == {
+            "qx",
+            "qy",
+            "qz",
+            "intensity",
+            "provenance_json",
+        }
+        assert all(
+            result[name].attrs["units"] == b"q_A^-1"
+            for name in frame.axis_names
+        )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "coordinate-frame",
+        "axis-order",
+        "axis-unit",
+        "provenance-matrix-policy",
+        "attestation-matrix-policy",
+    ),
+)
+def test_analysis_artifact_v3_cartesian_q_rejects_frame_tampering(
+    tmp_path,
+    tamper,
+):
+    frame = RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    projection = project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.RSM,
+        axes=tuple(
+            (name, np.linspace(index, index + 1.0, size))
+            for index, (name, size) in enumerate(
+                zip(frame.axis_names, (3, 4, 5), strict=True)
+            )
+        ),
+        axis_units=tuple(zip(frame.axis_names, frame.axis_units, strict=True)),
+        intensity=np.arange(60, dtype=np.float64).reshape(3, 4, 5),
+        sigma=None,
+        coverage=None,
+        normalization=None,
+    )
+    request_fingerprint = _digest(f"rsm-v3-q-tamper-{tamper}")
+    attestation = _rsm_q_execution_attestation(
+        request_fingerprint,
+        projection.result_fingerprint,
+    )
+    attestation_digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.RSM,
+        attestation,
+        request_fingerprint=request_fingerprint,
+    )
+    provenance = _rsm_frame_provenance(frame)
+    request = AnalysisArtifactRequest(
+        tmp_path / f"rsm-artifact-v3-q-{tamper}.nexus",
+        AnalysisArtifactKind.RSM,
+        AnalysisArtifactOverwrite.CREATE_NEW,
+        request_fingerprint,
+        _digest(f"rsm-v3-q-source-{tamper}"),
+        _digest(f"rsm-v3-q-plan-{tamper}"),
+        _digest(f"rsm-v3-q-provenance-{tamper}"),
+        provenance,
+        schema_version=ANALYSIS_SCHEMA_VERSION_V3,
+        execution_attestation_digest=attestation_digest,
+        execution_attestation=attestation,
+    )
+    admit_analysis_artifact(
+        request,
+        coordinator=OutputTransactionCoordinator(),
+    ).publish(
+        lambda entry: write_rsm(
+            entry,
+            result_projection=projection,
+            provenance=request.provenance_json,
+            bounded_artifact=True,
+            coordinate_frame=frame,
+        )
+    )
+
+    with h5py.File(request.target, "r+") as handle:
+        entry = handle["entry"]
+        result = entry["rsm"]
+        if tamper == "coordinate-frame":
+            result.attrs["coordinate_frame"] = np.bytes_(
+                b"q_sample_cartesian_xv"
+            )
+        elif tamper == "axis-order":
+            result.attrs["axes"] = np.asarray((b"qy", b"qx", b"qz"))
+        elif tamper == "axis-unit":
+            result["qx"].attrs["units"] = np.bytes_(b"q_A^-2")
+        elif tamper == "provenance-matrix-policy":
+            mutated = copy.deepcopy(provenance)
+            mutated["coordinate_frame"]["matrix_policy"] = (
+                "explicit-identity-ub-f8-v2"
+            )
+            text = canonical_analysis_provenance(mutated)
+            assert len(text) == len(request.provenance_json)
+            entry["provenance_json"][()] = np.bytes_(text.encode("utf-8"))
+            result["provenance_json"][()] = np.bytes_(text.encode("utf-8"))
+        else:
+            mutated = copy.deepcopy(attestation)
+            mutated["matrix_policy"] = "explicit-identity-ub-f8-v2"
+            text = json.dumps(
+                mutated,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            assert len(text) == len(request.execution_attestation_json)
+            entry["execution_attestation_json"][()] = np.bytes_(
+                text.encode("utf-8")
+            )
+    with pytest.raises(AnalysisArtifactInvalid):
+        inspect_analysis_artifact(request.target)
+
+
+def test_analysis_artifact_rsm_versions_refuse_cross_frame_attestations(tmp_path):
+    result_fingerprint = _digest("rsm-cross-version-result")
+    request_fingerprint = _digest("rsm-cross-version-request")
+    hkl = _rsm_execution_attestation(request_fingerprint, result_fingerprint)
+    cartesian_q = _rsm_q_execution_attestation(
+        request_fingerprint,
+        result_fingerprint,
+    )
+    hkl_digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.RSM,
+        hkl,
+        request_fingerprint=request_fingerprint,
+    )
+    q_digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.RSM,
+        cartesian_q,
+        request_fingerprint=request_fingerprint,
+    )
+    common = (
+        AnalysisArtifactKind.RSM,
+        AnalysisArtifactOverwrite.CREATE_NEW,
+        request_fingerprint,
+        _digest("rsm-cross-version-source"),
+        _digest("rsm-cross-version-plan"),
+        _digest("rsm-cross-version-provenance"),
+        {},
+    )
+    with pytest.raises(ValueError, match="HKL contract"):
+        AnalysisArtifactRequest(
+            tmp_path / "v2-with-q.nexus",
+            *common,
+            schema_version=ANALYSIS_SCHEMA_VERSION_V2,
+            execution_attestation_digest=q_digest,
+            execution_attestation=cartesian_q,
+        )
+    with pytest.raises(ValueError, match="frame contract"):
+        AnalysisArtifactRequest(
+            tmp_path / "v3-with-hkl.nexus",
+            *common,
+            schema_version=ANALYSIS_SCHEMA_VERSION_V3,
+            execution_attestation_digest=hkl_digest,
+            execution_attestation=hkl,
+        )
 
 
 @pytest.mark.parametrize(

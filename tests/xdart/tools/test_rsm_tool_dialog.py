@@ -61,6 +61,7 @@ from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactOverwrite,
     project_analysis_artifact_result,
 )
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 from xrd_tools.session.rsm_viewer_model import make_rsm_viewer_values
 
 
@@ -151,6 +152,32 @@ def _values(shape=(5, 7, 9), *, offset=0.0):
     return make_rsm_viewer_values(projection)
 
 
+def _q_values(shape=(5, 7, 9), *, offset=0.0):
+    frame = RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    axes = tuple(
+        (
+            name,
+            np.linspace(offset + index, offset + index + 1.0, size),
+        )
+        for index, (name, size) in enumerate(
+            zip(frame.axis_names, shape, strict=True)
+        )
+    )
+    intensity = np.arange(np.prod(shape), dtype=np.float64).reshape(shape) + offset
+    projection = project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.RSM,
+        axes=axes,
+        axis_units=tuple(
+            zip(frame.axis_names, frame.axis_units, strict=True)
+        ),
+        intensity=intensity,
+        sigma=None,
+        coverage=None,
+        normalization=None,
+    )
+    return make_rsm_viewer_values(projection)
+
+
 class _Result:
     pass
 
@@ -210,7 +237,7 @@ def _write_member(root: Path, ordinal: int):
     )
 
 
-def _prepared_v2(root):
+def _prepared_v2(root, coordinate_frame=RSMCoordinateFrame.HKL):
     install_canonical_rsm_geometry_asset(project_root=root)
     output = root / "output"
     output.mkdir(exist_ok=True)
@@ -226,6 +253,7 @@ def _prepared_v2(root):
         16 * 1024 * 1024,
         output / "rsm-v2.nexus",
         AnalysisArtifactOverwrite.CREATE_NEW,
+        coordinate_frame,
     )
     return prepare_rsm_tool_v2(form)
 
@@ -271,6 +299,32 @@ def test_v2_form_editor_and_six_panel_shell_do_no_source_io(
     finally:
         assert dialog.shutdown().status is PageCleanup.CLEAN
     assert owner.closed == 1
+
+
+def test_coordinate_frame_selector_binds_form_and_create_new_policy(qapp, tmp_path):
+    dialog, _owner, _status = _dialog(qapp)
+    try:
+        _fill_form(dialog, tmp_path)
+        initial = dialog._build_form()
+        assert initial.coordinate_frame is RSMCoordinateFrame.HKL
+        assert initial.overwrite is AnalysisArtifactOverwrite.CREATE_NEW
+        assert dialog.output_policy_label.text() == "Create new (refuse if present)"
+        dialog._prepared_form_fingerprint = initial.fingerprint
+        prior_revision = dialog._form_revision
+
+        dialog.coordinate_frame_combo.setCurrentIndex(1)
+
+        selected = dialog._build_form()
+        assert (
+            selected.coordinate_frame
+            is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+        )
+        assert selected.fingerprint != initial.fingerprint
+        assert dialog._form_revision == prior_revision + 1
+        assert dialog._prepared_form_fingerprint is None
+        assert not dialog.run_button.isEnabled()
+    finally:
+        dialog.shutdown()
 
 
 def test_ordered_member_actions_change_exact_visible_tuple(qapp, tmp_path):
@@ -403,6 +457,10 @@ def test_v2_preflight_presentation_lists_every_identity_member_and_dependency(
             "Holds:",
         ):
             assert label in shown
+        assert (
+            "Source UB authority: authenticated source UB drives H/K/L conversion"
+            in shown
+        )
         for member in prepared.summary.members:
             assert f"Member {member.ordinal + 1}:" in shown
             assert member.source_fingerprint in shown
@@ -415,6 +473,55 @@ def test_v2_preflight_presentation_lists_every_identity_member_and_dependency(
             prepared.summary.geometry_asset_raw_sha256
             in dialog.geometry_identity.text()
         )
+    finally:
+        dialog.shutdown()
+
+
+def test_cartesian_q_preflight_and_surface_use_frame_accurate_labels(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    prepared = _prepared_v2(
+        tmp_path,
+        RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU,
+    )
+    dialog, _owner, _status = _dialog(qapp)
+    values = _q_values()
+    _patch_results(monkeypatch, {"q": values})
+    try:
+        dialog._render_preflight(prepared.summary)
+        shown = dialog.preview_text.toPlainText()
+        assert "Coordinate frame: Q Cartesian" in shown
+        assert "Stored axes: Qx [q_A^-1], Qy [q_A^-1], Qz [q_A^-1]" in shown
+        assert "xrayutilities matrix policy: explicit-identity-ub-f8-v1" in shown
+        assert (
+            "Source UB authority: source UB is unused and non-driving; explicit "
+            "identity drives Cartesian Q" in shown
+        )
+        assert "Union coordinate bounds: Qx " in shown
+        assert "xrayutilities matrix: 1 0 0; 0 1 0; 0 0 1" in shown
+
+        dialog._paint_result(_result("q"))
+        assert dialog._surface_title_texts == (
+            "QxQy slice · Qz index 4",
+            "QxQz slice · Qy index 3",
+            "QyQz slice · Qx index 2",
+            "Qx mean projection",
+            "Qy mean projection",
+            "Qz mean projection",
+        )
+        assert tuple(label.text() for label in dialog.slice_index_labels) == (
+            "Qx",
+            "Qy",
+            "Qz",
+        )
+        assert dialog._surface_axis_label_texts[:3] == (
+            ("Qx (Å⁻¹)", "Qy (Å⁻¹)"),
+            ("Qx (Å⁻¹)", "Qz (Å⁻¹)"),
+            ("Qy (Å⁻¹)", "Qz (Å⁻¹)"),
+        )
+        assert "indices Qx/Qy/Qz 2/3/4" in dialog.result_facts.text()
     finally:
         dialog.shutdown()
 
@@ -855,6 +962,45 @@ def test_late_facts_or_title_failure_restores_all_six(qapp, monkeypatch, failure
                 strict=True,
             )
         )
+    finally:
+        dialog.shutdown()
+
+
+def test_cross_frame_presentation_failure_restores_hkl_labels(qapp, monkeypatch):
+    dialog, _owner, _status = _dialog(qapp)
+    hkl_values = _values()
+    q_values = _q_values()
+    _patch_results(monkeypatch, {"hkl": hkl_values, "q": q_values})
+    try:
+        dialog._paint_result(_result("hkl"))
+        old_items = dialog.surface_items
+        old_snapshot = dialog._painted_snapshot
+        old_titles = dialog._surface_title_texts
+        old_axis_labels = dialog._surface_axis_label_texts
+        old_slice_labels = tuple(
+            label.text() for label in dialog.slice_index_labels
+        )
+        original = dialog.result_facts.setText
+        calls = 0
+
+        def fail_once(value):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("cross-frame facts failed")
+            return original(value)
+
+        monkeypatch.setattr(dialog.result_facts, "setText", fail_once)
+        with pytest.raises(RuntimeError, match="cross-frame facts failed"):
+            dialog._paint_result(_result("q"))
+        assert dialog.surface_items is old_items
+        assert dialog._painted_snapshot is old_snapshot
+        assert dialog._surface_title_texts == old_titles
+        assert dialog._surface_axis_label_texts == old_axis_labels
+        assert tuple(
+            label.text() for label in dialog.slice_index_labels
+        ) == old_slice_labels
+        assert dialog._viewer_values is hkl_values
     finally:
         dialog.shutdown()
 

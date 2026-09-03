@@ -29,6 +29,7 @@ from xrd_tools.analysis.scan_operations import (
 from xrd_tools.io.analysis_artifact import (
     ANALYSIS_SCHEMA_VERSION,
     ANALYSIS_SCHEMA_VERSION_V2,
+    ANALYSIS_SCHEMA_VERSION_V3,
     AnalysisArtifactCleanupPending,
     AnalysisArtifactKind,
     AnalysisArtifactOutput,
@@ -1022,6 +1023,7 @@ def module_artifact_request(
         raise TypeError(
             "module execution attestation and digest must be supplied together"
         )
+    rsm_uses_cartesian_q = False
     if carries_attestation:
         if request._rsm_v2_bound:
             _validate_rsm_v2_intent(request, provenance)
@@ -1052,6 +1054,12 @@ def module_artifact_request(
             members = provenance["members"]
             masks = execution_attestation["member_masks"]
             plan_owner = request._rsm_v2_intent_owner[0]
+            from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
+
+            rsm_uses_cartesian_q = (
+                plan_owner.coordinate_frame
+                is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+            )
             expected_conditioning_fingerprint = analysis_canonical_fingerprint(
                 "rsm-conditioning-v2",
                 plan_owner.conditioning._canonical_value(),
@@ -1078,6 +1086,16 @@ def module_artifact_request(
                 for member in members
             )
             expected_frames = request.source.selected_frame_count
+            frame_attestation_mismatch = (
+                execution_attestation.get("coordinate_frame")
+                != provenance["coordinate_frame"]["name"]
+                or execution_attestation.get("axis_names")
+                != provenance["coordinate_frame"]["axis_names"]
+                or execution_attestation.get("axis_units")
+                != provenance["coordinate_frame"]["axis_units"]
+                or execution_attestation.get("matrix_policy")
+                != provenance["coordinate_frame"]["matrix_policy"]
+            )
             if (
                 execution_attestation.get("selected_scan_count")
                 != len(request.source.members)
@@ -1104,6 +1122,7 @@ def module_artifact_request(
                 != provenance["effective_geometry"]["fingerprint"]
                 or execution_attestation.get("common_grid_fingerprint")
                 != provenance["common_grid"]["fingerprint"]
+                or frame_attestation_mismatch
                 or [
                     item["member_preflight_fingerprint"]
                     for item in masks
@@ -1150,9 +1169,13 @@ def module_artifact_request(
         request.provenance_digest,
         provenance,
         schema_version=(
-            ANALYSIS_SCHEMA_VERSION_V2
-            if carries_attestation
-            else ANALYSIS_SCHEMA_VERSION
+            ANALYSIS_SCHEMA_VERSION_V3
+            if rsm_uses_cartesian_q
+            else (
+                ANALYSIS_SCHEMA_VERSION_V2
+                if carries_attestation
+                else ANALYSIS_SCHEMA_VERSION
+            )
         ),
         execution_attestation_digest=execution_attestation_digest,
         execution_attestation=execution_attestation,

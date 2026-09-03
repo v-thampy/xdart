@@ -12,6 +12,11 @@ from typing import Any as _Any
 
 
 _EXPORTS = {
+    # Closed semantic frame selector.
+    "RSMCoordinateFrame": (
+        "xrd_tools.rsm.coordinate_frame",
+        "RSMCoordinateFrame",
+    ),
     # Canonical geometry owners.
     "DetectorHeader": ("xrd_tools.core.geometry", "DetectorHeader"),
     "DiffractometerConfig": (

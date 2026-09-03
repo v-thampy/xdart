@@ -63,9 +63,9 @@ def test_streaming_equals_single_shot(weight_on):
     mapper, img, angles, weight, bounds = _setup()
     w = weight if weight_on else None
 
-    single = grid_img_data(mapper, img, angles, energy=1.0e4, bins=(8, 8, 8),
+    single = grid_img_data(mapper, img, angles, energy=1.0e4, UB=np.eye(3), bins=(8, 8, 8),
                            mask_static_pixels=False, weight=w)
-    stream = grid_img_data_streaming(mapper, img, angles, energy=1.0e4,
+    stream = grid_img_data_streaming(mapper, img, angles, energy=1.0e4, UB=np.eye(3),
                                      bins=(8, 8, 8), q_bounds=bounds,
                                      chunk_size=3, weight=w)
     np.testing.assert_allclose(single.intensity, stream.intensity, equal_nan=True)
@@ -82,7 +82,7 @@ def test_chunk_size_independent_intensity(weight_on):
 
     def run(cs):
         return grid_img_data_streaming(
-            mapper, img, angles, energy=1.0e4, bins=(8, 8, 8),
+            mapper, img, angles, energy=1.0e4, UB=np.eye(3), bins=(8, 8, 8),
             q_bounds=bounds, chunk_size=cs, weight=w).intensity
 
     a, b, c = run(1), run(3), run(8)
@@ -96,10 +96,10 @@ def test_weight_changes_intensity_vs_count_mean():
     pytest.importorskip("xrayutilities")
     from xrd_tools.rsm.gridding import grid_img_data_streaming
     mapper, img, angles, weight, bounds = _setup()
-    plain = grid_img_data_streaming(mapper, img, angles, energy=1.0e4,
+    plain = grid_img_data_streaming(mapper, img, angles, energy=1.0e4, UB=np.eye(3),
                                     bins=(8, 8, 8), q_bounds=bounds,
                                     chunk_size=4).intensity
-    wtd = grid_img_data_streaming(mapper, img, angles, energy=1.0e4,
+    wtd = grid_img_data_streaming(mapper, img, angles, energy=1.0e4, UB=np.eye(3),
                                   bins=(8, 8, 8), q_bounds=bounds,
                                   chunk_size=4, weight=weight).intensity
     both = np.isfinite(plain) & np.isfinite(wtd)
@@ -119,11 +119,11 @@ def test_3d_per_frame_weight_chunk_equivalence():
     n = img.shape[0]
     w3d = np.random.default_rng(1).uniform(0.2, 1.0, size=img.shape)  # (N, H, W)
 
-    single = grid_img_data(mapper, img, angles, energy=1.0e4, bins=(8, 8, 8),
+    single = grid_img_data(mapper, img, angles, energy=1.0e4, UB=np.eye(3), bins=(8, 8, 8),
                            mask_static_pixels=False, weight=w3d)
     for cs in (1, 3, n):
         stream = grid_img_data_streaming(
-            mapper, img, angles, energy=1.0e4, bins=(8, 8, 8),
+            mapper, img, angles, energy=1.0e4, UB=np.eye(3), bins=(8, 8, 8),
             q_bounds=bounds, chunk_size=cs, weight=w3d)
         np.testing.assert_allclose(single.intensity, stream.intensity, equal_nan=True)
 
@@ -136,5 +136,5 @@ def test_3d_weight_frame_count_mismatch_raises():
     mapper, img, angles, _w2d, bounds = _setup()
     bad = np.ones((img.shape[0] + 1, img.shape[1], img.shape[2]))
     with pytest.raises(ValueError, match="per-frame weight"):
-        grid_img_data_streaming(mapper, img, angles, energy=1.0e4, bins=(8, 8, 8),
+        grid_img_data_streaming(mapper, img, angles, energy=1.0e4, UB=np.eye(3), bins=(8, 8, 8),
                                 q_bounds=bounds, chunk_size=3, weight=bad)

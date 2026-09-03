@@ -54,6 +54,7 @@ from xrd_tools.io.output_transaction import OutputTransactionCoordinator, Transa
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.io.nexus import write_rsm, write_stitched
 from xrd_tools.rsm.volume import RSMVolume
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 from xrd_tools.sources.selection import image_series_spec
 
 
@@ -242,7 +243,7 @@ def _rsm_attestation(
         for member in members
     )
     return {
-        "schema_version": "rsm-execution-attestation-v1",
+        "schema_version": "rsm-execution-attestation-v2",
         "module_request_fingerprint": request.fingerprint,
         "result_projection_policy": "analysis_artifact_stored_le_f4_v1",
         "result_fingerprint": result_fingerprint,
@@ -283,6 +284,10 @@ def _rsm_attestation(
                 for ordinal, receipt in enumerate(mask_receipts)
             ]
         ),
+        "coordinate_frame": provenance["coordinate_frame"]["name"],
+        "axis_names": provenance["coordinate_frame"]["axis_names"],
+        "axis_units": provenance["coordinate_frame"]["axis_units"],
+        "matrix_policy": provenance["coordinate_frame"]["matrix_policy"],
         "xu_runtime": {
             "lock_policy": "shared_xrd_tools_xu_rlock_v1",
             "xrayutilities_distribution_version": "1.7.12",
@@ -1145,6 +1150,33 @@ def test_rsm_v2_module_commit_binds_group_and_exact_attestation(
             provenance,
             execution_attestation=forged,
             execution_attestation_digest=forged_digest,
+            rsm_mask_receipts=mask_receipts,
+        )
+
+    retagged = copy.deepcopy(attestation)
+    foreign_frame = RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    retagged.update(
+        {
+            "coordinate_frame": foreign_frame.value,
+            "axis_names": list(foreign_frame.axis_names),
+            "axis_units": list(foreign_frame.axis_units),
+            "matrix_policy": foreign_frame.matrix_policy,
+        }
+    )
+    retagged_digest = analysis_execution_attestation_digest(
+        AnalysisArtifactKind.RSM,
+        retagged,
+        request_fingerprint=request.fingerprint,
+    )
+    with pytest.raises(
+        ModuleArtifactRefused,
+        match="RSM_EXECUTION_ATTESTATION_MISMATCH",
+    ):
+        module_artifact_request(
+            request,
+            provenance,
+            execution_attestation=retagged,
+            execution_attestation_digest=retagged_digest,
             rsm_mask_receipts=mask_receipts,
         )
 

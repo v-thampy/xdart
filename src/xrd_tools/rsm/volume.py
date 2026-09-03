@@ -2,8 +2,8 @@
 RSMVolume container and associated slice/line-cut/VTK utilities.
 
 Contains:
-- RSMVolume          — dataclass for gridded H-K-L intensity volumes
-- mask_data()        — crop a volume to an H-K-L bounding box
+- RSMVolume          — frame-aware gridded reciprocal-space volume
+- mask_data()        — legacy crop helper for an H-K-L bounding box
 - save_vtk()         — export to VTK rectilinear grid (requires pyevtk)
 - extract_line_cut() — 1D projection / line cut along one axis
 - extract_2d_slice() — 2D projection / slice by integrating over one axis
@@ -14,9 +14,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
+
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 
 logger = logging.getLogger(__name__)
 
@@ -34,33 +36,166 @@ except ImportError:
 # Core data container
 # -----------------------------------------------------------------------------
 
-@dataclass(slots=True)
+@dataclass(slots=True, init=False)
 class RSMVolume:
-    """Container for gridded reciprocal-space data on a regular H-K-L grid."""
+    """Container for one closed reciprocal-space coordinate frame.
 
-    h: np.ndarray
-    k: np.ndarray
-    l: np.ndarray
+    The legacy constructor remains H/K/L-only.  New frames must use
+    :meth:`from_axes`, which binds ordered names and units through an exact
+    :class:`RSMCoordinateFrame`.  Consequently, Qx/Qy/Qz data can never be
+    exposed through the legacy ``h``/``k``/``l`` properties.
+    """
+
+    _coordinate_frame: RSMCoordinateFrame
+    _axis_values: tuple[np.ndarray, np.ndarray, np.ndarray]
     intensity: np.ndarray
     #: optional provenance (the RSMPlan + applied CorrectionStack) — populated by
     #: read_rsm when a persisted volume carries a provenance_json blob.
     provenance: Any = None
 
-    def __post_init__(self) -> None:
-        self.h = np.asarray(self.h, dtype=float)
-        self.k = np.asarray(self.k, dtype=float)
-        self.l = np.asarray(self.l, dtype=float)
-        self.intensity = np.asarray(self.intensity, dtype=float)
+    def __init__(
+        self,
+        h: np.ndarray,
+        k: np.ndarray,
+        l: np.ndarray,
+        intensity: np.ndarray,
+        provenance: Any = None,
+    ) -> None:
+        """Build a legacy-compatible H/K/L volume."""
 
-        if self.intensity.ndim != 3:
+        self._initialize(
+            RSMCoordinateFrame.HKL,
+            (h, k, l),
+            intensity,
+            provenance,
+        )
+
+    @classmethod
+    def from_axes(
+        cls,
+        coordinate_frame: RSMCoordinateFrame,
+        axes: tuple[
+            tuple[str, np.ndarray],
+            tuple[str, np.ndarray],
+            tuple[str, np.ndarray],
+        ],
+        intensity: np.ndarray,
+        provenance: Any = None,
+    ) -> RSMVolume:
+        """Build a volume from one exact ordered frame descriptor."""
+
+        if type(coordinate_frame) is not RSMCoordinateFrame:
+            raise TypeError("RSM coordinate frame must be exact")
+        if (
+            type(axes) is not tuple
+            or len(axes) != 3
+            or any(type(item) is not tuple or len(item) != 2 for item in axes)
+            or tuple(item[0] for item in axes) != coordinate_frame.axis_names
+        ):
+            raise ValueError("RSM axes do not match the coordinate frame")
+        result = cls.__new__(cls)
+        result._initialize(
+            coordinate_frame,
+            tuple(item[1] for item in axes),
+            intensity,
+            provenance,
+        )
+        return result
+
+    def _initialize(
+        self,
+        coordinate_frame: RSMCoordinateFrame,
+        axis_values: tuple[np.ndarray, np.ndarray, np.ndarray],
+        intensity: np.ndarray,
+        provenance: Any,
+    ) -> None:
+        values = tuple(np.asarray(axis, dtype=float) for axis in axis_values)
+        if any(axis.ndim != 1 for axis in values):
+            raise ValueError("RSM coordinate axes must be 1D arrays")
+        volume = np.asarray(intensity, dtype=float)
+
+        if volume.ndim != 3:
             raise ValueError("intensity must be a 3D array")
 
-        expected_shape = (len(self.h), len(self.k), len(self.l))
-        if self.intensity.shape != expected_shape:
+        expected_shape = tuple(len(axis) for axis in values)
+        if volume.shape != expected_shape:
             raise ValueError(
-                f"intensity shape {self.intensity.shape} does not match "
+                f"intensity shape {volume.shape} does not match "
                 f"axis lengths {expected_shape}"
             )
+        self._coordinate_frame = coordinate_frame
+        self._axis_values = values
+        self.intensity = volume
+        self.provenance = provenance
+
+    @property
+    def coordinate_frame(self) -> RSMCoordinateFrame:
+        return self._coordinate_frame
+
+    @property
+    def axes(self) -> tuple[
+        tuple[str, np.ndarray],
+        tuple[str, np.ndarray],
+        tuple[str, np.ndarray],
+    ]:
+        return tuple(
+            zip(
+                self._coordinate_frame.axis_names,
+                self._axis_values,
+                strict=True,
+            )
+        )  # type: ignore[return-value]
+
+    @property
+    def axis_values(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return self._axis_values
+
+    @property
+    def axis_units(self) -> tuple[
+        tuple[str, str | None],
+        tuple[str, str | None],
+        tuple[str, str | None],
+    ]:
+        return tuple(
+            zip(
+                self._coordinate_frame.axis_names,
+                self._coordinate_frame.axis_units,
+                strict=True,
+            )
+        )  # type: ignore[return-value]
+
+    def _axis_for_name(self, name: str) -> np.ndarray:
+        try:
+            index = self._coordinate_frame.axis_names.index(name)
+        except ValueError:
+            raise AttributeError(
+                f"{name} is not an axis in {self._coordinate_frame.value}"
+            ) from None
+        return self._axis_values[index]
+
+    @property
+    def h(self) -> np.ndarray:
+        return self._axis_for_name("h")
+
+    @property
+    def k(self) -> np.ndarray:
+        return self._axis_for_name("k")
+
+    @property
+    def l(self) -> np.ndarray:
+        return self._axis_for_name("l")
+
+    @property
+    def qx(self) -> np.ndarray:
+        return self._axis_for_name("qx")
+
+    @property
+    def qy(self) -> np.ndarray:
+        return self._axis_for_name("qy")
+
+    @property
+    def qz(self) -> np.ndarray:
+        return self._axis_for_name("qz")
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -73,10 +208,10 @@ class RSMVolume:
         Returns
         -------
         list of list of float
-            [[hmin, hmax, dh], [kmin, kmax, dk], [lmin, lmax, dl]]
+            One ``[minimum, maximum, step]`` row per ordered frame axis.
         """
         bounds: list[list[float]] = []
-        for axis in (self.h, self.k, self.l):
+        for axis in self._axis_values:
             step = 0.0 if len(axis) < 2 else float(np.nanmean(np.diff(axis)))
             bounds.append([float(np.nanmin(axis)), float(np.nanmax(axis)), step])
         return bounds
@@ -90,7 +225,7 @@ class RSMVolume:
         path : str or Path
             Output path without extension.
         """
-        save_vtk(self.intensity, (self.h, self.k, self.l), path)
+        save_vtk(self.intensity, self._axis_values, path)
 
     def get_slice(
         self,
@@ -102,7 +237,7 @@ class RSMVolume:
 
         Parameters
         ----------
-        axis : {'h', 'k', 'l'}
+        axis : str
             Axis to integrate over.
         val_range : tuple of float, optional
             (min, max) range along the integrated axis. If omitted, the full
@@ -120,14 +255,18 @@ class RSMVolume:
             Values of the integrated axis used in the slice/projection.
         """
         axis_key = axis.strip().lower()
-        axis_map = {"h": 0, "k": 1, "l": 2}
+        axis_map = {
+            name: index
+            for index, name in enumerate(self._coordinate_frame.axis_names)
+        }
         if axis_key not in axis_map:
-            raise ValueError("axis must be one of 'h', 'k', or 'l'")
+            raise ValueError(
+                "axis must be one of "
+                + ", ".join(repr(name) for name in axis_map)
+            )
 
         return extract_2d_slice(
-            self.h,
-            self.k,
-            self.l,
+            *self._axis_values,
             self.intensity,
             integrate_axis=axis_map[axis_key],
             axis_range=val_range,
@@ -143,10 +282,11 @@ class RSMVolume:
 
         Parameters
         ----------
-        axis : {'h', 'k', 'l'}
+        axis : str
             Axis to retain as the 1D profile axis.
         fixed_ranges : dict, optional
-            Ranges for the other axes. Keys may be 0/1/2 or 'h'/'k'/'l'.
+            Ranges for the other axes. Keys may be 0/1/2 or one of the
+            volume's exact axis names.
             If omitted, the full ranges of the other axes are integrated,
             giving a projection.
 
@@ -158,9 +298,15 @@ class RSMVolume:
             Integrated 1D intensity profile.
         """
         axis_key = axis.strip().lower()
-        axis_map = {"h": 0, "k": 1, "l": 2}
+        axis_map = {
+            name: index
+            for index, name in enumerate(self._coordinate_frame.axis_names)
+        }
         if axis_key not in axis_map:
-            raise ValueError("axis must be one of 'h', 'k', or 'l'")
+            raise ValueError(
+                "axis must be one of "
+                + ", ".join(repr(name) for name in axis_map)
+            )
 
         fr: dict[int, tuple[float, float]] | None = None
         if fixed_ranges is not None:
@@ -175,9 +321,7 @@ class RSMVolume:
                     fr[int(k)] = v
 
         return extract_line_cut(
-            self.h,
-            self.k,
-            self.l,
+            *self._axis_values,
             self.intensity,
             axis=axis_map[axis_key],
             fixed_ranges=fr,
@@ -202,16 +346,44 @@ class RSMVolume:
         RSMVolume
             Cropped volume.
         """
-        axes, data = mask_data(
-            self.h,
-            self.k,
-            self.l,
-            self.intensity,
-            HRange=hrange,
-            KRange=krange,
-            LRange=lrange,
+        if self._coordinate_frame is not RSMCoordinateFrame.HKL:
+            raise ValueError(
+                "crop(hrange, krange, lrange) is HKL-only; "
+                "use crop_by_axes() for this coordinate frame"
+            )
+        return self.crop_by_axes(
+            {"h": hrange, "k": krange, "l": lrange}
         )
-        return RSMVolume(axes[0], axes[1], axes[2], data)
+
+    def crop_by_axes(
+        self,
+        ranges: Mapping[str, tuple[float, float]],
+    ) -> RSMVolume:
+        """Crop using exact axis names from this volume's frame."""
+
+        if not isinstance(ranges, Mapping):
+            raise TypeError("RSM crop ranges must be a mapping")
+        names = self._coordinate_frame.axis_names
+        unknown = set(ranges) - set(names)
+        if unknown:
+            raise ValueError(
+                f"RSM crop axes are not in {self._coordinate_frame.value}: "
+                f"{sorted(unknown)!r}"
+            )
+        selectors = []
+        selected_axes = []
+        for name, values in zip(names, self._axis_values, strict=True):
+            lower, upper = ranges.get(name, (-np.inf, np.inf))
+            selected = (values >= lower) & (values <= upper)
+            selectors.append(selected)
+            selected_axes.append(values[selected])
+        data = self.intensity[np.ix_(*selectors)]
+        return RSMVolume.from_axes(
+            self._coordinate_frame,
+            tuple(zip(names, selected_axes, strict=True)),
+            data,
+            provenance=self.provenance,
+        )
 
 
 # -----------------------------------------------------------------------------

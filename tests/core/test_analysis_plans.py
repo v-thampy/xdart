@@ -22,6 +22,7 @@ from xrd_tools.analysis import (
 import xrd_tools.analysis.plans as plan_mod
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.core.scan import Scan, ScanFrame
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 from xrd_tools.sources import MemoryFrameSource
 
 
@@ -368,7 +369,13 @@ def test_canonical_scan_exposes_scan_data_for_rsm_consumers():
 def test_run_rsm_delegates_single_and_multi_source(monkeypatch):
     calls = []
     source = MemoryFrameSource([np.ones((2, 2))], name="rsm")
-    plan = RSMPlan(mapper=object(), diff_motors=("th",), bins=(3, 4, 5), energy=12000.0)
+    plan = RSMPlan(
+        mapper=object(),
+        diff_motors=("th",),
+        bins=(3, 4, 5),
+        UB=np.eye(3),
+        energy=12000.0,
+    )
 
     def fake_process(scan, mapper, diff_motors, bins, **kwargs):
         calls.append(("single", scan, diff_motors, bins, kwargs))
@@ -390,8 +397,16 @@ def test_run_rsm_delegates_single_and_multi_source(monkeypatch):
     assert calls[0][2] == ("th",)
     assert calls[0][3] == (3, 4, 5)
     assert calls[0][4]["energy"] == 12000.0
+    assert (
+        calls[0][4]["coordinate_frame"]
+        is RSMCoordinateFrame.HKL
+    )
     assert calls[1][0] == "multi"
     assert calls[1][1][0].scan is source
+    assert (
+        calls[1][4]["coordinate_frame"]
+        is RSMCoordinateFrame.HKL
+    )
 
 
 def test_run_rsm_gi_persists_single_source_inferred_mapping_wavelength(
@@ -414,6 +429,7 @@ def test_run_rsm_gi_persists_single_source_inferred_mapping_wavelength(
             mapper=object(),
             diff_motors=("th",),
             bins=(3, 4, 5),
+            UB=np.eye(3),
             energy=None,
             gi=GISettings(),
         ),
@@ -448,6 +464,7 @@ def test_run_rsm_grouped_gi_refuses_mismatched_inferred_wavelengths(
                 mapper=object(),
                 diff_motors=("th",),
                 bins=(3, 4, 5),
+                UB=np.eye(3),
                 energy=None,
                 gi=GISettings(),
             ),
@@ -479,6 +496,7 @@ def test_run_rsm_grouped_gi_uses_and_persists_one_admitted_wavelength(
             mapper=object(),
             diff_motors=("th",),
             bins=(3, 4, 5),
+            UB=np.eye(3),
             energy=None,
             gi=GISettings(),
         ),
@@ -503,7 +521,13 @@ def test_run_rsm_attaches_scan_tagged_frame_records(monkeypatch):
     s7 = MemoryFrameSource(
         [ScanFrame(1, image=np.ones((2, 2)), source_path="/d/scan7.h5", source_frame_index=1)],
         name="s7")
-    plan = RSMPlan(mapper=object(), diff_motors=("th",), bins=(3, 4, 5), energy=12000.0)
+    plan = RSMPlan(
+        mapper=object(),
+        diff_motors=("th",),
+        bins=(3, 4, 5),
+        UB=np.eye(3),
+        energy=12000.0,
+    )
 
     result = run_rsm(plan, [s5, s7], scan_labels=[5, 7])
     assert [(r["scan_label"], r["frame_index"], r["source_path"]) for r in result.frame_records] == [

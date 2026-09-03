@@ -265,8 +265,9 @@ class PixelQMap:
         energy : float
             X-ray energy in eV.
         UB : (3, 3) ndarray, optional
-            Sample orientation matrix.  ``None`` leaves the output in
-            raw lab-frame q-space (equivalent to UB = identity).
+            Coordinate-driving matrix.  ``None`` selects an explicit identity
+            matrix and therefore returns sample-fixed Cartesian Q.  Passing a
+            source UB returns crystal reciprocal coordinates.
         roi : (r0, r1, c0, c1), optional
             Crop ROI applied to the header before mapping.  Shifts the
             beam centre and reduces ``Nch1``/``Nch2`` accordingly.
@@ -325,9 +326,16 @@ class PixelQMap:
                 Nch2=int(header.Nch2),
             )
             require_active_xu_runtime_session(active_session)
+            matrix = (
+                np.eye(3, dtype=np.float64)
+                if UB is None
+                else np.ascontiguousarray(UB, dtype=np.float64)
+            )
+            if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+                raise ValueError("pixel_q UB must be one finite 3x3 matrix")
             qx, qy, qz = hxrd.Ang2Q.area(
                 *angles,
-                UB=UB,
+                UB=matrix,
                 **self.diff_config.ang2q_kwargs,
             )
             require_active_xu_runtime_session(active_session)

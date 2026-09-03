@@ -36,6 +36,10 @@ from xrd_tools.core.geometry.xu_runtime import (
     require_active_xu_runtime_session,
     xu_runtime_session,
 )
+from xrd_tools.rsm.coordinate_frame import (
+    RSMCoordinateFrame,
+    rsm_coordinate_matrix,
+)
 from xrd_tools.rsm.volume import RSMVolume
 
 # Private test seam. Production obtains Gridder3D only from an active shared
@@ -417,6 +421,7 @@ def grid_img_data(
     mask_static_pixels: bool = True,
     weight: np.ndarray | None = None,
     runtime_session: XuRuntimeSession | None = None,
+    coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
 ) -> RSMVolume:
     """Map a 3D image stack to reciprocal space and bin onto a 3D grid.
 
@@ -435,7 +440,9 @@ def grid_img_data(
     energy : float
         X-ray energy in eV.
     UB : (3, 3) ndarray, optional
-        Sample orientation matrix.  ``None`` → raw lab-frame q.
+        Matrix applied by xrayutilities.  H/K/L requires the physical source
+        UB.  Cartesian Q accepts only ``None`` or exact identity and always
+        executes with an explicit identity matrix.
     bins : tuple of int
         Grid bin counts along (qx, qy, qz).
     roi : (r0, r1, c0, c1), optional
@@ -452,10 +459,14 @@ def grid_img_data(
     Returns
     -------
     RSMVolume
-        Gridded H-K-L volume.
+        Gridded volume whose semantic axes are declared by
+        ``coordinate_frame``.
     """
     if runtime_session is not None:
         require_active_xu_runtime_session(runtime_session)
+    if type(coordinate_frame) is not RSMCoordinateFrame:
+        raise TypeError("RSM coordinate frame must be exact")
+    coordinate_matrix = rsm_coordinate_matrix(coordinate_frame, UB)
     img = np.array(img, dtype=float, copy=True)
     if img.ndim != 3:
         raise ValueError(
@@ -481,7 +492,7 @@ def grid_img_data(
     qx, qy, qz = mapper.pixel_q(
         angles,
         energy,
-        UB=UB,
+        UB=coordinate_matrix,
         roi=roi,
         image_shape=img.shape,
     )
@@ -503,12 +514,20 @@ def grid_img_data(
             img,
             1.0 if weight is None else weight,
         )
-        h = np.array(grid_raw.xaxis, dtype=float, copy=True)
-        k = np.array(grid_raw.yaxis, dtype=float, copy=True)
-        l = np.array(grid_raw.zaxis, dtype=float, copy=True)
+        axis_values = (
+            np.array(grid_raw.xaxis, dtype=float, copy=True),
+            np.array(grid_raw.yaxis, dtype=float, copy=True),
+            np.array(grid_raw.zaxis, dtype=float, copy=True),
+        )
         intensity = _pair_intensity(grid_raw, grid_norm)
 
-    return RSMVolume(h=h, k=k, l=l, intensity=intensity)
+    return RSMVolume.from_axes(
+        coordinate_frame,
+        tuple(
+            zip(coordinate_frame.axis_names, axis_values, strict=True)
+        ),
+        intensity,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -601,12 +620,16 @@ class StreamingGridder:
         bins: tuple[int, int, int],
         *,
         runtime_session: XuRuntimeSession | None = None,
+        coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
     ) -> None:
         if runtime_session is not None:
             require_active_xu_runtime_session(runtime_session)
+        if type(coordinate_frame) is not RSMCoordinateFrame:
+            raise TypeError("RSM coordinate frame must be exact")
         self.mapper = mapper
         self.bins = tuple(int(b) for b in bins)
         self._runtime_session = runtime_session
+        self._coordinate_frame = coordinate_frame
         # the Σraw and Σnorm accumulators (P6) — both KeepData+Normalize(False)
         self._grid_raw: object | None = None
         self._grid_norm: object | None = None
@@ -694,9 +717,13 @@ class StreamingGridder:
         qx_lo = qy_lo = qz_lo = np.inf
         qx_hi = qy_hi = qz_hi = -np.inf
         for angles, energy, UB, image_shape in scans:
+            coordinate_matrix = rsm_coordinate_matrix(
+                self._coordinate_frame,
+                UB,
+            )
             qx_c, qy_c, qz_c = _corner_pixel_q(
                 self.mapper, angles, energy,
-                UB=UB, roi=roi, image_shape=image_shape,
+                UB=coordinate_matrix, roi=roi, image_shape=image_shape,
             )
             qx_lo = float(min(qx_lo, np.nanmin(qx_c)))
             qx_hi = float(max(qx_hi, np.nanmax(qx_c)))
@@ -795,11 +822,15 @@ class StreamingGridder:
                 )
             img[:, sm] = np.nan
 
+        coordinate_matrix = rsm_coordinate_matrix(
+            self._coordinate_frame,
+            UB,
+        )
         with _gridder_runtime(self._runtime_session):
             qx, qy, qz = self.mapper.pixel_q(
                 angles,
                 energy,
-                UB=UB,
+                UB=coordinate_matrix,
                 roi=roi,
                 image_shape=img.shape,
             )
@@ -865,9 +896,7 @@ class StreamingGridder:
             raise ValueError("RSM leased energy must be finite and positive")
         if type(UB) is not np.ndarray:
             raise TypeError("RSM leased UB must be an exact ndarray")
-        matrix = np.asarray(UB, dtype=np.float64)
-        if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
-            raise ValueError("RSM leased UB must be a finite 3 by 3 matrix")
+        matrix = rsm_coordinate_matrix(self._coordinate_frame, UB)
         if roi is not None and (
             type(roi) is not tuple
             or len(roi) != 4
@@ -1035,11 +1064,23 @@ class StreamingGridder:
                 "no chunks processed; call add() at least once before to_volume()."
             )
         with _gridder_runtime(self._runtime_session):
-            h = np.array(self._grid_raw.xaxis, dtype=float, copy=True)
-            k = np.array(self._grid_raw.yaxis, dtype=float, copy=True)
-            l = np.array(self._grid_raw.zaxis, dtype=float, copy=True)
+            axis_values = (
+                np.array(self._grid_raw.xaxis, dtype=float, copy=True),
+                np.array(self._grid_raw.yaxis, dtype=float, copy=True),
+                np.array(self._grid_raw.zaxis, dtype=float, copy=True),
+            )
             intensity = _pair_intensity(self._grid_raw, self._grid_norm)
-        return RSMVolume(h=h, k=k, l=l, intensity=intensity)
+        return RSMVolume.from_axes(
+            self._coordinate_frame,
+            tuple(
+                zip(
+                    self._coordinate_frame.axis_names,
+                    axis_values,
+                    strict=True,
+                )
+            ),
+            intensity,
+        )
 
 
 def _pad_range(lo: float, hi: float, pad: float) -> tuple[float, float]:
@@ -1068,6 +1109,7 @@ def grid_img_data_streaming(
     scout_pad: float = 0.0,
     weight: np.ndarray | None = None,
     runtime_session: XuRuntimeSession | None = None,
+    coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
 ) -> RSMVolume:
     """Stream a single in-memory image stack through :class:`StreamingGridder`.
 
@@ -1118,7 +1160,10 @@ def grid_img_data_streaming(
             f"{n_frames}; a 3D weight must be (N, H, W) with N == img.shape[0].")
 
     sg = StreamingGridder(
-        mapper, bins, runtime_session=runtime_session
+        mapper,
+        bins,
+        runtime_session=runtime_session,
+        coordinate_frame=coordinate_frame,
     )
     if q_bounds is None:
         sg.scout(
@@ -1157,6 +1202,7 @@ def grid_scans_streaming(
     ] | None = None,
     static_mask: np.ndarray | None = None,
     scout_pad: float = 0.0,
+    coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
 ) -> RSMVolume:
     """Stream multiple in-memory scans into a single :class:`RSMVolume`.
 
@@ -1180,7 +1226,11 @@ def grid_scans_streaming(
     if not scans:
         raise ValueError("scans must not be empty")
 
-    sg = StreamingGridder(mapper, bins)
+    sg = StreamingGridder(
+        mapper,
+        bins,
+        coordinate_frame=coordinate_frame,
+    )
     if q_bounds is None:
         sg.scout(
             [(s.angles, s.energy, s.UB, s.img.shape[-2:]) for s in scans],
@@ -1217,18 +1267,17 @@ def get_common_grid(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if not volumes:
         raise ValueError("volumes must not be empty")
-
-    hmin = min(np.nanmin(v.h) for v in volumes)
-    hmax = max(np.nanmax(v.h) for v in volumes)
-    kmin = min(np.nanmin(v.k) for v in volumes)
-    kmax = max(np.nanmax(v.k) for v in volumes)
-    lmin = min(np.nanmin(v.l) for v in volumes)
-    lmax = max(np.nanmax(v.l) for v in volumes)
-
-    h = np.linspace(hmin, hmax, bins[0])
-    k = np.linspace(kmin, kmax, bins[1])
-    l = np.linspace(lmin, lmax, bins[2])
-    return h, k, l
+    frame = volumes[0].coordinate_frame
+    if any(volume.coordinate_frame is not frame for volume in volumes):
+        raise ValueError("RSM volumes must use one coordinate frame")
+    return tuple(
+        np.linspace(
+            min(np.nanmin(volume.axis_values[index]) for volume in volumes),
+            max(np.nanmax(volume.axis_values[index]) for volume in volumes),
+            bins[index],
+        )
+        for index in range(3)
+    )  # type: ignore[return-value]
 
 
 def combine_grids(
@@ -1247,30 +1296,44 @@ def combine_grids(
 
     from scipy.interpolate import RegularGridInterpolator  # noqa: PLC0415
 
-    h, k, l = get_common_grid(volumes, bins)
-    combined = np.zeros((len(h), len(k), len(l)), dtype=float)
+    frame = volumes[0].coordinate_frame
+    axis0, axis1, axis2 = get_common_grid(volumes, bins)
+    combined = np.zeros(
+        (len(axis0), len(axis1), len(axis2)),
+        dtype=float,
+    )
 
-    # Avoid materialising three dense ``(H, K, L)`` coordinate volumes.  A
+    # Avoid materialising three dense 3-D coordinate volumes.  A
     # realistic grid can make those temporaries hundreds of MB before the
     # interpolated output even exists.  Interpolate one H-slab at a time from a
     # reusable 2-D K/L point template.
-    kl_size = len(k) * len(l)
-    k_col = np.repeat(k, len(l))
-    l_col = np.tile(l, len(k))
-    pts = np.empty((kl_size, 3), dtype=float)
-    pts[:, 1] = k_col
-    pts[:, 2] = l_col
+    axis12_size = len(axis1) * len(axis2)
+    axis1_column = np.repeat(axis1, len(axis2))
+    axis2_column = np.tile(axis2, len(axis1))
+    pts = np.empty((axis12_size, 3), dtype=float)
+    pts[:, 1] = axis1_column
+    pts[:, 2] = axis2_column
 
     for vol in volumes:
         vals = np.nan_to_num(vol.intensity, nan=0.0)
         rgi = RegularGridInterpolator(
-            (vol.h, vol.k, vol.l),
+            vol.axis_values,
             vals,
             bounds_error=False,
             fill_value=0.0,
         )
-        for i, h_value in enumerate(h):
-            pts[:, 0] = h_value
-            combined[i] += rgi(pts).reshape(len(k), len(l))
+        for index, axis0_value in enumerate(axis0):
+            pts[:, 0] = axis0_value
+            combined[index] += rgi(pts).reshape(len(axis1), len(axis2))
 
-    return RSMVolume(h=h, k=k, l=l, intensity=combined)
+    return RSMVolume.from_axes(
+        frame,
+        tuple(
+            zip(
+                frame.axis_names,
+                (axis0, axis1, axis2),
+                strict=True,
+            )
+        ),
+        combined,
+    )

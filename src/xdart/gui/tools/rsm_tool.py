@@ -30,6 +30,7 @@ from xrd_tools.analysis.rsm_operation import (
     RSMOperationResultV2,
 )
 from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 from xrd_tools.session.display_logic import PanelRole
 from xrd_tools.session.rsm_viewer_model import (
     RSMViewerModel,
@@ -229,6 +230,11 @@ class RSMToolDialog(QtWidgets.QDialog):
         self.geometry_identity.setObjectName("rsmGeometryIdentity")
         self.geometry_identity.setWordWrap(True)
         common.addRow("Asset identity", self.geometry_identity)
+        self.coordinate_frame_combo = QtWidgets.QComboBox()
+        self.coordinate_frame_combo.setObjectName("rsmCoordinateFrame")
+        for frame in RSMCoordinateFrame:
+            self.coordinate_frame_combo.addItem(frame.display_name, frame)
+        common.addRow("Coordinates", self.coordinate_frame_combo)
 
         member_group = QtWidgets.QGroupBox("Ordered scan members")
         member_layout = QtWidgets.QVBoxLayout(member_group)
@@ -455,18 +461,15 @@ class RSMToolDialog(QtWidgets.QDialog):
         )
         self.output_edit.setObjectName("rsmOutput")
         output_form.addRow("Output", output_row)
-        self.overwrite_combo = QtWidgets.QComboBox()
-        self.overwrite_combo.setObjectName("rsmOverwrite")
-        self.overwrite_combo.addItem(
-            "Create new (refuse if present)", AnalysisArtifactOverwrite.CREATE_NEW
+        self.output_policy_label = QtWidgets.QLabel(
+            "Create new (refuse if present)"
         )
-        self.overwrite_combo.addItem(
-            "Replace transactionally", AnalysisArtifactOverwrite.REPLACE
-        )
-        output_form.addRow("Output policy", self.overwrite_combo)
+        self.output_policy_label.setObjectName("rsmOutputPolicy")
+        output_form.addRow("Output policy", self.output_policy_label)
         hold = QtWidgets.QLabel(
             "R2: ordered exact SPEC members, canonical psic geometry authority, "
-            "one common H/K/L grid, and committed-result display only. Held: "
+            "one common selected-coordinate grid, immutable new output, and "
+            "committed-result display only. Held: "
             "GI/refraction corrections, volume rendering, and hostile/shared "
             "Project output namespaces."
         )
@@ -523,11 +526,14 @@ class RSMToolDialog(QtWidgets.QDialog):
         indices = QtWidgets.QHBoxLayout()
         indices.addWidget(QtWidgets.QLabel("Committed-result slice indices"))
         self.slice_index_controls = []
+        self.slice_index_labels = []
         for axis in ("H", "K", "L"):
             control = self._spin(f"rsm{axis}SliceIndex", 0, 0)
             control.setEnabled(False)
-            indices.addWidget(QtWidgets.QLabel(axis))
+            label = QtWidgets.QLabel(axis)
+            indices.addWidget(label)
             indices.addWidget(control)
+            self.slice_index_labels.append(label)
             self.slice_index_controls.append(control)
         indices.addStretch(1)
         self.result_facts = QtWidgets.QLabel("No committed RSM loaded")
@@ -565,6 +571,9 @@ class RSMToolDialog(QtWidgets.QDialog):
             plots_layout.addWidget(plot, index // 3, index % 3)
         self.surface_items = tuple(initial_items)
         self._surface_title_texts = tuple(item[0] for item in panel_specs)
+        self._surface_axis_label_texts = tuple(
+            (item[1], item[2]) for item in panel_specs
+        )
         self.slice_plots = self.surface_plots[:3]
         self.slice_images = list(self.surface_items[:3])
         surface_layout.addWidget(plots)
@@ -613,7 +622,11 @@ class RSMToolDialog(QtWidgets.QDialog):
             *(item[1] for item in self.common_selector_edits.values()),
         ):
             spin.valueChanged.connect(self._form_changed)
-        for combo in (self.normalization_combo, self.grid_combo, self.overwrite_combo):
+        for combo in (
+            self.coordinate_frame_combo,
+            self.normalization_combo,
+            self.grid_combo,
+        ):
             combo.currentIndexChanged.connect(self._form_changed)
         for edit in (
             self.spec_edit,
@@ -818,6 +831,9 @@ class RSMToolDialog(QtWidgets.QDialog):
             self._members = [_MemberDraft.from_scan43()]
             if not self.output_edit.text().strip():
                 self.output_edit.setText("rsm_scan43.nexus")
+            self.coordinate_frame_combo.setCurrentIndex(
+                self.coordinate_frame_combo.findData(RSMCoordinateFrame.HKL)
+            )
             self.normalization_combo.setCurrentIndex(0)
             for role, selector in (
                 ("foil", preset.normalization.foil_selector),
@@ -921,10 +937,10 @@ class RSMToolDialog(QtWidgets.QDialog):
             self.max_frame_mib.value() * _MIB,
             self.max_chunk_mib.value() * _MIB,
             self._inside_project(project_path, self.output_edit.text(), "output path"),
-            (
-                AnalysisArtifactOverwrite.CREATE_NEW,
-                AnalysisArtifactOverwrite.REPLACE,
-            )[self.overwrite_combo.currentIndex()],
+            AnalysisArtifactOverwrite.CREATE_NEW,
+            coordinate_frame=RSMCoordinateFrame(
+                self.coordinate_frame_combo.currentData()
+            ),
         )
 
     def _current_form(self):
@@ -1144,13 +1160,41 @@ class RSMToolDialog(QtWidgets.QDialog):
     def _render_preflight(self, summary):
         if type(summary) is not RSMToolPreflightSummaryV2:
             raise TypeError("RSM v2 presenter requires exact summary")
+        frame = summary.coordinate_frame
+        axis_symbols = frame.axis_symbols
+        if frame is RSMCoordinateFrame.HKL:
+            source_ub_authority = (
+                "Source UB authority: authenticated source UB drives H/K/L "
+                "conversion"
+            )
+        else:
+            source_ub_authority = (
+                "Source UB authority: source UB is unused and non-driving; "
+                "explicit identity drives Cartesian Q"
+            )
         union = ", ".join(
             f"{name} {low:.10g}..{high:.10g}"
-            for name, (low, high) in zip(("H", "K", "L"), summary.union_q_bounds)
+            for name, (low, high) in zip(
+                axis_symbols,
+                summary.union_q_bounds,
+                strict=True,
+            )
         )
         lines = [
             f"Project: {summary.project_root}",
             f"Output: {summary.output_relative_path}",
+            f"Coordinate frame: {frame.display_name}",
+            "Stored axes: "
+            + ", ".join(
+                label if unit is None else f"{label} [{unit}]"
+                for label, unit in zip(
+                    frame.axis_symbols,
+                    frame.axis_units,
+                    strict=True,
+                )
+            ),
+            f"xrayutilities matrix policy: {frame.matrix_policy}",
+            source_ub_authority,
             (
                 f"Ordered members: {len(summary.members)} · total frames "
                 f"{summary.total_selected_frames}"
@@ -1160,7 +1204,12 @@ class RSMToolDialog(QtWidgets.QDialog):
             f"Asset receipt: {summary.geometry_asset_receipt_fingerprint}",
             f"Effective geometry: {summary.effective_geometry_fingerprint}",
             f"Common grid: {summary.common_grid_fingerprint}",
-            f"Union q bounds: {union}",
+            (
+                "Union q bounds: "
+                if frame is RSMCoordinateFrame.HKL
+                else "Union coordinate bounds: "
+            )
+            + union,
             f"Grid bins: {summary.bins} · detector {summary.detector_shape}",
             (
                 f"Normalization: {summary.normalization_mode.value} · divisor "
@@ -1177,12 +1226,16 @@ class RSMToolDialog(QtWidgets.QDialog):
             "",
         ]
         for member in summary.members:
-            ub = "; ".join(
+            coordinate_matrix = "; ".join(
                 " ".join(f"{value:.10g}" for value in row) for row in member.ub
             )
             bounds = ", ".join(
                 f"{name} {low:.10g}..{high:.10g}"
-                for name, (low, high) in zip(("H", "K", "L"), member.q_bounds)
+                for name, (low, high) in zip(
+                    axis_symbols,
+                    member.q_bounds,
+                    strict=True,
+                )
             )
             lines.extend(
                 (
@@ -1200,8 +1253,8 @@ class RSMToolDialog(QtWidgets.QDialog):
                     f"  member preflight: {member.member_preflight_fingerprint}",
                     f"  geometry binding: {member.geometry_binding_fingerprint}",
                     f"  energy: {member.energy_eV:.12g} eV",
-                    f"  UB: {ub}",
-                    f"  q bounds: {bounds}",
+                    f"  xrayutilities matrix: {coordinate_matrix}",
+                    f"  coordinate bounds: {bounds}",
                     (
                         "  divisor: "
                         f"{member.normalization_divisor_range[0]:.12g}.."
@@ -1255,26 +1308,41 @@ class RSMToolDialog(QtWidgets.QDialog):
     @staticmethod
     def _surface_titles(snapshot):
         state = snapshot.state
+        axis0, axis1, axis2 = state.coordinate_frame.axis_symbols
         return (
-            f"HK slice · L index {state.l_index}",
-            f"HL slice · K index {state.k_index}",
-            f"KL slice · H index {state.h_index}",
-            "H mean projection",
-            "K mean projection",
-            "L mean projection",
+            f"{axis0}{axis1} slice · {axis2} index {state.l_index}",
+            f"{axis0}{axis2} slice · {axis1} index {state.k_index}",
+            f"{axis1}{axis2} slice · {axis0} index {state.h_index}",
+            f"{axis0} mean projection",
+            f"{axis1} mean projection",
+            f"{axis2} mean projection",
+        )
+
+    @staticmethod
+    def _surface_axis_labels(values):
+        axis0, axis1, axis2 = values.coordinate_frame.axis_labels
+        return (
+            (axis0, axis1),
+            (axis0, axis2),
+            (axis1, axis2),
+            (axis0, "Mean I"),
+            (axis1, "Mean I"),
+            (axis2, "Mean I"),
         )
 
     @staticmethod
     def _surface_facts(values, snapshot):
         axes = tuple(axis for _name, axis in values.axes)
         state = snapshot.state
+        axis0, axis1, axis2 = values.coordinate_frame.axis_symbols
         return (
-            f"Shape {values.shape} · indices H/K/L {state.h_index}/"
+            f"{values.coordinate_frame.display_name} · shape {values.shape} · "
+            f"indices {axis0}/{axis1}/{axis2} {state.h_index}/"
             f"{state.k_index}/{state.l_index} · finite products "
             f"{snapshot.finite_counts} · cache {snapshot.cache_bytes} bytes · "
-            f"H {axes[0][0]:.8g}..{axes[0][-1]:.8g} · "
-            f"K {axes[1][0]:.8g}..{axes[1][-1]:.8g} · "
-            f"L {axes[2][0]:.8g}..{axes[2][-1]:.8g}"
+            f"{axis0} {axes[0][0]:.8g}..{axes[0][-1]:.8g} · "
+            f"{axis1} {axes[1][0]:.8g}..{axes[1][-1]:.8g} · "
+            f"{axis2} {axes[2][0]:.8g}..{axes[2][-1]:.8g}"
         )
 
     def _slice_control_state(self):
@@ -1299,12 +1367,15 @@ class RSMToolDialog(QtWidgets.QDialog):
         state = snapshot.state
         self._suppress_slice_changes = True
         try:
-            for control, size, index in zip(
+            for label, control, symbol, size, index in zip(
+                self.slice_index_labels,
                 self.slice_index_controls,
+                values.coordinate_frame.axis_symbols,
                 values.shape,
                 (state.h_index, state.k_index, state.l_index),
                 strict=True,
             ):
+                label.setText(symbol)
                 control.setRange(0, size - 1)
                 control.setValue(index)
                 control.setEnabled(True)
@@ -1314,9 +1385,12 @@ class RSMToolDialog(QtWidgets.QDialog):
     def _replace_surface(self, values, model, snapshot):
         staged = self._stage_surface(snapshot)
         titles = self._surface_titles(snapshot)
+        axis_labels = self._surface_axis_labels(values)
         facts = self._surface_facts(values, snapshot)
         old_items = self.surface_items
         old_titles = self._surface_title_texts
+        old_axis_labels = self._surface_axis_label_texts
+        old_slice_labels = tuple(label.text() for label in self.slice_index_labels)
         old_facts = self.result_facts.text()
         old_fingerprint = self._painted_result_fingerprint
         old_values = self._viewer_values
@@ -1331,10 +1405,18 @@ class RSMToolDialog(QtWidgets.QDialog):
                 plot.removeItem(item)
             for plot, title in zip(self.surface_plots, titles, strict=True):
                 plot.setTitle(title)
+            for plot, (horizontal, vertical) in zip(
+                self.surface_plots,
+                axis_labels,
+                strict=True,
+            ):
+                plot.setLabel("bottom", horizontal)
+                plot.setLabel("left", vertical)
             self.result_facts.setText(facts)
             self._set_slice_controls(values, snapshot)
             self.surface_items = staged
             self._surface_title_texts = titles
+            self._surface_axis_label_texts = axis_labels
             self.slice_images = list(staged[:3])
             self._painted_result_fingerprint = values.result_fingerprint
             self._viewer_values = values
@@ -1363,8 +1445,19 @@ class RSMToolDialog(QtWidgets.QDialog):
                     plot.setTitle(title)
                 except BaseException as error:
                     rollback_errors.append(error)
+            for plot, (horizontal, vertical) in zip(
+                self.surface_plots,
+                old_axis_labels,
+                strict=True,
+            ):
+                try:
+                    plot.setLabel("bottom", horizontal)
+                    plot.setLabel("left", vertical)
+                except BaseException as error:
+                    rollback_errors.append(error)
             self.surface_items = old_items
             self._surface_title_texts = old_titles
+            self._surface_axis_label_texts = old_axis_labels
             self.slice_images = list(old_items[:3])
             self._painted_result_fingerprint = old_fingerprint
             self._viewer_values = old_values
@@ -1376,6 +1469,12 @@ class RSMToolDialog(QtWidgets.QDialog):
                 rollback_errors.append(error)
             try:
                 self._restore_slice_controls(old_controls)
+                for label, text in zip(
+                    self.slice_index_labels,
+                    old_slice_labels,
+                    strict=True,
+                ):
+                    label.setText(text)
             except BaseException as error:
                 rollback_errors.append(error)
             for error in rollback_errors:

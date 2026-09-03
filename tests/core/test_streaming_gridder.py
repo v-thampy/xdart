@@ -40,7 +40,36 @@ from xrd_tools.rsm.gridding import (
     grid_img_data_streaming,
     grid_scans_streaming,
 )
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 from xrd_tools.rsm.volume import RSMVolume
+
+
+_Q_FRAME = RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+
+
+def _q_gridder(mapper, bins, **kwargs):
+    return StreamingGridder(
+        mapper,
+        bins,
+        coordinate_frame=_Q_FRAME,
+        **kwargs,
+    )
+
+
+def _q_grid_img_data_streaming(*args, **kwargs):
+    return grid_img_data_streaming(
+        *args,
+        coordinate_frame=_Q_FRAME,
+        **kwargs,
+    )
+
+
+def _q_grid_scans_streaming(*args, **kwargs):
+    return grid_scans_streaming(
+        *args,
+        coordinate_frame=_Q_FRAME,
+        **kwargs,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +264,7 @@ def test_streaming_gridder_explicit_runtime_owns_every_xu_access(monkeypatch):
     )
     with runtime:
         monkeypatch.setattr(runtime.xu, "Gridder3D", GuardedGridder)
-        gridder = StreamingGridder(
+        gridder = _q_gridder(
             _default_mapper(4, 5),
             (3, 3, 3),
             runtime_session=runtime,
@@ -251,7 +280,7 @@ def test_streaming_gridder_explicit_runtime_owns_every_xu_access(monkeypatch):
 
         def foreign_thread():
             try:
-                StreamingGridder(
+                _q_gridder(
                     _default_mapper(4, 5),
                     (3, 3, 3),
                     runtime_session=runtime,
@@ -268,7 +297,7 @@ def test_streaming_gridder_explicit_runtime_owns_every_xu_access(monkeypatch):
         assert failures[0].code == "XU_RUNTIME_SESSION_INACTIVE"
     assert config.NTHREADS == before
     with pytest.raises(XuRuntimeUnsupported) as raised:
-        StreamingGridder(
+        _q_gridder(
             _default_mapper(4, 5),
             (3, 3, 3),
             runtime_session=runtime,
@@ -359,7 +388,7 @@ def _exercise_leased_release_failure(
     runtime = xu_runtime_session()
     with runtime:
         monkeypatch.setattr(runtime.xu, "Gridder3D", gridder_type)
-        gridder = StreamingGridder(
+        gridder = _q_gridder(
             _default_mapper(4, 5),
             (3, 3, 3),
             runtime_session=runtime,
@@ -420,7 +449,7 @@ def test_rsm_chunk_lease_public_release_seam_and_factory_guards(monkeypatch):
     runtime = xu_runtime_session()
     with runtime:
         monkeypatch.setattr(runtime.xu, "Gridder3D", _FakeGridder3D)
-        gridder = StreamingGridder(
+        gridder = _q_gridder(
             _default_mapper(4, 5),
             (3, 3, 3),
             runtime_session=runtime,
@@ -470,7 +499,7 @@ def test_rsm_chunk_root_drift_is_refused_before_consumption(monkeypatch):
     runtime = xu_runtime_session()
     with runtime:
         monkeypatch.setattr(runtime.xu, "Gridder3D", _FakeGridder3D)
-        gridder = StreamingGridder(
+        gridder = _q_gridder(
             _default_mapper(4, 5),
             (3, 3, 3),
             runtime_session=runtime,
@@ -575,7 +604,7 @@ def test_rsm_chunk_release_failure_poisons_partial_grid(monkeypatch):
     runtime = xu_runtime_session()
     with runtime:
         monkeypatch.setattr(runtime.xu, "Gridder3D", _FakeGridder3D)
-        gridder = StreamingGridder(
+        gridder = _q_gridder(
             _default_mapper(4, 5),
             (3, 3, 3),
             runtime_session=runtime,
@@ -627,7 +656,7 @@ def test_rsm_chunk_backend_failure_without_retention_still_poisons(monkeypatch):
     runtime = xu_runtime_session()
     with runtime:
         monkeypatch.setattr(runtime.xu, "Gridder3D", FailingGridder)
-        gridder = StreamingGridder(
+        gridder = _q_gridder(
             _default_mapper(4, 5),
             (3, 3, 3),
             runtime_session=runtime,
@@ -670,7 +699,7 @@ def test_rsm_chunk_collection_failure_is_stable_and_scout_fails_fast(
     runtime = xu_runtime_session()
     with runtime:
         monkeypatch.setattr(runtime.xu, "Gridder3D", _FakeGridder3D)
-        gridder = StreamingGridder(
+        gridder = _q_gridder(
             _default_mapper(4, 5),
             (3, 3, 3),
             runtime_session=runtime,
@@ -802,25 +831,52 @@ class TestCornerPixelQ:
 # ---------------------------------------------------------------------------
 
 class TestStreamingGridder:
+    def test_coordinate_frame_owns_the_matrix_policy(self, patched_xu) -> None:
+        image = np.zeros((1, 64, 64))
+        angles = [np.array([0.0])]
+
+        q_gridder = _q_gridder(_default_mapper(), (4, 4, 4))
+        q_gridder.set_bounds((-1, 1), (-1, 1), (-1, 1))
+        with pytest.raises(ValueError, match="omitted or identity"):
+            q_gridder.add(
+                image,
+                angles,
+                energy=12000.0,
+                UB=np.diag((2.0, 3.0, 4.0)),
+            )
+        assert q_gridder.n_frames_processed == 0
+        q_gridder.add(image, angles, energy=12000.0)
+        assert q_gridder.to_volume().coordinate_frame is _Q_FRAME
+
+        hkl_gridder = StreamingGridder(
+            _default_mapper(),
+            (4, 4, 4),
+            coordinate_frame=RSMCoordinateFrame.HKL,
+        )
+        hkl_gridder.set_bounds((-1, 1), (-1, 1), (-1, 1))
+        with pytest.raises(ValueError, match="requires a source UB"):
+            hkl_gridder.add(image, angles, energy=12000.0)
+        assert hkl_gridder.n_frames_processed == 0
+
     def test_add_before_bounds_raises(self, patched_xu) -> None:
-        sg = StreamingGridder(_default_mapper(), (10, 10, 10))
+        sg = _q_gridder(_default_mapper(), (10, 10, 10))
         with pytest.raises(RuntimeError, match="bounds not set"):
             sg.add(np.zeros((1, 64, 64)), [np.array([0.0])], energy=12000.0)
 
     def test_to_volume_before_add_raises(self, patched_xu) -> None:
-        sg = StreamingGridder(_default_mapper(), (10, 10, 10))
+        sg = _q_gridder(_default_mapper(), (10, 10, 10))
         sg.set_bounds((-1, 1), (-1, 1), (-1, 1))
         with pytest.raises(RuntimeError, match="no chunks processed"):
             sg.to_volume()
 
     def test_set_bounds_twice_raises(self, patched_xu) -> None:
-        sg = StreamingGridder(_default_mapper(), (10, 10, 10))
+        sg = _q_gridder(_default_mapper(), (10, 10, 10))
         sg.set_bounds((-1, 1), (-1, 1), (-1, 1))
         with pytest.raises(RuntimeError, match="bounds already set"):
             sg.set_bounds((-2, 2), (-2, 2), (-2, 2))
 
     def test_inverted_bounds_rejected(self, patched_xu) -> None:
-        sg = StreamingGridder(_default_mapper(), (10, 10, 10))
+        sg = _q_gridder(_default_mapper(), (10, 10, 10))
         with pytest.raises(ValueError, match="qx range"):
             sg.set_bounds((1, -1), (-1, 1), (-1, 1))
         with pytest.raises(ValueError, match="qy range"):
@@ -830,7 +886,7 @@ class TestStreamingGridder:
 
     def test_gridder_configured_for_streaming(self, patched_xu) -> None:
         """KeepData(True) and fixed dataRange are the heart of the streaming path."""
-        sg = StreamingGridder(_default_mapper(), (8, 9, 10))
+        sg = _q_gridder(_default_mapper(), (8, 9, 10))
         sg.set_bounds((-1, 1), (-2, 2), (-3, 3))
         sg.add(
             np.zeros((1, 64, 64)),
@@ -843,7 +899,7 @@ class TestStreamingGridder:
         assert g.data_range == (-1, 1, -2, 2, -3, 3)
 
     def test_chunk_handoff_preserves_per_frame_count(self, patched_xu) -> None:
-        sg = StreamingGridder(_default_mapper(), (8, 9, 10))
+        sg = _q_gridder(_default_mapper(), (8, 9, 10))
         sg.set_bounds((-1, 1), (-2, 2), (-3, 3))
 
         # Three chunks of varying sizes
@@ -862,7 +918,7 @@ class TestStreamingGridder:
         assert len(_FakeGridder3D.instances) == 2
 
     def test_scout_sets_bounds_from_corner_q(self, patched_xu) -> None:
-        sg = StreamingGridder(_default_mapper(), (8, 9, 10))
+        sg = _q_gridder(_default_mapper(), (8, 9, 10))
         ((qx_lo, qx_hi), (qy_lo, qy_hi), (qz_lo, qz_hi)) = sg.scout(
             [([np.array([0.0, 0.1])], 12000.0, None, (64, 64))],
         )
@@ -877,11 +933,11 @@ class TestStreamingGridder:
         assert g.data_range_fixed is True
 
     def test_scout_pad_widens_bounds(self, patched_xu) -> None:
-        sg_no_pad = StreamingGridder(_default_mapper(), (4, 4, 4))
+        sg_no_pad = _q_gridder(_default_mapper(), (4, 4, 4))
         no_pad = sg_no_pad.scout(
             [([np.array([0.0, 0.1, 0.2])], 12000.0, None, (32, 32))],
         )
-        sg_pad = StreamingGridder(_default_mapper(), (4, 4, 4))
+        sg_pad = _q_gridder(_default_mapper(), (4, 4, 4))
         with_pad = sg_pad.scout(
             [([np.array([0.0, 0.1, 0.2])], 12000.0, None, (32, 32))],
             pad=0.1,
@@ -891,7 +947,7 @@ class TestStreamingGridder:
             assert with_pad[ax][1] > no_pad[ax][1]
 
     def test_2d_chunk_promoted_to_3d(self, patched_xu) -> None:
-        sg = StreamingGridder(_default_mapper(), (4, 4, 4))
+        sg = _q_gridder(_default_mapper(), (4, 4, 4))
         sg.set_bounds((-1, 1), (-1, 1), (-1, 1))
         sg.add(
             np.zeros((64, 64)),  # 2D — single frame
@@ -922,17 +978,17 @@ class TestStreamingGridder:
             img[start:start + 2, :, 5] = 42.0
         angles = [np.linspace(0, 0.7, 8)]
 
-        out_chunk2 = grid_img_data_streaming(
+        out_chunk2 = _q_grid_img_data_streaming(
             mapper, img, angles, energy=12000.0,
             bins=(4, 4, 4), chunk_size=2,
             q_bounds=((-1, 1), (-1, 1), (-1, 1)),
         )
-        out_chunk8 = grid_img_data_streaming(
+        out_chunk8 = _q_grid_img_data_streaming(
             mapper, img, angles, energy=12000.0,
             bins=(4, 4, 4), chunk_size=8,
             q_bounds=((-1, 1), (-1, 1), (-1, 1)),
         )
-        out_chunk1 = grid_img_data_streaming(
+        out_chunk1 = _q_grid_img_data_streaming(
             mapper, img, angles, energy=12000.0,
             bins=(4, 4, 4), chunk_size=1,
             q_bounds=((-1, 1), (-1, 1), (-1, 1)),
@@ -967,7 +1023,7 @@ class TestStreamingGridder:
         mask = np.zeros((8, 8), dtype=bool)
         mask[0, 0] = True  # mask one pixel
 
-        grid_img_data_streaming(
+        _q_grid_img_data_streaming(
             mapper, img, angles, energy=12000.0,
             bins=(2, 2, 2), chunk_size=2,
             q_bounds=((-1, 1), (-1, 1), (-1, 1)),
@@ -982,7 +1038,7 @@ class TestStreamingGridder:
 
     def test_p2_static_mask_shape_validation(self, patched_xu) -> None:
         mapper = _default_mapper(Nch1=8, Nch2=8)
-        sg = StreamingGridder(mapper, (2, 2, 2))
+        sg = _q_gridder(mapper, (2, 2, 2))
         sg.set_bounds((-1, 1), (-1, 1), (-1, 1))
         with pytest.raises(ValueError, match="static_mask shape"):
             sg.add(
@@ -1002,7 +1058,7 @@ class TestGridImgDataStreaming:
         mapper = _default_mapper(Nch1=32, Nch2=32)
         img = np.random.default_rng(0).random((10, 32, 32))
         angles = [np.linspace(0, 1, 10)]
-        out = grid_img_data_streaming(
+        out = _q_grid_img_data_streaming(
             mapper, img, angles, energy=12000.0,
             bins=(4, 4, 4),
             chunk_size=3,
@@ -1018,7 +1074,7 @@ class TestGridImgDataStreaming:
         mapper = _default_mapper(Nch1=32, Nch2=32)
         img = np.random.default_rng(0).random((6, 32, 32))
         angles = [np.linspace(0, 1, 6)]
-        grid_img_data_streaming(
+        _q_grid_img_data_streaming(
             mapper, img, angles, energy=12000.0,
             bins=(4, 4, 4),
             chunk_size=2,
@@ -1033,7 +1089,7 @@ class TestGridImgDataStreaming:
         mapper = _default_mapper()
         img = np.zeros((10, 64, 64))
         with pytest.raises(ValueError, match="length N matching"):
-            grid_img_data_streaming(
+            _q_grid_img_data_streaming(
                 mapper, img,
                 [np.array([0.0, 0.1, 0.2])],  # only 3 entries for 10 frames
                 energy=12000.0,
@@ -1042,7 +1098,7 @@ class TestGridImgDataStreaming:
     def test_2d_img_rejected(self, patched_xu) -> None:
         mapper = _default_mapper()
         with pytest.raises(ValueError, match=r"img must be \(N, H, W\)"):
-            grid_img_data_streaming(
+            _q_grid_img_data_streaming(
                 mapper, np.zeros((64, 64)),
                 [np.array([0.0])], energy=12000.0,
             )
@@ -1065,7 +1121,7 @@ class TestGridScansStreaming:
             )
             for i in range(3)
         ]
-        out = grid_scans_streaming(
+        out = _q_grid_scans_streaming(
             mapper, scans,
             bins=(4, 4, 4),
             chunk_size=2,
@@ -1088,7 +1144,7 @@ class TestGridScansStreaming:
                 roi=(4, 28, 8, 24),  # 24 x 16 ROI
             ),
         ]
-        grid_scans_streaming(
+        _q_grid_scans_streaming(
             mapper, scans,
             bins=(4, 4, 4),
             chunk_size=2,
@@ -1100,7 +1156,7 @@ class TestGridScansStreaming:
 
     def test_empty_scans_rejected(self, patched_xu) -> None:
         with pytest.raises(ValueError, match="must not be empty"):
-            grid_scans_streaming(_default_mapper(), [], bins=(4, 4, 4))
+            _q_grid_scans_streaming(_default_mapper(), [], bins=(4, 4, 4))
 
 
 # ---------------------------------------------------------------------------

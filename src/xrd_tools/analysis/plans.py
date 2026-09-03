@@ -17,6 +17,10 @@ from xrd_tools.core.energy import energy_eV_to_wavelength_m
 from xrd_tools.core.roi import RoiSpec, invalid_pixel_mask, roi_reduce
 from xrd_tools.core.scan import FrameSource, MaskSpec
 from xrd_tools.sources import ensure_frame_source
+from xrd_tools.rsm.coordinate_frame import (
+    RSMCoordinateFrame,
+    rsm_coordinate_matrix,
+)
 
 if TYPE_CHECKING:
     from xrd_tools.analysis.fitting import FitConfig, PhaseFitter
@@ -776,12 +780,18 @@ def run_stitch(
 
 @dataclass(frozen=True, slots=True)
 class RSMPlan:
-    """Plan for streaming reciprocal-space map gridding."""
+    """Plan for streaming reciprocal-space map gridding.
+
+    H/K/L remains the established default and requires the physical source UB.
+    Cartesian Q must be selected explicitly; it executes with an identity
+    matrix and therefore accepts only an omitted or exact-identity ``UB``.
+    """
 
     mapper: Any = field(repr=False, compare=False)
     diff_motors: tuple[str, ...] = ()
     bins: tuple[int, int, int] = (101, 101, 101)
     UB: np.ndarray | None = field(default=None, repr=False, compare=False)
+    coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL
     energy: float | None = None
     chunk_size: int = 8
     q_bounds: tuple[
@@ -800,11 +810,19 @@ class RSMPlan:
     #: the real-data-gated tail (see rsm/corrections.gi_grid_weight).
     gi: Any = None
 
+    def __post_init__(self) -> None:
+        if type(self.coordinate_frame) is not RSMCoordinateFrame:
+            raise TypeError("RSMPlan coordinate_frame must be exact")
+        # Refuse plans that can only fail after source I/O or gridding begins.
+        # The returned canonical matrix is deliberately not retained: the plan
+        # preserves the exact caller-supplied/source UB for provenance custody.
+        rsm_coordinate_matrix(self.coordinate_frame, self.UB)
+
     def provenance(self) -> dict[str, Any]:
         """A JSON-safe record of this RSM run for persistence (pass to
         ``write_rsm(provenance=…)``).
 
-        The grid parameters + the applied corrections — NOT the binary mask/UB
+        The frame, grid parameters, and applied corrections — NOT the binary mask/UB
         nor the PixelQMap; the diffractometer geometry round-trips separately
         under ``/entry/diffractometer`` (its preset tag is noted here).
         """
@@ -818,6 +836,7 @@ class RSMPlan:
             "bins": list(self.bins),
             "diff_motors": list(self.diff_motors),
             "energy": self.energy,
+            "coordinate_frame": self.coordinate_frame.value,
             "q_bounds": ([list(r) for r in self.q_bounds]
                          if self.q_bounds is not None else None),
             "roi": list(self.roi) if self.roi is not None else None,
@@ -862,6 +881,12 @@ class RSMPlan:
             bins=tuple(prov.get("bins", (101, 101, 101))),
             diff_motors=tuple(prov.get("diff_motors", ())),
             energy=prov.get("energy"),
+            coordinate_frame=RSMCoordinateFrame(
+                prov.get(
+                    "coordinate_frame",
+                    RSMCoordinateFrame.HKL.value,
+                )
+            ),
             q_bounds=(tuple(tuple(r) for r in qb) if qb is not None else None),
             roi=tuple(roi) if roi else None,
             chunk_size=int(prov.get("chunk_size", 8)),
@@ -914,6 +939,7 @@ def run_rsm(
             scout_pad=plan.scout_pad,
             corrections=plan.corrections,
             gi=plan.gi,
+            coordinate_frame=plan.coordinate_frame,
         )
         n_sources = len(inputs)
         _harvest = members
@@ -940,6 +966,7 @@ def run_rsm(
             scout_pad=plan.scout_pad,
             corrections=plan.corrections,
             gi=plan.gi,
+            coordinate_frame=plan.coordinate_frame,
         )
         n_sources = 1
     plan_provenance = _plan_dict(plan)

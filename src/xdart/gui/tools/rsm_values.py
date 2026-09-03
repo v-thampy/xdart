@@ -57,6 +57,7 @@ from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactKind,
     AnalysisArtifactOverwrite,
 )
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -391,6 +392,7 @@ class RSMToolFormV2:
     max_chunk_bytes: int
     output_path: str | Path
     overwrite: AnalysisArtifactOverwrite = AnalysisArtifactOverwrite.CREATE_NEW
+    coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -421,8 +423,11 @@ class RSMToolFormV2:
             or type(self.max_chunk_bytes) is not int
             or not 1 <= self.max_chunk_bytes <= _MAX_FRAME_OR_CHUNK_BYTES
             or type(self.overwrite) is not AnalysisArtifactOverwrite
+            or type(self.coordinate_frame) is not RSMCoordinateFrame
         ):
             raise TypeError("RSM v2 tool form is invalid")
+        if self.overwrite is not AnalysisArtifactOverwrite.CREATE_NEW:
+            raise ValueError("RSM v2 output policy must create a new artifact")
         normalization_keys = {
             (selector.name, selector.occurrence)
             for selector in (
@@ -455,6 +460,10 @@ class RSMToolFormV2:
             self.max_chunk_bytes,
             output,
             self.overwrite,
+            self.coordinate_frame,
+            self.coordinate_frame.axis_names,
+            self.coordinate_frame.axis_units,
+            self.coordinate_frame.matrix_policy,
         )
         object.__setattr__(
             self,
@@ -1152,6 +1161,7 @@ class RSMToolPreflightMemberSummaryV2:
     selected_frame_count: int
     dependency_files: tuple[str, ...]
     dependency_file_count: int
+    coordinate_frame: RSMCoordinateFrame
     energy_eV: float
     ub: tuple[tuple[float, float, float], ...]
     q_bounds: tuple[tuple[float, float], ...]
@@ -1187,6 +1197,7 @@ class RSMToolPreflightMemberSummaryV2:
             or any(type(item) is not str or not item for item in self.dependency_files)
             or type(self.dependency_file_count) is not int
             or self.dependency_file_count != len(self.dependency_files)
+            or type(self.coordinate_frame) is not RSMCoordinateFrame
             or type(self.energy_eV) is not float
             or not math.isfinite(self.energy_eV)
             or self.energy_eV <= 0.0
@@ -1251,6 +1262,7 @@ class RSMToolPreflightSummaryV2:
     geometry_asset_receipt_fingerprint: str
     effective_geometry_fingerprint: str
     common_grid_fingerprint: str
+    coordinate_frame: RSMCoordinateFrame
     project_root: str
     output_relative_path: str
     members: tuple[RSMToolPreflightMemberSummaryV2, ...]
@@ -1282,6 +1294,7 @@ class RSMToolPreflightSummaryV2:
         if (
             _claim is not _PREFLIGHT_V2_FACTORY
             or any(type(item) is not str or _SHA256.fullmatch(item) is None for item in hashes)
+            or type(self.coordinate_frame) is not RSMCoordinateFrame
             or type(self.project_root) is not str
             or not Path(self.project_root).is_absolute()
             or _relative_path(self.output_relative_path, "RSM v2 output path")
@@ -1291,6 +1304,10 @@ class RSMToolPreflightSummaryV2:
             or any(type(item) is not RSMToolPreflightMemberSummaryV2 for item in self.members)
             or tuple(item.ordinal for item in self.members)
             != tuple(range(len(self.members)))
+            or any(
+                item.coordinate_frame is not self.coordinate_frame
+                for item in self.members
+            )
             or type(self.union_q_bounds) is not tuple
             or len(self.union_q_bounds) != 3
             or any(
@@ -1330,6 +1347,10 @@ class RSMToolPreflightSummaryV2:
         canonical = (
             "rsm-tool-preflight-summary-v2",
             hashes,
+            self.coordinate_frame,
+            self.coordinate_frame.axis_names,
+            self.coordinate_frame.axis_units,
+            self.coordinate_frame.matrix_policy,
             self.project_root,
             self.output_relative_path,
             tuple(
@@ -1347,6 +1368,7 @@ class RSMToolPreflightSummaryV2:
                     item.selected_frame_count,
                     item.dependency_files,
                     item.dependency_file_count,
+                    item.coordinate_frame,
                     item.energy_eV,
                     item.ub,
                     item.q_bounds,
@@ -1420,6 +1442,8 @@ class RSMToolPreflightV2:
             != self.request.preflight.effective_geometry.fingerprint
             or self.summary.common_grid_fingerprint
             != self.request.preflight.common_grid.fingerprint
+            or self.summary.coordinate_frame is not self.form.coordinate_frame
+            or self.summary.coordinate_frame is not self.request.plan.coordinate_frame
         ):
             raise TypeError("RSM v2 tool preflight is invalid")
 
@@ -1570,6 +1594,7 @@ def prepare_rsm_tool_v2(
             max_frame_bytes=form.max_frame_bytes,
             max_chunk_bytes=form.max_chunk_bytes,
             project_root=project,
+            coordinate_frame=form.coordinate_frame,
             cancel_token=cancel_token,
         )
     except (
@@ -1601,6 +1626,7 @@ def prepare_rsm_tool_v2(
             len(source.selected_labels),
             tuple(file.relative_path for file in item.dependency_files),
             len(item.dependency_files),
+            item.coordinate_frame,
             item.energy_eV,
             item.ub,
             item.member_q_bounds,
@@ -1640,6 +1666,7 @@ def prepare_rsm_tool_v2(
         request.preflight.geometry_asset_receipt.receipt_fingerprint,
         request.preflight.effective_geometry.fingerprint,
         request.preflight.common_grid.fingerprint,
+        request.plan.coordinate_frame,
         str(project),
         output_relative,
         member_summaries,

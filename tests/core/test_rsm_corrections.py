@@ -245,9 +245,10 @@ class TestRsmGridCorrectionsWiring:
         # large enough to move the Σraw/Σnorm mean unmistakably.
         weight = np.linspace(0.1, 1.0, 32 * 32).reshape(32, 32)
 
-        plain = grid_img_data(mapper, img, angles, energy=12000.0,
+        plain = grid_img_data(mapper, img, angles, energy=12000.0, UB=np.eye(3),
                               bins=(6, 6, 6), mask_static_pixels=False)
         corrected = grid_img_data(mapper, img, angles, energy=12000.0,
+                                  UB=np.eye(3),
                                   bins=(6, 6, 6), mask_static_pixels=False,
                                   weight=weight)
         both = np.isfinite(plain.intensity) & np.isfinite(corrected.intensity)

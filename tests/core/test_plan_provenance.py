@@ -1,7 +1,7 @@
 """StitchPlan / RSMPlan provenance() ↔ from_provenance() round-trip.
 
 The reload half of the GUI section-3 contract: a plan's processing options
-serialize to a provenance dict (persisted in the .nxs) and rebuild from it. The
+serialize to a provenance dict (persisted in the .nexus) and rebuild from it. The
 geometry/mask/UB are NOT in provenance (they persist separately) — from_provenance
 reattaches whatever is passed.
 """
@@ -21,6 +21,7 @@ from xrd_tools.corrections.grazing import (
     LEGACY_GI_EXIT_ANGLE_CONVENTION,
 )
 from xrd_tools.corrections.stack import CorrectionStack
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 
 
 def test_stitchplan_provenance_roundtrip():
@@ -71,15 +72,18 @@ def test_rsmplan_provenance_roundtrip():
     plan = RSMPlan(
         mapper=None, bins=(64, 65, 66), diff_motors=("mu", "eta", "nu", "del"),
         energy=10500.0, q_bounds=((-1.0, 1.0), (0.0, 2.0), (-0.5, 0.5)),
+        UB=np.eye(3),
+        coordinate_frame=RSMCoordinateFrame.HKL,
         roi=(2, 30, 4, 40), chunk_size=4,
         corrections=CorrectionStack(solid_angle=True),
         gi=GISettings(corrections=GICorrectionStack(material="Si", energy_eV=10500.0),
                       incident_angle_deg=0.25),
     )
-    back = RSMPlan.from_provenance(plan.provenance())
+    back = RSMPlan.from_provenance(plan.provenance(), UB=plan.UB)
     assert back.bins == (64, 65, 66)
     assert back.diff_motors == ("mu", "eta", "nu", "del")
     assert back.energy == 10500.0
+    assert back.coordinate_frame is RSMCoordinateFrame.HKL
     assert back.q_bounds == ((-1.0, 1.0), (0.0, 2.0), (-0.5, 0.5))
     assert back.roi == (2, 30, 4, 40) and back.chunk_size == 4
     assert back.corrections.solid_angle is True
@@ -93,11 +97,50 @@ def test_rsmplan_provenance_roundtrip():
 
 
 def test_rsmplan_from_provenance_reattaches_mapper():
-    prov = RSMPlan(mapper=None, bins=(8, 8, 8)).provenance()
+    prov = RSMPlan(mapper=None, bins=(8, 8, 8), UB=np.eye(3)).provenance()
     sentinel = object()
     back = RSMPlan.from_provenance(prov, mapper=sentinel, UB=np.eye(3))
     assert back.mapper is sentinel
     assert back.UB is not None and back.bins == (8, 8, 8)
+    assert back.coordinate_frame is RSMCoordinateFrame.HKL
+
+    legacy_prov = dict(prov)
+    legacy_prov.pop("coordinate_frame")
+    legacy_back = RSMPlan.from_provenance(
+        legacy_prov,
+        mapper=sentinel,
+        UB=np.eye(3),
+    )
+    assert legacy_back.coordinate_frame is RSMCoordinateFrame.HKL
+
+    with pytest.raises(TypeError, match="coordinate_frame must be exact"):
+        RSMPlan(mapper=None, coordinate_frame="hkl")
+
+
+def test_rsmplan_refuses_impossible_frame_matrix_pairs_at_construction():
+    with pytest.raises(ValueError, match="requires a source UB"):
+        RSMPlan(mapper=None)
+    with pytest.raises(ValueError, match="omitted or identity"):
+        RSMPlan(
+            mapper=None,
+            UB=np.diag((2.0, 3.0, 4.0)),
+            coordinate_frame=RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU,
+        )
+
+
+def test_rsmplan_default_preserves_existing_hkl_physical_ub_contract():
+    physical_ub = np.array(
+        (
+            (2.0, 0.25, 0.10),
+            (0.15, 3.0, 0.20),
+            (0.05, 0.30, 4.0),
+        ),
+        dtype=np.float64,
+    )
+    plan = RSMPlan(mapper=None, UB=physical_ub)
+
+    assert plan.coordinate_frame is RSMCoordinateFrame.HKL
+    np.testing.assert_array_equal(plan.UB, physical_ub)
 
 
 def test_frozen_gi_exact_current_and_legacy_keysets_and_identity():

@@ -80,6 +80,7 @@ from xrd_tools.core.scan import SourceKind
 from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactCleanupPending,
     AnalysisArtifactKind,
+    AnalysisArtifactOverwrite,
     AnalysisArtifactPayload,
     AnalysisArtifactProjectionInvalid,
     analysis_execution_attestation_digest,
@@ -88,12 +89,16 @@ from xrd_tools.io.analysis_artifact import (
     read_analysis_artifact,
 )
 from xrd_tools.io.nexus import write_rsm
-from xrd_tools.io.spec import get_energy_and_UB
+from xrd_tools.io.spec import get_energy, get_energy_and_UB
 from xrd_tools.rsm.gridding import (
     RSMGridChunkLease,
     RSMGridChunkReleaseError,
     StreamingGridder,
     _rsm_grid_chunk_release_facts,
+)
+from xrd_tools.rsm.coordinate_frame import (
+    RSMCoordinateFrame,
+    rsm_coordinate_matrix,
 )
 from xrd_tools.rsm.volume import RSMVolume
 
@@ -131,6 +136,22 @@ _RSM_V2_HOLDS = (
 class RSMNormalizationMode(str, Enum):
     IDENTITY = "identity"
     FOIL_TRANSMISSION_EXPOSURE = "foil-transmission-exposure"
+
+
+def _rsm_coordinate_matrix(
+    coordinate_frame: RSMCoordinateFrame,
+    source_ub: object,
+    *,
+    invalid_ub_code: str,
+) -> np.ndarray:
+    """Return the exact matrix xrayutilities must apply for one frame."""
+
+    if type(coordinate_frame) is not RSMCoordinateFrame:
+        raise TypeError("RSM coordinate frame must be exact")
+    try:
+        return rsm_coordinate_matrix(coordinate_frame, source_ub)
+    except ValueError as error:
+        raise RSMOperationRefused(invalid_ub_code) from error
 
 
 class RSMOperationRefused(ValueError):
@@ -1212,6 +1233,7 @@ class _RSMCapturedMemberFacts:
     primary_revision: tuple[int, int, int, int, int, int]
     files: tuple[RSMManifestFile, ...]
     contributions: tuple[RSMContribution, ...]
+    coordinate_frame: RSMCoordinateFrame
     energy_eV: float
     ub: tuple[tuple[float, float, float], ...]
     q_bounds: tuple[
@@ -1247,7 +1269,10 @@ def _capture_preflight_facts(
     active_runtime_session: object | None = None,
     allow_single_static_hot: bool = False,
     cancel_token: threading.Event | None = None,
+    coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
 ) -> _RSMCapturedMemberFacts:
+    if type(coordinate_frame) is not RSMCoordinateFrame:
+        raise TypeError("RSM coordinate frame must be exact")
     root = _project_root(project_root)
     analysis = source.analysis
     if (
@@ -1377,43 +1402,60 @@ def _capture_preflight_facts(
             analysis,
             cancel_token=cancel_token,
         ) as opened:
-            if normalize_source_fact_errors:
-                try:
+            try:
+                if coordinate_frame is RSMCoordinateFrame.HKL:
                     energy, ub_value = get_energy_and_UB(
                         analysis.resolved_root,
                         analysis.resolved_scan,
                     )
-                except KeyError as error:
+                else:
+                    energy = get_energy(
+                        analysis.resolved_root,
+                        analysis.resolved_scan,
+                    )
+                    ub_value = None
+            except KeyError as error:
+                if normalize_source_fact_errors:
                     code = (
                         invalid_ub_code
-                        if error.args and error.args[0] == "G3"
+                        if (
+                            coordinate_frame is RSMCoordinateFrame.HKL
+                            and error.args
+                            and error.args[0] == "G3"
+                        )
                         else invalid_energy_code
                     )
                     raise RSMOperationRefused(
                         code or "RSM_MEMBER_ENERGY_INVALID"
                     ) from error
-                except ValueError as error:
-                    raise RSMOperationRefused(invalid_ub_code) from error
-            else:
-                energy, ub_value = get_energy_and_UB(
-                    analysis.resolved_root,
-                    analysis.resolved_scan,
-                )
+                raise
+            except ValueError as error:
+                if normalize_source_fact_errors:
+                    code = (
+                        invalid_ub_code
+                        if coordinate_frame is RSMCoordinateFrame.HKL
+                        else invalid_energy_code
+                    )
+                    raise RSMOperationRefused(
+                        code or "RSM_MEMBER_ENERGY_INVALID"
+                    ) from error
+                raise
             try:
                 energy = _finite_float(energy, "RSM energy", positive=True)
             except (TypeError, ValueError) as error:
                 if invalid_energy_code is None:
                     raise
                 raise RSMOperationRefused(invalid_energy_code) from error
-            if normalize_ub_errors:
-                try:
-                    ub = np.asarray(ub_value, dtype=np.float64)
-                except (TypeError, ValueError) as error:
-                    raise RSMOperationRefused(invalid_ub_code) from error
+            if normalize_ub_errors or coordinate_frame is not RSMCoordinateFrame.HKL:
+                ub = _rsm_coordinate_matrix(
+                    coordinate_frame,
+                    ub_value,
+                    invalid_ub_code=invalid_ub_code,
+                )
             else:
                 ub = np.asarray(ub_value, dtype=np.float64)
-            if ub.shape != (3, 3) or not np.all(np.isfinite(ub)):
-                raise RSMOperationRefused(invalid_ub_code)
+                if ub.shape != (3, 3) or not np.all(np.isfinite(ub)):
+                    raise RSMOperationRefused(invalid_ub_code)
             for contribution_index, label in enumerate(source.selected_labels):
                 if cancel_token is not None and cancel_token.is_set():
                     raise RSMOperationRefused("CANCELLED")
@@ -1526,6 +1568,7 @@ def _capture_preflight_facts(
         analysis.primary_post_state,
         tuple(files),
         tuple(contributions),
+        coordinate_frame,
         float(energy),
         tuple(tuple(float(value) for value in row) for row in ub),
         bounds,
@@ -1659,6 +1702,7 @@ class RSMCommonGrid:
 
     bounds: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
     bins: tuple[int, int, int]
+    coordinate_frame: RSMCoordinateFrame
     linspace_policy: str
     accumulation_policy: str
     empty_policy: str
@@ -1685,6 +1729,7 @@ class RSMCommonGrid:
                 for value in self.bins
             )
             or math.prod(self.bins) > _MAX_RSM_VOXELS
+            or type(self.coordinate_frame) is not RSMCoordinateFrame
             or self.linspace_policy != "numpy-linspace-f8-v1"
             or self.accumulation_policy
             != "xrayutilities-gridder3d-sum-raw-sum-norm-v1"
@@ -1709,6 +1754,9 @@ class RSMCommonGrid:
         return {
             "bounds": [list(item) for item in self.bounds],
             "bins": list(self.bins),
+            "coordinate_frame": self.coordinate_frame.value,
+            "axis_names": list(self.coordinate_frame.axis_names),
+            "axis_units": list(self.coordinate_frame.axis_units),
             "linspace_policy": self.linspace_policy,
             "accumulation_policy": self.accumulation_policy,
             "empty_policy": self.empty_policy,
@@ -1729,11 +1777,15 @@ def make_rsm_common_grid(
         tuple[tuple[float, float], tuple[float, float], tuple[float, float]], ...
     ],
     bins: tuple[int, int, int],
+    *,
+    coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
 ) -> RSMCommonGrid:
     if type(member_bounds) is not tuple or not member_bounds:
         raise TypeError("RSM common grid requires exact ordered member bounds")
     if type(bins) is not tuple:
         raise TypeError("RSM common grid bins must be an exact tuple")
+    if type(coordinate_frame) is not RSMCoordinateFrame:
+        raise TypeError("RSM common grid coordinate frame must be exact")
     try:
         bounds = tuple(
             (
@@ -1753,10 +1805,24 @@ def make_rsm_common_grid(
         "NaN-empty-v1",
     )
     fingerprint = analysis_canonical_fingerprint(
-        "rsm-common-grid-v1",
-        (bounds, bins, *policies),
+        "rsm-common-grid-v2",
+        (
+            coordinate_frame,
+            coordinate_frame.axis_names,
+            coordinate_frame.axis_units,
+            bounds,
+            bins,
+            *policies,
+        ),
     )
-    return RSMCommonGrid(bounds, bins, *policies, fingerprint, _RSM_V2_FACTORY)
+    return RSMCommonGrid(
+        bounds,
+        bins,
+        coordinate_frame,
+        *policies,
+        fingerprint,
+        _RSM_V2_FACTORY,
+    )
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -1774,6 +1840,7 @@ class RSMPreflightMemberV2:
     primary_revision: tuple[int, int, int, int, int, int]
     dependency_files: tuple[RSMManifestFile, ...]
     contributions: tuple[RSMContribution, ...]
+    coordinate_frame: RSMCoordinateFrame
     energy_eV: float
     ub: tuple[tuple[float, float, float], ...]
     member_q_bounds: tuple[
@@ -1836,6 +1903,7 @@ class RSMPreflightMemberV2:
             )
             or len({item.label for item in self.contributions})
             != len(self.contributions)
+            or type(self.coordinate_frame) is not RSMCoordinateFrame
             or type(self.energy_eV) is not float
             or not math.isfinite(self.energy_eV)
             or self.energy_eV <= 0.0
@@ -1899,6 +1967,12 @@ class RSMPreflightMemberV2:
                 self.mask_policy_intent[2],
                 "RSM conditioning fingerprint",
             )
+        if (
+            self.coordinate_frame is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+            and self.ub
+            != ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        ):
+            raise ValueError("Cartesian-Q RSM member must bind explicit identity")
 
     def _canonical_value(self) -> tuple[object, ...]:
         return (
@@ -1925,6 +1999,8 @@ class RSMPreflightMemberV2:
                 )
                 for item in self.contributions
             ),
+            self.coordinate_frame,
+            self.coordinate_frame.matrix_policy,
             self.energy_eV,
             self.ub,
             self.member_q_bounds,
@@ -1970,8 +2046,12 @@ class RSMPreflightMemberV2:
                 }
                 for item in self.contributions
             ],
+            "coordinate_frame": self.coordinate_frame.value,
+            "axis_names": list(self.coordinate_frame.axis_names),
+            "axis_units": list(self.coordinate_frame.axis_units),
+            "matrix_policy": self.coordinate_frame.matrix_policy,
             "energy_eV": self.energy_eV,
-            "ub": [list(row) for row in self.ub],
+            "coordinate_matrix": [list(row) for row in self.ub],
             "member_q_bounds": [list(item) for item in self.member_q_bounds],
             "detector_shape": list(self.detector_shape),
             "cropped_shape": list(self.cropped_shape),
@@ -2049,6 +2129,8 @@ def _make_rsm_preflight_member_v2(
             )
             for item in facts.contributions
         ),
+        facts.coordinate_frame,
+        facts.coordinate_frame.matrix_policy,
         facts.energy_eV,
         facts.ub,
         facts.q_bounds,
@@ -2073,6 +2155,7 @@ def _make_rsm_preflight_member_v2(
         facts.primary_revision,
         facts.files,
         facts.contributions,
+        facts.coordinate_frame,
         facts.energy_eV,
         facts.ub,
         facts.q_bounds,
@@ -2113,6 +2196,7 @@ class RSMOperationPlanV2:
 
     effective_geometry: RSMEffectiveGeometry
     ordered_geometry_bindings: tuple[RSMMemberGeometryBinding, ...]
+    coordinate_frame: RSMCoordinateFrame
     common_grid: RSMCommonGrid
     conditioning: RSMImageConditioning
     normalization: RSMNormalizationPolicy
@@ -2141,7 +2225,9 @@ class RSMOperationPlanV2:
                 != self.effective_geometry.fingerprint
                 for item in self.ordered_geometry_bindings
             )
+            or type(self.coordinate_frame) is not RSMCoordinateFrame
             or type(self.common_grid) is not RSMCommonGrid
+            or self.common_grid.coordinate_frame is not self.coordinate_frame
             or type(self.conditioning) is not RSMImageConditioning
             or type(self.normalization) is not RSMNormalizationPolicy
             or type(self.chunk_size) is not int
@@ -2178,6 +2264,10 @@ class RSMOperationPlanV2:
     def _canonical_value(self) -> tuple[object, ...]:
         return (
             "rsm-operation-plan-v2",
+            self.coordinate_frame,
+            self.coordinate_frame.axis_names,
+            self.coordinate_frame.axis_units,
+            self.coordinate_frame.matrix_policy,
             self.effective_geometry.fingerprint,
             tuple(item.fingerprint for item in self.ordered_geometry_bindings),
             self.common_grid.fingerprint,
@@ -2197,6 +2287,10 @@ class RSMOperationPlanV2:
 
     def to_provenance(self) -> dict[str, object]:
         return {
+            "coordinate_frame": self.coordinate_frame.value,
+            "axis_names": list(self.coordinate_frame.axis_names),
+            "axis_units": list(self.coordinate_frame.axis_units),
+            "matrix_policy": self.coordinate_frame.matrix_policy,
             "bins": list(self.bins),
             "chunk_size": self.chunk_size,
             "max_frame_bytes": self.max_frame_bytes,
@@ -2222,6 +2316,7 @@ class RSMOperationPlanV2:
 def _make_rsm_operation_plan_v2(
     effective_geometry: RSMEffectiveGeometry,
     bindings: tuple[RSMMemberGeometryBinding, ...],
+    coordinate_frame: RSMCoordinateFrame,
     common_grid: RSMCommonGrid,
     conditioning: RSMImageConditioning,
     normalization: RSMNormalizationPolicy,
@@ -2232,6 +2327,10 @@ def _make_rsm_operation_plan_v2(
 ) -> RSMOperationPlanV2:
     canonical = (
         "rsm-operation-plan-v2",
+        coordinate_frame,
+        coordinate_frame.axis_names,
+        coordinate_frame.axis_units,
+        coordinate_frame.matrix_policy,
         effective_geometry.fingerprint,
         tuple(item.fingerprint for item in bindings),
         common_grid.fingerprint,
@@ -2252,6 +2351,7 @@ def _make_rsm_operation_plan_v2(
     return RSMOperationPlanV2(
         effective_geometry,
         bindings,
+        coordinate_frame,
         common_grid,
         conditioning,
         normalization,
@@ -2308,6 +2408,10 @@ class RSMGroupPreflightReceiptV2:
                 )
             )
             or type(self.common_grid) is not RSMCommonGrid
+            or any(
+                item.coordinate_frame is not self.common_grid.coordinate_frame
+                for item in self.ordered_members
+            )
         ):
             raise TypeError("RSM v2 group preflight is not factory-owned")
         _require_rsm_v2_digest(
@@ -2347,6 +2451,9 @@ class RSMGroupPreflightReceiptV2:
     def to_provenance(self) -> dict[str, object]:
         return {
             "schema_version": "rsm-preflight-v2",
+            "coordinate_frame": self.common_grid.coordinate_frame.value,
+            "axis_names": list(self.common_grid.coordinate_frame.axis_names),
+            "axis_units": list(self.common_grid.coordinate_frame.axis_units),
             "project_root": self.project_root,
             "geometry_asset_receipt_fingerprint": (
                 self.geometry_asset_receipt.receipt_fingerprint
@@ -2394,8 +2501,11 @@ def _make_rsm_group_preflight_v2(
         for axis in range(3)
     )
     expected_grid_fingerprint = analysis_canonical_fingerprint(
-        "rsm-common-grid-v1",
+        "rsm-common-grid-v2",
         (
+            common_grid.coordinate_frame,
+            common_grid.coordinate_frame.axis_names,
+            common_grid.coordinate_frame.axis_units,
             expected_bounds,
             common_grid.bins,
             common_grid.linspace_policy,
@@ -2407,7 +2517,12 @@ def _make_rsm_group_preflight_v2(
         observed_member_sources != expected_member_sources
         or plan.effective_geometry is not effective
         or plan.ordered_geometry_bindings != bindings
+        or plan.coordinate_frame is not common_grid.coordinate_frame
         or plan.common_grid is not common_grid
+        or any(
+            item.coordinate_frame is not common_grid.coordinate_frame
+            for item in members
+        )
         or common_grid.bounds != expected_bounds
         or common_grid.fingerprint != expected_grid_fingerprint
     ):
@@ -2522,8 +2637,14 @@ def _rsm_v2_provenance(
     )
 
     return {
-        "schema_version": "rsm-operation-v2-intent",
+        "schema_version": "rsm-operation-v3-intent",
         "kind": "rsm",
+        "coordinate_frame": {
+            "name": plan.coordinate_frame.value,
+            "axis_names": list(plan.coordinate_frame.axis_names),
+            "axis_units": list(plan.coordinate_frame.axis_units),
+            "matrix_policy": plan.coordinate_frame.matrix_policy,
+        },
         "source_group": {
             "member_fingerprints": [item.fingerprint for item in group.members],
             "group_fingerprint": group.fingerprint,
@@ -2609,6 +2730,7 @@ class RSMOperationRequestV2:
             != {
                 "schema_version",
                 "kind",
+                "coordinate_frame",
                 "source_group",
                 "asset",
                 "effective_geometry",
@@ -3457,6 +3579,7 @@ def prepare_rsm_operation_v2(
     max_frame_bytes: int,
     max_chunk_bytes: int,
     project_root: str | Path,
+    coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
     cancel_token: threading.Event | None = None,
 ) -> RSMOperationRequestV2:
     """Build one ordered, image-free RSM v2 Preview transaction."""
@@ -3483,8 +3606,14 @@ def prepare_rsm_operation_v2(
         or type(chunk_size) is not int
         or type(max_frame_bytes) is not int
         or type(max_chunk_bytes) is not int
+        or type(coordinate_frame) is not RSMCoordinateFrame
     ):
         raise TypeError("RSM v2 preparation requires exact grouped values")
+    if output.overwrite is not AnalysisArtifactOverwrite.CREATE_NEW:
+        raise RSMOperationRefused(
+            "RSM_OUTPUT_POLICY_UNSUPPORTED",
+            "RSM v2 must create one new immutable artifact",
+        )
     if len(set(member_form_fingerprints)) != len(member_form_fingerprints):
         raise RSMOperationRefused(
             "RSM_SOURCE_GROUP_INVALID",
@@ -3587,6 +3716,7 @@ def prepare_rsm_operation_v2(
                 active_runtime_session=runtime_session,
                 allow_single_static_hot=True,
                 cancel_token=cancel_token,
+                coordinate_frame=coordinate_frame,
             )
             try:
                 read_options = json.loads(facts.source_options_json)[
@@ -3618,10 +3748,12 @@ def prepare_rsm_operation_v2(
         common_grid = make_rsm_common_grid(
             tuple(item.member_q_bounds for item in member_tuple),
             bins,
+            coordinate_frame=coordinate_frame,
         )
         plan = _make_rsm_operation_plan_v2(
             effective,
             bindings,
+            coordinate_frame,
             common_grid,
             conditioning,
             normalization,
@@ -4430,6 +4562,7 @@ def _runtime_plan(
         diff_motors=_PSIC_ROLES,
         bins=plan.bins,
         UB=np.asarray(preflight.ub, dtype=np.float64),
+        coordinate_frame=RSMCoordinateFrame.HKL,
         energy=preflight.energy_eV,
         chunk_size=plan.chunk_size,
         q_bounds=preflight.q_bounds,
@@ -4447,7 +4580,9 @@ def _validate_science_volume(
 ) -> RSMVolume:
     if type(value) is not RSMVolume:
         raise RSMOperationRefused("INVALID_SCIENCE_RESULT")
-    axes = (value.h, value.k, value.l)
+    if value.coordinate_frame is not RSMCoordinateFrame.HKL:
+        raise RSMOperationRefused("INVALID_SCIENCE_RESULT")
+    axes = value.axis_values
     if value.intensity.shape != request.plan.bins:
         raise RSMOperationRefused("INVALID_SCIENCE_RESULT")
     for axis, size, bounds in zip(axes, request.plan.bins, request.preflight.q_bounds):
@@ -4910,10 +5045,12 @@ def _validate_rsm_v2_science_volume(
 ) -> RSMVolume:
     if type(value) is not RSMVolume:
         raise RSMOperationRefused("INVALID_SCIENCE_RESULT")
+    if value.coordinate_frame is not request.plan.coordinate_frame:
+        raise RSMOperationRefused("INVALID_SCIENCE_RESULT")
     if value.intensity.shape != request.plan.bins:
         raise RSMOperationRefused("INVALID_SCIENCE_RESULT")
     for axis, size, bounds in zip(
-        (value.h, value.k, value.l),
+        value.axis_values,
         request.plan.bins,
         request.plan.common_grid.bounds,
         strict=True,
@@ -4958,8 +5095,8 @@ def _rsm_v2_execution_attestation(
         or frame_release_check_frame_count != selected_frames
     ):
         raise RSMOperationRefused("RSM_EXECUTION_ATTESTATION_MISMATCH")
-    return {
-        "schema_version": "rsm-execution-attestation-v1",
+    attestation = {
+        "schema_version": "rsm-execution-attestation-v2",
         "module_request_fingerprint": request.module.fingerprint,
         "result_projection_policy": "analysis_artifact_stored_le_f4_v1",
         "result_fingerprint": _require_rsm_v2_digest(
@@ -4982,7 +5119,12 @@ def _rsm_v2_execution_attestation(
             for ordinal, receipt in enumerate(mask_receipts)
         ],
         "xu_runtime": runtime.to_attestation(),
+        "coordinate_frame": request.plan.coordinate_frame.value,
+        "axis_names": list(request.plan.coordinate_frame.axis_names),
+        "axis_units": list(request.plan.coordinate_frame.axis_units),
+        "matrix_policy": request.plan.coordinate_frame.matrix_policy,
     }
+    return attestation
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -5003,7 +5145,13 @@ class RSMOperationResultV2:
                 committed
                 and (
                     self.payload.kind is not AnalysisArtifactKind.RSM
-                    or self.payload.schema_version != 2
+                    or self.payload.schema_version
+                    != (
+                        3
+                        if self.request.plan.coordinate_frame
+                        is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+                        else 2
+                    )
                     or self.payload.result_fingerprint
                     != self.terminal.commit.result_fingerprint
                     or self.payload.execution_attestation_digest
@@ -5118,7 +5266,13 @@ class RSMOperationExecutionV2:
         )
         invalid = (
             payload.kind is not AnalysisArtifactKind.RSM
-            or payload.schema_version != 2
+            or payload.schema_version
+            != (
+                3
+                if self.request.plan.coordinate_frame
+                is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+                else 2
+            )
             or payload.result_fingerprint != terminal.commit.result_fingerprint
             or payload.provenance_json != self.request.provenance_json
             or payload.execution_attestation_json
@@ -5136,8 +5290,15 @@ class RSMOperationExecutionV2:
             != self.request.module.provenance_digest
             or payload.inspection.shape != self.request.plan.bins
             or payload.inspection.axis_units
-            != (("h", None), ("k", None), ("l", None))
-            or tuple(name for name, _axis in payload.axes) != ("h", "k", "l")
+            != tuple(
+                zip(
+                    self.request.plan.coordinate_frame.axis_names,
+                    self.request.plan.coordinate_frame.axis_units,
+                    strict=True,
+                )
+            )
+            or tuple(name for name, _axis in payload.axes)
+            != self.request.plan.coordinate_frame.axis_names
             or any(
                 not np.array_equal(observed, expected)
                 for (_name, observed), expected in zip(
@@ -5263,6 +5424,7 @@ class RSMOperationExecutionV2:
                     mapper,
                     self.request.plan.bins,
                     runtime_session=session,
+                    coordinate_frame=self.request.plan.coordinate_frame,
                 )
                 gridder.set_bounds(*self.request.plan.common_grid.bounds)
                 for source_receipt, member in zip(
@@ -5410,10 +5572,12 @@ class RSMOperationExecutionV2:
                 "RSM_ALLOCATOR_PRESSURE_UNAVAILABLE",
             )
         try:
+            axis_names = volume.coordinate_frame.axis_names
+            axis_units = volume.coordinate_frame.axis_units
             result_projection = project_analysis_artifact_result(
                 kind=AnalysisArtifactKind.RSM,
-                axes=(("h", volume.h), ("k", volume.k), ("l", volume.l)),
-                axis_units=(("h", None), ("k", None), ("l", None)),
+                axes=volume.axes,
+                axis_units=tuple(zip(axis_names, axis_units, strict=True)),
                 intensity=volume.intensity,
                 sigma=None,
                 coverage=None,
@@ -5503,6 +5667,12 @@ class RSMOperationExecutionV2:
                 result_projection=result_projection,
                 provenance=bound.provenance_json,
                 bounded_artifact=True,
+                coordinate_frame=(
+                    self.request.plan.coordinate_frame
+                    if self.request.plan.coordinate_frame
+                    is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+                    else None
+                ),
             )
 
         def prepublish_check() -> None:

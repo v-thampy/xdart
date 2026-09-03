@@ -876,7 +876,9 @@ NB_RSM = [
 
         The public RSM path separates a source, persisted geometry, and an
         `RSMPlan`. Smoke mode creates a bounded `RSMVolume` for slice review;
-        real mode requires the matching `PixelQMap` and scan motor mapping.
+        real mode requires the matching `PixelQMap`, authenticated physical UB,
+        and scan motor mapping. HKL is the established/default frame; Cartesian
+        Q must be selected explicitly.
         """
     ),
     code(
@@ -888,15 +890,16 @@ NB_RSM = [
 
         from xrd_tools.analysis import RSMPlan, run_rsm
         from xrd_tools.io import open_scan
-        from xrd_tools.rsm import RSMVolume
+        from xrd_tools.rsm import RSMCoordinateFrame, RSMVolume
         from xrd_tools.viz import plot_image
         """
     ),
     CONFIG,
     code(
         """
-        processed_file = TEST_DATA / "processed.nxs"
+        processed_file = TEST_DATA / "processed.nexus"
         mapper = None  # Real mode: PixelQMap from the experiment's persisted geometry.
+        UB = None  # Real mode: authenticated physical 3x3 UB for this source.
         diff_motors = ()  # Real mode: one persisted scan_data motor name per circle.
         slice_axis = widgets.Dropdown(options=("h", "k", "l"), value="l", description="integrate")
         compute = widgets.Button(description="Compute RSM", button_style="primary")
@@ -934,7 +937,19 @@ NB_RSM = [
                 else:
                     assert processed_file.is_file(), f"Missing processed NeXus: {processed_file}"
                     assert mapper is not None and diff_motors, "Set mapper and diff_motors from the experiment geometry."
-                    volume = run_rsm(RSMPlan(mapper=mapper, diff_motors=tuple(diff_motors), bins=(96, 96, 96)), open_scan(processed_file)).payload
+                    assert UB is not None, "Set the authenticated physical UB for this source."
+                    ub = np.asarray(UB, dtype=np.float64)
+                    assert ub.shape == (3, 3) and np.all(np.isfinite(ub)), "UB must be a finite 3x3 matrix."
+                    volume = run_rsm(
+                        RSMPlan(
+                            mapper=mapper,
+                            diff_motors=tuple(diff_motors),
+                            bins=(96, 96, 96),
+                            UB=ub,
+                            coordinate_frame=RSMCoordinateFrame.HKL,
+                        ),
+                        open_scan(processed_file),
+                    ).payload
                 NOTEBOOK_STATE.update(computes=NOTEBOOK_STATE["computes"] + 1, volume=volume)
                 status.value = "<b>RSM gridding complete; slice changes redraw cached volume only.</b>"
                 draw_cached_slice()

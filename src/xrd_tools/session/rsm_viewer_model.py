@@ -11,6 +11,10 @@ from xrd_tools.analysis.canonical_fingerprint import (
     analysis_canonical_fingerprint,
 )
 from xrd_tools.session.display_logic import PanelKey, PanelRole
+from xrd_tools.rsm.coordinate_frame import (
+    RSMCoordinateFrame,
+    rsm_coordinate_frame_from_axes,
+)
 
 
 RSM_HK = PanelKey(PanelRole.SLICE_2D, "HK")
@@ -20,6 +24,13 @@ RSM_H = PanelKey(PanelRole.PROJ_1D, "H")
 RSM_K = PanelKey(PanelRole.PROJ_1D, "K")
 RSM_L = PanelKey(PanelRole.PROJ_1D, "L")
 
+RSM_QX_QY = PanelKey(PanelRole.SLICE_2D, "QxQy")
+RSM_QX_QZ = PanelKey(PanelRole.SLICE_2D, "QxQz")
+RSM_QY_QZ = PanelKey(PanelRole.SLICE_2D, "QyQz")
+RSM_QX = PanelKey(PanelRole.PROJ_1D, "Qx")
+RSM_QY = PanelKey(PanelRole.PROJ_1D, "Qy")
+RSM_QZ = PanelKey(PanelRole.PROJ_1D, "Qz")
+
 RSM_VIEWER_LAYOUT = (
     (RSM_HK, RSM_HL, RSM_KL),
     (RSM_H, RSM_K, RSM_L),
@@ -27,6 +38,14 @@ RSM_VIEWER_LAYOUT = (
 RSM_VIEWER_PANEL_ORDER = tuple(
     panel for row in RSM_VIEWER_LAYOUT for panel in row
 )
+RSM_Q_VIEWER_LAYOUT = (
+    (RSM_QX_QY, RSM_QX_QZ, RSM_QY_QZ),
+    (RSM_QX, RSM_QY, RSM_QZ),
+)
+RSM_Q_VIEWER_PANEL_ORDER = tuple(
+    panel for row in RSM_Q_VIEWER_LAYOUT for panel in row
+)
+_RSM_ALL_PANEL_KEYS = RSM_VIEWER_PANEL_ORDER + RSM_Q_VIEWER_PANEL_ORDER
 
 _MAX_RSM_VIEWER_SNAPSHOTS = 8
 _MAX_RSM_VIEWER_COMPONENTS = 32
@@ -40,6 +59,26 @@ _I8 = np.dtype("<i8")
 
 _ComponentKey = tuple[str, str, str] | tuple[str, str, str, int]
 _SnapshotKey = tuple[str, str]
+
+
+def rsm_viewer_layout(
+    coordinate_frame: RSMCoordinateFrame,
+) -> tuple[tuple[PanelKey, PanelKey, PanelKey], ...]:
+    """Return the exact six-panel layout for one admitted RSM frame."""
+
+    if coordinate_frame is RSMCoordinateFrame.HKL:
+        return RSM_VIEWER_LAYOUT
+    if coordinate_frame is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU:
+        return RSM_Q_VIEWER_LAYOUT
+    raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
+
+
+def _rsm_viewer_panel_order(
+    coordinate_frame: RSMCoordinateFrame,
+) -> tuple[PanelKey, ...]:
+    return tuple(
+        panel for row in rsm_viewer_layout(coordinate_frame) for panel in row
+    )
 
 
 class RSMViewerRefused(ValueError):
@@ -160,19 +199,26 @@ def _validate_canonical_float32(
 
 def _validate_source(
     result_fingerprint: object,
+    coordinate_frame: object,
     axes: object,
     intensity: object,
-) -> tuple[str, tuple[np.ndarray, np.ndarray, np.ndarray], np.ndarray]:
+) -> tuple[
+    str,
+    RSMCoordinateFrame,
+    tuple[np.ndarray, np.ndarray, np.ndarray],
+    np.ndarray,
+]:
     fingerprint = _require_digest(result_fingerprint)
     if (
-        type(axes) is not tuple
+        type(coordinate_frame) is not RSMCoordinateFrame
+        or type(axes) is not tuple
         or len(axes) != 3
         or tuple(
             item[0]
             for item in axes
             if type(item) is tuple and len(item) == 2
         )
-        != ("h", "k", "l")
+        != coordinate_frame.axis_names
     ):
         raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
     axis_values = tuple(
@@ -192,7 +238,7 @@ def _validate_source(
     )
     if volume.shape != tuple(values.size for values in axis_values):
         raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
-    return fingerprint, axis_values, volume
+    return fingerprint, coordinate_frame, axis_values, volume
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -202,6 +248,7 @@ class RSMViewerValues:
     result_fingerprint: str
     _axis_values: InitVar[tuple[tuple[str, np.ndarray], ...]]
     _intensity_values: InitVar[np.ndarray]
+    coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL
     _claim: InitVar[object] = None
     _axis_buffers: tuple[tuple[str, bytes], ...] = field(init=False, repr=False)
     _intensity_buffer: bytes = field(init=False, repr=False)
@@ -215,8 +262,9 @@ class RSMViewerValues:
     ) -> None:
         if _claim is not _RSM_VIEWER_FACTORY:
             raise TypeError("RSM viewer values are factory-issued")
-        result, axes, intensity = _validate_source(
+        result, frame, axes, intensity = _validate_source(
             self.result_fingerprint,
+            self.coordinate_frame,
             _axis_values,
             _intensity_values,
         )
@@ -238,6 +286,7 @@ class RSMViewerValues:
             _immutable_bytes(intensity),
         )
         object.__setattr__(self, "result_fingerprint", result)
+        object.__setattr__(self, "coordinate_frame", frame)
         object.__setattr__(self, "_shape", intensity.shape)
 
     @staticmethod
@@ -274,16 +323,31 @@ def make_rsm_viewer_values(
     try:
         from xrd_tools.io.analysis_artifact import (
             ANALYSIS_SCHEMA_VERSION_V2,
+            ANALYSIS_SCHEMA_VERSION_V3,
             AnalysisArtifactKind,
             AnalysisArtifactPayload,
             AnalysisArtifactResultProjection,
         )
 
         if type(source) is AnalysisArtifactResultProjection:
+            try:
+                coordinate_frame = rsm_coordinate_frame_from_axes(
+                    tuple(name for name, _values in source.axes),
+                    tuple(units for _name, units in source.axis_units),
+                )
+            except (TypeError, ValueError):
+                coordinate_frame = None
             if (
                 source.kind is not AnalysisArtifactKind.RSM
+                or coordinate_frame is None
                 or source.axis_units
-                != (("h", None), ("k", None), ("l", None))
+                != tuple(
+                    zip(
+                        coordinate_frame.axis_names,
+                        coordinate_frame.axis_units,
+                        strict=True,
+                    )
+                )
                 or source.sigma is not None
                 or source.coverage is not None
                 or source.normalization is not None
@@ -294,11 +358,35 @@ def make_rsm_viewer_values(
             intensity = source.intensity
         elif type(source) is AnalysisArtifactPayload:
             inspection = source.inspection
+            try:
+                coordinate_frame = rsm_coordinate_frame_from_axes(
+                    tuple(name for name, _size in inspection.axes),
+                    tuple(units for _name, units in inspection.axis_units),
+                )
+            except (TypeError, ValueError):
+                coordinate_frame = None
             if (
                 inspection.kind is not AnalysisArtifactKind.RSM
-                or inspection.schema_version != ANALYSIS_SCHEMA_VERSION_V2
+                or coordinate_frame is None
+                or (
+                    inspection.schema_version,
+                    coordinate_frame,
+                )
+                not in {
+                    (ANALYSIS_SCHEMA_VERSION_V2, RSMCoordinateFrame.HKL),
+                    (
+                        ANALYSIS_SCHEMA_VERSION_V3,
+                        RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU,
+                    ),
+                }
                 or inspection.axis_units
-                != (("h", None), ("k", None), ("l", None))
+                != tuple(
+                    zip(
+                        coordinate_frame.axis_names,
+                        coordinate_frame.axis_units,
+                        strict=True,
+                    )
+                )
                 or inspection.has_sigma
                 or inspection.has_stitch_diagnostics
             ):
@@ -312,7 +400,8 @@ def make_rsm_viewer_values(
             result_fingerprint,
             axes,
             intensity,
-            _RSM_VIEWER_FACTORY,
+            coordinate_frame=coordinate_frame,
+            _claim=_RSM_VIEWER_FACTORY,
         )
     except RSMViewerRefused:
         raise
@@ -328,6 +417,7 @@ class RSMViewerState:
     h_index: int
     k_index: int
     l_index: int
+    coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL
     fingerprint: str = field(init=False)
     _claim: InitVar[object] = None
 
@@ -338,22 +428,39 @@ class RSMViewerState:
             or type(self.k_index) is not int
             or type(self.l_index) is not int
             or min(self.h_index, self.k_index, self.l_index) < 0
+            or type(self.coordinate_frame) is not RSMCoordinateFrame
         ):
             raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
         _require_digest(self.result_fingerprint)
+        if self.coordinate_frame is RSMCoordinateFrame.HKL:
+            domain = "rsm-viewer-state-v1"
+            canonical_value = (
+                self.result_fingerprint,
+                self.h_index,
+                self.k_index,
+                self.l_index,
+            )
+        else:
+            domain = "rsm-viewer-state-v2"
+            canonical_value = (
+                self.result_fingerprint,
+                self.coordinate_frame,
+                self.h_index,
+                self.k_index,
+                self.l_index,
+            )
         object.__setattr__(
             self,
             "fingerprint",
             analysis_canonical_fingerprint(
-                "rsm-viewer-state-v1",
-                (
-                    self.result_fingerprint,
-                    self.h_index,
-                    self.k_index,
-                    self.l_index,
-                ),
+                domain,
+                canonical_value,
             ),
         )
+
+    @property
+    def axis_indices(self) -> tuple[int, int, int]:
+        return self.h_index, self.k_index, self.l_index
 
     (
         __copy__,
@@ -371,6 +478,7 @@ def make_rsm_viewer_state(
     h_index: int | None = None,
     k_index: int | None = None,
     l_index: int | None = None,
+    coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
 ) -> RSMViewerState:
     fingerprint = _require_digest(result_fingerprint)
     indices = _resolve_rsm_viewer_indices(
@@ -382,7 +490,8 @@ def make_rsm_viewer_state(
     return RSMViewerState(
         fingerprint,
         *indices,
-        _RSM_VIEWER_FACTORY,
+        coordinate_frame=coordinate_frame,
+        _claim=_RSM_VIEWER_FACTORY,
     )
 
 
@@ -426,7 +535,7 @@ class RSMViewerProduct:
         if (
             _claim is not _RSM_VIEWER_FACTORY
             or type(self.panel_key) is not PanelKey
-            or not any(self.panel_key is key for key in RSM_VIEWER_PANEL_ORDER)
+            or not any(self.panel_key is key for key in _RSM_ALL_PANEL_KEYS)
             or type(self.x_axis) is not np.ndarray
             or self.x_axis.dtype != _F4
             or self.x_axis.ndim != 1
@@ -520,16 +629,29 @@ def _snapshot_fingerprint(
     finite_counts: tuple[int, ...],
     cache_bytes: int,
 ) -> str:
+    if state.coordinate_frame is RSMCoordinateFrame.HKL:
+        domain = "rsm-viewer-snapshot-v1"
+        state_projection = (
+            state.result_fingerprint,
+            state.h_index,
+            state.k_index,
+            state.l_index,
+            state.fingerprint,
+        )
+    else:
+        domain = "rsm-viewer-snapshot-v2"
+        state_projection = (
+            state.result_fingerprint,
+            state.coordinate_frame,
+            state.h_index,
+            state.k_index,
+            state.l_index,
+            state.fingerprint,
+        )
     return analysis_canonical_fingerprint(
-        "rsm-viewer-snapshot-v1",
+        domain,
         (
-            (
-                state.result_fingerprint,
-                state.h_index,
-                state.k_index,
-                state.l_index,
-                state.fingerprint,
-            ),
+            state_projection,
             tuple(_product_projection(product) for product in products),
             finite_counts,
             cache_bytes,
@@ -547,17 +669,22 @@ class RSMViewerSnapshot:
     _claim: InitVar[object] = None
 
     def __post_init__(self, _claim: object) -> None:
+        panel_order = (
+            _rsm_viewer_panel_order(self.state.coordinate_frame)
+            if type(self.state) is RSMViewerState
+            else ()
+        )
         if (
             _claim is not _RSM_VIEWER_FACTORY
             or type(self.state) is not RSMViewerState
             or type(self.products) is not tuple
-            or len(self.products) != len(RSM_VIEWER_PANEL_ORDER)
+            or len(self.products) != len(panel_order)
             or any(
                 type(product) is not RSMViewerProduct
                 or product.panel_key is not key
                 for product, key in zip(
                     self.products,
-                    RSM_VIEWER_PANEL_ORDER,
+                    panel_order,
                     strict=True,
                 )
             )
@@ -621,12 +748,12 @@ def _projection_work_bytes(
 
 
 def _snapshot_shape_bytes(shape: tuple[int, int, int]) -> int:
-    h_size, k_size, l_size = shape
+    axis0_size, axis1_size, axis2_size = shape
     return _F4.itemsize * (
-        h_size * k_size
-        + h_size * l_size
-        + k_size * l_size
-        + 2 * (h_size + k_size + l_size)
+        axis0_size * axis1_size
+        + axis0_size * axis2_size
+        + axis1_size * axis2_size
+        + 2 * (axis0_size + axis1_size + axis2_size)
     )
 
 
@@ -686,54 +813,55 @@ def _build_rsm_viewer_product(
             _RSM_VIEWER_FACTORY,
         )
 
-    h_axis, k_axis, l_axis = axes
-    if panel_key is RSM_HK:
+    axis0, axis1, axis2 = axes
+    panel_order = _rsm_viewer_panel_order(state.coordinate_frame)
+    if panel_key is panel_order[0]:
         return product(
             panel_key,
-            h_axis,
-            k_axis,
+            axis0,
+            axis1,
             _freeze_float32(intensity[:, :, state.l_index].T),
             (None, None, state.l_index),
         )
-    if panel_key is RSM_HL:
+    if panel_key is panel_order[1]:
         return product(
             panel_key,
-            h_axis,
-            l_axis,
+            axis0,
+            axis2,
             _freeze_float32(intensity[:, state.k_index, :].T),
             (None, state.k_index, None),
         )
-    if panel_key is RSM_KL:
+    if panel_key is panel_order[2]:
         return product(
             panel_key,
-            k_axis,
-            l_axis,
+            axis1,
+            axis2,
             _freeze_float32(intensity[state.h_index, :, :].T),
             (state.h_index, None, None),
         )
-    if panel_key is RSM_H:
+    if panel_key is panel_order[3]:
         values = _projection_values(intensity, retained_axis=0)
         return product(
             panel_key,
-            h_axis,
+            axis0,
             None,
             values,
             (None, None, None),
         )
-    if panel_key is RSM_K:
+    if panel_key is panel_order[4]:
         values = _projection_values(intensity, retained_axis=1)
         return product(
             panel_key,
-            k_axis,
+            axis1,
             None,
             values,
             (None, None, None),
         )
-    if panel_key is RSM_L:
+    if panel_key is panel_order[5]:
         values = _projection_values(intensity, retained_axis=2)
         return product(
             panel_key,
-            l_axis,
+            axis2,
             None,
             values,
             (None, None, None),
@@ -743,13 +871,14 @@ def _build_rsm_viewer_product(
 
 def _component_keys(state: RSMViewerState) -> tuple[_ComponentKey, ...]:
     result = state.result_fingerprint
+    axis0, axis1, axis2 = state.coordinate_frame.axis_names
     return (
-        (result, "slice", "l", state.l_index),
-        (result, "slice", "k", state.k_index),
-        (result, "slice", "h", state.h_index),
-        (result, "projection", "h"),
-        (result, "projection", "k"),
-        (result, "projection", "l"),
+        (result, "slice", axis2, state.l_index),
+        (result, "slice", axis1, state.k_index),
+        (result, "slice", axis0, state.h_index),
+        (result, "projection", axis0),
+        (result, "projection", axis1),
+        (result, "projection", axis2),
     )
 
 
@@ -835,10 +964,15 @@ class RSMViewerModel:
     def _axis_values(
         self,
         result_fingerprint: str,
+        coordinate_frame: RSMCoordinateFrame,
         source_axes: tuple[np.ndarray, np.ndarray, np.ndarray],
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         values: list[np.ndarray] = []
-        for name, source in zip(("h", "k", "l"), source_axes, strict=True):
+        for name, source in zip(
+            coordinate_frame.axis_names,
+            source_axes,
+            strict=True,
+        ):
             key: _ComponentKey = (
                 result_fingerprint,
                 "projection",
@@ -963,6 +1097,8 @@ class RSMViewerModel:
                     cached_state = snapshot.state
                     if (
                         cached_state.result_fingerprint == result
+                        and cached_state.coordinate_frame
+                        is values.coordinate_frame
                         and cached_state.h_index == indices[0]
                         and cached_state.k_index == indices[1]
                         and cached_state.l_index == indices[2]
@@ -990,7 +1126,8 @@ class RSMViewerModel:
             state = RSMViewerState(
                 result,
                 *indices,
-                _RSM_VIEWER_FACTORY,
+                coordinate_frame=values.coordinate_frame,
+                _claim=_RSM_VIEWER_FACTORY,
             )
             required_bytes = _snapshot_shape_bytes(values.shape)
             if required_bytes > _MAX_RSM_VIEWER_CACHE_BYTES:
@@ -1009,11 +1146,16 @@ class RSMViewerModel:
                     sum(_projection_work_bytes(source_intensity, output_size))
                 )
             component_keys = _component_keys(state)
-            axis_values = self._axis_values(result, source_axes)
+            axis_values = self._axis_values(
+                result,
+                values.coordinate_frame,
+                source_axes,
+            )
             staged_products: list[RSMViewerProduct] = []
+            panel_order = _rsm_viewer_panel_order(values.coordinate_frame)
             for component_key, panel_key in zip(
                 component_keys,
-                RSM_VIEWER_PANEL_ORDER,
+                panel_order,
                 strict=True,
             ):
                 cached_product = self._components.get(component_key)
@@ -1063,6 +1205,14 @@ __all__ = [
     "RSM_K",
     "RSM_KL",
     "RSM_L",
+    "RSM_QX",
+    "RSM_QX_QY",
+    "RSM_QX_QZ",
+    "RSM_QY",
+    "RSM_QY_QZ",
+    "RSM_QZ",
+    "RSM_Q_VIEWER_LAYOUT",
+    "RSM_Q_VIEWER_PANEL_ORDER",
     "RSM_VIEWER_LAYOUT",
     "RSM_VIEWER_PANEL_ORDER",
     "RSMViewerModel",
@@ -1073,4 +1223,5 @@ __all__ = [
     "RSMViewerValues",
     "make_rsm_viewer_state",
     "make_rsm_viewer_values",
+    "rsm_viewer_layout",
 ]

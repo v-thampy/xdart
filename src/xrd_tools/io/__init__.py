@@ -137,6 +137,7 @@ _EXPORTS = {
         "xrd_tools.io.read", "get_average_finite_counts",
     ),
     "get_detector_mask": ("xrd_tools.io.image", "get_detector_mask"),
+    "get_energy": ("xrd_tools.io.spec", "get_energy"),
     "get_energy_and_UB": ("xrd_tools.io.spec", "get_energy_and_UB"),
     "get_from_spec_file": ("xrd_tools.io.spec", "get_from_spec_file"),
     "get_frames": ("xrd_tools.io.read", "get_frames"),

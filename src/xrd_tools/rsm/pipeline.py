@@ -28,6 +28,7 @@ from xrd_tools.rsm.gridding import (
     grid_img_data,
     grid_img_data_streaming,
 )
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,7 @@ def process_scan_data(
                 chunk_size=chunk_size,
                 roi=roi,
                 static_mask=static_mask,
+                coordinate_frame=RSMCoordinateFrame.HKL,
             )
         return grid_img_data(
             mapper,
@@ -179,6 +181,7 @@ def process_scan_data(
             UB=UB,
             bins=bins,
             roi=roi,
+            coordinate_frame=RSMCoordinateFrame.HKL,
         )
     except Exception:
         logger.exception("Error processing scan %s", scan_name)
@@ -561,6 +564,7 @@ def process_scan_from_nexus(
     scout_pad: float = 0.0,
     corrections: Any = None,
     gi: Any = None,
+    coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
 ) -> RSMVolume:
     """Stream-process a frame-source scan into an :class:`RSMVolume`.
 
@@ -603,6 +607,10 @@ def process_scan_from_nexus(
     scout_pad : float
         Padding fraction applied to scouted bounds.  Ignored when
         ``q_bounds`` is supplied.
+    coordinate_frame : RSMCoordinateFrame
+        Semantic coordinate system for the three grid axes.  H/K/L is the
+        established default and requires a physical ``UB``; Cartesian Q must
+        be selected explicitly.
 
     Returns
     -------
@@ -626,7 +634,11 @@ def process_scan_from_nexus(
         roi=roi,
     )
 
-    sg = StreamingGridder(mapper, bins)
+    sg = StreamingGridder(
+        mapper,
+        bins,
+        coordinate_frame=coordinate_frame,
+    )
     if q_bounds is None:
         # Scout uses the full angle arrays + the configured detector
         # size.  No raw image is loaded.
@@ -681,6 +693,7 @@ def grid_scans_streaming(
     scout_pad: float = 0.0,
     corrections: Any = None,
     gi: Any = None,
+    coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
 ) -> RSMVolume:
     """Stream multiple v2 frame-source scans into one :class:`RSMVolume`.
 
@@ -694,6 +707,10 @@ def grid_scans_streaming(
     followed by :func:`combine_grids`: there's no intermediate per-scan
     volume, no ``RegularGridInterpolator`` rebin at the end, and no
     correlated-NaN bookkeeping.
+
+    ``coordinate_frame`` applies to every member.  H/K/L is the established
+    default and requires each :class:`ScanInput` to carry its physical UB;
+    Cartesian Q must be selected explicitly.
     """
     scan_inputs = list(scan_inputs)
     if not scan_inputs:
@@ -711,7 +728,11 @@ def grid_scans_streaming(
         }
         resolved.append((si, e, angles_full, angle_rows))
 
-    sg = StreamingGridder(mapper, bins)
+    sg = StreamingGridder(
+        mapper,
+        bins,
+        coordinate_frame=coordinate_frame,
+    )
     if q_bounds is None:
         sg.scout(
             [

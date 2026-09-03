@@ -36,6 +36,9 @@ from xrd_tools.rsm.pipeline import (
 )
 
 
+_IDENTITY_UB = np.eye(3)
+
+
 # ---------------------------------------------------------------------------
 # Reusable mocks (subset of the streaming-gridder mocks)
 # ---------------------------------------------------------------------------
@@ -430,12 +433,15 @@ class TestProcessScanFromSphere:
             scan, mapper,
             diff_motors=("tth", "th", "chi", "phi"),
             bins=(4, 4, 4),
+            UB=_IDENTITY_UB,
             chunk_size=2,
             q_bounds=((-1, 1), (-1, 1), (-1, 1)),  # skip scout
         )
         from xrd_tools.rsm.volume import RSMVolume
+        from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
         assert isinstance(vol, RSMVolume)
         assert vol.shape == (4, 4, 4)
+        assert vol.coordinate_frame is RSMCoordinateFrame.HKL
 
     def test_explicit_energy_overrides_sphere(self, patched_xu) -> None:
         """Pass energy= explicitly; the scan's wavelength is ignored."""
@@ -445,6 +451,7 @@ class TestProcessScanFromSphere:
             scan, _default_mapper(Nch1=16, Nch2=16),
             diff_motors=("tth", "th", "chi", "phi"),
             bins=(2, 2, 2),
+            UB=_IDENTITY_UB,
             chunk_size=2,
             energy=12000.0,
             q_bounds=((-1, 1), (-1, 1), (-1, 1)),
@@ -458,6 +465,7 @@ class TestProcessScanFromSphere:
             scan, _default_mapper(Nch1=8, Nch2=8),
             diff_motors=("tth", "th", "chi", "phi"),
             bins=(2, 2, 2),
+            UB=_IDENTITY_UB,
             chunk_size=2,
             q_bounds=((-1, 1), (-1, 1), (-1, 1)),
         )
@@ -469,6 +477,7 @@ class TestProcessScanFromSphere:
             scan, _default_mapper(Nch1=16, Nch2=16),
             diff_motors=("tth", "th", "chi", "phi"),
             bins=(4, 4, 4),
+            UB=_IDENTITY_UB,
             chunk_size=3,
             q_bounds=((-1, 1), (-1, 1), (-1, 1)),
         )
@@ -501,6 +510,7 @@ class TestProcessScanFromSphere:
             scan, _default_mapper(Nch1=16, Nch2=16),
             diff_motors=("tth", "th", "chi", "phi"),
             bins=(2, 2, 2),
+            UB=_IDENTITY_UB,
             chunk_size=4,  # one big chunk
         )
         # After processing: all 4 frames got loaded exactly once
@@ -541,6 +551,7 @@ class TestProcessScanFromSphere:
                 scan, _default_mapper(Nch1=8, Nch2=8),
                 diff_motors=("tth", "th"),
                 bins=(2, 2, 2),
+                UB=_IDENTITY_UB,
                 chunk_size=3,
                 q_bounds=((-1, 1), (-1, 1), (-1, 1)),
             )
@@ -567,7 +578,7 @@ class TestGridSpheresStreaming:
                                     motors=("tth", "th", "chi", "phi"),
                                     seed=i),
                 energy=11000.0 + 100 * i,
-                UB=None,
+                UB=_IDENTITY_UB,
             )
             for i in range(3)
         ]
@@ -593,7 +604,10 @@ class TestGridSpheresStreaming:
         s2.mg_args["wavelength"] = 2.0e-10  #  6199 eV
         grid_scans_streaming(
             _default_mapper(Nch1=8, Nch2=8),
-            [ScanInput(scan=s1), ScanInput(scan=s2)],
+            [
+                ScanInput(scan=s1, UB=_IDENTITY_UB),
+                ScanInput(scan=s2, UB=_IDENTITY_UB),
+            ],
             diff_motors=("tth", "th", "chi", "phi"),
             bins=(2, 2, 2),
             chunk_size=2,
@@ -613,7 +627,10 @@ class TestGridSpheresStreaming:
     def test_scout_runs_without_q_bounds(self, patched_xu) -> None:
         """No q_bounds → scout must succeed and produce non-degenerate bounds."""
         sphere_inputs = [
-            ScanInput(scan=_make_scan(n_frames=3, Nch1=8, Nch2=8)),
+            ScanInput(
+                scan=_make_scan(n_frames=3, Nch1=8, Nch2=8),
+                UB=_IDENTITY_UB,
+            ),
         ]
         grid_scans_streaming(
             _default_mapper(Nch1=8, Nch2=8), sphere_inputs,

@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
 
 EXPECTED_EXPORTS = {
+    "RSMCoordinateFrame",
     "DetectorHeader",
     "DiffractometerConfig",
     "PixelQMap",
@@ -40,6 +41,10 @@ EXPECTED_EXPORTS = {
 }
 
 EXPORT_OWNERS = {
+    "RSMCoordinateFrame": (
+        "xrd_tools.rsm.coordinate_frame",
+        "RSMCoordinateFrame",
+    ),
     "DetectorHeader": ("xrd_tools.core.geometry", "DetectorHeader"),
     "DiffractometerConfig": (
         "xrd_tools.core.geometry",
@@ -167,7 +172,7 @@ def test_rsm_lazy_api_preserves_public_identity_and_duplicate_resolution(
     import xrd_tools.rsm as rsm
 
     assert set(rsm.__all__) == EXPECTED_EXPORTS
-    assert len(rsm.__all__) == len(set(rsm.__all__)) == 23
+    assert len(rsm.__all__) == len(set(rsm.__all__)) == 24
     assert not hasattr(rsm, "Any")
     assert not hasattr(rsm, "import_module")
     for name, (module_name, attribute_name) in EXPORT_OWNERS.items():

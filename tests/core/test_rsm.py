@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 from xrd_tools.rsm import (
     DetectorHeader,
     DiffractometerConfig,
@@ -126,6 +127,50 @@ class TestRSMVolume:
         bad = np.zeros((5, 6, 8), dtype=float)
         with pytest.raises(ValueError):
             RSMVolume(h=h, k=k, l=l, intensity=bad)
+
+    def test_cartesian_q_volume_is_semantic_and_never_aliases_hkl(self) -> None:
+        frame = RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+        qx = np.linspace(-1.0, 1.0, 5)
+        qy = np.linspace(-2.0, 2.0, 6)
+        qz = np.linspace(0.0, 3.0, 7)
+        intensity = np.arange(210, dtype=float).reshape(5, 6, 7)
+        volume = RSMVolume.from_axes(
+            frame,
+            (("qx", qx), ("qy", qy), ("qz", qz)),
+            intensity,
+        )
+
+        assert volume.coordinate_frame is frame
+        assert tuple(name for name, _values in volume.axes) == frame.axis_names
+        assert volume.axis_units == tuple(
+            zip(frame.axis_names, frame.axis_units, strict=True)
+        )
+        np.testing.assert_array_equal(volume.qx, qx)
+        np.testing.assert_array_equal(volume.qy, qy)
+        np.testing.assert_array_equal(volume.qz, qz)
+        with pytest.raises(AttributeError):
+            _ = volume.h
+        with pytest.raises(AttributeError):
+            _ = volume.k
+        with pytest.raises(AttributeError):
+            _ = volume.l
+        with pytest.raises(ValueError, match="HKL-only"):
+            volume.crop()
+
+        line_axis, line = volume.line_cut("qx")
+        np.testing.assert_array_equal(line_axis, qx)
+        assert line.shape == (5,)
+        axis1, axis2, projection, integrated = volume.get_slice("qy")
+        np.testing.assert_array_equal(axis1, qx)
+        np.testing.assert_array_equal(axis2, qz)
+        assert projection.shape == (5, 7)
+        np.testing.assert_array_equal(integrated, qy)
+        cropped = volume.crop_by_axes(
+            {"qx": (-0.5, 0.5), "qz": (0.5, 2.5)}
+        )
+        assert cropped.coordinate_frame is frame
+        assert cropped.shape[0] < volume.shape[0]
+        assert cropped.shape[2] < volume.shape[2]
 
 
 class TestMaskData:

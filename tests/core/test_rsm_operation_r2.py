@@ -10,6 +10,7 @@ import stat
 import threading
 import weakref
 
+import h5py
 import numpy as np
 import pytest
 import tifffile
@@ -49,6 +50,7 @@ from xrd_tools.core.allocator_pressure import (
 from xrd_tools.core.geometry import Diffractometer, PixelQMap
 from xrd_tools.core.geometry.xu_runtime import XuRuntimeUnsupported
 from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 from xrd_tools.sources.spec import SpecSource
 
 
@@ -179,10 +181,18 @@ def test_two_member_preview_is_ordered_image_free_and_factory_owned(
     assert tuple(item.selected_frame_count for item in preflight.summary.members) == (2, 2)
     assert tuple(item.dependency_file_count for item in preflight.summary.members) == (3, 3)
     assert preflight.summary.union_q_bounds == preflight.request.preflight.common_grid.bounds
-    assert preflight.request.provenance["schema_version"] == "rsm-operation-v2-intent"
+    assert preflight.request.provenance["schema_version"] == "rsm-operation-v3-intent"
+    assert preflight.summary.coordinate_frame is RSMCoordinateFrame.HKL
+    assert preflight.request.provenance["coordinate_frame"] == {
+        "name": "hkl",
+        "axis_names": ["h", "k", "l"],
+        "axis_units": [None, None, None],
+        "matrix_policy": "authenticated-source-ub-f8-v1",
+    }
     assert set(preflight.request.provenance) == {
         "schema_version",
         "kind",
+        "coordinate_frame",
         "source_group",
         "asset",
         "effective_geometry",
@@ -235,6 +245,74 @@ def test_visible_member_order_changes_group_preflight_and_request(tmp_path):
     assert forward.request.module.fingerprint != reverse.request.module.fingerprint
     assert forward.request.preflight.common_grid.bounds == reverse.request.preflight.common_grid.bounds
     assert not Path(forward.form.output_path).exists()
+
+
+def test_member_order_changes_identity_but_not_cartesian_q_science(
+    tmp_path,
+    monkeypatch,
+):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+
+    def full_detector_frame(self, index):
+        ordinal = int(
+            str(self.name).split(" [", 1)[0].rsplit("_", 1)[-1]
+        )
+        return np.full(
+            (195, 487),
+            10 + ordinal + int(index),
+            dtype=np.float64,
+        )
+
+    monkeypatch.setattr(SpecSource, "load_frame", full_detector_frame)
+    members = (_write_member(tmp_path, 0), _write_member(tmp_path, 1))
+    common = replace(
+        _form(tmp_path, members),
+        coordinate_frame=RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU,
+    )
+    forward = prepare_rsm_tool_v2(
+        replace(
+            common,
+            output_path=tmp_path / "output" / "forward-q.nexus",
+        )
+    ).request
+    reverse = prepare_rsm_tool_v2(
+        replace(
+            common,
+            members=tuple(reversed(members)),
+            output_path=tmp_path / "output" / "reverse-q.nexus",
+        )
+    ).request
+    assert forward.module.fingerprint != reverse.module.fingerprint
+
+    forward_result = run_rsm_operation_v2(forward)
+    reverse_result = run_rsm_operation_v2(reverse)
+    assert forward_result.payload is not None
+    assert reverse_result.payload is not None
+    for (forward_name, forward_axis), (reverse_name, reverse_axis) in zip(
+        forward_result.payload.axes,
+        reverse_result.payload.axes,
+        strict=True,
+    ):
+        assert forward_name == reverse_name
+        np.testing.assert_array_equal(forward_axis, reverse_axis)
+    np.testing.assert_array_equal(
+        np.isfinite(forward_result.payload.intensity),
+        np.isfinite(reverse_result.payload.intensity),
+    )
+    np.testing.assert_array_equal(
+        forward_result.payload.intensity,
+        reverse_result.payload.intensity,
+    )
 
 
 def test_group_preflight_factory_rejects_foreign_ordered_source_relation(tmp_path):
@@ -345,7 +423,7 @@ def test_per_member_energy_and_ub_are_ordered_source_facts(tmp_path, monkeypatch
     import xrd_tools.analysis.rsm_operation as rsm_operation
 
     first_ub = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-    second_ub = (2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 4.0)
+    second_ub = (2.0, 0.2, -0.1, 0.05, 3.0, 0.3, -0.2, 0.1, 4.0)
     members = (
         _write_member(tmp_path, 0, energy_eV=12001.0, ub=first_ub),
         _write_member(tmp_path, 1, energy_eV=14002.0, ub=second_ub),
@@ -382,6 +460,79 @@ def test_per_member_energy_and_ub_are_ordered_source_facts(tmp_path, monkeypatch
         (first_ub[0:3], first_ub[3:6], first_ub[6:9]),
         (second_ub[0:3], second_ub[3:6], second_ub[6:9]),
     )
+
+
+def test_cartesian_q_preview_uses_energy_only_and_explicit_identity(
+    tmp_path,
+    monkeypatch,
+):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    member = _write_member(tmp_path, 0)
+    spec = Path(member.spec_path)
+    spec.write_text(
+        spec.read_text(encoding="utf-8").replace(
+            "#G3 1.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 1.0",
+            "#G3 malformed and deliberately ignored",
+        ),
+        encoding="utf-8",
+    )
+    observed = []
+
+    def q_bounds_spy(_mapper, _angles, energy_eV, matrix, **_kwargs):
+        observed.append((energy_eV, matrix.copy()))
+        return ((-1.0, 1.0), (-2.0, 2.0), (-3.0, 3.0))
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "get_energy_and_UB",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Cartesian Q must not read #G3")
+        ),
+    )
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        q_bounds_spy,
+    )
+    form = replace(
+        _form(tmp_path, (member,)),
+        coordinate_frame=RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU,
+    )
+    prepared = prepare_rsm_tool_v2(form)
+
+    assert len(observed) == 1
+    assert observed[0][0] == 13000.007
+    assert observed[0][1].dtype == np.dtype(np.float64)
+    assert observed[0][1].flags.c_contiguous
+    np.testing.assert_array_equal(observed[0][1], np.eye(3, dtype=np.float64))
+    assert prepared.summary.coordinate_frame is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    assert prepared.request.plan.coordinate_frame is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    assert prepared.request.preflight.members[0].ub == (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+
+
+def test_hkl_preview_refuses_singular_ub_before_q_mapping(tmp_path, monkeypatch):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    member = _write_member(
+        tmp_path,
+        0,
+        ub=(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+    )
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("singular UB must refuse before xrayutilities")
+        ),
+    )
+    with pytest.raises(RSMToolPreflightRefused) as refused:
+        prepare_rsm_tool_v2(_form(tmp_path, (member,)))
+    assert refused.value.code == "RSM_MEMBER_UB_INVALID"
 
 
 @pytest.mark.parametrize(
@@ -568,6 +719,15 @@ def test_core_v2_rejects_duplicate_forms_and_limits_before_runtime(
     with pytest.raises(RSMOperationRefused) as refused:
         prepare_rsm_operation_v2(**duplicate)
     assert refused.value.code == "RSM_SOURCE_GROUP_INVALID"
+
+    replace_output = dict(common)
+    replace_output["output"] = replace(
+        request.module.output,
+        overwrite=AnalysisArtifactOverwrite.REPLACE,
+    )
+    with pytest.raises(RSMOperationRefused) as refused:
+        prepare_rsm_operation_v2(**replace_output)
+    assert refused.value.code == "RSM_OUTPUT_POLICY_UNSUPPORTED"
 
     invalid_cases = (
         ("bins", (1_000_001, 2, 2), "RSM_COMMON_GRID_INVALID"),
@@ -758,6 +918,11 @@ def test_two_member_science_uses_one_grid_and_persists_exact_attestation(
         (14002.0, second_ub, 1),
     ]
     attestation = json.loads(result.payload.execution_attestation_json)
+    assert attestation["schema_version"] == "rsm-execution-attestation-v2"
+    assert attestation["coordinate_frame"] == "hkl"
+    assert attestation["axis_names"] == ["h", "k", "l"]
+    assert attestation["axis_units"] == [None, None, None]
+    assert attestation["matrix_policy"] == RSMCoordinateFrame.HKL.matrix_policy
     assert attestation["selected_scan_count"] == 2
     assert attestation["selected_frame_count"] == 4
     assert attestation["science_chunk_count"] == 4
@@ -778,6 +943,232 @@ def test_two_member_science_uses_one_grid_and_persists_exact_attestation(
         copy.copy(execution)
     with pytest.raises(TypeError):
         copy.deepcopy(execution)
+
+
+def test_cartesian_q_science_persists_exact_schema_v3_frame_contract(
+    tmp_path,
+    monkeypatch,
+):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: (
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+            (-8.0, 8.0),
+        ),
+    )
+    source_ub = (2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 4.0)
+    member = _write_member(
+        tmp_path,
+        0,
+        energy_eV=12001.0,
+        ub=source_ub,
+    )
+    form = replace(
+        _form(tmp_path, (member,)),
+        coordinate_frame=RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU,
+    )
+    prepared = prepare_rsm_tool_v2(form).request
+    identity = tuple(float(value) for value in np.eye(3).flat)
+    assert prepared.plan.coordinate_frame is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    for item in prepared.preflight.members:
+        np.testing.assert_array_equal(np.asarray(item.ub), np.eye(3))
+
+    def full_detector_frame(self, index):
+        return np.full(
+            (195, 487),
+            10 + int(index),
+            dtype=np.float64,
+        )
+
+    monkeypatch.setattr(SpecSource, "load_frame", full_detector_frame)
+    real_pixel_q = PixelQMap.pixel_q
+    mapped = []
+    mapped_calls = []
+    mapped_values = []
+
+    def record_pixel_q(
+        self,
+        angles,
+        energy,
+        *,
+        UB=None,
+        roi=None,
+        image_shape=None,
+        runtime_session=None,
+    ):
+        mapped.append(tuple(float(value) for value in UB.flat))
+        result = real_pixel_q(
+            self,
+            angles,
+            energy,
+            UB=UB,
+            roi=roi,
+            image_shape=image_shape,
+            runtime_session=runtime_session,
+        )
+        mapped_calls.append(
+            (
+                tuple(np.array(value, dtype=np.float64, copy=True) for value in angles),
+                float(energy),
+                tuple(roi) if roi is not None else None,
+            )
+        )
+        mapped_values.append(
+            tuple(np.array(value, dtype=np.float64, copy=True) for value in result)
+        )
+        return result
+
+    monkeypatch.setattr(PixelQMap, "pixel_q", record_pixel_q)
+    result = run_rsm_operation_v2(prepared)
+
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED
+    assert result.payload is not None
+    assert result.payload.schema_version == 3
+    assert mapped == [identity, identity]
+    assert tuple(name for name, _values in result.payload.axes) == (
+        "qx",
+        "qy",
+        "qz",
+    )
+    assert result.payload.inspection.axis_units == (
+        ("qx", "q_A^-1"),
+        ("qy", "q_A^-1"),
+        ("qz", "q_A^-1"),
+    )
+    attestation = json.loads(result.payload.execution_attestation_json)
+    assert attestation["schema_version"] == "rsm-execution-attestation-v2"
+    assert attestation["coordinate_frame"] == "q_sample_cartesian_xu"
+    assert attestation["axis_names"] == ["qx", "qy", "qz"]
+    assert attestation["axis_units"] == ["q_A^-1"] * 3
+    assert attestation["matrix_policy"] == (
+        RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.matrix_policy
+    )
+    with h5py.File(form.output_path, "r") as handle:
+        entry = handle["entry"]
+        volume = entry["rsm"]
+        assert int(entry.attrs["ssrl_schema_version"]) == 3
+        assert volume.attrs["coordinate_frame"] == b"q_sample_cartesian_xu"
+        assert tuple(volume.attrs["axes"]) == (b"qx", b"qy", b"qz")
+        assert set(volume) == {
+            "intensity",
+            "provenance_json",
+            "qx",
+            "qy",
+            "qz",
+        }
+        for name in ("qx", "qy", "qz"):
+            assert volume[name].attrs["units"] == b"q_A^-1"
+
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_effective_pixel_q_map
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+    from xrd_tools.integrate.xu_stitch import XuPowderQFrameLease
+    from xrd_tools.io.nexus import read_rsm
+
+    public_volume = read_rsm(form.output_path)
+    assert public_volume.coordinate_frame is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    assert tuple(name for name, _values in public_volume.axes) == (
+        "qx",
+        "qy",
+        "qz",
+    )
+    with pytest.raises(AttributeError):
+        _ = public_volume.h
+
+    # Independent numeric oracle: call the pinned xrayutilities conversion and
+    # Gridder3D directly, without PixelQMap or StreamingGridder, then compare
+    # the exact persisted float32 axes and voxels.
+    direct_mapper = rsm_effective_pixel_q_map(prepared.plan.effective_geometry)
+    roi = prepared.plan.effective_geometry.roi
+    header = direct_mapper.header.with_roi(roi)
+    flat_bounds = tuple(
+        value
+        for bounds in prepared.plan.common_grid.bounds
+        for value in bounds
+    )
+    with xu_runtime_session() as runtime:
+        hxrd = direct_mapper.diff_config.make_hxrd(12001.0)
+        hxrd.Ang2Q.init_area(
+            direct_mapper.diff_config.init_area_detrot,
+            direct_mapper.diff_config.init_area_tiltazimuth,
+            cch1=float(header.cch1),
+            cch2=float(header.cch2),
+            pwidth1=float(header.pwidth1),
+            pwidth2=float(header.pwidth2),
+            distance=float(header.distance),
+            Nch1=int(header.Nch1),
+            Nch2=int(header.Nch2),
+        )
+        raw_grid = runtime.xu.Gridder3D(*prepared.plan.bins)
+        norm_grid = runtime.xu.Gridder3D(*prepared.plan.bins)
+        for grid in (raw_grid, norm_grid):
+            grid.KeepData(True)
+            grid.Normalize(False)
+            grid.dataRange(*flat_bounds, fixed=True)
+        for ordinal, (call, observed) in enumerate(
+            zip(mapped_calls, mapped_values, strict=True)
+        ):
+            angles, energy, observed_roi = call
+            assert energy == 12001.0
+            assert observed_roi == roi
+            direct = hxrd.Ang2Q.area(
+                *angles,
+                UB=np.eye(3, dtype=np.float64),
+                **direct_mapper.diff_config.ang2q_kwargs,
+            )
+            direct = tuple(
+                np.asarray(value).reshape(observed[index].shape)
+                for index, value in enumerate(direct)
+            )
+            for expected, actual in zip(direct, observed, strict=True):
+                np.testing.assert_array_equal(actual, expected)
+            image = np.full(observed[0].shape, 10 + ordinal, dtype=np.float64)
+            raw_grid(*direct, image)
+            norm_grid(*direct, np.ones_like(image))
+            if ordinal == 0:
+                expected_q_magnitude = np.hypot(
+                    np.hypot(direct[0], direct[1]),
+                    direct[2],
+                )
+                stitch_lease = XuPowderQFrameLease(
+                    direct,
+                    observed[0].shape[1:],
+                )
+                stitch_q_magnitude = stitch_lease.q_magnitude()
+                np.testing.assert_array_equal(
+                    stitch_q_magnitude,
+                    expected_q_magnitude.reshape(stitch_q_magnitude.shape),
+                )
+                stitch_q_magnitude = expected_q_magnitude = None
+                expected = actual = None
+                direct = ()
+                stitch_lease.release()
+        direct_axes = tuple(
+            np.asarray(axis, dtype="<f4")
+            for axis in (raw_grid.xaxis, raw_grid.yaxis, raw_grid.zaxis)
+        )
+        numerator = np.array(raw_grid.data, dtype=np.float64, copy=True)
+        denominator = np.asarray(norm_grid.data, dtype=np.float64)
+        direct_intensity = np.full(numerator.shape, np.nan, dtype=np.float64)
+        np.divide(
+            numerator,
+            denominator,
+            out=direct_intensity,
+            where=denominator > 0,
+        )
+    for (_name, actual), expected in zip(
+        result.payload.axes,
+        direct_axes,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(
+        result.payload.intensity,
+        direct_intensity.astype("<f4"),
+    )
 
 
 def test_member_static_masks_are_independent_and_attested(tmp_path, monkeypatch):
@@ -1899,66 +2290,8 @@ def test_mutated_mask_receipt_reload_failure_retains_exact_execution(
     assert counts == {"science": 2, "writer": 1, "read": 2}
 
 
-def test_v2_cleanup_retry_never_replays_science_or_writer(
-    tmp_path,
-    monkeypatch,
-):
-    import xrd_tools.analysis.rsm_operation as rsm_operation
-    import xrd_tools.io.output_transaction as transaction_api
-
-    monkeypatch.setattr(
-        rsm_operation,
-        "_resolve_exact_rsm_q_bounds_active",
-        lambda *_args, **_kwargs: (
-            (-8.0, 8.0),
-            (-8.0, 8.0),
-            (-8.0, 8.0),
-        ),
-    )
+def test_v2_refuses_the_retired_replace_output_policy(tmp_path):
     member = _write_member(tmp_path, 0)
     initial = _form(tmp_path, (member,))
-    target = Path(initial.output_path)
-    target.write_bytes(b"prior operator output")
-    prepared = prepare_rsm_tool_v2(
+    with pytest.raises(ValueError, match="must create a new artifact"):
         replace(initial, overwrite=AnalysisArtifactOverwrite.REPLACE)
-    ).request
-    monkeypatch.setattr(
-        SpecSource,
-        "load_frame",
-        lambda _self, index: np.full(
-            (195, 487),
-            10 + int(index),
-            dtype=np.float64,
-        ),
-    )
-    real_unlink = transaction_api._unlink
-    real_add = rsm_operation.StreamingGridder.add_leased
-    real_write = rsm_operation.write_rsm
-    failures = []
-    counts = {"science": 0, "writer": 0}
-
-    def fail_backup_once(path):
-        if ".xdart-replacing-" in Path(path).name and not failures:
-            failures.append("backup")
-            raise OSError("backup cleanup fault")
-        return real_unlink(path)
-
-    def counted_add(*args, **kwargs):
-        counts["science"] += 1
-        return real_add(*args, **kwargs)
-
-    def counted_write(*args, **kwargs):
-        counts["writer"] += 1
-        return real_write(*args, **kwargs)
-
-    monkeypatch.setattr(transaction_api, "_unlink", fail_backup_once)
-    monkeypatch.setattr(rsm_operation.StreamingGridder, "add_leased", counted_add)
-    monkeypatch.setattr(rsm_operation, "write_rsm", counted_write)
-    with pytest.raises(RSMOperationCleanupPendingV2) as pending:
-        run_rsm_operation_v2(prepared)
-    recovered = pending.value.retry_cleanup()
-    assert recovered.terminal.disposition is ModuleDisposition.COMMITTED
-    assert recovered.payload is not None
-    assert pending.value.execution.retry_cleanup() is recovered
-    assert failures == ["backup"]
-    assert counts == {"science": 2, "writer": 1}

@@ -2734,6 +2734,24 @@ def _projected_diagnostic_dataset(
     return group.create_dataset(name, data=data, **ck)
 
 
+def _frame_aware_rsm_axis_dataset(
+    group: h5py.Group,
+    name: str,
+    data: np.ndarray,
+) -> h5py.Dataset:
+    """Write one schema-v3-only Cartesian-Q axis without changing SCHEMA v2."""
+
+    if (
+        name not in {"qx", "qy", "qz"}
+        or type(data) is not np.ndarray
+        or data.dtype != np.dtype("<f4")
+        or not data.flags.c_contiguous
+        or data.flags.writeable
+    ):
+        raise TypeError("stored frame-aware RSM axis is not exact frozen <f4")
+    return group.create_dataset(name, data=data)
+
+
 def _norm_attr(value):
     """Normalize an attr value (schema-declared or h5py-read) for comparison.
 
@@ -3788,12 +3806,12 @@ def write_rsm(
     source_base=None,
     compression: str | None = None,
     bounded_artifact: bool = False,
+    coordinate_frame: object | None = None,
 ) -> None:
     """Write ``/entry/rsm`` — a gridded :class:`~xrd_tools.rsm.RSMVolume` as an
-    NXdata group (``h``/``k``/``l`` axes + the 3D ``intensity``), plus an optional
-    ``provenance_json`` blob (the RSMPlan + applied CorrectionStack), the same
-    idiom as :func:`write_stitched` / the diffractometer ``config_json``.  The
-    group is replaced atomically (idempotent).
+    NXdata group with frame-declared axes plus the 3D ``intensity``.  H/K/L is
+    retained by the legacy form; Cartesian Q requires the bounded frame-aware
+    form.  An optional ``provenance_json`` records the plan and corrections.
     """
     if type(bounded_artifact) is not bool:
         raise TypeError("bounded_artifact must be an exact bool")
@@ -3821,11 +3839,31 @@ def write_rsm(
                 "stored RSM projection is exclusive to a bounded artifact"
             )
         prov = _bounded_artifact_provenance(provenance)
+        from xrd_tools.rsm.coordinate_frame import (
+            RSMCoordinateFrame,
+            rsm_coordinate_frame_from_axes,
+        )
+
+        derived_frame = rsm_coordinate_frame_from_axes(
+            tuple(name for name, _values in result_projection.axes),
+            tuple(units for _name, units in result_projection.axis_units),
+        )
+        if coordinate_frame is None:
+            if derived_frame is not RSMCoordinateFrame.HKL:
+                raise ValueError("Cartesian-Q RSM requires a frame-aware artifact")
+        elif (
+            type(coordinate_frame) is not RSMCoordinateFrame
+            or coordinate_frame is not RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+            or coordinate_frame is not derived_frame
+        ):
+            raise ValueError("RSM projection and coordinate frame disagree")
         if "rsm" in entry_grp:
             del entry_grp["rsm"]
         group = _create_group_from_schema(entry_grp, "rsm")
         axis_names = tuple(name for name, _values in result_projection.axes)
         _bound_analysis_nxdata(group, axis_names)
+        if coordinate_frame is not None:
+            _bounded_text_attr(group, "coordinate_frame", coordinate_frame.value)
         _schema_projected_dataset(
             group,
             "rsm",
@@ -3833,14 +3871,24 @@ def write_rsm(
             result_projection.intensity,
             ck=ck,
         )
-        for name, values in result_projection.axes:
-            _schema_projected_dataset(
-                group,
-                "rsm",
-                name,
-                values,
-                ck=ck,
+        for (name, values), (_unit_name, units) in zip(
+            result_projection.axes,
+            result_projection.axis_units,
+            strict=True,
+        ):
+            dataset = (
+                _frame_aware_rsm_axis_dataset(group, name, values)
+                if derived_frame is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+                else _schema_projected_dataset(
+                    group,
+                    "rsm",
+                    name,
+                    values,
+                    ck=ck,
+                )
             )
+            if units is not None:
+                _bounded_text_attr(dataset, "units", units)
         group.create_dataset(
             "provenance_json",
             data=np.bytes_(prov.encode("utf-8")),
@@ -3851,15 +3899,21 @@ def write_rsm(
             AnalysisArtifactKind,
             project_analysis_artifact_result,
         )
+        from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
+        from xrd_tools.rsm.volume import RSMVolume
 
-        if volume is None or frame_records is not None or source_base is not None:
+        if (
+            type(volume) is not RSMVolume
+            or frame_records is not None
+            or source_base is not None
+        ):
             raise ValueError(
                 "bounded analysis artifact requires one unbound-free RSM volume"
             )
         projection = project_analysis_artifact_result(
             kind=AnalysisArtifactKind.RSM,
-            axes=(("h", volume.h), ("k", volume.k), ("l", volume.l)),
-            axis_units=(("h", None), ("k", None), ("l", None)),
+            axes=volume.axes,
+            axis_units=volume.axis_units,
             intensity=volume.intensity,
             sigma=None,
             coverage=None,
@@ -3871,6 +3925,12 @@ def write_rsm(
             provenance=provenance,
             compression=compression,
             bounded_artifact=True,
+            coordinate_frame=(
+                volume.coordinate_frame
+                if volume.coordinate_frame
+                is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+                else coordinate_frame
+            ),
         )
     if bounded_artifact:
         if frame_records is not None or source_base is not None:
@@ -3885,6 +3945,15 @@ def write_rsm(
         prov = None
     if volume is None:
         raise TypeError("RSM writer requires one volume")
+    from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
+
+    if (
+        getattr(volume, "coordinate_frame", RSMCoordinateFrame.HKL)
+        is not RSMCoordinateFrame.HKL
+    ):
+        raise ValueError(
+            "legacy RSM persistence accepts only an H/K/L volume"
+        )
     intensity = np.asarray(volume.intensity, np.float32)
     expected = (len(volume.h), len(volume.k), len(volume.l))
     if intensity.shape != expected:
@@ -3921,12 +3990,54 @@ def read_rsm(path: Path | str, *, entry: str = "entry"):
     """Read ``/entry/rsm`` into an :class:`~xrd_tools.rsm.RSMVolume`.
 
     The ``provenance_json`` blob (if present) is parsed onto
-    :attr:`RSMVolume.provenance`.  Raises :class:`KeyError` when the entry or the
-    ``rsm`` group is absent.
+    :attr:`RSMVolume.provenance`.  Standalone analysis artifacts first pass the
+    authoritative artifact reader; this function otherwise remains a
+    structural convenience reader for legacy/ad-hoc RSM groups.  Both H/K/L
+    and sample-fixed Cartesian-Q descriptors are frame-aware, and mixed or
+    incomplete descriptors are refused.  Raises :class:`KeyError` when the
+    entry or the ``rsm`` group is absent.
     """
+    from xrd_tools.rsm.coordinate_frame import (
+        RSMCoordinateFrame,
+        rsm_coordinate_frame_from_axes,
+    )
     from xrd_tools.rsm.volume import RSMVolume  # noqa: PLC0415
 
     path = Path(path)
+    if entry == "entry":
+        from xrd_tools.io.analysis_artifact import (
+            ANALYSIS_KIND_ATTR,
+            ANALYSIS_SCHEMA_ATTR,
+            AnalysisArtifactKind,
+            read_analysis_artifact,
+        )
+
+        with h5py.File(path, "r") as handle:
+            candidate = handle.get(entry)
+            standalone_artifact = (
+                isinstance(candidate, h5py.Group)
+                and ANALYSIS_SCHEMA_ATTR in candidate.attrs
+                and ANALYSIS_KIND_ATTR in candidate.attrs
+            )
+        if standalone_artifact:
+            payload = read_analysis_artifact(
+                path,
+                expected_kind=AnalysisArtifactKind.RSM,
+            )
+            coordinate_frame = rsm_coordinate_frame_from_axes(
+                tuple(name for name, _values in payload.axes),
+                tuple(units for _name, units in payload.inspection.axis_units),
+            )
+            try:
+                provenance = json.loads(payload.provenance_json)
+            except (TypeError, ValueError):
+                provenance = payload.provenance_json
+            return RSMVolume.from_axes(
+                coordinate_frame,
+                payload.axes,
+                payload.intensity,
+                provenance=provenance,
+            )
     with h5py.File(path, "r") as f:
         if entry not in f:
             raise KeyError(f"No {entry!r} group in {path}")
@@ -3934,6 +4045,36 @@ def read_rsm(path: Path | str, *, entry: str = "entry"):
         if "rsm" not in e:
             raise KeyError(f"No rsm group in {path}:{entry}")
         g = e["rsm"]
+        hkl_names = RSMCoordinateFrame.HKL.axis_names
+        q_frame = RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+        q_names = q_frame.axis_names
+        has_hkl = all(name in g for name in hkl_names)
+        has_q = all(name in g for name in q_names)
+        frame_attr = _v2_decode_str(g.attrs.get("coordinate_frame", ""))
+        if has_hkl and not any(name in g for name in q_names):
+            if frame_attr not in ("", RSMCoordinateFrame.HKL.value):
+                raise ValueError("RSM H/K/L frame descriptor is invalid")
+            frame = RSMCoordinateFrame.HKL
+            names = hkl_names
+        elif has_q and not any(name in g for name in hkl_names):
+            stored_axes = tuple(
+                _v2_decode_str(value)
+                for value in np.asarray(g.attrs.get("axes", ())).reshape(-1)
+            )
+            if frame_attr != q_frame.value or any(
+                _v2_decode_str(g[name].attrs.get("units", ""))
+                != q_frame.axis_units[index]
+                for index, name in enumerate(q_names)
+            ) or (
+                _v2_decode_str(g.attrs.get("NX_class", "")) != "NXdata"
+                or _v2_decode_str(g.attrs.get("signal", "")) != "intensity"
+                or stored_axes != q_names
+            ):
+                raise ValueError("RSM Cartesian-Q frame descriptor is invalid")
+            frame = q_frame
+            names = q_names
+        else:
+            raise ValueError("RSM coordinate axes are incomplete or mixed")
         prov = None
         if "provenance_json" in g:
             raw = g["provenance_json"][()]
@@ -3943,9 +4084,10 @@ def read_rsm(path: Path | str, *, entry: str = "entry"):
                 prov = json.loads(raw)
             except (ValueError, TypeError):
                 prov = str(raw)
-        return RSMVolume(
-            h=np.asarray(g["h"][()]), k=np.asarray(g["k"][()]),
-            l=np.asarray(g["l"][()]), intensity=np.asarray(g["intensity"][()]),
+        return RSMVolume.from_axes(
+            frame,
+            tuple((name, np.asarray(g[name][()])) for name in names),
+            np.asarray(g["intensity"][()]),
             provenance=prov,
         )
 
