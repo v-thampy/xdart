@@ -44,6 +44,11 @@ from-scratch framing was a local-only CC_ note, not published.)
    persistence).  New sources/sinks (Tiled, zarr) implement the seam and
    self-verify against the contract tests.
 
+Integrity complexity is proportional to demonstrated risk.  Finite operations
+prefer immutable sources and new, validated artifacts over rollback/recovery
+state machines; scientific correctness remains independently non-negotiable
+(ADR-0010).
+
 ## The contracts
 
 - **`FrameSource`** (`xrd_tools.core.scan`): `frame_indices`,
@@ -95,6 +100,10 @@ purity guard enforces it). The session `FrameRecordStore` is authoritative;
   multimode record round-trip, and Scattering Workspace GI-axis parity gates
   must agree on canonical results. A failure is a bug, never a tolerance to
   widen.
+- **authenticated real-data promotion** — promotion names its beamline corpus,
+  fails if that corpus is unavailable, and runs the applicable pyFAI, Stitch,
+  RSM, and persisted-reload scientific/performance gates. Synthetic contract
+  fixtures do not substitute for this evidence (ADR-0010).
 - **Byte-compat gate** (`tests/core/test_v2_record_compat.py`) — the
   written record's content signature is pinned; a diff means the on-disk
   format changed.
@@ -105,7 +114,8 @@ purity guard enforces it). The session `FrameRecordStore` is authoritative;
 
 See `decisions/` (ADRs).  Highlights: xarray lives at the read boundary
 only (ADR-0001); schema evolution is integer version + per-feature
-capability attributes (ADR-0002).
+capability attributes (ADR-0002); integrity complexity is proportional to
+demonstrated risk and promotion requires real-data evidence (ADR-0010).
 
 ## Document map
 
