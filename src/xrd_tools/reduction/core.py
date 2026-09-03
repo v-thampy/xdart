@@ -4981,6 +4981,9 @@ def _replace_integration_2d_ranges(
     return replace(plan, integration_2d=p2d)
 
 
+_PYFAI_COLD_GEOMETRY_LOCK = threading.Lock()
+
+
 class _ReductionIntegratorProvider:
     """Per-thread integrator cache for executor-backed reductions."""
 
@@ -5045,6 +5048,34 @@ class _ReductionIntegratorProvider:
         self._local.run_mask_binding = (run_mask, shape, False)
         return ai, False
 
+    def _warm_standard_centers(
+        self,
+        ai: Any,
+        shape: tuple[int, int],
+    ) -> None:
+        """Populate numexpr-backed pyFAI center arrays before parallel use.
+
+        numexpr 2.14 no longer serializes concurrent ``evaluate`` calls.  A
+        cold, mask-bound pyFAI integrator reaches that global interpreter while
+        building its radial and azimuthal geometry.  Worker-local integrators
+        still provide the scientific isolation; this small process-wide lock
+        covers only their one-time geometry construction.
+        """
+        units: list[str] = []
+        one_d = getattr(self.plan, "integration_1d", None)
+        if one_d is not None:
+            if str(one_d.unit or "").lower() == "chi_deg":
+                units.extend(("q_A^-1", "chi_deg"))
+            else:
+                units.append(one_d.unit)
+                if one_d.azimuth_range is not None:
+                    units.append("chi_deg")
+        two_d = getattr(self.plan, "integration_2d", None)
+        if two_d is not None:
+            units.extend((two_d.unit, "chi_deg"))
+        for unit in dict.fromkeys(units):
+            ai.array_from_unit(shape, "center", unit, scale=False)
+
     def standard_with_run_mask(
         self,
         run_mask: np.ndarray | None,
@@ -5079,35 +5110,44 @@ class _ReductionIntegratorProvider:
                 shape,
             )
 
-        try:
-            ai = self._new_standard()
-            if not _stock_pyfai_detector_mask_semantics(ai, shape):
-                unbound = ai if self.ai is None else self._unbound_standard()
-                return self._retain_unbound_standard(unbound, run_mask, shape)
-            detector = ai.detector
-            detector_mask = detector.mask
-            if detector_mask is not None:
-                detector_mask = np.asarray(detector_mask, dtype=bool)
-                bound_mask = (
-                    detector_mask
-                    if run_mask is None
-                    else np.logical_or(run_mask, detector_mask)
-                )
-            else:
-                bound_mask = (
-                    None if run_mask is None else np.asarray(run_mask, dtype=bool)
-                )
-            if run_mask is not None:
-                detector.mask = bound_mask
-            ai.reset_engines(collect_garbage=False)
-            if run_mask is not None:
-                admitted = np.asarray(detector.mask, dtype=bool)
-                if admitted.shape != shape or not np.array_equal(admitted, bound_mask):
-                    unbound = self._unbound_standard()
+        with _PYFAI_COLD_GEOMETRY_LOCK:
+            try:
+                ai = self._new_standard()
+                if not _stock_pyfai_detector_mask_semantics(ai, shape):
+                    unbound = ai if self.ai is None else self._unbound_standard()
                     return self._retain_unbound_standard(unbound, run_mask, shape)
-        except (AttributeError, TypeError, ValueError):
-            unbound = self._unbound_standard()
-            return self._retain_unbound_standard(unbound, run_mask, shape)
+                detector = ai.detector
+                detector_mask = detector.mask
+                if detector_mask is not None:
+                    detector_mask = np.asarray(detector_mask, dtype=bool)
+                    bound_mask = (
+                        detector_mask
+                        if run_mask is None
+                        else np.logical_or(run_mask, detector_mask)
+                    )
+                else:
+                    bound_mask = (
+                        None if run_mask is None else np.asarray(run_mask, dtype=bool)
+                    )
+                if run_mask is not None:
+                    detector.mask = bound_mask
+                ai.reset_engines(collect_garbage=False)
+                if run_mask is not None:
+                    admitted = np.asarray(detector.mask, dtype=bool)
+                    if (
+                        admitted.shape != shape
+                        or not np.array_equal(admitted, bound_mask)
+                    ):
+                        unbound = self._unbound_standard()
+                        return self._retain_unbound_standard(
+                            unbound,
+                            run_mask,
+                            shape,
+                        )
+                self._warm_standard_centers(ai, shape)
+            except (AttributeError, TypeError, ValueError):
+                unbound = self._unbound_standard()
+                return self._retain_unbound_standard(unbound, run_mask, shape)
 
         self._local.ai = ai
         self._local.run_mask_binding = (run_mask, shape, True)

@@ -1,10 +1,11 @@
 {
   "version": 1,
   "corpus_id": "xdart-private-promotion-v1-20260902",
-  "expected_tests": 16,
+  "expected_tests": 17,
   "pytest_nodes": [
     "tests/core/test_e2sci_saturation_mask.py::test_all_short_eiger_standard_outputs_match_explicit_mask",
     "tests/core/test_e2sci_saturation_mask.py::test_five_file_gi_directory_outputs_match_explicit_mask",
+    "tests/core/test_pyfai_worker_initialization_real_data.py::test_four_workers_initialize_pyfai_with_one_numexpr_thread",
     "tests/core/test_rsm_operation_r2_real_data.py::test_rsm_v2_matches_independent_authenticated_oracle",
     "tests/core/test_stitch_operation_real_data.py::test_scan14_quick_stitch_commits_with_calibrated_geometry",
     "tests/core/test_stitch_operation_real_data.py::test_scan14_full_287_streams_and_persists_diagnostics",
