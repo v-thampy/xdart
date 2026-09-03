@@ -1288,6 +1288,85 @@ def test_nexus_sink_create_new_requires_an_exact_boolean(tmp_path: Path) -> None
         NexusSink(tmp_path / "scan.nexus", create_new=1)
 
 
+def test_create_new_refusal_leaves_no_lease_behind(tmp_path: Path) -> None:
+    """The refusal must precede acquire_lease, not merely precede the writer.
+
+    Pins the invariant the refusal depends on: moving the CREATE_NEW_TARGET_EXISTS
+    raise below acquire_lease would strand a lease in the process-wide coordinator
+    and make every later write to this path fail in _acquire.
+    """
+    from xrd_tools.io.output_transaction import (
+        get_output_transaction_coordinator,
+    )
+
+    # The coordinator is process-wide, so assert on this target's delta only.
+    coordinator = get_output_transaction_coordinator()
+    before = set(coordinator._leases)
+
+    out = tmp_path / "scan.nexus"
+    out.write_bytes(b"existing scientific artifact")
+    sink = NexusSink(out, overwrite=True, create_new=True)
+
+    with pytest.raises(ValueError, match="CREATE_NEW_TARGET_EXISTS"):
+        sink.begin(Scan("scan", []), ReductionPlan())
+
+    assert set(coordinator._leases) == before
+    # A second admission of the same target must still be able to take the
+    # lease the refusal must not have stranded.
+    survivor = NexusSink(out, overwrite=True)
+    survivor.begin(Scan("scan", []), ReductionPlan())
+    assert len(set(coordinator._leases) - before) == 1
+    survivor.abort(None)
+    assert set(coordinator._leases) == before
+
+
+@pytest.mark.parametrize("constructor", ("append", "replacement"))
+def test_alternative_constructors_refuse_a_smuggled_create_new(
+    tmp_path: Path, constructor: str,
+) -> None:
+    """create_new is an admission policy each alternative constructor owns.
+
+    Regression: two of the three hand-maintained forbidden-kwarg tuples omitted
+    create_new, so a caller could pass it and have it silently dropped.
+    """
+    from xrd_tools.io.append import AppendIntent, AppendSource
+    from xrd_tools.io.output_transaction import capture_target_snapshot
+
+    target = tmp_path / "existing.nexus"
+    target.write_bytes(b"existing")
+
+    if constructor == "append":
+        intent = AppendIntent(
+            entry="entry", source_base=str(tmp_path),
+            source_identity="beam/run", science_fingerprint="science-v1",
+            modes=("1d:default",),
+            source=AppendSource(
+                path=str(tmp_path / "master.h5"), adapter_id="nexus_hdf5",
+                size=200, mtime_ns=2000, extent=1, dataset_paths=(),
+                external_members=(), generation=0,
+            ),
+            labels=(0,),
+        )
+        with pytest.raises(ValueError, match="owns its admission policy"):
+            NexusSink.for_existing_append(target, intent, create_new=True)
+    else:
+        with pytest.raises(ValueError, match="owns its output policy"):
+            NexusSink.for_existing_replacement(
+                target,
+                expected_target_snapshot=capture_target_snapshot(target),
+                dimension="1d", labels=(0,), audit_bytes=b"{}",
+                selected_plan={}, selected_gi_mode=None,
+                source_execution={}, append_lineage=None,
+                create_new=True,
+            )
+
+
+def test_finite_replacement_shares_the_owned_admission_kwargs() -> None:
+    """for_finite_replacement guards the same owned set, from one constant."""
+    assert "create_new" in reduction_core._ADMISSION_OWNED_KWARGS
+    assert "same_run_intent" in reduction_core._ADMISSION_OWNED_KWARGS
+
+
 def test_reduction_validation_for_shapes_and_duplicate_frames() -> None:
     with pytest.raises(ValueError, match="duplicate"):
         Scan(

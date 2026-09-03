@@ -1508,6 +1508,17 @@ class TransactionalXYESink:
         self._transition_kind = None
 
 
+# One admission policy is owned by each alternative constructor, so a caller
+# may never smuggle it in through **sink_values.  Kept as one constant because
+# three hand-maintained copies already let "create_new" through two of them.
+_ADMISSION_OWNED_KWARGS = (
+    "append_preflight",
+    "same_run_intent",
+    "allow_unbound_same_run",
+    "create_new",
+)
+
+
 @dataclass(slots=True)
 class NexusSink:
     """Headless value adapter for :class:`NexusRecordWriter`.
@@ -1630,9 +1641,7 @@ class NexusSink:
             raise TypeError(
                 "existing Append prefix must be an exact AppendCommittedPrefix"
             )
-        if any(name in sink_values for name in (
-            "append_preflight", "same_run_intent", "allow_unbound_same_run",
-        )):
+        if any(name in sink_values for name in _ADMISSION_OWNED_KWARGS):
             raise ValueError("existing Append owns its admission policy")
         sink = cls(path, **sink_values)
         if sink.overwrite:
@@ -1654,10 +1663,8 @@ class NexusSink:
     ) -> "NexusSink":
         """Bind one selected-dimension rewrite to an admitted existing target."""
         if type(expected_target_snapshot) is not TargetSnapshot or type(source_execution) is not dict or append_lineage is not None and type(append_lineage) is not bytes or cancel_token is not None and type(cancel_token) is not threading.Event: raise TypeError("replacement requires exact target/source/cancellation objects")
-        if any(name in sink_values for name in (
-            "overwrite", "append_preflight", "same_run_intent",
-            "allow_unbound_same_run",
-        )):
+        if any(name in sink_values
+               for name in ("overwrite",) + _ADMISSION_OWNED_KWARGS):
             raise ValueError("existing replacement owns its output policy")
         sink = cls(path, overwrite=False, **sink_values)
         sink._replacement = (
@@ -1712,13 +1719,7 @@ class NexusSink:
             )
         if any(
             name in sink_values
-            for name in (
-                "overwrite",
-                "append_preflight",
-                "same_run_intent",
-                "allow_unbound_same_run",
-                "atomic",
-            )
+            for name in ("overwrite", "atomic") + _ADMISSION_OWNED_KWARGS
         ):
             raise ValueError("finite replacement owns its output policy")
         sink = cls(path, overwrite=False, atomic=False, **sink_values)
