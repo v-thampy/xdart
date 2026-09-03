@@ -5433,6 +5433,16 @@ class NexusRecordWriter:
             # so descriptor revocation remains single-owner and pathless.
             self._h5 = None
             return
+        if allow_unverified and self._fast_regenerable:
+            # Fast abort rejects this artifact as canonical output.  Close its
+            # HDF5 handle without starting, repeating, or sealing terminal
+            # science proof;
+            # the transaction can then retire the untrusted bytes directly.
+            if self._h5 is not None:
+                self._h5.close()
+                self._h5 = None
+            self._stream_close_attempt = None
+            return
         verification_path = (
             Path(self._h5.filename)
             if self._h5 is not None and binding is not None

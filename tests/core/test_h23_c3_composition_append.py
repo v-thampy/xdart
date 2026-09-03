@@ -2301,7 +2301,7 @@ def test_fast_regenerable_close_rejects_changed_scientific_value(
         ReductionResult,
     )
 
-    _target, sink, facade = _begin_finite_overwrite_sink(
+    target, sink, facade = _begin_finite_overwrite_sink(
         tmp_path,
         "fast-science.nexus",
         "science",
@@ -2356,6 +2356,40 @@ def test_fast_regenerable_close_rejects_changed_scientific_value(
         else TransactionPhase.INTEGRITY_HOLD
     )
     assert facade.durable == []
+    sink.abort(None)
+    assert writer.phase.value == "aborted"
+    assert sink._transaction.snapshot().phase is TransactionPhase.ABORTED
+    assert not target.exists()
+    assert facade.durable == []
+
+
+def test_fast_science_failure_abort_restores_exact_prior_target(tmp_path):
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.io.record_writer import WriterIncomplete
+    from xrd_tools.reduction import FrameReduction, ReductionResult
+
+    target = tmp_path / "fast-prior.nexus"
+    prior = b"exact prior regenerable target"
+    target.write_bytes(prior)
+    target, sink, facade = _begin_finite_overwrite_sink(
+        tmp_path,
+        target.name,
+        "prior",
+        bind_session=True,
+    )
+    sink.write(ScanFrame(0), FrameReduction(0, result_1d=_r1(5)))
+    writer = sink._writer
+    writer._h5["entry/integrated_1d/intensity"][0, 0] += np.float32(1)
+
+    with pytest.raises(WriterIncomplete, match="fast close"):
+        sink.finish(ReductionResult("prior", {}, 1))
+    sink.abort(None)
+
+    assert writer.phase.value == "aborted"
+    assert sink._transaction.snapshot().phase is TransactionPhase.ABORTED
+    assert target.read_bytes() == prior
+    assert facade.durable == []
+    _assert_lease_available(target)
 
 
 def test_fast_terminal_science_accepts_allclose_axes_and_mixed_sigma(tmp_path):
