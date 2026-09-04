@@ -899,9 +899,10 @@ def test_average_page_accepts_only_exact_cancelled_payload_status_pairs(
     )
     # _clear_terminal_browse was RELOCATED, not removed: 1e3a4a1c "Extract
     # processed browser owner" moved it onto the browser owner as
-    # ProcessedBrowser.retire_terminal (processed_browser.py:968), which
-    # page.py:2512 calls after a successful Average reload.  Re-point the
-    # sentinel there rather than dropping the coverage.
+    # ProcessedBrowserOwner.retire_terminal (processed_browser.py:474 defines
+    # the class, :968 the method), which page.py:2512 calls after a successful
+    # Average reload.  Re-point the sentinel there rather than dropping the
+    # coverage.
     monkeypatch.setattr(
         page._processed_browser,
         "retire_terminal",
