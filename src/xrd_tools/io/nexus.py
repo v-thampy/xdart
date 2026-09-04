@@ -2410,6 +2410,14 @@ def validate_integrated_stack_write(
         # (int(b"0") == 0, and the same for an h5py vlen str); it refused text
         # only when that text was not numeric.  Refuse a non-integer index
         # outright instead of pretending it is one.
+        #
+        # RATIFIED by the project owner 2026-09-03 as a deliberate change in
+        # which files are accepted, after being shown all four cases above.
+        # Do not "restore compatibility" by reinstating the coercion: turning
+        # [0.5, 1.5, 2.5] into (0, 1, 2) and then validating THAT is how a
+        # malformed index used to pass.  Exact parity would cost nothing on the
+        # hot path (non-integer could fall back to the old loop); it was
+        # rejected on semantics, not performance.
         if persisted.dtype.kind not in "iu":
             raise ValueError(
                 f"{group_name}/frame_index must be an integer dataset"
