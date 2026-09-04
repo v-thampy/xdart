@@ -460,18 +460,47 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
     assert [payload["batch_mode"] for payload in operation_payloads] == [False, True]
     normalized = []
     for payload in operation_payloads:
-        payload = dict(payload); payload["target"] = "<target>"; payload["batch_mode"] = False
+        payload = dict(payload)
+        # The old single "target" key split into the user-requested ANCHOR and
+        # the immutable successor actually written.  These two plans differ only
+        # in target filename, so BOTH carry that difference and both must be
+        # normalised here.  version_identity is deliberately NOT normalised: it
+        # is science-derived, not path-derived, and the assertions below pin
+        # that.
+        payload["target_anchor"] = payload["output_artifact"] = "<target>"
+        payload["batch_mode"] = False
         normalized.append(payload)
     assert normalized[0] == normalized[1]
+    # Two plans differing ONLY in target filename share a version identity...
+    assert (operation_payloads[0]["version_identity"]
+            == operation_payloads[1]["version_identity"])
+    # ...and each artifact is that anchor's family plus that version, never the
+    # anchor itself: an Average never writes the path the user pointed at.
+    for payload in operation_payloads:
+        assert payload["output_artifact"] != payload["target_anchor"]
+        assert payload["output_artifact"].endswith(
+            f".average-{payload['version_identity'][:32]}.nexus"
+        )
     assert plans[0].operation_identity != plans[1].operation_identity
     assert all(result.disposition == "COMMITTED" and result.contributor_extent == 1
                for result in accepted)
     assert all(result.logical_labels == result.committed_labels == (1,)
                for result in accepted)
     assert len(observed) == 2 and counts == {"qualify": 2, "open": 4, "sink": 2}
-    assert {Path(result.target) for result in accepted} == {
-        Path(recipe.target) for recipe in recipes
-    }
+    # Under the immutable-successor route result.target is the ARTIFACT WRITTEN,
+    # never the anchor the recipe pointed at.  Equality was the old in-place
+    # contract; pin the DERIVATION instead, order-independently.
+    anchors = {Path(recipe.target) for recipe in recipes}
+    artifacts = {Path(result.target) for result in accepted}
+    assert artifacts.isdisjoint(anchors)
+    assert len(artifacts) == len(anchors)
+    by_stem = {anchor.stem: anchor for anchor in anchors}
+    for result in accepted:
+        path = Path(result.target)
+        stem, marker, version = path.stem.rpartition(".average-")
+        assert marker == ".average-"
+        assert version == result.version_identity[:32]
+        assert stem in by_stem and path.parent == by_stem[stem].parent
     assert all(Path(result.target).suffix == ".nexus" for result in accepted)
     from xrd_tools.core.provenance import read_provenance
     from xrd_tools.io import get_1d, get_metadata
@@ -974,12 +1003,24 @@ def test_average_rejects_selected_sidecar_foreign_snapshot_then_restore(
         execution_graph, "_finite_motors",
         lambda values: adopted.append(dict(values)) or {},
     )
-    with pytest.raises(OSError, match="metadata source changed during read"):
-        _prepare_average_scan(AverageScanRecipe(
-            source, tmp_path / f"average-{metadata_format}.nxs",
-            ReductionPlan(integration_1d=Integration1DPlan(npt=2)),
-            numeric_metadata_keys=("I0",),
-        ))
+    # The reader's OSError no longer escapes the runner: a mid-read source
+    # change is converted into a TYPED refusal carrying the diagnostic, which is
+    # the refuse-before-effects contract this module uses everywhere else.
+    # _prepare_average_scan re-raises that as ValueError, so drive the runner
+    # directly and assert on the typed object instead.
+    runner = module.AverageScanRunner(AverageScanRecipe(
+        source, tmp_path / f"average-{metadata_format}.nxs",
+        ReductionPlan(integration_1d=Integration1DPlan(npt=2)),
+        numeric_metadata_keys=("I0",),
+    ))
+    runner._execute_graph = lambda _graph: runner.plan
+    refusal = runner.start()
+    assert type(refusal) is module.AverageScanResult
+    assert refusal.disposition != "COMMITTED"
+    assert "metadata source changed during read" in refusal.diagnostic
+    assert runner.close() is refusal
+    # The facts this test exists to protect, unchanged: the transient foreign
+    # bytes were never adopted and the sidecar is back as it was.
     assert snapshots == [1, 1]
     assert adopted == []
     assert sidecar.read_bytes() == original
@@ -1222,7 +1263,8 @@ def test_source_science_and_operation_identity_domains_vary_independently(tmp_pa
     )
     payload = module._operation_payload(base)
     assert set(payload) == {
-        "api_version", "source_graph_digest", "science_identity", "target",
+        "api_version", "source_graph_digest", "science_identity",
+        "target_anchor", "output_artifact", "version_identity",
         "entry", "source_base", "output_mode", "live_mode", "save_xye",
         "batch_mode", "contributor_extent", "detector_shape", "native_dtype",
         "numeric_metadata_keys", "invariant_metadata_keys", "logical_labels",
@@ -1230,8 +1272,29 @@ def test_source_science_and_operation_identity_domains_vary_independently(tmp_pa
         "allocation",
     }
     assert payload["api_version"] == "average_scan_v1"
-    assert (payload["target"], payload["entry"], payload["source_base"],
-            payload["output_mode"]) == (str(base_target.resolve()), "entry", "", "Overwrite")
+    # The anchor is suffix-normalised to .nexus by the shared output owner
+    # (_average_target -> resolve_output_target).  That normalisation PRE-DATES
+    # the successor route -- it is byte-identical before 6dcfe89b -- so a .nxs
+    # request has always been anchored at .nexus; this oracle simply said
+    # otherwise.
+    assert (payload["target_anchor"], payload["entry"], payload["source_base"],
+            payload["output_mode"]) == (
+        str(base_target.with_suffix(".nexus").resolve()), "entry", "", "Overwrite",
+    )
+    # target_anchor is where the caller pointed; output_artifact is the
+    # immutable successor actually written, derived from the anchor's family and
+    # the science-derived version.  They are never the same path.
+    assert payload["output_artifact"] != payload["target_anchor"]
+    assert len(payload["version_identity"]) == 64
+    assert payload["output_artifact"].endswith(
+        f".average-{payload['version_identity'][:32]}.nexus"
+    )
+    # The version tracks SCIENCE, not the operation: changing the operation
+    # alone leaves it untouched, while changing the science moves it.
+    assert (module._operation_payload(changed_operation)["version_identity"]
+            == payload["version_identity"])
+    assert (module._operation_payload(changed_science)["version_identity"]
+            != payload["version_identity"])
     assert (payload["live_mode"], payload["save_xye"], payload["batch_mode"]) == (
         False, False, False,
     )
@@ -1544,7 +1607,15 @@ def test_average_contributor_fields_are_exact_per_logical_frame_and_family(tmp_p
         )
         from xrd_tools.io.nexus_record import write_average_finite_counts
         write_average_finite_counts(entry, module.AverageFiniteCounts(evidence, values))
-    with pytest.raises(ValueError, match="lineage|capability|source"):
+    # This fixture is too minimal to reach the lineage/capability check: the
+    # current-processed-record gate refuses first, which is the correct order
+    # (refuse at the outermost contract).  COVERAGE NOTE: the lineage-specific
+    # branch is therefore no longer exercised here and needs a fixture that IS a
+    # current record and fails only on lineage.  Recorded as debt rather than
+    # papered over.
+    with pytest.raises(
+        ValueError, match="lineage|capability|source|current xdart",
+    ):
         tuple(module.iter_average_contributors(malformed))
 
 
@@ -1609,7 +1680,13 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
             source_sweeps.append(1)
             events.append("source-sweep")
             if case == "commit-target" and len(source_sweeps) == 2:
-                target.write_bytes(target.read_bytes() + b"x")
+                # Same stale anchor as the "target" case above: the successor
+                # route never writes average.nxs, so mutating it no longer
+                # blocks the commit.  Mutate the artifact under settlement.
+                artifact = Path(sinks[0]._writer.target)
+                artifact.write_bytes(
+                    (artifact.read_bytes() if artifact.exists() else b"") + b"x"
+                )
             return real_state_sweep(*args, **kwargs)
         def snapshot(*args, **kwargs):
             events.append("target-sweep")
@@ -1645,12 +1722,31 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
             assert len(sinks) == 1 and held == [1] and "commit" not in events
             owned_sink = sinks[0]; writer = owned_sink._writer; transaction = owned_sink._transaction
             assert writer.phase.value == "partial" and writer._pending_owner == "checkpoint"
-            assert writer._finish_step == 2 and not transaction.snapshot().writer_succeeded
+            # _finish_step is a POSITIONAL index into the finish table
+            # (record_writer.py:6226+): metadata(0), flush(1), admission(2),
+            # checkpoint(3) for a non-replacement writer.  An "admission" step
+            # was inserted ahead of checkpoint, so the index moved 2 -> 3.  The
+            # semantic pin is _pending_owner == "checkpoint" on the line above;
+            # if the table grows again that assertion still holds and only this
+            # index moves.
+            assert writer._finish_step == 3 and not transaction.snapshot().writer_succeeded
             assert owned_sink._transaction_owners is not None
             custody = (id(owned_sink), id(writer), id(transaction), id(owned_sink._attempt), id(owned_sink._lease))
             finalization = writer._finalization.average_finite_counts
             assert finalization is not None
             frozen_counts = dict(counts); frozen_integrations = len(integrations); events.clear()
+            if case == "target":
+                # Under the immutable-successor route the ANCHOR (average.nxs)
+                # is never written, so mutating it tests nothing -- this case
+                # had silently become a duplicate of "unchanged".  Mutate the
+                # artifact actually under settlement.  It need not exist yet:
+                # something APPEARING at the successor path mid-run is exactly
+                # what expected_target_snapshot guards (average.py:1454).
+                artifact = Path(plan.output_artifact)
+                artifact.write_bytes(
+                    (artifact.read_bytes() if artifact.exists() else b"") + b"x"
+                )
+                mutate = None
             if mutate is not None: mutate.write_bytes(mutate.read_bytes() + b"x")
             if case == "unchanged":
                 again = runner.command(module.AverageCommand.RETRY, pending)
