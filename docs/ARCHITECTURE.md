@@ -45,9 +45,28 @@ from-scratch framing was a local-only CC_ note, not published.)
    self-verify against the contract tests.
 
 Integrity complexity is proportional to demonstrated risk.  Finite operations
-prefer immutable sources and new, validated artifacts over rollback/recovery
-state machines; scientific correctness remains independently non-negotiable
-(ADR-0010).
+keep raw/source artifacts immutable and publish closed, scientifically validated
+results into stable operation slots.  Ordinary streamed Run keeps its current
+high-throughput output transaction, Overwrite, and STOP semantics; this policy
+changes only its target naming.  Derived finite operations atomically replace
+their processed slots while leaving the prior slot untouched until publication.
+Scientific correctness remains independently non-negotiable, and finite
+operations do not gain a general crash-recovery state machine (ADR-0010).
+
+The public slots for one `<family>` are `_int1d.nexus`, `_int2d.nexus`,
+`_average.nexus`, `_reintegrate1d.nexus`, `_reintegrate2d.nexus`,
+`_stitch1d.nexus`, `_stitch2d.nexus`, and `_rsm.nexus`.  Public filenames
+never expose a version or hash; exact identities remain in provenance.  Finite
+Average, Reintegration, Stitch, and RSM publish a hidden same-directory
+candidate only after close and scientific validation.  STOP discards a partial
+candidate.  Run is not converted to that protocol: a hard crash may leave its
+public result or hidden backup unresolved, and automatic recovery is not
+guaranteed.  The raw/source artifact remains safe.  Append and Live follow their
+separate continuation contract.
+
+Stable-slot publication belongs outside the hot integration and writer loop.
+It must leave Run's output-transaction loop unchanged and preserve the accepted
+promotion performance floors.
 
 ## The contracts
 
