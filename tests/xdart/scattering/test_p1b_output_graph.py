@@ -251,21 +251,10 @@ def _write_eiger(master: Path, member: Path, frames: int) -> None:
 
 
 def _written(target: Path, processing_mode: str = "Int 1D") -> Path:
-    """Where a run actually writes, given the save path it was REQUESTED with.
+    """Thin alias for the SHARED spelling; see `_output_slots.written`."""
+    from tests.xdart.scattering._output_slots import written
 
-    Under ADR-0010 the public name is `<family><slot>.nexus`, and an explicit
-    save path supplies the FAMILY, so a run requested at `append.nexus` in
-    `Int 1D` writes `append_int1d.nexus`. These tests hand the request to the
-    intent and then inspect the written file, so the two must be spelled apart.
-
-    Derived from the production table rather than restated, so a change to the
-    slot vocabulary fails here instead of silently disagreeing with it.
-    """
-    from xdart.gui.tabs.scattering.output_preflight import _RUN_MODE_SLOTS
-
-    return target.with_name(
-        f"{target.stem}{_RUN_MODE_SLOTS[processing_mode]}.nexus"
-    )
+    return written(target, processing_mode)
 
 
 def _nexus_rows(path: Path) -> tuple[int, ...]:
@@ -2090,6 +2079,10 @@ def test_p1b_b17_collision_custody_and_xye_append_refuse_typed(
     first_raw = first_root / "shared_0001.tif"
     second_raw = second_root / "shared_0001.tif"
     shared_target = tmp_path / "executor-collision.nexus"
+    # Both contenders REQUEST the anchor and both resolve the one `Int 2D`
+    # slot, so the artifact -- not the anchor -- is what the writer holds
+    # and what H23 leases. Hold and expect the file that is really there.
+    collision_written = _written(shared_target, "Int 2D")
     collision_poni = tmp_path / "collision.poni"
     _write_tiff(first_raw, 1)
     _write_tiff(second_raw, 2)
@@ -2102,7 +2095,7 @@ def test_p1b_b17_collision_custody_and_xye_append_refuse_typed(
 
     def held_finish(owner, result):
         if (
-            Path(owner.path).resolve() == shared_target.resolve()
+            Path(owner.path).resolve() == collision_written.resolve()
             and not held_owner
         ):
             held_owner.append(owner)
@@ -2159,7 +2152,9 @@ def test_p1b_b17_collision_custody_and_xye_append_refuse_typed(
         collision_terminal = next(
             event for event in second_events if event.kind in _TERMINAL
         )
-        normalized_target = os.path.normcase(os.path.abspath(shared_target))
+        normalized_target = os.path.normcase(
+            os.path.abspath(collision_written)
+        )
         assert collision_terminal.kind is StandardEventKind.FAILED
         assert collision_terminal.primary is not None
         assert collision_terminal.primary.type_module == (

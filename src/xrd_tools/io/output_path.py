@@ -191,8 +191,8 @@ def artifact_family_from_source(
 
     A valid persisted family is authoritative.  Without one, the complete
     source stem is retained verbatim when safe; generated-looking suffixes are
-    deliberately *not* guessed or stripped.  Unsafe basenames receive a stable
-    hash family without placing arbitrary text in a public pathname.
+    deliberately *not* guessed or stripped.  An unsafe basename RAISES -- see
+    the body -- because a public pathname must never carry a content hash.
     """
 
     if persisted_family is not None:

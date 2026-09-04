@@ -2068,10 +2068,13 @@ def test_average_repeat_in_the_same_directory_currently_refuses(
     ))
     assert first.disposition == "COMMITTED"
     artifact = Path(first.target)
-    # NOTE FOR THE MAINTAINER: the anchor stem IS the family, so the default
-    # anchor `average.nxs` yields the doubled-looking `average_average.nexus`.
-    # Design-literal and harmless, but if the intended default anchor is the
-    # scan name this is where it shows.
+    # This FIXTURE names its scan `average`, so the family is `average` and the
+    # slot reads `average_average.nexus`.  That doubling is an artifact of the
+    # fixture name alone -- NOT a product default.  `page.py:2553` builds the
+    # anchor from the save FOLDER plus the SCAN NAME, so a real scan resolves
+    # `GI_sampleA_0001.nexus` -> `GI_sampleA_0001_average.nexus`.  Spelled out
+    # because the earlier wording here read as a naming defect and was raised
+    # with the maintainer as one.
     assert artifact.name == "average_average.nexus"
     committed_bytes = artifact.read_bytes()
 

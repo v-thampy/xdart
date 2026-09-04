@@ -50,6 +50,9 @@ def _terminal_events(executor):
     return _drain_until(executor, lambda values: any(event.kind in _TERMINAL for event in values), timeout=90.0)
 def _terminal_event(executor):
     return next(event for event in _terminal_events(executor) if event.kind in _TERMINAL)
+from tests.xdart.scattering._output_slots import written
+
+
 def _terminal_run(tmp_path: Path, *, frames=1, processing_mode="Int 1D"):
     tmp_path.mkdir(parents=True, exist_ok=True)
     source = tmp_path / "source.nxs"
@@ -66,7 +69,15 @@ def _terminal_run(tmp_path: Path, *, frames=1, processing_mode="Int 1D"):
     assert run is not None
     assert len(run.display.artifacts) == 1
     artifact = next(iter(run.display.artifacts.values()))
-    return executor, identity, run, artifact, target, terminal
+    # The WRITTEN artifact, not the requested anchor.  Every caller that uses
+    # this value opens it with h5py; none of them re-submits it as a request.
+    # Returning the anchor made `h5py.File(target, "a")` CREATE an empty
+    # `processed.nexus` beside the real `processed_int1d.nexus` and then fail
+    # on a missing component -- a confusing failure a long way from its cause.
+    return (
+        executor, identity, run, artifact,
+        written(target, processing_mode), terminal,
+    )
 def _directory_intent(
     raw: Path, target: Path, poni: Path, *, live: bool = False,
 ) -> RunIntent:

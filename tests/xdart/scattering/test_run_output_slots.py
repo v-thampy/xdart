@@ -133,3 +133,37 @@ def test_an_explicit_file_request_still_gets_a_slot(tmp_path):
             str(tmp_path / requested), "scan12", "_int2d",
         )
         assert resolved == tmp_path / "chosen_int2d.nexus"
+
+
+def test_a_non_canonical_family_is_recorded_verbatim_today(tmp_path):
+    """PINNED INTERIM, not an endorsement -- this needs a maintainer ruling.
+
+    `_run_artifact_family` records the requested stem without checking it
+    against the ONE family vocabulary, so a Run can persist an
+    `@artifact_family_v1` that no later operation can resolve.  The finite owner
+    then refuses with "artifact family is not canonical", which names nothing
+    the operator can act on, where the UN-stamped path would have said "rename
+    the source".
+
+    Not decided here, because both remedies are product decisions:
+
+    * refuse at PLAN time -- my recommendation, since the operator learns before
+      a long run and a family the finite operations cannot use yields no usable
+      artifact anyway -- but that turns an over-80-character or leading-`_` scan
+      name into a NEW refusal for a run that writes its own file perfectly well;
+    * record nothing when the stem is not canonical, which restores the better
+      message but reopens chaining for a stem like `scan ` whose slotted form
+      `scan _int1d` IS canonical and would be consumed as a family.
+
+    This row exists so the gap has an oracle and the change is visible the
+    moment either ruling lands.
+    """
+    from xrd_tools.io.output_path import artifact_family_from_source
+
+    configuration = _configuration("Int 1D", str(tmp_path / "_leading.nexus"))
+    recorded = _run_artifact_family(configuration, "unused-scan-name")
+    assert recorded == "_leading"
+
+    # What the NEXT operation does with what the Run just persisted.
+    with pytest.raises(ValueError, match="artifact family is not canonical"):
+        artifact_family_from_source(tmp_path / "_leading_int1d.nexus", recorded)

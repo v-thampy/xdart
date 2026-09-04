@@ -25,6 +25,8 @@ from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import DirectorySourceSpec
 
+from tests.xdart.scattering._output_slots import written
+
 
 def test_two_independent_tiff_series_keep_distinct_group_identity(
     tmp_path: Path,
@@ -39,14 +41,13 @@ def test_two_independent_tiff_series_keep_distinct_group_identity(
     poni = tmp_path / "cal.poni"
     write_poni(poni)
     source = DirectorySourceSpec(raw, suffixes=(".tif",))
-    run_store = RunIntentStore(
-        RunIntent(
-            source_spec=source,
-            poni_file=str(poni),
-            save_path=str(tmp_path / "processed"),
-            output_mode="Overwrite",
-        )
+    intent = RunIntent(
+        source_spec=source,
+        poni_file=str(poni),
+        save_path=str(tmp_path / "processed"),
+        output_mode="Overwrite",
     )
+    run_store = RunIntentStore(intent)
     snapshot = run_store.snapshot()
     request = RequestId(2)
     start = StartCapture(
@@ -65,9 +66,12 @@ def test_two_independent_tiff_series_keep_distinct_group_identity(
             ("alpha_0001.tif", "alpha_0002.tif"),
             ("beta_0001.tif", "beta_0002.tif"),
         }
+        # The guard is DISTINCTNESS, and it still holds: alpha and beta keep
+        # separate targets.  Only the spelling moved -- both now carry the
+        # `Int 2D` slot this intent defaults to.
         assert {entry.target.name for entry in deferred.entries} == {
-            "alpha.nexus",
-            "beta.nexus",
+            written(tmp_path / "alpha.nexus", intent.processing_mode).name,
+            written(tmp_path / "beta.nexus", intent.processing_mode).name,
         }
     finally:
         session.close()
