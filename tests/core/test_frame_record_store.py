@@ -817,6 +817,120 @@ def test_live_store_set_hydrator_rehydrates_an_evicted_record_on_access():
 
 
 
+_FAST_MODE_KEYS = [("1d", "default"), ("2d", "cake")]
+
+
+def _fast_view(label, *, scale=1.0):
+    from xrd_tools.core import Axis, FrameView
+
+    return FrameView(
+        label=label,
+        axis_1d=Axis("Q", "q_A^-1", values=np.arange(4.0)),
+        intensity_1d=np.full(4, float(label) * scale),
+        axis_2d_x=Axis("Q", "q_A^-1", values=np.arange(4.0)),
+        axis_2d_y=Axis("chi", "chi_deg", values=np.arange(3.0)),
+        intensity_2d=np.full((3, 4), float(label) * scale),
+        mask_baked=True,
+        # A hydrated record must carry the SAME source identity the store
+        # captured, or the stale-read fence refuses it and get_or_hydrate
+        # quietly returns the thinned record instead
+        # (frame_record_store.py _source_identity_from_record + the
+        # captured/fresh comparison).  Pin it on the view so the fixture and
+        # the hydrator agree.
+        source_path=f"/data/scan_{label}.tif",
+        source_frame_index=0,
+    )
+
+
+def _fast_record(label, *, scale=1.0):
+    from xrd_tools.core import FrameRecord
+
+    view = _fast_view(label, scale=scale)
+    return FrameRecord(
+        label=label,
+        results_1d={"default": view},
+        results_2d={"cake": view},
+        active_mode_1d="default",
+        active_mode_2d="cake",
+    )
+
+
+def _project_fast_frame(store, label, *, durable, recoverable, scale=1.0):
+    """Put one frame into the state a fast-regenerable Run's checkpoint leaves."""
+    keys = _FAST_MODE_KEYS
+    store.upsert(
+        _fast_record(label, scale=scale),
+        source_identity=f"/data/scan_{label}.tif#0",
+    )
+    store.replace_projection(
+        label, hydratable=keys, durable=keys if durable else [],
+    )
+    if recoverable:
+        resident = store.get(label)
+        revisions = {key: 1 for key in keys}
+        assert store._bind_checkpoint_revisions(
+            label, expected=resident, revisions=revisions,
+        )
+        assert store._mark_checkpoint_recoverable(
+            label, expected=resident, revisions=revisions,
+            frame_verified=True, thumbnail_verified=False,
+        )
+
+
+def test_fast_checkpoint_release_rehydrate_then_writer_mutation_revokes():
+    """The whole production sequence, end to end, in one test.
+
+    The suite covered the four legs SEPARATELY -- release eligibility,
+    checkpoint publication, hydration gates, terminal verification -- but never
+    composed: periodic fast checkpoint -> heavy release -> ACTUAL re-hydration
+    -> later writer mutation -> revocation.  A regression that only shows up
+    when one leg hands off to the next (a re-hydration that silently drops the
+    recoverable projection, or a mutation that leaves stale release authority
+    behind) would pass every existing test.
+    """
+    from xrd_tools.session import FrameRecordStore
+
+    store = FrameRecordStore(max_heavy_items=8)
+    _project_fast_frame(store, 1, durable=False, recoverable=True)
+
+    # 1. The fast checkpoint licenses release without claiming durability.
+    assert store.durable_modes(1) == frozenset()
+    assert store.can_release_heavy(1)
+    assert store.release_heavy(1)
+    assert not store.has_heavy_payload(1)
+
+    # 2. Re-hydration actually restores the arrays, exactly once.
+    calls = []
+
+    def hydrate(label):
+        calls.append(label)
+        return _fast_record(label, scale=3.0)
+
+    _set_certified_hydrator(store, hydrate)
+    restored = store.get_or_hydrate(1)
+
+    assert calls == [1]
+    assert restored is not None
+    assert store.has_heavy_payload(1)
+    np.testing.assert_allclose(
+        restored.view_2d("cake").intensity_2d, np.full((3, 4), 3.0)
+    )
+    # Hydration RE-ARMS the projection rather than dropping it, so the frame is
+    # immediately releasable again -- otherwise a hydrated frame would pin its
+    # payload for the rest of the run and the leak would return by the back door.
+    assert store.can_release_heavy(1)
+    assert store.durable_modes(1) == frozenset()
+
+    # 3. A later writer mutation of the SAME label revokes that authority: the
+    #    rows the checkpoint proved are no longer the rows in the store.
+    store.upsert(_fast_record(1, scale=7.0), source_identity="/data/scan_1.tif#0")
+
+    assert store.checkpoint_recoverable_modes(1) == frozenset()
+    assert not store.can_release_heavy(1)
+    assert not store.release_heavy(1)
+    assert store.has_heavy_payload(1)
+
+
 def test_projected_heavy_release_needs_durable_or_checkpoint_recoverable():
     """A live projection must not pin every heavy payload for the whole run.
 

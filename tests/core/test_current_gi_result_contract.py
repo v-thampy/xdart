@@ -188,6 +188,50 @@ def test_nested_soft_link_is_refused_by_admission_and_writer_preflight(tmp_path)
             )
 
 
+@pytest.mark.parametrize(
+    "replacement, message",
+    [
+        (np.array([0.0, 1.0, 2.0]), "must be an integer dataset"),
+        (np.array([False, True]), "must be an integer dataset"),
+        (np.array([b"0", b"1"]), "must be an integer dataset"),
+        (np.array([[0, 1], [2, 3]], dtype=np.int64), "must be a 1-D dataset"),
+        (np.int64(0), "must be a 1-D dataset"),
+    ],
+    ids=["float", "bool", "numeric-text", "matrix", "scalar"],
+)
+def test_cursor_validation_refuses_a_malformed_frame_index(
+    tmp_path, replacement, message,
+):
+    """The persisted cursor must be a rank-one INTEGER dataset, or be refused.
+
+    Both rules are deliberately stricter than the Python loop this validation
+    replaced, and both were ratified by the project owner on 2026-09-03.  The
+    old loop coerced instead: it truncated a float index (0.5 -> 0), read a
+    bool as 0/1, and accepted NUMERIC text because ``int(b"0") == 0`` -- then
+    validated the fiction it had just built.  It also ``.ravel()``-ed, so a
+    scalar or matrix dataset was flattened into something that read like a
+    cursor.  Product writers only ever emit rank-one int64
+    (nexus.py:2005/2176/3122), and record_writer.py:368 already refuses a
+    non-integer source-fact index, so this only ever affects foreign files.
+    """
+    target, _source_root = _gi_scan(tmp_path)
+    with h5py.File(target, "r+") as handle:
+        group = handle["entry/integrated_1d/q_oop"]
+        del group["frame_index"]
+        group.create_dataset("frame_index", data=replacement)
+    with h5py.File(target, "r+") as handle:
+        with pytest.raises(ValueError, match=message):
+            validate_integrated_stack_write(
+                handle["entry"],
+                frame_indices=[9],
+                results_1d=[
+                    _result_1d(9, unit=_GI_1D_UNITS["q_oop"], offset=3)
+                ],
+                group_name_1d="integrated_1d/q_oop",
+                allow_rebuild=False,
+            )
+
+
 def test_record_writer_refuses_linked_existing_result_before_mutation(tmp_path):
     target, source_root = _gi_scan(tmp_path)
     with h5py.File(target, "r+") as handle:

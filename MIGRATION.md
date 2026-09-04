@@ -68,9 +68,14 @@ The shim is scheduled for removal; update imports.
 `xrd_tools.core` is now import-light: importing the core contracts pulls no
 Qt/pyqtgraph/h5py/pyFAI/fabio (the h5py codec re-exports are lazy).
 
-## On-disk format: unchanged
+## Processed NeXus on-disk format: unchanged
 
-No persisted-format changes.  Attribute keys keep their historical `ssrl_`
+No persisted-format changes to the processed NeXus record.  (Textual `.xye`
+export is NOT covered by this heading: it is written at `%.9g` rather than
+NumPy's default `%.18e`, so the bytes of a newly written `.xye` differ from
+older releases.  Values round-trip to better than 5e-9 relative -- far beyond
+any XRD measurement -- and `tests/core/test_export.py` pins that tolerance.)
+Attribute keys keep their historical `ssrl_`
 prefixes (`ssrl_schema`, `ssrl_schema_version`, `ssrl_dtype`); the NXprocess
 `@program` of the GUI writer stays `"ssrl_xrd_tools"`.  A byte-compat gate
 (`tests/core/test_v2_record_compat.py`) pins the written record against a

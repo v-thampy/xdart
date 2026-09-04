@@ -2400,7 +2400,19 @@ def validate_integrated_stack_write(
         # persisted index on every batch, and every message is unchanged.
         if group is None:
             return
-        persisted = np.asarray(group["frame_index"][()]).ravel()
+        persisted = np.asarray(group["frame_index"][()])
+        # RANK-ONE ONLY.  This used to .ravel(), which flattened a scalar,
+        # matrix or higher-rank dataset into something that reads like a
+        # cursor, so a structurally wrong index was validated as if it were
+        # sound.  Every product writer creates this dataset rank-one and
+        # resizable (nexus.py:2005/2176/3122) and the fast-path readback proof
+        # already pins frame_index_shape == (row_count,)
+        # (record_writer.py:3900).  An EMPTY rank-one index stays legal: a
+        # group can exist with no rows yet, and the size guards below cover it.
+        if persisted.ndim != 1:
+            raise ValueError(
+                f"{group_name}/frame_index must be a 1-D dataset"
+            )
         # DELIBERATELY STRICTER than the Python loop this replaced, which is a
         # behaviour change on foreign files only: every product writer pins an
         # integer index (nexus.py:2005/2176/3122, record_writer.py:3900), and

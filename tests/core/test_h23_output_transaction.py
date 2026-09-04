@@ -3403,6 +3403,38 @@ def test_unowned_backup_refuses_without_destroying_only_prior(
     assert transaction.backup.read_bytes() == b"only durable prior"
 
 
+def test_xye_restaging_a_label_moves_it_to_the_end_of_publication_order(
+    tmp_path: Path,
+) -> None:
+    """Re-staging an existing label publishes it LAST, carrying the newest payload.
+
+    `_staged` became an insertion-ordered dict for O(1) staging; the previous
+    list was rebuilt per frame and therefore quadratic over a run.  The dict
+    keeps the old semantics only because `stage()` pops before assigning --
+    without the pop, a re-staged label would keep its ORIGINAL position.  No
+    committed test pinned that, so the ordering could have been changed
+    silently by anyone simplifying the two lines into one.
+    """
+    api = _api()
+    coordinator = api.OutputTransactionCoordinator()
+    run_owner = api.OwnerToken("xye-run")
+    xye = coordinator.prepare_xye(tmp_path, run_owner=run_owner)
+
+    xye.stage(run_owner, 0, b"zero")
+    assert xye.snapshot().staged_indices == (0,)
+    xye.stage(run_owner, 1, b"one")
+    assert xye.snapshot().staged_indices == (0, 1)
+
+    # Re-stage 0: it moves to the END of publication order, and never
+    # duplicates the label.
+    xye.stage(run_owner, 0, b"zero-again")
+    assert xye.snapshot().staged_indices == (1, 0)
+
+    # ...carrying the NEW payload.  The snapshot publishes indices only, so the
+    # value has to be read from the staged mapping itself.
+    assert dict(xye._staged) == {1: b"one", 0: b"zero-again"}
+
+
 def test_xye_stale_tail_failure_withholds_publication_and_retries_exact_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
