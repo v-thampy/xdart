@@ -42,6 +42,129 @@ def _normalize_target(path) -> str:
     return os.path.normcase(os.path.abspath(str(path)))
 
 
+def _lease_key(target: str) -> str:
+    """The identity two spellings of ONE file cannot escape.
+
+    Codex F1 on `da228738`.  The lease registry keyed on
+    `normcase(abspath(...))`, which is a pure STRING transform -- and on POSIX
+    `normcase` is the identity function.  So `<root>/processed/slot.nexus` and
+    `<root>/PROCESSED/slot.nexus`, which are the SAME FILE on a case-insensitive
+    volume (verified with `os.path.samefile`), produced two different keys and
+    two simultaneous leases.  That is survivable while a no-clobber `os.link`
+    still refuses the second writer; it is not survivable once replacement
+    removes that link, which is exactly why this lands with it.
+
+    The fix is an IDENTITY, not a spelling rule.  The parent directory is
+    stat'ed, and its `(st_dev, st_ino)` replaces the whole directory portion of
+    the path: that collapses case-aliased directories, symlinked directories,
+    `..` segments and relative spellings in one step, without assuming anything
+    about the platform.
+
+    NO BLANKET LOWERCASING.  Codex's direction was explicit that it would
+    conflate genuinely distinct files on a case-sensitive volume.  The final
+    NAME is therefore casefolded only when this directory is OBSERVED to treat
+    two spellings of it as one file -- which is checkable exactly when the file
+    exists, and when it exists is when replacement has something to lose.
+
+    TWO RESIDUAL GAPS, stated rather than papered over.
+
+    1. When the parent cannot be stat'ed -- it does not exist yet, or is
+       unreadable -- this falls back to the old string key.  A key that
+       cannot be computed must not take the publication down; the caller
+       fails later on the real operation with a real message.  Two aliasing
+       spellings of a NOT-YET-EXISTING directory would each get a string key
+       and both proceed.  Narrow in practice: the finite publisher opens and
+       holds its parent BEFORE acquiring, so for that path the parent always
+       exists.
+    2. Two spellings of the FILE NAME in one directory, when the file does
+       not exist yet, cannot be told apart without creating a probe file in
+       the operator's output directory.  When the file DOES exist the check
+       below settles it -- and an existing file is precisely when
+       replacement has something to lose.
+    """
+    directory, name = os.path.split(target)
+    try:
+        state = os.stat(directory or ".")
+    except OSError:
+        return target
+    folded = name.casefold()
+    if folded != name:
+        try:
+            here = os.stat(os.path.join(directory, name))
+            there = os.stat(os.path.join(directory, folded))
+            if (here.st_dev, here.st_ino) == (there.st_dev, there.st_ino):
+                name = folded
+        except OSError:
+            # Not both present: the directory's case rule is unobservable
+            # without creating a file, and creating one here would be a side
+            # effect on the operator's output directory.  Keep the exact name.
+            pass
+    return f"{state.st_dev}:{state.st_ino}:{os.path.normcase(name)}"
+
+
+def _held_open_message(target: str, verb: str) -> str:
+    """The ONE operator-facing account of a rename some holder is blocking.
+
+    Spelled once so the streamed staging path and the finite publication path
+    cannot drift into two different explanations of the same condition (DIR-3).
+    """
+    return (
+        f"could not {verb} '{target}' for replacement: the file is held open by "
+        "another program (on Windows an open handle blocks the rename, "
+        "including antivirus, search indexing, a preview pane or another SMB "
+        "client). The exact existing file was left untouched; stop the other "
+        "program and retry."
+    )
+
+
+def replace_into_place(
+    source,
+    target,
+    *,
+    verb: str = "publish",
+    src_dir_fd: int | None = None,
+    dst_dir_fd: int | None = None,
+) -> None:
+    """Atomically install *source* at *target*, retrying a held-open rename.
+
+    ONE replacement primitive for the finite operations.  `os.replace` is atomic
+    on POSIX and on Windows, so a reader sees either the whole prior file or the
+    whole new one and never a partial write -- which is what lets ADR-0010 say
+    "the prior slot remains visible and untouched until that publication step".
+
+    The retry is for Windows/SMB only (DIR-3): an open handle -- antivirus,
+    search indexing, a preview pane, another SMB client -- makes the rename fail
+    with a PermissionError that clears once the holder lets go.  Any OTHER error
+    is raised immediately rather than retried.
+
+    Pass *src_dir_fd* / *dst_dir_fd* to rename by NAME relative to an already
+    open directory descriptor, as the finite publisher does.  That keeps the
+    rename immune to the parent directory being moved or swapped underneath it
+    between validation and publication.
+
+    NOT used by `OutputTransaction._stage_prior`, deliberately.  That is the
+    streamed Run path, which ADR-0010 leaves unchanged, and its loop interleaves
+    reservation and receipt capture between attempts rather than performing a
+    bare rename.  Converting it would put Run's hot output path at risk for a
+    cosmetic saving.  The POLICY is shared instead: both use `_REPLACE_RETRIES`,
+    `_REPLACE_RETRY_DELAY_S` and `_held_open_message`.
+    """
+    attempts = max(1, int(_REPLACE_RETRIES))
+    for attempt in range(1, attempts + 1):
+        try:
+            _replace(
+                source, target,
+                src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd,
+            )
+            return
+        except PermissionError as error:
+            if attempt == attempts:
+                raise PermissionError(
+                    _held_open_message(_normalize_target(target), verb)
+                ) from error
+            time.sleep(max(0.0, float(_REPLACE_RETRY_DELAY_S)))
+
+
 class OutputTransactionError(RuntimeError):
     """Base class for shared output-transaction refusals."""
 
@@ -843,6 +966,8 @@ class OutputTransactionCoordinator:
     def __init__(self):
         self._lock = threading.RLock()
         self._leases: dict[str, _LeaseState] = {}
+        # display target -> identity key, so release never re-stats.
+        self._lease_keys: dict[str, str] = {}
         self._ordinal = 0
 
     def _next_ordinal(self) -> int:
@@ -936,10 +1061,15 @@ class OutputTransactionCoordinator:
         if not all(isinstance(owner, OwnerToken) for owner in copied.values()):
             raise TypeError("every lease owner must be an OwnerToken")
         with self._lock:
-            if target in self._leases:
+            key = _lease_key(target)
+            if key in self._leases:
                 raise LeaseUnavailable(f"target already leased: {target}")
             lease = TargetLease(target, self._next_ordinal())
-            self._leases[target] = _LeaseState(lease=lease, owners=copied)
+            self._leases[key] = _LeaseState(lease=lease, owners=copied)
+            # Remembered rather than recomputed on release: the parent may be
+            # gone by then, and a key that cannot be rebuilt would strand the
+            # lease forever.
+            self._lease_keys[target] = key
             return lease
 
     def _lease_snapshot(self, state: _LeaseState, *, active: bool) -> LeaseSnapshot:
@@ -953,7 +1083,8 @@ class OutputTransactionCoordinator:
 
     def _require_lease(self, lease: TargetLease) -> _LeaseState:
         with self._lock:
-            state = self._leases.get(lease.target)
+            key = self._lease_keys.get(lease.target)
+            state = None if key is None else self._leases.get(key)
             if state is None or state.lease is not lease:
                 raise OwnershipRefused("foreign or retired target lease")
             return state
@@ -965,7 +1096,8 @@ class OutputTransactionCoordinator:
         owner: OwnerToken,
     ) -> LeaseSnapshot:
         with self._lock:
-            state = self._leases.get(lease.target)
+            key = self._lease_keys.get(lease.target)
+            state = None if key is None else self._leases.get(key)
             if state is None or state.lease is not lease:
                 raise OwnershipRefused("foreign or retired target lease")
             expected = state.owners.get(role)
@@ -977,7 +1109,8 @@ class OutputTransactionCoordinator:
             # independently registered cleanup owner has released.
             if state.owners:
                 return self._lease_snapshot(state, active=True)
-            del self._leases[lease.target]
+            del self._leases[key]
+            self._lease_keys.pop(lease.target, None)
             return self._lease_snapshot(state, active=False)
 
 
@@ -1563,12 +1696,7 @@ class OutputTransaction:
                 raise replace_error.with_traceback(replace_error.__traceback__)
             if attempt == attempts:
                 raise PermissionError(
-                    f"could not stage '{self._admission.target}' for replacement: "
-                    "the file is held open by another program (on Windows an "
-                    "open handle blocks the rename, including antivirus, search "
-                    "indexing, a preview pane or another SMB client). The exact "
-                    "existing file was left untouched; stop the other program "
-                    "and retry."
+                    _held_open_message(self._admission.target, "stage")
                 ) from replace_error
             time.sleep(max(0.0, float(_REPLACE_RETRY_DELAY_S)))
 

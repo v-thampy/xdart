@@ -591,8 +591,14 @@ class WorkspaceOperationOwner:
             state.identity,
             state.stamp,
         )
+        # UNREACHABLE SINCE 2026-09-04, and kept honest anyway.  Nothing
+        # produces ALREADY_COMMITTED now that an occupied slot is replaced
+        # rather than reused, but a lying string in a dead branch is still a
+        # lying string the next reader has to disbelieve.  The enum member and
+        # its consumers are retired with the rest of the dead reuse machinery
+        # (item 7), not mid-packet.
         action = (
-            "reused the existing exact version"
+            "replaced the existing version"
             if result.disposition == "ALREADY_COMMITTED"
             else "published a new version"
         )

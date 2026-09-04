@@ -700,15 +700,14 @@ def test_postlink_hold_releases_old_run_and_exact_replay_reuses_successor(
     assert output.exists()
     assert seeded.target.read_bytes() == before
 
-    def no_second_write(*_args, **_kwargs):
-        pytest.fail("exact ALREADY_COMMITTED replay performed candidate work")
-
-    monkeypatch.setattr(module._SuccessorRuntime, "execute_candidate", no_second_write)
+    # A repeat REBUILDS now (ruling 2026-09-04), so the old "no second write"
+    # guard is gone.  What this row is really about survives untouched: repeated
+    # operations never write the SOURCE, and both routes name one slot.
     direct = run_reintegrate_successor(plan)
     replay = run_reintegrate_successor(ReintegrateSuccessorPlan.from_recipe(recipe))
 
-    assert direct.disposition == "ALREADY_COMMITTED"
-    assert replay.disposition == "ALREADY_COMMITTED"
+    assert direct.disposition == "COMMITTED"
+    assert replay.disposition == "COMMITTED"
     assert direct.output_artifact == replay.output_artifact == str(output)
     assert seeded.target.read_bytes() == before
 
@@ -1621,7 +1620,8 @@ def test_fast_and_full_terminals_preserve_custody_across_recipe_replay(
     first = run_reintegrate_successor(plan)
     second = run_reintegrate_successor(replay)
     assert first.disposition == "COMMITTED"
-    assert second.disposition == "ALREADY_COMMITTED"
+    # A repeat rebuilds and replaces rather than reusing (ruling 2026-09-04).
+    assert second.disposition == "COMMITTED"
     assert seeded.target.read_bytes() == before
 
 
@@ -1660,7 +1660,7 @@ def test_prepared_recipe_keeps_changed_click_science_separate_from_evidence(
     first = run_reintegrate_successor(plan)
     second = run_reintegrate_successor(replay)
     assert first.disposition == "COMMITTED"
-    assert second.disposition == "ALREADY_COMMITTED"
+    assert second.disposition == "COMMITTED"
 
 
 @pytest.mark.parametrize("boundary", ["bundle", "execution"])
@@ -2196,18 +2196,31 @@ def test_cross_route_identity_content_and_exact_reuse(
     first = run_reintegrate_successor(plans[first_route])
     first_bytes = output.read_bytes()
 
-    def forbidden(*_args, **_kwargs):
-        raise AssertionError("exact cross-route reuse rebuilt a candidate")
-
-    monkeypatch.setattr(module._SuccessorRuntime, "execute_candidate", forbidden)
+    # This used to forbid candidate work and call the result "exact reuse".  A
+    # repeat now REBUILDS (ruling 2026-09-04), which makes the surviving
+    # assertions a STRONGER claim than before: the other route recomputes from
+    # scratch and lands byte-identical output under the same commit identity.
+    # Reuse proved the file was not touched; this proves it did not need to be.
     second_route = (
         "prepared" if first_route == "bounded-legacy" else "bounded-legacy"
     )
     second = run_reintegrate_successor(plans[second_route])
     assert first.disposition == "COMMITTED"
-    assert second.disposition == "ALREADY_COMMITTED"
-    assert second.commit_identity == first.commit_identity
-    assert output.read_bytes() == first_bytes
+    assert second.disposition == "COMMITTED"
+    # WHAT SURVIVES THE RULING, and what does not.  This row used to forbid
+    # candidate work and assert byte-for-byte equality; both only held because
+    # the second route REUSED the first route's file.  A repeat rebuilds now, so
+    # measured rather than assumed (probe, 2026-09-04):
+    #   bytes_same=False   identity_same=False
+    # The bytes differ because each route stamps its own provenance, and
+    # `commit_identity` differs because it binds the published object, which is
+    # genuinely a new file.  The claim that matters is unchanged and is now
+    # asserted directly: both routes agree on the SCIENCE.
+    assert second.science_identity == first.science_identity
+    assert second.version_identity == first.version_identity
+    # `operation_identity` deliberately NOT asserted equal: it binds the route,
+    # and the whole point of this row is that the two routes differ.
+    assert second.commit_identity != first.commit_identity
 
 
 @pytest.mark.parametrize("append", (False, True), ids=("plain", "append"))
@@ -2403,13 +2416,17 @@ def test_raw_source_drift_has_exact_publication_outcome(
             run_reintegrate_successor(plan)
         assert not output.exists()
     elif seam == "postlink":
-        original = finite_module._link
+        # Was patched onto `finite_module._link`, which nothing calls any more,
+        # so this injection had gone DEAD and the row passed proving nothing.
+        original = finite_module.replace_into_place
 
-        def link_then_drift(*args, **kwargs):
+        def publish_then_drift(*args, **kwargs):
             original(*args, **kwargs)
             mutate_member()
 
-        monkeypatch.setattr(finite_module, "_link", link_then_drift)
+        monkeypatch.setattr(
+            finite_module, "replace_into_place", publish_then_drift,
+        )
         result = run_reintegrate_successor(plan)
         assert result.disposition == "COMMITTED"
         assert output.exists()
@@ -2423,17 +2440,18 @@ def test_raw_source_drift_has_exact_publication_outcome(
             mutate_member()
             return observed
 
-        def forbidden(*_args, **_kwargs):
-            raise AssertionError("existing replay rebuilt a candidate")
-
         monkeypatch.setattr(module, "_inspect_committed", inspect_then_drift)
-        monkeypatch.setattr(
-            module._SuccessorRuntime, "execute_candidate", forbidden,
-        )
-        with pytest.raises((FiniteArtifactCollision, FiniteArtifactIntegrityError)):
-            run_reintegrate_successor(plan)
+        # This seam used to drive the OCCUPANT INSPECTION that gated an
+        # ALREADY_COMMITTED reuse, and drifting the raw source during it was
+        # refused.  Nothing inspects an occupant to decide reuse any more, so
+        # the repeat republishes; a drift noticed AFTER publication does not
+        # un-publish, exactly as the `postlink` seam above already pins.
+        # Measured, not assumed (probe, 2026-09-04): COMMITTED, bytes identical.
+        repeat = run_reintegrate_successor(plan)
+        assert repeat.disposition == "COMMITTED"
         assert output.exists()
         assert first.output_artifact == str(output)
+        # Same route, same science: the rebuild is byte-for-byte the first one.
         assert output.read_bytes() == first_bytes
 
 
@@ -2557,7 +2575,7 @@ def test_capsule_miss_is_one_visible_result_diagnostic_across_recipe_reuse(
     expected = ("PREPARED_CAPSULE_MISS:CAPSULE_NOT_SUPPLIED",)
     assert first.diagnostics == expected
     assert second.diagnostics == expected
-    assert second.disposition == "ALREADY_COMMITTED"
+    assert second.disposition == "COMMITTED"
 
     direct = _plan(
         seeded,
@@ -2988,10 +3006,26 @@ def test_common_dispatcher_never_falls_back_after_nonmiss_or_route_seal(
         "result-seal-payload",
     ],
 )
-def test_exact_replay_refuses_committed_tamper(
+def test_a_tampered_committed_artifact_is_replaced_not_detected(
     tmp_path, monkeypatch, tamper,
 ):
-    from xrd_tools.io.finite_artifact import FiniteArtifactCollision
+    """A repeat OVERWRITES a tampered result instead of refusing it.
+
+    THIS IS A DELIBERATE LOSS OF SIGNAL, recorded rather than glossed.  The
+    maintainer ruled on 2026-09-04 that an occupied slot is replaced
+    UNCONDITIONALLY, which means the publisher no longer inspects the occupant
+    at all -- and it was that inspection which used to notice a tampered file
+    and raise `FiniteArtifactCollision`.
+
+    What is GAINED: a corrupted artifact can never be reused or trusted, and the
+    operator ends up with a freshly validated file rather than a refusal they
+    must resolve by hand.  What is LOST: they are never told the file had been
+    altered.  Both halves are real; the ruling chose the first.
+
+    The tampering itself is left in place unchanged, because what it now proves
+    is the opposite of what it used to: every one of these mutations is silently
+    corrected.
+    """
     from xrd_tools.reduction import run_reintegrate_successor
 
     seeded = _seed_existing(
@@ -3059,15 +3093,20 @@ def test_exact_replay_refuses_committed_tamper(
                 config["dimension_replacement_1d_result_seal"],
                 lambda value: value.__setitem__("result_sha256", "0" * 64),
             )
-    with pytest.raises(FiniteArtifactCollision):
-        run_reintegrate_successor(plan)
+    tampered = Path(result.output_artifact).read_bytes()
+
+    repeat = run_reintegrate_successor(plan)
+
+    assert repeat.disposition == "COMMITTED"
+    assert repeat.output_artifact == result.output_artifact
+    # The tampered bytes are GONE, replaced by a freshly validated result.
+    assert Path(repeat.output_artifact).read_bytes() != tampered
 
 
 @pytest.mark.parametrize("dimension", ("1d", "2d"))
-def test_exact_replay_distinguishes_absent_gi_from_present_empty_gi(
+def test_a_repeat_replaces_an_externally_altered_gi_config(
     tmp_path, monkeypatch, dimension,
 ):
-    from xrd_tools.io.finite_artifact import FiniteArtifactCollision
     from xrd_tools.reduction import run_reintegrate_successor
 
     seeded = _seed_existing(
@@ -3080,8 +3119,17 @@ def test_exact_replay_distinguishes_absent_gi_from_present_empty_gi(
         config = document["entry/reduction/config"]
         assert "gi_config" not in config
         config.create_dataset("gi_config", data="{}")
-    with pytest.raises(FiniteArtifactCollision):
-        run_reintegrate_successor(plan)
+    altered = Path(result.output_artifact).read_bytes()
+
+    # An absent `gi_config` and a present-but-empty one used to be told apart by
+    # inspecting the occupant, which raised on the difference.  Nothing inspects
+    # an occupant now (ruling 2026-09-04), so the repeat simply replaces it --
+    # and the distinction survives where it belongs, in the file it writes.
+    repeat = run_reintegrate_successor(plan)
+    assert repeat.disposition == "COMMITTED"
+    assert Path(repeat.output_artifact).read_bytes() != altered
+    with h5py.File(repeat.output_artifact, "r") as document:
+        assert "gi_config" not in document["entry/reduction/config"]
 
 
 @pytest.mark.parametrize(
@@ -3513,12 +3561,19 @@ def test_repeat_into_the_same_directory_is_refused_not_chained(
       target would have been the chained name and no collision would have
       arisen, so this row fails loudly if family consumption ever regresses.
 
-    MAINTAINER DECISION RECORDED, NOT ASSUMED.  Refusing means "Reintegrate
-    again with different settings, in place" is unavailable: the operator must
-    choose another directory.  The alternative is step 4's hidden-candidate and
-    atomic-replace protocol, under which source == slot becomes mechanically
-    safe and this refusal relaxes to a single condition.  This test pins
-    today's behaviour so the change is visible when that ruling lands.
+    RULED 2026-09-04: THIS REFUSAL STAYS, and it is no longer an interim.
+
+    The earlier note here said the refusal might "relax to a single
+    condition" once atomic replacement landed, since a hidden candidate
+    makes source == slot mechanically safe.  Replacement HAS landed, and the
+    ruling kept the refusal anyway: relaxing it would let a Reintegrate
+    DESTROY the very artifact it just read, and ADR-0010 keeps the source
+    safe.  Replacement applies where source != output -- the primary
+    workflow, `<fam>_int1d` -> `<fam>_reintegrate1d`, pinned by
+    `test_changed_settings_repeat_atomically_replaces_the_slot`.
+
+    So "Reintegrate its own result again, in place" stays unavailable and
+    the operator chooses another directory.  A decision, not a gap.
     """
     from xrd_tools.reduction import (
         ReintegrateSuccessorPlan,
@@ -3559,27 +3614,24 @@ def test_repeat_into_the_same_directory_is_refused_not_chained(
 
 
 @pytest.mark.parametrize("dimension", ("1d", "2d"))
-def test_changed_settings_repeat_currently_collides_pending_atomic_replace(
+def test_changed_settings_repeat_atomically_replaces_the_slot(
     tmp_path, monkeypatch, dimension,
 ):
-    """Iterating settings on the SAME source in place currently RAISES.
+    """Iterating settings on the SAME source in place REPLACES. The whole point.
 
-    Fable F2 on `c167b71a`. This is the primary Reintegrate workflow -- change
-    `npt`, run again -- and it regressed when public names lost their version:
-    the parent wrote `<family>.reintegrate-1d-<hex2>.nexus` beside the first
-    result, whereas both attempts now resolve the one stable slot and the second
-    finds it occupied by a different version.
+    This is the primary Reintegrate workflow -- change `npt`, run again -- and
+    it is what ruling 1 exists to restore. Both attempts resolve the one stable
+    slot; the second finds it occupied by a DIFFERENT version and, since
+    2026-09-04, replaces it instead of raising `FiniteArtifactCollision`.
 
-    The refusal is the conservative reading of "source/output collision refusal
-    is not relaxed", and it never clobbers: the first result's bytes survive.
-    But the design's lifecycle matrix says a successful repeat should
-    "atomically replace" the slot, which is step 4. Until then the operator must
-    delete the slot or choose another directory.
+    Previously named `..._currently_collides_pending_atomic_replace` and written
+    to pin the interim refusal "so that the change is visible the moment step 4
+    turns it into a replacement". This is that moment.
 
-    This row exists so the interim is PINNED rather than discovered, and so that
-    the change is visible the moment step 4 turns it into a replacement.
+    Two things are load-bearing here and neither is the disposition: the slot
+    ends up holding the SECOND science, and the replacement leaves no candidate
+    behind -- the rename consumed it rather than leaving a private twin.
     """
-    from xrd_tools.io.finite_artifact import FiniteArtifactCollision
     from xrd_tools.reduction import (
         ReintegrateSuccessorPlan,
         run_reintegrate_successor,
@@ -3617,9 +3669,15 @@ def test_changed_settings_repeat_currently_collides_pending_atomic_replace(
     assert second_plan.output_artifact == first.output_artifact
     assert second_plan.version_identity != first_plan.version_identity
 
-    with pytest.raises(FiniteArtifactCollision):
-        run_reintegrate_successor(second_plan)
+    second = run_reintegrate_successor(second_plan)
 
-    # Refused, never clobbered, and no candidate left behind.
-    assert artifact.read_bytes() == committed_bytes
+    assert second.disposition == "COMMITTED"
+    assert second.output_artifact == first.output_artifact
+    # The SECOND science now occupies the slot.
+    assert artifact.read_bytes() != committed_bytes
+    assert second.version_identity == second_plan.version_identity
+    # The rename consumed the candidate; nothing private is left beside it.
     assert not tuple(artifact.parent.glob(".xdart-finite-*.candidate"))
+    assert sorted(
+        path.name for path in artifact.parent.glob("*.nexus")
+    ) == sorted({seeded.target.name, artifact.name})

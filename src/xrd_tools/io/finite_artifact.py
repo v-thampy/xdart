@@ -35,6 +35,7 @@ from xrd_tools.io.output_path import (
 from xrd_tools.io.output_transaction import (
     StreamTerminal,
     get_output_transaction_coordinator,
+    replace_into_place,
     revalidate_stream_terminal,
 )
 
@@ -70,7 +71,6 @@ FINITE_SLOT_LEASE_WARNING = "finite-slot-lease-release-failed"
 FINITE_DESCRIPTOR_CLOSE_WARNING = "FINITE_DESCRIPTOR_CLOSE_INCOMPLETE"
 
 # Narrow deterministic fault seams.  Production uses the standard library.
-_link = os.link
 _fsync = os.fsync
 
 
@@ -2644,6 +2644,7 @@ class FiniteArtifactPublisher:
             diagnostics: list[str] = []
             hidden_orphan: str | None = None
             own_link_observed = False
+            candidate_consumed = False
             parent_closed = False
 
             def close_parent(primary: BaseException | None = None) -> None:
@@ -2660,6 +2661,20 @@ class FiniteArtifactPublisher:
                     diagnostics.append(_bounded_diagnostic(
                         FINITE_SLOT_LEASE_WARNING, slot_error,
                     ))
+                    if primary is not None:
+                        # Codex F2 on `da228738`.  The `diagnostics` list only
+                        # reaches the caller through a RESULT object, and a
+                        # pre-publication failure re-raises the primary error
+                        # instead of returning one -- so the warning was
+                        # appended to a list nobody would ever read.  Attach it
+                        # to the exception, exactly as a descriptor-close
+                        # failure already does.
+                        try:
+                            primary.add_note(_bounded_diagnostic(
+                                FINITE_SLOT_LEASE_WARNING, slot_error,
+                            ))
+                        except BaseException:
+                            pass
                 close_error = _close_descriptor_once(parent_descriptor)
                 if close_error is None:
                     return
@@ -2705,54 +2720,15 @@ class FiniteArtifactPublisher:
                     )
                 if self._cancelled():
                     return cleanup_result(FiniteArtifactDisposition.ABORTED)
-                try:
-                    existing = _try_observe_at(
-                        parent_descriptor,
-                        target.name,
-                        target,
-                    )
-                except FiniteArtifactIntegrityError as observation_error:
-                    try:
-                        os.stat(
-                            target.name,
-                            dir_fd=parent_descriptor,
-                            follow_symlinks=False,
-                        )
-                    except FileNotFoundError:
-                        raise observation_error
-                    raise FiniteArtifactCollision(
-                        "finite publication found a foreign public occupant"
-                    ) from observation_error
-                if existing is not None:
-                    terminal = self._inspect_exact(
-                        target,
-                        inspect_committed,
-                        parent_descriptor=parent_descriptor,
-                        parent_state=parent_state,
-                        collision=True,
-                    )
-                    if self._cancelled():
-                        return cleanup_result(
-                            FiniteArtifactDisposition.ABORTED
-                        )
-                    if prepublish is not None:
-                        prepublish()
-                    self._require_request_source()
-                    if seed is not None and _require_source(seed) != request_source:
-                        raise FiniteArtifactIntegrityError(
-                            "finite seed admission changed during committed reuse"
-                        )
-                    if self._cancelled():
-                        return cleanup_result(
-                            FiniteArtifactDisposition.ABORTED
-                        )
-                    close_parent()
-                    return self._result(
-                        FiniteArtifactDisposition.ALREADY_COMMITTED,
-                        terminal=terminal,
-                        seed_receipt=None,
-                        diagnostics=tuple(diagnostics),
-                    )
+                # NO OCCUPANT EARLY EXIT.  This used to observe the slot
+                # first and, if anything was there, inspect it and return
+                # ALREADY_COMMITTED without building a candidate at all -- so a
+                # repeat DISCARDED its own newly computed science and kept the
+                # older file.  That is what made "change npt and Reintegrate
+                # again" impossible in place, and it is what the maintainer's
+                # ruling of 2026-09-04 overturns.  The slot is now always built
+                # and always replaced; the H23 hold taken above is what keeps a
+                # CONCURRENT operation out, which the no-clobber link used to do.
                 if self._cancelled():
                     return cleanup_result(FiniteArtifactDisposition.ABORTED)
 
@@ -2869,21 +2845,34 @@ class FiniteArtifactPublisher:
                     return cleanup_result(FiniteArtifactDisposition.ABORTED)
                 link_error: BaseException | None = None
                 try:
-                    _link(
+                    # ATOMIC REPLACEMENT (ADR-0010; maintainer ruling
+                    # 2026-09-04).  Was a NO-CLOBBER link, so an occupied slot
+                    # kept the OLD file and discarded newly validated science.
+                    # `os.replace` is atomic on POSIX and Windows, so the prior
+                    # slot stays whole and visible right up to this instant.
+                    #
+                    # UNCONDITIONAL, as ruled: the slot name is fully determined
+                    # by family plus operation, so an occupant is by definition
+                    # this operation's own output.  A hand-placed file at that
+                    # name IS destroyed -- an accepted consequence.  The
+                    # CONCURRENT case is guarded by the H23 hold, not by this
+                    # syscall.
+                    replace_into_place(
                         candidate.name,
                         target.name,
+                        verb="publish",
                         src_dir_fd=parent_descriptor,
                         dst_dir_fd=parent_descriptor,
-                        follow_symlinks=False,
                     )
                 except BaseException as error:
                     link_error = error
                 else:
-                    # A successful no-clobber link syscall is already the
-                    # public visibility point.  Later namespace inspection may
-                    # fail, but accounting must retain HELD state rather than
-                    # treating the visible effect as a pre-link abort.
+                    # The rename is the public visibility point AND it consumed
+                    # the candidate name.  Later namespace inspection may fail,
+                    # but accounting must retain HELD state rather than treating
+                    # a visible effect as a pre-publication abort.
                     own_link_observed = True
+                    candidate_consumed = True
                 try:
                     final_state = _try_observe_at(
                         parent_descriptor,
@@ -2899,14 +2888,13 @@ class FiniteArtifactPublisher:
                         )
                     except FileNotFoundError:
                         raise observation_error
-                    if (
-                        link_error is not None
-                        and not isinstance(link_error, FileExistsError)
-                    ):
-                        # The no-clobber syscall may have installed the link
-                        # before reporting failure.  An occupied final plus an
-                        # unavailable exact observation is therefore an
-                        # unresolved public effect, never proven pre-link abort.
+                    if link_error is not None:
+                        # The rename may have landed before reporting failure.
+                        # An occupied final name plus an unavailable exact
+                        # observation is therefore an unresolved public effect,
+                        # never a proven pre-publication abort.  The old
+                        # `FileExistsError` exemption is gone with the
+                        # no-clobber link: `os.replace` cannot raise it.
                         own_link_observed = True
                     raise FiniteArtifactCollision(
                         "finite publication found a foreign public occupant"
@@ -2923,19 +2911,39 @@ class FiniteArtifactPublisher:
                 ):
                     disposition = FiniteArtifactDisposition.COMMITTED
                     own_link_observed = True
-                elif final_state is not None:
-                    disposition = FiniteArtifactDisposition.ALREADY_COMMITTED
                 elif link_error is not None:
+                    # The rename FAILED.  Whatever occupies the slot is the
+                    # prior file, exactly as ADR-0010 promises, so this is that
+                    # failure and not a foreign writer.  Ordered before the
+                    # branch below: reversed, a failed rename over an existing
+                    # slot reported "changed under an exclusive hold" and buried
+                    # the real cause.
                     raise link_error.with_traceback(link_error.__traceback__)
+                elif final_state is not None:
+                    # The rename reported success and yet the slot is not our
+                    # inode: something outside this process wrote it in between.
+                    # Under the H23 hold no xdart operation can, so this is an
+                    # integrity failure -- NOT the old "already committed, reuse
+                    # it" reading, which only made sense when a no-clobber link
+                    # could legitimately lose a race.
+                    raise FiniteArtifactIntegrityError(
+                        "finite slot changed under an exclusive hold"
+                    )
                 else:
                     raise FiniteArtifactIntegrityError(
                         "finite publication effect cannot be established"
                     )
-                hidden_orphan, cleanup_error = self._cleanup(
-                    parent_descriptor,
-                    candidate,
-                    validated.snapshot,
-                )
+                if candidate_consumed:
+                    # Nothing left to unlink: the rename moved the candidate ONTO
+                    # the slot.  Asking anyway raises FileNotFoundError and hangs
+                    # a spurious cleanup warning off a clean publication.
+                    hidden_orphan, cleanup_error = None, None
+                else:
+                    hidden_orphan, cleanup_error = self._cleanup(
+                        parent_descriptor,
+                        candidate,
+                        validated.snapshot,
+                    )
                 if cleanup_error is not None:
                     diagnostics.append(_bounded_diagnostic(
                         FINITE_CANDIDATE_CLEANUP_WARNING, cleanup_error
@@ -2983,7 +2991,11 @@ class FiniteArtifactPublisher:
                     diagnostics=tuple(diagnostics),
                 )
             except BaseException as primary:
-                if candidate is not None and reservation is not None:
+                if (
+                    candidate is not None
+                    and reservation is not None
+                    and not candidate_consumed
+                ):
                     retry_hidden, cleanup_error = self._cleanup(
                         parent_descriptor,
                         candidate,

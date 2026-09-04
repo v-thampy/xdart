@@ -658,9 +658,16 @@ def test_seeded_adapter_receives_only_publisher_owned_copy_binding(
         seed=admitted,
         accept_validated_commit=accepted.append,
     )
-    assert replay.disposition is FiniteArtifactDisposition.ALREADY_COMMITTED
-    assert inspected == [Path(request.output_artifact)]
-    assert len(accepted) == 1
+    # A repeat REBUILDS and replaces (ruling 2026-09-04); it no longer short
+    # circuits to ALREADY_COMMITTED on finding the slot occupied.
+    assert replay.disposition is FiniteArtifactDisposition.COMMITTED
+    # NOT inspected.  The replay is a fresh, validated commit accepted through
+    # the seeded shortcut, so it takes `_accept_validated_own_link`.  Previously
+    # it found the slot occupied, returned ALREADY_COMMITTED and had to INSPECT
+    # someone else's file to describe it -- the publisher no longer reads an
+    # occupant at all, which is why this list is empty.
+    assert inspected == []
+    assert len(accepted) == 2
     with pytest.raises(TypeError, match="factory-owned"):
         replace(result.seed_receipt)
     with pytest.raises(TypeError, match="publisher-owned"):
@@ -866,16 +873,20 @@ def test_validated_commit_keeps_an_observed_own_link(
     request = _request(tmp_path, source)
     token = threading.Event()
     accepted: list[FiniteCandidateValidation] = []
-    link = finite_module._link
+    # Patched onto `replace_into_place`, not `_link`: nothing calls `_link` any
+    # more, so this injection had gone DEAD and the row proved nothing.
+    publish = finite_module.replace_into_place
 
-    def link_with_late_effect(*args, **kwargs):
-        link(*args, **kwargs)
+    def publish_with_late_effect(*args, **kwargs):
+        publish(*args, **kwargs)
         if late_effect == "stop":
             token.set()
         else:
-            raise OSError("uncertain after exact link")
+            raise OSError("uncertain after exact publication")
 
-    monkeypatch.setattr(finite_module, "_link", link_with_late_effect)
+    monkeypatch.setattr(
+        finite_module, "replace_into_place", publish_with_late_effect,
+    )
     result = _publish_validated_seed(
         request,
         admitted,
@@ -1072,7 +1083,10 @@ def test_prepublish_failures_preserve_primary_source_and_absent_final(
     (
         "changed-before-publish",
         "changed-without-seed-before-link",
-        "changed-during-existing-inspection",
+        # "changed-during-existing-inspection" REMOVED: it drove the occupant
+        # inspection that ran before an ALREADY_COMMITTED reuse, and under
+        # unconditional replacement the publisher never inspects an occupant.
+        # The seam is gone, so the row would have asserted nothing.
     ),
 )
 def test_request_source_snapshot_is_revalidated_without_rehashing(
@@ -1085,23 +1099,6 @@ def test_request_source_snapshot_is_revalidated_without_rehashing(
     request = _request(tmp_path, source, admission=admitted)
     calls: list[str] = []
     seed = None
-
-    if seam == "changed-during-existing-inspection":
-        _publish(request)
-
-        def inspect(path, selected):
-            terminal = _inspect_payload(path, selected)
-            source.write_bytes(b"changed during inspection")
-            return terminal
-
-        with pytest.raises(
-            FiniteArtifactIntegrityError,
-            match="request source changed",
-        ):
-            _publish(request, inspect_committed=inspect)
-        assert Path(request.output_artifact).exists()
-        assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
-        return
 
     if seam == "changed-before-publish":
         source.write_bytes(b"later source")
@@ -1137,9 +1134,21 @@ def test_request_source_snapshot_is_revalidated_without_rehashing(
     assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
 
 
-def test_existing_exact_result_is_reused_without_writer_or_validation_work(
+def test_an_identical_repeat_rebuilds_and_replaces_rather_than_reusing(
     tmp_path: Path,
 ) -> None:
+    """A second identical publication does the work again and replaces.
+
+    MAINTAINER RULING 2026-09-04, recorded here rather than assumed: an occupied
+    slot is replaced UNCONDITIONALLY, and an IDENTICAL repeat replaces too --
+    there is no no-op fast path.  The publisher no longer inspects the occupant
+    at all, so it cannot be fooled by one; the CONCURRENT case is held off by
+    the H23 slot hold instead of by a no-clobber link.
+
+    This row previously asserted the opposite -- that the writer and validator
+    were NOT replayed and the inode was unchanged.  That was the no-op fast
+    path, and pinning its removal is the point of this row.
+    """
     source = tmp_path / "source.nexus"
     source.write_bytes(b"source")
     request = _request(tmp_path, source)
@@ -1147,33 +1156,52 @@ def test_existing_exact_result_is_reused_without_writer_or_validation_work(
     before = Path(request.output_artifact).stat()
     calls: list[str] = []
 
-    def forbidden(_binding) -> None:
-        calls.append("work")
-        raise AssertionError("writer/validator replayed")
+    def counted_write(binding: FiniteCandidateBinding) -> None:
+        calls.append("write")
+        _write_payload(request)(binding)
 
-    second = FiniteArtifactPublisher(request).publish(
-        FiniteDocumentAdapter(
-            lambda binding: nullcontext(binding),
-            forbidden,
-            lambda binding: nullcontext(binding),
-            forbidden,
-        ),
-        inspect_committed=_inspect_payload,
-    )
+    def counted_validate(binding):
+        calls.append("validate")
+        # MUST return the validation: it is what proves exact lineage.
+        return _validate_payload(request)(binding)
+
+    second = _publish(request, writer=counted_write, validate=counted_validate)
     after = Path(request.output_artifact).stat()
+
     assert first.disposition is FiniteArtifactDisposition.COMMITTED
-    assert second.disposition is FiniteArtifactDisposition.ALREADY_COMMITTED
-    assert calls == []
-    assert (before.st_dev, before.st_ino, before.st_mtime_ns) == (
-        after.st_dev, after.st_ino, after.st_mtime_ns
-    )
+    assert second.disposition is FiniteArtifactDisposition.COMMITTED
+    # The work IS redone...
+    assert calls == ["write", "validate"]
+    # ...and a genuinely different file now occupies the slot.
+    assert (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+    assert Path(request.output_artifact).read_bytes() == _payload(request)
 
 
 @pytest.mark.parametrize("occupant", ("foreign", "symlink", "short-tag-collision"))
-def test_existing_foreign_or_mismatched_occupant_is_preserved(
+def test_an_existing_foreign_or_mismatched_occupant_is_replaced(
     tmp_path: Path,
     occupant: str,
 ) -> None:
+    """Whatever sits at the slot is replaced.  This is the data-loss boundary.
+
+    MAINTAINER RULING 2026-09-04, recorded here rather than assumed: an occupied
+    slot is replaced UNCONDITIONALLY, and an IDENTICAL repeat replaces too --
+    there is no no-op fast path.  The publisher no longer inspects the occupant
+    at all, so it cannot be fooled by one; the CONCURRENT case is held off by
+    the H23 slot hold instead of by a no-clobber link.
+
+    Pinned per occupant, because each says something different:
+
+    * `foreign` -- a hand-placed file at the slot name IS DESTROYED.  That is
+      the accepted cost of the unconditional rule and it should be visible in a
+      test rather than discovered in a folder.
+    * `symlink` -- `os.replace` replaces the LINK, not what it points at, so the
+      referent survives untouched.  A real safety property that the ruling does
+      not change.
+    * `short-tag-collision` -- a version-mismatched occupant.  This is exactly
+      the "change npt and run again" workflow, which used to raise
+      `FiniteArtifactCollision` and now simply succeeds.
+    """
     source = tmp_path / "source.nexus"
     source.write_bytes(b"source")
     request = _request(tmp_path, source)
@@ -1189,62 +1217,74 @@ def test_existing_foreign_or_mismatched_occupant_is_preserved(
     else:
         target.write_bytes(b"foreign")
 
-    with pytest.raises(FiniteArtifactCollision):
-        _publish(request)
+    result = _publish(request)
+
+    assert result.disposition is FiniteArtifactDisposition.COMMITTED
+    assert target.read_bytes() == _payload(request)
+    assert not target.is_symlink()
+    # `os.replace` onto a symlink consumes the LINK; the referent is untouched.
     assert foreign.read_bytes() == b"foreign"
-    assert os.path.lexists(target)
 
 
-@pytest.mark.parametrize(
-    "link_fault", ("before", "after", "exact-winner", "foreign", "symlink")
-)
-def test_no_clobber_link_resolution_never_deletes_a_public_occupant(
+@pytest.mark.parametrize("fault", ("before", "after"))
+def test_a_failed_replacement_leaves_the_prior_slot_whole(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    link_fault: str,
+    fault: str,
 ) -> None:
+    """The ADR guarantee: the prior slot is untouched until the rename lands.
+
+    This replaced a row that injected faults into `finite_module._link`.  That
+    function is no longer called, so every one of those injections had become
+    DEAD -- the test still passed, but proved nothing.  A monkeypatch that never
+    fires is worse than a red test, so the fault now targets the seam that
+    actually exists.
+
+    Its `exact-winner`, `foreign` and `symlink` cases are gone with the
+    no-clobber semantics: under unconditional replacement there is no loser to
+    observe an occupant.  Replacement of an occupant is pinned by
+    `test_an_existing_foreign_or_mismatched_occupant_is_replaced`.
+    """
     source = tmp_path / "source.nexus"
     source.write_bytes(b"source")
     request = _request(tmp_path, source)
     target = Path(request.output_artifact)
-    real_link = finite_module._link
 
-    def fault(source_path, destination_path, **kwargs):
-        if link_fault == "after":
-            real_link(source_path, destination_path, **kwargs)
-            raise OSError("uncertain after link")
-        if link_fault == "exact-winner":
-            target.write_bytes(_payload(request))
-            raise FileExistsError(target)
-        if link_fault == "foreign":
-            target.write_bytes(b"foreign winner")
-            raise FileExistsError(target)
-        if link_fault == "symlink":
-            target.symlink_to(source)
-            raise FileExistsError(target)
-        raise OSError("known before link")
+    # A prior result really occupying the slot, so "untouched" is observable.
+    _publish(request)
+    prior_bytes = target.read_bytes()
+    prior = target.stat()
 
-    monkeypatch.setattr(finite_module, "_link", fault)
-    if link_fault == "after":
-        result = _publish(request)
-        assert result.disposition is FiniteArtifactDisposition.COMMITTED
-        assert target.read_bytes() == _payload(request)
-    elif link_fault == "exact-winner":
-        result = _publish(request)
-        assert result.disposition is FiniteArtifactDisposition.ALREADY_COMMITTED
-        assert target.read_bytes() == _payload(request)
-    elif link_fault in {"foreign", "symlink"}:
-        with pytest.raises(FiniteArtifactCollision):
-            _publish(request)
-        assert os.path.lexists(target)
-        if link_fault == "foreign":
-            assert target.read_bytes() == b"foreign winner"
-        else:
-            assert target.is_symlink()
-    else:
+    real_replace = finite_module.replace_into_place
+
+    def faulty(*args, **kwargs):
+        if fault == "after":
+            real_replace(*args, **kwargs)
+            raise OSError("uncertain after rename")
+        raise OSError("known before rename")
+
+    monkeypatch.setattr(finite_module, "replace_into_place", faulty)
+
+    if fault == "before":
+        # No effect reached the slot: the PRIOR file is still exactly there.
         with pytest.raises(OSError, match="known before"):
             _publish(request)
-        assert not target.exists()
+        after = target.stat()
+        assert target.read_bytes() == prior_bytes
+        assert (after.st_dev, after.st_ino) == (prior.st_dev, prior.st_ino)
+        return
+
+    # The rename DID land and then reported failure.  The observation shows our
+    # exact inode, so the effect is proven ours and the publication COMMITS --
+    # a spurious error after a verified rename must not be re-read as a
+    # pre-publication abort.  (Same expectation the old no-clobber row had for
+    # its "after" fault; only the injected seam moved.)
+    result = _publish(request)
+    assert result.disposition is FiniteArtifactDisposition.COMMITTED
+    assert target.read_bytes() == _payload(request)
+    assert (target.stat().st_dev, target.stat().st_ino) != (
+        prior.st_dev, prior.st_ino
+    )
 
 
 def test_own_link_commits_and_fsyncs_if_private_alias_disappears(
@@ -1254,19 +1294,17 @@ def test_own_link_commits_and_fsyncs_if_private_alias_disappears(
     source = tmp_path / "source.nexus"
     source.write_bytes(b"source")
     request = _request(tmp_path, source)
-    real_link = finite_module._link
     real_parent_fsync = finite_module._fsync_parent
     fsync_calls: list[int] = []
-
-    def link_then_remove(source_name, target_name, **kwargs):
-        real_link(source_name, target_name, **kwargs)
-        os.unlink(source_name, dir_fd=kwargs["src_dir_fd"])
 
     def observed_fsync(descriptor: int) -> None:
         fsync_calls.append(descriptor)
         real_parent_fsync(descriptor)
 
-    monkeypatch.setattr(finite_module, "_link", link_then_remove)
+    # No injection needed any more.  This row used to LINK and then unlink the
+    # private alias by hand, to prove the publication survives its
+    # disappearance.  `os.replace` consumes that alias as part of publishing,
+    # so the condition the row was constructing is now simply what happens.
     monkeypatch.setattr(finite_module, "_fsync_parent", observed_fsync)
     result = _publish(request)
     assert result.disposition is FiniteArtifactDisposition.COMMITTED
@@ -1413,13 +1451,16 @@ def test_linked_publication_uncertainty_is_typed_held(
             finite_module, "_try_observe_at", fail_final_observation,
         )
         if seam == "link-after-effect":
-            link = finite_module._link
+            # Seam moved with the syscall; on `_link` it no longer fired.
+            publish = finite_module.replace_into_place
 
-            def link_then_raise(*args, **kwargs):
-                link(*args, **kwargs)
-                raise OSError("uncertain after link")
+            def publish_then_raise(*args, **kwargs):
+                publish(*args, **kwargs)
+                raise OSError("uncertain after publication")
 
-            monkeypatch.setattr(finite_module, "_link", link_then_raise)
+            monkeypatch.setattr(
+                finite_module, "replace_into_place", publish_then_raise,
+            )
         action = lambda: _publish(request)
 
     with pytest.raises(FiniteArtifactPublicationHeld) as captured:
@@ -1783,10 +1824,15 @@ def test_candidate_cleanup_failure_reports_exact_hidden_orphan(
 
     monkeypatch.setattr(finite_module, "_unlink_candidate", fail_cleanup)
     if outcome == "committed":
+        # NOTHING TO STRAND.  The rename MOVED the candidate onto the slot, so
+        # there is no private name left to unlink and the injected cleanup
+        # failure is never even reached.  Under the old no-clobber link both
+        # names existed after publication and a failed unlink left an orphan.
         result = _publish(request)
         assert result.disposition is FiniteArtifactDisposition.COMMITTED
         assert Path(request.output_artifact).exists()
-        assert result.hidden_orphan == str(paths[0])
+        assert paths == []
+        assert result.hidden_orphan is None
     elif outcome == "aborted":
         token = threading.Event()
 
@@ -1811,13 +1857,11 @@ def test_candidate_cleanup_failure_reports_exact_hidden_orphan(
             _publish(request, inspect_committed=inspect)
         held = captured.value
         assert Path(request.output_artifact).exists()
-        assert held.hidden_orphan == (
-            None if outcome == "held-transient" else str(paths[0])
-        )
-        assert any(
-            "CANDIDATE_CLEANUP_INCOMPLETE" in item
-            for item in held.diagnostics
-        )
+        # Same reason as the committed branch: the rename consumed the
+        # candidate before the post-publication inspection ran, so a held
+        # failure can no longer leave one behind either.
+        assert held.hidden_orphan is None
+        assert paths == []
         result = held
     if result.hidden_orphan is not None:
         assert Path(result.hidden_orphan).exists()
@@ -1977,3 +2021,135 @@ def test_a_second_publication_into_one_slot_is_refused_while_the_first_holds_it(
         FiniteArtifactDisposition.COMMITTED,
         FiniteArtifactDisposition.ALREADY_COMMITTED,
     }
+
+
+def _directory_is_case_insensitive(root: Path) -> bool:
+    """Ask THIS filesystem rather than assuming the platform's usual answer."""
+    probe = root / "CaseProbe"
+    probe.mkdir()
+    try:
+        other = root / "caseprobe"
+        return other.exists() and os.path.samefile(probe, other)
+    finally:
+        probe.rmdir()
+
+
+def test_one_file_under_two_spellings_cannot_be_leased_twice(
+    tmp_path: Path,
+) -> None:
+    """Codex F1 on `da228738`: the lease keyed on a STRING, not on a file.
+
+    `_normalize_target` is `normcase(abspath(...))`, and on POSIX `normcase` is
+    the identity function.  So two spellings of ONE directory produced two keys
+    and two simultaneous leases.  Survivable while a no-clobber `os.link` still
+    refused the second writer; NOT survivable once replacement removes it, which
+    is why the fix ships alongside.
+
+    The registry now keys on the parent's `(st_dev, st_ino)` plus the name, so
+    aliasing collapses by IDENTITY.  No blanket lowercasing -- that would
+    conflate genuinely distinct files on a case-sensitive volume, which is why
+    the case leg below asks the filesystem first instead of assuming.
+    """
+    from xrd_tools.io.output_transaction import (
+        LeaseOwner,
+        LeaseUnavailable,
+        OwnerToken,
+        get_output_transaction_coordinator,
+    )
+
+    coordinator = get_output_transaction_coordinator()
+    real = tmp_path / "processed"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real, target_is_directory=True)
+
+    # A SYMLINKED directory is one directory.
+    hold = coordinator.hold_target(real / "slot.nexus", label="first")
+    try:
+        with pytest.raises(LeaseUnavailable):
+            coordinator.hold_target(
+                tmp_path / "link" / "slot.nexus", label="second",
+            )
+    finally:
+        coordinator.release_target(hold)
+
+    # A CASE-ALIASED directory is one directory -- where this volume says so.
+    if _directory_is_case_insensitive(tmp_path):
+        assert os.path.samefile(real, tmp_path / "PROCESSED")
+        hold = coordinator.hold_target(real / "slot.nexus", label="third")
+        try:
+            with pytest.raises(LeaseUnavailable):
+                coordinator.hold_target(
+                    tmp_path / "PROCESSED" / "slot.nexus", label="fourth",
+                )
+        finally:
+            coordinator.release_target(hold)
+
+    # CROSS-MECHANISM: an ordinary Run transaction lease and a finite hold are
+    # the same exclusion. This is the property the whole ruling rests on -- a
+    # Run and a Reintegrate must not both believe they own one file.
+    transaction_owner = OwnerToken("run-transaction")
+    target_owner = OwnerToken("run-target")
+    transaction = coordinator.admit(
+        real / "shared.nexus",
+        transaction_owner=transaction_owner,
+        target_owner=target_owner,
+    )
+    # The SAME token objects must come back at release; a fresh token with an
+    # equal name is refused.
+    run_owners = {r: OwnerToken(f"run-{r.value}") for r in LeaseOwner}
+    lease = transaction.acquire_lease(
+        admission=transaction.admission,
+        transaction_owner=transaction_owner,
+        target_owner=target_owner,
+        owners=run_owners,
+    )
+    with pytest.raises(LeaseUnavailable):
+        coordinator.hold_target(
+            tmp_path / "link" / "shared.nexus", label="finite",
+        )
+    transaction.abandon(lease)
+    for role in LeaseOwner:
+        transaction.release_lease_owner(lease, role, run_owners[role])
+
+    # And a genuinely DIFFERENT file is still free: the fix excludes aliases,
+    # not neighbours.
+    free = coordinator.hold_target(real / "other.nexus", label="fifth")
+    coordinator.release_target(free)
+
+
+def test_a_failed_slot_release_is_reported_on_the_error_that_caused_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex F2 on `da228738`: the warning was appended where nobody reads it.
+
+    `diagnostics` reaches a caller only through a RESULT object.  A
+    pre-publication failure RE-RAISES instead of returning one, so a release
+    failure on that path was recorded into a list that was then discarded.  It
+    is now attached to the exception as a note, exactly as a descriptor-close
+    failure already is.
+    """
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+
+    def failing_release(_hold) -> None:
+        raise OSError("slot release denied")
+
+    def failing_writer(_binding) -> None:
+        raise ValueError("the real publication failure")
+
+    from xrd_tools.io.output_transaction import OutputTransactionCoordinator
+
+    monkeypatch.setattr(
+        OutputTransactionCoordinator,
+        "release_target",
+        lambda self, hold: failing_release(hold),
+    )
+    with pytest.raises(ValueError, match="the real publication failure") as caught:
+        _publish(request, writer=failing_writer)
+
+    # The primary error is still the one the caller came for...
+    notes = getattr(caught.value, "__notes__", [])
+    # ...and the release failure is visible ON it rather than lost.
+    assert any(finite_module.FINITE_SLOT_LEASE_WARNING in note for note in notes), notes
