@@ -67,6 +67,17 @@ def _set_average_state(
 
 def _result(disposition: str, target: str = "/detached/average.nxs") -> AverageScanResult:
     from xrd_tools.io.output_transaction import StreamTerminal
+    from xrd_tools.reduction.average import (
+        _average_output_artifact, _average_target,
+    )
+    # A real Average result NEVER names the ANCHOR.  The successor route writes
+    # <family>.average-<version>.nexus, and the page verifies a terminal by
+    # RECOMPUTING exactly that from anchor + version_identity
+    # (workspace_operations.py:719).  Returning the anchor here fabricated an
+    # impossible result that every reload path then correctly refused, so the
+    # tests were asserting refusals they had manufactured themselves.
+    version = "e" * 64
+    artifact = _average_output_artifact(_average_target(target), version)
     committed = disposition == "COMMITTED"
     evidence = (AverageFiniteCountsEvidence(
         "average_scan_v1", 2, (1, 1), "<u4", "c" * 64, 1, 2, 0,
@@ -79,8 +90,8 @@ def _result(disposition: str, target: str = "/detached/average.nxs") -> AverageS
     }
     code, diagnostic = diagnostics[disposition]
     return AverageScanResult(
-        disposition=disposition, target=target, entry="entry",
-        version_identity="e" * 64,
+        disposition=disposition, target=artifact, entry="entry",
+        version_identity=version,
         operation_identity="a" * 64, science_identity="b" * 64,
         contributor_extent=2, logical_labels=(1,),
         committed_labels=(1,) if committed else (),
@@ -88,7 +99,7 @@ def _result(disposition: str, target: str = "/detached/average.nxs") -> AverageS
         diagnostic_code=code, diagnostic=diagnostic,
         h23_phase="committed" if committed else None,
         commit_identity=(
-            StreamTerminal(target, 1, "d" * 64, 1, 1, 1, 1, 1)
+            StreamTerminal(artifact, 1, "d" * 64, 1, 1, 1, 1, 1)
             if committed else None
         ),
     )
@@ -886,13 +897,21 @@ def test_average_page_accepts_only_exact_cancelled_payload_status_pairs(
         "begin_browse",
         lambda *args, **kwargs: reloads.append((args, kwargs)),
     )
+    # _clear_terminal_browse was RELOCATED, not removed: 1e3a4a1c "Extract
+    # processed browser owner" moved it onto the browser owner as
+    # ProcessedBrowser.retire_terminal (processed_browser.py:968), which
+    # page.py:2512 calls after a successful Average reload.  Re-point the
+    # sentinel there rather than dropping the coverage.
     monkeypatch.setattr(
-        page, "_clear_terminal_browse", lambda: clears.append(None),
+        page._processed_browser,
+        "retire_terminal",
+        lambda *args, **kwargs: clears.append(None) or False,
     )
     monkeypatch.setattr(
         page, "_request_browser_catalog", lambda: catalogs.append(None),
     )
     monkeypatch.setattr(page, "_notice", notices.append)
+    terminal_owner = page._processed_browser.terminal_request
     rows = (
         (OperationTerminalStatus.CANCELLED, None, "Average cancelled."),
         (
@@ -932,6 +951,10 @@ def test_average_page_accepts_only_exact_cancelled_payload_status_pairs(
             assert notices[-1] == expected_notice
             assert page._workspace_operations.average_state is None
         assert reloads == clears == catalogs == []
+        # ...and the terminal the browser owns is untouched.  This holds on the
+        # STATE rather than on one method name, so it survives the next
+        # relocation the way the sentinel above did not.
+        assert page._processed_browser.terminal_request is terminal_owner
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
@@ -1593,6 +1616,12 @@ def test_direct_and_gui_average_match_after_fresh_reopen(tmp_path, monkeypatch) 
     gui = update.terminal.payload
     assert update.terminal.status is OperationTerminalStatus.RETURNED
     assert gui.disposition == "COMMITTED"
+    # The successor route writes <anchor stem>.average-<version>.nexus, never
+    # the anchor.  direct_target/gui_target are the REQUESTS; read the artifacts
+    # the results name.
+    direct_artifact = Path(direct.target); gui_artifact = Path(gui.target)
+    assert direct_artifact != direct_target and gui_artifact != gui_target
+    assert direct_artifact.exists() and gui_artifact.exists()
     assert direct.science_identity == gui.science_identity
     assert direct.operation_identity != gui.operation_identity
     assert direct.metadata_denominators == gui.metadata_denominators == (("I0", 2),)
@@ -1600,31 +1629,31 @@ def test_direct_and_gui_average_match_after_fresh_reopen(tmp_path, monkeypatch) 
         (get_1d, ("q", "intensity", "sigma", "q_unit", "frames")),
         (get_2d, ("q", "chi", "intensity", "q_unit", "chi_unit", "frames")),
     ):
-        direct_value = getter(direct_target, frame=1)
-        gui_value = getter(gui_target, frame=1)
+        direct_value = getter(direct_artifact, frame=1)
+        gui_value = getter(gui_artifact, frame=1)
         for name in fields_to_compare:
             left, right = getattr(direct_value, name), getattr(gui_value, name)
             if isinstance(left, np.ndarray):
                 np.testing.assert_allclose(left, right, equal_nan=True)
             else:
                 assert left == right
-    np.testing.assert_array_equal(get_average_finite_counts(direct_target).values,
-                                  get_average_finite_counts(gui_target).values)
-    assert tuple(average_module.iter_average_contributors(direct_target)) == tuple(average_module.iter_average_contributors(gui_target))
-    direct_provenance = read_provenance(direct_target)["config"]["average_scan_v1"]
-    gui_provenance = read_provenance(gui_target)["config"]["average_scan_v1"]
+    np.testing.assert_array_equal(get_average_finite_counts(direct_artifact).values,
+                                  get_average_finite_counts(gui_artifact).values)
+    assert tuple(average_module.iter_average_contributors(direct_artifact)) == tuple(average_module.iter_average_contributors(gui_artifact))
+    direct_provenance = read_provenance(direct_artifact)["config"]["average_scan_v1"]
+    gui_provenance = read_provenance(gui_artifact)["config"]["average_scan_v1"]
     operation_identities = tuple(value.pop("operation_identity") for value in (direct_provenance, gui_provenance))
     assert direct_provenance == gui_provenance
     assert operation_identities == (direct.operation_identity, gui.operation_identity)
     assert operation_identities[0] != operation_identities[1]
-    direct_scan = get_metadata(direct_target)["scan_data"]
-    gui_scan = get_metadata(gui_target)["scan_data"]
+    direct_scan = get_metadata(direct_artifact)["scan_data"]
+    gui_scan = get_metadata(gui_artifact)["scan_data"]
     assert set(direct_scan) == set(gui_scan) and "I0" in direct_scan
     for name in direct_scan:
         np.testing.assert_allclose(direct_scan[name], gui_scan[name], equal_nan=True)
     np.testing.assert_allclose(direct_scan["I0"], [1.5])
     import hashlib
-    for result, target in ((direct, direct_target), (gui, gui_target)):
+    for result, target in ((direct, direct_artifact), (gui, gui_artifact)):
         commit = result.commit_identity
         assert (commit is not None and commit.target == str(target.resolve())
                 and type(commit.ordinal) is int and commit.ordinal > 0)
@@ -1739,7 +1768,13 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
         )
 
     identity, update = scheduled(committed)
-    arm(identity, committed.target)
+    # The page's average state holds the ANCHOR, not the artifact: it verifies a
+    # terminal by RECOMPUTING the successor from anchor + version_identity
+    # (workspace_operations.py:719) and comparing against result.target.  Arming
+    # with committed.target made it derive a DOUBLE-suffixed path, so it
+    # correctly reported a mismatch and never reloaded.  Before the successor
+    # route the two were the same string, which is why this read as equivalent.
+    arm(identity)
     before_catalog = len(catalog); before_refreshes = len(refreshes)
     from xrd_tools.core import provenance as provenance_module
     def forbidden(*_args, **_kwargs):
@@ -1795,7 +1830,11 @@ def test_average_terminal_projection_preserves_typed_truth_and_reload_boundary(
         )
 
     stale, stale_update = scheduled(committed)
-    arm(stale, committed.target); before_notices = len(notices); before_catalog = len(catalog)
+    # Anchor again, not the artifact: arming with the artifact makes the
+    # target-mismatch branch fire BEFORE the stale branch, and that branch does
+    # not request a catalog -- so this asserted the wrong refusal for the wrong
+    # reason.
+    arm(stale); before_notices = len(notices); before_catalog = len(catalog)
     before_refreshes = len(refreshes)
     assert page._consume_average_update(OperationUpdate(
         stale, terminal=stale_update.terminal, stale=True,
@@ -1950,10 +1989,13 @@ def test_average_commit_reload_refusal_retains_exact_retryable_directive(
             lambda *args, **kwargs: reloads.append((args, kwargs)),
         )
         assert page._retry_pending_average_reload()
-        assert reloads == [((target,), {
+        # The reload names the ARTIFACT the result committed, not the anchor
+        # that was requested.
+        assert reloads == [((result.target,), {
             "terminal_commit_identity": result.commit_identity,
             "source_root": str(tmp_path),
         })]
+        assert result.target != target
         assert page._processed_browser.pending_average_reload is None
         assert page._workspace_operations.average_state is None
         assert not page._processed_browser.busy
@@ -2052,7 +2094,11 @@ def test_average_persists_sensor_and_parallax_detector_fields(
 
     assert result.disposition == "COMMITTED"
     assert recipe.calibration.parallax is True
-    with h5py.File(target, "r") as handle:
+    # `target` is the anchor requested; the successor route wrote
+    # result.target.  Read the artifact, not the request.
+    artifact = Path(result.target)
+    assert artifact != target and artifact.exists()
+    with h5py.File(artifact, "r") as handle:
         detector = handle["entry/instrument/detector"]
         assert detector["sensor_material"].asstr()[()] == "CdTe"
         assert float(detector["sensor_thickness"][()]) == pytest.approx(
