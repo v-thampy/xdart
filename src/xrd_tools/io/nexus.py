@@ -2400,9 +2400,16 @@ def validate_integrated_stack_write(
         # still re-validates the whole persisted index on every batch.
         if group is None:
             return
-        persisted = np.asarray(
-            group["frame_index"][()]
-        ).ravel().astype(np.int64, copy=False)
+        persisted = np.asarray(group["frame_index"][()]).ravel()
+        # One dtype check per batch, not per row.  The Python loop this replaced
+        # refused a non-integer index incidentally, because int(nan) raises;
+        # astype would instead convert NaN to 0 and could let a malformed index
+        # pass the ordering check.  Refuse explicitly and keep the strictness.
+        if persisted.dtype.kind not in "iu":
+            raise ValueError(
+                f"{group_name}/frame_index must be an integer dataset"
+            )
+        persisted = persisted.astype(np.int64, copy=False)
         if persisted.size > 1 and not bool(
             np.all(persisted[1:] > persisted[:-1])
         ):
