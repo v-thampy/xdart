@@ -2261,7 +2261,18 @@ def test_fast_regenerable_finish_skips_checkpoint_payload_scans_but_verifies_sci
     assert writer._dirty_frames == {}
     assert writer._dirty_indexed == {}
     assert writer._dirty_absent_modes == set()
-    assert recoveries == []
+    # The fast path publishes checkpoint RECOVERABILITY ("written and re-readable
+    # from the artifact") but still no DURABILITY: len(facade.durable) == 1 above
+    # proves the single durable publication happens at close, not per checkpoint.
+    # Without the recoverable projection the display store may never release a
+    # heavy payload under a live projection and memory grows with frame count.
+    # Every cost assertion above still holds: no checkpoint reads, no payload
+    # scans, no whole-file hash, no _verify_dirty_evidence.
+    assert len(recoveries) == 1
+    _checkpoint, receipts, drops, frame_labels, thumbnails = recoveries[0]
+    assert tuple(frame_labels) == (0,)
+    assert tuple(drops) == () and tuple(thumbnails) == ()
+    assert tuple(int(receipt.label) for receipt in receipts) == (0,)
     assert all(
         proof.row_count == 1
         and len(proof.sigma_presence) == 1

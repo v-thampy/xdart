@@ -5397,21 +5397,41 @@ class NexusRecordWriter:
         if batch:
             self._commit_receipts(batch)
         recover = getattr(self._facade, "commit_checkpoint_recoverable", None)
+        # A fast-regenerable checkpoint still publishes NO durability receipts:
+        # `batch` and `dropped` stay empty above, so neither commit_durable nor
+        # promote_stream_checkpoint runs and nothing is recorded durable without
+        # the readback proof this path declines (see _fast_checkpoint_evidence).
+        # It DOES hand those same staged receipts to the checkpoint-recovery
+        # route, which asserts only "written and re-readable from the artifact".
+        # Without it the display store never releases a heavy payload: under a
+        # live projection release_heavy is licensed by the recoverable set alone
+        # (frame_record_store _heavy_releasable_modes_locked), so every frame's
+        # 2-D array stayed resident and memory grew with the frame count -- about
+        # 7 GB on a 3621-frame Run against a ~64-frame cap.
+        recoverable_batch = (
+            self._current_receipts()
+            if (
+                self._fast_regenerable
+                and publish_receipts
+                and self._facade is not None
+            )
+            else batch
+        )
         checkpoint_recovered = (
-            not self._fast_regenerable
-            and checkpoint is not None
+            checkpoint is not None
             and callable(recover)
+            and (not self._fast_regenerable or bool(recoverable_batch))
         )
         if checkpoint_recovered:
             frame_labels = tuple(sorted(
                 set(frame_proofs)
                 | {
                     int(receipt.label)
-                    for receipt in (*batch, *dropped)
+                    for receipt in (*recoverable_batch, *dropped)
                 }
             ))
             recover(
-                checkpoint, batch, dropped,
+                checkpoint, recoverable_batch, dropped,
                 frame_labels,
                 tuple(label for label in frame_labels
                       if label in self._dirty_frames

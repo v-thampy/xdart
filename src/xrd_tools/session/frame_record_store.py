@@ -466,7 +466,31 @@ class FrameRecordStore:
         revisions: Mapping[_ModeKey, int], frame_verified: bool,
         thumbnail_verified: bool, verified_absent: Iterable[_ModeKey] = (),
     ) -> bool:
-        """Project a verified rollback-capable checkpoint without public truth."""
+        """Project a rollback-capable checkpoint without public truth.
+
+        This set licenses ``release_heavy`` only.  It never becomes durable or
+        persisted truth, and it is deliberately weaker than either, so it must
+        answer exactly one question: can this label's arrays be dropped and read
+        back from the artifact if the display wants them again?
+
+        Two writer paths reach it with DIFFERENT strengths behind the same set,
+        and callers must not read more into a membership than the weaker one:
+
+        * the ordinary checkpointing writer marks a label after
+          ``_verify_dirty_evidence`` has re-read and compared its rows, so the
+          rows are proven byte-for-byte;
+        * a fast-regenerable finite Overwrite marks a label whose rows were
+          written and flushed but never re-read, because that path skips
+          checkpoint readback by design.  Its guarantee is "on disk and
+          re-readable", not "proven".  That is sufficient here: a torn row fails
+          terminal integrated-science verification and the whole Run fails, and
+          the artifact is regenerable by construction.  It is NOT sufficient for
+          anything that must survive as truth -- which is why this path still
+          publishes no durability receipt and promotes no durable floor.
+
+        ``frame_verified`` therefore means "this checkpoint covers the label's
+        frame row", not "the row was read back".
+        """
         requested = {tuple(key): int(value) for key, value in revisions.items()}
         absent = _normalize_mode_keys(verified_absent)
         with self._lock:

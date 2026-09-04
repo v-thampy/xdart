@@ -814,3 +814,82 @@ def test_live_store_set_hydrator_rehydrates_an_evicted_record_on_access():
     calls.clear()
     store.get_or_hydrate(resident)
     assert calls == []                                 # no hydrator call for resident
+
+
+
+def test_projected_heavy_release_needs_durable_or_checkpoint_recoverable():
+    """A live projection must not pin every heavy payload for the whole run.
+
+    ``_releasable_modes_locked`` answers a projected label with the DURABLE set
+    alone, and a fast-regenerable Overwrite publishes no durability receipt until
+    close.  Before the writer also published checkpoint recoverability, that
+    combination licensed no release at all and the display retained every frame's
+    2-D array -- about 7 GB on a 3621-frame Run against a 64-frame cap.  Drive the
+    release path production uses (``display_runtime`` registers
+    ``can_release_heavy`` as the heavy-evictable probe and ``display_residency``
+    calls ``release_heavy``), not the automatic cap enforcer, which consults the
+    stricter predicate and would pass while the real leak stayed open.
+    """
+    from xrd_tools.core import Axis, FrameRecord, FrameView
+    from xrd_tools.session import FrameRecordStore
+
+    keys = [("1d", "default"), ("2d", "cake")]
+
+    def project(store, label, *, durable, recoverable):
+        view = FrameView(
+            label=label,
+            axis_1d=Axis("Q", "q_A^-1", values=np.arange(4.0)),
+            intensity_1d=np.full(4, float(label)),
+            axis_2d_x=Axis("Q", "q_A^-1", values=np.arange(4.0)),
+            axis_2d_y=Axis("chi", "chi_deg", values=np.arange(3.0)),
+            intensity_2d=np.full((3, 4), float(label)),
+            mask_baked=True,
+        )
+        store.upsert(
+            FrameRecord(
+                label=label,
+                results_1d={"default": view},
+                results_2d={"cake": view},
+                active_mode_1d="default",
+                active_mode_2d="cake",
+            ),
+            source_identity="src",
+        )
+        store.replace_projection(
+            label, hydratable=keys, durable=keys if durable else [],
+        )
+        if recoverable:
+            resident = store.get(label)
+            revisions = {key: 1 for key in keys}
+            assert store._bind_checkpoint_revisions(
+                label, expected=resident, revisions=revisions,
+            )
+            assert store._mark_checkpoint_recoverable(
+                label, expected=resident, revisions=revisions,
+                frame_verified=True, thumbnail_verified=False,
+            )
+
+    # Durability alone licenses release, as it always did.
+    durable_store = FrameRecordStore(max_heavy_items=2)
+    project(durable_store, 1, durable=True, recoverable=False)
+    assert durable_store.can_release_heavy(1)
+
+    # The fast path's projection on its own licenses nothing: this is the leak.
+    leaking = FrameRecordStore(max_heavy_items=2)
+    project(leaking, 1, durable=False, recoverable=False)
+    assert not leaking.can_release_heavy(1)
+    assert not leaking.release_heavy(1)
+    assert leaking.has_heavy_payload(1)
+
+    # Checkpoint recoverability licenses the release without asserting durable.
+    recovered = FrameRecordStore(max_heavy_items=2)
+    project(recovered, 1, durable=False, recoverable=True)
+    assert recovered.durable_modes(1) == frozenset()
+    assert recovered.can_release_heavy(1)
+    assert recovered.release_heavy(1)
+    assert not recovered.has_heavy_payload(1)
+    # Thinning keeps the label resident and still recorded on disk, never
+    # forgets it.  (hydratable_modes() would need a registered hydrator, which a
+    # bare store has none of; persisted_modes is the on-disk fact itself.)
+    assert recovered.get(1) is not None
+    assert recovered.persisted_modes(1) == frozenset(keys)
