@@ -1640,8 +1640,10 @@ def test_recursive_same_named_containers_preserve_relative_output_directories(
             for entry in deferred.entries
         }
         assert targets == {
-            first: output / "data" / "scan_0001.nexus",
-            second: output / "live_test" / "scan_0001.nexus",
+            # Same stem, different relative directories -- the point of this
+            # test. The stable slot rides along; it does not disambiguate them.
+            first: output / "data" / "scan_0001_int2d.nexus",
+            second: output / "live_test" / "scan_0001_int2d.nexus",
         }
         assert len(reservations) == 1
         assert set(reservations[0]) == set(targets.values())
@@ -2934,7 +2936,8 @@ def test_exact_tiff_suffix_excludes_edf_mask_candidate(tmp_path: Path) -> None:
     try:
         assert len(receipt.outputs) == 1
         item = receipt.outputs[0].item
-        assert item.target.name == "scan.nexus"
+        # The run publishes its stable slot, not the bare scan name.
+        assert item.target.name == "scan_int2d.nexus"
         assert tuple(Path(value.path) for value in item.source_stamp.members) == (
             image,
         )

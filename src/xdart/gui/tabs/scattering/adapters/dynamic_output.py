@@ -1286,6 +1286,10 @@ class DynamicOutputAdapter:
                     atomic=False,
                     incremental_finalization=True,
                     source_base=self.configuration.project_root or None,
+                    # Persist the ROOT family so a later Reintegrate/Average
+                    # consumes it instead of deriving `<scan>_int2d` from this
+                    # artifact's own stem and publishing a chained name.
+                    artifact_family=item.artifact_family or None,
                     run_configuration_provenance=run_provenance,
                     source_execution_provenance=source_execution_projection(
                         _prepared_source_execution(item)

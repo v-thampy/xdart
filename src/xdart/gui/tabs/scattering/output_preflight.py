@@ -17,7 +17,11 @@ from xrd_tools.integrate.calibration import (
 )
 from xrd_tools.io import AppendDisposition, AppendRefused, load_mask
 from xrd_tools.io.image import read_detector_image_layout
-from xrd_tools.io.output_path import OVERWRITE_MODE, resolve_output_target
+from xrd_tools.io.output_path import (
+    FINITE_OPERATION_SLOTS,
+    OVERWRITE_MODE,
+    resolve_output_target,
+)
 from xrd_tools.io.output_safety import (
     OutputCollisionError,
     check_output_not_source,
@@ -737,7 +741,9 @@ def _directory_target(
                 f"{output_directory}"
             )
         output_request = str(output_directory)
-    return _resolved_generated_target(output_request, name)
+    return _resolved_generated_target(
+        output_request, name, _run_output_slot(configuration),
+    )
 
 
 def _candidate_still_exact(candidate: Candidate) -> bool:
@@ -2743,21 +2749,113 @@ def _selected_tiff_gi_motor(
     return motor if motor and motor != "Manual" else None
 
 
-def _resolved_generated_target(save_path: str, scan_name: str) -> Path:
+#: GUI run mode -> the SHARED operation token.  Deliberately NOT a table of
+#: suffixes: `FINITE_OPERATION_SLOTS` owns the one suffix vocabulary, and a
+#: second copy here is how `_int2d` in one place and `_int2d` in another drift
+#: apart.  This maps only the GUI's own spelling onto that vocabulary.
+#:
+#: Only the three native run modes appear; anything else is not a run mode and
+#: must not silently pick a slot.  ``Int 1D (XYE)`` writes NO ``.nexus`` at all
+#: (`dynamic_output.py` guards the whole sink behind ``if not xye_only:``), but
+#: a target is still resolved for it as a grouping key, so it maps to the token
+#: its science would have used rather than raising.
+_RUN_MODE_OPERATIONS = {
+    "Int 1D": "int-1d",
+    "Int 2D": "int-2d",
+    "Int 1D (XYE)": "int-1d",
+}
+
+#: Derived, never restated.  A token this GUI names that the shared vocabulary
+#: does not define is a programming error, not an operator one.
+_RUN_MODE_SLOTS = {
+    mode: FINITE_OPERATION_SLOTS[token]
+    for mode, token in _RUN_MODE_OPERATIONS.items()
+}
+
+
+def _run_output_slot(
+    configuration: "FrozenRunConfiguration | OutputCandidate",
+) -> str:
+    """The stable public slot this run publishes into.
+
+    Refuses an unrecognised mode rather than defaulting.  A wrong slot here is a
+    run writing to the wrong filename, which is worse than a loud failure.
+    """
+    frozen = (
+        configuration._configuration
+        if type(configuration) is OutputCandidate
+        else configuration
+    )
+    mode = None if frozen is None else str(frozen.processing_mode)
+    if mode is None and type(configuration) is OutputCandidate:
+        # A candidate signed by `from_start_capture` always carries the frozen
+        # configuration; a hand-built one may not, but it still carries the
+        # provenance mapping the mode was frozen into.
+        declared = configuration.processing_mapping().get("processing_mode")
+        mode = None if declared is None else str(declared)
+    if mode is None or mode == "":
+        # NO run mode is declared anywhere.  Not reachable from the GUI, where
+        # `from_start_capture` signs every candidate; this is a source-shaped
+        # double that names a target without ever declaring how it would be
+        # reduced.  Take NO slot rather than inventing one -- guessing here
+        # would name a file for a mode nobody chose.
+        return ""
+    slot = _RUN_MODE_SLOTS.get(mode)
+    if slot is None:
+        # A mode IS declared and it is not one this policy knows.  That is the
+        # dangerous case: continuing would publish under some other mode's slot.
+        raise ValueError(
+            f"run processing mode has no stable output slot: {mode!r}"
+        )
+    return slot
+
+
+def _run_artifact_family(
+    configuration: "FrozenRunConfiguration | OutputCandidate", scan_name: str,
+) -> str:
+    """The ROOT family a run publishes into: the requested stem, or the scan.
+
+    Must agree exactly with what :func:`_resolved_generated_target` used as the
+    stem, because the persisted family is what every LATER operation consumes.
+    If the two ever disagreed, a Reintegrate would resolve a slot in a family
+    the Run never wrote.
+    """
+    requested = Path(configuration.save_path)
+    return requested.stem if requested.suffix else scan_name
+
+
+def _resolved_generated_target(
+    save_path: str, scan_name: str, slot: str = "",
+) -> Path:
     """Delegate vNext's one generated-output naming decision to the shared owner.
 
     vNext admission is Overwrite-only.  A suffix-shaped requested path keeps
     its directory/stem but is normalized to ``.nexus``; a directory request
-    generates ``<scan>.nexus`` (P4/OUT-1).  This helper only decides
-    how the captured ``save_path`` is supplied to the shared API — suffix,
-    collision, writer and transaction policy stay with their owners.
+    generates ``<scan><slot>.nexus`` (P4/OUT-1, ADR-0010).  This helper only
+    decides how the captured ``save_path`` is supplied to the shared API —
+    suffix, collision, writer and transaction policy stay with their owners.
+
+    *slot* is empty for the Average NAMING ANCHOR, which is not a written file:
+    it supplies the directory and the root FAMILY, so appending a run slot to it
+    would make Average derive `<scan>_int2d` as its family and publish the
+    chained `<scan>_int2d_average.nexus`.  Callers that name a real run target
+    pass the slot from :func:`_run_output_slot`.
     """
     requested = Path(save_path)
+    if requested.suffix:
+        # An explicit file request keeps its directory and stem; the slot is
+        # still appended, because the public name is always `<family><slot>`.
+        return Path(resolve_output_target(
+            requested.parent,
+            f"{requested.stem}{slot}",
+            mode=OVERWRITE_MODE,
+            explicit_target=None,
+        ))
     return Path(resolve_output_target(
-        requested.parent if requested.suffix else requested,
-        scan_name,
+        requested,
+        f"{scan_name}{slot}",
         mode=OVERWRITE_MODE,
-        explicit_target=requested if requested.suffix else None,
+        explicit_target=None,
     ))
 
 
@@ -2922,8 +3020,12 @@ def _series_item(
         cancelled=cancelled,
     )
     return PlannedOutput(graph.execution_source, Path(graph.source_path),
-        _resolved_generated_target(configuration.save_path, graph.group_key),
-        graph.stamp, descriptor=graph.descriptor, motor_names=graph.motor_names)
+        _resolved_generated_target(
+            configuration.save_path, graph.group_key,
+            _run_output_slot(configuration),
+        ),
+        graph.stamp, descriptor=graph.descriptor, motor_names=graph.motor_names,
+        artifact_family=_run_artifact_family(configuration, graph.group_key))
 
 
 def _container_item(
@@ -2937,8 +3039,12 @@ def _container_item(
         cancelled=cancelled,
     )
     return PlannedOutput(graph.execution_source, Path(graph.source_path),
-        _resolved_generated_target(configuration.save_path, graph.group_key),
-        graph.stamp, descriptor=graph.descriptor, motor_names=graph.motor_names)
+        _resolved_generated_target(
+            configuration.save_path, graph.group_key,
+            _run_output_slot(configuration),
+        ),
+        graph.stamp, descriptor=graph.descriptor, motor_names=graph.motor_names,
+        artifact_family=_run_artifact_family(configuration, graph.group_key))
 
 
 def _uses_eager_directory_descriptors(
@@ -3143,11 +3249,14 @@ def _directory_items(
         items.append(PlannedOutput(
             spec,
             candidate.path,
-            _resolved_generated_target(output_request, name),
+            _resolved_generated_target(
+                output_request, name, _run_output_slot(configuration),
+            ),
             stamp,
             candidate,
             descriptor,
             motor_names,
+            _run_artifact_family(configuration, name),
         ))
     return tuple(items)
 def validate_planned_source(

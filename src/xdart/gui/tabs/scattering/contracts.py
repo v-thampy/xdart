@@ -88,6 +88,11 @@ class PlannedOutput:
     candidate: Candidate | None = None
     descriptor: ContainerDescriptor | None = None
     motor_names: tuple[str, ...] | None = None
+    #: ROOT FAMILY this run publishes into, carried from the moment the target
+    #: was named.  Recorded rather than re-derived: the public name is
+    #: `<family><slot>.nexus`, so recovering the family from `target` would mean
+    #: stripping the slot, which is an explicit stop condition.
+    artifact_family: str = ""
     group: SourceGroupIdentity = field(init=False)
 
     def __post_init__(self) -> None:

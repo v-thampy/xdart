@@ -250,6 +250,24 @@ def _write_eiger(master: Path, member: Path, frames: int) -> None:
         )
 
 
+def _written(target: Path, processing_mode: str = "Int 1D") -> Path:
+    """Where a run actually writes, given the save path it was REQUESTED with.
+
+    Under ADR-0010 the public name is `<family><slot>.nexus`, and an explicit
+    save path supplies the FAMILY, so a run requested at `append.nexus` in
+    `Int 1D` writes `append_int1d.nexus`. These tests hand the request to the
+    intent and then inspect the written file, so the two must be spelled apart.
+
+    Derived from the production table rather than restated, so a change to the
+    slot vocabulary fails here instead of silently disagreeing with it.
+    """
+    from xdart.gui.tabs.scattering.output_preflight import _RUN_MODE_SLOTS
+
+    return target.with_name(
+        f"{target.stem}{_RUN_MODE_SLOTS[processing_mode]}.nexus"
+    )
+
+
 def _nexus_rows(path: Path) -> tuple[int, ...]:
     with h5py.File(path, "r") as handle:
         return tuple(
@@ -992,7 +1010,7 @@ def test_p1b_b03_native_cross_run_append_missing_only(
     first_executor.close(_identity)
     assert len(output_adapters) == 1
     assert output_adapters[0].persisted_prefix_labels == ()
-    assert _nexus_rows(target) == (1, 2)
+    assert _nexus_rows(_written(target)) == (1, 2)
     xye_directory = tmp_path / "series"
     seeded_xye = tuple(sorted(xye_directory.glob("*.xye")))
     assert [path.name for path in seeded_xye] == [
@@ -1059,7 +1077,7 @@ def test_p1b_b03_native_cross_run_append_missing_only(
     assert next(event for event in missing_events if event.kind in _TERMINAL).kind \
         is StandardEventKind.FINISHED, "B03 missing"
     assert reads == [raw3.resolve()], "B03 missing"
-    assert _nexus_rows(target) == (1, 2, 3), "B03 missing"
+    assert _nexus_rows(_written(target)) == (1, 2, 3), "B03 missing"
     missing_frames = _frame_events(missing_events)
     assert len(missing_frames) == 1, "B03 missing"
     missing_frame = missing_frames[0]
@@ -1142,8 +1160,8 @@ def test_p1b_b03_native_cross_run_append_missing_only(
 
     # no-op: exact committed content performs no source read or replacement.
     reads.clear()
-    before = target.read_bytes()
-    before_stat = target.stat()
+    before = _written(target).read_bytes()
+    before_stat = _written(target).stat()
     before_xye = xye_facts(tuple(sorted(xye_directory.glob("*.xye"))))
     noop_executor, noop_identity, noop_events = _run_to_terminal(
         _intent(raw1, target, poni, output_mode="Append"),
@@ -1151,9 +1169,9 @@ def test_p1b_b03_native_cross_run_append_missing_only(
     )
     assert next(event for event in noop_events if event.kind in _TERMINAL).kind \
         is StandardEventKind.FINISHED, "B03 no-op"
-    after_stat = target.stat()
+    after_stat = _written(target).stat()
     assert reads == [], "B03 no-op"
-    assert target.read_bytes() == before, "B03 no-op"
+    assert _written(target).read_bytes() == before, "B03 no-op"
     assert (after_stat.st_dev, after_stat.st_ino) == (
         before_stat.st_dev,
         before_stat.st_ino,
@@ -1183,8 +1201,8 @@ def test_p1b_b03_native_cross_run_append_missing_only(
     # Same-path scientific-asset drift is part of the signed science identity,
     # not a path-only match.  It refuses at preview before source pixels open.
     reads.clear()
-    before = target.read_bytes()
-    before_stat = target.stat()
+    before = _written(target).read_bytes()
+    before_stat = _written(target).stat()
     before_xye = xye_facts(tuple(sorted(xye_directory.glob("*.xye"))))
     original_poni = poni.read_bytes()
     changed_poni = original_poni.replace(b"0.1234", b"0.2234")
@@ -1200,8 +1218,8 @@ def test_p1b_b03_native_cross_run_append_missing_only(
         assert type(asset_admission) is AdmissionFailure, "B03 PONI drift"
         assert "Append" in asset_admission.reason, "B03 PONI drift"
         assert reads == [], "B03 PONI drift"
-        after_stat = target.stat()
-        assert target.read_bytes() == before, "B03 PONI drift"
+        after_stat = _written(target).stat()
+        assert _written(target).read_bytes() == before, "B03 PONI drift"
         assert (after_stat.st_dev, after_stat.st_ino) == (
             before_stat.st_dev,
             before_stat.st_ino,
@@ -1214,8 +1232,8 @@ def test_p1b_b03_native_cross_run_append_missing_only(
 
     # mismatch: foreign science refuses before the first pixel loader call.
     reads.clear()
-    before = target.read_bytes()
-    before_stat = target.stat()
+    before = _written(target).read_bytes()
+    before_stat = _written(target).stat()
     before_xye = xye_facts(tuple(sorted(xye_directory.glob("*.xye"))))
     mismatch = _intent(
         raw1, target, poni, output_mode="Append", npt=9,
@@ -1228,8 +1246,8 @@ def test_p1b_b03_native_cross_run_append_missing_only(
         assert type(admission) is AdmissionFailure, "B03 mismatch"
         assert "Append" in admission.reason, "B03 mismatch"
         assert reads == [], "B03 mismatch"
-        after_stat = target.stat()
-        assert target.read_bytes() == before, "B03 mismatch"
+        after_stat = _written(target).stat()
+        assert _written(target).read_bytes() == before, "B03 mismatch"
         assert (after_stat.st_dev, after_stat.st_ino) == (
             before_stat.st_dev,
             before_stat.st_ino,
@@ -1596,18 +1614,21 @@ def test_p1b_b17_collision_custody_and_xye_append_refuse_typed(
         seed_identity
     ).cleanup_status is CleanupStatus.CLEANED
     _write_tiff(custody_raw2, 2)
+    # The run wrote its SLOT, not the requested name. Custody -- leases and
+    # byte/inode fingerprints alike -- is about the artifact that exists.
+    custody_written = _written(custody_target)
     custody_before = (
-        custody_target.read_bytes(),
-        custody_target.stat().st_dev,
-        custody_target.stat().st_ino,
-        custody_target.stat().st_mtime_ns,
+        custody_written.read_bytes(),
+        custody_written.stat().st_dev,
+        custody_written.stat().st_ino,
+        custody_written.stat().st_mtime_ns,
     )
 
     def assert_custody_target_reacquirable(label: str) -> None:
         transaction_authority = OwnerToken(f"{label}-transaction")
         target_authority = OwnerToken(f"{label}-target")
         admitted = coordinator.admit(
-            custody_target,
+            custody_written,
             transaction_owner=transaction_authority,
             target_owner=target_authority,
         )
@@ -1670,10 +1691,10 @@ def test_p1b_b17_collision_custody_and_xye_append_refuse_typed(
         prebind_identity
     ).cleanup_status is CleanupStatus.CLEANED
     assert (
-        custody_target.read_bytes(),
-        custody_target.stat().st_dev,
-        custody_target.stat().st_ino,
-        custody_target.stat().st_mtime_ns,
+        custody_written.read_bytes(),
+        custody_written.stat().st_dev,
+        custody_written.stat().st_ino,
+        custody_written.stat().st_mtime_ns,
     ) == custody_before
     assert_custody_target_reacquirable("p1b-prebind-reacquire")
 
@@ -1699,7 +1720,7 @@ def test_p1b_b17_collision_custody_and_xye_append_refuse_typed(
 
     def retryable_nexus_abort(owner, result):
         if (
-            Path(owner.path).resolve() == custody_target.resolve()
+            Path(owner.path).resolve() == custody_written.resolve()
             and len(abort_attempts) < 2
         ):
             abort_attempts.append(owner)
@@ -1742,10 +1763,10 @@ def test_p1b_b17_collision_custody_and_xye_append_refuse_typed(
     ).cleanup_status is CleanupStatus.CLEANED
     assert begin_owners[0].snapshot.state is AppendPreflightState.ABORTED
     assert (
-        custody_target.read_bytes(),
-        custody_target.stat().st_dev,
-        custody_target.stat().st_ino,
-        custody_target.stat().st_mtime_ns,
+        custody_written.read_bytes(),
+        custody_written.stat().st_dev,
+        custody_written.stat().st_ino,
+        custody_written.stat().st_mtime_ns,
     ) == custody_before
     assert_custody_target_reacquirable("p1b-later-begin-reacquire")
 
@@ -2333,7 +2354,7 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
     try:
         terminal = next(event for event in events if event.kind in _TERMINAL)
         assert terminal.kind is StandardEventKind.FINISHED
-        assert _nexus_rows(target) == (1,)
+        assert _nexus_rows(_written(target)) == (1,)
         assert observed == [expected]
         assert checkpoint_observed == [(
             True,
@@ -2624,7 +2645,7 @@ def test_post_g2_funded_staging_partial_grant_refuses_before_output_and_retries(
     assert terminal.kind is StandardEventKind.FAILED
     assert "staging request was not granted exactly" in terminal.detail
     assert "requested=10008" in terminal.detail
-    assert not target.exists()
+    assert not _written(target).exists()
     assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
 
     intent.run_options["_post_g2_pipeline_v2"] = {
@@ -2643,7 +2664,7 @@ def test_post_g2_funded_staging_partial_grant_refuses_before_output_and_retries(
     assert terminal.kind is StandardEventKind.FAILED
     assert "checkpoint retention was not funded" in terminal.detail
     assert "checkpoint=1000" in terminal.detail
-    assert not target.exists()
+    assert not _written(target).exists()
     assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
 
     intent.run_options["_post_g2_pipeline_v2"] = {
@@ -2663,7 +2684,7 @@ def test_post_g2_funded_staging_partial_grant_refuses_before_output_and_retries(
             next(event for event in events if event.kind in _TERMINAL).kind
             is StandardEventKind.FINISHED
         )
-        assert _nexus_rows(target) == (1,)
+        assert _nexus_rows(_written(target)) == (1,)
     finally:
         assert (
             executor.close(identity).cleanup_status is CleanupStatus.CLEANED
@@ -2742,7 +2763,7 @@ def test_post_g2_unsafe_unfunded_staging_accepts_exact_eiger(
             is StandardEventKind.FINISHED
         )
         assert observed == [(64, 10_008, 10_000)]
-        with h5py.File(target, "r") as handle:
+        with h5py.File(_written(target, "Int 2D"), "r") as handle:
             raw = handle["entry/reduction/config/run_configuration"].asstr()[()]
             configuration = json.loads(raw)
         assert configuration["run_options"][
@@ -2824,7 +2845,7 @@ def test_post_g2_output_diagnostics_disable_only_xye_and_fsync(
     try:
         terminal = next(event for event in events if event.kind in _TERMINAL)
         assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
-        assert _nexus_rows(target) == (1,)
+        assert _nexus_rows(_written(target)) == (1,)
         assert tuple(tmp_path.rglob("*.xye")) == ()
         assert len(observed) == 1
         child_names, durable_fsync, nexus = observed[0]
