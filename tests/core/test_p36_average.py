@@ -1766,10 +1766,26 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
                 pending = again
             if case == "recapture-error": recapture_armed.append(True)
             terminal = runner.command(module.AverageCommand.RETRY, pending)
-            expected_events = (["target-sweep", "target-sweep", "source-sweep", "target-sweep", "commit"]
+            # The TWO trailing "target-sweep"s on the committed path are the
+            # PUBLICATION boundary: Average now writes a hidden candidate and one
+            # atomic replacement publishes it.  First the SLOT is swept against
+            # its plan-time identity -- it must still be what we planned against
+            # at the instant we replace it -- then the published bytes are
+            # observed to re-seal the terminal, because `os.replace` changes
+            # ctime and a copied receipt would pass here and fail later.
+            expected_events = (["target-sweep", "target-sweep", "source-sweep", "target-sweep", "commit", "target-sweep", "target-sweep"]
                 if case == "unchanged" else ["target-sweep", "target-sweep", "source-sweep", "target-sweep"]
                 if case == "commit-target" else ["target-sweep", "target-sweep"]
-                if case == "recapture-error" else ["target-sweep"] if case == "target"
+                if case == "recapture-error"
+                # The "target" case mutates the SLOT mid-run.  It used to refuse
+                # on the very first sweep; it now refuses at the PUBLICATION
+                # boundary instead, after the candidate has fully settled -- so
+                # `commit` appears and the trailing sweep is the slot check that
+                # raises.  Later, and better: the candidate is complete and the
+                # prior slot is left exactly as it was, never half-replaced.
+                else ["target-sweep", "target-sweep", "source-sweep",
+                      "target-sweep", "commit", "target-sweep"]
+                if case == "target"
                 else ["target-sweep", "target-sweep", "source-sweep"])
             assert events == expected_events
             assert counts == frozen_counts and len(integrations) == frozen_integrations
@@ -1791,10 +1807,27 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
                 artifact = Path(module._average_output_artifact(
                     module._average_target(str(target))
                 ))
-                assert not artifact.exists()
+                if case == "target":
+                    # THE TEST put this file at the slot, to simulate something
+                    # appearing there mid-run.  Average must leave it EXACTLY
+                    # alone: it did not create it, so it may not remove it.
+                    # Under the parent the transaction admitted the SLOT, so
+                    # rollback restored "absent" by UNLINKING an operator's
+                    # file.  Writing to a hidden candidate instead means the
+                    # only thing Average can roll back is its own.
+                    assert artifact.exists()
+                    assert artifact.read_bytes().endswith(b"x")
+                else:
+                    assert not artifact.exists()
                 with pytest.raises((KeyError, ValueError)): get_average_finite_counts(target)
                 assert not tuple(target.parent.glob(f".{target.name}*"))
                 assert not tuple(artifact.parent.glob(f".{artifact.name}*"))
+                # The hidden candidate is named `.<stem>.xdart-average-<hex>.nexus`,
+                # which the globs above do NOT match -- check it explicitly, or an
+                # abort could strand a private file and nothing would say so.
+                assert not tuple(
+                    artifact.parent.glob(f".{artifact.stem}.xdart-average-*")
+                )
             terminal_events, terminal_counts = tuple(events), dict(counts)
             assert runner.close() is terminal
             assert tuple(events) == terminal_events and counts == terminal_counts
@@ -2040,24 +2073,25 @@ def test_average_fail_loud_all_dummy_2d_refuses_before_commit(tmp_path, monkeypa
             module.get_average_finite_counts(path)
 
 
-def test_average_repeat_in_the_same_directory_currently_refuses(
+def test_average_repeat_in_the_same_directory_atomically_replaces(
     tmp_path, monkeypatch,
 ) -> None:
-    """A second Average for the same family in one directory RAISES today.
+    """A second Average for the same family REPLACES the slot. The ruling.
 
-    Fable F2 on `c167b71a`, the Average half. `_average_output_artifact` is now
-    version-independent, so ANY second Average for the same anchor -- different
-    frame selection, different npt, anything -- resolves the one slot and is
-    refused at plan time by `AVERAGE_OUTPUT_EXISTS` (average.py:562). The parent
-    refused only an identical-science rerun; a different selection produced
-    `<family>.average-<hex2>.nexus`.
+    This row previously asserted a REFUSAL: `_average_output_artifact` is
+    version-independent, so ANY second Average for one anchor -- different frame
+    selection, different npt, anything -- resolved the one slot and was refused
+    at plan time by `AVERAGE_OUTPUT_EXISTS`. The operator had to delete the file
+    by hand.
 
-    `grep AVERAGE_OUTPUT_EXISTS tests/` had ZERO hits before this row, so the
-    behaviour had no oracle at either end of the range.
+    Ruled 2026-09-04: an occupied slot is replaced unconditionally, and an
+    identical repeat replaces too. The refusal is gone; Average now writes a
+    hidden same-directory candidate and one atomic replacement publishes it.
 
-    The refusal never clobbers, which is the important half. But the design's
-    lifecycle matrix says a successful repeat should atomically replace the slot
-    (step 4), so this pins the interim rather than leaving it to be discovered.
+    This FIXTURE names its scan `average`, so the family is `average` and the
+    slot reads `average_average.nexus`. That doubling is the fixture's own name,
+    not a product default -- `page.py:2553` builds the anchor from the save
+    FOLDER plus the SCAN NAME, so a real scan gives `<scan>_average.nexus`.
     """
     source = _series(tmp_path)
     target = tmp_path / "average.nxs"
@@ -2068,22 +2102,79 @@ def test_average_repeat_in_the_same_directory_currently_refuses(
     ))
     assert first.disposition == "COMMITTED"
     artifact = Path(first.target)
-    # This FIXTURE names its scan `average`, so the family is `average` and the
-    # slot reads `average_average.nexus`.  That doubling is an artifact of the
-    # fixture name alone -- NOT a product default.  `page.py:2553` builds the
-    # anchor from the save FOLDER plus the SCAN NAME, so a real scan resolves
-    # `GI_sampleA_0001.nexus` -> `GI_sampleA_0001_average.nexus`.  Spelled out
-    # because the earlier wording here read as a naming defect and was raised
-    # with the maintainer as one.
     assert artifact.name == "average_average.nexus"
     committed_bytes = artifact.read_bytes()
+    first_state = artifact.stat()
 
     second = _run_average_scan(AverageScanRecipe(
         source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=6)),
     ))
-    assert second.disposition == "REFUSED"
-    assert second.diagnostic_code == "AVERAGE_OUTPUT_EXISTS"
-    assert artifact.read_bytes() == committed_bytes
+
+    assert second.disposition == "COMMITTED"
+    assert second.target == first.target
+    # The SECOND science occupies the slot, and it is genuinely a new file.
+    assert artifact.read_bytes() != committed_bytes
+    assert (artifact.stat().st_dev, artifact.stat().st_ino) != (
+        first_state.st_dev, first_state.st_ino
+    )
+    # The commit terminal describes the PUBLISHED slot, not the candidate that
+    # produced it -- a copied receipt would name a file that no longer exists.
+    assert second.commit_identity.target == second.target
+    assert second.commit_identity.inode == artifact.stat().st_ino
+    # Nothing private is left beside it.
+    assert not tuple(artifact.parent.glob(f".{artifact.stem}.xdart-average-*"))
+
+
+def test_a_failed_average_leaves_the_prior_slot_byte_identical(
+    tmp_path, monkeypatch,
+) -> None:
+    """The ADR guarantee this whole design exists to deliver.
+
+    ADR-0010: "The prior slot remains visible and untouched until that
+    publication step. STOP during Average discards the partial candidate and
+    leaves the prior slot unchanged."
+
+    Nothing pinned that until now. It is the reason Average writes a hidden
+    candidate at all rather than simply dropping `AVERAGE_OUTPUT_EXISTS` -- the
+    streamed transaction moves the prior to a BACKUP first, so a failure
+    mid-Average would have left the public slot missing rather than intact.
+    """
+    import xrd_tools.reduction.average as module
+
+    source = _series(tmp_path)
+    target = tmp_path / "average.nxs"
+    _stub_integrators(monkeypatch, [])
+
+    first = _run_average_scan(AverageScanRecipe(
+        source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=4)),
+    ))
+    assert first.disposition == "COMMITTED"
+    artifact = Path(first.target)
+    prior_bytes = artifact.read_bytes()
+    prior_state = artifact.stat()
+
+    real_write = module.NexusSink.write
+
+    def failing_write(owner, *args, **kwargs):
+        real_write(owner, *args, **kwargs)
+        raise OSError("injected mid-Average writer failure")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(module.NexusSink, "write", failing_write)
+        second = _run_average_scan(AverageScanRecipe(
+            source, target,
+            ReductionPlan(integration_1d=Integration1DPlan(npt=6)),
+        ))
+
+    assert second.disposition != "COMMITTED"
+    # UNTOUCHED: same bytes, same inode -- not restored from a backup, never
+    # moved in the first place.
+    assert artifact.read_bytes() == prior_bytes
+    assert (artifact.stat().st_dev, artifact.stat().st_ino) == (
+        prior_state.st_dev, prior_state.st_ino
+    )
+    # And the partial candidate is discarded, not stranded.
+    assert not tuple(artifact.parent.glob(f".{artifact.stem}.xdart-average-*"))
 
 
 def test_average_persists_its_root_family_so_the_next_operation_cannot_chain(
