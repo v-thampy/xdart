@@ -714,12 +714,14 @@ class WorkspaceOperationOwner:
         # NARROWED by the stable-slot policy, deliberately.  The recompute used
         # to include the result's own version identity, so it also refused a
         # wrong VERSION.  Public names no longer carry one, so this guard can
-        # no longer see that class of mismatch.  Nothing was lost silently:
-        # version agreement is verified where the evidence actually lives --
-        # `_committed_average_mismatch` (average.py:593) checks the committed
-        # result against the recomputed slot, and the version itself survives
-        # in persisted provenance.  This guard's remaining job is to refuse a
-        # FOREIGN artifact, which is the failure this branch was written for.
+        # no longer see that class of mismatch.  Nothing was lost silently, but
+        # name the carrier precisely: the recomputed SLOT no longer encodes a
+        # version, so what actually verifies version agreement is the persisted
+        # `operation_identity` comparison in `_committed_average_mismatch`,
+        # because `operation_identity` is a hash over a payload that embeds both
+        # `version_identity` and `output_artifact` (average.py:475/564/596).
+        # This guard's remaining job is to refuse a FOREIGN artifact, which is
+        # the failure this branch was written for.
         from xrd_tools.reduction.average import (
             _average_output_artifact,
             _average_target,

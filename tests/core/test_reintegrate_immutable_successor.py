@@ -523,7 +523,13 @@ def test_cancelled_successor_never_publishes_or_mutates_source(
     assert result.committed_labels == ()
     assert result.terminal is None
     assert result.commit_identity is None
-    assert not (seeded.target.parent / "immutable-successor.nexus").exists()
+    # The slot the plan would have written -- NOT the removed `_plan` default
+    # filename, which the code can no longer produce and which therefore made
+    # this assertion vacuous (Fable F3 on c167b71a).
+    assert not Path(plan.output_artifact).exists()
+    assert not tuple(
+        Path(plan.output_artifact).parent.glob(".xdart-finite-*.candidate")
+    )
     assert seeded.target.read_bytes() == before
 
 
@@ -649,7 +655,10 @@ def test_integrator_failure_is_primary_and_never_masquerades_as_abort(
         run_reintegrate_successor(plan)
 
     assert raised.value is failure
-    assert not (seeded.target.parent / "immutable-successor.nexus").exists()
+    assert not Path(plan.output_artifact).exists()
+    assert not tuple(
+        Path(plan.output_artifact).parent.glob(".xdart-finite-*.candidate")
+    )
     assert seeded.target.read_bytes() == before
 
 
@@ -2621,9 +2630,12 @@ def test_capsule_miss_allows_changed_click_integration_settings(
     result = run_reintegrate_successor(plan)
     assert result.disposition == "COMMITTED"
     # Changed integration settings move the SCIENCE identity but not the public
-    # name: a repeat with different settings replaces this operation's own slot
-    # rather than accumulating a second public file.  That is the whole point of
-    # the stable-slot policy, and it is why the version lives in provenance.
+    # name: both resolve this operation's own slot rather than accumulating a
+    # second public file.  This test does NOT repeat, so it does not show what
+    # happens when the slot is already occupied -- today that RAISES
+    # FiniteArtifactCollision, and only step 4's atomic replace turns it into a
+    # replacement.  See
+    # `test_changed_settings_repeat_currently_collides_pending_atomic_replace`.
     expected = seeded.target.parent / (
         f"{seeded.target.stem}_reintegrate{dimension}.nexus"
     )
@@ -3331,8 +3343,11 @@ def test_recipe_predecessor_identity_is_joined_to_the_admitted_parent(
         replay = ReintegrateSuccessorPlan.from_recipe(recipe)
     with pytest.raises(ValueError, match="FINITE_REQUEST_CHANGED"):
         run_reintegrate_successor(replay)
-    assert not (seeded.target.parent / "generation-two.nexus").exists()
-    assert not tuple(seeded.target.parent.glob(".xdart-finite-*.candidate"))
+    # Look where the REPLAY would write.  Both checks used to look in the
+    # source's directory while the replay's root is `generation-two/`.
+    replay_root = Path(second_plan.output_artifact).parent
+    assert not Path(second_plan.output_artifact).exists()
+    assert not tuple(replay_root.glob(".xdart-finite-*.candidate"))
 
 
 def test_cold_successor_reintegrates_with_stable_automatic_family(
@@ -3454,6 +3469,10 @@ def test_finite_predecessor_lineage_is_bounded_local_and_bracketed(
             module, "require_finite_artifact_lineage", swap_after_read,
         )
     expected_terminal = first.terminal if seam == "source-swap" else None
+    # Snapshot AFTER the seam is installed: three of the four seams mutate the
+    # parent artifact themselves, so the post-seam bytes are the baseline the
+    # refused child must leave alone.
+    parent_bytes = Path(parent).read_bytes()
     with pytest.raises((FiniteArtifactIntegrityError, ValueError)):
         ReintegrateSuccessorPlan.from_artifact(
             parent,
@@ -3464,7 +3483,14 @@ def test_finite_predecessor_lineage_is_bounded_local_and_bracketed(
             expected_labels=seeded.labels,
             explicit_output=seeded.target.parent / "finite-child.nexus",
         )
-    assert not (seeded.target.parent / "finite-child.nexus").exists()
+    # The old assertion named `finite-child.nexus`, which the code can no longer
+    # produce, so it proved nothing.  Absence is ALSO the wrong property now:
+    # the child's slot IS the parent's artifact (same family, same operation,
+    # same directory), and the parent legitimately exists.  What must hold is
+    # that the refused child left the parent's bytes untouched and dropped no
+    # candidate.
+    assert Path(parent).read_bytes() == parent_bytes
+    assert not tuple(Path(parent).parent.glob(".xdart-finite-*.candidate"))
 
 
 def test_repeat_into_the_same_directory_is_refused_not_chained(
@@ -3530,3 +3556,70 @@ def test_repeat_into_the_same_directory_is_refused_not_chained(
         if path.suffix == ".nexus"
     )
     assert "existing_reintegrate1d_reintegrate1d.nexus" not in siblings
+
+
+@pytest.mark.parametrize("dimension", ("1d", "2d"))
+def test_changed_settings_repeat_currently_collides_pending_atomic_replace(
+    tmp_path, monkeypatch, dimension,
+):
+    """Iterating settings on the SAME source in place currently RAISES.
+
+    Fable F2 on `c167b71a`. This is the primary Reintegrate workflow -- change
+    `npt`, run again -- and it regressed when public names lost their version:
+    the parent wrote `<family>.reintegrate-1d-<hex2>.nexus` beside the first
+    result, whereas both attempts now resolve the one stable slot and the second
+    finds it occupied by a different version.
+
+    The refusal is the conservative reading of "source/output collision refusal
+    is not relaxed", and it never clobbers: the first result's bytes survive.
+    But the design's lifecycle matrix says a successful repeat should
+    "atomically replace" the slot, which is step 4. Until then the operator must
+    delete the slot or choose another directory.
+
+    This row exists so the interim is PINNED rather than discovered, and so that
+    the change is visible the moment step 4 turns it into a replacement.
+    """
+    from xrd_tools.io.finite_artifact import FiniteArtifactCollision
+    from xrd_tools.reduction import (
+        ReintegrateSuccessorPlan,
+        run_reintegrate_successor,
+    )
+
+    seeded = _seed_existing(
+        tmp_path, labels=(2, 5), name=f"settings-repeat-{dimension}",
+    )
+    _stub_integrators(monkeypatch)
+    key = "npt" if dimension == "1d" else "npt_rad"
+
+    def plan_with(delta):
+        preparation = _dimension_preparation(seeded, dimension)
+        preparation["selected_plan"]["bai_args"][key] += delta
+        return ReintegrateSuccessorPlan.from_artifact(
+            seeded.target,
+            entry="entry",
+            dimension=dimension,
+            preparation=preparation,
+            expected_terminal_identity=seeded.terminal.commit_identity,
+            expected_labels=seeded.labels,
+            destination_directory=seeded.target.parent,
+            explicit_output=None,
+        )
+
+    first_plan = plan_with(0)
+    first = run_reintegrate_successor(first_plan)
+    assert first.disposition == "COMMITTED"
+    artifact = Path(first.output_artifact)
+    assert artifact.name == f"{seeded.target.stem}_reintegrate{dimension}.nexus"
+    committed_bytes = artifact.read_bytes()
+
+    second_plan = plan_with(1)
+    # Same public name, different science -- that is the whole collision.
+    assert second_plan.output_artifact == first.output_artifact
+    assert second_plan.version_identity != first_plan.version_identity
+
+    with pytest.raises(FiniteArtifactCollision):
+        run_reintegrate_successor(second_plan)
+
+    # Refused, never clobbered, and no candidate left behind.
+    assert artifact.read_bytes() == committed_bytes
+    assert not tuple(artifact.parent.glob(".xdart-finite-*.candidate"))

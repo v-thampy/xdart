@@ -2038,3 +2038,46 @@ def test_average_fail_loud_all_dummy_2d_refuses_before_commit(tmp_path, monkeypa
     for path in (target, gui_target):
         with pytest.raises((KeyError, ValueError)):
             module.get_average_finite_counts(path)
+
+
+def test_average_repeat_in_the_same_directory_currently_refuses(
+    tmp_path, monkeypatch,
+) -> None:
+    """A second Average for the same family in one directory RAISES today.
+
+    Fable F2 on `c167b71a`, the Average half. `_average_output_artifact` is now
+    version-independent, so ANY second Average for the same anchor -- different
+    frame selection, different npt, anything -- resolves the one slot and is
+    refused at plan time by `AVERAGE_OUTPUT_EXISTS` (average.py:562). The parent
+    refused only an identical-science rerun; a different selection produced
+    `<family>.average-<hex2>.nexus`.
+
+    `grep AVERAGE_OUTPUT_EXISTS tests/` had ZERO hits before this row, so the
+    behaviour had no oracle at either end of the range.
+
+    The refusal never clobbers, which is the important half. But the design's
+    lifecycle matrix says a successful repeat should atomically replace the slot
+    (step 4), so this pins the interim rather than leaving it to be discovered.
+    """
+    source = _series(tmp_path)
+    target = tmp_path / "average.nxs"
+    _stub_integrators(monkeypatch, [])
+
+    first = _run_average_scan(AverageScanRecipe(
+        source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=4)),
+    ))
+    assert first.disposition == "COMMITTED"
+    artifact = Path(first.target)
+    # NOTE FOR THE MAINTAINER: the anchor stem IS the family, so the default
+    # anchor `average.nxs` yields the doubled-looking `average_average.nexus`.
+    # Design-literal and harmless, but if the intended default anchor is the
+    # scan name this is where it shows.
+    assert artifact.name == "average_average.nexus"
+    committed_bytes = artifact.read_bytes()
+
+    second = _run_average_scan(AverageScanRecipe(
+        source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=6)),
+    ))
+    assert second.disposition == "REFUSED"
+    assert second.diagnostic_code == "AVERAGE_OUTPUT_EXISTS"
+    assert artifact.read_bytes() == committed_bytes

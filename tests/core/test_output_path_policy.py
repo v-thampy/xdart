@@ -904,3 +904,44 @@ def test_a_persisted_family_prevents_suffix_chaining(tmp_path):
     # generated suffixes to recover a root family" is an explicit stop
     # condition.  This is why consuming the persisted family is mandatory.
     assert artifact_family_from_source(published) == "sample_average"
+
+
+def test_unsafe_source_basenames_fall_back_to_a_hashed_public_family(tmp_path):
+    """An unsafe stem yields `artifact-<24hex>`, which IS a hash in a public name.
+
+    Fable F5 on `c167b71a`. `_ARTIFACT_FAMILY` admits only
+    `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`, so a stem containing a space, `#`, or a
+    non-ASCII letter falls back to `"artifact-" + sha256(basename)[:24]`.
+    Beamline TIFF stems with spaces make this routine, not exotic.
+
+    That collides with two sentences this objective's own ADR carries: public
+    filenames "do not contain a version, content hash, operation identity,
+    timestamp, or random token", and the design calls the namespace
+    "human-readable". `test_public_slot_names_carry_no_version_hash_or_counter`
+    only covers the safe family `sample`, so it passes over this case.
+
+    MAINTAINER DECISION, pinned either way rather than silently resolved. The
+    two options are to widen the family alphabet (spaces, Unicode letters) or to
+    document the fallback as an exception in the ADR. This row asserts today's
+    behaviour so whichever is chosen is a visible change.
+    """
+    from xrd_tools.io.output_path import (
+        artifact_family_from_source,
+        resolve_finite_output_target,
+    )
+
+    for stem in ("Sample A 001", "basé", "scan#12"):
+        family = artifact_family_from_source(tmp_path / f"{stem}.nexus")
+        assert family.startswith("artifact-")
+        assert len(family) == len("artifact-") + 24
+        name = resolve_finite_output_target(
+            tmp_path, family, operation_token="average",
+        ).name
+        assert name == f"{family}_average.nexus"
+        # The very thing the no-hash row forbids, reached by a different door.
+        assert re.search(r"[0-9a-f]{8,}", name) is not None, name
+
+    # A stem that is already safe is retained verbatim -- no hashing, no
+    # stripping, including one that merely LOOKS like a slot name.
+    for stem in ("scan_12-a.b", "sample_average"):
+        assert artifact_family_from_source(tmp_path / f"{stem}.nexus") == stem
