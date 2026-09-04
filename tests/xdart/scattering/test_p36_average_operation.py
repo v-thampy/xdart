@@ -1567,7 +1567,12 @@ def test_average_publication_gate_linearizes_cancel_wins_and_seal_wins(
             assert gate_results == [True]
             assert update.terminal.status is OperationTerminalStatus.RETURNED
             assert update.terminal.payload.disposition == "COMMITTED"
-            assert get_average_finite_counts(target).evidence.contributor_extent == 2
+            # Counts live in the ARTIFACT, not the anchor.  `target` is only
+            # the request, and the read_bytes() checks above already pin that
+            # the anchor is never written at all.
+            artifact = Path(update.terminal.payload.target)
+            assert artifact != target and artifact.exists()
+            assert get_average_finite_counts(artifact).evidence.contributor_extent == 2
 
     exercise("cancel-wins", cancel_first=True)
     exercise("seal-wins")

@@ -122,11 +122,21 @@ def _stamp(
 
 
 def _average_result(target: str) -> AverageScanResult:
+    # `target` is the ANCHOR requested.  A real committed result names the
+    # SUCCESSOR the route wrote, and the owner verifies a terminal by
+    # recomputing exactly that from anchor + version_identity
+    # (workspace_operations.py:719).  Deriving it here keeps the fixture a
+    # possible object; returning the anchor made every reload path refuse.
+    from xrd_tools.reduction.average import (
+        _average_output_artifact, _average_target,
+    )
+    version = "e" * 64
+    artifact = _average_output_artifact(_average_target(target), version)
     return AverageScanResult(
         disposition="COMMITTED",
-        target=target,
+        target=artifact,
         entry="entry",
-        version_identity="e" * 64,
+        version_identity=version,
         operation_identity="a" * 64,
         science_identity="b" * 64,
         contributor_extent=2,
@@ -151,7 +161,7 @@ def _average_result(target: str) -> AverageScanResult:
         diagnostic_code="",
         diagnostic="",
         h23_phase="committed",
-        commit_identity=_seal(target),
+        commit_identity=_seal(artifact),
     )
 
 
