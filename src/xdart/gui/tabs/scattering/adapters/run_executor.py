@@ -214,6 +214,8 @@ _QUARTILE_STAGE_NAMES = (
     "xye",
     "completion_display",
     "finish_wait",
+    "finish_writer_seal",
+    "finish_display_drain",
 )
 
 
@@ -237,6 +239,12 @@ def _quartile_stage_totals(
             "display_projection",
         )),
         "finish_wait": value("finish_wait"),
+        # finish_wait covers two unrelated things: the writer's terminal seal
+        # (whose real cost is the one deferred integrated-science readback) and
+        # draining the display-projection worker backlog.  Split so a live run
+        # says which dominates the end-of-run tail.
+        "finish_writer_seal": value("finish_writer_seal"),
+        "finish_display_drain": value("finish_display_drain"),
     }
 
 
@@ -2255,6 +2263,7 @@ class StandardRunExecutor:
             finished_current = not (
                 retain_session and not run.stop_requested
             )
+            seal_started = monotonic()
             try:
                 if not finished_current:
                     result = output.commit_epoch()
@@ -2262,11 +2271,16 @@ class StandardRunExecutor:
                     result = output.finish_current()
             except BaseException as error:
                 session_error = error
+            _perf_add(run, "finish_writer_seal", monotonic() - seal_started)
             if session_error is None:
+                drain_started = monotonic()
                 try:
                     self._finish_display_projection(run)
                 except BaseException as error:
                     projection_error = error
+                _perf_add(
+                    run, "finish_display_drain", monotonic() - drain_started,
+                )
             _perf_add(run, "finish_wait", monotonic() - finish_started)
             if session_error is not None:
                 raise session_error.with_traceback(session_error.__traceback__)
@@ -2874,6 +2888,8 @@ class StandardRunExecutor:
             ("writer_flush", "sink_nexus_flush"),
             ("xye", "sink_xye_write"),
             ("finish_wait", "finish_wait"),
+            ("finish_writer_seal", "finish_writer_seal"),
+            ("finish_display_drain", "finish_display_drain"),
         ):
             if key in perf:
                 timing_details.append((name, float(perf[key])))
