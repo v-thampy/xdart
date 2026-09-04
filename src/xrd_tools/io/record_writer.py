@@ -5290,15 +5290,21 @@ class NexusRecordWriter:
         Run drains that set only at finish, so calling it per checkpoint is
         quadratic in frame count: measured +2.9% wall over 3000 frames at the
         production cadence, and it grows.  A checkpoint only ever needs to mark
-        the rows it newly covers, so consume the staged delta and leave
-        `_pending` for the single durable publication at finish.
+        the rows it newly covers, so read the staged delta and leave `_pending`
+        for the single durable publication at finish.
+
+        READ-ONLY on the staged window.  An earlier revision emptied it here,
+        which lost the delta when the publication that follows raised: `flush()`
+        stays retryable and `_pending` survives, but the retry sealed a fresh
+        checkpoint that never covered those labels, so their heavy arrays
+        stayed resident until close.  The window is closed by a COMPLETED seal
+        (`_seal_checkpoint_and_receipts`) or by abort, never here.
         """
         staged = self._staged_since_checkpoint
-        self._staged_since_checkpoint = {}
         if self._facade is None:
             return ()
         current = []
-        for key, receipt in staged.items():
+        for key, receipt in tuple(staged.items()):
             if key not in self._pending:
                 continue
             observed = self._facade.capture_receipt(
@@ -5481,9 +5487,14 @@ class NexusRecordWriter:
                 self._commit_publication_drops(dropped)
         self._checkpoint_rows += rows
         self._checkpoint_read_bytes += read_bytes
-        # Every checkpoint closes the staged window, on both paths: the ordinary
-        # writer never consumes it (it publishes the whole validated batch), so
-        # without this the delta would grow for the life of the run.
+        # The ONLY reset point for the staged window, on both paths: the
+        # ordinary writer never reads it (it publishes the whole validated
+        # batch), so without this the delta would grow for the life of the run.
+        # It sits after recover() deliberately -- a seal that raises before
+        # here leaves the window intact so the retry republishes the same
+        # delta, which is what the pre-31a89da4 writer did from `_pending`.
+        # Re-marking an already-recoverable label is idempotent (the store
+        # holds a set), so a late raise costs a repeat, never a loss.
         self._staged_since_checkpoint.clear()
         self._clear_dirty_evidence()
 

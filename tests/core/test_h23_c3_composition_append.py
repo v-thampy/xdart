@@ -207,6 +207,71 @@ def _begin_finite_overwrite_sink(
     return target, sink, facade
 
 
+def test_failed_checkpoint_publication_retries_the_same_staged_delta(
+    tmp_path,
+):
+    """A seal that raises must not lose the labels it was about to cover.
+
+    `_checkpoint_staged_receipts` reads the staged window; only a COMPLETED
+    seal closes it.  When it emptied the window up front instead, a transient
+    failure in `commit_checkpoint_recoverable` left `flush()` retryable and
+    `_pending` intact, but the delta was gone: the retry sealed a checkpoint
+    covering no labels, so those frames' heavy arrays stayed resident until
+    close and bounded-memory release silently stopped working for that window.
+    """
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.io.record_writer import WriterIncomplete
+    from xrd_tools.reduction import (
+        FrameReduction,
+        NexusTerminalDisposition,
+        ReductionResult,
+    )
+
+    _target, sink, facade = _begin_finite_overwrite_sink(
+        tmp_path,
+        "fast-retry.nexus",
+        "fast",
+        bind_session=True,
+    )
+    recoveries = []
+    fail_next = [True]
+
+    def flaky_recoverable(*values):
+        if fail_next[0]:
+            fail_next[0] = False
+            raise OSError("transient checkpoint publication failure")
+        recoveries.append(values)
+
+    facade.commit_checkpoint_recoverable = flaky_recoverable
+    writer = sink._writer
+
+    sink.write(ScanFrame(0), FrameReduction(0, result_1d=_r1(3)))
+    staged_before = tuple(writer._staged_since_checkpoint)
+    assert staged_before, "the frame should be staged before the first seal"
+
+    with pytest.raises(WriterIncomplete):
+        writer.flush(force=True)
+
+    # The failed attempt must leave the window intact AND the flush retryable.
+    assert tuple(writer._staged_since_checkpoint) == staged_before
+    assert writer._since_flush > 0
+
+    writer.flush(force=True)
+
+    assert len(recoveries) == 1
+    _checkpoint, receipts, _drops, frame_labels, _thumbnails = recoveries[0]
+    assert tuple(frame_labels) == (0,)
+    assert tuple(int(receipt.label) for receipt in receipts) == (0,)
+    # The successful seal is what closes the window.
+    assert writer._staged_since_checkpoint == {}
+
+    # And the Run still finishes normally after the retry: the single durable
+    # publication happens at close exactly as on an unimpeded fast Run.
+    terminal = sink.finish(ReductionResult("fast", {}, 1))
+    assert terminal.disposition is NexusTerminalDisposition.COMMITTED
+    assert len(facade.durable) == 1
+
+
 def test_grouped_semantic_reads_preserve_order_axes_sigma_and_two_observations(
     tmp_path, monkeypatch,
 ):

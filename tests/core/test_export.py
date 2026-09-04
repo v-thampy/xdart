@@ -6,7 +6,15 @@ import h5py
 import numpy as np
 import pytest
 
-from xrd_tools.io.export import write_h5, write_xye
+from xrd_tools.io.export import read_xye, write_h5, write_xye
+
+
+# XYE is written at "%.9g" (io/export.py), so a round trip is lossy in the 9th
+# significant digit.  The tolerance below IS the accepted contract: values are
+# preserved to better than 5e-9 relative, far beyond any XRD measurement.  The
+# whole-number fixtures used elsewhere in this file cannot distinguish "%.9g"
+# from the old "%.18e" and so pin nothing -- these values can.
+XYE_ROUND_TRIP_RTOL = 5e-9
 
 
 def test_write_xye(tmp_path):
@@ -17,6 +25,31 @@ def test_write_xye(tmp_path):
     assert arr.shape == (3, 3)
     np.testing.assert_allclose(arr[:, 0], [1, 2, 3], rtol=1e-10, atol=1e-12)
     np.testing.assert_allclose(arr[:, 1], [4, 5, 6], rtol=1e-10, atol=1e-12)
+
+
+def test_write_xye_round_trip_precision_contract(tmp_path):
+    """Pin the accepted "%.9g" round-trip tolerance on rounding-SENSITIVE values."""
+    out = tmp_path / "precision.xye"
+    # 1.0000000049 is the WORST case for "%.9g": a mantissa just above 1.0
+    # loses a full half-ulp of the 9th digit, i.e. 4.9e-9 relative.  Without a
+    # value like it the fixture only reaches ~1e-9 and the bound is not pinned.
+    x = np.array([1.0000000049, np.pi * 1e3, 1.0 / 3.0, 2.5e-7])
+    y = np.array([1.0 / 7.0, 6.02214076e23, 1.2345678901234e4, np.e])
+    sigma = np.sqrt(np.abs(y))
+    write_xye(out, x, y, variance=sigma)
+
+    rx, ry, rsigma = read_xye(out)
+    for original, restored in ((x, rx), (y, ry), (sigma, rsigma)):
+        np.testing.assert_allclose(
+            restored, original, rtol=XYE_ROUND_TRIP_RTOL, atol=0.0
+        )
+    # And the tolerance is TIGHT: these values genuinely exercise it, so a
+    # future format change that loses more precision cannot pass unnoticed.
+    worst = max(
+        float(np.max(np.abs((restored - original) / original)))
+        for original, restored in ((x, rx), (y, ry), (sigma, rsigma))
+    )
+    assert worst > 4e-9, f"fixture no longer reaches the bound (worst={worst})"
 
 
 def test_write_xye_with_variance(tmp_path):
