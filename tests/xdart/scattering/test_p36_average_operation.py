@@ -915,7 +915,18 @@ def test_average_page_accepts_only_exact_cancelled_payload_status_pairs(
         page, "_request_browser_catalog", lambda: catalogs.append(None),
     )
     monkeypatch.setattr(page, "_notice", notices.append)
+    # SEED a terminal so the state assertion at the end is real.  On a fresh
+    # page `terminal_request` is None, so `is terminal_owner` read `None is
+    # None` and could not have detected a retirement.
+    sentinel_request = object()
+    monkeypatch.setattr(
+        page._processed_browser,
+        "_terminal_presentation",
+        SimpleNamespace(request=sentinel_request),
+        raising=False,
+    )
     terminal_owner = page._processed_browser.terminal_request
+    assert terminal_owner is sentinel_request
     rows = (
         (OperationTerminalStatus.CANCELLED, None, "Average cancelled."),
         (
@@ -955,9 +966,10 @@ def test_average_page_accepts_only_exact_cancelled_payload_status_pairs(
             assert notices[-1] == expected_notice
             assert page._workspace_operations.average_state is None
         assert reloads == clears == catalogs == []
-        # ...and the terminal the browser owns is untouched.  This holds on the
-        # STATE rather than on one method name, so it survives the next
-        # relocation the way the sentinel above did not.
+        # ...and the terminal the browser owns is untouched.  `clears == []`
+        # above proves the stubbed `retire_terminal` was not called; this holds
+        # on the STATE, so it also catches a retirement performed by clearing
+        # the handoff directly rather than through that method.
         assert page._processed_browser.terminal_request is terminal_owner
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
@@ -1572,8 +1584,10 @@ def test_average_publication_gate_linearizes_cancel_wins_and_seal_wins(
             assert update.terminal.status is OperationTerminalStatus.RETURNED
             assert update.terminal.payload.disposition == "COMMITTED"
             # Counts live in the ARTIFACT, not the anchor.  `target` is only
-            # the request, and the read_bytes() checks above already pin that
-            # the anchor is never written at all.
+            # the request.  The read_bytes() checks in the OTHER legs do not
+            # cover this one, so pin the anchor here too rather than claiming
+            # they do.
+            assert target.read_bytes() == before
             artifact = Path(update.terminal.payload.target)
             assert artifact != target and artifact.exists()
             assert get_average_finite_counts(artifact).evidence.contributor_extent == 2
@@ -1625,10 +1639,19 @@ def test_direct_and_gui_average_match_after_fresh_reopen(tmp_path, monkeypatch) 
     gui = update.terminal.payload
     assert update.terminal.status is OperationTerminalStatus.RETURNED
     assert gui.disposition == "COMMITTED"
-    # The successor route writes <anchor stem>.average-<version>.nexus, never
-    # the anchor.  direct_target/gui_target are the REQUESTS; read the artifacts
-    # the results name.
-    direct_artifact = Path(direct.target); gui_artifact = Path(gui.target)
+    # The route writes <family>_average.nexus, never the anchor.
+    # direct_target/gui_target are the REQUESTS.  Derive the expected artifact
+    # from the REQUEST rather than from `result.target`, so the commit-identity
+    # comparison below is anchored on something the result did not supply.
+    from xrd_tools.reduction.average import (
+        _average_output_artifact, _average_target,
+    )
+    direct_artifact = Path(_average_output_artifact(
+        _average_target(str(direct_target))))
+    gui_artifact = Path(_average_output_artifact(
+        _average_target(str(gui_target))))
+    assert Path(direct.target) == direct_artifact
+    assert Path(gui.target) == gui_artifact
     assert direct_artifact != direct_target and gui_artifact != gui_target
     assert direct_artifact.exists() and gui_artifact.exists()
     assert direct.science_identity == gui.science_identity

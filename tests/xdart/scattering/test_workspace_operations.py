@@ -634,3 +634,73 @@ def test_close_preserves_active_state_until_exact_slot_cleanup() -> None:
     assert owner.average_identity is identity
     assert owner.close().cleanup_status is CleanupStatus.CLEANED
     assert owner.average_state is None
+
+
+def test_committed_average_naming_a_foreign_artifact_never_reloads() -> None:
+    """The page's slot recompute refuses a terminal that names another artifact.
+
+    Fable F1 on `b078cbda`: `workspace_operations.py` recomputes the stable slot
+    from the anchor and compares it to `result.target`, but NO test asserted
+    that contract.  At the parent the branch executed only by accident, because
+    the fixtures happened to name the anchor; replacing the recompute with
+    `successor = result.target` left the whole file green.  This row is that
+    missing oracle.
+
+    The failure it guards is not hypothetical: a RETURNED + COMMITTED terminal
+    naming an artifact in another directory or family would otherwise be adopted
+    and Browse reloaded onto a foreign file.
+    """
+    owner, slot = _owner_with_slot()
+    identity = OperationIdentity(77)
+    anchor = "/detached/average.nxs"
+    slot._identity = identity
+    owner._average = AverageOperationState(identity, 4, anchor, "entry")
+
+    # A well-formed COMMITTED result in every respect EXCEPT the path it names.
+    foreign = replace(
+        _average_result(anchor), target="/detached/elsewhere/other_average.nexus",
+    )
+    transition = owner.consume_average_update(
+        OperationUpdate(
+            identity,
+            terminal=OperationTerminal(
+                identity, OperationTerminalStatus.RETURNED, payload=foreign,
+            ),
+        ),
+        current_intent_revision=4,
+    )
+
+    assert transition.effect is WorkspaceRefreshEffect.CONTROLS
+    assert "target mismatch" in transition.notice
+    assert transition.average_reload is None
+    assert transition.request_catalog is False
+    assert owner.average_state is None
+
+
+def test_committed_average_naming_the_recomputed_slot_is_adopted() -> None:
+    """The companion: the SAME shape with the right path is accepted.
+
+    Without this, the row above would still pass if the guard refused
+    everything, which is the classic way a mismatch oracle rots into a
+    tautology.
+    """
+    owner, slot = _owner_with_slot()
+    identity = OperationIdentity(78)
+    anchor = "/detached/average.nxs"
+    slot._identity = identity
+    owner._average = AverageOperationState(identity, 4, anchor, "entry")
+
+    transition = owner.consume_average_update(
+        OperationUpdate(
+            identity,
+            terminal=OperationTerminal(
+                identity,
+                OperationTerminalStatus.RETURNED,
+                payload=_average_result(anchor),
+            ),
+        ),
+        current_intent_revision=4,
+    )
+
+    assert transition.average_reload is not None
+    assert "target mismatch" not in transition.notice

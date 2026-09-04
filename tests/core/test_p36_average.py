@@ -1021,7 +1021,9 @@ def test_average_rejects_selected_sidecar_foreign_snapshot_then_restore(
     runner._execute_graph = lambda _graph: runner.plan
     refusal = runner.start()
     assert type(refusal) is module.AverageScanResult
-    assert refusal.disposition != "COMMITTED"
+    assert (refusal.disposition, refusal.diagnostic_code) == (
+        "REFUSED", "AVERAGE_PREPARATION_FAILED"
+    )
     assert "metadata source changed during read" in refusal.diagnostic
     assert runner.close() is refusal
     # The facts this test exists to protect, unchanged: the transient foreign
@@ -1783,8 +1785,16 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
                 elif case == "recapture-error": assert terminal.diagnostic_code == "AVERAGE_H23_FAILED" and not runner._gate_called
                 else: assert "TARGET" in terminal.diagnostic_code
                 assert target.read_bytes() == before_target
+                # The ANCHOR is never written by this route, so its bytes cannot
+                # fail on a botched rollback -- that oracle was vacuous.  The
+                # ARTIFACT is what the route creates and must remove on abort.
+                artifact = Path(module._average_output_artifact(
+                    module._average_target(str(target))
+                ))
+                assert not artifact.exists()
                 with pytest.raises((KeyError, ValueError)): get_average_finite_counts(target)
                 assert not tuple(target.parent.glob(f".{target.name}*"))
+                assert not tuple(artifact.parent.glob(f".{artifact.name}*"))
             terminal_events, terminal_counts = tuple(events), dict(counts)
             assert runner.close() is terminal
             assert tuple(events) == terminal_events and counts == terminal_counts
