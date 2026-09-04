@@ -45,6 +45,7 @@ from xrd_tools.core import (
 )
 from xrd_tools.io.schema import (
     INTEGRATED_ROW_ALIGNED,
+    ARTIFACT_FAMILY_ATTR,
     SOURCE_BASE_ATTR,
     THUMBNAIL_LUT_ATTRS,
     canonical_gi_mode_key,
@@ -492,6 +493,57 @@ def validate_source_base(entry_grp: h5py.Group, source_base) -> str | None:
                 "file for the new Project Folder."
             )
     return base
+
+
+def validate_artifact_family(entry_grp: h5py.Group, artifact_family) -> str | None:
+    """Validate the persisted root family without mutating the entry.
+
+    Mirrors :func:`validate_source_base`, including its LEGACY TOLERANCE: a
+    record written before this attribute existed has none, and appending to it
+    must keep working, so an ABSENT stored value is not a mismatch.  Only a
+    stored value that DIFFERS raises.
+    """
+    if not artifact_family:
+        return None
+    family = str(artifact_family)
+    existing = entry_grp.attrs.get(ARTIFACT_FAMILY_ATTR)
+    if existing is not None:
+        if isinstance(existing, bytes):
+            existing = existing.decode("utf-8", errors="replace")
+        if str(existing) != family:
+            raise ValueError(
+                f"cannot append to {os.fspath(entry_grp.file.filename)!r}: its "
+                f"root family (@{ARTIFACT_FAMILY_ATTR}={str(existing)!r}) "
+                f"differs from the current ({family!r}).  Every operation on "
+                "this artifact publishes into that family's stable slots; "
+                "start a NEW output file for a different family."
+            )
+    return family
+
+
+def stamp_artifact_family(entry_grp: h5py.Group, artifact_family) -> str | None:
+    """Stamp the root family on ``entry/@artifact_family_v1``.
+
+    Written ONCE per file, at the same seam as ``@source_base`` -- never in the
+    per-frame loop, so the accepted integration/writer floors are untouched.
+
+    This is what makes the stable-slot policy's anti-chaining rule real. A later
+    operation CONSUMES this value; without it, deriving a family from the
+    artifact's own stem turns `sample_int2d.nexus` into
+    `sample_int2d_average.nexus`.
+    """
+    family = validate_artifact_family(entry_grp, artifact_family)
+    if family is None:
+        return None
+    try:
+        entry_grp.attrs[ARTIFACT_FAMILY_ATTR] = family
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed to stamp @{ARTIFACT_FAMILY_ATTR}={family!r} on "
+            f"{entry_grp.name!r}; a later operation would derive a chained "
+            "family from this artifact's own stem"
+        ) from exc
+    return family
 
 
 def stamp_source_base(entry_grp: h5py.Group, source_base) -> str | None:

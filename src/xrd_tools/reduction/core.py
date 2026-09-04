@@ -1544,6 +1544,11 @@ class NexusSink:
     atomic: bool | None = None
     complete_record: bool = True
     source_base: Path | str | None = None
+    #: ROOT FAMILY persisted on the entry so a LATER operation consumes it
+    #: instead of deriving one from this artifact's own stem.  Without it,
+    #: reintegrating `sample_int2d.nexus` yields the chained
+    #: `sample_int2d_reintegrate1d.nexus` that ADR-0010 forbids by name.
+    artifact_family: str | None = None
     write_thumbnails: bool = True
     thumbnail_max: int = 256
     run_configuration_provenance: Mapping[str, Any] | None = field(
@@ -2102,6 +2107,7 @@ class NexusSink:
                     flush_every=self.flush_every,
                     complete_record=self.complete_record,
                     source_base=self.source_base,
+                    artifact_family=self.artifact_family,
                     file_lock=self.file_lock,
                     opener=open_nexus_writer,
                     transaction_binding=WriterTransactionBinding(
@@ -2150,6 +2156,7 @@ class NexusSink:
                     candidate_binding,
                     entry=self.entry,
                     source_base=self.source_base,
+                    artifact_family=self.artifact_family,
                     file_lock=self.file_lock,
                     replacement_dimension=replacement[1],
                     replacement_labels=replacement[2],
@@ -2252,6 +2259,7 @@ class NexusSink:
                 flush_every=self.flush_every,
                 complete_record=self.complete_record,
                 source_base=self.source_base,
+                artifact_family=self.artifact_family,
                 file_lock=self.file_lock,
                 opener=open_nexus_writer,
                 transaction_binding=WriterTransactionBinding(

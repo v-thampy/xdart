@@ -273,7 +273,16 @@ def _predecessor(
             "finite predecessor lineage is unavailable"
         ) from error
     if lineage is None:
-        return capture_finite_predecessor(admission, terminal=terminal)
+        # No finite lineage node: this is a RUN or AVERAGE output (they write
+        # through NexusSink, not the finite publisher) or a foreign/legacy file.
+        # Consume the root family those writers stamp on the entry rather than
+        # falling through to a stem-derived family, which is what produced
+        # `<scan>_int2d_reintegrate1d.nexus`.
+        return capture_finite_predecessor(
+            admission,
+            terminal=terminal,
+            artifact_family_v1=_persisted_root_family(admission.path, entry),
+        )
     payload = json.loads(lineage.canonical_json)
     return capture_finite_predecessor(
         admission,
@@ -283,6 +292,56 @@ def _predecessor(
         publication_identity=payload["publication_identity"],
         lineage_identity=lineage.lineage_identity,
     )
+
+
+def _persisted_root_family(path, entry: str) -> str | None:
+    """Read `entry/@artifact_family_v1`, or refuse a slot-named file without one.
+
+    A stable public name is `<family><slot>.nexus`, so deriving a family from
+    THIS artifact's stem is only safe when the stem is not itself a published
+    slot. When it is, the derived family would chain
+    (`sample_average` -> `sample_average_reintegrate1d.nexus`), and stripping
+    the slot to recover the root is an explicit stop condition.
+
+    So: return the stamped family when present. When absent AND the stem ends in
+    a known slot, REFUSE with a diagnostic instead of silently chaining. A
+    pre-slot legacy artifact keeps working, because its stem ends in no slot.
+
+    Matching the tail against `FINITE_OPERATION_SLOTS` is a membership test on a
+    CLOSED set, not a parse of a generated token: it is used only to decide
+    whether to refuse, never to recover a family.
+    """
+    from xrd_tools.io.output_path import FINITE_OPERATION_SLOTS
+    from xrd_tools.io.schema import ARTIFACT_FAMILY_ATTR
+
+    family = None
+    try:
+        with h5py.File(path, "r") as document:
+            group = document.get(entry)
+            if isinstance(group, h5py.Group):
+                stored = group.attrs.get(ARTIFACT_FAMILY_ATTR)
+                if stored is not None:
+                    family = (
+                        stored.decode("utf-8", errors="replace")
+                        if isinstance(stored, bytes) else str(stored)
+                    )
+    except OSError as error:
+        raise FiniteArtifactIntegrityError(
+            "finite predecessor root family is unavailable"
+        ) from error
+    if family is not None:
+        return family
+    stem = Path(os.fspath(path)).stem
+    for slot in FINITE_OPERATION_SLOTS.values():
+        if stem.endswith(slot) and stem != slot:
+            raise FiniteArtifactIntegrityError(
+                f"{os.fspath(path)!r} is named as the {slot!r} slot but carries "
+                f"no @{ARTIFACT_FAMILY_ATTR}; its root family cannot be "
+                "recovered from the filename, and deriving one from the stem "
+                "would publish a chained name.  Re-run the operation that "
+                "produced it so the family is persisted."
+            )
+    return None
 
 
 def _derived_request_inputs(

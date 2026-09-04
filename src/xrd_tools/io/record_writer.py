@@ -44,6 +44,7 @@ from xrd_tools.io.nexus_record import (
     ensure_frames_container,
     read_background_dependency,
     replace_frame_record,
+    stamp_artifact_family,
     stamp_source_base,
     validate_source_base,
     write_average_finite_counts,
@@ -87,6 +88,7 @@ from xrd_tools.io.schema import (
     INTEGRATED_ROW_ALIGNED,
     MONOTONIC_ATTR,
     PRIMARY_MODE_ATTR,
+    ARTIFACT_FAMILY_ATTR,
     SOURCE_BASE_ATTR,
     THUMBNAIL_LUT_ATTRS,
     canonical_gi_mode_key,
@@ -1931,6 +1933,7 @@ class NexusRecordWriter:
         flush_every: int | None = 16,
         complete_record: bool = True,
         source_base: Path | str | None = None,
+        artifact_family: str | None = None,
         file_lock: Any | None = None,
         pool: Any | None = None,
         replace_attempts: int = 3,
@@ -1972,6 +1975,9 @@ class NexusRecordWriter:
                     > _MAX_REPLACEMENT_PATH_UTF8_BYTES):
             raise ValueError("source_base exceeds the persisted path byte ceiling")
         self.source_base = source_base
+        # ROOT FAMILY for the stable-slot policy.  Stamped once at the same seam
+        # as source_base; never touched per frame.
+        self.artifact_family = artifact_family
         self.file_lock = file_lock
         self._pool = get_pool() if pool is None else pool
         self._replace_attempts = int(replace_attempts)
@@ -2168,6 +2174,7 @@ class NexusRecordWriter:
         *,
         entry: str,
         source_base: Path | str,
+        artifact_family: str | None = None,
         file_lock: Any | None,
         replacement_dimension: str,
         replacement_labels: tuple[int, ...],
@@ -2191,6 +2198,10 @@ class NexusRecordWriter:
             flush_every=flush_every,
             complete_record=True,
             source_base=source_base,
+            # Finite artifacts already carry the family in their lineage node;
+            # stamping the entry attribute too keeps ONE reader
+            # (`_persisted_root_family`) sufficient for every artifact kind.
+            artifact_family=artifact_family,
             file_lock=file_lock,
             replacement_dimension=replacement_dimension,
             replacement_labels=replacement_labels,
@@ -4430,6 +4441,13 @@ class NexusRecordWriter:
                     )
                 if self._replacement_configuration is None and self.complete_record and self.source_base:
                     stamp_source_base(self._entry_group(), self.source_base)
+                if self._replacement_configuration is None and self.artifact_family:
+                    # Independent of source_base and of complete_record: a
+                    # partial record is still a member of its family, and a
+                    # later operation must be able to consume it.
+                    stamp_artifact_family(
+                        self._entry_group(), self.artifact_family,
+                    )
                 if self._append_decision is not None:
                     stage_append_lineage(
                         self._entry_group(),
@@ -4511,6 +4529,8 @@ class NexusRecordWriter:
             if (gi_link is not None and type(gi_link) is not h5py.HardLink) or self._replacement_node_signature(gi_config) != frozen[3]: raise WriterStateError("replacement opener changed physical GI config")
             self._authorize_transaction_mutation()
             entry.attrs[SOURCE_BASE_ATTR] = Path(os.fspath(self.source_base)).as_posix()
+            if self.artifact_family:
+                entry.attrs[ARTIFACT_FAMILY_ATTR] = str(self.artifact_family)
             for name in ("source_execution", "append_lineage"):
                 if name in config:
                     del config[name]

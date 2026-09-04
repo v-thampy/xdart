@@ -2081,3 +2081,89 @@ def test_average_repeat_in_the_same_directory_currently_refuses(
     assert second.disposition == "REFUSED"
     assert second.diagnostic_code == "AVERAGE_OUTPUT_EXISTS"
     assert artifact.read_bytes() == committed_bytes
+
+
+def test_average_persists_its_root_family_so_the_next_operation_cannot_chain(
+    tmp_path, monkeypatch,
+) -> None:
+    """A committed Average carries `@artifact_family_v1`, refuting P-CHAIN.
+
+    Fable F1 (P2) on `c167b71a`. Average writes through `NexusSink`, not the
+    finite publisher, so before this change its output carried NO root family.
+    `_predecessor` then fell through to a stem-derived family and the next
+    operation published `<family>_average_reintegrate1d.nexus` -- the chained
+    name ADR-0010 forbids by name, reachable today, in the same range that
+    carried the ADR.
+
+    Three things are asserted, and the third is the one that matters: the
+    attribute exists, it is the ROOT family rather than the artifact's stem, and
+    the family a following operation would CONSUME is the root -- so its slot is
+    `<root>_reintegrate1d.nexus` and not a chain.
+    """
+    from xrd_tools.io.output_path import (
+        artifact_family_from_source,
+        resolve_finite_output_target,
+    )
+    from xrd_tools.io.schema import ARTIFACT_FAMILY_ATTR
+    from xrd_tools.reduction.reintegrate_successor import _persisted_root_family
+
+    source = _series(tmp_path)
+    target = tmp_path / "scan12.nxs"
+    _stub_integrators(monkeypatch, [])
+    result = _run_average_scan(AverageScanRecipe(
+        source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=4)),
+    ))
+    assert result.disposition == "COMMITTED"
+    artifact = Path(result.target)
+    assert artifact.name == "scan12_average.nexus"
+
+    with h5py.File(artifact, "r") as document:
+        stored = document["entry"].attrs[ARTIFACT_FAMILY_ATTR]
+    if isinstance(stored, bytes):
+        stored = stored.decode("utf-8")
+    # The ROOT, not this artifact's stem.
+    assert str(stored) == "scan12"
+    assert str(stored) != artifact.stem
+
+    consumed = _persisted_root_family(artifact, "entry")
+    assert consumed == "scan12"
+    family = artifact_family_from_source(artifact, consumed)
+    following = resolve_finite_output_target(
+        artifact.parent, family, operation_token="reintegrate-1d",
+    )
+    assert following.name == "scan12_reintegrate1d.nexus"
+    # The chain that was reachable before this change.
+    assert following.name != "scan12_average_reintegrate1d.nexus"
+
+
+def test_a_slot_named_artifact_without_a_family_is_refused_not_chained(
+    tmp_path,
+) -> None:
+    """A slot-named file carrying no family REFUSES rather than chaining.
+
+    The stamp only helps files this code wrote. A slot-named artifact from an
+    older build, or a hand-made one, still has no `@artifact_family_v1`, and the
+    stem is exactly what must not be used. Recovering the root by stripping the
+    slot is an explicit stop condition, so the only honest options are to refuse
+    or to publish a chained name. Refuse.
+
+    Matching the stem's tail against the CLOSED slot vocabulary decides only
+    whether to refuse; it never recovers a family, which is the distinction the
+    stop condition draws.
+    """
+    from xrd_tools.io.finite_artifact import FiniteArtifactIntegrityError
+    from xrd_tools.reduction.reintegrate_successor import _persisted_root_family
+
+    orphan = tmp_path / "scan12_average.nexus"
+    with h5py.File(orphan, "w") as document:
+        document.create_group("entry")
+
+    with pytest.raises(FiniteArtifactIntegrityError, match="root family"):
+        _persisted_root_family(orphan, "entry")
+
+    # A PRE-SLOT legacy artifact keeps working: its stem ends in no known slot,
+    # so there is nothing to chain and the stem-derived family is still safe.
+    legacy = tmp_path / "scan12.nexus"
+    with h5py.File(legacy, "w") as document:
+        document.create_group("entry")
+    assert _persisted_root_family(legacy, "entry") is None
