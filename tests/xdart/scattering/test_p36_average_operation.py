@@ -77,7 +77,10 @@ def _result(disposition: str, target: str = "/detached/average.nxs") -> AverageS
     # impossible result that every reload path then correctly refused, so the
     # tests were asserting refusals they had manufactured themselves.
     version = "e" * 64
-    artifact = _average_output_artifact(_average_target(target), version)
+    # The public slot no longer carries the version, so the derivation takes
+    # only the anchor.  `version` still populates `version_identity` below,
+    # which is where the identity actually lives.
+    artifact = _average_output_artifact(_average_target(target))
     committed = disposition == "COMMITTED"
     evidence = (AverageFiniteCountsEvidence(
         "average_scan_v1", 2, (1, 1), "<u4", "c" * 64, 1, 2, 0,

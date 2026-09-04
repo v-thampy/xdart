@@ -62,12 +62,31 @@ __all__ = [
     "is_readable_output_path",
     "artifact_family_from_source",
     "resolve_finite_output_target",
+    "FINITE_OPERATION_SLOTS",
 ]
 
 
 _ARTIFACT_FAMILY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
-_FINITE_OPERATION_TOKEN = re.compile(r"[a-z0-9][a-z0-9-]{0,39}\Z")
-_LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
+
+#: The CLOSED public operation vocabulary (ADR-0010, carried as 491b9413).
+#: A generated public filename is ``<root-family><slot>.nexus`` and the
+#: separator is an UNDERSCORE, not the dot the superseded immutable-successor
+#: route used -- a dot reads as a suffix to every path tool, which is how
+#: ``sample.average-<hex>.nexus`` came to look like a versioned sibling.
+#:
+#: Closed on purpose.  An open token would let a caller mint a public name this
+#: policy never reviewed, and "do not parse generated suffixes to recover a root
+#: family" then leaves no way to read that name back.
+FINITE_OPERATION_SLOTS: dict[str, str] = {
+    "int-1d": "_int1d",
+    "int-2d": "_int2d",
+    "average": "_average",
+    "reintegrate-1d": "_reintegrate1d",
+    "reintegrate-2d": "_reintegrate2d",
+    "stitch-1d": "_stitch1d",
+    "stitch-2d": "_stitch2d",
+    "rsm": "_rsm",
+}
 
 
 def is_readable_output_path(path: "os.PathLike[str] | str") -> bool:
@@ -170,44 +189,42 @@ def resolve_finite_output_target(
     artifact_family: str,
     *,
     operation_token: str,
-    version_identity: str,
-    explicit_target: "os.PathLike[str] | str | None" = None,
 ) -> Path:
-    """Resolve one absent-path or deterministic immutable successor name.
+    """Resolve the one stable public slot ``<family><slot>.nexus``.
 
-    An absent explicit destination is honored after strict ``.nexus`` suffix
-    normalization.  An occupied explicit destination is never replaced; the
-    deterministic family/operation/version name is selected instead.  An
-    occupied deterministic name remains selected so the publisher can perform
-    exact-version reuse or typed collision admission without a counter suffix.
+    Repeating an operation for the same family returns the SAME path, occupied
+    or not: replacing that operation's own slot is the policy, and selecting a
+    different name on a second run is exactly the accumulating public sequence
+    ADR-0010 forbids.  Whether an occupied slot may be replaced is a
+    publication decision owned by the transaction, not a naming one.
+
+    Deliberately impossible to misuse.  This owner takes no version identity and
+    no explicit target, so no caller can reintroduce a public version name or
+    bypass the vocabulary at this seam -- the previous signature accepted both,
+    and the rule was merely unbroken rather than unbreakable.  The version, the
+    science identity and the source set survive in persisted provenance, which
+    is where exact identity belongs; the public name stays human-readable.
     """
 
     if type(artifact_family) is not str or not _ARTIFACT_FAMILY.fullmatch(
         artifact_family
     ):
         raise ValueError("artifact family is not canonical")
-    if type(operation_token) is not str or not _FINITE_OPERATION_TOKEN.fullmatch(
-        operation_token
-    ):
-        raise ValueError("finite operation token is not canonical")
-    if type(version_identity) is not str or not _LOWER_HEX_64.fullmatch(
-        version_identity
-    ):
-        raise ValueError("finite version identity is not canonical")
+    slot = (
+        FINITE_OPERATION_SLOTS.get(operation_token)
+        if type(operation_token) is str
+        else None
+    )
+    if slot is None:
+        raise ValueError(
+            "finite operation is not one of the stable public slots: "
+            + ", ".join(sorted(FINITE_OPERATION_SLOTS))
+        )
     try:
         root = Path(os.fspath(directory))
     except TypeError as error:
         raise TypeError("finite output directory must be path-like") from error
-    if explicit_target is not None and os.fspath(explicit_target) != "":
-        requested = Path(os.fspath(explicit_target)).with_suffix(
-            NEW_OUTPUT_SUFFIX
-        )
-        if not os.path.lexists(requested):
-            return requested
-    return root / (
-        f"{artifact_family}.{operation_token}-{version_identity[:32]}"
-        f"{NEW_OUTPUT_SUFFIX}"
-    )
+    return root / f"{artifact_family}{slot}{NEW_OUTPUT_SUFFIX}"
 
 
 def resolve_output_target(

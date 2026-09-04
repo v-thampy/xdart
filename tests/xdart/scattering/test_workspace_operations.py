@@ -131,7 +131,10 @@ def _average_result(target: str) -> AverageScanResult:
         _average_output_artifact, _average_target,
     )
     version = "e" * 64
-    artifact = _average_output_artifact(_average_target(target), version)
+    # The public slot no longer carries the version, so the derivation takes
+    # only the anchor.  `version` still populates `version_identity` below,
+    # which is where the identity actually lives.
+    artifact = _average_output_artifact(_average_target(target))
     return AverageScanResult(
         disposition="COMMITTED",
         target=artifact,

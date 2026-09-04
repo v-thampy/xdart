@@ -706,19 +706,27 @@ class WorkspaceOperationOwner:
                 "Average returned an invalid terminal disposition.",
             )
         # Average never writes `target`: it is only this operation's directory
-        # and naming anchor.  Recompute the deterministic successor from that
-        # anchor plus the result's own version identity, so a wrong directory,
-        # family or version cannot be adopted.  Path math only -- the worker
-        # already did the full provenance verification.
+        # and naming anchor.  Recompute the stable slot from that anchor so a
+        # terminal naming a different directory, family or operation cannot be
+        # adopted.  Path math only -- the worker already did the full
+        # provenance verification.
+        #
+        # NARROWED by the stable-slot policy, deliberately.  The recompute used
+        # to include the result's own version identity, so it also refused a
+        # wrong VERSION.  Public names no longer carry one, so this guard can
+        # no longer see that class of mismatch.  Nothing was lost silently:
+        # version agreement is verified where the evidence actually lives --
+        # `_committed_average_mismatch` (average.py:593) checks the committed
+        # result against the recomputed slot, and the version itself survives
+        # in persisted provenance.  This guard's remaining job is to refuse a
+        # FOREIGN artifact, which is the failure this branch was written for.
         from xrd_tools.reduction.average import (
             _average_output_artifact,
             _average_target,
         )
 
         try:
-            successor = _average_output_artifact(
-                _average_target(target), result.version_identity
-            )
+            successor = _average_output_artifact(_average_target(target))
         except Exception:
             successor = None
         if successor is None or result.target != successor or result.entry != entry:

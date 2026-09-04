@@ -255,9 +255,10 @@ def test_request_identities_are_deterministic_and_path_roles_are_separate(
     assert first.publication_identity != third.publication_identity
     assert first.source_artifact == str(source.resolve())
     assert first.output_artifact != first.source_artifact
-    assert Path(first.output_artifact).name == (
-        f"scan.reintegrate-1d-{first.version_identity[:32]}.nexus"
-    )
+    assert Path(first.output_artifact).name == "scan_reintegrate1d.nexus"
+    # The version identity is still deterministic and still distinguishes
+    # requests (asserted above); it simply never reaches the public name.
+    assert first.version_identity[:32] not in first.output_artifact
     assert first.canonical_version_json.encode("utf-8")
 
 
@@ -428,28 +429,45 @@ def test_request_recomputes_and_refuses_tampered_derived_identities(
         replace(request, **{field: _digest(f"tampered-{field}")})
 
 
-def test_explicit_absent_target_is_honored_and_occupied_target_derives_version(
-    tmp_path: Path,
-) -> None:
+def test_explicit_target_no_longer_names_the_artifact(tmp_path: Path) -> None:
+    """An explicit target constrains the DIRECTORY only; the slot names the file.
+
+    This replaces the superseded contract in which an absent explicit target was
+    honored verbatim and an occupied one fell back to a version-named sibling.
+    Both halves are gone by policy: honouring a caller's filename would bypass
+    the closed vocabulary, and the version-named fallback was the accumulating
+    public sequence ADR-0010 forbids.
+    """
     source = tmp_path / "source.nexus"
     source.write_bytes(b"source")
     explicit = tmp_path / "chosen.h5"
-    first = _request(tmp_path, source, explicit_target=explicit)
-    assert first.output_artifact == str((tmp_path / "chosen.nexus").resolve())
 
+    first = _request(tmp_path, source, explicit_target=explicit)
+    assert first.output_artifact == str((tmp_path / "scan_reintegrate1d.nexus").resolve())
+    assert "chosen" not in first.output_artifact
+
+    # An OCCUPIED slot is still the same slot -- a repeat replaces its own
+    # result rather than accumulating a sibling.  Whether the replacement is
+    # allowed is the transaction's decision, not the namer's.
     Path(first.output_artifact).write_bytes(b"foreign")
     second = _request(tmp_path, source, explicit_target=explicit)
-    assert second.output_artifact == str(
-        resolve_finite_output_target(
-            tmp_path,
-            "scan",
-            operation_token="reintegrate-1d",
-            version_identity=second.version_identity,
-            explicit_target=explicit,
-        ).resolve()
-    )
-    assert second.output_artifact != first.output_artifact
+    assert second.output_artifact == first.output_artifact
     assert Path(first.output_artifact).read_bytes() == b"foreign"
+
+
+def test_explicit_target_in_another_directory_is_refused(tmp_path: Path) -> None:
+    """A cross-directory request is refused, never quietly redirected.
+
+    The explicit target no longer names the file, so the only honest options are
+    to refuse or to silently write somewhere the caller did not ask for.  Refuse.
+    """
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    with pytest.raises(ValueError, match="destination directory"):
+        _request(tmp_path, source, explicit_target=elsewhere / "chosen.nexus")
 
 
 @pytest.mark.parametrize(

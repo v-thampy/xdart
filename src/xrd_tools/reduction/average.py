@@ -490,13 +490,28 @@ def _average_version_identity(
     ).hexdigest()
 
 
-def _average_output_artifact(anchor: str, version_identity: str) -> str:
+def _average_output_artifact(anchor: str, *, artifact_family: str | None = None) -> str:
+    """The stable ``<family>_average.nexus`` slot beside *anchor*.
+
+    *anchor* supplies the DIRECTORY and, absent a persisted family, the family.
+    It is never written.
+
+    STEP-3 PREREQUISITE, deliberately recorded here rather than in the packet
+    only.  The anchor is the ordinary Run target (`page.py:2554`).  While that
+    target is `<scan>.nexus` the anchor-derived family is `<scan>` and this is
+    correct.  The moment Run adopts its own `_int1d`/`_int2d` slot the anchor
+    becomes `<scan>_int2d.nexus`, and deriving the family from that stem yields
+    `<scan>_int2d_average.nexus` -- precisely the chained suffix ADR-0010
+    forbids by name.  Stripping `_int2d` to recover the root is NOT the remedy;
+    parsing a generated suffix is an explicit stop condition.  The remedy is to
+    pass the family Run persisted, which is why *artifact_family* exists now
+    and why renaming Run without persisting a root family is unsafe.
+    """
     requested = Path(anchor)
     return str(resolve_finite_output_target(
         requested.parent,
-        artifact_family_from_source(requested),
+        artifact_family_from_source(requested, artifact_family),
         operation_token='average',
-        version_identity=version_identity,
     ).resolve())
 def _derived_reduction(recipe: AverageScanRecipe) -> ReductionPlan:
     value = _thaw_reduction(recipe)
@@ -542,7 +557,7 @@ def _plan_from_prepared_graph(
         science_identity=science,
         entry=recipe.entry,
     )
-    output = _average_output_artifact(recipe.target, version)
+    output = _average_output_artifact(recipe.target)
     snapshot = capture_target_snapshot(output)
     _reject(snapshot.exists, 'AVERAGE_OUTPUT_EXISTS')
     prospective = AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, output, version, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, '')
@@ -575,7 +590,7 @@ def _committed_average_mismatch(result: AverageScanResult, target: str | Path, e
     if _COUNT_DIGEST.fullmatch(result.version_identity) is None:
         return 'version'
     try:
-        expected = _average_output_artifact(_average_target(target), result.version_identity)
+        expected = _average_output_artifact(_average_target(target))
     except Exception:
         return 'target'
     if result.target != expected or result.entry != entry: return 'target' if result.target != expected else 'entry'

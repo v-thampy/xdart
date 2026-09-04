@@ -73,10 +73,7 @@ def _plan(
             else expected_terminal
         ),
         expected_labels=seeded.labels,
-        explicit_output=(
-            seeded.target.parent / "immutable-successor.nexus"
-            if explicit_output is None else explicit_output
-        ),
+        explicit_output=explicit_output,
         **values,
     )
 
@@ -187,10 +184,7 @@ def _prepared_plan(
             if preparation is None else preparation
         ),
         expected_labels=seeded.labels,
-        explicit_output=(
-            seeded.target.parent / "immutable-prepared.nexus"
-            if explicit_output is None else explicit_output
-        ),
+        explicit_output=explicit_output,
         **values,
     )
     return offer, plan
@@ -691,7 +685,9 @@ def test_postlink_hold_releases_old_run_and_exact_replay_reuses_successor(
     with pytest.raises(FiniteArtifactPublicationHeld):
         run_reintegrate_successor(plan)
 
-    output = seeded.target.parent / "immutable-successor.nexus"
+    # The stable slot, not the requested filename: an explicit output no longer
+    # names the artifact, so ask the plan what it actually published.
+    output = Path(plan.output_artifact)
     assert output.exists()
     assert seeded.target.read_bytes() == before
 
@@ -1099,7 +1095,7 @@ def test_unicode_single_epoch_append_is_prepared_and_preserved(
     _stub_integrators(monkeypatch)
     result = run_reintegrate_successor(plan)
     assert result.disposition == "COMMITTED"
-    with h5py.File(output, "r") as document:
+    with h5py.File(plan.output_artifact, "r") as document:
         assert (
             document["entry/reduction/config/append_lineage"][()]
             == expected_lineage
@@ -1429,7 +1425,7 @@ def test_prepared_dimensions_admit_independent_inventories(
     assert seeded.target.read_bytes() == before
     sibling = "2d" if dimension == "1d" else "1d"
     expected_sibling = (2, 5, 9) if sibling == "2d" else (2, 5)
-    with h5py.File(output, "r") as document:
+    with h5py.File(plan.output_artifact, "r") as document:
         assert tuple(document[
             f"entry/integrated_{dimension}/frame_index"
         ][...]) == browse_labels
@@ -2182,6 +2178,11 @@ def test_cross_route_identity_content_and_exact_reuse(
     assert prepared.operation_identity != legacy.operation_identity
 
     plans = {"prepared": prepared, "bounded-legacy": legacy}
+    # Both routes resolve the SAME stable slot -- that identity is the point of
+    # this test, and it is now visible in the path rather than only in the
+    # publication identity asserted above.
+    assert prepared.output_artifact == legacy.output_artifact
+    output = Path(prepared.output_artifact)
     _stub_integrators(monkeypatch)
     first = run_reintegrate_successor(plans[first_route])
     first_bytes = output.read_bytes()
@@ -2219,8 +2220,10 @@ def test_cross_route_science_and_preservation_are_exactly_equal(
         labels=(0, 1) if append else (2, 5),
         name=f"science-parity-{dimension}-{append}",
     )
-    prepared_output = seeded.target.parent / f"prepared-{dimension}.nexus"
-    legacy_output = seeded.target.parent / f"legacy-{dimension}.nexus"
+    prepared_root = seeded.target.parent / "prepared-route"
+    legacy_root = seeded.target.parent / "legacy-route"
+    prepared_root.mkdir()
+    legacy_root.mkdir()
     offer = None
     if append:
         source, _lineage = _install_prepared_append_lineage(seeded)
@@ -2234,15 +2237,21 @@ def test_cross_route_science_and_preservation_are_exactly_equal(
     _offer, prepared = _prepared_plan(
         seeded,
         dimension=dimension,
-        explicit_output=prepared_output,
+        destination_directory=prepared_root,
         offer=offer,
     )
     legacy = _plan(
         seeded,
         dimension=dimension,
-        explicit_output=legacy_output,
+        destination_directory=legacy_root,
         expected_terminal=None,
     )
+    # Same family, same operation, different directories: identical slot NAME,
+    # distinct paths.  That is what lets both routes' bytes be compared below.
+    prepared_output = Path(prepared.output_artifact)
+    legacy_output = Path(legacy.output_artifact)
+    assert prepared_output != legacy_output
+    assert prepared_output.name == legacy_output.name
     _stub_integrators(monkeypatch)
     prepared_result = run_reintegrate_successor(prepared)
     legacy_result = run_reintegrate_successor(legacy)
@@ -2361,8 +2370,8 @@ def test_raw_source_drift_has_exact_publication_outcome(
     seeded = _seed_existing(
         tmp_path, labels=(2, 5), name=f"raw-drift-{seam}",
     )
-    output = seeded.target.parent / "raw-drift-successor.nexus"
-    _offer, plan = _prepared_plan(seeded, explicit_output=output)
+    _offer, plan = _prepared_plan(seeded)
+    output = Path(plan.output_artifact)
     member = seeded.source.with_name("raw-member.h5")
     _stub_integrators(monkeypatch)
 
@@ -2598,7 +2607,6 @@ def test_capsule_miss_allows_changed_click_integration_settings(
     preparation = _dimension_preparation(seeded, dimension)
     key = "npt" if dimension == "1d" else "npt_rad"
     preparation["selected_plan"]["bai_args"][key] += 1
-    output = seeded.target.parent / f"miss-changed-{dimension}.nexus"
     plan = ReintegrateSuccessorPlan.from_prepared_or_artifact(
         None,
         seeded.target,
@@ -2607,13 +2615,19 @@ def test_capsule_miss_allows_changed_click_integration_settings(
         preparation=preparation,
         source_root=str(seeded.target.parent),
         expected_labels=seeded.labels,
-        explicit_output=output,
     )
 
     _stub_integrators(monkeypatch)
     result = run_reintegrate_successor(plan)
     assert result.disposition == "COMMITTED"
-    assert result.output_artifact == str(output.resolve())
+    # Changed integration settings move the SCIENCE identity but not the public
+    # name: a repeat with different settings replaces this operation's own slot
+    # rather than accumulating a second public file.  That is the whole point of
+    # the stable-slot policy, and it is why the version lives in provenance.
+    expected = seeded.target.parent / (
+        f"{seeded.target.stem}_reintegrate{dimension}.nexus"
+    )
+    assert result.output_artifact == str(expected.resolve())
     assert seeded.target.exists()
 
 
@@ -3275,10 +3289,7 @@ def test_recipe_predecessor_identity_is_joined_to_the_admitted_parent(
 
     seeded = _seed_existing(tmp_path, labels=(2,), name="recipe-predecessor")
     _stub_integrators(monkeypatch)
-    first_plan = _plan(
-        seeded,
-        explicit_output=seeded.target.parent / "generation-one.nexus",
-    )
+    first_plan = _plan(seeded)
     first = run_reintegrate_successor(first_plan)
     successor_source = SimpleNamespace(
         target=first_plan.output_artifact,
@@ -3286,10 +3297,15 @@ def test_recipe_predecessor_identity_is_joined_to_the_admitted_parent(
         preparation=seeded.preparation,
         terminal=SimpleNamespace(commit_identity=first.terminal),
     )
-    second_plan = _plan(
-        successor_source,
-        explicit_output=seeded.target.parent / "generation-two.nexus",
-    )
+    # Two generations no longer differ by FILENAME: the consumed family and the
+    # operation are the same, so the slot is the same.  They are kept apart by
+    # DIRECTORY, which is the dimension a stable slot still varies over.  In one
+    # directory the second generation would resolve onto its own source and be
+    # refused -- pinned directly by
+    # `test_repeat_into_the_same_directory_is_refused_not_chained`.
+    second_root = seeded.target.parent / "generation-two"
+    second_root.mkdir()
+    second_plan = _plan(successor_source, destination_directory=second_root)
     recipe = second_plan.as_recipe()
     finite = recipe["plan"]["finite"]
     lineage = json.loads(finite["lineage_json"])
@@ -3355,16 +3371,21 @@ def test_cold_successor_reintegrates_with_stable_automatic_family(
             artifact_family="other-family",
             **common,
         )
+    cold_root = seeded.target.parent / "cold-generation-two"
+    cold_root.mkdir()
     second_plan = ReintegrateSuccessorPlan.from_artifact(
         first.output_artifact,
         expected_terminal_identity=None,
-        **common,
+        **{**common, "destination_directory": cold_root},
     )
     second = run_reintegrate_successor(second_plan)
 
     assert second.disposition == "COMMITTED"
     assert first_plan.artifact_family == second_plan.artifact_family == "existing"
-    assert Path(second.output_artifact).name.startswith("existing.reintegrate-1d-")
+    # The persisted family survives the cold restart, so the slot is named from
+    # `existing` -- NOT from the source stem `existing_reintegrate1d`, which
+    # would have chained, and NOT from an `artifact-<hash>` fallback.
+    assert Path(second.output_artifact).name == "existing_reintegrate1d.nexus"
     assert not Path(second.output_artifact).name.startswith("artifact-")
     with h5py.File(second.output_artifact, "r") as document:
         lineage = require_finite_artifact_lineage(document)
@@ -3444,3 +3465,68 @@ def test_finite_predecessor_lineage_is_bounded_local_and_bracketed(
             explicit_output=seeded.target.parent / "finite-child.nexus",
         )
     assert not (seeded.target.parent / "finite-child.nexus").exists()
+
+
+def test_repeat_into_the_same_directory_is_refused_not_chained(
+    tmp_path, monkeypatch,
+):
+    """Re-running an operation on its own result refuses; it never chains.
+
+    Under stable slots a family+operation names exactly one file per directory,
+    so reintegrating `existing_reintegrate1d.nexus` back into its own directory
+    resolves onto its own source.  Two behaviours are forbidden here and the
+    third is what must happen:
+
+    * chaining to `existing_reintegrate1d_reintegrate1d.nexus` is forbidden by
+      name in ADR-0010;
+    * stripping `_reintegrate1d` to recover a root family is an explicit stop
+      condition -- parsing a generated suffix is exactly what the persisted
+      family exists to avoid; so
+    * the source/output collision is REFUSED, and that refusal is itself proof
+      the persisted family was consumed.  Had the SOURCE STEM been used the
+      target would have been the chained name and no collision would have
+      arisen, so this row fails loudly if family consumption ever regresses.
+
+    MAINTAINER DECISION RECORDED, NOT ASSUMED.  Refusing means "Reintegrate
+    again with different settings, in place" is unavailable: the operator must
+    choose another directory.  The alternative is step 4's hidden-candidate and
+    atomic-replace protocol, under which source == slot becomes mechanically
+    safe and this refusal relaxes to a single condition.  This test pins
+    today's behaviour so the change is visible when that ruling lands.
+    """
+    from xrd_tools.reduction import (
+        ReintegrateSuccessorPlan,
+        run_reintegrate_successor,
+    )
+
+    seeded = _seed_existing(tmp_path, labels=(2,), name="repeat-in-place")
+    _stub_integrators(monkeypatch)
+    common = {
+        "entry": "entry",
+        "dimension": "1d",
+        "preparation": _dimension_preparation(seeded, "1d"),
+        "expected_labels": seeded.labels,
+        "destination_directory": seeded.target.parent,
+        "explicit_output": None,
+    }
+    first = run_reintegrate_successor(ReintegrateSuccessorPlan.from_artifact(
+        seeded.target,
+        expected_terminal_identity=seeded.terminal.commit_identity,
+        **common,
+    ))
+    assert first.disposition == "COMMITTED"
+    assert Path(first.output_artifact).name == "existing_reintegrate1d.nexus"
+
+    with pytest.raises(ValueError, match="source and output must be distinct"):
+        ReintegrateSuccessorPlan.from_artifact(
+            first.output_artifact,
+            expected_terminal_identity=None,
+            **common,
+        )
+
+    # The refusal is total: nothing chained was created as a side effect.
+    siblings = sorted(
+        path.name for path in Path(first.output_artifact).parent.iterdir()
+        if path.suffix == ".nexus"
+    )
+    assert "existing_reintegrate1d_reintegrate1d.nexus" not in siblings

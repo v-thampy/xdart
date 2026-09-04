@@ -1352,16 +1352,24 @@ def finite_artifact_request(
     resolved_root = Path(os.path.realpath(os.path.abspath(os.path.normpath(root))))
     if not resolved_root.is_dir():
         raise ValueError("finite output directory must already exist")
+    # An explicit target no longer NAMES the artifact.  Under ADR-0010 the
+    # public name is the stable slot, so honouring a caller's filename would
+    # reopen the very bypass the closed vocabulary exists to shut.  Its
+    # DIRECTORY constraint still binds: silently dropping the check would let a
+    # caller aim at another directory and be quietly redirected there instead
+    # of refused, which is worse than either honouring or rejecting it.
+    if explicit_target is not None and os.fspath(explicit_target) != "":
+        requested = Path(_resolved_parent_path(explicit_target))
+        if requested.parent != Path(os.path.normcase(os.fspath(resolved_root))):
+            raise ValueError(
+                "finite explicit target must share the destination directory"
+            )
     target = resolve_finite_output_target(
         resolved_root,
         family,
         operation_token=operation_kind,
-        version_identity=version,
-        explicit_target=explicit_target,
     )
     output = _resolved_parent_path(target)
-    if Path(output).parent != resolved_root:
-        raise ValueError("finite explicit target must share the destination directory")
     if source == output:
         raise ValueError("finite source and output must be distinct")
     _publication_json, publication = _identity({

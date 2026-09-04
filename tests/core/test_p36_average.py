@@ -474,22 +474,26 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
     # Two plans differing ONLY in target filename share a version identity...
     assert (operation_payloads[0]["version_identity"]
             == operation_payloads[1]["version_identity"])
-    # ...and each artifact is that anchor's family plus that version, never the
-    # anchor itself: an Average never writes the path the user pointed at.
+    # ...and each artifact is that anchor's family plus the STABLE `_average`
+    # slot, never the anchor itself: an Average never writes the path the user
+    # pointed at.  The version stays in provenance and out of the public name.
     for payload in operation_payloads:
         assert payload["output_artifact"] != payload["target_anchor"]
-        assert payload["output_artifact"].endswith(
-            f".average-{payload['version_identity'][:32]}.nexus"
-        )
+        artifact = Path(payload["output_artifact"])
+        anchor = Path(payload["target_anchor"])
+        assert artifact.name == f"{anchor.stem}_average.nexus"
+        assert artifact.parent == anchor.parent
+        # No version leak: the identity is 64 hex, and none of it may surface.
+        assert payload["version_identity"][:32] not in artifact.name
     assert plans[0].operation_identity != plans[1].operation_identity
     assert all(result.disposition == "COMMITTED" and result.contributor_extent == 1
                for result in accepted)
     assert all(result.logical_labels == result.committed_labels == (1,)
                for result in accepted)
     assert len(observed) == 2 and counts == {"qualify": 2, "open": 4, "sink": 2}
-    # Under the immutable-successor route result.target is the ARTIFACT WRITTEN,
-    # never the anchor the recipe pointed at.  Equality was the old in-place
-    # contract; pin the DERIVATION instead, order-independently.
+    # result.target is the ARTIFACT WRITTEN, never the anchor the recipe pointed
+    # at.  Equality was the old in-place contract; pin the DERIVATION instead,
+    # order-independently.
     anchors = {Path(recipe.target) for recipe in recipes}
     artifacts = {Path(result.target) for result in accepted}
     assert artifacts.isdisjoint(anchors)
@@ -497,10 +501,11 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
     by_stem = {anchor.stem: anchor for anchor in anchors}
     for result in accepted:
         path = Path(result.target)
-        stem, marker, version = path.stem.rpartition(".average-")
-        assert marker == ".average-"
-        assert version == result.version_identity[:32]
+        stem, marker, slot = path.stem.rpartition("_average")
+        assert (marker, slot) == ("_average", "")
         assert stem in by_stem and path.parent == by_stem[stem].parent
+        # The version identity stays in provenance and out of the public name.
+        assert result.version_identity[:32] not in path.name
     assert all(Path(result.target).suffix == ".nexus" for result in accepted)
     from xrd_tools.core.provenance import read_provenance
     from xrd_tools.io import get_1d, get_metadata
@@ -1281,14 +1286,15 @@ def test_source_science_and_operation_identity_domains_vary_independently(tmp_pa
             payload["output_mode"]) == (
         str(base_target.with_suffix(".nexus").resolve()), "entry", "", "Overwrite",
     )
-    # target_anchor is where the caller pointed; output_artifact is the
-    # immutable successor actually written, derived from the anchor's family and
-    # the science-derived version.  They are never the same path.
+    # target_anchor is where the caller pointed; output_artifact is the stable
+    # `_average` slot actually written, derived from the anchor's family alone.
+    # They are never the same path.  The 64-hex version identity is still
+    # computed and still travels in provenance -- it just never reaches a
+    # public filename, which is the whole point of the slot policy.
     assert payload["output_artifact"] != payload["target_anchor"]
     assert len(payload["version_identity"]) == 64
-    assert payload["output_artifact"].endswith(
-        f".average-{payload['version_identity'][:32]}.nexus"
-    )
+    assert payload["output_artifact"].endswith("_average.nexus")
+    assert payload["version_identity"][:32] not in payload["output_artifact"]
     # The version tracks SCIENCE, not the operation: changing the operation
     # alone leaves it untouched, while changing the science moves it.
     assert (module._operation_payload(changed_operation)["version_identity"]
