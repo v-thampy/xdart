@@ -2396,20 +2396,24 @@ def validate_integrated_stack_write(
         # the elementwise comparison and one bulk tolist() replace a Python
         # int() per persisted row per frame, which cost 2.75 million interpreted
         # iterations across the last 500 frames of a 3000-frame run and about
-        # 24% of the writer's wall time.  Same conditions, same messages: this
-        # still re-validates the whole persisted index on every batch.
+        # 24% of the writer's wall time.  It still re-validates the whole
+        # persisted index on every batch, and every message is unchanged.
         if group is None:
             return
         persisted = np.asarray(group["frame_index"][()]).ravel()
-        # One dtype check per batch, not per row.  The Python loop this replaced
-        # refused a non-integer index incidentally, because int(nan) raises;
-        # astype would instead convert NaN to 0 and could let a malformed index
-        # pass the ordering check.  Refuse explicitly and keep the strictness.
+        # DELIBERATELY STRICTER than the Python loop this replaced, which is a
+        # behaviour change on foreign files only: every product writer pins an
+        # integer index (nexus.py:2005/2176/3122, record_writer.py:3900).  The
+        # old loop silently truncated a float index (0.5 -> 0) and accepted a
+        # bool one; it refused text only incidentally, because int(b"a") raises.
+        # Refuse a non-integer index outright instead of pretending it is one.
         if persisted.dtype.kind not in "iu":
             raise ValueError(
                 f"{group_name}/frame_index must be an integer dataset"
             )
-        persisted = persisted.astype(np.int64, copy=False)
+        # Do NOT cast to int64: a valid uint64 label above 2**63 wraps negative
+        # and fabricates a "not strictly increasing" refusal on a sound index.
+        # numpy compares unsigned natively and tolist() yields Python ints.
         if persisted.size > 1 and not bool(
             np.all(persisted[1:] > persisted[:-1])
         ):

@@ -488,8 +488,16 @@ class FrameRecordStore:
           anything that must survive as truth -- which is why this path still
           publishes no durability receipt and promotes no durable floor.
 
-        ``frame_verified`` therefore means "this checkpoint covers the label's
-        frame row", not "the row was read back".
+        ``frame_verified`` therefore means "this checkpoint carries a receipt for
+        this label", not "the row was read back".  On the fast path the set only
+        ever holds 1-D/2-D RESULT-ROW mode keys: frame proofs are empty, so no
+        frame-record row and no thumbnail is covered, and ``release_record`` /
+        ``can_release_thumbnail`` still require durable or ``thumbnail_verified``.
+
+        CONSEQUENCE, accepted by design: on a FAILED or ABORTED fast Run a frame
+        already thinned under this licence cannot be re-hydrated, because the
+        working artifact is disposable.  Before this licence existed every frame
+        stayed resident, so a failed long Run still displayed all of them.
         """
         requested = {tuple(key): int(value) for key, value in revisions.items()}
         absent = _normalize_mode_keys(verified_absent)
