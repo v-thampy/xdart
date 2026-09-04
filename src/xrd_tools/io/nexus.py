@@ -2403,10 +2403,13 @@ def validate_integrated_stack_write(
         persisted = np.asarray(group["frame_index"][()]).ravel()
         # DELIBERATELY STRICTER than the Python loop this replaced, which is a
         # behaviour change on foreign files only: every product writer pins an
-        # integer index (nexus.py:2005/2176/3122, record_writer.py:3900).  The
-        # old loop silently truncated a float index (0.5 -> 0) and accepted a
-        # bool one; it refused text only incidentally, because int(b"a") raises.
-        # Refuse a non-integer index outright instead of pretending it is one.
+        # integer index (nexus.py:2005/2176/3122, record_writer.py:3900), and
+        # record_writer.py:368 already refuses a non-integer source-fact index
+        # as malformed.  The old loop silently truncated a float index
+        # (0.5 -> 0), accepted a bool one, and accepted a NUMERIC text one
+        # (int(b"0") == 0, and the same for an h5py vlen str); it refused text
+        # only when that text was not numeric.  Refuse a non-integer index
+        # outright instead of pretending it is one.
         if persisted.dtype.kind not in "iu":
             raise ValueError(
                 f"{group_name}/frame_index must be an integer dataset"
