@@ -769,3 +769,138 @@ def test_row15_headless_producer_has_no_hard_coded_legacy_target(
     found = _legacy_literals(SRC / rel_path, qualname)
     assert found == [], (
         f"{rel_path}::{qualname} still builds a hard-coded legacy target: {found}")
+
+
+# ---------------------------------------------------------------------------
+# VNX-FIXED-OPERATION-SLOTS-20260903 — stable operation result slots
+#
+# Frozen BEFORE the implementation, against the authority in
+# `docs/decisions/0010-proportional-integrity-and-scientific-correctness.md`
+# (carried as public commit 491b9413) and the design note
+# `finite_operation_output_slots_2026-09-03.md`.  The contract these rows pin:
+# the public NeXus filename is `<root-family><slot>.nexus`, the separator is an
+# UNDERSCORE, and no version, hash, timestamp, UUID or chained operation suffix
+# may appear in a public name.
+# ---------------------------------------------------------------------------
+
+#: The complete public vocabulary, transcribed from the ADR table.  Written out
+#: literally rather than imported from the owner so that a typo in the owner is
+#: a test failure instead of a silently agreeing constant.
+_ADR_SLOTS = {
+    "int-1d": "_int1d",
+    "int-2d": "_int2d",
+    "average": "_average",
+    "reintegrate-1d": "_reintegrate1d",
+    "reintegrate-2d": "_reintegrate2d",
+    "stitch-1d": "_stitch1d",
+    "stitch-2d": "_stitch2d",
+    "rsm": "_rsm",
+}
+
+
+@pytest.mark.parametrize("kind,slot", sorted(_ADR_SLOTS.items()))
+def test_slots_resolve_the_exact_underscore_spelling(tmp_path, kind, slot):
+    """Every operation resolves `<family><slot>.nexus` and nothing else."""
+    from xrd_tools.io.output_path import resolve_finite_output_target
+
+    resolved = resolve_finite_output_target(
+        tmp_path, "sample", operation_token=kind,
+    )
+    assert resolved == tmp_path / f"sample{slot}.nexus"
+    # The separator is an underscore, not the dot the superseded immutable
+    # successor route used.  A dot would read as a suffix to every path tool.
+    assert resolved.name == f"sample{slot}.nexus"
+    assert f"sample.{kind}" not in resolved.name
+
+
+def test_slot_resolution_refuses_an_unknown_operation(tmp_path):
+    """A closed vocabulary: an unlisted operation cannot invent a public name."""
+    from xrd_tools.io.output_path import resolve_finite_output_target
+
+    for unknown in ("integrate", "average-2", "reintegrate", "", "RSM"):
+        with pytest.raises(ValueError, match="finite operation"):
+            resolve_finite_output_target(
+                tmp_path, "sample", operation_token=unknown,
+            )
+
+
+def test_public_slot_names_carry_no_version_hash_or_counter(tmp_path):
+    """No version, content hash, timestamp, UUID or counter in a public name."""
+    from xrd_tools.io.output_path import resolve_finite_output_target
+
+    for kind in _ADR_SLOTS:
+        name = resolve_finite_output_target(
+            tmp_path, "sample", operation_token=kind,
+        ).name
+        # Any run of 8+ hex characters would be a version/hash leak.  `sample`
+        # and the slot words are deliberately not hex-shaped.
+        assert re.search(r"[0-9a-f]{8,}", name) is None, name
+        assert re.search(r"-\d+\b", name) is None, name
+        assert name.count(".") == 1, name
+
+
+def test_resolution_takes_no_version_identity(tmp_path):
+    """The owner cannot be handed a version, so it cannot publish one.
+
+    Structural, not behavioural: while the parameter exists a future caller can
+    reintroduce a public version name by passing it.  Removing it from the
+    signature is what makes the ADR's "no public version names" rule
+    unbreakable at this seam.
+    """
+    import inspect
+
+    from xrd_tools.io.output_path import resolve_finite_output_target
+
+    parameters = inspect.signature(resolve_finite_output_target).parameters
+    assert "version_identity" not in parameters
+    assert "explicit_target" not in parameters
+
+
+def test_repeating_an_operation_reuses_the_same_slot(tmp_path):
+    """Repeat execution replaces its own slot; it never accumulates files."""
+    from xrd_tools.io.output_path import resolve_finite_output_target
+
+    first = resolve_finite_output_target(
+        tmp_path, "sample", operation_token="average",
+    )
+    first.write_bytes(b"prior")
+    second = resolve_finite_output_target(
+        tmp_path, "sample", operation_token="average",
+    )
+    # An OCCUPIED slot is still the answer.  Selecting a different name on the
+    # second run is exactly the accumulating public sequence the ADR forbids.
+    assert second == first
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["sample_average.nexus"]
+
+
+def test_a_persisted_family_prevents_suffix_chaining(tmp_path):
+    """Operating on a slot-named result consumes its family, never its stem.
+
+    The superseded route derived the family from the source stem, so feeding a
+    generated artifact back produced a doubled suffix.  Under stable slots that
+    same mistake would yield `sample_average_reintegrate1d.nexus`, which the
+    design forbids by name.
+    """
+    from xrd_tools.io.output_path import (
+        artifact_family_from_source,
+        resolve_finite_output_target,
+    )
+
+    published = resolve_finite_output_target(
+        tmp_path, "sample", operation_token="average",
+    )
+    assert published.name == "sample_average.nexus"
+
+    # The family travels in provenance, so the next operation is handed it.
+    family = artifact_family_from_source(published, "sample")
+    chained = resolve_finite_output_target(
+        tmp_path, family, operation_token="reintegrate-1d",
+    )
+    assert chained == tmp_path / "sample_reintegrate1d.nexus"
+    assert "_average_" not in chained.name
+
+    # And without a persisted family the stem is retained verbatim -- the owner
+    # must NOT strip `_average` to guess a root, because "do not parse
+    # generated suffixes to recover a root family" is an explicit stop
+    # condition.  This is why consuming the persisted family is mandatory.
+    assert artifact_family_from_source(published) == "sample_average"
