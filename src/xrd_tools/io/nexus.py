@@ -2390,23 +2390,31 @@ def validate_integrated_stack_write(
         )
 
     def require_after_cursor(group, group_name):
+        # Once per group per written batch, so this sits on the per-frame path
+        # of a long Run.  Both the ordering check and the owned-label set are
+        # done in numpy rather than by walking the persisted index in Python:
+        # the elementwise comparison and one bulk tolist() replace a Python
+        # int() per persisted row per frame, which cost 2.75 million interpreted
+        # iterations across the last 500 frames of a 3000-frame run and about
+        # 24% of the writer's wall time.  Same conditions, same messages: this
+        # still re-validates the whole persisted index on every batch.
         if group is None:
             return
-        persisted = tuple(
-            int(value) for value in np.asarray(group["frame_index"][()]).ravel()
-        )
-        if any(
-            right <= left for left, right in zip(persisted, persisted[1:])
+        persisted = np.asarray(
+            group["frame_index"][()]
+        ).ravel().astype(np.int64, copy=False)
+        if persisted.size > 1 and not bool(
+            np.all(persisted[1:] > persisted[:-1])
         ):
             raise ValueError(
                 f"{group_name}/frame_index is not strictly increasing"
             )
-        owned = set(persisted)
+        owned = set(persisted.tolist())
         new_labels = tuple(label for label in fis if label not in owned)
-        if new_labels and persisted and new_labels[0] <= persisted[-1]:
+        if new_labels and persisted.size and new_labels[0] <= int(persisted[-1]):
             raise ValueError(
                 f"new labels for {group_name} must be strictly increasing "
-                f"after persisted cursor {persisted[-1]}"
+                f"after persisted cursor {int(persisted[-1])}"
             )
 
     if results_1d is not None and len(results_1d):
