@@ -3720,7 +3720,10 @@ class XyeOutputTransaction:
         self._coordinator = coordinator
         self._directory = directory
         self._run_owner = run_owner
-        self._staged: list[tuple[int, object]] = []
+        # Keyed by label, insertion-ordered.  A list rebuild per stage was
+        # O(staged) per frame and therefore quadratic over a run; XYE is about
+        # a third of a long Run's wall clock.
+        self._staged: dict[int, object] = {}
         self._attempted: tuple[tuple[int, object], ...] | None = None
         self._attempted_final: bool | None = None
         self._pending_stale: list[Path] | None = None
@@ -3748,8 +3751,11 @@ class XyeOutputTransaction:
                     "cannot stage during an XYE publication attempt"
                 )
             label = int(index)
-            self._staged = [pair for pair in self._staged if pair[0] != label]
-            self._staged.append((label, value))
+            # pop-then-set keeps the previous semantics exactly: re-staging a
+            # label moves it to the END of the publication order, as the old
+            # filter-and-append did.  Both operations are O(1).
+            self._staged.pop(label, None)
+            self._staged[label] = value
 
     def abandon(self, *, run_owner: OwnerToken) -> XyeSnapshot:
         """Discard a mutable run set without touching any durable XYE file."""
@@ -3770,7 +3776,10 @@ class XyeOutputTransaction:
             pending = tuple(
                 str(path) for path in (self._pending_stale or ())
             )
-            staged = self._attempted if self._attempted is not None else self._staged
+            staged = (
+                self._attempted if self._attempted is not None
+                else tuple(self._staged.items())
+            )
             return XyeSnapshot(
                 directory=self._directory,
                 staged_indices=tuple(index for index, _value in staged),
@@ -3865,7 +3874,7 @@ class XyeOutputTransaction:
             self._ensure_cleanup_token()
             self._pending_stale = [Path(path) for path in normalized]
 
-        self._attempted = tuple(self._staged)
+        self._attempted = tuple(self._staged.items())
         self._attempted_final = bool(final)
         return self._publish_after_cleanup(publisher)
 
