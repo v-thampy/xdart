@@ -2110,6 +2110,11 @@ class NexusRecordWriter:
         self._in_boundary = False
         self._facade = None
         self._pending: dict[tuple[int, ResultMode, str], StageReceipt] = {}
+        # Receipts staged since the last checkpoint.  `_pending` is drained only
+        # at finish on the fast path, so a checkpoint must never walk all of it.
+        self._staged_since_checkpoint: dict[
+            tuple[int, ResultMode, str], StageReceipt
+        ] = {}
         self._pending_publication_drops: dict[
             tuple[int, ResultMode], int
         ] = {}
@@ -5247,7 +5252,9 @@ class NexusRecordWriter:
                     if source not in self._source_paths:
                         self._source_paths.append(source)
             for receipt in receipts:
-                self._pending[(receipt.label, receipt.mode, receipt.target)] = receipt
+                key = (receipt.label, receipt.mode, receipt.target)
+                self._pending[key] = receipt
+                self._staged_since_checkpoint[key] = receipt
             self._since_flush += len(batch)
             if self.flush_every is not None and self._since_flush >= self.flush_every:
                 self.flush()
@@ -5263,9 +5270,37 @@ class NexusRecordWriter:
     def _current_receipts(self) -> tuple[StageReceipt, ...]:
         if self._facade is None:
             self._pending.clear()
+            self._staged_since_checkpoint.clear()
             return ()
         current = []
         for key, receipt in tuple(self._pending.items()):
+            observed = self._facade.capture_receipt(
+                receipt.label, receipt.mode, receipt.target
+            )
+            if observed != receipt:
+                self._pending.pop(key, None)
+                continue
+            current.append(receipt)
+        return tuple(current)
+
+    def _checkpoint_staged_receipts(self) -> tuple[StageReceipt, ...]:
+        """Validate only what was staged since the last checkpoint.
+
+        `_current_receipts` walks the whole pending set, and a fast-regenerable
+        Run drains that set only at finish, so calling it per checkpoint is
+        quadratic in frame count: measured +2.9% wall over 3000 frames at the
+        production cadence, and it grows.  A checkpoint only ever needs to mark
+        the rows it newly covers, so consume the staged delta and leave
+        `_pending` for the single durable publication at finish.
+        """
+        staged = self._staged_since_checkpoint
+        self._staged_since_checkpoint = {}
+        if self._facade is None:
+            return ()
+        current = []
+        for key, receipt in staged.items():
+            if key not in self._pending:
+                continue
             observed = self._facade.capture_receipt(
                 receipt.label, receipt.mode, receipt.target
             )
@@ -5409,7 +5444,7 @@ class NexusRecordWriter:
         # 2-D array stayed resident and memory grew with the frame count -- about
         # 7 GB on a 3621-frame Run against a ~64-frame cap.
         recoverable_batch = (
-            self._current_receipts()
+            self._checkpoint_staged_receipts()
             if (
                 self._fast_regenerable
                 and publish_receipts
@@ -5446,6 +5481,10 @@ class NexusRecordWriter:
                 self._commit_publication_drops(dropped)
         self._checkpoint_rows += rows
         self._checkpoint_read_bytes += read_bytes
+        # Every checkpoint closes the staged window, on both paths: the ordinary
+        # writer never consumes it (it publishes the whole validated batch), so
+        # without this the delta would grow for the life of the run.
+        self._staged_since_checkpoint.clear()
         self._clear_dirty_evidence()
 
     def _close_handle(self) -> None:
@@ -6248,6 +6287,7 @@ class NexusRecordWriter:
                 ):
                     self._resume_pool()
             self._pending.clear()
+            self._staged_since_checkpoint.clear()
             self._pending_owner = None
             self.phase = WriterPhase.ABORTED
             return self._outcome()
