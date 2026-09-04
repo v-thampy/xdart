@@ -70,16 +70,10 @@ __all__ = [
 #: and narrow enough that nothing structural can hide in a filename.
 #:
 #: WIDENED 2026-09-04 on the maintainer's ruling.  The previous ASCII-only class
-#: sent `Sample A 001` to the `artifact-<24 hex>` fallback, putting a content
+#: sent `Sample A 001` to an `artifact-<24 hex>` fallback, putting a content
 #: hash in a public name in direct contradiction of the ADR carried by this same
-#: work.  `\w` with re.UNICODE admits letters, digits and underscore in any
-#: script; space, dot, dash and tilde are added explicitly.
-#:
-#: Still REFUSED, and each for a reason: `/` and `\` (path separators), any
-#: control character or NUL, a leading dot (hidden files, and the candidate
-#: namespace `.<name>.xdart-candidate-...` lives there), a leading dash (reads
-#: as an option to command-line tools), and `:` (an alternate-data-stream and
-#: drive separator on Windows).  The hash fallback remains for those.
+#: work.  That fallback is now DELETED, not merely narrowed: an unusable stem
+#: raises.  The class below is expressed as a FORBIDDEN set for that reason.
 #: Characters a public family may never contain, and why: POSIX and Windows path
 #: separators, the Windows drive/alternate-data-stream separator, the four
 #: Windows wildcard/redirection characters, quote, and any control character.

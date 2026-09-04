@@ -906,7 +906,7 @@ def test_a_persisted_family_prevents_suffix_chaining(tmp_path):
     assert artifact_family_from_source(published) == "sample_average"
 
 
-def test_readable_stems_stay_readable_and_only_unsafe_ones_are_hashed(tmp_path):
+def test_readable_stems_stay_readable_and_unsafe_ones_are_refused(tmp_path):
     """Real beamline stems keep their name; only structurally unsafe ones hash.
 
     Fable F5 on `c167b71a`, RULED by the maintainer 2026-09-04: widen the family

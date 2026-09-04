@@ -71,21 +71,22 @@ def test_a_declared_but_unknown_mode_is_refused_not_defaulted(tmp_path, mode):
         _run_output_slot(_configuration(mode, str(tmp_path)))
 
 
-def test_no_declared_mode_takes_no_slot_rather_than_guessing(tmp_path):
-    """An undeclared mode yields NO slot; it does not pick one.
+def test_an_absent_run_mode_is_refused_like_an_unknown_one():
+    """Fable F2 on `4fe073e8`: an empty mode used to take NO slot.
 
-    Distinct from the row above, and the distinction is the safety property.
-    A DECLARED mode this policy does not know is dangerous -- continuing would
-    publish under some other mode's slot -- so it raises. Nothing declared at
-    all is a source-shaped double that names a target without ever saying how it
-    would be reduced; inventing `_int2d` there would name a file for a mode
-    nobody chose. Every GUI candidate is signed by `from_start_capture` and
-    always carries a mode, so this branch is not reachable from a real run.
+    The old row enshrined that, on the argument that `from_start_capture` signs
+    every candidate.  That named the wrong guard -- the branch fires on the
+    FROZEN configuration's `processing_mode`, which `RunIntent.__post_init__`
+    and `freeze()` both accept as `""`.  The reviewer drove a real admission
+    with it and got an `AdmissionReceipt` planning the un-slotted
+    `scan_0001.nexus`; only the disabled Start button stood in the way.
+
+    An absent mode is an unrecognised mode.  Publishing under no slot at all is
+    the same class of wrong as publishing under another mode's slot.
     """
-    assert _run_output_slot(_configuration("", str(tmp_path))) == ""
-    assert _resolved_generated_target(str(tmp_path), "scan12", "") == (
-        tmp_path / "scan12.nexus"
-    )
+    for absent in ("", "   "):
+        with pytest.raises(ValueError, match="no stable output slot"):
+            _run_output_slot(_configuration(absent, "/tmp/whatever"))
 
 
 def test_1d_and_2d_runs_of_one_scan_do_not_share_a_file(tmp_path):
@@ -119,6 +120,50 @@ def test_the_recorded_family_matches_the_stem_the_target_was_named_from(tmp_path
         )
         # THE INVARIANT: the filename is exactly `<recorded family><slot>.nexus`.
         assert target.name == f"{family}_int2d.nexus"
+
+
+@pytest.mark.parametrize(
+    "sub_folder", ("2026.09.04", "run.001", "sample1.5V", "plain"),
+)
+def test_a_dotted_source_sub_folder_cannot_split_family_from_filename(
+    tmp_path, sub_folder,
+):
+    """Fable F1 on `4fe073e8`, the row the blind invariant above could not see.
+
+    A recursive directory run places each source beneath its own parent, so the
+    per-candidate output directory used to be handed down as a REQUEST STRING
+    and re-inspected for a suffix.  A sub-folder named `2026.09.04` reads as a
+    suffix, so it was treated as an explicit FILE request: the run published
+    `processed/2026.09_int2d.nexus` -- collapsed into the parent, stem truncated
+    -- while recording the family `scan_0001`.  A later Reintegrate then
+    resolved `processed/scan_0001_reintegrate1d.nexus`, a slot in a family whose
+    Run file does not exist.
+
+    The row above cannot catch this: it passes `save_path` itself as the
+    request, so its two inputs never differ.  This one drives the naming owner
+    the way the directory planner does, with a separate per-candidate directory.
+    """
+    from xdart.gui.tabs.scattering.output_preflight import (
+        _generated_target_in,
+        _run_output_naming,
+    )
+
+    configuration = _configuration("Int 2D", str(tmp_path / "processed"))
+    output_directory = tmp_path / "processed" / sub_folder
+    directory, family = _run_output_naming(
+        configuration, "scan_0001", output_directory,
+    )
+    target = _generated_target_in(
+        directory, family, _run_output_slot(configuration),
+    )
+
+    # The directory is used AS a directory: the file lands inside the dotted
+    # sub-folder, not collapsed into its parent with a truncated stem.
+    assert directory == output_directory
+    assert target.parent == output_directory
+    # And the invariant holds regardless of what the folder is called.
+    assert family == "scan_0001"
+    assert target.name == f"{family}_int2d.nexus"
 
 
 def test_an_explicit_file_request_still_gets_a_slot(tmp_path):

@@ -718,7 +718,7 @@ def _directory_target(
     name: str,
 ) -> Path:
     output_root = Path(configuration.save_path)
-    output_request = configuration.save_path
+    output_directory: Path | None = None
     if not output_root.suffix:
         try:
             relative_parent = candidate.path.parent.relative_to(plan.root)
@@ -740,9 +740,11 @@ def _directory_target(
                 "directory output escaped selected root: "
                 f"{output_directory}"
             )
-        output_request = str(output_directory)
-    return _resolved_generated_target(
-        output_request, name, _run_output_slot(configuration),
+    # Hand the directory DOWN as a directory (F1).  Passing it as a request
+    # string let a dotted sub-folder read as a file and split the naming.
+    directory, family = _run_output_naming(configuration, name, output_directory)
+    return _generated_target_in(
+        directory, family, _run_output_slot(configuration),
     )
 
 
@@ -2778,8 +2780,19 @@ def _run_output_slot(
 ) -> str:
     """The stable public slot this run publishes into.
 
-    Refuses an unrecognised mode rather than defaulting.  A wrong slot here is a
-    run writing to the wrong filename, which is worse than a loud failure.
+    Refuses an unrecognised mode rather than defaulting, and an ABSENT mode is
+    unrecognised.  A wrong slot here is a run writing to the wrong filename,
+    which is worse than a loud failure.
+
+    Fable F2 on `4fe073e8`.  An empty mode used to return NO slot on the
+    argument that `from_start_capture` signs every candidate.  That named the
+    wrong guard: the branch fires on the FROZEN configuration's
+    `processing_mode`, and `from_start_capture` only rejects XYE+Append.  What
+    actually stops an empty mode in the GUI is the run strip, which sets a
+    mode blocker and disables Start (`run_mode_projection.py:76-80`) -- but
+    `RunIntent.__post_init__` and `freeze()` both accept `""`, so any
+    programmatic or persisted intent reached admission and planned an
+    UN-SLOTTED public name.  It now raises like any other unknown mode.
     """
     frozen = (
         configuration._configuration
@@ -2793,35 +2806,89 @@ def _run_output_slot(
         # provenance mapping the mode was frozen into.
         declared = configuration.processing_mapping().get("processing_mode")
         mode = None if declared is None else str(declared)
-    if mode is None or mode == "":
-        # NO run mode is declared anywhere.  Not reachable from the GUI, where
-        # `from_start_capture` signs every candidate; this is a source-shaped
-        # double that names a target without ever declaring how it would be
-        # reduced.  Take NO slot rather than inventing one -- guessing here
-        # would name a file for a mode nobody chose.
+    if mode is None:
+        # NOTHING declared a mode anywhere -- no frozen configuration AND no
+        # provenance entry.  That is a source-shaped double naming a target it
+        # will never reduce, not a run; `_directory_items` is exercised that way
+        # directly.  Take NO slot rather than inventing one.  This is NARROWER
+        # than the branch F2 removed, which also swallowed a DECLARED empty mode
+        # on a real frozen configuration -- the reachable case.
         return ""
     slot = _RUN_MODE_SLOTS.get(mode)
     if slot is None:
-        # A mode IS declared and it is not one this policy knows.  That is the
-        # dangerous case: continuing would publish under some other mode's slot.
+        # Either no mode reached here at all, or one did and this policy does
+        # not know it.  Both are the dangerous case: continuing would publish
+        # under some other mode's slot, or under no slot at all.
         raise ValueError(
             f"run processing mode has no stable output slot: {mode!r}"
         )
     return slot
 
 
+def _run_output_naming(
+    configuration: "FrozenRunConfiguration | OutputCandidate",
+    scan_name: str,
+    output_directory: Path | None = None,
+) -> tuple[Path, str]:
+    """Decide ONCE where a run writes and which family it publishes into.
+
+    Returns ``(directory, family)``.  The public name is
+    ``<family><slot>.nexus`` inside *directory*, and *family* is the value
+    persisted as ``@artifact_family_v1``, so the filename and the recorded
+    family CANNOT disagree -- they are the same string, used twice.
+
+    Fable F1 on `4fe073e8`.  They used to be decided by two functions reading
+    two DIFFERENT inputs: the filename came from a per-candidate
+    ``output_request`` that re-inferred file-vs-directory from
+    ``Path(...).suffix``, while the family came from ``configuration.save_path``.
+    A recursive raw sub-folder whose name contains a dot (`2026.09.04/`,
+    `run.001/`, `sample1.5V/`) reads as a suffix, so the sub-folder was treated
+    as an explicit FILE request: the run published
+    `processed/2026.09_int2d.nexus` while recording the family `scan_0001`.  A
+    later Reintegrate then resolved `processed/scan_0001_reintegrate1d.nexus` --
+    a slot in a family whose Run file does not exist.
+
+    *output_directory* is the already-validated per-candidate directory for a
+    directory-shaped request (recursive sources keep their parent beneath the
+    selected root).  It is used as a DIRECTORY and never re-inspected for a
+    suffix, which is what makes the dotted sub-folder safe.
+    """
+    requested = Path(configuration.save_path)
+    if requested.suffix:
+        # An explicit FILE request: its parent is the directory and its stem is
+        # the family.  A per-candidate directory does not apply.
+        return requested.parent, requested.stem
+    return (
+        requested if output_directory is None else output_directory,
+        scan_name,
+    )
+
+
 def _run_artifact_family(
     configuration: "FrozenRunConfiguration | OutputCandidate", scan_name: str,
 ) -> str:
-    """The ROOT family a run publishes into: the requested stem, or the scan.
+    """The ROOT family a run publishes into.
 
-    Must agree exactly with what :func:`_resolved_generated_target` used as the
-    stem, because the persisted family is what every LATER operation consumes.
-    If the two ever disagreed, a Reintegrate would resolve a slot in a family
-    the Run never wrote.
+    Thin view onto :func:`_run_output_naming`, which decides it alongside the
+    directory.  Kept as a name because the family is the thing every LATER
+    operation consumes, and it reads better at the call site than a tuple index.
     """
-    requested = Path(configuration.save_path)
-    return requested.stem if requested.suffix else scan_name
+    return _run_output_naming(configuration, scan_name)[1]
+
+
+def _generated_target_in(directory: Path | str, family: str, slot: str) -> Path:
+    """``<family><slot>.nexus`` inside *directory*, via the shared owner.
+
+    *directory* is ALWAYS a directory.  Nothing here re-decides file-vs-
+    directory; that decision belongs to :func:`_run_output_naming` and is made
+    once, from the requested save path.
+    """
+    return Path(resolve_output_target(
+        directory,
+        f"{family}{slot}",
+        mode=OVERWRITE_MODE,
+        explicit_target=None,
+    ))
 
 
 def _resolved_generated_target(
@@ -2831,32 +2898,25 @@ def _resolved_generated_target(
 
     vNext admission is Overwrite-only.  A suffix-shaped requested path keeps
     its directory/stem but is normalized to ``.nexus``; a directory request
-    generates ``<scan><slot>.nexus`` (P4/OUT-1, ADR-0010).  This helper only
-    decides how the captured ``save_path`` is supplied to the shared API —
-    suffix, collision, writer and transaction policy stay with their owners.
+    generates ``<scan><slot>.nexus`` (P4/OUT-1, ADR-0010).
 
     *slot* is empty for the Average NAMING ANCHOR, which is not a written file:
     it supplies the directory and the root FAMILY, so appending a run slot to it
     would make Average derive `<scan>_int2d` as its family and publish the
     chained `<scan>_int2d_average.nexus`.  Callers that name a real run target
     pass the slot from :func:`_run_output_slot`.
+
+    This is the NO-per-candidate-directory case (a whole-request target, and
+    `page.py`'s Average anchor).  Directory-shaped runs that place each source
+    beneath its own parent call :func:`_run_output_naming` with that directory.
     """
     requested = Path(save_path)
-    if requested.suffix:
-        # An explicit file request keeps its directory and stem; the slot is
-        # still appended, because the public name is always `<family><slot>`.
-        return Path(resolve_output_target(
-            requested.parent,
-            f"{requested.stem}{slot}",
-            mode=OVERWRITE_MODE,
-            explicit_target=None,
-        ))
-    return Path(resolve_output_target(
-        requested,
-        f"{scan_name}{slot}",
-        mode=OVERWRITE_MODE,
-        explicit_target=None,
-    ))
+    directory, family = (
+        (requested.parent, requested.stem)
+        if requested.suffix
+        else (requested, scan_name)
+    )
+    return _generated_target_in(directory, family, slot)
 
 
 def _not_cancelled() -> bool:
@@ -3217,7 +3277,7 @@ def _directory_items(
         spec, stamp, descriptor, motor_names = (
             graph.execution_source, graph.stamp, graph.descriptor, graph.motor_names,
         )
-        output_request = configuration.save_path
+        output_directory: Path | None = None
         if not output_root.suffix:
             try:
                 relative_parent = candidate.path.parent.relative_to(plan.root)
@@ -3245,18 +3305,22 @@ def _directory_items(
                     "directory output escaped selected root: "
                     f"{output_directory}"
                 )
-            output_request = str(output_directory)
+        # ONE naming decision feeds both the filename and the recorded family,
+        # so they cannot diverge for a dotted sub-folder (Fable F1).
+        directory, family = _run_output_naming(
+            configuration, name, output_directory,
+        )
         items.append(PlannedOutput(
             spec,
             candidate.path,
-            _resolved_generated_target(
-                output_request, name, _run_output_slot(configuration),
+            _generated_target_in(
+                directory, family, _run_output_slot(configuration),
             ),
             stamp,
             candidate,
             descriptor,
             motor_names,
-            _run_artifact_family(configuration, name),
+            family,
         ))
     return tuple(items)
 def validate_planned_source(

@@ -300,23 +300,18 @@ def _predecessor(
 def _persisted_root_family(
     path, entry: str, explicit_family: str | None = None,
 ) -> str | None:
-    """Read `entry/@artifact_family_v1`, or refuse a slot-named file without one.
+    """Read `entry/@artifact_family_v1`, falling back to *explicit_family*.
 
-    A stable public name is `<family><slot>.nexus`, so deriving a family from
-    THIS artifact's stem is only safe when the stem is not itself a published
-    slot. When it is, the derived family would chain
-    (`sample_average` -> `sample_average_reintegrate1d.nexus`), and stripping
-    the slot to recover the root is an explicit stop condition.
+    A stable public name is `<family><slot>.nexus`.  The stamped family is
+    authoritative when present, and NOTHING here ever parses a slot out of a
+    stem -- stripping a generated suffix to recover a root is an explicit stop
+    condition.
 
-    So: return the stamped family when present. When absent AND the stem ends in
-    a known slot, REFUSE with a diagnostic instead of silently chaining. A
-    pre-slot legacy artifact keeps working, because its stem ends in no slot.
-
-    Matching the tail against `FINITE_OPERATION_SLOTS` is a membership test on a
-    CLOSED set, not a parse of a generated token: it is used only to decide
-    whether to refuse, never to recover a family.
+    Fable F4 on `4fe073e8`: this docstring used to describe a refusal for a
+    slot-shaped stem without the attribute, which the body no longer performs.
+    The reason it was removed is in the body comment below; the short version is
+    that it refused `series_rsm.nexus`, a scan legitimately named `series_rsm`.
     """
-    from xrd_tools.io.output_path import FINITE_OPERATION_SLOTS
     from xrd_tools.io.schema import ARTIFACT_FAMILY_ATTR
 
     family = None
@@ -346,7 +341,6 @@ def _persisted_root_family(
     # keeps the "never interpret a generated suffix" rule intact by not looking
     # at the suffix at all.
     return explicit_family
-    return None
 
 
 def _derived_request_inputs(

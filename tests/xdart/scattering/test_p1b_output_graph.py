@@ -573,7 +573,11 @@ def test_p1b_b02_overwrite_native_durable_terminal(
     assert terminal.kind is StandardEventKind.FINISHED
     assert persisted_before_terminal is False
     assert records.is_persisted(label) is True
-    assert target.is_file()
+    # The ARTIFACT, not the anchor.  Fable F3 on `4fe073e8`: left as `target`
+    # this assertion failed FIRST and masked b02's own pre-existing cause
+    # (`activation requires one prepared admission`), quietly giving a test
+    # already labelled pre-existing a second, range-introduced reason to be red.
+    assert _written(target).is_file()
     xye_files = tuple((tmp_path / "native").glob("*.xye"))
     assert [path.name for path in xye_files] == ["iq_native_0001.xye"]
     executor.close(identity)

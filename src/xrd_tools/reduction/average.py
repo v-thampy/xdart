@@ -496,16 +496,14 @@ def _average_output_artifact(anchor: str, *, artifact_family: str | None = None)
     *anchor* supplies the DIRECTORY and, absent a persisted family, the family.
     It is never written.
 
-    STEP-3 PREREQUISITE, deliberately recorded here rather than in the packet
-    only.  The anchor is the ordinary Run target (`page.py:2554`).  While that
-    target is `<scan>.nexus` the anchor-derived family is `<scan>` and this is
-    correct.  The moment Run adopts its own `_int1d`/`_int2d` slot the anchor
-    becomes `<scan>_int2d.nexus`, and deriving the family from that stem yields
-    `<scan>_int2d_average.nexus` -- precisely the chained suffix ADR-0010
-    forbids by name.  Stripping `_int2d` to recover the root is NOT the remedy;
-    parsing a generated suffix is an explicit stop condition.  The remedy is to
-    pass the family Run persisted, which is why *artifact_family* exists now
-    and why renaming Run without persisting a root family is unsafe.
+    WHY THE ANCHOR CARRIES NO SLOT.  `page.py:2553` builds it from the save
+    FOLDER plus the SCAN NAME, so it is `<scan>.nexus` and the anchor-derived
+    family is `<scan>`.  It must stay that way.  Were the anchor ever given the
+    run's own `_int1d`/`_int2d` slot, the family derived from that stem would be
+    `<scan>_int2d` and this would publish `<scan>_int2d_average.nexus` -- the
+    chained suffix ADR-0010 forbids by name.  Stripping `_int2d` to recover the
+    root is NOT the remedy; parsing a generated suffix is an explicit stop
+    condition.  The remedy is *artifact_family*: pass the family Run persisted.
     """
     requested = Path(anchor)
     return str(resolve_finite_output_target(
