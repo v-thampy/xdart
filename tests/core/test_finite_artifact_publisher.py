@@ -224,10 +224,12 @@ def test_trusted_adapter_authority_boundary_is_explicit() -> None:
         ("scan.reintegrate-1d-deadbeef.nexus", None,
          "scan.reintegrate-1d-deadbeef"),
         ("ignored.nexus", "beamline-scan_7", "beamline-scan_7"),
-        (" space name.nexus", None,
-         "artifact-" + hashlib.sha256(b" space name.nexus").hexdigest()[:24]),
-        ("x" * 82 + ".nexus", None,
-         "artifact-" + hashlib.sha256(("x" * 82 + ".nexus").encode()).hexdigest()[:24]),
+        # Ordinary punctuation and non-Latin script stay READABLE. These used
+        # to reach the `artifact-<24 hex>` fallback, which put a content hash in
+        # a public name against ADR-0010; the fallback is gone.
+        ("Sample A 001.nexus", None, "Sample A 001"),
+        ("scan#12.nexus", None, "scan#12"),
+        ("basé.nexus", None, "basé"),
     ),
 )
 def test_family_policy_never_guesses_generated_suffixes(
@@ -477,7 +479,10 @@ def test_explicit_target_in_another_directory_is_refused(tmp_path: Path) -> None
         {"source_graph_identity": "0" * 63},
         {"entry": ""},
         {"output_schema": ""},
-        {"artifact_family": "bad family"},
+        # A space is now a legal family character, so the invalid cases must be
+        # structurally invalid: a path separator and a leading dot.
+        {"artifact_family": "bad/family"},
+        {"artifact_family": ".hidden"},
     ),
 )
 def test_request_refuses_noncanonical_or_unbounded_identity_inputs(

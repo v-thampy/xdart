@@ -256,6 +256,7 @@ def _predecessor(
     admission: FiniteSourceAdmission,
     terminal: StreamTerminal | None,
     entry: str,
+    explicit_family: str | None = None,
 ):
     try:
         with h5py.File(admission.path, "r") as document:
@@ -281,7 +282,9 @@ def _predecessor(
         return capture_finite_predecessor(
             admission,
             terminal=terminal,
-            artifact_family_v1=_persisted_root_family(admission.path, entry),
+            artifact_family_v1=_persisted_root_family(
+                admission.path, entry, explicit_family,
+            ),
         )
     payload = json.loads(lineage.canonical_json)
     return capture_finite_predecessor(
@@ -294,7 +297,9 @@ def _predecessor(
     )
 
 
-def _persisted_root_family(path, entry: str) -> str | None:
+def _persisted_root_family(
+    path, entry: str, explicit_family: str | None = None,
+) -> str | None:
     """Read `entry/@artifact_family_v1`, or refuse a slot-named file without one.
 
     A stable public name is `<family><slot>.nexus`, so deriving a family from
@@ -331,16 +336,16 @@ def _persisted_root_family(path, entry: str) -> str | None:
         ) from error
     if family is not None:
         return family
-    stem = Path(os.fspath(path)).stem
-    for slot in FINITE_OPERATION_SLOTS.values():
-        if stem.endswith(slot) and stem != slot:
-            raise FiniteArtifactIntegrityError(
-                f"{os.fspath(path)!r} is named as the {slot!r} slot but carries "
-                f"no @{ARTIFACT_FAMILY_ATTR}; its root family cannot be "
-                "recovered from the filename, and deriving one from the stem "
-                "would publish a chained name.  Re-run the operation that "
-                "produced it so the family is persisted."
-            )
+    # NO SUFFIX-TAIL REFUSAL.  An earlier revision refused a stem ending in a
+    # known slot, on the theory that its root could not be recovered.  That was
+    # wrong twice over: it refused `series_rsm.nexus`, a scan legitimately named
+    # `series_rsm`, and it was unnecessary -- every artifact the slot-aware
+    # writers produce carries the attribute, so a slot-shaped stem WITHOUT one
+    # was never written under this policy and its stem IS its root family.
+    # Retaining it verbatim is therefore correct rather than a chain, and it
+    # keeps the "never interpret a generated suffix" rule intact by not looking
+    # at the suffix at all.
+    return explicit_family
     return None
 
 
@@ -482,6 +487,7 @@ def _request_from_values(
         admission,
         _exact_predecessor_terminal(admission, terminal),
         qualified.entry,
+        artifact_family,
     )
     persisted_family = predecessor.artifact_family_v1
     if (

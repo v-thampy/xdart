@@ -906,40 +906,45 @@ def test_a_persisted_family_prevents_suffix_chaining(tmp_path):
     assert artifact_family_from_source(published) == "sample_average"
 
 
-def test_unsafe_source_basenames_fall_back_to_a_hashed_public_family(tmp_path):
-    """An unsafe stem yields `artifact-<24hex>`, which IS a hash in a public name.
+def test_readable_stems_stay_readable_and_only_unsafe_ones_are_hashed(tmp_path):
+    """Real beamline stems keep their name; only structurally unsafe ones hash.
 
-    Fable F5 on `c167b71a`. `_ARTIFACT_FAMILY` admits only
-    `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`, so a stem containing a space, `#`, or a
-    non-ASCII letter falls back to `"artifact-" + sha256(basename)[:24]`.
-    Beamline TIFF stems with spaces make this routine, not exotic.
+    Fable F5 on `c167b71a`, RULED by the maintainer 2026-09-04: widen the family
+    alphabet rather than document an exception. The previous ASCII-only class
+    sent `Sample A 001` to the `artifact-<24 hex>` fallback, putting a content
+    hash in a public name in direct contradiction of the ADR this same work
+    carried, and stems with spaces are routine at a beamline.
 
-    That collides with two sentences this objective's own ADR carries: public
-    filenames "do not contain a version, content hash, operation identity,
-    timestamp, or random token", and the design calls the namespace
-    "human-readable". `test_public_slot_names_carry_no_version_hash_or_counter`
-    only covers the safe family `sample`, so it passes over this case.
-
-    MAINTAINER DECISION, pinned either way rather than silently resolved. The
-    two options are to widen the family alphabet (spaces, Unicode letters) or to
-    document the fallback as an exception in the ADR. This row asserts today's
-    behaviour so whichever is chosen is a visible change.
+    The fallback is kept for names that would be structurally dangerous rather
+    than merely unusual, and each refusal has a reason: a leading dot (hidden
+    files, and the private candidate namespace lives there), a leading dash
+    (reads as an option to command-line tools), `:` (drive and alternate-data-
+    stream separator on Windows), and a leading underscore (would read as a bare
+    slot).
     """
     from xrd_tools.io.output_path import (
         artifact_family_from_source,
         resolve_finite_output_target,
     )
 
-    for stem in ("Sample A 001", "basé", "scan#12"):
+    for stem in ("Sample A 001", "basé", "日本語", "scan#12", "scan_12-a.b",
+                 "sample_average"):
         family = artifact_family_from_source(tmp_path / f"{stem}.nexus")
-        assert family.startswith("artifact-")
-        assert len(family) == len("artifact-") + 24
+        assert family == stem, f"{stem!r} should stay readable"
         name = resolve_finite_output_target(
             tmp_path, family, operation_token="average",
         ).name
-        assert name == f"{family}_average.nexus"
-        # The very thing the no-hash row forbids, reached by a different door.
-        assert re.search(r"[0-9a-f]{8,}", name) is not None, name
+        assert name == f"{stem}_average.nexus"
+        # No hash reached the public name.
+        assert re.search(r"[0-9a-f]{8,}", name) is None, name
+
+    # A structurally unusable stem is REFUSED, not silently hashed. The old
+    # `artifact-<24 hex>` fallback put a content hash in a public name against
+    # the ADR, and gave the operator an unreadable filename with no reason for
+    # it. With the alphabet widened, what is left is genuinely unusable.
+    for stem in ("-leading-dash", ".hidden", "a:b", "_leading"):
+        with pytest.raises(ValueError, match="public result family"):
+            artifact_family_from_source(tmp_path / f"{stem}.nexus")
 
     # A stem that is already safe is retained verbatim -- no hashing, no
     # stripping, including one that merely LOOKS like a slot name.

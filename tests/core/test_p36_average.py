@@ -2136,34 +2136,30 @@ def test_average_persists_its_root_family_so_the_next_operation_cannot_chain(
     assert following.name != "scan12_average_reintegrate1d.nexus"
 
 
-def test_a_slot_named_artifact_without_a_family_is_refused_not_chained(
-    tmp_path,
-) -> None:
-    """A slot-named file carrying no family REFUSES rather than chaining.
+def test_a_slot_named_artifact_without_a_family_keeps_its_stem(tmp_path) -> None:
+    """No stamped family means the STEM is the family -- no suffix interpretation.
 
-    The stamp only helps files this code wrote. A slot-named artifact from an
-    older build, or a hand-made one, still has no `@artifact_family_v1`, and the
-    stem is exactly what must not be used. Recovering the root by stripping the
-    slot is an explicit stop condition, so the only honest options are to refuse
-    or to publish a chained name. Refuse.
+    An earlier revision of mine refused a stem ending in a known slot, reasoning
+    that its root could not be recovered. Codex ruled that out on 2026-09-04 and
+    was right on both counts:
 
-    Matching the stem's tail against the CLOSED slot vocabulary decides only
-    whether to refuse; it never recovers a family, which is the distinction the
-    stop condition draws.
+    * it was WRONG, refusing `series_rsm.nexus` -- a scan legitimately named
+      `series_rsm` -- with no way for the operator to proceed; and
+    * it was UNNECESSARY, because every artifact the slot-aware writers produce
+      carries `@artifact_family_v1`. A slot-shaped stem WITHOUT one was never
+      written under this policy, so its stem IS its root family and retaining it
+      verbatim is correct rather than a chain.
+
+    Not interpreting the suffix at all is also the stronger reading of the "do
+    not parse a generated suffix to recover a root family" stop condition.
     """
-    from xrd_tools.io.finite_artifact import FiniteArtifactIntegrityError
     from xrd_tools.reduction.reintegrate_successor import _persisted_root_family
 
-    orphan = tmp_path / "scan12_average.nexus"
-    with h5py.File(orphan, "w") as document:
-        document.create_group("entry")
-
-    with pytest.raises(FiniteArtifactIntegrityError, match="root family"):
-        _persisted_root_family(orphan, "entry")
-
-    # A PRE-SLOT legacy artifact keeps working: its stem ends in no known slot,
-    # so there is nothing to chain and the stem-derived family is still safe.
-    legacy = tmp_path / "scan12.nexus"
-    with h5py.File(legacy, "w") as document:
-        document.create_group("entry")
-    assert _persisted_root_family(legacy, "entry") is None
+    for stem in ("scan12", "series_rsm", "sample_average", "run_int1d"):
+        artifact = tmp_path / f"{stem}.nexus"
+        with h5py.File(artifact, "w") as document:
+            document.create_group("entry")
+        # No stamped family -> None, so the caller falls back to the stem.
+        assert _persisted_root_family(artifact, "entry") is None
+        # An explicit family still wins when the caller knows better.
+        assert _persisted_root_family(artifact, "entry", "explicit") == "explicit"

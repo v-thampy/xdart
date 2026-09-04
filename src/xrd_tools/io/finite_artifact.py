@@ -41,7 +41,11 @@ from xrd_tools.io.output_transaction import (
 _FACTORY = object()
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 _OPERATION_KIND = re.compile(r"[a-z0-9][a-z0-9-]{0,39}\Z")
-_ARTIFACT_FAMILY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
+# ONE family vocabulary, imported rather than restated.  This module used to
+# keep its own ASCII-only copy, so a family `output_path` accepted (`Sample A
+# 001`) was rejected here -- two spellings of the same rule is how the widening
+# would have silently failed one layer down.
+from xrd_tools.io.output_path import _ARTIFACT_FAMILY
 _SCHEMA_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _COPY_BLOCK_BYTES = 1024 * 1024
 _CANDIDATE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024

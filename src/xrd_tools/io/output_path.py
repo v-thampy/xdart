@@ -32,7 +32,6 @@ numpy, no Qt, no ``xdart``, no writer and no schema import.
 
 from __future__ import annotations
 
-import hashlib
 import os
 from pathlib import Path
 import re
@@ -66,7 +65,37 @@ __all__ = [
 ]
 
 
-_ARTIFACT_FAMILY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
+#: A public family must stay HUMAN-READABLE (ADR-0010), so the alphabet is wide
+#: enough for real beamline stems -- spaces and accented letters are routine --
+#: and narrow enough that nothing structural can hide in a filename.
+#:
+#: WIDENED 2026-09-04 on the maintainer's ruling.  The previous ASCII-only class
+#: sent `Sample A 001` to the `artifact-<24 hex>` fallback, putting a content
+#: hash in a public name in direct contradiction of the ADR carried by this same
+#: work.  `\w` with re.UNICODE admits letters, digits and underscore in any
+#: script; space, dot, dash and tilde are added explicitly.
+#:
+#: Still REFUSED, and each for a reason: `/` and `\` (path separators), any
+#: control character or NUL, a leading dot (hidden files, and the candidate
+#: namespace `.<name>.xdart-candidate-...` lives there), a leading dash (reads
+#: as an option to command-line tools), and `:` (an alternate-data-stream and
+#: drive separator on Windows).  The hash fallback remains for those.
+#: Characters a public family may never contain, and why: POSIX and Windows path
+#: separators, the Windows drive/alternate-data-stream separator, the four
+#: Windows wildcard/redirection characters, quote, and any control character.
+#: Everything else -- spaces, `#`, parentheses, accented and non-Latin letters --
+#: is ORDINARY punctuation in a filename and stays readable.
+_FAMILY_FORBIDDEN = r'\x00-\x1f\x7f/\\:*?"<>|'
+
+#: A family is at most 80 characters, contains nothing forbidden, and neither
+#: starts with `.` `-` `_` or whitespace (hidden files, option-looking names, a
+#: bare-slot look-alike, and leading blanks) nor ends with a space or dot, which
+#: Windows silently strips.
+_ARTIFACT_FAMILY = re.compile(
+    rf"[^{_FAMILY_FORBIDDEN}.\-_\s][^{_FAMILY_FORBIDDEN}]{{0,78}}[^{_FAMILY_FORBIDDEN}\s.]\Z"
+    rf"|[^{_FAMILY_FORBIDDEN}.\-_\s]\Z",
+    re.UNICODE,
+)
 
 #: The CLOSED public operation vocabulary (ADR-0010, carried as 491b9413).
 #: A generated public filename is ``<root-family><slot>.nexus`` and the
@@ -181,7 +210,17 @@ def artifact_family_from_source(
     stem = Path(basename).stem
     if _ARTIFACT_FAMILY.fullmatch(stem):
         return stem
-    return "artifact-" + hashlib.sha256(os.fsencode(basename)).hexdigest()[:24]
+    # NO HASH FALLBACK.  It used to return `artifact-<24 hex>` here, which put a
+    # content hash into a PUBLIC filename in direct contradiction of ADR-0010,
+    # and did so silently -- the operator saw an unreadable name and no reason
+    # for it.  With the alphabet widened to real beamline stems, what remains
+    # unmatched is structurally unusable rather than merely unusual, so say so.
+    raise ValueError(
+        f"artifact source stem cannot be a public result family: {stem!r}. "
+        "A family may not start with '.', '-' or '_', may not contain a path "
+        "separator or ':', and is at most 80 characters. Rename the source, or "
+        "pass an explicit result family."
+    )
 
 
 def resolve_finite_output_target(
