@@ -70,16 +70,15 @@ def _result(disposition: str, target: str = "/detached/average.nxs") -> AverageS
     from xrd_tools.reduction.average import (
         _average_output_artifact, _average_target,
     )
-    # A real Average result NEVER names the ANCHOR.  The successor route writes
-    # <family>.average-<version>.nexus, and the page verifies a terminal by
-    # RECOMPUTING exactly that from anchor + version_identity
-    # (workspace_operations.py:719).  Returning the anchor here fabricated an
-    # impossible result that every reload path then correctly refused, so the
-    # tests were asserting refusals they had manufactured themselves.
+    # A real Average result NEVER names the ANCHOR.  The route writes the stable
+    # <family>_average.nexus slot, and the page verifies a terminal by
+    # RECOMPUTING exactly that from the anchor (workspace_operations.py).
+    # Returning the anchor here fabricated an impossible result that every
+    # reload path then correctly refused, so the tests were asserting refusals
+    # they had manufactured themselves.  `version` still populates
+    # `version_identity` below, which is where the identity actually lives now
+    # that the public name no longer carries it.
     version = "e" * 64
-    # The public slot no longer carries the version, so the derivation takes
-    # only the anchor.  `version` still populates `version_identity` below,
-    # which is where the identity actually lives.
     artifact = _average_output_artifact(_average_target(target))
     committed = disposition == "COMMITTED"
     evidence = (AverageFiniteCountsEvidence(
