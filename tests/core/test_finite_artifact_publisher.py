@@ -48,6 +48,7 @@ from xrd_tools.io.output_path import (
     resolve_finite_output_target,
 )
 from xrd_tools.io.output_transaction import (
+    LeaseUnavailable,
     StreamTerminal,
     capture_target_snapshot,
 )
@@ -1900,3 +1901,79 @@ def test_types_are_public_lazy_exports() -> None:
         "FINITE_PARENT_DIRECTORY_FSYNC_UNCONFIRMED"
     )
     assert "FiniteArtifactPublisher" in io_api.__all__
+
+
+def test_a_second_publication_into_one_slot_is_refused_while_the_first_holds_it(
+    tmp_path: Path,
+) -> None:
+    """The finite path holds an H23 lease on the PUBLIC SLOT. It did not before.
+
+    Until 2026-09-04 `grep -rn "coordinator.admit\\|\\.acquire_lease(" src/`
+    returned NOTHING in `finite_artifact.py`, `reintegrate_successor.py` or
+    `scan_session.py`.  The no-clobber `os.link` at the end of publication WAS
+    the entire concurrency guard for Reintegrate, Stitch and RSM: two concurrent
+    operations on one slot were settled by whichever linked first.
+
+    That matters because atomic replacement REMOVES that link.  Landing the
+    lease first, on the still-no-clobber publisher, means the guard exists
+    before the thing it replaces goes away -- so this row is what makes
+    unconditional replacement safe rather than a silent last-writer-wins.
+
+    Shaped after P1-B's b17, which pins the same typed refusal for ordinary Run:
+    hold the first writer INSIDE its own adapter, and require the contender to
+    fail with `LeaseUnavailable` naming the artifact.
+    """
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"source")
+    request = _request(tmp_path, source)
+    target = Path(request.output_artifact)
+
+    inside = threading.Event()
+    release = threading.Event()
+    contender_error: list[BaseException] = []
+
+    def held_write(binding: FiniteCandidateBinding) -> None:
+        _write_payload(request)(binding)
+        inside.set()
+        assert release.wait(30.0)
+
+    def first() -> None:
+        _publish(request, writer=held_write)
+
+    writer_thread = threading.Thread(target=first)
+    writer_thread.start()
+    try:
+        assert inside.wait(30.0), "first publication never reached its writer"
+        # A whole second publisher, mid-candidate on the same slot.
+        try:
+            _publish(_request(tmp_path, source))
+        except BaseException as error:
+            contender_error.append(error)
+    finally:
+        release.set()
+        writer_thread.join(30.0)
+    assert not writer_thread.is_alive()
+
+    assert len(contender_error) == 1, contender_error
+    refusal = contender_error[0]
+    assert type(refusal) is LeaseUnavailable
+    assert str(refusal) == (
+        f"target already leased: {os.path.normcase(os.path.abspath(target))}"
+    )
+    # The first publication still completed, and it owns the slot.
+    assert target.read_bytes() == _payload(request)
+
+    # And the hold is GIVEN BACK: the slot is publishable again afterwards.
+    again = FiniteArtifactPublisher(_request(tmp_path, source))
+    assert again.publish(
+        FiniteDocumentAdapter(
+            lambda binding: nullcontext(binding),
+            _write_payload(request),
+            lambda binding: nullcontext(binding),
+            _validate_payload(request),
+        ),
+        inspect_committed=_inspect_payload,
+    ).disposition in {
+        FiniteArtifactDisposition.COMMITTED,
+        FiniteArtifactDisposition.ALREADY_COMMITTED,
+    }

@@ -34,6 +34,7 @@ from xrd_tools.io.output_path import (
 )
 from xrd_tools.io.output_transaction import (
     StreamTerminal,
+    get_output_transaction_coordinator,
     revalidate_stream_terminal,
 )
 
@@ -65,6 +66,7 @@ FINITE_PARENT_DIRECTORY_FSYNC_WARNING = (
     "FINITE_PARENT_DIRECTORY_FSYNC_UNCONFIRMED"
 )
 FINITE_CANDIDATE_CLEANUP_WARNING = "FINITE_CANDIDATE_CLEANUP_INCOMPLETE"
+FINITE_SLOT_LEASE_WARNING = "finite-slot-lease-release-failed"
 FINITE_DESCRIPTOR_CLOSE_WARNING = "FINITE_DESCRIPTOR_CLOSE_INCOMPLETE"
 
 # Narrow deterministic fault seams.  Production uses the standard library.
@@ -1859,6 +1861,7 @@ class FiniteArtifactPublisher:
         self._cancel_token = cancel_token
         self._used = False
         self._lock = threading.RLock()
+        self._slot_hold = None
 
     def __copy__(self):
         raise TypeError("finite publisher is not copyable")
@@ -1876,6 +1879,47 @@ class FiniteArtifactPublisher:
                 "finite request source changed after operation-context capture"
             )
         return expected
+
+    def _acquire_slot(self) -> None:
+        """Hold the H23 lease on the PUBLIC SLOT for this whole publication.
+
+        Until 2026-09-04 the finite path held NO lease at all: `grep -rn
+        "coordinator.admit\\|\\.acquire_lease(" src/` returned nothing in this
+        module, in `reintegrate_successor.py` or in `scan_session.py`.  The
+        no-clobber `os.link` at the end WAS the entire concurrency guard for
+        Reintegrate, Stitch and RSM -- two concurrent operations on one slot
+        were resolved by whichever linked first, and the loser was told the slot
+        was already committed.
+
+        That is why this lands BEFORE atomic replacement rather than with it.
+        Replacement removes the link, and removing the link without this lease
+        would turn a typed refusal into a silent last-writer-wins.  A second
+        operation on the same slot now gets `LeaseUnavailable`, the same typed
+        failure ordinary Run has always produced for a contended target.
+
+        Held from before the first candidate byte (the parent is open but
+        nothing is written yet) until `close_parent`, which every exit path
+        runs.
+        """
+        self._slot_hold = get_output_transaction_coordinator().hold_target(
+            self.request.output_artifact, label="finite-artifact",
+        )
+
+    def _release_slot(self) -> BaseException | None:
+        """Give the slot back, once, on every exit path.
+
+        Returns the first failure rather than raising: releasing a hold must
+        never mask the outcome -- success or failure -- the caller came for.
+        """
+        hold = self._slot_hold
+        if hold is None:
+            return None
+        self._slot_hold = None
+        try:
+            get_output_transaction_coordinator().release_target(hold)
+        except BaseException as error:
+            return error
+        return None
 
     def _open_parent(self) -> tuple[int, tuple[int, int, int, int, int, int]]:
         parent = Path(self.request.output_artifact).parent
@@ -2586,6 +2630,14 @@ class FiniteArtifactPublisher:
             self._used = True
             target = Path(self.request.output_artifact)
             parent_descriptor, parent_state = self._open_parent()
+            # The slot lease comes AFTER the parent opens (so a bad parent needs
+            # no release) and BEFORE any candidate byte exists.  A failure here
+            # must not leak the descriptor the line above just took.
+            try:
+                self._acquire_slot()
+            except BaseException:
+                _close_descriptor_once(parent_descriptor)
+                raise
             candidate: Path | None = None
             reservation: FiniteFileSnapshot | None = None
             seed_receipt: FiniteSourceSeedReceipt | None = None
@@ -2599,6 +2651,15 @@ class FiniteArtifactPublisher:
                 if parent_closed:
                     return
                 parent_closed = True
+                # Give the slot back on EVERY exit path -- this helper is the
+                # one point all four of them pass through.  A release failure is
+                # reported, never raised: it must not mask the outcome the
+                # caller came for.
+                slot_error = self._release_slot()
+                if slot_error is not None:
+                    diagnostics.append(_bounded_diagnostic(
+                        FINITE_SLOT_LEASE_WARNING, slot_error,
+                    ))
                 close_error = _close_descriptor_once(parent_descriptor)
                 if close_error is None:
                     return
@@ -2962,6 +3023,7 @@ __all__ = [
     "FINITE_LINEAGE_MAX_BYTES",
     "FINITE_LINEAGE_SCHEMA",
     "FINITE_PARENT_DIRECTORY_FSYNC_WARNING",
+    "FINITE_SLOT_LEASE_WARNING",
     "FINITE_PUBLICATION_POLICY",
     "FiniteArtifactCollision",
     "FiniteArtifactCapacityError",

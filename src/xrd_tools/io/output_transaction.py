@@ -371,6 +371,26 @@ def stream_terminal_object_revision(
 
 
 @dataclass(frozen=True)
+class TargetHold:
+    """An exclusive claim on one target for a writer that publishes ITSELF.
+
+    `OutputTransaction` assumes it performs the write, so `abandon` refuses once
+    the target has changed and `release_lease_owner` blocks the CLEANUP role
+    outside a terminal phase.  A finite operation publishes out of band -- it
+    builds a private candidate and renames it into place -- so it can never
+    reach that terminal phase, and driving the transaction would leave the
+    target leased forever.
+
+    This is the SAME lease registry, keyed the same normalized way, so a hold
+    and an ordinary Run/Append/Average lease exclude each other exactly as two
+    Runs would.  It is only the state machine that is skipped.
+    """
+
+    lease: TargetLease
+    owners: "Mapping[LeaseOwner, OwnerToken]"
+
+
+@dataclass(frozen=True)
 class CleanupToken:
     """Opaque retry owner; equal-valued copies have no authority."""
 
@@ -865,6 +885,27 @@ class OutputTransactionCoordinator:
             durable_fsync=durable_fsync,
             fast_regenerable=fast_regenerable,
         )
+
+    def hold_target(self, target, *, label: str) -> TargetHold:
+        """Claim *target* exclusively for a caller that publishes it itself.
+
+        Raises `LeaseUnavailable` when anything already holds the target,
+        whether that is another hold or an ordinary transaction lease.
+        """
+        if type(label) is not str or not label:
+            raise ValueError("a target hold requires a non-empty label")
+        owners = {
+            role: OwnerToken(f"{label}-{role.value}") for role in LeaseOwner
+        }
+        lease = self._acquire(_normalize_target(target), owners)
+        return TargetHold(lease, owners)
+
+    def release_target(self, hold: TargetHold) -> None:
+        """Give a hold back.  Idempotent only in the sense that it is one-shot."""
+        if type(hold) is not TargetHold:
+            raise TypeError("release_target requires an exact TargetHold")
+        for role in LeaseOwner:
+            self._release(hold.lease, role, hold.owners[role])
 
     def prepare_xye(
         self,
