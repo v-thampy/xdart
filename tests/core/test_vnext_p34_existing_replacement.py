@@ -2912,10 +2912,14 @@ def test_exact_event_flows_unchanged_through_scan_session_and_stop(tmp_path, mon
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "PRE-EXISTING predecessor-contract gap (Codex F5 on e06d6123), NOT the "
-        "family-stamp defect this row was written for. Blocked before the "
-        "family is even consulted, on finite lineage admission. STRICT so it "
-        "reports the moment the contract slice lands."
+        "FIXTURE LIMITATION, not a product defect -- corrected 2026-09-04. "
+        "This seed was built for the OLD in-place ReintegratePlan and writes a "
+        "finite lineage the successor path cannot parse, so the row dies on "
+        "lineage admission. I first recorded the cause as Codex F5 reached from "
+        "the Run side; that was WRONG. A real Run output DOES persist a "
+        "scientific_signature (see test_run_then_reintegrate.py), so F5 is "
+        "AVERAGE-only. STRICT so it reports if the fixture is ever made "
+        "successor-shaped."
     ),
 )
 def test_a_family_stamped_run_output_reintegrates_end_to_end(tmp_path, monkeypatch):
