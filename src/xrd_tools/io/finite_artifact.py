@@ -1124,14 +1124,33 @@ def admit_finite_artifact_lineage(value: str | bytes) -> FiniteArtifactLineage:
         or not 0 <= source_size <= _I64_MAX
         or type(predecessor.get("source_digest")) is not str
         or not _LOWER_HEX_64.fullmatch(predecessor["source_digest"])
+        # THE FAMILY IS INDEPENDENT OF THE LINEAGE TRIPLE.  Fable F1 on
+        # `55338dd9`: `0015f756` applied this decoupling to
+        # `FinitePredecessorReceipt` and NOT here, so a family-stamped Run
+        # output passed PLANNING and then failed inside the run, while this
+        # validator checked the successor's own written lineage.  Half a fix is
+        # worse than none: it moved the failure later without removing it.
+        #
+        # `[0]` is the family, `[1:]` the lineage triple.  The triple stays
+        # all-or-none among themselves; a triple still requires a family; the
+        # family alone -- what every streamed Run and Average writes -- is now
+        # coherent on its own.
         or not (
-            all(item is None for item in predecessor_finite)
-            or (
-                type(predecessor_finite[0]) is str
-                and _ARTIFACT_FAMILY.fullmatch(predecessor_finite[0])
-                and all(
-                    type(item) is str and _LOWER_HEX_64.fullmatch(item)
-                    for item in predecessor_finite[1:]
+            (
+                predecessor_finite[0] is None
+                or (
+                    type(predecessor_finite[0]) is str
+                    and _ARTIFACT_FAMILY.fullmatch(predecessor_finite[0])
+                )
+            )
+            and (
+                all(item is None for item in predecessor_finite[1:])
+                or (
+                    predecessor_finite[0] is not None
+                    and all(
+                        type(item) is str and _LOWER_HEX_64.fullmatch(item)
+                        for item in predecessor_finite[1:]
+                    )
                 )
             )
         )

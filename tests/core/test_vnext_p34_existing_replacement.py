@@ -2909,19 +2909,6 @@ def test_exact_event_flows_unchanged_through_scan_session_and_stop(tmp_path, mon
         session_module.ScanSession(core_plan, scan, cancel_token=object())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "FIXTURE LIMITATION, not a product defect -- corrected 2026-09-04. "
-        "This seed was built for the OLD in-place ReintegratePlan and writes a "
-        "finite lineage the successor path cannot parse, so the row dies on "
-        "lineage admission. I first recorded the cause as Codex F5 reached from "
-        "the Run side; that was WRONG. A real Run output DOES persist a "
-        "scientific_signature (see test_run_then_reintegrate.py), so F5 is "
-        "AVERAGE-only. STRICT so it reports if the fixture is ever made "
-        "successor-shaped."
-    ),
-)
 def test_a_family_stamped_run_output_reintegrates_end_to_end(tmp_path, monkeypatch):
     """THE PRIMARY WORKFLOW, end to end: integrate a scan, reintegrate the result.
 
@@ -2936,16 +2923,19 @@ def test_a_family_stamped_run_output_reintegrates_end_to_end(tmp_path, monkeypat
     lineage. The production shape had no fixture at all. This is that fixture:
     the seed writes through `NexusSink` exactly as a Run does, WITH the stamp.
 
-    XFAIL, and NOT for the reason this row exists. The receipt-level defect IS
-    fixed and is proved by `test_a_family_only_predecessor_is_accepted`. This
-    row gets no further than finite lineage admission -- "finite lineage schema
-    or canonical form is invalid" -- which is the SAME pre-existing
-    producer/consumer contract gap Codex recorded as F5 for Average, reached
-    from the Run side. Weakening that validation to turn this green would hide
-    a science-contract problem, which is precisely what Codex warned against.
+    THIS ROW WAS AN XFAIL TWICE, FOR TWO WRONG REASONS, before it passed.
 
-    So: the primary workflow is NOT yet proven end to end, and this row says so
-    out loud instead of the suite implying otherwise by silence.
+    First I recorded the blocker as Codex F5 (`scientific_signature`) reached
+    from the Run side. Wrong: a real Run persists a signature -- different
+    error, different site, mapped together by reading rather than running.
+    Then I recorded it as a fixture limitation. Also wrong.
+
+    The real cause was that `0015f756` decoupled the family from the lineage
+    triple in `FinitePredecessorReceipt` and NOT in
+    `admit_finite_artifact_lineage`, so a stamped Run output passed PLANNING and
+    failed inside the run. Half a fix, which moved the failure later instead of
+    removing it, and each of my explanations was a story that fit the symptom I
+    happened to be looking at.
     """
     from xrd_tools.io.schema import ARTIFACT_FAMILY_ATTR
     from xrd_tools.reduction import ReintegrateSuccessorPlan, run_reintegrate_successor

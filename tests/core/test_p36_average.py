@@ -2347,3 +2347,39 @@ def test_a_failure_after_candidate_settlement_strands_nothing(
     slot = Path(module._average_output_artifact(module._average_target(str(target))))
     assert not slot.exists()
     assert not tuple(slot.parent.glob(f".{slot.stem}.xdart-average-*"))
+
+
+def test_average_refuses_a_slot_that_is_its_own_raw_input(tmp_path, monkeypatch):
+    """The P1 data-loss refusal, pinned. Fable F3 on `55338dd9`.
+
+    `AVERAGE_OUTPUT_IS_SOURCE` had ZERO test references: the defect was proved
+    by a reviewer probe and by mine, and the fix shipped with nothing in the
+    suite to hold it. A refactor of the plan path would have removed it silently
+    and the reviews that found it would not run again.
+
+    Codex's construction, exactly: a RAW NeXus stack sitting at the pathname the
+    Average slot resolves to. No aliases, no concurrency. Before the fix this
+    returned COMMITTED and overwrote the raw data.
+    """
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.reduction.average import AverageScanRunner
+
+    raw = tmp_path / "scan_average.nexus"          # IS the derived slot
+    with h5py.File(raw, "w") as handle:
+        handle.create_group("entry/instrument/detector").create_dataset(
+            "data", data=np.arange(12, dtype="u2").reshape(3, 2, 2),
+        )
+    before = raw.read_bytes()
+    _stub_integrators(monkeypatch, [])
+
+    result = AverageScanRunner(AverageScanRecipe(
+        SourceSpec(raw, SourceKind.NEXUS_STACK, entry="entry"),
+        tmp_path / "scan.nexus",
+        ReductionPlan(integration_1d=Integration1DPlan(npt=4)),
+    )).start()
+
+    assert result.disposition == "REFUSED"
+    assert result.diagnostic_code == "AVERAGE_OUTPUT_IS_SOURCE"
+    # Every source byte survives, and nothing was published or left behind.
+    assert raw.read_bytes() == before
+    assert not tuple(tmp_path.glob(".*.xdart-average-*"))
