@@ -704,3 +704,68 @@ def test_committed_average_naming_the_recomputed_slot_is_adopted() -> None:
 
     assert transition.average_reload is not None
     assert "target mismatch" not in transition.notice
+
+
+def test_a_published_unverified_average_refreshes_the_folder_not_just_controls(
+) -> None:
+    """Fable F4 on `55338dd9`: a failure that CHANGED the folder.
+
+    Every other Average failure leaves the directory as it was, and refreshing
+    only the controls is right for those. PUBLISHED_UNVERIFIED is different: the
+    atomic replacement landed and only the verification after it did not, so a
+    new file really is at the slot. Refreshing controls alone told the operator
+    about a file the browser would not show them until something else happened
+    to refresh it.
+    """
+    from dataclasses import replace as _replace
+
+    owner, slot = _owner_with_slot()
+    identity = OperationIdentity(71)
+    target = "/detached/average.nxs"
+    slot._identity = identity
+    owner._average = AverageOperationState(identity, 4, target, "entry")
+    result = _replace(
+        _average_result(target),
+        disposition="PUBLISHED_UNVERIFIED",
+        committed_labels=(),
+        finite_counts=None,
+        metadata_denominators=(),
+        h23_phase=None,
+        commit_identity=None,
+        diagnostic_code="AVERAGE_PUBLISHED_UNVERIFIED",
+        diagnostic="injected post-rename seal failure",
+    )
+    transition = owner.consume_average_update(
+        OperationUpdate(
+            identity,
+            terminal=OperationTerminal(
+                identity,
+                OperationTerminalStatus.FAILED,
+                "AVERAGE_PUBLISHED_UNVERIFIED: a new result was published at "
+                f"{result.target} but could not be verified: injected",
+                payload=result,
+            ),
+        ),
+        current_intent_revision=4,
+    )
+
+    assert transition.effect is WorkspaceRefreshEffect.FULL
+    # ...and an ordinary abort still gets the cheaper refresh.
+    owner._average = AverageOperationState(identity, 4, target, "entry")
+    aborted = owner.consume_average_update(
+        OperationUpdate(
+            identity,
+            terminal=OperationTerminal(
+                identity, OperationTerminalStatus.FAILED, "AVERAGE_H23_FAILED: x",
+                payload=_replace(
+                    _average_result(target), disposition="ABORTED",
+                    committed_labels=(), finite_counts=None,
+                    metadata_denominators=(), h23_phase=None,
+                    commit_identity=None, diagnostic_code="AVERAGE_H23_FAILED",
+                    diagnostic="x",
+                ),
+            ),
+        ),
+        current_intent_revision=4,
+    )
+    assert aborted.effect is WorkspaceRefreshEffect.CONTROLS

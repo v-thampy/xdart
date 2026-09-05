@@ -693,8 +693,18 @@ class WorkspaceOperationOwner:
                 if result.disposition == "ABORTED"
                 else f"Average failed: {terminal.diagnostic}"
             )
+            # PUBLISHED_UNVERIFIED is a FAILURE THAT CHANGED THE FOLDER: the
+            # atomic replacement landed and only the check after it did not, so
+            # a new file really is at the slot.  Every other failure here leaves
+            # the directory as it was, and CONTROLS is right for those.  Fable
+            # F4 on `55338dd9`: refreshing only the controls left the operator
+            # told about a file the browser would not show them until something
+            # else happened to refresh it.
             return WorkspaceOperationTransition(
-                WorkspaceRefreshEffect.CONTROLS, notice
+                WorkspaceRefreshEffect.FULL
+                if result.disposition == "PUBLISHED_UNVERIFIED"
+                else WorkspaceRefreshEffect.CONTROLS,
+                notice,
             )
         if result.disposition == "REFUSED":
             self._average = None
