@@ -1268,8 +1268,12 @@ def test_c2_dynamic_checkpoint_failure_restores_prior_and_revokes_pending_durabl
     )
 
     target = tmp_path / "checkpoint-failure-rollback.nexus"
-    prior = b"immutable prior checkpoint target"
-    target.write_bytes(prior)
+    from tests.core._processed_fixture import write_recognized_result
+
+    # A RECOGNIZED prior: an ordinary Replace refuses an unrecognized
+    # occupant since OWNER-GATE-RAW-TARGET-20260905, and arbitrary bytes
+    # are exactly that. The subject here is backup/restore, not content.
+    prior = write_recognized_result(target)
     _ledger, accounting, mode, target_name = accounting_for(
         target, max_attempts=2, max_outstanding=3,
     )

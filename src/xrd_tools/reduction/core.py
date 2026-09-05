@@ -102,6 +102,7 @@ from xrd_tools.io.output_transaction import (
 )
 from xrd_tools.io.processed_scan_id import (
     require_current_output_path,
+    is_current_processed_xdart_path,
     require_current_writable_processed_groups,
 )
 
@@ -2057,7 +2058,16 @@ class NexusSink:
         return decision
 
     def _require_current_append_target(self) -> None:
-        if not self.path.exists() or self.overwrite:
+        if not self.path.exists():
+            return
+        if self.overwrite:
+            # `create_new` already refuses an existing target with its own,
+            # more precise message (`CREATE_NEW_TARGET_EXISTS`), and it refuses
+            # EVERY existing target rather than only unrecognized ones.  Letting
+            # this guard fire first would replace a specific contract with a
+            # vaguer one and change an established diagnostic.
+            if not self.create_new:
+                self._require_replaceable_target()
             return
         with h5py.File(self.path, "r") as existing:
             require_current_writable_processed_groups(
@@ -2065,6 +2075,48 @@ class NexusSink:
                 self.entry,
                 container=self.path,
             )
+
+    def _require_replaceable_target(self) -> None:
+        """Refuse to REPLACE an existing file that is not an xdart result.
+
+        OWNER-GATE-RAW-TARGET-20260905, approved by the maintainer.
+
+        Overwrite deliberately skipped the positive existing-target admission
+        that Append performs, on the reading that Replace means "whatever is
+        there, replace it".  A real two-scan directory Run turned that into raw
+        data loss: scan B's external detector member occupied scan A's generated
+        output slot, so A's transaction backed it up, replaced it with A's
+        processed result, and the Run then skipped B and reported
+        FINISHED/CLEANED.  The backup/swap worked exactly as designed -- it was
+        AUTHORIZED for the wrong kind of target, which is an ADMISSION error and
+        is why no amount of rollback machinery would have helped.
+
+        POSITIVE RECOGNITION, not a raw-negative guess.  The check is
+        `is_current_processed_xdart_path`: current schema name and version AND
+        real integrated result content.  A filename or suffix is never
+        sufficient, and the broad `has_processed_output_markers_*` helper is NOT
+        used here -- it is documented as raw-NEGATIVE recognition, and arbitrary
+        result-group names or resolved external entries can satisfy it.
+
+        WHAT IS REFUSED, deliberately and with the operator's remedy in the
+        message: raw containers, unrecognized files, damaged/unreadable files
+        (the recognizer returns False rather than guessing), and LEGACY
+        processed outputs that predate the current schema.  Legacy is a real
+        cost and is accepted because it is small under stable slots: an older
+        result lives at `<scan>.nexus`, while a Run now writes
+        `<scan>_int1d.nexus`, so the two rarely collide.
+
+        Once per existing target, at the admitted-target boundary, BEFORE any
+        backup, truncation or writer mutation.  Nothing per frame.
+        """
+        if is_current_processed_xdart_path(self.path, self.entry):
+            return
+        raise ValueError(
+            f"refusing to replace {os.fspath(self.path)!r}: it exists and is "
+            "not a current xdart processed result, so it may be raw data or "
+            "another program's file. Replacing it would destroy it. Choose a "
+            "different output folder, or move or delete that file deliberately."
+        )
 
     def begin(self, scan: Scan, plan: ReductionPlan) -> None:
         if self._writer is not None and self._writer.phase.value in {"active", "partial"}:

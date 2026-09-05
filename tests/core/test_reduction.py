@@ -1304,7 +1304,12 @@ def test_create_new_refusal_leaves_no_lease_behind(tmp_path: Path) -> None:
     before = set(coordinator._leases)
 
     out = tmp_path / "scan.nexus"
-    out.write_bytes(b"existing scientific artifact")
+    from tests.core._processed_fixture import write_recognized_result
+
+    # A RECOGNIZED prior: an ordinary Replace refuses an unrecognized
+    # occupant since OWNER-GATE-RAW-TARGET-20260905, and arbitrary bytes
+    # are exactly that. The subject here is backup/restore, not content.
+    write_recognized_result(out)
     sink = NexusSink(out, overwrite=True, create_new=True)
 
     with pytest.raises(ValueError, match="CREATE_NEW_TARGET_EXISTS"):

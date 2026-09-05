@@ -2187,8 +2187,12 @@ def test_frozen_provenance_routes_only_exact_overwrite_to_fast_regenerable(
     core = importlib.import_module("xrd_tools.reduction.core")
     transaction_module = importlib.import_module("xrd_tools.io.output_transaction")
     target = tmp_path / "route.nexus"
-    prior = b"regenerable prior"
-    target.write_bytes(prior)
+    from tests.core._processed_fixture import write_recognized_result
+
+    # A RECOGNIZED prior: an ordinary Replace refuses an unrecognized
+    # occupant since OWNER-GATE-RAW-TARGET-20260905, and arbitrary bytes
+    # are exactly that. The subject here is backup/restore, not content.
+    prior = write_recognized_result(target)
     real_hash = transaction_module._sha256_handle
     hashes = []
 
@@ -2282,7 +2286,12 @@ def test_fast_regenerable_finish_skips_checkpoint_payload_scans_but_verifies_sci
 
     transaction_module = importlib.import_module("xrd_tools.io.output_transaction")
     target = tmp_path / "fast-finish.nexus"
-    target.write_bytes(b"old regenerable result")
+    from tests.core._processed_fixture import write_recognized_result
+
+    # A RECOGNIZED prior: an ordinary Replace refuses an unrecognized
+    # occupant since OWNER-GATE-RAW-TARGET-20260905, and arbitrary bytes
+    # are exactly that. The subject here is backup/restore, not content.
+    write_recognized_result(target)
     real_fsync = transaction_module.os.fsync
     fsync_calls = []
 
@@ -2492,8 +2501,12 @@ def test_fast_science_failure_abort_restores_exact_prior_target(tmp_path):
     from xrd_tools.reduction import FrameReduction, ReductionResult
 
     target = tmp_path / "fast-prior.nexus"
-    prior = b"exact prior regenerable target"
-    target.write_bytes(prior)
+    from tests.core._processed_fixture import write_recognized_result
+
+    # A RECOGNIZED prior: an ordinary Replace refuses an unrecognized
+    # occupant since OWNER-GATE-RAW-TARGET-20260905, and arbitrary bytes
+    # are exactly that. The subject here is backup/restore, not content.
+    prior = write_recognized_result(target)
     target, sink, facade = _begin_finite_overwrite_sink(
         tmp_path,
         target.name,
@@ -2896,8 +2909,12 @@ def test_existing_overwrite_routes_empty_seed_without_prior_copy_and_abort_resto
 
     core = importlib.import_module("xrd_tools.reduction.core")
     target = tmp_path / "overwrite-empty-seed.nexus"
-    prior = b"immutable prior bytes"
-    target.write_bytes(prior)
+    from tests.core._processed_fixture import write_recognized_result
+
+    # A RECOGNIZED prior: an ordinary Replace refuses an unrecognized
+    # occupant since OWNER-GATE-RAW-TARGET-20260905, and arbitrary bytes
+    # are exactly that. The subject here is backup/restore, not content.
+    prior = write_recognized_result(target)
     sink = NexusSink(target, overwrite=True)
     observed = []
 
