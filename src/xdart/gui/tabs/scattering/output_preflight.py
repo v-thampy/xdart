@@ -2874,8 +2874,8 @@ def _run_output_naming(
         raise ValueError(
             f"cannot use {family!r} as a processed-result name: it may not "
             "start with '.', '-', '_' or a space, may not end with a space or "
-            "'.', may not contain a path separator or ':', and is at most 80 "
-            "characters. Rename the scan, or choose a different output name."
+            "'.', may not contain any of / \\ : * ? \" < > |, and is at most "
+            "80 characters. Rename the scan, or choose a different output name."
         )
     return directory, family
 

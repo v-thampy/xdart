@@ -2433,21 +2433,26 @@ def test_raw_source_drift_has_exact_publication_outcome(
     else:
         first = run_reintegrate_successor(plan)
         first_bytes = output.read_bytes()
-        original = module._inspect_committed
+        # REPOINTED, and the hook is now ASSERTED TO FIRE.  Codex F6: this
+        # injection was still attached to `_inspect_committed`, which the
+        # prepared route never calls once it accepts its own candidate
+        # validation -- instrumenting the row recorded ZERO hook calls while its
+        # assertions passed.  A fault injection that never fires is a test
+        # proving nothing, which is the failure mode this arc keeps producing.
+        # The drift now happens at the PUBLICATION seam, which does run.
+        real_publish = finite_module.replace_into_place
+        fired = []
 
-        def inspect_then_drift(*args, **kwargs):
-            observed = original(*args, **kwargs)
+        def publish_then_drift(*args, **kwargs):
+            real_publish(*args, **kwargs)
+            fired.append(1)
             mutate_member()
-            return observed
 
-        monkeypatch.setattr(module, "_inspect_committed", inspect_then_drift)
-        # This seam used to drive the OCCUPANT INSPECTION that gated an
-        # ALREADY_COMMITTED reuse, and drifting the raw source during it was
-        # refused.  Nothing inspects an occupant to decide reuse any more, so
-        # the repeat republishes; a drift noticed AFTER publication does not
-        # un-publish, exactly as the `postlink` seam above already pins.
-        # Measured, not assumed (probe, 2026-09-04): COMMITTED, bytes identical.
+        monkeypatch.setattr(
+            finite_module, "replace_into_place", publish_then_drift,
+        )
         repeat = run_reintegrate_successor(plan)
+        assert fired == [1], "the injected drift never executed"
         assert repeat.disposition == "COMMITTED"
         assert output.exists()
         assert first.output_artifact == str(output)
@@ -3681,3 +3686,132 @@ def test_changed_settings_repeat_atomically_replaces_the_slot(
     assert sorted(
         path.name for path in artifact.parent.glob("*.nexus")
     ) == sorted({seeded.target.name, artifact.name})
+
+
+def test_a_case_aliased_predecessor_is_not_replaced_by_its_own_successor(
+    tmp_path, monkeypatch,
+):
+    """Codex F1 (P1) on `e06d6123`: the operation replaced its own predecessor.
+
+    `EXISTING_REINTEGRATE1D.NEXUS` and `existing_reintegrate1d.nexus` are ONE
+    FILE on a case-insensitive volume, but the distinctness check compared the
+    two path STRINGS, so the alias passed as distinct and the Reintegrate
+    replaced the artifact it had just read.
+
+    Harmless while an occupied slot was refused outright -- the old
+    `FiniteArtifactCollision` masked it -- and fatal the moment replacement
+    became unconditional.  The check now compares FILE IDENTITY.
+
+    Accepted destruction of a foreign OUTPUT occupant was never permission to
+    overwrite an admitted INPUT, and the source/output distinctness rule was
+    explicitly RULED to stay.
+    """
+    from xrd_tools.reduction import ReintegrateSuccessorPlan, run_reintegrate_successor
+
+    seeded = _seed_existing(tmp_path, labels=(2, 5), name="existing")
+    _stub_integrators(monkeypatch)
+    first = run_reintegrate_successor(_plan(seeded))
+    assert first.disposition == "COMMITTED"
+    artifact = Path(first.output_artifact)
+    assert artifact.name == "existing_reintegrate1d.nexus"
+    predecessor_bytes = artifact.read_bytes()
+
+    aliased = artifact.with_name(artifact.name.upper())
+    if not (aliased.exists() and os.path.samefile(aliased, artifact)):
+        pytest.skip("volume is case-sensitive; the alias is a different file")
+
+    with pytest.raises(ValueError, match="source and output must be distinct"):
+        ReintegrateSuccessorPlan.from_artifact(
+            aliased,
+            entry="entry",
+            dimension="1d",
+            preparation=_dimension_preparation(seeded, "1d"),
+            expected_terminal_identity=None,
+            expected_labels=seeded.labels,
+            destination_directory=artifact.parent,
+            explicit_output=None,
+        )
+
+    # The predecessor is untouched, and nothing was published or left behind.
+    assert artifact.read_bytes() == predecessor_bytes
+    assert not tuple(artifact.parent.glob(".xdart-finite-*"))
+
+
+def test_an_unrelated_prior_output_is_still_replaced(tmp_path, monkeypatch):
+    """POSITIVE CONTROL for the refusal above.
+
+    Protecting admitted inputs must not quietly reinstate the occupied-slot
+    refusal that ruling 1 removed.  A prior result that is NOT an input still
+    gets replaced.
+    """
+    from xrd_tools.reduction import run_reintegrate_successor
+
+    seeded = _seed_existing(tmp_path, labels=(2, 5), name="unrelated")
+    _stub_integrators(monkeypatch)
+    first = run_reintegrate_successor(_plan(seeded))
+    assert first.disposition == "COMMITTED"
+    artifact = Path(first.output_artifact)
+    first_bytes = artifact.read_bytes()
+
+    second = run_reintegrate_successor(_plan(seeded))
+    assert second.disposition == "COMMITTED"
+    assert second.output_artifact == first.output_artifact
+    assert artifact.exists()
+    assert artifact.read_bytes() == first_bytes  # same science, rebuilt
+
+
+def test_a_family_only_predecessor_is_accepted(tmp_path):
+    """Fable F3 (P1): the family stamp made every Run output un-reintegratable.
+
+    `FinitePredecessorReceipt` required its four lineage fields to be all
+    present or all absent. That held while only the finite publisher set any of
+    them. Then `dbb84c33` made ordinary Run and Average stamp
+    `@artifact_family_v1` through `NexusSink` -- a writer with NO finite lineage
+    node -- so FAMILY-ONLY became the normal shape for every GUI Run output and
+    every Average result, and every one was refused as a Reintegrate
+    predecessor with "lineage is partially populated".
+
+    That is the primary workflow: integrate a scan, then reintegrate the result.
+    It was broken on the deliverable branch and nothing caught it, because every
+    fixture in this file writes a FINITE artifact with a full lineage node --
+    the all-present shape. The production shape had no fixture at all, which is
+    exactly why the defect survived two reviews and my own testing.
+
+    PINNED AT THE RECEIPT, deliberately. A full Run/Average -> Reintegrate row
+    cannot be written yet: it stops later on a SEPARATE pre-existing gap --
+    Average persists `_recipe_payload` where the predecessor reader wants a
+    canonical run configuration carrying a `scientific_signature` (Codex F5 on
+    `e06d6123`, present at the parent too). That is a science/provenance
+    contract to fix in its own slice, and weakening this validation to fake an
+    end-to-end row here would hide it.
+    """
+    from xrd_tools.io.finite_artifact import (
+        capture_finite_predecessor, capture_finite_source,
+    )
+
+    written = tmp_path / "scan_int1d.nexus"
+    written.write_bytes(b"a streamed Run output, stamped but not finite")
+    admission = capture_finite_source(written)
+
+    # THE PRODUCTION SHAPE: a family and nothing else.
+    receipt = capture_finite_predecessor(admission, artifact_family_v1="scan")
+    assert receipt.artifact_family_v1 == "scan"
+    assert receipt.version_identity is None
+
+    # A legacy artifact with no family at all still works.
+    assert capture_finite_predecessor(admission).artifact_family_v1 is None
+
+    # A HALF-POPULATED finite lineage is still incoherent and still refused.
+    with pytest.raises(ValueError, match="partially populated"):
+        capture_finite_predecessor(
+            admission, artifact_family_v1="scan", version_identity="b" * 64,
+        )
+
+    # A finite parent must still carry a family.
+    with pytest.raises(ValueError, match="family is invalid"):
+        capture_finite_predecessor(
+            admission,
+            version_identity="b" * 64,
+            publication_identity="c" * 64,
+            lineage_identity="d" * 64,
+        )

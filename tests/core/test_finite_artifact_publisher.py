@@ -2133,13 +2133,21 @@ def test_a_failed_slot_release_is_reported_on_the_error_that_caused_it(
     source.write_bytes(b"source")
     request = _request(tmp_path, source)
 
-    def failing_release(_hold) -> None:
+    captured: list = []
+
+    def failing_release(hold) -> None:
+        # CAPTURE it: this test deliberately breaks release, and without giving
+        # the hold back afterwards it leaks into the PROCESS-WIDE coordinator
+        # and poisons every later test that touches this slot (Codex F7).
+        captured.append(hold)
         raise OSError("slot release denied")
 
     def failing_writer(_binding) -> None:
         raise ValueError("the real publication failure")
 
-    from xrd_tools.io.output_transaction import OutputTransactionCoordinator
+    from xrd_tools.io.output_transaction import (
+        OutputTransactionCoordinator, get_output_transaction_coordinator,
+    )
 
     monkeypatch.setattr(
         OutputTransactionCoordinator,
@@ -2153,3 +2161,119 @@ def test_a_failed_slot_release_is_reported_on_the_error_that_caused_it(
     notes = getattr(caught.value, "__notes__", [])
     # ...and the release failure is visible ON it rather than lost.
     assert any(finite_module.FINITE_SLOT_LEASE_WARNING in note for note in notes), notes
+
+    # GIVE THE HOLD BACK. `monkeypatch` restores the real method at teardown but
+    # cannot undo the hold this test stranded; the registry is process-wide.
+    assert len(captured) == 1
+    monkeypatch.undo()
+    get_output_transaction_coordinator().release_target(captured[0])
+
+
+def test_a_hold_survives_the_file_appearing_underneath_it(tmp_path: Path) -> None:
+    """Codex F2 (P2) on `e06d6123`: the lease key moved after acquisition.
+
+    `_lease_key` is computed from MUTABLE filesystem state -- it folds the name
+    only when the directory is observed to treat two spellings as one file, and
+    that observation is only possible once the file EXISTS.  So holding
+    `Scan.nexus` before creation and again after produced two DIFFERENT keys for
+    the IDENTICAL string, and both were admitted.
+
+    Worse, the first fix kept a reverse map from pathname to key; the second
+    acquisition overwrote it, so the first hold became unreleasable and its
+    registry entry was stranded for the life of the process.
+
+    Acquisition now excludes by identity key AND by pathname, and release finds
+    its entry by object identity rather than recomputing anything.
+    """
+    from xrd_tools.io.output_transaction import (
+        LeaseUnavailable, get_output_transaction_coordinator,
+    )
+
+    coordinator = get_output_transaction_coordinator()
+    target = tmp_path / "Scan.nexus"
+
+    hold = coordinator.hold_target(target, label="first")
+    try:
+        target.write_bytes(b"the file appears mid-hold")
+        with pytest.raises(LeaseUnavailable):
+            coordinator.hold_target(target, label="second")
+    finally:
+        # THE ORIGINAL HOLD MUST STILL RELEASE. This is what the reverse map broke.
+        coordinator.release_target(hold)
+
+    # Positive control: acquirable again afterwards, so nothing is stranded.
+    again = coordinator.hold_target(target, label="third")
+    coordinator.release_target(again)
+
+
+def test_a_hold_survives_its_parent_directory_appearing(tmp_path: Path) -> None:
+    """The same transition through the OTHER key path.
+
+    With no parent to stat, `_lease_key` falls back to the raw string; once the
+    directory exists it returns a parent-identity key. Codex named this the same
+    defect reached a second way.
+    """
+    from xrd_tools.io.output_transaction import (
+        LeaseUnavailable, get_output_transaction_coordinator,
+    )
+
+    coordinator = get_output_transaction_coordinator()
+    target = tmp_path / "not-yet" / "slot.nexus"
+
+    hold = coordinator.hold_target(target, label="first")
+    try:
+        target.parent.mkdir()
+        with pytest.raises(LeaseUnavailable):
+            coordinator.hold_target(target, label="second")
+    finally:
+        coordinator.release_target(hold)
+    again = coordinator.hold_target(target, label="third")
+    coordinator.release_target(again)
+
+
+def test_a_run_and_an_average_cannot_both_hold_a_slot_in_a_fresh_directory(
+    tmp_path: Path,
+) -> None:
+    """Fable F2 (P1) on `58123dc7`: the two callers that matter acquire early.
+
+    My disclosure claimed this gap was narrow because "the publisher opens its
+    parent before acquiring". True of the FINITE publisher, false of ordinary
+    Run and Average: both acquire BEFORE the destination directory exists --
+    `_copy_stream_seed` creates it -- so the first got a raw-string key and the
+    second, after the mkdir, a parent-identity key. Different keys, both
+    granted, and the first hold then unreleasable.
+
+    The same-pathname exclusion is what actually covers them, and this row
+    drives the real sequence rather than the tidy one.
+    """
+    from xrd_tools.io.output_transaction import (
+        LeaseOwner, LeaseUnavailable, OwnerToken,
+        get_output_transaction_coordinator,
+    )
+
+    coordinator = get_output_transaction_coordinator()
+    slot = tmp_path / "fresh" / "scan_average.nexus"   # 'fresh/' does NOT exist
+
+    hold = coordinator.hold_target(slot, label="average-slot")
+    try:
+        slot.parent.mkdir()          # what the streamed seed does mid-operation
+        transaction_owner = OwnerToken("run-transaction")
+        target_owner = OwnerToken("run-target")
+        transaction = coordinator.admit(
+            slot,
+            transaction_owner=transaction_owner,
+            target_owner=target_owner,
+        )
+        with pytest.raises(LeaseUnavailable):
+            transaction.acquire_lease(
+                admission=transaction.admission,
+                transaction_owner=transaction_owner,
+                target_owner=target_owner,
+                owners={r: OwnerToken(f"run-{r.value}") for r in LeaseOwner},
+            )
+    finally:
+        coordinator.release_target(hold)
+
+    # Nothing stranded: the slot is acquirable again afterwards.
+    again = coordinator.hold_target(slot, label="after")
+    coordinator.release_target(again)

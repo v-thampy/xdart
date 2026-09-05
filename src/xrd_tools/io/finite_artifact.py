@@ -32,6 +32,7 @@ from xrd_tools.io.output_path import (
     artifact_family_from_source,
     resolve_finite_output_target,
 )
+from xrd_tools.io.output_safety import paths_same_file
 from xrd_tools.io.output_transaction import (
     StreamTerminal,
     get_output_transaction_coordinator,
@@ -305,8 +306,21 @@ class FinitePredecessorReceipt:
     def __post_init__(self) -> None:
         if type(self.source_snapshot) is not FiniteFileSnapshot:
             raise TypeError("finite predecessor requires an exact source snapshot")
+        # THE FAMILY IS INDEPENDENT OF THE FINITE LINEAGE.  Fable F3 on
+        # `58123dc7`, introduced by `dbb84c33`.  These four used to be
+        # all-present-or-all-absent together, which was true while only the
+        # finite publisher ever set any of them.  Then ordinary Run and Average
+        # began stamping `@artifact_family_v1` through `NexusSink` -- a writer
+        # that has no finite lineage node at all -- so a family-only receipt
+        # became the NORMAL shape for every GUI Run output, and the all-or-none
+        # rule refused every one of them as a Reintegrate predecessor with
+        # "lineage is partially populated".  That is the primary workflow:
+        # integrate a scan, then reintegrate the result.
+        #
+        # The three LINEAGE identities remain all-or-none among themselves --
+        # a half-populated finite lineage is still incoherent -- and a genuine
+        # finite parent must still carry a family.
         finite_values = (
-            self.artifact_family_v1,
             self.version_identity,
             self.publication_identity,
             self.lineage_identity,
@@ -314,11 +328,13 @@ class FinitePredecessorReceipt:
         finite_parent = all(value is not None for value in finite_values)
         if not finite_parent and not all(value is None for value in finite_values):
             raise ValueError("finite predecessor lineage is partially populated")
+        if self.artifact_family_v1 is not None and (
+            type(self.artifact_family_v1) is not str
+            or not _ARTIFACT_FAMILY.fullmatch(self.artifact_family_v1)
+        ):
+            raise ValueError("finite predecessor family is invalid")
         if finite_parent:
-            if (
-                type(self.artifact_family_v1) is not str
-                or not _ARTIFACT_FAMILY.fullmatch(self.artifact_family_v1)
-            ):
+            if self.artifact_family_v1 is None:
                 raise ValueError("finite predecessor family is invalid")
             for value in (
                 self.version_identity,
@@ -1376,7 +1392,13 @@ def finite_artifact_request(
         operation_token=operation_kind,
     )
     output = _resolved_parent_path(target)
-    if source == output:
+    if paths_same_file(source, output):
+        # IDENTITY, not string equality.  Codex F1 on `e06d6123`: comparing the
+        # two strings let `EXISTING_REINTEGRATE1D.NEXUS` and
+        # `existing_reintegrate1d.nexus` -- the SAME FILE on a case-insensitive
+        # volume -- pass as distinct, so the operation replaced its own admitted
+        # predecessor.  Harmless while an occupied slot was refused outright;
+        # fatal once replacement became unconditional.
         raise ValueError("finite source and output must be distinct")
     _publication_json, publication = _identity({
         "domain": "xdart.finite-artifact-publication.v1",

@@ -69,13 +69,18 @@ def _lease_key(target: str) -> str:
     TWO RESIDUAL GAPS, stated rather than papered over.
 
     1. When the parent cannot be stat'ed -- it does not exist yet, or is
-       unreadable -- this falls back to the old string key.  A key that
-       cannot be computed must not take the publication down; the caller
-       fails later on the real operation with a real message.  Two aliasing
-       spellings of a NOT-YET-EXISTING directory would each get a string key
-       and both proceed.  Narrow in practice: the finite publisher opens and
-       holds its parent BEFORE acquiring, so for that path the parent always
-       exists.
+       unreadable -- this falls back to the raw string key.  Two aliasing
+       SPELLINGS of a not-yet-existing directory would each get a string key
+       and both proceed.
+
+       CORRECTED (Fable F2 on `58123dc7`): an earlier version of this note
+       claimed the gap was narrow because "the publisher opens its parent
+       before acquiring".  That is true of the FINITE publisher and false of
+       the two callers that matter most -- ordinary Run's `acquire_lease` and
+       Average's `hold_target` both run BEFORE the destination directory is
+       created (`_copy_stream_seed` makes it), so they routinely acquire
+       against a missing parent.  The same-pathname exclusion in `_acquire`
+       is what actually covers them; do not rely on the parent existing.
     2. Two spellings of the FILE NAME in one directory, when the file does
        not exist yet, cannot be told apart without creating a probe file in
        the operator's output directory.  When the file DOES exist the check
@@ -966,8 +971,6 @@ class OutputTransactionCoordinator:
     def __init__(self):
         self._lock = threading.RLock()
         self._leases: dict[str, _LeaseState] = {}
-        # display target -> identity key, so release never re-stats.
-        self._lease_keys: dict[str, str] = {}
         self._ordinal = 0
 
     def _next_ordinal(self) -> int:
@@ -1062,15 +1065,36 @@ class OutputTransactionCoordinator:
             raise TypeError("every lease owner must be an OwnerToken")
         with self._lock:
             key = _lease_key(target)
+            # TWO independent exclusions, because the identity key is computed
+            # from MUTABLE filesystem state and can legitimately change between
+            # two acquisitions of the same pathname (Codex F2 on `e06d6123`):
+            # hold `Scan.nexus` before it exists, create it, then hold the
+            # IDENTICAL string -- the second key folds to `scan.nexus` on a
+            # case-insensitive volume and the old code admitted both.
             if key in self._leases:
+                raise LeaseUnavailable(f"target already leased: {target}")
+            if any(state.lease.target == target for state in self._leases.values()):
                 raise LeaseUnavailable(f"target already leased: {target}")
             lease = TargetLease(target, self._next_ordinal())
             self._leases[key] = _LeaseState(lease=lease, owners=copied)
-            # Remembered rather than recomputed on release: the parent may be
-            # gone by then, and a key that cannot be rebuilt would strand the
-            # lease forever.
-            self._lease_keys[target] = key
             return lease
+
+    def _entry(self, lease: TargetLease) -> tuple[str, _LeaseState] | None:
+        """Find a lease's registry entry BY IDENTITY, never by recomputation.
+
+        The key cannot be rebuilt at release time: the file or its parent may
+        have been created, removed or renamed since acquisition, and a key that
+        no longer matches would strand the lease permanently.  A reverse map
+        keyed by pathname was the first fix and was worse -- a second
+        acquisition of the same string overwrote the first one's entry, so the
+        original became unreleasable.  The registry is small (one entry per
+        contended output), so an exact scan is both cheapest to reason about
+        and impossible to corrupt.
+        """
+        for key, state in self._leases.items():
+            if state.lease is lease:
+                return key, state
+        return None
 
     def _lease_snapshot(self, state: _LeaseState, *, active: bool) -> LeaseSnapshot:
         remaining = tuple(role for role in LeaseOwner if role in state.owners)
@@ -1083,11 +1107,10 @@ class OutputTransactionCoordinator:
 
     def _require_lease(self, lease: TargetLease) -> _LeaseState:
         with self._lock:
-            key = self._lease_keys.get(lease.target)
-            state = None if key is None else self._leases.get(key)
-            if state is None or state.lease is not lease:
+            found = self._entry(lease)
+            if found is None:
                 raise OwnershipRefused("foreign or retired target lease")
-            return state
+            return found[1]
 
     def _release(
         self,
@@ -1096,10 +1119,10 @@ class OutputTransactionCoordinator:
         owner: OwnerToken,
     ) -> LeaseSnapshot:
         with self._lock:
-            key = self._lease_keys.get(lease.target)
-            state = None if key is None else self._leases.get(key)
-            if state is None or state.lease is not lease:
+            found = self._entry(lease)
+            if found is None:
                 raise OwnershipRefused("foreign or retired target lease")
+            key, state = found
             expected = state.owners.get(role)
             if expected is None:
                 raise OwnershipRefused(f"lease owner {role.value} already released")
@@ -1110,7 +1133,6 @@ class OutputTransactionCoordinator:
             if state.owners:
                 return self._lease_snapshot(state, active=True)
             del self._leases[key]
-            self._lease_keys.pop(lease.target, None)
             return self._lease_snapshot(state, active=False)
 
 

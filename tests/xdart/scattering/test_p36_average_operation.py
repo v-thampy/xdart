@@ -89,6 +89,11 @@ def _result(disposition: str, target: str = "/detached/average.nxs") -> AverageS
         "REFUSED": ("AVERAGE_TEST_REFUSED", "detached refusal"),
         "CANCELLED": ("AVERAGE_TEST_CANCELLED", "detached cancellation"),
         "ABORTED": ("AVERAGE_TEST_ABORT", "detached diagnostic"),
+        # The replacement LANDED and the check after it did not: neither a
+        # verified commit nor a clean abort.
+        "PUBLISHED_UNVERIFIED": (
+            "AVERAGE_PUBLISHED_UNVERIFIED", "injected post-rename seal failure",
+        ),
     }
     code, diagnostic = diagnostics[disposition]
     return AverageScanResult(
@@ -2137,3 +2142,49 @@ def test_average_persists_sensor_and_parallax_detector_fields(
         )
         assert detector["sensor_thickness"].attrs["units"] == "m"
         assert bool(detector["parallax"][()]) is True
+
+
+def test_a_published_unverified_average_is_not_shown_as_success_or_abort(
+    tmp_path, monkeypatch,
+) -> None:
+    """Codex F3 on `e06d6123`, at the GUI boundary.
+
+    A post-rename verification failure leaves a NEW FILE at the slot. Shown as
+    RETURNED it reads as a verified success; shown as an ordinary ABORTED it
+    reads as an operation with no public effect. Both mislead in a way the
+    operator cannot resolve by looking at the folder, because the file really is
+    there and really is unverified.
+
+    Before this branch existed, the disposition fell through to
+    `RuntimeError("Average runner retained settlement unexpectedly")` -- the GUI
+    would have raised rather than reported.
+    """
+    target = str((tmp_path / "average.nxs").resolve())
+    result = _result("PUBLISHED_UNVERIFIED", target)
+
+    class Runner:
+        def __init__(self, recipe):
+            self.recipe = recipe
+
+        def start(self, **_kwargs):
+            return result
+
+        def close(self):
+            return result
+
+    monkeypatch.setattr(adapter, "AverageScanRunner", Runner)
+    slot = OperationSlot()
+    identity = slot.begin_average(
+        _configuration(_source(tmp_path / "source")), result.target,
+        stamp=OperationContextStamp(0),
+    )
+    assert identity is not None
+    terminal = _wait_update(
+        slot, identity, lambda value: value.terminal is not None,
+    ).terminal
+
+    assert terminal.status is OperationTerminalStatus.FAILED
+    assert terminal.status is not OperationTerminalStatus.RETURNED
+    # The operator is told WHICH file is now sitting there, unverified.
+    assert result.target in terminal.diagnostic
+    assert "could not be verified" in terminal.diagnostic

@@ -20,6 +20,7 @@ from xrd_tools.io.output_transaction import (
     StreamTerminal, TargetSnapshot, capture_target_snapshot,
     get_output_transaction_coordinator, replace_into_place,
 )
+from xrd_tools.io.output_safety import paths_same_file
 from xrd_tools.io.output_path import (
     OVERWRITE_MODE,
     artifact_family_from_source,
@@ -305,7 +306,11 @@ class AverageScanResult:
     metadata_denominators: tuple[tuple[str, int], ...]; finite_counts: AverageFiniteCountsEvidence | None
     diagnostic_code: str; diagnostic: str; h23_phase: str | None; commit_identity: StreamTerminal | None
     def __post_init__(self):
-        terminal = self.disposition in {'COMMITTED', 'REFUSED', 'CANCELLED', 'ABORTED'}
+        # PUBLISHED_UNVERIFIED: the atomic replacement LANDED and the
+        # verification after it did not.  Neither a verified commit nor a
+        # clean abort -- the operator has a new file at the slot and must be
+        # told so.  Codex F3 on `e06d6123`.
+        terminal = self.disposition in {'COMMITTED', 'REFUSED', 'CANCELLED', 'ABORTED', 'PUBLISHED_UNVERIFIED'}
         denominators = self.metadata_denominators; logical = self.logical_labels; committed_labels = self.committed_labels
         base = all(type(value) is str for value in (self.disposition, self.target, self.entry, self.version_identity, self.operation_identity, self.science_identity, self.diagnostic_code, self.diagnostic)) and (not self.version_identity or _COUNT_DIGEST.fullmatch(self.version_identity) is not None) and type(self.contributor_extent) is int and 0 <= self.contributor_extent <= _MAX_CONTRIBUTORS and type(logical) is tuple and logical == (1,) and all(type(value) is int for value in logical) and type(denominators) is tuple and all(type(value) is tuple and len(value) == 2 and type(value[0]) is str and bool(value[0]) and type(value[1]) is int and value[1] >= 0 for value in denominators) and len({value[0] for value in denominators}) == len(denominators)
         committed = type(committed_labels) is tuple and committed_labels == (1,) and all(type(value) is int for value in committed_labels) and _COUNT_DIGEST.fullmatch(self.version_identity) is not None and type(self.finite_counts) is AverageFiniteCountsEvidence and self.finite_counts.contributor_extent == self.contributor_extent and self.h23_phase == 'committed' and type(self.commit_identity) is StreamTerminal and not self.diagnostic_code and not self.diagnostic
@@ -500,6 +505,25 @@ def _average_version_identity(
     ).hexdigest()
 
 
+def _admitted_input_paths(graph) -> tuple[str, ...]:
+    """Every file this Average has ADMITTED as input.
+
+    The stamp's own inventory -- the master, its members, external members,
+    detector dependencies and metadata sidecars -- so nothing that the operation
+    reads can be mistaken for an output slot it may replace.
+    """
+    stamp = graph.stamp
+    paths = [stamp.file.path]
+    paths.extend(member.path for member in stamp.members)
+    paths.extend(value.file.path for value in stamp.external_members)
+    paths.extend(value.path for value in stamp.dependency_files)
+    paths.extend(
+        value.metadata_file.path for value in stamp.metadata_sources
+        if value.metadata_file is not None
+    )
+    return tuple(paths)
+
+
 def _average_output_artifact(anchor: str, *, artifact_family: str | None = None) -> str:
     """The stable ``<family>_average.nexus`` slot beside *anchor*.
 
@@ -566,6 +590,17 @@ def _plan_from_prepared_graph(
         entry=recipe.entry,
     )
     output = _average_output_artifact(recipe.target)
+    # THE SLOT MAY NOT BE AN ADMITTED INPUT.  Codex F1 (P1) on `e06d6123`: with
+    # the occupied-slot refusal gone, a raw stack sitting at the derived slot
+    # name -- `scan_average.nexus` fed to an Average anchored at `scan.nexus` in
+    # the same directory -- was REPLACED by the processed result.  Raw data
+    # loss, no aliases and no concurrency required.  Accepted destruction of a
+    # foreign OUTPUT occupant was never permission to overwrite an INPUT, and
+    # this is the distinctness rule the maintainer ruled to keep.
+    # Compared by file identity, so a case or symlink alias cannot slip past.
+    _reject(any(paths_same_file(output, admitted)
+                for admitted in _admitted_input_paths(graph)),
+            'AVERAGE_OUTPUT_IS_SOURCE')
     snapshot = capture_target_snapshot(output)
     # NO `AVERAGE_OUTPUT_EXISTS` REFUSAL.  Ruled 2026-09-04: a repeat REPLACES.
     # An occupied slot used to refuse at plan time, which made "Average again
@@ -1611,11 +1646,31 @@ class AverageScanRunner:
                     AveragePendingPhase.OUTPUT_SETTLEMENT,
                     'AVERAGE_H23_SETTLEMENT_PENDING',
                 )
+            # Codex F4: the candidate transaction has SETTLED by the time this
+            # branch runs, so the sink's rollback no longer owns the private
+            # file and `_publish_and_finish` -- the only other place that
+            # removes it -- is never reached.  Discard it here or an ordinary
+            # failure strands a hidden file in the operator's output folder.
+            self._discard_candidate()
             return self._terminal(_error_result(
                 self.plan, error, h23=True,
                 denominators=self._science['denominators'],
             ))
         return self._publish_and_finish(terminal)
+
+    def _discard_candidate(self) -> None:
+        """Remove our own private candidate, once nothing else owns it.
+
+        Deliberately silent on failure: a stranded candidate is a disclosure
+        problem, never a reason to replace the outcome the caller came for.
+        """
+        candidate = getattr(self.plan, 'publication_candidate', '')
+        if not candidate:
+            return
+        try:
+            os.unlink(candidate)
+        except OSError:
+            pass
 
     def _publish_and_finish(self, terminal):
         """ONE atomic replacement publishes the validated candidate at the slot.
@@ -1631,6 +1686,7 @@ class AverageScanRunner:
         The slot HOLD is what keeps another operation out, and it outlives the
         transaction precisely because it is on the slot, not the candidate.
         """
+        renamed = False
         try:
             # THE SLOT MUST STILL BE WHAT WE PLANNED AGAINST, right up to the
             # instant we replace it.  Moving the writer-output sweeps onto the
@@ -1645,10 +1701,25 @@ class AverageScanRunner:
                 self.plan.output_artifact,
                 verb='publish',
             )
+            renamed = True
             published = _seal_published(
                 self.plan.output_artifact, terminal.commit_identity.ordinal,
             )
         except BaseException as error:
+            if renamed:
+                # THE REPLACEMENT LANDED.  Reporting ABORTED here would be a
+                # lie in the direction that costs most: the operator sees "no
+                # public effect" while a NEW FILE sits at the slot.  Say what is
+                # actually true -- published, verification failed -- and do not
+                # touch the slot: restoring or deleting it would destroy the
+                # result the science already produced.  The candidate is gone,
+                # consumed by the rename, so there is nothing to clean up.
+                return self._terminal(_result(
+                    self.plan, 'PUBLISHED_UNVERIFIED',
+                    code='AVERAGE_PUBLISHED_UNVERIFIED',
+                    diagnostic=_diagnostic(error),
+                    denominators=self._science['denominators'],
+                ))
             # REMOVE OUR OWN CANDIDATE.  Its transaction has already settled by
             # the time we get here, so the sink's rollback no longer covers it
             # and nothing else will.  Without this an Average that commits its
@@ -1657,10 +1728,7 @@ class AverageScanRunner:
             # assertion added alongside this change, not by inspection.)
             # If the rename already succeeded the name is gone and the unlink
             # simply fails -- the PUBLISHED slot is never touched here.
-            try:
-                os.unlink(self.plan.publication_candidate)
-            except OSError:
-                pass
+            self._discard_candidate()
             return self._terminal(_error_result(
                 self.plan, error, h23=True,
                 denominators=self._science['denominators'],

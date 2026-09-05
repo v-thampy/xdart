@@ -2257,3 +2257,93 @@ def test_a_slot_named_artifact_without_a_family_keeps_its_stem(tmp_path) -> None
         assert _persisted_root_family(artifact, "entry") is None
         # An explicit family still wins when the caller knows better.
         assert _persisted_root_family(artifact, "entry", "explicit") == "explicit"
+
+
+def test_a_failure_after_the_rename_reports_published_not_aborted(
+    tmp_path, monkeypatch,
+) -> None:
+    """Codex F3 (P2) on `e06d6123`: Average claimed a clean abort after publishing.
+
+    One `except` covered both a failed rename and a failed read AFTER a
+    successful rename, even though their visible effects are opposite. The
+    second reported ABORTED with no commit identity -- so the operator was told
+    there was no public effect while a NEW FILE sat at the slot.
+
+    Now the two are separated. A post-rename failure reports
+    PUBLISHED_UNVERIFIED and leaves the published file exactly where it is:
+    restoring or deleting it would destroy the result the science produced.
+    """
+    import xrd_tools.reduction.average as module
+
+    source = _series(tmp_path)
+    target = tmp_path / "average.nxs"
+    _stub_integrators(monkeypatch, [])
+    first = _run_average_scan(AverageScanRecipe(
+        source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=4)),
+    ))
+    assert first.disposition == "COMMITTED"
+    artifact = Path(first.target)
+    prior_bytes = artifact.read_bytes()
+
+    calls = []
+
+    def failing_seal(path, ordinal):
+        calls.append(path)
+        raise OSError("injected post-rename seal failure")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(module, "_seal_published", failing_seal)
+        second = _run_average_scan(AverageScanRecipe(
+            source, target,
+            ReductionPlan(integration_1d=Integration1DPlan(npt=6)),
+        ))
+
+    # The injection actually fired -- this row proves nothing otherwise.
+    assert len(calls) == 1
+
+    assert second.disposition == "PUBLISHED_UNVERIFIED"
+    assert second.diagnostic_code == "AVERAGE_PUBLISHED_UNVERIFIED"
+    assert second.commit_identity is None and second.committed_labels == ()
+    # NOT a clean abort: the replacement really landed and is still there.
+    assert second.target == first.target
+    assert artifact.exists() and artifact.read_bytes() != prior_bytes
+    # The candidate was consumed by the rename, so nothing is stranded.
+    assert not tuple(artifact.parent.glob(f".{artifact.stem}.xdart-average-*"))
+
+
+def test_a_failure_after_candidate_settlement_strands_nothing(
+    tmp_path, monkeypatch,
+) -> None:
+    """Codex F4 (P3) on `e06d6123`: an ordinary failure left a hidden file behind.
+
+    Between the candidate transaction settling and entry to
+    `_publish_and_finish`, the sink's rollback no longer owns the private file
+    and the publication path is never reached -- so an error in that gap left
+    `.<stem>.xdart-average-<hex>.nexus` in the operator's output folder.
+    """
+    import xrd_tools.reduction.average as module
+
+    source = _series(tmp_path)
+    target = tmp_path / "average.nxs"
+    _stub_integrators(monkeypatch, [])
+
+    real_release = module.NexusSink._release_terminal_lease
+    calls = []
+
+    def release_then_fail(owner, *args, **kwargs):
+        value = real_release(owner, *args, **kwargs)
+        calls.append(1)
+        raise OSError("injected failure after candidate settlement")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(module.NexusSink, "_release_terminal_lease", release_then_fail)
+        result = _run_average_scan(AverageScanRecipe(
+            source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=4)),
+        ))
+
+    assert len(calls) == 1, "the injected failure never fired"
+    assert result.disposition != "COMMITTED"
+    # No slot was published, and NO private candidate remains.
+    slot = Path(module._average_output_artifact(module._average_target(str(target))))
+    assert not slot.exists()
+    assert not tuple(slot.parent.glob(f".{slot.stem}.xdart-average-*"))

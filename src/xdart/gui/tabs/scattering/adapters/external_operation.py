@@ -633,6 +633,19 @@ class OperationSlot:
         if result.disposition == "CANCELLED":
             return OperationTerminal(identity, OperationTerminalStatus.CANCELLED,
                                      payload=result)
+        if result.disposition == "PUBLISHED_UNVERIFIED":
+            # The replacement LANDED and the check after it did not.  Not a
+            # verified success and not an ordinary abort with no public effect,
+            # so the message names the file that is now there -- the operator
+            # has a new result they did not get told about otherwise, and it
+            # has not been verified.  Codex F3 on `e06d6123`.
+            return OperationTerminal(
+                identity, OperationTerminalStatus.FAILED,
+                f"{result.diagnostic_code}: a new result was published at "
+                f"{result.target} but could not be verified: "
+                f"{result.diagnostic}",
+                payload=result,
+            )
         if result.disposition == "ABORTED":
             return OperationTerminal(
                 identity, OperationTerminalStatus.FAILED,
