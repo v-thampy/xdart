@@ -60,6 +60,7 @@ __all__ = [
     "resolve_output_target",
     "is_readable_output_path",
     "artifact_family_from_source",
+    "is_artifact_family",
     "resolve_finite_output_target",
     "FINITE_OPERATION_SLOTS",
 ]
@@ -175,6 +176,18 @@ def default_output_path(directory: "os.PathLike[str] | str",
     headless layer), never a filename with a suffix.  Nothing is created here.
     """
     return Path(os.fspath(directory)) / f"{scan_name}{NEW_OUTPUT_SUFFIX}"
+
+
+def is_artifact_family(value: object) -> bool:
+    """True when *value* may be a public result family.
+
+    The one place to ASK the question, so callers stop re-deriving the rule.
+    A name that fails this cannot produce a conforming public name at all --
+    every finite operation resolves `<family><slot>.nexus` -- so a caller that
+    is about to RECORD a family should check here first and refuse early,
+    rather than let a run finish and strand its own artifact.
+    """
+    return type(value) is str and _ARTIFACT_FAMILY.fullmatch(value) is not None
 
 
 def artifact_family_from_source(

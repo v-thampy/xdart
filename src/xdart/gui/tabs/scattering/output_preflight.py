@@ -20,6 +20,7 @@ from xrd_tools.io.image import read_detector_image_layout
 from xrd_tools.io.output_path import (
     FINITE_OPERATION_SLOTS,
     OVERWRITE_MODE,
+    is_artifact_family,
     resolve_output_target,
 )
 from xrd_tools.io.output_safety import (
@@ -2857,11 +2858,26 @@ def _run_output_naming(
     if requested.suffix:
         # An explicit FILE request: its parent is the directory and its stem is
         # the family.  A per-candidate directory does not apply.
-        return requested.parent, requested.stem
-    return (
-        requested if output_directory is None else output_directory,
-        scan_name,
-    )
+        directory, family = requested.parent, requested.stem
+    else:
+        directory, family = (
+            requested if output_directory is None else output_directory,
+            scan_name,
+        )
+    if not is_artifact_family(family):
+        # REFUSE NOW, ruled 2026-09-04.  This family is what gets written into
+        # the artifact for every later operation to consume, and one that
+        # breaks the rule cannot resolve `<family><slot>.nexus` at all -- so an
+        # Average or Reintegrate on this run's output would refuse afterwards,
+        # with a message naming nothing the operator can act on.  Better to say
+        # so before the run than after it.
+        raise ValueError(
+            f"cannot use {family!r} as a processed-result name: it may not "
+            "start with '.', '-', '_' or a space, may not end with a space or "
+            "'.', may not contain a path separator or ':', and is at most 80 "
+            "characters. Rename the scan, or choose a different output name."
+        )
+    return directory, family
 
 
 def _run_artifact_family(

@@ -180,35 +180,30 @@ def test_an_explicit_file_request_still_gets_a_slot(tmp_path):
         assert resolved == tmp_path / "chosen_int2d.nexus"
 
 
-def test_a_non_canonical_family_is_recorded_verbatim_today(tmp_path):
-    """PINNED INTERIM, not an endorsement -- this needs a maintainer ruling.
+def test_a_name_that_cannot_be_a_family_is_refused_before_the_run(tmp_path):
+    """RULED 2026-09-04: refuse at PLAN time, not after hours of integration.
 
-    `_run_artifact_family` records the requested stem without checking it
-    against the ONE family vocabulary, so a Run can persist an
-    `@artifact_family_v1` that no later operation can resolve.  The finite owner
-    then refuses with "artifact family is not canonical", which names nothing
-    the operator can act on, where the UN-stamped path would have said "rename
-    the source".
+    This row previously PINNED the opposite -- that a non-canonical stem was
+    recorded verbatim -- and set out both candidate remedies for the maintainer.
+    The ruling took the plan-time refusal.
 
-    Not decided here, because both remedies are product decisions:
+    Why it matters: the family is written INTO the artifact for every later
+    operation to consume, and a name that breaks the rule cannot resolve
+    `<family><slot>.nexus` at all.  Recorded silently, it produced a Run that
+    succeeded and an Average that then refused with "artifact family is not
+    canonical" -- a message naming nothing the operator could act on, arriving
+    after the work was already done.
 
-    * refuse at PLAN time -- my recommendation, since the operator learns before
-      a long run and a family the finite operations cannot use yields no usable
-      artifact anyway -- but that turns an over-80-character or leading-`_` scan
-      name into a NEW refusal for a run that writes its own file perfectly well;
-    * record nothing when the stem is not canonical, which restores the better
-      message but reopens chaining for a stem like `scan ` whose slotted form
-      `scan _int1d` IS canonical and would be consumed as a family.
-
-    This row exists so the gap has an oracle and the change is visible the
-    moment either ruling lands.
+    ACCEPTED COST, stated: a run whose own file would have been written fine now
+    refuses.  `_draft.nexus` is the realistic trigger; over-80-character names
+    are possible but unusual -- a 68-character beamline stem passes.
     """
-    from xrd_tools.io.output_path import artifact_family_from_source
+    for stem in ("_draft", ".hidden", "-dash", "trailing "):
+        configuration = _configuration("Int 1D", str(tmp_path / f"{stem}.nexus"))
+        with pytest.raises(ValueError, match="as a processed-result name"):
+            _run_artifact_family(configuration, "unused-scan-name")
 
-    configuration = _configuration("Int 1D", str(tmp_path / "_leading.nexus"))
-    recorded = _run_artifact_family(configuration, "unused-scan-name")
-    assert recorded == "_leading"
-
-    # What the NEXT operation does with what the Run just persisted.
-    with pytest.raises(ValueError, match="artifact family is not canonical"):
-        artifact_family_from_source(tmp_path / "_leading_int1d.nexus", recorded)
+    # ...and an ordinary beamline stem is untouched, including a long one.
+    for stem in ("scan12", "Sample A 001", "2026_beamtime_sampleA_gi_0p15deg_0001"):
+        configuration = _configuration("Int 1D", str(tmp_path / f"{stem}.nexus"))
+        assert _run_artifact_family(configuration, "unused") == stem
