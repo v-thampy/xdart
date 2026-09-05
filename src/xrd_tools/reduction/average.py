@@ -505,12 +505,19 @@ def _average_version_identity(
     ).hexdigest()
 
 
-def _admitted_input_paths(graph) -> tuple[str, ...]:
+def _admitted_input_paths(graph, recipe=None) -> tuple[str, ...]:
     """Every file this Average has ADMITTED as input.
 
     The stamp's own inventory -- the master, its members, external members,
     detector dependencies and metadata sidecars -- so nothing that the operation
     reads can be mistaken for an output slot it may replace.
+
+    PLUS THE ACTIVE MASK.  Codex R1 on `cca7d537`: the first version of this
+    covered only the source graph, and the mask is not in it.  I had checked
+    `CalibrationState.source_uri`, which is provenance-only, and missed
+    `CalibrationState.mask.source_uri`, which `load_mask` actually READS -- so an
+    Average whose slot resolved onto the operator's mask file overwrote it.
+    Same data-loss class as the raw-input case, one input short.
     """
     stamp = graph.stamp
     paths = [stamp.file.path]
@@ -521,7 +528,12 @@ def _admitted_input_paths(graph) -> tuple[str, ...]:
         value.metadata_file.path for value in stamp.metadata_sources
         if value.metadata_file is not None
     )
-    return tuple(paths)
+    calibration = getattr(recipe, 'calibration', None)
+    mask = getattr(calibration, 'mask', None)
+    mask_uri = getattr(mask, 'source_uri', None)
+    if type(mask_uri) is str and mask_uri:
+        paths.append(mask_uri)
+    return tuple(path for path in paths if type(path) is str and path)
 
 
 def _average_output_artifact(anchor: str, *, artifact_family: str | None = None) -> str:
@@ -599,7 +611,7 @@ def _plan_from_prepared_graph(
     # this is the distinctness rule the maintainer ruled to keep.
     # Compared by file identity, so a case or symlink alias cannot slip past.
     _reject(any(paths_same_file(output, admitted)
-                for admitted in _admitted_input_paths(graph)),
+                for admitted in _admitted_input_paths(graph, recipe)),
             'AVERAGE_OUTPUT_IS_SOURCE')
     snapshot = capture_target_snapshot(output)
     # NO `AVERAGE_OUTPUT_EXISTS` REFUSAL.  Ruled 2026-09-04: a repeat REPLACES.

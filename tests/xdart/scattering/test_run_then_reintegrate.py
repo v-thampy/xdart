@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
-"""THE PRIMARY WORKFLOW, driven end to end through the real executor.
+"""What a REAL Run output carries, driven through the production executor.
 
-Integrate a scan with the production Run path, then Reintegrate what it wrote.
+NAME CORRECTED after Codex review of `cca7d537`: this was called
+`..._can_be_reintegrated`, which overstated it -- the body runs the executor and
+checks provenance but never calls a reintegration method. The round trip is
+proved by the p34 NexusSink-seeded row, and independently by Codex on real
+651-frame Eiger data through the actual page preparation builder.
 
 This exists because Fable F3 -- the family stamp making every real Run output
 un-reintegratable -- survived my own testing and two independent reviews, and it
@@ -31,7 +35,7 @@ from tests.xdart.scattering.test_p1b_output_graph import (
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardEventKind
 
 
-def test_a_real_run_output_can_be_reintegrated(tmp_path: Path) -> None:
+def test_a_real_run_output_carries_what_reintegrate_requires(tmp_path: Path) -> None:
     from xrd_tools.io.schema import ARTIFACT_FAMILY_ATTR
     from xrd_tools.reduction import ReintegrateSuccessorPlan
 

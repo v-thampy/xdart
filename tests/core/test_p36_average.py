@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import fields, replace
 import hashlib
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -2383,3 +2384,49 @@ def test_average_refuses_a_slot_that_is_its_own_raw_input(tmp_path, monkeypatch)
     # Every source byte survives, and nothing was published or left behind.
     assert raw.read_bytes() == before
     assert not tuple(tmp_path.glob(".*.xdart-average-*"))
+
+
+def test_average_refuses_a_slot_that_is_its_own_active_mask(tmp_path, monkeypatch):
+    """Codex R1 (P1) on `cca7d537`: the mask is READ, and it was not excluded.
+
+    The first version of the input-collision guard covered the source graph
+    only. I had checked `CalibrationState.source_uri` -- provenance-only -- and
+    missed `CalibrationState.mask.source_uri`, which `load_mask` actually reads.
+    So an Average whose derived slot resolved onto the operator's mask file
+    OVERWROTE it: the same data-loss class as the raw-input case, one input
+    short, and in a supported file format.
+
+    The lesson is not "add the mask". It is that an inventory of admitted inputs
+    is only as good as its completeness, and mine was assembled from the source
+    graph because that is where I happened to be looking.
+    """
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.reduction.average import AverageScanRunner
+
+    source = _series(tmp_path)
+    # The mask sits exactly where this Average's slot resolves.
+    mask_path = tmp_path / "scan_average.nexus"
+    static_mask = np.zeros((4, 4), dtype=bool)
+    static_mask[0, 0] = True
+    # Written directly: `np.save` would append `.npy` and defeat the collision.
+    buffer = io.BytesIO()
+    np.save(buffer, static_mask)
+    mask_path.write_bytes(buffer.getvalue())
+    before = mask_path.read_bytes()
+    digest = hashlib.sha256(before).hexdigest()
+    calibration = CalibrationState(mask=MaskState(
+        str(mask_path), digest, np.dtype(bool).str, static_mask.shape,
+        FactStatus.PRESENT,
+    ))
+    _stub_integrators(monkeypatch, [])
+
+    result = AverageScanRunner(AverageScanRecipe(
+        source, tmp_path / "scan.nexus",
+        ReductionPlan(integration_1d=Integration1DPlan(npt=4)),
+        calibration=calibration,
+    )).start()
+
+    assert result.disposition == "REFUSED"
+    assert result.diagnostic_code == "AVERAGE_OUTPUT_IS_SOURCE"
+    # The operator's mask survives byte for byte.
+    assert mask_path.read_bytes() == before
