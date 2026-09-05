@@ -57,7 +57,7 @@ def _preparation(*, background=None, gi=None, resource_policy=None):
         },
         "resource_policy": resource_policy,
     }
-def _seed_existing(tmp_path, *, labels=(2, 5, 9), append=False, gi=None, monitor=None, monitor_metadata=None, name="fixture", background=False, disabled_motor=None, persisted_poni=True, legacy_bai=False, detector_descriptor=True, source_options=True):
+def _seed_existing(tmp_path, *, labels=(2, 5, 9), append=False, gi=None, monitor=None, monitor_metadata=None, name="fixture", background=False, disabled_motor=None, persisted_poni=True, legacy_bai=False, detector_descriptor=True, source_options=True, artifact_family=None):
     from xdart.gui.tabs.scattering.contracts import SourceExecutionStamp, SourceFileState
     from xrd_tools.core.containers import PONI
     from xrd_tools.core.geometry.diffractometer import DetectorCalibration
@@ -163,6 +163,7 @@ def _seed_existing(tmp_path, *, labels=(2, 5, 9), append=False, gi=None, monitor
     )
     sink = NexusSink(
         target, overwrite=True, atomic=False, flush_every=None, source_base=root,
+        artifact_family=artifact_family,
         run_configuration_provenance=provenance,
         source_execution_provenance=execution.as_dict(),
         source_snapshots_provenance={str(source): snapshot}, same_run_intent=same,
@@ -2906,3 +2907,68 @@ def test_exact_event_flows_unchanged_through_scan_session_and_stop(tmp_path, mon
         assert legacy_seen == [stop_token] and (stop_token.is_set() if type(stop_token) is threading.Event else stop_token.cancelled)
     with pytest.raises(TypeError, match="cancellation token"):
         session_module.ScanSession(core_plan, scan, cancel_token=object())
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "PRE-EXISTING predecessor-contract gap (Codex F5 on e06d6123), NOT the "
+        "family-stamp defect this row was written for. Blocked before the "
+        "family is even consulted, on finite lineage admission. STRICT so it "
+        "reports the moment the contract slice lands."
+    ),
+)
+def test_a_family_stamped_run_output_reintegrates_end_to_end(tmp_path, monkeypatch):
+    """THE PRIMARY WORKFLOW, end to end: integrate a scan, reintegrate the result.
+
+    Fable F3 (P1) on `58123dc7`. `dbb84c33` made ordinary Run and Average stamp
+    `@artifact_family_v1` through `NexusSink` -- a writer with NO finite lineage
+    node -- so FAMILY-ONLY became the shape of every real Run output, and
+    `FinitePredecessorReceipt`'s all-or-none rule refused every one of them as a
+    Reintegrate predecessor.
+
+    It survived my own testing and TWO independent reviews because every
+    predecessor fixture wrote either an unstamped artifact or a full finite
+    lineage. The production shape had no fixture at all. This is that fixture:
+    the seed writes through `NexusSink` exactly as a Run does, WITH the stamp.
+
+    XFAIL, and NOT for the reason this row exists. The receipt-level defect IS
+    fixed and is proved by `test_a_family_only_predecessor_is_accepted`. This
+    row gets no further than finite lineage admission -- "finite lineage schema
+    or canonical form is invalid" -- which is the SAME pre-existing
+    producer/consumer contract gap Codex recorded as F5 for Average, reached
+    from the Run side. Weakening that validation to turn this green would hide
+    a science-contract problem, which is precisely what Codex warned against.
+
+    So: the primary workflow is NOT yet proven end to end, and this row says so
+    out loud instead of the suite implying otherwise by silence.
+    """
+    from xrd_tools.io.schema import ARTIFACT_FAMILY_ATTR
+    from xrd_tools.reduction import ReintegrateSuccessorPlan, run_reintegrate_successor
+
+    seeded = _seed_existing(
+        tmp_path, labels=(2, 5), name="run-shape", artifact_family="existing",
+    )
+    target = Path(seeded.target)
+    with h5py.File(target, "r") as document:
+        assert document["entry"].attrs[ARTIFACT_FAMILY_ATTR] == "existing"
+    source_bytes = target.read_bytes()
+
+    plan = ReintegrateSuccessorPlan.from_artifact(
+        target,
+        entry="entry",
+        dimension="1d",
+        preparation=copy.deepcopy(seeded.preparation),
+        expected_terminal_identity=seeded.terminal.commit_identity,
+        expected_labels=seeded.labels,
+        destination_directory=target.parent,
+        explicit_output=None,
+    )
+    result = run_reintegrate_successor(plan)
+
+    assert result.disposition == "COMMITTED"
+    # The STAMPED family is consumed, so the slot is the root family's rather
+    # than a chain off the predecessor's own stem.
+    assert Path(result.output_artifact).name == "existing_reintegrate1d.nexus"
+    # And the predecessor it read is untouched.
+    assert target.read_bytes() == source_bytes
