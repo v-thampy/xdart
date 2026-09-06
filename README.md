@@ -160,6 +160,13 @@ with the pure-pip HDF5 wheels than the conda-forge builds
 ([see below](#performance-install-the-hdf5-stack-from-conda-forge)), and
 lz4-compressed outputs need `hdf5plugin` (a base dep) to read outside xdart.
 
+The GUI installation includes **NeXpy** for opening the selected processed
+NeXus file and **silx view** for general HDF5 browsing. Both run in separate
+windows using the same installed environment; no extra viewer environment is
+needed. Use the buttons below the Data Browser. Advanced executable overrides
+are `XDART_NEXPY_EXECUTABLE` and `XDART_SILX_EXECUTABLE` (absolute executable
+paths, not shell commands).
+
 **Headless core only** (no Qt anywhere, `import xrd_tools`):
 
 ```bash
@@ -226,7 +233,7 @@ modest for batch / pipeline / CI use:
 | Extra        | What it enables                                          | Packages                                                    |
 | ------------ | -------------------------------------------------------- | ----------------------------------------------------------- |
 | *(base)*     | `core`, `io`, `integrate`, `viz` — headless / batch      | numpy, scipy, pandas, xarray, h5py, hdf5plugin, nexusformat, fabio, silx, pyFAI, pyyaml, joblib, natsort, matplotlib, plotly |
-| `[gui]`      | the `xdart` desktop GUI **+ its analysis tools** (bundles `[fitting]` + `[rsm]`) | PySide6, pyqtgraph, qtawesome, imagecodecs, imageio, lmfit, pymatgen, xrayutilities, pyevtk |
+| `[gui]`      | the `xdart` desktop GUI **+ its analysis tools and external viewers** (bundles `[fitting]` + `[rsm]`) | PySide6, pyqtgraph, qtawesome, imagecodecs, imageio, lmfit, pymatgen, xrayutilities, pyevtk, nexpy (silx already in base) |
 | `[fitting]`  | `analysis.fitting.*` — peak / phase / strain fitting     | lmfit, pymatgen                                             |
 | `[rsm]`      | `rsm.*` — reciprocal-space mapping, VTK export           | xrayutilities, pyevtk                                       |
 | `[notebook]` | self-contained Jupyter environment                       | ipywidgets, anywidget, ipyfilechooser, ipykernel, ipympl, jupyterlab |

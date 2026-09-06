@@ -103,7 +103,7 @@ def _loaded_capture(path: Path) -> LoadedBrowseCapture:
 def test_registry_is_exactly_two_tools_and_imports_no_gui_dependency() -> None:
     assert tuple(ExternalToolId) == (
         ExternalToolId.NEXPY_SELECTED,
-        ExternalToolId.DASHPVA_H5VIEWER,
+        ExternalToolId.SILX_H5VIEWER,
     )
     assert ToolsView._TOOLS == (
         ("∧ Peak Fitting", "peak_fitting"),
@@ -113,7 +113,7 @@ def test_registry_is_exactly_two_tools_and_imports_no_gui_dependency() -> None:
     )
     assert ToolsView._EXTERNAL_VIEWERS == (
         ("◇ Open Selected in NeXpy", "nexpy_selected"),
-        ("▦ DashPVA HDF5 Viewer…", "dashpva_h5viewer"),
+        ("▦ silx HDF5 Viewer…", "silx_h5viewer"),
     )
     module_path = Path(__import__(
         "xdart.gui.tabs.scattering.external_tools", fromlist=["__file__"]
@@ -129,11 +129,11 @@ def test_registry_is_exactly_two_tools_and_imports_no_gui_dependency() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.ImportFrom)
     }
-    assert not {"PyQt5", "PyQt6", "PySide6", "pyqtgraph", "nexpy", "dashpva"} & imported
+    assert not {"PyQt5", "PyQt6", "PySide6", "pyqtgraph", "nexpy", "silx"} & imported
     script = """
 import sys
 import xdart.gui.tabs.scattering.external_tools
-forbidden = ('PyQt5', 'PyQt6', 'PySide6', 'pyqtgraph', 'h5py', 'nexpy', 'dashpva')
+forbidden = ('PyQt5', 'PyQt6', 'PySide6', 'pyqtgraph', 'h5py', 'nexpy', 'silx')
 print(sorted(name for name in forbidden if name in sys.modules))
 """
     completed = subprocess.run(
@@ -153,12 +153,12 @@ def test_discovery_is_explicit_then_interpreter_sibling_then_path(
     bin_dir = tmp_path / "pixi env" / "bin"
     interpreter = _executable(bin_dir / "python")
     sibling_nexpy = _executable(bin_dir / "nexpy")
-    path_dashpva = _executable(tmp_path / "external tools" / "DashPVA")
+    path_silx = _executable(tmp_path / "external tools" / "silx")
     calls: list[str] = []
 
     def which(name: str) -> str | None:
         calls.append(name)
-        return path_dashpva if name == "DashPVA" else None
+        return path_silx if name == "silx" else None
 
     registry = ExternalToolRegistry(
         environment={}, interpreter=interpreter, which=which,
@@ -167,9 +167,9 @@ def test_discovery_is_explicit_then_interpreter_sibling_then_path(
         registry, ExternalToolId.NEXPY_SELECTED
     ).executable == sibling_nexpy
     assert _status(
-        registry, ExternalToolId.DASHPVA_H5VIEWER
-    ).executable == path_dashpva
-    assert calls == ["DashPVA"]
+        registry, ExternalToolId.SILX_H5VIEWER
+    ).executable == path_silx
+    assert calls == ["silx"]
 
     configured_nexpy = _executable(tmp_path / "configured" / "nexpy")
     calls.clear()
@@ -180,7 +180,7 @@ def test_discovery_is_explicit_then_interpreter_sibling_then_path(
     assert _status(
         configured, ExternalToolId.NEXPY_SELECTED
     ).executable == configured_nexpy
-    assert calls == ["DashPVA"]
+    assert calls == ["silx"]
 
 
 def test_invalid_explicit_configuration_blocks_fallback(tmp_path: Path) -> None:
@@ -207,19 +207,19 @@ def test_projection_requires_current_processed_nexus_only_for_nexpy(
     tmp_path: Path,
 ) -> None:
     nexpy = _executable(tmp_path / "bin" / "nexpy")
-    dashpva = _executable(tmp_path / "bin" / "DashPVA")
+    silx = _executable(tmp_path / "bin" / "silx")
     registry = ExternalToolRegistry(
-        ExternalToolConfig(nexpy, dashpva), environment={},
+        ExternalToolConfig(nexpy, silx), environment={},
     )
 
     missing = registry.project(nexus=ExternalNexusQualification.refused(
         "Select one stable current processed .nexus file in Browse."
     ))
     nexpy_missing = missing.for_tool(ExternalToolId.NEXPY_SELECTED)
-    dash = missing.for_tool(ExternalToolId.DASHPVA_H5VIEWER)
+    silx_missing = missing.for_tool(ExternalToolId.SILX_H5VIEWER)
     assert nexpy_missing.available and not nexpy_missing.enabled
     assert "current processed .nexus" in nexpy_missing.reason
-    assert dash.available and dash.enabled
+    assert silx_missing.available and silx_missing.enabled
 
     old_suffix = tmp_path / "old-output.nxs"
     old_suffix.write_bytes(b"old")
@@ -238,7 +238,7 @@ def test_launch_uses_exact_argv_detachment_and_isolated_child_environments(
     tmp_path: Path,
 ) -> None:
     nexpy = _executable(tmp_path / "bin with spaces" / "nexpy")
-    dashpva = _executable(tmp_path / "bin with spaces" / "DashPVA")
+    silx = _executable(tmp_path / "bin with spaces" / "silx")
     selected = tmp_path / "selected ; literal.nexus"
     selected.write_bytes(b"current")
     target = str(selected.resolve())
@@ -259,7 +259,7 @@ def test_launch_uses_exact_argv_detachment_and_isolated_child_environments(
         return process
 
     registry = ExternalToolRegistry(
-        ExternalToolConfig(nexpy, dashpva),
+        ExternalToolConfig(nexpy, silx),
         environment=parent_environment,
         popen=popen,
         windows=False,
@@ -268,17 +268,17 @@ def test_launch_uses_exact_argv_detachment_and_isolated_child_environments(
         ExternalToolId.NEXPY_SELECTED,
         nexus=ExternalNexusQualification.ready(target),
     )
-    dashpva_receipt = registry.launch(
-        ExternalToolId.DASHPVA_H5VIEWER,
+    silx_receipt = registry.launch(
+        ExternalToolId.SILX_H5VIEWER,
     )
 
     assert nexpy_receipt.status is ExternalToolLaunchStatus.ACCEPTED
-    assert dashpva_receipt.status is ExternalToolLaunchStatus.ACCEPTED
+    assert silx_receipt.status is ExternalToolLaunchStatus.ACCEPTED
     assert nexpy_receipt.argv == (nexpy, target)
-    assert dashpva_receipt.argv == (dashpva, "h5viewer")
+    assert silx_receipt.argv == (silx, "view")
     assert [argv for argv, _options in calls] == [
         (nexpy, target),
-        (dashpva, "h5viewer"),
+        (silx, "view"),
     ]
     for _argv, options in calls:
         assert options["shell"] is False
@@ -290,13 +290,8 @@ def test_launch_uses_exact_argv_detachment_and_isolated_child_environments(
         assert "creationflags" not in options
     nexpy_env = calls[0][1]["env"]
     assert nexpy_env == {"PRESERVE_ME": "yes"}
-    dashpva_env = calls[1][1]["env"]
-    assert dashpva_env == {
-        "PYQTGRAPH_QT_LIB": "PyQt5",
-        "QT_API": "pyqt5",
-        "MPLBACKEND": "QtAgg",
-        "PRESERVE_ME": "yes",
-    }
+    silx_env = calls[1][1]["env"]
+    assert silx_env == {"PRESERVE_ME": "yes"}
     assert parent_environment == parent_before
     assert all(
         value is not process
@@ -307,7 +302,7 @@ def test_launch_uses_exact_argv_detachment_and_isolated_child_environments(
 
 
 def test_windows_launch_uses_both_detachment_flags(tmp_path: Path) -> None:
-    dashpva = _executable(tmp_path / "DashPVA")
+    silx = _executable(tmp_path / "silx")
     calls = []
 
     def popen(argv, **options):
@@ -315,10 +310,10 @@ def test_windows_launch_uses_both_detachment_flags(tmp_path: Path) -> None:
         return SimpleNamespace(pid=91)
 
     registry = ExternalToolRegistry(
-        ExternalToolConfig(dashpva_executable=dashpva),
+        ExternalToolConfig(silx_executable=silx),
         environment={}, popen=popen, windows=True,
     )
-    receipt = registry.launch(ExternalToolId.DASHPVA_H5VIEWER)
+    receipt = registry.launch(ExternalToolId.SILX_H5VIEWER)
     assert receipt.status is ExternalToolLaunchStatus.ACCEPTED
     flags = calls[0][1]["creationflags"]
     assert flags & 0x00000008
@@ -344,15 +339,15 @@ def test_changed_executable_and_spawn_failure_are_typed(tmp_path: Path) -> None:
     assert "changed" in refused.diagnostic.lower()
     assert calls == []
 
-    failing_path = _executable(tmp_path / "DashPVA")
+    failing_path = _executable(tmp_path / "silx")
 
     def fail(_argv, **_options):
         raise OSError("synthetic spawn refusal")
 
     failing = ExternalToolRegistry(
-        ExternalToolConfig(dashpva_executable=failing_path),
+        ExternalToolConfig(silx_executable=failing_path),
         environment={}, popen=fail,
-    ).launch(ExternalToolId.DASHPVA_H5VIEWER)
+    ).launch(ExternalToolId.SILX_H5VIEWER)
     assert failing.status is ExternalToolLaunchStatus.FAILED
     assert "synthetic spawn refusal" in failing.diagnostic
 
@@ -365,7 +360,7 @@ def test_tools_view_reconciles_truthful_external_availability(
         unavailable = ExternalToolRegistry(
             ExternalToolConfig(
                 nexpy_executable="/missing/nexpy",
-                dashpva_executable="/missing/DashPVA",
+                silx_executable="/missing/silx",
             ),
             environment={},
         )
@@ -377,13 +372,13 @@ def test_tools_view_reconciles_truthful_external_availability(
         nexpy_button = tools.findChild(
             QtWidgets.QPushButton, "e3Tool_nexpy_selected"
         )
-        dashpva_button = tools.findChild(
-            QtWidgets.QPushButton, "e3Tool_dashpva_h5viewer"
+        silx_button = tools.findChild(
+            QtWidgets.QPushButton, "e3Tool_silx_h5viewer"
         )
         assert nexpy_button is not None and not nexpy_button.isEnabled()
-        assert dashpva_button is not None and not dashpva_button.isEnabled()
+        assert silx_button is not None and not silx_button.isEnabled()
         assert "configured" in nexpy_button.toolTip().lower()
-        assert "configured" in dashpva_button.toolTip().lower()
+        assert "configured" in silx_button.toolTip().lower()
         assert all(
             tools.findChild(QtWidgets.QPushButton, f"e3Tool_{name}").isEnabled()
             for name in (
@@ -393,16 +388,16 @@ def test_tools_view_reconciles_truthful_external_availability(
         )
 
         nexpy = _executable(tmp_path / "nexpy")
-        dashpva = _executable(tmp_path / "DashPVA")
+        silx = _executable(tmp_path / "silx")
         selected = tmp_path / "selected.nexus"
         selected.write_bytes(b"current")
         ready = ExternalToolRegistry(
-            ExternalToolConfig(nexpy, dashpva), environment={},
+            ExternalToolConfig(nexpy, silx), environment={},
         )
         tools.reconcile_external(ready.project(
             nexus=ExternalNexusQualification.ready(str(selected.resolve()))
         ))
-        assert nexpy_button.isEnabled() and dashpva_button.isEnabled()
+        assert nexpy_button.isEnabled() and silx_button.isEnabled()
     finally:
         tools.close()
         tools.deleteLater()
@@ -540,7 +535,7 @@ def test_page_recaptures_selection_at_click_and_never_owns_child(
     monkeypatch, qapp, tmp_path: Path,
 ) -> None:
     nexpy = _executable(tmp_path / "nexpy")
-    dashpva = _executable(tmp_path / "DashPVA")
+    silx = _executable(tmp_path / "silx")
     projected = tmp_path / "projected-a.nexus"
     projected.write_bytes(b"projected")
     projected_capture = _loaded_capture(projected)
@@ -570,7 +565,7 @@ def test_page_recaptures_selection_at_click_and_never_owns_child(
         return HostileDetachedChild()
 
     registry = ExternalToolRegistry(
-        ExternalToolConfig(nexpy, dashpva),
+        ExternalToolConfig(nexpy, silx),
         environment={}, popen=popen,
     )
     page = ScatteringWorkspace(
@@ -617,16 +612,16 @@ def test_page_recaptures_selection_at_click_and_never_owns_child(
             page,
             "_capture_current_loaded_browse",
             lambda: (_ for _ in ()).throw(
-                AssertionError("DashPVA must not inspect Browse selection")
+                AssertionError("silx must not inspect Browse selection")
             ),
         )
         page._handle_shell_command(ShellCommand(
             ShellCommandKind.LAUNCH_EXTERNAL_VIEWER,
-            "dashpva_h5viewer",
+            "silx_h5viewer",
         ))
         assert [argv for argv, _options in calls] == [
             (nexpy, selected_path),
-            (dashpva, "h5viewer"),
+            (silx, "view"),
         ]
         assert len(tool_reconciles) == 2
 

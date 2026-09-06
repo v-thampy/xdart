@@ -25,7 +25,7 @@ class ToolsView(QtWidgets.QFrame):
     )
     _EXTERNAL_VIEWERS = (
         ("◇ Open Selected in NeXpy", "nexpy_selected"),
-        ("▦ DashPVA HDF5 Viewer…", "dashpva_h5viewer"),
+        ("▦ silx HDF5 Viewer…", "silx_h5viewer"),
     )
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:

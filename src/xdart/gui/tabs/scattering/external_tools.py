@@ -14,7 +14,7 @@ import sys
 
 
 _NEXPY_ENV = "XDART_NEXPY_EXECUTABLE"
-_DASHPVA_ENV = "XDART_DASHPVA_EXECUTABLE"
+_SILX_ENV = "XDART_SILX_EXECUTABLE"
 _QT_CHILD_KEYS = ("PYQTGRAPH_QT_LIB", "QT_API", "MPLBACKEND")
 _WINDOWS_DETACHED_PROCESS = 0x00000008
 _WINDOWS_NEW_PROCESS_GROUP = 0x00000200
@@ -24,7 +24,7 @@ class ExternalToolId(str, Enum):
     """The complete, deliberately non-extensible external-viewer inventory."""
 
     NEXPY_SELECTED = "nexpy_selected"
-    DASHPVA_H5VIEWER = "dashpva_h5viewer"
+    SILX_H5VIEWER = "silx_h5viewer"
 
 
 class ExternalToolAvailabilityStatus(str, Enum):
@@ -44,14 +44,14 @@ class ExternalToolConfig:
     """Optional authoritative executable paths for the two fixed tools."""
 
     nexpy_executable: str | None = None
-    dashpva_executable: str | None = None
+    silx_executable: str | None = None
 
     def __post_init__(self) -> None:
         if any(
             value is not None and type(value) is not str
             for value in (
                 self.nexpy_executable,
-                self.dashpva_executable,
+                self.silx_executable,
             )
         ):
             raise TypeError("external viewer configuration must be text")
@@ -64,7 +64,7 @@ class ExternalToolConfig:
             raise TypeError("external viewer environment must be a mapping")
         return cls(
             environment.get(_NEXPY_ENV),
-            environment.get(_DASHPVA_ENV),
+            environment.get(_SILX_ENV),
         )
 
 
@@ -359,20 +359,20 @@ class ExternalToolRegistry:
             interpreter=interpreter,
             which=which,
         )
-        dashpva, dashpva_reason = _resolve_executable(
-            name="DashPVA",
-            configured=config.dashpva_executable,
-            configuration_name=_DASHPVA_ENV,
+        silx, silx_reason = _resolve_executable(
+            name="silx",
+            configured=config.silx_executable,
+            configuration_name=_SILX_ENV,
             interpreter=interpreter,
             which=which,
         )
         self._receipts = {
             ExternalToolId.NEXPY_SELECTED: nexpy,
-            ExternalToolId.DASHPVA_H5VIEWER: dashpva,
+            ExternalToolId.SILX_H5VIEWER: silx,
         }
         self._configuration_reasons = {
             ExternalToolId.NEXPY_SELECTED: nexpy_reason,
-            ExternalToolId.DASHPVA_H5VIEWER: dashpva_reason,
+            ExternalToolId.SILX_H5VIEWER: silx_reason,
         }
         self._popen = popen
         self._windows = windows
@@ -432,7 +432,7 @@ class ExternalToolRegistry:
             (
                 "Open the selected current processed NeXus in NeXpy."
                 if tool is ExternalToolId.NEXPY_SELECTED
-                else "Open DashPVA's general HDF5 viewer and choose a file."
+                else "Open silx's general HDF5 viewer and choose a file."
             ),
         )
 
@@ -487,18 +487,13 @@ class ExternalToolRegistry:
         argv = (
             (receipt.path, nexus.target)
             if tool is ExternalToolId.NEXPY_SELECTED
-            else (receipt.path, "h5viewer")
+            else (receipt.path, "view")
         )
         child_environment = dict(self._environment)
-        if tool is ExternalToolId.NEXPY_SELECTED:
-            for key in _QT_CHILD_KEYS:
-                child_environment.pop(key, None)
-        else:
-            child_environment.update({
-                "PYQTGRAPH_QT_LIB": "PyQt5",
-                "QT_API": "pyqt5",
-                "MPLBACKEND": "QtAgg",
-            })
+        # Both viewers can use the PySide6 supplied by xdart[gui]. Let their
+        # own Qt selection run, without inheriting xdart's plotting overrides.
+        for key in _QT_CHILD_KEYS:
+            child_environment.pop(key, None)
         options: dict[str, object] = {
             "shell": False,
             "stdin": subprocess.DEVNULL,
@@ -538,7 +533,7 @@ class ExternalToolRegistry:
             (
                 "NeXpy launch request accepted for the selected NeXus."
                 if tool is ExternalToolId.NEXPY_SELECTED
-                else "DashPVA HDF5 viewer launch request accepted."
+                else "silx HDF5 viewer launch request accepted."
             ),
         )
 

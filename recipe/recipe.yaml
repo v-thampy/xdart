@@ -54,6 +54,7 @@ build:
   python:
     entry_points:
       - xdart = xdart.xdart_main:main
+      - xdart-calib2 = xdart.calib2_main:main
 
 requirements:
   host:
@@ -83,6 +84,7 @@ requirements:
     - pyside6 >=6.5
     - pyqtgraph >=0.13.7
     - qtawesome
+    - nexpy ==2.0.1               # external NeXus browser; silx view is already included
     - imagecodecs
     - imageio
     - packaging

@@ -62,6 +62,9 @@ gui = [
     # silx.gui.plot pulls qtawesome at import time (pyFAI-calib2 /
     # drawmask path) but silx doesn't declare it.
     "qtawesome",
+    # External NeXus GUI; reuse our PySide6 (not nexpy[qt], which adds PyQt5).
+    # Keep this release on the tested nexusformat 2.0.2 dependency line.
+    "nexpy==2.0.1",
     "imagecodecs",
     "imageio",
     "packaging",         # Help → Check for Updates… version comparison (updater.py)
