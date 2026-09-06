@@ -944,13 +944,13 @@ class TestWriteNexusResult1D:
             grp = f["entry/integrated_1d"]
             assert grp.attrs["NX_class"] == "NXdata"
             assert grp.attrs["signal"] == "intensity"
-            assert list(grp.attrs["axes"]) == ["frame_index", "q"]
+            assert list(grp.attrs["axes"]) == ["frame_index", "axis_x"]
 
     def test_q_axis_values(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "a.nexus", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
             np.testing.assert_allclose(
-                f["entry/integrated_1d/q"][()], result_1d.radial, rtol=1e-6,
+                f["entry/integrated_1d/axis_x"][()], result_1d.radial, rtol=1e-6,
             )
 
     def test_intensity_values_stacked(self, tmp_path, result_1d):
@@ -979,7 +979,7 @@ class TestWriteNexusResult1D:
     def test_unit_on_q_axis(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "a.nexus", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
-            assert f["entry/integrated_1d/q"].attrs["units"] == "q_A^-1"
+            assert f["entry/integrated_1d/axis_x"].attrs["units"] == "q_A^-1"
 
     def test_non_integer_frame_key_raises(self, tmp_path, result_1d):
         # The stacked frame_index requires integer frame labels.
@@ -1011,16 +1011,16 @@ class TestWriteNexusResult2D:
             grp = f["entry/integrated_2d"]
             assert grp.attrs["NX_class"] == "NXdata"
             assert grp.attrs["signal"] == "intensity"
-            assert list(grp.attrs["axes"]) == ["frame_index", "chi", "q"]
+            assert list(grp.attrs["axes"]) == ["frame_index", "axis_y", "axis_x"]
 
     def test_axes_values(self, tmp_path, result_2d):
         p = write_nexus(tmp_path / "a.nexus", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
             np.testing.assert_allclose(
-                f["entry/integrated_2d/q"][()], result_2d.radial, rtol=1e-6,
+                f["entry/integrated_2d/axis_x"][()], result_2d.radial, rtol=1e-6,
             )
             np.testing.assert_allclose(
-                f["entry/integrated_2d/chi"][()], result_2d.azimuthal, rtol=1e-6,
+                f["entry/integrated_2d/axis_y"][()], result_2d.azimuthal, rtol=1e-6,
             )
 
     def test_intensity_shape_and_orientation(self, tmp_path, result_2d):
@@ -1049,7 +1049,7 @@ class TestWriteNexusResult2D:
     def test_unit_on_q_axis(self, tmp_path, result_2d):
         p = write_nexus(tmp_path / "a.nexus", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
-            assert f["entry/integrated_2d/q"].attrs["units"] == "q_A^-1"
+            assert f["entry/integrated_2d/axis_x"].attrs["units"] == "q_A^-1"
 
 
 # ---------------------------------------------------------------------------
@@ -1364,18 +1364,18 @@ class TestRoundtrip:
         with h5py.File(p, "r") as f:
             g = f["entry/integrated_1d"]
             assert list(g["frame_index"][()]) == [0, 1]
-            np.testing.assert_allclose(g["q"][()], result_1d.radial, rtol=1e-6)
+            np.testing.assert_allclose(g["axis_x"][()], result_1d.radial, rtol=1e-6)
             for row in (0, 1):
                 np.testing.assert_allclose(g["intensity"][row], result_1d.intensity, rtol=1e-6)
                 np.testing.assert_allclose(g["sigma"][row], result_1d.sigma, rtol=1e-6)
-            assert g["q"].attrs["units"] == "q_A^-1"
+            assert g["axis_x"].attrs["units"] == "q_A^-1"
 
     def test_2d_full_roundtrip(self, tmp_path, result_2d):
         p = write_nexus(tmp_path / "scan.nexus", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
             g = f["entry/integrated_2d"]
-            np.testing.assert_allclose(g["q"][()], result_2d.radial, rtol=1e-6)
-            np.testing.assert_allclose(g["chi"][()], result_2d.azimuthal, rtol=1e-6)
+            np.testing.assert_allclose(g["axis_x"][()], result_2d.radial, rtol=1e-6)
+            np.testing.assert_allclose(g["axis_y"][()], result_2d.azimuthal, rtol=1e-6)
             np.testing.assert_allclose(g["intensity"][0], result_2d.intensity.T, rtol=1e-6)
 
     def test_list_entries_after_write(self, tmp_path, result_1d):
@@ -1401,8 +1401,8 @@ class TestRoundtrip:
             h5.close()
 
         with h5py.File(p_batch, "r") as fb, h5py.File(p_incr, "r") as fi:
-            for key in ("integrated_1d/q", "integrated_1d/intensity",
-                        "integrated_2d/q", "integrated_2d/chi", "integrated_2d/intensity"):
+            for key in ("integrated_1d/axis_x", "integrated_1d/intensity",
+                        "integrated_2d/axis_x", "integrated_2d/axis_y", "integrated_2d/intensity"):
                 np.testing.assert_allclose(fb[f"entry/{key}"][()], fi[f"entry/{key}"][()])
 
 

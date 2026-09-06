@@ -2100,11 +2100,10 @@ class NexusSink:
 
         WHAT IS REFUSED, deliberately and with the operator's remedy in the
         message: raw containers, unrecognized files, damaged/unreadable files
-        (the recognizer returns False rather than guessing), and LEGACY
-        processed outputs that predate the current schema.  Legacy is a real
-        cost and is accepted because it is small under stable slots: an older
-        result lives at `<scan>.nexus`, while a Run now writes
-        `<scan>_int1d.nexus`, so the two rarely collide.
+        (the recognizer returns False rather than guessing), and historical
+        outputs outside the supported schema family. The owner-approved v2
+        q/chi layout is positively recognizable and may be replaced by a fresh
+        v3 result, but must not be appended to or migrated in place.
 
         Once per existing target, at the admitted-target boundary, BEFORE any
         backup, truncation or writer mutation.  Nothing per frame.

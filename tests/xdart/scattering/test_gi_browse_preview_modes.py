@@ -58,11 +58,15 @@ def _write_named_gi(path):
 
 
 @pytest.mark.parametrize("first_mode", ("Waterfall", "Single"))
+@pytest.mark.parametrize("schema_version", (2, 3))
 def test_first_borrowed_gi_preview_and_frame9_preserve_persisted_modes(
-    tmp_path, first_mode,
+    tmp_path, first_mode, schema_version,
 ):
     path = tmp_path / "named_gi.nexus"
     _write_named_gi(path)
+    if schema_version == 2:
+        from tests.core.test_neutral_axis_contract import _as_v2
+        _as_v2(path)
     with FrameViewReader(path) as reader:
         expected = {label: reader.read(label) for label in (16, 9)}
 

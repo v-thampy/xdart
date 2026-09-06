@@ -3347,6 +3347,7 @@ class FrameViewReader:
             container=self.path,
         )
         entry = processed.entry
+        x_name, y_name = processed.axis_names
         # N1: the project root the relative source paths point under (None on old
         # absolute-path files; harmless there).
         source_base = _bounded_text_attr(
@@ -3399,12 +3400,12 @@ class FrameViewReader:
                     group, "intensity", role=f"{group.name}/intensity",
                 )
                 q_node = _required_direct_dataset(
-                    group, "axis_x", role=f"{group.name}/axis_x",
+                    group, x_name, role=f"{group.name}/{x_name}",
                 )
                 if intensity_node is None or q_node is None:
                     return
                 q = _read_numeric_vector(
-                    q_node, role=f"{group.name}/axis_x", bundle=bundle,
+                    q_node, role=f"{group.name}/{x_name}", bundle=bundle,
                 )
                 _qualify_1d_stack(
                     group,
@@ -3427,7 +3428,7 @@ class FrameViewReader:
                     group, self.target_frame, bundle=bundle,
                 )
                 axis_1d_modes[mode] = axis_from_unit(
-                    _dataset_unit(group, "axis_x"), q,
+                    _dataset_unit(group, x_name), q,
                 )
 
             def register_2d(mode, group):
@@ -3435,10 +3436,10 @@ class FrameViewReader:
                     group, "intensity", role=f"{group.name}/intensity",
                 )
                 q_node = _required_direct_dataset(
-                    group, "axis_x", role=f"{group.name}/axis_x",
+                    group, x_name, role=f"{group.name}/{x_name}",
                 )
                 chi_node = _required_direct_dataset(
-                    group, "axis_y", role=f"{group.name}/axis_y",
+                    group, y_name, role=f"{group.name}/{y_name}",
                 )
                 if (
                     intensity_node is None
@@ -3447,10 +3448,10 @@ class FrameViewReader:
                 ):
                     return
                 q = _read_numeric_vector(
-                    q_node, role=f"{group.name}/axis_x", bundle=bundle,
+                    q_node, role=f"{group.name}/{x_name}", bundle=bundle,
                 )
                 chi = _read_numeric_vector(
-                    chi_node, role=f"{group.name}/axis_y", bundle=bundle,
+                    chi_node, role=f"{group.name}/{y_name}", bundle=bundle,
                 )
                 _qualify_2d_stack(
                     group,
@@ -3474,8 +3475,8 @@ class FrameViewReader:
                 map_2d_modes[mode] = _frame_map(
                     group, self.target_frame, bundle=bundle,
                 )
-                qu = _dataset_unit(group, "axis_x")
-                cu = _dataset_unit(group, "axis_y")
+                qu = _dataset_unit(group, x_name)
+                cu = _dataset_unit(group, y_name)
                 axis_2d_x_modes[mode] = axis_from_unit(qu, q)
                 axis_2d_y_modes[mode] = axis_from_unit(cu, chi)
                 two_d_kind_modes[mode] = _decode_kind(

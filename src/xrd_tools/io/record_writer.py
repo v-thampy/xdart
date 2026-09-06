@@ -1135,6 +1135,7 @@ def _replacement_manifest_digest_for(
     *,
     ignore_source_base: bool,
     ignore_file_name: bool,
+    normalize_integrated_axes: bool = False,
 ) -> str:
     digest = hashlib.sha256(b"xrd-tools-replacement-manifest-v2\0")
     config = _replacement_hard_group(root, f"{entry_name}/reduction/config")
@@ -1142,6 +1143,29 @@ def _replacement_manifest_digest_for(
     entry_path = "/" + "/".join(
         part for part in entry_name.split("/") if part
     )
+    renames, attributes = {}, {}
+    if normalize_integrated_axes and root[entry_name].attrs.get("ssrl_schema_version") == 2:
+        from xrd_tools.io.processed_scan_id import (
+            require_current_processed_groups, neutral_axis_upgrade,
+        )
+        renames, attributes = neutral_axis_upgrade(
+            require_current_processed_groups(root, entry_name),
+        )
+
+    def attribute_signature(node, name):
+        overrides = attributes.get(node.name, {})
+        if name in overrides:
+            value = overrides[name]
+            dtype = (
+                h5py.string_dtype("utf-8") if np.asarray(value).dtype.kind in "OU"
+                else np.asarray(value).dtype
+            )
+        else:
+            value = _read_replacement_attribute_value(
+                node, name, f"replacement manifest {node.name}@{name}",
+            )
+            dtype = node.attrs.get_id(name).dtype
+        return _replacement_value_signature(value, dtype)
 
     nodes = 1
     first_roles: dict[int, str] = {}
@@ -1209,28 +1233,24 @@ def _replacement_manifest_digest_for(
 
     def walk(group, prefix, active=()):
         nonlocal nodes
-        for name in sorted(group.attrs):
+        for name in sorted(set(group.attrs) | set(attributes.get(group.name, {}))):
             if ignore_source_base and group.name == entry_path and name == SOURCE_BASE_ATTR:
                 continue
             if ignore_file_name and group.name == "/" and name == "file_name":
                 continue
             update(
                 f"{prefix}@{name}",
-                _replacement_value_signature(
-                    _read_replacement_attribute_value(
-                        group,
-                        name,
-                        f"replacement manifest {group.name}@{name}",
-                    ),
-                    group.attrs.get_id(name).dtype,
-                ),
+                attribute_signature(group, name),
             )
-        for name in sorted(group):
+        def logical_name(name):
+            return renames.get(f"{group.name.rstrip('/')}/{name}", name)
+
+        for name in sorted(group, key=logical_name):
             path = f"{group.name.rstrip('/')}/{name}"
             if path in exclude:
                 continue
             link = group.get(name, getlink=True)
-            role = f"{prefix}/{name}"
+            role = f"{prefix}/{logical_name(name)}"
             update(
                 f"{role}@link",
                 (
@@ -1289,17 +1309,10 @@ def _replacement_manifest_digest_for(
                     ),
                 )
                 hash_dataset(child, role)
-                for attr in sorted(child.attrs):
+                for attr in sorted(set(child.attrs) | set(attributes.get(child.name, {}))):
                     update(
                         f"{role}@{attr}",
-                        _replacement_value_signature(
-                            _read_replacement_attribute_value(
-                                child,
-                                attr,
-                                f"replacement manifest {child.name}@{attr}",
-                            ),
-                            child.attrs.get_id(attr).dtype,
-                        ),
+                        attribute_signature(child, attr),
                     )
             else:
                 raise WriterStateError(
@@ -1655,6 +1668,7 @@ def prepare_replacement_manifest_receipt(
         exclusions,
         ignore_source_base=True,
         ignore_file_name=True,
+        normalize_integrated_axes=True,
     )
     gi_node_receipt = _canonical_node_signature_digest(signature)
     gi_structure_receipt = _canonical_node_signature_digest(
@@ -3340,6 +3354,7 @@ class NexusRecordWriter:
             tuple(exclude),
             ignore_source_base=self._replacement_configuration is not None,
             ignore_file_name=self._seeded_document is not None,
+            normalize_integrated_axes=self._seeded_document is not None,
         )
     def _verify_indexed_row(
         self,
@@ -4185,6 +4200,11 @@ class NexusRecordWriter:
             admitted = None
             if self._replacement_configuration is not None:
                 entry = _replacement_hard_group(h5, self.entry)
+                # The retired in-place route must not migrate an old file.
+                # Immutable successors arrive here as normalized private v3 copies.
+                require_current_writable_processed_groups(
+                    h5, self.entry, container=self.target,
+                )
             else:
                 admitted = require_current_writable_processed_groups(
                     h5,

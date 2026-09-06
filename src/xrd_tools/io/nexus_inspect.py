@@ -377,7 +377,11 @@ def _reduced_summary(e: h5py.Group, name: str) -> NexusReducedSummary | None:
         if "intensity" in group and isinstance(group["intensity"], h5py.Dataset)
         else None
     )
-    axes = tuple(_axis_summaries(group, name))
+    # This is a general HDF5 inspector, not positive processed-file admission.
+    # Show physical nodes even in unstamped diagnostic files; actual readers
+    # still require the version-matched layout through processed_scan_id.
+    axis_names = ("axis_x", "axis_y") if "axis_x" in group else ("q", "chi")
+    axes = tuple(_axis_summaries(group, name, axis_names))
     two_d_kind = None
     if name == "integrated_2d":
         two_d_kind = _two_d_kind(group, axes)
@@ -391,8 +395,8 @@ def _reduced_summary(e: h5py.Group, name: str) -> NexusReducedSummary | None:
     )
 
 
-def _axis_summaries(group: h5py.Group, group_name: str) -> list[NexusAxisSummary]:
-    candidates = ("axis_x",) if group_name == "integrated_1d" else ("axis_x", "axis_y")
+def _axis_summaries(group: h5py.Group, group_name: str, names) -> list[NexusAxisSummary]:
+    candidates = names[:1] if group_name == "integrated_1d" else names
     axes: list[NexusAxisSummary] = []
     for name in candidates:
         if name not in group or not isinstance(group[name], h5py.Dataset):
@@ -417,8 +421,9 @@ def _two_d_kind(group: h5py.Group, axes: tuple[NexusAxisSummary, ...]) -> TwoDKi
             return TwoDKind(str(attr))
         except ValueError:
             pass
-    units = {axis.name: axis.units for axis in axes}
-    return two_d_kind_from_units(units.get("axis_x"), units.get("axis_y"))
+    return two_d_kind_from_units(
+        axes[0].units if axes else None, axes[1].units if len(axes) > 1 else None,
+    )
 
 
 def _frame_group_labels(e: h5py.Group) -> tuple[int, ...]:

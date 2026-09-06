@@ -465,9 +465,9 @@ def get_1d(
         ``sigma`` is ``None`` when the file stored no error estimate.
     """
     spec = SCHEMA.groups["integrated_1d"]
-    (q_name,) = spec.axes
     with h5py.File(Path(scan_file), "r") as f:
         processed = _processed(f, entry, container=Path(scan_file))
+        q_name, _ = processed.axis_names
         g = processed.integrated_1d
         if g is None:
             raise KeyError(f"{scan_file} has no {spec.name} group")
@@ -500,9 +500,9 @@ def get_2d(
         ``(n_frames, n_chi, n_q)``.
     """
     spec = SCHEMA.groups["integrated_2d"]
-    q_name, chi_name = spec.axes
     with h5py.File(Path(scan_file), "r") as f:
         processed = _processed(f, entry, container=Path(scan_file))
+        q_name, chi_name = processed.axis_names
         g = processed.integrated_2d
         if g is None:
             raise KeyError(f"{scan_file} has no {spec.name} group")

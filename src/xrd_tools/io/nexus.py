@@ -5085,6 +5085,7 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
 
     with h5py.File(path, "r") as f:
         processed = _current_processed_groups(f, entry, path)
+        x_name, y_name = processed.axis_names
         e = processed.entry
         g1 = processed.integrated_1d
         g2 = processed.integrated_2d
@@ -5095,8 +5096,8 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
                 ("frame", "q"),
                 np.asarray(g1["intensity"][()]),
             )
-            coords["q"] = np.asarray(g1["axis_x"][()])
-            u = g1["axis_x"].attrs.get("units", None)
+            coords["q"] = np.asarray(g1[x_name][()])
+            u = g1[x_name].attrs.get("units", None)
             if u is not None:
                 attrs_per_coord["q"] = {"units": _v2_decode_str(u)}
             if "sigma" in g1:
@@ -5148,10 +5149,10 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
                     g2.attrs.get(
                         "two_d_kind",
                         two_d_kind_from_units(
-                            _v2_decode_str(g2["axis_x"].attrs.get("units", ""))
-                            if "axis_x" in g2 else "",
-                            _v2_decode_str(g2["axis_y"].attrs.get("units", ""))
-                            if "axis_y" in g2 else "",
+                            _v2_decode_str(g2[x_name].attrs.get("units", ""))
+                            if x_name in g2 else "",
+                            _v2_decode_str(g2[y_name].attrs.get("units", ""))
+                            if y_name in g2 else "",
                         ).value,
                     )
                 )
@@ -5161,12 +5162,12 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
                     (frame_dim, "chi", "q_2d"),
                     np.asarray(g2["sigma"][()]),
                 )
-            coords["q_2d"] = np.asarray(g2["axis_x"][()])
-            u_q2 = g2["axis_x"].attrs.get("units", None)
+            coords["q_2d"] = np.asarray(g2[x_name][()])
+            u_q2 = g2[x_name].attrs.get("units", None)
             if u_q2 is not None:
                 attrs_per_coord["q_2d"] = {"units": _v2_decode_str(u_q2)}
-            coords["chi"] = np.asarray(g2["axis_y"][()])
-            u = g2["axis_y"].attrs.get("units", None)
+            coords["chi"] = np.asarray(g2[y_name][()])
+            u = g2[y_name].attrs.get("units", None)
             if u is not None:
                 attrs_per_coord["chi"] = {"units": _v2_decode_str(u)}
 
@@ -5321,20 +5322,21 @@ def read_scan_metadata(
                 coords["frame_2d"] = f2
 
         # q / chi axes (small).
-        if g1 is not None and "axis_x" in g1:
-            coords["q"] = np.asarray(g1["axis_x"][()])
-            u = g1["axis_x"].attrs.get("units", None)
+        x_name, y_name = processed.axis_names
+        if g1 is not None and x_name in g1:
+            coords["q"] = np.asarray(g1[x_name][()])
+            u = g1[x_name].attrs.get("units", None)
             if u is not None:
                 attrs_per_coord["q"] = {"units": _v2_decode_str(u)}
         if g2 is not None:
-            if "axis_x" in g2:
-                coords["q_2d"] = np.asarray(g2["axis_x"][()])
-                u_q2 = g2["axis_x"].attrs.get("units", None)
+            if x_name in g2:
+                coords["q_2d"] = np.asarray(g2[x_name][()])
+                u_q2 = g2[x_name].attrs.get("units", None)
                 if u_q2 is not None:
                     attrs_per_coord["q_2d"] = {"units": _v2_decode_str(u_q2)}
-            if "axis_y" in g2:
-                coords["chi"] = np.asarray(g2["axis_y"][()])
-                u = g2["axis_y"].attrs.get("units", None)
+            if y_name in g2:
+                coords["chi"] = np.asarray(g2[y_name][()])
+                u = g2[y_name].attrs.get("units", None)
                 if u is not None:
                     attrs_per_coord["chi"] = {"units": _v2_decode_str(u)}
 

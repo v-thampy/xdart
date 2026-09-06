@@ -9,8 +9,8 @@ though it were a detector stack (v1.1.2 finding F-NXS-2).
 
 Raw-input guards must reject integrated result groups regardless of suffix or
 schema stamp.  Positive processed-output admission is intentionally stricter:
-only a ``.nexus`` file carrying the current schema name/version and integrated
-results is a current xdart output.  Keeping the two questions separate prevents
+only a ``.nexus`` file carrying the supported schema identity and integrated
+results is an admitted xdart output (v2 read-only, v3 read/write). Keeping the two questions separate prevents
 a raw ``.nxs`` with unrelated result groups from being positively claimed while
 still preventing those groups from being mistaken for detector frames.
 
@@ -41,6 +41,8 @@ from xrd_tools.io.schema import (
     REINTEGRATE_SHADOW_SUFFIX,
     SCHEMA_NAME_ATTR,
     SCHEMA_VERSION_ATTR,
+    integrated_axis_names,
+    axis_display_metadata,
     read_current_mode_layout,
     resolve_integrated_group,
 )
@@ -85,15 +87,20 @@ class ProcessedXdartInputError(ValueError):
 
 @dataclass(frozen=True)
 class CurrentProcessedGroups:
-    """Exact bound groups certified together by current-output admission."""
+    """Exact groups and axis layout certified together by read admission."""
 
     entry: h5py.Group
+    schema_version: int
     integrated_1d: h5py.Group | None
     integrated_2d: h5py.Group | None
     primary_mode_1d: str
     primary_mode_2d: str
     mode_groups_1d: tuple[tuple[str, h5py.Group], ...]
     mode_groups_2d: tuple[tuple[str, h5py.Group], ...]
+
+    @property
+    def axis_names(self) -> tuple[str, str]:
+        return integrated_axis_names(self.schema_version)
 
     @property
     def modes_1d(self) -> tuple[str, ...]:
@@ -251,13 +258,17 @@ def require_current_output_path(path: str | Path) -> Path:
     return target
 
 
-def _valid_current_result_group(group: h5py.Group, name: str) -> bool:
-    """Qualify one concrete v3 integrated stack, not a name-only marker."""
+def _valid_current_result_group(group: h5py.Group, name: str, version: int) -> bool:
+    """Qualify one concrete supported stack, not a name-only marker."""
     try:
+        x_name, y_name = integrated_axis_names(version)
+        other_names = ("axis_x", "axis_y") if version == 2 else ("q", "chi")
+        if any(key in group for key in other_names):
+            return False
         expected_axes = (
-            ("frame_index", "axis_x")
+            ("frame_index", x_name)
             if name == "integrated_1d"
-            else ("frame_index", "axis_y", "axis_x")
+            else ("frame_index", y_name, x_name)
         )
         axes = group.attrs.get("axes")
         if isinstance(axes, np.ndarray):
@@ -274,8 +285,8 @@ def _valid_current_result_group(group: h5py.Group, name: str) -> bool:
             return False
         labels = _direct_dataset(group, "frame_index")
         intensity = _direct_dataset(group, "intensity")
-        q = _direct_dataset(group, "axis_x")
-        chi = None if name == "integrated_1d" else _direct_dataset(group, "axis_y")
+        q = _direct_dataset(group, x_name)
+        chi = None if name == "integrated_1d" else _direct_dataset(group, y_name)
         if (
             labels is None
             or intensity is None
@@ -347,9 +358,9 @@ def _valid_current_result_group(group: h5py.Group, name: str) -> bool:
         return False
 
 
-def _valid_current_result_leaf(group: h5py.Group, name: str) -> bool:
+def _valid_current_result_leaf(group: h5py.Group, name: str, version: int) -> bool:
     """Qualify one owned result leaf, including its complete local graph."""
-    if not _valid_current_result_group(group, name):
+    if not _valid_current_result_group(group, name, version):
         return False
     if (
         PRIMARY_MODE_ATTR in group.attrs
@@ -379,6 +390,10 @@ def _qualified_current_processed_entry(
             or Path(container).suffix.casefold() != ".nexus"
         ):
             return None
+        version = _attr_int(entry.attrs.get(SCHEMA_VERSION_ATTR))
+        if (_attr_str(entry.attrs.get(SCHEMA_NAME_ATTR)) != PROCESSED_SCHEMA_NAME
+                or version not in (2, PROCESSED_SCHEMA_VERSION)):
+            return None
         groups: dict[str, h5py.Group | None] = {}
         primaries = {
             "integrated_1d": DEFAULT_MODE_KEY,
@@ -400,7 +415,7 @@ def _qualified_current_processed_entry(
             present = present or slot_present
             if slot_present and (
                 not isinstance(group, h5py.Group)
-                or not _valid_current_result_group(group, name)
+                or not _valid_current_result_group(group, name, version)
             ):
                 return None
             if isinstance(group, h5py.Group):
@@ -410,7 +425,7 @@ def _qualified_current_processed_entry(
                     dimension,
                 )
                 if any(
-                    mode != primary and not _valid_current_result_leaf(child, name)
+                    mode != primary and not _valid_current_result_leaf(child, name, version)
                     for mode, child in pairs
                 ):
                     return None
@@ -430,16 +445,11 @@ def _qualified_current_processed_entry(
                 primaries[name] = primary
                 mode_groups[name] = pairs
             groups[name] = group if isinstance(group, h5py.Group) else None
-        if (
-            _attr_str(entry.attrs.get(SCHEMA_NAME_ATTR))
-            != PROCESSED_SCHEMA_NAME
-            or _attr_int(entry.attrs.get(SCHEMA_VERSION_ATTR))
-            != PROCESSED_SCHEMA_VERSION
-            or not present
-        ):
+        if not present:
             return None
         return CurrentProcessedGroups(
             entry=entry,
+            schema_version=version,
             integrated_1d=groups["integrated_1d"],
             integrated_2d=groups["integrated_2d"],
             primary_mode_1d=primaries["integrated_1d"],
@@ -491,14 +501,14 @@ def is_current_processed_xdart_file(
     f: h5py.File,
     entry: str = "entry",
 ) -> bool:
-    """Strict positive admission for an already-open current output."""
+    """Strict positive recognition of a supported v2/v3 processed output."""
     return _current_processed_groups_file(f, entry) is not None
 
 
 def is_current_processed_xdart_path(path, entry: str = "entry") -> bool:
     """Strict positive admission for a current ``.nexus`` path.
 
-    Suffix alone is never sufficient; the current schema name/version and
+    Suffix alone is never sufficient; the supported schema name/version and
     integrated result content must all be present.
     """
     try:
@@ -518,7 +528,7 @@ def require_current_processed(
     *,
     container: str | Path | None = None,
 ) -> None:
-    """Require one exact current processed record at a public read boundary."""
+    """Require one exact supported v2/v3 record at a public read boundary."""
     if isinstance(source, _H5File):
         accepted = _current_processed_groups_file(
             source, entry, container=container,
@@ -562,6 +572,8 @@ def require_current_writable_processed_groups(
         entry,
         container=container,
     )
+    if groups.schema_version != PROCESSED_SCHEMA_VERSION:
+        raise ValueError("read-only processed v2 record; create a new v3 output instead of Append")
     for name, group in (
         ("integrated_1d", groups.integrated_1d),
         ("integrated_2d", groups.integrated_2d),
@@ -574,3 +586,50 @@ def require_current_writable_processed_groups(
                 f"completed {name} reintegration shadow is read-only recovery"
             )
     return groups
+
+
+def neutral_axis_upgrade(
+    groups: CurrentProcessedGroups,
+) -> tuple[dict[str, str], dict[str, dict[str, object]]]:
+    """Describe only the approved v2-to-v3 names and display-attribute changes.
+
+    Shared by private-candidate conversion and its read-only preservation
+    comparison. No arrays are copied or converted; the caller owns mutation.
+    """
+    if groups.schema_version != 2:
+        return {}, {}
+    renames = {}
+    attributes = {
+        groups.entry.name: {SCHEMA_VERSION_ATTR: np.int64(PROCESSED_SCHEMA_VERSION)},
+    }
+    for dimension, pairs in (
+        ("1d", groups.mode_groups_1d), ("2d", groups.mode_groups_2d),
+    ):
+        for _mode, group in pairs:
+            names = ("q",) if dimension == "1d" else ("q", "chi")
+            axes = (
+                ["frame_index", "axis_x"] if dimension == "1d"
+                else ["frame_index", "axis_y", "axis_x"]
+            )
+            attributes[group.name] = {"axes": np.asarray(axes, dtype=object)}
+            for old, new in zip(names, ("axis_x", "axis_y")):
+                node = group[old]
+                renames[node.name] = new
+                unit = _attr_str(node.attrs.get("units", ""))
+                label = axis_display_metadata(unit)["long_name"]
+                attributes[node.name] = {"long_name": label}
+    return renames, attributes
+
+
+def upgrade_private_integrated_axes(
+    document: h5py.File, entry: str, *, container: str | Path,
+) -> None:
+    """Normalize an already publisher-owned candidate, never a source file."""
+    groups = require_current_processed_groups(document, entry, container=container)
+    renames, attributes = neutral_axis_upgrade(groups)
+    for path, values in attributes.items():
+        for key, value in values.items():
+            document[path].attrs[key] = value
+    for path, new in renames.items():
+        parent, old = path.rsplit("/", 1)
+        document[parent].move(old, new)

@@ -2,6 +2,15 @@
 
 **Status:** accepted · 2026-06-12 · (greenfield Difference 5)
 
+**2026-09-06 amendment:** the approved integrated-axis rename is the first
+breaking layout boundary: new processed outputs use integer version 3 and
+`axis_x`/`axis_y`. Strictly qualified version-2 `q`/`chi` outputs remain readable;
+only v3 is writable through Append. Immutable Reintegration converts its private
+candidate, never the original file. Positive read admission refuses unknown
+versions; the historical warn-only recommendation below is superseded at that
+boundary. All other capability/attribute keys and scientific arrays retain their
+existing contracts. See [the processed schema](../core/schema_v2.md).
+
 ## Context
 
 The processed-scan schema stamps `ssrl_schema_version = 2`, but "version

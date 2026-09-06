@@ -1978,7 +1978,8 @@ def _validate_candidate_document(
             "successor candidate is not the exact current processed document"
         )
     try:
-        require_current_processed(
+        from xrd_tools.io.processed_scan_id import require_current_writable_processed_groups
+        require_current_writable_processed_groups(
             document, plan.entry, container=request.output_artifact,
         )
     except ValueError as error:
@@ -2059,6 +2060,7 @@ def _preservation_expectation(plan, source_document=None):
                 source_exclusions,
                 ignore_source_base=True,
                 ignore_file_name=True,
+                normalize_integrated_axes=True,
             )
             return source_exclusions, expected
     except (OSError, ValueError, TypeError, WriterStateError) as error:
@@ -2137,6 +2139,7 @@ def _validate_committed_preservation(document, plan, expectation) -> None:
             candidate_exclusions,
             ignore_source_base=True,
             ignore_file_name=True,
+            normalize_integrated_axes=True,
         )
     except (OSError, ValueError, TypeError, WriterStateError) as error:
         raise FiniteArtifactIntegrityError(
@@ -2429,6 +2432,8 @@ class _SuccessorRuntime:
         from xrd_tools.session.scan_session import ScanSession
 
         plan = self.plan
+        from xrd_tools.io.processed_scan_id import upgrade_private_integrated_axes
+        upgrade_private_integrated_axes(document, plan.entry, container=request.output_artifact)
         try:
             _legacy._event(self.token)
         except _legacy.ReintegrateCancelled:

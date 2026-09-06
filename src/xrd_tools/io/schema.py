@@ -57,6 +57,7 @@ __all__ = [
     "ACCEPTED_SCHEMA_NAMES",
     "PROCESSED_SCHEMA_VERSION",
     "axis_display_metadata",
+    "integrated_axis_names",
     "INTEGRATED_ROW_ALIGNED",
     "GroupSchema",
     "ProcessedScanSchema",
@@ -287,9 +288,19 @@ CAPABILITIES: "Mapping[str, CapabilityAttr]" = None  # set below GroupSchema
 PROCESSED_SCHEMA_NAME = "xrd_tools.processed_scan"
 #: Exact schema identities accepted by the forward-only reader.
 ACCEPTED_SCHEMA_NAMES = (PROCESSED_SCHEMA_NAME,)
-#: current schema version; positive processed-output admission requires this
-#: exact version.  Lower-level readers may still diagnose newer stamps.
+#: New writes use v3; qualified v2 records remain readable, never appendable.
 PROCESSED_SCHEMA_VERSION = 3
+
+
+def integrated_axis_names(version: int) -> tuple[str, str]:
+    """Physical integrated coordinates for the two supported record layouts."""
+    if isinstance(version, (bool, np.bool_)) or not isinstance(version, (int, np.integer)):
+        raise ValueError("unsupported processed schema version")
+    if version == 2:
+        return "q", "chi"
+    if version == PROCESSED_SCHEMA_VERSION:
+        return "axis_x", "axis_y"
+    raise ValueError("unsupported processed schema version")
 
 
 def axis_display_metadata(unit: str) -> dict[str, str]:
