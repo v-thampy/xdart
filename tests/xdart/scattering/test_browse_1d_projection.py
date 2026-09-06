@@ -902,6 +902,8 @@ def test_first_preview_hydration_stamps_scalar_catalog_named_modes(
         None,
         None,
         None,
+        "q_ip",
+        "q_ip_q_oop",
     )
     prepared = PreparedHydrationCommit(
         request, token, None, False, preview, None,

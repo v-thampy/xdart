@@ -273,6 +273,8 @@ def test_browse_heavy_hydration_preserves_named_active_modes() -> None:
         None,
         view.source_frame_index,
         None,
+        "q_ip",
+        "q_ip_q_oop",
     )
     prepared = PreparedHydrationCommit(
         hydration,

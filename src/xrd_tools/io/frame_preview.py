@@ -90,6 +90,8 @@ class FramePreview:
     raw_dataset_path: str | None
     source_frame_index: int | None
     source_base: str | None
+    mode_1d: str
+    mode_2d: str
     detector_fallback_used: bool = False
     detector_diagnostic: str | None = None
     def __post_init__(self):
@@ -101,6 +103,9 @@ class FramePreview:
         for name in ("raw_locator", "raw_dataset_path", "source_base"):
             value = getattr(self, name)
             _check(value is None or (type(value) is str and bool(value)), f"{name} must be a nonempty string or None")
+        for name in ("mode_1d", "mode_2d"):
+            value = getattr(self, name)
+            _check(type(value) is str and bool(value), f"{name} must be an exact nonempty string")
         _check(self.source_frame_index is None or (type(self.source_frame_index) is int and self.source_frame_index >= 0), "source_frame_index must be nonnegative or None")
         _check(type(self.detector_fallback_used) is bool, "detector_fallback_used must be an exact bool")
         _check(self.detector_diagnostic is None or (type(self.detector_diagnostic) is str and bool(self.detector_diagnostic)), "detector_diagnostic must be nonempty or None")
@@ -180,6 +185,8 @@ def read_frame_preview(read_key: HydrationReadKey, *, detector_projection: Detec
         if not reader.has_frame(frame):
             raise KeyError(f"processed frame {frame} is absent")
         view = reader.read(frame)
+        mode_1d = reader.primary_mode_1d()
+        mode_2d = reader.primary_mode_2d()
         provenance = _source_provenance(reader, frame)
         dataset = None if reader._entry is None else reader._entry.get("instrument/detector/detector_shape")
         try: shape_values = np.asarray(dataset[()]) if dataset is not None else np.asarray(())
@@ -216,4 +223,7 @@ def read_frame_preview(read_key: HydrationReadKey, *, detector_projection: Detec
                 except Exception as error:
                     diagnostic = str(error) or type(error).__name__
     fallback = bool(raw is not None and read_key.purpose is HydrationPurpose.PREVIEW and view.thumbnail is None)
-    return FramePreview(read_key, view, view.thumbnail, raw, locator, dataset_path, source_index, source_base, fallback, diagnostic)
+    return FramePreview(
+        read_key, view, view.thumbnail, raw, locator, dataset_path,
+        source_index, source_base, mode_1d, mode_2d, fallback, diagnostic,
+    )

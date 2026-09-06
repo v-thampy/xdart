@@ -1482,20 +1482,13 @@ class RunDisplayState:
                     or _projection_masks_values(prepared.projection)
                 ),
             )
-        prior = store.get(prepared.request.label)
-        prior_record = None if prior is None else prior.record
+        # A sparse Browse store is empty on first hydration.  The reader's
+        # selected persisted modes travel with the exact preview, independent
+        # of whether this frame has an earlier publication.
         record = FrameRecord.from_view(
             view,
-            mode_1d=(
-                prior_record.active_mode_1d
-                if prior_record is not None and prior_record.results_1d
-                else DEFAULT_MODE_KEY
-            ),
-            mode_2d=(
-                prior_record.active_mode_2d
-                if prior_record is not None and prior_record.results_2d
-                else DEFAULT_MODE_KEY
-            ),
+            mode_1d=preview.mode_1d,
+            mode_2d=preview.mode_2d,
         )
         source_identity = canonical_browse_source_identity(
             view,

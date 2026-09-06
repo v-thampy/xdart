@@ -128,6 +128,7 @@ def test_thumbnail_preview_opens_processed_once_and_never_reads_detector(
     )
     assert counts == {"processed": 1, "detector": 0, "detector_paths": []}
     assert result.read_key.frame_identity == 17
+    assert (result.mode_1d, result.mode_2d) == ("default", "default")
     assert result.view.has_1d and result.view.has_2d
     assert result.thumbnail is not None
     assert result.raw is None
@@ -145,6 +146,50 @@ def test_thumbnail_preview_opens_processed_once_and_never_reads_detector(
         result.view.axis_2d_y.values,
     ):
         assert array.flags.writeable is False
+
+
+def test_preview_carries_persisted_gi_modes_without_reading_all_modes(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.core import FrameRecord, TwoDKind, axis_from_unit
+    from xrd_tools.io import FrameViewReader, write_frame_records
+    from tests.core.v2_fixture_factory import current_entry
+
+    processed = tmp_path / "named_gi.nexus"
+    # Keep exact equality independent of the writer's float32 axis storage.
+    q_ip = np.array([0.125, 0.25, 0.5])
+    view = FrameView(
+        label=17,
+        axis_1d=axis_from_unit("qip_A^-1", q_ip),
+        intensity_1d=np.array([1.0, 2.0, 3.0]),
+        axis_2d_x=axis_from_unit("qip_A^-1", q_ip),
+        axis_2d_y=axis_from_unit("qoop_A^-1", np.array([0.4, 0.8])),
+        intensity_2d=np.arange(6.0).reshape(2, 3),
+        two_d_kind=TwoDKind.QIP_QOOP,
+    )
+    record = FrameRecord.from_view(view, mode_1d="q_ip", mode_2d="qip_qoop")
+    record = record.with_result_1d(
+        "q_oop",
+        replace(view, axis_1d=axis_from_unit("qoop_A^-1", np.array([1.0, 2.0, 3.0]))),
+        make_active=False,
+    )
+    with h5py.File(processed, "w") as handle:
+        write_frame_records(current_entry(handle), (record,))
+
+    def forbidden_record_read(*_args, **_kwargs):
+        pytest.fail("preview must not read all persisted modes")
+
+    monkeypatch.setattr(FrameViewReader, "read_record", forbidden_record_read)
+    counts = _instrument_reads(monkeypatch, processed)
+    preview = _api().read_frame_preview(
+        _read_key(processed, _hydration().HydrationPurpose.PREVIEW),
+    )
+    assert counts == {"processed": 1, "detector": 0, "detector_paths": []}
+    assert (preview.mode_1d, preview.mode_2d) == ("q_ip", "qip_qoop")
+    assert preview.view.axis_1d.unit == view.axis_1d.unit
+    np.testing.assert_array_equal(preview.view.axis_1d.values, view.axis_1d.values)
+    np.testing.assert_array_equal(preview.view.intensity_1d, view.intensity_1d)
+    np.testing.assert_array_equal(preview.view.intensity_2d, view.intensity_2d)
 
 
 def test_raw_absent_thumbnail_preview_keeps_portable_projection(
@@ -779,6 +824,8 @@ def _preview_result(
         dataset_path,
         source_index,
         None,
+        "default",
+        "default",
         fallback,
         diagnostic,
     )
@@ -917,6 +964,12 @@ def test_frame_preview_result_rejects_malformed_fields_and_label_aliases(
         {"source_frame_index": -1},
         {"source_frame_index": True},
         {"source_base": 3},
+        {"mode_1d": ""},
+        {"mode_1d": None},
+        {"mode_1d": True},
+        {"mode_2d": ""},
+        {"mode_2d": None},
+        {"mode_2d": 1},
         {"detector_fallback_used": 1},
         {"detector_fallback_used": True},
         {"detector_diagnostic": object()},
@@ -1020,6 +1073,8 @@ def test_preview_value_fields_and_scientific_import_boundary_are_exact():
         "raw_dataset_path",
         "source_frame_index",
         "source_base",
+        "mode_1d",
+        "mode_2d",
         "detector_fallback_used",
         "detector_diagnostic",
     )
@@ -1032,6 +1087,8 @@ def test_preview_value_fields_and_scientific_import_boundary_are_exact():
         "raw_dataset_path": "str | None",
         "source_frame_index": "int | None",
         "source_base": "str | None",
+        "mode_1d": "str",
+        "mode_2d": "str",
         "detector_fallback_used": "bool",
         "detector_diagnostic": "str | None",
     }
