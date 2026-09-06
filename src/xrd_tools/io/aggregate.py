@@ -49,7 +49,6 @@ import h5py
 import numpy as np
 
 from .read import _decode, _frame_index, _processed, _resolve_positions
-from .schema import SCHEMA
 
 __all__ = ["Aggregated1D", "Aggregated2D", "aggregate_1d", "aggregate_2d"]
 
@@ -108,13 +107,13 @@ def _finalize(acc_sum, acc_count, method):
         return np.where(acc_count > 0, acc_sum / np.maximum(acc_count, 1), np.nan)
 
 
-def _aggregate_stack(scan_file, group_name, axis_names, *, method, frame, extra,
+def _aggregate_stack(scan_file, group_name, dimension, *, method, frame, extra,
                      norm, entry, chunk_size):
     """Shared 1D/2D engine: open once, fold the on-disk stack in label-chunks
     (deduped against the tail), then fold the in-memory tail.
 
     Returns ``(axes, units, intensity, n_frames)`` where ``axes``/``units`` are
-    tuples aligned to ``axis_names``; ``intensity`` is the reduced array (or
+    tuples in x/y order; ``intensity`` is the reduced array (or
     ``None`` for zero frames)."""
     if method not in _METHODS:
         raise ValueError(f"method must be one of {_METHODS}, got {method!r}")
@@ -126,11 +125,12 @@ def _aggregate_stack(scan_file, group_name, axis_names, *, method, frame, extra,
 
     acc_sum = acc_count = None
     n_frames = 0
-    axes: list = [None] * len(axis_names)
-    units: list = [None] * len(axis_names)
+    axes: list = [None] * dimension
+    units: list = [None] * dimension
 
     with h5py.File(Path(scan_file), "r") as f:
         processed = _processed(f, entry, container=Path(scan_file))
+        axis_names = processed.axis_names[:dimension]
         e = processed.entry
         if group_name not in e:
             raise KeyError(f"{scan_file} has no {group_name} group")
@@ -188,9 +188,8 @@ def aggregate_1d(
     divisor}`` normalizes each frame before reducing.  ``intensity`` is
     ``(n_q,)`` (or ``None`` if there are zero frames).  The on-disk stack is read
     in ``chunk_size``-frame slabs (bounded peak RAM)."""
-    (q_name,) = SCHEMA.groups["integrated_1d"].axes
     (q,), (q_unit,), intensity, n_frames = _aggregate_stack(
-        scan_file, "integrated_1d", (q_name,), method=method, frame=frame,
+        scan_file, "integrated_1d", 1, method=method, frame=frame,
         extra=extra, norm=norm, entry=entry, chunk_size=chunk_size)
     return Aggregated1D(q=q, intensity=intensity, q_unit=q_unit, n_frames=n_frames)
 
@@ -211,9 +210,8 @@ def aggregate_2d(
     display caller must transpose), or ``None`` for zero frames.  ``extra`` stacks
     are ``(labels, (n_extra, n_chi, n_q))``.  See :func:`aggregate_1d` for the
     shared ``method``/``frame``/``norm``/``chunk_size`` semantics."""
-    q_name, chi_name = SCHEMA.groups["integrated_2d"].axes
     (q, chi), (q_unit, chi_unit), intensity, n_frames = _aggregate_stack(
-        scan_file, "integrated_2d", (q_name, chi_name), method=method, frame=frame,
+        scan_file, "integrated_2d", 2, method=method, frame=frame,
         extra=extra, norm=norm, entry=entry, chunk_size=chunk_size)
     return Aggregated2D(
         q=q, chi=chi, intensity=intensity,

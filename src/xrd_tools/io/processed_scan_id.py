@@ -627,9 +627,15 @@ def upgrade_private_integrated_axes(
     """Normalize an already publisher-owned candidate, never a source file."""
     groups = require_current_processed_groups(document, entry, container=container)
     renames, attributes = neutral_axis_upgrade(groups)
+    if not renames:
+        return
+    from .record_writer import _neutral_axis_result_seals
+    seals = _neutral_axis_result_seals(document, entry, (renames, attributes))
     for path, values in attributes.items():
         for key, value in values.items():
             document[path].attrs[key] = value
     for path, new in renames.items():
         parent, old = path.rsplit("/", 1)
         document[parent].move(old, new)
+    for path, value in seals.items():
+        document[path][()] = value

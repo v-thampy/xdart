@@ -933,10 +933,26 @@ def _finite_result_dataset_blocks(
             yield value.tobytes(order="C")
 
 
+def _axis_upgrade_attribute_signature(node, name, attributes):
+    overrides = attributes.get(node.name, {})
+    if name in overrides:
+        value = overrides[name]
+        dtype = (
+            h5py.string_dtype("utf-8") if np.asarray(value).dtype.kind in "OU"
+            else np.asarray(value).dtype
+        )
+    else:
+        value = _read_replacement_attribute_value(node, name, f"{node.name}@{name}")
+        dtype = node.attrs.get_id(name).dtype
+    return _replacement_value_signature(value, dtype)
+
+
 def _finite_selected_result_digest(
     document: h5py.File,
     entry: str,
     dimension: str,
+    *,
+    axis_upgrade=None,
 ) -> str:
     if dimension not in {"1d", "2d"}:
         raise WriterStateError("finite result dimension is invalid")
@@ -947,6 +963,7 @@ def _finite_selected_result_digest(
         raise WriterStateError("finite selected result is absent or nonlocal")
     digest = hashlib.sha256(b"xrd-tools-finite-selected-result-v1\0")
     nodes = 0
+    renames, attributes = ({}, {}) if axis_upgrade is None else axis_upgrade
 
     def update(role: str, value) -> None:
         payload = json.dumps(
@@ -969,20 +986,18 @@ def _finite_selected_result_digest(
         if nodes > _FINITE_RESULT_MAX_NODES:
             raise WriterStateError("finite selected result exceeds its node bound")
         update(role, ("group", group.name))
-        for name in sorted(group.attrs):
+        for name in sorted(set(group.attrs) | set(attributes.get(group.name, {}))):
             update(
                 f"{role}@{name}",
-                _replacement_value_signature(
-                    _read_replacement_attribute_value(
-                        group, name, f"finite result {group.name}@{name}",
-                    ),
-                    group.attrs.get_id(name).dtype,
-                ),
+                _axis_upgrade_attribute_signature(group, name, attributes),
             )
-        for name in sorted(group):
+        def logical_name(name):
+            return renames.get(f"{group.name}/{name}", name)
+
+        for name in sorted(group, key=logical_name):
             link = group.get(name, getlink=True)
             child = group.get(name)
-            child_role = f"{role}/{name}"
+            child_role = f"{role}/{logical_name(name)}"
             if type(link) is not h5py.HardLink:
                 raise WriterStateError("finite selected result contains a nonlocal link")
             if isinstance(child, h5py.Group):
@@ -1010,15 +1025,10 @@ def _finite_selected_result_digest(
                     child.scaleoffset,
                 ),
             )
-            for attr in sorted(child.attrs):
+            for attr in sorted(set(child.attrs) | set(attributes.get(child.name, {}))):
                 update(
                     f"{child_role}@{attr}",
-                    _replacement_value_signature(
-                        _read_replacement_attribute_value(
-                            child, attr, f"finite result {child.name}@{attr}",
-                        ),
-                        child.attrs.get_id(attr).dtype,
-                    ),
+                    _axis_upgrade_attribute_signature(child, attr, attributes),
                 )
             for block in _finite_result_dataset_blocks(child):
                 digest.update(len(block).to_bytes(8, "big") + block)
@@ -1077,6 +1087,34 @@ def require_finite_replacement_result_seal(
     if observed != value["result_sha256"]:
         raise WriterStateError("finite selected result changed after sealing")
     return observed
+
+
+def _neutral_axis_result_seals(document, entry, axis_upgrade):
+    """Validate old seals before projecting only their renamed result digest."""
+    replacements = {}
+    if not axis_upgrade[0]:
+        return replacements
+    config = _replacement_hard_group(document, f"{entry}/reduction/config")
+    if config is None:
+        return replacements
+    for dimension in ("1d", "2d"):
+        audit_name = f"dimension_replacement_{dimension}"
+        seal_name = f"{audit_name}_result_seal"
+        if seal_name not in config:
+            continue
+        audit = _replacement_hard_group(config, audit_name, h5py.Dataset)
+        audit_text = _replacement_utf8_scalar(audit, "axis upgrade audit")
+        require_finite_replacement_result_seal(
+            document, entry=entry, dimension=dimension,
+            audit_identity=hashlib.sha256(audit_text.encode("utf-8")).hexdigest(),
+        )
+        node = config[seal_name]
+        payload = json.loads(_replacement_utf8_scalar(node, "axis upgrade seal"))
+        payload["result_sha256"] = _finite_selected_result_digest(
+            document, entry, dimension, axis_upgrade=axis_upgrade,
+        )
+        replacements[node.name] = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return replacements
 
 
 def _replacement_exclusion_paths(
@@ -1143,7 +1181,7 @@ def _replacement_manifest_digest_for(
     entry_path = "/" + "/".join(
         part for part in entry_name.split("/") if part
     )
-    renames, attributes = {}, {}
+    renames, attributes, seal_values = {}, {}, {}
     if normalize_integrated_axes and root[entry_name].attrs.get("ssrl_schema_version") == 2:
         from xrd_tools.io.processed_scan_id import (
             require_current_processed_groups, neutral_axis_upgrade,
@@ -1151,21 +1189,7 @@ def _replacement_manifest_digest_for(
         renames, attributes = neutral_axis_upgrade(
             require_current_processed_groups(root, entry_name),
         )
-
-    def attribute_signature(node, name):
-        overrides = attributes.get(node.name, {})
-        if name in overrides:
-            value = overrides[name]
-            dtype = (
-                h5py.string_dtype("utf-8") if np.asarray(value).dtype.kind in "OU"
-                else np.asarray(value).dtype
-            )
-        else:
-            value = _read_replacement_attribute_value(
-                node, name, f"replacement manifest {node.name}@{name}",
-            )
-            dtype = node.attrs.get_id(name).dtype
-        return _replacement_value_signature(value, dtype)
+        seal_values = _neutral_axis_result_seals(root, entry_name, (renames, attributes))
 
     nodes = 1
     first_roles: dict[int, str] = {}
@@ -1215,6 +1239,9 @@ def _replacement_manifest_digest_for(
         return raw
 
     def hash_dataset(dataset, role):
+        if dataset.name in seal_values:
+            update(f"{role}@data", seal_values[dataset.name].encode("utf-8"))
+            return
         if not dataset.dtype.hasobject:
             for block in _finite_result_dataset_blocks(dataset):
                 update(f"{role}@data", block)
@@ -1240,7 +1267,7 @@ def _replacement_manifest_digest_for(
                 continue
             update(
                 f"{prefix}@{name}",
-                attribute_signature(group, name),
+                _axis_upgrade_attribute_signature(group, name, attributes),
             )
         def logical_name(name):
             return renames.get(f"{group.name.rstrip('/')}/{name}", name)
@@ -1312,7 +1339,7 @@ def _replacement_manifest_digest_for(
                 for attr in sorted(set(child.attrs) | set(attributes.get(child.name, {}))):
                     update(
                         f"{role}@{attr}",
-                        attribute_signature(child, attr),
+                        _axis_upgrade_attribute_signature(child, attr, attributes),
                     )
             else:
                 raise WriterStateError(

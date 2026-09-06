@@ -32,6 +32,7 @@ def _as_v2(path):
 
 @pytest.mark.parametrize("gi", [False, True])
 def test_previous_axes_read_without_mutation_and_append_refuses(tmp_path, gi):
+    from xrd_tools.io.aggregate import aggregate_1d, aggregate_2d
     from xrd_tools.io.read import get_1d, get_2d, open_scan
     from xrd_tools.io.nexus import open_nexus_writer
     from xrd_tools.io.nexus_inspect import inspect_nexus
@@ -68,6 +69,8 @@ def test_previous_axes_read_without_mutation_and_append_refuses(tmp_path, gi):
     np.testing.assert_array_equal(scan.get_1d(2).intensity, x + 2)
     inspected = inspect_nexus(path).xdart
     assert [axis.name for axis in inspected.integrated_2d.axes] == ["q", "chi"]
+    np.testing.assert_array_equal(aggregate_1d(path).intensity, x + 3.5)
+    np.testing.assert_array_equal(aggregate_2d(path).intensity, (cake + 3.5).T)
     with h5py.File(path, "r") as handle:
         with pytest.raises(ValueError, match="read-only.*v2"):
             require_current_writable_processed_groups(handle)
@@ -93,6 +96,12 @@ def test_old_axis_support_does_not_guess_unknown_schema(tmp_path, version):
 @pytest.mark.parametrize("dimension", ["1d", "2d"])
 @pytest.mark.parametrize("prepared", [False, True])
 def test_v2_reintegrate_only_normalizes_private_candidate(tmp_path, monkeypatch, dimension, prepared):
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+    from xrd_tools.io.record_writer import (
+        _finite_selected_result_digest, require_finite_replacement_result_seal,
+    )
     from tests.core.test_reintegrate_immutable_successor import (
         _seed_existing, _stub_integrators, _plan, _prepared_plan, _prepared_eligible_source,
     )
@@ -102,12 +111,25 @@ def test_v2_reintegrate_only_normalizes_private_candidate(tmp_path, monkeypatch,
     seeded = _seed_existing(tmp_path, labels=(2, 5))
     if prepared:
         _prepared_eligible_source(seeded)
-    _as_v2(seeded.target)
-    before, raw_before = seeded.target.read_bytes(), seeded.source.read_bytes()
     other = "2d" if dimension == "1d" else "1d"
+    _stub_integrators(monkeypatch)
+    first = run_reintegrate_successor(_plan(seeded, dimension=other, expected_terminal=None))
+    assert first.disposition == "COMMITTED"
+    seeded = SimpleNamespace(**{**vars(seeded), "target": Path(first.output_artifact)})
+    _as_v2(seeded.target)
+    # Recreate the previous layout's seal using the real first operation's audit.
+    with h5py.File(seeded.target, "r+") as handle:
+        config = handle["entry/reduction/config"]
+        seal = config[f"dimension_replacement_{other}_result_seal"]
+        payload = json.loads(seal.asstr()[()])
+        audit_identity = payload["audit_identity"]
+        payload["result_sha256"] = _finite_selected_result_digest(handle, "entry", other)
+        seal[()] = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        require_finite_replacement_result_seal(handle, entry="entry", dimension=other,
+                                               audit_identity=audit_identity)
+    before, raw_before = seeded.target.read_bytes(), seeded.source.read_bytes()
     with h5py.File(seeded.target, "r") as handle:
         preserved = handle[f"entry/integrated_{other}/intensity"][()]
-    _stub_integrators(monkeypatch)
     if prepared:
         offer = prepare_reintegrate_bundle(capture_finite_source(seeded.target),
                   entry="entry", labels=seeded.labels, source_root=str(seeded.target.parent))
@@ -125,6 +147,8 @@ def test_v2_reintegrate_only_normalizes_private_candidate(tmp_path, monkeypatch,
             assert "axis_x" in group and "q" not in group and "chi" not in group
             assert "long_name" in group["axis_x"].attrs
         np.testing.assert_array_equal(handle[f"entry/integrated_{other}/intensity"], preserved)
+        require_finite_replacement_result_seal(handle, entry="entry", dimension=other,
+                                               audit_identity=audit_identity)
     assert read_frame_view(result.output_artifact, 5, include_thumbnail=False).intensity_1d is not None
 
 
@@ -159,6 +183,58 @@ def test_v2_preservation_normalizes_only_approved_deltas(tmp_path, damage):
             handle["entry"].attrs["unrelated"] = "changed"
         assert signature(handle) != expected
     assert source.read_bytes() == before
+
+
+@pytest.mark.parametrize("damage", [None, "intensity", "seal", "audit"])
+def test_v2_axis_conversion_verifies_existing_seal_before_resealing(tmp_path, damage):
+    import hashlib
+    import json
+    from xrd_tools.io.processed_scan_id import upgrade_private_integrated_axes
+    from xrd_tools.io.record_writer import (
+        WriterStateError, _finite_selected_result_digest, _replacement_manifest_digest_for,
+        require_finite_replacement_result_seal,
+    )
+
+    path = tmp_path / "private.nexus"
+    x = np.arange(5)
+    write_nexus(path, results_1d={1: IntegrationResult1D(x, x)})
+    _as_v2(path)
+    identity = hashlib.sha256(b"{}").hexdigest()
+    with h5py.File(path, "r+") as handle:
+        config = handle["entry"].require_group("reduction/config")
+        config.create_dataset("dimension_replacement_1d", data="{}")
+        payload = {
+            "schema": "xrd_tools.finite_replacement_result_seal", "version": 1,
+            "dimension": "1d", "audit_identity": identity,
+            "result_sha256": _finite_selected_result_digest(handle, "entry", "1d"),
+        }
+        if damage == "seal":
+            payload["result_sha256"] = "0" * 64
+        seal = config.create_dataset("dimension_replacement_1d_result_seal",
+                    data=json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        if damage == "intensity":
+            handle["entry/integrated_1d/intensity"][0, 0] += 1
+        elif damage == "audit":
+            config["dimension_replacement_1d"][()] = '{"changed":true}'
+        def signature():
+            return _replacement_manifest_digest_for(handle, "entry", (),
+                ignore_source_base=False, ignore_file_name=False, normalize_integrated_axes=True)
+        if damage is not None:
+            with pytest.raises(WriterStateError, match="seal|sealing"):
+                signature()
+            with pytest.raises(WriterStateError, match="seal|sealing"):
+                upgrade_private_integrated_axes(handle, "entry", container=path)
+            assert handle["entry"].attrs["ssrl_schema_version"] == 2
+            assert "q" in handle["entry/integrated_1d"]
+        else:
+            expected = signature()
+            upgrade_private_integrated_axes(handle, "entry", container=path)
+            require_finite_replacement_result_seal(handle, entry="entry", dimension="1d",
+                                                   audit_identity=identity)
+            assert signature() == expected
+            payload["result_sha256"] = "0" * 64
+            seal[()] = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            assert signature() != expected
 
 
 @pytest.mark.parametrize("damage", ["mixed_names", "wrong_axes", "missing_axis"])
