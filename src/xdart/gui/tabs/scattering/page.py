@@ -2426,7 +2426,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             self._refresh_shell(); return
         self._notice(
-            f"Reintegrating {dimension[0]}-D into a new immutable version…"
+            f"Reintegrating {dimension[0]}-D into a replacement candidate…"
         ); self._refresh_shell(); self._ensure_timer()
 
     def _consume_reintegrate_update(

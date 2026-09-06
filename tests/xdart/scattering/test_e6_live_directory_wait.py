@@ -338,10 +338,12 @@ def test_live_probe_to_strong_freeze_never_mixes_candidate_revisions(
     assert released.cleanup_status is CleanupStatus.CLEANED
 
 
-def test_live_hdf_inventory_initial_capture_disappearance_is_typed_pending(
+def test_live_hdf_initial_capture_disappearance_is_typed_pending(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
+    from xrd_tools.io.output_transaction import get_output_transaction_coordinator
+
     raw = tmp_path / "raw"
     raw.mkdir()
     master = raw / "capture-race.h5"
@@ -351,19 +353,22 @@ def test_live_hdf_inventory_initial_capture_disappearance_is_typed_pending(
         DirectorySourceSpec(raw, suffixes=(".h5",), metadata_format=None),
         request_value=998,
     )
-    inventory = output_preflight._external_link_inventory
+    capture = output_preflight._capture_exact_candidate_state
+    coordinator = get_output_transaction_coordinator()
+    prior_leases = dict(coordinator._leases)
     changed = False
 
-    def disappear_before_inventory(candidate, *, cancelled, **kwargs):
+    def disappear_before_capture(candidate):
         nonlocal changed
-        master.unlink()
-        changed = True
-        return inventory(candidate, cancelled=cancelled, **kwargs)
+        if candidate.path == master and not changed:
+            master.unlink()
+            changed = True
+        return capture(candidate)
 
     monkeypatch.setattr(
         output_preflight,
-        "_external_link_inventory",
-        disappear_before_inventory,
+        "_capture_exact_candidate_state",
+        disappear_before_capture,
     )
     try:
         attempt = output_preflight.materialize_live_directory_group(
@@ -377,7 +382,7 @@ def test_live_hdf_inventory_initial_capture_disappearance_is_typed_pending(
         assert attempt.state is ProbeState.IN_PROGRESS
         assert attempt.revision_changed is True
         assert attempt.decision is None
-        assert operation.target_lease is None
+        assert coordinator._leases == prior_leases
     finally:
         released = executor.cancel_admission(operation.token)
     assert released.cleanup_status is CleanupStatus.CLEANED

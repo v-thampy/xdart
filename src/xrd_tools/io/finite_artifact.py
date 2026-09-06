@@ -1,10 +1,11 @@
-"""Immutable finite-artifact naming, candidate ownership, and publication.
+"""Finite-artifact identity, candidate ownership, and stable-slot publication.
 
 Finite operations never open an existing public artifact for writing.  This
 module owns one smaller protocol: build and validate a same-directory private
-file, atomically link it to an absent public ``.nexus`` name, and never remove
-that public name after publication is observable.  Append/Live continuity is
-deliberately outside this module.
+file, atomically replace the public operation-specific ``.nexus`` slot, and
+never remove that public name after publication is observable. The prior slot
+stays visible until replacement. Content identities do not imply versioned
+filenames. Append/Live continuity is deliberately outside this module.
 
 Document adapters are trusted in-process repository code, not a Python
 sandbox boundary.  They must use only the supplied public file-object methods

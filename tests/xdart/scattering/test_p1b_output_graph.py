@@ -2783,13 +2783,18 @@ def test_post_g2_unsafe_unfunded_staging_accepts_exact_eiger(
         )
 
 
+@pytest.mark.parametrize("save_xye", (False, True))
+@pytest.mark.parametrize("durable_fsync", (False, True))
 def test_post_g2_output_diagnostics_disable_only_xye_and_fsync(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog,
+    save_xye: bool,
+    durable_fsync: bool,
 ) -> None:
     from xdart.gui.tabs.scattering.adapters import dynamic_output
     from xrd_tools.io import output_transaction
+    from xrd_tools.reduction import NexusSink
 
     raw = tmp_path / "diagnostics_0001.tif"
     target = tmp_path / "diagnostics.nexus"
@@ -2806,8 +2811,8 @@ def test_post_g2_output_diagnostics_disable_only_xye_and_fsync(
         "staging_frame_cap": 64,
     }
     intent.run_options["_post_g2_output_diagnostics_v1"] = {
-        "save_xye": False,
-        "durable_fsync": False,
+        "save_xye": save_xye,
+        "durable_fsync": durable_fsync,
     }
     resolve = dynamic_output.resolve_session_policy
     open_session = dynamic_output.open_headless_scan_session
@@ -2820,7 +2825,7 @@ def test_post_g2_output_diagnostics_disable_only_xye_and_fsync(
     def capture_session(*args, **kwargs):
         sink = kwargs["sink"]
         children = getattr(sink, "output_sink_children", (sink,))
-        (nexus,) = tuple(children)
+        (nexus,) = tuple(child for child in children if isinstance(child, NexusSink))
         session = open_session(*args, **kwargs)
         observed.append((
             tuple(type(child).__name__ for child in children),
@@ -2845,22 +2850,73 @@ def test_post_g2_output_diagnostics_disable_only_xye_and_fsync(
         terminal = next(event for event in events if event.kind in _TERMINAL)
         assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
         assert _nexus_rows(_written(target)) == (1,)
-        assert tuple(tmp_path.rglob("*.xye")) == ()
+        assert len(tuple(tmp_path.rglob("*.xye"))) == int(save_xye)
         assert len(observed) == 1
-        child_names, durable_fsync, nexus = observed[0]
-        assert child_names == ("NexusSink",)
-        assert durable_fsync is False
-        assert nexus._transaction._durable_fsync is False
-        assert fsync_calls == []
+        child_names, observed_fsync, nexus = observed[0]
+        assert set(child_names) == (
+            {"NexusSink", "TransactionalXYESink"} if save_xye else {"NexusSink"}
+        )
+        assert observed_fsync is durable_fsync
+        assert nexus._transaction._durable_fsync is durable_fsync
+        assert bool(fsync_calls) is durable_fsync
         assert [
             record.getMessage() for record in caplog.records
             if record.getMessage().startswith("[RUN-OUTPUT-DIAGNOSTICS]")
         ] == [
-            "[RUN-OUTPUT-DIAGNOSTICS] save-xye=off durable-fsync=off "
-            "durability=UNSAFE_SIMULATED"
+            f"[RUN-OUTPUT-DIAGNOSTICS] save-xye={'on' if save_xye else 'off'} "
+            f"durable-fsync={'on' if durable_fsync else 'off'} "
+            f"durability={'DURABLE' if durable_fsync else 'UNSAFE_SIMULATED'}"
         ]
     finally:
         executor.close(identity)
+
+
+def test_no_xye_terminal_verification_failure_is_not_finished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+    from xrd_tools.io.record_writer import NexusRecordWriter
+
+    raw = tmp_path / "verification_0001.tif"
+    target = tmp_path / "verification.nexus"
+    poni = tmp_path / "verification.poni"
+    _write_tiff(raw, 7)
+    write_poni(poni)
+    original_raw = raw.read_bytes()
+    intent = _intent(raw, target, poni)
+    intent.run_options["_post_g2_output_diagnostics_v1"] = {
+        "save_xye": False, "durable_fsync": True,
+    }
+    calls = []
+    sessions = []
+    verify = NexusRecordWriter._verify_fast_integrated_results
+    open_session = dynamic_output.open_headless_scan_session
+
+    def fail_once(writer):
+        calls.append(writer)
+        if len(calls) == 1:
+            raise OSError("injected terminal science readback failure")
+        return verify(writer)
+
+    def capture_session(*args, **kwargs):
+        session = open_session(*args, **kwargs)
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(NexusRecordWriter, "_verify_fast_integrated_results", fail_once)
+    monkeypatch.setattr(dynamic_output, "open_headless_scan_session", capture_session)
+    executor, identity, events = _run_to_terminal(intent, request_value=1712)
+    try:
+        assert calls, "the terminal verification fault must actually execute"
+        assert len(sessions) == 1
+        terminal = next(event for event in events if event.kind in _TERMINAL)
+        assert terminal.kind is StandardEventKind.FAILED, terminal.detail
+        assert "injected terminal science readback failure" in str(terminal)
+        assert not sessions[0]._dynamic_accounting.snapshot().durable
+        assert not _written(target).exists()
+        assert raw.read_bytes() == original_raw
+    finally:
+        assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
 
 
 def test_p1b_b18_headless_and_single_owner_census(tmp_path: Path) -> None:

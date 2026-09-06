@@ -541,24 +541,15 @@ def test_prestamp_exact_cancellation_skips_failure_classification(
         ),
         request_value=12030,
     )
-    _install_post_discovery_failure(
+    fired = _install_post_discovery_failure(
         monkeypatch,
         dependency_kind="external_link",
         alias=alias,
         action=lambda: None,
         exception_factory=lambda: RuntimeError("admission cancelled"),
     )
-
-    def forbidden_classifier(*_args, **_kwargs):
-        raise AssertionError("exact cancellation reached failure classification")
-
-    monkeypatch.setattr(
-        output_preflight,
-        "_classify_inventory_failure",
-        forbidden_classifier,
-    )
     try:
-        with pytest.raises(RuntimeError, match="admission cancelled"):
+        with pytest.raises(RuntimeError, match="admission cancelled") as caught:
             output_preflight.materialize_live_directory_group(
                 receipt,
                 intent.freeze(),
@@ -566,6 +557,8 @@ def test_prestamp_exact_cancellation_skips_failure_classification(
                 group,
                 cancelled=lambda: False,
             )
+        assert fired == [True]
+        assert caught.value.args == ("admission cancelled",)
     finally:
         released = executor.cancel_admission(operation.token)
     assert released.cleanup_status is CleanupStatus.CLEANED

@@ -1470,9 +1470,13 @@ class ScanSession:
             try:
                 self._event_sink.flush(force=True)
                 if _cancel_requested(self._session.cancel_token) and (self._dynamic_nexus_sink is None or self._dynamic_nexus_sink._transaction is None or not self._dynamic_nexus_sink._transaction.snapshot().writer_succeeded): stopped = True; result = replace(result, cancelled=True); self._dynamic_frozen_result = result
-                self._dynamic_finish_seal = boundary.prepare_session_finish(
-                    self, owner, stopped=stopped,
-                )
+                # Completed arithmetic can still await the writer's terminal
+                # readback and receipts. Reject unfinished attempts here, but
+                # seal FINISHED only after settling the sink (as with XYE).
+                if not stopped and self._dynamic_has_unresolved_attempt():
+                    raise RuntimeError(
+                        "session finish cannot abandon unresolved dynamic work"
+                    )
             except BaseException as error:
                 result = self._mark_dynamic_failure(error)
                 failed = True
@@ -1481,8 +1485,11 @@ class ScanSession:
         if failed:
             value = self._settle_dynamic_graph(result, failed=True)
             if value is not None and value.disposition is NexusTerminalDisposition.COMMITTED:
+                self._promote_dynamic_terminal_nexus(value)
                 if self._dynamic_finish_seal is None:
-                    raise RuntimeError("committed dynamic failure has no finish seal")
+                    self._dynamic_finish_seal = boundary.prepare_session_finish(
+                        self, owner, stopped=stopped,
+                    )
                 boundary.session_finished(
                     self, owner, self._dynamic_finish_seal, value.commit_identity,
                 )
@@ -1496,6 +1503,18 @@ class ScanSession:
             self._dynamic_terminal_settled = True
         else:
             value = self._settle_dynamic_graph(result, failed=False)
+            self._promote_dynamic_terminal_nexus(value)
+            if (
+                self._dynamic_finish_seal is None
+                and (
+                    value is None
+                    or value.disposition is NexusTerminalDisposition.COMMITTED
+                    or stopped
+                )
+            ):
+                self._dynamic_finish_seal = boundary.prepare_session_finish(
+                    self, owner, stopped=stopped,
+                )
             if value is None:
                 if stopped:
                     boundary.session_stopped(

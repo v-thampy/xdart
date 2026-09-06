@@ -564,15 +564,8 @@ def test_external_storage_capture_classifier_has_one_ast_owner() -> None:
         for node in top_level
         if node.name == "_extend_hdf5_dataset_dependency_paths"
     ]
-    wrapper_defs = [
-        node
-        for node in top_level
-        if node.name == "_hdf5_dataset_dependency_paths"
-    ]
     assert len(extend_defs) == 1
-    assert len(wrapper_defs) == 1
     extend = extend_defs[0]
-    wrapper = wrapper_defs[0]
 
     remember_calls = [
         node
@@ -645,53 +638,6 @@ def test_external_storage_capture_classifier_has_one_ast_owner() -> None:
     assert len(capture_raises) == 1
     assert owners[landing_raises[0]] is extend
     assert owners[capture_raises[0]] is extend
-
-    wrapper_handlers = [
-        node
-        for node in ast.walk(wrapper)
-        if isinstance(node, ast.ExceptHandler) and owners[node] is wrapper
-    ]
-    assert not any(
-        caught_name(handler) in {"FileNotFoundError", "OSError"}
-        and any(
-            isinstance(node, ast.Raise)
-            and isinstance(node.exc, ast.Call)
-            and called_name(node.exc) == "SourceRevisionChanged"
-            for node in ast.walk(handler)
-        )
-        for handler in wrapper_handlers
-    )
-    assert not any(
-        isinstance(node, ast.Constant)
-        and node.value in {landing_prefix, capture_prefix}
-        and owners[node] is wrapper
-        for node in ast.walk(wrapper)
-    )
-
-    wrapper_calls = [
-        node
-        for node in ast.walk(wrapper)
-        if isinstance(node, ast.Call)
-        and called_name(node) == "_extend_hdf5_dataset_dependency_paths"
-        and owners[node] is wrapper
-    ]
-    assert len(wrapper_calls) == 1
-    wrapper_call = wrapper_calls[0]
-    current = wrapper_call
-    while current in parents and parents[current] is not wrapper:
-        current = parents[current]
-        assert not isinstance(current, ast.Try)
-    keywords = {keyword.arg: keyword.value for keyword in wrapper_call.keywords}
-    assert sum(keyword.arg == "cancelled" for keyword in wrapper_call.keywords) == 1
-    assert sum(keyword.arg == "required" for keyword in wrapper_call.keywords) == 1
-    assert sum(keyword.arg == "states" for keyword in wrapper_call.keywords) == 1
-    assert isinstance(keywords["cancelled"], ast.Name)
-    assert keywords["cancelled"].id == "cancelled"
-    assert isinstance(keywords["required"], ast.Name)
-    assert keywords["required"].id == "required"
-    assert isinstance(keywords["states"], ast.Name)
-    assert keywords["states"].id == "accepted_states"
-
 
 @pytest.mark.parametrize("layout", _HDF_LAYOUTS)
 def test_unchanged_missing_dependency_object_is_stable_value_error(

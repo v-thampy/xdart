@@ -1,10 +1,11 @@
-"""Immutable-successor reintegration.
+"""Reintegration through a validated candidate and stable operation slot.
 
 This additive v4 API never opens its source artifact for writing.  It qualifies
 the existing scientific recipe, builds one publisher-owned private HDF5 copy,
-and publishes a distinct ``.nexus`` successor only after bounded reduction and
-semantic validation complete.  The v3 in-place API remains a disjoint control
-until the GUI switches atomically in the next lane.
+and publishes the operation-specific ``.nexus`` slot only after bounded
+reduction and semantic validation complete. The GUI uses this path. The older
+in-place module still supplies shared scientific/source helpers; it cannot be
+removed wholesale until those dependencies have been extracted.
 """
 
 from __future__ import annotations

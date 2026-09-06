@@ -362,10 +362,6 @@ def test_standard_directory_dependency_inventory_does_not_walk_whole_hdf5_tree(
         unexpected_walk,
         raising=False,
     )
-    monkeypatch.setattr(
-        "xdart.gui.tabs.scattering.output_preflight._scan_all_external_links",
-        unexpected_walk,
-    )
     request = RequestId(719)
     sessions: list[DirectoryIndexSession] = []
     receipt = prepare_output(
@@ -1359,7 +1355,7 @@ def test_selected_vds_refuses_existing_file_with_missing_dataset(
             session.close()
 
 
-def test_dependency_graph_state_cannot_rebaseline_after_inventory(
+def test_dependency_graph_state_cannot_rebaseline_after_jit_freeze(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1408,39 +1404,39 @@ def test_dependency_graph_state_cannot_rebaseline_after_inventory(
         output_mode="Overwrite",
     )).snapshot()
     request = RequestId(733)
-    original_inventory = output_preflight._external_link_inventory
+    original_items = output_preflight._directory_items
     mutated = False
 
-    def racing_inventory(candidate, *, cancelled, **kwargs):
+    def racing_items(configuration, plan, *, cancelled):
         nonlocal mutated
-        result = original_inventory(
-            candidate,
-            cancelled=cancelled,
-            **kwargs,
-        )
-        if candidate.path == master and not mutated:
+        result = original_items(configuration, plan, cancelled=cancelled)
+        graph = output_preflight._prepared_source_execution(result[0])
+        assert str(sidecar.resolve()) in {
+            target.resolved_path for target in graph.stamp.canonical_targets
+        }
+        if not mutated:
             mutated = True
             write_sidecar(second)
         return result
 
     monkeypatch.setattr(
         output_preflight,
-        "_external_link_inventory",
-        racing_inventory,
+        "_directory_items",
+        racing_items,
     )
     sessions: list[DirectoryIndexSession] = []
     try:
-        with pytest.raises(ValueError, match="changed during admission"):
-            prepare_output(
-                StartCapture(
-                    request,
-                    1,
-                    snapshot,
-                    SourceCapture(request, 1, source),
-                ),
+        receipt = prepare_output(
+            StartCapture(request, 1, snapshot, SourceCapture(request, 1, source)),
+            cancelled=lambda: False,
+            session_owner=sessions.append,
+        )
+        with pytest.raises(SourceRevisionChanged, match="source target changed after admission"):
+            materialize_deferred_output(
+                receipt, sessions[0], receipt.deferred_directory.entries[0],
                 cancelled=lambda: False,
-                session_owner=sessions.append,
             )
+        assert mutated is True
     finally:
         for session in sessions:
             session.close()

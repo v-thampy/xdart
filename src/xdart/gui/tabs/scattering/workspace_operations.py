@@ -573,7 +573,7 @@ class WorkspaceOperationOwner:
         if update.stale or state.owner_abandoned:
             return WorkspaceOperationTransition(
                 WorkspaceRefreshEffect.CONTROLS,
-                f"Reintegrate {shown} published a new version after its "
+                f"Reintegrate {shown} published its result after its "
                 "display owner changed; it was cataloged without switching."
                 f"{_reintegrate_result_notice_suffix(result)}",
                 request_catalog=True,
@@ -598,9 +598,9 @@ class WorkspaceOperationOwner:
         # its consumers are retired with the rest of the dead reuse machinery
         # (item 7), not mid-packet.
         action = (
-            "replaced the existing version"
+            "reused the existing result"
             if result.disposition == "ALREADY_COMMITTED"
-            else "published a new version"
+            else "published its result"
         )
         return WorkspaceOperationTransition(
             WorkspaceRefreshEffect.CONTROLS,
