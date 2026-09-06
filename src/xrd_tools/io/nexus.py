@@ -74,6 +74,7 @@ from xrd_tools.io.schema import (
     SCHEMA_NAME_ATTR,
     SCHEMA_VERSION_ATTR,
     canonical_gi_mode_key,
+    axis_display_metadata,
     local_hard_dataset,
     local_hard_group_path,
     mode_subgroup_name,
@@ -2000,8 +2001,8 @@ def _append_stacked_1d(
         )
         g.create_dataset("intensity", data=intensity[None, :],
                          maxshape=(None, n_q), chunks=(1, n_q), **comp_kwargs)
-        qd = g.create_dataset("q", data=np.asarray(r.radial, dtype=np.float32))
-        qd.attrs["units"] = r.unit
+        qd = g.create_dataset("axis_x", data=np.asarray(r.radial, dtype=np.float32))
+        qd.attrs.update(axis_display_metadata(r.unit))
         g.create_dataset("frame_index", data=np.asarray([idx], dtype=np.int64),
                          maxshape=(None,), chunks=(64,))
         axis_kind = _axis_kind_1d(r.unit)
@@ -2169,10 +2170,10 @@ def _append_stacked_2d(
         g.create_dataset("intensity", data=intensity[None],
                          maxshape=(None, n_chi, n_q),
                          chunks=(1, n_chi, n_q), **comp_kwargs)
-        qd = g.create_dataset("q", data=np.asarray(r.radial, dtype=np.float32))
-        qd.attrs["units"] = r.unit
-        cd = g.create_dataset("chi", data=np.asarray(r.azimuthal, dtype=np.float32))
-        cd.attrs["units"] = r.azimuthal_unit
+        qd = g.create_dataset("axis_x", data=np.asarray(r.radial, dtype=np.float32))
+        qd.attrs.update(axis_display_metadata(r.unit))
+        cd = g.create_dataset("axis_y", data=np.asarray(r.azimuthal, dtype=np.float32))
+        cd.attrs.update(axis_display_metadata(r.azimuthal_unit))
         g.create_dataset("frame_index", data=np.asarray([idx], dtype=np.int64),
                          maxshape=(None,), chunks=(64,))
         g.attrs[MONOTONIC_ATTR] = True
@@ -2461,7 +2462,7 @@ def validate_integrated_stack_write(
             role=group_name_1d,
         )
         if g is not None:
-            for dataset_name in ("frame_index", "intensity", "q"):
+            for dataset_name in ("frame_index", "intensity", "axis_x"):
                 if local_hard_dataset(
                     g,
                     dataset_name,
@@ -2496,7 +2497,7 @@ def validate_integrated_stack_write(
             role=group_name_2d,
         )
         if g is not None:
-            for dataset_name in ("frame_index", "intensity", "q", "chi"):
+            for dataset_name in ("frame_index", "intensity", "axis_x", "axis_y"):
                 if local_hard_dataset(
                     g,
                     dataset_name,
@@ -3046,8 +3047,8 @@ def write_integrated_stack(
             np.stack([np.asarray(r.intensity, np.float32) for r in results]),
             ck=ck, row_chunk=(rows, n_q),
         )
-        qd = _schema_dataset(g, "integrated_1d", "q", r0.radial, ck=ck)
-        qd.attrs["units"] = r0.unit            # units_from="radial_unit"
+        qd = _schema_dataset(g, "integrated_1d", "axis_x", r0.radial, ck=ck)
+        qd.attrs.update(axis_display_metadata(r0.unit))
         _schema_dataset(g, "integrated_1d", "frame_index", fis_, ck=ck)
         axis_kind = _axis_kind_1d(r0.unit)
         if axis_kind != "radial":
@@ -3086,10 +3087,10 @@ def write_integrated_stack(
         ).value
         _schema_dataset(g, "integrated_2d", "intensity", stacked,
                         ck=ck, row_chunk=(rows_2d, n_chi, n_q))
-        qd = _schema_dataset(g, "integrated_2d", "q", r0.radial, ck=ck)
-        qd.attrs["units"] = r0.unit            # units_from="radial_unit"
-        cd = _schema_dataset(g, "integrated_2d", "chi", r0.azimuthal, ck=ck)
-        cd.attrs["units"] = r0.azimuthal_unit  # units_from="azimuthal_unit"
+        qd = _schema_dataset(g, "integrated_2d", "axis_x", r0.radial, ck=ck)
+        qd.attrs.update(axis_display_metadata(r0.unit))
+        cd = _schema_dataset(g, "integrated_2d", "axis_y", r0.azimuthal, ck=ck)
+        cd.attrs.update(axis_display_metadata(r0.azimuthal_unit))
         _schema_dataset(g, "integrated_2d", "frame_index", fis_, ck=ck)
         g.attrs[MONOTONIC_ATTR] = bool(
             len(fis_) < 2 or np.all(np.diff(fis_) > 0)
@@ -5094,8 +5095,8 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
                 ("frame", "q"),
                 np.asarray(g1["intensity"][()]),
             )
-            coords["q"] = np.asarray(g1["q"][()])
-            u = g1["q"].attrs.get("units", None)
+            coords["q"] = np.asarray(g1["axis_x"][()])
+            u = g1["axis_x"].attrs.get("units", None)
             if u is not None:
                 attrs_per_coord["q"] = {"units": _v2_decode_str(u)}
             if "sigma" in g1:
@@ -5147,10 +5148,10 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
                     g2.attrs.get(
                         "two_d_kind",
                         two_d_kind_from_units(
-                            _v2_decode_str(g2["q"].attrs.get("units", ""))
-                            if "q" in g2 else "",
-                            _v2_decode_str(g2["chi"].attrs.get("units", ""))
-                            if "chi" in g2 else "",
+                            _v2_decode_str(g2["axis_x"].attrs.get("units", ""))
+                            if "axis_x" in g2 else "",
+                            _v2_decode_str(g2["axis_y"].attrs.get("units", ""))
+                            if "axis_y" in g2 else "",
                         ).value,
                     )
                 )
@@ -5160,12 +5161,12 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
                     (frame_dim, "chi", "q_2d"),
                     np.asarray(g2["sigma"][()]),
                 )
-            coords["q_2d"] = np.asarray(g2["q"][()])
-            u_q2 = g2["q"].attrs.get("units", None)
+            coords["q_2d"] = np.asarray(g2["axis_x"][()])
+            u_q2 = g2["axis_x"].attrs.get("units", None)
             if u_q2 is not None:
                 attrs_per_coord["q_2d"] = {"units": _v2_decode_str(u_q2)}
-            coords["chi"] = np.asarray(g2["chi"][()])
-            u = g2["chi"].attrs.get("units", None)
+            coords["chi"] = np.asarray(g2["axis_y"][()])
+            u = g2["axis_y"].attrs.get("units", None)
             if u is not None:
                 attrs_per_coord["chi"] = {"units": _v2_decode_str(u)}
 
@@ -5320,20 +5321,20 @@ def read_scan_metadata(
                 coords["frame_2d"] = f2
 
         # q / chi axes (small).
-        if g1 is not None and "q" in g1:
-            coords["q"] = np.asarray(g1["q"][()])
-            u = g1["q"].attrs.get("units", None)
+        if g1 is not None and "axis_x" in g1:
+            coords["q"] = np.asarray(g1["axis_x"][()])
+            u = g1["axis_x"].attrs.get("units", None)
             if u is not None:
                 attrs_per_coord["q"] = {"units": _v2_decode_str(u)}
         if g2 is not None:
-            if "q" in g2:
-                coords["q_2d"] = np.asarray(g2["q"][()])
-                u_q2 = g2["q"].attrs.get("units", None)
+            if "axis_x" in g2:
+                coords["q_2d"] = np.asarray(g2["axis_x"][()])
+                u_q2 = g2["axis_x"].attrs.get("units", None)
                 if u_q2 is not None:
                     attrs_per_coord["q_2d"] = {"units": _v2_decode_str(u_q2)}
-            if "chi" in g2:
-                coords["chi"] = np.asarray(g2["chi"][()])
-                u = g2["chi"].attrs.get("units", None)
+            if "axis_y" in g2:
+                coords["chi"] = np.asarray(g2["axis_y"][()])
+                u = g2["axis_y"].attrs.get("units", None)
                 if u is not None:
                     attrs_per_coord["chi"] = {"units": _v2_decode_str(u)}
 

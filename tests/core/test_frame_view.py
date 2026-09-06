@@ -218,7 +218,7 @@ def test_frame_view_reader_caches_scan_data_columns_per_open(tmp_path):
     ("case", "node_name", "message"),
     (
         ("inventory", "/entry/integrated_1d/frame_index", "current xdart"),
-        ("axis", "/entry/integrated_1d/q", "current xdart"),
+        ("axis", "/entry/integrated_1d/axis_x", "current xdart"),
         ("scan_data", "/entry/scan_data/oversized", "columns exceed"),
         ("row_1d", "/entry/integrated_1d/intensity", "current xdart"),
         ("row_2d", "/entry/integrated_2d/intensity", "current xdart"),
@@ -251,8 +251,8 @@ def test_frame_view_refuses_malformed_or_oversized_nodes_before_getitem(
             )
         elif case == "axis":
             group = entry["integrated_1d"]
-            del group["q"]
-            group.create_dataset("q", shape=(1_000_001,), dtype=np.float64, chunks=(64,))
+            del group["axis_x"]
+            group.create_dataset("axis_x", shape=(1_000_001,), dtype=np.float64, chunks=(64,))
         elif case == "scan_data":
             scan_data.create_dataset(
                 "oversized", shape=(1,), dtype="S67108865", chunks=(1,),
@@ -316,7 +316,7 @@ def test_frame_view_bounds_source_path_and_text_attributes_without_getitem(
 
     with h5py.File(path, "r+") as handle:
         del handle["entry/frames/frame_0005/source/path"]
-        handle["entry/integrated_1d/q"].attrs["units"] = "u" * 257
+        handle["entry/integrated_1d/axis_x"].attrs["units"] = "u" * 257
     with pytest.raises(ValueError, match="text byte ceiling"):
         with FrameViewReader(path):
             pass
@@ -526,9 +526,9 @@ def test_frame_view_rejects_external_scientific_ancestry(tmp_path, node):
                     str(foreign), "/entry/integrated_1d/q_ip",
                 )
             else:
-                del entry["integrated_1d/q"]
-                entry["integrated_1d"]["q"] = h5py.ExternalLink(
-                    str(foreign), "/entry/integrated_1d/q",
+                del entry["integrated_1d/axis_x"]
+                entry["integrated_1d"]["axis_x"] = h5py.ExternalLink(
+                    str(foreign), "/entry/integrated_1d/axis_x",
                 )
 
     with pytest.raises(

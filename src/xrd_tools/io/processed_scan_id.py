@@ -252,12 +252,12 @@ def require_current_output_path(path: str | Path) -> Path:
 
 
 def _valid_current_result_group(group: h5py.Group, name: str) -> bool:
-    """Qualify one concrete v2 integrated stack, not a name-only marker."""
+    """Qualify one concrete v3 integrated stack, not a name-only marker."""
     try:
         expected_axes = (
-            ("frame_index", "q")
+            ("frame_index", "axis_x")
             if name == "integrated_1d"
-            else ("frame_index", "chi", "q")
+            else ("frame_index", "axis_y", "axis_x")
         )
         axes = group.attrs.get("axes")
         if isinstance(axes, np.ndarray):
@@ -274,8 +274,8 @@ def _valid_current_result_group(group: h5py.Group, name: str) -> bool:
             return False
         labels = _direct_dataset(group, "frame_index")
         intensity = _direct_dataset(group, "intensity")
-        q = _direct_dataset(group, "q")
-        chi = None if name == "integrated_1d" else _direct_dataset(group, "chi")
+        q = _direct_dataset(group, "axis_x")
+        chi = None if name == "integrated_1d" else _direct_dataset(group, "axis_y")
         if (
             labels is None
             or intensity is None

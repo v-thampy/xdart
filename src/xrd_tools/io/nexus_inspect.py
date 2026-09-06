@@ -392,7 +392,7 @@ def _reduced_summary(e: h5py.Group, name: str) -> NexusReducedSummary | None:
 
 
 def _axis_summaries(group: h5py.Group, group_name: str) -> list[NexusAxisSummary]:
-    candidates = ("q",) if group_name == "integrated_1d" else ("q", "chi")
+    candidates = ("axis_x",) if group_name == "integrated_1d" else ("axis_x", "axis_y")
     axes: list[NexusAxisSummary] = []
     for name in candidates:
         if name not in group or not isinstance(group[name], h5py.Dataset):
@@ -418,7 +418,7 @@ def _two_d_kind(group: h5py.Group, axes: tuple[NexusAxisSummary, ...]) -> TwoDKi
         except ValueError:
             pass
     units = {axis.name: axis.units for axis in axes}
-    return two_d_kind_from_units(units.get("q"), units.get("chi"))
+    return two_d_kind_from_units(units.get("axis_x"), units.get("axis_y"))
 
 
 def _frame_group_labels(e: h5py.Group) -> tuple[int, ...]:

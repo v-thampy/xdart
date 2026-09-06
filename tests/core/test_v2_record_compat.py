@@ -115,13 +115,30 @@ def test_v2_record_content_matches_normalized_legacy_signature(tmp_path):
         entry = h5["entry"]
         assert _text(entry.attrs["default"]) == "integrated_1d"
         assert _text(entry.attrs["ssrl_schema"]) == "xrd_tools.processed_scan"
-        assert int(entry.attrs["ssrl_schema_version"]) == 2
+        assert int(entry.attrs["ssrl_schema_version"]) == 3
+        assert tuple(entry["integrated_1d"].attrs["axes"]) == ("frame_index", "axis_x")
+        assert tuple(entry["integrated_2d"].attrs["axes"]) == (
+            "frame_index", "axis_y", "axis_x",
+        )
         assert _text(h5["entry/reduction"].attrs["program"]) == "ssrl_xrd_tools"
         for frame in h5["entry/frames"].values():
             assert bool(frame.attrs["mask_baked"])
             assert bool(frame["thumbnail"].attrs["mask_baked"])
 
     comparable = copy.deepcopy(now)
+    # Explicitly approved v3 deltas only. Keep the historical fixture unchanged
+    # so every numeric value, dtype, chunk and unrelated attribute stays pinned.
+    for group, names in (
+        ("integrated_1d", {"axis_x": "q"}),
+        ("integrated_2d", {"axis_x": "q", "axis_y": "chi"}),
+    ):
+        group_path = f"entry/{group}"
+        comparable[group_path]["attrs"]["axes"] = ref[group_path]["attrs"]["axes"]
+        for neutral, old in names.items():
+            value = comparable.pop(f"{group_path}/{neutral}")
+            assert "long_name" in value["attrs"]
+            del value["attrs"]["long_name"]
+            comparable[f"{group_path}/{old}"] = value
     assert set(comparable["/"]["attrs"]) == set(ref["/"]["attrs"])
     assert comparable["/"]["attrs"]["creator"] != ref["/"]["attrs"]["creator"]
     comparable["/"]["attrs"]["creator"] = ref["/"]["attrs"]["creator"]
@@ -173,8 +190,8 @@ def test_v2_record_storage_layout_frozen(tmp_path):
             assert ds.chunks is not None and ds.maxshape[0] is None
             assert ds.compression is None
         # fixed axes: not chunked, not compressed
-        for p in ("entry/integrated_1d/q", "entry/integrated_2d/q",
-                  "entry/integrated_2d/chi"):
+        for p in ("entry/integrated_1d/axis_x", "entry/integrated_2d/axis_x",
+                  "entry/integrated_2d/axis_y"):
             ds = f[p]
             assert ds.chunks is None and ds.compression is None
         # the ARM64 guard: no dataset re-emits raw lzf anywhere in the tree

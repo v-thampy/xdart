@@ -58,6 +58,7 @@ from xrd_tools.io.output_transaction import (
 from xrd_tools.io.output_path import artifact_family_from_source
 from xrd_tools.io.processed_scan_id import require_current_processed
 from xrd_tools.io.record_writer import bind_prepared_manifest_receipt
+from xrd_tools.io.schema import PROCESSED_SCHEMA_VERSION
 from xrd_tools.reduction import reintegrate as _legacy
 from xrd_tools.reduction.reintegrate_prepared import (
     LegacyRouteReason,
@@ -81,7 +82,7 @@ from xrd_tools.reduction.reintegrate_prepared import (
 _PLAN_API_VERSION = 4
 _RECIPE_VERSION = 4
 _RECIPE_SCHEMA = "xrd_tools.reintegrate.plan"
-_OUTPUT_SCHEMA = "xdart-current-v4"
+_OUTPUT_SCHEMA = f"xdart-current-v4-processed-v{PROCESSED_SCHEMA_VERSION}"
 _PUBLICATION_POLICY = "IMMUTABLE_SUCCESSOR_V1"
 _ROUTES = {"bounded-legacy", "prepared"}
 _STAGES = {"qualify", "read", "reduce", "write", "validate", "publish"}

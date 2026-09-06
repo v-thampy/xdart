@@ -74,7 +74,7 @@ def _one_d_file(path: Path, *, alias_modes: bool = False) -> None:
         if alias_modes:
             parent = handle["entry/integrated_1d"]
             child = parent[mode_subgroup_name("q_oop")]
-            for name in ("q", "intensity", "sigma"):
+            for name in ("axis_x", "intensity", "sigma"):
                 del child[name]
                 child[name] = parent[name]
 
@@ -82,7 +82,7 @@ def _one_d_file(path: Path, *, alias_modes: bool = False) -> None:
 def _tiny_one_d_file(path: Path, *, points: int) -> None:
     with h5py.File(path, "w") as handle:
         group = handle.create_group("entry").create_group("integrated_1d")
-        q = group.create_dataset("q", data=np.arange(points, dtype=np.float32))
+        q = group.create_dataset("axis_x", data=np.arange(points, dtype=np.float32))
         q.attrs["units"] = "q_A^-1"
         group.create_dataset(
             "intensity", data=np.zeros((2, points), dtype=np.float32),
@@ -231,7 +231,7 @@ def test_read_1d_rows_uses_one_lean_bundle_and_no_unrelated_payloads(
     assert forbidden == []
     assert read_paths
     assert all("/integrated_1d/" in name for name in read_paths)
-    assert all(not name.endswith("/q") for name in read_paths)
+    assert all(not name.endswith("/axis_x") for name in read_paths)
 
 
 def test_read_1d_rows_preserves_hardlinked_axis_and_row_identity(tmp_path) -> None:

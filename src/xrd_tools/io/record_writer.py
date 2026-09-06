@@ -2284,11 +2284,11 @@ class NexusRecordWriter:
             group, "intensity", role=f"{rows[0].group_name}/intensity",
         ) if isinstance(group, h5py.Group) else None
         radial = local_hard_dataset(
-            group, "q", role=f"{rows[0].group_name}/q",
+            group, "axis_x", role=f"{rows[0].group_name}/axis_x",
         ) if isinstance(group, h5py.Group) else None
         azimuthal = (
             local_hard_dataset(
-                group, "chi", role=f"{rows[0].group_name}/chi",
+                group, "axis_y", role=f"{rows[0].group_name}/axis_y",
             )
             if rows[0].dimension == "2d" and isinstance(group, h5py.Group)
             else None
@@ -2328,7 +2328,7 @@ class NexusRecordWriter:
                 raise WriterStateError(f"durable-row proof lost mode group {first.group_name}")
             labels = local_hard_dataset(group, "frame_index", role=f"{first.group_name}/frame_index")
             intensity = local_hard_dataset(group, "intensity", role=f"{first.group_name}/intensity")
-            radial = local_hard_dataset(group, "q", role=f"{first.group_name}/q")
+            radial = local_hard_dataset(group, "axis_x", role=f"{first.group_name}/axis_x")
             sigma = local_hard_dataset(group, "sigma", role=f"{first.group_name}/sigma")
             if not all(isinstance(value, h5py.Dataset) for value in (
                 labels, intensity, radial,
@@ -2344,7 +2344,7 @@ class NexusRecordWriter:
             if not isinstance(top, h5py.Group):
                 raise WriterStateError(f"durable-row proof lost integrated_{first.dimension}")
             chi = local_hard_dataset(
-                group, "chi", role=f"{first.group_name}/chi",
+                group, "axis_y", role=f"{first.group_name}/axis_y",
             ) if first.dimension == "2d" else None
             if first.dimension == "2d" and not isinstance(chi, h5py.Dataset):
                 raise WriterStateError(
@@ -2935,13 +2935,13 @@ class NexusRecordWriter:
         grouped = self._semantic_mode_observation
         observed_radial = (
             grouped[0] if grouped is not None else
-            np.asarray(group["q"][()]) if observed is None else observed.radial
+            np.asarray(group["axis_x"][()]) if observed is None else observed.radial
         )
-        evidence.array(f"{role}/q", expected.radial, observed_radial)
+        evidence.array(f"{role}/axis_x", expected.radial, observed_radial)
         evidence.text(
             f"{role}/q@units",
             expected.unit,
-            self._text_value(group["q"].attrs.get("units", "")),
+            self._text_value(group["axis_x"].attrs.get("units", "")),
         )
         observed_intensity = None if grouped is None else grouped[1]
         if observed_intensity is None:
@@ -2999,16 +2999,16 @@ class NexusRecordWriter:
             if expected.azimuthal is None:
                 raise WriterStateError("2-D evidence has no azimuthal axis")
             evidence.array(
-                f"{role}/chi",
+                f"{role}/axis_y",
                 expected.azimuthal,
                 (grouped[2] if grouped is not None else
-                 np.asarray(group["chi"][()])
+                 np.asarray(group["axis_y"][()])
                  if observed is None else observed.azimuthal),
             )
             evidence.text(
                 f"{role}/chi@units",
                 str(expected.azimuthal_unit or ""),
-                self._text_value(group["chi"].attrs.get("units", "")),
+                self._text_value(group["axis_y"].attrs.get("units", "")),
             )
             evidence.text(
                 f"{role}/two_d_kind",
@@ -3554,7 +3554,7 @@ class NexusRecordWriter:
                 np.asarray(proof.label, dtype=context.frame_index_dtype),
                 np.asarray(label, dtype=context.frame_index_dtype),
             )
-            evidence.array(f"{role}/q", context.radial, context.radial)
+            evidence.array(f"{role}/axis_x", context.radial, context.radial)
             evidence.text(f"{role}/q@units", proof.unit, context.unit)
             evidence.array(f"{role}/intensity", intensity, intensity)
             shape_facts = json.dumps({
@@ -3578,7 +3578,7 @@ class NexusRecordWriter:
                 if context.azimuthal is None:
                     raise WriterStateError(f"durable-row proof lost chi for label {proof.label}")
                 evidence.array(
-                    f"{role}/chi", context.azimuthal, context.azimuthal,
+                    f"{role}/axis_y", context.azimuthal, context.azimuthal,
                 )
                 evidence.text(
                     f"{role}/chi@units", str(proof.azimuthal_unit or ""),
@@ -3610,7 +3610,7 @@ class NexusRecordWriter:
             group, "intensity", role=f"{proof.group_name}/intensity",
         )
         radial = local_hard_dataset(
-            group, "q", role=f"{proof.group_name}/q",
+            group, "axis_x", role=f"{proof.group_name}/axis_x",
         )
         if not isinstance(intensity, h5py.Dataset) or not isinstance(
             radial, h5py.Dataset,
@@ -3638,7 +3638,7 @@ class NexusRecordWriter:
         azimuthal = None
         if proof.dimension == "2d":
             chi = local_hard_dataset(
-                group, "chi", role=f"{proof.group_name}/chi",
+                group, "axis_y", role=f"{proof.group_name}/axis_y",
             )
             if not isinstance(chi, h5py.Dataset):
                 raise WriterStateError(
@@ -3929,7 +3929,7 @@ class NexusRecordWriter:
                 f"fast close changed shared science for {proof.group_name}"
             )
         evidence.text(
-            f"{proof.group_name}/q",
+            f"{proof.group_name}/axis_x",
             proof.radial.digest,
             observed_radial.digest,
         )
@@ -3974,7 +3974,7 @@ class NexusRecordWriter:
                     f"fast close changed azimuthal science for {proof.group_name}"
                 )
             evidence.text(
-                f"{proof.group_name}/chi",
+                f"{proof.group_name}/axis_y",
                 proof.azimuthal.digest,
                 observed_azimuthal.digest,
             )
@@ -4697,8 +4697,8 @@ class NexusRecordWriter:
         group = _replacement_hard_group(self._entry_group(), group_name)
         if not isinstance(group, h5py.Group):
             raise WriterStateError("prepared stack admission lost its exact group")
-        names = ("intensity", "frame_index", "q") + (
-            ("chi",) if dimension == "2d" else ()
+        names = ("intensity", "frame_index", "axis_x") + (
+            ("axis_y",) if dimension == "2d" else ()
         )
         datasets = {
             name: _replacement_hard_group(group, name, h5py.Dataset)
@@ -4724,10 +4724,10 @@ class NexusRecordWriter:
         if observed_primary != primary:
             raise WriterStateError("prepared stack primary mode changed")
         first = results[0]
-        axes = [np.asarray(datasets["q"][()], np.float32).copy()]
+        axes = [np.asarray(datasets["axis_x"][()], np.float32).copy()]
         units = [str(first.unit or "")]
         if dimension == "2d":
-            axes.append(np.asarray(datasets["chi"][()], np.float32).copy())
+            axes.append(np.asarray(datasets["axis_y"][()], np.float32).copy())
             units.append(str(first.azimuthal_unit or ""))
             expected_kind = two_d_kind_from_units(*units).value
             if self._text_value(group.attrs.get("two_d_kind", "")) != expected_kind:
@@ -4794,12 +4794,12 @@ class NexusRecordWriter:
             ) != ("sigma" not in datasets)
             or any(
                 self._text_value(datasets[name].attrs.get("units", "")) != unit
-                for name, unit in zip(("q", "chi"), authority["units"])
+                for name, unit in zip(("axis_x", "axis_y"), authority["units"])
             )
         ):
             raise WriterStateError("prepared stack authority changed before append")
         for offset, axis in enumerate(authority["axes"]):
-            name = "q" if offset == 0 else "chi"
+            name = "axis_x" if offset == 0 else "axis_y"
             if tuple(datasets[name].shape) != tuple(axis.shape):
                 raise WriterStateError("prepared stack axis shape changed before append")
         sigma_node = datasets.get("sigma")

@@ -81,7 +81,7 @@ def _processed(
             group = entry.create_group("integrated_2d")
             group.attrs["NX_class"] = "NXdata"
             group.attrs["signal"] = "intensity"
-            group.attrs["axes"] = ("frame_index", "chi", "q")
+            group.attrs["axes"] = ("frame_index", "axis_y", "axis_x")
             group.create_dataset(
                 "intensity",
                 data=np.ones((2, 3, 4), dtype=np.float32),
@@ -94,8 +94,8 @@ def _processed(
                 chunks=(2,),
                 maxshape=(None,),
             )
-            group.create_dataset("chi", data=np.arange(3, dtype=np.float32))
-            group.create_dataset("q", data=np.arange(4, dtype=np.float32))
+            group.create_dataset("axis_y", data=np.arange(3, dtype=np.float32))
+            group.create_dataset("axis_x", data=np.arange(4, dtype=np.float32))
         if detector:
             entry.create_dataset(
                 "instrument/detector/data",
@@ -351,7 +351,7 @@ def test_current_admission_rejects_a_malformed_present_result_sibling(
     )
     with h5py.File(missing_axis, "r+") as handle:
         group = handle["entry/integrated_2d"]
-        del group["chi"]
+        del group["axis_y"]
         del group["intensity"]
         group.create_dataset(
             "intensity", data=np.ones((2, 4), dtype=np.float32),
@@ -566,7 +566,7 @@ def _replace_result_dataset_with_indirect_storage(
 
 @pytest.mark.parametrize("storage", ("virtual", "external"))
 @pytest.mark.parametrize(
-    "dataset_name", ("frame_index", "q", "chi", "intensity", "sigma"),
+    "dataset_name", ("frame_index", "axis_x", "axis_y", "intensity", "sigma"),
 )
 def test_current_admission_rejects_indirect_result_storage(
     tmp_path: Path, storage: str, dataset_name: str,
@@ -596,9 +596,9 @@ def test_direct_processed_readers_reject_unstamped_historical_layout(
         group = entry.create_group("integrated_1d")
         group.attrs["NX_class"] = "NXdata"
         group.attrs["signal"] = "intensity"
-        group.attrs["axes"] = ("frame_index", "q")
+        group.attrs["axes"] = ("frame_index", "axis_x")
         group.create_dataset("frame_index", data=np.arange(2, dtype=np.int64))
-        group.create_dataset("q", data=np.arange(4, dtype=np.float32))
+        group.create_dataset("axis_x", data=np.arange(4, dtype=np.float32))
         group.create_dataset(
             "intensity", data=np.ones((2, 4), dtype=np.float32),
         )

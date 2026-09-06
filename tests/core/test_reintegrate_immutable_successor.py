@@ -2293,7 +2293,7 @@ def test_cross_route_science_and_preservation_are_exactly_equal(
                         np.asarray(group[name][...]).tobytes()
                     ).hexdigest(),
                 )
-                for name in ("frame_index", "q", "chi", "intensity", "sigma")
+                for name in ("frame_index", "axis_x", "axis_y", "intensity", "sigma")
                 if name in group
             }
             entry = document["entry"]

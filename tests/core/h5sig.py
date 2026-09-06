@@ -32,8 +32,10 @@ VOLATILE_PARENTS = ("versions",)   # /entry/reduction/versions/* values
 
 def _digest(value) -> str:
     arr = np.asarray(value)
-    if arr.dtype.kind in ("O", "U", "S"):
-        data = np.asarray(arr, dtype="S").tobytes()
+    if arr.dtype.kind in ("O", "U"):
+        data = np.char.encode(arr.astype("U"), "utf-8").tobytes()
+    elif arr.dtype.kind == "S":
+        data = arr.tobytes()
     else:
         data = arr.tobytes()
     return hashlib.sha256(data).hexdigest()[:16]

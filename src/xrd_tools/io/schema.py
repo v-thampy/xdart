@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Schema-as-code for the processed-scan NeXus record (v2).
+"""Schema-as-code for the processed-scan NeXus record (v3).
 
 The single declarative description of the on-disk layout that
 ``xrd_tools.io.nexus`` writes and the readers consume.  Layout facts —
@@ -8,10 +8,10 @@ dimension), the axis dataset names, the capability attributes — live HERE
 so writers, validators, readers, and row surgery share one source of
 truth instead of each re-hard-coding strings.
 
-This module describes the format; it never changes it.  Everything below
-is **persisted** in existing user files — treat every string as frozen.
-Schema evolution = bump :data:`PROCESSED_SCHEMA_VERSION` and extend the
-structures additively; never rename an attribute key or dataset name.
+Version 3 intentionally replaces integrated q/chi dataset names with neutral
+axis_x/axis_y names. Scientific units, mode identities and array orientation
+are unchanged. Other persisted keys remain frozen; format changes require
+an explicit schema-version boundary, not silent in-place file migration.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from typing import Mapping
 import h5py
 import numpy as np
 
-from xrd_tools.core.frame_view import DEFAULT_MODE_KEY  # "default"; the top-level slot
+from xrd_tools.core.frame_view import DEFAULT_MODE_KEY, axis_from_unit
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,7 @@ __all__ = [
     "PROCESSED_SCHEMA_NAME",
     "ACCEPTED_SCHEMA_NAMES",
     "PROCESSED_SCHEMA_VERSION",
+    "axis_display_metadata",
     "INTEGRATED_ROW_ALIGNED",
     "GroupSchema",
     "ProcessedScanSchema",
@@ -288,14 +289,31 @@ PROCESSED_SCHEMA_NAME = "xrd_tools.processed_scan"
 ACCEPTED_SCHEMA_NAMES = (PROCESSED_SCHEMA_NAME,)
 #: current schema version; positive processed-output admission requires this
 #: exact version.  Lower-level readers may still diagnose newer stamps.
-PROCESSED_SCHEMA_VERSION = 2
+PROCESSED_SCHEMA_VERSION = 3
+
+
+def axis_display_metadata(unit: str) -> dict[str, str]:
+    """Scientific labels for neutral axes, computed only at dataset creation.
+
+    Keep the existing machine-readable unit token intact. NeXpy and silx use
+    long_name verbatim, so the human label includes the physical unit too.
+    """
+    physical_unit = unit.rsplit("_", 1)[-1]
+    display_unit = {
+        "A^-1": "Å⁻¹", "nm^-1": "nm⁻¹", "deg": "°", "rad": "rad",
+        "degrees": "°", "1/angstrom": "Å⁻¹", "angstrom^-1": "Å⁻¹",
+    }.get(physical_unit, physical_unit)
+    return {
+        "units": unit,
+        "long_name": f"{axis_from_unit(unit).label} ({display_unit})",
+    }
 
 # ── row-aligned datasets ─────────────────────────────────────────────────────
 
 #: datasets inside ``integrated_1d``/``integrated_2d`` whose LEADING dimension
 #: is the per-frame row — exactly these are sliced/rebuilt by row surgery
 #: (``drop_integrated_rows``) and grown by the appenders.  Axis datasets
-#: (``q``/``chi``) are shared across rows and are NOT in this set.
+#: (``axis_x``/``axis_y``) are shared across rows and are NOT in this set.
 INTEGRATED_ROW_ALIGNED = frozenset({"frame_index", "intensity", "sigma"})
 
 # ── multi-result GI mode keys (the per-mode nested-subgroup layout) ──────────
@@ -508,7 +526,7 @@ class DatasetSpec:
 
 
 def _integrated_datasets(axes: tuple[str, ...]) -> "Mapping[str, DatasetSpec]":
-    """The shared integrated_1d/2d dataset family (2D adds the chi axis)."""
+    """The shared integrated_1d/2d dataset family (2D adds axis_y)."""
     two_d = len(axes) == 2
     specs = {
         "intensity": DatasetSpec(
@@ -585,7 +603,7 @@ class GroupSchema:
     name: str
     #: shared (non-row) axis DATASET NAMES, (radial, azimuthal) order.
     #: NOTE: not the intensity storage order — integrated_2d intensity rows
-    #: are stored (chi, q) = (azimuthal, radial); see the 2D-orientation
+    #: are stored (axis_y, axis_x) = (azimuthal, radial); see the 2D-orientation
     #: convention in CLAUDE.md before consuming axes positionally.
     axes: tuple[str, ...] = ()
     #: datasets with a per-frame leading dimension.
@@ -604,7 +622,7 @@ class GroupSchema:
 
 @dataclass(frozen=True)
 class ProcessedScanSchema:
-    """The whole v2 processed-scan record, as data."""
+    """The current processed-scan record, as data."""
 
     name: str = PROCESSED_SCHEMA_NAME
     accepted_names: tuple[str, ...] = ACCEPTED_SCHEMA_NAMES
@@ -614,23 +632,23 @@ class ProcessedScanSchema:
     groups: Mapping[str, GroupSchema] = field(
         default_factory=lambda: MappingProxyType({
             "integrated_1d": GroupSchema(
-                "integrated_1d", axes=("q",),
+                "integrated_1d", axes=("axis_x",),
                 row_aligned=INTEGRATED_ROW_ALIGNED,
-                datasets=_integrated_datasets(("q",)),
+                datasets=_integrated_datasets(("axis_x",)),
                 nx_attrs=MappingProxyType({
                     "NX_class": "NXdata",
                     "signal": "intensity",
-                    "axes": ("frame_index", "q"),
+                    "axes": ("frame_index", "axis_x"),
                 }),
             ),
             "integrated_2d": GroupSchema(
-                "integrated_2d", axes=("q", "chi"),
+                "integrated_2d", axes=("axis_x", "axis_y"),
                 row_aligned=INTEGRATED_ROW_ALIGNED,
-                datasets=_integrated_datasets(("q", "chi")),
+                datasets=_integrated_datasets(("axis_x", "axis_y")),
                 nx_attrs=MappingProxyType({
                     "NX_class": "NXdata",
                     "signal": "intensity",
-                    "axes": ("frame_index", "chi", "q"),
+                    "axes": ("frame_index", "axis_y", "axis_x"),
                 }),
             ),
             "per_frame_geometry": GroupSchema(
