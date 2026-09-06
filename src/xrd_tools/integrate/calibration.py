@@ -139,6 +139,11 @@ def _admit_detector_config(
     such as ``pixel1=1`` (integer) becoming ``1.0`` (float).
     """
 
+    from xrd_tools.integrate._pyfai_rayonix import (
+        apply_rayonix_serialization_backport,
+    )
+
+    apply_rayonix_serialization_backport()
     from pyFAI.detectors import ALL_DETECTORS, detector_factory
 
     if type(detector_config) not in _DETECTOR_CONFIG_MAPPING_TYPES:

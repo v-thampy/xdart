@@ -43,7 +43,7 @@ Wavelength: 1e-10
 
 
 def _binary(tmp_path: Path, monkeypatch) -> Path:
-    binary = tmp_path / "bin" / "pyFAI-calib2"
+    binary = tmp_path / "bin" / "xdart-calib2"
     binary.parent.mkdir(exist_ok=True)
     binary.write_text("fixture", encoding="utf-8")
     binary.chmod(0o700)
@@ -103,8 +103,8 @@ def test_resolver_prefers_real_python_sibling_then_validated_path_fallback(
     runtime.mkdir(parents=True)
     fallback.mkdir()
     interpreter = runtime / "python"
-    sibling = runtime / "pyFAI-calib2"
-    path_tool = fallback / "pyFAI-calib2"
+    sibling = runtime / "xdart-calib2"
+    path_tool = fallback / "xdart-calib2"
     for path in (interpreter, sibling, path_tool):
         path.write_text("fixture", encoding="utf-8")
         path.chmod(0o700)

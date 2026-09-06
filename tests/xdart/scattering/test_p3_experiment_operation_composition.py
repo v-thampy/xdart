@@ -52,7 +52,7 @@ def qapp():
 
 
 def _binary(tmp_path: Path, monkeypatch) -> Path:
-    binary = tmp_path / "bin" / "pyFAI-calib2"
+    binary = tmp_path / "bin" / "xdart-calib2"
     binary.parent.mkdir(exist_ok=True)
     binary.write_text("fixture", encoding="utf-8")
     binary.chmod(0o700)

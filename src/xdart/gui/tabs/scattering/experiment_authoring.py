@@ -394,7 +394,9 @@ def _resolve_authoring_executable(
 
 
 def resolve_calibration_executable(fixed: str | None = None) -> str | None:
-    return _resolve_authoring_executable("pyFAI-calib2", fixed)
+    # The installed xdart entry point applies the pinned Rayonix backport in
+    # the calibration child before delegating to the normal pyFAI GUI.
+    return _resolve_authoring_executable("xdart-calib2", fixed)
 def _directory_identity(path: Path) -> tuple[int, int]:
     state = path.lstat()
     if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
@@ -792,7 +794,7 @@ def prepare_calibration_request(selected: str) -> CalibrationRequest:
     identity = _directory_identity(directory)
     executable = resolve_calibration_executable()
     if executable is None:
-        raise ValueError("pyFAI-calib2 is unavailable on PATH.")
+        raise ValueError("xdart-calib2 is unavailable; reinstall xdart[gui] in this environment.")
     return CalibrationRequest(
         str(source), executable, SourceFileState.capture(Path(executable)), explicit,
         state, str(directory), identity,
