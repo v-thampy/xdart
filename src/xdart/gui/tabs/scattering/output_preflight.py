@@ -2999,8 +2999,8 @@ def _external_members(
     *,
     cancelled: Callable[[], bool] = _not_cancelled,
 ) -> tuple[ExternalSourceState, ...]:
-    if descriptor.self_contained is not False:
-        return ()
+    # A HardLink/SoftLink leaf can resolve through an external ancestor. Match
+    # the core qualifier's dataset owner, not the syntax of the final link.
     segments = descriptor.segment_paths or (
         (descriptor.dataset_path,) if descriptor.dataset_path else ()
     )
@@ -3013,7 +3013,19 @@ def _external_members(
     }
     values: list[ExternalSourceState] = []
     first = 0
-    member_qualified = True
+
+    def member_state(path: Path) -> _CapturedSourceTopology:
+        try:
+            return _remember_source_state(path, states, cancelled=cancelled)
+        except FileNotFoundError as error:
+            raise SourceRevisionChanged(
+                f"external detector member disappeared during admission: {path}"
+            ) from error
+        except OSError as error:
+            raise SourceRevisionChanged(
+                f"external detector member capture is unverifiable: {path}"
+            ) from error
+
     try:
         with _open_stable_hdf5_dependency(
             master,
@@ -3027,52 +3039,19 @@ def _external_members(
             for epoch, segment in enumerate(segments):
                 if cancelled():
                     raise RuntimeError("admission cancelled")
-                components = tuple(
-                    value
-                    for value in segment.strip("/").split("/")
-                    if value
-                )
-                parent: object = handle
-                for component in components[:-1]:
-                    if not isinstance(parent, h5py.Group):
-                        member_qualified = False
-                        break
-                    parent = parent.get(component)
-                if (
-                    not member_qualified
-                    or not components
-                    or not isinstance(parent, h5py.Group)
-                ):
-                    member_qualified = False
-                    break
-                link = parent.get(components[-1], getlink=True)
-                if not isinstance(link, h5py.ExternalLink):
-                    # SoftLink, ancestor-ExternalLink and VDS layouts are
-                    # frozen by the selected dependency closure below.
-                    member_qualified = False
-                    break
-                path = _hdf5_link_file(parent, link.filename)
-                try:
-                    topology = _remember_source_state(
-                        path,
-                        states,
-                        cancelled=cancelled,
-                    )
-                except FileNotFoundError as error:
-                    raise SourceRevisionChanged(
-                        "external detector member disappeared during "
-                        f"admission: {path}"
-                    ) from error
-                except OSError as error:
-                    raise SourceRevisionChanged(
-                        "external detector member capture is unverifiable: "
-                        f"{path}"
-                    ) from error
-                dataset = parent.get(components[-1])
-                if not isinstance(dataset, h5py.Dataset):
-                    raise ValueError(
-                        "external container lost its exact dataset"
-                    )
+                parent = handle.get(posixpath.dirname(segment) or "/")
+                if not isinstance(parent, h5py.Group):
+                    raise ValueError("external container lost its exact dataset")
+                leaf = posixpath.basename(segment)
+                link = parent.get(leaf, getlink=True)
+                if isinstance(link, h5py.ExternalLink):
+                    # Retain direct-link capture before dereferencing it.
+                    member_state(_hdf5_link_file(parent, link.filename))
+                dataset = parent.get(leaf)
+                if not isinstance(dataset, h5py.Dataset) or dataset.ndim not in {2, 3}:
+                    raise ValueError("external container lost its exact dataset")
+                path = Path(_raw_source_path(dataset.file.filename))
+                topology = member_state(path)
                 count = 1 if dataset.ndim == 2 else int(dataset.shape[0])
                 frame_shape = (
                     tuple(int(value) for value in dataset.shape)
@@ -3085,22 +3064,25 @@ def _external_members(
                 ):
                     raise ValueError(
                         "external detector layout changed during admission: "
-                        f"{path}:{link.path}"
+                        f"{path}:{dataset.name}"
                     )
                 stop = first + count
-                values.append(
-                    ExternalSourceState(
-                        topology.followed_state,
-                        link.path,
-                        first,
-                        stop,
-                        epoch,
+                if _resolved_source_key(topology.resolved_path) != _resolved_source_key(
+                    master_topology.resolved_path
+                ):
+                    values.append(
+                        ExternalSourceState(
+                            topology.followed_state,
+                            str(dataset.name),
+                            first,
+                            stop,
+                            epoch,
+                        )
                     )
-                )
                 first = stop
                 if cancelled():
                     raise RuntimeError("admission cancelled")
-        if values and first != descriptor.frame_count:
+        if first != descriptor.frame_count:
             raise ValueError(
                 "external detector frame count changed during admission: "
                 f"descriptor={descriptor.frame_count}, members={first}"
@@ -3122,8 +3104,6 @@ def _external_members(
             raise drift from error
         raise
     _verify_source_states(states, cancelled=cancelled)
-    if not member_qualified:
-        return ()
     return tuple(values)
 
 

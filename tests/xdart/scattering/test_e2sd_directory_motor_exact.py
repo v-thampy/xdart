@@ -1175,8 +1175,10 @@ def test_eager_gi_reprobes_cached_self_contained_descriptor_after_rebind(
         sessions[0].close()
 
 
+@pytest.mark.parametrize("layout", ("direct", "soft", "local"))
 def test_soft_detector_path_materializes_with_exact_external_dependency(
     tmp_path: Path,
+    layout: str,
 ) -> None:
     raw = tmp_path / "raw"
     landing = tmp_path / "landing"
@@ -1190,12 +1192,16 @@ def test_soft_detector_path_materializes_with_exact_external_dependency(
             data=np.ones((2, 4, 5), dtype=np.uint16),
         )
     with h5py.File(master, "w") as handle:
-        entry = handle.create_group("entry")
-        entry.create_group("data")["data"] = h5py.SoftLink("/hidden/raw")
-        entry.file.create_group("hidden")["raw"] = h5py.ExternalLink(
-            str(sidecar),
-            "/entry/data/data",
-        )
+        data = handle.create_group("entry").create_group("data")
+        if layout == "soft":
+            data["data"] = h5py.SoftLink("/hidden/raw")
+            handle.create_group("hidden")["raw"] = h5py.ExternalLink(
+                str(sidecar), "/entry/data/data",
+            )
+        elif layout == "local":
+            data.create_dataset("data", data=np.ones((2, 4, 5), dtype=np.uint16))
+        else:
+            data["data"] = h5py.ExternalLink(str(sidecar), "/entry/data/data")
     poni = tmp_path / "cal.poni"
     write_poni(poni)
     source = DirectorySourceSpec(raw, suffixes=(".nxs",))
@@ -1230,14 +1236,55 @@ def test_soft_detector_path_materializes_with_exact_external_dependency(
         )
         assert decision is not None
         assert (ready, skipped) == (1, 0)
-        assert decision.item.source_stamp.frame_count == 2
-        assert decision.item.source_stamp.external_members == ()
-        assert tuple(
-            Path(value.path)
-            for value in decision.item.source_stamp.dependency_files
-        ) == (sidecar,)
+        stamp = decision.item.source_stamp
+        assert stamp.frame_count == 2
+        if layout == "local":
+            assert stamp.external_members == ()
+        else:
+            member, = stamp.external_members
+            assert Path(member.file.path) == sidecar
+            assert member.dataset == "/entry/data/data"
+            assert (member.first, member.stop, member.epoch) == (0, 2, 0)
+        assert stamp.dependency_files == ()
     finally:
         session.close()
+
+
+@pytest.mark.parametrize("layout", ("ancestor", "mixed"))
+def test_external_member_capture_uses_dataset_owner_and_all_segment_offsets(
+    tmp_path: Path, layout: str,
+) -> None:
+    """Capture contract only: these descriptors do not test adapter selection."""
+    from xdart.gui.tabs.scattering.output_preflight import _external_members
+    from xrd_tools.sources.descriptor import ContainerDescriptor
+
+    master, sidecar = tmp_path / "master.h5", tmp_path / "pixels.h5"
+    pixels = np.ones((2, 4, 5), dtype=np.uint16)
+    with h5py.File(sidecar, "w") as handle:
+        handle.create_dataset("detector/pixels", data=pixels)
+    with h5py.File(master, "w") as handle:
+        if layout == "ancestor":
+            handle["landed"] = h5py.ExternalLink(str(sidecar), "/detector")
+            paths = ("/landed/pixels",)
+        else:
+            paths = tuple(f"/segment_{index}" for index in range(4))
+            for index, path in enumerate(paths):
+                if index % 2:
+                    handle[path] = h5py.ExternalLink(str(sidecar), "/detector/pixels")
+                else:
+                    handle.create_dataset(path, data=pixels)
+    descriptor = ContainerDescriptor(
+        master, dataset_path=paths[0], segment_paths=paths,
+        frame_count=2 * len(paths), frame_shape=(4, 5), dtype=pixels.dtype,
+        # The descriptor's leaf-link heuristic misses an external ancestor.
+        self_contained=layout == "ancestor",
+    )
+    members = _external_members(master, SourceFileState.capture(master), descriptor)
+    assert all(Path(member.file.path) == sidecar for member in members)
+    assert all(member.dataset == "/detector/pixels" for member in members)
+    assert [(member.first, member.stop, member.epoch) for member in members] == (
+        [(0, 2, 0)] if layout == "ancestor" else [(2, 4, 1), (6, 8, 3)]
+    )
 
 
 def test_nested_vds_dependency_collision_is_rejected_before_execution(
