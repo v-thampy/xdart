@@ -142,6 +142,15 @@ def test_first_borrowed_gi_preview_and_frame9_preserve_persisted_modes(
                 np.testing.assert_array_equal(payload.view.thumbnail, expected[label].thumbnail)
                 adopted = prepare_browse_1d_display(runtime)
                 assert adopted is not None
+                assert runtime.borrow_bundle.released
+                assert runtime.borrow_bundle.remaining == 0
+                # Hydration protects cached rows with its own borrows until
+                # worker cleanup; display release does not retire those pins.
+                deadline = time.monotonic() + 10.0
+                while owner.polling_needed() and time.monotonic() < deadline:
+                    controller.poll_browse_preview()
+                    time.sleep(0.005)
+                assert not owner.polling_needed()
                 assert browse.browse_1d_cache.outstanding_borrows == 0
                 runtime = None
 
