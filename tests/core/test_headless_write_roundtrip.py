@@ -584,7 +584,7 @@ def test_write_integrated_stack_marks_and_guards_azimuthal_1d_axis(tmp_path):
         )
         g = e["integrated_1d"]
         assert g.attrs["axis_kind"] == "azimuthal"
-        assert g["axis_x"].attrs["units"] == "chi_deg"
+        assert g["axis_1"].attrs["units"] == "chi_deg"
 
     ds = read_scan(p, groups=("1d",))
     assert ds["q"].attrs.get("units") == "chi_deg"

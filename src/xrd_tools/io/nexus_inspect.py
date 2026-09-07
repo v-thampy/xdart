@@ -380,7 +380,7 @@ def _reduced_summary(e: h5py.Group, name: str) -> NexusReducedSummary | None:
     # This is a general HDF5 inspector, not positive processed-file admission.
     # Show physical nodes even in unstamped diagnostic files; actual readers
     # still require the version-matched layout through processed_scan_id.
-    axis_names = ("axis_x", "axis_y") if "axis_x" in group else ("q", "chi")
+    axis_names = ("axis_1", "axis_2") if "axis_1" in group else ("q", "chi")
     axes = tuple(_axis_summaries(group, name, axis_names))
     two_d_kind = None
     if name == "integrated_2d":

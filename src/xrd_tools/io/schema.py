@@ -9,7 +9,7 @@ so writers, validators, readers, and row surgery share one source of
 truth instead of each re-hard-coding strings.
 
 Version 3 intentionally replaces integrated q/chi dataset names with neutral
-axis_x/axis_y names. Scientific units, mode identities and array orientation
+axis_1/axis_2 names. Scientific units, mode identities and array orientation
 are unchanged. Other persisted keys remain frozen; format changes require
 an explicit schema-version boundary, not silent in-place file migration.
 """
@@ -299,7 +299,7 @@ def integrated_axis_names(version: int) -> tuple[str, str]:
     if version == 2:
         return "q", "chi"
     if version == PROCESSED_SCHEMA_VERSION:
-        return "axis_x", "axis_y"
+        return "axis_1", "axis_2"
     raise ValueError("unsupported processed schema version")
 
 
@@ -324,7 +324,7 @@ def axis_display_metadata(unit: str) -> dict[str, str]:
 #: datasets inside ``integrated_1d``/``integrated_2d`` whose LEADING dimension
 #: is the per-frame row — exactly these are sliced/rebuilt by row surgery
 #: (``drop_integrated_rows``) and grown by the appenders.  Axis datasets
-#: (``axis_x``/``axis_y``) are shared across rows and are NOT in this set.
+#: (``axis_1``/``axis_2``) are shared across rows and are NOT in this set.
 INTEGRATED_ROW_ALIGNED = frozenset({"frame_index", "intensity", "sigma"})
 
 # ── multi-result GI mode keys (the per-mode nested-subgroup layout) ──────────
@@ -537,7 +537,7 @@ class DatasetSpec:
 
 
 def _integrated_datasets(axes: tuple[str, ...]) -> "Mapping[str, DatasetSpec]":
-    """The shared integrated_1d/2d dataset family (2D adds axis_y)."""
+    """The shared integrated_1d/2d dataset family (2D adds axis_2)."""
     two_d = len(axes) == 2
     specs = {
         "intensity": DatasetSpec(
@@ -614,7 +614,7 @@ class GroupSchema:
     name: str
     #: shared (non-row) axis DATASET NAMES, (radial, azimuthal) order.
     #: NOTE: not the intensity storage order — integrated_2d intensity rows
-    #: are stored (axis_y, axis_x) = (azimuthal, radial); see the 2D-orientation
+    #: are stored (axis_2, axis_1) = (azimuthal, radial); see the 2D-orientation
     #: convention in CLAUDE.md before consuming axes positionally.
     axes: tuple[str, ...] = ()
     #: datasets with a per-frame leading dimension.
@@ -643,23 +643,23 @@ class ProcessedScanSchema:
     groups: Mapping[str, GroupSchema] = field(
         default_factory=lambda: MappingProxyType({
             "integrated_1d": GroupSchema(
-                "integrated_1d", axes=("axis_x",),
+                "integrated_1d", axes=("axis_1",),
                 row_aligned=INTEGRATED_ROW_ALIGNED,
-                datasets=_integrated_datasets(("axis_x",)),
+                datasets=_integrated_datasets(("axis_1",)),
                 nx_attrs=MappingProxyType({
                     "NX_class": "NXdata",
                     "signal": "intensity",
-                    "axes": ("frame_index", "axis_x"),
+                    "axes": ("frame_index", "axis_1"),
                 }),
             ),
             "integrated_2d": GroupSchema(
-                "integrated_2d", axes=("axis_x", "axis_y"),
+                "integrated_2d", axes=("axis_1", "axis_2"),
                 row_aligned=INTEGRATED_ROW_ALIGNED,
-                datasets=_integrated_datasets(("axis_x", "axis_y")),
+                datasets=_integrated_datasets(("axis_1", "axis_2")),
                 nx_attrs=MappingProxyType({
                     "NX_class": "NXdata",
                     "signal": "intensity",
-                    "axes": ("frame_index", "axis_y", "axis_x"),
+                    "axes": ("frame_index", "axis_2", "axis_1"),
                 }),
             ),
             "per_frame_geometry": GroupSchema(
@@ -824,7 +824,7 @@ SCHEMA = ProcessedScanSchema()
 
 # Stitch uses a separate physical layout while retaining logical q/chi APIs.
 # The preceding layouts stay available for exact old artifact/embedded reads.
-STITCH_NEUTRAL_AXIS_NAMES = MappingProxyType({"q": "axis_x", "chi": "axis_y"})
+STITCH_NEUTRAL_AXIS_NAMES = MappingProxyType({"q": "axis_1", "chi": "axis_2"})
 STITCH_NEUTRAL_GROUPS = MappingProxyType({
     name: GroupSchema(
         name, axes=axes, datasets=_stitched_datasets(axes),
@@ -833,7 +833,7 @@ STITCH_NEUTRAL_GROUPS = MappingProxyType({
         }),
     )
     for name, axes in (
-        ("stitched_1d", ("axis_x",)),
-        ("stitched_2d", ("axis_x", "axis_y")),
+        ("stitched_1d", ("axis_1",)),
+        ("stitched_2d", ("axis_1", "axis_2")),
     )
 })

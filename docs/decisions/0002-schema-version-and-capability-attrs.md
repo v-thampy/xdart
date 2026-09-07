@@ -4,12 +4,17 @@
 
 **2026-09-06 amendment:** the approved integrated-axis rename is the first
 breaking layout boundary: new processed outputs use integer version 3 and
-`axis_x`/`axis_y`. Strictly qualified version-2 `q`/`chi` outputs remain readable;
+`axis_1`/`axis_2`. Strictly qualified version-2 `q`/`chi` outputs remain readable;
 only v3 is writable through Append. Immutable Reintegration converts its private
 candidate, never the original file. Positive read admission refuses unknown
 versions; the historical warn-only recommendation below is superseded at that
 boundary. All other capability/attribute keys and scientific arrays retain their
 existing contracts. See [the processed schema](../core/schema_v2.md).
+
+**2026-09-07 naming refinement:** `axis_1`/`axis_2` replaces the prerelease
+`axis_x`/`axis_y` spelling. The interim spelling was test-only and is not a
+supported legacy format. Axis numbering identifies the first and second
+scientific coordinates, not NumPy dimension numbers or screen directions.
 
 ## Context
 

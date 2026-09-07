@@ -17,12 +17,12 @@ def _as_v2(path):
         entry = handle["entry"]
         groups = []
         entry.visititems(lambda _name, node: groups.append(node)
-                         if isinstance(node, h5py.Group) and "axis_x" in node else None)
+                         if isinstance(node, h5py.Group) and "axis_1" in node else None)
         for group in groups:
-            group.move("axis_x", "q")
+            group.move("axis_1", "q")
             del group["q"].attrs["long_name"]
-            if "axis_y" in group:
-                group.move("axis_y", "chi")
+            if "axis_2" in group:
+                group.move("axis_2", "chi")
                 del group["chi"].attrs["long_name"]
                 group.attrs["axes"] = ["frame_index", "chi", "q"]
             else:
@@ -144,8 +144,8 @@ def test_v2_reintegrate_only_normalizes_private_candidate(tmp_path, monkeypatch,
         assert handle["entry"].attrs["ssrl_schema_version"] == 3
         for name in ("integrated_1d", "integrated_2d"):
             group = handle[f"entry/{name}"]
-            assert "axis_x" in group and "q" not in group and "chi" not in group
-            assert "long_name" in group["axis_x"].attrs
+            assert "axis_1" in group and "q" not in group and "chi" not in group
+            assert "long_name" in group["axis_1"].attrs
         np.testing.assert_array_equal(handle[f"entry/integrated_{other}/intensity"], preserved)
         require_finite_replacement_result_seal(handle, entry="entry", dimension=other,
                                                audit_identity=audit_identity)
@@ -178,7 +178,7 @@ def test_v2_preservation_normalizes_only_approved_deltas(tmp_path, damage):
         if damage == "intensity":
             group["intensity"][0, 0, 0] += 1
         elif damage == "units":
-            group["axis_x"].attrs["units"] = "qoop_A^-1"
+            group["axis_1"].attrs["units"] = "qoop_A^-1"
         else:
             handle["entry"].attrs["unrelated"] = "changed"
         assert signature(handle) != expected
@@ -245,9 +245,9 @@ def test_v2_requires_its_exact_axis_layout(tmp_path, damage):
     with h5py.File(path, "r+") as handle:
         group = handle["entry/integrated_1d"]
         if damage == "mixed_names":
-            group["axis_x"] = group["q"]
+            group["axis_1"] = group["q"]
         elif damage == "wrong_axes":
-            group.attrs["axes"] = ["frame_index", "axis_x"]
+            group.attrs["axes"] = ["frame_index", "axis_1"]
         else:
             del group["q"]
     assert not is_current_processed_xdart_path(path)
@@ -305,20 +305,20 @@ def test_neutral_axes_roundtrip_values_labels_and_nonsquare_orientation(
     with h5py.File(path, "r") as handle:
         assert handle["entry"].attrs["ssrl_schema_version"] == 3
         for name, expected in (
-            ("integrated_1d", ("frame_index", "axis_x")),
-            ("integrated_2d", ("frame_index", "axis_y", "axis_x")),
+            ("integrated_1d", ("frame_index", "axis_1")),
+            ("integrated_2d", ("frame_index", "axis_2", "axis_1")),
         ):
             group = handle[f"entry/{name}"]
             assert tuple(group.attrs["axes"]) == expected
             assert "q" not in group and "chi" not in group
-            np.testing.assert_array_equal(group["axis_x"][()], x)
-            assert group["axis_x"].attrs["units"] == x_unit
-            assert group["axis_x"].attrs["long_name"].startswith(x_label + " (")
+            np.testing.assert_array_equal(group["axis_1"][()], x)
+            assert group["axis_1"].attrs["units"] == x_unit
+            assert group["axis_1"].attrs["long_name"].startswith(x_label + " (")
         group = handle["entry/integrated_2d"]
-        np.testing.assert_array_equal(group["axis_y"][()], y)
+        np.testing.assert_array_equal(group["axis_2"][()], y)
         np.testing.assert_array_equal(group["intensity"][0], intensity.T)
-        assert group["axis_y"].attrs["units"] == y_unit
-        assert group["axis_y"].attrs["long_name"].startswith(y_label + " (")
+        assert group["axis_2"].attrs["units"] == y_unit
+        assert group["axis_2"].attrs["long_name"].startswith(y_label + " (")
     assert is_current_processed_xdart_path(path)
     # Existing Python coordinate API stays stable; physical disk names do not.
     data = read_scan(path)
@@ -354,8 +354,8 @@ def test_named_gi_modes_append_and_reload_neutral_axes(tmp_path, bulk):
             )
         for name in ("integrated_1d", "integrated_1d/q_oop", "integrated_2d"):
             group = entry[name]
-            assert "axis_x" in group and "q" not in group
-            assert "long_name" in group["axis_x"].attrs
+            assert "axis_1" in group and "q" not in group
+            assert "long_name" in group["axis_1"].attrs
             np.testing.assert_array_equal(group["frame_index"], [1, 4])
     assert is_current_processed_xdart_path(path)
     view = read_frame_view(path, 4, mode_1d="q_oop", include_thumbnail=False)

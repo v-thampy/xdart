@@ -116,9 +116,9 @@ def test_v2_record_content_matches_normalized_legacy_signature(tmp_path):
         assert _text(entry.attrs["default"]) == "integrated_1d"
         assert _text(entry.attrs["ssrl_schema"]) == "xrd_tools.processed_scan"
         assert int(entry.attrs["ssrl_schema_version"]) == 3
-        assert tuple(entry["integrated_1d"].attrs["axes"]) == ("frame_index", "axis_x")
+        assert tuple(entry["integrated_1d"].attrs["axes"]) == ("frame_index", "axis_1")
         assert tuple(entry["integrated_2d"].attrs["axes"]) == (
-            "frame_index", "axis_y", "axis_x",
+            "frame_index", "axis_2", "axis_1",
         )
         assert _text(h5["entry/reduction"].attrs["program"]) == "ssrl_xrd_tools"
         for frame in h5["entry/frames"].values():
@@ -129,8 +129,8 @@ def test_v2_record_content_matches_normalized_legacy_signature(tmp_path):
     # Explicitly approved v3 deltas only. Keep the historical fixture unchanged
     # so every numeric value, dtype, chunk and unrelated attribute stays pinned.
     for group, names in (
-        ("integrated_1d", {"axis_x": "q"}),
-        ("integrated_2d", {"axis_x": "q", "axis_y": "chi"}),
+        ("integrated_1d", {"axis_1": "q"}),
+        ("integrated_2d", {"axis_1": "q", "axis_2": "chi"}),
     ):
         group_path = f"entry/{group}"
         comparable[group_path]["attrs"]["axes"] = ref[group_path]["attrs"]["axes"]
@@ -190,8 +190,8 @@ def test_v2_record_storage_layout_frozen(tmp_path):
             assert ds.chunks is not None and ds.maxshape[0] is None
             assert ds.compression is None
         # fixed axes: not chunked, not compressed
-        for p in ("entry/integrated_1d/axis_x", "entry/integrated_2d/axis_x",
-                  "entry/integrated_2d/axis_y"):
+        for p in ("entry/integrated_1d/axis_1", "entry/integrated_2d/axis_1",
+                  "entry/integrated_2d/axis_2"):
             ds = f[p]
             assert ds.chunks is None and ds.compression is None
         # the ARM64 guard: no dataset re-emits raw lzf anywhere in the tree

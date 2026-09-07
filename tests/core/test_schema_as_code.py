@@ -40,8 +40,8 @@ def test_schema_identity_and_back_compat_names():
 
 def test_row_aligned_and_axis_declarations():
     assert INTEGRATED_ROW_ALIGNED == {"frame_index", "intensity", "sigma"}
-    assert SCHEMA.groups["integrated_1d"].axes == ("axis_x",)
-    assert SCHEMA.groups["integrated_2d"].axes == ("axis_x", "axis_y")
+    assert SCHEMA.groups["integrated_1d"].axes == ("axis_1",)
+    assert SCHEMA.groups["integrated_2d"].axes == ("axis_1", "axis_2")
     for g in ("integrated_1d", "integrated_2d"):
         assert SCHEMA.groups[g].row_aligned == INTEGRATED_ROW_ALIGNED
         # axis datasets are shared across rows, never row-sliced
@@ -76,7 +76,7 @@ def test_drop_integrated_rows_slices_only_schema_row_set(tmp_path):
         g.create_dataset("frame_index", data=np.array([0, 1, 2], dtype=np.int64))
         g.create_dataset("intensity", data=np.arange(15.0).reshape(3, 5))
         g.create_dataset("sigma", data=np.ones((3, 5)))
-        g.create_dataset("axis_x", data=np.linspace(0.0, 1.0, 5))
+        g.create_dataset("axis_1", data=np.linspace(0.0, 1.0, 5))
         # row-shaped but NOT in the schema's row set: must survive unsliced
         g.create_dataset("not_per_frame", data=np.arange(3.0))
         drop_integrated_rows(f, "entry/integrated_1d", [1])
@@ -84,7 +84,7 @@ def test_drop_integrated_rows_slices_only_schema_row_set(tmp_path):
         np.testing.assert_array_equal(g["frame_index"][()], [0, 2])
         assert g["intensity"].shape == (2, 5)
         assert g["sigma"].shape == (2, 5)
-        assert g["axis_x"].shape == (5,)              # shared axis untouched
+        assert g["axis_1"].shape == (5,)              # shared axis untouched
         assert g["not_per_frame"].shape == (3,)  # not declared -> not sliced
 
 
@@ -107,15 +107,15 @@ def test_dataset_spec_facts_are_frozen():
     stacks.  Changing any of these breaks files already on disk."""
     g1 = SCHEMA.groups["integrated_1d"].datasets
     g2 = SCHEMA.groups["integrated_2d"].datasets
-    assert set(g1) == {"intensity", "axis_x", "frame_index", "sigma"}
-    assert set(g2) == {"intensity", "axis_x", "axis_y", "frame_index", "sigma"}
+    assert set(g1) == {"intensity", "axis_1", "frame_index", "sigma"}
+    assert set(g2) == {"intensity", "axis_1", "axis_2", "frame_index", "sigma"}
     for g in (g1, g2):
         assert g["intensity"].dtype == "float32" and g["intensity"].compressed
         assert g["frame_index"].dtype == "int64"
         assert not g["sigma"].required          # optional on disk
         assert g["sigma"].compressed
-    assert g1["axis_x"].units_from == "radial_unit"
-    assert g2["axis_y"].units_from == "azimuthal_unit"
+    assert g1["axis_1"].units_from == "radial_unit"
+    assert g2["axis_2"].units_from == "azimuthal_unit"
     geo = SCHEMA.groups["per_frame_geometry"].datasets
     assert geo["incident_angle"].units_from == "deg"
     assert all(geo[k].units_from == "rad" for k in ("rot1", "rot2", "rot3"))
@@ -123,9 +123,9 @@ def test_dataset_spec_facts_are_frozen():
 
 def test_group_nx_attrs_declared():
     assert SCHEMA.groups["integrated_1d"].nx_attrs["axes"] == (
-        "frame_index", "axis_x")
+        "frame_index", "axis_1")
     assert SCHEMA.groups["integrated_2d"].nx_attrs["axes"] == (
-        "frame_index", "axis_y", "axis_x")
+        "frame_index", "axis_2", "axis_1")
     assert SCHEMA.groups["per_frame_geometry"].nx_attrs["NX_class"] == (
         "NXcollection")
 

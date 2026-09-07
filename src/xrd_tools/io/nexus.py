@@ -2002,7 +2002,7 @@ def _append_stacked_1d(
         )
         g.create_dataset("intensity", data=intensity[None, :],
                          maxshape=(None, n_q), chunks=(1, n_q), **comp_kwargs)
-        qd = g.create_dataset("axis_x", data=np.asarray(r.radial, dtype=np.float32))
+        qd = g.create_dataset("axis_1", data=np.asarray(r.radial, dtype=np.float32))
         qd.attrs.update(axis_display_metadata(r.unit))
         g.create_dataset("frame_index", data=np.asarray([idx], dtype=np.int64),
                          maxshape=(None,), chunks=(64,))
@@ -2171,9 +2171,9 @@ def _append_stacked_2d(
         g.create_dataset("intensity", data=intensity[None],
                          maxshape=(None, n_chi, n_q),
                          chunks=(1, n_chi, n_q), **comp_kwargs)
-        qd = g.create_dataset("axis_x", data=np.asarray(r.radial, dtype=np.float32))
+        qd = g.create_dataset("axis_1", data=np.asarray(r.radial, dtype=np.float32))
         qd.attrs.update(axis_display_metadata(r.unit))
-        cd = g.create_dataset("axis_y", data=np.asarray(r.azimuthal, dtype=np.float32))
+        cd = g.create_dataset("axis_2", data=np.asarray(r.azimuthal, dtype=np.float32))
         cd.attrs.update(axis_display_metadata(r.azimuthal_unit))
         g.create_dataset("frame_index", data=np.asarray([idx], dtype=np.int64),
                          maxshape=(None,), chunks=(64,))
@@ -2463,7 +2463,7 @@ def validate_integrated_stack_write(
             role=group_name_1d,
         )
         if g is not None:
-            for dataset_name in ("frame_index", "intensity", "axis_x"):
+            for dataset_name in ("frame_index", "intensity", "axis_1"):
                 if local_hard_dataset(
                     g,
                     dataset_name,
@@ -2498,7 +2498,7 @@ def validate_integrated_stack_write(
             role=group_name_2d,
         )
         if g is not None:
-            for dataset_name in ("frame_index", "intensity", "axis_x", "axis_y"):
+            for dataset_name in ("frame_index", "intensity", "axis_1", "axis_2"):
                 if local_hard_dataset(
                     g,
                     dataset_name,
@@ -3051,7 +3051,7 @@ def write_integrated_stack(
             np.stack([np.asarray(r.intensity, np.float32) for r in results]),
             ck=ck, row_chunk=(rows, n_q),
         )
-        qd = _schema_dataset(g, "integrated_1d", "axis_x", r0.radial, ck=ck)
+        qd = _schema_dataset(g, "integrated_1d", "axis_1", r0.radial, ck=ck)
         qd.attrs.update(axis_display_metadata(r0.unit))
         _schema_dataset(g, "integrated_1d", "frame_index", fis_, ck=ck)
         axis_kind = _axis_kind_1d(r0.unit)
@@ -3091,9 +3091,9 @@ def write_integrated_stack(
         ).value
         _schema_dataset(g, "integrated_2d", "intensity", stacked,
                         ck=ck, row_chunk=(rows_2d, n_chi, n_q))
-        qd = _schema_dataset(g, "integrated_2d", "axis_x", r0.radial, ck=ck)
+        qd = _schema_dataset(g, "integrated_2d", "axis_1", r0.radial, ck=ck)
         qd.attrs.update(axis_display_metadata(r0.unit))
-        cd = _schema_dataset(g, "integrated_2d", "axis_y", r0.azimuthal, ck=ck)
+        cd = _schema_dataset(g, "integrated_2d", "axis_2", r0.azimuthal, ck=ck)
         cd.attrs.update(axis_display_metadata(r0.azimuthal_unit))
         _schema_dataset(g, "integrated_2d", "frame_index", fis_, ck=ck)
         g.attrs[MONOTONIC_ATTR] = bool(
@@ -3662,7 +3662,7 @@ def write_stitched(
     Unlike the per-frame ``integrated_2d`` stack (``frame, y, x``), stitched
     intensity is stored **as-is** ``(x, y)`` and read with logical dims
     ``(q, chi)``. Current processed and neutral standalone outputs use
-    ``axis_x``/``axis_y`` tree names; explicit legacy artifacts retain q/chi.
+    ``axis_1``/``axis_2`` tree names; explicit legacy artifacts retain q/chi.
     Supplied groups replace their predecessors inside the caller's transaction.
 
     ``provenance`` (the StitchPlan + applied CorrectionStack — typically
@@ -5532,8 +5532,8 @@ def read_stitched(
             raise KeyError(f"No stitched_1d/2d in {path}:{entry}")
         if has_1d:
             g = e["stitched_1d"]
-            axis_x = _stitched_read_axis_names(g)[0]
-            coords["q"] = np.asarray(g[axis_x][()])
+            axis_1 = _stitched_read_axis_names(g)[0]
+            coords["q"] = np.asarray(g[axis_1][()])
             data_vars["stitched_1d"] = (("q",), np.asarray(g["intensity"][()]))
             if "sigma" in g:
                 data_vars["stitched_1d_sigma"] = (
@@ -5544,9 +5544,9 @@ def read_stitched(
                 attrs["stitched_1d_provenance"] = prov
         if has_2d:
             g = e["stitched_2d"]
-            axis_x, axis_y = _stitched_read_axis_names(g)
-            coords.setdefault("q", np.asarray(g[axis_x][()]))
-            coords["chi"] = np.asarray(g[axis_y][()])
+            axis_1, axis_2 = _stitched_read_axis_names(g)
+            coords.setdefault("q", np.asarray(g[axis_1][()]))
+            coords["chi"] = np.asarray(g[axis_2][()])
             data_vars["stitched_2d"] = (
                 ("q", "chi"), np.asarray(g["intensity"][()])
             )

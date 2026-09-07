@@ -36,7 +36,7 @@ from tests.core.test_stitch_operation import _prepared, _xu_prepared
 
 def _assert_neutral(group, payload=None):
     two_d = group.name.endswith("stitched_2d")
-    names = ("axis_x", "axis_y") if two_d else ("axis_x",)
+    names = ("axis_1", "axis_2") if two_d else ("axis_1",)
     assert "q" not in group and "chi" not in group
     assert tuple(group.attrs["axes"].astype(str)) == names
     assert validate_group_against_schema(group, group.name.rsplit("/", 1)[1]) == []
@@ -121,7 +121,7 @@ def test_neutral_artifact_refuses_old_physical_names_under_new_version(tmp_path,
     request, _ = _publish_fixture(tmp_path, version, "1d")
     with h5py.File(request.target, "r+") as handle:
         group = handle["entry/stitched_1d"]
-        group.move("axis_x", "q")
+        group.move("axis_1", "q")
         group.attrs["axes"] = ["q"]
     with pytest.raises(AnalysisArtifactInvalid, match="axes"):
         inspect_analysis_artifact(request.target)

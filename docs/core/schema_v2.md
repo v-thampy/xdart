@@ -42,11 +42,14 @@ Non-numeric columns are stored as UTF-8 variable-length string datasets with:
 - `missing_value = ""`
 - `description = "Per-frame scan metadata column"`
 
-Integrated coordinates use `axis_x` (1-D) and `axis_x`, `axis_y` (2-D), including
+Integrated coordinates use `axis_1` (1-D) and `axis_1`, `axis_2` (2-D), including
 named GI mode groups. Their NXdata `axes` attributes are respectively
-`[frame_index, axis_x]` and `[frame_index, axis_y, axis_x]`. Intensity orientation
+`[frame_index, axis_1]` and `[frame_index, axis_2, axis_1]`. Intensity orientation
 is unchanged: `(frame, y, x)`. Existing Python `q`/`chi` result fields and xarray
 coordinate names remain unchanged; these changes concern on-disk names only.
+Axis numbering identifies the first and second scientific coordinates, not
+NumPy dimension numbers. The interim prerelease `axis_x`/`axis_y` spelling is
+not supported; existing version-2 `q`/`chi` compatibility is retained.
 
 Readers should use dataset units and descriptions where present. Integrated
 axes carry the existing scientific unit tokens (for example `qip_A^-1`) and
@@ -55,8 +58,8 @@ Version 2 stores the same coordinates under `q`/`chi`. `integrated_2d` may also
 carry `two_d_kind` to distinguish standard `q/chi`, GI `qip/qoop`, GI
 `qtotal/chigi`, and exit-angle maps.
 
-New embedded `stitched_1d` and `stitched_2d` groups also use `axis_x` and
-`axis_x`, `axis_y`, with scientific `units` and `long_name`. Unlike integrated
+New embedded `stitched_1d` and `stitched_2d` groups also use `axis_1` and
+`axis_1`, `axis_2`, with scientific `units` and `long_name`. Unlike integrated
 stacks, stitched 2-D intensity remains **(x, y)**, with NXdata axes in that order;
 no array is transposed. `read_stitched` retains logical xarray `q`/`chi` names
 and reads the preceding exact embedded `q`/`chi` layout as well.

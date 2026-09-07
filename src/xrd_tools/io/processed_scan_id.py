@@ -262,7 +262,7 @@ def _valid_current_result_group(group: h5py.Group, name: str, version: int) -> b
     """Qualify one concrete supported stack, not a name-only marker."""
     try:
         x_name, y_name = integrated_axis_names(version)
-        other_names = ("axis_x", "axis_y") if version == 2 else ("q", "chi")
+        other_names = ("axis_1", "axis_2") if version == 2 else ("q", "chi")
         if any(key in group for key in other_names):
             return False
         expected_axes = (
@@ -608,11 +608,11 @@ def neutral_axis_upgrade(
         for _mode, group in pairs:
             names = ("q",) if dimension == "1d" else ("q", "chi")
             axes = (
-                ["frame_index", "axis_x"] if dimension == "1d"
-                else ["frame_index", "axis_y", "axis_x"]
+                ["frame_index", "axis_1"] if dimension == "1d"
+                else ["frame_index", "axis_2", "axis_1"]
             )
             attributes[group.name] = {"axes": np.asarray(axes, dtype=object)}
-            for old, new in zip(names, ("axis_x", "axis_y")):
+            for old, new in zip(names, ("axis_1", "axis_2")):
                 node = group[old]
                 renames[node.name] = new
                 unit = _attr_str(node.attrs.get("units", ""))
