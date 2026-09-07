@@ -821,3 +821,19 @@ def is_known_schema_name(value) -> bool:
 
 #: the singleton consumers import.
 SCHEMA = ProcessedScanSchema()
+
+# Stitch uses a separate physical layout while retaining logical q/chi APIs.
+# The preceding layouts stay available for exact old artifact/embedded reads.
+STITCH_NEUTRAL_AXIS_NAMES = MappingProxyType({"q": "axis_x", "chi": "axis_y"})
+STITCH_NEUTRAL_GROUPS = MappingProxyType({
+    name: GroupSchema(
+        name, axes=axes, datasets=_stitched_datasets(axes),
+        nx_attrs=MappingProxyType({
+            "NX_class": "NXdata", "signal": "intensity", "axes": axes,
+        }),
+    )
+    for name, axes in (
+        ("stitched_1d", ("axis_x",)),
+        ("stitched_2d", ("axis_x", "axis_y")),
+    )
+})

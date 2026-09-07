@@ -511,7 +511,7 @@ def test_prepare_binds_mode_source_selectors_and_provenance(tmp_path):
     assert provenance["geometry"]["relative_path"] == "geometry.json"
 
 
-def test_xu_prepare_binds_exact_intent_and_commits_v2_artifact(tmp_path):
+def test_xu_prepare_binds_exact_intent_and_commits_neutral_artifact(tmp_path):
     request = _xu_prepared(tmp_path)
     assert type(request.plan) is XuStitchOperationPlan
     assert request.plan.backend == "xu_hist"
@@ -534,7 +534,7 @@ def test_xu_prepare_binds_exact_intent_and_commits_v2_artifact(tmp_path):
     assert result.terminal.disposition is ModuleDisposition.COMMITTED
     assert result.terminal.request is request.module
     assert result.terminal.commit.request is request.module
-    assert result.payload.schema_version == 2
+    assert result.payload.schema_version == 5
     assert result.payload.execution_attestation_digest == (
         result.terminal.commit.execution_attestation_digest
     )
@@ -651,7 +651,7 @@ def test_xu_transient_reload_retry_never_replays_science_or_writer(
     execution = failed.value.execution
     recovered = execution.retry_verification()
     assert recovered.terminal.disposition is ModuleDisposition.COMMITTED
-    assert recovered.payload.schema_version == 2
+    assert recovered.payload.schema_version == 5
     assert execution.retry_verification() is recovered
     assert reads == ["read", "read"]
     assert writes == ["write"]
@@ -1147,7 +1147,7 @@ def test_transient_strict_reload_retry_does_not_replay_science_or_writer(
 
     def write_once(*args, **kwargs):
         writes.append("write")
-        assert kwargs["legacy_v1_unit_layout"] is True
+        assert kwargs["legacy_v1_unit_layout"] is False
         return real_write(*args, **kwargs)
 
     def science_once(*args, **kwargs):

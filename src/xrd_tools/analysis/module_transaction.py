@@ -30,6 +30,8 @@ from xrd_tools.io.analysis_artifact import (
     ANALYSIS_SCHEMA_VERSION,
     ANALYSIS_SCHEMA_VERSION_V2,
     ANALYSIS_SCHEMA_VERSION_V3,
+    ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
+    ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
     AnalysisArtifactCleanupPending,
     AnalysisArtifactKind,
     AnalysisArtifactOutput,
@@ -1163,6 +1165,17 @@ def module_artifact_request(
                 raise ModuleArtifactRefused(
                     "EXECUTION_ATTESTATION_COUNT_MISMATCH"
                 )
+    if request.kind is ModuleKind.STITCH:
+        schema_version = (
+            ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL
+            if carries_attestation else ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL
+        )
+    elif rsm_uses_cartesian_q:
+        schema_version = ANALYSIS_SCHEMA_VERSION_V3
+    else:
+        schema_version = (
+            ANALYSIS_SCHEMA_VERSION_V2 if carries_attestation else ANALYSIS_SCHEMA_VERSION
+        )
     artifact = AnalysisArtifactRequest(
         request.output.target,
         request.output.kind,
@@ -1172,15 +1185,7 @@ def module_artifact_request(
         request.plan_fingerprint,
         request.provenance_digest,
         provenance,
-        schema_version=(
-            ANALYSIS_SCHEMA_VERSION_V3
-            if rsm_uses_cartesian_q
-            else (
-                ANALYSIS_SCHEMA_VERSION_V2
-                if carries_attestation
-                else ANALYSIS_SCHEMA_VERSION
-            )
-        ),
+        schema_version=schema_version,
         execution_attestation_digest=execution_attestation_digest,
         execution_attestation=execution_attestation,
         module_owner=request,

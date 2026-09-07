@@ -901,7 +901,7 @@ def test_module_artifact_admission_and_commit_keep_exact_request(tmp_path):
     assert output.snapshot.remaining_lease_owners == ()
 
 
-def test_module_v2_commit_binds_separate_attestation_and_same_request(tmp_path):
+def test_module_neutral_stitch_commit_binds_separate_attestation_and_same_request(tmp_path):
     request, provenance = _xu_request(tmp_path)
     projection = project_analysis_artifact_result(
         kind=AnalysisArtifactKind.STITCH_1D,
@@ -924,7 +924,7 @@ def test_module_v2_commit_binds_separate_attestation_and_same_request(tmp_path):
         execution_attestation=attestation,
         execution_attestation_digest=digest,
     )
-    assert bound.schema_version == 2
+    assert bound.schema_version == 5
     output = admit_module_artifact(
         request,
         provenance,

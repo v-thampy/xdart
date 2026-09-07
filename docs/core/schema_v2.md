@@ -55,5 +55,21 @@ Version 2 stores the same coordinates under `q`/`chi`. `integrated_2d` may also
 carry `two_d_kind` to distinguish standard `q/chi`, GI `qip/qoop`, GI
 `qtotal/chigi`, and exit-angle maps.
 
-Stitched analysis groups and RSM retain their separate existing layouts; this
-version change does not rename H/K/L or Cartesian-Q coordinates.
+New embedded `stitched_1d` and `stitched_2d` groups also use `axis_x` and
+`axis_x`, `axis_y`, with scientific `units` and `long_name`. Unlike integrated
+stacks, stitched 2-D intensity remains **(x, y)**, with NXdata axes in that order;
+no array is transposed. `read_stitched` retains logical xarray `q`/`chi` names
+and reads the preceding exact embedded `q`/`chi` layout as well.
+
+Standalone Stitch operations have a different schema marker:
+`xrd_tools.analysis_artifact`. New ordinary Stitch artifacts use version 4;
+attested XU Stitch uses version 5. These retain the scientific contracts of
+artifact versions 1 and 2, respectively, while changing the physical axes to
+neutral names. Existing artifact versions 1 and 2 remain readable, and their
+explicit low-level writers remain available. Scientific result fingerprints use
+logical coordinates and do not change merely because the stored axes are renamed.
+These artifact version numbers are independent of processed-scan version 3.
+
+RSM artifact versions 2 (HKL) and 3 (Cartesian Q) retain their existing layouts.
+This migration does not rename H/K/L or Cartesian-Q coordinates or enable new
+Stitch/RSM modes.

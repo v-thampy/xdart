@@ -73,6 +73,7 @@ from xrd_tools.io.schema import (
     SCHEMA,
     SCHEMA_NAME_ATTR,
     SCHEMA_VERSION_ATTR,
+    STITCH_NEUTRAL_GROUPS,
     canonical_gi_mode_key,
     axis_display_metadata,
     local_hard_dataset,
@@ -2823,6 +2824,9 @@ def validate_group_against_schema(group: h5py.Group,
     """
     spec = SCHEMA.groups[group_name]
     problems: list[str] = []
+    neutral = STITCH_NEUTRAL_GROUPS.get(group_name)
+    if neutral is not None and _norm_attr(group.attrs.get("axes")) == list(neutral.axes):
+        spec = neutral
     for name, ds_spec in spec.datasets.items():
         if name not in group:
             if ds_spec.required:
@@ -3592,6 +3596,51 @@ def _bound_analysis_nxdata(group: h5py.Group, axes: tuple[str, ...]) -> None:
     _bounded_text_attr(group, "axes", axes)
 
 
+def _uses_neutral_stitch_axes(entry: h5py.Group, *, bounded_artifact: bool) -> bool:
+    version = entry.attrs.get(SCHEMA_VERSION_ATTR)
+    if bounded_artifact:
+        from xrd_tools.io.analysis_artifact import _STITCH_NEUTRAL_CONTRACTS
+
+        return version in _STITCH_NEUTRAL_CONTRACTS
+    marker = entry.attrs.get(SCHEMA_NAME_ATTR)
+    if isinstance(marker, bytes):
+        marker = marker.decode("utf-8")
+    return marker == PROCESSED_SCHEMA_NAME and version == PROCESSED_SCHEMA_VERSION
+
+
+def _finish_stitch_axis_layout(group: h5py.Group, *, bounded: bool) -> None:
+    """Relabel just-created axis links; never read or rewrite scientific arrays."""
+    schema = STITCH_NEUTRAL_GROUPS[group.name.rsplit("/", 1)[1]]
+    for logical, physical in zip(SCHEMA.groups[schema.name].axes, schema.axes, strict=True):
+        group.move(logical, physical)
+        axis = group[physical]
+        unit = axis.attrs["units"]
+        if isinstance(unit, bytes):
+            unit = unit.decode("utf-8")
+        label = axis_display_metadata(unit)["long_name"]
+        if bounded:
+            _bounded_text_attr(axis, "long_name", label)
+        else:
+            axis.attrs["long_name"] = label
+    if bounded:
+        _bound_analysis_nxdata(group, schema.axes)
+    else:
+        group.attrs["axes"] = list(schema.axes)
+
+
+def _stitched_read_axis_names(group: h5py.Group) -> tuple[str, ...]:
+    name = group.name.rsplit("/", 1)[1]
+    legacy = SCHEMA.groups[name].axes
+    neutral = STITCH_NEUTRAL_GROUPS[name].axes
+    declared = tuple(_norm_attr(group.attrs.get("axes", list(legacy))))
+    if declared not in (legacy, neutral):
+        raise ValueError("stitched axis layout is invalid")
+    present = tuple(axis for axis in (*legacy, *neutral) if axis in group)
+    if present != declared:
+        raise ValueError("stitched axis layout is mixed or incomplete")
+    return declared
+
+
 def write_stitched(
     entry_grp: h5py.Group,
     *,
@@ -3610,11 +3659,11 @@ def write_stitched(
     """Write ``/entry/stitched_1d`` / ``/entry/stitched_2d`` — the symmetric
     counterpart to :func:`read_stitched`.
 
-    Note the orientation: unlike the per-frame ``integrated_2d`` stack
-    (stored ``(frame, chi, q)``), ``stitched_2d/intensity`` is stored
-    **as-is** ``(n_q, n_chi)`` and read back with dims ``(q, chi)`` — this
-    matches the existing xdart writer + ``read_stitched`` so files stay
-    interchangeable.  Each group is replaced atomically (idempotent).
+    Unlike the per-frame ``integrated_2d`` stack (``frame, y, x``), stitched
+    intensity is stored **as-is** ``(x, y)`` and read with logical dims
+    ``(q, chi)``. Current processed and neutral standalone outputs use
+    ``axis_x``/``axis_y`` tree names; explicit legacy artifacts retain q/chi.
+    Supplied groups replace their predecessors inside the caller's transaction.
 
     ``provenance`` (the StitchPlan + applied CorrectionStack — typically
     ``StitchPlan.provenance()``) is stamped into each written group as a
@@ -3634,6 +3683,7 @@ def write_stitched(
         raise TypeError("bounded_artifact must be an exact bool")
     if type(legacy_v1_unit_layout) is not bool:
         raise TypeError("legacy_v1_unit_layout must be an exact bool")
+    neutral_axes = _uses_neutral_stitch_axes(entry_grp, bounded_artifact=bounded_artifact)
     if result_projection is not None:
         from xrd_tools.io.analysis_artifact import (
             AnalysisArtifactKind,
@@ -3720,6 +3770,8 @@ def write_stitched(
             "provenance_json",
             data=np.bytes_(prov_json.encode("utf-8")),
         )
+        if neutral_axes:
+            _finish_stitch_axis_layout(group, bounded=True)
         return
     if bounded_artifact:
         from xrd_tools.io.analysis_artifact import (
@@ -3779,7 +3831,7 @@ def write_stitched(
         return write_stitched(
             entry_grp,
             result_projection=projection,
-            legacy_v1_unit_layout=True,
+            legacy_v1_unit_layout=not neutral_axes,
             provenance=provenance,
             compression=compression,
             bounded_artifact=True,
@@ -3923,6 +3975,10 @@ def write_stitched(
     if frame_records:
         from xrd_tools.io.nexus_record import write_contributing_frames  # noqa: PLC0415
         write_contributing_frames(entry_grp, frame_records, source_base=source_base)
+    if neutral_axes:
+        for name, value in (("stitched_1d", stitched_1d), ("stitched_2d", stitched_2d)):
+            if value is not None:
+                _finish_stitch_axis_layout(entry_grp[name], bounded=False)
 
 
 def write_rsm(
@@ -5443,10 +5499,10 @@ def read_stitched(
     *,
     entry: str = "entry",
 ):
-    """Read ``stitched_1d`` / ``stitched_2d`` if present (v2 only).
+    """Read embedded Stitch groups in qualified processed v2/v3 files.
 
-    v1 schema doesn't have stitched outputs — :class:`KeyError` is
-    raised on v1 files regardless of which entry is requested.
+    Neutral and preceding q/chi physical layouts return logical q/chi xarray
+    coordinates. Standalone analysis files use ``read_analysis_artifact``.
     """
     import xarray as xr
 
@@ -5476,7 +5532,8 @@ def read_stitched(
             raise KeyError(f"No stitched_1d/2d in {path}:{entry}")
         if has_1d:
             g = e["stitched_1d"]
-            coords["q"] = np.asarray(g["q"][()])
+            axis_x = _stitched_read_axis_names(g)[0]
+            coords["q"] = np.asarray(g[axis_x][()])
             data_vars["stitched_1d"] = (("q",), np.asarray(g["intensity"][()]))
             if "sigma" in g:
                 data_vars["stitched_1d_sigma"] = (
@@ -5487,8 +5544,9 @@ def read_stitched(
                 attrs["stitched_1d_provenance"] = prov
         if has_2d:
             g = e["stitched_2d"]
-            coords.setdefault("q", np.asarray(g["q"][()]))
-            coords["chi"] = np.asarray(g["chi"][()])
+            axis_x, axis_y = _stitched_read_axis_names(g)
+            coords.setdefault("q", np.asarray(g[axis_x][()]))
+            coords["chi"] = np.asarray(g[axis_y][()])
             data_vars["stitched_2d"] = (
                 ("q", "chi"), np.asarray(g["intensity"][()])
             )

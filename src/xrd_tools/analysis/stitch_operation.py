@@ -61,6 +61,8 @@ from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.core.geometry import AngleMapping, Diffractometer, ImageOrientation
 from xrd_tools.core.scan import SourceKind
 from xrd_tools.io.analysis_artifact import (
+    ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
+    ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
     AnalysisArtifactCleanupPending,
     AnalysisArtifactKind,
     AnalysisArtifactOverwrite,
@@ -2278,7 +2280,7 @@ class StitchOperationExecution:
             )
         if type(self.request.plan) is XuStitchOperationPlan:
             if (
-                payload.schema_version != 2
+                payload.schema_version != ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL
                 or payload.execution_attestation_json
                 != self._execution_attestation_json
                 or payload.execution_attestation_digest
@@ -2293,7 +2295,7 @@ class StitchOperationExecution:
                     "strict XU Stitch attestation no longer matches execution",
                 )
         elif (
-            payload.schema_version != 1
+            payload.schema_version != ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL
             or payload.execution_attestation_json is not None
             or payload.execution_attestation_digest is not None
             or terminal.commit.execution_attestation_digest is not None
@@ -2680,7 +2682,7 @@ class StitchOperationExecution:
             write_stitched(
                 entry,
                 result_projection=result_projection,
-                legacy_v1_unit_layout=True,
+                legacy_v1_unit_layout=False,
                 provenance=bound.provenance_json,
                 bounded_artifact=True,
             )

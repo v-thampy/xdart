@@ -226,12 +226,12 @@ def test_xu_form_is_backend_tagged_and_preflight_binds_asset_runtime(tmp_path):
     ] == [17000.018, 17000.018]
 
 
-def test_xu_form_runs_its_production_spec_raw_request_to_v2(tmp_path):
+def test_xu_form_runs_its_production_spec_raw_request_to_neutral_artifact(tmp_path):
     preflight = prepare_stitch_tool(_xu_form(tmp_path))
     result = run_stitch_operation(preflight.request)
     assert result.terminal.disposition is ModuleDisposition.COMMITTED
     assert result.terminal.request is preflight.request.module
-    assert result.payload.schema_version == 2
+    assert result.payload.schema_version == 5
     assert result.payload.execution_attestation_digest == (
         result.terminal.commit.execution_attestation_digest
     )

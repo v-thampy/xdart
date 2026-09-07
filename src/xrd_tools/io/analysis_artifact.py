@@ -44,6 +44,10 @@ ANALYSIS_SCHEMA_VERSION_ATTR = "ssrl_schema_version"
 ANALYSIS_SCHEMA_VERSION = 1
 ANALYSIS_SCHEMA_VERSION_V2 = 2
 ANALYSIS_SCHEMA_VERSION_V3 = 3
+ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL = 4
+ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL = 5
+# Keep ordinary and attested science contracts distinct; only physical names change.
+_STITCH_NEUTRAL_CONTRACTS = {4: 1, 5: 2}
 ANALYSIS_KIND_ATTR = "analysis_kind"
 _ENTRY = "entry"
 _PROVENANCE = "provenance_json"
@@ -68,6 +72,18 @@ _ANALYSIS_PAYLOAD_FACTORY = object()
 _ANALYSIS_CANDIDATE_INSPECTION = object()
 _ANALYSIS_PROJECTION_FACTORY = object()
 _ANALYSIS_V1_DECODE_PROJECTION = object()
+
+
+def _artifact_contract_version(version: int) -> int:
+    return _STITCH_NEUTRAL_CONTRACTS.get(version, version)
+
+
+def _artifact_axis_name(version: int, logical_name: str) -> str:
+    if version in _STITCH_NEUTRAL_CONTRACTS:
+        from xrd_tools.io.schema import STITCH_NEUTRAL_AXIS_NAMES
+
+        return STITCH_NEUTRAL_AXIS_NAMES[logical_name]
+    return logical_name
 
 
 class AnalysisArtifactKind(str, Enum):
@@ -701,9 +717,18 @@ class AnalysisArtifactRequest:
             ANALYSIS_SCHEMA_VERSION,
             ANALYSIS_SCHEMA_VERSION_V2,
             ANALYSIS_SCHEMA_VERSION_V3,
+            ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
+            ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
         }:
             raise TypeError("analysis artifact schema version is unsupported")
-        if self.schema_version == ANALYSIS_SCHEMA_VERSION:
+        if self.schema_version in _STITCH_NEUTRAL_CONTRACTS and (
+            self.kind not in {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}
+            or (self.schema_version == ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL
+                and self.kind is not AnalysisArtifactKind.STITCH_1D)
+        ):
+            raise ValueError("neutral analysis artifact requires its Stitch kind")
+        contract_version = _artifact_contract_version(self.schema_version)
+        if contract_version == ANALYSIS_SCHEMA_VERSION:
             if (
                 self.execution_attestation_digest is not None
                 or execution_attestation is not None
@@ -1921,10 +1946,13 @@ def inspect_analysis_artifact(
                 ANALYSIS_SCHEMA_VERSION,
                 ANALYSIS_SCHEMA_VERSION_V2,
                 ANALYSIS_SCHEMA_VERSION_V3,
+                ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
+                ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
             }:
                 raise AnalysisArtifactInvalid(
                     "analysis artifact schema version is unsupported"
                 )
+            contract_version = _artifact_contract_version(version)
             expected_entry_attrs = {
                 "NX_class",
                 ANALYSIS_SCHEMA_ATTR,
@@ -1936,7 +1964,7 @@ def inspect_analysis_artifact(
                 "provenance_digest",
                 "file_name",
             }
-            if version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
+            if contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
                 expected_entry_attrs.add(_EXECUTION_ATTESTATION_DIGEST_ATTR)
             if len(entry.attrs) != len(expected_entry_attrs) or any(
                 name not in expected_entry_attrs for name in entry.attrs
@@ -1959,6 +1987,12 @@ def inspect_analysis_artifact(
                 raise AnalysisArtifactInvalid(
                     "analysis artifact v3 is reserved for frame-aware RSM"
                 )
+            if version in _STITCH_NEUTRAL_CONTRACTS and (
+                kind not in {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}
+                or (version == ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL
+                    and kind is not AnalysisArtifactKind.STITCH_1D)
+            ):
+                raise AnalysisArtifactInvalid("neutral analysis artifact requires its Stitch kind")
             expected = expected_request.kind if expected_request is not None else expected_kind
             if expected is not None and kind is not expected:
                 raise AnalysisArtifactInvalid("analysis artifact kind does not match request")
@@ -1982,7 +2016,7 @@ def inspect_analysis_artifact(
                 if expected_request is not None and value != getattr(expected_request, request_attr):
                     raise AnalysisArtifactInvalid(f"analysis artifact {attr} changed")
             execution_attestation_digest = None
-            if version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
+            if contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
                 execution_attestation_digest = _sha256(
                     _exact_sha256_attr_text(
                         entry, _EXECUTION_ATTESTATION_DIGEST_ATTR
@@ -2006,7 +2040,7 @@ def inspect_analysis_artifact(
             if final_name != expected_name:
                 raise AnalysisArtifactInvalid("analysis artifact records a private candidate path")
             expected_entry_children = 2 + int(
-                version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}
+                contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}
             )
             if len(entry) != expected_entry_children:
                 raise AnalysisArtifactInvalid(
@@ -2023,7 +2057,7 @@ def inspect_analysis_artifact(
             # source identity meanwhile; an unbound raw-popup graph must not
             # acquire artifact authority merely by being local-hard HDF5.
             allowed = {kind.group, _PROVENANCE}
-            if version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
+            if contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
                 allowed.add(_EXECUTION_ATTESTATION)
             if any(name not in allowed for name in entry):
                 raise AnalysisArtifactInvalid("analysis artifact contains an unknown entry graph")
@@ -2031,7 +2065,7 @@ def inspect_analysis_artifact(
             if expected_request is not None and provenance != expected_request.provenance_json:
                 raise AnalysisArtifactInvalid("analysis artifact provenance changed")
             execution_attestation_json = None
-            if version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
+            if contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
                 execution_attestation_json = _read_scalar_execution_attestation(
                     entry,
                     _EXECUTION_ATTESTATION,
@@ -2112,9 +2146,10 @@ def inspect_analysis_artifact(
                     AnalysisArtifactKind.STITCH_2D: ("q", "chi"),
                     AnalysisArtifactKind.RSM: ("h", "k", "l"),
                 }[kind]
-            if _bounded_attr_texts(result, "axes") != axis_names:
+            stored_axis_names = tuple(_artifact_axis_name(version, name) for name in axis_names)
+            if _bounded_attr_texts(result, "axes") != stored_axis_names:
                 raise AnalysisArtifactInvalid("analysis result axes are invalid")
-            allowed_result = {"intensity", _PROVENANCE, *axis_names}
+            allowed_result = {"intensity", _PROVENANCE, *stored_axis_names}
             if kind in {
                 AnalysisArtifactKind.STITCH_1D,
                 AnalysisArtifactKind.STITCH_2D,
@@ -2142,9 +2177,9 @@ def inspect_analysis_artifact(
                 raise AnalysisArtifactInvalid(
                     "analysis result contains an unknown graph"
                 )
-            axes = tuple((name, _axis(result, name)) for name in axis_names)
+            axes = tuple((name, _axis(result, _artifact_axis_name(version, name))) for name in axis_names)
             for name, _values in axes:
-                axis = _direct(result, name, h5py.Dataset)
+                axis = _direct(result, _artifact_axis_name(version, name), h5py.Dataset)
                 expected_axis_attrs = set()
                 if kind in {
                     AnalysisArtifactKind.STITCH_1D,
@@ -2161,6 +2196,13 @@ def inspect_analysis_artifact(
                     is not None
                 ):
                     expected_axis_attrs.add("units")
+                if version in _STITCH_NEUTRAL_CONTRACTS:
+                    from xrd_tools.io.schema import axis_display_metadata
+
+                    expected_axis_attrs.add("long_name")
+                    expected_label = axis_display_metadata(_bounded_attr_text(axis, "units"))["long_name"]
+                    if _bounded_attr_text(axis, "long_name") != expected_label:
+                        raise AnalysisArtifactInvalid(f"analysis axis {name} display label is invalid")
                 if len(axis.attrs) != len(expected_axis_attrs) or any(
                     attr not in expected_axis_attrs for attr in axis.attrs
                 ):
@@ -2174,13 +2216,13 @@ def inspect_analysis_artifact(
                 AnalysisArtifactKind.STITCH_1D,
                 AnalysisArtifactKind.STITCH_2D,
             }:
-                q = _direct(result, "q", h5py.Dataset)
+                q = _direct(result, _artifact_axis_name(version, "q"), h5py.Dataset)
                 q_units = _bounded_attr_text(q, "units")
                 if not q_units:
                     raise AnalysisArtifactInvalid("stitched q units are invalid")
                 axis_units[0] = ("q", q_units)
             if kind is AnalysisArtifactKind.STITCH_2D:
-                chi = _direct(result, "chi", h5py.Dataset)
+                chi = _direct(result, _artifact_axis_name(version, "chi"), h5py.Dataset)
                 chi_units = _bounded_attr_text(chi, "units")
                 if not chi_units:
                     raise AnalysisArtifactInvalid("stitched chi units are invalid")
@@ -2204,7 +2246,7 @@ def inspect_analysis_artifact(
                             f"analysis RSM axis {name} units are invalid"
                         )
                     axis_units[index] = (name, observed_units)
-            if version == ANALYSIS_SCHEMA_VERSION_V2:
+            if contract_version == ANALYSIS_SCHEMA_VERSION_V2:
                 if kind is AnalysisArtifactKind.STITCH_1D:
                     if (
                         axis_units != [("q", "q_A^-1")]
@@ -2319,14 +2361,14 @@ def inspect_analysis_artifact(
                     normalization=normalization_values,
                     _stored_v1_claim=(
                         _ANALYSIS_V1_DECODE_PROJECTION
-                        if version == ANALYSIS_SCHEMA_VERSION
+                        if contract_version == ANALYSIS_SCHEMA_VERSION
                         else None
                     ),
                 )
             except AnalysisArtifactProjectionInvalid as error:
                 raise AnalysisArtifactInvalid(str(error)) from error
             if (
-                version == ANALYSIS_SCHEMA_VERSION_V2
+                contract_version == ANALYSIS_SCHEMA_VERSION_V2
                 and kind is AnalysisArtifactKind.STITCH_1D
             ):
                 empty_coverage = projection.coverage == 0
@@ -2467,7 +2509,7 @@ def read_analysis_artifact(
             entry = _direct(handle, _ENTRY, h5py.Group)
             result = _direct(entry, inspection.group, h5py.Group)
             axes = tuple(
-                (name, _axis(result, name))
+                (name, _axis(result, _artifact_axis_name(inspection.schema_version, name)))
                 for name, _length in inspection.axes
             )
             intensity = _materialize_bounded_values(
@@ -2512,7 +2554,7 @@ def read_analysis_artifact(
                 AnalysisArtifactKind.STITCH_2D,
             }:
                 q_units = _bounded_attr_text(
-                    _direct(result, "q", h5py.Dataset),
+                    _direct(result, _artifact_axis_name(inspection.schema_version, "q"), h5py.Dataset),
                     "units",
                 )
                 if q_units != units["q"]:
@@ -2521,7 +2563,7 @@ def read_analysis_artifact(
                     )
             if inspection.kind is AnalysisArtifactKind.STITCH_2D:
                 chi_units = _bounded_attr_text(
-                    _direct(result, "chi", h5py.Dataset),
+                    _direct(result, _artifact_axis_name(inspection.schema_version, "chi"), h5py.Dataset),
                     "units",
                 )
                 if chi_units != units["chi"]:
@@ -2554,7 +2596,7 @@ def read_analysis_artifact(
                     normalization=normalization,
                     _stored_v1_claim=(
                         _ANALYSIS_V1_DECODE_PROJECTION
-                        if inspection.schema_version
+                        if _artifact_contract_version(inspection.schema_version)
                         == ANALYSIS_SCHEMA_VERSION
                         else None
                     ),
@@ -2704,7 +2746,7 @@ class AnalysisArtifactOutput:
                 ("file_name", self.request.target),
             ):
                 entry.attrs.create(name, np.bytes_(value.encode("utf-8")))
-            if self.request.schema_version in {
+            if _artifact_contract_version(self.request.schema_version) in {
                 ANALYSIS_SCHEMA_VERSION_V2,
                 ANALYSIS_SCHEMA_VERSION_V3,
             }:
@@ -2720,7 +2762,7 @@ class AnalysisArtifactOutput:
                 _PROVENANCE,
                 data=np.bytes_(self.request.provenance_json.encode("utf-8")),
             )
-            if self.request.schema_version in {
+            if _artifact_contract_version(self.request.schema_version) in {
                 ANALYSIS_SCHEMA_VERSION_V2,
                 ANALYSIS_SCHEMA_VERSION_V3,
             }:
@@ -3063,6 +3105,8 @@ __all__ = [
     "ANALYSIS_SCHEMA_VERSION",
     "ANALYSIS_SCHEMA_VERSION_V2",
     "ANALYSIS_SCHEMA_VERSION_V3",
+    "ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL",
+    "ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL",
     "ANALYSIS_SCHEMA_VERSION_ATTR",
     "AnalysisArtifactCleanupPending",
     "AnalysisArtifactError",
