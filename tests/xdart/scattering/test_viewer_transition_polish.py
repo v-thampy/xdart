@@ -60,6 +60,8 @@ def test_new_hdf_file_has_no_teardown_or_zero_one_range(viewer_2d, monkeypatch):
         assert view.viewer_loading_snapshot_visible
         assert view._viewer_loading_notice.text() == "Loading — previous view"
         assert 0 < view.viewer_loading_snapshot_pixels <= 2_000_000
+        pixmap = view._viewer_loading_pixmap.pixmap()
+        assert view.viewer_loading_snapshot_pixels == pixmap.width() * pixmap.height()
         assert view._viewer_loading_overlay.geometry() == QtCore.QRect(
             view.raw.canvas.mapTo(view, QtCore.QPoint()),
             view.raw.canvas.size(),

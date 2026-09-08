@@ -240,11 +240,10 @@ def _waterfall_rows_on_reference_axis(traces) -> np.ndarray | None:
 
 
 def _pixmap_pixel_count(pixmap) -> int:
-    ratio = pixmap.devicePixelRatio()
-    return (
-        int(round(pixmap.width() * ratio))
-        * int(round(pixmap.height() * ratio))
-    )
+    # QPixmap dimensions already count backing pixels. DevicePixelRatio only
+    # converts them to logical screen coordinates; multiplying again would
+    # unnecessarily downsample a Retina preview a second time.
+    return pixmap.width() * pixmap.height()
 
 
 class ScientificView(QtWidgets.QFrame):
