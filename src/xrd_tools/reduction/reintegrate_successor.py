@@ -42,6 +42,10 @@ from xrd_tools.io.finite_artifact import (
     FiniteFileSnapshot,
     FiniteSourceAdmission,
     _replay_finite_artifact_request,
+    _operation_context_payload_values,
+    _operation_payload,
+    _publication_payload,
+    _version_payload,
     admit_finite_artifact_lineage,
     capture_finite_predecessor,
     capture_finite_source,
@@ -1432,46 +1436,27 @@ def _validate_finite_projection(
         or finite["output_schema"] != _OUTPUT_SCHEMA
     ):
         raise ValueError("recipe finite output is noncanonical")
-    version_payload = {
-        "algorithm_identity": finite["algorithm_identity"],
-        "domain": "xdart.finite-artifact-version.v1",
-        "entry": qualified.entry,
-        "operation_kind": f"reintegrate-{qualified.dimension}",
-        "output_schema": finite["output_schema"],
-        "preservation_identity": finite["preservation_identity"],
-        "scientific_identity": finite["science_identity"],
-        "source_graph_identity": finite["source_graph_identity"],
-    }
+    version_payload = _version_payload(
+        algorithm_identity=finite["algorithm_identity"],
+        entry=qualified.entry,
+        operation_kind=f"reintegrate-{qualified.dimension}",
+        output_schema=finite["output_schema"],
+        preservation_identity=finite["preservation_identity"],
+        scientific_identity=finite["science_identity"],
+        source_graph_identity=finite["source_graph_identity"],
+    )
     version = _sha(version_payload)
-    publication = _sha({
-        "domain": "xdart.finite-artifact-publication.v1",
-        "output_artifact": output,
-        "version_identity": version,
-    })
-    context = _sha({
-        "custody_identity": finite["custody_identity"],
-        "domain": "xdart.finite-artifact-operation-context.v1",
-        "request_generation_identity": finite["request_generation_identity"],
-        "resource_allocation_identity": finite["resource_allocation_identity"],
-        "route_identity": finite["route_identity"],
-        "source_snapshot": {
-            "ctime_ns": snapshot.ctime_ns,
-            "device": snapshot.device,
-            "digest": snapshot.digest,
-            "inode": snapshot.inode,
-            "mode": snapshot.mode,
-            "mtime_ns": snapshot.mtime_ns,
-            "size": snapshot.size,
-        },
-    })
-    operation = _sha({
-        "domain": "xdart.finite-artifact-operation.v1",
-        "operation_context_identity": context,
-        "output_artifact": output,
-        "publication_identity": publication,
-        "source_artifact": snapshot.path,
-        "version_identity": version,
-    })
+    publication = _sha(_publication_payload(output, version))
+    context = _sha(_operation_context_payload_values(
+        snapshot,
+        finite["request_generation_identity"],
+        finite["resource_allocation_identity"],
+        finite["route_identity"],
+        finite["custody_identity"],
+    ))
+    operation = _sha(_operation_payload(
+        context, output, publication, snapshot.path, version,
+    ))
     lineage = admit_finite_artifact_lineage(finite["lineage_json"])
     payload = json.loads(lineage.canonical_json)
     predecessor = payload["predecessor"]
