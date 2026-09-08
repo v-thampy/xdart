@@ -611,7 +611,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._presentation_targets: deque[DisplayFrameKey] = deque(maxlen=1)
         self._presentation_run_identity: RunIdentity | None = None
         self._live_plot_interval_ms = _live_plot_interval_ms()
-        self._last_live_plot_at: float | None = None
+        self._image_plot_at: float | None = None
+        self._curve_plot_at: float | None = None
+        self._dense_plot_at: float | None = None
+        self._image_plot_pending = False
+        self._curve_plot_pending = False
+        self._dense_plot_pending = False
         self._scientific_repaint_pending = False
         self._waterfall_candidate_count = 0
         self._browse_1d_release_debt: Browse1DBorrowBundle | None = None
@@ -750,6 +755,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
         self._run_timer = QtCore.QTimer(self)
         self._run_timer.setInterval(_LIVE_EVENT_DRAIN_INTERVAL_MS)
+        self._plot_deadline_timer = QtCore.QTimer(self)
+        self._plot_deadline_timer.setSingleShot(True)
         self._browser_catalog_timer = QtCore.QTimer(self)
         self._browser_catalog_timer.setInterval(
             _BROWSER_CATALOG_REFRESH_INTERVAL_MS
@@ -786,6 +793,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             (self._browserCatalogFinished, self._on_browser_catalog)
         )
         self._connect(self._run_timer.timeout, self._drain_executor)
+        self._connect(
+            self._plot_deadline_timer.timeout, self._flush_live_plot_deadline,
+        )
         self._connect(
             self._browser_catalog_timer.timeout,
             self._poll_browser_catalog,
@@ -2639,6 +2649,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                            self._peak_dialog, self._phase_dialog):
                 if dialog is not None: dialog.close()
             ScatteringWorkspace._clear_presentation_targets(self)
+            self._clear_live_plot_schedule()
             self._source_selection.begin_close()
             self._shell.browser.cancel_pending_frame_selection()
             self._run_timer.stop()
@@ -2956,6 +2967,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         ):
             return
         kind = command.kind
+        if kind in {
+            ShellCommandKind.SHOW_ALL,
+            ShellCommandKind.SELECT_SCAN,
+            ShellCommandKind.SELECT_FRAME,
+            ShellCommandKind.HYDRATE_FRAME,
+            ShellCommandKind.SELECT_BROWSER_FRAMES,
+        }:
+            self._clear_live_plot_schedule()
         if kind is ShellCommandKind.LAUNCH_EXTERNAL_VIEWER:
             tool = external_tool_id(command.value)
             if tool is None:
@@ -3211,6 +3230,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._edit_run_strip(kind, command.value)
             return
         if self._edit_scientific_preference(command):
+            self._clear_live_plot_schedule()
             self._refresh_shell()
 
     def _run_action(self) -> None:
@@ -3714,6 +3734,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 outcome.configuration,
             )
             ScatteringWorkspace._clear_presentation_targets(self)
+            self._clear_live_plot_schedule()
             launched_source = outcome.source_capture.source
             self._source_selection.set_launched_source(
                 launched_source,
@@ -3728,7 +3749,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             self._apply_batch_retirement(retirement)
             self._run_frame_seen = False
-            self._last_live_plot_at = None
             self._scientific_repaint_pending = False
             self._waterfall_candidate_count = 0
             self._quartile_refresh_identity = (
@@ -4040,6 +4060,125 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if hasattr(self, "_background_owner"):
             self._release_display_background()
 
+    def _clear_live_plot_schedule(self) -> None:
+        self._image_plot_pending = False
+        self._curve_plot_pending = False
+        self._dense_plot_pending = False
+        self._image_plot_at = None
+        self._curve_plot_at = None
+        self._dense_plot_at = None
+        timer = getattr(self, "_plot_deadline_timer", None)
+        if timer is not None:
+            timer.stop()
+
+    def _live_plot_pending(self) -> bool:
+        return bool(
+            self._image_plot_pending
+            or self._curve_plot_pending
+            or self._dense_plot_pending
+        )
+
+    def _live_plot_bottom_is_dense(self) -> bool:
+        view = self._shell.scientific
+        return waterfall_should_be_active(
+            self._preferences.plot_mode,
+            self._waterfall_candidate_count,
+            was_active=view.bottom_waterfall_active,
+        )
+
+    def _live_plot_interval(self, *, dense: bool) -> float:
+        interval_ms = max(
+            self._live_plot_interval_ms,
+            500 if dense else 0,
+        )
+        return interval_ms / 1000.0
+
+    def _live_plot_due(self, *, dense: bool, image: bool) -> bool:
+        last = (
+            self._image_plot_at if image else
+            self._dense_plot_at if dense else self._curve_plot_at
+        )
+        return (
+            last is None
+            or time.monotonic() - last >= self._live_plot_interval(
+                dense=dense,
+            )
+        )
+
+    def _arm_live_plot_deadline(self) -> None:
+        deadlines = []
+        now = time.monotonic()
+        if self._image_plot_pending and self._image_plot_at is not None:
+            deadlines.append(
+                self._image_plot_at + self._live_plot_interval(dense=False)
+            )
+        if self._curve_plot_pending and self._curve_plot_at is not None:
+            deadlines.append(
+                self._curve_plot_at + self._live_plot_interval(dense=False)
+            )
+        if self._dense_plot_pending and self._dense_plot_at is not None:
+            deadlines.append(
+                self._dense_plot_at + self._live_plot_interval(dense=True)
+            )
+        timer = self._plot_deadline_timer
+        timer.stop()
+        if deadlines and not self._closing and not self._closed:
+            timer.start(max(1, math.ceil((min(deadlines) - now) * 1000)))
+
+    def _defer_live_plot_panes(self) -> tuple[bool, bool]:
+        dense = self._live_plot_bottom_is_dense()
+        image_due = self._live_plot_due(dense=False, image=True)
+        bottom_due = self._live_plot_due(dense=dense, image=False)
+        if not image_due:
+            self._image_plot_pending = True
+        if dense:
+            self._curve_plot_pending = False
+            if not bottom_due:
+                self._dense_plot_pending = True
+        else:
+            self._dense_plot_pending = False
+            if not bottom_due:
+                self._curve_plot_pending = True
+        self._arm_live_plot_deadline()
+        return not image_due, not bottom_due
+
+    def _record_live_plot_panes(
+        self, *, defer_image_render: bool, defer_bottom_render: bool,
+    ) -> None:
+        now = time.monotonic()
+        if not defer_image_render:
+            self._image_plot_at = now
+            self._image_plot_pending = False
+        if not defer_bottom_render:
+            if self._shell.scientific.bottom_waterfall_active:
+                self._dense_plot_at = now
+                self._dense_plot_pending = False
+                self._curve_plot_pending = False
+            else:
+                self._curve_plot_at = now
+                self._curve_plot_pending = False
+                self._dense_plot_pending = False
+        self._arm_live_plot_deadline()
+
+    def _flush_live_plot_deadline(self) -> None:
+        if self._closing or self._closed:
+            self._clear_live_plot_schedule()
+            return
+        dense = self._live_plot_bottom_is_dense()
+        image_due = self._image_plot_pending and self._live_plot_due(
+            dense=False, image=True,
+        )
+        bottom_due = (
+            self._dense_plot_pending if dense else self._curve_plot_pending
+        ) and self._live_plot_due(dense=dense, image=False)
+        if image_due or bottom_due:
+            self._refresh_event_shell(
+                defer_image_render=not image_due,
+                defer_bottom_render=not bottom_due,
+            )
+        else:
+            self._arm_live_plot_deadline()
+
     def _presentation_pacing_active(self, identity: RunIdentity) -> bool:
         controller = self._context_controller
         context, selection = controller.acquisition_context, controller.selection
@@ -4093,6 +4232,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         identity = getattr(self, "_presentation_run_identity", None)
         targets = tuple(getattr(self, "_presentation_targets", ()))
         ScatteringWorkspace._clear_presentation_targets(self)
+        self._clear_live_plot_schedule()
         if identity is None:
             return False
         return any(self._select_presentation_target(identity, frame)
@@ -4407,7 +4547,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             rendered_trace_count = scientific_view.trace_row_count
             if self._retain_outgoing_display:
                 pass
-            elif self._scientific_repaint_pending:
+            elif (
+                self._scientific_repaint_pending
+                or self._live_plot_pending()
+            ):
                 self._waterfall_candidate_count = max(
                     self._waterfall_candidate_count,
                     rendered_trace_count,
@@ -4459,6 +4602,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._context_controller.adopt_acquisition(
                         event.run_identity
                     )
+                    self._clear_live_plot_schedule()
                     changed = True
                     force_scientific = True
                 except Exception as error:
@@ -4737,14 +4881,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             changed = True
             frame_presentation_changed = True
         if self._scientific_repaint_pending:
-            last_plot = self._last_live_plot_at
-            if (
-                last_plot is None
-                or time.monotonic() - last_plot
-                >= self._live_plot_interval_ms / 1000.0
-            ):
-                changed = True
-                force_scientific = True
+            changed = True
+            force_scientific = True
         if controls_refresh and not changed:
             self._refresh_shell(
                 preserve_display=True,
@@ -4785,19 +4923,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 or reuse_terminal_science
                 or hold_complete_terminal_science
             )
-            last_plot = self._last_live_plot_at
+            defer_image_render = False
+            defer_bottom_render = False
             if (
                 not preserve_scientific
-                and
-                frame_presentation_changed
+                and frame_presentation_changed
                 and not force_scientific
-                and self._live_plot_interval_ms
-                > _LIVE_EVENT_DRAIN_INTERVAL_MS
-                and last_plot is not None
-                and time.monotonic() - last_plot
-                < self._live_plot_interval_ms / 1000.0
+                and self._lifecycle.phase is RunPhase.RUNNING
             ):
-                preserve_scientific = True
+                defer_image_render, defer_bottom_render = (
+                    self._defer_live_plot_panes()
+                )
+                preserve_scientific = (
+                    defer_image_render and defer_bottom_render
+                )
             if preserve_scientific:
                 if hold_batch_terminal_science:
                     self._scientific_repaint_pending = False
@@ -4829,11 +4968,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                             applied=self._shell_revision > prior_revision,
                         )
                 else:
-                    self._scientific_repaint_pending = not (
-                        defer_terminal_science
-                        and terminal_science_complete
-                        or hold_complete_terminal_science
-                    )
                     self._refresh_event_shell(
                         preserve_scientific=True,
                         skip_scientific_projection=True,
@@ -4860,7 +4994,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     )
                 )
                 prior_revision = self._shell_revision
-                self._refresh_event_shell(terminal_paint=paint)
+                self._refresh_event_shell(
+                    terminal_paint=paint,
+                    defer_image_render=defer_image_render,
+                    defer_bottom_render=defer_bottom_render,
+                )
                 if paint is not None:
                     self._complete_processed_terminal_paint(
                         paint,
@@ -5458,6 +5596,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         *,
         preserve_scientific: bool = False,
         skip_scientific_projection: bool = False,
+        defer_image_render: bool = False,
+        defer_bottom_render: bool = False,
         rebind_scientific_navigation: bool = False,
         suppress_detector_demand: bool = False,
         allow_batch_terminal_paint: bool = False,
@@ -5480,6 +5620,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         else:
             self._refresh_shell(
                 suppress_detector_demand=suppress_detector_demand,
+                defer_image_render=defer_image_render,
+                defer_bottom_render=defer_bottom_render,
                 allow_batch_terminal_paint=allow_batch_terminal_paint,
                 terminal_paint=terminal_paint,
             )
@@ -5782,6 +5924,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         preserve_display: bool = False,
         preserve_scientific: bool = False,
         skip_scientific_projection: bool = False,
+        defer_image_render: bool = False,
+        defer_bottom_render: bool = False,
         rebind_scientific_navigation: bool = False,
         suppress_detector_demand: bool = False,
         allow_batch_terminal_paint: bool = False,
@@ -5808,6 +5952,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if explicit_preserve_display or explicit_preserve_scientific:
             preserve_scientific = True
             skip_scientific_projection = True
+            defer_image_render = False
+            defer_bottom_render = False
         if batch_science_hold:
             preserve_display = True
             preserve_scientific = True
@@ -6285,6 +6431,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 apply_options["preserve_scientific"] = True
             if cache_trace_snapshot is not None:
                 apply_options["replace_scientific_on_failure"] = True
+            if defer_image_render:
+                apply_options["defer_image_render"] = True
+            if defer_bottom_render:
+                apply_options["defer_bottom_render"] = True
             self._shell.scientific.expect_display_background(
                 self._background_owner.active_key)
             self._shell.apply_state(projection, **apply_options)
@@ -6354,17 +6504,36 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 projection.scientific,
                 projection.scientific.heavy,
             )
+            accepted_scientific = scientific
+            prior_scientific = self._last_scientific_projection
+            if prior_scientific is not None and defer_bottom_render:
+                accepted_scientific = replace(
+                    accepted_scientific,
+                    title=prior_scientific.title,
+                    status=prior_scientific.status,
+                    traces=prior_scientific.traces,
+                    pinned_traces=prior_scientific.pinned_traces,
+                    browse_trace_snapshot=prior_scientific.browse_trace_snapshot,
+                )
+            if prior_scientific is not None and defer_image_render:
+                accepted_scientific = replace(
+                    accepted_scientific,
+                    heavy=prior_scientific.heavy,
+                    heavy_available=prior_scientific.heavy_available,
+                )
             self._last_scientific_projection = (None
                 if scientific.processing_mode == "Int 1D" and heavy is not None
-                and heavy.detector_source == "full" else scientific)
+                and heavy.detector_source == "full" else accepted_scientific)
             self._context_controller.commit_navigation_projection(
                 self._shell.scientific.trace_history_keys
             )
             rendered_axis = self._shell.scientific.rendered_image_axis
             if rendered_axis is not None:
                 self._rendered_image_axis = rendered_axis
-            if not preserve_display:
-                self._last_live_plot_at = time.monotonic()
+            self._record_live_plot_panes(
+                defer_image_render=defer_image_render,
+                defer_bottom_render=defer_bottom_render,
+            )
         if (
             not preserve_display
             and not preserve_scientific
@@ -7209,7 +7378,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._refresh_shell()
             return
         self._live_plot_interval_ms = values.plot_interval_ms
-        self._last_live_plot_at = None
+        self._clear_live_plot_schedule()
         os.environ["XDART_PERF"] = "1"
         if values.quartile_telemetry:
             os.environ["XDART_PERF_QUARTILES"] = "1"

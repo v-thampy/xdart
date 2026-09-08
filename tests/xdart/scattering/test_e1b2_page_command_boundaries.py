@@ -670,264 +670,222 @@ def test_pending_failure_cannot_reset_or_launch(
         _dispose(page, qapp)
 
 
-@pytest.mark.parametrize(
-    (
-        "plot_mode",
-        "plot_interval_ms",
-        "expected_light_refreshes",
-        "expected_follow_latest",
-    ),
-    (
-        ("Single", 125, (False, False, False), False),
-        ("Single", 375, (False, True, False), False),
-        ("Overlay", 375, (False, False, False), True),
-    ),
-)
-def test_auto_last_paces_eight_frame_burst_to_same_drain_latest(
-        qapp: QtWidgets.QApplication, monkeypatch,
-        plot_mode: str,
-        plot_interval_ms: int,
-        expected_light_refreshes: tuple[bool, bool, bool],
-        expected_follow_latest: bool) -> None:
-    monkeypatch.setenv(
-        "XDART_LIVE_PLOT_INTERVAL_MS", str(plot_interval_ms),
-    )
+def test_dense_bottom_deadline_keeps_real_images_separate_from_waterfall(
+        qapp: QtWidgets.QApplication, monkeypatch) -> None:
+    """The page, not the renderer, owns the latest dense-image deadline."""
+    from tests.xdart.scattering.test_e3_context_contract import _view
+
     executor = _Executor()
     page, _, identity = _active_page(executor)
-    page._preferences = replace(
-        page._preferences,
-        plot_mode=plot_mode,
-    )
-    events = _paced_frame_events(page, executor, identity, 24)
+    page._preferences = replace(page._preferences, plot_mode="Waterfall")
+    page._live_plot_interval_ms = 375
+    events = _paced_frame_events(page, executor, identity, 5)
+    acquisition = executor.acquisition_context(identity)
+    assert acquisition is not None
+    display = acquisition.publication_store
+    display.max_payload_items = 16
+    owner = display.artifacts["/out/a.nxs"]
+    for event in events[1:]:
+        frame = event.frame_key
+        assert frame is not None
+        view = _view(frame.local_frame_label, float(frame.local_frame_label))
+        record = FrameRecord.from_view(view)
+        publication = FramePublication(
+            view,
+            record=record,
+            source_identity=f"{view.source_path}#{frame.local_frame_label}",
+            scan_key=frame.source_scan,
+        )
+        display.retain_frame(
+            owner,
+            frame,
+            record,
+            publication,
+            source_identity=publication.source_identity,
+            frame_mask_qualified=False,
+        )
+        display.put_payload(StandardDisplayPayload(
+            0, frame, f"Standard · run.a · frame {frame.local_frame_label}",
+            view,
+        ))
     now = [0.0]
     monkeypatch.setattr(
         page_module, "time", SimpleNamespace(monotonic=lambda: now[0]),
         raising=False,
     )
-    assert page._live_plot_interval_ms == plot_interval_ms
-    page._last_live_plot_at = None
-    accepted_follow_latest: list[bool] = []
-    accept_navigation = page._context_controller.accept_navigation
-
-    def accept(delta, *, plot_mode="Single", follow_latest=True):
-        accepted_follow_latest.append(follow_latest)
-        return accept_navigation(
-            delta,
-            plot_mode=plot_mode,
-            follow_latest=follow_latest,
-        )
-
-    monkeypatch.setattr(page._context_controller, "accept_navigation", accept)
-    monkeypatch.setattr(page, "_follow_processed_artifact", lambda _frame: None)
-    paints: list[tuple[int | None, bool]] = []
-    def record_paint(*, preserve_scientific=False, **_kwargs):
-        current = page._context_controller.navigation.current
-        paints.append((
-            None if current is None else current.local_frame_label,
-            preserve_scientific,
-        ))
-        if not preserve_scientific:
-            page._last_live_plot_at = now[0]
-
-    monkeypatch.setattr(page, "_refresh_shell", record_paint)
     try:
-        executor.events.extend(events[:8])
+        executor.events.extend(events[:4])
         page._drain_executor()
-
-        assert tuple(
-            frame.local_frame_label
-            for frame in page._context_controller.navigation.frames
-        ) == (
-            1, 2, 3, 4, 5, 6, 7, 8,
-        )
-        assert page._progress.completed == 8
-        assert page._artifact_progress["/out/a.nxs"].published == 8
-        assert accepted_follow_latest == [expected_follow_latest] * 8
-        assert paints == [(8, expected_light_refreshes[0])]
-        assert tuple(page._presentation_targets) == ()
-
-        for _ in range(3):
-            page._drain_executor()
-
-        assert paints == [(8, expected_light_refreshes[0])]
-        assert tuple(page._presentation_targets) == ()
+        scientific = page._shell.scientific
+        assert scientific._waterfall_y_values == (1.0, 2.0, 3.0, 4.0)
+        rendered_projection = page._last_scientific_projection
+        assert rendered_projection is not None
+        assert scientific.bottom_waterfall_active
+        assert not page._scientific_repaint_pending
+        assert page._lifecycle.phase is RunPhase.RUNNING
+        assert page._dense_plot_at == 0.0
 
         now[0] = 0.125
-        executor.events.extend(events[8:16])
+        executor.events.append(events[4])
         page._drain_executor()
-
-        assert tuple(
-            frame.local_frame_label
-            for frame in page._context_controller.navigation.frames
-        ) == tuple(range(1, 17))
-        assert page._progress.completed == 16
-        assert page._artifact_progress["/out/a.nxs"].published == 16
-        assert accepted_follow_latest == [expected_follow_latest] * 16
-        assert paints == [
-            (8, expected_light_refreshes[0]),
-            (16, expected_light_refreshes[1]),
-        ]
-        assert tuple(page._presentation_targets) == ()
-
-        for _ in range(3):
-            page._drain_executor()
-
-        assert paints == [
-            (8, expected_light_refreshes[0]),
-            (16, expected_light_refreshes[1]),
-        ]
-        assert tuple(page._presentation_targets) == ()
+        page._plot_deadline_timer.stop()
+        assert page._waterfall_candidate_count == 5
+        assert page._dense_plot_pending
 
         now[0] = 0.375
-        executor.events.extend(events[16:])
         page._drain_executor()
+        assert page._dense_plot_pending
+        assert page._live_plot_bottom_is_dense()
+        assert scientific._waterfall_y_values == (1.0, 2.0, 3.0, 4.0)
+        deadline = getattr(page, "_plot_deadline_timer", None)
+        if deadline is not None:
+            deadline.timeout.emit()
+        assert scientific.raw.image.image[0, 0] == 5.0
+        assert scientific.cake.image.image[0, 0] == 15.0
+        assert scientific._waterfall_y_values == (1.0, 2.0, 3.0, 4.0)
+        accepted = page._last_scientific_projection
+        assert accepted is not None
+        assert accepted.heavy is not None
+        assert accepted.heavy.frame is events[4].frame_key
+        assert accepted.title == rendered_projection.title
+        assert accepted.traces is rendered_projection.traces
 
-        assert tuple(
-            frame.local_frame_label
-            for frame in page._context_controller.navigation.frames
-        ) == tuple(range(1, 25))
-        assert page._progress.completed == 24
-        assert accepted_follow_latest == [expected_follow_latest] * 24
-        assert paints == [
-            (8, expected_light_refreshes[0]),
-            (16, expected_light_refreshes[1]),
-            (24, expected_light_refreshes[2]),
-        ]
-        if plot_mode == "Overlay":
-            assert page._context_controller.navigation.selected == (
-                page._context_controller.navigation.frames
-            )
+        now[0] = 0.5
+        page._drain_executor()
+        if deadline is not None:
+            deadline.timeout.emit()
+        assert scientific._waterfall_y_values == (1.0, 2.0, 3.0, 4.0, 5.0)
+        assert page._last_scientific_projection is not None
+        assert any(trace.frame is events[4].frame_key
+                   for trace in page._last_scientific_projection.traces)
+
+        now[0] = 0.55
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SET_PLOT_OPTION,
+            2,
+            path=("waterfall", "step"),
+        ))
+        assert scientific._waterfall_y_values == (1.0, 3.0, 5.0)
+        assert not page._plot_deadline_timer.isActive()
     finally:
         _dispose(page, qapp)
 
 
-@pytest.mark.parametrize("plot_mode", ("Single", "Overlay"))
-def test_live_plot_cadence_repaints_suppressed_frame_after_quiet_deadline(
-        qapp: QtWidgets.QApplication, monkeypatch,
-        plot_mode: str) -> None:
-    monkeypatch.setenv("XDART_LIVE_PLOT_INTERVAL_MS", "250")
+def test_single_125ms_deadline_coalesces_and_direct_frame_bypasses(
+        qapp: QtWidgets.QApplication, monkeypatch) -> None:
+    """A new Single burst keeps its deadline after the target queue empties."""
+    from tests.xdart.scattering.test_e3_context_contract import _view
+
     executor = _Executor()
     page, _, identity = _active_page(executor)
-    page._preferences = replace(page._preferences, plot_mode=plot_mode)
-    events = _paced_frame_events(page, executor, identity, 16)
+    page._live_plot_interval_ms = 125
+    events = _paced_frame_events(page, executor, identity, 4)
+    acquisition = executor.acquisition_context(identity)
+    assert acquisition is not None
+    display = acquisition.publication_store
+    display.max_payload_items = 16
+    owner = display.artifacts["/out/a.nxs"]
+    for event in events[1:]:
+        frame = event.frame_key
+        assert frame is not None
+        view = _view(frame.local_frame_label, float(frame.local_frame_label))
+        record = FrameRecord.from_view(view)
+        publication = FramePublication(
+            view,
+            record=record,
+            source_identity=f"{view.source_path}#{frame.local_frame_label}",
+            scan_key=frame.source_scan,
+        )
+        display.retain_frame(
+            owner,
+            frame,
+            record,
+            publication,
+            source_identity=publication.source_identity,
+            frame_mask_qualified=False,
+        )
+        display.put_payload(StandardDisplayPayload(
+            0, frame, f"Standard · run.a · frame {frame.local_frame_label}",
+            view,
+        ))
     now = [0.0]
     monkeypatch.setattr(
         page_module, "time", SimpleNamespace(monotonic=lambda: now[0]),
         raising=False,
     )
-    page._last_live_plot_at = None
-    monkeypatch.setattr(page, "_follow_processed_artifact", lambda _frame: None)
-    paints: list[tuple[int | None, bool]] = []
-
-    def record_paint(*, preserve_scientific=False, **_kwargs):
-        current = page._context_controller.navigation.current
-        paints.append((
-            None if current is None else current.local_frame_label,
-            preserve_scientific,
-        ))
-        if not preserve_scientific:
-            page._scientific_repaint_pending = False
-            page._last_live_plot_at = now[0]
-
-    monkeypatch.setattr(page, "_refresh_shell", record_paint)
     try:
-        executor.events.extend(events[:8])
+        executor.events.append(events[0])
         page._drain_executor()
-        assert paints == [(8, False)]
-        assert page._scientific_repaint_pending is False
+        scientific = page._shell.scientific
+        assert scientific.raw.image.image[0, 0] == 1.0
+
+        now[0] = 0.001
+        executor.events.append(events[1])
+        page._drain_executor()
+        page._plot_deadline_timer.stop()
+        assert page._image_plot_pending
+        assert page._curve_plot_pending
+        assert scientific.raw.image.image[0, 0] == 1.0
+
+        now[0] = 0.05
+        executor.events.append(events[2])
+        page._drain_executor()
+        assert scientific.raw.image.image[0, 0] == 1.0
+
+        now[0] = 0.124
+        page._plot_deadline_timer.timeout.emit()
+        assert scientific.raw.image.image[0, 0] == 1.0
 
         now[0] = 0.125
-        executor.events.extend(events[8:])
-        page._drain_executor()
-        assert paints == [(8, False), (16, True)]
-        assert page._scientific_repaint_pending is True
+        page._plot_deadline_timer.timeout.emit()
+        assert scientific.raw.image.image[0, 0] == 3.0
+        assert scientific.cake.image.image[0, 0] == 13.0
+        assert scientific.trace_history_keys == (events[2].frame_key,)
 
-        now[0] = 0.249
+        now[0] = 0.126
+        executor.events.append(events[3])
         page._drain_executor()
-        assert paints == [(8, False), (16, True)]
-        assert page._scientific_repaint_pending is True
-
-        now[0] = 0.250
-        page._drain_executor()
-        assert paints == [(8, False), (16, True), (16, False)]
-        assert page._scientific_repaint_pending is False
-
-        now[0] = 0.500
-        page._drain_executor()
-        assert paints == [(8, False), (16, True), (16, False)]
+        page._plot_deadline_timer.stop()
+        assert page._live_plot_pending()
+        frame = events[3].frame_key
+        assert frame is not None
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SELECT_FRAME, frame=frame, frames=(frame,),
+        ))
+        assert scientific.raw.image.image[0, 0] == 4.0
+        assert scientific.trace_history_keys == (frame,)
+        assert not page._live_plot_pending()
+        assert not page._plot_deadline_timer.isActive()
     finally:
         _dispose(page, qapp)
 
 
-@pytest.mark.parametrize("pinned_rows", (0, 1))
-def test_overlay_waterfall_boundary_bypasses_cadence_once(
-        qapp: QtWidgets.QApplication, monkeypatch, pinned_rows: int) -> None:
-    monkeypatch.setenv("XDART_LIVE_PLOT_INTERVAL_MS", "250")
+def test_plot_deadline_is_cancelled_at_terminal_and_close(
+        qapp: QtWidgets.QApplication) -> None:
     executor = _Executor()
     page, _, identity = _active_page(executor)
-    page._preferences = replace(page._preferences, plot_mode="Overlay")
-    events = _paced_frame_events(page, executor, identity, 17)
-    now = [0.0]
-    monkeypatch.setattr(
-        page_module, "time", SimpleNamespace(monotonic=lambda: now[0]),
-        raising=False,
-    )
-    page._last_live_plot_at = None
-    page._shell.scientific._trace_row_count = pinned_rows
-    monkeypatch.setattr(page, "_follow_processed_artifact", lambda _frame: None)
-    paints: list[tuple[int | None, bool]] = []
-
-    def record_paint(*, preserve_scientific=False, **_kwargs):
-        current = page._context_controller.navigation.current
-        paints.append((
-            None if current is None else current.local_frame_label,
-            preserve_scientific,
-        ))
-        if not preserve_scientific:
-            page._scientific_repaint_pending = False
-            page._last_live_plot_at = now[0]
-            trace_count = (
-                len(page._context_controller.navigation.selected) + pinned_rows
-            )
-            page._shell.scientific._trace_row_count = trace_count
-            page._waterfall_candidate_count = trace_count
-            page._shell.scientific._bottom_waterfall_active = (
-                page_module.waterfall_should_be_active(
-                    page._preferences.plot_mode,
-                    trace_count,
-                    was_active=page._shell.scientific._bottom_waterfall_active,
-                )
-            )
-
-    monkeypatch.setattr(page, "_refresh_shell", record_paint)
     try:
-        before_boundary = 15 - pinned_rows
-        for index, event in enumerate(events[:before_boundary]):
-            now[0] = min(0.100, index / 1000.0)
-            executor.events.append(event)
-            page._drain_executor()
-        assert paints[0] == (1, False)
-        assert paints[-1] == (before_boundary, True)
-        assert page._waterfall_candidate_count == 15
+        page._image_plot_at = time.monotonic()
+        page._image_plot_pending = True
+        page._arm_live_plot_deadline()
+        assert page._plot_deadline_timer.isActive()
 
-        now[0] = 0.125
-        executor.events.append(events[before_boundary])
+        executor.events.append(StandardRunEvent(
+            identity,
+            StandardEventKind.FINISHED,
+            cleanup_status=CleanupStatus.CLEANED,
+        ))
         page._drain_executor()
-        boundary = before_boundary + 1
-        assert paints[-1] == (boundary, False)
-        assert page._scientific_repaint_pending is False
+        assert not page._live_plot_pending()
+        assert not page._plot_deadline_timer.isActive()
 
-        now[0] = 0.249
-        executor.events.append(events[boundary])
-        page._drain_executor()
-        after_boundary = boundary + 1
-        assert paints[-2:] == [(boundary, False), (after_boundary, True)]
-        assert page._scientific_repaint_pending is True
-
-        now[0] = 0.375
-        page._drain_executor()
-        assert paints[-2:] == [(after_boundary, True), (after_boundary, False)]
-        assert page._scientific_repaint_pending is False
+        page._image_plot_at = time.monotonic()
+        page._image_plot_pending = True
+        page._arm_live_plot_deadline()
+        assert page._plot_deadline_timer.isActive()
+        page.close_workspace()
+        assert not page._live_plot_pending()
+        assert not page._plot_deadline_timer.isActive()
     finally:
         _dispose(page, qapp)
 

@@ -212,6 +212,8 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
         *,
         preserve_display: bool = False,
         preserve_scientific: bool = False,
+        defer_image_render: bool = False,
+        defer_bottom_render: bool = False,
         replace_scientific_on_failure: bool = False,
     ) -> None:
         """Reconcile passive state with independently retainable plot paint."""
@@ -291,6 +293,8 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
                             completed=local_completed,
                             total=local_total,
                             detail=state.progress.detail,
+                            defer_image_render=defer_image_render,
+                            defer_bottom_render=defer_bottom_render,
                         )
                     except Exception:
                         if replace_scientific_on_failure:

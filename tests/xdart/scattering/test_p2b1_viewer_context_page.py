@@ -504,7 +504,7 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
         _rendered_trace_keys=(), _rendered_trace_axis_key=None,
         _waterfall_source_keys=(), _waterfall_render_contract=None,
         _rendered_browse_science_contract=None,
-        _merge_pinned_trace_history=lambda _state: (), _skip_live_waterfall=lambda *_args, **_kwargs: False,
+        _merge_pinned_trace_history=lambda _state: (),
         _bounded_waterfall_rows=lambda rows: rows, _axis_key=lambda axis: id(axis.values),
         _waterfall_axis=lambda _scope, traces, *_args: (np.arange(len(traces), dtype=float), "Frame #"),
         waterfall=SimpleNamespace(render=lambda rows, **kwargs: rendered.append((rows, kwargs))),
