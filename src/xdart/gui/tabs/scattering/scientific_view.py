@@ -14,6 +14,7 @@ from xdart.modules.display_context import (
     Viewer2DRendererClearReceipt, Viewer2DRendererClearRequest,
 )
 from xdart.gui.themes import apply_seaborn_plot_style
+from xdart.gui.widgets.intensity_controls import IntensityControls
 from xrd_tools.session.display_logic import (
     canonical_axis_key,
     resample_image_axis_to_uniform,
@@ -281,6 +282,10 @@ class ScientificView(QtWidgets.QFrame):
         self._waterfall_source_keys: tuple[tuple[object, ...], ...] = ()
         self._waterfall_render_contract: tuple[object, ...] | None = None
         self._processing_mode = ""
+        self._layout_mode = ""
+        self._viewer_intensity_contract = None
+        self._viewer_intensity_domain = None
+        self._viewer_auto_levels = None
         self._viewer_2d_payload = None
         self._viewer_2d_known_empty = False
         self._viewer_2d_shape = None
@@ -377,6 +382,11 @@ class ScientificView(QtWidgets.QFrame):
         layout.addWidget(self.vertical_splitter, 1)
 
         self.footer = QtWidgets.QHBoxLayout()
+        self.viewer_intensity = IntensityControls(self)
+        self.viewer_intensity.hide()
+        self.viewer_intensity.rangeChanged.connect(self._set_viewer_intensity)
+        self.viewer_intensity.autoToggled.connect(self._toggle_viewer_autoscale)
+        self.footer.addWidget(self.viewer_intensity)
         self.status = QtWidgets.QLabel("")
         self.status.setContentsMargins(
             SCIENTIFIC_FOOTER_STATUS_LEFT_INSET,
@@ -721,6 +731,7 @@ class ScientificView(QtWidgets.QFrame):
         )
         row.addWidget(self.axis_display_group)
         row.addSpacing(PLOT_TOOLBAR_INTER_GROUP_GAP)
+        self._plot_group_gap = row.itemAt(row.count() - 1).spacerItem()
         row.addWidget(self.plot_action_group)
         row.addStretch(1)
         row.addWidget(self.share_axis)
@@ -857,11 +868,8 @@ class ScientificView(QtWidgets.QFrame):
                 self.raw.render(heavy.raw, detector_shape=heavy.detector_shape,
                                 color_map=state.color_map,
                                 log_scale=state.log_scale,
-                                level_scan_token=(id(frame), id(heavy.raw)))
-                if retained_range is not None:
-                    self.raw.canvas.imageViewBox.setRange(
-                        rect=retained_range, padding=0,
-                    )
+                                level_scan_token=(id(frame), id(heavy.raw)),
+                                view_range=retained_range)
                 self._rendered_detector_source = detector_source
                 self.raw.canvas.imageItem.pos_label.setText("")
                 self.cake.canvas.imageItem.pos_label.setText("")
@@ -883,6 +891,7 @@ class ScientificView(QtWidgets.QFrame):
                 self.next_frame.setEnabled(
                     current is not None and current < len(navigation.frames) - 1)
                 self._apply_processing_layout("2D Viewer")
+                self._refresh_viewer_intensity()
                 del blockers
             except Exception:
                 ScientificView.clear_viewer_2d(self, None, failure=True)
@@ -1083,6 +1092,7 @@ class ScientificView(QtWidgets.QFrame):
             self._rendered_slice_contract = slice_contract
         self.status.setText(state.detector_diagnostic if state.detector_mode == "full" and not state.detector_pending and state.heavy is not None and state.heavy.detector_source != "full" else state.status or detail)
         self.progress.setText(f"{completed}/{total}")
+        self._refresh_viewer_intensity()
         del blockers
 
     def clear_viewer_2d(self, request, *, failure=False, preserve_navigation=False):
@@ -1094,6 +1104,13 @@ class ScientificView(QtWidgets.QFrame):
             and request.context_token == self._current_key.run_identity.fingerprint
             and request.label == self._current_key.local_frame_label
         )
+        cleared = ScientificView._clear_viewer_payloads(
+            self, keep_chrome=keep_chrome, failure=failure,
+        )
+        return cleared if failure else Viewer2DRendererClearReceipt(request, cleared)
+
+    def _clear_viewer_payloads(self, *, keep_chrome=False, failure=False):
+        """Release scientific buffers; navigation need not dismantle the layout."""
         cleared, canonical = True, self._viewer_2d_payload
         def scrub(target, name, value=None, *, read=False):
             nonlocal cleared
@@ -1131,8 +1148,8 @@ class ScientificView(QtWidgets.QFrame):
                 (image, "_imageNanLocations", None), (image, "_imageHasNans", None),
             ):
                 scrub(target, name, value)
-            scrub(histogram, "setLevels", (0.0, 1.0))
             if not keep_chrome:
+                scrub(histogram, "setLevels", (0.0, 1.0))
                 scrub(view, "setRange", QtCore.QRectF(0.0, 0.0, 1.0, 1.0))
             for method in ("resetTransform", "prepareGeometryChange",
                            "informViewBoundsChanged", "update"):
@@ -1159,6 +1176,8 @@ class ScientificView(QtWidgets.QFrame):
             if not keep_chrome:
                 scrub(widget, "hide")
         for name, value in (
+            ("_viewer_intensity_contract", None),
+            ("_viewer_intensity_domain", None), ("_viewer_auto_levels", None),
             ("_viewer_2d_payload", None), ("_frame_keys", ()), ("_current_key", None),
             ("_viewer_2d_shape", None),
             ("_rendered_detector_source", "none"),
@@ -1195,16 +1214,24 @@ class ScientificView(QtWidgets.QFrame):
             if not keep_chrome:
                 scrub(widget, method, value)
         self._viewer_2d_known_empty = bool(cleared)
-        return cleared if failure else Viewer2DRendererClearReceipt(request, cleared)
+        self.viewer_intensity.sync(None, None)
+        if not keep_chrome:
+            self.viewer_intensity.hide()
+        return cleared
 
-    def clear_viewer_1d(self, request, *, failure=False):
+    def clear_viewer_1d(self, request, *, failure=False, preserve_navigation=False):
         if not failure and type(request) is not Viewer1DRendererClearRequest:
             return None
-        cleared = ScientificView.clear_viewer_2d(self, None, failure=True)
+        keep_chrome = bool(preserve_navigation and not failure
+                           and self._processing_mode == "1D Viewer")
+        cleared = ScientificView._clear_viewer_payloads(
+            self, keep_chrome=keep_chrome, failure=failure,
+        )
         try:
-            self.title.setText("1D Viewer · Render failed" if failure else "Current")
-            self.status.setText(
-                "1D Viewer · Render failed; retry available." if failure else "")
+            if not keep_chrome:
+                self.title.setText("1D Viewer · Render failed" if failure else "Current")
+                self.status.setText(
+                    "1D Viewer · Render failed; retry available." if failure else "")
             cleared = bool(cleared and not self.curve.listDataItems()
                            and not self._trace_history_by_identity
                            and not self._pinned_trace_by_id
@@ -2618,6 +2645,21 @@ class ScientificView(QtWidgets.QFrame):
 
     def _apply_processing_layout(self, mode: str) -> None:
         normalized = str(mode or "")
+        changed = self._layout_mode != normalized
+        self._layout_mode = normalized
+        viewer = normalized in {"1D Viewer", "2D Viewer"}
+        self.viewer_intensity.setVisible(viewer)
+        self.axis_display_group.setVisible(not viewer)
+        self.plot_axis.setVisible(not viewer)
+        if changed:
+            self._plot_group_gap.changeSize(
+                0 if viewer else PLOT_TOOLBAR_INTER_GROUP_GAP, 0,
+            )
+            self.plot_bar.invalidate()
+            self.viewer_intensity.sync(None, None, reset=True)
+            self._viewer_intensity_contract = None
+            self._viewer_intensity_domain = self._viewer_auto_levels = None
+            self.curve.getViewBox().enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
         self.detector_controls.setVisible(normalized == "Int 2D")
         self.raw_popup_button.setVisible(normalized == "Int 1D")
         if normalized != "Int 1D" and self.raw_popup_dialog is not None:
@@ -2639,7 +2681,8 @@ class ScientificView(QtWidgets.QFrame):
             ):
                 widget.setVisible(False)
             self.background.setVisible(True); self.vertical_splitter.widget(1).setVisible(True)
-            self.vertical_splitter.setSizes([0, 1])
+            if changed:
+                self.vertical_splitter.setSizes([0, 1])
             self._set_share_link(False)
             return
         if normalized == "2D Viewer":
@@ -2675,6 +2718,77 @@ class ScientificView(QtWidgets.QFrame):
             self._set_share_link(False)
         elif not prior_has_2d:
             self.vertical_splitter.setSizes([500, 500])
+
+    def _viewer_intensity_image(self):
+        if self._processing_mode == "2D Viewer":
+            return self.raw
+        if self._processing_mode == "1D Viewer" and self._bottom_waterfall_active:
+            return self.waterfall
+        return None
+
+    def _refresh_viewer_intensity(self) -> None:
+        """Synchronize scalar display limits, never retain another pixel buffer."""
+        if self._processing_mode not in {"1D Viewer", "2D Viewer"}:
+            return
+        controls = self.viewer_intensity
+        pane = self._viewer_intensity_image()
+        if pane is not None:
+            if pane.image.image is None:
+                controls.sync(None, None)
+                return
+            contract = (self._processing_mode, pane._render_contract)
+            if contract != self._viewer_intensity_contract:
+                self._viewer_intensity_contract = contract
+                histogram = pane.canvas.histogram
+                self._viewer_intensity_domain = (histogram.lo_lim, histogram.hi_lim)
+                self._viewer_auto_levels = tuple(histogram.levels())
+            controls.sync(self._viewer_intensity_domain, pane.canvas.histogram.levels())
+            if not controls.autoscale.isChecked():
+                self._set_viewer_intensity(*controls.values())
+            return
+        ranges = []
+        for item in self.curve.listDataItems():
+            _x, y = item.getData()
+            if y is not None:
+                finite = y[np.isfinite(y)]
+                if finite.size:
+                    ranges.append((float(finite.min()), float(finite.max())))
+        if not ranges:
+            controls.sync(None, None)
+            return
+        domain = (min(lo for lo, _hi in ranges), max(hi for _lo, hi in ranges))
+        plot = self.curve.getViewBox()
+        if controls.autoscale.isChecked():
+            plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+            plot.updateAutoRange()
+        else:
+            self._set_viewer_intensity(*controls.values())
+        controls.sync(domain, plot.viewRange()[1])
+
+    def _set_viewer_intensity(self, lo, hi) -> None:
+        if (self._processing_mode not in {"1D Viewer", "2D Viewer"}
+                or not np.isfinite((lo, hi)).all() or hi <= lo):
+            return
+        pane = self._viewer_intensity_image()
+        if pane is None:
+            self.curve.getViewBox().setYRange(lo, hi, padding=0)
+        elif pane.image.image is not None:
+            histogram = pane.canvas.histogram
+            domain = self._viewer_intensity_domain or (lo, hi)
+            histogram.lo_lim = min(domain[0], lo)
+            histogram.hi_lim = max(domain[1], hi)
+            histogram.setLevels((lo, hi))
+
+    def _toggle_viewer_autoscale(self, enabled) -> None:
+        if not enabled:
+            self._set_viewer_intensity(*self.viewer_intensity.values())
+            return
+        pane = self._viewer_intensity_image()
+        if pane is not None and pane.image.image is not None and self._viewer_auto_levels:
+            histogram = pane.canvas.histogram
+            histogram.lo_lim, histogram.hi_lim = self._viewer_intensity_domain
+            histogram.setLevels(self._viewer_auto_levels)
+        self._refresh_viewer_intensity()
 
     def _set_share_link(self, on: bool) -> None:
         cake_view = self.cake.canvas.imageViewBox

@@ -204,6 +204,7 @@ class ScientificImagePane(QtWidgets.QWidget):
         color_map: str = "viridis",
         log_scale: bool = False,
         level_scan_token: object | None = None,
+        view_range: QtCore.QRectF | None = None,
     ) -> None:
         source = np.asarray(data)
         render_contract = ScientificImagePane._image_render_contract(
@@ -261,7 +262,9 @@ class ScientificImagePane(QtWidgets.QWidget):
             expand_degenerate_levels=expand_degenerate,
             level_scan_token=level_scan_token,
         )
-        self.canvas.imageViewBox.setRange(rect, padding=0.0)
+        self.canvas.imageViewBox.setRange(
+            rect if view_range is None else view_range, padding=0.0,
+        )
         if x_axis is not None and y_axis is not None:
             x_label, x_unit = _axis_presentation(
                 x_axis.label,

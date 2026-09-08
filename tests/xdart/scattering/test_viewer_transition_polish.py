@@ -53,7 +53,7 @@ def test_new_hdf_file_has_no_teardown_or_zero_one_range(viewer_2d, monkeypatch):
         assert not hidden.events
         assert plot.targetRect() == target
         assert not any(np.allclose(bounds, (0, 1)) for bounds in ranges)
-        assert tuple(view.raw.canvas.histogram.getLevels()) == levels
+        assert tuple(view.raw.canvas.histogram.levels()) == levels
         assert view._viewer_2d_payload is None
         assert view.raw.image.image is None and view.raw.image.qimage is None
         assert view.raw.canvas.raw_image.size == 0
@@ -130,13 +130,13 @@ def test_one_d_manual_intensity_survives_frame_selection(viewer_1d, mode):
     page._context_controller.select_viewer_1d(current, (current,))
     page._refresh_shell()
     app.processEvents()
-    target = (view.waterfall.canvas.histogram.getLevels() if mode == "Waterfall"
+    target = (view.waterfall.canvas.histogram.levels() if mode == "Waterfall"
               else view.curve.getViewBox().viewRange()[1])
     np.testing.assert_allclose(target, (12, 18))
     assert controls.values() == (12, 18)
     controls.autoscale.setChecked(True)
     app.processEvents()
-    target = (view.waterfall.canvas.histogram.getLevels() if mode == "Waterfall"
+    target = (view.waterfall.canvas.histogram.levels() if mode == "Waterfall"
               else view.curve.getViewBox().viewRange()[1])
     assert target[1] > 18
 
@@ -154,7 +154,7 @@ def test_hdf_manual_color_range_survives_next_frame(viewer_2d):
           and page._context_controller.viewer_2d_frame.label == 1
           and view._viewer_2d_payload is page._context_controller.viewer_2d_frame.array)
     np.testing.assert_array_equal(view.raw.image.levels, (100, 150))
-    np.testing.assert_array_equal(view.raw.canvas.histogram.getLevels(), (100, 150))
+    np.testing.assert_array_equal(view.raw.canvas.histogram.levels(), (100, 150))
     controls.autoscale.setChecked(True)
     app.processEvents()
     assert view.raw.image.levels[1] > 150

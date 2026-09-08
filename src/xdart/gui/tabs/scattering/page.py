@@ -6758,7 +6758,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._context_controller.poll_viewer_1d()
             cleared = not self._context_controller.viewer_1d_cleanup_pending
         else:
-            try: receipt = self._shell.scientific.clear_viewer_1d(request)
+            try:
+                receipt = (
+                    self._shell.scientific.clear_viewer_1d(request, preserve_navigation=True)
+                    if paths is not None and not close
+                    else self._shell.scientific.clear_viewer_1d(request)
+                )
             except Exception: return False
             try: cleared = self._context_controller.acknowledge_viewer_1d_renderer_clear(receipt)
             except Exception: return False
@@ -6788,7 +6793,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 and not self._clear_viewer_1d_renderer(close=True)):
             self._notice("1D Viewer cleanup remains pending"); return
         context = self._context_controller.viewer_2d_context
-        if context is not None and not self._clear_viewer_2d_renderer():
+        if context is not None and not self._clear_viewer_2d_renderer(preserve_navigation=True):
             self._notice("2D Viewer cleanup remains pending")
             return
         try:
