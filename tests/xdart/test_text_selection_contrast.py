@@ -93,6 +93,9 @@ def test_periwinkle_poni_selection_is_visible_in_real_controls(qapp, theme_name)
         _assert_selection_painted(editor)
     finally:
         panel.close()
+        # Poni focus-out schedules its basename collapse.  Deliver it while
+        # the real Controls tree is still owned, before the harness retires it.
+        qapp.processEvents()
 
 
 @pytest.mark.parametrize("theme_name", ["dark", "light"])
