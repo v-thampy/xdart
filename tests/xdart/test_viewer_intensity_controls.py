@@ -41,6 +41,29 @@ def test_default_auto_and_sync_are_signal_silent(qapp):
     assert ranges == toggles == []
 
 
+def test_unchanged_sync_does_not_repaint_the_slider(qapp):
+    control = _control(qapp)
+    control.sync((0, 1000), (100, 500))
+    qapp.processEvents()
+
+    class PaintCounter(QtCore.QObject):
+        paints = 0
+
+        def eventFilter(self, watched, event):
+            if event.type() == QtCore.QEvent.Type.Paint:
+                self.paints += 1
+            return False
+
+    counter = PaintCounter(control)
+    control.slider.installEventFilter(counter)
+    control.sync((0, 1000), (100, 500))
+    qapp.processEvents()
+    assert counter.paints == 0
+    control.sync((0, 1000), (200, 700))
+    qapp.processEvents()
+    assert counter.paints > 0
+
+
 def test_real_manual_handle_gesture_and_auto_toggle(qapp):
     control = _control(qapp)
     ranges, toggles = [], []
