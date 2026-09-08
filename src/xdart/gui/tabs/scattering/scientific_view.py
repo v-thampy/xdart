@@ -37,6 +37,7 @@ from .scientific_plot_options import (
     waterfall_should_be_active,
 )
 from .presentation_background import DisplayBackgroundRendererReleaseReceipt
+from .processed_browser import TerminalRebindAuthorization
 from .shell_widgets import (
     _axis_presentation,
     aggregate_traces,
@@ -1517,7 +1518,7 @@ class ScientificView(QtWidgets.QFrame):
 
     def rebind_navigation(
         self,
-        navigation: FrameNavigationProjection,
+        authorization: TerminalRebindAuthorization,
         *,
         heavy_available: frozenset[DisplayFrameKey],
     ) -> bool:
@@ -1530,23 +1531,30 @@ class ScientificView(QtWidgets.QFrame):
         selection, and presentation-contract checks.
         """
 
-        if type(navigation) is not FrameNavigationProjection:
+        if type(authorization) is not TerminalRebindAuthorization:
             raise TypeError("navigation rebind requires an exact projection")
+        source_navigation = authorization.source_navigation
+        navigation = authorization.browse_navigation
         current = navigation.current
-        frames = (
-            tuple(
-                frame
-                for frame in navigation.frames
-                if frame.artifact == current.artifact
-            )
-            if current is not None
-            else ()
-        )
+        frames = navigation.frames
+        source_frames = source_navigation.frames
         frame_by_id = {id(frame): frame for frame in frames}
+        rebound_by_id = {
+            id(old): new for old, new in authorization.frame_pairs
+        }
+        identity_map = {
+            id(old): id(new) for old, new in authorization.frame_pairs
+        }
         if (
             current is None
             or type(heavy_available) is not frozenset
-            or len(frames) != len(self._frame_keys)
+            or len(self._frame_keys) != len(source_frames)
+            or any(
+                rendered is not source
+                for rendered, source in zip(
+                    self._frame_keys, source_frames, strict=True,
+                )
+            )
             or len(navigation.selected) != len(self._trace_history_keys)
             or not any(frame is current for frame in heavy_available)
             or any(
@@ -1554,14 +1562,20 @@ class ScientificView(QtWidgets.QFrame):
                 or frame_by_id.get(id(frame)) is not frame
                 for frame in heavy_available
             )
+            or len(source_navigation.selected) != len(self._trace_history_keys)
             or any(
-                old.local_frame_label != new.local_frame_label
-                for old, new in zip(self._frame_keys, frames, strict=True)
-            )
-            or any(
-                old.local_frame_label != new.local_frame_label
-                for old, new in zip(
+                rendered is not source
+                for rendered, source in zip(
                     self._trace_history_keys,
+                    source_navigation.selected,
+                    strict=True,
+                )
+            )
+            or len(navigation.selected) != len(source_navigation.selected)
+            or any(
+                id(selected) != identity_map.get(id(source))
+                for source, selected in zip(
+                    source_navigation.selected,
                     navigation.selected,
                     strict=True,
                 )
@@ -1574,19 +1588,9 @@ class ScientificView(QtWidgets.QFrame):
         )
         if any(type(trace) is not TraceProjection for trace in old_traces):
             return False
-        identity_map = {
-            id(old): id(new)
-            for old, new in zip(
-                self._trace_history_keys,
-                navigation.selected,
-                strict=True,
-            )
-        }
         rebound = tuple(
-            replace(trace, frame=frame)
-            for trace, frame in zip(
-                old_traces, navigation.selected, strict=True,
-            )
+            replace(trace, frame=rebound_by_id[id(trace.frame)])
+            for trace in old_traces
         )
 
         def rekey(row_key: tuple[object, ...]) -> tuple[object, ...]:

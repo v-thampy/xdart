@@ -31,8 +31,8 @@ from xdart.gui.tabs.scattering.processed_browser import (
     ReintegrateSuccessorPhase,
     TerminalBrowsePaintReceipt,
     TerminalPaintMode,
-    TerminalRebindAuthorization,
 )
+from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
 from xdart.modules.display_context import (
     BrowseContext,
     ContextKind,
@@ -49,6 +49,34 @@ def _wait(predicate, *, timeout: float = 3.0) -> None:
             return
         time.sleep(0.005)
     raise AssertionError("processed Browser owner did not settle")
+
+
+def _terminal_rebind_authorization(owner, handoff):
+    source = tuple(
+        DisplayFrameKey(
+            handoff.run_identity,
+            "terminal",
+            handoff.source_artifact,
+            label,
+            label + 1,
+        )
+        for label in range(2)
+    )
+    browse = tuple(
+        DisplayFrameKey(
+            handoff.run_identity,
+            "terminal",
+            handoff.request.source_path,
+            label,
+            label + 1,
+        )
+        for label in range(2)
+    )
+    return owner.build_terminal_rebind_authorization(
+        handoff,
+        FrameNavigationProjection(source, source[0], source),
+        FrameNavigationProjection(browse, browse[0], browse),
+    )
 
 
 def _entry(directory: str, label: str) -> BrowserCatalogEntry:
@@ -556,9 +584,8 @@ def test_terminal_paint_receipts_are_exact_and_rebind_falls_back_once() -> None:
         )
         assert settlement is not None
         assert settlement.reuse_seal_authorized
-        authorization = TerminalRebindAuthorization(
-            identity, handoff.source_artifact, target
-        )
+        authorization = _terminal_rebind_authorization(owner, handoff)
+        assert authorization is not None
         assert owner.authorize_terminal_rebind(
             settlement.presentation, authorization
         )
@@ -596,6 +623,58 @@ def test_terminal_paint_receipts_are_exact_and_rebind_falls_back_once() -> None:
         assert done.accepted and done.retired
         assert owner.terminal_presentation is None
         assert not owner.terminal_perf_active
+    finally:
+        owner.begin_close()
+        _wait(owner.retry_close)
+
+
+def test_terminal_rebind_builder_refuses_unknown_target_without_path_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import xdart.gui.tabs.scattering.processed_browser as browser_module
+
+    request = BrowseLoadRequest("terminal", 1, "/processed/final.nexus")
+    identity = RunIdentity(7, "terminal")
+    owner = ProcessedBrowserOwner(
+        save_path="/processed",
+        processing_mode="Int 2D",
+        deliver=lambda _wake: None,
+        catalog_reader=lambda _directory, **_kwargs: (),
+    )
+    try:
+        handoff = owner.begin_terminal_handoff(
+            request,
+            identity,
+            "/staging/final.nexus",
+            0,
+            (0, 1),
+            None,
+            timing_start=None,
+        )
+        assert handoff is not None
+        valid = _terminal_rebind_authorization(owner, handoff)
+        assert valid is not None
+        unknown = tuple(
+            DisplayFrameKey(
+                identity,
+                frame.source_scan,
+                "/unknown/final.nexus",
+                frame.local_frame_label,
+                frame.work_ordinal,
+            )
+            for frame in valid.browse_navigation.frames
+        )
+        foreign_target = FrameNavigationProjection(
+            unknown, unknown[0], unknown,
+        )
+        monkeypatch.setattr(
+            browser_module.os.path,
+            "realpath",
+            lambda _value: pytest.fail("terminal map performed path I/O"),
+        )
+        assert owner.build_terminal_rebind_authorization(
+            handoff, valid.source_navigation, foreign_target,
+        ) is None
     finally:
         owner.begin_close()
         _wait(owner.retry_close)

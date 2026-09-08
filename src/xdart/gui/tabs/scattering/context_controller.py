@@ -909,6 +909,11 @@ class ContextController:
             processing_mode=processing_mode,
         )
 
+    def terminal_rebind_is_current(self, authorization: object) -> bool:
+        if self._closed:
+            return False
+        return self._runtime.terminal_rebind_is_current(authorization)
+
     def qualify_display_event(
         self, event: StandardRunEvent
     ) -> StandardDisplayPayload | None:

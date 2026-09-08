@@ -38,7 +38,11 @@ from .browse_values import (
 from .display_values import DisplayFrameKey
 from .events import RunIdentity, detached_exception_strings
 from .operation_values import OperationContextStamp, OperationIdentity
-from .shell_values import BrowserScanIndex, build_browser_scan_index
+from .shell_values import (
+    BrowserScanIndex,
+    FrameNavigationProjection,
+    build_browser_scan_index,
+)
 
 
 _LOG = logging.getLogger(__name__)
@@ -316,19 +320,57 @@ class TerminalBrowseSettlement:
 
 @dataclass(frozen=True, slots=True)
 class TerminalRebindAuthorization:
+    request: BrowseLoadRequest
     run_identity: RunIdentity
     source_artifact: str
     browse_artifact: str
+    source_navigation: FrameNavigationProjection
+    browse_navigation: FrameNavigationProjection
+    frame_pairs: tuple[tuple[DisplayFrameKey, DisplayFrameKey], ...]
 
     def __post_init__(self) -> None:
         if (
-            type(self.run_identity) is not RunIdentity
+            type(self.request) is not BrowseLoadRequest
+            or type(self.run_identity) is not RunIdentity
             or type(self.source_artifact) is not str
             or not self.source_artifact
             or type(self.browse_artifact) is not str
             or not self.browse_artifact
+            or type(self.source_navigation) is not FrameNavigationProjection
+            or type(self.browse_navigation) is not FrameNavigationProjection
+            or type(self.frame_pairs) is not tuple
+            or not self.frame_pairs
+            or any(
+                type(pair) is not tuple
+                or len(pair) != 2
+                or type(pair[0]) is not DisplayFrameKey
+                or type(pair[1]) is not DisplayFrameKey
+                for pair in self.frame_pairs
+            )
+            or tuple(old for old, _new in self.frame_pairs)
+            != self.source_navigation.frames
+            or tuple(new for _old, new in self.frame_pairs)
+            != self.browse_navigation.frames
         ):
             raise ValueError("terminal rebind authorization is invalid")
+        rebound_by_id = {id(old): new for old, new in self.frame_pairs}
+        if (
+            self.source_navigation.current is None
+            or self.browse_navigation.current is None
+            or rebound_by_id.get(id(self.source_navigation.current))
+            is not self.browse_navigation.current
+            or len(self.source_navigation.selected)
+            != len(self.browse_navigation.selected)
+            or any(
+                rebound_by_id.get(id(old)) is not new
+                for old, new in zip(
+                    self.source_navigation.selected,
+                    self.browse_navigation.selected,
+                    strict=True,
+                )
+            )
+        ):
+            raise ValueError("terminal rebind selection is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -836,6 +878,77 @@ class ProcessedBrowserOwner:
             return False
         self._terminal_rebind = authorization
         return True
+
+    @staticmethod
+    def build_terminal_rebind_authorization(
+        handoff: TerminalBrowseHandoff,
+        source_navigation: FrameNavigationProjection,
+        browse_navigation: FrameNavigationProjection,
+    ) -> TerminalRebindAuthorization | None:
+        """Freeze the one exact terminal old-to-new frame correspondence."""
+
+        if (
+            type(handoff) is not TerminalBrowseHandoff
+            or type(source_navigation) is not FrameNavigationProjection
+            or type(browse_navigation) is not FrameNavigationProjection
+            or not source_navigation.frames
+            or len(source_navigation.frames) != len(browse_navigation.frames)
+        ):
+            return None
+        source_frames = source_navigation.frames
+        browse_frames = browse_navigation.frames
+        if (
+            source_navigation.current is None
+            or browse_navigation.current is None
+            or source_navigation.current.local_frame_label
+            != handoff.current_label
+            or browse_navigation.current.local_frame_label
+            != handoff.current_label
+            or tuple(
+                frame.local_frame_label
+                for frame in source_navigation.selected
+            )
+            != handoff.selected_labels
+            or tuple(
+                frame.local_frame_label
+                for frame in browse_navigation.selected
+            )
+            != handoff.selected_labels
+            or any(
+                frame.run_identity is not handoff.run_identity
+                or frame.artifact != handoff.source_artifact
+                for frame in source_frames
+            )
+            or any(
+                frame.run_identity is not handoff.run_identity
+                or frame.artifact != handoff.request.source_path
+                for frame in browse_frames
+            )
+        ):
+            return None
+        browse_by_label = {
+            frame.local_frame_label: frame for frame in browse_frames
+        }
+        if len(browse_by_label) != len(browse_frames):
+            return None
+        pairs = tuple(
+            (frame, browse_by_label.get(frame.local_frame_label))
+            for frame in source_frames
+        )
+        if (
+            any(new is None for _old, new in pairs)
+            or tuple(new for _old, new in pairs) != browse_frames
+        ):
+            return None
+        return TerminalRebindAuthorization(
+            handoff.request,
+            handoff.run_identity,
+            handoff.source_artifact,
+            handoff.request.source_path,
+            source_navigation,
+            browse_navigation,
+            pairs,
+        )
 
     def begin_terminal_paint(
         self,

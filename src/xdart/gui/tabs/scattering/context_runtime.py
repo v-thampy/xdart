@@ -48,6 +48,7 @@ from .display_values import (
     display_payload_is_valid,
 )
 from .events import CleanupStatus, RunIdentity
+from .processed_browser import TerminalRebindAuthorization
 from .scientific_axes import (
     resolve_norm_presentation,
     trace_normalization_scope,
@@ -1402,6 +1403,34 @@ class _ContextRuntime:
         self._committed_trace_selection = selected
         self._pending_trace_projection = None
         return True
+
+    def terminal_rebind_is_current(
+        self,
+        authorization: TerminalRebindAuthorization,
+    ) -> bool:
+        """Confirm a browser-built terminal map names this committed Browse view."""
+
+        selection = self._selection
+        browse = self._browse
+        return bool(
+            type(authorization) is TerminalRebindAuthorization
+            and self._pending_replacement is None
+            and selection is not None
+            and selection.kind is ContextKind.BROWSE
+            and browse is not None
+            and self.run_identity is authorization.run_identity
+            and self.acquisition_context is not None
+            and selection.names(browse)
+            and selection.display_generation == self._display_generation
+            and browse.operation is authorization.request
+            and browse.load_request is authorization.request
+            and authorization.browse_navigation is self._browse_navigation
+            and authorization.browse_navigation is self.navigation
+            and all(
+                self._browse_frame_by_id.get(id(frame)) is frame
+                for _old, frame in authorization.frame_pairs
+            )
+        )
 
     def qualify_display_event(
         self,

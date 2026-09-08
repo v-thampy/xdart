@@ -11,6 +11,50 @@ from pyqtgraph.Qt import QtWidgets
 from tests.core.reintegrate_support import _seed_existing
 
 
+def _terminal_rebind_authorization(owner, handoff):
+    from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
+    from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
+
+    labels = tuple(sorted({handoff.current_label, *handoff.selected_labels}))
+    frames = tuple(
+        DisplayFrameKey(
+            handoff.run_identity,
+            "terminal",
+            handoff.source_artifact,
+            label,
+            index,
+        )
+        for index, label in enumerate(labels, 1)
+    )
+    browse_frames = tuple(
+        DisplayFrameKey(
+            handoff.run_identity,
+            "terminal",
+            handoff.request.source_path,
+            label,
+            index,
+        )
+        for index, label in enumerate(labels, 1)
+    )
+    source_by_label = {frame.local_frame_label: frame for frame in frames}
+    browse_by_label = {
+        frame.local_frame_label: frame for frame in browse_frames
+    }
+    return owner.build_terminal_rebind_authorization(
+        handoff,
+        FrameNavigationProjection(
+            frames,
+            source_by_label[handoff.current_label],
+            tuple(source_by_label[label] for label in handoff.selected_labels),
+        ),
+        FrameNavigationProjection(
+            browse_frames,
+            browse_by_label[handoff.current_label],
+            tuple(browse_by_label[label] for label in handoff.selected_labels),
+        ),
+    )
+
+
 @pytest.fixture
 def qapp() -> QtWidgets.QApplication:
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -359,7 +403,6 @@ def test_terminal_browse_logs_once_at_actual_ready_paint(
     from xdart.gui.tabs.scattering.processed_browser import (
         TerminalBrowsePaintReceipt,
         TerminalPaintMode,
-        TerminalRebindAuthorization,
     )
 
     request = BrowseLoadRequest("gui-timing", 1, "/out/a.nxs")
@@ -383,8 +426,8 @@ def test_terminal_browse_logs_once_at_actual_ready_paint(
         request,
         identity,
         request.source_path,
-        None,
-        (),
+        0,
+        (0,),
         None,
         timing_start=owner.begin_terminal_timing(enabled=True),
     )
@@ -399,9 +442,8 @@ def test_terminal_browse_logs_once_at_actual_ready_paint(
     settlement = owner.settle_terminal(outcome, capture)
     assert settlement is not None
     assert owner.finish_settle_timing(request, settle_started, outcome)
-    authorization = TerminalRebindAuthorization(
-        identity, handoff.source_artifact, request.source_path,
-    )
+    authorization = _terminal_rebind_authorization(owner, handoff)
+    assert authorization is not None
     assert owner.authorize_terminal_rebind(
         settlement.presentation, authorization,
     )
@@ -479,7 +521,6 @@ def test_terminal_browse_stale_fallback_cannot_complete_new_request(
     from xdart.gui.tabs.scattering.processed_browser import (
         TerminalBrowsePaintReceipt,
         TerminalPaintMode,
-        TerminalRebindAuthorization,
     )
 
     source = str((tmp_path / "same.nxs").resolve())
@@ -506,8 +547,8 @@ def test_terminal_browse_stale_fallback_cannot_complete_new_request(
             request_a,
             identity_a,
             source,
-            None,
-            (),
+            0,
+            (0,),
             None,
             timing_start=owner.begin_terminal_timing(enabled=True),
         )
@@ -521,9 +562,8 @@ def test_terminal_browse_stale_fallback_cannot_complete_new_request(
         assert owner.finish_settle_timing(
             request_a, settle_started, outcome_a,
         )
-        authorization = TerminalRebindAuthorization(
-            identity_a, handoff_a.source_artifact, request_a.source_path,
-        )
+        authorization = _terminal_rebind_authorization(owner, handoff_a)
+        assert authorization is not None
         assert owner.authorize_terminal_rebind(
             settlement_a.presentation, authorization,
         )

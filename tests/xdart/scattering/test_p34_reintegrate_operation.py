@@ -1770,8 +1770,20 @@ def test_terminal_waterfall_match_requires_exact_painted_source_receipt(
             handoff,
             FrameNavigationProjection(foreign, foreign[-1], foreign),
         )
+        authorization = (
+            page._processed_browser.build_terminal_rebind_authorization(
+                handoff,
+                FrameNavigationProjection(
+                    view.navigation_frame_keys,
+                    view.navigation_current_key,
+                    view.navigation_selected_keys,
+                ),
+                rebound,
+            )
+        )
+        assert authorization is not None
         assert view.rebind_navigation(
-            rebound,
+            authorization,
             heavy_available=frozenset(clones),
         )
         expected_rebound_source = clones[1:20:3]
@@ -1898,10 +1910,15 @@ def test_terminal_browse_rebind_reuses_complete_identity_distinct_waterfall(
         assert not page._terminal_scientific_matches(
             handoff, foreign_navigation,
         )
-        assert not page._terminal_scientific_rebind_authorized(
+        assert page._processed_browser.build_terminal_rebind_authorization(
+            handoff,
+            FrameNavigationProjection(
+                view.navigation_frame_keys,
+                view.navigation_current_key,
+                view.navigation_selected_keys,
+            ),
             foreign_navigation,
-            (run_identity, handoff.source_artifact, request.source_path),
-        )
+        ) is None
         assert page._terminal_scientific_matches(handoff, rebound)
 
         controller._runtime._set_browse_navigation(rebound)

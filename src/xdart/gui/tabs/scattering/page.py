@@ -5261,114 +5261,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ) == current_signature
         )
 
-    def _terminal_scientific_rebind_authorized(
-        self,
-        navigation: FrameNavigationProjection,
-        authorization: tuple[RunIdentity, str, str],
-    ) -> bool:
-        scientific = self._last_scientific_projection
-        view = self._shell.scientific
-        if (
-            type(navigation) is not FrameNavigationProjection
-            or type(authorization) is not tuple
-            or len(authorization) != 3
-            or type(authorization[0]) is not RunIdentity
-            or not all(
-                type(value) is str and value
-                for value in authorization[1:]
-            )
-            or scientific is None
-        ):
-            return False
-        run_identity, source_artifact, browse_artifact = authorization
-        if (
-            self._context_controller.run_identity is not run_identity
-            or self._context_controller.acquisition_context is None
-        ):
-            return False
-        canonical_by_artifact = {
-            source_artifact: browse_artifact,
-            browse_artifact: browse_artifact,
-        }
-        frames = (
-            *((navigation.current,) if navigation.current is not None else ()),
-            *navigation.frames,
-            *navigation.selected,
-            *((view.navigation_current_key,)
-              if view.navigation_current_key is not None else ()),
-            *view.navigation_frame_keys,
-            *view.navigation_selected_keys,
-            *view.trace_history_keys,
-            *view.heavy_available_keys,
-            *((scientific.heavy.frame,)
-              if scientific.heavy is not None else ()),
-            *(trace.frame for trace in scientific.traces),
-            *scientific.heavy_available,
-        )
-        authorized = bool(frames) and all(
-            type(frame) is DisplayFrameKey
-            and frame.run_identity is run_identity
-            and frame.artifact in canonical_by_artifact
-            for frame in frames
-        )
-        if not authorized or self._preferences.plot_mode != "Single":
-            return authorized
-        current = navigation.current
-        painted_current = view.navigation_current_key
-        if current is None or painted_current is None:
-            return False
-        current_signature = _terminal_frame_signature(
-            current, canonical_by_artifact,
-        )
-        return (
-            scientific.plot_mode == "Single"
-            and view.presentation_plot_mode == "Single"
-            and len(navigation.selected) == 1
-            and navigation.selected[0] is current
-            and len(view.navigation_selected_keys) == 1
-            and view.navigation_selected_keys[0] is painted_current
-            and len(view.trace_history_keys) == 1
-            and view.trace_history_keys[0] is painted_current
-            and len(scientific.traces) == 1
-            and scientific.traces[0].frame is painted_current
-            and scientific.heavy is not None
-            and scientific.heavy.frame is painted_current
-            and any(
-                frame is painted_current
-                for frame in view.heavy_available_keys
-            )
-            and any(
-                frame is painted_current
-                for frame in scientific.heavy_available
-            )
-            and _terminal_frame_signature(
-                painted_current, canonical_by_artifact,
-            ) == current_signature
-        )
-
     def _rebind_last_scientific_projection(
         self,
-        navigation: FrameNavigationProjection,
-        authorization: tuple[RunIdentity, str, str],
+        authorization: TerminalRebindAuthorization,
     ) -> bool:
         scientific = self._last_scientific_projection
         if (
             scientific is None
-            or type(authorization) is not tuple
-            or len(authorization) != 3
-            or type(authorization[0]) is not RunIdentity
-            or not all(
-                type(value) is str and value
-                for value in authorization[1:]
-            )
+            or type(authorization) is not TerminalRebindAuthorization
         ):
             return False
-        run_identity, source_artifact, browse_artifact = authorization
-        canonical_by_artifact = {
-            source_artifact: browse_artifact,
-            browse_artifact: browse_artifact,
+        navigation = authorization.browse_navigation
+        source_by_id = {
+            id(old): new for old, new in authorization.frame_pairs
         }
-        candidate_frames = navigation.frames
         scientific_frames = (
             *((scientific.heavy.frame,) if scientific.heavy is not None else ()),
             *(trace.frame for trace in scientific.traces),
@@ -5376,30 +5282,21 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if any(
             type(frame) is not DisplayFrameKey
-            or frame.run_identity is not run_identity
-            or frame.artifact not in canonical_by_artifact
-            for frame in (*candidate_frames, *scientific_frames)
+            or source_by_id.get(id(frame)) is None
+            for frame in scientific_frames
         ):
             return False
-        by_signature = {
-            _terminal_frame_signature(frame, canonical_by_artifact): frame
-            for frame in navigation.frames
-        }
-        if len(by_signature) != len(navigation.frames):
-            return False
-
-        def rebound(frame: DisplayFrameKey) -> DisplayFrameKey | None:
-            return by_signature.get(_terminal_frame_signature(
-                frame, canonical_by_artifact,
-            ))
-
         heavy_frame = (
             None
             if scientific.heavy is None
-            else rebound(scientific.heavy.frame)
+            else source_by_id.get(id(scientific.heavy.frame))
         )
-        trace_frames = tuple(rebound(trace.frame) for trace in scientific.traces)
-        available = tuple(rebound(frame) for frame in scientific.heavy_available)
+        trace_frames = tuple(
+            source_by_id.get(id(trace.frame)) for trace in scientific.traces
+        )
+        available = tuple(
+            source_by_id.get(id(frame)) for frame in scientific.heavy_available
+        )
         if (
             scientific.heavy is not None and heavy_frame is None
             or any(frame is None for frame in trace_frames)
@@ -5485,19 +5382,31 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             # choice, but only a writer-authenticated seal can authorize
             # zero-copy reuse of the acquisition scientific arrays.
             return False
+        view = self._shell.scientific
+        try:
+            source_navigation = FrameNavigationProjection(
+                view.navigation_frame_keys,
+                view.navigation_current_key,
+                view.navigation_selected_keys,
+            )
+        except (TypeError, ValueError):
+            return False
+        authorization = (
+            self._processed_browser.build_terminal_rebind_authorization(
+                handoff,
+                source_navigation,
+                self._context_controller.navigation,
+            )
+        )
         matches = self._terminal_scientific_matches(
             handoff, self._context_controller.navigation,
         )
-        if matches:
+        if matches and authorization is not None:
             self._processed_browser.authorize_terminal_rebind(
                 settlement.presentation,
-                TerminalRebindAuthorization(
-                    handoff.run_identity,
-                    handoff.source_artifact,
-                    request.source_path,
-                ),
+                authorization,
             )
-        return matches
+        return bool(matches and authorization is not None)
 
     def _begin_processed_terminal_paint(
         self,
@@ -6349,15 +6258,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             else None
         )
-        rebind_artifacts = (
-            None
-            if authorization is None
-            else (
-                authorization.run_identity,
-                authorization.source_artifact,
-                authorization.browse_artifact,
-            )
-        )
         if cache_trace_snapshot is not None and (
             cache_plan is None
             or self._preferences is not cache_preferences
@@ -6403,17 +6303,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._shell.scientific.trace_history_projections
                 )
                 rebound = (
-                    rebind_artifacts is not None
+                    type(authorization) is TerminalRebindAuthorization
                     and prior_scientific is not None
                     and prior_scientific.browse_trace_snapshot is None
-                    and self._terminal_scientific_rebind_authorized(
-                        navigation, rebind_artifacts,
+                    and self._context_controller.terminal_rebind_is_current(
+                        authorization,
                     )
                     and self._rebind_last_scientific_projection(
-                        navigation, rebind_artifacts,
+                        authorization,
                     )
                     and self._shell.scientific.rebind_navigation(
-                        navigation,
+                        authorization,
                         heavy_available=(
                             self._last_scientific_projection.heavy_available
                         ),
