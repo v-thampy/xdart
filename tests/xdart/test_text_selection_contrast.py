@@ -48,9 +48,19 @@ def _assert_selection_palette(editor):
         assert _contrast(background, palette.color(group, QtGui.QPalette.Base)) >= 2.0
 
 
+def _assert_selection_painted(editor):
+    # Verify pixels, not just a palette role the widget never consumes.
+    image = editor.grab().toImage()
+    colors = {
+        image.pixelColor(x, y).name()
+        for y in range(image.height()) for x in range(image.width())
+    }
+    assert "#8f98b8" in colors
+    assert "#1a1a1a" in colors
+
+
 @pytest.mark.parametrize("theme_name", ["dark", "light"])
-@pytest.mark.parametrize("inactive", [False, True], ids=["active", "inactive"])
-def test_periwinkle_poni_selection_is_visible_in_real_controls(qapp, theme_name, inactive):
+def test_periwinkle_poni_selection_is_visible_in_real_controls(qapp, theme_name):
     from xdart.gui.tabs.scattering.controls_projection import project_controls
     from xdart.gui.tabs.scattering.state_machine import RunPhase
     from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow
@@ -59,14 +69,14 @@ def test_periwinkle_poni_selection_is_visible_in_real_controls(qapp, theme_name,
 
     apply_theme(qapp, theme_name, accent_color="periwinkle_muted")
     panel = ControlsPanel()
-    other_window = QtWidgets.QLineEdit("other window")
     try:
         intent = RunIntent(poni_file="/project/detxn26_detyn6p5_eta4p5.poni")
         panel.reconcile(project_controls(RunIntentStore(intent).snapshot(), None, RunPhase.IDLE))
         panel.resize(520, 1600)
         panel.show()
-        other_window.show()
-        qapp.setActiveWindow(panel)
+        qapp.processEvents()
+        panel.activateWindow()
+        qapp.processEvents()
         editor = next(
             row.editor for row in panel.findChildren(FormRow)
             if row.path == ("Signal", "poni_file")
@@ -75,26 +85,39 @@ def test_periwinkle_poni_selection_is_visible_in_real_controls(qapp, theme_name,
         editor.setFocus()
         editor.selectAll()
         qapp.processEvents()
-        if inactive:
-            qapp.setActiveWindow(other_window)
-            other_window.setFocus()
-            qapp.processEvents()
-        assert editor.isActiveWindow() is not inactive
+        assert editor.isActiveWindow()
+        assert editor.hasFocus()
         assert editor.selectedText() == editor.text()
         assert editor.selectedText()
         _assert_selection_palette(editor)
-        # Verify the actual selected field paints both colours, not just a
-        # stylesheet token or palette role that the widget never consumes.
-        image = editor.grab().toImage()
-        colors = {
-            image.pixelColor(x, y).name()
-            for y in range(image.height()) for x in range(image.width())
-        }
-        assert "#8f98b8" in colors
-        assert "#1a1a1a" in colors
+        _assert_selection_painted(editor)
+    finally:
+        panel.close()
+
+
+@pytest.mark.parametrize("theme_name", ["dark", "light"])
+def test_shared_line_edit_keeps_selection_readable_in_an_inactive_window(qapp, theme_name):
+    apply_theme(qapp, theme_name, accent_color="periwinkle_muted")
+    editor = QtWidgets.QLineEdit("Selected input text")
+    other_window = QtWidgets.QLineEdit("other window")
+    try:
+        editor.show()
+        other_window.show()
+        qapp.processEvents()
+        editor.activateWindow()
+        qapp.processEvents()
+        editor.setFocus()
+        editor.selectAll()
+        other_window.activateWindow()
+        qapp.processEvents()
+        assert not editor.isActiveWindow()
+        assert not editor.hasFocus()
+        assert editor.selectedText() == editor.text()
+        _assert_selection_palette(editor)
+        _assert_selection_painted(editor)
     finally:
         other_window.close()
-        panel.close()
+        editor.close()
 
 
 @pytest.mark.parametrize("theme_name", ["dark", "light"])
