@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 from pyqtgraph.Qt import QtCore, QtTest
 
-from .test_viewer_1d_selection import viewer as viewer_1d, _ready, _mode
-from .test_viewer_2d_navigation import viewer as viewer_2d, _wait
+from test_viewer_1d_selection import viewer as viewer_1d, _ready, _mode
+from test_viewer_2d_navigation import viewer as viewer_2d, _wait
 
 
 class _HideEvents(QtCore.QObject):
