@@ -611,7 +611,7 @@ class StitchToolDialog(QtWidgets.QDialog):
             ),
             use_detector_mask=self.detector_mask_check.isChecked(),
             output_path=self.output_edit.text().strip(),
-            overwrite=AnalysisArtifactOverwrite.CREATE_NEW,
+            overwrite=AnalysisArtifactOverwrite.REPLACE,
             max_frame_bytes=self.max_frame_mib.value() * 1024 * 1024,
             mode="1d",
             backend=self.backend_combo.currentData(),

@@ -297,6 +297,53 @@ def _xu_prepared(
     )
 
 
+@pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
+def test_repeat_stitch_replaces_previous_result_with_changed_parameters(tmp_path, backend):
+    initial = _prepared(tmp_path) if backend == "multigeometry" else _xu_prepared(tmp_path)
+    first = run_stitch_operation(initial)
+    assert first.terminal.disposition is ModuleDisposition.COMMITTED
+    target = Path(initial.module.output.target)
+    first_inode = target.stat().st_ino
+    repeat = prepare_stitch_operation(
+        initial.module.source,
+        replace(initial.module.output, overwrite=AnalysisArtifactOverwrite.REPLACE),
+        replace(initial.plan, npt_1d=80),
+        project_root=tmp_path,
+    )
+    second = run_stitch_operation(repeat)
+    assert second.terminal.disposition is ModuleDisposition.COMMITTED
+    assert second.payload.intensity.shape == (80,)
+    assert second.terminal.commit.request is repeat.module
+    assert second.payload.inspection.result_fingerprint != first.payload.inspection.result_fingerprint
+    assert target.stat().st_ino != first_inode
+
+
+@pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
+@pytest.mark.parametrize("protected", ("raw", "geometry"))
+def test_stitch_output_aliases_of_manifest_and_geometry_are_refused(tmp_path, backend, protected):
+    initial = _prepared(tmp_path) if backend == "multigeometry" else _xu_prepared(tmp_path)
+    if protected == "raw":
+        source = next(tmp_path.rglob("scan_0001.tif"))
+    elif backend == "multigeometry":
+        source = tmp_path / "geometry.json"
+    else:
+        source = tmp_path / "calibration" / "xu" / "surface.json"
+    before = source.read_bytes()
+    target = Path(initial.module.output.target)
+    target.symlink_to(source)
+    request = prepare_stitch_operation(
+        initial.module.source,
+        replace(initial.module.output, overwrite=AnalysisArtifactOverwrite.REPLACE),
+        initial.plan,
+        project_root=tmp_path,
+    )
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "OUTPUT_INPUT_ALIAS"
+    assert source.read_bytes() == before
+    assert target.samefile(source)
+
+
 def test_geometry_capture_is_hash_bound_and_rejects_duplicate_json(tmp_path):
     path = tmp_path / "geometry.json"
     path.write_text(json.dumps(_goniometer_record()), encoding="utf-8")
@@ -1169,7 +1216,7 @@ def test_transient_strict_reload_retry_does_not_replay_science_or_writer(
     assert science == ["science"]
 
 
-def test_stitch_refuses_replace_output_policy_without_mutating_target(tmp_path):
+def test_stitch_refuses_replacing_foreign_output_without_mutating_target(tmp_path):
     initial = _prepared(tmp_path)
     target = Path(initial.module.output.target)
     target.write_bytes(b"prior operator output")
@@ -1178,14 +1225,12 @@ def test_stitch_refuses_replace_output_policy_without_mutating_target(tmp_path):
         AnalysisArtifactKind.STITCH_1D,
         AnalysisArtifactOverwrite.REPLACE,
     )
-    with pytest.raises(StitchOperationRefused) as refused:
-        prepare_stitch_operation(
-            initial.module.source,
-            replacement,
-            initial.plan,
-            project_root=tmp_path,
-        )
-    assert refused.value.code == "STITCH_OUTPUT_POLICY_UNSUPPORTED"
+    request = prepare_stitch_operation(
+        initial.module.source, replacement, initial.plan, project_root=tmp_path,
+    )
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "OUTPUT_NOT_PREVIOUS_ANALYSIS"
     assert target.read_bytes() == b"prior operator output"
 
 

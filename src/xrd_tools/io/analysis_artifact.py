@@ -34,6 +34,7 @@ from xrd_tools.io.output_transaction import (
     stream_terminal_object_revision,
 )
 from xrd_tools.io.finite_artifact import _FinitePublicationSession
+from xrd_tools.io.output_safety import check_output_not_source
 
 
 ANALYSIS_SCHEMA_ATTR = "ssrl_schema"
@@ -2653,12 +2654,14 @@ class AnalysisArtifactOutput:
     """One analysis schema adapter over the shared finite publication owner."""
 
     def __init__(self, request: AnalysisArtifactRequest, *,
-                 coordinator: OutputTransactionCoordinator) -> None:
+                 coordinator: OutputTransactionCoordinator,
+                 protected_inputs: tuple[str | Path, ...] = ()) -> None:
         if type(request) is not AnalysisArtifactRequest:
             raise TypeError("analysis output requires exact request")
         if not Path(request.target).parent.is_dir():
             raise ValueError("analysis artifact parent directory must already exist")
         self.request = request
+        self._protected_inputs = tuple(Path(value).expanduser().absolute() for value in protected_inputs)
         self._publication = _FinitePublicationSession(request.target, coordinator=coordinator)
         self._writer_started = False
         self._writer_finished = False
@@ -2670,14 +2673,22 @@ class AnalysisArtifactOutput:
         self._publication.reserve()
         try:
             self._ordinal = self._publication.ordinal
+            self._check_input_aliases()
             self._expected_target = capture_target_snapshot(request.target)
             if request.overwrite is AnalysisArtifactOverwrite.CREATE_NEW and (
                 self._expected_target.exists or os.path.lexists(request.target)
             ):
                 raise FileExistsError(request.target)
+            if self._expected_target.exists:
+                inspect_analysis_artifact(request.target, expected_kind=request.kind)
+                if capture_target_snapshot(request.target) != self._expected_target:
+                    raise TargetChanged("previous analysis changed during admission")
         except BaseException:
             self._publication.abort()
             raise
+
+    def _check_input_aliases(self) -> None:
+        check_output_not_source(self.request.target, input_files=self._protected_inputs)
 
     def __copy__(self):
         raise TypeError("analysis artifact output owner is not copyable")
@@ -2769,6 +2780,7 @@ class AnalysisArtifactOutput:
             )
         if prepublish is not None:
             prepublish()
+        self._check_input_aliases()
         final = capture_target_snapshot(candidate)
         if final != after:
             raise TargetChanged(
@@ -2891,6 +2903,7 @@ class AnalysisArtifactOutput:
         self._on_published = _on_published
         try:
             candidate = self._publication.candidate
+            self._check_input_aliases()
             if capture_target_snapshot(self.request.target) != self._expected_target:
                 raise TargetChanged("analysis target changed before writing")
             self._write_candidate(write_result)
@@ -2940,13 +2953,14 @@ def admit_analysis_artifact(
     request: AnalysisArtifactRequest,
     *,
     coordinator: OutputTransactionCoordinator | None = None,
+    protected_inputs: tuple[str | Path, ...] = (),
 ) -> AnalysisArtifactOutput:
     if type(request) is not AnalysisArtifactRequest:
         raise TypeError("analysis artifact admission requires exact request")
     selected = get_output_transaction_coordinator() if coordinator is None else coordinator
     if type(selected) is not OutputTransactionCoordinator:
         raise TypeError("analysis artifact coordinator must be exact")
-    return AnalysisArtifactOutput(request, coordinator=selected)
+    return AnalysisArtifactOutput(request, coordinator=selected, protected_inputs=protected_inputs)
 
 
 __all__ = [

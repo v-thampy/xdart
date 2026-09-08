@@ -1546,7 +1546,8 @@ def test_canonical_provenance_stops_oversized_structure_during_freeze():
 
 def test_create_new_refuses_collision_and_replace_is_atomic(tmp_path):
     target = tmp_path / "replace.nexus"
-    target.write_bytes(b"prior bytes")
+    initial = _request(target, AnalysisArtifactKind.STITCH_1D)
+    previous = admit_analysis_artifact(initial).publish(_writer(initial))
     with pytest.raises(FileExistsError):
         admit_analysis_artifact(
             _request(target, AnalysisArtifactKind.STITCH_1D),
@@ -1560,8 +1561,72 @@ def test_create_new_refuses_collision_and_replace_is_atomic(tmp_path):
     receipt = admit_analysis_artifact(
         request, coordinator=OutputTransactionCoordinator()
     ).publish(_writer(request))
-    assert receipt.terminal.digest != hashlib.sha256(b"prior bytes").hexdigest()
+    assert receipt.terminal.inode != previous.terminal.inode
     assert inspect_analysis_artifact(target).kind is AnalysisArtifactKind.STITCH_1D
+
+
+@pytest.mark.parametrize("prior", ("arbitrary", "damaged", "other_kind"))
+def test_replace_refuses_unrecognized_or_different_analysis_kind(tmp_path, prior):
+    target = tmp_path / "protected.nexus"
+    if prior == "arbitrary":
+        target.write_bytes(b"raw or unrelated operator file")
+    else:
+        kind = AnalysisArtifactKind.RSM if prior == "other_kind" else AnalysisArtifactKind.STITCH_1D
+        initial = _request(target, kind)
+        admit_analysis_artifact(initial).publish(_writer(initial))
+        if prior == "damaged":
+            with h5py.File(target, "r+") as handle:
+                handle.attrs[ANALYSIS_SCHEMA_ATTR] = "damaged"
+    before = target.read_bytes()
+    request = _request(target, AnalysisArtifactKind.STITCH_1D, overwrite=AnalysisArtifactOverwrite.REPLACE)
+    with pytest.raises(AnalysisArtifactInvalid):
+        admit_analysis_artifact(request)
+    assert target.read_bytes() == before
+    assert not tuple(tmp_path.glob(".*xdart-*"))
+
+
+@pytest.mark.parametrize("alias", ("same_path", "symlink", "hardlink"))
+def test_replace_refuses_selected_input_alias_before_content_recognition(tmp_path, alias):
+    from xrd_tools.io.output_safety import OutputCollisionError
+
+    source = tmp_path / "source.nexus"
+    source.write_bytes(b"protected raw or geometry input")
+    target = source if alias == "same_path" else tmp_path / "output.nexus"
+    if alias == "symlink":
+        target.symlink_to(source)
+    elif alias == "hardlink":
+        os.link(source, target)
+    request = _request(target, AnalysisArtifactKind.STITCH_1D, overwrite=AnalysisArtifactOverwrite.REPLACE)
+    with pytest.raises(OutputCollisionError):
+        admit_analysis_artifact(request, protected_inputs=(source,))
+    assert source.read_bytes() == b"protected raw or geometry input"
+    assert os.path.samefile(target, source)
+
+
+@pytest.mark.parametrize("moment", ("before_writer", "prepublish"))
+def test_repeat_refuses_input_retargeted_after_admission(tmp_path, moment):
+    from xrd_tools.io.output_safety import OutputCollisionError
+
+    target = tmp_path / "prior.nexus"
+    initial = _request(target, AnalysisArtifactKind.STITCH_1D)
+    admit_analysis_artifact(initial).publish(_writer(initial))
+    prior = target.read_bytes()
+    source = tmp_path / "selected-input.nexus"
+    source.write_bytes(b"selected input")
+    request = _request(target, initial.kind, overwrite=AnalysisArtifactOverwrite.REPLACE)
+    output = admit_analysis_artifact(request, protected_inputs=(source,))
+
+    def retarget():
+        source.unlink()
+        source.symlink_to(target)
+
+    if moment == "before_writer":
+        retarget()
+    with pytest.raises(OutputCollisionError):
+        output.publish(_writer(request), prepublish=retarget if moment == "prepublish" else None)
+    assert target.read_bytes() == prior
+    assert source.samefile(target)
+    assert not output.snapshot.slot_held
 
 
 def test_create_new_uses_the_admitted_snapshot_not_a_racy_precheck(
@@ -1694,7 +1759,9 @@ def test_target_appearance_after_admission_refuses_and_releases(tmp_path):
 def test_writer_or_readback_failure_rolls_back_and_releases(tmp_path, prior):
     target = tmp_path / "rollback.nexus"
     if prior is not None:
-        target.write_bytes(prior)
+        initial = _request(target, AnalysisArtifactKind.RSM)
+        admit_analysis_artifact(initial).publish(_writer(initial))
+        prior = target.read_bytes()
     request = _request(
         target,
         AnalysisArtifactKind.RSM,

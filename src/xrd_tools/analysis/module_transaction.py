@@ -33,6 +33,7 @@ from xrd_tools.io.analysis_artifact import (
     ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
     ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
     AnalysisArtifactCleanupPending,
+    AnalysisArtifactInvalid,
     AnalysisArtifactKind,
     AnalysisArtifactOutput,
     AnalysisArtifactOutputSnapshot,
@@ -49,6 +50,7 @@ from xrd_tools.io import (
     StreamTerminal,
     stream_terminal_object_revision,
 )
+from xrd_tools.io.output_safety import OutputCollisionError
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -431,7 +433,10 @@ class ModuleOperationRequest:
         )
         if not compatible:
             raise ValueError("module source and artifact kinds do not match")
-        if self.output.overwrite is not AnalysisArtifactOverwrite.CREATE_NEW:
+        if (
+            self.source.kind is ModuleKind.RSM
+            and self.output.overwrite is not AnalysisArtifactOverwrite.CREATE_NEW
+        ):
             raise ValueError(
                 "standalone module output must create one new immutable artifact"
             )
@@ -1387,6 +1392,8 @@ class ModuleArtifactOutput:
             self._pending = (ModuleDisposition.CANCELLED, "CANCELLED", "")
         elif isinstance(primary, _ModuleCommitRefused):
             self._pending = (ModuleDisposition.REFUSED, primary.code, "")
+        elif isinstance(primary, OutputCollisionError):
+            self._pending = (ModuleDisposition.REFUSED, "OUTPUT_INPUT_ALIAS", str(primary))
         else:
             cause = primary.error if isinstance(primary, (_ModuleWriterFailed, _ModulePrepublishFailed)) else primary
             diagnostic = _failure_diagnostic(cause)
@@ -1420,6 +1427,7 @@ def admit_module_artifact(
     rsm_mask_receipts: tuple[object, ...] | None = None,
     cancel_token: threading.Event | None = None,
     coordinator: object | None = None,
+    protected_inputs: tuple[str | Path, ...] = (),
 ) -> ModuleArtifactOutput:
     if type(request) is not ModuleOperationRequest:
         raise TypeError("module artifact admission requires exact request")
@@ -1440,10 +1448,24 @@ def admit_module_artifact(
         execution_attestation_digest=execution_attestation_digest,
         rsm_mask_receipts=rsm_mask_receipts,
     )
-    output = _admit_analysis_artifact(
-        artifact_request,
-        coordinator=coordinator,
+    inputs = list(protected_inputs)
+    sources = (
+        request.source.members
+        if type(request.source) is ModuleSourceGroupReceipt else (request.source,)
     )
+    for source in sources:
+        analysis = source.analysis
+        inputs.extend((analysis.lexical_root, analysis.resolved_root))
+        for lexical, resolved, _revision in analysis.dependency_revisions:
+            inputs.extend((lexical, resolved))
+    try:
+        output = _admit_analysis_artifact(
+            artifact_request, coordinator=coordinator, protected_inputs=tuple(inputs),
+        )
+    except OutputCollisionError as error:
+        raise ModuleArtifactRefused("OUTPUT_INPUT_ALIAS") from error
+    except AnalysisArtifactInvalid as error:
+        raise ModuleArtifactRefused("OUTPUT_NOT_PREVIOUS_ANALYSIS") from error
     return ModuleArtifactOutput(
         request,
         output,

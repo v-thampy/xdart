@@ -1959,7 +1959,7 @@ def test_module_commit_refuses_genuine_artifact_with_foreign_provenance(tmp_path
         (ModuleKind.RSM, AnalysisArtifactKind.RSM),
     ),
 )
-def test_public_module_request_refuses_replace_without_mutating_target(
+def test_module_replacement_refuses_foreign_target_and_keeps_rsm_create_new(
     tmp_path,
     kind,
     artifact_kind,
@@ -1974,13 +1974,20 @@ def test_public_module_request_refuses_replace_without_mutating_target(
         AnalysisArtifactOverwrite.REPLACE,
     )
 
-    with pytest.raises(ValueError, match="must create one new immutable artifact"):
-        ModuleOperationRequest(
-            initial.source,
-            output_request,
-            initial.plan_fingerprint,
-            initial.provenance_digest,
+    if kind is ModuleKind.RSM:
+        with pytest.raises(ValueError, match="must create one new immutable artifact"):
+            ModuleOperationRequest(
+                initial.source, output_request,
+                initial.plan_fingerprint, initial.provenance_digest,
+            )
+    else:
+        request = ModuleOperationRequest(
+            initial.source, output_request,
+            initial.plan_fingerprint, initial.provenance_digest,
         )
+        with pytest.raises(ModuleArtifactRefused) as refused:
+            admit_module_artifact(request, _provenance(request))
+        assert refused.value.code == "OUTPUT_NOT_PREVIOUS_ANALYSIS"
 
     assert target.read_bytes() == original
 

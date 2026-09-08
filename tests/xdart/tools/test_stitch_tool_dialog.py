@@ -120,7 +120,7 @@ def test_source_picker_and_form_projection_do_no_source_io(
         assert form.detector_shape == (195, 1475)
         assert form.threshold == 800_000.0
         assert form.mode == "1d"
-        assert form.overwrite is AnalysisArtifactOverwrite.CREATE_NEW
+        assert form.overwrite is AnalysisArtifactOverwrite.REPLACE
         assert dialog.output_policy_label.text() == (
             "Create new (refuse if present)"
         )

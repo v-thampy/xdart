@@ -111,7 +111,6 @@ def stitch_form(tmp_path):
         monitor_selector=MetadataColumnSelector("I0"),
         use_detector_mask=True,
         output_path=output / "stitched.nexus",
-        overwrite=AnalysisArtifactOverwrite.CREATE_NEW,
         max_frame_bytes=1 << 20,
     )
 

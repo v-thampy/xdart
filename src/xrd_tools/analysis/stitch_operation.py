@@ -65,7 +65,6 @@ from xrd_tools.io.analysis_artifact import (
     ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
     AnalysisArtifactCleanupPending,
     AnalysisArtifactKind,
-    AnalysisArtifactOverwrite,
     AnalysisArtifactPayload,
     AnalysisArtifactProjectionInvalid,
     _project_analysis_artifact_result_v1_compat,
@@ -1870,11 +1869,6 @@ def prepare_stitch_operation(
         or type(plan) not in {StitchOperationPlan, XuStitchOperationPlan}
     ):
         raise TypeError("stitch preparation requires exact Stitch module values")
-    if output.overwrite is not AnalysisArtifactOverwrite.CREATE_NEW:
-        raise StitchOperationRefused(
-            "STITCH_OUTPUT_POLICY_UNSUPPORTED",
-            "Stitch must create one new immutable artifact",
-        )
     if source.analysis.resolved_kind not in {
         SourceKind.SPEC,
         SourceKind.TIFF_SERIES,
@@ -2150,6 +2144,22 @@ class StitchOperationResult:
             )
         ):
             raise TypeError("stitch operation result is invalid")
+
+
+def _protected_stitch_inputs(request: StitchOperationRequest) -> tuple[Path, ...]:
+    root = Path(request.manifest.project_root)
+    inputs = [root / request.manifest.source_relative_path]
+    inputs.extend(root / item.relative_path for item in request.manifest.files)
+    if type(request.plan) is XuStitchOperationPlan:
+        geometry = request.plan.calibration
+        inputs.extend((
+            root / geometry.lexical_relative_path,
+            root / geometry.resolved_relative_path,
+        ))
+    else:
+        geometry = request.plan.geometry
+        inputs.extend((Path(geometry.lexical_path), Path(geometry.resolved_path)))
+    return tuple(dict.fromkeys(inputs))
 
 
 class StitchOperationExecution:
@@ -2450,6 +2460,7 @@ class StitchOperationExecution:
                 execution_attestation_digest=attestation_digest,
                 cancel_token=cancel_token,
                 coordinator=self.coordinator,
+                protected_inputs=_protected_stitch_inputs(self.request),
             )
         except ModuleArtifactRefused as error:
             disposition = (
@@ -2660,6 +2671,7 @@ class StitchOperationExecution:
                 provenance,
                 cancel_token=cancel_token,
                 coordinator=self.coordinator,
+                protected_inputs=_protected_stitch_inputs(self.request),
             )
         except ModuleArtifactRefused as error:
             disposition = (
