@@ -226,6 +226,39 @@ def test_scalar_catalog_projects_all_rows_modes_and_deeply_frozen_facts(
     assert first.source_path == "raw_2.h5"
 
 
+def test_scalar_catalog_qualifies_frame_nodes_once(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "one_frame_lookup.nexus"
+    _catalog_file(path)
+    expected = {
+        f"/entry/frames/frame_{label:04d}{suffix}": 1
+        for label in (2, 5, 9)
+        for suffix in (
+            "", "/source", "/source/path", "/source/frame_index", "/thumbnail",
+        )
+    }
+    inspections: dict[str, int] = {}
+    real_get = h5py.Group.get
+
+    def tracked_get(group, name, *args, **kwargs):
+        node_path = f"{group.name}/{name}"
+        if kwargs.get("getlink") and node_path in expected:
+            inspections[node_path] = inspections.get(node_path, 0) + 1
+        return real_get(group, name, *args, **kwargs)
+
+    with FrameViewReader(path, resolve_source=False) as reader:
+        monkeypatch.setattr(h5py.Group, "get", tracked_get)
+        catalog = reader.read_scalar_catalog()
+    assert tuple(
+        (row.source_path, row.source_frame_index, row.has_thumbnail, row.mask_baked)
+        for row in catalog.rows
+    ) == (
+        ("raw_2.h5", 102, True, True),
+        ("raw_5.h5", 105, False, False),
+        ("raw_9.h5", 109, True, False),
+    )
+    assert inspections == expected
+
+
 def test_scalar_catalog_marks_current_average_capability(tmp_path) -> None:
     path = tmp_path / "average.nexus"
     record = FrameRecord.from_view(_view(1, 1.0))

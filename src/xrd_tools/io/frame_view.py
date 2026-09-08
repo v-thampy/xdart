@@ -589,8 +589,13 @@ def _required_direct_group(
         return None
     if type(link) is not h5py.HardLink:
         raise ValueError(f"{role} is not a local hard-linked group")
-    value = _direct_group(group, name)
-    if value is None:
+    # The link was qualified above; open it without a second link lookup or
+    # Group.get's redundant membership probe.
+    try:
+        value = group[name]
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError(f"{role} is not a local hard-linked group") from error
+    if not isinstance(value, h5py.Group):
         raise ValueError(f"{role} is not a local hard-linked group")
     return value
 
@@ -606,9 +611,15 @@ def _required_direct_dataset(
         return None
     if type(link) is not h5py.HardLink:
         raise ValueError(f"{role} is not a bounded local hard-linked dataset")
-    value = _direct_dataset(group, name)
-    if value is None:
-        raise ValueError(f"{role} is not a bounded local hard-linked dataset")
+    try:
+        value = group[name]
+        if not isinstance(value, h5py.Dataset):
+            raise ValueError(f"{role} is not a dataset")
+        external = tuple(value.external or ())
+        if value.is_virtual or external:
+            raise ValueError(f"{role} is not locally stored")
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError(f"{role} is not a bounded local hard-linked dataset") from error
     return value
 
 
@@ -2251,23 +2262,26 @@ class FrameViewReader:
             metadata[key] = _decode(scalar.item())
         return metadata
 
-    def _thumbnail_fact_for_frame(self, frame: int) -> tuple[bool, bool]:
-        """Qualify thumbnail structure and mask fact without reading pixels."""
+    def _scalar_catalog_frame_facts(
+        self, frame: int,
+    ) -> tuple[str | None, int | None, bool, bool]:
+        """Read source and thumbnail facts through one qualified frame group."""
 
         frames = self._frames
         if frames is None:
-            return False, False
+            return None, None, False, False
         frame_name = f"frame_{frame:04d}"
         group = _required_direct_group(
             frames, frame_name, role=f"{frames.name}/{frame_name}",
         )
         if group is None:
-            return False, False
+            return None, None, False, False
+        source_path, source_index = self._persisted_source_in_group(group)
         thumbnail = _required_direct_dataset(
             group, "thumbnail", role=f"{group.name}/thumbnail",
         )
         if thumbnail is None:
-            return False, False
+            return source_path, source_index, False, False
         if (
             thumbnail.ndim != 2
             or not all(1 <= int(part) <= 256 for part in thumbnail.shape)
@@ -2281,7 +2295,10 @@ class FrameViewReader:
             "mask_baked",
             role=f"{thumbnail.name} mask marker",
         )
-        return True, True if mask_baked is None else mask_baked
+        return (
+            source_path, source_index, True,
+            True if mask_baked is None else mask_baked,
+        )
 
     def read_scalar_catalog(
         self,
@@ -2341,12 +2358,10 @@ class FrameViewReader:
                 geometry = bundle._callback(
                     self._scalar_catalog_geometry_for_frame, label,
                 )
-                source_path, source_index = bundle._callback(
-                    self._persisted_source_for_frame, label,
+                frame_facts = bundle._callback(
+                    self._scalar_catalog_frame_facts, label,
                 )
-                has_thumbnail, mask_baked = bundle._callback(
-                    self._thumbnail_fact_for_frame, label,
-                )
+                source_path, source_index, has_thumbnail, mask_baked = frame_facts
                 modes_1d = tuple(
                     mode
                     for mode, mode_map in self._map_1d_modes.items()
@@ -2816,6 +2831,12 @@ class FrameViewReader:
         )
         if fg is None:
             return None, None
+        return self._persisted_source_in_group(fg)
+
+    @staticmethod
+    def _persisted_source_in_group(
+        fg: h5py.Group,
+    ) -> tuple[str | None, int | None]:
         src = _required_direct_group(
             fg, "source", role=f"{fg.name}/source",
         )
