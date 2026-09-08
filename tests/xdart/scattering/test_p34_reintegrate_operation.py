@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.core.test_vnext_p34_existing_replacement import _seed_existing, _stub_integrators
+from tests.core.reintegrate_support import _seed_existing, _stub_integrators
 from tests.xdart.scattering.test_e4_preview_transport import _write_processed
 from tests.xdart.scattering.test_p3_experiment_operation_composition import _page
 from xdart.gui.tabs.scattering.processed_browser import (
@@ -353,7 +353,7 @@ def test_reintegrate_rolls_exact_settlement_before_one_terminal_drain(
     import h5py
     import numpy as np
 
-    from tests.core.test_vnext_p34_existing_replacement import _r1
+    from tests.core.reintegrate_support import _r1
     from xrd_tools.io.record_writer import NexusRecordWriter
     from xrd_tools.reduction import core
     from xrd_tools.reduction import reintegrate as module

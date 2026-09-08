@@ -123,7 +123,7 @@ def test_a_recognized_previous_result_is_still_replaceable(tmp_path, monkeypatch
     as a genuine predecessor -- rather than a hand-built file that might satisfy
     the recognizer for the wrong reason.
     """
-    from tests.core.test_vnext_p34_existing_replacement import _seed_existing
+    from tests.core.reintegrate_support import _seed_existing
     from xrd_tools.io.processed_scan_id import is_current_processed_xdart_path
 
     seeded = _seed_existing(tmp_path, labels=(2, 5), name="recognized")

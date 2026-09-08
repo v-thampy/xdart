@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from tests.core.test_vnext_p34_existing_replacement import _seed_existing
+from tests.core.reintegrate_support import _seed_existing
 from tests.xdart.scattering.test_e4_accumulation_selection_parity import (
     _click_frame,
 )

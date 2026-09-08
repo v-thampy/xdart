@@ -17,7 +17,7 @@ import h5py
 import numpy as np
 import pytest
 
-from tests.core.test_vnext_p34_existing_replacement import (
+from tests.core.reintegrate_support import (
     _plans,
     _seed_existing,
     _stub_integrators,

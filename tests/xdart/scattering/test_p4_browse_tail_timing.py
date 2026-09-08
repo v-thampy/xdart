@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from pyqtgraph.Qt import QtWidgets
 
-from tests.core.test_vnext_p34_existing_replacement import _seed_existing
+from tests.core.reintegrate_support import _seed_existing
 
 
 @pytest.fixture

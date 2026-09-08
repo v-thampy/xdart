@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from tests.core.test_vnext_p34_existing_replacement import _seed_existing
+from tests.core.reintegrate_support import _seed_existing
 from tests.xdart.scattering.test_p34_reintegrate_operation import _loaded_page
 from xdart.gui.tabs.scattering.adapters.browse_loader import BrowseLoader
 from xdart.gui.tabs.scattering.operation_values import OperationIdentity

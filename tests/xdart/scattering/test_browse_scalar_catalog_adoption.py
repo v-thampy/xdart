@@ -79,7 +79,7 @@ def _fake_loader(monkeypatch, path: Path, reader_factory):
 def test_default_browse_adopts_one_scalar_catalog_without_payload_rows(
     tmp_path, monkeypatch,
 ) -> None:
-    from tests.core.test_vnext_p34_existing_replacement import _seed_existing
+    from tests.core.reintegrate_support import _seed_existing
     from xdart.gui.tabs.scattering.adapters import browse_loader as module
     from xdart.gui.tabs.scattering.browse_values import (
         BrowseLoadRequest,
