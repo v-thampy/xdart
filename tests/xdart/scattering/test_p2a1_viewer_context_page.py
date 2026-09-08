@@ -11,6 +11,7 @@ import time
 
 import numpy as np
 import pytest
+from pyqtgraph.Qt import QtCore
 from xdart.gui.tabs.scattering.context_controller import ContextController
 from xdart.gui.tabs.scattering.context_projection import ContextProjection
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey, StandardEventKind, StandardRunEvent
@@ -493,101 +494,42 @@ def test_real_viewer_chooser_preserves_opaque_identity_and_acquisition_isolation
     )
     controller.viewer_2d_context = SimpleNamespace(original_path=selected)
     page._viewer_2d_file_chooser = forbidden
-    page._clear_viewer_2d_renderer = lambda: calls.append("clear") or True
+    page._clear_viewer_2d_renderer = lambda *, preserve_navigation=False: calls.append("clear") or True
     ScatteringWorkspace._run_action(page)
     assert calls[-4:] == ["clear", ("open", selected), ("notice", ""), "timer"]
-def _set(widget, attribute, action, value) -> None:
-    setattr(widget, attribute, value)
-    widget.events.append((widget.name, action, value))
-
-def _widget(value="", *, events=None, name=""):
-    widget = SimpleNamespace(
-        value=value, hidden=False, enabled=True,
-        events=[] if events is None else events, name=name)
-    widget.setText = partial(_set, widget, "value", "text")
-    widget.setEnabled = partial(_set, widget, "enabled", "enabled")
-    widget.setChecked = partial(_set, widget, "value", "checked")
-    widget.hide = partial(_set, widget, "hidden", "hide", True)
-    widget.show = partial(_set, widget, "hidden", "show", False)
-    def set_visible(visible):
-        widget.hidden = not visible
-        widget.events.append((widget.name, "visible", visible))
-    widget.setVisible = set_visible
-    return widget
-
-def _pane(*, fail=False, events=None, name="pane"):
-    pane = _widget(events=events, name=name)
-    pane.fail, pane.rendered, pane.render_values = fail, None, None
-    histogram = SimpleNamespace(
-        values=(9.0, 99.0), lo_lim=9.0, hi_lim=99.0, events=pane.events, name=f"{name}-color",
-        setLevels=lambda values: _set(histogram, "values", "levels", values))
-    view = SimpleNamespace(
-        range=(0.0, 9.0, 0.0, 99.0), events=pane.events, name=f"{name}-range",
-        setRange=lambda rect: _set(view, "range", "range", rect))
-    image = SimpleNamespace(
-        image=np.ones((2, 3)), levels=(9.0, 99.0),
-        qimage=object(), _defferedLevels=object(), _lastDownsample=(2, 2), _displayBuffer=object(),
-        _processingBuffer=object(), _imageNanLocations=object(), _imageHasNans=True,
-        transform="frame-transform", events=pane.events, name=name,
-        pos_label=_widget("pixel", events=pane.events, name=f"{name}-hover"),
-        resetTransform=lambda: _set(image, "transform", "transform", None),
-        prepareGeometryChange=lambda: pane.events.append((name, "geometry")),
-        informViewBoundsChanged=lambda: pane.events.append((name, "bounds")),
-        update=lambda: pane.events.append((name, "update")))
-    pane.canvas = SimpleNamespace(
-        imageItem=image, histogram=histogram, imageViewBox=view,
-        raw_image=np.ones((2, 3)), displayed_image=np.ones((2, 3)),
-        _level_cache=object(), _level_scan_token=object())
-    def render(value, **_kwargs):
-        pane.events.append((name, "render", value))
-        if pane.fail:
-            raise pane.fail if isinstance(pane.fail, BaseException) else ValueError("secret")
-        pane.rendered = value
-        pane.render_values = _kwargs
-        pane.canvas.raw_image = pane.canvas.displayed_image = value
-        image.image, image.levels, image.transform = value, (0.0, 11.0), value.shape
-        histogram.values, histogram.lo_lim, histogram.hi_lim = (0.0, 11.0), 0.0, 11.0
-        view.range = (0.0, float(value.shape[1]), 0.0, float(value.shape[0]))
-    pane.render = render
-    pane.clear = lambda: setattr(pane, "rendered", None)
-    return pane
-
-def _selector(events):
-    selector = SimpleNamespace(
-        items=[object()], captions=[], index=0, events=events, name="selector")
-    def clear():
-        selector.items.clear()
-        selector.captions.clear()
-        events.append(("selector", "clear"))
-    def add_frame(caption, frame, _tooltip):
-        selector.items.append(frame)
-        selector.captions.append(caption)
-    selector.clear = clear
-    selector.setCurrentIndex = partial(_set, selector, "index", "index")
-    selector.add_frame = add_frame
-    selector.count = lambda: len(selector.items)
-    selector.itemData = lambda index: selector.items[index]
-    return selector
-
-def _fake_scientific(*, failing=False):
+def _scientific(monkeypatch, *, failing=False):
+    """Observe real widget calls; only render/clear failures are injected."""
+    view = ScientificView()
     events = []
-    raw, cake = (_pane(fail=failing, events=events, name="raw"),
-                 _pane(events=events, name="cake"))
-    bottom, splitter = (_widget(events=events, name="bottom"),
-                        _widget(events=events, name="splitter"))
-    vertical = SimpleNamespace(widget=lambda _index: bottom, sizes=[500, 500])
-    vertical.setSizes = partial(setattr, vertical, "sizes")
-    widgets = {name: _widget(events=events, name=name) for name in (
-        "previous_frame", "next_frame", "title", "status", "progress",
-        "log_scale", "norm", "background", "image_axis", "share_axis", "slice",
-        "slice_center", "slice_width", "pin", "detector_controls", "raw_popup_button")}
-    view = SimpleNamespace(
-        events=events, raw=raw, cake=cake, image_splitter=splitter,
-        vertical_splitter=vertical, frame_selector=_selector(events), color_map=object(),
-        curve=_pane(events=events, name="curve"), waterfall=_pane(events=events, name="waterfall"),
-        _processing_mode="", _selector_operations=0, raw_popup_dialog=None,
-        _expected_background_key=None, _rendered_background_key=None,
-        _viewer_2d_known_empty=False,
+    view.events = events
+
+    def observe(target, name, method, action):
+        original = getattr(target, method)
+        def call(*args, **kwargs):
+            events.append((name, action, *args))
+            return original(*args, **kwargs)
+        monkeypatch.setattr(target, method, call)
+
+    for name, widget in (("raw", view.raw), ("splitter", view.image_splitter)):
+        observe(widget, name, "hide", "hide")
+        observe(widget, name, "setVisible", "visible")
+    for name in ("title", "status", "progress"):
+        observe(getattr(view, name), name, "setText", "text")
+    for name in ("previous_frame", "next_frame"):
+        observe(getattr(view, name), name, "setEnabled", "enabled")
+    observe(view.frame_selector, "selector", "setCurrentIndex", "index")
+    observe(view.vertical_splitter, "vertical", "setSizes", "sizes")
+    for name, pane in (("raw", view.raw), ("cake", view.cake)):
+        pane.render(np.arange(6.0).reshape(2, 3))
+        image = pane.canvas.imageItem
+        for method, action in (("prepareGeometryChange", "geometry"),
+                               ("informViewBoundsChanged", "bounds"), ("update", "update")):
+            observe(image, name, method, action)
+        observe(image.pos_label, f"{name}-hover", "setText", "text")
+        observe(pane.canvas.imageViewBox, f"{name}-range", "setRange", "range")
+    view.curve.plot([1, 2], [3, 4])
+    view.waterfall.render(np.ones((2, 3)))
+    for name, value in dict(
         _viewer_2d_payload=np.ones((2, 2)), _frame_keys=(object(),),
         _selected_keys=(object(),), _label_indices={1: [0]},
         _heavy_available=frozenset((object(),)), _trace_history_scope=object(),
@@ -599,14 +541,18 @@ def _fake_scientific(*, failing=False):
         _waterfall_y_values=(1.0,), _waterfall_source_keys=(object(),),
         _waterfall_render_contract=object(), _rendered_image_axis="Q-Chi",
         _rendered_cake_axis_key="Q", _rendered_cake_x_axis=object(),
-        _rendered_cake_y_axis=object(), _rendered_trace_axis_key="Q", **widgets,
-    )
-    view._set_share_link = lambda _on: None
-    view._rebuild_frames = partial(ScientificView._rebuild_frames, view)
-    view._apply_processing_layout = partial(ScientificView._apply_processing_layout, view)
-    view.reconcile_action_availability = partial(
-        ScientificView.reconcile_action_availability, view,
-    )
+        _rendered_cake_y_axis=object(), _rendered_trace_axis_key="Q",
+    ).items():
+        setattr(view, name, value)
+    view.raw.fail = failing
+    render = view.raw.render
+    def observed_render(value, **kwargs):
+        events.append(("raw", "render", value))
+        if view.raw.fail:
+            raise view.raw.fail if isinstance(view.raw.fail, BaseException) else ValueError("secret")
+        view.raw.render_values = kwargs
+        return render(value, **kwargs)
+    monkeypatch.setattr(view.raw, "render", observed_render)
     return view
 
 def _assert_neutral(view, title, status, *, known_empty=True) -> None:
@@ -614,7 +560,8 @@ def _assert_neutral(view, title, status, *, known_empty=True) -> None:
     assert view._viewer_2d_payload is None
     assert view._frame_keys == view._selected_keys == view._rendered_trace_keys == ()
     assert view._label_indices == view._trace_history_by_identity == view._pinned_trace_by_id == {}
-    assert view._heavy_available == frozenset() and view.curve.rendered is view.waterfall.rendered is None
+    assert view._heavy_available == frozenset()
+    assert view.curve.listDataItems() == [] and view.waterfall.canvas.imageItem.image is None
     assert view._trace_selection_keys == view._trace_history_keys == view._waterfall_y_values == view._waterfall_source_keys == ()
     assert view._trace_history_scope is view._pinned_trace_scope is view._rendered_plot_options is None
     assert (view._rendered_plot_mode, view._bottom_waterfall_active) == ("", False)
@@ -623,25 +570,28 @@ def _assert_neutral(view, title, status, *, known_empty=True) -> None:
             view._rendered_trace_axis_key) == (None,) * 7
     for pane in (view.raw, view.cake):
         assert pane.canvas.raw_image.size == pane.canvas.displayed_image.size == 0
-        assert pane.canvas.imageItem.image is pane.canvas.imageItem.levels is None
+        assert pane.canvas.imageItem.image is None
+        np.testing.assert_array_equal(pane.canvas.imageItem.levels, (0.0, 1.0))
         assert all(getattr(pane.canvas.imageItem, name) is None for name in (
             "qimage", "_defferedLevels", "_displayBuffer", "_processingBuffer", "_imageNanLocations", "_imageHasNans"))
         assert pane.canvas.imageItem._lastDownsample == (1, 1)
         assert pane.canvas._level_cache is pane.canvas._level_scan_token is None
-        assert pane.canvas.histogram.values == (0.0, 1.0)
+        assert pane.canvas.histogram.levels() == (0.0, 1.0)
         assert pane.canvas.histogram.lo_lim is pane.canvas.histogram.hi_lim is None
-        assert pane.canvas.imageItem.transform is None
-        rect = pane.canvas.imageViewBox.range
+        assert pane.canvas.imageItem.transform().isIdentity()
+        name = "raw-range" if pane is view.raw else "cake-range"
+        rect = next(event[2] for event in reversed(view.events)
+                    if event[:2] == (name, "range") and len(event) > 2)
         assert (rect.x(), rect.y(), rect.width(), rect.height()) == (0.0, 0.0, 1.0, 1.0)
     assert {"geometry", "bounds", "update"} <= {event[1] for event in view.events}
-    assert view.frame_selector.items == [] and view.frame_selector.index == -1
-    assert not view.previous_frame.enabled and not view.next_frame.enabled
-    assert (view.title.value, view.status.value, view.progress.value) == (title, status, "0/0")
-    assert all(item.hidden for item in (
+    assert view.frame_selector.count() == 0 and view.frame_selector.currentIndex() == -1
+    assert not view.previous_frame.isEnabled() and not view.next_frame.isEnabled()
+    assert (view.title.text(), view.status.text(), view.progress.text()) == (title, status, "0/0")
+    assert all(item.isHidden() for item in (
         view.image_splitter, view.raw, view.cake, view.vertical_splitter.widget(1)))
 
 def test_viewer_transaction_hides_renders_reveals_last_and_retries_same_array(monkeypatch) -> None:
-    view = _fake_scientific(failing=True)
+    view = _scientific(monkeypatch, failing=True)
     array = np.arange(12.0).reshape(3, 4)
     identity = RunIdentity(1, "viewer-token")
     prior = DisplayFrameKey(identity, "viewer-2d", "viewer-2d", 2, 1)
@@ -652,8 +602,6 @@ def test_viewer_transaction_hides_renders_reveals_last_and_retries_same_array(mo
         title="image.npy · frame 7 · NumPy array", status="2D Viewer · NumPy array",
         background_set=False, background_enabled=True)
     navigation = SimpleNamespace(frames=(prior, frame), current=frame, selected=(frame,))
-    monkeypatch.setattr("xdart.gui.tabs.scattering.scientific_view.QtCore.QSignalBlocker", lambda _widget: object())
-    monkeypatch.setattr("xdart.gui.tabs.scattering.scientific_view.set_combo_value", lambda *_args, **_kwargs: "viridis")
     def reconcile(target=view):
         return ScientificView.reconcile(
             target, state, navigation, completed=2, total=2, detail="")
@@ -677,15 +625,24 @@ def test_viewer_transaction_hides_renders_reveals_last_and_retries_same_array(mo
     view.raw.fail = False
     view.events.clear()
     reconcile()
-    assert view.raw.rendered is view._viewer_2d_payload is array
+    assert view._viewer_2d_payload is array
+    np.testing.assert_array_equal(view.raw.canvas.raw_image, array.T[:, ::-1])
+    assert np.shares_memory(view.raw.canvas.raw_image, array)
     assert view.raw.render_values["level_scan_token"] == (id(frame), id(array))
     assert (view.raw.render_values["color_map"], view.raw.render_values["log_scale"]) == ("plasma", True)
-    assert (view.raw.canvas.imageItem.levels, view.raw.canvas.imageItem.transform, view.raw.canvas.histogram.values,
-            view.raw.canvas.histogram.lo_lim, view.raw.canvas.histogram.hi_lim, view.raw.canvas.imageViewBox.range) == (
-        (0.0, 11.0), array.shape, (0.0, 11.0), 0.0, 11.0, (0.0, 4.0, 0.0, 3.0))
-    assert view.progress.value == "2/2" and view.frame_selector.captions == ["2", "7"]
-    assert view.cake.rendered is view.curve.rendered is view.waterfall.rendered is None
-    assert view.norm.hidden and not view.background.hidden
+    displayed = np.log10(array.T[:, ::-1] + 1.0)
+    np.testing.assert_allclose(view.raw.canvas.displayed_image, displayed)
+    np.testing.assert_allclose(view.raw.canvas.imageItem.image, displayed)
+    expected_levels = np.percentile(displayed, (0.1, 99.9))
+    np.testing.assert_allclose(view.raw.canvas.imageItem.levels, expected_levels)
+    np.testing.assert_allclose(view.raw.canvas.histogram.levels(), expected_levels)
+    assert (view.raw.canvas.histogram.lo_lim, view.raw.canvas.histogram.hi_lim) == (0.0, np.log10(12.0))
+    assert view.raw.canvas.imageItem.mapRectToParent(view.raw.canvas.imageItem.boundingRect()) == QtCore.QRectF(0, 0, 3, 2)
+    assert view.progress.text() == "2/2"
+    assert [view.frame_selector.itemText(index) for index in range(view.frame_selector.count())] == ["2", "7"]
+    assert view.cake.canvas.imageItem.image is view.waterfall.canvas.imageItem.image is None
+    assert view.curve.listDataItems() == []
+    assert view.norm.isHidden() and not view.background.isHidden()
     render_at = next(i for i, event in enumerate(view.events) if event[:2] == ("raw", "render"))
     reveal_at = next(i for i, event in enumerate(view.events)
                      if event == ("splitter", "visible", True))
@@ -696,23 +653,26 @@ def test_viewer_transaction_hides_renders_reveals_last_and_retries_same_array(mo
                 ("previous_frame", "enabled"), ("next_frame", "enabled")}
     positions = [max(i for i, event in enumerate(view.events) if event[:2] == key) for key in required]
     assert render_at < min(positions) and max(positions) < reveal_at
-    assert view.raw.canvas.imageItem.pos_label.value == ""
-    assert view.previous_frame.enabled and not view.next_frame.enabled
+    assert view.raw.canvas.imageItem.pos_label.text == ""
+    assert view.previous_frame.isEnabled() and not view.next_frame.isEnabled()
     forged = DisplayFrameKey(RunIdentity(9, "native"), "viewer-2d", "viewer-2d", 99, 1)
     commands = []
-    view.commandRequested = SimpleNamespace(emit=commands.append)
+    view.commandRequested.connect(commands.append)
     for selected, kind in ((navigation.current, ShellCommandKind.SELECT_FRAME),
                            (forged, ShellCommandKind.HYDRATE_FRAME),
                            (replace(navigation.current), ShellCommandKind.HYDRATE_FRAME)):
         commands.clear()
-        view.frame_selector.items = [selected]
+        blocker = QtCore.QSignalBlocker(view.frame_selector)
+        view.frame_selector.clear()
+        view.frame_selector.add_frame(str(selected.local_frame_label), selected, "")
+        del blocker
         ScientificView._frame_selected(view, 0)
         assert commands[0].kind is kind
     canonical = view._viewer_2d_payload
     request = Viewer2DRendererClearRequest("viewer-token", 3, "0" * 64, 0)
     receipt = ScientificView.clear_viewer_2d(view, request)
     assert receipt.request is request and receipt.cleared
-    assert canonical is array and view.raw.rendered is None
+    assert canonical is array and view.raw.canvas.imageItem.image is None
     _assert_neutral(view, "Current", "")
     view.events.clear()
     reconcile()
@@ -723,22 +683,24 @@ def test_viewer_transaction_hides_renders_reveals_last_and_retries_same_array(mo
     assert not any(event[:2] == ("raw", "hide")
                    for event in view.events[:render_at])
     assert not view._viewer_2d_known_empty
-    interrupt = _fake_scientific()
+    interrupt = _scientific(monkeypatch)
     interrupt.raw.fail = KeyboardInterrupt()
     with pytest.raises(KeyboardInterrupt):
         reconcile(interrupt)
 
-def test_processing_layout_rederives_viewer_and_both_native_rows_non_gui() -> None:
-    view = _fake_scientific()
+def test_processing_layout_rederives_viewer_and_both_native_rows_non_gui(monkeypatch) -> None:
+    view = _scientific(monkeypatch)
     panes = (view.image_splitter, view.raw, view.cake, view.vertical_splitter.widget(1))
+    initial_sizes = view.vertical_splitter.sizes()
     ScientificView._apply_processing_layout(view, "2D Viewer")
-    assert not view.image_splitter.hidden and not view.raw.hidden
-    assert view.cake.hidden and view.vertical_splitter.widget(1).hidden
+    assert not view.image_splitter.isHidden() and not view.raw.isHidden()
+    assert view.cake.isHidden() and view.vertical_splitter.widget(1).isHidden()
     ScientificView._apply_processing_layout(view, "Int 2D")
-    assert not any(item.hidden for item in panes)
-    assert view.vertical_splitter.sizes == [500, 500]
+    assert not any(item.isHidden() for item in panes)
+    assert view.vertical_splitter.sizes() == initial_sizes
     ScientificView._apply_processing_layout(view, "Int 1D")
-    assert view.image_splitter.hidden
-    assert not any(item.hidden for item in panes[1:])
+    assert view.image_splitter.isHidden()
+    assert not any(item.isHidden() for item in panes[1:])
     ScientificView._apply_processing_layout(view, "Int 2D")
-    assert not any(item.hidden for item in panes)
+    assert not any(item.isHidden() for item in panes)
+    assert ("vertical", "sizes", [500, 500]) in view.events
