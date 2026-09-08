@@ -55,15 +55,13 @@ class RunDisplayResidency:
         incoming_heavy: bool = False,
         incoming_thumbnail: bool = False,
     ) -> None:
-        """Register one key's stores and tier membership (prepare half).
+        """Register actual stores and tier membership after publication.
 
-        ``incoming_heavy``/``incoming_thumbnail`` are detached values-only
-        facts about a payload the caller is about to publish, so a
-        publication-last commit keeps tier membership exact without the
-        payload being publicly visible yet.  Cap enforcement is the separate
-        :meth:`enforce` apply half, run only after the authoritative
-        publication landed — a rejected candidate therefore never evicts
-        prior public state (its touches are undone by :meth:`reconcile`).
+        Live ``retain_frame`` callers may pass detached incoming facts while
+        their publication is being admitted. Hydration calls this method only
+        after its authoritative publication has returned, without candidate
+        hints, so failed fills cannot create phantom residency entries.
+        Cap enforcement is the separate :meth:`enforce` apply half.
         """
         stores = _ResidentStores(records, publications)
         self._stores[key] = stores

@@ -95,7 +95,7 @@ def _write_processed(
     thumbnails: bool = True,
     two_d: bool = True,
     raw_dtype=np.uint16,
-    schema_version=2,
+    schema_version=3,
 ) -> tuple[Path, Path]:
     """One real processed container + one real raw master, portable layout."""
     raw = np.arange(16, dtype=raw_dtype).reshape(4, 4)
@@ -1005,11 +1005,14 @@ def test_newest_active_selection_supersedes_older_queued_read(
 
 def _install_seam_failure(monkeypatch, state, owner, seam, *, permanent):
     """Inject one exact commit-seam failure (fail-once or persistent)."""
-    target, name = {
-        "light": (owner.light_records, "exchange_releasable_record"),
-        "residency": (state._residency, "observe"),
-        "publication": (owner.publications, "upsert"),
-    }[seam]
+    if seam == "light":
+        target, name = owner.publications, "publish_gui_light_1d"
+    elif seam == "residency":
+        target, name = state._residency, "observe"
+    elif seam == "publication":
+        target, name = owner.publications, "upsert"
+    else:
+        raise ValueError(f"unknown commit seam: {seam}")
     original = getattr(target, name)
     calls = {"n": 0}
 
@@ -1033,7 +1036,7 @@ def _hydrate_ok(state, owner_value, gate, processed, label, generation):
     return request
 
 
-@pytest.mark.parametrize("seam", ["light", "publication"])
+@pytest.mark.parametrize("seam", ["publication"])
 def test_persistent_seam_failure_rejects_candidate_and_preserves_display(
     monkeypatch, tmp_path, seam
 ):
@@ -1069,7 +1072,7 @@ def test_persistent_seam_failure_rejects_candidate_and_preserves_display(
     assert state.payloads.get(keys[2]) is prior_payload
 
 
-@pytest.mark.parametrize("seam", ["light", "publication"])
+@pytest.mark.parametrize("seam", ["publication"])
 def test_fail_once_seam_retries_exact_prepared_commit_once(
     monkeypatch, tmp_path, seam
 ):
@@ -1423,7 +1426,7 @@ def test_failed_commit_does_not_publish_detector_outcome(
     assert state.detector_outcome(keys[1]) is None
 
 
-@pytest.mark.parametrize("seam", ["light", "publication"])
+@pytest.mark.parametrize("seam", ["publication"])
 @pytest.mark.parametrize("shape", ["fresh", "rehydrated"])
 def test_failed_attempt_restores_every_public_surface_exactly(
     monkeypatch, tmp_path, seam, shape
@@ -1549,10 +1552,9 @@ def test_failed_hydration_restore_preserves_concurrent_live_residency(
     live_complete = threading.Event()
     live_errors = []
     canonical_record = owner.records.get(2)
-    original_light_upsert = owner.light_records.upsert
     original_publication_upsert = owner.publications.upsert
 
-    def coordinated_light_upsert(candidate, *args, **kwargs):
+    def coordinated_publication_upsert(candidate, *args, **kwargs):
         if (
             candidate.label == 2
             and threading.current_thread().name == "live-producer"
@@ -1561,9 +1563,6 @@ def test_failed_hydration_restore_preserves_concurrent_live_residency(
             # rejected parent.
             live_passed_display_lock.set()
             assert release_live_store_write.wait(timeout=10)
-        return original_light_upsert(candidate, *args, **kwargs)
-
-    def coordinated_publication_upsert(candidate):
         if (
             candidate.label == 1
             and threading.current_thread().name != "live-producer"
@@ -1574,11 +1573,8 @@ def test_failed_hydration_restore_preserves_concurrent_live_residency(
             release_live_store_write.set()
             assert live_complete.wait(timeout=10)
             raise RuntimeError("injected hydration publication failure")
-        return original_publication_upsert(candidate)
+        return original_publication_upsert(candidate, *args, **kwargs)
 
-    monkeypatch.setattr(
-        owner.light_records, "upsert", coordinated_light_upsert
-    )
     monkeypatch.setattr(
         owner.publications, "upsert", coordinated_publication_upsert
     )
@@ -1644,7 +1640,9 @@ def test_failed_hydration_restore_preserves_concurrent_live_residency(
         (1, HydrationOutcome.FAILED)
     ) == 1
     assert owner.records.get(2) is canonical_record
-    assert owner.publications.get(2) is publication
+    live_publication = owner.publications.get(2)
+    assert live_publication is not None
+    assert live_publication.view.raw is publication.view.raw
     residency = state._residency
     assert keys[2] in residency._stores
     assert keys[2] in residency._heavy

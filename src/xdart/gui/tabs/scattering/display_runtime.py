@@ -1286,11 +1286,12 @@ class RunDisplayState:
                 # bookkeeping error must not turn published science into a
                 # failed/retried hydration.
                 try:
-                    self._residency.observe(
-                        key,
-                        records=art.records,
-                        publications=art.publications,
-                    )
+                    if request.purpose is not HydrationPurpose.FULL:
+                        self._residency.observe(
+                            key,
+                            records=art.records,
+                            publications=art.publications,
+                        )
                     self._residency.enforce(
                         protected=self._raw_lru,
                         heavy_victim=heavy_victim,
