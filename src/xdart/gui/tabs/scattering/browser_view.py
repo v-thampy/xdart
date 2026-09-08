@@ -156,6 +156,9 @@ class _FrameSelectionCadenceFilter(QtCore.QObject):
         try:
             owner = self._owner
             if event_type == QtCore.QEvent.Type.KeyPress:
+                if event.matches(QtGui.QKeySequence.StandardKey.SelectAll):
+                    owner._select_all_frames()
+                    return True
                 if key in _FRAME_NAVIGATION_KEYS:
                     if not owner._frame_gesture_active:
                         owner._begin_frame_gesture(modifiers)
@@ -751,6 +754,27 @@ class BrowserView(QtWidgets.QFrame):
             path=("artifact",),
             artifacts=artifacts,
         ))
+
+    def _select_all_frames(self) -> None:
+        """Select All is exact membership, not one Overlay visit."""
+        self._cancel_pending_frame_selection()
+        frames = self.frame_model.frames
+        if not frames:
+            return
+        current = self.frames.currentIndex().data(_USER_ROLE)
+        if not any(current is frame for frame in frames):
+            current = frames[-1]
+        self._reconciling_frames = True
+        try:
+            self.frames.selectAll()
+        finally:
+            self._reconciling_frames = False
+        self._selected_frames = self._trace_frames = frames
+        self._queue_frame_command(ShellCommand(
+            ShellCommandKind.SELECT_BROWSER_FRAMES,
+            frame=current, frames=frames, intent=FrameSelectionIntent.EXACT,
+        ))
+        self._frame_selection_coalescer.trigger()
 
     def _frames_selected(
         self,

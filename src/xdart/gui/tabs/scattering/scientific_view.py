@@ -2166,9 +2166,9 @@ class ScientificView(QtWidgets.QFrame):
             self._waterfall_source_keys = ()
             self._waterfall_render_contract = None
         elif viewer_single:
-            # Viewer Single is exact-current science, so its semantic history
-            # is reseeded for each navigation step.  Its compatible rendered
-            # item remains mounted for the setData reuse path below.
+            # Viewer Single is the exact selected science. Its semantic
+            # history is reseeded, while compatible rendered items stay
+            # mounted for the setData reuse path below.
             self._trace_history_by_identity.clear()
         selected_by_id = {id(frame): frame for frame in selected}
         for trace in state.traces:

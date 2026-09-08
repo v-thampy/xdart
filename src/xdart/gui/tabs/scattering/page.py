@@ -6680,6 +6680,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice("2D Viewer cleanup remains pending"); return
         context = self._context_controller.viewer_1d_context
         if context is not None and context.state.value == "ready":
+            navigation = self._context_controller.navigation
+            if (len(navigation.frames) == len(context.paths)
+                    and all(path in context.paths for path in selected)):
+                frame_by_path = dict(zip(context.paths, navigation.frames))
+                if self._context_controller.select_viewer_1d(
+                    frame_by_path[current_path],
+                    tuple(frame_by_path[path] for path in selected),
+                ):
+                    # Already-owned files are a resident selection edit.
+                    # Explicit Reload and new files retain the clear fence.
+                    self._notice("")
+                    self._refresh_shell()
+                    return
             if not self._clear_viewer_1d_renderer(
                 paths=selected,
                 current_path=current_path,
@@ -6861,18 +6874,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             updates["plot_mode"] = value
             if value not in {"Overlay", "Waterfall"}:
                 updates["slice_pins"] = ()
-            if value == "Single" and prior_mode != "Single":
+            if value == "Single" and prior_mode != "Single" and not viewer_1d:
                 self._shell.browser.cancel_pending_frame_selection()
                 current = self._context_controller.navigation.current
                 if current is not None:
-                    if viewer_1d:
-                        self._context_controller.select_viewer_1d(
-                            current, (current,),
-                        )
-                    else:
-                        self._context_controller.select_navigation(
-                            current, (current,),
-                        )
+                    self._context_controller.select_navigation(
+                        current, (current,),
+                    )
         elif kind is ShellCommandKind.SET_SHARE_AXIS:
             if type(value) is not bool:
                 return False

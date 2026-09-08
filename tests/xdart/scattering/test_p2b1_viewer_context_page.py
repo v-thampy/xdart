@@ -421,7 +421,7 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     assert single.browser.selected_scan == str(first)
     assert single.browser.selected_artifacts == (str(first), str(second))
     assert single.browser.multi_artifact_selection
-    assert len(single.scientific.traces) == 1
+    assert len(single.scientific.traces) == 2
     trace = single.scientific.traces[0]
     mode = borrow.modes[0]
     assert trace.axis.values is mode.coordinate
@@ -532,7 +532,7 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
         inherited = _shell(controller, preferences)
         assert (inherited.scientific.plot_mode == "Single" and preferences.plot_mode == aggregate
                 and inherited.scientific.slice_pins == () and inherited.scientific.pinned_traces == ())
-        assert len(inherited.scientific.traces) == 1
+        assert len(inherited.scientific.traces) == 2
         ScientificView._render_traces(render, inherited.scientific, controller.navigation, live_update=False)
     render._merge_trace_history = render._render_waterfall = None; rendered.clear(); plots.clear()
     payloads = controller.project_navigation(preferences=ScientificPreferences(), processing_mode="1D Viewer")
@@ -580,6 +580,9 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     refused = _shell(controller, ScientificPreferences(plot_mode="Overlay"))
     assert refused.scientific.traces == ()
     assert "conflicting units" in refused.scientific.status
+    single_refused = _shell(controller, ScientificPreferences(plot_mode="Single"))
+    assert single_refused.scientific.traces == ()
+    assert "conflicting units" in single_refused.scientific.status
     assert controller.viewer_1d_context.state.value == "ready"
     _close_1d(controller)
 
@@ -786,7 +789,7 @@ def test_viewer_1d_catalog_selection_emits_one_exact_batch_command() -> None:
     )]
 
 
-def test_viewer_1d_clicked_current_seeds_single_but_overlay_keeps_all_paths(
+def test_viewer_1d_clicked_current_keeps_explicit_selection_in_both_modes(
     tmp_path,
 ) -> None:
     from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
@@ -877,9 +880,7 @@ def test_viewer_1d_clicked_current_seeds_single_but_overlay_keeps_all_paths(
         )
         assert single.browser.selected_scan == paths[1]
         assert single.browser.selected_artifacts == paths
-        assert tuple(trace.frame for trace in single.scientific.traces) == (
-            frames[1],
-        )
+        assert tuple(trace.frame for trace in single.scientific.traces) == frames
 
         overlay = _shell(
             controller,
@@ -897,7 +898,7 @@ def test_viewer_1d_clicked_current_seeds_single_but_overlay_keeps_all_paths(
         app.processEvents()
 
 
-def test_viewer_1d_single_collapses_membership_without_preclear(
+def test_viewer_1d_single_keeps_membership_without_preclear(
     monkeypatch,
 ) -> None:
     current = object()
@@ -929,7 +930,7 @@ def test_viewer_1d_single_collapses_membership_without_preclear(
         ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Single"),
     )
 
-    assert calls == ["retire", "cancel", ("select", current, (current,))]
+    assert calls == ["retire"]
     assert page._preferences.plot_mode == "Single"
 
 

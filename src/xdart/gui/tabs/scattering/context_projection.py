@@ -251,14 +251,14 @@ def _viewer_1d_scientific(navigation, payloads, resident, preferences, notice):
         "Single", "Overlay", "Waterfall"} else "Single")
     payload_by_id = {id(item.frame_key): item for item in payloads
                      if type(item) is StandardDisplayPayload}
-    frames = ((navigation.current,) if effective == "Single" else navigation.selected)
+    # Single changes presentation, not an explicit multi-file selection.
+    frames = navigation.selected
     frames = tuple(frame for frame in frames if frame is not None)
     accepted = tuple(payload_by_id.get(id(frame)) for frame in frames)
     ready = (bool(frames) and all(item is not None for item in accepted)
              and all(frame in resident for frame in frames))
     status = notice or ("1D Viewer" if ready else "Loading 1D Viewer…")
-    if ready and effective != "Single" and len({item.view.axis_1d.unit
-                                                 for item in accepted}) != 1:
+    if ready and len({item.view.axis_1d.unit for item in accepted}) != 1:
         ready, status = False, "1D Viewer refused: conflicting units"
     if ready and effective == "Waterfall":
         axes = tuple(item.view.axis_1d.values for item in accepted)
