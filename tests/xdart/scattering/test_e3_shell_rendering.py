@@ -960,7 +960,7 @@ def test_failed_image_render_retires_contract_before_canvas_mutation(
 
     pane = ScientificImagePane(lock_aspect=True)
     first = np.arange(16.0).reshape(4, 4)
-    second = first + 100.0
+    second = np.arange(15.0).reshape(3, 5) + 100.0
     first.flags.writeable = False
     second.flags.writeable = False
     pane.render(first)
@@ -992,6 +992,72 @@ def test_failed_image_render_retires_contract_before_canvas_mutation(
             pane.image.image,
             first.T[:, ::-1],
         )
+    finally:
+        pane.close()
+        pane.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_distinct_immutable_images_keep_zoom_for_unchanged_geometry(
+    qapp: QtWidgets.QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """New pixels need not reset an operator's view of the same geometry."""
+    from xdart.gui.tabs.scattering.shell_widgets import ScientificImagePane
+
+    pane = ScientificImagePane(lock_aspect=False)
+    first = np.arange(12.0).reshape(3, 4)
+    second = first + 100.0
+    for source in (first, second):
+        source.flags.writeable = False
+    x_values = np.array((-4.0, -1.0, 2.0, 5.0))
+    y_values = np.array((-6.0, 0.0, 9.0))
+    same_extent_x = np.array((-4.0, 0.5, 3.0, 5.0))
+    for values in (x_values, y_values, same_extent_x):
+        values.flags.writeable = False
+    x_axis = AxisProjection(x_values, "Q", "q_A^-1")
+    y_axis = AxisProjection(y_values, "chi", "chi_deg")
+    same_extent_axis = AxisProjection(same_extent_x, "Q", "q_A^-1")
+    calls: list[tuple[str, object]] = []
+    set_range = pane.canvas.imageViewBox.setRange
+    set_label = pane.plot.setLabel
+
+    def observed_range(*args, **kwargs):
+        calls.append(("range", args[0] if args else kwargs.get("rect")))
+        return set_range(*args, **kwargs)
+
+    def observed_label(*args, **kwargs):
+        calls.append(("label", args[0] if args else kwargs.get("axis")))
+        return set_label(*args, **kwargs)
+
+    monkeypatch.setattr(pane.canvas.imageViewBox, "setRange", observed_range)
+    monkeypatch.setattr(pane.plot, "setLabel", observed_label)
+    try:
+        pane.render(first, x_axis=x_axis, y_axis=y_axis)
+        pane.canvas.imageViewBox.setRange(
+            QtCore.QRectF(-2.0, -3.0, 3.0, 6.0), padding=0.0,
+        )
+        retained = pane.canvas.imageViewBox.targetRect()
+        calls.clear()
+
+        pane.render(second, x_axis=same_extent_axis, y_axis=y_axis)
+
+        assert pane.canvas.imageViewBox.targetRect() == retained
+        assert calls == []
+
+        explicit = QtCore.QRectF(-1.0, -2.0, 2.0, 4.0)
+        pane.render(second, x_axis=same_extent_axis, y_axis=y_axis,
+                    view_range=explicit)
+        assert pane.canvas.imageViewBox.targetRect() == explicit
+        assert [kind for kind, _value in calls].count("range") == 1
+        assert [kind for kind, _value in calls].count("label") == 0
+
+        calls.clear()
+        changed_units = AxisProjection(same_extent_x, "Q", "2th_deg")
+        pane.render(second + 1.0, x_axis=changed_units, y_axis=y_axis)
+
+        assert [kind for kind, _value in calls].count("range") == 1
+        assert [kind for kind, _value in calls].count("label") == 2
     finally:
         pane.close()
         pane.deleteLater()

@@ -9,6 +9,7 @@ from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_values import (
+    BrowseTraceSnapshot,
     FrameNavigationProjection,
     ShellCommandKind,
 )
@@ -350,6 +351,60 @@ def test_single_compatible_update_reuses_curve_item(
             view.curve.getPlotItem().getAxis("bottom").labelText
             == "2θ"
         )
+    finally:
+        _dispose(view)
+
+
+def test_browse_single_rebind_keeps_curve_and_legend_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    view = ScientificView()
+    projection = make_shell_projection(
+        frame_count=2,
+        selected_index=0,
+        heavy_indices=(),
+        plot_mode="Single",
+        source_scan="browse",
+    )
+    frames = projection.navigation.frames
+    base = replace(projection.scientific, heavy=None, heavy_available=frozenset())
+
+    def state_for(index: int):
+        frame = frames[index]
+        state = replace(base, traces=(base.traces[index],))
+        snapshot = BrowseTraceSnapshot(
+            (frame,), (frame,), (1,), plot_mode="Single",
+            science_contract=state.browse_science_contract,
+        )
+        return replace(state, browse_trace_snapshot=snapshot), FrameNavigationProjection(
+            frames, frame, (frame,),
+        )
+
+    try:
+        first, first_navigation = state_for(0)
+        _reconcile(view, first, first_navigation)
+        item = view.curve.listDataItems()[0]
+        legend = view.legend.getLabel(item)
+        assert legend is not None
+        plot = view.curve.plot
+        plots: list[object] = []
+
+        def observed_plot(*args, **kwargs):
+            plots.append(args)
+            return plot(*args, **kwargs)
+
+        monkeypatch.setattr(view.curve, "plot", observed_plot)
+        second, second_navigation = state_for(1)
+        _reconcile(view, second, second_navigation)
+
+        trace = second.traces[0]
+        assert plots == []
+        assert view.curve.listDataItems() == [item]
+        assert view.legend.getLabel(item) is legend
+        assert legend.text == trace.title
+        np.testing.assert_array_equal(item.xData, trace.axis.values)
+        np.testing.assert_array_equal(item.yData, trace.intensity)
     finally:
         _dispose(view)
 

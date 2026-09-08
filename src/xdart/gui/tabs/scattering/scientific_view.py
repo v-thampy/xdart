@@ -518,12 +518,12 @@ class ScientificView(QtWidgets.QFrame):
         domain = active_key[2]
         try:
             if domain == "raw":
-                self._scrub_detector_pane(self.raw); self._viewer_2d_payload = None
+                self.raw.clear_image_buffers(); self._viewer_2d_payload = None
                 self._viewer_2d_known_empty = False
                 self._rendered_detector_source = "none"
-                if self.raw_popup_image is not None: self._scrub_detector_pane(self.raw_popup_image)
+                if self.raw_popup_image is not None: self.raw_popup_image.clear_image_buffers()
             elif domain == "integrated_2d":
-                self.cake.clear(); self._rendered_cake_x_axis = self._rendered_cake_y_axis = self._rendered_cake_axis_key = self._rendered_image_axis = None
+                self.cake.clear_image_buffers(); self._rendered_cake_x_axis = self._rendered_cake_y_axis = self._rendered_cake_axis_key = self._rendered_image_axis = None
             else:
                 self.curve.clear(); self.waterfall.clear(); self._trace_history_by_identity.clear(); self._pinned_trace_by_id.clear()
                 self._rendered_trace_keys = self._trace_history_keys = self._waterfall_source_keys = ()
@@ -637,16 +637,10 @@ class ScientificView(QtWidgets.QFrame):
 
     def _release_raw_popup(self, *_args) -> None:
         if self.raw_popup_image is not None:
-            self._scrub_detector_pane(self.raw_popup_image)
+            self.raw_popup_image.clear_image_buffers()
         if hasattr(self, "raw_popup_status"): self.raw_popup_status.setText("")
         if self._processing_mode == "Int 1D":
             self._emit(ShellCommandKind.SET_DETECTOR_MODE, "thumbnail", ("popup",))
-
-    @staticmethod
-    def _scrub_detector_pane(pane) -> None:
-        pane.clear()
-        for name in ("qimage", "levels", "_defferedLevels", "_displayBuffer", "_processingBuffer", "_imageNanLocations", "_imageHasNans"):
-            setattr(pane.image, name, None)
 
     def _reconcile_raw_popup(self, state: ScientificProjection) -> None:
         heavy = state.heavy
@@ -654,10 +648,10 @@ class ScientificView(QtWidgets.QFrame):
         if dialog is None or not dialog.isVisible():
             return
         if heavy is None or heavy.raw is None:
-            self._scrub_detector_pane(self.raw_popup_image)
+            self.raw_popup_image.clear_image_buffers()
             return
         if heavy.detector_source != "full":
-            self._scrub_detector_pane(self.raw_popup_image)
+            self.raw_popup_image.clear_image_buffers()
         self.raw_popup_image.render(
             heavy.raw, detector_shape=heavy.detector_shape,
             color_map=state.color_map, log_scale=state.log_scale,
@@ -993,7 +987,7 @@ class ScientificView(QtWidgets.QFrame):
                         or self._rendered_detector_source
                         != state.heavy.detector_source
                     ):
-                        self._scrub_detector_pane(self.raw)
+                        self.raw.clear_image_buffers()
                     self.raw.render(
                         state.heavy.raw,
                         detector_shape=state.heavy.detector_shape,
@@ -1008,7 +1002,7 @@ class ScientificView(QtWidgets.QFrame):
                         state.heavy.detector_source
                     )
                 else:
-                    self._scrub_detector_pane(self.raw)
+                    self.raw.clear_image_buffers()
                     self._rendered_detector_source = "none"
                 if state.heavy.cake is not None:
                     self.cake.render(
@@ -1029,7 +1023,7 @@ class ScientificView(QtWidgets.QFrame):
                     self._rendered_cake_y_axis = state.heavy.cake_y
                     self._rendered_image_axis = state.image_axis
                 else:
-                    self.cake.clear()
+                    self.cake.clear_image_buffers()
                     self._rendered_cake_axis_key = None
                     self._rendered_cake_x_axis = None
                     self._rendered_cake_y_axis = None
@@ -1044,9 +1038,9 @@ class ScientificView(QtWidgets.QFrame):
             else:
                 # An accepted absence is a complete transition, not permission
                 # to leave a stale raw/cake hybrid on screen.
-                self._scrub_detector_pane(self.raw)
+                self.raw.clear_image_buffers()
                 self._rendered_detector_source = "none"
-                self.cake.clear()
+                self.cake.clear_image_buffers()
                 self._rendered_cake_axis_key = None
                 self._rendered_cake_x_axis = None
                 self._rendered_cake_y_axis = None
@@ -1132,32 +1126,31 @@ class ScientificView(QtWidgets.QFrame):
                     cleared = False
             except Exception:
                 cleared = False
+        def verify_released(target, name):
+            nonlocal cleared
+            value = scrub(target, name, read=True)
+            if (
+                canonical is not None
+                and (
+                    value is canonical
+                    or isinstance(value, np.ndarray)
+                    and np.shares_memory(value, canonical)
+                )
+            ):
+                cleared = False
         for pane in (self.raw, self.cake):
-            scrub(pane, "clear")
+            try:
+                pane.clear_image_buffers(keep_chrome=keep_chrome)
+            except Exception:
+                cleared = False
             canvas = scrub(pane, "canvas", read=True)
             image = scrub(canvas, "imageItem", read=True)
-            histogram = scrub(canvas, "histogram", read=True)
-            view = scrub(canvas, "imageViewBox", read=True)
-            hover = scrub(image, "pos_label", read=True)
-            scrub(hover, "setText", "")
-            for target, name, value in (
-                (canvas, "raw_image", np.zeros(0)), (canvas, "displayed_image", np.zeros(0)),
-                (canvas, "_level_cache", None), (canvas, "_level_scan_token", None),
-                (histogram, "lo_lim", None), (histogram, "hi_lim", None),
-                (image, "image", None), (image, "qimage", None), (image, "levels", None),
-                (image, "_defferedLevels", None), (image, "_lastDownsample", (1, 1)),
-                (image, "_displayBuffer", None), (image, "_processingBuffer", None),
-                (image, "_imageNanLocations", None), (image, "_imageHasNans", None),
+            for target, name in (
+                (canvas, "raw_image"), (canvas, "displayed_image"),
+                (image, "image"), (image, "qimage"), (image, "levels"),
+                (image, "_displayBuffer"), (image, "_processingBuffer"),
             ):
-                scrub(target, name, value)
-            if not keep_chrome:
-                scrub(histogram, "setLevels", (0.0, 1.0))
-                scrub(view, "setRange", QtCore.QRectF(0.0, 0.0, 1.0, 1.0))
-            for method in ("resetTransform", "prepareGeometryChange",
-                           "informViewBoundsChanged", "update"):
-                if keep_chrome and method == "resetTransform":
-                    continue
-                scrub(image, method)
+                verify_released(target, name)
         for root in (self.curve, self.waterfall):
             scrub(root, "clear")
         try:
@@ -1976,6 +1969,13 @@ class ScientificView(QtWidgets.QFrame):
                 and state.plot_options == self._rendered_plot_options
                 and self._rendered_trace_axis_key == prior_trace_axis_key
                 and not state.share_axis
+                and (
+                    browse_snapshot is not None
+                    or (
+                        not state.pinned_traces
+                        and not state.slice_pins
+                    )
+                )
                 and self.bottom_stack.currentWidget() is self.curve
             ),
         )
@@ -2043,7 +2043,6 @@ class ScientificView(QtWidgets.QFrame):
         if (
             allow_single_rebind
             and len(keys) == 1
-            and keys[0][0] == "live"
             and keys[0] not in self._curve_items_by_key
             and len(self._curve_mounted_keys) == 1
         ):

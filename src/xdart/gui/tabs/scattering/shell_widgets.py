@@ -127,15 +127,94 @@ class ScientificImagePane(QtWidgets.QWidget):
         self.image = self.canvas.imageItem
         self.color_scale = self.canvas.histogram
         self._render_contract: tuple[object, ...] | None = None
+        self._geometry_contract: tuple[object, ...] | None = None
+        self._axis_presentation_contract: tuple[object, ...] | None = None
         layout.addWidget(self.canvas, 1)
 
     def clear(self) -> None:
         self._render_contract = None
+        self._geometry_contract = None
+        self._axis_presentation_contract = None
         self.canvas.raw_image = np.zeros(0)
         self.canvas.displayed_image = np.zeros(0)
         self.canvas._level_cache = None
         self.canvas._level_scan_token = None
         self.image.clear()
+
+    def clear_image_buffers(self, *, keep_chrome: bool = True) -> None:
+        """Release pyqtgraph image state while leaving failures observable."""
+        errors: list[Exception] = []
+
+        def clear_member(target, name, value=None, *, call=False) -> None:
+            try:
+                if call:
+                    member = getattr(target, name)
+                    if value is None:
+                        member()
+                    else:
+                        member(value)
+                else:
+                    setattr(target, name, value)
+            except Exception as error:
+                errors.append(error)
+
+        clear_member(self, "clear", call=True)
+        # Ordinary source/absence transitions historically scrubbed only the
+        # image buffers.  Retain their ViewBox, histogram and geometry state;
+        # full viewer retirement below explicitly requests a chrome reset.
+        if keep_chrome:
+            for name in (
+                "qimage", "levels", "_defferedLevels", "_displayBuffer",
+                "_processingBuffer", "_imageNanLocations", "_imageHasNans",
+            ):
+                clear_member(self.image, name, None)
+            if errors:
+                raise errors[0]
+            return
+        canvas = self.canvas
+        image = self.image
+        histogram = self.color_scale
+        try:
+            hover = image.pos_label
+        except Exception as error:
+            errors.append(error)
+        else:
+            clear_member(hover, "setText", "", call=True)
+        for target, name, value in (
+            (canvas, "raw_image", np.zeros(0)),
+            (canvas, "displayed_image", np.zeros(0)),
+            (canvas, "_level_cache", None),
+            (canvas, "_level_scan_token", None),
+            (histogram, "lo_lim", None),
+            (histogram, "hi_lim", None),
+            (image, "image", None),
+            (image, "qimage", None),
+            (image, "levels", None),
+            (image, "_defferedLevels", None),
+            (image, "_lastDownsample", (1, 1)),
+            (image, "_displayBuffer", None),
+            (image, "_processingBuffer", None),
+            (image, "_imageNanLocations", None),
+            (image, "_imageHasNans", None),
+        ):
+            clear_member(target, name, value)
+        if not keep_chrome:
+            clear_member(histogram, "setLevels", (0.0, 1.0), call=True)
+            clear_member(
+                canvas.imageViewBox,
+                "setRange",
+                QtCore.QRectF(0.0, 0.0, 1.0, 1.0),
+                call=True,
+            )
+        for method in (
+            "resetTransform", "prepareGeometryChange", "informViewBoundsChanged",
+            "update",
+        ):
+            if keep_chrome and method == "resetTransform":
+                continue
+            clear_member(image, method, call=True)
+        if errors:
+            raise errors[0]
 
     @staticmethod
     def _axis_render_contract(
@@ -165,6 +244,37 @@ class ScientificImagePane(QtWidgets.QWidget):
             ScientificImagePane._axis_render_contract(x_axis),
             ScientificImagePane._axis_render_contract(y_axis),
             detector_shape, color_map, bool(log_scale),
+        )
+
+    @staticmethod
+    def _image_geometry_contract(
+        data: np.ndarray,
+        *,
+        x_axis: AxisProjection | None,
+        y_axis: AxisProjection | None,
+        detector_shape: tuple[int, int] | None,
+    ) -> tuple[object, ...]:
+        source = np.asarray(data)
+        if x_axis is not None and y_axis is not None:
+            x0, x1 = axis_extent(x_axis.values)
+            y0, y1 = axis_extent(y_axis.values)
+            return (
+                "axes", source.shape, x_axis.values.shape, y_axis.values.shape,
+                x0, x1, y0, y1,
+            )
+        return ("detector", source.shape, detector_shape or source.shape)
+
+    @staticmethod
+    def _axis_presentation_key(
+        x_axis: AxisProjection | None,
+        y_axis: AxisProjection | None,
+    ) -> tuple[object, ...]:
+        if x_axis is None or y_axis is None:
+            return ("raw",)
+        return (
+            "axes",
+            *_axis_presentation(x_axis.label, x_axis.unit),
+            *_axis_presentation(y_axis.label, y_axis.unit),
         )
 
     def render_matches(
@@ -215,6 +325,15 @@ class ScientificImagePane(QtWidgets.QWidget):
             color_map=color_map,
             log_scale=log_scale,
         )
+        geometry_contract = ScientificImagePane._image_geometry_contract(
+            source,
+            x_axis=x_axis,
+            y_axis=y_axis,
+            detector_shape=detector_shape,
+        )
+        axis_presentation = ScientificImagePane._axis_presentation_key(
+            x_axis, y_axis,
+        )
         # FrameView arrays and axes are immutable.  Plot-mode, selection, and
         # status-only reconciliations therefore must not resend identical
         # detector/cake pixels through pyqtgraph's setImage path.
@@ -228,6 +347,8 @@ class ScientificImagePane(QtWidgets.QWidget):
             and not any(axis.flags.writeable for axis in axes)
         )
         if immutable and getattr(self, "_render_contract", None) == render_contract:
+            if view_range is not None:
+                self.canvas.imageViewBox.setRange(view_range, padding=0.0)
             return
         # A failed repaint may already have changed pixels, range, or labels.
         # Retire the prior identity contract before the first mutation so a
@@ -235,6 +356,10 @@ class ScientificImagePane(QtWidgets.QWidget):
         # return against a partially updated canvas.  Publish only after the
         # complete render succeeds below.
         self._render_contract = None
+        prior_geometry = self._geometry_contract
+        prior_axis_presentation = self._axis_presentation_contract
+        self._geometry_contract = None
+        self._axis_presentation_contract = None
         image = source.T
         if x_axis is not None and y_axis is not None:
             x0, x1 = axis_extent(x_axis.values)
@@ -262,10 +387,18 @@ class ScientificImagePane(QtWidgets.QWidget):
             expand_degenerate_levels=expand_degenerate,
             level_scan_token=level_scan_token,
         )
-        self.canvas.imageViewBox.setRange(
-            rect if view_range is None else view_range, padding=0.0,
-        )
-        if x_axis is not None and y_axis is not None:
+        if (
+            view_range is not None
+            or prior_geometry != geometry_contract
+            or prior_axis_presentation != axis_presentation
+        ):
+            self.canvas.imageViewBox.setRange(
+                rect if view_range is None else view_range, padding=0.0,
+            )
+        if (
+            x_axis is not None and y_axis is not None
+            and prior_axis_presentation != axis_presentation
+        ):
             x_label, x_unit = _axis_presentation(
                 x_axis.label,
                 x_axis.unit,
@@ -284,7 +417,7 @@ class ScientificImagePane(QtWidgets.QWidget):
                 y_label,
                 units=y_unit,
             )
-        else:
+        elif prior_axis_presentation != axis_presentation:
             # Do not pass ``units=`` here: AxisItem interprets it as an SI
             # quantity and silently relabels a 3020-pixel detector as
             # ``3.02 kpixel``.  Raw axes are literal detector indices.
@@ -304,6 +437,8 @@ class ScientificImagePane(QtWidgets.QWidget):
         # read-only and presented again.  Only immutable inputs publish a
         # reusable contract.
         self._render_contract = render_contract if immutable else None
+        self._geometry_contract = geometry_contract
+        self._axis_presentation_contract = axis_presentation
 
 
 class CompactFrameSelector(QtWidgets.QComboBox):
