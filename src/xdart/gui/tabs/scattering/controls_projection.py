@@ -236,7 +236,8 @@ def project_controls(
     fields = _threshold_fields(fields, intent, unlocked=unlocked)
     fields = [truthful_field(candidate) for candidate in fields]
     if viewer:
-        fields = [replace(candidate, enabled=False,
+        fields = [candidate if candidate.path == PROJECT_ROOT else
+                  replace(candidate, enabled=False,
                           reason=("1D Viewer" if tool is Tool.XYE_VIEWER
                                   else "2D Viewer") + " has no acquisition authority.")
                   for candidate in fields]

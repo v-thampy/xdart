@@ -4,7 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from xdart.gui.tabs.scattering.context_projection import ContextProjection
-from xdart.gui.tabs.scattering.controls_projection import project_controls
+from xdart.gui.tabs.scattering.controls_projection import PROJECT_ROOT, project_controls
 from xdart.gui.tabs.scattering.shell_projection import (
     RUN_MODE_CHOICES,
     ScientificPreferences,
@@ -81,12 +81,12 @@ def test_viewer_aliases_share_one_headless_parser_and_2d_is_mounted() -> None:
     assert (snapshot.thaw().processing_mode, Tool.IMAGE_VIEWER.value, Tool.XYE_VIEWER.value, Mode.IMAGE_VIEWER.value, Mode.XYE_VIEWER.value, ProcessingPage.VIEWER.value) == (
         "2D Viewer", "image_viewer", "xye_viewer", "image_viewer", "xye_viewer", "viewer")
     assert controls.processing_page is ProcessingPage.VIEWER
-    assert all(not field.enabled for field in controls.fields)
+    assert {field.path for field in controls.fields if field.enabled} == {PROJECT_ROOT}
     assert all(not action.enabled for actions in controls.section_actions.values()
                for action in actions)
     assert one_d_controls.processing_page is ProcessingPage.VIEWER
-    assert all(not field.enabled for field in one_d_controls.fields)
-    assert {field.reason for field in one_d_controls.fields} == {"1D Viewer has no acquisition authority."}
+    assert {field.path for field in one_d_controls.fields if field.enabled} == {PROJECT_ROOT}
+    assert {field.reason for field in one_d_controls.fields if field.path != PROJECT_ROOT} == {"1D Viewer has no acquisition authority."}
     assert all(not action.enabled for actions in one_d_controls.section_actions.values()
                for action in actions)
     assert RUN_MODE_CHOICES == _EXPECTED_MODES

@@ -105,6 +105,7 @@ from .controls_projection import (
     MASK_FILE,
     OUTPUT_MODE,
     PONI_FILE,
+    PROJECT_ROOT,
     SOURCE_DIRECTORY,
     SOURCE_FILE,
     SOURCE_TYPE,
@@ -6413,6 +6414,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
         self._shell_revision += 1
 
+    def _project_folder_edit_permitted(self) -> bool:
+        phase = self._lifecycle.phase
+        return (
+            not self._closing and not self._closed
+            and self._admission_state is None
+            and not self._experiment_operation_busy()
+            and (phase is RunPhase.IDLE
+                 or phase is RunPhase.FAILED and self._lifecycle.reset_permitted)
+            and not self._context_controller.viewer_1d_cleanup_pending
+            and not self._context_controller.viewer_2d_cleanup_pending
+        )
+
     def _project_controls(
         self, snapshot: RunIntentSnapshot
     ):
@@ -6482,6 +6495,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._workspace_operations.reintegrate_cancel_accepted
             ),
         )
+        if not self._project_folder_edit_permitted():
+            controls = replace(controls, fields=tuple(
+                replace(field, enabled=False,
+                        reason="Project Folder is locked during Run or cleanup.")
+                if field.path == PROJECT_ROOT else field
+                for field in controls.fields
+            ))
         if self._analysis_operation_busy():
             conflicting = {
                 "calibrate",
@@ -7440,6 +7460,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     ) -> None:
         if self._closing or self._closed:
             return
+        if path == PROJECT_ROOT and not self._project_folder_edit_permitted():
+            self._notice("Project Folder is locked during Run or cleanup.")
+            self._refresh_shell()
+            return
         if self._source_selection.owns_edit(path):
             self._apply_source_observation_transition(
                 self._source_selection.edit(path, value)
@@ -7684,6 +7708,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             type(part) is str for part in path
         ):
             self._notice("Unknown control.")
+            return
+        if path == PROJECT_ROOT and not self._project_folder_edit_permitted():
+            self._notice("Project Folder is locked during Run or cleanup.")
+            self._refresh_shell()
             return
         if path in {SOURCE_FILE, SOURCE_DIRECTORY}:
             snapshot = self._intents.snapshot()
