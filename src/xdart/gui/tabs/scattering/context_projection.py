@@ -288,6 +288,8 @@ def _viewer_1d_scientific(navigation, payloads, resident, preferences, notice):
                 frame, axis, intensity, os.path.basename(view.source_path or ""),
                 sigma=sigma))
     current = payload_by_id.get(id(navigation.current))
+    if ready and current is not None:
+        status += f" · {os.path.basename(current.view.source_path or '')}"
     return ScientificProjection(heavy_available=resident, traces=tuple(traces),
         title=("Current" if current is None else current.title),
         processing_mode="1D Viewer", color_map=preferences.color_map,
