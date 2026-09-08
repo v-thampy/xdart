@@ -360,6 +360,26 @@ def test_unmarked_ordinary_tiff_adds_zero_layout_reads_and_uses_null_layout(tmp_
     assert value.reader_binding is None and value.scanned_motor_names is None
 
 
+def test_tiff_cancel_during_final_revision_check_does_not_return_graph(tmp_path, monkeypatch):
+    source = _tiffs(tmp_path, names=("scan_0001.tif",))
+    capture = graph.SourceFileState.capture
+    captures = []
+    stopped = False
+
+    def stop_after_second_capture(cls, path):
+        nonlocal stopped
+        state = capture(path)
+        captures.append(state)
+        if len(captures) == 2:
+            stopped = True
+        return state
+
+    monkeypatch.setattr(graph.SourceFileState, "capture", classmethod(stop_after_second_capture))
+    with pytest.raises(InterruptedError, match="source qualification cancelled"):
+        graph.qualify_source_execution_graph(source, cancelled=lambda: stopped)
+    assert len(captures) == 2
+
+
 def test_source_read_policy_changes_graph_identity_for_auto_vs_txt_metadata(tmp_path, monkeypatch) -> None:
     root = tmp_path / "gráph"; root.mkdir()
     source = _tiffs(root)

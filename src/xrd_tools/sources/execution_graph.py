@@ -640,6 +640,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
             else:
                 motor = AdmittedMotorValue(before.path, selected_motor, float(motors[selected_motor]))
         after = SourceFileState.capture(path)
+        _cancelled(cancelled)
         if before != after or _path_key(_resolved(before)) != _path_key(_resolved(after)):
             raise SourceRevisionChanged("TIFF source changed during qualification")
         if expected is None:
