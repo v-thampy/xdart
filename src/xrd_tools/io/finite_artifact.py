@@ -1943,17 +1943,19 @@ def _commit_identity(
 # Storage ownership is deliberately target-shaped, not lineage-shaped.  Both
 # seeded replacement and cold documents use these helpers; their distinct
 # domain contracts remain in the adapters above this boundary.
-def _acquire_publication_slot(target: Path) -> object:
-    return get_output_transaction_coordinator().hold_target(
+def _acquire_publication_slot(target: Path, *, coordinator=None) -> object:
+    selected = get_output_transaction_coordinator() if coordinator is None else coordinator
+    return selected.hold_target(
         str(target), label="finite-artifact",
     )
 
 
-def _release_publication_slot(hold: object | None) -> BaseException | None:
+def _release_publication_slot(hold: object | None, *, coordinator=None) -> BaseException | None:
     if hold is None:
         return None
     try:
-        get_output_transaction_coordinator().release_target(hold)
+        selected = get_output_transaction_coordinator() if coordinator is None else coordinator
+        selected.release_target(hold)
     except BaseException as error:
         return error
     return None
@@ -2070,8 +2072,9 @@ class _FinitePublicationSession:
     and its public slot together until close, replacement, and observation.
     """
 
-    def __init__(self, target: Path | str) -> None:
+    def __init__(self, target: Path | str, *, coordinator=None) -> None:
         self.target = Path(target)
+        self._coordinator = coordinator
         self._parent_descriptor: int | None = None
         self._parent_state: tuple[int, int, int, int, int, int] | None = None
         self._hold = None
@@ -2126,6 +2129,20 @@ class _FinitePublicationSession:
             raise RuntimeError("finite publication document is not open")
         return self._document
 
+    @property
+    def slot_held(self) -> bool:
+        return self._hold is not None
+
+    @property
+    def ordinal(self) -> int:
+        if self._hold is None:
+            raise RuntimeError("finite publication has no slot hold")
+        return self._hold.lease.ordinal
+
+    @property
+    def published(self) -> bool:
+        return self._published
+
     def _require_parent(self) -> int:
         descriptor, admitted = self._parent_descriptor, self._parent_state
         if descriptor is None or admitted is None:
@@ -2133,20 +2150,38 @@ class _FinitePublicationSession:
         _require_publication_parent(self.target, descriptor, admitted)
         return descriptor
 
-    def start(self, opener: Callable[[Path], object]) -> object:
+    def reserve(self) -> None:
+        """Hold the public slot and reserve its private inode before writing."""
         if self._parent_descriptor is not None:
             raise RuntimeError("finite publication session is one-shot")
         descriptor, admitted = _open_publication_parent(self.target)
         self._parent_descriptor = descriptor
         self._parent_state = admitted
         try:
-            self._hold = _acquire_publication_slot(self.target)
+            self._hold = (
+                _acquire_publication_slot(self.target)
+                if self._coordinator is None else
+                _acquire_publication_slot(self.target, coordinator=self._coordinator)
+            )
             self._reservation = _reserve_publication_candidate(
                 descriptor, self.target, secrets.token_hex(16), suffix=".nexus",
             )
             self._candidate = Path(self._reservation.path)
-            self._document = opener(self._candidate)
-            return self._document
+        except BaseException:
+            self.abort()
+            raise
+
+    def open_document(self, opener: Callable[[Path], object]) -> object:
+        self._require_parent()
+        if self._document is not None:
+            raise RuntimeError("finite publication document is already open")
+        self._document = opener(self.candidate)
+        return self._document
+
+    def start(self, opener: Callable[[Path], object]) -> object:
+        self.reserve()
+        try:
+            return self.open_document(opener)
         except BaseException:
             self.abort()
             raise
@@ -2168,7 +2203,11 @@ class _FinitePublicationSession:
 
     def _release(self) -> None:
         hold, self._hold = self._hold, None
-        self._warning(FINITE_SLOT_LEASE_WARNING, _release_publication_slot(hold))
+        error = (
+            _release_publication_slot(hold) if self._coordinator is None else
+            _release_publication_slot(hold, coordinator=self._coordinator)
+        )
+        self._warning(FINITE_SLOT_LEASE_WARNING, error)
         descriptor, self._parent_descriptor = self._parent_descriptor, None
         self._parent_state = None
         if descriptor is not None:

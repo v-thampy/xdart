@@ -47,7 +47,6 @@ from xrd_tools.io.analysis_artifact import (
 from xrd_tools.io import (
     revalidate_stream_terminal,
     StreamTerminal,
-    TransactionPhase,
     stream_terminal_object_revision,
 )
 
@@ -947,8 +946,8 @@ class ModuleArtifactOutputSnapshot:
         return self.artifact.target
 
     @property
-    def phase(self) -> TransactionPhase:
-        return self.artifact.phase
+    def published(self) -> bool:
+        return self.artifact.published
 
     @property
     def writer_started(self) -> bool:
@@ -959,8 +958,12 @@ class ModuleArtifactOutputSnapshot:
         return self.artifact.writer_finished
 
     @property
-    def remaining_lease_owners(self):
-        return self.artifact.remaining_lease_owners
+    def close_pending(self) -> bool:
+        return self.artifact.close_pending
+
+    @property
+    def slot_held(self) -> bool:
+        return self.artifact.slot_held
 
     @property
     def receipt(self) -> AnalysisArtifactReceipt | None:
@@ -1258,18 +1261,9 @@ class ModuleArtifactOutput:
     @property
     def snapshot(self) -> ModuleArtifactOutputSnapshot:
         artifact = self._output.snapshot
-        module_pending = self._publish_started and (
-            self._terminal is None or bool(artifact.remaining_lease_owners)
-        )
+        pending = self._publish_started and self._terminal is None
         return ModuleArtifactOutputSnapshot(
-            artifact,
-            module_pending,
-            artifact.retryable
-            or (
-                module_pending
-                and artifact.phase is TransactionPhase.COMMITTED
-                and artifact.receipt is not None
-            ),
+            artifact, pending, artifact.retryable or pending and artifact.published,
         )
 
     def _committed(
@@ -1300,6 +1294,13 @@ class ModuleArtifactOutput:
         if self._pending is None:
             raise RuntimeError("module cleanup finished without a retained outcome")
         disposition, code, diagnostic = self._pending
+        state = self._output.snapshot
+        details = (*state.diagnostics, *(
+            (f"hidden candidate remains: {state.hidden_orphan}",)
+            if state.hidden_orphan is not None else ()
+        ))
+        if details:
+            diagnostic = "; ".join(filter(None, (diagnostic, *details)))
         self._terminal = ModuleTerminalResult(
             self.request,
             disposition,
@@ -1362,130 +1363,52 @@ class ModuleArtifactOutput:
                 raise _ModuleWriterFailed(error) from error
 
         if cancel_token is not None and cancel_token.is_set():
-            self._pending = (
-                ModuleDisposition.CANCELLED,
-                "CANCELLED",
-                "",
-            )
+            self._pending = (ModuleDisposition.CANCELLED, "CANCELLED", "")
             try:
                 self._output.abort()
             except BaseException as error:
                 raise AnalysisArtifactCleanupPending(self.snapshot) from error
             return self._settle_pending()
         try:
-            artifact = self._output._publish_retained(
-                guarded_writer,
-                prepublish=prepublish,
-            )
-        except (_ModuleWriterFailed, _ModulePrepublishFailed) as error:
-            self._pending = (
-                ModuleDisposition.FAILED,
-                "OUTPUT_FAILED",
-                _failure_diagnostic(error.error),
-            )
-            if self._output.snapshot.remaining_lease_owners:
-                raise AnalysisArtifactCleanupPending(self.snapshot) from error.error
-            return self._settle_pending()
-        except _ModuleCommitCancelled:
-            self._pending = (
-                ModuleDisposition.CANCELLED,
-                "CANCELLED",
-                "",
-            )
-            if self._output.snapshot.remaining_lease_owners:
-                raise AnalysisArtifactCleanupPending(self.snapshot)
-            return self._settle_pending()
-        except _ModuleCommitRefused as error:
-            self._pending = (
-                ModuleDisposition.REFUSED,
-                error.code,
-                "",
-            )
-            if self._output.snapshot.remaining_lease_owners:
-                raise AnalysisArtifactCleanupPending(self.snapshot) from error
-            return self._settle_pending()
-        except AnalysisArtifactCleanupPending as error:
-            snapshot = self._output.snapshot
-            if self._pending is None:
-                primary = error.__cause__
-                if isinstance(
-                    primary, (_ModuleWriterFailed, _ModulePrepublishFailed)
-                ):
-                    self._pending = (
-                        ModuleDisposition.FAILED,
-                        "OUTPUT_FAILED",
-                        _failure_diagnostic(primary.error),
-                    )
-                elif isinstance(primary, _ModuleCommitCancelled):
-                    self._pending = (
-                        ModuleDisposition.CANCELLED,
-                        "CANCELLED",
-                        "",
-                    )
-                elif isinstance(primary, _ModuleCommitRefused):
-                    self._pending = (
-                        ModuleDisposition.REFUSED,
-                        primary.code,
-                        "",
-                    )
-                else:
-                    self._pending = (
-                        ModuleDisposition.FAILED,
-                        "OUTPUT_FAILED",
-                        _failure_diagnostic(primary if primary is not None else error),
-                    )
-            if (
-                snapshot.phase is TransactionPhase.ABORTED
-                and not snapshot.remaining_lease_owners
-            ):
-                return self._settle_pending()
-            raise AnalysisArtifactCleanupPending(self.snapshot) from (
-                error.__cause__ if error.__cause__ is not None else error
+            self._output.publish(
+                guarded_writer, prepublish=prepublish, _on_published=self._committed,
             )
         except BaseException as error:
-            diagnostic = _failure_diagnostic(error)
-            self._pending = (
-                ModuleDisposition.FAILED,
-                "OUTPUT_FAILED",
-                diagnostic,
-            )
-            if self._output.snapshot.remaining_lease_owners:
-                raise AnalysisArtifactCleanupPending(self.snapshot) from error
-            return self._settle_pending()
-        try:
-            terminal = self._committed(artifact)
-            self._output._complete_retained()
-            return terminal
-        except BaseException as error:
-            raise AnalysisArtifactCleanupPending(self.snapshot) from error
+            return self._failed_publication(error)
+        return self._terminal
+
+    def _failed_publication(self, error: BaseException) -> ModuleTerminalResult:
+        primary = error.__cause__ if isinstance(error, AnalysisArtifactCleanupPending) else error
+        primary = error if primary is None else primary
+        state = self._output.snapshot
+        if state.published:
+            raise AnalysisArtifactCleanupPending(self.snapshot) from primary
+        if isinstance(primary, _ModuleCommitCancelled):
+            self._pending = (ModuleDisposition.CANCELLED, "CANCELLED", "")
+        elif isinstance(primary, _ModuleCommitRefused):
+            self._pending = (ModuleDisposition.REFUSED, primary.code, "")
+        else:
+            cause = primary.error if isinstance(primary, (_ModuleWriterFailed, _ModulePrepublishFailed)) else primary
+            diagnostic = _failure_diagnostic(cause)
+            self._pending = (ModuleDisposition.FAILED, "OUTPUT_FAILED", diagnostic)
+        if state.close_pending:
+            raise AnalysisArtifactCleanupPending(self.snapshot) from primary
+        return self._settle_pending()
 
     def retry_cleanup(self) -> ModuleTerminalResult:
-        if self._terminal is not None:
-            if not self._output.snapshot.remaining_lease_owners:
-                return self._terminal
-            try:
-                self._output._complete_retained()
-            except BaseException as error:
-                raise AnalysisArtifactCleanupPending(self.snapshot) from error
-            return self._terminal
+        if not self._publish_started:
+            raise RuntimeError("module publication has not started")
         try:
-            snapshot = self._output._retry_retained()
-        except AnalysisArtifactCleanupPending as error:
+            snapshot = self._output.retry_cleanup()
+        except BaseException as error:
             raise AnalysisArtifactCleanupPending(self.snapshot) from (
                 error.__cause__ if error.__cause__ is not None else error
             )
-        if snapshot.phase is TransactionPhase.COMMITTED:
+        if snapshot.published:
             if snapshot.receipt is None:
                 raise AnalysisArtifactCleanupPending(self.snapshot)
-            try:
-                terminal = self._committed(snapshot.receipt)
-                self._output._complete_retained()
-                return terminal
-            except BaseException as error:
-                raise AnalysisArtifactCleanupPending(self.snapshot) from error
-        if snapshot.phase is TransactionPhase.ABORTED:
-            return self._settle_pending()
-        raise AnalysisArtifactCleanupPending(self.snapshot)
+            return self._committed(snapshot.receipt)
+        return self._settle_pending()
 
 
 def admit_module_artifact(

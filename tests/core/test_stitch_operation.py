@@ -1200,24 +1200,25 @@ def test_create_new_output_conflict_is_late_refusal_without_overwrite(tmp_path):
     assert target.read_bytes() == original
 
 
-def test_create_new_cleanup_retry_does_not_replay_science_or_writer(
+def test_published_inspection_retry_does_not_replay_science_or_writer(
     tmp_path,
     monkeypatch,
 ):
     request = _prepared(tmp_path)
     coordinator = OutputTransactionCoordinator()
-    real_release = coordinator._release
+    from xrd_tools.io import analysis_artifact as artifact_api
+    real_inspect = artifact_api.inspect_analysis_artifact
     real_write = stitch_operation.write_stitched
     real_science = stitch_operation.run_stitch
     failures = []
     writes = []
     science = []
 
-    def fail_release_once(lease, role, owner):
-        if not failures:
-            failures.append(role)
-            raise OSError("module release transient")
-        return real_release(lease, role, owner)
+    def fail_published_inspection_once(path, **kwargs):
+        if Path(path) == Path(request.module.output.target) and not failures:
+            failures.append(path)
+            raise OSError("published inspection transient")
+        return real_inspect(path, **kwargs)
 
     def write_once(*args, **kwargs):
         writes.append("write")
@@ -1227,11 +1228,13 @@ def test_create_new_cleanup_retry_does_not_replay_science_or_writer(
         science.append("science")
         return real_science(*args, **kwargs)
 
-    monkeypatch.setattr(coordinator, "_release", fail_release_once)
+    monkeypatch.setattr(artifact_api, "inspect_analysis_artifact", fail_published_inspection_once)
     monkeypatch.setattr(stitch_operation, "write_stitched", write_once)
     monkeypatch.setattr(stitch_operation, "run_stitch", science_once)
     with pytest.raises(StitchOperationCleanupPending) as pending:
         run_stitch_operation(request, coordinator=coordinator)
+    assert pending.value.snapshot.published
+    assert not pending.value.snapshot.slot_held
 
     recovered = pending.value.retry_cleanup()
     assert recovered.terminal.disposition is ModuleDisposition.COMMITTED

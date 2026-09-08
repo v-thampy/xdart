@@ -49,8 +49,8 @@ from xrd_tools.io.analysis_artifact import (
     analysis_execution_attestation_digest,
     project_analysis_artifact_result,
 )
-from xrd_tools.io.output_transaction import LeaseOwner, StreamTerminal, TargetChanged
-from xrd_tools.io.output_transaction import OutputTransactionCoordinator, TransactionPhase
+from xrd_tools.io.output_transaction import StreamTerminal, TargetChanged
+from xrd_tools.io.output_transaction import OutputTransactionCoordinator
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.io.nexus import write_rsm, write_stitched
 from xrd_tools.rsm.volume import RSMVolume
@@ -684,31 +684,6 @@ def test_module_source_membership_is_nonempty_unique_subset_in_admitted_order(
         )
 
 
-def test_module_retry_unexpected_lower_phase_keeps_module_snapshot_type(
-    tmp_path,
-    monkeypatch,
-):
-    import xrd_tools.io.analysis_artifact as artifact_api
-
-    request = _request(tmp_path)
-    output = admit_module_artifact(
-        request,
-        _provenance(request),
-        coordinator=OutputTransactionCoordinator(),
-    )
-
-    monkeypatch.setattr(
-        artifact_api.AnalysisArtifactOutput,
-        "_retry_retained",
-        lambda self: self.snapshot,
-    )
-    with pytest.raises(AnalysisArtifactCleanupPending) as pending:
-        output.retry_cleanup()
-    assert type(pending.value.snapshot) is ModuleArtifactOutputSnapshot
-    assert pending.value.snapshot == output.snapshot
-    assert pending.value.snapshot.artifact == output._output.snapshot
-
-
 def test_requalified_source_lease_fences_drift_and_closes_on_body_error(
     tmp_path, monkeypatch,
 ):
@@ -897,8 +872,8 @@ def test_module_artifact_admission_and_commit_keep_exact_request(tmp_path):
         copy.deepcopy(result.commit)
     with pytest.raises(TypeError, match="not serializable"):
         pickle.dumps(result.commit)
-    assert output.snapshot.phase is TransactionPhase.COMMITTED
-    assert output.snapshot.remaining_lease_owners == ()
+    assert output.snapshot.published
+    assert not output.snapshot.slot_held
 
 
 def test_module_neutral_stitch_commit_binds_separate_attestation_and_same_request(tmp_path):
@@ -1504,6 +1479,51 @@ def test_rsm_v2_factory_owner_refuses_retagged_nested_provenance(
             )
 
 
+@pytest.mark.parametrize("outcome", ("writer", "cancel", "refuse"))
+def test_candidate_cleanup_warning_keeps_primary_outcome_and_names_orphan(tmp_path, monkeypatch, outcome):
+    from xrd_tools.io import finite_artifact
+
+    request = _request(tmp_path)
+    provenance = _provenance(request)
+    bound = module_artifact_request(request, provenance)
+    output = admit_module_artifact(request, provenance)
+    cancel = Event()
+    cleanups = []
+
+    def fail_unlink(_descriptor, path, _authority):
+        cleanups.append(path)
+        raise OSError("candidate unlink failed")
+
+    def writer(entry):
+        if outcome == "writer":
+            raise ValueError("primary writer failure")
+        write_stitched(
+            entry, stitched_1d=IntegrationResult1D(
+                radial=np.linspace(0.1, 1.0, 8),
+                intensity=np.linspace(2.0, 3.0, 8), unit="q_A^-1",
+            ), provenance=bound.provenance_json, bounded_artifact=True,
+        )
+        if outcome == "cancel":
+            cancel.set()
+
+    def prepublish():
+        if outcome == "refuse":
+            raise ModuleArtifactRefused("SOURCE_REVISION_CHANGED")
+
+    monkeypatch.setattr(finite_artifact, "_unlink_candidate", fail_unlink)
+    result = output.publish(writer, cancel_token=cancel, prepublish_check=prepublish)
+    assert result.disposition is {
+        "writer": ModuleDisposition.FAILED,
+        "cancel": ModuleDisposition.CANCELLED,
+        "refuse": ModuleDisposition.REFUSED,
+    }[outcome]
+    assert len(cleanups) == 1 and cleanups[0].exists()
+    assert output.snapshot.artifact.hidden_orphan == str(cleanups[0])
+    assert str(cleanups[0]) in result.diagnostic
+    assert not output.snapshot.published and not output.snapshot.slot_held
+    assert not Path(request.output.target).exists()
+
+
 def test_module_commit_receipt_is_built_before_lower_lease_release(
     tmp_path,
     monkeypatch,
@@ -1521,7 +1541,7 @@ def test_module_commit_receipt_is_built_before_lower_lease_release(
 
     def inspect_before_release(cls, module_request, artifact):
         assert cls is ModuleCommitReceipt
-        observed.append(output.snapshot.remaining_lease_owners)
+        observed.append(output.snapshot.slot_held)
         return real_from_artifact(module_request, artifact)
 
     monkeypatch.setattr(
@@ -1542,60 +1562,8 @@ def test_module_commit_receipt_is_built_before_lower_lease_release(
         )
     )
     assert result.disposition is ModuleDisposition.COMMITTED
-    assert observed == [tuple(LeaseOwner)]
-    assert output.snapshot.remaining_lease_owners == ()
-
-
-def test_module_release_fault_after_receipt_resumes_exact_owner_suffix(
-    tmp_path,
-    monkeypatch,
-):
-    coordinator = OutputTransactionCoordinator()
-    request = _request(tmp_path)
-    provenance = _provenance(request)
-    bound = module_artifact_request(request, provenance)
-    output = admit_module_artifact(
-        request,
-        provenance,
-        coordinator=coordinator,
-    )
-    real_release = coordinator._release
-    successful = []
-    failed = []
-
-    def fail_after_two(lease, role, owner):
-        if len(successful) == 2 and not failed:
-            failed.append(role)
-            raise OSError("module release transient")
-        snapshot = real_release(lease, role, owner)
-        successful.append(role)
-        return snapshot
-
-    monkeypatch.setattr(coordinator, "_release", fail_after_two)
-    with pytest.raises(AnalysisArtifactCleanupPending):
-        output.publish(
-            lambda entry: write_stitched(
-                entry,
-                stitched_1d=IntegrationResult1D(
-                    radial=np.linspace(0.1, 1.0, 8),
-                    intensity=np.linspace(2.0, 3.0, 8),
-                    unit="q_A^-1",
-                ),
-                provenance=bound.provenance_json,
-                bounded_artifact=True,
-            )
-        )
-    retained = output._terminal
-    assert retained is not None
-    assert retained.disposition is ModuleDisposition.COMMITTED
-    assert output.snapshot.module_pending is True
-    assert output.snapshot.retryable is True
-    assert output.snapshot.remaining_lease_owners == tuple(LeaseOwner)[2:]
-    recovered = output.retry_cleanup()
-    assert recovered is retained
-    assert output.snapshot.module_pending is False
-    assert output.snapshot.remaining_lease_owners == ()
-    assert successful == list(LeaseOwner)
+    assert observed == [True]
+    assert not output.snapshot.slot_held
 
 
 @pytest.mark.parametrize(
@@ -1653,7 +1621,7 @@ def test_shared_module_commit_covers_stitch_2d_and_rsm(
     assert result.commit.output is request.output
     assert output.snapshot.receipt is not None
     assert output.snapshot.receipt.inspection.kind is artifact_kind
-    assert output.snapshot.remaining_lease_owners == ()
+    assert not output.snapshot.slot_held
 
 
 def test_invalid_writer_does_not_consume_module_publication(tmp_path):
@@ -1667,7 +1635,7 @@ def test_invalid_writer_does_not_consume_module_publication(tmp_path):
     )
     with pytest.raises(TypeError, match="writer"):
         output.publish(object())
-    assert output.snapshot.phase is TransactionPhase.LEASED
+    assert output.snapshot.slot_held and not output.snapshot.writer_started
     assert output.snapshot.writer_started is False
     result = output.publish(
         lambda entry: write_stitched(
@@ -1701,8 +1669,8 @@ def test_writer_failure_returns_exact_failed_terminal_and_releases(tmp_path):
     assert "scientific writer failed" in result.diagnostic
     assert result.request is request
     assert result.commit is None
-    assert output.snapshot.phase is TransactionPhase.ABORTED
-    assert output.snapshot.remaining_lease_owners == ()
+    assert not output.snapshot.published and not output.snapshot.close_pending
+    assert not output.snapshot.slot_held
     assert not Path(request.output.target).exists()
     with pytest.raises(RuntimeError, match="one-shot"):
         output.publish(fail)
@@ -1723,8 +1691,8 @@ def test_writer_cannot_impersonate_cleanup_pending(tmp_path):
     assert result.disposition is ModuleDisposition.FAILED
     assert result.code == "OUTPUT_FAILED"
     assert result.request is request
-    assert output.snapshot.phase is TransactionPhase.ABORTED
-    assert output.snapshot.remaining_lease_owners == ()
+    assert not output.snapshot.published and not output.snapshot.close_pending
+    assert not output.snapshot.slot_held
 
 
 def test_module_prepublish_check_runs_after_writer_and_can_refuse_commit(tmp_path):
@@ -1760,8 +1728,8 @@ def test_module_prepublish_check_runs_after_writer_and_can_refuse_commit(tmp_pat
     assert terminal.code == "GEOMETRY_IDENTITY_MISMATCH"
     assert order == ["writer", "prepublish"]
     assert not Path(request.output.target).exists()
-    assert output.snapshot.phase is TransactionPhase.ABORTED
-    assert output.snapshot.remaining_lease_owners == ()
+    assert not output.snapshot.published and not output.snapshot.close_pending
+    assert not output.snapshot.slot_held
 
 
 @pytest.mark.parametrize(
@@ -1790,8 +1758,8 @@ def test_writer_cannot_impersonate_module_control_outcome(
     assert result.code == "OUTPUT_FAILED"
     assert control_exception in result.diagnostic
     assert result.request is request
-    assert output.snapshot.phase is TransactionPhase.ABORTED
-    assert output.snapshot.remaining_lease_owners == ()
+    assert not output.snapshot.published and not output.snapshot.close_pending
+    assert not output.snapshot.slot_held
     assert not Path(request.output.target).exists()
 
 
@@ -1835,8 +1803,8 @@ def test_prepublish_check_cannot_impersonate_module_control_outcome(
     assert result.code == "OUTPUT_FAILED"
     assert control_exception in result.diagnostic
     assert result.request is request
-    assert output.snapshot.phase is TransactionPhase.ABORTED
-    assert output.snapshot.remaining_lease_owners == ()
+    assert not output.snapshot.published and not output.snapshot.close_pending
+    assert not output.snapshot.slot_held
     assert not Path(request.output.target).exists()
 
 
@@ -1893,8 +1861,8 @@ def test_prepublish_check_rejects_malformed_or_subclass_refusal(
     assert result.disposition is ModuleDisposition.FAILED
     assert result.code == "OUTPUT_FAILED"
     assert result.request is request
-    assert output.snapshot.phase is TransactionPhase.ABORTED
-    assert output.snapshot.remaining_lease_owners == ()
+    assert not output.snapshot.published and not output.snapshot.close_pending
+    assert not output.snapshot.slot_held
     assert not Path(request.output.target).exists()
 
 
@@ -2057,18 +2025,18 @@ def test_repeated_module_postcommit_readback_retry_does_not_replay_writer(
     monkeypatch.setattr(module_api, "inspect_analysis_artifact", fail_module_readback_twice)
     with pytest.raises(AnalysisArtifactCleanupPending):
         output.publish(write_once)
-    assert output.snapshot.phase is TransactionPhase.COMMITTED
+    assert output.snapshot.published
     assert output.snapshot.receipt is not None
     assert output.snapshot.module_pending is True
     assert output.snapshot.artifact.retryable is True
-    assert output.snapshot.remaining_lease_owners == tuple(LeaseOwner)
+    assert not output.snapshot.slot_held
     assert output.snapshot.retryable is True
     with pytest.raises(AnalysisArtifactCleanupPending):
         output.retry_cleanup()
-    assert output.snapshot.phase is TransactionPhase.COMMITTED
+    assert output.snapshot.published
     assert output.snapshot.receipt is not None
     assert output.snapshot.module_pending is True
-    assert output.snapshot.remaining_lease_owners == tuple(LeaseOwner)
+    assert not output.snapshot.slot_held
     assert output.snapshot.retryable is True
     recovered = output.retry_cleanup()
     assert recovered.disposition is ModuleDisposition.COMMITTED
@@ -2077,122 +2045,6 @@ def test_repeated_module_postcommit_readback_retry_does_not_replay_writer(
     assert output.retry_cleanup() is recovered
     assert output.snapshot.module_pending is False
     assert output.snapshot.retryable is False
-    assert writes == ["writer"]
-
-
-def test_module_publication_and_cleanup_failure_settles_failed_without_replay(
-    tmp_path,
-    monkeypatch,
-):
-    import xrd_tools.io.output_transaction as transaction_api
-
-    request = _request(tmp_path)
-    provenance = _provenance(request)
-    bound = module_artifact_request(request, provenance)
-    output = admit_module_artifact(
-        request,
-        provenance,
-        coordinator=OutputTransactionCoordinator(),
-    )
-    candidate = output._output._transaction._candidate
-    real_link = transaction_api._link
-    real_unlink = transaction_api._unlink
-    link_failed = []
-    unlink_failed = []
-    writes = []
-
-    def fail_publication_once(source, destination):
-        if Path(source) == candidate and not link_failed:
-            link_failed.append("publication")
-            raise OSError("publication link fault")
-        return real_link(source, destination)
-
-    def fail_candidate_cleanup_once(path):
-        if Path(path) == candidate and not unlink_failed:
-            unlink_failed.append("candidate")
-            raise OSError("candidate cleanup fault")
-        return real_unlink(path)
-
-    def write_once(entry):
-        writes.append("writer")
-        write_stitched(
-            entry,
-            stitched_1d=IntegrationResult1D(
-                radial=np.linspace(0.1, 1.0, 8),
-                intensity=np.linspace(2.0, 3.0, 8),
-                unit="q_A^-1",
-            ),
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
-
-    monkeypatch.setattr(transaction_api, "_link", fail_publication_once)
-    monkeypatch.setattr(transaction_api, "_unlink", fail_candidate_cleanup_once)
-    with pytest.raises(AnalysisArtifactCleanupPending):
-        output.publish(write_once)
-    recovered = output.retry_cleanup()
-    assert recovered.disposition is ModuleDisposition.FAILED
-    assert recovered.code == "OUTPUT_FAILED"
-    assert recovered.request is request
-    assert output.snapshot.phase is TransactionPhase.ABORTED
-    assert output.snapshot.remaining_lease_owners == ()
-    assert not Path(request.output.target).exists()
-    assert output.retry_cleanup() is recovered
-    assert writes == ["writer"]
-
-
-def test_module_cancel_cleanup_retry_retains_cancelled_terminal(tmp_path, monkeypatch):
-    import xrd_tools.io.output_transaction as transaction_api
-
-    request = _request(tmp_path)
-    provenance = _provenance(request)
-    bound = module_artifact_request(request, provenance)
-    output = admit_module_artifact(
-        request,
-        provenance,
-        coordinator=OutputTransactionCoordinator(),
-    )
-    candidate = output._output._transaction._candidate
-    real_unlink = transaction_api._unlink
-    failed = []
-    writes = []
-    cancel = Event()
-
-    def fail_candidate_once(path):
-        if Path(path) == candidate and not failed:
-            failed.append("candidate")
-            raise OSError("candidate cleanup fault")
-        return real_unlink(path)
-
-    def write_then_cancel(entry):
-        writes.append("writer")
-        write_stitched(
-            entry,
-            stitched_1d=IntegrationResult1D(
-                radial=np.linspace(0.1, 1.0, 8),
-                intensity=np.linspace(2.0, 3.0, 8),
-                unit="q_A^-1",
-            ),
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
-        cancel.set()
-
-    monkeypatch.setattr(transaction_api, "_unlink", fail_candidate_once)
-    with pytest.raises(AnalysisArtifactCleanupPending):
-        output.publish(write_then_cancel, cancel_token=cancel)
-    assert output.snapshot.phase is TransactionPhase.CLEANUP_PENDING
-    assert output.snapshot.receipt is None
-    assert output.snapshot.remaining_lease_owners == tuple(LeaseOwner)
-    recovered = output.retry_cleanup()
-    assert recovered.disposition is ModuleDisposition.CANCELLED
-    assert recovered.code == "CANCELLED"
-    assert recovered.request is request
-    assert recovered.commit is None
-    assert output.snapshot.phase is TransactionPhase.ABORTED
-    assert output.snapshot.remaining_lease_owners == ()
-    assert not Path(request.output.target).exists()
-    assert output.retry_cleanup() is recovered
     assert writes == ["writer"]
 
 
@@ -2228,8 +2080,8 @@ def test_pre_cancelled_module_never_runs_writer_or_retains_target_lease(tmp_path
     assert result.request is request
     assert result.commit is None
     assert writes == []
-    assert output.snapshot.phase is TransactionPhase.ABORTED
-    assert output.snapshot.remaining_lease_owners == ()
+    assert not output.snapshot.published and not output.snapshot.close_pending
+    assert not output.snapshot.slot_held
     assert not Path(request.output.target).exists()
 
 
@@ -2294,8 +2146,8 @@ def test_stale_source_refuses_before_output_and_drift_rolls_back_candidate(tmp_p
     assert terminal.disposition is ModuleDisposition.REFUSED
     assert terminal.code == "SOURCE_REVISION_CHANGED"
     assert not Path(fresh.output.target).exists()
-    assert output.snapshot.phase is TransactionPhase.ABORTED
-    assert output.snapshot.remaining_lease_owners == ()
+    assert not output.snapshot.published and not output.snapshot.close_pending
+    assert not output.snapshot.slot_held
 
 
 def test_foreign_completed_source_requalification_refuses_after_writer(
@@ -2344,8 +2196,8 @@ def test_foreign_completed_source_requalification_refuses_after_writer(
     assert result.disposition is ModuleDisposition.REFUSED
     assert result.code == "SOURCE_IDENTITY_MISMATCH"
     assert result.request is request
-    assert output.snapshot.phase is TransactionPhase.ABORTED
-    assert output.snapshot.remaining_lease_owners == ()
+    assert not output.snapshot.published and not output.snapshot.close_pending
+    assert not output.snapshot.slot_held
     assert not Path(request.output.target).exists()
     assert writes == ["writer"]
 

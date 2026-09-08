@@ -2,8 +2,8 @@
 
 An analysis artifact is deliberately not a processed scan: it contains exactly
 one scan-level result and never fabricates an integrated-frame group.  This
-module composes the accepted file transaction with a small, independently
-admitted schema and strict semantic readback.
+module supplies the schema and strict semantic readback to the shared finite
+publication owner.
 """
 
 from __future__ import annotations
@@ -23,19 +23,17 @@ import h5py
 import numpy as np
 
 from xrd_tools.io.output_transaction import (
-    LeaseOwner,
-    OwnerToken,
     OutputTransactionCoordinator,
     StreamTerminal,
     TargetSnapshot,
     TargetChanged,
-    TransactionPhase,
     TransactionStateError,
     capture_target_snapshot,
     get_output_transaction_coordinator,
     revalidate_stream_terminal,
     stream_terminal_object_revision,
 )
+from xrd_tools.io.finite_artifact import _FinitePublicationSession
 
 
 ANALYSIS_SCHEMA_ATTR = "ssrl_schema"
@@ -122,7 +120,11 @@ class AnalysisArtifactProjectionInvalid(AnalysisArtifactError, ValueError):
 class AnalysisArtifactCleanupPending(AnalysisArtifactError):
     def __init__(self, snapshot: object) -> None:
         self.snapshot = snapshot
-        super().__init__("analysis artifact cleanup remains retryable")
+        self.published = bool(getattr(snapshot, "published", False))
+        super().__init__(
+            "analysis artifact published; verification remains pending"
+            if self.published else "analysis artifact document close remains pending"
+        )
 
 
 def _sha256(value: object, name: str) -> str:
@@ -1121,12 +1123,15 @@ class AnalysisArtifactReceipt:
 @dataclass(frozen=True, slots=True)
 class AnalysisArtifactOutputSnapshot:
     target: str
-    phase: TransactionPhase
     writer_started: bool
     writer_finished: bool
-    remaining_lease_owners: tuple[LeaseOwner, ...]
+    published: bool
+    close_pending: bool
+    slot_held: bool
     retryable: bool
     receipt: AnalysisArtifactReceipt | None = None
+    diagnostics: tuple[str, ...] = ()
+    hidden_orphan: str | None = None
 
 
 def _decode_fixed_text(value: object) -> str:
@@ -2645,52 +2650,34 @@ def read_analysis_artifact(
 
 
 class AnalysisArtifactOutput:
-    """Factory-owned exact lease and one-shot artifact publisher."""
+    """One analysis schema adapter over the shared finite publication owner."""
 
-    def __init__(
-        self,
-        request: AnalysisArtifactRequest,
-        *,
-        coordinator: OutputTransactionCoordinator,
-    ) -> None:
+    def __init__(self, request: AnalysisArtifactRequest, *,
+                 coordinator: OutputTransactionCoordinator) -> None:
         if type(request) is not AnalysisArtifactRequest:
             raise TypeError("analysis output requires exact request")
-        parent = Path(request.target).parent
-        if not parent.is_dir():
+        if not Path(request.target).parent.is_dir():
             raise ValueError("analysis artifact parent directory must already exist")
-        if (
-            request.overwrite is AnalysisArtifactOverwrite.CREATE_NEW
-            and os.path.lexists(request.target)
-        ):
-            raise FileExistsError(request.target)
         self.request = request
-        self._transaction_owner = OwnerToken("analysis-artifact-transaction")
-        self._target_owner = OwnerToken("analysis-artifact-target")
-        self._owners = {
-            role: OwnerToken(f"analysis-artifact-{role.value}")
-            for role in LeaseOwner
-        }
-        self._transaction = coordinator.admit(
-            request.target,
-            transaction_owner=self._transaction_owner,
-            target_owner=self._target_owner,
-        )
-        if (
-            request.overwrite is AnalysisArtifactOverwrite.CREATE_NEW
-            and self._transaction.admission.snapshot.exists
-        ):
-            raise FileExistsError(request.target)
-        self._lease = self._transaction.acquire_lease(
-            admission=self._transaction.admission,
-            transaction_owner=self._transaction_owner,
-            target_owner=self._target_owner,
-            owners=self._owners,
-        )
-        self._remaining = list(LeaseOwner)
+        self._publication = _FinitePublicationSession(request.target, coordinator=coordinator)
         self._writer_started = False
         self._writer_finished = False
         self._validated_candidate: TargetSnapshot | None = None
         self._receipt: AnalysisArtifactReceipt | None = None
+        self._completed = False
+        self._close_pending = False
+        self._on_published: Callable[[AnalysisArtifactReceipt], object] | None = None
+        self._publication.reserve()
+        try:
+            self._ordinal = self._publication.ordinal
+            self._expected_target = capture_target_snapshot(request.target)
+            if request.overwrite is AnalysisArtifactOverwrite.CREATE_NEW and (
+                self._expected_target.exists or os.path.lexists(request.target)
+            ):
+                raise FileExistsError(request.target)
+        except BaseException:
+            self._publication.abort()
+            raise
 
     def __copy__(self):
         raise TypeError("analysis artifact output owner is not copyable")
@@ -2700,85 +2687,64 @@ class AnalysisArtifactOutput:
 
     @property
     def snapshot(self) -> AnalysisArtifactOutputSnapshot:
-        state = self._transaction.snapshot()
+        owner = self._publication
         return AnalysisArtifactOutputSnapshot(
-            self.request.target,
-            state.phase,
-            self._writer_started,
-            self._writer_finished,
-            tuple(self._remaining),
-            state.retryable or bool(self._remaining and state.phase in {
-                TransactionPhase.COMMITTED,
-                TransactionPhase.ABORTED,
-            }),
-            self._receipt,
+            self.request.target, self._writer_started, self._writer_finished,
+            owner.published, self._close_pending, owner.slot_held,
+            self._close_pending or owner.published and not self._completed,
+            self._receipt, tuple(owner.diagnostics), owner.hidden_orphan,
         )
-
-    def _release(self) -> None:
-        for role in tuple(LeaseOwner):
-            if role not in self._remaining:
-                continue
-            self._transaction.release_lease_owner(
-                self._lease, role, self._owners[role]
-            )
-            self._remaining.remove(role)
 
     def _write_candidate(
         self,
-        candidate: Path,
         write_result: Callable[[h5py.Group], object],
     ) -> None:
         self._writer_started = True
-        with h5py.File(candidate, "w") as handle:
-            entry = handle.create_group(_ENTRY)
-            entry.attrs.create("NX_class", np.bytes_(b"NXentry"))
+        handle = self._publication.open_document(lambda path: h5py.File(path, "w"))
+        entry = handle.create_group(_ENTRY)
+        entry.attrs.create("NX_class", np.bytes_(b"NXentry"))
+        entry.attrs.create(
+            ANALYSIS_SCHEMA_ATTR,
+            np.bytes_(ANALYSIS_SCHEMA_NAME.encode("utf-8")),
+        )
+        entry.attrs[ANALYSIS_SCHEMA_VERSION_ATTR] = self.request.schema_version
+        for name, value in (
+            (ANALYSIS_KIND_ATTR, self.request.kind.value),
+            ("request_fingerprint", self.request.request_fingerprint),
+            ("source_fingerprint", self.request.source_fingerprint),
+            ("plan_fingerprint", self.request.plan_fingerprint),
+            ("provenance_digest", self.request.provenance_digest),
+            ("file_name", self.request.target),
+        ):
+            entry.attrs.create(name, np.bytes_(value.encode("utf-8")))
+        if _artifact_contract_version(self.request.schema_version) in {
+            ANALYSIS_SCHEMA_VERSION_V2,
+            ANALYSIS_SCHEMA_VERSION_V3,
+        }:
             entry.attrs.create(
-                ANALYSIS_SCHEMA_ATTR,
-                np.bytes_(ANALYSIS_SCHEMA_NAME.encode("utf-8")),
+                _EXECUTION_ATTESTATION_DIGEST_ATTR,
+                np.bytes_(
+                    self.request.execution_attestation_digest.encode(
+                        "utf-8"
+                    )
+                ),
             )
-            entry.attrs[ANALYSIS_SCHEMA_VERSION_ATTR] = self.request.schema_version
-            for name, value in (
-                (ANALYSIS_KIND_ATTR, self.request.kind.value),
-                ("request_fingerprint", self.request.request_fingerprint),
-                ("source_fingerprint", self.request.source_fingerprint),
-                ("plan_fingerprint", self.request.plan_fingerprint),
-                ("provenance_digest", self.request.provenance_digest),
-                ("file_name", self.request.target),
-            ):
-                entry.attrs.create(name, np.bytes_(value.encode("utf-8")))
-            if _artifact_contract_version(self.request.schema_version) in {
-                ANALYSIS_SCHEMA_VERSION_V2,
-                ANALYSIS_SCHEMA_VERSION_V3,
-            }:
-                entry.attrs.create(
-                    _EXECUTION_ATTESTATION_DIGEST_ATTR,
-                    np.bytes_(
-                        self.request.execution_attestation_digest.encode(
-                            "utf-8"
-                        )
-                    ),
-                )
+        entry.create_dataset(
+            _PROVENANCE,
+            data=np.bytes_(self.request.provenance_json.encode("utf-8")),
+        )
+        if _artifact_contract_version(self.request.schema_version) in {
+            ANALYSIS_SCHEMA_VERSION_V2,
+            ANALYSIS_SCHEMA_VERSION_V3,
+        }:
             entry.create_dataset(
-                _PROVENANCE,
-                data=np.bytes_(self.request.provenance_json.encode("utf-8")),
+                _EXECUTION_ATTESTATION,
+                data=np.bytes_(
+                    self.request.execution_attestation_json.encode("utf-8")
+                ),
             )
-            if _artifact_contract_version(self.request.schema_version) in {
-                ANALYSIS_SCHEMA_VERSION_V2,
-                ANALYSIS_SCHEMA_VERSION_V3,
-            }:
-                entry.create_dataset(
-                    _EXECUTION_ATTESTATION,
-                    data=np.bytes_(
-                        self.request.execution_attestation_json.encode("utf-8")
-                    ),
-                )
-            write_result(entry)
-            handle.flush()
-        descriptor = os.open(candidate, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        write_result(entry)
+        handle.flush()
 
     def _validate_candidate(
         self,
@@ -2846,7 +2812,7 @@ class AnalysisArtifactOutput:
             self.request.target,
             captured.size,
             captured.digest,
-            self._transaction.admission.ordinal,
+            self._ordinal,
             int(state.st_dev),
             int(state.st_ino),
             int(state.st_mtime_ns),
@@ -2899,189 +2865,74 @@ class AnalysisArtifactOutput:
                 )
         return self._receipt
 
-    def _settle_failed_writer(self) -> None:
-        phase = self._transaction.snapshot().phase
-        if phase is TransactionPhase.READY_TO_RETRY:
-            self._transaction.abort(
-                admission=self._transaction.admission,
-                transaction_owner=self._transaction_owner,
-                target_owner=self._target_owner,
-                lease=self._lease,
-            )
-            phase = TransactionPhase.ABORTED
-        elif phase is TransactionPhase.LEASED:
-            self._transaction.abandon(self._lease)
-            phase = TransactionPhase.ABORTED
-        if phase is TransactionPhase.ABORTED:
-            self._release()
-
-    def _settle_or_raise(self, primary: BaseException) -> None:
-        settlement_error: BaseException | None = None
-        try:
-            self._settle_failed_writer()
-        except BaseException as error:
-            settlement_error = error
-            try:
-                primary.add_note(
-                    f"analysis artifact settlement also failed: "
-                    f"{type(error).__module__}.{type(error).__qualname__}: {error}"
-                )
-            except BaseException:
-                pass
-        state = self.snapshot
-        if settlement_error is not None or state.retryable:
-            raise AnalysisArtifactCleanupPending(state) from primary
-        raise primary.with_traceback(primary.__traceback__)
-
-    def _publish_owned(
-        self,
-        write_result: Callable[[h5py.Group], object],
-        *,
-        prepublish: Callable[[], object] | None = None,
-        retain_lease: bool,
-    ) -> AnalysisArtifactReceipt:
-        if not callable(write_result):
-            raise TypeError("analysis artifact writer must be callable")
-        if prepublish is not None and not callable(prepublish):
-            raise TypeError("analysis artifact prepublication check must be callable")
-        if self._writer_started or self._receipt is not None:
-            raise TransactionStateError("analysis artifact writer is one-shot")
-        try:
-            outcome = self._transaction.execute(
-                lambda candidate: self._write_candidate(candidate, write_result),
-                admission=self._transaction.admission,
-                transaction_owner=self._transaction_owner,
-                target_owner=self._target_owner,
-                lease=self._lease,
-                validate_writer_result=lambda candidate, captured: (
-                    self._validate_candidate(candidate, captured, prepublish)
-                ),
-            )
-        except BaseException as error:
-            self._settle_or_raise(error)
-        if outcome.phase is not TransactionPhase.COMMITTED:
-            raise TransactionStateError("analysis artifact did not reach committed phase")
-        try:
-            receipt = self._seal_receipt()
-        except BaseException as error:
-            raise AnalysisArtifactCleanupPending(self.snapshot) from error
-        if not retain_lease:
-            try:
-                self._release()
-            except BaseException as error:
-                raise AnalysisArtifactCleanupPending(self.snapshot) from error
-        return receipt
+    def _observe_published(self, _path: Path, _ordinal: int) -> StreamTerminal:
+        receipt = self._seal_receipt()
+        if self._on_published is not None:
+            self._on_published(receipt)
+        self._completed = True
+        self._on_published = None
+        return receipt.terminal
 
     def publish(
         self,
         write_result: Callable[[h5py.Group], object],
         *,
         prepublish: Callable[[], object] | None = None,
+        _on_published: Callable[[AnalysisArtifactReceipt], object] | None = None,
     ) -> AnalysisArtifactReceipt:
-        return self._publish_owned(
-            write_result,
-            prepublish=prepublish,
-            retain_lease=False,
-        )
-
-    def _publish_retained(
-        self,
-        write_result: Callable[[h5py.Group], object],
-        *,
-        prepublish: Callable[[], object] | None = None,
-    ) -> AnalysisArtifactReceipt:
-        return self._publish_owned(
-            write_result,
-            prepublish=prepublish,
-            retain_lease=True,
-        )
+        if not callable(write_result):
+            raise TypeError("analysis artifact writer must be callable")
+        if prepublish is not None and not callable(prepublish):
+            raise TypeError("analysis artifact prepublication check must be callable")
+        if _on_published is not None and not callable(_on_published):
+            raise TypeError("analysis published observer must be callable")
+        if self._writer_started or not self._publication.slot_held:
+            raise TransactionStateError("analysis artifact writer is one-shot")
+        self._on_published = _on_published
+        try:
+            candidate = self._publication.candidate
+            if capture_target_snapshot(self.request.target) != self._expected_target:
+                raise TargetChanged("analysis target changed before writing")
+            self._write_candidate(write_result)
+            if not self._publication.close_document():
+                raise OSError("analysis candidate document has not closed")
+            self._validate_candidate(candidate, capture_target_snapshot(candidate), prepublish)
+            facts = self._publication.publish(
+                self._expected_target, ordinal=self._ordinal,
+                observe=self._observe_published,
+            )
+        except BaseException as error:
+            self._on_published = None
+            self._close_pending = not self._publication.abort()
+            for diagnostic in self._publication.diagnostics:
+                error.add_note(diagnostic)
+            if self._publication.hidden_orphan is not None:
+                error.add_note(f"hidden candidate remains: {self._publication.hidden_orphan}")
+            if self._close_pending:
+                raise AnalysisArtifactCleanupPending(self.snapshot) from error
+            raise
+        if facts.error is not None:
+            # The shared owner has already observed publication and released
+            # the slot. Keep only immutable verification facts, never rollback.
+            raise AnalysisArtifactCleanupPending(self.snapshot) from facts.error
+        return self._receipt
 
     def abort(self) -> AnalysisArtifactOutputSnapshot:
-        if self._receipt is not None:
-            if self._remaining:
-                try:
-                    self._release()
-                except BaseException as error:
-                    raise AnalysisArtifactCleanupPending(self.snapshot) from error
+        if self._publication.published:
             return self.snapshot
-        phase = self._transaction.snapshot().phase
-        if phase in {TransactionPhase.LEASED, TransactionPhase.READY_TO_RETRY}:
-            try:
-                if phase is TransactionPhase.LEASED:
-                    self._transaction.abandon(self._lease)
-                else:
-                    self._transaction.abort(
-                        admission=self._transaction.admission,
-                        transaction_owner=self._transaction_owner,
-                        target_owner=self._target_owner,
-                        lease=self._lease,
-                    )
-            except BaseException as error:
-                raise AnalysisArtifactCleanupPending(self.snapshot) from error
-        elif phase not in {TransactionPhase.ABORTED}:
-            raise TransactionStateError(
-                f"analysis artifact cannot abort in phase {phase.value}"
-            )
-        try:
-            self._release()
-        except BaseException as error:
-            raise AnalysisArtifactCleanupPending(self.snapshot) from error
+        self._on_published = None
+        self._close_pending = not self._publication.abort()
+        if self._close_pending:
+            raise AnalysisArtifactCleanupPending(self.snapshot)
         return self.snapshot
 
-    def _retry_cleanup_owned(
-        self,
-        *,
-        retain_lease: bool,
-    ) -> AnalysisArtifactOutputSnapshot:
+    def retry_cleanup(self) -> AnalysisArtifactOutputSnapshot:
+        if not self._publication.published:
+            return self.abort()
         try:
-            state = self._transaction.snapshot()
-            if state.cleanup_token is not None and state.retryable:
-                state = self._transaction.retry_cleanup(state.cleanup_token)
-            if (
-                state.phase in {
-                    TransactionPhase.LEASED,
-                    TransactionPhase.INTEGRITY_HOLD,
-                }
-                and not self._writer_started
-            ):
-                self._transaction.abandon(self._lease)
-                state = self._transaction.snapshot()
-            if state.phase is TransactionPhase.READY_TO_RETRY:
-                self._transaction.abort(
-                    admission=self._transaction.admission,
-                    transaction_owner=self._transaction_owner,
-                    target_owner=self._target_owner,
-                    lease=self._lease,
-                )
-                state = self._transaction.snapshot()
-            if state.phase is TransactionPhase.COMMITTED:
-                self._seal_receipt()
-                if not retain_lease:
-                    self._release()
-                return self.snapshot
-            if state.phase is TransactionPhase.ABORTED:
-                self._release()
-                return self.snapshot
-        except AnalysisArtifactCleanupPending:
-            raise
+            self._observe_published(Path(self.request.target), self._ordinal)
         except BaseException as error:
             raise AnalysisArtifactCleanupPending(self.snapshot) from error
-        raise AnalysisArtifactCleanupPending(self.snapshot)
-
-    def retry_cleanup(self) -> AnalysisArtifactOutputSnapshot:
-        return self._retry_cleanup_owned(retain_lease=False)
-
-    def _retry_retained(self) -> AnalysisArtifactOutputSnapshot:
-        return self._retry_cleanup_owned(retain_lease=True)
-
-    def _complete_retained(self) -> AnalysisArtifactOutputSnapshot:
-        state = self._transaction.snapshot()
-        if state.phase is not TransactionPhase.COMMITTED or self._receipt is None:
-            raise TransactionStateError(
-                "retained analysis artifact is not ready for final release"
-            )
-        self._seal_receipt()
-        self._release()
         return self.snapshot
 
 

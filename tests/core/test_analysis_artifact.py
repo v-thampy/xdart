@@ -45,11 +45,9 @@ from xrd_tools.io.nexus import (
     write_stitched,
 )
 from xrd_tools.io.output_transaction import (
-    LeaseOwner,
     LeaseUnavailable,
     OutputTransactionCoordinator,
     TargetChanged,
-    TransactionPhase,
     stream_terminal_object_revision,
 )
 from xrd_tools.io.processed_scan_id import (
@@ -308,8 +306,8 @@ def test_standalone_artifact_roundtrip_is_exact_and_raw_negative(tmp_path, kind)
     assert receipt.inspection.provenance_digest == request.provenance_digest
     assert stream_terminal_object_revision(receipt.terminal) is not None
     assert receipt.terminal.target == request.target
-    assert output.snapshot.phase is TransactionPhase.COMMITTED
-    assert output.snapshot.remaining_lease_owners == ()
+    assert output.snapshot.published
+    assert not output.snapshot.slot_held
     assert output.snapshot.receipt is receipt
     assert inspect_analysis_artifact(request.target, expected_request=request).kind is kind
     payload = read_analysis_artifact(request.target, expected_receipt=receipt)
@@ -1572,19 +1570,82 @@ def test_create_new_uses_the_admitted_snapshot_not_a_racy_precheck(
 ):
     target = tmp_path / "raced-create-new.nexus"
     coordinator = OutputTransactionCoordinator()
-    real_admit = coordinator.admit
+    real_hold = coordinator.hold_target
 
     def appear_before_admission(*args, **kwargs):
         target.write_bytes(b"foreign arrival")
-        return real_admit(*args, **kwargs)
+        return real_hold(*args, **kwargs)
 
-    monkeypatch.setattr(coordinator, "admit", appear_before_admission)
+    monkeypatch.setattr(coordinator, "hold_target", appear_before_admission)
     with pytest.raises(FileExistsError):
         admit_analysis_artifact(
             _request(target, AnalysisArtifactKind.STITCH_1D),
             coordinator=coordinator,
         )
     assert target.read_bytes() == b"foreign arrival"
+
+
+def test_repeat_keeps_prior_visible_through_candidate_validation(tmp_path):
+    target = tmp_path / "visible.nexus"
+    initial = _request(target, AnalysisArtifactKind.STITCH_1D)
+    admit_analysis_artifact(initial).publish(_writer(initial))
+    prior = target.read_bytes()
+    request = _request(target, initial.kind, overwrite=AnalysisArtifactOverwrite.REPLACE)
+    output = admit_analysis_artifact(request)
+    observed = []
+
+    def writer(entry):
+        observed.append(target.read_bytes())
+        _writer(request)(entry)
+        observed.append(target.read_bytes())
+
+    result = output.publish(writer, prepublish=lambda: observed.append(target.read_bytes()))
+    assert observed == [prior, prior, prior]
+    assert result.request is request
+    assert output.snapshot.published and not output.snapshot.slot_held
+    assert not tuple(tmp_path.glob(".*xdart-*"))
+
+
+def test_failed_writer_retains_actual_document_until_close_retry(tmp_path, monkeypatch):
+    target = tmp_path / "close.nexus"
+    initial = _request(target, AnalysisArtifactKind.STITCH_1D)
+    admit_analysis_artifact(initial).publish(_writer(initial))
+    prior = target.read_bytes()
+    request = _request(target, initial.kind, overwrite=AnalysisArtifactOverwrite.REPLACE)
+    coordinator = OutputTransactionCoordinator()
+    output = admit_analysis_artifact(request, coordinator=coordinator)
+    real_close = h5py.File.close
+    held = []
+    writes = []
+    blocked = True
+
+    def fail_owned_close(handle):
+        if blocked and held and handle is held[0]:
+            raise OSError("actual document close fault")
+        return real_close(handle)
+
+    def writer(entry):
+        writes.append(1)
+        held.append(output._publication.document)
+        _writer(request)(entry)
+        raise ValueError("writer failure")
+
+    monkeypatch.setattr(h5py.File, "close", fail_owned_close)
+    with pytest.raises(AnalysisArtifactCleanupPending) as pending:
+        output.publish(writer)
+    assert isinstance(pending.value.__cause__, ValueError)
+    assert output.snapshot.close_pending and output.snapshot.slot_held
+    assert not output.snapshot.published and held[0].id.valid
+    assert output._publication.document is held[0]
+    assert target.read_bytes() == prior
+    with pytest.raises(LeaseUnavailable):
+        admit_analysis_artifact(request, coordinator=coordinator)
+    blocked = False
+    settled = output.retry_cleanup()
+    assert not settled.close_pending and not settled.slot_held
+    assert not held[0].id.valid and writes == [1]
+    assert target.read_bytes() == prior
+    assert not tuple(tmp_path.glob(".*xdart-*"))
 
 
 def test_untouched_abort_releases_normalized_target_lease(tmp_path):
@@ -1601,75 +1662,32 @@ def test_untouched_abort_releases_normalized_target_lease(tmp_path):
             coordinator=coordinator,
         )
     retired = first.abort()
-    assert retired.phase is TransactionPhase.ABORTED
-    assert retired.remaining_lease_owners == ()
+    assert not retired.published and not retired.close_pending
+    assert not retired.slot_held
     replacement = admit_analysis_artifact(
         _request(alias, AnalysisArtifactKind.STITCH_1D),
         coordinator=coordinator,
     )
     final = replacement.abort()
-    assert final.phase is TransactionPhase.ABORTED
-    assert final.remaining_lease_owners == ()
+    assert not final.published and not final.close_pending
+    assert not final.slot_held
 
 
-def test_abort_release_fault_is_typed_and_resumes_exact_owner_suffix(
-    tmp_path,
-    monkeypatch,
-):
-    coordinator = OutputTransactionCoordinator()
-    request = _request(
-        tmp_path / "abort-release-retry.nexus",
-        AnalysisArtifactKind.STITCH_1D,
-    )
-    output = admit_analysis_artifact(request, coordinator=coordinator)
-    real_release = coordinator._release
-    successful = []
-    failed = []
-
-    def fail_after_two(lease, role, owner):
-        if len(successful) == 2 and not failed:
-            failed.append(role)
-            raise OSError("abort release transient")
-        snapshot = real_release(lease, role, owner)
-        successful.append(role)
-        return snapshot
-
-    monkeypatch.setattr(coordinator, "_release", fail_after_two)
-    with pytest.raises(AnalysisArtifactCleanupPending) as pending:
-        output.abort()
-    assert isinstance(pending.value.__cause__, OSError)
-    assert pending.value.snapshot.phase is TransactionPhase.ABORTED
-    assert pending.value.snapshot.retryable is True
-    assert pending.value.snapshot.remaining_lease_owners == tuple(LeaseOwner)[2:]
-    recovered = output.retry_cleanup()
-    assert recovered.phase is TransactionPhase.ABORTED
-    assert recovered.remaining_lease_owners == ()
-    assert successful == list(LeaseOwner)
-
-
-def test_target_appearance_after_admission_is_an_integrity_hold(tmp_path):
+def test_target_appearance_after_admission_refuses_and_releases(tmp_path):
     target = tmp_path / "post-admission-arrival.nexus"
     request = _request(target, AnalysisArtifactKind.STITCH_1D)
-    output = admit_analysis_artifact(
-        request,
-        coordinator=OutputTransactionCoordinator(),
-    )
+    output = admit_analysis_artifact(request, coordinator=OutputTransactionCoordinator())
     target.write_bytes(b"foreign after admission")
     writes = []
-    with pytest.raises(AnalysisArtifactCleanupPending) as pending:
+    with pytest.raises(TargetChanged, match="before writing"):
         output.publish(lambda entry: writes.append(entry))
-    assert isinstance(pending.value.__cause__, TargetChanged)
     assert writes == []
     assert target.read_bytes() == b"foreign after admission"
-    assert output.snapshot.phase is TransactionPhase.INTEGRITY_HOLD
-    assert output.snapshot.remaining_lease_owners == tuple(LeaseOwner)
-    with pytest.raises(AnalysisArtifactCleanupPending):
-        output.retry_cleanup()
+    assert not output.snapshot.published
+    assert not output.snapshot.slot_held
+    assert not output.snapshot.retryable
+    assert output.retry_cleanup() == output.snapshot
     assert target.read_bytes() == b"foreign after admission"
-    target.unlink()
-    recovered = output.retry_cleanup()
-    assert recovered.phase is TransactionPhase.ABORTED
-    assert recovered.remaining_lease_owners == ()
 
 
 @pytest.mark.parametrize("prior", (None, b"exact prior"))
@@ -1700,8 +1718,8 @@ def test_writer_or_readback_failure_rolls_back_and_releases(tmp_path, prior):
     with pytest.raises(AnalysisArtifactInvalid):
         output.publish(wrong_kind)
     assert (target.read_bytes() if target.exists() else None) == prior
-    assert output.snapshot.phase is TransactionPhase.ABORTED
-    assert output.snapshot.remaining_lease_owners == ()
+    assert not output.snapshot.published and not output.snapshot.close_pending
+    assert not output.snapshot.slot_held
     assert not tuple(tmp_path.glob(".*xdart-*"))
 
 
@@ -1758,55 +1776,6 @@ def test_marker_only_and_historical_result_groups_are_never_raw(tmp_path):
             require_raw_input(path)
 
 
-def test_committed_cleanup_retry_seals_receipt_without_writer_replay(
-    tmp_path,
-    monkeypatch,
-):
-    import xrd_tools.io.output_transaction as transaction_api
-
-    target = tmp_path / "cleanup-retry.nexus"
-    target.write_bytes(b"prior")
-    request = _request(
-        target,
-        AnalysisArtifactKind.STITCH_1D,
-        overwrite=AnalysisArtifactOverwrite.REPLACE,
-    )
-    output = admit_analysis_artifact(
-        request,
-        coordinator=OutputTransactionCoordinator(),
-    )
-    backup = output._transaction.backup
-    real_unlink = transaction_api._unlink
-    failed = []
-    writes = []
-
-    def fail_backup_once(path):
-        if Path(path) == backup and not failed:
-            failed.append("backup")
-            raise OSError("backup unlink fault")
-        return real_unlink(path)
-
-    def write_once(entry):
-        writes.append("writer")
-        _writer(request)(entry)
-
-    monkeypatch.setattr(transaction_api, "_unlink", fail_backup_once)
-    with pytest.raises(AnalysisArtifactCleanupPending):
-        output.publish(write_once)
-    pending = output.snapshot
-    assert pending.phase is TransactionPhase.CLEANUP_PENDING
-    assert pending.receipt is None
-    assert pending.remaining_lease_owners == tuple(LeaseOwner)
-
-    recovered = output.retry_cleanup()
-    assert recovered.phase is TransactionPhase.COMMITTED
-    assert recovered.receipt is not None
-    assert recovered.receipt.request is request
-    assert recovered.receipt.inspection.result_fingerprint
-    assert recovered.remaining_lease_owners == ()
-    assert writes == ["writer"]
-
-
 def test_transient_final_readback_retries_without_writer_replay(
     tmp_path,
     monkeypatch,
@@ -1838,55 +1807,13 @@ def test_transient_final_readback_retries_without_writer_replay(
     monkeypatch.setattr(artifact_api, "inspect_analysis_artifact", fail_final_once)
     with pytest.raises(AnalysisArtifactCleanupPending):
         output.publish(write_once)
-    assert output.snapshot.phase is TransactionPhase.COMMITTED
+    assert output.snapshot.published
     assert output.snapshot.receipt is None
-    assert output.snapshot.remaining_lease_owners == tuple(LeaseOwner)
+    assert not output.snapshot.slot_held
 
     recovered = output.retry_cleanup()
     assert recovered.receipt is not None
-    assert recovered.remaining_lease_owners == ()
-    assert writes == ["writer"]
-
-
-def test_invalid_candidate_and_cleanup_fault_preserve_primary_then_retry(
-    tmp_path,
-    monkeypatch,
-):
-    import xrd_tools.io.output_transaction as transaction_api
-
-    request = _request(
-        tmp_path / "invalid-cleanup-retry.nexus",
-        AnalysisArtifactKind.STITCH_1D,
-    )
-    output = admit_analysis_artifact(
-        request,
-        coordinator=OutputTransactionCoordinator(),
-    )
-    real_unlink = transaction_api._unlink
-    cleanup_failures = []
-    writes = []
-
-    def fail_candidate_cleanup_once(path):
-        if ".xdart-candidate-" in Path(path).name and not cleanup_failures:
-            cleanup_failures.append("candidate")
-            raise OSError("candidate cleanup fault")
-        return real_unlink(path)
-
-    def invalid_writer(entry):
-        writes.append("writer")
-        _writer(request)(entry)
-        entry.attrs["unexpected"] = "invalid"
-
-    monkeypatch.setattr(transaction_api, "_unlink", fail_candidate_cleanup_once)
-    with pytest.raises(AnalysisArtifactCleanupPending) as pending:
-        output.publish(invalid_writer)
-    assert isinstance(pending.value.__cause__, AnalysisArtifactInvalid)
-    assert output.snapshot.phase is TransactionPhase.CLEANUP_PENDING
-    assert output.snapshot.remaining_lease_owners == tuple(LeaseOwner)
-    recovered = output.retry_cleanup()
-    assert recovered.phase is TransactionPhase.ABORTED
-    assert recovered.remaining_lease_owners == ()
-    assert not Path(request.target).exists()
+    assert not recovered.slot_held
     assert writes == ["writer"]
 
 
@@ -1913,13 +1840,13 @@ def test_committed_readback_retry_refuses_changed_target(tmp_path, monkeypatch):
     monkeypatch.setattr(artifact_api, "inspect_analysis_artifact", fail_final_once)
     with pytest.raises(AnalysisArtifactCleanupPending):
         output.publish(_writer(request))
-    assert output.snapshot.phase is TransactionPhase.COMMITTED
+    assert output.snapshot.published
     assert output.snapshot.receipt is None
     Path(request.target).write_bytes(b"foreign committed occupant")
     with pytest.raises(AnalysisArtifactCleanupPending) as pending:
         output.retry_cleanup()
     assert pending.value.snapshot.receipt is None
-    assert pending.value.snapshot.remaining_lease_owners == tuple(LeaseOwner)
+    assert not pending.value.snapshot.slot_held
     assert Path(request.target).read_bytes() == b"foreign committed occupant"
 
 
@@ -2091,78 +2018,6 @@ def test_expected_request_requires_exact_path_and_consistent_kind(tmp_path):
             expected_request=request,
             expected_receipt=receipt,
         )
-
-
-def test_cached_receipt_retry_revalidates_before_final_lease_release(
-    tmp_path,
-    monkeypatch,
-):
-    coordinator = OutputTransactionCoordinator()
-    request = _request(
-        tmp_path / "cached-receipt-release.nexus",
-        AnalysisArtifactKind.STITCH_1D,
-    )
-    output = admit_analysis_artifact(request, coordinator=coordinator)
-    real_release = coordinator._release
-    failed = []
-
-    def fail_release_once(*args, **kwargs):
-        if not failed:
-            failed.append("release")
-            raise OSError("lease release transient")
-        return real_release(*args, **kwargs)
-
-    monkeypatch.setattr(coordinator, "_release", fail_release_once)
-    with pytest.raises(AnalysisArtifactCleanupPending):
-        output.publish(_writer(request))
-    pending = output.snapshot
-    assert pending.phase is TransactionPhase.COMMITTED
-    assert pending.receipt is not None
-    assert pending.remaining_lease_owners == tuple(LeaseOwner)
-    target = Path(request.target)
-    replacement = target.with_name("foreign-cached.nexus")
-    replacement.write_bytes(b"foreign replacement")
-    os.replace(replacement, target)
-    with pytest.raises(AnalysisArtifactCleanupPending) as held:
-        output.retry_cleanup()
-    assert isinstance(held.value.__cause__, TargetChanged)
-    assert held.value.snapshot.receipt is pending.receipt
-    assert held.value.snapshot.remaining_lease_owners == pending.remaining_lease_owners
-    assert target.read_bytes() == b"foreign replacement"
-
-
-def test_release_retry_resumes_the_exact_remaining_owner_suffix(
-    tmp_path,
-    monkeypatch,
-):
-    coordinator = OutputTransactionCoordinator()
-    request = _request(
-        tmp_path / "release-suffix.nexus",
-        AnalysisArtifactKind.STITCH_1D,
-    )
-    output = admit_analysis_artifact(request, coordinator=coordinator)
-    real_release = coordinator._release
-    successful = []
-    failed = []
-
-    def fail_after_two(lease, role, owner):
-        if len(successful) == 2 and not failed:
-            failed.append(role)
-            raise OSError("third owner release transient")
-        snapshot = real_release(lease, role, owner)
-        successful.append(role)
-        return snapshot
-
-    monkeypatch.setattr(coordinator, "_release", fail_after_two)
-    with pytest.raises(AnalysisArtifactCleanupPending):
-        output.publish(_writer(request))
-    pending = output.snapshot
-    assert pending.receipt is not None
-    assert pending.remaining_lease_owners == tuple(LeaseOwner)[2:]
-    recovered = output.retry_cleanup()
-    assert recovered.receipt is pending.receipt
-    assert recovered.remaining_lease_owners == ()
-    assert successful == list(LeaseOwner)
 
 
 @pytest.mark.parametrize(
@@ -2575,6 +2430,6 @@ def test_unbound_frame_records_and_source_base_are_refused(tmp_path):
                 source_base=tmp_path,
             )
         )
-    assert output.snapshot.phase is TransactionPhase.ABORTED
-    assert output.snapshot.remaining_lease_owners == ()
+    assert not output.snapshot.published and not output.snapshot.close_pending
+    assert not output.snapshot.slot_held
     assert not Path(request.target).exists()
