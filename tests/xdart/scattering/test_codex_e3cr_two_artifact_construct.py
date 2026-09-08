@@ -13,6 +13,7 @@ from xdart.gui.tabs.scattering.contracts import (
     SourceFileState,
 )
 from xdart.gui.tabs.scattering.events import RequestId, RunIdentity
+from xrd_tools.sources.execution_graph import freeze_source_execution_graph
 from xrd_tools.sources.selection import image_series_spec
 
 from tests.xdart.scattering.test_e3_context_contract import _configuration
@@ -44,15 +45,14 @@ def test_construct_loop_adopts_two_artifacts_as_one_atomic_current_scope(
     )
     items = tuple(
         PlannedOutput(
-            image_series_spec(path),
-            path,
-            Path(f"/out/{name}.nxs"),
-            SourceExecutionStamp(
-                SourceFileState(str(path), 1, 1, 1, 1, index),
-                "tiff_series",
-                1,
-                1,
+            freeze_source_execution_graph(
+                image_series_spec(path), image_series_spec(path),
+                source_path=path, group_key=path.stem,
+                file=SourceFileState(str(path), 1, 1, 1, 1, index),
+                adapter_id="tiff_series", frame_count=1, first_label=1,
+                detector_shape=None, native_dtype=None,
             ),
+            Path(f"/out/{name}.nxs"),
         )
         for index, (path, name) in enumerate(
             zip(paths, ("artifact-a", "artifact-b")), start=1

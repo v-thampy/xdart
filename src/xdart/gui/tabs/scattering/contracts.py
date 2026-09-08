@@ -47,6 +47,7 @@ from xrd_tools.sources.execution_graph import (
     SourceExecutionIdentityV1,
     SourceExecutionStamp,
     SourceFileState,
+    PreparedSourceExecutionGraph,
 )
 
 @dataclass(frozen=True, slots=True)
@@ -81,13 +82,9 @@ class SourceGroupIdentity:
 
 @dataclass(frozen=True, slots=True)
 class PlannedOutput:
-    source_spec: SourceSpec
-    source_path: Path
+    graph: PreparedSourceExecutionGraph
     target: Path
-    source_stamp: SourceExecutionStamp
     candidate: Candidate | None = None
-    descriptor: ContainerDescriptor | None = None
-    motor_names: tuple[str, ...] | None = None
     #: ROOT FAMILY this run publishes into, carried from the moment the target
     #: was named.  Recorded rather than re-derived: the public name is
     #: `<family><slot>.nexus`, so recovering the family from `target` would mean
@@ -96,6 +93,8 @@ class PlannedOutput:
     group: SourceGroupIdentity = field(init=False)
 
     def __post_init__(self) -> None:
+        if type(self.graph) is not PreparedSourceExecutionGraph:
+            raise TypeError("planned output requires an exact source graph")
         members = tuple(Path(value.path) for value in self.source_stamp.members)
         members = members or (self.source_path,)
         members += tuple(
@@ -108,11 +107,7 @@ class PlannedOutput:
         )
         members = tuple(dict.fromkeys(members))
         options = dict(self.source_spec.options)
-        key = str(
-            options.get("scan_name")
-            or getattr(self.descriptor, "scan_name", "")
-            or Path(self.source_stamp.path).stem
-        )
+        key = self.graph.group_key
         motors = self.motor_names
         if motors is None and self.descriptor is not None:
             motors = self.descriptor.motor_names
@@ -146,6 +141,26 @@ class PlannedOutput:
             self.source_stamp, motors,
         )
         object.__setattr__(self, "group", group)
+
+    @property
+    def source_spec(self) -> SourceSpec:
+        return self.graph.execution_source
+
+    @property
+    def source_path(self) -> Path:
+        return Path(self.graph.source_path)
+
+    @property
+    def source_stamp(self) -> SourceExecutionStamp:
+        return self.graph.stamp
+
+    @property
+    def descriptor(self) -> ContainerDescriptor | None:
+        return self.graph.descriptor
+
+    @property
+    def motor_names(self) -> tuple[str, ...] | None:
+        return self.graph.motor_names
 
 @dataclass(frozen=True, slots=True)
 class OutputFact:

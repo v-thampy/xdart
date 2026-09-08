@@ -37,11 +37,20 @@ def _composition(tmp_path: Path, *, live=False, count=3,
     from xrd_tools.reduction.core import Integration1DPlan, ReductionPlan
     from xrd_tools.session.run_configuration import RunIntent
     from xrd_tools.sources.selection import image_series_spec
+    from xrd_tools.sources.execution_graph import freeze_source_execution_graph
     paths = tuple(tmp_path / f"scan_{index}.tif" for index in range(1, count + 1))
     for path in paths: path.write_bytes(b"raw")
     spec = image_series_spec(paths[0]); states = tuple(SourceFileState.capture(path) for path in paths)
     stamp = SourceExecutionStamp(states[0], "tiff_series", count, 1, members=states)
-    item = PlannedOutput(spec, paths[0], tmp_path / "out.nxs", stamp)
+    item = PlannedOutput(
+        freeze_source_execution_graph(
+            spec, spec, source_path=paths[0], group_key=paths[0].stem,
+            file=stamp.file, adapter_id=stamp.adapter_id,
+            frame_count=stamp.frame_count, first_label=stamp.first_label,
+            detector_shape=None, native_dtype=None, members=stamp.members,
+        ),
+        tmp_path / "out.nxs",
+    )
     decision = AdmittedOutput(item, OutputDisposition.WRITE,
         tuple(range(1, count + 1)), OutputFact(False))
     frames = [ScanFrame(index, image=np.ones((2, 2), np.uint16),

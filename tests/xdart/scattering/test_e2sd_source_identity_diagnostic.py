@@ -178,17 +178,17 @@ def test_admitted_tiff_gi_run_resolves_each_frame_th_without_fallback(
             match="do not match source stamp",
         ):
             PlannedOutput(
-                SourceSpec(
-                    item.source_spec.uri,
-                    item.source_spec.kind,
-                    options=forged_options,
+                replace(
+                    item.graph,
+                    execution_source=SourceSpec(
+                        item.source_spec.uri,
+                        item.source_spec.kind,
+                        options=forged_options,
+                    ),
                 ),
-                item.source_path,
                 item.target,
-                item.source_stamp,
                 item.candidate,
-                item.descriptor,
-                item.motor_names,
+                item.artifact_family,
             )
 
         empty_stamp = replace(
@@ -198,17 +198,18 @@ def test_admitted_tiff_gi_run_resolves_each_frame_th_without_fallback(
         empty_options = dict(item.source_spec.options)
         empty_options["admitted_motor_values"] = ()
         incomplete = PlannedOutput(
-            SourceSpec(
-                item.source_spec.uri,
-                item.source_spec.kind,
-                options=empty_options,
+            replace(
+                item.graph,
+                execution_source=SourceSpec(
+                    item.source_spec.uri,
+                    item.source_spec.kind,
+                    options=empty_options,
+                ),
+                stamp=empty_stamp,
             ),
-            item.source_path,
             item.target,
-            empty_stamp,
             item.candidate,
-            item.descriptor,
-            item.motor_names,
+            item.artifact_family,
         )
         with pytest.raises(
             ValueError,

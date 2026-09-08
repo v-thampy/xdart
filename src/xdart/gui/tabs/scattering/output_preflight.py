@@ -45,22 +45,17 @@ from xrd_tools.sources.execution_graph import (
     PreparedSourceExecutionGraph,
     SelectedContainerInput,
     SourceRevisionChanged,
-    freeze_source_execution_graph,
     qualify_source_execution_graph,
     source_snapshots_projection,
     validate_source_execution_graph,
     validate_source_aliases as _validate_source_aliases_shared,
 )
 from .contracts import (
-    AcceptedScientificAssets, AdmittedMetadataSource,
-    AdmittedMotorValue, AdmittedOutput, AdmissionReceipt,
+    AcceptedScientificAssets, AdmittedOutput, AdmissionReceipt,
     ExternalSourceState, OutputDisposition, OutputFact, PlannedOutput,
     SourceExecutionStamp, SourceFileState, StartCapture,
 )
-from .source_metadata import (
-    ordered_motor_intersection,
-    read_image_motor_metadata,
-)
+from .source_metadata import ordered_motor_intersection
 
 load_poni = load_detector_calibration
 
@@ -1216,7 +1211,7 @@ def _validate_deferred_entry_states(
         # fences so no alias drift can be classified without its frozen
         # raw-to-resolved identity reaching the central validator.
         validate_source_execution_graph(
-            _prepared_source_execution(item), cancelled=is_cancelled,
+            item.graph, cancelled=is_cancelled,
         )
     topologies = entry._protected_topology or tuple(
         _topology_from_captured_state(value)
@@ -1615,7 +1610,7 @@ def _capture_source_states(
 
     File-state capture can block on beamline storage.  Check both sides of
     every member so cancellation raised during one capture cannot trigger a
-    sweep of all remaining TIFFs before admission notices it.
+    sweep of all remaining sources before admission notices it.
     """
 
     states: list[SourceFileState] = []
@@ -1632,124 +1627,6 @@ def _capture_source_states(
             raise RuntimeError("admission cancelled")
         states.append(state)
     return tuple(states)
-
-
-def _tiff_motor_knowledge(
-    members: tuple[Path, ...],
-    states: tuple[SourceFileState, ...],
-    metadata_format: str | None,
-    selected_motor: str | None,
-    *,
-    meta_dir: Path | str | None = None,
-    cancelled: Callable[[], bool] = _not_cancelled,
-) -> tuple[
-    tuple[str, ...] | None,
-    tuple[AdmittedMotorValue, ...],
-    tuple[AdmittedMetadataSource, ...],
-]:
-    if len(members) != len(states):
-        raise ValueError("TIFF metadata knowledge lost member alignment")
-    metadata: list[dict[str, float]] = []
-    metadata_sources: list[AdmittedMetadataSource] = []
-    for member, state in zip(members, states, strict=True):
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        discovered = read_image_motor_metadata(
-            member,
-            metadata_format,
-            meta_dir=meta_dir,
-        )
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        discovered_path = discovered.source_path
-        before = (
-            None
-            if discovered_path is None
-            else SourceFileState.capture(discovered_path)
-        )
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        # The first read discovers the exact sidecar candidate.  Accept values
-        # only from a guarded second read so a writer cannot replace V0 with V1
-        # between parsing and the stamp and leave V0 values falsely bound to
-        # V1's file identity.  The nullable no-sidecar result is guarded too:
-        # a companion that appears during admission changes the source fact.
-        observed = read_image_motor_metadata(
-            member,
-            metadata_format,
-            meta_dir=meta_dir,
-        )
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        observed_path = observed.source_path
-        if (
-            (discovered_path is None) != (observed_path is None)
-            or (
-                discovered_path is not None
-                and observed_path is not None
-                and Path(discovered_path).resolve(strict=False)
-                != Path(observed_path).resolve(strict=False)
-            )
-        ):
-            raise SourceRevisionChanged(
-                f"TIFF metadata source changed during admission: {member}"
-            )
-        metadata_file = (
-            None
-            if observed_path is None
-            else SourceFileState.capture(observed_path)
-        )
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        if before != metadata_file:
-            raise SourceRevisionChanged(
-                f"TIFF metadata source changed during admission: {member}"
-            )
-        metadata.append(dict(observed.values))
-        metadata_sources.append(
-            AdmittedMetadataSource(state.path, metadata_file)
-        )
-    if cancelled():
-        raise RuntimeError("admission cancelled")
-    names = ordered_motor_intersection(
-        tuple(tuple(value) for value in metadata)
-    )
-    admitted: tuple[AdmittedMotorValue, ...] = ()
-    if (
-        selected_motor is not None
-        and all(selected_motor in value for value in metadata)
-    ):
-        admitted = tuple(
-            AdmittedMotorValue(
-                state.path,
-                selected_motor,
-                float(value[selected_motor]),
-            )
-            for state, value in zip(states, metadata)
-        )
-    if cancelled():
-        raise RuntimeError("admission cancelled")
-    return names, admitted, tuple(metadata_sources)
-
-
-def _execution_tiff_source(
-    source: SourceSpec,
-    states: tuple[SourceFileState, ...],
-    admitted: tuple[AdmittedMotorValue, ...],
-) -> SourceSpec:
-    options = dict(source.options)
-    options["files"] = tuple(value.path for value in states)
-    options["admitted_motor_values"] = tuple(
-        (value.source_path, value.motor, value.value)
-        for value in admitted
-    )
-    return SourceSpec(
-        source.uri,
-        source.kind,
-        metadata_uri=source.metadata_uri,
-        entry=source.entry,
-        options=options,
-    )
 
 
 def _qualify_for_admission(
@@ -1779,12 +1656,11 @@ def _series_item(
         source, selected_motor=_selected_tiff_gi_motor(configuration),
         cancelled=cancelled,
     )
-    return PlannedOutput(graph.execution_source, Path(graph.source_path),
+    return PlannedOutput(graph,
         _resolved_generated_target(
             configuration.save_path, graph.group_key,
             _run_output_slot(configuration),
         ),
-        graph.stamp, descriptor=graph.descriptor, motor_names=graph.motor_names,
         artifact_family=_run_artifact_family(configuration, graph.group_key))
 
 
@@ -1850,42 +1726,25 @@ def _directory_items(
                     grouped.append(value)
             members = tuple(grouped)
             consumed.update(value.path for value in members)
-            states = _capture_source_states(
-                tuple(value.path for value in members),
-                cancelled,
-            )
             spec = SourceSpec(
                 candidate.path.parent, SourceKind.TIFF_SERIES,
                 options={
                     "selected_file": str(candidate.path),
-                    "files": tuple(value.path for value in states),
+                    "files": tuple(value.path for value in members),
                     "scan_name": name,
                     "metadata_format": metadata_format,
                 },
             )
-            member_paths = tuple(value.path for value in members)
-            motor_names, admitted, metadata_sources = _tiff_motor_knowledge(
-                member_paths,
-                states,
-                metadata_format,
-                _selected_tiff_gi_motor(configuration),
+            graph = _qualify_for_admission(
+                spec,
+                selected_motor=_selected_tiff_gi_motor(configuration),
                 cancelled=cancelled,
-            )
-            spec = _execution_tiff_source(spec, states, admitted)
-            graph = freeze_source_execution_graph(
-                spec, spec, source_path=candidate.path, group_key=name,
-                file=states[0], adapter_id="tiff_series",
-                frame_count=len(states), first_label=1,
-                detector_shape=None, native_dtype=None, members=states,
-                admitted_motor_values=admitted, metadata_sources=metadata_sources,
-                motor_names=motor_names,
             )
         else:
             consumed.add(candidate.path)
             if _uses_eager_directory_descriptors(configuration):
                 state = _capture_source_states(
-                    (candidate.path,),
-                    cancelled,
+                    (candidate.path,), cancelled,
                 )[0]
                 adapter = get_adapter(candidate.adapter_id)
                 if adapter is None:
@@ -1909,8 +1768,7 @@ def _directory_items(
                 descriptor = refreshed.descriptor
             else:
                 state = _capture_source_states(
-                    (candidate.path,),
-                    cancelled,
+                    (candidate.path,), cancelled,
                 )[0]
             if descriptor.kind is SourceKind.PROCESSED_NEXUS:
                 raise ValueError("processed output cannot be raw input")
@@ -1928,9 +1786,6 @@ def _directory_items(
                 ),
                 cancelled=cancelled,
             )
-        spec, stamp, descriptor, motor_names = (
-            graph.execution_source, graph.stamp, graph.descriptor, graph.motor_names,
-        )
         output_directory: Path | None = None
         if not output_root.suffix:
             try:
@@ -1965,15 +1820,11 @@ def _directory_items(
             configuration, name, output_directory,
         )
         items.append(PlannedOutput(
-            spec,
-            candidate.path,
+            graph,
             _generated_target_in(
                 directory, family, _run_output_slot(configuration),
             ),
-            stamp,
             candidate,
-            descriptor,
-            motor_names,
             family,
         ))
     return tuple(items)
@@ -1984,29 +1835,11 @@ def validate_planned_source(
 ) -> None:
     is_cancelled = _not_cancelled if cancelled is None else cancelled
     validate_source_execution_graph(
-        _prepared_source_execution(item), cancelled=is_cancelled,
+        item.graph, cancelled=is_cancelled,
     )
-def _prepared_source_execution(item: PlannedOutput) -> PreparedSourceExecutionGraph:
-    descriptor = item.descriptor
-    stamp = item.source_stamp
-    return freeze_source_execution_graph(
-        item.source_spec, item.source_spec, source_path=item.source_path,
-        group_key=item.group.group_key, file=stamp.file,
-        adapter_id=stamp.adapter_id, frame_count=stamp.frame_count,
-        first_label=stamp.first_label,
-        detector_shape=None if descriptor is None else tuple(descriptor.frame_shape),
-        native_dtype=None if descriptor is None else np.dtype(descriptor.dtype).str,
-        members=stamp.members, external_members=stamp.external_members,
-        dependency_files=stamp.dependency_files,
-        admitted_motor_values=stamp.admitted_motor_values,
-        metadata_sources=stamp.metadata_sources, descriptor=descriptor,
-        motor_names=item.group.motor_names,
-    )
-
-
 def source_snapshots(item: PlannedOutput) -> dict[str, dict[str, Any]]:
     return source_snapshots_projection(
-        _prepared_source_execution(item), writer=False
+        item.graph, writer=False
     )
 def execution_plan_values(
     configuration: FrozenRunConfiguration,

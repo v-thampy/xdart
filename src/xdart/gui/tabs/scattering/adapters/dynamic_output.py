@@ -70,7 +70,6 @@ from ..contracts import AdmittedOutput, PlannedOutput, SourceExecutionStamp
 from ..output_preflight import (
     _background_resource_terms,
     _merge_background_binding,
-    _prepared_source_execution,
 )
 
 
@@ -525,7 +524,7 @@ def _target_key(path: Path | str) -> str:
 
 def _stable_lineage(item: PlannedOutput) -> tuple[object, ...]:
     return stable_lineage_projection(
-        _prepared_source_execution(item), target=item.group.target,
+        item.graph, target=item.group.target,
     )
 
 
@@ -535,7 +534,7 @@ def _append_source(
     *,
     generation: int,
 ) -> AppendSource:
-    graph = _prepared_source_execution(item)
+    graph = item.graph
     if stamp is not item.source_stamp:
         raise ValueError("Append source stamp must be the admitted item stamp")
     return append_source_from_execution_graph(graph, generation=generation)
@@ -689,7 +688,7 @@ def _writer_source_snapshots(
     item: PlannedOutput,
 ) -> dict[str, dict[str, Any]]:
     return source_snapshots_projection(
-        _prepared_source_execution(item), writer=True,
+        item.graph, writer=True,
     )
 
 
@@ -1292,7 +1291,7 @@ class DynamicOutputAdapter:
                     artifact_family=item.artifact_family or None,
                     run_configuration_provenance=run_provenance,
                     source_execution_provenance=source_execution_projection(
-                        _prepared_source_execution(item)
+                        item.graph
                     ),
                     source_snapshots_provenance=(
                         _writer_source_snapshots(item)

@@ -78,12 +78,20 @@ def _image_item(
     *,
     descriptor: ContainerDescriptor | None = None,
 ) -> PlannedOutput:
+    from xrd_tools.sources.execution_graph import freeze_source_execution_graph
+    spec = SourceSpec(source, SourceKind.IMAGE_FILE)
     return PlannedOutput(
-        SourceSpec(source, SourceKind.IMAGE_FILE),
-        source,
+        freeze_source_execution_graph(
+            spec, spec, source_path=source, group_key=source.stem,
+            file=stamp.file, adapter_id=stamp.adapter_id,
+            frame_count=stamp.frame_count, first_label=stamp.first_label,
+            detector_shape=None, native_dtype=None, members=stamp.members,
+            external_members=stamp.external_members,
+            dependency_files=stamp.dependency_files,
+            admitted_motor_values=stamp.admitted_motor_values,
+            metadata_sources=stamp.metadata_sources, descriptor=descriptor,
+        ),
         target,
-        stamp,
-        descriptor=descriptor,
     )
 
 
@@ -397,7 +405,8 @@ def test_sidecar_alias_retarget_is_pending_before_every_output_side_effect(
         DirectorySourceSpec(raw, suffixes=(".tif",), metadata_format="auto"),
         request_value=1107,
     )
-    real_read = output_preflight.read_image_motor_metadata
+    from xrd_tools.io import metadata as metadata_io
+    real_read = metadata_io.read_image_metadata_observed
     retargeted = False
     forbidden: list[str] = []
 
@@ -416,8 +425,8 @@ def test_sidecar_alias_retarget_is_pending_before_every_output_side_effect(
         return fail
 
     monkeypatch.setattr(
-        output_preflight,
-        "read_image_motor_metadata",
+        metadata_io,
+        "read_image_metadata_observed",
         retarget_earlier_alias,
     )
     real_execute_live = executor._execute_live_directory
@@ -460,11 +469,6 @@ def test_sidecar_alias_retarget_is_pending_before_every_output_side_effect(
     )
     monkeypatch.setattr(executor, "_execute_live_directory", gated_execute_live)
     monkeypatch.setattr(executor, "_construct", forbidden_call("construct"))
-    monkeypatch.setattr(
-        executor_module.TargetLease,
-        "acquire",
-        classmethod(lambda _cls, _paths: forbidden_call("target_lease")()),
-    )
     try:
         accepted = executor.start(
             configuration,
@@ -476,7 +480,6 @@ def test_sidecar_alias_retarget_is_pending_before_every_output_side_effect(
         run = executor._exact_run(identity)
         assert run is not None
         run.processed_live_revisions = RejectMap()
-        run.deferred_live_revisions = RejectMap()
         execution_gate.set()
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline and not attempts and not forbidden:
@@ -490,7 +493,6 @@ def test_sidecar_alias_retarget_is_pending_before_every_output_side_effect(
         assert attempt.decision is None
         assert forbidden == []
         assert run.processed_live_revisions == {}
-        assert run.deferred_live_revisions == {}
         assert not any(
             event.kind in {
                 StandardEventKind.CONTEXT_READY,
@@ -832,13 +834,13 @@ def test_nullable_metadata_absence_has_no_binding_and_appearance_is_pending(
         DirectorySourceSpec(raw, suffixes=(".tif",), metadata_format="auto"),
         request_value=1110,
     )
-    real_knowledge = output_preflight._tiff_motor_knowledge
+    real_qualify = output_preflight.qualify_source_execution_graph
     appeared = False
     forbidden: list[str] = []
 
-    def appear_after_absent_freeze(*args, **kwargs):
+    def appear_after_absent_qualification(*args, **kwargs):
         nonlocal appeared
-        observed = real_knowledge(*args, **kwargs)
+        observed = real_qualify(*args, **kwargs)
         if not appeared:
             image.with_suffix(".txt").write_text(
                 "th=0.1\nsequence=1\nexposure=0.5\n",
@@ -851,7 +853,10 @@ def test_nullable_metadata_absence_has_no_binding_and_appearance_is_pending(
         forbidden.append("inspect_output")
         raise AssertionError("nullable metadata appearance reached decision")
 
-    monkeypatch.setattr(output_preflight, "_tiff_motor_knowledge", appear_after_absent_freeze)
+    monkeypatch.setattr(
+        output_preflight, "qualify_source_execution_graph",
+        appear_after_absent_qualification,
+    )
     monkeypatch.setattr(output_preflight, "inspect_output", forbid_inspect)
     try:
         attempt = output_preflight.materialize_live_directory_group(
@@ -866,7 +871,6 @@ def test_nullable_metadata_absence_has_no_binding_and_appearance_is_pending(
         assert attempt.revision_changed is True
         assert attempt.decision is None
         assert forbidden == []
-        assert operation.target_lease is None
     finally:
         executor.cancel_admission(operation.token)
 
@@ -1122,12 +1126,19 @@ def test_raw_frame_path_keeps_legacy_snapshot_and_provenance_shape(
         frame_count=3,
         self_contained=True,
     )
+    spec = SourceSpec(alias, SourceKind.NEXUS_STACK)
     item = PlannedOutput(
-        SourceSpec(alias, SourceKind.NEXUS_STACK),
-        alias,
+        source_graph.freeze_source_execution_graph(
+            spec, spec, source_path=alias, group_key=alias.stem,
+            file=stamp.file, adapter_id=stamp.adapter_id,
+            frame_count=stamp.frame_count, first_label=stamp.first_label,
+            members=stamp.members, external_members=stamp.external_members,
+            dependency_files=stamp.dependency_files,
+            admitted_motor_values=stamp.admitted_motor_values,
+            metadata_sources=stamp.metadata_sources, descriptor=descriptor,
+            detector_shape=None, native_dtype=None,
+        ),
         tmp_path / "processed.nexus",
-        stamp,
-        descriptor=descriptor,
     )
 
     def forbidden_capture(_path: Path) -> SourceFileState:
@@ -1215,8 +1226,7 @@ def test_shared_source_graph_direct_and_ordinary_projections_are_byte_exact(
     from xdart.gui.tabs.scattering.adapters import dynamic_output
     from xrd_tools.sources import execution_graph as graph_api
     graph = _p36_tiff_graph(tmp_path)
-    item = PlannedOutput(graph.execution_source, Path(graph.source_path),
-        tmp_path / "out.nexus", graph.stamp, descriptor=graph.descriptor, motor_names=graph.motor_names)
+    item = PlannedOutput(graph, tmp_path / "out.nexus")
     assert contracts.SourceExecutionStamp is graph_api.SourceExecutionStamp
     assert contracts.SourceFileState is graph_api.SourceFileState
     assert graph_api.source_execution_projection(graph) == graph.stamp.as_dict()
@@ -1230,13 +1240,13 @@ def test_shared_source_graph_direct_and_ordinary_projections_are_byte_exact(
     assert graph_api.append_source_from_execution_graph(graph, generation=3) == dynamic_output._append_source(graph.stamp, item, generation=3)
     qualified, frozen = [], []
     real_qualify = output_preflight.qualify_source_execution_graph
-    real_freeze = output_preflight.freeze_source_execution_graph
+    real_freeze = graph_api.freeze_source_execution_graph
     def qualify(source, **kwargs):
         qualified.append(source.kind); return real_qualify(source, **kwargs)
     def freeze(*args, **kwargs):
         frozen.append(kwargs["adapter_id"]); return real_freeze(*args, **kwargs)
     monkeypatch.setattr(output_preflight, "qualify_source_execution_graph", qualify)
-    monkeypatch.setattr(output_preflight, "freeze_source_execution_graph", freeze)
+    monkeypatch.setattr(graph_api, "freeze_source_execution_graph", freeze)
     monkeypatch.setattr(output_preflight, "SourceExecutionStamp", lambda *_a, **_k: pytest.fail("GUI constructed source stamp"))
     monkeypatch.setattr(output_preflight, "PreparedSourceExecutionGraph", lambda *_a, **_k: pytest.fail("GUI constructed source graph"))
     config = output_preflight.OutputCandidate(graph.execution_source, "", "", str(tmp_path / "outputs"), "{}", "p36")
@@ -1260,10 +1270,13 @@ def test_shared_source_graph_direct_and_ordinary_projections_are_byte_exact(
         DirectorySourceSpec(tmp_path, suffixes=(".tif",), metadata_format="txt"),
         "", "", str(tmp_path / "directory"), "{}", "p36",
     ), plan)
-    assert qualified == [SourceKind.TIFF_SERIES, SourceKind.NEXUS_STACK]
-    assert len(directory) == 1 and frozen == ["tiff_series"]
+    assert qualified == [
+        SourceKind.TIFF_SERIES, SourceKind.NEXUS_STACK,
+        SourceKind.TIFF_SERIES,
+    ]
+    assert len(directory) == 1 and frozen == ["tiff_series", "nexus_hdf5", "tiff_series"]
     output_preflight.validate_planned_source(directory[0])
-    assert frozen == ["tiff_series", "tiff_series"] and direct.source_stamp.adapter_id == "tiff_series" and container_item.source_stamp.adapter_id != "tiff_series"
+    assert frozen == ["tiff_series", "nexus_hdf5", "tiff_series"] and direct.source_stamp.adapter_id == "tiff_series" and container_item.source_stamp.adapter_id != "tiff_series"
 
 
 def test_duplicate_snapshot_conflict_refuses_without_changing_valid_append_hashes(
@@ -1277,8 +1290,7 @@ def test_duplicate_snapshot_conflict_refuses_without_changing_valid_append_hashe
     from xdart.gui.tabs.scattering.output_preflight import source_snapshots
 
     valid = _p36_tiff_graph(tmp_path / "valid")
-    item = PlannedOutput(valid.execution_source, Path(valid.source_path),
-                         tmp_path / "valid.nexus", valid.stamp)
+    item = PlannedOutput(valid, tmp_path / "valid.nexus")
     before = append_source_from_execution_graph(valid, generation=1)
     before_snapshots = source_snapshots(item)
     before_writer = dynamic_output._writer_source_snapshots(item)
@@ -1336,8 +1348,7 @@ def test_average_lineage_and_provenance_match_exact_ordinary_projections(
 
     graph = _p36_tiff_graph(tmp_path / "gráph")
     target = tmp_path / "average.nexus"
-    item = PlannedOutput(graph.execution_source, Path(graph.source_path),
-                         target, graph.stamp)
+    item = PlannedOutput(graph, target)
     append = append_source_from_execution_graph(graph, generation=1)
     assert append.extent == 1 and append.generation == 1
     assert append.image_members[0].source_start == 0

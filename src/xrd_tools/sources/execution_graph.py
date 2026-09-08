@@ -564,7 +564,7 @@ def _finite_motors(values: dict[str, Any]) -> dict[str, float]:
     filtered = {key: value for key, value in values.items()
                 if not isinstance(value, (bool, np.bool_))}
     return {key: value for key, value in numeric_metadata(filtered).items()
-            if key and "roi" not in key.casefold() and "pd" not in key.casefold()}
+            if key and key != "Manual" and "roi" not in key.casefold() and "pd" not in key.casefold()}
 def _source_policy(source: SourceSpec, options: dict[str, Any]) -> tuple:
     excluded = {"files", "admitted_motor_values", "average_compact_series_v1"}
     return (str(source.uri), source.kind, None if source.metadata_uri is None else str(source.metadata_uri),
@@ -594,7 +594,10 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
         raise ValueError("TIFF source enumeration is empty or ambiguous")
     qualified.pop("admitted_motor_values", None)
     members: list[SourceFileState] = []; metadata_sources: list[AdmittedMetadataSource] = []
-    motor_rows: list[AdmittedMotorValue] = []; common: list[str] | None = None; layout = None
+    motor_rows: list[AdmittedMotorValue] = []
+    observed_motor_count = 0
+    selected_motor_complete = selected_motor is not None
+    common: list[str] | None = None; layout = None
     metadata_format = qualified.get("metadata_format", "auto")
     from xrd_tools.io.metadata import ImageMetadataRead, read_image_metadata_observed
     for index, value in enumerate(files):
@@ -609,24 +612,33 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
             if layout is not None and (current.shape, current.dtype) != (layout.shape, layout.dtype):
                 raise ValueError("Average TIFF member layouts differ")
             layout = current
+        _cancelled(cancelled)
         first = (ImageMetadataRead({}, None) if metadata_format is None else
                  read_image_metadata_observed(path, metadata_format, meta_dir=qualified.get("meta_dir"),
                     max_input_bytes=(1 << 16) if reader_binding else None))
+        _cancelled(cancelled)
         first_state = None if first.source_path is None else SourceFileState.capture(first.source_path)
+        _cancelled(cancelled)
         second = (ImageMetadataRead({}, None) if metadata_format is None else
                   read_image_metadata_observed(path, metadata_format, meta_dir=qualified.get("meta_dir"),
                     max_input_bytes=(1 << 16) if reader_binding else None))
+        _cancelled(cancelled)
         second_state = None if second.source_path is None else SourceFileState.capture(second.source_path)
+        _cancelled(cancelled)
         if ((first.source_path is None) != (second.source_path is None)
                 or first.source_path is not None and _path_key(_absolute(str(first.source_path)))
                 != _path_key(_absolute(str(second.source_path))) or first_state != second_state):
-            raise SourceRevisionChanged("TIFF metadata source changed during qualification")
+            raise SourceRevisionChanged(f"TIFF metadata source changed during admission: {path}")
         metadata = AdmittedMetadataSource(before.path, second_state); motors = _finite_motors(dict(second.values))
         common = list(motors) if common is None else [name for name in common if name in motors]
         motor = None
         if selected_motor is not None:
-            if selected_motor not in motors: raise ValueError("selected motor is absent from TIFF metadata")
-            motor = AdmittedMotorValue(before.path, selected_motor, float(motors[selected_motor]))
+            if selected_motor not in motors:
+                if reader_binding:
+                    raise ValueError("selected motor is absent from TIFF metadata")
+                selected_motor_complete = False
+            else:
+                motor = AdmittedMotorValue(before.path, selected_motor, float(motors[selected_motor]))
         after = SourceFileState.capture(path)
         if before != after or _path_key(_resolved(before)) != _path_key(_resolved(after)):
             raise SourceRevisionChanged("TIFF source changed during qualification")
@@ -638,10 +650,12 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
                 raise SourceRevisionChanged("TIFF source graph gained a member")
             _same(before, expected.stamp.members[index], "TIFF member changed")
             _same(metadata, expected.stamp.metadata_sources[index], "TIFF metadata source changed")
-            if motor is not None:
+            if motor is not None and expected.stamp.admitted_motor_values and selected_motor_complete:
                 if index >= len(expected.stamp.admitted_motor_values):
                     raise SourceRevisionChanged("TIFF selected motor graph changed")
                 _same(motor, expected.stamp.admitted_motor_values[index], "TIFF selected motor changed")
+        if motor is not None: observed_motor_count += 1
+    admitted_motor_rows = tuple(motor_rows) if selected_motor_complete else ()
     names = tuple(common or ()); scanned = names if reader_binding else None
     group = str(qualified.get("scan_name") or selected.stem)
     detector_shape = None if layout is None else tuple(layout.shape)
@@ -649,7 +663,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
     if expected is not None:
         stamp = expected.stamp
         if len(stamp.members) != len(files) or len(stamp.metadata_sources) != len(files) \
-                or len(stamp.admitted_motor_values) != (len(files) if selected_motor else 0):
+                or len(stamp.admitted_motor_values) != (observed_motor_count if selected_motor_complete else 0):
             raise SourceRevisionChanged("TIFF source graph cardinality changed")
         _same((stamp.adapter_id, stamp.frame_count, stamp.first_label), ("tiff_series", len(files), 1), "TIFF source scalar facts changed")
         _same((expected.source_path, expected.group_key, expected.motor_names,
@@ -662,13 +676,13 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
             dict(expected.execution_source.options)), "TIFF source read policy changed")
         return None
     qualified["files"] = tuple(value.path for value in members)
-    qualified["admitted_motor_values"] = tuple((value.source_path, value.motor, value.value) for value in motor_rows)
+    qualified["admitted_motor_values"] = tuple((value.source_path, value.motor, value.value) for value in admitted_motor_rows)
     execution = SourceSpec(source.uri, SourceKind.TIFF_SERIES,
         metadata_uri=source.metadata_uri, entry=source.entry, options=qualified)
     return freeze_source_execution_graph(source, execution, source_path=selected, group_key=group,
         reader_binding=reader_binding, file=members[0], adapter_id="tiff_series",
         frame_count=len(members), first_label=1, detector_shape=detector_shape,
-        native_dtype=native_dtype, members=tuple(members), admitted_motor_values=tuple(motor_rows),
+        native_dtype=native_dtype, members=tuple(members), admitted_motor_values=admitted_motor_rows,
         metadata_sources=tuple(metadata_sources), motor_names=names, scanned_motor_names=scanned)
 def _drain_average_qualification(
     handle: Any, slot: Any, completion: Callable[[], Any],

@@ -55,7 +55,9 @@ def _one_frame_dynamic_admission(tmp_path):
     )
     from xrd_tools.core.scan import Scan, ScanFrame, SourceKind
     from xrd_tools.sources.descriptor import ContainerDescriptor
-    from xrd_tools.sources.execution_graph import SourceExecutionStamp, SourceFileState
+    from xrd_tools.sources.execution_graph import (
+        SourceExecutionStamp, SourceFileState, freeze_source_execution_graph,
+    )
     from xrd_tools.sources.selection import image_series_spec
 
     source = tmp_path / "frame_0001.tif"
@@ -68,7 +70,14 @@ def _one_frame_dynamic_admission(tmp_path):
         frame_shape=(4, 4), dtype=np.dtype("uint16"),
     )
     item = PlannedOutput(
-        spec, source, tmp_path / "result.nexus", stamp, descriptor=descriptor,
+        freeze_source_execution_graph(
+            spec, spec, source_path=source, group_key=source.stem,
+            file=stamp.file, adapter_id=stamp.adapter_id,
+            frame_count=stamp.frame_count, first_label=stamp.first_label,
+            detector_shape=(4, 4), native_dtype=np.dtype("uint16").str,
+            members=stamp.members, descriptor=descriptor,
+        ),
+        tmp_path / "result.nexus",
     )
     decision = AdmittedOutput(
         item, OutputDisposition.WRITE, (1,), OutputFact(False),

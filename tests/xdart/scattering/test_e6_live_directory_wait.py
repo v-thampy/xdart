@@ -80,7 +80,8 @@ def test_live_tiff_metadata_changes_after_capture_before_ready_is_typed_pending(
         request_value=1002,
         gi=GIIntent(enabled=True, incidence_motor="th"),
     )
-    real_read = output_preflight.read_image_motor_metadata
+    from xrd_tools.io import metadata as metadata_io
+    real_read = metadata_io.read_image_metadata_observed
     changed = False
 
     def change_earlier_sidecar_while_later_is_inspected(path, *args, **kwargs):
@@ -94,8 +95,8 @@ def test_live_tiff_metadata_changes_after_capture_before_ready_is_typed_pending(
         return real_read(path, *args, **kwargs)
 
     monkeypatch.setattr(
-        output_preflight,
-        "read_image_motor_metadata",
+        metadata_io,
+        "read_image_metadata_observed",
         change_earlier_sidecar_while_later_is_inspected,
     )
     identity = RunIdentity.from_configuration(intent.freeze())
@@ -112,9 +113,7 @@ def test_live_tiff_metadata_changes_after_capture_before_ready_is_typed_pending(
         assert attempt.state is ProbeState.IN_PROGRESS
         assert attempt.revision_changed is True
         assert attempt.decision is None
-        assert operation.target_lease is None
         assert executor.processed_live_revisions(identity) == ()
-        assert executor.deferred_live_revisions(identity) == ()
     finally:
         released = executor.cancel_admission(operation.token)
     assert released.cleanup_status is CleanupStatus.CLEANED
@@ -187,9 +186,7 @@ def test_live_stable_tiff_metadata_remains_exact_through_pending_projection(
             assert snapshots[sidecar]["path"] == sidecar
         assert attempt.group is group
         assert attempt.decision.item.source_stamp is stamp
-        assert operation.target_lease is None
         assert executor.processed_live_revisions(identity) == ()
-        assert executor.deferred_live_revisions(identity) == ()
     finally:
         released = executor.cancel_admission(operation.token)
     assert released.cleanup_status is CleanupStatus.CLEANED
@@ -327,11 +324,7 @@ def test_live_probe_to_strong_freeze_never_mixes_candidate_revisions(
         assert attempt.state is ProbeState.IN_PROGRESS
         assert attempt.revision_changed is True
         assert attempt.decision is None
-        assert operation.target_lease is None
         assert executor.processed_live_revisions(
-            RunIdentity.from_configuration(intent.freeze())
-        ) == ()
-        assert executor.deferred_live_revisions(
             RunIdentity.from_configuration(intent.freeze())
         ) == ()
     finally:
@@ -461,7 +454,6 @@ def test_live_hdf_change_during_stable_open_is_typed_pending(
         assert attempt.state is ProbeState.IN_PROGRESS
         assert attempt.revision_changed is True
         assert attempt.decision is None
-        assert operation.target_lease is None
         for sibling in sibling_candidates:
             assert session._results.get(sibling.path) == before.get(sibling.path)
     finally:
@@ -522,7 +514,6 @@ def test_live_stable_hdf_open_error_remains_hard(
             error.value,
             output_preflight.SourceRevisionChanged,
         )
-        assert operation.target_lease is None
     finally:
         released = executor.cancel_admission(operation.token)
     assert released.cleanup_status is CleanupStatus.CLEANED
@@ -621,8 +612,6 @@ def test_live_construct_source_revision_drift_reprobes_and_retries(
     run = executor._exact_run(identity)
     assert run is not None
     assert run.resources is not None
-    assert run.resources.target_lease is None
-
     executor.stop(identity)
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:

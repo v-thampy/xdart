@@ -1474,7 +1474,7 @@ def test_dependency_graph_state_cannot_rebaseline_after_jit_freeze(
     def racing_items(configuration, plan, *, cancelled):
         nonlocal mutated
         result = original_items(configuration, plan, cancelled=cancelled)
-        graph = output_preflight._prepared_source_execution(result[0])
+        graph = result[0].graph
         assert str(sidecar.resolve()) in {
             target.resolved_path for target in graph.stamp.canonical_targets
         }
@@ -1862,6 +1862,7 @@ def test_tiff_admission_cancels_after_first_metadata_read(
     tmp_path: Path,
 ) -> None:
     from xdart.gui.tabs.scattering import output_preflight
+    from xrd_tools.io import metadata as metadata_io
 
     images = tuple(tmp_path / f"scan_{index:04d}.tif" for index in range(3))
     for index, image in enumerate(images):
@@ -1879,8 +1880,8 @@ def test_tiff_admission_cancels_after_first_metadata_read(
         return ImageMetadataRead({}, None)
 
     monkeypatch.setattr(
-        output_preflight,
-        "read_image_motor_metadata",
+        metadata_io,
+        "read_image_metadata_observed",
         cancel_first,
     )
     sessions: list[DirectoryIndexSession] = []
@@ -1905,11 +1906,12 @@ def test_tiff_admission_binds_values_to_stable_second_sidecar_read(
     tmp_path: Path,
 ) -> None:
     from xdart.gui.tabs.scattering import output_preflight
+    from xrd_tools.io import metadata as metadata_io
 
     image = tmp_path / "scan_0001.tif"
     _write_tiff(image, 1)
     _write_sidecar(image, ("th=0.1", "exposure=1", "sequence=1"))
-    real_read = output_preflight.read_image_motor_metadata
+    real_read = metadata_io.read_image_metadata_observed
     calls = 0
 
     def replace_after_discovery(*args, **kwargs):
@@ -1924,8 +1926,8 @@ def test_tiff_admission_binds_values_to_stable_second_sidecar_read(
         return observed
 
     monkeypatch.setattr(
-        output_preflight,
-        "read_image_motor_metadata",
+        metadata_io,
+        "read_image_metadata_observed",
         replace_after_discovery,
     )
     sessions: list[DirectoryIndexSession] = []
@@ -1948,11 +1950,12 @@ def test_tiff_admission_rejects_sidecar_mutation_during_guarded_read(
     tmp_path: Path,
 ) -> None:
     from xdart.gui.tabs.scattering import output_preflight
+    from xrd_tools.io import metadata as metadata_io
 
     image = tmp_path / "scan_0001.tif"
     _write_tiff(image, 1)
     _write_sidecar(image, ("th=0.1", "exposure=1", "sequence=1"))
-    real_read = output_preflight.read_image_motor_metadata
+    real_read = metadata_io.read_image_metadata_observed
     calls = 0
 
     def replace_during_guarded_read(*args, **kwargs):
@@ -1967,8 +1970,8 @@ def test_tiff_admission_rejects_sidecar_mutation_during_guarded_read(
         return observed
 
     monkeypatch.setattr(
-        output_preflight,
-        "read_image_motor_metadata",
+        metadata_io,
+        "read_image_metadata_observed",
         replace_during_guarded_read,
     )
     sessions: list[DirectoryIndexSession] = []
@@ -2123,6 +2126,7 @@ def test_mixed_tiff_metadata_rejects_missing_selected_gi_motor_but_manual_is_exa
     tmp_path: Path,
 ) -> None:
     from xdart.gui.tabs.scattering import source_metadata
+    from xrd_tools.io import metadata as metadata_io
 
     first = tmp_path / "scan_0001.tif"
     second = tmp_path / "scan_0002.tif"
@@ -2140,7 +2144,7 @@ def test_mixed_tiff_metadata_rejects_missing_selected_gi_motor_but_manual_is_exa
 
     monkeypatch.setattr(source_metadata, "read_image_metadata", metadata)
     monkeypatch.setattr(
-        source_metadata,
+        metadata_io,
         "read_image_metadata_observed",
         lambda path, metadata_format, **_kwargs: ImageMetadataRead(
             metadata(Path(path), metadata_format),
@@ -2188,6 +2192,7 @@ def test_tiff_preview_and_admission_share_ordered_member_intersection(
     tmp_path: Path,
 ) -> None:
     from xdart.gui.tabs.scattering import source_metadata
+    from xrd_tools.io import metadata as metadata_io
 
     first = tmp_path / "scan_0001.tif"
     second = tmp_path / "scan_0002.tif"
@@ -2213,7 +2218,7 @@ def test_tiff_preview_and_admission_share_ordered_member_intersection(
     )
     calls: list[Path] = []
     original = source_metadata.read_image_metadata
-    original_observed = source_metadata.read_image_metadata_observed
+    original_observed = metadata_io.read_image_metadata_observed
 
     def counted(path: Path, metadata_format: str | None):
         calls.append(Path(path))
@@ -2221,18 +2226,15 @@ def test_tiff_preview_and_admission_share_ordered_member_intersection(
 
     def counted_observed(
         path: Path,
-        metadata_format: str | None,
+        metadata_format: str | None = None,
         **kwargs,
     ) -> ImageMetadataRead:
         calls.append(Path(path))
-        return original_observed(path, metadata_format, **kwargs)
+        return original_observed(
+            path, kwargs.pop("meta_format", metadata_format), **kwargs,
+        )
 
     monkeypatch.setattr(source_metadata, "read_image_metadata", counted)
-    monkeypatch.setattr(
-        source_metadata,
-        "read_image_metadata_observed",
-        counted_observed,
-    )
     preview = FilesystemSourceAdapter().preview_motors(
         SourceObservationRequest(701, 0, source)
     )
@@ -2241,6 +2243,11 @@ def test_tiff_preview_and_admission_share_ordered_member_intersection(
     assert calls == [first, second]
 
     calls.clear()
+    monkeypatch.setattr(
+        metadata_io,
+        "read_image_metadata_observed",
+        counted_observed,
+    )
     receipt, session = admit_with_session(_tiff_directory_start(tmp_path))
     try:
         assert receipt.gi_motor_choices == preview.gi_motor_choices

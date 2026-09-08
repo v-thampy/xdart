@@ -711,7 +711,7 @@ def test_p1b_b02_overwrite_native_durable_terminal(
         oversized_item = replace(
             large_decision.item,
             target=oversized_target,
-            source_stamp=oversized_stamp,
+            graph=replace(large_decision.item.graph, stamp=oversized_stamp),
         )
         with monkeypatch.context() as bounded:
             bounded.setattr(

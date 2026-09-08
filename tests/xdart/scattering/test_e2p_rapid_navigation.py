@@ -242,22 +242,23 @@ def _accepted_admission(
     assert len(states) == _FRAME_COUNT
     state = states[0]
     target = Path(capture.intent_snapshot.thaw().save_path)
-    item = PlannedOutput(
-        candidate.source,
-        selected,
-        target,
-        SourceExecutionStamp(
-            state,
-            "tiff_series",
-            len(states),
-            1,
-            states,
-            metadata_sources=tuple(
-                AdmittedMetadataSource(member.path, None)
-                for member in states
-            ),
+    stamp = SourceExecutionStamp(
+        state, "tiff_series", len(states), 1, states,
+        metadata_sources=tuple(
+            AdmittedMetadataSource(member.path, None) for member in states
         ),
-        motor_names=(),
+    )
+    from xrd_tools.sources.execution_graph import freeze_source_execution_graph
+    item = PlannedOutput(
+        freeze_source_execution_graph(
+            candidate.source, candidate.source, source_path=selected,
+            group_key=selected.stem, file=stamp.file,
+            adapter_id=stamp.adapter_id, frame_count=stamp.frame_count,
+            first_label=stamp.first_label, detector_shape=None,
+            native_dtype=None, members=stamp.members,
+            metadata_sources=stamp.metadata_sources, motor_names=(),
+        ),
+        target,
     )
     return AdmissionReceipt(
         capture.request_id,
