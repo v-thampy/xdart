@@ -206,13 +206,9 @@ def _seed_label(
         tuple(modes),
         scalar_row.active_mode_1d,
     )
-    receipt = cache.begin_store_1d_label(
-        catalog, rows, ordinal, label,
-    )
-    if receipt.operation is not None:
-        assert receipt.operation.run() == "accepted"
+    keys = cache.store_1d_label(catalog, rows, ordinal, label)
     with hydration._lock:
-        hydration._known_keys[(ordinal, label)] = tuple(receipt.keys)
+        hydration._known_keys[(ordinal, label)] = tuple(keys)
     return arrays
 
 
@@ -934,8 +930,7 @@ def test_wrong_key_live_borrow_is_adopted_for_exact_cleanup(
     _seed_label(scope[7], scope[5], scope[4], 1, 1)
     foreign = Browse1DCache(1 << 20)
     name = browse_1d_row_name("q", "axis")
-    operation = foreign.begin_store(9, 9, ((name, _readonly([1.0, 2.0])),))
-    assert operation.run() == "accepted"
+    assert foreign.store_rows(9, 9, ((name, _readonly([1.0, 2.0])),)) == "accepted"
     wrong = foreign.borrow(9, 9, name)
     real_borrow = Browse1DCache.borrow
 
@@ -981,9 +976,9 @@ def test_multi_frame_eviction_during_acquire_returns_no_partial_payload(
         calls.append((frame, label, name))
         if cache is scope[5] and len(calls) == 3:
             competitor = _readonly(np.arange(6, dtype=np.float64))
-            assert cache.begin_store(
+            assert cache.store_rows(
                 99, 99, (("competitor", competitor),),
-            ).run() == "accepted"
+            ) == "accepted"
         return real_borrow(cache, frame, label, name)
 
     monkeypatch.setattr(Browse1DCache, "borrow", borrow)

@@ -309,9 +309,9 @@ def test_partial_repair_substitutes_exact_borrowed_survivor(tmp_path) -> None:
     outside = cache.borrow(1, 1, axis_name)
     survivor = outside.array
     competitor = _readonly(np.arange(9, dtype=np.float64))
-    assert cache.begin_store(
+    assert cache.store_rows(
         99, 99, (("competitor", competitor),),
-    ).run() == "accepted"
+    ) == "accepted"
     assert tuple(key.name for key in cache.resident_keys) == (
         axis_name, "competitor",
     )
@@ -393,39 +393,6 @@ def test_cancelled_a_then_b_then_fresh_a_runs_only_latest_a(tmp_path) -> None:
     }
     assert (1, 1) in coordinates
     assert (2, 2) not in coordinates
-    assert not lane.polling_needed()
-    assert lane.release()
-    cache.close()
-
-
-def test_rolled_back_cache_operation_is_clean_terminal_failure(
-    tmp_path, monkeypatch,
-) -> None:
-    from xdart.gui.tabs.scattering.browse_1d_hydration import (
-        Browse1DHydrationLane,
-        Browse1DHydrationStatus,
-    )
-    from xrd_tools.io import Browse1DCacheOperation
-
-    context, selection, frames, catalog, cache = _scope(tmp_path, 1)
-    factory = _ReaderFactory(catalog)
-    lane = Browse1DHydrationLane(context, open_reader=factory)
-    operations = []
-
-    def roll_back(operation):
-        operations.append(operation)
-        return operation.rollback()
-
-    monkeypatch.setattr(Browse1DCacheOperation, "run", roll_back)
-    assert lane.submit(selection, frames) is not None
-    _wait_worker_idle(lane)
-    completions = _take_completions(lane)
-    assert len(completions) == 1
-    assert completions[0].status is Browse1DHydrationStatus.FAILED
-    assert operations and operations[0].terminal_direction == "rolled-back"
-    assert cache.resident_keys == ()
-    assert cache.outstanding_borrows == 0
-    assert not lane.consume_repaint()
     assert not lane.polling_needed()
     assert lane.release()
     cache.close()
@@ -682,61 +649,6 @@ def test_post_read_artifact_drift_refuses_cache_publication(tmp_path) -> None:
     assert factory.read_labels == [(1,)]
     assert cache.resident_keys == ()
     assert lane.release()
-    cache.close()
-
-
-def test_release_retains_exact_failed_operation_until_worker_recovery(
-    tmp_path, monkeypatch,
-) -> None:
-    from xdart.gui.tabs.scattering.browse_1d_hydration import (
-        Browse1DHydrationLane,
-    )
-    from xrd_tools.io import Browse1DCacheOperation
-
-    context, selection, frames, catalog, cache = _scope(tmp_path, 1)
-    factory = _ReaderFactory(catalog)
-    lane = Browse1DHydrationLane(context, open_reader=factory)
-    allow_recovery = Event()
-    recovery_attempted = Event()
-    seen = []
-    real_run = Browse1DCacheOperation.run
-
-    def fail_run(operation):
-        seen.append(operation)
-        if allow_recovery.is_set():
-            return real_run(operation)
-        raise RuntimeError("injected operation run cut")
-
-    def recover(operation):
-        seen.append(operation)
-        recovery_attempted.set()
-        if not allow_recovery.is_set():
-            raise RuntimeError("held operation recovery")
-        return real_run(operation)
-
-    monkeypatch.setattr(Browse1DCacheOperation, "run", fail_run)
-    monkeypatch.setattr(Browse1DCacheOperation, "recover", recover)
-    lane.submit(selection, frames)
-    assert recovery_attempted.wait(2.0)
-    deadline = monotonic() + 2.0
-    while monotonic() < deadline:
-        active = lane._active
-        if active is not None and active.cleanup_pending and not active.running:
-            break
-        sleep(0.001)
-    else:
-        raise AssertionError("exact failed operation was not retained")
-    operation = lane._active.operation
-    assert type(operation) is Browse1DCacheOperation
-    assert seen and all(item is operation for item in seen)
-    assert not lane.release()
-    allow_recovery.set()
-    deadline = monotonic() + 2.0
-    while monotonic() < deadline and not lane.release():
-        sleep(0.001)
-    assert lane.release()
-    assert seen and all(item is operation for item in seen)
-    assert len(cache.resident_keys) == 2
     cache.close()
 
 

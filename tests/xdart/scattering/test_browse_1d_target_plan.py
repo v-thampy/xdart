@@ -135,16 +135,14 @@ def _seed(rig, owner, frames) -> None:
             ),
             "q",
         )
-        receipt = cache.begin_store_1d_label(
+        keys = cache.store_1d_label(
             catalog,
             rows,
             frame.work_ordinal,
             label,
         )
-        if receipt.operation is not None:
-            assert receipt.operation.run() == "accepted"
         with lane._lock:
-            lane._known_keys[(frame.work_ordinal, label)] = tuple(receipt.keys)
+            lane._known_keys[(frame.work_ordinal, label)] = tuple(keys)
 
 
 def _close(rig, owner=None) -> None:

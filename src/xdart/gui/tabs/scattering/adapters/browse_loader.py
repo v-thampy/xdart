@@ -229,11 +229,10 @@ class BrowseLoader:
 
     @staticmethod
     def _settle_cache(cache: Browse1DCache) -> None:
-        """Recover and close one exact cache without a loader/context lock."""
+        """Close one exact cache without a loader/context lock."""
 
         if type(cache) is not Browse1DCache:
             raise TypeError("browse cleanup requires an exact Browse1DCache")
-        cache.recover()
         cache.close()
         if cache.phase is not Browse1DCachePhase.CLOSED:
             raise RuntimeError("browse 1-D cache close did not settle")

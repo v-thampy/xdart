@@ -22,8 +22,6 @@ from xdart.modules.display_context import (
 from xrd_tools.core import Axis
 from xrd_tools.io import (
     Browse1DCache,
-    Browse1DCacheOperation,
-    Browse1DLabelStoreCustodyError,
     Browse1DRowKey,
     Frame1DModeRows,
     Frame1DRows,
@@ -230,8 +228,7 @@ class _HydrationTask:
 
     __slots__ = (
         "request", "signature", "cancelled", "thread", "running",
-        "reader", "reader_entered", "operation", "borrows", "status",
-        "pending_coordinate", "pending_keys", "diagnostic",
+        "reader", "reader_entered", "borrows", "status", "diagnostic",
         "cleanup_pending",
     )
 
@@ -247,11 +244,8 @@ class _HydrationTask:
         self.running = False
         self.reader: object | None = None
         self.reader_entered = False
-        self.operation: Browse1DCacheOperation | None = None
         self.borrows: list[object] = []
         self.status: Browse1DHydrationStatus | None = None
-        self.pending_coordinate: tuple[int, int] | None = None
-        self.pending_keys: tuple[object, ...] = ()
         self.diagnostic = ""
         self.cleanup_pending = False
 
@@ -795,25 +789,6 @@ class Browse1DHydrationLane:
             rows.primary_mode,
         )
 
-    def _settle_operation(self, task: _HydrationTask) -> str | None:
-        operation = task.operation
-        if operation is None:
-            return None
-        try:
-            direction = operation.run()
-        except BaseException:
-            direction = operation.recover()
-        if direction not in {"accepted", "rolled-back"}:
-            raise RuntimeError("Browse 1-D cache operation did not accept")
-        task.operation = None
-        coordinate = task.pending_coordinate
-        if coordinate is not None and direction == "accepted":
-            with self._lock:
-                self._known_keys[coordinate] = task.pending_keys
-        task.pending_coordinate = None
-        task.pending_keys = ()
-        return direction
-
     @staticmethod
     def _release_borrows(task: _HydrationTask) -> None:
         while task.borrows:
@@ -840,27 +815,12 @@ class Browse1DHydrationLane:
     ) -> None:
         self._borrow_survivors(task, target)
         singleton = self._singleton_rows(task, rows, target)
-        try:
-            receipt = task.request.cache.begin_store_1d_label(
-                task.request.catalog,
-                singleton,
-                target.ordinal,
-                target.label,
-            )
-        except Browse1DLabelStoreCustodyError as error:
-            task.operation = error.operation
-            raise
-        task.operation = receipt.operation
-        task.pending_coordinate = (target.ordinal, target.label)
-        task.pending_keys = tuple(receipt.keys)
-        direction = self._settle_operation(task)
-        if direction not in {None, "accepted"}:
-            raise RuntimeError("Browse 1-D cache operation rolled back")
-        keys = tuple(receipt.keys)
+        keys = task.request.cache.store_1d_label(
+            task.request.catalog, singleton, target.ordinal, target.label,
+            cancelled=lambda: self._checkpoint(task),
+        )
         with self._lock:
             self._known_keys[(target.ordinal, target.label)] = keys
-        task.pending_coordinate = None
-        task.pending_keys = ()
         self._protect_keys(task, target, keys)
 
     def _protect_complete_targets(
@@ -943,7 +903,6 @@ class Browse1DHydrationLane:
 
     def _cleanup_task(self, task: _HydrationTask) -> bool:
         try:
-            self._settle_operation(task)
             self._release_borrows(task)
             self._close_reader(task)
         except BaseException as error:

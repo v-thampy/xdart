@@ -50,15 +50,6 @@ _EXPORTS = {
     "apply_rotation": ("xrd_tools.io.image", "apply_rotation"),
     "begin_same_run_lineage": ("xrd_tools.io.append", "begin_same_run_lineage"),
     "Browse1DCache": ("xrd_tools.io.browse_1d_cache", "Browse1DCache"),
-    "Browse1DCacheOperation": (
-        "xrd_tools.io.browse_1d_cache", "Browse1DCacheOperation",
-    ),
-    "Browse1DLabelStoreReceipt": (
-        "xrd_tools.io.browse_1d_cache", "Browse1DLabelStoreReceipt",
-    ),
-    "Browse1DLabelStoreCustodyError": (
-        "xrd_tools.io.browse_1d_cache", "Browse1DLabelStoreCustodyError",
-    ),
     "Browse1DRowKey": (
         "xrd_tools.io.browse_1d_cache", "Browse1DRowKey",
     ),
