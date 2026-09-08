@@ -181,6 +181,46 @@ class _FrameSelectionCadenceFilter(QtCore.QObject):
         return False
 
 
+class _ArtifactNavigationFilter(QtCore.QObject):
+    """Plain arrows visit adjacent files; directory entry is explicit."""
+
+    def __init__(self, view, activate_directory):
+        super().__init__(view)
+        self._view = view
+        self._activate_directory = activate_directory
+
+    def eventFilter(self, watched, event) -> bool:
+        view = self._view
+        if event.type() == QtCore.QEvent.Type.MouseButtonDblClick:
+            index = view.indexAt(event.position().toPoint())
+            item = view.item(index.row()) if index.isValid() else None
+            if item is not None and item.data(_DIRECTORY_ROLE):
+                view.setCurrentRow(index.row())
+                self._activate_directory(item)
+                return True
+            return False
+        if (event.type() == QtCore.QEvent.Type.KeyPress
+                and event.key() in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter)):
+            item = view.currentItem()
+            if item is not None and item.data(_DIRECTORY_ROLE):
+                self._activate_directory(item)
+                return True
+            return False
+        if (event.type() != QtCore.QEvent.Type.KeyPress
+                or event.modifiers() != QtCore.Qt.KeyboardModifier.NoModifier
+                or event.key() not in (QtCore.Qt.Key.Key_Up, QtCore.Qt.Key.Key_Down)):
+            return False
+        step = -1 if event.key() == QtCore.Qt.Key.Key_Up else 1
+        row = view.currentRow()
+        if row < 0:
+            row = view.count() if step < 0 else -1
+        for index in range(row + step, view.count() if step > 0 else -1, step):
+            if not view.item(index).data(_DIRECTORY_ROLE):
+                view.setCurrentRow(index)
+                break
+        return True
+
+
 class _ElidedDirectoryLabel(QtWidgets.QLabel):
     _MAX_GLYPHS = 30
 
@@ -285,6 +325,11 @@ class BrowserView(QtWidgets.QFrame):
         scan_labels_layout.addWidget(self.directory_label, 1)
         self.scans = QtWidgets.QListWidget()
         self.scans.setObjectName("e3ScanList")
+        self._artifact_navigation_filter = _ArtifactNavigationFilter(
+            self.scans, self._activate_directory,
+        )
+        self.scans.installEventFilter(self._artifact_navigation_filter)
+        self.scans.viewport().installEventFilter(self._artifact_navigation_filter)
         scan_pane_layout.addWidget(scan_labels)
         scan_pane_layout.addWidget(self.scans, 1)
 
@@ -341,6 +386,8 @@ class BrowserView(QtWidgets.QFrame):
         layout.addLayout(actions)
 
         self.scans.itemSelectionChanged.connect(self._scan_selected)
+        self.scans.itemClicked.connect(self._activate_directory)
+        self.scans.itemActivated.connect(self._activate_directory)
         self.frames.selectionModel().selectionChanged.connect(
             self._frames_selected
         )
@@ -715,13 +762,6 @@ class BrowserView(QtWidgets.QFrame):
             item for item in items if item.data(_DIRECTORY_ROLE)
         )
         if directories:
-            if len(items) != 1:
-                return
-            self._emit(
-                ShellCommandKind.SELECT_SCAN,
-                directories[0].data(_USER_ROLE),
-                path=("directory",),
-            )
             return
         artifacts = tuple(
             item.data(_USER_ROLE)
@@ -775,6 +815,17 @@ class BrowserView(QtWidgets.QFrame):
             frame=current, frames=frames, intent=FrameSelectionIntent.EXACT,
         ))
         self._frame_selection_coalescer.trigger()
+
+    def _activate_directory(self, item) -> None:
+        if item.data(_DIRECTORY_ROLE) and len(self.scans.selectedItems()) == 1:
+            # Directory reconciliation replaces this native item. Capture only
+            # its value and let the input event finish before changing models.
+            directory = item.data(_USER_ROLE)
+            QtCore.QTimer.singleShot(
+                0, self, lambda: self._emit(
+                    ShellCommandKind.SELECT_SCAN, directory, path=("directory",),
+                ),
+            )
 
     def _frames_selected(
         self,

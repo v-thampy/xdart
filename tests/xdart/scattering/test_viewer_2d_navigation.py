@@ -145,7 +145,9 @@ def test_same_hdf_frame_step_retires_arrays_but_keeps_viewer_chrome(viewer, monk
     frame_items = tuple(view.frame_selector.itemData(i) for i in range(view.frame_selector.count()))
     selector_operations = view._selector_operations
     view.raw.canvas.imageViewBox.setRange(xRange=(3, 10), yRange=(2, 8), padding=0)
-    prior_range = view.raw.canvas.imageViewBox.viewRange()
+    # Keep the operator's requested rectangle. Locked aspect ratio expands
+    # the visible range when histogram tick labels change the viewport width.
+    prior_target = view.raw.canvas.imageViewBox.targetRect()
     try:
         QtTest.QTest.mouseClick(view.next_frame, QtCore.Qt.LeftButton)
         _wait(page, app, entered.is_set)
@@ -157,14 +159,14 @@ def test_same_hdf_frame_step_retires_arrays_but_keeps_viewer_chrome(viewer, monk
         assert view.raw.isVisible() and view.image_splitter.isVisible()
         assert tuple(view.frame_selector.itemData(i) for i in range(view.frame_selector.count())) == frame_items
         assert view._selector_operations == selector_operations
-        np.testing.assert_allclose(view.raw.canvas.imageViewBox.viewRange(), prior_range)
+        assert view.raw.canvas.imageViewBox.targetRect() == prior_target
         release.set()
         _wait(page, app, lambda: controller.viewer_2d_frame is not None
               and controller.viewer_2d_frame.label == 1
               and view._viewer_2d_payload is controller.viewer_2d_frame.array)
         assert view.raw.image is image_item
         assert view._selector_operations == selector_operations
-        np.testing.assert_allclose(view.raw.canvas.imageViewBox.viewRange(), prior_range)
+        assert view.raw.canvas.imageViewBox.targetRect() == prior_target
         np.testing.assert_array_equal(controller.viewer_2d_frame.array, values[1])
     finally:
         release.set()

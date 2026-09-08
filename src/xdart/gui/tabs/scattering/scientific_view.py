@@ -283,6 +283,7 @@ class ScientificView(QtWidgets.QFrame):
         self._processing_mode = ""
         self._viewer_2d_payload = None
         self._viewer_2d_known_empty = False
+        self._viewer_2d_shape = None
         self._rendered_detector_source = "none"
         self._expected_background_key = self._rendered_background_key = None
         self.raw_popup_dialog = None
@@ -818,8 +819,11 @@ class ScientificView(QtWidgets.QFrame):
             entering_viewer = self._processing_mode != "2D Viewer"
             self._processing_mode = "2D Viewer"
             if state.heavy is None:
-                cleared = ScientificView.clear_viewer_2d(self, None, failure=True)
-                if not cleared:
+                if self._viewer_2d_known_empty and self._frame_keys:
+                    blocker = QtCore.QSignalBlocker(self.frame_selector)
+                    self._rebuild_frames(navigation.frames, navigation.current)
+                    del blocker
+                elif not ScientificView.clear_viewer_2d(self, None, failure=True):
                     raise RuntimeError("2D Viewer render failed.") from None
                 self.title.setText(state.title)
                 self.status.setText(state.status)
@@ -844,10 +848,20 @@ class ScientificView(QtWidgets.QFrame):
                     raise ValueError("viewer reset is incomplete")
                 blockers = [QtCore.QSignalBlocker(widget) for widget in (
                     self.frame_selector, self.color_map, self.log_scale)]
+                retained_range = (
+                    self.raw.canvas.imageViewBox.targetRect()
+                    if self._viewer_2d_known_empty and self._frame_keys
+                    and getattr(self, "_viewer_2d_shape", None) == heavy.raw.shape
+                    else None
+                )
                 self.raw.render(heavy.raw, detector_shape=heavy.detector_shape,
                                 color_map=state.color_map,
                                 log_scale=state.log_scale,
                                 level_scan_token=(id(frame), id(heavy.raw)))
+                if retained_range is not None:
+                    self.raw.canvas.imageViewBox.setRange(
+                        rect=retained_range, padding=0,
+                    )
                 self._rendered_detector_source = detector_source
                 self.raw.canvas.imageItem.pos_label.setText("")
                 self.cake.canvas.imageItem.pos_label.setText("")
@@ -858,6 +872,7 @@ class ScientificView(QtWidgets.QFrame):
                 set_combo_value(self.color_map, state.color_map, fallback="Default")
                 self.log_scale.setChecked(state.log_scale)
                 self._viewer_2d_payload = heavy.raw
+                self._viewer_2d_shape = heavy.raw.shape
                 self._viewer_2d_known_empty = False
                 self.title.setText(state.title)
                 self.status.setText(state.status)
@@ -1070,9 +1085,15 @@ class ScientificView(QtWidgets.QFrame):
         self.progress.setText(f"{completed}/{total}")
         del blockers
 
-    def clear_viewer_2d(self, request, *, failure=False):
+    def clear_viewer_2d(self, request, *, failure=False, preserve_navigation=False):
         if not failure and type(request) is not Viewer2DRendererClearRequest:
             return None
+        keep_chrome = bool(
+            preserve_navigation and not failure and self._processing_mode == "2D Viewer"
+            and self._current_key is not None
+            and request.context_token == self._current_key.run_identity.fingerprint
+            and request.label == self._current_key.local_frame_label
+        )
         cleared, canonical = True, self._viewer_2d_payload
         def scrub(target, name, value=None, *, read=False):
             nonlocal cleared
@@ -1111,9 +1132,12 @@ class ScientificView(QtWidgets.QFrame):
             ):
                 scrub(target, name, value)
             scrub(histogram, "setLevels", (0.0, 1.0))
-            scrub(view, "setRange", QtCore.QRectF(0.0, 0.0, 1.0, 1.0))
+            if not keep_chrome:
+                scrub(view, "setRange", QtCore.QRectF(0.0, 0.0, 1.0, 1.0))
             for method in ("resetTransform", "prepareGeometryChange",
                            "informViewBoundsChanged", "update"):
+                if keep_chrome and method == "resetTransform":
+                    continue
                 scrub(image, method)
         for root in (self.curve, self.waterfall):
             scrub(root, "clear")
@@ -1122,8 +1146,9 @@ class ScientificView(QtWidgets.QFrame):
         except Exception:
             blocker = None
             cleared = False
-        scrub(self.frame_selector, "clear")
-        scrub(self.frame_selector, "setCurrentIndex", -1)
+        if not keep_chrome:
+            scrub(self.frame_selector, "clear")
+            scrub(self.frame_selector, "setCurrentIndex", -1)
         del blocker
         bottom = scrub(self.vertical_splitter, "widget", 1)
         for widget in (
@@ -1131,9 +1156,11 @@ class ScientificView(QtWidgets.QFrame):
             self.image_axis, self.share_axis, self.slice,
             self.slice_center, self.slice_width, self.pin,
         ):
-            scrub(widget, "hide")
+            if not keep_chrome:
+                scrub(widget, "hide")
         for name, value in (
             ("_viewer_2d_payload", None), ("_frame_keys", ()), ("_current_key", None),
+            ("_viewer_2d_shape", None),
             ("_rendered_detector_source", "none"),
             ("_selected_keys", ()),
             ("_trace_selection_keys", ()), ("_trace_history_keys", ()), ("_rendered_trace_keys", ()),
@@ -1149,6 +1176,11 @@ class ScientificView(QtWidgets.QFrame):
             ("_waterfall_render_contract", None), ("_rendered_image_axis", None), ("_rendered_cake_axis_key", None),
             ("_rendered_cake_x_axis", None), ("_rendered_cake_y_axis", None), ("_rendered_trace_axis_key", None),
         ):
+            if keep_chrome and name in {
+                "_frame_keys", "_current_key", "_selected_keys", "_label_indices",
+                "_viewer_2d_shape",
+            }:
+                continue
             scrub(self, name, value)
         for widget, method, value in (
             (self.previous_frame, "setEnabled", False),
@@ -1160,7 +1192,8 @@ class ScientificView(QtWidgets.QFrame):
                 if failure else "")),
             (self.progress, "setText", "0/0"),
         ):
-            scrub(widget, method, value)
+            if not keep_chrome:
+                scrub(widget, method, value)
         self._viewer_2d_known_empty = bool(cleared)
         return cleared if failure else Viewer2DRendererClearReceipt(request, cleared)
 

@@ -4196,7 +4196,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             current = self._context_controller.navigation.current
             if (current is not frame
                     and self._context_controller.viewer_2d_frame is not None
-                    and not self._clear_viewer_2d_renderer()):
+                    and not self._clear_viewer_2d_renderer(preserve_navigation=True)):
                 return
             self._context_controller.select_viewer_2d_frame(
                 frame.local_frame_label)
@@ -6789,14 +6789,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         context = self._context_controller.viewer_2d_context
         return "" if context is None else os.path.dirname(context.original_path)
 
-    def _clear_viewer_2d_renderer(self, *, close=False) -> bool:
+    def _clear_viewer_2d_renderer(self, *, close=False, preserve_navigation=False) -> bool:
         self._last_scientific_projection = None
         request = self._context_controller.begin_viewer_2d_renderer_clear()
         if request is None:
             cleared = self._context_controller.viewer_2d_frame is None
         else:
             try:
-                receipt = self._shell.scientific.clear_viewer_2d(request)
+                receipt = (
+                    self._shell.scientific.clear_viewer_2d(request, preserve_navigation=True)
+                    if preserve_navigation and not close
+                    else self._shell.scientific.clear_viewer_2d(request)
+                )
             except Exception:
                 return False
             try:

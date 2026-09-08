@@ -491,9 +491,15 @@ class ContextProjection:
                 selected_artifacts=(
                     viewer_1d_selected_paths if viewer_1d_selected else ()
                 ),
-                current_artifact=viewer_1d_current_path,
+                current_artifact=(
+                    next((os.path.abspath(context.original_path)
+                          for context in contexts
+                          if type(context) is Viewer2DContext
+                          and selection.names(context)), "")
+                    if viewer_2d_selected else viewer_1d_current_path
+                ),
                 multi_artifact_selection=tool is Tool.XYE_VIEWER,
-                show_all_frames=viewer_1d_selected,
+                show_all_frames=viewer_selected,
             ),
             scientific,
             viewer_navigation if viewer_selected else navigation,

@@ -895,6 +895,7 @@ def test_catalog_directory_fact_reaches_exact_activation_command() -> None:
             QtTest.QTest.mouseClick(
                 browser.scans.viewport(), QtCore.Qt.LeftButton, pos=point,
             )
+            app.processEvents()
             assert commands[-1] == ShellCommand(
                 ShellCommandKind.SELECT_SCAN,
                 projected.scans[row].identifier,
