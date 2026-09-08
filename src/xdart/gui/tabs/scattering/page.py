@@ -4955,9 +4955,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         """Load a clean run's exact published artifact through Browse.
 
         Reintegration deliberately accepts only a stable authenticated Browse
-        context.  A successful run already published that artifact, so follow
-        it through the existing asynchronous BrowseLoader instead of requiring
-        a redundant browser click or weakening the reintegration contract.
+        context.  A finished run or a stopped run's saved prefix can follow
+        the existing asynchronous BrowseLoader without a redundant browser
+        click or a weaker external-tool/reintegration qualification.
         """
 
         controller = self._context_controller
@@ -4967,7 +4967,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         run_identity = event.run_identity
         if (
             was_batch
-            or event.kind is not StandardEventKind.FINISHED
+            or event.kind not in {StandardEventKind.FINISHED, StandardEventKind.STOPPED}
+            or event.kind is StandardEventKind.STOPPED
+            and (event.artifact_completed <= 0 or artifact not in event.artifacts)
             or event.cleanup_status is not CleanupStatus.CLEANED
             or self._lifecycle.phase is not RunPhase.IDLE
             or type(artifact) is not str

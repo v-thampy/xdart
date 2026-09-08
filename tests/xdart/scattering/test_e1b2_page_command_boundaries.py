@@ -1206,8 +1206,8 @@ def test_clean_nonbatch_terminal_starts_exact_browse_and_keeps_frame_labels(
         )
         assert paints == [(True, True)]
 
-        # None of the terminal cases that lacks an exact clean publication may
-        # start the convenience Browse transition.
+        # A Stop without durable rows for its current artifact must not load
+        # either an absent output or a restored prior file at the same name.
         page._begin_terminal_browse(
             replace(terminal, kind=StandardEventKind.STOPPED),
             was_batch=False,
@@ -1215,7 +1215,27 @@ def test_clean_nonbatch_terminal_starts_exact_browse_and_keeps_frame_labels(
             selected=navigation.selected,
         )
         page._begin_terminal_browse(
+            replace(
+                terminal, kind=StandardEventKind.STOPPED,
+                artifact_completed=3, artifact_total=3,
+            ),
+            was_batch=False,
+            current=navigation.current,
+            selected=navigation.selected,
+        )
+        page._begin_terminal_browse(
             replace(terminal, cleanup_status=CleanupStatus.CLEANUP_PENDING),
+            was_batch=False,
+            current=navigation.current,
+            selected=navigation.selected,
+        )
+        page._begin_terminal_browse(
+            replace(
+                terminal, kind=StandardEventKind.STOPPED,
+                cleanup_status=CleanupStatus.CLEANUP_PENDING,
+                artifact_completed=3, artifact_total=3,
+                artifacts=(terminal.artifact,),
+            ),
             was_batch=False,
             current=navigation.current,
             selected=navigation.selected,
@@ -1350,9 +1370,11 @@ def test_terminal_browse_refusal_retires_exact_handoff_without_outcome(
         _dispose(page, qapp)
 
 
+@pytest.mark.parametrize("kind", (StandardEventKind.FINISHED, StandardEventKind.STOPPED))
 def test_clean_xye_terminal_does_not_browse_unwritten_nexus_target(
     qapp: QtWidgets.QApplication,
     monkeypatch,
+    kind,
 ) -> None:
     """XYE-only publishes sidecars, so its planned NeXus path is not Browseable."""
 
@@ -1378,13 +1400,14 @@ def test_clean_xye_terminal_does_not_browse_unwritten_nexus_target(
         )
         executor.events.append(StandardRunEvent(
             identity,
-            StandardEventKind.FINISHED,
+            kind,
             completed=1,
             total=1,
             artifact="/out/planned-but-unwritten.nxs",
             cleanup_status=CleanupStatus.CLEANED,
             artifact_completed=1,
             artifact_total=1,
+            artifacts=("/out/planned-but-unwritten.nxs",),
         ))
         page._drain_executor()
 
