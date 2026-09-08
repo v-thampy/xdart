@@ -867,6 +867,8 @@ def test_catalog_directory_fact_reaches_exact_activation_command() -> None:
     assert tuple(scan.is_directory for scan in projected.scans) == (True, False)
 
     browser = BrowserView()
+    browser.resize(640, 480)
+    browser.show()
     commands = []
     browser.commandRequested.connect(commands.append)
     try:
@@ -888,10 +890,11 @@ def test_catalog_directory_fact_reaches_exact_activation_command() -> None:
             QtCore.Qt.ItemDataRole.UserRole
         ) == "/out/result.nxs"
         for row, expected in enumerate(("directory", "artifact")):
-            blocker = QtCore.QSignalBlocker(browser.scans)
-            browser.scans.setCurrentRow(row)
-            del blocker
-            browser._scan_selected()
+            app.processEvents()
+            point = browser.scans.visualItemRect(browser.scans.item(row)).center()
+            QtTest.QTest.mouseClick(
+                browser.scans.viewport(), QtCore.Qt.LeftButton, pos=point,
+            )
             assert commands[-1] == ShellCommand(
                 ShellCommandKind.SELECT_SCAN,
                 projected.scans[row].identifier,
