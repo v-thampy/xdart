@@ -1000,6 +1000,19 @@ def test_exact_gapped_inventory_replaces_only_selected_dimension(tmp_path, monke
     assert type(result.commit_identity) is str
     assert seen == [(2, 3), (5, 3), (9, 3)]
     assert _preserved_signature(seeded.target) == before
+    candidate_preserved = _preserved_signature(result.output_artifact)
+    untouched = {name: value for name, value in before.items() if name != "/"}
+    assert {name: candidate_preserved[name] for name in untouched} == untouched
+    with h5py.File(seeded.target, "r") as source, h5py.File(
+        result.output_artifact, "r",
+    ) as candidate:
+        assert {
+            name: source.attrs[name] for name in source.attrs if name != "file_name"
+        } == {
+            name: candidate.attrs[name]
+            for name in candidate.attrs if name != "file_name"
+        }
+        assert candidate.attrs["file_name"] == str(result.output_artifact)
     with h5py.File(result.output_artifact, "r") as handle:
         group = handle["entry/integrated_1d"]
         np.testing.assert_array_equal(group["frame_index"][()], seeded.labels)
@@ -1013,6 +1026,19 @@ def test_exact_gapped_inventory_replaces_only_selected_dimension(tmp_path, monke
     replay = _module().ReintegratePlan.from_artifact(result.output_artifact, entry="entry", dimension="1d", preparation=seeded.preparation)
     assert replay.labels == seeded.labels
     from xrd_tools.reduction.provenance_config import _integration_2d_args; two_prep = copy.deepcopy(seeded.preparation); two_args = _integration_2d_args(_plans()[1], None); two_args.pop("gi_mode_2d", None); two_prep["selected_plan"] = {"version": 1, "dimension": "2d", "bai_args": two_args, "gi_mode": None}; two_result = _run_successor(_module().ReintegratePlan.from_artifact(result.output_artifact, entry="entry", dimension="2d", preparation=two_prep)); assert two_result.committed_labels == seeded.labels
+    nested = _seed_existing(tmp_path, name="nested-entry")
+    with h5py.File(nested.target, "r+") as handle:
+        handle.create_group("outer")
+        handle.move("entry", "outer/entry")
+    nested_before = nested.target.read_bytes()
+    with pytest.raises(
+        ValueError, match="replacement target is not a current xdart .nexus record",
+    ):
+        _module().ReintegratePlan.from_artifact(
+            nested.target, entry="/outer//entry", dimension="1d",
+            preparation=nested.preparation,
+        )
+    assert nested.target.read_bytes() == nested_before
 
 
 def test_reintegrate_detaches_selected_monitor_metadata(tmp_path, monkeypatch):
@@ -2259,18 +2285,26 @@ def test_shared_science_dimension_audit_and_untouched_manifest(tmp_path, monkeyp
         assert dict(config["append_lineage"].attrs) == append_attrs
     with h5py.File(result.output_artifact, "r") as handle:
         config = handle["entry/reduction/config"]
+        assert config["append_lineage"][()] == append_before
+        assert dict(config["append_lineage"].attrs) == append_attrs
         stored = json.loads(config["dimension_replacement_1d"].asstr()[()])
     assert set(stored) == set(audit) and module._audit_identity(stored) == result.audit_identity
-    decision = qualify_append(seeded.target, seeded.append_intent)
+    decision = qualify_append(result.output_artifact, seeded.append_intent)
     assert (decision.disposition, decision.reason) == (
-        AppendDisposition.SKIP, "exact source already committed",
+        AppendDisposition.REFUSE, "DIMENSION_REPLACEMENT_APPEND_UNSUPPORTED",
     )
 
     active = _seed_existing(tmp_path, name="active-background", background=True)
     with h5py.File(active.target, "r") as handle: pairs = tuple(read_background_dependency(handle[f"entry/frames/frame_{label:04d}"]) for label in active.labels)
     active_plan = module.ReintegratePlan.from_artifact(active.target, entry="entry", dimension="1d", preparation=active.preparation)
-    assert active_plan.requested_shared_science["background"]["mode"] == "Single BG File" and _run_successor(active_plan).disposition == "COMMITTED"
+    active_result = _run_successor(active_plan)
+    assert (
+        active_plan.requested_shared_science["background"]["mode"]
+        == "Single BG File"
+        and active_result.disposition == "COMMITTED"
+    )
     with h5py.File(active.target, "r") as handle: assert pairs == tuple(read_background_dependency(handle[f"entry/frames/frame_{label:04d}"]) for label in active.labels)
+    with h5py.File(active_result.output_artifact, "r") as handle: assert pairs == tuple(read_background_dependency(handle[f"entry/frames/frame_{label:04d}"]) for label in active.labels)
 def test_stop_before_and_after_writes_roll_back_without_prefix(tmp_path, monkeypatch):
     from pathlib import Path
     from xrd_tools.reduction import NexusSink, run_reintegrate_successor
