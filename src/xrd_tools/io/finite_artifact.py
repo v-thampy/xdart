@@ -515,30 +515,28 @@ class FiniteArtifactRequest:
             > _MAX_CANONICAL_BYTES
         ):
             raise ValueError("finite canonical version input is invalid")
-        expected_version = {
-            "algorithm_identity": self.algorithm_identity,
-            "domain": "xdart.finite-artifact-version.v1",
-            "entry": self.entry,
-            "operation_kind": self.operation_kind,
-            "output_schema": self.output_schema,
-            "preservation_identity": self.preservation_identity,
-            "scientific_identity": self.scientific_identity,
-            "source_graph_identity": self.source_graph_identity,
-        }
+        expected_version = _version_payload(
+            self.algorithm_identity,
+            self.entry,
+            self.operation_kind,
+            self.output_schema,
+            self.preservation_identity,
+            self.scientific_identity,
+            self.source_graph_identity,
+        )
         canonical_version, version = _identity(expected_version)
-        _publication_json, publication = _identity({
-            "domain": "xdart.finite-artifact-publication.v1",
-            "output_artifact": self.output_artifact,
-            "version_identity": version,
-        })
-        _operation_json, operation = _identity({
-            "domain": "xdart.finite-artifact-operation.v1",
-            "operation_context_identity": self.operation_context_identity,
-            "output_artifact": self.output_artifact,
-            "publication_identity": publication,
-            "source_artifact": self.source_artifact,
-            "version_identity": version,
-        })
+        _publication_json, publication = _identity(
+            _publication_payload(self.output_artifact, version)
+        )
+        _operation_json, operation = _identity(
+            _operation_payload(
+                self.operation_context_identity,
+                self.output_artifact,
+                publication,
+                self.source_artifact,
+                version,
+            )
+        )
         expected_lineage = _lineage_for_request_fields(
             artifact_family=self.artifact_family,
             operation_kind=self.operation_kind,
@@ -857,6 +855,55 @@ def _canonical(payload: dict[str, object]) -> str:
 def _identity(payload: dict[str, object]) -> tuple[str, str]:
     canonical = _canonical(payload)
     return canonical, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _version_payload(
+    algorithm_identity: str,
+    entry: str,
+    operation_kind: str,
+    output_schema: str,
+    preservation_identity: str,
+    scientific_identity: str,
+    source_graph_identity: str,
+) -> dict[str, object]:
+    return {
+        "algorithm_identity": algorithm_identity,
+        "domain": "xdart.finite-artifact-version.v1",
+        "entry": entry,
+        "operation_kind": operation_kind,
+        "output_schema": output_schema,
+        "preservation_identity": preservation_identity,
+        "scientific_identity": scientific_identity,
+        "source_graph_identity": source_graph_identity,
+    }
+
+
+def _publication_payload(
+    output_artifact: str,
+    version_identity: str,
+) -> dict[str, object]:
+    return {
+        "domain": "xdart.finite-artifact-publication.v1",
+        "output_artifact": output_artifact,
+        "version_identity": version_identity,
+    }
+
+
+def _operation_payload(
+    operation_context_identity: str,
+    output_artifact: str,
+    publication_identity: str,
+    source_artifact: str,
+    version_identity: str,
+) -> dict[str, object]:
+    return {
+        "domain": "xdart.finite-artifact-operation.v1",
+        "operation_context_identity": operation_context_identity,
+        "output_artifact": output_artifact,
+        "publication_identity": publication_identity,
+        "source_artifact": source_artifact,
+        "version_identity": version_identity,
+    }
 
 
 def _operation_context_payload_values(
@@ -1383,16 +1430,17 @@ def finite_artifact_request(
     science = _hex_identity(scientific_identity, "scientific identity")
     algorithm = _hex_identity(algorithm_identity, "algorithm identity")
     preservation = _hex_identity(preservation_identity, "preservation identity")
-    version_json, version = _identity({
-        "algorithm_identity": algorithm,
-        "domain": "xdart.finite-artifact-version.v1",
-        "entry": entry,
-        "operation_kind": operation_kind,
-        "output_schema": output_schema,
-        "preservation_identity": preservation,
-        "scientific_identity": science,
-        "source_graph_identity": source_graph,
-    })
+    version_json, version = _identity(
+        _version_payload(
+            algorithm,
+            entry,
+            operation_kind,
+            output_schema,
+            preservation,
+            science,
+            source_graph,
+        )
+    )
     try:
         root = Path(os.fspath(destination_directory))
     except TypeError as error:
@@ -1426,19 +1474,18 @@ def finite_artifact_request(
         # predecessor.  Harmless while an occupied slot was refused outright;
         # fatal once replacement became unconditional.
         raise ValueError("finite source and output must be distinct")
-    _publication_json, publication = _identity({
-        "domain": "xdart.finite-artifact-publication.v1",
-        "output_artifact": output,
-        "version_identity": version,
-    })
-    _operation_json, operation = _identity({
-        "domain": "xdart.finite-artifact-operation.v1",
-        "operation_context_identity": operation_context.context_identity,
-        "output_artifact": output,
-        "publication_identity": publication,
-        "source_artifact": source,
-        "version_identity": version,
-    })
+    _publication_json, publication = _identity(
+        _publication_payload(output, version)
+    )
+    _operation_json, operation = _identity(
+        _operation_payload(
+            operation_context.context_identity,
+            output,
+            publication,
+            source,
+            version,
+        )
+    )
     lineage = _lineage_for_request_fields(
         artifact_family=family,
         operation_kind=operation_kind,
@@ -1518,29 +1565,29 @@ def _replay_finite_artifact_request(
     science = _hex_identity(scientific_identity, "scientific identity")
     algorithm = _hex_identity(algorithm_identity, "algorithm identity")
     preservation = _hex_identity(preservation_identity, "preservation identity")
-    version_json, version = _identity({
-        "algorithm_identity": algorithm,
-        "domain": "xdart.finite-artifact-version.v1",
-        "entry": entry,
-        "operation_kind": operation_kind,
-        "output_schema": output_schema,
-        "preservation_identity": preservation,
-        "scientific_identity": science,
-        "source_graph_identity": source_graph,
-    })
-    _publication_json, publication = _identity({
-        "domain": "xdart.finite-artifact-publication.v1",
-        "output_artifact": output,
-        "version_identity": version,
-    })
-    _operation_json, operation = _identity({
-        "domain": "xdart.finite-artifact-operation.v1",
-        "operation_context_identity": operation_context.context_identity,
-        "output_artifact": output,
-        "publication_identity": publication,
-        "source_artifact": source,
-        "version_identity": version,
-    })
+    version_json, version = _identity(
+        _version_payload(
+            algorithm,
+            entry,
+            operation_kind,
+            output_schema,
+            preservation,
+            science,
+            source_graph,
+        )
+    )
+    _publication_json, publication = _identity(
+        _publication_payload(output, version)
+    )
+    _operation_json, operation = _identity(
+        _operation_payload(
+            operation_context.context_identity,
+            output,
+            publication,
+            source,
+            version,
+        )
+    )
     lineage = _lineage_for_request_fields(
         artifact_family=family,
         operation_kind=operation_kind,
