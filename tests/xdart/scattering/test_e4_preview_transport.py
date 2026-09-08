@@ -1033,7 +1033,7 @@ def _hydrate_ok(state, owner_value, gate, processed, label, generation):
     return request
 
 
-@pytest.mark.parametrize("seam", ["light", "residency", "publication"])
+@pytest.mark.parametrize("seam", ["light", "publication"])
 def test_persistent_seam_failure_rejects_candidate_and_preserves_display(
     monkeypatch, tmp_path, seam
 ):
@@ -1069,7 +1069,7 @@ def test_persistent_seam_failure_rejects_candidate_and_preserves_display(
     assert state.payloads.get(keys[2]) is prior_payload
 
 
-@pytest.mark.parametrize("seam", ["light", "residency", "publication"])
+@pytest.mark.parametrize("seam", ["light", "publication"])
 def test_fail_once_seam_retries_exact_prepared_commit_once(
     monkeypatch, tmp_path, seam
 ):
@@ -1097,6 +1097,31 @@ def test_fail_once_seam_retries_exact_prepared_commit_once(
         if getattr(event, "frame_key", None) is keys[2]
     ]
     assert len(ready) == 1  # exactly one public signal
+
+
+def test_postpublication_residency_failure_keeps_hydrated_commit(
+    monkeypatch, tmp_path
+):
+    """A trusted residency bookkeeping failure cannot retry published data."""
+    state, owner, processed, _raw, events = _bound_state(monkeypatch, tmp_path)
+    keys = _catalog(state, owner, (1, 2, 3))
+    owner_value, gate = _acquisition_identity(state)
+    calls = _install_seam_failure(
+        monkeypatch, state, owner, "residency", permanent=True
+    )
+    request = _typed_request(
+        state, owner_value, gate, processed, 2, HydrationPurpose.PREVIEW, 5
+    )
+    assert state.transport.submit(request) is not None
+    assert _wait_transport_idle(state)
+
+    assert calls["n"] == 1
+    assert _completion_outcomes(state).count((2, HydrationOutcome.HYDRATED)) == 1
+    assert owner.publications.get(2) is not None
+    assert keys[2] in state.payloads
+    assert sum(
+        getattr(event, "frame_key", None) is keys[2] for event in events
+    ) == 1
 
 
 def test_failed_rehydration_preserves_the_exact_existing_publication(
@@ -1398,7 +1423,7 @@ def test_failed_commit_does_not_publish_detector_outcome(
     assert state.detector_outcome(keys[1]) is None
 
 
-@pytest.mark.parametrize("seam", ["light", "residency", "publication"])
+@pytest.mark.parametrize("seam", ["light", "publication"])
 @pytest.mark.parametrize("shape", ["fresh", "rehydrated"])
 def test_failed_attempt_restores_every_public_surface_exactly(
     monkeypatch, tmp_path, seam, shape

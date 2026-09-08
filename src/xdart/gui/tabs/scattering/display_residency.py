@@ -102,59 +102,6 @@ class RunDisplayResidency:
         self._trim(self._browse, self.limits.browse, self._evict_browse, protected)
         self._trim(self._live, self.limits.live, self._evict_live, protected)
 
-    def capture(self, key: DisplayFrameKey) -> tuple:
-        """Exact pre-attempt facts for ONE key (§22.3 prepare half).
-
-        Detached values: the key's registration entry plus the COMPLETE
-        four-tier and heavy-probe key orders, so :meth:`restore` can put back
-        membership AND FIFO eviction order exactly — never re-derive them from
-        stores the failed attempt already mutated (the §22.2 root cause).
-        """
-        return (
-            key,
-            key in self._stores,
-            self._stores.get(key),
-            tuple(self._heavy),
-            tuple(self._heavy_candidates),
-            tuple(self._thumbnails),
-            tuple(self._browse),
-            tuple(self._live),
-        )
-
-    def restore(self, captured: tuple) -> None:
-        """Restore the exact captured state (§22.3 abort half).
-
-        Only the capturing commit can have mutated this owner in between
-        (both run under the one display lock), so rebuilding each tier from
-        its captured key order is an exact undo — including the prior FIFO
-        position of a re-observed public key and the complete removal of a
-        never-published candidate.  Idempotent; pure dict operations.
-        """
-        (
-            key,
-            registered,
-            stores,
-            heavy,
-            heavy_candidates,
-            thumbnails,
-            browse,
-            live,
-        ) = captured
-        if registered:
-            self._stores[key] = stores
-        else:
-            self._stores.pop(key, None)
-        for tier, snapshot in (
-            (self._heavy, heavy),
-            (self._heavy_candidates, heavy_candidates),
-            (self._thumbnails, thumbnails),
-            (self._browse, browse),
-            (self._live, live),
-        ):
-            tier.clear()
-            for entry in snapshot:
-                tier[entry] = None
-
     def snapshot(self) -> DisplayResidencySnapshot:
         return DisplayResidencySnapshot(
             self.limits,

@@ -358,19 +358,12 @@ def test_owner_rearm_uses_global_fifo_and_includes_dropped_projection(
     assert owners[1].records.has_heavy_payload(1)
 
 
-def test_heavy_candidate_capture_restore_and_exception_retry(
+def test_heavy_eviction_failure_is_retryable(
     monkeypatch,
 ) -> None:
+    """A failed eviction remains retryable without residency snapshot undo."""
     state, owner, modes, keys = _heavy_case("p1c-retry", (1, 2, 3))
     residency = state._residency
-    captured = residency.capture(keys[1])
-    before = tuple(residency._heavy), tuple(residency._heavy_candidates)
-    residency.observe(
-        keys[0], records=owner.records, publications=owner.publications
-    )
-    assert (tuple(residency._heavy), tuple(residency._heavy_candidates)) != before
-    residency.restore(captured)
-    assert (tuple(residency._heavy), tuple(residency._heavy_candidates)) == before
 
     owner.records.replace_projection(1, hydratable=modes, durable=modes)
     residency.limits = DisplayResidencyLimits(2, 8, 8, 8)
@@ -481,14 +474,14 @@ def test_owed_live_retirement_is_unchanged_then_durable_retry_is_total() -> None
     before = (
         owner.records.get(1),
         owner.publications.get(1),
-        state._residency.capture(key),
+        state.residency_snapshot(),
     )
 
     assert state._residency._evict_live(key) is False
     assert (
         owner.records.get(1),
         owner.publications.get(1),
-        state._residency.capture(key),
+        state.residency_snapshot(),
     ) == before
 
     owner.records.replace_projection(

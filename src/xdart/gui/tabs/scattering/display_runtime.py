@@ -1281,11 +1281,16 @@ class RunDisplayState:
                 gate.leave()
             if acquisition_target and event is not None:
                 # The commit is SEALED: publication/payload landed coherently.
-                # Cap enforcement is demotion-only bookkeeping by the same
-                # trusted owner; a raise here must not un-publish the sealed
-                # commit — it is logged and the next commit's enforce retries
-                # the identical trims over current state.
+                # Residency bookkeeping and cap enforcement are demotion-only
+                # trusted-owner work after the authoritative publication.  A
+                # bookkeeping error must not turn published science into a
+                # failed/retried hydration.
                 try:
+                    self._residency.observe(
+                        key,
+                        records=art.records,
+                        publications=art.publications,
+                    )
                     self._residency.enforce(
                         protected=self._raw_lru,
                         heavy_victim=heavy_victim,
@@ -1397,36 +1402,24 @@ class RunDisplayState:
             key.local_frame_label,
             protected=raw_protected,
         )
-        residency = self._residency.capture(key)
-        try:
-            self._residency.observe(
-                key,
-                records=art.records,
-                publications=art.publications,
-                incoming_heavy=_publication_has_heavy_payload(candidate),
-                incoming_thumbnail=view.thumbnail is not None,
+        lease = art.light_lease
+        if (
+            type(lease) is Light1DRetentionLease
+            and lease.state is Light1DLeaseState.ACTIVE
+            and record.results_1d
+        ):
+            publication = art.publications.publish_gui_light_1d(
+                candidate,
+                _light_1d_record(
+                    record,
+                    generation=lease.generation,
+                    source_identity=source_identity,
+                    scan_key=art.source_scan,
+                ),
+                protected=protected,
             )
-            lease = art.light_lease
-            if (
-                type(lease) is Light1DRetentionLease
-                and lease.state is Light1DLeaseState.ACTIVE
-                and record.results_1d
-            ):
-                publication = art.publications.publish_gui_light_1d(
-                    candidate,
-                    _light_1d_record(
-                        record,
-                        generation=lease.generation,
-                        source_identity=source_identity,
-                        scan_key=art.source_scan,
-                    ),
-                    protected=protected,
-                )
-            else:
-                publication = art.publications.upsert(candidate, protected=protected)
-        except BaseException:
-            self._residency.restore(residency)
-            raise
+        else:
+            publication = art.publications.upsert(candidate, protected=protected)
         heavy_after = frozenset(art.publications.heavy_labels())
         victim_label = next(
             (
