@@ -836,9 +836,27 @@ def _admit_source_topology(fact, *, full_inventory, token=None,
             final["adapter_id"] != adapter
             or os.path.normcase(os.path.normpath(final["path"]))
             != os.path.normcase(os.path.normpath(execution["path"]))
-            or execution["frame_count"] > final["extent"]),
+            or selected_labels[0] < execution["first_label"]
+            or selected_labels[-1] - execution["first_label"] >= final["extent"]),
         "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED",
     )
+    # Stop seals a processed prefix, not a truncated raw container. Keep the
+    # whole admitted raw graph for HDF shape/link checks while the lineage
+    # continues to bound every selected persisted label below.
+    stopped_prefix = final is not None and final["extent"] < execution["frame_count"]
+    graph_final = None if stopped_prefix else final
+    if stopped_prefix and adapter == "nexus_hdf5":
+        expected_members = [
+            {"path": member["file"]["path"], "dataset_path": member["dataset"],
+             "size": member["file"]["size"], "mtime_ns": member["file"]["mtime_ns"],
+             "source_start": member["first"],
+             "source_stop": min(member["stop"], final["extent"]),
+             "ordinal": member["epoch"]}
+            for member in execution["external_members"]
+            if member["first"] < final["extent"]
+        ]
+        _reject(final["external_members"] != expected_members,
+                "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED")
     execution_stops, execution_ranges = _external_ranges(
         execution["external_members"], final=False)
     final_stops, final_ranges = _external_ranges(
@@ -867,8 +885,8 @@ def _admit_source_topology(fact, *, full_inventory, token=None,
             or len(final_rows) != len(set(final_rows)),
             "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
         )
-    external = (execution["external_members"] if final is None
-                else final["external_members"])
+    external = (execution["external_members"] if graph_final is None
+                else graph_final["external_members"])
     # Admission freezes the whole immutable source graph once.  Frame reads
     # below use only their pre-bound route and exact revision closure.
     _execution, revisions, _targets = _execution_revisions(
@@ -892,8 +910,8 @@ def _admit_source_topology(fact, *, full_inventory, token=None,
         paths = tuple(link.local_path for link in links)
         expected = tuple(
             (os.path.normcase(os.path.normpath(
-                (value["file"] if final is None else value)["path"])),
-             value["dataset"] if final is None else value["dataset_path"])
+                (value["file"] if graph_final is None else value)["path"])),
+             value["dataset"] if graph_final is None else value["dataset_path"])
             for value in external
         )
         actual = tuple(
@@ -903,14 +921,15 @@ def _admit_source_topology(fact, *, full_inventory, token=None,
         )
         recorded = () if final is None else tuple(final["dataset_paths"])
         _reject(
-            actual != expected or recorded not in {(), paths},
+            actual != expected or recorded not in {
+                (), paths[:len(final["external_members"])] if stopped_prefix else paths},
             "REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED",
         )
     hdf_routes = ()
     hdf_stops = ()
     if adapter == "nexus_hdf5":
         hdf_ranges = _admit_hdf_routes(
-            execution, final, fact, revision_lookup, links,
+            execution, graph_final, fact, revision_lookup, links,
         )
         hdf_stops = tuple(stop for _start, stop, _route in hdf_ranges)
         hdf_routes = hdf_ranges
@@ -1012,8 +1031,9 @@ def _admit_source_topology(fact, *, full_inventory, token=None,
                 *(slot.lexical_path for slot in route.storage_slices),
             )
             frame_routes[label] = _FrameRoute(
-                execution["path"], source_state, source_state["extent"]
-                if epoch_source is not None else total,
+                execution["path"], source_state, (
+                    execution["frame_count"] if stopped_prefix else
+                    source_state["extent"] if epoch_source is not None else total),
                 paths[0] if paths else fact["snapshot"]["dataset_path"],
                 not bool(external), revision_paths, route,
             )
