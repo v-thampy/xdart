@@ -1979,11 +1979,11 @@ def test_injected_commit_failure_retains_exact_prepared_commit_once(
     original_upsert = owner.publications.upsert
     failures = {"remaining": 1}
 
-    def failing_upsert(publication):
+    def failing_upsert(publication, **kwargs):
         if failures["remaining"]:
             failures["remaining"] -= 1
             raise RuntimeError("injected publication failure")
-        return original_upsert(publication)
+        return original_upsert(publication, **kwargs)
 
     monkeypatch.setattr(owner.publications, "upsert", failing_upsert)
 
@@ -1994,6 +1994,7 @@ def test_injected_commit_failure_retains_exact_prepared_commit_once(
     assert _wait_transport_idle(state)
 
     # Retry consumed the exact retained prepared commit once and succeeded.
+    assert failures["remaining"] == 0
     publication = owner.publications.get(2)
     assert publication is not None
     assert (2, HydrationOutcome.HYDRATED) in _completion_outcomes(state)
@@ -3370,6 +3371,52 @@ def _b1_acquisition(tmp_path, labels):
                     processed, label, generation)
     events.clear()
     return runtime, state, artifact, context, keys, raw_path, events
+
+
+def test_b1_light_publication_failure_retries_exact_prepared_commit(
+    monkeypatch, tmp_path,
+):
+    """A real GUI-light publication failure retries without phantom residency."""
+    _runtime, state, artifact, context, keys, _raw, events = _b1_acquisition(
+        tmp_path, (1, 2, 3),
+    )
+    before = artifact.publications.get(2)
+    assert before is not None
+    before_residency = tuple(state._residency._stores)
+    calls = {"total": 0, "failures": 1}
+    original = artifact.publications.publish_gui_light_1d
+
+    def fail_once(publication, light_record, **kwargs):
+        calls["total"] += 1
+        if calls["failures"]:
+            calls["failures"] -= 1
+            raise RuntimeError("injected GUI-light publication failure")
+        return original(publication, light_record, **kwargs)
+
+    monkeypatch.setattr(
+        artifact.publications, "publish_gui_light_1d", fail_once,
+    )
+    request = _typed_request(
+        state,
+        context.hydration_owner,
+        context.commit_gate,
+        Path(artifact.artifact),
+        2,
+        HydrationPurpose.PREVIEW,
+        99,
+    )
+    assert state.transport.submit(request) is not None
+    assert _wait_transport_idle(state)
+
+    assert calls == {"total": 2, "failures": 0}
+    assert (2, HydrationOutcome.HYDRATED) in _completion_outcomes(state)
+    current = artifact.publications.get(2)
+    assert current is not None
+    assert keys[2] in state.payloads
+    assert tuple(state._residency._stores) == before_residency
+    assert sum(
+        getattr(event, "frame_key", None) is keys[2] for event in events
+    ) == 1
 
 
 def test_b1_light_publish_and_full_admission_share_one_lock_order(
