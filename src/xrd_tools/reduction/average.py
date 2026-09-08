@@ -2,7 +2,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, fields
 from enum import Enum
-import hashlib, json, math, os, secrets
+import hashlib, json, math, os
 from pathlib import Path
 import re, threading
 import tempfile
@@ -18,8 +18,9 @@ from xrd_tools.io.image import load_mask, read_detector_image_layout
 from xrd_tools.io.nexus_record import _average_count_chunks, _average_count_digest
 from xrd_tools.io.output_transaction import (
     StreamTerminal, TargetSnapshot, capture_target_snapshot,
-    get_output_transaction_coordinator, replace_into_place,
 )
+from xrd_tools.io.finite_artifact import _FinitePublicationSession
+from xrd_tools.io.nexus import open_nexus_writer
 from xrd_tools.io.output_safety import paths_same_file
 from xrd_tools.io.output_path import (
     OVERWRITE_MODE,
@@ -243,15 +244,8 @@ class AverageScanPlan:
     numeric_metadata_keys: tuple[str, ...]; invariant_metadata_keys: tuple[str, ...]; allocation: SessionResourceAllocation
     direct_eiger_eligible: bool; science_identity: str; operation_identity: str
     logical_labels: tuple[int, ...] = (1,)
-    #: HIDDEN same-directory file this Average actually writes.  ADR-0010: the
-    #: prior slot "remains visible and untouched until that publication step",
-    #: so the writer never opens `output_artifact` -- it builds this, and ONE
-    #: atomic replacement publishes it.  Random per run, and deliberately absent
-    #: from every identity payload: it is private plumbing, not science, and a
-    #: deterministic name would collide with the very repeat it exists to serve.
-    publication_candidate: str = ''
     def __post_init__(self) -> None:
-        _reject(type(self.recipe) is not AverageScanRecipe or type(self.contributor_extent) is not int or (not 1 <= self.contributor_extent <= _MAX_CONTRIBUTORS) or (type(self.detector_shape) is not tuple) or (len(self.detector_shape) != 2) or any((type(item) is not int or item <= 0 for item in self.detector_shape)) or (type(self.output_artifact) is not str or not os.path.isabs(self.output_artifact)) or _COUNT_DIGEST.fullmatch(self.version_identity) is None or (type(self.expected_target_snapshot) is not TargetSnapshot) or (type(self.allocation) is not SessionResourceAllocation) or type(self.direct_eiger_eligible) is not bool or (self.logical_labels != (1,)) or type(self.publication_candidate) is not str or (self.publication_candidate and not os.path.isabs(self.publication_candidate)) or (self.publication_candidate == self.output_artifact), 'Average scan plan is invalid')
+        _reject(type(self.recipe) is not AverageScanRecipe or type(self.contributor_extent) is not int or (not 1 <= self.contributor_extent <= _MAX_CONTRIBUTORS) or (type(self.detector_shape) is not tuple) or (len(self.detector_shape) != 2) or any((type(item) is not int or item <= 0 for item in self.detector_shape)) or (type(self.output_artifact) is not str or not os.path.isabs(self.output_artifact)) or _COUNT_DIGEST.fullmatch(self.version_identity) is None or (type(self.expected_target_snapshot) is not TargetSnapshot) or (type(self.allocation) is not SessionResourceAllocation) or type(self.direct_eiger_eligible) is not bool or (self.logical_labels != (1,)), 'Average scan plan is invalid')
 @dataclass(frozen=True, slots=True)
 class AverageScanProgress:
     operation_identity: str; stage: str; completed: int; total: int; revision: int
@@ -620,19 +614,9 @@ def _plan_from_prepared_graph(
     # hand.  `snapshot` is still captured: it is the plan-time identity of the
     # public slot, and `_target_sweep` still uses it to refuse if the slot
     # changes underneath a running Average.
-    # HIDDEN, same directory, and it MUST end in `.nexus`: the record writer
-    # refuses any other suffix (`require_current_output_path`).  So the private
-    # name is a dotfile rather than a private extension.
-    # DISCLOSED: `is_readable_output_path` classifies by suffix alone and does
-    # not skip dotfiles, so this file is briefly classifiable as a readable
-    # output while the Average runs.  It exists only for that window and the
-    # rename consumes it.
-    candidate = str(Path(output).with_name(
-        f".{Path(output).stem}.xdart-average-{secrets.token_hex(16)}.nexus"
-    ))
     prospective = AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, output, version, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, '')
     operation = hashlib.sha256(b'xdart.average-operation.v1\x00' + _canonical(_operation_payload(prospective))).hexdigest()
-    return AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, output, version, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, operation, publication_candidate=candidate)
+    return AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, output, version, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, operation)
 
 
 def _seal_published(path: str, ordinal: int) -> StreamTerminal:
@@ -1099,11 +1083,11 @@ def _reduce_average(plan: AverageScanPlan, science: dict[str, Any], token: threa
 def _append_intent(plan: AverageScanPlan, graph: PreparedSourceExecutionGraph) -> AppendIntent:
     modes = required_result_modes(_derived_reduction(plan.recipe))
     return AppendIntent(plan.recipe.entry, plan.recipe.source_base or '', science_fingerprint(stable_lineage_projection(graph, target=plan.output_artifact)), plan.science_identity, tuple((f'{item.kind}:{item.key}' for item in modes)), append_source_from_execution_graph(graph, generation=1), (1,))
-def _average_sink(plan: AverageScanPlan, graph: PreparedSourceExecutionGraph):
+def _average_sink(plan: AverageScanPlan, graph: PreparedSourceExecutionGraph, document):
     run_configuration = _recipe_payload(plan.recipe)
     if plan.recipe.background is None:
         run_configuration.pop('background')
-    return NexusSink(plan.publication_candidate, entry=plan.recipe.entry, overwrite=True, create_new=True, source_base=plan.recipe.source_base, artifact_family=artifact_family_from_source(Path(plan.recipe.target)), run_configuration_provenance=run_configuration, source_execution_provenance=source_execution_projection(graph), source_snapshots_provenance=source_snapshots_projection(graph, writer=True), same_run_intent=_append_intent(plan, graph), rollback_until_commit=True)
+    return NexusSink.for_finite_document(plan.output_artifact, document, entry=plan.recipe.entry, lineage_intent=_append_intent(plan, graph), source_base=plan.recipe.source_base, artifact_family=artifact_family_from_source(Path(plan.recipe.target)), run_configuration_provenance=run_configuration, source_execution_provenance=source_execution_projection(graph), source_snapshots_provenance=source_snapshots_projection(graph, writer=True))
 def _resolved_lineage_path(stored: str, artifact: str | Path, source_base: str) -> str:
     value = resolve_source_master(stored, scan_file=artifact, source_base=source_base)
     _reject(value is None, 'Average lineage source is unavailable')
@@ -1156,8 +1140,7 @@ class AverageScanRunner:
         self._source_window = None; self._source_error = None
         self._science = self._reduction = None; self._graph = None
         self._sink = None; self._pending_abort = None
-        self._slot_hold = None
-        self._h23_target_snapshot = None
+        self._publication = None
         self._cancel_token = None; self._progress_cb = None
         self._publication_gate = None
         self._gate_called = False; self._revision = 0
@@ -1191,17 +1174,6 @@ class AverageScanRunner:
 
     def _terminal(self, value: AverageScanResult) -> AverageScanResult:
         value.__post_init__()
-        # Give the slot back HERE: this is the one funnel every terminal passes
-        # through, committed or not.  A release failure must not replace the
-        # outcome the caller came for, so it is swallowed -- a stranded hold
-        # would make the slot unpublishable for the life of the process, which
-        # is why it is released on the success path too and not only on abort.
-        hold, self._slot_hold = self._slot_hold, None
-        if hold is not None:
-            try:
-                get_output_transaction_coordinator().release_target(hold)
-            except BaseException:
-                pass
         self._result = value
         self._state = AverageRunnerPhase.TERMINAL
         self._pending_token = None
@@ -1568,17 +1540,9 @@ class AverageScanRunner:
         except SourceRevisionChanged as error:
             raise SourceRevisionChanged('AVERAGE_SOURCE_DRIFT') from error
 
-    def _target_sweep(self, expected: TargetSnapshot, path: str = '') -> None:
-        """Refuse if *path* has drifted from *expected*.
-
-        TWO DIFFERENT SUBJECTS, and conflating them would delete a real guard.
-        With no argument this sweeps the PUBLIC SLOT against its plan-time
-        identity -- "nobody else changed the published file while we worked",
-        which stays meaningful now that the slot legitimately holds a prior
-        result throughout.  Called with the candidate it sweeps the WRITER'S
-        OUTPUT against what the writer last produced.
-        """
-        _reject(capture_target_snapshot(path or self.plan.output_artifact)
+    def _target_sweep(self, expected: TargetSnapshot) -> None:
+        """Refuse if the public slot changed since this operation was planned."""
+        _reject(capture_target_snapshot(self.plan.output_artifact)
                 != expected, 'AVERAGE_TARGET_DRIFT')
 
     def _terminal_abort(self, error: BaseException, disposition: str):
@@ -1600,18 +1564,17 @@ class AverageScanRunner:
         if self._sink is not None:
             try:
                 self._sink._scan = self._sink._plan = None
-                self._sink._abort_composed()
+                self._sink.abort(None)
             except BaseException:
-                phase = self._sink._transaction.snapshot().phase.value
-                if phase in {
-                    'ready-to-retry', 'rollback-pending', 'cleanup-pending',
-                    'integrity-hold', 'executing',
-                }:
-                    return self._pending(
-                        AveragePendingPhase.OUTPUT_SETTLEMENT,
-                        'AVERAGE_H23_SETTLEMENT_PENDING',
-                    )
-                raise
+                return self._pending(
+                    AveragePendingPhase.OUTPUT_SETTLEMENT,
+                    'AVERAGE_H23_SETTLEMENT_PENDING',
+                )
+        if self._publication is not None and not self._publication.abort():
+            return self._pending(
+                AveragePendingPhase.OUTPUT_SETTLEMENT,
+                'AVERAGE_H23_SETTLEMENT_PENDING',
+            )
         self._pending_abort = None
         return self._terminal_abort(error, disposition)
 
@@ -1640,125 +1603,32 @@ class AverageScanRunner:
         return None
 
     def _commit(self):
-        sink = self._sink
         try:
-            snapshot = sink._transaction.commit_stream(
-                sink._attempt, lease=sink._lease,
+            facts = self._publication.publish(
+                self.plan.expected_target_snapshot,
+                ordinal=1,
+                observe=lambda path, ordinal: _seal_published(str(path), ordinal),
             )
-            sink._release_terminal_lease()
-            terminal = sink._typed_terminal(snapshot)
-            sink._scan = sink._plan = None
         except BaseException as error:
-            phase = sink._transaction.snapshot().phase.value
-            if phase in {
-                'ready-to-retry', 'rollback-pending', 'cleanup-pending',
-                'integrity-hold', 'executing',
-            }:
-                return self._pending(
-                    AveragePendingPhase.OUTPUT_SETTLEMENT,
-                    'AVERAGE_H23_SETTLEMENT_PENDING',
-                )
-            # Codex F4: the candidate transaction has SETTLED by the time this
-            # branch runs, so the sink's rollback no longer owns the private
-            # file and `_publish_and_finish` -- the only other place that
-            # removes it -- is never reached.  Discard it here or an ordinary
-            # failure strands a hidden file in the operator's output folder.
-            self._discard_candidate()
             return self._terminal(_error_result(
                 self.plan, error, h23=True,
                 denominators=self._science['denominators'],
             ))
-        return self._publish_and_finish(terminal)
-
-    def _discard_candidate(self) -> None:
-        """Remove our own private candidate, once nothing else owns it.
-
-        Deliberately silent on failure: a stranded candidate is a disclosure
-        problem, never a reason to replace the outcome the caller came for.
-        """
-        candidate = getattr(self.plan, 'publication_candidate', '')
-        if not candidate:
-            return
-        try:
-            os.unlink(candidate)
-        except OSError:
-            pass
-
-    def _publish_and_finish(self, terminal):
-        """ONE atomic replacement publishes the validated candidate at the slot.
-
-        ADR-0010 for finite operations: the candidate is closed and
-        scientifically validated BEFORE this, and the prior slot stays visible
-        and untouched until this instant.  Everything above wrote a hidden
-        same-directory file; nothing has touched `output_artifact` yet.
-
-        Ordering matters and is deliberate.  The candidate's transaction has
-        already settled -- `commit_stream` returned and the writer lease was
-        released -- so this rename cannot race the machinery that produced it.
-        The slot HOLD is what keeps another operation out, and it outlives the
-        transaction precisely because it is on the slot, not the candidate.
-        """
-        renamed = False
-        try:
-            # THE SLOT MUST STILL BE WHAT WE PLANNED AGAINST, right up to the
-            # instant we replace it.  Moving the writer-output sweeps onto the
-            # candidate silently dropped this check from the settlement-retry
-            # path -- something appearing at, or changing, the public slot
-            # mid-run stopped being noticed.  Sweeping here restores it and
-            # covers BOTH paths at once, because every commit publishes through
-            # this method.
-            self._target_sweep(self.plan.expected_target_snapshot)
-            replace_into_place(
-                self.plan.publication_candidate,
-                self.plan.output_artifact,
-                verb='publish',
-            )
-            renamed = True
-            published = _seal_published(
-                self.plan.output_artifact, terminal.commit_identity.ordinal,
-            )
-        except BaseException as error:
-            if renamed:
-                # THE REPLACEMENT LANDED.  Reporting ABORTED here would be a
-                # lie in the direction that costs most: the operator sees "no
-                # public effect" while a NEW FILE sits at the slot.  Say what is
-                # actually true -- published, verification failed -- and do not
-                # touch the slot: restoring or deleting it would destroy the
-                # result the science already produced.  The candidate is gone,
-                # consumed by the rename, so there is nothing to clean up.
-                return self._terminal(_result(
-                    self.plan, 'PUBLISHED_UNVERIFIED',
-                    code='AVERAGE_PUBLISHED_UNVERIFIED',
-                    diagnostic=_diagnostic(error),
-                    denominators=self._science['denominators'],
-                ))
-            # REMOVE OUR OWN CANDIDATE.  Its transaction has already settled by
-            # the time we get here, so the sink's rollback no longer covers it
-            # and nothing else will.  Without this an Average that commits its
-            # candidate and then fails the slot sweep strands a hidden file in
-            # the operator's output folder forever.  (Found by the leftover
-            # assertion added alongside this change, not by inspection.)
-            # If the rename already succeeded the name is gone and the unlink
-            # simply fails -- the PUBLISHED slot is never touched here.
-            self._discard_candidate()
-            return self._terminal(_error_result(
-                self.plan, error, h23=True,
+        if facts.published and facts.error is not None:
+            return self._terminal(_result(
+                self.plan, 'PUBLISHED_UNVERIFIED',
+                code='AVERAGE_PUBLISHED_UNVERIFIED',
+                diagnostic=_diagnostic(facts.error),
                 denominators=self._science['denominators'],
             ))
         return self._terminal(_result(
             self.plan, 'COMMITTED',
             denominators=self._science['denominators'],
             evidence=self._science['finite'].evidence,
-            commit=published,
+            commit=facts.terminal,
         ))
 
     def _writer_pending(self):
-        try:
-            self._h23_target_snapshot = capture_target_snapshot(
-                self.plan.publication_candidate,
-            )
-        except BaseException as error:
-            return self._abort(error)
         return self._pending(
             AveragePendingPhase.OUTPUT_SETTLEMENT,
             'AVERAGE_H23_SETTLEMENT_PENDING',
@@ -1780,16 +1650,14 @@ class AverageScanRunner:
         except BaseException as error:
             return self._terminal(_error_result(self.plan, error))
         try:
-            # Hold the PUBLIC SLOT before the first candidate byte and keep it
-            # until this Average reaches a terminal.  The sink's own H23 lease
-            # is on the CANDIDATE, so without this a second Average of the same
-            # family would lease a different private file and both would replace
-            # the one slot -- last writer wins, silently.  Same reason the finite
-            # publisher gained a hold in `da228738`.
-            self._slot_hold = get_output_transaction_coordinator().hold_target(
-                self.plan.output_artifact, label='average-slot',
+            self._publication = _FinitePublicationSession(self.plan.output_artifact)
+            document = self._publication.start(
+                lambda path: open_nexus_writer(
+                    path, metadata=scan.to_metadata(), entry=self.plan.recipe.entry,
+                    compression='gzip', overwrite=True,
+                )
             )
-            self._sink = _average_sink(self.plan, self._graph)
+            self._sink = _average_sink(self.plan, self._graph, document)
             self._sink.begin(scan, _derived_reduction(self.plan.recipe))
             self._progress('write', 0, 1)
             self._sink.write(frame, reduced)
@@ -1797,19 +1665,16 @@ class AverageScanRunner:
             self._sink._drain_pending_record_writes(force=True)
             writer = self._sink._writer
             writer.finish(self._sink._writer_finalization(writer))
-            self._h23_target_snapshot = capture_target_snapshot(
-                self.plan.publication_candidate,
-            )
             self._progress('write', 1, 1)
         except WriterIncomplete:
             return self._writer_pending()
         except BaseException as error:
-            return self._abort(error) if self._sink is not None else self._terminal(
-                _error_result(self.plan, error)
-            )
+            return self._abort(error)
         return self._after_writer_finished()
 
     def _after_writer_finished(self):
+        if not self._publication.close_document():
+            return self._writer_pending()
         try:
             self._source_state_sweep()
         except BaseException as error:
@@ -1817,38 +1682,13 @@ class AverageScanRunner:
         return self._commit_after_writer_source_sweep()
 
     def _commit_after_writer_source_sweep(self):
-        try:
-            self._target_sweep(self._h23_target_snapshot,
-                               self.plan.publication_candidate)
-        except BaseException as error:
-            return self._abort(error)
         gated = self._gate()
         return gated if gated is not None else self._commit()
 
     def _retry_output_once(self):
-        sink = self._sink
         if self._pending_abort is not None:
             error, disposition = self._pending_abort
-            try:
-                sink._scan = sink._plan = None
-                sink._abort_composed()
-            except BaseException:
-                return self._pending(
-                    AveragePendingPhase.OUTPUT_SETTLEMENT,
-                    'AVERAGE_H23_SETTLEMENT_PENDING',
-                )
-            self._pending_abort = None
-            return self._terminal_abort(error, disposition)
-        phase = sink._transaction.snapshot().phase.value
-        if phase in {'cleanup-pending', 'epoch-committed', 'committed'}:
-            try:
-                terminal = sink.finish(SimpleNamespace(cancelled=False))
-            except BaseException:
-                return self._pending(
-                    AveragePendingPhase.OUTPUT_SETTLEMENT,
-                    'AVERAGE_H23_SETTLEMENT_PENDING',
-                )
-            return self._publish_and_finish(terminal)
+            return self._abort(error, disposition=disposition)
         return self._retry_writer_once()
 
     def _retry_writer_once(self):
@@ -1859,22 +1699,13 @@ class AverageScanRunner:
                 disposition='CANCELLED',
             )
         try:
-            self._target_sweep(self._h23_target_snapshot,
-                               self.plan.publication_candidate)
-        except BaseException as error:
-            return self._abort(error)
-        try:
             sink._writer.finish()
         except WriterIncomplete:
             return self._writer_pending()
         except BaseException as error:
             return self._abort(error)
-        try:
-            self._h23_target_snapshot = capture_target_snapshot(
-                self.plan.publication_candidate,
-            )
-        except BaseException as error:
-            return self._abort(error)
+        if not self._publication.close_document():
+            return self._writer_pending()
         try:
             self._source_state_sweep()
         except BaseException as error:

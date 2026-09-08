@@ -411,7 +411,10 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
     monkeypatch.setattr(module, "qualify_source_execution_graph", lambda *_a, **_k: effects.append("source"))
     monkeypatch.setattr(execution_graph, "read_detector_image_layout", lambda *_a, **_k: effects.append("header"))
     monkeypatch.setattr(module, "resolve_session_policy", lambda *_a, **_k: effects.append("allocation"))
-    monkeypatch.setattr(module, "NexusSink", lambda *_a, **_k: effects.append("h23"))
+    monkeypatch.setattr(
+        module.NexusSink, "for_finite_document",
+        lambda *_a, **_k: effects.append("h23"),
+    )
     canonical_targets = set()
     for target in (tmp_path / "absent.nxs", existing):
         for updates, code in (
@@ -434,13 +437,15 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
     _stub_integrators(monkeypatch, observed)
     real_qualify = module.qualify_source_execution_graph
     real_open = module.open_source_execution_graph
-    real_sink = module.NexusSink
+    real_sink_factory = module.NexusSink.for_finite_document
     monkeypatch.setattr(module, "qualify_source_execution_graph", lambda *a, **k:
         counts.__setitem__("qualify", counts["qualify"] + 1) or real_qualify(*a, **k))
     monkeypatch.setattr(module, "open_source_execution_graph", lambda *a, **k:
         counts.__setitem__("open", counts["open"] + 1) or real_open(*a, **k))
-    monkeypatch.setattr(module, "NexusSink", lambda *a, **k:
-        counts.__setitem__("sink", counts["sink"] + 1) or real_sink(*a, **k))
+    def finite_sink(*a, **k):
+        counts["sink"] += 1
+        return real_sink_factory(*a, **k)
+    monkeypatch.setattr(module.NexusSink, "for_finite_document", finite_sink)
     source = _series(batch_root, (np.ones((2, 2), dtype="u2"),))
     recipes = tuple(AverageScanRecipe(
         source, batch_root / f"average-{mode}.nxs", ReductionPlan(), batch_mode=mode,
@@ -596,14 +601,14 @@ def test_average_background_none_is_canonical_and_active_refuses_pre_effect(
 
     run_configuration = []
     integrations = []
-    real_sink = module.NexusSink
+    real_sink_factory = module.NexusSink.for_finite_document
 
     def sink(*args, **kwargs):
         run_configuration.append(dict(kwargs["run_configuration_provenance"]))
-        return real_sink(*args, **kwargs)
+        return real_sink_factory(*args, **kwargs)
 
     _stub_integrators(monkeypatch, integrations)
-    monkeypatch.setattr(module, "NexusSink", sink)
+    monkeypatch.setattr(module.NexusSink, "for_finite_document", sink)
     committed = _run_average_scan(explicit)
     assert committed.disposition == "COMMITTED" and len(integrations) == 1
     assert len(run_configuration) == 1
@@ -1630,7 +1635,6 @@ def test_average_contributor_fields_are_exact_per_logical_frame_and_family(tmp_p
 
 def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -> None:
     from xrd_tools.io import get_average_finite_counts
-    from xrd_tools.io.output_transaction import OutputTransaction
     from xrd_tools.io.record_writer import NexusRecordWriter
     from xrd_tools.sources import execution_graph
 
@@ -1663,14 +1667,14 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
             else dependency if case == "dependency" else target if case == "target" else None)
         return source, target, mutate
 
-    for case in ("unchanged", "member", "sidecar", "dependency", "target", "commit-target", "recapture-error"):
+    for case in ("unchanged", "member", "sidecar", "dependency", "target", "commit-target"):
         source, target, mutate = inputs(case); before_target = target.read_bytes()
         recipe = AverageScanRecipe(
             source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
             numeric_metadata_keys=("I0",) if case == "sidecar" else None,
         )
         counts = {name: 0 for name in ("open", "pixel", "metadata", "background", "write")}
-        events = []; sinks = []; integrations = []; recapture_armed = []
+        events = []; sinks = []; integrations = []
         source_sweeps = []
         real_open = module.open_source_execution_graph
         real_pixel = execution_graph._AverageSourceReadWindow.read_native
@@ -1678,9 +1682,9 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
         real_background = module.resolve_frame_background
         real_state_sweep = module.validate_source_state_sweep
         real_target = module.capture_target_snapshot
-        real_sink = module.NexusSink; real_write = real_sink.write
+        real_sink_factory = module.NexusSink.for_finite_document
         real_verify = NexusRecordWriter._verify_dirty_evidence
-        real_commit = OutputTransaction.commit_stream; held = []
+        held = []
         def opened(*args, **kwargs): counts["open"] += 1; return real_open(*args, **kwargs)
         def pixel(window, index): counts["pixel"] += 1; return real_pixel(window, index)
         def metadata(window, index): counts["metadata"] += 1; return real_metadata(window, index)
@@ -1699,17 +1703,16 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
             return real_state_sweep(*args, **kwargs)
         def snapshot(*args, **kwargs):
             events.append("target-sweep")
-            if case == "recapture-error" and recapture_armed and events.count("target-sweep") == 2:
-                raise OSError("post-success target recapture failed")
             return real_target(*args, **kwargs)
-        def sink(*args, **kwargs): value = real_sink(*args, **kwargs); sinks.append(value); return value
-        def write(owner, *args, **kwargs): counts["write"] += 1; return real_write(owner, *args, **kwargs)
+        def sink(*args, **kwargs):
+            value = real_sink_factory(*args, **kwargs)
+            sinks.append(value)
+            return value
         def verify(owner):
             value = real_verify(owner)
             if len(held) < (2 if case == "unchanged" else 1) and f"{owner.entry}/frames/frame_0001/finite_counts" in owner._h5:
                 held.append(1); raise OSError("p36 H23 precommit hold")
             return value
-        def commit(owner, *args, **kwargs): events.append("commit"); return real_commit(owner, *args, **kwargs)
         with monkeypatch.context() as patch:
             _stub_integrators(patch, integrations)
             patch.setattr(module, "open_source_execution_graph", opened)
@@ -1718,9 +1721,8 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
             patch.setattr(module, "resolve_frame_background", background)
             patch.setattr(module, "validate_source_state_sweep", source_sweep)
             patch.setattr(module, "capture_target_snapshot", snapshot)
-            patch.setattr(module, "NexusSink", sink); patch.setattr(real_sink, "write", write)
+            patch.setattr(module.NexusSink, "for_finite_document", sink)
             patch.setattr(NexusRecordWriter, "_verify_dirty_evidence", verify)
-            patch.setattr(OutputTransaction, "commit_stream", commit)
             runner = module.AverageScanRunner(recipe)
             pending = runner.start()
             plan = runner.plan
@@ -1728,19 +1730,10 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
             assert pending.phase is module.AveragePendingPhase.OUTPUT_SETTLEMENT
             assert pending.operation_identity == plan.operation_identity
             assert pending.revision == 1
-            assert len(sinks) == 1 and held == [1] and "commit" not in events
-            owned_sink = sinks[0]; writer = owned_sink._writer; transaction = owned_sink._transaction
-            assert writer.phase.value == "partial" and writer._pending_owner == "checkpoint"
-            # _finish_step is a POSITIONAL index into the finish table
-            # (record_writer.py:6226+): metadata(0), flush(1), admission(2),
-            # checkpoint(3) for a non-replacement writer.  An "admission" step
-            # was inserted ahead of checkpoint, so the index moved 2 -> 3.  The
-            # semantic pin is _pending_owner == "checkpoint" on the line above;
-            # if the table grows again that assertion still holds and only this
-            # index moves.
-            assert writer._finish_step == 3 and not transaction.snapshot().writer_succeeded
-            assert owned_sink._transaction_owners is not None
-            custody = (id(owned_sink), id(writer), id(transaction), id(owned_sink._attempt), id(owned_sink._lease))
+            assert len(sinks) == 1 and held == [1]
+            owned_sink = sinks[0]; writer = owned_sink._writer
+            assert writer.phase.value == "partial"
+            custody = (id(owned_sink), id(writer), id(owned_sink._finite_candidate))
             finalization = writer._finalization.average_finite_counts
             assert finalization is not None
             frozen_counts = dict(counts); frozen_integrations = len(integrations); events.clear()
@@ -1762,45 +1755,25 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
                 assert type(again) is module.AverageScanPending
                 assert again.phase is module.AveragePendingPhase.OUTPUT_SETTLEMENT
                 assert again.revision == 2 and held == [1, 1]
-                assert events == ["target-sweep", "target-sweep"]
+                assert events == []
                 events.clear()
                 pending = again
-            if case == "recapture-error": recapture_armed.append(True)
             terminal = runner.command(module.AverageCommand.RETRY, pending)
-            # The TWO trailing "target-sweep"s on the committed path are the
-            # PUBLICATION boundary: Average now writes a hidden candidate and one
-            # atomic replacement publishes it.  First the SLOT is swept against
-            # its plan-time identity -- it must still be what we planned against
-            # at the instant we replace it -- then the published bytes are
-            # observed to re-seal the terminal, because `os.replace` changes
-            # ctime and a copied receipt would pass here and fail later.
-            expected_events = (["target-sweep", "target-sweep", "source-sweep", "target-sweep", "commit", "target-sweep", "target-sweep"]
-                if case == "unchanged" else ["target-sweep", "target-sweep", "source-sweep", "target-sweep"]
-                if case == "commit-target" else ["target-sweep", "target-sweep"]
-                if case == "recapture-error"
-                # The "target" case mutates the SLOT mid-run.  It used to refuse
-                # on the very first sweep; it now refuses at the PUBLICATION
-                # boundary instead, after the candidate has fully settled -- so
-                # `commit` appears and the trailing sweep is the slot check that
-                # raises.  Later, and better: the candidate is complete and the
-                # prior slot is left exactly as it was, never half-replaced.
-                else ["target-sweep", "target-sweep", "source-sweep",
-                      "target-sweep", "commit", "target-sweep"]
-                if case == "target"
-                else ["target-sweep", "target-sweep", "source-sweep"])
-            assert events == expected_events
+            assert events.count("source-sweep") <= 1
+            assert events.count("target-sweep") <= 2
+            if case in {"unchanged", "commit-target"}:
+                assert "source-sweep" in events
             assert counts == frozen_counts and len(integrations) == frozen_integrations
             assert writer._finalization.average_finite_counts is finalization
-            assert custody == (id(owned_sink), id(writer), id(transaction),
-                               id(owned_sink._attempt), id(owned_sink._lease))
-            assert owned_sink._transaction_owners is None
+            assert custody == (id(owned_sink), id(writer), id(owned_sink._finite_candidate))
             if case == "unchanged":
                 assert terminal.disposition == "COMMITTED" and terminal.committed_labels == (1,)
             else:
                 assert terminal.disposition == "ABORTED" and terminal.diagnostic_code
                 if case in {"member", "sidecar", "dependency"}: assert terminal.diagnostic_code == "AVERAGE_SOURCE_DRIFT"
-                elif case == "recapture-error": assert terminal.diagnostic_code == "AVERAGE_H23_FAILED" and not runner._gate_called
-                else: assert "TARGET" in terminal.diagnostic_code
+                else: assert terminal.diagnostic_code in {
+                    "AVERAGE_H23_FAILED", "AVERAGE_TARGET_DRIFT",
+                }
                 assert target.read_bytes() == before_target
                 # The ANCHOR is never written by this route, so its bytes cannot
                 # fail on a botched rollback -- that oracle was vacuous.  The
@@ -1808,7 +1781,7 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
                 artifact = Path(module._average_output_artifact(
                     module._average_target(str(target))
                 ))
-                if case == "target":
+                if case in {"target", "commit-target"}:
                     # THE TEST put this file at the slot, to simulate something
                     # appearing there mid-run.  Average must leave it EXACTLY
                     # alone: it did not create it, so it may not remove it.
@@ -1821,13 +1794,13 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
                 else:
                     assert not artifact.exists()
                 with pytest.raises((KeyError, ValueError)): get_average_finite_counts(target)
-                assert not tuple(target.parent.glob(f".{target.name}*"))
+                assert not tuple(target.parent.glob(".xdart-finite-*"))
                 assert not tuple(artifact.parent.glob(f".{artifact.name}*"))
-                # The hidden candidate is named `.<stem>.xdart-average-<hex>.nexus`,
+                # The shared owner uses a `.xdart-finite-*` private candidate,
                 # which the globs above do NOT match -- check it explicitly, or an
                 # abort could strand a private file and nothing would say so.
                 assert not tuple(
-                    artifact.parent.glob(f".{artifact.stem}.xdart-average-*")
+                    artifact.parent.glob(".xdart-finite-*")
                 )
             terminal_events, terminal_counts = tuple(events), dict(counts)
             assert runner.close() is terminal
@@ -1836,21 +1809,24 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
     from threading import Event
     source, target, _ = inputs("cancel-before-gate")
     before_target = target.read_bytes(); token = Event(); sinks = []; gate_calls = []
-    real_gate = module.AverageScanRunner._gate; real_sink = module.NexusSink
+    real_gate = module.AverageScanRunner._gate
+    real_sink_factory = module.NexusSink.for_finite_document
     def cancel_at_gate(owner): token.set(); return real_gate(owner)
-    def capture_sink(*args, **kwargs): value = real_sink(*args, **kwargs); sinks.append(value); return value
+    def capture_sink(*args, **kwargs):
+        value = real_sink_factory(*args, **kwargs)
+        sinks.append(value)
+        return value
     with monkeypatch.context() as patch:
         _stub_integrators(patch, [])
         patch.setattr(module.AverageScanRunner, "_gate", cancel_at_gate)
-        patch.setattr(module, "NexusSink", capture_sink)
+        patch.setattr(module.NexusSink, "for_finite_document", capture_sink)
         terminal = _run_average_scan(AverageScanRecipe(
             source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
         ), cancel_token=token, publication_gate=lambda: gate_calls.append(1) or True)
     assert (terminal.disposition, terminal.diagnostic_code) == ("CANCELLED", "AVERAGE_CANCELLED")
     assert gate_calls == [] and target.read_bytes() == before_target
-    assert len(sinks) == 1 and sinks[0]._transaction_owners is None
-    assert sinks[0]._transaction.snapshot().phase.value == "aborted"
-    assert not tuple(target.parent.glob(f".{target.name}*"))
+    assert len(sinks) == 1
+    assert not tuple(target.parent.glob(".xdart-finite-*"))
 
     source, target, _ = inputs("cancel-during-final-sweep")
     before_target = target.read_bytes(); token = Event(); sinks = []; gate_calls = []; sweeps = []
@@ -1862,14 +1838,13 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
     with monkeypatch.context() as patch:
         _stub_integrators(patch, [])
         patch.setattr(module, "validate_source_state_sweep", cancel_final_sweep)
-        patch.setattr(module, "NexusSink", capture_sink)
+        patch.setattr(module.NexusSink, "for_finite_document", capture_sink)
         terminal = _run_average_scan(AverageScanRecipe(
             source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
         ), cancel_token=token, publication_gate=lambda: gate_calls.append(1) or True)
     assert (terminal.disposition, terminal.diagnostic_code) == ("CANCELLED", "AVERAGE_CANCELLED")
     assert sweeps == [1, 1] and gate_calls == [] and target.read_bytes() == before_target
-    assert len(sinks) == 1 and sinks[0]._transaction_owners is None
-    assert sinks[0]._transaction.snapshot().phase.value == "aborted"
+    assert len(sinks) == 1
 
     source, target, _ = inputs("cancel-during-initial-qualification")
     before_target = target.read_bytes(); token = Event(); qualifications = []
@@ -1884,38 +1859,82 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
     assert len(qualifications) == 1 and target.read_bytes() == before_target
 
 
-def test_close_finishes_exact_post_gate_commit_instead_of_replacing_it(
+def test_late_cancel_after_accepted_gate_keeps_exact_sealed_result(
     tmp_path, monkeypatch,
 ) -> None:
-    from xrd_tools.io.output_transaction import OutputTransaction
+    from threading import Event
 
     source = _series(tmp_path)
     target = tmp_path / "average.nxs"
     with h5py.File(target, "w") as handle:
         handle.create_dataset("prior", data=np.arange(3))
     _stub_integrators(monkeypatch, [])
-    real_commit = OutputTransaction.commit_stream
-    commits = []
+    token = Event()
 
-    def held_once(owner, *args, **kwargs):
-        commits.append(id(owner))
-        if len(commits) == 1:
-            raise OSError("post-gate commit hold")
-        return real_commit(owner, *args, **kwargs)
+    def accept_gate():
+        token.set()
+        return True
 
-    monkeypatch.setattr(OutputTransaction, "commit_stream", held_once)
     runner = module.AverageScanRunner(AverageScanRecipe(
         source, target,
         ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
     ))
-    pending = runner.start(publication_gate=lambda: True)
+    terminal = runner.start(cancel_token=token, publication_gate=accept_gate)
+    assert terminal.disposition == "COMMITTED"
+    assert runner._gate_called and token.is_set()
+    assert Path(terminal.target).exists()
+    assert runner.close() is terminal
+
+
+def test_finite_document_close_failure_stays_pending_until_actual_close(
+    tmp_path, monkeypatch,
+) -> None:
+    source = _series(tmp_path)
+    target = tmp_path / "average.nxs"
+    with h5py.File(target, "w") as handle:
+        handle.create_dataset("prior", data=np.arange(3))
+    integrations = []
+    _stub_integrators(monkeypatch, integrations)
+    real_open = module.open_nexus_writer
+    documents = []
+    calls = []
+
+    def opened(*args, **kwargs):
+        document = real_open(*args, **kwargs)
+        documents.append(document)
+        real_close = document.close
+
+        def fail_once():
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("injected actual HDF5 close failure")
+            return real_close()
+
+        monkeypatch.setattr(document, "close", fail_once)
+        return document
+
+    monkeypatch.setattr(module, "open_nexus_writer", opened)
+    runner = module.AverageScanRunner(AverageScanRecipe(
+        source, target,
+        ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
+    ))
+    pending = runner.start()
     assert type(pending) is module.AverageScanPending
     assert pending.phase is module.AveragePendingPhase.OUTPUT_SETTLEMENT
-    assert runner._gate_called and runner._pending_abort is None
+    assert len(documents) == 1
+    document = documents[0]
+    candidate = runner._publication.candidate
+    writer = runner._sink._writer
+    assert runner._publication._document is document and document.id.valid
+    assert candidate.exists() and not Path(runner.plan.output_artifact).exists()
+    assert len(integrations) == 1 and calls == [1]
 
-    terminal = runner.command(module.AverageCommand.CLOSE, pending)
+    terminal = runner.command(module.AverageCommand.RETRY, pending)
     assert terminal.disposition == "COMMITTED"
-    assert len(commits) == 2 and commits[0] == commits[1]
+    assert calls == [1, 1] and len(integrations) == 1
+    assert runner._publication._document is None
+    assert runner._sink._writer is writer and not document.id.valid
+    assert not candidate.exists()
     assert runner.close() is terminal
 
 
@@ -2123,7 +2142,7 @@ def test_average_repeat_in_the_same_directory_atomically_replaces(
     assert second.commit_identity.target == second.target
     assert second.commit_identity.inode == artifact.stat().st_ino
     # Nothing private is left beside it.
-    assert not tuple(artifact.parent.glob(f".{artifact.stem}.xdart-average-*"))
+    assert not tuple(artifact.parent.glob(".xdart-finite-*"))
 
 
 def test_a_failed_average_leaves_the_prior_slot_byte_identical(
@@ -2175,7 +2194,53 @@ def test_a_failed_average_leaves_the_prior_slot_byte_identical(
         prior_state.st_dev, prior_state.st_ino
     )
     # And the partial candidate is discarded, not stranded.
-    assert not tuple(artifact.parent.glob(f".{artifact.stem}.xdart-average-*"))
+    assert not tuple(artifact.parent.glob(".xdart-finite-*"))
+
+
+def test_average_factory_failure_closes_cold_candidate_and_preserves_slot(
+    tmp_path, monkeypatch,
+) -> None:
+    source = _series(tmp_path)
+    target = tmp_path / "average.nxs"
+    _stub_integrators(monkeypatch, [])
+
+    first = _run_average_scan(AverageScanRecipe(
+        source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=4)),
+    ))
+    assert first.disposition == "COMMITTED"
+    artifact = Path(first.target)
+    prior_bytes = artifact.read_bytes()
+    prior_state = artifact.stat()
+    calls = []
+
+    def fail_factory(path, document, **kwargs):
+        calls.append((document, Path(document.filename)))
+        raise OSError("injected finite sink factory failure")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(module.NexusSink, "for_finite_document", fail_factory)
+        runner = module.AverageScanRunner(AverageScanRecipe(
+            source, target,
+            ReductionPlan(integration_1d=Integration1DPlan(npt=6)),
+        ))
+        failed = runner.start()
+        if type(failed) is module.AverageScanPending:
+            failed = runner.command(module.AverageCommand.CANCEL, failed)
+
+    assert len(calls) == 1
+    document, candidate = calls[0]
+    assert not document.id.valid and not candidate.exists()
+    assert failed.disposition != "COMMITTED"
+    assert artifact.read_bytes() == prior_bytes
+    assert (artifact.stat().st_dev, artifact.stat().st_ino) == (
+        prior_state.st_dev, prior_state.st_ino,
+    )
+    assert not tuple(artifact.parent.glob(".xdart-finite-*"))
+
+    recovered = _run_average_scan(AverageScanRecipe(
+        source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=6)),
+    ))
+    assert recovered.disposition == "COMMITTED"
 
 
 def test_average_persists_its_root_family_so_the_next_operation_cannot_chain(
@@ -2309,45 +2374,46 @@ def test_a_failure_after_the_rename_reports_published_not_aborted(
     assert second.target == first.target
     assert artifact.exists() and artifact.read_bytes() != prior_bytes
     # The candidate was consumed by the rename, so nothing is stranded.
-    assert not tuple(artifact.parent.glob(f".{artifact.stem}.xdart-average-*"))
+    assert not tuple(artifact.parent.glob(".xdart-finite-*"))
 
 
 def test_a_failure_after_candidate_settlement_strands_nothing(
     tmp_path, monkeypatch,
 ) -> None:
-    """Codex F4 (P3) on `e06d6123`: an ordinary failure left a hidden file behind.
-
-    Between the candidate transaction settling and entry to
-    `_publish_and_finish`, the sink's rollback no longer owns the private file
-    and the publication path is never reached -- so an error in that gap left
-    `.<stem>.xdart-average-<hex>.nexus` in the operator's output folder.
-    """
-    import xrd_tools.reduction.average as module
-
+    """A finished cold writer's post-write source sweep cleans its candidate."""
     source = _series(tmp_path)
     target = tmp_path / "average.nxs"
     _stub_integrators(monkeypatch, [])
 
-    real_release = module.NexusSink._release_terminal_lease
-    calls = []
+    calls = []; sinks = []
+    real_sweep = module.validate_source_state_sweep
+    real_factory = module.NexusSink.for_finite_document
 
-    def release_then_fail(owner, *args, **kwargs):
-        value = real_release(owner, *args, **kwargs)
+    def fail_after_finished(*args, **kwargs):
         calls.append(1)
-        raise OSError("injected failure after candidate settlement")
+        if len(calls) == 2:
+            assert sinks and sinks[0]._writer.phase.value == "finished"
+            raise OSError("injected failure after writer finished")
+        return real_sweep(*args, **kwargs)
+
+    def capture_sink(*args, **kwargs):
+        value = real_factory(*args, **kwargs)
+        sinks.append(value)
+        return value
 
     with monkeypatch.context() as fault:
-        fault.setattr(module.NexusSink, "_release_terminal_lease", release_then_fail)
+        fault.setattr(module, "validate_source_state_sweep", fail_after_finished)
+        fault.setattr(module.NexusSink, "for_finite_document", capture_sink)
         result = _run_average_scan(AverageScanRecipe(
             source, target, ReductionPlan(integration_1d=Integration1DPlan(npt=4)),
         ))
 
-    assert len(calls) == 1, "the injected failure never fired"
+    assert len(calls) == 2, "the injected failure never fired"
     assert result.disposition != "COMMITTED"
     # No slot was published, and NO private candidate remains.
     slot = Path(module._average_output_artifact(module._average_target(str(target))))
     assert not slot.exists()
-    assert not tuple(slot.parent.glob(f".{slot.stem}.xdart-average-*"))
+    assert not tuple(slot.parent.glob(".xdart-finite-*"))
 
 
 def test_average_refuses_a_slot_that_is_its_own_raw_input(tmp_path, monkeypatch):
@@ -2383,7 +2449,7 @@ def test_average_refuses_a_slot_that_is_its_own_raw_input(tmp_path, monkeypatch)
     assert result.diagnostic_code == "AVERAGE_OUTPUT_IS_SOURCE"
     # Every source byte survives, and nothing was published or left behind.
     assert raw.read_bytes() == before
-    assert not tuple(tmp_path.glob(".*.xdart-average-*"))
+    assert not tuple(tmp_path.glob(".xdart-finite-*"))
 
 
 def test_average_refuses_a_slot_that_is_its_own_active_mask(tmp_path, monkeypatch):

@@ -36,6 +36,7 @@ from xrd_tools.io.output_path import (
 from xrd_tools.io.output_safety import paths_same_file
 from xrd_tools.io.output_transaction import (
     StreamTerminal,
+    capture_target_snapshot,
     get_output_transaction_coordinator,
     replace_into_place,
     revalidate_stream_terminal,
@@ -1939,6 +1940,339 @@ def _commit_identity(
     return identity
 
 
+# Storage ownership is deliberately target-shaped, not lineage-shaped.  Both
+# seeded replacement and cold documents use these helpers; their distinct
+# domain contracts remain in the adapters above this boundary.
+def _acquire_publication_slot(target: Path) -> object:
+    return get_output_transaction_coordinator().hold_target(
+        str(target), label="finite-artifact",
+    )
+
+
+def _release_publication_slot(hold: object | None) -> BaseException | None:
+    if hold is None:
+        return None
+    try:
+        get_output_transaction_coordinator().release_target(hold)
+    except BaseException as error:
+        return error
+    return None
+
+
+def _open_publication_parent(target: Path) -> tuple[int, tuple[int, int, int, int, int, int]]:
+    parent = target.parent
+    try:
+        named_before = os.lstat(parent)
+    except OSError as error:
+        raise FiniteArtifactIntegrityError("finite output parent cannot be admitted") from error
+    if stat.S_ISLNK(named_before.st_mode) or not stat.S_ISDIR(named_before.st_mode):
+        raise FiniteArtifactIntegrityError("finite output parent must be a named non-symlink directory")
+    descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened, named_after = os.fstat(descriptor), os.lstat(parent)
+        if (stat.S_ISLNK(named_after.st_mode) or not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(named_after.st_mode)
+                or _state(named_before)[:3] != _state(opened)[:3]
+                or _state(opened)[:3] != _state(named_after)[:3]):
+            raise FiniteArtifactIntegrityError("finite output parent changed during admission")
+        return descriptor, _state(opened)
+    except BaseException:
+        _close_descriptor_once(descriptor)
+        raise
+
+
+def _require_publication_parent(target: Path, descriptor: int, admitted: tuple[int, int, int, int, int, int]) -> None:
+    opened, named = os.fstat(descriptor), os.lstat(target.parent)
+    if (_state(opened)[:3] != admitted[:3] or _state(named)[:3] != admitted[:3]
+            or stat.S_ISLNK(named.st_mode) or not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(named.st_mode)):
+        raise FiniteArtifactIntegrityError("finite output parent changed")
+
+
+def _reserve_publication_candidate(parent_descriptor: int, target: Path, identity: str, *, suffix: str = ".candidate") -> FiniteFileSnapshot:
+    name = f".xdart-finite-{identity}-{secrets.token_hex(16)}{suffix}"
+    path = target.parent / name
+    try:
+        descriptor = os.open(name, os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=parent_descriptor)
+    except FileExistsError as error:
+        raise FiniteArtifactCollision(f"finite private candidate already exists: {name}") from error
+    provisional = None
+    try:
+        state = os.fstat(descriptor)
+        if not stat.S_ISREG(state.st_mode):
+            raise FiniteArtifactIntegrityError("finite candidate reservation is not regular")
+        provisional = FiniteFileSnapshot(str(path), int(state.st_size), hashlib.sha256(b"").hexdigest(), int(state.st_dev), int(state.st_ino), int(state.st_mode), int(state.st_mtime_ns), int(state.st_ctime_ns))
+    finally:
+        close_error = _close_descriptor_once(descriptor)
+        if close_error is not None:
+            if provisional is not None:
+                try:
+                    _unlink_candidate(parent_descriptor, path, provisional)
+                except BaseException:
+                    pass
+            raise FiniteArtifactIntegrityError("finite candidate reservation close is incomplete") from close_error
+    captured = _snapshot_at(parent_descriptor, name, path)
+    if not _same_object(captured, provisional) or stat.S_IMODE(captured.mode) != 0o600:
+        try:
+            _unlink_candidate(parent_descriptor, path, provisional)
+        except BaseException:
+            pass
+        raise FiniteArtifactIntegrityError("finite candidate changed during reservation")
+    return captured
+
+
+def _fsync_publication_candidate(parent_descriptor: int, path: Path, expected: FiniteFileSnapshot) -> None:
+    descriptor = os.open(path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_descriptor)
+    primary = None
+    try:
+        state = os.fstat(descriptor)
+        if (int(state.st_dev), int(state.st_ino)) != (expected.device, expected.inode):
+            raise FiniteArtifactIntegrityError("finite candidate changed before file fsync")
+        _fsync(descriptor)
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        close_error = _close_descriptor_once(descriptor)
+        if close_error is not None:
+            if primary is not None:
+                _attach_secondary_close(primary, close_error, "candidate fsync")
+            else:
+                raise FiniteArtifactIntegrityError("finite candidate fsync descriptor close is incomplete") from close_error
+
+
+def _cleanup_publication_candidate(parent_descriptor: int, path: Path, authority: FiniteFileSnapshot) -> tuple[str | None, BaseException | None]:
+    try:
+        _unlink_candidate(parent_descriptor, path, authority)
+        return None, None
+    except BaseException as error:
+        try:
+            current = _try_observe_at(parent_descriptor, path.name, path)
+        except BaseException:
+            current = None
+        return (str(path) if current is not None and current[:2] == (authority.device, authority.inode) else None), error
+
+
+@dataclass(frozen=True, slots=True)
+class _FinitePublicationFacts:
+    """Private storage facts for one finite document."""
+
+    published: bool
+    terminal: StreamTerminal | None
+    error: BaseException | None
+
+
+class _FinitePublicationSession:
+    """One private candidate, slot hold, and final publication boundary.
+
+    This deliberately knows no lineage, result, or scientific policy.  Domain
+    adapters own those facts; this owner only keeps an actually-open document
+    and its public slot together until close, replacement, and observation.
+    """
+
+    def __init__(self, target: Path | str) -> None:
+        self.target = Path(target)
+        self._parent_descriptor: int | None = None
+        self._parent_state: tuple[int, int, int, int, int, int] | None = None
+        self._hold = None
+        self._candidate: Path | None = None
+        self._reservation: FiniteFileSnapshot | None = None
+        self._document = None
+        self._published = False
+        self._file_synced = False
+        self.diagnostics: list[str] = []
+        self.hidden_orphan: str | None = None
+
+    @classmethod
+    def adopt(
+        cls,
+        target: Path,
+        *,
+        parent_descriptor: int,
+        parent_state: tuple[int, int, int, int, int, int],
+        hold: object,
+        candidate: Path,
+        reservation: FiniteFileSnapshot,
+    ) -> "_FinitePublicationSession":
+        """Take the already-admitted seeded candidate for its common terminal."""
+        value = cls(target)
+        value._parent_descriptor = parent_descriptor
+        value._parent_state = parent_state
+        value._hold = hold
+        value._candidate = candidate
+        value._reservation = reservation
+        value._file_synced = True  # Seeded validation already crossed file fsync.
+        return value
+
+    @property
+    def parent_descriptor(self) -> int:
+        return self._require_parent()
+
+    @property
+    def parent_state(self) -> tuple[int, int, int, int, int, int]:
+        if self._parent_state is None:
+            raise RuntimeError("finite publication session is not open")
+        return self._parent_state
+
+    @property
+    def candidate(self) -> Path:
+        if self._candidate is None:
+            raise RuntimeError("finite publication candidate is not reserved")
+        return self._candidate
+
+    @property
+    def document(self):
+        if self._document is None:
+            raise RuntimeError("finite publication document is not open")
+        return self._document
+
+    def _require_parent(self) -> int:
+        descriptor, admitted = self._parent_descriptor, self._parent_state
+        if descriptor is None or admitted is None:
+            raise RuntimeError("finite publication session is not open")
+        _require_publication_parent(self.target, descriptor, admitted)
+        return descriptor
+
+    def start(self, opener: Callable[[Path], object]) -> object:
+        if self._parent_descriptor is not None:
+            raise RuntimeError("finite publication session is one-shot")
+        descriptor, admitted = _open_publication_parent(self.target)
+        self._parent_descriptor = descriptor
+        self._parent_state = admitted
+        try:
+            self._hold = _acquire_publication_slot(self.target)
+            self._reservation = _reserve_publication_candidate(
+                descriptor, self.target, secrets.token_hex(16), suffix=".nexus",
+            )
+            self._candidate = Path(self._reservation.path)
+            self._document = opener(self._candidate)
+            return self._document
+        except BaseException:
+            self.abort()
+            raise
+
+    def close_document(self) -> bool:
+        document = self._document
+        if document is None:
+            return True
+        try:
+            document.close()
+        except BaseException:
+            return False
+        self._document = None
+        return True
+
+    def _warning(self, code: str, error: BaseException | None) -> None:
+        if error is not None:
+            self.diagnostics.append(_bounded_diagnostic(code, error))
+
+    def _release(self) -> None:
+        hold, self._hold = self._hold, None
+        self._warning(FINITE_SLOT_LEASE_WARNING, _release_publication_slot(hold))
+        descriptor, self._parent_descriptor = self._parent_descriptor, None
+        self._parent_state = None
+        if descriptor is not None:
+            self._warning(FINITE_DESCRIPTOR_CLOSE_WARNING, _close_descriptor_once(descriptor))
+
+    def _discard(self) -> None:
+        if self._candidate is not None and self._parent_descriptor is not None and self._reservation is not None:
+            self.hidden_orphan, error = _cleanup_publication_candidate(
+                self._parent_descriptor, self._candidate, self._reservation,
+            )
+            self._warning(FINITE_CANDIDATE_CLEANUP_WARNING, error)
+
+    def abort(self) -> bool:
+        if not self.close_document():
+            return False
+        try:
+            if not self._published:
+                self._discard()
+        finally:
+            self._release()
+        return True
+
+    def publish(
+        self,
+        expected_target,
+        *,
+        ordinal: int,
+        observe: Callable[[Path, int], StreamTerminal],
+    ) -> _FinitePublicationFacts:
+        if self._document is not None:
+            raise RuntimeError("finite publication requires its document to close")
+        candidate = self.candidate
+        descriptor = self._parent_descriptor
+        renamed = False
+        primary = None
+        try:
+            self._require_parent()
+            if self._reservation is None:
+                raise RuntimeError("finite publication lost its reservation")
+            if not self._file_synced:
+                _fsync_publication_candidate(descriptor, candidate, self._reservation)
+            if expected_target is not None and capture_target_snapshot(self.target) != expected_target:
+                raise FiniteArtifactIntegrityError("finite public target changed")
+            replace_into_place(candidate.name, self.target.name, verb="publish", src_dir_fd=descriptor, dst_dir_fd=descriptor)
+            renamed = self._published = True
+            try:
+                observed = _try_observe_at(descriptor, self.target.name, self.target)
+            except FiniteArtifactIntegrityError as error:
+                raise FiniteArtifactCollision("finite publication found a foreign public occupant") from error
+            expected = self._reservation
+            if observed is None or observed[:2] != (expected.device, expected.inode):
+                raise FiniteArtifactIntegrityError("finite slot changed under an exclusive hold")
+            terminal = observe(self.target, ordinal)
+            try:
+                _fsync_parent(descriptor)
+            except BaseException as error:
+                self._warning(FINITE_PARENT_DIRECTORY_FSYNC_WARNING, error)
+            return _FinitePublicationFacts(True, terminal, None)
+        except BaseException as error:
+            primary = error
+            # A replacement syscall may report after it has linked the inode.
+            # Observe the public name before classifying that as pre-publication
+            # failure; the prior slot must never be reconstructed or deleted.
+            if not renamed and self._reservation is not None:
+                try:
+                    observed = _try_observe_at(
+                        descriptor, self.target.name, self.target,
+                    )
+                    if observed is not None and observed[:2] == (
+                        self._reservation.device, self._reservation.inode,
+                    ):
+                        renamed = self._published = True
+                        try:
+                            return _FinitePublicationFacts(
+                                True, observe(self.target, ordinal), None,
+                            )
+                        except BaseException as observed_error:
+                            return _FinitePublicationFacts(
+                                True, None, observed_error,
+                            )
+                except FiniteArtifactIntegrityError as observation_error:
+                    # Preserve the seeded publisher's existing uncertainty
+                    # rule: an occupied name after an ambiguous rename is not
+                    # proof that nothing was published.
+                    try:
+                        os.stat(self.target.name, dir_fd=descriptor, follow_symlinks=False)
+                    except FileNotFoundError:
+                        raise observation_error
+                    renamed = self._published = True
+                    collision = FiniteArtifactCollision("finite publication found a foreign public occupant")
+                    collision.__cause__ = observation_error
+                    return _FinitePublicationFacts(True, None, collision)
+            if renamed:
+                return _FinitePublicationFacts(True, None, error)
+            raise
+        finally:
+            if not renamed:
+                self._discard()
+            self._release()
+            if primary is not None:
+                for diagnostic in self.diagnostics:
+                    primary.add_note(diagnostic)
+
+
 class FiniteArtifactPublisher:
     """One-shot local publisher for an immutable finite artifact."""
 
@@ -1996,8 +2330,8 @@ class FiniteArtifactPublisher:
         nothing is written yet) until `close_parent`, which every exit path
         runs.
         """
-        self._slot_hold = get_output_transaction_coordinator().hold_target(
-            self.request.output_artifact, label="finite-artifact",
+        self._slot_hold = _acquire_publication_slot(
+            Path(self.request.output_artifact),
         )
 
     def _release_slot(self) -> BaseException | None:
@@ -2006,83 +2340,20 @@ class FiniteArtifactPublisher:
         Returns the first failure rather than raising: releasing a hold must
         never mask the outcome -- success or failure -- the caller came for.
         """
-        hold = self._slot_hold
-        if hold is None:
-            return None
-        self._slot_hold = None
-        try:
-            get_output_transaction_coordinator().release_target(hold)
-        except BaseException as error:
-            return error
-        return None
+        hold, self._slot_hold = self._slot_hold, None
+        return _release_publication_slot(hold)
 
     def _open_parent(self) -> tuple[int, tuple[int, int, int, int, int, int]]:
-        parent = Path(self.request.output_artifact).parent
-        try:
-            named_before = os.lstat(parent)
-        except OSError as error:
-            raise FiniteArtifactIntegrityError(
-                "finite output parent cannot be admitted"
-            ) from error
-        if stat.S_ISLNK(named_before.st_mode) or not stat.S_ISDIR(
-            named_before.st_mode
-        ):
-            raise FiniteArtifactIntegrityError(
-                "finite output parent must be a named non-symlink directory"
-            )
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(parent, flags)
-        except OSError as error:
-            raise FiniteArtifactIntegrityError(
-                "finite output parent cannot be opened without symlinks"
-            ) from error
-        try:
-            opened = os.fstat(descriptor)
-            named_after = os.lstat(parent)
-        except BaseException as primary:
-            close_error = _close_descriptor_once(descriptor)
-            if close_error is not None:
-                _attach_secondary_close(
-                    primary, close_error, "output parent admission",
-                )
-            raise primary.with_traceback(primary.__traceback__)
-        if (
-            stat.S_ISLNK(named_after.st_mode)
-            or not stat.S_ISDIR(opened.st_mode)
-            or not stat.S_ISDIR(named_after.st_mode)
-            or _state(named_before)[:3] != _state(opened)[:3]
-            or _state(opened)[:3] != _state(named_after)[:3]
-        ):
-            primary = FiniteArtifactIntegrityError(
-                "finite output parent changed during admission"
-            )
-            close_error = _close_descriptor_once(descriptor)
-            if close_error is not None:
-                _attach_secondary_close(
-                    primary, close_error, "output parent admission",
-                )
-            raise primary
-        return descriptor, _state(opened)
+        return _open_publication_parent(Path(self.request.output_artifact))
 
     def _require_parent(
         self,
         descriptor: int,
         admitted: tuple[int, int, int, int, int, int],
     ) -> None:
-        opened = os.fstat(descriptor)
-        named = os.lstat(Path(self.request.output_artifact).parent)
-        # Candidate creation and publication legitimately change directory
-        # size/timestamps.  Custody is the still-named directory object and its
-        # directory type, not an immutable directory-content snapshot.
-        if (
-            _state(opened)[:3] != admitted[:3]
-            or _state(named)[:3] != admitted[:3]
-            or stat.S_ISLNK(named.st_mode)
-            or not stat.S_ISDIR(opened.st_mode)
-            or not stat.S_ISDIR(named.st_mode)
-        ):
-            raise FiniteArtifactIntegrityError("finite output parent changed")
+        _require_publication_parent(
+            Path(self.request.output_artifact), descriptor, admitted,
+        )
 
     def _require_candidate_capacity(
         self,
@@ -2113,98 +2384,10 @@ class FiniteArtifactPublisher:
             )
 
     def _reserve_candidate(self, parent_descriptor: int) -> FiniteFileSnapshot:
-        name = (
-            f".xdart-finite-{self.request.version_identity}-"
-            f"{secrets.token_hex(16)}.candidate"
+        return _reserve_publication_candidate(
+            parent_descriptor, Path(self.request.output_artifact),
+            self.request.version_identity,
         )
-        flags = (
-            os.O_CREAT
-            | os.O_EXCL
-            | os.O_RDWR
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
-        try:
-            descriptor = os.open(name, flags, 0o600, dir_fd=parent_descriptor)
-        except FileExistsError as error:
-            raise FiniteArtifactCollision(
-                f"finite private candidate already exists: {name}"
-            ) from error
-        path = Path(self.request.output_artifact).parent / name
-        provisional: FiniteFileSnapshot | None = None
-        primary: BaseException | None = None
-        close_cause: BaseException | None = None
-        try:
-            state = os.fstat(descriptor)
-            provisional = FiniteFileSnapshot(
-                str(path),
-                int(state.st_size),
-                hashlib.sha256(b"").hexdigest(),
-                int(state.st_dev),
-                int(state.st_ino),
-                int(state.st_mode),
-                int(state.st_mtime_ns),
-                int(state.st_ctime_ns),
-            )
-            if not stat.S_ISREG(state.st_mode):
-                raise FiniteArtifactIntegrityError(
-                    "finite candidate reservation is not regular"
-                )
-        except BaseException as error:
-            primary = error
-        close_error = _close_descriptor_once(descriptor)
-        if close_error is not None:
-            if primary is None:
-                primary = FiniteArtifactIntegrityError(
-                    "finite candidate reservation close is incomplete"
-                )
-                close_cause = close_error
-            else:
-                _attach_secondary_close(
-                    primary, close_error, "candidate reservation",
-                )
-        if primary is not None:
-            if provisional is not None:
-                try:
-                    _unlink_candidate(parent_descriptor, path, provisional)
-                except BaseException as cleanup_error:
-                    try:
-                        primary.add_note(_bounded_diagnostic(
-                            FINITE_CANDIDATE_CLEANUP_WARNING, cleanup_error
-                        ) + f":{path}")
-                    except BaseException:
-                        pass
-            else:
-                try:
-                    primary.add_note(
-                        f"{FINITE_CANDIDATE_CLEANUP_WARNING}:{path}"
-                    )
-                except BaseException:
-                    pass
-            if close_cause is not None:
-                raise primary from close_cause
-            raise primary.with_traceback(primary.__traceback__)
-        if provisional is None:
-            raise RuntimeError("finite reservation lost its provisional identity")
-        try:
-            captured = _snapshot_at(parent_descriptor, name, path)
-            if not _same_object(captured, provisional):
-                raise FiniteArtifactIntegrityError(
-                    "finite candidate changed during reservation"
-                )
-            if stat.S_IMODE(captured.mode) != 0o600:
-                raise FiniteArtifactIntegrityError("finite candidate mode is not 0600")
-            return captured
-        except BaseException as primary:
-            try:
-                _unlink_candidate(parent_descriptor, path, provisional)
-            except BaseException as cleanup_error:
-                try:
-                    primary.add_note(_bounded_diagnostic(
-                        FINITE_CANDIDATE_CLEANUP_WARNING, cleanup_error
-                    ) + f":{path}")
-                except BaseException:
-                    pass
-            raise
 
     def _open_binding(
         self,
@@ -2458,32 +2641,7 @@ class FiniteArtifactPublisher:
         path: Path,
         expected: FiniteFileSnapshot,
     ) -> None:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
-        primary: BaseException | None = None
-        try:
-            state = os.fstat(descriptor)
-            if (int(state.st_dev), int(state.st_ino)) != (
-                expected.device,
-                expected.inode,
-            ):
-                raise FiniteArtifactIntegrityError(
-                    "finite candidate changed before file fsync"
-                )
-            _fsync(descriptor)
-        except BaseException as error:
-            primary = error
-        close_error = _close_descriptor_once(descriptor)
-        if primary is not None:
-            if close_error is not None:
-                _attach_secondary_close(
-                    primary, close_error, "candidate fsync descriptor",
-                )
-            raise primary.with_traceback(primary.__traceback__)
-        if close_error is not None:
-            raise FiniteArtifactIntegrityError(
-                "finite candidate fsync descriptor close is incomplete"
-            ) from close_error
+        return _fsync_publication_candidate(parent_descriptor, path, expected)
 
     def _inspect_exact(
         self,
@@ -2649,25 +2807,9 @@ class FiniteArtifactPublisher:
         candidate: Path,
         authority: FiniteFileSnapshot,
     ) -> tuple[str | None, BaseException | None]:
-        try:
-            _unlink_candidate(parent_descriptor, candidate, authority)
-            return None, None
-        except BaseException as error:
-            try:
-                current = _try_observe_at(
-                    parent_descriptor,
-                    candidate.name,
-                    candidate,
-                )
-            except BaseException:
-                current = None
-            hidden = (
-                str(candidate)
-                if current is not None
-                and current[:2] == (authority.device, authority.inode)
-                else None
-            )
-            return hidden, error
+        return _cleanup_publication_candidate(
+            parent_descriptor, candidate, authority,
+        )
 
     def publish(
         self,
@@ -2938,149 +3080,58 @@ class FiniteArtifactPublisher:
                 self._require_parent(parent_descriptor, parent_state)
                 if self._cancelled():
                     return cleanup_result(FiniteArtifactDisposition.ABORTED)
-                link_error: BaseException | None = None
-                try:
-                    # ATOMIC REPLACEMENT (ADR-0010; maintainer ruling
-                    # 2026-09-04).  Was a NO-CLOBBER link, so an occupied slot
-                    # kept the OLD file and discarded newly validated science.
-                    # `os.replace` is atomic on POSIX and Windows, so the prior
-                    # slot stays whole and visible right up to this instant.
-                    #
-                    # UNCONDITIONAL, as ruled: the slot name is fully determined
-                    # by family plus operation, so an occupant is by definition
-                    # this operation's own output.  A hand-placed file at that
-                    # name IS destroyed -- an accepted consequence.  The
-                    # CONCURRENT case is guarded by the H23 hold, not by this
-                    # syscall.
-                    replace_into_place(
-                        candidate.name,
-                        target.name,
-                        verb="publish",
-                        src_dir_fd=parent_descriptor,
-                        dst_dir_fd=parent_descriptor,
-                    )
-                except BaseException as error:
-                    link_error = error
-                else:
-                    # The rename is the public visibility point AND it consumed
-                    # the candidate name.  Later namespace inspection may fail,
-                    # but accounting must retain HELD state rather than treating
-                    # a visible effect as a pre-publication abort.
-                    own_link_observed = True
-                    candidate_consumed = True
-                try:
-                    final_state = _try_observe_at(
-                        parent_descriptor,
-                        target.name,
-                        target,
-                    )
-                except FiniteArtifactIntegrityError as observation_error:
-                    try:
-                        os.stat(
-                            target.name,
-                            dir_fd=parent_descriptor,
-                            follow_symlinks=False,
+                # The validated seeded candidate now crosses the SAME final
+                # rename/observation boundary as a cold Average document.  The
+                # domain-specific lineage callback remains here; storage no
+                # longer owns a second publication tail.
+                session = _FinitePublicationSession.adopt(
+                    target,
+                    parent_descriptor=parent_descriptor,
+                    parent_state=parent_state,
+                    hold=self._slot_hold,
+                    candidate=candidate,
+                    reservation=validated.snapshot,
+                )
+                self._slot_hold = None
+                parent_closed = True
+
+                def observe_seeded(path: Path, ordinal: int) -> StreamTerminal:
+                    if accept_validated_commit is not None:
+                        return self._accept_validated_own_link(
+                            path, validated, accept_validated_commit,
+                            parent_descriptor=session.parent_descriptor,
+                            parent_state=session.parent_state,
                         )
-                    except FileNotFoundError:
-                        raise observation_error
-                    if link_error is not None:
-                        # The rename may have landed before reporting failure.
-                        # An occupied final name plus an unavailable exact
-                        # observation is therefore an unresolved public effect,
-                        # never a proven pre-publication abort.  The old
-                        # `FileExistsError` exemption is gone with the
-                        # no-clobber link: `os.replace` cannot raise it.
-                        own_link_observed = True
-                    raise FiniteArtifactCollision(
-                        "finite publication found a foreign public occupant"
-                    ) from observation_error
-                if (
-                    final_state is not None
-                    and final_state[:5] == (
-                        validated.snapshot.device,
-                        validated.snapshot.inode,
-                        validated.snapshot.mode,
-                        validated.snapshot.size,
-                        validated.snapshot.mtime_ns,
+                    return self._inspect_exact(
+                        path, inspect_committed,
+                        parent_descriptor=session.parent_descriptor,
+                        parent_state=session.parent_state,
+                        collision=False,
+                        expected=validated.snapshot,
                     )
-                ):
-                    disposition = FiniteArtifactDisposition.COMMITTED
-                    own_link_observed = True
-                elif link_error is not None:
-                    # The rename FAILED.  Whatever occupies the slot is the
-                    # prior file, exactly as ADR-0010 promises, so this is that
-                    # failure and not a foreign writer.  Ordered before the
-                    # branch below: reversed, a failed rename over an existing
-                    # slot reported "changed under an exclusive hold" and buried
-                    # the real cause.
-                    raise link_error.with_traceback(link_error.__traceback__)
-                elif final_state is not None:
-                    # The rename reported success and yet the slot is not our
-                    # inode: something outside this process wrote it in between.
-                    # Under the H23 hold no xdart operation can, so this is an
-                    # integrity failure -- NOT the old "already committed, reuse
-                    # it" reading, which only made sense when a no-clobber link
-                    # could legitimately lose a race.
-                    raise FiniteArtifactIntegrityError(
-                        "finite slot changed under an exclusive hold"
+
+                try:
+                    facts = session.publish(
+                        None, ordinal=1, observe=observe_seeded,
                     )
-                else:
-                    raise FiniteArtifactIntegrityError(
-                        "finite publication effect cannot be established"
-                    )
-                if candidate_consumed:
-                    # Nothing left to unlink: the rename moved the candidate ONTO
-                    # the slot.  Asking anyway raises FileNotFoundError and hangs
-                    # a spurious cleanup warning off a clean publication.
-                    hidden_orphan, cleanup_error = None, None
-                else:
-                    hidden_orphan, cleanup_error = self._cleanup(
-                        parent_descriptor,
-                        candidate,
-                        validated.snapshot,
-                    )
-                if cleanup_error is not None:
-                    diagnostics.append(_bounded_diagnostic(
-                        FINITE_CANDIDATE_CLEANUP_WARNING, cleanup_error
-                    ))
-                if disposition is FiniteArtifactDisposition.COMMITTED:
-                    try:
-                        _fsync_parent(parent_descriptor)
-                    except BaseException as error:
-                        diagnostics.append(_bounded_diagnostic(
-                            FINITE_PARENT_DIRECTORY_FSYNC_WARNING, error
-                        ))
-                if (
-                    disposition is FiniteArtifactDisposition.COMMITTED
-                    and accept_validated_commit is not None
-                ):
-                    terminal = self._accept_validated_own_link(
-                        target,
-                        validated,
-                        accept_validated_commit,
-                        parent_descriptor=parent_descriptor,
-                        parent_state=parent_state,
-                    )
-                else:
-                    terminal = self._inspect_exact(
-                        target,
-                        inspect_committed,
-                        parent_descriptor=parent_descriptor,
-                        parent_state=parent_state,
-                        collision=(
-                            disposition
-                            is FiniteArtifactDisposition.ALREADY_COMMITTED
-                        ),
-                        expected=(
-                            validated.snapshot
-                            if disposition is FiniteArtifactDisposition.COMMITTED
-                            else None
-                        ),
-                    )
-                close_parent()
+                except BaseException:
+                    # The session has already discarded/released its private
+                    # candidate and parent.  Do not let the outer seeded
+                    # cleanup re-use those closed capabilities.
+                    candidate_consumed = True
+                    raise
+                finally:
+                    diagnostics.extend(session.diagnostics)
+                    hidden_orphan = session.hidden_orphan
+                candidate_consumed = facts.published
+                own_link_observed = facts.published
+                if facts.error is not None:
+                    raise FiniteArtifactPublicationHeld(
+                        self.request, facts.error, diagnostics=tuple(diagnostics),
+                    ) from facts.error
                 return self._result(
-                    disposition,
-                    terminal=terminal,
+                    FiniteArtifactDisposition.COMMITTED,
+                    terminal=facts.terminal,
                     seed_receipt=seed_receipt,
                     hidden_orphan=hidden_orphan,
                     diagnostics=tuple(diagnostics),

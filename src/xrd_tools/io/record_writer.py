@@ -1995,6 +1995,7 @@ class NexusRecordWriter:
         finite_seed_binding: FiniteSeedBinding | None = None,
         finite_candidate_binding: FiniteCandidateBinding | None = None,
         prepared_manifest_admission: PreparedManifestAdmission | None = None,
+        finite_document: bool = False,
     ) -> None:
         if flush_every is not None and int(flush_every) <= 0:
             raise ValueError(f"flush_every must be > 0 or None; got {flush_every}")
@@ -2025,20 +2026,31 @@ class NexusRecordWriter:
         self._opener = opener
         self._transaction_binding = transaction_binding
         if seeded_document is not None and (
-            type(seeded_document) is not h5py.File
+            (type(seeded_document) is not h5py.File
+             and not (finite_document and isinstance(seeded_document, h5py.File)))
             or not seeded_document.id.valid
             or seeded_document.mode != "r+"
         ):
             raise TypeError("seeded replacement document must be one open h5py.File")
-        if not (
+        if type(finite_document) is not bool:
+            raise TypeError("finite_document must be an exact bool")
+        seeded_values = (
+            seeded_document is not None
+            and finite_request is None
+            and finite_seed_binding is None
+            and finite_candidate_binding is None
+            if finite_document else
             (seeded_document is None)
             == (finite_request is None)
             == (finite_seed_binding is None)
             == (finite_candidate_binding is None)
-        ):
+        )
+        if not seeded_values:
             raise ValueError(
                 "seeded document, finite request, and seed binding must be supplied together"
             )
+        if finite_document and finite_request is not None:
+            raise ValueError("cold finite document cannot carry a seeded request")
         if finite_request is not None and (
             type(finite_request) is not FiniteArtifactRequest
             or type(finite_seed_binding) is not FiniteSeedBinding
@@ -2083,6 +2095,7 @@ class NexusRecordWriter:
                 "seeded replacement cannot use a transaction, overwrite, or atomic path"
             )
         self._seeded_document = seeded_document
+        self._finite_document = finite_document
         self._finite_request = finite_request
         self._finite_seed_binding = finite_seed_binding
         self._finite_candidate_binding = finite_candidate_binding
@@ -2121,7 +2134,8 @@ class NexusRecordWriter:
         )
         if any(value is not None for value in replacement_values) and (not all(value is not None for value in replacement_values) or replacement_owner_count != 1 or fast_regenerable or replacement_source_execution is None or not self.source_base): raise ValueError("selected-dimension replacement configuration is incomplete or unbound")
         if replacement_dimension is None and (replacement_source_execution is not None or replacement_append_lineage is not None): raise ValueError("replacement source context requires a selected dimension")
-        if seeded_document is not None and replacement_dimension is None:
+        if (seeded_document is not None and replacement_dimension is None
+                and not finite_document):
             raise ValueError("seeded document mode is replacement-only")
         if replacement_dimension is not None:
             try:
@@ -2143,9 +2157,9 @@ class NexusRecordWriter:
             self._replacement_configuration is not None or append_decision.disposition is not AppendDisposition.WRITE
         ):
             raise ValueError("writer requires a WRITE Append decision")
-        if append_decision is not None and transaction_binding is None:
+        if append_decision is not None and transaction_binding is None and not finite_document:
             raise ValueError("Append writer requires a live transaction binding")
-        if append_decision is not None and seeded_document is not None:
+        if append_decision is not None and seeded_document is not None and not finite_document:
             raise ValueError("seeded finite replacement cannot Append")
         if transaction_binding is not None and atomic:
             raise ValueError("transaction-bound writer cannot replace its owned inode")
@@ -2256,6 +2270,30 @@ class NexusRecordWriter:
             finite_seed_binding=seed_binding,
             finite_candidate_binding=candidate_binding,
             prepared_manifest_admission=prepared_manifest_admission,
+        )
+
+    @classmethod
+    def for_finite_document(
+        cls,
+        logical_target: Path | str,
+        document: h5py.File,
+        *,
+        entry: str,
+        source_base: Path | str | None,
+        artifact_family: str | None = None,
+        file_lock: Any | None = None,
+        compression: str | None = "gzip",
+        flush_every: int | None = None,
+        append_decision: AppendDecision | None = None,
+    ) -> "NexusRecordWriter":
+        """Write one fresh document owned and closed by finite publication."""
+        return cls(
+            logical_target, entry=entry, compression=compression,
+            overwrite=False, atomic=False, flush_every=flush_every,
+            complete_record=True, source_base=source_base,
+            artifact_family=artifact_family, file_lock=file_lock,
+            seeded_document=document, finite_document=True,
+            append_decision=append_decision,
         )
 
     @property
@@ -4423,7 +4461,9 @@ class NexusRecordWriter:
                 seeded = self._seeded_document
                 exists = False if seeded is not None else self.target.exists()
                 logical_exists = (
-                    True
+                    False
+                    if self._finite_document
+                    else True
                     if seeded is not None
                     else bool(binding.transaction.stream_base_snapshot.exists)
                     if binding is not None else exists
@@ -6236,14 +6276,16 @@ class NexusRecordWriter:
                     if self._seeded_document is not None:
                         verification = (
                             ()
-                            if self._prepared_manifest_admission is not None
+                            if self._finite_document
+                            or self._prepared_manifest_admission is not None
                             else (("verify", self._verify_replacement_manifest),)
                         )
-                        steps = (
-                            common[0],
-                            ("result-seal", self._seal_finite_replacement_result),
-                            common[1],
-                        ) + verification + (
+                        prefix = (
+                            (common[0], common[1])
+                            if self._finite_document else
+                            (common[0], ("result-seal", self._seal_finite_replacement_result), common[1])
+                        )
+                        steps = prefix + verification + (
                             ("admission", require_terminal_admission),
                             ("checkpoint", lambda: checkpoint(publish_receipts=False)),
                             ("close", self._close_handle),

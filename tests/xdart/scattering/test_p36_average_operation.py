@@ -756,23 +756,22 @@ def test_average_internal_source_failure_retains_exact_owner_until_close(
 def test_average_internal_h23_failure_retains_revisioned_owner_until_close(
     tmp_path, monkeypatch,
 ) -> None:
-    from xrd_tools.io.output_transaction import OutputTransaction
+    from xrd_tools.io.finite_artifact import _FinitePublicationSession
     from xrd_tools.reduction import average as average_module
 
     source = _source(tmp_path / "source")
     target = tmp_path / "average.nxs"
     integrations = _stub_integrators(monkeypatch)
-    real_sink = average_module.NexusSink
+    real_sink_factory = average_module.NexusSink.for_finite_document
     real_runner = average_module.AverageScanRunner
     real_retry = real_runner._retry_output_once
-    real_commit = OutputTransaction.commit_stream
     sinks = []
     runners = []
     retries = []
-    commits = []
+    closes = []
 
     def capture_sink(*args, **kwargs):
-        value = real_sink(*args, **kwargs)
+        value = real_sink_factory(*args, **kwargs)
         sinks.append(value)
         return value
 
@@ -787,15 +786,18 @@ def test_average_internal_h23_failure_retains_revisioned_owner_until_close(
             raise RuntimeError("injected retry owner failure")
         return real_retry(owner)
 
-    def hold_commit_twice(owner, *args, **kwargs):
-        commits.append(id(owner))
-        if len(commits) <= 2:
-            raise OSError("injected H23 commit hold")
-        return real_commit(owner, *args, **kwargs)
+    real_close = _FinitePublicationSession.close_document
+    def hold_close_twice(owner):
+        closes.append(id(owner))
+        if len(closes) <= 2:
+            return False
+        return real_close(owner)
 
-    monkeypatch.setattr(average_module, "NexusSink", capture_sink)
+    monkeypatch.setattr(
+        average_module.NexusSink, "for_finite_document", capture_sink,
+    )
     monkeypatch.setattr(real_runner, "_retry_output_once", fail_internal_retry_once)
-    monkeypatch.setattr(OutputTransaction, "commit_stream", hold_commit_twice)
+    monkeypatch.setattr(_FinitePublicationSession, "close_document", hold_close_twice)
     monkeypatch.setattr(adapter, "AverageScanRunner", capture_runner)
     slot = OperationSlot()
     identity = slot.begin_average(
@@ -848,13 +850,12 @@ def test_average_internal_h23_failure_retains_revisioned_owner_until_close(
     assert len(runners) == len(sinks) == 1
     assert runners[0]._pending_revision == 3
     assert runners[0]._source_window is None
-    assert sinks[0]._transaction_owners is None
-    assert len(set(commits)) == 1 and len(commits) == 3
-    assert len(set(retries)) == 1 and len(retries) == 3
+    assert len(set(closes)) == 1 and len(closes) == 3
+    assert len(set(retries)) == 1 and len(retries) == 2
     assert tuple(integrations) == frozen_integrations
     assert receipts[-1].terminal is not None
-    assert receipts[-1].terminal.status is OperationTerminalStatus.RETURNED
-    assert receipts[-1].terminal.payload.disposition == "COMMITTED"
+    assert receipts[-1].terminal.status is OperationTerminalStatus.CANCELLED
+    assert receipts[-1].terminal.payload.disposition == "CANCELLED"
     assert not worker.is_alive()
 
 
@@ -1504,7 +1505,7 @@ def test_average_publication_gate_linearizes_cancel_wins_and_seal_wins(
     tmp_path, monkeypatch
 ) -> None:
     from xrd_tools.io import get_average_finite_counts
-    from xrd_tools.io.output_transaction import OutputTransaction
+    from xrd_tools.io.finite_artifact import _FinitePublicationSession
     _stub_integrators(monkeypatch)
     real_run = _run_terminal_average
 
@@ -1519,10 +1520,10 @@ def test_average_publication_gate_linearizes_cancel_wins_and_seal_wins(
         progress_waiting = threading.Event(); progress_release = threading.Event()
         terminal_waiting = threading.Event(); terminal_release = threading.Event()
         gate_results = []; commits = []; progress_seen = []
-        real_commit = OutputTransaction.commit_stream
+        real_publish = _FinitePublicationSession.publish
         real_body = OperationSlot._run_average_request
-        def commit(owner, *args, **kwargs):
-            commits.append(id(owner)); return real_commit(owner, *args, **kwargs)
+        def publish(owner, *args, **kwargs):
+            commits.append(id(owner)); return real_publish(owner, *args, **kwargs)
         def body(owner, *args, **kwargs):
             terminal = real_body(owner, *args, **kwargs)
             terminal_waiting.set(); assert terminal_release.wait(5)
@@ -1547,7 +1548,7 @@ def test_average_publication_gate_linearizes_cancel_wins_and_seal_wins(
                                        "publication_gate": held_gate})
         with monkeypatch.context() as patch:
             patch.setattr(adapter, "AverageScanRunner", _runner_from_callable(run))
-            patch.setattr(OutputTransaction, "commit_stream", commit)
+            patch.setattr(_FinitePublicationSession, "publish", publish)
             patch.setattr(OperationSlot, "_run_average_request", body)
             slot = OperationSlot()
             identity = slot.begin_average(

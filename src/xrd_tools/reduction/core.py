@@ -1749,6 +1749,36 @@ class NexusSink:
         )
         return sink
 
+    @classmethod
+    def for_finite_document(
+        cls,
+        path: Path | str,
+        document: h5py.File,
+        *,
+        entry: str = "entry",
+        lineage_intent: AppendIntent | None = None,
+        **sink_values: Any,
+    ) -> "NexusSink":
+        """Bind a cold fresh document owned by finite publication.
+
+        This is intentionally not a transaction or a per-frame mode: the
+        caller owns one already-open private document and publishes it only
+        after the writer has detached and that owner has actually closed it.
+        """
+        if (
+            not isinstance(document, h5py.File)
+            or not document.id.valid
+            or document.mode != "r+"
+            or any(name in sink_values for name in ("overwrite", "atomic") + _ADMISSION_OWNED_KWARGS)
+        ):
+            raise TypeError("finite document requires one owned fresh h5py.File")
+        sink = cls(
+            path, entry=entry, overwrite=False, atomic=False,
+            same_run_intent=lineage_intent, **sink_values,
+        )
+        sink._finite_candidate = (document, None, None, None, None)
+        return sink
+
     @property
     def output_sink_kinds(self) -> frozenset[OutputSinkKind]:
         return frozenset({OutputSinkKind.NEXUS})
@@ -2190,8 +2220,6 @@ class NexusSink:
                     ),
                 )
             else:
-                if replacement is None:
-                    raise RuntimeError("finite candidate lost replacement facts")
                 (
                     document,
                     request,
@@ -2199,27 +2227,44 @@ class NexusSink:
                     candidate_binding,
                     prepared_manifest_admission,
                 ) = finite_candidate
-                writer = NexusRecordWriter.for_seeded_replacement(
-                    self.path,
-                    document,
-                    request,
-                    seed_binding,
-                    candidate_binding,
-                    entry=self.entry,
-                    source_base=self.source_base,
-                    artifact_family=self.artifact_family,
-                    file_lock=self.file_lock,
-                    replacement_dimension=replacement[1],
-                    replacement_labels=replacement[2],
-                    replacement_audit=replacement[3],
-                    replacement_selected_plan=replacement[4],
-                    replacement_gi_mode=replacement[5],
-                    replacement_source_execution=replacement[7],
-                    replacement_append_lineage=replacement[8],
-                    prepared_manifest_admission=prepared_manifest_admission,
-                    compression=self.compression,
-                    flush_every=self.flush_every,
-                )
+                if request is None:
+                    if replacement is not None:
+                        raise RuntimeError("cold finite document cannot replace a selected dimension")
+                    writer = NexusRecordWriter.for_finite_document(
+                        self.path, document, entry=self.entry,
+                        source_base=self.source_base,
+                        artifact_family=self.artifact_family,
+                        file_lock=self.file_lock, compression=self.compression,
+                        flush_every=self.flush_every,
+                        append_decision=(
+                            None if self.same_run_intent is None
+                            else begin_same_run_lineage(self.same_run_intent)
+                        ),
+                    )
+                else:
+                    if replacement is None:
+                        raise RuntimeError("finite candidate lost replacement facts")
+                    writer = NexusRecordWriter.for_seeded_replacement(
+                        self.path,
+                        document,
+                        request,
+                        seed_binding,
+                        candidate_binding,
+                        entry=self.entry,
+                        source_base=self.source_base,
+                        artifact_family=self.artifact_family,
+                        file_lock=self.file_lock,
+                        replacement_dimension=replacement[1],
+                        replacement_labels=replacement[2],
+                        replacement_audit=replacement[3],
+                        replacement_selected_plan=replacement[4],
+                        replacement_gi_mode=replacement[5],
+                        replacement_source_execution=replacement[7],
+                        replacement_append_lineage=replacement[8],
+                        prepared_manifest_admission=prepared_manifest_admission,
+                        compression=self.compression,
+                        flush_every=self.flush_every,
+                    )
             self._writer = writer
             if self._session_facade is not None:
                 writer.bind_session(self._session_facade)
