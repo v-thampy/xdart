@@ -492,17 +492,19 @@ def _selected_link_owner_selector(
     def canonical(value: str) -> str:
         return "/" + posixpath.normpath("/" + value.lstrip("/")).lstrip("/")
 
-    root = selected_root.file
-    root_path = Path(os.fsdecode(root.filename)).resolve()
     actual_owner = Path(os.fsdecode(dataset.file.filename)).resolve()
-    selector = canonical(str(logical_selector))
-    seen: set[str] = set()
+    current: Any = selected_root.file
+    components = tuple(
+        part for part in canonical(str(logical_selector)).split("/") if part
+    )
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
     while True:
-        if selector in seen:
+        state = (
+            os.fsdecode(current.file.filename), current.name, components,
+        )
+        if state in seen:
             raise ValueError("selected detector link is cyclic")
-        seen.add(selector)
-        current: Any = root
-        components = tuple(part for part in selector.split("/") if part)
+        seen.add(state)
         for offset, component in enumerate(components):
             if not isinstance(current, h5py.Group):
                 raise ValueError("selected detector path is incomplete")
@@ -514,19 +516,31 @@ def _selected_link_owner_selector(
                 target = str(link.path)
                 if not target.startswith("/"):
                     target = posixpath.join(current.name, target)
-                selector = canonical(posixpath.join(target, *remainder))
+                current = current.file
+                components = tuple(
+                    part for part in canonical(
+                        posixpath.join(target, *remainder),
+                    ).split("/") if part
+                )
                 break
             if isinstance(link, h5py.ExternalLink):
                 owner = Path(os.fsdecode(current.file.filename)).parent / os.fsdecode(link.filename)
                 owner = owner.resolve()
-                if owner != actual_owner:
-                    raise ValueError("selected detector owner changed during resolution")
-                return owner, canonical(posixpath.join(str(link.path), *remainder))
+                target = canonical(posixpath.join(str(link.path), *remainder))
+                if not remainder:
+                    if owner != actual_owner:
+                        raise ValueError("selected detector owner changed during resolution")
+                    return owner, target
+                current = current[component]
+                if not isinstance(current, h5py.Group):
+                    raise ValueError("selected detector path is incomplete")
+                components = remainder
+                break
+            if not remainder:
+                if actual_owner != Path(os.fsdecode(current.file.filename)).resolve():
+                    raise ValueError("selected detector owner is not linked from its master")
+                return actual_owner, canonical(posixpath.join(current.name, component))
             current = current[component]
-        else:
-            if actual_owner != root_path:
-                raise ValueError("selected detector owner is not linked from its master")
-            return actual_owner, selector
 
 
 class _ResolvedNexusStack:

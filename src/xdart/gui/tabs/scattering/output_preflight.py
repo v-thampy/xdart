@@ -3007,6 +3007,7 @@ def _external_members(
     if not segments:
         raise ValueError("external container has no member-qualified proof")
     import h5py
+    from xrd_tools.io.nexus import _selected_link_owner_selector
     master_topology = _topology_from_captured_state(master_state)
     states = {
         _source_state_key(master_topology.raw_path): master_topology
@@ -3050,7 +3051,10 @@ def _external_members(
                 dataset = parent.get(leaf)
                 if not isinstance(dataset, h5py.Dataset) or dataset.ndim not in {2, 3}:
                     raise ValueError("external container lost its exact dataset")
-                path = Path(_raw_source_path(dataset.file.filename))
+                owner_path, owner_selector = _selected_link_owner_selector(
+                    handle, segment, dataset,
+                )
+                path = Path(_raw_source_path(owner_path))
                 topology = member_state(path)
                 count = 1 if dataset.ndim == 2 else int(dataset.shape[0])
                 frame_shape = (
@@ -3073,7 +3077,7 @@ def _external_members(
                     values.append(
                         ExternalSourceState(
                             topology.followed_state,
-                            str(dataset.name),
+                            owner_selector,
                             first,
                             stop,
                             epoch,

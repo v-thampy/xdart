@@ -1187,8 +1187,8 @@ def test_soft_detector_path_materializes_with_exact_external_dependency(
     master = raw / "scan_0001.nxs"
     sidecar = landing / "pixels.nexus"
     with h5py.File(sidecar, "w") as handle:
-        handle.create_group("entry").create_group("data").create_dataset(
-            "data",
+        handle.create_group("detector").create_dataset(
+            "pixels",
             data=np.ones((2, 4, 5), dtype=np.uint16),
         )
     with h5py.File(master, "w") as handle:
@@ -1196,12 +1196,12 @@ def test_soft_detector_path_materializes_with_exact_external_dependency(
         if layout == "soft":
             data["data"] = h5py.SoftLink("/hidden/raw")
             handle.create_group("hidden")["raw"] = h5py.ExternalLink(
-                str(sidecar), "/entry/data/data",
+                str(sidecar), "/detector/pixels",
             )
         elif layout == "local":
             data.create_dataset("data", data=np.ones((2, 4, 5), dtype=np.uint16))
         else:
-            data["data"] = h5py.ExternalLink(str(sidecar), "/entry/data/data")
+            data["data"] = h5py.ExternalLink(str(sidecar), "/detector/pixels")
     poni = tmp_path / "cal.poni"
     write_poni(poni)
     source = DirectorySourceSpec(raw, suffixes=(".nxs",))
@@ -1243,14 +1243,14 @@ def test_soft_detector_path_materializes_with_exact_external_dependency(
         else:
             member, = stamp.external_members
             assert Path(member.file.path) == sidecar
-            assert member.dataset == "/entry/data/data"
+            assert member.dataset == "/detector/pixels"
             assert (member.first, member.stop, member.epoch) == (0, 2, 0)
         assert stamp.dependency_files == ()
     finally:
         session.close()
 
 
-@pytest.mark.parametrize("layout", ("ancestor", "mixed"))
+@pytest.mark.parametrize("layout", ("ancestor", "mixed", "soft"))
 def test_external_member_capture_uses_dataset_owner_and_all_segment_offsets(
     tmp_path: Path, layout: str,
 ) -> None:
@@ -1266,6 +1266,12 @@ def test_external_member_capture_uses_dataset_owner_and_all_segment_offsets(
         if layout == "ancestor":
             handle["landed"] = h5py.ExternalLink(str(sidecar), "/detector")
             paths = ("/landed/pixels",)
+        elif layout == "soft":
+            handle["bridge"] = h5py.ExternalLink(str(sidecar), "/detector")
+            handle["entry/data/data_000001"] = h5py.SoftLink(
+                "/bridge/pixels",
+            )
+            paths = ("/entry/data/data_000001",)
         else:
             paths = tuple(f"/segment_{index}" for index in range(4))
             for index, path in enumerate(paths):
@@ -1283,7 +1289,7 @@ def test_external_member_capture_uses_dataset_owner_and_all_segment_offsets(
     assert all(Path(member.file.path) == sidecar for member in members)
     assert all(member.dataset == "/detector/pixels" for member in members)
     assert [(member.first, member.stop, member.epoch) for member in members] == (
-        [(0, 2, 0)] if layout == "ancestor" else [(2, 4, 1), (6, 8, 3)]
+        [(0, 2, 0)] if layout in {"ancestor", "soft"} else [(2, 4, 1), (6, 8, 3)]
     )
 
 
