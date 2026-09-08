@@ -5961,8 +5961,37 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and not self._preferences.slice_enabled
             and not self._preferences.slice_pins
         )
+        browse_current_slice = bool(
+            browse_selected
+            and intent.processing_mode == "Int 2D"
+            and self._preferences.plot_mode == "Single"
+            and self._preferences.slice_enabled
+            and not self._preferences.slice_pins
+            and navigation.current is not None
+            and navigation.selected == (navigation.current,)
+        )
         if skip_scientific_projection:
             payloads = ()
+        elif browse_current_slice:
+            # A single cut needs the saved cake, not the sparse full-1D rows.
+            # Reuse the existing exact-current asynchronous preview; never
+            # hydrate every selected detector frame to draw one slice.
+            preview = (
+                self._context_controller.request_current_browse_preview()
+                if self._release_browse_1d_debt() else None
+            )
+            payloads = () if preview is None else (preview,)
+            self._scientific_repaint_pending = preview is None
+            if preview is None:
+                cache_adoption_missing = True
+                preserve_scientific = True
+                self._ensure_timer()
+            elif preview.view.intensity_2d is None:
+                # Never pass a native full-range 1-D row off as a 2-D cut.
+                payloads = ()
+                cache_adoption_missing = True
+                cache_terminal_diagnostic = "Selected frame has no saved 2-D data for slicing."
+                self._notice(cache_terminal_diagnostic)
         elif browse_selected and not browse_cache_supported:
             payloads = ()
             cache_adoption_missing = True

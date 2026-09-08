@@ -503,6 +503,82 @@ def test_page_fail_closes_terminal_and_incompatible_browse_cache_misses(
         _close_page(page, app)
 
 
+@pytest.mark.parametrize("two_d", [True, False])
+def test_single_browse_chi_slice_uses_saved_cake_and_keeps_images(
+    tmp_path, monkeypatch, two_d,
+) -> None:
+    import time
+    from tests.xdart.scattering.test_e4_preview_transport import _write_processed
+    from tests.xdart.scattering.test_p3_experiment_operation_composition import _close, _page
+    from xdart.gui.tabs.scattering.browse_values import BrowseLoadStatus
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    processed, _ = _write_processed(tmp_path / "slice", schema_version=3, two_d=two_d)
+    page, _ = _page(tmp_path, monkeypatch)
+    controller = page._context_controller
+
+    def wait_for(call):
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            app.processEvents()
+            value = call()
+            if value:
+                return value
+            time.sleep(0.005)
+        raise AssertionError(("Browse slice timed out", page._notice_text))
+
+    try:
+        request = controller.begin_browse(str(processed.resolve()))
+        loaded = wait_for(controller.poll_browse)
+        assert loaded.request is request and loaded.status is BrowseLoadStatus.READY
+        current = controller.navigation.frames[1]
+        assert controller.select_navigation(current, (current,))
+        page._refresh_shell()
+        view = page._shell.scientific
+        # Real controls must request a cake slice, not the stored full 1-D row.
+        view.slice_center.setValue(-1.0)
+        view.slice_width.setValue(0.1)
+        view.slice.click()
+        assert page._preferences.slice_enabled
+
+        if not two_d:
+            wait_for(lambda: (page._refresh_shell() or
+                "no saved 2-D data" in page._notice_text))
+            assert not page._last_scientific_projection.traces
+            assert not page._scientific_repaint_pending
+            return
+
+        def sliced():
+            page._refresh_shell()
+            projection = page._last_scientific_projection
+            return projection if (projection is not None and projection.traces
+                and "@" in projection.traces[0].title) else None
+
+        projection = wait_for(sliced)
+        np.testing.assert_allclose(projection.traces[0].intensity, [2.0, 4.0, 6.0])
+        assert view.raw.canvas.displayed_image.size
+        assert view.cake.canvas.displayed_image.size
+        assert len(view._slice_extent_lines) == 2
+        view.slice_center.setValue(1.0)
+        projection = wait_for(lambda: (p if (p := sliced()) is not None
+            and np.allclose(p.traces[0].intensity, [3.0, 5.0, 7.0]) else None))
+        np.testing.assert_allclose(projection.traces[0].axis.values, [0.1, 0.2, 0.3])
+        # A cold selected frame must replace both images and the cut, not keep
+        # the preceding frame under the new selection.
+        current = controller.navigation.frames[0]
+        assert controller.select_navigation(current, (current,))
+        projection = wait_for(lambda: (p if (p := sliced()) is not None
+            and p.traces[0].frame is current else None))
+        np.testing.assert_allclose(projection.traces[0].intensity, [2.0, 4.0, 6.0])
+        view.slice.click()
+        assert not page._preferences.slice_enabled
+        wait_for(lambda: (page._refresh_shell() or
+            (page._last_scientific_projection.browse_trace_snapshot is not None)))
+        np.testing.assert_allclose(page._last_scientific_projection.traces[0].intensity, [2, 3, 4])
+    finally:
+        _close(page, app)
+
+
 def test_cache_paint_exception_replaces_whole_scientific_view(
     monkeypatch,
 ) -> None:

@@ -95,6 +95,7 @@ def _write_processed(
     thumbnails: bool = True,
     two_d: bool = True,
     raw_dtype=np.uint16,
+    schema_version=2,
 ) -> tuple[Path, Path]:
     """One real processed container + one real raw master, portable layout."""
     raw = np.arange(16, dtype=raw_dtype).reshape(4, 4)
@@ -124,7 +125,7 @@ def _write_processed(
     with h5py.File(processed, "w") as handle:
         entry = handle.create_group("entry")
         entry.attrs["ssrl_schema"] = "xrd_tools.processed_scan"
-        entry.attrs["ssrl_schema_version"] = 2
+        entry.attrs["ssrl_schema_version"] = schema_version
         write_integrated_stack(
             entry,
             frame_indices=list(labels),
