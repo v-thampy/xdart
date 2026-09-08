@@ -419,7 +419,7 @@ def test_proved_dependency_drift_precedes_late_stop(
             _replace_dependency(dependency)
         return state
 
-    real_same = output_preflight._same_followed_source_revision
+    real_same = source_graph._same_followed_source_revision
 
     def compared(left, right):
         result = real_same(left, right)
@@ -436,7 +436,7 @@ def test_proved_dependency_drift_precedes_late_stop(
 
     monkeypatch.setattr(SourceFileState, "capture", staticmethod(captured))
     monkeypatch.setattr(
-        output_preflight,
+        source_graph,
         "_same_followed_source_revision",
         compared,
     )

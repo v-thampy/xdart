@@ -424,13 +424,13 @@ def test_prestamp_inventory_failure_two_sweep_order_and_cancellation(
             traces.append(f"owner:{Path(path).name}")
         return real_owner(path)
 
-    monkeypatch.setattr(output_preflight, "_resolve_source_alias", traced_resolve)
+    monkeypatch.setattr(source_graph, "_resolve_source_alias", traced_resolve)
     monkeypatch.setattr(
         source_graph,
         "_capture_canonical_source_target",
         traced_capture,
     )
-    monkeypatch.setattr(output_preflight, "_candidate_owner_id", traced_owner)
+    monkeypatch.setattr(source_graph, "_candidate_owner_id", traced_owner)
     _install_post_discovery_failure(
         monkeypatch,
         dependency_kind="external_link",

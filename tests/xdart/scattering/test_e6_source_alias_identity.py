@@ -36,7 +36,6 @@ from xdart.gui.tabs.scattering.output_preflight import SourceRevisionChanged
 from xrd_tools.core.scan import ScanFrame, SourceKind, SourceSpec
 from xrd_tools.io.output_safety import OutputCollisionError
 from xrd_tools.reduction.core import FrameReduction, NexusSink
-from xrd_tools.sources import execution_graph as graph
 from xrd_tools.sources.descriptor import ContainerDescriptor
 from xrd_tools.sources import execution_graph as source_graph
 from xrd_tools.sources.probe import ProbeState
@@ -944,9 +943,9 @@ def test_two_sweep_validation_order_and_cancellation_are_exact(
         traces.append("cancel")
         return cancel_at == cancel_calls
 
-    monkeypatch.setattr(graph, "_resolve_source_alias", resolve_alias)
-    monkeypatch.setattr(graph, "_capture_canonical_source_target", capture_target)
-    monkeypatch.setattr(graph, "_candidate_owner_id", owner_id)
+    monkeypatch.setattr(source_graph, "_resolve_source_alias", resolve_alias)
+    monkeypatch.setattr(source_graph, "_capture_canonical_source_target", capture_target)
+    monkeypatch.setattr(source_graph, "_candidate_owner_id", owner_id)
 
     if cancel_at is None:
         validated = output_preflight.validate_source_aliases(

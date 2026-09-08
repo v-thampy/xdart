@@ -79,7 +79,7 @@ def _capture_after_close(
             captures.append(Path(path))
         return real_capture(path, *args, **kwargs)
 
-    monkeypatch.setattr(output_preflight, "_capture_source_topology", counted)
+    monkeypatch.setattr(source_graph, "_capture_source_topology", counted)
     return captures
 
 

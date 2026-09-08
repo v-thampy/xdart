@@ -122,7 +122,7 @@ def test_stop_after_hdf_open_failure_precedes_topology_revalidation(
     ):
         real = getattr(source_graph, name)
         monkeypatch.setattr(
-            output_preflight,
+            source_graph,
             name,
             _trace_after(stopped, name, real, later_io),
         )
@@ -397,7 +397,7 @@ def test_trial_verification_uses_exact_callback_before_filesystem_work(
     ):
         real = getattr(source_graph, name)
         monkeypatch.setattr(
-            output_preflight,
+            source_graph,
             name,
             _trace_after(stopped, name, real, later_io),
         )
@@ -635,7 +635,7 @@ def test_stop_before_external_storage_capture_has_no_later_side_effect(
     ):
         real = getattr(source_graph, name)
         monkeypatch.setattr(
-            output_preflight,
+            source_graph,
             name,
             _trace_after(stopped, name, real, later),
         )
