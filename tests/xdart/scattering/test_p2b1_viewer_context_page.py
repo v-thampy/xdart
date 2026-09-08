@@ -397,8 +397,36 @@ def test_viewer_1d_replacement_fences_stale_completion_and_clears_before_release
     real_retry(provider, outer); _close_1d(controller)
 
 
-def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(tmp_path, monkeypatch) -> None:
+@pytest.fixture
+def real_scientific_view():
+    from pyqtgraph.Qt import QtWidgets
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    view = ScientificView()
+    yield view
+    assert view.clear_workspace()
+    view.close()
+    view.deleteLater()
+    app.processEvents()
+
+
+def _reconcile_real_viewer(view, scientific, navigation):
+    view.reconcile(scientific, navigation, completed=0,
+                   total=len(navigation.frames), detail="Ready")
+
+
+def _release_real_viewer(controller, view):
+    request = controller.begin_viewer_1d_renderer_clear()
+    assert request is not None
+    receipt = view.clear_viewer_1d(request)
+    assert receipt.cleared
+    assert controller.acknowledge_viewer_1d_renderer_clear(receipt)
+    assert controller.close_viewer_1d()
+
+
+def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(tmp_path, monkeypatch, real_scientific_view) -> None:
     import xdart.gui.tabs.scattering.context_projection as projection_module
+    render = real_scientific_view
     (tmp_path / "left").mkdir(); (tmp_path / "right").mkdir()
     first = _write_xye(tmp_path / "left/same.xye", [0, 1 + 1.5e-12, 2], [10, 11, 12], [.5, .6, .7])
     second = _write_xye(tmp_path / "right/same.xye", [.5, 1.5], [20, 21], [.8, .9])
@@ -440,23 +468,7 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     assert selected.browser.selected_artifacts == (str(second),)
     selected_by_context = _shell(controller, ScientificPreferences(plot_mode="Single"), "Int 2D")
     assert selected_by_context.scientific.processing_mode == "1D Viewer"
-    commands = []
-    view = SimpleNamespace(
-        _processing_mode="1D Viewer", _frame_keys=frames,
-        _selected_keys=(frames[1],), _single_mode=True,
-        frame_selector=SimpleNamespace(itemData=lambda _index: frames[0]),
-        commandRequested=SimpleNamespace(emit=commands.append),
-    )
-    ScientificView._frame_selected(view, 0)
-    assert commands[0].frames == (frames[0],)
-    presented = []
-    page = SimpleNamespace(
-        _context_controller=controller,
-        _refresh_shell=lambda: presented.append(
-            _shell(controller, ScientificPreferences()).scientific.traces[0].frame),
-    )
-    ScatteringWorkspace._select_frames(page, commands[0])
-    assert presented == [frames[0]] and controller.navigation.selected == (frames[0],)
+    assert controller.select_viewer_1d(frames[0], (frames[0],))
     current_only = _shell(controller, ScientificPreferences(plot_mode="Single"))
     assert current_only.browser.selected_scan == str(first)
     assert current_only.browser.selected_artifacts == (str(first),)
@@ -466,12 +478,7 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     assert overlay.scientific.traces[0].axis.values is borrow.modes[0].coordinate
     assert overlay.scientific.traces[1].axis.values is borrow.modes[1].coordinate
     assert overlay.scientific.traces[0].axis.values.shape != overlay.scientific.traces[1].axis.values.shape
-    ScatteringWorkspace._select_frames(page, ShellCommand(
-        ShellCommandKind.SELECT_BROWSER_FRAMES,
-        frame=frames[0],
-        frames=(frames[0],),
-        intent=FrameSelectionIntent.TOGGLE_TRACE,
-    ))
+    assert controller.select_viewer_1d(frames[0], (frames[1],))
     assert controller.navigation.current is frames[0]
     assert controller.navigation.selected == (frames[1],)
     toggled = _shell(
@@ -493,38 +500,45 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     assert np.array_equal(borrow.modes[0].coordinate, [0, 1 + 1.5e-12, 2])
     assert np.array_equal(borrow.modes[1].coordinate, [.5, 1.5])
     assert np.array_equal(borrow.modes[1].intensity, [20, 21]) and np.array_equal(borrow.modes[1].uncertainty, [.8, .9])
-    rendered, plots = [], []
-    legend = SimpleNamespace(setVisible=lambda _value: None)
-    curve = SimpleNamespace(listDataItems=lambda: (), clear=lambda: None,
-        getPlotItem=lambda: SimpleNamespace(legend=legend), addLegend=lambda: legend,
-        plot=lambda *args, **_kwargs: plots.append(args), setLabel=lambda *_args, **_kwargs: None)
-    render = SimpleNamespace(_processing_mode="1D Viewer", _trace_history_scope=(), _trace_selection_keys=(),
-        _trace_history_by_identity={}, _trace_history_keys=(), _bottom_waterfall_active=False, _share_link_on=False,
-        _rendered_plot_mode="", _rendered_plot_options=None, _rendered_overlay_step=None,
-        _rendered_trace_keys=(), _rendered_trace_axis_key=None,
-        _waterfall_source_keys=(), _waterfall_render_contract=None,
-        _rendered_browse_science_contract=None,
-        _merge_pinned_trace_history=lambda _state: (),
-        _bounded_waterfall_rows=lambda rows: rows, _axis_key=lambda axis: id(axis.values),
-        _waterfall_axis=lambda _scope, traces, *_args: (np.arange(len(traces), dtype=float), "Frame #"),
-        waterfall=SimpleNamespace(render=lambda rows, **kwargs: rendered.append((rows, kwargs))),
-        curve=curve, legend=legend, bottom_stack=SimpleNamespace(
-            setCurrentWidget=lambda _widget: None,
-            currentWidget=lambda: curve,
-        ))
-    render._merge_trace_history = partial(ScientificView._merge_trace_history, render); render._render_waterfall = partial(ScientificView._render_waterfall, render)
-    assert render._merge_trace_history(single.scientific, controller.navigation)[0] is trace
-    assert render._merge_trace_history(selected.scientific, controller.navigation)[0] is selected.scientific.traces[0] and render._trace_history_keys == (frames[1],)
+    _reconcile_real_viewer(render, single.scientific,
+                           FrameNavigationProjection(frames, frames[0], frames))
+    # Viewer rows borrow provider arrays; the detached native-history accessor
+    # intentionally excludes this row type. Inspect the mounted viewer history.
+    assert render._trace_history_by_identity[id(frames[0])] is trace
+    assert render._trace_history_by_identity[id(frames[0])].sigma is mode.uncertainty
+    _reconcile_real_viewer(render, selected.scientific,
+                           FrameNavigationProjection(frames, frames[1], (frames[1],)))
+    assert render.trace_history_keys == (frames[1],)
+    curve, = render.curve.listDataItems()
+    np.testing.assert_array_equal(curve.getData()[0], borrow.modes[1].coordinate)
+    np.testing.assert_array_equal(curve.getData()[1], borrow.modes[1].intensity)
+
+    rendered = []
+    real_waterfall_render = render.waterfall.render
+    def observe_waterfall(rows, **kwargs):
+        rendered.append((rows, kwargs))
+        return real_waterfall_render(rows, **kwargs)
+    monkeypatch.setattr(render.waterfall, "render", observe_waterfall)
     monkeypatch.setattr("xdart.gui.tabs.scattering.scientific_view.resample_image_axis_to_uniform",
                         lambda *_args, **_kwargs: pytest.fail("viewer grid was resampled"))
-    waterfall_state = replace(waterfall.scientific, plot_options=replace(waterfall.scientific.plot_options, waterfall_start=2))
-    ScientificView._render_traces(render, waterfall_state, controller.navigation, live_update=False)
+    waterfall_state = replace(waterfall.scientific,
+        plot_options=replace(waterfall.scientific.plot_options, waterfall_start=2))
+    _reconcile_real_viewer(render, waterfall_state, controller.navigation)
+    assert render.bottom_waterfall_active
     assert rendered[0][0].shape == (2, 3)
+    # ScientificImagePane converts row-major science to pyqtgraph's columns.
+    assert render.waterfall.image.image.shape == (3, 2)
+    np.testing.assert_array_equal(render.waterfall.canvas.raw_image,
+                                 np.stack([item.intensity for item in waterfall.scientific.traces]).T)
     assert rendered[0][1]["x_axis"].values is borrow.modes[0].coordinate
-    real_merge = render._merge_trace_history; render._merge_trace_history = lambda state, _nav: state.traces; overlay_state = replace(overlay.scientific, traces=(overlay.scientific.traces[0],) * 16,
-        plot_options=replace(overlay.scientific.plot_options, waterfall_start=4, waterfall_stop=6, waterfall_step=2))
-    ScientificView._render_traces(render, overlay_state, controller.navigation, live_update=False)
-    assert len(plots) == 16 and not render._bottom_waterfall_active; render._merge_trace_history = real_merge
+    assert all(render._trace_history_by_identity[id(item.frame)].sigma is item.sigma
+               for item in waterfall.scientific.traces)
+    _reconcile_real_viewer(render, overlay.scientific, controller.navigation)
+    assert not render.bottom_waterfall_active
+    assert len(render.curve.listDataItems()) == 2
+    for index, item in enumerate(render.curve.listDataItems()):
+        np.testing.assert_array_equal(item.getData()[0], borrow.modes[index].coordinate)
+
     monkeypatch.setattr("xdart.gui.tabs.scattering.scientific_view.aggregate_traces",
                         lambda *_args: pytest.fail("viewer entered native aggregate"))
     for aggregate in ("Average", "Sum"):
@@ -533,8 +547,8 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
         assert (inherited.scientific.plot_mode == "Single" and preferences.plot_mode == aggregate
                 and inherited.scientific.slice_pins == () and inherited.scientific.pinned_traces == ())
         assert len(inherited.scientific.traces) == 2
-        ScientificView._render_traces(render, inherited.scientific, controller.navigation, live_update=False)
-    render._merge_trace_history = render._render_waterfall = None; rendered.clear(); plots.clear()
+        _reconcile_real_viewer(render, inherited.scientific, controller.navigation)
+        assert len(render.curve.listDataItems()) == 2
     payloads = controller.project_navigation(preferences=ScientificPreferences(), processing_mode="1D Viewer")
     cases = (([0, 1 + 4e-12, 2], 0, "nonuniform"), ([0, np.nan, 2], 0, "finite"),
              ([2, 1, 0], 0, "strictly increasing"), ([0, 2, 1], 0, "strictly increasing"),
@@ -547,27 +561,25 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
         invalid = list(payloads); invalid[index] = replace(base, view=view)
         refused = projection_module._viewer_1d_scientific(controller.navigation, tuple(invalid), controller.resident_frame_keys, ScientificPreferences(plot_mode="Waterfall"), "")
         assert refused.traces == () and diagnostic in refused.status
+        _reconcile_real_viewer(render, refused, controller.navigation)
+        assert not render.curve.listDataItems()
+        assert render.bottom_stack.currentWidget() is render.curve
+        assert diagnostic in render.status.text()
     assert owner.request is request and owner.context.commit_gate is gate and gate.epoch == request.read_key.scope.epoch and gate._reserved_epoch == 0 and owner.context.generation == generation and owner.provider is provider
     assert provider_calls["counters"](provider) == counters and resident_effects == []
     monkeypatch.undo()
-    clear = controller.begin_viewer_1d_renderer_clear()
-    render = SimpleNamespace(
-        _trace_history_by_identity={id(trace): trace}, _pinned_trace_by_id={id(trace): trace},
-        _trace_history_keys=(trace.frame,), _rendered_trace_keys=(("live", id(trace.frame)),), _waterfall_y_values=(1.0,),
-        curve=SimpleNamespace(listDataItems=lambda: ()),
-        title=SimpleNamespace(setText=lambda _value: None),
-        status=SimpleNamespace(setText=lambda _value: None),
-    )
-    def scrub(target, _request, *, failure):
-        assert failure and target._trace_history_by_identity[id(trace)].sigma is mode.uncertainty
-        target._trace_history_by_identity.clear(); target._pinned_trace_by_id.clear(); target._trace_history_keys = ()
-        target._rendered_trace_keys = (); target._waterfall_y_values = (); return True
-    monkeypatch.setattr(ScientificView, "clear_viewer_2d", scrub)
-    receipt = ScientificView.clear_viewer_1d(render, clear)
-    assert receipt.cleared and not render._trace_history_by_identity and not render._pinned_trace_by_id and render._waterfall_y_values == ()
-    del single, trace, mode, selected, selected_by_context, current_only, overlay, toggled, waterfall, inherited, borrow, waterfall_state, overlay_state, render, real_merge, payloads, base, view, invalid, refused
+    _reconcile_real_viewer(render, waterfall.scientific, controller.navigation)
+    receipt = render.clear_viewer_1d(controller.begin_viewer_1d_renderer_clear())
+    assert receipt.cleared
+    assert not render._trace_history_by_identity
+    assert not render.curve.listDataItems()
+    assert not render._pinned_trace_by_id
+    assert render.waterfall.image.image is None
+    assert render.waterfall.canvas.raw_image.size == 0
+    rendered.clear()
+    del single, trace, mode, selected, selected_by_context, current_only, overlay, toggled, waterfall, inherited, borrow, waterfall_state, payloads, base, view, invalid, refused, curve, item
     assert controller.acknowledge_viewer_1d_renderer_clear(receipt)
-    _close_1d(controller)
+    assert controller.close_viewer_1d()
 
     mixed = tmp_path / "mixed.npz"
     np.savez(mixed, x=np.arange(3.0), y=np.arange(3.0),
@@ -584,7 +596,44 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     assert single_refused.scientific.traces == ()
     assert "conflicting units" in single_refused.scientific.status
     assert controller.viewer_1d_context.state.value == "ready"
-    _close_1d(controller)
+    _reconcile_real_viewer(render, single_refused.scientific, controller.navigation)
+    assert not render.curve.listDataItems()
+    _release_real_viewer(controller, render)
+
+
+def test_viewer_1d_overlay_keeps_sixteen_real_sources_as_curves(
+        tmp_path, real_scientific_view) -> None:
+    paths = tuple(_write_xye(tmp_path / f"trace_{i}.xye", [0, 1, 2],
+                             [i, i + 1, i + 2], [.1, .2, .3])
+                  for i in range(16))
+    controller = _controller()
+    controller.open_viewer_1d(tuple(map(str, paths)))
+    _await_ready(controller)
+    frames = controller.navigation.frames
+    assert controller.select_viewer_1d(frames[0], frames)
+    projection = _shell(controller, ScientificPreferences(plot_mode="Overlay"))
+    state = replace(projection.scientific, plot_options=replace(
+        projection.scientific.plot_options,
+        waterfall_start=4, waterfall_stop=6, waterfall_step=2))
+    view = real_scientific_view
+    try:
+        _reconcile_real_viewer(view, state, controller.navigation)
+        assert not view.bottom_waterfall_active
+        assert len(view.curve.listDataItems()) == 16
+        assert view.trace_history_keys == frames
+        assert len(view.legend.items) == 16
+        for item in view.curve.listDataItems():
+            np.testing.assert_array_equal(item.getData()[0], [0, 1, 2])
+            assert len(item.getData()[1]) == 3
+        assert len(view._trace_history_by_identity) == 16
+        assert all(np.array_equal(trace.sigma, [.1, .2, .3])
+                   for trace in view._trace_history_by_identity.values())
+        del item
+    finally:
+        # As in the workspace, drop the last projection before releasing its
+        # borrowed arrays; the lease must not certify externally retained roots.
+        del projection, state
+        _release_real_viewer(controller, view)
 
 
 def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_path) -> None:
