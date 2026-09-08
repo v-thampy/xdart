@@ -263,7 +263,60 @@ def test_request_identities_are_deterministic_and_path_roles_are_separate(
     # The version identity is still deterministic and still distinguishes
     # requests (asserted above); it simply never reaches the public name.
     assert first.version_identity[:32] not in first.output_artifact
-    assert first.canonical_version_json.encode("utf-8")
+    expected_version_payload = {
+        "algorithm_identity": first.algorithm_identity,
+        "domain": "xdart.finite-artifact-version.v1",
+        "entry": first.entry,
+        "operation_kind": first.operation_kind,
+        "output_schema": first.output_schema,
+        "preservation_identity": first.preservation_identity,
+        "scientific_identity": first.scientific_identity,
+        "source_graph_identity": first.source_graph_identity,
+    }
+    expected_version_json = json.dumps(
+        expected_version_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    assert first.canonical_version_json == expected_version_json
+    assert first.version_identity == hashlib.sha256(
+        expected_version_json.encode("utf-8")
+    ).hexdigest()
+    expected_publication_payload = {
+        "domain": "xdart.finite-artifact-publication.v1",
+        "output_artifact": first.output_artifact,
+        "version_identity": first.version_identity,
+    }
+    expected_publication_json = json.dumps(
+        expected_publication_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    assert first.publication_identity == hashlib.sha256(
+        expected_publication_json.encode("utf-8")
+    ).hexdigest()
+    expected_operation_payload = {
+        "domain": "xdart.finite-artifact-operation.v1",
+        "operation_context_identity": first.operation_context_identity,
+        "output_artifact": first.output_artifact,
+        "publication_identity": first.publication_identity,
+        "source_artifact": first.source_artifact,
+        "version_identity": first.version_identity,
+    }
+    expected_operation_json = json.dumps(
+        expected_operation_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    assert first.operation_identity == hashlib.sha256(
+        expected_operation_json.encode("utf-8")
+    ).hexdigest()
 
 
 @pytest.mark.parametrize(
