@@ -47,6 +47,7 @@ from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import GIIntent, RunIntent
 from xrd_tools.core.scan import SourceKind
 from xrd_tools.io.metadata import ImageMetadataRead
+from xrd_tools.sources import execution_graph as source_graph
 from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xrd_tools.sources.directory_index import DirectoryIndex
 from xrd_tools.sources.selection import DirectorySourceSpec, image_series_spec
@@ -1018,7 +1019,7 @@ def test_apstools_external_detector_revision_is_frozen_before_dereference(
         output_mode="Overwrite",
     )).snapshot()
     request = RequestId(737)
-    original_trace = output_preflight._trace_hdf5_object_dependencies
+    original_trace = source_graph._trace_hdf5_object_dependencies
     raced = False
 
     def racing_trace(file_path, object_path, **kwargs):
@@ -1046,7 +1047,7 @@ def test_apstools_external_detector_revision_is_frozen_before_dereference(
         return result
 
     monkeypatch.setattr(
-        output_preflight,
+        source_graph,
         "_trace_hdf5_object_dependencies",
         racing_trace,
     )

@@ -33,6 +33,7 @@ from xdart.gui.tabs.scattering.events import (
 from xdart.gui.tabs.scattering import output_preflight
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import GIIntent, RunIntent
+from xrd_tools.sources import execution_graph as source_graph
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.selection import DirectorySourceSpec
 
@@ -899,7 +900,7 @@ def test_stable_malformed_hdf5_path_is_not_source_revision_drift(
         ValueError,
         match="selected HDF5 dependency path is unavailable",
     ) as error:
-        output_preflight._trace_hdf5_object_dependencies(
+        source_graph._trace_hdf5_object_dependencies(
             source,
             "/entry/data/missing",
             paths=[],

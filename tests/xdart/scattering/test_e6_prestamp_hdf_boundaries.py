@@ -31,6 +31,7 @@ from xdart.gui.tabs.scattering.events import (
     RunIdentity,
 )
 from xrd_tools.sources.probe import ProbeState
+from xrd_tools.sources import execution_graph as source_graph
 from xrd_tools.sources.selection import DirectorySourceSpec
 
 
@@ -42,7 +43,7 @@ _CAPTURE_SENTINEL = "dependency capture is unverifiable"
 def _adaptive_stable_open(path: Path, states: dict, cancelled):
     """Exercise the semantic boundary on both sides of the API correction."""
 
-    helper = output_preflight._open_stable_hdf5_dependency
+    helper = source_graph._open_stable_hdf5_dependency
     kwargs = (
         {"cancelled": cancelled}
         if "cancelled" in inspect.signature(helper).parameters
@@ -52,23 +53,23 @@ def _adaptive_stable_open(path: Path, states: dict, cancelled):
 
 
 def _seed_topology(path: Path, *, owner: str | None = None):
-    topology = output_preflight._topology_from_captured_state(
+    topology = source_graph._topology_from_captured_state(
         SourceFileState.capture(path),
         candidate_owner_id=owner,
     )
-    return {output_preflight._source_state_key(path): topology}
+    return {source_graph._source_state_key(path): topology}
 
 
 def test_stable_hdf_open_requires_and_forwards_exact_callback() -> None:
     """K-M09: stable-open boundaries require the exact Stop callback."""
 
-    helper = output_preflight._open_stable_hdf5_dependency
+    helper = source_graph._open_stable_hdf5_dependency
     parameter = inspect.signature(helper).parameters.get("cancelled")
     assert parameter is not None
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default is inspect.Parameter.empty
 
-    tree = ast.parse(inspect.getsource(output_preflight))
+    tree = ast.parse(inspect.getsource(source_graph))
     calls = [
         node
         for node in ast.walk(tree)
@@ -76,7 +77,7 @@ def test_stable_hdf_open_requires_and_forwards_exact_callback() -> None:
         and isinstance(node.func, ast.Name)
         and node.func.id == "_open_stable_hdf5_dependency"
     ]
-    assert len(calls) == 6
+    assert len(calls) == 3
     for call in calls:
         callbacks = [
             keyword.value
@@ -119,7 +120,7 @@ def test_stop_after_hdf_open_failure_precedes_topology_revalidation(
         "_capture_canonical_source_target",
         "_candidate_owner_id",
     ):
-        real = getattr(output_preflight, name)
+        real = getattr(source_graph, name)
         monkeypatch.setattr(
             output_preflight,
             name,
@@ -181,7 +182,7 @@ def test_stop_from_hdf_close_forbids_final_recapture(
     source.write_bytes(b"stable source bytes")
     stopped = Event()
     post_close_captures: list[Path] = []
-    real_capture = output_preflight._capture_source_topology
+    real_capture = source_graph._capture_source_topology
 
     def traced_capture(path, *args, **kwargs):
         if stopped.is_set():
@@ -197,7 +198,7 @@ def test_stop_from_hdf_close_forbids_final_recapture(
         ),
     )
     monkeypatch.setattr(
-        output_preflight,
+        source_graph,
         "_capture_source_topology",
         traced_capture,
     )
@@ -257,7 +258,7 @@ def test_proved_post_close_drift_precedes_late_stop(
     source.write_bytes(b"stable source bytes")
     closed = Event()
     stopped = Event()
-    real_capture = output_preflight._capture_source_topology
+    real_capture = source_graph._capture_source_topology
 
     def drifting_capture(path, *args, **kwargs):
         if closed.is_set():
@@ -274,7 +275,7 @@ def test_proved_post_close_drift_precedes_late_stop(
         lambda *_args, **_kwargs: _FakeHandle(on_close=closed.set),
     )
     monkeypatch.setattr(
-        output_preflight,
+        source_graph,
         "_capture_source_topology",
         drifting_capture,
     )
@@ -348,8 +349,8 @@ def test_trial_verification_uses_exact_callback_before_filesystem_work(
     trial_callbacks: list[object] = []
     verifier_returned = [False]
     open_count = 0
-    real_open = output_preflight._open_stable_hdf5_dependency
-    real_verify = output_preflight._verify_source_states
+    real_open = source_graph._open_stable_hdf5_dependency
+    real_verify = source_graph._verify_source_states
 
     def cancelled() -> bool:
         return stopped.is_set()
@@ -379,12 +380,12 @@ def test_trial_verification_uses_exact_callback_before_filesystem_work(
         return result
 
     monkeypatch.setattr(
-        output_preflight,
+        source_graph,
         "_open_stable_hdf5_dependency",
         traced_open,
     )
     monkeypatch.setattr(
-        output_preflight,
+        source_graph,
         "_verify_source_states",
         traced_verify,
     )
@@ -394,7 +395,7 @@ def test_trial_verification_uses_exact_callback_before_filesystem_work(
         "_candidate_owner_id",
         "_capture_source_topology",
     ):
-        real = getattr(output_preflight, name)
+        real = getattr(source_graph, name)
         monkeypatch.setattr(
             output_preflight,
             name,
@@ -559,16 +560,16 @@ def test_each_raw_external_link_alias_is_captured_before_canonical_dedup(
         DirectorySourceSpec(raw, suffixes=(".h5",), metadata_format=None),
         request_value=13040,
     )
-    real_trace = output_preflight._trace_hdf5_object_dependencies
-    real_capture = output_preflight._capture_source_topology
+    real_trace = source_graph._trace_hdf5_object_dependencies
+    real_capture = source_graph._capture_source_topology
     captured: list[str] = []
     retargeted = [False]
 
     def racing_trace(file_path, object_path, **kwargs):
         result = real_trace(file_path, object_path, **kwargs)
         if (
-            output_preflight._source_state_key(file_path)
-            == output_preflight._source_state_key(alias_b)
+            source_graph._source_state_key(file_path)
+            == source_graph._source_state_key(alias_b)
             and not retargeted[0]
         ):
             retargeted[0] = True
@@ -576,16 +577,16 @@ def test_each_raw_external_link_alias_is_captured_before_canonical_dedup(
         return result
 
     def traced_capture(path, *args, **kwargs):
-        captured.append(output_preflight._source_state_key(path))
+        captured.append(source_graph._source_state_key(path))
         return real_capture(path, *args, **kwargs)
 
     monkeypatch.setattr(
-        output_preflight,
+        source_graph,
         "_trace_hdf5_object_dependencies",
         racing_trace,
     )
     monkeypatch.setattr(
-        output_preflight,
+        source_graph,
         "_capture_source_topology",
         traced_capture,
     )
@@ -593,8 +594,8 @@ def test_each_raw_external_link_alias_is_captured_before_canonical_dedup(
         executor, intent, receipt, session, group, monkeypatch
     )
     assert retargeted == [True]
-    assert output_preflight._source_state_key(alias_a) in captured
-    assert output_preflight._source_state_key(alias_b) in captured
+    assert source_graph._source_state_key(alias_a) in captured
+    assert source_graph._source_state_key(alias_b) in captured
 
 
 def test_stop_before_external_storage_capture_has_no_later_side_effect(
@@ -615,14 +616,14 @@ def test_stop_before_external_storage_capture_has_no_later_side_effect(
     )
     stopped = Event()
     later: list[str] = []
-    real_extend = output_preflight._extend_hdf5_dataset_dependency_paths
+    real_extend = source_graph._extend_hdf5_dataset_dependency_paths
 
     def stopping_extend(dataset, **kwargs):
         stopped.set()
         return real_extend(dataset, **kwargs)
 
     monkeypatch.setattr(
-        output_preflight,
+        source_graph,
         "_extend_hdf5_dataset_dependency_paths",
         stopping_extend,
     )
@@ -632,7 +633,7 @@ def test_stop_before_external_storage_capture_has_no_later_side_effect(
         "_capture_canonical_source_target",
         "_candidate_owner_id",
     ):
-        real = getattr(output_preflight, name)
+        real = getattr(source_graph, name)
         monkeypatch.setattr(
             output_preflight,
             name,
@@ -700,18 +701,18 @@ def test_required_external_storage_capture_oserror_is_pending_without_effects(
         ),
         request_value=13060,
     )
-    real_capture = output_preflight._capture_source_topology
+    real_capture = source_graph._capture_source_topology
 
     def failing_capture(path, *args, **kwargs):
         if (
-            output_preflight._source_state_key(path)
-            == output_preflight._source_state_key(alias)
+            source_graph._source_state_key(path)
+            == source_graph._source_state_key(alias)
         ):
             raise OSError(_CAPTURE_SENTINEL)
         return real_capture(path, *args, **kwargs)
 
     monkeypatch.setattr(
-        output_preflight,
+        source_graph,
         "_capture_source_topology",
         failing_capture,
     )

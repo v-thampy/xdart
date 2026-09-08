@@ -27,6 +27,7 @@ from xdart.gui.tabs.scattering.contracts import (
 from xdart.gui.tabs.scattering.events import CleanupStatus, RequestId
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.sources import execution_graph as source_graph
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.selection import image_series_spec
 
@@ -37,7 +38,7 @@ _CAPTURE_SENTINEL = "P-1M required dependency capture"
 
 
 def _key(path: Path | str) -> str:
-    return output_preflight._source_state_key(path)
+    return source_graph._source_state_key(path)
 
 
 def _write_graph(
@@ -295,21 +296,21 @@ def test_stop_before_required_dependency_capture_has_no_later_io(
         assert operation is not None
         operation.cancelled.set()
 
-    real_trace = output_preflight._trace_hdf5_object_dependencies
+    real_trace = source_graph._trace_hdf5_object_dependencies
 
     def traced(file_path, object_path, **kwargs):
         if _key(file_path) == _key(dependency):
             stop()
         return real_trace(file_path, object_path, **kwargs)
 
-    real_extend = output_preflight._extend_hdf5_dataset_dependency_paths
+    real_extend = source_graph._extend_hdf5_dataset_dependency_paths
 
     def extended(dataset, **kwargs):
         if layout == "external_storage":
             stop()
         return real_extend(dataset, **kwargs)
 
-    real_link = output_preflight._hdf5_link_file
+    real_link = source_graph._hdf5_link_file
 
     def linked(parent, filename):
         value = real_link(parent, filename)
@@ -338,16 +339,16 @@ def test_stop_before_required_dependency_capture_has_no_later_io(
         return real_file(*args, **kwargs)
 
     monkeypatch.setattr(
-        output_preflight,
+        source_graph,
         "_trace_hdf5_object_dependencies",
         traced,
     )
     monkeypatch.setattr(
-        output_preflight,
+        source_graph,
         "_extend_hdf5_dataset_dependency_paths",
         extended,
     )
-    monkeypatch.setattr(output_preflight, "_hdf5_link_file", linked)
+    monkeypatch.setattr(source_graph, "_hdf5_link_file", linked)
     monkeypatch.setattr(SourceFileState, "capture", staticmethod(captured))
     monkeypatch.setattr(h5py, "File", opened)
 

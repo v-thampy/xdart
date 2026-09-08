@@ -36,7 +36,9 @@ from xdart.gui.tabs.scattering.output_preflight import SourceRevisionChanged
 from xrd_tools.core.scan import ScanFrame, SourceKind, SourceSpec
 from xrd_tools.io.output_safety import OutputCollisionError
 from xrd_tools.reduction.core import FrameReduction, NexusSink
+from xrd_tools.sources import execution_graph as graph
 from xrd_tools.sources.descriptor import ContainerDescriptor
+from xrd_tools.sources import execution_graph as source_graph
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.selection import DirectorySourceSpec
 
@@ -942,9 +944,9 @@ def test_two_sweep_validation_order_and_cancellation_are_exact(
         traces.append("cancel")
         return cancel_at == cancel_calls
 
-    monkeypatch.setattr(output_preflight, "_resolve_source_alias", resolve_alias, raising=False)
-    monkeypatch.setattr(output_preflight, "_capture_canonical_source_target", capture_target, raising=False)
-    monkeypatch.setattr(output_preflight, "_candidate_owner_id", owner_id, raising=False)
+    monkeypatch.setattr(graph, "_resolve_source_alias", resolve_alias)
+    monkeypatch.setattr(graph, "_capture_canonical_source_target", capture_target)
+    monkeypatch.setattr(graph, "_candidate_owner_id", owner_id)
 
     if cancel_at is None:
         validated = output_preflight.validate_source_aliases(
@@ -1067,7 +1069,7 @@ def test_stable_semantic_and_schema_failures_are_terminal_not_pending(
         with h5py.File(source, "w") as handle:
             handle.create_group("entry/data")
         with pytest.raises(ValueError, match="unavailable") as error:
-            output_preflight._trace_hdf5_object_dependencies(
+            source_graph._trace_hdf5_object_dependencies(
                 source,
                 "/entry/data/missing",
                 paths=[],

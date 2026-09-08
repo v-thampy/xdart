@@ -13,6 +13,7 @@ from tests.xdart.scattering.test_e6_prestamp_hdf_boundaries import (
 )
 from xdart.gui.tabs.scattering import output_preflight
 from xdart.gui.tabs.scattering.contracts import SourceFileState
+from xrd_tools.sources import execution_graph as source_graph
 
 
 _CLOSE_SENTINEL = "P-1L stable close sentinel"
@@ -71,7 +72,7 @@ def _capture_after_close(
     handle: _CloseHandle,
 ) -> list[Path]:
     captures: list[Path] = []
-    real_capture = output_preflight._capture_source_topology
+    real_capture = source_graph._capture_source_topology
 
     def counted(path, *args, **kwargs):
         if handle.close_calls:
@@ -294,14 +295,14 @@ def _trace_io_after_inner_stop(
         "_capture_canonical_source_target",
         "_candidate_owner_id",
     ):
-        real = getattr(output_preflight, name)
+        real = getattr(source_graph, name)
 
         def traced(*args, _name=name, _real=real, **kwargs):
             if stopped.trace == [False, True]:
                 later.append(_name)
             return _real(*args, **kwargs)
 
-        monkeypatch.setattr(output_preflight, name, traced)
+        monkeypatch.setattr(source_graph, name, traced)
     return later
 
 

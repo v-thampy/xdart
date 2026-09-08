@@ -23,6 +23,7 @@ from xdart.gui.tabs.scattering.events import (
     ExecutorAccepted,
     RunIdentity,
 )
+from xrd_tools.sources import execution_graph as source_graph
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.selection import DirectorySourceSpec
 
@@ -113,7 +114,7 @@ def _install_post_discovery_failure(
     """Raise once after the real format-specific discovery helper returns."""
 
     fired = [False]
-    alias_key = output_preflight._source_state_key(alias)
+    alias_key = source_graph._source_state_key(alias)
 
     def trigger() -> None:
         if fired[0]:
@@ -124,33 +125,33 @@ def _install_post_discovery_failure(
         raise exception_factory()
 
     if dependency_kind == "external_storage":
-        real_extend = output_preflight._extend_hdf5_dataset_dependency_paths
+        real_extend = source_graph._extend_hdf5_dataset_dependency_paths
 
         def failing_extend(dataset, *, paths, **kwargs):
             result = real_extend(dataset, paths=paths, **kwargs)
             if any(
-                output_preflight._source_state_key(path) == alias_key
+                source_graph._source_state_key(path) == alias_key
                 for path in paths
             ):
                 trigger()
             return result
 
         monkeypatch.setattr(
-            output_preflight,
+            source_graph,
             "_extend_hdf5_dataset_dependency_paths",
             failing_extend,
         )
     else:
-        real_trace = output_preflight._trace_hdf5_object_dependencies
+        real_trace = source_graph._trace_hdf5_object_dependencies
 
         def failing_trace(file_path, object_path, **kwargs):
             result = real_trace(file_path, object_path, **kwargs)
-            if output_preflight._source_state_key(file_path) == alias_key:
+            if source_graph._source_state_key(file_path) == alias_key:
                 trigger()
             return result
 
         monkeypatch.setattr(
-            output_preflight,
+            source_graph,
             "_trace_hdf5_object_dependencies",
             failing_trace,
         )
@@ -390,9 +391,9 @@ def test_prestamp_inventory_failure_two_sweep_order_and_cancellation(
     armed = False
     cancel_calls = 0
 
-    real_resolve = output_preflight._resolve_source_alias
-    real_capture = output_preflight._capture_canonical_source_target
-    real_owner = output_preflight._candidate_owner_id
+    real_resolve = source_graph._resolve_source_alias
+    real_capture = source_graph._capture_canonical_source_target
+    real_owner = source_graph._candidate_owner_id
 
     def before_raise() -> None:
         nonlocal armed, cancel_calls
@@ -425,7 +426,7 @@ def test_prestamp_inventory_failure_two_sweep_order_and_cancellation(
 
     monkeypatch.setattr(output_preflight, "_resolve_source_alias", traced_resolve)
     monkeypatch.setattr(
-        output_preflight,
+        source_graph,
         "_capture_canonical_source_target",
         traced_capture,
     )
