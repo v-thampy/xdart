@@ -3389,7 +3389,17 @@ def test_b1_light_publication_failure_retries_exact_prepared_commit(
 
     def fail_once(publication, light_record, **kwargs):
         calls["total"] += 1
-        prepared.append((publication, light_record))
+        prepared.append(
+            (
+                publication.view.raw,
+                publication.view.intensity_1d,
+                publication.source_identity,
+                light_record.row_identity,
+                light_record.generation,
+                light_record.active_mode,
+                light_record.provenance,
+            )
+        )
         if calls["failures"]:
             calls["failures"] -= 1
             assert artifact.publications.get(2) is before
@@ -3415,6 +3425,7 @@ def test_b1_light_publication_failure_retries_exact_prepared_commit(
     assert calls == {"total": 2, "failures": 0}
     assert prepared[0][0] is prepared[1][0]
     assert prepared[0][1] is prepared[1][1]
+    assert prepared[0][2:] == prepared[1][2:]
     assert (2, HydrationOutcome.HYDRATED) in _completion_outcomes(state)
     current = artifact.publications.get(2)
     assert current is not None
