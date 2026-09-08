@@ -4962,7 +4962,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         *,
         current: DisplayFrameKey | None,
     ) -> bool:
-        """Open a completed XYE-only Run's published rows in the normal viewer."""
+        """Show a completed XYE Run's terminal curve and its output folder."""
 
         controller = self._context_controller
         acquisition = controller.acquisition_context
@@ -4976,28 +4976,28 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or acquisition.run_configuration.processing_mode != "Int 1D (XYE)"
         ):
             return False
-        frames = tuple(
-            frame for frame in controller.frame_keys
-            if frame.run_identity is event.run_identity
-            and frame.artifact in event.artifacts
-        )
-        if not frames:
+        frame = current
+        if (frame is None or frame.run_identity is not event.run_identity
+                or frame.artifact not in event.artifacts):
+            frame = next((item for item in reversed(controller.frame_keys)
+                          if item.run_identity is event.run_identity
+                          and item.artifact in event.artifacts), None)
+        if frame is None:
             return False
         plan = native_int_reduction_plan(acquisition.run_configuration)
         prefix = xye_prefix_for_unit(plan.integration_1d.unit)
         # The event artifacts are planned NeXus slots, not written files in
         # XYE-only mode. Match TransactionalXYESink's scan/index naming for
-        # the completed Run's exact rows; never glob unrelated sidecars.
-        paths = tuple(str(Path(frame.artifact).parent / frame.source_scan /
-                          f"{prefix}_{frame.source_scan}_{frame.local_frame_label:04d}.xye")
-                      for frame in frames)
-        current_path = paths[frames.index(current)] if current in frames else paths[-1]
+        # the terminal row; the other generated files remain folder-browsable.
+        # Do not turn completion into a multi-file Viewer admission/overlay.
+        current_path = str(Path(frame.artifact).parent / frame.source_scan /
+                           f"{prefix}_{frame.source_scan}_{frame.local_frame_label:04d}.xye")
         # This viewer handoff replaces the terminal batch paint itself.
         self._retire_batch_presentation(force=True)
         self._edit_run_strip(ShellCommandKind.SET_PROCESSING_MODE, "1D Viewer")
         self._set_browser_directory(str(Path(current_path).parent), explicit=False)
-        self._open_viewer_1d_paths(paths, current_path=current_path)
-        self._notice(f"Completed {len(paths)} XYE files · {Path(current_path).name}")
+        self._open_viewer_1d_paths((current_path,), current_path=current_path)
+        self._notice(f"Completed {event.completed} XYE files · showing {Path(current_path).name}")
         return True
 
     def _begin_terminal_browse(
