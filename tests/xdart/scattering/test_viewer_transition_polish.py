@@ -57,9 +57,23 @@ def test_new_hdf_file_has_no_teardown_or_zero_one_range(viewer_2d, monkeypatch):
         assert view._viewer_2d_payload is None
         assert view.raw.image.image is None and view.raw.image.qimage is None
         assert view.raw.canvas.raw_image.size == 0
+        assert view.viewer_loading_snapshot_visible
+        assert view._viewer_loading_notice.text() == "Loading — previous view"
+        assert 0 < view.viewer_loading_snapshot_pixels <= 2_000_000
+        assert view._viewer_loading_overlay.geometry() == QtCore.QRect(
+            view.raw.canvas.mapTo(view, QtCore.QPoint()),
+            view.raw.canvas.size(),
+        )
+        snapshot = view._viewer_loading_pixmap.pixmap().toImage()
+        sample_x = (0, snapshot.width() // 2, snapshot.width() - 1)
+        sample_y = (0, snapshot.height() // 2, snapshot.height() - 1)
+        assert len({snapshot.pixelColor(x, y).rgba()
+                    for x in sample_x for y in sample_y}) > 1
         release.set()
         _wait(page, app, lambda: page._context_controller.viewer_2d_frame is not None
               and view._viewer_2d_payload is page._context_controller.viewer_2d_frame.array)
+        assert not view.viewer_loading_snapshot_visible
+        assert view.viewer_loading_snapshot_pixels == 0
         assert id(view.raw.image) == image_id
         assert plot.targetRect() == target
         np.testing.assert_array_equal(page._context_controller.viewer_2d_frame.array, values[0])
@@ -96,13 +110,47 @@ def test_new_xye_batch_retires_curves_without_hiding_panel(viewer_1d, monkeypatc
         assert not hidden.events and bottom.isVisible()
         assert not view.curve.listDataItems() and not view.trace_history_keys
         assert plot.targetRect() == target
+        assert view.viewer_loading_snapshot_visible
+        assert view._viewer_loading_notice.text() == "Loading — previous view"
+        assert 0 < view.viewer_loading_snapshot_pixels <= 2_000_000
         release.set()
         _ready(app, page)
         assert id(view.curve) == curve_id and bottom.isVisible()
         assert len(view.curve.listDataItems()) == 1
+        assert not view.viewer_loading_snapshot_visible
     finally:
         release.set()
         _ready(app, page)
+
+
+def test_failed_xye_replacement_drops_pending_snapshot(viewer_1d, monkeypatch):
+    import xdart.gui.tabs.scattering.hydration_transport as transport
+
+    app, page, paths = viewer_1d
+    view = page._shell.scientific
+    entered, release = Event(), Event()
+    read = transport.begin_viewer_1d_read
+
+    def failed_read(*args, **kwargs):
+        entered.set()
+        assert release.wait(6)
+        raise OSError("test viewer read failure")
+
+    monkeypatch.setattr(transport, "begin_viewer_1d_read", failed_read)
+    try:
+        page._open_viewer_1d_paths((paths[-1],))
+        _wait(page, app, entered.is_set)
+        assert view.viewer_loading_snapshot_visible
+        assert not view.curve.listDataItems() and not view.trace_history_keys
+        release.set()
+        _wait(page, app, lambda: not page._context_controller.viewer_1d_loading)
+        assert not view.viewer_loading_snapshot_visible
+        assert view.viewer_loading_snapshot_pixels == 0
+    finally:
+        release.set()
+        page._ensure_timer()
+        _wait(page, app, lambda: not page._context_controller.viewer_1d_loading)
+        monkeypatch.setattr(transport, "begin_viewer_1d_read", read)
 
 
 def test_one_d_actions_align_with_top_background_button(viewer_1d):

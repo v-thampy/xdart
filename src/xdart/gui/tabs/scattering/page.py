@@ -6388,6 +6388,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._shell.scientific.expect_display_background(
                 self._background_owner.active_key)
             self._shell.apply_state(projection, **apply_options)
+            viewer_loading = (
+                controller.viewer_1d_loading
+                if viewer_1d
+                else controller.viewer_2d_loading
+                if viewer_2d
+                else False
+            )
+            if not viewer_loading:
+                self._shell.scientific.drop_viewer_loading_snapshot()
             if rebind_scientific_navigation:
                 prior_scientific = self._last_scientific_projection
                 prior_trace_history = (
@@ -6424,6 +6433,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._scientific_repaint_pending = not rebound
         except Exception as error:
             _LOG.exception("Passive shell render failed")
+            self._shell.scientific.drop_viewer_loading_snapshot()
             if cache_trace_snapshot is not None:
                 self._last_scientific_projection = None
                 self._scientific_repaint_pending = True
@@ -6803,6 +6813,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if request is not None and close: self._context_controller.close_viewer_1d()
         if request is None:
+            if close:
+                self._shell.scientific.drop_viewer_loading_snapshot()
             context = self._context_controller.viewer_1d_context
             cleared = context is None or context.state.value != "ready"
         elif getattr(request, "acknowledgement_identity", None) is not None:
@@ -6869,6 +6881,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._last_scientific_projection = None
         request = self._context_controller.begin_viewer_2d_renderer_clear()
         if request is None:
+            if close:
+                self._shell.scientific.drop_viewer_loading_snapshot()
             cleared = self._context_controller.viewer_2d_frame is None
         else:
             try:

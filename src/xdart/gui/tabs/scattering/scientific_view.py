@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 import time
 
 from matplotlib import colormaps as matplotlib_colormaps
@@ -67,6 +68,7 @@ SCIENTIFIC_TOOLBAR_EDGE_INSET = 4
 SCIENTIFIC_FOOTER_STATUS_LEFT_INSET = 8
 ONE_D_PLOT_BOTTOM_MARGIN = 6
 MAX_WATERFALL_DISPLAY_ROWS = 256
+MAX_VIEWER_LOADING_SNAPSHOT_PIXELS = 2_000_000
 _PLOT_OPTION_FIELDS = (
     "waterfall_y_axis",
     "waterfall_start",
@@ -237,6 +239,14 @@ def _waterfall_rows_on_reference_axis(traces) -> np.ndarray | None:
     return np.stack(rows)
 
 
+def _pixmap_pixel_count(pixmap) -> int:
+    ratio = pixmap.devicePixelRatio()
+    return (
+        int(round(pixmap.width() * ratio))
+        * int(round(pixmap.height() * ratio))
+    )
+
+
 class ScientificView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
 
@@ -402,6 +412,44 @@ class ScientificView(QtWidgets.QFrame):
         self.footer.addWidget(self.next_frame)
         self.footer.addWidget(self.progress)
         layout.addLayout(self.footer)
+        self._viewer_loading_mode: str | None = None
+        self._viewer_loading_target: QtWidgets.QWidget | None = None
+        self._viewer_loading_overlay = QtWidgets.QFrame(self)
+        self._viewer_loading_overlay.setObjectName("e6ViewerLoadingPreviousView")
+        self._viewer_loading_overlay.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self._viewer_loading_overlay.setStyleSheet(
+            "background-color: rgba(22, 28, 36, 210);"
+        )
+        self._viewer_loading_overlay.setFocusPolicy(
+            QtCore.Qt.FocusPolicy.NoFocus
+        )
+        self._viewer_loading_pixmap = QtWidgets.QLabel(
+            self._viewer_loading_overlay
+        )
+        self._viewer_loading_pixmap.setObjectName("e6ViewerLoadingPixmap")
+        self._viewer_loading_pixmap.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignCenter
+        )
+        self._viewer_loading_pixmap.setScaledContents(True)
+        self._viewer_loading_notice = QtWidgets.QLabel(
+            "Loading — previous view", self._viewer_loading_overlay,
+        )
+        self._viewer_loading_notice.setObjectName("e6ViewerLoadingNotice")
+        self._viewer_loading_notice.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignCenter
+        )
+        self._viewer_loading_notice.setStyleSheet(
+            "color: white; font-weight: 600; "
+            "background-color: rgba(22, 28, 36, 210);"
+        )
+        self._viewer_loading_notice.setContentsMargins(6, 3, 6, 3)
+        for widget in (
+            self._viewer_loading_overlay,
+            self._viewer_loading_pixmap,
+            self._viewer_loading_notice,
+        ):
+            widget.installEventFilter(self)
+        self._viewer_loading_overlay.hide()
         self._install_share_geometry_hooks()
 
     def reconcile_operation_status(self, status: object) -> bool:
@@ -417,6 +465,23 @@ class ScientificView(QtWidgets.QFrame):
         """Identity of the cake presentation actually accepted by the view."""
 
         return self._rendered_image_axis
+
+    @property
+    def viewer_loading_snapshot_visible(self) -> bool:
+        """Whether a non-scientific pending-view raster is currently shown."""
+
+        return self._viewer_loading_overlay.isVisible()
+
+    @property
+    def viewer_loading_snapshot_pixels(self) -> int:
+        """Pixel count retained by the pending-view raster, if any."""
+
+        pixmap = self._viewer_loading_pixmap.pixmap()
+        return (
+            0
+            if pixmap is None or pixmap.isNull()
+            else _pixmap_pixel_count(pixmap)
+        )
 
     @property
     def trace_history_keys(self) -> tuple[DisplayFrameKey, ...]:
@@ -1091,6 +1156,66 @@ class ScientificView(QtWidgets.QFrame):
         self._refresh_viewer_intensity()
         del blockers
 
+    def _viewer_loading_snapshot_target(
+        self, mode: str,
+    ) -> QtWidgets.QWidget | None:
+        if mode == "2D Viewer":
+            return self.raw.canvas
+        if mode == "1D Viewer":
+            return self.bottom_stack.currentWidget()
+        return None
+
+    def _layout_viewer_loading_snapshot(self) -> None:
+        target = self._viewer_loading_target
+        if target is None or not self._viewer_loading_overlay.isVisible():
+            return
+        origin = target.mapTo(self, QtCore.QPoint())
+        self._viewer_loading_overlay.setGeometry(
+            QtCore.QRect(origin, target.size())
+        )
+        self._viewer_loading_pixmap.setGeometry(
+            self._viewer_loading_overlay.rect()
+        )
+        self._viewer_loading_notice.adjustSize()
+        self._viewer_loading_notice.move(8, 8)
+        self._viewer_loading_overlay.raise_()
+
+    def _begin_viewer_loading_snapshot(self, mode: str) -> None:
+        """Keep one capped screen raster while an owned Viewer reloads."""
+
+        # A rapid replacement must continue to describe the original pending
+        # view, never capture the loading layer or build a snapshot history.
+        if self._viewer_loading_overlay.isVisible():
+            return
+        target = self._viewer_loading_snapshot_target(mode)
+        if target is None or target.width() < 1 or target.height() < 1:
+            return
+        pixmap = target.grab()
+        if pixmap.isNull():
+            return
+        pixels = _pixmap_pixel_count(pixmap)
+        if pixels > MAX_VIEWER_LOADING_SNAPSHOT_PIXELS:
+            scale = math.sqrt(MAX_VIEWER_LOADING_SNAPSHOT_PIXELS / pixels)
+            pixmap = pixmap.scaled(
+                max(1, int(pixmap.width() * scale)),
+                max(1, int(pixmap.height() * scale)),
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.FastTransformation,
+            )
+        self._viewer_loading_mode = mode
+        self._viewer_loading_target = target
+        self._viewer_loading_pixmap.setPixmap(pixmap)
+        self._viewer_loading_overlay.show()
+        self._layout_viewer_loading_snapshot()
+
+    def drop_viewer_loading_snapshot(self) -> None:
+        """Release the transient raster without touching scientific payloads."""
+
+        self._viewer_loading_mode = None
+        self._viewer_loading_target = None
+        self._viewer_loading_pixmap.clear()
+        self._viewer_loading_overlay.hide()
+
     def clear_viewer_2d(self, request, *, failure=False, preserve_navigation=False):
         if not failure and type(request) is not Viewer2DRendererClearRequest:
             return None
@@ -1100,9 +1225,15 @@ class ScientificView(QtWidgets.QFrame):
             and request.context_token == self._current_key.run_identity.fingerprint
             and request.label == self._current_key.local_frame_label
         )
+        if keep_chrome:
+            self._begin_viewer_loading_snapshot("2D Viewer")
+        else:
+            self.drop_viewer_loading_snapshot()
         cleared = ScientificView._clear_viewer_payloads(
             self, keep_chrome=keep_chrome, failure=failure,
         )
+        if not cleared:
+            self.drop_viewer_loading_snapshot()
         return cleared if failure else Viewer2DRendererClearReceipt(request, cleared)
 
     def _clear_viewer_payloads(self, *, keep_chrome=False, failure=False):
@@ -1219,6 +1350,10 @@ class ScientificView(QtWidgets.QFrame):
             return None
         keep_chrome = bool(preserve_navigation and not failure
                            and self._processing_mode == "1D Viewer")
+        if keep_chrome:
+            self._begin_viewer_loading_snapshot("1D Viewer")
+        else:
+            self.drop_viewer_loading_snapshot()
         cleared = ScientificView._clear_viewer_payloads(
             self, keep_chrome=keep_chrome, failure=failure,
         )
@@ -1234,11 +1369,14 @@ class ScientificView(QtWidgets.QFrame):
                            and not self._rendered_trace_keys)
         except Exception:
             cleared = False
+        if not cleared:
+            self.drop_viewer_loading_snapshot()
         return (cleared if failure else
                 _new_viewer_1d_renderer_clear_receipt(request, cleared))
 
     def clear_workspace(self) -> bool:
         """Drop every mounted scientific payload before owner retirement."""
+        self.drop_viewer_loading_snapshot()
         cleared = ScientificView.clear_viewer_1d(
             self, None, failure=True
         )
@@ -2646,6 +2784,11 @@ class ScientificView(QtWidgets.QFrame):
 
     def _apply_processing_layout(self, mode: str) -> None:
         normalized = str(mode or "")
+        if (
+            self._viewer_loading_mode is not None
+            and normalized != self._viewer_loading_mode
+        ):
+            self.drop_viewer_loading_snapshot()
         changed = self._layout_mode != normalized
         self._layout_mode = normalized
         viewer = normalized in {"1D Viewer", "2D Viewer"}
@@ -2855,10 +2998,27 @@ class ScientificView(QtWidgets.QFrame):
         self.waterfall.canvas.image_win.installEventFilter(self)
 
     def _on_share_geometry_changed(self, *_args) -> None:
+        self._layout_viewer_loading_snapshot()
         if self._share_link_on:
             self._schedule_curve_under_cake()
 
     def eventFilter(self, watched, event) -> bool:
+        if watched in {
+            self._viewer_loading_overlay,
+            self._viewer_loading_pixmap,
+            self._viewer_loading_notice,
+        }:
+            if event.type() in {
+                QtCore.QEvent.Type.MouseButtonPress,
+                QtCore.QEvent.Type.MouseButtonRelease,
+                QtCore.QEvent.Type.MouseButtonDblClick,
+                QtCore.QEvent.Type.MouseMove,
+                QtCore.QEvent.Type.Wheel,
+                QtCore.QEvent.Type.KeyPress,
+                QtCore.QEvent.Type.KeyRelease,
+                QtCore.QEvent.Type.ContextMenu,
+            }:
+                return True
         if (
             watched
             in {
@@ -2877,6 +3037,7 @@ class ScientificView(QtWidgets.QFrame):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._layout_viewer_loading_snapshot()
         if self._share_link_on:
             self._schedule_curve_under_cake()
 
