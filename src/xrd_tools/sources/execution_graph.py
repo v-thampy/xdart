@@ -873,12 +873,19 @@ def _capture_bound_container_dependencies(
         return values
     def identity(pair):
         return (os.path.normcase(os.path.normpath(pair[0])), os.path.normpath(pair[1]))
-    seen = {identity((str(Path(dataset.file.filename).resolve()), str(dataset.name)))
-            for dataset in binding._datasets}
+    from xrd_tools.io.nexus import _selected_link_owner_selector
+    seen: set[tuple[str, str]] = set()
     pending = []; dependency_paths: set[str] = set()
     for epoch, dataset in enumerate(binding._datasets):
         _cancelled(cancelled)
-        owner_path = Path(dataset.file.filename).resolve()
+        try:
+            logical_selector = binding.paths[epoch]
+        except IndexError as error:
+            raise ValueError("container detector binding lost its selector") from error
+        owner_path, owner_selector = _selected_link_owner_selector(
+            binding.entry_group, logical_selector, dataset,
+        )
+        seen.add(identity((str(owner_path), owner_selector)))
         before = SourceFileState.capture(owner_path)
         if dataset.ndim not in {2, 3}: raise ValueError("container detector rank changed")
         extent = 1 if dataset.ndim == 2 else int(dataset.shape[0])
@@ -886,7 +893,9 @@ def _capture_bound_container_dependencies(
         if shape != tuple(descriptor.frame_shape) or np.dtype(dataset.dtype) != descriptor.dtype:
             raise SourceRevisionChanged("container detector layout changed")
         if owner_path != master_path:
-            emit_external(ExternalSourceState(before, str(dataset.name), first, first + extent, epoch))
+            emit_external(ExternalSourceState(
+                before, owner_selector, first, first + extent, epoch,
+            ))
         first += extent
         if owner_path == master_path and bool(dataset.is_virtual): pending.extend(detached(dataset))
         after = SourceFileState.capture(owner_path)

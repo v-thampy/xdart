@@ -67,6 +67,46 @@ def _eiger_master(root: Path, extents=(2, 3)) -> tuple[Path, tuple[Path, ...]]:
     return master, tuple(members)
 
 
+def _soft_external_master(root: Path) -> tuple[Path, Path]:
+    sidecar = root / "pixels.h5"
+    with h5py.File(sidecar, "w") as handle:
+        handle.create_dataset(
+            "detector/pixels",
+            data=np.ones((2, 2, 3), dtype=np.uint16),
+            chunks=(1, 2, 3),
+        )
+    master = root / "soft-external-master.h5"
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        data = entry.create_group("data")
+        data.attrs["NX_class"] = "NXdata"
+        handle["bridge"] = h5py.ExternalLink(sidecar.name, "/detector")
+        data["data_000001"] = h5py.SoftLink("/bridge/pixels")
+    return master, sidecar
+
+
+def test_selected_link_owner_selector_detaches_sidecar_internal_path(tmp_path):
+    master, sidecar = _soft_external_master(tmp_path)
+    with h5py.File(master, "r") as handle:
+        dataset = handle["/entry/data/data_000001"]
+        assert Path(dataset.file.filename).resolve() == sidecar.resolve()
+        assert dataset.name == "/entry/data/data_000001"
+        owner, selector = nexus_io._selected_link_owner_selector(
+            handle, "/entry/data/data_000001", dataset,
+        )
+        assert owner == sidecar.resolve()
+        assert selector == "/detector/pixels"
+        with h5py.File(owner, "r") as sidecar_handle:
+            assert isinstance(sidecar_handle[selector], h5py.Dataset)
+    source = SourceSpec(master, SourceKind.NEXUS_STACK, entry="entry")
+    value = graph.qualify_source_execution_graph(source)
+    assert tuple((Path(member.file.path), member.dataset) for member in
+                 value.stamp.external_members) == ((sidecar, "/detector/pixels"),)
+    graph.validate_source_execution_graph(value)
+    assert graph.requalify_source_execution_graph(source, value) is value
+
+
 def _bind_stack(handle: h5py.File, entry: str = "entry"):
     slot = nexus_io._NexusDatasetOwnerSlot()
     binding = nexus_io._bind_nexus_stack_from_entry(

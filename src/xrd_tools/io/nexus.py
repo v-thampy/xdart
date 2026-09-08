@@ -37,6 +37,7 @@ from bisect import bisect_right
 import json
 import logging
 import os
+import posixpath
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -468,6 +469,64 @@ class _NexusDatasetOwnerSlot:
 
     def __init__(self) -> None:
         self.owner: Any | None = None
+
+
+def _selected_link_owner_selector(
+    selected_root: h5py.Group | h5py.File,
+    logical_selector: str,
+    dataset: h5py.Dataset,
+) -> tuple[Path, str]:
+    """Detach the selected link's owner and owner-relative selector.
+
+    A Dataset reached through a master-file SoftLink followed by an external
+    ancestor belongs to the sidecar, while ``Dataset.name`` can still report
+    the master-file spelling.  This follows only the already-selected link
+    chain; callers retain the Dataset/handle lifetime and decide capture and
+    drift policy.
+    """
+    if not isinstance(selected_root, (h5py.Group, h5py.File)):
+        raise TypeError("selected root must be an HDF5 Group or File")
+    if not isinstance(dataset, h5py.Dataset):
+        raise TypeError("selected value must be an HDF5 Dataset")
+
+    def canonical(value: str) -> str:
+        return "/" + posixpath.normpath("/" + value.lstrip("/")).lstrip("/")
+
+    root = selected_root.file
+    root_path = Path(os.fsdecode(root.filename)).resolve()
+    actual_owner = Path(os.fsdecode(dataset.file.filename)).resolve()
+    selector = canonical(str(logical_selector))
+    seen: set[str] = set()
+    while True:
+        if selector in seen:
+            raise ValueError("selected detector link is cyclic")
+        seen.add(selector)
+        current: Any = root
+        components = tuple(part for part in selector.split("/") if part)
+        for offset, component in enumerate(components):
+            if not isinstance(current, h5py.Group):
+                raise ValueError("selected detector path is incomplete")
+            link = current.get(component, getlink=True)
+            if link is None:
+                raise ValueError("selected detector path is unavailable")
+            remainder = components[offset + 1 :]
+            if isinstance(link, h5py.SoftLink):
+                target = str(link.path)
+                if not target.startswith("/"):
+                    target = posixpath.join(current.name, target)
+                selector = canonical(posixpath.join(target, *remainder))
+                break
+            if isinstance(link, h5py.ExternalLink):
+                owner = Path(os.fsdecode(current.file.filename)).parent / os.fsdecode(link.filename)
+                owner = owner.resolve()
+                if owner != actual_owner:
+                    raise ValueError("selected detector owner changed during resolution")
+                return owner, canonical(posixpath.join(str(link.path), *remainder))
+            current = current[component]
+        else:
+            if actual_owner != root_path:
+                raise ValueError("selected detector owner is not linked from its master")
+            return actual_owner, selector
 
 
 class _ResolvedNexusStack:
