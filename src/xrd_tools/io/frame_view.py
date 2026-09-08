@@ -29,9 +29,8 @@ from xrd_tools.core.frame_view import (
 )
 from xrd_tools.core.physical_memory import (
     PhysicalRootAuthority,
-    PhysicalRootExchange,
-    PhysicalRootExchangePhase,
     PhysicalRootLease,
+    PhysicalRootReservation,
     physical_root_fact,
 )
 from xrd_tools.io.read import _decode
@@ -1292,40 +1291,13 @@ class _ReaderCachePhase(Enum):
     OPENING = "opening"
     OPEN = "open"
     BUILDING = "building"
-    PREPARING = "preparing"
-    STAGED_PENDING = "staged-pending"
-    COMMITTING = "committing"
-    ACCEPT_PENDING = "accept-pending"
-    ACCEPTING = "accepting"
-    PUBLISHING = "publishing"
-    ROLLING_BACK = "rolling-back"
-    CLOSE_ADMITTED = "close-admitted"
-    CLOSE_STAGED = "close-staged"
-    CLOSE_COMMITTING = "close-committing"
-    CLOSE_ACCEPTING = "close-accepting"
+    CLOSING_LEASES = "closing-leases"
     CLOSE_AUTHORITY = "close-authority"
     CLOSE_HDF = "close-hdf"
-    BLOCKED = "blocked"
-
-
-class _ReaderCacheDirection(Enum):
-    ACCEPTED = "accepted"
-    ROLLED_BACK = "rolled-back"
-    CLOSED = "closed"
-
-
-@dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
-class _ReaderCacheMarker:
-    pass
 
 
 @dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
 class _ReaderBundleOwner:
-    pass
-
-
-@dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
-class _ReaderCacheDriver:
     pass
 
 
@@ -1344,21 +1316,10 @@ class _ReaderPendingArray:
 
 
 @dataclass(frozen=True, slots=True, eq=False)
-class _ReaderCacheJournal:
-    marker: _ReaderCacheMarker
-    owner_ref: ReferenceType[_ReaderBundleOwner] | None
-    driver_ref: ReferenceType[_ReaderCacheDriver] | None
-    exchange: PhysicalRootExchange | None
-    prior: "_ReaderCacheState"
-    plan: tuple[_ReaderPendingArray, ...]
-    pending_scan_data_columns: Mapping[str, np.ndarray] | None
-    candidate_entries: Mapping[tuple[object, ...], _ReaderCacheEntry] | None
-    candidate_scan_data_columns: Mapping[str, np.ndarray] | None
-    transient_leases: tuple[PhysicalRootLease, ...]
-    builder_factory: object
-    intent: _ReaderCacheDirection | None
+class _ReaderPendingBundle:
+    owner_ref: ReferenceType[_ReaderBundleOwner]
+    reservation: PhysicalRootReservation
     opening: bool
-    close_h5: h5py.File | None
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -1368,62 +1329,9 @@ class _ReaderCacheState:
     open_token: object | None
     entries: Mapping[tuple[object, ...], _ReaderCacheEntry]
     scan_data_columns: Mapping[str, np.ndarray] | None
-    journal: _ReaderCacheJournal | None
-    terminal_evidence: tuple[ReferenceType[_ReaderCacheMarker], ...]
-    terminal_directions: tuple[_ReaderCacheDirection, ...]
-
-
-def _reader_marker_direction(
-    state: _ReaderCacheState,
-    marker: _ReaderCacheMarker,
-) -> _ReaderCacheDirection | None:
-    if len(state.terminal_evidence) != len(state.terminal_directions):
-        raise RuntimeError("FrameView reader-cache terminal evidence is inconsistent")
-    for marker_ref, direction in zip(
-        state.terminal_evidence,
-        state.terminal_directions,
-        strict=True,
-    ):
-        if marker_ref() is marker:
-            return direction
-    return None
-
-
-def _reader_terminal_evidence_with(
-    state: _ReaderCacheState,
-    marker: _ReaderCacheMarker,
-    direction: _ReaderCacheDirection,
-) -> tuple[
-    tuple[ReferenceType[_ReaderCacheMarker], ...],
-    tuple[_ReaderCacheDirection, ...],
-]:
-    refs: list[ReferenceType[_ReaderCacheMarker]] = []
-    live: list[_ReaderCacheMarker] = []
-    directions: list[_ReaderCacheDirection] = []
-    found: _ReaderCacheDirection | None = None
-    if len(state.terminal_evidence) != len(state.terminal_directions):
-        raise RuntimeError("FrameView reader-cache terminal evidence is inconsistent")
-    for marker_ref, prior_direction in zip(
-        state.terminal_evidence,
-        state.terminal_directions,
-        strict=True,
-    ):
-        candidate = marker_ref()
-        if candidate is None:
-            continue
-        if any(candidate is previous for previous in live):
-            continue
-        live.append(candidate)
-        refs.append(marker_ref)
-        directions.append(prior_direction)
-        if candidate is marker:
-            found = prior_direction
-    if found is not None and found is not direction:
-        raise RuntimeError("FrameView reader-cache terminal direction changed")
-    if found is None:
-        refs.append(ref(marker))
-        directions.append(direction)
-    return tuple(refs), tuple(directions)
+    pending: _ReaderPendingBundle | None
+    close_leases: tuple[PhysicalRootLease, ...]
+    close_h5: h5py.File | None
 
 
 def _reader_cache_state_with(
@@ -1435,10 +1343,12 @@ def _reader_cache_state_with(
     entries: Mapping[tuple[object, ...], _ReaderCacheEntry] | None = None,
     scan_data_columns: Mapping[str, np.ndarray] | None = None,
     replace_scan_data_columns: bool = False,
-    journal: _ReaderCacheJournal | None = None,
-    replace_journal: bool = False,
-    terminal_evidence: tuple[ReferenceType[_ReaderCacheMarker], ...] | None = None,
-    terminal_directions: tuple[_ReaderCacheDirection, ...] | None = None,
+    pending: _ReaderPendingBundle | None = None,
+    replace_pending: bool = False,
+    close_leases: tuple[PhysicalRootLease, ...] | None = None,
+    replace_close_leases: bool = False,
+    close_h5: h5py.File | None = None,
+    replace_close_h5: bool = False,
 ) -> _ReaderCacheState:
     return _ReaderCacheState(
         state.generation + 1,
@@ -1450,73 +1360,9 @@ def _reader_cache_state_with(
             if replace_scan_data_columns
             else state.scan_data_columns
         ),
-        journal if replace_journal else state.journal,
-        (
-            state.terminal_evidence
-            if terminal_evidence is None
-            else terminal_evidence
-        ),
-        (
-            state.terminal_directions
-            if terminal_directions is None
-            else terminal_directions
-        ),
-    )
-
-
-def _reader_cache_journal_with(
-    journal: _ReaderCacheJournal,
-    *,
-    owner_ref: ReferenceType[_ReaderBundleOwner] | None = None,
-    replace_owner_ref: bool = False,
-    driver_ref: ReferenceType[_ReaderCacheDriver] | None = None,
-    replace_driver_ref: bool = False,
-    exchange: PhysicalRootExchange | None = None,
-    replace_exchange: bool = False,
-    plan: tuple[_ReaderPendingArray, ...] | None = None,
-    pending_scan_data_columns: Mapping[str, np.ndarray] | None = None,
-    replace_pending_scan_data_columns: bool = False,
-    candidate_entries: Mapping[
-        tuple[object, ...], _ReaderCacheEntry
-    ] | None = None,
-    replace_candidate_entries: bool = False,
-    candidate_scan_data_columns: Mapping[str, np.ndarray] | None = None,
-    replace_candidate_scan_data_columns: bool = False,
-    transient_leases: tuple[PhysicalRootLease, ...] | None = None,
-    intent: _ReaderCacheDirection | None = None,
-    replace_intent: bool = False,
-) -> _ReaderCacheJournal:
-    return _ReaderCacheJournal(
-        journal.marker,
-        owner_ref if replace_owner_ref else journal.owner_ref,
-        driver_ref if replace_driver_ref else journal.driver_ref,
-        exchange if replace_exchange else journal.exchange,
-        journal.prior,
-        journal.plan if plan is None else plan,
-        (
-            pending_scan_data_columns
-            if replace_pending_scan_data_columns
-            else journal.pending_scan_data_columns
-        ),
-        (
-            candidate_entries
-            if replace_candidate_entries
-            else journal.candidate_entries
-        ),
-        (
-            candidate_scan_data_columns
-            if replace_candidate_scan_data_columns
-            else journal.candidate_scan_data_columns
-        ),
-        (
-            journal.transient_leases
-            if transient_leases is None
-            else transient_leases
-        ),
-        journal.builder_factory,
-        intent if replace_intent else journal.intent,
-        journal.opening,
-        journal.close_h5,
+        pending if replace_pending else state.pending,
+        close_leases if replace_close_leases else state.close_leases,
+        close_h5 if replace_close_h5 else state.close_h5,
     )
 
 
@@ -1528,7 +1374,7 @@ class _ReaderArrayBundle:
     ) -> None:
         self._reader = reader
         self._owner = _ReaderBundleOwner()
-        self._marker, self._exchange = reader._begin_array_bundle(
+        self._reservation = reader._begin_array_bundle(
             self._owner, opening=opening,
         )
         self._token = object()
@@ -1549,29 +1395,19 @@ class _ReaderArrayBundle:
 
         self._require_active()
         prior_local = self._local
-        stamp = self._reader._bundle_callback_stamp(
-            self._marker, self._owner,
-        )
+        stamp = self._reader._bundle_callback_stamp(self._owner)
         result = callback(*args, **kwargs)
-        self._reader._revalidate_bundle_callback(
-            stamp, self._marker, self._owner,
-        )
+        self._reader._revalidate_bundle_callback(stamp, self._owner)
         if self._local is not prior_local:
             raise RuntimeError("FrameView read-bundle local mapping drifted")
         return result
 
     def _compact(self, direction: str) -> str:
-        if direction not in {
-            _ReaderCacheDirection.ACCEPTED.value,
-            _ReaderCacheDirection.ROLLED_BACK.value,
-        }:
-            raise RuntimeError("FrameView read bundle terminal is invalid")
         self._terminal = direction
         self._active = False
         self._local.clear()
         self.pending_scan_data_columns = None
-        self._exchange = None
-        self._marker = None
+        self._reservation = None
         self._owner = None
         self._reader = None
         return direction
@@ -1602,11 +1438,11 @@ class _ReaderArrayBundle:
 
         prior = self._local
         stamp = self._reader._bundle_callback_stamp(
-            self._marker, self._owner,
+            self._owner,
         )
         value = prior.get(key)
         self._reader._revalidate_bundle_callback(
-            stamp, self._marker, self._owner,
+            stamp, self._owner,
         )
         if self._local is not prior:
             raise RuntimeError("FrameView read-bundle local mapping drifted")
@@ -1625,18 +1461,16 @@ class _ReaderArrayBundle:
         if self._local is not prior:
             raise RuntimeError("FrameView read-bundle local mapping drifted")
         stamp = self._reader._bundle_callback_stamp(
-            self._marker, self._owner,
+            self._owner,
         )
         candidate = dict(prior)
         self._reader._revalidate_bundle_callback(
-            stamp, self._marker, self._owner,
+            stamp, self._owner,
         )
         if self._local is not prior:
             raise RuntimeError("FrameView read-bundle local mapping drifted")
         candidate[key] = value
-        self._reader._revalidate_bundle_callback(
-            stamp, self._marker, self._owner,
-        )
+        self._reader._revalidate_bundle_callback(stamp, self._owner)
         if self._local is not prior:
             raise RuntimeError("FrameView read-bundle local mapping drifted")
         self._local = candidate
@@ -1645,7 +1479,7 @@ class _ReaderArrayBundle:
         self, dataset: h5py.Dataset,
     ) -> tuple[object, int]:
         self._require_active()
-        self._reader._assert_bundle_owned(self._marker, self._owner)
+        self._reader._assert_bundle_owned(self._owner)
         owner = self._reader._hdf_owner_token
         if owner is None:
             raise RuntimeError("FrameViewReader HDF owner is unavailable")
@@ -1655,7 +1489,7 @@ class _ReaderArrayBundle:
             raise ValueError(f"{dataset.name} object identity is unavailable") from error
         if address < 0:
             raise ValueError(f"{dataset.name} object identity is invalid")
-        self._reader._assert_bundle_owned(self._marker, self._owner)
+        self._reader._assert_bundle_owned(self._owner)
         return owner, address
 
     def cache_key(
@@ -1672,9 +1506,7 @@ class _ReaderArrayBundle:
 
     def cached(self, key: tuple[object, ...]) -> np.ndarray | None:
         self._require_active()
-        cached = self._reader._bundle_cached(
-            self._marker, self._owner, key,
-        )
+        cached = self._reader._bundle_cached(self._owner, key)
         if cached is not None:
             return cached
         _prior, local = self._local_lookup(key)
@@ -1693,13 +1525,9 @@ class _ReaderArrayBundle:
     ) -> np.ndarray:
         self._require_active()
         # Scientific role qualification deliberately precedes every cache hit.
-        stamp = self._reader._bundle_callback_stamp(
-            self._marker, self._owner,
-        )
+        stamp = self._reader._bundle_callback_stamp(self._owner)
         qualified = validator(dataset)
-        self._reader._revalidate_bundle_callback(
-            stamp, self._marker, self._owner,
-        )
+        self._reader._revalidate_bundle_callback(stamp, self._owner)
         if not isinstance(qualified, h5py.Dataset):
             raise ValueError(f"{role} is not a qualified HDF dataset")
         dtype = np.dtype(final_dtype)
@@ -1709,9 +1537,7 @@ class _ReaderArrayBundle:
             final_dtype=dtype,
             transform=transform,
         )
-        cached = self._reader._bundle_cached(
-            self._marker, self._owner, key,
-        )
+        cached = self._reader._bundle_cached(self._owner, key)
         if cached is not None:
             return cached
         local_prior, local = self._local_lookup(key)
@@ -1731,18 +1557,14 @@ class _ReaderArrayBundle:
         ):
             raise ValueError(f"{role} row is out of range")
         nbytes = int(math.prod(shape)) * int(dtype.itemsize)
-        capacity = self._reader._bundle_exchange_claim(
-            self._marker, self._owner, nbytes,
-        )
+        capacity = self._reader._bundle_reservation_claim(self._owner, nbytes)
         destination = np.empty(shape, dtype=dtype, order="C")
         semantic = self._semantic("reader-cache" if retain else "return", key)
-        self._reader._bundle_exchange_bind(
-            self._marker, self._owner, capacity, destination, semantic,
+        self._reader._bundle_reservation_bind(
+            self._owner, capacity, destination, semantic,
         )
         if destination.size:
-            stamp = self._reader._bundle_callback_stamp(
-                self._marker, self._owner,
-            )
+            stamp = self._reader._bundle_callback_stamp(self._owner)
             try:
                 if selection is None:
                     qualified.read_direct(destination)
@@ -1752,9 +1574,7 @@ class _ReaderArrayBundle:
                     )
             except (OSError, RuntimeError, TypeError, ValueError) as error:
                 raise ValueError(f"{role} could not be read into final storage") from error
-            self._reader._revalidate_bundle_callback(
-                stamp, self._marker, self._owner,
-            )
+            self._reader._revalidate_bundle_callback(stamp, self._owner)
         if destination.dtype != dtype or not destination.flags.c_contiguous:
             raise AssertionError("FrameView HDF read did not retain final storage")
         self._publish_local(
@@ -1774,17 +1594,11 @@ class _ReaderArrayBundle:
             raise TypeError(f"{role} shape is invalid")
         local_prior = self._local
         nbytes = int(math.prod(shape)) * int(dtype.itemsize)
-        capacity = self._reader._bundle_exchange_claim(
-            self._marker, self._owner, nbytes,
-        )
+        capacity = self._reader._bundle_reservation_claim(self._owner, nbytes)
         destination = np.empty(shape, dtype=dtype, order="C")
         semantic = self._semantic("return", role)
-        self._reader._bundle_exchange_bind(
-            self._marker,
-            self._owner,
-            capacity,
-            destination,
-            semantic,
+        self._reader._bundle_reservation_bind(
+            self._owner, capacity, destination, semantic,
         )
         key = ("allocated", semantic)
         self._publish_local(
@@ -1805,9 +1619,7 @@ class _ReaderArrayBundle:
         self._require_active()
         if type(key) is not tuple:
             raise TypeError(f"{role} cache key is invalid")
-        cached = self._reader._bundle_cached(
-            self._marker, self._owner, key,
-        )
+        cached = self._reader._bundle_cached(self._owner, key)
         if cached is not None:
             return cached
         local_prior, local = self._local_lookup(key)
@@ -1820,17 +1632,11 @@ class _ReaderArrayBundle:
         ):
             raise TypeError(f"{role} shape is invalid")
         nbytes = int(math.prod(shape)) * int(dtype.itemsize)
-        capacity = self._reader._bundle_exchange_claim(
-            self._marker, self._owner, nbytes,
-        )
+        capacity = self._reader._bundle_reservation_claim(self._owner, nbytes)
         destination = np.empty(shape, dtype=dtype, order="C")
         semantic = self._semantic("reader-cache", key)
-        self._reader._bundle_exchange_bind(
-            self._marker,
-            self._owner,
-            capacity,
-            destination,
-            semantic,
+        self._reader._bundle_reservation_bind(
+            self._owner, capacity, destination, semantic,
         )
         self._publish_local(
             local_prior, key, (destination, semantic, True),
@@ -1845,18 +1651,14 @@ class _ReaderArrayBundle:
         retain: bool,
     ) -> np.ndarray:
         self._require_active()
-        cached = self._reader._bundle_cached(
-            self._marker, self._owner, key,
-        )
+        cached = self._reader._bundle_cached(self._owner, key)
         if cached is not None:
             return cached
         local_prior, local = self._local_lookup(key)
         if local is not None:
             return local[0]
         semantic = self._semantic("reader-cache" if retain else "return", key)
-        self._reader._bundle_exchange_reserve(
-            self._marker, self._owner, value, semantic,
-        )
+        self._reader._bundle_reservation_reserve(self._owner, value, semantic)
         self._publish_local(
             local_prior, key, (value, semantic, retain),
         )
@@ -1870,16 +1672,13 @@ class _ReaderArrayBundle:
         )
         try:
             direction = self._reader._finish_array_bundle(
-                self._marker,
                 self._owner,
                 plan,
                 self.pending_scan_data_columns,
             )
         except BaseException as error:
             try:
-                direction = self._reader._recover_array_bundle(
-                    self._marker, self._owner,
-                )
+                direction = self._reader._recover_array_bundle(self._owner)
             except BaseException as recovery_error:
                 raise recovery_error from error
             self._compact(direction)
@@ -1889,16 +1688,12 @@ class _ReaderArrayBundle:
     def rollback(self) -> None:
         if not self._active:
             return
-        direction = self._reader._rollback_array_bundle(
-            self._marker, self._owner,
-        )
+        direction = self._reader._rollback_array_bundle(self._owner)
         self._compact(direction)
 
     def recover(self) -> str:
         self._require_active()
-        direction = self._reader._recover_array_bundle(
-            self._marker, self._owner,
-        )
+        direction = self._reader._recover_array_bundle(self._owner)
         return self._compact(direction)
 
     def __enter__(self) -> "_ReaderArrayBundle":
@@ -1979,7 +1774,6 @@ class FrameViewReader:
             _MAX_READER_RETAINED_BYTES,
         )
         self._memory_authority.close()
-        self._reader_cache_builder_factory = dict
         self._reader_cache_state = _ReaderCacheState(
             0,
             _ReaderCachePhase.CLOSED,
@@ -1988,7 +1782,7 @@ class FrameViewReader:
             None,
             None,
             (),
-            (),
+            None,
         )
 
     def __copy__(self) -> "FrameViewReader":
@@ -2020,7 +1814,7 @@ class FrameViewReader:
         state = self._snapshot_reader_cache_state()
         if state.phase is _ReaderCachePhase.CLOSED:
             return 0
-        if state.phase is not _ReaderCachePhase.OPEN or state.journal is not None:
+        if state.phase is not _ReaderCachePhase.OPEN or state.pending is not None:
             raise RuntimeError("FrameView reader-cache accounting is busy")
         authority = self._memory_authority
         if kind == "bytes":
@@ -2044,7 +1838,7 @@ class FrameViewReader:
         state = self._snapshot_reader_cache_state()
         if state.phase is _ReaderCachePhase.CLOSED:
             return MappingProxyType({})
-        if state.phase is not _ReaderCachePhase.OPEN or state.journal is not None:
+        if state.phase is not _ReaderCachePhase.OPEN or state.pending is not None:
             raise RuntimeError("FrameView reader cache publication is busy")
         values: dict[tuple[object, ...], np.ndarray] = {}
         for key, entry in state.entries.items():
@@ -2060,7 +1854,7 @@ class FrameViewReader:
         state = self._snapshot_reader_cache_state()
         if state.phase is _ReaderCachePhase.CLOSED:
             return None
-        if state.phase is not _ReaderCachePhase.OPEN or state.journal is not None:
+        if state.phase is not _ReaderCachePhase.OPEN or state.pending is not None:
             raise RuntimeError("FrameView reader cache publication is busy")
         columns = state.scan_data_columns
         if self._snapshot_reader_cache_state() is not state:
@@ -2113,1228 +1907,6 @@ class FrameViewReader:
         if current is expected:
             return False
         raise RuntimeError("FrameView reader-cache state drifted")
-
-    @staticmethod
-    def _reader_journal_for(
-        state: _ReaderCacheState,
-        marker: _ReaderCacheMarker,
-    ) -> _ReaderCacheJournal:
-        journal = state.journal
-        if journal is None or journal.marker is not marker:
-            raise RuntimeError("FrameView reader-cache journal is not owned")
-        return journal
-
-    @staticmethod
-    def _reader_owner_for(
-        journal: _ReaderCacheJournal,
-        owner: _ReaderBundleOwner | None,
-    ) -> _ReaderBundleOwner | None:
-        owner_ref = journal.owner_ref
-        current = None if owner_ref is None else owner_ref()
-        if owner is not None:
-            if current is not owner:
-                raise RuntimeError("FrameView read-bundle owner is stale")
-            return owner
-        if current is not None:
-            raise RuntimeError("FrameView read-bundle owner is busy")
-        return None
-
-    def _assert_bundle_owned(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner,
-    ) -> _ReaderCacheState:
-        state = self._snapshot_reader_cache_state()
-        journal = self._reader_journal_for(state, marker)
-        self._reader_owner_for(journal, owner)
-        if state.phase is not _ReaderCachePhase.BUILDING:
-            raise RuntimeError("FrameView read bundle is no longer building")
-        if state.open_token is not self._hdf_owner_token:
-            raise RuntimeError("FrameView read bundle lost its HDF owner")
-        return state
-
-    def _bundle_callback_stamp(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner,
-    ) -> _ReaderCacheState:
-        return self._assert_bundle_owned(marker, owner)
-
-    def _revalidate_bundle_callback(
-        self,
-        stamp: _ReaderCacheState,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner,
-    ) -> None:
-        current = self._assert_bundle_owned(marker, owner)
-        if current is not stamp:
-            raise RuntimeError("FrameView read-bundle callback drifted")
-
-    def _claim_reader_driver(
-        self,
-        state: _ReaderCacheState,
-        marker: _ReaderCacheMarker,
-        phase: _ReaderCachePhase,
-    ) -> tuple[_ReaderCacheState, _ReaderCacheDriver] | None:
-        journal = self._reader_journal_for(state, marker)
-        live_driver = (
-            None if journal.driver_ref is None else journal.driver_ref()
-        )
-        if live_driver is not None:
-            raise RuntimeError("FrameView reader-cache helper is busy")
-        owner = _ReaderCacheDriver()
-        driven_journal = _reader_cache_journal_with(
-            journal,
-            driver_ref=ref(owner),
-            replace_driver_ref=True,
-        )
-        driven = _reader_cache_state_with(
-            state,
-            phase=phase,
-            journal=driven_journal,
-            replace_journal=True,
-        )
-        if not self._transition_reader_cache_state(state, driven):
-            return None
-        return driven, owner
-
-    def _revalidate_reader_driver(
-        self,
-        driven: _ReaderCacheState,
-        owner: _ReaderCacheDriver,
-    ) -> _ReaderCacheJournal:
-        current = self._snapshot_reader_cache_state()
-        if current is not driven:
-            raise RuntimeError("FrameView reader-cache callback drifted")
-        journal = current.journal
-        if (
-            journal is None
-            or journal.driver_ref is None
-            or journal.driver_ref() is not owner
-        ):
-            raise RuntimeError("FrameView reader-cache driver is stale")
-        return journal
-
-    def _clear_reader_driver(
-        self,
-        driven: _ReaderCacheState,
-        owner: _ReaderCacheDriver,
-        *,
-        phase: _ReaderCachePhase | None = None,
-        journal: _ReaderCacheJournal | None = None,
-    ) -> _ReaderCacheState:
-        current_journal = self._revalidate_reader_driver(driven, owner)
-        source_journal = current_journal if journal is None else journal
-        cleared_journal = _reader_cache_journal_with(
-            source_journal,
-            driver_ref=None,
-            replace_driver_ref=True,
-        )
-        replacement = _reader_cache_state_with(
-            driven,
-            phase=phase,
-            journal=cleared_journal,
-            replace_journal=True,
-        )
-        if not self._transition_reader_cache_state(driven, replacement):
-            raise RuntimeError("FrameView reader-cache driver settlement raced")
-        return replacement
-
-    def _begin_array_bundle(
-        self,
-        owner: _ReaderBundleOwner,
-        *,
-        opening: bool = False,
-    ) -> tuple[_ReaderCacheMarker, PhysicalRootExchange]:
-        if self._hdf_owner_token is None:
-            raise RuntimeError("FrameViewReader has no open memory authority")
-        state = self._snapshot_reader_cache_state()
-        expected_phase = (
-            _ReaderCachePhase.OPENING if opening else _ReaderCachePhase.OPEN
-        )
-        if state.phase is not expected_phase or state.journal is not None:
-            raise RuntimeError("FrameView reader cache publication is busy")
-        if state.open_token is not self._hdf_owner_token:
-            raise RuntimeError("FrameView reader cache HDF owner is stale")
-        marker = _ReaderCacheMarker()
-        journal = _ReaderCacheJournal(
-            marker,
-            ref(owner),
-            None,
-            None,
-            state,
-            (),
-            None,
-            None,
-            None,
-            (),
-            self._reader_cache_builder_factory,
-            None,
-            opening,
-            None,
-        )
-        replacement = _reader_cache_state_with(
-            state,
-            phase=_ReaderCachePhase.BUILDING,
-            journal=journal,
-            replace_journal=True,
-        )
-        if not self._transition_reader_cache_state(state, replacement):
-            raise RuntimeError("FrameView reader cache admission raced")
-        claim = self._claim_reader_driver(
-            replacement, marker, _ReaderCachePhase.BUILDING,
-        )
-        if claim is None:
-            raise RuntimeError("FrameView reader cache admission raced")
-        driven, driver = claim
-        try:
-            exchange = self._memory_authority.exchange(())
-            driven_journal = self._revalidate_reader_driver(driven, driver)
-            installed = _reader_cache_journal_with(
-                driven_journal,
-                exchange=exchange,
-                replace_exchange=True,
-            )
-            self._clear_reader_driver(
-                driven,
-                driver,
-                phase=_ReaderCachePhase.BUILDING,
-                journal=installed,
-            )
-        except BaseException:
-            # The immutable BUILDING journal and weak owner evidence retain
-            # exact recovery custody.  No unowned rollback races a live owner.
-            error = sys.exception()
-            assert error is not None
-            try:
-                if self._snapshot_reader_cache_state() is driven:
-                    self._clear_reader_driver(
-                        driven, driver, phase=_ReaderCachePhase.BUILDING,
-                    )
-                self._rollback_array_bundle(marker, owner)
-            except BaseException as recovery_error:
-                raise recovery_error from error
-            raise
-        current = self._assert_bundle_owned(marker, owner)
-        current_journal = self._reader_journal_for(current, marker)
-        if current_journal.exchange is not exchange:
-            raise RuntimeError("FrameView physical exchange was not admitted")
-        return marker, exchange
-
-    def _bundle_cached(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner,
-        key: tuple[object, ...],
-    ) -> np.ndarray | None:
-        state = self._assert_bundle_owned(marker, owner)
-        entry = state.entries.get(key)
-        if self._snapshot_reader_cache_state() is not state:
-            raise RuntimeError("FrameView reader-cache lookup drifted")
-        if entry is None:
-            return None
-        self._validate_reader_cache_entry(entry)
-        if self._snapshot_reader_cache_state() is not state:
-            raise RuntimeError("FrameView reader-cache lookup drifted")
-        return entry.array
-
-    def _bundle_scan_data_columns(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner,
-    ) -> Mapping[str, np.ndarray] | None:
-        state = self._assert_bundle_owned(marker, owner)
-        columns = state.scan_data_columns
-        if self._snapshot_reader_cache_state() is not state:
-            raise RuntimeError("FrameView scan-data lookup drifted")
-        return columns
-
-    def _bundle_exchange_call(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner,
-        method: str,
-        *args: object,
-    ) -> object:
-        state = self._assert_bundle_owned(marker, owner)
-        claim = self._claim_reader_driver(
-            state, marker, _ReaderCachePhase.BUILDING,
-        )
-        if claim is None:
-            raise RuntimeError("FrameView reader-cache helper raced")
-        driven, driver = claim
-        journal = self._revalidate_reader_driver(driven, driver)
-        exchange = journal.exchange
-        if exchange is None:
-            raise RuntimeError("FrameView physical exchange is unavailable")
-        error: BaseException | None = None
-        result: object | None = None
-        try:
-            try:
-                result = getattr(exchange, method)(*args)
-            except BaseException as caught:
-                error = caught
-            self._revalidate_reader_driver(driven, driver)
-            self._clear_reader_driver(
-                driven, driver, phase=_ReaderCachePhase.BUILDING,
-            )
-        except BaseException as settlement_error:
-            if error is not None:
-                raise settlement_error from error
-            raise
-        if error is not None:
-            raise error
-        return result
-
-    def _bundle_exchange_claim(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner,
-        nbytes: int,
-    ) -> object:
-        return self._bundle_exchange_call(
-            marker, owner, "claim", nbytes,
-        )
-
-    def _bundle_exchange_bind(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner,
-        token: object,
-        value: object,
-        semantic: object,
-    ) -> object:
-        return self._bundle_exchange_call(
-            marker, owner, "bind", token, value, semantic,
-        )
-
-    def _bundle_exchange_reserve(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner,
-        value: object,
-        semantic: object,
-    ) -> object:
-        return self._bundle_exchange_call(
-            marker, owner, "reserve", value, semantic,
-        )
-
-    def _seal_array_bundle(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner,
-        plan: tuple[_ReaderPendingArray, ...],
-        pending_scan_data_columns: dict[str, np.ndarray] | None,
-    ) -> _ReaderCacheState:
-        state = self._assert_bundle_owned(marker, owner)
-        journal = self._reader_journal_for(state, marker)
-        if journal.exchange is None:
-            raise RuntimeError("FrameView physical exchange is unavailable")
-        retained_keys: set[tuple[object, ...]] = set()
-        for pending in plan:
-            if type(pending) is not _ReaderPendingArray:
-                raise TypeError("FrameView pending array is untrusted")
-            if pending.retain:
-                if pending.key in retained_keys or pending.key in state.entries:
-                    raise RuntimeError(
-                        "FrameView reader-cache key was already retained"
-                    )
-                retained_keys.add(pending.key)
-                pending.value.setflags(write=False)
-        if self._snapshot_reader_cache_state() is not state:
-            raise RuntimeError("FrameView read-bundle seal callback drifted")
-        scan_columns = (
-            None
-            if pending_scan_data_columns is None
-            else MappingProxyType(dict(pending_scan_data_columns))
-        )
-        if self._snapshot_reader_cache_state() is not state:
-            raise RuntimeError("FrameView scan-data seal callback drifted")
-        sealed = _reader_cache_journal_with(
-            journal,
-            plan=plan,
-            pending_scan_data_columns=scan_columns,
-            replace_pending_scan_data_columns=True,
-        )
-        replacement = _reader_cache_state_with(
-            state,
-            phase=_ReaderCachePhase.PREPARING,
-            journal=sealed,
-            replace_journal=True,
-        )
-        if not self._transition_reader_cache_state(state, replacement):
-            raise RuntimeError("FrameView reader-cache seal did not complete")
-        return replacement
-
-    def _candidate_reader_journal(
-        self,
-        driven: _ReaderCacheState,
-        driver: _ReaderCacheDriver,
-        journal: _ReaderCacheJournal,
-    ) -> _ReaderCacheJournal:
-        exchange = journal.exchange
-        if exchange is None:
-            raise RuntimeError("FrameView physical exchange is unavailable")
-        leases = exchange.prepared_leases
-        self._revalidate_reader_driver(driven, driver)
-
-        desired: list[
-            tuple[tuple[object, ...], np.ndarray, PhysicalRootLease]
-        ] = []
-        for key, entry in journal.prior.entries.items():
-            self._validate_reader_cache_entry(entry)
-            desired.append((key, entry.array, entry.lease))
-        self._revalidate_reader_driver(driven, driver)
-
-        transient: list[PhysicalRootLease] = []
-        for pending in journal.plan:
-            lease = leases[pending.semantic]
-            self._revalidate_reader_driver(driven, driver)
-            if (
-                type(lease) is not PhysicalRootLease
-                or lease.released
-                or lease._authority is not self._memory_authority
-                or lease._semantic is not pending.semantic
-                or lease._token.semantic is not pending.semantic
-            ):
-                raise RuntimeError("FrameView prepared lease is invalid")
-            if pending.retain:
-                desired.append((pending.key, pending.value, lease))
-            else:
-                transient.append(lease)
-
-        # Preserve the historical cache-publication fault surface without
-        # ever trusting or publishing the builder's mapping/leases.  The
-        # factory receives values only; trusted entries are rebuilt below.
-        factory = journal.builder_factory
-        candidate_values = factory()
-        self._revalidate_reader_driver(driven, driver)
-        for key, value, _lease in desired:
-            candidate_values[key] = value
-            self._revalidate_reader_driver(driven, driver)
-        frozen_values = MappingProxyType(dict(candidate_values))
-        self._revalidate_reader_driver(driven, driver)
-        actual = tuple(frozen_values.items())
-        if len(actual) != len(desired):
-            raise RuntimeError("FrameView cache builder changed cardinality")
-        for (actual_key, actual_value), (key, value, _lease) in zip(
-            actual, desired, strict=True,
-        ):
-            if actual_key != key or actual_value is not value:
-                raise RuntimeError("FrameView cache builder changed an entry")
-            self._revalidate_reader_driver(driven, driver)
-
-        trusted: dict[tuple[object, ...], _ReaderCacheEntry] = {}
-        for key, value, lease in desired:
-            trusted[key] = _ReaderCacheEntry(value, lease)
-        candidate_entries = MappingProxyType(trusted)
-        self._revalidate_reader_driver(driven, driver)
-        candidate_scan = (
-            journal.prior.scan_data_columns
-            if journal.pending_scan_data_columns is None
-            else journal.pending_scan_data_columns
-        )
-        if candidate_scan is not None:
-            retained_arrays = tuple(
-                entry.array for entry in candidate_entries.values()
-            )
-            for value in candidate_scan.values():
-                if not any(value is candidate for candidate in retained_arrays):
-                    raise RuntimeError(
-                        "FrameView scan-data column is not cache-owned"
-                    )
-        self._revalidate_reader_driver(driven, driver)
-        return _reader_cache_journal_with(
-            journal,
-            candidate_entries=candidate_entries,
-            replace_candidate_entries=True,
-            candidate_scan_data_columns=candidate_scan,
-            replace_candidate_scan_data_columns=True,
-            transient_leases=tuple(transient),
-        )
-
-    def _reader_terminal_state(
-        self,
-        state: _ReaderCacheState,
-        journal: _ReaderCacheJournal,
-        direction: _ReaderCacheDirection,
-    ) -> _ReaderCacheState:
-        if direction is _ReaderCacheDirection.ACCEPTED:
-            entries = journal.candidate_entries
-            if entries is None:
-                raise RuntimeError("FrameView accepted cache candidate is absent")
-            scan_columns = journal.candidate_scan_data_columns
-            phase = (
-                _ReaderCachePhase.OPENING
-                if journal.opening
-                else _ReaderCachePhase.OPEN
-            )
-            open_token = state.open_token
-        elif direction is _ReaderCacheDirection.ROLLED_BACK:
-            entries = journal.prior.entries
-            scan_columns = journal.prior.scan_data_columns
-            phase = journal.prior.phase
-            open_token = journal.prior.open_token
-        elif direction is _ReaderCacheDirection.CLOSED:
-            entries = MappingProxyType({})
-            scan_columns = None
-            phase = _ReaderCachePhase.CLOSED
-            open_token = None
-        else:  # pragma: no cover - exact enum contract
-            raise RuntimeError("FrameView reader-cache terminal direction is invalid")
-        evidence, directions = _reader_terminal_evidence_with(
-            state, journal.marker, direction,
-        )
-        return _reader_cache_state_with(
-            state,
-            phase=phase,
-            open_token=open_token,
-            replace_open_token=True,
-            entries=entries,
-            scan_data_columns=scan_columns,
-            replace_scan_data_columns=True,
-            journal=None,
-            replace_journal=True,
-            terminal_evidence=evidence,
-            terminal_directions=directions,
-        )
-
-    def _install_reader_terminal(
-        self,
-        state: _ReaderCacheState,
-        journal: _ReaderCacheJournal,
-        direction: _ReaderCacheDirection,
-    ) -> None:
-        replacement = self._reader_terminal_state(state, journal, direction)
-        if not self._transition_reader_cache_state(state, replacement):
-            current = self._snapshot_reader_cache_state()
-            if _reader_marker_direction(current, journal.marker) is direction:
-                return
-            raise RuntimeError("FrameView reader-cache terminal CAS failed")
-
-    def _rollback_array_bundle(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner | None = None,
-    ) -> str:
-        state = self._snapshot_reader_cache_state()
-        direction = _reader_marker_direction(state, marker)
-        if direction is not None:
-            if direction is not _ReaderCacheDirection.ROLLED_BACK:
-                raise RuntimeError("FrameView read bundle was not rolled back")
-            return direction.value
-        journal = self._reader_journal_for(state, marker)
-        self._reader_owner_for(journal, owner)
-        if state.phase is _ReaderCachePhase.BLOCKED:
-            raise RuntimeError("FrameView reader-cache journal is blocked")
-        if state.phase in {
-            _ReaderCachePhase.ACCEPTING,
-            _ReaderCachePhase.PUBLISHING,
-        }:
-            raise RuntimeError("FrameView read bundle acceptance is pending")
-        exchange = journal.exchange
-        if exchange is None:
-            self._install_reader_terminal(
-                state, journal, _ReaderCacheDirection.ROLLED_BACK,
-            )
-            return _ReaderCacheDirection.ROLLED_BACK.value
-        claim = self._claim_reader_driver(
-            state, marker, _ReaderCachePhase.ROLLING_BACK,
-        )
-        if claim is None:
-            return self._rollback_array_bundle(marker, owner)
-        driven, driver = claim
-        driven_journal = self._revalidate_reader_driver(driven, driver)
-        exchange = driven_journal.exchange
-        assert exchange is not None
-        error: BaseException | None = None
-        try:
-            try:
-                exchange.rollback()
-            except BaseException as caught:
-                error = caught
-            phase = exchange.phase
-            self._revalidate_reader_driver(driven, driver)
-            cleared = self._clear_reader_driver(
-                driven, driver, phase=_ReaderCachePhase.ROLLING_BACK,
-            )
-            if phase is PhysicalRootExchangePhase.ROLLED_BACK:
-                cleared_journal = self._reader_journal_for(cleared, marker)
-                self._install_reader_terminal(
-                    cleared,
-                    cleared_journal,
-                    _ReaderCacheDirection.ROLLED_BACK,
-                )
-            elif phase not in {
-                PhysicalRootExchangePhase.OPEN,
-                PhysicalRootExchangePhase.PREPARED,
-                PhysicalRootExchangePhase.STAGED,
-                PhysicalRootExchangePhase.COMMIT_PENDING,
-            }:
-                blocked = _reader_cache_state_with(
-                    cleared, phase=_ReaderCachePhase.BLOCKED,
-                )
-                self._transition_reader_cache_state(cleared, blocked)
-        except BaseException as settlement_error:
-            if error is not None:
-                raise settlement_error from error
-            raise
-        if error is not None:
-            raise error
-        current = self._snapshot_reader_cache_state()
-        direction = _reader_marker_direction(current, marker)
-        if direction is _ReaderCacheDirection.ROLLED_BACK:
-            return direction.value
-        raise RuntimeError("FrameView physical rollback did not complete")
-
-    def _accept_array_bundle(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner | None = None,
-    ) -> str:
-        state = self._snapshot_reader_cache_state()
-        direction = _reader_marker_direction(state, marker)
-        if direction is not None:
-            if direction is not _ReaderCacheDirection.ACCEPTED:
-                raise RuntimeError("FrameView read bundle was not accepted")
-            return direction.value
-        journal = self._reader_journal_for(state, marker)
-        self._reader_owner_for(journal, owner)
-        if state.phase not in {
-            _ReaderCachePhase.ACCEPT_PENDING,
-            _ReaderCachePhase.ACCEPTING,
-            _ReaderCachePhase.PUBLISHING,
-        }:
-            raise RuntimeError("FrameView read bundle is not accepting")
-        if state.phase is not _ReaderCachePhase.PUBLISHING:
-            claim = self._claim_reader_driver(
-                state, marker, _ReaderCachePhase.ACCEPTING,
-            )
-            if claim is None:
-                return self._accept_array_bundle(marker, owner)
-            driven, driver = claim
-            driven_journal = self._revalidate_reader_driver(driven, driver)
-            exchange = driven_journal.exchange
-            if exchange is None:
-                raise RuntimeError("FrameView physical exchange is unavailable")
-            error: BaseException | None = None
-            try:
-                try:
-                    exchange.accept()
-                except BaseException as caught:
-                    error = caught
-                phase = exchange.phase
-                self._revalidate_reader_driver(driven, driver)
-                next_phase = (
-                    _ReaderCachePhase.PUBLISHING
-                    if phase is PhysicalRootExchangePhase.ACCEPTED
-                    else _ReaderCachePhase.ACCEPTING
-                )
-                state = self._clear_reader_driver(
-                    driven, driver, phase=next_phase,
-                )
-            except BaseException as settlement_error:
-                if error is not None:
-                    raise settlement_error from error
-                raise
-            if error is not None:
-                raise error
-            if phase is not PhysicalRootExchangePhase.ACCEPTED:
-                raise RuntimeError("FrameView physical acceptance did not complete")
-        else:
-            state = self._snapshot_reader_cache_state()
-        journal = self._reader_journal_for(state, marker)
-        for lease in journal.transient_leases:
-            if lease.released:
-                continue
-            # A fault wrapper may interrupt after exact retirement but before
-            # PhysicalRootLease can mark itself released.  Token absence from
-            # this exact accepted authority is durable completion evidence.
-            authority_state = self._memory_authority._snapshot_state()
-            if not any(
-                binding.token is lease._token
-                for binding in authority_state.bindings
-            ):
-                lease._released = True
-                continue
-            try:
-                lease.release()
-            except BaseException:
-                if self._snapshot_reader_cache_state() is not state:
-                    raise RuntimeError(
-                        "FrameView transient release callback drifted"
-                    )
-                raise
-            if self._snapshot_reader_cache_state() is not state:
-                raise RuntimeError("FrameView transient release callback drifted")
-        self._validate_authority_matches_entries(state, journal)
-        self._install_reader_terminal(
-            state, journal, _ReaderCacheDirection.ACCEPTED,
-        )
-        return _ReaderCacheDirection.ACCEPTED.value
-
-    def _validate_authority_matches_entries(
-        self,
-        state: _ReaderCacheState,
-        journal: _ReaderCacheJournal,
-    ) -> None:
-        entries = journal.candidate_entries
-        if entries is None:
-            raise RuntimeError("FrameView accepted cache candidate is absent")
-        authority_state = self._memory_authority._snapshot_state()
-        if authority_state.closed:
-            raise RuntimeError("FrameView physical authority closed early")
-        if len(authority_state.bindings) != len(entries):
-            raise RuntimeError("FrameView cache binding cardinality diverged")
-        expected_tokens: set[int] = set()
-        expected_roots: dict[int, tuple[object, int, int]] = {}
-        for entry in entries.values():
-            self._validate_reader_cache_entry(entry)
-            lease = entry.lease
-            if lease._authority is not self._memory_authority:
-                raise RuntimeError("FrameView cache lease authority diverged")
-            token = lease._token
-            token_id = id(token)
-            if token_id in expected_tokens:
-                raise RuntimeError("FrameView cache lease token is duplicated")
-            expected_tokens.add(token_id)
-            bindings = tuple(
-                binding
-                for binding in authority_state.bindings
-                if binding.token is token
-            )
-            if len(bindings) != 1:
-                raise RuntimeError("FrameView cache lease binding diverged")
-            binding = bindings[0]
-            if (
-                binding.semantic is not lease._semantic
-                or token.semantic is not lease._semantic
-            ):
-                raise RuntimeError("FrameView cache lease semantic diverged")
-            fact = physical_root_fact(entry.array)
-            identity = id(fact.root)
-            if binding.root_identity != identity:
-                raise RuntimeError("FrameView cache lease root diverged")
-            prior = expected_roots.get(identity)
-            if prior is not None and (
-                prior[0] is not fact.root or prior[1] != fact.nbytes
-            ):
-                raise RuntimeError("FrameView cache physical root diverged")
-            expected_roots[identity] = (
-                fact.root,
-                fact.nbytes,
-                1 if prior is None else prior[2] + 1,
-            )
-        if {id(binding.token) for binding in authority_state.bindings} != expected_tokens:
-            raise RuntimeError("FrameView cache and physical authority diverged")
-        if len(authority_state.roots) != len(expected_roots):
-            raise RuntimeError("FrameView physical-root cardinality diverged")
-        for root_entry in authority_state.roots:
-            expected = expected_roots.get(root_entry.identity)
-            if (
-                expected is None
-                or root_entry.identity != id(root_entry.root)
-                or root_entry.root is not expected[0]
-                or root_entry.nbytes != expected[1]
-                or root_entry.references != expected[2]
-            ):
-                raise RuntimeError("FrameView physical-root fact diverged")
-        if self._snapshot_reader_cache_state() is not state:
-            raise RuntimeError("FrameView authority validation drifted")
-
-    def _recover_array_bundle(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner | None = None,
-    ) -> str:
-        state = self._snapshot_reader_cache_state()
-        direction = _reader_marker_direction(state, marker)
-        if direction is not None:
-            return direction.value
-        journal = self._reader_journal_for(state, marker)
-        self._reader_owner_for(journal, owner)
-        if state.phase is _ReaderCachePhase.BLOCKED:
-            raise RuntimeError("FrameView reader-cache journal is blocked")
-        if state.phase in {
-            _ReaderCachePhase.ACCEPTING,
-            _ReaderCachePhase.PUBLISHING,
-        }:
-            return self._accept_array_bundle(marker, owner)
-        return self._rollback_array_bundle(marker, owner)
-
-    def _drive_reader_prepare(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner,
-    ) -> None:
-        state = self._snapshot_reader_cache_state()
-        journal = self._reader_journal_for(state, marker)
-        self._reader_owner_for(journal, owner)
-        if state.phase is not _ReaderCachePhase.PREPARING:
-            raise RuntimeError("FrameView read bundle is not preparing")
-        claim = self._claim_reader_driver(
-            state, marker, _ReaderCachePhase.PREPARING,
-        )
-        if claim is None:
-            raise RuntimeError("FrameView prepare helper raced")
-        driven, driver = claim
-        journal = self._revalidate_reader_driver(driven, driver)
-        exchange = journal.exchange
-        if exchange is None:
-            raise RuntimeError("FrameView physical exchange is unavailable")
-        error: BaseException | None = None
-        try:
-            try:
-                exchange.prepare()
-            except BaseException as caught:
-                error = caught
-            phase = exchange.phase
-            self._revalidate_reader_driver(driven, driver)
-            if phase is PhysicalRootExchangePhase.STAGED:
-                candidate = self._candidate_reader_journal(
-                    driven, driver, journal,
-                )
-                self._clear_reader_driver(
-                    driven,
-                    driver,
-                    phase=_ReaderCachePhase.STAGED_PENDING,
-                    journal=candidate,
-                )
-            else:
-                self._clear_reader_driver(
-                    driven, driver, phase=_ReaderCachePhase.PREPARING,
-                )
-        except BaseException as settlement_error:
-            # Best effort clears only this exact live driver; unknown state is
-            # deliberately retained for explicit recovery.
-            if self._snapshot_reader_cache_state() is driven:
-                try:
-                    self._clear_reader_driver(
-                        driven, driver, phase=_ReaderCachePhase.PREPARING,
-                    )
-                except BaseException:
-                    pass
-            if error is not None:
-                raise settlement_error from error
-            raise
-        if error is not None:
-            raise error
-        if phase is not PhysicalRootExchangePhase.STAGED:
-            raise RuntimeError("FrameView physical prepare did not complete")
-
-    def _drive_reader_commit(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner,
-    ) -> None:
-        state = self._snapshot_reader_cache_state()
-        journal = self._reader_journal_for(state, marker)
-        self._reader_owner_for(journal, owner)
-        if state.phase is not _ReaderCachePhase.STAGED_PENDING:
-            raise RuntimeError("FrameView read bundle is not staged")
-        claim = self._claim_reader_driver(
-            state, marker, _ReaderCachePhase.COMMITTING,
-        )
-        if claim is None:
-            raise RuntimeError("FrameView commit helper raced")
-        driven, driver = claim
-        journal = self._revalidate_reader_driver(driven, driver)
-        exchange = journal.exchange
-        assert exchange is not None
-        error: BaseException | None = None
-        try:
-            try:
-                exchange.commit()
-            except BaseException as caught:
-                error = caught
-            phase = exchange.phase
-            self._revalidate_reader_driver(driven, driver)
-            next_phase = (
-                _ReaderCachePhase.ACCEPT_PENDING
-                if phase is PhysicalRootExchangePhase.COMMIT_PENDING
-                else _ReaderCachePhase.STAGED_PENDING
-            )
-            self._clear_reader_driver(driven, driver, phase=next_phase)
-        except BaseException as settlement_error:
-            if error is not None:
-                raise settlement_error from error
-            raise
-        if error is not None:
-            raise error
-        if phase is not PhysicalRootExchangePhase.COMMIT_PENDING:
-            raise RuntimeError("FrameView physical commit did not complete")
-
-    def _finish_array_bundle(
-        self,
-        marker: _ReaderCacheMarker,
-        owner: _ReaderBundleOwner,
-        plan: tuple[_ReaderPendingArray, ...],
-        pending_scan_data_columns: dict[str, np.ndarray] | None,
-    ) -> str:
-        self._seal_array_bundle(
-            marker, owner, plan, pending_scan_data_columns,
-        )
-        self._drive_reader_prepare(marker, owner)
-        self._drive_reader_commit(marker, owner)
-        return self._accept_array_bundle(marker, owner)
-
-    def _close_reader_cache(self, *, opening_failure: bool = False) -> None:
-        for _attempt in range(64):
-            state = self._snapshot_reader_cache_state()
-            if state.phase is _ReaderCachePhase.CLOSED:
-                return
-            journal = state.journal
-            if journal is not None and journal.owner_ref is not None:
-                if journal.owner_ref() is not None:
-                    raise RuntimeError("FrameView reader cache publication is busy")
-                self._recover_array_bundle(journal.marker)
-                continue
-            if journal is None:
-                if state.phase not in {
-                    _ReaderCachePhase.OPEN,
-                    _ReaderCachePhase.OPENING,
-                }:
-                    raise RuntimeError("FrameView reader-cache close state drifted")
-                if (
-                    state.phase is _ReaderCachePhase.OPENING
-                    and not opening_failure
-                ):
-                    raise RuntimeError("FrameViewReader open is still pending")
-                marker = _ReaderCacheMarker()
-                journal = _ReaderCacheJournal(
-                    marker,
-                    None,
-                    None,
-                    None,
-                    state,
-                    (),
-                    None,
-                    MappingProxyType({}),
-                    None,
-                    (),
-                    self._reader_cache_builder_factory,
-                    _ReaderCacheDirection.CLOSED,
-                    False,
-                    self._h5,
-                )
-                replacement = _reader_cache_state_with(
-                    state,
-                    phase=_ReaderCachePhase.CLOSE_ADMITTED,
-                    journal=journal,
-                    replace_journal=True,
-                )
-                if not self._transition_reader_cache_state(state, replacement):
-                    continue
-                continue
-            if state.phase is _ReaderCachePhase.BLOCKED:
-                raise RuntimeError("FrameView reader-cache close is blocked")
-            exchange = journal.exchange
-            if state.phase is _ReaderCachePhase.CLOSE_ADMITTED and exchange is None:
-                claim = self._claim_reader_driver(
-                    state, journal.marker, _ReaderCachePhase.CLOSE_ADMITTED,
-                )
-                if claim is None:
-                    continue
-                driven, driver = claim
-                driven_journal = self._revalidate_reader_driver(driven, driver)
-                error: BaseException | None = None
-                try:
-                    try:
-                        victims = tuple(
-                            entry.lease for entry in driven.entries.values()
-                        )
-                        exchange = self._memory_authority.exchange(victims)
-                    except BaseException as caught:
-                        error = caught
-                        exchange = None
-                    self._revalidate_reader_driver(driven, driver)
-                    if exchange is None:
-                        self._clear_reader_driver(
-                            driven,
-                            driver,
-                            phase=_ReaderCachePhase.CLOSE_ADMITTED,
-                        )
-                    else:
-                        installed = _reader_cache_journal_with(
-                            driven_journal,
-                            exchange=exchange,
-                            replace_exchange=True,
-                        )
-                        self._clear_reader_driver(
-                            driven,
-                            driver,
-                            phase=_ReaderCachePhase.CLOSE_ADMITTED,
-                            journal=installed,
-                        )
-                except BaseException as settlement_error:
-                    if error is not None:
-                        raise settlement_error from error
-                    raise
-                if error is not None:
-                    raise error
-                continue
-            if exchange is None:
-                raise RuntimeError("FrameView close exchange is unavailable")
-            if state.phase is _ReaderCachePhase.CLOSE_ADMITTED:
-                self._drive_close_exchange(
-                    state,
-                    method="prepare",
-                    driving_phase=_ReaderCachePhase.CLOSE_ADMITTED,
-                    success_physical=PhysicalRootExchangePhase.STAGED,
-                    success_phase=_ReaderCachePhase.CLOSE_STAGED,
-                    retry_phase=_ReaderCachePhase.CLOSE_ADMITTED,
-                )
-                continue
-            if state.phase is _ReaderCachePhase.CLOSE_STAGED:
-                self._drive_close_exchange(
-                    state,
-                    method="commit",
-                    driving_phase=_ReaderCachePhase.CLOSE_COMMITTING,
-                    success_physical=PhysicalRootExchangePhase.COMMIT_PENDING,
-                    success_phase=_ReaderCachePhase.CLOSE_ACCEPTING,
-                    retry_phase=_ReaderCachePhase.CLOSE_STAGED,
-                )
-                continue
-            if state.phase in {
-                _ReaderCachePhase.CLOSE_COMMITTING,
-                _ReaderCachePhase.CLOSE_ACCEPTING,
-            }:
-                self._drive_close_exchange(
-                    state,
-                    method="accept" if state.phase is _ReaderCachePhase.CLOSE_ACCEPTING else "commit",
-                    driving_phase=state.phase,
-                    success_physical=(
-                        PhysicalRootExchangePhase.ACCEPTED
-                        if state.phase is _ReaderCachePhase.CLOSE_ACCEPTING
-                        else PhysicalRootExchangePhase.COMMIT_PENDING
-                    ),
-                    success_phase=(
-                        _ReaderCachePhase.CLOSE_AUTHORITY
-                        if state.phase is _ReaderCachePhase.CLOSE_ACCEPTING
-                        else _ReaderCachePhase.CLOSE_ACCEPTING
-                    ),
-                    retry_phase=state.phase,
-                )
-                continue
-            if state.phase is _ReaderCachePhase.CLOSE_AUTHORITY:
-                self._drive_close_authority(state)
-                continue
-            if state.phase is _ReaderCachePhase.CLOSE_HDF:
-                self._drive_close_hdf(state)
-                continue
-            raise RuntimeError("FrameView reader-cache close journal drifted")
-        raise RuntimeError("FrameView reader-cache close did not converge")
-
-    def _drive_close_exchange(
-        self,
-        state: _ReaderCacheState,
-        *,
-        method: str,
-        driving_phase: _ReaderCachePhase,
-        success_physical: PhysicalRootExchangePhase,
-        success_phase: _ReaderCachePhase,
-        retry_phase: _ReaderCachePhase,
-    ) -> None:
-        journal = state.journal
-        if journal is None:
-            raise RuntimeError("FrameView close journal is unavailable")
-        claim = self._claim_reader_driver(
-            state, journal.marker, driving_phase,
-        )
-        if claim is None:
-            return
-        driven, driver = claim
-        driven_journal = self._revalidate_reader_driver(driven, driver)
-        exchange = driven_journal.exchange
-        if exchange is None:
-            raise RuntimeError("FrameView close exchange is unavailable")
-        error: BaseException | None = None
-        try:
-            try:
-                getattr(exchange, method)()
-            except BaseException as caught:
-                error = caught
-            phase = exchange.phase
-            self._revalidate_reader_driver(driven, driver)
-            self._clear_reader_driver(
-                driven,
-                driver,
-                phase=(success_phase if phase is success_physical else retry_phase),
-            )
-        except BaseException as settlement_error:
-            if error is not None:
-                raise settlement_error from error
-            raise
-        if error is not None:
-            raise error
-        if phase is not success_physical:
-            raise RuntimeError(f"FrameView close {method} did not complete")
-
-    def _drive_close_authority(self, state: _ReaderCacheState) -> None:
-        journal = state.journal
-        if journal is None:
-            raise RuntimeError("FrameView close journal is unavailable")
-        claim = self._claim_reader_driver(
-            state, journal.marker, _ReaderCachePhase.CLOSE_AUTHORITY,
-        )
-        if claim is None:
-            return
-        driven, driver = claim
-        error: BaseException | None = None
-        try:
-            try:
-                self._memory_authority.close()
-            except BaseException as caught:
-                error = caught
-            closed = bool(self._memory_authority._snapshot_state().closed)
-            self._revalidate_reader_driver(driven, driver)
-            self._clear_reader_driver(
-                driven,
-                driver,
-                phase=(
-                    _ReaderCachePhase.CLOSE_HDF
-                    if closed
-                    else _ReaderCachePhase.CLOSE_AUTHORITY
-                ),
-            )
-        except BaseException as settlement_error:
-            if error is not None:
-                raise settlement_error from error
-            raise
-        if error is not None:
-            raise error
-        if not closed:
-            raise RuntimeError("FrameView physical authority did not close")
-
-    def _retire_open_graph(self) -> tuple[object, ...]:
-        """Clear mutable open fields while retaining losing refs to return."""
-
-        losing = (
-            self._entry, self._g1, self._g2, self._geom, self._scan_data,
-            self._frames, self._source_base, self._map_1d, self._map_2d,
-            self._map_geom, self._map_scan_data, self._axis_1d,
-            self._axis_2d_x, self._axis_2d_y, self._g1_modes,
-            self._g2_modes, self._map_1d_modes, self._map_2d_modes,
-            self._axis_1d_modes, self._axis_2d_x_modes,
-            self._axis_2d_y_modes, self._two_d_kind_modes,
-            self._scan_data_items,
-        )
-        self._entry = self._g1 = self._g2 = None
-        self._geom = self._scan_data = self._frames = None
-        self._source_base = None
-        self._map_1d = {}
-        self._map_2d = {}
-        self._map_geom = {}
-        self._map_scan_data = {}
-        self._axis_1d = None
-        self._axis_2d_x = None
-        self._axis_2d_y = None
-        self._two_d_kind = TwoDKind.Q_CHI
-        self._g1_modes = {}
-        self._g2_modes = {}
-        self._map_1d_modes = {}
-        self._map_2d_modes = {}
-        self._axis_1d_modes = {}
-        self._axis_2d_x_modes = {}
-        self._axis_2d_y_modes = {}
-        self._two_d_kind_modes = {}
-        self._primary_mode_1d = DEFAULT_MODE_KEY
-        self._primary_mode_2d = DEFAULT_MODE_KEY
-        self._multi_result_modes = False
-        self._scan_data_items = ()
-        return losing
-
-    def _drive_close_hdf(self, state: _ReaderCacheState) -> None:
-        journal = state.journal
-        if journal is None:
-            raise RuntimeError("FrameView close journal is unavailable")
-        claim = self._claim_reader_driver(
-            state, journal.marker, _ReaderCachePhase.CLOSE_HDF,
-        )
-        if claim is None:
-            return
-        driven, driver = claim
-        driven_journal = self._revalidate_reader_driver(driven, driver)
-        handle = driven_journal.close_h5
-        error: BaseException | None = None
-        try:
-            try:
-                if handle is not None and bool(handle.id.valid):
-                    handle.close()
-            except BaseException as caught:
-                error = caught
-            closed = handle is None or not bool(handle.id.valid)
-            self._revalidate_reader_driver(driven, driver)
-            if not closed:
-                self._clear_reader_driver(
-                    driven, driver, phase=_ReaderCachePhase.CLOSE_HDF,
-                )
-            else:
-                losing = self._retire_open_graph()
-                self._revalidate_reader_driver(driven, driver)
-                self._h5 = None
-                self._hdf_owner_token = None
-                current_journal = self._revalidate_reader_driver(driven, driver)
-                terminal = self._reader_terminal_state(
-                    driven, current_journal, _ReaderCacheDirection.CLOSED,
-                )
-                self._transition_reader_cache_state(driven, terminal)
-                del losing
-        except BaseException as settlement_error:
-            if error is not None:
-                raise settlement_error from error
-            raise
-        if error is not None:
-            raise error
-        if not closed:
-            raise RuntimeError("FrameView HDF close did not complete")
-
-    def _clear_open_state(self, *, opening_failure: bool = False) -> None:
-        self._close_reader_cache(opening_failure=opening_failure)
-
-    def __enter__(self) -> "FrameViewReader":
-        if self._h5 is not None:
-            raise RuntimeError("FrameViewReader is already open")
-        # A closed reader can be reopened.  Every open owns a fresh token and
-        # authority, so an HDF object address can never alias a prior file.
-        state = self._snapshot_reader_cache_state()
-        if state.phase is not _ReaderCachePhase.CLOSED or state.journal is not None:
-            raise RuntimeError("FrameViewReader cache is not closed")
-        authority = PhysicalRootAuthority(
-            _MAX_READER_RETAINED_BYTES,
-        )
-        token = object()
-        opening = _reader_cache_state_with(
-            state,
-            phase=_ReaderCachePhase.OPENING,
-            open_token=token,
-            replace_open_token=True,
-            entries=MappingProxyType({}),
-            scan_data_columns=None,
-            replace_scan_data_columns=True,
-            journal=None,
-            replace_journal=True,
-        )
-        if not self._transition_reader_cache_state(state, opening):
-            authority.close()
-            raise RuntimeError("FrameViewReader open admission raced")
-        self._memory_authority = authority
-        self._hdf_owner_token = token
-        # Anything raising past this point (missing entry group, duplicate
-        # frame labels, malformed datasets) happens BEFORE the caller's
-        # with-block exists, so __exit__ never runs — close the handle
-        # ourselves or it leaks (and locks the file on Windows).
-        try:
-            self._h5 = h5py.File(self.path, "r")
-            if self._snapshot_reader_cache_state() is not opening:
-                raise RuntimeError("FrameViewReader HDF open state drifted")
-            return self._enter_inner()
-        except BaseException as error:
-            try:
-                self._clear_open_state(opening_failure=True)
-            except BaseException as cleanup_error:
-                raise cleanup_error from error
-            raise
 
     def _enter_inner(self) -> "FrameViewReader":
         handle = self._h5
@@ -3529,7 +2101,7 @@ class FrameViewReader:
         state = self._snapshot_reader_cache_state()
         if (
             state.phase is not _ReaderCachePhase.OPENING
-            or state.journal is not None
+            or state.pending is not None
             or state.open_token is not self._hdf_owner_token
         ):
             raise RuntimeError("FrameViewReader open publication drifted")
@@ -3545,92 +2117,6 @@ class FrameViewReader:
 
     def _row(self, mapping: dict[int, int], frame: int) -> int | None:
         return mapping.get(int(frame))
-
-    def _recover_dead_read_bundle_for_admission(
-        self, state: _ReaderCacheState,
-    ) -> _ReaderCacheState:
-        """Settle one abandoned read journal before a fresh public action.
-
-        A live bundle remains the sole owner and is never helped.  Only an
-        ordinary read journal whose weak owner has died is recoverable here;
-        close, opening, blocked, and unknown journals remain explicit custody
-        failures.  A failed recovery is deliberately left journalled so the
-        next caller can retry the exact same operation.
-        """
-
-        journal = state.journal
-        if journal is None:
-            raise RuntimeError("FrameViewReader is not exactly open")
-        if (
-            state.phase is _ReaderCachePhase.BLOCKED
-            or journal.intent is _ReaderCacheDirection.CLOSED
-            or journal.opening
-            or journal.prior.phase is not _ReaderCachePhase.OPEN
-            or journal.prior.open_token is not self._hdf_owner_token
-            or journal.owner_ref is None
-            or state.phase
-            not in {
-                _ReaderCachePhase.BUILDING,
-                _ReaderCachePhase.PREPARING,
-                _ReaderCachePhase.STAGED_PENDING,
-                _ReaderCachePhase.COMMITTING,
-                _ReaderCachePhase.ACCEPT_PENDING,
-                _ReaderCachePhase.ACCEPTING,
-                _ReaderCachePhase.PUBLISHING,
-                _ReaderCachePhase.ROLLING_BACK,
-            }
-        ):
-            raise RuntimeError("FrameViewReader has an unrecoverable cache journal")
-        if journal.owner_ref() is not None:
-            raise RuntimeError("FrameView reader cache publication is busy")
-        current = self._snapshot_reader_cache_state()
-        if current is not state:
-            if (
-                current.phase is _ReaderCachePhase.OPEN
-                and current.journal is None
-                and current.open_token is self._hdf_owner_token
-            ):
-                return current
-            raise RuntimeError("FrameView read-bundle recovery admission drifted")
-        marker = journal.marker
-        try:
-            self._recover_array_bundle(marker)
-        except BaseException:
-            current = self._snapshot_reader_cache_state()
-            if (
-                current.phase is _ReaderCachePhase.OPEN
-                and current.journal is None
-                and current.open_token is self._hdf_owner_token
-            ):
-                return current
-            raise
-        current = self._snapshot_reader_cache_state()
-        if (
-            current.phase is not _ReaderCachePhase.OPEN
-            or current.journal is not None
-            or current.open_token is not self._hdf_owner_token
-        ):
-            raise RuntimeError("FrameView read-bundle recovery did not converge")
-        return current
-
-    def _require_reader_open(self) -> _ReaderCacheState:
-        state = self._snapshot_reader_cache_state()
-        if state.phase is not _ReaderCachePhase.OPEN or state.journal is not None:
-            state = self._recover_dead_read_bundle_for_admission(state)
-        if (
-            state.phase is not _ReaderCachePhase.OPEN
-            or state.journal is not None
-            or state.open_token is None
-            or state.open_token is not self._hdf_owner_token
-            or self._h5 is None
-            or not bool(self._h5.id.valid)
-        ):
-            raise RuntimeError("FrameViewReader is not exactly open")
-        return state
-
-    def _revalidate_reader_open(self, state: _ReaderCacheState) -> None:
-        if self._snapshot_reader_cache_state() is not state:
-            raise RuntimeError("FrameViewReader open state drifted")
 
     def labels(self) -> tuple[int, ...]:
         """Frame labels known to this scan without reopening the file."""
@@ -3724,9 +2210,7 @@ class FrameViewReader:
         group = self._scan_data
         if group is None:
             return MappingProxyType({})
-        retained = self._bundle_scan_data_columns(
-            bundle._marker, bundle._owner,
-        )
+        retained = self._bundle_scan_data_columns(bundle._owner)
         if retained is not None:
             return retained
         columns: dict[str, np.ndarray] = {}
@@ -4200,9 +2684,7 @@ class FrameViewReader:
                 if np.asarray(value).shape == ():
                     out[str(key)] = _decode(np.asarray(value).item())
             return out
-        retained_cols = self._bundle_scan_data_columns(
-            bundle._marker, bundle._owner,
-        )
+        retained_cols = self._bundle_scan_data_columns(bundle._owner)
         cols = (
             retained_cols
             if retained_cols is not None
@@ -4663,6 +3145,338 @@ class FrameViewReader:
             )
             bundle.finish()
             return record
+
+    # Reader reservations are deliberately smaller than the historical
+    # exchange journal: the authority owns the gate; this state holds only the
+    # live bundle and, during close, the actual leases still requiring release.
+    def _pending_bundle(
+        self, owner: _ReaderBundleOwner | None,
+    ) -> tuple[_ReaderCacheState, _ReaderPendingBundle]:
+        state = self._snapshot_reader_cache_state()
+        pending = state.pending
+        if state.phase is not _ReaderCachePhase.BUILDING or pending is None:
+            raise RuntimeError("FrameView reader cache is not building")
+        current = pending.owner_ref()
+        if owner is not None and current is not owner:
+            raise RuntimeError("FrameView read-bundle owner is stale")
+        if owner is None and current is not None:
+            raise RuntimeError("FrameView read-bundle owner is busy")
+        if state.open_token is not self._hdf_owner_token:
+            raise RuntimeError("FrameView read bundle lost its HDF owner")
+        return state, pending
+
+    def _assert_bundle_owned(
+        self, owner: _ReaderBundleOwner,
+    ) -> _ReaderCacheState:
+        return self._pending_bundle(owner)[0]
+
+    def _bundle_callback_stamp(
+        self, owner: _ReaderBundleOwner,
+    ) -> _ReaderCacheState:
+        return self._assert_bundle_owned(owner)
+
+    def _revalidate_bundle_callback(
+        self, stamp: _ReaderCacheState, owner: _ReaderBundleOwner,
+    ) -> None:
+        if self._assert_bundle_owned(owner) is not stamp:
+            raise RuntimeError("FrameView read-bundle callback drifted")
+
+    def _begin_array_bundle(
+        self, owner: _ReaderBundleOwner, *, opening: bool = False,
+    ) -> PhysicalRootReservation:
+        state = self._snapshot_reader_cache_state()
+        expected = _ReaderCachePhase.OPENING if opening else _ReaderCachePhase.OPEN
+        if (
+            state.phase is not expected
+            or state.pending is not None
+            or state.open_token is not self._hdf_owner_token
+        ):
+            raise RuntimeError("FrameView reader cache publication is busy")
+        reservation = self._memory_authority.reserve()
+        replacement = _reader_cache_state_with(
+            state,
+            phase=_ReaderCachePhase.BUILDING,
+            pending=_ReaderPendingBundle(ref(owner), reservation, opening),
+            replace_pending=True,
+        )
+        if not self._transition_reader_cache_state(state, replacement):
+            reservation.rollback()
+            raise RuntimeError("FrameView reader cache admission raced")
+        return reservation
+
+    def _bundle_cached(
+        self, owner: _ReaderBundleOwner, key: tuple[object, ...],
+    ) -> np.ndarray | None:
+        state = self._assert_bundle_owned(owner)
+        entry = state.entries.get(key)
+        if entry is None:
+            return None
+        self._validate_reader_cache_entry(entry)
+        return entry.array
+
+    def _bundle_scan_data_columns(
+        self, owner: _ReaderBundleOwner,
+    ) -> Mapping[str, np.ndarray] | None:
+        return self._assert_bundle_owned(owner).scan_data_columns
+
+    def _bundle_reservation_call(
+        self, owner: _ReaderBundleOwner, method: str, *args: object,
+    ) -> object:
+        stamp, pending = self._pending_bundle(owner)
+        result = getattr(pending.reservation, method)(*args)
+        self._revalidate_bundle_callback(stamp, owner)
+        return result
+
+    def _bundle_reservation_claim(
+        self, owner: _ReaderBundleOwner, nbytes: int,
+    ) -> object:
+        return self._bundle_reservation_call(owner, "claim", nbytes)
+
+    def _bundle_reservation_bind(
+        self, owner: _ReaderBundleOwner, token: object, value: object,
+        semantic: object,
+    ) -> object:
+        return self._bundle_reservation_call(
+            owner, "bind", token, value, semantic,
+        )
+
+    def _bundle_reservation_reserve(
+        self, owner: _ReaderBundleOwner, value: object, semantic: object,
+    ) -> object:
+        return self._bundle_reservation_call(owner, "reserve", value, semantic)
+
+    def _settle_bundle(
+        self, owner: _ReaderBundleOwner | None, *, accept: bool,
+        plan: tuple[_ReaderPendingArray, ...] = (),
+        pending_scan_data_columns: Mapping[str, np.ndarray] | None = None,
+    ) -> str:
+        state, pending = self._pending_bundle(owner)
+        reservation = pending.reservation
+        if not accept:
+            reservation.rollback()
+            restored = _reader_cache_state_with(
+                state,
+                phase=_ReaderCachePhase.OPENING if pending.opening else _ReaderCachePhase.OPEN,
+                pending=None,
+                replace_pending=True,
+            )
+            if not self._transition_reader_cache_state(state, restored):
+                raise RuntimeError("FrameView reader cache rollback raced")
+            return "rolled-back"
+        retained: dict[tuple[object, ...], _ReaderCacheEntry] = dict(state.entries)
+        for item in plan:
+            if type(item) is not _ReaderPendingArray:
+                raise TypeError("FrameView pending array is untrusted")
+            if item.retain:
+                if item.key in retained:
+                    raise RuntimeError("FrameView reader-cache key was already retained")
+                item.value.setflags(write=False)
+        leases = reservation.commit()
+        transient: list[PhysicalRootLease] = []
+        try:
+            for item in plan:
+                lease = leases[item.semantic]
+                if (
+                    type(lease) is not PhysicalRootLease
+                    or lease.released
+                    or lease._authority is not self._memory_authority
+                ):
+                    raise RuntimeError("FrameView reservation lease is invalid")
+                if item.retain:
+                    retained[item.key] = _ReaderCacheEntry(item.value, lease)
+                else:
+                    transient.append(lease)
+            scan_columns = (
+                state.scan_data_columns
+                if pending_scan_data_columns is None
+                else MappingProxyType(dict(pending_scan_data_columns))
+            )
+            if scan_columns is not None:
+                values = tuple(entry.array for entry in retained.values())
+                if any(not any(value is cached for cached in values)
+                       for value in scan_columns.values()):
+                    raise RuntimeError("FrameView scan-data column is not cache-owned")
+            for lease in transient:
+                lease.release()
+        except BaseException:
+            reservation.rollback()
+            raise
+        accepted = _reader_cache_state_with(
+            state,
+            phase=_ReaderCachePhase.OPENING if pending.opening else _ReaderCachePhase.OPEN,
+            entries=MappingProxyType(retained),
+            scan_data_columns=scan_columns,
+            replace_scan_data_columns=True,
+            pending=None,
+            replace_pending=True,
+        )
+        if not self._transition_reader_cache_state(state, accepted):
+            raise RuntimeError("FrameView reader cache publication raced")
+        return "accepted"
+
+    def _finish_array_bundle(
+        self, owner: _ReaderBundleOwner, plan: tuple[_ReaderPendingArray, ...],
+        pending_scan_data_columns: Mapping[str, np.ndarray] | None,
+    ) -> str:
+        return self._settle_bundle(
+            owner, accept=True, plan=plan,
+            pending_scan_data_columns=pending_scan_data_columns,
+        )
+
+    def _rollback_array_bundle(self, owner: _ReaderBundleOwner | None) -> str:
+        return self._settle_bundle(owner, accept=False)
+
+    def _recover_array_bundle(self, owner: _ReaderBundleOwner | None) -> str:
+        return self._rollback_array_bundle(owner)
+
+    def _require_reader_open(self) -> _ReaderCacheState:
+        state = self._snapshot_reader_cache_state()
+        if state.phase is _ReaderCachePhase.BUILDING and state.pending is not None:
+            if state.pending.owner_ref() is not None:
+                raise RuntimeError("FrameView reader cache publication is busy")
+            self._rollback_array_bundle(None)
+            state = self._snapshot_reader_cache_state()
+        if (
+            state.phase is not _ReaderCachePhase.OPEN
+            or state.pending is not None
+            or state.open_token is not self._hdf_owner_token
+            or self._h5 is None
+            or not bool(self._h5.id.valid)
+        ):
+            raise RuntimeError("FrameViewReader is not exactly open")
+        return state
+
+    def _revalidate_reader_open(self, state: _ReaderCacheState) -> None:
+        if self._snapshot_reader_cache_state() is not state:
+            raise RuntimeError("FrameViewReader open state drifted")
+
+    def _clear_reader_fields(self) -> None:
+        self._h5 = None
+        self._hdf_owner_token = None
+        self._detach_reader_science_fields()
+
+    def _detach_reader_science_fields(self) -> None:
+        self._entry = self._g1 = self._g2 = None
+        self._geom = self._scan_data = self._frames = None
+        self._source_base = None
+        self._map_1d = self._map_2d = self._map_geom = self._map_scan_data = {}
+        self._axis_1d = self._axis_2d_x = self._axis_2d_y = None
+        self._two_d_kind = TwoDKind.Q_CHI
+        self._g1_modes = self._g2_modes = {}
+        self._map_1d_modes = self._map_2d_modes = {}
+        self._axis_1d_modes = self._axis_2d_x_modes = self._axis_2d_y_modes = {}
+        self._two_d_kind_modes = {}
+        self._scan_data_items = ()
+
+    def _clear_open_state(self) -> None:
+        state = self._snapshot_reader_cache_state()
+        if state.phase is _ReaderCachePhase.BUILDING:
+            assert state.pending is not None
+            if state.pending.owner_ref() is not None:
+                raise RuntimeError("FrameView reader cache publication is busy")
+            self._rollback_array_bundle(None)
+            state = self._snapshot_reader_cache_state()
+        if state.phase in {_ReaderCachePhase.OPEN, _ReaderCachePhase.OPENING}:
+            leases = tuple(entry.lease for entry in state.entries.values())
+            closing = _reader_cache_state_with(
+                state,
+                phase=_ReaderCachePhase.CLOSING_LEASES,
+                entries=MappingProxyType({}),
+                scan_data_columns=None,
+                replace_scan_data_columns=True,
+                close_leases=leases,
+                replace_close_leases=True,
+                close_h5=self._h5,
+                replace_close_h5=True,
+            )
+            if not self._transition_reader_cache_state(state, closing):
+                raise RuntimeError("FrameView reader close admission raced")
+            self._detach_reader_science_fields()
+            state = closing
+        if state.phase is _ReaderCachePhase.CLOSED:
+            return
+        if state.phase is _ReaderCachePhase.CLOSING_LEASES:
+            remaining = list(state.close_leases)
+            while remaining:
+                lease = remaining.pop(0)
+                try:
+                    lease.release()
+                except BaseException:
+                    if not lease.released:
+                        held = _reader_cache_state_with(
+                            state,
+                            close_leases=tuple([lease, *remaining]),
+                            replace_close_leases=True,
+                        )
+                        self._transition_reader_cache_state(state, held)
+                        raise
+                released = _reader_cache_state_with(
+                    state,
+                    close_leases=tuple(remaining),
+                    replace_close_leases=True,
+                )
+                if not self._transition_reader_cache_state(
+                    state, released,
+                ):
+                    raise RuntimeError("FrameView reader close lease release raced")
+                state = released
+            authority_phase = _reader_cache_state_with(
+                state, phase=_ReaderCachePhase.CLOSE_AUTHORITY,
+            )
+            if not self._transition_reader_cache_state(state, authority_phase):
+                raise RuntimeError("FrameView reader authority close raced")
+            state = authority_phase
+        if state.phase is _ReaderCachePhase.CLOSE_AUTHORITY:
+            self._memory_authority.close()
+            hdf_phase = _reader_cache_state_with(
+                state, phase=_ReaderCachePhase.CLOSE_HDF,
+            )
+            if not self._transition_reader_cache_state(state, hdf_phase):
+                raise RuntimeError("FrameView reader HDF close admission raced")
+            state = hdf_phase
+        if state.phase is not _ReaderCachePhase.CLOSE_HDF:
+            raise RuntimeError("FrameView reader close state is invalid")
+        handle = state.close_h5
+        if handle is not None and bool(handle.id.valid):
+            handle.close()
+        closed = _reader_cache_state_with(
+            state, phase=_ReaderCachePhase.CLOSED,
+            open_token=None, replace_open_token=True,
+            entries=MappingProxyType({}), scan_data_columns=None,
+            replace_scan_data_columns=True, close_h5=None, replace_close_h5=True,
+        )
+        if not self._transition_reader_cache_state(state, closed):
+            raise RuntimeError("FrameView reader final close raced")
+        self._clear_reader_fields()
+
+    def __enter__(self) -> "FrameViewReader":
+        state = self._snapshot_reader_cache_state()
+        if state.phase is not _ReaderCachePhase.CLOSED or state.pending is not None:
+            raise RuntimeError("FrameViewReader cache is not closed")
+        authority = PhysicalRootAuthority(_MAX_READER_RETAINED_BYTES)
+        token = object()
+        opening = _reader_cache_state_with(
+            state, phase=_ReaderCachePhase.OPENING, open_token=token,
+            replace_open_token=True, entries=MappingProxyType({}),
+            scan_data_columns=None, replace_scan_data_columns=True,
+        )
+        if not self._transition_reader_cache_state(state, opening):
+            authority.close()
+            raise RuntimeError("FrameViewReader open admission raced")
+        self._memory_authority = authority
+        self._hdf_owner_token = token
+        try:
+            self._h5 = h5py.File(self.path, "r")
+            return self._enter_inner()
+        except BaseException as error:
+            try:
+                self._clear_open_state()
+            except BaseException as cleanup_error:
+                raise cleanup_error from error
+            raise
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._clear_open_state()
 
 
 def read_frame_view(
