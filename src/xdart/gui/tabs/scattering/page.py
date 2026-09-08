@@ -5775,11 +5775,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or navigation.current is None
         ):
             return False
-        expected_logical = (
-            (navigation.current,)
-            if snapshot.plot_mode == "Single"
-            else navigation.selected
-        )
+        expected_logical = navigation.selected
         logical = snapshot.logical_frames
         display = snapshot.display_frames
         traces = getattr(scientific, "traces", ())
@@ -6812,7 +6808,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if type(value) is not str or value not in {
                 "Q-Chi",
                 "2Th-Chi",
-                "Qz-Qxy",
                 "qip_qoop",
                 "q_chi",
                 "exit_angles",

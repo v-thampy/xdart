@@ -72,7 +72,8 @@ class Browse1DTargetPlan:
             or type(self.waterfall_active) is not bool
             or type(self.stacked_options_applied) is not bool
             or self.stacked_options_applied
-            != (self.plot_mode in {"Overlay", "Waterfall"})
+            != (self.plot_mode in {"Overlay", "Waterfall"}
+                or self.plot_mode == "Single" and len(logical) > 1)
             or type(logical) is not tuple
             or not logical
             or any(type(frame) is not DisplayFrameKey for frame in logical)
@@ -388,24 +389,23 @@ def plan_browse_1d_targets(
             was_waterfall_active=was_waterfall_active,
         )
         stacked = tuple(navigation.selected)
-        waterfall_active = (
-            False
-            if plot_mode == "Single"
-            else waterfall_should_be_active(
-                plot_mode,
-                len(stacked),
-                was_active=was_waterfall_active,
-            )
+        waterfall_active = waterfall_should_be_active(
+            plot_mode,
+            len(stacked),
+            was_active=was_waterfall_active,
         )
-        if plot_mode == "Single":
-            logical = (navigation.current,)
-        elif plot_mode in {"Overlay", "Waterfall"}:
+        # Single replaces on an ordinary click, but explicit modifier
+        # membership is still authoritative, just as in acquisition display.
+        if plot_mode in {"Single", "Overlay", "Waterfall"}:
             logical = stacked
         else:
             logical = (navigation.current,)
         candidates = logical
         positions = tuple(range(1, len(logical) + 1))
-        stacked_options_applied = plot_mode in {"Overlay", "Waterfall"}
+        stacked_options_applied = (
+            plot_mode in {"Overlay", "Waterfall"}
+            or plot_mode == "Single" and len(logical) > 1
+        )
         if stacked_options_applied:
             start = options.waterfall_start - 1
             stop = options.waterfall_stop or None

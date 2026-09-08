@@ -359,7 +359,8 @@ class BrowseTraceSnapshot:
             or type(self.waterfall_active) is not bool
             or type(self.stacked_options_applied) is not bool
             or self.stacked_options_applied
-            != (self.plot_mode in {"Overlay", "Waterfall"})
+            != (self.plot_mode in {"Overlay", "Waterfall"}
+                or self.plot_mode == "Single" and len(logical) > 1)
             or type(self.science_contract) is not tuple
         ):
             raise TypeError("Browse trace snapshot is invalid")

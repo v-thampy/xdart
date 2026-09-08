@@ -84,7 +84,6 @@ _STANDARD_PLOT_AXIS_CHOICES = (
 _STANDARD_IMAGE_AXIS_CHOICES = (
     ("Q-χ", "Q-Chi"),
     ("2θ-χ", "2Th-Chi"),
-    ("Qz-Qxy", "Qz-Qxy"),
 )
 _GI_PLOT_AXIS_CHOICES = {
     "q_total": (

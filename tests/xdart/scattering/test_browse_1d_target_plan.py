@@ -154,8 +154,9 @@ def _close(rig, owner=None) -> None:
     rig[-1].close()
 
 
-def test_overlay_651_is_sampled_before_hydration_with_terminal_position(
-    tmp_path,
+@pytest.mark.parametrize("mode", ("Overlay", "Single"))
+def test_stacked_651_is_sampled_before_hydration_with_terminal_position(
+    tmp_path, mode,
 ) -> None:
     from xdart.gui.tabs.scattering.browse_1d_target_plan import (
         Browse1DTargetPlanStatus,
@@ -166,7 +167,7 @@ def test_overlay_651_is_sampled_before_hydration_with_terminal_position(
     rig = _rig(tmp_path, 651)
     navigation_before = rig[1].navigation
     resident_before = rig[-1].resident_keys
-    outcome = _plan(rig, ScientificPreferences(plot_mode="Overlay"))
+    outcome = _plan(rig, ScientificPreferences(plot_mode=mode))
 
     assert outcome.status is Browse1DTargetPlanStatus.PLANNED
     plan = outcome.plan
@@ -270,9 +271,9 @@ def test_below_threshold_stacked_modes_slice_exact_selected_order_once(
         ("Overlay", 16, False, True, 16),
         ("Overlay", 8, True, True, 8),
         ("Overlay", 7, True, False, 7),
-        ("Single", 15, False, False, 1),
-        ("Single", 16, False, False, 1),
-        ("Single", 8, True, False, 1),
+        ("Single", 15, False, False, 15),
+        ("Single", 16, False, True, 16),
+        ("Single", 8, True, True, 8),
         ("Average", 16, True, False, 1),
         ("Sum", 16, True, False, 1),
     ),
@@ -408,6 +409,7 @@ def test_runtime_complete_cache_retains_linear_bundle_and_performs_no_read(
     rig = _rig(tmp_path, 3)
     owner = _BrowseHydrationOwner(rig[0])
     target = rig[1].navigation.current
+    assert rig[1].select_navigation(target, (target,))
     _seed(rig, owner, (target,))
     reads = []
 
@@ -499,6 +501,7 @@ def test_stale_complete_is_refused_without_dropping_borrow_custody(
     runtime = rig[1]
     owner = _BrowseHydrationOwner(rig[0])
     target = runtime.navigation.current
+    assert runtime.select_navigation(target, (target,))
     _seed(rig, owner, (target,))
     original = owner.project_1d
 

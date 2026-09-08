@@ -282,7 +282,7 @@ def test_e3_ui4_exact_scientific_labels_and_metadata_action(
         assert [
             shell.scientific.image_axis.itemText(index)
             for index in range(shell.scientific.image_axis.count())
-        ] == ["Q-χ", "2θ-χ", "Qz-Qxy"]
+        ] == ["Q-χ", "2θ-χ"]
         assert shell.scientific.slice.text() == "χ (c/w)"
         assert shell.scientific.cake.plot.getAxis("bottom").labelText == "Q"
         assert shell.scientific.cake.plot.getAxis("bottom").labelUnits == "Å⁻¹"
