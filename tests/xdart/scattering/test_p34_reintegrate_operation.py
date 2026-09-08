@@ -89,7 +89,34 @@ def _persisted(selected, workers=1):
     selected=copy.deepcopy(selected); selected["gi_mode"]=selected["gi_mode"] or "q_total"; return {"api_version": 1, "selected_plan": selected,
             "requested_shared_science": {"version": 1, "kind": "persisted_target"},
             "resource_policy": {"version": 1, "kind": "resolve", "envelope_bytes": 8 << 30,
-                                "requests": {"workers": workers, "reduction_inflight": 1}}}
+            "requests": {"workers": workers, "reduction_inflight": 1}}}
+
+
+def _successor_from_support_plan(plan):
+    from xrd_tools.reduction import ReintegrateSuccessorPlan
+    from xrd_tools.reduction import reintegrate as support
+
+    mapping = support._plan_mapping(plan)
+    return ReintegrateSuccessorPlan.from_artifact(
+        plan.target,
+        entry=plan.entry,
+        dimension=plan.dimension,
+        source_root=plan.source_root,
+        expected_target_snapshot=plan.expected_target_snapshot,
+        expected_labels=plan.labels,
+        preparation={
+            "api_version": 1,
+            "selected_plan": support._plain(plan.selected_plan),
+            "requested_shared_science": support._plain(
+                plan.requested_shared_science,
+            ),
+            "resource_policy": {
+                "version": 1,
+                "kind": "explicit",
+                "allocation": mapping["session_policy"]["allocation"],
+            },
+        },
+    )
 def _join(slot, identity):
     worker = slot._worker; assert worker is not None; worker.join(20); assert not worker.is_alive()
     update = slot.poll(identity); assert update is not None and update.terminal is not None
@@ -225,23 +252,15 @@ def test_ordinary_output_routes_group_target_through_one_borrowed_lock(tmp_path)
 
 def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch):
     root = Path(__file__).resolve().parents[3]
-    probe_code = "import sys;sys.path.insert(0," + repr(str(root / "src")) + ");from xrd_tools.reduction import ReintegratePlan,ReintegrateProgress,ReintegrateResult,ReintegrateRunner,run_reintegrate;bad=sorted(name for name in sys.modules if name.split('.')[0] in {'xdart','qtpy','PyQt5','PySide6','pyFAI'});assert not bad,bad"
+    probe_code = "import sys;sys.path.insert(0," + repr(str(root / "src")) + ");from xrd_tools.reduction import ReintegratePlan,ReintegrateSuccessorPlan,ReintegrateSuccessorProgress,ReintegrateSuccessorResult,run_reintegrate_successor;bad=sorted(name for name in sys.modules if name.split('.')[0] in {'xdart','qtpy','PyQt5','PySide6','pyFAI'});assert not bad,bad"
     probe = subprocess.run([sys.executable, "-I", "-c", probe_code], capture_output=True, text=True, check=False)
     assert probe.returncode == 0, probe.stderr
-    from xrd_tools.reduction import (
-        ReintegratePlan,
-        ReintegrateProgress,
-        ReintegrateResult,
-        ReintegrateRunner,
-        run_reintegrate,
-    )
+    from xrd_tools.reduction import ReintegratePlan
     from xrd_tools.reduction import reintegrate as module
-    from xrd_tools.io.output_transaction import StreamTerminal
 
-    assert all(value is not None for value in (
-        ReintegratePlan, ReintegrateProgress, ReintegrateResult,
-        ReintegrateRunner, run_reintegrate,
-    ))
+    retired = {"ReintegrateProgress", "ReintegrateResult", "ReintegrateRunner", "run_reintegrate"}
+    import xrd_tools.reduction as reduction
+    assert all(not hasattr(reduction, name) for name in retired)
     assert tuple(field.name for field in fields(ReintegratePlan)) == (
         "api_version", "target", "entry", "source_root", "expected_target_snapshot", "dimension",
         "labels", "detector_shape", "native_dtype", "selected_plan",
@@ -249,54 +268,15 @@ def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch)
         "retained_mask_bytes", "mask_decode_bytes", "session_policy",
         "rollback_policy", "science_identity", "operation_identity",
     )
-    assert set(field.name for field in fields(ReintegrateProgress)) == {
-        "operation_identity", "stage", "completed", "total", "revision",
-    }
-    assert tuple(field.name for field in fields(ReintegrateResult)) == (
-        "disposition", "input_labels", "committed_labels",
-        "publication_dropped_labels", "diagnostics", "science_identity",
-        "operation_identity", "audit_identity", "commit_identity",
-    )
     assert tuple(inspect.signature(ReintegratePlan.from_artifact).parameters) == (
         "target", "entry", "dimension", "preparation", "source_root", "expected_target_snapshot",
         "expected_terminal_identity", "expected_labels", "cancel_token",
     )
     assert tuple(inspect.signature(ReintegratePlan.from_recipe).parameters) == ("recipe",)
-    assert tuple(inspect.signature(ReintegrateRunner).parameters) == ("plan", "cancel_token", "progress_cb")
-    assert tuple(inspect.signature(run_reintegrate).parameters) == ("plan", "cancel_token", "progress_cb")
-    progress = module._progress("a" * 64, "read", 1, 3, 2)
-    assert (progress.completed, progress.total, progress.revision) == (1, 3, 2)
-    assert ReintegrateProgress.__dataclass_params__.frozen
-    assert ReintegrateResult.__dataclass_params__.frozen
     assert ReintegratePlan.__dataclass_params__.frozen
-    for cls in (ReintegratePlan, ReintegrateProgress, ReintegrateResult):
-        with pytest.raises(TypeError, match="factory-constructed"): cls()
-    failures = module._ExecutionRuntime(SimpleNamespace(operation_identity="a" * 64), None, lambda _value: (_ for _ in ()).throw(RuntimeError("é" * 2000)))
-    for revision in range(20): failures._report("read", 0, 1)
-    assert failures.revision == 20 and len(failures.diagnostics) == 16
-    assert all(len(value.encode("utf-8")) <= 1024 for value in failures.diagnostics)
+    with pytest.raises(TypeError, match="factory-constructed"):
+        ReintegratePlan()
 
-    plan = object.__new__(ReintegratePlan)
-    object.__setattr__(plan, "labels", (2, 5)); object.__setattr__(plan, "science_identity", "b" * 64); object.__setattr__(plan, "operation_identity", "c" * 64)
-    terminal = StreamTerminal(
-        "/detached", 1, "d" * 64, 1, 1, 1, 1, 1,
-    )
-    class Pending:
-        primary = None
-        def __init__(self): self.custody = True; self.retries = 0
-        def run(self): return module._RuntimeOutcome("SETTLEMENT_PENDING", (), (), (), None, None)
-        def finish_current(self): self.retries += 1; self.custody = False; return module._RuntimeOutcome("COMMITTED", (2, 5), (), (), "e" * 64, terminal)
-        def _has_custody(self): return self.custody
-        def close(self): assert not self.custody
-    created = []
-    monkeypatch.setattr(module, "_open_runtime", lambda *_a, **_k: created.append(Pending()) or created[-1])
-    runner = ReintegrateRunner(plan); pending = runner.run()
-    assert pending.disposition == "SETTLEMENT_PENDING" and pending.commit_identity is None
-    with pytest.raises(RuntimeError, match="custody remains pending"): runner.close()
-    committed = runner.finish_current(); runner.close()
-    assert committed.disposition == "COMMITTED" and committed.commit_identity is terminal and created[0].retries == 1
-    convenient = run_reintegrate(plan)
-    assert convenient.disposition == "COMMITTED" and convenient.commit_identity is terminal and created[1].retries == 1
     from xrd_tools.io import record_writer
     from xrd_tools.reduction import Frame
     trace = []
@@ -322,12 +302,6 @@ def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch)
     )
     frame = Frame(7); source = module._ReintegrateFrameSource(source_plan, topology=topology); source._frames = {7: frame}; source.bind_allocation(allocation); source.bind_fact_reader(writer._detach_replacement_fact)
     assert source.prepare(frame)[0] is marker and trace == ["lock-enter", "detach", "lock-exit", "raw"]
-    runtime_source = inspect.getsource(module._ExecutionRuntime.run)
-    assert (
-        runtime_source.index("self.source.prepare(frame)")
-        < runtime_source.index("_drain_reintegration_engine(")
-        and "with " not in runtime_source
-    )
     source.clear_jit()
 
     owners = {
@@ -375,6 +349,7 @@ def test_reintegrate_rolls_exact_settlement_before_one_terminal_drain(
         plan.resource_allocation.workers,
         plan.resource_allocation.reduction_inflight,
     ) == (4, 8)
+    successor = _successor_from_support_plan(plan)
 
     sources = []
     prepare_snapshots = []
@@ -445,7 +420,8 @@ def test_reintegrate_rolls_exact_settlement_before_one_terminal_drain(
 
     monkeypatch.setattr(core, "integrate_1d", gated_integrate)
 
-    result = module.run_reintegrate(plan)
+    from xrd_tools.reduction import run_reintegrate_successor
+    result = run_reintegrate_successor(successor)
     assert result.disposition == "COMMITTED"
     assert result.committed_labels == labels
     assert len(prepare_snapshots) == len(labels)
@@ -466,7 +442,7 @@ def test_reintegrate_rolls_exact_settlement_before_one_terminal_drain(
     assert sources[0]._receipt_attempt_high_water <= 8
     assert sources[0].jit_roots == ()
     assert sources[0]._frames == {}
-    with h5py.File(seeded.target, "r") as handle:
+    with h5py.File(result.output_artifact, "r") as handle:
         group = handle["entry/integrated_1d"]
         np.testing.assert_array_equal(group["frame_index"][()], labels)
         np.testing.assert_allclose(
@@ -615,7 +591,7 @@ def test_reintegrate_cancelled_stalled_worker_returns_pending_bounded(
     tmp_path, monkeypatch,
 ):
     from xrd_tools.io.output_transaction import capture_target_snapshot
-    from xrd_tools.reduction import core
+    from xrd_tools.reduction import core, run_reintegrate_successor
     from xrd_tools.reduction import reintegrate as module
 
     labels = tuple(range(12))
@@ -628,6 +604,7 @@ def test_reintegrate_cancelled_stalled_worker_returns_pending_bounded(
     plan = module.ReintegratePlan.from_artifact(
         seeded.target, entry="entry", dimension="1d", preparation=preparation,
     )
+    successor = _successor_from_support_plan(plan)
     expected = capture_target_snapshot(seeded.target)
     _stub_integrators(monkeypatch)
     integrate_1d = core.integrate_1d
@@ -647,36 +624,23 @@ def test_reintegrate_cancelled_stalled_worker_returns_pending_bounded(
         time.sleep(0.02)
         cancelled.set()
     timer = threading.Thread(target=cancel_stalled)
-    runner = module.ReintegrateRunner(plan, cancel_token=cancelled)
     timer.start()
     started = time.monotonic()
     try:
-        pending = runner.run()
-        assert pending.disposition == "SETTLEMENT_PENDING"
+        with pytest.raises(TimeoutError, match="writer thread did not exit"):
+            run_reintegrate_successor(successor, cancel_token=cancelled)
         assert time.monotonic() - started < 1.0
-        assert runner._runtime._has_custody()
     finally:
         release.set()
         timer.join()
-
-    engine = runner._runtime.session._session
-    deadline = time.monotonic() + 2.0
-    while engine._writer_thread is not None and engine._writer_thread.is_alive():
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
-    assert engine.sink_terminal_safe
-    assert runner._runtime.session._session is engine
-    assert runner._runtime.session._dynamic_frozen_result is not None
-    with pytest.raises(TimeoutError, match="writer thread did not exit"):
-        runner.finish_current()
     assert capture_target_snapshot(seeded.target) == expected
-    runner.close()
+    assert not Path(successor.output_artifact).exists()
 
 
 def test_reintegrate_successful_drain_renews_join_budget_after_slow_validation(
     tmp_path, monkeypatch,
 ):
-    from xrd_tools.reduction import reintegrate as module
+    from xrd_tools.reduction import reintegrate as module, run_reintegrate_successor
     from xrd_tools.session.scan_session import ScanSession
 
     seeded = _seed_existing(tmp_path, labels=(0, 1, 2), name="join-budget")
@@ -684,10 +648,11 @@ def test_reintegrate_successful_drain_renews_join_budget_after_slow_validation(
         seeded.target, entry="entry", dimension="1d",
         preparation=seeded.preparation,
     )
+    successor = _successor_from_support_plan(plan)
     _stub_integrators(monkeypatch)
     monkeypatch.setattr(module, "_TERMINAL_DRAIN_TIMEOUT_SECONDS", 0.05)
     validate = module._ReintegrateFrameSource.validate_terminal_topology
-    finish = ScanSession.finish
+    prepare_external_publication = ScanSession.prepare_external_publication
     observed = []
 
     def slow_validate(owner):
@@ -695,18 +660,21 @@ def test_reintegrate_successful_drain_renews_join_budget_after_slow_validation(
         time.sleep(0.08)
         return value
 
-    def capture_finish(owner, *args, **kwargs):
+    def capture_prepare_external_publication(owner, *args, **kwargs):
         observed.append(kwargs.get("join_timeout"))
-        return finish(owner, *args, **kwargs)
+        return prepare_external_publication(owner, *args, **kwargs)
 
     monkeypatch.setattr(
         module._ReintegrateFrameSource,
         "validate_terminal_topology",
         slow_validate,
     )
-    monkeypatch.setattr(ScanSession, "finish", capture_finish)
+    monkeypatch.setattr(
+        ScanSession, "prepare_external_publication",
+        capture_prepare_external_publication,
+    )
 
-    result = module.run_reintegrate(plan)
+    result = run_reintegrate_successor(successor)
     assert result.disposition == "COMMITTED"
     assert len(observed) == 1
     assert type(observed[0]) is float and observed[0] > 0.02

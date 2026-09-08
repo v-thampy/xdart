@@ -460,7 +460,7 @@ def test_bounded_legacy_preparation_refuses_before_artifact_inspection(
     else:
         monkeypatch.setattr(module, "_MAX_RECIPE_BYTES", 256)
     monkeypatch.setattr(
-        module._legacy.ReintegratePlan,
+        module._support.ReintegratePlan,
         "from_artifact",
         lambda *_args, **_kwargs: pytest.fail("legacy artifact inspection ran"),
     )
@@ -590,7 +590,7 @@ def test_cancellation_immediately_after_preflight_precedes_source_expectations(
     def cancel(*_args, **_kwargs):
         token.set()
         if preflight == "raise":
-            raise module._legacy.ReintegrateCancelled()
+            raise module._support.ReintegrateCancelled()
 
     monkeypatch.setattr(module, "preflight_prepared_execution", cancel)
     monkeypatch.setattr(
@@ -762,7 +762,7 @@ def test_prepared_successor_uses_detached_facts_and_one_click_manifest(
     recipe = plan.as_recipe()
     _stub_integrators(monkeypatch)
     monkeypatch.setattr(
-        module._legacy,
+        module._support,
         "_inspect_artifact",
         lambda *_args, **_kwargs: pytest.fail("prepared click inspected artifact"),
     )
@@ -1373,7 +1373,7 @@ def test_prepared_append_recipe_refuses_revision_regression(
         ][0]["size"] = payload["final_source"]["external_members"][0][
             "size"
         ]
-    payload["lineage_digest"] = module._legacy._digest(payload["lineage"])
+    payload["lineage_digest"] = module._support._digest(payload["lineage"])
     topology["topology_digest"] = module._digest(payload)
 
     with pytest.raises(PreparedRouteRejected) as captured:
@@ -1751,7 +1751,7 @@ def test_prepared_and_manifest_versions_require_exact_integer_literals(
     malformed_execution = copy.deepcopy(execution["topology"])
     payload = malformed_execution["payload"]
     del payload["execution"]["adapter_id"]
-    payload["execution_digest"] = module._legacy._digest(payload["execution"])
+    payload["execution_digest"] = module._support._digest(payload["execution"])
     malformed_execution["topology_digest"] = module._digest(payload)
     with pytest.raises(module.PreparedRouteRejected) as captured:
         module._admit_topology(malformed_execution)
@@ -2697,7 +2697,7 @@ def test_browse_target_drift_is_never_a_fallback_authorizing_miss(
         os.replace(staged, seeded.target)
 
     if seam in ("inspection", "inspection-known-error"):
-        original = prepared_module._legacy._inspect_artifact
+        original = prepared_module._support._inspect_artifact
 
         def drift_then_inspect(*args, **kwargs):
             if seam == "inspection":
@@ -2708,7 +2708,7 @@ def test_browse_target_drift_is_never_a_fallback_authorizing_miss(
             raise ValueError("selected frame inventory is not exact")
 
         monkeypatch.setattr(
-            prepared_module._legacy, "_inspect_artifact", drift_then_inspect,
+            prepared_module._support, "_inspect_artifact", drift_then_inspect,
         )
     else:
         original = prepared_module.prepare_replacement_manifest_receipt
@@ -2750,7 +2750,7 @@ def test_browse_cancellation_is_never_a_fallback_authorizing_miss(
     source = _prepared_eligible_source(seeded)
     token = threading.Event()
     if seam == "inspection":
-        original = prepared_module._legacy._inspect_artifact
+        original = prepared_module._support._inspect_artifact
 
         def cancel_then_known_error(*args, **kwargs):
             original(*args, **kwargs)
@@ -2758,7 +2758,7 @@ def test_browse_cancellation_is_never_a_fallback_authorizing_miss(
             raise ValueError("selected frame inventory is not exact")
 
         monkeypatch.setattr(
-            prepared_module._legacy,
+            prepared_module._support,
             "_inspect_artifact",
             cancel_then_known_error,
         )
@@ -2774,7 +2774,7 @@ def test_browse_cancellation_is_never_a_fallback_authorizing_miss(
             "prepare_replacement_manifest_receipt",
             cancel_then_writer_error,
         )
-    with pytest.raises(prepared_module._legacy.ReintegrateCancelled):
+    with pytest.raises(prepared_module._support.ReintegrateCancelled):
         prepare_reintegrate_bundle(
             source,
             entry="entry",
@@ -2882,7 +2882,7 @@ def test_phase_a_cancellation_wins_over_translated_target_drift(
 
     monkeypatch.setattr(module, "capture_finite_source", cancel_then_drift)
     monkeypatch.setattr(module, "_legacy_successor_plan", forbidden_fallback)
-    with pytest.raises(module._legacy.ReintegrateCancelled):
+    with pytest.raises(module._support.ReintegrateCancelled):
         ReintegrateSuccessorPlan.from_prepared_or_artifact(
             offer,
             seeded.target,
@@ -2949,7 +2949,7 @@ def test_common_dispatcher_never_falls_back_after_nonmiss_or_route_seal(
         expected = LookupError
     elif seam == "cancel":
         token.set()
-        expected = module._legacy.ReintegrateCancelled
+        expected = module._support.ReintegrateCancelled
     else:
         expected = PreparedRouteChanged
 

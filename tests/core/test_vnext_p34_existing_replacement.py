@@ -15,6 +15,42 @@ from tests.core.reintegrate_support import (
 def _module():
     from xrd_tools.reduction import reintegrate
     return reintegrate
+
+
+def _successor_from_plan(plan, *, destination_directory=None):
+    """Build the immutable v4 execution plan from admitted v3 support facts."""
+    from xrd_tools.reduction import ReintegrateSuccessorPlan
+
+    support = _module()
+    mapping = support._plan_mapping(plan)
+    preparation = {
+        "api_version": 1,
+        "selected_plan": support._plain(plan.selected_plan),
+        "requested_shared_science": support._plain(
+            plan.requested_shared_science,
+        ),
+        "resource_policy": {
+            "version": 1,
+            "kind": "explicit",
+            "allocation": mapping["session_policy"]["allocation"],
+        },
+    }
+    return ReintegrateSuccessorPlan.from_artifact(
+        plan.target,
+        entry=plan.entry,
+        dimension=plan.dimension,
+        preparation=preparation,
+        source_root=plan.source_root,
+        expected_target_snapshot=plan.expected_target_snapshot,
+        expected_labels=plan.labels,
+        destination_directory=destination_directory,
+    )
+
+
+def _run_successor(plan, **kwargs):
+    from xrd_tools.reduction import run_reintegrate_successor
+
+    return run_reintegrate_successor(_successor_from_plan(plan), **kwargs)
 def _preserved_signature(path):
     allowed = ("entry/integrated_1d", "entry/reduction/config/bai_1d_args",
                "entry/reduction/config/gi_config",
@@ -42,6 +78,7 @@ def test_selected_project_root_relocates_reintegrate_and_restamps_context(
 ):
     from xrd_tools.io.output_transaction import capture_target_snapshot
     from xrd_tools.io.read import ProcessedScan
+    from xrd_tools.reduction import run_reintegrate_successor
 
     module = _module()
     seeded = _seed_existing(
@@ -64,11 +101,13 @@ def test_selected_project_root_relocates_reintegrate_and_restamps_context(
         expected_labels=seeded.labels,
     )
     assert plan.source_root == str(new_root)
-    result = module.run_reintegrate(plan)
+    source_before = moved_target.read_bytes()
+    result = run_reintegrate_successor(_successor_from_plan(plan))
     assert result.disposition == "COMMITTED"
     assert result.committed_labels == seeded.labels
+    assert moved_target.read_bytes() == source_before
 
-    with h5py.File(moved_target, "r") as handle:
+    with h5py.File(result.output_artifact, "r") as handle:
         entry = handle["entry"]
         assert entry.attrs["source_base"] == new_root.as_posix()
         execution = json.loads(
@@ -84,7 +123,7 @@ def test_selected_project_root_relocates_reintegrate_and_restamps_context(
             for epoch in lineage["epochs"]
         )
 
-    scan = ProcessedScan(moved_target, source_root=new_root)
+    scan = ProcessedScan(result.output_artifact, source_root=new_root)
     np.testing.assert_array_equal(scan.load_frame(2), seeded.raw[2])
 
 
@@ -840,6 +879,7 @@ def test_processed_mask_indices_must_be_strictly_canonical(tmp_path, indices):
 
 def test_replay_cannot_hide_persisted_mask_before_allocation(tmp_path, monkeypatch):
     from xrd_tools.reduction import NexusSink
+    from xrd_tools.reduction import run_reintegrate_successor
 
     module = _module()
     seeded = _seed_existing(tmp_path, name="false-mask-replay")
@@ -856,7 +896,8 @@ def test_replay_cannot_hide_persisted_mask_before_allocation(tmp_path, monkeypat
         module._PersistedMaskSpec(0, 0),
     )
     false_plan = module._make_plan(
-        admitted.target, admitted.entry, admitted.dimension, admitted.labels,
+        admitted.target, admitted.entry, admitted.source_root,
+        admitted.dimension, admitted.labels,
         admitted.detector_shape, admitted.native_dtype,
         module._plain(admitted.selected_plan),
         module._plain(admitted.requested_shared_science),
@@ -876,11 +917,13 @@ def test_replay_cannot_hide_persisted_mask_before_allocation(tmp_path, monkeypat
 
     monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded_getitem)
     monkeypatch.setattr(
-        NexusSink, "for_existing_replacement",
+        NexusSink, "for_finite_replacement",
         classmethod(lambda cls, *args, **kwargs: sinks.append(1)),
     )
-    with pytest.raises(ValueError, match="RECIPE_ARTIFACT_FACTS_CHANGED"):
-        module.run_reintegrate(false_plan)
+    with pytest.raises(
+        ValueError, match="REINTEGRATE_MASK_OWNER_BLOCK_GRANT_CHANGED",
+    ):
+        run_reintegrate_successor(_successor_from_plan(false_plan))
     assert mask_reads == []
     assert sinks == []
     assert seeded.target.read_bytes() == before
@@ -948,49 +991,28 @@ def test_mask_peak_has_exact_owner_grant_before_materialization(
 
 
 def test_exact_gapped_inventory_replaces_only_selected_dimension(tmp_path, monkeypatch):
-    from xrd_tools.io.output_transaction import OutputTransaction, StreamTerminal
-    from xrd_tools.io.record_writer import NexusRecordWriter
     seeded = _seed_existing(tmp_path, name="gapped")
-    before, reset, epochs, detached = _preserved_signature(seeded.target), [], [], []
-    real_reset, real_epoch = NexusRecordWriter._reset_selected_dimension, OutputTransaction.begin_stream_epoch
-    real_detach = NexusRecordWriter._detach_replacement_fact
-    def reset_once(self, *args, **kwargs): reset.append(args[0]); return real_reset(self, *args, **kwargs)
-    def no_epoch(self, *args, **kwargs): epochs.append(1); return real_epoch(self, *args, **kwargs)
-    def detach_once(self, label, **kwargs):
-        detached.append((label, kwargs)); return real_detach(self, label, **kwargs)
-    monkeypatch.setattr(NexusRecordWriter, "_reset_selected_dimension", reset_once)
-    monkeypatch.setattr(OutputTransaction, "begin_stream_epoch", no_epoch)
-    monkeypatch.setattr(NexusRecordWriter, "_detach_replacement_fact", detach_once)
+    before = _preserved_signature(seeded.target)
     seen = _stub_integrators(monkeypatch)
     plan = _module().ReintegratePlan.from_artifact(seeded.target, entry="entry", dimension="1d", preparation=seeded.preparation)
-    result = _module().run_reintegrate(plan)
+    result = _run_successor(plan)
     assert result.disposition == "COMMITTED" and result.committed_labels == seeded.labels
-    assert type(result.commit_identity) is StreamTerminal
-    assert reset == ["1d"] and epochs == []
-    assert [label for label, _ in detached] == list(seeded.labels)
-    assert all(keys == {"metadata_keys": (), "include_geometry": False}
-               for _, keys in detached)
+    assert type(result.commit_identity) is str
     assert seen == [(2, 3), (5, 3), (9, 3)]
     assert _preserved_signature(seeded.target) == before
-    with h5py.File(seeded.target, "r") as handle:
+    with h5py.File(result.output_artifact, "r") as handle:
         group = handle["entry/integrated_1d"]
         np.testing.assert_array_equal(group["frame_index"][()], seeded.labels)
-        np.testing.assert_allclose(group["q"][()], _r1(102, q0=.2).radial); assert not np.array_equal(group["q"][()], _r1(2).radial)
+        np.testing.assert_allclose(group["axis_1"][()], _r1(102, q0=.2).radial)
+        assert not np.array_equal(group["axis_1"][()], _r1(2).radial)
         np.testing.assert_allclose(group["intensity"][()],
                                    np.stack([_r1(v + 100).intensity for v in seeded.labels]))
         np.testing.assert_allclose(group["sigma"][()],
                                    np.stack([_r1(v + 100).sigma for v in seeded.labels]))
         assert "dimension_replacement_1d" in handle["entry/reduction/config"]
-    replay = _module().ReintegratePlan.from_artifact(seeded.target, entry="entry", dimension="1d", preparation=seeded.preparation)
+    replay = _module().ReintegratePlan.from_artifact(result.output_artifact, entry="entry", dimension="1d", preparation=seeded.preparation)
     assert replay.labels == seeded.labels
-    from xrd_tools.reduction.provenance_config import _integration_2d_args; two_prep = copy.deepcopy(seeded.preparation); two_args = _integration_2d_args(_plans()[1], None); two_args.pop("gi_mode_2d", None); two_prep["selected_plan"] = {"version": 1, "dimension": "2d", "bai_args": two_args, "gi_mode": None}; two_result = _module().run_reintegrate(_module().ReintegratePlan.from_artifact(seeded.target, entry="entry", dimension="2d", preparation=two_prep)); assert two_result.committed_labels == seeded.labels and reset == ["1d", "2d"]
-    nested = _seed_existing(tmp_path, name="nested-entry")
-    with h5py.File(nested.target, "r+") as handle: handle.create_group("outer"); handle.move("entry", "outer/entry")
-    exact = _module().ReintegratePlan.from_artifact(nested.target, entry="/outer//entry", dimension="1d", preparation=nested.preparation)
-    canonical = _module().ReintegratePlan.from_artifact(nested.target, entry="outer/entry", dimension="1d", preparation=nested.preparation)
-    assert exact.operation_identity != canonical.operation_identity
-    assert _module().run_reintegrate(exact).committed_labels == nested.labels
-    with h5py.File(nested.target, "r") as handle: assert "entry" not in handle and tuple(handle["outer/entry/integrated_1d/frame_index"][()]) == nested.labels
+    from xrd_tools.reduction.provenance_config import _integration_2d_args; two_prep = copy.deepcopy(seeded.preparation); two_args = _integration_2d_args(_plans()[1], None); two_args.pop("gi_mode_2d", None); two_prep["selected_plan"] = {"version": 1, "dimension": "2d", "bai_args": two_args, "gi_mode": None}; two_result = _run_successor(_module().ReintegratePlan.from_artifact(result.output_artifact, entry="entry", dimension="2d", preparation=two_prep)); assert two_result.committed_labels == seeded.labels
 
 
 def test_reintegrate_detaches_selected_monitor_metadata(tmp_path, monkeypatch):
@@ -1032,7 +1054,7 @@ def test_reintegrate_detaches_selected_monitor_metadata(tmp_path, monkeypatch):
         preparation=seeded.preparation,
     )
     assert plan.selected_plan["bai_args"]["monitor"] == "monitor"
-    result = module.run_reintegrate(plan)
+    result = _run_successor(plan)
     assert result.disposition == "COMMITTED"
     assert observed == [(label, float(label + 1)) for label in seeded.labels]
 
@@ -1046,6 +1068,7 @@ def test_production_gui_provenance_is_canonicalized_from_authenticated_facts(tmp
     module = _module(); seeded = _seed_existing(
         tmp_path, name="production-gui", persisted_poni=False,
         legacy_bai=True, detector_descriptor=False, source_options=False)
+    source_before = seeded.target.read_bytes()
     request = copy.deepcopy(seeded.preparation); request["requested_shared_science"] = {"version": 1, "kind": "persisted_target"}; request["selected_plan"] = {"version": 1, "dimension": "1d", "gi_mode": "q_total", "bai_args": {"numpoints": 4, "unit": "q_A^-1", "method": "numpy", "radial_range": None, "azimuth_range": None, "chi_offset": 90.0, "npt_oop": 1000}}
     plan = module.ReintegratePlan.from_artifact(
         seeded.target, entry="entry", dimension="1d", preparation=request,
@@ -1058,7 +1081,7 @@ def test_production_gui_provenance_is_canonicalized_from_authenticated_facts(tmp
     }
     assert module._plain(plan.selected_plan) == expected_one
     assert plan.requested_shared_science["poni_values"] == plan.requested_shared_science["accepted_scientific_assets"]["poni_values"]
-    one_result = module.run_reintegrate(plan)
+    one_result = _run_successor(plan)
     assert one_result.committed_labels == seeded.labels
     two_args = _integration_2d_args(_plans()[1], None)
     two_args.pop("gi_mode_2d", None)
@@ -1072,9 +1095,10 @@ def test_production_gui_provenance_is_canonicalized_from_authenticated_facts(tmp
         preparation=two_request,
         expected_target_snapshot=capture_target_snapshot(seeded.target),
         expected_labels=seeded.labels)
-    two_result = module.run_reintegrate(two_plan)
+    two_result = _run_successor(two_plan)
     assert two_result.committed_labels == seeded.labels
-    with h5py.File(seeded.target, "r") as handle: run = read_provenance_from_handle(handle)["config"]["run_configuration"]
+    assert seeded.target.read_bytes() == source_before
+    with h5py.File(one_result.output_artifact, "r") as handle: run = read_provenance_from_handle(handle)["config"]["run_configuration"]
     assert run["poni_values"] is None and "options" not in run["source"]
     conflicting = copy.deepcopy(run); conflicting["poni_values"] = {"conflict": True}; conflicting["scientific_signature"]["poni_values"] = {"conflict": True}
     with pytest.raises(ValueError, match="accepted scientific assets"): module._validated_shared_science(conflicting)
@@ -1161,7 +1185,7 @@ def test_production_gui_provenance_is_canonicalized_from_authenticated_facts(tmp
             expected_target_snapshot=capture_target_snapshot(mixed.target),
             expected_labels=mixed.labels,
         )
-        assert module.run_reintegrate(plan).committed_labels == mixed.labels
+        assert _run_successor(plan).committed_labels == mixed.labels
 def test_hdf_transient_path_replacement_is_refused_before_pixel_decode(
     tmp_path, monkeypatch,
 ):
@@ -1618,11 +1642,12 @@ def test_source_topology_and_static_final_lineage_matrix(tmp_path, monkeypatch):
             value, raw_options=raw_options, read=True)
         assert shape_seen == shape and dtype == expected.dtype.str
         np.testing.assert_array_equal(image, expected)
-    assert module._resolve_source_locator("/abs/a.tif", "/ignored", tmp_path) == Path("/abs/a.tif")
-    assert module._resolve_source_locator("raw/a.tif", str(tmp_path), root) == tmp_path / "raw/a.tif"
+    tifffile.imwrite(root / "a.tif", pixels)
+    assert module._resolve_source_locator("/abs/a.tif", "/ignored") == Path("/abs/a.tif")
+    assert module._resolve_source_locator("raw/a.tif", str(tmp_path)) == tmp_path / "raw/a.tif"
     for locator, base in (("a.tif", ""), ("../a.tif", str(root)), ("a.tif", "relative")):
         with pytest.raises(ValueError, match="REPLACEMENT_SOURCE_RELOCATION_UNSUPPORTED"):
-            module._resolve_source_locator(locator, base, root)
+            module._resolve_source_locator(locator, base)
     series = []
     for index in range(3):
         path = root / f"series_{index}.tif"
@@ -1758,7 +1783,7 @@ def test_source_topology_and_static_final_lineage_matrix(tmp_path, monkeypatch):
     with h5py.File(linked.target, "r+") as local, h5py.File(external, "w") as remote:
         local.copy("entry", remote, name="entry"); del local["entry"]; local["entry"] = h5py.ExternalLink(str(external), "/entry")
     unchanged = linked.target.read_bytes()
-    with pytest.raises(ValueError, match="REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"): module.ReintegratePlan.from_artifact(linked.target, entry="entry", dimension="1d", preparation=linked.preparation)
+    with pytest.raises(ValueError, match="replacement target is not a current xdart .nexus record"): module.ReintegratePlan.from_artifact(linked.target, entry="entry", dimension="1d", preparation=linked.preparation)
     assert linked.target.read_bytes() == unchanged
     for index, path in enumerate(("entry/frames", "entry/frames/frame_0002", "entry/frames/frame_0002/source", "entry/frames/frame_0002/source/path", "entry/frames/frame_0002/source/frame_index", "entry/reduction", "entry/reduction/config", "entry/reduction/config/source_execution")):
         broken = _seed_existing(tmp_path, name=f"foreign-{index}"); parent, leaf = path.rsplit("/", 1)
@@ -1772,8 +1797,14 @@ def test_source_topology_and_static_final_lineage_matrix(tmp_path, monkeypatch):
         scan = handle["entry/scan_data"]; del scan["theta"]; scan["theta"] = h5py.ExternalLink("missing.nxs", "/theta")
         notes = handle["entry"].create_group("operator_notes"); notes["foreign"] = h5py.SoftLink("/missing"); notes["self"] = notes
         handle["entry/integrated_2d"]["foreign"] = h5py.ExternalLink("missing.nxs", "/foreign")
-    signature = _preserved_signature(preserved.target); _stub_integrators(monkeypatch)
-    assert module.run_reintegrate(module.ReintegratePlan.from_artifact(preserved.target, entry="entry", dimension="1d", preparation=preserved.preparation)).disposition == "COMMITTED"
+    signature = _preserved_signature(preserved.target)
+    with pytest.raises(
+        ValueError, match="replacement target is not a current xdart .nexus record",
+    ):
+        module.ReintegratePlan.from_artifact(
+            preserved.target, entry="entry", dimension="1d",
+            preparation=preserved.preparation,
+        )
     assert _preserved_signature(preserved.target) == signature
     with pytest.raises(ValueError, match="REPLACEMENT_SOURCE_FORMAT_UNSUPPORTED"):
         module._source_route(Path("processed.txt"))
@@ -2189,7 +2220,6 @@ def test_shared_science_dimension_audit_and_untouched_manifest(tmp_path, monkeyp
     from xrd_tools.io.append import AppendDisposition, qualify_append
     from xrd_tools.io.nexus_record import read_background_dependency
     module = _module(); seeded = _seed_existing(tmp_path, labels=(0, 1, 2), append=True, name="append")
-    with h5py.File(seeded.target, "r+") as handle: handle["entry/reduction/config/append_lineage"].attrs["benign"] = "preserve"
     before = _preserved_signature(seeded.target)
     with h5py.File(seeded.target, "r") as handle:
         run = read_provenance_from_handle(handle)["config"]["run_configuration"]
@@ -2221,89 +2251,46 @@ def test_shared_science_dimension_audit_and_untouched_manifest(tmp_path, monkeyp
         module._validated_shared_science(broken)
     _stub_integrators(monkeypatch)
     plan = module.ReintegratePlan.from_artifact(seeded.target, entry="entry", dimension="1d", preparation=seeded.preparation)
-    result = module.run_reintegrate(plan)
+    result = _run_successor(plan)
     assert _preserved_signature(seeded.target) == before
     with h5py.File(seeded.target, "r") as handle:
         config = handle["entry/reduction/config"]
         assert config["append_lineage"][()] == append_before
         assert dict(config["append_lineage"].attrs) == append_attrs
+    with h5py.File(result.output_artifact, "r") as handle:
+        config = handle["entry/reduction/config"]
         stored = json.loads(config["dimension_replacement_1d"].asstr()[()])
     assert set(stored) == set(audit) and module._audit_identity(stored) == result.audit_identity
     decision = qualify_append(seeded.target, seeded.append_intent)
-    assert (decision.disposition, decision.reason) == (AppendDisposition.REFUSE, "DIMENSION_REPLACEMENT_APPEND_UNSUPPORTED")
-    from xrd_tools.io.record_writer import NexusRecordWriter; from xrd_tools.reduction import GIMode
-    reset = NexusRecordWriter._reset_selected_dimension
-    for index, mutation in enumerate((1.0, True, "link", "layout", "ascii", "attr")):
-        gi_seed = _seed_existing(tmp_path, gi=GIMode(incident_angle=.1, incidence_motor="Manual", mode_2d="q_chi"), name=f"gi-opener-{index}"); gi_before = gi_seed.target.read_bytes()
-        gi_plan = module.ReintegratePlan.from_artifact(gi_seed.target, entry="entry", dimension="1d", preparation=gi_seed.preparation)
-        def corrupt(self, *args, _mutation=mutation, **kwargs):
-            config = self._h5[f"{self.entry}/reduction/config"]; raw = config["gi_config"].asstr()[()]; del config["gi_config"]
-            if _mutation == "link": config["gi_config"] = h5py.SoftLink("missing")
-            elif _mutation == "layout": config.create_dataset("gi_config", data=np.bytes_(raw))
-            elif _mutation == "ascii": config.create_dataset("gi_config", data=raw.encode(), dtype=h5py.string_dtype("ascii"))
-            elif _mutation == "attr": config.create_dataset("gi_config", data=raw).attrs["race"] = np.int64(1)
-            else: value = json.loads(raw); value["sample_orientation"] = _mutation; config.create_dataset("gi_config", data=json.dumps(value, sort_keys=True, separators=(",", ":")))
-            return reset(self, *args, **kwargs)
-        with monkeypatch.context() as patch:
-            patch.setattr(NexusRecordWriter, "_reset_selected_dimension", corrupt)
-            with pytest.raises(RuntimeError, match="replacement opener changed"): module.run_reintegrate(gi_plan)
-        assert gi_seed.target.read_bytes() == gi_before
-    for index, replacement in enumerate((np.int64(2), np.float64(1))):
-        raced = _seed_existing(tmp_path, labels=(0, 1, 2), append=True, name=f"append-attr-{index}")
-        with h5py.File(raced.target, "r+") as handle: handle["entry/reduction/config/append_lineage"].attrs["race"] = np.int64(1)
-        race_before = _preserved_signature(raced.target); race_plan = module.ReintegratePlan.from_artifact(raced.target, entry="entry", dimension="1d", preparation=raced.preparation); verify = NexusRecordWriter._verify_replacement_manifest; calls, token = [], threading.Event()
-        def race(self, _replacement=replacement):
-            if calls: return verify(self)
-            attrs = self._h5[f"{self.entry}/reduction/config/append_lineage"].attrs; old = attrs["race"]; del attrs["race"]; attrs["race"] = _replacement; calls.append(1)
-            try: return verify(self)
-            finally: del attrs["race"]; attrs["race"] = old
-        with monkeypatch.context() as patch:
-            patch.setattr(NexusRecordWriter, "_verify_replacement_manifest", race); runner = module.ReintegrateRunner(race_plan, cancel_token=token); assert runner.run().disposition == "SETTLEMENT_PENDING"; token.set() if index == 0 else None; retried = runner.finish_current(); runner.close()
-        assert retried.disposition == ("ROLLED_BACK" if index == 0 else "COMMITTED") and calls == [1] and _preserved_signature(raced.target) == race_before
+    assert (decision.disposition, decision.reason) == (
+        AppendDisposition.SKIP, "exact source already committed",
+    )
+
     active = _seed_existing(tmp_path, name="active-background", background=True)
     with h5py.File(active.target, "r") as handle: pairs = tuple(read_background_dependency(handle[f"entry/frames/frame_{label:04d}"]) for label in active.labels)
     active_plan = module.ReintegratePlan.from_artifact(active.target, entry="entry", dimension="1d", preparation=active.preparation)
-    assert active_plan.requested_shared_science["background"]["mode"] == "Single BG File" and module.run_reintegrate(active_plan).disposition == "COMMITTED"
+    assert active_plan.requested_shared_science["background"]["mode"] == "Single BG File" and _run_successor(active_plan).disposition == "COMMITTED"
     with h5py.File(active.target, "r") as handle: assert pairs == tuple(read_background_dependency(handle[f"entry/frames/frame_{label:04d}"]) for label in active.labels)
 def test_stop_before_and_after_writes_roll_back_without_prefix(tmp_path, monkeypatch):
-    from xrd_tools.reduction import NexusSink; from xrd_tools.io.record_writer import NexusRecordWriter
+    from pathlib import Path
+    from xrd_tools.reduction import NexusSink, run_reintegrate_successor
     module = _module()
     for name in ("pre", "qualify"):
-        first = _seed_existing(tmp_path, name=f"stop-{name}"); before = first.target.read_bytes(); plan = module.ReintegratePlan.from_artifact(first.target, entry="entry", dimension="1d", preparation=first.preparation); token = threading.Event(); token.set() if name == "pre" else None
+        first = _seed_existing(tmp_path, name=f"stop-{name}"); before = first.target.read_bytes(); plan = module.ReintegratePlan.from_artifact(first.target, entry="entry", dimension="1d", preparation=first.preparation); successor = _successor_from_plan(plan); token = threading.Event(); token.set() if name == "pre" else None
         def cancel_qualify(value): token.set() if name == "qualify" and value.stage == "qualify" else None
-        with monkeypatch.context() as patch:
-            patch.setattr(module, "_inspect_artifact", lambda *_: pytest.fail("qualify cancellation crossed into artifact read")) if name == "qualify" else None
-            result = module.ReintegrateRunner(plan, cancel_token=token, progress_cb=cancel_qualify).run()
-        assert result.disposition == "ROLLED_BACK" and first.target.read_bytes() == before
-    second = _seed_existing(tmp_path, name="stop-after"); before = second.target.read_bytes(); plan = module.ReintegratePlan.from_artifact(second.target, entry="entry", dimension="1d", preparation=second.preparation); token = threading.Event(); real_write = NexusSink.write; writes = []
+        result = run_reintegrate_successor(successor, cancel_token=token, progress_cb=cancel_qualify)
+        assert result.disposition == "ABORTED" and result.commit_identity is None and first.target.read_bytes() == before
+        assert not Path(successor.output_artifact).exists()
+    second = _seed_existing(tmp_path, name="stop-after"); before = second.target.read_bytes(); plan = module.ReintegratePlan.from_artifact(second.target, entry="entry", dimension="1d", preparation=second.preparation); successor = _successor_from_plan(plan); token = threading.Event(); real_write = NexusSink.write; writes = []
     def stop_after_one(self, *args, **kwargs): value = real_write(self, *args, **kwargs); writes.append(args[0].index); token.set(); return value
-    with monkeypatch.context() as patch: patch.setattr(NexusSink, "write", stop_after_one); _stub_integrators(patch); result = module.ReintegrateRunner(plan, cancel_token=token).run()
-    assert result.disposition == "ROLLED_BACK" and writes == [2] and second.target.read_bytes() == before and not tuple(second.target.parent.glob(f".{second.target.name}*"))
-    for seam in ("read", "flush", "verify"):
-        settled = _seed_existing(tmp_path, name=f"stop-{seam}"); settled_before = settled.target.read_bytes(); settled_plan = module.ReintegratePlan.from_artifact(settled.target, entry="entry", dimension="1d", preparation=settled.preparation); token = threading.Event(); real_action = module._source_fact if seam == "read" else NexusSink.flush if seam == "flush" else NexusRecordWriter._verify_replacement_manifest; trigger = lambda kwargs: kwargs.get("read") if seam == "read" else kwargs.get("force") if seam == "flush" else True; cancel_action = lambda *args, **kwargs: (lambda value: (token.set(), value)[1] if trigger(kwargs) else value)(real_action(*args, **kwargs))
-        with monkeypatch.context() as patch: patch.setattr(module if seam == "read" else NexusSink if seam == "flush" else NexusRecordWriter, "_source_fact" if seam == "read" else "flush" if seam == "flush" else "_verify_replacement_manifest", cancel_action); _stub_integrators(patch); result = module.ReintegrateRunner(settled_plan, cancel_token=token).run(); assert result.disposition == "ROLLED_BACK" and settled.target.read_bytes() == settled_before
-def test_drop_matrix_commits_partial_and_rolls_back_all(tmp_path, monkeypatch):
-    module = _module()
-    partial = _seed_existing(tmp_path, name="partial")
-    plan = module.ReintegratePlan.from_artifact(partial.target, entry="entry", dimension="1d", preparation=partial.preparation)
-    _stub_integrators(monkeypatch, dropped=(5,)); result = module.run_reintegrate(plan)
-    assert result.committed_labels == (2, 9) and result.publication_dropped_labels == (5,)
-    with h5py.File(partial.target, "r") as handle:
-        np.testing.assert_array_equal(handle["entry/integrated_1d/frame_index"][()], (2, 9))
-    assert module.ReintegratePlan.from_artifact(
-        partial.target, entry="entry", dimension="1d",
-        preparation=partial.preparation).labels == (2, 9)
-    dropped = _seed_existing(tmp_path, name="all-drop"); before = dropped.target.read_bytes()
-    plan = module.ReintegratePlan.from_artifact(dropped.target, entry="entry", dimension="1d", preparation=dropped.preparation)
-    _stub_integrators(monkeypatch, dropped=dropped.labels)
-    result = module.run_reintegrate(plan)
-    assert result.disposition == "ROLLED_BACK" and result.publication_dropped_labels == dropped.labels
-    assert dropped.target.read_bytes() == before
-
+    with monkeypatch.context() as patch: patch.setattr(NexusSink, "write", stop_after_one); _stub_integrators(patch); result = run_reintegrate_successor(successor, cancel_token=token)
+    assert result.disposition == "ABORTED" and result.commit_identity is None and writes == [2] and second.target.read_bytes() == before
+    assert not Path(successor.output_artifact).exists()
 
 def test_post_flush_terminal_topology_failure_rolls_back_without_commit(
     tmp_path, monkeypatch,
 ):
+    from xrd_tools.reduction import run_reintegrate_successor
     from xrd_tools.session.scan_session import ScanSession
 
     module = _module()
@@ -2312,11 +2299,10 @@ def test_post_flush_terminal_topology_failure_rolls_back_without_commit(
     plan = module.ReintegratePlan.from_artifact(
         seeded.target, entry="entry", dimension="1d",
         preparation=seeded.preparation)
+    successor = _successor_from_plan(plan)
     _stub_integrators(monkeypatch)
     order = []
-    outcomes = []
     real_flush = ScanSession.flush
-    real_outcome = module._ExecutionRuntime._outcome
 
     def flush(session, *args, **kwargs):
         result = real_flush(session, *args, **kwargs)
@@ -2328,47 +2314,14 @@ def test_post_flush_terminal_topology_failure_rolls_back_without_commit(
         order.append("terminal")
         raise ValueError("injected terminal topology failure")
 
-    def capture_outcome(runtime, terminal):
-        result = real_outcome(runtime, terminal)
-        outcomes.append(result)
-        return result
-
     monkeypatch.setattr(ScanSession, "flush", flush)
     monkeypatch.setattr(module, "_validate_terminal_topology", fail_terminal)
-    monkeypatch.setattr(module._ExecutionRuntime, "_outcome", capture_outcome)
-    runner = module.ReintegrateRunner(plan)
     with pytest.raises(ValueError, match="injected terminal topology failure"):
-        runner.run()
-    runner.close()
+        run_reintegrate_successor(successor)
     assert order == ["flush", "terminal"]
-    assert len(outcomes) == 1
-    assert outcomes[0].disposition == "ROLLED_BACK"
-    assert outcomes[0].audit is None and outcomes[0].terminal is None
     assert seeded.target.read_bytes() == before
+    assert not Path(successor.output_artifact).exists()
 
-
-def test_terminal_settlement_cleanup_retry_is_identity_stable_without_recompute(tmp_path, monkeypatch):
-    from xrd_tools.io.output_transaction import OutputTransaction, StreamTerminal
-    module = _module()
-    seeded = _seed_existing(tmp_path, name="settlement")
-    plan = module.ReintegratePlan.from_artifact(seeded.target, entry="entry", dimension="1d", preparation=seeded.preparation); token = threading.Event()
-    reductions = _stub_integrators(monkeypatch); reads = []
-    real_source, real_release = module._source_fact, OutputTransaction.release_lease_owner
-    def source(*args, **kwargs): reads.append(kwargs.get("read")); return real_source(*args, **kwargs)
-    failures = []
-    def fail_once(self, *args, **kwargs):
-        if not failures: failures.append(1); raise RuntimeError("one settlement fault")
-        return real_release(self, *args, **kwargs)
-    monkeypatch.setattr(module, "_source_fact", source)
-    monkeypatch.setattr(OutputTransaction, "release_lease_owner", fail_once)
-    runner = module.ReintegrateRunner(plan, cancel_token=token); first = runner.run()
-    counts = (len(reads), len(reductions))
-    assert first.disposition == "SETTLEMENT_PENDING"
-    with pytest.raises(RuntimeError, match="custody remains pending"): runner.close()
-    token.set(); second = runner.finish_current(); runner.close()
-    assert second.disposition == "COMMITTED" and type(second.commit_identity) is StreamTerminal
-    assert first.operation_identity == second.operation_identity == plan.operation_identity
-    assert first.audit_identity == second.audit_identity and counts == (len(reads), len(reductions))
 
 
 def test_v1_science_audit_is_readmitted_by_v3_plan(tmp_path, monkeypatch):
@@ -2385,22 +2338,23 @@ def test_v1_science_audit_is_readmitted_by_v3_plan(tmp_path, monkeypatch):
     assert plan.api_version == 3
     assert plan.science_identity == expected_science
     _stub_integrators(monkeypatch)
-    assert module.run_reintegrate(plan).disposition == "COMMITTED"
-    with h5py.File(seeded.target, "r") as handle:
+    result = _run_successor(plan)
+    assert result.disposition == "COMMITTED"
+    with h5py.File(result.output_artifact, "r") as handle:
         audit = json.loads(handle[
             "entry/reduction/config/dimension_replacement_1d"
         ].asstr()[()])
     assert audit["schema_version"] == 1
     assert audit["science_identity"] == expected_science
     replay = module.ReintegratePlan.from_artifact(
-        seeded.target, entry="entry", dimension="1d",
+        result.output_artifact, entry="entry", dimension="1d",
         preparation=seeded.preparation)
     assert replay.api_version == 3
     assert replay.science_identity == expected_science
 
 
 def test_plan_preparation_recipe_roundtrip_share_one_runner_and_writer(tmp_path, monkeypatch):
-    from xrd_tools.reduction import GIMode, NexusSink
+    from xrd_tools.reduction import GIMode
     module = _module()
     seeded = _seed_existing(tmp_path, name="recipe")
     plan = module.ReintegratePlan.from_artifact(
@@ -2437,7 +2391,7 @@ def test_plan_preparation_recipe_roundtrip_share_one_runner_and_writer(tmp_path,
     assert replay.labels == seeded.labels
     with pytest.raises(FrozenInstanceError): replay.target = "changed"
     with pytest.raises(TypeError): replay.selected_plan["bai_args"]["npt"] = 999
-    for cls in (module.ReintegratePlan, module.ReintegrateProgress, module.ReintegrateResult):
+    for cls in (module.ReintegratePlan,):
         with pytest.raises(TypeError, match="factory-constructed"): cls()
     cases = (("science_identity", None, "SCIENCE_IDENTITY|version"), ("operation_identity", None, "OPERATION_IDENTITY|version"), ("native_dtype", "<f1", "plan facts"), ("dimension", [], "preparation version"), ("labels", tuple(seeded.labels), "noncanonical JSON"), ("entry", "other", "OPERATION_IDENTITY"))
     for key, value, message in cases:
@@ -2463,15 +2417,8 @@ def test_plan_preparation_recipe_roundtrip_share_one_runner_and_writer(tmp_path,
     for malformed in ({"version": 1, "kind": "ambient"}, {"version": 1, "kind": "explicit", "allocation": {}}):
         bad = copy.deepcopy(seeded.preparation); bad["resource_policy"] = malformed
         with pytest.raises((TypeError, ValueError)): module.ReintegratePlan.from_artifact(seeded.target, entry="entry", dimension="1d", preparation=bad)
-    opens, writers = [], []; real_open = module._open_runtime; real_factory = NexusSink.for_existing_replacement.__func__
-    monkeypatch.setattr(module, "_open_runtime", lambda *a, **k: opens.append(1) or real_open(*a, **k))
-    def factory(cls, *args, **kwargs): writers.append(1); return real_factory(cls, *args, **kwargs)
-    monkeypatch.setattr(NexusSink, "for_existing_replacement", classmethod(factory)); _stub_integrators(monkeypatch)
-    runner = module.ReintegrateRunner(replay); assert runner.run().disposition == "COMMITTED"
-    with pytest.raises(RuntimeError, match="one-shot"): runner.run()
-    runner.close(); assert opens == [1] and writers == [1]
 def test_descriptor_allocation_background_roots_and_pre_effect_refusal(tmp_path, monkeypatch):
-    from xrd_tools.reduction import MemorySink; from xrd_tools.session.scan_session import ScanSession
+    from xrd_tools.reduction import MemorySink, run_reintegrate_successor; from xrd_tools.session.scan_session import ScanSession
     module = _module()
     pixels = 5 * 7
     expected = {"None": (0, 0, 0, 0), "Single BG File": (8 * pixels, 8 * pixels, 8 * pixels, 64 << 20), "Series Average": (8 * pixels, 25 * pixels, 8 * pixels, 64 << 20), "BG Directory": (8 * pixels, 8 * pixels, 8 * pixels, 64 << 20)}
@@ -2510,11 +2457,12 @@ def test_descriptor_allocation_background_roots_and_pre_effect_refusal(tmp_path,
     session = ScanSession(core_plan, legacy, MemorySink(), policy=plan.session_policy, executor=1)
     try: assert legacy.bound_allocation is plan.resource_allocation
     finally: session.finish(raise_on_failure=False)
+    successor_plan = _successor_from_plan(plan)
     runtime_policies = []; init = ScanSession.__init__
     def runtime_init(self, *args, policy=None, **kwargs): runtime_policies.append(policy); return init(self, *args, policy=policy, **kwargs)
     with monkeypatch.context() as patch:
-        patch.setattr(module, "resolve_session_policy", lambda *_a, **_k: pytest.fail("runtime re-resolved its plan allocation")); patch.setattr(ScanSession, "__init__", runtime_init); _stub_integrators(patch); assert module.run_reintegrate(plan).disposition == "COMMITTED"
-    assert runtime_policies == [plan.session_policy] and runtime_policies[0].allocation is plan.resource_allocation
+        patch.setattr(module, "resolve_session_policy", lambda *_a, **_k: pytest.fail("runtime re-resolved its plan allocation")); patch.setattr(ScanSession, "__init__", runtime_init); _stub_integrators(patch); assert run_reintegrate_successor(successor_plan).disposition == "COMMITTED"
+    assert runtime_policies == [successor_plan.session_policy] and runtime_policies[0].allocation is successor_plan.resource_allocation
 def test_gi_bootstrap_freezes_before_sink_with_bounded_roots_and_stable_snapshot(tmp_path, monkeypatch):
     from xrd_tools.reduction import GIMode
     import xrd_tools.reduction.core as core
@@ -2544,13 +2492,19 @@ def test_gi_bootstrap_freezes_before_sink_with_bounded_roots_and_stable_snapshot
     def integrate(image, fi, _plan, mode, *, mask, incident_angle, **_kwargs):
         label = int(np.asarray(image).flat[0] // 35); executions.append((label, incident_angle, int(fi.detector.orientation), np.array(mask, copy=True))); return _r1(np.nan if label in dropped else label + 200)
     monkeypatch.setattr(core, "_run_gi_1d", integrate)
-    result = module.run_reintegrate(plan); assert result.committed_labels == (2, 9) and result.publication_dropped_labels == (5,)
+    result = _run_successor(plan); assert result.committed_labels == (2, 9) and result.publication_dropped_labels == (5,)
+    assert seeded.target.read_bytes() == snapshot
     assert [(v[0], v[1], v[2]) for v in executions] == [(2, float(np.float32(.2)), 3), (5, float(np.float32(.5)), 3), (9, float(np.float32(.9)), 3)]
     assert all(np.array_equal(v[3], seeded.mask) for v in executions)
     repeat = copy.deepcopy(seeded.preparation); repeat["selected_plan"] = module._plain(plan.selected_plan); dropped.clear(); executions.clear()
-    replay = module.ReintegratePlan.from_artifact(seeded.target, entry="entry", dimension="1d", preparation=repeat)
+    replay = module.ReintegratePlan.from_artifact(result.output_artifact, entry="entry", dimension="1d", preparation=repeat)
     assert replay.labels == (2, 9) and replay.gi_bootstrap_incidence == float(np.float32(.2))
-    assert module.run_reintegrate(replay).committed_labels == (2, 9)
+    replay_root = tmp_path / "gi-replay"
+    replay_root.mkdir()
+    from xrd_tools.reduction import run_reintegrate_successor
+    assert run_reintegrate_successor(
+        _successor_from_plan(replay, destination_directory=replay_root),
+    ).committed_labels == (2, 9)
     for name, labels, active in (("single", (2,), False), ("constant", (2, 5, 9), True)):
         case = _seed_existing(tmp_path, labels=labels, gi=gi, background=active, name=f"gi-{name}")
         if name == "constant":
@@ -2664,19 +2618,20 @@ def test_jit_stub_fields_scrub_on_every_terminal_and_refusal(tmp_path, monkeypat
     good, bad = _seed_existing(tmp_path, name="jit-good"), _seed_existing(tmp_path, name="jit-refusal")
     good_plan = module.ReintegratePlan.from_artifact(good.target, entry="entry", dimension="1d", preparation=good.preparation)
     bad_plan = module.ReintegratePlan.from_artifact(bad.target, entry="entry", dimension="1d", preparation=bad.preparation); bad_bytes = bad.target.read_bytes()
-    sources, frames, sinks = [], [], []; source_init, to_scan = module._ReintegrateFrameSource.__init__, module._ReintegrateFrameSource.to_scan; factory = NexusSink.for_existing_replacement.__func__
+    sources, frames, sinks = [], [], []; source_init, to_scan = module._ReintegrateFrameSource.__init__, module._ReintegrateFrameSource.to_scan; factory = NexusSink.for_finite_replacement.__func__
     def initialize(self, *args, **kwargs): source_init(self, *args, **kwargs); sources.append(self)
     def scan(self, *args, **kwargs): value = to_scan(self, *args, **kwargs); frames.extend(value.frames); return value
     def sink(cls, *args, **kwargs): value = factory(cls, *args, **kwargs); sinks.append(value); return value
-    monkeypatch.setattr(module._ReintegrateFrameSource, "__init__", initialize); monkeypatch.setattr(module._ReintegrateFrameSource, "to_scan", scan); monkeypatch.setattr(NexusSink, "for_existing_replacement", classmethod(sink)); _stub_integrators(monkeypatch)
-    assert module.run_reintegrate(good_plan).disposition == "COMMITTED"
+    monkeypatch.setattr(module._ReintegrateFrameSource, "__init__", initialize); monkeypatch.setattr(module._ReintegrateFrameSource, "to_scan", scan); monkeypatch.setattr(NexusSink, "for_finite_replacement", classmethod(sink)); _stub_integrators(monkeypatch)
+    assert _run_successor(good_plan).disposition == "COMMITTED"
+    assert sources and frames and sinks
     mismatch = _seed_existing(tmp_path, name="jit-mismatch"); mismatch_plan = module.ReintegratePlan.from_artifact(mismatch.target, entry="entry", dimension="1d", preparation=mismatch.preparation); mismatch_bytes = mismatch.target.read_bytes()
     with monkeypatch.context() as patch:
         patch.setattr(module, "_geometry_fact", lambda *_: SimpleNamespace(rot1=0., rot2=0., rot3=0., incident_angle=0.))
-        with pytest.raises(ValueError, match="replacement local JIT stub differs"): module.run_reintegrate(mismatch_plan)
+        with pytest.raises(ValueError, match="replacement local JIT stub differs"): _run_successor(mismatch_plan)
     assert mismatch.target.read_bytes() == mismatch_bytes
     monkeypatch.setattr(module, "_source_fact", lambda *_a, **_k: (_ for _ in ()).throw(ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")))
-    with pytest.raises(ValueError, match="REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"): module.run_reintegrate(bad_plan)
+    with pytest.raises(ValueError, match="REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"): _run_successor(bad_plan)
     assert bad.target.read_bytes() == bad_bytes and all(source.jit_roots == () and source._fact_reader is None and source._frames == {} for source in sources)
     assert all(frame.image is frame.background is frame.geometry is frame.source_identity is frame.source_path is frame.loader is frame.mask is None and frame.source_frame_index is frame.normalization_factor is frame.background_dependency_bytes is frame.background_dependency_fingerprint is None and not frame.metadata for frame in frames)
     assert all(sink._writer._replacement_read_context is sink._writer._replacement_manifest is sink._writer._replacement_expected is None and not sink._writer._row_cursors and sink._writer._replacement_labels == () for sink in sinks)
@@ -2690,7 +2645,7 @@ def test_exact_event_flows_unchanged_through_scan_session_and_stop(tmp_path, mon
     def load(*args, **kwargs): captured.append(("raw", args[4])); return real_load(*args, **kwargs)
     def background(*args, **kwargs): captured.append(("background", args[4])); return real_background(*args, **kwargs)
     monkeypatch.setattr(session_module.ScanSession, "__init__", session_init); monkeypatch.setattr(module, "_load_fact", load); monkeypatch.setattr(module, "_background_fact", background); _stub_integrators(monkeypatch)
-    assert module.run_reintegrate(plan, cancel_token=token).disposition == "COMMITTED"
+    assert _run_successor(plan, cancel_token=token).disposition == "COMMITTED"
     assert {role for role, _ in captured} == {"session", "raw", "background"} and all(value is token for _, value in captured)
     legacy_seen = []
     class Legacy:

@@ -59,7 +59,7 @@ from xrd_tools.io.output_path import artifact_family_from_source
 from xrd_tools.io.processed_scan_id import require_current_processed
 from xrd_tools.io.record_writer import bind_prepared_manifest_receipt
 from xrd_tools.io.schema import PROCESSED_SCHEMA_VERSION
-from xrd_tools.reduction import reintegrate as _legacy
+from xrd_tools.reduction import reintegrate as _support
 from xrd_tools.reduction.reintegrate_prepared import (
     LegacyRouteReason,
     PreparedCapsuleMiss,
@@ -114,7 +114,7 @@ class ReintegrateRecipeMigrationRequired(ValueError):
 
 def _sha(value: Any) -> str:
     raw = json.dumps(
-        _legacy._plain(value), sort_keys=True, separators=(",", ":"),
+        _support._plain(value), sort_keys=True, separators=(",", ":"),
         ensure_ascii=False, allow_nan=False,
     ).encode("utf-8", errors="strict")
     return hashlib.sha256(raw).hexdigest()
@@ -357,7 +357,7 @@ def _derived_request_inputs(
     legacy_reason: LegacyRouteReason | None,
     miss_code: PreparedCapsuleMissCode | None,
 ) -> dict[str, str]:
-    evidence = _legacy._plain(source_graph_evidence)
+    evidence = _support._plain(source_graph_evidence)
     if (
         type(evidence) is not dict
         or set(evidence) != {
@@ -400,10 +400,10 @@ def _derived_request_inputs(
         "dimension": qualified.dimension,
         "entry": qualified.entry,
         "labels": list(qualified.labels),
-        "selected_plan": _legacy._plain(qualified.selected_plan),
-        "shared_science": _legacy._plain(qualified.requested_shared_science),
+        "selected_plan": _support._plain(qualified.selected_plan),
+        "shared_science": _support._plain(qualified.requested_shared_science),
     })
-    allocation = _sha(_legacy._allocation_recipe(qualified.resource_allocation))
+    allocation = _sha(_support._allocation_recipe(qualified.resource_allocation))
     route_identity = _sha({
         "execution_digest": execution_digest,
         "legacy_reason": (
@@ -434,7 +434,7 @@ def _derived_request_inputs(
         "dimension": qualified.dimension,
         "engine": "bounded-jit-direct-hdf-v1",
         "schema": "reintegrate-algorithm-v1",
-        "selected_plan": _legacy._plain(qualified.selected_plan),
+        "selected_plan": _support._plain(qualified.selected_plan),
     })
     preservation = _sha({
         "predecessor_digest": snapshot.digest,
@@ -536,8 +536,8 @@ def _request_from_values(
 def _legacy_source_graph_evidence(qualified) -> Mapping[str, object]:
     source = Path(qualified.target)
     snapshot = qualified.expected_target_snapshot
-    revision = _legacy._target_object_revision(source, snapshot)
-    inspected = _legacy._inspect_artifact(
+    revision = _support._target_object_revision(source, snapshot)
+    inspected = _support._inspect_artifact(
         source,
         qualified.entry,
         qualified.dimension,
@@ -550,8 +550,8 @@ def _legacy_source_graph_evidence(qualified) -> Mapping[str, object]:
         inspected.labels != qualified.labels
         or inspected.detector_shape != qualified.detector_shape
         or inspected.native_dtype != qualified.native_dtype
-        or _legacy._plain(inspected.persisted_shared_science)
-        != _legacy._plain(qualified.requested_shared_science)
+        or _support._plain(inspected.persisted_shared_science)
+        != _support._plain(qualified.requested_shared_science)
     ):
         raise ValueError("RECIPE_ARTIFACT_FACTS_CHANGED")
     return MappingProxyType({
@@ -571,13 +571,13 @@ def _qualified_from_prepared(
     expected_labels: tuple[int, ...] | None,
     cancel_token: threading.Event | None,
 ):
-    _legacy._event(cancel_token)
+    _support._event(cancel_token)
     try:
         preparation, _preparation_bytes = _bounded_preparation_snapshot(
             preparation,
             role="prepared click science",
         )
-        _legacy._keys(
+        _support._keys(
             preparation,
             {
                 "api_version", "selected_plan", "requested_shared_science",
@@ -615,23 +615,23 @@ def _qualified_from_prepared(
     )
     try:
         if persisted:
-            _legacy._validate_persisted_selected(selected, dimension)
-            shared = _legacy._plain(
+            _support._validate_persisted_selected(selected, dimension)
+            shared = _support._plain(
                 execution.artifact.persisted_shared_science
             )
-            selected = _legacy._resolve_persisted_selected(
+            selected = _support._resolve_persisted_selected(
                 selected, shared, dimension, None,
             )
         else:
-            _legacy._validate_science(selected, shared, dimension)
+            _support._validate_science(selected, shared, dimension)
             if (
-                _legacy._plain(execution.artifact.persisted_shared_science)
+                _support._plain(execution.artifact.persisted_shared_science)
                 != shared
             ):
                 raise PreparedCapsuleMiss(
                     PreparedCapsuleMissCode.REQUESTED_SCIENCE_UNSUPPORTED
                 )
-        metadata_keys, include_geometry = _legacy._fact_projection(
+        metadata_keys, include_geometry = _support._fact_projection(
             selected, shared,
         )
         if (
@@ -644,16 +644,16 @@ def _qualified_from_prepared(
             raise PreparedCapsuleMiss(
                 PreparedCapsuleMissCode.REQUEST_REQUIRES_UNPREPARED_FACTS
             )
-        requirements = _legacy._requirements(
+        requirements = _support._requirements(
             execution.artifact.detector_shape,
             execution.artifact.native_dtype,
             selected,
             shared,
         )
-        policy = _legacy._policy(
+        policy = _support._policy(
             requirements,
             preparation["resource_policy"],
-            _legacy._PersistedMaskSpec(0, 0),
+            _support._PersistedMaskSpec(0, 0),
         )
     except PreparedCapsuleMiss:
         raise
@@ -667,7 +667,7 @@ def _qualified_from_prepared(
         if offered_root != root:
             raise PreparedCapsuleMiss(PreparedCapsuleMissCode.SOURCE_ROOT_CHANGED)
     try:
-        qualified = _legacy._make_plan(
+        qualified = _support._make_plan(
             execution.target.snapshot.path,
             execution.artifact.entry,
             root,
@@ -687,7 +687,7 @@ def _qualified_from_prepared(
         raise PreparedCapsuleMiss(
             PreparedCapsuleMissCode.REQUESTED_SCIENCE_UNSUPPORTED
         ) from error
-    _legacy._event(cancel_token)
+    _support._event(cancel_token)
     return qualified
 
 
@@ -938,7 +938,7 @@ class ReintegrateSuccessorPlan:
         try:
             return select()
         except PreparedCapsuleMiss as miss:
-            _legacy._event(cancel_token)
+            _support._event(cancel_token)
             return fallback(miss.code)
 
     @classmethod
@@ -1020,7 +1020,7 @@ class ReintegrateSuccessorPlan:
             raise
         if _named_snapshot_changed(admission.snapshot):
             raise PreparedCapsuleMiss(PreparedCapsuleMissCode.TARGET_CHANGED)
-        _legacy._event(cancel_token)
+        _support._event(cancel_token)
         return _plan_from_request(
             qualified,
             admission.snapshot,
@@ -1034,7 +1034,7 @@ class ReintegrateSuccessorPlan:
         )
 
     def as_recipe(self) -> dict[str, object]:
-        qualification = _legacy._plan_mapping(self._qualified)
+        qualification = _support._plan_mapping(self._qualified)
         qualification.pop("rollback_policy")
         qualification.pop("operation_identity")
         finite = {
@@ -1042,7 +1042,7 @@ class ReintegrateSuccessorPlan:
             "expected_terminal": _terminal_mapping(self.expected_terminal),
             "output_artifact": self.output_artifact,
             "artifact_family": self.artifact_family,
-            "source_graph_evidence": _legacy._plain(
+            "source_graph_evidence": _support._plain(
                 self.source_graph_evidence
             ),
             "source_graph_identity": self.source_graph_identity,
@@ -1227,28 +1227,28 @@ class ReintegrateSuccessorPlan:
         )
         if session["flush"] != {"interval": 8, "cap": 64, "margin": 8}:
             raise ValueError("recipe flush policy is unsupported")
-        selected = _legacy._plain(_legacy._freeze(qualification["selected_plan"]))
-        shared = _legacy._plain(
-            _legacy._freeze(qualification["requested_shared_science"])
+        selected = _support._plain(_support._freeze(qualification["selected_plan"]))
+        shared = _support._plain(
+            _support._freeze(qualification["requested_shared_science"])
         )
         dimension = qualification["dimension"]
-        _legacy._validate_science(selected, shared, dimension)
+        _support._validate_science(selected, shared, dimension)
         shape = tuple(qualification["detector_shape"])
-        mask_spec = _legacy._mask_spec(
+        mask_spec = _support._mask_spec(
             qualification["retained_mask_bytes"],
             qualification["mask_decode_bytes"],
             shape,
             "recipe persisted-mask resources",
         )
-        requirements = _legacy._requirements(
+        requirements = _support._requirements(
             shape, qualification["native_dtype"], selected, shared,
         )
-        policy = _legacy._policy(
+        policy = _support._policy(
             requirements,
             {"version": 1, "kind": "explicit", "allocation": session["allocation"]},
             mask_spec,
         )
-        qualified = _legacy._make_plan(
+        qualified = _support._make_plan(
             qualification["target"], qualification["entry"],
             qualification["source_root"], dimension,
             tuple(qualification["labels"]), shape,
@@ -1267,8 +1267,8 @@ class ReintegrateSuccessorPlan:
             or prepared.artifact.source_base != qualified.source_root
             or prepared.artifact.detector_shape != qualified.detector_shape
             or prepared.artifact.native_dtype != qualified.native_dtype
-            or _legacy._plain(prepared.artifact.persisted_shared_science)
-            != _legacy._plain(qualified.requested_shared_science)
+            or _support._plain(prepared.artifact.persisted_shared_science)
+            != _support._plain(qualified.requested_shared_science)
             or prepared.selected_admission.dimension != qualified.dimension
             or finite["source_graph_evidence"] != {
                 "facts_digest": prepared.facts_digest,
@@ -1321,7 +1321,7 @@ def _legacy_successor_plan(
     legacy_reason,
     miss_code,
 ):
-    _legacy._event(cancel_token)
+    _support._event(cancel_token)
     try:
         preparation, _preparation_bytes = _bounded_preparation_snapshot(
             preparation,
@@ -1329,7 +1329,7 @@ def _legacy_successor_plan(
         )
     except BoundedJsonError as error:
         raise ValueError("REINTEGRATE_PREPARATION_UNSUPPORTED") from error
-    _legacy._event(cancel_token)
+    _support._event(cancel_token)
     if (
         expected_terminal_identity is not None
         and expected_target_snapshot is None
@@ -1337,7 +1337,7 @@ def _legacy_successor_plan(
         expected_target_snapshot = revalidate_stream_terminal(
             Path(source_artifact).resolve(), expected_terminal_identity,
         )
-    qualified = _legacy.ReintegratePlan.from_artifact(
+    qualified = _support.ReintegratePlan.from_artifact(
         source_artifact,
         entry=entry,
         dimension=dimension,
@@ -1532,7 +1532,7 @@ def _plan_values(
         qualified.gi_bootstrap_incidence, qualified.retained_mask_bytes,
         qualified.mask_decode_bytes, qualified.session_policy, snapshot, terminal,
         route, request.artifact_family,
-        _legacy._freeze(_legacy._plain(source_graph_evidence)),
+        _support._freeze(_support._plain(source_graph_evidence)),
         request.source_graph_identity,
         request.scientific_identity, request.output_schema,
         request.algorithm_identity, request.preservation_identity,
@@ -1593,7 +1593,7 @@ def _plan_from_projection(
         qualified.gi_bootstrap_incidence, qualified.retained_mask_bytes,
         qualified.mask_decode_bytes, qualified.session_policy, snapshot, terminal,
         route, finite["artifact_family"],
-        _legacy._freeze(finite["source_graph_evidence"]),
+        _support._freeze(finite["source_graph_evidence"]),
         finite["source_graph_identity"],
         finite["science_identity"], finite["output_schema"],
         finite["algorithm_identity"], finite["preservation_identity"],
@@ -1889,7 +1889,7 @@ def _validate_selected_source_projection(
         f"bai_{plan.dimension}_args",
         "selected BAI config",
     )
-    if bai != _legacy._plain(plan.selected_plan["bai_args"]):
+    if bai != _support._plain(plan.selected_plan["bai_args"]):
         raise FiniteArtifactIntegrityError(
             "successor selected BAI config changed"
         )
@@ -1914,7 +1914,7 @@ def _validate_selected_source_projection(
         "source execution",
         max_bytes=64 << 20,
     )
-    expected_execution = _legacy._plain(inspected.topology.execution)
+    expected_execution = _support._plain(inspected.topology.execution)
     if (
         execution != expected_execution
         or execution_text != json.dumps(
@@ -1994,7 +1994,7 @@ def _validate_candidate_document(
         )
     audit, identity = _audit_from_document(document, plan)
     if expected_audit is None:
-        expected_audit = _legacy._dimension_audit(
+        expected_audit = _support._dimension_audit(
             dimension=plan.dimension,
             operation_identity=request.version_identity,
             science_identity=plan.science_identity,
@@ -2006,7 +2006,7 @@ def _validate_candidate_document(
     if (
         audit.get("operation_identity") != request.version_identity
         or audit.get("science_identity") != plan.science_identity
-        or identity != _legacy._audit_identity(audit)
+        or identity != _support._audit_identity(audit)
         or expected_audit is not None
         and audit != expected_audit
     ):
@@ -2153,7 +2153,7 @@ def _validate_committed_preservation(document, plan, expectation) -> None:
 
 def _require_terminal_source_topology(inspected, cancel_token=None) -> None:
     try:
-        _legacy._validate_terminal_topology(inspected.topology, cancel_token)
+        _support._validate_terminal_topology(inspected.topology, cancel_token)
     except (OSError, ValueError, TypeError) as error:
         raise FiniteArtifactIntegrityError(
             "immutable reintegration source topology changed"
@@ -2173,10 +2173,10 @@ def _inspect_committed(
     capture=None,
     preservation_prevalidated: bool = False,
 ):
-    snapshot = _legacy.capture_target_snapshot(path)
+    snapshot = _support.capture_target_snapshot(path)
     if not snapshot.exists:
         raise FiniteArtifactIntegrityError("committed successor is absent")
-    expected_audit = _legacy._dimension_audit(
+    expected_audit = _support._dimension_audit(
         dimension=plan.dimension,
         operation_identity=request.version_identity,
         science_identity=plan.science_identity,
@@ -2212,7 +2212,7 @@ def _inspect_committed(
         )
     if not preservation_prevalidated:
         _require_terminal_source_topology(inspected)
-    final = _legacy.capture_target_snapshot(path)
+    final = _support.capture_target_snapshot(path)
     state = os.stat(path)
     if final != snapshot:
         raise FiniteArtifactIntegrityError(
@@ -2231,8 +2231,8 @@ def _inspect_committed(
 def _preflight_legacy_plan(plan, token):
     source_path = Path(plan.source_artifact)
     source_snapshot = _target_snapshot(plan.source_snapshot)
-    revision = _legacy._target_object_revision(source_path, source_snapshot)
-    inspected = _legacy._inspect_artifact(
+    revision = _support._target_object_revision(source_path, source_snapshot)
+    inspected = _support._inspect_artifact(
         source_path,
         plan.entry,
         plan.dimension,
@@ -2241,7 +2241,7 @@ def _preflight_legacy_plan(plan, token):
         plan.source_root,
         read_mask=False,
     )
-    expected_mask = _legacy._PersistedMaskSpec(
+    expected_mask = _support._PersistedMaskSpec(
         plan.retained_mask_bytes, plan.mask_decode_bytes,
     )
     evidence = {
@@ -2255,15 +2255,15 @@ def _preflight_legacy_plan(plan, token):
         or inspected.detector_shape != plan.detector_shape
         or inspected.native_dtype != plan.native_dtype
         or inspected.mask_spec != expected_mask
-        or _legacy._plain(inspected.persisted_shared_science)
-        != _legacy._plain(plan.requested_shared_science)
-        or evidence != _legacy._plain(plan.source_graph_evidence)
+        or _support._plain(inspected.persisted_shared_science)
+        != _support._plain(plan.requested_shared_science)
+        or evidence != _support._plain(plan.source_graph_evidence)
         or plan.gi_bootstrap_incidence is not None
         and inspected.gi_values.get(plan.labels[0])
         != plan.gi_bootstrap_incidence
     ):
         raise ValueError("RECIPE_ARTIFACT_FACTS_CHANGED")
-    _legacy._event(token)
+    _support._event(token)
     return inspected
 
 
@@ -2315,7 +2315,7 @@ class _SuccessorRuntime:
 
     def _note(self, value):
         if len(self.diagnostics) < 16:
-            self.diagnostics.append(_legacy._diagnostic(value))
+            self.diagnostics.append(_support._diagnostic(value))
 
     def _pre_candidate_abort_result(self):
         return _value(
@@ -2435,17 +2435,17 @@ class _SuccessorRuntime:
         from xrd_tools.io.processed_scan_id import upgrade_private_integrated_axes
         upgrade_private_integrated_axes(document, plan.entry, container=request.output_artifact)
         try:
-            _legacy._event(self.token)
-        except _legacy.ReintegrateCancelled:
+            _support._event(self.token)
+        except _support.ReintegrateCancelled:
             return FiniteCandidateWriteDisposition.ABORTED
         self._report("qualify", 0, len(plan.labels))
         try:
-            _legacy._event(self.token)
-        except _legacy.ReintegrateCancelled:
+            _support._event(self.token)
+        except _support.ReintegrateCancelled:
             return FiniteCandidateWriteDisposition.ABORTED
         source_path = Path(plan.source_artifact)
         source_snapshot = _target_snapshot(plan.source_snapshot)
-        revision = _legacy._target_object_revision(source_path, source_snapshot)
+        revision = _support._target_object_revision(source_path, source_snapshot)
         prepared = plan._prepared
         inspected = (
             prepared._inspection
@@ -2454,13 +2454,13 @@ class _SuccessorRuntime:
         if inspected is None:
             raise RuntimeError("bounded legacy route lost its preflight facts")
         if (
-            _legacy.capture_target_snapshot(source_path) != source_snapshot
-            or _legacy._target_object_revision(
+            _support.capture_target_snapshot(source_path) != source_snapshot
+            or _support._target_object_revision(
                 source_path, source_snapshot,
             ) != revision
         ):
             raise ValueError("TARGET_SNAPSHOT_CHANGED")
-        expected_mask = _legacy._PersistedMaskSpec(
+        expected_mask = _support._PersistedMaskSpec(
             plan.retained_mask_bytes, plan.mask_decode_bytes,
         )
         if (
@@ -2468,15 +2468,15 @@ class _SuccessorRuntime:
             or inspected.detector_shape != plan.detector_shape
             or inspected.native_dtype != plan.native_dtype
             or inspected.mask_spec != expected_mask
-            or _legacy._plain(inspected.persisted_shared_science)
-            != _legacy._plain(plan.requested_shared_science)
+            or _support._plain(inspected.persisted_shared_science)
+            != _support._plain(plan.requested_shared_science)
             or plan.gi_bootstrap_incidence is not None
             and inspected.gi_values.get(plan.labels[0])
             != plan.gi_bootstrap_incidence
         ):
             raise ValueError("RECIPE_ARTIFACT_FACTS_CHANGED")
         mask = (
-            _legacy._load_persisted_mask(
+            _support._load_persisted_mask(
                 source_path, plan.entry, inspected.detector_shape,
                 source_snapshot, revision, inspected.mask_spec,
             )
@@ -2484,10 +2484,10 @@ class _SuccessorRuntime:
         )
         inspected = inspected._replace(mask=mask)
         try:
-            _legacy._event(self.token)
-        except _legacy.ReintegrateCancelled:
+            _support._event(self.token)
+        except _support.ReintegrateCancelled:
             return FiniteCandidateWriteDisposition.ABORTED
-        self.audit = _legacy._dimension_audit(
+        self.audit = _support._dimension_audit(
             dimension=plan.dimension,
             operation_identity=request.version_identity,
             science_identity=plan.science_identity,
@@ -2496,13 +2496,13 @@ class _SuccessorRuntime:
             selected_plan=plan.selected_plan,
             append_lineage=inspected.append_lineage,
         )
-        self.audit_identity = _legacy._audit_identity(self.audit)
+        self.audit_identity = _support._audit_identity(self.audit)
         background = plan.requested_shared_science["background"]
         run = {} if background["mode"] == "None" else {
-            "background": _legacy._plain(background),
+            "background": _support._plain(background),
         }
         lock = threading.RLock()
-        self.source = _legacy._ReintegrateFrameSource(
+        self.source = _support._ReintegrateFrameSource(
             plan, self.token, inspected.raw_options, inspected.topology,
         )
         prepared_manifest_admission = None
@@ -2522,10 +2522,10 @@ class _SuccessorRuntime:
             candidate_binding,
             dimension=plan.dimension,
             labels=plan.labels,
-            audit_bytes=_legacy._canonical(self.audit),
+            audit_bytes=_support._canonical(self.audit),
             selected_plan=plan.selected_plan["bai_args"],
             selected_gi_mode=plan.selected_plan["gi_mode"],
-            source_execution=_legacy._plain(inspected.topology.execution),
+            source_execution=_support._plain(inspected.topology.execution),
             append_lineage=inspected.append_lineage,
             cancel_token=self.token,
             entry=plan.entry,
@@ -2537,7 +2537,7 @@ class _SuccessorRuntime:
             file_lock=lock,
         )
         self.sink._configure_writer_batch_size(
-            _legacy._replacement_writer_batch_size(plan.resource_allocation)
+            _support._replacement_writer_batch_size(plan.resource_allocation)
         )
         if prepared is None:
             self.source.bind_fact_reader(
@@ -2560,7 +2560,7 @@ class _SuccessorRuntime:
                     ) from error
 
             self.source.bind_fact_reader(prepared_fact)
-        core_plan = _legacy._core_plan(
+        core_plan = _support._core_plan(
             plan.selected_plan, plan.requested_shared_science, inspected.mask,
         )
         modes = required_result_modes(core_plan)
@@ -2596,7 +2596,7 @@ class _SuccessorRuntime:
             "immutable reintegration writer exited before settlement"
         )
         self.source.bind_failure_probe(
-            lambda: _legacy._replacement_engine_failure(engine, dead_writer)
+            lambda: _support._replacement_engine_failure(engine, dead_writer)
         )
         total = len(plan.labels)
         submitted = 0
@@ -2657,8 +2657,8 @@ class _SuccessorRuntime:
                     )
                     break
                 submitted += 1
-            _legacy._drain_reintegration_engine(
-                engine, self.source, _legacy._TERMINAL_DRAIN_TIMEOUT_SECONDS,
+            _support._drain_reintegration_engine(
+                engine, self.source, _support._TERMINAL_DRAIN_TIMEOUT_SECONDS,
             )
             if not stopped:
                 release_progress(self.source.consume_settled())
@@ -2699,7 +2699,7 @@ class _SuccessorRuntime:
                     "finite reintegration produced no publishable rows"
                 ))
                 return FiniteCandidateWriteDisposition.ABORTED
-        except _legacy.ReintegrateCancelled as error:
+        except _support.ReintegrateCancelled as error:
             primary = error
             stopped = True
             cancelled_by_request = True
@@ -2712,12 +2712,12 @@ class _SuccessorRuntime:
             self._stop(error)
         try:
             self.seal = self.session.prepare_external_publication(
-                join_timeout=_legacy._TERMINAL_DRAIN_TIMEOUT_SECONDS,
+                join_timeout=_support._TERMINAL_DRAIN_TIMEOUT_SECONDS,
             )
         except BaseException:
             if (
                 primary is not None
-                and type(primary) is not _legacy.ReintegrateCancelled
+                and type(primary) is not _support.ReintegrateCancelled
             ):
                 raise primary
             if (
@@ -2870,7 +2870,7 @@ class _SuccessorRuntime:
                     if self.token is not None and self.token.is_set()
                     else self.token,
                 )
-        except _legacy.ReintegrateCancelled:
+        except _support.ReintegrateCancelled:
             if self.token is not None and self.token.is_set():
                 return self._pre_candidate_abort_result()
             raise
@@ -2961,7 +2961,7 @@ class _SuccessorRuntime:
             dropped = self.dropped_labels
             audit_identity = None
         diagnostics = tuple(
-            _legacy._diagnostic(item)
+            _support._diagnostic(item)
             for item in (*self.diagnostics, *publication.diagnostics)
         )[:16]
         return _value(
@@ -2992,7 +2992,7 @@ def run_reintegrate_successor(
 ) -> ReintegrateSuccessorResult:
     if type(plan) is not ReintegrateSuccessorPlan:
         raise TypeError("immutable reintegration requires an exact v4 plan")
-    _legacy._event(cancel_token, honor=False)
+    _support._event(cancel_token, honor=False)
     runtime = _SuccessorRuntime(plan, cancel_token, progress_cb)
     try:
         return runtime.run()

@@ -1,5 +1,5 @@
-from __future__ import annotations; import hashlib, json, math, os, tempfile, threading, time; from bisect import bisect_right; from collections.abc import Mapping; from contextlib import contextmanager; from dataclasses import dataclass, fields; from pathlib import Path, PurePosixPath; from types import MappingProxyType, SimpleNamespace; from typing import Any, Callable, Literal, NamedTuple; from xrd_tools.io.append import _replacement_hard_group, decode_replacement_lineage, science_fingerprint; from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot, capture_target_snapshot, revalidate_stream_terminal, stream_terminal_object_revision; from xrd_tools.session.policy import FlushPolicy, SessionPolicy, SessionResourceAllocation, SessionResourceRequirements, requirements_from, resolve_session_policy
-_REQUESTS = {"workers", "reduction_inflight", "queue_depth", "owner_block_bytes", "staging_items", "record_heavy_items", "publication_heavy_items", "thumbnail_items", "record_items", "publication_items"}; _STAGES = {"qualify", "read", "reduce", "write", "settle"}
+from __future__ import annotations; import hashlib, json, math, os, tempfile, threading, time; from bisect import bisect_right; from collections.abc import Mapping; from contextlib import contextmanager; from dataclasses import dataclass, fields; from pathlib import Path, PurePosixPath; from types import MappingProxyType, SimpleNamespace; from typing import Any, Literal, NamedTuple; from xrd_tools.io.append import _replacement_hard_group, decode_replacement_lineage, science_fingerprint; from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot, capture_target_snapshot, revalidate_stream_terminal, stream_terminal_object_revision; from xrd_tools.session.policy import FlushPolicy, SessionPolicy, SessionResourceAllocation, SessionResourceRequirements, requirements_from, resolve_session_policy
+_REQUESTS = {"workers", "reduction_inflight", "queue_depth", "owner_block_bytes", "staging_items", "record_heavy_items", "publication_heavy_items", "thumbnail_items", "record_items", "publication_items"}
 # Keep headless replacement admission aligned with the GUI's 256 MiB decoded
 # scientific-mask ceiling without importing GUI policy into xrd_tools.  Both
 # the persisted int64 index vector and its expanded bool mask must fit the cap.
@@ -21,7 +21,6 @@ _TERMINAL_DRAIN_TIMEOUT_SECONDS = 60.0
 class ReintegrateCancelled(RuntimeError): pass
 class _PersistedMaskSpec(NamedTuple): retained_bytes: int; decode_bytes: int
 class _ArtifactInspection(NamedTuple): labels: tuple[int, ...]; detector_shape: tuple[int, int]; native_dtype: str; persisted_shared_science: Mapping[str, Any]; persisted_selected_plan: Mapping[str, Any] | None; acquisition_fingerprint: str; source_base: str; append_lineage: bytes | None; gi_values: Mapping[int, float]; mask_spec: _PersistedMaskSpec; mask: Any | None; raw_options: Mapping[str, Any] | None; topology: _SourceTopology
-class _RuntimeOutcome(NamedTuple): disposition: str; committed: tuple[int, ...]; dropped: tuple[int, ...]; diagnostics: tuple[str, ...]; audit: str | None; terminal: Any | None
 def _reject(condition: Any, message: str) -> None: return None if not condition else (_ for _ in ()).throw(ValueError(message))
 def _diagnostic(value: Any) -> str:
     try: return str(value).encode("utf-8")[:1024].decode("utf-8", "ignore")
@@ -2501,7 +2500,6 @@ def _resolve_persisted_selected(selected, shared, dimension, mask):
     mode = selected["gi_mode"] if shared["gi"]["enabled"] else None; requested = {**selected, "gi_mode": mode}; plan = _core_plan(requested, shared, mask)
     from xrd_tools.reduction.provenance_config import _integration_1d_args, _integration_2d_args
     args = _integration_1d_args(plan.integration_1d, plan.gi) if dimension == "1d" else _integration_2d_args(plan.integration_2d, plan.gi); args.pop(f"gi_mode_{dimension}", None); resolved = {**requested, "bai_args": args}; _validate_science(resolved, shared, dimension); return resolved
-def _value(cls, *values): obj = object.__new__(cls); [object.__setattr__(obj, f.name, v) for f, v in zip(fields(cls), values)]; return obj
 @dataclass(frozen=True, slots=True, init=False)
 class ReintegratePlan:
     api_version: int; target: str; entry: str; source_root: str; expected_target_snapshot: TargetSnapshot; dimension: Literal["1d", "2d"]; labels: tuple[int, ...]; detector_shape: tuple[int, int]; native_dtype: str; selected_plan: Mapping[str, Any]; requested_shared_science: Mapping[str, Any]; gi_bootstrap_incidence: float | None; retained_mask_bytes: int; mask_decode_bytes: int; session_policy: SessionPolicy; rollback_policy: Literal["ROLLBACK_ON_STOP"]; science_identity: str; operation_identity: str
@@ -2563,17 +2561,6 @@ def _make_plan(path, entry, source_root, dimension, labels, shape, dtype, select
     payload = {"target": target, "entry": entry, "source_root": source_root, "snapshot": _snapshot_mapping(snapshot), "labels": labels, "shape": shape, "dtype": dtype, "bootstrap": bootstrap, "retained_mask_bytes": retained_mask_bytes, "mask_decode_bytes": mask_decode_bytes, "rollback": "ROLLBACK_ON_STOP", "flush": {"interval": 8, "cap": 64, "margin": 8}, "allocation": _allocation_recipe(policy.allocation), "science": science}
     operation = _digest(payload); _reject(expected_science is not None and science != expected_science, "SCIENCE_IDENTITY"); _reject(expected_operation is not None and operation != expected_operation, "OPERATION_IDENTITY"); obj = object.__new__(ReintegratePlan)
     values = (_REINTEGRATE_PLAN_API_VERSION, target, entry, source_root, snapshot, dimension, labels, shape, str(dtype), selected, shared, bootstrap, retained_mask_bytes, mask_decode_bytes, policy, "ROLLBACK_ON_STOP", science, operation); [object.__setattr__(obj, field.name, value) for field, value in zip(fields(ReintegratePlan), values)]; return obj
-@dataclass(frozen=True, slots=True, init=False)
-class ReintegrateProgress:
-    operation_identity: str; stage: str; completed: int; total: int; revision: int
-    def __new__(cls, *args, **kwargs): raise TypeError("ReintegrateProgress is factory-constructed")
-def _progress(identity, stage, completed, total, revision): _reject(stage not in _STAGES or any(type(v) is not int or v < 0 for v in (completed, total, revision)) or completed > total, "invalid reintegration progress"); return _value(ReintegrateProgress, identity, stage, completed, total, revision)
-@dataclass(frozen=True, slots=True, init=False)
-class ReintegrateResult:
-    disposition: str; input_labels: tuple[int, ...]; committed_labels: tuple[int, ...]; publication_dropped_labels: tuple[int, ...]; diagnostics: tuple[str, ...]; science_identity: str; operation_identity: str; audit_identity: str | None; commit_identity: Any | None
-    def __new__(cls, *args, **kwargs): raise TypeError("ReintegrateResult is factory-constructed")
-
-
 def _replacement_engine_failure(engine, dead_writer):
     failure = engine._current_failure()
     if failure is not None:
@@ -2902,231 +2889,3 @@ def _drain_reintegration_engine(engine, source, timeout):
         if engine.drain(timeout=min(0.1, remaining), poll=0.05):
             source._raise_terminal_state()
             return
-
-
-class _ExecutionRuntime:
-    def __init__(self, plan, cancel_token, progress_cb): self.plan, self.token, self.progress_cb, self.session, self.source, self.sink, self.result, self.audit, self.revision, self.diagnostics, self.accounting, self.primary, self.dropped, self.terminal_deadline = plan, cancel_token, progress_cb, None, None, None, None, None, 0, [], None, None, (), None
-    def _report(self, stage, completed, total):
-        self.revision += 1; value = _progress(self.plan.operation_identity, stage, completed, total, self.revision)
-        if self.progress_cb is not None:
-            try: self.progress_cb(value)
-            except BaseException as error: self._note(f"progress callback: {_diagnostic(error)}")
-    def _note(self, value): self.diagnostics.append(_diagnostic(value)) if len(self.diagnostics) < 16 else None
-    def _outcome(self, terminal):
-        from xrd_tools.reduction.core import NexusTerminalDisposition, NexusTerminalResult
-        if type(terminal) is not NexusTerminalResult: raise RuntimeError("replacement settlement returned no typed terminal")
-        if terminal.disposition is NexusTerminalDisposition.ABORTED: return _RuntimeOutcome("ROLLED_BACK", (), self.dropped, tuple(self.diagnostics), None, None)
-        dropped = self.dropped; committed = tuple(v for v in self.plan.labels if v not in set(dropped)); (None if committed else (_ for _ in ()).throw(RuntimeError("replacement committed an empty survivor set")))
-        return _RuntimeOutcome("COMMITTED", committed, dropped, tuple(self.diagnostics), self.audit, terminal.commit_identity)
-    def _terminal(self, terminal): outcome = self._outcome(terminal); self.close(); return outcome
-    def _has_custody(self):
-        transaction = None if self.sink is None else self.sink._transaction
-        if transaction is None: return False
-        try: return self.sink._transaction_owners is not None or transaction.snapshot().phase.value not in {"committed", "aborted"}
-        except BaseException: return True
-    def _stop(self, error):
-        self.primary = self.primary or error
-        try: self.session._session._record_failure(error)
-        except BaseException as cleanup: self._note(cleanup)
-        try: self.session.stop()
-        except BaseException as cleanup: self._note(cleanup)
-    def _settle_construction(self):
-        try: terminal = self.sink.abort(None)
-        except BaseException as error:
-            if self._has_custody(): self._note(error); return _RuntimeOutcome("SETTLEMENT_PENDING", (), (), tuple(self.diagnostics), None, None)
-            raise self.primary or error
-        if terminal is None: raise self.primary or RuntimeError("replacement construction lost terminal custody")
-        return self._terminal(terminal)
-    def _settle(self):
-        if self.session is None: return self._settle_construction()
-        self._report("settle", 0, 1)
-        join_timeout = (
-            _TERMINAL_DRAIN_TIMEOUT_SECONDS
-            if self.terminal_deadline is None
-            else max(0.0, self.terminal_deadline - time.monotonic())
-        )
-        try:
-            self.result = self.session.finish(raise_on_failure=False, join_timeout=join_timeout); terminal = self.session.terminal_result
-        except BaseException as error:
-            terminal = self.session.terminal_result
-            if terminal is not None and self.session._dynamic_terminal_settled: self.primary = self.primary or error; return self._terminal(terminal)
-            writer = None if self.sink is None else self.sink._writer
-            if not (self._has_custody() or terminal is not None or self.session._dynamic_frozen_result is not None): raise self.primary or error
-            self._note(error); pending_audit = self.audit if writer is not None and writer._finish_step >= 3 else None
-            return _RuntimeOutcome("SETTLEMENT_PENDING", (), (), tuple(self.diagnostics), pending_audit, None)
-        self._report("settle", 1, 1); self.primary = self.primary or self.session._session._current_failure(); return self._terminal(terminal)
-    def run(self):
-        if self.token is not None and self.token.is_set(): return _RuntimeOutcome("ROLLED_BACK", (), (), (), None, None)
-        _event(self.token); self._report("qualify", 0, len(self.plan.labels)); _event(self.token); path = Path(self.plan.target)
-        if capture_target_snapshot(path) != self.plan.expected_target_snapshot: raise ValueError("TARGET_SNAPSHOT_CHANGED")
-        target_revision = _target_object_revision(path, self.plan.expected_target_snapshot)
-        _event(self.token)
-        from xrd_tools.reduction.core import NexusSink; from xrd_tools.session import DynamicAccountingLimits, DynamicFrameIdentity, DynamicRunAccounting, StageLedger, required_result_modes; from xrd_tools.session.scan_session import ScanSession; inspected = _inspect_artifact(path, self.plan.entry, self.plan.dimension, self.plan.expected_target_snapshot, target_revision, self.plan.source_root, read_mask=False); _event(self.token)
-        if capture_target_snapshot(path) != self.plan.expected_target_snapshot or _target_object_revision(path, self.plan.expected_target_snapshot) != target_revision: raise ValueError("TARGET_SNAPSHOT_CHANGED")
-        _event(self.token)
-        expected_mask = _PersistedMaskSpec(
-            self.plan.retained_mask_bytes, self.plan.mask_decode_bytes)
-        if inspected.labels != self.plan.labels or inspected.detector_shape != self.plan.detector_shape or inspected.native_dtype != self.plan.native_dtype or inspected.mask_spec != expected_mask or _mask_owner_block_bytes(self.plan.resource_allocation.requirements, inspected.mask_spec) != (None if not inspected.mask_spec.retained_bytes else self.plan.resource_allocation.owner_block_bytes) or _plain(inspected.persisted_shared_science) != _plain(self.plan.requested_shared_science) or self.plan.gi_bootstrap_incidence is not None and inspected.gi_values.get(self.plan.labels[0]) != self.plan.gi_bootstrap_incidence: raise ValueError("RECIPE_ARTIFACT_FACTS_CHANGED")
-        mask = (_load_persisted_mask(
-            path, self.plan.entry, inspected.detector_shape,
-            self.plan.expected_target_snapshot, target_revision,
-            inspected.mask_spec,
-        ) if inspected.mask_spec.retained_bytes else None)
-        inspected = inspected._replace(mask=mask)
-        _event(self.token)
-        audit = _dimension_audit(dimension=self.plan.dimension, operation_identity=self.plan.operation_identity, science_identity=self.plan.science_identity, acquisition_fingerprint=inspected.acquisition_fingerprint, requested_shared_science=self.plan.requested_shared_science, selected_plan=self.plan.selected_plan, append_lineage=inspected.append_lineage); self.audit = _audit_identity(audit); background = self.plan.requested_shared_science["background"]; run = {} if background["mode"] == "None" else {"background": _plain(background)}
-        lock = threading.RLock(); self.source = _ReintegrateFrameSource(self.plan, self.token, inspected.raw_options, inspected.topology); self.sink = NexusSink.for_existing_replacement(path, expected_target_snapshot=self.plan.expected_target_snapshot, dimension=self.plan.dimension, labels=self.plan.labels, audit_bytes=_canonical(audit), selected_plan=self.plan.selected_plan["bai_args"], selected_gi_mode=self.plan.selected_plan["gi_mode"], source_execution=dict(inspected.topology.execution), append_lineage=inspected.append_lineage, cancel_token=self.token, entry=self.plan.entry, source_base=inspected.source_base, run_configuration_provenance=run, write_thumbnails=False, flush_every=None, file_lock=lock); self.sink._configure_writer_batch_size(_replacement_writer_batch_size(self.plan.resource_allocation))
-        self.source.bind_fact_reader(lambda label, **kwargs: self.sink._writer._detach_replacement_fact(label, **kwargs)); core_plan = _core_plan(self.plan.selected_plan, self.plan.requested_shared_science, inspected.mask); modes = required_result_modes(core_plan); targets = {mode: (f"nexus:{path}",) for mode in modes}; ledger = StageLedger(required_modes=modes, targets_by_mode=targets); self.accounting = DynamicRunAccounting(ledger, run_generation=1, limits=DynamicAccountingLimits(1, 1, len(self.plan.labels)))
-        try: self.session = ScanSession(core_plan, self.source, self.sink, policy=self.plan.session_policy, cancel_token=self.token, clear_frame_images=True, accounting=ledger, dynamic_accounting=self.accounting, targets_by_mode=targets, _dynamic_batch_settlement_authority_cb=self.source.enqueue_settled_batch)
-        except BaseException as error: self.primary = error; return self._settle()
-        engine = self.session._session
-        dead_writer = RuntimeError(
-            "replacement writer exited before terminal settlement"
-        )
-
-        self.source.bind_failure_probe(
-            lambda: _replacement_engine_failure(engine, dead_writer)
-        )
-        total = len(self.plan.labels); submitted = settled = 0; stopped = False; terminal_drain_succeeded = False
-
-        def release_progress(attempts):
-            nonlocal settled
-            if not attempts:
-                return
-            settled += len(attempts)
-            self._report("reduce", settled, total)
-            self._report("write", settled, total)
-
-        try:
-            self.source.open_direct_hdf()
-            self.session.start()
-            self.sink._writer._replacement_read_context = (
-                inspected.source_base, inspected.topology.lineage,
-                inspected.topology.execution,
-            )
-            frames = tuple(self.session.scan.frames)
-            for ordinal, frame in enumerate(frames):
-                if self.token is not None and self.token.is_set():
-                    self.session.stop(); stopped = True; break
-                release_progress(self.source.wait_for_capacity())
-                self._report("read", ordinal, total)
-                image, revision = self.source.prepare(frame)
-                key = DynamicFrameIdentity(
-                    self.plan.operation_identity, int(frame.index),
-                )
-                self.accounting.discover(
-                    key, group=self.plan.operation_identity, ordinal=ordinal,
-                    output_label=int(frame.index),
-                )
-                attempt = self.accounting.begin_attempt(
-                    key, source_revision=revision,
-                )
-                self.accounting.record_enqueued(attempt)
-                self.source.bind_attempt(frame.index, attempt)
-                if not self.session.submit(
-                    frame, image, attempt_token=attempt,
-                ):
-                    self.accounting.record_cancelled(
-                        attempt, reason="reintegration submission cancelled",
-                    )
-                    self.source.clear_label(frame.index)
-                    self.session.stop()
-                    stopped = True
-                    break
-                submitted += 1
-            self.terminal_deadline = (
-                time.monotonic() + _TERMINAL_DRAIN_TIMEOUT_SECONDS
-            )
-            _drain_reintegration_engine(
-                engine, self.source,
-                max(0.001, self.terminal_deadline - time.monotonic()),
-            )
-            terminal_drain_succeeded = True
-            if not stopped:
-                release_progress(self.source.consume_settled())
-                if (
-                    submitted != total
-                    or settled != total
-                    or self.source.jit_labels
-                    or self.source.pending_settlement_count
-                ):
-                    raise RuntimeError(
-                        "replacement rolling settlement lost exact custody"
-                    )
-        except ReintegrateCancelled: self.session.stop()
-        except BaseException as error: self._stop(error)
-        try:
-            if (
-                not stopped
-                and self.session._session._current_failure() is None
-                and (self.token is None or not self.token.is_set())
-            ):
-                self.session.flush(force=True)
-                self.source.validate_terminal_topology()
-            snapshot = self.accounting.snapshot(); pairs = snapshot.publication_dropped | snapshot.pending_publication_dropped; self.dropped = tuple(label for label in self.plan.labels if any(key.logical_frame_identity == label for key, _mode in pairs))
-        except BaseException as error: self._note(error); self._stop(error)
-        if terminal_drain_succeeded:
-            # Draining proved the writer quiescent.  Qualification/flush/topology
-            # work after that boundary must not consume the separate finite join
-            # budget needed to publish the sentinel and settle the transaction.
-            self.terminal_deadline = (
-                time.monotonic() + _TERMINAL_DRAIN_TIMEOUT_SECONDS
-            )
-        return self._settle()
-    def finish_current(self): self.session._mark_dynamic_failure(ReintegrateCancelled("reintegration cancelled before commit")) if self.token is not None and self.token.is_set() and self.session is not None and not self.sink._transaction.snapshot().writer_succeeded else None; return self._settle()
-    def close(self): source, sink = self.source, self.sink; writer = None if sink is None else sink._writer; source.close_direct_hdf(validate=False) if source is not None else None; source.clear_jit() if source is not None else None; source._frames.clear() if source is not None else None; setattr(source, "_fact_reader", None) if source is not None else None; setattr(source, "_topology", None) if source is not None else None; [setattr(writer, name, None) for name in ("_replacement_configuration", "_replacement_read_context", "_replacement_manifest", "_replacement_expected")] if writer is not None else None; writer._row_cursors.clear() if writer is not None else None; setattr(writer, "_replacement_labels", ()) if writer is not None else None; self.session = self.source = self.sink = self.result = self.accounting = None
-def _open_runtime(plan, cancel_token, progress_cb): return _ExecutionRuntime(plan, cancel_token, progress_cb)
-class ReintegrateRunner:
-    def __init__(self, plan: ReintegratePlan, *, cancel_token: threading.Event | None = None, progress_cb: Callable[[ReintegrateProgress], object] | None = None) -> None:
-        if type(plan) is not ReintegratePlan: raise TypeError("runner requires an exact ReintegratePlan")
-        _event(cancel_token, honor=False); self.plan, self.cancel_token, self.progress_cb = plan, cancel_token, progress_cb; self._thread, self._runtime, self._state = threading.get_ident(), None, "NEW"
-    def __enter__(self) -> ReintegrateRunner: return self
-    def __exit__(self, exc_type, exc, traceback) -> None: self.close()
-    def _result(self, outcome):
-        from xrd_tools.io.output_transaction import StreamTerminal
-        if not (outcome.audit is None or type(outcome.audit) is str and len(outcome.audit) == 64 and all(c in "0123456789abcdef" for c in outcome.audit)) or outcome.disposition not in {"COMMITTED", "ROLLED_BACK", "SETTLEMENT_PENDING"} or outcome.disposition == "COMMITTED" and (not outcome.committed or type(outcome.terminal) is not StreamTerminal or outcome.audit is None or outcome.committed != tuple(v for v in self.plan.labels if v not in set(outcome.dropped))) or outcome.disposition != "COMMITTED" and (outcome.committed or outcome.terminal is not None) or outcome.disposition == "ROLLED_BACK" and outcome.audit is not None or set(outcome.committed) & set(outcome.dropped) or tuple(v for v in self.plan.labels if v in set(outcome.committed)) != outcome.committed or tuple(v for v in self.plan.labels if v in set(outcome.dropped)) != outcome.dropped: raise RuntimeError("replacement result contract is invalid")
-        return _value(ReintegrateResult, outcome.disposition, self.plan.labels, outcome.committed, outcome.dropped, tuple(_diagnostic(x) for x in outcome.diagnostics[:16]), self.plan.science_identity, self.plan.operation_identity, outcome.audit, outcome.terminal)
-    def _terminal_result(self, outcome):
-        self._state = (
-            "SETTLEMENT_PENDING"
-            if outcome.disposition == "SETTLEMENT_PENDING"
-            else "TERMINAL"
-        )
-        value = self._result(outcome)
-        runtime = self._runtime
-        self._runtime = runtime if self._state == "SETTLEMENT_PENDING" else None
-        primary = runtime.primary
-        cancelled_after_rollback = (
-            outcome.disposition == "ROLLED_BACK"
-            and type(primary) is ReintegrateCancelled
-        )
-        if (
-            self._state == "TERMINAL"
-            and primary is not None
-            and not cancelled_after_rollback
-        ):
-            raise primary
-        return value
-    def run(self) -> ReintegrateResult:
-        if threading.get_ident() != self._thread or self._state != "NEW": raise RuntimeError("runner is one-shot and thread-affine")
-        self._runtime = _open_runtime(self.plan, self.cancel_token, self.progress_cb); self._state = "ACTIVE"
-        try: outcome = self._runtime.run()
-        except ReintegrateCancelled: outcome = _RuntimeOutcome("ROLLED_BACK", (), (), (), None, None)
-        except BaseException: self._state = "TERMINAL"; raise
-        return self._terminal_result(outcome)
-    def finish_current(self) -> ReintegrateResult:
-        if threading.get_ident() != self._thread or self._state != "SETTLEMENT_PENDING": raise RuntimeError("no settlement is pending on this runner thread")
-        try: outcome = self._runtime.finish_current()
-        except BaseException: self._state = "TERMINAL"; raise
-        return self._terminal_result(outcome)
-    def close(self) -> None:
-        if threading.get_ident() != self._thread: raise RuntimeError("runner is thread-affine")
-        if self._state == "SETTLEMENT_PENDING" or self._runtime is not None and self._runtime._has_custody(): raise RuntimeError("reintegration settlement custody remains pending")
-        self._runtime is not None and self._runtime.close(); self._state = "CLOSED"
-def run_reintegrate(plan: ReintegratePlan, *, cancel_token: threading.Event | None = None, progress_cb: Callable[[ReintegrateProgress], object] | None = None) -> ReintegrateResult:
-    with ReintegrateRunner(plan, cancel_token=cancel_token, progress_cb=progress_cb) as runner:
-        result = runner.run()
-        while result.disposition == "SETTLEMENT_PENDING":
-            time.sleep(0.1)
-            result = runner.finish_current()
-        return result

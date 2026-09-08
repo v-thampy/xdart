@@ -114,6 +114,13 @@ pre-migration reference signature.  Two additive notes:
 
 ## Behavior changes to know about
 
+* **Unreleased API retirement:** the mutable in-place Reintegration execution
+  API (`ReintegrateRunner`, `run_reintegrate`, `ReintegrateProgress`, and
+  `ReintegrateResult`) has been removed. Use
+  `ReintegrateSuccessorPlan.from_artifact(...)` or the prepared-plan route
+  with `run_reintegrate_successor(...)`; it preserves the source artifact and
+  publishes a validated successor artifact.
+
 * **Current processed artifacts use `.nexus` exclusively.** New writers and
   ordinary processed readers require both the `.nexus` suffix and the current
   schema/layout. Raw acquisition inputs retain `.h5`, `.hdf5`, `.nxs`, `.nexus`,

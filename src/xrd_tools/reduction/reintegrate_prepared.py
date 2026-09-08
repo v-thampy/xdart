@@ -56,7 +56,7 @@ from xrd_tools.io.record_writer import (
     prepare_replacement_manifest_receipt,
     replacement_manifest_receipt_mapping,
 )
-from xrd_tools.reduction import reintegrate as _legacy
+from xrd_tools.reduction import reintegrate as _support
 
 
 _CAPSULE_FACTORY = object()
@@ -149,7 +149,7 @@ def _value(cls, *values):
 
 def _canonical_bytes(value: object) -> bytes:
     return json.dumps(
-        _legacy._plain(value),
+        _support._plain(value),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -166,7 +166,7 @@ def _is_digest(value: object) -> bool:
 
 
 def _freeze_json(value: object):
-    return _legacy._freeze(json.loads(_canonical_bytes(value)))
+    return _support._freeze(json.loads(_canonical_bytes(value)))
 
 
 def _exact_mapping(value: object, keys: set[str], role: str) -> dict:
@@ -439,7 +439,7 @@ def _artifact_mapping(value: PreparedArtifactFactsReceipt) -> dict[str, object]:
         "entry": value.entry,
         "detector_shape": list(value.detector_shape),
         "native_dtype": value.native_dtype,
-        "persisted_shared_science": _legacy._plain(
+        "persisted_shared_science": _support._plain(
             value.persisted_shared_science
         ),
         "acquisition_fingerprint": value.acquisition_fingerprint,
@@ -499,7 +499,7 @@ def _topology_mapping(topology: Any) -> dict[str, object]:
         return {
             "label": label,
             "source_path": route.source_path,
-            "source_state": _legacy._plain(route.source_state),
+            "source_state": _support._plain(route.source_state),
             "snapshot_count": route.snapshot_count,
             "snapshot_dataset_path": route.snapshot_dataset_path,
             "self_contained": route.self_contained,
@@ -511,14 +511,14 @@ def _topology_mapping(topology: Any) -> dict[str, object]:
         "schema": "xrd_tools.reintegrate.prepared_topology",
         "version": 1,
         "source_base": topology.source_base,
-        "execution": _legacy._plain(topology.execution),
-        "lineage": _legacy._plain(topology.lineage),
-        "final_source": _legacy._plain(topology.final_source),
+        "execution": _support._plain(topology.execution),
+        "lineage": _support._plain(topology.lineage),
+        "final_source": _support._plain(topology.final_source),
         "execution_digest": topology.execution_digest,
         "lineage_digest": topology.lineage_digest,
-        "revision_signature": _legacy._plain(topology.revision_signature),
+        "revision_signature": _support._plain(topology.revision_signature),
         "revisions": [
-            {"path": key, "value": _legacy._plain(value)}
+            {"path": key, "value": _support._plain(value)}
             for key, value in sorted(topology.revisions.items())
         ],
         "frame_routes": [
@@ -568,10 +568,10 @@ def _compact_fact(fact: Mapping[str, Any]) -> Mapping[str, Any]:
         "label": fact["label"],
         "path": fact["path"],
         "frame_index": fact["frame_index"],
-        "snapshot": _legacy._plain(fact["snapshot"]),
-        "metadata": _legacy._plain(fact["metadata"]),
-        "geometry": _legacy._plain(fact["geometry"]),
-        "background_dependency": _legacy._plain(fact["background_dependency"]),
+        "snapshot": _support._plain(fact["snapshot"]),
+        "metadata": _support._plain(fact["metadata"]),
+        "geometry": _support._plain(fact["geometry"]),
+        "background_dependency": _support._plain(fact["background_dependency"]),
     }
     encoded = _canonical_bytes(value)
     if len(encoded) > MAX_PREPARED_FACT_BYTES:
@@ -586,7 +586,7 @@ def _facts_digest_payload(
     labels: tuple[int, ...],
     facts: tuple[Mapping[str, Any], ...],
 ) -> tuple[str, str]:
-    per_frame = _digest([_legacy._plain(value) for value in facts])
+    per_frame = _digest([_support._plain(value) for value in facts])
     value = {
         "schema": "xrd_tools.reintegrate.prepared_facts",
         "version": 1,
@@ -606,7 +606,7 @@ def _payload_mapping(value: PreparedDimensionPayload) -> dict[str, object]:
         "version": 1,
         "dimension": value.dimension,
         "dimension_labels": list(value.dimension_labels),
-        "selected_plan": _legacy._plain(value.selected_plan),
+        "selected_plan": _support._plain(value.selected_plan),
         "selected_facts_digest": value.selected_facts_digest,
         "manifest_receipt": replacement_manifest_receipt_mapping(
             value.manifest_receipt
@@ -625,7 +625,7 @@ def _dimension_payload(
     selected_digest = _digest({
         "dimension": dimension,
         "labels": list(labels),
-        "selected_plan": _legacy._plain(selected),
+        "selected_plan": _support._plain(selected),
     })
     values = (dimension, labels, selected, selected_digest, receipt)
     provisional = _value(PreparedDimensionPayload, *values, "0" * 64)
@@ -731,11 +731,11 @@ def prepared_bundle_mapping(
         "target": _target_receipt_mapping(value.target),
         "artifact": _artifact_mapping(value.artifact),
         "topology": {
-            "payload": _legacy._plain(value.topology.payload),
+            "payload": _support._plain(value.topology.payload),
             "topology_digest": value.topology.topology_digest,
         },
         "labels": list(value.labels),
-        "facts": [_legacy._plain(fact) for fact in value.facts],
+        "facts": [_support._plain(fact) for fact in value.facts],
         "one_d": _admission_mapping(value.one_d),
         "two_d": _admission_mapping(value.two_d),
         "facts_digest": value.facts_digest,
@@ -754,11 +754,11 @@ def prepared_execution_mapping(
         "target": _target_receipt_mapping(value.target),
         "artifact": _artifact_mapping(value.artifact),
         "topology": {
-            "payload": _legacy._plain(value.topology.payload),
+            "payload": _support._plain(value.topology.payload),
             "topology_digest": value.topology.topology_digest,
         },
         "labels": list(value.labels),
-        "facts": [_legacy._plain(fact) for fact in value.facts],
+        "facts": [_support._plain(fact) for fact in value.facts],
         "facts_digest": value.facts_digest,
         "selected_admission": _admission_mapping(value.selected_admission),
         "sibling_commitment": {
@@ -1002,7 +1002,7 @@ def _require_v1_restored_topology(topology: Any) -> None:
             or len(lineage["epochs"]) != 1
         )
         try:
-            labels = _lineage_labels(_legacy._plain(lineage))
+            labels = _lineage_labels(_support._plain(lineage))
         except (TypeError, ValueError, KeyError) as error:
             raise PreparedRouteRejected(
                 PreparedCapsuleMissCode.CAPSULE_SCHEMA_UNSUPPORTED
@@ -1042,9 +1042,9 @@ def _require_v1_restored_topology(topology: Any) -> None:
         not os.path.isabs(topology.source_base)
         or os.path.normcase(os.path.normpath(topology.source_base))
         != topology.source_base
-        or topology.execution_digest != _legacy._digest(execution)
+        or topology.execution_digest != _support._digest(execution)
         or topology.lineage_digest
-        != (None if lineage is None else _legacy._digest(lineage))
+        != (None if lineage is None else _support._digest(lineage))
     )
 
     reject(len(topology.external_signature) != 1)
@@ -1099,7 +1099,7 @@ def _require_v1_restored_topology(topology: Any) -> None:
             )
         )
     try:
-        signature = _legacy._revision_signature(topology.revisions)
+        signature = _support._revision_signature(topology.revisions)
     except (TypeError, ValueError, KeyError, IndexError) as error:
         raise PreparedRouteRejected(
             PreparedCapsuleMissCode.CAPSULE_SCHEMA_UNSUPPORTED
@@ -1111,13 +1111,13 @@ def _require_v1_restored_topology(topology: Any) -> None:
     member_resolved = topology.revisions[member_path][0]
     reject(normalized(link.resolved_target) != normalized(member_resolved))
 
-    revision_paths = _legacy._ordered_revision_paths(
+    revision_paths = _support._ordered_revision_paths(
         source_path,
         member_path,
         None if final_member is None else final_member["path"],
         member_resolved,
     )
-    expected_hdf = _legacy._HdfFrameRoute(
+    expected_hdf = _support._HdfFrameRoute(
         route_dataset,
         route_start,
         route_stop,
@@ -1127,7 +1127,7 @@ def _require_v1_restored_topology(topology: Any) -> None:
     for label, route in topology.frame_routes.items():
         ordinal = label - execution["first_label"]
         reject(not 0 <= ordinal < total)
-        expected = _legacy._FrameRoute(
+        expected = _support._FrameRoute(
             source_path,
             source_state,
             total,
@@ -1140,7 +1140,7 @@ def _require_v1_restored_topology(topology: Any) -> None:
 
 
 def _restore_topology(value: Mapping[str, Any]):
-    plain = _legacy._plain(value)
+    plain = _support._plain(value)
     expected = {
         "schema", "version", "source_base", "execution", "lineage",
         "final_source", "execution_digest", "lineage_digest",
@@ -1182,8 +1182,8 @@ def _restore_topology(value: Mapping[str, Any]):
         _admit_named_paths(final_source, "final source")
     if (
         not _is_digest(mapping["execution_digest"])
-        or _legacy._digest(execution) != mapping["execution_digest"]
-        or (None if lineage is None else _legacy._digest(lineage))
+        or _support._digest(execution) != mapping["execution_digest"]
+        or (None if lineage is None else _support._digest(lineage))
         != mapping["lineage_digest"]
         or lineage is None
         and final_source is not None
@@ -1285,9 +1285,9 @@ def _restore_topology(value: Mapping[str, Any]):
                 selected["resolved_path"] = _admitted_text(
                     selected["resolved_path"], "HDF storage resolved path",
                 )
-                slices.append(_legacy._HdfStorageSlice(**selected))
+                slices.append(_support._HdfStorageSlice(**selected))
             try:
-                hdf = _legacy._HdfFrameRoute(
+                hdf = _support._HdfFrameRoute(
                     _admitted_text(
                         hdf_value["dataset_path"], "HDF dataset path",
                     ),
@@ -1303,7 +1303,7 @@ def _restore_topology(value: Mapping[str, Any]):
                     PreparedCapsuleMissCode.CAPSULE_SCHEMA_UNSUPPORTED
                 ) from error
         try:
-            routes[label] = _legacy._FrameRoute(
+            routes[label] = _support._FrameRoute(
                 source_path,
                 _freeze_json(row["source_state"]),
                 row["snapshot_count"],
@@ -1320,15 +1320,15 @@ def _restore_topology(value: Mapping[str, Any]):
     for item in mapping["external_signature"]:
         admitted_link = dict(_exact_mapping(
             item,
-            set(_legacy._HdfOwnerLink._fields),
+            set(_support._HdfOwnerLink._fields),
             "prepared external link",
         ))
-        for field in _legacy._HdfOwnerLink._fields:
+        for field in _support._HdfOwnerLink._fields:
             if admitted_link[field] is not None:
                 admitted_link[field] = _admitted_text(
                     admitted_link[field], f"external link {field}",
                 )
-        links.append(_legacy._HdfOwnerLink(**admitted_link))
+        links.append(_support._HdfOwnerLink(**admitted_link))
     external_parent = mapping["external_parent"]
     if external_parent is not None:
         external_parent = _admitted_text(
@@ -1339,8 +1339,8 @@ def _restore_topology(value: Mapping[str, Any]):
         for path in mapping["external_paths"]
     )
     try:
-        revision_lookup = _legacy._revision_lookup(revisions)
-        topology = _legacy._SourceTopology(
+        revision_lookup = _support._revision_lookup(revisions)
+        topology = _support._SourceTopology(
             source_base,
             _freeze_json(execution),
             None if lineage is None else _freeze_json(lineage),
@@ -1477,7 +1477,7 @@ def _admit_facts(
             "background_dependency": None,
         })
         try:
-            _legacy._require_fact_route(fact, topology, Path(path))
+            _support._require_fact_route(fact, topology, Path(path))
         except (WriterStateError, TypeError, ValueError, KeyError) as error:
             raise PreparedRouteRejected(
                 PreparedCapsuleMissCode.CAPSULE_SCHEMA_UNSUPPORTED
@@ -1522,7 +1522,7 @@ def _admit_payload(value: object) -> PreparedDimensionPayload:
     if _digest({
         "dimension": mapping["dimension"],
         "labels": list(labels),
-        "selected_plan": _legacy._plain(selected),
+        "selected_plan": _support._plain(selected),
     }) != mapping["selected_facts_digest"]:
         raise PreparedRouteRejected(
             PreparedCapsuleMissCode.CAPSULE_DIGEST_MISMATCH
@@ -1770,7 +1770,7 @@ def _inspection_for_execution(
         None
         if topology.lineage is None
         else _canonical_append_json(
-            _legacy._plain(topology.lineage)
+            _support._plain(topology.lineage)
         ).encode("utf-8")
     )
     if (
@@ -1781,7 +1781,7 @@ def _inspection_for_execution(
         raise PreparedRouteRejected(
             PreparedCapsuleMissCode.CAPSULE_DIGEST_MISMATCH
         )
-    return _legacy._ArtifactInspection(
+    return _support._ArtifactInspection(
         labels,
         artifact.detector_shape,
         artifact.native_dtype,
@@ -1791,7 +1791,7 @@ def _inspection_for_execution(
         artifact.source_base,
         append_lineage,
         MappingProxyType({}),
-        _legacy._PersistedMaskSpec(0, 0),
+        _support._PersistedMaskSpec(0, 0),
         None,
         None,
         topology,
@@ -2016,7 +2016,7 @@ def _is_self_external_topology(topology: Any) -> bool:
 
 
 def _initial_artifact_miss(inspection: Any) -> PreparedCapsuleMissCode | None:
-    shared = _legacy._plain(inspection.persisted_shared_science)
+    shared = _support._plain(inspection.persisted_shared_science)
     if (
         inspection.mask_spec.retained_bytes
         or inspection.mask_spec.decode_bytes
@@ -2056,7 +2056,7 @@ def _initial_artifact_miss(inspection: Any) -> PreparedCapsuleMissCode | None:
         )
     ):
         return PreparedCapsuleMissCode.SOURCE_TOPOLOGY_UNSUPPORTED
-    metadata_keys, include_geometry = _legacy._fact_projection(
+    metadata_keys, include_geometry = _support._fact_projection(
         inspection.persisted_selected_plan,
         inspection.persisted_shared_science,
     )
@@ -2076,8 +2076,8 @@ def _append_miss_before_topology(
 
     present = False
     try:
-        with _legacy._open_target_hdf(path) as document:
-            _legacy._target_hdf_fence(document, path, snapshot, revision)
+        with _support._open_target_hdf(path) as document:
+            _support._target_hdf_fence(document, path, snapshot, revision)
             present = document.get(
                 f"/{entry}/reduction/config/append_lineage",
                 getlink=True,
@@ -2092,10 +2092,10 @@ def _append_miss_before_topology(
             else:
                 prefix = decode_committed_append_prefix(document, entry=entry)
                 lineage = json.loads(prefix.lineage_json)
-            _legacy._target_hdf_fence(document, path, snapshot, revision)
+            _support._target_hdf_fence(document, path, snapshot, revision)
     except (OSError, TypeError, ValueError, WriterStateError) as error:
         try:
-            target_changed = _legacy.capture_target_snapshot(path) != snapshot
+            target_changed = _support.capture_target_snapshot(path) != snapshot
         except BaseException:
             target_changed = True
         if target_changed or "TARGET_SNAPSHOT_CHANGED" in str(error):
@@ -2144,13 +2144,13 @@ def _prepared_dimension_inventories(
     """
 
     values: dict[str, tuple[int, ...] | None] = {}
-    with _legacy._open_target_hdf(path) as document:
-        _legacy._target_hdf_fence(document, path, snapshot, revision)
+    with _support._open_target_hdf(path) as document:
+        _support._target_hdf_fence(document, path, snapshot, revision)
         root = _replacement_hard_group(document, entry)
         if root is None:
             raise ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
         for dimension in ("1d", "2d"):
-            _legacy._event(cancel_token)
+            _support._event(cancel_token)
             integrated = _replacement_hard_group(
                 root, f"integrated_{dimension}", h5py.Group,
             )
@@ -2181,7 +2181,7 @@ def _prepared_dimension_inventories(
                 and all(label >= 0 for label in labels)
                 else None
             )
-        _legacy._target_hdf_fence(document, path, snapshot, revision)
+        _support._target_hdf_fence(document, path, snapshot, revision)
     return MappingProxyType(values)
 
 
@@ -2201,7 +2201,7 @@ def prepare_reintegrate_bundle(
     they are never relabeled as a reason to fall back.
     """
 
-    _legacy._event(cancel_token)
+    _support._event(cancel_token)
     if (
         type(source) is not FiniteSourceAdmission
         or type(entry) is not str
@@ -2230,14 +2230,14 @@ def prepare_reintegrate_bundle(
     def miss(code: PreparedCapsuleMissCode) -> PreparedReintegrateOffer:
         """Only authorize fallback while the admitted source stays exact."""
 
-        _legacy._event(cancel_token)
+        _support._event(cancel_token)
         try:
             current = capture_finite_source(path)
         except (OSError, TypeError, ValueError) as error:
             raise ValueError("TARGET_SNAPSHOT_CHANGED") from error
         if current.snapshot != source.snapshot:
             raise ValueError("TARGET_SNAPSHOT_CHANGED")
-        _legacy._event(cancel_token)
+        _support._event(cancel_token)
         return _offer_miss(code)
 
     snapshot = _target_snapshot(source.snapshot)
@@ -2264,7 +2264,7 @@ def prepare_reintegrate_bundle(
         ):
             raise ValueError("TERMINAL_CHANGED")
     target = _target_receipt(source.snapshot, expected_terminal)
-    revision = _legacy._target_object_revision(path, snapshot)
+    revision = _support._target_object_revision(path, snapshot)
     append_code = _append_miss_before_topology(
         path, entry, labels, snapshot, revision,
     )
@@ -2297,9 +2297,9 @@ def prepare_reintegrate_bundle(
             ),
         )
     for dimension in dimensions_to_inspect:
-        _legacy._event(cancel_token)
+        _support._event(cancel_token)
         try:
-            inspections[dimension] = _legacy._inspect_artifact(
+            inspections[dimension] = _support._inspect_artifact(
                 path,
                 entry,
                 dimension,
@@ -2338,7 +2338,7 @@ def prepare_reintegrate_bundle(
         neutral = (
             tuple(inspection.detector_shape),
             inspection.native_dtype,
-            _legacy._plain(inspection.persisted_shared_science),
+            _support._plain(inspection.persisted_shared_science),
             inspection.acquisition_fingerprint,
             inspection.source_base,
             inspection.append_lineage,
@@ -2348,7 +2348,7 @@ def prepare_reintegrate_bundle(
         baseline = (
             tuple(base.detector_shape),
             base.native_dtype,
-            _legacy._plain(base.persisted_shared_science),
+            _support._plain(base.persisted_shared_science),
             base.acquisition_fingerprint,
             base.source_base,
             base.append_lineage,
@@ -2376,10 +2376,10 @@ def prepare_reintegrate_bundle(
         base.topology.lineage,
         base.topology.execution,
     )
-    with _legacy._open_target_hdf(path) as document:
-        _legacy._target_hdf_fence(document, path, snapshot, revision)
+    with _support._open_target_hdf(path) as document:
+        _support._target_hdf_fence(document, path, snapshot, revision)
         for label in labels:
-            _legacy._event(cancel_token)
+            _support._event(cancel_token)
             fact = _decode_replacement_fact(
                 document,
                 label,
@@ -2390,7 +2390,7 @@ def prepare_reintegrate_bundle(
             )
             fact = dict(fact)
             fact["path"] = os.path.normcase(os.path.normpath(os.path.abspath(
-                _legacy._resolve_source_locator(
+                _support._resolve_source_locator(
                     fact["path"], base.source_base,
                 )
             )))
@@ -2408,11 +2408,11 @@ def prepare_reintegrate_bundle(
                 compact_facts.append(_compact_fact(fact))
             except PreparedCapsuleMiss as error:
                 return miss(error.code)
-        _legacy._target_hdf_fence(document, path, snapshot, revision)
+        _support._target_hdf_fence(document, path, snapshot, revision)
     facts = tuple(compact_facts)
     if tuple(fact["label"] for fact in facts) != labels:
         raise RuntimeError("prepared source facts escaped their label inventory")
-    if len(_canonical_bytes([_legacy._plain(fact) for fact in facts])) > MAX_PREPARED_FACTS_BYTES:
+    if len(_canonical_bytes([_support._plain(fact) for fact in facts])) > MAX_PREPARED_FACTS_BYTES:
         return miss(PreparedCapsuleMissCode.CAPSULE_BYTE_LIMIT)
     _per_frame, facts_digest = _facts_digest_payload(
         target, artifact, topology_receipt, labels, facts,
@@ -2508,7 +2508,7 @@ def prepare_reintegrate_bundle(
     after = capture_finite_source(path)
     if after.snapshot != source.snapshot:
         raise ValueError("TARGET_SNAPSHOT_CHANGED")
-    _legacy._event(cancel_token)
+    _support._event(cancel_token)
     return _value(PreparedReintegrateOffer, "READY", admitted, None)
 
 
@@ -2522,7 +2522,7 @@ def preflight_prepared_execution(
 ) -> None:
     """Final effect-free route check before publisher candidate ownership."""
 
-    _legacy._event(cancel_token)
+    _support._event(cancel_token)
     if (
         type(execution) is not PreparedReintegrateExecution
         or type(source) is not FiniteSourceAdmission
@@ -2541,7 +2541,7 @@ def preflight_prepared_execution(
     # Full finite-source recapture above the caller and the raw topology fence
     # here cover both the processed artifact and its external member graph.
     try:
-        _legacy._validate_terminal_topology(
+        _support._validate_terminal_topology(
             execution._inspection.topology, cancel_token,
         )
     except OSError as error:
@@ -2556,7 +2556,7 @@ def preflight_prepared_execution(
             else PreparedCapsuleMissCode.SOURCE_TOPOLOGY_CHANGED
         )
         raise PreparedRouteRejected(code) from error
-    _legacy._event(cancel_token)
+    _support._event(cancel_token)
 
 
 __all__ = [

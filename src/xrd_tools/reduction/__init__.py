@@ -60,7 +60,7 @@ __all__ = [
     "MissingNormalizationError",
     "GIAllDummyError",
 ]
-__all__ += ["ReintegratePlan", "ReintegrateProgress", "ReintegrateResult", "ReintegrateRunner", "run_reintegrate"]
+__all__ += ["ReintegratePlan"]
 __all__ += [
     "ReintegrateRecipeMigrationRequired",
     "ReintegrateSuccessorPlan", "ReintegrateSuccessorProgress",
@@ -131,7 +131,7 @@ _STRICTNESS_EXPORTS = {
 
 _BACKGROUND_EXPORTS = {"DisplayBackgroundPlan", "DisplayBackgroundResult", "run_display_background"}
 _BACKGROUND_EXPORTS.update({"FrameBackgroundPlan", "FrameBackgroundResult", "resolve_frame_background"})
-_REINTEGRATE_EXPORTS = {"ReintegratePlan", "ReintegrateProgress", "ReintegrateResult", "ReintegrateRunner", "run_reintegrate"}
+_REINTEGRATE_EXPORTS = {"ReintegratePlan"}
 _REINTEGRATE_SUCCESSOR_EXPORTS = {
     "ReintegrateRecipeMigrationRequired",
     "ReintegrateSuccessorPlan", "ReintegrateSuccessorProgress",
