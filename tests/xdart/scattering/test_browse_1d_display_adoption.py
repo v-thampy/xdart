@@ -552,6 +552,10 @@ def test_single_browse_chi_slice_uses_saved_cake_and_keeps_images(
             page._refresh_shell()
             projection = page._last_scientific_projection
             return projection if (projection is not None and projection.traces
+                # Selected cuts and exact-current heavy preview now have
+                # independent workers. Verify both deliveries, not their order.
+                and projection.heavy is not None
+                and projection.heavy.frame is controller.navigation.current
                 and "@" in projection.traces[0].title) else None
 
         projection = wait_for(sliced)

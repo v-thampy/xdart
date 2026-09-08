@@ -2437,6 +2437,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if transition.notice:
             self._notice(transition.notice)
+            if update.terminal is not None:
+                # Terminal ownership is already qualified by the operation
+                # owner. Controls-only settlement must also retire its footer.
+                self._shell.scientific.reconcile_operation_status(transition.notice)
         progress = transition.reintegrate_progress
         state = self._workspace_operations.reintegrate_state
         if (
@@ -5959,43 +5963,29 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and not self._preferences.slice_enabled
             and not self._preferences.slice_pins
         )
-        browse_current_slice = bool(
+        browse_slices = bool(
             browse_selected
             and intent.processing_mode == "Int 2D"
-            and self._preferences.plot_mode == "Single"
-            and self._preferences.slice_enabled
-            and not self._preferences.slice_pins
-            and navigation.current is not None
-            and navigation.selected == (navigation.current,)
+            and self._preferences.plot_mode in {"Single", "Overlay", "Waterfall"}
+            and (self._preferences.slice_enabled or self._preferences.slice_pins)
         )
+        if not browse_slices:
+            self._context_controller.cancel_browse_slices()
         if skip_scientific_projection:
             payloads = ()
-        elif browse_current_slice:
-            # A single cut needs the saved cake, not the sparse full-1D rows.
-            # Reuse the existing exact-current asynchronous preview; never
-            # hydrate every selected detector frame to draw one slice.
+        elif browse_slices:
+            # Heavy images remain on the exact-current preview lane. Selected
+            # cuts read only saved cakes independently, off the GUI thread.
             preview = (
                 self._context_controller.request_current_browse_preview()
                 if self._release_browse_1d_debt() else None
             )
             payloads = () if preview is None else (preview,)
-            self._scientific_repaint_pending = preview is None
-            if preview is None:
-                cache_adoption_missing = True
-                preserve_scientific = True
-                self._ensure_timer()
-            elif preview.view.intensity_2d is None:
-                # Never pass a native full-range 1-D row off as a 2-D cut.
-                payloads = ()
-                cache_adoption_missing = True
-                cache_terminal_diagnostic = "Selected frame has no saved 2-D data for slicing."
-                self._notice(cache_terminal_diagnostic)
         elif browse_selected and not browse_cache_supported:
             payloads = ()
             cache_adoption_missing = True
             cache_terminal_diagnostic = (
-                "Browse cache display is unavailable for Average/Sum "
-                "and 2-D slice or pin projections."
+                "Browse cache display is unavailable for Average/Sum or this operation."
             )
             preserve_scientific = True
             self._scientific_repaint_pending = False
@@ -6179,6 +6169,27 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             norm_aggregate=self._context_controller.norm_aggregate,
             presentation_background=self._background_owner.projection(),
         )
+        if browse_slices and not skip_scientific_projection:
+            science = projection.scientific
+            cuts = self._context_controller.project_browse_slices(
+                preferences=replace(self._preferences, plot_axis=science.plot_axis),
+                norm_channel=("" if science.norm_channel == "Norm Channel" else science.norm_channel),
+            )
+            pending = cuts is not None and cuts.pending
+            diagnostic = ("Browse slicing is unavailable." if cuts is None
+                          else cuts.diagnostic or ("Loading selected slices…" if pending else ""))
+            self._scientific_repaint_pending = pending
+            if pending:
+                self._ensure_timer()
+            if diagnostic != self._notice_text:
+                self._notice(diagnostic)
+            projection = replace(projection, scientific=replace(
+                science,
+                traces=() if cuts is None else cuts.traces,
+                pinned_traces=() if cuts is None else cuts.pinned_traces,
+                replace_trace_history=True,
+                status=diagnostic,
+            ))
         projection = replace(
             projection,
             scientific=replace(

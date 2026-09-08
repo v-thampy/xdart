@@ -843,6 +843,19 @@ class ContextController:
         except (RuntimeError, TypeError, ValueError):
             return None
 
+    def project_browse_slices(self, *, preferences, norm_channel):
+        owner = self._browse_hydration_owner
+        if self._closed or owner is None:
+            return None
+        return owner.project_slices(
+            self.browse_context, self.selection, self.navigation,
+            preferences=preferences, norm_channel=norm_channel,
+        )
+
+    def cancel_browse_slices(self):
+        if self._browse_hydration_owner is not None:
+            self._browse_hydration_owner.cancel_slices()
+
     def browse_1d_plan_is_current(self, plan: object) -> bool:
         if self._closed:
             return False

@@ -1728,6 +1728,9 @@ class ScientificView(QtWidgets.QFrame):
             self._waterfall_render_contract = None
         else:
             self._rendered_browse_science_contract = None
+        if state.replace_trace_history:
+            self._trace_history_by_identity.clear()
+            self._pinned_trace_by_id.clear()
         live_traces = self._merge_trace_history(state, navigation)
         pinned = self._merge_pinned_trace_history(state)
         rows = (

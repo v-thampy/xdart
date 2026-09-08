@@ -23,6 +23,7 @@ from .browse_values import (
     canonical_browse_source_identity,
 )
 from .browse_1d_hydration import Browse1DHydrationLane
+from .browse_slice_hydration import BrowseSliceLane, BrowseSliceResult
 from .display_runtime import (
     DetectorHydrationOutcome,
     _hydration_locality_protection,
@@ -63,6 +64,7 @@ class _BrowseHydrationOwner:
         self._borrowed_tickets: list[_HydrationTicket] = []
         self._owns_transport = borrowed_transport is None
         self._one_d_lane = Browse1DHydrationLane(browse)
+        self._slice_lane = None
         self.transport = (
             HydrationTransport(
                 self.commit_preview,
@@ -199,6 +201,22 @@ class _BrowseHydrationOwner:
         if not self.names(browse):
             return None
         return self._one_d_lane.submit(selection, frames)
+
+    def project_slices(self, browse, selection, navigation, *, preferences, norm_channel):
+        if not self.names(browse):
+            return None
+        if self._slice_lane is None:
+            try:
+                self._slice_lane = BrowseSliceLane(browse)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                return BrowseSliceResult(diagnostic=f"{type(error).__name__}: {error}"[:512])
+        return self._slice_lane.project(
+            selection, navigation, preferences=preferences, norm_channel=norm_channel,
+        )
+
+    def cancel_slices(self):
+        if self._slice_lane is not None:
+            self._slice_lane.cancel()
 
     def project_1d(
         self,
@@ -343,6 +361,7 @@ class _BrowseHydrationOwner:
 
     def consume_repaint(self) -> bool:
         one_d_repaint = self._one_d_lane.consume_repaint()
+        slice_repaint = self._slice_lane is not None and self._slice_lane.consume_repaint()
         if not self._owns_transport:
             self._observe_borrowed()
         consumed = False
@@ -350,11 +369,12 @@ class _BrowseHydrationOwner:
             try:
                 self._repaints.get_nowait()
             except Empty:
-                return consumed or one_d_repaint
+                return consumed or one_d_repaint or slice_repaint
             consumed = True
 
     def polling_needed(self) -> bool:
-        one_d_pending = self._one_d_lane.polling_needed()
+        one_d_pending = self._one_d_lane.polling_needed() or (
+            self._slice_lane is not None and self._slice_lane.polling_needed())
         if not self._owns_transport:
             # Never the shared worker: unrelated acquisition reads must not
             # keep this page awake.  Only this owner's own outstanding read
@@ -396,6 +416,10 @@ class _BrowseHydrationOwner:
             return BrowseCleanupReceipt(
                 request, CleanupStatus.CLEANUP_PENDING
             )
+        if self._slice_lane is not None and not self._slice_lane.release(
+            preserve_pending_repaint=preserve_pending_repaint,
+        ):
+            return BrowseCleanupReceipt(request, CleanupStatus.CLEANUP_PENDING)
         if not self._one_d_lane.release(
             preserve_pending_repaint=preserve_pending_repaint,
         ):

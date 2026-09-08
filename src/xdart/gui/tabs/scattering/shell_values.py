@@ -532,6 +532,9 @@ class ScientificProjection:
     detector_pending: bool = False
     detector_diagnostic: str = ""
     browse_trace_snapshot: BrowseTraceSnapshot | None = None
+    # Whole detached cut batches replace history, including empty/refused rows.
+    # Acquisition's incremental trace publications keep their existing merge.
+    replace_trace_history: bool = False
 
     def __post_init__(self) -> None:
         if self.detector_mode not in {"thumbnail", "full"}:

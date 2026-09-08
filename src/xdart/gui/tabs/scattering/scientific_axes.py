@@ -159,7 +159,9 @@ def trace_projection(
         # enables a complementary-axis slice. A cake-only axis is projected
         # from the full cake even with slicing disabled.
         selected_from_cake = False
-        if cake_matches and slice_enabled:
+        if slice_enabled:
+            # A full-range native row is never a substitute for a requested
+            # cut when the saved cake is absent or the interval is empty.
             selected = cake
             selected_from_cake = True
         elif cake is not None and (
