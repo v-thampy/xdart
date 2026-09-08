@@ -2853,6 +2853,16 @@ class StandardRunExecutor:
             if run.terminal_emitted:
                 return
             run.terminal_emitted = True
+        if receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING:
+            logger.warning(
+                "[RUN-CLEANUP] output=%s retained=%s light_pending=%s failures=%s",
+                run.artifact,
+                tuple(name for name in ("session", "sink", "output", "source", "resources")
+                      if getattr(run, name) is not None),
+                run.display.light_1d_cleanup_unresolved(),
+                tuple(f"{error.operation}: {error.message}"
+                      for error in receipt.cleanup_failures),
+            )
         detail = (
             receipt.primary.message
             if receipt.primary is not None

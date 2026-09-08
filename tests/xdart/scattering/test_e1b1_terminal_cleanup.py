@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 from threading import Event, Thread
 import time
 from types import SimpleNamespace
@@ -143,6 +144,7 @@ def test_cleanup_failure_cannot_publish_false_finished() -> None:
 def test_construct_cleanup_failure_is_not_reported_cleaned(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog,
 ) -> None:
     source_spec = image_series_spec(tmp_path / "raw_0001.tif")
     configuration = RunIntent(
@@ -183,6 +185,9 @@ def test_construct_cleanup_failure_is_not_reported_cleaned(
     assert terminal.kind is StandardEventKind.FAILED
     assert terminal.cleanup_status is CleanupStatus.CLEANUP_PENDING
     assert source.close_calls == 1
+    assert any("[RUN-CLEANUP]" in row.message
+               and "source.close: source close failed" in row.message
+               for row in caplog.records)
 
 
 @pytest.fixture
@@ -252,10 +257,12 @@ def test_page_does_not_acknowledge_failed_executor_close(
         qapp.processEvents()
 
 
-def test_wrong_shaped_mask_fails_cleanly_and_next_run_can_start(
+@pytest.mark.parametrize("failure", ["mask", "refused-target", "eiger-refused-target", "eiger-nexus-only-refusal"])
+def test_zero_frame_failure_cleans_up_and_next_run_can_start(
     qapp: QtWidgets.QApplication,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure: str,
 ) -> None:
     """A real zero-frame reduction failure settles below the Qt timer."""
 
@@ -281,6 +288,18 @@ def test_wrong_shaped_mask_fails_cleanly_and_next_run_can_start(
     )
     wrong_mask = tmp_path / "wrong-mask.npy"
     np.save(wrong_mask, np.zeros((2, 2), dtype=bool))
+    # The production output policy adds the operation slot to the save stem.
+    target = tmp_path / "failed_int2d.nexus"
+    if failure != "mask":
+        target.write_bytes(b"not a processed result; must not be replaced")
+    before = target.read_bytes() if target.exists() else None
+    real_eiger = failure.startswith("eiger-")
+    if real_eiger:
+        data_root = Path(os.environ.get("XDART_TEST_DATA", "/missing"))
+        raw = data_root / "eiger" / "long" / "eiger_S069Ta_redo_eta2p0_1_scan001_master.h5"
+        poni = data_root / "eiger" / "LaB6_detxn26_detyn6p5_eta4p5.poni"
+        if not raw.is_file() or not poni.is_file():
+            pytest.skip("real 651-frame Eiger input unavailable")
 
     lifecycle = ScatteringCoordinator()
     executor = StandardRunExecutor(join_timeout=2.0)
@@ -288,14 +307,27 @@ def test_wrong_shaped_mask_fails_cleanly_and_next_run_can_start(
         intents=RunIntentStore(RunIntent(
             source_spec=image_series_spec(raw),
             poni_file=str(poni),
-            mask_file=str(wrong_mask),
+            mask_file=str(wrong_mask) if failure == "mask" else "",
             project_root=str(tmp_path),
-            save_path=str(tmp_path / "failed.nxs"),
+            save_path=str(tmp_path / "failed.nexus"),
             output_mode="Overwrite",
             processing_mode="Int 2D",
-            max_cores=1,
-            bai_1d_args={"npt": 16},
-            bai_2d_args={"npt_rad": 16, "npt_azim": 8},
+            max_cores=4 if real_eiger else 1,
+            bai_1d_args={"npt": 1000 if real_eiger else 16},
+            bai_2d_args={"npt_rad": 500 if real_eiger else 16,
+                         "npt_azim": 500 if real_eiger else 8},
+            run_options=({
+                "_post_g2_pipeline_v2": {
+                    "writer_settlement_batch_size": 1,
+                    "nexus_record_batch_size": 8,
+                    "reduction_inflight": 16,
+                    "semantic_checkpoint_frame_cap": 56,
+                    "staging_frame_cap": 64,
+                },
+                "_post_g2_output_diagnostics_v1": {
+                    "save_xye": False, "durable_fsync": False,
+                },
+            } if failure == "eiger-nexus-only-refusal" else {}),
         )),
         lifecycle=lifecycle,
         sources=FilesystemSourceAdapter(),
@@ -338,30 +370,37 @@ def test_wrong_shaped_mask_fails_cleanly_and_next_run_can_start(
         assert wait_for(lambda: any(
             event.kind is StandardEventKind.FAILED
             for event in observed_events
-        ))
+        )), (lifecycle.phase, page._notice_text, page._admission_state,
+             tuple((event.kind, event.detail, event.cleanup_status)
+                   for event in observed_events))
 
         terminal = next(
             event for event in observed_events
             if event.kind is StandardEventKind.FAILED
         )
-        assert terminal.cleanup_status is CleanupStatus.CLEANED
+        assert terminal.cleanup_status is CleanupStatus.CLEANED, terminal
         assert terminal.completed == 0
         assert terminal.primary is not None
-        assert "mask shape" in terminal.primary.message.casefold()
+        expected = "mask shape" if failure == "mask" else "not a current xdart processed result"
+        assert expected in terminal.primary.message.casefold()
+        if before is not None:
+            assert target.read_bytes() == before
         assert lifecycle.phase is RunPhase.FAILED
         assert lifecycle.reset_permitted
         assert shell.run_controls.startButton.isEnabled()
 
         owner = custody["owner"]
         lease = custody["lease"]
-        slot = custody["slot"]
+        slot = custody.get("slot")
         assert owner.light_lease is None
         assert owner.light_slot is None
         assert lease.state is Light1DLeaseState.RELEASED
-        assert slot.state is Light1DCustodyState.CANCELLED
+        if slot is not None:
+            assert slot.state is Light1DCustodyState.CANCELLED
         assert lease.authority.snapshot().reservation_count == 0
         identity = terminal.run_identity
-        assert page._context_controller.run_identity is identity
+        retained_identity = page._context_controller.run_identity
+        assert retained_identity is None or retained_identity is identity
         retirement_results: list[bool] = []
         real_apply_retirement = (
             page._context_controller.apply_display_retirement
@@ -381,7 +420,7 @@ def test_wrong_shaped_mask_fails_cleanly_and_next_run_can_start(
         snapshot = page._intents.snapshot()
         candidate = snapshot.thaw()
         candidate.mask_file = ""
-        candidate.save_path = str(tmp_path / "valid.nxs")
+        candidate.save_path = str(tmp_path / "valid.nexus")
         accepted = page._intents.commit(
             candidate, expected_revision=snapshot.revision,
         )
