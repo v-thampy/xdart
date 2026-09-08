@@ -987,7 +987,9 @@ class ScientificView(QtWidgets.QFrame):
                         log_scale=state.log_scale,
                     )
                     if state.heavy.detector_source != "full" and (
-                        not raw_matches
+                        # Thumbnail replacement overwrites the existing image;
+                        # a source-kind transition still scrubs full buffers.
+                        (not raw_matches and state.heavy.detector_source != "thumbnail")
                         or self._rendered_detector_source
                         != state.heavy.detector_source
                     ):
