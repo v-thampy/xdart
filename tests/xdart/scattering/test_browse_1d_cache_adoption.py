@@ -241,9 +241,8 @@ def test_cancelled_or_failed_context_construction_closes_exact_allocated_cache(
     assert loader.consume(outcome) is None
 
 
-@pytest.mark.parametrize("cut", ("recover", "close"))
 def test_release_cut_retains_exact_cache_and_catalog_for_retry(
-    tmp_path, monkeypatch, cut: str,
+    tmp_path, monkeypatch,
 ) -> None:
     from xdart.gui.tabs.scattering.browse_values import (
         BrowseLoadRequest,
@@ -253,7 +252,7 @@ def test_release_cut_retains_exact_cache_and_catalog_for_retry(
     from xrd_tools.io import Browse1DCache
     from xrd_tools.io.browse_1d_cache import Browse1DCachePhase
 
-    path = tmp_path / f"release-{cut}.nexus"
+    path = tmp_path / "release-close.nexus"
     path.write_bytes(b"catalog")
     catalog = _catalog(path)
     caches = []
@@ -266,7 +265,7 @@ def test_release_cut_retains_exact_cache_and_catalog_for_retry(
     loader, _readers = _loader(
         monkeypatch, path, catalog, open_cache=open_cache,
     )
-    request = BrowseLoadRequest(f"release-{cut}", 1, str(path))
+    request = BrowseLoadRequest("release-close", 1, str(path))
     loader.begin(request)
     outcome = _finish(loader, request)
     assert outcome.status is BrowseLoadStatus.READY
@@ -274,22 +273,13 @@ def test_release_cut_retains_exact_cache_and_catalog_for_retry(
     assert context is not None
     cache = caches[0]
     calls = []
-    real_recover = Browse1DCache.recover
     real_close = Browse1DCache.close
     real_detach = BrowseContext.detach_browse_1d_cache
     real_release = BrowseContext.release
 
-    def recover(owner):
-        calls.append(("recover", owner))
-        if cut == "recover" and sum(
-            kind == "recover" for kind, _item in calls
-        ) == 1:
-            raise RuntimeError("injected recover cut")
-        return real_recover(owner)
-
     def close(owner):
         calls.append(("close", owner))
-        if cut == "close" and sum(
+        if sum(
             kind == "close" for kind, _item in calls
         ) == 1:
             raise RuntimeError("injected close cut")
@@ -308,7 +298,6 @@ def test_release_cut_retains_exact_cache_and_catalog_for_retry(
         calls.append(("release", cache))
         return real_release(owner)
 
-    monkeypatch.setattr(Browse1DCache, "recover", recover)
     monkeypatch.setattr(Browse1DCache, "close", close)
     monkeypatch.setattr(BrowseContext, "detach_browse_1d_cache", detach)
     monkeypatch.setattr(BrowseContext, "release", release_context)

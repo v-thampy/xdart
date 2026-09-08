@@ -4,21 +4,17 @@ The utility is deliberately independent of HDF5 and GUI packages. It counts
 the ultimate buffer owner, not the size of an arbitrarily small NumPy view,
 and keeps that owner alive for every committed semantic reference.
 
-The byte limit applies to the final committed set of unique physical roots.
-An exchange stages incoming allocations outside the authority while its old
-roots remain live, so transient process ownership can approach old plus new
-(roughly twice the configured limit). Authority accounting describes only the
-published graph and never claims that staging overlap is a hard-memory cap.
+Reservations admit the final unique-root set against the byte limit. Callers
+must release evicted roots before reserving replacement capacity.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from threading import RLock, local
+from threading import RLock
 from types import MappingProxyType
 from typing import Hashable, Mapping
-from weakref import ReferenceType, ref
 
 import numpy as np
 
@@ -64,8 +60,6 @@ def physical_root_fact(value: object) -> PhysicalRootFact:
 class _GatePhase(Enum):
     BASE = "base"
     LEGACY = "legacy"
-    STAGED = "staged"
-    COMMIT_PENDING = "commit-pending"
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -100,7 +94,6 @@ class _AuthorityState:
     gate: object | None
     phase: _GatePhase
     closed: bool
-    terminal_evidence: tuple[ReferenceType[_TerminalMarker], ...]
 
 
 def _indexed_state(
@@ -109,7 +102,6 @@ def _indexed_state(
     gate: object | None,
     phase: _GatePhase,
     closed: bool,
-    terminal_evidence: tuple[ReferenceType[_TerminalMarker], ...],
 ) -> _AuthorityState:
     """Build one callback-free immutable index for an authority graph."""
 
@@ -149,7 +141,6 @@ def _indexed_state(
         gate,
         phase,
         closed,
-        terminal_evidence,
     )
 
 
@@ -159,7 +150,6 @@ def _state_with_graph(
     gate: object | None,
     phase: _GatePhase,
     closed: bool | None = None,
-    terminal_evidence: tuple[ReferenceType[_TerminalMarker], ...] | None = None,
 ) -> _AuthorityState:
     """Reuse one exact immutable graph while changing only shell state."""
 
@@ -173,45 +163,13 @@ def _state_with_graph(
         gate,
         phase,
         state.closed if closed is None else closed,
-        (
-            state.terminal_evidence
-            if terminal_evidence is None
-            else terminal_evidence
-        ),
     )
 
 
-def _is_exchange_gate(state: _AuthorityState) -> bool:
-    return state.phase in {_GatePhase.STAGED, _GatePhase.COMMIT_PENDING}
 
 
-def _has_terminal_marker(
-    state: _AuthorityState, marker: _TerminalMarker,
-) -> bool:
-    return any(marker_ref() is marker for marker_ref in state.terminal_evidence)
 
 
-def _terminal_evidence_with(
-    state: _AuthorityState, marker: _TerminalMarker,
-) -> tuple[ReferenceType[_TerminalMarker], ...]:
-    """Prune dead evidence and append ``marker`` using identity only."""
-
-    refs: list[ReferenceType[_TerminalMarker]] = []
-    live: list[_TerminalMarker] = []
-    marker_present = False
-    for marker_ref in state.terminal_evidence:
-        candidate = marker_ref()
-        if candidate is None:
-            continue
-        if any(candidate is prior for prior in live):
-            continue
-        live.append(candidate)
-        refs.append(marker_ref)
-        if candidate is marker:
-            marker_present = True
-    if not marker_present:
-        refs.append(ref(marker))
-    return tuple(refs)
 
 
 def _root_entry(
@@ -450,7 +408,6 @@ def _replacement_state(
         gate,
         phase,
         state.closed,
-        state.terminal_evidence,
     )
 
 
@@ -629,7 +586,7 @@ class PhysicalRootAuthority:
             raise TypeError("physical-root limit must be a nonnegative integer")
         self._limit = limit_bytes
         self._state = _indexed_state(
-            (), (), None, _GatePhase.BASE, False, (),
+            (), (), None, _GatePhase.BASE, False,
         )
         self._lock = RLock()
 
@@ -657,24 +614,12 @@ class PhysicalRootAuthority:
 
     def _accounting_state(self) -> _AuthorityState:
         state = self._snapshot_state()
-        if _is_exchange_gate(state):
-            raise RuntimeError("physical-root authority accounting is busy")
         return state
 
     def _snapshot_state(self) -> _AuthorityState:
         with self._lock:
             return self._state
 
-    def _swap_state(
-        self, expected: _AuthorityState, replacement: _AuthorityState,
-    ) -> bool:
-        """Exact identity CAS containing no user callbacks."""
-
-        with self._lock:
-            if self._state is not expected:
-                return False
-            self._state = replacement
-            return True
 
     def reserve(self) -> PhysicalRootReservation:
         operation = object()
@@ -693,8 +638,6 @@ class PhysicalRootAuthority:
     def _cancel_reservation(self, operation: object | None = None) -> None:
         with self._lock:
             state = self._state
-            if _is_exchange_gate(state):
-                raise RuntimeError("physical-root authority is busy")
             if state.gate is None:
                 return
             if state.phase is not _GatePhase.LEGACY:
@@ -716,8 +659,6 @@ class PhysicalRootAuthority:
                 state = self._state
                 if state.closed:
                     raise RuntimeError("physical-root authority is closed")
-                if _is_exchange_gate(state):
-                    raise RuntimeError("physical-root authority is busy")
                 if state.phase is not _GatePhase.LEGACY:
                     raise RuntimeError("physical-root reservation is not active")
                 if operation is not None and state.gate is not operation:
@@ -738,8 +679,6 @@ class PhysicalRootAuthority:
         while True:
             with self._lock:
                 state = self._state
-                if _is_exchange_gate(state):
-                    raise RuntimeError("physical-root authority is busy")
                 if state.phase is not _GatePhase.LEGACY:
                     raise RuntimeError("physical-root reservation is not active")
                 if operation is not None and state.gate is not operation:
@@ -781,9 +720,6 @@ class PhysicalRootAuthority:
         while True:
             with self._lock:
                 state = self._state
-                # Busy is checked before token liveness.
-                if _is_exchange_gate(state):
-                    raise RuntimeError("physical-root authority is busy")
             binding: _SemanticBinding | None = None
             candidate = _binding_for_token(state, token)
             if candidate is not None and candidate.semantic is semantic:
@@ -809,7 +745,6 @@ class PhysicalRootAuthority:
                     )
             replacement = _indexed_state(
                 tuple(roots), bindings, state.gate, state.phase, state.closed,
-                state.terminal_evidence,
             )
             with self._lock:
                 if self._state is state:
@@ -820,13 +755,10 @@ class PhysicalRootAuthority:
         old_state: _AuthorityState
         with self._lock:
             old_state = self._state
-            if _is_exchange_gate(old_state):
-                raise RuntimeError("physical-root authority is busy")
             if old_state.closed:
                 return
             self._state = _indexed_state(
                 (), (), None, _GatePhase.BASE, True,
-                old_state.terminal_evidence,
             )
         # Keep the losing state strong through lock exit so arbitrary root or
         # semantic destructors cannot run in the pointer-swap critical section.
