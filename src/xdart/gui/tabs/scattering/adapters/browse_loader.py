@@ -78,7 +78,7 @@ class _BrowseOperation:
 
 
 class BrowseLoader:
-    """Own one active operation and at most one exact queued replacement."""
+    """Own one active operation and the latest never-started replacement."""
 
     def __init__(
         self,
@@ -373,10 +373,13 @@ class BrowseLoader:
                     return request
                 if queued.cancelled.is_set():
                     raise RuntimeError("browse cleanup remains pending")
-                raise RuntimeError(
-                    "browse loader already owns one queued replacement"
+                # Queued operations have no worker, reader, cache or context.
+                # Supersede only this intent; the active operation retains all
+                # real cleanup until _progress can launch the latest selection.
+                self._queued = _BrowseOperation(
+                    request, Event(), self._perf_requested()
                 )
-            if operation is None:
+            elif operation is None:
                 launch = True
             elif operation.request is request:
                 if operation.cancelled.is_set():
