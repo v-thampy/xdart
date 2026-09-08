@@ -1,7 +1,7 @@
 """Values-only owner for the selected-control accent preference.
 
 The ordinary theme accent still owns focus rings, progress, tabs, and tool
-hover.  This preference deliberately affects selected toggles only.
+hover.  This preference affects selected toggles and input text selections.
 """
 
 from __future__ import annotations

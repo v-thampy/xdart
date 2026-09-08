@@ -329,7 +329,8 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit, QPlainTextEdit {
     border: 1px solid $field_border;
     border-radius: 5px;
     padding: $field_padding;
-    selection-background-color: $field_border;
+    selection-background-color: $selection_accent;
+    selection-color: $selection_accent_on_text;
 }
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
 QComboBox:focus, QTextEdit:focus, QPlainTextEdit:focus {
