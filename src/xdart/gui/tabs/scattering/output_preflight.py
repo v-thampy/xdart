@@ -38,13 +38,12 @@ from xrd_tools.sources.selection import DirectorySourceSpec
 from xrd_tools.sources.execution_graph import (
     _CapturedSourceTopology,
     _capture_source_topology,
-    _external_members,
     _same_source_revision,
-    _selected_dependency_files,
     _source_state_key,
     _topology_from_captured_state,
     _verify_source_states,
     PreparedSourceExecutionGraph,
+    SelectedContainerInput,
     SourceRevisionChanged,
     freeze_source_execution_graph,
     qualify_source_execution_graph,
@@ -1753,33 +1752,30 @@ def _execution_tiff_source(
     )
 
 
+def _qualify_for_admission(
+    source: SourceSpec,
+    *,
+    selected_motor: str | None = None,
+    selected_container: SelectedContainerInput | None = None,
+    cancelled: Callable[[], bool],
+) -> PreparedSourceExecutionGraph:
+    try:
+        return qualify_source_execution_graph(
+            source, selected_motor=selected_motor,
+            selected_container=selected_container, cancelled=cancelled,
+        )
+    except InterruptedError as error:
+        if error.args != ("source qualification cancelled",):
+            raise
+        raise RuntimeError("admission cancelled") from error
+
+
 def _series_item(
     configuration: FrozenRunConfiguration | OutputCandidate, source: SourceSpec,
     *,
     cancelled: Callable[[], bool] = _not_cancelled,
 ) -> PlannedOutput:
-    if source.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
-        return _container_item(configuration, source, cancelled=cancelled)
-    graph = qualify_source_execution_graph(
-        source, selected_motor=_selected_tiff_gi_motor(configuration),
-        cancelled=cancelled,
-    )
-    return PlannedOutput(graph.execution_source, Path(graph.source_path),
-        _resolved_generated_target(
-            configuration.save_path, graph.group_key,
-            _run_output_slot(configuration),
-        ),
-        graph.stamp, descriptor=graph.descriptor, motor_names=graph.motor_names,
-        artifact_family=_run_artifact_family(configuration, graph.group_key))
-
-
-def _container_item(
-    configuration: FrozenRunConfiguration | OutputCandidate,
-    source: SourceSpec,
-    *,
-    cancelled: Callable[[], bool] = _not_cancelled,
-) -> PlannedOutput:
-    graph = qualify_source_execution_graph(
+    graph = _qualify_for_admission(
         source, selected_motor=_selected_tiff_gi_motor(configuration),
         cancelled=cancelled,
     )
@@ -1925,39 +1921,12 @@ def _directory_items(
                 candidate.path, descriptor.kind,
                 entry=descriptor.resolved_entry or descriptor.requested_entry,
             )
-            try:
-                external_members = _external_members(
-                    candidate.path,
-                    state,
-                    descriptor,
-                    cancelled=cancelled,
-                )
-            except OSError as error:
-                # Deferred materialization owns the accepted strong-state set.
-                # Preserve this as a hard read failure here; its outer
-                # classifier upgrades it to SourceRevisionChanged only when
-                # exact master/member revalidation proves drift.
-                raise ValueError(
-                    "external source members could not be inspected: "
-                    f"{candidate.path}: {error}"
-                ) from error
-            dependency_files = _selected_dependency_files(
-                candidate.path,
-                state,
-                descriptor,
-                external_members,
+            graph = _qualify_for_admission(
+                spec,
+                selected_container=SelectedContainerInput(
+                    state, candidate.adapter_id, descriptor,
+                ),
                 cancelled=cancelled,
-            )
-            if cancelled():
-                raise RuntimeError("admission cancelled")
-            graph = freeze_source_execution_graph(
-                spec, spec, source_path=candidate.path, group_key=name,
-                file=state, adapter_id=candidate.adapter_id,
-                frame_count=descriptor.frame_count, first_label=0,
-                detector_shape=tuple(descriptor.frame_shape),
-                native_dtype=np.dtype(descriptor.dtype).str,
-                descriptor=descriptor, external_members=external_members,
-                dependency_files=dependency_files, motor_names=descriptor.motor_names,
             )
         spec, stamp, descriptor, motor_names = (
             graph.execution_source, graph.stamp, graph.descriptor, graph.motor_names,

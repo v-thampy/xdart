@@ -135,6 +135,33 @@ class SourceFileState:
 
 
 @dataclass(frozen=True, slots=True)
+class SelectedContainerInput:
+    """Already-admitted facts for one directory-selected container."""
+
+    file: SourceFileState
+    adapter_id: str
+    descriptor: ContainerDescriptor
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.file) is not SourceFileState
+            or type(self.adapter_id) is not str
+            or not self.adapter_id
+            or type(self.descriptor) is not ContainerDescriptor
+        ):
+            raise TypeError("selected container input requires exact admitted facts")
+        # Direct adapter probes leave identity binding to their caller, just
+        # as DirectoryIndex does. Bind only that missing identity; all probed
+        # layout, readiness and revision facts remain exact.
+        if self.descriptor.adapter_id is None:
+            object.__setattr__(self, "descriptor", replace(
+                self.descriptor, adapter_id=self.adapter_id,
+            ))
+        elif self.descriptor.adapter_id != self.adapter_id:
+            raise ValueError("selected container descriptor has a different adapter")
+
+
+@dataclass(frozen=True, slots=True)
 class _CapturedSourceTopology:
     """Private pre-stamp owner of one lexical source binding."""
 
@@ -670,7 +697,8 @@ def _drain_qualification(handle: Any, slot: Any) -> bool:
 
 def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader_binding: str | None,
                        cancelled: Callable[[], bool] | None,
-                       expected: PreparedSourceExecutionGraph | None = None) -> PreparedSourceExecutionGraph | None:
+                       expected: PreparedSourceExecutionGraph | None = None,
+                       selected: SelectedContainerInput | None = None) -> PreparedSourceExecutionGraph | None:
     from xrd_tools.io.bluesky_nexus import resolve_nxentry, validate_average_container_metadata_inputs
     from xrd_tools.io.nexus import _NexusDatasetOwnerSlot, _ResolvedNexusStack
     from xrd_tools.sources.adapters import candidate_owner
@@ -680,6 +708,12 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
     while True:
         before = SourceFileState.capture(path); _cancelled(cancelled)
         owner = None if reader_binding else candidate_owner(path); owner_id = None if owner is None else owner.id
+        if selected is not None and (
+            before != selected.file
+            or _path_key(_resolved(before)) != _path_key(_resolved(selected.file))
+            or owner_id != selected.adapter_id
+        ):
+            raise SourceRevisionChanged("selected container changed before qualification")
         handle = _HDF5_FILE_OPEN(path, "r", **({"rdcc_nbytes": 1 << 20} if reader_binding else {}))
         slot = _NexusDatasetOwnerSlot(); error = None; descriptor = None
         external_members: list[ExternalSourceState] = []; dependencies: list[SourceFileState] = []
@@ -725,12 +759,26 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
             if descriptor.state is not ProbeState.READY or descriptor.kind is SourceKind.PROCESSED_NEXUS \
                     or descriptor.frame_count < 1 or descriptor.dataset_path is None:
                 raise ValueError("container is not a READY raw detector source")
-            _capture_bound_container_dependencies(binding, descriptor, before, cancelled=cancelled,
-                emit_external=emit_external, emit_dependency=emit_dependency)
+            if selected is not None and descriptor != selected.descriptor:
+                raise SourceRevisionChanged("selected container descriptor changed during qualification")
+            if reader_binding:
+                # Average's bounded reader retains its one captured binding.
+                _capture_bound_container_dependencies(binding, descriptor, before, cancelled=cancelled,
+                    emit_external=emit_external, emit_dependency=emit_dependency)
+            else:
+                is_cancelled = _not_cancelled if cancelled is None else cancelled
+                for member in _external_members(path, before, descriptor, cancelled=is_cancelled):
+                    emit_external(member)
+                for dependency in _selected_dependency_files(
+                    path, before, descriptor, tuple(external_members), cancelled=is_cancelled,
+                ):
+                    emit_dependency(dependency)
         except BaseException as caught: error = caught
 
         def complete() -> PreparedSourceExecutionGraph | None:
             if error is not None:
+                if isinstance(error, RuntimeError) and error.args == ("admission cancelled",):
+                    raise InterruptedError("source qualification cancelled") from error
                 if isinstance(error, KeyError) and error.args == ("captured entry has no detector dataset",):
                     raise ValueError("container has no detector dataset") from error
                 raise error
@@ -778,15 +826,23 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
         return complete()
 def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | None = None,
         reader_binding: str | None = None,
+        selected_container: SelectedContainerInput | None = None,
         cancelled: Callable[[], bool] | None = None) -> PreparedSourceExecutionGraph:
     if type(source) is not SourceSpec: raise TypeError("source must be an exact SourceSpec")
     if reader_binding not in (None, "average_closed_v1"): raise ValueError("source reader binding is unsupported")
+    if selected_container is not None and (
+        type(selected_container) is not SelectedContainerInput
+        or reader_binding is not None
+        or source.kind not in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER)
+    ):
+        raise TypeError("selected container facts require ordinary container qualification")
     if source.kind is SourceKind.TIFF_SERIES:
         return _qualify_tiff(source, selected_motor=selected_motor,
             reader_binding=reader_binding, cancelled=cancelled)
     if source.kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER):
         return _qualify_container(source, selected_motor=selected_motor,
-                                  reader_binding=reader_binding, cancelled=cancelled)
+                                  reader_binding=reader_binding, cancelled=cancelled,
+                                  selected=selected_container)
     raise ValueError(f"source kind {source.kind.value} is unsupported for Average")
 def requalify_source_execution_graph(source: SourceSpec, expected: PreparedSourceExecutionGraph,
         *, selected_motor: str | None = None, reader_binding: str | None = None,
@@ -1970,7 +2026,7 @@ def open_source_execution_graph(value: PreparedSourceExecutionGraph, *,
 __all__ = [
     "AdmittedMetadataSource", "AdmittedMotorValue", "CanonicalSourceTarget",
     "ExternalSourceState", "PreparedSourceExecutionGraph", "SourceAliasBinding",
-    "SourceCleanupFailed", "SourceCleanupPending",
+    "SelectedContainerInput", "SourceCleanupFailed", "SourceCleanupPending",
     "SourceExecutionIdentityV1", "SourceExecutionStamp", "SourceFileState",
     "SourceRevisionChanged", "append_source_from_execution_graph",
     "freeze_source_execution_graph", "open_source_execution_graph",

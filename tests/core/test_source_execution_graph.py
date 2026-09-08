@@ -138,6 +138,32 @@ def test_selected_link_owner_selector_preserves_terminal_external_chain(tmp_path
     assert selector == "/detector/pixels"
 
 
+@pytest.mark.parametrize("changed", (None, "file", "descriptor"))
+def test_selected_container_keeps_admitted_revision_and_descriptor(tmp_path, changed):
+    from xrd_tools.sources.adapters import candidate_owner
+
+    path = _container(tmp_path / "selected.nexus")
+    owner = candidate_owner(path)
+    state = graph.SourceFileState.capture(path)
+    descriptor = owner.probe(path).descriptor
+    assert descriptor.adapter_id is None  # Direct probes have no index binding.
+    if changed == "descriptor":
+        descriptor = replace(descriptor, frame_count=descriptor.frame_count + 1)
+    selected = graph.SelectedContainerInput(state, owner.id, descriptor)
+    source = SourceSpec(path, descriptor.kind, entry=descriptor.resolved_entry)
+    if changed == "file":
+        with h5py.File(path, "r+") as handle:
+            handle.attrs["revision"] = "changed"
+    if changed is not None:
+        with pytest.raises(graph.SourceRevisionChanged, match="selected container"):
+            graph.qualify_source_execution_graph(source, selected_container=selected)
+        return
+    result = graph.qualify_source_execution_graph(source, selected_container=selected)
+    assert result.stamp.file == state
+    assert result.descriptor == replace(descriptor, adapter_id=owner.id)
+    graph.validate_source_execution_graph(result)
+
+
 def test_selected_link_owner_selector_uses_captured_entry_without_root_lookup(
     tmp_path, monkeypatch,
 ):

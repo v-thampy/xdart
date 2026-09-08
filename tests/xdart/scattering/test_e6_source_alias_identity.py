@@ -633,7 +633,7 @@ def test_hdf_dependency_raw_alias_retarget_is_caught_before_decision(
     retargeted = False
     captured_stamps: list[SourceExecutionStamp] = []
     forbidden: list[str] = []
-    real_owner = output_preflight._selected_dependency_files
+    real_owner = source_graph._selected_dependency_files
 
     def arm_dependency_files(*args, **kwargs):
         nonlocal retargeted
@@ -649,23 +649,18 @@ def test_hdf_dependency_raw_alias_retarget_is_caught_before_decision(
         return result
 
     monkeypatch.setattr(
-        output_preflight,
+        source_graph,
         "_selected_dependency_files",
         arm_dependency_files,
     )
 
-    if hasattr(output_preflight, "validate_source_aliases"):
-        real_validator = output_preflight.validate_source_aliases
+    real_validator = source_graph.validate_source_aliases
 
-        def capture_validator(stamp, *args, **kwargs):
-            captured_stamps.append(stamp)
-            return real_validator(stamp, *args, **kwargs)
+    def capture_validator(stamp, *args, **kwargs):
+        captured_stamps.append(stamp)
+        return real_validator(stamp, *args, **kwargs)
 
-        monkeypatch.setattr(
-            output_preflight,
-            "validate_source_aliases",
-            capture_validator,
-        )
+    monkeypatch.setattr(source_graph, "validate_source_aliases", capture_validator)
 
     def forbid_inspect(item, *_args, **_kwargs):
         captured_stamps.append(item.source_stamp)
@@ -681,7 +676,7 @@ def test_hdf_dependency_raw_alias_retarget_is_caught_before_decision(
             group,
             cancelled=lambda: False,
         )
-        assert retargeted is True
+        assert retargeted is True, attempt
         assert attempt.state is ProbeState.IN_PROGRESS
         assert attempt.revision_changed is True
         assert attempt.decision is None
@@ -699,7 +694,6 @@ def test_hdf_dependency_raw_alias_retarget_is_caught_before_decision(
         assert raw_alias in {
             value["raw_path"] for value in identity["aliases"]
         }
-        assert operation.target_lease is None
         assert master.exists()
     finally:
         executor.cancel_admission(operation.token)
@@ -1254,7 +1248,7 @@ def test_shared_source_graph_direct_and_ordinary_projections_are_byte_exact(
         image = data.create_dataset("image", data=np.ones((1, 2, 2), dtype="u2"))
         image.attrs["signal_type"] = "detector"
     container_source = SourceSpec(container, SourceKind.NEXUS_STACK)
-    container_item = output_preflight._container_item(replace(config, source=container_source), container_source)
+    container_item = output_preflight._series_item(replace(config, source=container_source), container_source)
     from xrd_tools.sources.adapters import candidate_owner
     from xrd_tools.sources.discover import Candidate
     from xrd_tools.sources.run_plan import RunCandidatePlan

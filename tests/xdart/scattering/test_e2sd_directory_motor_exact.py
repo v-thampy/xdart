@@ -1256,7 +1256,7 @@ def test_external_member_capture_uses_dataset_owner_and_all_segment_offsets(
     tmp_path: Path, layout: str,
 ) -> None:
     """Capture contract only: these descriptors do not test adapter selection."""
-    from xdart.gui.tabs.scattering.output_preflight import _external_members
+    from xrd_tools.sources.execution_graph import _external_members
     from xrd_tools.sources.descriptor import ContainerDescriptor
 
     master, sidecar = tmp_path / "master.h5", tmp_path / "pixels.h5"
