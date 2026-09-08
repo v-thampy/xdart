@@ -664,6 +664,27 @@ def test_run_enablement_binds_exact_current_form_fingerprint(qapp, tmp_path):
         dialog.shutdown()
 
 
+@pytest.mark.parametrize("message", (
+    "analysis artifact published; verification remains pending",
+    "analysis artifact document close remains pending",
+))
+def test_finalization_notice_preserves_actual_publication_state(qapp, message):
+    dialog, _owner, _status = _dialog(qapp)
+    try:
+        dialog._accept_update(RSMOwnerUpdate(
+            OperationIdentity(1, object()), RSMOwnerAction.RUN,
+            terminal_status=OperationTerminalStatus.RETURNED,
+            outcome=RSMOwnerOutcome(
+                RSMOwnerOutcomeKind.CLEANUP_PENDING,
+                finalization_message=message,
+            ),
+        ))
+        assert message in dialog.status_label.text()
+        assert dialog.retry_cleanup_button.text() == "Retry Finalization"
+    finally:
+        dialog.shutdown()
+
+
 def test_progress_refusal_pending_and_stale_commit_never_paint(qapp, monkeypatch):
     from xdart.gui.tools import rsm_owner, rsm_tool
 

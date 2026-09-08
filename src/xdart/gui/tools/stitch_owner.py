@@ -55,10 +55,12 @@ class StitchOwnerOutcome:
     kind: StitchOwnerOutcomeKind
     preflight: StitchToolPreflight | None = None
     result: StitchOperationResult | None = None
+    finalization_message: str = ""
 
     def __post_init__(self) -> None:
         if (
             type(self.kind) is not StitchOwnerOutcomeKind
+            or type(self.finalization_message) is not str
             or (self.preflight is not None and type(self.preflight) is not StitchToolPreflight)
             or (self.result is not None and type(self.result) is not StitchOperationResult)
             or (
@@ -468,7 +470,10 @@ class StitchToolOwner:
         except StitchOperationCleanupPending as error:
             if error.execution is not execution:
                 raise RuntimeError("cleanup exception changed Stitch execution owner")
-            return StitchOwnerOutcome(StitchOwnerOutcomeKind.CLEANUP_PENDING)
+            return StitchOwnerOutcome(
+                StitchOwnerOutcomeKind.CLEANUP_PENDING,
+                finalization_message=str(error),
+            )
         except StitchOperationVerificationError as error:
             if error.execution is not execution:
                 raise RuntimeError(

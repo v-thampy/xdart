@@ -492,7 +492,7 @@ class RSMToolDialog(QtWidgets.QDialog):
         self.run_button.setObjectName("rsmRun")
         self.cancel_button = QtWidgets.QPushButton("Cancel")
         self.cancel_button.setObjectName("rsmCancel")
-        self.retry_cleanup_button = QtWidgets.QPushButton("Retry Cleanup")
+        self.retry_cleanup_button = QtWidgets.QPushButton("Retry Finalization")
         self.retry_cleanup_button.setObjectName("rsmRetryCleanup")
         self.retry_verification_button = QtWidgets.QPushButton("Retry Verification")
         self.retry_verification_button.setObjectName("rsmRetryVerification")
@@ -1026,7 +1026,7 @@ class RSMToolDialog(QtWidgets.QDialog):
             return
         self._begin_polling(
             RSMOwnerAction.RETRY_CLEANUP,
-            "Retrying cleanup only…",
+            "Retrying finalization; science will not rerun…",
             form_revision=self._execution_form_revision,
         )
 
@@ -1127,7 +1127,8 @@ class RSMToolDialog(QtWidgets.QDialog):
             )
             return
         if outcome.kind is RSMOwnerOutcomeKind.CLEANUP_PENDING:
-            self._notice("Output cleanup needs retry; science will not rerun")
+            message = outcome.finalization_message or "Output finalization needs retry"
+            self._notice(f"{message}; use Retry Finalization. Science will not rerun")
             return
         if outcome.kind is RSMOwnerOutcomeKind.VERIFICATION_PENDING:
             self._notice("Output committed; strict reload needs verification retry")
@@ -1148,9 +1149,9 @@ class RSMToolDialog(QtWidgets.QDialog):
                 f"Committed {Path(result.request.module.output.target).name}"
             )
         elif terminal.disposition is ModuleDisposition.CANCELLED:
-            self.status_label.setText("RSM cancelled")
+            self._notice("RSM cancelled" + (f" · {terminal.diagnostic}" if terminal.diagnostic else ""))
         elif terminal.disposition is ModuleDisposition.REFUSED:
-            self._notice(f"RSM refused: {terminal.code}")
+            self._notice(f"RSM refused: {terminal.code}" + (f" · {terminal.diagnostic}" if terminal.diagnostic else ""))
         else:
             self._notice(
                 f"RSM failed: {terminal.code}"

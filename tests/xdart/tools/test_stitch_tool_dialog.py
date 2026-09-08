@@ -86,6 +86,27 @@ def _dialog(qapp):
     return dialog, owner, status
 
 
+@pytest.mark.parametrize("message", (
+    "analysis artifact published; verification remains pending",
+    "analysis artifact document close remains pending",
+))
+def test_finalization_notice_preserves_actual_publication_state(qapp, message):
+    dialog, _owner, _status = _dialog(qapp)
+    try:
+        dialog._accept_update(StitchOwnerUpdate(
+            OperationIdentity(1, object()), StitchOwnerAction.RUN,
+            terminal_status=OperationTerminalStatus.RETURNED,
+            outcome=StitchOwnerOutcome(
+                StitchOwnerOutcomeKind.CLEANUP_PENDING,
+                finalization_message=message,
+            ),
+        ))
+        assert message in dialog.status_label.text()
+        assert dialog.retry_cleanup_button.text() == "Retry Finalization"
+    finally:
+        dialog.shutdown()
+
+
 def _fill_form(dialog, tmp_path):
     dialog.project_edit.setText(str(tmp_path))
     dialog.source_widget.set_uri(tmp_path / "extensionless_spec")

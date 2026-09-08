@@ -293,7 +293,7 @@ class StitchToolDialog(QtWidgets.QDialog):
         self.run_button.setObjectName("stitchRun")
         self.cancel_button = QtWidgets.QPushButton("Cancel")
         self.cancel_button.setObjectName("stitchCancel")
-        self.retry_cleanup_button = QtWidgets.QPushButton("Retry Cleanup")
+        self.retry_cleanup_button = QtWidgets.QPushButton("Retry Finalization")
         self.retry_cleanup_button.setObjectName("stitchRetryCleanup")
         self.retry_verification_button = QtWidgets.QPushButton(
             "Retry Verification"
@@ -669,7 +669,7 @@ class StitchToolDialog(QtWidgets.QDialog):
             return
         self._begin_polling(
             StitchOwnerAction.RETRY_CLEANUP,
-            "Retrying cleanup only…",
+            "Retrying finalization; science will not rerun…",
             form_revision=self._execution_form_revision,
         )
 
@@ -766,7 +766,8 @@ class StitchToolDialog(QtWidgets.QDialog):
             )
             return
         if outcome.kind is StitchOwnerOutcomeKind.CLEANUP_PENDING:
-            self._notice("Output finalization needs cleanup retry; science will not rerun")
+            message = outcome.finalization_message or "Output finalization needs retry"
+            self._notice(f"{message}; use Retry Finalization. Science will not rerun")
             return
         if outcome.kind is StitchOwnerOutcomeKind.VERIFICATION_PENDING:
             self._notice("Output committed; strict reload needs verification retry")
@@ -790,9 +791,9 @@ class StitchToolDialog(QtWidgets.QDialog):
                 f"Committed {Path(result.request.module.output.target).name}"
             )
         elif terminal.disposition is ModuleDisposition.CANCELLED:
-            self.status_label.setText("Stitch cancelled")
+            self._notice("Stitch cancelled" + (f" · {terminal.diagnostic}" if terminal.diagnostic else ""))
         elif terminal.disposition is ModuleDisposition.REFUSED:
-            self._notice(f"Stitch refused: {terminal.code}")
+            self._notice(f"Stitch refused: {terminal.code}" + (f" · {terminal.diagnostic}" if terminal.diagnostic else ""))
         else:
             self._notice(
                 f"Stitch failed: {terminal.code}"

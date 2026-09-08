@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from threading import Event
 import time
 
+import numpy as np
 import pytest
 
 from xdart.gui.pages.operation_owner import OperationTerminalStatus
@@ -190,6 +192,37 @@ def test_latest_progress_and_cleanup_retry_never_replay_science(
     assert completed.outcome.result is owner.last_result
     assert owner.finalization is StitchOwnerFinalization.NONE
     assert calls == ["run", "retry-cleanup"]
+    assert owner.close().status is PageCleanup.CLEAN
+
+
+def test_published_inspection_failure_reaches_owner_with_publication_truth(monkeypatch, preflight):
+    from xrd_tools.io import analysis_artifact
+
+    # The form fixture uses tiny raw files for preflight-only tests. Execute
+    # with the actual Pilatus100k shape required by its captured geometry.
+    for path in Path(preflight.form.image_dir).glob("*.raw"):
+        np.ones((195, 487), dtype=np.int32).tofile(path)
+    preflight = prepare_stitch_tool(replace(preflight.form, detector_shape=(195, 487)))
+    target = Path(preflight.request.module.output.target)
+    inspect = analysis_artifact.inspect_analysis_artifact
+    failures = []
+
+    def inspect_once(path, **kwargs):
+        if Path(path) == target and not failures:
+            failures.append(path)
+            raise OSError("transient published inspection")
+        return inspect(path, **kwargs)
+
+    monkeypatch.setattr(analysis_artifact, "inspect_analysis_artifact", inspect_once)
+    owner = _prepare_owner(preflight)
+    assert owner.begin_run() is not None
+    pending = _poll_terminal(owner, timeout=10)
+    assert pending.outcome.kind is StitchOwnerOutcomeKind.CLEANUP_PENDING
+    assert pending.outcome.finalization_message == "analysis artifact published; verification remains pending"
+    assert target.exists()
+    assert owner.begin_retry_cleanup() is not None
+    completed = _poll_terminal(owner, timeout=10)
+    assert completed.outcome.result.terminal.disposition is ModuleDisposition.COMMITTED
     assert owner.close().status is PageCleanup.CLEAN
 
 

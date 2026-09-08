@@ -93,10 +93,12 @@ class RSMOwnerOutcome:
     refusal_code: str = ""
     refusal_message: str = ""
     diagnostics: tuple[str, ...] = ()
+    finalization_message: str = ""
 
     def __post_init__(self) -> None:
         if (
             type(self.kind) is not RSMOwnerOutcomeKind
+            or type(self.finalization_message) is not str
             or (
                 self.preflight is not None
                 and type(self.preflight) not in (RSMToolPreflight, RSMToolPreflightV2)
@@ -587,7 +589,10 @@ class RSMToolOwner:
                 )
             if error.execution is not execution:
                 raise RuntimeError("cleanup exception changed RSM execution owner")
-            return RSMOwnerOutcome(RSMOwnerOutcomeKind.CLEANUP_PENDING)
+            return RSMOwnerOutcome(
+                RSMOwnerOutcomeKind.CLEANUP_PENDING,
+                finalization_message=str(error),
+            )
         except (
             RSMOperationVerificationError,
             RSMOperationVerificationErrorV2,
