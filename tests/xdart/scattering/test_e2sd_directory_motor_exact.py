@@ -1250,7 +1250,7 @@ def test_soft_detector_path_materializes_with_exact_external_dependency(
         session.close()
 
 
-@pytest.mark.parametrize("layout", ("ancestor", "mixed", "soft"))
+@pytest.mark.parametrize("layout", ("ancestor", "mixed", "soft", "terminal"))
 def test_external_member_capture_uses_dataset_owner_and_all_segment_offsets(
     tmp_path: Path, layout: str,
 ) -> None:
@@ -1272,6 +1272,16 @@ def test_external_member_capture_uses_dataset_owner_and_all_segment_offsets(
                 "/bridge/pixels",
             )
             paths = ("/entry/data/data_000001",)
+        elif layout == "terminal":
+            middle = tmp_path / "middle.h5"
+            with h5py.File(middle, "w") as middle_handle:
+                middle_handle["alias"] = h5py.ExternalLink(
+                    sidecar.name, "/detector/pixels",
+                )
+            handle["entry/data/data_000001"] = h5py.ExternalLink(
+                middle.name, "/alias",
+            )
+            paths = ("/entry/data/data_000001",)
         else:
             paths = tuple(f"/segment_{index}" for index in range(4))
             for index, path in enumerate(paths):
@@ -1289,7 +1299,7 @@ def test_external_member_capture_uses_dataset_owner_and_all_segment_offsets(
     assert all(Path(member.file.path) == sidecar for member in members)
     assert all(member.dataset == "/detector/pixels" for member in members)
     assert [(member.first, member.stop, member.epoch) for member in members] == (
-        [(0, 2, 0)] if layout in {"ancestor", "soft"} else [(2, 4, 1), (6, 8, 3)]
+        [(0, 2, 0)] if layout in {"ancestor", "soft", "terminal"} else [(2, 4, 1), (6, 8, 3)]
     )
 
 

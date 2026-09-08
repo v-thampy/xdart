@@ -493,11 +493,21 @@ def _selected_link_owner_selector(
         return "/" + posixpath.normpath("/" + value.lstrip("/")).lstrip("/")
 
     actual_owner = Path(os.fsdecode(dataset.file.filename)).resolve()
-    current: Any = selected_root.file
-    components = tuple(
-        part for part in canonical(str(logical_selector)).split("/") if part
-    )
+    logical = canonical(str(logical_selector))
+    if isinstance(selected_root, h5py.File):
+        current: Any = selected_root
+        components = tuple(part for part in logical.split("/") if part)
+    else:
+        current = selected_root
+        captured = canonical(selected_root.name)
+        prefix = captured.rstrip("/") + "/"
+        if not logical.startswith(prefix):
+            raise ValueError("selected detector is outside its captured entry")
+        components = tuple(part for part in logical[len(prefix):].split("/") if part)
+        if not components:
+            raise ValueError("selected detector is its captured entry")
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    followed_soft_link = False
     while True:
         state = (
             os.fsdecode(current.file.filename), current.name, components,
@@ -513,6 +523,7 @@ def _selected_link_owner_selector(
                 raise ValueError("selected detector path is unavailable")
             remainder = components[offset + 1 :]
             if isinstance(link, h5py.SoftLink):
+                followed_soft_link = True
                 target = str(link.path)
                 if not target.startswith("/"):
                     target = posixpath.join(current.name, target)
@@ -528,9 +539,11 @@ def _selected_link_owner_selector(
                 owner = owner.resolve()
                 target = canonical(posixpath.join(str(link.path), *remainder))
                 if not remainder:
-                    if owner != actual_owner:
-                        raise ValueError("selected detector owner changed during resolution")
-                    return owner, target
+                    if owner == actual_owner:
+                        return owner, target
+                    if not followed_soft_link:
+                        return actual_owner, canonical(str(dataset.name))
+                    raise ValueError("selected detector owner changed during resolution")
                 current = current[component]
                 if not isinstance(current, h5py.Group):
                     raise ValueError("selected detector path is incomplete")

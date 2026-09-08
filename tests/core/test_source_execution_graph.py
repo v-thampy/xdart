@@ -86,6 +86,26 @@ def _soft_external_master(root: Path) -> tuple[Path, Path]:
     return master, sidecar
 
 
+def _terminal_external_master(root: Path) -> tuple[Path, Path]:
+    sidecar = root / "terminal-pixels.h5"
+    with h5py.File(sidecar, "w") as handle:
+        handle.create_dataset(
+            "detector/pixels",
+            data=np.ones((2, 2, 3), dtype=np.uint16),
+        )
+    middle = root / "terminal-middle.h5"
+    with h5py.File(middle, "w") as handle:
+        handle["alias"] = h5py.ExternalLink(
+            sidecar.name, "/detector/pixels",
+        )
+    master = root / "terminal-master.h5"
+    with h5py.File(master, "w") as handle:
+        handle["entry/data/data_000001"] = h5py.ExternalLink(
+            middle.name, "/alias",
+        )
+    return master, sidecar
+
+
 def test_selected_link_owner_selector_detaches_sidecar_internal_path(tmp_path):
     master, sidecar = _soft_external_master(tmp_path)
     with h5py.File(master, "r") as handle:
@@ -105,6 +125,45 @@ def test_selected_link_owner_selector_detaches_sidecar_internal_path(tmp_path):
                  value.stamp.external_members) == ((sidecar, "/detector/pixels"),)
     graph.validate_source_execution_graph(value)
     assert graph.requalify_source_execution_graph(source, value) is value
+
+
+def test_selected_link_owner_selector_preserves_terminal_external_chain(tmp_path):
+    master, sidecar = _terminal_external_master(tmp_path)
+    with h5py.File(master, "r") as handle:
+        dataset = handle["/entry/data/data_000001"]
+        owner, selector = nexus_io._selected_link_owner_selector(
+            handle, "/entry/data/data_000001", dataset,
+        )
+    assert owner == sidecar.resolve()
+    assert selector == "/detector/pixels"
+
+
+def test_selected_link_owner_selector_uses_captured_entry_without_root_lookup(
+    tmp_path, monkeypatch,
+):
+    path = tmp_path / "captured-entry.h5"
+    with h5py.File(path, "w") as handle:
+        handle.create_group("entry").create_group("data").create_dataset(
+            "pixels", data=np.ones((2, 2, 3), dtype=np.uint16),
+        )
+    real_get = h5py.Group.get
+    armed = [False]
+
+    def guarded_get(group, name, *args, **kwargs):
+        if armed[0] and group.name == "/" and name == "entry":
+            pytest.fail("captured entry was reacquired by root name")
+        return real_get(group, name, *args, **kwargs)
+
+    monkeypatch.setattr(h5py.Group, "get", guarded_get)
+    with h5py.File(path, "r") as handle:
+        entry = handle["entry"]
+        dataset = entry["data/pixels"]
+        armed[0] = True
+        owner, selector = nexus_io._selected_link_owner_selector(
+            entry, "/entry/data/pixels", dataset,
+        )
+    assert owner == path.resolve()
+    assert selector == "/entry/data/pixels"
 
 
 def _bind_stack(handle: h5py.File, entry: str = "entry"):
