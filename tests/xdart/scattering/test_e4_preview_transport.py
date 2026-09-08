@@ -3385,11 +3385,15 @@ def test_b1_light_publication_failure_retries_exact_prepared_commit(
     before_residency = tuple(state._residency._stores)
     calls = {"total": 0, "failures": 1}
     original = artifact.publications.publish_gui_light_1d
+    prepared = []
 
     def fail_once(publication, light_record, **kwargs):
         calls["total"] += 1
+        prepared.append((publication, light_record))
         if calls["failures"]:
             calls["failures"] -= 1
+            assert artifact.publications.get(2) is before
+            assert tuple(state._residency._stores) == before_residency
             raise RuntimeError("injected GUI-light publication failure")
         return original(publication, light_record, **kwargs)
 
@@ -3409,6 +3413,8 @@ def test_b1_light_publication_failure_retries_exact_prepared_commit(
     assert _wait_transport_idle(state)
 
     assert calls == {"total": 2, "failures": 0}
+    assert prepared[0][0] is prepared[1][0]
+    assert prepared[0][1] is prepared[1][1]
     assert (2, HydrationOutcome.HYDRATED) in _completion_outcomes(state)
     current = artifact.publications.get(2)
     assert current is not None
