@@ -859,16 +859,19 @@ def _identity(payload: dict[str, object]) -> tuple[str, str]:
     return canonical, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _operation_context_payload(
-    context: FiniteOperationContext,
+def _operation_context_payload_values(
+    snapshot: FiniteFileSnapshot,
+    request_generation_identity: str,
+    resource_allocation_identity: str,
+    route_identity: str,
+    custody_identity: str,
 ) -> dict[str, object]:
-    snapshot = context.source_snapshot
     return {
-        "custody_identity": context.custody_identity,
+        "custody_identity": custody_identity,
         "domain": "xdart.finite-artifact-operation-context.v1",
-        "request_generation_identity": context.request_generation_identity,
-        "resource_allocation_identity": context.resource_allocation_identity,
-        "route_identity": context.route_identity,
+        "request_generation_identity": request_generation_identity,
+        "resource_allocation_identity": resource_allocation_identity,
+        "route_identity": route_identity,
         "source_snapshot": {
             "ctime_ns": snapshot.ctime_ns,
             "device": snapshot.device,
@@ -879,6 +882,18 @@ def _operation_context_payload(
             "size": snapshot.size,
         },
     }
+
+
+def _operation_context_payload(
+    context: FiniteOperationContext,
+) -> dict[str, object]:
+    return _operation_context_payload_values(
+        context.source_snapshot,
+        context.request_generation_identity,
+        context.resource_allocation_identity,
+        context.route_identity,
+        context.custody_identity,
+    )
 
 
 def finite_operation_context(
@@ -910,22 +925,13 @@ def _new_operation_context(
     route_identity: str,
     custody_identity: str,
 ) -> FiniteOperationContext:
-    payload = {
-        "custody_identity": custody_identity,
-        "domain": "xdart.finite-artifact-operation-context.v1",
-        "request_generation_identity": request_generation_identity,
-        "resource_allocation_identity": resource_allocation_identity,
-        "route_identity": route_identity,
-        "source_snapshot": {
-            "ctime_ns": snapshot.ctime_ns,
-            "device": snapshot.device,
-            "digest": snapshot.digest,
-            "inode": snapshot.inode,
-            "mode": snapshot.mode,
-            "mtime_ns": snapshot.mtime_ns,
-            "size": snapshot.size,
-        },
-    }
+    payload = _operation_context_payload_values(
+        snapshot,
+        request_generation_identity,
+        resource_allocation_identity,
+        route_identity,
+        custody_identity,
+    )
     canonical, identity = _identity(payload)
     return FiniteOperationContext(
         snapshot,

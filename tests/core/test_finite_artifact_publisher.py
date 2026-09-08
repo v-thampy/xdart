@@ -29,6 +29,7 @@ from xrd_tools.io.finite_artifact import (
     FiniteCandidateValidation,
     FiniteCommittedInspection,
     FiniteDocumentAdapter,
+    FiniteFileSnapshot,
     FiniteSeedBinding,
     FiniteSeededDocumentAdapter,
     FiniteOperationContext,
@@ -326,6 +327,47 @@ def test_operation_context_is_required_canonical_and_attempt_only(
     assert first.version_identity == changed.version_identity
     assert first.publication_identity == changed.publication_identity
     assert first.lineage == changed.lineage
+
+
+def test_operation_context_payload_fixed_snapshot_bytes_and_hash() -> None:
+    snapshot = FiniteFileSnapshot(
+        path="/fixed/source.nexus",
+        size=3,
+        digest="e" * 64,
+        device=4,
+        inode=5,
+        mode=6,
+        mtime_ns=7,
+        ctime_ns=8,
+    )
+    payload = finite_module._operation_context_payload_values(
+        snapshot,
+        "a" * 64,
+        "b" * 64,
+        "c" * 64,
+        "d" * 64,
+    )
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    expected = (
+        '{"custody_identity":"' + "d" * 64
+        + '","domain":"xdart.finite-artifact-operation-context.v1",'
+        '"request_generation_identity":"' + "a" * 64
+        + '","resource_allocation_identity":"' + "b" * 64
+        + '","route_identity":"' + "c" * 64
+        + '","source_snapshot":{"ctime_ns":8,"device":4,"digest":"'
+        + "e" * 64
+        + '","inode":5,"mode":6,"mtime_ns":7,"size":3}}'
+    )
+    assert canonical == expected
+    assert hashlib.sha256(canonical.encode("utf-8")).hexdigest() == (
+        "975a9d6a3f5968c8e10a832fcab56e394e02db60a52239618aa2df59b771bef0"
+    )
 
 
 def test_lineage_is_canonical_acyclic_and_excludes_attempt_facts(
