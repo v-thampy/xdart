@@ -6805,6 +6805,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     and selection.names(browse)
                 ):
                     viewer_source = browse.requested_path
+                elif (
+                    selection is not None
+                    and selection.kind is ContextKind.ACQUISITION
+                    and (acquisition := controller.acquisition_context) is not None
+                    and selection.names(acquisition)
+                    and (frame := controller.navigation.current) is not None
+                    and controller.owns_frame(frame)
+                    and Path(frame.artifact).suffix.casefold() == ".nexus"
+                ):
+                    # A completed run's file can still be selected through
+                    # acquisition navigation after leaving its XYE viewer.
+                    viewer_source = frame.artifact
                 else:
                     one_d = controller.viewer_1d_context
                     if (
