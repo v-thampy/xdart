@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
+import os
 import time
 
 from matplotlib import colormaps as matplotlib_colormaps
@@ -54,6 +55,7 @@ from .shell_values import (
     AxisProjection,
     BrowseTraceSnapshot,
     FrameNavigationProjection,
+    FrameSelectionIntent,
     ScientificPlotOptions,
     ScientificProjection,
     ShellCommand,
@@ -2498,14 +2500,11 @@ class ScientificView(QtWidgets.QFrame):
         if rows is None:
             return False
         now = time.monotonic()
-        if self._processing_mode == "1D Viewer":
-            x_values = axis.values
-        else:
-            rows, x_values = resample_image_axis_to_uniform(
-                rows,
-                axis.values,
-                axis=1,
-            )
+        rows, x_values = resample_image_axis_to_uniform(
+            rows,
+            axis.values,
+            axis=1,
+        )
         y_values, y_label = self._waterfall_axis(
             waterfall_scope,
             traces,
@@ -2686,17 +2685,19 @@ class ScientificView(QtWidgets.QFrame):
         frame = self.frame_selector.itemData(index)
         if type(frame) is not DisplayFrameKey:
             return
+        if os.environ.get("XDART_VIEWER_DEBUG") == "1":
+            print("viewer_footer", {"mode": self._processing_mode,
+                "plot_mode": self._plot_mode, "current": frame.local_frame_label,
+                "selected": [key.local_frame_label for key in self._selected_keys]}, flush=True)
         if (self._processing_mode == "1D Viewer"
                 and frame.source_scan == frame.artifact == "viewer-1d"
                 and any(frame is item for item in self._frame_keys)):
-            membership = (
-                (frame,)
-                if self._single_mode
-                else self._selected_keys or (frame,)
-            )
             self.commandRequested.emit(ShellCommand(
                 ShellCommandKind.SELECT_FRAME, frame=frame,
-                frames=membership))
+                frames=(frame,), intent=(
+                    FrameSelectionIntent.VISIT
+                    if self._plot_mode in {"Overlay", "Waterfall"}
+                    else FrameSelectionIntent.EXACT)))
             return
         if (self._processing_mode == "2D Viewer"
                 and frame.source_scan == frame.artifact == "viewer-2d"

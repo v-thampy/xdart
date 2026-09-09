@@ -4170,11 +4170,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                    for frame in reversed(targets))
 
     def _select_scan(
-        self, value: object, *, is_directory: bool = False,
+        self, value: object, *, is_directory: bool = False, reopen: bool = False,
     ) -> None:
         if type(value) is not str or not value:
             return
-        if type(is_directory) is not bool:
+        if type(is_directory) is not bool or type(reopen) is not bool:
             return
         self._abandon_reintegrate_display_owner()
         successor = self._processed_browser.pending_reintegrate_successor
@@ -4208,7 +4208,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._ensure_timer()
             return
         if (
-            (terminal_request is None or same_terminal_target)
+            not reopen
+            and (terminal_request is None or same_terminal_target)
             and self._context_controller.select_browser_target(value)
         ):
             self._notice("")
@@ -4256,11 +4257,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if frame is None or not any(
                     frame is item for item in self._context_controller.navigation.frames):
                 return
-            if command.kind is ShellCommandKind.SELECT_BROWSER_FRAMES:
-                frames = _linearized_frame_selection(
-                    self._context_controller.navigation,
-                    command,
-                )
+            frames = _linearized_frame_selection(
+                self._context_controller.navigation,
+                command,
+            )
             if self._context_controller.select_viewer_1d(frame, frames):
                 self._refresh_shell()
             return
@@ -6675,6 +6675,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         candidate = snapshot.thaw()
         release_outgoing_display = False
         viewer_source = None
+        browse_source = None
         if kind is ShellCommandKind.SET_PROCESSING_MODE:
             if type(value) is not str or not value:
                 return
@@ -6709,6 +6710,23 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         == ".nexus"
                     ):
                         viewer_source = one_d.current_path
+            elif target_tool in {Tool.INT_1D, Tool.INT_2D}:
+                # Capture the selected processed path before the viewer clear
+                # fence retires its context. Reopen through Browse: entry into
+                # a viewer released that owner, even if its row is still shown.
+                selection = controller.selection
+                one_d = controller.viewer_1d_context
+                two_d = controller.viewer_2d_context
+                if (controller.viewer_1d_owned and one_d is not None
+                        and selection is not None and selection.names(one_d)
+                        and one_d.current_path in one_d.paths):
+                    browse_source = one_d.current_path
+                elif (controller.viewer_2d_owned and two_d is not None
+                        and selection is not None and selection.names(two_d)):
+                    browse_source = two_d.original_path
+                if (browse_source is not None
+                        and Path(browse_source).suffix.casefold() != ".nexus"):
+                    browse_source = None
             if (controller.viewer_2d_owned
                     and target_tool is not Tool.IMAGE_VIEWER
                     and not self._clear_viewer_2d_renderer(close=True)):
@@ -6748,6 +6766,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if (viewer_source is not None
                 and result.snapshot.thaw().processing_mode == candidate.processing_mode):
             self._open_viewer_2d_path(viewer_source)
+        if (browse_source is not None
+                and result.snapshot.thaw().processing_mode == candidate.processing_mode):
+            self._select_scan(browse_source, reopen=True)
         if release_outgoing_display:
             self._retain_outgoing_display = False
             self._refresh_shell()

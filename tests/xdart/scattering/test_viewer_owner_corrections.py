@@ -112,6 +112,16 @@ def test_return_from_viewer_reopens_same_processed_file(
     from test_browse_selected_slices import _wait as wait_browse, _ready as ready_browse
     app, page, path, _ = processed_page
     controller = page._context_controller
+    def ready():
+        if integration_mode == "Int 2D":
+            return bool(ready_browse(page, 1))
+        page._drain_executor()
+        page._refresh_shell()
+        projection = page._last_scientific_projection
+        return (projection is not None and len(projection.traces) == 1
+                and projection.traces[0].frame is controller.navigation.current
+                and len(page._shell.scientific.curve.listDataItems()) == 1
+                and "Loading" not in page._shell.scientific.status.text())
     page._handle_shell_command(ShellCommand(
         ShellCommandKind.SET_PROCESSING_MODE, viewer_mode))
     if viewer_mode == "1D Viewer":
@@ -128,7 +138,7 @@ def test_return_from_viewer_reopens_same_processed_file(
     assert controller.browse_context is None
     page._handle_shell_command(ShellCommand(
         ShellCommandKind.SET_PROCESSING_MODE, integration_mode))
-    wait_browse(app, lambda: ready_browse(page, 1), page)
+    wait_browse(app, ready, page)
     assert controller.browse_context.requested_path == str(path)
     assert not controller.viewer_1d_owned and not controller.viewer_2d_owned
     browser = page._shell.browser
@@ -136,7 +146,7 @@ def test_return_from_viewer_reopens_same_processed_file(
     QtTest.QTest.mouseClick(browser.frames.viewport(), QtCore.Qt.MouseButton.LeftButton,
         QtCore.Qt.KeyboardModifier.NoModifier, browser.frames.visualRect(second).center())
     wait_browse(app, lambda: (controller.navigation.current.local_frame_label == 2
-                            and ready_browse(page, 1)), page)
+                            and ready()), page)
     assert "Loading" not in page._shell.scientific.status.text()
 
 

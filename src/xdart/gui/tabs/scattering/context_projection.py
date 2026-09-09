@@ -273,28 +273,19 @@ def _viewer_1d_scientific(navigation, payloads, resident, preferences, notice,
         if any(len(axis) < 2 or not np.all(np.isfinite(axis)) or np.any(np.diff(axis) <= 0)
                for axis in axes):
             ready, status = False, "1D Viewer refused: axes must be finite and strictly increasing"
-        elif not np.allclose(axes[0], np.linspace(axes[0][0], axes[0][-1], len(axes[0])),
-                             rtol=1e-12, atol=1e-12):
+        else:
             if os.environ.get("XDART_VIEWER_DEBUG") == "1":
                 print("viewer_grid", {"rows": len(axes), "points": len(axes[0]),
                     "max_uniform_error": float(np.max(np.abs(axes[0] - np.linspace(
                         axes[0][0], axes[0][-1], len(axes[0])))))}, flush=True)
-            ready, status = False, "1D Viewer refused: first selected axis is nonuniform"
-        else:
             status = "1D Viewer · first selected 1D source display grid"
     traces = []
     if ready:
-        grid = accepted[0].view.axis_1d.values
-        for index, (frame, payload) in enumerate(zip(frames, accepted)):
+        # Keep provider coordinates, intensity and uncertainty native. The
+        # renderer owns the same display-only grid mapping as integration.
+        for frame, payload in zip(frames, accepted):
             view = payload.view; values = view.axis_1d.values
             intensity, sigma = view.intensity_1d, view.sigma_1d
-            if waterfall and index:
-                intensity = np.interp(grid, values, intensity, left=np.nan, right=np.nan)
-                sigma = (None if sigma is None else
-                         np.interp(grid, values, sigma, left=np.nan, right=np.nan))
-                intensity.setflags(write=False)
-                if sigma is not None: sigma.setflags(write=False)
-                values = grid
             axis = AxisProjection(values, view.axis_1d.label, view.axis_1d.unit)
             traces.append(_Viewer1DTraceProjection(
                 frame, axis, intensity, os.path.basename(view.source_path or ""),

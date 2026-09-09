@@ -95,6 +95,10 @@ class _AccumulatingFrameClickFilter(QtCore.QObject):
         if not index.isValid():
             # An empty-area click must not destroy an accumulating selection.
             return accumulating
+        if os.environ.get("XDART_VIEWER_DEBUG") == "1":
+            focus = QtWidgets.QApplication.focusWidget()
+            print("viewer_frame_click", {"mode": plot_mode, "row": index.row(),
+                "focus": None if focus is None else focus.objectName()}, flush=True)
         selection = self._view.selectionModel()
         anchor = selection.currentIndex()
         intent = (

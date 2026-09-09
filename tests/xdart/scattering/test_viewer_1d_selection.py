@@ -150,6 +150,27 @@ def test_overlay_frame_arrows_accumulate_after_mouse_selection(viewer):
     assert browser.frames.currentIndex().row() == 5
 
 
+def test_overlay_frame_click_moves_keyboard_focus_from_files(viewer):
+    app, page, _paths = viewer
+    browser = page._shell.browser
+    first = browser.frame_model.index(0, 0)
+    QtTest.QTest.mouseClick(browser.frames.viewport(), QtCore.Qt.MouseButton.LeftButton,
+        QtCore.Qt.KeyboardModifier.NoModifier, browser.frames.visualRect(first).center())
+    _settle(app)
+    _mode(app, page, "Overlay")
+    browser.scans.setFocus()
+    _settle(app)
+    second = browser.frame_model.index(1, 0)
+    QtTest.QTest.mouseClick(browser.frames.viewport(), QtCore.Qt.MouseButton.LeftButton,
+        QtCore.Qt.KeyboardModifier.NoModifier, browser.frames.visualRect(second).center())
+    _settle(app)
+    _assert_curves(page, 2)
+    assert app.focusWidget() is browser.frames
+    QtTest.QTest.keyClick(app.focusWidget(), QtCore.Qt.Key.Key_Down)
+    _settle(app, .3)
+    _assert_curves(page, 3)
+
+
 @pytest.mark.parametrize("uneven", (False, True))
 def test_dense_text_axes_use_display_grid_without_changing_curves(viewer, tmp_path, uneven):
     app, page, _paths = viewer
@@ -178,6 +199,26 @@ def test_dense_text_axes_use_display_grid_without_changing_curves(viewer, tmp_pa
     _ready(app, page)
     _assert_curves(page, 7)
     assert tuple(Path(path).read_bytes() for path in paths) == original
+
+
+@pytest.mark.parametrize("control", ("selector_keys", "next_button"))
+def test_overlay_footer_navigation_accumulates_like_frame_clicks(viewer, control):
+    app, page, _paths = viewer
+    browser, view = page._shell.browser, page._shell.scientific
+    first = browser.frame_model.index(0, 0)
+    QtTest.QTest.mouseClick(browser.frames.viewport(), QtCore.Qt.MouseButton.LeftButton,
+        QtCore.Qt.KeyboardModifier.NoModifier, browser.frames.visualRect(first).center())
+    _settle(app)
+    _mode(app, page, "Overlay")
+    for count in (2, 3):
+        if control == "selector_keys":
+            view.frame_selector.setFocus()
+            QtTest.QTest.keyClick(view.frame_selector, QtCore.Qt.Key.Key_Down)
+        else:
+            QtTest.QTest.mouseClick(view.next_frame, QtCore.Qt.MouseButton.LeftButton)
+        _settle(app, .3)
+        assert page._context_controller.navigation.current is browser.frame_model.frames[count - 1]
+        _assert_curves(page, count)
 
 
 def test_resident_artifact_subset_reuses_batch_and_new_file_keeps_clear_fence(viewer, monkeypatch):

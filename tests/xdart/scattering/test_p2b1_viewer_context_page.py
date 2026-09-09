@@ -492,11 +492,11 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     assert controller.select_viewer_1d(frames[1], frames)
     waterfall = _shell(controller, ScientificPreferences(plot_mode="Waterfall"))
     assert "first selected 1D source" in waterfall.scientific.status
-    assert all(trace.axis.values is borrow.modes[0].coordinate for trace in waterfall.scientific.traces)
-    assert np.isnan(waterfall.scientific.traces[1].intensity[0])
-    assert np.isnan(waterfall.scientific.traces[1].intensity[-1])
-    assert not waterfall.scientific.traces[1].intensity.flags.writeable
-    assert np.isnan(waterfall.scientific.traces[1].sigma[[0, -1]]).all() and not waterfall.scientific.traces[1].sigma.flags.writeable
+    for projected, source in zip(waterfall.scientific.traces, borrow.modes.values(), strict=True):
+        assert projected.axis.values is source.coordinate
+        assert projected.intensity is source.intensity
+        assert projected.sigma is source.uncertainty
+    del projected, source
     assert np.array_equal(borrow.modes[0].coordinate, [0, 1 + 1.5e-12, 2])
     assert np.array_equal(borrow.modes[1].coordinate, [.5, 1.5])
     assert np.array_equal(borrow.modes[1].intensity, [20, 21]) and np.array_equal(borrow.modes[1].uncertainty, [.8, .9])
@@ -519,8 +519,6 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
         rendered.append((rows, kwargs))
         return real_waterfall_render(rows, **kwargs)
     monkeypatch.setattr(render.waterfall, "render", observe_waterfall)
-    monkeypatch.setattr("xdart.gui.tabs.scattering.scientific_view.resample_image_axis_to_uniform",
-                        lambda *_args, **_kwargs: pytest.fail("viewer grid was resampled"))
     waterfall_state = replace(waterfall.scientific,
         plot_options=replace(waterfall.scientific.plot_options, waterfall_start=2))
     _reconcile_real_viewer(render, waterfall_state, controller.navigation)
@@ -529,7 +527,9 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     # ScientificImagePane converts row-major science to pyqtgraph's columns.
     assert render.waterfall.image.image.shape == (3, 2)
     np.testing.assert_array_equal(render.waterfall.canvas.raw_image,
-                                 np.stack([item.intensity for item in waterfall.scientific.traces]).T)
+        np.stack((borrow.modes[0].intensity, np.interp(borrow.modes[0].coordinate,
+            borrow.modes[1].coordinate, borrow.modes[1].intensity,
+            left=np.nan, right=np.nan))).T)
     assert rendered[0][1]["x_axis"].values is borrow.modes[0].coordinate
     assert all(render._trace_history_by_identity[id(item.frame)].sigma is item.sigma
                for item in waterfall.scientific.traces)
@@ -550,7 +550,7 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
         _reconcile_real_viewer(render, inherited.scientific, controller.navigation)
         assert len(render.curve.listDataItems()) == 2
     payloads = controller.project_navigation(preferences=ScientificPreferences(), processing_mode="1D Viewer")
-    cases = (([0, 1 + 4e-12, 2], 0, "nonuniform"), ([0, np.nan, 2], 0, "finite"),
+    cases = (([0, np.nan, 2], 0, "finite"),
              ([2, 1, 0], 0, "strictly increasing"), ([0, 2, 1], 0, "strictly increasing"),
              ([0, 2, 1], 1, "strictly increasing"), ([0], 0, "finite"),
              ([0, 1, 1], 0, "strictly increasing"))
