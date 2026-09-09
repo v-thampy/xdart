@@ -704,6 +704,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._rendered_image_axis = self._preferences.image_axis
         self._detector_summary_key: tuple[str, str] | None = None
         self._detector_summary_text = "not configured"
+        self._authoring_dependency_availability: tuple[bool, bool] | None = None
         self._project_readiness_key: tuple[str, str] | None = None
         self._project_readiness = SectionHeaderProjection("")
         self._experiment_readiness_key: tuple[bool, str] | None = None
@@ -6583,7 +6584,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and operation_identity
             is self._workspace_operations.reintegrate_identity
         )
-        phase = self._lifecycle.phase; calibrate_dependency_available = resolve_calibration_executable() is not None; mask_dependency_available = resolve_mask_executable() is not None
+        phase = self._lifecycle.phase
+        if self._authoring_dependency_availability is None or (
+            phase is RunPhase.IDLE
+            or phase is RunPhase.FAILED and self._lifecycle.reset_permitted
+        ):
+            # Disabled authoring actions do not need filesystem discovery on
+            # every plot refresh. Recheck when eligible; launch also validates.
+            self._authoring_dependency_availability = (
+                resolve_calibration_executable() is not None,
+                resolve_mask_executable() is not None,
+            )
+        calibrate_dependency_available, mask_dependency_available = (
+            self._authoring_dependency_availability
+        )
         calibrate_available = (
             not self._closing and not self._closed
             and self._admission_state is None

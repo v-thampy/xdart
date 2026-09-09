@@ -860,6 +860,45 @@ def test_single_125ms_deadline_coalesces_and_direct_frame_bypasses(
         _dispose(page, qapp)
 
 
+def test_live_plot_refresh_retains_disabled_authoring_dependency_checks(
+        qapp: QtWidgets.QApplication, monkeypatch) -> None:
+    calls = []
+    for name in ("resolve_calibration_executable", "resolve_mask_executable"):
+        original = getattr(page_module, name)
+
+        def observed(*args, _name=name, _original=original, **kwargs):
+            calls.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(page_module, name, observed)
+    executor = _Executor()
+    page, lifecycle, identity = _active_page(executor)
+    initial = tuple(calls)
+    assert set(initial) == {
+        "resolve_calibration_executable", "resolve_mask_executable",
+    }
+    try:
+        executor.events.extend(_paced_frame_events(page, executor, identity, 1))
+        page._drain_executor()
+        page._image_plot_at = time.monotonic() - 1.0
+        page._image_plot_pending = True
+        page._plot_deadline_timer.timeout.emit()
+        assert page._shell.scientific.raw.image.image is not None
+        assert lifecycle.phase is RunPhase.RUNNING
+        assert tuple(calls) == initial
+
+        executor.events.append(StandardRunEvent(
+            identity, StandardEventKind.FINISHED,
+            cleanup_status=CleanupStatus.CLEANED,
+        ))
+        page._drain_executor()
+        assert lifecycle.phase is RunPhase.IDLE
+        for name in set(initial):
+            assert calls.count(name) > initial.count(name)
+    finally:
+        _dispose(page, qapp)
+
+
 def test_plot_deadline_is_cancelled_at_terminal_and_close(
         qapp: QtWidgets.QApplication) -> None:
     executor = _Executor()
