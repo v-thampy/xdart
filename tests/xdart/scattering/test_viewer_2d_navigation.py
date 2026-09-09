@@ -170,3 +170,43 @@ def test_same_hdf_frame_step_retires_arrays_but_keeps_viewer_chrome(viewer, monk
         np.testing.assert_array_equal(controller.viewer_2d_frame.array, values[1])
     finally:
         release.set()
+
+
+def test_cancelled_frame_read_releases_before_subsequent_viewer_load(
+        viewer, monkeypatch):
+    import xdart.gui.tabs.scattering.hydration_transport as hydration
+
+    page, app, paths, values = viewer
+    controller = page._context_controller
+    entered, release = Event(), Event()
+    read = hydration.read_viewer_2d_frame
+
+    def gated_read(catalog, label, **kwargs):
+        if label == 1:
+            entered.set()
+            assert release.wait(6)
+        return read(catalog, label, **kwargs)
+
+    monkeypatch.setattr(hydration, "read_viewer_2d_frame", gated_read)
+    try:
+        QtTest.QTest.mouseClick(
+            page._shell.scientific.next_frame, QtCore.Qt.LeftButton,
+        )
+        _wait(page, app, entered.is_set)
+        prior_gate = controller.viewer_2d_context.commit_gate
+        assert controller.viewer_2d_frame is None
+        assert not controller.close_viewer_2d()
+        assert prior_gate.cancelled
+        release.set()
+        _wait(page, app, controller.close_viewer_2d)
+
+        page._open_viewer_2d_path(str(paths[1]))
+        _wait(page, app, lambda: (
+            controller.viewer_2d_frame is not None
+            and controller.viewer_2d_context.original_path == str(paths[1])
+            and page._shell.scientific._viewer_2d_payload
+            is controller.viewer_2d_frame.array
+        ))
+        np.testing.assert_array_equal(controller.viewer_2d_frame.array, values[0])
+    finally:
+        release.set()
