@@ -236,7 +236,7 @@ class _ArtifactNavigationFilter(QtCore.QObject):
         for index in range(row + step, view.count() if step > 0 else -1, step):
             if not view.item(index).data(_DIRECTORY_ROLE):
                 if not self._visit_artifact(view.item(index)):
-                    view.setCurrentRow(index)
+                    view.setCurrentRow(index, QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
                 break
         return True
 

@@ -399,6 +399,23 @@ class ContextController:
     @property
     def viewer_1d_context(self): return self._viewer_1d.context
     @property
+    def viewer_1d_artifact_selection(self) -> tuple[str, tuple[str, ...]]:
+        """Project file intent even while its replacement arrays are loading."""
+        with self._viewer_2d_lock:
+            owner = self._viewer_1d
+            context = owner.context
+            if context is None or context.commit_gate.cancelled:
+                return "", ()
+            if owner.latest_intent is not None:
+                intent = owner.latest_intent
+                return intent.current_path, intent.paths
+            if context.state is not Viewer1DState.READY:
+                return context.current_path or "", context.paths
+            navigation = self._runtime._viewer_1d_navigation
+            paths = dict(zip(navigation.frames, context.paths, strict=True))
+            return paths.get(navigation.current, ""), tuple(
+                paths[frame] for frame in navigation.selected)
+    @property
     def viewer_1d_loading(self) -> bool: return self._viewer_1d.loading
     @property
     def viewer_1d_diagnostic(self) -> str: return self._viewer_1d.diagnostic

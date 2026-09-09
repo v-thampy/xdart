@@ -3191,15 +3191,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     tool is Tool.XYE_VIEWER
                     or mode == "Int 1D (XYE)" and value.lower().endswith(".xye"))):
                 selected = command.artifacts or (value,)
-                context = self._context_controller.viewer_1d_context
-                navigation = self._context_controller.navigation
-                if (command.intent is FrameSelectionIntent.VISIT
-                        and context is not None and context.state.value == "ready"
-                        and len(context.paths) == len(navigation.frames)):
-                    selected_ids = {id(frame) for frame in navigation.selected}
-                    prior = tuple(path for path, frame in zip(
-                        context.paths, navigation.frames, strict=True)
-                        if id(frame) in selected_ids)
+                if command.intent is FrameSelectionIntent.VISIT:
+                    _current, prior = self._context_controller.viewer_1d_artifact_selection
                     selected = tuple(dict.fromkeys((*prior, *selected)))
                 self._open_viewer_1d_paths(selected, current_path=value)
                 return
@@ -6165,6 +6158,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._progress
         )
         browser = self._processed_browser.projection()
+        viewer_current, viewer_paths = (
+            self._context_controller.viewer_1d_artifact_selection
+            if viewer_1d else ("", ()))
         projection = self._context_projection.build_shell(
             revision=self._shell_revision,
             controls=controls,
@@ -6181,12 +6177,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             browser_directory=browser.directory,
             browser_catalog_index=browser.scan_index,
             browser_transient_frame=browser.transient_frame,
-            viewer_1d_paths=(
-                self._context_controller.viewer_1d_context.paths
-                if viewer_1d
-                and self._context_controller.viewer_1d_context is not None
-                else ()
-            ),
+            viewer_1d_current_path=viewer_current,
+            viewer_1d_selected_paths=viewer_paths,
             viewer_waterfall_active=self._shell.scientific.bottom_waterfall_active,
             date_sorted=browser.date_sorted,
             auto_last=browser.auto_last,

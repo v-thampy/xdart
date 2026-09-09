@@ -122,11 +122,8 @@ def _shell(
         preferences=preferences, browser_directory="",
         browser_catalog=browser_catalog,
         date_sorted=False, auto_last=True,
-        viewer_1d_paths=(
-            ()
-            if context is None
-            else context.paths
-        ),
+        viewer_1d_current_path=controller.viewer_1d_artifact_selection[0],
+        viewer_1d_selected_paths=controller.viewer_1d_artifact_selection[1],
         executor_available=False, start_permitted=True, start_blocker="",
         notice=getattr(controller, "viewer_1d_diagnostic", ""),
     )
