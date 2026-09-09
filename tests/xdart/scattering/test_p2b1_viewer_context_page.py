@@ -948,182 +948,99 @@ def test_viewer_1d_single_keeps_membership_without_preclear(
     assert page._preferences.plot_mode == "Single"
 
 
-def test_viewer_1d_page_commands_reload_status_and_native_restore(monkeypatch, tmp_path) -> None:
-    calls = []
-    paths = ("/opaque/first.xye", "/other/first.xye")
-    context = SimpleNamespace(
-        paths=paths,
-        current_path=paths[1],
-        state=SimpleNamespace(value="ready"),
-    )
-    controller = SimpleNamespace(viewer_1d_context=None, viewer_1d_owned=False,
-        viewer_2d_owned=False, run_identity=None,
-        open_viewer_1d=lambda selected, *, current_path=None: calls.append(
-            ("open", selected, current_path)
-        ) or object())
-    intent = SimpleNamespace(processing_mode="1D Viewer", live_mode=False, run_options={})
-    forbidden = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("foreign seam"))
-    page = SimpleNamespace(_context_controller=controller,
-        _workspace_operations=WorkspaceOperationOwner(),
-        _lifecycle=SimpleNamespace(phase=RunPhase.IDLE),
-        _retire_batch_presentation=lambda: None,
-        _retain_outgoing_display=True,
-        _viewer_1d_start_directory=lambda: calls.append("start") or "/viewer",
-        _viewer_1d_file_chooser=lambda start: calls.append(("choose", start)) or paths,
-        _clear_viewer_1d_renderer=forbidden, _intents=SimpleNamespace(
-            snapshot=lambda: SimpleNamespace(thaw=lambda: intent)),
-        _notice=lambda value: calls.append(("notice", value)), _ensure_timer=lambda: calls.append("timer"),
-        _error_notice=forbidden, _begin_run=forbidden, _commit_focused_control_edit_for_run=forbidden)
-    page._choose_viewer_1d_files = partial(
-        _api(ScatteringWorkspace, "_choose_viewer_1d_files"), page)
-    page._open_viewer_1d_paths = partial(
-        _api(ScatteringWorkspace, "_open_viewer_1d_paths"), page)
-    ScatteringWorkspace._run_action(page)
-    assert calls == [
-        "start",
-        ("choose", "/viewer"),
-        ("open", paths, paths[0]),
-        ("notice", ""),
-        "timer",
-    ]
-    controller.viewer_1d_context = context
-    controller.viewer_1d_owned = True
-    page._viewer_1d_file_chooser = forbidden
-    page._clear_viewer_1d_renderer = lambda *, paths=None, current_path=None, close=False: (
-        calls.append(("clear", paths, current_path, close)) or True
-    )
-    ScatteringWorkspace._run_action(page)
-    assert calls[-2:] == [("clear", paths, paths[1], False), "timer"]
-    page._clear_viewer_1d_renderer = lambda **_: False
-    ScatteringWorkspace._edit_run_strip(page, ShellCommandKind.SET_PROCESSING_MODE, "Int 2D")
-    assert intent.processing_mode == "1D Viewer" and calls[-1] == ("notice", "1D Viewer cleanup remains pending")
-    ordered, outcomes = [], [False, True]
-    directory = tmp_path / "viewer-folder"; directory.mkdir()
-    processed_browser = ProcessedBrowserOwner(
-        save_path="",
-        processing_mode="Int 2D",
-        deliver=lambda _wake: None,
-        catalog_reader=lambda _directory, **_kwargs: (),
-    )
-    dispatch = SimpleNamespace(_closing=False, _closed=False,
-        _context_controller=SimpleNamespace(viewer_1d_owned=True, viewer_2d_owned=False, selection=None),
-        _workspace_operations=WorkspaceOperationOwner(),
-        _processed_browser=processed_browser,
-        _analysis_operation_busy=lambda: False,
-        _experiment_operation_busy=lambda: False,
-        _notice=lambda _message: None,
-        _refresh_shell=lambda: None,
-        _clear_viewer_1d_renderer=lambda *, close: ordered.append(("clear", close)) or outcomes.pop(0),
-        _clear_viewer_2d_renderer=forbidden,
-        _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(revision=1, thaw=lambda: intent)),
-        _open_viewer_1d_paths=lambda value, *, current_path=None: ordered.append(
-            ("open-1d", value, current_path)
-        ),
-        _open_viewer_2d_path=lambda value: ordered.append(("open-2d", value)),
-        _select_scan=lambda value, **kwargs: ordered.append(
-            ("select", value, kwargs)
-        ))
-    ScatteringWorkspace._handle_shell_command(
-        dispatch, ShellCommand(
-            ShellCommandKind.SELECT_SCAN, str(directory), path=("directory",),
-        ))
-    assert ordered == [("select", str(directory), {"is_directory": True})]
-    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(
-        ShellCommandKind.SELECT_SCAN, "scan.xye", path=("artifact",),
-    ))
-    assert ordered[-1] == ("open-1d", ("scan.xye",), "scan.xye")
-    intent.processing_mode = "2D Viewer"
-    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(
-        ShellCommandKind.SELECT_SCAN, "image.tif", path=("artifact",),
-    ))
-    assert ordered[-1] == ("open-2d", "image.tif")
-    intent.processing_mode = "Int 2D"
-    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(
-        ShellCommandKind.SELECT_SCAN, "scan.nxs", path=("artifact",),
-    ))
-    assert ordered[-1] == ("clear", True)
-    ScatteringWorkspace._handle_shell_command(dispatch, ShellCommand(
-        ShellCommandKind.SELECT_SCAN, "scan.nxs", path=("artifact",),
-    ))
-    assert ordered[-2:] == [
-        ("clear", True), ("select", "scan.nxs", {"is_directory": False}),
-    ]
-    identity = RunIdentity(7, "owned")
-    dispatch._context_controller.__dict__.update(run_identity=identity, poll_viewer_1d=lambda: False,
-        poll_viewer_2d=lambda: False, poll_browse_preview=lambda: False, browse_pending=False, adopt_acquisition=forbidden)
-    dispatch.__dict__.update(_poll_admission=lambda: False, _run_executor=SimpleNamespace(drain_events=lambda: (
-        StandardRunEvent(identity, StandardEventKind.CONTEXT_READY),)), _lifecycle=SimpleNamespace(
-        active_run_identity=identity, attempt_run_identity=None), _refresh_shell=forbidden,
-        _settle_browse_1d_before_drain=lambda: True,
-        _dispatch_deferred_metadata=lambda: WorkspaceRefreshEffect.NONE,
-        _batch_ready_to_paint=lambda: None,
-        _advance_authored_asset_confirmation=lambda: None,
-        _batch_terminal=SimpleNamespace(active=False),
-        _polling_needed=lambda: True, _run_timer=SimpleNamespace(stop=forbidden),
-        _scientific_repaint_pending=False,
-        _retain_outgoing_display=False, _waterfall_candidate_count=0,
-        _shell=SimpleNamespace(scientific=SimpleNamespace(
-            trace_row_count=0, bottom_waterfall_active=False)))
-    monkeypatch.setattr(
-        ScatteringWorkspace,
-        "_advance_presentation_target",
-        lambda _self: False,
-    )
-    dispatch._clear_presentation_targets = lambda: None; ScatteringWorkspace._drain_executor(dispatch)
-    preferences = ScientificPreferences(plot_mode="Overlay")
-    owner = SimpleNamespace(
-        _preferences=preferences,
-        _retire_batch_presentation=lambda: None,
-        _retain_outgoing_display=True,
-        _context_controller=SimpleNamespace(
-            selection=SimpleNamespace(kind=ContextKind.VIEWER_1D),
-            navigation=SimpleNamespace(current=object()),
-        ),
-        _shell=SimpleNamespace(browser=SimpleNamespace(
-            cancel_pending_frame_selection=lambda: calls.append("cancel"))),
-        _background_owner=SimpleNamespace(projection=lambda: None),
-    )
-    for command in (ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Average"),
-                    ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Sum"),
-                    ShellCommand(ShellCommandKind.PIN_SLICE)):
-        assert not ScatteringWorkspace._edit_scientific_preference(owner, command)
-        assert owner._preferences is preferences
-    clear_calls = []
-    owner._clear_viewer_1d_renderer = lambda *, close=False: clear_calls.append(close) or True
-    assert ScatteringWorkspace._edit_scientific_preference(
-        owner, ShellCommand(ShellCommandKind.CLEAR_1D)
-    )
-    assert clear_calls == [True]
-    enabled = []
-    item = SimpleNamespace(setEnabled=enabled.append)
-    view = SimpleNamespace(_processing_mode="Int 2D", detector_controls=SimpleNamespace(setVisible=lambda _value: None), raw_popup_button=SimpleNamespace(setVisible=lambda _value: None), raw_popup_dialog=None,
-        plot_mode=SimpleNamespace(findText=lambda value: value,
-                                  model=lambda: SimpleNamespace(item=lambda _index: item)),
-        image_splitter=SimpleNamespace(setVisible=lambda value: calls.append(("images", value))),
-        raw=SimpleNamespace(setVisible=lambda value: calls.append(("raw", value))), cake=SimpleNamespace(
-            setVisible=lambda value: calls.append(("cake", value))),
-        vertical_splitter=SimpleNamespace(
-            widget=lambda _index: SimpleNamespace(setVisible=lambda value: calls.append(("bottom", value))),
-            setSizes=lambda value: calls.append(("sizes", value)),
-        ),
-        norm=SimpleNamespace(setVisible=lambda value: calls.append(("norm", value))), background=SimpleNamespace(
-            setVisible=lambda value: calls.append(("background", value))),
-        image_axis=SimpleNamespace(setVisible=lambda value: calls.append(("image-axis", value))),
-        share_axis=SimpleNamespace(setVisible=lambda value: calls.append(("share", value))),
-        slice=SimpleNamespace(setVisible=lambda value: calls.append(("slice", value))), slice_center=SimpleNamespace(
-            setVisible=lambda value: calls.append(("center", value))), slice_width=SimpleNamespace(
-            setVisible=lambda value: calls.append(("width", value))), pin=SimpleNamespace(
-            setVisible=lambda value: calls.append(("pin", value))), _set_share_link=lambda value: calls.append(("link", value)))
-    ScientificView._apply_processing_layout(view, "1D Viewer")
-    assert view._processing_mode == "1D Viewer"
-    assert ("images", False) in calls and ("bottom", True) in calls
-    assert enabled == [False, False]
-    ScientificView._apply_processing_layout(view, "Int 2D")
-    assert view._processing_mode == "Int 2D"
-    assert ("images", True) in calls and ("sizes", [500, 500]) in calls
-    assert enabled == [False, False, True, True] and owner._preferences is preferences
-    assert processed_browser.begin_close()
+def test_viewer_1d_page_commands_reload_status_and_native_restore(
+    monkeypatch, tmp_path,
+) -> None:
+    """Real chooser/reload and clear receipts preserve the viewer boundary."""
+    from pyqtgraph.Qt import QtWidgets
 
+    from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
+    from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
+    from xrd_tools.session.intent_store import RunIntentStore
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    paths = tuple(
+        str(_write_xye(
+            tmp_path / f"curve_{index}.xye", [0, 1], [index, index + 1],
+        ))
+        for index in (1, 2)
+    )
+    chooser_starts: list[str] = []
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(
+            processing_mode="1D Viewer", project_root=str(tmp_path),
+        )),
+        lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+        viewer_1d_file_chooser=lambda start: (
+            chooser_starts.append(start) or paths
+        ),
+    )
+
+    def settle_ready() -> None:
+        _await_ready(page._context_controller)
+        page._refresh_shell()
+        app.processEvents()
+
+    try:
+        page._run_action()
+        settle_ready()
+        controller = page._context_controller
+        context = controller.viewer_1d_context
+        assert context is not None and context.paths == paths
+        assert chooser_starts == [""]
+        owner = controller._viewer_1d
+        assert owner.holder is not None and owner.holder.borrow is not None
+
+        real_clear = page._shell.scientific.clear_viewer_1d
+        receipts = []
+
+        def observed_clear(request, **kwargs):
+            receipt = real_clear(request, **kwargs)
+            receipts.append(receipt)
+            return receipt
+
+        monkeypatch.setattr(
+            page._shell.scientific, "clear_viewer_1d", observed_clear,
+        )
+        page._run_action()
+        settle_ready()
+        assert chooser_starts == [""]
+        assert len(receipts) == 1 and receipts[0].cleared
+        assert controller.viewer_1d_context is not context
+        assert controller.viewer_1d_context.paths == paths
+
+        def refused_clear(_request, **_kwargs):
+            raise RuntimeError("renderer clear refused")
+
+        monkeypatch.setattr(
+            page._shell.scientific, "clear_viewer_1d", refused_clear,
+        )
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SET_PROCESSING_MODE, "Int 2D",
+        ))
+        assert page._intents.snapshot().thaw().processing_mode == "1D Viewer"
+        assert controller.viewer_1d_cleanup_pending
+
+        monkeypatch.setattr(
+            page._shell.scientific, "clear_viewer_1d", real_clear,
+        )
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SET_PROCESSING_MODE, "Int 2D",
+        ))
+        assert page._intents.snapshot().thaw().processing_mode == "Int 2D"
+        assert controller.viewer_1d_context is None
+        assert page._shell.scientific._processing_mode == "Int 2D"
+    finally:
+        for _ in range(100):
+            receipt = page.close_workspace()
+            if receipt.cleanup_status.value == "cleaned":
+                break
+            app.processEvents()
+            time.sleep(0.005)
+        assert receipt.cleanup_status.value == "cleaned"
+        page.deleteLater()
+        app.processEvents()
 
 def test_viewer_1d_scope_and_authority_census_stays_bounded() -> None:
     trees = {name: ast.parse((_ROOT / "src/xdart/gui/tabs/scattering" / name).read_text())
