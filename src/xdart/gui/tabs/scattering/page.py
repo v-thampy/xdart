@@ -3202,10 +3202,28 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     tool is Tool.XYE_VIEWER
                     or mode == "Int 1D (XYE)" and value.lower().endswith(".xye"))):
                 selected = command.artifacts or (value,)
-                if command.intent is FrameSelectionIntent.VISIT:
-                    _current, prior = self._context_controller.viewer_1d_artifact_selection
-                    selected = tuple(dict.fromkeys((*prior, *selected)))
-                self._open_viewer_1d_paths(selected, current_path=value)
+                current_path = value
+                if command.intent is not FrameSelectionIntent.EXACT:
+                    current, prior = self._context_controller.viewer_1d_artifact_selection
+                    if command.intent is FrameSelectionIntent.TOGGLE_TRACE:
+                        selected = tuple(
+                            path for path in prior if path not in selected
+                        ) + tuple(
+                            path for path in selected if path not in prior
+                        )
+                    elif command.intent is FrameSelectionIntent.REMOVE_TRACE_RANGE:
+                        selected = tuple(
+                            path for path in prior if path not in selected
+                        )
+                    else:
+                        selected = tuple(dict.fromkeys((*prior, *selected)))
+                    if not selected:
+                        return
+                    current_path = (
+                        value if value in selected else current
+                        if current in selected else selected[-1]
+                    )
+                self._open_viewer_1d_paths(selected, current_path=current_path)
                 return
             if tool is Tool.IMAGE_VIEWER and type(value) is str and value:
                 self._open_viewer_2d_path(value)

@@ -337,7 +337,14 @@ def test_resident_artifact_subset_reuses_batch_and_new_file_keeps_clear_fence(vi
     monkeypatch.undo()
 
 
-def test_overlay_file_visits_keep_previous_curves(viewer):
+@pytest.mark.parametrize(
+    "modifiers",
+    (
+        QtCore.Qt.KeyboardModifier.ControlModifier,
+        QtCore.Qt.KeyboardModifier.MetaModifier,
+    ),
+)
+def test_overlay_file_visits_keep_previous_curves(viewer, modifiers):
     app, page, paths = viewer
     scans = page._shell.browser.scans
 
@@ -361,10 +368,96 @@ def test_overlay_file_visits_keep_previous_curves(viewer):
     assert {trace.title for trace in page._last_scientific_projection.traces} == {
         f"curve_{index}.xye" for index in (0, 1, 6)}
     assert len(_mounted(page)) == 3
-    click(paths[0], QtCore.Qt.KeyboardModifier.ControlModifier)
+    click(paths[0], modifiers)
     _assert_curves(page, 2)
     assert {trace.title for trace in page._last_scientific_projection.traces} == {
         "curve_1.xye", "curve_6.xye"}
+
+
+def test_overlay_file_shift_visit_removes_artifact_range(viewer):
+    app, page, paths = viewer
+    scans = page._shell.browser.scans
+
+    def click(path, modifiers=QtCore.Qt.KeyboardModifier.NoModifier):
+        item = next(
+            scans.item(row) for row in range(scans.count())
+            if scans.item(row).data(QtCore.Qt.ItemDataRole.UserRole) == path
+        )
+        scans.scrollToItem(item)
+        QtTest.QTest.mouseClick(
+            scans.viewport(), QtCore.Qt.MouseButton.LeftButton,
+            modifiers, scans.visualItemRect(item).center(),
+        )
+        _ready(app, page)
+
+    click(paths[0])
+    _mode(app, page, "Overlay")
+    for path in paths[1:4]:
+        click(path)
+    _assert_curves(page, 4)
+    click(paths[1], QtCore.Qt.KeyboardModifier.ShiftModifier)
+    _assert_curves(page, 1)
+    assert page._context_controller.viewer_1d_artifact_selection == (
+        paths[0], (paths[0],),
+    )
+
+
+@pytest.mark.parametrize("viewer", ("1D Viewer", "Int 1D (XYE)"), indirect=True)
+@pytest.mark.parametrize(
+    ("start", "key", "expected"),
+    ((0, QtCore.Qt.Key.Key_Down, 1), (1, QtCore.Qt.Key.Key_Up, 0)),
+)
+def test_overlay_keypad_arrows_visit_adjacent_artifacts(viewer, start, key, expected):
+    app, page, paths = viewer
+    scans = page._shell.browser.scans
+    item = next(
+        scans.item(row) for row in range(scans.count())
+        if scans.item(row).data(QtCore.Qt.ItemDataRole.UserRole) == paths[start]
+    )
+    scans.scrollToItem(item)
+    QtTest.QTest.mouseClick(
+        scans.viewport(), QtCore.Qt.MouseButton.LeftButton,
+        QtCore.Qt.KeyboardModifier.NoModifier, scans.visualItemRect(item).center(),
+    )
+    _ready(app, page)
+    _mode(app, page, "Overlay")
+    scans.setFocus()
+    QtTest.QTest.keyClick(
+        scans, key, QtCore.Qt.KeyboardModifier.KeypadModifier,
+    )
+    _ready(app, page)
+    _assert_curves(page, 2)
+    current, selected = page._context_controller.viewer_1d_artifact_selection
+    assert current == paths[expected]
+    assert selected == (paths[start], paths[expected])
+
+
+@pytest.mark.parametrize("viewer", ("1D Viewer", "Int 1D (XYE)"), indirect=True)
+def test_overlay_file_visits_highlight_only_current_artifact(viewer):
+    app, page, paths = viewer
+    scans = page._shell.browser.scans
+
+    def click(path):
+        item = next(
+            scans.item(row) for row in range(scans.count())
+            if scans.item(row).data(QtCore.Qt.ItemDataRole.UserRole) == path
+        )
+        scans.scrollToItem(item)
+        QtTest.QTest.mouseClick(
+            scans.viewport(), QtCore.Qt.MouseButton.LeftButton,
+            QtCore.Qt.KeyboardModifier.NoModifier, scans.visualItemRect(item).center(),
+        )
+        _ready(app, page)
+
+    click(paths[0])
+    _mode(app, page, "Overlay")
+    click(paths[1])
+    _assert_curves(page, 2)
+    assert tuple(
+        item.data(QtCore.Qt.ItemDataRole.UserRole)
+        for item in scans.selectedItems()
+    ) == (paths[1],)
+    assert scans.currentItem().data(QtCore.Qt.ItemDataRole.UserRole) == paths[1]
 
 
 @pytest.mark.parametrize("mode", ("Single", "Overlay"))

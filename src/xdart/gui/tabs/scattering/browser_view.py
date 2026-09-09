@@ -204,11 +204,25 @@ class _ArtifactNavigationFilter(QtCore.QObject):
             return False
         view = self._view
         if event_type == QtCore.QEvent.Type.MouseButtonPress:
-            if (event.button() == QtCore.Qt.MouseButton.LeftButton
-                    and event.modifiers() == QtCore.Qt.KeyboardModifier.NoModifier):
-                index = view.indexAt(event.position().toPoint())
-                if index.isValid():
-                    return self._visit_artifact(view.item(index.row()))
+            if event.button() != QtCore.Qt.MouseButton.LeftButton:
+                return False
+            index = view.indexAt(event.position().toPoint())
+            if not index.isValid():
+                return False
+            modifiers = event.modifiers()
+            if modifiers & QtCore.Qt.KeyboardModifier.ShiftModifier:
+                intent = FrameSelectionIntent.REMOVE_TRACE_RANGE
+            elif modifiers & (
+                QtCore.Qt.KeyboardModifier.ControlModifier
+                | QtCore.Qt.KeyboardModifier.MetaModifier
+            ):
+                intent = FrameSelectionIntent.TOGGLE_TRACE
+            elif modifiers == QtCore.Qt.KeyboardModifier.NoModifier:
+                intent = FrameSelectionIntent.VISIT
+            else:
+                return False
+            if self._visit_artifact(view.item(index.row()), intent):
+                return True
             return False
         if event.type() == QtCore.QEvent.Type.MouseButtonDblClick:
             index = view.indexAt(event.position().toPoint())
@@ -226,7 +240,10 @@ class _ArtifactNavigationFilter(QtCore.QObject):
                 return True
             return False
         if (event.type() != QtCore.QEvent.Type.KeyPress
-                or event.modifiers() != QtCore.Qt.KeyboardModifier.NoModifier
+                or event.modifiers() not in {
+                    QtCore.Qt.KeyboardModifier.NoModifier,
+                    QtCore.Qt.KeyboardModifier.KeypadModifier,
+                }
                 or event.key() not in (QtCore.Qt.Key.Key_Up, QtCore.Qt.Key.Key_Down)):
             return False
         step = -1 if event.key() == QtCore.Qt.Key.Key_Up else 1
@@ -655,7 +672,17 @@ class BrowserView(QtWidgets.QFrame):
             state.selected_artifacts
             or (() if not state.selected_scan else (state.selected_scan,))
         )
-        selection_contract = (selected_artifacts, state.selected_scan)
+        highlighted_artifacts = (
+            (state.selected_scan,)
+            if (
+                plot_mode in _VISIT_ACCUMULATING_PLOT_MODES
+                and state.selected_scan
+            )
+            else selected_artifacts
+        )
+        selection_contract = (
+            selected_artifacts, state.selected_scan, highlighted_artifacts,
+        )
         current_item = self.scans.currentItem()
         current_identifier = (
             None if current_item is None else current_item.data(_USER_ROLE)
@@ -680,7 +707,7 @@ class BrowserView(QtWidgets.QFrame):
             current_artifact_item = None
             for index in range(self.scans.count()):
                 item = self.scans.item(index)
-                item.setSelected(item.data(_USER_ROLE) in selected_artifacts)
+                item.setSelected(item.data(_USER_ROLE) in highlighted_artifacts)
                 if item.data(_USER_ROLE) == state.selected_scan:
                     current_artifact_item = item
             if current_artifact_item is not None:
@@ -779,17 +806,39 @@ class BrowserView(QtWidgets.QFrame):
         self.auto_last.setChecked(state.auto_last)
         del blockers
 
-    def _visit_artifact(self, item) -> bool:
+    def _visit_artifact(
+        self,
+        item,
+        intent: FrameSelectionIntent = FrameSelectionIntent.VISIT,
+    ) -> bool:
         if (item.data(_DIRECTORY_ROLE)
                 or self._plot_mode not in _VISIT_ACCUMULATING_PLOT_MODES
                 or self.scans.selectionMode()
                 != QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection):
             return False
+        anchor = self.scans.currentItem()
+        artifacts = (item.data(_USER_ROLE),)
+        if intent is FrameSelectionIntent.REMOVE_TRACE_RANGE and anchor is not None:
+            first, last = sorted((self.scans.row(anchor), self.scans.row(item)))
+            artifacts = tuple(
+                candidate.data(_USER_ROLE)
+                for row in range(first, last + 1)
+                if not (candidate := self.scans.item(row)).data(_DIRECTORY_ROLE)
+            )
         blocker = QtCore.QSignalBlocker(self.scans)
         self.scans.setCurrentItem(
             item, QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
         del blocker
-        self._scan_selected(FrameSelectionIntent.VISIT)
+        if intent is FrameSelectionIntent.VISIT:
+            self._scan_selected(intent)
+        else:
+            self.commandRequested.emit(ShellCommand(
+                ShellCommandKind.SELECT_SCAN,
+                item.data(_USER_ROLE),
+                path=("artifact",),
+                artifacts=artifacts,
+                intent=intent,
+            ))
         return True
 
     def _scan_selected(self, intent=FrameSelectionIntent.EXACT) -> None:
