@@ -63,12 +63,22 @@ def test_completed_run_selected_artifact_enters_2d_viewer(tmp_path, outgoing):
         assert _wait(app, lambda: page._progress.terminal and page._start_permitted()[0]), page._notice_text
         artifact = controller.navigation.current.artifact
         assert Path(artifact).is_file()
+        # A subsequent XYE-only Run leaves this earlier NeXus on disk, while
+        # its nominal artifact path remains in acquisition navigation.
+        prior_run = controller.run_identity
+        page._shell.run_controls.modeCombo.setCurrentText("Int 1D (XYE)")
+        page._shell.run_controls.startButton.click()
+        assert _wait(app, lambda: controller.run_identity is not prior_run
+                     and page._progress.terminal and page._start_permitted()[0]), page._notice_text
+        assert _wait(app, lambda: controller.viewer_1d_context is not None
+                     and controller.viewer_1d_context.state.value == "ready"), page._notice_text
+        assert controller.browse_context is None
+        page._shell.run_controls.modeCombo.setCurrentText(outgoing)
         # Re-select the completed run's existing file through its actual command.
         page._handle_shell_command(ShellCommand(
             ShellCommandKind.SELECT_SCAN, artifact, path=("artifact",),
             artifacts=(artifact,)))
         assert controller.selection.kind is ContextKind.ACQUISITION
-        page._shell.run_controls.modeCombo.setCurrentText(outgoing)
         page._shell.run_controls.modeCombo.setCurrentText("2D Viewer")
         assert _wait(app, lambda: controller.viewer_2d_frame is not None
                      and page._shell.scientific._viewer_2d_payload is not None), page._notice_text
