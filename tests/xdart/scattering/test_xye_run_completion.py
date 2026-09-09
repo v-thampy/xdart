@@ -32,6 +32,56 @@ def _wait(app, predicate, timeout=15.0):
     return False
 
 
+@pytest.mark.parametrize("outgoing", ("Int 1D", "Int 1D (XYE)"))
+def test_completed_run_selected_artifact_enters_2d_viewer(tmp_path, outgoing):
+    from xdart.modules.display_context import ContextKind
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    images = np.arange(3 * 8 * 8, dtype=np.uint16).reshape(3, 8, 8)
+    for index, image in enumerate(images, 1):
+        tifffile.imwrite(tmp_path / f"raw_{index:04d}.tif", image)
+    poni = tmp_path / "calibration.poni"
+    poni.write_text('poni_version: 2\nDetector: Detector\n'
+        'Detector_config: {"pixel1": 0.000172, "pixel2": 0.000172, "max_shape": [8, 8]}\n'
+        'Distance: 0.1234\nPoni1: 0.01\nPoni2: 0.01\n'
+        'Rot1: 0.0\nRot2: 0.0\nRot3: 0.0\nWavelength: 1.0e-10\n')
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(
+            source_spec=image_series_spec(tmp_path / "raw_0001.tif"),
+            poni_file=str(poni), project_root=str(tmp_path),
+            save_path=str(tmp_path / "output"), output_mode="Overwrite",
+            processing_mode="Int 1D", max_cores=1, bai_1d_args={"npt": 16},
+        )),
+        lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(),
+        executor=StandardRunExecutor(join_timeout=2.0),
+    )
+    page.resize(1400, 1000)
+    page.show()
+    controller = page._context_controller
+    try:
+        page._shell.run_controls.startButton.click()
+        assert _wait(app, lambda: page._progress.terminal and page._start_permitted()[0]), page._notice_text
+        artifact = controller.navigation.current.artifact
+        assert Path(artifact).is_file()
+        # Re-select the completed run's existing file through its actual command.
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SELECT_SCAN, artifact, path=("artifact",),
+            artifacts=(artifact,)))
+        assert controller.selection.kind is ContextKind.ACQUISITION
+        page._shell.run_controls.modeCombo.setCurrentText(outgoing)
+        page._shell.run_controls.modeCombo.setCurrentText("2D Viewer")
+        assert _wait(app, lambda: controller.viewer_2d_frame is not None
+                     and page._shell.scientific._viewer_2d_payload is not None), page._notice_text
+        assert controller.viewer_2d_context.original_path == artifact
+        assert "Loading" not in page._shell.scientific.status.text()
+        assert len(controller.navigation.frames) == 3
+        np.testing.assert_array_equal(controller.viewer_2d_frame.array, images[0])
+    finally:
+        assert _wait(app, lambda: page.close_workspace().cleanup_status is CleanupStatus.CLEANED)
+        page.deleteLater()
+        app.processEvents()
+
+
 @pytest.mark.parametrize("source_kind,batch,unit,prefix", [
     ("tiff", False, "q_A^-1", "iq"),
     ("hdf", True, "2th_deg", "itth"),

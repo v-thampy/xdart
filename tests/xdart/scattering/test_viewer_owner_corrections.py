@@ -61,6 +61,15 @@ def test_switch_processed_browse_to_2d_viewer_loads_current_source(processed_pag
                                   np.arange(16).reshape(4, 4))
 
 
+def test_xye_mode_with_selected_browse_enters_2d_through_mode_widget(processed_page):
+    app, page, path, _ = processed_page
+    page._shell.run_controls.modeCombo.setCurrentText("Int 1D (XYE)")
+    page._shell.run_controls.modeCombo.setCurrentText("2D Viewer")
+    _wait(page, app, lambda: page._context_controller.viewer_2d_frame is not None
+          and page._shell.scientific._viewer_2d_payload is not None)
+    assert page._context_controller.viewer_2d_context.original_path == str(path)
+
+
 def test_ready_processed_2d_viewer_qualifies_its_exact_nexus_revision(
         processed_page):
     app, page, path, _ = processed_page
