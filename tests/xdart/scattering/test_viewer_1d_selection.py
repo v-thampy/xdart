@@ -2,10 +2,11 @@
 
 import time
 from pathlib import Path
+from threading import Event
 
 import numpy as np
 import pytest
-from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtTest, QtWidgets
 
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
@@ -36,14 +37,14 @@ def _ready(app, page):
 
 
 @pytest.fixture
-def viewer(tmp_path):
+def viewer(tmp_path, request):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     paths = tuple(str(tmp_path / f"curve_{index}.xye") for index in range(7))
     for index, path in enumerate(paths):
         np.savetxt(path, np.column_stack((np.arange(3),
             np.arange(3) + 10 * (index + 1), np.ones(3))))
     page = ScatteringWorkspace(
-        intents=RunIntentStore(RunIntent(processing_mode="1D Viewer",
+        intents=RunIntentStore(RunIntent(processing_mode=getattr(request, "param", "1D Viewer"),
                                        project_root=str(tmp_path))),
         lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(),
     )
@@ -168,6 +169,78 @@ def test_overlay_frame_click_moves_keyboard_focus_from_files(viewer):
     assert app.focusWidget() is browser.frames
     QtTest.QTest.keyClick(app.focusWidget(), QtCore.Qt.Key.Key_Down)
     _settle(app, .3)
+    _assert_curves(page, 3)
+
+
+@pytest.mark.parametrize("viewer", ("1D Viewer", "Int 1D (XYE)"), indirect=True)
+@pytest.mark.parametrize("mode", ("Single", "Overlay"))
+def test_held_scans_arrows_keep_position_during_real_reader_work(viewer, monkeypatch, mode):
+    from xrd_tools.io import viewer_1d as reader
+
+    app, page, paths = viewer
+    assert page._clear_viewer_1d_renderer(paths=paths[:1], current_path=paths[0])
+    _ready(app, page)
+    _mode(app, page, mode)
+    scans = page._shell.browser.scans
+    scans.setFocus()
+    release, entered = Event(), Event()
+    read = reader._read_text
+
+    def delayed_read(*args, **kwargs):
+        entered.set()
+        assert release.wait(5), "test did not release the real XYE reader"
+        return read(*args, **kwargs)
+
+    monkeypatch.setattr(reader, "_read_text", delayed_read)
+    try:
+        for index in range(1, 5):
+            event = QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress, QtCore.Qt.Key.Key_Down,
+                QtCore.Qt.KeyboardModifier.NoModifier, "", index > 1, 1)
+            app.sendEvent(scans, event)
+            assert entered.wait(.5)
+            # A timer/shell refresh while source I/O is pending must not move
+            # the native keyboard anchor back to the first file.
+            page._refresh_shell()
+            current = scans.currentItem()
+            assert current is not None
+            assert current.data(QtCore.Qt.ItemDataRole.UserRole) == paths[index]
+        QtTest.QTest.keyRelease(scans, QtCore.Qt.Key.Key_Down)
+    finally:
+        release.set()
+    _ready(app, page)
+    assert page._context_controller.viewer_1d_context.current_path == paths[4]
+    _assert_curves(page, 5 if mode == "Overlay" else 1)
+
+
+@pytest.mark.parametrize("viewer", ("1D Viewer", "Int 1D (XYE)"), indirect=True)
+def test_overlay_scans_clicks_accumulate_while_next_file_loads(viewer, monkeypatch):
+    from xrd_tools.io import viewer_1d as reader
+
+    app, page, paths = viewer
+    assert page._clear_viewer_1d_renderer(paths=paths[:1], current_path=paths[0])
+    _ready(app, page)
+    _mode(app, page, "Overlay")
+    scans = page._shell.browser.scans
+    release, entered = Event(), Event()
+    read = reader._read_text
+
+    def delayed_read(*args, **kwargs):
+        entered.set()
+        assert release.wait(5), "test did not release the real XYE reader"
+        return read(*args, **kwargs)
+
+    monkeypatch.setattr(reader, "_read_text", delayed_read)
+    try:
+        for path in paths[1:3]:
+            item = next(scans.item(i) for i in range(scans.count())
+                if scans.item(i).data(QtCore.Qt.ItemDataRole.UserRole) == path)
+            QtTest.QTest.mouseClick(scans.viewport(), QtCore.Qt.MouseButton.LeftButton,
+                QtCore.Qt.KeyboardModifier.NoModifier, scans.visualItemRect(item).center())
+            assert entered.wait(.5)
+        assert page._context_controller.viewer_1d_context.paths == paths[:3]
+    finally:
+        release.set()
+    _ready(app, page)
     _assert_curves(page, 3)
 
 

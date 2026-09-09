@@ -667,6 +667,12 @@ class BrowserView(QtWidgets.QFrame):
             or selected_identifiers != self._applied_artifact_selection
             or current_identifier != self._applied_current_artifact
         )
+        if os.environ.get("XDART_VIEWER_DEBUG") == "1" and reconcile_artifact_selection:
+            print("viewer_artifact_projection", {
+                "mode": plot_mode, "ui_current": current_identifier,
+                "projected_current": state.selected_scan,
+                "projected_paths": selected_artifacts,
+            }, flush=True)
         if reconcile_artifact_selection:
             current_artifact_item = None
             for index in range(self.scans.count()):
@@ -839,6 +845,11 @@ class BrowserView(QtWidgets.QFrame):
                 ),
             ).data(_USER_ROLE)
         )
+        if os.environ.get("XDART_VIEWER_DEBUG") == "1":
+            print("viewer_artifact_visit", {
+                "intent": intent.value, "current": current_artifact,
+                "paths": artifacts, "row": current_row,
+            }, flush=True)
         self.commandRequested.emit(ShellCommand(
             ShellCommandKind.SELECT_SCAN,
             current_artifact,
