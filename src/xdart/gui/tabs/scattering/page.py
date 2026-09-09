@@ -6376,7 +6376,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if viewer_2d
                 else False
             )
-            if not viewer_loading and not (cache_adoption_missing and cache_retry_needed):
+            # A read may finish during a control-only refresh. Keep the raster
+            # until the scientific refresh actually installs its replacement.
+            if (not preserve_scientific and not viewer_loading
+                    and not (cache_adoption_missing and cache_retry_needed)):
                 self._shell.scientific.drop_viewer_loading_snapshot()
             if rebind_scientific_navigation:
                 prior_scientific = self._last_scientific_projection

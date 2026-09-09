@@ -163,7 +163,7 @@ def test_rapid_raw_frame_selection_keeps_one_preview_and_adopts_latest(
                 and view.raw.isVisible()
                 and view.raw.image.image is None
                 and not view.viewer_loading_snapshot_visible
-            ):
+                ):
                 self.paints += 1
             return False
 
