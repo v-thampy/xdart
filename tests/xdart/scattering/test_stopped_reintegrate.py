@@ -14,6 +14,7 @@ from pyqtgraph.Qt import QtWidgets
 import tifffile
 
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
+from xdart.gui.tabs.scattering.adapters import dynamic_output as dynamic_output_module
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.display_values import StandardEventKind
@@ -23,7 +24,7 @@ from xrd_tools.io.record_writer import _decode_replacement_fact
 from xrd_tools.reduction import ReintegrateSuccessorPlan, run_reintegrate_successor
 from xrd_tools.reduction import reintegrate
 from xrd_tools.session.intent_store import RunIntentStore
-from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.session.run_configuration import GIIntent, RunIntent
 from xrd_tools.sources.image import TiffSeriesSource
 from xrd_tools.sources.nexus import NexusStackSource
 from xrd_tools.sources.selection import image_series_spec
@@ -37,6 +38,303 @@ def _wait(app, predicate, timeout=30.0):
             return True
         time.sleep(0.005)
     return False
+
+
+def test_real_gi_stopped_append_reuses_the_original_freeze_extent(
+    tmp_path, monkeypatch,
+):
+    """Append retains the full GI grid even though only the suffix is written."""
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fixture_root = Path("/Users/vthampy/repos/test_data/Tiff")
+    raw = fixture_root / "Combi4_Angledependence_samz_4p9_03271005_0001.tif"
+    poni = fixture_root / "LaB6_detz190_dety72_th5_03261554_0001.poni"
+    mask = fixture_root / "mask.edf"
+    assert all(path.is_file() for path in (raw, poni, mask))
+    assert len(tuple(fixture_root.glob(
+        "Combi4_Angledependence_samz_4p9_03271005_*.tif"
+    ))) == 16
+
+    entered, release = Event(), Event()
+    original_read = TiffSeriesSource._read_path
+    observed_freezes = []
+    completed_labels = []
+    open_session = dynamic_output_module.open_headless_scan_session
+    frame_ready = StandardRunExecutor._frame_ready
+    close_run = StandardRunExecutor._close_run
+
+    def observe_close(executor, identity):
+        run = executor._exact_run(identity)
+        if run is not None:
+            transport = run.display._transport
+            print("GI_CLOSE_START", run.closed, [(None if entry is None else
+                (entry.state, type(entry.request).__name__)) for entry in
+                (transport._active, transport._queued)], flush=True)
+        try:
+            receipt = close_run(executor, identity)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            raise
+        if receipt.cleanup_status is not CleanupStatus.CLEANED:
+            print("GI_CLOSE_PENDING", receipt, flush=True)
+        return receipt
+
+    monkeypatch.setattr(StandardRunExecutor, "_close_run", observe_close)
+    from xdart.gui.tabs.scattering.display_runtime import RunDisplayState
+    release_light = RunDisplayState.release_light_1d
+
+    def observe_release(display, owner, **kwargs):
+        clean = release_light(display, owner, **kwargs)
+        if not clean:
+            lease = owner.light_lease
+            print("GI_RELEASE_PENDING", kwargs, "lease", None if lease is None else lease.state,
+                  "slot", None if owner.light_slot is None else owner.light_slot.state,
+                  "allocation", owner.publications.allocation is not None,
+                  "light", owner.publications._light_1d is not None,
+                  "subscription", owner.light_unsubscribe is not None,
+                  "reservations", None if lease is None else lease.authority.snapshot(), flush=True)
+        return clean
+
+    monkeypatch.setattr(RunDisplayState, "release_light_1d", observe_release)
+
+    def paced_read(source, path):
+        if Path(path).stem.endswith("_0009"):
+            entered.set()
+            assert release.wait(60.0), "TIFF source pacing not released"
+        return original_read(source, path)
+
+    monkeypatch.setattr(TiffSeriesSource, "_read_path", paced_read)
+
+    def observe_freeze(scan, plan, *args, **kwargs):
+        observed = {
+            "frames": tuple(int(frame.index) for frame in scan.frames),
+            "th": tuple(
+                scan._frame_by_index[int(frame.index)].metadata.get("th")
+                for frame in scan.frames
+            ),
+            "radial": None,
+            "azimuth": None,
+        }
+        observed_freezes.append(observed)
+        session = open_session(scan, plan, *args, **kwargs)
+        frozen = session._session.plan.integration_1d
+        observed["radial"] = frozen.radial_range
+        observed["azimuth"] = frozen.azimuth_range
+        return session
+
+    def observe_frame_ready(executor, run, event):
+        completed_labels.append(int(event.frame_index))
+        return frame_ready(executor, run, event)
+
+    monkeypatch.setattr(
+        dynamic_output_module, "open_headless_scan_session", observe_freeze,
+    )
+    monkeypatch.setattr(StandardRunExecutor, "_frame_ready", observe_frame_ready)
+    target = tmp_path / "stopped-append.nxs"
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(
+            source_spec=image_series_spec(raw), poni_file=str(poni),
+            mask_file=str(mask), project_root=str(fixture_root.parent),
+            save_path=str(target), output_mode="Overwrite",
+            processing_mode="Int 2D", max_cores=4,
+            bai_1d_args={"npt": 1000, "method": "csr"},
+            bai_2d_args={"npt_rad": 500, "npt_azim": 500, "method": "csr"},
+            gi=GIIntent(
+                enabled=True, incidence_motor="th", mode_1d="q_ip",
+                mode_2d="qip_qoop",
+            ),
+        )),
+        lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(),
+        executor=StandardRunExecutor(join_timeout=60.0),
+    )
+    page.resize(1400, 1000)
+    page.show()
+    events = []
+    drain_events = page._run_executor.drain_events
+
+    def observe_events():
+        update = drain_events()
+        events.extend(update)
+        return update
+
+    monkeypatch.setattr(page._run_executor, "drain_events", observe_events)
+    try:
+        page._shell.run_controls.startButton.click()
+        assert _wait(app, entered.is_set, timeout=60.0), page._notice_text
+        page._shell.run_controls.stopButton.click()
+        release.set()
+        assert _wait(app, lambda: any(event.kind in {
+            StandardEventKind.STOPPED, StandardEventKind.FAILED,
+        } for event in events), timeout=60.0), page._notice_text
+        stopped = next(event for event in events if event.kind in {
+            StandardEventKind.STOPPED, StandardEventKind.FAILED,
+        })
+        assert stopped.kind is StandardEventKind.STOPPED, stopped
+        assert stopped.cleanup_status is CleanupStatus.CLEANED
+        assert 0 < stopped.completed < stopped.total == 16
+        assert _wait(
+            app, lambda: page._capture_current_loaded_browse() is not None,
+        )
+        artifact = Path(page._capture_current_loaded_browse().target)
+        print(
+            "GI_STOP_FREEZE",
+            f"frames={observed_freezes[-1]['frames']}",
+            f"th={observed_freezes[-1]['th']}",
+            f"radial={observed_freezes[-1]['radial']}",
+            f"completed={tuple(completed_labels)}",
+            flush=True,
+        )
+        with h5py.File(artifact, "r") as document:
+            prefix = {
+                key: value[()].copy()
+                for key, value in document["entry/integrated_1d"].items()
+                if isinstance(value, h5py.Dataset)
+            }
+            prefix_2d = {
+                key: value[()].copy()
+                for key, value in document["entry/integrated_2d"].items()
+                if isinstance(value, h5py.Dataset)
+            }
+        assert prefix["intensity"].shape[0] == stopped.completed
+
+        page._shell.run_controls.writeModeButton.click()
+        assert _wait(
+            app,
+            lambda: page._intents.snapshot().thaw().output_mode == "Append",
+        )
+        terminal_offset = len(events)
+        assert _wait(app, page._shell.run_controls.startButton.isEnabled)
+        page._shell.run_controls.startButton.click()
+        assert _wait(app, lambda: any(event.kind in {
+            StandardEventKind.FINISHED, StandardEventKind.FAILED,
+        } for event in events[terminal_offset:]) or page._notice_text.startswith(
+            "Output admission failed:"), timeout=30.0), page._notice_text
+        assert any(event.kind in {StandardEventKind.FINISHED, StandardEventKind.FAILED}
+                   for event in events[terminal_offset:]), page._notice_text
+        resumed = next(event for event in events[terminal_offset:] if event.kind in {
+            StandardEventKind.FINISHED, StandardEventKind.FAILED,
+        })
+        print(
+            "GI_STOP_APPEND",
+            f"stopped={stopped.completed}/{stopped.total}",
+            f"resumed={resumed.kind.value}:{resumed.completed}/{resumed.total}",
+            f"append_frames={observed_freezes[-1]['frames']}",
+            f"append_th={observed_freezes[-1]['th']}",
+            f"append_radial={observed_freezes[-1]['radial']}",
+            page._notice_text,
+            flush=True,
+        )
+        assert resumed.kind is StandardEventKind.FINISHED, resumed
+        assert resumed.cleanup_status is CleanupStatus.CLEANED
+        assert resumed.completed == resumed.total == 16
+        with h5py.File(artifact, "r") as document:
+            resumed_1d = {
+                key: value[()].copy()
+                for key, value in document["entry/integrated_1d"].items()
+                if isinstance(value, h5py.Dataset)
+            }
+            resumed_2d = {
+                key: value[()].copy()
+                for key, value in document["entry/integrated_2d"].items()
+                if isinstance(value, h5py.Dataset)
+            }
+        for key, values in prefix.items():
+            if values.ndim == 1:
+                np.testing.assert_array_equal(
+                    resumed_1d[key][: values.shape[0]], values,
+                )
+            else:
+                np.testing.assert_array_equal(
+                    resumed_1d[key][: values.shape[0], ...], values,
+                )
+        for key, values in prefix_2d.items():
+            actual = (
+                resumed_2d[key][: values.shape[0], ...]
+                if values.ndim and values.shape[0] == stopped.completed
+                else resumed_2d[key]
+            )
+            np.testing.assert_array_equal(actual, values)
+    finally:
+        release.set()
+        assert _wait(
+            app,
+            lambda: page.close_workspace().cleanup_status is CleanupStatus.CLEANED,
+            timeout=60.0,
+        )
+        page.deleteLater()
+        app.processEvents()
+
+    reference_target = tmp_path / "full.nxs"
+    reference = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(
+            source_spec=image_series_spec(raw), poni_file=str(poni),
+            mask_file=str(mask), project_root=str(fixture_root.parent),
+            save_path=str(reference_target), output_mode="Overwrite",
+            processing_mode="Int 2D", max_cores=4,
+            bai_1d_args={"npt": 1000, "method": "csr"},
+            bai_2d_args={"npt_rad": 500, "npt_azim": 500, "method": "csr"},
+            gi=GIIntent(
+                enabled=True, incidence_motor="th", mode_1d="q_ip",
+                mode_2d="qip_qoop",
+            ),
+        )),
+        lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(),
+        executor=StandardRunExecutor(join_timeout=60.0),
+    )
+    reference_events = []
+    reference_drain = reference._run_executor.drain_events
+
+    def observe_reference_events():
+        update = reference_drain()
+        reference_events.extend(update)
+        return update
+
+    monkeypatch.setattr(
+        reference._run_executor, "drain_events", observe_reference_events,
+    )
+    try:
+        reference._shell.run_controls.startButton.click()
+        assert _wait(app, lambda: any(event.kind in {
+            StandardEventKind.FINISHED, StandardEventKind.FAILED,
+        } for event in reference_events), timeout=120.0), reference._notice_text
+        completed = next(event for event in reference_events if event.kind in {
+            StandardEventKind.FINISHED, StandardEventKind.FAILED,
+        })
+        assert completed.kind is StandardEventKind.FINISHED, completed
+        assert completed.cleanup_status is CleanupStatus.CLEANED
+        assert _wait(
+            app, lambda: reference._capture_current_loaded_browse() is not None,
+        )
+        reference_artifact = Path(
+            reference._capture_current_loaded_browse().target,
+        )
+        with h5py.File(reference_artifact, "r") as document:
+            reference_1d = {
+                key: value[()].copy()
+                for key, value in document["entry/integrated_1d"].items()
+                if isinstance(value, h5py.Dataset)
+            }
+            reference_2d = {
+                key: value[()].copy()
+                for key, value in document["entry/integrated_2d"].items()
+                if isinstance(value, h5py.Dataset)
+            }
+        for key, values in reference_1d.items():
+            np.testing.assert_allclose(
+                resumed_1d[key], values, rtol=0.0, atol=0.0, equal_nan=True,
+            )
+        for key, values in reference_2d.items():
+            np.testing.assert_allclose(
+                resumed_2d[key], values, rtol=0.0, atol=0.0, equal_nan=True,
+            )
+    finally:
+        assert _wait(
+            app,
+            lambda: reference.close_workspace().cleanup_status is CleanupStatus.CLEANED,
+            timeout=60.0,
+        )
+        reference.deleteLater()
+        app.processEvents()
 
 
 @pytest.mark.parametrize("source_kind", ["stopped-tiff", "completed-tiff", "stopped-eiger"])

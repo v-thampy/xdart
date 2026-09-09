@@ -3252,6 +3252,34 @@ def test_e6pm2_moved_presentation_supersedes_the_displaced_ticket(
     assert ticket_a.result().outcome is HydrationOutcome.SUPERSEDED
 
 
+def test_retirement_does_not_requeue_a_retargeted_active_read(monkeypatch, tmp_path):
+    state, _owner, processed, _raw, _events = _bound_state(monkeypatch, tmp_path)
+    art_owner, gate = _acquisition_identity(state)
+    transport = state.transport
+    entered, release = _hold_reads(monkeypatch)
+    first = _admit(transport, _typed_request(
+        state, art_owner, gate, processed, 2, HydrationPurpose.PREVIEW, 1))
+    assert entered.wait(timeout=10.0)
+    latest = _admit(transport, _typed_request(
+        state, art_owner, gate, processed, 2, HydrationPurpose.PREVIEW, 2))
+    worker = transport.worker
+    try:
+        assert not transport.retire(join_timeout=0.0)
+        assert latest.result() is None  # the real read still owns its request
+        release.set()
+        worker.join(timeout=10.0)
+        assert not worker.is_alive()
+        assert transport.active_token is None
+        assert transport.queued_token is None
+        assert first.result().outcome is HydrationOutcome.SUPERSEDED
+        assert latest.result().outcome is HydrationOutcome.CANCELLED
+        assert transport.retire(join_timeout=0.0)
+    finally:
+        release.set()
+        worker.join(timeout=10.0)
+        transport.retire(join_timeout=1.0)
+
+
 def test_e6pm2_settlement_validates_token_and_is_first_wins(
     monkeypatch, tmp_path
 ):
