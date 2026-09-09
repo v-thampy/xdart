@@ -112,6 +112,13 @@ def _project(saved, preferences, *, selected=None, norm=""):
     return result
 
 
+@pytest.mark.parametrize("saved", [False], indirect=True)
+def test_full_chi_without_saved_cake_never_substitutes_native_q(saved):
+    result = _project(saved, ScientificPreferences(plot_axis="chi"))
+    assert not result.traces
+    assert "no saved 2-D data" in result.diagnostic
+
+
 @pytest.mark.parametrize("mode", ["Single", "Overlay", "Waterfall"])
 def test_saved_selected_cuts_use_half_width_nanmean_and_row_normalization(saved, mode):
     preferences = ScientificPreferences(plot_mode=mode, slice_enabled=True,

@@ -199,18 +199,3 @@ def test_full_chi_selection_never_presents_native_q(tmp_path, monkeypatch, mode,
     finally:
         _close(page, app)
 
-
-def test_full_chi_without_saved_cake_never_substitutes_native_q():
-    from xdart.gui.tabs.scattering.browse_slice_hydration import BrowseSliceLane
-    from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
-    from tests.xdart.scattering.e3_shell_support import make_shell_projection
-    from xrd_tools.core import Axis, FrameView
-
-    frame = make_shell_projection(frame_count=1).navigation.current
-    payload = StandardDisplayPayload(1, frame, "native only", FrameView(
-        label=frame.local_frame_label,
-        axis_1d=Axis("Q", "q_A^-1", values=np.array([1., 2., 3.])),
-        intensity_1d=np.array([2., 3., 4.]),
-    ))
-    with pytest.raises(RuntimeError, match="no saved 2-D data"):
-        BrowseSliceLane._cut(payload, "chi", False, 0., 1., "")
