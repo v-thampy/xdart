@@ -2793,17 +2793,16 @@ class StandardRunExecutor:
             if (
                 non_display_clean
                 and run.primary is not None
-                and run.completed == 0
                 and not run.display.payloads
-                and not run.display.catalog_snapshot().entries
+                and all(owner.publications.allocation is None
+                        and owner.publications._light_1d is None
+                        for owner in run.display.artifacts.values())
             ):
-                # A construction/first-frame failure can leave the display
-                # pointing at a lease and custody slot that lower-layer
-                # settlement has already terminalized.  There is no published
-                # or partial historical display in this exact zero-frame
-                # shape, so retire it here on the executor worker before the
-                # FAILED receipt is emitted.  Any genuinely pending owner
-                # keeps ``display_clean`` false and cleanup remains fail-closed.
+                # Failed construction can leave references to an already
+                # released lease/cancelled slot. Append counts persisted rows,
+                # so a nonzero catalog does not imply retained display arrays.
+                # Retire only after those arrays are gone; actual pending
+                # owners still withhold the CLEANED receipt.
                 try:
                     display_clean = run.display.retire(
                         join_timeout=self._join_timeout

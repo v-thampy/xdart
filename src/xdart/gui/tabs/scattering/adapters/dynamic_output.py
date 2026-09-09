@@ -1141,6 +1141,7 @@ class DynamicOutputAdapter:
             raise TypeError("dynamic GUI light mount requires one exact graph")
         lease = hooks = slot = None
         session = None
+        loaded_scout_frame = None
 
         preflight = None
         persisted_prefix_labels: tuple[int, ...] = ()
@@ -1264,8 +1265,13 @@ class DynamicOutputAdapter:
                                               else frame_count),
                     )
                     display_state.stage_light_1d(display_owner, lease)
-            session_scan = scan if not coordinated else replace(
+            # GI scouts must use the original scan extent on Append as well.
+            # The submission ledger independently admits only write_labels.
+            session_scan = scan if not coordinated or self.configuration.gi.enabled else replace(
                 scan, frames=[frame for frame in scan.frames if int(frame.index) in write_labels])
+            if self.configuration.gi.enabled and session_scan.frames[0].image is None:
+                loaded_scout_frame = session_scan.frames[0]
+                loaded_scout_frame.load_image()
             integration_1d = getattr(plan, "integration_1d", None)
             inflight_max = (
                 max(1, self.configuration.max_cores)
@@ -1389,6 +1395,9 @@ class DynamicOutputAdapter:
                     if pipeline_v2 is not None else None
                 ),
             )
+            if loaded_scout_frame is not None:
+                loaded_scout_frame.image = None
+                loaded_scout_frame = None
             if coordinated:
                 session.set_generation(int(self.configuration.generation))
             if lease is not None:
@@ -1516,6 +1525,8 @@ class DynamicOutputAdapter:
                 )
             return session, True
         except BaseException as primary:
+            if loaded_scout_frame is not None:
+                loaded_scout_frame.image = None
             if science_identity_was_unset and not self._graphs:
                 self._science_identity = None
             cleanup: BaseException | None = None
