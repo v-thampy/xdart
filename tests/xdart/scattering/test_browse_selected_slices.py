@@ -148,3 +148,69 @@ def test_slice_without_saved_cake_never_returns_native_trace(tmp_path):
                             slice_enabled=False, slice_center=0., slice_width=1.) is not None
     assert trace_projection(payload, requested_axis="Q", allow_cake=True,
                             slice_enabled=True, slice_center=0., slice_width=1.) is None
+
+
+@pytest.mark.parametrize("mode,count", [("Single", 4), ("Overlay", 4),
+                                        ("Single", 17), ("Waterfall", 4)])
+def test_full_chi_selection_never_presents_native_q(tmp_path, monkeypatch, mode, count):
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    path, _ = _write_processed(tmp_path / "source", schema_version=3,
+                               labels=tuple(range(1, count + 1)))
+    page, _ = _page(tmp_path, monkeypatch)
+    controller, view = page._context_controller, page._shell.scientific
+    presented = []
+    reconcile = view.reconcile
+
+    def observe(state, *args, **kwargs):
+        if page._preferences.plot_axis == "chi":
+            presented.append((state.plot_axis, tuple(trace.axis.unit for trace in state.traces)))
+        return reconcile(state, *args, **kwargs)
+
+    monkeypatch.setattr(view, "reconcile", observe)
+    try:
+        controller.begin_browse(str(path.resolve()))
+        assert _wait(app, controller.poll_browse, page).status is BrowseLoadStatus.READY
+        page._refresh_shell()
+        view.plot_mode.setCurrentText(mode)
+        frames = controller.navigation.frames
+        assert controller.select_navigation(frames[-1], frames)
+        _wait(app, lambda: _ready(page, count), page)
+        view.plot_axis.setCurrentIndex(view.plot_axis.findData("chi"))
+        assert page._preferences.plot_axis == "chi"
+        assert not page._preferences.slice_enabled
+        for current in (frames[-1], frames[0]):
+            assert controller.select_navigation(current, frames)
+            state = _wait(app, lambda: _ready(page, count), page)
+            assert presented and all(axis == "chi" and all(unit == "chi_deg" for unit in units)
+                                     for axis, units in presented), presented
+            assert tuple(trace.frame for trace in state.traces) == frames
+            for trace in state.traces:
+                np.testing.assert_array_equal(trace.axis.values, [-1., 1.])
+                np.testing.assert_array_equal(trace.intensity,
+                                              np.array([2., 3.]) + trace.frame.local_frame_label)
+                assert not trace.intensity.flags.writeable
+            if mode == "Waterfall" or count > 15:
+                assert view.bottom_waterfall_active
+        view.plot_axis.setCurrentIndex(view.plot_axis.findData("Q"))
+        state = _wait(app, lambda: _ready(page, count), page)
+        for trace in state.traces:
+            np.testing.assert_array_equal(trace.intensity,
+                                          np.array([1., 2., 3.]) + trace.frame.local_frame_label)
+    finally:
+        _close(page, app)
+
+
+def test_full_chi_without_saved_cake_never_substitutes_native_q():
+    from xdart.gui.tabs.scattering.browse_slice_hydration import BrowseSliceLane
+    from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
+    from tests.xdart.scattering.e3_shell_support import make_shell_projection
+    from xrd_tools.core import Axis, FrameView
+
+    frame = make_shell_projection(frame_count=1).navigation.current
+    payload = StandardDisplayPayload(1, frame, "native only", FrameView(
+        label=frame.local_frame_label,
+        axis_1d=Axis("Q", "q_A^-1", values=np.array([1., 2., 3.])),
+        intensity_1d=np.array([2., 3., 4.]),
+    ))
+    with pytest.raises(RuntimeError, match="no saved 2-D data"):
+        BrowseSliceLane._cut(payload, "chi", False, 0., 1., "")
