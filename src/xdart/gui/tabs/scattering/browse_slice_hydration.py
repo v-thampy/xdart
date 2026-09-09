@@ -209,10 +209,11 @@ class BrowseSliceLane:
                 observed.st_mtime_ns, observed.st_ctime_ns)
 
     def _cut(self, payload, axis, sliced, center, width, norm):
-        if sliced:
+        if sliced or axis == "chi":
             if not payload.view.has_2d:
                 raise RuntimeError(f"Browse slice has no saved 2-D data for frame {payload.view.label}")
-            # A cut can be empty; it must never fall back to the stored full 1-D row.
+            # Cuts and full chi projections require a cake. Neither may fall
+            # back to the stored radial 1-D row while that cake is unavailable.
             payload = replace(payload, view=replace(
                 payload.view, axis_1d=None, intensity_1d=None, sigma_1d=None,
             ))

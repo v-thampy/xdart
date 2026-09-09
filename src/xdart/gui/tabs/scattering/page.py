@@ -6072,6 +6072,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         browse_selected = bool(
             selection is not None and selection.kind is ContextKind.BROWSE
         )
+        requested_plot_axis = self._preferences.plot_axis
+        if self._preferences.share_axis:
+            requested_plot_axis = (
+                share_plot_axis_for_image(self._preferences.image_axis)
+                or requested_plot_axis
+            )
         browse_cache_supported = bool(
             browse_selected
             and intent.processing_mode in {"Int 1D", "Int 2D"}
@@ -6085,7 +6091,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             browse_selected
             and intent.processing_mode == "Int 2D"
             and self._preferences.plot_mode in {"Single", "Overlay", "Waterfall"}
-            and (self._preferences.slice_enabled or self._preferences.slice_pins)
+            and (self._preferences.slice_enabled or self._preferences.slice_pins
+                 or requested_plot_axis == "chi")
         )
         if not browse_slices:
             self._context_controller.cancel_browse_slices()
@@ -6290,7 +6297,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if browse_slices and not skip_scientific_projection:
             science = projection.scientific
             cuts = self._context_controller.project_browse_slices(
-                preferences=replace(self._preferences, plot_axis=science.plot_axis),
+                preferences=replace(self._preferences, plot_axis=requested_plot_axis),
                 norm_channel=("" if science.norm_channel == "Norm Channel" else science.norm_channel),
             )
             pending = cuts is not None and cuts.pending
@@ -6303,6 +6310,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._notice(diagnostic)
             projection = replace(projection, scientific=replace(
                 science,
+                plot_axis=requested_plot_axis,
                 traces=() if cuts is None else cuts.traces,
                 pinned_traces=() if cuts is None else cuts.pinned_traces,
                 replace_trace_history=True,
