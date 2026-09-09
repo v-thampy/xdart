@@ -574,12 +574,13 @@ class HydrationTransport:
                 with self._lock:
                     if (self._active is entry and entry.state is _EntryState.READING
                             and entry.delivery_guard is None):
-                        if self._queued is None:
+                        if self._queued is None and not self._retired:
                             self._active = None
                             self._queued = entry
                             continue
                         delivery = self._capture_locked(
-                            entry, entry.token, HydrationOutcome.SUPERSEDED,
+                            entry, entry.token, (HydrationOutcome.CANCELLED
+                                if self._retired else HydrationOutcome.SUPERSEDED),
                             entry.ticket, clear=True)
                     elif (self._active is entry and entry.state is _EntryState.CLEANUP_BLOCKED
                             and type(entry.terminal) is _Viewer1DBlockedTerminal
