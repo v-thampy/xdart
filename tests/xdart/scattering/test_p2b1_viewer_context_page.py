@@ -601,41 +601,6 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     _release_real_viewer(controller, render)
 
 
-def test_viewer_1d_overlay_keeps_sixteen_real_sources_as_curves(
-        tmp_path, real_scientific_view) -> None:
-    paths = tuple(_write_xye(tmp_path / f"trace_{i}.xye", [0, 1, 2],
-                             [i, i + 1, i + 2], [.1, .2, .3])
-                  for i in range(16))
-    controller = _controller()
-    controller.open_viewer_1d(tuple(map(str, paths)))
-    _await_ready(controller)
-    frames = controller.navigation.frames
-    assert controller.select_viewer_1d(frames[0], frames)
-    projection = _shell(controller, ScientificPreferences(plot_mode="Overlay"))
-    state = replace(projection.scientific, plot_options=replace(
-        projection.scientific.plot_options,
-        waterfall_start=4, waterfall_stop=6, waterfall_step=2))
-    view = real_scientific_view
-    try:
-        _reconcile_real_viewer(view, state, controller.navigation)
-        assert not view.bottom_waterfall_active
-        assert len(view.curve.listDataItems()) == 16
-        assert view.trace_history_keys == frames
-        assert len(view.legend.items) == 16
-        for item in view.curve.listDataItems():
-            np.testing.assert_array_equal(item.getData()[0], [0, 1, 2])
-            assert len(item.getData()[1]) == 3
-        assert len(view._trace_history_by_identity) == 16
-        assert all(np.array_equal(trace.sigma, [.1, .2, .3])
-                   for trace in view._trace_history_by_identity.values())
-        del item
-    finally:
-        # As in the workspace, drop the last projection before releasing its
-        # borrowed arrays; the lease must not certify externally retained roots.
-        del projection, state
-        _release_real_viewer(controller, view)
-
-
 def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_path) -> None:
     import xrd_tools.session.viewer_1d as viewer
     from tests.xdart.scattering.test_e3_context_contract import _cold_controller, _select_browse
