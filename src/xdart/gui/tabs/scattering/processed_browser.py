@@ -18,6 +18,7 @@ from xrd_tools.io.output_transaction import (
     stream_terminal_object_revision,
 )
 from xrd_tools.io.viewer_1d import SUPPORTED_VIEWER_1D_SUFFIXES
+from xrd_tools.io.output_path import READABLE_OUTPUT_SUFFIXES
 from xrd_tools.io.viewer_2d import SUPPORTED_VIEWER_SUFFIXES
 from xrd_tools.session.intent_store import RunIntentSnapshot
 from xrd_tools.session.readiness import Tool, tool_from_mode_text
@@ -506,6 +507,8 @@ def browser_suffixes_for_mode(mode: str) -> frozenset[str] | None:
     """Return the immutable artifact suffix policy for one processing mode."""
 
     tool = tool_from_mode_text(mode)
+    if mode == "Int 1D (XYE)":
+        return frozenset((*READABLE_OUTPUT_SUFFIXES, ".xye"))
     if tool is Tool.XYE_VIEWER:
         return SUPPORTED_VIEWER_1D_SUFFIXES
     if tool is Tool.IMAGE_VIEWER:

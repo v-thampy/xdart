@@ -100,6 +100,7 @@ def test_completed_xye_run_opens_terminal_file_and_output_folder(
     monkeypatch.setattr(page._run_executor, "drain_events", observe_events)
     scientific = trace = None
     try:
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Waterfall"))
         page._shell.run_controls.startButton.click()
         assert _wait(app, lambda: any(event.kind in {
             StandardEventKind.FINISHED, StandardEventKind.STOPPED, StandardEventKind.FAILED,
@@ -118,7 +119,7 @@ def test_completed_xye_run_opens_terminal_file_and_output_folder(
         assert not Path(terminal.artifact).exists()
         assert {path: hashlib.sha256(path.read_bytes()).hexdigest()
                 for path in raw_paths} == raw_hashes
-        assert page._intents.snapshot().thaw().processing_mode == "1D Viewer"
+        assert page._intents.snapshot().thaw().processing_mode == "Int 1D (XYE)"
         assert _wait(app, lambda: (
             (context := page._context_controller.viewer_1d_context) is not None
             and context.state.value == "ready"
@@ -156,11 +157,28 @@ def test_completed_xye_run_opens_terminal_file_and_output_folder(
             (context := page._context_controller.viewer_1d_context) is not None
             and context.state.value == "ready" and context.paths == (str(generated[0]),)
         )), page._notice_text
-        page._handle_shell_command(ShellCommand(
-            ShellCommandKind.SET_PROCESSING_MODE, "Int 1D (XYE)"))
         assert page._intents.snapshot().thaw().processing_mode == "Int 1D (XYE)"
         assert page._start_permitted()[0]
         assert page._shell.run_controls.startButton.isEnabled()
+        if source_kind == "tiff":
+            # Run retains integration authority after browsing the output.
+            events.clear()
+            page._shell.run_controls.startButton.click()
+            assert _wait(app, lambda: any(event.kind in {
+                StandardEventKind.FINISHED, StandardEventKind.STOPPED,
+                StandardEventKind.FAILED,
+            } for event in events)), page._notice_text
+            repeated = next(event for event in events if event.kind in {
+                StandardEventKind.FINISHED, StandardEventKind.STOPPED,
+                StandardEventKind.FAILED,
+            })
+            assert repeated.kind is StandardEventKind.FINISHED
+            assert repeated.run_identity is not terminal.run_identity
+            assert repeated.completed == count
+            assert repeated.cleanup_status is CleanupStatus.CLEANED
+            assert page._intents.snapshot().thaw().processing_mode == "Int 1D (XYE)"
+            assert {path: hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in raw_paths} == raw_hashes
     finally:
         # These are borrowed production projections, not test-owned arrays.
         scientific = trace = None

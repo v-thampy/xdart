@@ -507,16 +507,21 @@ class Main(QMainWindow):
         self._attached_config_menu = None
         self._attached_help_menu = None
         self._attached_analysis_menu = None
+        self._attached_tool_requested = None
 
     def _attach_application_menus(self):
         if PageCapability.APP_MENU_HOSTS in self.page_descriptor.capabilities:
             points = self.page_handle.app_menus.mount_points()
             config_menu, help_menu = points.config_menu, points.help_menu
             analysis_menu = points.analysis_menu
+            tool_requested = points.tool_requested
         else:
             config_menu, help_menu = self.host_config_menu, self.host_help_menu
             analysis_menu = None
+            tool_requested = None
         try:
+            if self._attached_tool_requested is not None:
+                self._attached_tool_requested.disconnect(self.open_tool)
             if self._attached_config_menu is not None:
                 for action in self.application_config_actions:
                     self._attached_config_menu.removeAction(action)
@@ -541,6 +546,9 @@ class Main(QMainWindow):
         self._attached_config_menu = config_menu
         self._attached_help_menu = help_menu
         self._attached_analysis_menu = analysis_menu
+        if tool_requested is not None:
+            tool_requested.connect(self.open_tool)
+        self._attached_tool_requested = tool_requested
 
     def _open_log_location(self):
         """Help ▸ Open Log Location — reveal the rotating log file in the OS file

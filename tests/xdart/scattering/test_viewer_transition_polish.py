@@ -180,13 +180,13 @@ def test_one_d_manual_intensity_survives_frame_selection(viewer_1d, mode):
     page._context_controller.select_viewer_1d(current, (current,))
     page._refresh_shell()
     app.processEvents()
-    target = (view.waterfall.canvas.histogram.levels() if mode == "Waterfall"
+    target = (view.waterfall.canvas.histogram.levels() if view.bottom_waterfall_active
               else view.curve.getViewBox().viewRange()[1])
     np.testing.assert_allclose(target, (12, 18))
     assert controls.values() == (12, 18)
     controls.autoscale.setChecked(True)
     app.processEvents()
-    target = (view.waterfall.canvas.histogram.levels() if mode == "Waterfall"
+    target = (view.waterfall.canvas.histogram.levels() if view.bottom_waterfall_active
               else view.curve.getViewBox().viewRange()[1])
     assert target[1] > 18
 

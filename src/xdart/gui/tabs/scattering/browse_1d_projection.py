@@ -518,6 +518,8 @@ def _payload(
     inventory: Browse1DLabelInventory,
     borrowed: dict[str, Browse1DBorrow],
 ) -> StandardDisplayPayload:
+    from .context_projection import _browse_wavelength
+
     scalar_row = scope.catalog.row(frame.local_frame_label)
     if scalar_row is None:
         raise _Refused("Browse scalar row disappeared")
@@ -586,6 +588,7 @@ def _payload(
         ),
         view,
         "browse",
+        wavelength_m=_browse_wavelength(scope.context),
         measurement_mode="GI" if gi else "Standard",
         gi_incidence_motor="Manual" if gi else "",
         gi_resolved_motor="Manual" if gi else "",

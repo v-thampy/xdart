@@ -65,7 +65,8 @@ def test_int2d_detector_control_is_exclusive_and_acquisition_gated(
     available: bool,
 ) -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    view = ScientificView()
+    from xdart.gui.tabs.scattering.browser_view import BrowserView
+    view = BrowserView()
     projection = make_shell_projection(plot_mode="Single")
     scientific = replace(
         projection.scientific,
@@ -80,18 +81,20 @@ def test_int2d_detector_control_is_exclusive_and_acquisition_gated(
     commands = []
     view.commandRequested.connect(commands.append)
     try:
-        _reconcile(view, scientific, projection.navigation)
-        assert view.detector_mode_group.exclusive()
-        assert view.detector_thumbnail.isChecked()
-        assert view.detector_full.isEnabled() is available
+        view.reconcile_detector_mode(scientific)
+        assert view._detector_group.isExclusive()
+        assert view._detector_actions["thumbnail"].isChecked()
+        full = view._detector_actions["full"]
+        assert full.isEnabled() is available
         assert not commands
-        view.detector_full.click()
+        if full.isEnabled():
+            full.trigger()
         if available:
             assert commands[-1].kind is ShellCommandKind.SET_DETECTOR_MODE
             assert commands[-1].value == "full"
         else:
             assert not commands
-            assert view.detector_full.toolTip() == scientific.detector_diagnostic
+            assert full.toolTip() == scientific.detector_diagnostic
     finally:
         _dispose(view)
 

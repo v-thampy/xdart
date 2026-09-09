@@ -457,7 +457,6 @@ class BrowserView(QtWidgets.QFrame):
                 "configMenuButton",
                 ("Save", "Load", "Advanced", "Performance Diagnostics…"),
             ),
-            ("Analysis", "analysisMenuButton", ()),
             ("Help", "helpMenuButton", ("Help",)),
         ):
             button = QtWidgets.QToolButton()
@@ -475,6 +474,19 @@ class BrowserView(QtWidgets.QFrame):
                     )
                 )
             if title == "Config":
+                self._detector_menu = menu.addMenu("Raw image resolution")
+                self._detector_group = QtGui.QActionGroup(self._detector_menu)
+                self._detector_group.setExclusive(True)
+                self._detector_actions = {}
+                for label, choice in (("Thumbnail", "thumbnail"), ("Full Raw", "full")):
+                    action = self._detector_menu.addAction(label)
+                    action.setCheckable(True)
+                    self._detector_group.addAction(action)
+                    action.triggered.connect(
+                        lambda _checked=False, value=choice: self._emit(
+                            ShellCommandKind.SET_DETECTOR_MODE, value))
+                    self._detector_actions[choice] = action
+                self._detector_actions["thumbnail"].setChecked(True)
                 self._heavy_residency_menu = QtWidgets.QMenu("Heavy residency", menu); menu.addMenu(self._heavy_residency_menu)
                 self._heavy_residency_group = QtGui.QActionGroup(self._heavy_residency_menu)
                 self._heavy_residency_group.setExclusive(True)
@@ -495,6 +507,12 @@ class BrowserView(QtWidgets.QFrame):
             row.addWidget(button)
         row.addStretch(1)
         return row
+
+    def reconcile_detector_mode(self, state) -> None:
+        self._detector_actions[state.detector_mode].setChecked(True)
+        full = self._detector_actions["full"]
+        full.setEnabled(state.detector_available)
+        full.setToolTip(state.detector_diagnostic if not state.detector_available else "")
 
     def reconcile_heavy_residency(
         self, choice: str, *, next_run: bool,

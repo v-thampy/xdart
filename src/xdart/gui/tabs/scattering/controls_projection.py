@@ -134,7 +134,7 @@ def project_controls(
     unlocked = phase in {RunPhase.IDLE, RunPhase.FAILED} and not operation_busy
     processing_mode = str(intent.processing_mode or "")
     tool = tool_from_mode_text(processing_mode)
-    viewer = tool in {Tool.IMAGE_VIEWER, Tool.XYE_VIEWER}
+    viewer = tool in {Tool.IMAGE_VIEWER, Tool.XYE_VIEWER, Tool.STITCH, Tool.RSM}
     projected = project_control_fields(
         values,
         choices,
@@ -239,7 +239,8 @@ def project_controls(
         fields = [candidate if candidate.path == PROJECT_ROOT else
                   replace(candidate, enabled=False,
                           reason=("1D Viewer" if tool is Tool.XYE_VIEWER
-                                  else "2D Viewer") + " has no acquisition authority.")
+                                  else "2D Viewer" if tool is Tool.IMAGE_VIEWER
+                                  else "Selected tool") + " has no acquisition authority.")
                   for candidate in fields]
     reintegrate_1d_active = reintegrate_active and reintegrate_dimension == "1d"; reintegrate_2d_active = reintegrate_active and reintegrate_dimension == "2d"
     reintegrate_1d_enabled = (not reintegrate_stop_accepted if reintegrate_1d_active else reintegrate_available and unlocked); reintegrate_2d_enabled = (not reintegrate_stop_accepted if reintegrate_2d_active else reintegrate_available and unlocked)
@@ -335,7 +336,7 @@ def project_controls(
     return ControlsProjection(
         processing_page=(
             ProcessingPage.VIEWER
-            if tool in {Tool.IMAGE_VIEWER, Tool.XYE_VIEWER}
+            if viewer
             else ProcessingPage.INT_1D
             if tool is Tool.INT_1D
             else ProcessingPage.INT_2D

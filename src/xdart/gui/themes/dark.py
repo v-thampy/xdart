@@ -478,7 +478,6 @@ QToolButton#e3RefreshBrowser {
    toggles remain indicator-free. */
 QToolButton#fileMenuButton::menu-indicator,
 QToolButton#configMenuButton::menu-indicator,
-QToolButton#analysisMenuButton::menu-indicator,
 QToolButton#helpMenuButton::menu-indicator {
     image: none;
     width: 0px;
@@ -492,7 +491,6 @@ QToolButton#helpMenuButton::menu-indicator {
 }
 QToolButton#fileMenuButton,
 QToolButton#configMenuButton,
-QToolButton#analysisMenuButton,
 QToolButton#helpMenuButton {
     font-size: $control_panel_browse_font;
     padding-right: 12px;

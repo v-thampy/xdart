@@ -1225,13 +1225,11 @@ def test_browser_menu_theme_uses_canonical_indicator_and_font_contract() -> None
     font_selector = (
         "QToolButton#fileMenuButton,\n"
         "QToolButton#configMenuButton,\n"
-        "QToolButton#analysisMenuButton,\n"
         "QToolButton#helpMenuButton {"
     )
     indicator_selector = (
         "QToolButton#fileMenuButton::menu-indicator,\n"
         "QToolButton#configMenuButton::menu-indicator,\n"
-        "QToolButton#analysisMenuButton::menu-indicator,\n"
         "QToolButton#helpMenuButton::menu-indicator {"
     )
     default = render_qss("dark", font_scale="default")
@@ -1449,7 +1447,6 @@ def test_open_folder_and_refresh_publish_processed_catalog(
         assert menu_buttons == {
             "fileMenuButton": "File",
             "configMenuButton": "Config",
-            "analysisMenuButton": "Analysis",
             "helpMenuButton": "Help",
         }
         file_menu = shell.browser.findChild(

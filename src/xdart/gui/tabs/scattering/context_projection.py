@@ -243,7 +243,8 @@ def _viewer_2d_payload(context, request, selection, frame_keys, catalog, frame):
                      source_frame_index=frame.provenance.frame_index)
     if view.raw is not frame.array:
         return None
-    title = f"{name} · frame {frame.label} · {text}"
+    position = catalog.frame_labels.index(frame.label) + 1
+    title = f"{name} · frame {position} · {text}"
     return StandardDisplayPayload(selection.display_generation, request.frame,
                                   title, view, status)
 def _viewer_1d_scientific(navigation, payloads, resident, preferences, notice):
@@ -258,9 +259,12 @@ def _viewer_1d_scientific(navigation, payloads, resident, preferences, notice):
     ready = (bool(frames) and all(item is not None for item in accepted)
              and all(frame in resident for frame in frames))
     status = notice or ("1D Viewer" if ready else "Loading 1D Viewer…")
+    # A newly adopted result starts its own comparison. One source is a curve,
+    # including a rounded text export or a nonuniform native axis; there is no
+    # image grid to validate until a second source joins the Waterfall.
     if ready and len({item.view.axis_1d.unit for item in accepted}) != 1:
         ready, status = False, "1D Viewer refused: conflicting units"
-    if ready and effective == "Waterfall":
+    if ready and effective == "Waterfall" and len(frames) > 1:
         axes = tuple(item.view.axis_1d.values for item in accepted)
         if any(len(axis) < 2 or not np.all(np.isfinite(axis)) or np.any(np.diff(axis) <= 0)
                for axis in axes):

@@ -396,7 +396,13 @@ class ScientificView(QtWidgets.QFrame):
         self.viewer_intensity.hide()
         self.viewer_intensity.rangeChanged.connect(self._set_viewer_intensity)
         self.viewer_intensity.autoToggled.connect(self._toggle_viewer_autoscale)
-        self.footer.addWidget(self.viewer_intensity)
+        self.viewer_intensity_row = QtWidgets.QWidget(self)
+        self.viewer_intensity_row_layout = QtWidgets.QHBoxLayout(self.viewer_intensity_row)
+        self.viewer_intensity_row_layout.setContentsMargins(0, 0, 0, 0)
+        self.viewer_intensity_row_layout.addStretch(1)
+        self.plot_bar.addWidget(self.viewer_intensity)
+        self.viewer_intensity_row.hide()
+        layout.addWidget(self.viewer_intensity_row)
         self.status = QtWidgets.QLabel("")
         self.status.setContentsMargins(
             SCIENTIFIC_FOOTER_STATUS_LEFT_INSET,
@@ -617,23 +623,10 @@ class ScientificView(QtWidgets.QFrame):
         self.color_map.addItems(self._color_map_choices)
         self.log_scale = QtWidgets.QPushButton("Log")
         self.log_scale.setCheckable(True)
-        self.detector_controls = QtWidgets.QWidget()
-        detector_layout = QtWidgets.QHBoxLayout(self.detector_controls)
-        detector_layout.setContentsMargins(0, 0, 0, 0)
-        detector_layout.setSpacing(0)
-        self.detector_thumbnail = QtWidgets.QPushButton("Thumbnail")
-        self.detector_full = QtWidgets.QPushButton("Full Raw")
-        self.detector_mode_group = QtWidgets.QButtonGroup(self)
-        self.detector_mode_group.setExclusive(True)
-        for button in (self.detector_thumbnail, self.detector_full):
-            button.setCheckable(True)
-            self.detector_mode_group.addButton(button)
-            detector_layout.addWidget(button)
         self.raw_popup_button = QtWidgets.QPushButton("Raw")
         row.addWidget(self.norm)
         row.addWidget(self.background)
         row.addWidget(self.raw_popup_button)
-        row.addWidget(self.detector_controls)
         row.addWidget(self.title, 1)
         row.addWidget(self.color_map)
         row.addWidget(self.log_scale)
@@ -652,12 +645,6 @@ class ScientificView(QtWidgets.QFrame):
             lambda value: self._emit(
                 ShellCommandKind.SET_LOG_SCALE, bool(value)
             )
-        )
-        self.detector_thumbnail.clicked.connect(
-            lambda: self._emit(ShellCommandKind.SET_DETECTOR_MODE, "thumbnail")
-        )
-        self.detector_full.clicked.connect(
-            lambda: self._emit(ShellCommandKind.SET_DETECTOR_MODE, "full")
         )
         self.raw_popup_button.clicked.connect(self._open_raw_popup)
         return row
@@ -980,8 +967,6 @@ class ScientificView(QtWidgets.QFrame):
             self.plot_mode,
             self.share_axis,
             self.frame_selector,
-            self.detector_thumbnail,
-            self.detector_full,
         )
         blockers = [QtCore.QSignalBlocker(widget) for widget in widgets]
         set_combo(self.norm, state.norm_channels, state.norm_channel)
@@ -1009,12 +994,8 @@ class ScientificView(QtWidgets.QFrame):
         self.share_axis.setChecked(state.share_axis)
         self.plot_options_dialog.reconcile(state.plot_options)
         self._apply_processing_layout(state.processing_mode)
-        self.detector_thumbnail.setChecked(state.detector_mode == "thumbnail")
-        self.detector_full.setChecked(state.detector_mode == "full")
-        self.detector_full.setEnabled(state.detector_available)
         self.raw_popup_button.setEnabled(state.detector_available)
         explanation = state.detector_diagnostic if not state.detector_available else ""
-        self.detector_full.setToolTip(explanation)
         self.raw_popup_button.setToolTip(explanation or "Show exact-current raw image")
         if replace_presentation:
             self.image_axis.setEnabled(state.measurement_mode != "GI")
@@ -1161,8 +1142,10 @@ class ScientificView(QtWidgets.QFrame):
     ) -> QtWidgets.QWidget | None:
         if mode == "2D Viewer":
             return self.raw.canvas
-        if mode == "1D Viewer":
+        if mode in {"1D Viewer", "Int 1D"}:
             return self.bottom_stack.currentWidget()
+        if mode == "Int 2D":
+            return self.vertical_splitter
         return None
 
     def _layout_viewer_loading_snapshot(self) -> None:
@@ -1181,7 +1164,7 @@ class ScientificView(QtWidgets.QFrame):
         self._viewer_loading_overlay.raise_()
 
     def _begin_viewer_loading_snapshot(self, mode: str) -> None:
-        """Keep one capped screen raster while an owned Viewer reloads."""
+        """Keep one capped screen raster while the selected display reloads."""
 
         # A rapid replacement must continue to describe the original pending
         # view, never capture the loading layer or build a snapshot history.
@@ -1491,13 +1474,9 @@ class ScientificView(QtWidgets.QFrame):
             self._selector_operations += 1
             start = 0
         for index, frame in enumerate(frames[start:], start):
-            viewer_scope = {"1D Viewer": "viewer-1d",
-                            "2D Viewer": "viewer-2d"}.get(self._processing_mode)
-            viewer = frame.source_scan == frame.artifact == viewer_scope
             label = frame.local_frame_label
             indices = self._label_indices.setdefault(label, [])
             self.frame_selector.add_frame(
-                str(label) if viewer else
                 frame_caption(frame, frozenset(), position=index),
                 frame,
                 f"{frame.source_scan}:{frame.local_frame_label}",
@@ -1959,7 +1938,7 @@ class ScientificView(QtWidgets.QFrame):
         self._bottom_waterfall_active = (
             browse_snapshot.waterfall_active
             if browse_snapshot is not None
-            else state.plot_mode == "Waterfall"
+            else state.plot_mode == "Waterfall" and len(rows) > 1
             if state.processing_mode == "1D Viewer"
             else waterfall_should_be_active(
                 state.plot_mode, len(rows),
@@ -2103,6 +2082,7 @@ class ScientificView(QtWidgets.QFrame):
         self._reconcile_curve_items(
             keys,
             traces,
+            color_map=state.color_map,
             overlay_step=(overlay_step if stacked_selection else 0.0),
             clip_single_live=state.plot_mode == "Single",
             allow_single_rebind=(
@@ -2152,6 +2132,7 @@ class ScientificView(QtWidgets.QFrame):
         keys: tuple[tuple[object, ...], ...],
         traces: tuple[TraceProjection, ...],
         *,
+        color_map: str = "Default",
         overlay_step: float,
         clip_single_live: bool,
         allow_single_rebind: bool,
@@ -2194,6 +2175,10 @@ class ScientificView(QtWidgets.QFrame):
             if prior_contract is not None:
                 self._curve_item_contracts[keys[0]] = prior_contract
 
+        colors = None
+        if color_map != "Default" and color_map in matplotlib_colormaps:
+            positions = [.65] if len(traces) == 1 else np.linspace(.15, .85, len(traces))
+            colors = matplotlib_colormaps[color_map](positions, bytes=True)
         desired_items = []
         for index, (key, trace) in enumerate(
             zip(keys, traces, strict=True)
@@ -2206,7 +2191,11 @@ class ScientificView(QtWidgets.QFrame):
                 offset,
                 title,
             )
-            style_contract = _TRACE_COLORS[index % len(_TRACE_COLORS)]
+            style_contract = (
+                _TRACE_COLORS[index % len(_TRACE_COLORS)]
+                if colors is None
+                else tuple(int(channel) for channel in colors[index])
+            )
             item = self._curve_items_by_key.get(key)
             prior_contract = self._curve_item_contracts.get(key)
             clip_eligible = (
@@ -2795,6 +2784,11 @@ class ScientificView(QtWidgets.QFrame):
         changed = self._layout_mode != normalized
         self._layout_mode = normalized
         viewer = normalized in {"1D Viewer", "2D Viewer"}
+        if changed:
+            host = (self.viewer_intensity_row_layout if normalized == "2D Viewer"
+                    else self.plot_bar)
+            host.addWidget(self.viewer_intensity)
+        self.viewer_intensity_row.setVisible(normalized == "2D Viewer")
         self.viewer_intensity.setVisible(viewer)
         self.axis_display_group.setVisible(not viewer)
         self.plot_axis.setVisible(not viewer)
@@ -2807,7 +2801,6 @@ class ScientificView(QtWidgets.QFrame):
             self._viewer_intensity_contract = None
             self._viewer_intensity_domain = self._viewer_auto_levels = None
             self.curve.getViewBox().enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
-        self.detector_controls.setVisible(normalized == "Int 2D")
         self.raw_popup_button.setVisible(normalized == "Int 1D")
         if normalized != "Int 1D" and self.raw_popup_dialog is not None:
             self.raw_popup_dialog.close()

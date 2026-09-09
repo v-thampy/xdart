@@ -70,6 +70,11 @@ class IntensityRangeSlider(QtWidgets.QWidget):
         changed = (lo, hi) != self.values()
         if changed:
             self._lo, self._hi = lo, hi
+        self.setToolTip(
+            f"Intensity: {lo:.8g} to {hi:.8g}\n"
+            "Drag handles or double-click to enter exact minimum and maximum."
+        )
+        if changed:
             self.update()
             if emit:
                 self.sigRangeChanged.emit(lo, hi)

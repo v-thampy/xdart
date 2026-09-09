@@ -528,6 +528,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     sourceSelectionRequested = QtCore.Signal(object)
     browseRequested = QtCore.Signal(object)
+    toolRequested = QtCore.Signal(str)
     noticeChanged = QtCore.Signal(str)
     _observationFinished = QtCore.Signal(object)
     _browserCatalogFinished = QtCore.Signal(object)
@@ -1613,7 +1614,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     @staticmethod
     def _background_domain(mode: str) -> str | None:
-        return {"Int 1D": "integrated_1d", "Int 2D": "integrated_2d", "1D Viewer": "integrated_1d", "2D Viewer": "raw"}.get(mode)
+        return {"Int 1D": "integrated_1d", "Int 1D (XYE)": "integrated_1d", "Int 2D": "integrated_2d", "1D Viewer": "integrated_1d", "2D Viewer": "raw"}.get(mode)
 
     def _background_key(self, plan, stamp, mode: str, target_facts) -> tuple[object, ...]:
         return (stamp.context_token, stamp.display_generation, plan.domain, mode,
@@ -3132,7 +3133,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 return
             mode = self._intents.snapshot().thaw().processing_mode
             tool = tool_from_mode_text(mode)
-            if tool is Tool.XYE_VIEWER and type(value) is str and value:
+            if (type(value) is str and value and (
+                    tool is Tool.XYE_VIEWER
+                    or mode == "Int 1D (XYE)" and value.lower().endswith(".xye"))):
                 selected = command.artifacts or (value,)
                 self._open_viewer_1d_paths(selected, current_path=value)
                 return
@@ -3264,6 +3267,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         snapshot = self._intents.snapshot()
         intent = snapshot.thaw()
         tool = tool_from_mode_text(intent.processing_mode)
+        if tool in {Tool.STITCH, Tool.RSM}:
+            self.toolRequested.emit("stitch" if tool is Tool.STITCH else "rsm")
+            return
         stored_average = intent.run_options.get(
             "series_average", False
         )
@@ -4995,7 +5001,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                            f"{prefix}_{frame.source_scan}_{frame.local_frame_label:04d}.xye")
         # This viewer handoff replaces the terminal batch paint itself.
         self._retire_batch_presentation(force=True)
-        self._edit_run_strip(ShellCommandKind.SET_PROCESSING_MODE, "1D Viewer")
         self._set_browser_directory(str(Path(current_path).parent), explicit=False)
         self._open_viewer_1d_paths((current_path,), current_path=current_path)
         self._notice(f"Completed {event.completed} XYE files · showing {Path(current_path).name}")
@@ -5853,9 +5858,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         controls = self._project_controls(snapshot)
         permitted, blocker = self._start_permitted()
         tool = tool_from_mode_text(intent.processing_mode)
-        viewer_2d, viewer_1d = tool is Tool.IMAGE_VIEWER, tool is Tool.XYE_VIEWER
+        viewer_2d = (tool is Tool.IMAGE_VIEWER or selection is not None
+                     and selection.kind is ContextKind.VIEWER_2D)
+        viewer_1d = (tool is Tool.XYE_VIEWER or selection is not None
+                     and selection.kind is ContextKind.VIEWER_1D)
         viewer = viewer_1d or viewer_2d
-        if viewer:
+        if tool in {Tool.XYE_VIEWER, Tool.IMAGE_VIEWER, Tool.STITCH, Tool.RSM}:
             cleanup = (self._context_controller.viewer_1d_cleanup_pending
                        if viewer_1d else self._context_controller.viewer_2d_cleanup_pending)
             mutating_busy = self._mutating_operation_busy()
@@ -6191,6 +6199,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 projection.scientific.browse_science_contract,
             )
             if cache_terminal_diagnostic or not retention_compatible:
+                if (cache_retry_needed and not cache_terminal_diagnostic
+                        and prior is not None and (prior.traces or prior.heavy is not None)):
+                    # Keep only the existing capped, labeled screen raster;
+                    # foreign scientific arrays are still released below.
+                    self._shell.scientific._begin_viewer_loading_snapshot(
+                        projection.scientific.processing_mode)
                 # INCOMPLETE may retain only an exact-current Browse snapshot.
                 # A terminal refusal/no-runtime state cannot, and a changed
                 # request, navigation, artifact, mode, axis, or options cannot
@@ -6273,6 +6287,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         try:
             if not preserve_display:
+                self._shell.browser.reconcile_detector_mode(projection.scientific)
                 choice, _ = heavy_residency_choice(intent.run_options)
                 self._shell.browser.reconcile_heavy_residency(
                     choice,
@@ -6296,7 +6311,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if viewer_2d
                 else False
             )
-            if not viewer_loading:
+            if not viewer_loading and not (cache_adoption_missing and cache_retry_needed):
                 self._shell.scientific.drop_viewer_loading_snapshot()
             if rebind_scientific_navigation:
                 prior_scientific = self._last_scientific_projection
@@ -6589,6 +6604,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         snapshot = self._intents.snapshot()
         candidate = snapshot.thaw()
         release_outgoing_display = False
+        viewer_source = None
         if kind is ShellCommandKind.SET_PROCESSING_MODE:
             if type(value) is not str or not value:
                 return
@@ -6603,6 +6619,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._notice("1D Viewer cleanup remains pending")
                 return
             if value != candidate.processing_mode:
+                selection = self._context_controller.selection
+                browse = self._context_controller.browse_context
+                if (tool_from_mode_text(value) is Tool.IMAGE_VIEWER
+                        and browse is not None and selection is not None
+                        and selection.names(browse)):
+                    viewer_source = browse.requested_path
                 self._retire_batch_presentation()
                 release_outgoing_display = True
                 self._retain_outgoing_display = False
@@ -6628,6 +6650,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             candidate, expected_revision=snapshot.revision
         )
         self._reconcile_snapshot(snapshot, result.snapshot)
+        if (viewer_source is not None
+                and result.snapshot.thaw().processing_mode == candidate.processing_mode):
+            self._open_viewer_2d_path(viewer_source)
         if release_outgoing_display:
             self._retain_outgoing_display = False
             self._refresh_shell()
@@ -6834,6 +6859,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             updates["color_map"] = str(value)
         elif kind is ShellCommandKind.SET_LOG_SCALE:
             updates["log_scale"] = bool(value)
+            updates["plot_options"] = replace(
+                self._preferences.plot_options,
+                intensity_scale="Log" if value else "Linear",
+            )
         elif kind is ShellCommandKind.SET_DETECTOR_MODE:
             return self._set_detector_mode(str(value))
         elif kind is ShellCommandKind.SET_IMAGE_AXIS:

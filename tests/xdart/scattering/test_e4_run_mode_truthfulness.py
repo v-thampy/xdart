@@ -31,6 +31,8 @@ _EXPECTED_MODES = (
     "Int 1D (XYE)",
     "2D Viewer",
     "1D Viewer",
+    "Stitch",
+    "RSM",
 )
 _EXPECTED_DISABLED_REASONS = ()
 
@@ -123,24 +125,19 @@ def test_projection_owns_modes_and_refuses_run_readiness_for_unowned_mode() -> N
     assert unsupported.readiness == "Ready · Int 1D (XYE)"
 
 
-def test_retired_analysis_mode_remains_visible_and_fail_loud() -> None:
+def test_analysis_modes_launch_their_existing_tools_without_acquisition_inputs() -> None:
     expected = {
-        "Stitch 1D": "open Analysis > Stitching",
-        "Stitch 2D": "open Analysis > Stitching",
-        "RSM": "open Analysis > Reciprocal Space Map",
+        "Stitch": "Stitch",
+        "Stitch 1D": "Stitch",
+        "Stitch 2D": "Stitch",
+        "RSM": "RSM",
     }
-    for mode, guidance in expected.items():
-        projected = _run_strip(
-            _configured_intent(mode), executor_available=True,
-        )
-        assert projected.mode == mode
-        assert projected.modes == (*RUN_MODE_CHOICES, mode)
-        assert dict(projected.disabled_modes) == {
-            mode: projected.readiness,
-        }
-        assert guidance in projected.readiness
-        assert not projected.ready
-        assert not projected.run_enabled
+    for mode, normalized in expected.items():
+        projected = _run_strip(RunIntent(processing_mode=mode, output_mode=""))
+        assert projected.mode == normalized
+        assert projected.modes == RUN_MODE_CHOICES
+        assert not projected.disabled_modes
+        assert projected.ready and projected.run_enabled
 
 
 def test_directory_strip_qualifies_paused_and_failed_file_progress() -> None:
@@ -315,7 +312,6 @@ def test_xye_output_uses_the_existing_int1d_trace_and_center_layout(
     )
     assert mounted.image_splitter.hidden
     assert not mounted.raw_popup_button.hidden
-    assert mounted.detector_controls.hidden
 
     controls = project_controls(
         RunIntentStore(intent).snapshot(), None, RunPhase.IDLE,

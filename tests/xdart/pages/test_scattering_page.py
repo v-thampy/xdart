@@ -147,15 +147,13 @@ def test_builtin_stitch_action_constructs_one_idle_tool_only_when_opened(
             "Stitching",
             "Reciprocal Space Map",
         ]
-        in_window = window.page_handle.app_menus.mount_points().analysis_menu
-        assert in_window is not None
-        assert tuple(in_window.actions()) == tuple(
-            window.ui.menuAnalysis.actions()
-        )
-        assert window.ui.menuAnalysis.actions()[0].objectName() == (
-            "actionAnalysisTool_stitch"
-        )
-        in_window.actions()[0].trigger()
+        page = window.page_handle.widget
+        assert page.findChild(QtWidgets.QToolButton, "analysisMenuButton") is None
+        combo = page._shell.run_controls.modeCombo
+        assert combo.findText("Stitch") >= 0 and combo.findText("RSM") >= 0
+        combo.setCurrentText("Stitch")
+        assert page._shell.run_controls.startButton.isEnabled()
+        page._shell.run_controls.startButton.click()
         qapp.processEvents()
         handle = window._tool_handles[STITCH_TOOL.key]
         assert handle.widget.objectName() == "stitchToolDialog"
@@ -188,7 +186,11 @@ def test_builtin_rsm_action_constructs_one_idle_tool_only_when_opened(
         assert window.ui.menuAnalysis.actions()[1].objectName() == (
             "actionAnalysisTool_rsm"
         )
-        assert window.open_tool(RSM_TOOL.key) == ActionCompleted("rsm")
+        page = window.page_handle.widget
+        page._shell.run_controls.modeCombo.setCurrentText("RSM")
+        assert page._shell.run_controls.startButton.isEnabled()
+        page._shell.run_controls.startButton.click()
+        qapp.processEvents()
         handle = window._tool_handles[RSM_TOOL.key]
         dialog = handle.widget
         assert handle.key == RSM_TOOL_KEY

@@ -17,11 +17,11 @@ RUN_MODE_CHOICES = (
     "Int 1D (XYE)",
     "2D Viewer",
     "1D Viewer",
+    "Stitch",
+    "RSM",
 )
-# Stitch and RSM are standalone Analysis tools with their own source, geometry,
-# output, progress, and lifecycle controls.  Keeping stale disabled entries in
-# the ordinary reduction selector made complete tools look unavailable and
-# would route them through the wrong Controls/Run owner if enabled.
+# These choices launch the existing tools; their source/geometry/publication
+# controls and lifecycle remain owned by each tool, not the reduction executor.
 UNOWNED_RUN_MODE_REASONS: tuple[tuple[str, str], ...] = ()
 _NATIVE_RUN_MODES = frozenset(("Int 1D", "Int 2D", "Int 1D (XYE)"))
 
@@ -41,44 +41,40 @@ def build_run_strip_projection(
     tool = tool_from_mode_text(mode)
     viewer_2d = tool is Tool.IMAGE_VIEWER
     viewer = viewer_2d or tool is Tool.XYE_VIEWER
+    analysis = tool in {Tool.STITCH, Tool.RSM}
+    standalone = viewer or analysis
     if viewer_2d:
         mode = "2D Viewer"
     elif tool is Tool.XYE_VIEWER:
         mode = "1D Viewer"
+    elif tool is Tool.STITCH:
+        mode = "Stitch"
+    elif tool is Tool.RSM:
+        mode = "RSM"
     output_supported = (
         type(intent.output_mode) is str
         and intent.output_mode.strip().lower() in {"overwrite", "append"}
     )
-    if viewer:
+    if standalone:
         output_supported = True
     xye_append = (
         mode == "Int 1D (XYE)"
         and intent.output_mode.strip().lower() == "append"
     )
     missing: list[str] = []
-    if intent.source_spec is None and not viewer:
+    if intent.source_spec is None and not standalone:
         missing.append("source")
-    if not intent.poni_file and not viewer:
+    if not intent.poni_file and not standalone:
         missing.append("PONI")
-    if not intent.save_path and not viewer:
+    if not intent.save_path and not standalone:
         missing.append("output")
     mode_blocker = dict(UNOWNED_RUN_MODE_REASONS).get(mode)
-    if tool is Tool.STITCH:
-        mode_blocker = (
-            "Stitching is a standalone Analysis tool; open Analysis > "
-            "Stitching, or choose a current Run mode."
-        )
-    elif tool is Tool.RSM:
-        mode_blocker = (
-            "RSM is a standalone Analysis tool; open Analysis > Reciprocal "
-            "Space Map, or choose a current Run mode."
-        )
     if mode not in _NATIVE_RUN_MODES and mode_blocker is None:
         mode_blocker = (
             f"{mode or 'Selected mode'} has no mounted vNext operation "
             "service yet."
         )
-    if viewer:
+    if standalone:
         mode_blocker = None
     modes = RUN_MODE_CHOICES
     disabled_modes = UNOWNED_RUN_MODE_REASONS
@@ -90,7 +86,7 @@ def build_run_strip_projection(
         disabled_modes = (*disabled_modes, (mode, mode_blocker or "Unsupported"))
     if mode_blocker is not None:
         readiness = mode_blocker
-    elif not executor_available and not viewer:
+    elif not executor_available and not standalone:
         readiness = "Execution is unavailable"
     elif xye_append:
         readiness = "XYE-only Append has no persisted lineage owner"
@@ -113,7 +109,7 @@ def build_run_strip_projection(
                 count += " (folder + 1 level)"
             readiness += f" · {count}"
     ready = (
-        (executor_available or viewer)
+        (executor_available or standalone)
         and output_supported
         and not xye_append
         and not missing
