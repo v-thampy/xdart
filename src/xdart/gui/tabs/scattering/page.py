@@ -21,6 +21,7 @@ from xdart.modules.display_context import (
     ContextKind,
     DisplaySelection,
     Viewer1DContext,
+    Viewer1DState,
     Viewer2DContext,
     Viewer2DState,
 )
@@ -46,6 +47,7 @@ from xrd_tools.io.output_transaction import (
     StreamTerminal,
 )
 from xrd_tools.io.viewer_2d import Viewer2DArtifactCatalog, _stable_revision
+from .results_notebook import results_notebook_text
 from xrd_tools.session.readiness import Tool, tool_from_mode_text
 from xrd_tools.session.display_logic import xye_prefix_for_unit
 from xrd_tools.sources.selection import (
@@ -580,6 +582,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         profile_path_chooser: (
             Callable[[str, str], str | None] | None
         ) = None,
+        results_notebook_chooser: Callable[[str], str | None] | None = None,
         external_tool_registry: ExternalToolRegistry | None = None,
         browse_clock: Callable[[], float] = time.monotonic,
         parent: QtWidgets.QWidget | None = None,
@@ -650,6 +653,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             profile_path_chooser
             if profile_path_chooser is not None
             else self._choose_profile_path_dialog
+        )
+        self._results_notebook_chooser = (
+            results_notebook_chooser
+            if results_notebook_chooser is not None
+            else self._choose_results_notebook_dialog
         )
         self._advanced_dialog: AdvancedSettingsDialog | None = None
         self._advanced_settings_editor = (
@@ -3124,6 +3132,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if command.value == "Config:Performance Diagnostics…":
                 self._edit_performance_diagnostics()
                 return
+            if command.value == "Help:Export Analyze Results Notebook":
+                self._export_results_notebook()
+                return
             prefix = "Config:Heavy residency:"
             if str(command.value).startswith(prefix):
                 label = str(command.value)[len(prefix):]
@@ -3506,6 +3517,86 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         else:  # pragma: no cover - private callers are closed above
             raise ValueError("profile action must be 'save' or 'load'")
         return selected or None
+
+    def _choose_results_notebook_dialog(self, start_directory: str) -> str | None:
+        selected, _filter = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Analyze Results Notebook",
+            start_directory,
+            "Jupyter notebooks (*.ipynb);;All files (*)",
+        )
+        return selected or None
+
+    def _selected_results_notebook_sources(
+        self,
+    ) -> tuple[str, tuple[str, ...], str]:
+        nexus = self._qualify_external_nexus(validate_disk=True)
+        if nexus.target is not None:
+            return "nexus", (nexus.target,), ""
+        if self._closing or self._closed:
+            return "", (), "The workspace is closing; results are unavailable."
+        if self._workspace_operations.busy:
+            return "", (), "A workspace operation is active; wait for it to finish."
+        if self._lifecycle.phase not in {RunPhase.IDLE, RunPhase.FAILED}:
+            return "", (), "An acquisition writer is active; wait for it to finish."
+        controller = self._context_controller
+        context = controller.viewer_1d_context
+        selection = controller.selection
+        navigation = controller.navigation
+        if (
+            type(context) is not Viewer1DContext
+            or context.state is not Viewer1DState.READY
+            or selection is None
+            or selection.kind is not ContextKind.VIEWER_1D
+            or not selection.names(context)
+            or len(navigation.frames) != len(context.paths)
+            or not navigation.selected
+        ):
+            return "", (), nexus.reason
+        selected_paths = []
+        for frame in navigation.selected:
+            try:
+                index = next(
+                    index for index, candidate in enumerate(navigation.frames)
+                    if candidate is frame
+                )
+                path = context.paths[index]
+                state = Path(path).stat()
+            except (StopIteration, OSError):
+                return "", (), "A selected XYE result is no longer available."
+            if (
+                not os.path.isabs(path)
+                or Path(path).suffix.casefold() != ".xye"
+                or not stat.S_ISREG(state.st_mode)
+            ):
+                return "", (), "Select ready XYE result files or one stable processed NeXus file."
+            selected_paths.append(path)
+        return "xye", tuple(selected_paths), ""
+
+    def _export_results_notebook(self) -> None:
+        kind, paths, reason = self._selected_results_notebook_sources()
+        if not paths:
+            self._notice(reason)
+            return
+        try:
+            selected = self._results_notebook_chooser(str(Path(paths[0]).parent))
+        except Exception as error:
+            self._error_notice("Results notebook chooser failed", error)
+            return
+        if type(selected) is not str or not selected:
+            return
+        destination = Path(selected).expanduser()
+        if destination.suffix.casefold() != ".ipynb":
+            destination = destination.with_name(f"{destination.name}.ipynb")
+        try:
+            self._write_profile_atomically(
+                destination, results_notebook_text(kind=kind, paths=paths),
+            )
+        except Exception as error:
+            self._error_notice("Results notebook export failed", error)
+            return
+        remember_browse_path(destination)
+        self._notice(f"Results notebook saved: {destination.name}")
 
     def _choose_run_intent_profile_path(self, action: str) -> Path | None:
         intent = self._intents.snapshot().thaw()

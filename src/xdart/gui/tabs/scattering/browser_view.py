@@ -477,7 +477,10 @@ class BrowserView(QtWidgets.QFrame):
                 "configMenuButton",
                 ("Save", "Load", "Advanced", "Performance Diagnostics…"),
             ),
-            ("Help", "helpMenuButton", ("Help",)),
+            (
+                "Help", "helpMenuButton",
+                ("Help", "Export Analyze Results Notebook"),
+            ),
         ):
             button = QtWidgets.QToolButton()
             button.setText(title)
