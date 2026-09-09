@@ -15,14 +15,17 @@ RUN_MODE_CHOICES = (
     "Int 1D",
     "Int 2D",
     "Int 1D (XYE)",
-    "2D Viewer",
-    "1D Viewer",
-    "Stitch",
+    "Stitch 1D",
+    "Stitch 2D",
     "RSM",
+    "1D Viewer",
+    "2D Viewer",
 )
-# These choices launch the existing tools; their source/geometry/publication
-# controls and lifecycle remain owned by each tool, not the reduction executor.
-UNOWNED_RUN_MODE_REASONS: tuple[tuple[str, str], ...] = ()
+# These choices route to existing tools when their owner is available.  Stitch
+# 2D remains visible but cannot open the current 1-D-only Stitch owner.
+UNOWNED_RUN_MODE_REASONS = (
+    ("Stitch 2D", "Stitch 2D is not available yet"),
+)
 _NATIVE_RUN_MODES = frozenset(("Int 1D", "Int 2D", "Int 1D (XYE)"))
 
 
@@ -48,7 +51,11 @@ def build_run_strip_projection(
     elif tool is Tool.XYE_VIEWER:
         mode = "1D Viewer"
     elif tool is Tool.STITCH:
-        mode = "Stitch"
+        mode = (
+            "Stitch 2D"
+            if mode.strip().lower() == "stitch 2d"
+            else "Stitch 1D"
+        )
     elif tool is Tool.RSM:
         mode = "RSM"
     output_supported = (
@@ -69,13 +76,11 @@ def build_run_strip_projection(
     if not intent.save_path and not standalone:
         missing.append("output")
     mode_blocker = dict(UNOWNED_RUN_MODE_REASONS).get(mode)
-    if mode not in _NATIVE_RUN_MODES and mode_blocker is None:
+    if not standalone and mode not in _NATIVE_RUN_MODES and mode_blocker is None:
         mode_blocker = (
             f"{mode or 'Selected mode'} has no mounted vNext operation "
             "service yet."
         )
-    if standalone:
-        mode_blocker = None
     modes = RUN_MODE_CHOICES
     disabled_modes = UNOWNED_RUN_MODE_REASONS
     if mode and mode not in modes:

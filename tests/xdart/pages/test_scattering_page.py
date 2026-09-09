@@ -150,13 +150,26 @@ def test_builtin_stitch_action_constructs_one_idle_tool_only_when_opened(
         page = window.page_handle.widget
         assert page.findChild(QtWidgets.QToolButton, "analysisMenuButton") is None
         combo = page._shell.run_controls.modeCombo
-        assert combo.findText("Stitch") >= 0 and combo.findText("RSM") >= 0
-        combo.setCurrentText("Stitch")
+        assert combo.findText("Stitch") < 0
+        assert combo.findText("Stitch 1D") >= 0
+        assert combo.findText("Stitch 2D") >= 0
+        assert combo.findText("RSM") >= 0
+        requested = []
+        page.toolRequested.connect(requested.append)
+        combo.setCurrentText("Stitch 1D")
         assert page._shell.run_controls.startButton.isEnabled()
         page._shell.run_controls.startButton.click()
         qapp.processEvents()
         handle = window._tool_handles[STITCH_TOOL.key]
         assert handle.widget.objectName() == "stitchToolDialog"
+        assert handle.widget.parity_hold.text() == (
+            "Mode: 1-D only · 2-D held pending the scan-14 orientation parity oracle"
+        )
+        combo.setCurrentText("Stitch 2D")
+        assert not page._shell.run_controls.startButton.isEnabled()
+        page._shell.run_controls.startButton.click()
+        qapp.processEvents()
+        assert requested == ["stitch"]
         assert handle.widget.source_widget._external_execution is True
         assert handle.widget.source_widget._probe_executor is None
         assert handle.activity.active() is False
