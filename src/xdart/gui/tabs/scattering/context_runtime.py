@@ -30,7 +30,6 @@ from .browse_values import BrowseLoadRequest
 from .context_projection import ContextProjection, ProjectionRequest
 from .context_values import (
     _BrowseProjectionPass,
-    _navigation_after_append,
     _normalized_navigation,
     _PendingBrowseReplacement,
     BrowseMissReason,
@@ -125,6 +124,11 @@ class _ContextRuntime:
         self._browse_projection_identity: RunIdentity | None = None
         self._selection: DisplaySelection | None = None
         self._acquisition_navigation = FrameNavigationProjection()
+        # The acquisition index is the ordered live owner.  The immutable
+        # projection remains a consumer value and is rebuilt only on demand.
+        self._acquisition_navigation_current: DisplayFrameKey | None = None
+        self._acquisition_navigation_selected: dict[int, DisplayFrameKey] = {}
+        self._acquisition_navigation_dirty = False
         self._browse_navigation = FrameNavigationProjection()
         self._viewer_1d_navigation = FrameNavigationProjection()
         self._viewer_2d_navigation = FrameNavigationProjection()
@@ -200,6 +204,32 @@ class _ContextRuntime:
             return self._viewer_2d_navigation
         if selection is not None and selection.kind is ContextKind.BROWSE:
             return self._browse_navigation
+        return self._acquisition_navigation_snapshot()
+
+    def _acquisition_navigation_snapshot(self) -> FrameNavigationProjection:
+        if not self._acquisition_navigation_dirty:
+            return self._acquisition_navigation
+        # This is the consumer boundary.  Use the concrete dict view so a
+        # hostile mapping cannot turn snapshot materialization into a second
+        # owner-graph callback path.
+        frames = tuple(dict.values(self._acquisition_frame_by_id))
+        current = self._acquisition_navigation_current
+        if (
+            current is not None
+            and self._acquisition_frame_by_id.get(id(current)) is not current
+        ):
+            current = frames[-1] if frames else None
+        selected = tuple(
+            frame for frame in frames
+            if self._acquisition_navigation_selected.get(id(frame)) is frame
+        )
+        if current is not None and not selected:
+            selected = (current,)
+        self._acquisition_navigation = FrameNavigationProjection(
+            frames, current, selected,
+        )
+        self._acquisition_navigation_current = current
+        self._acquisition_navigation_dirty = False
         return self._acquisition_navigation
 
     @property
@@ -274,7 +304,7 @@ class _ContextRuntime:
 
     def _full_raw_target(self):
         selection, context = self._selection, self._acquisition
-        current = self._acquisition_navigation.current
+        current = self._acquisition_navigation_current
         return ((context, current) if selection is not None and context is not None
                 and current is not None and selection.kind is ContextKind.ACQUISITION
                 and selection.names(context) and selection.owner == context.hydration_owner
@@ -462,7 +492,7 @@ class _ContextRuntime:
             )
         ):
             entries = ()
-        navigation = self._acquisition_navigation
+        navigation = self._acquisition_navigation_snapshot()
         self._set_acquisition_navigation(FrameNavigationProjection(
             *_normalized_navigation(
                 entries, navigation.current, navigation.selected,
@@ -524,23 +554,33 @@ class _ContextRuntime:
             is not delta.appended
         ):
             return False
-        navigation = FrameNavigationProjection(
-            *_navigation_after_append(
-                self._acquisition_navigation,
-                delta,
-                plot_mode,
-                follow_latest=follow_latest,
-            )
-        )
+        current = self._acquisition_navigation_current
+        selected = self._acquisition_navigation_selected
+        for retired in delta.retired:
+            self._acquisition_frame_by_id.pop(id(retired), None)
+            selected.pop(id(retired), None)
+        self._acquisition_frame_by_id[id(delta.appended)] = delta.appended
+        if not follow_latest and plot_mode not in {"Overlay", "Waterfall"}:
+            if current is None or self._acquisition_frame_by_id.get(id(current)) is not current:
+                current = delta.appended
+            if not selected:
+                selected[id(current)] = current
+        elif plot_mode not in {"Overlay", "Waterfall", "Average", "Sum"}:
+            current = delta.appended
+            selected.clear()
+            selected[id(delta.appended)] = delta.appended
+        else:
+            current = delta.appended if follow_latest or current is None else current
+            if self._acquisition_frame_by_id.get(id(current)) is not current:
+                current = delta.appended
+            selected[id(delta.appended)] = delta.appended
         if (
-            navigation.current is not self._acquisition_navigation.current
+            current is not self._acquisition_navigation_current
             and self._acquisition is not None
         ):
             self._acquisition.publication_store.invalidate_full_demand()
-        self._acquisition_navigation = navigation
-        for retired in delta.retired:
-            self._acquisition_frame_by_id.pop(id(retired), None)
-        self._acquisition_frame_by_id[id(delta.appended)] = delta.appended
+        self._acquisition_navigation_current = current
+        self._acquisition_navigation_dirty = True
         return True
 
     def select_latest_navigation(
@@ -555,7 +595,7 @@ class _ContextRuntime:
             return False
         navigation = (
             self._browse_navigation if selection.kind is ContextKind.BROWSE
-            else self._acquisition_navigation
+            else self._acquisition_navigation_snapshot()
         )
         if not navigation.frames:
             return False
@@ -693,7 +733,7 @@ class _ContextRuntime:
             identifier == acquisition.context_token
             or any(
                 frame.artifact == identifier
-                for frame in self._acquisition_navigation.frames
+                for frame in self._acquisition_navigation_snapshot().frames
             )
         ):
             self.select_acquisition()
@@ -928,7 +968,7 @@ class _ContextRuntime:
         elif selection is not None:
             context = self._acquisition
             identity = self._run_identity
-            current = self._acquisition_navigation.current
+            current = self._acquisition_navigation_current
             if (
                 context is not None
                 and identity is not None
@@ -1627,7 +1667,7 @@ class _ContextRuntime:
         selection = DisplaySelection.for_context(
             context, self._display_generation)
         navigation = (
-            self._acquisition_navigation
+            self._acquisition_navigation_snapshot()
             if type(context) is AcquisitionContext
             else self._browse_navigation
         )
@@ -1649,7 +1689,7 @@ class _ContextRuntime:
         navigation = (
             self._browse_navigation
             if browse
-            else self._acquisition_navigation
+            else self._acquisition_navigation_snapshot()
         )
         matching = tuple(
             frame
@@ -1685,12 +1725,19 @@ class _ContextRuntime:
         self,
         navigation: FrameNavigationProjection,
     ) -> None:
+        prior_current = self._acquisition_navigation_current
         prior_frames = self._acquisition_navigation.frames
-        if navigation.current is not self._acquisition_navigation.current \
+        was_dirty = self._acquisition_navigation_dirty
+        if navigation.current is not prior_current \
                 and self._acquisition is not None:
             self._acquisition.publication_store.invalidate_full_demand()
         self._acquisition_navigation = navigation
-        if navigation.frames is not prior_frames:
+        self._acquisition_navigation_current = navigation.current
+        self._acquisition_navigation_selected = {
+            id(frame): frame for frame in navigation.selected
+        }
+        self._acquisition_navigation_dirty = False
+        if was_dirty or navigation.frames is not prior_frames:
             self._acquisition_frame_by_id = {
                 id(frame): frame for frame in navigation.frames
             }

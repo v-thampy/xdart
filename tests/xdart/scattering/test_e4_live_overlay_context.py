@@ -20,7 +20,11 @@ from xdart.gui.tabs.scattering.display_values import (
 )
 from xdart.gui.tabs.scattering.events import RunIdentity
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
-from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
+from xdart.gui.tabs.scattering.shell_values import (
+    FrameNavigationProjection,
+    ShellCommand,
+    ShellCommandKind,
+)
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 
 
@@ -82,6 +86,91 @@ def test_live_delta_updates_identity_index_in_place_without_full_rebuild() -> No
     assert controller.owns_frame(first) is False
     assert controller.owns_frame(second) is True
     assert controller.owns_frame(third_delta.appended) is True
+
+
+def test_live_append_defers_immutable_navigation_validation_until_snapshot(
+    monkeypatch,
+) -> None:
+    controller, _lifecycle, _executor, _loader, acquisition = (
+        _running_controller()
+    )
+    display = acquisition.publication_store
+    assert display.catalog.resize(1_025) == ()
+    initial = controller.navigation
+    first = initial.current
+    assert first is not None
+    original = FrameNavigationProjection.__post_init__
+    validations: list[int] = []
+
+    def counted(projection):
+        validations.append(len(projection.frames))
+        return original(projection)
+
+    monkeypatch.setattr(FrameNavigationProjection, "__post_init__", counted)
+    appended: list[DisplayFrameKey] = []
+    for label in range(2, 1_026):
+        delta = display.append_navigation("run.a", "/out/a.nxs", label)
+        appended.append(delta.appended)
+        assert controller.accept_navigation(delta, plot_mode="Overlay")
+
+    navigation = controller.navigation
+    _assert_exact(initial.frames, (first,))
+    assert initial.current is first
+    _assert_exact(initial.selected, (first,))
+    _assert_exact(navigation.frames, (first, *appended))
+    assert navigation.current is appended[-1]
+    _assert_exact(navigation.selected, navigation.frames)
+    assert validations == [len(navigation.frames)]
+
+
+def test_live_reset_before_snapshot_replaces_acquisition_identity_index() -> None:
+    controller, _lifecycle, _executor, _loader, acquisition = (
+        _running_controller()
+    )
+    runtime = controller._runtime
+    display = acquisition.publication_store
+    runtime._set_acquisition_navigation(FrameNavigationProjection())
+    delta = display.append_navigation("run.a", "/out/a.nxs", 2)
+
+    assert controller.accept_navigation(delta, plot_mode="Overlay")
+    assert runtime._acquisition_navigation_dirty is True
+
+    runtime._set_acquisition_navigation(FrameNavigationProjection())
+
+    assert runtime._acquisition_frame_by_id == {}
+    assert runtime._acquisition_navigation_dirty is False
+    assert controller.navigation.frames == ()
+
+
+def test_live_explicit_selection_before_snapshot_uses_incremental_current(
+    monkeypatch,
+) -> None:
+    controller, _lifecycle, _executor, _loader, acquisition = (
+        _running_controller()
+    )
+    runtime = controller._runtime
+    first = controller.navigation.current
+    assert first is not None
+    invalidations: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        acquisition.publication_store,
+        "invalidate_full_demand",
+        lambda **kwargs: invalidations.append(kwargs),
+    )
+    delta = acquisition.publication_store.append_navigation(
+        "run.a", "/out/a.nxs", 2,
+    )
+
+    assert controller.accept_navigation(delta, plot_mode="Overlay")
+    invalidations.clear()
+    runtime._set_acquisition_navigation(
+        FrameNavigationProjection((first,), first, (first,))
+    )
+
+    assert invalidations == [{}]
+    assert runtime._acquisition_frame_by_id == {id(first): first}
+    assert controller.navigation.current is first
+    _assert_exact(controller.navigation.selected, (first,))
 
 
 def test_live_delta_invalidates_full_demand_only_when_current_changes(

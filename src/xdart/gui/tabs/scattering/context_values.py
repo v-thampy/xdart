@@ -11,7 +11,7 @@ from xdart.modules.display_context import (
 
 from .browse_values import BrowseLoadRequest
 from .display_values import (
-    DisplayFrameKey, DisplayNavigationDelta, StandardDisplayPayload,
+    DisplayFrameKey, StandardDisplayPayload,
 )
 from .shell_values import FrameNavigationProjection
 
@@ -131,61 +131,4 @@ def _normalized_navigation(
         selected = ()
     elif not selected:
         selected = (current,)
-    return frames, current, selected
-
-
-def _navigation_after_append(
-    navigation: FrameNavigationProjection,
-    delta: DisplayNavigationDelta,
-    plot_mode: str,
-    *,
-    follow_latest: bool = True,
-) -> tuple[
-    tuple[DisplayFrameKey, ...],
-    DisplayFrameKey,
-    tuple[DisplayFrameKey, ...],
-]:
-    """Apply one accepted live append while retaining exact multi-selection."""
-
-    retired = {id(frame) for frame in delta.retired}
-    frames = tuple(
-        frame
-        for frame in navigation.frames
-        if id(frame) not in retired
-    )
-    if not any(frame is delta.appended for frame in frames):
-        frames = (*frames, delta.appended)
-    if not follow_latest and plot_mode not in {"Overlay", "Waterfall"}:
-        current = (
-            navigation.current
-            if any(frame is navigation.current for frame in frames)
-            else delta.appended
-        )
-        selected = tuple(
-            frame
-            for frame in navigation.selected
-            if any(candidate is frame for candidate in frames)
-        )
-        if not selected:
-            selected = (current,)
-        return frames, current, selected
-    if plot_mode not in {"Overlay", "Waterfall", "Average", "Sum"}:
-        return frames, delta.appended, (delta.appended,)
-    frame_identities = {id(frame) for frame in frames}
-    selected_identities = {
-        id(frame)
-        for frame in navigation.selected
-        if id(frame) in frame_identities
-    }
-    selected_identities.add(id(delta.appended))
-    selected = tuple(
-        frame for frame in frames if id(frame) in selected_identities
-    )
-    current = (
-        delta.appended
-        if follow_latest
-        else navigation.current
-        if any(frame is navigation.current for frame in frames)
-        else delta.appended
-    )
     return frames, current, selected
