@@ -1,6 +1,7 @@
 """Real Viewer page selection agrees with the resident scientific traces."""
 
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -123,6 +124,60 @@ def test_real_overlay_select_all_commits_all_highlighted_rows(viewer):
     _settle(app)
     assert len(browser.frames.selectionModel().selectedRows()) == 6
     _assert_curves(page, 6)
+
+
+def test_overlay_frame_arrows_accumulate_after_mouse_selection(viewer):
+    app, page, _paths = viewer
+    browser = page._shell.browser
+    first = browser.frame_model.index(0, 0)
+    QtTest.QTest.mouseClick(browser.frames.viewport(), QtCore.Qt.MouseButton.LeftButton,
+        QtCore.Qt.KeyboardModifier.NoModifier, browser.frames.visualRect(first).center())
+    _settle(app)
+    _mode(app, page, "Overlay")
+    browser.frames.setFocus()
+    for count in (2, 3):
+        QtTest.QTest.keyClick(browser.frames, QtCore.Qt.Key.Key_Down)
+        _settle(app, .3)
+        _assert_curves(page, count)
+        assert browser.frames.currentIndex().row() == count - 1
+    # Held-key delivery and a quick subsequent gesture must keep every visit.
+    QtTest.QTest.keyPress(browser.frames, QtCore.Qt.Key.Key_Down)
+    QtTest.QTest.keyPress(browser.frames, QtCore.Qt.Key.Key_Down)
+    QtTest.QTest.keyRelease(browser.frames, QtCore.Qt.Key.Key_Down)
+    QtTest.QTest.keyClick(browser.frames, QtCore.Qt.Key.Key_Down)
+    _settle(app, .3)
+    _assert_curves(page, 6)
+    assert browser.frames.currentIndex().row() == 5
+
+
+@pytest.mark.parametrize("uneven", (False, True))
+def test_dense_text_axes_use_display_grid_without_changing_curves(viewer, tmp_path, uneven):
+    app, page, _paths = viewer
+    # Same precision and range as the owner's exported 1000-point iq files.
+    axis = np.linspace(1.03419784, 8.48116166, 1000)
+    if uneven:
+        axis = axis[0] + (axis - axis[0]) ** 1.1
+    paths = tuple(str(tmp_path / f"rounded_{i:02}.xye") for i in range(16))
+    for i, path in enumerate(paths):
+        np.savetxt(path, np.column_stack((axis, 3 * axis + i, np.ones(axis.size))),
+                   fmt="%.9g", delimiter="\t")
+    original = tuple(Path(path).read_bytes() for path in paths)
+    page._open_viewer_1d_paths(paths)
+    _ready(app, page)
+    view = page._shell.scientific
+    assert view.bottom_waterfall_active, view.status.text()
+    image = view.waterfall.canvas.raw_image
+    assert image.shape == (1000, 16)
+    for i, path in enumerate(paths):
+        data = np.loadtxt(path)
+        grid = np.linspace(data[0, 0], data[-1, 0], len(data))
+        np.testing.assert_allclose(image[:, i], np.interp(grid, data[:, 0], data[:, 1]))
+    del image
+    # Returning below the hysteresis threshold restores exact native curves.
+    page._open_viewer_1d_paths(paths[:7])
+    _ready(app, page)
+    _assert_curves(page, 7)
+    assert tuple(Path(path).read_bytes() for path in paths) == original
 
 
 def test_resident_artifact_subset_reuses_batch_and_new_file_keeps_clear_fence(viewer, monkeypatch):

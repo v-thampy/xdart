@@ -105,6 +105,41 @@ def test_switch_refused_nexus_1d_viewer_to_2d_viewer_loads_current_source(
     assert page._context_controller.viewer_2d_context.original_path == str(path)
 
 
+@pytest.mark.parametrize("viewer_mode", ("1D Viewer", "2D Viewer"))
+@pytest.mark.parametrize("integration_mode", ("Int 1D", "Int 2D"))
+def test_return_from_viewer_reopens_same_processed_file(
+        processed_page, viewer_mode, integration_mode):
+    from test_browse_selected_slices import _wait as wait_browse, _ready as ready_browse
+    app, page, path, _ = processed_page
+    controller = page._context_controller
+    page._handle_shell_command(ShellCommand(
+        ShellCommandKind.SET_PROCESSING_MODE, viewer_mode))
+    if viewer_mode == "1D Viewer":
+        # Selecting the already shown NeXus in 1D Viewer reaches its real
+        # unsupported-suffix refusal and releases the previous Browse owner.
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_SCAN,
+            str(path), path=("artifact",), artifacts=(str(path),)))
+        _wait(page, app, lambda: controller.viewer_1d_context is not None
+              and controller.viewer_1d_context.state.value == "empty"
+              and controller.viewer_1d_diagnostic)
+    else:
+        _wait(page, app, lambda: controller.viewer_2d_frame is not None
+              and page._shell.scientific._viewer_2d_payload is not None)
+    assert controller.browse_context is None
+    page._handle_shell_command(ShellCommand(
+        ShellCommandKind.SET_PROCESSING_MODE, integration_mode))
+    wait_browse(app, lambda: ready_browse(page, 1), page)
+    assert controller.browse_context.requested_path == str(path)
+    assert not controller.viewer_1d_owned and not controller.viewer_2d_owned
+    browser = page._shell.browser
+    second = browser.frame_model.index(1, 0)
+    QtTest.QTest.mouseClick(browser.frames.viewport(), QtCore.Qt.MouseButton.LeftButton,
+        QtCore.Qt.KeyboardModifier.NoModifier, browser.frames.visualRect(second).center())
+    wait_browse(app, lambda: (controller.navigation.current.local_frame_label == 2
+                            and ready_browse(page, 1)), page)
+    assert "Loading" not in page._shell.scientific.status.text()
+
+
 def test_uncached_browse_retains_only_capped_raster_until_current_is_ready(
         processed_page, monkeypatch):
     from xdart.gui.tabs.scattering.browse_1d_hydration import FrameViewReader

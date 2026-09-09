@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xdart.gui.themes.spacing import current_spacing_tokens
@@ -1044,6 +1046,14 @@ class BrowserView(QtWidgets.QFrame):
         command = self._pending_frame_command
         self._pending_frame_command = None
         if command is not None:
+            if os.environ.get("XDART_VIEWER_DEBUG") == "1":
+                print("viewer_selection", {
+                    "intent": command.intent.value,
+                    "current": getattr(command.frame, "local_frame_label", None),
+                    "operands": [frame.local_frame_label for frame in command.frames],
+                    "ui_current": self.frames.currentIndex().row(),
+                    "gesture": self._frame_gesture_active,
+                }, flush=True)
             self.commandRequested.emit(command)
 
     def _queue_frame_command(self, command: ShellCommand) -> None:

@@ -6680,6 +6680,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 return
             controller = self._context_controller
             target_tool = tool_from_mode_text(value)
+            if os.environ.get("XDART_VIEWER_DEBUG") == "1":
+                print("viewer_mode", {"from": candidate.processing_mode, "to": value,
+                    "browse": getattr(controller.browse_context, "requested_path", None),
+                    "one_d": getattr(controller.viewer_1d_context, "current_path", None),
+                    "two_d": getattr(controller.viewer_2d_context, "original_path", None),
+                    "selection": str(controller.selection)}, flush=True)
             if target_tool is Tool.IMAGE_VIEWER:
                 selection = controller.selection
                 browse = controller.browse_context

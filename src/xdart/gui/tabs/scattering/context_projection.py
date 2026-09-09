@@ -275,6 +275,10 @@ def _viewer_1d_scientific(navigation, payloads, resident, preferences, notice,
             ready, status = False, "1D Viewer refused: axes must be finite and strictly increasing"
         elif not np.allclose(axes[0], np.linspace(axes[0][0], axes[0][-1], len(axes[0])),
                              rtol=1e-12, atol=1e-12):
+            if os.environ.get("XDART_VIEWER_DEBUG") == "1":
+                print("viewer_grid", {"rows": len(axes), "points": len(axes[0]),
+                    "max_uniform_error": float(np.max(np.abs(axes[0] - np.linspace(
+                        axes[0][0], axes[0][-1], len(axes[0])))))}, flush=True)
             ready, status = False, "1D Viewer refused: first selected axis is nonuniform"
         else:
             status = "1D Viewer · first selected 1D source display grid"
