@@ -86,7 +86,6 @@ def test_uncached_browse_retains_only_capped_raster_until_current_is_ready(
         wait_browse(app, entered.is_set, page)
         assert view.viewer_loading_snapshot_visible
         assert 0 < view.viewer_loading_snapshot_pixels <= 2_000_000
-        assert view._viewer_loading_notice.text() == "Loading — previous view"
         assert not view.curve.listDataItems()
         assert view.raw.image.image is None
         release.set()

@@ -437,22 +437,9 @@ class ScientificView(QtWidgets.QFrame):
             QtCore.Qt.AlignmentFlag.AlignCenter
         )
         self._viewer_loading_pixmap.setScaledContents(True)
-        self._viewer_loading_notice = QtWidgets.QLabel(
-            "Loading — previous view", self._viewer_loading_overlay,
-        )
-        self._viewer_loading_notice.setObjectName("e6ViewerLoadingNotice")
-        self._viewer_loading_notice.setAlignment(
-            QtCore.Qt.AlignmentFlag.AlignCenter
-        )
-        self._viewer_loading_notice.setStyleSheet(
-            "color: white; font-weight: 600; "
-            "background-color: rgba(22, 28, 36, 210);"
-        )
-        self._viewer_loading_notice.setContentsMargins(6, 3, 6, 3)
         for widget in (
             self._viewer_loading_overlay,
             self._viewer_loading_pixmap,
-            self._viewer_loading_notice,
         ):
             widget.installEventFilter(self)
         self._viewer_loading_overlay.hide()
@@ -1159,8 +1146,6 @@ class ScientificView(QtWidgets.QFrame):
         self._viewer_loading_pixmap.setGeometry(
             self._viewer_loading_overlay.rect()
         )
-        self._viewer_loading_notice.adjustSize()
-        self._viewer_loading_notice.move(8, 8)
         self._viewer_loading_overlay.raise_()
 
     def _begin_viewer_loading_snapshot(self, mode: str) -> None:
@@ -1938,11 +1923,10 @@ class ScientificView(QtWidgets.QFrame):
         self._bottom_waterfall_active = (
             browse_snapshot.waterfall_active
             if browse_snapshot is not None
-            else state.plot_mode == "Waterfall" and len(rows) > 1
-            if state.processing_mode == "1D Viewer"
             else waterfall_should_be_active(
                 state.plot_mode, len(rows),
-                was_active=self._bottom_waterfall_active)
+                was_active=self._bottom_waterfall_active,
+                viewer_1d=state.processing_mode == "1D Viewer")
         )
         waterfall_scope = rows
         stacked_selection = (
@@ -2781,7 +2765,8 @@ class ScientificView(QtWidgets.QFrame):
             and normalized != self._viewer_loading_mode
         ):
             self.drop_viewer_loading_snapshot()
-        changed = self._layout_mode != normalized
+        previous_layout = self._layout_mode
+        changed = previous_layout != normalized
         self._layout_mode = normalized
         viewer = normalized in {"1D Viewer", "2D Viewer"}
         if changed:
@@ -2821,8 +2806,6 @@ class ScientificView(QtWidgets.QFrame):
             ):
                 widget.setVisible(False)
             self.background.setVisible(True); self.vertical_splitter.widget(1).setVisible(True)
-            if changed:
-                self.vertical_splitter.setSizes([0, 1])
             self._set_share_link(False)
             return
         if normalized == "2D Viewer":
@@ -2834,16 +2817,24 @@ class ScientificView(QtWidgets.QFrame):
             ):
                 widget.setVisible(False)
             self._set_share_link(False)
-            for widget in (self.raw, self.image_splitter, self.background): widget.setVisible(True)
+            self.raw.setVisible(True)
+            if self.image_splitter.isHidden():
+                self.image_splitter.refresh()
+            self.image_splitter.setVisible(True)
+            self.background.setVisible(True)
             return
         has_2d = normalized != "Int 1D"
-        prior_has_2d = self._processing_mode not in {"Int 1D", "1D Viewer"}
+        prior_has_2d = previous_layout not in {"Int 1D", "1D Viewer", "2D Viewer"}
         self._processing_mode = normalized
         self.norm.setVisible(True)
         self.background.setVisible(True)
-        self.image_splitter.setVisible(has_2d)
         self.raw.setVisible(True)
         self.cake.setVisible(True)
+        if changed or self.image_splitter.isHidden():
+            # Hidden children leave QSplitter's cached maximum at (0, 0).
+            # Recompute it before the vertical splitter restores this row.
+            self.image_splitter.refresh()
+        self.image_splitter.setVisible(has_2d)
         self.vertical_splitter.widget(1).setVisible(True)
         for widget in (
             self.image_axis,
@@ -3002,7 +2993,6 @@ class ScientificView(QtWidgets.QFrame):
         if watched in {
             self._viewer_loading_overlay,
             self._viewer_loading_pixmap,
-            self._viewer_loading_notice,
         }:
             if event.type() in {
                 QtCore.QEvent.Type.MouseButtonPress,

@@ -7,7 +7,7 @@ import time
 import h5py
 import numpy as np
 import pytest
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 import tifffile
 
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
@@ -90,6 +90,8 @@ def test_completed_xye_run_opens_terminal_file_and_output_folder(
         executor=StandardRunExecutor(join_timeout=2.0),
     )
     events = []
+    page.resize(1400, 1000)
+    page.show()
     original_drain = page._run_executor.drain_events
 
     def observe_events():
@@ -161,6 +163,27 @@ def test_completed_xye_run_opens_terminal_file_and_output_folder(
         assert page._start_permitted()[0]
         assert page._shell.run_controls.startButton.isEnabled()
         if source_kind == "tiff":
+            # Completion retains the integration mode, but file gestures must
+            # still have the same meaning as in the standalone 1-D Viewer.
+            page._handle_shell_command(ShellCommand(
+                ShellCommandKind.SET_PLOT_MODE, "Overlay"))
+            item = next(scans.item(index) for index in range(scans.count())
+                        if scans.item(index).data(QtCore.Qt.ItemDataRole.UserRole)
+                        == str(generated[1]))
+            scans.scrollToItem(item)
+            app.processEvents()
+            QtTest.QTest.mouseClick(
+                scans.viewport(), QtCore.Qt.MouseButton.LeftButton,
+                QtCore.Qt.KeyboardModifier.ControlModifier,
+                scans.visualItemRect(item).center())
+            assert _wait(app, lambda: (
+                len(page._context_controller.navigation.selected) == 2
+                and page._last_scientific_projection is not None
+                and len(page._last_scientific_projection.traces) == 2
+            )), page._notice_text
+            assert len(page._shell.scientific.curve.getPlotItem().listDataItems()) == 2
+            assert set(page._context_controller.viewer_1d_context.paths) == {
+                str(generated[0]), str(generated[1])}
             # Run retains integration authority after browsing the output.
             events.clear()
             page._shell.run_controls.startButton.click()

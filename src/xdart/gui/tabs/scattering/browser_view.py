@@ -184,13 +184,26 @@ class _FrameSelectionCadenceFilter(QtCore.QObject):
 class _ArtifactNavigationFilter(QtCore.QObject):
     """Plain arrows visit adjacent files; directory entry is explicit."""
 
-    def __init__(self, view, activate_directory):
+    def __init__(self, view, activate_directory, visit_artifact):
         super().__init__(view)
         self._view = view
         self._activate_directory = activate_directory
+        self._visit_artifact = visit_artifact
 
     def eventFilter(self, watched, event) -> bool:
+        event_type = event.type()
+        if event_type not in {QtCore.QEvent.Type.MouseButtonPress,
+                              QtCore.QEvent.Type.MouseButtonDblClick,
+                              QtCore.QEvent.Type.KeyPress}:
+            return False
         view = self._view
+        if event_type == QtCore.QEvent.Type.MouseButtonPress:
+            if (event.button() == QtCore.Qt.MouseButton.LeftButton
+                    and event.modifiers() == QtCore.Qt.KeyboardModifier.NoModifier):
+                index = view.indexAt(event.position().toPoint())
+                if index.isValid():
+                    return self._visit_artifact(view.item(index.row()))
+            return False
         if event.type() == QtCore.QEvent.Type.MouseButtonDblClick:
             index = view.indexAt(event.position().toPoint())
             item = view.item(index.row()) if index.isValid() else None
@@ -216,7 +229,8 @@ class _ArtifactNavigationFilter(QtCore.QObject):
             row = view.count() if step < 0 else -1
         for index in range(row + step, view.count() if step > 0 else -1, step):
             if not view.item(index).data(_DIRECTORY_ROLE):
-                view.setCurrentRow(index)
+                if not self._visit_artifact(view.item(index)):
+                    view.setCurrentRow(index)
                 break
         return True
 
@@ -326,7 +340,7 @@ class BrowserView(QtWidgets.QFrame):
         self.scans = QtWidgets.QListWidget()
         self.scans.setObjectName("e3ScanList")
         self._artifact_navigation_filter = _ArtifactNavigationFilter(
-            self.scans, self._activate_directory,
+            self.scans, self._activate_directory, self._visit_artifact,
         )
         self.scans.installEventFilter(self._artifact_navigation_filter)
         self.scans.viewport().installEventFilter(self._artifact_navigation_filter)
@@ -750,7 +764,20 @@ class BrowserView(QtWidgets.QFrame):
         self.auto_last.setChecked(state.auto_last)
         del blockers
 
-    def _scan_selected(self) -> None:
+    def _visit_artifact(self, item) -> bool:
+        if (item.data(_DIRECTORY_ROLE)
+                or self._plot_mode not in _VISIT_ACCUMULATING_PLOT_MODES
+                or self.scans.selectionMode()
+                != QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection):
+            return False
+        blocker = QtCore.QSignalBlocker(self.scans)
+        self.scans.setCurrentItem(
+            item, QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        del blocker
+        self._scan_selected(FrameSelectionIntent.VISIT)
+        return True
+
+    def _scan_selected(self, intent=FrameSelectionIntent.EXACT) -> None:
         items = tuple(
             self.scans.item(index)
             for index in range(self.scans.count())
@@ -811,6 +838,7 @@ class BrowserView(QtWidgets.QFrame):
             current_artifact,
             path=("artifact",),
             artifacts=artifacts,
+            intent=intent,
         ))
 
     def _select_all_frames(self) -> None:

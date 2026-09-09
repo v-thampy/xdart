@@ -45,6 +45,7 @@ from .shell_values import (
     ProgressProjection, ScientificProjection, ShellProjection, TraceProjection,
 )
 from .state_machine import RunPhase
+from .scientific_waterfall_policy import waterfall_should_be_active
 
 
 def _scientific_presentation_mode(processing_mode: str) -> str:
@@ -247,7 +248,8 @@ def _viewer_2d_payload(context, request, selection, frame_keys, catalog, frame):
     title = f"{name} · frame {position} · {text}"
     return StandardDisplayPayload(selection.display_generation, request.frame,
                                   title, view, status)
-def _viewer_1d_scientific(navigation, payloads, resident, preferences, notice):
+def _viewer_1d_scientific(navigation, payloads, resident, preferences, notice,
+                          was_waterfall_active=False):
     effective = (preferences.plot_mode if preferences.plot_mode in {
         "Single", "Overlay", "Waterfall"} else "Single")
     payload_by_id = {id(item.frame_key): item for item in payloads
@@ -264,7 +266,9 @@ def _viewer_1d_scientific(navigation, payloads, resident, preferences, notice):
     # image grid to validate until a second source joins the Waterfall.
     if ready and len({item.view.axis_1d.unit for item in accepted}) != 1:
         ready, status = False, "1D Viewer refused: conflicting units"
-    if ready and effective == "Waterfall" and len(frames) > 1:
+    waterfall = waterfall_should_be_active(
+        effective, len(frames), was_active=was_waterfall_active, viewer_1d=True)
+    if ready and waterfall:
         axes = tuple(item.view.axis_1d.values for item in accepted)
         if any(len(axis) < 2 or not np.all(np.isfinite(axis)) or np.any(np.diff(axis) <= 0)
                for axis in axes):
@@ -280,7 +284,7 @@ def _viewer_1d_scientific(navigation, payloads, resident, preferences, notice):
         for index, (frame, payload) in enumerate(zip(frames, accepted)):
             view = payload.view; values = view.axis_1d.values
             intensity, sigma = view.intensity_1d, view.sigma_1d
-            if effective == "Waterfall" and index:
+            if waterfall and index:
                 intensity = np.interp(grid, values, intensity, left=np.nan, right=np.nan)
                 sigma = (None if sigma is None else
                          np.interp(grid, values, sigma, left=np.nan, right=np.nan))
@@ -361,6 +365,7 @@ class ContextProjection:
         browser_catalog_index: BrowserScanIndex | None = None,
         browser_transient_frame: DisplayFrameKey | None = None,
         viewer_1d_paths: tuple[str, ...] = (),
+        viewer_waterfall_active: bool = False,
         date_sorted: bool,
         auto_last: bool,
         executor_available: bool,
@@ -471,7 +476,8 @@ class ContextProjection:
         )
         if viewer_1d_selected:
             viewer_scientific = _viewer_1d_scientific(
-                viewer_navigation, payloads, resident_frames, preferences, notice)
+                viewer_navigation, payloads, resident_frames, preferences, notice,
+                viewer_waterfall_active)
         scientific = (viewer_scientific if viewer_selected else
             build_scientific_projection(
                 payloads, navigation, resident_frames, preferences, notice,
@@ -504,7 +510,7 @@ class ContextProjection:
                           and selection.names(context)), "")
                     if viewer_2d_selected else viewer_1d_current_path
                 ),
-                multi_artifact_selection=tool is Tool.XYE_VIEWER,
+                multi_artifact_selection=viewer_1d_selected or tool is Tool.XYE_VIEWER,
                 show_all_frames=viewer_selected,
             ),
             scientific,

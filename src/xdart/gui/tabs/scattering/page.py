@@ -3137,6 +3137,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     tool is Tool.XYE_VIEWER
                     or mode == "Int 1D (XYE)" and value.lower().endswith(".xye"))):
                 selected = command.artifacts or (value,)
+                context = self._context_controller.viewer_1d_context
+                navigation = self._context_controller.navigation
+                if (command.intent is FrameSelectionIntent.VISIT
+                        and context is not None and context.state.value == "ready"
+                        and len(context.paths) == len(navigation.frames)):
+                    selected_ids = {id(frame) for frame in navigation.selected}
+                    prior = tuple(path for path, frame in zip(
+                        context.paths, navigation.frames, strict=True)
+                        if id(frame) in selected_ids)
+                    selected = tuple(dict.fromkeys((*prior, *selected)))
                 self._open_viewer_1d_paths(selected, current_path=value)
                 return
             if tool is Tool.IMAGE_VIEWER and type(value) is str and value:
@@ -6123,6 +6133,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 and self._context_controller.viewer_1d_context is not None
                 else ()
             ),
+            viewer_waterfall_active=self._shell.scientific.bottom_waterfall_active,
             date_sorted=browser.date_sorted,
             auto_last=browser.auto_last,
             executor_available=self._run_executor is not None,

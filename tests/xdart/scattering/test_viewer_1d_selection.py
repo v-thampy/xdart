@@ -75,19 +75,21 @@ def _mounted(page):
 
 def _assert_curves(page, count):
     navigation = page._context_controller.navigation
-    state = page._last_scientific_projection
     assert len(navigation.selected) == count
-    assert tuple(trace.frame for trace in state.traces) == navigation.selected
+    assert tuple(trace.frame for trace in page._last_scientific_projection.traces) == navigation.selected
     assert len(_mounted(page)) == count
     assert len(page._shell.scientific.curve.getPlotItem().listDataItems()) == count
-    for trace, item in zip(state.traces, _mounted(page).values(), strict=True):
+    for trace, item in zip(page._last_scientific_projection.traces,
+                           _mounted(page).values(), strict=True):
         x, y = item.getData()
         np.testing.assert_array_equal(x, trace.axis.values)
         # Presentation offset may differ between modes; the distinct per-file
         # scientific values and within-curve differences must remain exact.
         np.testing.assert_allclose(np.diff(y), np.diff(trace.intensity))
-        np.testing.assert_array_equal(trace.intensity,
-            np.arange(3) + 10 * (trace.frame.local_frame_label + 1))
+        index = next(index for index, frame in enumerate(navigation.frames)
+                     if frame is trace.frame)
+        path = page._context_controller.viewer_1d_context.paths[index]
+        np.testing.assert_array_equal(trace.intensity, np.loadtxt(path)[:, 1])
 
 
 def test_real_single_explicit_selection_survives_mode_switch(viewer):
@@ -164,6 +166,59 @@ def test_resident_artifact_subset_reuses_batch_and_new_file_keeps_clear_fence(vi
     assert holder.borrow is None and owner.batch_identity is not batch
     _assert_curves(page, 7)
     monkeypatch.undo()
+
+
+def test_overlay_file_visits_keep_previous_curves(viewer):
+    app, page, paths = viewer
+    scans = page._shell.browser.scans
+
+    def click(path, modifiers=QtCore.Qt.KeyboardModifier.NoModifier):
+        item = next(scans.item(row) for row in range(scans.count())
+                    if scans.item(row).data(QtCore.Qt.ItemDataRole.UserRole) == path)
+        scans.scrollToItem(item)
+        app.processEvents()
+        QtTest.QTest.mouseClick(scans.viewport(), QtCore.Qt.MouseButton.LeftButton,
+            modifiers, scans.visualItemRect(item).center())
+        _ready(app, page)
+
+    click(paths[0])
+    _assert_curves(page, 1)
+    _mode(app, page, "Overlay")
+    click(paths[1])
+    _assert_curves(page, 2)
+    # A previously unopened file uses the real reader/clear fence too.
+    click(paths[6])
+    assert len(page._context_controller.navigation.selected) == 3
+    assert {trace.title for trace in page._last_scientific_projection.traces} == {
+        f"curve_{index}.xye" for index in (0, 1, 6)}
+    assert len(_mounted(page)) == 3
+    click(paths[0], QtCore.Qt.KeyboardModifier.ControlModifier)
+    _assert_curves(page, 2)
+    assert {trace.title for trace in page._last_scientific_projection.traces} == {
+        "curve_1.xye", "curve_6.xye"}
+
+
+@pytest.mark.parametrize("mode", ("Single", "Overlay"))
+def test_viewer_dense_selection_uses_shared_waterfall_threshold(viewer, tmp_path, mode):
+    app, page, paths = viewer
+    extra = tuple(str(tmp_path / f"dense_{index}.xye") for index in range(9))
+    for index, path in enumerate(extra):
+        np.savetxt(path, np.column_stack((np.arange(3),
+            np.arange(3) + 100 + index, np.ones(3))))
+    paths = paths + extra
+    _mode(app, page, mode)
+    page._open_viewer_1d_paths(paths[:15])
+    _ready(app, page)
+    assert not page._shell.scientific.bottom_waterfall_active
+    page._open_viewer_1d_paths(paths)
+    _ready(app, page)
+    assert len(page._last_scientific_projection.traces) == 16
+    assert page._shell.scientific.bottom_waterfall_active
+    assert page._shell.scientific.bottom_stack.currentWidget() is page._shell.scientific.waterfall
+    page._open_viewer_1d_paths(paths[:7])
+    _ready(app, page)
+    assert not page._shell.scientific.bottom_waterfall_active
+    assert len(_mounted(page)) == 7
 
 
 @pytest.mark.parametrize("mode", ("Single", "Overlay"))

@@ -22,6 +22,22 @@ class _HideEvents(QtCore.QObject):
         return False
 
 
+@pytest.mark.parametrize("fixture_name", ("viewer_1d", "viewer_2d"))
+def test_return_to_int2d_restores_both_plot_rows(request, fixture_name):
+    from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
+
+    fixture = request.getfixturevalue(fixture_name)
+    app, page = fixture[:2] if fixture_name == "viewer_1d" else (fixture[1], fixture[0])
+    page._handle_shell_command(ShellCommand(
+        ShellCommandKind.SET_PROCESSING_MODE, "Int 2D"))
+    app.processEvents()
+    view = page._shell.scientific
+    sizes = view.vertical_splitter.sizes()
+    assert view.image_splitter.isVisible()
+    assert view.vertical_splitter.widget(1).isVisible()
+    assert len(sizes) == 2 and min(sizes) > sum(sizes) * 0.25, sizes
+
+
 def test_new_hdf_file_has_no_teardown_or_zero_one_range(viewer_2d, monkeypatch):
     import xdart.gui.tabs.scattering.hydration_transport as transport
 
@@ -58,7 +74,6 @@ def test_new_hdf_file_has_no_teardown_or_zero_one_range(viewer_2d, monkeypatch):
         assert view.raw.image.image is None and view.raw.image.qimage is None
         assert view.raw.canvas.raw_image.size == 0
         assert view.viewer_loading_snapshot_visible
-        assert view._viewer_loading_notice.text() == "Loading — previous view"
         assert 0 < view.viewer_loading_snapshot_pixels <= 2_000_000
         pixmap = view._viewer_loading_pixmap.pixmap()
         assert view.viewer_loading_snapshot_pixels == pixmap.width() * pixmap.height()
@@ -113,7 +128,6 @@ def test_new_xye_batch_retires_curves_without_hiding_panel(viewer_1d, monkeypatc
         assert not view.curve.listDataItems() and not view.trace_history_keys
         assert plot.targetRect() == target
         assert view.viewer_loading_snapshot_visible
-        assert view._viewer_loading_notice.text() == "Loading — previous view"
         assert 0 < view.viewer_loading_snapshot_pixels <= 2_000_000
         release.set()
         _ready(app, page)
