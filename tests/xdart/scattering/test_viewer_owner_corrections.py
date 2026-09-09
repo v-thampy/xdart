@@ -70,6 +70,27 @@ def test_xye_mode_with_selected_browse_enters_2d_through_mode_widget(processed_p
     assert page._context_controller.viewer_2d_context.original_path == str(path)
 
 
+@pytest.mark.parametrize("select_in_viewer", (False, True))
+def test_mode_widget_from_1d_viewer_keeps_selected_nexus(
+        processed_page, select_in_viewer):
+    app, page, path, _ = processed_page
+    controller = page._context_controller
+    page._shell.run_controls.modeCombo.setCurrentText("1D Viewer")
+    app.processEvents()
+    if select_in_viewer:
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SELECT_SCAN, str(path), path=("artifact",),
+            artifacts=(str(path),)))
+        _wait(page, app, lambda: bool(controller.viewer_1d_diagnostic))
+    page._shell.run_controls.modeCombo.setCurrentText("2D Viewer")
+    _wait(page, app, lambda: controller.viewer_2d_frame is not None
+          and page._shell.scientific._viewer_2d_payload is not None)
+    assert controller.viewer_2d_context.original_path == str(path)
+    assert "Loading" not in page._shell.scientific.status.text()
+    np.testing.assert_array_equal(controller.viewer_2d_frame.array,
+                                  np.arange(16).reshape(4, 4))
+
+
 def test_ready_processed_2d_viewer_qualifies_its_exact_nexus_revision(
         processed_page):
     app, page, path, _ = processed_page
