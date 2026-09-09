@@ -2,14 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import time
 
 import numpy as np
 import pytest
 
-from xdart.gui.tabs.scattering.adapters.browse_loader import BrowseLoader
 from xdart.gui.tabs.scattering.browse_values import (
-    BrowseLoadRequest,
     BrowseLoadStatus,
 )
 from xdart.gui.tabs.scattering.context_projection import (
@@ -35,19 +32,6 @@ from xrd_tools.reduction.core import Frame, FrameReduction, Scan
 from tests.xdart.scattering.test_e3_context_contract import _browse
 
 
-def _wait_outcome(
-    loader: BrowseLoader,
-    request: BrowseLoadRequest,
-):
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        outcome = loader.poll(request)
-        if outcome is not None:
-            return outcome
-        time.sleep(0.002)
-    raise AssertionError("browse loader did not finish")
-
-
 def _project_browse(context, *, identity: RunIdentity | None = None):
     identity = identity or RunIdentity(1, "browse-wavelength")
     selection = DisplaySelection.for_context(context, 3)
@@ -71,10 +55,17 @@ def _project_browse(context, *, identity: RunIdentity | None = None):
 
 
 def test_processed_file_round_trip_preserves_wavelength_and_converts_trace(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
-    path = tmp_path / "processed.nxs"
-    frame = Frame(index=1, image=np.arange(16, dtype=float).reshape(4, 4))
+    import tifffile
+    from pyqtgraph.Qt import QtWidgets
+    from tests.xdart.scattering.test_p3_experiment_operation_composition import _page
+    from test_browse_selected_slices import _wait, _ready, _close
+    path = tmp_path / "processed.nexus"
+    raw = tmp_path / "raw.tif"
+    image = np.arange(16, dtype=float).reshape(4, 4)
+    tifffile.imwrite(raw, image)
+    frame = Frame(index=1, image=image, source_path=str(raw), source_frame_index=0)
     scan = Scan(
         name="persisted-wavelength",
         frames=[frame],
@@ -103,48 +94,26 @@ def test_processed_file_round_trip_preserves_wavelength_and_converts_trace(
     )
     sink.finish(result=None)
 
-    loader = BrowseLoader()
-    request = BrowseLoadRequest(
-        new_context_token(ContextKind.BROWSE),
-        1,
-        str(path),
-    )
-    loader.begin(request)
-    outcome = _wait_outcome(loader, request)
-    assert outcome.status is BrowseLoadStatus.READY
-    context = loader.consume(outcome)
-    assert context is not None
-    assert json.loads(context.calibration_identity)["wavelength_m"] \
-        == pytest.approx(0.7293e-10)
-
-    payload = _project_browse(context)
-    assert payload is not None
-    assert payload.wavelength_m == pytest.approx(0.7293e-10)
-    frame_key = payload.frame_key
-    navigation = FrameNavigationProjection(
-        (frame_key,),
-        frame_key,
-        (frame_key,),
-    )
-    projection = build_scientific_projection(
-        (payload,),
-        navigation,
-        frozenset({frame_key}),
-        ScientificPreferences(plot_axis="2theta"),
-        "",
-    )
-    assert projection.plot_axis == "2theta"
-    assert len(projection.traces) == 1
-    assert projection.traces[0].axis.unit == "2th_deg"
-    np.testing.assert_allclose(
-        projection.traces[0].axis.values,
-        2.0 * np.rad2deg(
-            np.arcsin(q * 0.7293 / (4.0 * np.pi))
-        ),
-    )
-
-    loader.release_context(context)
-    loader.close()
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    page, _ = _page(tmp_path, monkeypatch)
+    projection = None
+    try:
+        controller = page._context_controller
+        controller.begin_browse(str(path))
+        assert _wait(app, controller.poll_browse, page).status is BrowseLoadStatus.READY
+        assert json.loads(controller.browse_context.calibration_identity)["wavelength_m"] \
+            == pytest.approx(0.7293e-10)
+        _wait(app, lambda: _ready(page, 1), page)
+        axis = page._shell.scientific.plot_axis
+        axis.setCurrentIndex(axis.findData("2theta"))
+        projection = _wait(app, lambda: _ready(page, 1), page)
+        assert projection.plot_axis == "2theta"
+        assert projection.traces[0].axis.unit == "2th_deg"
+        np.testing.assert_allclose(projection.traces[0].axis.values,
+            2.0 * np.rad2deg(np.arcsin(q * 0.7293 / (4.0 * np.pi))))
+    finally:
+        projection = None
+        _close(page, app)
 
 
 @pytest.mark.parametrize(

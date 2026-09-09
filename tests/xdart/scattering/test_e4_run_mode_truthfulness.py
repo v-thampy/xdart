@@ -246,9 +246,7 @@ def test_xye_output_uses_the_existing_int1d_trace_and_center_layout(
     monkeypatch,
 ) -> None:
     from tests.xdart.scattering.test_e3_context_contract import _view
-    from tests.xdart.scattering.test_p2a1_viewer_context_page import (
-        _fake_scientific,
-    )
+    from pyqtgraph.Qt import QtWidgets
     from xdart.gui.tabs.scattering import shell_projection
     from xdart.gui.tabs.scattering.display_values import (
         DisplayFrameKey,
@@ -306,12 +304,14 @@ def test_xye_output_uses_the_existing_int1d_trace_and_center_layout(
     assert projected.scientific.traces[0].intensity is view.intensity_1d
     assert allow_cake and set(allow_cake) == {False}
 
-    mounted = _fake_scientific()
-    ScientificView._apply_processing_layout(
-        mounted, projected.scientific.processing_mode,
-    )
-    assert mounted.image_splitter.hidden
-    assert not mounted.raw_popup_button.hidden
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    mounted = ScientificView()
+    try:
+        mounted._apply_processing_layout(projected.scientific.processing_mode)
+        assert mounted.image_splitter.isHidden()
+        assert not mounted.raw_popup_button.isHidden()
+    finally:
+        mounted.close()
 
     controls = project_controls(
         RunIntentStore(intent).snapshot(), None, RunPhase.IDLE,

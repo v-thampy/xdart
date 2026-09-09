@@ -1522,7 +1522,9 @@ def test_open_folder_and_refresh_publish_processed_catalog(
                 QtCore.Qt.ItemDataRole.UserRole
             ) == str(nested)
         )
-        shell.browser.scans.setCurrentItem(nested_item)
+        QtTest.QTest.mouseClick(
+            shell.browser.scans.viewport(), QtCore.Qt.MouseButton.LeftButton,
+            pos=shell.browser.scans.visualItemRect(nested_item).center())
         wait_for(
             lambda: (
                 shell.browser.directory_label._path == str(nested)
@@ -1543,7 +1545,9 @@ def test_open_folder_and_refresh_publish_processed_catalog(
                 == str(selected)
             )
         )
-        shell.browser.scans.setCurrentItem(shell.browser.scans.item(0))
+        QtTest.QTest.mouseClick(
+            shell.browser.scans.viewport(), QtCore.Qt.MouseButton.LeftButton,
+            pos=shell.browser.scans.visualItemRect(shell.browser.scans.item(0)).center())
         wait_for(
             lambda: shell.browser.directory_label._path == str(selected)
         )
