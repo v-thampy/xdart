@@ -61,6 +61,50 @@ def test_switch_processed_browse_to_2d_viewer_loads_current_source(processed_pag
                                   np.arange(16).reshape(4, 4))
 
 
+def test_ready_processed_2d_viewer_qualifies_its_exact_nexus_revision(
+        processed_page):
+    app, page, path, _ = processed_page
+    page._handle_shell_command(ShellCommand(
+        ShellCommandKind.SET_PROCESSING_MODE, "2D Viewer",
+    ))
+    _wait(page, app, lambda: (
+        page._context_controller.viewer_2d_frame is not None
+        and page._shell.scientific._viewer_2d_payload
+        is page._context_controller.viewer_2d_frame.array
+    ))
+    catalog = page._context_controller._runtime._viewer_2d_catalog
+    assert catalog is not None
+    assert catalog.primary_revision.canonical_path == str(path)
+    assert page._qualify_external_nexus(validate_disk=False).target == str(path)
+    assert page._qualify_external_nexus(validate_disk=True).target == str(path)
+
+    path.write_bytes(b"replacement")
+    qualification = page._qualify_external_nexus(validate_disk=True)
+    assert qualification.target is None
+    assert "changed after it was opened in 2D Viewer" in qualification.reason
+
+
+def test_switch_refused_nexus_1d_viewer_to_2d_viewer_loads_current_source(
+        processed_page):
+    app, page, path, _ = processed_page
+    page._open_viewer_1d_paths((str(path),), current_path=str(path))
+    _wait(page, app, lambda: (
+        page._context_controller.viewer_1d_context is not None
+        and page._context_controller.viewer_1d_context.state.value == "empty"
+        and page._context_controller.viewer_1d_diagnostic
+    ))
+    assert "viewer suffix" in page._context_controller.viewer_1d_diagnostic
+    page._handle_shell_command(ShellCommand(
+        ShellCommandKind.SET_PROCESSING_MODE, "2D Viewer",
+    ))
+    _wait(page, app, lambda: (
+        page._context_controller.viewer_2d_frame is not None
+        and page._shell.scientific._viewer_2d_payload
+        is page._context_controller.viewer_2d_frame.array
+    ))
+    assert page._context_controller.viewer_2d_context.original_path == str(path)
+
+
 def test_uncached_browse_retains_only_capped_raster_until_current_is_ready(
         processed_page, monkeypatch):
     from xdart.gui.tabs.scattering.browse_1d_hydration import FrameViewReader
@@ -103,8 +147,25 @@ def test_rapid_raw_frame_selection_keeps_one_preview_and_adopts_latest(
 
     page, app, _, values = viewer_2d
     view = page._shell.scientific
+    browser = page._shell.browser
     entered, release = Event(), Event()
     read = transport.read_viewer_2d_frame
+
+    class BlankRawPaints(QtCore.QObject):
+        paints = 0
+        total = 0
+
+        def eventFilter(self, watched, event):
+            if event.type() == QtCore.QEvent.Type.Paint:
+                self.total += 1
+            if (
+                event.type() == QtCore.QEvent.Type.Paint
+                and view.raw.isVisible()
+                and view.raw.image.image is None
+                and not view.viewer_loading_snapshot_visible
+            ):
+                self.paints += 1
+            return False
 
     def gated_read(*args, **kwargs):
         entered.set()
@@ -113,15 +174,16 @@ def test_rapid_raw_frame_selection_keeps_one_preview_and_adopts_latest(
 
     monkeypatch.setattr(transport, "read_viewer_2d_frame", gated_read)
     frames = page._context_controller.navigation.frames
+    blank_paints = BlankRawPaints(view.raw.canvas)
+    view.raw.canvas.viewport().installEventFilter(blank_paints)
     try:
-        page._handle_shell_command(ShellCommand(
-            ShellCommandKind.SELECT_FRAME, frame=frames[1], frames=(frames[1],)))
+        browser.frames.setFocus()
+        QtTest.QTest.keyClick(browser.frames, QtCore.Qt.Key_Down)
         _wait(page, app, entered.is_set)
         assert view.viewer_loading_snapshot_visible
         snapshot = view._viewer_loading_pixmap.pixmap().cacheKey()
-        for target in (frames[2], frames[0], frames[2]):
-            page._handle_shell_command(ShellCommand(
-                ShellCommandKind.SELECT_FRAME, frame=target, frames=(target,)))
+        for key in (QtCore.Qt.Key_Down, QtCore.Qt.Key_Up, QtCore.Qt.Key_Down):
+            QtTest.QTest.keyClick(browser.frames, key)
             page._refresh_shell()
             assert view.viewer_loading_snapshot_visible
             assert view._viewer_loading_pixmap.pixmap().cacheKey() == snapshot
@@ -132,6 +194,9 @@ def test_rapid_raw_frame_selection_keeps_one_preview_and_adopts_latest(
               and view._viewer_2d_payload is page._context_controller.viewer_2d_frame.array)
         np.testing.assert_array_equal(view._viewer_2d_payload, values[2])
         assert not view.viewer_loading_snapshot_visible
+        app.processEvents()
+        assert blank_paints.total > 0
+        assert blank_paints.paints == 0
     finally:
         release.set()
 

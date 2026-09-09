@@ -16,7 +16,14 @@ import weakref
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from xdart.modules.display_context import BrowseContext, ContextKind, DisplaySelection
+from xdart.modules.display_context import (
+    BrowseContext,
+    ContextKind,
+    DisplaySelection,
+    Viewer1DContext,
+    Viewer2DContext,
+    Viewer2DState,
+)
 from xrd_tools.core.scan import SourceSpec
 from xrd_tools.session.intent_store import (
     IntentCommitAccepted,
@@ -38,6 +45,7 @@ from xrd_tools.reduction.provenance_config import jsonable_run_value
 from xrd_tools.io.output_transaction import (
     StreamTerminal,
 )
+from xrd_tools.io.viewer_2d import Viewer2DArtifactCatalog, _stable_revision
 from xrd_tools.session.readiness import Tool, tool_from_mode_text
 from xrd_tools.session.display_logic import xye_prefix_for_unit
 from xrd_tools.sources.selection import (
@@ -2048,7 +2056,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _qualify_external_nexus(
         self, *, validate_disk: bool,
     ) -> ExternalNexusQualification:
-        """Return only a fresh selected loaded-Browse processed target."""
+        """Return only a fresh processed Browse or ready 2-D Viewer target."""
 
         if type(validate_disk) is not bool:
             raise TypeError("external NeXus validation flag must be exact")
@@ -2057,7 +2065,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return ExternalNexusQualification.refused(
                 "The workspace is closing; external viewers are unavailable."
             )
+        controller = self._context_controller
         capture = self._capture_current_loaded_browse()
+        target = None
+        viewer_revision = None
         held = self._external_nexus_refusal
         held_is_current = (
             type(capture) is LoadedBrowseCapture
@@ -2079,46 +2090,89 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return ExternalNexusQualification.refused(
                 "An acquisition writer is active; wait for it to finish."
             )
-        if type(capture) is not LoadedBrowseCapture:
+        if type(capture) is LoadedBrowseCapture:
+            target = capture.target
+        else:
+            context = controller.viewer_2d_context
+            catalog = controller._runtime._viewer_2d_catalog
+            selection = controller.selection
+            current = controller.navigation.current
+            frame = controller.viewer_2d_frame
+            if (
+                controller.viewer_2d_owned
+                and type(context) is Viewer2DContext
+                and context is controller._runtime._viewer_2d
+                and context.state is Viewer2DState.READY
+                and type(catalog) is Viewer2DArtifactCatalog
+                and catalog.canonical_path == context.original_path
+                and catalog.format_name == "hdf5-processed"
+                and type(selection) is DisplaySelection
+                and selection.kind is ContextKind.VIEWER_2D
+                and selection.names(context)
+                and current is not None
+                and controller.owns_frame(current)
+                and frame is not None
+                and frame.label == current.local_frame_label
+            ):
+                target = context.original_path
+                viewer_revision = catalog.primary_revision
+        if target is None:
             return ExternalNexusQualification.refused(
-                "Select one stable current processed .nexus file in Browse."
+                "Select one stable current processed .nexus file in Browse or 2D Viewer."
             )
         if held is not None:
             return held[1]
-        if Path(capture.target).suffix.casefold() != ".nexus":
+        if Path(target).suffix.casefold() != ".nexus":
             return ExternalNexusQualification.refused(
-                "The selected Browse target is not a processed .nexus file."
+                "The selected target is not a processed .nexus file."
             )
         if validate_disk:
-            try:
-                state = Path(capture.target).stat()
-            except FileNotFoundError:
-                refusal = ExternalNexusQualification.refused(
-                    "The selected processed .nexus file is no longer available."
-                )
-                self._external_nexus_refusal = (capture, refusal)
-                return refusal
-            except OSError:
-                refusal = ExternalNexusQualification.refused(
-                    "The selected processed .nexus file could not be revalidated."
-                )
-                self._external_nexus_refusal = (capture, refusal)
-                return refusal
-            snapshot = capture.target_snapshot
-            if (
-                not stat.S_ISREG(state.st_mode)
-                or int(state.st_size) != snapshot.size
-                or int(state.st_mtime_ns) != snapshot.mtime_ns
-                or int(state.st_dev) != snapshot.device
-                or int(state.st_ino) != snapshot.inode
-            ):
-                refusal = ExternalNexusQualification.refused(
-                    "The selected processed .nexus file changed after it was "
-                    "loaded; refresh Browse before opening it."
-                )
-                self._external_nexus_refusal = (capture, refusal)
-                return refusal
-        return ExternalNexusQualification.ready(capture.target)
+            if capture is not None:
+                try:
+                    state = Path(target).stat()
+                except FileNotFoundError:
+                    refusal = ExternalNexusQualification.refused(
+                        "The selected processed .nexus file is no longer available."
+                    )
+                    self._external_nexus_refusal = (capture, refusal)
+                    return refusal
+                except OSError:
+                    refusal = ExternalNexusQualification.refused(
+                        "The selected processed .nexus file could not be revalidated."
+                    )
+                    self._external_nexus_refusal = (capture, refusal)
+                    return refusal
+                snapshot = capture.target_snapshot
+                if (
+                    not stat.S_ISREG(state.st_mode)
+                    or int(state.st_size) != snapshot.size
+                    or int(state.st_mtime_ns) != snapshot.mtime_ns
+                    or int(state.st_dev) != snapshot.device
+                    or int(state.st_ino) != snapshot.inode
+                ):
+                    refusal = ExternalNexusQualification.refused(
+                        "The selected processed .nexus file changed after it was "
+                        "loaded; refresh Browse before opening it."
+                    )
+                    self._external_nexus_refusal = (capture, refusal)
+                    return refusal
+            else:
+                try:
+                    current_revision = _stable_revision(Path(target))
+                except FileNotFoundError:
+                    return ExternalNexusQualification.refused(
+                        "The selected processed .nexus file is no longer available."
+                    )
+                except Exception:
+                    return ExternalNexusQualification.refused(
+                        "The selected processed .nexus file could not be revalidated."
+                    )
+                if current_revision != viewer_revision:
+                    return ExternalNexusQualification.refused(
+                        "The selected processed .nexus file changed after it was "
+                        "opened in 2D Viewer; reload it before opening it."
+                    )
+        return ExternalNexusQualification.ready(target)
 
     def _begin_pending_reintegrate_successor(
         self,
@@ -6619,23 +6673,42 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if kind is ShellCommandKind.SET_PROCESSING_MODE:
             if type(value) is not str or not value:
                 return
-            if (self._context_controller.viewer_2d_owned
-                    and tool_from_mode_text(value) is not Tool.IMAGE_VIEWER
+            controller = self._context_controller
+            target_tool = tool_from_mode_text(value)
+            if target_tool is Tool.IMAGE_VIEWER:
+                selection = controller.selection
+                browse = controller.browse_context
+                if (
+                    browse is not None
+                    and selection is not None
+                    and selection.names(browse)
+                ):
+                    viewer_source = browse.requested_path
+                else:
+                    one_d = controller.viewer_1d_context
+                    if (
+                        controller.viewer_1d_owned
+                        and type(one_d) is Viewer1DContext
+                        and one_d is controller._runtime._viewer_1d
+                        and selection is not None
+                        and selection.kind is ContextKind.VIEWER_1D
+                        and selection.names(one_d)
+                        and one_d.current_path in one_d.paths
+                        and Path(one_d.current_path).suffix.casefold()
+                        == ".nexus"
+                    ):
+                        viewer_source = one_d.current_path
+            if (controller.viewer_2d_owned
+                    and target_tool is not Tool.IMAGE_VIEWER
                     and not self._clear_viewer_2d_renderer(close=True)):
                 self._notice("2D Viewer cleanup remains pending")
                 return
-            if (getattr(self._context_controller, "viewer_1d_owned", False)
-                    and tool_from_mode_text(value) is not Tool.XYE_VIEWER
+            if (getattr(controller, "viewer_1d_owned", False)
+                    and target_tool is not Tool.XYE_VIEWER
                     and not self._clear_viewer_1d_renderer(close=True)):
                 self._notice("1D Viewer cleanup remains pending")
                 return
             if value != candidate.processing_mode:
-                selection = self._context_controller.selection
-                browse = self._context_controller.browse_context
-                if (tool_from_mode_text(value) is Tool.IMAGE_VIEWER
-                        and browse is not None and selection is not None
-                        and selection.names(browse)):
-                    viewer_source = browse.requested_path
                 self._retire_batch_presentation()
                 release_outgoing_display = True
                 self._retain_outgoing_display = False
