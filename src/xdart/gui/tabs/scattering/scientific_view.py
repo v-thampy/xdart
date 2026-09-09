@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
+import time
 
 from matplotlib import colormaps as matplotlib_colormaps
 import numpy as np
@@ -287,6 +288,7 @@ class ScientificView(QtWidgets.QFrame):
         self._bottom_waterfall_active = False
         self._waterfall_y_values: tuple[float, ...] = ()
         self._waterfall_y_label = "Frame #"
+        self._waterfall_last_draw = 0.0
         self._waterfall_source_keys: tuple[tuple[object, ...], ...] = ()
         self._waterfall_render_contract: tuple[object, ...] | None = None
         self._processing_mode = ""
@@ -879,8 +881,6 @@ class ScientificView(QtWidgets.QFrame):
         completed: int,
         total: int,
         detail: str,
-        defer_image_render: bool = False,
-        defer_bottom_render: bool = False,
     ) -> None:
         self.reconcile_action_availability(state)
         self.background.setText(("Clear" if state.background_set else "Set") + " " + {"Int 1D": "1D", "1D Viewer": "1D", "Int 2D": "2D", "2D Viewer": "Raw"}.get(state.processing_mode, "BG") + " BG")
@@ -996,7 +996,7 @@ class ScientificView(QtWidgets.QFrame):
             or state.heavy is not None
             or not state.retain_display
         )
-        if replace_presentation and not defer_bottom_render:
+        if replace_presentation:
             self._reconcile_axis_choices(state)
         self._set_data_combo(self.image_axis, state.image_axis)
         self._set_data_combo(self.plot_axis, state.plot_axis)
@@ -1018,7 +1018,7 @@ class ScientificView(QtWidgets.QFrame):
         self.raw_popup_button.setToolTip(explanation or "Show exact-current raw image")
         if replace_presentation:
             self.image_axis.setEnabled(state.measurement_mode != "GI")
-        if replace_presentation and not defer_bottom_render:
+        if replace_presentation:
             self.title.setText(state.title)
         self._heavy_available = state.heavy_available
         self._plot_mode = state.plot_mode
@@ -1037,7 +1037,7 @@ class ScientificView(QtWidgets.QFrame):
         prior_syncing = self._share_axis_syncing
         self._share_axis_syncing = True
         try:
-            if not defer_image_render and state.heavy is not None:
+            if state.heavy is not None:
                 if state.heavy.raw is not None and state.processing_mode != "Int 1D":
                     raw_matches = self.raw.render_matches(
                         state.heavy.raw,
@@ -1093,14 +1093,14 @@ class ScientificView(QtWidgets.QFrame):
                     self._rendered_cake_x_axis = None
                     self._rendered_cake_y_axis = None
                     self._rendered_image_axis = None
-            elif not defer_image_render and (
+            elif (
                 state.retain_display
                 and state.browse_trace_snapshot is None
             ):
                 # A qualified hydration is pending.  Keep the last accepted
                 # title/images/traces together until its exact result arrives.
                 pass
-            elif not defer_image_render:
+            else:
                 # An accepted absence is a complete transition, not permission
                 # to leave a stale raw/cake hybrid on screen.
                 self.raw.clear_image_buffers()
@@ -1110,7 +1110,7 @@ class ScientificView(QtWidgets.QFrame):
                 self._rendered_cake_x_axis = None
                 self._rendered_cake_y_axis = None
                 self._rendered_image_axis = None
-            if replace_presentation and not defer_bottom_render:
+            if replace_presentation:
                 self._render_traces(
                     state,
                     navigation,
@@ -1120,7 +1120,7 @@ class ScientificView(QtWidgets.QFrame):
                 self._reconcile_raw_popup(state)
         finally:
             self._share_axis_syncing = prior_syncing
-        if replace_presentation and not defer_bottom_render:
+        if replace_presentation:
             self._reconcile_slice_extent(state)
         pin_available = (
             state.heavy is not None
@@ -1988,6 +1988,16 @@ class ScientificView(QtWidgets.QFrame):
                 state.color_map,
                 state.norm_channel,
             )
+            if browse_snapshot is None and self._skip_live_waterfall(
+                source_keys,
+                render_contract,
+                live_update=live_update,
+            ):
+                self.bottom_stack.setCurrentWidget(self.waterfall)
+                self.legend.setVisible(False)
+                if self._share_link_on:
+                    self._schedule_curve_under_cake()
+                return
             if browse_snapshot is None:
                 rows = self._bounded_waterfall_rows(rows)
         if state.plot_mode in {"Average", "Sum"}:
@@ -2456,6 +2466,29 @@ class ScientificView(QtWidgets.QFrame):
             if pin_id in self._pinned_trace_by_id
         )
 
+    def _skip_live_waterfall(
+        self,
+        source_keys: tuple[tuple[object, ...], ...],
+        render_contract: tuple[object, ...],
+        *,
+        live_update: bool,
+    ) -> bool:
+        """Throttle a compatible prefix before scaling or stacking rows."""
+
+        if (
+            not live_update
+            or self.bottom_stack.currentWidget() is not self.waterfall
+            or self.waterfall.image.image is None
+            or render_contract != self._waterfall_render_contract
+            or len(source_keys) < len(self._waterfall_source_keys)
+            or not all(
+                key == source_keys[index]
+                for index, key in enumerate(self._waterfall_source_keys)
+            )
+        ):
+            return False
+        return time.monotonic() - self._waterfall_last_draw < 0.5
+
     @staticmethod
     def _bounded_waterfall_rows(
         rows: tuple[tuple[tuple[object, ...], TraceProjection], ...],
@@ -2491,6 +2524,7 @@ class ScientificView(QtWidgets.QFrame):
         rows = _waterfall_rows_on_reference_axis(traces)
         if rows is None:
             return False
+        now = time.monotonic()
         if self._processing_mode == "1D Viewer":
             x_values = axis.values
         else:
@@ -2528,6 +2562,7 @@ class ScientificView(QtWidgets.QFrame):
         )
         self._waterfall_y_values = tuple(float(value) for value in y_values)
         self._waterfall_y_label = y_label
+        self._waterfall_last_draw = now
         return True
 
     @staticmethod
