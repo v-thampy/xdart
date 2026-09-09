@@ -40,8 +40,9 @@ def _wait(app, predicate, timeout=30.0):
     return False
 
 
+@pytest.mark.parametrize("fail_append", (False, True))
 def test_real_gi_stopped_append_reuses_the_original_freeze_extent(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, fail_append,
 ):
     """Append retains the full GI grid even though only the suffix is written."""
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -197,6 +198,15 @@ def test_real_gi_stopped_append_reuses_the_original_freeze_extent(
             }
         assert prefix["intensity"].shape[0] == stopped.completed
 
+        if fail_append:
+            arm = dynamic_output_module.DynamicOutputAdapter._arm
+
+            def fail_after_arm(adapter, *args, **kwargs):
+                arm(adapter, *args, **kwargs)
+                raise RuntimeError("test_append_arm_failure")
+
+            monkeypatch.setattr(dynamic_output_module.DynamicOutputAdapter, "_arm", fail_after_arm)
+
         page._shell.run_controls.writeModeButton.click()
         assert _wait(
             app,
@@ -224,8 +234,27 @@ def test_real_gi_stopped_append_reuses_the_original_freeze_extent(
             page._notice_text,
             flush=True,
         )
-        assert resumed.kind is StandardEventKind.FINISHED, resumed
+        active = page._run_executor._active
+        if resumed.kind is StandardEventKind.FAILED and active is not None:
+            print("GI_FAILED_DISPLAY", len(active.display.payloads),
+                  len(active.display.catalog_snapshot().entries), flush=True)
+            for owner in active.display.artifacts.values():
+                print("GI_FAILED_OWNER", None if owner.light_lease is None else owner.light_lease.state,
+                      None if owner.light_slot is None else owner.light_slot.state,
+                      owner.publications.allocation is not None,
+                      owner.publications._light_1d is not None, owner.light_unsubscribe is not None, flush=True)
         assert resumed.cleanup_status is CleanupStatus.CLEANED
+        if fail_append:
+            assert resumed.kind is StandardEventKind.FAILED
+            assert "test_append_arm_failure" in resumed.primary.message
+            assert page._lifecycle.reset_permitted
+            assert _wait(app, page._shell.run_controls.startButton.isEnabled)
+            with h5py.File(artifact, "r") as document:
+                for group, expected in (("integrated_1d", prefix), ("integrated_2d", prefix_2d)):
+                    for key, values in expected.items():
+                        np.testing.assert_array_equal(document[f"entry/{group}/{key}"][()], values)
+            return
+        assert resumed.kind is StandardEventKind.FINISHED, resumed
         assert resumed.completed == resumed.total == 16
         with h5py.File(artifact, "r") as document:
             resumed_1d = {
