@@ -210,3 +210,41 @@ def test_cancelled_frame_read_releases_before_subsequent_viewer_load(
         np.testing.assert_array_equal(controller.viewer_2d_frame.array, values[0])
     finally:
         release.set()
+
+
+def test_cancelled_prepared_frame_releases_before_subsequent_viewer_load(
+        viewer, monkeypatch):
+    page, app, paths, values = viewer
+    controller = page._context_controller
+    entered, release = Event(), Event()
+    commit = controller._viewer_2d.commit
+
+    def gated_commit(owner, prepared):
+        assert owner is controller._viewer_2d
+        entered.set()
+        assert release.wait(6)
+        return commit(prepared)
+
+    monkeypatch.setattr(type(controller._viewer_2d), "commit", gated_commit)
+    try:
+        QtTest.QTest.mouseClick(
+            page._shell.scientific.next_frame, QtCore.Qt.LeftButton,
+        )
+        _wait(page, app, entered.is_set)
+        prior_gate = controller.viewer_2d_context.commit_gate
+        assert controller.viewer_2d_frame is None
+        assert not controller.close_viewer_2d()
+        assert prior_gate.cancelled
+        release.set()
+        _wait(page, app, controller.close_viewer_2d)
+
+        page._open_viewer_2d_path(str(paths[1]))
+        _wait(page, app, lambda: (
+            controller.viewer_2d_frame is not None
+            and controller.viewer_2d_context.original_path == str(paths[1])
+            and page._shell.scientific._viewer_2d_payload
+            is controller.viewer_2d_frame.array
+        ))
+        np.testing.assert_array_equal(controller.viewer_2d_frame.array, values[0])
+    finally:
+        release.set()

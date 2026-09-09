@@ -662,7 +662,9 @@ class TwoDViewerCommitPort(Protocol):
     def complete(self, completion): ...
 
 
-def _viewer_request_identity(generation, gate, port, read_key, token, label):
+def _viewer_request_identity(
+    generation, gate, port, read_key, token, label, *, current_epoch=True,
+):
     if (type(generation) is not int or generation < 0
             or type(gate) is not Viewer2DCommitGate
             or not isinstance(port, TwoDViewerCommitPort)
@@ -675,7 +677,7 @@ def _viewer_request_identity(generation, gate, port, read_key, token, label):
             or read_key.artifact_identity != "viewer-2d"
             or read_key.frame_identity != label
             or read_key.purpose is not HydrationPurpose.PREVIEW
-            or read_key.scope.epoch != gate.epoch):
+            or current_epoch and read_key.scope.epoch != gate.epoch):
         raise ValueError("viewer request identity is inconsistent")
 
 
@@ -694,6 +696,37 @@ def _viewer_policy(value):
     return value
 
 
+def _validate_viewer_catalog_request(request, *, current_epoch):
+    if (type(request.path) is not str or not request.path
+            or len(os.fsencode(request.path)) > 4096):
+        raise TypeError("viewer catalog path must be an exact bounded string")
+    _viewer_policy(request.policy)
+    _viewer_request_identity(
+        request.generation, request.commit_gate, request.port,
+        request.read_key, request.token, "catalog", current_epoch=current_epoch,
+    )
+
+
+def _validate_viewer_frame_request(request, *, current_epoch):
+    from xrd_tools.io.viewer_2d import Viewer2DArtifactCatalog
+    labels = getattr(request.catalog, "frame_labels", None)
+    identity = getattr(request.catalog, "catalog_identity", None)
+    if type(request.catalog) is Viewer2DArtifactCatalog:
+        request.catalog.__post_init__()
+    if (type(request.label) is not int or request.receipt_identity is None
+            or type(request.catalog) is not Viewer2DArtifactCatalog
+            or type(labels) is not tuple or request.label not in labels
+            or type(identity) is not str or not identity
+            or _viewer_policy(request.policy).identity
+            != getattr(request.catalog, "policy_identity", None)):
+        raise TypeError("viewer frame request values are malformed")
+    _viewer_request_identity(
+        request.generation, request.commit_gate, request.port,
+        request.read_key, request.token, request.label,
+        current_epoch=current_epoch,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Viewer2DCatalogHydrationRequest(_ViewerRequest):
     path: str
@@ -705,11 +738,7 @@ class Viewer2DCatalogHydrationRequest(_ViewerRequest):
     token: HydrationToken
 
     def __post_init__(self):
-        if type(self.path) is not str or not self.path or len(os.fsencode(self.path)) > 4096:
-            raise TypeError("viewer catalog path must be an exact bounded string")
-        _viewer_policy(self.policy)
-        _viewer_request_identity(self.generation, self.commit_gate, self.port,
-                                 self.read_key, self.token, "catalog")
+        _validate_viewer_catalog_request(self, current_epoch=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -725,19 +754,7 @@ class Viewer2DFrameHydrationRequest(_ViewerRequest):
     token: HydrationToken
 
     def __post_init__(self):
-        from xrd_tools.io.viewer_2d import Viewer2DArtifactCatalog
-        labels = getattr(self.catalog, "frame_labels", None)
-        identity = getattr(self.catalog, "catalog_identity", None)
-        if type(self.catalog) is Viewer2DArtifactCatalog:
-            self.catalog.__post_init__()
-        if (type(self.label) is not int or self.receipt_identity is None
-                or type(self.catalog) is not Viewer2DArtifactCatalog
-                or type(labels) is not tuple or self.label not in labels
-                or type(identity) is not str or not identity
-                or _viewer_policy(self.policy).identity != getattr(self.catalog, "policy_identity", None)):
-            raise TypeError("viewer frame request values are malformed")
-        _viewer_request_identity(self.generation, self.commit_gate, self.port,
-                                 self.read_key, self.token, self.label)
+        _validate_viewer_frame_request(self, current_epoch=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -747,28 +764,7 @@ class Prepared2DCatalogCommit:
     catalog: object
 
     def __post_init__(self):
-        from xrd_tools.io.viewer_2d import (
-            CATALOG_RESERVATION, Viewer2DArtifactCatalog, viewer_2d_memory_ledger,
-        )
-        if type(self.request) is Viewer2DCatalogHydrationRequest:
-            self.request.__post_init__()
-        if type(self.activation) is Viewer2DReadActivation:
-            self.activation.__post_init__()
-        if type(self.catalog) is Viewer2DArtifactCatalog:
-            self.catalog.__post_init__()
-        receipt = getattr(self.activation, "receipt", None)
-        _viewer_malformed(type(self.request) is not Viewer2DCatalogHydrationRequest
-            or type(self.activation) is not Viewer2DReadActivation
-            or not self.activation.accepted
-            or self.activation.token is not self.request.token
-            or self.activation.phase is not Viewer2DReceiptPhase.CATALOG_R
-            or receipt.capacity != viewer_2d_memory_ledger(1, 1).budget
-            or receipt.reserved != CATALOG_RESERVATION
-            or type(self.catalog) is not Viewer2DArtifactCatalog
-            or self.request.policy.identity != self.catalog.policy_identity
-            or os.path.realpath(os.path.expanduser(self.request.path)) !=
-                self.catalog.canonical_path,
-            "prepared viewer catalog is inconsistent")
+        _validate_prepared_viewer_catalog(self, current_epoch=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -779,33 +775,79 @@ class Prepared2DFrameCommit:
     receipt_identity: object
 
     def __post_init__(self):
-        from xrd_tools.io.viewer_2d import (
-            Viewer2DFrame, _validate_frame_against_catalog,
-            viewer_2d_selected_ledger,
+        _validate_prepared_viewer_frame(self, current_epoch=True)
+
+
+def _validate_prepared_viewer_catalog(prepared, *, current_epoch):
+    from xrd_tools.io.viewer_2d import (
+        CATALOG_RESERVATION, Viewer2DArtifactCatalog, viewer_2d_memory_ledger,
+    )
+    if type(prepared.request) is Viewer2DCatalogHydrationRequest:
+        _validate_viewer_catalog_request(
+            prepared.request, current_epoch=current_epoch,
         )
-        if type(self.request) is Viewer2DFrameHydrationRequest:
-            self.request.__post_init__()
-        if type(self.activation) is Viewer2DReadActivation:
-            self.activation.__post_init__()
-        if type(self.frame) is Viewer2DFrame:
-            self.frame.__post_init__()
-        receipt = getattr(self.activation, "receipt", None)
-        ledger = (viewer_2d_selected_ledger(self.request.catalog, self.request.label)
-                  if type(self.request) is Viewer2DFrameHydrationRequest else None)
-        _viewer_malformed(type(self.request) is not Viewer2DFrameHydrationRequest
-            or type(self.activation) is not Viewer2DReadActivation
-            or not self.activation.accepted
-            or self.activation.token is not self.request.token
-            or self.activation.phase is not Viewer2DReceiptPhase.FRAME_A
-            or self.activation.receipt_identity is not self.request.receipt_identity
-            or self.receipt_identity is not self.request.receipt_identity
-            or receipt.capacity != ledger.budget or receipt.reserved != ledger.admission
-            or type(self.frame) is not Viewer2DFrame
-            or self.frame.catalog_identity !=
-                getattr(self.request.catalog, "catalog_identity", None)
-            or getattr(self.frame, "label", None) != self.request.label,
-            "prepared viewer frame is inconsistent")
-        _validate_frame_against_catalog(self.request.catalog, self.request.label, self.frame)
+    if type(prepared.activation) is Viewer2DReadActivation:
+        prepared.activation.__post_init__()
+    if type(prepared.catalog) is Viewer2DArtifactCatalog:
+        prepared.catalog.__post_init__()
+    receipt = getattr(prepared.activation, "receipt", None)
+    _viewer_malformed(
+        type(prepared.request) is not Viewer2DCatalogHydrationRequest
+        or type(prepared.activation) is not Viewer2DReadActivation
+        or not prepared.activation.accepted
+        or prepared.activation.token is not prepared.request.token
+        or prepared.activation.phase is not Viewer2DReceiptPhase.CATALOG_R
+        or receipt.capacity != viewer_2d_memory_ledger(1, 1).budget
+        or receipt.reserved != CATALOG_RESERVATION
+        or type(prepared.catalog) is not Viewer2DArtifactCatalog
+        or prepared.request.policy.identity != prepared.catalog.policy_identity
+        or os.path.realpath(os.path.expanduser(prepared.request.path))
+        != prepared.catalog.canonical_path,
+        "prepared viewer catalog is inconsistent",
+    )
+
+
+def _validate_prepared_viewer_frame(prepared, *, current_epoch):
+    from xrd_tools.io.viewer_2d import (
+        Viewer2DFrame, _validate_frame_against_catalog,
+        viewer_2d_selected_ledger,
+    )
+    if type(prepared.request) is Viewer2DFrameHydrationRequest:
+        _validate_viewer_frame_request(
+            prepared.request, current_epoch=current_epoch,
+        )
+    if type(prepared.activation) is Viewer2DReadActivation:
+        prepared.activation.__post_init__()
+    if type(prepared.frame) is Viewer2DFrame:
+        prepared.frame.__post_init__()
+    receipt = getattr(prepared.activation, "receipt", None)
+    ledger = (
+        viewer_2d_selected_ledger(
+            prepared.request.catalog, prepared.request.label,
+        )
+        if type(prepared.request) is Viewer2DFrameHydrationRequest
+        else None
+    )
+    _viewer_malformed(
+        type(prepared.request) is not Viewer2DFrameHydrationRequest
+        or type(prepared.activation) is not Viewer2DReadActivation
+        or not prepared.activation.accepted
+        or prepared.activation.token is not prepared.request.token
+        or prepared.activation.phase is not Viewer2DReceiptPhase.FRAME_A
+        or prepared.activation.receipt_identity
+        is not prepared.request.receipt_identity
+        or prepared.receipt_identity is not prepared.request.receipt_identity
+        or receipt.capacity != ledger.budget
+        or receipt.reserved != ledger.admission
+        or type(prepared.frame) is not Viewer2DFrame
+        or prepared.frame.catalog_identity
+        != getattr(prepared.request.catalog, "catalog_identity", None)
+        or getattr(prepared.frame, "label", None) != prepared.request.label,
+        "prepared viewer frame is inconsistent",
+    )
+    _validate_frame_against_catalog(
+        prepared.request.catalog, prepared.request.label, prepared.frame,
+    )
 
 
 class Viewer2DDisposalToken:
@@ -860,7 +902,12 @@ class Viewer2DDisposal:
                 Viewer2DFrameHydrationRequest)
             or type(self.token) is not Viewer2DDisposalToken,
             "viewer disposal identity is inconsistent")
-        self.request.__post_init__()
+        # A disposal owns the original request after cancellation has advanced
+        # its gate.  Recheck immutable lineage, not current admission epoch.
+        if request_type is Viewer2DCatalogHydrationRequest:
+            _validate_viewer_catalog_request(self.request, current_epoch=False)
+        else:
+            _validate_viewer_frame_request(self.request, current_epoch=False)
         readable = _viewer_quarantine_readable(self.request, self.activation)
         expected_phase, expected_capacity, expected_reserved = \
             _viewer_disposal_expected(self.request)
@@ -878,7 +925,14 @@ class Viewer2DDisposal:
                 or self.prepared.request is not self.request
                 or self.prepared.activation is not self.activation,
                 "viewer disposal identity is inconsistent")
-            self.prepared.__post_init__()
+            if prepared_type is Prepared2DCatalogCommit:
+                _validate_prepared_viewer_catalog(
+                    self.prepared, current_epoch=False,
+                )
+            else:
+                _validate_prepared_viewer_frame(
+                    self.prepared, current_epoch=False,
+                )
             return
         _viewer_malformed(self.prepared is not None or not readable,
                           "viewer disposal identity is inconsistent")
