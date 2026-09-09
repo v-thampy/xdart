@@ -6376,9 +6376,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if viewer_2d
                 else False
             )
-            # A read may finish during a control-only refresh. Keep the raster
-            # until the scientific refresh actually installs its replacement.
-            if (not preserve_scientific and not viewer_loading
+            # Match the shell's paint gate: a completed read can precede the
+            # trailing browser gesture, which still postpones scientific paint.
+            if (not preserve_display and not preserve_scientific
+                    and not self._shell.browser.frame_selection_pending
+                    and not viewer_loading
                     and not (cache_adoption_missing and cache_retry_needed)):
                 self._shell.scientific.drop_viewer_loading_snapshot()
             if rebind_scientific_navigation:
