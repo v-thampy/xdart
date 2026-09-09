@@ -175,7 +175,7 @@ def test_rapid_raw_frame_selection_keeps_one_preview_and_adopts_latest(
     monkeypatch.setattr(transport, "read_viewer_2d_frame", gated_read)
     frames = page._context_controller.navigation.frames
     blank_paints = BlankRawPaints(view.raw.canvas)
-    view.raw.canvas.viewport().installEventFilter(blank_paints)
+    view.raw.canvas.image_win.viewport().installEventFilter(blank_paints)
     try:
         browser.frames.setFocus()
         QtTest.QTest.keyClick(browser.frames, QtCore.Qt.Key_Down)
