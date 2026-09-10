@@ -5480,6 +5480,14 @@ def _reduce_frame(
         if include_corrected_image
         else None
     )
+    value_mask = detector_value_mask(
+        None, raw_image_arr, enabled=bool(plan.mask_saturation),
+    )
+    if value_mask is not None:
+        # Like intensity thresholds, reject values in the owned working image.
+        # Keep the native dtype for detection and the static geometric mask for
+        # integration axes/cache reuse; a recovered pixel is valid next frame.
+        image[value_mask] = np.nan
     if not use_float32_csr:
         image = _apply_thresholds_owned(image, plan)
         image = _subtract_background(image, frame.background)
@@ -5498,11 +5506,6 @@ def _reduce_frame(
             else plan_mask
             if frame_mask is None
             else plan_mask | frame_mask
-        )
-        mask = _apply_saturation_mask(
-            mask,
-            raw_image_arr,
-            plan,
         )
         fi = integrators.fiber()
         incident_angle = _resolve_gi_incident_angle(frame, plan.gi)
@@ -5547,7 +5550,7 @@ def _reduce_frame(
         detector_mask_is_bound = False
         has_run_constant_mask = False
         if (frame_mask is None and not chi_mode
-                and not unsafe_dynamic_mask_cache and not plan.mask_saturation):
+                and not unsafe_dynamic_mask_cache):
             # Only the static plan mask may be bound into an integrator cache.
             # Value-based exclusions belong to the current native frame.
             mask = plan_mask
@@ -5567,11 +5570,6 @@ def _reduce_frame(
                 else plan_mask
                 if frame_mask is None
                 else plan_mask | frame_mask
-            )
-            mask = _apply_saturation_mask(
-                mask,
-                raw_image_arr,
-                plan,
             )
             integration_mask = mask
         elif ai is None:
@@ -5686,7 +5684,12 @@ def _reduce_frame(
         corrected_image=corrected_image,
     )
     if include_worker_thumbnail_prep:
-        reduction._worker_thumbnail_prep = _WorkerThumbnailPrep(mask)
+        thumbnail_mask = (
+            mask if value_mask is None
+            else value_mask if mask is None
+            else mask | value_mask
+        )
+        reduction._worker_thumbnail_prep = _WorkerThumbnailPrep(thumbnail_mask)
     return reduction
 
 
@@ -6106,13 +6109,6 @@ def _cached_frame_mask_for_shape(
     resolved = _as_bool_mask(mask, "Frame.mask", image_shape=image_shape)
     cache[key] = (owner, resolved)
     return resolved
-
-
-def _apply_saturation_mask(mask, raw_image, plan):
-    """Union this native frame's detector-value exclusions with its masks."""
-    return detector_value_mask(
-        mask, raw_image, enabled=bool(plan.mask_saturation),
-    )
 
 
 # S8: fallback warn-state for direct (sessionless) calls.  Sessions own

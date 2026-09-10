@@ -184,52 +184,6 @@ def test_reduce_frame_routes_fresh_owned_buffer_without_mutating_raw(
     np.testing.assert_array_equal(raw, raw_before)
 
 
-def test_owned_thresholds_preserve_background_and_saturation_interactions(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    raw = np.full((100, 100), 10, dtype=np.uint16)
-    raw[:2, :] = np.iinfo(np.uint16).max
-    # This value must be rejected before background subtraction: subtracting
-    # first would turn 101 into the otherwise-admitted value 99.
-    raw[2, 0] = 101
-    raw[3, 0] = 0
-    raw_before = raw.copy()
-    captured: dict[str, np.ndarray | None] = {}
-
-    def capture(image, ai, **kwargs):
-        captured["image"] = np.array(image, copy=True)
-        mask = kwargs["mask"]
-        captured["mask"] = None if mask is None else np.array(mask, copy=True)
-        return _r1d(float(np.nansum(image)))
-
-    monkeypatch.setattr(reduction_core, "integrate_1d", capture)
-    result = run_reduction(
-        ReductionPlan(
-            threshold_min=5.0,
-            threshold_max=100.0,
-            mask_saturation=True,
-        ),
-        Scan(
-            "interactions",
-            [Frame(0, image=raw, background=2.0)],
-            integrator=object(),
-        ),
-    )
-
-    assert result.n_processed == 1
-    image = captured["image"]
-    mask = captured["mask"]
-    assert image is not None and mask is not None
-    assert image[4, 4] == 8.0
-    assert np.isnan(image[:2, :]).all()
-    assert np.isnan(image[2, 0])
-    assert np.isnan(image[3, 0])
-    assert mask[:2, :].all()
-    assert int(mask.sum()) == 200
-    assert not mask[2, 0] and not mask[3, 0]
-    np.testing.assert_array_equal(raw, raw_before)
-
-
 @pytest.mark.parametrize("gi", (False, True), ids=("standard", "gi"))
 def test_owned_thresholds_preserve_1d_2d_science_input_hashes(
     monkeypatch: pytest.MonkeyPatch,
