@@ -1845,7 +1845,7 @@ def _capture_bound_container_dependencies(
             file_name = os.fsdecode(selector.file_name)
             candidate = parent if file_name in {"", "."} else Path(file_name)
             if not candidate.is_absolute(): candidate = parent.parent / candidate
-            values.append((str(candidate.resolve()), "/" + os.fsdecode(selector.dset_name).lstrip("/")))
+            values.append((_raw_source_path(candidate), "/" + os.fsdecode(selector.dset_name).lstrip("/")))
         return values
     def identity(pair):
         return (os.path.normcase(os.path.normpath(pair[0])), os.path.normpath(pair[1]))
@@ -1906,10 +1906,23 @@ def _capture_bound_container_dependencies(
         _cancelled(cancelled); selector = pending[cursor]; cursor += 1
         key = identity(selector)
         if key in seen: continue
-        seen.add(key); dependency = binding.open_dependency_dataset(selector)
+        seen.add(key)
+        emit_dependency_once(Path(selector[0]))
+        dependency = binding.open_dependency_dataset(selector)
         try:
             dependency_path = Path(dependency.file.filename).resolve()
             before = SourceFileState.capture(dependency_path)
+            dependency_root = (
+                binding.entry_group.file if binding._dependency_file is None
+                else binding._dependency_file
+            )
+            lexical_external: list[Path] = []
+            _selected_link_owner_selector(
+                dependency_root, selector[1], dependency,
+                on_external_link=lexical_external.append,
+            )
+            for path in lexical_external:
+                emit_dependency_once(path)
             emit_dependency_once(dependency_path)
             capture_dataset_storage(dependency, dependency_path)
             after = SourceFileState.capture(dependency_path)

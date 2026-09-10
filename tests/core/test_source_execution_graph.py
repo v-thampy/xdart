@@ -2005,7 +2005,7 @@ def test_average_bound_graph_captures_external_storage_for_output_alias(
         detector = entry.create_group("instrument/detector")
         detector.create_dataset(
             "data", shape=values.shape, dtype=values.dtype,
-            external=[(str(storage), 0, values.nbytes)],
+            external=[(storage.name, 0, values.nbytes)],
         )
     value = graph.qualify_source_execution_graph(
         SourceSpec(master, SourceKind.NEXUS_STACK, entry="entry"),
@@ -2059,6 +2059,54 @@ def test_average_refuses_raw_external_storage_output_alias(tmp_path):
     assert result.disposition == "REFUSED", result
     assert result.diagnostic_code == "AVERAGE_OUTPUT_IS_SOURCE"
     assert storage.read_bytes() == storage_before
+
+
+def test_average_refuses_vds_external_link_source_output_alias(tmp_path):
+    """The VDS source file remains protected through its selected link."""
+    from xrd_tools.reduction import (
+        AverageScanRecipe, AverageScanRunner, Integration1DPlan, ReductionPlan,
+    )
+    from xrd_tools.session.experiment_state import (
+        CalibrationState, FactStatus, PoniValues,
+    )
+
+    master = tmp_path / "scan.nexus"
+    intermediate = tmp_path / "scan_average.nexus"
+    raw = tmp_path / "raw.nexus"
+    values = np.arange(48, dtype=np.uint16).reshape(3, 4, 4) + 10
+    with h5py.File(raw, "w") as handle:
+        handle.create_dataset("pixels", data=values)
+    with h5py.File(intermediate, "w") as handle:
+        handle["pixels"] = h5py.ExternalLink(raw.name, "/pixels")
+    with h5py.File(master, "w", libver="latest") as handle:
+        entry = handle.create_group("entry"); entry.attrs["NX_class"] = "NXentry"
+        data = entry.create_group("data"); data.attrs["NX_class"] = "NXdata"
+        layout = h5py.VirtualLayout(shape=values.shape, dtype=values.dtype)
+        layout[:] = h5py.VirtualSource(
+            str(intermediate), "/pixels", shape=values.shape,
+        )
+        data.create_virtual_dataset("data", layout)
+    intermediate_before = intermediate.read_bytes()
+    raw_before = raw.read_bytes()
+    calibration = CalibrationState(
+        PoniValues(0.2, 0.001, 0.001, 0.0, 0.0, 0.0, 1.0e-10), "Detector",
+        {"pixel1": 1.0e-4, "pixel2": 1.0e-4, "max_shape": [4, 4], "orientation": 3},
+        status=FactStatus.PRESENT,
+    )
+    runner = AverageScanRunner(AverageScanRecipe(
+        SourceSpec(master, SourceKind.NEXUS_STACK, entry="entry"), master,
+        ReductionPlan(integration_1d=Integration1DPlan(npt=4, method="numpy")),
+        calibration=calibration,
+    ))
+    try:
+        result = runner.start()
+    finally:
+        runner.close()
+
+    assert result.disposition == "REFUSED", result
+    assert result.diagnostic_code == "AVERAGE_OUTPUT_IS_SOURCE"
+    assert intermediate.read_bytes() == intermediate_before
+    assert raw.read_bytes() == raw_before
 
 
 def test_average_bound_graph_captures_external_owner_vds_and_link_chain(tmp_path):

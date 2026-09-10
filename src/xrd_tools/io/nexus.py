@@ -537,10 +537,13 @@ def _selected_link_owner_selector(
                 )
                 break
             if isinstance(link, h5py.ExternalLink):
-                owner = Path(os.fsdecode(current.file.filename)).parent / os.fsdecode(link.filename)
-                owner = owner.resolve()
+                lexical_owner = (
+                    Path(os.fsdecode(current.file.filename)).parent
+                    / os.fsdecode(link.filename)
+                )
                 if on_external_link is not None:
-                    on_external_link(owner)
+                    on_external_link(lexical_owner)
+                owner = lexical_owner.resolve()
                 target = canonical(posixpath.join(str(link.path), *remainder))
                 if not remainder:
                     if owner == actual_owner:
