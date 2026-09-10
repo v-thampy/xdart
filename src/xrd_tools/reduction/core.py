@@ -5423,8 +5423,6 @@ def _can_use_owned_float32_csr(
         and raw_image.flags.c_contiguous
         and plan.gi is None
         and background is None
-        and plan.threshold_min is None
-        and plan.threshold_max is None
         and integrator_input_safe is True
         and bool(enabled)
         and not (
@@ -5477,9 +5475,14 @@ def _reduce_frame(
         if include_corrected_image
         else None
     )
-    value_mask = detector_value_mask(
-        None, raw_image_arr, enabled=bool(plan.mask_saturation),
-    )
+    # Compare native values: uint32 neighbours above 2**24 can collapse when
+    # converted to float32. Explicit bounds already suppress saturation in the
+    # plan, and both policies reject into the same owned integration buffer.
+    value_mask = _threshold_mask(raw_image_arr, plan) if use_float32_csr else None
+    if value_mask is None:
+        value_mask = detector_value_mask(
+            None, raw_image_arr, enabled=bool(plan.mask_saturation),
+        )
     if value_mask is not None:
         # Like intensity thresholds, reject values in the owned working image.
         # Keep the native dtype for detection and the static geometric mask for
@@ -5744,13 +5747,21 @@ def _apply_threshold_bounds_in_place(
     out: np.ndarray,
     plan: ReductionPlan,
 ) -> np.ndarray:
-    bad = np.zeros(out.shape, dtype=bool)
-    if plan.threshold_min is not None:
-        bad |= out < float(plan.threshold_min)
-    if plan.threshold_max is not None:
-        bad |= out > float(plan.threshold_max)
-    out[bad] = np.nan
+    bad = _threshold_mask(out, plan)
+    if bad is not None:
+        out[bad] = np.nan
     return out
+
+
+def _threshold_mask(values: np.ndarray, plan: ReductionPlan) -> np.ndarray | None:
+    if plan.threshold_min is None and plan.threshold_max is None:
+        return None
+    bad = np.zeros(values.shape, dtype=bool)
+    if plan.threshold_min is not None:
+        bad |= values < float(plan.threshold_min)
+    if plan.threshold_max is not None:
+        bad |= values > float(plan.threshold_max)
+    return bad
 
 
 def _subtract_background(

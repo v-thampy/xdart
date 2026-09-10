@@ -304,7 +304,6 @@ def test_float32_csr_eligibility_fails_closed():
         (raw.astype(">u2"), None, base),
         (np.asfortranarray(raw), None, base),
         (raw, 0.0, base),
-        (raw, None, _csr_float32_plan(threshold_min=0.0)),
         (raw, None, _csr_float32_plan(gi=GIMode(incident_angle=0.1))),
         (raw, None, ReductionPlan(
             integration_1d=Integration1DPlan(unit="chi_deg"), integration_2d=None)),
@@ -387,3 +386,88 @@ def test_real_pyfai_float32_csr_matches_prior_float64_science(
                 assert _digest(left) == _digest(right)
     assert _digest(actual.result_2d.azimuthal) == _digest(expected_2d.azimuthal)
     np.testing.assert_array_equal(raw, before)
+
+
+@pytest.mark.parametrize("dtype", (np.uint8, np.uint16, np.uint32))
+@pytest.mark.parametrize("band", ("native", "fractional", "inclusive-ceiling"))
+def test_native_thresholds_share_float32_csr_without_rounding_membership(dtype, band, monkeypatch):
+    ceiling = int(np.iinfo(dtype).max)
+    limits = {
+        "native": (0., float(ceiling - 1)),
+        "fractional": (5.5, 100.5),
+        "inclusive-ceiling": (float(ceiling - 1), float(ceiling)),
+    }
+    _check_native_thresholds(dtype, *limits[band], monkeypatch)
+
+
+@pytest.mark.parametrize("lower,upper", (
+    (16777217., 16777219.), (16777216.5, 16777218.5),
+    (4294967294., 4294967294.), (None, 16777217.), (16777217., None),
+))
+def test_uint32_threshold_boundaries_survive_float32_rounding(lower, upper, monkeypatch):
+    _check_native_thresholds(np.uint32, lower, upper, monkeypatch)
+
+
+def _check_native_thresholds(dtype, lower, upper, monkeypatch):
+    from pyFAI.detectors import Detector
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+
+    shape = (32, 32)
+    ceiling = int(np.iinfo(dtype).max)
+    values = [0, 5, 6, 100, 101, ceiling - 1, ceiling]
+    if dtype is np.uint32:
+        values += [16777216, 16777217, 16777218, 16777219, 16777220]
+    raw = np.resize(np.array(values, dtype=dtype), shape).copy()
+    raw.setflags(write=False)
+    before = raw.tobytes()
+    static = np.zeros(shape, dtype=bool)
+    static[10, 10] = True
+    # Binary64 represents every supported native integer exactly. This is the
+    # former execution path and an independent membership/reference oracle.
+    prior = raw.astype(np.float64)
+    rejected = np.zeros(shape, dtype=bool)
+    if lower is not None:
+        rejected |= prior < lower
+    if upper is not None:
+        rejected |= prior > upper
+    prior[rejected] = np.nan
+
+    def scan(image):
+        ai = AzimuthalIntegrator(
+            dist=.1, poni1=0., poni2=0., wavelength=1e-10,
+            detector=Detector(pixel1=100e-6, pixel2=100e-6, max_shape=shape),
+        )
+        return Scan("native-threshold", [Frame(0, image=image)], integrator=ai)
+
+    from dataclasses import replace
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(npt=16, method="csr", error_model="poisson"),
+        integration_2d=Integration2DPlan(npt_rad=16, npt_azim=8, method="csr", error_model="poisson"),
+        mask=static, threshold_min=lower, threshold_max=upper, mask_saturation=True,
+    )
+    expected = run_reduction(
+        replace(plan, threshold_min=None, threshold_max=None), scan(prior),
+        execution="chunked", executor=False,
+    ).frames[0]
+    seen = []
+    for name in ("integrate_1d", "integrate_2d"):
+        original = getattr(reduction_core, name)
+
+        def observe(image, *args, _original=original, **kwargs):
+            seen.append(image)
+            return _original(image, *args, **kwargs)
+
+        monkeypatch.setattr(reduction_core, name, observe)
+    actual = run_reduction(plan, scan(raw), execution="chunked", executor=False).frames[0]
+    assert len(seen) == 2 and seen[0] is seen[1]
+    working = seen[0]
+    assert working.dtype == np.dtype(np.float32)
+    assert working.flags.owndata and working.flags.writeable
+    assert not np.shares_memory(working, raw)
+    np.testing.assert_array_equal(np.isnan(working), rejected)
+    for dimension in ("result_1d", "result_2d"):
+        left, right = getattr(actual, dimension), getattr(expected, dimension)
+        for field in ("radial", "intensity", "sigma"):
+            np.testing.assert_array_equal(getattr(left, field), getattr(right, field))
+    np.testing.assert_array_equal(actual.result_2d.azimuthal, expected.result_2d.azimuthal)
+    assert raw.tobytes() == before
