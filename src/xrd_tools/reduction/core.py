@@ -4986,7 +4986,7 @@ class _ReductionIntegratorProvider:
 
     def _unbound_standard(self) -> Any:
         """Discard an optional bound clone and return the established AI path."""
-        for name in ("ai", "mask_binding"):
+        for name in ("ai", "run_mask_binding"):
             try:
                 delattr(self._local, name)
             except AttributeError:
@@ -4996,12 +4996,12 @@ class _ReductionIntegratorProvider:
     def _retain_unbound_standard(
         self,
         ai: Any,
-        mask: np.ndarray | None,
+        run_mask: np.ndarray | None,
         shape: tuple[int, int],
     ) -> tuple[Any, bool]:
         """Cache a negative admission without rebuilding on every frame."""
         self._local.ai = ai
-        self._local.mask_binding = (mask, shape, False)
+        self._local.run_mask_binding = (run_mask, shape, False)
         return ai, False
 
     def _warm_standard_centers(
@@ -5032,12 +5032,12 @@ class _ReductionIntegratorProvider:
         for unit in dict.fromkeys(units):
             ai.array_from_unit(shape, "center", unit, scale=False)
 
-    def standard_with_mask(
+    def standard_with_run_mask(
         self,
-        mask: np.ndarray | None,
+        run_mask: np.ndarray | None,
         image_shape: tuple[int, int],
     ) -> tuple[Any, bool]:
-        """Return a private AI bound to the current frame's resolved mask.
+        """Return a private AI with a run-constant mask bound to its detector.
 
         The boolean reports whether the caller may pass ``mask=None`` and let
         pyFAI use the detector's cached mask checksum. Binding is deliberately
@@ -5046,21 +5046,13 @@ class _ReductionIntegratorProvider:
         integrator owned by ``Scan``.
         """
         shape = (int(image_shape[0]), int(image_shape[1]))
-        cached = getattr(self._local, "mask_binding", None)
+        cached = getattr(self._local, "run_mask_binding", None)
         if (
             cached is not None
+            and cached[0] is run_mask
             and cached[1] == shape
-            and ((cached[0] is None and mask is None)
-                 or (cached[0] is not None and mask is not None
-                     and np.array_equal(cached[0], mask)))
         ):
             return self._local.ai, bool(cached[2])
-
-        # Only the current mask is retained, independently of caller buffers.
-        # Equality permits cache reuse; changed pixels require a fresh binding.
-        if mask is not None:
-            mask = np.array(mask, dtype=bool, order="C", copy=True)
-            mask.setflags(write=False)
 
         # Rejected custom AIs keep the exact identity/state semantics of the
         # established provider path (not an opportunistic clone on the owner).
@@ -5070,7 +5062,7 @@ class _ReductionIntegratorProvider:
         ):
             return self._retain_unbound_standard(
                 self._unbound_standard(),
-                mask,
+                run_mask,
                 shape,
             )
 
@@ -5079,24 +5071,24 @@ class _ReductionIntegratorProvider:
                 ai = self._new_standard()
                 if not _stock_pyfai_detector_mask_semantics(ai, shape):
                     unbound = ai if self.ai is None else self._unbound_standard()
-                    return self._retain_unbound_standard(unbound, mask, shape)
+                    return self._retain_unbound_standard(unbound, run_mask, shape)
                 detector = ai.detector
                 detector_mask = detector.mask
                 if detector_mask is not None:
                     detector_mask = np.asarray(detector_mask, dtype=bool)
                     bound_mask = (
                         detector_mask
-                        if mask is None
-                        else np.logical_or(mask, detector_mask)
+                        if run_mask is None
+                        else np.logical_or(run_mask, detector_mask)
                     )
                 else:
                     bound_mask = (
-                        None if mask is None else np.asarray(mask, dtype=bool)
+                        None if run_mask is None else np.asarray(run_mask, dtype=bool)
                     )
-                if mask is not None:
+                if run_mask is not None:
                     detector.mask = bound_mask
                 ai.reset_engines(collect_garbage=False)
-                if mask is not None:
+                if run_mask is not None:
                     admitted = np.asarray(detector.mask, dtype=bool)
                     if (
                         admitted.shape != shape
@@ -5105,16 +5097,16 @@ class _ReductionIntegratorProvider:
                         unbound = self._unbound_standard()
                         return self._retain_unbound_standard(
                             unbound,
-                            mask,
+                            run_mask,
                             shape,
                         )
                 self._warm_standard_centers(ai, shape)
             except (AttributeError, TypeError, ValueError):
                 unbound = self._unbound_standard()
-                return self._retain_unbound_standard(unbound, mask, shape)
+                return self._retain_unbound_standard(unbound, run_mask, shape)
 
         self._local.ai = ai
-        self._local.mask_binding = (mask, shape, True)
+        self._local.run_mask_binding = (run_mask, shape, True)
         return ai, True
 
     def fiber(self) -> Any:
@@ -5550,23 +5542,40 @@ def _reduce_frame(
             for item in (p1, plan.integration_2d)
         )
         ai = None
+        mask = None
+        integration_mask = None
         detector_mask_is_bound = False
-        mask = (
-            frame_mask
-            if plan_mask is None
-            else plan_mask
-            if frame_mask is None
-            else plan_mask | frame_mask
-        )
-        mask = _apply_saturation_mask(mask, raw_image_arr, plan)
-        integration_mask = mask
-        if not chi_mode and not unsafe_dynamic_mask_cache:
-            binder = getattr(integrators, "standard_with_mask", None)
-            if callable(binder):
+        has_run_constant_mask = False
+        if (frame_mask is None and not chi_mode
+                and not unsafe_dynamic_mask_cache and not plan.mask_saturation):
+            # Only the static plan mask may be bound into an integrator cache.
+            # Value-based exclusions belong to the current native frame.
+            mask = plan_mask
+            has_run_constant_mask = True
+            binder = getattr(integrators, "standard_with_run_mask", None)
+            if has_run_constant_mask and callable(binder):
                 ai, bound = binder(mask, image.shape)
                 if bound:
                     integration_mask = None
                     detector_mask_is_bound = True
+                else:
+                    integration_mask = mask
+        if not has_run_constant_mask:
+            mask = (
+                frame_mask
+                if plan_mask is None
+                else plan_mask
+                if frame_mask is None
+                else plan_mask | frame_mask
+            )
+            mask = _apply_saturation_mask(
+                mask,
+                raw_image_arr,
+                plan,
+            )
+            integration_mask = mask
+        elif ai is None:
+            integration_mask = mask
         if ai is None:
             ai = integrators.standard()
         if chi_mode:

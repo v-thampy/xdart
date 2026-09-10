@@ -117,7 +117,7 @@ def test_provider_binds_private_run_mask_once_and_resets_warmed_engines(
     monkeypatch.setattr(provider, "_new_standard", private_candidate)
     run_mask = np.zeros(shape, dtype=bool)
     run_mask[1, :] = True
-    bound, admitted = provider.standard_with_mask(run_mask, shape)
+    bound, admitted = provider.standard_with_run_mask(run_mask, shape)
 
     assert admitted is True
     assert bound is candidate
@@ -126,7 +126,7 @@ def test_provider_binds_private_run_mask_once_and_resets_warmed_engines(
     assert not candidate.engines
     np.testing.assert_array_equal(accepted.detector.mask, geometric)
     np.testing.assert_array_equal(candidate.detector.mask.astype(bool), geometric | run_mask)
-    again, admitted_again = provider.standard_with_mask(run_mask, shape)
+    again, admitted_again = provider.standard_with_run_mask(run_mask, shape)
     assert admitted_again is True and again is candidate
     assert len(builds) == 1
 
@@ -195,71 +195,12 @@ def test_provider_binds_private_run_mask_once_and_resets_warmed_engines(
     )
     assert explicit.any()  # both the plan and geometric rows were exercised
 
-    fallback, fallback_admitted = provider.standard_with_mask(
+    fallback, fallback_admitted = provider.standard_with_run_mask(
         np.zeros((16, 16), dtype=bool),
         (16, 16),
     )
     assert fallback_admitted is False
     assert fallback is accepted
-
-
-def test_provider_reuses_equal_masks_and_replaces_changed_membership():
-    from pyFAI.detectors import Detector
-    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
-
-    from xrd_tools.reduction.core import (
-        Scan, ReductionPlan, Integration1DPlan, Integration2DPlan,
-        _ReductionIntegratorProvider,
-    )
-    from xrd_tools.integrate.single import integrate_1d, integrate_2d
-
-    shape = (32, 32)
-    detector = Detector(pixel1=100e-6, pixel2=100e-6, max_shape=shape)
-    geometric = np.zeros(shape, dtype=bool)
-    geometric[:, 0] = True
-    detector.mask = geometric
-    accepted = AzimuthalIntegrator(
-        dist=0.1, poni1=0.0016, poni2=0.0016,
-        detector=detector, wavelength=1e-10,
-    )
-    plan = ReductionPlan(
-        integration_1d=Integration1DPlan(npt=16, method="csr"),
-        integration_2d=Integration2DPlan(npt_rad=16, npt_azim=8, method="csr"),
-    )
-    provider = _ReductionIntegratorProvider(
-        scan=Scan("masks", [], integrator=accepted), plan=plan, ai=accepted,
-        fi=None, initial_incident_angle=None,
-    )
-    image = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) + 1
-    first = np.zeros(shape, dtype=bool)
-    first[2, :] = True
-    current, admitted = provider.standard_with_mask(first, shape)
-    assert admitted and current is not accepted
-    equal, admitted = provider.standard_with_mask(first.copy(), shape)
-    assert admitted and equal is current
-
-    # Mutating the caller's buffer must not mutate the retained comparison
-    # snapshot. Returning to the earlier mask must also discard the newer AI.
-    prior = first.copy()
-    first[2, :] = False
-    first[4, :] = True
-    for mask in (first, prior, None, prior):
-        changed, admitted = provider.standard_with_mask(mask, shape)
-        assert admitted and changed is not current
-        current = changed
-        for integrate, options, axes in (
-            (integrate_1d, {"npt": 16}, ("radial",)),
-            (integrate_2d, {"npt_rad": 16, "npt_azim": 8}, ("radial", "azimuthal")),
-        ):
-            expected = integrate(image, copy.deepcopy(accepted), mask=mask,
-                                 method="csr", error_model="poisson", **options)
-            actual = integrate(image, current, mask=None,
-                               _detector_mask_is_bound=True,
-                               method="csr", error_model="poisson", **options)
-            for field in (*axes, "intensity", "sigma"):
-                np.testing.assert_array_equal(getattr(actual, field),
-                                              getattr(expected, field))
-        np.testing.assert_array_equal(accepted.detector.mask, geometric)
 
 
 def test_provider_refuses_duck_typed_detector_mask_semantics(
@@ -299,10 +240,10 @@ def test_provider_refuses_duck_typed_detector_mask_semantics(
     )
 
     run_mask = np.ones((2, 2), dtype=bool)
-    returned, admitted = provider.standard_with_mask(run_mask, (2, 2))
+    returned, admitted = provider.standard_with_run_mask(run_mask, (2, 2))
     assert admitted is False
     assert returned is accepted
-    again, admitted_again = provider.standard_with_mask(run_mask, (2, 2))
+    again, admitted_again = provider.standard_with_run_mask(run_mask, (2, 2))
     assert admitted_again is False
     assert again is accepted
 
@@ -347,7 +288,7 @@ def test_numpy_false_safe_transition_stays_on_explicit_mask_path(
     )
     monkeypatch.setattr(
         provider,
-        "standard_with_mask",
+        "standard_with_run_mask",
         lambda *_args: (_ for _ in ()).throw(
             AssertionError("safe=False path attempted detector binding")
         ),
