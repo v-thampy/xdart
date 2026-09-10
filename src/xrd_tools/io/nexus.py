@@ -41,7 +41,7 @@ import posixpath
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, NamedTuple, Sequence
+from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 import h5py
 import numpy as np
@@ -475,6 +475,8 @@ def _selected_link_owner_selector(
     selected_root: h5py.Group | h5py.File,
     logical_selector: str,
     dataset: h5py.Dataset,
+    *,
+    on_external_link: Callable[[Path], object] | None = None,
 ) -> tuple[Path, str]:
     """Detach the selected link's owner and owner-relative selector.
 
@@ -537,6 +539,8 @@ def _selected_link_owner_selector(
             if isinstance(link, h5py.ExternalLink):
                 owner = Path(os.fsdecode(current.file.filename)).parent / os.fsdecode(link.filename)
                 owner = owner.resolve()
+                if on_external_link is not None:
+                    on_external_link(owner)
                 target = canonical(posixpath.join(str(link.path), *remainder))
                 if not remainder:
                     if owner == actual_owner:

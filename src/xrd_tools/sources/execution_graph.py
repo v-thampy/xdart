@@ -1852,14 +1852,34 @@ def _capture_bound_container_dependencies(
     from xrd_tools.io.nexus import _selected_link_owner_selector
     seen: set[tuple[str, str]] = set()
     pending = []; dependency_paths: set[str] = set()
+
+    def emit_dependency_once(path: Path) -> None:
+        key = _path_key(str(path))
+        if path != master_path and key not in dependency_paths:
+            dependency_paths.add(key)
+            emit_dependency(SourceFileState.capture(path))
+
+    def capture_dataset_storage(dataset, owner_path: Path) -> None:
+        base = owner_path.parent
+        for value in dataset.external or ():
+            _cancelled(cancelled)
+            path = Path(os.fsdecode(value[0]))
+            if not path.is_absolute():
+                path = base / path
+            emit_dependency_once(path.resolve())
+        if bool(dataset.is_virtual):
+            pending.extend(detached(dataset))
+
     for epoch, dataset in enumerate(binding._datasets):
         _cancelled(cancelled)
         try:
             logical_selector = binding.paths[epoch]
         except IndexError as error:
             raise ValueError("container detector binding lost its selector") from error
+        lexical_external: list[Path] = []
         owner_path, owner_selector = _selected_link_owner_selector(
             binding.entry_group, logical_selector, dataset,
+            on_external_link=lexical_external.append,
         )
         seen.add(identity((str(owner_path), owner_selector)))
         before = SourceFileState.capture(owner_path)
@@ -1872,8 +1892,11 @@ def _capture_bound_container_dependencies(
             emit_external(ExternalSourceState(
                 before, owner_selector, first, first + extent, epoch,
             ))
+        for path in lexical_external:
+            if path != owner_path:
+                emit_dependency_once(path)
         first += extent
-        if owner_path == master_path and bool(dataset.is_virtual): pending.extend(detached(dataset))
+        capture_dataset_storage(dataset, owner_path)
         after = SourceFileState.capture(owner_path)
         if before != after or _path_key(_resolved(before)) != _path_key(_resolved(after)):
             raise SourceRevisionChanged("container detector owner changed")
@@ -1887,11 +1910,8 @@ def _capture_bound_container_dependencies(
         try:
             dependency_path = Path(dependency.file.filename).resolve()
             before = SourceFileState.capture(dependency_path)
-            dependency_key = _path_key(str(dependency_path))
-            if dependency_path != master_path and dependency_key not in dependency_paths:
-                dependency_paths.add(dependency_key)
-                emit_dependency(before)
-            if bool(dependency.is_virtual): pending.extend(detached(dependency))
+            emit_dependency_once(dependency_path)
+            capture_dataset_storage(dependency, dependency_path)
             after = SourceFileState.capture(dependency_path)
             if before != after or _path_key(_resolved(before)) != _path_key(_resolved(after)):
                 raise SourceRevisionChanged("container dependency changed")

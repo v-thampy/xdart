@@ -1991,6 +1991,109 @@ def test_average_bound_dependencies_use_same_group_without_master_reopen(
     assert opens == [(path, 1 << 20), (path, 1 << 20)]
 
 
+def test_average_bound_graph_captures_external_storage_for_output_alias(
+    tmp_path,
+):
+    """Raw HDF5 storage is an admitted input even though it is not an HDF5 file."""
+    master = tmp_path / "scan.nexus"
+    storage = tmp_path / "scan_average.nexus"
+    values = np.arange(48, dtype=np.uint16).reshape(3, 4, 4)
+    storage.write_bytes(values.tobytes())
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry"); entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("end_time", data=np.bytes_("done"))
+        detector = entry.create_group("instrument/detector")
+        detector.create_dataset(
+            "data", shape=values.shape, dtype=values.dtype,
+            external=[(str(storage), 0, values.nbytes)],
+        )
+    value = graph.qualify_source_execution_graph(
+        SourceSpec(master, SourceKind.NEXUS_STACK, entry="entry"),
+        reader_binding="average_closed_v1",
+    )
+    assert tuple(Path(item.path) for item in value.stamp.dependency_files) == (
+        storage,
+    )
+    from xrd_tools.reduction.average import _admitted_input_paths
+    assert str(storage) in _admitted_input_paths(value)
+
+
+def test_average_refuses_raw_external_storage_output_alias(tmp_path):
+    """The bound raw-storage dependency is protected by Average's real owner."""
+    from xrd_tools.reduction import (
+        AverageScanRecipe, AverageScanRunner, Integration1DPlan, ReductionPlan,
+    )
+    from xrd_tools.session.experiment_state import (
+        CalibrationState, FactStatus, PoniValues,
+    )
+
+    master = tmp_path / "scan.nexus"
+    storage = tmp_path / "scan_average.nexus"
+    values = np.arange(48, dtype=np.uint16).reshape(3, 4, 4) + 10
+    storage.write_bytes(values.tobytes())
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry"); entry.attrs["NX_class"] = "NXentry"
+        detector = entry.create_group("instrument/detector")
+        detector.create_dataset(
+            "data", shape=values.shape, dtype=values.dtype,
+            external=[(str(storage), 0, values.nbytes)],
+        )
+    storage_before = storage.read_bytes()
+    master_before = master.read_bytes()
+    calibration = CalibrationState(
+        PoniValues(0.2, 0.001, 0.001, 0.0, 0.0, 0.0, 1.0e-10), "Detector",
+        {"pixel1": 1.0e-4, "pixel2": 1.0e-4, "max_shape": [4, 4], "orientation": 3},
+        status=FactStatus.PRESENT,
+    )
+    runner = AverageScanRunner(AverageScanRecipe(
+        SourceSpec(master, SourceKind.NEXUS_STACK, entry="entry"), master,
+        ReductionPlan(integration_1d=Integration1DPlan(npt=4, method="numpy")),
+        calibration=calibration,
+    ))
+    try:
+        result = runner.start()
+    finally:
+        runner.close()
+
+    assert master.read_bytes() == master_before
+    assert result.disposition == "REFUSED", result
+    assert result.diagnostic_code == "AVERAGE_OUTPUT_IS_SOURCE"
+    assert storage.read_bytes() == storage_before
+
+
+def test_average_bound_graph_captures_external_owner_vds_and_link_chain(tmp_path):
+    raw = tmp_path / "scan_average.nexus"
+    sidecar = tmp_path / "sidecar.h5"
+    middle = tmp_path / "middle.h5"
+    master = tmp_path / "scan.nexus"
+    values = np.arange(24, dtype=np.uint16).reshape(2, 3, 4)
+    with h5py.File(raw, "w") as handle:
+        handle.create_dataset("pixels", data=values)
+    with h5py.File(sidecar, "w", libver="latest") as handle:
+        layout = h5py.VirtualLayout(shape=values.shape, dtype=values.dtype)
+        layout[:] = h5py.VirtualSource(
+            raw.name, "/pixels", shape=values.shape,
+        )
+        handle.create_virtual_dataset("pixels", layout)
+    with h5py.File(middle, "w") as handle:
+        handle["pixels"] = h5py.ExternalLink(sidecar.name, "/pixels")
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry"); entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("end_time", data=np.bytes_("done"))
+        data = entry.create_group("data"); data.attrs["NX_class"] = "NXdata"
+        data["data_000001"] = h5py.ExternalLink(middle.name, "/pixels")
+    value = graph.qualify_source_execution_graph(
+        SourceSpec(master, SourceKind.NEXUS_STACK, entry="entry"),
+        reader_binding="average_closed_v1",
+    )
+    assert tuple(Path(item.file.path) for item in value.stamp.external_members) == (
+        sidecar,
+    )
+    assert tuple(Path(item.path) for item in value.stamp.dependency_files) == (
+        middle, raw,
+    )
+
+
 def test_average_nested_same_master_vds_uses_one_sequential_owned_dataset_id(
     tmp_path, monkeypatch,
 ) -> None:
