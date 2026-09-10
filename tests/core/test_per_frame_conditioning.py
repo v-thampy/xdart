@@ -16,7 +16,7 @@ from xrd_tools.reduction import (
 
 @pytest.mark.parametrize("static_mask", (False, True), ids=("no-mask-file", "static-mask"))
 @pytest.mark.parametrize("method", ("no", "csr"))
-@pytest.mark.parametrize("dtype", (np.uint16, np.uint32))
+@pytest.mark.parametrize("dtype", (np.uint8, np.uint16, np.uint32))
 def test_saturation_matches_threshold_with_stable_axes(tmp_path, static_mask, method, dtype):
     """Value exclusions change counts and errors, never the geometric grid."""
     from pyFAI.detectors import Detector
