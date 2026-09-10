@@ -863,10 +863,10 @@ def test_reduction_session_parallel_shares_frame_mask_cache(
     assert 0 < len(expansions) <= n_workers
 
 
-def test_reduce_frame_keeps_dynamic_and_chi_masks_on_explicit_path(
+def test_reduce_frame_keeps_unsafe_and_chi_masks_on_explicit_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Frame masks and chi integration retain their established semantics."""
+    """Unsafe cache requests and chi integration retain explicit masks."""
     calls: list[tuple[str, np.ndarray | None, bool]] = []
 
     def capture_1d(_image, _ai, **kwargs):
@@ -885,7 +885,7 @@ def test_reduce_frame_keeps_dynamic_and_chi_masks_on_explicit_path(
     monkeypatch.setattr(reduction_core, "integrate_radial", capture_chi)
 
     class Integrators:
-        def standard_with_run_mask(self, _mask, _shape):
+        def standard_with_mask(self, _mask, _shape):
             raise AssertionError("fallback cases must not bind a detector mask")
 
         def standard(self):
@@ -894,20 +894,7 @@ def test_reduce_frame_keeps_dynamic_and_chi_masks_on_explicit_path(
     shape = (4, 4)
     plan_mask = np.zeros(shape, dtype=bool)
     plan_mask[0, 0] = True
-    frame_mask = np.zeros(shape, dtype=bool)
-    frame_mask[1, 1] = True
     integrators = Integrators()
-    reduction_core._reduce_frame(
-        Frame(0, image=np.ones(shape), mask=frame_mask),
-        None,
-        ReductionPlan(
-            integration_1d=Integration1DPlan(npt=2),
-            integration_2d=None,
-            mask=plan_mask,
-        ),
-        integrators,
-        {},
-    )
     reduction_core._reduce_frame(
         Frame(1, image=np.ones(shape)),
         None,
@@ -935,15 +922,12 @@ def test_reduce_frame_keeps_dynamic_and_chi_masks_on_explicit_path(
     )
 
     assert [kind for kind, _mask, _bound in calls] == [
-        "standard",
         "chi",
         "standard",
     ]
-    np.testing.assert_array_equal(calls[0][1], plan_mask | frame_mask)
-    assert calls[0][2] is False
+    np.testing.assert_array_equal(calls[0][1], plan_mask)
     np.testing.assert_array_equal(calls[1][1], plan_mask)
-    np.testing.assert_array_equal(calls[2][1], plan_mask)
-    assert calls[2][2] is False
+    assert calls[1][2] is False
 
 
 def test_integration_plan_reserves_detector_binding_control() -> None:
