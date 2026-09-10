@@ -10,6 +10,23 @@ from xrd_tools.core.invalid import (
 )
 
 
+def test_native_ceiling_is_resolved_once_independent_of_frame_values(monkeypatch):
+    from xrd_tools.core.invalid import _integer_dtype_saturation_ceiling
+
+    _integer_dtype_saturation_ceiling.cache_clear()
+    original = np.iinfo
+    calls = []
+
+    def observed(dtype):
+        calls.append(dtype)
+        return original(dtype)
+
+    monkeypatch.setattr(np, "iinfo", observed)
+    for value in (0, 123, 65535, 1000):
+        assert integer_saturation_ceiling(np.full((2, 2), value, dtype=np.uint16)) == 65535
+    assert calls == [np.dtype("uint16")]
+
+
 @pytest.mark.parametrize("dtype, expected", [
     (np.uint16, 65535.0),
     (np.uint8, 255.0),

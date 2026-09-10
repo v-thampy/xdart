@@ -14,6 +14,8 @@ integer dtype was lost upstream returns ``None`` from
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 
 #: uint32 max — the unambiguous dead/hot-pixel dummy (Eiger masters etc.).
@@ -101,9 +103,14 @@ def integer_saturation_ceiling(arr) -> float | None:
     was lost upstream (e.g. after a threshold/background float conversion) — so
     the caller chooses any fallback.  Core never hardcodes 65535.
     """
-    a = np.asarray(arr)
-    if np.issubdtype(a.dtype, np.integer):
-        return float(np.iinfo(a.dtype).max)
+    return _integer_dtype_saturation_ceiling(np.asarray(arr).dtype)
+
+
+@lru_cache(maxsize=32)
+def _integer_dtype_saturation_ceiling(dtype) -> float | None:
+    """Resolve type metadata once, never from a frame's observed maximum."""
+    if np.issubdtype(dtype, np.integer):
+        return float(np.iinfo(dtype).max)
     return None
 
 
