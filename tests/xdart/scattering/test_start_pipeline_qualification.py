@@ -147,8 +147,8 @@ def test_unexpected_freeze_exception_is_closed_invariant_not_a_validation_refusa
     assert executor.calls == []
 
 
-def test_all_threshold_pairs_remain_exact_through_execution_and_provenance():
-    """Manual thresholding and saturated masking are independent run facts."""
+def test_threshold_precedence_is_exact_through_execution_and_provenance():
+    """Editable legacy flags survive, but all frozen consumers use precedence."""
     from xdart.gui.tabs.scattering.output_preflight import (
         OutputCandidate,
         execution_plan_values,
@@ -180,7 +180,7 @@ def test_all_threshold_pairs_remain_exact_through_execution_and_provenance():
             "apply_threshold": apply_flag,
             "threshold_min": 1.0,
             "threshold_max": 2.0,
-            "mask_saturation": mask_flag,
+            "mask_saturation": mask_flag and not apply_flag,
         }
 
         # Admission signature.
@@ -194,7 +194,7 @@ def test_all_threshold_pairs_remain_exact_through_execution_and_provenance():
         assert isinstance(result, IntentFreezeAccepted)
         configuration = result.configuration
         assert configuration.threshold.apply_threshold is apply_flag
-        assert configuration.threshold.mask_saturation is mask_flag
+        assert configuration.threshold.mask_saturation is (mask_flag and not apply_flag)
 
         # The signed candidate and executed configuration carry one identity.
         assert candidate.fingerprint == configuration.fingerprint
@@ -208,14 +208,14 @@ def test_all_threshold_pairs_remain_exact_through_execution_and_provenance():
         else:
             assert values["threshold_min"] is None
             assert values["threshold_max"] is None
-        assert values["mask_saturation"] is mask_flag
+        assert values["mask_saturation"] is (mask_flag and not apply_flag)
 
         # Writer provenance records that same exact mapping.
         assert configuration.as_provenance()["threshold"] == exact_dict
 
 
 def test_direct_admission_and_execution_accept_each_threshold_pair():
-    """No later boundary silently rejects or rewrites either independent fact."""
+    """Direct callers receive the same threshold precedence as GUI capture."""
     import dataclasses
 
     from xdart.gui.tabs.scattering.output_preflight import (
@@ -243,7 +243,7 @@ def test_direct_admission_and_execution_accept_each_threshold_pair():
             "apply_threshold"
         ] is apply_flag
         _, _, values = execution_plan_values(direct.freeze())
-        assert values["mask_saturation"] is mask_flag
+        assert values["mask_saturation"] is (mask_flag and not apply_flag)
 
 
 def _eiger_poni(tmp_path: Path) -> str:
@@ -266,8 +266,8 @@ def _eiger_poni(tmp_path: Path) -> str:
 def test_defaulted_bounds_materialize_to_exactly_the_displayed_band(tmp_path):
     """DESIGN_STOP oracle (2026-08-04): manual mode with absent/cleared bounds
     DISPLAYS a substituted band; the start capture must MATERIALIZE that exact
-    band into the one run identity.  Known detector -> the finite displayed
-    band everywhere; unknown detector -> blank max = open-ended, EVERYWHERE
+    band into the one run identity.  PONI geometry never determines a native type limit;
+    explicit blank max = open-ended, EVERYWHERE
     (display and identity agree in both directions).  Spans rendered values,
     capture/store, admission signature, fingerprint, execution values and
     writer provenance."""
@@ -282,7 +282,7 @@ def test_defaulted_bounds_materialize_to_exactly_the_displayed_band(tmp_path):
     )
     from xdart.gui.tabs.scattering.state_machine import RunPhase
 
-    for poni_file, want_max in ((_eiger_poni(tmp_path), 4294967295.0), ("", None)):
+    for poni_file, want_max in ((_eiger_poni(tmp_path), None), ("", None)):
         intent = _intent()
         intent.output_mode = "Overwrite"
         intent.poni_file = poni_file

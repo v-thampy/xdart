@@ -66,20 +66,18 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
         "convention for the grazing geometry."),
     ("GI", "tilt_angle"): "Sample tilt angle in degrees for the grazing geometry.",
     # Processing / conditioning
-    ("MaskSat", "mask_sentinel"): (
-        "Mask dead/saturated detector pixels at the detector's saturation "
-        "sentinel. This is independent of the optional manual threshold band."),
     ("Signal", "series_average"): (
         "Average all frames in the series into one frame before integration."),
     ("Mask", "Threshold"): (
-        "Clip pixel intensities outside the [min, max] band before integration."),
+        "Exclude values outside the inclusive [min, max] band per frame. "
+        "Default: 0 to native integer maximum minus one. Off keeps all finite "
+        "values. The global mask always applies."),
     ("Mask", "min"): (
         "Manual threshold lower bound (pixels below are masked). Default 0."),
     ("Mask", "max"): (
-        "Manual threshold upper bound (pixels above are masked). The default "
-        "is the detector family's typical raw-stream ceiling — a display "
-        "default only; saturated-pixel masking always follows the acquired "
-        "frame's own data type."),
+        "Upper threshold (pixels above are masked). The automatic default is "
+        "the native integer type maximum minus one, not the frame maximum. "
+        "Clear this bound to restore the default 0-to-limit band."),
     # Source
     ("Signal", "inp_type"): (
         "Source kind: a numbered image series, a directory of images, or a "
@@ -2012,7 +2010,6 @@ class ControlsPanel(QtWidgets.QWidget):
                 row = PillRow(list(pending_pills))
                 if any(
                     field.path in {
-                        ("MaskSat", "mask_sentinel"),
                         ("Signal", "series_average"),
                     }
                     for field in pending_pills
@@ -2049,8 +2046,7 @@ class ControlsPanel(QtWidgets.QWidget):
                 consumed.add(path)
                 continue
             # Threshold: (Mask, Threshold)=enable + (Mask, min) + (Mask, max).
-            # Threshold always has its own explicit enable. Mask Saturated is
-            # a separate projected fact and never substitutes for it.
+            # One threshold enable covers the automatic or explicit band.
             if path == ("Mask", "min") and ("Mask", "max") in by_path:
                 flush_pills()
                 toggle_field = by_path.get(("Mask", "Threshold"))

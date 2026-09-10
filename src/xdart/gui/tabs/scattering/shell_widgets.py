@@ -941,8 +941,11 @@ def _threshold_is_configured(
     if values.get(("Mask", "Threshold")) is not True:
         return True
     low = _finite(values.get(("Mask", "min")))
-    high = _finite(values.get(("Mask", "max")))
-    return low is not None and high is not None and low <= high
+    upper = values.get(("Mask", "max"))
+    # A blank maximum is valid: automatic limits await source admission,
+    # and legacy explicit bands may intentionally be open-ended above.
+    high = _finite(upper)
+    return low is not None and (upper is None or (high is not None and low <= high))
 
 
 def scrollable_toolbar(

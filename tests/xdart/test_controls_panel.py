@@ -813,95 +813,6 @@ def test_reconcile_refuses_fast_path_before_schema_rebuild(qapp):
         panel.deleteLater()
 
 
-def test_threshold_and_mask_saturated_are_independent_in_vnext(qapp):
-    """Both switches are editable and each emits only its own exact path."""
-    from xrd_tools.session.intent_store import RunIntentStore
-    from xrd_tools.session.run_configuration import RunIntent
-    from xdart.gui.tabs.scattering.controls_inventory import (
-        MASK_SATURATION,
-        THRESHOLD_ENABLED,
-    )
-    from xdart.gui.tabs.scattering.controls_projection import project_controls
-    from xdart.gui.tabs.scattering.state_machine import RunPhase
-    from xdart.gui.widgets.controls_panel import PillRow, RangeRow
-
-    panel = ControlsPanel()
-    try:
-        panel.reconcile(project_controls(
-            RunIntentStore(RunIntent()).snapshot(), None, RunPhase.IDLE))
-        row = next(
-            r for r in panel.findChildren(RangeRow)
-            if tuple(r._low_path) == ("Mask", "min")
-        )
-        tpath, btn = row._toggle
-        assert tuple(tpath) == THRESHOLD_ENABLED
-        assert not btn.isChecked()                 # manual band is off
-        assert not row._low.isEnabled()
-        assert not row._high.isEnabled()
-
-        emitted = []
-        panel.fieldValueChanged.connect(
-            lambda p, v: emitted.append((tuple(p), v)))
-        btn.setChecked(True)
-        assert (THRESHOLD_ENABLED, True) in emitted
-
-        pill_rows = [
-            p for p in panel.findChildren(PillRow)
-            if any(tuple(path) == MASK_SATURATION for path, _ in p._pills)
-        ]
-        assert pill_rows, "the Mask Saturated pill must stay visible"
-        pill = next(
-            b for path, b in pill_rows[0]._pills
-            if tuple(path) == MASK_SATURATION
-        )
-        assert pill.isEnabled()
-        assert pill.isChecked()
-        assert pill.objectName() == "controlsPillButton"
-        assert (MASK_SATURATION, True) in pill_rows[0].current_edits()
-        pill.setChecked(False)
-        assert (MASK_SATURATION, False) in emitted
-        pill_top = pill_rows[0].layout().contentsMargins().top()
-        conditioning = next(
-            card
-            for card in panel.processing_card.body.findChildren(SubsectionCard)
-            if card.title.text() == "Conditioning"
-        )
-        assert pill_top == 3
-        assert (
-            conditioning.body_layout.spacing() + pill_top
-            == conditioning.body_layout.contentsMargins().bottom()
-        )
-
-        # Scope guard (Codex P2): the seeded max is a detector-FAMILY display
-        # default, not an acquisition-dtype fact — the RENDERED max-bound
-        # widget must say so whether the band is disabled or enabled.
-        assert "display default" in row._high.toolTip()
-
-        manual = RunIntent()
-        manual.threshold.mask_saturation = False
-        manual.threshold.apply_threshold = True
-        panel.reconcile(project_controls(
-            RunIntentStore(manual).snapshot(), None, RunPhase.IDLE))
-        manual_row = next(
-            r for r in panel.findChildren(RangeRow)
-            if tuple(r._low_path) == ("Mask", "min")
-        )
-        assert manual_row._toggle[1].isChecked()
-        assert manual_row._high.isEnabled()
-        assert "display default" in manual_row._high.toolTip()
-        manual_pill = next(
-            b
-            for pills in panel.findChildren(PillRow)
-            for path, b in pills._pills
-            if tuple(path) == MASK_SATURATION
-        )
-        assert manual_pill.isEnabled()
-        assert not manual_pill.isChecked()
-    finally:
-        panel.close()
-        panel.deleteLater()
-
-
 def test_threshold_bounds_render_without_decimals_without_rounding_the_model(
     qapp,
 ):
@@ -1033,17 +944,17 @@ def test_max_bound_scope_caveat_survives_run_lock(qapp):
         locked = _row(panel)
         assert not locked._high.isEnabled()
         assert "locked" in locked._high.toolTip()
-        assert "display default" in locked._high.toolTip()
+        assert "native integer type maximum minus one" in locked._high.toolTip()
 
         # In-place unlock, then re-lock, through the update path.
         panel.reconcile(project_controls(
             store.snapshot(), None, RunPhase.IDLE))
-        assert "display default" in _row(panel)._high.toolTip()
+        assert "native integer type maximum minus one" in _row(panel)._high.toolTip()
         panel.reconcile(project_controls(
             store.snapshot(), None, RunPhase.RUNNING))
         relocked = _row(panel)
         assert "locked" in relocked._high.toolTip()
-        assert "display default" in relocked._high.toolTip()
+        assert "native integer type maximum minus one" in relocked._high.toolTip()
     finally:
         panel.close()
         panel.deleteLater()

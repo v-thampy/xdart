@@ -26,6 +26,7 @@ from .controls_editing import (
     reduce_advanced_settings,
     reduce_control_edit,
     reduce_source_selection,
+    observed_threshold_max,
 )
 from .controls_inventory import (
     AVERAGE_SCAN,
@@ -83,7 +84,7 @@ from .controls_inventory import (
     source_mode,
     truthful_field,
 )
-from .detector_projection import detector_summary, poni_saturation_ceiling
+from .detector_projection import detector_summary
 from .state_machine import RunPhase
 
 
@@ -233,7 +234,7 @@ def project_controls(
         2,
     )
     fields.insert(insertion, output)
-    fields = _threshold_fields(fields, intent, unlocked=unlocked)
+    fields = _threshold_fields(fields, intent, observation, unlocked=unlocked)
     fields = [truthful_field(candidate) for candidate in fields]
     if viewer:
         fields = [candidate if candidate.path == PROJECT_ROOT else
@@ -357,37 +358,31 @@ def project_controls(
 #: Detector-scope hover guard: rides every disabled reason for the manual
 #: max bound AND its enabled-state tooltip, so it is visible whichever state
 #: the row renders in.
-_MAX_BOUND_SCOPE_CAVEAT = (
-    " The default max is the detector family's typical raw-stream ceiling "
-    "— a display default only; masking follows the acquired frame's own "
-    "data type."
-)
+_MAX_BOUND_SCOPE_CAVEAT = " Automatic upper limit: native integer type maximum minus one. Clear this bound to restore the default 0-to-limit band."
 
 
 def _threshold_fields(
     fields: list,
     intent,
+    observation: SourceObservation | None,
     *,
     unlocked: bool,
 ) -> list:
-    """Project independent manual-threshold and saturated-mask controls.
-
-    The Threshold row's compact toggle owns only ``apply_threshold``.  The
-    separate Mask Saturated pill owns only ``mask_saturation``.  Manual bounds
-    are editable exactly while manual thresholding is enabled, and display the
-    [0, detector-ceiling] defaults when the intent carries none — the ceiling
-    stays blank until a valid PONI names a known detector family.
-    """
+    """One enable owns the automatic native band or an explicit edited band."""
     manual_on = bool(intent.threshold.apply_threshold)
+    enabled = manual_on or bool(intent.threshold.mask_saturation)
     out = []
     for candidate in fields:
+        if candidate.path == THRESHOLD_ENABLED:
+            out.append(replace(candidate, value=enabled))
+            continue
         if candidate.path in {THRESHOLD_MIN, THRESHOLD_MAX}:
-            value = candidate.value
+            value = candidate.value if manual_on or not enabled else None
             if value is None:
                 value = (
                     0.0
                     if candidate.path == THRESHOLD_MIN
-                    else poni_saturation_ceiling(intent.poni_file)
+                    else None if manual_on else observed_threshold_max(intent, observation)
                 )
             # The disabled reason takes tooltip precedence, so the max
             # bound's detector-scope caveat must ride EVERY disabled reason
@@ -402,14 +397,14 @@ def _threshold_fields(
             reason = (
                 "Controls are locked during the active run." + caveat
                 if not unlocked
-                else "Enable Manual Threshold to edit this bound." + caveat
-                if not manual_on
+                else "Enable Threshold to edit this bound." + caveat
+                if not enabled
                 else ""
             )
             out.append(replace(
                 candidate,
                 value=value,
-                enabled=unlocked and manual_on,
+                enabled=unlocked and enabled,
                 reason=reason,
             ))
             continue

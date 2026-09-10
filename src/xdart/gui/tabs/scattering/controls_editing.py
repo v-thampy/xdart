@@ -21,8 +21,7 @@ from xrd_tools.session.run_configuration import PoniV3OverrideIntent
 from xrd_tools.integrate.calibration import PONI_V3_SENSOR_MATERIALS
 from xrd_tools.sources.selection import DirectorySourceSpec
 
-from .contracts import SourceSelection
-from .detector_projection import poni_saturation_ceiling
+from .contracts import SourceSelection, SourceObservation
 from .controls_inventory import (
     AVERAGE_SCAN,
     BACKGROUND_DIRECTORY,
@@ -448,6 +447,7 @@ def reduce_control_edit(
     value: object,
     *,
     reset_auto_gi_motor: bool = False,
+    observation: SourceObservation | None = None,
 ) -> EditResult:
     """Validate one presentation edit before changing an independent candidate."""
 
@@ -490,6 +490,13 @@ def reduce_control_edit(
     if isinstance(parsed, EditRefusal):
         return parsed
     current = _current_value(intent, path)
+    if (
+        path in {THRESHOLD_MIN, THRESHOLD_MAX}
+        and intent.threshold.mask_saturation
+        and not intent.threshold.apply_threshold
+    ):
+        # Focusing a projected default is not an explicit range edit.
+        current = 0.0 if path == THRESHOLD_MIN else observed_threshold_max(intent, observation)
     # A touch of any threshold control must not absorb as EditNoChange while
     # the active manual band's displayed defaults are still unmaterialized.
     # The probe runs on a detached thawed copy.
@@ -502,11 +509,15 @@ def reduce_control_edit(
     if parsed == current and not noncanonical_threshold_touch:
         return EditNoChange()
     if path in {THRESHOLD_MIN, THRESHOLD_MAX}:
-        low = parsed if path == THRESHOLD_MIN else intent.threshold.threshold_min
-        high = parsed if path == THRESHOLD_MAX else intent.threshold.threshold_max
+        automatic = intent.threshold.mask_saturation and not intent.threshold.apply_threshold
+        low = parsed if path == THRESHOLD_MIN else (0.0 if automatic else intent.threshold.threshold_min)
+        high = parsed if path == THRESHOLD_MAX else (observed_threshold_max(intent, observation) if automatic else intent.threshold.threshold_max)
         if low is not None and high is not None and low > high:
             return EditRefusal("Threshold minimum cannot exceed maximum.")
     candidate = snapshot.thaw()
+    if path in {THRESHOLD_MIN, THRESHOLD_MAX} and automatic:
+        # Old sessions may retain inactive manual values behind automatic mode.
+        candidate.threshold.threshold_min = candidate.threshold.threshold_max = None
     _install_value(candidate, path, parsed)
     prior_default_save_path = (
         str(Path(str(intent.project_root)).expanduser() / "xdart_processed_data")
@@ -530,16 +541,28 @@ def reduce_control_edit(
             was_enabled=intent.gi.enabled,
         )
     elif path in {THRESHOLD_MIN, THRESHOLD_MAX}:
-        # Setting a manual bound chooses manual thresholding.  Saturated-pixel
-        # masking is an independent fact and is deliberately left untouched.
-        # A cleared bound keeps the mode and re-materializes to the displayed
-        # default through the canonicalizer below.
-        if parsed is not None:
-            candidate.threshold.apply_threshold = True
+        threshold = candidate.threshold
+        if path == THRESHOLD_MAX and parsed is None:
+            # Clearing the upper bound restores the entire automatic band.
+            threshold.threshold_min = threshold.threshold_max = None
+            threshold.apply_threshold = False
+            threshold.mask_saturation = True
+            return candidate
+        if threshold.threshold_max is None:
+            threshold.threshold_max = observed_threshold_max(candidate, observation)
+            if threshold.threshold_max is None:
+                return EditRefusal("Select an integer detector input or enter an upper threshold first.")
+        threshold.apply_threshold = True
+        threshold.mask_saturation = False
         canonicalize_threshold_intent(candidate)
+        if threshold.threshold_min > threshold.threshold_max:
+            return EditRefusal("Threshold minimum cannot exceed maximum.")
     elif path == THRESHOLD_ENABLED:
-        # Enabling the manual band materializes exactly what its visible
-        # bounds show; disabling it preserves those values for later reuse.
+        threshold = candidate.threshold
+        if not parsed and intent.threshold.mask_saturation and not intent.threshold.apply_threshold:
+            threshold.threshold_min = threshold.threshold_max = None
+        threshold.apply_threshold = bool(parsed and threshold.threshold_max is not None)
+        threshold.mask_saturation = bool(parsed and not threshold.apply_threshold)
         canonicalize_threshold_intent(candidate)
     return candidate
 
@@ -605,26 +628,22 @@ def _reduce_background_edit(
     return candidate
 
 
+def observed_threshold_max(intent: RunIntent, observation: SourceObservation | None) -> float | None:
+    """Only this selected input's header may provide a numeric default."""
+    return (
+        observation.default_threshold_max
+        if observation is not None and observation.source == intent.source_spec
+        else None
+    )
+
+
 def canonicalize_threshold_intent(intent: RunIntent) -> bool:
-    """Make the active manual-threshold identity match its displayed bounds.
+    """Materialize the displayed lower default for an explicit band.
 
-    Used by both the edit reducer and start capture; returns True when the
-    intent changed.  Manual Threshold and Mask Saturated are independent
-    booleans, so canonicalization never changes either switch.
-
-    - Manual mode MATERIALIZES the displayed defaults into the identity:
-      missing minimum -> 0.0; missing maximum -> the detector family's
-      display default when known, otherwise None (the box renders blank and
-      execution stays open-ended above — display and identity agree either
-      way).  The ceiling is a display default, not an acquisition fact;
-      reduction-time masking keys off the acquired frame's own dtype.
-    - Runs whenever manual mode is active: cleared bounds stored as None while
-      the projection displays substituted defaults would otherwise make the
-      run execute a band the panel never showed.
-    - No min<=max guard here: materialization mirrors the display verbatim,
-      and a nonsensical band refuses LOUDLY at freeze
-      (``FrozenThresholdPolicy`` validation) instead of being silently
-      un-materialized.
+    The automatic band retains the existing saturation-policy encoding for
+    saved-session/headless compatibility. Its type limit is resolved once
+    from native metadata, not from observed pixel values. Explicit None upper
+    bounds from older headless callers remain open-ended; no PONI guessing.
     """
     threshold = intent.threshold
     changed = False
@@ -632,11 +651,6 @@ def canonicalize_threshold_intent(intent: RunIntent) -> bool:
         if threshold.threshold_min is None:
             threshold.threshold_min = 0.0
             changed = True
-        if threshold.threshold_max is None:
-            ceiling = poni_saturation_ceiling(intent.poni_file)
-            if ceiling is not None:
-                threshold.threshold_max = ceiling
-                changed = True
     return changed
 
 
@@ -1133,7 +1147,7 @@ def _current_value(intent: RunIntent, path: tuple[str, ...]) -> object:
         GI_THETA: intent.gi.th_val,
         GI_ORIENTATION: intent.gi.sample_orientation,
         GI_TILT: intent.gi.tilt_angle,
-        THRESHOLD_ENABLED: intent.threshold.apply_threshold,
+        THRESHOLD_ENABLED: intent.threshold.apply_threshold or intent.threshold.mask_saturation,
         THRESHOLD_MIN: intent.threshold.threshold_min,
         THRESHOLD_MAX: intent.threshold.threshold_max,
         MASK_SATURATION: intent.threshold.mask_saturation,

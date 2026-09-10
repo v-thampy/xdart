@@ -138,12 +138,6 @@ CONTROL_FIELD_SPECS: tuple[ControlFieldSpec, ...] = (
     ControlFieldSpec(SectionId.PROCESSING, "Max", THRESHOLD_MAX),
     ControlFieldSpec(
         SectionId.PROCESSING,
-        "Mask Saturated",
-        MASK_SATURATION,
-        ControlFieldKind.BOOL,
-    ),
-    ControlFieldSpec(
-        SectionId.PROCESSING,
         "1D Axis",
         INT_1D_AXIS,
         ControlFieldKind.COMBO,

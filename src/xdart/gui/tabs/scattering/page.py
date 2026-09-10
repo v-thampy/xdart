@@ -3474,6 +3474,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             snapshot,
             edit.path,
             edit.value,
+            observation=self._source_selection.project_observation(snapshot),
         )
         if isinstance(reduced, EditRefusal):
             self._notice(reduced.reason)
@@ -7428,8 +7429,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             self._refresh_shell()
             return
+        snapshot = self._intents.snapshot()
         reduced = reduce_control_edit(
-            self._intents.snapshot(), path, value  # type: ignore[arg-type]
+            snapshot, path, value,  # type: ignore[arg-type]
+            observation=self._source_selection.project_observation(snapshot),
         )
         self._notice(
             reduced.reason if isinstance(reduced, EditRefusal) else ""
@@ -7748,6 +7751,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             snapshot,
             path,  # type: ignore[arg-type]
             value,
+            observation=self._source_selection.project_observation(snapshot),
         )
         if isinstance(reduced, EditRefusal):
             self._notice(reduced.reason)

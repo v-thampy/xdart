@@ -512,6 +512,7 @@ class SourceObservation:
     candidate_fingerprint: str = ""
     one_level_file_count: int | None = None
     file_count_scope: SourceCountScope = SourceCountScope.DIRECT_ONLY
+    default_threshold_max: float | None = None
 
     def __post_init__(self) -> None:
         if type(self.observation_id) is not int or self.observation_id <= 0:
@@ -522,6 +523,12 @@ class SourceObservation:
             raise TypeError("status must be SourceObservationStatus")
         if type(self.file_count_scope) is not SourceCountScope:
             raise TypeError("file_count_scope must be SourceCountScope")
+        if self.default_threshold_max is not None and (
+            type(self.default_threshold_max) not in (float, int)
+            or not math.isfinite(self.default_threshold_max)
+            or self.default_threshold_max < 0
+        ):
+            raise ValueError("default threshold maximum must be finite and non-negative")
         for value in (self.exists, self.is_directory, self.subdirectories_deferred):
             if type(value) is not bool:
                 raise TypeError("observation flags must be booleans")

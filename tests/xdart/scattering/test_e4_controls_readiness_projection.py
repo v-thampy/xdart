@@ -210,7 +210,7 @@ def test_container_directory_counts_files_while_explicit_series_counts_frames(
             assert candidate == path
             return SimpleNamespace(
                 state=ProbeState.READY,
-                descriptor=SimpleNamespace(frame_count=651),
+                descriptor=SimpleNamespace(frame_count=651, dtype="uint32"),
             )
 
     monkeypatch.setattr(

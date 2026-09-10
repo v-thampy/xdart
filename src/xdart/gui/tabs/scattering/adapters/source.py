@@ -8,8 +8,10 @@ from pathlib import Path
 from threading import Lock
 from typing import Callable
 
+import numpy as np
 from natsort import os_sorted
 from xrd_tools.core.filters import compile_filter
+from xrd_tools.core.invalid import integer_saturation_ceiling
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.sources.adapters import candidate_owner, get_adapter
 from xrd_tools.sources.probe import ProbeState
@@ -35,6 +37,30 @@ from ..source_metadata import (
 
 class FilesystemSourceAdapter:
     _MOTOR_PREVIEW_LIMIT = 32
+
+    @staticmethod
+    def _threshold_max_for_dtype(dtype) -> float | None:
+        ceiling = integer_saturation_ceiling(np.empty(0, dtype=dtype))
+        return None if ceiling is None else ceiling - 1.0
+
+    @classmethod
+    def _image_threshold_max(cls, path, options) -> float | None:
+        # One header on the observation worker. No pixels, per-frame maxima,
+        # or detector-family guesses; admission still qualifies the source.
+        from xrd_tools.io.image import read_detector_image_layout
+
+        try:
+            layout = read_detector_image_layout(
+                path, raw_dtype=str(options.get("raw_dtype", "int32")),
+                raw_header_skip=int(options.get("raw_header_skip", 0)),
+                detector_shape=options.get("detector_shape"),
+                detector=options.get("detector"),
+            )
+            return cls._threshold_max_for_dtype(layout.dtype)
+        except Exception:
+            # Passive presence/count readiness is independent of optional
+            # layout availability. Unknown limits stay automatic in the UI.
+            return None
 
     def __init__(self) -> None:
         self._lock = Lock()
@@ -549,6 +575,7 @@ class FilesystemSourceAdapter:
                 max(fact.mtime_ns for fact in facts),
                 len(facts),
                 candidate_fingerprint=self._fingerprint(facts),
+                default_threshold_max=self._image_threshold_max(members[0], source.options),
             )
         path = Path(source.uri).expanduser()
         try:
@@ -562,6 +589,7 @@ class FilesystemSourceAdapter:
         except OSError:
             return self._unavailable(request, "Source metadata is unavailable.", path.name)
         frame_count = None
+        default_threshold_max = None
         if source.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
             # An explicitly selected container is one bounded observation, so
             # its known frame count is useful readiness truth.  Directory
@@ -578,6 +606,7 @@ class FilesystemSourceAdapter:
                     and descriptor.frame_count > 0
                 ):
                     frame_count = int(descriptor.frame_count)
+                    default_threshold_max = self._threshold_max_for_dtype(descriptor.dtype)
             except Exception:
                 frame_count = None
         return SourceObservation(
@@ -585,6 +614,7 @@ class FilesystemSourceAdapter:
             SourceObservationStatus.AVAILABLE, path.name, True, is_directory,
             state.size, state.mtime_ns, frame_count,
             candidate_fingerprint=self._fingerprint((state,)),
+            default_threshold_max=default_threshold_max,
         )
 
     def _observe_directory(self, request: SourceObservationRequest) -> SourceObservation:
