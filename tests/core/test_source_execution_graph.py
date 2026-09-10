@@ -2072,12 +2072,15 @@ def test_average_refuses_vds_external_link_source_output_alias(tmp_path):
 
     master = tmp_path / "scan.nexus"
     intermediate = tmp_path / "scan_average.nexus"
+    middle = tmp_path / "middle.nexus"
     raw = tmp_path / "raw.nexus"
     values = np.arange(48, dtype=np.uint16).reshape(3, 4, 4) + 10
     with h5py.File(raw, "w") as handle:
         handle.create_dataset("pixels", data=values)
-    with h5py.File(intermediate, "w") as handle:
+    with h5py.File(middle, "w") as handle:
         handle["pixels"] = h5py.ExternalLink(raw.name, "/pixels")
+    with h5py.File(intermediate, "w") as handle:
+        handle["pixels"] = h5py.ExternalLink(middle.name, "/pixels")
     with h5py.File(master, "w", libver="latest") as handle:
         entry = handle.create_group("entry"); entry.attrs["NX_class"] = "NXentry"
         data = entry.create_group("data"); data.attrs["NX_class"] = "NXdata"
@@ -2086,7 +2089,15 @@ def test_average_refuses_vds_external_link_source_output_alias(tmp_path):
             str(intermediate), "/pixels", shape=values.shape,
         )
         data.create_virtual_dataset("data", layout)
+    graph_value = graph.qualify_source_execution_graph(
+        SourceSpec(master, SourceKind.NEXUS_STACK, entry="entry"),
+        reader_binding="average_closed_v1",
+    )
+    assert tuple(Path(item.path) for item in graph_value.stamp.dependency_files) == (
+        intermediate, middle, raw,
+    )
     intermediate_before = intermediate.read_bytes()
+    middle_before = middle.read_bytes()
     raw_before = raw.read_bytes()
     calibration = CalibrationState(
         PoniValues(0.2, 0.001, 0.001, 0.0, 0.0, 0.0, 1.0e-10), "Detector",
@@ -2106,6 +2117,7 @@ def test_average_refuses_vds_external_link_source_output_alias(tmp_path):
     assert result.disposition == "REFUSED", result
     assert result.diagnostic_code == "AVERAGE_OUTPUT_IS_SOURCE"
     assert intermediate.read_bytes() == intermediate_before
+    assert middle.read_bytes() == middle_before
     assert raw.read_bytes() == raw_before
 
 

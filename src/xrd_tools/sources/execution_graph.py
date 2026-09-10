@@ -1851,11 +1851,12 @@ def _capture_bound_container_dependencies(
         return (os.path.normcase(os.path.normpath(pair[0])), os.path.normpath(pair[1]))
     from xrd_tools.io.nexus import _selected_link_owner_selector
     seen: set[tuple[str, str]] = set()
-    pending = []; dependency_paths: set[str] = set()
+    pending = []; dependency_paths: set[str] = set(); external_paths: set[str] = set()
 
     def emit_dependency_once(path: Path) -> None:
         key = _path_key(str(path))
-        if path != master_path and key not in dependency_paths:
+        if (path != master_path and key not in dependency_paths
+                and key not in external_paths):
             dependency_paths.add(key)
             emit_dependency(SourceFileState.capture(path))
 
@@ -1866,7 +1867,7 @@ def _capture_bound_container_dependencies(
             path = Path(os.fsdecode(value[0]))
             if not path.is_absolute():
                 path = base / path
-            emit_dependency_once(path.resolve())
+            emit_dependency_once(Path(_raw_source_path(path)))
         if bool(dataset.is_virtual):
             pending.extend(detached(dataset))
 
@@ -1877,9 +1878,13 @@ def _capture_bound_container_dependencies(
         except IndexError as error:
             raise ValueError("container detector binding lost its selector") from error
         lexical_external: list[Path] = []
+        lexical_selectors: list[tuple[Path, str]] = []
         owner_path, owner_selector = _selected_link_owner_selector(
             binding.entry_group, logical_selector, dataset,
             on_external_link=lexical_external.append,
+            on_external_selector=lambda path, selector: lexical_selectors.append(
+                (path, selector),
+            ),
         )
         seen.add(identity((str(owner_path), owner_selector)))
         before = SourceFileState.capture(owner_path)
@@ -1892,9 +1897,14 @@ def _capture_bound_container_dependencies(
             emit_external(ExternalSourceState(
                 before, owner_selector, first, first + extent, epoch,
             ))
+            external_paths.add(_path_key(str(before.path)))
         for path in lexical_external:
             if path != owner_path:
                 emit_dependency_once(path)
+        pending.extend(
+            (_raw_source_path(path), selector)
+            for path, selector in lexical_selectors
+        )
         first += extent
         capture_dataset_storage(dataset, owner_path)
         after = SourceFileState.capture(owner_path)
@@ -1917,12 +1927,20 @@ def _capture_bound_container_dependencies(
                 else binding._dependency_file
             )
             lexical_external: list[Path] = []
+            lexical_selectors: list[tuple[Path, str]] = []
             _selected_link_owner_selector(
                 dependency_root, selector[1], dependency,
                 on_external_link=lexical_external.append,
+                on_external_selector=lambda path, selector: lexical_selectors.append(
+                    (path, selector),
+                ),
             )
             for path in lexical_external:
                 emit_dependency_once(path)
+            pending.extend(
+                (_raw_source_path(path), selector)
+                for path, selector in lexical_selectors
+            )
             emit_dependency_once(dependency_path)
             capture_dataset_storage(dependency, dependency_path)
             after = SourceFileState.capture(dependency_path)

@@ -477,6 +477,7 @@ def _selected_link_owner_selector(
     dataset: h5py.Dataset,
     *,
     on_external_link: Callable[[Path], object] | None = None,
+    on_external_selector: Callable[[Path, str], object] | None = None,
 ) -> tuple[Path, str]:
     """Detach the selected link's owner and owner-relative selector.
 
@@ -543,8 +544,10 @@ def _selected_link_owner_selector(
                 )
                 if on_external_link is not None:
                     on_external_link(lexical_owner)
-                owner = lexical_owner.resolve()
                 target = canonical(posixpath.join(str(link.path), *remainder))
+                if on_external_selector is not None:
+                    on_external_selector(lexical_owner, target)
+                owner = lexical_owner.resolve()
                 if not remainder:
                     if owner == actual_owner:
                         return owner, target
