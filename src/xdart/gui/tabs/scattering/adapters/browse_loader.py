@@ -66,7 +66,6 @@ class _BrowseOperation:
     # strongly owned here until its retryable close succeeds.  It is never
     # closed while BrowseLoader._lock is held.
     reader: object | None = None
-    reader_entered: bool = False
     reader_cleanup_in_progress: bool = False
     # A newly allocated cache remains operation-owned until it is transferred
     # into the exact loaded context.  Failed/cancelled construction therefore
@@ -152,20 +151,6 @@ class BrowseLoader:
                 raise RuntimeError("browse scalar reader admission raced")
             operation.reader = reader
 
-    def _discard_unentered_reader(
-        self, operation: _BrowseOperation, reader: object,
-    ) -> None:
-        """Drop a reader whose failure-total __enter__ did not return."""
-
-        with self._lock:
-            if (
-                operation.reader is not reader
-                or operation.reader_entered
-                or operation.reader_cleanup_in_progress
-            ):
-                raise RuntimeError("browse unentered reader custody drifted")
-            operation.reader = None
-
     def _close_operation_reader(
         self,
         operation: _BrowseOperation,
@@ -180,10 +165,7 @@ class BrowseLoader:
             reader = operation.reader
             if reader is None:
                 return True
-            if (
-                not operation.reader_entered
-                or operation.reader_cleanup_in_progress
-            ):
+            if operation.reader_cleanup_in_progress:
                 return False
             operation.reader_cleanup_in_progress = True
         caught: BaseException | None = None
@@ -198,7 +180,6 @@ class BrowseLoader:
                     operation.reader_cleanup_in_progress = False
                     raise RuntimeError("browse reader close custody drifted")
                 operation.reader = None
-                operation.reader_entered = False
                 operation.reader_cleanup_in_progress = False
                 operation.cleanup_failures.clear()
             return True
@@ -310,43 +291,28 @@ class BrowseLoader:
             resolve_source=False,
         )
         self._attach_reader(operation, reader)
-        if cancelled.is_set():
-            self._discard_unentered_reader(operation, reader)
-            raise InterruptedError("Browse scalar catalog read cancelled")
         try:
+            if cancelled.is_set():
+                raise InterruptedError("Browse scalar catalog read cancelled")
             entered = reader.__enter__()
-        except BaseException:
-            # FrameViewReader.__enter__ is failure-total and closes its own
-            # partially opened HDF graph before propagating.
-            self._discard_unentered_reader(operation, reader)
-            raise
-        if entered is not reader:
-            # A foreign context-manager replacement is not the object this
-            # operation admitted and cannot become its close authority.
+            if entered is not reader:
+                raise RuntimeError("browse scalar reader changed identity")
             with self._lock:
-                if operation.reader is reader:
-                    operation.reader_entered = True
-            self._close_operation_reader(operation, attempts=2)
-            raise RuntimeError("browse scalar reader changed identity")
-        with self._lock:
-            if operation.reader is not reader:
-                raise RuntimeError("browse scalar reader custody drifted")
-            operation.reader_entered = True
-        try:
+                if operation.reader is not reader:
+                    raise RuntimeError("browse scalar reader custody drifted")
             catalog = reader.read_scalar_catalog(cancelled=cancelled.is_set)
             if type(catalog) is not FrameScalarCatalog:
                 raise TypeError(
                     "browse scalar reader returned a foreign catalog"
                 )
-        except BaseException:
+            return catalog
+        finally:
+            # Failed entry may still own a partially opened HDF handle. Only
+            # actual close releases custody; terminal _progress retries holds.
             if not self._close_operation_reader(operation, attempts=2):
                 raise RuntimeError(
                     "browse scalar reader cleanup remains pending"
                 )
-            raise
-        if not self._close_operation_reader(operation, attempts=2):
-            raise RuntimeError("browse scalar reader cleanup remains pending")
-        return catalog
 
     @property
     def _context(self) -> BrowseContext | None:

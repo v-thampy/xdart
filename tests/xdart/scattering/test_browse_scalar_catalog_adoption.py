@@ -139,6 +139,109 @@ def test_default_browse_adopts_one_scalar_catalog_without_payload_rows(
     assert catalog.rows and context.scalar_catalog is None
 
 
+@pytest.mark.parametrize("finish", ("retry", "cancel", "close", "replace"))
+def test_failed_reader_entry_retains_actual_hdf_close_owner(
+    tmp_path, monkeypatch, finish,
+) -> None:
+    import h5py
+    from tests.core.reintegrate_support import _seed_existing
+    from xdart.gui.tabs.scattering.adapters.browse_loader import BrowseLoader
+    from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest, BrowseLoadStatus
+    from xdart.gui.tabs.scattering.events import CleanupStatus
+    from xrd_tools.io import FrameViewReader
+
+    path = _seed_existing(tmp_path, monitor="i0").target
+    readers, handles, close_attempts = [], [], []
+    admitted, proceed, allow_close = Event(), Event(), Event()
+    real_enter, real_close = FrameViewReader._enter_inner, h5py.File.close
+    if finish != "cancel":
+        proceed.set()
+
+    def factory(*args, **kwargs):
+        reader = FrameViewReader(*args, **kwargs)
+        readers.append(reader)
+        return reader
+
+    def enter(reader):
+        if reader is not readers[0]:
+            return real_enter(reader)
+        handles.append(reader._h5)
+        assert handles[0].id.valid
+        admitted.set()
+        assert proceed.wait(10)
+        raise OSError("injected read failure after real HDF open")
+
+    def close(handle):
+        if handles and handle is handles[0]:
+            close_attempts.append(handle)
+            if not allow_close.is_set() and (
+                finish != "retry" or len(close_attempts) == 1
+            ):
+                raise OSError("injected HDF close hold")
+        return real_close(handle)
+
+    monkeypatch.setattr(FrameViewReader, "_enter_inner", enter)
+    monkeypatch.setattr(h5py.File, "close", close)
+    loader = BrowseLoader(open_reader=factory)
+    request = BrowseLoadRequest("entry-failure", 1, str(path))
+    try:
+        loader.begin(request)
+        operation, worker = loader._active, loader._worker
+        assert admitted.wait(10)
+        if finish == "cancel":
+            assert loader.cancel(request).cleanup_status is CleanupStatus.CLEANUP_PENDING
+            assert not close_attempts and handles[0].id.valid
+            proceed.set()
+        worker.join(10)
+        assert not worker.is_alive()
+        assert len(readers) == 1
+        if finish == "retry":
+            assert not handles[0].id.valid
+            assert operation.reader is None
+            assert loader.poll(request).status is BrowseLoadStatus.FAILED
+            assert loader.close(request).cleanup_status is CleanupStatus.CLEANED
+            return
+
+        assert handles[0].id.valid
+        assert operation.reader is readers[0], "failed entry lost its close-retry owner"
+        assert loader.owns_request(request)
+        if finish == "replace":
+            replacement = BrowseLoadRequest("replacement", 2, str(path))
+            loader.begin(replacement)
+            assert loader.poll(replacement) is None
+            assert len(readers) == 1 and operation.reader is readers[0]
+        else:
+            cleanup = loader.cancel if finish == "cancel" else loader.close
+            receipt = cleanup(request)
+            assert receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING
+            assert receipt.cleanup_failures
+            assert loader.owns_request(request) and operation.reader is readers[0]
+        assert handles[0].id.valid
+        allow_close.set()
+        if finish == "replace":
+            loader.poll(replacement)
+            outcome = _finish(loader, replacement)
+            assert outcome.status is BrowseLoadStatus.READY
+            context = loader.consume(outcome)
+            assert context is not None
+            assert loader.release_context(context).cleanup_status is CleanupStatus.CLEANED
+        else:
+            assert cleanup(request).cleanup_status is CleanupStatus.CLEANED
+        assert not handles[0].id.valid and operation.reader is None
+        assert readers[0]._snapshot_reader_cache_state().phase.value == "closed"
+        assert loader.close().cleanup_status is CleanupStatus.CLEANED
+    finally:
+        proceed.set()
+        allow_close.set()
+        worker = loader._worker
+        if worker is not None:
+            worker.join(10)
+        loader.close()
+        # Also settle the parent's lost reader on a failing pre-fix assertion.
+        for reader in readers:
+            reader.__exit__(None, None, None)
+
+
 def test_scalar_reader_cancellation_closes_before_terminal_cleanup(
     tmp_path, monkeypatch,
 ) -> None:
