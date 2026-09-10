@@ -690,6 +690,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             clock=browse_clock,
         )
         self._deferred_browse_selection: _DeferredBrowseSelection | None = None
+        self._pending_viewer_2d_path: str | None = None
         self._admission_state: _AdmissionPageOwner | None = None
         self._closing = False
         self._closed = False
@@ -2690,6 +2691,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         first = not self._closing
         if first:
             self._closing = True
+            self._pending_viewer_2d_path = None
             self._deferred_browse_selection = None
             self._abandon_reintegrate_display_owner()
             self._retire_native_plot_axis_transition()
@@ -4462,6 +4464,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             changed = True
         if self._context_controller.poll_viewer_2d():
             changed = True
+        if self._pending_viewer_2d_path is not None:
+            self._open_viewer_2d_path(self._pending_viewer_2d_path)
+            changed = True
         if self._context_controller.poll_browse_preview():
             changed = True
         if self._context_controller.browse_pending:
@@ -5757,6 +5762,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or getattr(self._context_controller, "viewer_1d_loading", False)
             or getattr(self._context_controller, "viewer_1d_cleanup_pending", False)
             or self._context_controller.viewer_2d_loading
+            or self._pending_viewer_2d_path is not None
             or self._context_controller.browse_pending
             or self._context_controller.browse_preview_polling_needed
             or self._browse_1d_release_debt is not None
@@ -6793,8 +6799,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if os.environ.get("XDART_VIEWER_DEBUG") == "1":
                 print("viewer_mode", {"from": candidate.processing_mode, "to": value,
                     "browse": getattr(controller.browse_context, "requested_path", None),
+                    "browse_pending": controller.browse_pending,
                     "one_d": getattr(controller.viewer_1d_context, "current_path", None),
+                    "one_d_owned": controller.viewer_1d_owned,
                     "two_d": getattr(controller.viewer_2d_context, "original_path", None),
+                    "current_artifact": getattr(controller.navigation.current, "artifact", None),
                     "selection": str(controller.selection)}, flush=True)
             if target_tool is Tool.IMAGE_VIEWER:
                 selection = controller.selection
@@ -6805,18 +6814,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     and selection.names(browse)
                 ):
                     viewer_source = browse.requested_path
-                elif (
-                    selection is not None
-                    and selection.kind is ContextKind.ACQUISITION
-                    and (acquisition := controller.acquisition_context) is not None
-                    and selection.names(acquisition)
-                    and (frame := controller.navigation.current) is not None
-                    and controller.owns_frame(frame)
-                    and Path(frame.artifact).suffix.casefold() == ".nexus"
-                ):
-                    # A completed run's file can still be selected through
-                    # acquisition navigation after leaving its XYE viewer.
-                    viewer_source = frame.artifact
                 else:
                     one_d = controller.viewer_1d_context
                     if (
@@ -6858,12 +6855,29 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     and not self._clear_viewer_1d_renderer(close=True)):
                 self._notice("1D Viewer cleanup remains pending")
                 return
+            # Closing XYE restores acquisition navigation. Resolve its source
+            # after that clear, just as the browser resolves the restored row.
+            if target_tool is Tool.IMAGE_VIEWER and viewer_source is None:
+                selection = controller.selection
+                acquisition = controller.acquisition_context
+                if selection is None and acquisition is not None:
+                    selection = controller.select_acquisition()
+                frame = controller.navigation.current
+                if (acquisition is not None and frame is not None
+                        and selection is not None
+                        and selection.kind is ContextKind.ACQUISITION
+                        and selection.names(acquisition)
+                        and controller.owns_frame(frame)
+                        and Path(frame.artifact).suffix.casefold() == ".nexus"):
+                    viewer_source = frame.artifact
             if value != candidate.processing_mode:
                 self._retire_batch_presentation()
                 release_outgoing_display = True
                 self._retain_outgoing_display = False
                 self._release_display_background()
             candidate.processing_mode = value
+            if target_tool is not Tool.IMAGE_VIEWER:
+                self._pending_viewer_2d_path = None
             if value == "Int 1D (XYE)":
                 _drop_nexus_only_performance_options(candidate)
         elif kind is ShellCommandKind.SET_BATCH:
@@ -6890,6 +6904,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if (browse_source is not None
                 and result.snapshot.thaw().processing_mode == candidate.processing_mode):
             self._select_scan(browse_source, reopen=True)
+        if kind is ShellCommandKind.SET_PROCESSING_MODE and os.environ.get("XDART_VIEWER_DEBUG") == "1":
+            print("viewer_mode_result", {"mode": result.snapshot.thaw().processing_mode,
+                "viewer_source": viewer_source, "browse_source": browse_source,
+                "two_d_state": getattr(controller.viewer_2d_context, "state", None),
+                "two_d_loading": controller.viewer_2d_loading,
+                "two_d_diagnostic": controller.viewer_2d_diagnostic,
+                "notice": self._notice_text, "selection": str(controller.selection)}, flush=True)
         if release_outgoing_display:
             self._retain_outgoing_display = False
             self._refresh_shell()
@@ -7032,9 +7053,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 and not self._clear_viewer_1d_renderer(close=True)):
             self._notice("1D Viewer cleanup remains pending"); return
         context = self._context_controller.viewer_2d_context
-        if context is not None and not self._clear_viewer_2d_renderer(preserve_navigation=True):
+        if context is not None and not self._clear_viewer_2d_renderer(close=True):
+            self._pending_viewer_2d_path = selected
             self._notice("2D Viewer cleanup remains pending")
+            self._ensure_timer()
             return
+        self._pending_viewer_2d_path = None
         try:
             request = self._context_controller.open_viewer_2d(selected)
         except Exception as error:

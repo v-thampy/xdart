@@ -32,7 +32,7 @@ def _wait(app, predicate, timeout=15.0):
     return False
 
 
-@pytest.mark.parametrize("outgoing", ("Int 1D", "Int 1D (XYE)"))
+@pytest.mark.parametrize("outgoing", ("Int 1D", "Int 1D (XYE)", "1D Viewer", "1D Viewer NeXus"))
 def test_completed_run_selected_artifact_enters_2d_viewer(tmp_path, outgoing):
     from xdart.modules.display_context import ContextKind
 
@@ -73,12 +73,28 @@ def test_completed_run_selected_artifact_enters_2d_viewer(tmp_path, outgoing):
         assert _wait(app, lambda: controller.viewer_1d_context is not None
                      and controller.viewer_1d_context.state.value == "ready"), page._notice_text
         assert controller.browse_context is None
-        page._shell.run_controls.modeCombo.setCurrentText(outgoing)
-        # Re-select the completed run's existing file through its actual command.
-        page._handle_shell_command(ShellCommand(
-            ShellCommandKind.SELECT_SCAN, artifact, path=("artifact",),
-            artifacts=(artifact,)))
-        assert controller.selection.kind is ContextKind.ACQUISITION
+        page._shell.run_controls.modeCombo.setCurrentText(
+            "1D Viewer" if outgoing == "1D Viewer NeXus" else outgoing)
+        if outgoing.startswith("1D Viewer"):
+            # Return to the processed folder while the XYE remains displayed.
+            # Do not preselect NeXus: clearing 1D restores acquisition navigation,
+            # which highlights this catalog-owned artifact after the mode switch.
+            page._set_browser_directory(str(Path(artifact).parent), explicit=True)
+            assert page._processed_browser.projection().directory == str(Path(artifact).parent)
+            assert controller.viewer_1d_context.state.value == "ready"
+            assert controller.viewer_1d_context.current_path.endswith(".xye")
+            assert controller.selection.kind is ContextKind.VIEWER_1D
+            if outgoing == "1D Viewer NeXus":
+                page._handle_shell_command(ShellCommand(
+                    ShellCommandKind.SELECT_SCAN, artifact, path=("artifact",),
+                    artifacts=(artifact,)))
+                assert _wait(app, lambda: not controller.viewer_1d_loading), page._notice_text
+        else:
+            # Re-select the completed run's existing file through its actual command.
+            page._handle_shell_command(ShellCommand(
+                ShellCommandKind.SELECT_SCAN, artifact, path=("artifact",),
+                artifacts=(artifact,)))
+            assert controller.selection.kind is ContextKind.ACQUISITION
         page._shell.run_controls.modeCombo.setCurrentText("2D Viewer")
         assert _wait(app, lambda: controller.viewer_2d_frame is not None
                      and page._shell.scientific._viewer_2d_payload is not None), page._notice_text

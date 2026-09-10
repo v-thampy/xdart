@@ -248,3 +248,60 @@ def test_cancelled_prepared_frame_releases_before_subsequent_viewer_load(
         np.testing.assert_array_equal(controller.viewer_2d_frame.array, values[0])
     finally:
         release.set()
+
+
+@pytest.mark.parametrize("action", ("load", "latest", "close"))
+def test_file_click_during_prepared_frame_recovers_through_page(viewer, monkeypatch, action):
+    page, app, paths, values = viewer
+    controller = page._context_controller
+    entered, release = Event(), Event()
+    commit = controller._viewer_2d.commit
+
+    def gated_commit(owner, prepared):
+        if getattr(prepared.request, "label", None) == 1:
+            entered.set()
+            assert release.wait(6)
+        return commit(prepared)
+
+    monkeypatch.setattr(type(controller._viewer_2d), "commit", gated_commit)
+    try:
+        QtTest.QTest.mouseClick(page._shell.scientific.next_frame, QtCore.Qt.LeftButton)
+        _wait(page, app, entered.is_set)
+        scans = page._shell.browser.scans
+        target = scans.item(_row(page._shell.browser, paths[1]))
+        QtTest.QTest.mouseClick(scans.viewport(), QtCore.Qt.LeftButton,
+                              pos=scans.visualItemRect(target).center())
+        assert controller.viewer_2d_cleanup_pending
+        expected = paths[1]
+        if action == "latest":
+            expected = paths[0]
+            target = scans.item(_row(page._shell.browser, expected))
+            QtTest.QTest.mouseClick(scans.viewport(), QtCore.Qt.LeftButton,
+                                  pos=scans.visualItemRect(target).center())
+        elif action == "close":
+            from xdart.gui.tabs.scattering.events import CleanupStatus
+            assert page.close_workspace().cleanup_status is CleanupStatus.CLEANUP_PENDING
+            assert page._pending_viewer_2d_path is None
+            release.set()
+            _wait(page, app, lambda: page.close_workspace().cleanup_status is CleanupStatus.CLEANED)
+            assert controller.viewer_2d_context is None
+            return
+        release.set()
+        _wait(page, app, lambda: not controller.viewer_2d_loading)
+        assert _wait_cleanup(page, app), controller.viewer_2d_diagnostic
+        _wait(page, app, lambda: controller.viewer_2d_frame is not None
+              and controller.viewer_2d_context.original_path == str(expected))
+        np.testing.assert_array_equal(controller.viewer_2d_frame.array, values[0])
+    finally:
+        release.set()
+
+
+def _wait_cleanup(page, app):
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        app.processEvents()
+        page._drain_executor()
+        if not page._context_controller.viewer_2d_cleanup_pending:
+            return True
+        time.sleep(0.005)
+    return False
