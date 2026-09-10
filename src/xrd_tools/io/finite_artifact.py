@@ -2242,6 +2242,7 @@ class _FinitePublicationSession:
         candidate = self.candidate
         descriptor = self._parent_descriptor
         renamed = False
+        rename_attempted = False
         primary = None
         try:
             self._require_parent()
@@ -2251,6 +2252,7 @@ class _FinitePublicationSession:
                 _fsync_publication_candidate(descriptor, candidate, self._reservation)
             if expected_target is not None and capture_target_snapshot(self.target) != expected_target:
                 raise FiniteArtifactIntegrityError("finite public target changed")
+            rename_attempted = True
             replace_into_place(candidate.name, self.target.name, verb="publish", src_dir_fd=descriptor, dst_dir_fd=descriptor)
             renamed = self._published = True
             try:
@@ -2271,7 +2273,7 @@ class _FinitePublicationSession:
             # A replacement syscall may report after it has linked the inode.
             # Observe the public name before classifying that as pre-publication
             # failure; the prior slot must never be reconstructed or deleted.
-            if not renamed and self._reservation is not None:
+            if rename_attempted and not renamed and self._reservation is not None:
                 try:
                     observed = _try_observe_at(
                         descriptor, self.target.name, self.target,

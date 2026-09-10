@@ -2372,3 +2372,35 @@ def test_a_run_and_an_average_cannot_both_hold_a_slot_in_a_fresh_directory(
     # Nothing stranded: the slot is acquirable again afterwards.
     again = coordinator.hold_target(slot, label="after")
     coordinator.release_target(again)
+
+
+def test_pre_rename_directory_collision_never_claims_publication(tmp_path):
+    import h5py
+    from xrd_tools.io.finite_artifact import _FinitePublicationSession
+
+    target = tmp_path / "output.nexus"
+    expected = capture_target_snapshot(target)
+    owner = _FinitePublicationSession(target)
+    document = owner.start(lambda path: h5py.File(path, "w"))
+    document.create_dataset("value", data=[1, 2, 3])
+    candidate = owner.candidate
+    ordinal = owner.ordinal
+    assert owner.close_document()
+    target.mkdir()
+
+    def observe(path, ordinal):
+        raise AssertionError("no candidate was renamed; observation must not run")
+
+    facts = None
+    try:
+        facts = owner.publish(expected, ordinal=ordinal, observe=observe)
+    except OSError:
+        pass
+    finally:
+        owner.abort()
+    print("PRE_RENAME_COLLISION", "published", owner.published,
+          "candidate_exists", candidate.exists(), "hidden_orphan", owner.hidden_orphan,
+          "facts", facts, flush=True)
+    assert target.is_dir()
+    assert not owner.published
+    assert not candidate.exists()
