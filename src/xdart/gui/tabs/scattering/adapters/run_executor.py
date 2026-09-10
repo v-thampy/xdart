@@ -2570,9 +2570,6 @@ class StandardRunExecutor:
             if pending is not None and session is not None:
                 try:
                     if image is not None: run.display.stamp_saturation_ceiling(owner, image)
-                    if (session.saturation_mask_seeded
-                            and not owner.saturation_mask_seeded):
-                        run.display.stamp_saturation_mask(owner, session.saturation_mask)
                 except BaseException as error:
                     run.display_projection_errors.append(error)
                     return

@@ -120,11 +120,6 @@ class DisplayArtifact:
     #: accepted saturation input is unavailable and a toggle-ON preview
     #: fallback fails closed instead of guessing a ceiling.
     saturation_ceiling: float | None = None
-    #: Session-owned first-frame value mask copied once for live, persisted,
-    #: and rehydrated detector parity.  ``saturation_mask_seeded`` distinguishes
-    #: a valid empty mask from a run that has not accepted its first frame.
-    saturation_mask: np.ndarray | None = None
-    saturation_mask_seeded: bool = False
     wavelength_m: float | None = None
     #: Monotonic authority that this artifact's output/checkpoint owner has
     #: finished and its final durable projection was applied.  This belongs to
@@ -1064,28 +1059,6 @@ class RunDisplayState:
         if owner.saturation_ceiling is None:
             owner.saturation_ceiling = integer_saturation_ceiling(image)
 
-    def stamp_saturation_mask(
-        self,
-        owner: DisplayArtifact,
-        mask: np.ndarray | None,
-    ) -> None:
-        """Copy the session's immutable first-frame value mask exactly once."""
-        frozen = None
-        if mask is not None:
-            frozen = np.array(mask, dtype=bool, copy=True)
-            frozen.setflags(write=False)
-        if owner.saturation_mask_seeded:
-            current = owner.saturation_mask
-            if (current is None) != (frozen is None) or (
-                current is not None
-                and frozen is not None
-                and not np.array_equal(current, frozen)
-            ):
-                raise RuntimeError("display saturation mask changed within one run")
-            return
-        owner.saturation_mask = frozen
-        owner.saturation_mask_seeded = True
-
     def _request_preview(
         self,
         art: DisplayArtifact,
@@ -1168,25 +1141,13 @@ class RunDisplayState:
                 return DetectorPreviewProjection.unavailable(), key
             if (
                 art.mask_saturation
-                and not art.saturation_mask_seeded
                 and art.saturation_ceiling is None
             ):
                 return DetectorPreviewProjection.unavailable(), key
             projection_mask = art.mask
-            dynamic_saturation = bool(art.mask_saturation)
-            if art.mask_saturation and art.saturation_mask_seeded:
-                dynamic_saturation = False
-                if art.saturation_mask is not None:
-                    projection_mask = combine_detector_masks(
-                        art.mask,
-                        art.saturation_mask,
-                        art.saturation_mask.shape,
-                    )
             policy = {
-                "mask_saturation": dynamic_saturation,
-                "saturation_ceiling": (
-                    art.saturation_ceiling if dynamic_saturation else None
-                ),
+                "mask_saturation": bool(art.mask_saturation),
+                "saturation_ceiling": art.saturation_ceiling,
             }
             if projection_mask is not None:
                 return (
@@ -1738,12 +1699,10 @@ def project_frame_detector_values(
     frame_mask: object,
     *,
     value_mask_enabled: bool,
-    stable_value_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, bool]:
     """Project live detector values with the reduction-qualified mask union."""
     raw = np.asarray(image)
     resolved = combine_detector_masks(static_mask, frame_mask, raw.shape)
-    resolved = combine_detector_masks(resolved, stable_value_mask, raw.shape)
     return project_detector_values(
         raw,
         resolved,

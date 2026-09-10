@@ -1,39 +1,34 @@
-from pathlib import Path
-
 import numpy as np
 import pytest
 
 from xdart.gui.tabs.scattering.display_runtime import (
-    RunDisplayState,
     project_detector_values,
     project_frame_detector_values,
 )
-from xdart.gui.tabs.scattering.events import RunIdentity
 
 
-def test_live_projection_uses_scan_stable_value_mask_not_current_frame_values() -> None:
-    raw = np.zeros((100, 100), dtype=np.uint16)
-    raw[3, :2] = np.iinfo(np.uint16).max
-    static = np.zeros(raw.shape, dtype=bool)
+def test_live_projection_uses_each_frame_values_with_static_and_frame_masks() -> None:
+    static = np.zeros((100, 100), dtype=bool)
     static[1, 1] = True
-    frame = np.zeros(raw.shape, dtype=bool)
+    frame = np.zeros(static.shape, dtype=bool)
     frame[2, 2] = True
-    stable = np.zeros(raw.shape, dtype=bool)
-    stable[0, :2] = True
-
-    projected, mask_baked = project_frame_detector_values(
-        raw,
-        static,
-        frame,
-        value_mask_enabled=False,
-        stable_value_mask=stable,
-    )
-
-    assert mask_baked
-    assert np.isnan(projected[0, :2]).all()
-    assert np.isnan(projected[1, 1])
-    assert np.isnan(projected[2, 2])
-    assert np.isfinite(projected[3, :2]).all()
+    previous = None
+    for row in (3, 4):
+        raw = np.zeros(static.shape, dtype=np.uint16)
+        raw[row, :2] = np.iinfo(np.uint16).max
+        before = raw.copy()
+        projected, mask_baked = project_frame_detector_values(
+            raw, static, frame, value_mask_enabled=True,
+        )
+        assert mask_baked
+        assert np.isnan(projected[row, :2]).all()
+        assert np.isnan(projected[1, 1])
+        assert np.isnan(projected[2, 2])
+        assert np.isfinite(projected[7 - row, :2]).all()
+        if previous is not None:
+            assert np.isnan(previous[3, :2]).all()
+        np.testing.assert_array_equal(raw, before)
+        previous = projected
 
 
 def test_masked_integer_projection_uses_one_float_output_allocation(
@@ -67,33 +62,3 @@ def test_masked_integer_projection_uses_one_float_output_allocation(
     assert projected.dtype == float
     assert np.isnan(projected[1, 2])
     assert not projected.flags.writeable
-
-
-def test_display_owner_copies_one_runtime_mask_and_rejects_divergence() -> None:
-    state = RunDisplayState(
-        RunIdentity(1, "stable-saturation"),
-        max_payload_items=2,
-    )
-    owner = state.add_artifact(
-        Path("/tmp/stable-saturation.nxs"),
-        "scan",
-        mask=None,
-        mask_saturation=True,
-        measurement_mode="Standard",
-    )
-    mask = np.zeros((4, 4), dtype=bool)
-    mask[0, 0] = True
-
-    state.stamp_saturation_mask(owner, mask)
-    mask[0, 0] = False
-
-    assert owner.saturation_mask_seeded
-    assert owner.saturation_mask is not None
-    assert owner.saturation_mask[0, 0]
-    assert not owner.saturation_mask.flags.writeable
-    state.stamp_saturation_mask(owner, owner.saturation_mask)
-
-    divergent = np.zeros((4, 4), dtype=bool)
-    divergent[1, 1] = True
-    with pytest.raises(RuntimeError, match="changed within one run"):
-        state.stamp_saturation_mask(owner, divergent)
