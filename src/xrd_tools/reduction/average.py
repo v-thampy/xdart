@@ -929,7 +929,7 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
     needs_metadata = bool(
         plan.numeric_metadata_keys or plan.invariant_metadata_keys
     )
-    detector_mask = invariant_valid = None
+    invariant_valid = None
     scratch = valid = None
     native_dtype = np.dtype(plan.native_dtype)
     floating_native = native_dtype.kind == 'f'
@@ -938,6 +938,7 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
     )
     invariant_counts = (
         not floating_native
+        and not plan.recipe.mask_saturation
         and threshold_min is None
         and threshold_max is None
     )
@@ -959,24 +960,11 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
         _reject(native.ndim != 2 or tuple(native.shape) != shape or native.dtype.str != plan.native_dtype or (native.dtype.kind not in 'iuf') or (native.dtype.itemsize > 8), 'AVERAGE_CONTRIBUTOR_LAYOUT_CHANGED')
         progress('read', index + 1, extent)
         if index == 0:
-            mask = detector_value_mask(None, native, enabled=plan.recipe.mask_saturation)
-            if mask is not None:
-                detector_mask = np.frombuffer(np.ascontiguousarray(mask, dtype=bool).tobytes(), dtype=bool).reshape(shape)
-                detector_mask.setflags(write=False)
-            del mask
             valid = np.empty(shape, dtype=bool)
             scratch = np.empty(shape, dtype=bool)
-            if static is not None or detector_mask is not None:
-                if static is not None and detector_mask is not None:
-                    np.logical_or(static, detector_mask, out=valid)
-                else:
-                    np.copyto(
-                        valid,
-                        static if static is not None else detector_mask,
-                    )
-                np.logical_not(valid, out=valid)
-                invariant_valid = np.array(valid, copy=True)
-            static = detector_mask = None
+            if static is not None:
+                invariant_valid = np.logical_not(static)
+            static = None
         frame_valid = invariant_valid
         if not invariant_counts:
             predicates = 0
@@ -995,6 +983,17 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
                 if predicates:
                     np.logical_and(valid, target, out=valid)
                 predicates += 1
+            if plan.recipe.mask_saturation:
+                detector_mask = detector_value_mask(None, native, enabled=True)
+                target = valid if predicates == 0 else scratch
+                if detector_mask is None:
+                    target.fill(True)
+                else:
+                    np.logical_not(detector_mask, out=target)
+                if predicates:
+                    np.logical_and(valid, target, out=valid)
+                predicates += 1
+                del detector_mask
             if invariant_valid is not None:
                 if predicates:
                     np.logical_and(valid, invariant_valid, out=valid)

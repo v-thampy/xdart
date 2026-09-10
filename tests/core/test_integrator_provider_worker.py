@@ -259,7 +259,6 @@ def test_numpy_false_safe_transition_stays_on_explicit_mask_path(
     from xrd_tools.reduction import Frame, Integration1DPlan, ReductionPlan
     from xrd_tools.reduction.core import (
         _ReductionIntegratorProvider,
-        _RunSaturationMask,
         _reduce_frame,
     )
 
@@ -320,7 +319,6 @@ def test_numpy_false_safe_transition_stays_on_explicit_mask_path(
             plan,
             provider,
             {},
-            run_saturation_mask=_RunSaturationMask(False),
         ).result_1d
         for frame in frames
     ]

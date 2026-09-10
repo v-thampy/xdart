@@ -211,11 +211,6 @@ class _EventSink:
         if self._inner is not None:
             self._inner.begin(scan, plan)
 
-    def _bind_run_saturation_mask(self, state) -> None:
-        bind = getattr(self._inner, "_bind_run_saturation_mask", None)
-        if callable(bind):
-            bind(state)
-
     def write(self, frame, reduction) -> None:
         if self._inner is not None:
             self._inner.write(frame, reduction)
@@ -1945,14 +1940,6 @@ class ScanSession:
         a later replacement whose write fails cannot decrement it — and a
         re-feed cannot inflate it."""
         return self._accounting.written_label_count()
-
-    @property
-    def saturation_mask_seeded(self) -> bool:
-        return self._session.saturation_mask_seeded
-
-    @property
-    def saturation_mask(self) -> np.ndarray | None:
-        return self._session.saturation_mask
 
     @property
     def scan(self):

@@ -136,6 +136,40 @@ def _run_average_scan(recipe, **kwargs):
     return result
 
 
+@pytest.mark.parametrize("thresholds", (False, True))
+def test_real_average_counts_follow_each_frame_saturation(tmp_path, thresholds):
+    frames = [np.full((4, 4), 20, dtype=np.uint32) for _ in range(3)]
+    for index, frame in enumerate(frames):
+        frame[index, 0] = np.iinfo(np.uint32).max
+        frame[index, 1] = 2000
+    source = _series(tmp_path, frames)
+    static = np.zeros((4, 4), dtype=bool)
+    static[3, 3] = True
+    mask_path = tmp_path / "mask.npy"
+    np.save(mask_path, static)
+    calibration = CalibrationState(
+        PoniValues(0.2, 0.001, 0.001, 0.0, 0.0, 0.0, 1e-10), "Detector",
+        {"pixel1": 1e-4, "pixel2": 1e-4, "max_shape": [4, 4], "orientation": 3},
+        status=FactStatus.PRESENT,
+        mask=MaskState(str(mask_path), hashlib.sha256(mask_path.read_bytes()).hexdigest(),
+                       np.dtype(bool).str, static.shape, FactStatus.PRESENT),
+    )
+    result = _run_average_scan(AverageScanRecipe(
+        source, tmp_path / "scan.nexus", ReductionPlan(
+            integration_1d=Integration1DPlan(npt=4, method="numpy"),
+            mask_saturation=True, threshold_max=100 if thresholds else None,
+        ), calibration=calibration,
+    ))
+    assert result.disposition == "COMMITTED", result
+    expected = np.full((4, 4), 3, dtype=np.uint32)
+    expected[:3, 0] = 2
+    if thresholds:
+        expected[:3, 1] = 2
+    expected[3, 3] = 0
+    np.testing.assert_array_equal(module.get_average_finite_counts(result.target).values,
+                                  expected)
+
+
 def _prepare_average_scan(recipe):
     runner = module.AverageScanRunner(recipe)
     runner._execute_graph = lambda _graph: runner.plan
@@ -226,11 +260,11 @@ def test_streaming_average_matches_reference_counts_metadata_and_order(tmp_path,
     assert result.disposition == "COMMITTED" and result.committed_labels == (1,)
     assert result.metadata_denominators == (("I0", 3), ("theta", 3))
     finite = module.get_average_finite_counts(result.target)
-    np.testing.assert_array_equal(finite.values, [[0, 3], [0, 2]])
+    np.testing.assert_array_equal(finite.values, [[2, 3], [0, 2]])
     assert finite.evidence.contributor_extent == 3
     assert len(observed) == 1 and observed[0][0] == "1d"
     mean, mask, normalization = observed[0][1:]
-    np.testing.assert_allclose(mean, [[np.nan, 16.0], [np.nan, 16.0]], equal_nan=True)
+    np.testing.assert_allclose(mean, [[3.0, 16.0], [np.nan, 16.0]], equal_nan=True)
     np.testing.assert_array_equal(mask, finite.values == 0)
     assert normalization == pytest.approx(2.0)
     assert read_order == [0, 0, 1, 2]
@@ -239,8 +273,9 @@ def test_streaming_average_matches_reference_counts_metadata_and_order(tmp_path,
                               (2, {"max_input_bytes": 65536}),
                               (3, {"max_input_bytes": 65536})]
     assert background_order == []
-    assert len(detector_masks) == 1
-    np.testing.assert_array_equal(detector_masks[0], frames[0])
+    assert len(detector_masks) == len(frames)
+    for observed_mask, frame in zip(detector_masks, frames):
+        np.testing.assert_array_equal(observed_mask, frame)
     assert recipe.batch_mode is False and result.finite_counts == finite.evidence
 
 
@@ -326,12 +361,10 @@ def test_average_where_out_accumulator_is_bit_exact(
     assert result.disposition == "COMMITTED" and len(observed) == 1
     actual = observed[0][1]
     actual_counts = module.get_average_finite_counts(result.target).values
-    detector_mask = module.detector_value_mask(
-        None, frames[0], enabled=mask_saturation,
-    )
     expected = np.zeros(frames[0].shape, dtype=np.float64)
     expected_counts = np.zeros(frames[0].shape, dtype="<u4")
     for native in frames:
+        detector_mask = module.detector_value_mask(None, native, enabled=mask_saturation)
         conditioned = native.astype(np.float64, copy=True)
         invalid = np.zeros(native.shape, dtype=bool)
         if minimum is not None:

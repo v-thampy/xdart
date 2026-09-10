@@ -909,12 +909,6 @@ class CompositeSink:
         for sink in self.sinks:
             _emit_sink_write_batch(sink, batch)
 
-    def _bind_run_saturation_mask(self, state) -> None:
-        for sink in self.sinks:
-            bind = getattr(sink, "_bind_run_saturation_mask", None)
-            if callable(bind):
-                bind(state)
-
     def replace(self, frame: Frame, reduction: FrameReduction) -> None:
         for sink in self.sinks:
             _emit_sink_replace(sink, frame, reduction)
@@ -1576,9 +1570,6 @@ class NexusSink:
     )
     _scan: "Scan | None" = field(default=None, init=False, repr=False)
     _plan: "ReductionPlan | None" = field(default=None, init=False, repr=False)
-    _run_saturation_mask: "_RunSaturationMask | None" = field(
-        default=None, init=False, repr=False,
-    )
     _session_facade: Any | None = field(default=None, init=False, repr=False)
     _primary_mode_1d: str = field(default=DEFAULT_MODE_KEY, init=False, repr=False)
     _primary_mode_2d: str = field(default=DEFAULT_MODE_KEY, init=False, repr=False)
@@ -2593,9 +2584,6 @@ class NexusSink:
         )
         reduction.thumbnail, reduction._thumbnail_mask_baked = prepared
 
-    def _bind_run_saturation_mask(self, state: "_RunSaturationMask") -> None:
-        self._run_saturation_mask = state
-
     def _prepare_frame_thumbnail(
         self,
         frame: Frame,
@@ -2627,15 +2615,9 @@ class NexusSink:
                     plan.mask, "ReductionPlan.mask", image_shape=raw.shape,
                 )
                 static_mask = _combined_mask(static_mask, frame.mask, raw.shape)
-            run_mask = self._run_saturation_mask
-            resolved_mask = (
-                run_mask.combine(static_mask, raw.shape)
-                if run_mask is not None and run_mask.seeded
-                else detector_value_mask(
-                    static_mask,
-                    raw,
-                    enabled=bool(plan is not None and plan.mask_saturation),
-                )
+            resolved_mask = detector_value_mask(
+                static_mask, raw,
+                enabled=bool(plan is not None and plan.mask_saturation),
             )
         return (
             make_thumbnail_array(
@@ -3103,111 +3085,6 @@ def bind_dynamic_output_sink(value: object) -> BoundOutputSinkGraph:
     return bind(value)
 
 
-class _RunSaturationMask:
-    """Session-owned, immutable detector-value mask seeded by frame one."""
-
-    __slots__ = (
-        "enabled",
-        "_seeded",
-        "_mask",
-        "_constant_owner",
-        "_constant_shape",
-        "_constant_mask",
-        "_lock",
-    )
-
-    def __init__(self, enabled: bool) -> None:
-        self.enabled = bool(enabled)
-        self._seeded = False
-        self._mask: np.ndarray | None = None
-        self._constant_owner: object | None = None
-        self._constant_shape: tuple[int, int] | None = None
-        self._constant_mask: np.ndarray | None = None
-        self._lock = threading.Lock()
-
-    @property
-    def seeded(self) -> bool:
-        with self._lock:
-            return self._seeded
-
-    @property
-    def mask(self) -> np.ndarray | None:
-        with self._lock:
-            return self._mask
-
-    def seed(self, raw_image: object | None = None) -> None:
-        with self._lock:
-            if self._seeded:
-                return
-            if not self.enabled:
-                self._seeded = True
-                return
-            if raw_image is None:
-                raise RuntimeError(
-                    "enabled run saturation mask requires the first raw frame"
-                )
-            resolved = detector_value_mask(
-                None,
-                np.asarray(raw_image),
-                enabled=True,
-            )
-            if resolved is not None:
-                resolved = np.array(resolved, dtype=bool, copy=True)
-                resolved.setflags(write=False)
-            self._mask = resolved
-            self._seeded = True
-
-    def apply(self, mask: np.ndarray | None, raw_image: object) -> np.ndarray | None:
-        self.seed(raw_image)
-        return self.combine(mask, np.asarray(raw_image).shape)
-
-    def apply_run_constant(
-        self,
-        mask: np.ndarray | None,
-        raw_image: object,
-    ) -> np.ndarray | None:
-        """Return one immutable plan/value-mask union for this run and shape."""
-        raw = np.asarray(raw_image)
-        self.seed(raw)
-        image_shape = raw.shape
-        if len(image_shape) != 2:
-            raise ValueError(f"detector image must be 2D; got shape {image_shape}")
-        shape = (int(image_shape[0]), int(image_shape[1]))
-        with self._lock:
-            if self._constant_owner is mask and self._constant_shape == shape:
-                return self._constant_mask
-            resolved = combine_detector_masks(mask, self._mask, shape)
-            if resolved is not None:
-                if resolved is mask and isinstance(mask, np.ndarray) and (
-                    mask.dtype == np.dtype(bool)
-                    and mask.flags.c_contiguous
-                    and not mask.flags.writeable
-                ):
-                    resolved = mask
-                elif resolved is self._mask and self._mask is not None:
-                    resolved = self._mask
-                else:
-                    resolved = np.array(resolved, dtype=bool, order="C", copy=True)
-                resolved.setflags(write=False)
-            self._constant_owner = mask
-            self._constant_shape = shape
-            self._constant_mask = resolved
-            return resolved
-
-    def combine(
-        self,
-        mask: np.ndarray | None,
-        image_shape: tuple[int, ...],
-    ) -> np.ndarray | None:
-        if len(image_shape) != 2:
-            raise ValueError(f"detector image must be 2D; got shape {image_shape}")
-        with self._lock:
-            if not self._seeded:
-                raise RuntimeError("run saturation mask used before first-frame seed")
-            value_mask = self._mask
-        return combine_detector_masks(mask, value_mask, image_shape)
-
-
 @dataclass(slots=True)
 class ReductionSession:
     """Incremental headless reduction engine for one scan/run.
@@ -3302,7 +3179,6 @@ class ReductionSession:
     _frame_masks: dict[tuple[int, tuple[int, int]], tuple[Any, np.ndarray | None]] = field(
         default_factory=dict, init=False, repr=False,
     )
-    _run_saturation_mask: _RunSaturationMask = field(init=False, repr=False)
     # S8: per-SCAN monitor warn-once state (shared with pool workers like
     # _plan_masks; set.add is GIL-atomic).  Session-owned so a dead monitor
     # warns again on the next scan and concurrent sessions don't cross-talk.
@@ -3429,10 +3305,6 @@ class ReductionSession:
                     self.scan.integrator,
                 )
         self._sink = _coerce_sink(self.sink)
-        self._run_saturation_mask = _RunSaturationMask(self.plan.mask_saturation)
-        bind_run_mask = getattr(self._sink, "_bind_run_saturation_mask", None)
-        if callable(bind_run_mask):
-            bind_run_mask(self._run_saturation_mask)
         if self.cancel_token is None:
             self.cancel_token = CancelToken()
         else:
@@ -3524,14 +3396,6 @@ class ReductionSession:
         """Completed frame reductions accumulated so far."""
 
         return self._products
-
-    @property
-    def saturation_mask_seeded(self) -> bool:
-        return self._run_saturation_mask.seeded
-
-    @property
-    def saturation_mask(self) -> np.ndarray | None:
-        return self._run_saturation_mask.mask
 
     def perf_snapshot(self) -> dict[str, float]:
         """Return aggregate worker compute timing without per-frame history."""
@@ -3707,7 +3571,6 @@ class ReductionSession:
                 self._inflight.release(ticket)
                 return False
             _admission_trace("permit_acquired", label=label)
-            image = self._prime_saturation_mask(frame, image)
             ticket.future = self._worker.submit(
                 self._ticketed_stream_reduce, ticket, image)
             _admission_trace("future_bound", label=label)
@@ -3846,7 +3709,6 @@ class ReductionSession:
                     and _worker_process_requires_corrected_image(self._sink)
                 ),
                 include_worker_thumbnail_prep=has_worker_process,
-                run_saturation_mask=self._run_saturation_mask,
                 strict=self.strict,
             )
         finally:
@@ -4358,24 +4220,8 @@ class ReductionSession:
             fi=_accepted_reintegrate_fi(self.scan),
             initial_incident_angle=self._initial_incident_angle,
             warned_monitor_keys=self._warned_monitor_keys,
-            run_saturation_mask=self._run_saturation_mask,
         )
         self._gi_freeze_applied = True
-
-    def _prime_saturation_mask(
-        self,
-        frame: Frame,
-        image: np.ndarray | None,
-    ) -> np.ndarray | None:
-        """Seed once from the first image already entering this session."""
-        if self._run_saturation_mask.seeded:
-            return image
-        if not self._run_saturation_mask.enabled:
-            self._run_saturation_mask.seed()
-            return image
-        raw = np.asarray(image) if image is not None else np.asarray(frame.load_image())
-        self._run_saturation_mask.seed(raw)
-        return raw
 
     def _normalize_process_input(
         self,
@@ -4461,7 +4307,6 @@ class ReductionSession:
             if _cancel_requested(self.cancel_token):
                 self._mark_cancelled()
                 break
-            raw_image = self._prime_saturation_mask(frame, raw_image)
             _emit(self.progress_cb, self.scan.name, "load", frame.index, self._completed, len(self.scan))
             _emit(self.progress_cb, self.scan.name, "integrate", frame.index, self._completed, len(self.scan))
             if self._worker is None:
@@ -4475,7 +4320,6 @@ class ReductionSession:
                         self._frame_masks,
                         cancel_token=self.cancel_token,
                         warned_monitor_keys=self._warned_monitor_keys,
-                        run_saturation_mask=self._run_saturation_mask,
                         strict=self.strict,
                     )
                 except _ReductionCancelled:
@@ -4509,7 +4353,6 @@ class ReductionSession:
                         self._frame_masks,
                         self.cancel_token,
                         self._warned_monitor_keys,
-                        run_saturation_mask=self._run_saturation_mask,
                         strict=self.strict,
                     ),
                 ))
@@ -4898,7 +4741,6 @@ def _apply_gi_freeze_policy(
     fi: Any,
     initial_incident_angle: float | None,
     warned_monitor_keys: set[str] | None = None,
-    run_saturation_mask: _RunSaturationMask | None = None,
 ) -> ReductionPlan:
     """Return a copy of *plan* with missing GI output ranges frozen.
 
@@ -4935,8 +4777,7 @@ def _apply_gi_freeze_policy(
         frame = scan._frame_by_index[int(idx)]
         was_empty = frame.image is None
         reduction = _reduce_frame(frame, None, plan, scout_integrators, masks,
-                                  warned_monitor_keys=warned_monitor_keys,
-                                  run_saturation_mask=run_saturation_mask)
+                                  warned_monitor_keys=warned_monitor_keys)
         if reduction.result_1d is not None:
             scout_results_1d.append(reduction.result_1d)
         if reduction.result_2d is not None:
@@ -5609,7 +5450,6 @@ def _reduce_frame(
     *,
     include_corrected_image: bool = False,
     include_worker_thumbnail_prep: bool = False,
-    run_saturation_mask: _RunSaturationMask | None = None,
     strict: StrictPolicy | None = None,
 ) -> FrameReduction:
     if _cancel_requested(cancel_token):
@@ -5663,7 +5503,6 @@ def _reduce_frame(
             mask,
             raw_image_arr,
             plan,
-            run_saturation_mask=run_saturation_mask,
         )
         fi = integrators.fiber()
         incident_angle = _resolve_gi_incident_angle(frame, plan.gi)
@@ -5707,16 +5546,12 @@ def _reduce_frame(
         integration_mask = None
         detector_mask_is_bound = False
         has_run_constant_mask = False
-        if frame_mask is None and not chi_mode and not unsafe_dynamic_mask_cache:
-            if run_saturation_mask is not None:
-                mask = run_saturation_mask.apply_run_constant(
-                    plan_mask,
-                    raw_image_arr,
-                )
-                has_run_constant_mask = True
-            elif not plan.mask_saturation:
-                mask = plan_mask
-                has_run_constant_mask = True
+        if (frame_mask is None and not chi_mode
+                and not unsafe_dynamic_mask_cache and not plan.mask_saturation):
+            # Only the static plan mask may be bound into an integrator cache.
+            # Value-based exclusions belong to the current native frame.
+            mask = plan_mask
+            has_run_constant_mask = True
             binder = getattr(integrators, "standard_with_run_mask", None)
             if has_run_constant_mask and callable(binder):
                 ai, bound = binder(mask, image.shape)
@@ -5737,7 +5572,6 @@ def _reduce_frame(
                 mask,
                 raw_image_arr,
                 plan,
-                run_saturation_mask=run_saturation_mask,
             )
             integration_mask = mask
         elif ai is None:
@@ -6209,6 +6043,10 @@ def _cached_mask_for_shape(
         return None
     if image_shape not in cache:
         resolved = _as_bool_mask(mask, name, image_shape=image_shape)
+        if resolved.shape != image_shape:
+            raise ValueError(
+                f"{name} shape {resolved.shape} does not match image shape {image_shape}"
+            )
         # Session plans were detached synchronously; direct/private callers get
         # the same first-resolved immutable ownership at this boundary.
         if (
@@ -6270,25 +6108,10 @@ def _cached_frame_mask_for_shape(
     return resolved
 
 
-def _apply_saturation_mask(
-    mask,
-    raw_image,
-    plan,
-    *,
-    run_saturation_mask: _RunSaturationMask | None = None,
-):
-    """Union the toggle-qualified detector value mask into ``mask``.
-
-    A session supplies ``run_saturation_mask`` so the first native frame owns
-    one immutable mask for the scan.  The no-state path remains dynamic for
-    direct/private callers.  Disabled behavior is an exact no-op.
-    """
-    if run_saturation_mask is not None:
-        return run_saturation_mask.apply(mask, raw_image)
+def _apply_saturation_mask(mask, raw_image, plan):
+    """Union this native frame's detector-value exclusions with its masks."""
     return detector_value_mask(
-        mask,
-        raw_image,
-        enabled=bool(plan.mask_saturation),
+        mask, raw_image, enabled=bool(plan.mask_saturation),
     )
 
 

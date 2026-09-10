@@ -296,9 +296,6 @@ def test_gi_refuses_mismatched_poni_and_integrator_before_resources(
     resource_events = []
 
     class Sink:
-        def _bind_run_saturation_mask(self, _mask):
-            resource_events.append("sink-bind")
-
         def begin(self, scan, plan):
             resource_events.append("sink")
 
