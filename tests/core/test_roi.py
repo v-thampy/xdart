@@ -47,9 +47,10 @@ def test_roi_reduce_reducers_and_mask():
 def test_invalid_pixel_mask_policy():
     img = np.array([[1.0, UINT32_CEILING], [np.nan, 5.0]])
     m = invalid_pixel_mask(img)
-    assert m[0, 1] and m[1, 0]            # uint32 dummy + NaN always excluded
+    assert not m[0, 1] and m[1, 0]  # OFF preserves finite sentinel values
+    assert invalid_pixel_mask(img, mask_saturation=True)[0, 1]
     assert not m[0, 0] and not m[1, 1]
-    # dtype-ceiling saturation: gated by mask_saturation + the fraction guard
+    # Native ceiling saturation is controlled only by the toggle.
     sat = np.full((10, 10), 65535, dtype=np.uint16)
     sat[0, 0] = 1
     assert not invalid_pixel_mask(sat, mask_saturation=False).any()

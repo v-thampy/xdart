@@ -14,6 +14,87 @@ from xrd_tools.reduction import (
 )
 
 
+@pytest.mark.parametrize("thresholds", (False, True))
+@pytest.mark.parametrize("saturation", (False, True))
+def test_preview_priority_keeps_static_mask_and_uses_only_selected_values(thresholds,
+                                                                        saturation):
+    from xrd_tools.io.frame_preview import DetectorPreviewProjection, _masked_detector
+    from xrd_tools.session.display_logic import sentinel_mask
+
+    raw = np.array([[-1, 20], [100, 4294967295]], dtype=np.int64)
+    static = np.array([[False, True], [False, False]])
+    projection = DetectorPreviewProjection.from_mask(
+        static, mask_saturation=saturation, saturation_ceiling=4294967295,
+        apply_threshold=thresholds, threshold_max=4294967295 if thresholds else None,
+    )
+    result = _masked_detector(raw, projection)
+    np.testing.assert_array_equal(np.isnan(result),
+        static | (np.array([[True, False], [False, True]])
+                  if saturation and not thresholds else False))
+    off = sentinel_mask(raw, mask_saturation=False)
+    np.testing.assert_array_equal(off, raw)
+
+
+@pytest.mark.parametrize("static_mask", (False, True))
+@pytest.mark.parametrize("mask_saturated", (False, True))
+@pytest.mark.parametrize("threshold", ("off", "low", "ceiling"))
+@pytest.mark.parametrize("dtype", (np.uint8, np.uint16, np.uint32))
+def test_value_toggle_precedence_and_sparse_saturation(dtype, threshold, mask_saturated,
+                                                      static_mask):
+    from pyFAI.detectors import Detector
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+
+    shape = (128, 128)  # One ceiling pixel is below the retired fraction cutoff.
+    ceiling = np.iinfo(dtype).max
+    raw = [np.full(shape, 20, dtype=dtype) for _ in range(2)]
+    raw[0][100, 100] = ceiling
+    raw[1][101, 100] = ceiling
+    for image in raw:
+        image[20, 20] = 200
+    before = [image.copy() for image in raw]
+    mask = np.zeros(shape, dtype=bool) if static_mask else None
+    if mask is not None:
+        mask[20, 20] = True
+    maximum = None if threshold == "off" else 100 if threshold == "low" else float(ceiling)
+
+    def scan(images):
+        ai = AzimuthalIntegrator(
+            dist=0.1, poni1=0.0, poni2=0.0, wavelength=1e-10,
+            detector=Detector(pixel1=100e-6, pixel2=100e-6, max_shape=shape),
+        )
+        return Scan("toggle-values", [Frame(i, image=x) for i, x in enumerate(images)],
+                    integrator=ai)
+
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(npt=16, method="csr", error_model="poisson"),
+        integration_2d=Integration2DPlan(npt_rad=16, npt_azim=8, method="csr",
+                                       error_model="poisson"),
+        mask=mask, threshold_max=maximum, mask_saturation=mask_saturated,
+    )
+    actual = run_reduction(plan, scan(raw), execution="chunked", executor=False)
+    expected_images = []
+    for image in raw:
+        working = image.astype(float)
+        if maximum is not None:
+            working[image > maximum] = np.nan
+        elif mask_saturated:
+            working[image == ceiling] = np.nan
+        expected_images.append(working)
+    expected = run_reduction(
+        replace(plan, threshold_max=None, mask_saturation=False), scan(expected_images),
+        execution="chunked", executor=False,
+    )
+    for index in actual.frames:
+        for dimension in ("result_1d", "result_2d"):
+            left, right = (getattr(result.frames[index], dimension)
+                           for result in (actual, expected))
+            np.testing.assert_array_equal(left.radial, right.radial)
+            for field in ("intensity", "sigma"):
+                np.testing.assert_allclose(getattr(left, field), getattr(right, field),
+                                           rtol=2e-6, atol=1e-7, equal_nan=True)
+        np.testing.assert_array_equal(raw[index], before[index])
+
+
 @pytest.mark.parametrize("static_mask", (False, True), ids=("no-mask-file", "static-mask"))
 @pytest.mark.parametrize("method", ("no", "csr"))
 @pytest.mark.parametrize("dtype", (np.uint8, np.uint16, np.uint32))
@@ -108,7 +189,7 @@ def test_each_frame_matches_local_value_exclusions(tmp_path, execution, gi):
     for index, image in enumerate(raw):
         # Independently reject the native sentinel in this frame's working
         # values, keeping the accepted static geometry and thresholds.
-        local_mask = static | (image >= np.iinfo(np.uint32).max)
+        local_mask = static  # Thresholds override the separate raw saturation mask.
         working = image.astype(float)
         working[image >= np.iinfo(np.uint32).max] = np.nan
         reference = run_reduction(

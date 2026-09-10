@@ -59,6 +59,8 @@ class DetectorPreviewProjection:
                 object.__setattr__(self, name, value)
         _check(self.threshold_min is None or self.threshold_max is None or self.threshold_min <= self.threshold_max, "threshold_min cannot exceed threshold_max", ValueError)
         _check(self.saturation_ceiling is None or self.saturation_ceiling > 0, "saturation_ceiling must be positive", ValueError)
+        if self.apply_threshold:
+            object.__setattr__(self, "mask_saturation", False)
         _check(not self.mask_saturation or self.saturation_ceiling is not None, "mask_saturation requires an accepted detector ceiling", ValueError)
     @classmethod
     def from_mask(cls, mask, **policy):

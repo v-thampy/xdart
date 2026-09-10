@@ -15,11 +15,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from xrd_tools.core.invalid import (
-    UINT32_CEILING,
-    integer_saturation_ceiling,
-    saturation_pixels,
-)
+from xrd_tools.core.invalid import detector_value_mask
 
 _REDUCERS = ("mean", "sum", "max", "min", "std")
 
@@ -62,16 +58,12 @@ class RoiSpec:
 
 
 def invalid_pixel_mask(image, *, mask_saturation: bool = False) -> np.ndarray:
-    """Boolean mask (True = exclude) of invalid pixels — the SAME policy the
-    reducer applies (R3-C): non-finite + the unambiguous uint32 dead/hot dummy
-    ALWAYS; the dtype-derived saturation ceiling only when ``mask_saturation``
-    AND a whole module sits there (the fraction guard in
-    :func:`xrd_tools.core.invalid.saturation_pixels`)."""
+    """Exclude non-finite values and the operator-selected detector values."""
     a = np.asarray(image)
     bad = ~np.isfinite(a)
-    bad |= (a == UINT32_CEILING)
-    if mask_saturation:
-        bad |= saturation_pixels(a, ceiling=integer_saturation_ceiling(a))
+    selected = detector_value_mask(None, a, enabled=mask_saturation)
+    if selected is not None:
+        bad |= selected
     return bad
 
 

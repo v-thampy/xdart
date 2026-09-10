@@ -156,7 +156,7 @@ def _assert_2d(actual, expected: IntegrationResult2D) -> None:
     )
 
 
-def test_value_mask_is_toggle_qualified_fraction_guarded_and_unioning() -> None:
+def test_value_mask_is_toggle_qualified_and_unioning() -> None:
     existing = np.zeros((100, 100), dtype=bool)
     existing[4, 4] = True
 
@@ -174,7 +174,7 @@ def test_value_mask_is_toggle_qualified_fraction_guarded_and_unioning() -> None:
     uint16_sparse[0, 0] = np.iinfo(np.uint16).max
     assert detector_value_mask(
         None, uint16_sparse, enabled=True
-    ) is None
+    )[0, 0]
 
     uint16_dense = uint16_sparse.copy()
     uint16_dense[0, 1] = np.iinfo(np.uint16).max

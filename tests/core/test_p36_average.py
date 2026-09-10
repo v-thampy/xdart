@@ -136,8 +136,10 @@ def _run_average_scan(recipe, **kwargs):
     return result
 
 
-@pytest.mark.parametrize("thresholds", (False, True))
-def test_real_average_counts_follow_each_frame_saturation(tmp_path, thresholds):
+@pytest.mark.parametrize("mask_saturation", (False, True))
+@pytest.mark.parametrize("thresholds", ("off", "low", "ceiling"))
+def test_real_average_counts_follow_each_frame_saturation(tmp_path, thresholds,
+                                                         mask_saturation):
     frames = [np.full((4, 4), 20, dtype=np.uint32) for _ in range(3)]
     for index, frame in enumerate(frames):
         frame[index, 0] = np.iinfo(np.uint32).max
@@ -157,13 +159,17 @@ def test_real_average_counts_follow_each_frame_saturation(tmp_path, thresholds):
     result = _run_average_scan(AverageScanRecipe(
         source, tmp_path / "scan.nexus", ReductionPlan(
             integration_1d=Integration1DPlan(npt=4, method="numpy"),
-            mask_saturation=True, threshold_max=100 if thresholds else None,
+            mask_saturation=mask_saturation,
+            threshold_max=(100 if thresholds == "low" else
+                           float(np.iinfo(np.uint32).max) if thresholds == "ceiling"
+                           else None),
         ), calibration=calibration,
     ))
     assert result.disposition == "COMMITTED", result
     expected = np.full((4, 4), 3, dtype=np.uint32)
-    expected[:3, 0] = 2
-    if thresholds:
+    if thresholds == "low" or (thresholds == "off" and mask_saturation):
+        expected[:3, 0] = 2
+    if thresholds == "low":
         expected[:3, 1] = 2
     expected[3, 3] = 0
     np.testing.assert_array_equal(module.get_average_finite_counts(result.target).values,
@@ -273,9 +279,7 @@ def test_streaming_average_matches_reference_counts_metadata_and_order(tmp_path,
                               (2, {"max_input_bytes": 65536}),
                               (3, {"max_input_bytes": 65536})]
     assert background_order == []
-    assert len(detector_masks) == len(frames)
-    for observed_mask, frame in zip(detector_masks, frames):
-        np.testing.assert_array_equal(observed_mask, frame)
+    assert detector_masks == []  # Manual thresholds skip the redundant saturation pass.
     assert recipe.batch_mode is False and result.finite_counts == finite.evidence
 
 
@@ -364,7 +368,9 @@ def test_average_where_out_accumulator_is_bit_exact(
     expected = np.zeros(frames[0].shape, dtype=np.float64)
     expected_counts = np.zeros(frames[0].shape, dtype="<u4")
     for native in frames:
-        detector_mask = module.detector_value_mask(None, native, enabled=mask_saturation)
+        detector_mask = module.detector_value_mask(
+            None, native, enabled=mask_saturation and minimum is None and maximum is None,
+        )
         conditioned = native.astype(np.float64, copy=True)
         invalid = np.zeros(native.shape, dtype=bool)
         if minimum is not None:

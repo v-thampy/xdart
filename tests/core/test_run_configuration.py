@@ -828,3 +828,10 @@ def test_average_import_owner_and_alternate_writer_census():
         (root / "xdart/gui/tabs/scattering/adapters/dynamic_output.py", "submit"),
         (run_path, "_execute_current"), (run_path, "_background_ready"), (run_path, "_submit_container_source")):
         assert "average_finite_counts" not in {node.id if isinstance(node, ast.Name) else node.attr for node in ast.walk(nodes[path, scope]) if isinstance(node, (ast.Name, ast.Attribute))}
+@pytest.mark.parametrize("enabled", (False, True))
+def test_active_thresholds_override_saturation_without_changing_intent(enabled):
+    intent = ThresholdIntent(apply_threshold=enabled, threshold_max=100,
+                             mask_saturation=True)
+    frozen = intent.freeze()
+    assert frozen.mask_saturation is (not enabled)
+    assert intent.mask_saturation is True

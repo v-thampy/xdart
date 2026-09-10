@@ -1317,29 +1317,17 @@ def integer_saturation_ceiling(arr):
 
 
 def sentinel_mask(arr, mask_saturation=True, ceiling=None):
-    """Return a float copy of ``arr`` with detector sentinels masked to NaN.
+    """Return a float copy with selected detector values replaced by NaN.
 
-    Always masks the UNAMBIGUOUS invalids: non-finite values and the uint32
-    dead/hot-pixel ceiling (4294967295, e.g. from Eiger masters) — neither can
-    be a real photon count.
-
-    The detector SATURATION ceiling (uint16 65535, or whatever ``iinfo.max``
-    the raw dtype implies — see :func:`integer_saturation_ceiling`) is
-    AMBIGUOUS: it is both the max real count and a common overflow/invalid
-    sentinel — so masking it is OPT-IN via ``mask_saturation`` (the "Mask
-    Saturated" wrangler toggle, default ON).  ``ceiling`` overrides the
-    dtype-derived value (callers that already converted to float pass the
-    ceiling captured from the raw dtype).  The fraction-guarded saturation
-    policy itself lives in :func:`xrd_tools.core.invalid.saturation_pixels`
-    (R3-C — shared with the integration path); here it only feeds the NaN fill
-    so the raw-display autoscale uses the real image range.  When disabled a
-    real saturated Bragg peak is left intact (the raw display relies on a robust
-    percentile level-clamp to avoid blowing out — it never hides it).
+    Non-finite values remain invalid. Finite sentinels and every native ceiling
+    pixel are excluded only when Mask Saturated is enabled. A supplied ceiling
+    preserves the native dtype's limit after a caller converts to float.
     """
     orig = np.asarray(arr)
     a = orig.astype(float)
-    bad = ~np.isfinite(a) | (a >= _UINT32_CEILING)
-    if mask_saturation and a.size and np.isfinite(a).any():
+    bad = ~np.isfinite(a)
+    if mask_saturation:
+        bad |= (a < 0) | (a >= _UINT32_CEILING)
         if ceiling is None:
             ceiling = integer_saturation_ceiling(orig)
         bad |= _saturation_pixels(a, ceiling=ceiling)

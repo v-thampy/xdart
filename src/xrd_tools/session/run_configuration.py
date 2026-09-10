@@ -525,6 +525,8 @@ class FrozenThresholdPolicy:
     mask_saturation: bool = True
 
     def __post_init__(self) -> None:
+        if self.apply_threshold:
+            object.__setattr__(self, "mask_saturation", False)
         for name in ("threshold_min", "threshold_max"):
             value = getattr(self, name)
             if value is not None and not math.isfinite(float(value)):

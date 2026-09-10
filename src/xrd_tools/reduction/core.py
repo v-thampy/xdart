@@ -602,13 +602,8 @@ class ReductionPlan:
     mask: np.ndarray | MaskSpec | None = None
     threshold_min: float | None = None
     threshold_max: float | None = None
-    # R3-C: opt-in detector-saturation masking in the HEADLESS reduction path.
-    # When True, _reduce_frame excludes the dtype-derived saturation ceiling
-    # (np.iinfo(dtype).max, e.g. uint16 65535) using the same fraction-guarded
-    # policy as the GUI (xrd_tools.core.invalid.saturation_pixels): masked only
-    # when a whole module sits at the ceiling (>1e-4 of the frame), never a few
-    # genuinely-saturated Bragg pixels.  Default False is behavior-preserving;
-    # core never hardcodes 65535 (a float-dtype frame -> ceiling None -> no-op).
+    # Exclude all native ceiling values per frame. Manual thresholds take
+    # precedence; only static masks determine integration geometry.
     mask_saturation: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -617,6 +612,8 @@ class ReductionPlan:
             raise ValueError(
                 "ReductionPlan must include integration_1d or integration_2d."
             )
+        if self.threshold_min is not None or self.threshold_max is not None:
+            self.mask_saturation = False
 
 
 @dataclass(frozen=True, slots=True)
