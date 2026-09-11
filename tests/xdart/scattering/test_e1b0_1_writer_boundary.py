@@ -131,10 +131,24 @@ def test_full_accepted_configuration_value_algebra_round_trips(
     )
 
 
-@pytest.mark.parametrize("value", [lambda: None, _Authority(), ("not", "json-native")])
+@pytest.mark.parametrize("value", [lambda: None, _Authority()])
 def test_sink_refuses_non_json_native_authority_values_before_output(tmp_path, value):
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError, match="JSON-native"):
         NexusSink(
             tmp_path / "refused.nexus",
             run_configuration_provenance=_identity(value=value),
         )
+    assert not (tmp_path / "refused.nexus").exists()
+
+
+def test_sink_projects_tuple_values_to_detached_json_lists(tmp_path, monkeypatch):
+    values = (["first"], "second")
+    sink = NexusSink(
+        tmp_path / "tuple.nexus", overwrite=True,
+        run_configuration_provenance=_identity(value=values),
+    )
+    values[0].append("caller mutation")
+    path = _write_provenance(tmp_path, monkeypatch, sink)
+    assert read_provenance(path)["config"]["run_configuration"]["value"] == [
+        ["first"], "second",
+    ]

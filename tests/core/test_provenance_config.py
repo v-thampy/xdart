@@ -80,7 +80,7 @@ def test_headless_nexus_sink_writes_reduction_provenance(
     raw1 = tmp_path / "raw_0001.tif"
     raw0.write_bytes(b"raw pointer target 0")
     raw1.write_bytes(b"raw pointer target 1")
-    out = tmp_path / "headless.nxs"
+    out = tmp_path / "headless.nexus"
     plan = ReductionPlan(
         integration_1d=Integration1DPlan(
             npt=2,

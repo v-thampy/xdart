@@ -652,11 +652,13 @@ def test_post_read_artifact_drift_refuses_cache_publication(tmp_path) -> None:
     cache.close()
 
 
-def test_runtime_submits_only_exact_final_browse_frame_plan(tmp_path) -> None:
+def test_runtime_submits_only_exact_final_browse_frame_plan(tmp_path, monkeypatch) -> None:
+    from xdart.gui.tabs.scattering.browse_1d_projection import Browse1DProjectionStatus
     from xdart.gui.tabs.scattering.browse_hydration import (
         _BrowseHydrationOwner,
     )
     from xdart.gui.tabs.scattering.context_runtime import _ContextRuntime
+    from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
 
     context, _selection, _frames, _catalog_value, cache = _scope(tmp_path, 3)
     runtime = _ContextRuntime()
@@ -685,19 +687,20 @@ def test_runtime_submits_only_exact_final_browse_frame_plan(tmp_path) -> None:
             return self.release_result
 
     spy = LaneSpy()
-    owner._one_d_lane = spy
+    # Keep the actual lane as the projection's scope owner. Observe only its
+    # submission boundary; replacing it loses the production admission contract.
+    monkeypatch.setattr(original_lane, "submit", spy.submit)
 
-    class EmptyProjection:
-        def resolve_browse(self, *_args, **_kwargs):
-            return None
-
-    assert runtime.project_navigation(
-        EmptyProjection(), browse_hydration_owner=owner,
-    ) == ()
+    outcome = runtime.project_browse_1d_cache(
+        owner, preferences=ScientificPreferences(plot_mode="Single"),
+        was_waterfall_active=False,
+    )
+    assert outcome.status is Browse1DProjectionStatus.INCOMPLETE
     assert spy.calls == [
         (selection, (runtime.navigation.current,)),
     ]
     assert runtime.navigation.current is runtime.navigation.selected[0]
+    monkeypatch.setattr(original_lane, "release", spy.release)
 
     class LoaderBomb:
         def release_context(self, _context):
@@ -710,6 +713,7 @@ def test_runtime_submits_only_exact_final_browse_frame_plan(tmp_path) -> None:
     assert spy.release_calls == [{"preserve_pending_repaint": True}]
     assert context.browse_1d_cache is cache and context.loaded
 
+    monkeypatch.undo()
     assert original_lane.release()
     assert owner.retire()
     cache.close()

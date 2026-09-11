@@ -1116,8 +1116,8 @@ def test_nexus_sink_persists_non_gi_chi_1d_axis(
     with h5py.File(out, "r") as h5:
         g = h5["entry/integrated_1d"]
         assert g.attrs["axis_kind"] == "azimuthal"
-        assert g["q"].attrs["units"] == "chi_deg"
-        np.testing.assert_allclose(g["q"][()], np.linspace(-180.0, 180.0, 5))
+        assert g["axis_1"].attrs["units"] == "chi_deg"
+        np.testing.assert_allclose(g["axis_1"][()], np.linspace(-180.0, 180.0, 5))
 
 
 def test_nexus_sink_atomic_overwrite_preserves_target_on_failure(
@@ -1133,10 +1133,11 @@ def test_nexus_sink_atomic_overwrite_preserves_target_on_failure(
     def fail_write(*args, **kwargs):
         raise RuntimeError("simulated write failure")
 
-    monkeypatch.setattr(reduction_core.NexusRecordWriter, "write", fail_write)
     out = tmp_path / "scan.nexus"
-    original = b"old complete file"
-    out.write_bytes(original)
+    scan = Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object())
+    run_reduction(ReductionPlan(), scan, NexusSink(out, overwrite=True))
+    original = out.read_bytes()
+    monkeypatch.setattr(reduction_core.NexusRecordWriter, "write_batch", fail_write)
 
     with pytest.raises(RuntimeError, match="simulated write failure"):
         run_reduction(

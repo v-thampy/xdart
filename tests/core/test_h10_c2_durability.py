@@ -1092,7 +1092,7 @@ def test_g15_declared_ledger_construction_sites_and_one_cadence_definition():
     assert [(rel, where) for rel, where, _line in sites] == [
         ("xdart/gui/tabs/scattering/adapters/dynamic_output.py",
          "_activate_owned"),
-        ("xrd_tools/reduction/reintegrate.py", "run"),
+        ("xrd_tools/reduction/reintegrate_successor.py", "execute_candidate"),
         ("xrd_tools/session/scan_session.py", "__init__"),
     ], f"exactly the declared ledger composition sites; got {sites}"
 

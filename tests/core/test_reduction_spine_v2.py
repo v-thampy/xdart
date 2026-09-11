@@ -102,7 +102,7 @@ def test_nexus_sink_preserves_non_numeric_scan_metadata(
         "integrate_1d",
         lambda image, ai, **kwargs: _r1d(float(np.sum(image))),
     )
-    path = tmp_path / "mixed_metadata.nxs"
+    path = tmp_path / "mixed_metadata.nexus"
     scan = Scan(
         "mixed",
         [

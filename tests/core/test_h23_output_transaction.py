@@ -3725,6 +3725,7 @@ def test_kernel_is_qt_free_and_has_only_headless_transaction_mounts() -> None:
         "xdart/gui/tabs/scattering/adapters/run_executor.py",
         "xdart/gui/tabs/scattering/browse_1d_hydration.py",
         "xdart/gui/tabs/scattering/browse_1d_projection.py",
+        "xdart/gui/tabs/scattering/browse_slice_hydration.py",
         "xdart/gui/tabs/scattering/browse_values.py",
         "xdart/gui/tabs/scattering/context_controller.py",
         "xdart/gui/tabs/scattering/display_values.py",

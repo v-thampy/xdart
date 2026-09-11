@@ -152,13 +152,13 @@ def test_nexus_sink_detaches_caller_provenance_before_output(tmp_path, monkeypat
 @pytest.mark.parametrize(
     "provenance",
     [
-        {"schema_version": 1, "generation": 0, "fingerprint": "valid"},
-        {"schema_version": 1, "generation": True, "fingerprint": "valid"},
-        {"schema_version": 1, "generation": 1, "fingerprint": ""},
-        {"generation": 1, "fingerprint": "valid"},
+        {"value": float("nan")},
+        {"value": float("inf")},
+        {1: "non-string key"},
+        {"value": object()},
     ],
 )
-def test_nexus_sink_rejects_malformed_identity_before_output_creation(
+def test_nexus_sink_rejects_non_json_values_before_output_creation(
     tmp_path,
     monkeypatch,
     provenance,
@@ -187,7 +187,9 @@ def test_nexus_sink_rejects_malformed_identity_before_output_creation(
             ),
         )
 
-    with pytest.raises(ValueError):
+    # FrozenRunConfiguration owns run identity. The headless sink accepts a
+    # detached provenance value tree and must reject values it cannot serialize.
+    with pytest.raises((TypeError, ValueError)):
         construct_or_begin()
 
     assert opened == []

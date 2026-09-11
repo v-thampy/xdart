@@ -8,6 +8,7 @@ import h5py
 import numpy as np
 import pytest
 
+from tests.core.v2_fixture_factory import current_entry
 from xrd_tools.core import FrameRecord, FrameView, axis_from_unit
 from xrd_tools.io import (
     Frame1DModeRows,
@@ -70,27 +71,24 @@ def _one_d_file(path: Path, *, alias_modes: bool = False) -> None:
             )
         records.append(record)
     with h5py.File(path, "w") as handle:
-        write_frame_records(handle.create_group("entry"), records)
+        write_frame_records(current_entry(handle), records)
         if alias_modes:
             parent = handle["entry/integrated_1d"]
             child = parent[mode_subgroup_name("q_oop")]
-            for name in ("axis_1", "intensity", "sigma"):
+            for name in ("axis_1",):
                 del child[name]
                 child[name] = parent[name]
 
 
 def _tiny_one_d_file(path: Path, *, points: int) -> None:
+    records = [FrameRecord.from_view(FrameView(
+        label=label,
+        axis_1d=axis_from_unit("q_A^-1", np.arange(points, dtype=np.float32)),
+        intensity_1d=np.zeros(points, dtype=np.float32),
+        sigma_1d=np.ones(points, dtype=np.float32),
+    )) for label in (2, 5)]
     with h5py.File(path, "w") as handle:
-        group = handle.create_group("entry").create_group("integrated_1d")
-        q = group.create_dataset("axis_1", data=np.arange(points, dtype=np.float32))
-        q.attrs["units"] = "q_A^-1"
-        group.create_dataset(
-            "intensity", data=np.zeros((2, points), dtype=np.float32),
-        )
-        group.create_dataset(
-            "sigma", data=np.ones((2, points), dtype=np.float32),
-        )
-        group.create_dataset("frame_index", data=np.asarray([2, 5], np.int64))
+        write_frame_records(current_entry(handle), records)
 
 
 def _cache_identity(
@@ -109,7 +107,7 @@ def _cache_identity(
 def test_read_1d_rows_projects_sparse_modes_axes_sigma_and_catalog_descriptors(
     tmp_path, monkeypatch,
 ) -> None:
-    path = tmp_path / "rows.nxs"
+    path = tmp_path / "rows.nexus"
     _one_d_file(path)
     projections: list[tuple[int, int, int, int]] = []
     real_projection = module._validate_1d_result_projection
@@ -189,7 +187,7 @@ def test_read_1d_rows_projects_sparse_modes_axes_sigma_and_catalog_descriptors(
 def test_read_1d_rows_uses_one_lean_bundle_and_no_unrelated_payloads(
     tmp_path, monkeypatch,
 ) -> None:
-    path = tmp_path / "lean.nxs"
+    path = tmp_path / "lean.nexus"
     _one_d_file(path)
     forbidden: list[str] = []
     read_paths: list[str] = []
@@ -234,8 +232,8 @@ def test_read_1d_rows_uses_one_lean_bundle_and_no_unrelated_payloads(
     assert all(not name.endswith("/axis_1") for name in read_paths)
 
 
-def test_read_1d_rows_preserves_hardlinked_axis_and_row_identity(tmp_path) -> None:
-    path = tmp_path / "aliases.nxs"
+def test_read_1d_rows_preserves_hardlinked_axis_with_independent_rows(tmp_path) -> None:
+    path = tmp_path / "aliases.nexus"
     _one_d_file(path, alias_modes=True)
     with FrameViewReader(path, resolve_source=False) as reader:
         result = reader.read_1d_rows((2, 5, 9))
@@ -245,24 +243,38 @@ def test_read_1d_rows_preserves_hardlinked_axis_and_row_identity(tmp_path) -> No
     assert primary is not None and secondary is not None
     assert primary.axis.values is secondary.axis.values
     assert all(
-        left is right
+        left is not right and np.array_equal(left, right)
         for left, right in zip(
             primary.intensity_rows, secondary.intensity_rows, strict=True,
         )
     )
     assert primary.sigma_rows is not None and secondary.sigma_rows is not None
     assert all(
-        left is right
+        left is not right and np.array_equal(left, right)
         for left, right in zip(
             primary.sigma_rows, secondary.sigma_rows, strict=True,
         )
     )
 
 
+@pytest.mark.parametrize("row_name", ("intensity", "sigma"))
+def test_read_1d_rows_refuses_cross_mode_row_aliases(tmp_path, row_name):
+    path = tmp_path / "aliased-rows.nexus"
+    _one_d_file(path, alias_modes=True)
+    with h5py.File(path, "r+") as handle:
+        parent = handle["entry/integrated_1d"]
+        child = parent[mode_subgroup_name("q_oop")]
+        del child[row_name]
+        child[row_name] = parent[row_name]
+    with pytest.raises(ValueError, match="not a current xdart"):
+        with FrameViewReader(path, resolve_source=False):
+            pytest.fail("cross-mode row alias was admitted")
+
+
 def test_read_1d_rows_cancellation_rolls_back_exactly_and_retries(
     tmp_path, monkeypatch,
 ) -> None:
-    path = tmp_path / "cancel.nxs"
+    path = tmp_path / "cancel.nexus"
     _one_d_file(path)
     reads = 0
     cancelling = True
@@ -293,7 +305,7 @@ def test_read_1d_rows_cancellation_rolls_back_exactly_and_retries(
 def test_read_1d_rows_preflight_cancellation_has_zero_rows_and_retries(
     tmp_path, monkeypatch,
 ) -> None:
-    path = tmp_path / "preflight_cancel.nxs"
+    path = tmp_path / "preflight_cancel.nexus"
     _one_d_file(path)
     callbacks = 0
     row_reads = 0
@@ -332,7 +344,7 @@ def test_read_1d_rows_preflight_cancellation_has_zero_rows_and_retries(
 def test_live_1d_preflight_blocks_close_before_hdf_or_row_mutation(
     tmp_path, monkeypatch,
 ) -> None:
-    path = tmp_path / "preflight_close.nxs"
+    path = tmp_path / "preflight_close.nexus"
     _one_d_file(path)
     reader = FrameViewReader(path, resolve_source=False).__enter__()
     h5 = reader._h5
@@ -395,7 +407,7 @@ def test_live_1d_preflight_blocks_close_before_hdf_or_row_mutation(
 
 
 def test_read_1d_rows_callback_is_lock_free_and_reentry_refuses(tmp_path) -> None:
-    path = tmp_path / "callback.nxs"
+    path = tmp_path / "callback.nexus"
     _one_d_file(path)
     observations: list[tuple[bool, bool]] = []
     nested: list[str] = []
@@ -487,7 +499,7 @@ def test_frame_1d_rows_freezes_direct_arrays_and_refuses_invalid_selection(
             "scan.nxs", "entry", (FrameScalarRow(1, modes_1d=("q",)),),
         )
 
-    path = tmp_path / "partial.nxs"
+    path = tmp_path / "partial.nexus"
     _one_d_file(path)
     with FrameViewReader(path, target_frame=2) as reader:
         with pytest.raises(ValueError, match="full-inventory reader"):
@@ -498,11 +510,11 @@ def test_frame_1d_rows_freezes_direct_arrays_and_refuses_invalid_selection(
                 reader.read_1d_rows(bad)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("points", [0, 1])
+@pytest.mark.parametrize("points", [1, 2])
 def test_1d_projection_refuses_tiny_excess_before_rows_or_cache_mutation(
     tmp_path, monkeypatch, points,
 ) -> None:
-    path = tmp_path / f"tiny_{points}.nxs"
+    path = tmp_path / f"tiny_{points}.nexus"
     _tiny_one_d_file(path, points=points)
     row_accesses: list[tuple[str, str]] = []
     real_getitem = h5py.Dataset.__getitem__

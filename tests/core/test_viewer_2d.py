@@ -69,30 +69,18 @@ def _processed_thumbnail(handle, label, value, *, vmin, vmax, mask=None):
 
 
 def _write_current_result(entry, labels):
-    from xrd_tools.io.schema import (
-        PROCESSED_SCHEMA_NAME,
-        PROCESSED_SCHEMA_VERSION,
-        SCHEMA_NAME_ATTR,
-        SCHEMA_VERSION_ATTR,
-    )
+    from tests.core.v2_fixture_factory import current_entry
+    from xrd_tools.core import IntegrationResult1D
+    from xrd_tools.io.nexus import write_integrated_stack
 
-    entry.attrs["NX_class"] = "NXentry"
-    entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
-    entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+    current_entry(entry.file, entry=entry.name)
     labels = tuple(int(label) for label in labels)
-    result = entry.create_group("integrated_1d")
-    result.attrs["NX_class"] = "NXdata"
-    result.attrs["signal"] = "intensity"
-    result.attrs["axes"] = ("frame_index", "q")
-    result.create_dataset(
-        "frame_index", data=np.asarray(labels, dtype=np.int64),
-        chunks=(min(len(labels), 1024),), maxshape=(None,),
+    write_integrated_stack(
+        entry, frame_indices=labels,
+        results_1d=[IntegrationResult1D(
+            radial=np.array([0.0]), intensity=np.array([0.0]), unit="q_A^-1",
+        ) for _ in labels],
     )
-    result.create_dataset(
-        "intensity", data=np.zeros((len(labels), 1), dtype=np.float32),
-        chunks=(min(len(labels), 64), 1), maxshape=(None, 1),
-    )
-    result.create_dataset("q", data=np.zeros(1, dtype=np.float32))
 
 
 def _finalize_processed(handle):
@@ -1755,7 +1743,7 @@ def test_exported_values_reject_local_malformed_values(tmp_path):
     np.save(path, np.arange(6).reshape(2, 3))
     catalog = api.catalog_viewer_2d(path)
     frame = api.read_viewer_2d_frame(catalog, 0)
-    ledger = api.viewer_2d_memory_ledger(2, 3, ram_bytes=10**12)
+    ledger = api.viewer_2d_memory_ledger(2, 3)
 
     _raises(TypeError, api.Viewer2DReadError, "format_invalid", "not an exact refusal code")
     _raises(TypeError, replace, catalog, frame_labels=(0, 0))
@@ -2002,7 +1990,8 @@ def test_primary_same_size_aba_and_dependency_change_refuse_without_publication(
 
 
 def test_memory_ledger_uses_raw_only_r7_arithmetic_and_fails_closed(monkeypatch):
-    ledger = api.viewer_2d_memory_ledger(2, 3, encoded_retained=17, ram_bytes=10**12)
+    monkeypatch.setattr(api, "_physical_ram_bytes", lambda: 10**12)
+    ledger = api.viewer_2d_memory_ledger(2, 3, encoded_retained=17)
     assert ledger.canonical_bytes == 48
     assert ledger.reader_peak == max(3 * 48, 17 + 4 * 48)
     assert ledger.renderer_slack_raw == 5 * 48 // 2
