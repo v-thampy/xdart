@@ -43,6 +43,12 @@ _SOLID_ANGLE_SHA256_EQUIVALENTS: Mapping[str, frozenset[str]] = {
     "a8d6453bc56b99a0c3151b54999adff4684de5648b8f23c8deb7aa0799937034": frozenset({
         # macOS arm64 (reference host, == asset corrections.solid_angle_sha256)
         "a8d6453bc56b99a0c3151b54999adff4684de5648b8f23c8deb7aa0799937034",
+        # ubuntu-24.04 x86_64, pip numpy 2.5.1 / pyFAI 2026.5.0
+        # (PR #1 run 34651556456: core, application, numerical ubuntu)
+        "0faf8164da6b2256b8f5f7b06d10fa7e182aae3fb9069da62ef3741fdc415f3d",
+        # macos-15-intel x86_64, pip numpy 2.5.1 / pyFAI 2026.5.0
+        # (PR #1 run 34651556456: numerical macos-15-intel)
+        "3862680896d693c8ae021bf1c15447bd9cca4cc96968a111f88a009c2f89f2b8",
     }),
 }
 
