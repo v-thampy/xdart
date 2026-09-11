@@ -295,9 +295,8 @@ def test_canonical_resource_refuses_noncanonical_package_root(
 
 
 def test_exact_historical_xu_json_requires_reviewed_migration():
-    legacy = Path(
-        "/Users/vthampy/repos/example_notebooks/Stitching/"
-        "xu_geometry_del_nu.json"
+    legacy = (
+        Path(__file__).parent / "fixtures" / "xu_geometry_del_nu_legacy.json"
     ).read_bytes()
     assert hashlib.sha256(legacy).hexdigest() == (
         "9bb13babeb60475128dd9d14c833cdd8cd85af7510424c1b860b87231d8c0c25"

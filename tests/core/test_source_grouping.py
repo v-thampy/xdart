@@ -170,12 +170,7 @@ def test_discover_scans_nexus_and_images(tmp_path):
 def test_discover_scans_partitions_current_raw_and_historical_processed(
     tmp_path,
 ):
-    from xrd_tools.io.schema import (
-        PROCESSED_SCHEMA_NAME,
-        PROCESSED_SCHEMA_VERSION,
-        SCHEMA_NAME_ATTR,
-        SCHEMA_VERSION_ATTR,
-    )
+    from tests.core._processed_fixture import write_recognized_result
 
     def raw(path):
         with h5py.File(path, "w") as handle:
@@ -190,24 +185,7 @@ def test_discover_scans_partitions_current_raw_and_historical_processed(
     (tmp_path / "landing.h5").write_bytes(b"")
 
     current = tmp_path / "current.nexus"
-    with h5py.File(current, "w") as handle:
-        entry = handle.create_group("entry")
-        entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
-        entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
-        result = entry.create_group("integrated_2d")
-        result.attrs["NX_class"] = "NXdata"
-        result.attrs["signal"] = "intensity"
-        result.attrs["axes"] = ("frame_index", "chi", "q")
-        result.create_dataset(
-            "frame_index", data=np.arange(2, dtype=np.int64),
-            chunks=(2,), maxshape=(None,),
-        )
-        result.create_dataset(
-            "intensity", data=np.ones((2, 3, 4), dtype=np.float32),
-            chunks=(1, 3, 4), maxshape=(None, 3, 4),
-        )
-        result.create_dataset("chi", data=np.arange(3, dtype=np.float32))
-        result.create_dataset("q", data=np.arange(4, dtype=np.float32))
+    write_recognized_result(current, labels=(0, 1))
     shutil.copyfile(current, tmp_path / "historical.nxs")
     shutil.copyfile(current, tmp_path / "historical.h5")
     shutil.copyfile(current, tmp_path / "historical.hdf5")
