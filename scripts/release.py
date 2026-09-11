@@ -20,17 +20,17 @@ Checks (each prints PASS/FAIL; any FAIL exits 1):
   schema     the persisted-format pins + byte-compat gate test files run
              green (tests/core/test_schema_as_code.py,
              tests/core/test_v2_record_compat.py).
-  gui        offscreen smoke of the run-end reload/select-last path
-             (tests/xdart/test_batch_finish_select_last.py); skipped where
+  gui        offscreen smoke of XYE run-end selection and NeXus viewer adoption
+             (tests/xdart/scattering/test_xye_run_completion.py); skipped where
              Qt is absent.  NOTE: this is a smoke, not the full GUI suite —
              the complete tests/xdart offscreen run is the CI gate (pr.yml).
   deps       pyFAI's audited project, Pixi, conda-recipe, and uv pins agree.
   promotion  authenticate the finite private corpus, run the exact real-data
              science selection, and fail on any skip or collection drift.
 
-There is intentionally NO publish subcommand: the maintainer uploads
-manually (see .github/workflows/release.yml, which runs `check` before
-building the artifacts).
+There is intentionally NO publish subcommand: the maintainer pushes a release
+tag to trigger .github/workflows/release.yml, which checks and builds before
+publishing the artifacts.
 """
 from __future__ import annotations
 
@@ -139,7 +139,10 @@ def check_gui_smoke() -> bool:
     env = {**os.environ, "QT_QPA_PLATFORM": "offscreen"}
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-         "tests/xdart/test_batch_finish_select_last.py"],
+         "tests/xdart/scattering/test_xye_run_completion.py::"
+         "test_completed_xye_run_opens_terminal_file_and_output_folder[hdf-True-2th_deg-itth]",
+         "tests/xdart/scattering/test_xye_run_completion.py::"
+         "test_completed_run_selected_artifact_enters_2d_viewer[Int 1D]"],
         cwd=ROOT, env=env,
     )
     return (_ok if proc.returncode == 0 else _fail)("GUI run-end smoke (offscreen)")

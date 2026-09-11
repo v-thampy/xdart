@@ -120,9 +120,8 @@ filterwarnings = [
 # dev build and the released global stop shadowing each other (which is what
 # made `which xdart` resolve to the global binary during development).
 #
-# The GUI/analysis stack resolves from the project's own [gui]+[dev] extras
-# (PyPI wheels); if you'd rather have conda-forge binaries for the heavy libs
-# (pyFAI, PySide6, silx, h5py), add them under [tool.pixi.dependencies].
+# Native libraries below come from conda-forge. The editable project and the
+# remaining GUI, development, and notebook requirements resolve through PyPI.
 # ---------------------------------------------------------------------------
 [tool.pixi.workspace]
 channels = ["conda-forge"]
@@ -140,6 +139,11 @@ numpy = "*"
 h5py = "*"
 hdf5plugin = "*"
 fabio = "*"
+# Keep the native HDF5/compression stack explicit, matching the installers.
+hdf5 = "*"
+blosc = "*"
+c-blosc2 = "*"
+lz4-c = "*"
 pyfai = ">=2026.5,<2026.6"
 silx = "*"
 # The Qt binding must come from the SAME provenance as the natives above: the
