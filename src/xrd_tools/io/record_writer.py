@@ -2189,7 +2189,7 @@ class NexusRecordWriter:
         self._since_flush = 0
         self._vector = {name: 0 for name in _VECTOR_FIELDS}
         self._pending_owner: str | None = None
-        self._finish_step = 0
+        self._finish_step = -1
         self._finalization = WriterFinalization()
         self._fresh = False
         self._dirty_modes: dict[tuple[str, int], _ExpectedModeRow] = {}
@@ -6214,6 +6214,11 @@ class NexusRecordWriter:
     def append_decision(self) -> AppendDecision | None:
         return self._append_decision
 
+    @property
+    def finalization_started(self) -> bool:
+        """Whether finish has taken custody of the frozen terminal steps."""
+        return self._finish_step >= 0
+
     def _replace_target(self) -> None:
         if self._active_path == self.target:
             return
@@ -6247,6 +6252,9 @@ class NexusRecordWriter:
             self._finish_step = 0
         elif finalization is not None and finalization != self._finalization:
             raise WriterStateError("retry must use the frozen finalization values")
+        # PARTIAL can also come from an ordinary flush. Its first finish still
+        # starts at the first terminal step; later retries retain their cursor.
+        self._finish_step = max(0, self._finish_step)
         def checkpoint(*, publish_receipts=True):
             counts = self._finalization.average_finite_counts
             verified = (

@@ -1463,7 +1463,11 @@ class ScanSession:
 
         if not failed and self._dynamic_finish_seal is None:
             try:
-                self._event_sink.flush(force=True)
+                if not (
+                    self._dynamic_nexus_sink is not None
+                    and self._dynamic_nexus_sink.finalization_started
+                ):
+                    self._event_sink.flush(force=True)
                 if _cancel_requested(self._session.cancel_token) and (self._dynamic_nexus_sink is None or self._dynamic_nexus_sink._transaction is None or not self._dynamic_nexus_sink._transaction.snapshot().writer_succeeded): stopped = True; result = replace(result, cancelled=True); self._dynamic_frozen_result = result
                 # Completed arithmetic can still await the writer's terminal
                 # readback and receipts. Reject unfinished attempts here, but
@@ -1657,7 +1661,12 @@ class ScanSession:
                 raise_on_failure=raise_on_failure,
             )
 
-        if not self._dynamic_graph_terminal_settled:
+        # A failed terminal step retains its writer cursor. Retry finish itself
+        # instead of re-entering the active-row flush after finalization began.
+        if not self._dynamic_graph_terminal_settled and not (
+            self._dynamic_nexus_sink is not None
+            and self._dynamic_nexus_sink.finalization_started
+        ):
             self._event_sink.flush(force=True)
         value = self._settle_dynamic_graph(result, failed=False)
         if (
