@@ -302,7 +302,8 @@ def test_browse_release_is_idempotent_and_drops_what_it_retained():
     assert browse.released is True
     assert browse.loaded is False
     assert browse.publication_store.cleared == 1
-    assert browse.frames == {} and browse.frame_ids == (1,)
+    assert browse.frames == {} and browse.frame_ids == ()
+    assert browse.frame_ids is browse.loaded_labels
     assert browse.viewer_rows_1d == {}
     assert browse.scalar_catalog is None
     # A released context must still REJECT a late completion by token rather
