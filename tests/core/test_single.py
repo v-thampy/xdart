@@ -9,6 +9,30 @@ from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.integrate.single import integrate_1d, integrate_2d, integrate_scan
 
 
+def test_readonly_mask_detaches_for_pyfai_without_changing_exclusions():
+    from pyFAI.detectors import Detector
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+    from xrd_tools.integrate.detector_mask import mask_with_detector
+
+    shape = (32, 32)
+    ai = AzimuthalIntegrator(
+        dist=0.1, wavelength=1e-10,
+        detector=Detector(pixel1=1e-4, pixel2=1e-4, max_shape=shape),
+    )
+    mask = np.zeros(shape, dtype=bool)
+    mask[8:16, 8:16] = True
+    mask.setflags(write=False)
+    prepared = mask_with_detector(ai, mask)
+    assert prepared.flags.writeable
+    assert not np.shares_memory(prepared, mask)
+    np.testing.assert_array_equal(prepared, mask)
+    image = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    actual = integrate_1d(image, ai, npt=16, mask=mask, method="no")
+    expected = integrate_1d(image, ai, npt=16, mask=mask.copy(), method="no")
+    np.testing.assert_array_equal(actual.intensity, expected.intensity)
+    assert not mask.flags.writeable
+
+
 def test_private_bound_detector_mask_seam_preserves_public_default(monkeypatch):
     """Only an admitted private AI may bypass the protective mask union."""
     from types import SimpleNamespace

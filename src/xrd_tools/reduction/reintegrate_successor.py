@@ -189,6 +189,7 @@ def _terminal_mapping(value: StreamTerminal | None) -> dict[str, object] | None:
 def _target_snapshot(value: FiniteFileSnapshot) -> TargetSnapshot:
     return TargetSnapshot(
         True, value.size, value.mtime_ns, value.device, value.inode, value.digest,
+        ctime_ns=value.ctime_ns,
     )
 
 
@@ -1220,7 +1221,7 @@ class ReintegrateSuccessorPlan:
             terminal = StreamTerminal(**terminal_value)
         target_snapshot = _exact_keys(
             qualification["expected_target_snapshot"],
-            {"exists", "size", "mtime_ns", "device", "inode", "digest"},
+            {field.name for field in fields(TargetSnapshot)},
             "qualification snapshot",
         )
         if TargetSnapshot(**target_snapshot) != _target_snapshot(snapshot):
