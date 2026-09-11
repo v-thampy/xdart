@@ -42,31 +42,18 @@ def _entry_file(tmp_path, version):
     return p
 
 
-def test_newer_schema_warns_in_all_readers(tmp_path):
-    p = _entry_file(tmp_path, PROCESSED_SCHEMA_VERSION + 1)
-    with pytest.warns(RuntimeWarning, match="newer"):
-        read_scan_metadata(p)
-    with pytest.warns(RuntimeWarning, match="newer"):
-        read_scan(p)
-    with pytest.warns(RuntimeWarning, match="newer"):
-        with FrameViewReader(p):
-            pass
-
-
-def test_newer_schema_warns_in_convenience_readers(tmp_path):
-    """6b: get_frames/get_1d/get_2d/get_thumbnail funnel through the C1
-    check too (file built with the real writers, then stamped newer)."""
+def _processed_file(tmp_path):
+    """Build readable current content before varying schema admission."""
     from xrd_tools.core.containers import IntegrationResult2D
-    from xrd_tools.io import (
-        get_1d, get_2d, get_frames, get_thumbnail, write_integrated_stack,
-    )
+    from xrd_tools.io import write_integrated_stack
     from xrd_tools.io.nexus_record import (
         ensure_frames_container, write_frame_record,
     )
+    from tests.core.v2_fixture_factory import current_entry
 
-    p = tmp_path / "newer.nxs"
+    p = tmp_path / "schema.nexus"
     with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
+        e = current_entry(f)
         write_integrated_stack(
             e, frame_indices=[0],
             results_1d=[IntegrationResult1D(
@@ -79,22 +66,62 @@ def test_newer_schema_warns_in_convenience_readers(tmp_path):
         )
         write_frame_record(ensure_frames_container(e), "frame_0000",
                            thumbnail=np.ones((4, 4)))
-        e.attrs["ssrl_schema_version"] = PROCESSED_SCHEMA_VERSION + 1
+    return p
 
-    for reader in (lambda: get_frames(p), lambda: get_1d(p, 0),
+
+@pytest.mark.parametrize("version", [None, 1, PROCESSED_SCHEMA_VERSION + 1])
+def test_unsupported_schema_is_refused_by_all_readers(tmp_path, version):
+    """Current entry guards refuse missing, retired v1 and future schemas.
+
+    The warning utility does not override admission. Qualified v2 files have
+    separate read-only coverage in test_neutral_axis_contract.
+    """
+    from xrd_tools.io import get_1d, get_2d, get_frames, get_thumbnail
+
+    p = _processed_file(tmp_path)
+    with h5py.File(p, "r+") as f:
+        if version is None:
+            del f["entry"].attrs["ssrl_schema_version"]
+        else:
+            f["entry"].attrs["ssrl_schema_version"] = version
+
+    for reader in (lambda: read_scan_metadata(p), lambda: read_scan(p),
+                   lambda: get_frames(p), lambda: get_1d(p, 0),
                    lambda: get_2d(p, 0), lambda: get_thumbnail(p, 0)):
-        with pytest.warns(RuntimeWarning, match="newer"):
+        with pytest.raises(ValueError, match="not a current"):
             reader()
+    with pytest.raises(ValueError, match="not a current"):
+        with FrameViewReader(p):
+            pass
+
+
+def test_current_schema_readers_succeed_without_warnings(tmp_path):
+    from xrd_tools.io import get_1d, get_2d, get_frames, get_thumbnail
+
+    p = _processed_file(tmp_path)
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error", RuntimeWarning)
+        np.testing.assert_array_equal(read_scan_metadata(p).coords["frame"], [0])
+        scan = read_scan(p)
+        np.testing.assert_array_equal(scan["intensity_1d"], np.ones((1, 5)))
+        np.testing.assert_array_equal(scan["intensity_2d"], np.ones((1, 3, 4)))
+        with FrameViewReader(p) as reader:
+            view = reader.read(0)
+            np.testing.assert_array_equal(view.intensity_1d, np.ones(5))
+            np.testing.assert_array_equal(view.intensity_2d, np.ones((3, 4)))
+        np.testing.assert_array_equal(get_frames(p), [0])
+        np.testing.assert_array_equal(get_1d(p, 0).intensity, np.ones(5))
+        np.testing.assert_array_equal(get_2d(p, 0).intensity, np.ones((3, 4)))
+        assert get_thumbnail(p, 0).shape == (4, 4)
 
 
 @pytest.mark.parametrize("version", [None, PROCESSED_SCHEMA_VERSION, 1])
-def test_current_or_older_schema_is_silent(tmp_path, version):
+def test_current_or_older_schema_warning_utility_is_silent(tmp_path, version):
     p = _entry_file(tmp_path, version)
-    with _warnings.catch_warnings():
-        _warnings.simplefilter("error", RuntimeWarning)
-        read_scan_metadata(p)
-        with FrameViewReader(p):
-            pass
+    with h5py.File(p, "r") as f:
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error", RuntimeWarning)
+            warn_if_newer_schema(f["entry"], str(p))
 
 
 def test_schema_version_accepts_only_bounded_scalar_hdf5_integers(

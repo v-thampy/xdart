@@ -131,18 +131,25 @@ def test_nested_subgroup_nxdata_contract(tmp_path):
     p = str(tmp_path / "mm.nexus")
     _write(p, _multimode_records(2))
     with h5py.File(p, "r") as f:
-        for grp_path in (
-            "entry/integrated_1d", "entry/integrated_1d/q_oop",
-            "entry/integrated_2d", "entry/integrated_2d/q_chi",
+        assert f["entry"].attrs[SCHEMA_NAME_ATTR] == "xrd_tools.processed_scan"
+        assert f["entry"].attrs[SCHEMA_VERSION_ATTR] == 3
+        for grp_path, axes in (
+            ("entry/integrated_1d", ("frame_index", "axis_1")),
+            ("entry/integrated_1d/q_oop", ("frame_index", "axis_1")),
+            ("entry/integrated_2d", ("frame_index", "axis_2", "axis_1")),
+            ("entry/integrated_2d/q_chi", ("frame_index", "axis_2", "axis_1")),
         ):
             g = f[grp_path]
             assert g.attrs["NX_class"] == "NXdata", grp_path
             assert g.attrs["signal"] == "intensity", grp_path
-            assert "axes" in g.attrs, grp_path
-            assert "intensity" in g and "frame_index" in g and "q" in g, grp_path
+            assert tuple(g.attrs["axes"]) == axes, grp_path
+            assert {"intensity", *axes}.issubset(g), grp_path
+            assert "q" not in g and "chi" not in g, grp_path
         # distinct on-disk shapes per mode (the wrong-subgroup tripwire)
         assert f["entry/integrated_1d/intensity"].shape[1] == 5
         assert f["entry/integrated_1d/q_oop/intensity"].shape[1] == 7
+        assert f["entry/integrated_2d/intensity"].shape[1:] == (3, 5)
+        assert f["entry/integrated_2d/q_chi/intensity"].shape[1:] == (4, 5)
 
 
 def test_frozen_validators_accept_each_group_standalone(tmp_path):
