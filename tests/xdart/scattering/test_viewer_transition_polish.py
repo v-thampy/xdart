@@ -112,6 +112,50 @@ def test_new_hdf_file_has_no_teardown_or_zero_one_range(viewer_2d, monkeypatch, 
         _wait(page, app, lambda: not page._context_controller.viewer_2d_loading)
 
 
+def test_pending_snapshot_follows_late_layout(viewer_2d, monkeypatch):
+    """A slow host can still be settling the 2D Viewer rows when the next
+    file's read begins; the previous-view raster must follow the canvas
+    instead of keeping the rectangle it was first laid out on."""
+    import xdart.gui.tabs.scattering.hydration_transport as transport
+
+    page, app, paths, _values = viewer_2d
+    view = page._shell.scientific
+    entered, release = Event(), Event()
+    read = transport.read_viewer_2d_frame
+
+    def gated_read(*args, **kwargs):
+        entered.set()
+        assert release.wait(6)
+        return read(*args, **kwargs)
+
+    monkeypatch.setattr(transport, "read_viewer_2d_frame", gated_read)
+    bottom = view.vertical_splitter.widget(1)
+    canvas = view.raw.canvas
+
+    def covers_canvas():
+        return view._viewer_loading_overlay.geometry() == QtCore.QRect(
+            canvas.mapTo(view, QtCore.QPoint()), canvas.size())
+
+    try:
+        page._open_viewer_2d_path(str(paths[1]))
+        _wait(page, app, entered.is_set)
+        assert view.viewer_loading_snapshot_visible and covers_canvas()
+        before = canvas.geometry()
+        # Re-lay the canvas row without resizing the view: the bottom row
+        # returning squeezes the canvas, hiding it again restores it.
+        bottom.setVisible(True)
+        app.processEvents()
+        assert canvas.geometry() != before
+        assert covers_canvas()
+        bottom.setVisible(False)
+        app.processEvents()
+        assert canvas.geometry() == before
+        assert covers_canvas()
+    finally:
+        release.set()
+        _wait(page, app, lambda: not page._context_controller.viewer_2d_loading)
+
+
 def test_new_xye_batch_retires_curves_without_hiding_panel(viewer_1d, monkeypatch):
     import xdart.gui.tabs.scattering.hydration_transport as transport
 

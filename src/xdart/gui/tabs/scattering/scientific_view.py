@@ -422,6 +422,7 @@ class ScientificView(QtWidgets.QFrame):
         layout.addLayout(self.footer)
         self._viewer_loading_mode: str | None = None
         self._viewer_loading_target: QtWidgets.QWidget | None = None
+        self._viewer_loading_watched: tuple[QtWidgets.QWidget, ...] = ()
         self._viewer_loading_overlay = QtWidgets.QFrame(self)
         self._viewer_loading_overlay.setObjectName("e6ViewerLoadingPreviousView")
         self._viewer_loading_overlay.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
@@ -1174,15 +1175,33 @@ class ScientificView(QtWidgets.QFrame):
             )
         self._viewer_loading_mode = mode
         self._viewer_loading_target = target
+        self._watch_viewer_loading_geometry(target)
         self._viewer_loading_pixmap.setPixmap(pixmap)
         self._viewer_loading_overlay.show()
         self._layout_viewer_loading_snapshot()
+
+    def _watch_viewer_loading_geometry(self, target: QtWidgets.QWidget) -> None:
+        # The overlay covers the target in this view's coordinates, but the
+        # target's row can still be re-laid while the load is pending (the
+        # previous mode's rows collapsing, a splitter settling on a slow
+        # host).  Follow every geometry change on the target and on each
+        # ancestor below this view.  Filters stay installed: some of these
+        # widgets already carry the share-axis hook, and removing the filter
+        # would drop that too.
+        chain = []
+        widget: QtWidgets.QWidget | None = target
+        while widget is not None and widget is not self:
+            widget.installEventFilter(self)
+            chain.append(widget)
+            widget = widget.parentWidget()
+        self._viewer_loading_watched = tuple(chain)
 
     def drop_viewer_loading_snapshot(self) -> None:
         """Release the transient raster without touching scientific payloads."""
 
         self._viewer_loading_mode = None
         self._viewer_loading_target = None
+        self._viewer_loading_watched = ()
         self._viewer_loading_pixmap.clear()
         self._viewer_loading_overlay.hide()
 
@@ -3006,6 +3025,16 @@ class ScientificView(QtWidgets.QFrame):
                 QtCore.QEvent.Type.ContextMenu,
             }:
                 return True
+        if (
+            watched in self._viewer_loading_watched
+            and event.type() in {
+                QtCore.QEvent.Type.Move,
+                QtCore.QEvent.Type.Resize,
+                QtCore.QEvent.Type.Show,
+                QtCore.QEvent.Type.Hide,
+            }
+        ):
+            self._layout_viewer_loading_snapshot()
         if (
             watched
             in {
