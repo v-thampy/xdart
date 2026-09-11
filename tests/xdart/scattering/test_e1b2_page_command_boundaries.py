@@ -1312,7 +1312,7 @@ def test_run_click_preserves_outgoing_paint_until_a_frame_arrives(
     monkeypatch.setattr(
         page,
         "_refresh_shell",
-        lambda *, preserve_display=False: refreshes.append(
+        lambda *, preserve_display=False, **_options: refreshes.append(
             preserve_display
         ),
     )
@@ -1522,7 +1522,7 @@ def test_post_retirement_start_refusal_preserves_detached_outgoing_paint(
     monkeypatch.setattr(
         page,
         "_refresh_shell",
-        lambda *, preserve_display=False: refreshes.append(
+        lambda *, preserve_display=False, **_options: refreshes.append(
             preserve_display or page._retain_outgoing_display
         ),
     )
