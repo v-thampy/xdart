@@ -351,14 +351,17 @@ class HydrationTransport:
             ):
                 displaced = active.token
                 displaced_ticket = active.ticket
-                active.token = token
                 active.closed = bool(closed)
                 deliveries = []
                 if displaced != token:
+                    active.token = token
                     active.ticket = _HydrationTicket(token)
                     deliveries.append(self._capture_locked(
                         active, displaced, HydrationOutcome.SUPERSEDED,
                         displaced_ticket, clear=False, restore=_EntryState.READING))
+                # An equal token represents the same in-flight presentation.
+                # Keep its identity: _execute checks that exact object before
+                # committing the read already in progress.
                 queued = self._queued
                 if queued is not None:
                     deliveries.append(self._capture_locked(
