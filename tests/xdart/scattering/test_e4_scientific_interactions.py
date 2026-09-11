@@ -53,7 +53,15 @@ def _assert_shared_pixels_align(
             value,
         )
         curve_x = _global_data_x(bottom_widget, bottom_view, value)
-        assert abs(cake_x - curve_x) <= 1
+        # Name both mappings on failure: a platform whose tick labels
+        # re-flow after the range change (Linux fonts) moves one axis.
+        assert abs(cake_x - curve_x) <= 1, (
+            f"value={value} cake_x={cake_x} curve_x={curve_x} "
+            f"cake_span={view._global_xspan(view.cake.canvas.image_win, cake_view)} "
+            f"cake_range={_x_range(cake_view)} "
+            f"curve_span={view._global_xspan(bottom_widget, bottom_view)} "
+            f"curve_range={_x_range(bottom_view)}"
+        )
 
 
 def _dispose(view: ScientificView) -> None:
