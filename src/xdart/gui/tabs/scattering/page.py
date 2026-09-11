@@ -7054,7 +7054,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 and not self._clear_viewer_1d_renderer(close=True)):
             self._notice("1D Viewer cleanup remains pending"); return
         context = self._context_controller.viewer_2d_context
-        if context is not None and not self._clear_viewer_2d_renderer(close=True):
+        if context is not None and not self._clear_viewer_2d_renderer(
+            close=True, preserve_navigation=True,
+        ):
             self._pending_viewer_2d_path = selected
             self._notice("2D Viewer cleanup remains pending")
             self._ensure_timer()
@@ -7082,14 +7084,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._last_scientific_projection = None
         request = self._context_controller.begin_viewer_2d_renderer_clear()
         if request is None:
-            if close:
+            if close and not preserve_navigation:
                 self._shell.scientific.drop_viewer_loading_snapshot()
             cleared = self._context_controller.viewer_2d_frame is None
         else:
             try:
                 receipt = (
                     self._shell.scientific.clear_viewer_2d(request, preserve_navigation=True)
-                    if preserve_navigation and not close
+                    if preserve_navigation
                     else self._shell.scientific.clear_viewer_2d(request)
                 )
             except Exception:

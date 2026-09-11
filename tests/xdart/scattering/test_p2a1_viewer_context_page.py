@@ -512,7 +512,7 @@ def test_real_viewer_chooser_preserves_opaque_identity_and_acquisition_isolation
     controller.viewer_2d_context = SimpleNamespace(original_path=selected)
     page._viewer_2d_file_chooser = forbidden
     def clear_renderer(*, close=False, preserve_navigation=False):
-        assert close is True and preserve_navigation is False
+        assert close is True and preserve_navigation is True
         calls.append("clear")
         return True
     page._clear_viewer_2d_renderer = clear_renderer

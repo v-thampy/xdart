@@ -43,7 +43,7 @@ class _Renderer:
         self.events.append("clear1")
         return _new_viewer_1d_renderer_clear_receipt(request, self.ok1)
 
-    def clear_viewer_2d(self, request):
+    def clear_viewer_2d(self, request, *, preserve_navigation=False):
         self.events.append("clear2")
         return Viewer2DRendererClearReceipt(request, self.ok2)
 

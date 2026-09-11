@@ -38,7 +38,8 @@ def test_return_to_int2d_restores_both_plot_rows(request, fixture_name):
     assert len(sizes) == 2 and min(sizes) > sum(sizes) * 0.25, sizes
 
 
-def test_new_hdf_file_has_no_teardown_or_zero_one_range(viewer_2d, monkeypatch):
+@pytest.mark.parametrize("read_fails", (False, True))
+def test_new_hdf_file_has_no_teardown_or_zero_one_range(viewer_2d, monkeypatch, read_fails):
     import xdart.gui.tabs.scattering.hydration_transport as transport
 
     page, app, paths, values = viewer_2d
@@ -49,6 +50,8 @@ def test_new_hdf_file_has_no_teardown_or_zero_one_range(viewer_2d, monkeypatch):
     def gated_read(*args, **kwargs):
         entered.set()
         assert release.wait(6)
+        if read_fails:
+            raise OSError("test replacement HDF read failure")
         return read(*args, **kwargs)
 
     monkeypatch.setattr(transport, "read_viewer_2d_frame", gated_read)
@@ -87,6 +90,16 @@ def test_new_hdf_file_has_no_teardown_or_zero_one_range(viewer_2d, monkeypatch):
         assert len({snapshot.pixelColor(x, y).rgba()
                     for x in sample_x for y in sample_y}) > 1
         release.set()
+        if read_fails:
+            _wait(page, app, lambda: not page._context_controller.viewer_2d_loading)
+            assert "test replacement HDF read failure" in page._context_controller.viewer_2d_diagnostic
+            assert page._context_controller.viewer_2d_frame is None
+            assert view._viewer_2d_payload is None
+            assert view.raw.image.image is None and view.raw.image.qimage is None
+            assert view.raw.canvas.raw_image.size == 0
+            assert not view.viewer_loading_snapshot_visible
+            assert view.viewer_loading_snapshot_pixels == 0
+            return
         _wait(page, app, lambda: page._context_controller.viewer_2d_frame is not None
               and view._viewer_2d_payload is page._context_controller.viewer_2d_frame.array)
         assert not view.viewer_loading_snapshot_visible
