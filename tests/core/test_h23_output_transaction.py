@@ -2904,29 +2904,24 @@ def test_candidate_reservation_replacement_is_foreign_before_writer(
         _owners_by_role,
         lease,
     ) = _prepared(tmp_path, prior=prior)
-    real_close = api.os.close
+    real_receipt = api._descriptor_receipt
     reservation_identity: list[tuple[int, int]] = []
+    reservation_descriptors: list[int] = []
     writes: list[Path] = []
 
-    def replace_candidate_after_close(descriptor: int) -> None:
-        descriptor_stat = os.fstat(descriptor)
-        real_close(descriptor)
-        if transaction._candidate.exists() and not reservation_identity:
-            path_stat = transaction._candidate.stat()
-            if (path_stat.st_dev, path_stat.st_ino) == (
-                descriptor_stat.st_dev,
-                descriptor_stat.st_ino,
-            ):
-                reservation_identity.append(
-                    (descriptor_stat.st_dev, descriptor_stat.st_ino)
-                )
-                replacement = transaction._candidate.with_name(
-                    transaction._candidate.name + ".foreign"
-                )
-                replacement.write_bytes(foreign)
-                os.replace(replacement, transaction._candidate)
+    def replace_candidate_after_receipt(descriptor: int, path: Path, role: str):
+        receipt = real_receipt(descriptor, path, role)
+        if role == "candidate-reservation":
+            reservation_descriptors.append(descriptor)
+            reservation_identity.append((receipt.identity.device, receipt.identity.inode))
+            replacement = transaction._candidate.with_name(
+                transaction._candidate.name + ".foreign"
+            )
+            replacement.write_bytes(foreign)
+            os.replace(replacement, transaction._candidate)
+        return receipt
 
-    monkeypatch.setattr(api.os, "close", replace_candidate_after_close)
+    monkeypatch.setattr(api, "_descriptor_receipt", replace_candidate_after_receipt)
 
     with pytest.raises(api.OutputTransactionError):
         _execute(
@@ -2944,6 +2939,8 @@ def test_candidate_reservation_replacement_is_foreign_before_writer(
     assert target.read_bytes() == prior
     assert writes == []
     assert transaction.snapshot().phase is not api.TransactionPhase.COMMITTED
+    with pytest.raises(OSError):
+        os.fstat(reservation_descriptors[0])
 
 
 def test_backup_reservation_replacement_refuses_before_target_stage(
@@ -3029,9 +3026,18 @@ def test_writer_namespace_replacement_is_preserved_and_never_published(
         lease,
     ) = _prepared(tmp_path, prior=prior)
     real_link = api._link
+    real_receipt = api._descriptor_receipt
+    reservation_descriptors: list[int] = []
     reserved_identity: list[tuple[int, int]] = []
+    unlinked_reservation_identity: list[tuple[int, int] | None] = []
     publication_links: list[tuple[Path, Path]] = []
     writes: list[Path] = []
+
+    def record_reservation(descriptor: int, path: Path, role: str):
+        receipt = real_receipt(descriptor, path, role)
+        if role == "candidate-reservation":
+            reservation_descriptors.append(descriptor)
+        return receipt
 
     def record_publication_link(source, destination):
         if Path(source) == transaction._candidate and Path(destination) == target:
@@ -3039,12 +3045,20 @@ def test_writer_namespace_replacement_is_preserved_and_never_published(
         return real_link(source, destination)
 
     monkeypatch.setattr(api, "_link", record_publication_link)
+    monkeypatch.setattr(api, "_descriptor_receipt", record_reservation)
 
     def writer(path: Path) -> None:
         writes.append(path)
         reserved = path.stat()
         reserved_identity.append((reserved.st_dev, reserved.st_ino))
         path.unlink()
+        try:
+            held = os.fstat(reservation_descriptors[0])
+        except OSError:
+            unlinked_reservation_identity.append(None)
+        else:
+            assert held.st_nlink == 0
+            unlinked_reservation_identity.append((held.st_dev, held.st_ino))
         path.write_bytes(replacement)
 
     with pytest.raises(api.OutputTransactionError):
@@ -3064,6 +3078,89 @@ def test_writer_namespace_replacement_is_preserved_and_never_published(
     assert target.read_bytes() == prior
     assert publication_links == []
     assert transaction.snapshot().phase is not api.TransactionPhase.COMMITTED
+    assert unlinked_reservation_identity == reserved_identity
+    with pytest.raises(OSError):
+        os.fstat(reservation_descriptors[0])
+
+
+@pytest.mark.parametrize("failure", [None, "receipt", "observation", "writer"])
+def test_candidate_reservation_descriptor_is_closed_after_atomic_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
+) -> None:
+    (
+        api,
+        target,
+        _coordinator,
+        transaction,
+        transaction_owner,
+        target_owner,
+        _owners_by_role,
+        lease,
+    ) = _prepared(tmp_path, prior=None)
+    real_receipt = api._descriptor_receipt
+    real_capture = api._capture_target
+    reservations: list[tuple[int, tuple[int, int]]] = []
+    observations: list[str] = []
+
+    def record_reservation(descriptor: int, path: Path, role: str):
+        receipt = real_receipt(descriptor, path, role)
+        if role == "candidate-reservation":
+            reservations.append((descriptor, (receipt.identity.device, receipt.identity.inode)))
+            if failure == "receipt":
+                raise RuntimeError("receipt fault")
+        return receipt
+
+    def observe_candidate(path, *, hash_content=True):
+        if Path(path) == transaction._candidate and reservations and failure != "receipt":
+            descriptor, identity = reservations[0]
+            held = os.fstat(descriptor)
+            assert (held.st_dev, held.st_ino) == identity
+            first = not observations
+            observations.append("capture")
+            if failure == "observation" and first:
+                raise RuntimeError("observation fault")
+        return real_capture(path, hash_content=hash_content)
+
+    def writer(path: Path) -> None:
+        descriptor, identity = reservations[0]
+        held = os.fstat(descriptor)
+        assert (held.st_dev, held.st_ino) == identity
+        observations.append("writer")
+        path.write_bytes(b"writer result")
+        if failure == "writer":
+            raise RuntimeError("writer fault")
+
+    monkeypatch.setattr(api, "_descriptor_receipt", record_reservation)
+    monkeypatch.setattr(api, "_capture_target", observe_candidate)
+    if failure is None:
+        _execute(
+            transaction, writer,
+            transaction_owner=transaction_owner, target_owner=target_owner, lease=lease,
+        )
+        assert target.read_bytes() == b"writer result"
+    else:
+        with pytest.raises(RuntimeError, match=f"{failure} fault"):
+            _execute(
+                transaction, writer,
+                transaction_owner=transaction_owner, target_owner=target_owner, lease=lease,
+            )
+        assert not target.exists()
+
+    assert len(reservations) == 1
+    with pytest.raises(OSError):
+        os.fstat(reservations[0][0])
+    if failure == "receipt":
+        # Receipt failure leaves no authority to remove even an empty object.
+        assert transaction._candidate.read_bytes() == b""
+    else:
+        assert not transaction._candidate.exists()
+    if failure in (None, "writer"):
+        assert observations.count("writer") == 1
+        assert "capture" in observations[observations.index("writer") + 1:]
+    else:
+        assert "writer" not in observations
 
 
 def test_positive_stage_receipt_outranks_generic_post_move_error(

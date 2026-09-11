@@ -1527,7 +1527,7 @@ class OutputTransaction:
         self._candidate_owned = True
         self._pending.discard(RetryAction.CANDIDATE_RESERVATION)
 
-    def _reserve_candidate(self) -> None:
+    def _reserve_candidate(self) -> int:
         self._ensure_cleanup_token()
         self._pending.add(RetryAction.ROLLBACK)
         self._pending.add(RetryAction.CANDIDATE_RESERVATION)
@@ -1553,17 +1553,17 @@ class OutputTransaction:
                 self._candidate,
                 "candidate-reservation",
             )
+            self._candidate_reservation = receipt
+            self._candidate_owned = True
+            self._candidate_snapshot = receipt.snapshot
+            self._writer_receipt = _WriterReceipt(receipt, False, None)
         except BaseException:
             os.close(descriptor)
             raise
-        self._candidate_reservation = receipt
-        self._candidate_owned = True
-        self._candidate_snapshot = receipt.snapshot
-        self._writer_receipt = _WriterReceipt(receipt, False, None)
-        os.close(descriptor)
-        self._resolve_candidate_reservation()
-        if self._candidate_snapshot is None:
-            raise TargetChanged("owned candidate disappeared during reservation")
+        # The caller retains this descriptor through writer capture and
+        # rollback/publication.  An unlinked reservation cannot have its inode
+        # recycled while that descriptor remains open.
+        return descriptor
 
     def _resolve_backup_reservation(self) -> None:
         if RetryAction.BACKUP_RESERVATION not in self._pending:
@@ -3655,6 +3655,7 @@ class OutputTransaction:
 
             primary: BaseException | None = None
             cleanup_failures: list[BaseException] = []
+            candidate_descriptor: int | None = None
             try:
                 # Recheck after reader exclusion.  No validation result is
                 # trusted across a later clobber: the prior is captured and
@@ -3665,7 +3666,12 @@ class OutputTransaction:
                 try:
                     if self._admission.snapshot.exists:
                         self._stage_prior()
-                    self._reserve_candidate()
+                    candidate_descriptor = self._reserve_candidate()
+                    self._resolve_candidate_reservation()
+                    if self._candidate_snapshot is None:
+                        raise TargetChanged(
+                            "owned candidate disappeared during reservation"
+                        )
 
                     # Install the post-writer observation owner before entering
                     # user code.  An authorized mutation of the private path is
@@ -3741,6 +3747,14 @@ class OutputTransaction:
                         primary = None
                         cleanup_failures.extend(self._finish_published_cleanup())
             finally:
+                if candidate_descriptor is not None:
+                    try:
+                        os.close(candidate_descriptor)
+                    except BaseException as exc:
+                        if primary is None:
+                            primary = exc
+                        else:
+                            cleanup_failures.append(exc)
                 # The exact pause owner remains live while any later retry may
                 # publish or restore the admitted final pathname.
                 if not self._target_transition_pending():
