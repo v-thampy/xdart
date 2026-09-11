@@ -378,8 +378,10 @@ def test_active_background_revokes_at_every_page_boundary(monkeypatch, entry: st
             page._handle_shell_command(ShellCommand(
                 ShellCommandKind.SELECT_FRAME, frame=current, frames=(current,)))
         elif entry == "context":
-            monkeypatch.setattr(page, "_select_scan",
-                                lambda _value: delegated.append(page._background_owner.phase))
+            def select_scan(_value, *, is_directory):
+                assert is_directory is False
+                delegated.append(page._background_owner.phase)
+            monkeypatch.setattr(page, "_select_scan", select_scan)
             page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_SCAN, ""))
         elif entry == "mode":
             page._handle_shell_command(ShellCommand(
