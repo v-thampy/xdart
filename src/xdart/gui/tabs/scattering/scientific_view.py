@@ -3076,13 +3076,20 @@ class ScientificView(QtWidgets.QFrame):
 
     @staticmethod
     def _global_xspan(widget, view_box) -> tuple[float, float]:
-        rect = view_box.sceneBoundingRect()
-        left = widget.mapToGlobal(
-            widget.mapFromScene(rect.topLeft())
-        ).x()
-        right = widget.mapToGlobal(
-            widget.mapFromScene(rect.bottomRight())
-        ).x()
+        # pyqtgraph maps the view range onto view_box.rect(); the bounding
+        # rect is half a pen wider, the box sits at a fractional scene x
+        # (axis widths follow the font metrics), and mapFromScene rounds to
+        # whole pixels.  Any of those errors extrapolates into a visible
+        # column offset on the linked plot, so take the rect the transform
+        # targets and keep its sub-pixel position: map through the viewport
+        # transform and add the viewport's integer origin.
+        rect = view_box.mapRectToScene(view_box.rect())
+        transform = widget.viewportTransform()
+        origin = float(
+            widget.viewport().mapToGlobal(QtCore.QPoint(0, 0)).x()
+        )
+        left = origin + transform.map(rect.topLeft()).x()
+        right = origin + transform.map(rect.bottomRight()).x()
         return float(left), float(right)
 
     def _share_geometry(self):

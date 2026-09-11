@@ -808,6 +808,50 @@ def test_share_axis_links_both_directions_survives_repaint_and_unlinks() -> None
         _dispose(view)
 
 
+@pytest.mark.parametrize(
+    ("curve_axis_width", "cake_axis_width"),
+    ((40.5, 30.5), (33.3, 47.7)),
+)
+def test_share_axis_stays_exact_at_fractional_axis_widths(
+    curve_axis_width: float,
+    cake_axis_width: float,
+) -> None:
+    """Linux font metrics leave the left axes at fractional widths, so both
+    view boxes sit at sub-pixel scene x.  The link must derive its spans
+    from the rect pyqtgraph maps the range onto, without rounding: columns
+    sampled well outside the cake window amplify any span error."""
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    view = ScientificView()
+    projection = make_shell_projection(
+        frame_count=5,
+        selected_index=0,
+        heavy_indices=(0, 4),
+        plot_mode="Single",
+    )
+    scientific = replace(projection.scientific, share_axis=True)
+    view.resize(1200, 800)
+    view.show()
+    try:
+        _reconcile(view, scientific, projection.navigation)
+        app.processEvents()
+        view.curve.getPlotItem().getAxis("left").setWidth(curve_axis_width)
+        view.cake.canvas.image_plot.getAxis("left").setWidth(cake_axis_width)
+        QtTest.QTest.qWait(80)
+
+        curve_view = view.curve.getPlotItem().getViewBox()
+        curve_view.setXRange(0.75, 1.85, padding=0.0)
+        QtTest.QTest.qWait(80)
+        _assert_shared_pixels_align(view, -2.0, 0.8, 1.3, 1.8, 5.0)
+
+        cake_view = view.cake.canvas.imageViewBox
+        cake_view.setXRange(0.45, 2.15, padding=0.0)
+        QtTest.QTest.qWait(80)
+        _assert_shared_pixels_align(view, -2.5, 0.55, 1.25, 2.05, 5.5)
+    finally:
+        _dispose(view)
+
+
 def test_share_axis_geometry_coalescing_cannot_starve() -> None:
     """A sustained resize stream still admits a bounded alignment callback."""
 
