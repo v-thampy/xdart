@@ -336,7 +336,7 @@ def test_trial_verification_uses_exact_callback_before_filesystem_work(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """K03: real trial copies cancel before verification or promotion."""
+    """K03: the dependency verifier consumes the exact Stop before I/O."""
 
     raw, suffix = _write_trial_graph(tmp_path, layout)
     executor, intent, receipt, operation, session, group = _admitted_live_group(
@@ -359,7 +359,6 @@ def test_trial_verification_uses_exact_callback_before_filesystem_work(
     def traced_open(path, states, **kwargs):
         nonlocal open_count
         open_count += 1
-        selected = open_count
         accepted = (
             kwargs
             if "cancelled" in inspect.signature(real_open).parameters
@@ -367,10 +366,13 @@ def test_trial_verification_uses_exact_callback_before_filesystem_work(
         )
         with real_open(path, states, **accepted) as handle:
             yield handle
-        if selected == 2:
-            stopped.set()
 
     def traced_verify(states, **kwargs):
+        # Core qualification now verifies the captured dataset owner before
+        # the later dependency trial. Arm at this real verifier boundary,
+        # after the same two opens, rather than cancelling in its caller.
+        if open_count >= 2:
+            stopped.set()
         active = stopped.is_set()
         if active:
             trial_callbacks.append(kwargs.get("cancelled"))
@@ -478,9 +480,9 @@ def _assert_live_pending_fence(
     monkeypatch.setattr(executor, "_execute_live_directory", gated_execute_live)
     monkeypatch.setattr(executor, "_construct", forbidden_call("construct"))
     monkeypatch.setattr(
-        executor_module.TargetLease,
-        "acquire",
-        classmethod(lambda _cls, _paths: forbidden_call("target_lease")()),
+        executor_module.DynamicOutputAdapter,
+        "__init__",
+        forbidden_call("dynamic_output"),
     )
     try:
         accepted = executor.start(
@@ -493,7 +495,6 @@ def _assert_live_pending_fence(
         run = executor._exact_run(identity)
         assert run is not None
         run.processed_live_revisions = _RejectMap(forbidden)
-        run.deferred_live_revisions = _RejectMap(forbidden)
         execution_gate.set()
         assert outcome.wait(10.0), "Live P-1K materialization did not settle"
 
@@ -505,7 +506,6 @@ def _assert_live_pending_fence(
         assert attempt.decision is None
         assert forbidden == []
         assert run.processed_live_revisions == {}
-        assert run.deferred_live_revisions == {}
         assert not any(
             event.kind in {
                 StandardEventKind.CONTEXT_READY,
@@ -646,28 +646,28 @@ def test_stop_before_external_storage_capture_has_no_later_side_effect(
             later.append("SourceFileState.capture")
         return real_state_capture(path)
 
-    real_file = h5py.File
+    real_file_init = h5py.File.__init__
 
-    def traced_file(*args, **kwargs):
-        if stopped.is_set():
+    def traced_file(handle, *args, **kwargs):
+        if stopped.is_set() and args and isinstance(args[0], (str, Path)):
             later.append("h5py.File")
-        return real_file(*args, **kwargs)
+        return real_file_init(handle, *args, **kwargs)
 
     monkeypatch.setattr(
         SourceFileState,
         "capture",
         staticmethod(traced_state_capture),
     )
-    monkeypatch.setattr(h5py, "File", traced_file)
+    monkeypatch.setattr(h5py.File, "__init__", traced_file)
     monkeypatch.setattr(
         output_preflight,
         "inspect_output",
         lambda *_args, **_kwargs: later.append("inspect_output"),
     )
     monkeypatch.setattr(
-        executor_module.TargetLease,
-        "acquire",
-        classmethod(lambda _cls, _paths: later.append("target_lease")),
+        executor_module.DynamicOutputAdapter,
+        "__init__",
+        lambda *_args, **_kwargs: later.append("dynamic_output"),
     )
     try:
         with pytest.raises(RuntimeError, match="admission cancelled"):
@@ -679,7 +679,6 @@ def test_stop_before_external_storage_capture_has_no_later_side_effect(
                 cancelled=stopped.is_set,
             )
         assert later == []
-        assert operation.target_lease is None
     finally:
         released = executor.cancel_admission(operation.token)
     assert released.cleanup_status is CleanupStatus.CLEANED

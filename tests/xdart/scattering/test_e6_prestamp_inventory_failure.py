@@ -254,9 +254,9 @@ def test_prestamp_inventory_schema_failure_with_hardlink_retarget_is_pending(
     monkeypatch.setattr(executor, "_execute_live_directory", gated_execute_live)
     monkeypatch.setattr(executor, "_construct", forbidden_call("construct"))
     monkeypatch.setattr(
-        executor_module.TargetLease,
-        "acquire",
-        classmethod(lambda _cls, _paths: forbidden_call("target_lease")()),
+        executor_module.DynamicOutputAdapter,
+        "__init__",
+        forbidden_call("dynamic_output"),
     )
     try:
         accepted = executor.start(
@@ -269,7 +269,6 @@ def test_prestamp_inventory_schema_failure_with_hardlink_retarget_is_pending(
         run = executor._exact_run(identity)
         assert run is not None
         run.processed_live_revisions = _RejectMap(forbidden)
-        run.deferred_live_revisions = _RejectMap(forbidden)
         execution_gate.set()
         assert outcome.wait(10.0), (
             "Live P-1J materialization returned neither a result nor an "
@@ -285,7 +284,6 @@ def test_prestamp_inventory_schema_failure_with_hardlink_retarget_is_pending(
         assert attempt.decision is None
         assert forbidden == []
         assert run.processed_live_revisions == {}
-        assert run.deferred_live_revisions == {}
         assert not any(
             event.kind in {
                 StandardEventKind.CONTEXT_READY,
@@ -346,9 +344,9 @@ def test_prestamp_unchanged_inventory_schema_failure_remains_terminal(
 
     monkeypatch.setattr(output_preflight, "inspect_output", fail("inspect_output"))
     monkeypatch.setattr(
-        executor_module.TargetLease,
-        "acquire",
-        classmethod(lambda _cls, _paths: fail("target_lease")()),
+        executor_module.DynamicOutputAdapter,
+        "__init__",
+        fail("dynamic_output"),
     )
     try:
         with pytest.raises(ValueError, match=_SCHEMA_SENTINEL):
@@ -361,7 +359,6 @@ def test_prestamp_unchanged_inventory_schema_failure_remains_terminal(
             )
         assert fired == [True]
         assert forbidden == []
-        assert operation.target_lease is None
     finally:
         released = executor.cancel_admission(operation.token)
     assert released.cleanup_status is CleanupStatus.CLEANED
@@ -438,87 +435,38 @@ def test_prestamp_inventory_failure_two_sweep_order_and_cancellation(
         action=lambda: None,
         before_raise=before_raise,
     )
+    # Core qualification retains both the resolved dataset owner and its raw
+    # external alias. It verifies both twice before the outer Live candidate
+    # proof classifies the stable schema failure; neither sweep may rebaseline.
+    target_name = alias.resolve().name
+    expected = ["cancel"] * 3
+    for _sweep in range(2):
+        for raw_name, resolved_name in (
+            (master.name, master.name),
+            (target_name, target_name),
+            (alias.name, target_name),
+        ):
+            expected.extend(("cancel", f"resolve:{raw_name}", f"capture:{resolved_name}"))
+    expected.extend((
+        "cancel", "cancel", f"resolve:{master.name}",
+        f"capture:{master.name}", f"owner:{master.name}",
+        "cancel", f"resolve:{master.name}", f"capture:{master.name}", "cancel",
+    ))
     try:
         if cancel_at is None:
             with pytest.raises(ValueError, match=_SCHEMA_SENTINEL):
                 output_preflight.materialize_live_directory_group(
-                    receipt,
-                    intent.freeze(),
-                    session,
-                    group,
-                    cancelled=cancelled,
+                    receipt, intent.freeze(), session, group, cancelled=cancelled,
                 )
-            assert traces == [
-                "cancel",
-                "cancel",
-                "cancel",
-                "cancel",
-                f"resolve:{master.name}",
-                f"capture:{master.name}",
-                f"owner:{master.name}",
-                "cancel",
-                f"resolve:{alias.name}",
-                f"capture:{alias.resolve().name}",
-                "cancel",
-                f"resolve:{master.name}",
-                f"capture:{master.name}",
-                "cancel",
-                f"resolve:{alias.name}",
-                f"capture:{alias.resolve().name}",
-                "cancel",
-            ]
+            assert traces == expected
         else:
             with pytest.raises(RuntimeError, match="admission cancelled"):
                 output_preflight.materialize_live_directory_group(
-                    receipt,
-                    intent.freeze(),
-                    session,
-                    group,
-                    cancelled=cancelled,
+                    receipt, intent.freeze(), session, group, cancelled=cancelled,
                 )
-            expected = {
-                4: ["cancel", "cancel", "cancel", "cancel"],
-                5: [
-                    "cancel",
-                    "cancel",
-                    "cancel",
-                    "cancel",
-                    f"resolve:{master.name}",
-                    f"capture:{master.name}",
-                    f"owner:{master.name}",
-                    "cancel",
-                ],
-                6: [
-                    "cancel",
-                    "cancel",
-                    "cancel",
-                    "cancel",
-                    f"resolve:{master.name}",
-                    f"capture:{master.name}",
-                    f"owner:{master.name}",
-                    "cancel",
-                    f"resolve:{alias.name}",
-                    f"capture:{alias.resolve().name}",
-                    "cancel",
-                ],
-                7: [
-                    "cancel",
-                    "cancel",
-                    "cancel",
-                    "cancel",
-                    f"resolve:{master.name}",
-                    f"capture:{master.name}",
-                    f"owner:{master.name}",
-                    "cancel",
-                    f"resolve:{alias.name}",
-                    f"capture:{alias.resolve().name}",
-                    "cancel",
-                    f"resolve:{master.name}",
-                    f"capture:{master.name}",
-                    "cancel",
-                ],
-            }
-            assert traces == expected[cancel_at]
+            cancellation_positions = [index for index, value in enumerate(expected)
+                                      if value == "cancel"]
+            assert traces == expected[:cancellation_positions[cancel_at - 1] + 1]
     finally:
         released = executor.cancel_admission(operation.token)
     assert released.cleanup_status is CleanupStatus.CLEANED
