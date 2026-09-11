@@ -178,6 +178,7 @@ def _state(
     identity=None,
     mask_saturation=False,
     catalog_max_items=None,
+    source_base=None,
 ):
     state = RunDisplayState(
         identity or RunIdentity(1, "e4-preview"),
@@ -191,6 +192,7 @@ def _state(
         mask=None,
         mask_saturation=mask_saturation,
         measurement_mode="Standard",
+        source_base=source_base,
     )
     return state, owner
 
@@ -222,6 +224,69 @@ def _catalog(state, owner, labels):
         )
         keys[label] = delta.appended
     return keys
+
+
+def _bind_light_history(state, owner, labels, *, records=None):
+    """Retain real record science through the current allocation-bound owner."""
+    from xrd_tools.session import (
+        Light1DBufferLayout, Light1DFundingMode, Light1DLayout,
+        Light1DModeLayout, SessionResourceAuthority, SessionResourceRequirements,
+        acquire_light_1d_retention, resolve_session_policy,
+    )
+
+    records = tuple(records or (
+        read_frame_record(owner.artifact, label) for label in labels
+    ))
+    reference = records[0]
+    modes = []
+    for mode, view in reference.results_1d.items():
+        count = len(view.axis_1d.values)
+        modes.append(Light1DModeLayout(
+            mode=mode,
+            coordinate=Light1DBufferLayout(
+                count, 8, f"{mode}-axis", "<f8",
+            ),
+            intensity=Light1DBufferLayout(count, 8, f"{mode}-intensity", "<f8"),
+            uncertainty=(None if view.sigma_1d is None else
+                         Light1DBufferLayout(count, 8, f"{mode}-sigma", "<f8")),
+        ))
+    layout = Light1DLayout(tuple(modes), reference.active_mode_1d)
+    persisted = read_frame_record(owner.artifact, labels[0])
+    cake = next(iter(persisted.results_2d.values()), None)
+    requirements = SessionResourceRequirements(
+        height=4, width=4, native_itemsize=4,
+        modes_1d=len(modes), npt_1d=count,
+        sigma_1d=sum(view.sigma_1d is not None for view in reference.results_1d.values()),
+        modes_2d=len(persisted.results_2d),
+        npt_rad=0 if cake is None else len(cake.axis_2d_x.values),
+        npt_azim=0 if cake is None else len(cake.axis_2d_y.values),
+    )
+    allocation = resolve_session_policy(
+        requirements, envelope_bytes=4 * 1024 ** 3, env={},
+    ).allocation
+    authority = SessionResourceAuthority.from_allocation(allocation)
+    ceiling = layout.shared_bytes + len(records) * layout.per_row_unique_ndarray_bytes
+    lease = acquire_light_1d_retention(
+        authority, owner=f"preview-history:{owner.artifact}",
+        generation=state.identity.generation, layout=layout,
+        requested_rows=len(records), compatibility_byte_ceiling=ceiling,
+        gui_thread_id=threading.get_ident(),
+        funding_mode=Light1DFundingMode.REPLACE_PUBLICATION_A1,
+        current_lineage_rows=len(records),
+    )
+    owner.publications.bind_allocation(allocation)
+    owner.publications.bind_light_1d(lease)
+    hooks = owner.publications.light_1d_cleanup_hooks(lease)
+    state.stage_light_1d(owner, lease, hooks=hooks)
+    state.bind_light_1d(owner, lease)
+    for record in records:
+        view = record.active_view()
+        state.publish_light_1d(
+            owner, record,
+            source_identity=f"{view.source_path or ''}#{view.source_frame_index}",
+        )
+    assert lease.keys() == tuple(labels)
+    return lease
 
 
 def _acquisition_identity(state):
@@ -395,6 +460,7 @@ def test_live_thumbnail_carrier_is_exact_complete_and_snapshot_ordered(
     from queue import Queue; from types import SimpleNamespace; import xrd_tools.reduction.core as reduction_core
     from xrd_tools.reduction import Frame, Integration1DPlan, Integration2DPlan, NexusSink, ReductionPlan, Scan
     from xrd_tools.session import ScanSession
+    from xrd_tools.session.run_configuration import RunIntent
     from xdart.gui.tabs.scattering.adapters import dynamic_output; from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor, _StandardRun
 
     one = IntegrationResult1D(np.array([0., 1.]), np.array([2., 3.]), unit="q_A^-1")
@@ -410,7 +476,11 @@ def test_live_thumbnail_carrier_is_exact_complete_and_snapshot_ordered(
     target = tmp_path / "live.nexus"
     run = _StandardRun(None, RunIdentity(1, "perf-c5"), scan, None, None, None, target)
     owner = run.display.add_artifact(target, "live", mask=None, mask_saturation=False, measurement_mode="Standard")
-    policy, layout, rows, ceiling, _ = dynamic_output._light_policy_layout(SimpleNamespace(max_cores=1, live_mode=False, gi=SimpleNamespace(enabled=False)), plan, SimpleNamespace(descriptor=None), scan, (1,))
+    policy, layout, rows, ceiling, _ = dynamic_output._light_policy_layout(
+        RunIntent(max_cores=1).freeze(), plan,
+        SimpleNamespace(descriptor=None, source_stamp=SimpleNamespace(frame_count=1)),
+        scan, (1,),
+    )
     lease = dynamic_output.acquire_light_1d_retention(dynamic_output.SessionResourceAuthority.from_allocation(policy.allocation), owner="scattering-light-1d:perf-c5", generation=1, layout=layout, requested_rows=rows, compatibility_byte_ceiling=ceiling, gui_thread_id=run.gui_thread_id, funding_mode=dynamic_output.Light1DFundingMode.REPLACE_PUBLICATION_A1, current_lineage_rows=1)
     owner.publications.bind_allocation(policy.allocation); owner.publications.bind_light_1d(lease)
     hooks = owner.publications.light_1d_cleanup_hooks(lease)
@@ -513,8 +583,11 @@ def test_thumbnail_semilight_missing_science_rehydrates_once(monkeypatch, tmp_pa
     assert state.transport.counters()[HydrationOutcome.HYDRATED] == before[HydrationOutcome.HYDRATED] + 1
 
 
-def test_non_square_thumbnail_uses_true_extent_without_remask_or_cake_drift(tmp_path):
-    from types import SimpleNamespace; from unittest.mock import Mock
+def test_non_square_thumbnail_uses_true_extent_without_remask_or_cake_drift(
+    monkeypatch, tmp_path,
+):
+    from unittest.mock import Mock
+    from pyqtgraph.Qt import QtWidgets
     from xdart.gui.tabs.scattering.scientific_axes import heavy_projection
     from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
     from xdart.gui.tabs.scattering.shell_widgets import ScientificImagePane
@@ -525,14 +598,23 @@ def test_non_square_thumbnail_uses_true_extent_without_remask_or_cake_drift(tmp_
     view = FrameView(label=1, thumbnail=thumbnail, axis_2d_x=Axis("q", "1/angstrom", values=np.array([.1, .2, .3])), axis_2d_y=Axis("chi", "degree", values=np.array([-1., 1.])), intensity_2d=cake, extra={"detector_shape": (8, 12)})
     heavy = heavy_projection(StandardDisplayPayload(0, key, "frame", view))
     assert heavy.detector_shape == (8, 12) and heavy.raw is thumbnail
-    pane = SimpleNamespace(canvas=Mock(), plot=Mock()); pane.canvas.imageViewBox = Mock()
-    ScientificImagePane.render(pane, heavy.raw, detector_shape=heavy.detector_shape)
-    image, options = pane.canvas.setImage.call_args.args[0], pane.canvas.setImage.call_args.kwargs
-    np.testing.assert_allclose(image, thumbnail.T[:, ::-1], equal_nan=True); rect = options["rect"]
-    assert (rect.x(), rect.y(), rect.width(), rect.height()) == (0., 0., 11., 7.)
-    pane.canvas.setImage.reset_mock(); ScientificImagePane.render(pane, heavy.cake, x_axis=heavy.cake_x, y_axis=heavy.cake_y)
-    np.testing.assert_array_equal(pane.canvas.setImage.call_args.args[0], cake.T)
-    assert pane.canvas.setImage.call_args.kwargs["linear_percentiles"] == (0.5, 99.5)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = ScientificImagePane(lock_aspect=True)
+    set_image = Mock(wraps=pane.canvas.setImage)
+    monkeypatch.setattr(pane.canvas, "setImage", set_image)
+    try:
+        pane.render(heavy.raw, detector_shape=heavy.detector_shape)
+        image, options = set_image.call_args.args[0], set_image.call_args.kwargs
+        np.testing.assert_allclose(image, thumbnail.T[:, ::-1], equal_nan=True)
+        rect = options["rect"]
+        assert (rect.x(), rect.y(), rect.width(), rect.height()) == (0., 0., 11., 7.)
+        set_image.reset_mock()
+        pane.render(heavy.cake, x_axis=heavy.cake_x, y_axis=heavy.cake_y)
+        np.testing.assert_array_equal(set_image.call_args.args[0], cake.T)
+        assert set_image.call_args.kwargs["linear_percentiles"] == (0.5, 99.5)
+    finally:
+        pane.deleteLater()
+        app.processEvents()
 
 
 @pytest.mark.parametrize(
@@ -584,6 +666,8 @@ def test_b2_full_demand_is_zero_by_default_and_one_per_exact_current() -> None:
         _preferences=ScientificPreferences(), _context_controller=controller,
         _detector_scope_owner=selection.owner, _detector_demand_frame=None,
         _ensure_timer=lambda: None, _notice=lambda _text: None,
+        _retire_batch_presentation=lambda: None,
+        _release_display_background=lambda: None,
     )
     ScatteringWorkspace._sync_detector_demand(page)
     assert requests == []
@@ -797,10 +881,10 @@ def test_gate_cancel_waits_for_the_bounded_insert(monkeypatch, tmp_path):
     release = threading.Event()
     original_upsert = owner.publications.upsert
 
-    def holding_upsert(publication):
+    def holding_upsert(publication, **kwargs):
         inside.set()
         assert release.wait(timeout=10.0)
-        return original_upsert(publication)
+        return original_upsert(publication, **kwargs)
 
     monkeypatch.setattr(owner.publications, "upsert", holding_upsert)
     request = _typed_request(
@@ -1141,7 +1225,7 @@ def test_failed_rehydration_preserves_the_exact_existing_publication(
     events.clear()
 
     _install_seam_failure(
-        monkeypatch, state, owner, "residency", permanent=True
+        monkeypatch, state, owner, "publication", permanent=True
     )
     request = _typed_request(
         state, owner_value, gate, processed, 2, HydrationPurpose.PREVIEW, 6
@@ -1155,34 +1239,33 @@ def test_failed_rehydration_preserves_the_exact_existing_publication(
     assert not events
 
 
-def test_owed_multimode_light_row_refuses_hydration_before_mutation(
+def test_incompatible_multimode_light_row_refuses_hydration_before_mutation(
     tmp_path,
 ):
-    """P1-C L1: hydration cannot merge onto an unreleasable GUI-light row."""
+    """Hydration cannot replace retained science with a different mode set."""
+    from dataclasses import replace
     state, owner, processed, _raw, events = _bound_state(None, tmp_path)
     keys = _catalog(state, owner, (1,))
     owner_value, gate = _acquisition_identity(state)
     view = FrameView(
         label=1,
-        axis_1d=Axis("q", "1/angstrom", np.array([0.1, 0.2, 0.3])),
+        axis_1d=Axis("q", "1/angstrom", values=np.array([0.1, 0.2, 0.3])),
         intensity_1d=np.array([4.0, 5.0, 6.0]),
         source_path="/owed/source.tif",
         source_frame_index=1,
     )
+    second_mode = replace(
+        view,
+        axis_1d=replace(view.axis_1d, values=view.axis_1d.values.copy()),
+        intensity_1d=view.intensity_1d.copy(),
+    )
     owed = FrameRecord.from_view(view, mode_1d="owed-a").with_result_1d(
-        "owed-b", view, make_active=False,
+        "owed-b", second_mode, make_active=False,
     )
-    source_identity = "/owed/source.tif#1"
-    owner.light_records.upsert(
-        owed,
-        source_identity=source_identity,
-        persisted=False,
-    )
+    lease = _bind_light_history(state, owner, (1,), records=(owed,))
     before = (
-        owner.light_records.get(1),
-        owner.light_records.source_identity(1),
-        owner.light_records.is_persisted(1),
-        owner.publications.get(1),
+        owner.publications.get_light_1d_shell(1),
+        lease.keys(),
         state.payloads.get(keys[1]),
         state.residency_snapshot(),
     )
@@ -1203,13 +1286,17 @@ def test_owed_multimode_light_row_refuses_hydration_before_mutation(
         (1, HydrationOutcome.FAILED)
     ) == 1
     assert (
-        owner.light_records.get(1),
-        owner.light_records.source_identity(1),
-        owner.light_records.is_persisted(1),
-        owner.publications.get(1),
+        owner.publications.get_light_1d_shell(1),
+        lease.keys(),
         state.payloads.get(keys[1]),
         state.residency_snapshot(),
     ) == before
+    assert not owner.publications.has_heavy_payload(1)
+    assert not owner.publications.has_thumbnail(1)
+    with lease.borrow(1) as retained:
+        assert set(retained.modes) == {"owed-a", "owed-b"}
+        for mode in retained.modes.values():
+            np.testing.assert_array_equal(mode.intensity, view.intensity_1d)
     assert not events
 
 
@@ -1326,7 +1413,7 @@ def test_failed_rehydration_does_not_leak_light_record_after_cache_eviction(
     keys = _catalog(state, owner, (1, 2))
     owner_value, gate = _acquisition_identity(state)
     _hydrate_ok(state, owner_value, gate, processed, 1, 1)
-    prior = state.payloads[keys[1]].view.intensity_1d.copy()
+    prior = state.project(keys[1], 1, closed=True).view.intensity_1d.copy()
 
     transport_api = _transport_api()
     original_read = transport_api.read_frame_preview
@@ -1447,7 +1534,7 @@ def test_failed_attempt_restores_every_public_surface_exactly(
 
     before = dict(
         record=owner.records.get(target),
-        light=owner.light_records.get(target),
+        light=owner.publications.get_light_1d_shell(target),
         outcome=state.detector_outcome(keys[target]),
         publication=owner.publications.get(target),
         payload=state.payloads.get(keys[target]),
@@ -1466,7 +1553,7 @@ def test_failed_attempt_restores_every_public_surface_exactly(
     ) == 1
 
     assert owner.records.get(target) is before["record"]
-    assert owner.light_records.get(target) is before["light"]
+    assert owner.publications.get_light_1d_shell(target) is before["light"]
     assert state.detector_outcome(keys[target]) is before["outcome"]
     assert owner.publications.get(target) is before["publication"]
     assert state.payloads.get(keys[target]) is before["payload"]
@@ -1483,7 +1570,7 @@ def test_failed_reattempt_preserves_a_prior_terminal_detector_outcome(
         tmp_path, labels=(1, 2), thumbnails=False
     )
     raw_path.unlink()
-    state, owner = _state(processed)
+    state, owner = _state(processed, source_base=str(tmp_path))
     state.bind_transport(event_sink=lambda event: None)
     keys = _catalog(state, owner, (1, 2))
     owner_value, gate = _acquisition_identity(state)
@@ -1762,7 +1849,7 @@ def test_closed_integrated_only_record_reaches_detector_unavailable_once(
 ):
     processed, raw_path = _write_processed(tmp_path, thumbnails=False)
     raw_path.unlink()  # detector source genuinely absent
-    state, owner = _state(processed)
+    state, owner = _state(processed, source_base=str(tmp_path))
     events = []
     state.bind_transport(event_sink=events.append)
     keys = _catalog(state, owner, (1, 2, 3))
@@ -1790,24 +1877,22 @@ def test_closed_integrated_only_record_reaches_detector_unavailable_once(
     assert counts["processed"] == first_reads
 
 
-def test_empty_integrated_arrays_never_terminalize_detector_absence(
+def test_unqualified_empty_record_never_terminalizes_detector_absence(
     monkeypatch, tmp_path
 ):
-    """A closed record whose integrated arrays are EMPTY has no scientific
-    basis for a terminal detector verdict (superseded E2-LV-D claim retained
-    against the transport seam)."""
+    """An empty, unqualified record cannot establish a detector verdict."""
     processed = tmp_path / "xdart_processed_data" / "empty.nexus"
     processed.parent.mkdir(parents=True)
     with h5py.File(processed, "w") as handle:
         entry = handle.create_group("entry")
         entry.attrs["NX_class"] = "NXentry"
-        # A reachable degenerate persisted shape: the frame record exists but
-        # carries NO integrated arrays, thumbnail or source provenance.
+        # The frame path exists, but the file lacks the current processed
+        # schema, integrated arrays and source provenance.
         record = entry.create_group("frames/frame_0002")
         record.create_dataset("metadata/placeholder", data=1)
     state, owner = _state(processed)
     state.bind_transport(event_sink=lambda event: None)
-    keys = _catalog(state, owner, (2,))
+    key = state.append_navigation(owner.source_scan, str(processed), 2).appended
     owner_value, gate = _acquisition_identity(state)
 
     request = _typed_request(
@@ -1815,7 +1900,10 @@ def test_empty_integrated_arrays_never_terminalize_detector_absence(
     )
     assert state.transport.submit(request, closed=True) is not None
     assert _wait_transport_idle(state)
-    assert state.detector_outcome(keys[2]) is None  # never terminal
+    assert _completion_outcomes(state) == ((2, HydrationOutcome.FAILED),)
+    assert "not a current xdart .nexus record" in state.transport.completions()[0].diagnostic
+    assert owner.publications.get(2) is None
+    assert state.detector_outcome(key) is None
 
 
 def test_running_detector_miss_remains_retryable_with_truthful_cake(
@@ -1823,7 +1911,7 @@ def test_running_detector_miss_remains_retryable_with_truthful_cake(
 ):
     processed, raw_path = _write_processed(tmp_path, thumbnails=False)
     raw_path.unlink()
-    state, owner = _state(processed)
+    state, owner = _state(processed, source_base=str(tmp_path))
     state.bind_transport(event_sink=lambda event: None)
     keys = _catalog(state, owner, (1, 2, 3))
     owner_value, gate = _acquisition_identity(state)
@@ -2154,7 +2242,7 @@ def test_legacy_optional_identity_shape_is_refused_by_transport(
         HydrationPurpose.PREVIEW,
         5,
         owner_value,
-        (owner.records, owner.light_records, owner.publications),
+        (owner.records, object(), owner.publications),
         gate,
     )
     assert legacy.read_key is None
@@ -2175,6 +2263,7 @@ def test_light_one_d_history_order_survives_preview_churn(
         monkeypatch, tmp_path, labels=labels
     )
     _catalog(state, owner, labels)
+    lease = _bind_light_history(state, owner, labels)
     owner_value, gate = _acquisition_identity(state)
 
     for index, label in enumerate(labels):
@@ -2184,12 +2273,14 @@ def test_light_one_d_history_order_survives_preview_churn(
         )
         assert state.transport.submit(request) is not None
         assert _wait_transport_idle(state)
-    history = tuple(sorted(owner.light_records.labels()))
+    history = tuple(lease.keys())
     assert history == labels  # complete 1-D history for Single/Overlay/Waterfall
     for label in labels:
-        light = owner.light_records.get(label)
-        assert light is not None
-        assert light.active_view().intensity_1d is not None
+        with lease.borrow(label) as light:
+            np.testing.assert_array_equal(
+                light.modes[light.active_mode].intensity,
+                np.array([1.0, 2.0, 3.0]) + label,
+            )
 
     # More preview churn on one frame neither reorders nor drops the history.
     request = _typed_request(
@@ -2197,7 +2288,7 @@ def test_light_one_d_history_order_survives_preview_churn(
     )
     assert state.transport.submit(request) is not None
     assert _wait_transport_idle(state)
-    assert tuple(sorted(owner.light_records.labels())) == labels
+    assert tuple(lease.keys()) == labels
 
 
 def test_acquisition_residency_does_not_compose_historical_publications(
@@ -2261,6 +2352,7 @@ def test_sixteen_trace_members_project_from_light_history_with_heavy_window_eigh
     state, owner = _state(processed, identity=identity)
     state.bind_transport(event_sink=lambda event: None)
     keys_by_label = _catalog(state, owner, labels)
+    _bind_light_history(state, owner, labels)
     owner_value, gate = _acquisition_identity(state)
     for label in labels:
         _hydrate_ok(
@@ -2411,12 +2503,37 @@ def _demote_browse_publication(browse, label):
     assert view.raw is None and view.thumbnail is None
 
 
+def _warm_browse_preview(controller, label):
+    """Read an exact sparse Browse row before testing its later eviction."""
+    key = _browse_key(controller, label)
+    browse = controller.browse_context
+    assert browse is not None
+    owner = controller._browse_hydration_owner
+    assert owner is not None
+    generation = controller.selection.display_generation
+    read_key = HydrationReadKey(
+        HydrationScope(*browse.hydration_owner.as_tuple()),
+        browse.requested_path, label, HydrationPurpose.PREVIEW,
+        source_root=browse.load_request.source_root,
+    )
+    request = HydrationRequest(
+        label, HydrationPurpose.PREVIEW, generation, browse.hydration_owner,
+        (browse.publication_store,), browse.commit_gate,
+        read_key=read_key, token=HydrationToken(read_key, generation),
+    )
+    assert owner.submit(request) == request.token
+    assert _wait_transport_idle(owner)
+    assert owner.consume_repaint()
+    assert browse.publication_store.get(label) is not None
+    return key
+
+
 def test_browse_evicted_frame_rehydrates_b_store_without_second_context(
     tmp_path,
 ):
     controller, acquisition, browse, processed = _adopted_browse(tmp_path)
     transport = acquisition.publication_store.transport
-    key = _browse_key(controller, 2)
+    key = _warm_browse_preview(controller, 2)
     reference = browse.publication_store.get(2)
     assert reference is not None
     reference_source = (reference.view.source_path, reference.view.source_frame_index)
@@ -2650,7 +2767,7 @@ def test_resume_makes_late_browse_completion_terminal_bookkeeping_only(
 ):
     controller, acquisition, browse, _processed = _adopted_browse(tmp_path)
     transport = acquisition.publication_store.transport
-    key = _browse_key(controller, 2)
+    key = _warm_browse_preview(controller, 2)
     _demote_browse_publication(browse, 2)
 
     preview_module = import_module("xrd_tools.io.frame_preview")
@@ -2699,7 +2816,7 @@ def test_close_withholds_cleaned_until_transport_drops_browse_request(
 
     controller, acquisition, browse, _processed = _adopted_browse(tmp_path)
     transport = acquisition.publication_store.transport
-    key = _browse_key(controller, 2)
+    key = _warm_browse_preview(controller, 2)
     _demote_browse_publication(browse, 2)
 
     preview_module = import_module("xrd_tools.io.frame_preview")
@@ -2854,10 +2971,10 @@ def test_mounted_selection_retains_presentation_then_restores_thumbnail(
     monkeypatch, tmp_path
 ):
     lv_support = _lv()
-    monkeypatch.setenv("XDART_HEAVY_WINDOW", "2")
-    monkeypatch.setattr(display_runtime, "THUMBNAIL_MAX_ITEMS", 2)
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "16")
+    monkeypatch.setattr(display_runtime, "THUMBNAIL_MAX_ITEMS", 16)
     qapp, page, lifecycle, _executor, output = lv_support._standard_page(
-        monkeypatch, tmp_path, labels=tuple(range(1, 11))
+        monkeypatch, tmp_path, labels=tuple(range(1, 19))
     )
     shell, controller = lv_support._mounted(page)
     try:
@@ -2871,27 +2988,29 @@ def test_mounted_selection_retains_presentation_then_restores_thumbnail(
                 f"admission={page._admission is not None}; "
                 f"context_identity={controller.run_identity!r}; "
                 f"executor_active={active is not None}; "
-                f"worker_alive={bool(worker and worker.is_alive())}"
+                f"worker_alive={bool(worker and worker.is_alive())}; "
+                f"current={controller.navigation.current!r}; "
+                f"selector={shell.scientific.frame_selector.currentData()!r}; "
+                f"title={shell.scientific.title.text()!r}; "
+                f"transport={controller.acquisition_context.publication_store.transport.counters()}"
             )
 
         lv_support._wait(
             qapp, lambda: shell.run_controls.startButton.isEnabled()
         )
         shell.run_controls.startButton.click()
-        lv_support._wait(
-            qapp,
-            lambda: lifecycle.phase.value == "idle",
-            timeout=60.0,
-            diagnostic=run_diagnostic,
-        )
+        lv_support._completed_acquisition(qapp, page, lifecycle, _executor)
         display = controller.acquisition_context.publication_store
         artifact_owner = next(iter(display.artifacts.values()))
         demoted = artifact_owner.publications.get(1)
         assert demoted is None or (
             demoted.view.raw is None and demoted.view.thumbnail is None
         )
+        # This inspection borrows frame 1's retained 1D arrays.  It must not
+        # pin that row while the real historical read replaces its payload.
+        del demoted
         held_title = shell.scientific.title.text()
-        assert held_title == "tiny_0001.tif"
+        assert held_title == "tiny_0018.tif"
         held_image = shell.scientific.raw.image.image
         assert held_image is not None
 
@@ -2934,6 +3053,7 @@ def test_mounted_selection_retains_presentation_then_restores_thumbnail(
                 and transport.counters()[HydrationOutcome.HYDRATED] >= 1
             ),
             timeout=30.0,
+            diagnostic=run_diagnostic,
         )
         assert counts["processed"] == 1
         assert counts["detector"] == 0
@@ -2948,8 +3068,8 @@ def test_651_frame_run_hydrates_oldest_frame_with_bounded_opens(
     monkeypatch, tmp_path
 ):
     lv_support = _lv()
-    monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
-    monkeypatch.setattr(display_runtime, "THUMBNAIL_MAX_ITEMS", 8)
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "16")
+    monkeypatch.setattr(display_runtime, "THUMBNAIL_MAX_ITEMS", 16)
     qapp, page, lifecycle, _executor, output = lv_support._standard_page(
         monkeypatch, tmp_path, labels=tuple(range(1, 652))
     )
@@ -2959,9 +3079,7 @@ def test_651_frame_run_hydrates_oldest_frame_with_bounded_opens(
             qapp, lambda: shell.run_controls.startButton.isEnabled()
         )
         shell.run_controls.startButton.click()
-        lv_support._wait(
-            qapp, lambda: lifecycle.phase.value == "idle", timeout=300.0
-        )
+        lv_support._completed_acquisition(qapp, page, lifecycle, _executor)
         display = controller.acquisition_context.publication_store
         keys = controller.frame_keys
         assert keys and keys[-1].local_frame_label == 651
@@ -2999,8 +3117,8 @@ def test_post_run_overlay_to_single_browser_selection_repaints_hydrated_frame(
     from pyqtgraph.Qt import QtCore
 
     lv_support = _lv()
-    monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
-    monkeypatch.setattr(display_runtime, "THUMBNAIL_MAX_ITEMS", 8)
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "16")
+    monkeypatch.setattr(display_runtime, "THUMBNAIL_MAX_ITEMS", 16)
     qapp, page, lifecycle, _executor, _output = lv_support._standard_page(
         monkeypatch, tmp_path, labels=tuple(range(1, 33))
     )
@@ -3011,9 +3129,7 @@ def test_post_run_overlay_to_single_browser_selection_repaints_hydrated_frame(
             qapp, lambda: shell.run_controls.startButton.isEnabled()
         )
         shell.run_controls.startButton.click()
-        lv_support._wait(
-            qapp, lambda: lifecycle.phase.value == "idle", timeout=90.0
-        )
+        lv_support._completed_acquisition(qapp, page, lifecycle, _executor)
         reconciled_heavy: list[object] = []
         original_reconcile = shell.scientific.reconcile
 
@@ -3070,8 +3186,11 @@ def test_batch_run_click_projects_phase_and_control_lock_without_display_repaint
     captures: list[tuple[str, bool, str, bool, bool, bool]] = []
     original_apply = shell.apply_state
 
-    def capture_apply(state, *, preserve_display=False):
-        original_apply(state, preserve_display=preserve_display)
+    def capture_apply(state, *, preserve_display=False, preserve_scientific=False):
+        original_apply(
+            state, preserve_display=preserve_display,
+            preserve_scientific=preserve_scientific,
+        )
         fields = state.controls.fields
         captures.append(
             (
@@ -3162,7 +3281,12 @@ def test_e6pm2_ticket_contract_refusal_and_distinct_admissions(
     api = _transport_api()
     ticket_type = _ticket_type()
     assert ticket_type is not None, "hydration_transport needs _HydrationTicket"
-    assert api.__all__ == ["HydrationTransport", "PreparedHydrationCommit"]
+    assert api.__all__ == [
+        "DetachedHydrationMutation", "HydrationTransportCleanupReceipt",
+        "HydrationTransportCleanupToken", "HydrationTransport",
+        "PreparedHydrationCommit",
+    ]
+    assert "_HydrationTicket" not in api.__all__
 
     state, owner, processed, _raw, _events = _bound_state(monkeypatch, tmp_path)
     art_owner, gate = _acquisition_identity(state)

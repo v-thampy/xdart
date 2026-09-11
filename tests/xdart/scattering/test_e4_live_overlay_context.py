@@ -478,7 +478,7 @@ def test_mounted_live_multitrace_mode_renders_every_sequential_delta(
     tmp_path,
     plot_mode: str,
 ) -> None:
-    qapp, page, lifecycle, _executor, _output = _standard_page(
+    qapp, page, lifecycle, _executor, output = _standard_page(
         monkeypatch,
         tmp_path,
         labels=(1, 2, 3),
@@ -495,9 +495,17 @@ def test_mounted_live_multitrace_mode_renders_every_sequential_delta(
         shell.run_controls.startButton.click()
         _wait(
             qapp,
-            lambda: lifecycle.phase is RunPhase.IDLE,
+            lambda: lifecycle.phase is RunPhase.IDLE and output.is_file(),
             diagnostic=lambda: _shell_diagnostic(shell, lifecycle),
         )
+        _wait(qapp, lambda: (
+            controller.browse_context is not None
+            and controller.capture_loaded_browse(
+                controller.browse_context.load_request
+            ) is not None
+        ))
+        controller.select_acquisition()
+        page._refresh_shell()
 
         frames = controller.navigation.frames
         assert len(frames) == 3
