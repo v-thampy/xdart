@@ -3,32 +3,21 @@
 <!-- After the repo is pushed, point the badge at the real org/name:
 [![PR checks](https://github.com/<org>/xdart/actions/workflows/pr.yml/badge.svg)](https://github.com/<org>/xdart/actions/workflows/pr.yml) -->
 
-**SSRL X-ray diffraction toolkit — one distribution, two import packages.**
+**X-ray diffraction processing and analysis, from live acquisition to notebooks.**
 
-`xdart` is the merged successor to the former
-`ssrl_xrd_tools` (the headless reduction + I/O library) and `xdart` (the
-real-time Qt GUI). It ships **two import packages** from one wheel:
-
-- **`xrd_tools`** — the headless XRD reduction + I/O core. Imports **no
-  Qt / pyqtgraph**; fully usable from scripts, Jupyter notebooks, and
-  automated batch pipelines at the beamline or in the lab. Built on
-  [pyFAI](https://pyfai.readthedocs.io/) for azimuthal integration with added
-  support for grazing incidence, multi-geometry stitching, reciprocal-space
-  mapping, peak/phase/strain fitting, and a streaming reduction spine.
-- **`xdart`** — the PySide6 + pyqtgraph desktop GUI for real-time and batch
-  analysis. A thin consumer of `xrd_tools`.
+**xdart** is a desktop application for real-time and batch X-ray diffraction
+analysis, built on [pyFAI](https://pyfai.readthedocs.io/) for azimuthal integration.
 
 The Scattering Workspace brings integration, processed-data browsing, 1D/2D
-viewers, and notebook export into one window. It supports NeXus output or
-lightweight XYE output, per-frame intensity thresholds, and Standard or
-Grazing-incidence geometry.
+viewers, and notebook export into one window. It supports NeXus and XYE output,
+with stitching and reciprocal-space mapping (RSM) coming soon to the GUI.
 
-The two former repositories were merged **with full git histories**
-(`git log --follow` works across the boundary); see
-[`MIGRATION.md`](https://github.com/v-thampy/xdart/blob/main/MIGRATION.md).
-The old `ssrl_xrd_tools` import name still
-works as a **deprecation shim** that re-exports the real `xrd_tools` modules
-— update imports to `xrd_tools` at your convenience.
+xdart's processing and analysis functions are also available through
+**`xrd_tools`**, its headless Python core, for scripts, Jupyter notebooks, and
+automated batch pipelines without Qt. The
+[example notebooks](examples/notebooks/README.md) cover integration,
+grazing incidence, stitching, reciprocal-space mapping, peak/phase/strain
+fitting, and analysis of processed results.
 
 ---
 
@@ -53,7 +42,6 @@ works as a **deprecation shim** that re-exports the real `xrd_tools` modules
   - [Analyze Results notebooks](#analyze-results-notebooks)
   - [Configuration & calibration](#configuration--calibration)
   - [Troubleshooting](#troubleshooting)
-- [Module architecture](#module-architecture)
 - [Development](#development)
 - [Contributing](#contributing)
 - [License](#license)
@@ -217,17 +205,6 @@ paths, not shell commands).
 ```bash
 pip install xdart
 ```
-
-> **Upgrading from the old `xdart` / `ssrl_xrd_tools`?** Uninstall the legacy
-> packages first so their entry points and shims don't shadow `xdart`:
->
-> ```bash
-> pip uninstall -y xdart ssrl_xrd_tools
-> ```
->
-> Then install `xdart` as above. See
-> [`MIGRATION.md`](https://github.com/v-thampy/xdart/blob/main/MIGRATION.md)
-> for the full import-name migration.
 
 ### Headless / notebooks with pixi
 
@@ -409,8 +386,8 @@ raw = get_raw_frame("processed/scan1.nexus", 0)    # resolves the source pointer
 
 ## Headless API guide
 
-> All examples import from `xrd_tools`. The legacy `ssrl_xrd_tools` import
-> name still resolves (deprecation shim) but is not recommended for new code.
+Use `xrd_tools` for headless processing and analysis. For complete workflows,
+see the [example notebooks](examples/notebooks/README.md).
 
 ### Basic integration
 
@@ -861,70 +838,6 @@ not determine how many full detector images remain resident.
 
 ---
 
-## Module architecture
-
-One distribution, two import packages under `src/`. Anything that does not
-need Qt belongs in `xrd_tools` ("keep xdart thin").
-
-### `xrd_tools` — headless core (no Qt)
-
-- **`core/`** — pure, import-light data contracts (no Qt/h5py/fabio/pyFAI at
-  import). `containers` (`PONI`, `IntegrationResult1D/2D`), `frame_view`
-  (`Axis`, `TwoDKind`, `FrameView`, the GI-kind classifier), `scan`
-  (`ScanFrame` / `Scan` / `FrameSource` — the reduction-input contracts),
-  `filters`, `geometry/`, `metadata`, `hdf5` (universal NumPy/pandas/Python
-  codec, lazily re-exported), `provenance`, `config`.
-- **`io/`** — persistence + readers. `schema.py` (schema-as-code), `nexus.py`
-  (stacked v2 writer/reader + strict validators), `nexus_record.py` (per-frame
-  record primitives + thumbnails), `read.py` (`get_1d/2d/thumbnail/metadata`,
-  `get_raw_frame`, `open_scan` / `ProcessedScan`, portable-path resolution),
-  `frame_view.py` (`read_frame_view` / `read_frame_views`), `image.py`,
-  `image_source.py`, `spec.py`, `metadata.py`, `nexus_inspect.py`, `export.py`,
-  `tiled.py`.
-- **`sources/`** — source-readiness and capability contracts, including
-  `describe_source_readiness`, shared by headless callers and xdart run gating.
-- **`reduction/`** — the streaming spine. `ReductionSession` (parallel workers
-  + single writer thread, bounded in-flight, fail-loud `finish()`),
-  `run_reduction`, sinks (`NexusSink`, `XYESink`, `MemorySink`,
-  `CompositeSink`), GI freeze policies, `FlushPolicy`.
-- **`session/`** — headless session/display contracts: readiness, display
-  decision logic, frame records, publication projections, and shared staging
-  budgets used by the GUI.
-- **`integrate/`** — pyFAI integration + GI (`integrate_1d/2d`,
-  `create_fiber_integrator`, `integrate_gi_*`, `stitch_1d/2d`,
-  calibration: `load_poni` / `poni_to_integrator` / `poni_to_fiber_integrator`).
-- **`transforms/`** — unit conversions (`tth_to_q`, `q_to_tth`, `q_to_d`,
-  `d_to_q`, `energy_to_wavelength`) and angular calculations.
-- **`rsm/`** — reciprocal-space mapping (`ExperimentConfig`, `RSMVolume`,
-  HKL gridding, VTK export).
-- **`analysis/`** — `fitting` (lmfit peak + `PhaseFitter` phase fitting,
-  backgrounds incl. SNIP), `phase` (`PhaseModel` over pymatgen), `strain`
-  (sin²ψ).
-- **`corrections/`** — intensity-correction modules (see above).
-- **`viz/`** — matplotlib/plotly headless plotting (no Qt).
-- **`gui/`** — Jupyter-widget viewers for notebooks (`powder_1d_viewer`,
-  `powder_2d_viewer`, `rsm_viewer`, `napari_viewer`). `gui.main` is a reserved
-  entry point only — it raises `NotImplementedError`; the desktop GUI is
-  `xdart`.
-
-### `xdart` — Qt GUI (thin consumer)
-
-- **`xdart_main.py`** — thin Qt-probing entry (the `xdart` console script;
-  `xdart.xdart_main:main`).
-- **`modules/`** — the retained Qt-free GUI ownership records and publication
-  envelope (`display_context.py`, `frame_publication.py`). Reduction sessions,
-  source reads, and NeXus writes are owned by `xrd_tools`.
-- **`gui/tabs/scattering/`** — the sole built-in Scattering Workspace: typed
-  control intent, source/browse adapters, run coordination, and scientific
-  presentation. Qt-free display decisions remain in `xrd_tools.session`, and
-  file access goes through the headless `xrd_tools.io` / source APIs.
-- **`gui/widgets/` and `gui/analysis/`** — shared current controls, run status,
-  plotting widgets, and analysis dialogs used by the Scattering Workspace.
-
-Layer map: [`docs/ARCHITECTURE.md`](https://github.com/v-thampy/xdart/blob/main/docs/ARCHITECTURE.md).
-
----
-
 ## Development
 
 ### Editable install with Pixi (recommended)
@@ -1040,13 +953,14 @@ open an issue on the GitHub repository.
 ## License
 
 First-party code is released under the **MIT License** (see
-[LICENSE](https://github.com/v-thampy/xdart/blob/main/LICENSE)); code
-inherited from `ssrl_xrd_tools` is BSD-3-Clause (see
-`licenses/LICENSE-ssrl_xrd_tools`). SPDX: `MIT AND BSD-3-Clause`.
+[LICENSE](https://github.com/v-thampy/xdart/blob/main/LICENSE)). Portions of
+the headless core retain their
+[BSD-3-Clause license](licenses/LICENSE-ssrl_xrd_tools).
+SPDX: `MIT AND BSD-3-Clause`.
 
 ## Citation
 
-If you use `xdart` (`xrd_tools` / `xdart`) in your research, please cite:
+If you use xdart or its `xrd_tools` core in your research, please cite:
 
 ```
 xdart: SSRL X-ray diffraction toolkit (headless reduction core + xdart GUI)

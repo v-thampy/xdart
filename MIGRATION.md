@@ -1,4 +1,13 @@
-# Migration: `ssrl_xrd_tools` + `xdart` → `xrd-tools` 1.0 (monorepo)
+# Migration notes
+
+The current distribution is **xdart**, with `xdart` and `xrd_tools` as its
+Python import packages. The legacy `ssrl_xrd_tools` import alias has been
+removed; update those imports to `xrd_tools`. See the
+[README installation guide](README.md#install) for current Pixi and pip setup.
+The notes below describe the earlier repository merger, including the
+historical `xrd-tools` distribution name and installation commands.
+
+## Repository merger (June 2026)
 
 June 2026.  The two repositories are now ONE distribution — `xrd-tools` —
 holding the headless reduction core (import package `xrd_tools`) and the Qt
@@ -45,16 +54,14 @@ from xrd_tools.reduction import ReductionPlan, ReductionSession, NexusSink
 from xrd_tools.io import read_scan, get_1d, read_frame_view, open_scan
 ```
 
-`import ssrl_xrd_tools` still works through a deprecation shim that returns
-the REAL `xrd_tools` modules (true module identity — `isinstance` and
-monkeypatching across the alias are safe) and emits one `DeprecationWarning`.
-The shim is scheduled for removal; update imports.
+Replace `ssrl_xrd_tools` with `xrd_tools` in existing Python imports.
+The legacy alias is no longer shipped.
 
 ## Renames / API changes (the 1.0 window)
 
 | old | new | notes |
 |---|---|---|
-| `ssrl_xrd_tools.*` | `xrd_tools.*` | mechanical rename, shimmed |
+| `ssrl_xrd_tools.*` | `xrd_tools.*` | import rename required; legacy alias removed |
 | `io.read.Scan` (removed) | `io.read.ProcessedScan` | use the explicit read-side type; the old name collided with the reduction-input `Scan` |
 | `reduction/core.py` legacy `Frame/MaskSpec/FrameSource/Scan` block | deleted | the names remain as aliases to the `xrd_tools.core.scan` contracts (same runtime classes) |
 | `NexusSink.swmr` | removed | was dead: `open_nexus_writer(swmr=True)` has refused since 0.41 |

@@ -87,7 +87,7 @@ Changelog = "https://github.com/v-thampy/xdart/blob/main/MIGRATION.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["xrd_tools*", "xdart*", "ssrl_xrd_tools*"]
+include = ["xrd_tools*", "xdart*"]
 
 [tool.setuptools.package-data]
 xdart = ["**/*.ui"]

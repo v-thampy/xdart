@@ -23,7 +23,7 @@ jobs:
       - uses: actions/setup-python@v6
         with: {python-version: "3.13"}
       - run: pip install -e ".[dev]"
-      - run: pytest tests/core/test_architecture_guards.py tests/core/test_ssrl_shim.py -q --timeout=120
+      - run: pytest tests/core/test_architecture_guards.py -q --timeout=120
 
   xdart-offscreen:
     runs-on: ubuntu-latest
