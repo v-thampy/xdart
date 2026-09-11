@@ -16,6 +16,8 @@ The Scattering Workspace brings integration, processed-data browsing, 1D/2D
 viewers, and notebook export into one window. It supports NeXus and XYE output,
 with stitching and reciprocal-space mapping (RSM) coming soon to the GUI.
 
+![xdart Scattering Workspace displaying a detector image, a 2D diffraction map, and an integrated 1D pattern](docs/assets/xdart-workspace.png)
+
 xdart's processing and analysis functions are also available through
 **`xrd_tools`**, its headless Python core, for scripts, Jupyter notebooks, and
 automated batch pipelines without Qt. The
