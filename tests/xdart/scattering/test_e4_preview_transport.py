@@ -3205,13 +3205,28 @@ def test_e6pm2_same_active_same_token_resubmit_returns_one_ticket(
         state, art_owner, gate, processed, 2, HydrationPurpose.PREVIEW, 1
     )
     entered, release = _hold_reads(monkeypatch)
+    read_calls = []
+    held_read = _transport_api().read_frame_preview
+
+    def counted_read(*args, **kwargs):
+        read_calls.append(args)
+        return held_read(*args, **kwargs)
+
+    monkeypatch.setattr(_transport_api(), "read_frame_preview", counted_read)
 
     first = _admit(transport, request)
     assert entered.wait(timeout=10.0)
     assert _admit(transport, request) is first  # one outstanding receipt
+    equal_request = _typed_request(
+        state, art_owner, gate, processed, 2, HydrationPurpose.PREVIEW, 1
+    )
+    assert equal_request.token == request.token
+    assert equal_request.token is not request.token
+    assert _admit(transport, equal_request) is first
 
     release.set()
     assert _wait_transport_idle(state)
+    assert len(read_calls) == 1
     assert first.result() is not None
     assert first.result().outcome is not HydrationOutcome.SUPERSEDED
 
