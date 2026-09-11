@@ -2323,8 +2323,9 @@ preview = FilesystemSourceAdapter().preview_motors(
 )
 assert preview.gi_motor_choices == (), preview
 
-# The builtin adapters bootstrap lazily on first registry use; the preview
-# above must have brought the image owner up without any GUI registration.
+# The builtin adapters bootstrap lazily on first registry use (so the
+# registry is never observably empty); in this fresh process nothing GUI-side
+# registered anything, and the image owner still resolves.
 from xrd_tools.sources.adapters import candidate_owner
 owner = candidate_owner(image)
 assert owner is not None and owner.id == "image_file", owner
