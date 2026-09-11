@@ -302,8 +302,10 @@ def test_tight_combo_popup_rows_keep_independent_readable_height(
         assert combo.view().viewport().width() >= widest_text
         if path == ("Signal", "meta_ext"):
             row = combo.parentWidget()
-            gap = combo.x() - (row.label.x() + row.label.sizeHint().width())
-            assert gap <= row.layout().spacing()
+            text_width = row.label.fontMetrics().horizontalAdvance(row.label.text())
+            gap = combo.x() - (row.label.x() + text_width)
+            # QLabel rounds its glyph bounds up to whole widget pixels.
+            assert gap <= row.layout().spacing() + 1
     finally:
         if combo is not None:
             combo.hidePopup()
