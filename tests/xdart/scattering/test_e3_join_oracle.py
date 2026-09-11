@@ -419,9 +419,32 @@ def test_j0_01_run_mounts_exact_a_and_shell_bindings(
         assert bindings.publication_store is context.publication_store
 
         _wait(rig.app, lambda: bool(rig.controller.frame_keys))
+        # Presentation pacing (Single + Auto Last) repaints the scientific
+        # surface on hydration boundaries, not on every FRAME_READY, so the
+        # selector can trail controller.frame_keys by a few frames on a slow
+        # host (Linux CI).  The contract is that a reconcile mirrors the
+        # exact key objects; wait for one, then pin the mirrored snapshot.
+        selector = rig.shell.scientific.frame_selector
+
+        def selector_mirrors_keys() -> bool:
+            keys = rig.controller.frame_keys
+            return bool(keys) and selector.count() == len(keys) and all(
+                selector.itemData(index) is key
+                for index, key in enumerate(keys)
+            )
+
+        _wait(
+            rig.app,
+            selector_mirrors_keys,
+            diagnostic=lambda: (
+                f"selector={selector.count()} "
+                f"keys={len(rig.controller.frame_keys)} "
+                f"phase={rig.lifecycle.phase}"
+            ),
+        )
         keys = rig.controller.frame_keys
         assert all(
-            rig.shell.scientific.frame_selector.itemData(index) is key
+            selector.itemData(index) is key
             for index, key in enumerate(keys)
         )
         assert all(
