@@ -784,8 +784,11 @@ def test_runtime_facade_keeps_viewer_out_of_light_graph_and_detector_target_is_t
 
     fake = FakeTransport()
     state._transport = fake
-    records, publications = object(), object()
-    art = runtime.DisplayArtifact(Path("artifact.nxs"), "scan", records, publications)
+    art = state.add_artifact(
+        Path("artifact.nxs"), "scan", mask=None,
+        mask_saturation=False, measurement_mode="Standard",
+    )
+    records, publications = art.records, art.publications
     owner = dc.HydrationOwner("ctx", "scan", "source", 1)
     gate = dc.CommitGate()
     key = values.DisplayFrameKey(state.identity, "scan", "artifact.nxs", 7, 1)
@@ -890,7 +893,10 @@ def test_real_runtime_worker_start_and_fast_completion_are_post_admission(
         completed.append(value)
 
     state._transport._completion_sink = completion
-    artifact = runtime.DisplayArtifact(Path("artifact.nxs"), "scan", object(), object())
+    artifact = state.add_artifact(
+        Path("artifact.nxs"), "scan", mask=None,
+        mask_saturation=False, measurement_mode="Standard",
+    )
     owner = dc.HydrationOwner("ctx", "scan", "source", 1)
     gate = dc.CommitGate()
     key = values.DisplayFrameKey(state.identity, "scan", "artifact.nxs", 0, 1)

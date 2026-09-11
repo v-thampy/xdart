@@ -16,9 +16,11 @@ from xdart.gui.tabs.scattering.context_controller import ContextController
 from xdart.gui.tabs.scattering.context_projection import ContextProjection
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey, StandardEventKind, StandardRunEvent
 from xdart.gui.tabs.scattering.events import RunIdentity
+from xdart.gui.tabs.scattering.metadata_operations import MetadataOperationOwner
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.processed_browser import ProcessedBrowserOwner
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
+from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xdart.gui.tabs.scattering.workspace_operations import (
@@ -152,7 +154,7 @@ def test_catalog_first_controller_mounts_exact_identity_and_navigation(tmp_path,
         ledger = viewer_api.viewer_2d_selected_ledger(owner.catalog, owner.frame.label)
         assert (owner.receipt.phase, owner.receipt.capacity, owner.receipt.reserved) == (Viewer2DReceiptPhase.FRAME_READY_A, ledger.budget, ledger.admission)
         kind = ({"processed": ("Processed raw", "Thumbnail preview"), "csv": ("CSV matrix",)}.get(family, ("NumPy array",) * len(expected) if family in {"npy2", "npy3", "npz"} else ("Raw detector",)))[index]
-        assert payload.title == f"{path.name} · frame {controller.navigation.current.local_frame_label} · {kind}"
+        assert payload.title == f"{path.name} · frame {index + 1} · {kind}"
         assert payload.status == (f"2D Viewer · {kind}" + (" · Raw source unavailable; displaying stored thumbnail." if kind == "Thumbnail preview" else ""))
         token = controller._viewer_2d.request_token
         assert controller.select_viewer_2d_frame(controller.navigation.current.local_frame_label)
@@ -330,6 +332,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
     @dataclass(frozen=True)
     class _ShellProjection:
         scientific: _ScientificProjection
+        external_tools: object = None
 
     calls: list[object] = []
     clear_request = object()
@@ -350,6 +353,8 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         close_viewer_2d=lambda: calls.append("close") or True)
     scientific = SimpleNamespace(
         clear_viewer_2d=lambda _request: "forged",
+        drop_viewer_loading_snapshot=lambda: calls.append("drop-snapshot"),
+        expect_display_background=lambda _key: None,
         trace_row_count=0,
         bottom_waterfall_active=False,
     )
@@ -360,7 +365,9 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _scientific_repaint_pending=False,
         _waterfall_candidate_count=0,
         _workspace_operations=WorkspaceOperationOwner(),
+        _metadata_operations=MetadataOperationOwner(),
         _processed_browser=processed_browser,
+        _pending_viewer_2d_path=None,
         _batch_terminal=SimpleNamespace(
             active=False,
             project_progress=lambda progress: progress,
@@ -383,6 +390,8 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _refresh_shell=lambda: calls.append("refresh"), _polling_needed=lambda: True,
         _run_timer=SimpleNamespace(stop=lambda: calls.append("stop")))
     page._clear_presentation_targets = partial(ScatteringWorkspace._clear_presentation_targets, page)
+    page._retire_lost_reintegrate_successor = partial(
+        ScatteringWorkspace._retire_lost_reintegrate_successor, page)
     page._clear_viewer_2d_renderer = partial(ScatteringWorkspace._clear_viewer_2d_renderer, page)
     command = ShellCommand(ShellCommandKind.SELECT_SCAN, "/retained/result.nxs")
     ScatteringWorkspace._handle_shell_command(page, command)
@@ -402,6 +411,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
     controller.__dict__.update(
         synchronize_acquisition_scope=lambda: None,
         capture_norm_aggregate_for_refresh=lambda: None,
+        cancel_browse_slices=lambda: None,
         viewer_2d_cleanup_pending=False,
         browse_context=None,
         navigation=SimpleNamespace(current=None), project_navigation=lambda **_: (),
@@ -413,22 +423,29 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
             processing_mode="2D Viewer", live_mode=False, source_spec=None, run_options={}))),
         _project_controls=lambda _snapshot: None, _start_permitted=lambda: (True, ""), _sync_detector_demand=lambda: None,
         _mutating_operation_busy=lambda: False,
-        _preferences=SimpleNamespace(slice_pins=()), _retain_outgoing_display=False,
+        _preferences=ScientificPreferences(), _retain_outgoing_display=False,
+        _external_tools=SimpleNamespace(project=lambda **_kwargs: None),
+        _qualify_external_nexus=lambda **_kwargs: None,
         _source_selection=SimpleNamespace(observation=None),
             _context_projection=SimpleNamespace(
                 build_shell=lambda **_: _ShellProjection(retained),
             ),
-            _background_owner=SimpleNamespace(projection=lambda: None),
+            _background_owner=SimpleNamespace(projection=lambda: None, active_key=None),
             _shell_revision=0, _controls_readiness=None, _progress=None,
         _notice_text="")
     def fail_render(_projection, *, preserve_display=False):
+        calls.append("render-failed")
         raise RuntimeError("render")
-    page._shell = SimpleNamespace(browser=SimpleNamespace(reconcile_heavy_residency=lambda *_args, **_kwargs: None), apply_state=fail_render)
+    page._shell = SimpleNamespace(scientific=scientific, browser=SimpleNamespace(
+        reconcile_detector_mode=lambda _projection: None,
+        reconcile_heavy_residency=lambda *_args, **_kwargs: None), apply_state=fail_render)
     page._notice = lambda text: setattr(page, "_notice_text", text)
     page._last_scientific_projection = retained
     owner_state = (controller.viewer_2d_frame, controller.viewer_2d_context)
     assert retained.heavy.raw is canonical
     ScatteringWorkspace._refresh_shell(page)
+    assert calls[-2:] == ["render-failed", "drop-snapshot"]
+    assert page._notice_text == "Passive shell render failed: render"
     assert page._last_scientific_projection is None and owner_state == (controller.viewer_2d_frame, controller.viewer_2d_context)
     assert processed_browser.begin_close()
 
@@ -494,7 +511,11 @@ def test_real_viewer_chooser_preserves_opaque_identity_and_acquisition_isolation
     )
     controller.viewer_2d_context = SimpleNamespace(original_path=selected)
     page._viewer_2d_file_chooser = forbidden
-    page._clear_viewer_2d_renderer = lambda *, preserve_navigation=False: calls.append("clear") or True
+    def clear_renderer(*, close=False, preserve_navigation=False):
+        assert close is True and preserve_navigation is False
+        calls.append("clear")
+        return True
+    page._clear_viewer_2d_renderer = clear_renderer
     ScatteringWorkspace._run_action(page)
     assert calls[-4:] == ["clear", ("open", selected), ("notice", ""), "timer"]
 def _scientific(monkeypatch, *, failing=False):
@@ -599,7 +620,7 @@ def test_viewer_transaction_hides_renders_reveals_last_and_retries_same_array(mo
     state = SimpleNamespace(
         processing_mode="2D Viewer", heavy=SimpleNamespace(frame=frame, raw=array, detector_shape=None),
         heavy_available=frozenset((frame,)), color_map="plasma", log_scale=True,
-        title="image.npy · frame 7 · NumPy array", status="2D Viewer · NumPy array",
+        title="image.npy · frame 2 · NumPy array", status="2D Viewer · NumPy array",
         background_set=False, background_enabled=True)
     navigation = SimpleNamespace(frames=(prior, frame), current=frame, selected=(frame,))
     def reconcile(target=view):
@@ -639,7 +660,9 @@ def test_viewer_transaction_hides_renders_reveals_last_and_retries_same_array(mo
     assert (view.raw.canvas.histogram.lo_lim, view.raw.canvas.histogram.hi_lim) == (0.0, np.log10(12.0))
     assert view.raw.canvas.imageItem.mapRectToParent(view.raw.canvas.imageItem.boundingRect()) == QtCore.QRectF(0, 0, 3, 2)
     assert view.progress.text() == "2/2"
-    assert [view.frame_selector.itemText(index) for index in range(view.frame_selector.count())] == ["2", "7"]
+    assert [view.frame_selector.itemText(index) for index in range(view.frame_selector.count())] == ["1", "2"]
+    assert view.frame_selector.itemData(0) is prior
+    assert view.frame_selector.itemData(1) is frame
     assert view.cake.canvas.imageItem.image is view.waterfall.canvas.imageItem.image is None
     assert view.curve.listDataItems() == []
     assert view.norm.isHidden() and not view.background.isHidden()
