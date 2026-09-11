@@ -7695,7 +7695,8 @@ packages:
   - plotly
   - lmfit ; extra == 'fitting'
   - pymatgen ; extra == 'fitting'
-  - xrayutilities ; extra == 'rsm'
+  - xrayutilities==1.7.12 ; extra == 'rsm'
+  - numpy==2.5.1 ; extra == 'rsm'
   - pyevtk ; extra == 'rsm'
   - pyside6>=6.5 ; extra == 'gui'
   - pyqtgraph>=0.13.7 ; extra == 'gui'

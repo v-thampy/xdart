@@ -113,8 +113,6 @@ acquisition stream through the **same** headless reduction spine (parallel
 pyFAI workers and a single writer). The GUI displays completed results from
 the saved NeXus or XYE output.
 
-![xdart Scattering Workspace displaying a detector image, a 2D diffraction map, and an integrated 1D pattern](docs/assets/xdart-workspace.png)
-
 ### Key capabilities
 
 - **Real-time 1D/2D azimuthal integration** using pyFAI.

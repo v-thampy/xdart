@@ -136,7 +136,7 @@ pixi run jupyter lab
 - The env lives in `./.pixi/` next to the notebooks; commit `pixi.toml` +
   `pixi.lock` and anyone (including future-you) reproduces the exact env with one
   `pixi install`.
-- Add `[rsm]` via conda where possible — `pixi add xrayutilities` (conda-forge)
+- Add `[rsm]` via conda where possible — `pixi add xrayutilities==1.7.12 numpy==2.5.1` (conda-forge)
   avoids the missing macOS-arm64 PyPI wheels.
 - `pixi run python script.py` runs a headless batch script; `pixi shell` in the
   workspace is the equivalent of `conda activate`.
@@ -282,7 +282,7 @@ platforms = ["win-64"]
 
 [dependencies]
 python = "3.13.*"
-numpy = "*"
+numpy = "==2.5.1"
 h5py = "*"
 hdf5plugin = "*"
 hdf5 = "*"
@@ -293,7 +293,7 @@ fabio = "*"
 pyfai = ">=2026.5,<2026.6"
 silx = "*"
 pyside6 = "*"
-xrayutilities = "*"
+xrayutilities = "==1.7.12"
 
 [pypi-dependencies]
 xdart = { path = "../xdart", editable = true, extras = ["gui", "dev", "notebook"] }
