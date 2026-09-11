@@ -33,6 +33,18 @@ from xrd_tools.rsm.corrections import detector_header_to_ai
 _MAX_COUNT = 2**24
 _Q_ROOT_POLICY = "shared_ultimate_ndarray_root_weakref_v1"
 _RUNTIME_GEOMETRY_FACTORY = object()
+# SURFACE v1 pins the float64 solid-angle bytes the reference host (macOS
+# arm64) computes from the asset's detector header.  Other libm/SIMD builds
+# land within an ULP of the same array and hash differently, so the asset
+# reference maps to every hash accepted as that projection.  Add a platform
+# only from its own CI log (the refusal below prints the host hash); the
+# projection carries the reference, provenance carries the host value.
+_SOLID_ANGLE_SHA256_EQUIVALENTS: Mapping[str, frozenset[str]] = {
+    "a8d6453bc56b99a0c3151b54999adff4684de5648b8f23c8deb7aa0799937034": frozenset({
+        # macOS arm64 (reference host, == asset corrections.solid_angle_sha256)
+        "a8d6453bc56b99a0c3151b54999adff4684de5648b8f23c8deb7aa0799937034",
+    }),
+}
 
 
 class XuStitchScienceRefused(RuntimeError):
@@ -65,6 +77,8 @@ class XuStitchEffectiveGeometryProjection:
     sample_axes: tuple[str, ...]
     detector_axes: tuple[str, ...]
     camera: tuple[str, str]
+    # What this host computed; equivalent to the reference, not fingerprinted.
+    solid_angle_sha256_host: str
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -84,6 +98,8 @@ class XuStitchEffectiveGeometryProjection:
             != "0a48766039393e4b1ffc08e70e09b3af762b90a451eabfdad392ecc773b04b28"
             or self.solid_angle_sha256
             != "a8d6453bc56b99a0c3151b54999adff4684de5648b8f23c8deb7aa0799937034"
+            or self.solid_angle_sha256_host
+            not in _SOLID_ANGLE_SHA256_EQUIVALENTS[self.solid_angle_sha256]
             or self.energy_eV != 17000.018
             or self.xdart_wavelength_A != 0.7293180418985439
             or self.xu_mapping_wavelength_A != 0.7293180420938394
@@ -124,6 +140,7 @@ class XuStitchEffectiveGeometryProjection:
             "mask_count": self.mask_count,
             "mask_sha256": self.mask_sha256,
             "solid_angle_sha256": self.solid_angle_sha256,
+            "solid_angle_sha256_host": self.solid_angle_sha256_host,
             "energy_eV": self.energy_eV,
             "xdart_wavelength_A": self.xdart_wavelength_A,
             "xu_mapping_wavelength_A": self.xu_mapping_wavelength_A,
@@ -248,15 +265,20 @@ def resolve_xu_stitch_effective_geometry(
         dtype=np.float64,
         order="C",
     )
+    solid_sha256 = _sha256_array(solid, "<f8")
+    accepted_solid_sha256 = _SOLID_ANGLE_SHA256_EQUIVALENTS.get(
+        corrections["solid_angle_sha256"], frozenset()
+    )
     if (
         solid.shape != shape
         or not np.isfinite(solid).all()
         or np.any(solid <= 0)
-        or _sha256_array(solid, "<f8") != corrections["solid_angle_sha256"]
+        or solid_sha256 not in accepted_solid_sha256
     ):
         raise XuStitchScienceRefused(
             "XU_SOLID_ANGLE_MISMATCH",
-            "solid-angle projection differs from SURFACE v1",
+            "solid-angle projection differs from SURFACE v1 "
+            f"(host sha256={solid_sha256}; accepted={sorted(accepted_solid_sha256)})",
         )
     energy = float(acquisition["energy_eV"])
     if energy_eV_to_wavelength_m(energy) * 1e10 != acquisition["xdart_wavelength_A"]:
@@ -300,13 +322,14 @@ def resolve_xu_stitch_effective_geometry(
         shape,
         int(mask.sum()),
         _sha256_array(mask, "|u1"),
-        _sha256_array(solid, "<f8"),
+        str(corrections["solid_angle_sha256"]),
         energy,
         float(acquisition["xdart_wavelength_A"]),
         float(hxrd._wl),
         tuple(xu_asset["sample_axes"]),
         tuple(xu_asset["detector_axes"]),
         tuple(xu_asset["camera"]),
+        solid_sha256,
     )
     frozen_mask = np.frombuffer(mask.tobytes(order="C"), dtype=bool).reshape(shape)
     frozen_solid = np.frombuffer(
