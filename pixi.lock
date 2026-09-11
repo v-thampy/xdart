@@ -7701,6 +7701,7 @@ packages:
   - pyside6>=6.5 ; extra == 'gui'
   - pyqtgraph>=0.13.7 ; extra == 'gui'
   - qtawesome ; extra == 'gui'
+  - pyopengl ; extra == 'gui'
   - nexpy==2.0.1 ; extra == 'gui'
   - imagecodecs ; extra == 'gui'
   - imageio ; extra == 'gui'
