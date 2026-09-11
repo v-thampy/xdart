@@ -32,6 +32,7 @@ from xrd_tools.io import (
 from xrd_tools.io.output_transaction import (
     TargetSnapshot,
     capture_target_snapshot,
+    revalidate_target_snapshot,
     revalidate_stream_terminal,
     stream_terminal_object_revision,
 )
@@ -642,6 +643,8 @@ class Browse1DHydrationLane:
         terminal = self._terminal
         if terminal is not None:
             return revalidate_stream_terminal(request.artifact, terminal)
+        if self._capture_snapshot is capture_target_snapshot:
+            return revalidate_target_snapshot(request.artifact, request.target_snapshot)
         return self._capture_snapshot(request.artifact)
 
     def _open_and_read(

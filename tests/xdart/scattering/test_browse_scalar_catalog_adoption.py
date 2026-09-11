@@ -87,9 +87,18 @@ def test_default_browse_adopts_one_scalar_catalog_without_payload_rows(
     )
     from xrd_tools.io import FrameScalarCatalog, FrameViewReader
     frame_view_module = importlib.import_module("xrd_tools.io.frame_view")
+    transaction_module = importlib.import_module("xrd_tools.io.output_transaction")
 
     seeded = _seed_existing(tmp_path, monitor="i0")
     payload_calls: list[str] = []
+    hashed = []
+    real_hash = transaction_module._sha256_handle
+
+    def record_hash(handle):
+        hashed.append(handle.name)
+        return real_hash(handle)
+
+    monkeypatch.setattr(transaction_module, "_sha256_handle", record_hash)
 
     def forbidden(name):
         def call(*_args, **_kwargs):
@@ -130,6 +139,30 @@ def test_default_browse_adopts_one_scalar_catalog_without_payload_rows(
         len(seeded.labels),
     )
 
+    # The initial digest binds the file; unchanged-file revalidation must not
+    # reread the entire artifact for load completion or first-frame hydration.
+    from xdart.gui.tabs.scattering.browse_1d_hydration import Browse1DHydrationLane
+    from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
+    from xdart.gui.tabs.scattering.events import RunIdentity
+    from xdart.modules.display_context import DisplaySelection
+    from tests.xdart.scattering.test_browse_1d_hydration import _drain
+
+    selection = DisplaySelection.for_context(context, 1)
+    frame = DisplayFrameKey(
+        RunIdentity(1, "scalar-default"), context.scan_key,
+        context.requested_path, seeded.labels[0], 1,
+    )
+    # Payload prohibition above covers catalog adoption only.
+    monkeypatch.undo()
+    monkeypatch.setattr(transaction_module, "_sha256_handle", record_hash)
+    lane = Browse1DHydrationLane(context)
+    try:
+        assert lane.submit(selection, (frame,)) is not None
+        assert _drain(lane)
+        assert context.browse_1d_cache.resident_keys
+    finally:
+        assert lane.release()
+
     receipt = loader.release_context(context)
     assert receipt.cleanup_status.value == "cleaned"
     assert context.released and not context.loaded
@@ -137,6 +170,7 @@ def test_default_browse_adopts_one_scalar_catalog_without_payload_rows(
     # Holding the released context cannot retain the catalog graph; only this
     # explicit test reference now keeps it alive.
     assert catalog.rows and context.scalar_catalog is None
+    assert len(hashed) == 1
 
 
 @pytest.mark.parametrize("finish", ("retry", "cancel", "close", "replace"))

@@ -25,6 +25,7 @@ from xrd_tools.io.browse_presentation import read_browse_presentation
 from xrd_tools.io.output_transaction import (
     TargetSnapshot,
     capture_target_snapshot,
+    revalidate_target_snapshot,
     revalidate_stream_terminal,
     stream_terminal_object_revision,
 )
@@ -1081,7 +1082,7 @@ class BrowseLoader:
             return None
         started = stage_start()
         after = (
-            capture_target_snapshot(path)
+            revalidate_target_snapshot(path, before)
             if sealed_terminal is None
             else revalidate_stream_terminal(path, sealed_terminal)
         )

@@ -8,7 +8,7 @@ kernel's contract has been accepted.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 import os
@@ -291,6 +291,9 @@ class TargetSnapshot:
     device: int | None
     inode: int | None
     digest: str | None
+    # A full read can be revalidated against this exact filesystem revision.
+    # Keep content equality unchanged (e.g. a rename changes ctime, not bytes).
+    ctime_ns: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -655,12 +658,52 @@ def _capture_target(target: str, *, hash_content: bool = True) -> TargetSnapshot
         int(after.st_dev),
         int(after.st_ino),
         digest,
+        int(after.st_ctime_ns),
     )
 
 
 def capture_target_snapshot(path: Path | str) -> TargetSnapshot:
     """Return one stable, content-sensitive observation without ownership."""
     return _capture_target(os.path.realpath(os.fspath(path)))
+
+
+def revalidate_target_snapshot(
+    path: Path | str, snapshot: TargetSnapshot,
+) -> TargetSnapshot:
+    """Reuse a content digest only while its exact file revision is unchanged.
+
+    This uses the same filesystem revision as stream-terminal revalidation;
+    ctime also detects in-place edits that restore the previous size/mtime.
+    Snapshots without that observation retain the full content check.
+    """
+    if type(snapshot) is not TargetSnapshot or not snapshot.exists:
+        raise TypeError("target revalidation requires an existing TargetSnapshot")
+    if snapshot.ctime_ns is None or snapshot.digest is None:
+        current = capture_target_snapshot(path)
+        if current != snapshot:
+            raise TargetChanged("target changed since its content snapshot")
+        return current
+    expected = (
+        snapshot.device, snapshot.inode, snapshot.size,
+        snapshot.mtime_ns, snapshot.ctime_ns,
+    )
+    target = os.path.realpath(os.fspath(path))
+    try:
+        descriptor = os.open(target, os.O_RDONLY)
+    except OSError as error:
+        raise TargetChanged(f"target is unavailable: {target}") from error
+    try:
+        before = os.fstat(descriptor)
+        try:
+            named = os.stat(target)
+        except OSError as error:
+            raise TargetChanged(f"target pathname is unavailable: {target}") from error
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if any(_stat_identity(value) != expected for value in (before, named, after)):
+        raise TargetChanged("target changed since its content snapshot")
+    return snapshot
 
 
 def revalidate_stream_terminal(
@@ -4141,6 +4184,7 @@ __all__ = [
     "TargetLease",
     "TargetSnapshot",
     "capture_target_snapshot",
+    "revalidate_target_snapshot",
     "revalidate_stream_terminal",
     "stream_terminal_object_revision",
     "TransactionPhase",
