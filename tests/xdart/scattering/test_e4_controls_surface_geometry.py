@@ -250,8 +250,12 @@ def test_controls_interactive_surfaces_share_square_scaled_geometry(
         )
 
 
+@pytest.mark.parametrize("path", (
+    ("Int1D", "axis"), ("Signal", "img_ext"), ("Signal", "meta_ext"),
+))
 def test_tight_combo_popup_rows_keep_independent_readable_height(
     qapp: QtWidgets.QApplication,
+    path: tuple[str, ...],
 ) -> None:
     apply_theme(
         qapp,
@@ -275,7 +279,7 @@ def test_tight_combo_popup_rows_keep_independent_readable_height(
         combo = next(
             row.editor
             for row in panel.findChildren(FormRow)
-            if row.path == ("Int1D", "axis")
+            if row.path == path
         )
         combo.showPopup()
         qapp.processEvents()
@@ -291,6 +295,15 @@ def test_tight_combo_popup_rows_keep_independent_readable_height(
             for row in range(visible)
         )
         assert combo.view().height() >= expected_viewport_height
+        widest_text = max(
+            combo.fontMetrics().horizontalAdvance(combo.itemText(index))
+            for index in range(combo.count())
+        )
+        assert combo.view().viewport().width() >= widest_text
+        if path == ("Signal", "meta_ext"):
+            row = combo.parentWidget()
+            gap = combo.x() - (row.label.x() + row.label.sizeHint().width())
+            assert gap <= row.layout().spacing()
     finally:
         if combo is not None:
             combo.hidePopup()

@@ -546,7 +546,15 @@ class _ControlsComboBox(QtWidgets.QComboBox):
 
     def showPopup(self) -> None:
         view = self.view()
+        view.setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
         view.doItemsLayout()
+        popup_width = (
+            view.sizeHintForColumn(0) + 2 * view.frameWidth()
+            + view.style().pixelMetric(
+                QtWidgets.QStyle.PixelMetric.PM_ScrollBarExtent, None, view,
+            )
+        )
+        view.setMinimumWidth(max(self.width(), popup_width))
         visible = min(self.count(), max(1, self.maxVisibleItems()))
         row_height = max(
             (view.sizeHintForRow(row) for row in range(visible)),
@@ -1702,10 +1710,14 @@ class ControlsPanel(QtWidgets.QWidget):
             for field in present:
                 sub = self._make_bound_row(field)
                 if field.path in tight:
-                    # Directory mode pairs File Type + Meta Type; keep Meta Type
-                    # compact, but not jammed against its editor.
+                    # Paired labels use their text width instead of the full
+                    # form's aligned label column.
                     if getattr(sub, "label", None) is not None:
-                        sub.label.setMinimumWidth(92)
+                        sub.label.setMinimumWidth(0)
+                        sub.label.setSizePolicy(
+                            QtWidgets.QSizePolicy.Maximum,
+                            QtWidgets.QSizePolicy.Preferred,
+                        )
                     if sub.layout() is not None:
                         sub.layout().setSpacing(6)
                 is_bool = getattr(field.kind, "value", field.kind) == "bool"
