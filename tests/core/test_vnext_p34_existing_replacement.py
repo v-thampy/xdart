@@ -17,6 +17,17 @@ def _module():
     return reintegrate
 
 
+def _replacement_source_context(path):
+    from xrd_tools.io.append import decode_replacement_lineage
+
+    with h5py.File(path, "r") as handle:
+        _base, lineage, _decoded = decode_replacement_lineage(handle)
+        execution = json.loads(
+            handle["entry/reduction/config/source_execution"].asstr()[()]
+        )
+    return {"source_execution": execution, "append_lineage": lineage}
+
+
 def _successor_from_plan(plan, *, destination_directory=None):
     """Build the immutable v4 execution plan from admitted v3 support facts."""
     from xrd_tools.reduction import ReintegrateSuccessorPlan
@@ -148,11 +159,13 @@ def test_target_snapshot_mismatch_abandons_before_stream_and_releases_lease(tmp_
     seeded = _seed_existing(tmp_path, name="post-lease")
     original = capture_target_snapshot(seeded.target)
     selected = seeded.preparation["selected_plan"]
+    source_context = _replacement_source_context(seeded.target)
     sink = NexusSink.for_existing_replacement(
         seeded.target, expected_target_snapshot=original, dimension="1d",
         labels=seeded.labels, audit_bytes=b"{}", selected_plan=selected["bai_args"],
         selected_gi_mode=None, source_base=seeded.target.parent,
         file_lock=threading.RLock(), flush_every=None,
+        **source_context,
     )
     with h5py.File(seeded.target, "r+") as handle:
         handle["entry"].attrs["snapshot_bump"] = 1
@@ -165,6 +178,7 @@ def test_target_snapshot_mismatch_abandons_before_stream_and_releases_lease(tmp_
         dimension="1d", labels=seeded.labels, audit_bytes=b"{}",
         selected_plan=selected["bai_args"], selected_gi_mode=None,
         source_base=seeded.target.parent, file_lock=threading.RLock(), flush_every=None,
+        **source_context,
     )
     retry.begin(Scan("retry", []), ReductionPlan(integration_2d=None))
     assert retry.abort(None).disposition.value == "aborted"
@@ -340,7 +354,7 @@ def test_persisted_row_schema_refuses_before_dataset_read(
 
     monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded_getitem)
     messages = {
-        "inventory": "selected frame inventory is not exact",
+        "inventory": "replacement target is not a current xdart .nexus record",
         "detector": "processed detector descriptor is malformed",
         "geometry": "replacement geometry differs",
         "scan": "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED",
@@ -519,44 +533,32 @@ def test_replacement_inventory_cardinality_refuses_before_iteration(
 def test_replacement_writer_bounds_every_untouched_cursor_before_effects(
     tmp_path, monkeypatch, family,
 ):
-    from xrd_tools.io.record_writer import (
-        NexusRecordWriter, WriterIncomplete,
-    )
-    from xrd_tools.reduction import NexusSink, Scan
+    from xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.processed_scan_id import require_current_processed
+    from xrd_tools.io.record_writer import NexusRecordWriter, WriterStateError
+    from xrd_tools.reduction import GIMode
     import xrd_tools.io.record_writer as writer_module
 
-    module = _module()
     seeded = _seed_existing(
-        tmp_path, labels=(2,), name=f"bounded-writer-{family}",
+        tmp_path, labels=(2, 3), name=f"bounded-writer-{family}",
+        gi=GIMode(incidence_motor="theta", mode_2d="qip_qoop"),
     )
-    with h5py.File(seeded.target, "r+") as handle:
-        top = handle["entry/integrated_2d"]
-        if family == "untouched-primary":
-            del top["frame_index"]
-            node = top.create_dataset(
-                "frame_index", data=np.asarray([2, 3], dtype=np.int64),
+    group_name = "integrated_2d"
+    if family == "named-mode":
+        with h5py.File(seeded.target, "r+") as handle:
+            results = [_r2(label) for label in seeded.labels]
+            write_integrated_stack(
+                handle["entry"], frame_indices=seeded.labels,
+                results_2d=results, primary_mode_2d="qip_qoop",
+                extra_modes_2d={"q_chi": results},
             )
-        else:
-            node = top.create_group("oversized_mode").create_dataset(
-                "frame_index", data=np.asarray([2, 3], dtype=np.int64),
-            )
-        guarded = node.name
-
-    monkeypatch.setattr(writer_module, "_MAX_REPLACEMENT_FRAME_ROWS", 1)
-    plan = module.ReintegratePlan.from_artifact(
-        seeded.target, entry="entry", dimension="1d",
-        preparation=seeded.preparation,
-    )
+        group_name += "/q_chi"
+    with h5py.File(seeded.target, "r") as handle:
+        require_current_processed(handle)
     before = seeded.target.read_bytes()
-    sink = NexusSink.for_existing_replacement(
-        seeded.target,
-        expected_target_snapshot=plan.expected_target_snapshot,
-        dimension="1d", labels=plan.labels, audit_bytes=b"{}",
-        selected_plan=plan.selected_plan["bai_args"],
-        selected_gi_mode=plan.selected_plan["gi_mode"],
-        source_base=seeded.target.parent, file_lock=threading.RLock(),
-        flush_every=None,
-    )
+    guarded = f"/entry/{group_name}/frame_index"
+    writer = NexusRecordWriter(seeded.target, overwrite=False)
+    monkeypatch.setattr(writer_module, "_MAX_REPLACEMENT_FRAME_ROWS", 1)
     reads, mutations = [], []
     real_getitem = h5py.Dataset.__getitem__
 
@@ -571,15 +573,14 @@ def test_replacement_writer_bounds_every_untouched_cursor_before_effects(
         NexusRecordWriter, "_authorize_transaction_mutation",
         lambda *_args, **_kwargs: mutations.append("mutation"),
     )
-    with pytest.raises(WriterIncomplete, match="exact bounded int64 vector"):
-        sink.begin(
-            Scan("bounded-cursor", []),
-            module._core_plan(
-                plan.selected_plan, plan.requested_shared_science,
-            ),
-        )
+    # Exercise the cursor owner directly: complete-record admission also
+    # validates label values, while this lower guard must reject its own
+    # oversized vector before reading even one cell.
+    with h5py.File(seeded.target, "r") as handle:
+        with pytest.raises(WriterStateError, match="exact bounded int64 vector"):
+            writer._load_cursor_from(handle["entry"], group_name, local_hard=True)
     assert reads == [] and mutations == []
-    assert sink._transaction_owners is None
+    assert writer.operation_vector().frame_index_scan_rows == 0
     assert seeded.target.read_bytes() == before
 
 
@@ -611,8 +612,14 @@ def test_replacement_json_schema_refuses_before_read_or_decode(
 
     monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded_getitem)
     real_json = writer_module.json
+    def guarded_loads(value, *args, **kwargs):
+        if value == (raw.decode() if isinstance(raw, bytes) else raw):
+            decodes.append("decode")
+            raise AssertionError("malformed run configuration was decoded")
+        return real_json.loads(value, *args, **kwargs)
+
     monkeypatch.setattr(writer_module, "json", SimpleNamespace(
-        loads=lambda *_args, **_kwargs: decodes.append("decode"),
+        loads=guarded_loads,
         dumps=real_json.dumps, JSONDecodeError=real_json.JSONDecodeError,
     ))
     with pytest.raises(ValueError, match="run configuration"):
@@ -680,8 +687,14 @@ def test_replacement_config_ceiling_refuses_before_getitem_or_json_decode(
     monkeypatch.setattr(append_module, "_MAX_REPLACEMENT_CONFIG_UTF8_BYTES", 64)
     monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded_getitem)
     real_json = writer_module.json
+    def guarded_loads(value, *args, **kwargs):
+        if value == (raw.decode() if isinstance(raw, bytes) else raw):
+            decodes.append("decode")
+            raise AssertionError("malformed run configuration was decoded")
+        return real_json.loads(value, *args, **kwargs)
+
     monkeypatch.setattr(writer_module, "json", SimpleNamespace(
-        loads=lambda *_args, **_kwargs: decodes.append("decode"),
+        loads=guarded_loads,
         dumps=real_json.dumps, JSONDecodeError=real_json.JSONDecodeError,
     ))
     with pytest.raises(ValueError, match="UTF-8 byte ceiling"):
@@ -2399,7 +2412,7 @@ def test_plan_preparation_recipe_roundtrip_share_one_runner_and_writer(tmp_path,
     plan_keys = {"api_version", "target", "entry", "source_root", "expected_target_snapshot", "dimension", "labels", "detector_shape", "native_dtype", "selected_plan", "requested_shared_science", "gi_bootstrap_incidence", "retained_mask_bytes", "mask_decode_bytes", "session_policy", "rollback_policy", "science_identity", "operation_identity"}
     requirement_keys = {"height", "width", "native_itemsize", "background_bytes", "modes_1d", "modes_2d", "npt_1d", "npt_rad", "npt_azim", "sigma_1d", "sigma_2d", "resolver_background_bytes", "worker_background_bytes", "background_binding_bytes"}
     count_keys = {"workers", "reduction_inflight", "queue_depth", "owner_block_bytes", "staging_items", "record_heavy_items", "publication_heavy_items", "thumbnail_items", "record_items", "publication_items"}; category_keys = {"source_native", "staging", "records", "publication", "worker"}
-    nodes = ((values, plan_keys), (values["expected_target_snapshot"], {"exists", "size", "mtime_ns", "device", "inode", "digest"}), (session, {"flush", "allocation"}), (session["flush"], {"interval", "cap", "margin"}), (allocation, {"requirements", "envelope_bytes", "counts", "categories", "minimum_bytes", "floor_bytes", "assigned_bytes", "origin", "oversize_excess_bytes"}), (allocation["requirements"], requirement_keys), (allocation["counts"], count_keys), (allocation["categories"], category_keys), (values["selected_plan"], {"version", "dimension", "bai_args", "gi_mode"}), (values["requested_shared_science"], {"version", "gi", "threshold", "poni_values", "accepted_scientific_assets", "geometry", "background"}))
+    nodes = ((values, plan_keys), (values["expected_target_snapshot"], {"exists", "size", "mtime_ns", "device", "inode", "digest", "ctime_ns"}), (session, {"flush", "allocation"}), (session["flush"], {"interval", "cap", "margin"}), (allocation, {"requirements", "envelope_bytes", "counts", "categories", "minimum_bytes", "floor_bytes", "assigned_bytes", "origin", "oversize_excess_bytes"}), (allocation["requirements"], requirement_keys), (allocation["counts"], count_keys), (allocation["categories"], category_keys), (values["selected_plan"], {"version", "dimension", "bai_args", "gi_mode"}), (values["requested_shared_science"], {"version", "gi", "threshold", "poni_values", "accepted_scientific_assets", "geometry", "background"}))
     assert all(set(value) == keys for value, keys in nodes) and session["flush"] == {"interval": 8, "cap": 64, "margin": 8}
     from xrd_tools.io.schema import GI_MODE_KEYS_1D, GI_MODE_KEYS_2D
     assert set(GI_MODE_KEYS_1D) == {"q_total", "q_ip", "q_oop", "exit_angle", "chi_gi"} and set(GI_MODE_KEYS_2D) == {"qip_qoop", "q_chi", "exit_angles"}
@@ -2421,6 +2434,7 @@ def test_plan_preparation_recipe_roundtrip_share_one_runner_and_writer(tmp_path,
             module.ReintegratePlan.from_recipe(legacy)
         replay = module.ReintegratePlan.from_recipe(copy.deepcopy(recipe))
     assert replay == plan and replay.resource_allocation is replay.session_policy.allocation
+    assert replay.expected_target_snapshot.ctime_ns == plan.expected_target_snapshot.ctime_ns
     recipe["plan"]["labels"][0] = 999
     assert replay.labels == seeded.labels
     with pytest.raises(FrozenInstanceError): replay.target = "changed"
