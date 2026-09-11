@@ -1095,6 +1095,9 @@ class StandardRunExecutor:
             run.session, run.sink, run.output, run.source, run.resources,
         )) and not getattr(run.display, 'light_1d_cleanup_unresolved', lambda: False)():
             run.cleanup_status = CleanupStatus.CLEANED
+            # The worker and display are now retired. Do not keep its closed
+            # source alive through AcquisitionContext's scan frame loaders.
+            run.context_runtime = None
         return self._receipt(run)
 
     def drain_events(self) -> tuple[StandardRunEvent, ...]:

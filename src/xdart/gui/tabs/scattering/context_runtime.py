@@ -664,6 +664,7 @@ class _ContextRuntime:
         if self._acquisition is not None:
             self._acquisition.retire()
         self._acquisition = None
+        self._norm_capture_scope = None
         self._set_acquisition_navigation(FrameNavigationProjection())
         self._run_identity = None
         self._pending_replacement = None
@@ -678,6 +679,7 @@ class _ContextRuntime:
         self.clear_full_raw()
         self._acquisition.retire()
         self._acquisition = None
+        self._norm_capture_scope = None
         self._set_acquisition_navigation(FrameNavigationProjection())
         self._run_identity = None
         if (
@@ -1628,6 +1630,7 @@ class _ContextRuntime:
         ):
             self.select_acquisition()
         self._browse = None
+        self._norm_capture_scope = None
         self._browse_projection_identity = None
         self._set_browse_navigation(FrameNavigationProjection())
         self._reset_trace_projection()
