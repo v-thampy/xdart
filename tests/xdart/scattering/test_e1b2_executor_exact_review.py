@@ -2,11 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from threading import Event, Thread, current_thread
-from types import SimpleNamespace
 
 import pytest
 
-from xdart.gui.tabs.scattering.adapters import run_executor as executor_module
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor, _StandardRun
 from xdart.gui.tabs.scattering.display_values import StandardEventKind
 from xdart.gui.tabs.scattering.events import CleanupStatus, RunIdentity
@@ -37,106 +35,77 @@ def _run(*, source=None, session=None, sink=None) -> _StandardRun:
                         Path("out.nxs"), sink=sink)
 
 
+def _writer_begin_failure(monkeypatch, *, hold_abort=False):
+    """Inject storage failure after a real sink acquires its writer."""
+    from xrd_tools.reduction import NexusSink
+
+    sinks, aborts, held = [], [], [hold_abort]
+    real_begin, real_abort = NexusSink.begin, NexusSink.abort
+
+    def begin(owner, *args, **kwargs):
+        real_begin(owner, *args, **kwargs)
+        sinks.append(owner)
+        raise OSError("writer begin failed after sink acquisition")
+
+    def abort(owner, *args, **kwargs):
+        aborts.append(owner)
+        if held[0]:
+            raise OSError("sink still open")
+        return real_abort(owner, *args, **kwargs)
+
+    monkeypatch.setattr(NexusSink, "begin", begin)
+    monkeypatch.setattr(NexusSink, "abort", abort)
+    return sinks, aborts, held
+
+
 def test_acquired_sink_is_released_when_session_construction_raises(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
 ) -> None:
-    class Sink:
-        def __init__(self, *_args, **_kwargs) -> None:
-            self.abort_calls = 0
-            self.opened = False
+    from xrd_tools.sources.image import TiffSeriesSource
+    from tests.xdart.scattering.test_e1b1_terminal_cleanup import _prepared_run
 
-        def abort(self, _result) -> None:
-            self.abort_calls += 1
-            self.opened = False
-
-    sink = Sink()
-
-    class Opened(_Source):
-        def to_scan(self, **_kwargs):
-            return _Scan()
-
-    opened = Opened()
-    monkeypatch.setattr(executor_module, "open_source", lambda _spec: opened)
-    monkeypatch.setattr(executor_module, "load_poni", lambda _path: object())
-    monkeypatch.setattr(executor_module, "poni_to_integrator", lambda _poni: object())
-    monkeypatch.setattr(executor_module, "build_native_int_reduction_plan_from_args",
-                        lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(executor_module, "NexusSink", lambda *_args, **_kwargs: sink)
-
-    def failing_session(_plan, _scan, acquired_sink, **_kwargs):
-        assert acquired_sink is sink
-        sink.opened = True
-        raise RuntimeError("session construction failed after sink acquisition")
-
-    monkeypatch.setattr(executor_module, "ScanSession", failing_session)
-    run = _run()
-    run.configuration = SimpleNamespace(
-        thaw_source_spec=lambda: object(), poni_file="calibration.poni", save_path="out.nxs",
-        processing_mode="Int 2D", output_mode="Overwrite", mask_file="",
-        gi=SimpleNamespace(
-            scan_config=lambda: {}, enabled=False, effective_motor="Manual",
-            th_val=0.0, tilt_angle=0.0, sample_orientation=1,
-        ),
-        # This row targets cleanup after sink acquisition, so its forged
-        # configuration must satisfy the execution boundary's threshold
-        # shape and reach the monkeypatched ScanSession.
-        threshold=SimpleNamespace(apply_threshold=False, threshold_min=None,
-                                  threshold_max=None, mask_saturation=True),
-        bai_1d_args={}, bai_2d_args={}, max_cores=1,
-        as_provenance=lambda: {"generation": 1, "fingerprint": "f" * 64,
-                               "schema_version": 1}, project_root="",
-    )
-    run.capture = object()
-    executor = StandardRunExecutor()
-    executor._active = run
-
+    executor, run, _admission = _prepared_run(tmp_path)
+    sinks, aborts, _held = _writer_begin_failure(monkeypatch)
+    closed = []
+    monkeypatch.setattr(TiffSeriesSource, "close", lambda owner: closed.append(owner), raising=False)
     executor._run(run)
-
     event = executor.drain_events()[-1]
     assert event.kind is StandardEventKind.FAILED
+    assert "writer begin failed after sink acquisition" in event.detail
     assert event.cleanup_status is CleanupStatus.CLEANED
-    assert opened.close_calls == 1
-    assert sink.abort_calls == 1
-    assert sink.opened is False
+    assert len(closed) == 1
+    assert len(sinks) == 1 and aborts == sinks
+    assert sinks[0]._terminal_result.disposition.value == "aborted"
+    assert sinks[0]._writer._h5 is None
+    assert run.output is run.session is run.sink is None
+    assert executor.close(run.identity).cleanup_status is CleanupStatus.CLEANED
 
 
-def test_retry_cannot_drop_sink_whose_abort_never_succeeded() -> None:
-    class Session:
-        def __init__(self) -> None:
-            self.finish_calls = 0
-            self.stop_calls = 0
+def test_retry_cannot_drop_sink_whose_abort_never_succeeded(tmp_path, monkeypatch) -> None:
+    from tests.xdart.scattering.test_e1b1_terminal_cleanup import _prepared_run
 
-        def finish(self, **_kwargs):
-            self.finish_calls += 1
-            if self.finish_calls == 1:
-                raise RuntimeError("finish failed after retaining sink")
-            return SimpleNamespace(failed=False, cancelled=False)
-
-        def stop(self) -> None:
-            self.stop_calls += 1
-
-    class Sink:
-        def __init__(self) -> None:
-            self.abort_calls = 0
-
-        def abort(self, _result) -> None:
-            self.abort_calls += 1
-            raise RuntimeError("sink still open")
-
-    session, sink = Session(), Sink()
-    run = _run(source=_Source(), session=session, sink=sink)
-    executor = StandardRunExecutor()
-    executor._active = run
-
-    first = executor._cleanup(run)
-    assert first.cleanup_status is CleanupStatus.CLEANUP_PENDING
-    assert run.session is session
-    assert run.sink is sink
-
-    second = executor.close(run.identity)
-    assert second.cleanup_status is CleanupStatus.CLEANUP_PENDING
-    assert run.sink is sink
-    assert sink.abort_calls == 2
+    executor, run, admission = _prepared_run(tmp_path)
+    sinks, aborts, held = _writer_begin_failure(monkeypatch, hold_abort=True)
+    decision = admission.outputs[0]
+    try:
+        with pytest.raises(OSError, match="writer begin failed after sink acquisition"):
+            executor._construct(run, item=decision.item, decision=decision)
+        output = run.output
+        assert len(sinks) == 1 and output._pending_nexus == sinks
+        first = executor._cleanup(run)
+        assert first.cleanup_status is CleanupStatus.CLEANUP_PENDING
+        assert run.output is output and output._pending_nexus == sinks
+        attempts = len(aborts)
+        second = executor.close(run.identity)
+        assert second.cleanup_status is CleanupStatus.CLEANUP_PENDING
+        assert run.output is output and output._pending_nexus == sinks
+        assert len(aborts) == attempts + 1
+        assert all(owner is sinks[0] for owner in aborts)
+    finally:
+        held[0] = False
+        assert executor.close(run.identity).cleanup_status is CleanupStatus.CLEANED
+    assert output._pending_nexus == []
+    assert run.output is None
 
 
 def test_dead_worker_cleanup_retry_never_runs_on_close_caller() -> None:
@@ -199,53 +168,43 @@ def test_duplicate_close_starts_at_most_one_live_cleanup_retry() -> None:
             worker.join(2)
 
 
-def test_terminal_progress_does_not_regress_to_zero() -> None:
-    class FiveFrameScan:
-        name = "Standard"
-        frames = ()
+def test_terminal_progress_does_not_regress_to_zero(tmp_path) -> None:
+    from tests.xdart.scattering.test_e1b1_terminal_cleanup import _prepared_run
 
-        def __len__(self) -> int:
-            return 5
-
-    class FinishedSession:
-        frames_completed = 5
-
-        def start(self) -> None:
-            return None
-
-        def finish(self, **_kwargs):
-            return SimpleNamespace(failed=False, cancelled=False, n_processed=5)
-
-    run = _run(source=_Source(), session=FinishedSession())
-    run.scan = FiveFrameScan()
-    executor = StandardRunExecutor()
-    executor._active = run
-
+    executor, run, _admission = _prepared_run(tmp_path, frame_count=5)
     executor._run(run)
-
-    terminal = executor.drain_events()[-1]
-    assert terminal.kind is StandardEventKind.FINISHED
+    events = executor.drain_events()
+    terminal = events[-1]
+    assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
     assert terminal.completed == 5
     assert terminal.total == 5
+    frame_events = [event for event in events if event.kind is StandardEventKind.FRAME_READY]
+    assert frame_events and terminal.completed >= max(event.completed for event in frame_events)
+    assert executor.close(run.identity).cleanup_status is CleanupStatus.CLEANED
 
 
-def test_cleanup_diagnostics_name_each_failed_owner_in_order() -> None:
-    class Session:
-        def finish(self, **_kwargs):
-            raise RuntimeError("same failure text")
+def test_cleanup_diagnostics_name_each_failed_owner_in_order(tmp_path, monkeypatch) -> None:
+    from xrd_tools.sources.image import TiffSeriesSource
+    from tests.xdart.scattering.test_e1b1_terminal_cleanup import _prepared_run
 
-    class Sink:
-        def abort(self, _result) -> None:
-            raise RuntimeError("same failure text")
-
-    class Source:
-        def close(self) -> None:
-            raise RuntimeError("same failure text")
-
-    run = _run(source=Source(), session=Session(), sink=Sink())
-    receipt = StandardRunExecutor()._cleanup(run)
-
-    assert receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING
-    assert tuple(failure.operation for failure in receipt.cleanup_failures) == (
-        "session.finish", "sink.abort", "source.close",
-    )
+    executor, run, admission = _prepared_run(tmp_path)
+    _sinks, _aborts, held = _writer_begin_failure(monkeypatch, hold_abort=True)
+    decision = admission.outputs[0]
+    def close_source(owner):
+        raise RuntimeError("sink still open")
+    monkeypatch.setattr(TiffSeriesSource, "close", close_source, raising=False)
+    try:
+        with pytest.raises(OSError, match="writer begin failed after sink acquisition"):
+            executor._construct(run, item=decision.item, decision=decision)
+        receipt = executor._cleanup(run)
+        assert receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING
+        assert tuple(failure.operation for failure in receipt.cleanup_failures) == (
+            "dynamic_output.finish", "source.close",
+        )
+        assert tuple(failure.message for failure in receipt.cleanup_failures) == (
+            "sink still open", "sink still open",
+        )
+    finally:
+        held[0] = False
+        monkeypatch.setattr(TiffSeriesSource, "close", lambda owner: None)
+        assert executor.close(run.identity).cleanup_status is CleanupStatus.CLEANED

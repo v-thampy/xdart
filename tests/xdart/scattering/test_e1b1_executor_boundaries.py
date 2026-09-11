@@ -151,56 +151,31 @@ def test_start_cleanup_failure_is_not_reported_as_cleaned(monkeypatch, tmp_path)
 
 
 def test_disabled_threshold_does_not_reach_reduction_plan(monkeypatch, tmp_path) -> None:
-    selected = image_series_spec(tmp_path / "raw_0001.tif")
-    configuration = RunIntent(
-        source_spec=selected,
-        poni_file=str(tmp_path / "calibration.poni"),
-        save_path=str(tmp_path / "out.nxs"),
-        output_mode="Overwrite",
-        threshold=ThresholdIntent(
-            apply_threshold=False,
-            threshold_min=10.0,
-            threshold_max=20.0,
-        ),
-    ).freeze()
-    identity = RunIdentity.from_configuration(configuration)
-    seen = {}
+    from tests.xdart.scattering._e2sd_support import write_poni
+    from tests.xdart.scattering.test_p1b_output_graph import _intent, _write_tiff
+    from tests.xdart.scattering.test_e1b1_terminal_cleanup import _prepared_run
 
-    class Opened:
-        def to_scan(self, **_kwargs):
-            return type("Scan", (), {"gi_config": None, "frames": ()})()
-
-        def close(self) -> None:
-            return None
-
-    class Session:
-        def __init__(self, *_args, **_kwargs) -> None:
-            return None
-
-        def on_frame_completed(self, _callback):
-            return None
-
-    monkeypatch.setattr(executor_module, "open_source", lambda _spec: Opened())
-    monkeypatch.setattr(executor_module, "load_poni", lambda _path: object())
-    monkeypatch.setattr(executor_module, "poni_to_integrator", lambda _poni: object())
-
-    def capture_plan(*_args, **kwargs):
-        seen.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(
-        executor_module,
-        "build_native_int_reduction_plan_from_args",
-        capture_plan,
+    raw, poni = tmp_path / "raw_0001.tif", tmp_path / "cal.poni"
+    _write_tiff(raw, 1)
+    write_poni(poni)
+    intent = _intent(raw, tmp_path / "processed", poni)
+    intent.threshold = ThresholdIntent(
+        apply_threshold=False, threshold_min=10.0, threshold_max=20.0,
     )
-    monkeypatch.setattr(executor_module, "NexusSink", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(executor_module, "ScanSession", Session)
+    executor, run, _admission = _prepared_run(tmp_path, intent=intent)
+    plans = []
+    real_plan = executor_module.native_int_reduction_plan
 
-    run = _StandardRun(
-        configuration, identity, None, None, None, None, Path(configuration.save_path),
-        capture=SourceCapture(RequestId(1), 1, selected),
-    )
-    StandardRunExecutor()._construct(run)
+    def capture_plan(configuration):
+        plan = real_plan(configuration)
+        plans.append(plan)
+        return plan
 
-    assert seen["threshold_min"] is None
-    assert seen["threshold_max"] is None
+    monkeypatch.setattr(executor_module, "native_int_reduction_plan", capture_plan)
+    executor._run(run)
+    terminal = _terminal(executor)
+    assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
+    assert len(plans) == 1
+    assert plans[0].threshold_min is None
+    assert plans[0].threshold_max is None
+    assert executor.close(run.identity).cleanup_status is CleanupStatus.CLEANED
