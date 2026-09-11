@@ -38,6 +38,16 @@ from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.selection import DirectorySourceSpec
 
 
+def _write_small_poni(path: Path) -> None:
+    """Real calibration matching the four-by-four detector fixtures."""
+    write_poni(path)
+    path.write_text(path.read_text().replace(
+        "Detector: Pilatus100k\nDetector_config: {}",
+        'Detector: Detector\nDetector_config: {"pixel1": 0.0001, '
+        '"pixel2": 0.0001, "max_shape": [4, 4], "orientation": 3}',
+    ))
+
+
 def _add_display_artifact(run, item) -> None:
     if not run.display.configured:
         run.display.configure(
@@ -404,7 +414,7 @@ def test_live_hdf_change_during_stable_open_is_typed_pending(
         request_value=999 if open_target == "master" else 1000,
     )
     original_capture = SourceFileState.capture
-    real_h5_file = h5py.File
+    real_h5_file_init = h5py.File.__init__
     armed = False
     changed = False
 
@@ -415,10 +425,11 @@ def test_live_hdf_change_during_stable_open_is_typed_pending(
             armed = True
         return state
 
-    def change_then_fail(path, *args, **kwargs):
+    def change_then_fail(handle, path, *args, **kwargs):
         nonlocal changed
         if (
             armed
+            and isinstance(path, (str, Path))
             and not changed
             and Path(path).resolve() == selected.resolve()
             and (not args or args[0] == "r")
@@ -427,14 +438,14 @@ def test_live_hdf_change_during_stable_open_is_typed_pending(
             selected.unlink()
             changed = True
             raise OSError("source disappeared during HDF5 open")
-        return real_h5_file(path, *args, **kwargs)
+        return real_h5_file_init(handle, path, *args, **kwargs)
 
     monkeypatch.setattr(
         SourceFileState,
         "capture",
         staticmethod(capture_before_open),
     )
-    monkeypatch.setattr(h5py, "File", change_then_fail)
+    monkeypatch.setattr(h5py.File, "__init__", change_then_fail)
     try:
         sibling_candidates = tuple(
             candidate
@@ -474,33 +485,37 @@ def test_live_stable_hdf_open_error_remains_hard(
         DirectorySourceSpec(raw, suffixes=("_master.h5",), metadata_format=None),
         request_value=1001,
     )
-    original_capture = SourceFileState.capture
-    real_h5_file = h5py.File
+    from contextlib import contextmanager
+
+    real_open = source_graph._open_stable_hdf5_dependency
+    real_h5_file_init = h5py.File.__init__
     armed = False
 
-    def capture_before_open(path: Path) -> SourceFileState:
+    @contextmanager
+    def armed_stable_open(path, *args, **kwargs):
         nonlocal armed
-        state = original_capture(Path(path))
         if Path(path).resolve() == master.resolve():
             armed = True
-        return state
+        with real_open(path, *args, **kwargs) as handle:
+            yield handle
 
-    def fail_stably(path, *args, **kwargs):
+    def fail_stably(handle, path, *args, **kwargs):
         if (
             armed
+            and isinstance(path, (str, Path))
             and Path(path).resolve() == master.resolve()
             and (not args or args[0] == "r")
             and kwargs.get("mode", "r") == "r"
         ):
             raise OSError("stable HDF5 open refusal")
-        return real_h5_file(path, *args, **kwargs)
+        return real_h5_file_init(handle, path, *args, **kwargs)
 
     monkeypatch.setattr(
-        SourceFileState,
-        "capture",
-        staticmethod(capture_before_open),
+        source_graph,
+        "_open_stable_hdf5_dependency",
+        armed_stable_open,
     )
-    monkeypatch.setattr(h5py, "File", fail_stably)
+    monkeypatch.setattr(h5py.File, "__init__", fail_stably)
     try:
         with pytest.raises(ValueError, match="stable HDF5 open refusal") as error:
             output_preflight.materialize_live_directory_group(
@@ -531,7 +546,7 @@ def test_live_construct_source_revision_drift_reprobes_and_retries(
         data=np.ones((4, 4), dtype=np.uint16)
     ).write(str(late))
     poni = tmp_path / "cal.poni"
-    write_poni(poni)
+    _write_small_poni(poni)
     source = DirectorySourceSpec(
         raw,
         suffixes=(".tif",),
@@ -544,6 +559,8 @@ def test_live_construct_source_revision_drift_reprobes_and_retries(
         output_mode="Overwrite",
         live_mode=True,
         max_cores=1,
+        bai_1d_args={"npt": 8},
+        bai_2d_args={"npt_rad": 8, "npt_azim": 4},
     )
     snapshot = RunIntentStore(intent).snapshot()
     request_id = RequestId(992)
@@ -553,41 +570,20 @@ def test_live_construct_source_revision_drift_reprobes_and_retries(
     construct_calls = 0
     processed = []
 
-    class ProvenSourceDrift(ValueError):
-        pass
-
-    monkeypatch.setattr(
-        executor_module,
-        "SourceRevisionChanged",
-        ProvenSourceDrift,
-        raising=False,
-    )
+    real_construct = executor._construct
 
     def construct(run, *, item, labels, decision):
         nonlocal construct_calls
         construct_calls += 1
         if construct_calls == 1:
-            raise ProvenSourceDrift("source changed immediately before open")
-        _add_display_artifact(run, item)
-        run.artifact = item.target
-        run.current_total = item.source_stamp.frame_count
-        run.current_completed = run.current_total - len(labels)
-        run.current_published = run.current_completed
+            raise output_preflight.SourceRevisionChanged(
+                "source changed immediately before open"
+            )
+        result = real_construct(run, item=item, labels=labels, decision=decision)
         processed.append(item.source_path)
-        return run
-
-    def execute_current(run, *, construct=False):
-        assert construct is False
-        added = run.current_total - run.current_completed
-        run.completed += added
-        run.current_completed += added
-        run.current_published += added
-        if run.artifact not in run.artifacts:
-            run.artifacts.append(run.artifact)
-        return False
+        return result
 
     monkeypatch.setattr(executor, "_construct", construct)
-    monkeypatch.setattr(executor, "_execute_current", execute_current)
     receipt = _wait_for_admission(executor, capture)
     configuration = intent.freeze()
     identity = RunIdentity.from_configuration(configuration)
@@ -992,15 +988,18 @@ def _wait_for_admission(
     raise AssertionError("empty Live directory admission did not settle")
 
 
+@pytest.mark.parametrize("rewrite_prior", (False, True),
+                         ids=("distinct-group", "changed-prior-frame"))
 def test_empty_directory_live_waits_for_one_stable_late_group_until_stop(
     monkeypatch,
     request,
+    rewrite_prior,
     tmp_path: Path,
 ) -> None:
     raw = tmp_path / "raw"
     raw.mkdir()
     poni = tmp_path / "cal.poni"
-    write_poni(poni)
+    _write_small_poni(poni)
     source = DirectorySourceSpec(
         raw,
         suffixes=(".tif",),
@@ -1013,6 +1012,8 @@ def test_empty_directory_live_waits_for_one_stable_late_group_until_stop(
         output_mode="Overwrite",
         live_mode=True,
         max_cores=1,
+        bai_1d_args={"npt": 8},
+        bai_2d_args={"npt_rad": 8, "npt_azim": 4},
     )
     snapshot = RunIntentStore(intent).snapshot()
     request_id = RequestId(991)
@@ -1029,24 +1030,12 @@ def test_empty_directory_live_waits_for_one_stable_late_group_until_stop(
             ready_attempts.append(attempt)
         return attempt
 
-    def construct(run, *, item, labels, decision):
-        _add_display_artifact(run, item)
-        run.artifact = item.target
-        run.current_total = item.source_stamp.frame_count
-        run.current_completed = run.current_total - len(labels)
-        run.current_published = run.current_completed
-        processed.append((item.source_path, labels))
-        return run
+    real_construct = executor._construct
 
-    def execute_current(run, *, construct=False):
-        assert construct is False
-        added = run.current_total - run.current_completed
-        run.completed += added
-        run.current_completed += added
-        run.current_published += added
-        if run.artifact not in run.artifacts:
-            run.artifacts.append(run.artifact)
-        return False
+    def construct(run, *, item, labels, decision):
+        result = real_construct(run, item=item, labels=labels, decision=decision)
+        processed.append((item.source_path, labels))
+        return result
 
     monkeypatch.setattr(
         executor_module,
@@ -1054,7 +1043,6 @@ def test_empty_directory_live_waits_for_one_stable_late_group_until_stop(
         capture_attempt,
     )
     monkeypatch.setattr(executor, "_construct", construct)
-    monkeypatch.setattr(executor, "_execute_current", execute_current)
 
     receipt = _wait_for_admission(executor, capture)
     configuration = intent.freeze()
@@ -1111,69 +1099,47 @@ def test_empty_directory_live_waits_for_one_stable_late_group_until_stop(
         time.sleep(0.01)
     assert processed == [(late, (1,))]
 
-    # A later stable revision maps to the already committed output group.  P-1
-    # detects and reports it but must not fake an H23 same-run output epoch by
-    # overwriting the target a second time.
-    time.sleep(0.01)
-    fabio.tifimage.TifImage(
-        data=np.full((4, 4), 2, dtype=np.uint16)
-    ).write(str(late))
     deadline = time.monotonic() + 10.0
-    while time.monotonic() < deadline:
+    while not executor.processed_live_revisions(identity) and time.monotonic() < deadline:
         events.extend(executor.drain_events())
-        if any(
-            "1 source revision deferred" in event.detail
-            for event in events
-            if event.kind is StandardEventKind.DISCOVERY
-        ):
-            break
         time.sleep(0.01)
-    assert processed == [(late, (1,))]
-    assert any(
-        "1 source revision deferred" in event.detail
-        for event in events
-        if event.kind is StandardEventKind.DISCOVERY
-    )
-    pending = executor.deferred_live_revisions(identity)
-    assert len(pending) == 1
-    revised = pending[0]
-    assert revised is ready_attempts[-1]
-    assert revised.decision is not None
-    assert ready_attempts[0].decision is not None
-    original = ready_attempts[0]
-    original_decision = original.decision
-    revised_decision = revised.decision
-    assert original_decision is not None
-    assert revised_decision.labels == (1,)
-    assert revised_decision.item.target == revised.group.target
-    assert revised_decision.item.candidate == revised.group.plan.candidates[0]
-    assert revised_decision.item.descriptor == revised.group.plan.descriptors[0]
-    assert output_preflight.target_state_matches(revised_decision)
-    revised_candidate = revised.group.plan.candidates[0]
-    revised_stamp = revised_decision.item.source_stamp
-    assert (
-        revised_stamp.file.size,
-        revised_stamp.file.mtime_ns,
-    ) == revised_candidate.version_stamp
-    assert tuple(value.path for value in revised_stamp.members) == (
-        str(late.resolve()),
-    )
-    assert revised_stamp.external_members == ()
-    assert revised_stamp.dependency_files == ()
-    assert not any(
-        isinstance(value, np.ndarray)
-        for value in (
-            revised_stamp.file,
-            *revised_stamp.members,
-            *revised_stamp.external_members,
-            *revised_stamp.dependency_files,
+    original, = executor.processed_live_revisions(identity)
+    assert original is ready_attempts[0]
+    assert original.decision is not None
+
+    if rewrite_prior:
+        from xrd_tools.io.frame_view import FrameViewReader
+
+        target = original.decision.item.target
+        with FrameViewReader(target, resolve_source=False) as reader:
+            prior_view = reader.read(1)
+        time.sleep(0.01)
+        fabio.tifimage.TifImage(
+            data=np.full((4, 4), 2, dtype=np.uint16)
+        ).write(str(late))
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            events.extend(executor.drain_events())
+            failed = [event for event in events
+                      if event.kind is StandardEventKind.FAILED]
+            if failed:
+                break
+            time.sleep(0.01)
+        assert len(failed) == 1
+        assert failed[0].primary.type_qualname == "AppendRefused"
+        assert failed[0].primary.message == (
+            "source does not extend exact image-member history"
         )
-    )
-    assert executor.processed_live_revisions(identity) == (original,)
-    assert (
-        revised_decision.item.source_stamp
-        != original_decision.item.source_stamp
-    )
+        assert processed == [(late, (1,))]
+        assert executor.processed_live_revisions(identity) == (original,)
+        assert ready_attempts[-1].decision.item.source_stamp != (
+            original.decision.item.source_stamp
+        )
+        with FrameViewReader(target, resolve_source=False) as reader:
+            preserved = reader.read(1)
+        np.testing.assert_array_equal(preserved.intensity_1d, prior_view.intensity_1d)
+        np.testing.assert_array_equal(preserved.intensity_2d, prior_view.intensity_2d)
+        return
 
     # A distinct stable group remains independently processable after the
     # first artifact without resetting display residency or existing stores.

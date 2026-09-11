@@ -38,6 +38,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -46,6 +47,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from pyqtgraph.Qt import QtWidgets
+from xrd_tools.io import Browse1DCache, FrameScalarCatalog, FrameScalarRow
 
 from xdart.gui.tabs.scattering.browse_values import (
     BrowseLoadRequest,
@@ -187,6 +189,7 @@ def _retain(display, owner, scan_key, artifact, label, value, metadata):
         source_identity=publication.source_identity,
         frame_mask_qualified=False,
     )
+    display.publish_light_1d(owner, record, source_identity=publication.source_identity)
     display.put_payload(
         StandardDisplayPayload(
             0, delta.appended, f"Standard · {scan_key} · {label}", view
@@ -196,7 +199,14 @@ def _retain(display, owner, scan_key, artifact, label, value, metadata):
 
 
 def _add_artifact(display, artifact: str, scan_key: str):
-    return display.add_artifact(
+    from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
+    from xrd_tools.session import (
+        Light1DBufferLayout, Light1DLayout, Light1DModeLayout,
+        SessionResourceAuthority, SessionResourceRequirements,
+        acquire_light_1d_retention, resolve_session_policy,
+    )
+
+    owner = display.add_artifact(
         Path(artifact),
         scan_key,
         mask=None,
@@ -207,6 +217,35 @@ def _add_artifact(display, artifact: str, scan_key: str):
         gi_mode_1d="",
         gi_mode_2d="",
     )
+    layout = Light1DLayout((Light1DModeLayout(
+        DEFAULT_MODE_KEY,
+        Light1DBufferLayout(2, 8, "norm-axis", np.dtype(np.float64).str),
+        Light1DBufferLayout(2, 8, "norm-intensity", np.dtype(np.float64).str),
+    ),), DEFAULT_MODE_KEY)
+    row_capacity = 1024
+    ceiling = layout.shared_bytes + row_capacity * layout.per_row_unique_ndarray_bytes
+    allocation = resolve_session_policy(
+        SessionResourceRequirements(
+            2, 3, 8, modes_1d=1, modes_2d=1,
+            npt_1d=2, npt_rad=3, npt_azim=2,
+        ),
+        envelope_bytes=2 << 30,
+        requests={"record_heavy_items": 2, "publication_heavy_items": 2},
+        env={},
+    ).allocation
+    owner.publications.bind_allocation(allocation)
+    lease = acquire_light_1d_retention(
+        SessionResourceAuthority.from_allocation(allocation),
+        owner=f"norm-consumer:{artifact}", generation=1, layout=layout,
+        requested_rows=row_capacity, compatibility_byte_ceiling=ceiling,
+        gui_thread_id=threading.get_ident(),
+    )
+    owner.publications.bind_light_1d(lease)
+    display.stage_light_1d(
+        owner, lease, hooks=owner.publications.light_1d_cleanup_hooks(lease),
+    )
+    display.bind_light_1d(owner, lease)
+    return owner
 
 
 def _acquisition_context(configuration, display) -> AcquisitionContext:
@@ -256,6 +295,9 @@ def _acquisition_parts(
     runtime = _ContextRuntime()
     runtime.adopt_acquisition(identity, context)
     runtime.select_latest_navigation(plot_mode=plot_mode)
+    if plot_mode == "Overlay":
+        frames = runtime.navigation.frames
+        assert runtime.select_navigation(frames[-1], frames)
     return SimpleNamespace(
         configuration=configuration,
         identity=identity,
@@ -295,6 +337,12 @@ def _browse_parts(
 ):
     token = new_context_token(ContextKind.BROWSE)
     request = BrowseLoadRequest(token, generation, path)
+    catalog = FrameScalarCatalog(
+        path, "entry", tuple(
+            FrameScalarRow(label, metadata_raw=metadata)
+            for label, metadata in enumerate(rows, 1)
+        ),
+    )
     records = FrameRecordStore(max_items=8)
     publications = PublicationStore(max_items=8)
     for label, (metadata, value) in enumerate(
@@ -329,7 +377,10 @@ def _browse_parts(
         scan_key=scan_key,
         scan=object(),
         frame=None,
-        frame_ids=list(range(1, len(rows) + 1)),
+        frame_ids=catalog.labels,
+        loaded_labels=catalog.labels,
+        scalar_catalog=catalog,
+        browse_1d_cache=Browse1DCache(budget_bytes=1024),
         frames={},
         viewer_rows_1d={},
         viewer_rows_2d={},
@@ -349,6 +400,15 @@ def _browse_parts(
         projection=ContextProjection(),
         aggregate=aggregate,
     )
+
+
+def _release_browse_value(context):
+    """Retire the scalar fixture's actual cache before its Browse payload."""
+    context.invalidate()
+    cache = context.browse_1d_cache
+    cache.close()
+    context.detach_browse_1d_cache(cache)
+    context.release()
 
 
 def _acq_identity(identity: RunIdentity, artifact: str, scan: str):
@@ -724,7 +784,7 @@ def test_browse_refusals_are_independent_and_cannot_change_presentation(
     if refusal == "invalidated":
         parts.context.invalidate()
     elif refusal == "released":
-        parts.context.release()
+        _release_browse_value(parts.context)
     elif refusal == "cancelled_gate":
         parts.context.commit_gate.cancel()
     else:
@@ -760,7 +820,7 @@ def test_refused_new_browse_context_cannot_expose_the_prior_token(
     if refusal == "invalidated":
         b2.context.invalidate()
     elif refusal == "released":
-        b2.context.release()
+        _release_browse_value(b2.context)
     elif refusal == "cancelled_gate":
         b2.context.commit_gate.cancel()
     else:
@@ -789,7 +849,7 @@ def test_pending_replacement_retains_the_outgoing_presentation():
     b1 = _browse_parts()
     _project(b1, prefs)
     assert b1.runtime.norm_aggregate is b1.aggregate
-    b1.context.release()
+    _release_browse_value(b1.context)
     replacement = BrowseLoadRequest(
         new_context_token(ContextKind.BROWSE), 4, "/processed/next.nxs"
     )
@@ -885,6 +945,9 @@ def test_same_channel_foreign_artifact_cannot_cross_and_span_falls_back():
         publication_b,
         source_identity=publication_b.source_identity,
         frame_mask_qualified=False,
+    )
+    parts.display.publish_light_1d(
+        owner_b, record_b, source_identity=publication_b.source_identity,
     )
     parts.display.put_payload(
         StandardDisplayPayload(
@@ -1485,13 +1548,16 @@ def test_census_one_capture_one_borrow_no_second_read_no_forbidden_routes():
     assert borrow_counts == {
         "context_runtime": 1,
         "context_controller": 1,
-        "page": 1,
+        "page": 3,
         "context_projection": 0,
         "shell_projection": 0,
         "scientific_axes": 0,
         "shell_values": 0,
         "scientific_view": 0,
     }
+    assert _enclosing_functions(
+        trees["page"], set(_attribute_loads(trees["page"], "norm_aggregate")),
+    ) == ["_background_action", "_consume_background_update", "_refresh_shell"]
     capture_calls = [
         node
         for node in ast.walk(trees["context_runtime"])
@@ -1527,7 +1593,10 @@ def test_census_one_capture_one_borrow_no_second_read_no_forbidden_routes():
     }
     assert resolver_calls["shell_projection"] == 1
     assert resolver_calls["context_runtime"] == 1
-    assert resolver_calls["page"] == 0
+    assert resolver_calls["page"] == 2
+    assert _enclosing_functions(
+        trees["page"], set(_name_loads(trees["page"], "resolve_norm_presentation")),
+    ) == ["_background_action", "_consume_background_update"]
     assert resolver_calls["context_projection"] == 0
     assert resolver_calls["scientific_view"] == 0
 
@@ -1552,7 +1621,7 @@ def test_census_one_capture_one_borrow_no_second_read_no_forbidden_routes():
         "shell_projection": 2,     # one import, one projection call
         "scientific_axes": 2,      # the def and its __all__ export
         "context_controller": 0,
-        "page": 0,
+        "page": 3,                # import and two display-background borrows
         "context_projection": 0,
         "shell_values": 0,
         "scientific_view": 0,
