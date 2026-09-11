@@ -654,8 +654,38 @@ def test_public_result_projection_matches_axis_unit_and_nan_storage_bounds():
         )
 
 
+@pytest.mark.parametrize("kind", (AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.RSM))
+@pytest.mark.parametrize("malformation", ("partial", "null", "unknown", "wrong_kernel"))
+def test_runtime_environment_extension_remains_closed(kind, malformation):
+    request_fingerprint = _digest("runtime-environment-request")
+    factory = (
+        _execution_attestation
+        if kind is AnalysisArtifactKind.STITCH_1D
+        else _rsm_execution_attestation
+    )
+    value = factory(request_fingerprint, _digest("runtime-environment-result"))
+    runtime = value["xu_runtime"]
+    runtime.update(
+        python_implementation="CPython", python_version="3.13.0",
+        platform_system="Windows", platform_machine="AMD64",
+    )
+    analysis_execution_attestation_digest(kind, value, request_fingerprint=request_fingerprint)
+    if malformation == "partial":
+        del runtime["platform_machine"]
+    elif malformation == "null":
+        runtime["platform_machine"] = None
+    elif malformation == "unknown":
+        runtime["arbitrary_environment_claim"] = True
+    else:
+        runtime["xrayutilities_module_version"] = "future"
+    with pytest.raises(ValueError, match="attestation contract is invalid"):
+        analysis_execution_attestation_digest(kind, value, request_fingerprint=request_fingerprint)
+
+
+@pytest.mark.parametrize("observed_environment", (False, True))
 def test_analysis_artifact_v2_round_trip_binds_separate_execution_attestation(
     tmp_path,
+    observed_environment,
 ):
     projection = project_analysis_artifact_result(
         kind=AnalysisArtifactKind.STITCH_1D,
@@ -671,6 +701,12 @@ def test_analysis_artifact_v2_round_trip_binds_separate_execution_attestation(
         request_fingerprint,
         projection.result_fingerprint,
     )
+    if observed_environment:
+        from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+
+        with xu_runtime_session() as runtime:
+            pass
+        attestation["xu_runtime"] = runtime.execution_record.to_attestation()
     attestation_digest = analysis_execution_attestation_digest(
         AnalysisArtifactKind.STITCH_1D,
         attestation,
@@ -725,8 +761,10 @@ def test_analysis_artifact_v2_round_trip_binds_separate_execution_attestation(
         )
 
 
+@pytest.mark.parametrize("observed_environment", (False, True))
 def test_analysis_artifact_v2_rsm_round_trip_is_a_closed_exact_branch(
     tmp_path,
+    observed_environment,
 ):
     projection = project_analysis_artifact_result(
         kind=AnalysisArtifactKind.RSM,
@@ -746,6 +784,12 @@ def test_analysis_artifact_v2_rsm_round_trip_is_a_closed_exact_branch(
         request_fingerprint,
         projection.result_fingerprint,
     )
+    if observed_environment:
+        from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+
+        with xu_runtime_session() as runtime:
+            pass
+        attestation["xu_runtime"] = runtime.execution_record.to_attestation()
     attestation_digest = analysis_execution_attestation_digest(
         AnalysisArtifactKind.RSM,
         attestation,

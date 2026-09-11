@@ -771,15 +771,21 @@ def test_group_dependency_and_canonical_byte_limits_fail_closed(
     assert not Path(form.output_path).exists()
 
 
+@pytest.mark.parametrize("without_pressure_relief", (False, True))
 def test_two_member_science_uses_one_grid_and_persists_exact_attestation(
     tmp_path,
     monkeypatch,
+    without_pressure_relief,
 ):
     from contextlib import contextmanager
 
     import xrd_tools.analysis.rsm_operation as rsm_operation
     import xrd_tools.rsm.gridding as rsm_gridding
 
+    if without_pressure_relief:
+        monkeypatch.setattr(
+            rsm_operation, "bind_allocator_pressure_relief", lambda: None
+        )
     monkeypatch.setattr(
         rsm_operation,
         "_resolve_exact_rsm_q_bounds_active",
@@ -928,6 +934,11 @@ def test_two_member_science_uses_one_grid_and_persists_exact_attestation(
     assert attestation["science_chunk_count"] == 4
     assert attestation["q_release_check_chunk_count"] == 4
     assert attestation["frame_release_check_frame_count"] == 4
+    import platform
+
+    assert attestation["xu_runtime"]["python_version"] == platform.python_version()
+    assert attestation["xu_runtime"]["platform_system"] == platform.system()
+    assert attestation["xu_runtime"]["platform_machine"] == platform.machine()
     assert [item["mask_policy"] for item in attestation["member_masks"]] == [
         "none",
         "none",
@@ -1334,7 +1345,7 @@ def test_allocator_pressure_unavailable_refuses_before_science_or_output(
     ).request
     monkeypatch.setattr(
         rsm_operation,
-        "bind_darwin_allocator_pressure_relief",
+        "bind_allocator_pressure_relief",
         lambda: (_ for _ in ()).throw(AllocatorPressureUnavailable()),
     )
     monkeypatch.setattr(
@@ -1352,7 +1363,7 @@ def test_allocator_pressure_unavailable_refuses_before_science_or_output(
     assert not Path(prepared.module.output.target).exists()
 
 
-def test_xu_platform_refusal_precedes_darwin_allocator_binding(
+def test_xu_runtime_refusal_precedes_optional_allocator_binding(
     tmp_path,
     monkeypatch,
 ):
@@ -1376,7 +1387,7 @@ def test_xu_platform_refusal_precedes_darwin_allocator_binding(
         execution_record = None
 
         def __enter__(self):
-            raise XuRuntimeUnsupported("XU_PLATFORM_UNVALIDATED")
+            raise XuRuntimeUnsupported("XU_RUNTIME_UNSUPPORTED")
 
         def __exit__(self, *_args):
             return False
@@ -1388,16 +1399,16 @@ def test_xu_platform_refusal_precedes_darwin_allocator_binding(
     )
     monkeypatch.setattr(
         rsm_operation,
-        "bind_darwin_allocator_pressure_relief",
+        "bind_allocator_pressure_relief",
         lambda: (_ for _ in ()).throw(
-            AssertionError("unvalidated platform must refuse before Darwin binding")
+            AssertionError("unsupported runtime must refuse before allocator binding")
         ),
     )
 
     result = run_rsm_operation_v2(prepared)
 
     assert result.terminal.disposition is ModuleDisposition.REFUSED
-    assert result.terminal.code == "XU_PLATFORM_UNVALIDATED"
+    assert result.terminal.code == "XU_RUNTIME_UNSUPPORTED"
     assert not Path(prepared.module.output.target).exists()
 
 
@@ -1440,7 +1451,7 @@ def test_allocator_pressure_call_failure_is_bounded_and_writes_nothing(
 
     monkeypatch.setattr(
         rsm_operation,
-        "bind_darwin_allocator_pressure_relief",
+        "bind_allocator_pressure_relief",
         lambda: FailingPressure(),
     )
     monkeypatch.setattr(
@@ -1534,7 +1545,7 @@ def test_allocator_pressure_runs_at_two_root_death_fences_only(
     )
     monkeypatch.setattr(
         rsm_operation,
-        "bind_darwin_allocator_pressure_relief",
+        "bind_allocator_pressure_relief",
         lambda: RecordingPressure(),
     )
 

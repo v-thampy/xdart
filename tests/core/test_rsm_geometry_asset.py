@@ -724,9 +724,8 @@ def test_rsm_effective_geometry_lowers_every_exact_psic_and_runtime_fact(tmp_pat
         1e-8,
         8,
         "CPython",
-        "3.13.14",
-        "Darwin",
-        "arm64",
+        3, 13,
+        "Darwin", "Linux", "Windows",
         "shared_xrd_tools_xu_rlock_v1",
         1,
     )

@@ -67,7 +67,7 @@ from xrd_tools.analysis.scan_operations import (
 from xrd_tools.core.allocator_pressure import (
     AllocatorPressureCallFailed,
     AllocatorPressureUnavailable,
-    bind_darwin_allocator_pressure_relief,
+    bind_allocator_pressure_relief,
 )
 from xrd_tools.core.geometry import (
     DetectorHeader,
@@ -5417,11 +5417,10 @@ class RSMOperationExecutionV2:
         progress_completed = 1
         try:
             with runtime_owner as session:
-                # Preserve the existing cross-platform refusal order: the
-                # pinned XU runtime validates Darwin arm64 before this Darwin-
-                # only capability is bound.  A missing symbol still refuses
-                # before mapper/grid allocation or detector science.
-                allocator_pressure = bind_darwin_allocator_pressure_relief()
+                # Runtime admission precedes optional allocator optimization.
+                # Darwin binding failures still refuse before science; other
+                # platforms retain the same root-release proofs without it.
+                allocator_pressure = bind_allocator_pressure_relief()
                 mapper = rsm_effective_pixel_q_map(
                     self.request.plan.effective_geometry
                 )
@@ -5525,7 +5524,8 @@ class RSMOperationExecutionV2:
                 # Every source lease is closed and every issued chunk receipt
                 # has proven its raw/q/feed roots dead.  One end-science call is
                 # intentionally independent of member/chunk count.
-                allocator_pressure.relieve()
+                if allocator_pressure is not None:
+                    allocator_pressure.relieve()
                 volume = _validate_rsm_v2_science_volume(
                     gridder.to_volume(),
                     self.request,
@@ -5571,11 +5571,6 @@ class RSMOperationExecutionV2:
                 ModuleDisposition.REFUSED,
                 "RSM_EXECUTION_ATTESTATION_MISMATCH",
             )
-        if allocator_pressure is None:
-            return self._terminal(
-                ModuleDisposition.REFUSED,
-                "RSM_ALLOCATOR_PRESSURE_UNAVAILABLE",
-            )
         try:
             axis_names = volume.coordinate_frame.axis_names
             axis_units = volume.coordinate_frame.axis_units
@@ -5599,7 +5594,8 @@ class RSMOperationExecutionV2:
             # The stored projection is now the only large product owner needed
             # by publication; released grid/finalization pages must not stack
             # with HDF5 validation and strict detached reload.
-            allocator_pressure.relieve()
+            if allocator_pressure is not None:
+                allocator_pressure.relieve()
         except AllocatorPressureUnavailable:
             return self._terminal(
                 ModuleDisposition.REFUSED,

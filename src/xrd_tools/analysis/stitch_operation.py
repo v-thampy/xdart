@@ -1718,9 +1718,8 @@ def _xu_provenance(
             "config_digits": requirements.config_digits,
             "nthreads_effective": 1,
             "python_implementation": requirements.python_implementation,
-            "python_version": requirements.python_version,
-            "platform_system": requirements.platform_system,
-            "platform_machine": requirements.platform_machine,
+            "python_min_version": list(requirements.python_min_version),
+            "platform_systems": list(requirements.platform_systems),
             "runtime_policy": asset["xrayutilities"]["runtime_policy"],
         },
         "output": {

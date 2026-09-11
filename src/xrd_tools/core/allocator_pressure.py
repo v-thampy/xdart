@@ -3,9 +3,9 @@
 The RSM operation uses this small boundary only after its ordinary weak-root
 release proofs have passed.  The bound capability accepts no array or owner;
 it merely asks Darwin's public allocator to return currently reusable pages.
-Importing this module is safe on every platform.  Binding is explicit so an
-unsupported platform or unavailable symbol is a bounded refusal rather than a
-silent no-op.
+Importing this module is safe on every platform. Darwin binding failures remain
+explicit; other supported platforms use ordinary allocator reclamation without
+claiming that an optional pressure-relief call ran.
 """
 
 from __future__ import annotations
@@ -83,3 +83,15 @@ def bind_darwin_allocator_pressure_relief() -> _DarwinAllocatorPressureRelief:
         function,
         _CAPABILITY_FACTORY,
     )
+
+
+def bind_allocator_pressure_relief() -> _DarwinAllocatorPressureRelief | None:
+    """Select the native optional optimization without changing root ownership.
+
+    Linux and Windows need no Darwin allocator capability to execute science.
+    Returning None explicitly means that no pressure-relief call will run.
+    """
+
+    if sys.platform == "darwin":
+        return bind_darwin_allocator_pressure_relief()
+    return None

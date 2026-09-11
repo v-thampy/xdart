@@ -372,26 +372,24 @@ def _validated_execution_attestation(
         "q_root_policy",
         "xu_runtime",
     }
-    runtime_keys = {
-        "lock_policy",
-        "xrayutilities_distribution_version",
-        "xrayutilities_module_version",
-        "numpy_version",
-        "config_epsilon",
-        "config_digits",
-        "nthreads_before",
-        "nthreads_effective",
-        "nthreads_restored",
-        "restore_passed",
-    }
     runtime = parsed.get("xu_runtime")
     selected = parsed.get("selected_frame_count")
     released = parsed.get("release_check_frame_count")
-    before = runtime.get("nthreads_before") if type(runtime) is dict else None
-    restored = runtime.get("nthreads_restored") if type(runtime) is dict else None
-    if kind is AnalysisArtifactKind.RSM:
+
+    def valid_runtime_projection(value: object) -> bool:
         from xrd_tools.core.geometry.xu_runtime import XuRuntimeExecutionRecord
 
+        if type(value) is not dict:
+            return False
+        try:
+            record = XuRuntimeExecutionRecord(**value)
+        except TypeError:
+            return False
+        # Preserve the original closed shape and admit the complete observed
+        # environment extension. Partial, null, or unknown fields fail equality.
+        return record.to_attestation() == value
+
+    if kind is AnalysisArtifactKind.RSM:
         rsm_top_keys = {
             "schema_version",
             "module_request_fingerprint",
@@ -431,15 +429,6 @@ def _validated_execution_attestation(
         q_released = parsed.get("q_release_check_chunk_count")
         frame_released = parsed.get("frame_release_check_frame_count")
         masks = parsed.get("member_masks")
-
-        def valid_runtime_projection(value: object) -> bool:
-            if type(value) is not dict:
-                return False
-            try:
-                record = XuRuntimeExecutionRecord(**value)
-            except TypeError:
-                return False
-            return record.to_attestation() == value
 
         def valid_shape(value: object) -> bool:
             return (
@@ -589,23 +578,7 @@ def _validated_execution_attestation(
         or parsed.get("release_check_passed") is not True
         or parsed.get("q_root_policy")
         != "shared_ultimate_ndarray_root_weakref_v1"
-        or type(runtime) is not dict
-        or set(runtime) != runtime_keys
-        or runtime.get("lock_policy") != "shared_xrd_tools_xu_rlock_v1"
-        or runtime.get("xrayutilities_distribution_version") != "1.7.12"
-        or runtime.get("xrayutilities_module_version") != "1.7.12"
-        or runtime.get("numpy_version") != "2.5.1"
-        or type(runtime.get("config_epsilon")) is not float
-        or runtime.get("config_epsilon") != 1e-8
-        or type(runtime.get("config_digits")) is not int
-        or runtime.get("config_digits") != 8
-        or type(before) is not int
-        or before < 0
-        or type(runtime.get("nthreads_effective")) is not int
-        or runtime.get("nthreads_effective") != 1
-        or type(restored) is not int
-        or restored != before
-        or runtime.get("restore_passed") is not True
+        or not valid_runtime_projection(runtime)
     ):
         raise ValueError("analysis execution attestation contract is invalid")
     return text, parsed
