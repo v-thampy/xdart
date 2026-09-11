@@ -931,9 +931,24 @@ def test_j0_08_evicted_hydration_is_single_flight_and_does_not_blank(
     try:
         _run(rig)
         _wait(rig.app, lambda: len(rig.controller.frame_keys) >= 20)
+        first = rig.controller.frame_keys[0]
+        # Residency may only drop frame 1 once the writer's checkpoint has
+        # verified its rows; a slow host accepts twenty frames before that.
+        # Wait for the eviction while the acquisition still re-arms
+        # residency, so the hydration below has to read.
+        _wait(
+            rig.app,
+            lambda: not any(
+                frame is first for frame in rig.controller.resident_frame_keys
+            ),
+            diagnostic=lambda: (
+                f"frame 1 still resident after "
+                f"{len(rig.controller.frame_keys)} frames, "
+                f"phase={rig.lifecycle.phase.value}"
+            ),
+        )
         _pause(rig)
         _wait(rig.app, lambda: rig.shell.scientific.raw.image.image is not None)
-        first = rig.controller.frame_keys[0]
         from xdart.gui.tabs.scattering import hydration_transport
 
         read_labels: list[int] = []
@@ -957,7 +972,10 @@ def test_j0_08_evicted_hydration_is_single_flight_and_does_not_blank(
             frames=(first,),
         )
         rig.command(command)
-        assert read_entered.wait(5.0)
+        assert read_entered.wait(5.0), (
+            "no preview read for frame 1; resident="
+            f"{any(frame is first for frame in rig.controller.resident_frame_keys)}"
+        )
         rig.command(command)
         np.testing.assert_array_equal(
             rig.shell.scientific.raw.image.image, before_raw
