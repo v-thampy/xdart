@@ -2912,12 +2912,21 @@ def test_active_reintegrate_stop_preserves_readable_predecessor(
     def painted():
         page._drain_executor()
         projection = page._last_scientific_projection
-        return projection if projection is not None and view.trace_history_keys else None
+        # Baseline only once the heavy has hydrated: the stop must preserve
+        # the predecessor's painted frame, so a baseline taken while the
+        # heavy is still pending (slow host) would compare None against it.
+        return (
+            projection
+            if projection is not None
+            and view.trace_history_keys
+            and projection.heavy is not None
+            else None
+        )
 
     before = _wait(painted)
     before_keys = view.trace_history_keys
     before_trace_frames = tuple(trace.frame for trace in before.traces)
-    before_heavy_frame = None if before.heavy is None else before.heavy.frame
+    before_heavy_frame = before.heavy.frame
 
     def cancelled(_offer, _target, **kwargs):
         token = kwargs["cancel_token"]
