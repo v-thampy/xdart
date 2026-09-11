@@ -38,7 +38,8 @@ from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
 from tests.xdart.scattering._admission import ImmediateAdmission, install_admission
 
 
-def _prepared_run(tmp_path, *, frame_count=1, intent=None):
+def _prepared_run(tmp_path, *, frame_count=1, intent=None,
+                  identity_factory=RunIdentity.from_configuration):
     """Build the real admission and run owners without launching the worker."""
     from tests.xdart.scattering._e2sd_support import write_poni
     from tests.xdart.scattering.test_p1b_output_graph import (
@@ -62,7 +63,7 @@ def _prepared_run(tmp_path, *, frame_count=1, intent=None):
     assert resources is not None
     executor._admission = None
     run = _StandardRun(
-        configuration, RunIdentity.from_configuration(configuration),
+        configuration, identity_factory(configuration),
         None, None, None, None, Path(configuration.save_path),
         capture=capture, resources=resources,
     )
