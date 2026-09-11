@@ -681,6 +681,8 @@ class HydrationTransport:
         except Exception as error:
             return HydrationOutcome.FAILED, _diagnostic(error)
         with self._lock:
+            if self._retired:
+                return HydrationOutcome.CANCELLED, None
             if (self._active is not entry
                     or entry.state is not _EntryState.READING
                     or entry.delivery_guard is not None):
