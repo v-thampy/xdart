@@ -987,18 +987,25 @@ def _descriptor_stream_stat_receipt(
     )
 
 
-def _stream_stat_matches(path: Path | str, receipt: _StreamStatReceipt) -> bool:
-    try:
-        observed = os.stat(path)
-    except FileNotFoundError:
-        return False
-    return _stat_identity(observed) == (
+def _stream_receipt_identity(
+    receipt: _StreamStatReceipt,
+) -> tuple[int, int, int, int, int]:
+    """The sealed (dev, ino, size, mtime_ns, ctime_ns) view of a receipt."""
+    return (
         receipt.identity.device,
         receipt.identity.inode,
         receipt.size,
         receipt.mtime_ns,
         receipt.ctime_ns,
     )
+
+
+def _stream_stat_matches(path: Path | str, receipt: _StreamStatReceipt) -> bool:
+    try:
+        observed = os.stat(path)
+    except FileNotFoundError:
+        return False
+    return _stat_identity(observed) == _stream_receipt_identity(receipt)
 
 
 def _receipt_for_snapshot(path: Path | str, snapshot: TargetSnapshot, role: str) -> _ObjectReceipt:
@@ -2830,13 +2837,18 @@ class OutputTransaction:
                 self._phase = TransactionPhase.INTEGRITY_HOLD
                 raise TargetChanged("stream working target identity changed")
             if self._stream_checkpoint_fresh:
-                if checkpoint is None or not _stream_stat_matches(
-                    self._admission.target,
-                    checkpoint,
-                ):
+                observed = _stat_identity(stat_result)
+                sealed = (
+                    None if checkpoint is None
+                    else _stream_receipt_identity(checkpoint)
+                )
+                if observed != sealed:
                     self._phase = TransactionPhase.INTEGRITY_HOLD
+                    # Name both (dev, ino, size, mtime_ns, ctime_ns) views:
+                    # this refusal is the only evidence a live run leaves.
                     raise TargetChanged(
-                        "stream checkpoint failed identity verification"
+                        "stream checkpoint failed identity verification "
+                        f"(observed={observed} checkpoint={sealed})"
                     )
                 self._stream_checkpoint_fresh = False
                 self._stream_terminal_receipt = None
