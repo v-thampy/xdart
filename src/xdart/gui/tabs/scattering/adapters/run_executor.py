@@ -2356,9 +2356,8 @@ class StandardRunExecutor:
                     run.current_total,
                     run.current_completed + len(new_labels),
                 )
-                run.current_published = max(
-                    run.current_published, run.current_completed,
-                )
+                # Durable rows may outlive a failed display callback. Their
+                # acknowledgement does not prove a navigation publication.
             if new_labels and path not in run.artifacts:
                 run.artifacts.append(path)
         output.project_new_durable(apply)
