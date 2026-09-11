@@ -6,13 +6,9 @@ import h5py
 import numpy as np
 import pytest
 
+from xrd_tools.core.containers import IntegrationResult1D
 from xrd_tools.core.provenance import write_provenance
-from xrd_tools.io.schema import (
-    PROCESSED_SCHEMA_NAME,
-    PROCESSED_SCHEMA_VERSION,
-    SCHEMA_NAME_ATTR,
-    SCHEMA_VERSION_ATTR,
-)
+from xrd_tools.io.nexus import write_nexus
 from xrd_tools.session.experiment_reload import ExperimentRecordReader, ReloadStatus
 from xrd_tools.session.experiment_state import (
     CalibrationState,
@@ -58,27 +54,25 @@ def _exact_state() -> ExperimentState:
     )
 
 
-def _stamp_current_record(handle: h5py.File) -> None:
-    entry = handle.require_group("entry")
-    entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
-    entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
-    result = entry.create_group("integrated_1d")
-    result.attrs["NX_class"] = "NXdata"
-    result.attrs["signal"] = "intensity"
-    result.attrs["axes"] = ("frame_index", "q")
-    result.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
-    result.create_dataset("q", data=np.array([1.0], dtype=np.float32))
-    result.create_dataset(
-        "intensity", data=np.ones((1, 1), dtype=np.float32),
+def _write_current_record(path: Path, config: dict[str, object]) -> None:
+    write_nexus(
+        path,
+        results_1d={
+            0: IntegrationResult1D(
+                radial=np.array([1.0], dtype=np.float32),
+                intensity=np.ones(1, dtype=np.float32),
+                unit="q_A^-1",
+            ),
+        },
     )
+    with h5py.File(path, "r+") as handle:
+        write_provenance(handle, config=config)
 
 
 def test_exact_record_round_trips_typed_state_and_fingerprint(tmp_path: Path) -> None:
     state = _exact_state()
     record = tmp_path / "exact.nexus"
-    with h5py.File(record, "w") as handle:
-        _stamp_current_record(handle)
-        write_provenance(handle, config={"experiment": state.to_provenance()})
+    _write_current_record(record, {"experiment": state.to_provenance()})
 
     result = ExperimentRecordReader().read(record)
     assert result.status is ReloadStatus.EXACT
@@ -98,14 +92,12 @@ def test_historical_fallback_envelopes_are_absent(
     tmp_path: Path, config: dict[str, object]
 ) -> None:
     record = tmp_path / "historical.nexus"
-    with h5py.File(record, "w") as handle:
-        _stamp_current_record(handle)
-        write_provenance(handle, config=config)
+    _write_current_record(record, config)
 
     result = ExperimentRecordReader().read(record)
     assert result.status is ReloadStatus.ABSENT
     assert result.experiment is None
-    assert "exact experiment" in result.reason
+    assert result.reason == "exact experiment provenance is absent"
 
 
 @pytest.mark.parametrize("marker", ["not-a-mapping", None, []])
@@ -113,20 +105,18 @@ def test_malformed_exact_marker_fails_closed(
     tmp_path: Path, marker: object
 ) -> None:
     record = tmp_path / "malformed.nexus"
-    with h5py.File(record, "w") as handle:
-        _stamp_current_record(handle)
-        write_provenance(
-            handle,
-            config={
-                "experiment": marker,
-                "run_configuration": {"gi": {"enabled": False}},
-            },
-        )
+    _write_current_record(
+        record,
+        {
+            "experiment": marker,
+            "run_configuration": {"gi": {"enabled": False}},
+        },
+    )
 
     result = ExperimentRecordReader().read(record)
     assert result.status is ReloadStatus.ABSENT
     assert result.experiment is None
-    assert "exact experiment" in result.reason
+    assert result.reason == "exact experiment provenance is absent"
 
 
 def test_open_failure_is_distinct_from_absent(tmp_path: Path) -> None:

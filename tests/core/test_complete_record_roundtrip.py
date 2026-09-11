@@ -5,8 +5,8 @@ in real source files inside a project root must produce a file where:
 
 * ``get_raw_frame`` resolves the raw via the per-frame source pointer;
 * ``read_frame_view`` returns the thumbnail + source ref;
-* the record is N1-portable: MOVE the whole project directory and
-  resolution still works (relative pointers + @source_base semantics).
+* the record is N1-portable: MOVE the whole project directory and select its
+  new source root to resolve the persisted relative pointers.
 """
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ def test_headless_run_writes_complete_portable_record(project, tmp_path,
     # Reader round-trip on the headless-written file
     from xrd_tools.io import get_raw_frame
     from xrd_tools.io.frame_view import read_frame_view
-    raw = get_raw_frame(out, 1)
+    raw = get_raw_frame(out, 1, allow_thumbnail=False)
     np.testing.assert_allclose(np.asarray(raw), expected_raw_1)
     assert frames[1].image is None
     fv = read_frame_view(out, 1)
@@ -110,11 +110,14 @@ def test_headless_run_writes_complete_portable_record(project, tmp_path,
     assert fv.source_path.replace("\\", "/").endswith("raw/img_0001.tif")
     assert fv.source_frame_index == 0  # single-frame TIFF sources
 
-    # N1 portability: MOVE the whole project (sources + output together)
+    # N1 portability: MOVE the whole project (sources + output together), then
+    # select its new root instead of the persisted original @source_base.
     moved = tmp_path / "relocated"
     shutil.move(str(root), str(moved))
     moved_out = moved / "processed" / "scan.nexus"
-    raw2 = get_raw_frame(moved_out, 2)
+    raw2 = get_raw_frame(
+        moved_out, 2, source_root=moved, allow_thumbnail=False,
+    )
     np.testing.assert_allclose(np.asarray(raw2), expected_raw_2)
 
 
