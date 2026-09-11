@@ -804,12 +804,15 @@ def test_page_retains_one_shot_retirement_proof_until_browse_is_clean(
     browse_statuses = deque(
         (CleanupStatus.CLEANUP_PENDING, CleanupStatus.CLEANED)
     )
+    real_release_browse = controller._browse_loader.release_context
 
     def release_browse(context):
         assert context is browse
         status = browse_statuses.popleft()
         if status is CleanupStatus.CLEANED:
-            context.release()
+            # The loader owns closing/detaching the current 1-D cache before
+            # releasing the context; keep that real cleanup on the retry.
+            return real_release_browse(context)
         return BrowseCleanupReceipt(request, status)
 
     monkeypatch.setattr(
