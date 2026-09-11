@@ -178,10 +178,10 @@ def test_multi_output_gi_repeated_labels_keep_distinct_catalog_entries(
             for index in range(selector.count())
         ) == catalog.entries[1:]
         assert shell.scientific.progress.text() == "1/1"
-        # This raw .nxs member keeps its filename in the footer; its exact
+        # The footer presents a one-based member number while the exact
         # zero-based container label remains in the catalog key.
-        assert shell.scientific.status.text() == "second.nxs"
-        assert shell.scientific.title.text() == "second.nxs"
+        assert shell.scientific.status.text() == "second.nxs · frame 1"
+        assert shell.scientific.title.text() == "second.nxs · frame 1"
 
         first = catalog.entries[0]
         page._handle_shell_command(ShellCommand(
