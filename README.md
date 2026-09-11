@@ -89,16 +89,50 @@ and lz4-c):
 pixi global install -c https://prefix.dev/xrd-tools -c conda-forge xdart
 ```
 
-Launch with `xdart` (or the shortcut). Upgrade with `pixi global update xdart`
-(or from the app: **Help → Check for Updates…**).
-
-> The conda package is published with the release tag. Until it is live on the
-> channel, use the one-line installer script below (it needs nothing preinstalled
-> — not even pixi).
+Launch with `xdart` (or the shortcut). These same commands work for a normal
+Windows installation; Git and an editable checkout are only needed for development.
 
 These commands install the latest **published release**. To use the current
 source or work on xdart, use the [editable Pixi install](#editable-install-with-pixi-recommended)
 below; it also keeps the native HDF5/compression libraries on conda-forge.
+
+### Updating an existing installation
+
+For an existing **Pixi global** install on macOS, Linux, or Windows, close xdart
+and run these commands from any directory:
+
+```bash
+pixi global list
+pixi global update xdart
+xdart
+```
+
+`pixi global list` shows which environments are installed globally. The update
+command upgrades the existing `xdart` environment; a fresh editable install is
+not needed. See the [Pixi global update reference](https://pixi.sh/latest/reference/cli/pixi/global/update/).
+
+A release becomes available after the maintainer pushes its version tag **and
+the package publication workflows succeed**. A commit on `main`, or a local tag,
+does not update the published package. Pixi global installs use the conda channel;
+the installer scripts below use PyPI. If an install was pinned to an older
+version, its version constraint must also be updated.
+
+The **one-line installer** creates a private Pixi workspace, so it is updated
+separately from global environments. Use **Help → Check for Updates…**, or close
+xdart and update the workspace directly (default installation paths shown):
+
+```bash
+# macOS / Linux
+~/.local/share/xdart/pixi/bin/pixi update --manifest-path ~/.local/share/xdart/pixi.toml
+```
+
+```powershell
+# Windows (PowerShell)
+& "$env:LOCALAPPDATA\xdart\pixi\bin\pixi.exe" update --manifest-path "$env:LOCALAPPDATA\xdart\pixi.toml"
+```
+
+For an **editable checkout**, update the Git checkout and install its checked-in
+lockfile; see [Development](#editable-install-with-pixi-recommended).
 
 ### One-line installer script (no conda or pixi needed)
 
@@ -123,7 +157,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/v-t
   stack (the fastest Eiger bitshuffle/LZ4 decode) plus `xdart[gui]` from PyPI,
   resolved in one solve with a lockfile. This is the same layering the manual
   conda steps below do — only assembled for you.
-- **Launch** with `xdart`. **Upgrade** by re-running the same line.
+- **Launch** with `xdart`. **Upgrade** using the private-workspace instructions above.
 - **Extras**: set `XDART_EXTRAS` before the command, e.g.
   `curl -fsSL … | XDART_EXTRAS="gui,notebook" bash` on macOS/Linux.
 - If `xdart` launches an old version, run `hash -r` (or open a new terminal) — the
@@ -158,8 +192,8 @@ then launch with `xdart`. (Already have an environment? Just run step 2 in it.)
 
 ### Using pip / uv
 
-Requires **Python ≥ 3.11**. `xdart` is a normal PyPI package and installs
-anywhere:
+Requires **Python ≥ 3.13**. Python **3.13** is the default used by the Pixi
+workspaces, installer scripts, and CI. `xdart` is a normal PyPI package:
 
 ```bash
 pip install "xdart[gui]"          # the xdart GUI + reduction core
@@ -901,13 +935,27 @@ On **Apple Silicon macOS or Linux x86-64**, use the repository's locked workspac
 git clone https://github.com/v-thampy/xdart.git
 cd xdart
 pixi install --locked
-pixi run xdart
+pixi run --locked xdart
 ```
 
 `pyproject.toml` already declares `xdart = { path = ".", editable = true, ... }`
 with the GUI, development, and notebook extras. Changes under `src/` are used
 when you restart xdart; no separate `pip install -e` is needed. Always launch with
-`pixi run xdart` from this checkout to select it over a global release install.
+`pixi run --locked xdart` from this checkout to select it over a global release install.
+
+To update an existing clone, save or commit your local work first, then run:
+
+```bash
+git pull --ff-only
+git rev-parse --short=8 HEAD
+pixi install --locked
+pixi run --locked xdart
+```
+
+The Git hash identifies the exact source revision being tested. `--locked`
+requires the lockfile to match the manifest and installs its recorded package
+versions without updating the lockfile. It does not prevent editable source
+changes. See the [Pixi run reference](https://pixi.sh/latest/reference/cli/pixi/run/).
 
 The native stack comes from **conda-forge**: NumPy, h5py, hdf5plugin, HDF5,
 Blosc, c-blosc2, lz4-c, Fabio, pyFAI, silx, PySide6, and xrayutilities. The local
@@ -916,7 +964,7 @@ through PyPI without replacing those conda packages. Inspect the environment
 with `pixi list`, or confirm the source location with:
 
 ```bash
-pixi run python -c "import xdart; print(xdart.__file__)"
+pixi run --locked python -c "import xdart; print(xdart.__file__)"
 ```
 
 **Windows editable install:** the checked-in workspace currently locks only
@@ -958,8 +1006,11 @@ xdart = { path = "../xdart", editable = true, extras = ["gui", "dev", "notebook"
 ```
 
 Then run `pixi install` and `pixi run xdart` from `xdart-dev`. Keep the generated
-`pixi.lock` to reproduce that Windows environment. This Windows setup must be
-validated on Windows before declaring a release supported there.
+`pixi.lock` to reproduce that Windows environment; subsequent launches can use
+`pixi run --locked xdart`. To update the editable source, run `git pull --ff-only`
+in the sibling `xdart` checkout. If its dependencies changed, run `pixi install`
+in `xdart-dev` and retain the updated Windows lockfile. This Windows setup must
+be validated on Windows before declaring a release supported there.
 
 ### Tests and packaging
 

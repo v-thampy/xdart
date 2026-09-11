@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
-        with: {python-version: "3.12"}
+        with: {python-version: "3.13"}
       # Pre-flight (scripts/release.py): tag == pyproject == module
       # versions, dependency ceilings, schema pins + byte-compat gate.
       - run: pip install -e ".[dev]"

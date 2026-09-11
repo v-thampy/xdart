@@ -10,6 +10,9 @@ import nbformat
 import numpy as np
 import pytest
 
+from xrd_tools.core import IntegrationResult1D
+from xrd_tools.io.nexus import write_nexus
+
 
 matplotlib.use("Agg", force=True)
 
@@ -41,14 +44,14 @@ def _write_folder_scan(path: Path, *, center: float) -> None:
         8 + 140 * np.exp(-0.5 * ((q - (center - 0.0005 * frame)) / 0.02) ** 2)
         for frame in frames
     ], dtype=np.float32)
-    with h5py.File(path, "w") as h5:
-        entry = h5.create_group("entry")
-        one_d = entry.create_group("integrated_1d")
-        one_d.create_dataset("frame_index", data=frames)
-        q_data = one_d.create_dataset("q", data=q)
-        q_data.attrs["units"] = "q_A^-1"
-        one_d.create_dataset("intensity", data=intensity)
-        one_d.create_dataset("sigma", data=np.sqrt(intensity))
+    write_nexus(
+        path,
+        results_1d={
+            int(frame): IntegrationResult1D(q, row, sigma=np.sqrt(row), unit="q_A^-1")
+            for frame, row in zip(frames, intensity, strict=True)
+        },
+        compression=None,
+    )
 
 
 def test_integration_stitch_and_peak_callbacks_change_results(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -146,9 +149,9 @@ def test_time_resolved_folder_selection_uses_only_selected_scans_and_sequence_ti
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    selected_first = tmp_path / "scan_2.nxs"
-    selected_second = tmp_path / "scan_10.nxs"
-    _write_folder_scan(tmp_path / "scan_1.nxs", center=1.56)
+    selected_first = tmp_path / "scan_2.nexus"
+    selected_second = tmp_path / "scan_10.nexus"
+    _write_folder_scan(tmp_path / "scan_1.nexus", center=1.56)
     _write_folder_scan(selected_first, center=1.56)
     _write_folder_scan(selected_second, center=1.56)
     with h5py.File(tmp_path / "unrelated_99.nxs", "w") as h5:
@@ -158,10 +161,10 @@ def test_time_resolved_folder_selection_uses_only_selected_scans_and_sequence_ti
     notebook["export_directory"] = tmp_path / "exports"
     notebook["selection_mode"].value = "folder"
     notebook["processed_folder"].value = str(tmp_path)
-    notebook["scan_filter"].value = "scan_*.nxs"
+    notebook["scan_filter"].value = "scan_*.nexus"
     notebook["discover_button"].click()
     assert [label for label, _ in notebook["scan_selection"].options] == [
-        "scan_1.nxs", "scan_2.nxs", "scan_10.nxs"
+        "scan_1.nexus", "scan_2.nexus", "scan_10.nexus"
     ]
 
     notebook["scan_selection"].value = (str(selected_first), str(selected_second))
@@ -171,7 +174,7 @@ def test_time_resolved_folder_selection_uses_only_selected_scans_and_sequence_ti
     notebook["batch_button"].click()
     notebook["export_button"].click()
 
-    assert notebook["NOTEBOOK_STATE"]["selected_scans"] == ("scan_2.nxs", "scan_10.nxs")
+    assert notebook["NOTEBOOK_STATE"]["selected_scans"] == ("scan_2.nexus", "scan_10.nexus")
     assert notebook["NOTEBOOK_STATE"]["series"].dataset.sizes["pattern"] == 6
     assert notebook["NOTEBOOK_STATE"]["thermal_time_coord"] == "sequence_time"
     assert np.all(np.diff(notebook["NOTEBOOK_STATE"]["thermal"].coords["sequence_time"].values) > 0)

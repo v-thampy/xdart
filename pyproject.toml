@@ -11,7 +11,7 @@ readme = "README.md"
 # ssrl_xrd_tools-provenance code is BSD-3-Clause (licenses/LICENSE-ssrl_xrd_tools).
 license = "MIT AND BSD-3-Clause"
 license-files = ["licenses/LICENSE-*", "LICENSE"]
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 authors = [
     {name = "Vivek Thampy", email = "vthampy@stanford.edu"},
 ]
@@ -20,8 +20,6 @@ classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Physics",
     "Topic :: Scientific/Engineering :: Chemistry",

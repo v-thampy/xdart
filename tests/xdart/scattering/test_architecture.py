@@ -866,5 +866,4 @@ def test_e2_output_and_directory_owners_remain_on_the_exact_two_port_boundary():
         if "h5py" in names
     } == {
         Path("experiment_authoring.py"),
-        Path("output_preflight.py"),
     }

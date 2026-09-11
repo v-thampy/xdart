@@ -11,8 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
-        with: {python-version: "3.12"}
-      - run: pip install -e ".[dev,fitting,rsm]"
+        with: {python-version: "3.13"}
+      - run: pip install -e ".[dev,fitting,rsm,notebook]"
       - run: pytest tests/core -q -m "not slow" --timeout=300
 
   architecture-guards:
@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
-        with: {python-version: "3.12"}
+        with: {python-version: "3.13"}
       - run: pip install -e ".[dev]"
       - run: pytest tests/core/test_architecture_guards.py tests/core/test_ssrl_shim.py -q --timeout=120
 
@@ -31,9 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
-        with: {python-version: "3.12"}
+        with: {python-version: "3.13"}
       - run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0
-      - run: pip install -e ".[gui,dev,fitting,rsm]"
+      - run: pip install -e ".[gui,dev,fitting,rsm,notebook]"
       - env:
           QT_QPA_PLATFORM: offscreen
         # scripts/ci_pytest.py hard-exits with pytest's own verdict as soon as
@@ -71,7 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
-        with: {python-version: "3.12"}
+        with: {python-version: "3.13"}
       # base+dev suffices: `import xdart` resolves without the gui extra, and the
       # schema check's two test files need only io (h5py, pyFAI is a base dep) + pytest.
       - run: pip install -e ".[dev]"

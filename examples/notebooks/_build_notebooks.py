@@ -535,13 +535,15 @@ NB_READING = [
         from IPython.display import clear_output, display
 
         from xrd_tools.gui.widgets import ImageViewer, PatternViewer
+        from xrd_tools.core import IntegrationResult1D, IntegrationResult2D
         from xrd_tools.io import open_scan
+        from xrd_tools.io.nexus import write_nexus
         """
     ),
     CONFIG,
     code(
         """
-        processed_file = TEST_DATA / "xdart_processed_data" / "Pt_10nm_00013.nxs"
+        processed_file = TEST_DATA / "xdart_processed_data" / "Pt_10nm_00013.nexus"
         frame_selector = widgets.BoundedIntText(value=0, min=0, max=999999, description="frame label")
         source_root = widgets.Text(value="", description="source root")
         inspect_button = widgets.Button(description="Inspect frame", button_style="primary")
@@ -553,21 +555,20 @@ NB_READING = [
     code(
         """
         if SMOKE_MODE:
-            smoke_file = Path(tempfile.gettempdir()) / "xdart_notebook_processed_read_smoke.nxs"
+            smoke_directory = tempfile.TemporaryDirectory(prefix="xdart_notebook_processed_read_")
+            smoke_file = Path(smoke_directory.name) / "scan.nexus"
             q = np.linspace(1.0, 4.0, 180)
+            chi = np.linspace(-20, 20, 12)
             frames = np.array([3, 7], dtype=np.int64)
             stack = np.vstack([12 + np.sin(q) ** 2, 13 + np.cos(q) ** 2]).astype("float32")
-            with h5py.File(smoke_file, "w") as h5:
-                entry = h5.create_group("entry")
-                one_d = entry.create_group("integrated_1d")
-                one_d.create_dataset("frame_index", data=frames)
-                q_data = one_d.create_dataset("q", data=q); q_data.attrs["units"] = "q_A^-1"
-                one_d.create_dataset("intensity", data=stack)
-                two_d = entry.create_group("integrated_2d")
-                two_d.create_dataset("frame_index", data=frames)
-                two_d.create_dataset("q", data=q)
-                two_d.create_dataset("chi", data=np.linspace(-20, 20, 12))
-                two_d.create_dataset("intensity", data=np.broadcast_to(stack[:, None, :], (2, 12, q.size)))
+            write_nexus(
+                smoke_file,
+                results_1d={int(frame): IntegrationResult1D(q, row, unit="q_A^-1") for frame, row in zip(frames, stack)},
+                results_2d={int(frame): IntegrationResult2D(q, chi, np.broadcast_to(row[:, None], (q.size, chi.size)), unit="q_A^-1", azimuthal_unit="chi_deg") for frame, row in zip(frames, stack)},
+                compression=None,
+            )
+            with h5py.File(smoke_file, "r+") as h5:
+                entry = h5["entry"]
                 groups = entry.create_group("frames")
                 for frame in frames:
                     groups.create_group(f"frame_{frame:04d}").create_dataset("thumbnail", data=np.arange(64, dtype="uint8").reshape(8, 8))
@@ -645,6 +646,8 @@ NB_TIME_RESOLVED = [
             normalize_monitor, normalize_reference_band, select_time_zero,
         )
         from xrd_tools.gui.widgets import ImageViewer, PatternViewer, PeakFitControls
+        from xrd_tools.core import IntegrationResult1D, IntegrationResult2D
+        from xrd_tools.io.nexus import write_nexus
         from xrd_tools.viz import plot_peak_fit_frame, plot_thermal_history, plot_time_resolved_waterfall
         """
     ),
@@ -652,10 +655,10 @@ NB_TIME_RESOLVED = [
     code(
         """
         processed_root = TEST_DATA / "xdart_processed_data"
-        processed_file = widgets.Text(value=str(processed_root / "Pt_test_burst_00007.nxs"), description="processed file")
+        processed_file = widgets.Text(value=str(processed_root / "Pt_test_burst_00007.nexus"), description="processed file")
         processed_folder = widgets.Text(value=str(processed_root), description="processed folder")
         selection_mode = widgets.ToggleButtons(options=("file", "folder"), value="file", description="load")
-        scan_filter = widgets.Text(value="*.nxs", description="scan filter")
+        scan_filter = widgets.Text(value="*.nexus", description="scan filter")
         discover_button = widgets.Button(description="Find processed scans")
         scan_selection = widgets.SelectMultiple(options=(), description="selected scans", layout=widgets.Layout(width="620px", height="120px"))
         raw_root = widgets.Text(value=str(TEST_DATA) if TEST_DATA.exists() else "", description="raw root")
@@ -684,20 +687,26 @@ NB_TIME_RESOLVED = [
     code(
         """
         NOTEBOOK_STATE = {"loads": 0, "preprocesses": 0, "series": None, "prepared": None, "fits": None, "thermal": None, "raw_reads": 0, "discovered_scans": (), "selected_scans": (), "thermal_time_coord": None}
+        if SMOKE_MODE:
+            smoke_directory = tempfile.TemporaryDirectory(prefix="xdart_notebook_time_resolved_")
 
         def _smoke_file():
-            path = Path(tempfile.gettempdir()) / "xdart_notebook_time_resolved_smoke.nxs"
+            path = Path(smoke_directory.name) / "scan.nexus"
             q, frames = np.linspace(2.45, 3.30, 240), np.arange(16, dtype=np.int64)
+            chi = np.linspace(-30, 30, 12)
             centers = 2.765 - 0.0008 * frames
             stack = np.array([15 + 180 * np.exp(-0.5 * ((q - center) / 0.018) ** 2) for center in centers], dtype=np.float32)
-            with h5py.File(path, "w") as h5:
-                entry = h5.create_group("entry")
-                one_d = entry.create_group("integrated_1d"); one_d.create_dataset("frame_index", data=frames)
-                q_data = one_d.create_dataset("q", data=q); q_data.attrs["units"] = "q_A^-1"
-                one_d.create_dataset("intensity", data=stack); one_d.create_dataset("sigma", data=np.sqrt(stack))
+            write_nexus(
+                path,
+                results_1d={int(frame): IntegrationResult1D(q, row, sigma=np.sqrt(row), unit="q_A^-1") for frame, row in zip(frames, stack)},
+                results_2d={int(frame): IntegrationResult2D(q, chi, np.broadcast_to(row[:, None], (q.size, chi.size)), unit="q_A^-1", azimuthal_unit="chi_deg") for frame, row in zip(frames, stack)},
+                overwrite=True,
+                compression=None,
+            )
+            with h5py.File(path, "r+") as h5:
+                entry = h5["entry"]
                 scan_data = entry.create_group("scan_data"); scan_data.create_dataset("frame_index", data=frames)
                 scan_data.create_dataset("elapsed", data=frames * 2.0); scan_data.create_dataset("i0", data=np.linspace(0.98, 1.02, len(frames)))
-                cakes = entry.create_group("integrated_2d"); cakes.create_dataset("frame_index", data=frames); cakes.create_dataset("q", data=q); cakes.create_dataset("chi", data=np.linspace(-30, 30, 12)); cakes.create_dataset("intensity", data=np.broadcast_to(stack[:, None, :], (len(frames), 12, len(q))))
                 groups = entry.create_group("frames")
                 for frame in frames:
                     groups.create_group(f"frame_{frame:04d}").create_dataset("thumbnail", data=np.ones((8, 8), dtype=np.uint8))
@@ -709,7 +718,7 @@ NB_TIME_RESOLVED = [
                 try:
                     assert selection_mode.value == "folder", "Choose folder mode before discovering scans"
                     root = Path(processed_folder.value).expanduser()
-                    pattern = scan_filter.value.strip() or "*.nxs"
+                    pattern = scan_filter.value.strip() or "*.nexus"
                     paths = discover_processed_scans(root, pattern=pattern)
                     assert paths, f"No processed 1-D scans match {pattern!r} under {root}"
                     scan_selection.options = [(path.name, str(path)) for path in paths]

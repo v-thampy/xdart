@@ -16,9 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
-        with: {python-version: "3.12"}
+        with: {python-version: "3.13"}
       - run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0
-      - run: pip install -e ".[gui,dev,fitting,rsm]"
+      - run: pip install -e ".[gui,dev,fitting,rsm,notebook]"
       - run: pytest tests/core -q --timeout=600
       - env:
           QT_QPA_PLATFORM: offscreen
