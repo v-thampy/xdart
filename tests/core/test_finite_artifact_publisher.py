@@ -1020,16 +1020,48 @@ def test_seed_publication_does_not_rehash_the_admitted_source(
     assert len(captures) == 3
 
 
+@pytest.mark.parametrize("reuse_inode", (False, True))
 def test_seed_substitution_is_detected_before_foreign_file_truncation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    reuse_inode: bool,
 ) -> None:
     source = tmp_path / "source.nexus"
     source.write_bytes(b"source seed")
     admission = capture_finite_source(source)
     request = _request(tmp_path, source, admission=admission)
     real_open = finite_module.os.open
+    real_fstat = finite_module.os.fstat
+    real_stat = finite_module.os.stat
     swapped: list[Path] = []
+    identities: dict[str, tuple[int, int]] = {}
+    reused_descriptor_observations: list[int] = []
+
+    def reused_state(observed):
+        if (
+            reuse_inode
+            and (observed.st_dev, observed.st_ino) == identities.get("foreign")
+        ):
+            # Model Linux recycling the unlinked reservation's inode. Keep
+            # every other stat field from the real foreign file, and apply the
+            # same identity to both descriptor admission and pathname cleanup.
+            values = {
+                name: getattr(observed, name)
+                for name in dir(observed) if name.startswith("st_")
+            }
+            values["st_dev"], values["st_ino"] = identities["reserved"]
+            return SimpleNamespace(**values)
+        return observed
+
+    def fstat(descriptor):
+        observed = real_fstat(descriptor)
+        result = reused_state(observed)
+        if result is not observed:
+            reused_descriptor_observations.append(descriptor)
+        return result
+
+    def named_stat(*args, **kwargs):
+        return reused_state(real_stat(*args, **kwargs))
 
     def fault(path, flags, *args, **kwargs):
         dir_fd = kwargs.get("dir_fd")
@@ -1041,15 +1073,62 @@ def test_seed_substitution_is_detected_before_foreign_file_truncation(
             and flags & os.O_ACCMODE == os.O_WRONLY
         ):
             candidate = tmp_path / path
-            candidate.unlink()
-            candidate.write_bytes(b"foreign must survive")
+            reserved = real_stat(candidate)
+            foreign = tmp_path / "foreign-replacement"
+            foreign.write_bytes(b"foreign must survive")
+            replacement = real_stat(foreign)
+            identities["reserved"] = (reserved.st_dev, reserved.st_ino)
+            identities["foreign"] = (replacement.st_dev, replacement.st_ino)
+            assert identities["reserved"] != identities["foreign"]
+            foreign.replace(candidate)
             swapped.append(candidate)
         return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(finite_module.os, "open", fault)
+    monkeypatch.setattr(finite_module.os, "fstat", fstat)
+    monkeypatch.setattr(finite_module.os, "stat", named_stat)
     with pytest.raises(FiniteArtifactIntegrityError, match="descriptor identity"):
         _publish(request, seed=admission)
+    assert bool(reused_descriptor_observations) is reuse_inode
     assert swapped[0].read_bytes() == b"foreign must survive"
+    assert source.read_bytes() == b"source seed"
+    assert not Path(request.output_artifact).exists()
+
+
+def test_seed_partial_copy_failure_cleans_owned_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.nexus"
+    original = b"source seed" * 100_000
+    source.write_bytes(original)
+    admission = capture_finite_source(source)
+    request = _request(tmp_path, source, admission=admission)
+    real_read = finite_module.os.read
+    source_reads = 0
+    partial_copies: list[bytes] = []
+
+    def fail_after_first_block(descriptor, size):
+        nonlocal source_reads
+        observed = os.fstat(descriptor)
+        if (observed.st_dev, observed.st_ino) == (
+            admission.snapshot.device, admission.snapshot.inode,
+        ):
+            source_reads += 1
+            if source_reads == 2:
+                candidate, = tmp_path.glob(".xdart-finite-*.candidate")
+                partial_copies.append(candidate.read_bytes())
+                raise OSError("source read failed after a partial seed copy")
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(finite_module.os, "read", fail_after_first_block)
+    with pytest.raises(OSError, match="partial seed copy"):
+        _publish(request, seed=admission)
+    assert len(partial_copies) == 1
+    assert 0 < len(partial_copies[0]) < len(original)
+    assert original.startswith(partial_copies[0])
+    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+    assert source.read_bytes() == original
     assert not Path(request.output_artifact).exists()
 
 

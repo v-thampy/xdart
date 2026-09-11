@@ -93,6 +93,10 @@ class FiniteArtifactIntegrityError(FiniteArtifactError):
     """An admitted source, candidate, or public terminal lost exact identity."""
 
 
+class _FiniteCandidateOwnershipLost(FiniteArtifactIntegrityError):
+    """The reserved private name no longer authorizes mutation or cleanup."""
+
+
 class FiniteArtifactCapacityError(FiniteArtifactError):
     """The exact candidate directory lacks the frozen finite-space budget."""
 
@@ -2592,11 +2596,16 @@ class FiniteArtifactPublisher:
             )
             opened_source = os.fstat(source_descriptor)
             opened_target = os.fstat(target_descriptor)
+            # A closed reservation's inode can be reused after substitution.
+            # Nothing has written this candidate yet, so its full reservation
+            # state must still match before truncation or cleanup is allowed.
+            if _state(opened_target) != _snapshot_state(reservation):
+                raise _FiniteCandidateOwnershipLost(
+                    "finite seed descriptor identity changed"
+                )
             if (
                 (int(opened_source.st_dev), int(opened_source.st_ino))
                 != (source.device, source.inode)
-                or (int(opened_target.st_dev), int(opened_target.st_ino))
-                != (reservation.device, reservation.inode)
             ):
                 raise FiniteArtifactIntegrityError(
                     "finite seed descriptor identity changed"
@@ -3182,6 +3191,7 @@ class FiniteArtifactPublisher:
                     candidate is not None
                     and reservation is not None
                     and not candidate_consumed
+                    and not isinstance(primary, _FiniteCandidateOwnershipLost)
                 ):
                     retry_hidden, cleanup_error = self._cleanup(
                         parent_descriptor,
