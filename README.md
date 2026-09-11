@@ -49,6 +49,11 @@ To update later, close xdart and run `pixi global update xdart`.
 
 [Alternate installation methods and more details](docs/INSTALLATION.md)
 
+For Python scripts and Jupyter, start with the
+[headless integration notebook](examples/notebooks/06_headless_reduction_pipeline.ipynb).
+The [notebook gallery](examples/notebooks/README.md) has more `xrd_tools` API
+examples for processing, plotting, and analysis.
+
 <details>
 <summary>Contents</summary>
 
