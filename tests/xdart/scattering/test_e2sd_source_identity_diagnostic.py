@@ -474,11 +474,31 @@ def test_direct_tiff_no_sidecar_state_invalidates_when_one_appears(
         validate_admitted_receipt(receipt, None)
 
 
-@pytest.mark.parametrize("hardlink_alias", (False, True))
+def _alias_output_target(alias: str, raw: Path, requested: Path) -> None:
+    """Make the run's normalized output target another name for ``raw``.
+
+    P4/OUT-1 normalizes a suffix-shaped Save Path to ``<stem>_int2d.nexus``
+    beside it, so the collision is staged at that generated name: the
+    operator's request keeps its own spelling and the check has to see
+    through the normalization AND the alias.
+    """
+
+    target = requested.with_name(f"{requested.stem}_int2d.nexus")
+    if alias == "hardlink":
+        target.hardlink_to(raw)
+    elif alias == "symlink":
+        target.symlink_to(raw)
+    else:
+        raise AssertionError(alias)
+
+
+@pytest.mark.parametrize("alias", ("hardlink", "symlink"))
 def test_selected_tiff_output_cannot_overwrite_consumed_metadata_sidecar(
     tmp_path: Path,
-    hardlink_alias: bool,
+    alias: str,
 ) -> None:
+    # A metadata sidecar is always ``<image>.txt``, so it can only be the
+    # generated ``*_int2d.nexus`` target through an alias.
     image = tmp_path / "scan_0001.tif"
     _write_tiff(image, 1)
     sidecar = image.with_suffix(".txt")
@@ -488,16 +508,14 @@ def test_selected_tiff_output_cannot_overwrite_consumed_metadata_sidecar(
     )
     poni = tmp_path / "cal.poni"
     write_poni(poni)
-    target = sidecar
-    if hardlink_alias:
-        target = tmp_path / "overwrite_alias.nxs"
-        target.hardlink_to(sidecar)
+    requested = tmp_path / "overwrite_alias.nxs"
+    _alias_output_target(alias, sidecar, requested)
     source = image_series_spec(image)
     request = RequestId(910)
     snapshot = RunIntentStore(RunIntent(
         source_spec=source,
         poni_file=str(poni),
-        save_path=str(target),
+        save_path=str(requested),
         output_mode="Overwrite",
     )).snapshot()
 
@@ -658,12 +676,17 @@ def test_selected_eiger_master_keeps_container_owner_and_frame_count(
     validate_admitted_receipt(receipt, None)
 
 
-@pytest.mark.parametrize("hardlink_alias", (False, True))
+@pytest.mark.parametrize("alias", ("direct", "hardlink", "symlink"))
 def test_selected_eiger_output_cannot_overwrite_external_data_member(
     tmp_path: Path,
-    hardlink_alias: bool,
+    alias: str,
 ) -> None:
+    # An external member is named by the master's link, so it can carry the
+    # generated output name itself ("direct") as well as be aliased to it.
+    requested = tmp_path / "overwrite_alias.nxs"
     sidecar = tmp_path / "scan_data_000001.h5"
+    if alias == "direct":
+        sidecar = requested.with_name(f"{requested.stem}_int2d.nexus")
     master = tmp_path / "scan_master.h5"
     with h5py.File(sidecar, "w") as handle:
         handle.create_group("entry").create_group("data").create_dataset(
@@ -679,17 +702,15 @@ def test_selected_eiger_output_cannot_overwrite_external_data_member(
     poni = tmp_path / "cal.poni"
     write_poni(poni)
     source = image_series_spec(master)
-    target = sidecar
-    if hardlink_alias:
-        target = tmp_path / "overwrite_alias.h5"
-        target.hardlink_to(sidecar)
+    if alias != "direct":
+        _alias_output_target(alias, sidecar, requested)
     request = RequestId(907)
     capture = FilesystemSourceAdapter().capture(source, request)
     snapshot = RunIntentStore(
         RunIntent(
             source_spec=source,
             poni_file=str(poni),
-            save_path=str(target),
+            save_path=str(requested),
             output_mode="Overwrite",
         )
     ).snapshot()

@@ -217,6 +217,13 @@ class DeferredDirectoryPlan:
     entries: tuple[DeferredDirectoryEntry, ...]
     discovered_paths: tuple[Path, ...]
     live: bool = False
+    # Every output target of this run, keyed lexically and (when the target
+    # already exists) by stat identity, so one JIT materialization can refuse
+    # to read another group's output as raw data without rescanning the plan.
+    _target_keys: frozenset[str] = field(init=False, repr=False, compare=False)
+    _target_identities: frozenset[tuple[int, int]] = field(
+        init=False, repr=False, compare=False,
+    )
 
     def __post_init__(self) -> None:
         flattened = tuple(
@@ -253,6 +260,14 @@ class DeferredDirectoryPlan:
         )
         if not (common and (watching if self.live else finite)):
             raise TypeError("deferred directory plan is invalid")
+        object.__setattr__(self, "_target_keys", frozenset(
+            _lexical_key(entry.target) for entry in self.entries
+        ))
+        object.__setattr__(self, "_target_identities", frozenset(
+            (entry.fact.target_state[3], entry.fact.target_state[4])
+            for entry in self.entries
+            if type(entry.fact.target_state) is tuple
+        ))
 
     @property
     def discovered_file_count(self) -> int:
@@ -261,6 +276,26 @@ class DeferredDirectoryPlan:
     @property
     def targets(self) -> tuple[Path, ...]:
         return tuple(entry.target for entry in self.entries)
+
+    def owns_target(self, path: Path) -> bool:
+        """True when *path* is one of this run's output targets.
+
+        Lexical (normcase/abspath) and resolved (realpath) keys catch the
+        plain and symlinked spellings; the stat identity catches a hard link
+        to a target that already existed at admission.
+        """
+        if (
+            _lexical_key(path) in self._target_keys
+            or os.path.normcase(os.path.realpath(path)) in self._target_keys
+        ):
+            return True
+        if not self._target_identities:
+            return False
+        try:
+            state = os.stat(path)
+        except OSError:
+            return False
+        return (int(state.st_dev), int(state.st_ino)) in self._target_identities
 
 
 @dataclass(frozen=True, slots=True)
@@ -1189,6 +1224,7 @@ def materialize_deferred_output(
         receipt.candidate.source,
         (item,),
         cancelled=cancelled,
+        run_plan=deferred,
     )
     decision = inspect_output(item, receipt.candidate, entry.fact)
     if item.source_spec.kind is SourceKind.TIFF_SERIES:
@@ -1891,6 +1927,7 @@ def _validate_targets(
     items: tuple[PlannedOutput, ...],
     *,
     cancelled: Callable[[], bool] | None = None,
+    run_plan: DeferredDirectoryPlan | None = None,
 ) -> None:
     raw: tuple[Path, ...] = ()
     for item in items:
@@ -1900,6 +1937,17 @@ def _validate_targets(
         )
         raw += tuple(Path(binding.raw_path) for binding in identity.identity.aliases)
         raw += tuple(Path(target.resolved_path) for target in identity.targets)
+    if run_plan is not None:
+        # Directory JIT: this group's dependencies are in hand, so refuse to
+        # read ANY output target of the run as raw data (a raw container that
+        # links into the Save Path).  The item's own target is covered below.
+        for dependency in raw:
+            if run_plan.owns_target(dependency):
+                raise OutputCollisionError(
+                    f"Reduction output '{dependency}' is the same file as a raw "
+                    f"directory input that '{items[0].target.name}' depends on; "
+                    "choose a separate Save Path."
+                )
     protected = tuple(
         Path(value) for value in (
             configuration.poni_file, configuration.mask_file,
@@ -2186,6 +2234,10 @@ def _load_stable_asset(
     if after_state != before_state or after != before:
         raise ValueError(f"scientific asset changed while admitted: {path}")
     return value, hashlib.sha256(before).hexdigest()
+def _lexical_key(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
 def _path_state(path: Path) -> tuple[int, int, int, int, int] | bool:
     try:
         stat = path.stat()

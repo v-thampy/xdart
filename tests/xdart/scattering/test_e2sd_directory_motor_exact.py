@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from threading import Event, Thread
 import os
@@ -46,7 +47,9 @@ from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import GIIntent, RunIntent
 from xrd_tools.core.scan import SourceKind
+from xrd_tools.io import metadata as io_metadata
 from xrd_tools.io.metadata import ImageMetadataRead
+from xrd_tools.io.output_safety import OutputCollisionError
 from xrd_tools.sources import execution_graph as source_graph
 from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xrd_tools.sources.directory_index import DirectoryIndex
@@ -318,8 +321,16 @@ def test_deferred_unreadable_container_revalidates_before_skip(
         deferred = receipt.deferred_directory
         assert deferred is not None
         entry = deferred.entries[0]
-        assert entry.skip_reason == "not a readable HDF5 container"
+        # Admission is name/stat-only: the container is not opened until its
+        # own JIT materialization, which skips it while it is still landing.
+        assert entry.skip_reason == ""
         validate_admitted_receipt(receipt, session)
+        assert materialize_deferred_output(
+            receipt,
+            session,
+            entry,
+            cancelled=lambda: False,
+        ) == (None, 0, 1)
 
         landing.write_bytes(b"new revision")
 
@@ -455,24 +466,32 @@ def test_standard_directory_fails_closed_when_hdf5_dependency_proof_cannot_open(
     monkeypatch.setattr(h5py, "File", refused_file)
     request = RequestId(723)
     sessions: list[DirectoryIndexSession] = []
+    # Admission never opens the container, so a locked file cannot refuse
+    # Start; the JIT probe that owns the dependency proof skips it instead of
+    # executing without one.
+    receipt = prepare_output(
+        StartCapture(
+            request,
+            1,
+            snapshot,
+            SourceCapture(request, 1, source),
+        ),
+        cancelled=lambda: False,
+        session_owner=sessions.append,
+    )
+    session = sessions[0]
     try:
-        with pytest.raises(
-            ValueError,
-            match="source dependency inventory could not be established",
-        ):
-            prepare_output(
-                StartCapture(
-                    request,
-                    1,
-                    snapshot,
-                    SourceCapture(request, 1, source),
-                ),
-                cancelled=lambda: False,
-                session_owner=sessions.append,
-            )
+        deferred = receipt.deferred_directory
+        assert deferred is not None
+        validate_admitted_receipt(receipt, session)
+        assert materialize_deferred_output(
+            receipt,
+            session,
+            deferred.entries[0],
+            cancelled=lambda: False,
+        ) == (None, 0, 1)
     finally:
-        for session in sessions:
-            session.close()
+        session.close()
 
 
 @pytest.mark.parametrize("count", (1, 32, 33))
@@ -513,156 +532,111 @@ def test_standard_directory_lazy_policy_is_not_size_dependent(
         sessions[0].close()
 
 
+def _collision_target(tmp_path: Path) -> Path:
+    """Pre-create scan_0001's own output so a raw link to it can be followed.
+
+    Admission is name/stat-only, so the raw-input collision can only surface
+    once the linking container's dependency proof is materialized just in
+    time; that proof dereferences the link, which needs a real target.
+    """
+
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    target = processed / "scan_0001_int2d.nexus"
+    with h5py.File(target, "w") as handle:
+        handle.create_group("entry").create_group("data").create_dataset(
+            "data",
+            data=np.ones((2, 4, 5), dtype=np.uint16),
+        )
+    return target
+
+
+def _expect_jit_collision(
+    tmp_path: Path,
+    raw: Path,
+    *,
+    request: RequestId,
+) -> None:
+    processed = tmp_path / "processed"
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    source = DirectorySourceSpec(raw, suffixes=(".nxs",))
+    snapshot = RunIntentStore(RunIntent(
+        source_spec=source,
+        poni_file=str(poni),
+        save_path=str(processed),
+        output_mode="Overwrite",
+    )).snapshot()
+    sessions: list[DirectoryIndexSession] = []
+    receipt = prepare_output(
+        StartCapture(
+            request,
+            1,
+            snapshot,
+            SourceCapture(request, 1, source),
+        ),
+        cancelled=lambda: False,
+        session_owner=sessions.append,
+    )
+    session = sessions[0]
+    try:
+        deferred = receipt.deferred_directory
+        assert deferred is not None
+        validate_admitted_receipt(receipt, session)
+        entries = {
+            entry.candidates[0].path.name: entry for entry in deferred.entries
+        }
+        decision, ready, skipped = materialize_deferred_output(
+            receipt,
+            session,
+            entries["scan_0001.nxs"],
+            cancelled=lambda: False,
+        )
+        assert decision is not None
+        assert (ready, skipped) == (1, 0)
+        with pytest.raises(
+            OutputCollisionError,
+            match="same file as a raw directory input",
+        ):
+            materialize_deferred_output(
+                receipt,
+                session,
+                entries["scan_0002.nxs"],
+                cancelled=lambda: False,
+            )
+    finally:
+        session.close()
+
+
 def test_deferred_directory_rejects_generic_external_member_target(
     tmp_path: Path,
 ) -> None:
     raw = tmp_path / "raw"
     raw.mkdir()
     write_motor_container(raw / "scan_0001.nxs")
-    processed = tmp_path / "processed"
+    target = _collision_target(tmp_path)
     with h5py.File(raw / "scan_0002.nxs", "w") as handle:
         data = handle.create_group("entry").create_group("data")
-        data["pixels"] = h5py.ExternalLink(
-            str(processed / "scan_0001.nexus"),
-            "/entry/data/data",
-        )
-    poni = tmp_path / "cal.poni"
-    write_poni(poni)
-    source = DirectorySourceSpec(raw, suffixes=(".nxs",))
-    snapshot = RunIntentStore(RunIntent(
-        source_spec=source,
-        poni_file=str(poni),
-        save_path=str(processed),
-        output_mode="Overwrite",
-    )).snapshot()
-    request = RequestId(720)
-    sessions: list[DirectoryIndexSession] = []
-
-    try:
-        with pytest.raises(
-            ValueError,
-            match="same file as a raw directory input",
-        ):
-            prepare_output(
-                StartCapture(
-                    request,
-                    1,
-                    snapshot,
-                    SourceCapture(request, 1, source),
-                ),
-                cancelled=lambda: False,
-                session_owner=sessions.append,
-            )
-    finally:
-        for session in sessions:
-            session.close()
+        data["pixels"] = h5py.ExternalLink(str(target), "/entry/data/data")
+    _expect_jit_collision(tmp_path, raw, request=RequestId(720))
 
 
-def test_deferred_directory_rejects_measurement_external_member_target(
+def test_deferred_directory_soft_chain_rejects_external_target(
     tmp_path: Path,
 ) -> None:
-    """The fixed measurement/data resolver arm is part of raw dependency safety."""
+    """A soft chain onto an external link still binds the linked file."""
 
     raw = tmp_path / "raw"
     raw.mkdir()
     write_motor_container(raw / "scan_0001.nxs")
-    processed = tmp_path / "processed"
-    with h5py.File(raw / "scan_0002.nxs", "w") as handle:
-        measurement = handle.create_group("entry").create_group("measurement")
-        measurement["data"] = h5py.ExternalLink(
-            str(processed / "scan_0001.nexus"),
-            "/entry/data/data",
-        )
-    poni = tmp_path / "cal.poni"
-    write_poni(poni)
-    source = DirectorySourceSpec(raw, suffixes=(".nxs",))
-    snapshot = RunIntentStore(RunIntent(
-        source_spec=source,
-        poni_file=str(poni),
-        save_path=str(processed),
-        output_mode="Overwrite",
-    )).snapshot()
-    request = RequestId(724)
-    sessions: list[DirectoryIndexSession] = []
-
-    try:
-        with pytest.raises(
-            ValueError,
-            match="same file as a raw directory input",
-        ):
-            prepare_output(
-                StartCapture(
-                    request,
-                    1,
-                    snapshot,
-                    SourceCapture(request, 1, source),
-                ),
-                cancelled=lambda: False,
-                session_owner=sessions.append,
-            )
-    finally:
-        for session in sessions:
-            session.close()
-
-
-@pytest.mark.parametrize("layout", ("nested", "soft_chain"))
-def test_deferred_directory_fallback_inventory_rejects_external_target(
-    tmp_path: Path,
-    layout: str,
-) -> None:
-    """Fallback layouts need a complete link proof, including soft chains."""
-
-    raw = tmp_path / "raw"
-    raw.mkdir()
-    write_motor_container(raw / "scan_0001.nxs")
-    processed = tmp_path / "processed"
+    target = _collision_target(tmp_path)
     with h5py.File(raw / "scan_0002.nxs", "w") as handle:
         entry = handle.create_group("entry")
-        if layout == "nested":
-            detector = entry.create_group("nested").create_group("detector")
-            detector.attrs["NX_class"] = "NXdetector"
-            detector["data"] = h5py.ExternalLink(
-                str(processed / "scan_0001.nexus"),
-                "/entry/data/data",
-            )
-        else:
-            data = entry.create_group("data")
-            data["data"] = h5py.SoftLink("/hidden/raw")
-            hidden = handle.create_group("hidden")
-            hidden["raw"] = h5py.ExternalLink(
-                str(processed / "scan_0001.nexus"),
-                "/entry/data/data",
-            )
-    poni = tmp_path / "cal.poni"
-    write_poni(poni)
-    source = DirectorySourceSpec(raw, suffixes=(".nxs",))
-    snapshot = RunIntentStore(RunIntent(
-        source_spec=source,
-        poni_file=str(poni),
-        save_path=str(processed),
-        output_mode="Overwrite",
-    )).snapshot()
-    request = RequestId(725)
-    sessions: list[DirectoryIndexSession] = []
-
-    try:
-        with pytest.raises(
-            ValueError,
-            match="same file as a raw directory input",
-        ):
-            prepare_output(
-                StartCapture(
-                    request,
-                    1,
-                    snapshot,
-                    SourceCapture(request, 1, source),
-                ),
-                cancelled=lambda: False,
-                session_owner=sessions.append,
-            )
-    finally:
-        for session in sessions:
-            session.close()
+        data = entry.create_group("data")
+        data["data"] = h5py.SoftLink("/hidden/raw")
+        hidden = handle.create_group("hidden")
+        hidden["raw"] = h5py.ExternalLink(str(target), "/entry/data/data")
+    _expect_jit_collision(tmp_path, raw, request=RequestId(725))
 
 
 def test_indirect_instrument_precedence_forces_complete_dependency_proof(
@@ -671,17 +645,13 @@ def test_indirect_instrument_precedence_forces_complete_dependency_proof(
     raw = tmp_path / "raw"
     raw.mkdir()
     write_motor_container(raw / "scan_0001.nxs")
-    processed = tmp_path / "processed"
-    target = processed / "scan_0001.nexus"
+    target = _collision_target(tmp_path)
     landing = tmp_path / "landing"
     landing.mkdir()
     external_group = landing / "detector.h5"
     with h5py.File(external_group, "w") as handle:
         detector = handle.create_group("detector")
-        detector["data"] = h5py.ExternalLink(
-            str(target),
-            "/entry/data/data",
-        )
+        detector["data"] = h5py.ExternalLink(str(target), "/entry/data/data")
     with h5py.File(raw / "scan_0002.nxs", "w") as handle:
         instrument = handle.create_group("entry").create_group("instrument")
         instrument["aaa"] = h5py.ExternalLink(
@@ -692,36 +662,7 @@ def test_indirect_instrument_precedence_forces_complete_dependency_proof(
             "data",
             data=np.ones((2, 4, 5), dtype=np.uint16),
         )
-    poni = tmp_path / "cal.poni"
-    write_poni(poni)
-    source = DirectorySourceSpec(raw, suffixes=(".nxs",))
-    snapshot = RunIntentStore(RunIntent(
-        source_spec=source,
-        poni_file=str(poni),
-        save_path=str(processed),
-        output_mode="Overwrite",
-    )).snapshot()
-    request = RequestId(726)
-    sessions: list[DirectoryIndexSession] = []
-
-    try:
-        with pytest.raises(
-            ValueError,
-            match="same file as a raw directory input",
-        ):
-            prepare_output(
-                StartCapture(
-                    request,
-                    1,
-                    snapshot,
-                    SourceCapture(request, 1, source),
-                ),
-                cancelled=lambda: False,
-                session_owner=sessions.append,
-            )
-    finally:
-        for session in sessions:
-            session.close()
+    _expect_jit_collision(tmp_path, raw, request=RequestId(726))
 
 
 def test_external_entry_uses_landed_file_as_relative_link_base(
@@ -775,10 +716,11 @@ def test_external_entry_uses_landed_file_as_relative_link_base(
     try:
         deferred = receipt.deferred_directory
         assert deferred is not None
-        protected = {
+        # Name/stat admission freezes only the landed master; the linked
+        # entry file and segment are bound by the JIT dependency proof below.
+        assert tuple(
             Path(value.path) for value in deferred.entries[0].protected_states
-        }
-        assert {master, entry_file, segment}.issubset(protected)
+        ) == (master,)
         validate_admitted_receipt(receipt, session)
         decision, ready, skipped = materialize_deferred_output(
             receipt,
@@ -801,6 +743,85 @@ def test_external_entry_uses_landed_file_as_relative_link_base(
         session.close()
 
 
+def _restore_mtime(path: Path, before: os.stat_result) -> None:
+    """Put mtime back after a rewrite so only ctime records the change."""
+
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = path.stat()
+    assert (after.st_size, after.st_mtime_ns) == (
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    assert after.st_ctime_ns != before.st_ctime_ns
+
+
+def _same_stat_byte_rewrite(path: Path, offset: int) -> None:
+    """Rewrite one raw contiguous-dataset byte through a plain descriptor.
+
+    The JIT dependency proof holds the file open read-only through HDF5, so
+    a second in-process ``h5py.File`` open is refused; an external writer
+    does not go through this process's HDF5 open table at all.
+    """
+
+    before = path.stat()
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        assert os.pwrite(fd, np.uint16(7).tobytes(), offset) == 2
+    finally:
+        os.close(fd)
+    _restore_mtime(path, before)
+
+
+def _same_stat_rewrite_from_other_process(path: Path, dataset: str) -> None:
+    """Rewrite one dataset element from a separate writer process.
+
+    Chunked datasets have no fixed raw offset, so the rewrite goes through
+    HDF5 in another process (without the file lock), like a detector writer.
+    """
+
+    before = path.stat()
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, h5py\n"
+            "with h5py.File(sys.argv[1], 'r+', locking=False) as handle:\n"
+            "    handle[sys.argv[2]][0, 0, 0] = 7\n",
+            str(path),
+            dataset,
+        ],
+        env=dict(os.environ, HDF5_USE_FILE_LOCKING="FALSE"),
+        check=True,
+    )
+    _restore_mtime(path, before)
+
+
+def _race_dependency_after_first_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    dependency: Path,
+    rewrite: Callable[[], None],
+) -> Callable[[], bool]:
+    """Run ``rewrite`` right after the JIT proof first captures ``dependency``."""
+
+    original_capture = source_graph._capture_source_topology
+    raced = False
+
+    def racing_capture(path, **kwargs):
+        nonlocal raced
+        result = original_capture(path, **kwargs)
+        if not raced and Path(path).resolve() == dependency.resolve():
+            raced = True
+            rewrite()
+        return result
+
+    monkeypatch.setattr(
+        source_graph,
+        "_capture_source_topology",
+        racing_capture,
+    )
+    return lambda: raced
+
+
 def test_selected_external_entry_is_frozen_before_dereference(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -812,10 +833,13 @@ def test_selected_external_entry_is_frozen_before_dereference(
     master = raw / "scan_master.h5"
     entry_file = landing / "entry.h5"
     with h5py.File(entry_file, "w") as handle:
-        handle.create_group("entry").create_group("data").create_dataset(
+        pixels = handle.create_group("entry").create_group(
+            "data"
+        ).create_dataset(
             "data",
             data=np.ones((2, 4, 5), dtype=np.uint16),
         )
+        offset = int(pixels.id.get_offset())
     with h5py.File(master, "w") as handle:
         handle["entry"] = h5py.ExternalLink(
             str(entry_file),
@@ -831,67 +855,42 @@ def test_selected_external_entry_is_frozen_before_dereference(
         output_mode="Overwrite",
     )).snapshot()
     request = RequestId(735)
-    original_get = h5py.Group.get
-    raced = False
-
-    def racing_get(
-        group,
-        name,
-        default=None,
-        getclass=False,
-        getlink=False,
-    ):
-        nonlocal raced
-        if (
-            not raced
-            and not getlink
-            and name == "entry"
-            and group.name == "/"
-            and Path(os.fsdecode(group.file.filename)).resolve() == master
-        ):
-            raced = True
-            before = entry_file.stat()
-            with h5py.File(entry_file, "r+") as handle:
-                handle["entry/data/data"][0, 0, 0] = 7
-            os.utime(
-                entry_file,
-                ns=(before.st_atime_ns, before.st_mtime_ns),
-            )
-            after = entry_file.stat()
-            assert (after.st_size, after.st_mtime_ns) == (
-                before.st_size,
-                before.st_mtime_ns,
-            )
-            assert after.st_ctime_ns != before.st_ctime_ns
-        return original_get(
-            group,
-            name,
-            default=default,
-            getclass=getclass,
-            getlink=getlink,
-        )
-
-    monkeypatch.setattr(h5py.Group, "get", racing_get)
     sessions: list[DirectoryIndexSession] = []
+    receipt = prepare_output(
+        StartCapture(
+            request,
+            1,
+            snapshot,
+            SourceCapture(request, 1, source),
+        ),
+        cancelled=lambda: False,
+        session_owner=sessions.append,
+    )
+    session = sessions[0]
+    raced = _race_dependency_after_first_capture(
+        monkeypatch,
+        entry_file,
+        lambda: _same_stat_byte_rewrite(entry_file, offset),
+    )
     try:
+        deferred = receipt.deferred_directory
+        assert deferred is not None
+        validate_admitted_receipt(receipt, session)
         with pytest.raises(
-            ValueError,
+            SourceRevisionChanged,
             match="HDF5 dependency changed during admission",
         ):
-            prepare_output(
-                StartCapture(
-                    request,
-                    1,
-                    snapshot,
-                    SourceCapture(request, 1, source),
-                ),
+            materialize_deferred_output(
+                receipt,
+                session,
+                deferred.entries[0],
                 cancelled=lambda: False,
-                session_owner=sessions.append,
             )
-        assert raced
+        assert raced()
+        with h5py.File(entry_file, "r") as handle:
+            assert handle["entry/data/data"][0, 0, 0] == 7
     finally:
-        for session in sessions:
-            session.close()
+        session.close()
 
 
 def test_apstools_soft_external_nxdata_binds_only_selected_dependency(
@@ -956,7 +955,9 @@ def test_apstools_soft_external_nxdata_binds_only_selected_dependency(
             Path(value.path)
             for value in deferred.entries[0].protected_states
         }
-        assert protected == {master, sidecar}
+        # Name/stat admission freezes the master only; the selected sidecar
+        # is bound by the JIT proof and the unrelated dangling link never is.
+        assert protected == {master}
         assert missing not in protected
 
         decision, ready, skipped = materialize_deferred_output(
@@ -967,12 +968,17 @@ def test_apstools_soft_external_nxdata_binds_only_selected_dependency(
         )
         assert decision is not None
         assert (ready, skipped) == (1, 0)
-        assert decision.item.source_stamp.frame_count == 3
-        assert decision.item.source_stamp.external_members == ()
+        stamp = decision.item.source_stamp
+        assert stamp.frame_count == 3
+        # The detector dataset physically lives in the sidecar, so the proof
+        # binds it as an external member under its owner-file selector
+        # (tests/core: test_selected_link_owner_selector_detaches_sidecar_
+        # internal_path), not as a bare dependency file.
         assert tuple(
-            Path(value.path)
-            for value in decision.item.source_stamp.dependency_files
-        ) == (sidecar,)
+            (Path(member.file.path), member.dataset, member.first, member.stop)
+            for member in stamp.external_members
+        ) == ((sidecar, "/entry/data/pixels", 0, 3),)
+        assert stamp.dependency_files == ()
     finally:
         session.close()
 
@@ -981,8 +987,6 @@ def test_apstools_external_detector_revision_is_frozen_before_dereference(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from xdart.gui.tabs.scattering import output_preflight
-
     raw = tmp_path / "raw"
     landing = tmp_path / "landing"
     raw.mkdir()
@@ -997,6 +1001,7 @@ def test_apstools_external_detector_revision_is_frozen_before_dereference(
             data=np.ones((3, 4, 5), dtype=np.uint16),
         )
         pixels.attrs["signal_type"] = "detector"
+        offset = int(pixels.id.get_offset())
     with h5py.File(master, "w") as handle:
         handle.attrs["creator"] = "NXWriter"
         entry = handle.create_group("entry")
@@ -1019,58 +1024,42 @@ def test_apstools_external_detector_revision_is_frozen_before_dereference(
         output_mode="Overwrite",
     )).snapshot()
     request = RequestId(737)
-    original_trace = source_graph._trace_hdf5_object_dependencies
-    raced = False
-
-    def racing_trace(file_path, object_path, **kwargs):
-        nonlocal raced
-        result = original_trace(file_path, object_path, **kwargs)
-        if (
-            not raced
-            and Path(file_path).resolve() == sidecar.resolve()
-            and object_path == "/entry/data/pixels"
-        ):
-            raced = True
-            before = sidecar.stat()
-            with h5py.File(sidecar, "r+") as handle:
-                handle["entry/data/pixels"][0, 0, 0] = 9
-            os.utime(
-                sidecar,
-                ns=(before.st_atime_ns, before.st_mtime_ns),
-            )
-            after = sidecar.stat()
-            assert (after.st_size, after.st_mtime_ns) == (
-                before.st_size,
-                before.st_mtime_ns,
-            )
-            assert after.st_ctime_ns != before.st_ctime_ns
-        return result
-
-    monkeypatch.setattr(
-        source_graph,
-        "_trace_hdf5_object_dependencies",
-        racing_trace,
-    )
     sessions: list[DirectoryIndexSession] = []
+    receipt = prepare_output(
+        StartCapture(
+            request,
+            1,
+            snapshot,
+            SourceCapture(request, 1, source),
+        ),
+        cancelled=lambda: False,
+        session_owner=sessions.append,
+    )
+    session = sessions[0]
+    raced = _race_dependency_after_first_capture(
+        monkeypatch,
+        sidecar,
+        lambda: _same_stat_byte_rewrite(sidecar, offset),
+    )
     try:
+        deferred = receipt.deferred_directory
+        assert deferred is not None
+        validate_admitted_receipt(receipt, session)
         with pytest.raises(
-            ValueError,
+            SourceRevisionChanged,
             match="HDF5 dependency changed during admission",
         ):
-            prepare_output(
-                StartCapture(
-                    request,
-                    1,
-                    snapshot,
-                    SourceCapture(request, 1, source),
-                ),
+            materialize_deferred_output(
+                receipt,
+                session,
+                deferred.entries[0],
                 cancelled=lambda: False,
-                session_owner=sessions.append,
             )
-        assert raced
+        assert raced()
+        with h5py.File(sidecar, "r") as handle:
+            assert handle["entry/data/pixels"][0, 0, 0] == 7
     finally:
-        for session in sessions:
-            session.close()
+        session.close()
 
 
 def test_eager_gi_reprobes_cached_self_contained_descriptor_after_rebind(
@@ -1310,8 +1299,7 @@ def test_nested_vds_dependency_collision_is_rejected_before_execution(
     raw = tmp_path / "raw"
     raw.mkdir()
     write_motor_container(raw / "scan_0001.nxs")
-    processed = tmp_path / "processed"
-    target = processed / "scan_0001.nexus"
+    target = _collision_target(tmp_path)
     landing = tmp_path / "landing"
     landing.mkdir()
     middle = landing / "middle.h5"
@@ -1335,36 +1323,7 @@ def test_nested_vds_dependency_collision_is_rejected_before_execution(
             "data",
             layout,
         )
-    poni = tmp_path / "cal.poni"
-    write_poni(poni)
-    source = DirectorySourceSpec(raw, suffixes=(".nxs",))
-    snapshot = RunIntentStore(RunIntent(
-        source_spec=source,
-        poni_file=str(poni),
-        save_path=str(processed),
-        output_mode="Overwrite",
-    )).snapshot()
-    request = RequestId(729)
-    sessions: list[DirectoryIndexSession] = []
-
-    try:
-        with pytest.raises(
-            ValueError,
-            match="same file as a raw directory input",
-        ):
-            prepare_output(
-                StartCapture(
-                    request,
-                    1,
-                    snapshot,
-                    SourceCapture(request, 1, source),
-                ),
-                cancelled=lambda: False,
-                session_owner=sessions.append,
-            )
-    finally:
-        for session in sessions:
-            session.close()
+    _expect_jit_collision(tmp_path, raw, request=RequestId(729))
 
 
 def test_selected_vds_refuses_existing_file_with_missing_dataset(
@@ -1398,25 +1357,35 @@ def test_selected_vds_refuses_existing_file_with_missing_dataset(
     )).snapshot()
     request = RequestId(730)
     sessions: list[DirectoryIndexSession] = []
-
+    receipt = prepare_output(
+        StartCapture(
+            request,
+            1,
+            snapshot,
+            SourceCapture(request, 1, source),
+        ),
+        cancelled=lambda: False,
+        session_owner=sessions.append,
+    )
+    session = sessions[0]
     try:
+        deferred = receipt.deferred_directory
+        assert deferred is not None
+        validate_admitted_receipt(receipt, session)
+        # The VDS source file exists, so this is a terminal dependency
+        # failure at the JIT proof rather than a still-landing skip.
         with pytest.raises(
             ValueError,
             match="selected HDF5 dependency path is unavailable",
         ):
-            prepare_output(
-                StartCapture(
-                    request,
-                    1,
-                    snapshot,
-                    SourceCapture(request, 1, source),
-                ),
+            materialize_deferred_output(
+                receipt,
+                session,
+                deferred.entries[0],
                 cancelled=lambda: False,
-                session_owner=sessions.append,
             )
     finally:
-        for session in sessions:
-            session.close()
+        session.close()
 
 
 def test_dependency_graph_state_cannot_rebaseline_after_jit_freeze(
@@ -1510,10 +1479,6 @@ def test_image_series_refuses_external_frame_growth_after_descriptor(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from types import SimpleNamespace
-    from xdart.gui.tabs.scattering import output_preflight
-    from xrd_tools.sources.adapters import candidate_owner
-
     sidecar = tmp_path / "scan_data_000001.h5"
     master = tmp_path / "scan_master.h5"
     with h5py.File(sidecar, "w") as handle:
@@ -1537,30 +1502,36 @@ def test_image_series_refuses_external_frame_growth_after_descriptor(
         output_mode="Overwrite",
     )).snapshot()
     request = RequestId(734)
-    real_owner = candidate_owner(master)
-    assert real_owner is not None
+    original_describe = source_graph.describe_container_from_open
     mutated = False
+    # Qualification derives the descriptor from its own open master handle
+    # and then re-counts the external members through that same handle, so
+    # HDF5 already holds the sidecar open read-only here.  Grow it the way a
+    # detector writer would: from another process, without the file lock.
+    grow = (
+        "import sys, h5py\n"
+        "with h5py.File(sys.argv[1], 'r+', locking=False) as handle:\n"
+        "    dataset = handle['entry/data/data']\n"
+        "    dataset.resize((3, 4, 5))\n"
+        "    dataset[2] = 3\n"
+    )
 
-    def raced_probe(path: Path):
+    def racing_describe(handle, **kwargs):
         nonlocal mutated
-        result = real_owner.probe(path)
-        if not mutated:
+        result = original_describe(handle, **kwargs)
+        if not mutated and Path(kwargs.get("path", "")) == master:
             mutated = True
-            with h5py.File(sidecar, "r+") as handle:
-                dataset = handle["entry/data/data"]
-                dataset.resize((3, 4, 5))
-                dataset[2] = 3
+            subprocess.run(
+                [sys.executable, "-c", grow, str(sidecar)],
+                env=dict(os.environ, HDF5_USE_FILE_LOCKING="FALSE"),
+                check=True,
+            )
         return result
 
-    wrapper = SimpleNamespace(
-        id=real_owner.id,
-        kinds=real_owner.kinds,
-        probe=raced_probe,
-    )
     monkeypatch.setattr(
-        output_preflight,
-        "candidate_owner",
-        lambda path: wrapper if Path(path) == master else candidate_owner(path),
+        source_graph,
+        "describe_container_from_open",
+        racing_describe,
     )
 
     with pytest.raises(
@@ -1577,6 +1548,7 @@ def test_image_series_refuses_external_frame_growth_after_descriptor(
             cancelled=lambda: False,
             session_owner=lambda _session: None,
         )
+    assert mutated
 
 
 def test_deferred_standard_refuses_missing_eiger_dependency(
@@ -1603,24 +1575,32 @@ def test_deferred_standard_refuses_missing_eiger_dependency(
     )).snapshot()
     request = RequestId(721)
     sessions: list[DirectoryIndexSession] = []
+    # A still-landing dependency no longer refuses Start: admission is
+    # name/stat-only, and the JIT proof skips the master until its sidecar
+    # exists instead of executing against an incomplete series.
+    receipt = prepare_output(
+        StartCapture(
+            request,
+            1,
+            snapshot,
+            SourceCapture(request, 1, source),
+        ),
+        cancelled=lambda: False,
+        session_owner=sessions.append,
+    )
+    session = sessions[0]
     try:
-        with pytest.raises(
-            ValueError,
-            match="source dependency is still landing",
-        ):
-            prepare_output(
-                StartCapture(
-                    request,
-                    1,
-                    snapshot,
-                    SourceCapture(request, 1, source),
-                ),
-                cancelled=lambda: False,
-                session_owner=sessions.append,
-            )
+        deferred = receipt.deferred_directory
+        assert deferred is not None
+        validate_admitted_receipt(receipt, session)
+        assert materialize_deferred_output(
+            receipt,
+            session,
+            deferred.entries[0],
+            cancelled=lambda: False,
+        ) == (None, 0, 1)
     finally:
-        for session in sessions:
-            session.close()
+        session.close()
 
 
 def test_deferred_raw_series_uses_known_shape_and_counts_ready_members(
@@ -2091,9 +2071,9 @@ def test_tiff_revalidation_cancels_after_first_member_state_capture(
         cancelled=lambda: False,
         session_owner=lambda _session: None,
     )
-    # P4/OUT-1 retained-green: an explicit suffix-shaped save target is the
-    # operator's exact choice and is preserved byte-for-byte.
-    assert receipt.outputs[0].item.target == tmp_path / "processed.nxs"
+    # P4/OUT-1: a suffix-shaped save target keeps the operator's directory and
+    # stem, and the run slot + ``.nexus`` are the shared naming owner's.
+    assert receipt.outputs[0].item.target == tmp_path / "processed_int2d.nexus"
     cancelled = Event()
     calls: list[Path] = []
     original = SourceFileState.capture
@@ -2328,9 +2308,6 @@ fabio.tifimage.TifImage(
     data=np.ones((4, 4), dtype=np.uint16)
 ).write(str(image))
 
-from xrd_tools.sources.adapters import all_adapters
-assert all_adapters() == (), all_adapters()
-
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.contracts import SourceObservationRequest
 from xrd_tools.sources.selection import DirectorySourceSpec
@@ -2345,6 +2322,12 @@ preview = FilesystemSourceAdapter().preview_motors(
     SourceObservationRequest(1, 0, source)
 )
 assert preview.gi_motor_choices == (), preview
+
+# The builtin adapters bootstrap lazily on first registry use; the preview
+# above must have brought the image owner up without any GUI registration.
+from xrd_tools.sources.adapters import candidate_owner
+owner = candidate_owner(image)
+assert owner is not None and owner.id == "image_file", owner
 """
 
     result = subprocess.run(
@@ -2389,15 +2372,14 @@ def test_recursive_tiff_preview_is_shallow_but_run_rejects_deeper_gi_gap(
             else {"th": 0.15, "exposure": 1.0}
         )
 
+    def observed(path, metadata_format, **_kwargs):
+        return ImageMetadataRead(counted(Path(path), metadata_format), None)
+
     monkeypatch.setattr(source_metadata, "read_image_metadata", counted)
-    monkeypatch.setattr(
-        source_metadata,
-        "read_image_metadata_observed",
-        lambda path, metadata_format, **_kwargs: ImageMetadataRead(
-            counted(Path(path), metadata_format),
-            None,
-        ),
-    )
+    monkeypatch.setattr(source_metadata, "read_image_metadata_observed", observed)
+    # Run admission reads sidecars through the io owner, not the GUI preview
+    # module, so the same counted reader must answer there as well.
+    monkeypatch.setattr(io_metadata, "read_image_metadata_observed", observed)
     adapter = FilesystemSourceAdapter()
     request = SourceObservationRequest(706, 0, source)
 
@@ -3147,9 +3129,17 @@ def test_same_stat_motor_rewrite_invalidates_admission(tmp_path: Path) -> None:
         session.close()
 
 
-def test_same_stat_eiger_member_rewrite_invalidates_admission(
+def test_same_stat_eiger_member_rewrite_before_start_binds_current_revision(
     tmp_path: Path,
 ) -> None:
+    """A member rewritten before Start is bound as-is: there is no stale proof.
+
+    Directory admission never opens the Eiger sidecar, so a same-stat rewrite
+    between admission and Start cannot invalidate anything; the JIT proof
+    captures the member when the entry is materialized, and the stamp carries
+    that revision (the post-rewrite ctime), not the admission-time one.
+    """
+
     _store, _capture, start, sidecar = external_eiger_capture(tmp_path)
     intent = start.intent_snapshot.thaw()
     intent.output_mode = "Overwrite"
@@ -3165,26 +3155,41 @@ def test_same_stat_eiger_member_rewrite_invalidates_admission(
     try:
         with h5py.File(sidecar, "r+") as handle:
             handle["entry/data/data"][0, 0, 0] = 9
-        os.utime(sidecar, ns=(before.st_atime_ns, before.st_mtime_ns))
+        _restore_mtime(sidecar, before)
         after = sidecar.stat()
-        assert (after.st_size, after.st_mtime_ns) == (
-            before.st_size,
-            before.st_mtime_ns,
-        )
-        assert after.st_ctime_ns != before.st_ctime_ns
 
-        with pytest.raises(
-            SourceRevisionChanged,
-            match="HDF5 dependency changed during admission: ",
-        ):
-            validate_admitted_receipt(receipt, session)
+        validate_admitted_receipt(receipt, session)
+        deferred = receipt.deferred_directory
+        assert deferred is not None
+        decision, ready, skipped = materialize_deferred_output(
+            receipt,
+            session,
+            deferred.entries[0],
+            cancelled=lambda: False,
+        )
+        assert decision is not None
+        assert (ready, skipped) == (1, 0)
+        member, = decision.item.source_stamp.external_members
+        assert Path(member.file.path) == sidecar
+        assert member.file.ctime_ns == after.st_ctime_ns
+        assert member.file.ctime_ns != before.st_ctime_ns
     finally:
         session.close()
 
 
 def test_deferred_cursor_rechecks_dependency_after_start_validation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The JIT proof still freezes the member before dereferencing it.
+
+    Start validation is name/stat-only, so the recheck that matters is inside
+    materialization: a same-stat rewrite landing between the proof's first
+    capture and its verification recapture is refused, even though only
+    ctime records it.  The Eiger sidecar dataset is chunked, so the rewrite
+    goes through a separate writer process rather than a raw byte offset.
+    """
+
     _store, _capture, start, sidecar = external_eiger_capture(tmp_path)
     intent = start.intent_snapshot.thaw()
     intent.output_mode = "Overwrite"
@@ -3197,19 +3202,15 @@ def test_deferred_cursor_rechecks_dependency_after_start_validation(
         snapshot,
         SourceCapture(request, 1, source),
     ))
-    before = sidecar.stat()
+    raced = _race_dependency_after_first_capture(
+        monkeypatch,
+        sidecar,
+        lambda: _same_stat_rewrite_from_other_process(
+            sidecar, "entry/data/data"
+        ),
+    )
     try:
         validate_admitted_receipt(receipt, session)
-        with h5py.File(sidecar, "r+") as handle:
-            handle["entry/data/data"][0, 0, 0] = 7
-        os.utime(sidecar, ns=(before.st_atime_ns, before.st_mtime_ns))
-        after = sidecar.stat()
-        assert (after.st_size, after.st_mtime_ns) == (
-            before.st_size,
-            before.st_mtime_ns,
-        )
-        assert after.st_ctime_ns != before.st_ctime_ns
-
         deferred = receipt.deferred_directory
         assert deferred is not None
         with pytest.raises(
@@ -3222,5 +3223,8 @@ def test_deferred_cursor_rechecks_dependency_after_start_validation(
                 deferred.entries[0],
                 cancelled=lambda: False,
             )
+        assert raced()
+        with h5py.File(sidecar, "r") as handle:
+            assert handle["entry/data/data"][0, 0, 0] == 7
     finally:
         session.close()
