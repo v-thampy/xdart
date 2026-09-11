@@ -731,8 +731,9 @@ def test_e3_ui2_scientific_images_transpose_once_and_keep_axis_geometry(
         plot = shell.scientific.cake.plot
         assert rect == QtCore.QRectF(-4.0, -6.0, 9.0, 15.0)
         assert marker.x() > 0 and marker.y() > 0
-        assert raw_range[0][0] <= 0.0 and raw_range[0][1] >= 4.0
-        assert raw_range[1][0] <= 0.0 and raw_range[1][1] >= 2.0
+        # Canonical raw axes span detector pixel centers (0 .. size - 1).
+        assert raw_range[0][0] <= 0.0 and raw_range[0][1] >= 3.0
+        assert raw_range[1][0] <= 0.0 and raw_range[1][1] >= 1.0
         assert cake_range[0][0] <= -4.0 and cake_range[0][1] >= 5.0
         assert cake_range[1][0] <= -6.0 and cake_range[1][1] >= 9.0
         assert (
@@ -1327,6 +1328,7 @@ def test_e3_ui2_one_d_axis_follows_trace_and_clears_with_exact_absence(
                     traces=(),
                     title="no 1-D",
                     retain_display=False,
+                    replace_trace_history=True,
                 ),
             )
         )

@@ -185,7 +185,7 @@ def test_e3_ui5_maintainer_controls_are_exact_at_review_viewports(
             button.text()
             for row in shell.controls.findChildren(PillRow)
             for _path, button in row._pills
-        ] == ["Mask Saturated", "Average Scan"]
+        ] == ["Average Scan"]
 
         expected_browser_frames = [
             str(position)

@@ -96,7 +96,7 @@ class _RecordingExecutor(StandardRunExecutor):
 def _real_data_root() -> Path:
     configured = os.environ.get("XDART_TEST_DATA")
     if not configured:
-        raise RuntimeError("XDART_TEST_DATA is required for J3 live evidence")
+        pytest.skip("XDART_TEST_DATA is required for J3 external-data evidence")
     root = Path(configured)
     if not root.is_dir():
         raise RuntimeError(f"J3 real-data root is unavailable: {root}")
@@ -219,7 +219,7 @@ def _clean_close(
 def _accepted_xye() -> Path:
     root = os.environ.get("XDART_TEST_DATA")
     if not root:
-        raise RuntimeError("XDART_TEST_DATA is required for J3 live evidence")
+        pytest.skip("XDART_TEST_DATA is required for J3 external-data evidence")
     path = Path(root) / (
         "test_relative_path/xdart_processed_data/"
         "eiger_S069Ta_redo_eta2p0_1_scan001/"

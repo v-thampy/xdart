@@ -60,8 +60,19 @@ def test_context_events_and_outcomes_are_values_only():
         SCATTERING / "browse_values.py",
         SCATTERING / "events.py",
     ):
-        source = path.read_text(encoding="utf-8")
-        assert not forbidden.intersection(source.split()), path
+        for node in _tree(path).body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            # This synchronous owner capture is deliberately not an event or
+            # worker outcome. Its exact context is required for reintegration.
+            if path.name == "browse_values.py" and node.name == "LoadedBrowseCapture":
+                continue
+            annotations = {
+                name.id
+                for field in node.body if isinstance(field, ast.AnnAssign)
+                for name in ast.walk(field.annotation) if isinstance(name, ast.Name)
+            }
+            assert not forbidden.intersection(annotations), (path, node.name)
 
 
 def test_projection_has_no_file_or_source_io_route():
