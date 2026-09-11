@@ -163,7 +163,7 @@ def test_advanced_action_requires_a_mounted_editor_and_unlocked_controls(
     )
 
     assert absent.enabled is False
-    assert "native vNext editor" in absent.reason
+    assert absent.reason == "No vNext operation service is mounted."
     assert mounted.enabled is True
     assert mounted.production_ready is True
     assert running.enabled is False

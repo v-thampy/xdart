@@ -17,7 +17,7 @@ from xdart.gui.widgets.run_controls import RunControlsBar
 from xdart.gui.themes import apply_theme
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
-from xrd_tools.sources.selection import DirectorySourceSpec
+from xrd_tools.sources.selection import DirectorySourceSpec, image_series_spec
 
 
 @pytest.fixture
@@ -84,6 +84,7 @@ def _right_interior_colors(
     }
 
 
+@pytest.mark.parametrize("gi_enabled", (False, True), ids=("standard-series", "gi-directory"))
 @pytest.mark.parametrize(
     ("theme", "font_scale", "spacing", "expected_height"),
     (
@@ -99,6 +100,7 @@ def test_controls_interactive_surfaces_share_square_scaled_geometry(
     font_scale: str,
     spacing: str,
     expected_height: int,
+    gi_enabled: bool,
 ) -> None:
     apply_theme(
         qapp,
@@ -110,7 +112,9 @@ def test_controls_interactive_surfaces_share_square_scaled_geometry(
     run_controls = RunControlsBar()
     try:
         intent = _intent()
-        intent.gi.enabled = True
+        intent.gi.enabled = gi_enabled
+        if not gi_enabled:
+            intent.source_spec = image_series_spec("/raw/image_0001.tif")
         panel.reconcile(
             project_controls(
                 RunIntentStore(intent).snapshot(),
@@ -137,7 +141,12 @@ def test_controls_interactive_surfaces_share_square_scaled_geometry(
             name: panel.findChildren(QtWidgets.QWidget, name)
             for name in _SURFACE_NAMES
         }
-        assert all(surfaces.values())
+        # Average Scan is a series-only pill. Subdirs belongs to directory
+        # forms, and the remaining More menu contains GI geometry options.
+        absent = ({"controlsPillButton"} if gi_enabled else
+                  {"controlsToggleButton", "controlsMoreButton"})
+        assert {name for name, widgets in surfaces.items() if not widgets} == absent
+        surfaces = {name: widgets for name, widgets in surfaces.items() if name not in absent}
         for widgets in surfaces.values():
             for widget in widgets:
                 assert widget.height() == expected_height
@@ -158,7 +167,7 @@ def test_controls_interactive_surfaces_share_square_scaled_geometry(
         }
         assert {
             ("Project", "project_folder"),
-            ("Signal", "img_dir"),
+            ("Signal", "img_dir" if gi_enabled else "File"),
             ("Signal", "poni_file"),
             ("Signal", "mask_file"),
         } <= set(path_rows)

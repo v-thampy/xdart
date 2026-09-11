@@ -497,10 +497,21 @@ def test_project_header_requires_existing_project_and_creatable_save_target(
         None,
         RunPhase.IDLE,
     ))
-    assert not file_shaped_save.ready
+    # .nxs is a raw-source suffix, so an absent name with this suffix can be
+    # a new dotted directory. Existing files still cannot be save directories.
+    assert file_shaped_save.ready
+    Path(intent.save_path).write_text("occupied")
+    assert not project_header_projection(project_controls(
+        RunIntentStore(intent).snapshot(), None, RunPhase.IDLE,
+    )).ready
 
     intent.save_path = str(project / "new-output.nexus")
     assert not project_header_projection(project_controls(
+        RunIntentStore(intent).snapshot(), None, RunPhase.IDLE,
+    )).ready
+    # An existing directory is authoritative even with a processed suffix.
+    Path(intent.save_path).mkdir()
+    assert project_header_projection(project_controls(
         RunIntentStore(intent).snapshot(), None, RunPhase.IDLE,
     )).ready
 
