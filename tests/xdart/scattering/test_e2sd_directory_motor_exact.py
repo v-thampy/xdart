@@ -2798,7 +2798,11 @@ def test_directory_observation_cancels_during_root_listing(
 
     observation = adapter.observe(request)
 
-    assert yielded == [tmp_path / "scan_0000.tif"]
+    # Cancellation is checked after the first member, whichever the
+    # filesystem lists first (ext4 readdir is hash-ordered, not sorted).
+    assert len(yielded) == 1
+    assert yielded[0].parent == tmp_path
+    assert yielded[0].name in {f"scan_{index:04d}.tif" for index in range(3)}
     assert observation.status is SourceObservationStatus.UNAVAILABLE
     assert observation.reason == "Observation cancelled."
 

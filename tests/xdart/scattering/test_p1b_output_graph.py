@@ -2358,6 +2358,13 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
             ))
         return session
 
+    # The worker count pinned below is the Cores=4 request itself.  The pool
+    # cap also clamps to the host (``min(cores, cpu_count)``, 2 below 16 GiB
+    # RAM), so fix the host the way ``fixed_envelope`` fixes the envelope:
+    # a 16 GiB / 4 vCPU CI runner otherwise reports 2 workers.
+    from xrd_tools.core import staging
+    monkeypatch.setattr(staging, "total_physical_ram_bytes", lambda: 64 * 1024 ** 3)
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
     monkeypatch.setattr(
         dynamic_output, "resolve_session_policy", fixed_envelope,
     )

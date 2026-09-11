@@ -967,8 +967,13 @@ def _descriptor_stream_stat_receipt(
     if len(identities) != 1 or (
         expected_stat is not None and identities != {expected_stat}
     ):
+        # Name the (dev, ino, size, mtime_ns, ctime_ns) views so a platform
+        # disagreement (Windows: named stat vs the open descriptor) is
+        # diagnosable from the refusal alone.
         raise TargetChanged(
-            f"{role} descriptor/path identity changed during seal: {path}"
+            f"{role} descriptor/path identity changed during seal: {path} "
+            f"(descriptor={_stat_identity(first)} named={_stat_identity(named)} "
+            f"descriptor-after={_stat_identity(last)} expected={expected_stat})"
         )
     return _StreamStatReceipt(
         _normalize_target(path),

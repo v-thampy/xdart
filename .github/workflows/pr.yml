@@ -20,7 +20,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macos-latest is arm64, and xrayutilities==1.7.12 ships no arm64
+        # macOS wheel, so pip builds its sdist and fails on the runner's
+        # Apple clang ("openmp not found").  The Intel image installs the
+        # published x86_64 wheel; revisit when the xrayutilities pin moves.
+        os: [ubuntu-latest, macos-15-intel, windows-latest]
     runs-on: ${{ matrix.os }}
     # WINDOWS-CALIBRATION-READ-20260911: the XU/RSM calibration asset readers
     # (rsm_geometry_asset.py, xu_stitch_calibration.py) still walk with

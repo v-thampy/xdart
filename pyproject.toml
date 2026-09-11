@@ -60,6 +60,9 @@ gui = [
     # silx.gui.plot pulls qtawesome at import time (pyFAI-calib2 /
     # drawmask path) but silx doesn't declare it.
     "qtawesome",
+    # `silx view` (the installed viewer we launch) imports silx.gui.plot3d,
+    # which raises "PyOpenGL is not installed" unless silx[full] was chosen.
+    "PyOpenGL",
     # External NeXus GUI; reuse our PySide6 (not nexpy[qt], which adds PyQt5).
     # Keep this release on the tested nexusformat 2.0.2 dependency line.
     "nexpy==2.0.1",
