@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -255,6 +256,7 @@ class RetryAction(str, Enum):
     ROLLBACK = "rollback"
     BACKUP_UNLINK = "backup-unlink"
     CANDIDATE_UNLINK = "candidate-unlink"
+    CANDIDATE_RETIRE = "candidate-retire"
     STREAM_RETIRE = "stream-retire"
     POOL_RESUME = "pool-resume"
 
@@ -268,6 +270,7 @@ _RETRY_ORDER = (
     RetryAction.ROLLBACK,
     RetryAction.BACKUP_UNLINK,
     RetryAction.CANDIDATE_UNLINK,
+    RetryAction.CANDIDATE_RETIRE,
     RetryAction.STREAM_RETIRE,
     RetryAction.POOL_RESUME,
     RetryAction.POOL_PAUSE,
@@ -1234,6 +1237,8 @@ class OutputTransaction:
         self._captured_prior: TargetSnapshot | None = None
         self._candidate_snapshot: TargetSnapshot | None = None
         self._candidate_owned = False
+        self._candidate_descriptor: int | None = None
+        self._candidate_descriptor_identity: _FileIdentity | None = None
         self._candidate_reservation: _ObjectReceipt | None = None
         self._backup_reservation: _ObjectReceipt | None = None
         self._stage_receipt: _StageReceipt | None = None
@@ -1527,10 +1532,12 @@ class OutputTransaction:
         self._candidate_owned = True
         self._pending.discard(RetryAction.CANDIDATE_RESERVATION)
 
-    def _reserve_candidate(self) -> int:
+    def _reserve_candidate(self) -> None:
         self._ensure_cleanup_token()
         self._pending.add(RetryAction.ROLLBACK)
         self._pending.add(RetryAction.CANDIDATE_RESERVATION)
+        if self._candidate_descriptor is not None:
+            raise TransactionStateError("candidate descriptor has not been retired")
         if self._candidate.exists():
             self._pending.discard(RetryAction.CANDIDATE_RESERVATION)
             raise TransactionStateError(
@@ -1547,23 +1554,56 @@ class OutputTransaction:
             raise TransactionStateError(
                 f"unowned candidate occupies {self._candidate}; refusing write"
             ) from exc
+        # Install ownership before receipt capture can fail.  This descriptor
+        # pins the original inode across execute and every cleanup retry.
+        self._candidate_descriptor = descriptor
+        receipt = _descriptor_receipt(
+            descriptor,
+            self._candidate,
+            "candidate-reservation",
+        )
+        self._candidate_descriptor_identity = receipt.identity
+        self._candidate_reservation = receipt
+        self._candidate_owned = True
+        self._candidate_snapshot = receipt.snapshot
+        self._writer_receipt = _WriterReceipt(receipt, False, None)
+
+    def _attempt_candidate_retire(self) -> BaseException | None:
+        """Release the inode pin only after every candidate identity owner."""
+        descriptor = self._candidate_descriptor
+        if descriptor is None:
+            return None
+        if any(owner is not None for owner in (
+            self._candidate_reservation,
+            self._writer_receipt,
+            self._publication_receipt,
+        )):
+            return None
+        self._ensure_cleanup_token()
+        self._pending.add(RetryAction.CANDIDATE_RETIRE)
         try:
-            receipt = _descriptor_receipt(
-                descriptor,
-                self._candidate,
-                "candidate-reservation",
-            )
-            self._candidate_reservation = receipt
-            self._candidate_owned = True
-            self._candidate_snapshot = receipt.snapshot
-            self._writer_receipt = _WriterReceipt(receipt, False, None)
-        except BaseException:
-            os.close(descriptor)
-            raise
-        # The caller retains this descriptor through writer capture and
-        # rollback/publication.  An unlinked reservation cannot have its inode
-        # recycled while that descriptor remains open.
-        return descriptor
+            observed = os.fstat(descriptor)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                return exc
+            # A close may complete and then report an error.  Never retry
+            # close against a descriptor number already proven closed.
+        except BaseException as exc:
+            return exc
+        else:
+            identity = _FileIdentity(int(observed.st_dev), int(observed.st_ino))
+            expected = self._candidate_descriptor_identity
+            if expected is not None and identity != expected:
+                return OwnershipRefused("candidate descriptor now names a foreign object")
+            self._candidate_descriptor_identity = identity
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                return exc
+        self._candidate_descriptor = None
+        self._candidate_descriptor_identity = None
+        self._pending.discard(RetryAction.CANDIDATE_RETIRE)
+        return None
 
     def _resolve_backup_reservation(self) -> None:
         if RetryAction.BACKUP_RESERVATION not in self._pending:
@@ -3655,7 +3695,6 @@ class OutputTransaction:
 
             primary: BaseException | None = None
             cleanup_failures: list[BaseException] = []
-            candidate_descriptor: int | None = None
             try:
                 # Recheck after reader exclusion.  No validation result is
                 # trusted across a later clobber: the prior is captured and
@@ -3666,7 +3705,7 @@ class OutputTransaction:
                 try:
                     if self._admission.snapshot.exists:
                         self._stage_prior()
-                    candidate_descriptor = self._reserve_candidate()
+                    self._reserve_candidate()
                     self._resolve_candidate_reservation()
                     if self._candidate_snapshot is None:
                         raise TargetChanged(
@@ -3747,14 +3786,9 @@ class OutputTransaction:
                         primary = None
                         cleanup_failures.extend(self._finish_published_cleanup())
             finally:
-                if candidate_descriptor is not None:
-                    try:
-                        os.close(candidate_descriptor)
-                    except BaseException as exc:
-                        if primary is None:
-                            primary = exc
-                        else:
-                            cleanup_failures.append(exc)
+                retirement_failure = self._attempt_candidate_retire()
+                if retirement_failure is not None:
+                    cleanup_failures.append(retirement_failure)
                 # The exact pause owner remains live while any later retry may
                 # publish or restore the admitted final pathname.
                 if not self._target_transition_pending():
@@ -3868,6 +3902,9 @@ class OutputTransaction:
                 failure = self._attempt_candidate_unlink()
                 if failure is not None:
                     failures.append(failure)
+            retirement_failure = self._attempt_candidate_retire()
+            if retirement_failure is not None:
+                failures.append(retirement_failure)
             epoch_boundary = (
                 self._stream_epoch_receipt is not None
                 and not self._published

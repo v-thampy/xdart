@@ -2939,6 +2939,11 @@ def test_candidate_reservation_replacement_is_foreign_before_writer(
     assert target.read_bytes() == prior
     assert writes == []
     assert transaction.snapshot().phase is not api.TransactionPhase.COMMITTED
+    held = os.fstat(reservation_descriptors[0])
+    assert (held.st_dev, held.st_ino) == reservation_identity[0]
+    transaction._candidate.unlink()
+    recovered = transaction.retry_cleanup(transaction.snapshot().cleanup_token)
+    assert recovered.phase is api.TransactionPhase.READY_TO_RETRY
     with pytest.raises(OSError):
         os.fstat(reservation_descriptors[0])
 
@@ -3079,8 +3084,8 @@ def test_writer_namespace_replacement_is_preserved_and_never_published(
     assert publication_links == []
     assert transaction.snapshot().phase is not api.TransactionPhase.COMMITTED
     assert unlinked_reservation_identity == reserved_identity
-    with pytest.raises(OSError):
-        os.fstat(reservation_descriptors[0])
+    held = os.fstat(reservation_descriptors[0])
+    assert (held.st_dev, held.st_ino) == reserved_identity[0]
 
 
 @pytest.mark.parametrize("failure", [None, "receipt", "observation", "writer"])
@@ -3161,6 +3166,157 @@ def test_candidate_reservation_descriptor_is_closed_after_atomic_execution(
         assert "capture" in observations[observations.index("writer") + 1:]
     else:
         assert "writer" not in observations
+
+
+@pytest.mark.parametrize("failure", ["unlink", "capture"])
+def test_candidate_descriptor_pins_failed_cleanup_through_foreign_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    (
+        api, target, _coordinator, transaction,
+        transaction_owner, target_owner, _owners_by_role, lease,
+    ) = _prepared(tmp_path, prior=b"durable prior")
+    real_capture = api._capture_target
+    real_unlink = api._unlink
+    real_receipt = api._descriptor_receipt
+    descriptors: list[int] = []
+    writes: list[Path] = []
+    captures: list[Path] = []
+    faults: list[str] = []
+
+    def record_reservation(descriptor: int, path: Path, role: str):
+        receipt = real_receipt(descriptor, path, role)
+        if role == "candidate-reservation":
+            descriptors.append(descriptor)
+        return receipt
+
+    def capture(path, *, hash_content=True):
+        if Path(path) == transaction._candidate and writes:
+            captures.append(Path(path))
+            if failure == "capture" and len(captures) == 2:
+                faults.append("capture")
+                raise OSError("candidate cleanup capture fault")
+        return real_capture(path, hash_content=hash_content)
+
+    def unlink(path):
+        if Path(path) == transaction._candidate and failure == "unlink" and not faults:
+            faults.append("unlink")
+            raise OSError("candidate cleanup unlink fault")
+        return real_unlink(path)
+
+    def writer(path: Path) -> None:
+        writes.append(path)
+        path.write_bytes(b"partial candidate")
+        raise RuntimeError("writer fault")
+
+    monkeypatch.setattr(api, "_descriptor_receipt", record_reservation)
+    monkeypatch.setattr(api, "_capture_target", capture)
+    monkeypatch.setattr(api, "_unlink", unlink)
+    with pytest.raises(RuntimeError, match="writer fault"):
+        _execute(
+            transaction, writer,
+            transaction_owner=transaction_owner, target_owner=target_owner, lease=lease,
+        )
+
+    pending = transaction.snapshot()
+    assert pending.phase is api.TransactionPhase.CLEANUP_PENDING
+    assert pending.pending_actions == (api.RetryAction.CANDIDATE_UNLINK,)
+    assert faults == [failure]
+    assert len(descriptors) == 1
+    descriptor = descriptors[0]
+    reserved = os.fstat(descriptor)
+    assert writes[0].read_bytes() == b"partial candidate"
+    assert target.read_bytes() == b"durable prior"
+
+    writes[0].unlink()
+    assert os.fstat(descriptor).st_nlink == 0
+    writes[0].write_bytes(b"foreign retry occupant")
+    foreign = writes[0].stat()
+    assert (foreign.st_dev, foreign.st_ino) != (reserved.st_dev, reserved.st_ino)
+    with pytest.raises(api.CleanupIncomplete):
+        transaction.retry_cleanup(pending.cleanup_token)
+    assert writes[0].read_bytes() == b"foreign retry occupant"
+    assert target.read_bytes() == b"durable prior"
+    assert os.fstat(descriptor).st_ino == reserved.st_ino
+
+    writes[0].unlink()
+    recovered = transaction.retry_cleanup(pending.cleanup_token)
+    assert recovered.phase is api.TransactionPhase.READY_TO_RETRY
+    assert recovered.pending_actions == ()
+    assert transaction._candidate_descriptor is None
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+    assert len(writes) == 1
+    assert target.read_bytes() == b"durable prior"
+
+
+@pytest.mark.parametrize("close_completed", [False, True])
+def test_candidate_descriptor_close_failure_remains_owned_without_writer_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    close_completed: bool,
+) -> None:
+    (
+        api, target, _coordinator, transaction,
+        transaction_owner, target_owner, _owners_by_role, lease,
+    ) = _prepared(tmp_path, prior=None)
+    real_close = api.os.close
+    real_receipt = api._descriptor_receipt
+    descriptors: list[int] = []
+    closes: list[int] = []
+    writes: list[Path] = []
+
+    def record_reservation(descriptor: int, path: Path, role: str):
+        receipt = real_receipt(descriptor, path, role)
+        if role == "candidate-reservation":
+            descriptors.append(descriptor)
+        return receipt
+
+    def close(descriptor: int) -> None:
+        if descriptors and descriptor == descriptors[0]:
+            closes.append(descriptor)
+            if len(closes) == 1:
+                if close_completed:
+                    real_close(descriptor)
+                raise OSError("candidate close transient")
+        real_close(descriptor)
+
+    def writer(path: Path) -> None:
+        writes.append(path)
+        path.write_bytes(b"writer result")
+
+    monkeypatch.setattr(api, "_descriptor_receipt", record_reservation)
+    monkeypatch.setattr(api.os, "close", close)
+    with pytest.raises(api.CleanupIncomplete) as raised:
+        _execute(
+            transaction, writer,
+            transaction_owner=transaction_owner, target_owner=target_owner, lease=lease,
+        )
+    assert "candidate close transient" in str(raised.value.__cause__)
+    descriptor = descriptors[0]
+    pending = transaction.snapshot()
+    assert pending.phase is api.TransactionPhase.CLEANUP_PENDING
+    assert pending.pending_actions == (api.RetryAction.CANDIDATE_RETIRE,)
+    assert transaction._candidate_descriptor == descriptor
+    assert target.read_bytes() == b"writer result"
+    assert not transaction._candidate.exists()
+    if close_completed:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    else:
+        assert os.fstat(descriptor).st_ino == target.stat().st_ino
+
+    recovered = transaction.retry_cleanup(pending.cleanup_token)
+    assert recovered.phase is api.TransactionPhase.COMMITTED
+    assert recovered.pending_actions == ()
+    assert transaction._candidate_descriptor is None
+    assert closes == [descriptor] * (1 if close_completed else 2)
+    assert len(writes) == 1
+    assert target.read_bytes() == b"writer result"
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
 
 
 def test_positive_stage_receipt_outranks_generic_post_move_error(
