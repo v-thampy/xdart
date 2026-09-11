@@ -378,6 +378,18 @@ Lower **Cores** to reduce simultaneous raw-frame and integration buffers.
 Processed-data browsing loads image data on demand; the frame count alone does
 not determine how many full detector images remain resident.
 
+**Run stops with `writer mutation incomplete: stream checkpoint failed identity
+verification`:**
+Something other than xdart touched the output file while the run was writing
+it. The writer checks the file's identity (inode, size, mtime, ctime) before
+every batch and refuses to continue if it changed; the partial output is kept
+next to the target as `.<name>.xdart-partial-*` and any previous file is
+restored. The usual cause is a sync agent (Google Drive, iCloud Drive,
+Dropbox, OneDrive) mirroring the Save Path — it hard-links or re-reads
+in-progress files for upload. Keep the Save Path outside synced folders, or
+pause syncing for the duration of the run. The refusal message names the
+observed and expected identity tuples so the changed field can be read off.
+
 ---
 
 ## Headless quick start (`xrd_tools`)
