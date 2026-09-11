@@ -988,12 +988,13 @@ def _wait_for_admission(
     raise AssertionError("empty Live directory admission did not settle")
 
 
-@pytest.mark.parametrize("rewrite_prior", (False, True),
-                         ids=("distinct-group", "changed-prior-frame"))
+@pytest.mark.parametrize("arrival", (
+    "distinct-group", "changed-prior-frame", "same-group-suffix",
+))
 def test_empty_directory_live_waits_for_one_stable_late_group_until_stop(
     monkeypatch,
     request,
-    rewrite_prior,
+    arrival,
     tmp_path: Path,
 ) -> None:
     raw = tmp_path / "raw"
@@ -1107,7 +1108,7 @@ def test_empty_directory_live_waits_for_one_stable_late_group_until_stop(
     assert original is ready_attempts[0]
     assert original.decision is not None
 
-    if rewrite_prior:
+    if arrival == "changed-prior-frame":
         from xrd_tools.io.frame_view import FrameViewReader
 
         target = original.decision.item.target
@@ -1141,9 +1142,10 @@ def test_empty_directory_live_waits_for_one_stable_late_group_until_stop(
         np.testing.assert_array_equal(preserved.intensity_2d, prior_view.intensity_2d)
         return
 
-    # A distinct stable group remains independently processable after the
-    # first artifact without resetting display residency or existing stores.
-    second = raw / "second_0001.tif"
+    # A suffix reuses the same output owner; a distinct group retires it before
+    # constructing its own owner. Both arrivals remain processable in Live.
+    same_group = arrival == "same-group-suffix"
+    second = raw / ("late_0002.tif" if same_group else "second_0001.tif")
     fabio.tifimage.TifImage(
         data=np.full((4, 4), 3, dtype=np.uint16)
     ).write(str(second))
@@ -1151,7 +1153,16 @@ def test_empty_directory_live_waits_for_one_stable_late_group_until_stop(
     while time.monotonic() < deadline and len(processed) < 2:
         events.extend(executor.drain_events())
         time.sleep(0.01)
-    assert processed == [(late, (1,)), (second, (1,))]
+    assert processed == [(late, (1,)),
+                         (late, (1, 2)) if same_group else (second, (1,))]
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        revisions = executor.processed_live_revisions(identity)
+        if sum(attempt.decision.item.source_stamp.frame_count for attempt in revisions) == 2:
+            break
+        events.extend(executor.drain_events())
+        time.sleep(0.01)
+    assert sum(attempt.decision.item.source_stamp.frame_count for attempt in revisions) == 2
 
     # The Live owner remains armed after the first stable arrival.  It reaches
     # a terminal state only when the operator asks it to stop.
@@ -1191,3 +1202,8 @@ def test_empty_directory_live_waits_for_one_stable_late_group_until_stop(
     assert run is not None
     assert run.resources is None
     assert run.worker is not None and not run.worker.is_alive()
+    if same_group:
+        from xrd_tools.io.frame_view import FrameViewReader
+        assert len(executor.frame_catalog(identity).entries) == 2
+        with FrameViewReader(original.decision.item.target, resolve_source=False) as reader:
+            assert reader.labels() == (1, 2)

@@ -576,6 +576,10 @@ def test_live_pending_identity_revalidates_before_equal_candidate_skip(
             time.sleep(0.01)
         original = executor.processed_live_revisions(identity)
         assert len(original) == 1
+        from xrd_tools.io.frame_view import FrameViewReader
+        initial_target = original[0].decision.item.target
+        with FrameViewReader(initial_target, resolve_source=False) as reader:
+            initial = reader.read(1)
 
         replacement = raw / "replacement.tif"
         replacement.symlink_to(hardlink)
@@ -599,12 +603,20 @@ def test_live_pending_identity_revalidates_before_equal_candidate_skip(
             first.decision.item.source_stamp.execution_identity_v1
             != revised.decision.item.source_stamp.execution_identity_v1
         )
+        failed = [event for event in events if event.kind is StandardEventKind.FAILED]
+        assert len(failed) == 1
+        assert failed[0].primary.type_qualname == "ValueError"
+        assert failed[0].primary.message == "same target cannot change its exact output lineage"
         assert processed == [selected]
         assert executor.processed_live_revisions(identity) == original
     finally:
         executor.stop(identity)
         closed = executor.close(identity)
     assert closed.cleanup_status is CleanupStatus.CLEANED
+    with FrameViewReader(initial_target, resolve_source=False) as reader:
+        preserved = reader.read(1)
+    np.testing.assert_array_equal(preserved.intensity_1d, initial.intensity_1d)
+    np.testing.assert_array_equal(preserved.intensity_2d, initial.intensity_2d)
 
 
 @pytest.mark.parametrize("dependency_kind", ("external_link", "vds", "external_storage"))
