@@ -13,6 +13,8 @@ import numpy as np
 import pytest
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.io.nexus import write_integrated_stack
+from tests.core.v2_fixture_factory import current_entry
 from xrd_tools.io.output_transaction import (
     CleanupIncomplete,
     LeaseOwner,
@@ -38,6 +40,7 @@ from xrd_tools.io.schema import (
     SCHEMA_NAME_ATTR,
     SCHEMA_VERSION_ATTR,
     SOURCE_BASE_ATTR,
+    read_current_mode_layout,
 )
 
 
@@ -321,7 +324,7 @@ def test_grouped_semantic_reads_preserve_order_axes_sigma_and_two_observations(
             writer._pending_owner == "close"
             and "/integrated_" in dataset.name
             and dataset.name.rsplit("/", 1)[-1]
-            in {"frame_index", "q", "intensity", "sigma", "chi"}
+            in {"frame_index", "axis_1", "intensity", "sigma", "axis_2"}
         ):
             close_reads.setdefault(dataset.name, []).append(item)
         return real_getitem(dataset, item)
@@ -340,22 +343,22 @@ def test_grouped_semantic_reads_preserve_order_axes_sigma_and_two_observations(
     expected_slices = [slice(0, 8), slice(8, 10)]
     for group_name in ("integrated_1d", "integrated_2d"):
         prefix = f"/{writer.entry}/{group_name}"
-        assert close_reads[f"{prefix}/q"] == [()]
+        assert close_reads[f"{prefix}/axis_1"] == [()]
         assert close_reads[f"{prefix}/frame_index"] == expected_slices
         assert close_reads[f"{prefix}/intensity"] == expected_slices
         assert all(
             isinstance(item, slice)
             for item in close_reads[f"{prefix}/frame_index"]
         )
-    assert close_reads[f"/{writer.entry}/integrated_2d/chi"] == [()]
+    assert close_reads[f"/{writer.entry}/integrated_2d/axis_2"] == [()]
     assert transaction.commit_stream(attempt, lease=lease).phase is TransactionPhase.COMMITTED
     _release(transaction, lease, owners)
 
     with h5py.File(target, "r") as handle:
         one_d, two_d = handle["entry/integrated_1d"], handle["entry/integrated_2d"]
-        np.testing.assert_array_equal(one_d["q"][()], _r1(1).radial.astype("f4"))
-        np.testing.assert_array_equal(two_d["q"][()], _r2(1).radial.astype("f4"))
-        np.testing.assert_array_equal(two_d["chi"][()], _r2(1).azimuthal.astype("f4"))
+        np.testing.assert_array_equal(one_d["axis_1"][()], _r1(1).radial.astype("f4"))
+        np.testing.assert_array_equal(two_d["axis_1"][()], _r2(1).radial.astype("f4"))
+        np.testing.assert_array_equal(two_d["axis_2"][()], _r2(1).azimuthal.astype("f4"))
         for label in range(10):
             np.testing.assert_array_equal(one_d["intensity"][label], _r1(label + 1).intensity)
             np.testing.assert_array_equal(two_d["intensity"][label], _r2(label + 1).intensity.T)
@@ -957,12 +960,12 @@ def test_stream_retire_post_rename_observation_retries_from_exact_receipt(
     real_capture = module._capture_target
     failed = False
 
-    def fail_first_destination_observation(path):
+    def fail_first_destination_observation(path, **kwargs):
         nonlocal failed
         if Path(path) == partial and partial.exists() and not target.exists() and not failed:
             failed = True
             raise OSError("post-rename observation failed")
-        return real_capture(path)
+        return real_capture(path, **kwargs)
 
     monkeypatch.setattr(module, "_capture_target", fail_first_destination_observation)
     with pytest.raises(CleanupIncomplete):
@@ -1040,12 +1043,12 @@ def test_stream_retire_receipt_refuses_replaced_partial_after_observation_fault(
     real_capture = module._capture_target
     failed = False
 
-    def fail_once(path):
+    def fail_once(path, **kwargs):
         nonlocal failed
         if Path(path) == partial and partial.exists() and not target.exists() and not failed:
             failed = True
             raise OSError("post-rename observation failed")
-        return real_capture(path)
+        return real_capture(path, **kwargs)
 
     monkeypatch.setattr(module, "_capture_target", fail_once)
     with pytest.raises(CleanupIncomplete):
@@ -1077,12 +1080,12 @@ def test_stream_partial_absence_without_authorized_cleanup_stays_held(
     real_capture = module._capture_target
     failed = False
 
-    def fail_once(path):
+    def fail_once(path, **kwargs):
         nonlocal failed
         if Path(path) == partial and partial.exists() and not target.exists() and not failed:
             failed = True
             raise OSError("post-rename observation failed")
-        return real_capture(path)
+        return real_capture(path, **kwargs)
 
     monkeypatch.setattr(module, "_capture_target", fail_once)
     with pytest.raises(CleanupIncomplete):
@@ -1134,8 +1137,8 @@ def test_bound_writer_checkpoint_is_semantic_k_payload_not_file_size(
         WriterTransactionBinding,
     )
     target = tmp_path / "large.nexus"
-    with h5py.File(target, "w") as handle:
-        handle.create_group("entry")
+    _seed_target(target, (0,), tmp_path)
+    with h5py.File(target, "r+") as handle:
         handle.create_dataset("unrelated_padding", data=np.zeros(3 * 1024 * 1024,
                                                                   dtype=np.uint8))
     (coordinator, transaction, target, transaction_owner, target_owner,
@@ -1311,6 +1314,7 @@ def test_publication_drop_checkpoint_is_an_irreversible_static_h10_floor(tmp_pat
     )
     seed.begin()
     seed.write(RecordWrite(label=0, result_1d=_r1(1)))
+    seed.write(RecordWrite(label=1, result_1d=_r1(2)))
     seed.finish()
     prior = target.read_bytes()
 
@@ -1356,7 +1360,10 @@ def test_publication_drop_checkpoint_is_an_irreversible_static_h10_floor(tmp_pat
     assert snapshot.durable_floor is not None
     assert snapshot.partial_path == str(target)
     with h5py.File(target, "r") as handle:
-        assert tuple(handle["entry/integrated_1d/frame_index"][()]) == ()
+        assert tuple(handle["entry/integrated_1d/frame_index"][()]) == (1,)
+        np.testing.assert_array_equal(
+            handle["entry/integrated_1d/intensity"][0], _r1(2).intensity,
+        )
     _release(transaction, lease, owners)
     assert pool.events == [("pause", str(target)), ("resume", str(target))]
 
@@ -1689,14 +1696,15 @@ def test_existing_target_requires_preflight_and_overwrite_rejects_one(tmp_path):
     from xrd_tools.reduction import NexusSink, ReductionPlan
 
     existing = tmp_path / "existing.nexus"
-    existing.write_bytes(b"preserved")
+    _seed_target(existing, (0,), tmp_path)
+    preserved = existing.read_bytes()
     sink = NexusSink(
         existing,
         same_run_intent=_intent(tmp_path, extent=1, labels=(0,)),
     )
     with pytest.raises(ValueError, match="exact Append preflight"):
         sink.begin(Scan("existing", []), ReductionPlan())
-    assert existing.read_bytes() == b"preserved"
+    assert existing.read_bytes() == preserved
     assert sink._transaction_owners is None
 
     fresh = tmp_path / "fresh.nexus"
@@ -1900,13 +1908,18 @@ def _assert_lease_available(target):
 
 def _seed_target(path: Path, labels, source_base: Path) -> None:
     with h5py.File(path, "w") as handle:
-        entry = handle.create_group("entry")
-        entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
-        entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+        entry = current_entry(handle)
         entry.attrs[SOURCE_BASE_ATTR] = str(source_base)
-        for name in ("integrated_1d", "integrated_2d"):
-            group = entry.create_group(name)
-            group.create_dataset("frame_index", data=np.asarray(labels, dtype=np.int64))
+        _write_result_rows(entry, labels)
+
+
+def _write_result_rows(entry, labels) -> None:
+    labels = tuple(labels)
+    write_integrated_stack(
+        entry, frame_indices=labels,
+        results_1d=[_r1(label) for label in labels],
+        results_2d=[_r2(label) for label in labels],
+    )
 
 
 def test_existing_stream_startup_full_hashes_prior_exactly_three_times(
@@ -2449,17 +2462,17 @@ def test_fast_regenerable_close_rejects_changed_scientific_value(
     if changed == "frame-index":
         one_d["frame_index"][0] = np.int64(9)
     elif changed == "q":
-        one_d["q"][0] += np.float32(1)
+        one_d["axis_1"][0] += np.float32(1)
     elif changed == "q-unit":
-        one_d["q"].attrs["units"] = "changed"
+        one_d["axis_1"].attrs["units"] = "changed"
     elif changed == "intensity":
         one_d["intensity"][0, 0] += np.float32(1)
     elif changed == "sigma":
         two_d["sigma"][0, 0, 0] += np.float32(1)
     elif changed == "chi":
-        two_d["chi"][0] += np.float32(1)
+        two_d["axis_2"][0] += np.float32(1)
     elif changed == "chi-unit":
-        two_d["chi"].attrs["units"] = "changed"
+        two_d["axis_2"].attrs["units"] = "changed"
     elif changed == "two-d-kind":
         two_d.attrs["two_d_kind"] = "changed"
     elif changed == "axis-kind":
@@ -2576,10 +2589,10 @@ def test_fast_terminal_science_accepts_allclose_axes_and_mixed_sigma(tmp_path):
         one_d = handle["entry/integrated_1d"]
         two_d = handle["entry/integrated_2d"]
         np.testing.assert_array_equal(
-            one_d["q"][()], np.asarray(_r1(1).radial, np.float32),
+            one_d["axis_1"][()], np.asarray(_r1(1).radial, np.float32),
         )
         np.testing.assert_array_equal(
-            two_d["q"][()], np.asarray(_r2(1).radial, np.float32),
+            two_d["axis_1"][()], np.asarray(_r2(1).radial, np.float32),
         )
         assert np.isnan(one_d["sigma"][[0, 2]]).all()
         assert np.isnan(two_d["sigma"][[0, 2]]).all()
@@ -2721,7 +2734,7 @@ def test_fast_terminal_science_reads_result_rows_in_bounded_exact_slabs(
             writer._pending_owner == "close"
             and "/integrated_" in dataset.name
             and dataset.name.rsplit("/", 1)[-1]
-            in {"frame_index", "intensity", "sigma", "q", "chi"}
+            in {"frame_index", "intensity", "sigma", "axis_1", "axis_2"}
         ):
             reads.setdefault(dataset.name, []).append(item)
         return real_getitem(dataset, item)
@@ -2732,10 +2745,10 @@ def test_fast_terminal_science_reads_result_rows_in_bounded_exact_slabs(
     slabs = [slice(0, 8), slice(8, 10)]
     for name in ("integrated_1d", "integrated_2d"):
         root = f"/entry/{name}"
-        assert reads[root + "/q"] == [()]
+        assert reads[root + "/axis_1"] == [()]
         for leaf in ("frame_index", "intensity", "sigma"):
             assert reads[root + "/" + leaf] == slabs
-    assert reads["/entry/integrated_2d/chi"] == [()]
+    assert reads["/entry/integrated_2d/axis_2"] == [()]
     assert writer.grouped_semantic_read_volume["close"] == (4, 20)
 
 
@@ -3073,20 +3086,14 @@ def test_append_writer_lineage_n_to_m_to_k_and_final_noop(tmp_path):
     decision = qualify(target, second)
     assert decision.disposition is Disposition.WRITE
     with h5py.File(target, "r+") as handle:
-        for name in ("integrated_1d", "integrated_2d"):
-            del handle[f"entry/{name}/frame_index"]
-            handle[f"entry/{name}"].create_dataset(
-                "frame_index", data=np.arange(5, dtype=np.int64))
+        _write_result_rows(handle["entry"], (2, 3, 4))
         commit_lineage(handle["entry"], decision, written_labels=(2, 3, 4))
 
     third = _intent(tmp_path, extent=6, labels=tuple(range(6)))
     decision = qualify(target, third)
     assert decision.disposition is Disposition.WRITE
     with h5py.File(target, "r+") as handle:
-        for name in ("integrated_1d", "integrated_2d"):
-            del handle[f"entry/{name}/frame_index"]
-            handle[f"entry/{name}"].create_dataset(
-                "frame_index", data=np.arange(6, dtype=np.int64))
+        _write_result_rows(handle["entry"], (5,))
         commit_lineage(handle["entry"], decision, written_labels=(5,))
 
     final = qualify(target, _intent(tmp_path, extent=6, labels=tuple(range(6))))
@@ -3215,11 +3222,7 @@ def test_append_refuses_malformed_earlier_epoch_member_history(tmp_path):
     second = _intent(tmp_path, extent=3, labels=(0, 1, 2))
     second_decision = append_module.qualify_append(target, second)
     with h5py.File(target, "r+") as handle:
-        for name in ("integrated_1d", "integrated_2d"):
-            del handle[f"entry/{name}/frame_index"]
-            handle[f"entry/{name}"].create_dataset(
-                "frame_index", data=np.arange(3, dtype=np.int64),
-            )
+        _write_result_rows(handle["entry"], (2,))
         append_module.commit_append_lineage(
             handle["entry"], second_decision, written_labels=(2,),
         )
@@ -3404,7 +3407,7 @@ def test_first_run_same_owner_extends_without_readmit_reopen_or_cursor_rebuild(
 
     monkeypatch.setattr(coordinator, "admit", admit)
     monkeypatch.setattr(core, "open_nexus_writer", open_writer)
-    target = tmp_path / "same-run.nxs"
+    target = tmp_path / "same-run.nexus"
     first = _intent(
         tmp_path, extent=1, labels=(0,), generation=0,
         modes=("1d:default",),
@@ -3459,9 +3462,9 @@ def test_first_run_same_owner_extends_without_readmit_reopen_or_cursor_rebuild(
 def test_same_run_extension_rollback_restores_prior_bytes(tmp_path):
     from xrd_tools.core.scan import Scan, ScanFrame
     from xrd_tools.reduction import FrameReduction, NexusSink, ReductionPlan, ReductionResult
-    target = tmp_path / "rollback.nxs"
-    prior = b"immutable prior bytes"
-    target.write_bytes(prior)
+    target = tmp_path / "rollback.nexus"
+    _seed_target(target, (7,), tmp_path)
+    prior = target.read_bytes()
     first = _intent(
         tmp_path, extent=1, labels=(0,), generation=0,
         modes=("1d:default",),
@@ -3498,9 +3501,9 @@ def test_committed_epoch_extension_rollback_restores_epoch_not_original(
         core, "open_nexus_writer",
         lambda *a, **k: (opens.append(a[0]), real_open(*a, **k))[1],
     )
-    target = tmp_path / "epoch-rollback.nxs"
-    original = b"pre-run target"
-    target.write_bytes(original)
+    target = tmp_path / "epoch-rollback.nexus"
+    _seed_target(target, (7,), tmp_path)
+    original = target.read_bytes()
     first = _intent(
         tmp_path, extent=1, labels=(0,), generation=0,
         modes=("1d:default",),
@@ -3760,7 +3763,7 @@ def test_cross_run_append_preflight_extends_the_bound_writer(tmp_path):
     from xrd_tools.core.scan import Scan, ScanFrame
     from xrd_tools.io import prepare_append_preflight
     from xrd_tools.reduction import FrameReduction, NexusSink, ReductionPlan, ReductionResult
-    target = tmp_path / "cross-run.nxs"
+    target = tmp_path / "cross-run.nexus"
     first = _intent(
         tmp_path, extent=1, labels=(0,), generation=0,
         modes=("1d:default",),
@@ -4092,7 +4095,7 @@ def test_preflight_owns_lease_before_qualification_and_rejects_copy(
     from xrd_tools.io import get_output_transaction_coordinator, prepare_append_preflight
     module = importlib.import_module("xrd_tools.io.append")
     coordinator = get_output_transaction_coordinator()
-    target = tmp_path / "preflight.nxs"
+    target = tmp_path / "preflight.nexus"
     intent = _intent(tmp_path, extent=1, labels=(0,), modes=("1d:default",))
     real_qualify = module.qualify_append
     real_admit = coordinator.admit
@@ -4146,7 +4149,7 @@ def test_preflight_reserved_generation_replay_is_exact_and_monotonic(tmp_path):
         tmp_path, extent=1, labels=(0,), generation=1,
         modes=("1d:default",),
     )
-    preflight = prepare_append_preflight(tmp_path / "generation.nxs", current)
+    preflight = prepare_append_preflight(tmp_path / "generation.nexus", current)
     assert preflight.extend(current) == preflight.snapshot
     with pytest.raises(AppendRefused, match="generation did not advance"):
         preflight.extend(_intent(
@@ -4164,7 +4167,7 @@ def test_reserved_preflight_rejects_a_higher_generation_source_regression(tmp_pa
         tmp_path, extent=1, labels=(0,), generation=0,
         modes=("1d:default",),
     )
-    preflight = prepare_append_preflight(tmp_path / "reserved-regression.nxs", current)
+    preflight = prepare_append_preflight(tmp_path / "reserved-regression.nexus", current)
     regressed = replace(
         current,
         source=replace(
@@ -4202,7 +4205,7 @@ def test_qualification_cleanup_failure_returns_exact_retry_owner(
         lambda *_a, **_k: (_ for _ in ()).throw(OSError("qualify fault")),
     )
     monkeypatch.setattr(transaction_module.OutputTransaction, "abandon", fail_once)
-    target = tmp_path / "qualification-cleanup.nxs"
+    target = tmp_path / "qualification-cleanup.nexus"
     intent = _intent(tmp_path, extent=1, labels=(0,), modes=("1d:default",))
     with pytest.raises(AppendPreflightCleanupError) as excinfo:
         prepare_append_preflight(target, intent)
@@ -4219,7 +4222,7 @@ def test_qualification_cleanup_failure_returns_exact_retry_owner(
 def test_preflight_abort_preserves_integrity_hold_after_target_appears(tmp_path):
     from xrd_tools.io import prepare_append_preflight
 
-    target = tmp_path / "appeared.nxs"
+    target = tmp_path / "appeared.nexus"
     preflight = prepare_append_preflight(
         target, _intent(tmp_path, extent=1, labels=(0,), modes=("1d:default",)))
     target.write_bytes(b"foreign")
@@ -4231,7 +4234,7 @@ def test_preflight_abort_preserves_integrity_hold_after_target_appears(tmp_path)
 
 def test_noop_preflight_rechecks_target_before_reporting_terminal(tmp_path):
     from xrd_tools.io import prepare_append_preflight
-    target = tmp_path / "noop-mutation.nxs"
+    target = tmp_path / "noop-mutation.nexus"
     intent = _intent(
         tmp_path, extent=1, labels=(0,), modes=("1d:default",))
     seed = importlib.import_module("xrd_tools.io.append").begin_same_run_lineage(intent)
@@ -4284,11 +4287,7 @@ def _commit_image_series_target(target, intent):
         _seed_target(target, intent.labels, Path(intent.source_base))
     else:
         with h5py.File(target, "r+") as handle:
-            for name in ("integrated_1d", "integrated_2d"):
-                del handle[f"entry/{name}/frame_index"]
-                handle[f"entry/{name}"].create_dataset(
-                    "frame_index", data=np.asarray(intent.labels, dtype=np.int64),
-                )
+            _write_result_rows(handle["entry"], decision.write_labels)
     with h5py.File(target, "r+") as handle:
         module.commit_append_lineage(
             handle["entry"], decision, written_labels=decision.write_labels,
@@ -4306,7 +4305,7 @@ def test_committed_prefix_decoder_returns_exact_cumulative_image_series_intent(
     tmp_path,
 ):
     io_module = importlib.import_module("xrd_tools.io")
-    target = tmp_path / "decoder.nxs"
+    target = tmp_path / "decoder.nexus"
     first = _image_series_intent(tmp_path, 2, generation=0)
     final = _image_series_intent(tmp_path, 3, generation=1)
     _commit_image_series_target(target, first)
@@ -4349,7 +4348,7 @@ def test_prefix_bound_preflight_refuses_disappeared_target_instead_of_first_run_
 ):
     from xrd_tools.io import AppendRefused, prepare_append_preflight
 
-    target = tmp_path / "disappeared.nxs"
+    target = tmp_path / "disappeared.nexus"
     _commit_image_series_target(
         target, _image_series_intent(tmp_path, 2, generation=0),
     )
@@ -4372,7 +4371,7 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
         prepare_append_preflight,
     )
 
-    target = tmp_path / "divergent.nxs"
+    target = tmp_path / "divergent.nexus"
     _commit_image_series_target(
         target, _image_series_intent(tmp_path, 2, generation=0),
     )
@@ -4403,7 +4402,7 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
         "bool-version", "float-label", "bool-member-ordinal", "bool-digest",
         "string-image-members", "null-image-member",
     ):
-        typed_target = tmp_path / f"typed-{mutation}.nxs"
+        typed_target = tmp_path / f"typed-{mutation}.nexus"
         _commit_image_series_target(
             typed_target, _image_series_intent(tmp_path, 2, generation=0),
         )
@@ -4459,7 +4458,7 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
         )),
         ("lineage-scalar-int", 7),
     ):
-        scalar_target = tmp_path / f"scalar-{mutation}.nxs"
+        scalar_target = tmp_path / f"scalar-{mutation}.nexus"
         _commit_image_series_target(
             scalar_target, _image_series_intent(tmp_path, 2, generation=0),
         )
@@ -4478,10 +4477,15 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
             else:
                 entry.attrs[SCHEMA_VERSION_ATTR] = value
         scalar_before = scalar_target.read_bytes()
+        expected_error = (
+            "current xdart .nexus record" if mutation.startswith("schema-")
+            else "source base" if mutation == "source-base-int"
+            else "lineage scalar"
+        )
         with h5py.File(scalar_target, "r") as handle:
-            with pytest.raises(ValueError, match="schema|source base|lineage scalar"):
+            with pytest.raises(ValueError, match=expected_error):
                 decode_committed_append_prefix(handle)
-        with pytest.raises(AppendRefused, match="schema|source base|lineage scalar"):
+        with pytest.raises(AppendRefused, match=expected_error):
             prepare_append_preflight(
                 scalar_target, _image_series_intent(tmp_path, 3, generation=1),
                 committed_prefix=scalar_prefix,
@@ -4489,7 +4493,7 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
         assert scalar_target.read_bytes() == scalar_before
         _assert_lease_available(scalar_target)
 
-    primary_target = tmp_path / "primary-mode-int.nxs"
+    primary_target = tmp_path / "primary-mode-int.nexus"
     _commit_image_series_target(
         primary_target, _image_series_intent(tmp_path, 2, generation=0),
     )
@@ -4505,18 +4509,21 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
     with h5py.File(primary_target, "r+") as handle:
         entry = handle["entry"]
         entry["integrated_1d"].attrs[PRIMARY_MODE_ATTR] = 7
+        entry["integrated_1d"].attrs[MULTI_RESULT_MODES_ATTR] = ["q_total"]
+        with pytest.raises(ValueError, match="requires one bounded text scalar"):
+            read_current_mode_layout(entry["integrated_1d"], "1d")
         del entry["reduction/config/append_lineage"]
         entry["reduction/config"].create_dataset(
             "append_lineage", data=primary_prefix.lineage_json,
         )
     primary_before = primary_target.read_bytes()
     with h5py.File(primary_target, "r") as handle:
-        with pytest.raises(ValueError, match="primary mode"):
+        with pytest.raises(ValueError, match="current xdart .nexus record"):
             decode_committed_append_prefix(handle)
     successor = replace(
         _image_series_intent(tmp_path, 3, generation=1), modes=("1d:7",),
     )
-    with pytest.raises(AppendRefused, match="primary mode"):
+    with pytest.raises(AppendRefused, match="current xdart .nexus record"):
         prepare_append_preflight(
             primary_target, successor, committed_prefix=primary_prefix,
         )
@@ -4529,19 +4536,19 @@ def test_prefix_bound_preflight_refuses_divergent_same_label_lineage(tmp_path):
     (
         (
             "primary-1d", "1d", "qip_qoop", ("1d:qip_qoop",), None,
-            "primary mode",
+            "unknown canonical 1d mode key",
         ),
         (
             "non-primary-1d", "1d", "q_total",
-            ("1d:q_total", "1d:qip_qoop"), "qip_qoop", "unknown 1d mode",
+            ("1d:q_total", "1d:qip_qoop"), "qip_qoop", "malformed current mode inventory",
         ),
         (
             "primary-2d", "2d", "q_total", ("2d:q_total",), None,
-            "primary mode",
+            "unknown canonical 2d mode key",
         ),
         (
             "non-primary-2d", "2d", "qip_qoop",
-            ("2d:qip_qoop", "2d:q_total"), "q_total", "unknown 2d mode",
+            ("2d:qip_qoop", "2d:q_total"), "q_total", "malformed current mode inventory",
         ),
     ),
 )
@@ -4554,7 +4561,7 @@ def test_prefix_bound_preflight_refuses_dimension_incompatible_modes(
         prepare_append_preflight,
     )
 
-    target = tmp_path / f"wrong-dimension-{case}.nxs"
+    target = tmp_path / f"wrong-dimension-{case}.nexus"
     _commit_image_series_target(
         target, _image_series_intent(tmp_path, 2, generation=0),
     )
@@ -4569,10 +4576,14 @@ def test_prefix_bound_preflight_refuses_dimension_incompatible_modes(
     with h5py.File(target, "r+") as handle:
         entry = handle["entry"]
         top = entry[f"integrated_{dimension}"]
-        top.attrs[PRIMARY_MODE_ATTR] = primary
         if subgroup is not None:
-            group = top.create_group(subgroup)
-            group.create_dataset("frame_index", data=top["frame_index"][()])
+            # Keep the child payload schema-valid so only its mode identity is
+            # wrong. Copying also preserves independent row-dataset ownership.
+            top.copy(top, subgroup)
+        top.attrs[PRIMARY_MODE_ATTR] = primary
+        top.attrs[MULTI_RESULT_MODES_ATTR] = [mode.split(":", 1)[1] for mode in modes]
+        with pytest.raises(ValueError, match=error):
+            read_current_mode_layout(top, dimension)
         del entry["reduction/config/append_lineage"]
         entry["reduction/config"].create_dataset(
             "append_lineage", data=prefix.lineage_json,
@@ -4580,12 +4591,12 @@ def test_prefix_bound_preflight_refuses_dimension_incompatible_modes(
     before = target.read_bytes()
 
     with h5py.File(target, "r") as handle:
-        with pytest.raises(ValueError, match=error):
+        with pytest.raises(ValueError, match="current xdart .nexus record"):
             decode_committed_append_prefix(handle)
     successor = replace(
         _image_series_intent(tmp_path, 3, generation=1), modes=modes,
     )
-    with pytest.raises(AppendRefused, match=error):
+    with pytest.raises(AppendRefused, match="current xdart .nexus record"):
         prepare_append_preflight(
             target, successor, committed_prefix=prefix,
         )
@@ -4599,7 +4610,7 @@ def test_prefix_bound_preflight_accepts_concurrent_exact_successor_as_noop(
     from xrd_tools.io import AppendDisposition, AppendPreflightState
     from xrd_tools.io import prepare_append_preflight
 
-    target = tmp_path / "concurrent-successor.nxs"
+    target = tmp_path / "concurrent-successor.nexus"
     _commit_image_series_target(
         target, _image_series_intent(tmp_path, 2, generation=0),
     )
@@ -4622,7 +4633,7 @@ def test_reserved_prefix_bound_preflight_extend_retains_anchor(tmp_path, monkeyp
     from xrd_tools.io import prepare_append_preflight
 
     module = importlib.import_module("xrd_tools.io.append")
-    target = tmp_path / "reserved-anchor.nxs"
+    target = tmp_path / "reserved-anchor.nexus"
     _commit_image_series_target(
         target, _image_series_intent(tmp_path, 2, generation=0),
     )
@@ -4672,7 +4683,7 @@ def test_existing_append_sink_qualifies_once_and_reuses_owner_for_extension(
     from xrd_tools.reduction import FrameReduction, NexusSink, ReductionPlan, ReductionResult
     import xrd_tools.reduction.core as reduction_core
 
-    target = tmp_path / "lazy-existing.nxs"
+    target = tmp_path / "lazy-existing.nexus"
     first = _intent(
         tmp_path, extent=1, labels=(0,), modes=("1d:default",),
     )
@@ -4720,7 +4731,7 @@ def test_existing_append_refusal_is_typed_preserves_target_and_has_no_owner(
     from xrd_tools.reduction import NexusSink, ReductionPlan
     import xrd_tools.reduction.core as reduction_core
 
-    target = tmp_path / "lazy-refusal.nxs"
+    target = tmp_path / "lazy-refusal.nexus"
     first = _intent(
         tmp_path, extent=1, labels=(0,), modes=("1d:default",),
     )
@@ -4762,7 +4773,7 @@ def test_existing_append_retryable_cleanup_stays_in_sink_and_abort_retries(
     import xrd_tools.io.output_transaction as transaction_module
     import xrd_tools.reduction.core as reduction_core
 
-    target = tmp_path / "lazy-retryable.nxs"
+    target = tmp_path / "lazy-retryable.nexus"
     intent = _intent(
         tmp_path, extent=1, labels=(0,), modes=("1d:default",),
     )
@@ -4814,7 +4825,7 @@ def test_existing_append_integrity_hold_abort_never_reports_settled(
     from xrd_tools.reduction import NexusSink, ReductionPlan
     import xrd_tools.io.append as append_module
 
-    target = tmp_path / "lazy-integrity-hold.nxs"
+    target = tmp_path / "lazy-integrity-hold.nexus"
     intent = _intent(
         tmp_path, extent=1, labels=(0,), modes=("1d:default",),
     )
