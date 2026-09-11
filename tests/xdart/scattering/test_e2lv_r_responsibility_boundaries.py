@@ -16,7 +16,7 @@ from tests.xdart.scattering._e2sd_support import (
     write_motor_container,
     write_poni,
 )
-from tests.xdart.scattering.test_e2lv_three_mode_navigation import _run_page
+from tests.xdart.scattering.test_e2lv_three_mode_navigation import _run_page, _wait
 from xdart.gui.tabs.scattering.controls_inventory import THRESHOLD_MIN
 from xdart.gui.tabs.scattering.display_values import (
     DisplayFrameKey,
@@ -371,6 +371,14 @@ def test_delayed_frame_event_routes_its_exact_artifact_key(
         )
         page._drain_executor()
 
+        # Cold cross-artifact hydration keeps the outgoing plot until the exact
+        # replacement is ready; event acceptance alone is not a paint receipt.
+        _wait(
+            qapp,
+            lambda: shell.scientific.frame_selector.currentData() is delayed,
+            page=page,
+            lifecycle=_lifecycle,
+        )
         assert shell.scientific.frame_selector.currentData() is delayed
         status = shell.scientific.status.text()
         assert status == shell.scientific.title.text()
