@@ -19,6 +19,11 @@ from collections.abc import Mapping
 from types import MappingProxyType
 
 from xrd_tools.analysis.scan_operations import analysis_canonical_fingerprint
+from xrd_tools.io.descriptor_path import (
+    directory_identity,
+    leaf_created_inside,
+    unlink_empty_created_leaf,
+)
 from xrd_tools.io.stat_identity import identity_ctime_ns
 
 
@@ -899,7 +904,12 @@ def _install_by_descriptor(project: str, relative: str, raw: bytes) -> None:
 def _install_by_name(project: str, relative: str, raw: bytes) -> None:
     """The no-dir_fd installer: every ancestor is inspected with lstat
     (links refused) before the leaf is created exclusively by name; only
-    the file itself is flushed, a directory has no fsync on Windows."""
+    the file itself is flushed, a directory has no fsync on Windows.
+
+    A by-name open cannot pin where the leaf lands, so before any byte is
+    written the created object's final path must name the inspected
+    parent directory (``leaf_created_inside``); a leaf that landed
+    elsewhere is removed empty and the install refused."""
     file_flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -911,6 +921,7 @@ def _install_by_name(project: str, relative: str, raw: bytes) -> None:
     current = project_parts[0]
     leaf: str | None = None
     try:
+        value = os.lstat(current)
         for part in project_parts[1:] + Path(relative).parts[:-1]:
             current = os.path.join(current, part)
             try:
@@ -920,13 +931,22 @@ def _install_by_name(project: str, relative: str, raw: bytes) -> None:
                 value = os.lstat(current)
             if _is_link(value) or not stat.S_ISDIR(value.st_mode):
                 raise OSError("canonical asset ancestry is not a real directory")
+        parent_identity = directory_identity(value)
         target = os.path.join(current, Path(relative).parts[-1])
         descriptor = os.open(target, file_flags, 0o644)
-        leaf = target
         try:
-            _write_asset(descriptor, raw)
+            created = directory_identity(os.fstat(descriptor))
+            placed = leaf_created_inside(descriptor, parent_identity)
+            if placed:
+                leaf = target
+                _write_asset(descriptor, raw)
         finally:
             os.close(descriptor)
+        if not placed:
+            unlink_empty_created_leaf(target, created)
+            raise OSError(
+                "canonical asset was created outside its inspected directory"
+            )
     except FileExistsError as error:
         raise XuStitchCalibrationRefused(
             "XU_CALIBRATION_INSTALL_CONFLICT",

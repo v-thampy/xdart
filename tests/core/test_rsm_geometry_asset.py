@@ -522,6 +522,74 @@ def test_rsm_installer_refuses_symlink_parent_without_outside_write(tmp_path):
     assert list(outside.iterdir()) == []
 
 
+def test_rsm_by_name_installer_installs_and_readmits_like_the_descriptor_walk(
+    tmp_path, monkeypatch,
+):
+    """The no-dir_fd installer (Windows' only one) on any host."""
+    monkeypatch.setattr(rsm_asset_module, "_DESCRIPTOR_WALK", False)
+    project = tmp_path / "project"
+    project.mkdir()
+    first = install_canonical_rsm_geometry_asset(project_root=project)
+    target = project / CANONICAL_RSM_GEOMETRY_LOCATOR
+    assert target.read_bytes() == canonical_rsm_geometry_resource_bytes()
+    second = install_canonical_rsm_geometry_asset(project_root=project)
+    assert second.receipt_fingerprint == first.receipt_fingerprint
+    assert second.file_revision == first.file_revision
+
+
+def _descriptor_walk_modes(module):
+    modes = [pytest.param(False, id="by_name")]
+    if module._DESCRIPTOR_WALK:
+        modes.insert(0, pytest.param(True, id="descriptor"))
+    return modes
+
+
+@pytest.mark.parametrize(
+    "descriptor_walk", _descriptor_walk_modes(rsm_asset_module),
+)
+def test_rsm_installer_never_writes_outside_after_a_parent_exchange(
+    tmp_path, monkeypatch, descriptor_walk,
+):
+    """Codex PR #1 review, F2: a parent directory exchanged for a symbolic
+    link between the ancestry inspection and the leaf open must not land
+    the asset inside the link's target.  The descriptor walk cannot follow
+    it; the by-name walk reads the created leaf's final path and refuses,
+    removing the misplaced empty leaf."""
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    target = project / CANONICAL_RSM_GEOMETRY_LOCATOR
+    target.parent.mkdir(parents=True)
+    parked = target.parent.with_name(target.parent.name + "-parked")
+    real_open = os.open
+    exchanged = False
+
+    def exchange_then_open(path, flags, *args, **kwargs):
+        nonlocal exchanged
+        if not exchanged and flags & os.O_CREAT and Path(path).name == target.name:
+            exchanged = True
+            target.parent.rename(parked)
+            _symlink(target.parent, outside, directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(rsm_asset_module, "_DESCRIPTOR_WALK", descriptor_walk)
+    monkeypatch.setattr(os, "open", exchange_then_open)
+    with pytest.raises(RSMGeometryAssetRefused) as raised:
+        install_canonical_rsm_geometry_asset(project_root=project)
+    assert exchanged
+    assert raised.value.code == "RSM_GEOMETRY_INSTALL_FAILED"
+    assert list(outside.iterdir()) == []
+    if descriptor_walk:
+        # The held directory descriptor still names the inspected (now
+        # parked) directory: the asset lands there, and only the lexical
+        # re-admission through the exchanged parent refuses.
+        assert [entry.name for entry in parked.iterdir()] == [target.name]
+        assert (parked / target.name).read_bytes() == canonical_rsm_geometry_resource_bytes()
+    else:
+        assert list(parked.iterdir()) == []
+
+
 @_open_file_replacement
 def test_rsm_installer_never_unlinks_foreign_name_race_replacement(
     tmp_path, monkeypatch

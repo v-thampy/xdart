@@ -15,6 +15,11 @@ import stat
 from types import MappingProxyType
 
 from xrd_tools.analysis.canonical_fingerprint import analysis_canonical_fingerprint
+from xrd_tools.io.descriptor_path import (
+    directory_identity,
+    leaf_created_inside,
+    unlink_empty_created_leaf,
+)
 from xrd_tools.io.stat_identity import identity_ctime_ns
 
 
@@ -1131,11 +1136,16 @@ def _install_by_name(project: str, relative: str, raw: bytes) -> None:
 
     Directories cannot be opened or fsynced here, so each ancestor is
     inspected by ``lstat`` instead and only the file itself is synced.
-    Like the descriptor walk this never unlinks a leaf it failed to fill.
+    Like the descriptor walk this never unlinks a leaf it failed to fill,
+    with one exception: a by-name open cannot pin where the leaf lands, so
+    before any byte is written the created object's final path must name
+    the inspected parent directory (``leaf_created_inside``); a leaf that
+    landed elsewhere is removed empty and the install refused.
     """
     project_parts = Path(project).parts
     relative_parts = Path(relative).parts
     current = project_parts[0]
+    value = os.lstat(current)
     for part in project_parts[1:] + relative_parts[:-1]:
         current = os.path.join(current, part)
         try:
@@ -1145,14 +1155,21 @@ def _install_by_name(project: str, relative: str, raw: bytes) -> None:
             value = os.lstat(current)
         if _is_link(value) or not stat.S_ISDIR(value.st_mode):
             raise OSError("geometry ancestry is not a plain directory")
+    parent_identity = directory_identity(value)
     leaf = os.path.join(current, relative_parts[-1])
     descriptor = os.open(
         leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NAMED_LEAF_FLAGS, 0o644
     )
     try:
-        _write_asset(descriptor, raw)
+        created = directory_identity(os.fstat(descriptor))
+        placed = leaf_created_inside(descriptor, parent_identity)
+        if placed:
+            _write_asset(descriptor, raw)
     finally:
         os.close(descriptor)
+    if not placed:
+        unlink_empty_created_leaf(leaf, created)
+        raise OSError("geometry asset was created outside its inspected directory")
 
 
 def install_canonical_rsm_geometry_asset(

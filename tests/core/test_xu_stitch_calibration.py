@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import xrd_tools.analysis.xu_stitch_calibration as xu_module
 from xrd_tools.analysis.xu_stitch_calibration import (
     CANONICAL_XU_STITCH_CALIBRATION_LOCATOR,
     XuStitchCalibrationInput,
@@ -68,6 +69,72 @@ def test_canonical_surface_installer_is_create_only_and_idempotent(tmp_path):
         install_canonical_xu_stitch_calibration(project_root=conflict_project)
     assert raised.value.code == "XU_CALIBRATION_INSTALL_CONFLICT"
     assert conflict_target.read_bytes() == b"foreign"
+
+
+def test_by_name_installer_installs_readmits_and_conflicts_like_the_descriptor_walk(
+    tmp_path, monkeypatch,
+):
+    """The no-dir_fd installer (Windows' only one) on any host."""
+    monkeypatch.setattr(xu_module, "_DESCRIPTOR_WALK", False)
+    project = tmp_path / "project"
+    project.mkdir()
+    first = install_canonical_xu_stitch_calibration(project_root=project)
+    target = project / CANONICAL_XU_STITCH_CALIBRATION_LOCATOR
+    assert target.read_bytes() == canonical_surface_resource_bytes()
+    second = install_canonical_xu_stitch_calibration(project_root=project)
+    assert second.fingerprint == first.fingerprint
+    assert second.file_state == first.file_state
+
+
+def _descriptor_walk_modes(module):
+    modes = [pytest.param(False, id="by_name")]
+    if module._DESCRIPTOR_WALK:
+        modes.insert(0, pytest.param(True, id="descriptor"))
+    return modes
+
+
+@pytest.mark.parametrize("descriptor_walk", _descriptor_walk_modes(xu_module))
+def test_installer_never_writes_outside_after_a_parent_exchange(
+    tmp_path, monkeypatch, descriptor_walk,
+):
+    """Codex PR #1 review, F2: a parent directory exchanged for a symbolic
+    link between the ancestry inspection and the leaf open must not land
+    the asset inside the link's target.  The descriptor walk cannot follow
+    it; the by-name walk reads the created leaf's final path and refuses,
+    removing the misplaced empty leaf."""
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    target = project / CANONICAL_XU_STITCH_CALIBRATION_LOCATOR
+    target.parent.mkdir(parents=True)
+    parked = target.parent.with_name(target.parent.name + "-parked")
+    real_open = os.open
+    exchanged = False
+
+    def exchange_then_open(path, flags, *args, **kwargs):
+        nonlocal exchanged
+        if not exchanged and flags & os.O_CREAT and Path(path).name == target.name:
+            exchanged = True
+            target.parent.rename(parked)
+            _symlink(target.parent, outside, directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(xu_module, "_DESCRIPTOR_WALK", descriptor_walk)
+    monkeypatch.setattr(os, "open", exchange_then_open)
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        install_canonical_xu_stitch_calibration(project_root=project)
+    assert exchanged
+    assert raised.value.code == "XU_CALIBRATION_INSTALL_FAILED"
+    assert list(outside.iterdir()) == []
+    if descriptor_walk:
+        # The held directory descriptor still names the inspected (now
+        # parked) directory: the asset lands there, and only the lexical
+        # re-admission through the exchanged parent refuses.
+        assert [entry.name for entry in parked.iterdir()] == [target.name]
+        assert (parked / target.name).read_bytes() == canonical_surface_resource_bytes()
+    else:
+        assert list(parked.iterdir()) == []
 
 
 def test_surface_projection_and_receipt_factory_claims_cannot_be_reused(tmp_path):
