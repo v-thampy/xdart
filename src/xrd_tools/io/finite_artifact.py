@@ -1751,7 +1751,14 @@ def _capture_regular(
         _comparable(_state(finished)),
         _comparable(_state(lexical_after)),
     }
-    if len(observations) != 1 or stat.S_ISLNK(lexical_after.st_mode):
+    # The two descriptor views bracket the read: exact, ctime included, so a
+    # same-size same-mtime rewrite inside the window is refused where the
+    # pathname compare is neutral (win32) rather than digested torn.
+    if (
+        len(observations) != 1
+        or _state(opened) != _state(finished)
+        or stat.S_ISLNK(lexical_after.st_mode)
+    ):
         raise FiniteArtifactIntegrityError(
             f"finite file changed during observation: {normalized}"
         )

@@ -7,9 +7,17 @@ create-to-write gap), so an identity that compares a descriptor view
 against a pathname view can never agree there.  Every such comparison in
 the tree routes its ctime slot through :func:`identity_ctime_ns`: exact on
 POSIX, where ctime still catches a same-size same-mtime in-place edit, and
-neutral on win32, where the content digest remains the authority for that
-case.  Receipts keep recording the observed ctime as evidence; only the
-comparison slot is neutral.
+neutral on win32.
+
+A comparison with a DESCRIPTOR view on both sides (two ``fstat`` views of
+one open file, or a descriptor view against a receipt that recorded one)
+never goes through the seam: it keeps the raw ctime on every platform,
+because win32 fills the handle's ``st_ctime`` from NTFS ChangeTime, which
+every write and every ``utime`` advance.  That is what lets the stat-only
+revalidators hand out a recorded digest without rereading the bytes and
+lets a hash bracketed by two descriptor views refuse a same-size
+same-mtime rewrite inside its window, on win32 too.  Receipts therefore
+always record the descriptor's observed ctime, never a pathname stat's.
 """
 
 from __future__ import annotations

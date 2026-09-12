@@ -720,7 +720,12 @@ def _capture_target(target: str, *, hash_content: bool = True) -> TargetSnapshot
         _stat_identity(finished),
         _stat_identity(after),
     }
-    if len(identities) != 1:
+    # The two descriptor views bracket the hash: exact, ctime included, so a
+    # same-size same-mtime rewrite inside the window is refused where the
+    # pathname compare is neutral (win32) rather than digested torn.
+    if len(identities) != 1 or (
+        _descriptor_identity(opened) != _descriptor_identity(finished)
+    ):
         raise TargetChanged(f"target mutated while fingerprinting {target}")
     # The four views agree on identity; the descriptor's closing view is the
     # recorded one (identical to ``after`` wherever ctime is part of
@@ -964,8 +969,11 @@ def _descriptor_content_receipt(
     else:
         digest = _require_evidence_digest(evidence_digest)
     after = os.fstat(descriptor)
+    # Two descriptor views bracketing the hash: exact, ctime included.  The
+    # caller's expected identity was normalised to the seamed form above and
+    # stays a seamed compare.
     if (
-        _stat_identity(before) != _stat_identity(after)
+        _descriptor_identity(before) != _descriptor_identity(after)
         or (
             expected_stat is not None
             and _stat_identity(after) != expected_stat

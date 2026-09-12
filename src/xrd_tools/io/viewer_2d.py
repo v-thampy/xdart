@@ -461,8 +461,10 @@ def _digest_file(path):
         return _descriptor_revision(path, stream).sha256
 
 
-def _revision(path, sha256, info=None):
-    info = path.stat() if info is None else info
+def _revision(path, sha256, info):
+    # ``info`` is the DESCRIPTOR view that closed the hash: its ctime is the
+    # exact revalidation slot (NTFS ChangeTime on win32), which a pathname
+    # ``stat`` could not supply there.
     return Viewer2DRevision(
         str(path), int(info.st_dev), int(info.st_ino), int(info.st_size),
         int(info.st_mtime_ns), int(info.st_ctime_ns), sha256,
@@ -571,7 +573,10 @@ def _descriptor_revision(path, stream, sha256=None):
         pathname = path.stat()
     except OSError:
         _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "viewer source is no longer readable")
-    if _stat_identity(before) != _stat_identity(after) or (
+    # The two descriptor views bracket the hash: exact, ctime included, so a
+    # same-size same-mtime rewrite inside the window is refused where the
+    # pathname compare is neutral (win32) rather than digested torn.
+    if _exact_stat(before) != _exact_stat(after) or (
             _stat_identity(after) != _stat_identity(pathname)):
         _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "viewer descriptor or path changed")
     return _revision(path, sha256, after)

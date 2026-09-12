@@ -2101,6 +2101,54 @@ def test_win32_identity_descriptor_fence_refuses_a_same_size_same_mtime_rewrite(
     assert calls == [str(path.resolve())]
 
 
+@pytest.mark.parametrize("shape", ("posix", "win32"))
+def test_descriptor_revision_refuses_a_same_size_same_mtime_rewrite_inside_the_hash_window(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime, shape,
+):
+    """``_descriptor_revision`` brackets its hash with two descriptor views
+    held to each other exactly, ctime included: a rewrite that keeps size and
+    mtime inside that window is refused rather than digested torn, also where
+    the pathname compare is neutral (Codex PR #1 addendum, Fix 1 acceptance)."""
+    path = tmp_path / "plain.csv"
+    path.write_bytes(b"1,2\n3,4\n")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", shape == "posix")
+    if shape == "win32":
+        win32_pathname_ctime(path)
+    log = []
+
+    class _RewritingStream:
+        """The open stream, rewriting the file in place (same size, same
+        mtime) before the first block is read."""
+
+        def __init__(self, stream):
+            self._stream = stream
+
+        def __getattr__(self, name):
+            return getattr(self._stream, name)
+
+        def read(self, size=-1):
+            if not log:
+                opened = os.fstat(self._stream.fileno())
+                before = os.stat(path)
+                path.write_bytes(b"5,6\n7,8\n")
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+                rewritten = os.fstat(self._stream.fileno())
+                assert (rewritten.st_size, rewritten.st_mtime_ns) == (
+                    opened.st_size, opened.st_mtime_ns,
+                )
+                log.append((opened.st_ctime_ns, rewritten.st_ctime_ns))
+            return self._stream.read(size)
+
+    with path.open("rb", buffering=0) as stream:
+        _assert_changed(api._descriptor_revision, path, _RewritingStream(stream))
+    # Precondition of the row: the rewrite happened inside the window and
+    # only the descriptor's change time moved.
+    [(opened_ctime_ns, rewritten_ctime_ns)] = log
+    assert rewritten_ctime_ns != opened_ctime_ns
+    # The now-quiet file still certifies under either shape.
+    assert api._stable_revision(path).sha256 == hashlib.sha256(b"5,6\n7,8\n").hexdigest()
+
+
 def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
     tmp_path, monkeypatch, ctime_seam,
 ):

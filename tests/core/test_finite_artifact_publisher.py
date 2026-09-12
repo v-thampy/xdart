@@ -2553,6 +2553,53 @@ def test_win32_identity_refuses_a_same_size_same_mtime_rewrite_after_admission(
         finite_module._require_source(admission)
 
 
+@pytest.mark.parametrize("shape", ("posix", "win32"))
+def test_capture_refuses_a_same_size_same_mtime_rewrite_inside_the_read_window(
+    tmp_path: Path, monkeypatch, ctime_seam, win32_pathname_ctime, shape: str,
+) -> None:
+    """``_capture_regular`` brackets its read with two descriptor views held
+    to each other exactly, ctime included: a rewrite that keeps size and mtime
+    inside that window is refused rather than digested torn, also where the
+    pathname compare is neutral (Codex PR #1 addendum, Fix 1 acceptance)."""
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"finite")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", shape == "posix")
+    if shape == "win32":
+        win32_pathname_ctime(source)
+    log: list[tuple[int, int]] = []
+
+    class _RewritingOs:
+        """The module's ``os`` with a ``read`` that rewrites the file in place
+        (same size, same mtime) before the first block is read."""
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def read(self, descriptor, size):
+            if not log:
+                opened = os.fstat(descriptor)
+                before = os.stat(source)
+                source.write_bytes(b"FINITE")
+                os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+                rewritten = os.fstat(descriptor)
+                assert (rewritten.st_size, rewritten.st_mtime_ns) == (
+                    opened.st_size, opened.st_mtime_ns,
+                )
+                log.append((opened.st_ctime_ns, rewritten.st_ctime_ns))
+            return os.read(descriptor, size)
+
+    monkeypatch.setattr(finite_module, "os", _RewritingOs())
+    with pytest.raises(FiniteArtifactIntegrityError, match="changed during observation"):
+        capture_finite_source(source)
+    # Precondition of the row: the rewrite happened inside the window and
+    # only the descriptor's change time moved.
+    [(opened_ctime_ns, rewritten_ctime_ns)] = log
+    assert rewritten_ctime_ns != opened_ctime_ns
+    # The now-quiet file still captures under either shape.
+    monkeypatch.setattr(finite_module, "os", os)
+    assert capture_finite_source(source).snapshot.digest == hashlib.sha256(b"FINITE").hexdigest()
+
+
 def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
     tmp_path: Path, monkeypatch, ctime_seam,
 ) -> None:

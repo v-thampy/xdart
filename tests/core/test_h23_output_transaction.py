@@ -716,6 +716,79 @@ def test_win32_identity_target_snapshot_revalidation_refuses_a_same_size_same_mt
         api.revalidate_target_snapshot(target, snapshot)
 
 
+def _stat_shape(api, monkeypatch: pytest.MonkeyPatch, target: Path, shape: str) -> None:
+    """Put the seam and the pathname stat of *target* into *shape*: ``posix``
+    (ctime is identity, one ctime per file) or ``win32`` (ctime is neutral for
+    a pathname compare, and the pathname stat reports the creation time)."""
+    monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", shape == "posix")
+    if shape == "win32":
+        _pathname_stat_reports_creation_time(api, monkeypatch, target)
+
+
+def _rewrite_inside_the_hash(api, monkeypatch: pytest.MonkeyPatch, target: Path, payload: bytes):
+    """Make the module's own hash helper rewrite *target* in place (same size,
+    same mtime) before it hashes: the mutation lands between the two descriptor
+    views that bracket the read.  Returns the (opened ctime, rewritten ctime)
+    log so a row can assert the change time really moved."""
+    real_hash = api._sha256_handle
+    log: list[tuple[int, int]] = []
+
+    def rewrite_then_hash(handle):
+        opened_ctime_ns = os.fstat(handle.fileno()).st_ctime_ns
+        rewritten = _rewrite_keeping_size_and_mtime(target, payload)
+        log.append((opened_ctime_ns, rewritten.st_ctime_ns))
+        return real_hash(handle)
+
+    monkeypatch.setattr(api, "_sha256_handle", rewrite_then_hash)
+    return log
+
+
+@pytest.mark.parametrize("shape", ("posix", "win32"))
+def test_capture_refuses_a_same_size_same_mtime_rewrite_inside_the_hash_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    """``_capture_target`` brackets its hash with two descriptor views held to
+    each other exactly, ctime included: a rewrite that keeps size and mtime
+    inside that window is refused rather than digested torn, also where the
+    pathname compare is neutral (Codex PR #1 addendum, Fix 1 acceptance)."""
+    api = _api()
+    target = tmp_path / "scan.nexus"
+    target.write_bytes(b"AAAA")
+    _stat_shape(api, monkeypatch, target, shape)
+    real_hash = api._sha256_handle
+    log = _rewrite_inside_the_hash(api, monkeypatch, target, b"BBBB")
+    with pytest.raises(api.TargetChanged, match="mutated while fingerprinting"):
+        api.capture_target_snapshot(target)
+    # Precondition of the row: the rewrite happened inside the window and
+    # only the descriptor's change time moved.
+    [(opened_ctime_ns, rewritten_ctime_ns)] = log
+    assert rewritten_ctime_ns != opened_ctime_ns
+    # The now-quiet file still captures under either shape.
+    monkeypatch.setattr(api, "_sha256_handle", real_hash)
+    assert api.capture_target_snapshot(target).digest == hashlib.sha256(b"BBBB").hexdigest()
+
+
+@pytest.mark.parametrize("shape", ("posix", "win32"))
+def test_terminal_seal_refuses_a_same_size_same_mtime_rewrite_inside_the_hash_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    """The stream-terminal seal hashes between two descriptor views of the
+    target; those are held to each other exactly, ctime included."""
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, shape)
+    log = _rewrite_inside_the_hash(api, monkeypatch, target, b"BBBB")
+    with pytest.raises(api.TargetChanged, match="stream-terminal mutated while sealing descriptor"):
+        transaction.seal_stream_terminal(attempt, lease=lease)
+    [(opened_ctime_ns, rewritten_ctime_ns)] = log
+    assert rewritten_ctime_ns != opened_ctime_ns
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
 def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
