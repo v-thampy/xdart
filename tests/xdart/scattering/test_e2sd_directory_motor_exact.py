@@ -541,7 +541,7 @@ def _collision_target(tmp_path: Path) -> Path:
     """
 
     processed = tmp_path / "processed"
-    processed.mkdir()
+    processed.mkdir(exist_ok=True)
     target = processed / "scan_0001_int2d.nexus"
     with h5py.File(target, "w") as handle:
         handle.create_group("entry").create_group("data").create_dataset(
@@ -637,6 +637,178 @@ def test_deferred_directory_soft_chain_rejects_external_target(
         hidden = handle.create_group("hidden")
         hidden["raw"] = h5py.ExternalLink(str(target), "/entry/data/data")
     _expect_jit_collision(tmp_path, raw, request=RequestId(725))
+
+
+def _write_member_linking_container(raw: Path, member_name: str) -> None:
+    """scan_0002.nxs whose data lives in a sibling member file (still landing)."""
+
+    with h5py.File(raw / "scan_0002.nxs", "w") as handle:
+        data = handle.create_group("entry").create_group("data")
+        data["pixels"] = h5py.ExternalLink(member_name, "/entry/data/data")
+
+
+def test_deferred_directory_rejects_hard_link_to_admitted_target(
+    tmp_path: Path,
+) -> None:
+    """A hard link carries no target spelling; only stat identity sees it."""
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    write_motor_container(raw / "scan_0001.nxs")
+    target = _collision_target(tmp_path)
+    os.link(target, raw / "scan_0002_data.h5")
+    _write_member_linking_container(raw, "scan_0002_data.h5")
+    _expect_jit_collision(tmp_path, raw, request=RequestId(741))
+
+
+def test_deferred_directory_rejects_hard_link_to_target_written_after_admission(
+    tmp_path: Path,
+) -> None:
+    """The residual the admission-time identity set cannot see.
+
+    scan_0001's output does not exist at admission, so no identity is
+    frozen for it; the run writes it, and only then does a raw member land
+    as a hard link to that output.  The lexical and realpath keys cannot
+    see a hard link and the frozen identity set never held one, so the
+    member's link count is the only remaining signal.
+    """
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    write_motor_container(raw / "scan_0001.nxs")
+    _write_member_linking_container(raw, "scan_0002_data.h5")
+    processed = tmp_path / "processed"
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    source = DirectorySourceSpec(raw, suffixes=(".nxs",))
+    snapshot = RunIntentStore(RunIntent(
+        source_spec=source,
+        poni_file=str(poni),
+        save_path=str(processed),
+        output_mode="Overwrite",
+    )).snapshot()
+    request = RequestId(742)
+    sessions: list[DirectoryIndexSession] = []
+    receipt = prepare_output(
+        StartCapture(
+            request,
+            1,
+            snapshot,
+            SourceCapture(request, 1, source),
+        ),
+        cancelled=lambda: False,
+        session_owner=sessions.append,
+    )
+    session = sessions[0]
+    try:
+        deferred = receipt.deferred_directory
+        assert deferred is not None
+        assert not any(
+            type(entry.fact.target_state) is tuple for entry in deferred.entries
+        )
+        validate_admitted_receipt(receipt, session)
+        entries = {
+            entry.candidates[0].path.name: entry for entry in deferred.entries
+        }
+        decision, ready, skipped = materialize_deferred_output(
+            receipt,
+            session,
+            entries["scan_0001.nxs"],
+            cancelled=lambda: False,
+        )
+        assert decision is not None
+        assert (ready, skipped) == (1, 0)
+        # The run has written scan_0001's output; the member now lands as a
+        # hard link to it.
+        target = _collision_target(tmp_path)
+        assert target == entries["scan_0001.nxs"].target
+        os.link(target, raw / "scan_0002_data.h5")
+        with pytest.raises(
+            OutputCollisionError,
+            match="same file as a raw directory input",
+        ):
+            materialize_deferred_output(
+                receipt,
+                session,
+                entries["scan_0002.nxs"],
+                cancelled=lambda: False,
+            )
+    finally:
+        session.close()
+
+
+def test_owns_target_scans_current_identities_only_for_multiply_linked_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The residual is closed without a once-per-run inventory.
+
+    A single-linked dependency (every ordinary raw file) is settled by its
+    own stat; only a dependency with more than one link pays a stat per
+    target, and a hard link to an output written after admission is then
+    found through the targets' current identities.
+    """
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    write_motor_container(raw / "scan_0001.nxs")
+    write_motor_container(raw / "scan_0002.nxs")
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    source = DirectorySourceSpec(raw, suffixes=(".nxs",))
+    snapshot = RunIntentStore(RunIntent(
+        source_spec=source,
+        poni_file=str(poni),
+        save_path=str(tmp_path / "processed"),
+        output_mode="Overwrite",
+    )).snapshot()
+    request = RequestId(743)
+    sessions: list[DirectoryIndexSession] = []
+    receipt = prepare_output(
+        StartCapture(
+            request,
+            1,
+            snapshot,
+            SourceCapture(request, 1, source),
+        ),
+        cancelled=lambda: False,
+        session_owner=sessions.append,
+    )
+    sessions[0].close()
+    plan = receipt.deferred_directory
+    assert plan is not None
+    targets = set(plan.targets)
+    assert len(targets) == 2
+    real_stat = os.stat
+    stats: list[Path] = []
+
+    def counting_stat(path, *args, **kwargs):
+        stats.append(Path(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", counting_stat)
+
+    single = raw / "scan_0001.nxs"
+    assert plan.owns_target(single) is False
+    assert stats == [single]
+
+    # Multiply linked, but to another raw file: the targets are consulted
+    # and none matches.
+    twin = raw / "scan_0001_twin.nxs"
+    os.link(single, twin)
+    stats.clear()
+    assert plan.owns_target(twin) is False
+    assert stats[0] == twin and set(stats[1:]) == targets
+
+    # Multiply linked to an output the run wrote after admission.
+    written = next(iter(targets))
+    written.parent.mkdir(exist_ok=True)
+    written.write_bytes(b"processed")
+    landed = raw / "scan_0003_data.h5"
+    os.link(written, landed)
+    stats.clear()
+    assert plan.owns_target(landed) is True
+    assert stats[0] == landed and set(stats[1:]) <= targets
 
 
 def test_indirect_instrument_precedence_forces_complete_dependency_proof(

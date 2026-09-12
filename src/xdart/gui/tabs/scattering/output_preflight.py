@@ -281,21 +281,36 @@ class DeferredDirectoryPlan:
         """True when *path* is one of this run's output targets.
 
         Lexical (normcase/abspath) and resolved (realpath) keys catch the
-        plain and symlinked spellings; the stat identity catches a hard link
-        to a target that already existed at admission.
+        plain and symlinked spellings.  A hard link is only visible through
+        stat identity: the admission-time identities cover targets that
+        already existed then, and a dependency carrying more than one link
+        is compared against the targets' *current* identities, so a link
+        made after admission to an output this run has since written is
+        refused as well.  A single-linked dependency (the normal case) is
+        settled by its own stat alone.
         """
         if (
             _lexical_key(path) in self._target_keys
             or os.path.normcase(os.path.realpath(path)) in self._target_keys
         ):
             return True
-        if not self._target_identities:
-            return False
         try:
             state = os.stat(path)
         except OSError:
             return False
-        return (int(state.st_dev), int(state.st_ino)) in self._target_identities
+        identity = (int(state.st_dev), int(state.st_ino))
+        if identity in self._target_identities:
+            return True
+        if int(state.st_nlink) < 2:
+            return False
+        for entry in self.entries:
+            try:
+                current = os.stat(entry.target)
+            except OSError:
+                continue
+            if (int(current.st_dev), int(current.st_ino)) == identity:
+                return True
+        return False
 
 
 @dataclass(frozen=True, slots=True)
