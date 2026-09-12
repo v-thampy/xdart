@@ -372,10 +372,17 @@ def test_delayed_frame_event_routes_its_exact_artifact_key(
         page._drain_executor()
 
         # Cold cross-artifact hydration keeps the outgoing plot until the exact
-        # replacement is ready; event acceptance alone is not a paint receipt.
+        # replacement is ready; event acceptance alone is not a paint receipt,
+        # and neither is selector acceptance: the status follows the selection
+        # on every apply, the title only once the replacement presentation
+        # lands, so a slow host can show the new status under the old title.
         _wait(
             qapp,
-            lambda: shell.scientific.frame_selector.currentData() is delayed,
+            lambda: (
+                shell.scientific.frame_selector.currentData() is delayed
+                and shell.scientific.title.text()
+                == shell.scientific.status.text()
+            ),
             page=page,
             lifecycle=_lifecycle,
         )
