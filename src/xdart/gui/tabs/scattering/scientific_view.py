@@ -320,6 +320,7 @@ class ScientificView(QtWidgets.QFrame):
         self._align_cake_seq = 0
         self._align_curve_pending = False
         self._align_cake_pending = False
+        self._reflow_follows = 0
         self._share_cake_handler = self._on_cake_xrange_changed
         self._share_curve_handler = self._on_curve_xrange_changed
         layout = QtWidgets.QVBoxLayout(self)
@@ -2215,6 +2216,8 @@ class ScientificView(QtWidgets.QFrame):
                 or prior_contract is None
                 or prior_contract[0] != data_contract
             )
+            if data_changed:
+                self._reflow_follows = 0
             if item is None:
                 pen = pg.mkPen(
                     color=style_contract,
@@ -3003,11 +3006,25 @@ class ScientificView(QtWidgets.QFrame):
         self.cake.canvas.image_win.installEventFilter(self)
         self.curve.installEventFilter(self)
         self.waterfall.canvas.image_win.installEventFilter(self)
+        # An AxisItem sizes itself lazily at paint, so a tick-label re-flow
+        # moves a view box without any widget Resize/Show, splitter move or
+        # resizeEvent: follow the view boxes themselves.  The scheduler
+        # coalesces and budgets these follows (see _schedule_curve_under_cake).
+        for view_box in (
+            self.cake.canvas.imageViewBox,
+            self.curve.getPlotItem().getViewBox(),
+            self.waterfall.canvas.imageViewBox,
+        ):
+            view_box.sigResized.connect(self._on_share_view_resized)
 
     def _on_share_geometry_changed(self, *_args) -> None:
         self._layout_viewer_loading_snapshot()
         if self._share_link_on:
             self._schedule_curve_under_cake()
+
+    def _on_share_view_resized(self, *_args) -> None:
+        if self._share_link_on:
+            self._schedule_curve_under_cake(from_reflow=True)
 
     def eventFilter(self, watched, event) -> bool:
         if watched in {
@@ -3057,13 +3074,24 @@ class ScientificView(QtWidgets.QFrame):
         if self._share_link_on:
             self._schedule_curve_under_cake()
 
-    def _schedule_curve_under_cake(self) -> None:
+    def _schedule_curve_under_cake(self, *, from_reflow: bool = False) -> None:
         # Coalesce onto the first pending pair instead of restarting a
         # trailing-edge debounce.  The event-loop callback makes progress
         # during a resize/show storm; the bounded follow-up observes the final
         # pyqtgraph layout after axes and color bars settle.
         if self._align_curve_pending:
             return
+        if from_reflow:
+            # A clipped-to-view curve autoranges Y over the visible samples,
+            # so an align can move the tick-label width, which moves the
+            # align: when no fixed point exists this would ping-pong forever.
+            # Budget the axis-driven follows between real triggers (a widget
+            # event, an X-range change, the link, new curve data).
+            if self._reflow_follows >= _MAX_REFLOW_FOLLOWS:
+                return
+            self._reflow_follows += 1
+        else:
+            self._reflow_follows = 0
         self._align_curve_pending = True
         sequence = self._align_seq + 1
         self._align_seq = sequence
@@ -3346,6 +3374,9 @@ _TRACE_COLORS = (
     (23, 190, 207),
 )
 _MAX_RETAINED_CURVE_ITEMS = 32
+# Axis-re-flow-driven share-link follows allowed between real triggers: a
+# legitimate chain is two (the follow's own Y autorange may re-flow once).
+_MAX_REFLOW_FOLLOWS = 3
 
 
 __all__ = ["ScientificView"]

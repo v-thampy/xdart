@@ -7,7 +7,10 @@ import pyqtgraph as pg
 import pytest
 from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
-from xdart.gui.tabs.scattering.scientific_view import ScientificView
+from xdart.gui.tabs.scattering.scientific_view import (
+    _MAX_REFLOW_FOLLOWS,
+    ScientificView,
+)
 from xdart.gui.tabs.scattering.shell_values import (
     BrowseTraceSnapshot,
     FrameNavigationProjection,
@@ -62,6 +65,65 @@ def _assert_shared_pixels_align(
             f"curve_span={view._global_xspan(bottom_widget, bottom_view)} "
             f"curve_range={_x_range(bottom_view)}"
         )
+
+
+def _shared_pixel_errors(
+    view: ScientificView,
+    *values: float,
+) -> tuple[int, ...]:
+    cake_view = view.cake.canvas.imageViewBox
+    bottom_widget, bottom_view = view._active_bottom_plot()
+    return tuple(
+        _global_data_x(view.cake.canvas.image_win, cake_view, value)
+        - _global_data_x(bottom_widget, bottom_view, value)
+        for value in values
+    )
+
+
+def _wait_until(predicate, timeout_ms: int = 3000) -> None:
+    deadline = QtCore.QDeadlineTimer(timeout_ms)
+    while not predicate() and not deadline.hasExpired():
+        QtTest.QTest.qWait(20)
+
+
+def _wait_quiet(counter, quiet_ms: int = 300, timeout_ms: int = 5000) -> bool:
+    # True once the counter held still for quiet_ms; a slow host only takes
+    # longer, while a ping-pong (tens of ms per step) never goes quiet.
+    deadline = QtCore.QDeadlineTimer(timeout_ms)
+    while not deadline.hasExpired():
+        seen = counter()
+        QtTest.QTest.qWait(quiet_ms)
+        if counter() == seen:
+            return True
+    return False
+
+
+def _shared_link_at_rest(view: ScientificView, *values: float) -> bool:
+    # Aligned AND no align/settle callback still pending: a pending settle
+    # would re-align on its own and mask a hook the product does not have.
+    return (
+        not view._align_curve_pending
+        and not view._align_cake_pending
+        and all(abs(error) <= 1 for error in _shared_pixel_errors(view, *values))
+    )
+
+
+class _WidgetGeometryEvents(QtCore.QObject):
+    """Counts the widget events the share-link geometry hooks react to."""
+
+    def __init__(self, owner: QtCore.QObject, widgets) -> None:
+        super().__init__(owner)
+        self.count = 0
+        for widget in widgets:
+            widget.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() in {
+            QtCore.QEvent.Type.Resize,
+            QtCore.QEvent.Type.Show,
+        }:
+            self.count += 1
+        return False
 
 
 def _dispose(view: ScientificView) -> None:
@@ -848,6 +910,122 @@ def test_share_axis_stays_exact_at_fractional_axis_widths(
         cake_view.setXRange(0.45, 2.15, padding=0.0)
         QtTest.QTest.qWait(80)
         _assert_shared_pixels_align(view, -2.5, 0.55, 1.25, 2.05, 5.5)
+    finally:
+        _dispose(view)
+
+
+@pytest.mark.parametrize("reflow", ("fixed-width", "tick-labels"))
+def test_share_axis_follows_axis_reflow_without_a_widget_resize(
+    reflow: str,
+) -> None:
+    """pyqtgraph sizes an AxisItem lazily at paint, so a tick-label re-flow
+    moves the curve's view box after the link settled — with no widget
+    Resize/Show, splitter move or resizeEvent for the widget hooks to see.
+    The link must follow the view box itself."""
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    view = ScientificView()
+    projection = make_shell_projection(
+        frame_count=5,
+        selected_index=0,
+        heavy_indices=(0, 4),
+        plot_mode="Single",
+    )
+    scientific = replace(projection.scientific, share_axis=True)
+    view.resize(1200, 800)
+    view.show()
+    try:
+        _reconcile(view, scientific, projection.navigation)
+        app.processEvents()
+        _wait_until(lambda: _shared_link_at_rest(view, 0.5, 1.5, 2.5))
+        _assert_shared_pixels_align(view, 0.5, 1.5, 2.5)
+        assert not view._align_curve_pending
+
+        plot_item = view.curve.getPlotItem()
+        left_axis = plot_item.getAxis("left")
+        curve_view = plot_item.getViewBox()
+        width_before = float(left_axis.width())
+        widget_events = _WidgetGeometryEvents(view, (
+            view.cake.canvas.image_win,
+            view.curve,
+            view.waterfall.canvas.image_win,
+        ))
+        view_resizes: list[None] = []
+        curve_view.sigResized.connect(lambda *_args: view_resizes.append(None))
+        # Start from the fresh follow epoch any real trigger leaves behind.
+        view._reflow_follows = 0
+        if reflow == "fixed-width":
+            left_axis.setWidth(width_before + 3.0)
+        else:
+            # Tick strings wider than the autoranged ones re-flow the axis
+            # at its next paint; the link's own Y autorange narrows them
+            # again afterwards, a second lazy re-flow the link must follow.
+            curve_view.setYRange(-123456.0, 123456.0, padding=0.0)
+        _wait_until(lambda: bool(view_resizes))
+        assert view_resizes, "the axis re-flow never resized the view box"
+
+        _wait_until(lambda: _shared_link_at_rest(view, 0.5, 1.5, 2.5))
+        _assert_shared_pixels_align(view, 0.5, 1.5, 2.5)
+        assert not view._align_curve_pending
+        assert widget_events.count == 0
+        if reflow == "fixed-width":
+            assert float(left_axis.width()) == width_before + 3.0
+    finally:
+        _dispose(view)
+
+
+def test_share_axis_reflow_follow_is_bounded_without_a_fixed_point() -> None:
+    """A clipped-to-view curve autoranges Y over what the align leaves
+    visible, so the align can move the axis width that moves the align.
+    When the two never agree the axis-driven follows must stop on their own,
+    and a real trigger must re-arm them."""
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    view = ScientificView()
+    projection = make_shell_projection(
+        frame_count=5,
+        selected_index=0,
+        heavy_indices=(0, 4),
+        plot_mode="Single",
+    )
+    scientific = replace(projection.scientific, share_axis=True)
+    view.resize(1200, 800)
+    view.show()
+    try:
+        _reconcile(view, scientific, projection.navigation)
+        app.processEvents()
+        _wait_until(lambda: _shared_link_at_rest(view, 0.5, 1.5, 2.5))
+        assert not view._align_curve_pending
+
+        left_axis = view.curve.getPlotItem().getAxis("left")
+        width_before = float(left_axis.width())
+        aligns: list[None] = []
+        original_align = view._align_curve_under_cake
+
+        def align_then_reflow() -> None:
+            # Every align re-flows the axis: the pathological no-fixed-point
+            # case, with the width flipping between two values.
+            aligns.append(None)
+            original_align()
+            left_axis.setWidth(
+                width_before + (0.0 if len(aligns) % 2 else 3.0)
+            )
+
+        view._align_curve_under_cake = align_then_reflow
+        # Start from the fresh follow epoch any real trigger leaves behind.
+        view._reflow_follows = 0
+        left_axis.setWidth(width_before + 3.0)
+        quiet = _wait_quiet(lambda: len(aligns))
+        settled = len(aligns)
+        assert aligns, "the axis re-flow was never followed"
+        assert quiet, f"axis-driven follows never stopped: {settled} aligns"
+        assert settled <= 2 * _MAX_REFLOW_FOLLOWS, settled
+        assert not view._align_curve_pending
+
+        # A real trigger (here a widget resize) re-arms the follows.
+        view.resize(1210, 800)
+        _wait_until(lambda: len(aligns) > settled)
+        assert len(aligns) > settled
     finally:
         _dispose(view)
 
