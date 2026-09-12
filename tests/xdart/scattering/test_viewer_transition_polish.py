@@ -10,6 +10,52 @@ from test_viewer_1d_selection import viewer as viewer_1d, _ready, _mode
 from test_viewer_2d_navigation import viewer as viewer_2d, _wait
 
 
+def _rect(value):
+    return tuple(value.getRect())
+
+
+def _canvas_geometry(view):
+    """Layout facts of the grabbed canvas: is the 2D row still collapsing?"""
+    canvas = view.raw.canvas
+    return dict(
+        canvas=_rect(canvas.geometry()), canvas_visible=canvas.isVisible(),
+        image_win=_rect(canvas.image_win.geometry()),
+        viewbox=_rect(canvas.imageViewBox.geometry()),
+        vertical_splitter=view.vertical_splitter.sizes(),
+        image_splitter=view.image_splitter.sizes(),
+    )
+
+
+def _probe_loading_grab(monkeypatch, view):
+    """Record what the loading snapshot saw at grab time.
+
+    The 2D-row snapshot is grabbed synchronously inside the transition and
+    the image buffers are cleared right after it, so nothing about the
+    grab-time canvas (its geometry, whether an image was still present) can
+    be recovered by the time an assertion runs.  One nightly run in seven
+    produced a uniform snapshot (`assert 1 > 1`); these facts discriminate a
+    pre-settle collapsed canvas from an unlaid child or a stale overlay
+    without changing when anything happens.
+    """
+    facts = {}
+    canvas = view.raw.canvas
+    real_grab = canvas.grab
+
+    def probed_grab(*args, **kwargs):
+        facts.update(_canvas_geometry(view))
+        facts.update(
+            image_none=view.raw.image.image is None,
+            qimage_none=view.raw.image.qimage is None,
+            levels=view.raw.image.levels,
+        )
+        pixmap = real_grab(*args, **kwargs)
+        facts["pixmap"] = (pixmap.width(), pixmap.height())
+        return pixmap
+
+    monkeypatch.setattr(canvas, "grab", probed_grab)
+    return facts
+
+
 class _HideEvents(QtCore.QObject):
     def __init__(self, widget):
         super().__init__(widget)
@@ -55,6 +101,7 @@ def test_new_hdf_file_has_no_teardown_or_zero_one_range(viewer_2d, monkeypatch, 
         return read(*args, **kwargs)
 
     monkeypatch.setattr(transport, "read_viewer_2d_frame", gated_read)
+    grab_facts = _probe_loading_grab(monkeypatch, view)
     hidden = _HideEvents(view.image_splitter)
     plot = view.raw.canvas.imageViewBox
     plot.setRange(xRange=(3, 10), yRange=(2, 8), padding=0)
@@ -64,11 +111,13 @@ def test_new_hdf_file_has_no_teardown_or_zero_one_range(viewer_2d, monkeypatch, 
     plot.sigRangeChanged.connect(lambda *_: ranges.append(tuple(plot.viewRange()[0])))
     image_id = id(view.raw.image)
     try:
+        before_open = _canvas_geometry(view)
         page._open_viewer_2d_path(str(paths[1]))
         _wait(page, app, entered.is_set)
         print("VIEWER_TRANSITION", dict(mode="2D", hidden=hidden.events,
               ranges=ranges, target=tuple(plot.targetRect().getRect()),
-              levels=view.raw.image.levels))
+              levels=view.raw.image.levels, before_open=before_open,
+              grab=grab_facts, settled=_canvas_geometry(view)))
         assert not hidden.events
         assert plot.targetRect() == target
         assert not any(np.allclose(bounds, (0, 1)) for bounds in ranges)
@@ -87,8 +136,17 @@ def test_new_hdf_file_has_no_teardown_or_zero_one_range(viewer_2d, monkeypatch, 
         snapshot = view._viewer_loading_pixmap.pixmap().toImage()
         sample_x = (0, snapshot.width() // 2, snapshot.width() - 1)
         sample_y = (0, snapshot.height() // 2, snapshot.height() - 1)
-        assert len({snapshot.pixelColor(x, y).rgba()
-                    for x in sample_x for y in sample_y}) > 1
+        colours = {(x, y): f"{snapshot.pixelColor(x, y).rgba():08x}"
+                   for x in sample_x for y in sample_y}
+        assert len(set(colours.values())) > 1, (
+            "uniform loading snapshot\n"
+            f"  colours={colours}\n"
+            f"  before_open={before_open}\n"
+            f"  grab={grab_facts}\n"
+            f"  settled={_canvas_geometry(view)}\n"
+            f"  loading_mode={view._viewer_loading_mode!r} "
+            f"overlay={_rect(view._viewer_loading_overlay.geometry())}"
+        )
         release.set()
         if read_fails:
             _wait(page, app, lambda: not page._context_controller.viewer_2d_loading)

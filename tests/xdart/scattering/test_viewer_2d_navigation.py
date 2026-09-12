@@ -28,6 +28,33 @@ def _wait(page, qapp, predicate):
     raise AssertionError("real viewer did not settle")
 
 
+def _canvas_layout(page):
+    view = page._shell.scientific
+    canvas = view.raw.canvas
+    return (canvas.mapTo(view, QtCore.QPoint()).toTuple(), canvas.size().toTuple(),
+            tuple(view.vertical_splitter.sizes()), tuple(view.image_splitter.sizes()))
+
+
+def _settle_2d_layout(page, qapp):
+    """Return only once the 2D Viewer rows are laid out around the canvas.
+
+    Installing the first frame posts the LayoutRequest that hands the canvas
+    row its height; `_wait` checks its predicate straight after the drain, so
+    the fixture can hand back a page whose canvas is still the pre-settle
+    strip (629x88 here, 629x68 on the Linux runners).  A test that then opens
+    the next file synchronously grabs that strip as the loading snapshot.
+    """
+    seen = []
+
+    def settled():
+        seen.append(_canvas_layout(page))
+        sizes = page._shell.scientific.vertical_splitter.sizes()
+        return (len(seen) >= 2 and seen[-1] == seen[-2]
+                and sizes[0] > 0 and sizes[1] == 0)
+
+    _wait(page, qapp, settled)
+
+
 @pytest.fixture
 def viewer(tmp_path):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -53,6 +80,7 @@ def viewer(tmp_path):
         and page._shell.scientific._viewer_2d_payload is not None
         and page._shell.browser.scans.count() == 4
     ))
+    _settle_2d_layout(page, app)
     try:
         yield page, app, paths, values
     finally:
