@@ -34,6 +34,7 @@ from xrd_tools.io.output_path import (
     resolve_finite_output_target,
 )
 from xrd_tools.io.output_safety import paths_same_file
+from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.io.output_transaction import (
     StreamTerminal,
     capture_target_snapshot,
@@ -362,13 +363,13 @@ class FinitePredecessorReceipt:
                     terminal.device,
                     terminal.inode,
                     terminal.mtime_ns,
-                    terminal.ctime_ns,
+                    identity_ctime_ns(terminal.ctime_ns),
                 )
                 != (
                     snapshot.device,
                     snapshot.inode,
                     snapshot.mtime_ns,
-                    snapshot.ctime_ns,
+                    identity_ctime_ns(snapshot.ctime_ns),
                 )
             ):
                 raise ValueError("finite predecessor terminal does not match source")
@@ -1645,6 +1646,19 @@ def _state(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
     )
 
 
+def _comparable(
+    state: tuple[int, int, int, int, int, int],
+) -> tuple[int, int, int, int, int, int]:
+    """*state* with its ctime slot on the win32 seam.
+
+    Every identity check here compares a descriptor view of a file with a
+    pathname view, and on win32 the two report different ctimes for one
+    untouched file (change time vs creation time).  Snapshots keep the
+    observed ctime; only comparisons go through this.
+    """
+    return (*state[:5], identity_ctime_ns(state[5]))
+
+
 def _entry_stat(
     normalized: str,
     parent_descriptor: int | None,
@@ -1730,16 +1744,18 @@ def _capture_regular(
             f"finite file disappeared: {normalized}"
         ) from error
     observations = {
-        _state(lexical_before),
-        _state(opened),
-        _state(finished),
-        _state(lexical_after),
+        _comparable(_state(lexical_before)),
+        _comparable(_state(opened)),
+        _comparable(_state(finished)),
+        _comparable(_state(lexical_after)),
     }
     if len(observations) != 1 or stat.S_ISLNK(lexical_after.st_mode):
         raise FiniteArtifactIntegrityError(
             f"finite file changed during observation: {normalized}"
         )
-    return observations.pop(), None if digest is None else digest.hexdigest()
+    # The four views agree on identity; the descriptor's closing view is the
+    # recorded one (the same tuple wherever ctime is part of identity).
+    return _state(finished), None if digest is None else digest.hexdigest()
 
 
 def _snapshot_from_capture(
@@ -1793,19 +1809,20 @@ def _same_object(left: FiniteFileSnapshot, right: FiniteFileSnapshot) -> bool:
 
 
 def _snapshot_state(snapshot: FiniteFileSnapshot) -> tuple[int, int, int, int, int, int]:
+    """The comparable identity of *snapshot* (ctime on the win32 seam)."""
     return (
         snapshot.device,
         snapshot.inode,
         snapshot.mode,
         snapshot.size,
         snapshot.mtime_ns,
-        snapshot.ctime_ns,
+        identity_ctime_ns(snapshot.ctime_ns),
     )
 
 
 def _observe_regular(path: Path | str) -> tuple[int, int, int, int, int, int]:
     state, _digest_value = _capture_regular(path, hash_content=False)
-    return state
+    return _comparable(state)
 
 
 def _observe_regular_at(
@@ -1819,7 +1836,7 @@ def _observe_regular_at(
         name=name,
         hash_content=False,
     )
-    return state
+    return _comparable(state)
 
 
 def _try_observe(path: Path | str) -> tuple[int, int, int, int, int, int] | None:
@@ -2599,7 +2616,7 @@ class FiniteArtifactPublisher:
             # A closed reservation's inode can be reused after substitution.
             # Nothing has written this candidate yet, so its full reservation
             # state must still match before truncation or cleanup is allowed.
-            if _state(opened_target) != _snapshot_state(reservation):
+            if _comparable(_state(opened_target)) != _snapshot_state(reservation):
                 raise _FiniteCandidateOwnershipLost(
                     "finite seed descriptor identity changed"
                 )
@@ -2728,7 +2745,12 @@ class FiniteArtifactPublisher:
                 before != after
                 or terminal.target != str(path)
                 or terminal.size != after[3]
-                or (terminal.device, terminal.inode, terminal.mtime_ns, terminal.ctime_ns)
+                or (
+                    terminal.device,
+                    terminal.inode,
+                    terminal.mtime_ns,
+                    identity_ctime_ns(terminal.ctime_ns),
+                )
                 != (after[0], after[1], after[4], after[5])
                 or expected is not None
                 and (

@@ -2022,3 +2022,71 @@ def test_suffix_set_is_closed_and_viewer_only(tmp_path):
     assert ".npy" not in image.SUPPORTED_EXTS
     assert ".npz" not in image.SUPPORTED_EXTS
     assert "xrd_tools.io.viewer_2d" in sys.modules
+
+
+# ---------------------------------------------------------------------------
+# The Windows stat shape (PR #1 2026-09-11): pathname ctime = creation time,
+# descriptor ctime = change time.  ``_descriptor_revision`` fences fstat
+# against the pathname stat and ``_cert_stat_revision`` fences the recorded
+# revision against both; the seam is the only reason they agree on win32.
+# ---------------------------------------------------------------------------
+
+
+def test_win32_pathname_ctime_shape_is_refused_while_ctime_is_identity(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime,
+):
+    path = tmp_path / "plain.csv"
+    path.write_bytes(b"1,2\n3,4\n")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", True)
+    win32_pathname_ctime(path)
+    caught = _raises(api.Viewer2DReadError, api.catalog_viewer_2d, path)
+    assert caught.code is api.Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED
+
+
+def test_win32_identity_catalogs_reads_and_certifies_the_pathname_ctime_shape(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime,
+):
+    path = tmp_path / "plain.csv"
+    path.write_bytes(b"1,2\n3,4\n")
+    with path.open("rb") as handle:
+        handle_ctime_ns = os.fstat(handle.fileno()).st_ctime_ns
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    gap_ns = win32_pathname_ctime(path)
+    assert os.stat(path).st_ctime_ns == handle_ctime_ns - gap_ns
+    catalog = api.catalog_viewer_2d(path)
+    # The recorded revision keeps the descriptor's observed ctime ...
+    assert catalog.primary_revision.ctime_ns == handle_ctime_ns
+    frame = api.read_viewer_2d_frame(catalog, 0)
+    _assert_canonical(frame, [[1, 2], [3, 4]])
+    # ... and both fences accept the file under either view.
+    with path.open("rb", buffering=0) as stream:
+        api._cert_stat_revision(catalog.primary_revision, stream=stream, message="unused")
+    assert api._path_stat(path) == api._revision_stat(catalog.primary_revision)
+    assert api._revision_stat(catalog.primary_revision)[4] == 0
+
+
+def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
+    tmp_path, monkeypatch, ctime_seam,
+):
+    path = tmp_path / "plain.csv"
+    path.write_bytes(b"1,2\n3,4\n")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    real_stat = os.stat
+
+    class _Shifted:
+        def __init__(self, real):
+            self._real = real
+            self.st_mtime_ns = real.st_mtime_ns - 1
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def shifted_stat(target, *args, **kwargs):
+        result = real_stat(target, *args, **kwargs)
+        if isinstance(target, (str, os.PathLike)) and os.path.abspath(target) == str(path):
+            return _Shifted(result)
+        return result
+
+    monkeypatch.setattr(os, "stat", shifted_stat)
+    caught = _raises(api.Viewer2DReadError, api.catalog_viewer_2d, path)
+    assert caught.code is api.Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED

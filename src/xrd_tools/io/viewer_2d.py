@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 from xrd_tools.core.staging import total_physical_ram_bytes as _physical_ram_bytes
+from xrd_tools.io.stat_identity import identity_ctime_ns
 
 SUPPORTED_VIEWER_SUFFIXES = frozenset({
     ".edf", ".tif", ".tiff", ".cbf", ".img", ".mar3450", ".raw",
@@ -473,9 +474,19 @@ _REVISION_STAT_FIELDS = (
 )
 
 
+def _stat_identity(info):
+    """Comparable stat tuple of one view (descriptor or pathname).
+
+    The recorded revision keeps the observed ctime; every compare between a
+    descriptor view and a pathname view goes through the win32 ctime seam.
+    """
+    return (int(info.st_dev), int(info.st_ino), int(info.st_size),
+            int(info.st_mtime_ns), identity_ctime_ns(info.st_ctime_ns))
+
+
 def _revision_stat(revision):
     return (revision.device, revision.inode, revision.size,
-            revision.mtime_ns, revision.ctime_ns)
+            revision.mtime_ns, identity_ctime_ns(revision.ctime_ns))
 
 
 def _path_stat(path):
@@ -484,7 +495,7 @@ def _path_stat(path):
     except OSError:
         _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
                 "viewer source is no longer readable")
-    return tuple(int(getattr(info, name)) for name in _REVISION_STAT_FIELDS)
+    return _stat_identity(info)
 
 
 def _recertify_drift(revision, message):
@@ -517,9 +528,7 @@ def _cert_stat_revision(revision, *, stream=None, message):
             info = os.fstat(stream.fileno())
         except (OSError, ValueError):
             _recertify_drift(revision, message)
-        descriptor = tuple(
-            int(getattr(info, name)) for name in _REVISION_STAT_FIELDS
-        )
+        descriptor = _stat_identity(info)
     try:
         pathname = _path_stat(Path(revision.canonical_path))
     except Viewer2DReadError:
@@ -542,9 +551,8 @@ def _descriptor_revision(path, stream, sha256=None):
         pathname = path.stat()
     except OSError:
         _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "viewer source is no longer readable")
-    if any(getattr(before, key) != getattr(after, key)
-           or getattr(after, key) != getattr(pathname, key)
-           for key in _REVISION_STAT_FIELDS):
+    if _stat_identity(before) != _stat_identity(after) or (
+            _stat_identity(after) != _stat_identity(pathname)):
         _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "viewer descriptor or path changed")
     return _revision(path, sha256, after)
 
@@ -2168,11 +2176,14 @@ def _read_frame(catalog, label, policy, walk):
             opened = _revision(path, catalog.primary_revision.sha256,
                                os.fstat(stream.fileno()))
             try:
-                pathname = _revision(path, catalog.primary_revision.sha256)
+                # A pathname view against the descriptor-recorded catalog
+                # revision: comparable only through the win32 ctime seam.
+                pathname = _stat_identity(path.stat())
             except OSError:
                 _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
                         "CSV source is no longer readable")
-            if opened != catalog.primary_revision or pathname != catalog.primary_revision:
+            if (opened != catalog.primary_revision
+                    or pathname != _revision_stat(catalog.primary_revision)):
                 _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
                         "CSV descriptor does not match catalog")
             first_shape, first_digest = _csv_scan(stream)

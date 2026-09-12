@@ -13,6 +13,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
+from xrd_tools.io.stat_identity import identity_ctime_ns
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -128,7 +130,8 @@ def _metadata_path_revision(
         return None
     return (
         int(state.st_mode), int(state.st_dev), int(state.st_ino),
-        int(state.st_size), int(state.st_mtime_ns), int(state.st_ctime_ns),
+        int(state.st_size), int(state.st_mtime_ns),
+        identity_ctime_ns(state.st_ctime_ns),
     )
 
 
@@ -513,9 +516,12 @@ def _bounded_metadata_snapshot(
     if len(payload) > limit:
         raise MetadataInputTooLarge(f"metadata input exceeds {limit} bytes: {path}")
     if _with_revision:
+        # A descriptor view: comparable with the pathname revisions above
+        # only through the win32 ctime seam.
         return payload, (
             int(after.st_mode), int(after.st_dev), int(after.st_ino),
-            int(after.st_size), int(after.st_mtime_ns), int(after.st_ctime_ns),
+            int(after.st_size), int(after.st_mtime_ns),
+            identity_ctime_ns(after.st_ctime_ns),
         )
     return payload
 

@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image, ImageMode, UnidentifiedImageError
 from fabio.TiffIO import TiffIO; from fabio.tifimage import TifImage
 from xrd_tools.io.image import load_mask, read_image
+from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.integrate.calibration import load_detector_calibration
 from .contracts import SourceFileState
 from .events import detached_exception_strings
@@ -874,8 +875,8 @@ def _tighten_qualified(path: Path, proof, matcher: Callable = _matches) -> None:
     if type(nofollow) is not int or not hasattr(os, "fchmod"): raise OSError("descriptor-bound mode tightening is unavailable")
     fd = os.open(path, os.O_RDONLY | nofollow)
     try:
-        before = os.fstat(fd); observed = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-        expected = (proof.state.device, proof.state.inode, proof.state.size, proof.state.mtime_ns, proof.state.ctime_ns)
+        before = os.fstat(fd); observed = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, identity_ctime_ns(before.st_ctime_ns))
+        expected = (proof.state.device, proof.state.inode, proof.state.size, proof.state.mtime_ns, identity_ctime_ns(proof.state.ctime_ns))
         if not stat.S_ISREG(before.st_mode) or observed != expected: raise ValueError("qualified asset identity changed before mode tightening")
         os.fchmod(fd, 0o600); after = os.fstat(fd)
         if (not stat.S_ISREG(after.st_mode) or stat.S_IMODE(after.st_mode) != 0o600 or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != observed[:4]): raise OSError("qualified asset changed during mode tightening")

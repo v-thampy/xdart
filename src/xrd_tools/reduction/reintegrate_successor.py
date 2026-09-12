@@ -61,6 +61,7 @@ from xrd_tools.io.output_transaction import (
 )
 from xrd_tools.io.output_path import artifact_family_from_source
 from xrd_tools.io.processed_scan_id import require_current_processed
+from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.io.record_writer import bind_prepared_manifest_receipt
 from xrd_tools.io.schema import PROCESSED_SCHEMA_VERSION
 from xrd_tools.reduction import reintegrate as _support
@@ -204,14 +205,14 @@ def _named_snapshot_changed(value: FiniteFileSnapshot) -> bool:
         int(observed.st_mode),
         int(observed.st_size),
         int(observed.st_mtime_ns),
-        int(observed.st_ctime_ns),
+        identity_ctime_ns(observed.st_ctime_ns),
     ) != (
         value.device,
         value.inode,
         value.mode,
         value.size,
         value.mtime_ns,
-        value.ctime_ns,
+        identity_ctime_ns(value.ctime_ns),
     )
 
 
@@ -237,13 +238,13 @@ def _exact_terminal_for_snapshot(
             terminal.device,
             terminal.inode,
             terminal.mtime_ns,
-            terminal.ctime_ns,
+            identity_ctime_ns(terminal.ctime_ns),
         )
         == (
             snapshot.device,
             snapshot.inode,
             snapshot.mtime_ns,
-            snapshot.ctime_ns,
+            identity_ctime_ns(snapshot.ctime_ns),
         )
     ):
         return terminal
@@ -2071,16 +2072,23 @@ def _require_source_document_snapshot(document, snapshot) -> None:
         snapshot.mode,
         snapshot.size,
         snapshot.mtime_ns,
-        snapshot.ctime_ns,
+        identity_ctime_ns(snapshot.ctime_ns),
     )
     names = (
-        "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns",
+        "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns",
     )
+
+    def identity(state):
+        return (
+            *(int(getattr(state, name)) for name in names),
+            identity_ctime_ns(state.st_ctime_ns),
+        )
+
     if (
         type(descriptor) is not int
         or shown != os.path.normcase(os.path.abspath(snapshot.path))
-        or tuple(int(getattr(observed, name)) for name in names) != expected
-        or tuple(int(getattr(named, name)) for name in names) != expected
+        or identity(observed) != expected
+        or identity(named) != expected
     ):
         raise FiniteArtifactIntegrityError(
             "source expectation document changed"

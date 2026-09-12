@@ -2483,3 +2483,69 @@ def test_pre_rename_directory_collision_never_claims_publication(tmp_path):
     assert target.is_dir()
     assert not owner.published
     assert not candidate.exists()
+
+
+# ---------------------------------------------------------------------------
+# The Windows stat shape (PR #1 2026-09-11): pathname ctime = creation time,
+# descriptor ctime = change time.  ``_capture_regular`` compares four views of
+# one file (lstat, fstat, fstat, lstat); only the seam lets them agree there.
+# ---------------------------------------------------------------------------
+
+
+def test_win32_pathname_ctime_shape_is_refused_while_ctime_is_identity(
+    tmp_path: Path, monkeypatch, ctime_seam, win32_pathname_ctime,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"finite")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", True)
+    win32_pathname_ctime(source)
+    with pytest.raises(FiniteArtifactIntegrityError, match="changed during observation"):
+        capture_finite_source(source)
+
+
+def test_win32_identity_admits_the_pathname_ctime_shape_and_records_the_descriptor_view(
+    tmp_path: Path, monkeypatch, ctime_seam, win32_pathname_ctime,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"finite")
+    with source.open("rb") as handle:
+        handle_ctime_ns = os.fstat(handle.fileno()).st_ctime_ns
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    gap_ns = win32_pathname_ctime(source)
+    # The two views really disagree by the runner's gap; only the compare is neutral.
+    assert os.stat(source).st_ctime_ns == handle_ctime_ns - gap_ns
+    admission = capture_finite_source(source)
+    snapshot = admission.snapshot
+    assert snapshot.ctime_ns == handle_ctime_ns
+    assert (snapshot.size, snapshot.digest) == (6, hashlib.sha256(b"finite").hexdigest())
+    # A pathname re-observation of the same object still agrees with it ...
+    assert finite_module._observe_regular(source) == finite_module._snapshot_state(snapshot)
+    # ... and a same-size same-mtime rewrite is still caught by the digest, not ctime.
+    assert finite_module._snapshot_state(snapshot)[5] == 0
+
+
+def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
+    tmp_path: Path, monkeypatch, ctime_seam,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"finite")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    real_lstat = os.lstat
+
+    class _Shifted:
+        def __init__(self, real):
+            self._real = real
+            self.st_mtime_ns = real.st_mtime_ns - 1
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def shifted_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if isinstance(path, (str, os.PathLike)) and os.path.abspath(path) == str(source):
+            return _Shifted(result)
+        return result
+
+    monkeypatch.setattr(os, "lstat", shifted_lstat)
+    with pytest.raises(FiniteArtifactIntegrityError, match="changed during observation"):
+        capture_finite_source(source)

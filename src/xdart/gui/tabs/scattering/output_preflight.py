@@ -27,6 +27,7 @@ from xrd_tools.io.output_safety import (
 )
 from xrd_tools.session.intent_store import RunIntentSnapshot
 from xrd_tools.session.run_configuration import FrozenRunConfiguration, RunIntent
+from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.sources.adapters import candidate_owner, get_adapter
 from xrd_tools.sources.descriptor import ContainerDescriptor
 from xrd_tools.sources.discover import Candidate
@@ -2085,13 +2086,14 @@ def _scientific_mask_file_limit(
 def _asset_state(path: Path) -> tuple[int, ...]:
     state = path.stat()
     return (
-        state.st_size, state.st_mtime_ns, state.st_ctime_ns,
+        state.st_size, state.st_mtime_ns, identity_ctime_ns(state.st_ctime_ns),
         state.st_dev, state.st_ino,
     )
 def _asset_descriptor_state(stream: object) -> tuple[int, ...]:
+    # Compared against the pathname view above: ctime on the win32 seam.
     state = os.fstat(stream.fileno())
     return (
-        state.st_size, state.st_mtime_ns, state.st_ctime_ns,
+        state.st_size, state.st_mtime_ns, identity_ctime_ns(state.st_ctime_ns),
         state.st_dev, state.st_ino,
     )
 def _stream_asset(

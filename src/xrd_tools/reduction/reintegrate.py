@@ -1,4 +1,4 @@
-from __future__ import annotations; import hashlib, json, math, os, tempfile, threading, time; from bisect import bisect_right; from collections.abc import Mapping; from contextlib import contextmanager; from dataclasses import dataclass, fields; from pathlib import Path, PurePosixPath; from types import MappingProxyType, SimpleNamespace; from typing import Any, Literal, NamedTuple; from xrd_tools.io.append import _replacement_hard_group, decode_replacement_lineage, science_fingerprint; from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot, capture_target_snapshot, revalidate_stream_terminal, stream_terminal_object_revision; from xrd_tools.session.policy import FlushPolicy, SessionPolicy, SessionResourceAllocation, SessionResourceRequirements, requirements_from, resolve_session_policy
+from __future__ import annotations; import hashlib, json, math, os, tempfile, threading, time; from bisect import bisect_right; from collections.abc import Mapping; from contextlib import contextmanager; from dataclasses import dataclass, fields; from pathlib import Path, PurePosixPath; from types import MappingProxyType, SimpleNamespace; from typing import Any, Literal, NamedTuple; from xrd_tools.io.append import _replacement_hard_group, decode_replacement_lineage, science_fingerprint; from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot, capture_target_snapshot, revalidate_stream_terminal, stream_terminal_object_revision; from xrd_tools.io.stat_identity import identity_ctime_ns; from xrd_tools.session.policy import FlushPolicy, SessionPolicy, SessionResourceAllocation, SessionResourceRequirements, requirements_from, resolve_session_policy
 _REQUESTS = {"workers", "reduction_inflight", "queue_depth", "owner_block_bytes", "staging_items", "record_heavy_items", "publication_heavy_items", "thumbnail_items", "record_items", "publication_items"}
 # Keep headless replacement admission aligned with the GUI's 256 MiB decoded
 # scientific-mask ceiling without importing GUI policy into xrd_tools.  Both
@@ -1202,13 +1202,8 @@ def _descriptor_revision(descriptor, admitted):
         raise ValueError("REPLACEMENT_SOURCE_REVISION_CHANGED") from error
     _reject(
         type(descriptor) is not int
-        or (
-            int(observed.st_size),
-            int(observed.st_mtime_ns),
-            int(observed.st_ctime_ns),
-            int(observed.st_dev),
-            int(observed.st_ino),
-        ) != tuple(int(value) for value in admitted[3][1:]),
+        or _target_stat_revision(observed)
+        != _comparable_revision(admitted[3][1:]),
         "REPLACEMENT_SOURCE_REVISION_CHANGED",
     )
     return admitted[3]
@@ -1428,7 +1423,7 @@ def _immutable_nonhdf_source(path, revisions, token):
     admitted = revisions.get(raw)
     _reject(admitted is None, "REPLACEMENT_SOURCE_REVISION_CHANGED")
     observed = admitted[3]
-    expected = tuple(int(value) for value in observed[1:])
+    expected = _comparable_revision(observed[1:])
     _event(token)
     try:
         source = Path(path).open("rb")
@@ -1436,10 +1431,7 @@ def _immutable_nonhdf_source(path, revisions, token):
         raise ValueError("REPLACEMENT_SOURCE_REVISION_CHANGED") from error
     try:
         before = os.fstat(source.fileno())
-        opened = (
-            int(before.st_size), int(before.st_mtime_ns),
-            int(before.st_ctime_ns), int(before.st_dev), int(before.st_ino),
-        )
+        opened = _target_stat_revision(before)
         _reject(opened != expected, "REPLACEMENT_SOURCE_REVISION_CHANGED")
         with tempfile.TemporaryDirectory(prefix="xdart-reintegrate-source-") as root:
             snapshot = Path(root) / Path(path).name
@@ -1453,10 +1445,7 @@ def _immutable_nonhdf_source(path, revisions, token):
                     copied += len(payload)
                 _reject(bool(source.read(1)), "REPLACEMENT_SOURCE_REVISION_CHANGED")
             after = os.fstat(source.fileno())
-            closed = (
-                int(after.st_size), int(after.st_mtime_ns),
-                int(after.st_ctime_ns), int(after.st_dev), int(after.st_ino),
-            )
+            closed = _target_stat_revision(after)
             _reject(closed != expected, "REPLACEMENT_SOURCE_REVISION_CHANGED")
             _event(token)
             yield snapshot
@@ -2042,13 +2031,24 @@ def _scrub_frame(frame): frame.image = frame.background = frame.geometry = frame
 
 
 def _target_stat_revision(value):
+    """Comparable ``(size, mtime_ns, ctime_ns, dev, ino)`` of one stat view.
+
+    Descriptor and pathname views are compared with each other here, so the
+    ctime slot goes through the win32 seam; the admitted revisions keep the
+    observed ctime and are lifted with :func:`_comparable_revision`.
+    """
     return (
         int(value.st_size),
         int(value.st_mtime_ns),
-        int(value.st_ctime_ns),
+        identity_ctime_ns(value.st_ctime_ns),
         int(value.st_dev),
         int(value.st_ino),
     )
+
+
+def _comparable_revision(value):
+    size, mtime_ns, ctime_ns, device, inode = (int(item) for item in value)
+    return (size, mtime_ns, identity_ctime_ns(ctime_ns), device, inode)
 
 
 def _target_object_revision(target: Path, snapshot: TargetSnapshot):

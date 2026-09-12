@@ -35,6 +35,7 @@ from xrd_tools.io.output_transaction import (
 )
 from xrd_tools.io.finite_artifact import _FinitePublicationSession
 from xrd_tools.io.output_safety import check_output_not_source
+from xrd_tools.io.stat_identity import identity_ctime_ns
 
 
 ANALYSIS_SCHEMA_ATTR = "ssrl_schema"
@@ -1500,12 +1501,13 @@ def _require_bounded_values(
 
 
 def _stat_revision(state: os.stat_result) -> tuple[int, int, int, int, int]:
+    """Comparable identity of one stat view (descriptor or pathname)."""
     return (
         int(state.st_dev),
         int(state.st_ino),
         int(state.st_size),
         int(state.st_mtime_ns),
-        int(state.st_ctime_ns),
+        identity_ctime_ns(state.st_ctime_ns),
     )
 
 

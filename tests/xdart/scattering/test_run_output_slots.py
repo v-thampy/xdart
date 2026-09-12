@@ -207,3 +207,50 @@ def test_a_name_that_cannot_be_a_family_is_refused_before_the_run(tmp_path):
     for stem in ("scan12", "Sample A 001", "2026_beamtime_sampleA_gi_0p15deg_0001"):
         configuration = _configuration("Int 1D", str(tmp_path / f"{stem}.nexus"))
         assert _run_artifact_family(configuration, "unused") == stem
+
+
+# ---------------------------------------------------------------------------
+# The Windows stat shape (PR #1 2026-09-11): pathname ctime = creation time,
+# descriptor ctime = change time.  Scientific-asset streaming fences the open
+# descriptor against the pathname stat; the seam is the only reason the two
+# agree on win32.
+# ---------------------------------------------------------------------------
+
+
+def test_win32_pathname_ctime_shape_is_refused_while_ctime_is_identity(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime,
+):
+    from xdart.gui.tabs.scattering.output_preflight import _stream_asset
+
+    asset = tmp_path / "mask.npy"
+    asset.write_bytes(b"not a mask")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", True)
+    win32_pathname_ctime(asset)
+    with pytest.raises(ValueError, match="scientific asset changed while admitted"):
+        _stream_asset(asset, max_bytes=1 << 20)
+
+
+def test_win32_identity_streams_the_pathname_ctime_shape(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime,
+):
+    import hashlib
+    import os
+
+    from xdart.gui.tabs.scattering.output_preflight import _stream_asset
+
+    asset = tmp_path / "mask.npy"
+    asset.write_bytes(b"not a mask")
+    with asset.open("rb") as handle:
+        descriptor = os.fstat(handle.fileno())
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    gap_ns = win32_pathname_ctime(asset)
+    assert os.stat(asset).st_ctime_ns == descriptor.st_ctime_ns - gap_ns
+
+    state, digest = _stream_asset(asset, target=tmp_path / "copy.npy", max_bytes=1 << 20)
+
+    assert state == (
+        descriptor.st_size, descriptor.st_mtime_ns, 0,
+        descriptor.st_dev, descriptor.st_ino,
+    )
+    assert digest == hashlib.sha256(b"not a mask").hexdigest()
+    assert (tmp_path / "copy.npy").read_bytes() == b"not a mask"

@@ -2544,3 +2544,49 @@ def test_unbound_frame_records_and_source_base_are_refused(tmp_path):
     assert not output.snapshot.published and not output.snapshot.close_pending
     assert not output.snapshot.slot_held
     assert not Path(request.target).exists()
+
+
+# ---------------------------------------------------------------------------
+# The Windows stat shape (PR #1 2026-09-11): pathname ctime = creation time,
+# descriptor ctime = change time.  Inspection fences the opened HDF5
+# descriptor against the pathname admission stat; the seam is the only
+# reason the two agree on win32.
+# ---------------------------------------------------------------------------
+
+
+def _published_stitch_1d(tmp_path) -> AnalysisArtifactRequest:
+    request = _request(tmp_path / "stitch_1d.nexus", AnalysisArtifactKind.STITCH_1D)
+    admit_analysis_artifact(
+        request, coordinator=OutputTransactionCoordinator()
+    ).publish(_writer(request))
+    return request
+
+
+def test_win32_pathname_ctime_shape_is_refused_while_ctime_is_identity(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime,
+):
+    request = _published_stitch_1d(tmp_path)
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", True)
+    win32_pathname_ctime(request.target)
+    with pytest.raises(
+        AnalysisArtifactInvalid, match="changed while opening detached admission",
+    ):
+        inspect_analysis_artifact(request.target)
+
+
+def test_win32_identity_inspects_and_reads_the_pathname_ctime_shape(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime,
+):
+    request = _published_stitch_1d(tmp_path)
+    with open(request.target, "rb") as handle:
+        descriptor_ctime_ns = os.fstat(handle.fileno()).st_ctime_ns
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    gap_ns = win32_pathname_ctime(request.target)
+    assert os.stat(request.target).st_ctime_ns == descriptor_ctime_ns - gap_ns
+
+    inspection = inspect_analysis_artifact(request.target, expected_request=request)
+
+    assert inspection.kind is AnalysisArtifactKind.STITCH_1D
+    assert inspection.storage_revision[4] == 0
+    payload = read_analysis_artifact(request.target)
+    assert payload.inspection == inspection

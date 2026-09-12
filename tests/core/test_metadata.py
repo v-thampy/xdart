@@ -833,3 +833,54 @@ def test_read_spec_metadata_ignores_spec_beyond_two_parents(tmp_path: Path) -> N
     (tmp_path / "myscan").write_text(_SPEC_MINIMAL)  # tmp_path is 3 levels up
 
     assert read_image_metadata(image, meta_format="SPEC") == {}
+
+
+# ---------------------------------------------------------------------------
+# The Windows stat shape (PR #1 2026-09-11): pathname ctime = creation time,
+# descriptor ctime = change time.  A bounded (``max_input_bytes``) read
+# records the descriptor's revision and re-checks it against the pathname
+# revision; the seam is the only reason the two agree on win32.
+# ---------------------------------------------------------------------------
+
+
+def _win32_shape_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    image = tmp_path / "scan_0001.tif"
+    image.touch()
+    sidecar = tmp_path / "scan_0001.txt"
+    sidecar.write_text(_TXT_CONTENT)
+    return image, sidecar
+
+
+def test_win32_pathname_ctime_shape_is_refused_while_ctime_is_identity(
+    tmp_path: Path, monkeypatch, ctime_seam, win32_pathname_ctime,
+) -> None:
+    image, sidecar = _win32_shape_fixture(tmp_path)
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", True)
+    win32_pathname_ctime(sidecar)
+    with pytest.raises(OSError, match="metadata source changed during read"):
+        read_image_metadata_observed(image, meta_format="txt", max_input_bytes=1 << 20)
+
+
+def test_win32_identity_admits_the_pathname_ctime_shape(
+    tmp_path: Path, monkeypatch, ctime_seam, win32_pathname_ctime,
+) -> None:
+    import os
+
+    image, sidecar = _win32_shape_fixture(tmp_path)
+    with sidecar.open("rb") as handle:
+        descriptor = os.fstat(handle.fileno())
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    gap_ns = win32_pathname_ctime(sidecar)
+    assert os.stat(sidecar).st_ctime_ns == descriptor.st_ctime_ns - gap_ns
+
+    observed = read_image_metadata_observed(image, meta_format="txt", max_input_bytes=1 << 20)
+
+    assert observed.source_path == sidecar
+    assert observed.values["i0"] == pytest.approx(1000.0)
+    # The recorded revision is the descriptor view with its ctime slot neutral,
+    # equal to the pathname revision under the same seam.
+    assert observed.source_revision == (
+        int(descriptor.st_mode), int(descriptor.st_dev), int(descriptor.st_ino),
+        int(descriptor.st_size), int(descriptor.st_mtime_ns), 0,
+    )
+    assert observed.source_revision == metadata_module._metadata_path_revision(sidecar)

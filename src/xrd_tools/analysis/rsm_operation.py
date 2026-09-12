@@ -89,6 +89,7 @@ from xrd_tools.io.analysis_artifact import (
     read_analysis_artifact,
 )
 from xrd_tools.io.nexus import write_rsm
+from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.io.spec import get_energy, get_energy_and_UB
 from xrd_tools.rsm.gridding import (
     RSMGridChunkLease,
@@ -567,7 +568,7 @@ def _file_state(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
         value.st_ino,
         value.st_size,
         value.st_mtime_ns,
-        value.st_ctime_ns,
+        identity_ctime_ns(value.st_ctime_ns),
     )
 
 
