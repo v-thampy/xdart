@@ -47,6 +47,21 @@ FROZEN_VIEW_DIAGNOSTIC = (
 )
 
 
+def _symlink(link: Path, target: Path, *, directory: bool = False) -> None:
+    """Create *link* -> *target*; skip where the host refuses symbolic links."""
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"symbolic links unavailable here: {error}")
+
+
+# Replacing an open file by name is POSIX inode semantics; Windows refuses
+# the unlink while a handle is held, so those races cannot be staged there.
+_open_file_replacement = pytest.mark.skipif(
+    sys.platform == "win32", reason="an open file cannot be unlinked on Windows"
+)
+
+
 def _canonical_value() -> dict[str, object]:
     return json.loads(canonical_rsm_geometry_resource_bytes())
 
@@ -323,7 +338,7 @@ def test_rsm_capture_refuses_project_and_asset_symlink_ancestry(tmp_path):
     real_project.mkdir(parents=True)
     (real_project / "geometry.json").write_bytes(raw)
     alias = tmp_path / "alias"
-    alias.symlink_to(real_parent, target_is_directory=True)
+    _symlink(alias, real_parent, directory=True)
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         capture_rsm_geometry_asset(
             rsm_geometry_asset_input("geometry.json"),
@@ -336,14 +351,14 @@ def test_rsm_capture_refuses_project_and_asset_symlink_ancestry(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "geometry.json").write_bytes(raw)
-    (project / "linked").symlink_to(outside, target_is_directory=True)
+    _symlink(project / "linked", outside, directory=True)
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         capture_rsm_geometry_asset(
             rsm_geometry_asset_input("linked/geometry.json"), project_root=project
         )
     assert raised.value.code == "RSM_GEOMETRY_SYMLINK_REFUSED"
 
-    (project / "final.json").symlink_to(outside / "geometry.json")
+    _symlink(project / "final.json", outside / "geometry.json")
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         capture_rsm_geometry_asset(
             rsm_geometry_asset_input("final.json"), project_root=project
@@ -351,7 +366,18 @@ def test_rsm_capture_refuses_project_and_asset_symlink_ancestry(tmp_path):
     assert raised.value.code == "RSM_GEOMETRY_SYMLINK_REFUSED"
 
 
-@pytest.mark.parametrize("kind", ["directory", "fifo"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "directory",
+        pytest.param(
+            "fifo",
+            marks=pytest.mark.skipif(
+                not hasattr(os, "mkfifo"), reason="no named pipes here"
+            ),
+        ),
+    ],
+)
 def test_rsm_capture_refuses_nonregular_final_node(tmp_path, kind):
     project = tmp_path / "project"
     project.mkdir()
@@ -423,6 +449,7 @@ def test_rsm_capture_refuses_before_after_mutation(tmp_path, monkeypatch):
     assert raised.value.code == "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH"
 
 
+@_open_file_replacement
 def test_rsm_capture_refuses_exact_byte_inode_swap_before_open(
     tmp_path, monkeypatch
 ):
@@ -477,13 +504,14 @@ def test_rsm_installer_refuses_symlink_parent_without_outside_write(tmp_path):
     project.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
-    (project / "calibration").symlink_to(outside, target_is_directory=True)
+    _symlink(project / "calibration", outside, directory=True)
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         install_canonical_rsm_geometry_asset(project_root=project)
     assert raised.value.code == "RSM_GEOMETRY_INSTALL_FAILED"
     assert list(outside.iterdir()) == []
 
 
+@_open_file_replacement
 def test_rsm_installer_never_unlinks_foreign_name_race_replacement(
     tmp_path, monkeypatch
 ):
@@ -520,22 +548,22 @@ def test_canonical_rsm_resource_refuses_symlink_ancestry(
     resource.write_bytes(raw)
     package = tmp_path / "package"
     if linked_component == "package":
-        package.symlink_to(real_package, target_is_directory=True)
+        _symlink(package, real_package, directory=True)
     else:
         package.mkdir()
         if linked_component == "assets":
-            (package / "assets").symlink_to(
-                real_package / "assets", target_is_directory=True
-            )
+            _symlink(package / "assets", real_package / "assets", directory=True)
         elif linked_component == "rsm":
             (package / "assets").mkdir()
-            (package / "assets" / "rsm").symlink_to(
-                real_package / "assets" / "rsm", target_is_directory=True
+            _symlink(
+                package / "assets" / "rsm",
+                real_package / "assets" / "rsm",
+                directory=True,
             )
         else:
             target = package.joinpath("assets", "rsm", _RESOURCE_NAME)
             target.parent.mkdir(parents=True)
-            target.symlink_to(resource)
+            _symlink(target, resource)
     monkeypatch.setattr(
         "xrd_tools.analysis.rsm_geometry_asset.resources.files",
         lambda _package: package,
@@ -572,6 +600,7 @@ def test_canonical_rsm_resource_refuses_dotdot_package_spelling(tmp_path, monkey
     assert raised.value.code == "RSM_CANONICAL_ASSET_UNAVAILABLE"
 
 
+@_open_file_replacement
 def test_canonical_rsm_resource_refuses_exact_byte_inode_swap_before_open(
     tmp_path, monkeypatch
 ):

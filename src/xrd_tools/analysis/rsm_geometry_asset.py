@@ -10,10 +10,12 @@ import json
 import math
 import os
 from pathlib import Path
+import posixpath
 import stat
 from types import MappingProxyType
 
 from xrd_tools.analysis.canonical_fingerprint import analysis_canonical_fingerprint
+from xrd_tools.io.stat_identity import identity_ctime_ns
 
 
 _MAX_ASSET_BYTES = 65_536
@@ -274,23 +276,74 @@ def parse_rsm_geometry_asset_bytes(raw: bytes) -> RSMGeometryAssetProjection:
 
 
 def _state(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    # The ctime slot rides the tree-wide win32 seam: the descriptor and
+    # pathname views of one file this module compares disagree on it there.
     return (
         int(value.st_mode),
         int(value.st_dev),
         int(value.st_ino),
         int(value.st_size),
         int(value.st_mtime_ns),
-        int(value.st_ctime_ns),
+        identity_ctime_ns(value.st_ctime_ns),
     )
 
 
+# POSIX opens every component of the chain relative to the previous
+# descriptor with O_NOFOLLOW|O_DIRECTORY, so nothing can be swapped for a
+# link between two steps.  Windows can neither open a directory nor pass
+# dir_fd (os.supports_dir_fd is empty there and the keyword raises
+# NotImplementedError, which no OSError clause catches), so the chain is
+# inspected component by component with lstat instead -- symbolic links
+# and every other name-surrogate reparse point (junctions) refused -- the
+# leaf is opened by name and must carry the inspected leaf's identity, and
+# the same lexical chain is inspected again after the read.
+_DESCRIPTOR_WALK = (
+    os.open in getattr(os, "supports_dir_fd", frozenset())
+    and hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+)
+# IsReparseTagNameSurrogate: the reparse point stands for another path.
+_REPARSE_NAME_SURROGATE = 0x20000000
+_NAMED_LEAF_FLAGS = (
+    getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_BINARY", 0)
+    | getattr(os, "O_NOINHERIT", 0)
+)
+
+
+def _is_link(value: os.stat_result) -> bool:
+    """A symbolic link, or on Windows any junction-like reparse point."""
+    return stat.S_ISLNK(value.st_mode) or bool(
+        getattr(value, "st_reparse_tag", 0) & _REPARSE_NAME_SURROGATE
+    )
+
+
+def _exact_root(parts: tuple[str, ...]) -> bool:
+    """*parts* starts at a filesystem root: ``/`` on POSIX; ``D:\\`` or
+    ``\\\\server\\share\\`` on Windows, never a rootless drive or a
+    drive-less root."""
+    if not parts:
+        return False
+    if os.name == "nt":
+        drive, root = os.path.splitdrive(parts[0])
+        return bool(drive) and root == os.sep
+    return parts[0] == os.sep
+
+
 def _validate_exact_relative(locator: str) -> tuple[str, ...]:
+    # A locator is spelled with ``/`` on every platform (the canonical one
+    # is), so normalisation is judged on that spelling; where the host
+    # separator differs, a host-spelled or drive-qualified locator is
+    # refused rather than reinterpreted.
     if (
         type(locator) is not str
         or not locator
         or "\x00" in locator
+        or posixpath.isabs(locator)
         or os.path.isabs(locator)
-        or os.path.normpath(locator) != locator
+        or (os.sep != "/" and os.sep in locator)
+        or os.path.splitdrive(locator)[0]
+        or posixpath.normpath(locator) != locator
     ):
         raise TypeError("RSM geometry locator must be a normalized relative path")
     try:
@@ -362,12 +415,13 @@ def _project_path(project_root: str | Path) -> str:
         raise RSMGeometryAssetRefused(
             "RSM_GEOMETRY_PROJECT_INVALID", "Project path cannot be normalized"
         ) from error
-    current = os.sep
+    project_parts = Path(project).parts
+    current = project_parts[0] if project_parts else os.sep
     try:
-        for part in Path(project).parts[1:]:
+        for part in project_parts[1:]:
             current = os.path.join(current, part)
             state = os.lstat(current)
-            if stat.S_ISLNK(state.st_mode):
+            if _is_link(state):
                 _refuse(
                     "RSM_GEOMETRY_SYMLINK_REFUSED",
                     "Project ancestry traverses a symbolic link",
@@ -392,13 +446,17 @@ def _open_no_follow_chain(
 ) -> tuple[int, tuple[tuple[int, int, int, int, int, int], ...]]:
     relative_parts = _validate_exact_relative(relative)
     project_parts = Path(project).parts
+    if not _DESCRIPTOR_WALK:
+        return _open_inspected_chain(
+            project_parts, relative_parts, final_flags, final_mode
+        )
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     if final_flags is None:
         final_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptors: list[int] = []
     states: list[tuple[int, int, int, int, int, int]] = []
     try:
-        current = os.open(os.sep, directory_flags)
+        current = os.open(project_parts[0], directory_flags)
         descriptors.append(current)
         states.append(_state(os.fstat(current)))
         for part in project_parts[1:] + relative_parts[:-1]:
@@ -428,15 +486,76 @@ def _open_no_follow_chain(
     return descriptor, tuple(states)
 
 
+def _open_inspected_chain(
+    project_parts: tuple[str, ...],
+    relative_parts: tuple[str, ...],
+    final_flags: int | None,
+    final_mode: int,
+) -> tuple[int, tuple[tuple[int, int, int, int, int, int], ...]]:
+    """The no-dir_fd walk: lstat every component, open the leaf by name."""
+    flags = (os.O_RDONLY if final_flags is None else final_flags) | _NAMED_LEAF_FLAGS
+    states: list[tuple[int, int, int, int, int, int]] = []
+    current = project_parts[0]
+    inspected: os.stat_result | None = None
+    try:
+        states.append(_state(os.lstat(current)))
+        for part in project_parts[1:] + relative_parts[:-1]:
+            current = os.path.join(current, part)
+            value = os.lstat(current)
+            if _is_link(value):
+                raise OSError("ancestry component is a link")
+            if not stat.S_ISDIR(value.st_mode):
+                raise OSError("ancestry component is not a directory")
+            states.append(_state(value))
+        leaf = os.path.join(current, relative_parts[-1])
+        try:
+            inspected = os.lstat(leaf)
+        except FileNotFoundError:
+            if not flags & os.O_CREAT:
+                raise
+        if inspected is not None:
+            if _is_link(inspected):
+                raise OSError("geometry path is a link")
+            if not stat.S_ISREG(inspected.st_mode):
+                # Settled before the open: a directory cannot be opened
+                # here and a pipe would block it.  POSIX reports the same
+                # refusal from the caller's fstat.
+                _refuse("RSM_GEOMETRY_NOT_REGULAR", "geometry is not regular")
+        descriptor = os.open(leaf, flags, final_mode)
+    except FileNotFoundError as error:
+        raise RSMGeometryAssetRefused(
+            "RSM_GEOMETRY_UNAVAILABLE", "geometry path is unavailable"
+        ) from error
+    except OSError as error:
+        raise RSMGeometryAssetRefused(
+            "RSM_GEOMETRY_SYMLINK_REFUSED",
+            "geometry path cannot be opened without link traversal",
+        ) from error
+    try:
+        if inspected is None:
+            inspected = os.lstat(leaf)
+        if _state(os.fstat(descriptor)) != _state(inspected):
+            raise OSError("geometry leaf changed between inspection and open")
+    except OSError as error:
+        os.close(descriptor)
+        raise RSMGeometryAssetRefused(
+            "RSM_GEOMETRY_SYMLINK_REFUSED",
+            "geometry path cannot be opened without link traversal",
+        ) from error
+    states.append(_state(inspected))
+    return descriptor, tuple(states)
+
+
 def _lexical_chain_states(
     project: str, relative: str
 ) -> tuple[tuple[int, int, int, int, int, int], ...]:
-    states = [_state(os.lstat(os.sep))]
-    current = os.sep
-    for part in Path(project).parts[1:] + _validate_exact_relative(relative):
+    project_parts = Path(project).parts
+    states = [_state(os.lstat(project_parts[0]))]
+    current = project_parts[0]
+    for part in project_parts[1:] + _validate_exact_relative(relative):
         current = os.path.join(current, part)
         value = os.lstat(current)
-        if stat.S_ISLNK(value.st_mode):
+        if _is_link(value):
             _refuse("RSM_GEOMETRY_SYMLINK_REFUSED", "geometry ancestry changed")
         states.append(_state(value))
     return tuple(states)
@@ -490,11 +609,12 @@ def canonical_rsm_geometry_resource_bytes() -> bytes:
             raise OSError("package root is not an exact absolute path")
         package.encode("utf-8", errors="strict")
         package_parts = Path(package).parts
-        if not package_parts or package_parts[0] != os.sep or any(
+        if not _exact_root(package_parts) or any(
             part in {"", os.curdir, os.pardir} for part in package_parts[1:]
         ):
             raise OSError("package root is not canonical")
-        relative = os.path.join(*_RESOURCE_PARTS)
+        # Locators are ``/``-spelled on every platform.
+        relative = "/".join(_RESOURCE_PARTS)
         raw, _revision = _capture_exact(package, relative)
         parse_rsm_geometry_asset_bytes(raw)
         return raw
@@ -583,7 +703,9 @@ def capture_rsm_geometry_asset(
             raise ValueError
     except ValueError:
         _refuse("RSM_GEOMETRY_OUTSIDE_PROJECT", "geometry resolves outside Project")
-    resolved_relative = os.path.relpath(resolved_target, resolved_project)
+    resolved_relative = Path(
+        os.path.relpath(resolved_target, resolved_project)
+    ).as_posix()
     if resolved_relative != relative:
         _refuse("RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH", "geometry spelling changed")
     identity = (
@@ -961,6 +1083,78 @@ def rsm_effective_pixel_q_map(effective_geometry: RSMEffectiveGeometry):
     )
 
 
+def _write_asset(descriptor: int, raw: bytes) -> None:
+    view = memoryview(raw)
+    offset = 0
+    while offset < len(view):
+        written = os.write(descriptor, view[offset:])
+        if written <= 0:
+            raise OSError("geometry asset write made no progress")
+        offset += written
+    os.fsync(descriptor)
+
+
+def _install_by_descriptor(project: str, relative: str, raw: bytes) -> None:
+    """Create the asset through a dir_fd chain; never unlinks on failure."""
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    descriptors: list[int] = []
+    project_parts = Path(project).parts
+    filename = Path(relative).parts[-1]
+    try:
+        current = os.open(project_parts[0], directory_flags)
+        descriptors.append(current)
+        for part in project_parts[1:] + Path(relative).parts[:-1]:
+            try:
+                opened = os.open(part, directory_flags, dir_fd=current)
+            except FileNotFoundError:
+                os.mkdir(part, mode=0o755, dir_fd=current)
+                opened = os.open(part, directory_flags, dir_fd=current)
+            descriptors.append(opened)
+            current = opened
+        descriptor = os.open(filename, file_flags, 0o644, dir_fd=current)
+        try:
+            _write_asset(descriptor, raw)
+        finally:
+            os.close(descriptor)
+        os.fsync(current)
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _install_by_name(project: str, relative: str, raw: bytes) -> None:
+    """The no-dir_fd install: lstat-inspected ancestry, O_EXCL leaf by name.
+
+    Directories cannot be opened or fsynced here, so each ancestor is
+    inspected by ``lstat`` instead and only the file itself is synced.
+    Like the descriptor walk this never unlinks a leaf it failed to fill.
+    """
+    project_parts = Path(project).parts
+    relative_parts = Path(relative).parts
+    current = project_parts[0]
+    for part in project_parts[1:] + relative_parts[:-1]:
+        current = os.path.join(current, part)
+        try:
+            value = os.lstat(current)
+        except FileNotFoundError:
+            os.mkdir(current, mode=0o755)
+            value = os.lstat(current)
+        if _is_link(value) or not stat.S_ISDIR(value.st_mode):
+            raise OSError("geometry ancestry is not a plain directory")
+    leaf = os.path.join(current, relative_parts[-1])
+    descriptor = os.open(
+        leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NAMED_LEAF_FLAGS, 0o644
+    )
+    try:
+        _write_asset(descriptor, raw)
+    finally:
+        os.close(descriptor)
+
+
 def install_canonical_rsm_geometry_asset(
     *, project_root: str | Path
 ) -> RSMGeometryAssetReceipt:
@@ -980,34 +1174,11 @@ def install_canonical_rsm_geometry_asset(
             _refuse("RSM_GEOMETRY_INSTALL_CONFLICT", "geometry bytes conflict")
         return current
 
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptors: list[int] = []
-    filename = Path(relative).parts[-1]
     try:
-        current = os.open(os.sep, directory_flags)
-        descriptors.append(current)
-        for part in Path(project).parts[1:] + Path(relative).parts[:-1]:
-            try:
-                opened = os.open(part, directory_flags, dir_fd=current)
-            except FileNotFoundError:
-                os.mkdir(part, mode=0o755, dir_fd=current)
-                opened = os.open(part, directory_flags, dir_fd=current)
-            descriptors.append(opened)
-            current = opened
-        descriptor = os.open(filename, file_flags, 0o644, dir_fd=current)
-        try:
-            view = memoryview(raw)
-            offset = 0
-            while offset < len(view):
-                written = os.write(descriptor, view[offset:])
-                if written <= 0:
-                    raise OSError("geometry asset write made no progress")
-                offset += written
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        os.fsync(current)
+        if _DESCRIPTOR_WALK:
+            _install_by_descriptor(project, relative, raw)
+        else:
+            _install_by_name(project, relative, raw)
     except FileExistsError as error:
         raise RSMGeometryAssetRefused(
             "RSM_GEOMETRY_INSTALL_CONFLICT", "geometry destination appeared"
@@ -1016,12 +1187,6 @@ def install_canonical_rsm_geometry_asset(
         raise RSMGeometryAssetRefused(
             "RSM_GEOMETRY_INSTALL_FAILED", "geometry could not be installed"
         ) from error
-    finally:
-        for descriptor in reversed(descriptors):
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
     try:
         receipt = capture_rsm_geometry_asset(request, project_root=project)
     except RSMGeometryAssetRefused as error:

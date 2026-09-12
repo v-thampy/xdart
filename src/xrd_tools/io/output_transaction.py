@@ -21,6 +21,7 @@ import time
 from contextlib import nullcontext
 from typing import Callable, Mapping, Protocol, TypeVar, runtime_checkable
 
+from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.session import get_pool
 
 
@@ -584,19 +585,12 @@ def _require_identity(actual, expected, name: str) -> None:
         raise OwnershipRefused(f"foreign {name}; exact owner object required")
 
 
-# CPython on Windows fills ``st_ctime`` from the change time for a handle
-# ``fstat`` but from the creation time for a pathname ``stat`` (NTFS,
-# py3.13: the two views of one untouched file differ by the create-to-write
-# gap), so the descriptor and pathname identities this module compares can
-# never agree there.  Identity on win32 is (dev, ino, size, mtime_ns);
-# receipts still record the observed ctime as evidence, the comparison slot
-# is neutral, and the content digest remains the authority for a same-size
-# same-mtime in-place mutation.
-_IDENTITY_CARRIES_CTIME = sys.platform != "win32"
-
-
-def _identity_ctime_ns(ctime_ns: int) -> int:
-    return int(ctime_ns) if _IDENTITY_CARRIES_CTIME else 0
+# The descriptor and pathname identities this module compares share the
+# tree-wide win32 ctime seam (xrd_tools.io.stat_identity): identity on
+# win32 is (dev, ino, size, mtime_ns) with a neutral ctime slot, receipts
+# still record the observed ctime as evidence, and the content digest
+# remains the authority for a same-size same-mtime in-place mutation.
+_identity_ctime_ns = identity_ctime_ns
 
 
 def _comparable_identity(

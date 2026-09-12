@@ -577,6 +577,11 @@ class _CreationTimeStat:
         return getattr(self._real, name)
 
 
+def _ctime_seam():
+    """The tree-wide win32 ctime seam every identity compare routes through."""
+    return importlib.import_module("xrd_tools.io.stat_identity")
+
+
 def _pathname_stat_reports_creation_time(api, monkeypatch, target: Path):
     """Make every pathname ``os.stat`` of ``target`` disagree with ``fstat``
     on ``st_ctime_ns`` only (374 ms earlier, the gap observed on the
@@ -599,7 +604,7 @@ def test_windows_pathname_ctime_disagreement_refuses_every_seal_when_ctime_is_id
 ) -> None:
     (prepared, attempt) = _executing_stream(tmp_path)
     api, target, _coordinator, transaction, *_rest, lease = prepared
-    monkeypatch.setattr(api, "_IDENTITY_CARRIES_CTIME", True)
+    monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", True)
     _pathname_stat_reports_creation_time(api, monkeypatch, target)
     descriptor = os.open(target, os.O_RDONLY)
     try:
@@ -624,7 +629,7 @@ def test_win32_identity_ignores_ctime_and_still_seals_promotes_and_revalidates(
 ) -> None:
     (prepared, attempt) = _executing_stream(tmp_path)
     api, target, _coordinator, transaction, *_rest, lease = prepared
-    monkeypatch.setattr(api, "_IDENTITY_CARRIES_CTIME", False)
+    monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", False)
     _pathname_stat_reports_creation_time(api, monkeypatch, target)
     descriptor = os.open(target, os.O_RDONLY)
     try:
@@ -657,7 +662,7 @@ def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
 ) -> None:
     (prepared, attempt) = _executing_stream(tmp_path)
     api, target, _coordinator, transaction, *_rest, lease = prepared
-    monkeypatch.setattr(api, "_IDENTITY_CARRIES_CTIME", False)
+    monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", False)
     real_stat = api.os.stat
     resolved = os.path.realpath(target)
 

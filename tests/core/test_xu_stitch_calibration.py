@@ -24,6 +24,14 @@ EXPECTED_SHA = "57857833c56eeed0db27ec9e3f64aa635d5cd1d1e74eaed0b957eb054b3356d3
 EXPECTED_SEMANTIC = "90f3bec535ed9a21be1b9d93491e774364df5849155b9b9c1707eace848e40f8"
 
 
+def _symlink(link: Path, target: Path, *, directory: bool = False) -> None:
+    """Create *link* -> *target*; skip where the host refuses symbolic links."""
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"symbolic links unavailable here: {error}")
+
+
 def test_canonical_surface_resource_has_authenticated_exact_bytes():
     raw = canonical_surface_resource_bytes()
     projection = parse_xu_stitch_calibration_bytes(raw)
@@ -159,7 +167,7 @@ def test_surface_capture_refuses_outside_project_and_symlink(tmp_path):
     assert raised.value.code == "XU_CALIBRATION_OUTSIDE_PROJECT"
 
     linked = project / "surface.json"
-    linked.symlink_to(outside)
+    _symlink(linked, outside)
     with pytest.raises(XuStitchCalibrationRefused) as raised:
         capture_xu_stitch_calibration(
             XuStitchCalibrationInput(linked), project_root=project
@@ -172,7 +180,7 @@ def test_surface_capture_refuses_outside_project_and_symlink(tmp_path):
     real_project.mkdir(parents=True)
     real_target.write_bytes(canonical_surface_resource_bytes())
     parent_alias = tmp_path / "parent-alias"
-    parent_alias.symlink_to(real_parent, target_is_directory=True)
+    _symlink(parent_alias, real_parent, directory=True)
     with pytest.raises(XuStitchCalibrationRefused) as raised:
         capture_xu_stitch_calibration(
             XuStitchCalibrationInput("surface.json"),
@@ -186,14 +194,18 @@ def test_surface_capture_refuses_nonregular_before_read_and_normalizes_path_erro
 ):
     project = tmp_path / "project"
     project.mkdir()
-    fifo = project / "surface.fifo"
-    os.mkfifo(fifo)
-    with pytest.raises(XuStitchCalibrationRefused) as raised:
-        capture_xu_stitch_calibration(
-            XuStitchCalibrationInput("surface.fifo"),
-            project_root=project,
-        )
-    assert raised.value.code == "XU_CALIBRATION_NOT_REGULAR"
+    nonregular = ["surface.dir"]
+    (project / "surface.dir").mkdir()
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(project / "surface.fifo")
+        nonregular.append("surface.fifo")
+    for locator in nonregular:
+        with pytest.raises(XuStitchCalibrationRefused) as raised:
+            capture_xu_stitch_calibration(
+                XuStitchCalibrationInput(locator),
+                project_root=project,
+            )
+        assert raised.value.code == "XU_CALIBRATION_NOT_REGULAR", locator
 
     regular_parent = project / "regular-parent"
     regular_parent.write_bytes(b"not a directory")
@@ -215,7 +227,7 @@ def test_canonical_resource_refuses_symlink_even_when_bytes_match(
     resource.parent.mkdir(parents=True)
     real = tmp_path / "real.json"
     real.write_bytes(raw)
-    resource.symlink_to(real)
+    _symlink(resource, real)
     monkeypatch.setattr(
         "xrd_tools.analysis.xu_stitch_calibration.resources.files",
         lambda _package: package,
@@ -240,18 +252,18 @@ def test_canonical_resource_refuses_symlink_in_package_ancestry(
     resource.write_bytes(raw)
     if linked_component == "package":
         package = tmp_path / "package"
-        package.symlink_to(real_package, target_is_directory=True)
+        _symlink(package, real_package, directory=True)
     else:
         package = tmp_path / "package"
         package.mkdir()
         if linked_component == "assets":
-            (package / "assets").symlink_to(
-                real_package / "assets", target_is_directory=True
-            )
+            _symlink(package / "assets", real_package / "assets", directory=True)
         else:
             (package / "assets").mkdir()
-            (package / "assets" / "xu").symlink_to(
-                real_package / "assets" / "xu", target_is_directory=True
+            _symlink(
+                package / "assets" / "xu",
+                real_package / "assets" / "xu",
+                directory=True,
             )
     monkeypatch.setattr(
         "xrd_tools.analysis.xu_stitch_calibration.resources.files",
@@ -283,7 +295,7 @@ def test_canonical_resource_refuses_noncanonical_package_root(
     real_package = tmp_path / "package"
     real_package.mkdir()
     alias = tmp_path / "alias"
-    alias.symlink_to(real_package, target_is_directory=True)
+    _symlink(alias, real_package, directory=True)
     hostile = os.path.join(os.fspath(alias), os.pardir, real_package.name)
     monkeypatch.setattr(
         "xrd_tools.analysis.xu_stitch_calibration.resources.files",

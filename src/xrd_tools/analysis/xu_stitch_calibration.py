@@ -19,6 +19,7 @@ from collections.abc import Mapping
 from types import MappingProxyType
 
 from xrd_tools.analysis.scan_operations import analysis_canonical_fingerprint
+from xrd_tools.io.stat_identity import identity_ctime_ns
 
 
 _MAX_ASSET_BYTES = 65_536
@@ -284,8 +285,7 @@ def canonical_surface_resource_bytes() -> bytes:
         package_parts = Path(package_shown).parts
         if (
             not os.path.isabs(package_shown)
-            or not package_parts
-            or package_parts[0] != os.sep
+            or not _exact_root(package_parts)
             or any(
                 part in {"", os.curdir, os.pardir}
                 for part in package_parts[1:]
@@ -350,14 +350,59 @@ class XuStitchCalibrationInput:
 
 
 def _state(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    # The ctime slot rides the tree-wide win32 seam: the descriptor and
+    # pathname views of one file this module compares disagree on it there.
     return (
         int(value.st_mode),
         int(value.st_dev),
         int(value.st_ino),
         int(value.st_size),
         int(value.st_mtime_ns),
-        int(value.st_ctime_ns),
+        identity_ctime_ns(value.st_ctime_ns),
     )
+
+
+# POSIX opens every component of the chain relative to the previous
+# descriptor with O_NOFOLLOW|O_DIRECTORY, so nothing can be swapped for a
+# link between two steps.  Windows can neither open a directory nor pass
+# dir_fd (os.supports_dir_fd is empty there and the keyword raises
+# NotImplementedError, which no OSError clause catches), so the chain is
+# inspected component by component with lstat instead -- symbolic links
+# and every other name-surrogate reparse point (junctions) refused -- the
+# leaf is opened by name and must carry the inspected leaf's identity, and
+# the same lexical chain is inspected again after the read.
+_DESCRIPTOR_WALK = (
+    os.open in getattr(os, "supports_dir_fd", frozenset())
+    and hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+)
+# IsReparseTagNameSurrogate: the reparse point stands for another path.
+_REPARSE_NAME_SURROGATE = 0x20000000
+_LEAF_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_BINARY", 0)
+    | getattr(os, "O_NOINHERIT", 0)
+)
+
+
+def _is_link(value: os.stat_result) -> bool:
+    """A symbolic link, or on Windows any junction-like reparse point."""
+    return stat.S_ISLNK(value.st_mode) or bool(
+        getattr(value, "st_reparse_tag", 0) & _REPARSE_NAME_SURROGATE
+    )
+
+
+def _exact_root(parts: tuple[str, ...]) -> bool:
+    """*parts* starts at a filesystem root: ``/`` on POSIX; ``D:\\`` or
+    ``\\\\server\\share\\`` on Windows, never a rootless drive or a
+    drive-less root."""
+    if not parts:
+        return False
+    if os.name == "nt":
+        drive, root = os.path.splitdrive(parts[0])
+        return bool(drive) and root == os.sep
+    return parts[0] == os.sep
 
 
 def _lexical_target(
@@ -396,12 +441,13 @@ def _lexical_target(
             "XU_CALIBRATION_PROJECT_INVALID",
             "Project and calibration paths cannot be normalized",
         ) from error
-    current = os.sep
+    project_parts = Path(project).parts
+    current = project_parts[0] if project_parts else os.sep
     try:
-        for part in Path(project).parts[1:]:
+        for part in project_parts[1:]:
             current = os.path.join(current, part)
             state = os.lstat(current)
-            if stat.S_ISLNK(state.st_mode):
+            if _is_link(state):
                 _refuse(
                     "XU_CALIBRATION_SYMLINK_REFUSED",
                     "Project ancestry traverses a symbolic link",
@@ -436,7 +482,8 @@ def _lexical_target(
             "calibration locator is outside Project",
         )
     current = project
-    for part in Path(relative).parts:
+    relative_parts = Path(relative).parts
+    for index, part in enumerate(relative_parts):
         current = os.path.join(current, part)
         try:
             state = os.lstat(current)
@@ -447,14 +494,25 @@ def _lexical_target(
                 "XU_CALIBRATION_UNAVAILABLE",
                 "calibration path cannot be inspected",
             ) from error
-        if stat.S_ISLNK(state.st_mode):
+        if _is_link(state):
             _refuse(
                 "XU_CALIBRATION_SYMLINK_REFUSED",
                 "calibration path traverses a symbolic link",
             )
+        # POSIX reports a non-directory ancestor as ENOTDIR at the next
+        # step; Windows reports it as not-found, so settle it here.
+        if index < len(relative_parts) - 1 and not stat.S_ISDIR(state.st_mode):
+            _refuse(
+                "XU_CALIBRATION_UNAVAILABLE",
+                "calibration path cannot be inspected",
+            )
     resolved_project = os.path.realpath(project)
     resolved_target = os.path.realpath(target)
-    if os.path.commonpath((resolved_project, resolved_target)) != resolved_project:
+    try:
+        # Different drives have no common path on Windows.
+        if os.path.commonpath((resolved_project, resolved_target)) != resolved_project:
+            raise ValueError
+    except ValueError:
         _refuse(
             "XU_CALIBRATION_OUTSIDE_PROJECT",
             "resolved calibration locator is outside Project",
@@ -470,8 +528,7 @@ def _open_no_follow_chain(
     project_parts = Path(project).parts
     if (
         not relative_parts
-        or not project_parts
-        or project_parts[0] != os.sep
+        or not _exact_root(project_parts)
         or any(
             part in {"", os.curdir, os.pardir}
             for part in relative_parts
@@ -481,6 +538,8 @@ def _open_no_follow_chain(
             "XU_CALIBRATION_OUTSIDE_PROJECT",
             "calibration locator has an invalid lexical component",
         )
+    if not _DESCRIPTOR_WALK:
+        return _open_inspected_chain(project_parts, relative_parts)
     directory_flags = (
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
@@ -494,7 +553,7 @@ def _open_no_follow_chain(
     descriptors: list[int] = []
     states: list[tuple[int, int, int, int, int, int]] = []
     try:
-        current = os.open(os.sep, directory_flags)
+        current = os.open(project_parts[0], directory_flags)
         descriptors.append(current)
         states.append(_state(os.fstat(current)))
         for part in project_parts[1:] + relative_parts[:-1]:
@@ -528,22 +587,76 @@ def _open_no_follow_chain(
     return descriptor, tuple(states)
 
 
+def _open_inspected_chain(
+    project_parts: tuple[str, ...],
+    relative_parts: tuple[str, ...],
+) -> tuple[int, tuple[tuple[int, int, int, int, int, int], ...]]:
+    """The no-dir_fd walk: lstat every component, open the leaf by name."""
+    states: list[tuple[int, int, int, int, int, int]] = []
+    current = project_parts[0]
+    try:
+        states.append(_state(os.lstat(current)))
+        for part in project_parts[1:] + relative_parts[:-1]:
+            current = os.path.join(current, part)
+            value = os.lstat(current)
+            if _is_link(value):
+                raise OSError("calibration ancestry traverses a link")
+            if not stat.S_ISDIR(value.st_mode):
+                raise FileNotFoundError(current)
+            states.append(_state(value))
+        leaf = os.path.join(current, relative_parts[-1])
+        inspected = os.lstat(leaf)
+        if _is_link(inspected):
+            raise OSError("calibration path is a link")
+        if not stat.S_ISREG(inspected.st_mode):
+            # Settled before the open: a directory cannot be opened here
+            # and a pipe would block it.  POSIX reports the same refusal
+            # from the caller's fstat.
+            _refuse(
+                "XU_CALIBRATION_NOT_REGULAR",
+                "calibration must be a regular non-symlink file",
+            )
+        descriptor = os.open(leaf, _LEAF_FLAGS)
+    except FileNotFoundError as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_UNAVAILABLE",
+            "calibration path is unavailable",
+        ) from error
+    except OSError as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_SYMLINK_REFUSED",
+            "calibration path could not be opened without link traversal",
+        ) from error
+    try:
+        if _state(os.fstat(descriptor)) != _state(inspected):
+            raise OSError("calibration leaf changed between inspection and open")
+    except OSError as error:
+        os.close(descriptor)
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_SYMLINK_REFUSED",
+            "calibration path could not be opened without link traversal",
+        ) from error
+    states.append(_state(inspected))
+    return descriptor, tuple(states)
+
+
 def _lexical_chain_states(
     project: str,
     relative: str,
 ) -> tuple[tuple[int, int, int, int, int, int], ...]:
     states: list[tuple[int, int, int, int, int, int]] = []
-    current = os.sep
-    for part in Path(project).parts[1:] + Path(relative).parts:
+    project_parts = Path(project).parts
+    current = project_parts[0]
+    for part in project_parts[1:] + Path(relative).parts:
         current = os.path.join(current, part)
         value = os.lstat(current)
-        if stat.S_ISLNK(value.st_mode):
+        if _is_link(value):
             _refuse(
                 "XU_CALIBRATION_SYMLINK_REFUSED",
                 "calibration path changed to a symbolic link",
             )
         states.append(_state(value))
-    states.insert(0, _state(os.lstat(os.sep)))
+    states.insert(0, _state(os.lstat(project_parts[0])))
     return tuple(states)
 
 
@@ -647,7 +760,10 @@ def capture_xu_stitch_calibration(
     projection = parse_xu_stitch_calibration_bytes(raw)
     resolved_project = os.path.realpath(project)
     resolved_target = os.path.realpath(target)
-    if os.path.commonpath((resolved_project, resolved_target)) != resolved_project:
+    try:
+        if os.path.commonpath((resolved_project, resolved_target)) != resolved_project:
+            raise ValueError
+    except ValueError:
         _refuse(
             "XU_CALIBRATION_OUTSIDE_PROJECT",
             "calibration resolved outside Project after capture",
@@ -660,9 +776,13 @@ def capture_xu_stitch_calibration(
             "XU_CALIBRATION_OUTSIDE_PROJECT",
             "calibration resolved outside Project after capture",
         )
+    # Receipt paths are spelled with ``/`` on every platform so provenance
+    # and the receipt fingerprint do not depend on the host separator.
+    lexical_portable = Path(lexical_relative).as_posix()
+    resolved_portable = Path(resolved_relative).as_posix()
     receipt_projection = (
-        lexical_relative,
-        resolved_relative,
+        lexical_portable,
+        resolved_portable,
         _state(closed_state),
         projection.raw_sha256,
         projection.semantic_fingerprint,
@@ -673,8 +793,8 @@ def capture_xu_stitch_calibration(
     return XuStitchCalibrationReceipt(
         request,
         project,
-        lexical_relative,
-        resolved_relative,
+        lexical_portable,
+        resolved_portable,
         _state(closed_state),
         projection,
         fingerprint,
@@ -703,6 +823,125 @@ def revalidate_xu_stitch_calibration(
             "calibration no longer matches its receipt",
         )
     return current.content
+
+
+def _write_asset(descriptor: int, raw: bytes) -> None:
+    view = memoryview(raw)
+    offset = 0
+    while offset < len(view):
+        written = os.write(descriptor, view[offset:])
+        if written <= 0:
+            raise OSError("canonical asset write made no progress")
+        offset += written
+    os.fsync(descriptor)
+
+
+def _install_by_descriptor(project: str, relative: str, raw: bytes) -> None:
+    """Create the asset through an O_NOFOLLOW|O_DIRECTORY descriptor chain."""
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptors: list[int] = []
+    created = False
+    parent_descriptor: int | None = None
+    filename = Path(relative).parts[-1]
+    project_parts = Path(project).parts
+    try:
+        current = os.open(project_parts[0], directory_flags)
+        descriptors.append(current)
+        for part in project_parts[1:] + Path(relative).parts[:-1]:
+            try:
+                opened = os.open(part, directory_flags, dir_fd=current)
+            except FileNotFoundError:
+                os.mkdir(part, mode=0o755, dir_fd=current)
+                opened = os.open(part, directory_flags, dir_fd=current)
+            descriptors.append(opened)
+            current = opened
+        parent_descriptor = current
+        descriptor = os.open(filename, file_flags, 0o644, dir_fd=current)
+        created = True
+        try:
+            _write_asset(descriptor, raw)
+        finally:
+            os.close(descriptor)
+        os.fsync(current)
+    except FileExistsError as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_INSTALL_CONFLICT",
+            "canonical calibration destination appeared during install",
+        ) from error
+    except OSError as error:
+        if created and parent_descriptor is not None:
+            try:
+                os.unlink(filename, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_INSTALL_FAILED",
+            "canonical calibration could not be installed safely",
+        ) from error
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _install_by_name(project: str, relative: str, raw: bytes) -> None:
+    """The no-dir_fd installer: every ancestor is inspected with lstat
+    (links refused) before the leaf is created exclusively by name; only
+    the file itself is flushed, a directory has no fsync on Windows."""
+    file_flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOINHERIT", 0)
+    )
+    project_parts = Path(project).parts
+    current = project_parts[0]
+    leaf: str | None = None
+    try:
+        for part in project_parts[1:] + Path(relative).parts[:-1]:
+            current = os.path.join(current, part)
+            try:
+                value = os.lstat(current)
+            except FileNotFoundError:
+                os.mkdir(current, mode=0o755)
+                value = os.lstat(current)
+            if _is_link(value) or not stat.S_ISDIR(value.st_mode):
+                raise OSError("canonical asset ancestry is not a real directory")
+        target = os.path.join(current, Path(relative).parts[-1])
+        descriptor = os.open(target, file_flags, 0o644)
+        leaf = target
+        try:
+            _write_asset(descriptor, raw)
+        finally:
+            os.close(descriptor)
+    except FileExistsError as error:
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_INSTALL_CONFLICT",
+            "canonical calibration destination appeared during install",
+        ) from error
+    except OSError as error:
+        if leaf is not None:
+            try:
+                os.unlink(leaf)
+            except OSError:
+                pass
+        raise XuStitchCalibrationRefused(
+            "XU_CALIBRATION_INSTALL_FAILED",
+            "canonical calibration could not be installed safely",
+        ) from error
 
 
 def install_canonical_xu_stitch_calibration(
@@ -738,68 +977,10 @@ def install_canonical_xu_stitch_calibration(
             )
         return current
 
-    directory_flags = (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    file_flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    descriptors: list[int] = []
-    created = False
-    parent_descriptor: int | None = None
-    filename = Path(relative).parts[-1]
-    try:
-        current = os.open(os.sep, directory_flags)
-        descriptors.append(current)
-        for part in Path(project).parts[1:] + Path(relative).parts[:-1]:
-            try:
-                opened = os.open(part, directory_flags, dir_fd=current)
-            except FileNotFoundError:
-                os.mkdir(part, mode=0o755, dir_fd=current)
-                opened = os.open(part, directory_flags, dir_fd=current)
-            descriptors.append(opened)
-            current = opened
-        parent_descriptor = current
-        descriptor = os.open(filename, file_flags, 0o644, dir_fd=current)
-        created = True
-        try:
-            view = memoryview(raw)
-            offset = 0
-            while offset < len(view):
-                written = os.write(descriptor, view[offset:])
-                if written <= 0:
-                    raise OSError("canonical asset write made no progress")
-                offset += written
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        os.fsync(current)
-    except FileExistsError as error:
-        raise XuStitchCalibrationRefused(
-            "XU_CALIBRATION_INSTALL_CONFLICT",
-            "canonical calibration destination appeared during install",
-        ) from error
-    except OSError as error:
-        if created and parent_descriptor is not None:
-            try:
-                os.unlink(filename, dir_fd=parent_descriptor)
-            except OSError:
-                pass
-        raise XuStitchCalibrationRefused(
-            "XU_CALIBRATION_INSTALL_FAILED",
-            "canonical calibration could not be installed safely",
-        ) from error
-    finally:
-        for descriptor in reversed(descriptors):
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+    if _DESCRIPTOR_WALK:
+        _install_by_descriptor(project, relative, raw)
+    else:
+        _install_by_name(project, relative, raw)
     try:
         receipt = capture_xu_stitch_calibration(
             request,
