@@ -15,6 +15,7 @@ import hashlib
 import os
 from pathlib import Path
 import secrets
+import sys
 import threading
 import time
 from contextlib import nullcontext
@@ -583,13 +584,35 @@ def _require_identity(actual, expected, name: str) -> None:
         raise OwnershipRefused(f"foreign {name}; exact owner object required")
 
 
+# CPython on Windows fills ``st_ctime`` from the change time for a handle
+# ``fstat`` but from the creation time for a pathname ``stat`` (NTFS,
+# py3.13: the two views of one untouched file differ by the create-to-write
+# gap), so the descriptor and pathname identities this module compares can
+# never agree there.  Identity on win32 is (dev, ino, size, mtime_ns);
+# receipts still record the observed ctime as evidence, the comparison slot
+# is neutral, and the content digest remains the authority for a same-size
+# same-mtime in-place mutation.
+_IDENTITY_CARRIES_CTIME = sys.platform != "win32"
+
+
+def _identity_ctime_ns(ctime_ns: int) -> int:
+    return int(ctime_ns) if _IDENTITY_CARRIES_CTIME else 0
+
+
+def _comparable_identity(
+    identity: tuple[int, int, int, int, int],
+) -> tuple[int, int, int, int, int]:
+    """Normalise a sealed (dev, ino, size, mtime_ns, ctime_ns) for comparison."""
+    return (*identity[:4], _identity_ctime_ns(identity[4]))
+
+
 def _stat_identity(stat_result) -> tuple[int, int, int, int, int]:
     return (
         int(stat_result.st_dev),
         int(stat_result.st_ino),
         int(stat_result.st_size),
         int(stat_result.st_mtime_ns),
-        int(stat_result.st_ctime_ns),
+        _identity_ctime_ns(stat_result.st_ctime_ns),
     )
 
 
@@ -688,7 +711,7 @@ def revalidate_target_snapshot(
         return current
     expected = (
         snapshot.device, snapshot.inode, snapshot.size,
-        snapshot.mtime_ns, snapshot.ctime_ns,
+        snapshot.mtime_ns, _identity_ctime_ns(snapshot.ctime_ns),
     )
     target = os.path.realpath(os.fspath(path))
     try:
@@ -720,9 +743,10 @@ def revalidate_stream_terminal(
     target = _normalize_target(path)
     if target != terminal.target:
         raise TargetChanged("stream terminal target does not match browse path")
-    expected = stream_terminal_object_revision(terminal)
-    if expected is None:
+    revision = stream_terminal_object_revision(terminal)
+    if revision is None:
         raise TargetChanged("stream terminal lacks an exact object revision")
+    expected = _comparable_identity(revision)
     try:
         descriptor = os.open(target, os.O_RDONLY)
     except OSError as exc:
@@ -857,6 +881,8 @@ def _descriptor_content_receipt(
     """Seal exact descriptor identity, hashing unless evidence is supplied."""
     if type(durable_fsync) is not bool:
         raise TypeError("durable_fsync must be an exact bool")
+    if expected_stat is not None:
+        expected_stat = _comparable_identity(expected_stat)
     if durable_fsync:
         os.fsync(descriptor)
     before = os.fstat(descriptor)
@@ -946,6 +972,8 @@ def _descriptor_stream_stat_receipt(
     byte_count = int(evidence_bytes)
     if byte_count < 0:
         raise TransactionStateError("stream evidence byte count is negative")
+    if expected_stat is not None:
+        expected_stat = _comparable_identity(expected_stat)
     before = os.fstat(descriptor)
     if expected_stat is not None and _stat_identity(before) != expected_stat:
         raise TargetChanged(
@@ -990,13 +1018,14 @@ def _descriptor_stream_stat_receipt(
 def _stream_receipt_identity(
     receipt: _StreamStatReceipt,
 ) -> tuple[int, int, int, int, int]:
-    """The sealed (dev, ino, size, mtime_ns, ctime_ns) view of a receipt."""
+    """The sealed (dev, ino, size, mtime_ns, ctime_ns) view of a receipt,
+    normalised the way ``_stat_identity`` observes it."""
     return (
         receipt.identity.device,
         receipt.identity.inode,
         receipt.size,
         receipt.mtime_ns,
-        receipt.ctime_ns,
+        _identity_ctime_ns(receipt.ctime_ns),
     )
 
 
@@ -3125,13 +3154,7 @@ class OutputTransaction:
                 checkpoint = self._stream_checkpoint if self._fast_regenerable else None
                 if self._fast_regenerable and (
                     checkpoint is None or not self._stream_checkpoint_fresh
-                    or expected_stat != (
-                        checkpoint.identity.device,
-                        checkpoint.identity.inode,
-                        checkpoint.size,
-                        checkpoint.mtime_ns,
-                        checkpoint.ctime_ns,
-                    )
+                    or expected_stat != _stream_receipt_identity(checkpoint)
                 ):
                     raise TargetChanged("fast stream terminal lost its close checkpoint")
                 receipt = _descriptor_content_receipt(

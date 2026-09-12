@@ -565,6 +565,125 @@ def test_stream_terminal_refuses_same_length_mutation_between_receipts(
         transaction.commit_stream(attempt, lease=lease)
 
 
+class _CreationTimeStat:
+    """The Windows shape: a pathname stat whose ctime is the creation time."""
+
+    def __init__(self, real, ctime_ns: int) -> None:
+        self._real = real
+        self.st_ctime_ns = ctime_ns
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+
+def _pathname_stat_reports_creation_time(api, monkeypatch, target: Path):
+    """Make every pathname ``os.stat`` of ``target`` disagree with ``fstat``
+    on ``st_ctime_ns`` only (374 ms earlier, the gap observed on the
+    windows-latest runner), the way CPython on NTFS does."""
+    real_stat = api.os.stat
+    resolved = os.path.realpath(target)
+
+    def creation_time_stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if os.path.realpath(path) == resolved:
+            return _CreationTimeStat(result, result.st_ctime_ns - 374_000_000)
+        return result
+
+    monkeypatch.setattr(api.os, "stat", creation_time_stat)
+
+
+def test_windows_pathname_ctime_disagreement_refuses_every_seal_when_ctime_is_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    monkeypatch.setattr(api, "_IDENTITY_CARRIES_CTIME", True)
+    _pathname_stat_reports_creation_time(api, monkeypatch, target)
+    descriptor = os.open(target, os.O_RDONLY)
+    try:
+        with pytest.raises(
+            api.TargetChanged, match=r"identity changed during seal.*named=\(",
+        ):
+            transaction.seal_stream_checkpoint(
+                attempt,
+                lease=lease,
+                descriptor=descriptor,
+                evidence_digest=hashlib.sha256(b"row").hexdigest(),
+                evidence_bytes=3,
+            )
+    finally:
+        os.close(descriptor)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
+def test_win32_identity_ignores_ctime_and_still_seals_promotes_and_revalidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    monkeypatch.setattr(api, "_IDENTITY_CARRIES_CTIME", False)
+    _pathname_stat_reports_creation_time(api, monkeypatch, target)
+    descriptor = os.open(target, os.O_RDONLY)
+    try:
+        checkpoint = transaction.seal_stream_checkpoint(
+            attempt,
+            lease=lease,
+            descriptor=descriptor,
+            evidence_digest=hashlib.sha256(b"row").hexdigest(),
+            evidence_bytes=3,
+        )
+        handle_ctime_ns = os.fstat(descriptor).st_ctime_ns
+    finally:
+        os.close(descriptor)
+    # The pathname view really disagrees; only the identity slot is neutral.
+    assert api.os.stat(target).st_ctime_ns == handle_ctime_ns - 374_000_000
+    assert checkpoint.ctime_ns == handle_ctime_ns
+    transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    terminal = transaction.seal_stream_terminal(attempt, lease=lease)
+    assert terminal.ctime_ns == handle_ctime_ns
+    assert api.stream_terminal_object_revision(terminal)[4] == handle_ctime_ns
+    assert api.revalidate_stream_terminal(target, terminal).digest == (
+        hashlib.sha256(b"AAAA").hexdigest()
+    )
+    assert api._stream_stat_matches(target, transaction._stream_checkpoint)
+
+
+def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    monkeypatch.setattr(api, "_IDENTITY_CARRIES_CTIME", False)
+    real_stat = api.os.stat
+    resolved = os.path.realpath(target)
+
+    def shifted_mtime_stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if os.path.realpath(path) != resolved:
+            return result
+        shifted = _CreationTimeStat(result, result.st_ctime_ns)
+        shifted.st_mtime_ns = result.st_mtime_ns - 1
+        return shifted
+
+    monkeypatch.setattr(api.os, "stat", shifted_mtime_stat)
+    descriptor = os.open(target, os.O_RDONLY)
+    try:
+        with pytest.raises(api.TargetChanged, match="identity changed during seal"):
+            transaction.seal_stream_checkpoint(
+                attempt,
+                lease=lease,
+                descriptor=descriptor,
+                evidence_digest=hashlib.sha256(b"row").hexdigest(),
+                evidence_bytes=3,
+            )
+    finally:
+        os.close(descriptor)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
 def test_stream_terminal_constructor_failure_retains_prior_pair_and_holds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
