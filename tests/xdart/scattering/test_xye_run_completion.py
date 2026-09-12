@@ -32,6 +32,70 @@ def _wait(app, predicate, timeout=15.0):
     return False
 
 
+def _viewer_2d_probe(page, controller):
+    """One self-describing sample of everything the 2D-entry wait depends on.
+
+    The `[1D Viewer NeXus]` row timed out once in seven nightly runs with an
+    empty notice; a bare AssertionError cannot tell a never-requested load
+    from a refused one or a stalled one (two-iteration rule: probe, not a
+    wait bump).  Every read here is a plain attribute on the GUI thread.
+    """
+    owner = controller._viewer_2d
+    context_2d = controller.viewer_2d_context
+    context_1d = controller.viewer_1d_context
+    selection = controller.selection
+    current = controller.navigation.current
+    scientific = page._shell.scientific
+    return {
+        "mode": page._shell.run_controls.modeCombo.currentText(),
+        "run_timer_active": page._run_timer.isActive(),
+        "selection": None if selection is None else selection.kind.name,
+        "navigation_current": None if current is None else current.artifact,
+        "2d": {
+            "state": None if context_2d is None else context_2d.state.value,
+            "original_path": getattr(context_2d, "original_path", None),
+            "loading": controller.viewer_2d_loading,
+            "diagnostic": controller.viewer_2d_diagnostic,
+            "cleanup_pending": controller.viewer_2d_cleanup_pending,
+            "request": owner.request is not None,
+            "catalog": owner.catalog is not None,
+            "frame": owner.frame is not None,
+            "clear_request": owner.clear_request is not None,
+        },
+        "1d": {
+            "state": None if context_1d is None else context_1d.state.value,
+            "loading": controller.viewer_1d_loading,
+            "cleanup_pending": controller.viewer_1d_cleanup_pending,
+            "diagnostic": controller.viewer_1d_diagnostic,
+        },
+        "view": {
+            "loading_mode": scientific._viewer_loading_mode,
+            "payload": scientific._viewer_2d_payload is not None,
+            "status": scientific.status.text(),
+        },
+        "notice": page._notice_text,
+    }
+
+
+def _wait_2d_entry(app, page, controller, predicate, timeout=15.0):
+    """`_wait` that keeps a timeline of probe transitions for the failure message."""
+    timeline = []
+    last = None
+    start = time.monotonic()
+    deadline = start + timeout
+    while True:
+        app.processEvents()
+        sample = _viewer_2d_probe(page, controller)
+        if sample != last:
+            timeline.append((round(time.monotonic() - start, 3), sample))
+            last = sample
+        if predicate():
+            return True, timeline
+        if time.monotonic() >= deadline:
+            return False, timeline
+        time.sleep(0.005)
+
+
 @pytest.mark.parametrize("outgoing", ("Int 1D", "Int 1D (XYE)", "1D Viewer", "1D Viewer NeXus"))
 def test_completed_run_selected_artifact_enters_2d_viewer(tmp_path, outgoing):
     from xdart.modules.display_context import ContextKind
@@ -96,8 +160,12 @@ def test_completed_run_selected_artifact_enters_2d_viewer(tmp_path, outgoing):
                 artifacts=(artifact,)))
             assert controller.selection.kind is ContextKind.ACQUISITION
         page._shell.run_controls.modeCombo.setCurrentText("2D Viewer")
-        assert _wait(app, lambda: controller.viewer_2d_frame is not None
-                     and page._shell.scientific._viewer_2d_payload is not None), page._notice_text
+        entered, timeline = _wait_2d_entry(
+            app, page, controller,
+            lambda: controller.viewer_2d_frame is not None
+            and page._shell.scientific._viewer_2d_payload is not None)
+        assert entered, "2D entry timed out; probe timeline (s, sample):\n" + "\n".join(
+            f"  {elapsed:7.3f} {sample!r}" for elapsed, sample in timeline)
         assert controller.viewer_2d_context.original_path == artifact
         assert "Loading" not in page._shell.scientific.status.text()
         assert len(controller.navigation.frames) == 3

@@ -418,6 +418,18 @@ class ContextController:
     @property
     def viewer_1d_loading(self) -> bool: return self._viewer_1d.loading
     @property
+    def viewer_poll_pending(self) -> bool:
+        """A transport completion landed since the last poll consumed it.
+
+        `complete` clears `loading` on the transport worker; a completion that
+        lands after this tick's poll but before the drain timer's stop check
+        would otherwise read as idle and strand the follow-up (the catalog's
+        first frame, the ready presentation) until the next GUI command.
+        """
+        with self._viewer_2d_lock:
+            return bool(self._viewer_1d.changed or self._viewer_2d.changed
+                        or self._viewer_2d.latest_label is not None)
+    @property
     def viewer_1d_diagnostic(self) -> str: return self._viewer_1d.diagnostic
     @property
     def viewer_1d_cleanup_pending(self) -> bool:

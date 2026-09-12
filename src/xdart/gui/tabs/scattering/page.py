@@ -5763,6 +5763,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or getattr(self._context_controller, "viewer_1d_loading", False)
             or getattr(self._context_controller, "viewer_1d_cleanup_pending", False)
             or self._context_controller.viewer_2d_loading
+            or self._context_controller.viewer_poll_pending
             or self._pending_viewer_2d_path is not None
             or self._context_controller.browse_pending
             or self._context_controller.browse_preview_polling_needed
