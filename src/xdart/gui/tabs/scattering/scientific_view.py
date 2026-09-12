@@ -2778,7 +2778,9 @@ class ScientificView(QtWidgets.QFrame):
             # A live run can reconcile faster than the event-loop geometry
             # coalescer.  Geometry is already settled here (image + traces
             # rendered), so converge synchronously; the range guard keeps an
-            # already-aligned repaint a no-op.
+            # already-aligned repaint a no-op.  A real trigger, so it opens
+            # a fresh re-flow follow epoch like the scheduled ones do.
+            self._reflow_follows = 0
             self._align_curve_under_cake()
 
     def _apply_processing_layout(self, mode: str) -> None:
@@ -3079,19 +3081,22 @@ class ScientificView(QtWidgets.QFrame):
         # trailing-edge debounce.  The event-loop callback makes progress
         # during a resize/show storm; the bounded follow-up observes the final
         # pyqtgraph layout after axes and color bars settle.
+        if not from_reflow:
+            # A real trigger (a widget event, a cake X-range change, the
+            # link, new curve data) opens a fresh follow epoch even when it
+            # coalesces onto a pending pair; only the axis-driven follows
+            # below are budgeted.
+            self._reflow_follows = 0
         if self._align_curve_pending:
             return
         if from_reflow:
             # A clipped-to-view curve autoranges Y over the visible samples,
             # so an align can move the tick-label width, which moves the
             # align: when no fixed point exists this would ping-pong forever.
-            # Budget the axis-driven follows between real triggers (a widget
-            # event, an X-range change, the link, new curve data).
+            # Budget the axis-driven follows between real triggers.
             if self._reflow_follows >= _MAX_REFLOW_FOLLOWS:
                 return
             self._reflow_follows += 1
-        else:
-            self._reflow_follows = 0
         self._align_curve_pending = True
         sequence = self._align_seq + 1
         self._align_seq = sequence
@@ -3111,6 +3116,10 @@ class ScientificView(QtWidgets.QFrame):
         QtCore.QTimer.singleShot(0, align)
 
     def _schedule_cake_under_curve(self) -> None:
+        # Only a user/external curve X-range change reaches here (the link's
+        # own feedback is fenced by _share_axis_syncing): a real trigger for
+        # the re-flow budget as much as a cake-side change is.
+        self._reflow_follows = 0
         if self._align_cake_pending:
             return
         self._align_cake_pending = True
@@ -3201,13 +3210,14 @@ class ScientificView(QtWidgets.QFrame):
         prior_syncing = self._share_axis_syncing
         self._share_axis_syncing = True
         try:
+            # X only.  Y autorange is owned elsewhere (mode entry, the
+            # explicit intensity autoscale, a changed slice) and a follow
+            # must not discard a manual Y zoom: with clipToView the zoom
+            # itself re-flows the tick labels, which is one of the very
+            # triggers that land here.
             curve_view.enableAutoRange(
                 axis=pg.ViewBox.XAxis,
                 enable=False,
-            )
-            curve_view.enableAutoRange(
-                axis=pg.ViewBox.YAxis,
-                enable=True,
             )
             curve_view.setXRange(*desired, padding=0.0)
         finally:

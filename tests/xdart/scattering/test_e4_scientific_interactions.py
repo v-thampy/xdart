@@ -963,12 +963,16 @@ def test_share_axis_follows_axis_reflow_without_a_widget_resize(
         # Start from the fresh follow epoch any real trigger leaves behind.
         view._reflow_follows = 0
         if reflow == "fixed-width":
+            assert curve_view.autoRangeEnabled()[1] is not False
             left_axis.setWidth(width_before + 3.0)
         else:
-            # Tick strings wider than the autoranged ones re-flow the axis
-            # at its next paint; the link's own Y autorange narrows them
-            # again afterwards, a second lazy re-flow the link must follow.
+            # A manual intensity zoom: tick strings wider than the
+            # autoranged ones re-flow the axis at its next paint.  The
+            # follow is X only, so the zoom itself must survive it (a
+            # follow that re-enabled Y autorange would discard the user's
+            # Y intent the moment the labels re-flowed).
             curve_view.setYRange(-123456.0, 123456.0, padding=0.0)
+            assert curve_view.autoRangeEnabled()[1] is False
         _wait_until(lambda: bool(view_resizes))
         assert view_resizes, "the axis re-flow never resized the view box"
 
@@ -978,6 +982,132 @@ def test_share_axis_follows_axis_reflow_without_a_widget_resize(
         assert widget_events.count == 0
         if reflow == "fixed-width":
             assert float(left_axis.width()) == width_before + 3.0
+            # A curve that was autoranging Y keeps doing so.
+            assert curve_view.autoRangeEnabled()[1] is not False
+        else:
+            assert curve_view.viewRange()[1] == [-123456.0, 123456.0]
+            assert curve_view.autoRangeEnabled()[1] is False
+    finally:
+        _dispose(view)
+
+
+def test_share_axis_curve_x_change_rearms_an_exhausted_follow_budget() -> None:
+    """Three settled axis-width changes spend the whole re-flow budget
+    without any ping-pong.  An ordinary curve X zoom is a real trigger in
+    the other link direction, so it must open a fresh epoch: a lazy axis
+    layout after it is still followed."""
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    view = ScientificView()
+    projection = make_shell_projection(
+        frame_count=5,
+        selected_index=0,
+        heavy_indices=(0, 4),
+        plot_mode="Single",
+    )
+    scientific = replace(projection.scientific, share_axis=True)
+    view.resize(1200, 800)
+    view.show()
+    try:
+        _reconcile(view, scientific, projection.navigation)
+        app.processEvents()
+        _settle_shared_link(view, 0.5, 1.5, 2.5)
+        assert _shared_link_at_rest(view, 0.5, 1.5, 2.5)
+
+        plot_item = view.curve.getPlotItem()
+        left_axis = plot_item.getAxis("left")
+        curve_view = plot_item.getViewBox()
+        view_resizes: list[None] = []
+        curve_view.sigResized.connect(lambda *_args: view_resizes.append(None))
+
+        def reflow_axis(delta: float) -> None:
+            # The axis re-flows at its next layout pass, not synchronously:
+            # a rest check before the view box moved would see the old,
+            # still-aligned geometry.  Wait for the move, then for rest.
+            seen = len(view_resizes)
+            left_axis.setWidth(float(left_axis.width()) + delta)
+            _wait_until(lambda: len(view_resizes) > seen)
+            assert len(view_resizes) > seen, "the axis re-flow never resized the view box"
+
+        # Spend the budget through the product's own accounting: a follow
+        # may re-flow the view box again, so wait for the align sequence
+        # to go quiet rather than for one pair.
+        for _ in range(_MAX_REFLOW_FOLLOWS):
+            reflow_axis(3.0)
+            assert _wait_quiet(lambda: view._align_seq), "follows never rested"
+        assert view._reflow_follows == _MAX_REFLOW_FOLLOWS
+
+        curve_view.setXRange(0.75, 1.85, padding=0.0)
+        _settle_shared_link(view, 0.8, 1.3, 1.8)
+        assert _shared_link_at_rest(view, 0.8, 1.3, 1.8)
+        # A later paint can still re-flow the axis; the zoom re-armed it.
+        reflow_axis(12.0)
+        _settle_shared_link(view, 0.8, 1.3, 1.8)
+        _assert_shared_pixels_align(view, 0.8, 1.3, 1.8)
+        assert not view._align_curve_pending
+    finally:
+        _dispose(view)
+
+
+def test_share_axis_real_triggers_reopen_the_follow_epoch_in_both_directions() -> None:
+    """The re-flow budget counts axis-driven follows between real triggers,
+    so every real trigger must open a fresh epoch: a cake-side X change
+    that coalesces onto a still-pending follow, and a curve-side X change
+    that never schedules a curve follow at all."""
+
+    view = ScientificView()
+    aligns: list[None] = []
+    view._align_curve_under_cake = lambda: aligns.append(None)
+    view._align_cake_under_curve = lambda: None
+    try:
+        view._set_share_link(True)
+        _wait_until(lambda: not view._align_curve_pending and len(aligns) >= 2)
+        assert (view._align_curve_pending, view._reflow_follows) == (False, 0)
+        assert len(aligns) == 2
+
+        # Spend the budget on view-box re-flows, leaving the last pair pending.
+        for follow in range(1, _MAX_REFLOW_FOLLOWS + 1):
+            view._on_share_view_resized()
+            assert view._align_curve_pending
+            assert view._reflow_follows == follow
+            if follow < _MAX_REFLOW_FOLLOWS:
+                _wait_until(lambda: not view._align_curve_pending)
+                assert not view._align_curve_pending
+        # A cake-side X change arriving while that pair is pending coalesces
+        # onto it and still opens a fresh epoch.
+        view._on_cake_xrange_changed()
+        assert view._align_curve_pending
+        assert view._reflow_follows == 0
+        _wait_until(lambda: not view._align_curve_pending)
+        assert not view._align_curve_pending
+        settled = len(aligns)
+        view._on_share_view_resized()
+        assert view._align_curve_pending
+        assert view._reflow_follows == 1
+        _wait_until(lambda: not view._align_curve_pending)
+        assert not view._align_curve_pending
+        assert len(aligns) == settled + 2
+
+        # Spend it again, at rest this time: the next re-flow is refused.
+        for _ in range(_MAX_REFLOW_FOLLOWS - 1):
+            view._on_share_view_resized()
+            _wait_until(lambda: not view._align_curve_pending)
+            assert not view._align_curve_pending
+        assert view._reflow_follows == _MAX_REFLOW_FOLLOWS
+        settled = len(aligns)
+        view._on_share_view_resized()
+        assert not view._align_curve_pending
+        assert len(aligns) == settled
+        # A curve-side X change schedules the cake under the curve only, and
+        # is a real trigger all the same.
+        view._on_curve_xrange_changed()
+        assert view._reflow_follows == 0
+        view._on_share_view_resized()
+        assert view._align_curve_pending
+        assert view._reflow_follows == 1
+        _wait_until(lambda: not view._align_curve_pending)
+        assert not view._align_curve_pending
+        assert len(aligns) == settled + 2
     finally:
         _dispose(view)
 
