@@ -474,19 +474,36 @@ _REVISION_STAT_FIELDS = (
 )
 
 
+def _exact_stat(info):
+    """The exact stat tuple of one DESCRIPTOR view.
+
+    Compare it only with the descriptor-recorded revision
+    (``_exact_revision_stat``): win32 fills fstat's st_ctime from NTFS
+    ChangeTime, which every write and every utime advance, so the O(1)
+    fence below still catches a same-size same-mtime rewrite there.
+    """
+    return (int(info.st_dev), int(info.st_ino), int(info.st_size),
+            int(info.st_mtime_ns), int(info.st_ctime_ns))
+
+
 def _stat_identity(info):
     """Comparable stat tuple of one view (descriptor or pathname).
 
-    The recorded revision keeps the observed ctime; every compare between a
-    descriptor view and a pathname view goes through the win32 ctime seam.
+    The recorded revision keeps the descriptor's observed ctime; every
+    compare between a descriptor view and a pathname view goes through the
+    win32 ctime seam.
     """
-    return (int(info.st_dev), int(info.st_ino), int(info.st_size),
-            int(info.st_mtime_ns), identity_ctime_ns(info.st_ctime_ns))
+    return (*_exact_stat(info)[:4], identity_ctime_ns(info.st_ctime_ns))
+
+
+def _exact_revision_stat(revision):
+    return (revision.device, revision.inode, revision.size,
+            revision.mtime_ns, revision.ctime_ns)
 
 
 def _revision_stat(revision):
-    return (revision.device, revision.inode, revision.size,
-            revision.mtime_ns, identity_ctime_ns(revision.ctime_ns))
+    return (*_exact_revision_stat(revision)[:4],
+            identity_ctime_ns(revision.ctime_ns))
 
 
 def _path_stat(path):
@@ -528,13 +545,16 @@ def _cert_stat_revision(revision, *, stream=None, message):
             info = os.fstat(stream.fileno())
         except (OSError, ValueError):
             _recertify_drift(revision, message)
-        descriptor = _stat_identity(info)
+        descriptor = _exact_stat(info)
     try:
         pathname = _path_stat(Path(revision.canonical_path))
     except Viewer2DReadError:
         pathname = None
-    expected = _revision_stat(revision)
-    if pathname != expected or descriptor is not None and descriptor != expected:
+    # The descriptor view is held to the recorded revision exactly (ctime
+    # included); the pathname view only through the win32 ctime seam.
+    if pathname != _revision_stat(revision) or (
+            descriptor is not None
+            and descriptor != _exact_revision_stat(revision)):
         _recertify_drift(revision, message)
 
 

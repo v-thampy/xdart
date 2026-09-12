@@ -2065,6 +2065,42 @@ def test_win32_identity_catalogs_reads_and_certifies_the_pathname_ctime_shape(
     assert api._revision_stat(catalog.primary_revision)[4] == 0
 
 
+def test_win32_identity_descriptor_fence_refuses_a_same_size_same_mtime_rewrite(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime,
+):
+    """The O(1) selected-frame fence holds the open descriptor to the recorded
+    revision exactly: a rewrite the seamed pathname view cannot see must still
+    take the recertification path and refuse (Codex PR #1 review, F1)."""
+    initial = np.arange(30, dtype=np.uint16).reshape(2, 3, 5)
+    path, replacement = tmp_path / "selected.npy", tmp_path / "replacement.npy"
+    np.save(path, initial, allow_pickle=False)
+    np.save(replacement, initial + 100, allow_pickle=False)
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    win32_pathname_ctime(path)
+    catalog = api.catalog_viewer_2d(path)
+    admitted = path.stat()
+    path.write_bytes(replacement.read_bytes())
+    os.utime(path, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
+    with path.open("rb") as handle:
+        after = os.fstat(handle.fileno())
+    assert (after.st_size, after.st_mtime_ns) == (admitted.st_size, admitted.st_mtime_ns)
+    # Precondition of the row: only the descriptor's change time moved, and
+    # the seamed pathname fence is blind to it.
+    assert after.st_ctime_ns != catalog.primary_revision.ctime_ns
+    assert api._path_stat(path) == api._revision_stat(catalog.primary_revision)
+
+    calls = []
+    original = api._stable_revision
+
+    def stable(candidate):
+        calls.append(str(Path(candidate).resolve()))
+        return original(candidate)
+
+    monkeypatch.setattr(api, "_stable_revision", stable)
+    _assert_changed(api.read_viewer_2d_frame, catalog, 1)
+    assert calls == [str(path.resolve())]
+
+
 def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
     tmp_path, monkeypatch, ctime_seam,
 ):
