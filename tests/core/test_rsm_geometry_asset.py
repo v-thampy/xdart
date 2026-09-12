@@ -432,10 +432,21 @@ def test_rsm_capture_refuses_before_after_mutation(tmp_path, monkeypatch):
     real_states = __import__(
         "xrd_tools.analysis.rsm_geometry_asset", fromlist=["_lexical_chain_states"]
     )._lexical_chain_states
+    base = target.stat()
+    mutations = 0
 
     def mutate_then_states(project_path, relative):
+        # Each rewrite moves the mtime slot by whole seconds from a fixed
+        # base: on Windows the ctime slot is neutral and LastWriteTime rides
+        # the system tick (100 ns units, ~1-16 ms clock), so a +1 ns bump
+        # rounds away and two writes inside one tick share a stamp.
+        nonlocal mutations
+        mutations += 1
         target.write_bytes(raw)
-        os.utime(target, ns=(target.stat().st_atime_ns, target.stat().st_mtime_ns + 1))
+        os.utime(
+            target,
+            ns=(base.st_atime_ns, base.st_mtime_ns + mutations * 2_000_000_000),
+        )
         return real_states(project_path, relative)
 
     monkeypatch.setattr(
