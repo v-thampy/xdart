@@ -6,6 +6,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import InitVar, dataclass, field
 import hashlib
 import importlib.metadata
+from importlib import resources
+import io
 import math
 import threading
 import weakref
@@ -34,23 +36,27 @@ _MAX_COUNT = 2**24
 _Q_ROOT_POLICY = "shared_ultimate_ndarray_root_weakref_v1"
 _RUNTIME_GEOMETRY_FACTORY = object()
 # SURFACE v1 pins the float64 solid-angle bytes the reference host (macOS
-# arm64) computes from the asset's detector header.  Other libm/SIMD builds
-# land within an ULP of the same array and hash differently, so the asset
-# reference maps to every hash accepted as that projection.  Add a platform
-# only from its own CI log (the refusal below prints the host hash); the
-# projection carries the reference, provenance carries the host value.
-_SOLID_ANGLE_SHA256_EQUIVALENTS: Mapping[str, frozenset[str]] = {
-    "a8d6453bc56b99a0c3151b54999adff4684de5648b8f23c8deb7aa0799937034": frozenset({
-        # macOS arm64 (reference host, == asset corrections.solid_angle_sha256)
-        "a8d6453bc56b99a0c3151b54999adff4684de5648b8f23c8deb7aa0799937034",
-        # ubuntu-24.04 x86_64, pip numpy 2.5.1 / pyFAI 2026.5.0
-        # (PR #1 run 34651556456: core, application, numerical ubuntu)
-        "0faf8164da6b2256b8f5f7b06d10fa7e182aae3fb9069da62ef3741fdc415f3d",
-        # macos-15-intel x86_64, pip numpy 2.5.1 / pyFAI 2026.5.0
-        # (PR #1 run 34651556456: numerical macos-15-intel)
-        "3862680896d693c8ae021bf1c15447bd9cca4cc96968a111f88a009c2f89f2b8",
-    }),
-}
+# arm64) computes from the asset's detector header, and ships that array as
+# the ``*_solid_angle.npy`` sidecar next to the asset.  The sidecar is
+# authenticated by content only: its ``<f8`` C-order bytes must hash to the
+# asset's ``corrections.solid_angle_sha256`` pin, so a stale or swapped file
+# can be refused but never accepted.  Other libm/SIMD builds land within an
+# ULP of the reference and hash differently — PR #1 saw ubuntu-24.04
+# ``0faf8164…`` and ``2a973ee0…`` on ONE runner image plus macos-15-intel
+# ``38626808…``, i.e. the spread is per runner CPU, not per platform — so a
+# host hash is accepted exactly when it equals the pin, and otherwise only
+# when every element agrees with the reference within _SOLID_ANGLE_RTOL
+# (~4500 ULP at these magnitudes, eight orders below any geometry change).
+# Computation always uses the reference bytes; provenance records the host
+# hash, which path accepted it, and the measured deviation.
+_SOLID_ANGLE_RESOURCE_PARTS = (
+    "assets",
+    "xu",
+    "psic_powder_1d_surface_v1_solid_angle.npy",
+)
+_MAX_SOLID_ANGLE_RESOURCE_BYTES = 4 * 1024 * 1024
+_SOLID_ANGLE_RTOL = 1e-12
+_SOLID_ANGLE_MATCHES = frozenset({"exact", "tolerance"})
 
 
 class XuStitchScienceRefused(RuntimeError):
@@ -68,6 +74,41 @@ def _sha256_array(values: np.ndarray, dtype: str) -> str:
     return hashlib.sha256(array.tobytes(order="C")).hexdigest()
 
 
+def _solid_angle_reference_bytes() -> bytes:
+    resource = resources.files("xrd_tools").joinpath(*_SOLID_ANGLE_RESOURCE_PARTS)
+    with resource.open("rb") as handle:
+        return handle.read(_MAX_SOLID_ANGLE_RESOURCE_BYTES + 1)
+
+
+def _solid_angle_reference(
+    expected_sha256: str, shape: tuple[int, int]
+) -> np.ndarray:
+    """Load the packaged SURFACE v1 solid-angle array, authenticated by its pin."""
+    try:
+        raw = _solid_angle_reference_bytes()
+        if not 1 <= len(raw) <= _MAX_SOLID_ANGLE_RESOURCE_BYTES:
+            raise ValueError("solid-angle reference size is out of range")
+        reference = np.load(io.BytesIO(raw), allow_pickle=False)
+    except (EOFError, OSError, TypeError, ValueError) as error:
+        raise XuStitchScienceRefused(
+            "XU_SOLID_ANGLE_REFERENCE_UNAVAILABLE",
+            "SURFACE v1 solid-angle reference resource is unavailable",
+        ) from error
+    if (
+        type(reference) is not np.ndarray
+        or reference.dtype != np.dtype("<f8")
+        or reference.shape != shape
+        or not np.isfinite(reference).all()
+        or np.any(reference <= 0)
+        or _sha256_array(reference, "<f8") != expected_sha256
+    ):
+        raise XuStitchScienceRefused(
+            "XU_SOLID_ANGLE_REFERENCE_UNAVAILABLE",
+            "SURFACE v1 solid-angle reference resource does not match its pin",
+        )
+    return np.ascontiguousarray(reference, dtype="<f8")
+
+
 @dataclass(frozen=True, slots=True)
 class XuStitchEffectiveGeometryProjection:
     asset_semantic_fingerprint: str
@@ -83,14 +124,27 @@ class XuStitchEffectiveGeometryProjection:
     sample_axes: tuple[str, ...]
     detector_axes: tuple[str, ...]
     camera: tuple[str, str]
-    # What this host computed; equivalent to the reference, not fingerprinted.
+    # What this host computed and how it was accepted against the reference;
+    # host-specific, not fingerprinted (computation uses the reference bytes).
     solid_angle_sha256_host: str
+    solid_angle_match: str
+    solid_angle_max_rel_dev: float
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
         if (
             type(self.asset_semantic_fingerprint) is not str
             or len(self.asset_semantic_fingerprint) != 64
+            or type(self.solid_angle_sha256_host) is not str
+            or len(self.solid_angle_sha256_host) != 64
+            or self.solid_angle_match not in _SOLID_ANGLE_MATCHES
+            or (self.solid_angle_match == "exact")
+            != (self.solid_angle_sha256_host == self.solid_angle_sha256)
+            or type(self.solid_angle_max_rel_dev) is not float
+            or not math.isfinite(self.solid_angle_max_rel_dev)
+            or not 0.0 <= self.solid_angle_max_rel_dev <= _SOLID_ANGLE_RTOL
+            or (self.solid_angle_match == "exact")
+            != (self.solid_angle_max_rel_dev == 0.0)
             or self.detector_type != "pyFAI.detectors._dectris.Pilatus300kw"
             or self.detector_config
             != (
@@ -104,8 +158,6 @@ class XuStitchEffectiveGeometryProjection:
             != "0a48766039393e4b1ffc08e70e09b3af762b90a451eabfdad392ecc773b04b28"
             or self.solid_angle_sha256
             != "a8d6453bc56b99a0c3151b54999adff4684de5648b8f23c8deb7aa0799937034"
-            or self.solid_angle_sha256_host
-            not in _SOLID_ANGLE_SHA256_EQUIVALENTS[self.solid_angle_sha256]
             or self.energy_eV != 17000.018
             or self.xdart_wavelength_A != 0.7293180418985439
             or self.xu_mapping_wavelength_A != 0.7293180420938394
@@ -147,6 +199,8 @@ class XuStitchEffectiveGeometryProjection:
             "mask_sha256": self.mask_sha256,
             "solid_angle_sha256": self.solid_angle_sha256,
             "solid_angle_sha256_host": self.solid_angle_sha256_host,
+            "solid_angle_match": self.solid_angle_match,
+            "solid_angle_max_rel_dev": self.solid_angle_max_rel_dev,
             "energy_eV": self.energy_eV,
             "xdart_wavelength_A": self.xdart_wavelength_A,
             "xu_mapping_wavelength_A": self.xu_mapping_wavelength_A,
@@ -272,20 +326,31 @@ def resolve_xu_stitch_effective_geometry(
         order="C",
     )
     solid_sha256 = _sha256_array(solid, "<f8")
-    accepted_solid_sha256 = _SOLID_ANGLE_SHA256_EQUIVALENTS.get(
-        corrections["solid_angle_sha256"], frozenset()
-    )
-    if (
-        solid.shape != shape
-        or not np.isfinite(solid).all()
-        or np.any(solid <= 0)
-        or solid_sha256 not in accepted_solid_sha256
-    ):
+    reference_solid_sha256 = str(corrections["solid_angle_sha256"])
+    if solid.shape != shape or not np.isfinite(solid).all() or np.any(solid <= 0):
         raise XuStitchScienceRefused(
             "XU_SOLID_ANGLE_MISMATCH",
-            "solid-angle projection differs from SURFACE v1 "
-            f"(host sha256={solid_sha256}; accepted={sorted(accepted_solid_sha256)})",
+            "solid-angle projection is not a finite positive SURFACE v1 array "
+            f"(host sha256={solid_sha256})",
         )
+    reference_solid = _solid_angle_reference(reference_solid_sha256, shape)
+    if solid_sha256 == reference_solid_sha256:
+        solid_match = "exact"
+        solid_max_rel_dev = 0.0
+    else:
+        solid_max_rel_dev = float(
+            np.max(np.abs(solid - reference_solid) / reference_solid)
+        )
+        if not solid_max_rel_dev <= _SOLID_ANGLE_RTOL:
+            raise XuStitchScienceRefused(
+                "XU_SOLID_ANGLE_MISMATCH",
+                "solid-angle projection differs from SURFACE v1 "
+                f"(host sha256={solid_sha256}; "
+                f"reference sha256={reference_solid_sha256}; "
+                f"max_rel_dev={solid_max_rel_dev:.3e}; "
+                f"rtol={_SOLID_ANGLE_RTOL:.0e})",
+            )
+        solid_match = "tolerance"
     energy = float(acquisition["energy_eV"])
     if energy_eV_to_wavelength_m(energy) * 1e10 != acquisition["xdart_wavelength_A"]:
         raise XuStitchScienceRefused(
@@ -336,10 +401,14 @@ def resolve_xu_stitch_effective_geometry(
         tuple(xu_asset["detector_axes"]),
         tuple(xu_asset["camera"]),
         solid_sha256,
+        solid_match,
+        solid_max_rel_dev,
     )
     frozen_mask = np.frombuffer(mask.tobytes(order="C"), dtype=bool).reshape(shape)
+    # The reference bytes, not the host's: every host integrates with the
+    # array the projection's solid_angle_sha256 names.
     frozen_solid = np.frombuffer(
-        np.ascontiguousarray(solid, dtype="<f8").tobytes(order="C"),
+        reference_solid.tobytes(order="C"),
         dtype="<f8",
     ).reshape(shape)
     return XuStitchRuntimeGeometry(

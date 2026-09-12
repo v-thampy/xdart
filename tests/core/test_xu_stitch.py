@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
+import io
+import json
 
 import numpy as np
 import pytest
@@ -11,12 +14,17 @@ from xrd_tools.analysis.xu_stitch_calibration import (
     capture_xu_stitch_calibration,
 )
 from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+from xrd_tools.integrate import xu_stitch
 from xrd_tools.integrate.xu_stitch import (
     XuPowderQProvider,
     XuStitchScienceRefused,
     resolve_xu_stitch_effective_geometry,
     run_xu_hist_stitch_1d,
 )
+
+_SOLID_ANGLE_PIN = json.loads(canonical_surface_resource_bytes())["corrections"][
+    "solid_angle_sha256"
+]
 
 
 def _receipt(tmp_path):
@@ -75,6 +83,160 @@ def test_xu_effective_geometry_and_q_provider_use_one_shared_root(tmp_path):
         lease.release()
     assert owner.execution_record is not None
     assert owner.execution_record.restore_passed is True
+
+
+def _resolve(receipt):
+    with xu_runtime_session() as session:
+        return resolve_xu_stitch_effective_geometry(receipt, session)
+
+
+def _host_solid_angle_stack(values):
+    class _Stack:
+        def normalization(self, ai, shape):
+            assert tuple(shape) == values.shape
+            return values
+
+    return _Stack
+
+
+def test_xu_solid_angle_reference_authenticates_and_is_what_integrates(tmp_path):
+    reference = xu_stitch._solid_angle_reference(_SOLID_ANGLE_PIN, (195, 1475))
+    assert reference.dtype == np.dtype("<f8")
+    assert reference.flags.c_contiguous
+    assert hashlib.sha256(reference.tobytes(order="C")).hexdigest() == _SOLID_ANGLE_PIN
+
+    geometry = _resolve(_receipt(tmp_path))
+    projection = geometry.projection
+    # Whatever this host's libm/SIMD produced, integration uses the pinned bytes.
+    assert (
+        hashlib.sha256(geometry.solid_angle.tobytes(order="C")).hexdigest()
+        == _SOLID_ANGLE_PIN
+    )
+    assert projection.solid_angle_sha256 == _SOLID_ANGLE_PIN
+    assert projection.solid_angle_match in {"exact", "tolerance"}
+    assert (projection.solid_angle_match == "exact") == (
+        projection.solid_angle_sha256_host == _SOLID_ANGLE_PIN
+    )
+    assert 0.0 <= projection.solid_angle_max_rel_dev <= 1e-12
+    provenance = projection.to_provenance()
+    assert provenance["solid_angle_sha256_host"] == projection.solid_angle_sha256_host
+    assert provenance["solid_angle_match"] == projection.solid_angle_match
+    assert provenance["solid_angle_max_rel_dev"] == projection.solid_angle_max_rel_dev
+    with pytest.raises(TypeError, match="invalid"):
+        replace(
+            projection,
+            solid_angle_match="exact",
+            solid_angle_max_rel_dev=1e-13,
+        )
+    with pytest.raises(TypeError, match="invalid"):
+        replace(
+            projection,
+            solid_angle_sha256_host="0" * 64,
+            solid_angle_match="exact",
+            solid_angle_max_rel_dev=0.0,
+        )
+    with pytest.raises(TypeError, match="invalid"):
+        replace(
+            projection,
+            solid_angle_sha256_host="0" * 64,
+            solid_angle_match="tolerance",
+            solid_angle_max_rel_dev=2e-12,
+        )
+
+
+def test_xu_solid_angle_exact_and_tolerance_paths(tmp_path, monkeypatch):
+    receipt = _receipt(tmp_path)
+    reference = xu_stitch._solid_angle_reference(_SOLID_ANGLE_PIN, (195, 1475))
+
+    monkeypatch.setattr(
+        xu_stitch, "CorrectionStack", _host_solid_angle_stack(reference.copy())
+    )
+    exact = _resolve(receipt)
+    assert exact.projection.solid_angle_match == "exact"
+    assert exact.projection.solid_angle_max_rel_dev == 0.0
+    assert exact.projection.solid_angle_sha256_host == _SOLID_ANGLE_PIN
+
+    one_ulp_up = np.nextafter(reference, np.inf)
+    monkeypatch.setattr(
+        xu_stitch, "CorrectionStack", _host_solid_angle_stack(one_ulp_up)
+    )
+    tolerated = _resolve(receipt)
+    assert tolerated.projection.solid_angle_match == "tolerance"
+    assert tolerated.projection.solid_angle_sha256_host == hashlib.sha256(
+        one_ulp_up.tobytes(order="C")
+    ).hexdigest()
+    assert tolerated.projection.solid_angle_sha256_host != _SOLID_ANGLE_PIN
+    assert 0.0 < tolerated.projection.solid_angle_max_rel_dev < 1e-15
+    assert tolerated.projection.fingerprint == exact.projection.fingerprint
+    assert np.array_equal(tolerated.solid_angle, reference)
+    assert not np.array_equal(tolerated.solid_angle, one_ulp_up)
+
+
+def test_xu_solid_angle_refuses_beyond_tolerance(tmp_path, monkeypatch):
+    receipt = _receipt(tmp_path)
+    reference = xu_stitch._solid_angle_reference(_SOLID_ANGLE_PIN, (195, 1475))
+    monkeypatch.setattr(
+        xu_stitch,
+        "CorrectionStack",
+        _host_solid_angle_stack(reference * (1.0 + 1e-9)),
+    )
+    with pytest.raises(XuStitchScienceRefused) as raised:
+        _resolve(receipt)
+    assert raised.value.code == "XU_SOLID_ANGLE_MISMATCH"
+    message = str(raised.value)
+    assert "max_rel_dev=1.0" in message
+    assert "e-09" in message
+    assert "rtol=1e-12" in message
+    assert f"reference sha256={_SOLID_ANGLE_PIN}" in message
+
+    monkeypatch.setattr(
+        xu_stitch,
+        "CorrectionStack",
+        _host_solid_angle_stack(np.where(reference > 0.8, 0.0, reference)),
+    )
+    with pytest.raises(XuStitchScienceRefused) as raised:
+        _resolve(receipt)
+    assert raised.value.code == "XU_SOLID_ANGLE_MISMATCH"
+    assert "finite positive" in str(raised.value)
+
+
+def test_xu_solid_angle_refuses_unavailable_or_forged_reference(
+    tmp_path, monkeypatch
+):
+    receipt = _receipt(tmp_path)
+    reference = xu_stitch._solid_angle_reference(_SOLID_ANGLE_PIN, (195, 1475))
+
+    def _npy(values):
+        buffer = io.BytesIO()
+        np.save(buffer, values, allow_pickle=False)
+        return buffer.getvalue()
+
+    def _missing():
+        raise FileNotFoundError("sidecar not packaged")
+
+    forged = [
+        _missing,
+        lambda: b"",
+        lambda: b"\x93NUMPY" + b"\0" * xu_stitch._MAX_SOLID_ANGLE_RESOURCE_BYTES,
+        lambda: _npy(reference)[:-8],
+        lambda: _npy(np.nextafter(reference, np.inf)),
+        lambda: _npy(reference.astype(np.float32)),
+        lambda: _npy(reference[:, :1474]),
+    ]
+    for loader in forged:
+        monkeypatch.setattr(xu_stitch, "_solid_angle_reference_bytes", loader)
+        with pytest.raises(XuStitchScienceRefused) as raised:
+            _resolve(receipt)
+        assert raised.value.code == "XU_SOLID_ANGLE_REFERENCE_UNAVAILABLE"
+
+    # Same values in Fortran order hash identically once made C-contiguous;
+    # that is the same array, not a forgery.
+    for loader in (lambda: _npy(reference), lambda: _npy(np.asfortranarray(reference))):
+        monkeypatch.setattr(xu_stitch, "_solid_angle_reference_bytes", loader)
+        geometry = _resolve(receipt)
+        assert geometry.projection.solid_angle_sha256 == _SOLID_ANGLE_PIN
+        assert geometry.solid_angle.flags.c_contiguous
+        assert np.array_equal(geometry.solid_angle, reference)
 
 
 def test_xu_hist_science_releases_each_frame_and_restores_runtime(tmp_path):

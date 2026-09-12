@@ -94,7 +94,7 @@ include = ["xrd_tools*", "xdart*"]
 
 [tool.setuptools.package-data]
 xdart = ["**/*.ui"]
-xrd_tools = ["assets/rsm/*.json", "assets/xu/*.json"]
+xrd_tools = ["assets/rsm/*.json", "assets/xu/*.json", "assets/xu/*.npy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
