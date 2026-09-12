@@ -26,12 +26,6 @@ jobs:
         # published x86_64 wheel; revisit when the xrayutilities pin moves.
         os: [ubuntu-latest, macos-15-intel, windows-latest]
     runs-on: ${{ matrix.os }}
-    # WINDOWS-CALIBRATION-READ-20260911: the XU/RSM calibration asset readers
-    # (rsm_geometry_asset.py, xu_stitch_calibration.py) still walk with
-    # dir_fd= and os.sep anchors, which Windows does not support, so this leg
-    # is known red.  Keep it running for evidence, do not let it gate merges;
-    # delete this line in the commit that lands the native-safe readers.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
