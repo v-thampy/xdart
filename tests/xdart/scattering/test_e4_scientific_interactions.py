@@ -108,6 +108,14 @@ def _shared_link_at_rest(view: ScientificView, *values: float) -> bool:
     )
 
 
+def _settle_shared_link(view: ScientificView, *values: float) -> None:
+    # After a real trigger the link converges on its own (align, 50 ms settle,
+    # budgeted follows) in event-loop time, not wall time: a process carrying
+    # thousands of retained test widgets held the settle 600 ms past a fixed
+    # 80 ms wait.  Wait for rest; the assertion that follows still decides.
+    _wait_until(lambda: _shared_link_at_rest(view, *values))
+
+
 class _WidgetGeometryEvents(QtCore.QObject):
     """Counts the widget events the share-link geometry hooks react to."""
 
@@ -804,7 +812,7 @@ def test_share_axis_links_both_directions_survives_repaint_and_unlinks() -> None
         curve_view = view.curve.getPlotItem().getViewBox()
         assert view.share_axis.isEnabled()
         assert view.share_axis.isChecked()
-        QtTest.QTest.qWait(80)
+        _settle_shared_link(view, 0.5, 1.5, 2.5)
         _assert_shared_pixels_align(view, 0.5, 1.5, 2.5)
 
         range_events: list[str] = []
@@ -815,7 +823,7 @@ def test_share_axis_links_both_directions_survives_repaint_and_unlinks() -> None
             lambda *_args: range_events.append("curve")
         )
         cake_view.setXRange(0.45, 2.15, padding=0.0)
-        QtTest.QTest.qWait(80)
+        _settle_shared_link(view, 0.55, 1.25, 2.05)
         _assert_shared_pixels_align(view, 0.55, 1.25, 2.05)
         settled_event_count = len(range_events)
         for _ in range(3):
@@ -824,7 +832,7 @@ def test_share_axis_links_both_directions_survives_repaint_and_unlinks() -> None
         assert not view._share_axis_syncing
 
         curve_view.setXRange(0.75, 1.85, padding=0.0)
-        QtTest.QTest.qWait(80)
+        _settle_shared_link(view, 0.8, 1.3, 1.8)
         _assert_shared_pixels_align(view, 0.8, 1.3, 1.8)
 
         next_navigation = FrameNavigationProjection(
@@ -845,13 +853,13 @@ def test_share_axis_links_both_directions_survives_repaint_and_unlinks() -> None
             replace(scientific, heavy=next_heavy),
             next_navigation,
         )
-        QtTest.QTest.qWait(80)
+        _settle_shared_link(view, 0.8, 1.3, 1.8)
 
         assert view.share_axis.isChecked()
         _assert_shared_pixels_align(view, 0.8, 1.3, 1.8)
 
         view.resize(1460, 720)
-        QtTest.QTest.qWait(80)
+        _settle_shared_link(view, 0.8, 1.3, 1.8)
         _assert_shared_pixels_align(view, 0.8, 1.3, 1.8)
 
         _reconcile(
@@ -903,12 +911,12 @@ def test_share_axis_stays_exact_at_fractional_axis_widths(
 
         curve_view = view.curve.getPlotItem().getViewBox()
         curve_view.setXRange(0.75, 1.85, padding=0.0)
-        QtTest.QTest.qWait(80)
+        _settle_shared_link(view, -2.0, 0.8, 1.3, 1.8, 5.0)
         _assert_shared_pixels_align(view, -2.0, 0.8, 1.3, 1.8, 5.0)
 
         cake_view = view.cake.canvas.imageViewBox
         cake_view.setXRange(0.45, 2.15, padding=0.0)
-        QtTest.QTest.qWait(80)
+        _settle_shared_link(view, -2.5, 0.55, 1.25, 2.05, 5.5)
         _assert_shared_pixels_align(view, -2.5, 0.55, 1.25, 2.05, 5.5)
     finally:
         _dispose(view)
@@ -1122,7 +1130,7 @@ def test_share_axis_uses_the_active_curve_or_waterfall_in_every_plot_mode(
     view.show()
     try:
         _reconcile(view, scientific, projection.navigation)
-        QtTest.QTest.qWait(80)
+        _settle_shared_link(view, 0.5, 1.5, 2.5)
 
         assert view.share_axis.isEnabled()
         assert view.share_axis.isChecked()
@@ -1134,7 +1142,7 @@ def test_share_axis_uses_the_active_curve_or_waterfall_in_every_plot_mode(
 
         _widget, bottom_view = view._active_bottom_plot()
         bottom_view.setXRange(0.75, 1.85, padding=0.0)
-        QtTest.QTest.qWait(80)
+        _settle_shared_link(view, 0.8, 1.3, 1.8)
         _assert_shared_pixels_align(view, 0.8, 1.3, 1.8)
     finally:
         _dispose(view)
