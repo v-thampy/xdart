@@ -87,10 +87,41 @@ def _run_finished(lifecycle, executor) -> bool:
     )
 
 
+def _run_diagnostic(shell, lifecycle, executor, started: float) -> str:
+    # Read on timeout only: says whether the run is slow or stuck.
+    # current_published is the live per-frame counter on the series path;
+    # completed/current_completed move at epoch boundaries and the file
+    # counters only on the live-directory path.
+    run = executor._active
+    if run is None:
+        progress = "run=None"
+    else:
+        worker = run.worker
+        progress = (
+            f"terminal_emitted={run.terminal_emitted}, "
+            f"published={run.current_published}/{run.current_total} "
+            f"(completed={run.completed}+{run.current_completed}"
+            f"/{run.total}), "
+            f"files={run.files_processed}/{run.files_discovered}, "
+            f"worker_alive={worker is not None and worker.is_alive()}, "
+            f"stop_requested={run.stop_requested}, closed={run.closed}, "
+            f"cleanup={run.cleanup_status!r}"
+        )
+    return (
+        f"elapsed={time.monotonic() - started:.1f}s, {progress}, "
+        f"{_shell_diagnostic(shell, lifecycle)}"
+    )
+
+
 def _completed_acquisition(qapp, page, lifecycle, executor) -> None:
     """Finish the real terminal Browse handoff, then select retained Run data."""
     shell, controller = _mounted(page)
-    _wait(qapp, lambda: _run_finished(lifecycle, executor))
+    started = time.monotonic()
+    _wait(
+        qapp,
+        lambda: _run_finished(lifecycle, executor),
+        diagnostic=lambda: _run_diagnostic(shell, lifecycle, executor, started),
+    )
     _wait(
         qapp,
         lambda: (
@@ -98,6 +129,10 @@ def _completed_acquisition(qapp, page, lifecycle, executor) -> None:
             and controller.capture_loaded_browse(
                 controller.browse_context.load_request
             ) is not None
+        ),
+        diagnostic=lambda: (
+            f"browse_context={controller.browse_context!r}, "
+            f"{_run_diagnostic(shell, lifecycle, executor, started)}"
         ),
     )
     controller.select_acquisition()
@@ -107,10 +142,19 @@ def _completed_acquisition(qapp, page, lifecycle, executor) -> None:
     page._handle_shell_command(ShellCommand(
         ShellCommandKind.SELECT_FRAME, frame=last, frames=(last,),
     ))
-    _wait(qapp, lambda: (
-        shell.scientific.frame_selector.currentData() is last
-        and shell.scientific.raw.image.image is not None
-    ))
+    _wait(
+        qapp,
+        lambda: (
+            shell.scientific.frame_selector.currentData() is last
+            and shell.scientific.raw.image.image is not None
+        ),
+        diagnostic=lambda: (
+            f"selected={shell.scientific.frame_selector.currentData()!r}, "
+            f"last={last!r}, "
+            f"raw_loaded={shell.scientific.raw.image.image is not None}, "
+            f"{_shell_diagnostic(shell, lifecycle)}"
+        ),
+    )
 
 
 def _select_exact_frame(
