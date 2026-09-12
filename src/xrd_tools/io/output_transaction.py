@@ -616,6 +616,39 @@ def _stat_identity(stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
+# Windows only flushes a handle that was opened with write access
+# (``os.fsync`` is ``_commit`` -> ``FlushFileBuffers``), so the read-only
+# descriptors this module seals through raise ``EBADF`` there; POSIX flushes
+# any descriptor.
+_FSYNC_REQUIRES_WRITE_ACCESS = sys.platform == "win32"
+
+
+def _fsync_descriptor(descriptor: int, path: Path) -> None:
+    """Flush ``descriptor`` to stable storage.
+
+    Where the platform refuses to flush a read-only descriptor, flush the
+    same file through a second, writable descriptor of ``path`` instead —
+    after proving that the reopened pathname names the descriptor's exact
+    inode, the guard every seal in this module already applies.
+    """
+    try:
+        os.fsync(descriptor)
+        return
+    except OSError as error:
+        if not _FSYNC_REQUIRES_WRITE_ACCESS or error.errno != errno.EBADF:
+            raise
+    expected = _stat_identity(os.fstat(descriptor))
+    writable = os.open(path, os.O_RDWR)
+    try:
+        if _stat_identity(os.fstat(writable)) != expected:
+            raise TargetChanged(
+                f"durable flush reopened a foreign inode: {path}"
+            )
+        os.fsync(writable)
+    finally:
+        os.close(writable)
+
+
 def _sha256_handle(handle) -> str:
     digest = hashlib.sha256()
     while True:
@@ -884,7 +917,7 @@ def _descriptor_content_receipt(
     if expected_stat is not None:
         expected_stat = _comparable_identity(expected_stat)
     if durable_fsync:
-        os.fsync(descriptor)
+        _fsync_descriptor(descriptor, path)
     before = os.fstat(descriptor)
     if expected_stat is not None and _stat_identity(before) != expected_stat:
         raise TargetChanged(
@@ -980,7 +1013,7 @@ def _descriptor_stream_stat_receipt(
             f"{role} descriptor changed after semantic verification: {path}"
         )
     if durable_fsync:
-        os.fsync(descriptor)
+        _fsync_descriptor(descriptor, path)
     first = os.fstat(descriptor)
     try:
         named = os.stat(path)
@@ -3146,7 +3179,7 @@ class OutputTransaction:
                 descriptor = os.open(self._admission.target, os.O_RDONLY)
                 expected_stat = _stat_identity(os.fstat(descriptor))
                 if self._durable_fsync:
-                    os.fsync(descriptor)
+                    _fsync_descriptor(descriptor, Path(self._admission.target))
                 if _stat_identity(os.fstat(descriptor)) != expected_stat:
                     raise TargetChanged(
                         "stream terminal descriptor changed during fsync"

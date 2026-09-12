@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import FrozenInstanceError, replace
+import errno
 import hashlib
 import importlib
 import os
@@ -681,6 +682,167 @@ def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
             )
     finally:
         os.close(descriptor)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
+def _fsync_refuses_read_only_descriptors(api, monkeypatch):
+    """Make ``os.fsync`` behave as on Windows, where ``_commit`` ->
+    ``FlushFileBuffers`` needs a handle with write access: a descriptor
+    opened read-only raises ``EBADF`` (``[Errno 9] Bad file descriptor``,
+    the windows-latest runner shape at ``seal_stream_terminal``).  Returns
+    the log of ``(inode, writable)`` flush attempts."""
+    fcntl = pytest.importorskip("fcntl")
+    real_fsync = api.os.fsync
+    flushed: list[tuple[int, bool]] = []
+
+    def windows_fsync(descriptor: int) -> None:
+        access = fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+        writable = access != os.O_RDONLY
+        flushed.append((os.fstat(descriptor).st_ino, writable))
+        if not writable:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(api, "_FSYNC_REQUIRES_WRITE_ACCESS", True)
+    monkeypatch.setattr(api.os, "fsync", windows_fsync)
+    return flushed
+
+
+def test_win32_read_only_seal_flushes_through_a_writable_reopen_of_the_exact_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    flushed = _fsync_refuses_read_only_descriptors(api, monkeypatch)
+    accepted = target.stat()
+    descriptor = os.open(target, os.O_RDONLY)
+    try:
+        checkpoint = transaction.seal_stream_checkpoint(
+            attempt,
+            lease=lease,
+            descriptor=descriptor,
+            evidence_digest=hashlib.sha256(b"row").hexdigest(),
+            evidence_bytes=3,
+        )
+    finally:
+        os.close(descriptor)
+    transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    terminal = transaction.seal_stream_terminal(attempt, lease=lease)
+
+    # Each durable flush of a read-only descriptor is refused once and then
+    # completed through a writable descriptor of the SAME inode; the reopen
+    # neither writes nor touches the target.
+    assert flushed == [
+        (accepted.st_ino, False),
+        (accepted.st_ino, True),
+    ] * 2
+    assert target.stat().st_mtime_ns == accepted.st_mtime_ns
+    assert terminal.size == 4
+    assert api.revalidate_stream_terminal(target, terminal).digest == (
+        hashlib.sha256(b"AAAA").hexdigest()
+    )
+    assert transaction.snapshot().phase is api.TransactionPhase.EXECUTING
+
+
+def test_win32_read_only_receipts_flush_through_a_writable_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _api()
+    target = tmp_path / "diagnostic.nexus"
+    target.write_bytes(b"semantic-content")
+    flushed = _fsync_refuses_read_only_descriptors(api, monkeypatch)
+    inode = target.stat().st_ino
+    descriptor = os.open(target, os.O_RDONLY)
+    try:
+        content = api._descriptor_content_receipt(
+            descriptor, target, "diagnostic-content", durable_fsync=True,
+        )
+        stream = api._descriptor_stream_stat_receipt(
+            descriptor,
+            target,
+            evidence_digest=content.snapshot.digest,
+            evidence_bytes=content.snapshot.size,
+            ordinal=1,
+            role="diagnostic-stream",
+            durable_fsync=True,
+        )
+    finally:
+        os.close(descriptor)
+    assert flushed == [(inode, False), (inode, True)] * 2
+    assert content.snapshot.digest == hashlib.sha256(
+        b"semantic-content"
+    ).hexdigest()
+    assert stream.evidence_bytes == len(b"semantic-content")
+
+
+def test_win32_read_only_seal_refuses_a_foreign_inode_at_the_writable_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    flushed = _fsync_refuses_read_only_descriptors(api, monkeypatch)
+    other = tmp_path / "other.nexus"
+    other.write_bytes(b"AAAA")
+    real_open = api.os.open
+    resolved = os.path.realpath(target)
+    foreign: list[int] = []
+
+    def reopen_names_another_file(path, flags, *args, **kwargs):
+        # The pathname is swapped between the read-only fstat and the
+        # writable reopen: the reopened descriptor names another inode.
+        if (flags & os.O_ACCMODE) == os.O_RDWR and (
+            os.path.realpath(path) == resolved
+        ):
+            foreign.append(real_open(other, flags, *args, **kwargs))
+            return foreign[-1]
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(api.os, "open", reopen_names_another_file)
+    with pytest.raises(api.TargetChanged, match="reopened a foreign inode"):
+        transaction.seal_stream_terminal(attempt, lease=lease)
+    # The foreign descriptor was never flushed and is closed.
+    assert flushed == [(target.stat().st_ino, False)]
+    assert len(foreign) == 1
+    with pytest.raises(OSError):
+        os.fstat(foreign[0])
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
+@pytest.mark.parametrize(
+    ("requires_write_access", "error_number"),
+    [(False, errno.EBADF), (True, errno.EINVAL)],
+    ids=("posix-ebadf", "win32-other-errno"),
+)
+def test_flush_failure_never_reopens_unless_win32_refused_a_read_only_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_write_access: bool,
+    error_number: int,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    real_open = api.os.open
+    writable_opens: list[str] = []
+
+    def failing_fsync(descriptor: int) -> None:
+        raise OSError(error_number, os.strerror(error_number))
+
+    def counting_open(path, flags, *args, **kwargs):
+        if (flags & os.O_ACCMODE) != os.O_RDONLY:
+            writable_opens.append(str(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(api, "_FSYNC_REQUIRES_WRITE_ACCESS", requires_write_access)
+    monkeypatch.setattr(api.os, "fsync", failing_fsync)
+    monkeypatch.setattr(api.os, "open", counting_open)
+    with pytest.raises(api.TargetChanged, match="content seal failed") as caught:
+        transaction.seal_stream_terminal(attempt, lease=lease)
+    assert isinstance(caught.value.__cause__, OSError)
+    assert caught.value.__cause__.errno == error_number
+    assert writable_opens == []
     assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
 
 
