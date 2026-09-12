@@ -2207,17 +2207,19 @@ def _inspect_committed(
     if not preservation_prevalidated:
         _require_terminal_source_topology(inspected)
     final = _support.capture_target_snapshot(path)
-    state = os.stat(path)
-    if final != snapshot:
+    if final != snapshot or final.ctime_ns != snapshot.ctime_ns:
         raise FiniteArtifactIntegrityError(
             "committed successor changed during inspection"
         )
     if capture is not None:
         capture(labels, audit_identity, result_digest)
+    # The terminal's object revision is the capture's descriptor view (the
+    # change time on win32, not a pathname stat's creation time), the origin
+    # ``revalidate_stream_terminal`` holds its descriptor views to.
     terminal = StreamTerminal(
         str(path), int(snapshot.size), str(snapshot.digest), 1,
-        int(state.st_dev), int(state.st_ino), int(state.st_mtime_ns),
-        int(state.st_ctime_ns),
+        int(final.device), int(final.inode), int(final.mtime_ns),
+        int(final.ctime_ns),
     )
     return FiniteCommittedInspection(terminal, validation.lineage)
 

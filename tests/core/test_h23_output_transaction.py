@@ -656,6 +656,66 @@ def test_win32_identity_ignores_ctime_and_still_seals_promotes_and_revalidates(
     assert api._stream_stat_matches(target, transaction._stream_checkpoint)
 
 
+def _rewrite_keeping_size_and_mtime(target: Path, payload: bytes) -> os.stat_result:
+    """Rewrite *target* in place with a same-length *payload* and restore its
+    mtime: the mutation only the descriptor's change time still reveals.
+    Returns the descriptor view after the rewrite."""
+    before = os.stat(target)
+    assert len(payload) == before.st_size
+    target.write_bytes(payload)
+    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+    with target.open("rb") as handle:
+        after = os.fstat(handle.fileno())
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    return after
+
+
+def test_win32_identity_terminal_revalidation_refuses_a_same_size_same_mtime_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stat-only revalidator hands out the sealed digest without rereading
+    the bytes, so it must hold its DESCRIPTOR views to the sealed ctime even
+    where the pathname compare is neutral (Codex PR #1 review, F1)."""
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", False)
+    _pathname_stat_reports_creation_time(api, monkeypatch, target)
+    terminal = transaction.seal_stream_terminal(attempt, lease=lease)
+    assert api.revalidate_stream_terminal(target, terminal).digest == (
+        hashlib.sha256(b"AAAA").hexdigest()
+    )
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    # Precondition of the row: only the descriptor's change time moved.
+    assert after.st_ctime_ns != terminal.ctime_ns
+    with pytest.raises(api.TargetChanged, match="object changed before browse"):
+        api.revalidate_stream_terminal(target, terminal)
+
+
+def test_win32_identity_target_snapshot_revalidation_refuses_a_same_size_same_mtime_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _api()
+    target = tmp_path / "scan.nexus"
+    target.write_bytes(b"AAAA")
+    with target.open("rb") as handle:
+        handle_ctime_ns = os.fstat(handle.fileno()).st_ctime_ns
+    monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", False)
+    _pathname_stat_reports_creation_time(api, monkeypatch, target)
+    assert api.os.stat(target).st_ctime_ns == handle_ctime_ns - 374_000_000
+    snapshot = api.capture_target_snapshot(target)
+    # The snapshot records the descriptor's view, not the creation time ...
+    assert snapshot.ctime_ns == handle_ctime_ns
+    # ... so the untouched object revalidates under the Windows shape ...
+    assert api.revalidate_target_snapshot(target, snapshot) is snapshot
+    # ... and a rewrite the seamed pathname view cannot see is still refused.
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    assert after.st_ctime_ns != snapshot.ctime_ns
+    with pytest.raises(api.TargetChanged, match="changed since its content snapshot"):
+        api.revalidate_target_snapshot(target, snapshot)
+
+
 def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

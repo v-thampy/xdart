@@ -2795,31 +2795,37 @@ class AnalysisArtifactOutput:
             captured.mtime_ns,
         ):
             raise TargetChanged("analysis artifact changed while sealing commit")
+        # The terminal's object revision is the capture's descriptor view
+        # (its ctime is the change time on win32, never the pathname stat's
+        # creation time), the origin ``revalidate_stream_terminal`` holds
+        # its own descriptor views to.
         terminal = StreamTerminal(
             self.request.target,
             captured.size,
             captured.digest,
             self._ordinal,
-            int(state.st_dev),
-            int(state.st_ino),
-            int(state.st_mtime_ns),
-            int(state.st_ctime_ns),
+            captured.device,
+            captured.inode,
+            captured.mtime_ns,
+            captured.ctime_ns,
         )
         revalidate_stream_terminal(self.request.target, terminal)
         final_capture = capture_target_snapshot(self.request.target)
         final_state = os.stat(self.request.target)
-        if final_capture != captured or (
-            int(final_state.st_dev),
-            int(final_state.st_ino),
-            int(final_state.st_size),
-            int(final_state.st_mtime_ns),
-            int(final_state.st_ctime_ns),
-        ) != (
-            terminal.device,
-            terminal.inode,
-            terminal.size,
-            terminal.mtime_ns,
-            terminal.ctime_ns,
+        if (
+            final_capture != captured
+            or final_capture.ctime_ns != terminal.ctime_ns
+            or (
+                int(final_state.st_dev),
+                int(final_state.st_ino),
+                int(final_state.st_size),
+                int(final_state.st_mtime_ns),
+            ) != (
+                terminal.device,
+                terminal.inode,
+                terminal.size,
+                terminal.mtime_ns,
+            )
         ):
             raise TargetChanged("analysis artifact changed after terminal validation")
         return terminal, inspection

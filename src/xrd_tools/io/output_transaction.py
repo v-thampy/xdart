@@ -585,28 +585,46 @@ def _require_identity(actual, expected, name: str) -> None:
         raise OwnershipRefused(f"foreign {name}; exact owner object required")
 
 
-# The descriptor and pathname identities this module compares share the
-# tree-wide win32 ctime seam (xrd_tools.io.stat_identity): identity on
-# win32 is (dev, ino, size, mtime_ns) with a neutral ctime slot, receipts
-# still record the observed ctime as evidence, and the content digest
-# remains the authority for a same-size same-mtime in-place mutation.
+# The tree-wide win32 ctime seam (xrd_tools.io.stat_identity) applies to
+# every comparison that has a PATHNAME view on one side: win32 fills a
+# pathname stat's st_ctime from the creation time, so against a descriptor
+# view (or a descriptor-recorded receipt) the slot is neutral there and
+# identity is (dev, ino, size, mtime_ns).  A descriptor view compared with
+# a descriptor-recorded receipt keeps ctime on every platform: win32 fills
+# fstat's st_ctime from NTFS ChangeTime, which every write and every utime
+# advance, so a same-size same-mtime in-place rewrite still changes it and
+# the stat-only revalidators below cannot hand out a stale digest for it.
+# Receipts always record the descriptor's observed ctime.
 _identity_ctime_ns = identity_ctime_ns
 
 
 def _comparable_identity(
     identity: tuple[int, int, int, int, int],
 ) -> tuple[int, int, int, int, int]:
-    """Normalise a sealed (dev, ino, size, mtime_ns, ctime_ns) for comparison."""
+    """Normalise a sealed (dev, ino, size, mtime_ns, ctime_ns) for a
+    comparison that involves a pathname view."""
     return (*identity[:4], _identity_ctime_ns(identity[4]))
 
 
 def _stat_identity(stat_result) -> tuple[int, int, int, int, int]:
+    """The seamed identity of one stat view (pathname or descriptor)."""
+    return (*_descriptor_identity(stat_result)[:4],
+            _identity_ctime_ns(stat_result.st_ctime_ns))
+
+
+def _descriptor_identity(stat_result) -> tuple[int, int, int, int, int]:
+    """The exact (dev, ino, size, mtime_ns, ctime_ns) of one DESCRIPTOR view.
+
+    Compare it only with another descriptor view or a descriptor-recorded
+    receipt (``StreamTerminal``, ``TargetSnapshot.ctime_ns``); a pathname
+    view goes through ``_stat_identity``.
+    """
     return (
         int(stat_result.st_dev),
         int(stat_result.st_ino),
         int(stat_result.st_size),
         int(stat_result.st_mtime_ns),
-        _identity_ctime_ns(stat_result.st_ctime_ns),
+        int(stat_result.st_ctime_ns),
     )
 
 
@@ -704,6 +722,10 @@ def _capture_target(target: str, *, hash_content: bool = True) -> TargetSnapshot
     }
     if len(identities) != 1:
         raise TargetChanged(f"target mutated while fingerprinting {target}")
+    # The four views agree on identity; the descriptor's closing view is the
+    # recorded one (identical to ``after`` wherever ctime is part of
+    # identity; the change time rather than the creation time on win32), so
+    # ``revalidate_target_snapshot`` can hold its descriptor views to it.
     return TargetSnapshot(
         True,
         int(after.st_size),
@@ -711,7 +733,7 @@ def _capture_target(target: str, *, hash_content: bool = True) -> TargetSnapshot
         int(after.st_dev),
         int(after.st_ino),
         digest,
-        int(after.st_ctime_ns),
+        int(finished.st_ctime_ns),
     )
 
 
@@ -738,7 +760,7 @@ def revalidate_target_snapshot(
         return current
     expected = (
         snapshot.device, snapshot.inode, snapshot.size,
-        snapshot.mtime_ns, _identity_ctime_ns(snapshot.ctime_ns),
+        snapshot.mtime_ns, int(snapshot.ctime_ns),
     )
     target = os.path.realpath(os.fspath(path))
     try:
@@ -754,9 +776,29 @@ def revalidate_target_snapshot(
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
-    if any(_stat_identity(value) != expected for value in (before, named, after)):
+    if not _revision_holds(expected, before, named, after):
         raise TargetChanged("target changed since its content snapshot")
     return snapshot
+
+
+def _revision_holds(
+    expected: tuple[int, int, int, int, int],
+    before: os.stat_result,
+    named: os.stat_result,
+    after: os.stat_result,
+) -> bool:
+    """Whether a descriptor-recorded revision still names the open object.
+
+    The two descriptor views must match the recorded revision exactly (ctime
+    included, on every platform); the pathname view between them is held to
+    the seamed identity only.  Every revalidator that hands out a recorded
+    digest without rereading the bytes goes through this.
+    """
+    return (
+        _descriptor_identity(before) == expected
+        and _descriptor_identity(after) == expected
+        and _stat_identity(named) == _comparable_identity(expected)
+    )
 
 
 def revalidate_stream_terminal(
@@ -773,7 +815,6 @@ def revalidate_stream_terminal(
     revision = stream_terminal_object_revision(terminal)
     if revision is None:
         raise TargetChanged("stream terminal lacks an exact object revision")
-    expected = _comparable_identity(revision)
     try:
         descriptor = os.open(target, os.O_RDONLY)
     except OSError as exc:
@@ -791,10 +832,7 @@ def revalidate_stream_terminal(
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
-    if any(
-        _stat_identity(observed) != expected
-        for observed in (before, named, after)
-    ):
+    if not _revision_holds(revision, before, named, after):
         raise TargetChanged("stream terminal object changed before browse")
     return TargetSnapshot(
         True,
