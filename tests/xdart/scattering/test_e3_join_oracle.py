@@ -475,6 +475,11 @@ def test_j0_02_browser_footer_share_repeated_dotted_exact_keys(
     )
     try:
         _run(rig)
+        # _run returns once the acquisition context exists, before any frame
+        # is catalogued; a Pause landing that early on a slow host (Linux CI)
+        # freezes navigation with no key for frame 1.  Cores=1 delivers frames
+        # in order, so the first key is frame 1 once any key exists.
+        _wait(rig.app, lambda: bool(rig.controller.frame_keys))
         _pause(rig)
         a_one = next(
             key for key in rig.controller.frame_keys
