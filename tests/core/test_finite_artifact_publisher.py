@@ -2518,10 +2518,39 @@ def test_win32_identity_admits_the_pathname_ctime_shape_and_records_the_descript
     snapshot = admission.snapshot
     assert snapshot.ctime_ns == handle_ctime_ns
     assert (snapshot.size, snapshot.digest) == (6, hashlib.sha256(b"finite").hexdigest())
-    # A pathname re-observation of the same object still agrees with it ...
+    # A descriptor re-observation of the same object still agrees with it,
+    # ctime included: the recorded identity is the descriptor's view, exact.
     assert finite_module._observe_regular(source) == finite_module._snapshot_state(snapshot)
-    # ... and a same-size same-mtime rewrite is still caught by the digest, not ctime.
-    assert finite_module._snapshot_state(snapshot)[5] == 0
+    assert finite_module._snapshot_state(snapshot)[5] == handle_ctime_ns
+    # Only a compare against a pathname view goes through the seam.
+    assert finite_module._comparable(finite_module._snapshot_state(snapshot))[5] == 0
+
+
+def test_win32_identity_refuses_a_same_size_same_mtime_rewrite_after_admission(
+    tmp_path: Path, monkeypatch, ctime_seam, win32_pathname_ctime,
+) -> None:
+    """``_require_source`` carries ``snapshot.digest`` forward on a stat
+    compare alone, so it must see the descriptor's change time move even
+    where the pathname compare is neutral (Codex PR #1 review, F1)."""
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"finite")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    win32_pathname_ctime(source)
+    admission = capture_finite_source(source)
+    assert finite_module._require_source(admission) is admission.snapshot
+    before = os.stat(source)
+    source.write_bytes(b"FINITE")
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    with source.open("rb") as handle:
+        after = os.fstat(handle.fileno())
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    # Precondition of the row: only the descriptor's change time moved.
+    assert after.st_ctime_ns != admission.snapshot.ctime_ns
+    assert finite_module._observe_regular(source) != finite_module._snapshot_state(
+        admission.snapshot
+    )
+    with pytest.raises(FiniteArtifactIntegrityError, match="changed after admission"):
+        finite_module._require_source(admission)
 
 
 def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(

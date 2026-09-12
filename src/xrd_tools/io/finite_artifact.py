@@ -359,17 +359,18 @@ class FinitePredecessorReceipt:
                 terminal.target != snapshot.path
                 or terminal.size != snapshot.size
                 or terminal.digest != snapshot.digest
+                # Both are descriptor-recorded views of one object: exact.
                 or (
                     terminal.device,
                     terminal.inode,
                     terminal.mtime_ns,
-                    identity_ctime_ns(terminal.ctime_ns),
+                    terminal.ctime_ns,
                 )
                 != (
                     snapshot.device,
                     snapshot.inode,
                     snapshot.mtime_ns,
-                    identity_ctime_ns(snapshot.ctime_ns),
+                    snapshot.ctime_ns,
                 )
             ):
                 raise ValueError("finite predecessor terminal does not match source")
@@ -1651,10 +1652,11 @@ def _comparable(
 ) -> tuple[int, int, int, int, int, int]:
     """*state* with its ctime slot on the win32 seam.
 
-    Every identity check here compares a descriptor view of a file with a
-    pathname view, and on win32 the two report different ctimes for one
-    untouched file (change time vs creation time).  Snapshots keep the
-    observed ctime; only comparisons go through this.
+    ``_capture_regular`` agrees a descriptor view of a file with a pathname
+    view, and on win32 the two report different ctimes for one untouched
+    file (change time vs creation time).  Snapshots keep the descriptor's
+    observed ctime and compare with later descriptor views exactly
+    (``_snapshot_state``); only the mixed-view agreement goes through this.
     """
     return (*state[:5], identity_ctime_ns(state[5]))
 
@@ -1809,20 +1811,30 @@ def _same_object(left: FiniteFileSnapshot, right: FiniteFileSnapshot) -> bool:
 
 
 def _snapshot_state(snapshot: FiniteFileSnapshot) -> tuple[int, int, int, int, int, int]:
-    """The comparable identity of *snapshot* (ctime on the win32 seam)."""
+    """The exact recorded identity of *snapshot*: a descriptor view.
+
+    Snapshots record the descriptor's closing view (``_capture_regular``), so
+    they compare with ``_observe_regular*`` — another descriptor view — with
+    ctime intact on every platform: win32 fills fstat's st_ctime from NTFS
+    ChangeTime, which every write and every utime advance, so a same-size
+    same-mtime in-place rewrite still changes it and the stat-only fences
+    that carry ``snapshot.digest`` forward cannot pass it.  Only a compare
+    against a pathname view needs the seam (``_comparable``).
+    """
     return (
         snapshot.device,
         snapshot.inode,
         snapshot.mode,
         snapshot.size,
         snapshot.mtime_ns,
-        identity_ctime_ns(snapshot.ctime_ns),
+        snapshot.ctime_ns,
     )
 
 
 def _observe_regular(path: Path | str) -> tuple[int, int, int, int, int, int]:
+    """The descriptor's closing view of one stable regular file, exact."""
     state, _digest_value = _capture_regular(path, hash_content=False)
-    return _comparable(state)
+    return state
 
 
 def _observe_regular_at(
@@ -1836,7 +1848,7 @@ def _observe_regular_at(
         name=name,
         hash_content=False,
     )
-    return _comparable(state)
+    return state
 
 
 def _try_observe(path: Path | str) -> tuple[int, int, int, int, int, int] | None:
@@ -2616,7 +2628,7 @@ class FiniteArtifactPublisher:
             # A closed reservation's inode can be reused after substitution.
             # Nothing has written this candidate yet, so its full reservation
             # state must still match before truncation or cleanup is allowed.
-            if _comparable(_state(opened_target)) != _snapshot_state(reservation):
+            if _state(opened_target) != _snapshot_state(reservation):
                 raise _FiniteCandidateOwnershipLost(
                     "finite seed descriptor identity changed"
                 )
@@ -2745,11 +2757,13 @@ class FiniteArtifactPublisher:
                 before != after
                 or terminal.target != str(path)
                 or terminal.size != after[3]
+                # ``after`` is a descriptor view, the terminal a
+                # descriptor-recorded revision: exact on every platform.
                 or (
                     terminal.device,
                     terminal.inode,
                     terminal.mtime_ns,
-                    identity_ctime_ns(terminal.ctime_ns),
+                    terminal.ctime_ns,
                 )
                 != (after[0], after[1], after[4], after[5])
                 or expected is not None
