@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+from importlib import resources
 import io
 import json
 
@@ -9,6 +10,7 @@ import numpy as np
 import pytest
 
 from xrd_tools.analysis.xu_stitch_calibration import (
+    _RESOURCE_PARTS,
     XuStitchCalibrationInput,
     canonical_surface_resource_bytes,
     capture_xu_stitch_calibration,
@@ -22,9 +24,13 @@ from xrd_tools.integrate.xu_stitch import (
     run_xu_hist_stitch_1d,
 )
 
-_SOLID_ANGLE_PIN = json.loads(canonical_surface_resource_bytes())["corrections"][
-    "solid_angle_sha256"
-]
+# Read the pin straight from the packaged asset: the hardened canonical walker
+# refuses on hosts it does not support (Windows drive roots), and a refusal at
+# import time would error the whole module out of collection instead of
+# failing the tests that need the walker.
+_SOLID_ANGLE_PIN = json.loads(
+    resources.files("xrd_tools").joinpath(*_RESOURCE_PARTS).read_bytes()
+)["corrections"]["solid_angle_sha256"]
 
 
 def _receipt(tmp_path):
