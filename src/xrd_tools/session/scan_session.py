@@ -1917,8 +1917,13 @@ class ScanSession:
                         "ScanSession final sweep failed for label %r", label)
     def flush(self, *, force: bool = False) -> None:
         """Contract pass-through to the sink's optional ``flush`` hook (ADR-0004
-        §4).  No-op for a sink without one."""
+        §4).  No-op for a sink without one.  A forced flush writes and seals
+        every settled dynamic NeXus record, so it also restarts the
+        ``semantic_checkpoint_frame_cap`` cadence that
+        :meth:`_on_dynamic_nexus_batch_settled` counts from the last seal."""
         self._event_sink.flush(force=force)
+        if force and self._dynamic_nexus_sink is not None:
+            self._dynamic_nexus_checkpoint_count = 0
 
     def set_generation(self, generation: int) -> None:
         """Set the stale-render stamp put on subsequent events (ADR-0004 §2).

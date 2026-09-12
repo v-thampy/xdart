@@ -148,6 +148,9 @@ def test_projection_pause_and_failed_compensation_retain_both_exact_causes():
         def pause(self, *, timeout):
             return True
 
+        def flush(self, *, force):
+            assert force
+
         def resume(self):
             raise recovery
 

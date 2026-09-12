@@ -1286,6 +1286,9 @@ def test_p1b_b12_stop_cancel_preserves_exact_durable_prefix(
         def pause(self, *, timeout: float) -> bool:
             return True
 
+        def flush(self, *, force: bool) -> None:
+            assert force
+
         def resume(self) -> None:
             raise AssertionError("Stop must not compensate Pause with resume")
 

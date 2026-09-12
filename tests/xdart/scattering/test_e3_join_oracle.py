@@ -948,18 +948,17 @@ def test_j0_08_evicted_hydration_is_single_flight_and_does_not_blank(
             ),
         )
         _pause(rig)
-        # Pause quiesces the writer but seals nothing.  A record batch written
-        # since the last sixteen-frame checkpoint leaves the artifact's
-        # checkpoint-hydration authority revoked, and the shell then drops an
-        # evicted-frame read silently until the next seal, which a paused run
-        # never reaches.  Seal the quiesced writer here so the hydration below
-        # is authorised on every host, not only when the pause happens to
-        # land on a checkpoint boundary.
+        # A record batch written since the last sixteen-frame checkpoint
+        # revokes the artifact's checkpoint-hydration authority, and the shell
+        # drops an evicted-frame read silently while it is revoked.  A durable
+        # Pause seals the quiesced writer itself, so the hydration below is
+        # authorised on every host, not only when the pause happens to land
+        # on a checkpoint boundary.
         run = rig.executor._active
         assert run is not None and run.session is not None
-        run.session.flush(force=True)
         records = run.display.artifacts[str(run.artifact)].records
         assert records._checkpoint_hydration_authority()[0] is not None
+        assert run.session._dynamic_nexus_checkpoint_count == 0
         _wait(rig.app, lambda: rig.shell.scientific.raw.image.image is not None)
         from xdart.gui.tabs.scattering import hydration_transport
 
