@@ -219,12 +219,14 @@ class _TerminalInterruption(BaseException):
 def _executing_stream(
     tmp_path: Path,
     *,
+    prior: bytes | None = b"prior",
     durable_fsync: bool = True,
     fast_regenerable: bool = False,
     content: bytes = b"AAAA",
 ):
     prepared = _prepared(
         tmp_path,
+        prior=prior,
         durable_fsync=durable_fsync,
         fast_regenerable=fast_regenerable,
     )
@@ -821,6 +823,243 @@ def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
     finally:
         os.close(descriptor)
     assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
+# ---------------------------------------------------------------------------
+# Codex review of 0ed7a46c, F1: every reuse of a sealed receipt's digest
+# without rereading the bytes holds two DESCRIPTOR views to the recorded
+# revision exactly, ctime included.  A pathname stat alone is neutral on
+# ctime under the win32 seam and accepted a same-size same-mtime rewrite.
+# ---------------------------------------------------------------------------
+
+
+def _refuse_rehash(api, monkeypatch: pytest.MonkeyPatch, target: Path) -> None:
+    """Fail the row if the module hashes *target*'s object from here on
+    (its backup is still verified through a hash of its own)."""
+    real_hash = api._sha256_handle
+    sealed = os.stat(target)
+
+    def rehashed(handle):
+        observed = os.fstat(handle.fileno())
+        if (observed.st_dev, observed.st_ino) == (sealed.st_dev, sealed.st_ino):
+            raise AssertionError("the sealed digest was rehashed instead of held")
+        return real_hash(handle)
+
+    monkeypatch.setattr(api, "_sha256_handle", rehashed)
+
+
+def _sealed_checkpoint(api, transaction, attempt, lease, target: Path):
+    descriptor = os.open(target, os.O_RDONLY)
+    try:
+        return transaction.seal_stream_checkpoint(
+            attempt,
+            lease=lease,
+            descriptor=descriptor,
+            evidence_digest=hashlib.sha256(b"row").hexdigest(),
+            evidence_bytes=3,
+        )
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("boundary", ("final", "epoch"))
+def test_win32_identity_commit_refuses_a_same_size_same_mtime_rewrite_after_the_terminal_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    """The commit publishes the terminal seal's digest without rehashing, so
+    it holds the object to the seal's exact descriptor revision.  Under the
+    win32 shape 0ed7a46c compared a pathname stat, neutral on ctime, and
+    committed the stale digest over the rewritten bytes."""
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, "win32")
+    terminal = transaction.seal_stream_terminal(attempt, lease=lease)
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    assert after.st_ctime_ns != terminal.ctime_ns
+    _refuse_rehash(api, monkeypatch, target)
+    commit = (
+        transaction.commit_stream if boundary == "final"
+        else transaction.commit_stream_epoch
+    )
+    with pytest.raises(api.TargetChanged) as raised:
+        commit(attempt, lease=lease)
+    message = str(raised.value)
+    assert message.startswith("stream terminal seal changed before commit: ")
+    # Diagnosable from the refusal alone: the sealed revision and every view.
+    assert f"sealed={api.stream_terminal_object_revision(terminal)}" in message
+    assert "descriptor=(" in message and "named=(" in message
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert transaction._terminal_receipt is None
+    assert target.read_bytes() == b"BBBB"
+
+
+@pytest.mark.parametrize("shape", ("posix", "win32"))
+def test_untouched_terminal_still_commits_without_a_rehash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, shape)
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    _refuse_rehash(api, monkeypatch, target)
+    committed = transaction.commit_stream(attempt, lease=lease)
+    assert committed.phase is api.TransactionPhase.COMMITTED
+    assert transaction._terminal_receipt.observed.digest == (
+        hashlib.sha256(b"AAAA").hexdigest()
+    )
+
+
+def test_win32_identity_promotion_refuses_a_same_size_same_mtime_rewrite_after_the_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, "win32")
+    checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    assert after.st_ctime_ns != checkpoint.ctime_ns
+    _refuse_rehash(api, monkeypatch, target)
+    with pytest.raises(
+        api.TargetChanged,
+        match=r"checkpoint changed before promotion: .*sealed=\(.*named=\(",
+    ):
+        transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert transaction.snapshot().durable_floor is None
+
+
+def test_win32_identity_close_authorization_refuses_a_same_size_same_mtime_rewrite_after_the_floor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, "win32")
+    checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
+    transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    assert after.st_ctime_ns != checkpoint.ctime_ns
+    _refuse_rehash(api, monkeypatch, target)
+    with pytest.raises(
+        api.TargetChanged,
+        match=r"floor changed before the controlled close: .*sealed=\(",
+    ):
+        transaction.begin_stream_close(attempt, lease=lease)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
+def test_win32_identity_resolved_close_reuse_refuses_a_same_size_same_mtime_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, "win32")
+    checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
+    transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    owner = transaction.begin_stream_close(attempt, lease=lease)
+    resolved = transaction.seal_stream_close(attempt, owner, lease=lease)
+    assert transaction.seal_stream_close(attempt, owner, lease=lease) is resolved
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    assert after.st_ctime_ns != resolved.ctime_ns
+    _refuse_rehash(api, monkeypatch, target)
+    with pytest.raises(
+        api.TargetChanged,
+        match=r"resolved stream close changed before reuse: .*sealed=\(",
+    ):
+        transaction.seal_stream_close(attempt, owner, lease=lease)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
+def test_win32_identity_fast_terminal_refuses_a_same_size_same_mtime_rewrite_after_the_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fast-regenerable terminal seal reuses the checkpoint's evidence
+    digest without rehashing: its descriptor is held to the checkpoint's
+    exact revision, not to the seamed identity."""
+    # A fast-regenerable admission captures its prior without a digest, so
+    # a PRESERVE_BASE seed from a prior is refused; the row starts fresh.
+    (prepared, attempt) = _executing_stream(
+        tmp_path, prior=None, fast_regenerable=True,
+    )
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, "win32")
+    checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    assert after.st_ctime_ns != checkpoint.ctime_ns
+    _refuse_rehash(api, monkeypatch, target)
+    with pytest.raises(api.TargetChanged, match="lost its close checkpoint"):
+        transaction.seal_stream_terminal(attempt, lease=lease)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
+def test_win32_identity_durable_floor_abort_refuses_a_same_size_same_mtime_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, "win32")
+    checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
+    transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    assert after.st_ctime_ns != checkpoint.ctime_ns
+    with pytest.raises(
+        api.TargetChanged,
+        match=r"floor changed after its exact seal: .*sealed=\(",
+    ):
+        transaction.abort_stream(attempt, lease=lease)
+    snapshot = transaction.snapshot()
+    assert snapshot.phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert snapshot.durable_floor is checkpoint
+    assert transaction.backup.read_bytes() == b"prior"
+
+
+def test_stream_revision_mismatch_names_a_vanished_pathname(tmp_path: Path) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    sealed = transaction._stream_terminal_stat
+    assert api._stream_revision_mismatch(target, sealed) is None
+    assert api._stream_stat_matches(target, sealed)
+    target.unlink()
+    mismatch = api._stream_revision_mismatch(target, sealed)
+    assert mismatch is not None and mismatch.endswith(
+        f"pathname disappeared (sealed={api._stream_receipt_revision(sealed)})"
+    )
+    assert not api._stream_stat_matches(target, sealed)
+
+
+def test_stream_revision_mismatch_names_an_unreadable_pathname(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read-only open refused for any reason but absence (a win32 sharing
+    violation, a directory in the file's place) is a diagnosable refusal
+    through the same channel, not an escaping ``OSError``."""
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    sealed = transaction._stream_terminal_stat
+    assert api._stream_revision_mismatch(target, sealed) is None
+    real_open = api.os.open
+
+    def sharing_violation(path, flags, *args, **kwargs):
+        if Path(path) == target:
+            raise PermissionError(errno.EACCES, "sharing violation", str(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(api.os, "open", sharing_violation)
+    mismatch = api._stream_revision_mismatch(target, sealed)
+    assert mismatch is not None
+    assert mismatch.startswith(f"{target}: unreadable for the revision check ")
+    assert "PermissionError: sharing violation" in mismatch
+    assert mismatch.endswith(f"sealed={api._stream_receipt_revision(sealed)}")
 
 
 def _fsync_refuses_read_only_descriptors(api, monkeypatch):

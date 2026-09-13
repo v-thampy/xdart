@@ -1102,12 +1102,79 @@ def _stream_receipt_identity(
     )
 
 
-def _stream_stat_matches(path: Path | str, receipt: _StreamStatReceipt) -> bool:
+def _stream_receipt_revision(
+    receipt: _StreamStatReceipt,
+) -> tuple[int, int, int, int, int]:
+    """The exact (dev, ino, size, mtime_ns, ctime_ns) a receipt recorded from
+    its sealing descriptor; compare it only with descriptor views."""
+    return (
+        receipt.identity.device,
+        receipt.identity.inode,
+        receipt.size,
+        receipt.mtime_ns,
+        receipt.ctime_ns,
+    )
+
+
+def _stream_revision_mismatch(
+    path: Path | str,
+    receipt: _StreamStatReceipt,
+    *,
+    descriptor: int | None = None,
+) -> str | None:
+    """``None`` while *path* still names the exact object *receipt* sealed;
+    otherwise the views that disagree.
+
+    Every reuse of a sealed receipt's digest without rereading the bytes
+    goes through here, the way ``revalidate_stream_terminal`` does: two
+    descriptor views (*descriptor*, or a read-only open of *path*) are held
+    to the recorded revision exactly, ctime included, with the pathname view
+    between them held to the seamed identity (``_revision_holds``).  A
+    pathname stat on its own is neutral on ctime under win32 and would
+    accept a same-size same-mtime rewrite of the sealed bytes (Codex review
+    of 0ed7a46c, F1).
+    """
+    revision = _stream_receipt_revision(receipt)
+    owned = descriptor is None
+    if owned:
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+        except FileNotFoundError:
+            return f"{path}: pathname disappeared (sealed={revision})"
+        except OSError as exc:
+            # A read-only open that fails for any other reason (a win32
+            # sharing violation, a directory in the file's place) is a
+            # refusal through the same diagnosable channel, not a crash.
+            return (
+                f"{path}: unreadable for the revision check "
+                f"({type(exc).__name__}: {exc.strerror or exc}) sealed={revision}"
+            )
     try:
-        observed = os.stat(path)
-    except FileNotFoundError:
-        return False
-    return _stat_identity(observed) == _stream_receipt_identity(receipt)
+        before = os.fstat(descriptor)
+        try:
+            named = os.stat(path)
+        except FileNotFoundError:
+            return f"{path}: pathname disappeared (sealed={revision})"
+        after = os.fstat(descriptor)
+    finally:
+        if owned:
+            os.close(descriptor)
+    if _revision_holds(revision, before, named, after):
+        return None
+    return (
+        f"{path}: sealed={revision} descriptor={_descriptor_identity(before)} "
+        f"named={_stat_identity(named)} "
+        f"descriptor-after={_descriptor_identity(after)}"
+    )
+
+
+def _stream_stat_matches(
+    path: Path | str,
+    receipt: _StreamStatReceipt,
+    *,
+    descriptor: int | None = None,
+) -> bool:
+    return _stream_revision_mismatch(path, receipt, descriptor=descriptor) is None
 
 
 def _receipt_for_snapshot(path: Path | str, snapshot: TargetSnapshot, role: str) -> _ObjectReceipt:
@@ -3041,15 +3108,20 @@ class OutputTransaction:
                 if self._stream_durable_floor is not None
                 else self._stream_checkpoint_token
             )
-            if (
-                not self._stream_checkpoint_fresh
-                or self._stream_checkpoint_token is not floor
-                or checkpoint is None
-                or not _stream_stat_matches(self._admission.target, checkpoint)
-            ):
+            mismatch = (
+                "checkpoint is not the fresh durable floor"
+                if (
+                    not self._stream_checkpoint_fresh
+                    or self._stream_checkpoint_token is not floor
+                    or checkpoint is None
+                )
+                else _stream_revision_mismatch(self._admission.target, checkpoint)
+            )
+            if mismatch is not None:
                 self._phase = TransactionPhase.INTEGRITY_HOLD
                 raise TargetChanged(
-                    "durability floor changed before the controlled close"
+                    "durability floor changed before the controlled close: "
+                    + mismatch
                 )
             owner = _StreamCloseAttempt(
                 self._admission.target,
@@ -3078,12 +3150,16 @@ class OutputTransaction:
             resolved = self._stream_close_checkpoint
             if resolved is not None:
                 receipt = self._stream_checkpoint
-                if receipt is None or not _stream_stat_matches(
-                    self._admission.target, receipt,
-                ):
+                mismatch = (
+                    "no sealed checkpoint" if receipt is None
+                    else _stream_revision_mismatch(
+                        self._admission.target, receipt, descriptor=descriptor,
+                    )
+                )
+                if mismatch is not None:
                     self._phase = TransactionPhase.INTEGRITY_HOLD
                     raise TargetChanged(
-                        "resolved stream close changed before reuse"
+                        "resolved stream close changed before reuse: " + mismatch
                     )
                 return resolved
             floor_receipt = self._stream_checkpoint
@@ -3187,12 +3263,15 @@ class OutputTransaction:
                     "only the fresh sealed checkpoint can become durable"
                 )
             receipt = self._stream_checkpoint
-            if receipt is None or not _stream_stat_matches(
-                self._admission.target, receipt,
-            ):
+            mismatch = (
+                "no sealed checkpoint" if receipt is None
+                else _stream_revision_mismatch(self._admission.target, receipt)
+            )
+            if mismatch is not None:
                 self._phase = TransactionPhase.INTEGRITY_HOLD
                 raise TargetChanged(
-                    "durability-floor checkpoint changed before promotion"
+                    "durability-floor checkpoint changed before promotion: "
+                    + mismatch
                 )
             self._stream_durable_floor = checkpoint
             self._pending.discard(RetryAction.ROLLBACK)
@@ -3217,17 +3296,25 @@ class OutputTransaction:
             failure: BaseException | None = None
             try:
                 descriptor = os.open(self._admission.target, os.O_RDONLY)
-                expected_stat = _stat_identity(os.fstat(descriptor))
+                opened = os.fstat(descriptor)
+                expected_stat = _stat_identity(opened)
                 if self._durable_fsync:
                     _fsync_descriptor(descriptor, Path(self._admission.target))
-                if _stat_identity(os.fstat(descriptor)) != expected_stat:
+                flushed = os.fstat(descriptor)
+                # Two views of one descriptor: exact, ctime included.
+                if _descriptor_identity(flushed) != _descriptor_identity(opened):
                     raise TargetChanged(
                         "stream terminal descriptor changed during fsync"
                     )
                 checkpoint = self._stream_checkpoint if self._fast_regenerable else None
+                # The fast terminal reuses the checkpoint's evidence digest
+                # without rehashing, so the descriptor is held to the
+                # checkpoint's recorded revision exactly, not to the seamed
+                # identity a pathname compare would settle for.
                 if self._fast_regenerable and (
                     checkpoint is None or not self._stream_checkpoint_fresh
-                    or expected_stat != _stream_receipt_identity(checkpoint)
+                    or _descriptor_identity(flushed)
+                    != _stream_receipt_revision(checkpoint)
                 ):
                     raise TargetChanged("fast stream terminal lost its close checkpoint")
                 receipt = _descriptor_content_receipt(
@@ -3553,10 +3640,17 @@ class OutputTransaction:
                 not self._fast_regenerable
                 and terminal_stat.evidence_bytes != terminal_stat.size
             )
-            or not _stream_stat_matches(target, terminal_stat)
         ):
             self._terminal_receipt = None
             return TargetChanged("stream terminal seal changed before commit")
+        # The commit publishes the sealed digest without rereading the bytes:
+        # the object is held to the seal's exact descriptor revision.
+        mismatch = _stream_revision_mismatch(target, terminal_stat)
+        if mismatch is not None:
+            self._terminal_receipt = None
+            return TargetChanged(
+                "stream terminal seal changed before commit: " + mismatch
+            )
         self._terminal_receipt = _TerminalReceipt(
             self._admission.target,
             snapshot,
@@ -3651,17 +3745,23 @@ class OutputTransaction:
                             "durable-floor-preserved",
                             durable_fsync=self._durable_fsync,
                         )
+                        # The same descriptor that hashed the preserved bytes
+                        # is held to the checkpoint's exact revision.
+                        mismatch = (
+                            "preserved object is a foreign inode"
+                            if preserved.identity != checkpoint.identity
+                            else _stream_revision_mismatch(
+                                self._admission.target, checkpoint,
+                                descriptor=descriptor,
+                            )
+                        )
                     finally:
                         os.close(descriptor)
-                    if (
-                        preserved.identity != checkpoint.identity
-                        or not _stream_stat_matches(
-                            self._admission.target, checkpoint,
-                        )
-                    ):
+                    if mismatch is not None:
                         self._phase = TransactionPhase.INTEGRITY_HOLD
                         raise TargetChanged(
-                            "durability floor changed after its exact seal"
+                            "durability floor changed after its exact seal: "
+                            + mismatch
                         )
                     self._terminal_receipt = _TerminalReceipt(
                         self._admission.target,

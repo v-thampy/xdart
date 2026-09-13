@@ -670,7 +670,7 @@ def test_stream_terminal_commit_transfers_one_full_seal_under_exact_exclusion(
     hashes = 0
     stat_checks = 0
     real_hash = module._sha256_handle
-    real_stat_match = module._stream_stat_matches
+    real_revision_check = module._stream_revision_mismatch
 
     def count_hash(handle):
         nonlocal hashes
@@ -681,14 +681,14 @@ def test_stream_terminal_commit_transfers_one_full_seal_under_exact_exclusion(
             hashes += 1
         return real_hash(handle)
 
-    def check_stat_under_exclusion(path, receipt):
+    def check_stat_under_exclusion(path, receipt, **kwargs):
         nonlocal stat_checks
         assert lock.depth > 0
         stat_checks += 1
-        return real_stat_match(path, receipt)
+        return real_revision_check(path, receipt, **kwargs)
 
     monkeypatch.setattr(module, "_sha256_handle", count_hash)
-    monkeypatch.setattr(module, "_stream_stat_matches", check_stat_under_exclusion)
+    monkeypatch.setattr(module, "_stream_revision_mismatch", check_stat_under_exclusion)
     with lock:
         transaction.seal_stream_terminal(attempt, lease=lease)
     if boundary == "final":
@@ -785,7 +785,7 @@ def test_stream_terminal_cleanup_retry_reuses_seal_and_retains_exclusion(
         target.write_bytes(b"terminal")
         real_hash = module._sha256_handle
         real_unlink = module._unlink
-        real_stat_match = module._stream_stat_matches
+        real_revision_check = module._stream_revision_mismatch
         hashes = 0
         stat_checks = 0
         failed = False
@@ -800,11 +800,11 @@ def test_stream_terminal_cleanup_retry_reuses_seal_and_retains_exclusion(
                 hashes += 1
             return real_hash(handle)
 
-        def check_stat_under_exclusion(path, receipt):
+        def check_stat_under_exclusion(path, receipt, **kwargs):
             nonlocal stat_checks
             assert lock.depth > 0
             stat_checks += 1
-            return real_stat_match(path, receipt)
+            return real_revision_check(path, receipt, **kwargs)
 
         def fail_backup_once(path):
             nonlocal failed
@@ -815,7 +815,7 @@ def test_stream_terminal_cleanup_retry_reuses_seal_and_retains_exclusion(
 
         with monkeypatch.context() as patch:
             patch.setattr(module, "_sha256_handle", count_hash)
-            patch.setattr(module, "_stream_stat_matches", check_stat_under_exclusion)
+            patch.setattr(module, "_stream_revision_mismatch", check_stat_under_exclusion)
             patch.setattr(module, "_unlink", fail_backup_once)
             with lock:
                 transaction.seal_stream_terminal(attempt, lease=lease)
