@@ -79,6 +79,7 @@ def test_real_standard_run_is_headless_durable_and_projectable(tmp_path: Path) -
     capture = pipeline.begin()
     assert isinstance(capture, StartCapture)
     admission = await_admission(executor, capture)
+    output = admission.outputs[0].item.target
     launched = pipeline.start(admission)
 
     assert isinstance(launched, StartLaunched)

@@ -57,6 +57,7 @@ from xrd_tools.sources.selection import (
     image_series_spec,
 )
 
+from tests.core.v2_fixture_factory import current_entry
 from tests.xdart.scattering.test_e3_join_oracle import (
     _mount,
     _pause,
@@ -254,8 +255,7 @@ def _write_xye_only_b(path: Path) -> tuple[np.ndarray, np.ndarray]:
     )
     record = FrameRecord.from_view(view)
     with h5py.File(path, "w") as handle:
-        entry = handle.create_group("entry")
-        entry.attrs["NX_class"] = "NXentry"
+        entry = current_entry(handle)
         write_frame_records(entry, [record])
     return (
         np.asarray(q, dtype=np.float32).astype(float),
@@ -857,7 +857,7 @@ def test_j3_mounted_qualified_xye_only_replaces_images_and_renders_trace(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    b_path = tmp_path / "accepted-xye-only.nxs"
+    b_path = tmp_path / "accepted-xye-only.nexus"
     q, intensity = _write_xye_only_b(b_path)
     rig = _mount(
         monkeypatch,
