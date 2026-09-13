@@ -7,6 +7,7 @@ import hashlib
 import io
 import math
 import os
+import re
 import stat
 import struct
 import zipfile
@@ -45,6 +46,9 @@ _RAW_DATASETS = (
     "/entry/instrument/detector/data", "/entry/instrument/detector/data_000001",
     "/entry/data/data", "/entry/measurement/data", "/entry/data/eiger_image",
 )
+# A processed record's source dataset hint that names one Eiger segment
+# link, as _hdf_segments enumerates them: ``/<entry>/data/data_<number>``.
+_SEGMENT_HINT = re.compile(r"^(?P<group>/(?P<entry>[^/]+)/data)/(?P<name>data_[0-9]+)$")
 
 
 class Viewer2DSourceKind(str, Enum):
@@ -1486,6 +1490,15 @@ def _dependency(locator, dataset, *, start=None, stop=None, logical=None,
                               start, stop, logical)
 
 
+class _SegmentUnavailable(Viewer2DReadError):
+    """One named Eiger segment link resolves to no rank-three dataset."""
+
+    def __init__(self, logical):
+        super().__init__(Viewer2DRefusalCode.FORMAT_INVALID,
+                         f"Eiger segment is missing or not rank three: {logical}")
+        self.logical = logical
+
+
 def _hdf_segments(path, entry, walk, admission):
     import h5py
     group = _hget(entry, "data", walk)
@@ -1506,7 +1519,7 @@ def _hdf_segments(path, entry, walk, admission):
         except Exception:
             dataset = None
         if not isinstance(dataset, h5py.Dataset) or dataset.ndim != 3:
-            _refuse(Viewer2DRefusalCode.FORMAT_INVALID, "Eiger segment is missing or not rank three")
+            raise _SegmentUnavailable(logical)
         walk.retain_candidate()
         shape = tuple(int(value) for value in dataset.shape)
         _, h, w = _shape_fhw(shape)
@@ -1528,6 +1541,48 @@ def _hdf_segments(path, entry, walk, admission):
     shape = (total, *frame_shape)
     _admit(shape)
     return shape, dtype, tuple(dependencies), segments[0][1]
+
+
+def _hinted_segments(path, handle, walk, admission, selected_path):
+    """The Eiger segment chain the validated dataset hint *selected_path*
+    anchors, or ``None`` when the hint is to be read as one dataset.
+
+    A processed record stores the dataset the writer integrated from --
+    for an Eiger master its first segment, ``/entry/data/data_000001`` --
+    beside a frame index that counts across every segment of the master.
+    Resolving the hint alone stopped the catalog at the first segment, so
+    every frame past it was "unavailable" and fell back to its thumbnail
+    (bo_2 frames >= 1000).  The hint is read as the chain's anchor when
+    it names the first segment of an intact chain.  A hint that is not
+    named like a segment, whose entry is absent, or that is not the first
+    segment of the chain :func:`_hdf_segments` finds (none, when the name
+    is an in-file dataset) keeps the single-dataset reading, as does a
+    chain broken only at a segment AFTER the hinted one: the hinted
+    segment's own frames stay readable.  A chain broken at the hinted
+    segment or before it refuses -- the chain the record's frame index
+    counts across is not there -- and so does every other chain refusal
+    (segments that disagree, a chain over the frame cap).
+    """
+    import h5py
+    match = _SEGMENT_HINT.match(selected_path)
+    if match is None:
+        return None
+    try:
+        entry = _hpath(handle, "/" + match.group("entry"), walk)
+    except KeyError:
+        return None
+    if not isinstance(entry, h5py.Group):
+        return None
+    try:
+        eiger = _hdf_segments(path, entry, walk, admission)
+    except _SegmentUnavailable as error:
+        group, _, name = error.logical.rpartition("/")
+        if group != match.group("group") or name <= match.group("name"):
+            raise
+        return None
+    if eiger is None or eiger[3] != selected_path:
+        return None
+    return eiger
 
 
 def _processed_frame_groups(frames, walk):
@@ -1709,6 +1764,13 @@ def _catalog_hdf5(path, policy, walk=None, preferred=None, admission=None):
                         "processed source cannot be selected as raw detector data",
                     )
                 dataset_path, dataset = _hdf_dataset(handle, walk, preferred)
+                eiger = _hinted_segments(path, handle, walk, admission, dataset_path)
+                if eiger is not None:
+                    shape, dtype, dependencies, dataset_path = eiger
+                    return _make_catalog(
+                        path, policy, Viewer2DSourceKind.RAW_DETECTOR,
+                        range(shape[0]), shape, dtype, admission.revision(path),
+                        dependencies, "hdf5-eiger", dataset=dataset_path)
             else:
                 entry = _hdf_entry(handle, walk)
                 entry_name = (
