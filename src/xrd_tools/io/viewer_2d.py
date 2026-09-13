@@ -622,6 +622,44 @@ def _dependency_chains(dependencies):
     return tuple(chains)
 
 
+def _chain_identities(catalog, chain, shape, dtype):
+    """The source-catalog identities a raw fact of *shape* and *dtype* over
+    the dependency *chain* (its base, then its frame intervals) may carry:
+    the single-dataset "hdf5" catalog of an external link covering the chain
+    (both source shapes when the chain is one frame long) and the
+    "hdf5-eiger" catalog of a contiguous segment chain anchored at the base's
+    dataset."""
+    total = chain[-1].frame_stop
+    intervals = chain[1:]
+    identities = set()
+    if (len(intervals) == 1 and intervals[0].frame_start == 0
+            and intervals[0].frame_stop == total
+            and intervals[0].logical_path == chain[0].dataset_path):
+        shapes = ((total, *shape),)
+        if total == 1:
+            shapes += (shape,)
+        for source_shape in shapes:
+            manifest = (
+                chain[0].locator, Viewer2DSourceKind.RAW_DETECTOR.value,
+                tuple(range(total)), source_shape, dtype, intervals,
+                "hdf5", None, chain[0].dataset_path, (),
+                catalog.policy_identity, chain[0].revision)
+            identities.add(_catalog_id(*manifest))
+    cover = tuple((item.frame_start, item.frame_stop) for item in intervals)
+    if (all(item.logical_path is not None for item in intervals)
+            and intervals[0].logical_path == chain[0].dataset_path
+            and cover == tuple((start, stop) for start, stop in zip(
+                (0, *(item.frame_stop for item in intervals[:-1])),
+                (item.frame_stop for item in intervals)))):
+        manifest = (
+            chain[0].locator, Viewer2DSourceKind.RAW_DETECTOR.value,
+            tuple(range(total)), (total, *shape), dtype,
+            intervals, "hdf5-eiger", None, chain[0].dataset_path, (),
+            catalog.policy_identity, chain[0].revision)
+        identities.add(_catalog_id(*manifest))
+    return frozenset(identities)
+
+
 def _validate_catalog_cross_fields(catalog):
     try:
         identity_policy = Viewer2DFormatPolicy(*catalog.policy_identity)
@@ -666,41 +704,23 @@ def _validate_catalog_cross_fields(catalog):
                           for left, right in zip(chain[1:], chain[2:]))
                    or any(item.logical_path is None for item in chain[1:])
                    for chain in chains), "catalog")
+        # A chain's admissible source-catalog identities depend on the fact
+        # only through its shape and dtype: computed once per (chain, shape,
+        # dtype), not once per raw fact -- each manifest strings the chain's
+        # whole frame range, so per-fact hashing cost every read of a
+        # 2,500-frame all-raw record ~0.3 s and a 3,621-frame one ~0.9 s.
+        identities_by_chain = {}
         for fact, (matches, _) in zip(raw_facts, selected):
             chain = matches[0]
             _malformed(len(chain) == 1 and chain[0].dataset_path is not None
                 and chain[0].dataset_path.rsplit("/", 1)[-1].startswith("data_")
                 and chain[0].dataset_path.rsplit("/", 1)[-1][5:].isdigit(), "catalog")
             if len(chain) > 1:
-                total = chain[-1].frame_stop
-                intervals = chain[1:]
-                identities = set()
-                if (len(intervals) == 1 and intervals[0].frame_start == 0
-                        and intervals[0].frame_stop == total
-                        and intervals[0].logical_path == chain[0].dataset_path):
-                    shapes = ((total, *fact.shape),)
-                    if total == 1:
-                        shapes += (fact.shape,)
-                    for source_shape in shapes:
-                        manifest = (
-                            chain[0].locator, Viewer2DSourceKind.RAW_DETECTOR.value,
-                            tuple(range(total)), source_shape, fact.dtype, intervals,
-                            "hdf5", None, chain[0].dataset_path, (),
-                            catalog.policy_identity, chain[0].revision)
-                        identities.add(_catalog_id(*manifest))
-                cover = tuple((item.frame_start, item.frame_stop)
-                              for item in intervals)
-                if (all(item.logical_path is not None for item in intervals)
-                        and intervals[0].logical_path == chain[0].dataset_path
-                        and cover == tuple((start, stop) for start, stop in zip(
-                            (0, *(item.frame_stop for item in intervals[:-1])),
-                            (item.frame_stop for item in intervals)))):
-                    manifest = (
-                        chain[0].locator, Viewer2DSourceKind.RAW_DETECTOR.value,
-                        tuple(range(total)), (total, *fact.shape), fact.dtype,
-                        intervals, "hdf5-eiger", None, chain[0].dataset_path, (),
-                        catalog.policy_identity, chain[0].revision)
-                    identities.add(_catalog_id(*manifest))
+                key = (id(chain), fact.shape, fact.dtype)
+                identities = identities_by_chain.get(key)
+                if identities is None:
+                    identities = identities_by_chain[key] = _chain_identities(
+                        catalog, chain, fact.shape, fact.dtype)
                 _malformed(fact.source_catalog_identity not in identities, "catalog")
         return
     _malformed(catalog.frame_labels != tuple(range(f)), "catalog")

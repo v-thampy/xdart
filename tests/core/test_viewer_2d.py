@@ -1963,6 +1963,29 @@ def test_processed_non_first_segment_hint_keeps_the_hinted_dataset_local(tmp_pat
     assert frame.provenance.dependencies == (base, intervals[0])
 
 
+def test_catalog_validation_hashes_a_chain_identity_once_per_shape(tmp_path, monkeypatch):
+    # Every read re-validates the catalog, and a chain's admissible identity
+    # manifests string the chain's whole frame range: hashed once per raw
+    # fact, a 2,500-frame all-raw record cost ~0.3 s per read.  Once per
+    # (chain, shape, dtype) instead -- six raw facts over one chain, one hash.
+    processed, _, _, _ = _hinted_eiger_record(
+        tmp_path, _FIRST_SEGMENT_HINT, frames=3, segments=2)
+    catalog = api.catalog_viewer_2d(processed)
+    assert [fact.source_kind for fact in catalog.frame_facts] == (
+        [api.Viewer2DSourceKind.PROCESSED_RAW] * 6)
+    manifests = []
+    original = api._catalog_id
+
+    def counted(*parts):
+        manifests.append(parts)
+        return original(*parts)
+
+    monkeypatch.setattr(api, "_catalog_id", counted)
+    api._validate_catalog_cross_fields(catalog)
+    assert [parts[6] for parts in manifests] == ["hdf5-eiger"]
+    assert manifests[0][2] == tuple(range(6))
+
+
 _REAL_EIGER_RECORDS = (
     pytest.param("bo_2_716V_5p9ms_sfpx_23p70_halpha_0p30_burst_00001_int2d.nexus",
                  (0, 999, 1000, 1999, 2000, 2499), id="bo_2-2500-frames"),
