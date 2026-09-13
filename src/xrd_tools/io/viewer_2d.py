@@ -2007,11 +2007,72 @@ def _cert_processed_pointer(catalog, fact, policy, walk):
                 "processed source pointer changed")
 
 
+class _HeldRevisions:
+    """Hold every admitted revision an HDF5 read relies on through a
+    descriptor for the read's duration.
+
+    ``h5py`` opens the files by name itself, so the pathname fences alone
+    would settle for the seamed identity and accept a same-size same-mtime
+    rewrite under win32 (Codex review of 0ed7a46c, F3).  A read-only
+    descriptor per distinct path, opened before the first fence and closed
+    after the last, is what lets ``_cert_stat_revision`` hold the exact
+    descriptor view (ctime included) on both sides of the read, the way the
+    NPY/NPZ/RAW readers already do with their own stream.  The descriptors
+    are never read from: only ``fstat``.
+    """
+
+    __slots__ = ("_revisions", "_held")
+
+    def __init__(self, revisions):
+        unique = {}
+        for revision in revisions:
+            unique.setdefault(revision.canonical_path, revision)
+        self._revisions = tuple(unique.values())
+        self._held = ()
+
+    def __enter__(self):
+        held = []
+        try:
+            for revision in self._revisions:
+                try:
+                    stream = open(revision.canonical_path, "rb", buffering=0)
+                except OSError:
+                    _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
+                            "viewer source is no longer readable")
+                held.append((revision, stream))
+        except BaseException:
+            for _, stream in held:
+                stream.close()
+            raise
+        self._held = tuple(held)
+        return self
+
+    def fence(self, message):
+        for revision, stream in self._held:
+            _cert_stat_revision(revision, stream=stream, message=message)
+
+    def __exit__(self, exc_type, exc, tb):
+        for _, stream in self._held:
+            stream.close()
+        self._held = ()
+        return False
+
+
 def _read_hdf5(catalog, label, policy, walk):
+    with _HeldRevisions(
+            (catalog.primary_revision,)
+            + tuple(item.revision for item in _selected_dependencies(catalog, label))) as held:
+        return _read_hdf5_held(catalog, label, policy, walk, held)
+
+
+def _read_hdf5_held(catalog, label, policy, walk, held):
     import h5py
     fact = next((value for value in catalog.frame_facts if value.label == label), None)
     _cert_revision(catalog.primary_revision, walk)
     dependencies = _cert_dependencies(catalog, label, walk)
+    # The pathname fences above keep the walk accounting and the external
+    # link check; the held descriptors are the last word before the read.
+    held.fence("HDF5 descriptor does not match catalog")
     if fact is not None and fact.source_kind is Viewer2DSourceKind.PROCESSED_RAW:
         _cert_processed_pointer(catalog, fact, policy, walk)
         interval = next((item for item in dependencies if item.frame_start is not None), None)
@@ -2075,6 +2136,7 @@ def _read_hdf5(catalog, label, policy, walk):
                  False, "", "", None, None)
     _cert_dependencies(catalog, label, walk)
     _cert_revision(catalog.primary_revision, walk)
+    held.fence("HDF5 source changed")
     return value
 
 

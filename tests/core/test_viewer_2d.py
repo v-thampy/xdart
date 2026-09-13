@@ -2101,6 +2101,83 @@ def test_win32_identity_descriptor_fence_refuses_a_same_size_same_mtime_rewrite(
     assert calls == [str(path.resolve())]
 
 
+@pytest.mark.parametrize("layout", ("contiguous", "eiger-segment"))
+def test_win32_identity_hdf5_read_holds_its_descriptors_to_the_exact_revision(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime, layout,
+):
+    """``_read_hdf5`` holds a read-only descriptor on the primary and on the
+    pixel-supplying dependency for the read's duration: a same-size
+    same-mtime rewrite the seamed pathname fences cannot see (win32) is
+    refused, and rehashed once, before a changed pixel inherits the admitted
+    identity (Codex review of 0ed7a46c, F3)."""
+    h5py = pytest.importorskip("h5py")
+    value = np.arange(2 * 2 * 3, dtype=np.uint16).reshape(2, 2, 3)
+    if layout == "contiguous":
+        target = primary = tmp_path / "stack.nxs"
+        _write_hdf_stack(primary, value)
+    else:
+        primary, segments, _ = _eiger_master(tmp_path, [("data_000001.h5", value)])
+        target = segments[0]
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    win32_pathname_ctime(target)
+    catalog = api.catalog_viewer_2d(primary)
+    revision = (catalog.primary_revision if layout == "contiguous" else next(
+        item.revision for item in catalog.dependencies
+        if item.locator == str(target.resolve())))
+    calls = []
+    original = api._stable_revision
+
+    def stable(candidate):
+        calls.append(str(Path(candidate).resolve()))
+        return original(candidate)
+
+    monkeypatch.setattr(api, "_stable_revision", stable)
+    _assert_canonical(api.read_viewer_2d_frame(catalog, 1), value[1])
+    assert calls == []
+    with target.open("rb") as handle:
+        admitted = os.fstat(handle.fileno())
+    with h5py.File(target, "r+") as handle:
+        handle["entry/data/data"][1, 0, 0] += 1
+    os.utime(target, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
+    with target.open("rb") as handle:
+        after = os.fstat(handle.fileno())
+    assert (after.st_size, after.st_mtime_ns) == (admitted.st_size, admitted.st_mtime_ns)
+    # Precondition of the row: only the descriptor's change time moved, and
+    # the seamed pathname fence is blind to it.
+    assert after.st_ctime_ns != revision.ctime_ns
+    assert api._path_stat(target) == api._revision_stat(revision)
+    _assert_changed(api.read_viewer_2d_frame, catalog, 1)
+    assert calls == [str(target.resolve())]
+
+
+def test_hdf5_read_holds_only_the_primary_and_the_selected_dependencies(
+    tmp_path, monkeypatch,
+):
+    """The held descriptors are the primary and the selected interval's
+    dependencies, nothing else in the census, and they are never read."""
+    pytest.importorskip("h5py")
+    value = np.arange(2 * 2 * 3, dtype=np.uint16).reshape(2, 2, 3)
+    master, segments, _ = _eiger_master(
+        tmp_path, [("data_000001.h5", value), ("data_000002.h5", value + 10)])
+    catalog = api.catalog_viewer_2d(master)
+    opened, real_open = [], open
+
+    def observing_open(path, *args, **kwargs):
+        stream = real_open(path, *args, **kwargs)
+        if args[:1] == ("rb",) and kwargs.get("buffering") == 0:
+            opened.append(str(Path(path).resolve()))
+
+            def refused_read(*_args, **_kwargs):
+                raise AssertionError("a held revision descriptor was read")
+
+            stream.read = refused_read
+        return stream
+
+    monkeypatch.setattr("builtins.open", observing_open)
+    _assert_canonical(api.read_viewer_2d_frame(catalog, 3), (value + 10)[1])
+    assert opened == [str(master.resolve()), str(segments[1].resolve())]
+
+
 @pytest.mark.parametrize("shape", ("posix", "win32"))
 def test_descriptor_revision_refuses_a_same_size_same_mtime_rewrite_inside_the_hash_window(
     tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime, shape,
