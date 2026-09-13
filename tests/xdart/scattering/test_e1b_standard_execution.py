@@ -29,6 +29,7 @@ from xdart.gui.tabs.scattering.contracts import SourceCapture
 from xdart.gui.tabs.scattering.start_outcomes import StartCapture, StartLaunched
 from xdart.gui.tabs.scattering.start_pipeline import StartPipeline
 from tests.xdart.scattering._admission import admission_for, await_admission
+from tests.xdart.scattering.test_e4_preview_transport import _wait_transport_idle
 
 
 def _fixture_root() -> Path:
@@ -83,6 +84,18 @@ def test_real_standard_run_is_headless_durable_and_projectable(tmp_path: Path) -
     launched = pipeline.start(admission)
 
     assert isinstance(launched, StartLaunched)
+    try:
+        _assert_headless_run_is_durable_and_projectable(
+            executor, lifecycle, launched, admission, output,
+        )
+    finally:
+        receipt = executor.close(launched.run_identity)
+    assert receipt.cleanup_status.value == "cleaned"
+
+
+def _assert_headless_run_is_durable_and_projectable(
+    executor, lifecycle, launched, admission, output,
+) -> None:
     assert launched.configuration.generation == launched.run_identity.generation
     events = _wait_for_terminal(executor)
     assert events[-1].kind is StandardEventKind.FINISHED
@@ -120,6 +133,15 @@ def test_real_standard_run_is_headless_durable_and_projectable(tmp_path: Path) -
     payload = controller.project(final_key)
     assert payload is not None
     assert payload.frame_key.run_identity is launched.run_identity
+    assert payload.frame_key is final_key
+    assert payload.selection_generation == selection.display_generation
+    # The executor publishes light payloads; Full Raw is an explicit
+    # on-demand read through the acquisition's own preview transport.
+    assert controller.request_full_current() is not None
+    assert _wait_transport_idle(controller.acquisition_context.publication_store)
+    assert controller.full_raw_status() == (True, False, None)
+    payload = controller.project(final_key)
+    assert payload is not None
     assert payload.frame_key is final_key
     assert payload.selection_generation == selection.display_generation
     assert payload.view.raw is not None
