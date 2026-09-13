@@ -16,7 +16,11 @@ from types import MappingProxyType
 
 from xrd_tools.analysis.canonical_fingerprint import analysis_canonical_fingerprint
 from xrd_tools.io import descriptor_path
-from xrd_tools.io.descriptor_path import directory_identity
+from xrd_tools.io.descriptor_path import (
+    chain_components,
+    chain_drift,
+    directory_identity,
+)
 from xrd_tools.io.stat_identity import identity_ctime_ns
 
 
@@ -585,15 +589,23 @@ def _capture_exact(
         raise RSMGeometryAssetRefused(
             "RSM_GEOMETRY_UNAVAILABLE", "geometry cannot be captured"
         ) from error
+    components = chain_components(project, relative)
+    drift = (
+        chain_drift(before_chain, opened_chain, components)
+        or chain_drift(opened_chain, current_chain, components)
+    )
     if (
         trailing
         or len(raw) != int(opened.st_size)
-        or before_chain != opened_chain
-        or opened_chain != current_chain
+        or drift is not None
         or opened_chain[-1] != _state(opened)
         or _state(opened) != _state(closed)
     ):
-        _refuse("RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH", "geometry changed during capture")
+        _refuse(
+            "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH",
+            "geometry changed during capture"
+            + ("" if drift is None else f": {drift}"),
+        )
     return raw, _state(closed)
 
 

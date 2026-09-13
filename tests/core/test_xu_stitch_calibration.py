@@ -457,6 +457,146 @@ def test_surface_capture_binds_lexical_resolved_and_physical_identity(tmp_path):
     assert raised.value.code == "XU_CALIBRATION_IDENTITY_MISMATCH"
 
 
+def _between_open_and_inspection(monkeypatch, module, act):
+    """Run *act* on the module's post-read chain walk, before the walk: the
+    concurrent change lands between the open and the inspection."""
+    real = module._lexical_chain_states
+    observed = []
+
+    def act_then_walk(project, relative):
+        observed.append(act(len(observed)))
+        return real(project, relative)
+
+    monkeypatch.setattr(module, "_lexical_chain_states", act_then_walk)
+    return observed
+
+
+def _write_beside(directory, base):
+    """A writer that creates an entry in *directory* and pins the directory's
+    mtime past any timestamp granularity (the RSM before/after row's idiom):
+    the directory's identity stays, its recorded state does not."""
+
+    def act(count):
+        (directory / f"beside-{count}.tmp").write_bytes(b"")
+        os.utime(
+            directory,
+            ns=(base.st_atime_ns, base.st_mtime_ns + (count + 1) * 2_000_000_000),
+        )
+        return xu_module._state(os.lstat(directory))
+
+    return act
+
+
+@pytest.mark.parametrize("descriptor_walk", _descriptor_walk_modes(xu_module))
+@pytest.mark.parametrize("ancestor", ["above-project", "project-root"])
+def test_surface_capture_survives_a_concurrent_write_beside_its_chain(
+    tmp_path, monkeypatch, ancestor, descriptor_walk
+):
+    # PR #1 round 12 (macos-15-intel): the runner's system temp directory
+    # gained an entry while a capture ran and the capture refused
+    # "calibration changed during capture" -- the ancestors were held to
+    # their full state, mtime included, and the refusal named nothing.
+    monkeypatch.setattr(xu_module, "_DESCRIPTOR_WALK", descriptor_walk)
+    project = tmp_path / "project"
+    target = project / "calibration" / "xu" / "surface.json"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(canonical_surface_resource_bytes())
+    directory = tmp_path if ancestor == "above-project" else project
+    base = os.lstat(directory)
+    observed = _between_open_and_inspection(
+        monkeypatch, xu_module, _write_beside(directory, base)
+    )
+    receipt = capture_xu_stitch_calibration(
+        XuStitchCalibrationInput("calibration/xu/surface.json"),
+        project_root=project,
+    )
+    assert receipt.raw_sha256 == EXPECTED_SHA
+    # Revalidation is a re-capture: a second write lands beside that one.
+    assert revalidate_xu_stitch_calibration(receipt) == receipt.content
+    assert len(observed) == 2
+    for state in observed:
+        assert state[:3] == xu_module._state(base)[:3]
+        assert state[4] != base.st_mtime_ns
+    assert observed[0][4] != observed[1][4]
+
+
+def test_canonical_resource_survives_a_concurrent_write_beside_its_chain(
+    tmp_path, monkeypatch
+):
+    raw = canonical_surface_resource_bytes()
+    package = tmp_path / "package"
+    resource = package / "assets" / "xu" / "psic_powder_1d_surface_v1.json"
+    resource.parent.mkdir(parents=True)
+    resource.write_bytes(raw)
+    monkeypatch.setattr(
+        "xrd_tools.analysis.xu_stitch_calibration.resources.files",
+        lambda _package: package,
+    )
+    base = os.lstat(tmp_path)
+    observed = _between_open_and_inspection(
+        monkeypatch, xu_module, _write_beside(tmp_path, base)
+    )
+    assert canonical_surface_resource_bytes() == raw
+    assert len(observed) == 1
+    assert observed[0][4] != base.st_mtime_ns
+
+
+def test_surface_capture_names_the_ancestor_whose_identity_moved(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    calibration = project / "calibration"
+    target = calibration / "xu" / "surface.json"
+    target.parent.mkdir(parents=True)
+    raw = canonical_surface_resource_bytes()
+    target.write_bytes(raw)
+    opened_ino = os.lstat(calibration).st_ino
+
+    def exchange(_count):
+        # Every name still resolves and the bytes still match; only the
+        # identities under the exchanged directory differ.
+        calibration.rename(project / "calibration.stale")
+        target.parent.mkdir(parents=True)
+        target.write_bytes(raw)
+        return os.lstat(calibration).st_ino
+
+    observed = _between_open_and_inspection(monkeypatch, xu_module, exchange)
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        capture_xu_stitch_calibration(
+            XuStitchCalibrationInput("calibration/xu/surface.json"),
+            project_root=project,
+        )
+    assert raised.value.code == "XU_CALIBRATION_IDENTITY_MISMATCH"
+    assert observed[0] != opened_ino
+    assert str(raised.value) == (
+        "calibration changed during capture: "
+        f"ancestor {calibration}: ino {opened_ino} -> {observed[0]}"
+    )
+
+
+def test_surface_capture_names_the_leaf_that_changed_after_the_read(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    target = project / "surface.json"
+    project.mkdir()
+    target.write_bytes(canonical_surface_resource_bytes())
+
+    def grow(_count):
+        with target.open("ab") as stream:
+            stream.write(b"\n")
+
+    _between_open_and_inspection(monkeypatch, xu_module, grow)
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        capture_xu_stitch_calibration(
+            XuStitchCalibrationInput("surface.json"), project_root=project
+        )
+    assert raised.value.code == "XU_CALIBRATION_IDENTITY_MISMATCH"
+    assert str(raised.value) == (
+        f"calibration changed during capture: leaf {target}: size 4837 -> 4838"
+    )
+
+
 def test_surface_capture_refuses_outside_project_and_symlink(tmp_path):
     project = tmp_path / "project"
     project.mkdir()

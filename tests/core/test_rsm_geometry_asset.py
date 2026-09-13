@@ -461,6 +461,121 @@ def test_rsm_capture_refuses_before_after_mutation(tmp_path, monkeypatch):
     assert raised.value.code == "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH"
 
 
+def _between_open_and_inspection(monkeypatch, act):
+    """Run *act* before the post-read chain walk (a capture's second walk;
+    its first precedes the open): the concurrent change lands between the
+    open and the inspection."""
+    real = rsm_asset_module._lexical_chain_states
+    walks = []
+    observed = []
+
+    def act_then_walk(project, relative):
+        walks.append(relative)
+        if len(walks) % 2 == 0:
+            observed.append(act(len(observed)))
+        return real(project, relative)
+
+    monkeypatch.setattr(rsm_asset_module, "_lexical_chain_states", act_then_walk)
+    return observed
+
+
+@pytest.mark.parametrize(
+    "descriptor_walk",
+    [pytest.param(True, id="descriptor"), pytest.param(False, id="by_name")]
+    if rsm_asset_module._DESCRIPTOR_WALK
+    else [pytest.param(False, id="by_name")],
+)
+@pytest.mark.parametrize("ancestor", ["above-project", "project-root"])
+def test_rsm_capture_survives_a_concurrent_write_beside_its_chain(
+    tmp_path, monkeypatch, ancestor, descriptor_walk
+):
+    # The twin of the XU round-12 refusal: every ancestor directory was held
+    # to its full state, so an entry created beside the chain refused the
+    # capture and named nothing.
+    monkeypatch.setattr(rsm_asset_module, "_DESCRIPTOR_WALK", descriptor_walk)
+    project = tmp_path / "project"
+    target = project / "calibration" / "rsm" / "geometry.json"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(canonical_rsm_geometry_resource_bytes())
+    directory = tmp_path if ancestor == "above-project" else project
+    base = os.lstat(directory)
+
+    def write_beside(count):
+        (directory / f"beside-{count}.tmp").write_bytes(b"")
+        os.utime(
+            directory,
+            ns=(base.st_atime_ns, base.st_mtime_ns + (count + 1) * 2_000_000_000),
+        )
+        return rsm_asset_module._state(os.lstat(directory))
+
+    observed = _between_open_and_inspection(monkeypatch, write_beside)
+    receipt = capture_rsm_geometry_asset(
+        rsm_geometry_asset_input("calibration/rsm/geometry.json"),
+        project_root=project,
+    )
+    assert receipt.raw_sha256 == EXPECTED_SHA256
+    # Revalidation is a re-capture: a second write lands beside that one.
+    assert revalidate_rsm_geometry_asset(receipt) == receipt.content
+    assert len(observed) == 2
+    for state in observed:
+        assert state[:3] == rsm_asset_module._state(base)[:3]
+        assert state[4] != base.st_mtime_ns
+    assert observed[0][4] != observed[1][4]
+
+
+def test_rsm_capture_names_the_ancestor_whose_identity_moved(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    calibration = project / "calibration"
+    target = calibration / "rsm" / "geometry.json"
+    target.parent.mkdir(parents=True)
+    raw = canonical_rsm_geometry_resource_bytes()
+    target.write_bytes(raw)
+    opened_ino = os.lstat(calibration).st_ino
+
+    def exchange(_count):
+        calibration.rename(project / "calibration.stale")
+        target.parent.mkdir(parents=True)
+        target.write_bytes(raw)
+        return os.lstat(calibration).st_ino
+
+    observed = _between_open_and_inspection(monkeypatch, exchange)
+    with pytest.raises(RSMGeometryAssetRefused) as raised:
+        capture_rsm_geometry_asset(
+            rsm_geometry_asset_input("calibration/rsm/geometry.json"),
+            project_root=project,
+        )
+    assert raised.value.code == "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH"
+    assert observed[0] != opened_ino
+    assert str(raised.value) == (
+        "geometry changed during capture: "
+        f"ancestor {calibration}: ino {opened_ino} -> {observed[0]}"
+    )
+
+
+def test_rsm_capture_names_the_leaf_that_changed_after_the_read(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "geometry.json"
+    target.write_bytes(canonical_rsm_geometry_resource_bytes())
+
+    def grow(_count):
+        with target.open("ab") as stream:
+            stream.write(b"\n")
+
+    _between_open_and_inspection(monkeypatch, grow)
+    with pytest.raises(RSMGeometryAssetRefused) as raised:
+        capture_rsm_geometry_asset(
+            rsm_geometry_asset_input("geometry.json"), project_root=project
+        )
+    assert raised.value.code == "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH"
+    assert str(raised.value) == (
+        "geometry changed during capture: "
+        f"leaf {target}: size {EXPECTED_SIZE} -> {EXPECTED_SIZE + 1}"
+    )
+
+
 @_open_file_replacement
 def test_rsm_capture_refuses_exact_byte_inode_swap_before_open(
     tmp_path, monkeypatch

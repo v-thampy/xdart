@@ -20,7 +20,11 @@ from types import MappingProxyType
 
 from xrd_tools.analysis.scan_operations import analysis_canonical_fingerprint
 from xrd_tools.io import descriptor_path
-from xrd_tools.io.descriptor_path import directory_identity
+from xrd_tools.io.descriptor_path import (
+    chain_components,
+    chain_drift,
+    directory_identity,
+)
 from xrd_tools.io.stat_identity import identity_ctime_ns
 
 
@@ -308,13 +312,19 @@ def canonical_surface_resource_bytes() -> bytes:
         finally:
             os.close(descriptor)
         current_chain = _lexical_chain_states(package, relative)
+        drift = chain_drift(
+            opened_chain, current_chain, chain_components(package, relative)
+        )
         if (
             trailing
-            or opened_chain != current_chain
+            or drift is not None
             or opened_chain[-1] != _state(opened)
             or _state(opened) != _state(closed_state)
         ):
-            raise OSError("canonical resource changed during read")
+            raise OSError(
+                "canonical resource changed during read"
+                + ("" if drift is None else f": {drift}")
+            )
         parse_xu_stitch_calibration_bytes(raw)
         return raw
     except (
@@ -746,18 +756,22 @@ def capture_xu_stitch_calibration(
         raise XuStitchCalibrationRefused(
             "XU_CALIBRATION_UNAVAILABLE", "calibration file cannot be captured"
         ) from error
+    drift = chain_drift(
+        opened_chain, current_chain, chain_components(project, lexical_relative)
+    )
     if (
         not stat.S_ISREG(opened.st_mode)
         or trailing
         or target_again != target
         or relative_again != lexical_relative
-        or opened_chain != current_chain
+        or drift is not None
         or opened_chain[-1] != _state(opened)
         or _state(opened) != _state(closed_state)
     ):
         _refuse(
             "XU_CALIBRATION_IDENTITY_MISMATCH",
-            "calibration changed during capture",
+            "calibration changed during capture"
+            + ("" if drift is None else f": {drift}"),
         )
     projection = parse_xu_stitch_calibration_bytes(raw)
     resolved_project = os.path.realpath(project)

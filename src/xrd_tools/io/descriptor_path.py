@@ -36,6 +36,7 @@ import errno
 import os
 import stat
 import sys
+from pathlib import Path
 
 # FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
 _WIN32_FINAL_PATH_FLAGS = 0
@@ -171,6 +172,56 @@ def _win32_create_exclusive(path: str) -> int:
 def directory_identity(value: os.stat_result) -> tuple[int, int]:
     """The (st_dev, st_ino) of one inspected directory."""
     return (int(value.st_dev), int(value.st_ino))
+
+
+# The slots of a chain state: (st_mode, st_dev, st_ino, st_size,
+# st_mtime_ns, seamed st_ctime_ns), as the no-follow chain walkers record
+# them.  A directory is held to the first three: creating or removing a
+# sibling entry beside the chain advances its mtime (and its size on some
+# filesystems) without the chain having moved.
+_CHAIN_STATE_FIELDS = ("mode", "dev", "ino", "size", "mtime_ns", "ctime_ns")
+_DIRECTORY_HELD = slice(0, 3)
+
+
+def chain_drift(
+    opened: tuple[tuple[int, ...], ...],
+    current: tuple[tuple[int, ...], ...],
+    components: tuple[str, ...],
+) -> str | None:
+    """``None`` while the *current* chain still names the *opened* one;
+    otherwise the first component that moved, with the field that did.
+
+    Every ancestor directory is held to its identity (mode, device, inode)
+    only, so a concurrent write beside the chain is not a change of the
+    chain; the leaf (the last slot) is held to its full recorded state.
+    Holding the ancestors' mtime refused a capture under the runner's
+    system temp directory whenever another process created an entry there
+    (PR #1 round 12, macos-15-intel), and named nothing.
+    """
+    if len(components) != len(opened):
+        return f"chain of {len(opened)} slots names {len(components)} components"
+    if len(opened) != len(current):
+        return f"chain length {len(opened)} -> {len(current)}"
+    last = len(opened) - 1
+    for index, (before, after) in enumerate(zip(opened, current)):
+        held = slice(None) if index == last else _DIRECTORY_HELD
+        for name, x, y in zip(_CHAIN_STATE_FIELDS[held], before[held], after[held]):
+            if x != y:
+                kind = "leaf" if index == last else "ancestor"
+                return f"{kind} {components[index]}: {name} {x} -> {y}"
+    return None
+
+
+def chain_components(project: str, relative: str) -> tuple[str, ...]:
+    """The path each slot of a chain state names: the root, then every
+    component of *project* below it, then every component of *relative*."""
+    project_parts = Path(project).parts
+    components = [project_parts[0]]
+    current = project_parts[0]
+    for part in project_parts[1:] + Path(relative).parts:
+        current = os.path.join(current, part)
+        components.append(current)
+    return tuple(components)
 
 
 def created_leaf_misplacement(
