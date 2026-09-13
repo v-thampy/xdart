@@ -11,13 +11,23 @@ for an open handle:
 * linux: the ``/proc/self/fd/N`` link;
 * darwin: ``fcntl(F_GETPATH)``.
 
-:func:`leaf_created_inside` reads it once and holds the directory it
-names to the identity of the directory the installer inspected.  Renaming
-that directory keeps its identity; substituting it does not.  The check is
-identity-based on purpose: a pathname compare would have to reconcile
-short names, case and ``\\\\?\\`` prefixes, and a lexical ``realpath`` of
-the target computed after the exchange would follow the very link it is
-meant to catch.
+:func:`created_leaf_misplacement` reads it once and holds the directory
+it names to the identity of the directory the installer inspected, and
+the entry it names to the requested one.  Renaming that directory keeps
+its identity; substituting it does not.  The check is identity-based on
+purpose: a pathname compare would have to reconcile short names, case
+and ``\\\\?\\`` prefixes, and a lexical ``realpath`` of the target
+computed after the exchange would follow the very link it is meant to
+catch.
+
+A leaf that landed elsewhere is disposed of through the handle that
+created it (:func:`dispose_created_leaf`), never by name: between a
+by-name inspection and a by-name unlink the entry can be replaced by a
+foreign file, and the parent can be put back so the misplaced object is
+no longer even reachable by the name (Codex review of 0ed7a46c, F2).
+Windows, the only host whose production install is by name, deletes
+through the handle (``FileDispositionInfo``); POSIX has no unlink by
+descriptor, so there the caller refuses and names the leaf it left.
 """
 
 from __future__ import annotations
@@ -30,6 +40,20 @@ import sys
 # FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
 _WIN32_FINAL_PATH_FLAGS = 0
 _DARWIN_MAXPATHLEN = 1024
+
+_GENERIC_WRITE = 0x40000000
+_DELETE = 0x00010000
+_FILE_SHARE_READ = 0x00000001
+_CREATE_NEW = 1
+_FILE_ATTRIBUTE_NORMAL = 0x00000080
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_ERROR_FILE_EXISTS = 80
+_ERROR_ALREADY_EXISTS = 183
+# SetFileInformationByHandle information classes.
+_FILE_DISPOSITION_INFO = 4
+_FILE_DISPOSITION_INFO_EX = 21
+_FILE_DISPOSITION_DELETE = 0x00000001
+_FILE_DISPOSITION_POSIX_SEMANTICS = 0x00000002
 
 
 def descriptor_final_path(descriptor: int) -> str:
@@ -53,13 +77,18 @@ def descriptor_final_path(descriptor: int) -> str:
     )
 
 
+def _win32_kernel32():
+    import ctypes
+
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
 def _win32_final_path(descriptor: int) -> str:
     import ctypes
     from ctypes import wintypes
     import msvcrt
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    function = kernel32.GetFinalPathNameByHandleW
+    function = _win32_kernel32().GetFinalPathNameByHandleW
     function.argtypes = (
         wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
     )
@@ -77,44 +106,136 @@ def _win32_final_path(descriptor: int) -> str:
         size = length + 1
 
 
+def create_exclusive_leaf(path: str) -> int:
+    """Create the regular file *path* by name, exclusively, for writing.
+
+    Returns a descriptor the caller writes through and closes.  A name
+    that already exists -- a symbolic link included -- raises
+    ``FileExistsError``.  On Windows the handle is opened with ``DELETE``
+    access as well, so :func:`dispose_created_leaf` can remove the object
+    through it; the CRT ``os.open`` never asks for that right.
+    """
+    if sys.platform == "win32":
+        return _win32_create_exclusive(path)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    return os.open(path, flags, 0o644)
+
+
+def _win32_create_exclusive(path: str) -> int:
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    kernel32 = _win32_kernel32()
+    function = kernel32.CreateFileW
+    function.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    function.restype = wintypes.HANDLE
+    invalid = wintypes.HANDLE(-1).value
+    handle = function(
+        os.fspath(path),
+        _GENERIC_WRITE | _DELETE,
+        _FILE_SHARE_READ,
+        None,
+        _CREATE_NEW,
+        # A reparse point at the leaf name is the existing entry, not a
+        # path to create through: CREATE_NEW then fails as "exists".
+        _FILE_ATTRIBUTE_NORMAL | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle == invalid:
+        code = ctypes.get_last_error()
+        error = ctypes.WinError(code)
+        if code in (_ERROR_FILE_EXISTS, _ERROR_ALREADY_EXISTS) and not isinstance(
+            error, FileExistsError
+        ):
+            raise FileExistsError(errno.EEXIST, error.strerror, path) from error
+        raise error
+    try:
+        return msvcrt.open_osfhandle(
+            handle, os.O_WRONLY | os.O_BINARY | os.O_NOINHERIT
+        )
+    except OSError:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+        raise
+
+
 def directory_identity(value: os.stat_result) -> tuple[int, int]:
     """The (st_dev, st_ino) of one inspected directory."""
     return (int(value.st_dev), int(value.st_ino))
 
 
-def leaf_created_inside(descriptor: int, parent_identity: tuple[int, int]) -> bool:
-    """Whether the object behind *descriptor* lives directly inside the
-    directory whose :func:`directory_identity` is *parent_identity*.
+def created_leaf_misplacement(
+    descriptor: int, parent_identity: tuple[int, int], name: str,
+) -> str | None:
+    """``None`` when the object behind *descriptor* is the entry *name*
+    directly inside the directory whose :func:`directory_identity` is
+    *parent_identity*; otherwise the reason it is not, naming the final
+    path where the platform gives one.
 
-    False whenever the final path cannot be read or names a directory
-    other than the inspected one; the caller refuses and removes the
-    misplaced empty leaf (:func:`unlink_empty_created_leaf`).
+    Unreadable final paths count as misplaced: the caller refuses rather
+    than guesses.
     """
     try:
         final = descriptor_final_path(descriptor)
+    except OSError as error:
+        return f"final path of the created leaf is unavailable ({error})"
+    try:
         landing = os.lstat(os.path.dirname(final))
+    except OSError as error:
+        return f"{final}: landing directory is unavailable ({error})"
+    if not stat.S_ISDIR(landing.st_mode) or (
+        directory_identity(landing) != tuple(parent_identity)
+    ):
+        return f"{final}: outside the inspected directory"
+    if os.path.basename(final) != name:
+        return f"{final}: not the requested entry"
+    return None
+
+
+def dispose_created_leaf(descriptor: int) -> bool:
+    """Delete the object behind *descriptor* through the handle itself,
+    wherever it landed and whatever the name now resolves to.
+
+    True when the object is gone (or goes with the last close); False
+    where the platform cannot delete by descriptor (every POSIX host --
+    there the by-name installer runs only under test) or refuses, so the
+    caller reports the leaf it leaves.  Never touches a name.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        _win32_dispose(descriptor)
     except OSError:
         return False
-    return stat.S_ISDIR(landing.st_mode) and (
-        directory_identity(landing) == tuple(parent_identity)
+    return True
+
+
+def _win32_dispose(descriptor: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    function = _win32_kernel32().SetFileInformationByHandle
+    function.argtypes = (
+        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
     )
-
-
-def unlink_empty_created_leaf(path: str, identity: tuple[int, int]) -> None:
-    """Remove the empty regular file the caller just created at *path*, and
-    only that object: the name must still carry *identity* and hold no
-    bytes.  Best effort; a failure leaves the leaf for the caller's
-    refusal to report."""
-    try:
-        named = os.lstat(path)
-    except OSError:
+    function.restype = wintypes.BOOL
+    handle = msvcrt.get_osfhandle(descriptor)
+    # FILE_DISPOSITION_INFO_EX: the name goes now, POSIX-style (Windows 10
+    # 1709+); FILE_DISPOSITION_INFO: the object goes with the last close.
+    flags = wintypes.DWORD(_FILE_DISPOSITION_DELETE | _FILE_DISPOSITION_POSIX_SEMANTICS)
+    if function(handle, _FILE_DISPOSITION_INFO_EX, ctypes.byref(flags), ctypes.sizeof(flags)):
         return
-    if (
-        stat.S_ISREG(named.st_mode)
-        and int(named.st_size) == 0
-        and directory_identity(named) == tuple(identity)
-    ):
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+    delete = ctypes.c_ubyte(1)
+    if function(handle, _FILE_DISPOSITION_INFO, ctypes.byref(delete), ctypes.sizeof(delete)):
+        return
+    raise ctypes.WinError(ctypes.get_last_error())

@@ -19,11 +19,8 @@ from collections.abc import Mapping
 from types import MappingProxyType
 
 from xrd_tools.analysis.scan_operations import analysis_canonical_fingerprint
-from xrd_tools.io.descriptor_path import (
-    directory_identity,
-    leaf_created_inside,
-    unlink_empty_created_leaf,
-)
+from xrd_tools.io import descriptor_path
+from xrd_tools.io.descriptor_path import directory_identity
 from xrd_tools.io.stat_identity import identity_ctime_ns
 
 
@@ -907,19 +904,16 @@ def _install_by_name(project: str, relative: str, raw: bytes) -> None:
     the file itself is flushed, a directory has no fsync on Windows.
 
     A by-name open cannot pin where the leaf lands, so before any byte is
-    written the created object's final path must name the inspected
-    parent directory (``leaf_created_inside``); a leaf that landed
-    elsewhere is removed empty and the install refused."""
-    file_flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_BINARY", 0)
-        | getattr(os, "O_NOINHERIT", 0)
-    )
+    written the created object's final path must name the requested entry
+    of the inspected parent directory (``created_leaf_misplacement``).  A
+    leaf that landed elsewhere, or that could not be filled, is disposed
+    of through the handle that created it while it is still open
+    (``dispose_created_leaf``) and the install refused; nothing here ever
+    unlinks a name, which by then may belong to somebody else's file.
+    Where the platform cannot delete by descriptor the refusal names the
+    leaf it leaves behind."""
     project_parts = Path(project).parts
     current = project_parts[0]
-    leaf: str | None = None
     try:
         value = os.lstat(current)
         for part in project_parts[1:] + Path(relative).parts[:-1]:
@@ -932,20 +926,28 @@ def _install_by_name(project: str, relative: str, raw: bytes) -> None:
             if _is_link(value) or not stat.S_ISDIR(value.st_mode):
                 raise OSError("canonical asset ancestry is not a real directory")
         parent_identity = directory_identity(value)
-        target = os.path.join(current, Path(relative).parts[-1])
-        descriptor = os.open(target, file_flags, 0o644)
+        name = Path(relative).parts[-1]
+        target = os.path.join(current, name)
+        descriptor = descriptor_path.create_exclusive_leaf(target)
         try:
-            created = directory_identity(os.fstat(descriptor))
-            placed = leaf_created_inside(descriptor, parent_identity)
-            if placed:
-                leaf = target
-                _write_asset(descriptor, raw)
+            misplaced = descriptor_path.created_leaf_misplacement(
+                descriptor, parent_identity, name
+            )
+            if misplaced is None:
+                try:
+                    _write_asset(descriptor, raw)
+                except OSError as error:
+                    if not descriptor_path.dispose_created_leaf(descriptor):
+                        error.add_note(f"partial canonical asset left at {target}")
+                    raise
+            elif not descriptor_path.dispose_created_leaf(descriptor):
+                misplaced = f"{misplaced}; empty leaf left there"
         finally:
             os.close(descriptor)
-        if not placed:
-            unlink_empty_created_leaf(target, created)
+        if misplaced is not None:
             raise OSError(
-                "canonical asset was created outside its inspected directory"
+                "canonical asset was created outside its inspected directory: "
+                + misplaced
             )
     except FileExistsError as error:
         raise XuStitchCalibrationRefused(
@@ -953,11 +955,6 @@ def _install_by_name(project: str, relative: str, raw: bytes) -> None:
             "canonical calibration destination appeared during install",
         ) from error
     except OSError as error:
-        if leaf is not None:
-            try:
-                os.unlink(leaf)
-            except OSError:
-                pass
         raise XuStitchCalibrationRefused(
             "XU_CALIBRATION_INSTALL_FAILED",
             "canonical calibration could not be installed safely",
