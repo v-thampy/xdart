@@ -711,8 +711,6 @@ def _validate_viewer_frame_request(request, *, current_epoch):
     from xrd_tools.io.viewer_2d import Viewer2DArtifactCatalog
     labels = getattr(request.catalog, "frame_labels", None)
     identity = getattr(request.catalog, "catalog_identity", None)
-    if type(request.catalog) is Viewer2DArtifactCatalog:
-        request.catalog.__post_init__()
     if (type(request.label) is not int or request.receipt_identity is None
             or type(request.catalog) is not Viewer2DArtifactCatalog
             or type(labels) is not tuple or request.label not in labels

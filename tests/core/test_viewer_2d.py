@@ -260,7 +260,7 @@ def test_csv_catalog_is_array_free_and_second_pass_builds_one_canonical_frame(tm
     assert catalog.source_kind is api.Viewer2DSourceKind.CSV_MATRIX
     assert catalog.frame_labels == (0,)
     assert catalog.source_shape == (2, 3)
-    assert catalog.policy_version == "viewer-2d-v1"
+    assert catalog.policy_version == "viewer-2d-v2"
     assert catalog.canonical_path == str(path.resolve())
     _slots_have_no_array(catalog)
     assert events == [("scan", events[0][1], True)]
@@ -271,7 +271,7 @@ def test_csv_catalog_is_array_free_and_second_pass_builds_one_canonical_frame(tm
     assert events[0][1] == events[2][1] and events[0][2] and not events[2][2]
     _assert_canonical(frame, [[1, 2, np.nan], [3.5, -4, 6]])
     assert frame.provenance.source_kind is api.Viewer2DSourceKind.CSV_MATRIX
-    assert frame.provenance.source_sha256 == catalog.primary_revision.sha256
+    assert frame.provenance.source_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize(
@@ -1109,7 +1109,7 @@ def test_processed_external_preferred_path_bypasses_foreign_master_census(tmp_pa
 
 
 @pytest.mark.parametrize("drift", ["before", "during"])
-def test_eiger_frame_read_uses_stat_fences_and_rehashes_only_after_drift(
+def test_eiger_frame_read_refuses_metadata_drift_without_rehashing(
         tmp_path, monkeypatch, drift):
     h5py = pytest.importorskip("h5py")
     value = np.arange(2 * 2 * 3, dtype=np.uint16).reshape(2, 2, 3)
@@ -1143,7 +1143,8 @@ def test_eiger_frame_read_uses_stat_fences_and_rehashes_only_after_drift(
 
         monkeypatch.setattr(api, "_read_hdf_dataset", read_then_mutate)
     _assert_changed(api.read_viewer_2d_frame, catalog, 1)
-    assert calls == [str(segments[0].resolve())]
+    assert calls == []
+
 
 
 def _non_hdf_stat_case(tmp_path, family):
@@ -1179,7 +1180,7 @@ def _non_hdf_stat_case(tmp_path, family):
 
 
 @pytest.mark.parametrize("family", ["raw", "npy", "npz", "tiff"])
-def test_non_hdf_frame_read_keeps_catalog_hash_but_does_not_rehash_stable_file(
+def test_non_hdf_frame_read_uses_metadata_revision_and_selected_pixel_hash(
         tmp_path, monkeypatch, family):
     path, catalog, label, expected, policy = _non_hdf_stat_case(tmp_path, family)
     calls = []
@@ -1194,8 +1195,9 @@ def test_non_hdf_frame_read_keeps_catalog_hash_but_does_not_rehash_stable_file(
 
     _assert_canonical(frame, expected)
     assert calls == []
-    assert catalog.primary_revision.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert not hasattr(catalog.primary_revision, "sha256")
     assert frame.provenance.primary_revision is catalog.primary_revision
+
 
 
 def test_tiff_parent_swap_and_restore_reads_certified_descriptor(
@@ -1242,7 +1244,7 @@ def test_tiff_parent_swap_and_restore_reads_certified_descriptor(
     assert calls == []
 
 
-def test_fabio_selected_read_keeps_prior_full_revision_rechecks(
+def test_fabio_selected_read_checks_metadata_before_and_after(
         tmp_path, monkeypatch):
     path, catalog, label, expected, policy = _non_hdf_stat_case(
         tmp_path, "fabio",
@@ -1261,8 +1263,9 @@ def test_fabio_selected_read_keeps_prior_full_revision_rechecks(
     assert calls == [str(path.resolve()), str(path.resolve())]
 
 
+
 @pytest.mark.parametrize("drift", ["in-place", "replacement"])
-def test_non_hdf_stat_fence_rejects_same_size_restored_mtime_drift(
+def test_non_hdf_stat_fence_rejects_write_or_replacement(
         tmp_path, monkeypatch, drift):
     initial = np.arange(30, dtype=np.uint16).reshape(2, 3, 5)
     changed = initial + 100
@@ -1274,13 +1277,11 @@ def test_non_hdf_stat_fence_rejects_same_size_restored_mtime_drift(
     assert replacement.stat().st_size == admitted.st_size
     if drift == "in-place":
         path.write_bytes(replacement.read_bytes())
-        os.utime(path, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
     else:
         os.utime(replacement, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
         os.replace(replacement, path)
     current = path.stat()
     assert current.st_size == admitted.st_size
-    assert current.st_mtime_ns == admitted.st_mtime_ns
 
     calls = []
     original = api._stable_revision
@@ -1291,10 +1292,11 @@ def test_non_hdf_stat_fence_rejects_same_size_restored_mtime_drift(
 
     monkeypatch.setattr(api, "_stable_revision", stable)
     _assert_changed(api.read_viewer_2d_frame, catalog, 1)
-    assert calls == [str(path.resolve())]
+    assert calls == []
 
 
-def test_non_hdf_stat_fence_recertifies_drift_during_selected_read(
+
+def test_non_hdf_stat_fence_refuses_drift_during_selected_read(
         tmp_path, monkeypatch):
     initial = np.arange(30, dtype=np.uint16).reshape(2, 3, 5)
     changed = initial + 100
@@ -1311,7 +1313,6 @@ def test_non_hdf_stat_fence_recertifies_drift_during_selected_read(
         if not mutated:
             mutated.append(True)
             path.write_bytes(replacement.read_bytes())
-            os.utime(path, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
         return result
 
     def stable(candidate):
@@ -1322,7 +1323,8 @@ def test_non_hdf_stat_fence_recertifies_drift_during_selected_read(
     monkeypatch.setattr(api, "_stable_revision", stable)
     _assert_changed(api.read_viewer_2d_frame, catalog, 1)
     assert mutated == [True]
-    assert calls == [str(path.resolve())]
+    assert calls == []
+
 
 
 def test_non_hdf_selected_read_failure_closes_fenced_descriptor(
@@ -1700,7 +1702,7 @@ def test_r30_exported_values_recursively_close_isolated_forgery(tmp_path, axis):
         np.save(path, np.arange(6).reshape(2, 3))
         revision = api.catalog_viewer_2d(path).primary_revision
         _raises(TypeError, api.Viewer2DDependency,
-                revision.canonical_path, None, _forge(revision, sha256="x"))
+                revision.canonical_path, None, _forge(revision, size=-1))
     elif axis == "negative-source-frame":
         _raises(TypeError, api.Viewer2DFrameFact,
                 0, api.Viewer2DSourceKind.PROCESSED_RAW, (2, 3), "<i8",
@@ -1984,6 +1986,46 @@ def test_catalog_validation_hashes_a_chain_identity_once_per_shape(tmp_path, mon
     api._validate_catalog_cross_fields(catalog)
     assert [parts[6] for parts in manifests] == ["hdf5-eiger"]
     assert manifests[0][2] == tuple(range(6))
+    # Immutable catalogs are validated when constructed, not on every read.
+    api.read_viewer_2d_frame(catalog, 5)
+    assert len(manifests) == 1
+
+
+def test_hdf_catalog_and_selected_read_use_no_python_payload_streams(tmp_path, monkeypatch):
+    h5py = pytest.importorskip("h5py")
+    processed, _, _, arrays = _hinted_eiger_record(tmp_path, _FIRST_SEGMENT_HINT)
+    before = h5py.h5f.get_obj_count(types=h5py.h5f.OBJ_FILE)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("viewer opened an extra stream to hash or hold an HDF5 source")
+
+    monkeypatch.setattr(api, "open", forbidden, raising=False)
+    catalog = api.catalog_viewer_2d(processed)
+    for label in (0, 2, 3, 0):
+        _assert_canonical(api.read_viewer_2d_frame(catalog, label), arrays[label // 2][label % 2])
+    assert h5py.h5f.get_obj_count(types=h5py.h5f.OBJ_FILE) == before
+
+
+@pytest.mark.parametrize("family", ("npy", "hdf5"))
+def test_win32_metadata_revision_refuses_an_ordinary_write(
+        tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime, family):
+    value = np.arange(12, dtype=np.uint16).reshape(2, 2, 3)
+    path = tmp_path / ("stack.npy" if family == "npy" else "stack.nxs")
+    if family == "npy":
+        np.save(path, value)
+    else:
+        _write_hdf_stack(path, value)
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    win32_pathname_ctime(path)
+    catalog = api.catalog_viewer_2d(path)
+    if family == "npy":
+        np.save(path, value + 1)
+    else:
+        h5py = pytest.importorskip("h5py")
+        with h5py.File(path, "r+") as handle:
+            handle["entry/data/data"][0, 0, 0] += 1
+    assert path.stat().st_mtime_ns != catalog.primary_revision.mtime_ns
+    _assert_changed(api.read_viewer_2d_frame, catalog, 0)
 
 
 _REAL_EIGER_RECORDS = (
@@ -2252,8 +2294,8 @@ def test_win32_identity_catalogs_reads_and_certifies_the_pathname_ctime_shape(
     gap_ns = win32_pathname_ctime(path)
     assert os.stat(path).st_ctime_ns == handle_ctime_ns - gap_ns
     catalog = api.catalog_viewer_2d(path)
-    # The recorded revision keeps the descriptor's observed ctime ...
-    assert catalog.primary_revision.ctime_ns == handle_ctime_ns
+    # The metadata identity normalizes the platform ctime difference once.
+    assert catalog.primary_revision.ctime_ns == 0
     frame = api.read_viewer_2d_frame(catalog, 0)
     _assert_canonical(frame, [[1, 2], [3, 4]])
     # ... and both fences accept the file under either view.
@@ -2263,165 +2305,12 @@ def test_win32_identity_catalogs_reads_and_certifies_the_pathname_ctime_shape(
     assert api._revision_stat(catalog.primary_revision)[4] == 0
 
 
-def test_win32_identity_descriptor_fence_refuses_a_same_size_same_mtime_rewrite(
-    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime,
-):
-    """The O(1) selected-frame fence holds the open descriptor to the recorded
-    revision exactly: a rewrite the seamed pathname view cannot see must still
-    take the recertification path and refuse (Codex PR #1 review, F1)."""
-    initial = np.arange(30, dtype=np.uint16).reshape(2, 3, 5)
-    path, replacement = tmp_path / "selected.npy", tmp_path / "replacement.npy"
-    np.save(path, initial, allow_pickle=False)
-    np.save(replacement, initial + 100, allow_pickle=False)
-    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
-    win32_pathname_ctime(path)
-    catalog = api.catalog_viewer_2d(path)
-    admitted = path.stat()
-    path.write_bytes(replacement.read_bytes())
-    os.utime(path, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
-    with path.open("rb") as handle:
-        after = os.fstat(handle.fileno())
-    assert (after.st_size, after.st_mtime_ns) == (admitted.st_size, admitted.st_mtime_ns)
-    # Precondition of the row: only the descriptor's change time moved, and
-    # the seamed pathname fence is blind to it.
-    assert after.st_ctime_ns != catalog.primary_revision.ctime_ns
-    assert api._path_stat(path) == api._revision_stat(catalog.primary_revision)
-
-    calls = []
-    original = api._stable_revision
-
-    def stable(candidate):
-        calls.append(str(Path(candidate).resolve()))
-        return original(candidate)
-
-    monkeypatch.setattr(api, "_stable_revision", stable)
-    _assert_changed(api.read_viewer_2d_frame, catalog, 1)
-    assert calls == [str(path.resolve())]
 
 
-@pytest.mark.parametrize("layout", ("contiguous", "eiger-segment"))
-def test_win32_identity_hdf5_read_holds_its_descriptors_to_the_exact_revision(
-    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime, layout,
-):
-    """``_read_hdf5`` holds a read-only descriptor on the primary and on the
-    pixel-supplying dependency for the read's duration: a same-size
-    same-mtime rewrite the seamed pathname fences cannot see (win32) is
-    refused, and rehashed once, before a changed pixel inherits the admitted
-    identity (Codex review of 0ed7a46c, F3)."""
-    h5py = pytest.importorskip("h5py")
-    value = np.arange(2 * 2 * 3, dtype=np.uint16).reshape(2, 2, 3)
-    if layout == "contiguous":
-        target = primary = tmp_path / "stack.nxs"
-        _write_hdf_stack(primary, value)
-    else:
-        primary, segments, _ = _eiger_master(tmp_path, [("data_000001.h5", value)])
-        target = segments[0]
-    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
-    win32_pathname_ctime(target)
-    catalog = api.catalog_viewer_2d(primary)
-    revision = (catalog.primary_revision if layout == "contiguous" else next(
-        item.revision for item in catalog.dependencies
-        if item.locator == str(target.resolve())))
-    calls = []
-    original = api._stable_revision
-
-    def stable(candidate):
-        calls.append(str(Path(candidate).resolve()))
-        return original(candidate)
-
-    monkeypatch.setattr(api, "_stable_revision", stable)
-    _assert_canonical(api.read_viewer_2d_frame(catalog, 1), value[1])
-    assert calls == []
-    with target.open("rb") as handle:
-        admitted = os.fstat(handle.fileno())
-    with h5py.File(target, "r+") as handle:
-        handle["entry/data/data"][1, 0, 0] += 1
-    os.utime(target, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
-    with target.open("rb") as handle:
-        after = os.fstat(handle.fileno())
-    assert (after.st_size, after.st_mtime_ns) == (admitted.st_size, admitted.st_mtime_ns)
-    # Precondition of the row: only the descriptor's change time moved, and
-    # the seamed pathname fence is blind to it.
-    assert after.st_ctime_ns != revision.ctime_ns
-    assert api._path_stat(target) == api._revision_stat(revision)
-    _assert_changed(api.read_viewer_2d_frame, catalog, 1)
-    assert calls == [str(target.resolve())]
 
 
-def test_hdf5_read_holds_only_the_primary_and_the_selected_dependencies(
-    tmp_path, monkeypatch,
-):
-    """The held descriptors are the primary and the selected interval's
-    dependencies, nothing else in the census, and they are never read."""
-    pytest.importorskip("h5py")
-    value = np.arange(2 * 2 * 3, dtype=np.uint16).reshape(2, 2, 3)
-    master, segments, _ = _eiger_master(
-        tmp_path, [("data_000001.h5", value), ("data_000002.h5", value + 10)])
-    catalog = api.catalog_viewer_2d(master)
-    opened, real_open = [], open
-
-    def observing_open(path, *args, **kwargs):
-        stream = real_open(path, *args, **kwargs)
-        if args[:1] == ("rb",) and kwargs.get("buffering") == 0:
-            opened.append(str(Path(path).resolve()))
-
-            def refused_read(*_args, **_kwargs):
-                raise AssertionError("a held revision descriptor was read")
-
-            stream.read = refused_read
-        return stream
-
-    monkeypatch.setattr("builtins.open", observing_open)
-    _assert_canonical(api.read_viewer_2d_frame(catalog, 3), (value + 10)[1])
-    assert opened == [str(master.resolve()), str(segments[1].resolve())]
 
 
-@pytest.mark.parametrize("shape", ("posix", "win32"))
-def test_descriptor_revision_refuses_a_same_size_same_mtime_rewrite_inside_the_hash_window(
-    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime, shape,
-):
-    """``_descriptor_revision`` brackets its hash with two descriptor views
-    held to each other exactly, ctime included: a rewrite that keeps size and
-    mtime inside that window is refused rather than digested torn, also where
-    the pathname compare is neutral (Codex PR #1 addendum, Fix 1 acceptance)."""
-    path = tmp_path / "plain.csv"
-    path.write_bytes(b"1,2\n3,4\n")
-    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", shape == "posix")
-    if shape == "win32":
-        win32_pathname_ctime(path)
-    log = []
-
-    class _RewritingStream:
-        """The open stream, rewriting the file in place (same size, same
-        mtime) before the first block is read."""
-
-        def __init__(self, stream):
-            self._stream = stream
-
-        def __getattr__(self, name):
-            return getattr(self._stream, name)
-
-        def read(self, size=-1):
-            if not log:
-                opened = os.fstat(self._stream.fileno())
-                before = os.stat(path)
-                path.write_bytes(b"5,6\n7,8\n")
-                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
-                rewritten = os.fstat(self._stream.fileno())
-                assert (rewritten.st_size, rewritten.st_mtime_ns) == (
-                    opened.st_size, opened.st_mtime_ns,
-                )
-                log.append((opened.st_ctime_ns, rewritten.st_ctime_ns))
-            return self._stream.read(size)
-
-    with path.open("rb", buffering=0) as stream:
-        _assert_changed(api._descriptor_revision, path, _RewritingStream(stream))
-    # Precondition of the row: the rewrite happened inside the window and
-    # only the descriptor's change time moved.
-    [(opened_ctime_ns, rewritten_ctime_ns)] = log
-    assert rewritten_ctime_ns != opened_ctime_ns
-    # The now-quiet file still certifies under either shape.
-    assert api._stable_revision(path).sha256 == hashlib.sha256(b"5,6\n7,8\n").hexdigest()
 
 
 def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(

@@ -791,6 +791,34 @@ def test_terminal_seal_refuses_a_same_size_same_mtime_rewrite_inside_the_hash_wi
     assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
 
 
+@pytest.mark.parametrize("carries_ctime", (True, False), ids=("posix", "win32"))
+def test_terminal_seal_keeps_the_hashed_revision_through_the_stat_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, carries_ctime: bool,
+) -> None:
+    prepared, attempt = _executing_stream(tmp_path)
+    api, target, _, transaction, _, _, _, lease = prepared
+    monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", carries_ctime)
+    original = api._descriptor_stream_stat_receipt
+    changes = []
+
+    def rewrite_after_hash(descriptor, path, **kwargs):
+        assert kwargs["role"] == "stream-terminal"
+        assert kwargs["evidence_digest"] == hashlib.sha256(b"AAAA").hexdigest()
+        before = os.fstat(descriptor)
+        after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+        assert api._descriptor_identity(before)[:4] == api._descriptor_identity(after)[:4]
+        assert before.st_ctime_ns != after.st_ctime_ns
+        changes.append(True)
+        return original(descriptor, path, **kwargs)
+
+    monkeypatch.setattr(api, "_descriptor_stream_stat_receipt", rewrite_after_hash)
+    with pytest.raises(api.TargetChanged, match="changed after semantic verification"):
+        transaction.seal_stream_terminal(attempt, lease=lease)
+    assert changes == [True]
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert transaction._stream_terminal_receipt is None
+
+
 def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1037,7 +1037,8 @@ def _descriptor_stream_stat_receipt(
 
     This helper intentionally performs no content read.  The caller owns the
     semantic expected-vs-readback comparison and passes the descriptor of the
-    still-open canonical HDF5 owner.
+    still-open canonical HDF5 owner.  When supplied, expected_stat is that
+    descriptor's exact revision, including its change time on every platform.
     """
     if type(durable_fsync) is not bool:
         raise TypeError("durable_fsync must be an exact bool")
@@ -1045,10 +1046,9 @@ def _descriptor_stream_stat_receipt(
     byte_count = int(evidence_bytes)
     if byte_count < 0:
         raise TransactionStateError("stream evidence byte count is negative")
-    if expected_stat is not None:
-        expected_stat = _comparable_identity(expected_stat)
     before = os.fstat(descriptor)
-    if expected_stat is not None and _stat_identity(before) != expected_stat:
+    before_identity = _descriptor_identity(before)
+    if expected_stat is not None and before_identity != expected_stat:
         raise TargetChanged(
             f"{role} descriptor changed after semantic verification: {path}"
         )
@@ -1060,21 +1060,14 @@ def _descriptor_stream_stat_receipt(
     except FileNotFoundError as exc:
         raise TargetChanged(f"{role} pathname disappeared: {path}") from exc
     last = os.fstat(descriptor)
-    identities = {
-        _stat_identity(first),
-        _stat_identity(named),
-        _stat_identity(last),
-    }
-    if len(identities) != 1 or (
-        expected_stat is not None and identities != {expected_stat}
-    ):
+    if not _revision_holds(before_identity, first, named, last):
         # Name the (dev, ino, size, mtime_ns, ctime_ns) views so a platform
         # disagreement (Windows: named stat vs the open descriptor) is
         # diagnosable from the refusal alone.
         raise TargetChanged(
             f"{role} descriptor/path identity changed during seal: {path} "
-            f"(descriptor={_stat_identity(first)} named={_stat_identity(named)} "
-            f"descriptor-after={_stat_identity(last)} expected={expected_stat})"
+            f"(descriptor={_descriptor_identity(first)} named={_stat_identity(named)} "
+            f"descriptor-after={_descriptor_identity(last)} expected={expected_stat})"
         )
     return _StreamStatReceipt(
         _normalize_target(path),
@@ -3297,7 +3290,7 @@ class OutputTransaction:
             try:
                 descriptor = os.open(self._admission.target, os.O_RDONLY)
                 opened = os.fstat(descriptor)
-                expected_stat = _stat_identity(opened)
+                expected_stat = _descriptor_identity(opened)
                 if self._durable_fsync:
                     _fsync_descriptor(descriptor, Path(self._admission.target))
                 flushed = os.fstat(descriptor)

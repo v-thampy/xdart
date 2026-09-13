@@ -24,7 +24,7 @@ SUPPORTED_VIEWER_SUFFIXES = frozenset({
     ".edf", ".tif", ".tiff", ".cbf", ".img", ".mar3450", ".raw",
     ".h5", ".hdf5", ".nxs", ".nexus", ".csv", ".npy", ".npz",
 })
-POLICY_VERSION = "viewer-2d-v1"
+POLICY_VERSION = "viewer-2d-v2"
 CATALOG_RESERVATION = (
     2 * 1024 * 1024 + 512 * 10_000 + 4096 + 128 * 1024 + 4 * 1024 * 1024
 )
@@ -122,20 +122,23 @@ class Viewer2DFormatPolicy:
 
 @dataclass(frozen=True, slots=True)
 class Viewer2DRevision:
+    """File metadata for freshness checks, not a content fingerprint.
+
+    Viewer sources are ordinary local/shared files, not hostile writers.
+    Catalogs are immutable process-local values, validated at construction.
+    """
     canonical_path: str
     device: int
     inode: int
     size: int
     mtime_ns: int
     ctime_ns: int
-    sha256: str
 
     def __post_init__(self):
         values = (self.device, self.inode, self.size, self.mtime_ns, self.ctime_ns)
         _malformed(type(self.canonical_path) is not str or not self.canonical_path
             or len(os.fsencode(self.canonical_path)) > _MAX_PATH
-            or any(type(value) is not int or value < 0 for value in values)
-            or not _sha256_text(self.sha256), "revision")
+            or any(type(value) is not int or value < 0 for value in values), "revision")
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,56 +463,19 @@ def _canonical_path(value):
     return path
 
 
-def _digest_file(path):
-    with open(path, "rb", buffering=0) as stream:
-        return _descriptor_revision(path, stream).sha256
-
-
-def _revision(path, sha256, info):
-    # ``info`` is the DESCRIPTOR view that closed the hash: its ctime is the
-    # exact revalidation slot (NTFS ChangeTime on win32), which a pathname
-    # ``stat`` could not supply there.
-    return Viewer2DRevision(
-        str(path), int(info.st_dev), int(info.st_ino), int(info.st_size),
-        int(info.st_mtime_ns), int(info.st_ctime_ns), sha256,
-    )
-
-
-_REVISION_STAT_FIELDS = (
-    "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns",
-)
-
-
-def _exact_stat(info):
-    """The exact stat tuple of one DESCRIPTOR view.
-
-    Compare it only with the descriptor-recorded revision
-    (``_exact_revision_stat``): win32 fills fstat's st_ctime from NTFS
-    ChangeTime, which every write and every utime advance, so the O(1)
-    fence below still catches a same-size same-mtime rewrite there.
-    """
-    return (int(info.st_dev), int(info.st_ino), int(info.st_size),
-            int(info.st_mtime_ns), int(info.st_ctime_ns))
+def _revision(path, info):
+    return Viewer2DRevision(str(path), *_stat_identity(info))
 
 
 def _stat_identity(info):
-    """Comparable stat tuple of one view (descriptor or pathname).
-
-    The recorded revision keeps the descriptor's observed ctime; every
-    compare between a descriptor view and a pathname view goes through the
-    win32 ctime seam.
-    """
-    return (*_exact_stat(info)[:4], identity_ctime_ns(info.st_ctime_ns))
-
-
-def _exact_revision_stat(revision):
-    return (revision.device, revision.inode, revision.size,
-            revision.mtime_ns, revision.ctime_ns)
+    """Normalize the platform's descriptor/pathname ctime difference once."""
+    return (int(info.st_dev), int(info.st_ino), int(info.st_size),
+            int(info.st_mtime_ns), identity_ctime_ns(info.st_ctime_ns))
 
 
 def _revision_stat(revision):
-    return (*_exact_revision_stat(revision)[:4],
-            identity_ctime_ns(revision.ctime_ns))
+    return (revision.device, revision.inode, revision.size,
+            revision.mtime_ns, revision.ctime_ns)
 
 
 def _path_stat(path):
@@ -521,74 +487,34 @@ def _path_stat(path):
     return _stat_identity(info)
 
 
-def _recertify_drift(revision, message):
-    """Refuse a changed source after refreshing its content identity once.
-
-    The refresh is diagnostic/custodial only: a stat mismatch has already made
-    the admitted catalog stale, so a path that races back to its old contents
-    must still be refused rather than silently inheriting that admission.
-    """
-
-    try:
-        _stable_revision(Path(revision.canonical_path))
-    except (OSError, Viewer2DReadError):
-        pass
-    _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, message)
-
-
 def _cert_stat_revision(revision, *, stream=None, message):
-    """Fence one admitted revision without rereading its whole payload.
-
-    When *stream* is supplied, both the still-open descriptor and its pathname
-    must retain the exact catalog stat tuple.  Stable selected-frame reads are
-    therefore O(1) in artifact size; any drift takes the slow recertification
-    path before refusing the stale catalog.
-    """
+    """Refuse changed file metadata without reading the source payload."""
 
     descriptor = None
     if stream is not None:
         try:
             info = os.fstat(stream.fileno())
         except (OSError, ValueError):
-            _recertify_drift(revision, message)
-        descriptor = _exact_stat(info)
+            _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, message)
+        descriptor = _stat_identity(info)
     try:
         pathname = _path_stat(Path(revision.canonical_path))
     except Viewer2DReadError:
         pathname = None
-    # The descriptor view is held to the recorded revision exactly (ctime
-    # included); the pathname view only through the win32 ctime seam.
     if pathname != _revision_stat(revision) or (
             descriptor is not None
-            and descriptor != _exact_revision_stat(revision)):
-        _recertify_drift(revision, message)
+            and descriptor != _revision_stat(revision)):
+        _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, message)
 
 
-def _descriptor_revision(path, stream, sha256=None):
-    before = os.fstat(stream.fileno())
-    if sha256 is None:
-        stream.seek(0)
-        digest = hashlib.sha256()
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-        sha256 = digest.hexdigest()
-    after = os.fstat(stream.fileno())
-    try:
-        pathname = path.stat()
-    except OSError:
-        _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "viewer source is no longer readable")
-    # The two descriptor views bracket the hash: exact, ctime included, so a
-    # same-size same-mtime rewrite inside the window is refused where the
-    # pathname compare is neutral (win32) rather than digested torn.
-    if _exact_stat(before) != _exact_stat(after) or (
-            _stat_identity(after) != _stat_identity(pathname)):
-        _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "viewer descriptor or path changed")
-    return _revision(path, sha256, after)
+def _descriptor_revision(path, stream):
+    revision = _revision(path, os.fstat(stream.fileno()))
+    _cert_stat_revision(revision, stream=stream, message="viewer descriptor or path changed")
+    return revision
 
 
 def _stable_revision(path):
-    with open(path, "rb", buffering=0) as stream:
-        return _descriptor_revision(path, stream)
+    return _revision(path, path.stat())
 
 
 def _assert_primary(catalog):
@@ -790,7 +716,6 @@ def _selected_dependencies(catalog, label):
 def viewer_2d_selected_ledger(catalog, label):
     if type(catalog) is not Viewer2DArtifactCatalog:
         raise TypeError("selected ledger requires an exact viewer catalog")
-    catalog.__post_init__()
     if type(label) is not int or label not in catalog.frame_labels:
         raise TypeError("selected ledger label is not certified")
     fact = next((item for item in catalog.frame_facts if item.label == label), None)
@@ -811,8 +736,6 @@ def _validate_frame_against_catalog(catalog, label, frame):
     _malformed(type(catalog) is not Viewer2DArtifactCatalog
         or type(frame) is not Viewer2DFrame or type(label) is not int
         or label not in catalog.frame_labels, "selected frame")
-    catalog.__post_init__()
-    frame.__post_init__()
     fact = next((item for item in catalog.frame_facts if item.label == label), None)
     p = frame.provenance
     dependencies = _selected_dependencies(catalog, label)
@@ -938,7 +861,7 @@ def _catalog_csv(path, policy):
         _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED, "CSV exceeds 512 MiB")
     with open(path, "rb", buffering=0) as stream:
         shape, digest = _csv_scan(stream)
-        revision = _descriptor_revision(path, stream, digest)
+        revision = _descriptor_revision(path, stream)
     _admit(shape)
     return _make_catalog(path, policy, Viewer2DSourceKind.CSV_MATRIX, (0,), shape,
                          np.dtype(float), revision, (), "csv")
@@ -2005,19 +1928,7 @@ def _read_numpy(catalog, index):
 
 def _cert_revision(revision, walk):
     walk.touch(revision.canonical_path)
-    try:
-        current = _path_stat(Path(revision.canonical_path))
-    except Viewer2DReadError:
-        current = None
-    if current != _revision_stat(revision):
-        # A state change is always a refusal.  Rehash it before returning so a
-        # changed path never silently inherits an admitted content identity.
-        try:
-            _stable_revision(Path(revision.canonical_path))
-        except (OSError, Viewer2DReadError):
-            pass
-        _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
-                "selected viewer dependency changed")
+    _cert_stat_revision(revision, message="selected viewer dependency changed")
 
 
 def _cert_dependencies(catalog, label, walk):
@@ -2089,72 +2000,11 @@ def _cert_processed_pointer(catalog, fact, policy, walk):
                 "processed source pointer changed")
 
 
-class _HeldRevisions:
-    """Hold every admitted revision an HDF5 read relies on through a
-    descriptor for the read's duration.
-
-    ``h5py`` opens the files by name itself, so the pathname fences alone
-    would settle for the seamed identity and accept a same-size same-mtime
-    rewrite under win32 (Codex review of 0ed7a46c, F3).  A read-only
-    descriptor per distinct path, opened before the first fence and closed
-    after the last, is what lets ``_cert_stat_revision`` hold the exact
-    descriptor view (ctime included) on both sides of the read, the way the
-    NPY/NPZ/RAW readers already do with their own stream.  The descriptors
-    are never read from: only ``fstat``.
-    """
-
-    __slots__ = ("_revisions", "_held")
-
-    def __init__(self, revisions):
-        unique = {}
-        for revision in revisions:
-            unique.setdefault(revision.canonical_path, revision)
-        self._revisions = tuple(unique.values())
-        self._held = ()
-
-    def __enter__(self):
-        held = []
-        try:
-            for revision in self._revisions:
-                try:
-                    stream = open(revision.canonical_path, "rb", buffering=0)
-                except OSError:
-                    _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
-                            "viewer source is no longer readable")
-                held.append((revision, stream))
-        except BaseException:
-            for _, stream in held:
-                stream.close()
-            raise
-        self._held = tuple(held)
-        return self
-
-    def fence(self, message):
-        for revision, stream in self._held:
-            _cert_stat_revision(revision, stream=stream, message=message)
-
-    def __exit__(self, exc_type, exc, tb):
-        for _, stream in self._held:
-            stream.close()
-        self._held = ()
-        return False
-
-
 def _read_hdf5(catalog, label, policy, walk):
-    with _HeldRevisions(
-            (catalog.primary_revision,)
-            + tuple(item.revision for item in _selected_dependencies(catalog, label))) as held:
-        return _read_hdf5_held(catalog, label, policy, walk, held)
-
-
-def _read_hdf5_held(catalog, label, policy, walk, held):
     import h5py
     fact = next((value for value in catalog.frame_facts if value.label == label), None)
     _cert_revision(catalog.primary_revision, walk)
     dependencies = _cert_dependencies(catalog, label, walk)
-    # The pathname fences above keep the walk accounting and the external
-    # link check; the held descriptors are the last word before the read.
-    held.fence("HDF5 descriptor does not match catalog")
     if fact is not None and fact.source_kind is Viewer2DSourceKind.PROCESSED_RAW:
         _cert_processed_pointer(catalog, fact, policy, walk)
         interval = next((item for item in dependencies if item.frame_start is not None), None)
@@ -2218,7 +2068,6 @@ def _read_hdf5_held(catalog, label, policy, walk, held):
                  False, "", "", None, None)
     _cert_dependencies(catalog, label, walk)
     _cert_revision(catalog.primary_revision, walk)
-    held.fence("HDF5 source changed")
     return value
 
 
@@ -2342,8 +2191,7 @@ def _read_frame(catalog, label, policy, walk):
     if catalog.format_name == "csv":
         with open(catalog.canonical_path, "rb", buffering=0) as stream:
             path = Path(catalog.canonical_path)
-            opened = _revision(path, catalog.primary_revision.sha256,
-                               os.fstat(stream.fileno()))
+            opened = _revision(path, os.fstat(stream.fileno()))
             try:
                 # A pathname view against the descriptor-recorded catalog
                 # revision: comparable only through the win32 ctime seam.
@@ -2356,14 +2204,14 @@ def _read_frame(catalog, label, policy, walk):
                 _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
                         "CSV descriptor does not match catalog")
             first_shape, first_digest = _csv_scan(stream)
-            first_revision = _descriptor_revision(path, stream, first_digest)
+            first_revision = _descriptor_revision(path, stream)
             if first_shape != shape or first_revision != catalog.primary_revision:
                 _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
                         "CSV first pass changed")
             array = np.empty(shape, dtype=float, order="C")
             try:
                 checked_shape, digest = _csv_scan(stream, array)
-                second_revision = _descriptor_revision(path, stream, digest)
+                second_revision = _descriptor_revision(path, stream)
                 if (checked_shape != first_shape or digest != first_digest
                         or second_revision != first_revision):
                     _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
