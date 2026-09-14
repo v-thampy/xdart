@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import copy
+import os
 from pathlib import Path
 
 import pytest
@@ -118,6 +119,22 @@ def test_freeze_is_deeply_immutable_and_generation_is_content_independent():
     assert same_content.generation == 2
     assert same_content.fingerprint == frozen.fingerprint
     assert same_content.identity != frozen.identity
+
+
+@pytest.mark.parametrize("suffix", [os.sep, os.sep + "."])
+def test_project_folder_spelling_is_normalized_before_fingerprinting(tmp_path, suffix):
+    root = str(tmp_path)
+    canonical = RunIntent(project_root=root).freeze()
+    entered = RunIntent(project_root=root + suffix).freeze()
+
+    assert entered.project_root == os.path.normcase(root)
+    assert entered.fingerprint == canonical.fingerprint
+    assert entered.as_provenance()["project_root"] == canonical.project_root
+    assert RunIntent.from_frozen(entered).freeze().project_root == canonical.project_root
+
+
+def test_unselected_project_folder_stays_empty():
+    assert RunIntent().freeze().project_root == ""
 
 
 def test_v3_calibration_changes_frozen_fingerprint_and_is_deeply_immutable():

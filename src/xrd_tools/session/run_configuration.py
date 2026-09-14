@@ -20,6 +20,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -930,6 +931,13 @@ class FrozenRunConfiguration:
             )
         object.__setattr__(self, "generation", generation)
         object.__setattr__(self, "max_cores", max_cores)
+        # Folder-dialog and typed paths may retain a trailing separator.
+        # Normalize once, before fingerprinting, for every run consumer.
+        if self.project_root:
+            object.__setattr__(
+                self, "project_root",
+                os.path.normcase(os.path.normpath(self.project_root)),
+            )
         object.__setattr__(
             self,
             "output_mode",

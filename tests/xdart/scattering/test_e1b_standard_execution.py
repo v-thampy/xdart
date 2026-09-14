@@ -15,7 +15,7 @@ import pytest
 from xrd_tools.core.provenance import read_provenance
 from xrd_tools.io.frame_view import read_frame_record
 from xrd_tools.session.intent_store import RunIntentStore
-from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.session.run_configuration import RunIntent, ThresholdIntent
 from xrd_tools.sources.selection import image_series_spec
 from xdart.gui.tabs.scattering.adapters import run_executor as executor_module
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor, _StandardRun
@@ -185,6 +185,73 @@ def test_executor_refuses_incomplete_configuration_before_constructing_output(tm
     assert isinstance(result, ExecutorStartFailed)
     assert result.cleanup_status.value == "cleaned"
     assert not (tmp_path / "out.nxs").exists()
+
+
+@pytest.mark.parametrize("trailing_separator", [False, True])
+def test_real_16_frame_run_publishes_with_a_project_folder_separator(
+    tmp_path: Path, trailing_separator: bool,
+) -> None:
+    import h5py
+
+    tiff = _fixture_root()
+    selected = tiff / "Combi4_Angledependence_samz_4p9_03271005_0001.tif"
+    if not selected.is_file():
+        pytest.skip("the 16-frame Combi4 fixture is unavailable")
+    root = str(tiff.parent) + (os.sep if trailing_separator else "")
+    intent = RunIntent(
+        source_spec=image_series_spec(selected),
+        processing_mode="Int 2D",
+        poni_file=str(tiff / "LaB6_detz190_dety72_th5_03261554_0001.poni"),
+        project_root=root,
+        save_path=str(tmp_path / "combi.nexus"),
+        output_mode="Overwrite", max_cores=4,
+        threshold=ThresholdIntent(apply_threshold=True, threshold_min=0,
+                                  threshold_max=65534),
+        bai_1d_args={"npt": 1000, "method": "csr", "unit": "q_A^-1",
+                     "radial_range": (0, 5), "azimuth_range": (-180, 180)},
+        bai_2d_args={"npt_rad": 500, "npt_azim": 500, "method": "csr",
+                     "unit": "q_A^-1", "radial_range": (0, 5),
+                     "azimuth_range": (-180, 180)},
+    )
+    executor = StandardRunExecutor(max_display_items=8)
+    pipeline = StartPipeline(
+        intents=RunIntentStore(intent), lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(), executor=executor,
+    )
+    started = time.perf_counter()
+    capture = pipeline.begin()
+    admission = await_admission(executor, capture)
+    admitted = time.perf_counter()
+    launched = pipeline.start(admission)
+    assert isinstance(launched, StartLaunched)
+    try:
+        events = _wait_for_terminal(executor)
+    finally:
+        receipt = executor.close(launched.run_identity)
+    closed = time.perf_counter()
+    print(f"COMBI16 admission_s={admitted - started:.3f} "
+          f"run_and_close_s={closed - admitted:.3f} "
+          f"total_s={closed - started:.3f} output={admission.outputs[0].item.target}")
+    assert receipt.cleanup_status.value == "cleaned"
+    terminal = events[-1]
+    assert terminal.kind is StandardEventKind.FINISHED, (terminal.detail, terminal.primary)
+    assert terminal.completed == 16
+    assert terminal.cleanup_status.value == "cleaned"
+    ready = [event for event in events if event.kind is StandardEventKind.FRAME_READY]
+    assert [event.frame_key.local_frame_label for event in ready] == list(range(1, 17))
+    output = admission.outputs[0].item.target
+    with h5py.File(output, "r") as handle:
+        for dimension in ("integrated_1d", "integrated_2d"):
+            np.testing.assert_array_equal(
+                handle[f"entry/{dimension}/frame_index"][:], np.arange(1, 17),
+            )
+    for label in (1, 8, 16):
+        view = read_frame_record(output, label).active_view()
+        assert view.intensity_1d.shape == (1000,)
+        assert view.intensity_2d.shape == (500, 500)
+        # Empty integration bins are NaN; each result must still contain data.
+        assert np.isfinite(view.intensity_1d).any()
+        assert np.isfinite(view.intensity_2d).any()
 
 
 def test_stop_during_admitted_revalidation_returns_stopped(
