@@ -650,9 +650,34 @@ material selector: `examples/notebooks/02_multigeometry_stitching.ipynb`.
 
 ## Development
 
-See the [editable Pixi setup](docs/INSTALLATION.md#editable-install-with-pixi-recommended)
-for macOS, Linux, and Windows, and the
-[test and packaging commands](docs/INSTALLATION.md#tests-and-packaging).
+Use the repository's **shared Pixi workspace** for editable source installs.
+`pyproject.toml` and `pixi.lock` travel with the Git checkout; each machine installs
+the packages locked for its own platform. The xdart source is already editable,
+so source edits take effect when you restart the application.
+
+The checked-in workspace currently includes Apple Silicon macOS (`osx-arm64`)
+and Linux x86-64 (`linux-64`). Windows x86-64 (`win-64`) still needs the
+[one-time platform setup and native validation](docs/INSTALLATION.md#adding-windows-to-the-shared-workspace).
+Once that manifest and lockfile change is committed and merged, future Windows
+clones use the same `pixi install --locked` and `pixi run --locked xdart` commands.
+Users do not add the platform or regenerate the lockfile on each new machine.
+
+After saving or committing local work, update an existing supported checkout with:
+
+```bash
+git pull --ff-only
+pixi install --locked
+pixi run --locked xdart
+```
+
+Each new machine still needs Git, Pixi, and its own environment installation.
+Future dependency changes require an updated shared lockfile and checks on the
+affected platforms; ordinary source edits do not require relocking. Adding a
+platform increases dependency-resolution and validation work, but the platform
+declaration itself adds no application runtime memory or processing overhead.
+
+See the [complete editable setup](docs/INSTALLATION.md#editable-install-with-pixi-recommended)
+and [test and packaging commands](docs/INSTALLATION.md#tests-and-packaging).
 
 ---
 

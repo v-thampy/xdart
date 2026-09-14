@@ -261,50 +261,61 @@ with `pixi list`, or confirm the source location with:
 pixi run --locked python -c "import xdart; print(xdart.__file__)"
 ```
 
-**Windows editable install:** the checked-in workspace currently locks only
-`osx-arm64` and `linux-64`. Create a separate Windows workspace next to the clone,
-so its environment and lockfile do not change the repository's platform lock:
+### Adding Windows to the shared workspace
+
+The checked-in workspace currently locks only `osx-arm64` and `linux-64`.
+Windows x86-64 (`win-64`) needs the following **one-time repository change** and
+native Windows validation. Do this on a feature branch before merging it; a
+separate Windows workspace is unnecessary once the shared lock includes Windows.
+
+From the source checkout, add the platform and generate its lock entries:
 
 ```powershell
-git clone https://github.com/v-thampy/xdart.git
-mkdir xdart-dev
-cd xdart-dev
+pixi workspace platform add win-64 --no-install
+git diff -- pyproject.toml pixi.lock
 ```
 
-Save this as `xdart-dev/pixi.toml` (the source checkout is the sibling `xdart`
-directory):
+The command updates both `pyproject.toml` and `pixi.lock`. Keep the existing
+dependency pins and review any changes to the already locked macOS/Linux
+packages. No blanket `pixi update` is needed. See the
+[Pixi platform command](https://pixi.prefix.dev/latest/reference/cli/pixi/workspace/platform/add/).
 
-```toml
-[workspace]
-name = "xdart-dev"
-channels = ["conda-forge"]
-platforms = ["win-64"]
+On a Windows x86-64 machine, install from that lock and confirm that the imported
+xdart source is inside the checkout's `src` directory:
 
-[dependencies]
-python = "3.13.*"
-numpy = "==2.5.1"
-h5py = "*"
-hdf5plugin = "*"
-hdf5 = "*"
-blosc = "*"
-c-blosc2 = "*"
-lz4-c = "*"
-fabio = "*"
-pyfai = ">=2026.5,<2026.6"
-silx = "*"
-pyside6 = "*"
-xrayutilities = "==1.7.12"
-
-[pypi-dependencies]
-xdart = { path = "../xdart", editable = true, extras = ["gui", "dev", "notebook"] }
+```powershell
+pixi install --locked
+pixi run --locked python -c "import sys, xdart; print(sys.version); print(sys.executable); print(xdart.__file__)"
+pixi list
 ```
 
-Then run `pixi install` and `pixi run xdart` from `xdart-dev`. Keep the generated
-`pixi.lock` to reproduce that Windows environment; subsequent launches can use
-`pixi run --locked xdart`. To update the editable source, run `git pull --ff-only`
-in the sibling `xdart` checkout. If its dependencies changed, run `pixi install`
-in `xdart-dev` and retain the updated Windows lockfile. This Windows setup must
-be validated on Windows before declaring a release supported there.
+Run these small, synthetic-data checks for native HDF5/LZ4, pyFAI, and
+xrayutilities integration:
+
+```powershell
+pixi run --locked python -m pytest -q -ra --timeout=120 `
+  tests/core/test_nexus.py::TestResolveStackCompression::test_lz4_round_trips_when_natively_supported `
+  tests/core/test_single.py::test_readonly_mask_detaches_for_pyfai_without_changing_exclusions `
+  tests/core/test_circle_angles.py::test_q_identity_through_pixel_q
+$LASTEXITCODE
+```
+
+Require all three tests to pass without skips and exit normally with code 0.
+Then launch `pixi run --locked xdart`, open representative data, select frames,
+and close the application normally. Record the Windows results with the change;
+generating a lockfile on another OS does not validate native Windows behavior.
+
+Commit `pyproject.toml` and `pixi.lock` together. Once the change is merged,
+**future Windows clones use the same clone/install/launch commands above**.
+Each machine still installs Git, Pixi, and its own local environment, but users
+do not repeat the platform addition or regenerate the lockfile.
+
+Future dependency changes require maintainers to update the shared lockfile and
+validate affected platforms. Resolving more platforms can take longer or expose
+packages unavailable on Windows. Each machine installs only its platform's
+packages; declaring Windows does not itself increase xdart's runtime memory or
+processing cost. Dependency changes can affect performance and need their own
+checks. Ordinary source edits keep using the existing editable install.
 
 ## Tests and packaging
 
@@ -317,10 +328,9 @@ pixi run python scripts/release.py check          # focused release preflight
 pixi run python scripts/release.py build          # preflight, sdist/wheel, twine
 ```
 
-For the separate Windows workspace, run Python/pytest with paths into the sibling
-checkout. Release preflight is a focused check; it does not replace the CI suites
-or native platform testing. Publishing is performed by the release workflows
-when a maintainer pushes a version tag.
+Release preflight is a focused check; it does not replace the CI suites or native
+platform testing. Publishing is performed by the release workflows when a
+maintainer pushes a version tag.
 
 ## Published releases and updates
 
