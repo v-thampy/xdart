@@ -646,6 +646,124 @@ def test_mounted_profile_ports_roundtrip_one_next_run_intent(
         qapp.processEvents()
 
 
+@pytest.mark.parametrize("quit_action", [False, True])
+def test_application_close_restores_last_config_and_focused_edit(
+        qapp, isolated_settings, tmp_path, monkeypatch, quit_action):
+    from pyqtgraph.Qt import QtTest
+    from xdart._gui_main import Main, _apply_cli_session_args
+    from xdart.gui.tabs.scattering.controls_projection import PROJECT_ROOT
+    from xdart.gui.widgets.controls_panel import FormRow
+    from xdart.utils.session import load_session, save_session
+    from xrd_tools.session.run_intent_profile import dump_run_intent_profile
+
+    monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
+    if quit_action:
+        _apply_cli_session_args(["xdart", "-n", str(tmp_path / "named.json")])
+    save_session({"unrelated_session_key": "preserve-other-session-fields"})
+    window = Main()
+    try:
+        page = window.page_handle.widget
+        store = page._intents
+        changed = store.snapshot().thaw()
+        changed.processing_mode = "Int 2D"
+        changed.max_cores = 2
+        changed.bai_1d_args = {"npt": 711, "unit": "q_A^-1"}
+        changed.bai_2d_args = {"npt_rad": 401, "npt_azim": 91}
+        changed.threshold.threshold_min = 12
+        changed.threshold.threshold_max = 10000
+        store.commit(changed, expected_revision=store.revision)
+        page._refresh_shell()
+        project = tmp_path / "my project"
+        project.mkdir()
+        row = next(row for row in page._shell.controls.findChildren(FormRow)
+                   if row.path == PROJECT_ROOT)
+        window.activateWindow()
+        qapp.processEvents()
+        row.editor.setFocus()
+        qapp.processEvents()
+        assert row.editor.hasFocus()
+        row.editor.selectAll()
+        QtTest.QTest.keyClicks(row.editor, str(project))
+        assert store.snapshot().thaw().project_root != str(project)
+        exits = []
+        # Replace only process termination; the real Quit/close/save path runs.
+        monkeypatch.setattr(window, "_terminate_process", lambda: exits.append(True))
+        if quit_action:
+            window.ui.actionExit.trigger()
+        else:
+            window.close()
+        qapp.processEvents()
+        assert not window.isVisible()
+        if quit_action:
+            assert exits == [True]
+        assert store.snapshot().thaw().project_root == str(project)
+        expected = dump_run_intent_profile(store.snapshot().thaw())
+        assert load_session()["scattering_run_profile"] == expected
+        assert load_session()["unrelated_session_key"] == "preserve-other-session-fields"
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+    restored = Main()
+    try:
+        actual = restored.page_handle.widget._intents.snapshot().thaw()
+        assert dump_run_intent_profile(actual) == expected
+        assert actual.project_root == str(project)
+        assert actual.max_cores == 2
+    finally:
+        restored.close()
+        restored.deleteLater()
+        qapp.processEvents()
+
+
+def test_fresh_application_does_not_restore_or_overwrite_config(
+        qapp, isolated_settings, tmp_path, monkeypatch):
+    from xdart._gui_main import Main
+    from xdart.utils.session import save_session
+    from xrd_tools.session.run_configuration import RunIntent
+    from xrd_tools.session.run_intent_profile import dump_run_intent_profile
+
+    monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
+    save_session({"scattering_run_profile": dump_run_intent_profile(
+        RunIntent(project_root=str(tmp_path / "saved-project"), max_cores=2))})
+    session = Path(os.environ["XDART_SESSION_FILE"])
+    before = session.read_bytes()
+    monkeypatch.setenv("XDART_SESSION_FRESH", "1")
+    window = Main()
+    try:
+        assert window.page_handle.widget._intents.snapshot().thaw().project_root == ""
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+    assert session.read_bytes() == before
+
+
+def test_injected_intent_store_does_not_load_or_overwrite_app_session(
+        qapp, isolated_settings, tmp_path, monkeypatch):
+    from xdart.utils.session import save_session
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from xrd_tools.session.run_intent_profile import dump_run_intent_profile
+
+    monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
+    save_session({"scattering_run_profile": dump_run_intent_profile(
+        RunIntent(project_root=str(tmp_path / "saved-project")))})
+    session = Path(os.environ["XDART_SESSION_FILE"])
+    before = session.read_bytes()
+    store = RunIntentStore(RunIntent(project_root=str(tmp_path / "injected")))
+    handle = _build_mounted_workspace(store, SimpleNamespaceStatus())
+    try:
+        assert handle.widget._intents is store
+        assert store.snapshot().thaw().project_root == str(tmp_path / "injected")
+    finally:
+        assert handle.close().status is PageCleanup.CLEAN
+        handle.widget.deleteLater()
+        qapp.processEvents()
+    assert session.read_bytes() == before
+
+
 def test_mounted_profile_load_is_fail_closed_on_malformed_json(
         qapp, isolated_settings, tmp_path):
     from xrd_tools.session.intent_store import RunIntentStore

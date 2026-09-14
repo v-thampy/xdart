@@ -14,7 +14,8 @@ launcher.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import logging
 import os
 from typing import TYPE_CHECKING
 
@@ -31,6 +32,9 @@ from .values import (
 if TYPE_CHECKING:
     from pyqtgraph import QtWidgets as _QtWidgets  # noqa: F401 (typing only)
     from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+
+logger = logging.getLogger(__name__)
+_SESSION_PROFILE_KEY = "scattering_run_profile"
 
 
 def _tool_button_menu(widget, object_name: str):
@@ -96,10 +100,14 @@ class _WorkspaceCloser:
     """
 
     widget: "ScatteringWorkspace"
+    persist_session: bool = False
+    _session_saved: bool = field(default=False, init=False)
 
     def __call__(self) -> CloseReceipt:
         from xdart.gui.tabs.scattering.events import CleanupStatus
 
+        if self.persist_session and not self.widget._closing:
+            self.widget._commit_focused_control_edit_for_run()
         closed = self.widget.close_workspace()
         detail = closed.cleanup_status.value
         if closed.cleanup_failures:
@@ -108,6 +116,16 @@ class _WorkspaceCloser:
                 " diagnostics)"
             )
         if closed.cleanup_status is CleanupStatus.CLEANED:
+            if self.persist_session and not self._session_saved:
+                from xdart.utils.session import save_session
+                from xrd_tools.session.run_intent_profile import dump_run_intent_profile
+
+                try:
+                    profile = dump_run_intent_profile(self.widget._intents.snapshot().thaw())
+                    save_session({_SESSION_PROFILE_KEY: profile})
+                except Exception:
+                    logger.warning("Could not save the last run configuration", exc_info=True)
+                self._session_saved = True
             return CloseReceipt(PageCleanup.CLEAN, detail)
         return CloseReceipt(PageCleanup.PENDING, detail)
 
@@ -463,11 +481,22 @@ def build_scattering_workspace(
 
     key = SCATTERING_PAGE_KEY
     intents = services.run_intents.store_for(key)
+    persist_session = intents is None
     if intents is None:
-        intents = RunIntentStore(RunIntent(
+        from xdart.utils.session import load_session
+        from xrd_tools.session.run_intent_profile import load_run_intent_profile
+
+        intent = RunIntent(
             output_mode="Overwrite",
             max_cores=min(max(1, (os.cpu_count() or 1) - 1), 4),
-        ))
+        )
+        try:
+            profile = load_session().get(_SESSION_PROFILE_KEY)
+            if profile is not None:
+                intent = load_run_intent_profile(profile)
+        except Exception:
+            logger.warning("Could not restore the last run configuration", exc_info=True)
+        intents = RunIntentStore(intent)
     executor = services.execution.executor_for(key)
     if executor is None:
         executor = StandardRunExecutor()
@@ -498,7 +527,7 @@ def build_scattering_workspace(
     return PageHandle(
         key=key,
         widget=widget,
-        close=_WorkspaceCloser(widget),
+        close=_WorkspaceCloser(widget, persist_session=persist_session),
         open_folder=_WorkspaceOpenFolder(widget),
         settings_io=_WorkspaceSettings(widget),
         run_control=_WorkspaceRunControl(widget),
