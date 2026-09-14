@@ -1,8 +1,7 @@
-"""Exact-port oracle for the accepted canonical display-context kernel."""
+"""Display-context behavior and headless imports, with historical port inventory."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -21,22 +20,12 @@ from xdart.modules.display_context import (
 )
 
 
-# The E3-accepted kernel (7c379710 / blob 73449efe) was superseded by the
-# accepted E4-S canonical-first revision that composes the typed shared
-# hydration purpose/token; that accepted E4-S image (kept below as the
-# superseded ancestry record) was in turn superseded by E6-NORM-N1, which
-# adds exactly the ONE write-once ``norm_aggregate`` construction field to
-# the browse context (handoff §25.1).  The live pin names the E6-NORM-N1 bytes; a
-# commit cannot contain its own hash, so the commit->blob ancestry leg stays
-# asserted for the accepted E4-S object.
+# Historical E4-S inventory remains immutable. The current module has since
+# gained viewer and Browse ownership; runtime behavior below is its contract.
 _E4S_COMMIT = "72b7b08efd4d24df0f74aa462a4b1766a97be6b2"
 _E4S_BLOB = "3329391554910eb2e062da0a6c2afe3415db398c"
 _E4S_SHA256 = (
     "7664a4c0979336015a0779b568461e2953ec04295a503c04cc711521594da825"
-)
-_CANONICAL_BLOB = "ea99f4b98e5a3db4937a4e89c774b055f8bbcc0d"
-_CANONICAL_SHA256 = (
-    "80a8573efecb3d42f309697aa827f8faee4800ad8ee8af721bf50cf25a230819"
 )
 _MODULE = (
     Path(__file__).parents[3]
@@ -74,29 +63,6 @@ def _acquisition() -> AcquisitionContext:
     )
 
 
-def test_port_is_byte_identical_to_the_accepted_canonical_blob() -> None:
-    payload = _MODULE.read_bytes()
-    assert hashlib.sha256(payload).hexdigest() == _CANONICAL_SHA256
-    blob = subprocess.run(
-        ["git", "hash-object", str(_MODULE)],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert blob == _CANONICAL_BLOB
-    superseded = subprocess.run(
-        [
-            "git",
-            "rev-parse",
-            f"{_E4S_COMMIT}:src/xdart/modules/display_context.py",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert superseded == _E4S_BLOB
-
-
 def test_dependency_inventory_names_the_accepted_canonical_object() -> None:
     inventory = json.loads(_INVENTORY.read_text(encoding="utf-8"))
     assert inventory["canonical_context_commit"] == _E4S_COMMIT
@@ -114,20 +80,20 @@ sys.modules["e3_context"] = module
 spec.loader.exec_module(module)
 forbidden = (
     "PySide6", "PyQt5", "PyQt6", "qtpy", "pyqtgraph", "h5py",
-    "pyFAI", "fabio", "numpy", "pandas", "xdart",
+    "pyFAI", "fabio", "pandas", "matplotlib", "plotly", "xdart",
 )
 assert not any(
     name == root or name.startswith(root + ".")
     for name in sys.modules
     for root in forbidden
 ), sorted(name for name in sys.modules if name.split(".", 1)[0] in forbidden)
-loaded_xrd = {{
-    name for name in sys.modules
-    if name == "xrd_tools" or name.startswith("xrd_tools.")
-}}
-assert loaded_xrd <= {{
-    "xrd_tools", "xrd_tools.session", "xrd_tools.session.hydration"
-}}, sorted(loaded_xrd)
+# Viewer value contracts use NumPy for array validation. Importing the
+# display owner must still avoid the scientific execution and file readers.
+assert not any(
+    name == root or name.startswith(root + ".")
+    for name in sys.modules
+    for root in ("xrd_tools.reduction", "xrd_tools.sources", "xrd_tools.io.frame_view")
+)
 """
     completed = subprocess.run(
         [sys.executable, "-c", script],

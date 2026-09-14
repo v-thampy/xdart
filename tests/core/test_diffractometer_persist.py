@@ -11,6 +11,9 @@ from pathlib import Path
 import h5py
 
 import numpy as np
+import pytest
+
+from tests.core._processed_fixture import write_recognized_result
 
 from xrd_tools.core.geometry import (
     Diffractometer,
@@ -33,9 +36,9 @@ def _calibrated_diff() -> Diffractometer:
 
 
 def _write_entry(path: Path, diff) -> None:
-    with h5py.File(path, "w") as f:
-        entry = f.create_group("entry")
-        write_diffractometer(entry, diff)
+    write_recognized_result(path)
+    with h5py.File(path, "a") as f:
+        write_diffractometer(f["entry"], diff)
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +47,7 @@ def _write_entry(path: Path, diff) -> None:
 
 def test_write_read_roundtrip(tmp_path):
     diff = _calibrated_diff()
-    p = tmp_path / "scan.nxs"
+    p = tmp_path / "scan.nexus"
     _write_entry(p, diff)
     back = get_diffractometer(p)
     assert back == diff
@@ -58,31 +61,31 @@ def test_write_read_roundtrip(tmp_path):
 
 def test_preset_diffractometer_roundtrip(tmp_path):
     diff = Diffractometer.psic()
-    p = tmp_path / "scan.nxs"
+    p = tmp_path / "scan.nexus"
     _write_entry(p, diff)
     assert get_diffractometer(p) == diff
 
 
 # ---------------------------------------------------------------------------
-# back-compat: absent group / file → None (never raise, never synthesize)
+# Optional geometry on an admitted current record; malformed records refuse.
 # ---------------------------------------------------------------------------
 
 def test_absent_group_returns_none(tmp_path):
-    p = tmp_path / "old.nxs"
-    with h5py.File(p, "w") as f:
-        f.create_group("entry")  # no diffractometer group (a pre-existing file)
+    p = tmp_path / "without-geometry.nexus"
+    _write_entry(p, None)
     assert get_diffractometer(p) is None
 
 
-def test_absent_entry_returns_none(tmp_path):
-    p = tmp_path / "weird.nxs"
+def test_absent_entry_refuses_nonprocessed_input(tmp_path):
+    p = tmp_path / "weird.nexus"
     with h5py.File(p, "w") as f:
         f.create_group("something_else")
-    assert get_diffractometer(p) is None
+    with pytest.raises(ValueError, match="not a current xdart"):
+        get_diffractometer(p)
 
 
 def test_write_none_clears_group(tmp_path):
-    p = tmp_path / "scan.nxs"
+    p = tmp_path / "scan.nexus"
     _write_entry(p, _calibrated_diff())
     assert get_diffractometer(p) is not None
     # rewriting with None clears it (e.g. geometry removed)
@@ -102,7 +105,7 @@ def test_capability_registered():
     assert cap.introduced <= 2  # additive at v2, no schema bump
 
 def test_capability_detected_after_write(tmp_path):
-    p = tmp_path / "scan.nxs"
+    p = tmp_path / "scan.nexus"
     _write_entry(p, _calibrated_diff())
     with h5py.File(p, "r") as f:
         caps = detect_capabilities(f["entry"])
@@ -122,23 +125,21 @@ def test_capability_absent_on_old_file(tmp_path):
 
 def test_processed_scan_property(tmp_path):
     diff = _calibrated_diff()
-    p = tmp_path / "scan.nxs"
+    p = tmp_path / "scan.nexus"
     _write_entry(p, diff)
     scan = ProcessedScan(p)
     assert scan.diffractometer == diff
     # cached (the flag means a second read does not re-open)
     assert scan.diffractometer is scan.diffractometer
 
-def test_processed_scan_property_none_on_old_file(tmp_path):
-    p = tmp_path / "old.nxs"
-    with h5py.File(p, "w") as f:
-        f.create_group("entry")
+def test_processed_scan_property_none_without_geometry(tmp_path):
+    p = tmp_path / "without-geometry.nexus"
+    _write_entry(p, None)
     assert ProcessedScan(p).diffractometer is None
 
 def test_processed_scan_refresh_resets(tmp_path):
-    p = tmp_path / "scan.nxs"
-    with h5py.File(p, "w") as f:
-        f.create_group("entry")
+    p = tmp_path / "scan.nexus"
+    _write_entry(p, None)
     scan = ProcessedScan(p)
     assert scan.diffractometer is None
     # write a geometry, then refresh -> the property re-reads

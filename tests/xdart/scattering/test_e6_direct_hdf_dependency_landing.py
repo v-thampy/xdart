@@ -126,43 +126,24 @@ def _direct_start(
     return StartCapture(request, 1, snapshot, capture)
 
 
-class _ProbeOwner:
-    def __init__(self, owner, action) -> None:
-        self._owner = owner
-        self._action = action
-        self._fired = False
-
-    def __getattr__(self, name):
-        return getattr(self._owner, name)
-
-    def probe(self, path):
-        result = self._owner.probe(path)
-        if (
-            not self._fired
-            and result.state is ProbeState.READY
-            and result.descriptor is not None
-        ):
-            self._fired = True
-            self._action()
-        return result
-
-
-def _after_ready_probe(
+def _after_ready_descriptor(
     monkeypatch: pytest.MonkeyPatch,
     master: Path,
     action,
-) -> _ProbeOwner:
-    real_owner = output_preflight.candidate_owner
-    selected = real_owner(master)
-    assert selected is not None
-    proxy = _ProbeOwner(selected, action)
+) -> None:
+    """Cut after the real descriptor/binding, before dependency capture."""
+    real_members = source_graph._external_members
+    fired = False
 
-    def owner(path):
-        value = real_owner(path)
-        return proxy if value is not None and _key(path) == _key(master) else value
+    def members(path, state, descriptor, **kwargs):
+        nonlocal fired
+        if not fired and _key(path) == _key(master):
+            assert descriptor.state is ProbeState.READY
+            fired = True
+            action()
+        return real_members(path, state, descriptor, **kwargs)
 
-    monkeypatch.setattr(output_preflight, "candidate_owner", owner)
-    return proxy
+    monkeypatch.setattr(source_graph, "_external_members", members)
 
 
 def _assert_direct_failure(
@@ -207,9 +188,9 @@ def _assert_direct_failure(
         forbidden_call("inspect_output"),
     )
     monkeypatch.setattr(
-        executor_module.TargetLease,
-        "acquire",
-        classmethod(lambda _cls, _paths: forbidden_call("target_lease")()),
+        executor_module.DynamicOutputAdapter,
+        "__init__",
+        forbidden_call("dynamic_output"),
     )
     monkeypatch.setattr(
         executor,
@@ -236,7 +217,6 @@ def _assert_direct_failure(
     operation = executor._admission
     if operation is not None:
         assert operation.directory_session is None
-        assert operation.target_lease is None
     assert executor._active is None
     assert executor.drain_events() == ()
     assert forbidden == []
@@ -265,7 +245,7 @@ def test_post_probe_required_dependency_disappearance_is_revision(
 
     _raw, master, dependency = _write_graph(tmp_path, layout)
     start = _direct_start(tmp_path, master, request_value=14010)
-    _after_ready_probe(monkeypatch, master, dependency.unlink)
+    _after_ready_descriptor(monkeypatch, master, dependency.unlink)
     _assert_direct_failure(
         monkeypatch,
         StandardRunExecutor(join_timeout=2.0),
@@ -330,13 +310,16 @@ def test_stop_before_required_dependency_capture_has_no_later_io(
             later.append("SourceFileState.capture")
         return real_capture(path)
 
-    real_file = h5py.File
+    real_file_init = h5py.File.__init__
 
-    def opened(*args, **kwargs):
+    def opened(handle, *args, **kwargs):
         operation = executor._admission
-        if operation is not None and operation.cancelled.is_set():
+        if (
+            operation is not None and operation.cancelled.is_set()
+            and args and isinstance(args[0], (str, bytes, os.PathLike))
+        ):
             later.append("h5py.File")
-        return real_file(*args, **kwargs)
+        return real_file_init(handle, *args, **kwargs)
 
     monkeypatch.setattr(
         source_graph,
@@ -350,7 +333,7 @@ def test_stop_before_required_dependency_capture_has_no_later_io(
     )
     monkeypatch.setattr(source_graph, "_hdf5_link_file", linked)
     monkeypatch.setattr(SourceFileState, "capture", staticmethod(captured))
-    monkeypatch.setattr(h5py, "File", opened)
+    monkeypatch.setattr(h5py.File, "__init__", opened)
 
     _assert_direct_failure(
         monkeypatch,
@@ -375,7 +358,7 @@ def test_dependency_removed_after_capture_is_revision(
     start = _direct_start(tmp_path, master, request_value=14030)
     ready = [False]
     fired = [False]
-    _after_ready_probe(monkeypatch, master, lambda: ready.__setitem__(0, True))
+    _after_ready_descriptor(monkeypatch, master, lambda: ready.__setitem__(0, True))
     real_capture = SourceFileState.capture
 
     def captured(path):
@@ -409,7 +392,7 @@ def test_proved_dependency_drift_precedes_late_stop(
     ready = [False]
     replaced = [False]
     stopped = [False]
-    _after_ready_probe(monkeypatch, master, lambda: ready.__setitem__(0, True))
+    _after_ready_descriptor(monkeypatch, master, lambda: ready.__setitem__(0, True))
     real_capture = SourceFileState.capture
 
     def captured(path):
@@ -461,7 +444,7 @@ def test_generic_required_dependency_capture_error_is_revision(
     _raw, master, dependency = _write_graph(tmp_path, layout)
     start = _direct_start(tmp_path, master, request_value=14050)
     ready = [False]
-    _after_ready_probe(monkeypatch, master, lambda: ready.__setitem__(0, True))
+    _after_ready_descriptor(monkeypatch, master, lambda: ready.__setitem__(0, True))
     real_capture = SourceFileState.capture
 
     def captured(path):
@@ -489,7 +472,7 @@ def test_direct_external_storage_generic_capture_is_revision_before_side_effects
     ready = [False]
     fired = [0]
     capture_error = OSError(_CAPTURE_SENTINEL)
-    _after_ready_probe(monkeypatch, master, lambda: ready.__setitem__(0, True))
+    _after_ready_descriptor(monkeypatch, master, lambda: ready.__setitem__(0, True))
     real_capture = SourceFileState.capture
 
     def captured(path):
@@ -517,7 +500,7 @@ def test_external_storage_capture_classifier_has_one_ast_owner() -> None:
 
     landing_prefix = "external HDF5 storage is still landing: "
     capture_prefix = "external HDF5 storage capture is unverifiable: "
-    tree = ast.parse(inspect.getsource(output_preflight))
+    tree = ast.parse(inspect.getsource(source_graph))
     parents: dict[ast.AST, ast.AST] = {}
     owners: dict[ast.AST, ast.AST | None] = {}
 
@@ -651,7 +634,7 @@ def test_unchanged_missing_dependency_object_is_stable_value_error(
     _raw, master, dependency = _write_graph(tmp_path, layout)
     start = _direct_start(tmp_path, master, request_value=14060)
     ready = [False]
-    _after_ready_probe(monkeypatch, master, lambda: ready.__setitem__(0, True))
+    _after_ready_descriptor(monkeypatch, master, lambda: ready.__setitem__(0, True))
     real_get = h5py.Group.get
 
     def missing(group, name, *args, **kwargs):

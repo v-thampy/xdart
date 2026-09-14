@@ -3815,3 +3815,60 @@ def test_a_family_only_predecessor_is_accepted(tmp_path):
             publication_identity="c" * 64,
             lineage_identity="d" * 64,
         )
+
+
+# ---------------------------------------------------------------------------
+# The Windows stat shape (PR #1 2026-09-11): pathname ctime = creation time,
+# descriptor ctime = change time.  The target fences compare fstat views of
+# the opened object with pathname views of the same file; the seam is the
+# only reason they agree on win32.
+# ---------------------------------------------------------------------------
+
+
+def _target_hdf(tmp_path):
+    from xrd_tools.io.output_transaction import capture_target_snapshot
+
+    target = tmp_path / "target.nexus"
+    with h5py.File(target, "w") as handle:
+        handle.create_dataset("entry/value", data=np.arange(3))
+    return target, capture_target_snapshot(target)
+
+
+def test_win32_pathname_ctime_shape_is_refused_while_ctime_is_identity(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime,
+):
+    import xrd_tools.reduction.reintegrate as legacy
+
+    target, snapshot = _target_hdf(tmp_path)
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", True)
+    win32_pathname_ctime(target)
+    with pytest.raises(ValueError, match="TARGET_SNAPSHOT_CHANGED"):
+        legacy._target_object_revision(target, snapshot)
+
+
+def test_win32_identity_binds_and_fences_the_pathname_ctime_shape(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime,
+):
+    import xrd_tools.reduction.reintegrate as legacy
+
+    target, snapshot = _target_hdf(tmp_path)
+    with open(target, "rb") as handle:
+        descriptor = os.fstat(handle.fileno())
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    gap_ns = win32_pathname_ctime(target)
+    assert os.stat(target).st_ctime_ns == descriptor.st_ctime_ns - gap_ns
+
+    revision = legacy._target_object_revision(target, snapshot)
+
+    assert revision == (
+        int(descriptor.st_size), int(descriptor.st_mtime_ns), 0,
+        int(descriptor.st_dev), int(descriptor.st_ino),
+    )
+    assert revision == legacy._target_stat_revision(descriptor)
+    with h5py.File(target, "r") as handle:
+        legacy._target_hdf_fence(handle, target, snapshot, revision)
+    # An admitted revision that recorded the raw descriptor ctime lifts to the
+    # same comparable tuple.
+    raw = (descriptor.st_size, descriptor.st_mtime_ns, descriptor.st_ctime_ns,
+           descriptor.st_dev, descriptor.st_ino)
+    assert legacy._comparable_revision(raw) == revision

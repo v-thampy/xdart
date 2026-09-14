@@ -16,10 +16,12 @@ from xdart.gui.tabs.scattering.batch_terminal_presentation import (
     BatchTerminalPresentationController,
 )
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.metadata_operations import MetadataOperationOwner
 from xdart.gui.tabs.scattering.processed_browser import ProcessedBrowserOwner
 from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences, build_scientific_projection
 from xdart.gui.tabs.scattering.shell_values import ScientificPlotOptions, ShellCommand, ShellCommandKind, SlicePin
 from xdart.gui.tabs.scattering.state_machine import RunPhase
+from xdart.gui.tabs.scattering.workspace_operations import WorkspaceOperationOwner
 from xdart.modules.display_context import ContextKind, Viewer2DRendererClearReceipt
 from xrd_tools.session.hydration import HydrationCompletion, HydrationOutcome
 from xrd_tools.session.intent_store import RunIntentStore
@@ -41,13 +43,16 @@ class _Renderer:
         self.events.append("clear1")
         return _new_viewer_1d_renderer_clear_receipt(request, self.ok1)
 
-    def clear_viewer_2d(self, request):
+    def clear_viewer_2d(self, request, *, preserve_navigation=False):
         self.events.append("clear2")
         return Viewer2DRendererClearReceipt(request, self.ok2)
 
     def clear_workspace(self):
         self.events.append("workspace")
         return self.workspace
+
+    def drop_viewer_loading_snapshot(self):
+        pass
 
 
 class _Mount:
@@ -87,6 +92,8 @@ class _Mount:
             _closing=False, _closed=False, _context_controller=self.controller,
             _batch_terminal=BatchTerminalPresentationController(),
             _processed_browser=self.processed_browser,
+            _metadata_operations=MetadataOperationOwner(),
+            _workspace_operations=WorkspaceOperationOwner(),
             _browse_1d_release_debt=None,
             _intents=RunIntentStore(RunIntent(processing_mode="Int 2D")),
             _analysis_operation_busy=lambda: False,
@@ -104,6 +111,7 @@ class _Mount:
                      "_clear_viewer_1d_renderer", "_clear_viewer_2d_renderer",
                      "_apply_batch_retirement", "_retire_batch_presentation",
                      "_release_browse_1d_debt",
+                     "_abandon_reintegrate_display_owner", "_abandon_reintegrate_successor",
                      "_open_viewer_1d_paths", "_open_viewer_2d_path",
                      "_select_scan"):
             setattr(self.page, name, partial(getattr(ScatteringWorkspace, name), self.page))
@@ -262,7 +270,10 @@ def test_native_projection_and_preferences_survive_viewer_round_trip(mount, monk
     assert not viewer2.traces and not viewer2.slice_pins and viewer2.norm_identity is None
     assert mount.page._clear_viewer_2d_renderer(close=True); mount.open1()
     reads = mount.io["begin_viewer_1d_read"]
+    frames = mount.controller.navigation.frames
     for mode, count in (("Single", 1), ("Overlay", 2), ("Waterfall", 2)):
+        assert mount.controller.select_viewer_1d(
+            frames[0], (frames[0],) if mode == "Single" else frames)
         projected = _viewer_shell(mount.controller, replace(preferences, plot_mode=mode)).scientific
         assert projected.plot_mode == mode and len(projected.traces) == count
         assert projected.heavy is None and not projected.slice_pins and projected.norm_identity is None
@@ -323,16 +334,14 @@ def test_workspace_close_and_viewer_only_isolation_remain_truthful(mount) -> Non
     page._close_identity = None; page._lifecycle = mount.lifecycle
     context, holder, provider = mount.controller.viewer_1d_context, mount.controller._viewer_1d.holder, mount.controller._viewer_1d.provider
     mount.renderer.ok1 = False; mount.renderer.workspace = True
-    try: pending = ScatteringWorkspace.close_workspace(page)
-    except Exception: pending = None
+    pending = ScatteringWorkspace.close_workspace(page)
     assert pending is not None and pending.cleanup_status.value == "cleanup_pending"
     assert mount.controller.viewer_1d_context.context_token == context.context_token
     assert mount.controller._viewer_1d.holder is holder and mount.controller._viewer_1d.provider is provider
     mount.renderer.ok1 = True; assert mount.clear1(); mount.open2()
     context, frame, provider = mount.controller.viewer_2d_context, mount.controller.viewer_2d_frame, mount.controller._viewer_2d.provider
     mount.renderer.ok2 = False
-    try: pending = ScatteringWorkspace.close_workspace(page)
-    except Exception: pending = None
+    pending = ScatteringWorkspace.close_workspace(page)
     assert pending is not None and pending.cleanup_status.value == "cleanup_pending"
     assert mount.controller.viewer_2d_context.context_token == context.context_token
     assert mount.controller.viewer_2d_frame is frame and mount.controller._viewer_2d.provider is provider

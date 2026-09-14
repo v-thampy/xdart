@@ -27,6 +27,15 @@ import numpy as np
 __all__ = ["mask_with_detector"]
 
 
+def _writable_mask(mask):
+    # pyFAI's x86 SSE checksum requests a writable buffer even though it only
+    # reads it. Preserve the immutable accepted mask and detach at this call
+    # boundary; ordinary writable masks and the bound-detector path need no copy.
+    if isinstance(mask, np.ndarray) and not mask.flags.writeable:
+        return mask.copy(order="C")
+    return mask
+
+
 def mask_with_detector(ai, mask):
     """Union *mask* with ``ai.detector``'s geometric (calc) mask.
 
@@ -44,21 +53,21 @@ def mask_with_detector(ai, mask):
     ndarray or None
         The union when both exist; the geometric mask alone when *mask* is
         ``None`` (equivalent to pyFAI's own fallback, made explicit); *mask*
-        untouched when the detector has no geometric mask or the shapes
-        disagree (never guess about a non-frame-shaped mask).
+        unchanged in value when the detector has no geometric mask or the
+        shapes disagree. Read-only arrays are detached for pyFAI's checksum.
     """
     det = getattr(ai, "detector", None)
     if det is None:
-        return mask
+        return _writable_mask(mask)
     try:
         det_mask = det.mask
     except Exception:
         det_mask = None
     if det_mask is None:
-        return mask
+        return _writable_mask(mask)
     if mask is None:
-        return det_mask
+        return _writable_mask(det_mask)
     m = np.asarray(mask)
     if m.shape != np.asarray(det_mask).shape:
-        return mask
+        return _writable_mask(mask)
     return np.logical_or(m, det_mask)

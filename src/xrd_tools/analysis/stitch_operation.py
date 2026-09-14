@@ -73,6 +73,7 @@ from xrd_tools.io.analysis_artifact import (
     read_analysis_artifact,
 )
 from xrd_tools.io.nexus import write_stitched
+from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.integrate.multi import StitchDiagnostics
 from xrd_tools.integrate.xu_stitch import (
     XuStitchCancelled,
@@ -151,7 +152,7 @@ def _file_state(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
         value.st_ino,
         value.st_size,
         value.st_mtime_ns,
-        value.st_ctime_ns,
+        identity_ctime_ns(value.st_ctime_ns),
     )
 
 
@@ -1718,9 +1719,8 @@ def _xu_provenance(
             "config_digits": requirements.config_digits,
             "nthreads_effective": 1,
             "python_implementation": requirements.python_implementation,
-            "python_version": requirements.python_version,
-            "platform_system": requirements.platform_system,
-            "platform_machine": requirements.platform_machine,
+            "python_min_version": list(requirements.python_min_version),
+            "platform_systems": list(requirements.platform_systems),
             "runtime_policy": asset["xrayutilities"]["runtime_policy"],
         },
         "output": {

@@ -19,7 +19,6 @@ from xdart.gui.tabs.scattering.adapters.run_executor import (
     _eager_directory_file_counts,
     _session_terminal_commit_identity,
 )
-from xdart.gui.tabs.scattering.acquisition_runtime import AcquisitionRuntime
 from xdart.gui.tabs.scattering.display_values import (
     StandardEventKind,
     StandardRunEvent,
@@ -33,11 +32,6 @@ from xdart.gui.tabs.scattering.events import (
 )
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.state_machine import RunPhase
-
-from tests.xdart.scattering.test_e3_context_contract import (
-    _running_controller,
-)
-
 
 def test_linked_candidate_keeps_its_own_directory_counter_slot(
     tmp_path: Path,
@@ -100,6 +94,7 @@ def test_stopped_deferred_skip_counts_known_unowned_sidecar(
     linked_candidate = tmp_path / "linked.h5"
     sidecar = tmp_path / "master_data.h5"
     first = SimpleNamespace(
+        target=tmp_path / "master.nexus",
         physical_paths=(master,),
         protected_states=(
             SimpleNamespace(path=str(master)),
@@ -107,6 +102,7 @@ def test_stopped_deferred_skip_counts_known_unowned_sidecar(
         ),
     )
     second = SimpleNamespace(
+        target=tmp_path / "linked.nexus",
         physical_paths=(linked_candidate,),
         protected_states=(SimpleNamespace(path=str(linked_candidate)),),
     )
@@ -493,72 +489,56 @@ def test_failed_terminal_folds_a_durably_completed_container_file(
 
 
 def test_projection_failure_keeps_durable_artifact_and_frame_progress(
-    monkeypatch,
+    monkeypatch, tmp_path,
 ) -> None:
-    configuration = RunIntent().freeze()
-    identity = RunIdentity.from_configuration(configuration)
+    import h5py
+    import numpy as np
+    from tests.xdart.scattering._e2sd_support import write_poni
+    from tests.xdart.scattering.test_e1b1_terminal_cleanup import _prepared_run
+    from tests.xdart.scattering.test_p1b_output_graph import _intent, _nexus_rows
+    from xrd_tools.sources.selection import DirectorySourceSpec
 
-    class Session:
-        def start(self) -> None:
-            return None
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    with h5py.File(raw / "two_frames.nxs", "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        detector = entry.create_group("instrument").create_group("detector")
+        detector.create_dataset(
+            "data", data=np.ones((2, 195, 487), dtype=np.uint16),
+        )
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    intent = _intent(raw / "two_frames.nxs", tmp_path / "processed", poni)
+    intent.source_spec = DirectorySourceSpec(raw, suffixes=(".nxs",))
+    executor, run, _admission = _prepared_run(tmp_path, intent=intent)
+    projected = []
 
-    class Source:
-        def close(self) -> None:
-            raise AssertionError("failure cleanup, not success, owns close")
+    def fail_projection(_run, item, _image, _session):
+        projected.append(item.frame_index)
+        raise RuntimeError("projection failed")
 
-    run = _StandardRun(
-        configuration,
-        identity,
-        SimpleNamespace(frames=()),
-        Source(),
-        Session(),
-        None,
-        Path("durable.nexus"),
-        current_total=2,
-        files_discovered=1,
-        current_file_total=1,
-    )
-    executor = StandardRunExecutor()
-    monkeypatch.setattr(
-        executor,
-        "_finish_session",
-        lambda _run: SimpleNamespace(
-            n_processed=2,
-            failed=False,
-            cancelled=False,
-        ),
-    )
-    monkeypatch.setattr(
-        executor,
-        "_finish_display_projection",
-        lambda _run: (_ for _ in ()).throw(
-            RuntimeError("projection failed")
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="projection failed"):
-        executor._execute_current(run, construct=False)
-
-    assert (run.completed, run.current_completed) == (2, 2)
-    assert run.current_published == 0
-    assert run.artifacts == [Path("durable.nexus")]
-
-    executor._terminal_event(
-        run,
-        StandardEventKind.FAILED,
-        ExecutorClosed(identity, CleanupStatus.CLEANED),
-        2,
-        2,
-    )
-    event = executor.drain_events()[0]
-    assert event.artifacts == ("durable.nexus",)
-    assert (event.artifact_completed, event.artifact_total) == (2, 2)
-    assert (
-        event.files_processed,
-        event.files_skipped,
-        event.files_pending,
-        event.files_discovered,
-    ) == (1, 0, 0, 1)
+    monkeypatch.setattr(executor, "_frame_ready_owned", fail_projection)
+    try:
+        executor._run(run)
+        events = executor.drain_events()
+        event = events[-1]
+        assert projected == [0]
+        assert event.kind is StandardEventKind.FAILED
+        assert "projection failed" in event.detail
+        assert (run.completed, run.current_completed) == (2, 2)
+        assert run.current_published == 0
+        assert run.artifacts == [run.artifact]
+        assert _nexus_rows(run.artifact) == (0, 1)
+        assert not any(e.kind is StandardEventKind.FRAME_READY for e in events)
+        assert event.artifacts == (str(run.artifact),)
+        assert (event.artifact_completed, event.artifact_total) == (2, 2)
+        assert (
+            event.files_processed, event.files_skipped,
+            event.files_pending, event.files_discovered,
+        ) == (1, 0, 0, 1)
+    finally:
+        assert executor.close(run.identity).cleanup_status is CleanupStatus.CLEANED
 
 
 def test_terminal_durable_progress_does_not_invent_published_navigation() -> None:
@@ -597,46 +577,39 @@ def test_terminal_durable_progress_does_not_invent_published_navigation() -> Non
 
 
 def test_failed_session_does_not_report_unfinalized_artifact(
-    monkeypatch,
+    monkeypatch, tmp_path,
 ) -> None:
-    configuration = RunIntent().freeze()
-    identity = RunIdentity.from_configuration(configuration)
+    from tests.xdart.scattering.test_e1b1_terminal_cleanup import _prepared_run
+    from xrd_tools.io.record_writer import NexusRecordWriter
 
-    class Session:
-        def start(self) -> None:
-            return None
+    executor, run, _admission = _prepared_run(tmp_path, frame_count=2)
+    verify = NexusRecordWriter._verify_fast_integrated_results
+    attempts = []
 
-    run = _StandardRun(
-        configuration,
-        identity,
-        SimpleNamespace(frames=()),
-        SimpleNamespace(),
-        Session(),
-        None,
-        Path("aborted.nexus"),
-        current_total=2,
-    )
-    executor = StandardRunExecutor()
+    def fail_verification(writer):
+        attempts.append(writer)
+        raise OSError("writer failed terminal verification")
+
     monkeypatch.setattr(
-        executor,
-        "_finish_session",
-        lambda _run: SimpleNamespace(
-            n_processed=1,
-            failed=True,
-            cancelled=False,
-            error="writer failed",
-        ),
+        NexusRecordWriter, "_verify_fast_integrated_results", fail_verification,
     )
-    monkeypatch.setattr(
-        executor,
-        "_finish_display_projection",
-        lambda _run: None,
-    )
-
-    with pytest.raises(RuntimeError, match="writer failed"):
-        executor._execute_current(run, construct=False)
-
-    assert run.artifacts == []
+    try:
+        executor._run(run)
+        terminal = executor.drain_events()[-1]
+        assert attempts
+        assert terminal.kind is StandardEventKind.FAILED
+        assert "writer failed terminal verification" in terminal.detail
+        assert terminal.cleanup_status is CleanupStatus.CLEANUP_PENDING
+        assert run.artifacts == []
+        assert terminal.artifacts == ()
+        assert run.session.terminal_result is None
+        assert not run.session._dynamic_accounting.snapshot().durable
+    finally:
+        monkeypatch.setattr(NexusRecordWriter, "_verify_fast_integrated_results", verify)
+        # A successful writer retry is followed by retirement of the earlier
+        # pending display receipt; neither close changes the primary failure.
+        executor.close(run.identity)
+        assert executor.close(run.identity).cleanup_status is CleanupStatus.CLEANED
 
 
 def test_second_eager_construct_failure_keeps_new_artifact_pending(
@@ -812,97 +785,121 @@ def test_stopped_terminal_counts_members_but_not_partial_container(
     ) == expected
 
 
-def test_display_projection_leaves_hdf5_completion_thread(
-    monkeypatch,
-) -> None:
-    configuration = RunIntent().freeze()
-    identity = RunIdentity.from_configuration(configuration)
-    session = object()
-    run = _StandardRun(
-        configuration,
-        identity,
-        None,
-        None,
-        session,
-        None,
-        Path("display-worker.nxs"),
+@pytest.fixture
+def projection_run(tmp_path, monkeypatch):
+    from tests.xdart.scattering.test_e1b1_terminal_cleanup import _prepared_run
+
+    owned = []
+
+    def prepare(*, join_timeout=0.5, lifecycle=None):
+        def identity(configuration):
+            if lifecycle is None:
+                return RunIdentity.from_configuration(configuration)
+            from xdart.gui.tabs.scattering.events import PreflightAccepted
+            request = lifecycle.begin_start().request_id
+            accepted = lifecycle.preflight_accepted(
+                PreflightAccepted(request, configuration),
+            )
+            assert accepted.run_identity is not None
+            return accepted.run_identity
+
+        executor, run, admission = _prepared_run(
+            tmp_path / str(len(owned)), frame_count=2,
+            identity_factory=identity,
+        )
+        owned.append((executor, run))
+        executor._join_timeout = join_timeout
+        decision = admission.outputs[0]
+        executor._construct(run, item=decision.item, decision=decision)
+        run.frames_by_label = {int(frame.index): frame for frame in run.scan.frames}
+        session = run.session
+        calls = SimpleNamespace(resumes=0, stops=0, submits=0)
+        resume, stop, submit = session.resume, session.stop, session.submit
+
+        def observed_resume():
+            calls.resumes += 1
+            return resume()
+
+        def observed_stop():
+            calls.stops += 1
+            return stop()
+
+        def observed_submit(*args, **kwargs):
+            calls.submits += 1
+            return submit(*args, **kwargs)
+
+        monkeypatch.setattr(session, "resume", observed_resume)
+        monkeypatch.setattr(session, "stop", observed_stop)
+        monkeypatch.setattr(session, "submit", observed_submit)
+        session.start()
+        executor.drain_events()
+        return executor, run, calls
+
+    yield prepare
+    for executor, run in owned:
+        executor._join_timeout = 5.0
+        # Manual command fixtures have no source worker to settle the writer
+        # before Close's first display-retirement receipt.
+        executor.close(run.identity)
+        assert executor.close(run.identity).cleanup_status is CleanupStatus.CLEANED
+
+
+def _projection_controller(projection_run):
+    from tests.xdart.scattering.test_e3_context_contract import _BrowsePort
+    from xdart.gui.tabs.scattering.context_controller import ContextController
+    from xdart.gui.tabs.scattering.context_projection import ContextProjection
+    from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
+    from xdart.gui.tabs.scattering.events import ExecutorAccepted
+
+    lifecycle = ScatteringCoordinator()
+    executor, run, calls = projection_run(join_timeout=0.1, lifecycle=lifecycle)
+    assert lifecycle.executor_accepted(ExecutorAccepted(run.identity))
+    controller = ContextController(
+        lifecycle=lifecycle, executor=executor, browse_loader=_BrowsePort(),
+        projection=ContextProjection(),
     )
-    executor = StandardRunExecutor()
+    controller.adopt_acquisition(run.identity)
+    return controller, lifecycle, executor, run, calls
+
+
+def test_display_projection_leaves_hdf5_completion_thread(
+    monkeypatch, projection_run,
+) -> None:
+    executor, run, _calls = projection_run()
+    session = run.session
     entered = threading.Event()
     release = threading.Event()
     worker_names: list[str] = []
 
-    def project(_run, _event, _image, _session) -> None:
-        assert _session is session
+    def project(_run, item, _image, _session) -> None:
+        assert _run is run and _run.session is session
+        assert _image is _session is None
+        assert item.record is run.records.get(1)
         worker_names.append(threading.current_thread().name)
         entered.set()
         assert release.wait(timeout=2.0)
 
     monkeypatch.setattr(executor, "_frame_ready_owned", project)
-    executor._start_display_projection(run)
-
-    executor._frame_ready(run, SimpleNamespace(frame_index=1))
-
-    assert entered.wait(timeout=2.0)
-    assert worker_names == ["scattering-display-projection"]
-    release.set()
+    assert run.output.submit(run.scan.frames[0])
+    try:
+        assert entered.wait(timeout=2.0), (
+            run.light_projection_error, run.display_projection_errors,
+        )
+        # The HDF5 completion callback has returned even while presentation
+        # remains blocked on its dedicated projection thread.
+        assert session.pause(timeout=1.0)
+        assert session.frames_completed == 1
+        assert worker_names == ["scattering-display-projection"]
+    finally:
+        release.set()
     executor._finish_display_projection(run)
 
 
-class _PauseSession:
-    def __init__(self) -> None:
-        self.pause_calls: list[float] = []
-        self.resumes = 0
-        self.submits = 0
-        self.stops = 0
-
-    def pause(self, *, timeout: float) -> bool:
-        self.pause_calls.append(timeout)
-        return True
-
-    def resume(self) -> None:
-        self.resumes += 1
-
-    def submit(self, _frame) -> bool:
-        self.submits += 1
-        return True
-
-    def stop(self) -> None:
-        self.stops += 1
-
-    def finish(self, *, raise_on_failure: bool = False):
-        assert raise_on_failure is False
-        return SimpleNamespace(failed=False, n_processed=0)
-
-
-def _projection_pause_run(
-    executor: StandardRunExecutor,
-    *,
-    identity: RunIdentity | None = None,
-) -> tuple[_StandardRun, _PauseSession]:
-    configuration = RunIntent().freeze()
-    identity = identity or RunIdentity.from_configuration(configuration)
-    session = _PauseSession()
-    run = _StandardRun(
-        configuration,
-        identity,
-        None,
-        None,
-        session,
-        None,
-        Path("pause-projection.nexus"),
-        context_runtime=AcquisitionRuntime(),
-    )
-    executor._active = run
-    executor._start_display_projection(run)
-    return run, session
-
-
 def test_durable_pause_waits_for_accepted_display_projection_without_retiring_worker(
-    monkeypatch,
+    monkeypatch, projection_run,
 ) -> None:
-    executor = StandardRunExecutor(join_timeout=0.5)
-    run, session = _projection_pause_run(executor)
+    executor, run, _calls = projection_run(join_timeout=0.5)
+    session = run.session
     entered = threading.Event()
     release = threading.Event()
     returned = threading.Event()
@@ -916,9 +913,8 @@ def test_durable_pause_waits_for_accepted_display_projection_without_retiring_wo
         published.append(event)
 
     monkeypatch.setattr(executor, "_frame_ready_owned", blocked_projection)
-    event = SimpleNamespace(frame_index=1)
-    executor._frame_ready(run, event)
-    assert entered.wait(timeout=1.0)
+    assert run.output.submit(run.scan.frames[0])
+    assert entered.wait(timeout=2.0)
 
     def pause() -> None:
         result.append(executor.pause(run.identity))
@@ -936,7 +932,9 @@ def test_durable_pause_waits_for_accepted_display_projection_without_retiring_wo
     assert not command.is_alive()
     assert returned.is_set()
     assert result[0].run_identity is run.identity
-    assert published == [event]
+    assert len(published) == 1
+    assert published[0].frame_index == 1
+    assert published[0].record is run.records.get(1)
     frozen = tuple(published)
     assert returned.wait(timeout=0.02)
     assert tuple(published) == frozen
@@ -948,10 +946,10 @@ def test_durable_pause_waits_for_accepted_display_projection_without_retiring_wo
 
 
 def test_projection_pause_timeout_compensates_with_live_worker_and_no_duplicate_keys(
-    monkeypatch,
+    monkeypatch, projection_run,
 ) -> None:
-    executor = StandardRunExecutor(join_timeout=0.02)
-    run, session = _projection_pause_run(executor)
+    executor, run, calls = projection_run(join_timeout=0.02)
+    session = run.session
     entered = threading.Event()
     release = threading.Event()
     projected: list[int] = []
@@ -963,22 +961,22 @@ def test_projection_pause_timeout_compensates_with_live_worker_and_no_duplicate_
         projected.append(int(event.frame_index))
 
     monkeypatch.setattr(executor, "_frame_ready_owned", project)
-    executor._frame_ready(run, SimpleNamespace(frame_index=1))
-    assert entered.wait(timeout=1.0)
+    assert run.output.submit(run.scan.frames[0])
+    assert entered.wait(timeout=2.0)
 
     with pytest.raises(
         TimeoutError,
         match="display projection did not reach durable pause",
     ):
         executor.pause(run.identity)
-    assert session.resumes == 1
-    assert run.context_runtime.submit(session, object()) is True
-    assert session.submits == 1
+    assert calls.resumes == 1
+    assert run.context_runtime.submit(run.output, run.scan.frames[1]) is True
+    assert calls.submits == 2
     worker = run.display_projection_worker
     assert worker is not None and worker.is_alive()
 
     release.set()
-    executor._frame_ready(run, SimpleNamespace(frame_index=2))
+    assert session.pause(timeout=1.0)
     assert executor._drain_display_projection(run, 1.0) is True
     assert projected == [1, 2]
     assert len(projected) == len(set(projected))
@@ -988,15 +986,10 @@ def test_projection_pause_timeout_compensates_with_live_worker_and_no_duplicate_
 
 
 def test_projection_exception_is_terminal_failed_and_cleanup_is_visible(
-    monkeypatch,
+    monkeypatch, projection_run,
 ) -> None:
-    controller, lifecycle, mounted, _, _ = _running_controller()
-    executor = StandardRunExecutor(join_timeout=0.1)
-    run, session = _projection_pause_run(
-        executor,
-        identity=mounted.identity,
-    )
-    controller._executor = executor
+    controller, lifecycle, executor, run, calls = _projection_controller(projection_run)
+    output, frame = run.output, run.scan.frames[1]
     entered = threading.Event()
     primary = RuntimeError("queued display projection failed")
 
@@ -1005,18 +998,19 @@ def test_projection_exception_is_terminal_failed_and_cleanup_is_visible(
         raise primary
 
     monkeypatch.setattr(executor, "_frame_ready_owned", fail_projection)
-    executor._frame_ready(run, SimpleNamespace(frame_index=1))
-    assert entered.wait(timeout=1.0)
+    assert run.output.submit(run.scan.frames[0])
+    assert entered.wait(timeout=2.0)
 
     failed = controller.pause()
     assert type(failed) is PauseFailed
     assert failed.diagnostic.message == str(primary)
     assert failed.diagnostic.operation == "context.pause"
     assert lifecycle.phase is RunPhase.FAILED
-    assert session.resumes == 0
-    assert session.stops == 1
+    assert calls.resumes == 0
+    assert calls.stops == 1
     assert run.context_runtime is not None
-    assert run.context_runtime._gate.is_set() is False
+    assert run.context_runtime.submit(output, frame) is False
+    assert calls.submits == 1
     assert run.closed is True
     assert run.display_projection_worker is None
     terminal = executor.drain_events()
@@ -1028,15 +1022,17 @@ def test_projection_exception_is_terminal_failed_and_cleanup_is_visible(
 
 
 def test_dead_projection_worker_without_error_is_terminal_failed(
-    monkeypatch,
+    monkeypatch, projection_run,
 ) -> None:
-    controller, lifecycle, mounted, _, _ = _running_controller()
-    executor = StandardRunExecutor(join_timeout=0.1)
-    run, session = _projection_pause_run(
-        executor,
-        identity=mounted.identity,
-    )
-    controller._executor = executor
+    controller, lifecycle, executor, run, calls = _projection_controller(projection_run)
+    output, frame = run.output, run.scan.frames[1]
+    # Complete a real current row before killing the otherwise healthy worker.
+    assert run.output.submit(run.scan.frames[0])
+    assert run.session.pause(timeout=2.0)
+    assert executor._drain_display_projection(run, 1.0)
+    run.session.resume()
+    calls.resumes = 0
+    executor.drain_events()
     pending = run.display_projection_queue
     worker = run.display_projection_worker
     assert pending is not None and worker is not None
@@ -1051,10 +1047,11 @@ def test_dead_projection_worker_without_error_is_terminal_failed(
         "display projection worker stopped before durable pause"
     )
     assert lifecycle.phase is RunPhase.FAILED
-    assert session.resumes == 0
-    assert session.stops == 1
+    assert calls.resumes == 0
+    assert calls.stops == 1
     assert run.context_runtime is not None
-    assert run.context_runtime._gate.is_set() is False
+    assert run.context_runtime.submit(output, frame) is False
+    assert calls.submits == 1
     assert run.closed is True
     assert run.display_projection_worker is None
     terminal = executor.drain_events()

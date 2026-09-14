@@ -12,6 +12,7 @@ import fabio.tifimage
 import numpy as np
 from pyqtgraph.Qt import QtWidgets
 
+from tests.xdart.scattering._output_slots import written
 from xdart.gui.tabs.scattering.adapters import run_executor as executor_module
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
@@ -34,19 +35,16 @@ from xdart.gui.tabs.scattering.output_preflight import (
 )
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.state_machine import RunPhase
+from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xdart.gui.tabs.scattering.workspace_shell import (
     ScatteringWorkspaceShell,
 )
-from xrd_tools.core.scan import Scan, ScanFrame
 from xrd_tools.core.staging import (
     browse_publication_max_items,
     heavy_window,
     live_record_store_max_items,
 )
-from xrd_tools.io import (
-    load_processed_raw_or_thumbnail as real_load_processed_raw,
-)
-from xrd_tools.io import read_frame_record as real_read_frame_record
+from xrd_tools.integrate.calibration import detector_calibration_to_integrator
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import image_series_spec
@@ -80,6 +78,85 @@ def _mounted(
     return shell, controller
 
 
+def _run_finished(lifecycle, executor) -> bool:
+    # Start admission is asynchronous: initial IDLE is not a completed run.
+    run = executor._active
+    return (
+        run is not None and run.terminal_emitted
+        and lifecycle.phase is RunPhase.IDLE
+    )
+
+
+def _run_diagnostic(shell, lifecycle, executor, started: float) -> str:
+    # Read on timeout only: says whether the run is slow or stuck.
+    # current_published is the live per-frame counter on the series path;
+    # completed/current_completed move at epoch boundaries and the file
+    # counters only on the live-directory path.
+    run = executor._active
+    if run is None:
+        progress = "run=None"
+    else:
+        worker = run.worker
+        progress = (
+            f"terminal_emitted={run.terminal_emitted}, "
+            f"published={run.current_published}/{run.current_total} "
+            f"(completed={run.completed}+{run.current_completed}"
+            f"/{run.total}), "
+            f"files={run.files_processed}/{run.files_discovered}, "
+            f"worker_alive={worker is not None and worker.is_alive()}, "
+            f"stop_requested={run.stop_requested}, closed={run.closed}, "
+            f"cleanup={run.cleanup_status!r}"
+        )
+    return (
+        f"elapsed={time.monotonic() - started:.1f}s, {progress}, "
+        f"{_shell_diagnostic(shell, lifecycle)}"
+    )
+
+
+def _completed_acquisition(qapp, page, lifecycle, executor) -> None:
+    """Finish the real terminal Browse handoff, then select retained Run data."""
+    shell, controller = _mounted(page)
+    started = time.monotonic()
+    _wait(
+        qapp,
+        lambda: _run_finished(lifecycle, executor),
+        diagnostic=lambda: _run_diagnostic(shell, lifecycle, executor, started),
+    )
+    _wait(
+        qapp,
+        lambda: (
+            controller.browse_context is not None
+            and controller.capture_loaded_browse(
+                controller.browse_context.load_request
+            ) is not None
+        ),
+        diagnostic=lambda: (
+            f"browse_context={controller.browse_context!r}, "
+            f"{_run_diagnostic(shell, lifecycle, executor, started)}"
+        ),
+    )
+    controller.select_acquisition()
+    catalog = executor.frame_catalog(controller.run_identity)
+    assert catalog is not None and catalog.entries
+    last = catalog.entries[-1]
+    page._handle_shell_command(ShellCommand(
+        ShellCommandKind.SELECT_FRAME, frame=last, frames=(last,),
+    ))
+    _wait(
+        qapp,
+        lambda: (
+            shell.scientific.frame_selector.currentData() is last
+            and shell.scientific.raw.image.image is not None
+        ),
+        diagnostic=lambda: (
+            f"selected={shell.scientific.frame_selector.currentData()!r}, "
+            f"last={last!r}, "
+            f"raw_loaded={shell.scientific.raw.image.image is not None}, "
+            f"{_shell_diagnostic(shell, lifecycle)}"
+        ),
+    )
+
+
 def _select_exact_frame(
     shell: ScatteringWorkspaceShell,
     frame,
@@ -107,7 +184,16 @@ def _shell_diagnostic(
 
 
 class _Integrator:
-    detector = SimpleNamespace(mask=None)
+    def __init__(self, calibration):
+        # Keep real accepted geometry/detector metadata while this display
+        # oracle controls only the tiny numerical result and its timing.
+        calibrated = detector_calibration_to_integrator(calibration)
+        self.detector = calibrated.detector
+        for name in (
+            "dist", "poni1", "poni2", "rot1", "rot2", "rot3",
+            "wavelength", "parallax",
+        ):
+            setattr(self, name, getattr(calibrated, name))
 
     def integrate1d(self, image, npt, *, unit, **_kwargs):
         value = float(np.nanmean(np.asarray(image)))
@@ -143,40 +229,6 @@ class _Integrator:
         )
 
 
-class _Source:
-    def __init__(
-        self,
-        members: tuple[Path, ...],
-        labels: tuple[int, ...],
-    ) -> None:
-        self._members = members
-        self._selected = members[0]
-        self._labels = labels
-
-    def to_scan(self, *, poni, integrator, output_path):
-        return Scan(
-            self._selected.stem,
-            [
-                ScanFrame(
-                    label,
-                    image=np.arange(8, dtype=np.uint32).reshape(2, 4)
-                    + label,
-                    source_path=member,
-                    source_frame_index=0,
-                )
-                for member, label in zip(
-                    self._members, self._labels, strict=True
-                )
-            ],
-            poni=poni,
-            integrator=integrator,
-            output_path=output_path,
-        )
-
-    def close(self) -> None:
-        return None
-
-
 def _write_tiff(path: Path, *, offset: int = 0) -> None:
     fabio.tifimage.TifImage(
         data=np.arange(8, dtype=np.uint16).reshape(2, 4) + offset
@@ -210,7 +262,8 @@ def _accepted_admission(
                 if mask_bytes is None
                 else hashlib.sha256(mask_bytes).hexdigest()
             ),
-            "{\"orientation\":3}",
+            "{\"max_shape\":[2,4],\"orientation\":3,"
+            "\"pixel1\":0.0001,\"pixel2\":0.0001}",
         )
         candidate = OutputCandidate.from_start_capture(
             capture,
@@ -271,7 +324,7 @@ def _standard_page(
     selected = members[0]
     poni = tmp_path / "tiny.poni"
     poni.write_text("accepted through immutable test assets")
-    output = tmp_path / "tiny.nxs"
+    output = tmp_path / "tiny.nexus"
     monkeypatch.setattr(
         executor_module,
         "build_admission_receipt",
@@ -279,13 +332,8 @@ def _standard_page(
     )
     monkeypatch.setattr(
         executor_module,
-        "open_source",
-        lambda _spec: _Source(members, labels),
-    )
-    monkeypatch.setattr(
-        executor_module,
         "poni_to_integrator",
-        lambda _poni: _Integrator(),
+        _Integrator,
     )
     lifecycle = ScatteringCoordinator()
     executor = StandardRunExecutor(max_display_items=2)
@@ -297,6 +345,7 @@ def _standard_page(
                 project_root=str(tmp_path),
                 save_path=str(output),
                 output_mode="Overwrite",
+                processing_mode="Int 2D",
                 max_cores=1,
                 bai_1d_args={"npt": 8},
                 bai_2d_args={"npt_rad": 8, "npt_azim": 6},
@@ -306,15 +355,17 @@ def _standard_page(
         sources=FilesystemSourceAdapter(),
         executor=executor,
     )
-    return qapp, page, lifecycle, executor, output
+    return qapp, page, lifecycle, executor, written(output, "Int 2D")
 
 
 def test_all_frames_remain_selectable_and_evicted_frame_hydrates_off_gui(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
-    labels = tuple(range(1, 11))
+    # Fund the real sixteen-frame checkpoint and exceed its heavy window so
+    # selecting the first two frames must still exercise persisted hydration.
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "16")
+    labels = tuple(range(1, 19))
     qapp, page, lifecycle, executor, output = _standard_page(
         monkeypatch, tmp_path, labels=labels
     )
@@ -339,11 +390,7 @@ def test_all_frames_remain_selectable_and_evicted_frame_hydrates_off_gui(
             diagnostic=lambda: _shell_diagnostic(shell, lifecycle),
         )
         shell.run_controls.startButton.click()
-        _wait(
-            qapp,
-            lambda: lifecycle.phase is RunPhase.IDLE,
-            diagnostic=lambda: _shell_diagnostic(shell, lifecycle),
-        )
+        _completed_acquisition(qapp, page, lifecycle, executor)
         assert output.is_file()
         keys = controller.frame_keys
         assert tuple(key.local_frame_label for key in keys) == labels
@@ -379,9 +426,9 @@ def test_latest_qualified_selection_wins_over_slow_evicted_reload(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "16")
     qapp, page, lifecycle, executor, _output = _standard_page(
-        monkeypatch, tmp_path, labels=tuple(range(1, 11))
+        monkeypatch, tmp_path, labels=tuple(range(1, 19))
     )
     reads: list[int] = []
     frame_one_entered = Event()
@@ -407,7 +454,10 @@ def test_latest_qualified_selection_wins_over_slow_evicted_reload(
     try:
         _wait(qapp, lambda: shell.run_controls.startButton.isEnabled())
         shell.run_controls.startButton.click()
-        _wait(qapp, lambda: lifecycle.phase is RunPhase.IDLE)
+        _completed_acquisition(qapp, page, lifecycle, executor)
+        # The terminal Browse handoff may hydrate its own last-frame preview.
+        # Only subsequent acquisition selections belong to this race oracle.
+        reads.clear()
         first, second = controller.frame_keys[:2]
         _select_exact_frame(shell, first)
         _wait(qapp, frame_one_entered.is_set)
@@ -475,11 +525,11 @@ def test_duplicate_same_owner_context_ready_keeps_pending_display_and_request(
 ) -> None:
     """Queued short-artifact hints neither blank nor supersede hydration."""
 
-    monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "16")
     qapp, page, lifecycle, executor, _output = _standard_page(
         monkeypatch,
         tmp_path,
-        labels=tuple(range(1, 11)),
+        labels=tuple(range(1, 19)),
     )
     shell, controller = _mounted(page)
     entered = Event()
@@ -505,7 +555,7 @@ def test_duplicate_same_owner_context_ready_keeps_pending_display_and_request(
     try:
         _wait(qapp, lambda: shell.run_controls.startButton.isEnabled())
         shell.run_controls.startButton.click()
-        _wait(qapp, lambda: lifecycle.phase is RunPhase.IDLE)
+        _completed_acquisition(qapp, page, lifecycle, executor)
 
         first = controller.frame_keys[0]
         assert shell.scientific.raw.image.image is not None
@@ -523,8 +573,8 @@ def test_duplicate_same_owner_context_ready_keeps_pending_display_and_request(
         applied = []
         apply_state = shell.apply_state
 
-        def record_apply(state, *, preserve_display=False):
-            apply_state(state, preserve_display=preserve_display)
+        def record_apply(state, *, preserve_display=False, **options):
+            apply_state(state, preserve_display=preserve_display, **options)
             applied.append(state)
 
         monkeypatch.setattr(shell, "apply_state", record_apply)
@@ -599,15 +649,15 @@ def test_initial_context_ready_retains_outgoing_display_until_first_frame(
     try:
         _wait(qapp, lambda: shell.run_controls.startButton.isEnabled())
         shell.run_controls.startButton.click()
-        _wait(qapp, lambda: lifecycle.phase is RunPhase.IDLE)
+        _completed_acquisition(qapp, page, lifecycle, executor)
         previous = _painted_values(shell)
         output.unlink()
 
         applied: list[tuple[object, bool]] = []
         apply_state = shell.apply_state
 
-        def record_apply(state, *, preserve_display=False):
-            apply_state(state, preserve_display=preserve_display)
+        def record_apply(state, *, preserve_display=False, **options):
+            apply_state(state, preserve_display=preserve_display, **options)
             applied.append((state, preserve_display))
 
         monkeypatch.setattr(shell, "apply_state", record_apply)
@@ -653,14 +703,14 @@ def test_accepted_detector_mask_is_baked_before_live_publication(
 ) -> None:
     mask = np.zeros((2, 4), dtype=np.uint8)
     mask[0, 1] = 1
-    qapp, page, lifecycle, _executor, _output = _standard_page(
+    qapp, page, lifecycle, executor, _output = _standard_page(
         monkeypatch, tmp_path, labels=(1,), mask=mask
     )
     shell, _controller = _mounted(page)
     try:
         _wait(qapp, lambda: shell.run_controls.startButton.isEnabled())
         shell.run_controls.startButton.click()
-        _wait(qapp, lambda: lifecycle.phase is RunPhase.IDLE)
+        _completed_acquisition(qapp, page, lifecycle, executor)
         rendered = shell.scientific.raw.image.image
         assert rendered is not None
         assert rendered.shape == (4, 2)
@@ -676,8 +726,8 @@ def test_product_retention_uses_ram_aware_tiers_not_delivery_limits(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
-    labels = tuple(range(1, 11))
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "16")
+    labels = tuple(range(1, 19))
     qapp, page, lifecycle, executor, _output = _standard_page(
         monkeypatch, tmp_path, labels=labels
     )
@@ -689,11 +739,7 @@ def test_product_retention_uses_ram_aware_tiers_not_delivery_limits(
             diagnostic=lambda: _shell_diagnostic(shell, lifecycle),
         )
         shell.run_controls.startButton.click()
-        _wait(
-            qapp,
-            lambda: lifecycle.phase is RunPhase.IDLE,
-            diagnostic=lambda: _shell_diagnostic(shell, lifecycle),
-        )
+        _completed_acquisition(qapp, page, lifecycle, executor)
         identity = controller.run_identity
         assert identity is not None
         run = executor._exact_run(identity)
@@ -708,11 +754,14 @@ def test_product_retention_uses_ram_aware_tiers_not_delivery_limits(
         assert residency.limits.thumbnails == 512
         assert owner.records._max_items is None
         assert owner.records._max_heavy_items is None
-        assert owner.light_records._max_items is None
-        assert owner.light_records._max_heavy_items is None
-        assert owner.publications._max_heavy_items is None
-        assert owner.publications._max_thumbnail_items is None
-        assert len(owner.light_records) == len(labels)
+        assert not hasattr(owner, "light_records")
+        assert owner.light_lease is not None
+        assert owner.publications._light_1d is owner.light_lease
+        allocation = owner.publications.allocation
+        assert allocation is not None
+        assert owner.publications._max_heavy_items == allocation.publication_heavy_items
+        assert owner.publications._max_thumbnail_items == allocation.thumbnail_items
+        assert owner.light_lease.retained_count == len(labels)
         assert residency.heavy <= residency.limits.heavy
         assert residency.thumbnails <= residency.limits.thumbnails
         assert residency.browse <= residency.limits.browse
@@ -729,7 +778,7 @@ def test_historical_selection_moves_within_current_scan_footer(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    qapp, page, lifecycle, _executor, _output = _standard_page(
+    qapp, page, lifecycle, executor, _output = _standard_page(
         monkeypatch, tmp_path, labels=(1, 2, 3, 4, 5)
     )
     shell, controller = _mounted(page)
@@ -740,11 +789,7 @@ def test_historical_selection_moves_within_current_scan_footer(
             diagnostic=lambda: _shell_diagnostic(shell, lifecycle),
         )
         shell.run_controls.startButton.click()
-        _wait(
-            qapp,
-            lambda: lifecycle.phase is RunPhase.IDLE,
-            diagnostic=lambda: _shell_diagnostic(shell, lifecycle),
-        )
+        _completed_acquisition(qapp, page, lifecycle, executor)
         assert shell.scientific.progress.text() == "5/5"
 
         fourth = next(
@@ -783,11 +828,7 @@ def test_qualified_catalog_distinguishes_multi_output_repeated_labels(
             diagnostic=lambda: _shell_diagnostic(shell, lifecycle),
         )
         shell.run_controls.startButton.click()
-        _wait(
-            qapp,
-            lambda: lifecycle.phase is RunPhase.IDLE,
-            diagnostic=lambda: _shell_diagnostic(shell, lifecycle),
-        )
+        _completed_acquisition(qapp, page, lifecycle, executor)
         identity = controller.run_identity
         assert identity is not None
         catalog = executor.frame_catalog(identity)

@@ -323,6 +323,9 @@ def test_live_resume_failure_keeps_exact_session_and_effects_paused() -> None:
             self.pause_calls += 1
             return timeout >= 0.0
 
+        def flush(self, *, force: bool) -> None:
+            assert force and self.pause_calls
+
         def resume(self) -> None:
             self.resume_calls += 1
             if self.resume_calls == 1:

@@ -761,10 +761,9 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
                     raise ValueError(f"selected container has no compatible owner: {path}")
                 descriptor = describe_container_from_open(handle, path=path, entry=entry_name,
                     size=before.size, mtime_ns=before.mtime_ns, adapter_id=owner.id)
-                entry_group = resolve_nxentry(
-                    handle, descriptor.resolved_entry or entry_name, exact_hint=True,
-                )
-                if entry_group is None: raise ValueError("container resolved entry disappeared")
+                # Keep the selected entry already resolved from this open
+                # graph. Raw Run permits external/soft entry links; Average's
+                # bounded reader above deliberately requires a hard link.
                 binding = _ResolvedNexusStack(entry_group); slot.owner = binding
                 selectors = descriptor.segment_paths or ((descriptor.dataset_path,) if descriptor.dataset_path else ())
                 for selector in selectors:
@@ -1575,6 +1574,19 @@ def _external_members(
                 f"external detector member capture is unverifiable: {path}"
             ) from error
 
+    def missing_dataset(segment: str) -> None:
+        # A soft link or external ancestor can hide a missing physical file.
+        # Trace only this failed selector before classifying the failure. The
+        # successful path is traced once by _selected_dependency_files below.
+        paths: list[Path] = []
+        _trace_hdf5_object_dependencies(
+            master, segment, paths=paths, seen=set(), cancelled=cancelled,
+            required=True, states=states,
+        )
+        for path in paths:
+            member_state(path)
+        raise ValueError("external container lost its exact dataset")
+
     try:
         with _open_stable_hdf5_dependency(
             master,
@@ -1590,7 +1602,7 @@ def _external_members(
                     raise RuntimeError("admission cancelled")
                 parent = handle.get(posixpath.dirname(segment) or "/")
                 if not isinstance(parent, h5py.Group):
-                    raise ValueError("external container lost its exact dataset")
+                    missing_dataset(segment)
                 leaf = posixpath.basename(segment)
                 link = parent.get(leaf, getlink=True)
                 if isinstance(link, h5py.ExternalLink):
@@ -1598,7 +1610,7 @@ def _external_members(
                     member_state(_hdf5_link_file(parent, link.filename))
                 dataset = parent.get(leaf)
                 if not isinstance(dataset, h5py.Dataset) or dataset.ndim not in {2, 3}:
-                    raise ValueError("external container lost its exact dataset")
+                    missing_dataset(segment)
                 owner_path, owner_selector = _selected_link_owner_selector(
                     handle, segment, dataset,
                 )

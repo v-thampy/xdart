@@ -53,13 +53,16 @@ dependencies = [
 
 [project.optional-dependencies]
 fitting = ["lmfit", "pymatgen"]
-rsm = ["xrayutilities", "pyevtk"]
+rsm = ["xrayutilities==1.7.12", "numpy==2.5.1", "pyevtk"]
 gui = [
     "PySide6>=6.5",
     "pyqtgraph>=0.13.7",
     # silx.gui.plot pulls qtawesome at import time (pyFAI-calib2 /
     # drawmask path) but silx doesn't declare it.
     "qtawesome",
+    # `silx view` (the installed viewer we launch) imports silx.gui.plot3d,
+    # which raises "PyOpenGL is not installed" unless silx[full] was chosen.
+    "PyOpenGL",
     # External NeXus GUI; reuse our PySide6 (not nexpy[qt], which adds PyQt5).
     # Keep this release on the tested nexusformat 2.0.2 dependency line.
     "nexpy==2.0.1",
@@ -87,11 +90,11 @@ Changelog = "https://github.com/v-thampy/xdart/blob/main/MIGRATION.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["xrd_tools*", "xdart*", "ssrl_xrd_tools*"]
+include = ["xrd_tools*", "xdart*"]
 
 [tool.setuptools.package-data]
 xdart = ["**/*.ui"]
-xrd_tools = ["assets/rsm/*.json", "assets/xu/*.json"]
+xrd_tools = ["assets/rsm/*.json", "assets/xu/*.json", "assets/xu/*.npy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -133,7 +136,7 @@ python = "3.13.*"
 # the whole pixi-vs-xrd_test perf gap).  pixi maps these conda packages to
 # their PyPI names, so the editable install below sees its requirements as
 # already satisfied and does NOT re-install wheel copies.
-numpy = "*"
+numpy = "==2.5.1"
 h5py = "*"
 hdf5plugin = "*"
 fabio = "*"
@@ -152,7 +155,7 @@ pyside6 = "*"
 # Same rule for xrayutilities: its wheel bundles a second OpenMP runtime,
 # which aborts the process once conda-forge llvm-openmp is already loaded
 # (caught by test_circle_angles' pixel_q -> xrayutilities.area call).
-xrayutilities = "*"
+xrayutilities = "==1.7.12"
 
 [tool.pixi.pypi-dependencies]
 xdart = { path = ".", editable = true, extras = ["gui", "dev", "notebook"] }

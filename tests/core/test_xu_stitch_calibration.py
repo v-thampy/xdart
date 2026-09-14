@@ -3,11 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import xrd_tools.analysis.xu_stitch_calibration as xu_module
+from xrd_tools.io import descriptor_path
 from xrd_tools.analysis.xu_stitch_calibration import (
     CANONICAL_XU_STITCH_CALIBRATION_LOCATOR,
     XuStitchCalibrationInput,
@@ -22,6 +25,14 @@ from xrd_tools.analysis.xu_stitch_calibration import (
 
 EXPECTED_SHA = "57857833c56eeed0db27ec9e3f64aa635d5cd1d1e74eaed0b957eb054b3356d3"
 EXPECTED_SEMANTIC = "90f3bec535ed9a21be1b9d93491e774364df5849155b9b9c1707eace848e40f8"
+
+
+def _symlink(link: Path, target: Path, *, directory: bool = False) -> None:
+    """Create *link* -> *target*; skip where the host refuses symbolic links."""
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"symbolic links unavailable here: {error}")
 
 
 def test_canonical_surface_resource_has_authenticated_exact_bytes():
@@ -60,6 +71,305 @@ def test_canonical_surface_installer_is_create_only_and_idempotent(tmp_path):
         install_canonical_xu_stitch_calibration(project_root=conflict_project)
     assert raised.value.code == "XU_CALIBRATION_INSTALL_CONFLICT"
     assert conflict_target.read_bytes() == b"foreign"
+
+
+def test_by_name_installer_installs_readmits_and_conflicts_like_the_descriptor_walk(
+    tmp_path, monkeypatch,
+):
+    """The no-dir_fd installer (Windows' only one) on any host."""
+    monkeypatch.setattr(xu_module, "_DESCRIPTOR_WALK", False)
+    project = tmp_path / "project"
+    project.mkdir()
+    first = install_canonical_xu_stitch_calibration(project_root=project)
+    target = project / CANONICAL_XU_STITCH_CALIBRATION_LOCATOR
+    assert target.read_bytes() == canonical_surface_resource_bytes()
+    second = install_canonical_xu_stitch_calibration(project_root=project)
+    assert second.fingerprint == first.fingerprint
+    assert second.file_state == first.file_state
+
+
+def _descriptor_walk_modes(module):
+    modes = [pytest.param(False, id="by_name")]
+    if module._DESCRIPTOR_WALK:
+        modes.insert(0, pytest.param(True, id="descriptor"))
+    return modes
+
+
+# Only Windows can delete a file through the handle that created it; every
+# POSIX host leaves the misplaced (empty) leaf and names it in the refusal.
+_DISPOSES_BY_HANDLE = sys.platform == "win32"
+
+
+def _stage_parent_exchange(monkeypatch, target, outside, *, restore=False):
+    """Exchange *target*'s parent for a link to *outside* inside the leaf
+    create -- once, whichever installer creates it -- and with *restore*
+    put the real parent back before the create returns, so the misplaced
+    leaf is reachable only by its final path.  Returns the parked real
+    parent and a flag record."""
+    parked = target.parent.with_name(target.parent.name + "-parked")
+    real_open = os.open
+    real_create = descriptor_path.create_exclusive_leaf
+    state = {"exchanged": False}
+
+    def exchange():
+        state["exchanged"] = True
+        target.parent.rename(parked)
+        _symlink(target.parent, outside, directory=True)
+
+    def restore_parent():
+        os.unlink(target.parent)
+        parked.rename(target.parent)
+
+    def exchange_then_open(path, flags, *args, **kwargs):
+        if state["exchanged"] or not flags & os.O_CREAT or Path(path).name != target.name:
+            return real_open(path, flags, *args, **kwargs)
+        exchange()
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if restore:
+            restore_parent()
+        return descriptor
+
+    def exchange_then_create(path):
+        if state["exchanged"] or Path(path).name != target.name:
+            return real_create(path)
+        exchange()
+        descriptor = real_create(path)
+        if restore:
+            restore_parent()
+        return descriptor
+
+    monkeypatch.setattr(os, "open", exchange_then_open)
+    monkeypatch.setattr(descriptor_path, "create_exclusive_leaf", exchange_then_create)
+    return parked, state
+
+
+def _assert_misplaced_leaf_disposition(raised, outside, name):
+    """After a by-name refusal: nothing outside where the handle could
+    delete the leaf, otherwise exactly the empty leaf, named in the cause."""
+    if _DISPOSES_BY_HANDLE:
+        assert list(outside.iterdir()) == []
+        return
+    assert [(entry.name, entry.stat().st_size) for entry in outside.iterdir()] == [
+        (name, 0)
+    ]
+    cause = str(raised.value.__cause__)
+    assert os.path.realpath(outside / name) in cause
+    assert "empty leaf left there" in cause
+
+
+@pytest.mark.parametrize("descriptor_walk", _descriptor_walk_modes(xu_module))
+def test_installer_never_writes_outside_after_a_parent_exchange(
+    tmp_path, monkeypatch, descriptor_walk,
+):
+    """Codex PR #1 review, F2: a parent directory exchanged for a symbolic
+    link between the ancestry inspection and the leaf open must not land
+    the asset inside the link's target.  The descriptor walk cannot follow
+    it; the by-name walk reads the created leaf's final path and refuses,
+    disposing of the misplaced empty leaf through its own handle where
+    the platform can, and naming it where it cannot."""
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    target = project / CANONICAL_XU_STITCH_CALIBRATION_LOCATOR
+    target.parent.mkdir(parents=True)
+    parked, state = _stage_parent_exchange(monkeypatch, target, outside)
+
+    monkeypatch.setattr(xu_module, "_DESCRIPTOR_WALK", descriptor_walk)
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        install_canonical_xu_stitch_calibration(project_root=project)
+    assert state["exchanged"]
+    assert raised.value.code == "XU_CALIBRATION_INSTALL_FAILED"
+    if descriptor_walk:
+        # The held directory descriptor still names the inspected (now
+        # parked) directory: the asset lands there, and only the lexical
+        # re-admission through the exchanged parent refuses.
+        assert list(outside.iterdir()) == []
+        assert [entry.name for entry in parked.iterdir()] == [target.name]
+        assert (parked / target.name).read_bytes() == canonical_surface_resource_bytes()
+    else:
+        assert list(parked.iterdir()) == []
+        _assert_misplaced_leaf_disposition(raised, outside, target.name)
+
+
+def test_by_name_installer_disposes_of_a_leaf_the_name_no_longer_reaches(
+    tmp_path, monkeypatch,
+):
+    """Codex review of 0ed7a46c, F2: the parent is exchanged for the
+    create and put back before the placement check, so the misplaced leaf
+    is no longer what the target name resolves to.  A by-name cleanup
+    would miss it (or hit whatever now sits at the name); disposal goes
+    through the handle, and the project itself is untouched."""
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    target = project / CANONICAL_XU_STITCH_CALIBRATION_LOCATOR
+    target.parent.mkdir(parents=True)
+    _, state = _stage_parent_exchange(monkeypatch, target, outside, restore=True)
+
+    monkeypatch.setattr(xu_module, "_DESCRIPTOR_WALK", False)
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        install_canonical_xu_stitch_calibration(project_root=project)
+    assert state["exchanged"]
+    assert raised.value.code == "XU_CALIBRATION_INSTALL_FAILED"
+    assert not target.parent.is_symlink()
+    assert list(target.parent.iterdir()) == []
+    _assert_misplaced_leaf_disposition(raised, outside, target.name)
+    # The restored project installs normally afterwards.
+    receipt = install_canonical_xu_stitch_calibration(project_root=project)
+    assert receipt.content == canonical_surface_resource_bytes()
+    assert target.read_bytes() == canonical_surface_resource_bytes()
+
+
+def test_by_name_installer_never_deletes_a_foreign_file_at_the_misplaced_name(
+    tmp_path, monkeypatch,
+):
+    """Codex review of 0ed7a46c, F2: a foreign file moved over the
+    misplaced leaf's name between the placement check and the cleanup
+    must survive.  The cleanup holds the leaf's own handle and never
+    unlinks a name; where the handle blocks the move (Windows) the foreign
+    file simply stays where it was."""
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    target = project / CANONICAL_XU_STITCH_CALIBRATION_LOCATOR
+    target.parent.mkdir(parents=True)
+    _stage_parent_exchange(monkeypatch, target, outside)
+    payload = b"foreign payload must survive"
+    foreign = outside / "foreign.tmp"
+    outsider = outside / target.name
+    foreign.write_bytes(payload)
+    real_dispose = descriptor_path.dispose_created_leaf
+    moved = {"replaced": None}
+
+    def replace_then_dispose(descriptor):
+        assert moved["replaced"] is None
+        try:
+            os.replace(foreign, outsider)
+        except OSError:
+            moved["replaced"] = False
+        else:
+            moved["replaced"] = True
+        return real_dispose(descriptor)
+
+    monkeypatch.setattr(descriptor_path, "dispose_created_leaf", replace_then_dispose)
+    monkeypatch.setattr(xu_module, "_DESCRIPTOR_WALK", False)
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        install_canonical_xu_stitch_calibration(project_root=project)
+    assert raised.value.code == "XU_CALIBRATION_INSTALL_FAILED"
+    assert moved["replaced"] is not None
+    survivor = outsider if moved["replaced"] else foreign
+    assert survivor.read_bytes() == payload
+    if _DISPOSES_BY_HANDLE:
+        assert [entry.name for entry in outside.iterdir()] == [survivor.name]
+    else:
+        # POSIX replaces the open leaf by name; the foreign file now holds it.
+        assert moved["replaced"]
+        assert [entry.name for entry in outside.iterdir()] == [outsider.name]
+
+
+@pytest.mark.parametrize("descriptor_walk", _descriptor_walk_modes(xu_module))
+def test_installer_refuses_a_link_planted_at_the_leaf_name(
+    tmp_path, monkeypatch, descriptor_walk,
+):
+    """A symbolic link planted at the leaf name between the existence
+    check and the create is an existing entry, never a path to create
+    through: the exclusive create conflicts and the link's target is not
+    made.  (POSIX O_EXCL; on Windows CREATE_NEW opens the reparse point.)"""
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / CANONICAL_XU_STITCH_CALIBRATION_LOCATOR
+    target.parent.mkdir(parents=True)
+    sibling = target.parent / "sibling.json"
+    real_open = os.open
+    real_create = descriptor_path.create_exclusive_leaf
+    planted = {"done": False}
+
+    def plant():
+        if not planted["done"]:
+            planted["done"] = True
+            _symlink(target, sibling)
+
+    def plant_then_open(path, flags, *args, **kwargs):
+        if flags & os.O_CREAT and Path(path).name == target.name:
+            plant()
+        return real_open(path, flags, *args, **kwargs)
+
+    def plant_then_create(path):
+        plant()
+        return real_create(path)
+
+    monkeypatch.setattr(os, "open", plant_then_open)
+    monkeypatch.setattr(descriptor_path, "create_exclusive_leaf", plant_then_create)
+    monkeypatch.setattr(xu_module, "_DESCRIPTOR_WALK", descriptor_walk)
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        install_canonical_xu_stitch_calibration(project_root=project)
+    assert planted["done"]
+    assert not sibling.exists()
+    assert target.is_symlink()
+    assert raised.value.code == "XU_CALIBRATION_INSTALL_CONFLICT"
+
+
+def test_by_name_installer_disposes_of_a_leaf_it_failed_to_fill_through_the_handle(
+    tmp_path, monkeypatch,
+):
+    """A write failure after a verified placement disposes of the leaf
+    through its handle (Windows) or leaves it and says so (POSIX); a name
+    is never unlinked."""
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / CANONICAL_XU_STITCH_CALIBRATION_LOCATOR
+    attacked = {"done": False}
+
+    def fail_write(_descriptor, _payload):
+        assert not attacked["done"]
+        attacked["done"] = True
+        raise OSError("synthetic write failure")
+
+    monkeypatch.setattr(xu_module.os, "write", fail_write)
+    monkeypatch.setattr(xu_module, "_DESCRIPTOR_WALK", False)
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        install_canonical_xu_stitch_calibration(project_root=project)
+    assert attacked["done"]
+    assert raised.value.code == "XU_CALIBRATION_INSTALL_FAILED"
+    cause = raised.value.__cause__
+    assert str(cause) == "synthetic write failure"
+    if _DISPOSES_BY_HANDLE:
+        assert not target.exists()
+        assert not getattr(cause, "__notes__", [])
+    else:
+        assert target.stat().st_size == 0
+        assert cause.__notes__ == [f"partial canonical asset left at {target}"]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="an open file cannot be replaced on Windows"
+)
+def test_by_name_installer_never_unlinks_a_foreign_replacement_after_a_failed_fill(
+    tmp_path, monkeypatch,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / CANONICAL_XU_STITCH_CALIBRATION_LOCATOR
+    foreign = b"foreign replacement"
+    attacked = {"done": False}
+
+    def replace_name_then_fail(_descriptor, _payload):
+        assert not attacked["done"]
+        attacked["done"] = True
+        target.unlink()
+        target.write_bytes(foreign)
+        raise OSError("synthetic write failure")
+
+    monkeypatch.setattr(xu_module.os, "write", replace_name_then_fail)
+    monkeypatch.setattr(xu_module, "_DESCRIPTOR_WALK", False)
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        install_canonical_xu_stitch_calibration(project_root=project)
+    assert attacked["done"]
+    assert raised.value.code == "XU_CALIBRATION_INSTALL_FAILED"
+    assert target.read_bytes() == foreign
 
 
 def test_surface_projection_and_receipt_factory_claims_cannot_be_reused(tmp_path):
@@ -147,6 +457,146 @@ def test_surface_capture_binds_lexical_resolved_and_physical_identity(tmp_path):
     assert raised.value.code == "XU_CALIBRATION_IDENTITY_MISMATCH"
 
 
+def _between_open_and_inspection(monkeypatch, module, act):
+    """Run *act* on the module's post-read chain walk, before the walk: the
+    concurrent change lands between the open and the inspection."""
+    real = module._lexical_chain_states
+    observed = []
+
+    def act_then_walk(project, relative):
+        observed.append(act(len(observed)))
+        return real(project, relative)
+
+    monkeypatch.setattr(module, "_lexical_chain_states", act_then_walk)
+    return observed
+
+
+def _write_beside(directory, base):
+    """A writer that creates an entry in *directory* and pins the directory's
+    mtime past any timestamp granularity (the RSM before/after row's idiom):
+    the directory's identity stays, its recorded state does not."""
+
+    def act(count):
+        (directory / f"beside-{count}.tmp").write_bytes(b"")
+        os.utime(
+            directory,
+            ns=(base.st_atime_ns, base.st_mtime_ns + (count + 1) * 2_000_000_000),
+        )
+        return xu_module._state(os.lstat(directory))
+
+    return act
+
+
+@pytest.mark.parametrize("descriptor_walk", _descriptor_walk_modes(xu_module))
+@pytest.mark.parametrize("ancestor", ["above-project", "project-root"])
+def test_surface_capture_survives_a_concurrent_write_beside_its_chain(
+    tmp_path, monkeypatch, ancestor, descriptor_walk
+):
+    # PR #1 round 12 (macos-15-intel): the runner's system temp directory
+    # gained an entry while a capture ran and the capture refused
+    # "calibration changed during capture" -- the ancestors were held to
+    # their full state, mtime included, and the refusal named nothing.
+    monkeypatch.setattr(xu_module, "_DESCRIPTOR_WALK", descriptor_walk)
+    project = tmp_path / "project"
+    target = project / "calibration" / "xu" / "surface.json"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(canonical_surface_resource_bytes())
+    directory = tmp_path if ancestor == "above-project" else project
+    base = os.lstat(directory)
+    observed = _between_open_and_inspection(
+        monkeypatch, xu_module, _write_beside(directory, base)
+    )
+    receipt = capture_xu_stitch_calibration(
+        XuStitchCalibrationInput("calibration/xu/surface.json"),
+        project_root=project,
+    )
+    assert receipt.raw_sha256 == EXPECTED_SHA
+    # Revalidation is a re-capture: a second write lands beside that one.
+    assert revalidate_xu_stitch_calibration(receipt) == receipt.content
+    assert len(observed) == 2
+    for state in observed:
+        assert state[:3] == xu_module._state(base)[:3]
+        assert state[4] != base.st_mtime_ns
+    assert observed[0][4] != observed[1][4]
+
+
+def test_canonical_resource_survives_a_concurrent_write_beside_its_chain(
+    tmp_path, monkeypatch
+):
+    raw = canonical_surface_resource_bytes()
+    package = tmp_path / "package"
+    resource = package / "assets" / "xu" / "psic_powder_1d_surface_v1.json"
+    resource.parent.mkdir(parents=True)
+    resource.write_bytes(raw)
+    monkeypatch.setattr(
+        "xrd_tools.analysis.xu_stitch_calibration.resources.files",
+        lambda _package: package,
+    )
+    base = os.lstat(tmp_path)
+    observed = _between_open_and_inspection(
+        monkeypatch, xu_module, _write_beside(tmp_path, base)
+    )
+    assert canonical_surface_resource_bytes() == raw
+    assert len(observed) == 1
+    assert observed[0][4] != base.st_mtime_ns
+
+
+def test_surface_capture_names_the_ancestor_whose_identity_moved(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    calibration = project / "calibration"
+    target = calibration / "xu" / "surface.json"
+    target.parent.mkdir(parents=True)
+    raw = canonical_surface_resource_bytes()
+    target.write_bytes(raw)
+    opened_ino = os.lstat(calibration).st_ino
+
+    def exchange(_count):
+        # Every name still resolves and the bytes still match; only the
+        # identities under the exchanged directory differ.
+        calibration.rename(project / "calibration.stale")
+        target.parent.mkdir(parents=True)
+        target.write_bytes(raw)
+        return os.lstat(calibration).st_ino
+
+    observed = _between_open_and_inspection(monkeypatch, xu_module, exchange)
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        capture_xu_stitch_calibration(
+            XuStitchCalibrationInput("calibration/xu/surface.json"),
+            project_root=project,
+        )
+    assert raised.value.code == "XU_CALIBRATION_IDENTITY_MISMATCH"
+    assert observed[0] != opened_ino
+    assert str(raised.value) == (
+        "calibration changed during capture: "
+        f"ancestor {calibration}: ino {opened_ino} -> {observed[0]}"
+    )
+
+
+def test_surface_capture_names_the_leaf_that_changed_after_the_read(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    target = project / "surface.json"
+    project.mkdir()
+    target.write_bytes(canonical_surface_resource_bytes())
+
+    def grow(_count):
+        with target.open("ab") as stream:
+            stream.write(b"\n")
+
+    _between_open_and_inspection(monkeypatch, xu_module, grow)
+    with pytest.raises(XuStitchCalibrationRefused) as raised:
+        capture_xu_stitch_calibration(
+            XuStitchCalibrationInput("surface.json"), project_root=project
+        )
+    assert raised.value.code == "XU_CALIBRATION_IDENTITY_MISMATCH"
+    assert str(raised.value) == (
+        f"calibration changed during capture: leaf {target}: size 4837 -> 4838"
+    )
+
+
 def test_surface_capture_refuses_outside_project_and_symlink(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
@@ -159,7 +609,7 @@ def test_surface_capture_refuses_outside_project_and_symlink(tmp_path):
     assert raised.value.code == "XU_CALIBRATION_OUTSIDE_PROJECT"
 
     linked = project / "surface.json"
-    linked.symlink_to(outside)
+    _symlink(linked, outside)
     with pytest.raises(XuStitchCalibrationRefused) as raised:
         capture_xu_stitch_calibration(
             XuStitchCalibrationInput(linked), project_root=project
@@ -172,7 +622,7 @@ def test_surface_capture_refuses_outside_project_and_symlink(tmp_path):
     real_project.mkdir(parents=True)
     real_target.write_bytes(canonical_surface_resource_bytes())
     parent_alias = tmp_path / "parent-alias"
-    parent_alias.symlink_to(real_parent, target_is_directory=True)
+    _symlink(parent_alias, real_parent, directory=True)
     with pytest.raises(XuStitchCalibrationRefused) as raised:
         capture_xu_stitch_calibration(
             XuStitchCalibrationInput("surface.json"),
@@ -186,14 +636,18 @@ def test_surface_capture_refuses_nonregular_before_read_and_normalizes_path_erro
 ):
     project = tmp_path / "project"
     project.mkdir()
-    fifo = project / "surface.fifo"
-    os.mkfifo(fifo)
-    with pytest.raises(XuStitchCalibrationRefused) as raised:
-        capture_xu_stitch_calibration(
-            XuStitchCalibrationInput("surface.fifo"),
-            project_root=project,
-        )
-    assert raised.value.code == "XU_CALIBRATION_NOT_REGULAR"
+    nonregular = ["surface.dir"]
+    (project / "surface.dir").mkdir()
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(project / "surface.fifo")
+        nonregular.append("surface.fifo")
+    for locator in nonregular:
+        with pytest.raises(XuStitchCalibrationRefused) as raised:
+            capture_xu_stitch_calibration(
+                XuStitchCalibrationInput(locator),
+                project_root=project,
+            )
+        assert raised.value.code == "XU_CALIBRATION_NOT_REGULAR", locator
 
     regular_parent = project / "regular-parent"
     regular_parent.write_bytes(b"not a directory")
@@ -215,7 +669,7 @@ def test_canonical_resource_refuses_symlink_even_when_bytes_match(
     resource.parent.mkdir(parents=True)
     real = tmp_path / "real.json"
     real.write_bytes(raw)
-    resource.symlink_to(real)
+    _symlink(resource, real)
     monkeypatch.setattr(
         "xrd_tools.analysis.xu_stitch_calibration.resources.files",
         lambda _package: package,
@@ -240,18 +694,18 @@ def test_canonical_resource_refuses_symlink_in_package_ancestry(
     resource.write_bytes(raw)
     if linked_component == "package":
         package = tmp_path / "package"
-        package.symlink_to(real_package, target_is_directory=True)
+        _symlink(package, real_package, directory=True)
     else:
         package = tmp_path / "package"
         package.mkdir()
         if linked_component == "assets":
-            (package / "assets").symlink_to(
-                real_package / "assets", target_is_directory=True
-            )
+            _symlink(package / "assets", real_package / "assets", directory=True)
         else:
             (package / "assets").mkdir()
-            (package / "assets" / "xu").symlink_to(
-                real_package / "assets" / "xu", target_is_directory=True
+            _symlink(
+                package / "assets" / "xu",
+                real_package / "assets" / "xu",
+                directory=True,
             )
     monkeypatch.setattr(
         "xrd_tools.analysis.xu_stitch_calibration.resources.files",
@@ -283,7 +737,7 @@ def test_canonical_resource_refuses_noncanonical_package_root(
     real_package = tmp_path / "package"
     real_package.mkdir()
     alias = tmp_path / "alias"
-    alias.symlink_to(real_package, target_is_directory=True)
+    _symlink(alias, real_package, directory=True)
     hostile = os.path.join(os.fspath(alias), os.pardir, real_package.name)
     monkeypatch.setattr(
         "xrd_tools.analysis.xu_stitch_calibration.resources.files",
@@ -295,9 +749,8 @@ def test_canonical_resource_refuses_noncanonical_package_root(
 
 
 def test_exact_historical_xu_json_requires_reviewed_migration():
-    legacy = Path(
-        "/Users/vthampy/repos/example_notebooks/Stitching/"
-        "xu_geometry_del_nu.json"
+    legacy = (
+        Path(__file__).parent / "fixtures" / "xu_geometry_del_nu_legacy.json"
     ).read_bytes()
     assert hashlib.sha256(legacy).hexdigest() == (
         "9bb13babeb60475128dd9d14c833cdd8cd85af7510424c1b860b87231d8c0c25"

@@ -1020,16 +1020,48 @@ def test_seed_publication_does_not_rehash_the_admitted_source(
     assert len(captures) == 3
 
 
+@pytest.mark.parametrize("reuse_inode", (False, True))
 def test_seed_substitution_is_detected_before_foreign_file_truncation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    reuse_inode: bool,
 ) -> None:
     source = tmp_path / "source.nexus"
     source.write_bytes(b"source seed")
     admission = capture_finite_source(source)
     request = _request(tmp_path, source, admission=admission)
     real_open = finite_module.os.open
+    real_fstat = finite_module.os.fstat
+    real_stat = finite_module.os.stat
     swapped: list[Path] = []
+    identities: dict[str, tuple[int, int]] = {}
+    reused_descriptor_observations: list[int] = []
+
+    def reused_state(observed):
+        if (
+            reuse_inode
+            and (observed.st_dev, observed.st_ino) == identities.get("foreign")
+        ):
+            # Model Linux recycling the unlinked reservation's inode. Keep
+            # every other stat field from the real foreign file, and apply the
+            # same identity to both descriptor admission and pathname cleanup.
+            values = {
+                name: getattr(observed, name)
+                for name in dir(observed) if name.startswith("st_")
+            }
+            values["st_dev"], values["st_ino"] = identities["reserved"]
+            return SimpleNamespace(**values)
+        return observed
+
+    def fstat(descriptor):
+        observed = real_fstat(descriptor)
+        result = reused_state(observed)
+        if result is not observed:
+            reused_descriptor_observations.append(descriptor)
+        return result
+
+    def named_stat(*args, **kwargs):
+        return reused_state(real_stat(*args, **kwargs))
 
     def fault(path, flags, *args, **kwargs):
         dir_fd = kwargs.get("dir_fd")
@@ -1041,15 +1073,62 @@ def test_seed_substitution_is_detected_before_foreign_file_truncation(
             and flags & os.O_ACCMODE == os.O_WRONLY
         ):
             candidate = tmp_path / path
-            candidate.unlink()
-            candidate.write_bytes(b"foreign must survive")
+            reserved = real_stat(candidate)
+            foreign = tmp_path / "foreign-replacement"
+            foreign.write_bytes(b"foreign must survive")
+            replacement = real_stat(foreign)
+            identities["reserved"] = (reserved.st_dev, reserved.st_ino)
+            identities["foreign"] = (replacement.st_dev, replacement.st_ino)
+            assert identities["reserved"] != identities["foreign"]
+            foreign.replace(candidate)
             swapped.append(candidate)
         return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(finite_module.os, "open", fault)
+    monkeypatch.setattr(finite_module.os, "fstat", fstat)
+    monkeypatch.setattr(finite_module.os, "stat", named_stat)
     with pytest.raises(FiniteArtifactIntegrityError, match="descriptor identity"):
         _publish(request, seed=admission)
+    assert bool(reused_descriptor_observations) is reuse_inode
     assert swapped[0].read_bytes() == b"foreign must survive"
+    assert source.read_bytes() == b"source seed"
+    assert not Path(request.output_artifact).exists()
+
+
+def test_seed_partial_copy_failure_cleans_owned_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.nexus"
+    original = b"source seed" * 100_000
+    source.write_bytes(original)
+    admission = capture_finite_source(source)
+    request = _request(tmp_path, source, admission=admission)
+    real_read = finite_module.os.read
+    source_reads = 0
+    partial_copies: list[bytes] = []
+
+    def fail_after_first_block(descriptor, size):
+        nonlocal source_reads
+        observed = os.fstat(descriptor)
+        if (observed.st_dev, observed.st_ino) == (
+            admission.snapshot.device, admission.snapshot.inode,
+        ):
+            source_reads += 1
+            if source_reads == 2:
+                candidate, = tmp_path.glob(".xdart-finite-*.candidate")
+                partial_copies.append(candidate.read_bytes())
+                raise OSError("source read failed after a partial seed copy")
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(finite_module.os, "read", fail_after_first_block)
+    with pytest.raises(OSError, match="partial seed copy"):
+        _publish(request, seed=admission)
+    assert len(partial_copies) == 1
+    assert 0 < len(partial_copies[0]) < len(original)
+    assert original.startswith(partial_copies[0])
+    assert not tuple(tmp_path.glob(".xdart-finite-*.candidate"))
+    assert source.read_bytes() == original
     assert not Path(request.output_artifact).exists()
 
 
@@ -2404,3 +2483,145 @@ def test_pre_rename_directory_collision_never_claims_publication(tmp_path):
     assert target.is_dir()
     assert not owner.published
     assert not candidate.exists()
+
+
+# ---------------------------------------------------------------------------
+# The Windows stat shape (PR #1 2026-09-11): pathname ctime = creation time,
+# descriptor ctime = change time.  ``_capture_regular`` compares four views of
+# one file (lstat, fstat, fstat, lstat); only the seam lets them agree there.
+# ---------------------------------------------------------------------------
+
+
+def test_win32_pathname_ctime_shape_is_refused_while_ctime_is_identity(
+    tmp_path: Path, monkeypatch, ctime_seam, win32_pathname_ctime,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"finite")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", True)
+    win32_pathname_ctime(source)
+    with pytest.raises(FiniteArtifactIntegrityError, match="changed during observation"):
+        capture_finite_source(source)
+
+
+def test_win32_identity_admits_the_pathname_ctime_shape_and_records_the_descriptor_view(
+    tmp_path: Path, monkeypatch, ctime_seam, win32_pathname_ctime,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"finite")
+    with source.open("rb") as handle:
+        handle_ctime_ns = os.fstat(handle.fileno()).st_ctime_ns
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    gap_ns = win32_pathname_ctime(source)
+    # The two views really disagree by the runner's gap; only the compare is neutral.
+    assert os.stat(source).st_ctime_ns == handle_ctime_ns - gap_ns
+    admission = capture_finite_source(source)
+    snapshot = admission.snapshot
+    assert snapshot.ctime_ns == handle_ctime_ns
+    assert (snapshot.size, snapshot.digest) == (6, hashlib.sha256(b"finite").hexdigest())
+    # A descriptor re-observation of the same object still agrees with it,
+    # ctime included: the recorded identity is the descriptor's view, exact.
+    assert finite_module._observe_regular(source) == finite_module._snapshot_state(snapshot)
+    assert finite_module._snapshot_state(snapshot)[5] == handle_ctime_ns
+    # Only a compare against a pathname view goes through the seam.
+    assert finite_module._comparable(finite_module._snapshot_state(snapshot))[5] == 0
+
+
+def test_win32_identity_refuses_a_same_size_same_mtime_rewrite_after_admission(
+    tmp_path: Path, monkeypatch, ctime_seam, win32_pathname_ctime,
+) -> None:
+    """``_require_source`` carries ``snapshot.digest`` forward on a stat
+    compare alone, so it must see the descriptor's change time move even
+    where the pathname compare is neutral (Codex PR #1 review, F1)."""
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"finite")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    win32_pathname_ctime(source)
+    admission = capture_finite_source(source)
+    assert finite_module._require_source(admission) is admission.snapshot
+    before = os.stat(source)
+    source.write_bytes(b"FINITE")
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    with source.open("rb") as handle:
+        after = os.fstat(handle.fileno())
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    # Precondition of the row: only the descriptor's change time moved.
+    assert after.st_ctime_ns != admission.snapshot.ctime_ns
+    assert finite_module._observe_regular(source) != finite_module._snapshot_state(
+        admission.snapshot
+    )
+    with pytest.raises(FiniteArtifactIntegrityError, match="changed after admission"):
+        finite_module._require_source(admission)
+
+
+@pytest.mark.parametrize("shape", ("posix", "win32"))
+def test_capture_refuses_a_same_size_same_mtime_rewrite_inside_the_read_window(
+    tmp_path: Path, monkeypatch, ctime_seam, win32_pathname_ctime, shape: str,
+) -> None:
+    """``_capture_regular`` brackets its read with two descriptor views held
+    to each other exactly, ctime included: a rewrite that keeps size and mtime
+    inside that window is refused rather than digested torn, also where the
+    pathname compare is neutral (Codex PR #1 addendum, Fix 1 acceptance)."""
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"finite")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", shape == "posix")
+    if shape == "win32":
+        win32_pathname_ctime(source)
+    log: list[tuple[int, int]] = []
+
+    class _RewritingOs:
+        """The module's ``os`` with a ``read`` that rewrites the file in place
+        (same size, same mtime) before the first block is read."""
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def read(self, descriptor, size):
+            if not log:
+                opened = os.fstat(descriptor)
+                before = os.stat(source)
+                source.write_bytes(b"FINITE")
+                os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+                rewritten = os.fstat(descriptor)
+                assert (rewritten.st_size, rewritten.st_mtime_ns) == (
+                    opened.st_size, opened.st_mtime_ns,
+                )
+                log.append((opened.st_ctime_ns, rewritten.st_ctime_ns))
+            return os.read(descriptor, size)
+
+    monkeypatch.setattr(finite_module, "os", _RewritingOs())
+    with pytest.raises(FiniteArtifactIntegrityError, match="changed during observation"):
+        capture_finite_source(source)
+    # Precondition of the row: the rewrite happened inside the window and
+    # only the descriptor's change time moved.
+    [(opened_ctime_ns, rewritten_ctime_ns)] = log
+    assert rewritten_ctime_ns != opened_ctime_ns
+    # The now-quiet file still captures under either shape.
+    monkeypatch.setattr(finite_module, "os", os)
+    assert capture_finite_source(source).snapshot.digest == hashlib.sha256(b"FINITE").hexdigest()
+
+
+def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
+    tmp_path: Path, monkeypatch, ctime_seam,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"finite")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    real_lstat = os.lstat
+
+    class _Shifted:
+        def __init__(self, real):
+            self._real = real
+            self.st_mtime_ns = real.st_mtime_ns - 1
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def shifted_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if isinstance(path, (str, os.PathLike)) and os.path.abspath(path) == str(source):
+            return _Shifted(result)
+        return result
+
+    monkeypatch.setattr(os, "lstat", shifted_lstat)
+    with pytest.raises(FiniteArtifactIntegrityError, match="changed during observation"):
+        capture_finite_source(source)

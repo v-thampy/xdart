@@ -18,6 +18,7 @@ from tests.xdart.scattering.test_p1b_output_graph import (
     _bridge_legacy_expected_target_state,
     _drain_until,
     _start,
+    _written,
 )
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.display_values import StandardEventKind
@@ -1152,7 +1153,7 @@ def test_p1b_b12_stop_cancel_preserves_exact_durable_prefix(
                         key.artifact
                     ].records.is_persisted(key.local_frame_label)
                 ))
-                rows = _output_rows(target)
+                rows = _output_rows(_written(target))
                 xye_labels = _xye_labels(case)
                 dynamic_durable_count = len(persisted_labels)
                 if dynamic is not None:
@@ -1284,6 +1285,9 @@ def test_p1b_b12_stop_cancel_preserves_exact_durable_prefix(
     class PausedSession:
         def pause(self, *, timeout: float) -> bool:
             return True
+
+        def flush(self, *, force: bool) -> None:
+            assert force
 
         def resume(self) -> None:
             raise AssertionError("Stop must not compensate Pause with resume")
@@ -1507,7 +1511,10 @@ def test_p1b_b12_stop_cancel_preserves_exact_durable_prefix(
             pending = queue_run.display_projection_queue
             projection_worker = queue_run.display_projection_worker
             assert pending is not None and projection_worker is not None
-            queued = (SimpleNamespace(frame_index=0), None, object())
+            from xrd_tools.core import FrameRecord
+            queued = run_executor_module._FrameProjectionItem(
+                0, FrameRecord(0), False,
+            )
             pending.put(queued)
             assert projection_entered.wait(2.0)
             for _ in range(pending.maxsize):
@@ -1741,13 +1748,17 @@ def test_p1b_b12_stop_cancel_preserves_exact_durable_prefix(
     epoch_target = Path(epoch_frames[0].artifact)
     artifact_owner = epoch_run.display.artifacts[epoch_key.artifact]
     heavy_store = epoch_graph["record_store"]
-    light_store = artifact_owner.light_records
+    light_lease = artifact_owner.light_lease
     assert heavy_store is artifact_owner.records
-    assert light_store is not heavy_store
+    assert not hasattr(artifact_owner, "light_records")
+    assert light_lease is not None
+    assert artifact_owner.publications._light_1d is light_lease
     assert heavy_store.labels() == (epoch_label,)
-    assert light_store.labels() == (epoch_label,)
+    assert light_lease.keys() == (epoch_label,)
     assert heavy_store.get(epoch_label) is not None
-    assert light_store.get(epoch_label) is not None
+    borrowed = light_lease.borrow(epoch_label)
+    assert borrowed is not None
+    borrowed.close()
     assert epoch_terminal.kind is StandardEventKind.FAILED
     assert epoch_terminal.primary is not None
     assert epoch_terminal.primary.type_qualname == OSError.__qualname__
@@ -1757,7 +1768,7 @@ def test_p1b_b12_stop_cancel_preserves_exact_durable_prefix(
     assert epoch_terminal.cleanup_status is CleanupStatus.CLEANED
     assert _output_rows(epoch_target) == (epoch_label,)
     assert _xye_labels(epoch_output) == (epoch_label,)
-    assert light_store.is_persisted(epoch_label)
+    assert light_lease.state.value == "active"
     assert heavy_store.is_persisted(epoch_label)
     assert len(_fully_durable_keys(
         epoch_dynamic, epoch_dynamic.snapshot()
@@ -1780,7 +1791,8 @@ def test_p1b_b12_stop_cancel_preserves_exact_durable_prefix(
         epoch_identity
     ).cleanup_status is CleanupStatus.CLEANED
     assert heavy_store.is_persisted(epoch_label)
-    assert light_store.is_persisted(epoch_label)
+    assert light_lease.state.value == "released"
+    assert light_lease.retained_count == 0
     assert (
         epoch_run.completed,
         len(epoch_calls),

@@ -42,8 +42,9 @@ from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.selection import DirectorySourceSpec
 
 from tests.xdart.scattering.test_e6_live_directory_wait import (
-    _add_display_artifact,
     _admitted_live_group,
+    _write_small_poni,
+    _wait_for_admission,
 )
 
 
@@ -279,7 +280,6 @@ def test_replacing_symlink_with_same_target_and_owner_is_not_drift(
         1,
         1,
     )
-    item = _image_item(alias, stamp, tmp_path / "processed.nexus")
     identity = (
         stamp.execution_identity_v1
         if hasattr(stamp, "execution_identity_v1")
@@ -289,7 +289,7 @@ def test_replacing_symlink_with_same_target_and_owner_is_not_drift(
     refreshed.symlink_to(target)
     refreshed.replace(alias)
 
-    output_preflight.validate_planned_source(item)
+    output_preflight.validate_source_aliases(stamp)
     current_identity = (
         stamp.execution_identity_v1
         if hasattr(stamp, "execution_identity_v1")
@@ -320,7 +320,6 @@ def test_alias_validator_rejects_missing_broken_and_retargeted_aliases(
         1,
         1,
     )
-    item = _image_item(alias, stamp, tmp_path / "processed.nexus")
 
     alias.unlink()
     if change == "broken_link":
@@ -331,7 +330,7 @@ def test_alias_validator_rejects_missing_broken_and_retargeted_aliases(
         alias.symlink_to(hardlink)
 
     with pytest.raises(SourceRevisionChanged):
-        output_preflight.validate_planned_source(item)
+        output_preflight.validate_source_aliases(stamp)
 
 
 @pytest.mark.parametrize(
@@ -349,7 +348,6 @@ def test_alias_validator_rejects_target_revision_and_candidate_owner_change(
     _write_tiff(selected)
     accepted = SourceFileState.capture(selected)
     stamp = SourceExecutionStamp(accepted, "image_file", 1, 1)
-    item = _image_item(selected, stamp, tmp_path / "processed.nexus")
 
     if changed_field in {"size", "mtime_ns", "ctime_ns", "device", "inode"}:
         changed = replace(
@@ -362,14 +360,14 @@ def test_alias_validator_rejects_target_revision_and_candidate_owner_change(
             staticmethod(lambda _path: changed),
         )
     elif changed_field in {"owner", "missing_owner"}:
-        owner = None if changed_field == "missing_owner" else SimpleNamespace(id="nexus")
-        monkeypatch.setattr(output_preflight, "candidate_owner", lambda _path: owner)
+        owner_id = None if changed_field == "missing_owner" else "nexus"
+        monkeypatch.setattr(source_graph, "_candidate_owner_id", lambda _path: owner_id)
 
     if changed_field is None:
-        output_preflight.validate_planned_source(item)
+        output_preflight.validate_source_aliases(stamp)
     else:
         with pytest.raises(SourceRevisionChanged):
-            output_preflight.validate_planned_source(item)
+            output_preflight.validate_source_aliases(stamp)
 
 
 def test_sidecar_alias_retarget_is_pending_before_every_output_side_effect(
@@ -522,11 +520,25 @@ def test_live_pending_identity_revalidates_before_equal_candidate_skip(
     _write_tiff(target)
     os.link(target, hardlink)
     selected.symlink_to(target)
-    executor, intent, receipt, _operation, _session, _group = _admitted_live_group(
-        tmp_path,
-        DirectorySourceSpec(raw, suffixes=(".tif",), metadata_format=None),
-        request_value=1122,
+    from xdart.gui.tabs.scattering.contracts import SourceCapture, StartCapture
+    from xdart.gui.tabs.scattering.events import RequestId
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+
+    poni = tmp_path / "cal.poni"
+    _write_small_poni(poni)
+    source = DirectorySourceSpec(raw, suffixes=(".tif",), metadata_format=None)
+    intent = RunIntent(
+        source_spec=source, poni_file=str(poni),
+        save_path=str(tmp_path / "processed"), output_mode="Overwrite",
+        live_mode=True, max_cores=1,
+        bai_1d_args={"npt": 8}, bai_2d_args={"npt_rad": 8, "npt_azim": 4},
     )
+    request_id = RequestId(1122)
+    capture = StartCapture(request_id, 1, RunIntentStore(intent).snapshot(),
+                           SourceCapture(request_id, 1, source))
+    executor = StandardRunExecutor(join_timeout=2.0)
+    receipt = _wait_for_admission(executor, capture)
     attempts = []
     processed = []
     real_materialize = executor_module.materialize_live_directory_group
@@ -537,24 +549,12 @@ def test_live_pending_identity_revalidates_before_equal_candidate_skip(
             attempts.append(attempt)
         return attempt
 
-    def construct(run, *, item, labels, decision):
-        _add_display_artifact(run, item)
-        run.artifact = item.target
-        run.current_total = item.source_stamp.frame_count
-        run.current_completed = run.current_total - len(labels)
-        run.current_published = run.current_completed
-        processed.append(item.source_path)
-        return run
+    real_construct = executor._construct
 
-    def execute_current(run, *, construct=False):
-        assert construct is False
-        added = run.current_total - run.current_completed
-        run.completed += added
-        run.current_completed += added
-        run.current_published += added
-        if run.artifact not in run.artifacts:
-            run.artifacts.append(run.artifact)
-        return False
+    def construct(run, *, item, labels, decision):
+        result = real_construct(run, item=item, labels=labels, decision=decision)
+        processed.append(item.source_path)
+        return result
 
     monkeypatch.setattr(
         executor_module,
@@ -562,7 +562,6 @@ def test_live_pending_identity_revalidates_before_equal_candidate_skip(
         capture_attempt,
     )
     monkeypatch.setattr(executor, "_construct", construct)
-    monkeypatch.setattr(executor, "_execute_current", execute_current)
     configuration = intent.freeze()
     identity = RunIdentity.from_configuration(configuration)
     assert type(executor.start(
@@ -577,17 +576,26 @@ def test_live_pending_identity_revalidates_before_equal_candidate_skip(
             time.sleep(0.01)
         original = executor.processed_live_revisions(identity)
         assert len(original) == 1
+        from xrd_tools.io.frame_view import FrameViewReader
+        initial_target = original[0].decision.item.target
+        with FrameViewReader(initial_target, resolve_source=False) as reader:
+            initial = reader.read(1)
 
         replacement = raw / "replacement.tif"
         replacement.symlink_to(hardlink)
         replacement.replace(selected)
         deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and not executor.deferred_live_revisions(identity):
+        events = []
+        while time.monotonic() < deadline:
+            events.extend(executor.drain_events())
+            if len(attempts) >= 2 and (
+                len(processed) > 1 or any(event.kind is StandardEventKind.FAILED
+                                          for event in events)
+            ):
+                break
             time.sleep(0.01)
-        deferred = executor.deferred_live_revisions(identity)
-        assert len(deferred) == 1
         assert len(attempts) >= 2
-        first, revised = original[0], deferred[0]
+        first, revised = original[0], attempts[-1]
         assert first.group.revision == revised.group.revision
         assert first.decision is not None and revised.decision is not None
         assert first.decision.item.source_stamp == revised.decision.item.source_stamp
@@ -595,11 +603,20 @@ def test_live_pending_identity_revalidates_before_equal_candidate_skip(
             first.decision.item.source_stamp.execution_identity_v1
             != revised.decision.item.source_stamp.execution_identity_v1
         )
+        failed = [event for event in events if event.kind is StandardEventKind.FAILED]
+        assert len(failed) == 1
+        assert failed[0].primary.type_qualname == "ValueError"
+        assert failed[0].primary.message == "same target cannot change its exact output lineage"
         assert processed == [selected]
+        assert executor.processed_live_revisions(identity) == original
     finally:
         executor.stop(identity)
         closed = executor.close(identity)
     assert closed.cleanup_status is CleanupStatus.CLEANED
+    with FrameViewReader(initial_target, resolve_source=False) as reader:
+        preserved = reader.read(1)
+    np.testing.assert_array_equal(preserved.intensity_1d, initial.intensity_1d)
+    np.testing.assert_array_equal(preserved.intensity_2d, initial.intensity_2d)
 
 
 @pytest.mark.parametrize("dependency_kind", ("external_link", "vds", "external_storage"))
@@ -1027,6 +1044,7 @@ def test_preopen_validation_consumes_run_stop_before_reader_construction(
         stop_requested=True,
         source=None,
         scan=None,
+        output=None,
     )
     callbacks = []
 
@@ -1173,28 +1191,24 @@ def test_raw_frame_path_keeps_legacy_snapshot_and_provenance_shape(
     assert alias_identity["schema_version"] == 1
     assert "execution_identity_v1" not in legacy
 
+    writer_snapshots = source_graph.source_snapshots_projection(item.graph, writer=True)
     sink = NexusSink(
         tmp_path / "unused.nexus",
         source_execution_provenance=legacy,
-        source_snapshots_provenance=snapshots,
+        source_snapshots_provenance=writer_snapshots,
     )
-    captured: dict[str, object] = {}
-    import xrd_tools.io.nexus_record as nexus_record
-
-    monkeypatch.setattr(nexus_record, "ensure_frames_container", lambda _entry: object())
-
-    def capture_record(_container, _name, **kwargs):
-        captured.update(kwargs)
-
-    monkeypatch.setattr(nexus_record, "write_frame_record", capture_record)
-    sink._h5 = {"entry": object()}
     frame = ScanFrame(0, source_path=alias, source_frame_index=0)
-    sink._write_frame_record(
+    record = sink._write_frame_record(
         frame,
         FrameReduction(0),
-        prepared=(None, False),
+        result_1d=None,
+        result_2d=None,
+        mode_1d="default",
+        mode_2d="default",
     )
-    assert captured["source_snapshot"] == snapshots[raw_key]
+    assert record.source_snapshot == writer_snapshots[raw_key]
+    assert str(record.source_path) == raw_key
+    assert record.source_frame_index == 0
 
 
 def _p36_tiff_graph(root: Path, *, conflict: bool = False):
@@ -1374,10 +1388,12 @@ def test_average_lineage_and_provenance_match_exact_ordinary_projections(
     prepared = __import__("xrd_tools.sources.execution_graph", fromlist=["x"]).qualify_source_execution_graph(
         graph.execution_source, reader_binding="average_closed_v1",
     )
-    captured = {}; real_sink = average_module.NexusSink
-    def sink(*args, **kwargs):
-        captured.update(kwargs); return real_sink(*args, **kwargs)
-    monkeypatch.setattr(average_module, "NexusSink", sink)
+    captured = {}
+    real_sink = average_module.NexusSink.for_finite_document
+    def sink(cls, *args, **kwargs):
+        captured.update(kwargs)
+        return real_sink(*args, **kwargs)
+    monkeypatch.setattr(average_module.NexusSink, "for_finite_document", classmethod(sink))
     monkeypatch.setattr(reduction_core, "integrate_1d", lambda _image, _ai, *, npt, **_k:
         IntegrationResult1D(np.arange(npt, dtype=float), np.ones(npt), None, "q_A^-1"))
     runner = average_module.AverageScanRunner(AverageScanRecipe(
@@ -1386,16 +1402,20 @@ def test_average_lineage_and_provenance_match_exact_ordinary_projections(
         numeric_metadata_keys=("I0",),
     ))
     result = runner.start()
-    assert type(result) is average_module.AverageScanResult
+    deadline = time.monotonic() + 10.0
+    while type(result) is average_module.AverageScanPending and time.monotonic() < deadline:
+        result = runner.command(average_module.AverageCommand.RETRY, result)
+        time.sleep(0.01)
+    assert type(result) is average_module.AverageScanResult, result
     assert runner.close() is result
-    assert result.disposition == "COMMITTED"
+    assert result.disposition == "COMMITTED", result
     expected_execution = source_execution_projection(prepared)
     expected_snapshots = source_snapshots_projection(prepared, writer=True)
     expected_append = append_source_from_execution_graph(prepared, generation=1)
     ordinary_intent = AppendIntent("entry", "",
-        science_fingerprint(stable_lineage_projection(prepared, target=target)),
+        science_fingerprint(stable_lineage_projection(prepared, target=result.target)),
         result.science_identity, ("1d:default",), expected_append, (1,))
     assert captured["source_execution_provenance"] == expected_execution
     assert captured["source_snapshots_provenance"] == expected_snapshots
-    assert captured["same_run_intent"] == ordinary_intent
-    assert read_provenance(target)["config"]["source_execution"] == expected_execution
+    assert captured["lineage_intent"] == ordinary_intent
+    assert read_provenance(result.target)["config"]["source_execution"] == expected_execution

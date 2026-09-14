@@ -41,6 +41,8 @@ from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.io import read_frame_record, read_frame_view
 from xrd_tools.io.nexus import write_integrated_stack
 from xrd_tools.io.nexus_record import ensure_frames_container, stamp_source_base, write_frame_record
+from xrd_tools.io.frame_view import FrameScalarCatalog, FrameScalarRow
+from xrd_tools.reduction import prepare_reintegrate_bundle
 from xrd_tools.session import (
     Light1DBufferLayout, Light1DLayout, Light1DModeData, Light1DModeLayout,
     Light1DRecord, SessionResourceAuthority, acquire_light_1d_retention,
@@ -48,6 +50,7 @@ from xrd_tools.session import (
 from xrd_tools.session.hydration import HydrationCompletion, HydrationOutcome
 
 from tests.xdart.scattering import test_p2c_common_viewer_mount as p2c
+from tests.core.v2_fixture_factory import current_entry
 
 
 @pytest.fixture(autouse=True)
@@ -191,7 +194,15 @@ def _browse_three(mount):
         context.record_store.upsert(record, source_identity=source, persisted=True)
         context.publication_store.upsert(FramePublication(
             view, record=record, source_identity=source, scan_key=context.scan_key))
-        context.frame_ids.append(label)
+    catalog = FrameScalarCatalog(request.source_path, "entry", tuple(
+        FrameScalarRow(label) for label in (1, 2, 3)))
+    context = replace(
+        context, frame_ids=catalog.labels, loaded_labels=catalog.labels,
+        scalar_catalog=catalog, loaded=False,
+        prepared_reintegrate_offer=prepare_reintegrate_bundle(
+            None, entry=catalog.entry, labels=catalog.labels),
+    )
+    context.mark_loaded()
     mount.loader.complete(context)
     assert mount.controller.poll_browse() is not None
     return context
@@ -210,19 +221,28 @@ def _science(controller, mode):
 def _mode_fingerprint(controller, frames):
     current = controller.navigation.current
     result = []
-    for mode in ("Single", "Overlay", "Waterfall"):
-        selected = (current,) if mode == "Single" else frames
-        assert controller.select_navigation(current, selected)
-        scientific = _science(controller, mode)
-        assert scientific.plot_mode == mode
-        assert len(scientific.traces) == (1 if mode == "Single" else len(frames))
-        if mode != "Single":
-            assert controller.commit_navigation_projection(
-                tuple(trace.frame for trace in scientific.traces))
-        result.append((mode, scientific.title, tuple(
-            (trace.frame, trace.axis.label, trace.axis.unit,
-             tuple(trace.axis.values), tuple(trace.intensity))
-            for trace in scientific.traces)))
+    view = ScientificView()
+    try:
+        for mode in ("Single", "Overlay", "Waterfall"):
+            selected = (current,) if mode == "Single" else frames
+            assert controller.select_navigation(current, selected)
+            scientific = _science(controller, mode)
+            assert scientific.plot_mode == mode
+            view.reconcile(scientific, controller.navigation,
+                           completed=len(frames), total=len(frames), detail="")
+            traces = view.trace_history_projections
+            assert len(traces) == (1 if mode == "Single" else len(frames))
+            assert tuple(trace.frame for trace in traces) == selected
+            if mode != "Single":
+                assert controller.commit_navigation_projection(view.trace_history_keys)
+            result.append((mode, scientific.title, tuple(
+                (trace.frame, trace.axis.label, trace.axis.unit,
+                 tuple(trace.axis.values), tuple(trace.intensity))
+                for trace in traces)))
+    finally:
+        assert view.clear_workspace()
+        view.close()
+        view.deleteLater()
     return tuple(result)
 
 
@@ -239,7 +259,7 @@ def _write_result(root, labels):
                               np.arange(6.0).reshape(3, 2) + label,
                               unit="q_A^-1", azimuthal_unit="chi_deg") for label in labels]
     with h5py.File(processed, "w") as handle:
-        entry = handle.create_group("entry")
+        entry = current_entry(handle)
         write_integrated_stack(entry, frame_indices=labels, results_1d=one, results_2d=two)
         base = stamp_source_base(entry, root)
         frames = ensure_frames_container(entry)
@@ -516,7 +536,8 @@ def test_replacement_race_and_cleanup_failure_retry_to_one_owner(monkeypatch, tm
     controller, loader, acquisition, browse, processed, identity = _cold_browse(
         tmp_path / "race", acquisition=True)
     key = _select_label(controller, 2)
-    assert browse.publication_store.discard(2)
+    # Catalog-first Browse has not hydrated this non-current frame yet.
+    assert browse.publication_store.get(2) is None
     owner = controller._browse_hydration_owner
     entered, release = threading.Event(), threading.Event()
     original_read = transport_module.read_frame_preview

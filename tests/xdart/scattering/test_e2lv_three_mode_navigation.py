@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event
 import time
 
 import fabio
@@ -16,11 +15,13 @@ from tests.xdart.scattering._e2sd_support import (
     write_motor_container,
     write_poni,
 )
+from tests.xdart.scattering.test_p1b_output_graph import _write_eiger
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.shell_values import (
+    DirectoryFileProgress,
     ShellCommand,
     ShellCommandKind,
 )
@@ -80,7 +81,11 @@ def _run_page(
     shell.run_controls.startButton.click()
     _wait(
         qapp,
-        lambda: lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED},
+        lambda: lifecycle.phase is RunPhase.FAILED or (
+            lifecycle.phase is RunPhase.IDLE
+            and executor._active is not None
+            and executor._active.closed
+        ),
         page=page,
         lifecycle=lifecycle,
     )
@@ -91,7 +96,35 @@ def _run_page(
         f"progress={page._progress.detail!r}; "
         f"primary={None if active is None else active.primary!r}"
     )
+    _select_terminal_acquisition(qapp, page, lifecycle, executor)
     return qapp, page, lifecycle, executor
+
+
+def _select_terminal_acquisition(qapp, page, lifecycle, executor) -> None:
+    """Finish the real terminal Browse handoff, then select run history."""
+    shell, controller = lv_support._mounted(page)
+    # A clean Run hands its final artifact to Browse asynchronously. Let that
+    # real handoff settle, then explicitly inspect the retained acquisition
+    # whose cross-artifact navigation these tests exercise.
+    _wait(
+        qapp,
+        lambda: controller.browse_context is not None and (
+            controller.capture_loaded_browse(
+                controller.browse_context.load_request,
+            ) is not None
+        ),
+        page=page,
+        lifecycle=lifecycle,
+    )
+    controller.select_acquisition()
+    catalog = executor.frame_catalog(controller.run_identity)
+    assert catalog is not None and catalog.entries
+    last = catalog.entries[-1]
+    page._handle_shell_command(ShellCommand(
+        ShellCommandKind.SELECT_FRAME, frame=last, frames=(last,),
+    ))
+    _wait(qapp, lambda: shell.scientific.frame_selector.currentData() is last,
+          page=page, lifecycle=lifecycle)
 
 
 def test_multi_output_gi_repeated_labels_keep_distinct_catalog_entries(
@@ -145,8 +178,8 @@ def test_multi_output_gi_repeated_labels_keep_distinct_catalog_entries(
             for index in range(selector.count())
         ) == catalog.entries[1:]
         assert shell.scientific.progress.text() == "1/1"
-        # Container members are presented one-based (source_frame_index + 1)
-        # while the catalog key keeps its 0-based local_frame_label.
+        # The footer presents a one-based member number while the exact
+        # zero-based container label remains in the catalog key.
         assert shell.scientific.status.text() == "second.nxs · frame 1"
         assert shell.scientific.title.text() == "second.nxs · frame 1"
 
@@ -165,17 +198,15 @@ def test_multi_output_gi_repeated_labels_keep_distinct_catalog_entries(
         assert selector.count() == 1
         assert selector.itemData(0) is first
         assert shell.scientific.progress.text() == "1/1"
-        assert shell.run_controls.readinessLabel.full_text() == (
-            "Complete · 2 processed · 0 skipped · 0 pending · "
-            "2 discovered"
-        )
+        assert page._progress.directory_files == DirectoryFileProgress(2, 0, 0, 2)
+        assert shell.run_controls.readinessLabel.full_text().startswith("Complete · 2 Frames · ")
     finally:
         page.close_workspace()
         page.deleteLater()
         qapp.processEvents()
 
 
-def test_directory_grouped_image_footer_is_current_series_and_strip_counts_files(
+def test_directory_grouped_image_footer_is_current_series_and_progress_counts_files(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -211,8 +242,9 @@ def test_directory_grouped_image_footer_is_current_series_and_strip_counts_files
     executor = StandardRunExecutor(max_display_items=2)
     projection_entered = Event()
     release_projection = Event()
-    release_errors: list[str] = []
+    terminal_before_projection = []
     original_projection = executor._frame_ready_owned
+    original_finish_projection = executor._finish_display_projection
 
     def delayed_first_projection(run, event, image, session) -> None:
         if not projection_entered.is_set():
@@ -225,29 +257,24 @@ def test_directory_grouped_image_footer_is_current_series_and_strip_counts_files
         executor, "_frame_ready_owned", delayed_first_projection
     )
 
-    def release_after_session_detach() -> None:
-        if not projection_entered.wait(20.0):
-            release_errors.append("projection did not start")
-            release_projection.set()
-            return
-        deadline = time.monotonic() + 20.0
-        while time.monotonic() < deadline:
-            active = executor._active
-            if active is not None and active.session is None:
+    def drain_after_writer_finish(run) -> None:
+        if not release_projection.is_set():
+            try:
+                assert projection_entered.wait(20.0)
+                # Writer settlement precedes display drain. The session is
+                # retained until these queued publications have been drained.
+                assert run.session is not None
+                terminal_before_projection.append(run.session.terminal_result)
+            finally:
                 release_projection.set()
-                return
-            time.sleep(0.001)
-        release_errors.append("session did not detach before projection")
-        release_projection.set()
+        original_finish_projection(run)
 
-    releaser = Thread(target=release_after_session_detach, daemon=True)
-    releaser.start()
+    monkeypatch.setattr(executor, "_finish_display_projection", drain_after_writer_finish)
     qapp, page, lifecycle, executor = _run_page(
         intent, executor=executor
     )
-    releaser.join(timeout=1.0)
-    assert not releaser.is_alive()
-    assert release_errors == []
+    assert len(terminal_before_projection) == 1
+    assert terminal_before_projection[0].commit_identity is not None
     shell, controller = lv_support._mounted(page)
     try:
         identity = controller.run_identity
@@ -262,10 +289,8 @@ def test_directory_grouped_image_footer_is_current_series_and_strip_counts_files
         assert selector.count() == 3
         assert shell.scientific.progress.text() == "3/3"
         assert shell.scientific.status.text() == "beta_0003.edf"
-        assert shell.run_controls.readinessLabel.full_text() == (
-            "Complete · 7 processed · 1 skipped · 0 pending · "
-            "8 discovered"
-        )
+        assert page._progress.directory_files == DirectoryFileProgress(7, 1, 0, 8)
+        assert shell.run_controls.readinessLabel.full_text().startswith("Complete · 7 Frames · ")
 
         first = catalog.entries[0]
         page._handle_shell_command(ShellCommand(
@@ -293,7 +318,6 @@ def test_directory_grouped_image_footer_is_current_series_and_strip_counts_files
 def test_eiger_outputs_with_repeated_local_labels_remain_navigable(
     tmp_path: Path,
 ) -> None:
-    root = Path(os.environ["XDART_TEST_DATA"]) / "eiger"
     raw = tmp_path / "raw"
     raw.mkdir()
     stems = (
@@ -301,15 +325,13 @@ def test_eiger_outputs_with_repeated_local_labels_remain_navigable(
         "Eiger_NbN_2_thin_test__200mdeg_scan001",
     )
     for stem in stems:
-        for suffix in ("_master.h5", "_data_000001.h5"):
-            (raw / f"{stem}{suffix}").symlink_to(root / f"{stem}{suffix}")
-    poni = Path(os.environ["XDART_TEST_DATA"]) / "eiger" / (
-        "LaB6_detxn26_detyn6p5_eta3.poni"
-    )
+        _write_eiger(raw / f"{stem}_master.h5", raw / f"{stem}_data_000001.h5", 5)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
     intent = RunIntent(
         source_spec=DirectorySourceSpec(raw, suffixes=(".h5",)),
         poni_file=str(poni),
-        project_root=str(root),
+        project_root=str(tmp_path),
         save_path=str(tmp_path / "processed"),
         output_mode="Overwrite",
         max_cores=1,
@@ -371,10 +393,8 @@ def test_eiger_outputs_with_repeated_local_labels_remain_navigable(
             for index in range(selector.count())
         ) == catalog.entries[:5]
         assert shell.scientific.progress.text() == "1/5"
-        assert shell.run_controls.readinessLabel.full_text() == (
-            "Complete · 4 processed · 0 skipped · 0 pending · "
-            "4 discovered"
-        )
+        assert page._progress.directory_files == DirectoryFileProgress(4, 0, 0, 4)
+        assert shell.run_controls.readinessLabel.full_text().startswith("Complete · 10 Frames · ")
         assert shell.scientific.raw.image.image is not None
         assert shell.scientific.cake.image.image is not None
     finally:

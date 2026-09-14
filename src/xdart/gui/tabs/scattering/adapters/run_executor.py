@@ -479,6 +479,9 @@ class _StandardRun:
     display_projection_queue: Queue[object] | None = None
     display_projection_worker: Thread | None = None
     display_projection_errors: list[BaseException] = field(default_factory=list)
+    # Set once a recorded projection error has failed this artifact's display
+    # channel; durable acknowledgements stop counting as publications then.
+    display_projection_failed: bool = False
     light_projection_error: BaseException | None = None
     light_projection_error_lock: Lock = field(default_factory=Lock)
     gui_thread_id: int = field(default_factory=get_ident)
@@ -1095,6 +1098,9 @@ class StandardRunExecutor:
             run.session, run.sink, run.output, run.source, run.resources,
         )) and not getattr(run.display, 'light_1d_cleanup_unresolved', lambda: False)():
             run.cleanup_status = CleanupStatus.CLEANED
+            # The worker and display are now retired. Do not keep its closed
+            # source alive through AcquisitionContext's scan frame loaders.
+            run.context_runtime = None
         return self._receipt(run)
 
     def drain_events(self) -> tuple[StandardRunEvent, ...]:
@@ -1116,6 +1122,7 @@ class StandardRunExecutor:
         pending: Queue[object] = Queue(maxsize=_DISPLAY_PROJECTION_FRAMES)
         run.display_projection_queue = pending
         run.display_projection_errors.clear()
+        run.display_projection_failed = False
 
         def project_pending() -> None:
             while True:
@@ -1288,6 +1295,8 @@ class StandardRunExecutor:
                     pending.task_done()
         run.display_projection_queue = None
         run.display_projection_worker = None
+        if run.display_projection_errors:
+            run.display_projection_failed = True
         run.display_projection_errors.clear()
         return True
 
@@ -1307,6 +1316,7 @@ class StandardRunExecutor:
         run.display_projection_queue = None
         run.display_projection_worker = None
         if run.display_projection_errors:
+            run.display_projection_failed = True
             raise run.display_projection_errors[0]
 
     def frame_catalog(
@@ -2353,9 +2363,13 @@ class StandardRunExecutor:
                     run.current_total,
                     run.current_completed + len(new_labels),
                 )
-                run.current_published = max(
-                    run.current_published, run.current_completed,
-                )
+                # Durable rows may outlive a failed display callback. Their
+                # acknowledgement proves a navigation publication only while
+                # this artifact's display projection channel is intact.
+                if not run.display_projection_failed:
+                    run.current_published = max(
+                        run.current_published, run.current_completed,
+                    )
             if new_labels and path not in run.artifacts:
                 run.artifacts.append(path)
         output.project_new_durable(apply)

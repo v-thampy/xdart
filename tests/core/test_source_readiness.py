@@ -456,14 +456,12 @@ def test_source_readiness_processed_scan_denial_is_typed_not_escaped(
         tmp_path, monkeypatch):
     """A sharing denial must not escape while the observation formats its
     subject or enumerates a real ProcessedScan."""
-    import h5py
-
+    from tests.core._processed_fixture import write_recognized_result
     import xrd_tools.io.read as read_module
     from xrd_tools.sources.readiness import observe_source_readiness
 
-    record = tmp_path / "scan.nxs"
-    with h5py.File(record, "w") as handle:
-        handle.create_group("entry")
+    record = tmp_path / "scan.nexus"
+    write_recognized_result(record)
 
     def denied(*args, **kwargs):
         raise PermissionError("writer still owns the record")

@@ -77,6 +77,7 @@ from xrd_tools.io.finite_artifact import (
     finite_lineage_hdf_path,
     write_finite_artifact_lineage,
 )
+from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.io.processed_scan_id import (
     require_current_output_path,
     require_current_writable_processed_groups,
@@ -1591,31 +1592,32 @@ def _require_replacement_manifest_source(
         raise ReplacementManifestTargetChanged(
             "replacement manifest document identity is unavailable"
         ) from error
+    # The ctime slot rides the win32 seam: the descriptor view and the
+    # named view of one file disagree on it there.
     expected_state = (
         source_snapshot.device,
         source_snapshot.inode,
         source_snapshot.mode,
         source_snapshot.size,
         source_snapshot.mtime_ns,
-        source_snapshot.ctime_ns,
+        identity_ctime_ns(source_snapshot.ctime_ns),
     )
+
+    def _identity(value: os.stat_result) -> tuple[int, ...]:
+        return (
+            int(value.st_dev),
+            int(value.st_ino),
+            int(value.st_mode),
+            int(value.st_size),
+            int(value.st_mtime_ns),
+            identity_ctime_ns(value.st_ctime_ns),
+        )
+
     if (
         type(descriptor) is not int
         or shown != os.path.normcase(os.path.abspath(source_snapshot.path))
-        or tuple(
-            int(getattr(observed, name))
-            for name in (
-                "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns",
-                "st_ctime_ns",
-            )
-        ) != expected_state
-        or tuple(
-            int(getattr(named, name))
-            for name in (
-                "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns",
-                "st_ctime_ns",
-            )
-        ) != expected_state
+        or _identity(observed) != expected_state
+        or _identity(named) != expected_state
     ):
         raise ReplacementManifestTargetChanged(
             "replacement manifest document differs from its source snapshot"
@@ -2189,7 +2191,7 @@ class NexusRecordWriter:
         self._since_flush = 0
         self._vector = {name: 0 for name in _VECTOR_FIELDS}
         self._pending_owner: str | None = None
-        self._finish_step = 0
+        self._finish_step = -1
         self._finalization = WriterFinalization()
         self._fresh = False
         self._dirty_modes: dict[tuple[str, int], _ExpectedModeRow] = {}
@@ -6214,6 +6216,11 @@ class NexusRecordWriter:
     def append_decision(self) -> AppendDecision | None:
         return self._append_decision
 
+    @property
+    def finalization_started(self) -> bool:
+        """Whether finish has taken custody of the frozen terminal steps."""
+        return self._finish_step >= 0
+
     def _replace_target(self) -> None:
         if self._active_path == self.target:
             return
@@ -6247,6 +6254,9 @@ class NexusRecordWriter:
             self._finish_step = 0
         elif finalization is not None and finalization != self._finalization:
             raise WriterStateError("retry must use the frozen finalization values")
+        # PARTIAL can also come from an ordinary flush. Its first finish still
+        # starts at the first terminal step; later retries retain their cursor.
+        self._finish_step = max(0, self._finish_step)
         def checkpoint(*, publish_receipts=True):
             counts = self._finalization.average_finite_counts
             verified = (

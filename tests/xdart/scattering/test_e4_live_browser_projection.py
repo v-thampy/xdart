@@ -87,6 +87,32 @@ def _one_frame_dynamic_admission(tmp_path):
     ), item, decision
 
 
+def test_config_menu_introspection_preserves_raw_resolution_actions():
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    browser = BrowserView()
+    try:
+        button = browser.findChild(QtWidgets.QToolButton, "configMenuButton")
+        heavy = next(
+            action.menu() for action in button.menu().actions()
+            if action.menu() is not None
+            and action.menu().title().startswith("Heavy residency")
+        )
+        assert heavy is browser._heavy_residency_menu
+        assert browser._detector_menu.title() == "Raw image resolution"
+        assert [action.text() for action in browser._detector_menu.actions()] == [
+            "Thumbnail", "Full Raw",
+        ]
+        commands = []
+        browser.commandRequested.connect(commands.append)
+        browser._detector_actions["full"].trigger()
+        assert commands[-1] == ShellCommand(
+            ShellCommandKind.SET_DETECTOR_MODE, "full"
+        )
+    finally:
+        browser.deleteLater()
+        app.processEvents()
+
+
 def test_heavy_residency_menu_is_exclusive_and_edits_only_next_intent():
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     intents = RunIntentStore(RunIntent())

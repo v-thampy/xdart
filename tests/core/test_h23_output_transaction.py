@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import FrozenInstanceError, replace
+import errno
 import hashlib
 import importlib
 import os
@@ -218,12 +219,14 @@ class _TerminalInterruption(BaseException):
 def _executing_stream(
     tmp_path: Path,
     *,
+    prior: bytes | None = b"prior",
     durable_fsync: bool = True,
     fast_regenerable: bool = False,
     content: bytes = b"AAAA",
 ):
     prepared = _prepared(
         tmp_path,
+        prior=prior,
         durable_fsync=durable_fsync,
         fast_regenerable=fast_regenerable,
     )
@@ -563,6 +566,689 @@ def test_stream_terminal_refuses_same_length_mutation_between_receipts(
     assert transaction._stream_terminal_stat is prior_stat
     with pytest.raises(api.TransactionStateError, match="integrity hold"):
         transaction.commit_stream(attempt, lease=lease)
+
+
+class _CreationTimeStat:
+    """The Windows shape: a pathname stat whose ctime is the creation time."""
+
+    def __init__(self, real, ctime_ns: int) -> None:
+        self._real = real
+        self.st_ctime_ns = ctime_ns
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+
+def _ctime_seam():
+    """The tree-wide win32 ctime seam every identity compare routes through."""
+    return importlib.import_module("xrd_tools.io.stat_identity")
+
+
+def _pathname_stat_reports_creation_time(api, monkeypatch, target: Path):
+    """Make every pathname ``os.stat`` of ``target`` disagree with ``fstat``
+    on ``st_ctime_ns`` only (374 ms earlier, the gap observed on the
+    windows-latest runner), the way CPython on NTFS does."""
+    real_stat = api.os.stat
+    resolved = os.path.realpath(target)
+
+    def creation_time_stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if os.path.realpath(path) == resolved:
+            return _CreationTimeStat(result, result.st_ctime_ns - 374_000_000)
+        return result
+
+    monkeypatch.setattr(api.os, "stat", creation_time_stat)
+
+
+def test_windows_pathname_ctime_disagreement_refuses_every_seal_when_ctime_is_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", True)
+    _pathname_stat_reports_creation_time(api, monkeypatch, target)
+    descriptor = os.open(target, os.O_RDONLY)
+    try:
+        with pytest.raises(
+            api.TargetChanged, match=r"identity changed during seal.*named=\(",
+        ):
+            transaction.seal_stream_checkpoint(
+                attempt,
+                lease=lease,
+                descriptor=descriptor,
+                evidence_digest=hashlib.sha256(b"row").hexdigest(),
+                evidence_bytes=3,
+            )
+    finally:
+        os.close(descriptor)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
+def test_win32_identity_ignores_ctime_and_still_seals_promotes_and_revalidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", False)
+    _pathname_stat_reports_creation_time(api, monkeypatch, target)
+    descriptor = os.open(target, os.O_RDONLY)
+    try:
+        checkpoint = transaction.seal_stream_checkpoint(
+            attempt,
+            lease=lease,
+            descriptor=descriptor,
+            evidence_digest=hashlib.sha256(b"row").hexdigest(),
+            evidence_bytes=3,
+        )
+        handle_ctime_ns = os.fstat(descriptor).st_ctime_ns
+    finally:
+        os.close(descriptor)
+    # The pathname view really disagrees; only the identity slot is neutral.
+    assert api.os.stat(target).st_ctime_ns == handle_ctime_ns - 374_000_000
+    assert checkpoint.ctime_ns == handle_ctime_ns
+    transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    terminal = transaction.seal_stream_terminal(attempt, lease=lease)
+    assert terminal.ctime_ns == handle_ctime_ns
+    assert api.stream_terminal_object_revision(terminal)[4] == handle_ctime_ns
+    assert api.revalidate_stream_terminal(target, terminal).digest == (
+        hashlib.sha256(b"AAAA").hexdigest()
+    )
+    assert api._stream_stat_matches(target, transaction._stream_checkpoint)
+
+
+def _rewrite_keeping_size_and_mtime(target: Path, payload: bytes) -> os.stat_result:
+    """Rewrite *target* in place with a same-length *payload* and restore its
+    mtime: the mutation only the descriptor's change time still reveals.
+    Returns the descriptor view after the rewrite."""
+    before = os.stat(target)
+    assert len(payload) == before.st_size
+    target.write_bytes(payload)
+    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+    with target.open("rb") as handle:
+        after = os.fstat(handle.fileno())
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    return after
+
+
+def test_win32_identity_terminal_revalidation_refuses_a_same_size_same_mtime_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stat-only revalidator hands out the sealed digest without rereading
+    the bytes, so it must hold its DESCRIPTOR views to the sealed ctime even
+    where the pathname compare is neutral (Codex PR #1 review, F1)."""
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", False)
+    _pathname_stat_reports_creation_time(api, monkeypatch, target)
+    terminal = transaction.seal_stream_terminal(attempt, lease=lease)
+    assert api.revalidate_stream_terminal(target, terminal).digest == (
+        hashlib.sha256(b"AAAA").hexdigest()
+    )
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    # Precondition of the row: only the descriptor's change time moved.
+    assert after.st_ctime_ns != terminal.ctime_ns
+    with pytest.raises(api.TargetChanged, match="object changed before browse"):
+        api.revalidate_stream_terminal(target, terminal)
+
+
+def test_win32_identity_target_snapshot_revalidation_refuses_a_same_size_same_mtime_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _api()
+    target = tmp_path / "scan.nexus"
+    target.write_bytes(b"AAAA")
+    with target.open("rb") as handle:
+        handle_ctime_ns = os.fstat(handle.fileno()).st_ctime_ns
+    monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", False)
+    _pathname_stat_reports_creation_time(api, monkeypatch, target)
+    assert api.os.stat(target).st_ctime_ns == handle_ctime_ns - 374_000_000
+    snapshot = api.capture_target_snapshot(target)
+    # The snapshot records the descriptor's view, not the creation time ...
+    assert snapshot.ctime_ns == handle_ctime_ns
+    # ... so the untouched object revalidates under the Windows shape ...
+    assert api.revalidate_target_snapshot(target, snapshot) is snapshot
+    # ... and a rewrite the seamed pathname view cannot see is still refused.
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    assert after.st_ctime_ns != snapshot.ctime_ns
+    with pytest.raises(api.TargetChanged, match="changed since its content snapshot"):
+        api.revalidate_target_snapshot(target, snapshot)
+
+
+def _stat_shape(api, monkeypatch: pytest.MonkeyPatch, target: Path, shape: str) -> None:
+    """Put the seam and the pathname stat of *target* into *shape*: ``posix``
+    (ctime is identity, one ctime per file) or ``win32`` (ctime is neutral for
+    a pathname compare, and the pathname stat reports the creation time)."""
+    monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", shape == "posix")
+    if shape == "win32":
+        _pathname_stat_reports_creation_time(api, monkeypatch, target)
+
+
+def _rewrite_inside_the_hash(api, monkeypatch: pytest.MonkeyPatch, target: Path, payload: bytes):
+    """Make the module's own hash helper rewrite *target* in place (same size,
+    same mtime) before it hashes: the mutation lands between the two descriptor
+    views that bracket the read.  Returns the (opened ctime, rewritten ctime)
+    log so a row can assert the change time really moved."""
+    real_hash = api._sha256_handle
+    log: list[tuple[int, int]] = []
+
+    def rewrite_then_hash(handle):
+        opened_ctime_ns = os.fstat(handle.fileno()).st_ctime_ns
+        rewritten = _rewrite_keeping_size_and_mtime(target, payload)
+        log.append((opened_ctime_ns, rewritten.st_ctime_ns))
+        return real_hash(handle)
+
+    monkeypatch.setattr(api, "_sha256_handle", rewrite_then_hash)
+    return log
+
+
+@pytest.mark.parametrize("shape", ("posix", "win32"))
+def test_capture_refuses_a_same_size_same_mtime_rewrite_inside_the_hash_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    """``_capture_target`` brackets its hash with two descriptor views held to
+    each other exactly, ctime included: a rewrite that keeps size and mtime
+    inside that window is refused rather than digested torn, also where the
+    pathname compare is neutral (Codex PR #1 addendum, Fix 1 acceptance)."""
+    api = _api()
+    target = tmp_path / "scan.nexus"
+    target.write_bytes(b"AAAA")
+    _stat_shape(api, monkeypatch, target, shape)
+    real_hash = api._sha256_handle
+    log = _rewrite_inside_the_hash(api, monkeypatch, target, b"BBBB")
+    with pytest.raises(api.TargetChanged, match="mutated while fingerprinting"):
+        api.capture_target_snapshot(target)
+    # Precondition of the row: the rewrite happened inside the window and
+    # only the descriptor's change time moved.
+    [(opened_ctime_ns, rewritten_ctime_ns)] = log
+    assert rewritten_ctime_ns != opened_ctime_ns
+    # The now-quiet file still captures under either shape.
+    monkeypatch.setattr(api, "_sha256_handle", real_hash)
+    assert api.capture_target_snapshot(target).digest == hashlib.sha256(b"BBBB").hexdigest()
+
+
+@pytest.mark.parametrize("shape", ("posix", "win32"))
+def test_terminal_seal_refuses_a_same_size_same_mtime_rewrite_inside_the_hash_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    """The stream-terminal seal hashes between two descriptor views of the
+    target; those are held to each other exactly, ctime included."""
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, shape)
+    log = _rewrite_inside_the_hash(api, monkeypatch, target, b"BBBB")
+    with pytest.raises(api.TargetChanged, match="stream-terminal mutated while sealing descriptor"):
+        transaction.seal_stream_terminal(attempt, lease=lease)
+    [(opened_ctime_ns, rewritten_ctime_ns)] = log
+    assert rewritten_ctime_ns != opened_ctime_ns
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
+@pytest.mark.parametrize("carries_ctime", (True, False), ids=("posix", "win32"))
+def test_terminal_seal_keeps_the_hashed_revision_through_the_stat_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, carries_ctime: bool,
+) -> None:
+    prepared, attempt = _executing_stream(tmp_path)
+    api, target, _, transaction, _, _, _, lease = prepared
+    monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", carries_ctime)
+    original = api._descriptor_stream_stat_receipt
+    changes = []
+
+    def rewrite_after_hash(descriptor, path, **kwargs):
+        assert kwargs["role"] == "stream-terminal"
+        assert kwargs["evidence_digest"] == hashlib.sha256(b"AAAA").hexdigest()
+        before = os.fstat(descriptor)
+        after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+        assert api._descriptor_identity(before)[:4] == api._descriptor_identity(after)[:4]
+        assert before.st_ctime_ns != after.st_ctime_ns
+        changes.append(True)
+        return original(descriptor, path, **kwargs)
+
+    monkeypatch.setattr(api, "_descriptor_stream_stat_receipt", rewrite_after_hash)
+    with pytest.raises(api.TargetChanged, match="changed after semantic verification"):
+        transaction.seal_stream_terminal(attempt, lease=lease)
+    assert changes == [True]
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert transaction._stream_terminal_receipt is None
+
+
+def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", False)
+    real_stat = api.os.stat
+    resolved = os.path.realpath(target)
+
+    def shifted_mtime_stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if os.path.realpath(path) != resolved:
+            return result
+        shifted = _CreationTimeStat(result, result.st_ctime_ns)
+        shifted.st_mtime_ns = result.st_mtime_ns - 1
+        return shifted
+
+    monkeypatch.setattr(api.os, "stat", shifted_mtime_stat)
+    descriptor = os.open(target, os.O_RDONLY)
+    try:
+        with pytest.raises(api.TargetChanged, match="identity changed during seal"):
+            transaction.seal_stream_checkpoint(
+                attempt,
+                lease=lease,
+                descriptor=descriptor,
+                evidence_digest=hashlib.sha256(b"row").hexdigest(),
+                evidence_bytes=3,
+            )
+    finally:
+        os.close(descriptor)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
+# ---------------------------------------------------------------------------
+# Codex review of 0ed7a46c, F1: every reuse of a sealed receipt's digest
+# without rereading the bytes holds two DESCRIPTOR views to the recorded
+# revision exactly, ctime included.  A pathname stat alone is neutral on
+# ctime under the win32 seam and accepted a same-size same-mtime rewrite.
+# ---------------------------------------------------------------------------
+
+
+def _refuse_rehash(api, monkeypatch: pytest.MonkeyPatch, target: Path) -> None:
+    """Fail the row if the module hashes *target*'s object from here on
+    (its backup is still verified through a hash of its own)."""
+    real_hash = api._sha256_handle
+    sealed = os.stat(target)
+
+    def rehashed(handle):
+        observed = os.fstat(handle.fileno())
+        if (observed.st_dev, observed.st_ino) == (sealed.st_dev, sealed.st_ino):
+            raise AssertionError("the sealed digest was rehashed instead of held")
+        return real_hash(handle)
+
+    monkeypatch.setattr(api, "_sha256_handle", rehashed)
+
+
+def _sealed_checkpoint(api, transaction, attempt, lease, target: Path):
+    descriptor = os.open(target, os.O_RDONLY)
+    try:
+        return transaction.seal_stream_checkpoint(
+            attempt,
+            lease=lease,
+            descriptor=descriptor,
+            evidence_digest=hashlib.sha256(b"row").hexdigest(),
+            evidence_bytes=3,
+        )
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("boundary", ("final", "epoch"))
+def test_win32_identity_commit_refuses_a_same_size_same_mtime_rewrite_after_the_terminal_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    """The commit publishes the terminal seal's digest without rehashing, so
+    it holds the object to the seal's exact descriptor revision.  Under the
+    win32 shape 0ed7a46c compared a pathname stat, neutral on ctime, and
+    committed the stale digest over the rewritten bytes."""
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, "win32")
+    terminal = transaction.seal_stream_terminal(attempt, lease=lease)
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    assert after.st_ctime_ns != terminal.ctime_ns
+    _refuse_rehash(api, monkeypatch, target)
+    commit = (
+        transaction.commit_stream if boundary == "final"
+        else transaction.commit_stream_epoch
+    )
+    with pytest.raises(api.TargetChanged) as raised:
+        commit(attempt, lease=lease)
+    message = str(raised.value)
+    assert message.startswith("stream terminal seal changed before commit: ")
+    # Diagnosable from the refusal alone: the sealed revision and every view.
+    assert f"sealed={api.stream_terminal_object_revision(terminal)}" in message
+    assert "descriptor=(" in message and "named=(" in message
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert transaction._terminal_receipt is None
+    assert target.read_bytes() == b"BBBB"
+
+
+@pytest.mark.parametrize("shape", ("posix", "win32"))
+def test_untouched_terminal_still_commits_without_a_rehash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, shape)
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    _refuse_rehash(api, monkeypatch, target)
+    committed = transaction.commit_stream(attempt, lease=lease)
+    assert committed.phase is api.TransactionPhase.COMMITTED
+    assert transaction._terminal_receipt.observed.digest == (
+        hashlib.sha256(b"AAAA").hexdigest()
+    )
+
+
+def test_win32_identity_promotion_refuses_a_same_size_same_mtime_rewrite_after_the_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, "win32")
+    checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    assert after.st_ctime_ns != checkpoint.ctime_ns
+    _refuse_rehash(api, monkeypatch, target)
+    with pytest.raises(
+        api.TargetChanged,
+        match=r"checkpoint changed before promotion: .*sealed=\(.*named=\(",
+    ):
+        transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert transaction.snapshot().durable_floor is None
+
+
+def test_win32_identity_close_authorization_refuses_a_same_size_same_mtime_rewrite_after_the_floor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, "win32")
+    checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
+    transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    assert after.st_ctime_ns != checkpoint.ctime_ns
+    _refuse_rehash(api, monkeypatch, target)
+    with pytest.raises(
+        api.TargetChanged,
+        match=r"floor changed before the controlled close: .*sealed=\(",
+    ):
+        transaction.begin_stream_close(attempt, lease=lease)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
+def test_win32_identity_resolved_close_reuse_refuses_a_same_size_same_mtime_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, "win32")
+    checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
+    transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    owner = transaction.begin_stream_close(attempt, lease=lease)
+    resolved = transaction.seal_stream_close(attempt, owner, lease=lease)
+    assert transaction.seal_stream_close(attempt, owner, lease=lease) is resolved
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    assert after.st_ctime_ns != resolved.ctime_ns
+    _refuse_rehash(api, monkeypatch, target)
+    with pytest.raises(
+        api.TargetChanged,
+        match=r"resolved stream close changed before reuse: .*sealed=\(",
+    ):
+        transaction.seal_stream_close(attempt, owner, lease=lease)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
+def test_win32_identity_fast_terminal_refuses_a_same_size_same_mtime_rewrite_after_the_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fast-regenerable terminal seal reuses the checkpoint's evidence
+    digest without rehashing: its descriptor is held to the checkpoint's
+    exact revision, not to the seamed identity."""
+    # A fast-regenerable admission captures its prior without a digest, so
+    # a PRESERVE_BASE seed from a prior is refused; the row starts fresh.
+    (prepared, attempt) = _executing_stream(
+        tmp_path, prior=None, fast_regenerable=True,
+    )
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, "win32")
+    checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    assert after.st_ctime_ns != checkpoint.ctime_ns
+    _refuse_rehash(api, monkeypatch, target)
+    with pytest.raises(api.TargetChanged, match="lost its close checkpoint"):
+        transaction.seal_stream_terminal(attempt, lease=lease)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
+def test_win32_identity_durable_floor_abort_refuses_a_same_size_same_mtime_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    _stat_shape(api, monkeypatch, target, "win32")
+    checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
+    transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    assert after.st_ctime_ns != checkpoint.ctime_ns
+    with pytest.raises(
+        api.TargetChanged,
+        match=r"floor changed after its exact seal: .*sealed=\(",
+    ):
+        transaction.abort_stream(attempt, lease=lease)
+    snapshot = transaction.snapshot()
+    assert snapshot.phase is api.TransactionPhase.INTEGRITY_HOLD
+    assert snapshot.durable_floor is checkpoint
+    assert transaction.backup.read_bytes() == b"prior"
+
+
+def test_stream_revision_mismatch_names_a_vanished_pathname(tmp_path: Path) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    sealed = transaction._stream_terminal_stat
+    assert api._stream_revision_mismatch(target, sealed) is None
+    assert api._stream_stat_matches(target, sealed)
+    target.unlink()
+    mismatch = api._stream_revision_mismatch(target, sealed)
+    assert mismatch is not None and mismatch.endswith(
+        f"pathname disappeared (sealed={api._stream_receipt_revision(sealed)})"
+    )
+    assert not api._stream_stat_matches(target, sealed)
+
+
+def test_stream_revision_mismatch_names_an_unreadable_pathname(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read-only open refused for any reason but absence (a win32 sharing
+    violation, a directory in the file's place) is a diagnosable refusal
+    through the same channel, not an escaping ``OSError``."""
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    sealed = transaction._stream_terminal_stat
+    assert api._stream_revision_mismatch(target, sealed) is None
+    real_open = api.os.open
+
+    def sharing_violation(path, flags, *args, **kwargs):
+        if Path(path) == target:
+            raise PermissionError(errno.EACCES, "sharing violation", str(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(api.os, "open", sharing_violation)
+    mismatch = api._stream_revision_mismatch(target, sealed)
+    assert mismatch is not None
+    assert mismatch.startswith(f"{target}: unreadable for the revision check ")
+    assert "PermissionError: sharing violation" in mismatch
+    assert mismatch.endswith(f"sealed={api._stream_receipt_revision(sealed)}")
+
+
+def _fsync_refuses_read_only_descriptors(api, monkeypatch):
+    """Make ``os.fsync`` behave as on Windows, where ``_commit`` ->
+    ``FlushFileBuffers`` needs a handle with write access: a descriptor
+    opened read-only raises ``EBADF`` (``[Errno 9] Bad file descriptor``,
+    the windows-latest runner shape at ``seal_stream_terminal``).  Returns
+    the log of ``(inode, writable)`` flush attempts."""
+    fcntl = pytest.importorskip("fcntl")
+    real_fsync = api.os.fsync
+    flushed: list[tuple[int, bool]] = []
+
+    def windows_fsync(descriptor: int) -> None:
+        access = fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+        writable = access != os.O_RDONLY
+        flushed.append((os.fstat(descriptor).st_ino, writable))
+        if not writable:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(api, "_FSYNC_REQUIRES_WRITE_ACCESS", True)
+    monkeypatch.setattr(api.os, "fsync", windows_fsync)
+    return flushed
+
+
+def test_win32_read_only_seal_flushes_through_a_writable_reopen_of_the_exact_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    flushed = _fsync_refuses_read_only_descriptors(api, monkeypatch)
+    accepted = target.stat()
+    descriptor = os.open(target, os.O_RDONLY)
+    try:
+        checkpoint = transaction.seal_stream_checkpoint(
+            attempt,
+            lease=lease,
+            descriptor=descriptor,
+            evidence_digest=hashlib.sha256(b"row").hexdigest(),
+            evidence_bytes=3,
+        )
+    finally:
+        os.close(descriptor)
+    transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    terminal = transaction.seal_stream_terminal(attempt, lease=lease)
+
+    # Each durable flush of a read-only descriptor is refused once and then
+    # completed through a writable descriptor of the SAME inode; the reopen
+    # neither writes nor touches the target.
+    assert flushed == [
+        (accepted.st_ino, False),
+        (accepted.st_ino, True),
+    ] * 2
+    assert target.stat().st_mtime_ns == accepted.st_mtime_ns
+    assert terminal.size == 4
+    assert api.revalidate_stream_terminal(target, terminal).digest == (
+        hashlib.sha256(b"AAAA").hexdigest()
+    )
+    assert transaction.snapshot().phase is api.TransactionPhase.EXECUTING
+
+
+def test_win32_read_only_receipts_flush_through_a_writable_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _api()
+    target = tmp_path / "diagnostic.nexus"
+    target.write_bytes(b"semantic-content")
+    flushed = _fsync_refuses_read_only_descriptors(api, monkeypatch)
+    inode = target.stat().st_ino
+    descriptor = os.open(target, os.O_RDONLY)
+    try:
+        content = api._descriptor_content_receipt(
+            descriptor, target, "diagnostic-content", durable_fsync=True,
+        )
+        stream = api._descriptor_stream_stat_receipt(
+            descriptor,
+            target,
+            evidence_digest=content.snapshot.digest,
+            evidence_bytes=content.snapshot.size,
+            ordinal=1,
+            role="diagnostic-stream",
+            durable_fsync=True,
+        )
+    finally:
+        os.close(descriptor)
+    assert flushed == [(inode, False), (inode, True)] * 2
+    assert content.snapshot.digest == hashlib.sha256(
+        b"semantic-content"
+    ).hexdigest()
+    assert stream.evidence_bytes == len(b"semantic-content")
+
+
+def test_win32_read_only_seal_refuses_a_foreign_inode_at_the_writable_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    flushed = _fsync_refuses_read_only_descriptors(api, monkeypatch)
+    other = tmp_path / "other.nexus"
+    other.write_bytes(b"AAAA")
+    real_open = api.os.open
+    resolved = os.path.realpath(target)
+    foreign: list[int] = []
+
+    def reopen_names_another_file(path, flags, *args, **kwargs):
+        # The pathname is swapped between the read-only fstat and the
+        # writable reopen: the reopened descriptor names another inode.
+        if (flags & os.O_ACCMODE) == os.O_RDWR and (
+            os.path.realpath(path) == resolved
+        ):
+            foreign.append(real_open(other, flags, *args, **kwargs))
+            return foreign[-1]
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(api.os, "open", reopen_names_another_file)
+    with pytest.raises(api.TargetChanged, match="reopened a foreign inode"):
+        transaction.seal_stream_terminal(attempt, lease=lease)
+    # The foreign descriptor was never flushed and is closed.
+    assert flushed == [(target.stat().st_ino, False)]
+    assert len(foreign) == 1
+    with pytest.raises(OSError):
+        os.fstat(foreign[0])
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+
+
+@pytest.mark.parametrize(
+    ("requires_write_access", "error_number"),
+    [(False, errno.EBADF), (True, errno.EINVAL)],
+    ids=("posix-ebadf", "win32-other-errno"),
+)
+def test_flush_failure_never_reopens_unless_win32_refused_a_read_only_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_write_access: bool,
+    error_number: int,
+) -> None:
+    (prepared, attempt) = _executing_stream(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    real_open = api.os.open
+    writable_opens: list[str] = []
+
+    def failing_fsync(descriptor: int) -> None:
+        raise OSError(error_number, os.strerror(error_number))
+
+    def counting_open(path, flags, *args, **kwargs):
+        if (flags & os.O_ACCMODE) != os.O_RDONLY:
+            writable_opens.append(str(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(api, "_FSYNC_REQUIRES_WRITE_ACCESS", requires_write_access)
+    monkeypatch.setattr(api.os, "fsync", failing_fsync)
+    monkeypatch.setattr(api.os, "open", counting_open)
+    with pytest.raises(api.TargetChanged, match="content seal failed") as caught:
+        transaction.seal_stream_terminal(attempt, lease=lease)
+    assert isinstance(caught.value.__cause__, OSError)
+    assert caught.value.__cause__.errno == error_number
+    assert writable_opens == []
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
 
 
 def test_stream_terminal_constructor_failure_retains_prior_pair_and_holds(
@@ -2904,29 +3590,24 @@ def test_candidate_reservation_replacement_is_foreign_before_writer(
         _owners_by_role,
         lease,
     ) = _prepared(tmp_path, prior=prior)
-    real_close = api.os.close
+    real_receipt = api._descriptor_receipt
     reservation_identity: list[tuple[int, int]] = []
+    reservation_descriptors: list[int] = []
     writes: list[Path] = []
 
-    def replace_candidate_after_close(descriptor: int) -> None:
-        descriptor_stat = os.fstat(descriptor)
-        real_close(descriptor)
-        if transaction._candidate.exists() and not reservation_identity:
-            path_stat = transaction._candidate.stat()
-            if (path_stat.st_dev, path_stat.st_ino) == (
-                descriptor_stat.st_dev,
-                descriptor_stat.st_ino,
-            ):
-                reservation_identity.append(
-                    (descriptor_stat.st_dev, descriptor_stat.st_ino)
-                )
-                replacement = transaction._candidate.with_name(
-                    transaction._candidate.name + ".foreign"
-                )
-                replacement.write_bytes(foreign)
-                os.replace(replacement, transaction._candidate)
+    def replace_candidate_after_receipt(descriptor: int, path: Path, role: str):
+        receipt = real_receipt(descriptor, path, role)
+        if role == "candidate-reservation":
+            reservation_descriptors.append(descriptor)
+            reservation_identity.append((receipt.identity.device, receipt.identity.inode))
+            replacement = transaction._candidate.with_name(
+                transaction._candidate.name + ".foreign"
+            )
+            replacement.write_bytes(foreign)
+            os.replace(replacement, transaction._candidate)
+        return receipt
 
-    monkeypatch.setattr(api.os, "close", replace_candidate_after_close)
+    monkeypatch.setattr(api, "_descriptor_receipt", replace_candidate_after_receipt)
 
     with pytest.raises(api.OutputTransactionError):
         _execute(
@@ -2944,6 +3625,13 @@ def test_candidate_reservation_replacement_is_foreign_before_writer(
     assert target.read_bytes() == prior
     assert writes == []
     assert transaction.snapshot().phase is not api.TransactionPhase.COMMITTED
+    held = os.fstat(reservation_descriptors[0])
+    assert (held.st_dev, held.st_ino) == reservation_identity[0]
+    transaction._candidate.unlink()
+    recovered = transaction.retry_cleanup(transaction.snapshot().cleanup_token)
+    assert recovered.phase is api.TransactionPhase.READY_TO_RETRY
+    with pytest.raises(OSError):
+        os.fstat(reservation_descriptors[0])
 
 
 def test_backup_reservation_replacement_refuses_before_target_stage(
@@ -3029,9 +3717,18 @@ def test_writer_namespace_replacement_is_preserved_and_never_published(
         lease,
     ) = _prepared(tmp_path, prior=prior)
     real_link = api._link
+    real_receipt = api._descriptor_receipt
+    reservation_descriptors: list[int] = []
     reserved_identity: list[tuple[int, int]] = []
+    unlinked_reservation_identity: list[tuple[int, int] | None] = []
     publication_links: list[tuple[Path, Path]] = []
     writes: list[Path] = []
+
+    def record_reservation(descriptor: int, path: Path, role: str):
+        receipt = real_receipt(descriptor, path, role)
+        if role == "candidate-reservation":
+            reservation_descriptors.append(descriptor)
+        return receipt
 
     def record_publication_link(source, destination):
         if Path(source) == transaction._candidate and Path(destination) == target:
@@ -3039,12 +3736,20 @@ def test_writer_namespace_replacement_is_preserved_and_never_published(
         return real_link(source, destination)
 
     monkeypatch.setattr(api, "_link", record_publication_link)
+    monkeypatch.setattr(api, "_descriptor_receipt", record_reservation)
 
     def writer(path: Path) -> None:
         writes.append(path)
         reserved = path.stat()
         reserved_identity.append((reserved.st_dev, reserved.st_ino))
         path.unlink()
+        try:
+            held = os.fstat(reservation_descriptors[0])
+        except OSError:
+            unlinked_reservation_identity.append(None)
+        else:
+            assert held.st_nlink == 0
+            unlinked_reservation_identity.append((held.st_dev, held.st_ino))
         path.write_bytes(replacement)
 
     with pytest.raises(api.OutputTransactionError):
@@ -3064,6 +3769,240 @@ def test_writer_namespace_replacement_is_preserved_and_never_published(
     assert target.read_bytes() == prior
     assert publication_links == []
     assert transaction.snapshot().phase is not api.TransactionPhase.COMMITTED
+    assert unlinked_reservation_identity == reserved_identity
+    held = os.fstat(reservation_descriptors[0])
+    assert (held.st_dev, held.st_ino) == reserved_identity[0]
+
+
+@pytest.mark.parametrize("failure", [None, "receipt", "observation", "writer"])
+def test_candidate_reservation_descriptor_is_closed_after_atomic_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
+) -> None:
+    (
+        api,
+        target,
+        _coordinator,
+        transaction,
+        transaction_owner,
+        target_owner,
+        _owners_by_role,
+        lease,
+    ) = _prepared(tmp_path, prior=None)
+    real_receipt = api._descriptor_receipt
+    real_capture = api._capture_target
+    reservations: list[tuple[int, tuple[int, int]]] = []
+    observations: list[str] = []
+
+    def record_reservation(descriptor: int, path: Path, role: str):
+        receipt = real_receipt(descriptor, path, role)
+        if role == "candidate-reservation":
+            reservations.append((descriptor, (receipt.identity.device, receipt.identity.inode)))
+            if failure == "receipt":
+                raise RuntimeError("receipt fault")
+        return receipt
+
+    def observe_candidate(path, *, hash_content=True):
+        if Path(path) == transaction._candidate and reservations and failure != "receipt":
+            descriptor, identity = reservations[0]
+            held = os.fstat(descriptor)
+            assert (held.st_dev, held.st_ino) == identity
+            first = not observations
+            observations.append("capture")
+            if failure == "observation" and first:
+                raise RuntimeError("observation fault")
+        return real_capture(path, hash_content=hash_content)
+
+    def writer(path: Path) -> None:
+        descriptor, identity = reservations[0]
+        held = os.fstat(descriptor)
+        assert (held.st_dev, held.st_ino) == identity
+        observations.append("writer")
+        path.write_bytes(b"writer result")
+        if failure == "writer":
+            raise RuntimeError("writer fault")
+
+    monkeypatch.setattr(api, "_descriptor_receipt", record_reservation)
+    monkeypatch.setattr(api, "_capture_target", observe_candidate)
+    if failure is None:
+        _execute(
+            transaction, writer,
+            transaction_owner=transaction_owner, target_owner=target_owner, lease=lease,
+        )
+        assert target.read_bytes() == b"writer result"
+    else:
+        with pytest.raises(RuntimeError, match=f"{failure} fault"):
+            _execute(
+                transaction, writer,
+                transaction_owner=transaction_owner, target_owner=target_owner, lease=lease,
+            )
+        assert not target.exists()
+
+    assert len(reservations) == 1
+    with pytest.raises(OSError):
+        os.fstat(reservations[0][0])
+    if failure == "receipt":
+        # Receipt failure leaves no authority to remove even an empty object.
+        assert transaction._candidate.read_bytes() == b""
+    else:
+        assert not transaction._candidate.exists()
+    if failure in (None, "writer"):
+        assert observations.count("writer") == 1
+        assert "capture" in observations[observations.index("writer") + 1:]
+    else:
+        assert "writer" not in observations
+
+
+@pytest.mark.parametrize("failure", ["unlink", "capture"])
+def test_candidate_descriptor_pins_failed_cleanup_through_foreign_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    (
+        api, target, _coordinator, transaction,
+        transaction_owner, target_owner, _owners_by_role, lease,
+    ) = _prepared(tmp_path, prior=b"durable prior")
+    real_capture = api._capture_target
+    real_unlink = api._unlink
+    real_receipt = api._descriptor_receipt
+    descriptors: list[int] = []
+    writes: list[Path] = []
+    captures: list[Path] = []
+    faults: list[str] = []
+
+    def record_reservation(descriptor: int, path: Path, role: str):
+        receipt = real_receipt(descriptor, path, role)
+        if role == "candidate-reservation":
+            descriptors.append(descriptor)
+        return receipt
+
+    def capture(path, *, hash_content=True):
+        if Path(path) == transaction._candidate and writes:
+            captures.append(Path(path))
+            if failure == "capture" and len(captures) == 2:
+                faults.append("capture")
+                raise OSError("candidate cleanup capture fault")
+        return real_capture(path, hash_content=hash_content)
+
+    def unlink(path):
+        if Path(path) == transaction._candidate and failure == "unlink" and not faults:
+            faults.append("unlink")
+            raise OSError("candidate cleanup unlink fault")
+        return real_unlink(path)
+
+    def writer(path: Path) -> None:
+        writes.append(path)
+        path.write_bytes(b"partial candidate")
+        raise RuntimeError("writer fault")
+
+    monkeypatch.setattr(api, "_descriptor_receipt", record_reservation)
+    monkeypatch.setattr(api, "_capture_target", capture)
+    monkeypatch.setattr(api, "_unlink", unlink)
+    with pytest.raises(RuntimeError, match="writer fault"):
+        _execute(
+            transaction, writer,
+            transaction_owner=transaction_owner, target_owner=target_owner, lease=lease,
+        )
+
+    pending = transaction.snapshot()
+    assert pending.phase is api.TransactionPhase.CLEANUP_PENDING
+    assert pending.pending_actions == (api.RetryAction.CANDIDATE_UNLINK,)
+    assert faults == [failure]
+    assert len(descriptors) == 1
+    descriptor = descriptors[0]
+    reserved = os.fstat(descriptor)
+    assert writes[0].read_bytes() == b"partial candidate"
+    assert target.read_bytes() == b"durable prior"
+
+    writes[0].unlink()
+    assert os.fstat(descriptor).st_nlink == 0
+    writes[0].write_bytes(b"foreign retry occupant")
+    foreign = writes[0].stat()
+    assert (foreign.st_dev, foreign.st_ino) != (reserved.st_dev, reserved.st_ino)
+    with pytest.raises(api.CleanupIncomplete):
+        transaction.retry_cleanup(pending.cleanup_token)
+    assert writes[0].read_bytes() == b"foreign retry occupant"
+    assert target.read_bytes() == b"durable prior"
+    assert os.fstat(descriptor).st_ino == reserved.st_ino
+
+    writes[0].unlink()
+    recovered = transaction.retry_cleanup(pending.cleanup_token)
+    assert recovered.phase is api.TransactionPhase.READY_TO_RETRY
+    assert recovered.pending_actions == ()
+    assert transaction._candidate_descriptor is None
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+    assert len(writes) == 1
+    assert target.read_bytes() == b"durable prior"
+
+
+@pytest.mark.parametrize("close_completed", [False, True])
+def test_candidate_descriptor_close_failure_remains_owned_without_writer_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    close_completed: bool,
+) -> None:
+    (
+        api, target, _coordinator, transaction,
+        transaction_owner, target_owner, _owners_by_role, lease,
+    ) = _prepared(tmp_path, prior=None)
+    real_close = api.os.close
+    real_receipt = api._descriptor_receipt
+    descriptors: list[int] = []
+    closes: list[int] = []
+    writes: list[Path] = []
+
+    def record_reservation(descriptor: int, path: Path, role: str):
+        receipt = real_receipt(descriptor, path, role)
+        if role == "candidate-reservation":
+            descriptors.append(descriptor)
+        return receipt
+
+    def close(descriptor: int) -> None:
+        if descriptors and descriptor == descriptors[0]:
+            closes.append(descriptor)
+            if len(closes) == 1:
+                if close_completed:
+                    real_close(descriptor)
+                raise OSError("candidate close transient")
+        real_close(descriptor)
+
+    def writer(path: Path) -> None:
+        writes.append(path)
+        path.write_bytes(b"writer result")
+
+    monkeypatch.setattr(api, "_descriptor_receipt", record_reservation)
+    monkeypatch.setattr(api.os, "close", close)
+    with pytest.raises(api.CleanupIncomplete) as raised:
+        _execute(
+            transaction, writer,
+            transaction_owner=transaction_owner, target_owner=target_owner, lease=lease,
+        )
+    assert "candidate close transient" in str(raised.value.__cause__)
+    descriptor = descriptors[0]
+    pending = transaction.snapshot()
+    assert pending.phase is api.TransactionPhase.CLEANUP_PENDING
+    assert pending.pending_actions == (api.RetryAction.CANDIDATE_RETIRE,)
+    assert transaction._candidate_descriptor == descriptor
+    assert target.read_bytes() == b"writer result"
+    assert not transaction._candidate.exists()
+    if close_completed:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    else:
+        assert os.fstat(descriptor).st_ino == target.stat().st_ino
+
+    recovered = transaction.retry_cleanup(pending.cleanup_token)
+    assert recovered.phase is api.TransactionPhase.COMMITTED
+    assert recovered.pending_actions == ()
+    assert transaction._candidate_descriptor is None
+    assert closes == [descriptor] * (1 if close_completed else 2)
+    assert len(writes) == 1
+    assert target.read_bytes() == b"writer result"
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
 
 
 def test_positive_stage_receipt_outranks_generic_post_move_error(
@@ -3725,6 +4664,7 @@ def test_kernel_is_qt_free_and_has_only_headless_transaction_mounts() -> None:
         "xdart/gui/tabs/scattering/adapters/run_executor.py",
         "xdart/gui/tabs/scattering/browse_1d_hydration.py",
         "xdart/gui/tabs/scattering/browse_1d_projection.py",
+        "xdart/gui/tabs/scattering/browse_slice_hydration.py",
         "xdart/gui/tabs/scattering/browse_values.py",
         "xdart/gui/tabs/scattering/context_controller.py",
         "xdart/gui/tabs/scattering/display_values.py",

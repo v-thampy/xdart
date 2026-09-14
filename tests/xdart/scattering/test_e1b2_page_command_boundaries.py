@@ -1312,7 +1312,7 @@ def test_run_click_preserves_outgoing_paint_until_a_frame_arrives(
     monkeypatch.setattr(
         page,
         "_refresh_shell",
-        lambda *, preserve_display=False: refreshes.append(
+        lambda *, preserve_display=False, **_options: refreshes.append(
             preserve_display
         ),
     )
@@ -1522,7 +1522,7 @@ def test_post_retirement_start_refusal_preserves_detached_outgoing_paint(
     monkeypatch.setattr(
         page,
         "_refresh_shell",
-        lambda *, preserve_display=False: refreshes.append(
+        lambda *, preserve_display=False, **_options: refreshes.append(
             preserve_display or page._retain_outgoing_display
         ),
     )
@@ -1689,15 +1689,20 @@ def test_historical_frame_disables_auto_last_and_reenable_selects_latest(
         _dispose(page, qapp)
 
 
+@pytest.mark.parametrize("paint_due", (True, False), ids=("due", "paced"))
 def test_cold_frame_refresh_catches_up_distinct_acquisition_owner_before_paint(
     qapp: QtWidgets.QApplication,
     monkeypatch,
+    paint_due: bool,
 ) -> None:
     from tests.xdart.scattering.test_e3_context_contract import _acquisition
 
     executor = _Executor()
     page, _, identity = _active_page(executor)
-    configuration = RunIntent(output_mode="Overwrite").freeze()
+    configuration = RunIntent(
+        output_mode="Overwrite", processing_mode="Int 2D",
+    ).freeze()
+    assert configuration.identity == (identity.generation, identity.fingerprint)
     _, acquisition = _acquisition(
         configuration=configuration,
         identity=identity,
@@ -1712,7 +1717,14 @@ def test_cold_frame_refresh_catches_up_distinct_acquisition_owner_before_paint(
     acquisition.rescope_to("run.b", "/data/b_0001.tif")
     assert controller.project_navigation() == ()
     page._retain_outgoing_display = True
+    # A just-completed prior plot may defer the next scientific paint even
+    # though the exact acquisition owner must catch up on the first drain.
+    page._last_live_plot_at = None if paint_due else time.monotonic()
     monkeypatch.setattr(page, "_follow_processed_artifact", lambda _frame: None)
+    shell = _shell(page)
+    outgoing_title = shell.scientific.title.text()
+    outgoing_raw = shell.scientific.raw.image.image
+    outgoing_cake = shell.scientific.cake.image.image
 
     try:
         executor.events.append(
@@ -1732,8 +1744,22 @@ def test_cold_frame_refresh_catches_up_distinct_acquisition_owner_before_paint(
         assert selection is not None
         assert selection.owner == acquisition.hydration_owner
         assert controller.navigation.current is first
+        if not paint_due:
+            assert page._scientific_repaint_pending is True
+            assert page._retain_outgoing_display is True
+            assert shell.scientific.title.text() == outgoing_title
+            assert shell.scientific.raw.image.image is outgoing_raw
+            assert shell.scientific.cake.image.image is outgoing_cake
+
+            def pending_paint_settled():
+                page._drain_executor()
+                return not page._scientific_repaint_pending
+
+            _wait_until(qapp, pending_paint_settled)
+
+        assert controller.selection is selection
+        assert controller.navigation.current is first
         assert page._retain_outgoing_display is False
-        shell = _shell(page)
         assert shell.scientific.title.text() != "Current"
         assert shell.scientific.raw.image.image is not None
         assert shell.scientific.cake.image.image is not None

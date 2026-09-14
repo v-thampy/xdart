@@ -1081,7 +1081,11 @@ def test_raw_tiff_viewer_metadata_click_uses_auto_sidecar_plan(
         )
         request = analysis_request_facts(plan)
         assert request is not None
-        assert request[1][-1] == "auto"
+        from dataclasses import fields
+        request_values = dict(zip(
+            (field.name for field in fields(plan)), request[1], strict=True))
+        assert request_values["metadata_format"] == "auto"
+        assert request_values["source"] == str(image)
         process = page._metadata_operations.active
         assert process is not None
         assert process.request.request == request

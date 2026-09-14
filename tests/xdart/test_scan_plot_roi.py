@@ -947,27 +947,22 @@ def test_dialog_close_shuts_down_probe_executor(qapp, tmp_path):
 
 
 def _write_processed_nxs_with_scan_data(path):
-    """A real minimal processed .nxs: integrated_1d (classifies the file as
-    PROCESSED_XDART) + a scan_data group (what read_scan_data returns)."""
+    """Current public-writer artifact plus the real per-frame metadata table."""
     import h5py
+    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.io import write_nexus
 
     labels = np.asarray([1, 2, 3], dtype=np.int64)
     q = np.linspace(0.1, 1.0, 4, dtype=np.float32)
-    with h5py.File(path, "w") as h5:
-        entry = h5.create_group("entry")
-        entry.attrs["NX_class"] = "NXentry"
-        g1 = entry.create_group("integrated_1d")
-        g1.attrs["NX_class"] = "NXdata"
-        g1.attrs["signal"] = "intensity"
-        g1.attrs["axes"] = ["frame_index", "q"]
-        g1.create_dataset("frame_index", data=labels)
-        q_ds = g1.create_dataset("q", data=q)
-        q_ds.attrs["units"] = "q_A^-1"
-        g1.create_dataset(
-            "intensity",
-            data=np.arange(labels.size * q.size, dtype=np.float32).reshape(
-                labels.size, q.size))
-        sd = entry.create_group("scan_data")
+    intensity = np.arange(labels.size * q.size, dtype=np.float32).reshape(
+        labels.size, q.size,
+    )
+    write_nexus(path, results_1d={
+        int(label): IntegrationResult1D(q, row, unit="q_A^-1")
+        for label, row in zip(labels, intensity)
+    })
+    with h5py.File(path, "r+") as h5:
+        sd = h5["entry"].create_group("scan_data")
         sd.attrs["NX_class"] = "NXcollection"
         sd.create_dataset("frame_index", data=labels)
         sd.create_dataset("i0", data=np.asarray([10.0, 20.0, 30.0]))
@@ -1001,7 +996,7 @@ def test_scan_plot_processed_reads_take_writer_lock_x16(qapp, tmp_path):
     import os
     from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
 
-    p = tmp_path / "processed_scan.nxs"
+    p = tmp_path / "processed_scan.nexus"
     _write_processed_nxs_with_scan_data(p)
 
     rec = _RecordingRLock()

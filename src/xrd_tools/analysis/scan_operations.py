@@ -40,6 +40,7 @@ from xrd_tools.analysis.canonical_fingerprint import (
 from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
 from xrd_tools.core.scan import SourceCapabilities, SourceKind, SourceSpec, coerce_source_kind
 from xrd_tools.io.metadata import read_image_metadata_observed
+from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.sources.discover import discover_scans
 from xrd_tools.sources.registry import guess_source_kind, open_source
 from xrd_tools.sources.selection import image_series_spec
@@ -169,7 +170,7 @@ def _path_revision(path: Path) -> FileRevision | None:
         return None
     return (
         state.st_mode, state.st_dev, state.st_ino, state.st_size,
-        state.st_mtime_ns, state.st_ctime_ns,
+        state.st_mtime_ns, identity_ctime_ns(state.st_ctime_ns),
     )
 def _lexical_absolute(path: Path | str) -> Path:
     return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))

@@ -1357,7 +1357,7 @@ def test_source_science_and_operation_identity_domains_vary_independently(tmp_pa
     assert tuple(payload["numeric_metadata_keys"]) == base.numeric_metadata_keys
     assert tuple(payload["invariant_metadata_keys"]) == base.invariant_metadata_keys
     assert set(payload["expected_target_snapshot"]) == {
-        "exists", "size", "mtime_ns", "device", "inode", "digest",
+        "exists", "size", "mtime_ns", "device", "inode", "digest", "ctime_ns",
     }
     assert payload["expected_target_snapshot"] == {
         item.name: getattr(base.expected_target_snapshot, item.name)

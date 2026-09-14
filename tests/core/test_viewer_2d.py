@@ -69,30 +69,18 @@ def _processed_thumbnail(handle, label, value, *, vmin, vmax, mask=None):
 
 
 def _write_current_result(entry, labels):
-    from xrd_tools.io.schema import (
-        PROCESSED_SCHEMA_NAME,
-        PROCESSED_SCHEMA_VERSION,
-        SCHEMA_NAME_ATTR,
-        SCHEMA_VERSION_ATTR,
-    )
+    from tests.core.v2_fixture_factory import current_entry
+    from xrd_tools.core import IntegrationResult1D
+    from xrd_tools.io.nexus import write_integrated_stack
 
-    entry.attrs["NX_class"] = "NXentry"
-    entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
-    entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+    current_entry(entry.file, entry=entry.name)
     labels = tuple(int(label) for label in labels)
-    result = entry.create_group("integrated_1d")
-    result.attrs["NX_class"] = "NXdata"
-    result.attrs["signal"] = "intensity"
-    result.attrs["axes"] = ("frame_index", "q")
-    result.create_dataset(
-        "frame_index", data=np.asarray(labels, dtype=np.int64),
-        chunks=(min(len(labels), 1024),), maxshape=(None,),
+    write_integrated_stack(
+        entry, frame_indices=labels,
+        results_1d=[IntegrationResult1D(
+            radial=np.array([0.0]), intensity=np.array([0.0]), unit="q_A^-1",
+        ) for _ in labels],
     )
-    result.create_dataset(
-        "intensity", data=np.zeros((len(labels), 1), dtype=np.float32),
-        chunks=(min(len(labels), 64), 1), maxshape=(None, 1),
-    )
-    result.create_dataset("q", data=np.zeros(1, dtype=np.float32))
 
 
 def _finalize_processed(handle):
@@ -272,7 +260,7 @@ def test_csv_catalog_is_array_free_and_second_pass_builds_one_canonical_frame(tm
     assert catalog.source_kind is api.Viewer2DSourceKind.CSV_MATRIX
     assert catalog.frame_labels == (0,)
     assert catalog.source_shape == (2, 3)
-    assert catalog.policy_version == "viewer-2d-v1"
+    assert catalog.policy_version == "viewer-2d-v2"
     assert catalog.canonical_path == str(path.resolve())
     _slots_have_no_array(catalog)
     assert events == [("scan", events[0][1], True)]
@@ -283,7 +271,7 @@ def test_csv_catalog_is_array_free_and_second_pass_builds_one_canonical_frame(tm
     assert events[0][1] == events[2][1] and events[0][2] and not events[2][2]
     _assert_canonical(frame, [[1, 2, np.nan], [3.5, -4, 6]])
     assert frame.provenance.source_kind is api.Viewer2DSourceKind.CSV_MATRIX
-    assert frame.provenance.source_sha256 == catalog.primary_revision.sha256
+    assert frame.provenance.source_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize(
@@ -1121,7 +1109,7 @@ def test_processed_external_preferred_path_bypasses_foreign_master_census(tmp_pa
 
 
 @pytest.mark.parametrize("drift", ["before", "during"])
-def test_eiger_frame_read_uses_stat_fences_and_rehashes_only_after_drift(
+def test_eiger_frame_read_refuses_metadata_drift_without_rehashing(
         tmp_path, monkeypatch, drift):
     h5py = pytest.importorskip("h5py")
     value = np.arange(2 * 2 * 3, dtype=np.uint16).reshape(2, 2, 3)
@@ -1155,7 +1143,8 @@ def test_eiger_frame_read_uses_stat_fences_and_rehashes_only_after_drift(
 
         monkeypatch.setattr(api, "_read_hdf_dataset", read_then_mutate)
     _assert_changed(api.read_viewer_2d_frame, catalog, 1)
-    assert calls == [str(segments[0].resolve())]
+    assert calls == []
+
 
 
 def _non_hdf_stat_case(tmp_path, family):
@@ -1191,7 +1180,7 @@ def _non_hdf_stat_case(tmp_path, family):
 
 
 @pytest.mark.parametrize("family", ["raw", "npy", "npz", "tiff"])
-def test_non_hdf_frame_read_keeps_catalog_hash_but_does_not_rehash_stable_file(
+def test_non_hdf_frame_read_uses_metadata_revision_and_selected_pixel_hash(
         tmp_path, monkeypatch, family):
     path, catalog, label, expected, policy = _non_hdf_stat_case(tmp_path, family)
     calls = []
@@ -1206,8 +1195,9 @@ def test_non_hdf_frame_read_keeps_catalog_hash_but_does_not_rehash_stable_file(
 
     _assert_canonical(frame, expected)
     assert calls == []
-    assert catalog.primary_revision.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert not hasattr(catalog.primary_revision, "sha256")
     assert frame.provenance.primary_revision is catalog.primary_revision
+
 
 
 def test_tiff_parent_swap_and_restore_reads_certified_descriptor(
@@ -1254,7 +1244,7 @@ def test_tiff_parent_swap_and_restore_reads_certified_descriptor(
     assert calls == []
 
 
-def test_fabio_selected_read_keeps_prior_full_revision_rechecks(
+def test_fabio_selected_read_checks_metadata_before_and_after(
         tmp_path, monkeypatch):
     path, catalog, label, expected, policy = _non_hdf_stat_case(
         tmp_path, "fabio",
@@ -1273,8 +1263,9 @@ def test_fabio_selected_read_keeps_prior_full_revision_rechecks(
     assert calls == [str(path.resolve()), str(path.resolve())]
 
 
+
 @pytest.mark.parametrize("drift", ["in-place", "replacement"])
-def test_non_hdf_stat_fence_rejects_same_size_restored_mtime_drift(
+def test_non_hdf_stat_fence_rejects_write_or_replacement(
         tmp_path, monkeypatch, drift):
     initial = np.arange(30, dtype=np.uint16).reshape(2, 3, 5)
     changed = initial + 100
@@ -1286,13 +1277,11 @@ def test_non_hdf_stat_fence_rejects_same_size_restored_mtime_drift(
     assert replacement.stat().st_size == admitted.st_size
     if drift == "in-place":
         path.write_bytes(replacement.read_bytes())
-        os.utime(path, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
     else:
         os.utime(replacement, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
         os.replace(replacement, path)
     current = path.stat()
     assert current.st_size == admitted.st_size
-    assert current.st_mtime_ns == admitted.st_mtime_ns
 
     calls = []
     original = api._stable_revision
@@ -1303,10 +1292,11 @@ def test_non_hdf_stat_fence_rejects_same_size_restored_mtime_drift(
 
     monkeypatch.setattr(api, "_stable_revision", stable)
     _assert_changed(api.read_viewer_2d_frame, catalog, 1)
-    assert calls == [str(path.resolve())]
+    assert calls == []
 
 
-def test_non_hdf_stat_fence_recertifies_drift_during_selected_read(
+
+def test_non_hdf_stat_fence_refuses_drift_during_selected_read(
         tmp_path, monkeypatch):
     initial = np.arange(30, dtype=np.uint16).reshape(2, 3, 5)
     changed = initial + 100
@@ -1323,7 +1313,6 @@ def test_non_hdf_stat_fence_recertifies_drift_during_selected_read(
         if not mutated:
             mutated.append(True)
             path.write_bytes(replacement.read_bytes())
-            os.utime(path, ns=(admitted.st_atime_ns, admitted.st_mtime_ns))
         return result
 
     def stable(candidate):
@@ -1334,7 +1323,8 @@ def test_non_hdf_stat_fence_recertifies_drift_during_selected_read(
     monkeypatch.setattr(api, "_stable_revision", stable)
     _assert_changed(api.read_viewer_2d_frame, catalog, 1)
     assert mutated == [True]
-    assert calls == [str(path.resolve())]
+    assert calls == []
+
 
 
 def test_non_hdf_selected_read_failure_closes_fenced_descriptor(
@@ -1712,7 +1702,7 @@ def test_r30_exported_values_recursively_close_isolated_forgery(tmp_path, axis):
         np.save(path, np.arange(6).reshape(2, 3))
         revision = api.catalog_viewer_2d(path).primary_revision
         _raises(TypeError, api.Viewer2DDependency,
-                revision.canonical_path, None, _forge(revision, sha256="x"))
+                revision.canonical_path, None, _forge(revision, size=-1))
     elif axis == "negative-source-frame":
         _raises(TypeError, api.Viewer2DFrameFact,
                 0, api.Viewer2DSourceKind.PROCESSED_RAW, (2, 3), "<i8",
@@ -1755,7 +1745,7 @@ def test_exported_values_reject_local_malformed_values(tmp_path):
     np.save(path, np.arange(6).reshape(2, 3))
     catalog = api.catalog_viewer_2d(path)
     frame = api.read_viewer_2d_frame(catalog, 0)
-    ledger = api.viewer_2d_memory_ledger(2, 3, ram_bytes=10**12)
+    ledger = api.viewer_2d_memory_ledger(2, 3)
 
     _raises(TypeError, api.Viewer2DReadError, "format_invalid", "not an exact refusal code")
     _raises(TypeError, replace, catalog, frame_labels=(0, 0))
@@ -1821,16 +1811,23 @@ def test_rehashed_catalog_rejects_each_isolated_cross_field(tmp_path, axis):
     _raises(TypeError, _rehashed_catalog, catalog, **change)
 
 
+_FIRST_SEGMENT_HINT = "/entry/data/data_000001"
+
+
+@pytest.mark.parametrize("hint", [None, _FIRST_SEGMENT_HINT],
+                         ids=("no-hint", "first-segment-hint"))
 @pytest.mark.parametrize("axis", ["baseline", "unselected-drift", "selected-drift"],
                          ids=lambda axis: f"r45-v1-{axis}")
-def test_processed_eiger_selection_is_interval_local(tmp_path, monkeypatch, axis):
+def test_processed_eiger_selection_is_interval_local(tmp_path, monkeypatch, axis, hint):
     h5py = pytest.importorskip("h5py")
     raw = np.arange(2 * 3, dtype=np.uint16).reshape(1, 2, 3)
     master, segments, arrays = _eiger_master(tmp_path / axis, [
         (f"data_{number:06d}.h5", raw + number * 100) for number in (1, 2)])
     processed = tmp_path / f"{axis}.nexus"
     with h5py.File(processed, "w") as handle:
-        _processed_source(handle, 7, str(master.resolve()), 1)
+        # The writer's hint names the first segment beside a frame index
+        # that counts across every segment; the chain must be the same.
+        _processed_source(handle, 7, str(master.resolve()), 1, hint)
         _finalize_processed(handle)
     catalog = api.catalog_viewer_2d(processed)
     base, earlier, selected = catalog.dependencies
@@ -1864,6 +1861,237 @@ def test_processed_eiger_selection_is_interval_local(tmp_path, monkeypatch, axis
     assert selected.revision.canonical_path in touched
     assert all(earlier.logical_path != path for _, path in opened) and all(
         locator != earlier.locator for locator, _, _ in read)
+
+
+def _hinted_eiger_record(tmp_path, hint, *, frames=2, segments=2, thumbnails=True):
+    """A processed record over a *segments*-long Eiger chain of *frames*
+    frames each, one label per chain frame with the writer's global frame
+    index and the dataset *hint*; a thumbnail beside every label when
+    *thumbnails*, so a frame the raw resolution cannot reach shows up as
+    the thumbnail fallback rather than as an absent label."""
+    h5py = pytest.importorskip("h5py")
+    raw = np.arange(frames * 2 * 3, dtype=np.uint16).reshape(frames, 2, 3)
+    master, segment_paths, arrays = _eiger_master(tmp_path / "raw", [
+        (f"data_{number:06d}.h5", raw + number * 100)
+        for number in range(1, segments + 1)])
+    processed = tmp_path / "processed.nexus"
+    with h5py.File(processed, "w") as handle:
+        for label in range(frames * segments):
+            _processed_source(handle, label, str(master.resolve()), label, hint)
+            if thumbnails:
+                _processed_thumbnail(handle, label, np.full((2, 3), label, np.uint8),
+                                     vmin=0.0, vmax=255.0)
+        _finalize_processed(handle)
+    return processed, master, segment_paths, arrays
+
+
+def _chain_dependencies(catalog, master):
+    base = next(item for item in catalog.dependencies
+                if item.locator == str(master.resolve()) and item.frame_start is None)
+    intervals = tuple(item for item in catalog.dependencies if item.frame_start is not None)
+    return base, intervals
+
+
+@pytest.mark.parametrize("label", [1, 2, 3], ids=("first-segment", "second-segment-first",
+                                                  "second-segment-last"))
+def test_processed_first_segment_hint_reaches_every_eiger_segment(tmp_path, label):
+    processed, master, segments, arrays = _hinted_eiger_record(tmp_path, _FIRST_SEGMENT_HINT)
+
+    catalog = api.catalog_viewer_2d(processed)
+    frame = api.read_viewer_2d_frame(catalog, label)
+
+    assert catalog.frame_labels == (0, 1, 2, 3)
+    assert all(fact.source_kind is api.Viewer2DSourceKind.PROCESSED_RAW
+               and fact.dataset_path == _FIRST_SEGMENT_HINT and fact.source_frame == fact.label
+               for fact in catalog.frame_facts)
+    base, intervals = _chain_dependencies(catalog, master)
+    assert [(item.locator, item.logical_path, item.frame_start, item.frame_stop)
+            for item in intervals] == [
+        (str(segments[0].resolve()), "/entry/data/data_000001", 0, 2),
+        (str(segments[1].resolve()), "/entry/data/data_000002", 2, 4),
+    ]
+    _assert_canonical(frame, arrays[label // 2][label % 2])
+    assert frame.provenance.dependencies == (base, intervals[label // 2])
+    assert not frame.provenance.degraded_thumbnail
+
+
+@pytest.mark.parametrize("missing", ["later", "hinted", "earlier"])
+def test_processed_hint_keeps_partial_raw_access_only_past_a_missing_later_segment(
+        tmp_path, missing):
+    # Only a specifically identified missing LATER segment leaves the hinted
+    # segment's own frames readable; the hinted segment, or one before it,
+    # takes the chain the record's frame index counts across with it.
+    hint = "/entry/data/data_000002" if missing == "earlier" else _FIRST_SEGMENT_HINT
+    processed, master, segments, arrays = _hinted_eiger_record(tmp_path, hint)
+    gone = segments[{"later": 1, "hinted": 0, "earlier": 0}[missing]]
+    gone.rename(gone.with_suffix(".gone"))
+
+    catalog = api.catalog_viewer_2d(processed)
+    kinds = [fact.source_kind for fact in catalog.frame_facts]
+
+    raw, thumbnail = (api.Viewer2DSourceKind.PROCESSED_RAW,
+                      api.Viewer2DSourceKind.PROCESSED_THUMBNAIL)
+    assert catalog.frame_labels == (0, 1, 2, 3)
+    if missing == "later":
+        assert kinds == [raw, raw, thumbnail, thumbnail]
+        base, intervals = _chain_dependencies(catalog, master)
+        assert [(item.locator, item.frame_start, item.frame_stop) for item in intervals] == [
+            (str(segments[0].resolve()), 0, 2)]
+        _assert_canonical(api.read_viewer_2d_frame(catalog, 1), arrays[0][1])
+        assert api.read_viewer_2d_frame(catalog, 2).provenance.degraded_thumbnail
+    else:
+        assert kinds == [thumbnail] * 4
+        assert all(item.frame_start is None for item in catalog.dependencies)
+
+
+def test_processed_non_first_segment_hint_keeps_the_hinted_dataset_local(tmp_path):
+    # A hint the writer never produces: not the chain's first segment.  The
+    # frame index stays local to the hinted dataset, as before.
+    processed, master, segments, arrays = _hinted_eiger_record(
+        tmp_path, "/entry/data/data_000002")
+
+    catalog = api.catalog_viewer_2d(processed)
+
+    kinds = [fact.source_kind for fact in catalog.frame_facts]
+    raw, thumbnail = (api.Viewer2DSourceKind.PROCESSED_RAW,
+                      api.Viewer2DSourceKind.PROCESSED_THUMBNAIL)
+    assert kinds == [raw, raw, thumbnail, thumbnail]
+    base, intervals = _chain_dependencies(catalog, master)
+    assert [(item.locator, item.logical_path, item.frame_start, item.frame_stop)
+            for item in intervals] == [
+        (str(segments[1].resolve()), "/entry/data/data_000002", 0, 2)]
+    frame = api.read_viewer_2d_frame(catalog, 1)
+    _assert_canonical(frame, arrays[1][1])
+    assert frame.provenance.dependencies == (base, intervals[0])
+
+
+def test_catalog_validation_hashes_a_chain_identity_once_per_shape(tmp_path, monkeypatch):
+    # Every read re-validates the catalog, and a chain's admissible identity
+    # manifests string the chain's whole frame range: hashed once per raw
+    # fact, a 2,500-frame all-raw record cost ~0.3 s per read.  Once per
+    # (chain, shape, dtype) instead -- six raw facts over one chain, one hash.
+    processed, _, _, _ = _hinted_eiger_record(
+        tmp_path, _FIRST_SEGMENT_HINT, frames=3, segments=2)
+    catalog = api.catalog_viewer_2d(processed)
+    assert [fact.source_kind for fact in catalog.frame_facts] == (
+        [api.Viewer2DSourceKind.PROCESSED_RAW] * 6)
+    manifests = []
+    original = api._catalog_id
+
+    def counted(*parts):
+        manifests.append(parts)
+        return original(*parts)
+
+    monkeypatch.setattr(api, "_catalog_id", counted)
+    api._validate_catalog_cross_fields(catalog)
+    assert [parts[6] for parts in manifests] == ["hdf5-eiger"]
+    assert manifests[0][2] == tuple(range(6))
+    # Immutable catalogs are validated when constructed, not on every read.
+    api.read_viewer_2d_frame(catalog, 5)
+    assert len(manifests) == 1
+
+
+def test_hdf_catalog_and_selected_read_use_no_python_payload_streams(tmp_path, monkeypatch):
+    h5py = pytest.importorskip("h5py")
+    processed, _, _, arrays = _hinted_eiger_record(tmp_path, _FIRST_SEGMENT_HINT)
+    before = h5py.h5f.get_obj_count(types=h5py.h5f.OBJ_FILE)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("viewer opened an extra stream to hash or hold an HDF5 source")
+
+    monkeypatch.setattr(api, "open", forbidden, raising=False)
+    catalog = api.catalog_viewer_2d(processed)
+    for label in (0, 2, 3, 0):
+        _assert_canonical(api.read_viewer_2d_frame(catalog, label), arrays[label // 2][label % 2])
+    assert h5py.h5f.get_obj_count(types=h5py.h5f.OBJ_FILE) == before
+
+
+@pytest.mark.parametrize("family", ("npy", "hdf5"))
+def test_win32_metadata_revision_refuses_an_ordinary_write(
+        tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime, family):
+    value = np.arange(12, dtype=np.uint16).reshape(2, 2, 3)
+    path = tmp_path / ("stack.npy" if family == "npy" else "stack.nxs")
+    if family == "npy":
+        np.save(path, value)
+    else:
+        _write_hdf_stack(path, value)
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    win32_pathname_ctime(path)
+    catalog = api.catalog_viewer_2d(path)
+    if family == "npy":
+        np.save(path, value + 1)
+    else:
+        h5py = pytest.importorskip("h5py")
+        with h5py.File(path, "r+") as handle:
+            handle["entry/data/data"][0, 0, 0] += 1
+    assert path.stat().st_mtime_ns != catalog.primary_revision.mtime_ns
+    _assert_changed(api.read_viewer_2d_frame, catalog, 0)
+
+
+_REAL_EIGER_RECORDS = (
+    pytest.param("bo_2_716V_5p9ms_sfpx_23p70_halpha_0p30_burst_00001_int2d.nexus",
+                 (0, 999, 1000, 1999, 2000, 2499), id="bo_2-2500-frames"),
+    pytest.param("Eiger_TiN_thinAl2O3_TiN_pos1_2000mdeg_scan001_int2d.nexus",
+                 (0, 2999, 3000, 3620), id="TiN-3621-frames"),
+)
+
+
+@pytest.mark.parametrize("record,labels", _REAL_EIGER_RECORDS)
+def test_processed_real_eiger_record_reaches_every_segment(record, labels, monkeypatch):
+    h5py = pytest.importorskip("h5py")
+    pytest.importorskip("hdf5plugin")
+    configured = os.environ.get("XDART_TEST_DATA")
+    if not configured:
+        pytest.skip("XDART_TEST_DATA is not configured")
+    processed = Path(configured) / "xdart_processed_data" / record
+    if not processed.is_file():
+        pytest.skip(f"XDART_TEST_DATA lacks xdart_processed_data/{record}")
+
+    catalog = api.catalog_viewer_2d(processed)
+    base, intervals = _chain_dependencies(
+        catalog, Path(catalog.frame_facts[0].locator))
+    # The chain the master itself names, read independently of the viewer.
+    with h5py.File(base.locator, "r") as handle:
+        group = handle["entry/data"]
+        chain, start = [], 0
+        for name in sorted(group):
+            link = group.get(name, getlink=True)
+            if not isinstance(link, h5py.ExternalLink):
+                continue
+            frames = int(group[name].shape[0])
+            chain.append((Path(base.locator).parent / link.filename, name, start, start + frames))
+            start += frames
+    expected_total = start
+    calls = []
+    original = api._stable_revision
+
+    def stable(path):
+        calls.append(str(path))
+        return original(path)
+
+    monkeypatch.setattr(api, "_stable_revision", stable)
+
+    assert catalog.frame_labels == tuple(range(expected_total))
+    assert all(fact.source_kind is api.Viewer2DSourceKind.PROCESSED_RAW
+               and fact.dataset_path == _FIRST_SEGMENT_HINT and fact.source_frame == fact.label
+               for fact in catalog.frame_facts)
+    assert [(item.locator, item.logical_path, item.frame_start, item.frame_stop)
+            for item in intervals] == [
+        (str(segment.resolve()), f"/entry/data/{name}", first, stop)
+        for segment, name, first, stop in chain]
+    for label in labels:
+        index = next(index for index, (_, _, first, stop) in enumerate(chain)
+                     if first <= label < stop)
+        segment, _, first, _ = chain[index]
+        with h5py.File(segment, "r") as handle:
+            pixels = handle["entry/data/data"][label - first]
+        frame = api.read_viewer_2d_frame(catalog, label)
+        assert frame.array.shape == (2167, 2070)
+        _assert_canonical(frame, pixels)
+        assert not frame.provenance.degraded_thumbnail
+        assert frame.provenance.dependencies == (base, intervals[index])
+    # Unchanged files are never rehashed on a read.
+    assert calls == []
 
 
 @pytest.mark.parametrize("kind,size", [("utf8", 4096), ("bytes", 4096),
@@ -2002,7 +2230,8 @@ def test_primary_same_size_aba_and_dependency_change_refuse_without_publication(
 
 
 def test_memory_ledger_uses_raw_only_r7_arithmetic_and_fails_closed(monkeypatch):
-    ledger = api.viewer_2d_memory_ledger(2, 3, encoded_retained=17, ram_bytes=10**12)
+    monkeypatch.setattr(api, "_physical_ram_bytes", lambda: 10**12)
+    ledger = api.viewer_2d_memory_ledger(2, 3, encoded_retained=17)
     assert ledger.canonical_bytes == 48
     assert ledger.reader_peak == max(3 * 48, 17 + 4 * 48)
     assert ledger.renderer_slack_raw == 5 * 48 // 2
@@ -2033,3 +2262,79 @@ def test_suffix_set_is_closed_and_viewer_only(tmp_path):
     assert ".npy" not in image.SUPPORTED_EXTS
     assert ".npz" not in image.SUPPORTED_EXTS
     assert "xrd_tools.io.viewer_2d" in sys.modules
+
+
+# ---------------------------------------------------------------------------
+# The Windows stat shape (PR #1 2026-09-11): pathname ctime = creation time,
+# descriptor ctime = change time.  ``_descriptor_revision`` fences fstat
+# against the pathname stat and ``_cert_stat_revision`` fences the recorded
+# revision against both; the seam is the only reason they agree on win32.
+# ---------------------------------------------------------------------------
+
+
+def test_win32_pathname_ctime_shape_is_refused_while_ctime_is_identity(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime,
+):
+    path = tmp_path / "plain.csv"
+    path.write_bytes(b"1,2\n3,4\n")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", True)
+    win32_pathname_ctime(path)
+    caught = _raises(api.Viewer2DReadError, api.catalog_viewer_2d, path)
+    assert caught.code is api.Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED
+
+
+def test_win32_identity_catalogs_reads_and_certifies_the_pathname_ctime_shape(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime,
+):
+    path = tmp_path / "plain.csv"
+    path.write_bytes(b"1,2\n3,4\n")
+    with path.open("rb") as handle:
+        handle_ctime_ns = os.fstat(handle.fileno()).st_ctime_ns
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    gap_ns = win32_pathname_ctime(path)
+    assert os.stat(path).st_ctime_ns == handle_ctime_ns - gap_ns
+    catalog = api.catalog_viewer_2d(path)
+    # The metadata identity normalizes the platform ctime difference once.
+    assert catalog.primary_revision.ctime_ns == 0
+    frame = api.read_viewer_2d_frame(catalog, 0)
+    _assert_canonical(frame, [[1, 2], [3, 4]])
+    # ... and both fences accept the file under either view.
+    with path.open("rb", buffering=0) as stream:
+        api._cert_stat_revision(catalog.primary_revision, stream=stream, message="unused")
+    assert api._path_stat(path) == api._revision_stat(catalog.primary_revision)
+    assert api._revision_stat(catalog.primary_revision)[4] == 0
+
+
+
+
+
+
+
+
+
+
+def test_win32_identity_still_refuses_a_pathname_mtime_disagreement(
+    tmp_path, monkeypatch, ctime_seam,
+):
+    path = tmp_path / "plain.csv"
+    path.write_bytes(b"1,2\n3,4\n")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    real_stat = os.stat
+
+    class _Shifted:
+        def __init__(self, real):
+            self._real = real
+            self.st_mtime_ns = real.st_mtime_ns - 1
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def shifted_stat(target, *args, **kwargs):
+        result = real_stat(target, *args, **kwargs)
+        if isinstance(target, (str, os.PathLike)) and os.path.abspath(target) == str(path):
+            return _Shifted(result)
+        return result
+
+    monkeypatch.setattr(os, "stat", shifted_stat)
+    caught = _raises(api.Viewer2DReadError, api.catalog_viewer_2d, path)
+    assert caught.code is api.Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED

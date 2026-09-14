@@ -480,25 +480,19 @@ def test_publication_drop_compacts_middle_row_and_preserves_cursor_reuse(tmp_pat
 
 def test_cross_mode_and_source_prevalidation_precedes_any_authoritative_mutation(tmp_path):
     from xrd_tools.core.scan import Scan, ScanFrame
-    from xrd_tools.reduction.core import NexusSink, ReductionPlan, ReductionResult
+    from xrd_tools.reduction.core import FrameReduction, NexusSink, ReductionPlan, ReductionResult
 
     target = tmp_path / "atomic-validation.nexus"
     frame = ScanFrame(0, image=np.ones((2, 2)), source_path=tmp_path / "raw-0.h5")
     scan = Scan("atomic", [frame])
     sink = NexusSink(target, atomic=False, overwrite=True, flush_every=1)
     sink.begin(scan, ReductionPlan())
-    sink.write(frame, type("Reduction", (), {
-        "frame_index": 0, "result_1d": _r1(0), "result_2d": _r2(0),
-        "mode_1d": "default", "mode_2d": "default", "metadata": {},
-    })())
+    sink.write(frame, FrameReduction(0, _r1(0), _r2(0)))
     with h5py.File(target, "r") as h5:
         before = np.asarray(h5["entry/integrated_1d/intensity"][0]).copy()
     bad_2d = _r2(9, nq=5, nchi=3)
     with pytest.raises(ValueError):
-        sink.write(frame, type("Reduction", (), {
-            "frame_index": 0, "result_1d": _r1(9), "result_2d": bad_2d,
-            "mode_1d": "default", "mode_2d": "default", "metadata": {},
-        })())
+        sink.write(frame, FrameReduction(0, _r1(9), bad_2d))
     sink.abort(ReductionResult("atomic", {}, 1, failed=True))
     assert not target.exists()
     partial = Path(sink._transaction.snapshot().partial_path)
@@ -508,7 +502,7 @@ def test_cross_mode_and_source_prevalidation_precedes_any_authoritative_mutation
 
 def test_dirty_replacement_updates_exact_source_record_and_transposes_2d_once(tmp_path):
     from xrd_tools.core.scan import Scan, ScanFrame
-    from xrd_tools.reduction.core import NexusSink, ReductionPlan, ReductionResult
+    from xrd_tools.reduction.core import FrameReduction, NexusSink, ReductionPlan, ReductionResult
 
     target = tmp_path / "replace.nexus"
     old_frame = ScanFrame(
@@ -519,20 +513,14 @@ def test_dirty_replacement_updates_exact_source_record_and_transposes_2d_once(tm
     scan = Scan("replace", [old_frame])
     sink = NexusSink(target, atomic=False, overwrite=True, flush_every=None)
     sink.begin(scan, ReductionPlan())
-    sink.write(old_frame, type("Reduction", (), {
-        "frame_index": 2, "result_1d": None, "result_2d": _r2(1),
-        "mode_1d": "default", "mode_2d": "default", "metadata": {},
-    })())
+    sink.write(old_frame, FrameReduction(2, None, _r2(1)))
     replacement = _r2(20)
     new_frame = ScanFrame(
         2, image=np.array([[4.0, 5.0], [6.0, 7.0]]),
         source_path=tmp_path / "new.h5", source_frame_index=8,
         metadata={"timestamp": "new"},
     )
-    sink.replace(new_frame, type("Reduction", (), {
-        "frame_index": 2, "result_1d": None, "result_2d": replacement,
-        "mode_1d": "default", "mode_2d": "default", "metadata": {},
-    })())
+    sink.replace(new_frame, FrameReduction(2, None, replacement))
     sink.finish(ReductionResult("replace", {}, 1))
     with h5py.File(target, "r") as h5:
         np.testing.assert_allclose(h5["entry/integrated_2d/intensity"][0], replacement.intensity.T)
@@ -934,7 +922,7 @@ def test_surrogate_persisted_source_text_refuses_before_any_mutation(
     before_pending = dict(writer._pending)
     before_receipts = tuple(facade.durable)
     incoming_snapshot = dict(snapshot)
-    incoming_snapshot[field] = "\udcff"
+    # Valid incoming text must not conceal malformed already-persisted text.
     incoming = dict(
         label=0, result_2d=_r2(2), source_path=source,
         source_frame_index=1, source_snapshot=incoming_snapshot,
@@ -1292,6 +1280,7 @@ def test_source_base_mismatch_refuses_before_header_mutation(tmp_path):
     new = ScanMetadata("new", 13.0, 0.9, {}, {})
     h5 = open_nexus_writer(target, metadata=old, overwrite=True)
     try:
+        write_integrated_stack(h5["entry"], frame_indices=[0], results_1d=[_r1(1)])
         stamp_source_base(h5["entry"], tmp_path / "project-a")
     finally:
         h5.close()
@@ -1427,7 +1416,14 @@ def test_c1_is_mounted_through_qt_free_writer_binding():
     writer_source = (root / "src/xrd_tools/io/record_writer.py").read_text()
     assert "WriterTransactionBinding" in writer_source
     assert "seal_stream_checkpoint" in writer_source
-    assert all(name not in writer_source for name in ("xdart", "PyQt", "PySide", "qtpy"))
+    import ast
+    imports = [
+        name
+        for node in ast.walk(ast.parse(writer_source))
+        for name in ([alias.name for alias in node.names] if isinstance(node, ast.Import)
+                     else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
+    ]
+    assert not any(name.startswith(("xdart", "PyQt", "PySide", "qtpy")) for name in imports)
 
 
 def test_retained_v2_2d_writer_transposes_exactly_once(tmp_path):

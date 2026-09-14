@@ -94,10 +94,9 @@ def test_e3_ui61_user_clear_emits_empty_membership_then_projects_total(
             replace(state, revision=2, navigation=empty)
         )
         assert commands == []
-        # Browser/history retains accumulated run membership, while the
-        # scan-local footer below is empty without a current scan.
-        assert _browser_selected(shell) == (state.navigation.current,)
-        assert _browser_selected(shell)[0] is state.navigation.current
+        # Overlay history is independent of the browser highlight. With no
+        # current scan both browser focus and the scan-local footer are empty.
+        assert _browser_selected(shell) == ()
         assert not shell.browser.frames.currentIndex().isValid()
         assert shell.scientific.frame_selector.count() == 0
         assert shell.scientific.frame_selector.currentIndex() == -1
@@ -109,9 +108,9 @@ def test_e3_ui61_user_clear_emits_empty_membership_then_projects_total(
         assert commands == []
 
         shell.apply_state(replace(state, revision=4))
-        # The explicit clear is retained across projection refresh, while the
-        # run-global Browser catalog itself remains available.
-        assert _browser_selected(shell) == ()
+        # Returning to a current frame highlights that visit; the prior
+        # empty projection did not remove the run-global browser catalog.
+        assert _browser_selected(shell) == (state.navigation.current,)
         assert shell.browser.frame_model.rowCount() == len(
             state.navigation.frames
         )
@@ -120,7 +119,8 @@ def test_e3_ui61_user_clear_emits_empty_membership_then_projects_total(
         shell.apply_state(
             replace(state, revision=5, navigation=empty)
         )
-        assert _browser_selected(shell) == ()
+        # An empty projection does not invent a new user clear after that visit.
+        assert _browser_selected(shell) == (state.navigation.current,)
         assert shell.browser.frame_model.rowCount() == len(
             state.navigation.frames
         )

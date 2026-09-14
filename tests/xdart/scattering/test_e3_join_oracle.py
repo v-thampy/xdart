@@ -9,6 +9,7 @@ private controller beside a decorative shell.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from copy import deepcopy
 from pathlib import Path
 import shutil
 from threading import Event, current_thread
@@ -51,7 +52,6 @@ from xdart.gui.tabs.scattering.workspace_shell import (
     ScatteringWorkspaceShell,
 )
 from xdart.modules.display_context import ContextKind
-from xrd_tools.core.scan import Scan, ScanFrame
 from xrd_tools.io import (
     FrameViewReader,
     ProcessedScan,
@@ -61,13 +61,11 @@ from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import image_series_spec
 
-from tests.xdart.scattering.test_e2lv_live_display import (
-    _Integrator,
-    _accepted_admission,
-)
+from xrd_tools.integrate.calibration import detector_calibration_to_integrator
 
 
 _PRODUCTION_SINK = output_module.NexusSink
+_PRODUCTION_OPEN_SOURCE = executor_module.open_source
 
 
 def _wait(
@@ -86,68 +84,40 @@ def _wait(
     raise AssertionError(f"E3-J0 timed out: {diagnostic()}")
 
 
-class _RecordingIntegrator(_Integrator):
+class _RecordingIntegrator:
     def __init__(
         self,
+        calibration,
         facts: list[tuple[str, str]],
         *,
         delay: float,
     ) -> None:
+        self._inner = detector_calibration_to_integrator(calibration)
         self._facts = facts
         self._delay = delay
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def __deepcopy__(self, memo):
+        copied = object.__new__(type(self))
+        memo[id(self)] = copied
+        copied._inner = deepcopy(self._inner, memo)
+        copied._facts = self._facts
+        copied._delay = self._delay
+        return copied
 
     def integrate1d(self, *args, **kwargs):
         self._facts.append(("integrate1d", current_thread().name))
         if self._delay:
             time.sleep(self._delay)
-        return super().integrate1d(*args, **kwargs)
+        return self._inner.integrate1d(*args, **kwargs)
 
     def integrate2d(self, *args, **kwargs):
         self._facts.append(("integrate2d", current_thread().name))
         if self._delay:
             time.sleep(self._delay)
-        return super().integrate2d(*args, **kwargs)
-
-
-class _RecordingSource:
-    def __init__(
-        self,
-        members: tuple[Path, ...],
-        labels: tuple[int, ...],
-        scan_name: str,
-        facts: list[tuple[str, str]],
-    ) -> None:
-        self._members = members
-        self._labels = labels
-        self._scan_name = scan_name
-        self._facts = facts
-        facts.append(("source-open", current_thread().name))
-
-    def to_scan(self, *, poni, integrator, output_path):
-        self._facts.append(("source-to-scan", current_thread().name))
-        return Scan(
-            self._scan_name,
-            [
-                ScanFrame(
-                    label,
-                    image=(
-                        np.arange(24, dtype=np.uint32).reshape(4, 6)
-                        + ordinal - 1
-                    ),
-                    source_path=member,
-                    source_frame_index=0,
-                )
-                for ordinal, (member, label) in enumerate(
-                    zip(self._members, self._labels, strict=True), 1
-                )
-            ],
-            poni=poni,
-            integrator=integrator,
-            output_path=output_path,
-        )
-
-    def close(self) -> None:
-        self._facts.append(("source-close", current_thread().name))
+        return self._inner.integrate2d(*args, **kwargs)
 
 
 class _RecordingScalarReader:
@@ -252,7 +222,7 @@ def _mount(
     raw.mkdir(parents=True)
     processed.mkdir(parents=True)
     members = tuple(
-        raw / f"run.with.dots_{label:04d}.tif" for label in labels
+        raw / f"{scan_name}_{label:04d}.tif" for label in labels
     )
     for ordinal, member in enumerate(members, 1):
         fabio.tifimage.TifImage(
@@ -263,28 +233,41 @@ def _mount(
         ).write(str(member))
     selected = members[0]
     poni = project / "detector.poni"
-    poni.write_text("accepted through immutable test assets")
-    output = processed / "run.with.dots.nexus"
+    poni.write_text(
+        'poni_version: 2.1\nDetector: Detector\n'
+        'Detector_config: {"pixel1": 0.0001, "pixel2": 0.0001, "max_shape": [4, 6], "orientation": 3}\n'
+        'Distance: 0.1\nPoni1: 0.0002\nPoni2: 0.0003\n'
+        'Rot1: 0\nRot2: 0\nRot3: 0\nWavelength: 1e-10\n'
+    )
+    output = processed / "run.with.dots_int2d.nexus"
     facts: list[tuple[str, str]] = []
     browse_facts: list[tuple[str, str]] = []
 
-    monkeypatch.setattr(
-        executor_module,
-        "build_admission_receipt",
-        _accepted_admission(labels),
-    )
-    monkeypatch.setattr(
-        executor_module,
-        "open_source",
-        lambda _spec: _RecordingSource(
-            members, labels, scan_name, facts
-        ),
-    )
+    def open_source(spec):
+        source = _PRODUCTION_OPEN_SOURCE(spec)
+        facts.append(("source-open", current_thread().name))
+        to_scan = source.to_scan
+        close = getattr(source, "close", None)
+
+        def recorded_scan(**kwargs):
+            facts.append(("source-to-scan", current_thread().name))
+            return to_scan(**kwargs)
+
+        def recorded_close():
+            facts.append(("source-close", current_thread().name))
+            return close()
+
+        monkeypatch.setattr(source, "to_scan", recorded_scan)
+        if callable(close):
+            monkeypatch.setattr(source, "close", recorded_close)
+        return source
+
+    monkeypatch.setattr(executor_module, "open_source", open_source)
     monkeypatch.setattr(
         executor_module,
         "poni_to_integrator",
-        lambda _poni: _RecordingIntegrator(
-            facts, delay=reduction_delay
+        lambda calibration: _RecordingIntegrator(
+            calibration, facts, delay=reduction_delay
         ),
     )
 
@@ -329,7 +312,7 @@ def _mount(
                 source_spec=image_series_spec(selected),
                 poni_file=str(poni),
                 project_root=str(project),
-                save_path=str(output),
+                save_path=str(processed / "run.with.dots.nexus"),
                 output_mode=output_mode,
                 max_cores=1,
                 bai_1d_args={"npt": 12},
@@ -364,9 +347,11 @@ def _run(rig: _MountedRig) -> None:
     rig.shell.run_controls.startButton.click()
     _wait(
         rig.app,
-        lambda: rig.controller.acquisition_context is not None,
-        diagnostic=lambda: rig.lifecycle.phase.value,
+        lambda: rig.controller.acquisition_context is not None or rig.lifecycle.phase is RunPhase.FAILED,
+        diagnostic=lambda: rig.page._notice_text,
     )
+
+    assert rig.controller.acquisition_context is not None, rig.page._notice_text
 
 
 def _pause(rig: _MountedRig) -> None:
@@ -393,8 +378,10 @@ def _produce_browse_artifact(monkeypatch, root: Path) -> Path:
     )
     try:
         _run(rig)
-        _wait(rig.app, lambda: rig.lifecycle.phase is RunPhase.IDLE)
+        _wait(rig.app, lambda: rig.lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED})
+        assert rig.lifecycle.phase is RunPhase.IDLE, rig.page._notice_text
         assert rig.output.is_file()
+        assert rig.close().cleanup_status is CleanupStatus.CLEANED
         result = rig.output.with_name("browse.with.dots.nexus")
         if result != rig.output:
             rig.output.rename(result)
@@ -432,15 +419,43 @@ def test_j0_01_run_mounts_exact_a_and_shell_bindings(
         assert bindings.publication_store is context.publication_store
 
         _wait(rig.app, lambda: bool(rig.controller.frame_keys))
+        # Presentation pacing (Single + Auto Last) repaints the scientific
+        # surface on hydration boundaries, not on every FRAME_READY, so the
+        # selector can trail controller.frame_keys by a few frames on a slow
+        # host (Linux CI).  The contract is that a reconcile mirrors the
+        # exact key objects; wait for one, then pin the mirrored snapshot.
+        selector = rig.shell.scientific.frame_selector
+
+        def selector_mirrors_keys() -> bool:
+            keys = rig.controller.frame_keys
+            return bool(keys) and selector.count() == len(keys) and all(
+                selector.itemData(index) is key
+                for index, key in enumerate(keys)
+            )
+
+        _wait(
+            rig.app,
+            selector_mirrors_keys,
+            diagnostic=lambda: (
+                f"selector={selector.count()} "
+                f"keys={len(rig.controller.frame_keys)} "
+                f"phase={rig.lifecycle.phase}"
+            ),
+        )
         keys = rig.controller.frame_keys
         assert all(
-            rig.shell.scientific.frame_selector.itemData(index) is key
+            selector.itemData(index) is key
             for index, key in enumerate(keys)
         )
         assert all(
             thread == "scattering-standard"
             for operation, thread in rig.facts
-            if operation != "source-close"
+            if operation in {"source-open", "source-to-scan", "sink-open"}
+        )
+        assert all(
+            thread != current_thread().name
+            for operation, thread in rig.facts
+            if operation in {"integrate1d", "integrate2d"}
         )
         assert [item[0] for item in rig.facts].count("source-open") == 1
         assert [item[0] for item in rig.facts].count("sink-open") == 1
@@ -460,6 +475,11 @@ def test_j0_02_browser_footer_share_repeated_dotted_exact_keys(
     )
     try:
         _run(rig)
+        # _run returns once the acquisition context exists, before any frame
+        # is catalogued; a Pause landing that early on a slow host (Linux CI)
+        # freezes navigation with no key for frame 1.  Cores=1 delivers frames
+        # in order, so the first key is frame 1 once any key exists.
+        _wait(rig.app, lambda: bool(rig.controller.frame_keys))
         _pause(rig)
         a_one = next(
             key for key in rig.controller.frame_keys
@@ -717,7 +737,9 @@ def test_j0_06_stop_is_fail_closed_without_orphan_work(
                 lambda: rig.lifecycle.phase
                 in {RunPhase.IDLE, RunPhase.FAILED},
             )
-            assert rig.controller.browse_pending is False
+            # Stop settles the writer before the asynchronous final-artifact
+            # Browse handoff. It must settle too, rather than remain orphaned.
+            _wait(rig.app, lambda: not rig.controller.browse_pending)
             assert not rig.shell.run_controls.stopButton.isEnabled()
         finally:
             release.set()
@@ -752,6 +774,12 @@ def test_j0_07_b_to_c_releases_b_before_c_and_retains_failed_owner(
             ),
         )
         context_b = rig.controller.browse_context
+        # Catalog adoption precedes the separately queued preview publication.
+        _wait(rig.app, lambda: (
+            rig.shell.scientific.raw.image.image is not None
+            and rig.shell.scientific.cake.image.image is not None
+            and bool(rig.shell.scientific.curve.listDataItems())
+        ))
         frame_b = rig.controller.navigation.current
         assert frame_b is not None
         assert rig.shell.scientific.raw.image.image is not None
@@ -766,6 +794,7 @@ def test_j0_07_b_to_c_releases_b_before_c_and_retains_failed_owner(
                 int,
             ]
         ] = []
+        snapshots: list[bool] = []
         apply_state = rig.shell.apply_state
 
         def record_presentation(
@@ -783,6 +812,10 @@ def test_j0_07_b_to_c_releases_b_before_c_and_retains_failed_owner(
                     replace_scientific_on_failure
                 ),
             )
+            snapshots.append(
+                rig.shell.scientific.viewer_loading_snapshot_visible
+                and rig.shell.scientific.viewer_loading_snapshot_pixels > 0
+            )
             presentations.append(
                 (
                     state.navigation.current,
@@ -796,27 +829,23 @@ def test_j0_07_b_to_c_releases_b_before_c_and_retains_failed_owner(
         monkeypatch.setattr(
             rig.shell, "apply_state", record_presentation
         )
-        real_release = rig.loader.release_context
+        real_settle_cache = rig.loader._settle_cache
         cancelled_requests: list[BrowseLoadRequest] = []
 
-        def pending_once(context):
+        def pending_once(cache):
             monkeypatch.setattr(
-                rig.loader, "release_context", real_release
+                rig.loader, "_settle_cache", real_settle_cache
             )
+            assert cache is context_b.browse_1d_cache
             operation = rig.loader._active
             assert operation is not None
             cancelled_requests.append(operation.request)
-            from xdart.gui.tabs.scattering.browse_values import (
-                BrowseCleanupReceipt,
-            )
-
-            return BrowseCleanupReceipt(
-                context.load_request,
-                CleanupStatus.CLEANUP_PENDING,
-            )
+            # Fail after the real owner withdraws admission authority, while
+            # it still retains B's exact cache and presentation for retry.
+            raise OSError("injected Browse cache close failure")
 
         monkeypatch.setattr(
-            rig.loader, "release_context", pending_once
+            rig.loader, "_settle_cache", pending_once
         )
         rig.command(
             ShellCommand(ShellCommandKind.SELECT_SCAN, str(c))
@@ -873,9 +902,19 @@ def test_j0_07_b_to_c_releases_b_before_c_and_retains_failed_owner(
         assert presentations[0][0] is frame_b
         assert presentations[-1][0] is frame_c
         assert all(title for _frame, title, _raw, _cake, _traces in presentations)
-        assert all(raw for _frame, _title, raw, _cake, _traces in presentations)
-        assert all(cake for _frame, _title, _raw, cake, _traces in presentations)
-        assert all(traces for _frame, _title, _raw, _cake, traces in presentations)
+        # A changed Browse identity releases foreign scientific arrays while
+        # retaining the capped screen raster until the new sparse read is ready.
+        assert all(
+            snapshot or (raw and cake and traces)
+            for (_frame, _title, raw, cake, traces), snapshot
+            in zip(presentations, snapshots, strict=True)
+        ), (presentations, snapshots)
+        _wait(rig.app, lambda: (
+            rig.shell.scientific.raw.image.image is not None
+            and rig.shell.scientific.cake.image.image is not None
+            and bool(rig.shell.scientific.curve.listDataItems())
+            and not rig.shell.scientific.viewer_loading_snapshot_visible
+        ))
     finally:
         rig.close()
 
@@ -883,17 +922,49 @@ def test_j0_07_b_to_c_releases_b_before_c_and_retains_failed_owner(
 def test_j0_08_evicted_hydration_is_single_flight_and_does_not_blank(
     monkeypatch, tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("XDART_HEAVY_WINDOW", "1")
+    # Fund the sixteen-frame writer checkpoint, then exceed the retained
+    # heavy window while the acquisition is still running.
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "16")
     rig = _mount(
         monkeypatch,
         tmp_path,
-        labels=tuple(range(1, 13)),
+        labels=tuple(range(1, 180)),
         max_display_items=1,
+        reduction_delay=0.003,
     )
+    read_entered, release_read = Event(), Event()
     try:
         _run(rig)
-        _wait(rig.app, lambda: rig.lifecycle.phase is RunPhase.IDLE)
+        _wait(rig.app, lambda: len(rig.controller.frame_keys) >= 20)
         first = rig.controller.frame_keys[0]
+        # Residency may only drop frame 1 once the writer's checkpoint has
+        # verified its rows; a slow host accepts twenty frames before that.
+        # Wait for the eviction while the acquisition still re-arms
+        # residency, so the hydration below has to read.
+        _wait(
+            rig.app,
+            lambda: not any(
+                frame is first for frame in rig.controller.resident_frame_keys
+            ),
+            diagnostic=lambda: (
+                f"frame 1 still resident after "
+                f"{len(rig.controller.frame_keys)} frames, "
+                f"phase={rig.lifecycle.phase.value}"
+            ),
+        )
+        _pause(rig)
+        # A record batch written since the last sixteen-frame checkpoint
+        # revokes the artifact's checkpoint-hydration authority, and the shell
+        # drops an evicted-frame read silently while it is revoked.  A durable
+        # Pause seals the quiesced writer itself, so the hydration below is
+        # authorised on every host, not only when the pause happens to land
+        # on a checkpoint boundary.
+        run = rig.executor._active
+        assert run is not None and run.session is not None
+        records = run.display.artifacts[str(run.artifact)].records
+        assert records._checkpoint_hydration_authority()[0] is not None
+        assert run.session._dynamic_nexus_checkpoint_count == 0
+        _wait(rig.app, lambda: rig.shell.scientific.raw.image.image is not None)
         from xdart.gui.tabs.scattering import hydration_transport
 
         read_labels: list[int] = []
@@ -901,13 +972,15 @@ def test_j0_08_evicted_hydration_is_single_flight_and_does_not_blank(
 
         def counted_read(read_key, **kwargs):
             read_labels.append(int(read_key.frame_identity))
+            read_entered.set()
+            assert release_read.wait(5.0)
             return real_read(read_key, **kwargs)
 
         monkeypatch.setattr(
             hydration_transport, "read_frame_preview", counted_read
         )
         before_raw = np.array(
-            rig.shell.scientific.raw.image, copy=True
+            rig.shell.scientific.raw.image.image, copy=True
         )
         command = ShellCommand(
             ShellCommandKind.HYDRATE_FRAME,
@@ -915,10 +988,16 @@ def test_j0_08_evicted_hydration_is_single_flight_and_does_not_blank(
             frames=(first,),
         )
         rig.command(command)
+        assert read_entered.wait(5.0), (
+            "no preview read for frame 1; resident="
+            f"{any(frame is first for frame in rig.controller.resident_frame_keys)}"
+            f" authorised={records._checkpoint_hydration_authority()[0] is not None}"
+        )
         rig.command(command)
         np.testing.assert_array_equal(
-            rig.shell.scientific.raw.image, before_raw
+            rig.shell.scientific.raw.image.image, before_raw
         )
+        release_read.set()
         _wait(
             rig.app,
             lambda: (
@@ -931,6 +1010,7 @@ def test_j0_08_evicted_hydration_is_single_flight_and_does_not_blank(
         # Single flight: the repeated command coalesced onto ONE exact read.
         assert read_labels.count(first.local_frame_label) == 1
     finally:
+        release_read.set()
         rig.close()
 
 
@@ -944,7 +1024,8 @@ def test_j0_09_equal_foreign_stale_and_late_values_are_inert(
     )
     try:
         _run(rig)
-        _wait(rig.app, lambda: rig.lifecycle.phase is RunPhase.IDLE)
+        _wait(rig.app, lambda: rig.lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED})
+        assert rig.lifecycle.phase is RunPhase.IDLE, rig.page._notice_text
         accepted = rig.controller.frame_keys[-1]
         prior = rig.shell.scientific.frame_selector.currentData()
         equal_foreign = replace(accepted)
@@ -1019,7 +1100,8 @@ def test_j0_11_relative_raw_path_survives_project_tree_move(
     rig = _mount(monkeypatch, tmp_path, labels=(1,))
     try:
         _run(rig)
-        _wait(rig.app, lambda: rig.lifecycle.phase is RunPhase.IDLE)
+        _wait(rig.app, lambda: rig.lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED})
+        assert rig.lifecycle.phase is RunPhase.IDLE, rig.page._notice_text
         with h5py.File(rig.output, "r") as handle:
             source = handle["entry/frames/frame_0001/source/path"][()]
             if isinstance(source, bytes):
@@ -1042,37 +1124,25 @@ def test_j0_11_relative_raw_path_survives_project_tree_move(
             rig.close()
 
 
-def test_j0_12_append_is_visible_and_refused_before_any_preflight_owner(
+def test_j0_12_append_is_visible_and_admitted_through_real_preflight(
     monkeypatch, tmp_path: Path,
 ) -> None:
-    calls: list[str] = []
-
-    def forbidden(*_args, **_kwargs):
-        calls.append("preflight")
-        raise AssertionError("Append reached output preflight")
-
     rig = _mount(
         monkeypatch,
         tmp_path,
         labels=(1,),
         output_mode="Append",
     )
-    monkeypatch.setattr(
-        executor_module, "build_admission_receipt", forbidden
-    )
     try:
         state = rig.shell.run_controls
         assert state.write_mode() == "Append"
-        assert "H23" in state.readinessLabel.full_text()
-        assert not state.startButton.isEnabled()
-        rig.command(ShellCommand(ShellCommandKind.RUN_ACTION))
-        deadline = time.monotonic() + 0.05
-        while time.monotonic() < deadline:
-            rig.app.processEvents()
-            time.sleep(0.002)
-        assert calls == []
-        assert rig.lifecycle.phase is RunPhase.IDLE
-        assert rig.executor._active is None
-        assert not rig.output.exists()
+        _run(rig)
+        _wait(rig.app, lambda: rig.lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED})
+        assert rig.lifecycle.phase is RunPhase.IDLE, rig.page._notice_text
+        assert rig.output.is_file()
+        with h5py.File(rig.output, "r") as handle:
+            assert list(handle["entry/frames"]) == ["frame_0001"]
+        assert any(fact == "source-open" for fact, _thread in rig.facts)
+        assert any(fact == "sink-open" for fact, _thread in rig.facts)
     finally:
         rig.close()

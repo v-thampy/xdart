@@ -27,6 +27,7 @@ from xrd_tools.io.output_safety import (
 )
 from xrd_tools.session.intent_store import RunIntentSnapshot
 from xrd_tools.session.run_configuration import FrozenRunConfiguration, RunIntent
+from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.sources.adapters import candidate_owner, get_adapter
 from xrd_tools.sources.descriptor import ContainerDescriptor
 from xrd_tools.sources.discover import Candidate
@@ -217,6 +218,13 @@ class DeferredDirectoryPlan:
     entries: tuple[DeferredDirectoryEntry, ...]
     discovered_paths: tuple[Path, ...]
     live: bool = False
+    # Every output target of this run, keyed lexically and (when the target
+    # already exists) by stat identity, so one JIT materialization can refuse
+    # to read another group's output as raw data without rescanning the plan.
+    _target_keys: frozenset[str] = field(init=False, repr=False, compare=False)
+    _target_identities: frozenset[tuple[int, int]] = field(
+        init=False, repr=False, compare=False,
+    )
 
     def __post_init__(self) -> None:
         flattened = tuple(
@@ -253,6 +261,14 @@ class DeferredDirectoryPlan:
         )
         if not (common and (watching if self.live else finite)):
             raise TypeError("deferred directory plan is invalid")
+        object.__setattr__(self, "_target_keys", frozenset(
+            _lexical_key(entry.target) for entry in self.entries
+        ))
+        object.__setattr__(self, "_target_identities", frozenset(
+            (entry.fact.target_state[3], entry.fact.target_state[4])
+            for entry in self.entries
+            if type(entry.fact.target_state) is tuple
+        ))
 
     @property
     def discovered_file_count(self) -> int:
@@ -261,6 +277,41 @@ class DeferredDirectoryPlan:
     @property
     def targets(self) -> tuple[Path, ...]:
         return tuple(entry.target for entry in self.entries)
+
+    def owns_target(self, path: Path) -> bool:
+        """True when *path* is one of this run's output targets.
+
+        Lexical (normcase/abspath) and resolved (realpath) keys catch the
+        plain and symlinked spellings.  A hard link is only visible through
+        stat identity: the admission-time identities cover targets that
+        already existed then, and a dependency carrying more than one link
+        is compared against the targets' *current* identities, so a link
+        made after admission to an output this run has since written is
+        refused as well.  A single-linked dependency (the normal case) is
+        settled by its own stat alone.
+        """
+        if (
+            _lexical_key(path) in self._target_keys
+            or os.path.normcase(os.path.realpath(path)) in self._target_keys
+        ):
+            return True
+        try:
+            state = os.stat(path)
+        except OSError:
+            return False
+        identity = (int(state.st_dev), int(state.st_ino))
+        if identity in self._target_identities:
+            return True
+        if int(state.st_nlink) < 2:
+            return False
+        for entry in self.entries:
+            try:
+                current = os.stat(entry.target)
+            except OSError:
+                continue
+            if (int(current.st_dev), int(current.st_ino)) == identity:
+                return True
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1189,6 +1240,7 @@ def materialize_deferred_output(
         receipt.candidate.source,
         (item,),
         cancelled=cancelled,
+        run_plan=deferred,
     )
     decision = inspect_output(item, receipt.candidate, entry.fact)
     if item.source_spec.kind is SourceKind.TIFF_SERIES:
@@ -1891,6 +1943,7 @@ def _validate_targets(
     items: tuple[PlannedOutput, ...],
     *,
     cancelled: Callable[[], bool] | None = None,
+    run_plan: DeferredDirectoryPlan | None = None,
 ) -> None:
     raw: tuple[Path, ...] = ()
     for item in items:
@@ -1900,6 +1953,17 @@ def _validate_targets(
         )
         raw += tuple(Path(binding.raw_path) for binding in identity.identity.aliases)
         raw += tuple(Path(target.resolved_path) for target in identity.targets)
+    if run_plan is not None:
+        # Directory JIT: this group's dependencies are in hand, so refuse to
+        # read ANY output target of the run as raw data (a raw container that
+        # links into the Save Path).  The item's own target is covered below.
+        for dependency in raw:
+            if run_plan.owns_target(dependency):
+                raise OutputCollisionError(
+                    f"Reduction output '{dependency}' is the same file as a raw "
+                    f"directory input that '{items[0].target.name}' depends on; "
+                    "choose a separate Save Path."
+                )
     protected = tuple(
         Path(value) for value in (
             configuration.poni_file, configuration.mask_file,
@@ -2022,13 +2086,14 @@ def _scientific_mask_file_limit(
 def _asset_state(path: Path) -> tuple[int, ...]:
     state = path.stat()
     return (
-        state.st_size, state.st_mtime_ns, state.st_ctime_ns,
+        state.st_size, state.st_mtime_ns, identity_ctime_ns(state.st_ctime_ns),
         state.st_dev, state.st_ino,
     )
 def _asset_descriptor_state(stream: object) -> tuple[int, ...]:
+    # Compared against the pathname view above: ctime on the win32 seam.
     state = os.fstat(stream.fileno())
     return (
-        state.st_size, state.st_mtime_ns, state.st_ctime_ns,
+        state.st_size, state.st_mtime_ns, identity_ctime_ns(state.st_ctime_ns),
         state.st_dev, state.st_ino,
     )
 def _stream_asset(
@@ -2186,6 +2251,10 @@ def _load_stable_asset(
     if after_state != before_state or after != before:
         raise ValueError(f"scientific asset changed while admitted: {path}")
     return value, hashlib.sha256(before).hexdigest()
+def _lexical_key(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
 def _path_state(path: Path) -> tuple[int, int, int, int, int] | bool:
     try:
         stat = path.stat()

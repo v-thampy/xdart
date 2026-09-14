@@ -855,10 +855,9 @@ class DynamicOutputAdapter:
         graph = self._current
         if graph is None or graph.get("display_owner") is None:
             return None
-        if (
-            graph.get("target") == _target_key(item.target)
-            and graph.get("lineage") == _stable_lineage(item)
-        ):
+        if graph.get("target") == _target_key(item.target):
+            # Keep this target's owner through admission so activation can
+            # reject a changed lineage before a fresh Overwrite sink is built.
             return None
         return graph["display_owner"]
 

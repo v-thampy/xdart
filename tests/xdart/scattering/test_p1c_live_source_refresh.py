@@ -16,7 +16,7 @@ from xdart.gui.tabs.scattering.contracts import (
     SourceObservationRequest,
     SourceObservationStatus,
 )
-from xdart.gui.tabs.scattering.controls_projection import PROJECT_ROOT
+from xdart.gui.tabs.scattering.controls_projection import INT_1D_POINTS
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.display_values import (
     StandardEventKind,
@@ -489,10 +489,11 @@ def test_unrelated_intent_edit_does_not_drop_blocked_passive_refresh(
 
         prior_revision = page._intents.snapshot().revision
         page._shell.controls.fieldValueChanged.emit(
-            PROJECT_ROOT,
-            str(tmp_path / "unrelated-project"),
+            INT_1D_POINTS,
+            17,
         )
         assert page._intents.snapshot().revision == prior_revision + 1
+        assert page._intents.snapshot().thaw().bai_1d_args["npt"] == 17
 
         sources.refresh_release.set()
         _wait(

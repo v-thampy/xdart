@@ -149,8 +149,16 @@ def test_real_partial_stop_qualifies_nexpy_only_after_saved_browse(
             shell.scientific.curve.listDataItems()[0].getData()[1],
             expected.intensity_1d,
         )
-        assert shell.scientific.raw.image.image is not None
-        assert shell.scientific.cake.image.image is not None
+        # The curve rides the light 1-D borrow; raw and cake arrive with the
+        # heavy per-frame hydration, which may land a later drain.
+        assert _wait(qapp, lambda: (
+            shell.scientific.raw.image.image is not None
+            and shell.scientific.cake.image.image is not None
+        )), (
+            shell.scientific.raw.image.image is not None,
+            shell.scientific.cake.image.image is not None,
+            page._notice_text,
+        )
     finally:
         release.set()
         assert _wait(qapp, lambda: page.close_workspace().cleanup_status is CleanupStatus.CLEANED)

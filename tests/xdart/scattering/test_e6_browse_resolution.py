@@ -37,6 +37,10 @@ from tests.xdart.scattering.test_e4_preview_transport import (
     _transport_api,
 )
 
+from tests.xdart.scattering.test_e6_browse_hydration_owner import (
+    _warm_browse_preview,
+)
+
 _VALUE_NAMES = (
     "BrowseMissReason",
     "QualifiedPayload",
@@ -123,15 +127,11 @@ def _wait_repaint(controller, deadline_s: float = 10.0) -> bool:
 
 
 def _completed_cold_browse(tmp_path, label):
-    """A cold Browse whose current label is detector-complete.
-
-    ``loader_max=32`` seeds every label's full publication at load, exactly
-    like the warm E4 fixture, so the current label needs no hydration round.
-    """
+    """A sparse cold Browse explicitly hydrated before projection spies."""
     controller, browse, processed = _adopted_cold_browse(
         tmp_path, loader_max=32
     )
-    key = _browse_key(controller, label)
+    key = _warm_browse_preview(controller, label)
     return controller, browse, processed, key
 
 
@@ -174,11 +174,11 @@ def test_publication_needs_hydration_only_in_resolver_family():
     assert referencing <= permitted, sorted(referencing - permitted)
 
 
-def test_acquisition_closed_passthrough_is_preserved_byte_exact():
+def test_acquisition_closed_passthrough_reaches_detached_transport():
     source = inspect.getsource(
         import_module("xdart.gui.tabs.scattering.display_runtime")
     )
-    assert "self._transport.submit(request, closed=closed)" in source
+    assert "self._transport.submit_detached(request, closed=closed)" in source
 
 
 # --------------------------------------------------------------------------- #
@@ -254,6 +254,7 @@ def test_incomplete_current_single_get_exact_submit_not_resident(
         tmp_path, loader_max=32
     )
     key = _browse_key(controller, 2)
+    _warm_browse_preview(controller, 2)
     _demote_browse_publication(browse, 2)
 
     gets = _spy_gets(monkeypatch, browse)
@@ -281,6 +282,7 @@ def test_submitted_request_carries_exact_context_store_gate_artifact(
         tmp_path, loader_max=32
     )
     _browse_key(controller, 2)
+    _warm_browse_preview(controller, 2)
     _demote_browse_publication(browse, 2)
 
     submits = _spy_submits(monkeypatch, controller)
@@ -398,6 +400,7 @@ def test_repeated_label_change_reads_only_new_current(monkeypatch, tmp_path):
     _browse_key(controller, 2)
     controller.project_navigation()
 
+    _warm_browse_preview(controller, 3)
     _demote_browse_publication(browse, 3)
     key3 = _browse_key(controller, 3)
     gets = _spy_gets(monkeypatch, browse)
@@ -477,6 +480,7 @@ def test_refused_submit_leaves_no_pass_fail_closed(monkeypatch, tmp_path):
         tmp_path, loader_max=32
     )
     key = _browse_key(controller, 2)
+    _warm_browse_preview(controller, 2)
     _demote_browse_publication(browse, 2)
 
     owner = controller._browse_hydration_owner
@@ -499,6 +503,7 @@ def test_stale_refusal_regenerates_equivalent_current_miss(
         tmp_path, loader_max=32
     )
     key = _browse_key(controller, 2)
+    _warm_browse_preview(controller, 2)
     _demote_browse_publication(browse, 2)
 
     entered = threading.Event()
@@ -572,6 +577,7 @@ def test_stale_resolution_is_refused_before_submit(monkeypatch, tmp_path):
         tmp_path, loader_max=32
     )
     _browse_key(controller, 2)
+    _warm_browse_preview(controller, 2)
     _demote_browse_publication(browse, 2)
 
     projection = controller._projection
@@ -606,7 +612,7 @@ def test_typed_but_wrong_payload_is_malformed_and_not_resident(
     controller, _browse, _processed = _adopted_cold_browse(
         tmp_path, loader_max=32
     )
-    key = _browse_key(controller, 2)
+    key = _warm_browse_preview(controller, 2)
     payload = next(
         item for item in controller.project_navigation()
         if item.frame_key is key
@@ -635,7 +641,7 @@ def test_retained_pass_fails_closed_after_context_invalidation(tmp_path):
     controller, browse, _processed = _adopted_cold_browse(
         tmp_path, loader_max=32
     )
-    key = _browse_key(controller, 2)
+    key = _warm_browse_preview(controller, 2)
     assert any(
         item.frame_key is key for item in controller.project_navigation()
     )
@@ -657,11 +663,15 @@ def test_retained_pass_fails_closed_after_context_release(
     controller, browse, _processed = _adopted_cold_browse(
         tmp_path, loader_max=32
     )
-    key = _browse_key(controller, 2)
+    key = _warm_browse_preview(controller, 2)
     controller.project_navigation()
     assert _browse_pass(controller) is not None
 
-    browse.release()
+    receipt = controller._browse_hydration_owner.release(
+        controller._browse_loader, browse, preserve_pending_repaint=False,
+    )
+    assert receipt.cleanup_status.value == "cleaned"
+    assert browse.released
 
     gets = _spy_gets(monkeypatch, browse)
     assert key not in controller.resident_frame_keys
@@ -679,7 +689,7 @@ def test_retained_pass_fails_closed_after_direct_gate_cancel(
     controller, browse, _processed = _adopted_cold_browse(
         tmp_path, loader_max=32
     )
-    key = _browse_key(controller, 2)
+    key = _warm_browse_preview(controller, 2)
     controller.project_navigation()
     assert _browse_pass(controller) is not None
 

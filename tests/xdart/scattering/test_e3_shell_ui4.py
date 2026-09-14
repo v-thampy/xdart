@@ -151,6 +151,7 @@ def test_e3_ui4_scientific_controls_have_exact_local_and_global_order(
         assert _layout_widgets(shell.scientific.top_bar) == (
             shell.scientific.norm,
             shell.scientific.background,
+            shell.scientific.raw_popup_button,
             shell.scientific.title,
             shell.scientific.color_map,
             shell.scientific.log_scale,
@@ -165,6 +166,7 @@ def test_e3_ui4_scientific_controls_have_exact_local_and_global_order(
             shell.scientific.plot_action_group,
             shell.scientific.share_axis,
             shell.scientific.image_axis,
+            shell.scientific.viewer_intensity,
         )
         assert _layout_widgets(
             shell.scientific.axis_display_group.layout()

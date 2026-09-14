@@ -10,18 +10,47 @@ on:
         default: false
 
 jobs:
-  full:
+  core:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with: {python-version: "3.13"}
+      - run: pip install -e ".[gui,dev,fitting,rsm,notebook]"
+      - run: pytest tests/core -q --timeout=600
+
+  xdart-offscreen:
+    name: xdart-offscreen (${{ matrix.group }})
+    strategy:
+      fail-fast: false
+      # Same five bounded groups as pr.yml: the harness retains Qt objects to
+      # avoid unsafe DeferredDelete teardown, and one process over the whole
+      # tests/xdart tree grows that graph until theme repolishes time out.
+      matrix:
+        include:
+          - group: execution-context
+            tests: tests/xdart/scattering/test_e[123]*.py
+          - group: directory-display
+            tests: tests/xdart/scattering/test_e[46]*.py
+          - group: viewers-analysis
+            tests: tests/xdart/scattering/test_p*.py
+          - group: scattering-other
+            tests: tests/xdart/scattering --ignore-glob=tests/xdart/scattering/test_e[12346]*.py --ignore-glob=tests/xdart/scattering/test_p*.py
+          - group: application
+            tests: tests/xdart --ignore=tests/xdart/scattering
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with: {python-version: "3.13"}
       - run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0
       - run: pip install -e ".[gui,dev,fitting,rsm,notebook]"
-      - run: pytest tests/core -q --timeout=600
       - env:
           QT_QPA_PLATFORM: offscreen
+          XDART_SESSION_FILE: ${{ runner.temp }}/xdart-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.group }}-session.json
+          XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.group }}-settings.ini
         # scripts/ci_pytest.py hard-exits with pytest's own verdict, skipping
         # the interpreter teardown where the deterministic offscreen segfault
         # (exit 139, post-summary) lives — see pr.yml for the full rationale.
@@ -33,29 +62,40 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             code=0
-            python scripts/ci_pytest.py tests/xdart -q --timeout=900 --junitxml="xdart-attempt-$attempt.xml" || code=$?
+            python scripts/ci_pytest.py ${{ matrix.tests }} -q --timeout=900 --junitxml="xdart-attempt-$attempt.xml" || code=$?
             [ "$code" -eq 0 ] && exit 0
             if grep -qE '(failures|errors)="[1-9][0-9]*"' "xdart-attempt-$attempt.xml" 2>/dev/null; then
-              echo "::error::pytest tests/xdart reported real failures (not a segfault flake)"
+              echo "::error::pytest ${{ matrix.tests }} reported real failures (not a segfault flake)"
               exit 1
             fi
             if [ "$code" -ne 139 ]; then exit "$code"; fi
-            echo "::warning::pytest tests/xdart segfaulted mid-run (139), no reported failures, on attempt $attempt; retrying"
+            echo "::warning::pytest ${{ matrix.tests }} segfaulted mid-run (139), no reported failures, on attempt $attempt; retrying"
           done
           exit 139
-      # ── Teardown-crash diagnosis (opt-in via workflow_dispatch diag=true) ──
-      # Runs the suite WITHOUT the hard-exit wrapper so the interpreter-teardown
-      # SIGSEGV actually fires, under gdb, and uploads the native backtrace.
-      # This is the capture step for the structural fix: the crashing frames
-      # name the guilty library (libQt6*/shiboken/pyqtgraph/hdf5/OpenCL).
-      # Never fails the job — it exists only to produce the artifact.
-      - if: ${{ inputs.diag }}
-        continue-on-error: true
-        env:
+
+  # ── Teardown-crash diagnosis (opt-in via workflow_dispatch diag=true) ──
+  # Runs the whole suite WITHOUT the hard-exit wrapper so the interpreter-
+  # teardown SIGSEGV actually fires, under gdb, and uploads the native
+  # backtrace.  This is the capture step for the structural fix: the crashing
+  # frames name the guilty library (libQt6*/shiboken/pyqtgraph/hdf5/OpenCL).
+  # Never fails the run — it exists only to produce the artifact.
+  teardown-diagnosis:
+    if: ${{ inputs.diag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with: {python-version: "3.13"}
+      - run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 gdb
+      - run: pip install -e ".[gui,dev,fitting,rsm,notebook]"
+      - env:
           QT_QPA_PLATFORM: offscreen
           PYTHONFAULTHANDLER: "1"
+          XDART_SESSION_FILE: ${{ runner.temp }}/xdart-${{ github.run_id }}-${{ github.run_attempt }}-diag-session.json
+          XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-${{ github.run_id }}-${{ github.run_attempt }}-diag-settings.ini
         run: |
-          sudo apt-get install -y gdb
           code=0
           gdb -batch \
             -ex "handle SIGSEGV stop nopass" \
@@ -63,9 +103,7 @@ jobs:
             -ex "thread apply all bt" \
             --args python -m pytest tests/xdart -q --timeout=900 2>&1 | tee gdb-teardown.log || code=$?
           echo "diagnosis run exited $code (informational only)"
-      - if: ${{ inputs.diag }}
-        continue-on-error: true
-        uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7
         with:
           name: teardown-backtrace
           path: gdb-teardown.log

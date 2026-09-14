@@ -38,6 +38,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -46,6 +47,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from pyqtgraph.Qt import QtWidgets
+from xrd_tools.io import Browse1DCache, FrameScalarCatalog, FrameScalarRow
 
 from xdart.gui.tabs.scattering.browse_values import (
     BrowseLoadRequest,
@@ -83,7 +85,11 @@ from xdart.modules.display_context import (
     DisplaySelection,
     new_context_token,
 )
-from xdart.modules.frame_publication import FramePublication, PublicationStore
+from xdart.modules.frame_publication import (
+    FramePublication,
+    PublicationStore,
+    canonical_frame_source_identity,
+)
 from xrd_tools.core import Axis, FrameRecord, FrameView
 from xrd_tools.core.metadata import resolve_monitor_norm
 from xrd_tools.io.output_path import READABLE_OUTPUT_SUFFIXES
@@ -187,6 +193,7 @@ def _retain(display, owner, scan_key, artifact, label, value, metadata):
         source_identity=publication.source_identity,
         frame_mask_qualified=False,
     )
+    display.publish_light_1d(owner, record, source_identity=publication.source_identity)
     display.put_payload(
         StandardDisplayPayload(
             0, delta.appended, f"Standard · {scan_key} · {label}", view
@@ -195,18 +202,80 @@ def _retain(display, owner, scan_key, artifact, label, value, metadata):
     return delta.appended, delta
 
 
-def _add_artifact(display, artifact: str, scan_key: str):
-    return display.add_artifact(
+def _light_1d_layout(record: FrameRecord):
+    """One light-1D layout shaped exactly by a real multi-mode record."""
+    from xrd_tools.session import (
+        Light1DBufferLayout, Light1DLayout, Light1DModeLayout,
+    )
+
+    f64 = np.dtype(np.float64).str
+    modes = []
+    for mode, view in record.results_1d.items():
+        modes.append(Light1DModeLayout(
+            mode,
+            Light1DBufferLayout(len(view.axis_1d.values), 8, f"{mode}-axis", f64),
+            Light1DBufferLayout(
+                len(view.intensity_1d), 8, f"{mode}-intensity", f64,
+            ),
+            None if view.sigma_1d is None else Light1DBufferLayout(
+                len(view.sigma_1d), 8, f"{mode}-sigma", f64,
+            ),
+        ))
+    return Light1DLayout(tuple(modes), record.active_mode_1d)
+
+
+def _add_artifact(
+    display, artifact: str, scan_key: str, *, layout=None, gi: bool = False,
+):
+    from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
+    from xrd_tools.session import (
+        Light1DBufferLayout, Light1DLayout, Light1DModeLayout,
+        SessionResourceAuthority, SessionResourceRequirements,
+        acquire_light_1d_retention, resolve_session_policy,
+    )
+
+    owner = display.add_artifact(
         Path(artifact),
         scan_key,
         mask=None,
         mask_saturation=True,
-        measurement_mode="Standard",
-        gi_incidence_motor="",
-        gi_resolved_motor="",
-        gi_mode_1d="",
-        gi_mode_2d="",
+        measurement_mode="GI" if gi else "Standard",
+        gi_incidence_motor="th" if gi else "",
+        gi_resolved_motor="th" if gi else "",
+        gi_mode_1d="q_total" if gi else "",
+        gi_mode_2d="qip_qoop" if gi else "",
     )
+    if layout is None:
+        layout = Light1DLayout((Light1DModeLayout(
+            DEFAULT_MODE_KEY,
+            Light1DBufferLayout(2, 8, "norm-axis", np.dtype(np.float64).str),
+            Light1DBufferLayout(2, 8, "norm-intensity", np.dtype(np.float64).str),
+        ),), DEFAULT_MODE_KEY)
+    npt_1d = max(mode.intensity.length for mode in layout.modes)
+    row_capacity = 1024
+    ceiling = layout.shared_bytes + row_capacity * layout.per_row_unique_ndarray_bytes
+    allocation = resolve_session_policy(
+        SessionResourceRequirements(
+            2, 3, 8, modes_1d=len(layout.modes), modes_2d=1,
+            npt_1d=npt_1d, npt_rad=3, npt_azim=2,
+        ),
+        envelope_bytes=2 << 30,
+        requests={"record_heavy_items": 2, "publication_heavy_items": 2},
+        env={},
+    ).allocation
+    owner.publications.bind_allocation(allocation)
+    lease = acquire_light_1d_retention(
+        SessionResourceAuthority.from_allocation(allocation),
+        owner=f"norm-consumer:{artifact}", generation=1, layout=layout,
+        requested_rows=row_capacity, compatibility_byte_ceiling=ceiling,
+        gui_thread_id=threading.get_ident(),
+    )
+    owner.publications.bind_light_1d(lease)
+    display.stage_light_1d(
+        owner, lease, hooks=owner.publications.light_1d_cleanup_hooks(lease),
+    )
+    display.bind_light_1d(owner, lease)
+    return owner
 
 
 def _acquisition_context(configuration, display) -> AcquisitionContext:
@@ -256,6 +325,9 @@ def _acquisition_parts(
     runtime = _ContextRuntime()
     runtime.adopt_acquisition(identity, context)
     runtime.select_latest_navigation(plot_mode=plot_mode)
+    if plot_mode == "Overlay":
+        frames = runtime.navigation.frames
+        assert runtime.select_navigation(frames[-1], frames)
     return SimpleNamespace(
         configuration=configuration,
         identity=identity,
@@ -295,6 +367,12 @@ def _browse_parts(
 ):
     token = new_context_token(ContextKind.BROWSE)
     request = BrowseLoadRequest(token, generation, path)
+    catalog = FrameScalarCatalog(
+        path, "entry", tuple(
+            FrameScalarRow(label, metadata_raw=metadata)
+            for label, metadata in enumerate(rows, 1)
+        ),
+    )
     records = FrameRecordStore(max_items=8)
     publications = PublicationStore(max_items=8)
     for label, (metadata, value) in enumerate(
@@ -329,7 +407,10 @@ def _browse_parts(
         scan_key=scan_key,
         scan=object(),
         frame=None,
-        frame_ids=list(range(1, len(rows) + 1)),
+        frame_ids=catalog.labels,
+        loaded_labels=catalog.labels,
+        scalar_catalog=catalog,
+        browse_1d_cache=Browse1DCache(budget_bytes=1024),
         frames={},
         viewer_rows_1d={},
         viewer_rows_2d={},
@@ -349,6 +430,15 @@ def _browse_parts(
         projection=ContextProjection(),
         aggregate=aggregate,
     )
+
+
+def _release_browse_value(context):
+    """Retire the scalar fixture's actual cache before its Browse payload."""
+    context.invalidate()
+    cache = context.browse_1d_cache
+    cache.close()
+    context.detach_browse_1d_cache(cache)
+    context.release()
 
 
 def _acq_identity(identity: RunIdentity, artifact: str, scan: str):
@@ -724,7 +814,7 @@ def test_browse_refusals_are_independent_and_cannot_change_presentation(
     if refusal == "invalidated":
         parts.context.invalidate()
     elif refusal == "released":
-        parts.context.release()
+        _release_browse_value(parts.context)
     elif refusal == "cancelled_gate":
         parts.context.commit_gate.cancel()
     else:
@@ -760,7 +850,7 @@ def test_refused_new_browse_context_cannot_expose_the_prior_token(
     if refusal == "invalidated":
         b2.context.invalidate()
     elif refusal == "released":
-        b2.context.release()
+        _release_browse_value(b2.context)
     elif refusal == "cancelled_gate":
         b2.context.commit_gate.cancel()
     else:
@@ -789,7 +879,7 @@ def test_pending_replacement_retains_the_outgoing_presentation():
     b1 = _browse_parts()
     _project(b1, prefs)
     assert b1.runtime.norm_aggregate is b1.aggregate
-    b1.context.release()
+    _release_browse_value(b1.context)
     replacement = BrowseLoadRequest(
         new_context_token(ContextKind.BROWSE), 4, "/processed/next.nxs"
     )
@@ -885,6 +975,9 @@ def test_same_channel_foreign_artifact_cannot_cross_and_span_falls_back():
         publication_b,
         source_identity=publication_b.source_identity,
         frame_mask_qualified=False,
+    )
+    parts.display.publish_light_1d(
+        owner_b, record_b, source_identity=publication_b.source_identity,
     )
     parts.display.put_payload(
         StandardDisplayPayload(
@@ -1485,13 +1578,16 @@ def test_census_one_capture_one_borrow_no_second_read_no_forbidden_routes():
     assert borrow_counts == {
         "context_runtime": 1,
         "context_controller": 1,
-        "page": 1,
+        "page": 3,
         "context_projection": 0,
         "shell_projection": 0,
         "scientific_axes": 0,
         "shell_values": 0,
         "scientific_view": 0,
     }
+    assert _enclosing_functions(
+        trees["page"], set(_attribute_loads(trees["page"], "norm_aggregate")),
+    ) == ["_background_action", "_consume_background_update", "_refresh_shell"]
     capture_calls = [
         node
         for node in ast.walk(trees["context_runtime"])
@@ -1527,7 +1623,10 @@ def test_census_one_capture_one_borrow_no_second_read_no_forbidden_routes():
     }
     assert resolver_calls["shell_projection"] == 1
     assert resolver_calls["context_runtime"] == 1
-    assert resolver_calls["page"] == 0
+    assert resolver_calls["page"] == 2
+    assert _enclosing_functions(
+        trees["page"], set(_name_loads(trees["page"], "resolve_norm_presentation")),
+    ) == ["_background_action", "_consume_background_update"]
     assert resolver_calls["context_projection"] == 0
     assert resolver_calls["scientific_view"] == 0
 
@@ -1552,7 +1651,7 @@ def test_census_one_capture_one_borrow_no_second_read_no_forbidden_routes():
         "shell_projection": 2,     # one import, one projection call
         "scientific_axes": 2,      # the def and its __all__ export
         "context_controller": 0,
-        "page": 0,
+        "page": 3,                # import and two display-background borrows
         "context_projection": 0,
         "shell_values": 0,
         "scientific_view": 0,
@@ -1578,26 +1677,55 @@ def test_census_one_capture_one_borrow_no_second_read_no_forbidden_routes():
 
 
 def _browse_load(path: Path, generation: int):
+    """Load one real artifact through the production loader.
+
+    Returns ``(context, request, loader)``; the caller owns all three and
+    must settle them through :func:`_release_browse` (rejected candidates
+    included).  The loader publishes an EMPTY record store plus its scalar
+    catalog — intensity rows are hydrated on demand, never here.
+    """
     from xdart.gui.tabs.scattering.adapters.browse_loader import BrowseLoader
 
     loader = BrowseLoader()
     request = BrowseLoadRequest(
         new_context_token(ContextKind.BROWSE), generation, str(path)
     )
-    assert loader.begin(request) is request
-    deadline = time.monotonic() + 120.0
-    outcome = None
-    while time.monotonic() < deadline:
-        outcome = loader.poll(request)
-        if outcome is not None:
-            break
-        time.sleep(0.05)
-    assert outcome is not None and (
-        outcome.status is BrowseLoadStatus.READY
-    ), f"browse load did not become ready for {path}"
-    context = loader.consume(outcome)
-    assert type(context) is BrowseContext
-    return context, request
+    try:
+        assert loader.begin(request) is request
+        deadline = time.monotonic() + 120.0
+        outcome = None
+        while time.monotonic() < deadline:
+            outcome = loader.poll(request)
+            if outcome is not None:
+                break
+            time.sleep(0.05)
+        assert outcome is not None and (
+            outcome.status is BrowseLoadStatus.READY
+        ), f"browse load did not become ready for {path}"
+        context = loader.consume(outcome)
+        assert type(context) is BrowseContext
+    except BaseException:
+        loader.close()
+        raise
+    return context, request, loader
+
+
+def _release_browse(loader, context, owner=None) -> None:
+    """Settle one real Browse ownership chain: owner, context, loader."""
+    if owner is not None:
+        receipt = owner.release(loader, context)
+    else:
+        receipt = loader.release_context(context)
+    assert receipt.cleanup_status.value == "cleaned", receipt
+    assert loader.close().cleanup_status.value == "cleaned"
+
+
+def _independent_scalar_catalog(path: str) -> FrameScalarCatalog:
+    """One independent array-free read of the artifact's scalar metadata."""
+    from xrd_tools.io import FrameViewReader
+
+    with FrameViewReader(path, resolve_source=False) as reader:
+        return reader.read_scalar_catalog()
 
 
 def _readable_output_candidates(root: Path) -> tuple[Path, ...]:
@@ -1627,31 +1755,38 @@ def test_real_browse_reload_aggregate_fold_parity():
     candidates = _readable_output_candidates(root)
     assert candidates, f"no readable processed artifact under {root}"
 
-    context = None
+    context = loader = None
     for candidate in candidates:
         try:
-            context, _ = _browse_load(candidate, 1)
+            context, _, loader = _browse_load(candidate, 1)
             break
         except AssertionError:
             continue
     assert context is not None, "no loadable real artifact"
-    reloaded, _ = _browse_load(Path(context.requested_path), 2)
-    first = context.norm_aggregate
-    second = reloaded.norm_aggregate
-    assert first is not None and second is not None
-    assert first.revision == second.revision == 1
-    assert first.row_count == second.row_count
-    assert dict(first.channels) == dict(second.channels)
-    assert first.identity != second.identity
-    expected = empty_norm_aggregate(first.identity)
-    for label in context.frame_ids:
-        record = context.record_store.get(int(label))
-        expected = fold_norm_metadata(
-            expected, record.active_view().metadata_numeric
-        )
-    expected = next_norm_revision(expected)
-    assert first.row_count == expected.row_count
-    assert dict(first.channels) == dict(expected.channels)
+    reloaded, _, reload_loader = _browse_load(Path(context.requested_path), 2)
+    try:
+        first = context.norm_aggregate
+        second = reloaded.norm_aggregate
+        assert first is not None and second is not None
+        assert first.revision == second.revision == 1
+        assert first.row_count == second.row_count
+        assert dict(first.channels) == dict(second.channels)
+        assert first.identity != second.identity
+        # Browse hydrates intensity rows on demand: the record store is empty
+        # after admission.  Fold an INDEPENDENT scalar-catalog read instead.
+        assert len(context.record_store) == 0
+        catalog = _independent_scalar_catalog(context.requested_path)
+        expected = empty_norm_aggregate(first.identity)
+        for label in context.frame_ids:
+            row = catalog.row(int(label))
+            assert row is not None, label
+            expected = fold_norm_metadata(expected, row.metadata_numeric)
+        expected = next_norm_revision(expected)
+        assert first.row_count == expected.row_count
+        assert dict(first.channels) == dict(expected.channels)
+    finally:
+        _release_browse(reload_loader, reloaded)
+        _release_browse(loader, context)
 
 
 @pytest.mark.skipif(
@@ -1668,22 +1803,34 @@ def test_real_standard_gi_browse_reload_consumer_trace_parity():
     # Standard, acquisition GI, Browse, Browse reload) and compare every
     # normalized trace against an independent kernel division of the same
     # real records.
+    from xdart.gui.tabs.scattering.browse_1d_display import (
+        prepare_browse_1d_display,
+    )
+    from xdart.gui.tabs.scattering.browse_1d_projection import (
+        Browse1DProjectionStatus,
+    )
+    from xdart.gui.tabs.scattering.browse_hydration import (
+        _BrowseHydrationOwner,
+    )
+    from xrd_tools.io import FrameViewReader
+
     root = Path(os.environ["XDART_TEST_DATA"])
     candidates = _readable_output_candidates(root)
     assert candidates, f"no readable processed artifact under {root}"
 
     def _usable_channel(context):
+        # Browse admits an EMPTY record store: eligibility is decided from
+        # the loader's own array-free scalar catalog, never from residency.
         aggregate = context.norm_aggregate
         if aggregate is None or aggregate.revision != 1:
             return None
-        records = [
-            context.record_store.get(int(label))
-            for label in context.frame_ids
-        ]
-        if not records or any(record is None for record in records):
+        if not 2 <= len(context.frame_ids) <= 16:
             return None
-        rows = [record.active_view() for record in records]
-        if any(view.intensity_1d is None for view in rows):
+        catalog = context.scalar_catalog
+        if type(catalog) is not FrameScalarCatalog:
+            return None
+        rows = [catalog.row(int(label)) for label in context.frame_ids]
+        if any(row is None or not row.modes_1d for row in rows):
             return None
         for key in ("mon", *aggregate.channels):
             if key not in aggregate.channels:
@@ -1691,163 +1838,221 @@ def test_real_standard_gi_browse_reload_consumer_trace_parity():
             if channel_is_partial(aggregate, key):
                 continue
             if all(
-                resolve_monitor_norm(view.metadata_numeric, key)
+                resolve_monitor_norm(row.metadata_numeric, key)
                 is not None
-                for view in rows
+                for row in rows
             ):
                 return key
         return None
 
-    browse = browse_request = channel = None
-    for candidate in candidates:
-        try:
-            context, request = _browse_load(candidate, 1)
-        except AssertionError:
-            continue
-        key = _usable_channel(context)
-        if key is not None and 2 <= len(context.frame_ids) <= 16:
-            browse, browse_request, channel = context, request, key
+    # Every admitted Browse object is settled: [loader, context, owner].
+    owned: list[list] = []
+    try:
+        browse = browse_request = browse_loader = channel = None
+        for candidate in candidates:
+            try:
+                context, request, loader = _browse_load(candidate, 1)
+            except AssertionError:
+                continue
+            key = _usable_channel(context)
+            if key is None:
+                _release_browse(loader, context)
+                continue
+            browse, browse_request, browse_loader, channel = (
+                context, request, loader, key,
+            )
+            owned.append([loader, context, None])
             break
-    assert browse is not None and channel is not None, (
-        "four-route real parity is UNVERIFIED: no loadable artifact with "
-        "a complete, positively-resolvable channel and 2..16 frames"
-    )
-    views = {
-        int(label): browse.record_store.get(int(label)).active_view()
-        for label in browse.frame_ids
-    }
-    expected_traces = {}
-    for label, view in views.items():
-        divisor = resolve_monitor_norm(view.metadata_numeric, channel)
-        expected_traces[label] = np.asarray(view.intensity_1d) / divisor
-    prefs = _prefs(plot_mode="Overlay", norm_channel=channel.upper())
+        assert browse is not None and channel is not None, (
+            "four-route real parity is UNVERIFIED: no loadable artifact with "
+            "a complete, positively-resolvable channel and 2..16 frames"
+        )
+        # Independent 1-D reference views: complete 1-D modes plus metadata,
+        # no detector/cake payloads (the sparse projection reads none).
+        with FrameViewReader(
+            browse.requested_path, resolve_source=False,
+        ) as reader:
+            views = {
+                int(label): reader.read_record(
+                    int(label), include_heavy=False,
+                ).active_view()
+                for label in browse.frame_ids
+            }
+        assert all(view.intensity_1d is not None for view in views.values())
+        expected_traces = {}
+        for label, view in views.items():
+            divisor = resolve_monitor_norm(view.metadata_numeric, channel)
+            expected_traces[label] = np.asarray(view.intensity_1d) / divisor
+        prefs = _prefs(plot_mode="Overlay", norm_channel=channel.upper())
 
-    def _browse_route(context, request):
-        runtime = _ContextRuntime()
-        runtime.adopt_browse(context, request)
-        assert runtime.select_latest_navigation(plot_mode="Overlay")
-        runtime.project_navigation(
-            ContextProjection(), preferences=prefs,
-            processing_mode="Int 2D",
-        )
-        captured = runtime.norm_aggregate
-        assert captured is context.norm_aggregate
-        payloads = tuple(
-            StandardDisplayPayload(
-                0, frame, f"Browse · {frame.local_frame_label}",
-                views[frame.local_frame_label],
-            )
-            for frame in runtime.navigation.frames
-        )
-        return _build(payloads, runtime.navigation, prefs, captured)
-
-    def _acquisition_route(gi: bool):
-        configuration = _configuration(gi=gi)
-        identity = RunIdentity.from_configuration(configuration)
-        display = RunDisplayState(identity, max_payload_items=16)
-        display.set_factories(FrameRecordStore, PublicationStore)
-        display.configure(
-            partition_count=1, npt=1000, frame_bytes=8000
-        )
-        artifact = str(browse.requested_path)
-        scan_key = browse.scan_key
-        mode = "GI" if gi else "Standard"
-        owner = display.add_artifact(
-            Path(artifact),
-            scan_key,
-            mask=None,
-            mask_saturation=True,
-            measurement_mode=mode,
-            gi_incidence_motor="th" if gi else "",
-            gi_resolved_motor="th" if gi else "",
-            gi_mode_1d="q_total" if gi else "",
-            gi_mode_2d="qip_qoop" if gi else "",
-        )
-        for label, view in sorted(views.items()):
-            record = FrameRecord.from_view(view)
-            publication = FramePublication(
-                view,
-                record=record,
-                source_identity=f"{artifact}#{label}",
-                scan_key=scan_key,
-            )
-            delta = display.append_navigation(scan_key, artifact, label)
-            display.retain_frame(
-                owner,
-                delta.appended,
-                record,
-                publication,
-                source_identity=publication.source_identity,
-                frame_mask_qualified=False,
-            )
-            display.put_payload(
-                StandardDisplayPayload(
-                    0,
-                    delta.appended,
-                    f"{mode} · {scan_key} · {label}",
-                    view,
-                    measurement_mode=mode,
-                    gi_incidence_motor="th" if gi else "",
-                    gi_resolved_motor="th" if gi else "",
-                    gi_mode_1d="q_total" if gi else "",
-                    gi_mode_2d="qip_qoop" if gi else "",
+        def _browse_route(context, request, loader):
+            runtime = _ContextRuntime()
+            runtime.adopt_browse(context, request)
+            frames = runtime.navigation.frames
+            assert runtime.select_navigation(frames[-1], frames)
+            owner = _BrowseHydrationOwner(context)
+            for entry in owned:
+                if entry[0] is loader:
+                    entry[2] = owner
+            # The production sparse 1-D path: plan → hydrate on demand →
+            # borrow → detach.  INCOMPLETE submits the read; poll it.
+            deadline = time.monotonic() + 60.0
+            while True:
+                projected = runtime.project_browse_1d_cache(
+                    owner, preferences=prefs, was_waterfall_active=False,
                 )
+                if projected.status is not Browse1DProjectionStatus.INCOMPLETE:
+                    break
+                assert time.monotonic() < deadline, (
+                    f"Browse 1-D hydration timed out: {projected.diagnostic}"
+                )
+                owner.consume_repaint()
+                time.sleep(0.005)
+            assert projected.status is Browse1DProjectionStatus.COMPLETE, (
+                projected.diagnostic
             )
-        context = AcquisitionContext(
-            context_token=new_context_token(ContextKind.ACQUISITION),
-            run_configuration=configuration,
-            config_generation=configuration.generation,
-            config_fingerprint=configuration.fingerprint,
-            run_scan_key=scan_key,
-            source_path=artifact,
-            scan=object(),
-            frame=None,
-            frame_ids=display.catalog,
-            frames=display.artifacts,
-            viewer_rows_1d=(),
-            viewer_rows_2d=(),
-            publication_store=display,
-            origin="scattering-standard",
-            poni_identity=configuration.poni_file,
-        )
-        context.adopt_record_store(display)
-        runtime = _ContextRuntime()
-        runtime.adopt_acquisition(identity, context)
-        runtime.select_latest_navigation(plot_mode="Overlay")
-        payloads = runtime.project_navigation(
-            ContextProjection(), preferences=prefs,
-            processing_mode="Int 2D",
-        )
-        captured = runtime.norm_aggregate
-        assert captured is not None
-        assert captured.revision == len(views)
-        assert len(payloads) == len(views)
-        return _build(payloads, runtime.navigation, prefs, captured)
+            captured = runtime.norm_aggregate
+            assert captured is context.norm_aggregate
+            detached = prepare_browse_1d_display(projected)
+            assert detached is not None
+            assert len(detached.payloads) == len(views)
+            state = _build(
+                detached.payloads, runtime.navigation, prefs, captured,
+            )
+            deadline = time.monotonic() + 10.0
+            while owner.polling_needed() and time.monotonic() < deadline:
+                owner.consume_repaint()
+                time.sleep(0.005)
+            assert not owner.polling_needed()
+            return state
 
-    reloaded, reload_request = _browse_load(
-        Path(browse.requested_path), 2
-    )
-    states = {
-        "standard": _acquisition_route(gi=False),
-        "gi": _acquisition_route(gi=True),
-        "browse": _browse_route(browse, browse_request),
-        "reload": _browse_route(reloaded, reload_request),
-    }
-    for name, state in states.items():
-        assert state.norm_channel == channel, name
-        assert channel in state.norm_channels, name
-        values = _trace_by_label(state)
-        assert set(values) == set(views), name
-        for label, expected in expected_traces.items():
-            np.testing.assert_allclose(
-                values[label], expected, err_msg=f"{name}:{label}"
+        def _acquisition_route(gi: bool):
+            configuration = _configuration(gi=gi)
+            identity = RunIdentity.from_configuration(configuration)
+            display = RunDisplayState(identity, max_payload_items=16)
+            display.set_factories(FrameRecordStore, PublicationStore)
+            display.configure(
+                partition_count=1, npt=1000, frame_bytes=8000
             )
-    assert states["browse"].norm_identity == (
-        browse.context_token, browse.scan_key, browse.requested_path,
-    )
-    assert states["reload"].norm_identity == (
-        reloaded.context_token, reloaded.scan_key, reloaded.requested_path,
-    )
-    assert states["browse"].norm_identity != states["reload"].norm_identity
-    assert states["browse"].norm_revision == 1
-    assert states["reload"].norm_revision == 1
+            artifact = str(browse.requested_path)
+            scan_key = browse.scan_key
+            mode = "GI" if gi else "Standard"
+            # Acquisition keeps its 1-D rows in the light tier (the retained
+            # publication is stripped of them): lease it, shaped by the real
+            # records, exactly as the fabricated rows above do.
+            records = {
+                label: FrameRecord.from_view(view)
+                for label, view in sorted(views.items())
+            }
+            owner = _add_artifact(
+                display, artifact, scan_key,
+                layout=_light_1d_layout(next(iter(records.values()))),
+                gi=gi,
+            )
+            for label, view in sorted(views.items()):
+                record = records[label]
+                publication = FramePublication(
+                    view,
+                    record=record,
+                    source_identity=canonical_frame_source_identity(
+                        view,
+                        source_base=owner.source_base,
+                        fallback_path=owner.artifact,
+                    ),
+                    scan_key=scan_key,
+                )
+                delta = display.append_navigation(scan_key, artifact, label)
+                display.retain_frame(
+                    owner,
+                    delta.appended,
+                    record,
+                    publication,
+                    source_identity=publication.source_identity,
+                    frame_mask_qualified=False,
+                )
+                display.publish_light_1d(
+                    owner, record, source_identity=publication.source_identity,
+                )
+                display.put_payload(
+                    StandardDisplayPayload(
+                        0,
+                        delta.appended,
+                        f"{mode} · {scan_key} · {label}",
+                        view,
+                        measurement_mode=mode,
+                        gi_incidence_motor="th" if gi else "",
+                        gi_resolved_motor="th" if gi else "",
+                        gi_mode_1d="q_total" if gi else "",
+                        gi_mode_2d="qip_qoop" if gi else "",
+                    )
+                )
+            context = AcquisitionContext(
+                context_token=new_context_token(ContextKind.ACQUISITION),
+                run_configuration=configuration,
+                config_generation=configuration.generation,
+                config_fingerprint=configuration.fingerprint,
+                run_scan_key=scan_key,
+                source_path=artifact,
+                scan=object(),
+                frame=None,
+                frame_ids=display.catalog,
+                frames=display.artifacts,
+                viewer_rows_1d=(),
+                viewer_rows_2d=(),
+                publication_store=display,
+                origin="scattering-standard",
+                poni_identity=configuration.poni_file,
+            )
+            context.adopt_record_store(display)
+            runtime = _ContextRuntime()
+            runtime.adopt_acquisition(identity, context)
+            # Overlay preserves the explicit selection (01a73ab4): select
+            # every frame, as the Browse routes do.
+            frames = runtime.navigation.frames
+            assert runtime.select_navigation(frames[-1], frames)
+            payloads = runtime.project_navigation(
+                ContextProjection(), preferences=prefs,
+                processing_mode="Int 2D",
+            )
+            captured = runtime.norm_aggregate
+            assert captured is not None
+            assert captured.revision == len(views)
+            assert len(payloads) == len(views)
+            return _build(payloads, runtime.navigation, prefs, captured)
+
+        reloaded, reload_request, reload_loader = _browse_load(
+            Path(browse.requested_path), 2
+        )
+        owned.append([reload_loader, reloaded, None])
+        states = {
+            "standard": _acquisition_route(gi=False),
+            "gi": _acquisition_route(gi=True),
+            "browse": _browse_route(browse, browse_request, browse_loader),
+            "reload": _browse_route(reloaded, reload_request, reload_loader),
+        }
+        for name, state in states.items():
+            assert state.norm_channel == channel, name
+            assert channel in state.norm_channels, name
+            values = _trace_by_label(state)
+            assert set(values) == set(views), name
+            for label, expected in expected_traces.items():
+                np.testing.assert_allclose(
+                    values[label], expected, err_msg=f"{name}:{label}"
+                )
+        assert states["browse"].norm_identity == (
+            browse.context_token, browse.scan_key, browse.requested_path,
+        )
+        assert states["reload"].norm_identity == (
+            reloaded.context_token, reloaded.scan_key, reloaded.requested_path,
+        )
+        assert states["browse"].norm_identity != states["reload"].norm_identity
+        assert states["browse"].norm_revision == 1
+        assert states["reload"].norm_revision == 1
+    finally:
+        unsettled = []
+        for loader, context, owner in reversed(owned):
+            try:
+                _release_browse(loader, context, owner)
+            except AssertionError as error:
+                unsettled.append(error)
+        assert not unsettled, unsettled

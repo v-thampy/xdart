@@ -159,8 +159,9 @@ def test_e3_ui5_processing_rows_use_axis_paths_ranges_units_and_pills(
             "χ (°)",
         )
         assert fields[("Int2D", "axis")].choices == ("Q-χ", "2θ-χ")
-        assert ("Int1D", "unit") in fields
-        assert ("Int2D", "unit") in fields
+        # Units are expressed by the axis choice and range labels.
+        assert ("Int1D", "unit") not in fields
+        assert ("Int2D", "unit") not in fields
 
         processing = shell.controls.processing_card.body
         rows = _form_rows(processing)
@@ -200,6 +201,8 @@ def test_e3_ui5_processing_rows_use_axis_paths_ranges_units_and_pills(
             for path in expected_ranges
         } == expected_ranges
 
+        assert ("MaskSat", "mask_sentinel") not in fields
+        assert ("Mask", "Threshold") in fields
         pills = processing.findChildren(PillRow)
         matching = [
             row
@@ -207,7 +210,6 @@ def test_e3_ui5_processing_rows_use_axis_paths_ranges_units_and_pills(
             if {
                 path for path, _button in row._pills
             } == {
-                ("MaskSat", "mask_sentinel"),
                 ("Signal", "series_average"),
             }
         ]
@@ -216,7 +218,6 @@ def test_e3_ui5_processing_rows_use_axis_paths_ranges_units_and_pills(
             path: button.text()
             for path, button in matching[0]._pills
         } == {
-            ("MaskSat", "mask_sentinel"): "Mask Saturated",
             ("Signal", "series_average"): "Average Scan",
         }
     finally:

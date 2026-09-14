@@ -10,15 +10,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import errno
 import hashlib
 import os
 from pathlib import Path
 import secrets
+import sys
 import threading
 import time
 from contextlib import nullcontext
 from typing import Callable, Mapping, Protocol, TypeVar, runtime_checkable
 
+from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.session import get_pool
 
 
@@ -255,6 +258,7 @@ class RetryAction(str, Enum):
     ROLLBACK = "rollback"
     BACKUP_UNLINK = "backup-unlink"
     CANDIDATE_UNLINK = "candidate-unlink"
+    CANDIDATE_RETIRE = "candidate-retire"
     STREAM_RETIRE = "stream-retire"
     POOL_RESUME = "pool-resume"
 
@@ -268,6 +272,7 @@ _RETRY_ORDER = (
     RetryAction.ROLLBACK,
     RetryAction.BACKUP_UNLINK,
     RetryAction.CANDIDATE_UNLINK,
+    RetryAction.CANDIDATE_RETIRE,
     RetryAction.STREAM_RETIRE,
     RetryAction.POOL_RESUME,
     RetryAction.POOL_PAUSE,
@@ -580,7 +585,40 @@ def _require_identity(actual, expected, name: str) -> None:
         raise OwnershipRefused(f"foreign {name}; exact owner object required")
 
 
+# The tree-wide win32 ctime seam (xrd_tools.io.stat_identity) applies to
+# every comparison that has a PATHNAME view on one side: win32 fills a
+# pathname stat's st_ctime from the creation time, so against a descriptor
+# view (or a descriptor-recorded receipt) the slot is neutral there and
+# identity is (dev, ino, size, mtime_ns).  A descriptor view compared with
+# a descriptor-recorded receipt keeps ctime on every platform: win32 fills
+# fstat's st_ctime from NTFS ChangeTime, which every write and every utime
+# advance, so a same-size same-mtime in-place rewrite still changes it and
+# the stat-only revalidators below cannot hand out a stale digest for it.
+# Receipts always record the descriptor's observed ctime.
+_identity_ctime_ns = identity_ctime_ns
+
+
+def _comparable_identity(
+    identity: tuple[int, int, int, int, int],
+) -> tuple[int, int, int, int, int]:
+    """Normalise a sealed (dev, ino, size, mtime_ns, ctime_ns) for a
+    comparison that involves a pathname view."""
+    return (*identity[:4], _identity_ctime_ns(identity[4]))
+
+
 def _stat_identity(stat_result) -> tuple[int, int, int, int, int]:
+    """The seamed identity of one stat view (pathname or descriptor)."""
+    return (*_descriptor_identity(stat_result)[:4],
+            _identity_ctime_ns(stat_result.st_ctime_ns))
+
+
+def _descriptor_identity(stat_result) -> tuple[int, int, int, int, int]:
+    """The exact (dev, ino, size, mtime_ns, ctime_ns) of one DESCRIPTOR view.
+
+    Compare it only with another descriptor view or a descriptor-recorded
+    receipt (``StreamTerminal``, ``TargetSnapshot.ctime_ns``); a pathname
+    view goes through ``_stat_identity``.
+    """
     return (
         int(stat_result.st_dev),
         int(stat_result.st_ino),
@@ -588,6 +626,39 @@ def _stat_identity(stat_result) -> tuple[int, int, int, int, int]:
         int(stat_result.st_mtime_ns),
         int(stat_result.st_ctime_ns),
     )
+
+
+# Windows only flushes a handle that was opened with write access
+# (``os.fsync`` is ``_commit`` -> ``FlushFileBuffers``), so the read-only
+# descriptors this module seals through raise ``EBADF`` there; POSIX flushes
+# any descriptor.
+_FSYNC_REQUIRES_WRITE_ACCESS = sys.platform == "win32"
+
+
+def _fsync_descriptor(descriptor: int, path: Path) -> None:
+    """Flush ``descriptor`` to stable storage.
+
+    Where the platform refuses to flush a read-only descriptor, flush the
+    same file through a second, writable descriptor of ``path`` instead —
+    after proving that the reopened pathname names the descriptor's exact
+    inode, the guard every seal in this module already applies.
+    """
+    try:
+        os.fsync(descriptor)
+        return
+    except OSError as error:
+        if not _FSYNC_REQUIRES_WRITE_ACCESS or error.errno != errno.EBADF:
+            raise
+    expected = _stat_identity(os.fstat(descriptor))
+    writable = os.open(path, os.O_RDWR)
+    try:
+        if _stat_identity(os.fstat(writable)) != expected:
+            raise TargetChanged(
+                f"durable flush reopened a foreign inode: {path}"
+            )
+        os.fsync(writable)
+    finally:
+        os.close(writable)
 
 
 def _sha256_handle(handle) -> str:
@@ -649,8 +720,17 @@ def _capture_target(target: str, *, hash_content: bool = True) -> TargetSnapshot
         _stat_identity(finished),
         _stat_identity(after),
     }
-    if len(identities) != 1:
+    # The two descriptor views bracket the hash: exact, ctime included, so a
+    # same-size same-mtime rewrite inside the window is refused where the
+    # pathname compare is neutral (win32) rather than digested torn.
+    if len(identities) != 1 or (
+        _descriptor_identity(opened) != _descriptor_identity(finished)
+    ):
         raise TargetChanged(f"target mutated while fingerprinting {target}")
+    # The four views agree on identity; the descriptor's closing view is the
+    # recorded one (identical to ``after`` wherever ctime is part of
+    # identity; the change time rather than the creation time on win32), so
+    # ``revalidate_target_snapshot`` can hold its descriptor views to it.
     return TargetSnapshot(
         True,
         int(after.st_size),
@@ -658,7 +738,7 @@ def _capture_target(target: str, *, hash_content: bool = True) -> TargetSnapshot
         int(after.st_dev),
         int(after.st_ino),
         digest,
-        int(after.st_ctime_ns),
+        int(finished.st_ctime_ns),
     )
 
 
@@ -685,7 +765,7 @@ def revalidate_target_snapshot(
         return current
     expected = (
         snapshot.device, snapshot.inode, snapshot.size,
-        snapshot.mtime_ns, snapshot.ctime_ns,
+        snapshot.mtime_ns, int(snapshot.ctime_ns),
     )
     target = os.path.realpath(os.fspath(path))
     try:
@@ -701,9 +781,29 @@ def revalidate_target_snapshot(
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
-    if any(_stat_identity(value) != expected for value in (before, named, after)):
+    if not _revision_holds(expected, before, named, after):
         raise TargetChanged("target changed since its content snapshot")
     return snapshot
+
+
+def _revision_holds(
+    expected: tuple[int, int, int, int, int],
+    before: os.stat_result,
+    named: os.stat_result,
+    after: os.stat_result,
+) -> bool:
+    """Whether a descriptor-recorded revision still names the open object.
+
+    The two descriptor views must match the recorded revision exactly (ctime
+    included, on every platform); the pathname view between them is held to
+    the seamed identity only.  Every revalidator that hands out a recorded
+    digest without rereading the bytes goes through this.
+    """
+    return (
+        _descriptor_identity(before) == expected
+        and _descriptor_identity(after) == expected
+        and _stat_identity(named) == _comparable_identity(expected)
+    )
 
 
 def revalidate_stream_terminal(
@@ -717,8 +817,8 @@ def revalidate_stream_terminal(
     target = _normalize_target(path)
     if target != terminal.target:
         raise TargetChanged("stream terminal target does not match browse path")
-    expected = stream_terminal_object_revision(terminal)
-    if expected is None:
+    revision = stream_terminal_object_revision(terminal)
+    if revision is None:
         raise TargetChanged("stream terminal lacks an exact object revision")
     try:
         descriptor = os.open(target, os.O_RDONLY)
@@ -737,10 +837,7 @@ def revalidate_stream_terminal(
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
-    if any(
-        _stat_identity(observed) != expected
-        for observed in (before, named, after)
-    ):
+    if not _revision_holds(revision, before, named, after):
         raise TargetChanged("stream terminal object changed before browse")
     return TargetSnapshot(
         True,
@@ -854,8 +951,10 @@ def _descriptor_content_receipt(
     """Seal exact descriptor identity, hashing unless evidence is supplied."""
     if type(durable_fsync) is not bool:
         raise TypeError("durable_fsync must be an exact bool")
+    if expected_stat is not None:
+        expected_stat = _comparable_identity(expected_stat)
     if durable_fsync:
-        os.fsync(descriptor)
+        _fsync_descriptor(descriptor, path)
     before = os.fstat(descriptor)
     if expected_stat is not None and _stat_identity(before) != expected_stat:
         raise TargetChanged(
@@ -870,8 +969,11 @@ def _descriptor_content_receipt(
     else:
         digest = _require_evidence_digest(evidence_digest)
     after = os.fstat(descriptor)
+    # Two descriptor views bracketing the hash: exact, ctime included.  The
+    # caller's expected identity was normalised to the seamed form above and
+    # stays a seamed compare.
     if (
-        _stat_identity(before) != _stat_identity(after)
+        _descriptor_identity(before) != _descriptor_identity(after)
         or (
             expected_stat is not None
             and _stat_identity(after) != expected_stat
@@ -935,7 +1037,8 @@ def _descriptor_stream_stat_receipt(
 
     This helper intentionally performs no content read.  The caller owns the
     semantic expected-vs-readback comparison and passes the descriptor of the
-    still-open canonical HDF5 owner.
+    still-open canonical HDF5 owner.  When supplied, expected_stat is that
+    descriptor's exact revision, including its change time on every platform.
     """
     if type(durable_fsync) is not bool:
         raise TypeError("durable_fsync must be an exact bool")
@@ -944,28 +1047,27 @@ def _descriptor_stream_stat_receipt(
     if byte_count < 0:
         raise TransactionStateError("stream evidence byte count is negative")
     before = os.fstat(descriptor)
-    if expected_stat is not None and _stat_identity(before) != expected_stat:
+    before_identity = _descriptor_identity(before)
+    if expected_stat is not None and before_identity != expected_stat:
         raise TargetChanged(
             f"{role} descriptor changed after semantic verification: {path}"
         )
     if durable_fsync:
-        os.fsync(descriptor)
+        _fsync_descriptor(descriptor, path)
     first = os.fstat(descriptor)
     try:
         named = os.stat(path)
     except FileNotFoundError as exc:
         raise TargetChanged(f"{role} pathname disappeared: {path}") from exc
     last = os.fstat(descriptor)
-    identities = {
-        _stat_identity(first),
-        _stat_identity(named),
-        _stat_identity(last),
-    }
-    if len(identities) != 1 or (
-        expected_stat is not None and identities != {expected_stat}
-    ):
+    if not _revision_holds(before_identity, first, named, last):
+        # Name the (dev, ino, size, mtime_ns, ctime_ns) views so a platform
+        # disagreement (Windows: named stat vs the open descriptor) is
+        # diagnosable from the refusal alone.
         raise TargetChanged(
-            f"{role} descriptor/path identity changed during seal: {path}"
+            f"{role} descriptor/path identity changed during seal: {path} "
+            f"(descriptor={_descriptor_identity(first)} named={_stat_identity(named)} "
+            f"descriptor-after={_descriptor_identity(last)} expected={expected_stat})"
         )
     return _StreamStatReceipt(
         _normalize_target(path),
@@ -979,18 +1081,93 @@ def _descriptor_stream_stat_receipt(
     )
 
 
-def _stream_stat_matches(path: Path | str, receipt: _StreamStatReceipt) -> bool:
-    try:
-        observed = os.stat(path)
-    except FileNotFoundError:
-        return False
-    return _stat_identity(observed) == (
+def _stream_receipt_identity(
+    receipt: _StreamStatReceipt,
+) -> tuple[int, int, int, int, int]:
+    """The sealed (dev, ino, size, mtime_ns, ctime_ns) view of a receipt,
+    normalised the way ``_stat_identity`` observes it."""
+    return (
+        receipt.identity.device,
+        receipt.identity.inode,
+        receipt.size,
+        receipt.mtime_ns,
+        _identity_ctime_ns(receipt.ctime_ns),
+    )
+
+
+def _stream_receipt_revision(
+    receipt: _StreamStatReceipt,
+) -> tuple[int, int, int, int, int]:
+    """The exact (dev, ino, size, mtime_ns, ctime_ns) a receipt recorded from
+    its sealing descriptor; compare it only with descriptor views."""
+    return (
         receipt.identity.device,
         receipt.identity.inode,
         receipt.size,
         receipt.mtime_ns,
         receipt.ctime_ns,
     )
+
+
+def _stream_revision_mismatch(
+    path: Path | str,
+    receipt: _StreamStatReceipt,
+    *,
+    descriptor: int | None = None,
+) -> str | None:
+    """``None`` while *path* still names the exact object *receipt* sealed;
+    otherwise the views that disagree.
+
+    Every reuse of a sealed receipt's digest without rereading the bytes
+    goes through here, the way ``revalidate_stream_terminal`` does: two
+    descriptor views (*descriptor*, or a read-only open of *path*) are held
+    to the recorded revision exactly, ctime included, with the pathname view
+    between them held to the seamed identity (``_revision_holds``).  A
+    pathname stat on its own is neutral on ctime under win32 and would
+    accept a same-size same-mtime rewrite of the sealed bytes (Codex review
+    of 0ed7a46c, F1).
+    """
+    revision = _stream_receipt_revision(receipt)
+    owned = descriptor is None
+    if owned:
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+        except FileNotFoundError:
+            return f"{path}: pathname disappeared (sealed={revision})"
+        except OSError as exc:
+            # A read-only open that fails for any other reason (a win32
+            # sharing violation, a directory in the file's place) is a
+            # refusal through the same diagnosable channel, not a crash.
+            return (
+                f"{path}: unreadable for the revision check "
+                f"({type(exc).__name__}: {exc.strerror or exc}) sealed={revision}"
+            )
+    try:
+        before = os.fstat(descriptor)
+        try:
+            named = os.stat(path)
+        except FileNotFoundError:
+            return f"{path}: pathname disappeared (sealed={revision})"
+        after = os.fstat(descriptor)
+    finally:
+        if owned:
+            os.close(descriptor)
+    if _revision_holds(revision, before, named, after):
+        return None
+    return (
+        f"{path}: sealed={revision} descriptor={_descriptor_identity(before)} "
+        f"named={_stat_identity(named)} "
+        f"descriptor-after={_descriptor_identity(after)}"
+    )
+
+
+def _stream_stat_matches(
+    path: Path | str,
+    receipt: _StreamStatReceipt,
+    *,
+    descriptor: int | None = None,
+) -> bool:
+    return _stream_revision_mismatch(path, receipt, descriptor=descriptor) is None
 
 
 def _receipt_for_snapshot(path: Path | str, snapshot: TargetSnapshot, role: str) -> _ObjectReceipt:
@@ -1234,6 +1411,8 @@ class OutputTransaction:
         self._captured_prior: TargetSnapshot | None = None
         self._candidate_snapshot: TargetSnapshot | None = None
         self._candidate_owned = False
+        self._candidate_descriptor: int | None = None
+        self._candidate_descriptor_identity: _FileIdentity | None = None
         self._candidate_reservation: _ObjectReceipt | None = None
         self._backup_reservation: _ObjectReceipt | None = None
         self._stage_receipt: _StageReceipt | None = None
@@ -1531,6 +1710,8 @@ class OutputTransaction:
         self._ensure_cleanup_token()
         self._pending.add(RetryAction.ROLLBACK)
         self._pending.add(RetryAction.CANDIDATE_RESERVATION)
+        if self._candidate_descriptor is not None:
+            raise TransactionStateError("candidate descriptor has not been retired")
         if self._candidate.exists():
             self._pending.discard(RetryAction.CANDIDATE_RESERVATION)
             raise TransactionStateError(
@@ -1547,23 +1728,56 @@ class OutputTransaction:
             raise TransactionStateError(
                 f"unowned candidate occupies {self._candidate}; refusing write"
             ) from exc
-        try:
-            receipt = _descriptor_receipt(
-                descriptor,
-                self._candidate,
-                "candidate-reservation",
-            )
-        except BaseException:
-            os.close(descriptor)
-            raise
+        # Install ownership before receipt capture can fail.  This descriptor
+        # pins the original inode across execute and every cleanup retry.
+        self._candidate_descriptor = descriptor
+        receipt = _descriptor_receipt(
+            descriptor,
+            self._candidate,
+            "candidate-reservation",
+        )
+        self._candidate_descriptor_identity = receipt.identity
         self._candidate_reservation = receipt
         self._candidate_owned = True
         self._candidate_snapshot = receipt.snapshot
         self._writer_receipt = _WriterReceipt(receipt, False, None)
-        os.close(descriptor)
-        self._resolve_candidate_reservation()
-        if self._candidate_snapshot is None:
-            raise TargetChanged("owned candidate disappeared during reservation")
+
+    def _attempt_candidate_retire(self) -> BaseException | None:
+        """Release the inode pin only after every candidate identity owner."""
+        descriptor = self._candidate_descriptor
+        if descriptor is None:
+            return None
+        if any(owner is not None for owner in (
+            self._candidate_reservation,
+            self._writer_receipt,
+            self._publication_receipt,
+        )):
+            return None
+        self._ensure_cleanup_token()
+        self._pending.add(RetryAction.CANDIDATE_RETIRE)
+        try:
+            observed = os.fstat(descriptor)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                return exc
+            # A close may complete and then report an error.  Never retry
+            # close against a descriptor number already proven closed.
+        except BaseException as exc:
+            return exc
+        else:
+            identity = _FileIdentity(int(observed.st_dev), int(observed.st_ino))
+            expected = self._candidate_descriptor_identity
+            if expected is not None and identity != expected:
+                return OwnershipRefused("candidate descriptor now names a foreign object")
+            self._candidate_descriptor_identity = identity
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                return exc
+        self._candidate_descriptor = None
+        self._candidate_descriptor_identity = None
+        self._pending.discard(RetryAction.CANDIDATE_RETIRE)
+        return None
 
     def _resolve_backup_reservation(self) -> None:
         if RetryAction.BACKUP_RESERVATION not in self._pending:
@@ -2785,13 +2999,18 @@ class OutputTransaction:
                 self._phase = TransactionPhase.INTEGRITY_HOLD
                 raise TargetChanged("stream working target identity changed")
             if self._stream_checkpoint_fresh:
-                if checkpoint is None or not _stream_stat_matches(
-                    self._admission.target,
-                    checkpoint,
-                ):
+                observed = _stat_identity(stat_result)
+                sealed = (
+                    None if checkpoint is None
+                    else _stream_receipt_identity(checkpoint)
+                )
+                if observed != sealed:
                     self._phase = TransactionPhase.INTEGRITY_HOLD
+                    # Name both (dev, ino, size, mtime_ns, ctime_ns) views:
+                    # this refusal is the only evidence a live run leaves.
                     raise TargetChanged(
-                        "stream checkpoint failed identity verification"
+                        "stream checkpoint failed identity verification "
+                        f"(observed={observed} checkpoint={sealed})"
                     )
                 self._stream_checkpoint_fresh = False
                 self._stream_terminal_receipt = None
@@ -2882,15 +3101,20 @@ class OutputTransaction:
                 if self._stream_durable_floor is not None
                 else self._stream_checkpoint_token
             )
-            if (
-                not self._stream_checkpoint_fresh
-                or self._stream_checkpoint_token is not floor
-                or checkpoint is None
-                or not _stream_stat_matches(self._admission.target, checkpoint)
-            ):
+            mismatch = (
+                "checkpoint is not the fresh durable floor"
+                if (
+                    not self._stream_checkpoint_fresh
+                    or self._stream_checkpoint_token is not floor
+                    or checkpoint is None
+                )
+                else _stream_revision_mismatch(self._admission.target, checkpoint)
+            )
+            if mismatch is not None:
                 self._phase = TransactionPhase.INTEGRITY_HOLD
                 raise TargetChanged(
-                    "durability floor changed before the controlled close"
+                    "durability floor changed before the controlled close: "
+                    + mismatch
                 )
             owner = _StreamCloseAttempt(
                 self._admission.target,
@@ -2919,12 +3143,16 @@ class OutputTransaction:
             resolved = self._stream_close_checkpoint
             if resolved is not None:
                 receipt = self._stream_checkpoint
-                if receipt is None or not _stream_stat_matches(
-                    self._admission.target, receipt,
-                ):
+                mismatch = (
+                    "no sealed checkpoint" if receipt is None
+                    else _stream_revision_mismatch(
+                        self._admission.target, receipt, descriptor=descriptor,
+                    )
+                )
+                if mismatch is not None:
                     self._phase = TransactionPhase.INTEGRITY_HOLD
                     raise TargetChanged(
-                        "resolved stream close changed before reuse"
+                        "resolved stream close changed before reuse: " + mismatch
                     )
                 return resolved
             floor_receipt = self._stream_checkpoint
@@ -3028,12 +3256,15 @@ class OutputTransaction:
                     "only the fresh sealed checkpoint can become durable"
                 )
             receipt = self._stream_checkpoint
-            if receipt is None or not _stream_stat_matches(
-                self._admission.target, receipt,
-            ):
+            mismatch = (
+                "no sealed checkpoint" if receipt is None
+                else _stream_revision_mismatch(self._admission.target, receipt)
+            )
+            if mismatch is not None:
                 self._phase = TransactionPhase.INTEGRITY_HOLD
                 raise TargetChanged(
-                    "durability-floor checkpoint changed before promotion"
+                    "durability-floor checkpoint changed before promotion: "
+                    + mismatch
                 )
             self._stream_durable_floor = checkpoint
             self._pending.discard(RetryAction.ROLLBACK)
@@ -3058,23 +3289,25 @@ class OutputTransaction:
             failure: BaseException | None = None
             try:
                 descriptor = os.open(self._admission.target, os.O_RDONLY)
-                expected_stat = _stat_identity(os.fstat(descriptor))
+                opened = os.fstat(descriptor)
+                expected_stat = _descriptor_identity(opened)
                 if self._durable_fsync:
-                    os.fsync(descriptor)
-                if _stat_identity(os.fstat(descriptor)) != expected_stat:
+                    _fsync_descriptor(descriptor, Path(self._admission.target))
+                flushed = os.fstat(descriptor)
+                # Two views of one descriptor: exact, ctime included.
+                if _descriptor_identity(flushed) != _descriptor_identity(opened):
                     raise TargetChanged(
                         "stream terminal descriptor changed during fsync"
                     )
                 checkpoint = self._stream_checkpoint if self._fast_regenerable else None
+                # The fast terminal reuses the checkpoint's evidence digest
+                # without rehashing, so the descriptor is held to the
+                # checkpoint's recorded revision exactly, not to the seamed
+                # identity a pathname compare would settle for.
                 if self._fast_regenerable and (
                     checkpoint is None or not self._stream_checkpoint_fresh
-                    or expected_stat != (
-                        checkpoint.identity.device,
-                        checkpoint.identity.inode,
-                        checkpoint.size,
-                        checkpoint.mtime_ns,
-                        checkpoint.ctime_ns,
-                    )
+                    or _descriptor_identity(flushed)
+                    != _stream_receipt_revision(checkpoint)
                 ):
                     raise TargetChanged("fast stream terminal lost its close checkpoint")
                 receipt = _descriptor_content_receipt(
@@ -3400,10 +3633,17 @@ class OutputTransaction:
                 not self._fast_regenerable
                 and terminal_stat.evidence_bytes != terminal_stat.size
             )
-            or not _stream_stat_matches(target, terminal_stat)
         ):
             self._terminal_receipt = None
             return TargetChanged("stream terminal seal changed before commit")
+        # The commit publishes the sealed digest without rereading the bytes:
+        # the object is held to the seal's exact descriptor revision.
+        mismatch = _stream_revision_mismatch(target, terminal_stat)
+        if mismatch is not None:
+            self._terminal_receipt = None
+            return TargetChanged(
+                "stream terminal seal changed before commit: " + mismatch
+            )
         self._terminal_receipt = _TerminalReceipt(
             self._admission.target,
             snapshot,
@@ -3498,17 +3738,23 @@ class OutputTransaction:
                             "durable-floor-preserved",
                             durable_fsync=self._durable_fsync,
                         )
+                        # The same descriptor that hashed the preserved bytes
+                        # is held to the checkpoint's exact revision.
+                        mismatch = (
+                            "preserved object is a foreign inode"
+                            if preserved.identity != checkpoint.identity
+                            else _stream_revision_mismatch(
+                                self._admission.target, checkpoint,
+                                descriptor=descriptor,
+                            )
+                        )
                     finally:
                         os.close(descriptor)
-                    if (
-                        preserved.identity != checkpoint.identity
-                        or not _stream_stat_matches(
-                            self._admission.target, checkpoint,
-                        )
-                    ):
+                    if mismatch is not None:
                         self._phase = TransactionPhase.INTEGRITY_HOLD
                         raise TargetChanged(
-                            "durability floor changed after its exact seal"
+                            "durability floor changed after its exact seal: "
+                            + mismatch
                         )
                     self._terminal_receipt = _TerminalReceipt(
                         self._admission.target,
@@ -3666,6 +3912,11 @@ class OutputTransaction:
                     if self._admission.snapshot.exists:
                         self._stage_prior()
                     self._reserve_candidate()
+                    self._resolve_candidate_reservation()
+                    if self._candidate_snapshot is None:
+                        raise TargetChanged(
+                            "owned candidate disappeared during reservation"
+                        )
 
                     # Install the post-writer observation owner before entering
                     # user code.  An authorized mutation of the private path is
@@ -3741,6 +3992,9 @@ class OutputTransaction:
                         primary = None
                         cleanup_failures.extend(self._finish_published_cleanup())
             finally:
+                retirement_failure = self._attempt_candidate_retire()
+                if retirement_failure is not None:
+                    cleanup_failures.append(retirement_failure)
                 # The exact pause owner remains live while any later retry may
                 # publish or restore the admitted final pathname.
                 if not self._target_transition_pending():
@@ -3854,6 +4108,9 @@ class OutputTransaction:
                 failure = self._attempt_candidate_unlink()
                 if failure is not None:
                     failures.append(failure)
+            retirement_failure = self._attempt_candidate_retire()
+            if retirement_failure is not None:
+                failures.append(retirement_failure)
             epoch_boundary = (
                 self._stream_epoch_receipt is not None
                 and not self._published

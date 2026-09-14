@@ -17,6 +17,7 @@ from xrd_tools.io.nexus_record import (
 )
 from xrd_tools.io.read import get_raw_frame
 from xrd_tools.rsm.volume import RSMVolume
+from tests.core.v2_fixture_factory import make_v2_entry
 
 
 def test_frame_record_key():
@@ -43,9 +44,10 @@ def test_stitched_multiscan_frames_no_collision(tmp_path):
         {"scan_label": 5, "frame_index": 2, "thumbnail": _peaked(8, (0, 7))},
         {"scan_label": 7, "frame_index": 1, "thumbnail": _peaked(8, (7, 7))},
     ]
-    p = tmp_path / "grouped.nxs"
+    p = tmp_path / "grouped.nexus"
     with h5py.File(p, "w") as f:
-        write_stitched(f.create_group("entry"), stitched_1d=s1,
+        entry = make_v2_entry(f, frame_indices=(1, 2), with_2d=False)
+        write_stitched(entry, stitched_1d=s1,
                        frame_records=records)
 
     img_5_1 = get_raw_frame(p, 1, scan=5)
@@ -64,9 +66,10 @@ def test_single_scan_stays_flat(tmp_path):
     s1 = IntegrationResult1D(radial=np.linspace(0.5, 5.0, 10),
                              intensity=np.ones(10), unit="q_A^-1")
     records = [{"frame_index": 1, "thumbnail": _peaked(8, (3, 3))}]   # no scan_label
-    p = tmp_path / "single.nxs"
+    p = tmp_path / "single.nexus"
     with h5py.File(p, "w") as f:
-        write_stitched(f.create_group("entry"), stitched_1d=s1,
+        entry = make_v2_entry(f, frame_indices=(1,), with_2d=False)
+        write_stitched(entry, stitched_1d=s1,
                        frame_records=records)
     # flat addressing (scan=None) resolves
     img = get_raw_frame(p, 1)
@@ -86,9 +89,10 @@ def test_write_rsm_carries_frame_records(tmp_path):
         {"scan_label": 8, "frame_index": 1, "thumbnail": _peaked(8, (2, 2))},
         {"scan_label": 8, "frame_index": 2, "thumbnail": _peaked(8, (5, 5))},
     ]
-    p = tmp_path / "rsm_grouped.nxs"
+    p = tmp_path / "rsm_grouped.nexus"
     with h5py.File(p, "w") as f:
-        write_rsm(f.create_group("entry"), vol, frame_records=records)
+        entry = make_v2_entry(f, frame_indices=(1, 2), with_2d=False)
+        write_rsm(entry, vol, frame_records=records)
     img = get_raw_frame(p, 2, scan=8)
     assert np.unravel_index(int(np.argmax(img)), img.shape) == (5, 5)
 

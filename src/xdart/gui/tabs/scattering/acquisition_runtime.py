@@ -193,6 +193,13 @@ class AcquisitionRuntime:
             with self._command_lock:
                 drained = session is None or bool(session.pause(
                     timeout=max(0.0, deadline - monotonic())))
+                if drained and session is not None:
+                    # The drained writer is idle at a frame boundary, so seal
+                    # what it has settled.  A record write revokes checkpoint
+                    # hydration until the next seal, and a Pause landing
+                    # between seals would otherwise leave every evicted frame
+                    # unreadable for as long as it lasts.
+                    session.flush(force=True)
         except BaseException as primary:
             self._resume_after_pause_failure(session, primary, request)
         if not drained:

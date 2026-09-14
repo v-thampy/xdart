@@ -89,6 +89,10 @@ def test_image_member_name_owns_live_status_and_plot_title(
             12,
             "bluesky_17_2_00090.nxs · frame 13",
         ),
+        ("/raw/first.nxs", 0, "first.nxs · frame 1"),
+        ("/raw/scan.cxi", 12, "scan.cxi · frame 13"),
+        ("/raw/scan.hdf5", 12, "scan.hdf5 · frame 13"),
+        ("/raw/scan.NXS", 12, "scan.NXS · frame 13"),
         ("/processed/scan_00090.nexus", 12, "scan_00090.nexus · frame 13"),
     ],
 )

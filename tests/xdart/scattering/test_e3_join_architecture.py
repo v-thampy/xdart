@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import fields
+from dataclasses import MISSING, fields
 import json
 from pathlib import Path
 
@@ -265,6 +265,9 @@ def test_j2_merge_keyed_scalar_route_census_is_zero() -> None:
             "src/xdart/gui/tabs/scattering/shell_values.py."
             "ProgressProjection.for_artifact"
         },
+        "_active_mode": {
+            "src/xdart/gui/tabs/scattering/browse_1d_projection.py._active_mode"
+        },
     }
     for row in census["retired_tokens"]:
         token = row["token"]
@@ -441,13 +444,16 @@ def test_j2_one_projection_navigation_and_mount_route() -> None:
         "src/xdart/gui/tabs/scattering/shell_projection.py"
     }
     assert _constructor_sites("ScientificProjection") == {
-        "src/xdart/gui/tabs/scattering/shell_projection.py"
+        "src/xdart/gui/tabs/scattering/shell_projection.py",
+        "src/xdart/gui/tabs/scattering/context_projection.py",
     }
     assert _constructor_sites("RunStripProjection") == {
         "src/xdart/gui/tabs/scattering/run_mode_projection.py"
     }
     assert _constructor_sites("FrameNavigationProjection") == {
-        "src/xdart/gui/tabs/scattering/context_runtime.py"
+        "src/xdart/gui/tabs/scattering/context_runtime.py",
+        "src/xdart/gui/tabs/scattering/context_projection.py",
+        "src/xdart/gui/tabs/scattering/page.py",
     }
     assert _constructor_sites("_ContextRuntime") == {
         "src/xdart/gui/tabs/scattering/context_controller.py"
@@ -492,9 +498,16 @@ def test_j2_one_projection_navigation_and_mount_route() -> None:
     assert len(shell_calls) == 1
     call = shell_calls[0]
     assert not any(keyword.arg is None for keyword in call.keywords)
-    assert len(call.args) + len(call.keywords) == len(
-        fields(ShellProjection)
-    )
+    declared = fields(ShellProjection)
+    assert not any(isinstance(arg, ast.Starred) for arg in call.args)
+    supplied = [field.name for field in declared[:len(call.args)]]
+    supplied.extend(keyword.arg for keyword in call.keywords)
+    assert len(supplied) == len(set(supplied))
+    assert set(supplied) <= {field.name for field in declared}
+    assert {
+        field.name for field in declared
+        if field.default is MISSING and field.default_factory is MISSING
+    } <= set(supplied)
 
     page_tree = _tree("src/xdart/gui/tabs/scattering/page.py")
     calls = [

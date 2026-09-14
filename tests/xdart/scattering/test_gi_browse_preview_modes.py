@@ -117,6 +117,10 @@ def test_first_borrowed_gi_preview_and_frame9_preserve_persisted_modes(
             assert tuple(publication.record.results_2d) == ("qip_qoop",)
 
             for mode in (first_mode, other_mode):
+                # Single honors explicit multi-selection too. Model the
+                # ordinary single click when requesting its one-row oracle.
+                selected = (current,) if mode == "Single" else frames
+                assert controller.select_navigation(current, selected)
                 preferences = ScientificPreferences(plot_mode=mode)
                 deadline = time.monotonic() + 10.0
                 while time.monotonic() < deadline:

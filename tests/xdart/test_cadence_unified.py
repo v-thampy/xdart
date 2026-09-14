@@ -1,26 +1,45 @@
 # -*- coding: utf-8 -*-
-"""The one session cadence boundary table used by the C3 cutover."""
+"""The one session cadence boundary table used by the current GUI run owner."""
 from __future__ import annotations
 
 
 def test_session_bound_cadence_boundary(tmp_path, monkeypatch):
-    from tests.xdart.test_vnext_p0_c3_dynamic_gui_mount import (
-        _c3_real_source_case, _c3_run,
+    from tests.xdart.scattering.test_p1b_output_graph import (
+        _intent, _run_to_terminal, _write_tiff, write_poni,
     )
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+    from xdart.gui.tabs.scattering.display_values import StandardEventKind
+    from xdart.gui.tabs.scattering.events import CleanupStatus
 
     for mode, interval in (("Int 2D", 8), ("Int 1D", 1000)):
         with monkeypatch.context() as scoped:
-            adapter = None
-            case = _c3_real_source_case(
-                tmp_path / f"cadence-{interval}", "tiff", processing_mode=mode,
+            root = tmp_path / f"cadence-{interval}"
+            root.mkdir()
+            raw, poni = root / "scan_0001.tif", root / "cal.poni"
+            _write_tiff(raw, 1)
+            write_poni(poni)
+            intent = _intent(raw, root / "processed.nexus", poni,
+                             processing_mode=mode)
+            sessions = []
+            real_open = dynamic_output.open_headless_scan_session
+
+            def open_session(*args, **kwargs):
+                session = real_open(*args, **kwargs)
+                assert session.policy is kwargs["policy"]
+                sessions.append(session)
+                return session
+
+            scoped.setattr(dynamic_output, "open_headless_scan_session", open_session)
+            executor, identity, events = _run_to_terminal(
+                intent, request_value=21000 + interval,
             )
             try:
-                _trace, adapters = _c3_run(case, scoped)
-                assert len(adapters) == 1
-                adapter = adapters[0]
-                policy = adapter._session.policy
-                assert policy is adapter._policy
-                assert policy.allocation is case.worker.publication_store.allocation
+                assert any(event.kind is StandardEventKind.FINISHED for event in events)
+                session, = sessions
+                policy = session.policy
+                owner, = executor._exact_run(identity).display.artifacts.values()
+                assert policy is session._policy
+                assert policy.allocation is owner.publications.allocation
                 assert policy.flush.cap == policy.allocation.staging_items
                 assert policy.flush.margin == 8
                 assert policy.flush.interval == interval
@@ -40,12 +59,4 @@ def test_session_bound_cadence_boundary(tmp_path, monkeypatch):
                         force=force,
                     ) is expected
             finally:
-                case.worker.command = "start"
-                case.worker._close_reduction_session()
-                retained = getattr(
-                    case.worker, "_retained_scan_session_adapter", None,
-                )
-                if retained is not None:
-                    if adapter is not None:
-                        assert retained is adapter
-                    assert retained.release_retained_custody() is True
+                assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED

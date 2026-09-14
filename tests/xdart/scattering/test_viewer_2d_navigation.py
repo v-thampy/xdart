@@ -28,6 +28,33 @@ def _wait(page, qapp, predicate):
     raise AssertionError("real viewer did not settle")
 
 
+def _canvas_layout(page):
+    view = page._shell.scientific
+    canvas = view.raw.canvas
+    return (canvas.mapTo(view, QtCore.QPoint()).toTuple(), canvas.size().toTuple(),
+            tuple(view.vertical_splitter.sizes()), tuple(view.image_splitter.sizes()))
+
+
+def _settle_2d_layout(page, qapp):
+    """Return only once the 2D Viewer rows are laid out around the canvas.
+
+    Installing the first frame posts the LayoutRequest that hands the canvas
+    row its height; `_wait` checks its predicate straight after the drain, so
+    the fixture can hand back a page whose canvas is still the pre-settle
+    strip (629x88 here, 629x68 on the Linux runners).  A test that then opens
+    the next file synchronously grabs that strip as the loading snapshot.
+    """
+    seen = []
+
+    def settled():
+        seen.append(_canvas_layout(page))
+        sizes = page._shell.scientific.vertical_splitter.sizes()
+        return (len(seen) >= 2 and seen[-1] == seen[-2]
+                and sizes[0] > 0 and sizes[1] == 0)
+
+    _wait(page, qapp, settled)
+
+
 @pytest.fixture
 def viewer(tmp_path):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -53,6 +80,7 @@ def viewer(tmp_path):
         and page._shell.scientific._viewer_2d_payload is not None
         and page._shell.browser.scans.count() == 4
     ))
+    _settle_2d_layout(page, app)
     try:
         yield page, app, paths, values
     finally:
@@ -305,3 +333,64 @@ def _wait_cleanup(page, app):
             return True
         time.sleep(0.005)
     return False
+
+
+def _wait_timer_driven(app, predicate, timeout=6.0):
+    """Process events only: the drain runs on the page's own run timer."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+def test_completion_after_poll_keeps_the_drain_timer_alive(viewer, monkeypatch):
+    """A catalog completion that lands on the transport worker between one
+    tick's `poll_viewer_2d` and that tick's `_polling_needed` stop check must
+    not strand the first-frame follow-up: nothing but the next tick submits
+    it, and nothing but a GUI command restarts a stopped timer (the nightly
+    xye_run_completion 2D-entry timeout with an empty notice)."""
+    import xdart.gui.tabs.scattering.hydration_transport as transport
+
+    page, app, paths, values = viewer
+    controller = page._context_controller
+    real_catalog = transport.catalog_viewer_2d
+
+    def slow_catalog(*args, **kwargs):
+        time.sleep(0.3)   # a tick polls while the catalog is still loading
+        return real_catalog(*args, **kwargs)
+
+    real_poll = controller.poll_viewer_2d
+    injected = []
+
+    def poll_then_complete():
+        result = real_poll()
+        owner = controller._viewer_2d
+        if not injected and owner.loading and owner.catalog is None:
+            deadline = time.monotonic() + 3
+            while controller.viewer_2d_loading and time.monotonic() < deadline:
+                time.sleep(0.001)
+            injected.append(not controller.viewer_2d_loading)
+        return result
+
+    monkeypatch.setattr(transport, "catalog_viewer_2d", slow_catalog)
+    monkeypatch.setattr(controller, "poll_viewer_2d", poll_then_complete)
+    page._open_viewer_2d_path(str(paths[1]))
+    entered = _wait_timer_driven(app, lambda: (
+        controller.viewer_2d_frame is not None
+        and controller.viewer_2d_context.original_path == str(paths[1])
+        and page._shell.scientific._viewer_2d_payload is not None
+    ))
+    assert injected == [True], injected
+    assert entered, dict(
+        timer_active=page._run_timer.isActive(),
+        state=None if controller.viewer_2d_context is None
+        else controller.viewer_2d_context.state.value,
+        loading=controller.viewer_2d_loading,
+        catalog=controller._viewer_2d.catalog is not None,
+        frame=controller.viewer_2d_frame is not None,
+        diagnostic=controller.viewer_2d_diagnostic, notice=page._notice_text,
+    )
+    np.testing.assert_array_equal(controller.viewer_2d_frame.array, values[0])

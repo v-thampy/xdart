@@ -22,6 +22,7 @@ from xrd_tools.sources import cursor as cursor_module
 from xrd_tools.sources import execution_graph as graph
 from xrd_tools.sources import metadata_provider
 from xrd_tools.sources.selection import image_series_spec, single_image_spec
+from tests.core.v2_fixture_factory import make_v2_entry
 
 
 def _tiffs(tmp_path: Path, names=("scan_0001.tif", "scan_0002.tif")) -> SourceSpec:
@@ -1098,7 +1099,7 @@ def test_average_exact_entry_and_motor_pair_bind_descriptor_provider_and_graph(
             )
 
 
-def test_average_exact_entry_group_survives_root_relink_without_rediscovery(
+def test_average_exact_entry_group_relink_preserves_binding_or_refuses(
     tmp_path, monkeypatch,
 ) -> None:
     from xrd_tools.sources import descriptor as descriptor_module
@@ -1111,12 +1112,26 @@ def test_average_exact_entry_group_survives_root_relink_without_rediscovery(
     real_describe = descriptor_module._describe_container_from_open_with_binding
     observed = []; armed = [False]
     real_group_item = h5py.Group.__getitem__; real_group_get = h5py.Group.get
+    from xrd_tools.io import processed_scan_id
+    real_marker_census = processed_scan_id.has_processed_output_markers_file
+    marker_census_depth = [0]
+    def marker_census(*args, **kwargs):
+        # Raw admission checks every local entry for processed markers. That
+        # negative census must not be confused with detector rediscovery.
+        marker_census_depth[0] += 1
+        try:
+            return real_marker_census(*args, **kwargs)
+        finally:
+            marker_census_depth[0] -= 1
+    monkeypatch.setattr(
+        processed_scan_id, "has_processed_output_markers_file", marker_census,
+    )
     def guarded_item(group, name):
-        if armed[0] and group.name == "/" and name == "chosen":
+        if armed[0] and not marker_census_depth[0] and group.name == "/" and name == "chosen":
             pytest.fail("captured entry was reacquired by root name")
         return real_group_item(group, name)
     def guarded_get(group, name, *args, **kwargs):
-        if armed[0] and group.name == "/" and name == "chosen":
+        if armed[0] and not marker_census_depth[0] and group.name == "/" and name == "chosen":
             pytest.fail("captured entry was re-resolved by root name")
         return real_group_get(group, name, *args, **kwargs)
     monkeypatch.setattr(h5py.Group, "__getitem__", guarded_item)
@@ -1153,6 +1168,9 @@ def test_average_exact_entry_group_survives_root_relink_without_rediscovery(
             source, reader_binding="average_closed_v1",
         )
     except graph.SourceRevisionChanged:
+        value = None
+    except ValueError as error:
+        assert str(error) == "selected detector is outside its captured entry"
         value = None
     assert len(observed) == 1
     if value is not None:
@@ -1553,6 +1571,7 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
     from xrd_tools.reduction import AverageScanRecipe, Integration1DPlan, ReductionPlan
     from xrd_tools.reduction import average as average_module
     from xrd_tools.reduction import core as reduction_core
+    from xrd_tools.io import finite_artifact
 
     def inputs(case):
         root = tmp_path / f"runner-{case}"; root.mkdir()
@@ -1583,23 +1602,24 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
                 source = SourceSpec(source.uri, source.kind, options={
                     **dict(source.options), "metadata_format": "txt",
                 })
-        target = root / "average.nxs"
+        anchor = root / "scan.nexus"
+        target = root / "scan_average.nexus"
         with h5py.File(target, "w") as handle:
-            handle.create_dataset("prior", data=np.arange(4, dtype="<i4"))
+            make_v2_entry(handle, frame_indices=(1,), with_2d=False)
         changed = (
             Path(source.options["files"][1]) if case == "member" else
             Path(source.options["files"][1]).with_suffix(".txt")
             if case == "sidecar" else dependency if case == "dependency"
             else target if case == "target" else None
         )
-        return source, target, changed
+        return source, anchor, target, changed
 
     from xrd_tools.sources import execution_graph as execution_module
     for case in ("unchanged", "member", "sidecar", "dependency", "target", "commit-target"):
-        source, target, changed = inputs(case)
+        source, anchor, target, changed = inputs(case)
         original_target = target.read_bytes()
         recipe = AverageScanRecipe(
-            source, target,
+            source, anchor,
             ReductionPlan(integration_1d=Integration1DPlan(npt=3)),
             numeric_metadata_keys=("I0",) if case == "sidecar" else None,
         )
@@ -1616,6 +1636,7 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
         real_state_sweep = average_module.validate_source_state_sweep
         real_target = average_module.capture_target_snapshot
         real_sink = average_module.NexusSink; real_write = real_sink.write
+        real_finite_sink = real_sink.for_finite_document
 
         def held_close(window):
             if counts["open"] == 1:
@@ -1651,7 +1672,7 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
             return real_target(*args, **kwargs)
         def sink(*args, **kwargs):
             events.append("sink")
-            value = real_sink(*args, **kwargs); sinks.append(value)
+            value = real_finite_sink(*args, **kwargs); sinks.append(value)
             return value
         def write(owner, *args, **kwargs):
             counts["write"] += 1
@@ -1666,7 +1687,8 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
             patch.setattr(reduction_core, "integrate_1d", integrate)
             patch.setattr(average_module, "validate_source_state_sweep", source_sweep)
             patch.setattr(average_module, "capture_target_snapshot", target_snapshot)
-            patch.setattr(average_module, "NexusSink", sink)
+            patch.setattr(finite_artifact, "capture_target_snapshot", target_snapshot)
+            patch.setattr(real_sink, "for_finite_document", sink)
             patch.setattr(real_sink, "write", write)
             runner = average_module.AverageScanRunner(recipe)
             pending = runner.start()
@@ -1717,8 +1739,8 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
             assert terminal.operation_identity == pending.operation_identity
             if case == "unchanged":
                 assert events == [
-                    "source-sweep", "target-sweep", "sink", "target-sweep",
-                    "source-sweep", "target-sweep",
+                    "source-sweep", "target-sweep", "sink", "source-sweep",
+                    "target-sweep", "target-sweep",
                 ]
                 assert terminal.disposition == "COMMITTED"
                 assert len(sinks) == counts["write"] == 1
@@ -1729,9 +1751,15 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
                 assert sinks == [] and counts["write"] == 0
                 assert target.read_bytes() == preserved_target != original_target
             elif case == "commit-target":
-                assert events == ["source-sweep", "target-sweep", "sink", "target-sweep", "source-sweep", "target-sweep"]
-                assert terminal.disposition == "ABORTED" and "TARGET" in terminal.diagnostic_code
-                assert target.read_bytes() == original_target
+                assert events == [
+                    "source-sweep", "target-sweep", "sink", "source-sweep",
+                    "target-sweep",
+                ]
+                assert terminal.disposition == "ABORTED"
+                assert terminal.diagnostic == "finite public target changed"
+                # Publication refused the changed public occupant; it must
+                # preserve that external change rather than restore old bytes.
+                assert target.read_bytes() == original_target + b"x"
             else:
                 assert events == ["source-sweep"]
                 assert (terminal.disposition, terminal.diagnostic_code) == (

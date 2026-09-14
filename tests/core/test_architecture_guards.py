@@ -20,7 +20,7 @@ def _python_files():
             yield path
 
 
-def test_ssrl_tree_does_not_import_xdart():
+def test_headless_core_does_not_import_xdart():
     offenders: list[str] = []
     for path in _python_files():
         tree = ast.parse(path.read_text(), filename=str(path))
@@ -123,12 +123,11 @@ def test_headless_contract_imports_do_not_pull_gui_modules():
     assert forbidden == []
 
 
-def test_first_party_never_imports_the_shim():
-    """Nothing under src/ may import ssrl_xrd_tools -- the shim exists for
-    USER code only."""
+def test_first_party_never_imports_retired_namespace():
+    """All first-party code uses the current xrd_tools import namespace."""
     offenders: list[str] = []
     for path in SRC.rglob("*.py"):
-        if "__pycache__" in path.parts or path.parent.name == "ssrl_xrd_tools":
+        if "__pycache__" in path.parts:
             continue
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):

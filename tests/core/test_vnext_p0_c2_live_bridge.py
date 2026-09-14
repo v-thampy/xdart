@@ -509,14 +509,17 @@ def test_d1_direct_nexus_dynamic_graph_is_bound_and_admitted(tmp_path):
     from xrd_tools.reduction import NexusSink
 
     target, accounting, live, plan = _dynamic_sink_case(tmp_path, "direct-nexus")
+    _key, token = _armed_submission(accounting)
     session = open_headless_scan_session(
         _exact_scan((live,)), plan,
         sink=NexusSink(target, overwrite=True, atomic=False, flush_every=None),
         accounting=accounting,
         nexus_target=f"nexus:{target}",
     )
-    session.finish(raise_on_failure=False)
+    assert session.submit(session.scan.frames[0], attempt_token=token)
+    assert session.finish(raise_on_failure=False).failed is False
     assert target.exists()
+    assert _rows(target) == (0,)
 
 
 def test_d1_nexus_memory_dynamic_composite_is_bound_and_admitted(tmp_path):
@@ -524,6 +527,7 @@ def test_d1_nexus_memory_dynamic_composite_is_bound_and_admitted(tmp_path):
     from xrd_tools.reduction import CompositeSink, MemorySink, NexusSink
 
     target, accounting, live, plan = _dynamic_sink_case(tmp_path, "nexus-memory")
+    _key, token = _armed_submission(accounting)
     session = open_headless_scan_session(
         _exact_scan((live,)), plan,
         sink=CompositeSink((
@@ -534,8 +538,10 @@ def test_d1_nexus_memory_dynamic_composite_is_bound_and_admitted(tmp_path):
         accounting=accounting,
         nexus_target=f"nexus:{target}",
     )
-    session.finish(raise_on_failure=False)
+    assert session.submit(session.scan.frames[0], attempt_token=token)
+    assert session.finish(raise_on_failure=False).failed is False
     assert target.exists()
+    assert _rows(target) == (0,)
 
 
 def test_d1_swapping_delegation_proxy_refuses_before_begin_or_effect(tmp_path):
@@ -2516,7 +2522,7 @@ def test_c2_already_active_nexus_refuses_before_foreign_or_accounting_mutation(
 
 
 def test_c2_all_nan_is_written_before_pending_drop_and_committed_canonical(tmp_path):
-    from xrd_tools.reduction import NexusSink
+    from xrd_tools.reduction import Frame, NexusSink
 
     target, accounting, live, plan = _dynamic_sink_case(tmp_path, "all-nan-final")
     live.integrator = DeterministicIntegrator(all_nan=True)
@@ -2535,10 +2541,24 @@ def test_c2_all_nan_is_written_before_pending_drop_and_committed_canonical(tmp_p
     assert pending.written_attempts[(key, mode)] is token
     assert pending.pending_publication_dropped == frozenset(((key, mode),))
     assert pending.publication_dropped == frozenset()
+    # A current record retains at least one result row. Keep a finite row so
+    # dropping the all-NaN result still exercises a canonical terminal commit.
+    live.integrator.all_nan = False
+    finite_key, finite_token = _armed_submission(accounting, label=1)
+    finite_frame = Frame(
+        1, image=np.ones((2, 2)), source_path=live.source_file,
+        source_frame_index=0,
+    )
+    session.resume()
+    assert session.submit(finite_frame, attempt_token=finite_token)
     session.finish()
     final = accounting.snapshot()
     assert final.publication_dropped_attempts[(key, mode)] is token
-    assert final.durable == frozenset()
+    assert final.durable == frozenset(((finite_key, mode, target_name),))
+    assert final.durable_attempts[(finite_key, mode, target_name)] is finite_token
+    assert _rows(target) == (1,)
+    with h5py.File(target, "r") as handle:
+        np.testing.assert_allclose(handle["entry/integrated_1d/intensity"][()], 4.0)
 
 
 def test_c2_nexus_preparation_classifies_each_result_array_once(monkeypatch):

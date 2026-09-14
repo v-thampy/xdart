@@ -10,6 +10,7 @@ import time
 import pytest
 from pyqtgraph.Qt import QtWidgets
 
+from xrd_tools.io.output_path import resolve_finite_output_target
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import image_series_spec
@@ -58,7 +59,10 @@ def _page(tmp_path: Path) -> tuple[ScatteringWorkspace, ScatteringCoordinator, P
         sources=FilesystemSourceAdapter(),
         executor=StandardRunExecutor(),
     )
-    return page, lifecycle, output
+    expected_output = resolve_finite_output_target(
+        tmp_path, "standard", operation_token="int-2d",
+    )
+    return page, lifecycle, expected_output
 
 
 def test_real_standard_construction_is_off_the_qt_thread(

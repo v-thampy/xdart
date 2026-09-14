@@ -18,6 +18,8 @@ from xdart.gui.tabs.scattering.batch_terminal_presentation import (
 from xdart.gui.tabs.scattering.context_controller import ContextController
 from xdart.gui.tabs.scattering.context_projection import ContextProjection
 from xdart.gui.tabs.scattering.display_values import RunIdentity, StandardEventKind, StandardRunEvent
+from xdart.gui.tabs.scattering.metadata_operations import MetadataOperationOwner
+from xdart.gui.tabs.scattering.external_tools import unavailable_external_tools
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 import xdart.gui.tabs.scattering.page as page_module
 from xdart.gui.tabs.scattering.processed_browser import ProcessedBrowserOwner
@@ -598,7 +600,7 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
     _release_real_viewer(controller, render)
 
 
-def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_path) -> None:
+def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_path, caplog) -> None:
     import xrd_tools.session.viewer_1d as viewer
     from tests.xdart.scattering.test_e3_context_contract import _cold_controller, _select_browse
     one_d = _write_xye(tmp_path / "one.xye", [0, 1], [1, 2])
@@ -638,7 +640,11 @@ def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_pat
     assert controller.close_viewer_2d()
     controller.open_viewer_1d((str(one_d),))
     _await_ready(controller)
-    clear_results = [True, False, True]
+    clear_results = []
+    clear_allowed = False
+    def clear_viewer(request):
+        clear_results.append(clear_allowed)
+        return viewer._new_viewer_1d_renderer_clear_receipt(request, clear_allowed)
     processed_browser = ProcessedBrowserOwner(
         save_path="",
         processing_mode="1D Viewer",
@@ -647,12 +653,13 @@ def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_pat
     )
     assert processed_browser.begin_close()
     workspace = SimpleNamespace(_context_controller=controller,
-        _shell=SimpleNamespace(browser=SimpleNamespace(reconcile_heavy_residency=lambda *_args, **_kwargs: None), scientific=SimpleNamespace(
-            clear_viewer_1d=lambda request:
-                viewer._new_viewer_1d_renderer_clear_receipt(
-                    request, clear_results.pop(0)
-                ),
+        _shell=SimpleNamespace(browser=SimpleNamespace(
+            reconcile_detector_mode=lambda _projection: None,
+            reconcile_heavy_residency=lambda *_args, **_kwargs: None), scientific=SimpleNamespace(
+            clear_viewer_1d=clear_viewer,
             expect_display_background=lambda _key: None,
+            bottom_waterfall_active=False,
+            drop_viewer_loading_snapshot=lambda: None,
             clear_workspace=lambda: True,
         )),
         _last_scientific_projection=object(), _preferences=ScientificPreferences(),
@@ -664,6 +671,8 @@ def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_pat
             active_key=None, projection=lambda: None,
         ),
         _workspace_operations=SimpleNamespace(average_pending=None),
+        _external_tools=SimpleNamespace(project=lambda **_kwargs: unavailable_external_tools()),
+        _qualify_external_nexus=lambda **_kwargs: None,
     )
     workspace._clear_viewer_1d_renderer = partial(ScatteringWorkspace._clear_viewer_1d_renderer, workspace)
     workspace.__dict__.update(_closed=False, _sync_detector_demand=lambda: None, _retain_outgoing_display=False, _source_selection=SimpleNamespace(observation=None),
@@ -679,17 +688,42 @@ def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_pat
             _ensure_timer=lambda: None, _release_browse_1d_debt=lambda: True,
             _retire_batch_presentation=lambda **_kwargs: None)
     workspace._lifecycle.__dict__.update(reset_permitted=False, active_run_identity=None, attempt_run_identity=None)
-    notices = []; workspace._notice = notices.append; workspace._shell.apply_state = lambda *_args, **_kw: (_ for _ in ()).throw(RuntimeError("render"))
+    notices = []; workspace._notice = notices.append
+    def fail_render(*_args, **_kwargs):
+        notices.append("injected-render-failure")
+        raise RuntimeError("render")
+    workspace._shell.apply_state = fail_render
     ScatteringWorkspace._refresh_shell(workspace)
     assert controller.viewer_1d_cleanup_pending and workspace._last_scientific_projection is None and "Passive shell render failed" in notices[-1]
-    assert workspace._clear_viewer_1d_renderer(close=True) and controller.viewer_1d_context is None; controller.open_viewer_1d((str(one_d),)); _await_ready(controller)
+    assert notices == ["injected-render-failure", "Passive shell render failed: render"]
+    assert clear_results == [False]
+    clear_allowed = True
+    # Pytest retains logging traceback frames, including the exact projected
+    # arrays.  The lease must refuse release until that test-owned alias drops.
+    assert workspace._clear_viewer_1d_renderer(close=True) is False
+    assert controller._viewer_1d.holder is not None
+    logged = [record for record in caplog.records
+              if record.getMessage() == "Passive shell render failed"]
+    assert len(logged) == 1 and logged[0].exc_info[0] is RuntimeError
+    logged[0].exc_info = None
+    logged[0].exc_text = None
+    import gc
+    gc.collect()
+    deadline = time.monotonic() + 4
+    while time.monotonic() < deadline and not workspace._clear_viewer_1d_renderer(close=True):
+        time.sleep(0.005)
+    assert controller.viewer_1d_context is None
+    controller.open_viewer_1d((str(one_d),)); _await_ready(controller)
+    clear_allowed = False
     pending = ScatteringWorkspace.close_workspace(workspace)
     assert pending.cleanup_status.value == "cleanup_pending" and controller.viewer_1d_cleanup_pending
+    clear_allowed = True
     deadline = time.monotonic() + 4
     while time.monotonic() < deadline and not ScatteringWorkspace._edit_scientific_preference(
             workspace, ShellCommand(ShellCommandKind.CLEAR_1D)):
         time.sleep(0.005)
     assert controller.viewer_1d_context is None
+    assert clear_results == [False, True, False, True]
 
 
 def test_catalog_activation_routes_are_gui_thread_zero_io(monkeypatch) -> None:
@@ -703,6 +737,7 @@ def test_catalog_activation_routes_are_gui_thread_zero_io(monkeypatch) -> None:
         _closed=False,
         _context_controller=controller,
         _workspace_operations=WorkspaceOperationOwner(),
+        _metadata_operations=MetadataOperationOwner(),
         _analysis_operation_busy=lambda: False,
         _experiment_operation_busy=lambda: False,
         _notice=lambda _message: None,
@@ -825,6 +860,7 @@ def test_viewer_1d_clicked_current_keeps_explicit_selection_in_both_modes(
         _closed=False,
         _context_controller=controller,
         _workspace_operations=WorkspaceOperationOwner(),
+        _metadata_operations=MetadataOperationOwner(),
         _analysis_operation_busy=lambda: False,
         _experiment_operation_busy=lambda: False,
         _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(

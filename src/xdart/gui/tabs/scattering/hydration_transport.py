@@ -351,14 +351,17 @@ class HydrationTransport:
             ):
                 displaced = active.token
                 displaced_ticket = active.ticket
-                active.token = token
                 active.closed = bool(closed)
                 deliveries = []
                 if displaced != token:
+                    active.token = token
                     active.ticket = _HydrationTicket(token)
                     deliveries.append(self._capture_locked(
                         active, displaced, HydrationOutcome.SUPERSEDED,
                         displaced_ticket, clear=False, restore=_EntryState.READING))
+                # An equal token represents the same in-flight presentation.
+                # Keep its identity: _execute checks that exact object before
+                # committing the read already in progress.
                 queued = self._queued
                 if queued is not None:
                     deliveries.append(self._capture_locked(
@@ -596,29 +599,59 @@ class HydrationTransport:
             outcome, diagnostic = ((terminal.outcome, terminal.diagnostic)
                                    if terminal is not None else result)
             with self._lock:
-                if not self._entry_current_locked(entry, token, ticket):
-                    if self._worker is worker: self._worker = None
-                    return
-                final = entry.token
-                current_ticket = entry.ticket
-                committed = entry.committed_token
-                committed_ticket = entry.committed_ticket
-                if (
-                    committed_ticket is not None
-                    and committed_ticket is not current_ticket
-                ):
-                    guard = _DeliveryGuard()
-                    deliveries = (
-                        self._capture_locked(entry, committed, outcome,
-                            committed_ticket, diagnostic, clear=True, guard=guard),
-                        self._capture_locked(entry, final,
-                            HydrationOutcome.ALREADY_RESIDENT, current_ticket,
-                            clear=True, guard=guard),
-                    )
+                # Ordinary frame requests can be retargeted while the commit
+                # is outside this lock. Its receipt still belongs to this
+                # exact entry/admission, even after A -> B -> A selection.
+                committed_admission = (
+                    type(entry.request) is HydrationRequest
+                    and self._active is entry
+                    and entry.state is _EntryState.READING
+                    and entry.delivery_guard is None
+                    and entry.committed_token is not None
+                    and entry.committed_ticket is not None
+                )
+                if not (self._entry_current_locked(entry, token, ticket)
+                        or committed_admission):
+                    if (type(entry.request) is HydrationRequest
+                            and self._active is entry
+                            and entry.state is _EntryState.READING
+                            and entry.delivery_guard is None):
+                        # A read failed before the displaced admission reached
+                        # commit. The replacement still owns a pending ticket.
+                        if self._queued is None and not self._retired:
+                            self._active = None
+                            self._queued = entry
+                            continue
+                        deliveries = (self._capture_locked(
+                            entry, entry.token,
+                            (HydrationOutcome.CANCELLED if self._retired
+                             else HydrationOutcome.SUPERSEDED),
+                            entry.ticket, clear=True),)
+                    else:
+                        if self._worker is worker: self._worker = None
+                        return
                 else:
-                    deliveries = (self._capture_locked(
-                        entry, final, outcome, current_ticket, diagnostic,
-                        clear=True),)
+                    final = entry.token
+                    current_ticket = entry.ticket
+                    committed = entry.committed_token
+                    committed_ticket = entry.committed_ticket
+                    if (committed_ticket is not None
+                            and committed_ticket is not current_ticket):
+                        guard = _DeliveryGuard()
+                        deliveries = (
+                            self._capture_locked(entry, committed, outcome,
+                                committed_ticket, diagnostic, clear=True, guard=guard),
+                            self._capture_locked(entry, final,
+                                (HydrationOutcome.ALREADY_RESIDENT
+                                 if outcome in (HydrationOutcome.HYDRATED,
+                                                HydrationOutcome.ALREADY_RESIDENT)
+                                 else outcome), current_ticket,
+                                diagnostic, clear=True, guard=guard),
+                        )
+                    else:
+                        deliveries = (self._capture_locked(
+                            entry, final, outcome, current_ticket, diagnostic,
+                            clear=True),)
             try:
                 self.dispatch_detached(DetachedHydrationMutation(deliveries=deliveries))
             except BaseException as control:
@@ -637,6 +670,9 @@ class HydrationTransport:
             return self._execute_viewer_1d(entry, token, ticket)
         if type(entry.request) in _VIEWER_2D_REQUEST_TYPES:
             return self._execute_viewer(entry, token, ticket)
+        with self._lock:
+            entry.committed_token = None
+            entry.committed_ticket = None
         try:
             preview = read_frame_preview(
                 entry.request.read_key,
@@ -645,8 +681,16 @@ class HydrationTransport:
         except Exception as error:
             return HydrationOutcome.FAILED, _diagnostic(error)
         with self._lock:
-            if not self._entry_current_locked(entry, token, ticket):
+            if self._retired:
+                return HydrationOutcome.CANCELLED, None
+            if (self._active is not entry
+                    or entry.state is not _EntryState.READING
+                    or entry.delivery_guard is not None):
                 return None
+            # Coalescing changes presentation generation, not the exact read
+            # key or its carried stores/gate. Commit the one read for the most
+            # recent admitted presentation instead of reading it again.
+            token, ticket = entry.token, entry.ticket
             closed = entry.closed
             entry.committed_token = token
             entry.committed_ticket = ticket

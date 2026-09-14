@@ -115,7 +115,10 @@ def _write_raw_detector_nxs(path):
 
 class TestProcessedClassifier:
     def test_classifier_true_for_processed(self, tmp_path):
-        p = _write_processed_xdart(tmp_path / "proc.nexus")
+        from tests.core._processed_fixture import write_recognized_result
+
+        p = tmp_path / "proc.nexus"
+        write_recognized_result(p)
         assert has_processed_output_markers_path(p) is True
         assert is_current_processed_xdart_path(p) is True
         with h5py.File(p, "r") as f:

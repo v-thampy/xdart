@@ -2777,7 +2777,7 @@ _LEDGER_DEFINITION = "xrd_tools/session/stage_accounting.py"
 _LEDGER_COMPOSITION_SITE = "xrd_tools/session/scan_session.py"
 _LEDGER_RUN_COMPOSITION_SITES = frozenset({
     "xdart/gui/tabs/scattering/adapters/dynamic_output.py",
-    "xrd_tools/reduction/reintegrate.py",
+    "xrd_tools/reduction/reintegrate_successor.py",
     _LEDGER_COMPOSITION_SITE,
 })
 _OWNER_MODULE = "xrd_tools.session.stage_accounting"

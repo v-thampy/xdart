@@ -320,6 +320,7 @@ class ScientificView(QtWidgets.QFrame):
         self._align_cake_seq = 0
         self._align_curve_pending = False
         self._align_cake_pending = False
+        self._reflow_follows = 0
         self._share_cake_handler = self._on_cake_xrange_changed
         self._share_curve_handler = self._on_curve_xrange_changed
         layout = QtWidgets.QVBoxLayout(self)
@@ -422,6 +423,7 @@ class ScientificView(QtWidgets.QFrame):
         layout.addLayout(self.footer)
         self._viewer_loading_mode: str | None = None
         self._viewer_loading_target: QtWidgets.QWidget | None = None
+        self._viewer_loading_watched: tuple[QtWidgets.QWidget, ...] = ()
         self._viewer_loading_overlay = QtWidgets.QFrame(self)
         self._viewer_loading_overlay.setObjectName("e6ViewerLoadingPreviousView")
         self._viewer_loading_overlay.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
@@ -1174,15 +1176,33 @@ class ScientificView(QtWidgets.QFrame):
             )
         self._viewer_loading_mode = mode
         self._viewer_loading_target = target
+        self._watch_viewer_loading_geometry(target)
         self._viewer_loading_pixmap.setPixmap(pixmap)
         self._viewer_loading_overlay.show()
         self._layout_viewer_loading_snapshot()
+
+    def _watch_viewer_loading_geometry(self, target: QtWidgets.QWidget) -> None:
+        # The overlay covers the target in this view's coordinates, but the
+        # target's row can still be re-laid while the load is pending (the
+        # previous mode's rows collapsing, a splitter settling on a slow
+        # host).  Follow every geometry change on the target and on each
+        # ancestor below this view.  Filters stay installed: some of these
+        # widgets already carry the share-axis hook, and removing the filter
+        # would drop that too.
+        chain = []
+        widget: QtWidgets.QWidget | None = target
+        while widget is not None and widget is not self:
+            widget.installEventFilter(self)
+            chain.append(widget)
+            widget = widget.parentWidget()
+        self._viewer_loading_watched = tuple(chain)
 
     def drop_viewer_loading_snapshot(self) -> None:
         """Release the transient raster without touching scientific payloads."""
 
         self._viewer_loading_mode = None
         self._viewer_loading_target = None
+        self._viewer_loading_watched = ()
         self._viewer_loading_pixmap.clear()
         self._viewer_loading_overlay.hide()
 
@@ -2196,6 +2216,8 @@ class ScientificView(QtWidgets.QFrame):
                 or prior_contract is None
                 or prior_contract[0] != data_contract
             )
+            if data_changed:
+                self._reflow_follows = 0
             if item is None:
                 pen = pg.mkPen(
                     color=style_contract,
@@ -2756,7 +2778,9 @@ class ScientificView(QtWidgets.QFrame):
             # A live run can reconcile faster than the event-loop geometry
             # coalescer.  Geometry is already settled here (image + traces
             # rendered), so converge synchronously; the range guard keeps an
-            # already-aligned repaint a no-op.
+            # already-aligned repaint a no-op.  A real trigger, so it opens
+            # a fresh re-flow follow epoch like the scheduled ones do.
+            self._reflow_follows = 0
             self._align_curve_under_cake()
 
     def _apply_processing_layout(self, mode: str) -> None:
@@ -2984,11 +3008,25 @@ class ScientificView(QtWidgets.QFrame):
         self.cake.canvas.image_win.installEventFilter(self)
         self.curve.installEventFilter(self)
         self.waterfall.canvas.image_win.installEventFilter(self)
+        # An AxisItem sizes itself lazily at paint, so a tick-label re-flow
+        # moves a view box without any widget Resize/Show, splitter move or
+        # resizeEvent: follow the view boxes themselves.  The scheduler
+        # coalesces and budgets these follows (see _schedule_curve_under_cake).
+        for view_box in (
+            self.cake.canvas.imageViewBox,
+            self.curve.getPlotItem().getViewBox(),
+            self.waterfall.canvas.imageViewBox,
+        ):
+            view_box.sigResized.connect(self._on_share_view_resized)
 
     def _on_share_geometry_changed(self, *_args) -> None:
         self._layout_viewer_loading_snapshot()
         if self._share_link_on:
             self._schedule_curve_under_cake()
+
+    def _on_share_view_resized(self, *_args) -> None:
+        if self._share_link_on:
+            self._schedule_curve_under_cake(from_reflow=True)
 
     def eventFilter(self, watched, event) -> bool:
         if watched in {
@@ -3006,6 +3044,16 @@ class ScientificView(QtWidgets.QFrame):
                 QtCore.QEvent.Type.ContextMenu,
             }:
                 return True
+        if (
+            watched in self._viewer_loading_watched
+            and event.type() in {
+                QtCore.QEvent.Type.Move,
+                QtCore.QEvent.Type.Resize,
+                QtCore.QEvent.Type.Show,
+                QtCore.QEvent.Type.Hide,
+            }
+        ):
+            self._layout_viewer_loading_snapshot()
         if (
             watched
             in {
@@ -3028,13 +3076,27 @@ class ScientificView(QtWidgets.QFrame):
         if self._share_link_on:
             self._schedule_curve_under_cake()
 
-    def _schedule_curve_under_cake(self) -> None:
+    def _schedule_curve_under_cake(self, *, from_reflow: bool = False) -> None:
         # Coalesce onto the first pending pair instead of restarting a
         # trailing-edge debounce.  The event-loop callback makes progress
         # during a resize/show storm; the bounded follow-up observes the final
         # pyqtgraph layout after axes and color bars settle.
+        if not from_reflow:
+            # A real trigger (a widget event, a cake X-range change, the
+            # link, new curve data) opens a fresh follow epoch even when it
+            # coalesces onto a pending pair; only the axis-driven follows
+            # below are budgeted.
+            self._reflow_follows = 0
         if self._align_curve_pending:
             return
+        if from_reflow:
+            # A clipped-to-view curve autoranges Y over the visible samples,
+            # so an align can move the tick-label width, which moves the
+            # align: when no fixed point exists this would ping-pong forever.
+            # Budget the axis-driven follows between real triggers.
+            if self._reflow_follows >= _MAX_REFLOW_FOLLOWS:
+                return
+            self._reflow_follows += 1
         self._align_curve_pending = True
         sequence = self._align_seq + 1
         self._align_seq = sequence
@@ -3054,6 +3116,10 @@ class ScientificView(QtWidgets.QFrame):
         QtCore.QTimer.singleShot(0, align)
 
     def _schedule_cake_under_curve(self) -> None:
+        # Only a user/external curve X-range change reaches here (the link's
+        # own feedback is fenced by _share_axis_syncing): a real trigger for
+        # the re-flow budget as much as a cake-side change is.
+        self._reflow_follows = 0
         if self._align_cake_pending:
             return
         self._align_cake_pending = True
@@ -3076,13 +3142,20 @@ class ScientificView(QtWidgets.QFrame):
 
     @staticmethod
     def _global_xspan(widget, view_box) -> tuple[float, float]:
-        rect = view_box.sceneBoundingRect()
-        left = widget.mapToGlobal(
-            widget.mapFromScene(rect.topLeft())
-        ).x()
-        right = widget.mapToGlobal(
-            widget.mapFromScene(rect.bottomRight())
-        ).x()
+        # pyqtgraph maps the view range onto view_box.rect(); the bounding
+        # rect is half a pen wider, the box sits at a fractional scene x
+        # (axis widths follow the font metrics), and mapFromScene rounds to
+        # whole pixels.  Any of those errors extrapolates into a visible
+        # column offset on the linked plot, so take the rect the transform
+        # targets and keep its sub-pixel position: map through the viewport
+        # transform and add the viewport's integer origin.
+        rect = view_box.mapRectToScene(view_box.rect())
+        transform = widget.viewportTransform()
+        origin = float(
+            widget.viewport().mapToGlobal(QtCore.QPoint(0, 0)).x()
+        )
+        left = origin + transform.map(rect.topLeft()).x()
+        right = origin + transform.map(rect.bottomRight()).x()
         return float(left), float(right)
 
     def _share_geometry(self):
@@ -3137,13 +3210,14 @@ class ScientificView(QtWidgets.QFrame):
         prior_syncing = self._share_axis_syncing
         self._share_axis_syncing = True
         try:
+            # X only.  Y autorange is owned elsewhere (mode entry, the
+            # explicit intensity autoscale, a changed slice) and a follow
+            # must not discard a manual Y zoom: with clipToView the zoom
+            # itself re-flows the tick labels, which is one of the very
+            # triggers that land here.
             curve_view.enableAutoRange(
                 axis=pg.ViewBox.XAxis,
                 enable=False,
-            )
-            curve_view.enableAutoRange(
-                axis=pg.ViewBox.YAxis,
-                enable=True,
             )
             curve_view.setXRange(*desired, padding=0.0)
         finally:
@@ -3310,6 +3384,9 @@ _TRACE_COLORS = (
     (23, 190, 207),
 )
 _MAX_RETAINED_CURVE_ITEMS = 32
+# Axis-re-flow-driven share-link follows allowed between real triggers: a
+# legitimate chain is two (the follow's own Y autorange may re-flow once).
+_MAX_REFLOW_FOLLOWS = 3
 
 
 __all__ = ["ScientificView"]

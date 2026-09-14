@@ -25,7 +25,10 @@ from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.events import CleanupStatus
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.state_machine import RunPhase
-from xrd_tools.core.scan import Scan, ScanFrame
+from xrd_tools.sources.image import TiffSeriesSource
+from xrd_tools.integrate.calibration import load_detector_calibration
+from tests.xdart.scattering._output_slots import written
+import fabio.tifimage
 from xrd_tools.core.staging import (
     browse_publication_max_items,
     live_record_store_max_items,
@@ -47,10 +50,8 @@ from tests.xdart.scattering.test_e2p_rapid_navigation import (
     _TrackingExecutor,
     _TrackingRecordStore,
     _TrackingScanSession,
-    _accepted_admission,
     _heartbeat,
     _wait,
-    _write_synthetic_series,
 )
 
 
@@ -63,86 +64,57 @@ _J3_FRAME_COUNT = 651
 _SHARED_SHAPE = (384, 384)
 
 
-class _SharedImageSource:
-    """651 distinct frames sharing one immutable source image."""
-
-    def __init__(
-        self,
-        members: tuple[Path, ...],
-        lifecycle_facts: list[tuple[str, str]],
-    ) -> None:
-        if len(members) != _J3_FRAME_COUNT:
-            raise ValueError("synthetic source requires the exact 651 members")
-        self._members = members
-        self._lifecycle_facts = lifecycle_facts
-        image = np.arange(
-            int(np.prod(_SHARED_SHAPE)), dtype=np.float32
-        ).reshape(_SHARED_SHAPE)
-        image.setflags(write=False)
-        self._image = image
-        lifecycle_facts.append(("construct", current_thread().name))
-
-    def to_scan(self, *, poni, integrator, output_path):
-        self._lifecycle_facts.append(
-            ("to_scan", current_thread().name)
-        )
-        return Scan(
-            "rss-651",
-            [
-                ScanFrame(
-                    label,
-                    image=self._image,
-                    source_path=member,
-                    source_frame_index=0,
-                    source_identity=str(member),
-                )
-                for label, member in enumerate(self._members, start=1)
-            ],
-            poni=poni,
-            integrator=integrator,
-            output_path=output_path,
-        )
-
-    def close(self) -> None:
-        self._lifecycle_facts.append(
-            ("close", current_thread().name)
-        )
-
-
 def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "16")
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     selected = tmp_path / "rss_0001.tif"
-    members = _write_synthetic_series(selected)
+    image = np.arange(int(np.prod(_SHARED_SHAPE)), dtype=np.uint32).reshape(_SHARED_SHAPE)
+    fabio.tifimage.TifImage(data=image).write(str(selected))
+    members = tuple(tmp_path / f"rss_{label:04d}.tif" for label in range(1, _J3_FRAME_COUNT + 1))
+    for member in members[1:]:
+        os.link(selected, member)
+    del image
     poni = tmp_path / "rss.poni"
-    poni.write_text("deterministic resource calibration")
+    poni.write_text(
+        'poni_version: 2.1\nDetector: Detector\n'
+        'Detector_config: {"pixel1":0.0001,"pixel2":0.0001,"max_shape":[384,384],"orientation":3}\n'
+        'Distance: 0.1\nPoni1: 0.01\nPoni2: 0.01\n'
+        'Rot1: 0\nRot2: 0\nRot3: 0\nWavelength: 1e-10\n'
+    )
     output = tmp_path / "rss.nexus"
     source_lifecycle: list[tuple[str, str]] = []
     source_references: list[
-        weakref.ReferenceType[_SharedImageSource]
+        weakref.ReferenceType[TiffSeriesSource]
     ] = []
     plan_configurations: list[FrozenRunConfiguration] = []
     _TrackingRecordStore.instances.clear()
     _TrackingScanSession.references.clear()
 
-    monkeypatch.setattr(
-        executor_module, "build_admission_receipt", _accepted_admission
-    )
-
-    def open_source(_spec):
-        source = _SharedImageSource(members, source_lifecycle)
+    real_open_source = executor_module.open_source
+    real_to_scan = TiffSeriesSource.to_scan
+    def open_source(spec):
+        source = real_open_source(spec)
+        assert type(source) is TiffSeriesSource
+        source_lifecycle.append(("construct", current_thread().name))
         source_references.append(weakref.ref(source))
         return source
-
+    def to_scan(source, **kwargs):
+        source_lifecycle.append(("to_scan", current_thread().name))
+        return real_to_scan(source, **kwargs)
     monkeypatch.setattr(executor_module, "open_source", open_source)
-    monkeypatch.setattr(
-        executor_module,
-        "poni_to_integrator",
-        lambda _poni: _TinyIntegrator(),
-    )
+    monkeypatch.setattr(TiffSeriesSource, "to_scan", to_scan)
+    monkeypatch.setattr(TiffSeriesSource, "close", lambda source: source_lifecycle.append(
+        ("close", current_thread().name)), raising=False)
+    real_integrator = executor_module.poni_to_integrator
+    # This oracle bounds frame/owner retention, not first-import font and
+    # scientific-library caches. Initialize the real calibration dependency
+    # before the RSS baseline; Run still constructs its own integrator below.
+    real_integrator(load_detector_calibration(poni))
+    monkeypatch.setattr(executor_module, "poni_to_integrator",
+                        lambda calibration: _TinyIntegrator(real_integrator(calibration)))
     native_plan = executor_module.native_int_reduction_plan
 
     def observed_plan(configuration):
@@ -175,6 +147,7 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
         bai_1d_args={"npt": 2},
         bai_2d_args={},
     )
+    output = written(output, "Int 1D")
     lifecycle = ScatteringCoordinator()
     executor = _TrackingExecutor()
     page = ScatteringWorkspace(
@@ -280,7 +253,7 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
         # J3 exercises the full large-frame/checkpoint transient route: its
         # array-bearing record population must stay within the exact staging
         # grant, while the RSS ceiling below covers every resource category.
-        transient_heavy_bound = fact.granted_staging_count
+        transient_heavy_bound = allocation.record_items
         assert scientific_records.heavy_peak <= transient_heavy_bound
         assert scientific_records._heavy_labels == []
         publication_heavy = artifact_owner.publications.heavy_labels()
@@ -350,6 +323,9 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
         del artifact_owner
         del publication_heavy
         del records
+        # The real scan's frame loaders bind its source. Drop the test's
+        # retained run reference before checking that the owner released it.
+        run = None
         gc.collect()
         qapp.processEvents()
         post_close_rss = process.memory_info().rss
@@ -372,7 +348,7 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
                     "frames": _J3_FRAME_COUNT,
                     "shared_source_bytes": int(
                         np.prod(_SHARED_SHAPE)
-                        * np.dtype(np.float32).itemsize
+                        * np.dtype(np.uint32).itemsize
                     ),
                     "rss_baseline_bytes": baseline_rss,
                     "rss_peak_bytes": peak_rss,

@@ -57,6 +57,7 @@ from xrd_tools.sources.selection import (
     image_series_spec,
 )
 
+from tests.core.v2_fixture_factory import current_entry
 from tests.xdart.scattering.test_e3_join_oracle import (
     _mount,
     _pause,
@@ -96,7 +97,7 @@ class _RecordingExecutor(StandardRunExecutor):
 def _real_data_root() -> Path:
     configured = os.environ.get("XDART_TEST_DATA")
     if not configured:
-        raise RuntimeError("XDART_TEST_DATA is required for J3 live evidence")
+        pytest.skip("XDART_TEST_DATA is required for J3 external-data evidence")
     root = Path(configured)
     if not root.is_dir():
         raise RuntimeError(f"J3 real-data root is unavailable: {root}")
@@ -219,7 +220,7 @@ def _clean_close(
 def _accepted_xye() -> Path:
     root = os.environ.get("XDART_TEST_DATA")
     if not root:
-        raise RuntimeError("XDART_TEST_DATA is required for J3 live evidence")
+        pytest.skip("XDART_TEST_DATA is required for J3 external-data evidence")
     path = Path(root) / (
         "test_relative_path/xdart_processed_data/"
         "eiger_S069Ta_redo_eta2p0_1_scan001/"
@@ -254,8 +255,7 @@ def _write_xye_only_b(path: Path) -> tuple[np.ndarray, np.ndarray]:
     )
     record = FrameRecord.from_view(view)
     with h5py.File(path, "w") as handle:
-        entry = handle.create_group("entry")
-        entry.attrs["NX_class"] = "NXentry"
+        entry = current_entry(handle)
         write_frame_records(entry, [record])
     return (
         np.asarray(q, dtype=np.float32).astype(float),
@@ -857,7 +857,7 @@ def test_j3_mounted_qualified_xye_only_replaces_images_and_renders_trace(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    b_path = tmp_path / "accepted-xye-only.nxs"
+    b_path = tmp_path / "accepted-xye-only.nexus"
     q, intensity = _write_xye_only_b(b_path)
     rig = _mount(
         monkeypatch,

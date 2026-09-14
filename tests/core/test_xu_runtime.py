@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+import platform
 from pathlib import Path
 import subprocess
 import sys
@@ -20,15 +21,16 @@ from xrd_tools.core.geometry.xu_runtime import (
     xu_runtime_availability,
     xu_runtime_requirements_projection,
     xu_runtime_session,
+    _supported_platform,
 )
 
 
-def test_xu_runtime_requirements_are_the_exact_validated_platform_contract():
+def test_xu_runtime_requirements_preserve_the_numerical_contract():
     assert XuRuntimeRequirements().distribution_version == "1.7.12"
     with pytest.raises(TypeError, match="requirements are invalid"):
         XuRuntimeRequirements(distribution_version="future")
     with pytest.raises(TypeError, match="requirements are invalid"):
-        XuRuntimeRequirements(platform_machine="x86_64")
+        XuRuntimeRequirements(python_min_version=(3, 12))
 
 
 def test_xu_runtime_requirements_projection_is_the_exact_effective_contract():
@@ -41,14 +43,28 @@ def test_xu_runtime_requirements_projection_is_the_exact_effective_contract():
         1e-8,
         8,
         "CPython",
-        "3.13.14",
-        "Darwin",
-        "arm64",
+        3, 13,
+        "Darwin", "Linux", "Windows",
         XU_RUNTIME_LOCK_POLICY,
         XU_RUNTIME_EFFECTIVE_NTHREADS,
     )
     with pytest.raises(TypeError, match="must be exact"):
         xu_runtime_requirements_projection(object())
+
+
+@pytest.mark.parametrize("system", ("Darwin", "Linux", "Windows"))
+@pytest.mark.parametrize("version", ("3.13.0", "3.13.14", "3.14.0"))
+def test_portable_platform_policy_admits_supported_interpreters(system, version):
+    assert _supported_platform("CPython", version, system)
+
+
+@pytest.mark.parametrize(
+    ("implementation", "version", "system"),
+    (("PyPy", "3.13.0", "Linux"), ("CPython", "3.12.9", "Windows"),
+     ("CPython", "3.13.0", "FreeBSD"), ("CPython", "invalid", "Darwin")),
+)
+def test_portable_platform_policy_refuses_outside_support(implementation, version, system):
+    assert not _supported_platform(implementation, version, system)
 
 
 def test_xu_runtime_availability_is_engine_light(monkeypatch):
@@ -119,6 +135,17 @@ def test_xu_runtime_sets_one_and_restores_on_success_and_error():
     assert record.to_attestation()["lock_policy"] == (
         "shared_xrd_tools_xu_rlock_v1"
     )
+    import importlib.metadata
+    import numpy as np
+    import xrayutilities as xu
+
+    assert record.xrayutilities_distribution_version == importlib.metadata.version("xrayutilities")
+    assert record.xrayutilities_module_version == xu.__version__
+    assert record.numpy_version == np.__version__
+    assert record.python_implementation == platform.python_implementation()
+    assert record.python_version == platform.python_version()
+    assert record.platform_system == platform.system()
+    assert record.platform_machine == platform.machine()
 
     failed = xu_runtime_session()
     with pytest.raises(RuntimeError, match="body failure"):

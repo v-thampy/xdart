@@ -628,15 +628,17 @@ def _seal_published(path: str, ordinal: int) -> StreamTerminal:
     pass here and fail later, when a Reintegrate reads this artifact as its
     predecessor.  So the digest is RECOMPUTED from the published bytes: one full
     read, which a finite operation can afford once.  Mirrors what the finite
-    publisher does when it seals a file it did not itself write.
+    publisher does when it seals a file it did not itself write.  The object
+    revision is the capture's descriptor view (the change time on win32, not
+    a pathname stat's creation time), the origin `revalidate_stream_terminal`
+    holds its descriptor views to.
     """
     observed = capture_target_snapshot(path)
-    state = os.stat(path)
     _reject(not observed.exists, 'AVERAGE_PUBLICATION_VANISHED')
     return StreamTerminal(
         path, int(observed.size), observed.digest, int(ordinal),
-        int(state.st_dev), int(state.st_ino),
-        int(state.st_mtime_ns), int(state.st_ctime_ns),
+        int(observed.device), int(observed.inode),
+        int(observed.mtime_ns), int(observed.ctime_ns),
     )
 
 

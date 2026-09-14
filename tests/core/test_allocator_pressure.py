@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import inspect
+import sys
 
 import pytest
 
@@ -9,6 +10,7 @@ import xrd_tools.core.allocator_pressure as allocator_pressure
 from xrd_tools.core.allocator_pressure import (
     AllocatorPressureCallFailed,
     AllocatorPressureUnavailable,
+    bind_allocator_pressure_relief,
     bind_darwin_allocator_pressure_relief,
 )
 
@@ -30,6 +32,15 @@ class _Function:
 class _Library:
     def __init__(self, function: _Function) -> None:
         self.malloc_zone_pressure_relief = function
+
+
+def test_native_platform_selects_only_its_available_allocator_capability():
+    capability = bind_allocator_pressure_relief()
+    if sys.platform == "darwin":
+        assert capability is not None
+        capability.relieve()
+    else:
+        assert capability is None
 
 
 def test_non_darwin_platform_refuses_without_loading_library(monkeypatch) -> None:

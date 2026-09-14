@@ -38,6 +38,7 @@ from xrd_tools.io.finite_artifact import (
     capture_finite_source,
 )
 from xrd_tools.io.read import relative_source_path
+from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.io.output_transaction import (
     StreamTerminal,
     TargetSnapshot,
@@ -830,13 +831,13 @@ def _admit_target(value: object) -> PreparedTargetReceipt:
                 terminal.device,
                 terminal.inode,
                 terminal.mtime_ns,
-                terminal.ctime_ns,
+                identity_ctime_ns(terminal.ctime_ns),
             ) != (
                 snapshot.size,
                 snapshot.device,
                 snapshot.inode,
                 snapshot.mtime_ns,
-                snapshot.ctime_ns,
+                identity_ctime_ns(snapshot.ctime_ns),
             )
         ):
             raise PreparedRouteRejected(

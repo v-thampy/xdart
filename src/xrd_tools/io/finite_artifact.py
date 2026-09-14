@@ -34,6 +34,7 @@ from xrd_tools.io.output_path import (
     resolve_finite_output_target,
 )
 from xrd_tools.io.output_safety import paths_same_file
+from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.io.output_transaction import (
     StreamTerminal,
     capture_target_snapshot,
@@ -91,6 +92,10 @@ class FiniteArtifactCollision(FiniteArtifactError):
 
 class FiniteArtifactIntegrityError(FiniteArtifactError):
     """An admitted source, candidate, or public terminal lost exact identity."""
+
+
+class _FiniteCandidateOwnershipLost(FiniteArtifactIntegrityError):
+    """The reserved private name no longer authorizes mutation or cleanup."""
 
 
 class FiniteArtifactCapacityError(FiniteArtifactError):
@@ -354,6 +359,7 @@ class FinitePredecessorReceipt:
                 terminal.target != snapshot.path
                 or terminal.size != snapshot.size
                 or terminal.digest != snapshot.digest
+                # Both are descriptor-recorded views of one object: exact.
                 or (
                     terminal.device,
                     terminal.inode,
@@ -1641,6 +1647,20 @@ def _state(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
     )
 
 
+def _comparable(
+    state: tuple[int, int, int, int, int, int],
+) -> tuple[int, int, int, int, int, int]:
+    """*state* with its ctime slot on the win32 seam.
+
+    ``_capture_regular`` agrees a descriptor view of a file with a pathname
+    view, and on win32 the two report different ctimes for one untouched
+    file (change time vs creation time).  Snapshots keep the descriptor's
+    observed ctime and compare with later descriptor views exactly
+    (``_snapshot_state``); only the mixed-view agreement goes through this.
+    """
+    return (*state[:5], identity_ctime_ns(state[5]))
+
+
 def _entry_stat(
     normalized: str,
     parent_descriptor: int | None,
@@ -1726,16 +1746,25 @@ def _capture_regular(
             f"finite file disappeared: {normalized}"
         ) from error
     observations = {
-        _state(lexical_before),
-        _state(opened),
-        _state(finished),
-        _state(lexical_after),
+        _comparable(_state(lexical_before)),
+        _comparable(_state(opened)),
+        _comparable(_state(finished)),
+        _comparable(_state(lexical_after)),
     }
-    if len(observations) != 1 or stat.S_ISLNK(lexical_after.st_mode):
+    # The two descriptor views bracket the read: exact, ctime included, so a
+    # same-size same-mtime rewrite inside the window is refused where the
+    # pathname compare is neutral (win32) rather than digested torn.
+    if (
+        len(observations) != 1
+        or _state(opened) != _state(finished)
+        or stat.S_ISLNK(lexical_after.st_mode)
+    ):
         raise FiniteArtifactIntegrityError(
             f"finite file changed during observation: {normalized}"
         )
-    return observations.pop(), None if digest is None else digest.hexdigest()
+    # The four views agree on identity; the descriptor's closing view is the
+    # recorded one (the same tuple wherever ctime is part of identity).
+    return _state(finished), None if digest is None else digest.hexdigest()
 
 
 def _snapshot_from_capture(
@@ -1789,6 +1818,16 @@ def _same_object(left: FiniteFileSnapshot, right: FiniteFileSnapshot) -> bool:
 
 
 def _snapshot_state(snapshot: FiniteFileSnapshot) -> tuple[int, int, int, int, int, int]:
+    """The exact recorded identity of *snapshot*: a descriptor view.
+
+    Snapshots record the descriptor's closing view (``_capture_regular``), so
+    they compare with ``_observe_regular*`` — another descriptor view — with
+    ctime intact on every platform: win32 fills fstat's st_ctime from NTFS
+    ChangeTime, which every write and every utime advance, so a same-size
+    same-mtime in-place rewrite still changes it and the stat-only fences
+    that carry ``snapshot.digest`` forward cannot pass it.  Only a compare
+    against a pathname view needs the seam (``_comparable``).
+    """
     return (
         snapshot.device,
         snapshot.inode,
@@ -1800,6 +1839,7 @@ def _snapshot_state(snapshot: FiniteFileSnapshot) -> tuple[int, int, int, int, i
 
 
 def _observe_regular(path: Path | str) -> tuple[int, int, int, int, int, int]:
+    """The descriptor's closing view of one stable regular file, exact."""
     state, _digest_value = _capture_regular(path, hash_content=False)
     return state
 
@@ -2592,11 +2632,16 @@ class FiniteArtifactPublisher:
             )
             opened_source = os.fstat(source_descriptor)
             opened_target = os.fstat(target_descriptor)
+            # A closed reservation's inode can be reused after substitution.
+            # Nothing has written this candidate yet, so its full reservation
+            # state must still match before truncation or cleanup is allowed.
+            if _state(opened_target) != _snapshot_state(reservation):
+                raise _FiniteCandidateOwnershipLost(
+                    "finite seed descriptor identity changed"
+                )
             if (
                 (int(opened_source.st_dev), int(opened_source.st_ino))
                 != (source.device, source.inode)
-                or (int(opened_target.st_dev), int(opened_target.st_ino))
-                != (reservation.device, reservation.inode)
             ):
                 raise FiniteArtifactIntegrityError(
                     "finite seed descriptor identity changed"
@@ -2719,7 +2764,14 @@ class FiniteArtifactPublisher:
                 before != after
                 or terminal.target != str(path)
                 or terminal.size != after[3]
-                or (terminal.device, terminal.inode, terminal.mtime_ns, terminal.ctime_ns)
+                # ``after`` is a descriptor view, the terminal a
+                # descriptor-recorded revision: exact on every platform.
+                or (
+                    terminal.device,
+                    terminal.inode,
+                    terminal.mtime_ns,
+                    terminal.ctime_ns,
+                )
                 != (after[0], after[1], after[4], after[5])
                 or expected is not None
                 and (
@@ -3182,6 +3234,7 @@ class FiniteArtifactPublisher:
                     candidate is not None
                     and reservation is not None
                     and not candidate_consumed
+                    and not isinstance(primary, _FiniteCandidateOwnershipLost)
                 ):
                     retry_hidden, cleanup_error = self._cleanup(
                         parent_descriptor,

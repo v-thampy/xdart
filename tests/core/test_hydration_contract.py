@@ -80,6 +80,7 @@ def test_contract_values_cannot_carry_arrays_handles_stores_or_callbacks(tmp_pat
             "artifact_identity",
             "frame_identity",
             "purpose",
+            "source_root",
         ),
         "HydrationToken": ("read_key", "presentation_generation"),
         "HydrationCompletion": ("token", "outcome", "diagnostic"),
@@ -95,6 +96,7 @@ def test_contract_values_cannot_carry_arrays_handles_stores_or_callbacks(tmp_pat
         "artifact_identity": "str",
         "frame_identity": "int | str",
         "purpose": "HydrationPurpose",
+        "source_root": "str | None",
     }
     assert api.HydrationToken.__annotations__ == {
         "read_key": "HydrationReadKey",

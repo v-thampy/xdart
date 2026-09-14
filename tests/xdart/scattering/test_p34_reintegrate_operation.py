@@ -2218,15 +2218,65 @@ def test_xye_loaded_browse_disables_and_refuses_reintegrate(
 def test_browse_snapshot_brackets_complete_load_and_refuses_drift(tmp_path, monkeypatch):
     from xdart.gui.tabs.scattering.adapters import browse_loader as module
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest, BrowseLoadStatus
-    from xrd_tools.io.output_transaction import capture_target_snapshot
-    target, _raw = _write_processed(tmp_path, labels=(2, 5, 9)); calls = []; real = capture_target_snapshot
-    monkeypatch.setattr(module, "capture_target_snapshot", lambda path: calls.append(threading.current_thread().name) or real(path), raising=False)
-    loader = module.BrowseLoader(); request = BrowseLoadRequest("snapshot", 1, str(target.resolve())); outcome = _wait(lambda: loader.poll(loader.begin(request)))
-    context = loader.consume(outcome); assert outcome.status is BrowseLoadStatus.READY and context.loaded_labels == (2, 5, 9) and len(calls) == 2 and calls == ["scattering-browse"] * 2
-    with pytest.raises(Exception): context.target_snapshot = None
+
+    target, _raw = _write_processed(tmp_path, labels=(2, 5, 9))
+    real_capture = module.capture_target_snapshot
+    real_revalidate = module.revalidate_target_snapshot
+    real_presentation = module.read_browse_presentation
+    calls = []
+    snapshots = []
+    mutate = False
+
+    def capture(path):
+        calls.append(("capture", threading.current_thread().name))
+        snapshot = real_capture(path)
+        snapshots.append(snapshot)
+        return snapshot
+
+    def presentation(path):
+        result = real_presentation(path)
+        calls.append(("complete-read", threading.current_thread().name))
+        if mutate:
+            # Change the real artifact after its catalog/presentation were read
+            # but before the final object-revision fence can publish a context.
+            with open(path, "ab") as handle:
+                handle.write(b"changed-during-browse")
+        return result
+
+    def revalidate(path, snapshot):
+        calls.append(("revalidate", threading.current_thread().name))
+        assert snapshot is snapshots[-1]
+        return real_revalidate(path, snapshot)
+
+    monkeypatch.setattr(module, "capture_target_snapshot", capture)
+    monkeypatch.setattr(module, "read_browse_presentation", presentation)
+    monkeypatch.setattr(module, "revalidate_target_snapshot", revalidate)
+    expected = [(stage, "scattering-browse") for stage in (
+        "capture", "complete-read", "revalidate",
+    )]
+    loader = module.BrowseLoader()
+    request = BrowseLoadRequest("snapshot", 1, str(target.resolve()))
+    loader.begin(request)
+    outcome = _wait(lambda: loader.poll(request))
+    context = loader.consume(outcome)
+    assert outcome.status is BrowseLoadStatus.READY
+    assert context.loaded_labels == (2, 5, 9)
+    assert context.target_snapshot is snapshots[-1]
+    assert calls == expected
+    with pytest.raises(Exception):
+        context.target_snapshot = None
     assert loader.release_context(context).cleanup_status.value == "cleaned"
-    snap = real(target); values = iter((snap, replace(snap, digest="0" * 64))); monkeypatch.setattr(module, "capture_target_snapshot", lambda _path: next(values))
-    bad = module.BrowseLoader(); bad_request = BrowseLoadRequest("drift", 1, str(target.resolve())); bad.begin(bad_request); refused = _wait(lambda: bad.poll(bad_request)); assert refused.status is BrowseLoadStatus.FAILED and bad.context_for_outcome(refused) is None
+
+    calls.clear()
+    mutate = True
+    bad = module.BrowseLoader()
+    bad_request = BrowseLoadRequest("drift", 1, str(target.resolve()))
+    bad.begin(bad_request)
+    refused = _wait(lambda: bad.poll(bad_request))
+    assert refused.status is BrowseLoadStatus.FAILED
+    assert "target changed since its content snapshot" in refused.detail
+    assert bad.context_for_outcome(refused) is None
+    assert calls == expected
 
 
 def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
@@ -2251,14 +2301,24 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
     seal = seeded.terminal.commit_identity
     real_capture = module.capture_target_snapshot
     real_revalidate = module.revalidate_stream_terminal
+    real_snapshot_revalidate = module.revalidate_target_snapshot
     real_sha = transaction._sha256_handle
     full_captures = []
+    captured_snapshots = []
+    snapshot_revalidations = []
     revalidations = []
     hashed_bytes = []
 
     def capture(path):
         full_captures.append(threading.current_thread().name)
-        return real_capture(path)
+        snapshot = real_capture(path)
+        captured_snapshots.append(snapshot)
+        return snapshot
+
+    def revalidate_snapshot(path, snapshot):
+        snapshot_revalidations.append(threading.current_thread().name)
+        assert snapshot is captured_snapshots[-1]
+        return real_snapshot_revalidate(path, snapshot)
 
     def revalidate(path, terminal):
         revalidations.append(threading.current_thread().name)
@@ -2270,6 +2330,7 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
 
     monkeypatch.setattr(module, "capture_target_snapshot", capture)
     monkeypatch.setattr(module, "revalidate_stream_terminal", revalidate)
+    monkeypatch.setattr(module, "revalidate_target_snapshot", revalidate_snapshot)
     monkeypatch.setattr(transaction, "_sha256_handle", sha256_handle)
     monkeypatch.setattr(
         finite_artifact,
@@ -2299,7 +2360,7 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
         terminal_context.prepared_reintegrate_offer.miss_code
         is PreparedCapsuleMissCode.CAPSULE_NOT_SUPPLIED
     )
-    assert full_captures == hashed_bytes == []
+    assert full_captures == hashed_bytes == snapshot_revalidations == []
     assert revalidations == ["scattering-browse"] * 2
     assert terminal_loader.release_context(
         terminal_context
@@ -2307,6 +2368,7 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
 
     legacy = type(seal)(seal.target, seal.size, seal.digest, seal.ordinal)
     full_captures.clear(); revalidations.clear(); hashed_bytes.clear()
+    captured_snapshots.clear(); snapshot_revalidations.clear()
     legacy_loader = module.BrowseLoader()
     legacy_request = BrowseLoadRequest(
         "legacy-two-fence", 1, str(target), legacy,
@@ -2315,14 +2377,15 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
     legacy_outcome = _wait(lambda: legacy_loader.poll(legacy_request))
     legacy_context = legacy_loader.consume(legacy_outcome)
     assert legacy_outcome.status is BrowseLoadStatus.READY
-    assert full_captures == ["scattering-browse"] * 2
+    assert full_captures == snapshot_revalidations == ["scattering-browse"]
     assert revalidations == []
-    assert hashed_bytes == [target.stat().st_size] * 2
+    assert hashed_bytes == [target.stat().st_size]
     assert legacy_loader.release_context(
         legacy_context
     ).cleanup_status.value == "cleaned"
 
     full_captures.clear(); revalidations.clear(); hashed_bytes.clear()
+    captured_snapshots.clear(); snapshot_revalidations.clear()
     generic_loader = module.BrowseLoader()
     generic_request = BrowseLoadRequest(
         "generic-two-fence", 1, str(target),
@@ -2331,9 +2394,9 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
     generic_outcome = _wait(lambda: generic_loader.poll(generic_request))
     generic_context = generic_loader.consume(generic_outcome)
     assert generic_outcome.status is BrowseLoadStatus.READY
-    assert full_captures == ["scattering-browse"] * 2
+    assert full_captures == snapshot_revalidations == ["scattering-browse"]
     assert revalidations == []
-    assert hashed_bytes == [target.stat().st_size] * 2
+    assert hashed_bytes == [target.stat().st_size]
     assert generic_loader.release_context(
         generic_context
     ).cleanup_status.value == "cleaned"
@@ -2344,6 +2407,7 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
     os.replace(replacement, target)
     assert target.stat().st_ino != original_inode
     full_captures.clear(); revalidations.clear(); hashed_bytes.clear()
+    captured_snapshots.clear(); snapshot_revalidations.clear()
     opened = []
 
     def forbidden_open(_path):
@@ -2360,7 +2424,7 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
     )
     assert replaced_outcome.status is BrowseLoadStatus.FAILED
     assert replaced_loader.context_for_outcome(replaced_outcome) is None
-    assert opened == full_captures == hashed_bytes == []
+    assert opened == full_captures == hashed_bytes == snapshot_revalidations == []
     assert revalidations == ["scattering-browse"]
 
 
@@ -2753,7 +2817,7 @@ def test_reintegrate_progress_and_cancel_touch_only_current_scalar_footer(
 def test_reintegrate_gui_owner_import_writer_and_snapshot_frequency_census():
     root=Path(__file__).resolve().parents[3]; names=("src/xrd_tools/reduction/reintegrate.py","src/xdart/modules/display_context.py","src/xdart/gui/tabs/scattering/adapters/browse_loader.py","src/xdart/gui/tabs/scattering/context_controller.py","src/xdart/gui/tabs/scattering/adapters/external_operation.py","src/xdart/gui/tabs/scattering/page.py","src/xdart/gui/tabs/scattering/controls_projection.py","src/xdart/gui/tabs/scattering/workspace_operations.py")
     sources={name:(root/name).read_text() for name in names}; gui_text="\n".join(sources[name] for name in names[1:]); external_source=sources[names[4]]; page_source=sources[names[5]]
-    assert len(sources)==8 and sources[names[2]].count("capture_target_snapshot(")==2 and gui_text.count("Thread(")==2 and gui_text.count("OperationSlot()")==2
+    assert len(sources)==8 and sources[names[2]].count("capture_target_snapshot(")==1 and sources[names[2]].count("revalidate_target_snapshot(")==1 and sources[names[2]].count("revalidate_stream_terminal(")==2 and gui_text.count("Thread(")==2 and gui_text.count("OperationSlot()")==2
     assert not any(value in gui_text for value in ("h5py","NexusSink","NexusRecordWriter","_core_plan","_integration_1d_args","_integration_2d_args","resolve_session_policy","ReintegrateReloadDirective","reload_reintegrate_browse"))
     assert "ReintegrateRunner" not in external_source and "ReintegratePlan.from_artifact(" not in external_source and "run_reintegrate(" not in external_source
     assert external_source.count("ReintegrateSuccessorPlan.from_prepared_or_artifact(")==1 and external_source.count("run_reintegrate_successor(")==1 and page_source.count("jsonable_run_value(")==1
@@ -2783,7 +2847,7 @@ def test_gui_persisted_science_disclosure_and_no_shared_control_override(tmp_pat
     page,store,seeded,_context=_loaded_page(tmp_path,monkeypatch,qapp); plain=page._reintegrate_preparation(store.snapshot().thaw(),"1d"); assert plain["selected_plan"]["bai_args"]=={}; candidate=store.snapshot().thaw(); candidate.bai_1d_args={"numpoints":10,"radial_range":(.1,1.)}; candidate.max_cores=2; store.commit(candidate,expected_revision=store.revision); captured={}
     monkeypatch.setattr(_reintegrate_slot(page),"begin_reintegrate_successor",lambda **kw: captured.update(kw) or OperationIdentity(91)); page._reintegrate_action("1d")
     prep=captured["preparation_values"]; assert prep["requested_shared_science"]=={"version":1,"kind":"persisted_target"} and prep["selected_plan"]["bai_args"]=={"numpoints":10,"radial_range":[.1,1.]} and prep["selected_plan"]["gi_mode"]==candidate.gi.mode_1d and prep["resource_policy"]["requests"]=={"workers":2}
-    shown=json.dumps(prep); assert seeded.preparation["requested_shared_science"]["accepted_scientific_assets"]["poni_sha256"] not in shown and "new immutable version" in page._notice_text and captured["dimension"]=="1d"; page._workspace_operations._reintegrate=None; page.close_workspace()
+    shown=json.dumps(prep); assert seeded.preparation["requested_shared_science"]["accepted_scientific_assets"]["poni_sha256"] not in shown and page._notice_text=="Reintegrating 1-D into a replacement candidate…" and captured["dimension"]=="1d"; page._workspace_operations._reintegrate=None; page.close_workspace()
 
 def test_parent_red_stable_loaded_browse_enables_reintegrate_2d_start(tmp_path, monkeypatch, qapp):
     from xrd_tools.session.readiness import ControlAction, SectionId; page,store,_seed,_context=_loaded_page(tmp_path,monkeypatch,qapp); action={a.action:a for a in page._project_controls(store.snapshot()).actions_for(SectionId.PROCESSING)}[ControlAction.REINTEGRATE_2D]; assert action.enabled and action.label=="Reintegrate 2-D"; page.close_workspace()
@@ -2848,12 +2912,21 @@ def test_active_reintegrate_stop_preserves_readable_predecessor(
     def painted():
         page._drain_executor()
         projection = page._last_scientific_projection
-        return projection if projection is not None and view.trace_history_keys else None
+        # Baseline only once the heavy has hydrated: the stop must preserve
+        # the predecessor's painted frame, so a baseline taken while the
+        # heavy is still pending (slow host) would compare None against it.
+        return (
+            projection
+            if projection is not None
+            and view.trace_history_keys
+            and projection.heavy is not None
+            else None
+        )
 
     before = _wait(painted)
     before_keys = view.trace_history_keys
     before_trace_frames = tuple(trace.frame for trace in before.traces)
-    before_heavy_frame = None if before.heavy is None else before.heavy.frame
+    before_heavy_frame = before.heavy.frame
 
     def cancelled(_offer, _target, **kwargs):
         token = kwargs["cancel_token"]

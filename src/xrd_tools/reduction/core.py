@@ -1775,6 +1775,15 @@ class NexusSink:
     def writer_batch_size(self) -> int:
         return self._writer_batch_size
 
+    @property
+    def finalization_started(self) -> bool:
+        """Whether the current epoch has entered its writer finish steps."""
+        return (
+            self._pending_append_decision is None
+            and self._writer is not None
+            and self._writer.finalization_started
+        )
+
     def _configure_writer_batch_size(self, value: int) -> None:
         if type(value) is not int or not 1 <= value <= 16:
             raise TypeError("Nexus writer batch size must be an exact int in [1, 16]")

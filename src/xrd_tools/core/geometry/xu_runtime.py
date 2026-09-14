@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import importlib.metadata
 import platform
-import sys
 import threading
 
 
@@ -28,9 +27,8 @@ class XuRuntimeRequirements:
     config_epsilon: float = 1e-8
     config_digits: int = 8
     python_implementation: str = "CPython"
-    python_version: str = "3.13.14"
-    platform_system: str = "Darwin"
-    platform_machine: str = "arm64"
+    python_min_version: tuple[int, int] = (3, 13)
+    platform_systems: tuple[str, ...] = ("Darwin", "Linux", "Windows")
 
     def __post_init__(self) -> None:
         strings = (
@@ -38,9 +36,6 @@ class XuRuntimeRequirements:
             self.module_version,
             self.numpy_version,
             self.python_implementation,
-            self.python_version,
-            self.platform_system,
-            self.platform_machine,
         )
         if (
             any(type(value) is not str for value in strings)
@@ -52,9 +47,11 @@ class XuRuntimeRequirements:
             or type(self.config_digits) is not int
             or self.config_digits != 8
             or self.python_implementation != "CPython"
-            or self.python_version != "3.13.14"
-            or self.platform_system != "Darwin"
-            or self.platform_machine != "arm64"
+            or type(self.python_min_version) is not tuple
+            or self.python_min_version != (3, 13)
+            or any(type(value) is not int for value in self.python_min_version)
+            or type(self.platform_systems) is not tuple
+            or self.platform_systems != ("Darwin", "Linux", "Windows")
         ):
             raise TypeError("XU runtime requirements are invalid")
 
@@ -87,6 +84,12 @@ class XuRuntimeExecutionRecord:
     nthreads_effective: int
     nthreads_restored: int
     restore_passed: bool
+    # Absent only when reading the original attestation shape. New execution
+    # captures these observed facts; they are not calibration validation pins.
+    python_implementation: str | None = None
+    python_version: str | None = None
+    platform_system: str | None = None
+    platform_machine: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -107,9 +110,20 @@ class XuRuntimeExecutionRecord:
             or self.restore_passed is not True
         ):
             raise TypeError("XU runtime execution record is invalid")
+        environment = (
+            self.python_implementation,
+            self.python_version,
+            self.platform_system,
+            self.platform_machine,
+        )
+        if any(value is not None for value in environment) and (
+            any(type(value) is not str or not value for value in environment)
+            or not _supported_platform(*environment[:3])
+        ):
+            raise TypeError("XU runtime execution environment is invalid")
 
     def to_attestation(self) -> dict[str, object]:
-        return {
+        value = {
             "lock_policy": self.lock_policy,
             "xrayutilities_distribution_version": (
                 self.xrayutilities_distribution_version
@@ -123,6 +137,27 @@ class XuRuntimeExecutionRecord:
             "nthreads_restored": self.nthreads_restored,
             "restore_passed": self.restore_passed,
         }
+        if self.python_implementation is not None:
+            value.update(
+                python_implementation=self.python_implementation,
+                python_version=self.python_version,
+                platform_system=self.platform_system,
+                platform_machine=self.platform_machine,
+            )
+        return value
+
+
+def _supported_platform(implementation: str, version: str, system: str) -> bool:
+    """Portable interpreter policy, independent of numerical kernel admission."""
+
+    parts = version.split(".")
+    return (
+        implementation == "CPython"
+        and len(parts) == 3
+        and all(part.isascii() and part.isdecimal() for part in parts)
+        and tuple(map(int, parts)) >= (3, 13, 0)
+        and system in ("Darwin", "Linux", "Windows")
+    )
 
 
 def xu_runtime_availability(
@@ -135,19 +170,12 @@ def xu_runtime_availability(
         platform.python_implementation(),
         platform.python_version(),
         platform.system(),
-        platform.machine(),
     )
-    required_platform = (
-        selected.python_implementation,
-        selected.python_version,
-        selected.platform_system,
-        selected.platform_machine,
-    )
-    if observed_platform != required_platform:
+    if not _supported_platform(*observed_platform):
         return XuRuntimeAvailability(
             False,
             "XU_PLATFORM_UNVALIDATED",
-            "xu_hist requires CPython 3.13.14 on Darwin arm64",
+            "XU requires CPython >=3.13 on macOS, Linux, or Windows",
         )
     try:
         distribution = importlib.metadata.version("xrayutilities")
@@ -188,6 +216,8 @@ class XuRuntimeSession:
         self._mutation_detected = False
         self._entered = False
         self._owner_thread_id: int | None = None
+        self._observed_runtime: tuple[str, str, str] | None = None
+        self._observed_environment: tuple[str, str, str, str] | None = None
 
     def __copy__(self):
         raise TypeError("XU runtime session is not copyable")
@@ -302,8 +332,13 @@ class XuRuntimeSession:
             import xrayutilities as xu
             from xrayutilities import config
 
+            distribution = importlib.metadata.version("xrayutilities")
+            numpy_distribution = importlib.metadata.version("numpy")
+
             if (
-                xu.__version__ != self.requirements.module_version
+                distribution != self.requirements.distribution_version
+                or numpy_distribution != self.requirements.numpy_version
+                or xu.__version__ != self.requirements.module_version
                 or np.__version__ != self.requirements.numpy_version
                 or type(config.EPSILON) is not float
                 or config.EPSILON != self.requirements.config_epsilon
@@ -332,6 +367,13 @@ class XuRuntimeSession:
                 )
             self.xu = xu
             self.numpy = np
+            self._observed_runtime = (distribution, xu.__version__, np.__version__)
+            self._observed_environment = (
+                platform.python_implementation(),
+                platform.python_version(),
+                platform.system(),
+                platform.machine(),
+            )
             return self
         except BaseException as primary:
             restore_error = None
@@ -378,17 +420,18 @@ class XuRuntimeSession:
             else:
                 assert self._before is not None
                 if mutation_error is None:
+                    assert self._observed_runtime is not None
+                    assert self._observed_environment is not None
                     self.execution_record = XuRuntimeExecutionRecord(
                         XU_RUNTIME_LOCK_POLICY,
-                        self.requirements.distribution_version,
-                        self.requirements.module_version,
-                        self.requirements.numpy_version,
+                        *self._observed_runtime,
                         self.requirements.config_epsilon,
                         self.requirements.config_digits,
                         self._before,
                         XU_RUNTIME_EFFECTIVE_NTHREADS,
                         restored,
                         True,
+                        *self._observed_environment,
                     )
         finally:
             self.xu = None
@@ -425,9 +468,8 @@ def xu_runtime_requirements_projection(
         requirements.config_epsilon,
         requirements.config_digits,
         requirements.python_implementation,
-        requirements.python_version,
-        requirements.platform_system,
-        requirements.platform_machine,
+        *requirements.python_min_version,
+        *requirements.platform_systems,
         XU_RUNTIME_LOCK_POLICY,
         XU_RUNTIME_EFFECTIVE_NTHREADS,
     )

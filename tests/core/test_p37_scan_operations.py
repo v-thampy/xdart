@@ -13,6 +13,7 @@ import importlib
 import inspect
 import os
 import struct
+import subprocess
 import sys
 import threading
 from collections.abc import Mapping
@@ -2031,8 +2032,23 @@ def test_p37_has_zero_writer_h23_mutation_or_persistence_reachability(
     result, source = _run_table(monkeypatch, tmp_path, {1: {"Photod": 1.0}})
     _assert_terminal(result, "COMPLETED", "OK")
     assert source.load_calls == []
-    assert not any(
-        name.startswith("xrd_tools.io.record_writer")
-        or name.startswith("xrd_tools.io.output_transaction")
-        for name in sys.modules
+    # Other tests legitimately import writers. Prove this read-only operation
+    # remains writer-free in a fresh interpreter, through a real TIFF source.
+    probe = '''
+import sys
+from pathlib import Path
+import numpy as np
+import tifffile
+from xrd_tools.analysis import MetadataTablePlan, run_metadata_table
+source = Path(sys.argv[1]) / "metadata_0001.tif"
+tifffile.imwrite(source, np.ones((2, 2), dtype=np.uint16))
+result = run_metadata_table(MetadataTablePlan(source=source, selection="image_series"))
+assert result.disposition.value == "completed", result
+assert not any(name.startswith(("xrd_tools.io.record_writer", "xrd_tools.io.output_transaction"))
+               for name in sys.modules)
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", probe, str(tmp_path)],
+        capture_output=True, text=True, timeout=60,
     )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

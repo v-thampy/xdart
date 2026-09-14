@@ -51,12 +51,26 @@ def _assert_selection_palette(editor):
 def _assert_selection_painted(editor):
     # Verify pixels, not just a palette role the widget never consumes.
     image = editor.grab().toImage()
-    colors = {
-        image.pixelColor(x, y).name()
+    highlight = QtGui.QColor("#8f98b8")
+    painted = [
+        (x, y)
         for y in range(image.height()) for x in range(image.width())
-    }
-    assert "#8f98b8" in colors
-    assert "#1a1a1a" in colors
+        if image.pixelColor(x, y).name() == highlight.name()
+    ]
+    assert painted
+    # Inside the highlighted band only glyphs are dark.  Glyph edges are
+    # anti-aliased against the highlight and the exact #1a1a1a core is a
+    # font-rasterizer accident (Linux hinting never reaches it), so pin
+    # what the user sees: selected-text pixels at WCAG AA contrast, more
+    # of them than a caret column could supply (macOS offscreen: 280).
+    left, right = min(x for x, _ in painted), max(x for x, _ in painted)
+    top, bottom = min(y for _, y in painted), max(y for _, y in painted)
+    legible = sum(
+        1
+        for y in range(top, bottom + 1) for x in range(left, right + 1)
+        if _contrast(image.pixelColor(x, y), highlight) >= 4.5
+    )
+    assert legible >= 25
 
 
 @pytest.mark.parametrize("theme_name", ["dark", "light"])

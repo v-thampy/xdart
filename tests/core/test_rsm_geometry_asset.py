@@ -33,6 +33,7 @@ from xrd_tools.analysis.rsm_geometry_asset import (
     rsm_effective_pixel_q_map,
     rsm_geometry_asset_input,
 )
+from xrd_tools.io import descriptor_path
 
 
 EXPECTED_SIZE = 745
@@ -44,6 +45,21 @@ EXPECTED_SEMANTIC = (
 )
 FROZEN_VIEW_DIAGNOSTIC = (
     "036cff52be68a8c4aa3eb6e96be4b02d56e6f230a9e076353fabe96011927b5c"
+)
+
+
+def _symlink(link: Path, target: Path, *, directory: bool = False) -> None:
+    """Create *link* -> *target*; skip where the host refuses symbolic links."""
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"symbolic links unavailable here: {error}")
+
+
+# Replacing an open file by name is POSIX inode semantics; Windows refuses
+# the unlink while a handle is held, so those races cannot be staged there.
+_open_file_replacement = pytest.mark.skipif(
+    sys.platform == "win32", reason="an open file cannot be unlinked on Windows"
 )
 
 
@@ -323,7 +339,7 @@ def test_rsm_capture_refuses_project_and_asset_symlink_ancestry(tmp_path):
     real_project.mkdir(parents=True)
     (real_project / "geometry.json").write_bytes(raw)
     alias = tmp_path / "alias"
-    alias.symlink_to(real_parent, target_is_directory=True)
+    _symlink(alias, real_parent, directory=True)
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         capture_rsm_geometry_asset(
             rsm_geometry_asset_input("geometry.json"),
@@ -336,14 +352,14 @@ def test_rsm_capture_refuses_project_and_asset_symlink_ancestry(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "geometry.json").write_bytes(raw)
-    (project / "linked").symlink_to(outside, target_is_directory=True)
+    _symlink(project / "linked", outside, directory=True)
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         capture_rsm_geometry_asset(
             rsm_geometry_asset_input("linked/geometry.json"), project_root=project
         )
     assert raised.value.code == "RSM_GEOMETRY_SYMLINK_REFUSED"
 
-    (project / "final.json").symlink_to(outside / "geometry.json")
+    _symlink(project / "final.json", outside / "geometry.json")
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         capture_rsm_geometry_asset(
             rsm_geometry_asset_input("final.json"), project_root=project
@@ -351,7 +367,18 @@ def test_rsm_capture_refuses_project_and_asset_symlink_ancestry(tmp_path):
     assert raised.value.code == "RSM_GEOMETRY_SYMLINK_REFUSED"
 
 
-@pytest.mark.parametrize("kind", ["directory", "fifo"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "directory",
+        pytest.param(
+            "fifo",
+            marks=pytest.mark.skipif(
+                not hasattr(os, "mkfifo"), reason="no named pipes here"
+            ),
+        ),
+    ],
+)
 def test_rsm_capture_refuses_nonregular_final_node(tmp_path, kind):
     project = tmp_path / "project"
     project.mkdir()
@@ -406,10 +433,21 @@ def test_rsm_capture_refuses_before_after_mutation(tmp_path, monkeypatch):
     real_states = __import__(
         "xrd_tools.analysis.rsm_geometry_asset", fromlist=["_lexical_chain_states"]
     )._lexical_chain_states
+    base = target.stat()
+    mutations = 0
 
     def mutate_then_states(project_path, relative):
+        # Each rewrite moves the mtime slot by whole seconds from a fixed
+        # base: on Windows the ctime slot is neutral and LastWriteTime rides
+        # the system tick (100 ns units, ~1-16 ms clock), so a +1 ns bump
+        # rounds away and two writes inside one tick share a stamp.
+        nonlocal mutations
+        mutations += 1
         target.write_bytes(raw)
-        os.utime(target, ns=(target.stat().st_atime_ns, target.stat().st_mtime_ns + 1))
+        os.utime(
+            target,
+            ns=(base.st_atime_ns, base.st_mtime_ns + mutations * 2_000_000_000),
+        )
         return real_states(project_path, relative)
 
     monkeypatch.setattr(
@@ -423,6 +461,122 @@ def test_rsm_capture_refuses_before_after_mutation(tmp_path, monkeypatch):
     assert raised.value.code == "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH"
 
 
+def _between_open_and_inspection(monkeypatch, act):
+    """Run *act* before the post-read chain walk (a capture's second walk;
+    its first precedes the open): the concurrent change lands between the
+    open and the inspection."""
+    real = rsm_asset_module._lexical_chain_states
+    walks = []
+    observed = []
+
+    def act_then_walk(project, relative):
+        walks.append(relative)
+        if len(walks) % 2 == 0:
+            observed.append(act(len(observed)))
+        return real(project, relative)
+
+    monkeypatch.setattr(rsm_asset_module, "_lexical_chain_states", act_then_walk)
+    return observed
+
+
+@pytest.mark.parametrize(
+    "descriptor_walk",
+    [pytest.param(True, id="descriptor"), pytest.param(False, id="by_name")]
+    if rsm_asset_module._DESCRIPTOR_WALK
+    else [pytest.param(False, id="by_name")],
+)
+@pytest.mark.parametrize("ancestor", ["above-project", "project-root"])
+def test_rsm_capture_survives_a_concurrent_write_beside_its_chain(
+    tmp_path, monkeypatch, ancestor, descriptor_walk
+):
+    # The twin of the XU round-12 refusal: every ancestor directory was held
+    # to its full state, so an entry created beside the chain refused the
+    # capture and named nothing.
+    monkeypatch.setattr(rsm_asset_module, "_DESCRIPTOR_WALK", descriptor_walk)
+    project = tmp_path / "project"
+    target = project / "calibration" / "rsm" / "geometry.json"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(canonical_rsm_geometry_resource_bytes())
+    directory = tmp_path if ancestor == "above-project" else project
+    base = os.lstat(directory)
+
+    def write_beside(count):
+        (directory / f"beside-{count}.tmp").write_bytes(b"")
+        os.utime(
+            directory,
+            ns=(base.st_atime_ns, base.st_mtime_ns + (count + 1) * 2_000_000_000),
+        )
+        return rsm_asset_module._state(os.lstat(directory))
+
+    observed = _between_open_and_inspection(monkeypatch, write_beside)
+    receipt = capture_rsm_geometry_asset(
+        rsm_geometry_asset_input("calibration/rsm/geometry.json"),
+        project_root=project,
+    )
+    assert receipt.raw_sha256 == EXPECTED_SHA256
+    # Revalidation is a re-capture: a second write lands beside that one.
+    assert revalidate_rsm_geometry_asset(receipt) == receipt.content
+    assert len(observed) == 2
+    for state in observed:
+        assert state[:3] == rsm_asset_module._state(base)[:3]
+        assert state[4] != base.st_mtime_ns
+    assert observed[0][4] != observed[1][4]
+
+
+def test_rsm_capture_names_the_ancestor_whose_identity_moved(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    calibration = project / "calibration"
+    target = calibration / "rsm" / "geometry.json"
+    target.parent.mkdir(parents=True)
+    raw = canonical_rsm_geometry_resource_bytes()
+    target.write_bytes(raw)
+    opened_ino = os.lstat(calibration).st_ino
+
+    def exchange(_count):
+        calibration.rename(project / "calibration.stale")
+        target.parent.mkdir(parents=True)
+        target.write_bytes(raw)
+        return os.lstat(calibration).st_ino
+
+    observed = _between_open_and_inspection(monkeypatch, exchange)
+    with pytest.raises(RSMGeometryAssetRefused) as raised:
+        capture_rsm_geometry_asset(
+            rsm_geometry_asset_input("calibration/rsm/geometry.json"),
+            project_root=project,
+        )
+    assert raised.value.code == "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH"
+    assert observed[0] != opened_ino
+    assert str(raised.value) == (
+        "geometry changed during capture: "
+        f"ancestor {calibration}: ino {opened_ino} -> {observed[0]}"
+    )
+
+
+def test_rsm_capture_names_the_leaf_that_changed_after_the_read(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "geometry.json"
+    target.write_bytes(canonical_rsm_geometry_resource_bytes())
+
+    def grow(_count):
+        with target.open("ab") as stream:
+            stream.write(b"\n")
+
+    _between_open_and_inspection(monkeypatch, grow)
+    with pytest.raises(RSMGeometryAssetRefused) as raised:
+        capture_rsm_geometry_asset(
+            rsm_geometry_asset_input("geometry.json"), project_root=project
+        )
+    assert raised.value.code == "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH"
+    assert str(raised.value) == (
+        "geometry changed during capture: "
+        f"leaf {target}: size {EXPECTED_SIZE} -> {EXPECTED_SIZE + 1}"
+    )
+
+
+@_open_file_replacement
 def test_rsm_capture_refuses_exact_byte_inode_swap_before_open(
     tmp_path, monkeypatch
 ):
@@ -477,13 +631,257 @@ def test_rsm_installer_refuses_symlink_parent_without_outside_write(tmp_path):
     project.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
-    (project / "calibration").symlink_to(outside, target_is_directory=True)
+    _symlink(project / "calibration", outside, directory=True)
     with pytest.raises(RSMGeometryAssetRefused) as raised:
         install_canonical_rsm_geometry_asset(project_root=project)
     assert raised.value.code == "RSM_GEOMETRY_INSTALL_FAILED"
     assert list(outside.iterdir()) == []
 
 
+def test_rsm_by_name_installer_installs_and_readmits_like_the_descriptor_walk(
+    tmp_path, monkeypatch,
+):
+    """The no-dir_fd installer (Windows' only one) on any host."""
+    monkeypatch.setattr(rsm_asset_module, "_DESCRIPTOR_WALK", False)
+    project = tmp_path / "project"
+    project.mkdir()
+    first = install_canonical_rsm_geometry_asset(project_root=project)
+    target = project / CANONICAL_RSM_GEOMETRY_LOCATOR
+    assert target.read_bytes() == canonical_rsm_geometry_resource_bytes()
+    second = install_canonical_rsm_geometry_asset(project_root=project)
+    assert second.receipt_fingerprint == first.receipt_fingerprint
+    assert second.file_revision == first.file_revision
+
+
+def _descriptor_walk_modes(module):
+    modes = [pytest.param(False, id="by_name")]
+    if module._DESCRIPTOR_WALK:
+        modes.insert(0, pytest.param(True, id="descriptor"))
+    return modes
+
+
+# Only Windows can delete a file through the handle that created it; every
+# POSIX host leaves the misplaced (empty) leaf and names it in the refusal.
+_DISPOSES_BY_HANDLE = sys.platform == "win32"
+
+
+def _stage_parent_exchange(monkeypatch, target, outside, *, restore=False):
+    """Exchange *target*'s parent for a link to *outside* inside the leaf
+    create -- once, whichever installer creates it -- and with *restore*
+    put the real parent back before the create returns, so the misplaced
+    leaf is reachable only by its final path.  Returns the parked real
+    parent and a flag record."""
+    parked = target.parent.with_name(target.parent.name + "-parked")
+    real_open = os.open
+    real_create = descriptor_path.create_exclusive_leaf
+    state = {"exchanged": False}
+
+    def exchange():
+        state["exchanged"] = True
+        target.parent.rename(parked)
+        _symlink(target.parent, outside, directory=True)
+
+    def restore_parent():
+        os.unlink(target.parent)
+        parked.rename(target.parent)
+
+    def exchange_then_open(path, flags, *args, **kwargs):
+        if state["exchanged"] or not flags & os.O_CREAT or Path(path).name != target.name:
+            return real_open(path, flags, *args, **kwargs)
+        exchange()
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if restore:
+            restore_parent()
+        return descriptor
+
+    def exchange_then_create(path):
+        if state["exchanged"] or Path(path).name != target.name:
+            return real_create(path)
+        exchange()
+        descriptor = real_create(path)
+        if restore:
+            restore_parent()
+        return descriptor
+
+    monkeypatch.setattr(os, "open", exchange_then_open)
+    monkeypatch.setattr(descriptor_path, "create_exclusive_leaf", exchange_then_create)
+    return parked, state
+
+
+def _assert_misplaced_leaf_disposition(raised, outside, name):
+    """After a by-name refusal: nothing outside where the handle could
+    delete the leaf, otherwise exactly the empty leaf, named in the cause."""
+    if _DISPOSES_BY_HANDLE:
+        assert list(outside.iterdir()) == []
+        return
+    assert [(entry.name, entry.stat().st_size) for entry in outside.iterdir()] == [
+        (name, 0)
+    ]
+    cause = str(raised.value.__cause__)
+    assert os.path.realpath(outside / name) in cause
+    assert "empty leaf left there" in cause
+
+
+@pytest.mark.parametrize(
+    "descriptor_walk", _descriptor_walk_modes(rsm_asset_module),
+)
+def test_rsm_installer_never_writes_outside_after_a_parent_exchange(
+    tmp_path, monkeypatch, descriptor_walk,
+):
+    """Codex PR #1 review, F2: a parent directory exchanged for a symbolic
+    link between the ancestry inspection and the leaf open must not land
+    the asset inside the link's target.  The descriptor walk cannot follow
+    it; the by-name walk reads the created leaf's final path and refuses,
+    disposing of the misplaced empty leaf through its own handle where
+    the platform can, and naming it where it cannot."""
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    target = project / CANONICAL_RSM_GEOMETRY_LOCATOR
+    target.parent.mkdir(parents=True)
+    parked, state = _stage_parent_exchange(monkeypatch, target, outside)
+
+    monkeypatch.setattr(rsm_asset_module, "_DESCRIPTOR_WALK", descriptor_walk)
+    with pytest.raises(RSMGeometryAssetRefused) as raised:
+        install_canonical_rsm_geometry_asset(project_root=project)
+    assert state["exchanged"]
+    assert raised.value.code == "RSM_GEOMETRY_INSTALL_FAILED"
+    if descriptor_walk:
+        # The held directory descriptor still names the inspected (now
+        # parked) directory: the asset lands there, and only the lexical
+        # re-admission through the exchanged parent refuses.
+        assert list(outside.iterdir()) == []
+        assert [entry.name for entry in parked.iterdir()] == [target.name]
+        assert (parked / target.name).read_bytes() == canonical_rsm_geometry_resource_bytes()
+    else:
+        assert list(parked.iterdir()) == []
+        _assert_misplaced_leaf_disposition(raised, outside, target.name)
+
+
+def test_rsm_by_name_installer_disposes_of_a_leaf_the_name_no_longer_reaches(
+    tmp_path, monkeypatch,
+):
+    """Codex review of 0ed7a46c, F2: the parent is exchanged for the
+    create and put back before the placement check, so the misplaced leaf
+    is no longer what the target name resolves to.  A by-name cleanup
+    would miss it (or hit whatever now sits at the name); disposal goes
+    through the handle, and the project itself is untouched."""
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    target = project / CANONICAL_RSM_GEOMETRY_LOCATOR
+    target.parent.mkdir(parents=True)
+    _, state = _stage_parent_exchange(monkeypatch, target, outside, restore=True)
+
+    monkeypatch.setattr(rsm_asset_module, "_DESCRIPTOR_WALK", False)
+    with pytest.raises(RSMGeometryAssetRefused) as raised:
+        install_canonical_rsm_geometry_asset(project_root=project)
+    assert state["exchanged"]
+    assert raised.value.code == "RSM_GEOMETRY_INSTALL_FAILED"
+    assert not target.parent.is_symlink()
+    assert list(target.parent.iterdir()) == []
+    _assert_misplaced_leaf_disposition(raised, outside, target.name)
+    # The restored project installs normally afterwards.
+    receipt = install_canonical_rsm_geometry_asset(project_root=project)
+    assert receipt.content == canonical_rsm_geometry_resource_bytes()
+    assert target.read_bytes() == canonical_rsm_geometry_resource_bytes()
+
+
+def test_rsm_by_name_installer_never_deletes_a_foreign_file_at_the_misplaced_name(
+    tmp_path, monkeypatch,
+):
+    """Codex review of 0ed7a46c, F2: a foreign file moved over the
+    misplaced leaf's name between the placement check and the cleanup
+    must survive.  The cleanup holds the leaf's own handle and never
+    unlinks a name; where the handle blocks the move (Windows) the foreign
+    file simply stays where it was."""
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    target = project / CANONICAL_RSM_GEOMETRY_LOCATOR
+    target.parent.mkdir(parents=True)
+    _stage_parent_exchange(monkeypatch, target, outside)
+    payload = b"foreign payload must survive"
+    foreign = outside / "foreign.tmp"
+    outsider = outside / target.name
+    foreign.write_bytes(payload)
+    real_dispose = descriptor_path.dispose_created_leaf
+    moved = {"replaced": None}
+
+    def replace_then_dispose(descriptor):
+        assert moved["replaced"] is None
+        try:
+            os.replace(foreign, outsider)
+        except OSError:
+            moved["replaced"] = False
+        else:
+            moved["replaced"] = True
+        return real_dispose(descriptor)
+
+    monkeypatch.setattr(descriptor_path, "dispose_created_leaf", replace_then_dispose)
+    monkeypatch.setattr(rsm_asset_module, "_DESCRIPTOR_WALK", False)
+    with pytest.raises(RSMGeometryAssetRefused) as raised:
+        install_canonical_rsm_geometry_asset(project_root=project)
+    assert raised.value.code == "RSM_GEOMETRY_INSTALL_FAILED"
+    assert moved["replaced"] is not None
+    survivor = outsider if moved["replaced"] else foreign
+    assert survivor.read_bytes() == payload
+    if _DISPOSES_BY_HANDLE:
+        assert [entry.name for entry in outside.iterdir()] == [survivor.name]
+    else:
+        # POSIX replaces the open leaf by name; the foreign file now holds it.
+        assert moved["replaced"]
+        assert [entry.name for entry in outside.iterdir()] == [outsider.name]
+
+
+@pytest.mark.parametrize(
+    "descriptor_walk", _descriptor_walk_modes(rsm_asset_module),
+)
+def test_rsm_installer_refuses_a_link_planted_at_the_leaf_name(
+    tmp_path, monkeypatch, descriptor_walk,
+):
+    """A symbolic link planted at the leaf name between the existence
+    check and the create is an existing entry, never a path to create
+    through: the exclusive create conflicts and the link's target is not
+    made.  (POSIX O_EXCL; on Windows CREATE_NEW opens the reparse point.)"""
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / CANONICAL_RSM_GEOMETRY_LOCATOR
+    target.parent.mkdir(parents=True)
+    sibling = target.parent / "sibling.json"
+    real_open = os.open
+    real_create = descriptor_path.create_exclusive_leaf
+    planted = {"done": False}
+
+    def plant():
+        if not planted["done"]:
+            planted["done"] = True
+            _symlink(target, sibling)
+
+    def plant_then_open(path, flags, *args, **kwargs):
+        if flags & os.O_CREAT and Path(path).name == target.name:
+            plant()
+        return real_open(path, flags, *args, **kwargs)
+
+    def plant_then_create(path):
+        plant()
+        return real_create(path)
+
+    monkeypatch.setattr(os, "open", plant_then_open)
+    monkeypatch.setattr(descriptor_path, "create_exclusive_leaf", plant_then_create)
+    monkeypatch.setattr(rsm_asset_module, "_DESCRIPTOR_WALK", descriptor_walk)
+    with pytest.raises(RSMGeometryAssetRefused) as raised:
+        install_canonical_rsm_geometry_asset(project_root=project)
+    assert planted["done"]
+    assert not sibling.exists()
+    assert target.is_symlink()
+    assert raised.value.code == "RSM_GEOMETRY_INSTALL_CONFLICT"
+
+
+@_open_file_replacement
 def test_rsm_installer_never_unlinks_foreign_name_race_replacement(
     tmp_path, monkeypatch
 ):
@@ -520,22 +918,22 @@ def test_canonical_rsm_resource_refuses_symlink_ancestry(
     resource.write_bytes(raw)
     package = tmp_path / "package"
     if linked_component == "package":
-        package.symlink_to(real_package, target_is_directory=True)
+        _symlink(package, real_package, directory=True)
     else:
         package.mkdir()
         if linked_component == "assets":
-            (package / "assets").symlink_to(
-                real_package / "assets", target_is_directory=True
-            )
+            _symlink(package / "assets", real_package / "assets", directory=True)
         elif linked_component == "rsm":
             (package / "assets").mkdir()
-            (package / "assets" / "rsm").symlink_to(
-                real_package / "assets" / "rsm", target_is_directory=True
+            _symlink(
+                package / "assets" / "rsm",
+                real_package / "assets" / "rsm",
+                directory=True,
             )
         else:
             target = package.joinpath("assets", "rsm", _RESOURCE_NAME)
             target.parent.mkdir(parents=True)
-            target.symlink_to(resource)
+            _symlink(target, resource)
     monkeypatch.setattr(
         "xrd_tools.analysis.rsm_geometry_asset.resources.files",
         lambda _package: package,
@@ -572,6 +970,7 @@ def test_canonical_rsm_resource_refuses_dotdot_package_spelling(tmp_path, monkey
     assert raised.value.code == "RSM_CANONICAL_ASSET_UNAVAILABLE"
 
 
+@_open_file_replacement
 def test_canonical_rsm_resource_refuses_exact_byte_inode_swap_before_open(
     tmp_path, monkeypatch
 ):
@@ -724,9 +1123,8 @@ def test_rsm_effective_geometry_lowers_every_exact_psic_and_runtime_fact(tmp_pat
         1e-8,
         8,
         "CPython",
-        "3.13.14",
-        "Darwin",
-        "arm64",
+        3, 13,
+        "Darwin", "Linux", "Windows",
         "shared_xrd_tools_xu_rlock_v1",
         1,
     )

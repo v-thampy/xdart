@@ -514,7 +514,8 @@ class BrowserView(QtWidgets.QFrame):
                     )
                 )
             if title == "Config":
-                self._detector_menu = menu.addMenu("Raw image resolution")
+                self._detector_menu = QtWidgets.QMenu("Raw image resolution", menu)
+                menu.addMenu(self._detector_menu)
                 self._detector_group = QtGui.QActionGroup(self._detector_menu)
                 self._detector_group.setExclusive(True)
                 self._detector_actions = {}

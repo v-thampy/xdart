@@ -13,7 +13,39 @@ jobs:
       - uses: actions/setup-python@v6
         with: {python-version: "3.13"}
       - run: pip install -e ".[dev,fitting,rsm,notebook]"
-      - run: pytest tests/core -q -m "not slow" --timeout=300
+      - run: pytest tests/core -x -vv --tb=short -m "not slow" --timeout=300
+
+  numerical-portability:
+    name: numerical-portability (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is arm64, and xrayutilities==1.7.12 ships no arm64
+        # macOS wheel, so pip builds its sdist and fails on the runner's
+        # Apple clang ("openmp not found").  The Intel image installs the
+        # published x86_64 wheel; revisit when the xrayutilities pin moves.
+        os: [ubuntu-latest, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with: {python-version: "3.13"}
+      - run: python -m pip install -e ".[dev,rsm]"
+      # Real native pyFAI/XU execution on each OS. This does not substitute for
+      # the separate GUI and file-publication tests or native release testing.
+      - run: >-
+          python -m pytest
+          tests/core/test_single.py
+          tests/core/test_per_frame_conditioning.py
+          tests/core/test_xu_runtime.py
+          tests/core/test_xu_stitch.py
+          tests/core/test_xu_stitch_calibration.py
+          tests/core/test_rsm_geometry_asset.py
+          tests/core/test_rsm_equivalence.py
+          tests/core/test_rsm_coordinate_frame.py
+          tests/core/test_rsm_corrections.py
+          -x -vv --tb=short -m "not slow" --timeout=120
 
   architecture-guards:
     runs-on: ubuntu-latest
@@ -23,9 +55,27 @@ jobs:
       - uses: actions/setup-python@v6
         with: {python-version: "3.13"}
       - run: pip install -e ".[dev]"
-      - run: pytest tests/core/test_architecture_guards.py tests/core/test_ssrl_shim.py -q --timeout=120
+      - run: pytest tests/core/test_architecture_guards.py -q --timeout=120
 
   xdart-offscreen:
+    name: xdart-offscreen (${{ matrix.group }})
+    strategy:
+      fail-fast: false
+      # The harness retains Qt objects to avoid unsafe DeferredDelete teardown.
+      # Bound that graph per process: application-wide theme changes otherwise
+      # repolish thousands of widgets left by unrelated tests.
+      matrix:
+        include:
+          - group: execution-context
+            tests: tests/xdart/scattering/test_e[123]*.py
+          - group: directory-display
+            tests: tests/xdart/scattering/test_e[46]*.py
+          - group: viewers-analysis
+            tests: tests/xdart/scattering/test_p*.py
+          - group: scattering-other
+            tests: tests/xdart/scattering --ignore-glob=tests/xdart/scattering/test_e[12346]*.py --ignore-glob=tests/xdart/scattering/test_p*.py
+          - group: application
+            tests: tests/xdart --ignore=tests/xdart/scattering
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -36,6 +86,8 @@ jobs:
       - run: pip install -e ".[gui,dev,fitting,rsm,notebook]"
       - env:
           QT_QPA_PLATFORM: offscreen
+          XDART_SESSION_FILE: ${{ runner.temp }}/xdart-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.group }}-session.json
+          XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.group }}-settings.ini
         # scripts/ci_pytest.py hard-exits with pytest's own verdict as soon as
         # the run completes: the offscreen PySide6/pyqtgraph object graph
         # deterministically SIGSEGVs (exit 139) during *interpreter shutdown* —
@@ -51,7 +103,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             code=0
-            python scripts/ci_pytest.py tests/xdart -q --timeout=600 --junitxml="xdart-attempt-$attempt.xml" || code=$?
+            python scripts/ci_pytest.py ${{ matrix.tests }} -x -vv --tb=short --timeout=600 --junitxml="xdart-attempt-$attempt.xml" || code=$?
             [ "$code" -eq 0 ] && exit 0
             if grep -qE '(failures|errors)="[1-9][0-9]*"' "xdart-attempt-$attempt.xml" 2>/dev/null; then
               echo "::error::pytest tests/xdart reported real failures (not a segfault flake)"

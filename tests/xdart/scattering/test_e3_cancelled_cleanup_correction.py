@@ -188,7 +188,7 @@ def test_cancelled_cleanup_has_one_typed_nonterminal_architecture() -> None:
 
     controller_fields = self_assignments(ContextController)
     assert {name for name in controller_fields if "cleanup" in name} == {
-        "_cleanup_receipt"
+        "_cleanup_receipt", "_retired_browse_cleanup"
     }
     controller_calls = []
     for method in class_tree(ContextController).body:
@@ -221,7 +221,9 @@ def test_cancelled_cleanup_has_one_typed_nonterminal_architecture() -> None:
                 for node in ast.walk(method)
             ):
                 page_uses[method.name] = True
-    assert set(page_uses) == {
+    # The viewer and reintegration additions can also consult this blocker.
+    # Every original cancellation/Run admission consumer must still do so.
+    assert {
         "_classify_metadata_request",
         "_retry_pending_average_reload",
         "_select_scan",
@@ -229,7 +231,7 @@ def test_cancelled_cleanup_has_one_typed_nonterminal_architecture() -> None:
         "_polling_needed",
         "_refresh_shell",
         "_start_permitted",
-    }
+    } <= set(page_uses)
 
 
 @pytest.mark.parametrize("command", ("resume", "stop"))

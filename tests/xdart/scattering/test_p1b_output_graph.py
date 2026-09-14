@@ -627,11 +627,22 @@ def test_p1b_b02_overwrite_native_durable_terminal(
 
     adapter = dynamic_output.DynamicOutputAdapter(large_configuration)
     try:
+        from xdart.gui.tabs.scattering.adapters.run_executor import (
+            _qualify_background_bindings,
+        )
+        stop_signal = Event()
+        preparation = adapter.prepare_admission(
+            scan, plan, large_decision.item, large_decision, stop_signal,
+            qualify=lambda policy, prior: _qualify_background_bindings(
+                large_configuration, scan, large_decision.item,
+                large_decision, policy, prior, stop_signal,
+            ),
+        )
+        # The direct headless facade validates the admitted allocation against
+        # an actual native frame, as the coordinated GUI constructor does.
+        scan.frames[0].load_image()
         session, created = adapter.activate(
-            scan,
-            plan,
-            large_decision.item,
-            large_decision,
+            preparation,
             record_store=FrameRecordStore(),
             run_provenance={
                 **large_configuration.as_provenance(),
@@ -1437,15 +1448,22 @@ def test_p1b_b04_xye_only_prefix_and_append_envelope(
             ):
                 run = executor._exact_run(identity)
                 assert run is not None
-                assert all(
-                    event.frame_key is not None
-                    and run.display.artifacts[
-                        event.frame_key.artifact
-                    ].records.is_persisted(
-                        event.frame_key.local_frame_label
-                    )
-                    for event in frames[:expected]
-                )
+                # XYE has no NeXus record writer to mark a FrameRecordStore.
+                # Require the exact current attempt's receipts on every
+                # applicable XYE target, after the physical files settled.
+                assert run.output is not None
+                for event in frames[:expected]:
+                    assert event.frame_key is not None
+                    graph = run.output._graphs[event.frame_key.artifact]
+                    accounting = graph["accounting"]
+                    key = graph["keys"][event.frame_key.local_frame_label]
+                    receipts = {
+                        (key, mode, target)
+                        for mode, targets in accounting.ledger.targets_by_mode.items()
+                        for target in targets
+                    }
+                    assert receipts
+                    assert receipts.issubset(accounting.snapshot().durable)
                 return tuple(values)
             time.sleep(0.01)
         raise AssertionError("B04 XYE-only group did not physically settle")
@@ -2340,6 +2358,13 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
             ))
         return session
 
+    # The worker count pinned below is the Cores=4 request itself.  The pool
+    # cap also clamps to the host (``min(cores, cpu_count)``, 2 below 16 GiB
+    # RAM), so fix the host the way ``fixed_envelope`` fixes the envelope:
+    # a 16 GiB / 4 vCPU CI runner otherwise reports 2 workers.
+    from xrd_tools.core import staging
+    monkeypatch.setattr(staging, "total_physical_ram_bytes", lambda: 64 * 1024 ** 3)
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
     monkeypatch.setattr(
         dynamic_output, "resolve_session_policy", fixed_envelope,
     )
@@ -2489,6 +2514,7 @@ def test_live_gui_checkpoint_crosses_policy_then_stop_commits_exact_prefix(
     from xdart.gui.tabs.scattering.adapters import dynamic_output
     from xrd_tools.reduction import NexusTerminalDisposition
     from xrd_tools.session import FrameRecordStore
+    from xrd_tools.session.scan_session import ScanSession
 
     raw_root = tmp_path / "raw"
     raw_root.mkdir()
@@ -2508,6 +2534,9 @@ def test_live_gui_checkpoint_crosses_policy_then_stop_commits_exact_prefix(
     stores = []
     checkpoints = []
     clear_calls = []
+    epoch_entered = Event()
+    release_epoch = Event()
+    commit_epoch = ScanSession.commit_epoch
     clear_checkpoint_recoverable = (
         FrameRecordStore.clear_checkpoint_recoverable
     )
@@ -2529,6 +2558,13 @@ def test_live_gui_checkpoint_crosses_policy_then_stop_commits_exact_prefix(
         stores.append(kwargs["record_store"])
         return session
 
+    def held_epoch(owner):
+        # Observe checkpoint custody before the independent live-epoch
+        # terminal transition can close the writer and consume its receipts.
+        epoch_entered.set()
+        assert release_epoch.wait(10.0)
+        return commit_epoch(owner)
+
     monkeypatch.setattr(
         dynamic_output, "open_headless_scan_session", capture_session,
     )
@@ -2537,6 +2573,7 @@ def test_live_gui_checkpoint_crosses_policy_then_stop_commits_exact_prefix(
         "clear_checkpoint_recoverable",
         observed_clear,
     )
+    monkeypatch.setattr(ScanSession, "commit_epoch", held_epoch)
     executor = StandardRunExecutor(join_timeout=2.0)
     identity = _start(executor, intent, request_value=1716)
     try:
@@ -2548,6 +2585,7 @@ def test_live_gui_checkpoint_crosses_policy_then_stop_commits_exact_prefix(
                     for event in values
                 ) >= 8
                 and bool(checkpoints)
+                and epoch_entered.is_set()
             ),
         )
         assert len(sessions) == len(stores) == 1
@@ -2558,7 +2596,12 @@ def test_live_gui_checkpoint_crosses_policy_then_stop_commits_exact_prefix(
         assert session._dynamic_nexus_checkpoint_count == 0
         assert checkpoints[0].labels == expected_rows
         target = session._dynamic_nexus_sink.path
-        assert _nexus_rows(target) == expected_rows
+        # The checkpoint still belongs to the active writer. Read its exact
+        # HDF5 handle under the writer lock; an independent file open races
+        # that exclusive custody. The post-Stop read below uses a fresh open.
+        writer = session._dynamic_nexus_sink._writer
+        with writer._boundary():
+            assert tuple(writer._h5["entry/integrated_1d/frame_index"][()]) == expected_rows
 
         staged = session._dynamic_accounting.snapshot()
         assert len(staged.pending_durable) == 8
@@ -2570,6 +2613,7 @@ def test_live_gui_checkpoint_crosses_policy_then_stop_commits_exact_prefix(
         )
 
         executor.stop(identity)
+        release_epoch.set()
         terminal_events = _drain_until(
             executor,
             lambda values: any(event.kind in _TERMINAL for event in values),
@@ -2601,6 +2645,7 @@ def test_live_gui_checkpoint_crosses_policy_then_stop_commits_exact_prefix(
             for label in expected_rows
         )
     finally:
+        release_epoch.set()
         assert (
             executor.close(identity).cleanup_status
             is CleanupStatus.CLEANED
@@ -2871,8 +2916,9 @@ def test_post_g2_output_diagnostics_disable_only_xye_and_fsync(
         executor.close(identity)
 
 
-def test_no_xye_terminal_verification_failure_is_not_finished(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("verification_recovers", (True, False))
+def test_no_xye_terminal_verification_failure_preserves_terminal_truth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verification_recovers,
 ) -> None:
     from xdart.gui.tabs.scattering.adapters import dynamic_output
     from xrd_tools.io.record_writer import NexusRecordWriter
@@ -2894,7 +2940,7 @@ def test_no_xye_terminal_verification_failure_is_not_finished(
 
     def fail_once(writer):
         calls.append(writer)
-        if len(calls) == 1:
+        if not verification_recovers or len(calls) == 1:
             raise OSError("injected terminal science readback failure")
         return verify(writer)
 
@@ -2912,11 +2958,35 @@ def test_no_xye_terminal_verification_failure_is_not_finished(
         terminal = next(event for event in events if event.kind in _TERMINAL)
         assert terminal.kind is StandardEventKind.FAILED, terminal.detail
         assert "injected terminal science readback failure" in str(terminal)
-        assert not sessions[0]._dynamic_accounting.snapshot().durable
-        assert not _written(target).exists()
+        assert len({id(writer) for writer in calls}) == 1
+        snapshot = sessions[0]._dynamic_accounting.snapshot()
+        if verification_recovers:
+            # Cleanup retries the same writer's real proof; the executor
+            # still reports its original failure despite verified publication.
+            assert len(calls) >= 2
+            assert snapshot.state.value == "finished"
+            assert snapshot.durable
+            assert _nexus_rows(_written(target)) == (1,)
+            assert calls[0]._h5 is None
+        else:
+            assert not snapshot.durable
+            # Same-run streaming owns a visible provisional path. Without
+            # successful verification it has no typed terminal commit, and
+            # the exact writer handle remains held for cleanup retry.
+            assert sessions[0].terminal_result is None
+            assert calls[0]._h5 is not None and calls[0]._h5.id.valid
+            assert terminal.cleanup_status is CleanupStatus.CLEANUP_PENDING
         assert raw.read_bytes() == original_raw
     finally:
-        assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+        monkeypatch.setattr(NexusRecordWriter, "_verify_fast_integrated_results", verify)
+        receipt = executor.close(identity)
+        if receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING:
+            # Display retirement preceded the successful writer retry; close
+            # the same retained display now that its terminal lease settled.
+            assert calls[0]._h5 is None
+            receipt = executor.close(identity)
+        assert receipt.cleanup_status is CleanupStatus.CLEANED
+        assert calls[0]._h5 is None
 
 
 def test_p1b_b18_headless_and_single_owner_census(tmp_path: Path) -> None:

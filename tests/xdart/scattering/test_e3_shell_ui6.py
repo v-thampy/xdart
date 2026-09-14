@@ -11,6 +11,7 @@ from xdart.gui.tabs.scattering import shell_values
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
 from xdart.gui.tabs.scattering.shell_values import (
     BrowserProjection,
+    FrameSelectionIntent,
     ScientificProjection,
     ShellCommandKind,
 )
@@ -496,9 +497,9 @@ def test_e3_ui6_overlay_browser_selection_moves_focus_not_membership(
         assert commands[0].kind is (
             ShellCommandKind.SELECT_BROWSER_FRAMES
         )
-        assert len(commands[0].frames) == 2
-        assert commands[0].frames[0] is navigation.frames[1]
-        assert commands[0].frames[1] is navigation.frames[3]
+        # Overlay accumulates visits independently of the browser highlight.
+        assert commands[0].intent is FrameSelectionIntent.VISIT
+        assert commands[0].frames == (navigation.frames[3],)
         assert commands[0].frame is navigation.frames[3]
     finally:
         _dispose(shell, qapp)

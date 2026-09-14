@@ -7,6 +7,7 @@ import hashlib
 import io
 import math
 import os
+import re
 import stat
 import struct
 import zipfile
@@ -17,12 +18,13 @@ from pathlib import Path
 
 import numpy as np
 from xrd_tools.core.staging import total_physical_ram_bytes as _physical_ram_bytes
+from xrd_tools.io.stat_identity import identity_ctime_ns
 
 SUPPORTED_VIEWER_SUFFIXES = frozenset({
     ".edf", ".tif", ".tiff", ".cbf", ".img", ".mar3450", ".raw",
     ".h5", ".hdf5", ".nxs", ".nexus", ".csv", ".npy", ".npz",
 })
-POLICY_VERSION = "viewer-2d-v1"
+POLICY_VERSION = "viewer-2d-v2"
 CATALOG_RESERVATION = (
     2 * 1024 * 1024 + 512 * 10_000 + 4096 + 128 * 1024 + 4 * 1024 * 1024
 )
@@ -44,6 +46,9 @@ _RAW_DATASETS = (
     "/entry/instrument/detector/data", "/entry/instrument/detector/data_000001",
     "/entry/data/data", "/entry/measurement/data", "/entry/data/eiger_image",
 )
+# A processed record's source dataset hint that names one Eiger segment
+# link, as _hdf_segments enumerates them: ``/<entry>/data/data_<number>``.
+_SEGMENT_HINT = re.compile(r"^(?P<group>/(?P<entry>[^/]+)/data)/(?P<name>data_[0-9]+)$")
 
 
 class Viewer2DSourceKind(str, Enum):
@@ -117,20 +122,23 @@ class Viewer2DFormatPolicy:
 
 @dataclass(frozen=True, slots=True)
 class Viewer2DRevision:
+    """File metadata for freshness checks, not a content fingerprint.
+
+    Viewer sources are ordinary local/shared files, not hostile writers.
+    Catalogs are immutable process-local values, validated at construction.
+    """
     canonical_path: str
     device: int
     inode: int
     size: int
     mtime_ns: int
     ctime_ns: int
-    sha256: str
 
     def __post_init__(self):
         values = (self.device, self.inode, self.size, self.mtime_ns, self.ctime_ns)
         _malformed(type(self.canonical_path) is not str or not self.canonical_path
             or len(os.fsencode(self.canonical_path)) > _MAX_PATH
-            or any(type(value) is not int or value < 0 for value in values)
-            or not _sha256_text(self.sha256), "revision")
+            or any(type(value) is not int or value < 0 for value in values), "revision")
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,22 +463,14 @@ def _canonical_path(value):
     return path
 
 
-def _digest_file(path):
-    with open(path, "rb", buffering=0) as stream:
-        return _descriptor_revision(path, stream).sha256
+def _revision(path, info):
+    return Viewer2DRevision(str(path), *_stat_identity(info))
 
 
-def _revision(path, sha256, info=None):
-    info = path.stat() if info is None else info
-    return Viewer2DRevision(
-        str(path), int(info.st_dev), int(info.st_ino), int(info.st_size),
-        int(info.st_mtime_ns), int(info.st_ctime_ns), sha256,
-    )
-
-
-_REVISION_STAT_FIELDS = (
-    "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns",
-)
+def _stat_identity(info):
+    """Normalize the platform's descriptor/pathname ctime difference once."""
+    return (int(info.st_dev), int(info.st_ino), int(info.st_size),
+            int(info.st_mtime_ns), identity_ctime_ns(info.st_ctime_ns))
 
 
 def _revision_stat(revision):
@@ -484,74 +484,37 @@ def _path_stat(path):
     except OSError:
         _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
                 "viewer source is no longer readable")
-    return tuple(int(getattr(info, name)) for name in _REVISION_STAT_FIELDS)
-
-
-def _recertify_drift(revision, message):
-    """Refuse a changed source after refreshing its content identity once.
-
-    The refresh is diagnostic/custodial only: a stat mismatch has already made
-    the admitted catalog stale, so a path that races back to its old contents
-    must still be refused rather than silently inheriting that admission.
-    """
-
-    try:
-        _stable_revision(Path(revision.canonical_path))
-    except (OSError, Viewer2DReadError):
-        pass
-    _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, message)
+    return _stat_identity(info)
 
 
 def _cert_stat_revision(revision, *, stream=None, message):
-    """Fence one admitted revision without rereading its whole payload.
-
-    When *stream* is supplied, both the still-open descriptor and its pathname
-    must retain the exact catalog stat tuple.  Stable selected-frame reads are
-    therefore O(1) in artifact size; any drift takes the slow recertification
-    path before refusing the stale catalog.
-    """
+    """Refuse changed file metadata without reading the source payload."""
 
     descriptor = None
     if stream is not None:
         try:
             info = os.fstat(stream.fileno())
         except (OSError, ValueError):
-            _recertify_drift(revision, message)
-        descriptor = tuple(
-            int(getattr(info, name)) for name in _REVISION_STAT_FIELDS
-        )
+            _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, message)
+        descriptor = _stat_identity(info)
     try:
         pathname = _path_stat(Path(revision.canonical_path))
     except Viewer2DReadError:
         pathname = None
-    expected = _revision_stat(revision)
-    if pathname != expected or descriptor is not None and descriptor != expected:
-        _recertify_drift(revision, message)
+    if pathname != _revision_stat(revision) or (
+            descriptor is not None
+            and descriptor != _revision_stat(revision)):
+        _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, message)
 
 
-def _descriptor_revision(path, stream, sha256=None):
-    before = os.fstat(stream.fileno())
-    if sha256 is None:
-        stream.seek(0)
-        digest = hashlib.sha256()
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-        sha256 = digest.hexdigest()
-    after = os.fstat(stream.fileno())
-    try:
-        pathname = path.stat()
-    except OSError:
-        _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "viewer source is no longer readable")
-    if any(getattr(before, key) != getattr(after, key)
-           or getattr(after, key) != getattr(pathname, key)
-           for key in _REVISION_STAT_FIELDS):
-        _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED, "viewer descriptor or path changed")
-    return _revision(path, sha256, after)
+def _descriptor_revision(path, stream):
+    revision = _revision(path, os.fstat(stream.fileno()))
+    _cert_stat_revision(revision, stream=stream, message="viewer descriptor or path changed")
+    return revision
 
 
 def _stable_revision(path):
-    with open(path, "rb", buffering=0) as stream:
-        return _descriptor_revision(path, stream)
+    return _revision(path, path.stat())
 
 
 def _assert_primary(catalog):
@@ -583,6 +546,44 @@ def _dependency_chains(dependencies):
     if current:
         chains.append(tuple(current))
     return tuple(chains)
+
+
+def _chain_identities(catalog, chain, shape, dtype):
+    """The source-catalog identities a raw fact of *shape* and *dtype* over
+    the dependency *chain* (its base, then its frame intervals) may carry:
+    the single-dataset "hdf5" catalog of an external link covering the chain
+    (both source shapes when the chain is one frame long) and the
+    "hdf5-eiger" catalog of a contiguous segment chain anchored at the base's
+    dataset."""
+    total = chain[-1].frame_stop
+    intervals = chain[1:]
+    identities = set()
+    if (len(intervals) == 1 and intervals[0].frame_start == 0
+            and intervals[0].frame_stop == total
+            and intervals[0].logical_path == chain[0].dataset_path):
+        shapes = ((total, *shape),)
+        if total == 1:
+            shapes += (shape,)
+        for source_shape in shapes:
+            manifest = (
+                chain[0].locator, Viewer2DSourceKind.RAW_DETECTOR.value,
+                tuple(range(total)), source_shape, dtype, intervals,
+                "hdf5", None, chain[0].dataset_path, (),
+                catalog.policy_identity, chain[0].revision)
+            identities.add(_catalog_id(*manifest))
+    cover = tuple((item.frame_start, item.frame_stop) for item in intervals)
+    if (all(item.logical_path is not None for item in intervals)
+            and intervals[0].logical_path == chain[0].dataset_path
+            and cover == tuple((start, stop) for start, stop in zip(
+                (0, *(item.frame_stop for item in intervals[:-1])),
+                (item.frame_stop for item in intervals)))):
+        manifest = (
+            chain[0].locator, Viewer2DSourceKind.RAW_DETECTOR.value,
+            tuple(range(total)), (total, *shape), dtype,
+            intervals, "hdf5-eiger", None, chain[0].dataset_path, (),
+            catalog.policy_identity, chain[0].revision)
+        identities.add(_catalog_id(*manifest))
+    return frozenset(identities)
 
 
 def _validate_catalog_cross_fields(catalog):
@@ -629,41 +630,23 @@ def _validate_catalog_cross_fields(catalog):
                           for left, right in zip(chain[1:], chain[2:]))
                    or any(item.logical_path is None for item in chain[1:])
                    for chain in chains), "catalog")
+        # A chain's admissible source-catalog identities depend on the fact
+        # only through its shape and dtype: computed once per (chain, shape,
+        # dtype), not once per raw fact -- each manifest strings the chain's
+        # whole frame range, so per-fact hashing cost every read of a
+        # 2,500-frame all-raw record ~0.3 s and a 3,621-frame one ~0.9 s.
+        identities_by_chain = {}
         for fact, (matches, _) in zip(raw_facts, selected):
             chain = matches[0]
             _malformed(len(chain) == 1 and chain[0].dataset_path is not None
                 and chain[0].dataset_path.rsplit("/", 1)[-1].startswith("data_")
                 and chain[0].dataset_path.rsplit("/", 1)[-1][5:].isdigit(), "catalog")
             if len(chain) > 1:
-                total = chain[-1].frame_stop
-                intervals = chain[1:]
-                identities = set()
-                if (len(intervals) == 1 and intervals[0].frame_start == 0
-                        and intervals[0].frame_stop == total
-                        and intervals[0].logical_path == chain[0].dataset_path):
-                    shapes = ((total, *fact.shape),)
-                    if total == 1:
-                        shapes += (fact.shape,)
-                    for source_shape in shapes:
-                        manifest = (
-                            chain[0].locator, Viewer2DSourceKind.RAW_DETECTOR.value,
-                            tuple(range(total)), source_shape, fact.dtype, intervals,
-                            "hdf5", None, chain[0].dataset_path, (),
-                            catalog.policy_identity, chain[0].revision)
-                        identities.add(_catalog_id(*manifest))
-                cover = tuple((item.frame_start, item.frame_stop)
-                              for item in intervals)
-                if (all(item.logical_path is not None for item in intervals)
-                        and intervals[0].logical_path == chain[0].dataset_path
-                        and cover == tuple((start, stop) for start, stop in zip(
-                            (0, *(item.frame_stop for item in intervals[:-1])),
-                            (item.frame_stop for item in intervals)))):
-                    manifest = (
-                        chain[0].locator, Viewer2DSourceKind.RAW_DETECTOR.value,
-                        tuple(range(total)), (total, *fact.shape), fact.dtype,
-                        intervals, "hdf5-eiger", None, chain[0].dataset_path, (),
-                        catalog.policy_identity, chain[0].revision)
-                    identities.add(_catalog_id(*manifest))
+                key = (id(chain), fact.shape, fact.dtype)
+                identities = identities_by_chain.get(key)
+                if identities is None:
+                    identities = identities_by_chain[key] = _chain_identities(
+                        catalog, chain, fact.shape, fact.dtype)
                 _malformed(fact.source_catalog_identity not in identities, "catalog")
         return
     _malformed(catalog.frame_labels != tuple(range(f)), "catalog")
@@ -733,7 +716,6 @@ def _selected_dependencies(catalog, label):
 def viewer_2d_selected_ledger(catalog, label):
     if type(catalog) is not Viewer2DArtifactCatalog:
         raise TypeError("selected ledger requires an exact viewer catalog")
-    catalog.__post_init__()
     if type(label) is not int or label not in catalog.frame_labels:
         raise TypeError("selected ledger label is not certified")
     fact = next((item for item in catalog.frame_facts if item.label == label), None)
@@ -754,8 +736,6 @@ def _validate_frame_against_catalog(catalog, label, frame):
     _malformed(type(catalog) is not Viewer2DArtifactCatalog
         or type(frame) is not Viewer2DFrame or type(label) is not int
         or label not in catalog.frame_labels, "selected frame")
-    catalog.__post_init__()
-    frame.__post_init__()
     fact = next((item for item in catalog.frame_facts if item.label == label), None)
     p = frame.provenance
     dependencies = _selected_dependencies(catalog, label)
@@ -881,7 +861,7 @@ def _catalog_csv(path, policy):
         _refuse(Viewer2DRefusalCode.LIMIT_EXCEEDED, "CSV exceeds 512 MiB")
     with open(path, "rb", buffering=0) as stream:
         shape, digest = _csv_scan(stream)
-        revision = _descriptor_revision(path, stream, digest)
+        revision = _descriptor_revision(path, stream)
     _admit(shape)
     return _make_catalog(path, policy, Viewer2DSourceKind.CSV_MATRIX, (0,), shape,
                          np.dtype(float), revision, (), "csv")
@@ -1453,6 +1433,15 @@ def _dependency(locator, dataset, *, start=None, stop=None, logical=None,
                               start, stop, logical)
 
 
+class _SegmentUnavailable(Viewer2DReadError):
+    """One named Eiger segment link resolves to no rank-three dataset."""
+
+    def __init__(self, logical):
+        super().__init__(Viewer2DRefusalCode.FORMAT_INVALID,
+                         f"Eiger segment is missing or not rank three: {logical}")
+        self.logical = logical
+
+
 def _hdf_segments(path, entry, walk, admission):
     import h5py
     group = _hget(entry, "data", walk)
@@ -1473,7 +1462,7 @@ def _hdf_segments(path, entry, walk, admission):
         except Exception:
             dataset = None
         if not isinstance(dataset, h5py.Dataset) or dataset.ndim != 3:
-            _refuse(Viewer2DRefusalCode.FORMAT_INVALID, "Eiger segment is missing or not rank three")
+            raise _SegmentUnavailable(logical)
         walk.retain_candidate()
         shape = tuple(int(value) for value in dataset.shape)
         _, h, w = _shape_fhw(shape)
@@ -1495,6 +1484,48 @@ def _hdf_segments(path, entry, walk, admission):
     shape = (total, *frame_shape)
     _admit(shape)
     return shape, dtype, tuple(dependencies), segments[0][1]
+
+
+def _hinted_segments(path, handle, walk, admission, selected_path):
+    """The Eiger segment chain the validated dataset hint *selected_path*
+    anchors, or ``None`` when the hint is to be read as one dataset.
+
+    A processed record stores the dataset the writer integrated from --
+    for an Eiger master its first segment, ``/entry/data/data_000001`` --
+    beside a frame index that counts across every segment of the master.
+    Resolving the hint alone stopped the catalog at the first segment, so
+    every frame past it was "unavailable" and fell back to its thumbnail
+    (bo_2 frames >= 1000).  The hint is read as the chain's anchor when
+    it names the first segment of an intact chain.  A hint that is not
+    named like a segment, whose entry is absent, or that is not the first
+    segment of the chain :func:`_hdf_segments` finds (none, when the name
+    is an in-file dataset) keeps the single-dataset reading, as does a
+    chain broken only at a segment AFTER the hinted one: the hinted
+    segment's own frames stay readable.  A chain broken at the hinted
+    segment or before it refuses -- the chain the record's frame index
+    counts across is not there -- and so does every other chain refusal
+    (segments that disagree, a chain over the frame cap).
+    """
+    import h5py
+    match = _SEGMENT_HINT.match(selected_path)
+    if match is None:
+        return None
+    try:
+        entry = _hpath(handle, "/" + match.group("entry"), walk)
+    except KeyError:
+        return None
+    if not isinstance(entry, h5py.Group):
+        return None
+    try:
+        eiger = _hdf_segments(path, entry, walk, admission)
+    except _SegmentUnavailable as error:
+        group, _, name = error.logical.rpartition("/")
+        if group != match.group("group") or name <= match.group("name"):
+            raise
+        return None
+    if eiger is None or eiger[3] != selected_path:
+        return None
+    return eiger
 
 
 def _processed_frame_groups(frames, walk):
@@ -1676,6 +1707,13 @@ def _catalog_hdf5(path, policy, walk=None, preferred=None, admission=None):
                         "processed source cannot be selected as raw detector data",
                     )
                 dataset_path, dataset = _hdf_dataset(handle, walk, preferred)
+                eiger = _hinted_segments(path, handle, walk, admission, dataset_path)
+                if eiger is not None:
+                    shape, dtype, dependencies, dataset_path = eiger
+                    return _make_catalog(
+                        path, policy, Viewer2DSourceKind.RAW_DETECTOR,
+                        range(shape[0]), shape, dtype, admission.revision(path),
+                        dependencies, "hdf5-eiger", dataset=dataset_path)
             else:
                 entry = _hdf_entry(handle, walk)
                 entry_name = (
@@ -1890,19 +1928,7 @@ def _read_numpy(catalog, index):
 
 def _cert_revision(revision, walk):
     walk.touch(revision.canonical_path)
-    try:
-        current = _path_stat(Path(revision.canonical_path))
-    except Viewer2DReadError:
-        current = None
-    if current != _revision_stat(revision):
-        # A state change is always a refusal.  Rehash it before returning so a
-        # changed path never silently inherits an admitted content identity.
-        try:
-            _stable_revision(Path(revision.canonical_path))
-        except (OSError, Viewer2DReadError):
-            pass
-        _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
-                "selected viewer dependency changed")
+    _cert_stat_revision(revision, message="selected viewer dependency changed")
 
 
 def _cert_dependencies(catalog, label, walk):
@@ -2165,25 +2191,27 @@ def _read_frame(catalog, label, policy, walk):
     if catalog.format_name == "csv":
         with open(catalog.canonical_path, "rb", buffering=0) as stream:
             path = Path(catalog.canonical_path)
-            opened = _revision(path, catalog.primary_revision.sha256,
-                               os.fstat(stream.fileno()))
+            opened = _revision(path, os.fstat(stream.fileno()))
             try:
-                pathname = _revision(path, catalog.primary_revision.sha256)
+                # A pathname view against the descriptor-recorded catalog
+                # revision: comparable only through the win32 ctime seam.
+                pathname = _stat_identity(path.stat())
             except OSError:
                 _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
                         "CSV source is no longer readable")
-            if opened != catalog.primary_revision or pathname != catalog.primary_revision:
+            if (opened != catalog.primary_revision
+                    or pathname != _revision_stat(catalog.primary_revision)):
                 _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
                         "CSV descriptor does not match catalog")
             first_shape, first_digest = _csv_scan(stream)
-            first_revision = _descriptor_revision(path, stream, first_digest)
+            first_revision = _descriptor_revision(path, stream)
             if first_shape != shape or first_revision != catalog.primary_revision:
                 _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,
                         "CSV first pass changed")
             array = np.empty(shape, dtype=float, order="C")
             try:
                 checked_shape, digest = _csv_scan(stream, array)
-                second_revision = _descriptor_revision(path, stream, digest)
+                second_revision = _descriptor_revision(path, stream)
                 if (checked_shape != first_shape or digest != first_digest
                         or second_revision != first_revision):
                     _refuse(Viewer2DRefusalCode.VIEWER_SOURCE_CHANGED,

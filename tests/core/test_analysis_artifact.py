@@ -654,8 +654,38 @@ def test_public_result_projection_matches_axis_unit_and_nan_storage_bounds():
         )
 
 
+@pytest.mark.parametrize("kind", (AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.RSM))
+@pytest.mark.parametrize("malformation", ("partial", "null", "unknown", "wrong_kernel"))
+def test_runtime_environment_extension_remains_closed(kind, malformation):
+    request_fingerprint = _digest("runtime-environment-request")
+    factory = (
+        _execution_attestation
+        if kind is AnalysisArtifactKind.STITCH_1D
+        else _rsm_execution_attestation
+    )
+    value = factory(request_fingerprint, _digest("runtime-environment-result"))
+    runtime = value["xu_runtime"]
+    runtime.update(
+        python_implementation="CPython", python_version="3.13.0",
+        platform_system="Windows", platform_machine="AMD64",
+    )
+    analysis_execution_attestation_digest(kind, value, request_fingerprint=request_fingerprint)
+    if malformation == "partial":
+        del runtime["platform_machine"]
+    elif malformation == "null":
+        runtime["platform_machine"] = None
+    elif malformation == "unknown":
+        runtime["arbitrary_environment_claim"] = True
+    else:
+        runtime["xrayutilities_module_version"] = "future"
+    with pytest.raises(ValueError, match="attestation contract is invalid"):
+        analysis_execution_attestation_digest(kind, value, request_fingerprint=request_fingerprint)
+
+
+@pytest.mark.parametrize("observed_environment", (False, True))
 def test_analysis_artifact_v2_round_trip_binds_separate_execution_attestation(
     tmp_path,
+    observed_environment,
 ):
     projection = project_analysis_artifact_result(
         kind=AnalysisArtifactKind.STITCH_1D,
@@ -671,6 +701,12 @@ def test_analysis_artifact_v2_round_trip_binds_separate_execution_attestation(
         request_fingerprint,
         projection.result_fingerprint,
     )
+    if observed_environment:
+        from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+
+        with xu_runtime_session() as runtime:
+            pass
+        attestation["xu_runtime"] = runtime.execution_record.to_attestation()
     attestation_digest = analysis_execution_attestation_digest(
         AnalysisArtifactKind.STITCH_1D,
         attestation,
@@ -725,8 +761,10 @@ def test_analysis_artifact_v2_round_trip_binds_separate_execution_attestation(
         )
 
 
+@pytest.mark.parametrize("observed_environment", (False, True))
 def test_analysis_artifact_v2_rsm_round_trip_is_a_closed_exact_branch(
     tmp_path,
+    observed_environment,
 ):
     projection = project_analysis_artifact_result(
         kind=AnalysisArtifactKind.RSM,
@@ -746,6 +784,12 @@ def test_analysis_artifact_v2_rsm_round_trip_is_a_closed_exact_branch(
         request_fingerprint,
         projection.result_fingerprint,
     )
+    if observed_environment:
+        from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+
+        with xu_runtime_session() as runtime:
+            pass
+        attestation["xu_runtime"] = runtime.execution_record.to_attestation()
     attestation_digest = analysis_execution_attestation_digest(
         AnalysisArtifactKind.RSM,
         attestation,
@@ -2500,3 +2544,49 @@ def test_unbound_frame_records_and_source_base_are_refused(tmp_path):
     assert not output.snapshot.published and not output.snapshot.close_pending
     assert not output.snapshot.slot_held
     assert not Path(request.target).exists()
+
+
+# ---------------------------------------------------------------------------
+# The Windows stat shape (PR #1 2026-09-11): pathname ctime = creation time,
+# descriptor ctime = change time.  Inspection fences the opened HDF5
+# descriptor against the pathname admission stat; the seam is the only
+# reason the two agree on win32.
+# ---------------------------------------------------------------------------
+
+
+def _published_stitch_1d(tmp_path) -> AnalysisArtifactRequest:
+    request = _request(tmp_path / "stitch_1d.nexus", AnalysisArtifactKind.STITCH_1D)
+    admit_analysis_artifact(
+        request, coordinator=OutputTransactionCoordinator()
+    ).publish(_writer(request))
+    return request
+
+
+def test_win32_pathname_ctime_shape_is_refused_while_ctime_is_identity(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime,
+):
+    request = _published_stitch_1d(tmp_path)
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", True)
+    win32_pathname_ctime(request.target)
+    with pytest.raises(
+        AnalysisArtifactInvalid, match="changed while opening detached admission",
+    ):
+        inspect_analysis_artifact(request.target)
+
+
+def test_win32_identity_inspects_and_reads_the_pathname_ctime_shape(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime,
+):
+    request = _published_stitch_1d(tmp_path)
+    with open(request.target, "rb") as handle:
+        descriptor_ctime_ns = os.fstat(handle.fileno()).st_ctime_ns
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    gap_ns = win32_pathname_ctime(request.target)
+    assert os.stat(request.target).st_ctime_ns == descriptor_ctime_ns - gap_ns
+
+    inspection = inspect_analysis_artifact(request.target, expected_request=request)
+
+    assert inspection.kind is AnalysisArtifactKind.STITCH_1D
+    assert inspection.storage_revision[4] == 0
+    payload = read_analysis_artifact(request.target)
+    assert payload.inspection == inspection

@@ -46,11 +46,14 @@ def test_real_gi_stopped_append_reuses_the_original_freeze_extent(
 ):
     """Append retains the full GI grid even though only the suffix is written."""
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    fixture_root = Path("/Users/vthampy/repos/test_data/Tiff")
+    # Same gate as the Eiger rows below: the real GI series lives under
+    # XDART_TEST_DATA, which CI does not have.
+    fixture_root = Path(os.environ.get("XDART_TEST_DATA", "/missing")) / "Tiff"
     raw = fixture_root / "Combi4_Angledependence_samz_4p9_03271005_0001.tif"
     poni = fixture_root / "LaB6_detz190_dety72_th5_03261554_0001.poni"
     mask = fixture_root / "mask.edf"
-    assert all(path.is_file() for path in (raw, poni, mask))
+    if not all(path.is_file() for path in (raw, poni, mask)):
+        pytest.skip("real Tiff GI source unavailable")
     assert len(tuple(fixture_root.glob(
         "Combi4_Angledependence_samz_4p9_03271005_*.tif"
     ))) == 16

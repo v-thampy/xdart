@@ -160,8 +160,8 @@ def test_public_route_gi_has_no_per_frame_reopen(tmp_path, monkeypatch):
         p = _write_bluesky_gi(tmp_path / f"gi_{n:02d}_00001.nxs", n)
         counter.watch(p)
         src = open_source(SourceSpec(p, SourceKind.NEXUS_STACK))
-        src.integrator = object()
         src.poni = PONI(dist=0.2, poni1=0.1, poni2=0.1, wavelength=1e-10)
+        src.integrator = reduction_core.poni_to_integrator(src.poni)
         plan = ReductionPlan(
             integration_1d=Integration1DPlan(npt=2, monitor_key="i0"),
             gi=GIMode(incidence_motor="i1", mode_1d="q_oop", npt_oop=3))

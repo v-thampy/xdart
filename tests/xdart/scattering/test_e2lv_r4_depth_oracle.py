@@ -14,15 +14,21 @@ import pytest
 
 from tests.xdart.scattering import test_e2lv_live_display as lv_support
 from xdart.gui.tabs.scattering import display_runtime
-from xdart.gui.tabs.scattering.adapters import run_executor as executor_module
+from xdart.gui.tabs.scattering.controls_inventory import THRESHOLD_MIN
 from xdart.gui.tabs.scattering.display_runtime import RunDisplayState
 from xdart.gui.tabs.scattering.events import CleanupStatus, RunIdentity
+from xdart.gui.widgets.controls_panel import RangeRow
 from xdart.modules.frame_publication import FramePublication
 from xrd_tools.core import Axis, FrameRecord, FrameView
+from xrd_tools.core.containers import IntegrationResult1D
 from xrd_tools.core.scan import Scan, ScanFrame
 from xrd_tools.core.staging import browse_publication_max_items
 from xrd_tools.io import read_frame_record
 from xrd_tools.io.image_source import load_processed_raw_or_thumbnail
+from xrd_tools.reduction import (
+    FrameReduction, NexusSink, ReductionPlan, ReductionResult,
+)
+from xrd_tools.sources.image import TiffSeriesSource
 
 
 def _owner(state: RunDisplayState, index: int):
@@ -57,6 +63,11 @@ def _retain(
         label=label,
         axis_1d=axis,
         intensity_1d=np.arange(8, dtype=float) + label,
+        # Current heavy publications retain 2-D science; the sole light-1D
+        # lease owns curves independently of this aggregate cake/raw budget.
+        axis_2d_x=Axis(label="q", unit="1/angstrom", values=np.arange(4.0)),
+        axis_2d_y=Axis(label="chi", unit="deg", values=np.arange(4.0)),
+        intensity_2d=image.astype(float),
         raw=image,
         thumbnail=image.astype(float),
         source_path=f"/source/{owner.source_scan}.tif",
@@ -67,10 +78,15 @@ def _retain(
         owner.source_scan, str(owner.artifact), label
     )
     publication = FramePublication(
-        view,
+        replace(view, raw=None),
         record=record,
         source_identity=f"{view.source_path}#{label}",
         scan_key=owner.source_scan,
+    )
+    # The writer owns records and persistence qualification before the display
+    # receives a publication; eviction must consult that real custody evidence.
+    owner.records.upsert(
+        record, source_identity=publication.source_identity, persisted=True,
     )
     state.retain_frame(
         owner,
@@ -100,7 +116,7 @@ def test_nine_artifacts_do_not_consume_eight_heavy_slots(
 def test_uneven_artifacts_borrow_idle_capacity_under_each_run_limit(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("XDART_HEAVY_WINDOW", "4")
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
     monkeypatch.setattr(display_runtime, "THUMBNAIL_MAX_ITEMS", 20)
     monkeypatch.setattr(display_runtime, "live_record_store_max_items", lambda _npt: 20)
     monkeypatch.setattr(display_runtime, "browse_publication_max_items", lambda _npt: 20)
@@ -161,48 +177,26 @@ def test_frame_local_mask_matches_live_and_hydrated_durable_thumbnail(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
-    real_build = executor_module.build_native_int_reduction_plan_from_args
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "16")
     frame_mask = np.zeros((2, 4), dtype=bool)
     frame_mask[0, 0] = True
+    real_frame_for = TiffSeriesSource.frame_for
 
-    def to_scan(self, *, poni, integrator, output_path):
-        return Scan(
-            "frame-mask",
-            [
-                ScanFrame(
-                    label,
-                    image=np.arange(8, dtype=np.uint16).reshape(2, 4) + label,
-                    source_path=self._selected,
-                    source_frame_index=label,
-                    mask=frame_mask,
-                )
-                for label in range(1, 11)
-            ],
-            poni=poni,
-            integrator=integrator,
-            output_path=output_path,
-        )
+    def masked_frame_for(self, index):
+        return replace(real_frame_for(self, index), mask=frame_mask)
 
-    def build(*args, **kwargs):
-        return replace(real_build(*args, **kwargs), mask_saturation=False)
-
-    monkeypatch.setattr(lv_support._Source, "to_scan", to_scan)
-    monkeypatch.setattr(
-        executor_module,
-        "build_native_int_reduction_plan_from_args",
-        build,
-    )
-    qapp, page, lifecycle, _executor, output = lv_support._standard_page(
-        monkeypatch, tmp_path, labels=tuple(range(1, 11)), mask=None
+    monkeypatch.setattr(TiffSeriesSource, "frame_for", masked_frame_for)
+    qapp, page, lifecycle, executor, output = lv_support._standard_page(
+        monkeypatch, tmp_path, labels=tuple(range(1, 19)), mask=None
     )
     shell, controller = lv_support._mounted(page)
     try:
         lv_support._wait(
             qapp, lambda: shell.run_controls.startButton.isEnabled()
         )
+        _disable_value_mask(qapp, shell)
         shell.run_controls.startButton.click()
-        lv_support._wait(qapp, lambda: lifecycle.phase.value == "idle")
+        lv_support._completed_acquisition(qapp, page, lifecycle, executor)
         live = shell.scientific.raw.image.image
         assert live is not None and np.isnan(live[0, 1])
 
@@ -241,11 +235,17 @@ def test_historical_dense_integer_raw_keeps_native_mask_policy(
     with h5py.File(master, "w") as handle:
         handle.create_dataset("entry/data/data", data=raw)
 
-    processed = tmp_path / f"processed_{np.dtype(dtype).name}.nxs"
-    with h5py.File(processed, "w") as handle:
-        source = handle.create_group("entry/frames/frame_0001/source")
-        source.create_dataset("path", data=np.bytes_(str(master).encode()))
-        source.create_dataset("frame_index", data=0)
+    processed = tmp_path / f"processed_{np.dtype(dtype).name}.nexus"
+    sink = NexusSink(processed, overwrite=True, atomic=False)
+    sink.begin(Scan("native-dtype", []), ReductionPlan(integration_2d=None))
+    sink.write(
+        ScanFrame(1, source_path=master, source_frame_index=0),
+        FrameReduction(1, result_1d=IntegrationResult1D(
+            radial=np.linspace(0.1, 1.0, 8), intensity=np.ones(8),
+            sigma=None, unit="q_A^-1",
+        )),
+    )
+    sink.finish(ReductionResult("native-dtype", {}, 1))
 
     loaded = load_processed_raw_or_thumbnail(
         processed, 1, preserve_raw_dtype=True
@@ -260,22 +260,28 @@ def test_historical_dense_integer_raw_keeps_native_mask_policy(
     assert np.isnan(projected[0, :2]).all()
 
 
+def _disable_value_mask(qapp, shell) -> None:
+    threshold = next(
+        row for row in shell.controls.findChildren(RangeRow)
+        if tuple(row._low_path) == THRESHOLD_MIN
+    )
+    assert threshold._toggle[1].isChecked()
+    threshold._toggle[1].click()
+    lv_support._wait(qapp, lambda: shell.run_controls.startButton.isEnabled())
+
+
 def test_static_mask_and_value_toggle_off_remain_exact_after_hydration(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
-    real_build = executor_module.build_native_int_reduction_plan_from_args
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "16")
     static_mask = np.zeros((2, 4), dtype=bool)
     static_mask[0, 0] = True
 
-    def write_saturated(path):
+    def write_saturated(path, *, offset=0):
         image = np.zeros((2, 4), dtype=np.uint16)
         image[0, 1] = np.iinfo(np.uint16).max
         fabio.tifimage.TifImage(data=image).write(str(path))
-
-    def build(*args, **kwargs):
-        return replace(real_build(*args, **kwargs), mask_saturation=False)
 
     from xrd_tools.io import frame_preview as preview_module
 
@@ -288,16 +294,11 @@ def test_static_mask_and_value_toggle_off_remain_exact_after_hydration(
         return loaded
 
     monkeypatch.setattr(lv_support, "_write_tiff", write_saturated)
-    monkeypatch.setattr(
-        executor_module,
-        "build_native_int_reduction_plan_from_args",
-        build,
-    )
     monkeypatch.setattr(preview_module, "read_image", traced_loader)
-    qapp, page, lifecycle, _executor, _output = lv_support._standard_page(
+    qapp, page, lifecycle, executor, _output = lv_support._standard_page(
         monkeypatch,
         tmp_path,
-        labels=tuple(range(1, 11)),
+        labels=tuple(range(1, 19)),
         mask=static_mask,
     )
     shell, controller = lv_support._mounted(page)
@@ -305,8 +306,9 @@ def test_static_mask_and_value_toggle_off_remain_exact_after_hydration(
         lv_support._wait(
             qapp, lambda: shell.run_controls.startButton.isEnabled()
         )
+        _disable_value_mask(qapp, shell)
         shell.run_controls.startButton.click()
-        lv_support._wait(qapp, lambda: lifecycle.phase.value == "idle")
+        lv_support._completed_acquisition(qapp, page, lifecycle, executor)
         first = next(
             frame
             for frame in controller.frame_keys
@@ -339,9 +341,9 @@ def test_public_close_retries_the_exact_context_identity(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("XDART_HEAVY_WINDOW", "8")
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "16")
     qapp, page, lifecycle, executor, _output = lv_support._standard_page(
-        monkeypatch, tmp_path, labels=tuple(range(1, 11)), mask=None
+        monkeypatch, tmp_path, labels=tuple(range(1, 19)), mask=None
     )
     shell, controller = lv_support._mounted(page)
     from xdart.gui.tabs.scattering import hydration_transport
@@ -355,9 +357,6 @@ def test_public_close_retries_the_exact_context_identity(
         assert release.wait(5.0)
         return real_reader(read_key, **kwargs)
 
-    monkeypatch.setattr(
-        hydration_transport, "read_frame_preview", latched_reader
-    )
     executor._join_timeout = 0.01
     worker = None
     try:
@@ -365,7 +364,10 @@ def test_public_close_retries_the_exact_context_identity(
             qapp, lambda: shell.run_controls.startButton.isEnabled()
         )
         shell.run_controls.startButton.click()
-        lv_support._wait(qapp, lambda: lifecycle.phase.value == "idle")
+        lv_support._completed_acquisition(qapp, page, lifecycle, executor)
+        monkeypatch.setattr(
+            hydration_transport, "read_frame_preview", latched_reader
+        )
         identity = controller.run_identity
         assert identity is not None
         run = executor._exact_run(identity)

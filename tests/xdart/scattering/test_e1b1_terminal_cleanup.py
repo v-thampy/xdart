@@ -4,7 +4,6 @@ from pathlib import Path
 import os
 from threading import Event, Thread
 import time
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -39,48 +38,41 @@ from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
 from tests.xdart.scattering._admission import ImmediateAdmission, install_admission
 
 
-class _OneFrameScan:
-    name = "Standard"
-    frames = (SimpleNamespace(index=1),)
-
-    def __len__(self) -> int:
-        return 1
-
-
-class _SuccessfulSession:
-    frames_completed = 0
-
-    def start(self) -> None:
-        return None
-
-    def submit(self, _frame) -> bool:
-        return False
-
-    def finish(self, **_kwargs):
-        return SimpleNamespace(
-            failed=False,
-            cancelled=False,
-            n_processed=0,
-        )
-
-    def stop(self) -> None:
-        return None
-
-
-def _identity() -> RunIdentity:
-    return RunIdentity(1, "f" * 64)
-
-
-def _run(source: object) -> _StandardRun:
-    return _StandardRun(
-        None,
-        _identity(),
-        _OneFrameScan(),
-        source,
-        _SuccessfulSession(),
-        None,
-        Path("out.nxs"),
+def _prepared_run(tmp_path, *, frame_count=1, intent=None,
+                  identity_factory=RunIdentity.from_configuration):
+    """Build the real admission and run owners without launching the worker."""
+    from tests.xdart.scattering._e2sd_support import write_poni
+    from tests.xdart.scattering.test_p1b_output_graph import (
+        _admit, _intent, _write_tiff,
     )
+    from xdart.gui.tabs.scattering.contracts import AdmissionReceipt
+
+    if intent is None:
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        raw = tmp_path / "raw_0001.tif"
+        for label in range(1, frame_count + 1):
+            _write_tiff(tmp_path / f"raw_{label:04d}.tif", label)
+        poni = tmp_path / "cal.poni"
+        write_poni(poni)
+        intent = _intent(raw, tmp_path / "processed", poni)
+    executor = StandardRunExecutor()
+    admission, capture, _token = _admit(executor, intent, request_value=1)
+    assert type(admission) is AdmissionReceipt
+    configuration = intent.freeze()
+    resources = executor._admission.transfer(admission)
+    assert resources is not None
+    executor._admission = None
+    run = _StandardRun(
+        configuration, identity_factory(configuration),
+        None, None, None, None, Path(configuration.save_path),
+        capture=capture, resources=resources,
+    )
+    run.pending_partition_count = max(1, len(admission.outputs))
+    run.total = sum(row.item.source_stamp.frame_count for row in admission.outputs)
+    run.display.set_factories(executor_module.FrameRecordStore, executor_module.PublicationStore)
+    run.display.bind_transport(event_sink=executor._events.put)
+    executor._active = run
+    return executor, run, admission
 
 
 def _terminal(executor: StandardRunExecutor) -> StandardRunEvent:
@@ -98,18 +90,18 @@ def _terminal(executor: StandardRunExecutor) -> StandardRunEvent:
     raise AssertionError("executor did not publish a terminal receipt")
 
 
-def test_terminal_event_is_not_visible_before_source_cleanup_completes() -> None:
+def test_terminal_event_is_not_visible_before_source_cleanup_completes(
+    tmp_path, monkeypatch,
+) -> None:
     entered = Event()
     release = Event()
 
-    class BlockingSource:
-        def close(self) -> None:
-            entered.set()
-            assert release.wait(5)
-
-    executor = StandardRunExecutor()
-    run = _run(BlockingSource())
-    executor._active = run
+    from xrd_tools.sources.image import TiffSeriesSource
+    executor, run, _admission = _prepared_run(tmp_path)
+    def close_source(self):
+        entered.set()
+        assert release.wait(5)
+    monkeypatch.setattr(TiffSeriesSource, "close", close_source, raising=False)
     worker = Thread(target=executor._run, args=(run,))
     run.worker = worker
     worker.start()
@@ -120,25 +112,32 @@ def test_terminal_event_is_not_visible_before_source_cleanup_completes() -> None
         release.set()
         worker.join(5)
 
-    assert premature == ()
+    assert not any(event.kind in {
+        StandardEventKind.FINISHED, StandardEventKind.STOPPED,
+        StandardEventKind.FAILED,
+    } for event in premature)
     terminal = executor.drain_events()
     assert [event.kind for event in terminal] == [StandardEventKind.FINISHED]
+    assert terminal[0].completed == terminal[0].total == 1
+    assert executor.close(run.identity).cleanup_status is CleanupStatus.CLEANED
 
 
-def test_cleanup_failure_cannot_publish_false_finished() -> None:
-    class FailingSource:
-        def close(self) -> None:
-            raise RuntimeError("source close failed")
-
-    executor = StandardRunExecutor()
-    run = _run(FailingSource())
-    executor._active = run
+def test_cleanup_failure_cannot_publish_false_finished(tmp_path, monkeypatch) -> None:
+    from xrd_tools.sources.image import TiffSeriesSource
+    executor, run, _admission = _prepared_run(tmp_path)
+    def close_source(self):
+        raise RuntimeError("source close failed")
+    monkeypatch.setattr(TiffSeriesSource, "close", close_source, raising=False)
 
     executor._run(run)
 
-    terminal = executor.drain_events()
+    terminal = tuple(event for event in executor.drain_events()
+                     if event.kind in {StandardEventKind.FINISHED, StandardEventKind.FAILED})
     assert [event.kind for event in terminal] == [StandardEventKind.FAILED]
     assert "source close failed" in terminal[0].detail
+    assert terminal[0].cleanup_status is CleanupStatus.CLEANUP_PENDING
+    monkeypatch.setattr(TiffSeriesSource, "close", lambda self: None)
+    assert executor.close(run.identity).cleanup_status is CleanupStatus.CLEANED
 
 
 def test_construct_cleanup_failure_is_not_reported_cleaned(

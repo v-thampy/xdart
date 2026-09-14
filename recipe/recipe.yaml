@@ -64,7 +64,7 @@ requirements:
   run:
     - python >=${{ python_min }}
     # headless core — conda-forge fast I/O stack
-    - numpy
+    - numpy ==2.5.1               # match the XU numerical runtime contract
     - scipy
     - pandas
     - xarray
@@ -94,7 +94,7 @@ requirements:
     # ([fitting] + [rsm] extras; this package IS the full GUI).
     - lmfit                       # Peak / Phase Fitting
     - pymatgen                    # Phase Fitting (CIF / structure)
-    - xrayutilities               # Grazing/GI corrections + RSM geometry/gridding
+    - xrayutilities ==1.7.12      # match the [rsm] dependency and runtime contract
     - pyevtk                      # RSM VTK export
 
 tests:

@@ -1,0 +1,32 @@
+{
+  "engine": "xrayutilities",
+  "qconv_sample_axes": [
+    "x+",
+    "z-",
+    "y+",
+    "z-"
+  ],
+  "qconv_detector_axes": [
+    "x+",
+    "z-"
+  ],
+  "camera_or": [
+    "x-",
+    "z+"
+  ],
+  "Nch": [
+    195,
+    1475
+  ],
+  "pixel_mm": 0.17200000000000001,
+  "cch1": 221.15181086235674,
+  "cch2": 236.07225464050265,
+  "distance_mm": 389.5873766184827,
+  "del_offset_deg": 3.0181548880548474,
+  "nu_offset_deg": 1.1605834905734176,
+  "energy_eV": 17000.018,
+  "wavelength_A": 0.7293180395456053,
+  "control_points_dir": "data/LaB6_Calibration_Poni_and_Data",
+  "n_control_frames": 9,
+  "full_stitch_peak_over_median": 62.7
+}

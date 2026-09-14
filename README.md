@@ -3,39 +3,73 @@
 <!-- After the repo is pushed, point the badge at the real org/name:
 [![PR checks](https://github.com/<org>/xdart/actions/workflows/pr.yml/badge.svg)](https://github.com/<org>/xdart/actions/workflows/pr.yml) -->
 
-**SSRL X-ray diffraction toolkit — one distribution, two import packages.**
+**X-ray diffraction processing and analysis, from live acquisition to notebooks.**
 
-`xdart` is the merged successor to the former
-`ssrl_xrd_tools` (the headless reduction + I/O library) and `xdart` (the
-real-time Qt GUI). It ships **two import packages** from one wheel:
-
-- **`xrd_tools`** — the headless XRD reduction + I/O core. Imports **no
-  Qt / pyqtgraph**; fully usable from scripts, Jupyter notebooks, and
-  automated batch pipelines at the beamline or in the lab. Built on
-  [pyFAI](https://pyfai.readthedocs.io/) for azimuthal integration with added
-  support for grazing incidence, multi-geometry stitching, reciprocal-space
-  mapping, peak/phase/strain fitting, and a streaming reduction spine.
-- **`xdart`** — the PySide6 + pyqtgraph desktop GUI for real-time and batch
-  analysis. A thin consumer of `xrd_tools`.
+**xdart** is a desktop application for real-time and batch X-ray diffraction
+analysis. It uses [pyFAI](https://pyfai.readthedocs.io/) for azimuthal integration,
+the [pyFAI fiber module](https://pyfai.readthedocs.io/en/latest/api/pyFAI.html#module-pyFAI.integrator.fiber)
+for grazing-incidence processing, and
+[xrayutilities](https://xrayutilities.sourceforge.io/) for stitching and
+reciprocal-space mapping.
 
 The Scattering Workspace brings integration, processed-data browsing, 1D/2D
-viewers, and notebook export into one window. It supports NeXus output or
-lightweight XYE output, per-frame intensity thresholds, and Standard or
-Grazing-incidence geometry.
+viewers, and notebook export into one window. It supports NeXus and XYE output,
+with stitching and reciprocal-space mapping (RSM) coming soon to the GUI.
 
-The two former repositories were merged **with full git histories**
-(`git log --follow` works across the boundary); see
-[`MIGRATION.md`](https://github.com/v-thampy/xdart/blob/main/MIGRATION.md).
-The old `ssrl_xrd_tools` import name still
-works as a **deprecation shim** that re-exports the real `xrd_tools` modules
-— update imports to `xrd_tools` at your convenience.
+![xdart Scattering Workspace displaying a detector image, a 2D diffraction map, and an integrated 1D pattern](docs/assets/xdart-workspace.png)
+
+xdart's processing and analysis functions are also available through
+**`xrd_tools`**, its headless Python core, for scripts, Jupyter notebooks, and
+automated batch pipelines without Qt. The
+[example notebooks](examples/notebooks/README.md) cover integration,
+grazing incidence, stitching, reciprocal-space mapping, peak/phase/strain
+fitting, and analysis of processed results.
 
 ---
 
-## Contents
+<a id="install"></a>
 
-- [Install](#install)
+## Quick start
+
+1. **[Install Pixi](https://pixi.sh/latest/installation/)**, then open a new
+   terminal. You do not need to install Python or conda separately.
+
+2. **Install xdart:**
+
+   ```bash
+   pixi global install -c https://prefix.dev/xrd-tools -c conda-forge xdart
+   ```
+
+3. **Launch xdart** by clicking its app/shortcut in Applications (macOS), the
+   Start menu (Windows), or the application menu (Linux). Or run:
+
+   ```bash
+   xdart
+   ```
+
+To update later, close xdart and run `pixi global update xdart`.
+
+[Alternate installation methods and more details](docs/INSTALLATION.md)
+
+For Python scripts and Jupyter, start with the
+[headless integration notebook](examples/notebooks/06_headless_reduction_pipeline.ipynb).
+The [notebook gallery](examples/notebooks/README.md) has more `xrd_tools` API
+examples for processing, plotting, and analysis.
+
+<details>
+<summary>Contents</summary>
+
+- [Quick start](#quick-start)
+- [The GUI (`xdart`)](#the-gui-xdart)
+  - [Launching xdart](#launching-xdart)
+  - [Key capabilities](#key-capabilities)
+  - [GUI quick start](#gui-quick-start)
+  - [Usage guide](#usage-guide)
+  - [Analyze Results notebooks](#analyze-results-notebooks)
+  - [Configuration & calibration](#configuration--calibration)
+  - [Troubleshooting](#troubleshooting)
 - [Headless quick start (`xrd_tools`)](#headless-quick-start-xrd_tools)
+  - [Notebook examples](#notebook-examples)
 - [Library features](#library-features)
 - [Headless API guide](#headless-api-guide)
   - [Basic integration](#basic-integration)
@@ -46,14 +80,6 @@ works as a **deprecation shim** that re-exports the real `xrd_tools` modules
   - [Reading processed scan files](#reading-processed-scan-files)
   - [Peak & phase fitting](#peak--phase-fitting)
 - [Intensity corrections](#intensity-corrections)
-- [The GUI (`xdart`)](#the-gui-xdart)
-  - [Key capabilities](#key-capabilities)
-  - [GUI quick start](#gui-quick-start)
-  - [Usage guide](#usage-guide)
-  - [Analyze Results notebooks](#analyze-results-notebooks)
-  - [Configuration & calibration](#configuration--calibration)
-  - [Troubleshooting](#troubleshooting)
-- [Module architecture](#module-architecture)
 - [Development](#development)
 - [Contributing](#contributing)
 - [License](#license)
@@ -61,275 +87,308 @@ works as a **deprecation shim** that re-exports the real `xrd_tools` modules
 - [Acknowledgments](#acknowledgments)
 - [Contact](#contact)
 
+</details>
+
 ---
 
-## Install
+## The GUI (`xdart`)
 
-### Quick install — `pixi global` (recommended)
+### Launching xdart
 
-[pixi](https://pixi.sh) is a fast, self-contained package manager — no conda or
-Python needed first. **Install pixi once** ([more install options](https://pixi.sh/latest/)):
-
-```bash
-# macOS / Linux
-curl -fsSL https://pixi.sh/install.sh | sh
-```
-
-```powershell
-# Windows (PowerShell) — or: winget install prefix-dev.pixi
-powershell -ExecutionPolicy Bypass -c "irm -useb https://pixi.sh/install.ps1 | iex"
-```
-
-Open a new terminal so `~/.pixi/bin` is on your PATH, then **one command** installs
-xdart, puts it on your PATH, and adds a Start-menu / Applications shortcut — with
-the conda-forge I/O stack (`h5py`, `hdf5plugin`, HDF5, Blosc, c-blosc2,
-and lz4-c):
+After a Pixi global installation, click the **xdart app/shortcut** in your
+Applications folder (macOS), Start menu (Windows), or application menu (Linux).
+Alternatively, launch it from a terminal:
 
 ```bash
-pixi global install -c https://prefix.dev/xrd-tools -c conda-forge xdart
-```
-
-Launch with `xdart` (or the shortcut). These same commands work for a normal
-Windows installation; Git and an editable checkout are only needed for development.
-
-These commands install the latest **published release**. To use the current
-source or work on xdart, use the [editable Pixi install](#editable-install-with-pixi-recommended)
-below; it also keeps the native HDF5/compression libraries on conda-forge.
-
-### Updating an existing installation
-
-For an existing **Pixi global** install on macOS, Linux, or Windows, close xdart
-and run these commands from any directory:
-
-```bash
-pixi global list
-pixi global update xdart
 xdart
 ```
 
-`pixi global list` shows which environments are installed globally. The update
-command upgrades the existing `xdart` environment; a fresh editable install is
-not needed. See the [Pixi global update reference](https://pixi.sh/latest/reference/cli/pixi/global/update/).
+For an editable Pixi installation, run `pixi run --locked xdart` from its
+workspace instead.
 
-A release becomes available after the maintainer pushes its version tag **and
-the package publication workflows succeed**. A commit on `main`, or a local tag,
-does not update the published package. Pixi global installs use the conda channel;
-the installer scripts below use PyPI. If an install was pinned to an older
-version, its version constraint must also be updated.
+xdart is a pyFAI-based desktop GUI for real-time azimuthal integration and
+visualization of synchrotron X-ray diffraction data, built with PySide6 and
+pyqtgraph for high-performance interactive plotting. Live **and** batch
+acquisition stream through the **same** headless reduction spine (parallel
+pyFAI workers and a single writer). The GUI displays completed results from
+the saved NeXus or XYE output.
 
-The **one-line installer** creates a private Pixi workspace, so it is updated
-separately from global environments. Use **Help → Check for Updates…**, or close
-xdart and update the workspace directly (default installation paths shown):
+### Key capabilities
+
+- **Real-time 1D/2D azimuthal integration** using pyFAI.
+- **Batch processing** of image series with parallel multicore support.
+- **Grazing-incidence diffraction (GID)** integration using pyFAI
+  `FiberIntegrator`.
+- **Live monitoring** of ongoing experiments with directory-watched file
+  ingestion.
+- **NeXus/HDF5 data format** with full metadata preservation; portable
+  Project-Folder relative-path storage.
+- **Interactive 2D detector-image visualization** with zoom, pan, and masking.
+- **Unit conversion** between Q (Å⁻¹) and 2θ (°) with wavelength awareness.
+- **Background subtraction** (single file, series average, or
+  directory-matched).
+- **Masking tools** for bad pixels, beamstop shadows, and detector edges.
+- **Calibration management** via PONI files with visual feedback.
+- **Raw-image preview thumbnails** for quick file browsing.
+- **Automatic metadata discovery** — the Meta Type selector defaults to `auto`:
+  per-image sidecar metadata (`.txt`, `.pdi`, QXRD-style
+  `image.tif.metadata`, and other structured name=value sidecars) is found and
+  parsed automatically; choose `none` to disable or `spec` for SPEC files.
+- **Overlay / Waterfall comparison across scans** — overlay 1D patterns and
+  slice cuts from multiple frames, and **pin** the current slice cut (Cmd+P)
+  to keep it on the plot for comparison; the overlay survives compatible scan
+  boundaries, so cuts from successive scans (e.g. a chi-texture series) can be
+  compared directly.
+
+### GUI quick start
+
+**Basic workflow:**
+
+1. **Launch xdart** and wait for the main window to open.
+2. **Set calibration**: browse and select your PONI calibration file in the
+   right panel.
+3. **Select data**: choose an image file or directory containing images.
+4. **Choose processing mode**: **Int 1D**, **Int 2D**, or **Int 1D (XYE)** in
+   the dropdown beside Run. Set the Project folder and Save Path for output.
+5. **Configure parameters**: choose axes, point counts, background subtraction,
+   the global mask, and intensity thresholds as needed. **Batch** suppresses
+   intermediate plot updates for faster processing.
+6. **Click Run**: processing begins; monitor progress and view results in
+   real time.
+
+### Usage guide
+
+#### Processing and viewing modes
+
+| Mode | Purpose |
+| --- | --- |
+| **Int 1D** | Integrate 1D patterns and save a processed `.nexus` file. |
+| **Int 2D** | Integrate 1D patterns and 2D maps into a processed `.nexus` file. |
+| **Int 1D (XYE)** | Save individual text patterns containing axis, intensity, and uncertainty; browse them with the 1D viewer after completion. |
+| **Stitch 1D**, **Stitch 2D**, **RSM** | Specialized analysis entries; Stitch 2D is currently disabled in the GUI. |
+| **1D Viewer** | Browse XYE and other supported 1D data without integrating. |
+| **2D Viewer** | Browse raw detector images or the raw images associated with processed NeXus files. |
+
+**Batch** is a separate performance toggle: it suppresses intermediate plots
+and displays the saved result after completion. Set **Cores** to control worker
+parallelism. Image Series reads frames from a selected source; Image Directory
+adds file-type, metadata-type, filter, and subdirectory controls.
+
+#### Append vs Replace
+
+The write-mode toggle (Cmd+Shift+A) controls whether a run **appends** new
+frames to the existing processed `.nexus` or **replaces** it. Re-running Append
+on an already-processed scan is near-instant: frames already in the output are
+skipped. Use Append to continue a stopped NeXus run with compatible settings;
+use Replace to reprocess after changing the integration configuration.
+Append is not available for **Int 1D (XYE)**.
+
+#### Live acquisition
+
+Monitor a directory for new image files and integrate them as they arrive —
+real-time feedback during an active beamline experiment.
+
+1. Set the PONI file and image directory.
+2. Choose Int 1D or Int 2D and enable Live acquisition.
+3. Click Run.
+4. xdart watches the directory and processes new files automatically.
+
+The **Run** button becomes **Pause / Resume** during processing; **Stop** ends
+the run and closes its output.
+
+#### Keyboard shortcuts
+
+Use Cmd on macOS and Ctrl on Linux/Windows:
+
+- **Cmd+R** — Run / Pause / Resume the current processing run.
+- **Cmd+Shift+C** — Stop the run.
+- **Cmd+Shift+A** — toggle the write mode between Append and Replace.
+- **Cmd+P** — pin the current slice cut (adds it to the Overlay).
+- **Cmd+O** / **Cmd+S** — load / save the xdart settings (Config).
+
+#### Browsing and comparison
+
+Select a file in **Scans**, then navigate its **Frames** with the mouse or arrow
+keys. **Single** follows the current selection; modifier keys select several
+patterns for comparison. Dense selections are displayed as a waterfall.
+**Overlay** retains patterns as you navigate, while the browser highlights the
+current selection. Use **Clear** to reset the comparison.
+
+The **Open Selected in NeXpy** button opens the selected processed file in
+[NeXpy](https://nexpy.github.io/nexpy/) for further NeXus data exploration.
+The **silx HDF5 Viewer** button launches
+[silx view](https://silx.readthedocs.io/en/stable/applications/view.html) to browse
+HDF5 datasets, images, and metadata. Both viewers are included with the GUI
+installation. Processed files may reference their original raw images: retain
+those images when moving a project.
+
+#### Integration axes and units
+
+The 1D integration panel's axis dropdown offers:
+
+- **Q (Å⁻¹)**: scattering-vector magnitude; independent of wavelength.
+- **2θ (°)**: scattering angle; depends on the wavelength in your PONI file.
+
+The 2D integration panel offers:
+
+- **Q-χ**: radial-azimuthal in reciprocal space.
+- **2θ-χ**: radial-azimuthal in angle space.
+
+Unit conversion respects your calibration file's wavelength automatically.
+
+#### Grazing-incidence diffraction (GID)
+
+For surface-sensitive measurements, xdart supports grazing-incidence geometry
+using pyFAI's `FiberIntegrator`:
+
+1. Select **Experiment → Configuration → Grazing**.
+2. Choose the incidence-angle motor or a manual angle using the **θ motor**
+   controls. Use Advanced settings for sample orientation when needed.
+3. The integrator panel switches to GI-specific modes:
+   - **1D modes**: Qip (in-plane), Qoop (out-of-plane), Q-total.
+   - **2D modes**: Qip-Qoop, Q-χ.
+4. Process as normal; output reflects the rotated reciprocal-space axes.
+
+#### Advanced integration settings
+
+Click **Advanced** in the Processing panel for detailed pyFAI
+parameters:
+
+- **Solid-angle correction**: account for detector solid-angle variations.
+- **Dummy values**: mark pixels to ignore in integration.
+- **Polarization factor**: apply polarization correction for synchrotron
+  radiation.
+- **Integration method**: choose the algorithm (e.g. histogram, csr,
+  full-split).
+- **Radial range**: manually clip the Q or 2θ range (overrides auto-detection).
+- **Azimuthal range**: select only certain χ sectors.
+
+#### Intensity thresholds and the global mask
+
+The **Threshold** control replaces the separate Mask Saturated button. When
+enabled, it accepts the inclusive intensity range on **each frame**. Its automatic
+range starts at zero and ends one count below the detector/data-type saturation
+limit: for uint16 data, **0–65,534** excludes every pixel at **65,535**. The limit
+is determined once from the native detector/data type, not from the brightest
+pixel in each image.
+
+Edit the bounds to reject a different intensity range; clearing the upper bound
+restores automatic saturation rejection. With Threshold disabled, finite pixels
+are retained regardless of saturation or intensity. Nonfinite values are still
+invalid. The **global mask file is always honored**, whether Threshold is on or
+off, and Threshold also works when no mask file is specified.
+
+#### Background subtraction
+
+Configure in **Processing → Background**:
+
+- **No background**: raw data only.
+- **Single file**: subtract a single dark image.
+- **Series average**: average all images in a background directory, then
+  subtract.
+- **Directory-matched**: match each sample image to a background image by
+  filename pattern.
+
+Background frames are integrated with the same parameters as sample frames for
+consistency.
+
+#### Calibration and masking
+
+The integrator panel includes **Calibrate** and **Make Mask** buttons:
+
+- **Calibrate** launches the pyFAI-calib2 module for interactive detector
+  calibration. Use a calibration standard (e.g. LaB6, CeO2) to refine detector
+  geometry and generate a PONI file.
+- **Make Mask** launches the pyFAI mask-drawing tool to interactively draw
+  regions on a detector image and create/edit a bad-pixel mask.
+
+Load the static mask under **Experiment → Detector → Mask File**. Use
+**Processing → Conditioning → Threshold** for dynamic, per-frame intensity
+rejection.
+
+#### Data export and saving
+
+- **Int 1D / Int 2D** save processed NeXus files under the Project Save Path.
+- **Int 1D (XYE)** saves text patterns in a scan-specific output directory.
+- NeXus output carries processing metadata and calibration information for
+  subsequent analysis.
+
+### Analyze Results notebooks
+
+After a run, choose **Help → Export Analyze Results Notebook…** to save a Jupyter
+notebook for the selected processed NeXus file or XYE results. It includes the
+output paths, loading code, metadata access, and example plots using `xrd_tools`.
+Data is loaded on demand; exporting the notebook does not rerun the integration
+or copy the data files.
+
+Open it in an environment with `xdart[notebook]`, such as the
+[notebook Pixi workspace](docs/INSTALLATION.md#headless--notebooks-with-pixi) or
+[editable install](docs/INSTALLATION.md#editable-install-with-pixi-recommended),
+and run `pixi run jupyter lab`. If you move the results, update the paths
+in the notebook before running its cells.
+
+### Configuration & calibration
+
+#### PONI files
+
+xdart uses pyFAI PONI (PyFAI Object Containing Necessary Information) files for
+detector calibration. A PONI file contains:
+
+- detector geometry (pixel size, shape, name),
+- incident-beam center location,
+- sample-to-detector distance,
+- wavelength,
+- detector rotation (if any).
+
+Generate a PONI file with the **Calibrate** button in xdart's integrator panel
+(which launches pyFAI-calib2), or from the command line:
 
 ```bash
-# macOS / Linux
-~/.local/share/xdart/pixi/bin/pixi update --manifest-path ~/.local/share/xdart/pixi.toml
+pyFAI-calib2
 ```
 
-```powershell
-# Windows (PowerShell)
-& "$env:LOCALAPPDATA\xdart\pixi\bin\pixi.exe" update --manifest-path "$env:LOCALAPPDATA\xdart\pixi.toml"
-```
+Refer to the pyFAI documentation for detailed calibration procedures.
 
-For an **editable checkout**, update the Git checkout and install its checked-in
-lockfile; see [Development](#editable-install-with-pixi-recommended).
+### Troubleshooting
 
-### One-line installer script (no conda or pixi needed)
-
-Installs everything — Python, the fast HDF5/compression stack, and xdart — in one
-step, into its own folder, without touching any existing Python or conda setup.
+**pyFAI installation fails on macOS/Windows:**
+Install via conda instead of pip; conda packages include pre-built binaries.
 
 ```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/v-thampy/xdart/main/scripts/install_xdart.sh | bash
+conda install -c conda-forge pyfai
 ```
 
-```powershell
-# Windows (PowerShell)
-powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/v-thampy/xdart/main/scripts/install_xdart.ps1 | iex"
-```
-
-- **Needs nothing preinstalled** — no conda, no Python. It bootstraps a
-  self-contained [pixi](https://pixi.sh) workspace under `~/.local/share/xdart`
-  (`%LOCALAPPDATA%\xdart` on Windows) and never edits your shell config or an
-  existing conda install.
-- **Fast by construction** — it uses the conda-forge builds of the HDF5/compression
-  stack (the fastest Eiger bitshuffle/LZ4 decode) plus `xdart[gui]` from PyPI,
-  resolved in one solve with a lockfile. This is the same layering the manual
-  conda steps below do — only assembled for you.
-- **Launch** with `xdart`. **Upgrade** using the private-workspace instructions above.
-- **Extras**: set `XDART_EXTRAS` before the command, e.g.
-  `curl -fsSL … | XDART_EXTRAS="gui,notebook" bash` on macOS/Linux.
-- If `xdart` launches an old version, run `hash -r` (or open a new terminal) — the
-  installer prints the specifics when it detects a shadowing install.
-
-### Using conda / mamba
-
-The classic path: a **fresh conda environment** with the conda-forge compiled I/O
-stack, plus `xdart` from PyPI. No conda yet? Install one first (pick either):
-
-- **[Miniforge](https://github.com/conda-forge/miniforge)** — recommended;
-  conda-forge by default, smaller, ships `mamba`.
-- **[Miniconda](https://www.anaconda.com/download/success)** — Anaconda's minimal
-  distribution.
-
-On Windows, open the "Miniforge Prompt" / "Anaconda Prompt" the installer created;
-on macOS / Linux, open a regular terminal (the installer wires `conda`/`mamba` into
-your shell).
+**GUI doesn't appear or crashes on startup:**
+Check that PySide6 is installed and your Qt plugins are accessible:
 
 ```bash
-# 1. create + activate a fresh env (use `conda` in place of `mamba` if you prefer —
-#    mamba is just the faster solver)
-mamba create -n xrd python=3.13 -y
-mamba activate xrd
-
-# 2. the conda-forge fast I/O stack, then the xdart GUI from PyPI
-mamba install -c conda-forge h5py hdf5plugin fabio hdf5 blosc c-blosc2 lz4-c
-pip install "xdart[gui]"
+python -c "from PySide6 import QtWidgets; print('PySide6 OK')"
 ```
 
-then launch with `xdart`. (Already have an environment? Just run step 2 in it.)
+**Slow integration or freezing:**
+Ensure multicore processing is enabled, and reduce the radial resolution if
+working with very large detectors.
 
-### Using pip / uv
+**PONI file not recognized:**
+Verify the PONI file is text-based `key=value` pairs and that paths are
+absolute or relative to the working directory.
 
-Requires **Python ≥ 3.13**. Python **3.13** is the default used by the Pixi
-workspaces, installer scripts, and CI. `xdart` is a normal PyPI package:
+**Memory use on a low-RAM machine:**
+Lower **Cores** to reduce simultaneous raw-frame and integration buffers.
+Processed-data browsing loads image data on demand; the frame count alone does
+not determine how many full detector images remain resident.
 
-```bash
-pip install "xdart[gui]"          # the xdart GUI + reduction core
-uv tool install "xdart[gui]"      # isolated GUI install
-```
-
-then launch with `xdart`. Note the Eiger bitshuffle/LZ4 decode is measurably slower
-with the pure-pip HDF5 wheels than the conda-forge builds
-([see below](#performance-install-the-hdf5-stack-from-conda-forge)), and
-lz4-compressed outputs need `hdf5plugin` (a base dep) to read outside xdart.
-
-The GUI installation includes **NeXpy** for opening the selected processed
-NeXus file and **silx view** for general HDF5 browsing. Both run in separate
-windows using the same installed environment; no extra viewer environment is
-needed. Use the buttons below the Data Browser. Advanced executable overrides
-are `XDART_NEXPY_EXECUTABLE` and `XDART_SILX_EXECUTABLE` (absolute executable
-paths, not shell commands).
-
-**Headless core only** (no Qt anywhere, `import xrd_tools`):
-
-```bash
-pip install xdart
-```
-
-> **Upgrading from the old `xdart` / `ssrl_xrd_tools`?** Uninstall the legacy
-> packages first so their entry points and shims don't shadow `xdart`:
->
-> ```bash
-> pip uninstall -y xdart ssrl_xrd_tools
-> ```
->
-> Then install `xdart` as above. See
-> [`MIGRATION.md`](https://github.com/v-thampy/xdart/blob/main/MIGRATION.md)
-> for the full import-name migration.
-
-### Headless / notebooks with pixi
-
-For notebook analysis or batch scripts, a pixi workspace gives you the same fast
-stack **plus a lockfile** that makes the environment reproducible — a drop-in
-replacement for a per-project conda/mamba env. Existing conda envs keep working;
-this is an option, not a migration.
-
-```bash
-mkdir my-analysis && cd my-analysis
-pixi init -c conda-forge
-pixi add python=3.13 h5py hdf5plugin fabio hdf5 blosc c-blosc2 lz4-c jupyterlab
-pixi add --pypi "xdart[notebook,fitting]"
-pixi run jupyter lab
-```
-
-- The env lives in `./.pixi/` next to the notebooks; commit `pixi.toml` +
-  `pixi.lock` and anyone (including future-you) reproduces the exact env with one
-  `pixi install`.
-- Add `[rsm]` via conda where possible — `pixi add xrayutilities` (conda-forge)
-  avoids the missing macOS-arm64 PyPI wheels.
-- `pixi run python script.py` runs a headless batch script; `pixi shell` in the
-  workspace is the equivalent of `conda activate`.
-
-**Shared beamline environment (VS Code).** A pixi env is a normal prefix
-(`<workspace>/.pixi/envs/default/bin/python`), so the one-shared-env /
-many-user-directories pattern maps 1:1. Put **one** pixi workspace at a shared path
-(e.g. `/shared/xrd-env/` — its `pixi.toml`, `pixi.lock`, and `.pixi/`); users open
-their own notebook folders in VS Code and select that env's `bin/python` as the
-interpreter/kernel (VS Code auto-discovers pixi envs; "Enter interpreter path"
-always works). Register it by name once so it appears in every kernel picker:
-
-```bash
-cd /shared/xrd-env && pixi run python -m ipykernel install --prefix /usr/local \
-    --name xdart --display-name "XRD Tools (shared)"
-```
-
-Admins update the shared env with `pixi update` in that directory; the lockfile
-rebuilds it identically on a new machine (`pixi install`).
-
-### Extras
-
-The base install is **headless / scriptable** (`core`, `io`, `integrate`,
-`viz`). Domain-specific features live behind [PEP 621
-extras](https://peps.python.org/pep-0621/) so the dependency footprint stays
-modest for batch / pipeline / CI use:
-
-| Extra        | What it enables                                          | Packages                                                    |
-| ------------ | -------------------------------------------------------- | ----------------------------------------------------------- |
-| *(base)*     | `core`, `io`, `integrate`, `viz` — headless / batch      | numpy, scipy, pandas, xarray, h5py, hdf5plugin, nexusformat, fabio, silx, pyFAI, pyyaml, joblib, natsort, matplotlib, plotly |
-| `[gui]`      | the `xdart` desktop GUI **+ its analysis tools and external viewers** (bundles `[fitting]` + `[rsm]`) | PySide6, pyqtgraph, qtawesome, imagecodecs, imageio, lmfit, pymatgen, xrayutilities, pyevtk, nexpy (silx already in base) |
-| `[fitting]`  | `analysis.fitting.*` — peak / phase / strain fitting     | lmfit, pymatgen                                             |
-| `[rsm]`      | `rsm.*` — reciprocal-space mapping, VTK export           | xrayutilities, pyevtk                                       |
-| `[notebook]` | self-contained Jupyter environment                       | ipywidgets, anywidget, ipyfilechooser, ipykernel, ipympl, jupyterlab, nbformat |
-| `[all]`      | everything except dev                                    | `xdart[fitting,rsm,gui,notebook]`                       |
-| `[dev]`      | test / build / release tooling                           | pytest, pytest-timeout, pytest-xdist, build, twine, tifffile, imagecodecs |
-
-Extras compose. `[gui]` already bundles `[fitting]` + `[rsm]` — the GUI surfaces
-Peak/Phase Fitting and the Grazing/GI/RSM workflow — so `pip install "xdart[gui]"`
-(and the conda package) give you the **complete** GUI with no missing-dependency prompts.
-
-> **Tip — use [`uv`](https://docs.astral.sh/uv/) if you have it.** It is a
-> drop-in pip replacement that is typically 10–100× faster on cold installs.
-> With the scientific-stack dependency tree (pyFAI, h5py, silx, PySide6, …)
-> that is often the gap between a fresh-env install finishing in a few
-> seconds vs. several minutes. `pip install uv` (or `brew install uv` /
-> `winget install astral-sh.uv`), then prefix the commands with `uv `.
-
-### Performance: install the HDF5 stack from conda-forge
-
-Compressed detector data — Eiger `_master.h5` files use bitshuffle+LZ4 — is
-decompressed by the native HDF5 filter libraries, and that read is a large part
-of processing time. The pure-pip `h5py` / `hdf5plugin` wheels bundle a generic
-(non-SIMD) filter build that decompresses Eiger frames noticeably slower
-(~1.7× on Apple Silicon in our tests, e.g. a 651-frame Int-1D scan 25 s → 19 s).
-For best performance, install the HDF5 stack from **conda-forge** rather than
-pip:
-
-```bash
-conda install -c conda-forge h5py hdf5plugin fabio hdf5 blosc c-blosc2 lz4-c
-```
-
-This only affects raw-frame read speed — pyFAI integration and the writer are
-unchanged. A pure-pip install works correctly, just slower on compressed
-detector data.
-
-### Output compression (lz4 default — reading `.nexus` outside xdart)
-
-xdart writes the integrated 1D/2D stacks with **lz4+shuffle** by default (fast,
-hdf5plugin filter 32004; ~gzip-class size). **Reading those `.nexus` files requires
-`hdf5plugin`** — a base dependency, so any xdart environment reads them
-fine. To read them with **stock h5py elsewhere** (a collaborator's plain notebook,
-a third-party tool, long-term archival) either install `hdf5plugin`, or write
-portable files by setting the compression before launch:
-
-```bash
-XDART_INTEGRATED_COMPRESSION=gzip xdart   # gzip+shuffle — readable by any stock h5py
-XDART_INTEGRATED_COMPRESSION=none xdart   # uncompressed
-```
-
-(Detector module gaps and decompressed values are identical either way; only the
-on-disk filter changes.)
+**Run stops with `writer mutation incomplete: stream checkpoint failed identity
+verification`:**
+Something other than xdart touched the output file while the run was writing
+it. The writer checks the file's identity (inode, size, mtime, ctime) before
+every batch and refuses to continue if it changed; the partial output is kept
+next to the target as `.<name>.xdart-partial-*` and any previous file is
+restored. The usual cause is a sync agent (Google Drive, iCloud Drive,
+Dropbox, OneDrive) mirroring the Save Path — it hard-links or re-reads
+in-progress files for upload. Keep the Save Path outside synced folders, or
+pause syncing for the duration of the run. The refusal message names the
+observed and expected identity tuples so the changed field can be read off.
 
 ---
 
@@ -367,6 +426,20 @@ q, intensity, sigma, unit, frames = get_1d("processed/scan1.nexus")
 view = read_frame_view("processed/scan1.nexus", 0) # one frame, display-ready
 raw = get_raw_frame("processed/scan1.nexus", 0)    # resolves the source pointer
 ```
+
+### Notebook examples
+
+The [stitching notebook](examples/notebooks/02_multigeometry_stitching.ipynb)
+combines diffraction images from multiple geometries. This example uses
+deterministic demonstration data.
+
+![Jupyter notebook cell showing a stitched diffraction result from demonstration data](docs/assets/stitching-notebook.png)
+
+The [RSM notebook](examples/notebooks/09_reciprocal_space_mapping.ipynb)
+demonstrates plotting projections of a reciprocal-space volume. The screenshot
+uses a synthetic volume to illustrate the viewing tools.
+
+![Jupyter notebook cell showing projections of a synthetic reciprocal-space volume](docs/assets/rsm-notebook.png)
 
 ---
 
@@ -409,8 +482,8 @@ raw = get_raw_frame("processed/scan1.nexus", 0)    # resolves the source pointer
 
 ## Headless API guide
 
-> All examples import from `xrd_tools`. The legacy `ssrl_xrd_tools` import
-> name still resolves (deprecation shim) but is not recommended for new code.
+Use `xrd_tools` for headless processing and analysis. For complete workflows,
+see the [example notebooks](examples/notebooks/README.md).
 
 ### Basic integration
 
@@ -575,458 +648,36 @@ material selector: `examples/notebooks/02_multigeometry_stitching.ipynb`.
 
 ---
 
-## The GUI (`xdart`)
-
-```bash
-xdart
-```
-
-xdart is a pyFAI-based desktop GUI for real-time azimuthal integration and
-visualization of synchrotron X-ray diffraction data, built with PySide6 and
-pyqtgraph for high-performance interactive plotting. Live **and** batch
-acquisition stream through the **same** headless reduction spine (parallel
-pyFAI workers and a single writer). The GUI displays completed results from
-the saved NeXus or XYE output.
-
-### Key capabilities
-
-- **Real-time 1D/2D azimuthal integration** using pyFAI.
-- **Batch processing** of image series with parallel multicore support.
-- **Grazing-incidence diffraction (GID)** integration using pyFAI
-  `FiberIntegrator`.
-- **Live monitoring** of ongoing experiments with directory-watched file
-  ingestion.
-- **NeXus/HDF5 data format** with full metadata preservation; portable
-  Project-Folder relative-path storage.
-- **Interactive 2D detector-image visualization** with zoom, pan, and masking.
-- **Unit conversion** between Q (Å⁻¹) and 2θ (°) with wavelength awareness.
-- **Background subtraction** (single file, series average, or
-  directory-matched).
-- **Masking tools** for bad pixels, beamstop shadows, and detector edges.
-- **Calibration management** via PONI files with visual feedback.
-- **Raw-image preview thumbnails** for quick file browsing.
-- **Automatic metadata discovery** — the Meta Type selector defaults to `auto`:
-  per-image sidecar metadata (`.txt`, `.pdi`, QXRD-style
-  `image.tif.metadata`, and other structured name=value sidecars) is found and
-  parsed automatically; choose `none` to disable or `spec` for SPEC files.
-- **Overlay / Waterfall comparison across scans** — overlay 1D patterns and
-  slice cuts from multiple frames, and **pin** the current slice cut (Cmd+P)
-  to keep it on the plot for comparison; the overlay survives compatible scan
-  boundaries, so cuts from successive scans (e.g. a chi-texture series) can be
-  compared directly.
-
-### GUI quick start
-
-```bash
-xdart          # launch the GUI
-```
-
-Or from Python:
-
-```python
-from xdart.xdart_main import main
-main()
-```
-
-**Basic workflow:**
-
-1. **Launch xdart** and wait for the main window to open.
-2. **Set calibration**: browse and select your PONI calibration file in the
-   right panel.
-3. **Select data**: choose an image file or directory containing images.
-4. **Choose processing mode**: **Int 1D**, **Int 2D**, or **Int 1D (XYE)** in
-   the dropdown beside Run. Set the Project folder and Save Path for output.
-5. **Configure parameters**: choose axes, point counts, background subtraction,
-   the global mask, and intensity thresholds as needed. **Batch** suppresses
-   intermediate plot updates for faster processing.
-6. **Click Run**: processing begins; monitor progress and view results in
-   real time.
-
-### Usage guide
-
-#### Processing and viewing modes
-
-| Mode | Purpose |
-| --- | --- |
-| **Int 1D** | Integrate 1D patterns and save a processed `.nexus` file. |
-| **Int 2D** | Integrate 1D patterns and 2D maps into a processed `.nexus` file. |
-| **Int 1D (XYE)** | Save individual text patterns containing axis, intensity, and uncertainty; browse them with the 1D viewer after completion. |
-| **Stitch 1D**, **Stitch 2D**, **RSM** | Specialized analysis entries; Stitch 2D is currently disabled in the GUI. |
-| **1D Viewer** | Browse XYE and other supported 1D data without integrating. |
-| **2D Viewer** | Browse raw detector images or the raw images associated with processed NeXus files. |
-
-**Batch** is a separate performance toggle: it suppresses intermediate plots
-and displays the saved result after completion. Set **Cores** to control worker
-parallelism. Image Series reads frames from a selected source; Image Directory
-adds file-type, metadata-type, filter, and subdirectory controls.
-
-#### Append vs Replace
-
-The write-mode toggle (Cmd+Shift+A) controls whether a run **appends** new
-frames to the existing processed `.nexus` or **replaces** it. Re-running Append
-on an already-processed scan is near-instant: frames already in the output are
-skipped. Use Append to continue a stopped NeXus run with compatible settings;
-use Replace to reprocess after changing the integration configuration.
-Append is not available for **Int 1D (XYE)**.
-
-#### Live acquisition
-
-Monitor a directory for new image files and integrate them as they arrive —
-real-time feedback during an active beamline experiment.
-
-1. Set the PONI file and image directory.
-2. Choose Int 1D or Int 2D and enable Live acquisition.
-3. Click Run.
-4. xdart watches the directory and processes new files automatically.
-
-The **Run** button becomes **Pause / Resume** during processing; **Stop** ends
-the run and closes its output.
-
-#### Keyboard shortcuts
-
-Use Cmd on macOS and Ctrl on Linux/Windows:
-
-- **Cmd+R** — Run / Pause / Resume the current processing run.
-- **Cmd+Shift+C** — Stop the run.
-- **Cmd+Shift+A** — toggle the write mode between Append and Replace.
-- **Cmd+P** — pin the current slice cut (adds it to the Overlay).
-- **Cmd+O** / **Cmd+S** — load / save the xdart settings (Config).
-
-#### Browsing and comparison
-
-Select a file in **Scans**, then navigate its **Frames** with the mouse or arrow
-keys. **Single** follows the current selection; modifier keys select several
-patterns for comparison. Dense selections are displayed as a waterfall.
-**Overlay** retains patterns as you navigate, while the browser highlights the
-current selection. Use **Clear** to reset the comparison.
-
-The **Open Selected in NeXpy** and **silx HDF5 Viewer** buttons below the browser
-open external viewers in the same installed environment. Processed files may
-reference their original raw images: retain those images when moving a project.
-
-#### Integration axes and units
-
-The 1D integration panel's axis dropdown offers:
-
-- **Q (Å⁻¹)**: scattering-vector magnitude; independent of wavelength.
-- **2θ (°)**: scattering angle; depends on the wavelength in your PONI file.
-
-The 2D integration panel offers:
-
-- **Q-χ**: radial-azimuthal in reciprocal space.
-- **2θ-χ**: radial-azimuthal in angle space.
-
-Unit conversion respects your calibration file's wavelength automatically.
-
-#### Grazing-incidence diffraction (GID)
-
-For surface-sensitive measurements, xdart supports grazing-incidence geometry
-using pyFAI's `FiberIntegrator`:
-
-1. Select **Experiment → Configuration → Grazing**.
-2. Choose the incidence-angle motor or a manual angle using the **θ motor**
-   controls. Use Advanced settings for sample orientation when needed.
-3. The integrator panel switches to GI-specific modes:
-   - **1D modes**: Qip (in-plane), Qoop (out-of-plane), Q-total.
-   - **2D modes**: Qip-Qoop, Q-χ.
-4. Process as normal; output reflects the rotated reciprocal-space axes.
-
-#### Advanced integration settings
-
-Click **Advanced** in the Processing panel for detailed pyFAI
-parameters:
-
-- **Solid-angle correction**: account for detector solid-angle variations.
-- **Dummy values**: mark pixels to ignore in integration.
-- **Polarization factor**: apply polarization correction for synchrotron
-  radiation.
-- **Integration method**: choose the algorithm (e.g. histogram, csr,
-  full-split).
-- **Radial range**: manually clip the Q or 2θ range (overrides auto-detection).
-- **Azimuthal range**: select only certain χ sectors.
-
-#### Intensity thresholds and the global mask
-
-The **Threshold** control replaces the separate Mask Saturated button. When
-enabled, it accepts the inclusive intensity range on **each frame**. Its automatic
-range starts at zero and ends one count below the detector/data-type saturation
-limit: for uint16 data, **0–65,534** excludes every pixel at **65,535**. The limit
-is determined once from the native detector/data type, not from the brightest
-pixel in each image.
-
-Edit the bounds to reject a different intensity range; clearing the upper bound
-restores automatic saturation rejection. With Threshold disabled, finite pixels
-are retained regardless of saturation or intensity. Nonfinite values are still
-invalid. The **global mask file is always honored**, whether Threshold is on or
-off, and Threshold also works when no mask file is specified.
-
-#### Background subtraction
-
-Configure in **Processing → Background**:
-
-- **No background**: raw data only.
-- **Single file**: subtract a single dark image.
-- **Series average**: average all images in a background directory, then
-  subtract.
-- **Directory-matched**: match each sample image to a background image by
-  filename pattern.
-
-Background frames are integrated with the same parameters as sample frames for
-consistency.
-
-#### Calibration and masking
-
-The integrator panel includes **Calibrate** and **Make Mask** buttons:
-
-- **Calibrate** launches the pyFAI-calib2 module for interactive detector
-  calibration. Use a calibration standard (e.g. LaB6, CeO2) to refine detector
-  geometry and generate a PONI file.
-- **Make Mask** launches the pyFAI mask-drawing tool to interactively draw
-  regions on a detector image and create/edit a bad-pixel mask.
-
-Load the static mask under **Experiment → Detector → Mask File**. Use
-**Processing → Conditioning → Threshold** for dynamic, per-frame intensity
-rejection.
-
-#### Data export and saving
-
-- **Int 1D / Int 2D** save processed NeXus files under the Project Save Path.
-- **Int 1D (XYE)** saves text patterns in a scan-specific output directory.
-- NeXus output carries processing metadata and calibration information for
-  subsequent analysis.
-
-### Analyze Results notebooks
-
-After a run, choose **Help → Export Analyze Results Notebook…** to save a Jupyter
-notebook for the selected processed NeXus file or XYE results. It includes the
-output paths, loading code, metadata access, and example plots using `xrd_tools`.
-Data is loaded on demand; exporting the notebook does not rerun the integration
-or copy the data files.
-
-Open it in an environment with `xdart[notebook]`, such as the
-[notebook Pixi workspace](#headless--notebooks-with-pixi) or the editable install
-below, and run `pixi run jupyter lab`. If you move the results, update the paths
-in the notebook before running its cells.
-
-### Configuration & calibration
-
-#### PONI files
-
-xdart uses pyFAI PONI (PyFAI Object Containing Necessary Information) files for
-detector calibration. A PONI file contains:
-
-- detector geometry (pixel size, shape, name),
-- incident-beam center location,
-- sample-to-detector distance,
-- wavelength,
-- detector rotation (if any).
-
-Generate a PONI file with the **Calibrate** button in xdart's integrator panel
-(which launches pyFAI-calib2), or from the command line:
-
-```bash
-pyFAI-calib2
-```
-
-Refer to the pyFAI documentation for detailed calibration procedures.
-
-### Troubleshooting
-
-**pyFAI installation fails on macOS/Windows:**
-Install via conda instead of pip; conda packages include pre-built binaries.
-
-```bash
-conda install -c conda-forge pyfai
-```
-
-**GUI doesn't appear or crashes on startup:**
-Check that PySide6 is installed and your Qt plugins are accessible:
-
-```bash
-python -c "from PySide6 import QtWidgets; print('PySide6 OK')"
-```
-
-**Slow integration or freezing:**
-Ensure multicore processing is enabled, and reduce the radial resolution if
-working with very large detectors.
-
-**PONI file not recognized:**
-Verify the PONI file is text-based `key=value` pairs and that paths are
-absolute or relative to the working directory.
-
-**Memory use on a low-RAM machine:**
-Lower **Cores** to reduce simultaneous raw-frame and integration buffers.
-Processed-data browsing loads image data on demand; the frame count alone does
-not determine how many full detector images remain resident.
-
----
-
-## Module architecture
-
-One distribution, two import packages under `src/`. Anything that does not
-need Qt belongs in `xrd_tools` ("keep xdart thin").
-
-### `xrd_tools` — headless core (no Qt)
-
-- **`core/`** — pure, import-light data contracts (no Qt/h5py/fabio/pyFAI at
-  import). `containers` (`PONI`, `IntegrationResult1D/2D`), `frame_view`
-  (`Axis`, `TwoDKind`, `FrameView`, the GI-kind classifier), `scan`
-  (`ScanFrame` / `Scan` / `FrameSource` — the reduction-input contracts),
-  `filters`, `geometry/`, `metadata`, `hdf5` (universal NumPy/pandas/Python
-  codec, lazily re-exported), `provenance`, `config`.
-- **`io/`** — persistence + readers. `schema.py` (schema-as-code), `nexus.py`
-  (stacked v2 writer/reader + strict validators), `nexus_record.py` (per-frame
-  record primitives + thumbnails), `read.py` (`get_1d/2d/thumbnail/metadata`,
-  `get_raw_frame`, `open_scan` / `ProcessedScan`, portable-path resolution),
-  `frame_view.py` (`read_frame_view` / `read_frame_views`), `image.py`,
-  `image_source.py`, `spec.py`, `metadata.py`, `nexus_inspect.py`, `export.py`,
-  `tiled.py`.
-- **`sources/`** — source-readiness and capability contracts, including
-  `describe_source_readiness`, shared by headless callers and xdart run gating.
-- **`reduction/`** — the streaming spine. `ReductionSession` (parallel workers
-  + single writer thread, bounded in-flight, fail-loud `finish()`),
-  `run_reduction`, sinks (`NexusSink`, `XYESink`, `MemorySink`,
-  `CompositeSink`), GI freeze policies, `FlushPolicy`.
-- **`session/`** — headless session/display contracts: readiness, display
-  decision logic, frame records, publication projections, and shared staging
-  budgets used by the GUI.
-- **`integrate/`** — pyFAI integration + GI (`integrate_1d/2d`,
-  `create_fiber_integrator`, `integrate_gi_*`, `stitch_1d/2d`,
-  calibration: `load_poni` / `poni_to_integrator` / `poni_to_fiber_integrator`).
-- **`transforms/`** — unit conversions (`tth_to_q`, `q_to_tth`, `q_to_d`,
-  `d_to_q`, `energy_to_wavelength`) and angular calculations.
-- **`rsm/`** — reciprocal-space mapping (`ExperimentConfig`, `RSMVolume`,
-  HKL gridding, VTK export).
-- **`analysis/`** — `fitting` (lmfit peak + `PhaseFitter` phase fitting,
-  backgrounds incl. SNIP), `phase` (`PhaseModel` over pymatgen), `strain`
-  (sin²ψ).
-- **`corrections/`** — intensity-correction modules (see above).
-- **`viz/`** — matplotlib/plotly headless plotting (no Qt).
-- **`gui/`** — Jupyter-widget viewers for notebooks (`powder_1d_viewer`,
-  `powder_2d_viewer`, `rsm_viewer`, `napari_viewer`). `gui.main` is a reserved
-  entry point only — it raises `NotImplementedError`; the desktop GUI is
-  `xdart`.
-
-### `xdart` — Qt GUI (thin consumer)
-
-- **`xdart_main.py`** — thin Qt-probing entry (the `xdart` console script;
-  `xdart.xdart_main:main`).
-- **`modules/`** — the retained Qt-free GUI ownership records and publication
-  envelope (`display_context.py`, `frame_publication.py`). Reduction sessions,
-  source reads, and NeXus writes are owned by `xrd_tools`.
-- **`gui/tabs/scattering/`** — the sole built-in Scattering Workspace: typed
-  control intent, source/browse adapters, run coordination, and scientific
-  presentation. Qt-free display decisions remain in `xrd_tools.session`, and
-  file access goes through the headless `xrd_tools.io` / source APIs.
-- **`gui/widgets/` and `gui/analysis/`** — shared current controls, run status,
-  plotting widgets, and analysis dialogs used by the Scattering Workspace.
-
-Layer map: [`docs/ARCHITECTURE.md`](https://github.com/v-thampy/xdart/blob/main/docs/ARCHITECTURE.md).
-
----
-
 ## Development
 
-### Editable install with Pixi (recommended)
+Use the repository's **shared Pixi workspace** for editable source installs.
+`pyproject.toml` and `pixi.lock` travel with the Git checkout; each machine installs
+the packages locked for its own platform. The xdart source is already editable,
+so source edits take effect when you restart the application.
 
-On **Apple Silicon macOS or Linux x86-64**, use the repository's locked workspace:
+The checked-in workspace currently includes Apple Silicon macOS (`osx-arm64`)
+and Linux x86-64 (`linux-64`). Windows x86-64 (`win-64`) still needs the
+[one-time platform setup and native validation](docs/INSTALLATION.md#adding-windows-to-the-shared-workspace).
+Once that manifest and lockfile change is committed and merged, future Windows
+clones use the same `pixi install --locked` and `pixi run --locked xdart` commands.
+Users do not add the platform or regenerate the lockfile on each new machine.
 
-```bash
-git clone https://github.com/v-thampy/xdart.git
-cd xdart
-pixi install --locked
-pixi run --locked xdart
-```
-
-`pyproject.toml` already declares `xdart = { path = ".", editable = true, ... }`
-with the GUI, development, and notebook extras. Changes under `src/` are used
-when you restart xdart; no separate `pip install -e` is needed. Always launch with
-`pixi run --locked xdart` from this checkout to select it over a global release install.
-
-To update an existing clone, save or commit your local work first, then run:
+After saving or committing local work, update an existing supported checkout with:
 
 ```bash
 git pull --ff-only
-git rev-parse --short=8 HEAD
 pixi install --locked
 pixi run --locked xdart
 ```
 
-The Git hash identifies the exact source revision being tested. `--locked`
-requires the lockfile to match the manifest and installs its recorded package
-versions without updating the lockfile. It does not prevent editable source
-changes. See the [Pixi run reference](https://pixi.sh/latest/reference/cli/pixi/run/).
+Each new machine still needs Git, Pixi, and its own environment installation.
+Future dependency changes require an updated shared lockfile and checks on the
+affected platforms; ordinary source edits do not require relocking. Adding a
+platform increases dependency-resolution and validation work, but the platform
+declaration itself adds no application runtime memory or processing overhead.
 
-The native stack comes from **conda-forge**: NumPy, h5py, hdf5plugin, HDF5,
-Blosc, c-blosc2, lz4-c, Fabio, pyFAI, silx, PySide6, and xrayutilities. The local
-xdart package is editable; remaining Python requirements are resolved by Pixi
-through PyPI without replacing those conda packages. Inspect the environment
-with `pixi list`, or confirm the source location with:
-
-```bash
-pixi run --locked python -c "import xdart; print(xdart.__file__)"
-```
-
-**Windows editable install:** the checked-in workspace currently locks only
-`osx-arm64` and `linux-64`. Create a separate Windows workspace next to the clone,
-so its environment and lockfile do not change the repository's platform lock:
-
-```powershell
-git clone https://github.com/v-thampy/xdart.git
-mkdir xdart-dev
-cd xdart-dev
-```
-
-Save this as `xdart-dev/pixi.toml` (the source checkout is the sibling `xdart`
-directory):
-
-```toml
-[workspace]
-name = "xdart-dev"
-channels = ["conda-forge"]
-platforms = ["win-64"]
-
-[dependencies]
-python = "3.13.*"
-numpy = "*"
-h5py = "*"
-hdf5plugin = "*"
-hdf5 = "*"
-blosc = "*"
-c-blosc2 = "*"
-lz4-c = "*"
-fabio = "*"
-pyfai = ">=2026.5,<2026.6"
-silx = "*"
-pyside6 = "*"
-xrayutilities = "*"
-
-[pypi-dependencies]
-xdart = { path = "../xdart", editable = true, extras = ["gui", "dev", "notebook"] }
-```
-
-Then run `pixi install` and `pixi run xdart` from `xdart-dev`. Keep the generated
-`pixi.lock` to reproduce that Windows environment; subsequent launches can use
-`pixi run --locked xdart`. To update the editable source, run `git pull --ff-only`
-in the sibling `xdart` checkout. If its dependencies changed, run `pixi install`
-in `xdart-dev` and retain the updated Windows lockfile. This Windows setup must
-be validated on Windows before declaring a release supported there.
-
-### Tests and packaging
-
-From the repository workspace:
-
-```bash
-pixi run test                                    # headless core suite
-pixi run gui-test                                # GUI suite, offscreen
-pixi run python scripts/release.py check          # focused release preflight
-pixi run python scripts/release.py build          # preflight, sdist/wheel, twine
-```
-
-For the separate Windows workspace, run Python/pytest with paths into the sibling
-checkout. Release preflight is a focused check; it does not replace the CI suites
-or native platform testing. Publishing is performed by the release workflows
-when a maintainer pushes a version tag.
+See the [complete editable setup](docs/INSTALLATION.md#editable-install-with-pixi-recommended)
+and [test and packaging commands](docs/INSTALLATION.md#tests-and-packaging).
 
 ---
 
@@ -1040,13 +691,14 @@ open an issue on the GitHub repository.
 ## License
 
 First-party code is released under the **MIT License** (see
-[LICENSE](https://github.com/v-thampy/xdart/blob/main/LICENSE)); code
-inherited from `ssrl_xrd_tools` is BSD-3-Clause (see
-`licenses/LICENSE-ssrl_xrd_tools`). SPDX: `MIT AND BSD-3-Clause`.
+[LICENSE](https://github.com/v-thampy/xdart/blob/main/LICENSE)). Portions of
+the headless core retain their
+[BSD-3-Clause license](licenses/LICENSE-ssrl_xrd_tools).
+SPDX: `MIT AND BSD-3-Clause`.
 
 ## Citation
 
-If you use `xdart` (`xrd_tools` / `xdart`) in your research, please cite:
+If you use xdart or its `xrd_tools` core in your research, please cite:
 
 ```
 xdart: SSRL X-ray diffraction toolkit (headless reduction core + xdart GUI)
@@ -1059,10 +711,26 @@ https://github.com/v-thampy/xdart
 
 Developed at the [Stanford Synchrotron Radiation Lightsource
 (SSRL)](https://www-ssrl.slac.stanford.edu/), SLAC National Accelerator
-Laboratory. The project builds on the excellent `pyFAI` library and benefits
-from the broader scientific Python ecosystem including NumPy, SciPy, lmfit,
-xrayutilities, and pymatgen. Grateful thanks to the pyFAI community and to all
-collaborators and users who provide feedback and improvements.
+Laboratory.
+
+xdart relies on the scientific work and software developed by these projects:
+
+- **[pyFAI](https://pyfai.readthedocs.io/)** provides the azimuthal integration
+  algorithms at the heart of xdart's processing.
+- **[pyFAI's fiber module (FiberIntegrator)](https://pyfai.readthedocs.io/en/latest/api/pyFAI.html#module-pyFAI.integrator.fiber)**
+  provides the grazing-incidence integration used for thin-film analysis.
+- **[xrayutilities](https://xrayutilities.sourceforge.io/)** provides reciprocal-space
+  coordinate conversion and gridding used by both stitching and RSM.
+- **[NeXpy](https://nexpy.github.io/nexpy/)** provides the external NeXus viewer
+  and interactive analysis environment available from xdart's Data Browser.
+- **[silx](https://silx.readthedocs.io/en/stable/)** provides scientific I/O tools
+  and the [silx view](https://silx.readthedocs.io/en/stable/applications/view.html)
+  application used for general HDF5 inspection.
+
+We gratefully acknowledge their authors, maintainers, and contributors. Please
+also cite the relevant underlying packages when publishing results obtained with
+xdart. Thanks also to the NumPy, SciPy, lmfit, and pymatgen communities, and to
+the collaborators and users who provide feedback and improvements.
 
 ## Contact
 

@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import gc
-import hashlib
 import json
 import math
-import os
 from pathlib import Path
 from threading import current_thread
 from types import SimpleNamespace
@@ -16,7 +14,9 @@ import numpy as np
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from tests.xdart.scattering import test_e2lv_live_display as lv_support
-from xrd_tools.core.scan import Scan, ScanFrame
+from tests.xdart.scattering._output_slots import written
+from xrd_tools.io import read_frame_record
+from xrd_tools.sources.image import TiffSeriesSource
 from xrd_tools.core.staging import (
     browse_publication_max_items,
     live_record_store_max_items,
@@ -33,21 +33,9 @@ from xrd_tools.sources.selection import image_series_spec
 from xdart.gui.tabs.scattering.adapters import run_executor as executor_module
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
-from xdart.gui.tabs.scattering.contracts import (
-    AcceptedScientificAssets,
-    AdmittedMetadataSource,
-    AdmittedOutput,
-    AdmissionReceipt,
-    OutputDisposition,
-    OutputFact,
-    PlannedOutput,
-    SourceExecutionStamp,
-    SourceFileState,
-)
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.display_values import StandardEventKind
 from xdart.gui.tabs.scattering.events import CleanupStatus
-from xdart.gui.tabs.scattering.output_preflight import OutputCandidate
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 
@@ -61,19 +49,15 @@ _HEARTBEAT_MAX_LIMIT_S = 0.50
 
 
 def _write_synthetic_series(selected: Path) -> tuple[Path, ...]:
-    fabio.tifimage.TifImage(
-        data=np.ones((2, 2), dtype=np.uint16)
-    ).write(str(selected))
     prefix = selected.stem.rsplit("_", 1)[0]
     members = tuple(
         selected.with_name(f"{prefix}_{label:04d}{selected.suffix}")
         for label in range(1, _FRAME_COUNT + 1)
     )
-    for member in members[1:]:
-        os.link(
-            selected,
-            member,
-        )
+    for label, member in enumerate(members, start=1):
+        fabio.tifimage.TifImage(
+            data=np.full((2, 2), label, dtype=np.uint16)
+        ).write(str(member))
     return members
 
 
@@ -96,7 +80,13 @@ def _wait(
 
 
 class _TinyIntegrator:
-    detector = SimpleNamespace(mask=None)
+    def __init__(self, calibrated):
+        self.detector = calibrated.detector
+        for name in (
+            "dist", "poni1", "poni2", "rot1", "rot2", "rot3",
+            "wavelength", "parallax",
+        ):
+            setattr(self, name, getattr(calibrated, name))
 
     def integrate1d(self, image, npt, *, unit, **_kwargs):
         time.sleep(0.001)
@@ -107,42 +97,6 @@ class _TinyIntegrator:
             sigma=None,
             unit=unit,
         )
-
-
-class _TinySource:
-    def __init__(
-        self,
-        members: tuple[Path, ...],
-        lifecycle_facts: list[tuple[str, str]],
-    ) -> None:
-        if len(members) != _FRAME_COUNT:
-            raise ValueError("synthetic source requires the exact 651 members")
-        self._members = members
-        self._lifecycle_facts = lifecycle_facts
-        lifecycle_facts.append(("construct", current_thread().name))
-
-    def to_scan(self, *, poni, integrator, output_path):
-        self._lifecycle_facts.append(("to_scan", current_thread().name))
-        frames = [
-            ScanFrame(
-                label,
-                image=np.full((2, 2), label, dtype=np.float32),
-                source_path=member,
-                source_frame_index=0,
-                source_identity=str(member),
-            )
-            for label, member in enumerate(self._members, start=1)
-        ]
-        return Scan(
-            "tiny-651",
-            frames,
-            poni=poni,
-            integrator=integrator,
-            output_path=output_path,
-        )
-
-    def close(self) -> None:
-        self._lifecycle_facts.append(("close", current_thread().name))
 
 
 class _TrackingRecordStore(FrameRecordStore):
@@ -212,72 +166,6 @@ class _TrackingExecutor(StandardRunExecutor):
         )
 
 
-def _accepted_admission(
-    capture,
-    *,
-    cancelled,
-    session_owner,
-) -> AdmissionReceipt:
-    del session_owner
-    if cancelled():
-        raise RuntimeError("admission cancelled")
-    configuration = capture.intent_snapshot.thaw()
-    poni_bytes = Path(configuration.poni_file).read_bytes()
-    assets = AcceptedScientificAssets(
-        (0.1, 0.01, 0.01, 0.0, 0.0, 0.0, 1e-10, "Detector"),
-        None,
-        None,
-        None,
-        hashlib.sha256(poni_bytes).hexdigest(),
-        None,
-        "{\"orientation\":3}",
-    )
-    candidate = OutputCandidate.from_start_capture(capture, assets, ())
-    source_options = capture.source_capture.source.options
-    selected = Path(source_options["selected_file"])
-    states = tuple(
-        SourceFileState.capture(Path(value))
-        for value in source_options["files"]
-    )
-    assert len(states) == _FRAME_COUNT
-    state = states[0]
-    target = Path(capture.intent_snapshot.thaw().save_path)
-    stamp = SourceExecutionStamp(
-        state, "tiff_series", len(states), 1, states,
-        metadata_sources=tuple(
-            AdmittedMetadataSource(member.path, None) for member in states
-        ),
-    )
-    from xrd_tools.sources.execution_graph import freeze_source_execution_graph
-    item = PlannedOutput(
-        freeze_source_execution_graph(
-            candidate.source, candidate.source, source_path=selected,
-            group_key=selected.stem, file=stamp.file,
-            adapter_id=stamp.adapter_id, frame_count=stamp.frame_count,
-            first_label=stamp.first_label, detector_shape=None,
-            native_dtype=None, members=stamp.members,
-            metadata_sources=stamp.metadata_sources, motor_names=(),
-        ),
-        target,
-    )
-    return AdmissionReceipt(
-        capture.request_id,
-        capture.intent_snapshot.revision,
-        capture.source_capture,
-        candidate,
-        (
-            AdmittedOutput(
-                item,
-                OutputDisposition.WRITE,
-                tuple(range(1, _FRAME_COUNT + 1)),
-                OutputFact(False),
-            ),
-        ),
-        assets,
-        (),
-    )
-
-
 def _heartbeat(timer: QtCore.QTimer) -> tuple[list[float], object]:
     interval = 0.016
     lateness: list[float] = []
@@ -303,26 +191,44 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
     selected = tmp_path / "tiny_0001.tif"
     members = _write_synthetic_series(selected)
     poni = tmp_path / "tiny.poni"
-    poni.write_text("deterministic test calibration")
+    poni.write_text(
+        "poni_version: 2\nDetector: Detector\n"
+        'Detector_config: {"pixel1": 0.0001, "pixel2": 0.0001, "max_shape": [2, 2]}\n'
+        "Distance: 0.1\nPoni1: 0.01\nPoni2: 0.01\n"
+        "Rot1: 0.0\nRot2: 0.0\nRot3: 0.0\nWavelength: 1e-10\n"
+    )
     output = tmp_path / "tiny.nexus"
     source_lifecycle: list[tuple[str, str]] = []
-    source_references: list[weakref.ReferenceType[_TinySource]] = []
+    source_references: list[weakref.ReferenceType[TiffSeriesSource]] = []
     plan_configurations: list[FrozenRunConfiguration] = []
     _TrackingRecordStore.instances.clear()
     _TrackingScanSession.references.clear()
 
-    monkeypatch.setattr(
-        executor_module, "build_admission_receipt", _accepted_admission
-    )
+    real_open_source = executor_module.open_source
+    real_to_scan = TiffSeriesSource.to_scan
 
-    def open_source(_spec):
-        source = _TinySource(members, source_lifecycle)
+    def open_source(spec):
+        source = real_open_source(spec)
+        assert type(source) is TiffSeriesSource
+        source_lifecycle.append(("construct", current_thread().name))
         source_references.append(weakref.ref(source))
         return source
 
+    def to_scan(source, **kwargs):
+        source_lifecycle.append(("to_scan", current_thread().name))
+        return real_to_scan(source, **kwargs)
+
     monkeypatch.setattr(executor_module, "open_source", open_source)
+    monkeypatch.setattr(TiffSeriesSource, "to_scan", to_scan)
     monkeypatch.setattr(
-        executor_module, "poni_to_integrator", lambda _poni: _TinyIntegrator()
+        TiffSeriesSource, "close",
+        lambda source: source_lifecycle.append(("close", current_thread().name)),
+        raising=False,
+    )
+    real_integrator = executor_module.poni_to_integrator
+    monkeypatch.setattr(
+        executor_module, "poni_to_integrator",
+        lambda calibration: _TinyIntegrator(real_integrator(calibration)),
     )
     native_plan = executor_module.native_int_reduction_plan
 
@@ -356,6 +262,7 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
         bai_1d_args={"npt": 2},
         bai_2d_args={},
     )
+    output = written(output, "Int 1D")
     lifecycle = ScatteringCoordinator()
     executor = _TrackingExecutor()
     page = ScatteringWorkspace(
@@ -370,13 +277,18 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
     rendered_labels: list[int] = []
     original_apply_state = shell.apply_state
 
-    def record_apply_state(state, *, preserve_display: bool = False) -> None:
+    def record_apply_state(
+        state, *, preserve_display: bool = False, preserve_scientific: bool = False,
+    ) -> None:
         heavy = state.scientific.heavy
         if heavy is not None:
             rendered_labels.append(heavy.frame.local_frame_label)
             if heavy.raw is not None:
                 rendered_raw.append(weakref.ref(heavy.raw))
-        original_apply_state(state, preserve_display=preserve_display)
+        original_apply_state(
+            state, preserve_display=preserve_display,
+            preserve_scientific=preserve_scientific,
+        )
 
     shell.apply_state = record_apply_state
     heartbeat_timer = QtCore.QTimer(page)
@@ -496,6 +408,10 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
         assert len(source_references) == 1
         assert output.is_file()
         assert output.stat().st_size > 0
+        for label in (1, _FRAME_COUNT):
+            view = read_frame_record(output, label).active_view()
+            np.testing.assert_array_equal(view.intensity_1d, np.full(2, label))
+            assert Path(view.source_path) == members[label - 1]
 
         ordered = sorted(lateness)
         assert len(ordered) >= 8

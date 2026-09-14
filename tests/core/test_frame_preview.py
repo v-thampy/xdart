@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import tifffile
 
+from tests.core.v2_fixture_factory import current_entry
 from xrd_tools.core import FrameView, IntegrationResult1D, IntegrationResult2D
 from xrd_tools.io.nexus import write_integrated_stack
 from xrd_tools.io.nexus_record import (
@@ -57,9 +58,7 @@ def _write_processed(
         azimuthal_unit="chi_deg",
     )
     with h5py.File(processed, "w") as handle:
-        entry = handle.create_group("entry")
-        entry.attrs["ssrl_schema"] = "xrd_tools.processed_scan"
-        entry.attrs["ssrl_schema_version"] = 2
+        entry = current_entry(handle)
         if detector_shape is not None:
             entry.create_dataset(
                 "instrument/detector/detector_shape", data=detector_shape

@@ -29,6 +29,7 @@ from xdart.gui.tabs.scattering.contracts import SourceCapture
 from xdart.gui.tabs.scattering.start_outcomes import StartCapture, StartLaunched
 from xdart.gui.tabs.scattering.start_pipeline import StartPipeline
 from tests.xdart.scattering._admission import admission_for, await_admission
+from tests.xdart.scattering.test_e4_preview_transport import _wait_transport_idle
 
 
 def _fixture_root() -> Path:
@@ -79,9 +80,22 @@ def test_real_standard_run_is_headless_durable_and_projectable(tmp_path: Path) -
     capture = pipeline.begin()
     assert isinstance(capture, StartCapture)
     admission = await_admission(executor, capture)
+    output = admission.outputs[0].item.target
     launched = pipeline.start(admission)
 
     assert isinstance(launched, StartLaunched)
+    try:
+        _assert_headless_run_is_durable_and_projectable(
+            executor, lifecycle, launched, admission, output,
+        )
+    finally:
+        receipt = executor.close(launched.run_identity)
+    assert receipt.cleanup_status.value == "cleaned"
+
+
+def _assert_headless_run_is_durable_and_projectable(
+    executor, lifecycle, launched, admission, output,
+) -> None:
     assert launched.configuration.generation == launched.run_identity.generation
     events = _wait_for_terminal(executor)
     assert events[-1].kind is StandardEventKind.FINISHED
@@ -119,6 +133,15 @@ def test_real_standard_run_is_headless_durable_and_projectable(tmp_path: Path) -
     payload = controller.project(final_key)
     assert payload is not None
     assert payload.frame_key.run_identity is launched.run_identity
+    assert payload.frame_key is final_key
+    assert payload.selection_generation == selection.display_generation
+    # The executor publishes light payloads; Full Raw is an explicit
+    # on-demand read through the acquisition's own preview transport.
+    assert controller.request_full_current() is not None
+    assert _wait_transport_idle(controller.acquisition_context.publication_store)
+    assert controller.full_raw_status() == (True, False, None)
+    payload = controller.project(final_key)
+    assert payload is not None
     assert payload.frame_key is final_key
     assert payload.selection_generation == selection.display_generation
     assert payload.view.raw is not None
@@ -227,113 +250,51 @@ def test_stop_during_admitted_revalidation_returns_stopped(
 
 
 def test_executor_constructs_and_releases_each_standard_owner_once(monkeypatch, tmp_path: Path) -> None:
-    source = image_series_spec(tmp_path / "raw_0001.tif")
-    configuration = RunIntent(
-        source_spec=source, poni_file=str(tmp_path / "calibration.poni"),
-        save_path=str(tmp_path / "out.nxs"), output_mode="Overwrite",
-        max_cores=1,
-    ).freeze()
-    identity = RunIdentity.from_configuration(configuration)
-    calls: dict[str, int] = {}
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+    from xrd_tools.reduction import NexusSink
+    from xrd_tools.session import ScanSession
+    from xrd_tools.sources.image import TiffSeriesSource
+    from tests.xdart.scattering.test_e1b1_terminal_cleanup import _prepared_run
 
-    def counted(name: str) -> None:
-        calls[name] = calls.get(name, 0) + 1
-
-    class Scan:
-        name = "Standard"
-        frames = (SimpleNamespace(index=1, image=None),)
-
-        def __len__(self) -> int:
-            return 1
-
-    class Opened:
-        def to_scan(self, **_kwargs):
-            counted("scan")
-            return Scan()
-
-        def close(self) -> None:
-            counted("source.close")
-
-    sink_options: dict[str, object] = {}
-
-    class Sink:
-        def __init__(self, *_args, **kwargs) -> None:
-            counted("sink")
-            sink_options.update(kwargs)
-
-        def finish(self, _result) -> None:
-            counted("sink.finish")
-
-    class Session:
-        def __init__(self, _plan, _scan, sink, **_kwargs) -> None:
-            counted("session")
-            self._sink = sink
-            self.frames_completed = 0
-            self._completed = None
-
-        def on_frame_completed(self, callback) -> None:
-            self._completed = callback
-
-        def start(self) -> None:
-            counted("session.start")
-
-        def submit(self, _frame) -> bool:
-            counted("session.submit")
-            return True
-
-        def finish(self, **_kwargs):
-            counted("session.finish")
-            self._sink.finish(None)
-            self.frames_completed = 1
-            assert self._completed is not None
-            self._completed(SimpleNamespace(frame_index=1))
-            return SimpleNamespace(failed=False, cancelled=False, n_processed=1)
-
-    opened = Opened()
-    monkeypatch.setattr(executor_module, "open_source", lambda _source: (counted("source.open"), opened)[1])
-    monkeypatch.setattr(executor_module, "load_poni", lambda _path: (counted("poni"), object())[1])
-    monkeypatch.setattr(executor_module, "poni_to_integrator", lambda _poni: (counted("integrator"), object())[1])
-    monkeypatch.setattr(
-        executor_module,
-        "build_native_int_reduction_plan_from_args",
-        lambda *_args, **_kwargs: (counted("plan"), object())[1],
+    executor, run, _admission = _prepared_run(tmp_path)
+    calls, sessions, sinks = {}, [], []
+    originals = (
+        (executor_module, "open_source"),
+        (executor_module, "poni_to_integrator"),
+        (executor_module, "native_int_reduction_plan"),
+        (TiffSeriesSource, "to_scan"),
+        (NexusSink, "begin"),
+        (NexusSink, "finish"),
+        (ScanSession, "start"),
+        (ScanSession, "submit"),
+        (ScanSession, "finish"),
     )
-    monkeypatch.setattr(executor_module, "NexusSink", Sink)
-    monkeypatch.setattr(executor_module, "ScanSession", Session)
-
-    executor = StandardRunExecutor()
-    monkeypatch.setattr(
-        executor,
-        "_frame_ready_owned",
-        lambda owned_run, _event, _image, _session: setattr(
-            owned_run,
-            "current_published",
-            owned_run.current_published + 1,
-        ),
-    )
-    run = _StandardRun(
-        configuration, identity, None, None, None, None, Path(configuration.save_path),
-        capture=SourceCapture(RequestId(1), 1, source),
-    )
-    executor._construct(run)
-    assert sink_options["flush_every"] == 8
+    for owner, name in originals:
+        original = getattr(owner, name)
+        key = (owner, name)
+        def counted(*args, _original=original, _key=key, **kwargs):
+            calls[_key] = calls.get(_key, 0) + 1
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(owner, name, counted)
+    real_open = dynamic_output.open_headless_scan_session
+    def open_session(*args, **kwargs):
+        session = real_open(*args, **kwargs)
+        sessions.append(session)
+        sinks.append(kwargs["sink"])
+        return session
+    monkeypatch.setattr(dynamic_output, "open_headless_scan_session", open_session)
+    closed_sources = []
+    monkeypatch.setattr(TiffSeriesSource, "close", lambda source: closed_sources.append(source), raising=False)
     executor._run(run)
-
-    assert calls == {
-        "source.open": 1,
-        "poni": 1,
-        "integrator": 1,
-        "scan": 1,
-        "plan": 1,
-        "sink": 1,
-        "session": 1,
-        "session.start": 1,
-        "session.submit": 1,
-        "session.finish": 1,
-        "sink.finish": 1,
-        "source.close": 1,
-    }
-    assert executor.drain_events()[-1].kind is StandardEventKind.FINISHED
+    terminal = executor.drain_events()[-1]
+    assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
+    assert len(sessions) == len(sinks) == len(closed_sources) == 1
+    for owner, name in originals:
+        # The executor asks for terminal truth twice; the real ScanSession
+        # caches it and settles the sink exactly once.
+        assert calls[(owner, name)] == (2 if (owner, name) == (ScanSession, "finish") else 1)
+    assert sessions[0].terminal_result.commit_identity is not None
+    assert executor.close(run.identity).cleanup_status.value == "cleaned"
 
 
 def test_eiger_submission_uses_bounded_reads_and_stops_before_next_chunk(
@@ -374,7 +335,7 @@ def test_eiger_submission_uses_bounded_reads_and_stops_before_next_chunk(
 
     monkeypatch.setattr(executor_module, "NexusStackSource", Source)
     run = _StandardRun(
-        None,
+        RunIntent().freeze(),
         identity,
         Scan(),
         Source(),
@@ -421,7 +382,7 @@ def test_eiger_source_read_overlaps_submit_backpressure(monkeypatch) -> None:
 
     monkeypatch.setattr(executor_module, "NexusStackSource", Source)
     run = _StandardRun(
-        None,
+        RunIntent().freeze(),
         identity,
         Scan(),
         Source(),
@@ -478,7 +439,7 @@ def test_eiger_source_read_failure_releases_waiting_submitter(monkeypatch) -> No
 
     monkeypatch.setattr(executor_module, "NexusStackSource", Source)
     run = _StandardRun(
-        None,
+        RunIntent().freeze(),
         identity,
         SimpleNamespace(frames=()),
         Source(),
@@ -491,86 +452,58 @@ def test_eiger_source_read_failure_releases_waiting_submitter(monkeypatch) -> No
         StandardRunExecutor._submit_container_source(run, run.session)
 
 
-def test_executor_failure_stop_and_close_release_resources_once() -> None:
-    identity = RunIdentity(1, "f" * 64)
+def test_executor_failure_stop_and_close_release_resources_once(tmp_path, monkeypatch) -> None:
+    from xrd_tools.reduction import NexusSink
+    from xrd_tools.sources.image import TiffSeriesSource
+    from tests.xdart.scattering.test_e1b1_terminal_cleanup import _prepared_run
+    from tests.xdart.scattering.test_e1b2_executor_exact_review import _writer_begin_failure
 
-    class Source:
-        def __init__(self) -> None:
-            self.close_calls = 0
+    with monkeypatch.context() as patch:
+        executor, run, _admission = _prepared_run(tmp_path / "failure")
+        sinks, aborts, _held = _writer_begin_failure(patch)
+        closed = []
+        patch.setattr(TiffSeriesSource, "close", lambda source: closed.append(source), raising=False)
+        executor._run(run)
+        terminal = executor.drain_events()[-1]
+        assert terminal.kind is StandardEventKind.FAILED
+        assert len(closed) == 1 and aborts == sinks and len(sinks) == 1
+        assert executor.close(run.identity).cleanup_status.value == "cleaned"
+        assert len(closed) == len(aborts) == 1
 
-        def close(self) -> None:
-            self.close_calls += 1
-
-    class Sink:
-        def __init__(self) -> None:
-            self.abort_calls = 0
-
-        def abort(self, _result) -> None:
-            self.abort_calls += 1
-
-    class Session:
-        def __init__(self, sink: Sink, *, submit: bool, cancelled: bool = False) -> None:
-            self.sink = sink
-            self.submit_result = submit
-            self.cancelled = cancelled
-            self.frames_completed = 0
-            self.finish_calls = 0
-            self.stop_calls = 0
-
-        def start(self) -> None:
-            return None
-
-        def submit(self, _frame) -> bool:
-            if self.submit_result:
-                raise RuntimeError("reduction failed")
-            return False
-
-        def finish(self, **_kwargs):
-            self.finish_calls += 1
-            self.sink.abort(None)
-            return SimpleNamespace(failed=False, cancelled=self.cancelled, n_processed=0)
-
-        def stop(self) -> None:
-            self.stop_calls += 1
-
-    def run_for(source: Source, session: Session) -> _StandardRun:
-        class Scan:
-            name = "Standard"
-            frames = (SimpleNamespace(index=1),)
-
-            def __len__(self) -> int:
-                return 1
-
-        finished = []
-        finish = lambda **_kwargs: finished[0] if finished else (finished.append(session.finish()) or finished[0])
-        output = SimpleNamespace(write_labels=(1,), submit=session.submit, stop=session.stop,
-                                 finish_current=finish, finish_all=finish,
-                                 project_new_durable=lambda _apply: None)
-        return _StandardRun(None, identity, Scan(), source, session, None,
-                            Path("out.nxs"), output=output)
-
-    failure_source, failure_sink = Source(), Sink()
-    failure_session = Session(failure_sink, submit=True)
-    failure_executor = StandardRunExecutor()
-    failure_executor._run(run_for(failure_source, failure_session))
-    assert failure_session.finish_calls == failure_sink.abort_calls == failure_source.close_calls == 1
-    assert failure_executor.drain_events()[-1].kind is StandardEventKind.FAILED
-
-    stop_source, stop_sink = Source(), Sink()
-    stop_session = Session(stop_sink, submit=False, cancelled=True)
-    stop_executor = StandardRunExecutor()
-    stop_executor._run(run_for(stop_source, stop_session))
-    assert stop_session.finish_calls == stop_sink.abort_calls == stop_source.close_calls == 1
-    assert stop_executor.drain_events()[-1].kind is StandardEventKind.STOPPED
-
-    close_source, close_sink = Source(), Sink()
-    close_session = Session(close_sink, submit=False, cancelled=True)
-    close_executor = StandardRunExecutor()
-    close_run = run_for(close_source, close_session)
-    close_executor._active = close_run
-    close_executor.close(identity)
-    close_executor.close(identity)
-    assert close_session.stop_calls == close_session.finish_calls == close_sink.abort_calls == close_source.close_calls == 1
+    for action in ("stop", "close"):
+        executor, run, admission = _prepared_run(tmp_path / action)
+        decision = admission.outputs[0]
+        executor._construct(run, item=decision.item, decision=decision)
+        session, output = run.session, run.output
+        source = run.source
+        closed, finished = [], []
+        real_finish = NexusSink.finish
+        with monkeypatch.context() as patch:
+            patch.setattr(TiffSeriesSource, "close", lambda owner: closed.append(owner), raising=False)
+            def finish(owner, result):
+                finished.append(owner)
+                return real_finish(owner, result)
+            patch.setattr(NexusSink, "finish", finish)
+            # Preserve one genuine completed row before Stop/Close, so the
+            # final processed record remains a nonempty current record.
+            assert output.submit(run.scan.frames[0])
+            assert session.pause(timeout=5.0)
+            if action == "stop":
+                executor.stop(run.identity)
+                executor._run(run)
+                terminal = executor.drain_events()[-1]
+                assert terminal.kind is StandardEventKind.STOPPED, terminal.detail
+            receipt = executor.close(run.identity)
+            if action == "close":
+                # This run has no source worker: Close settles its writer
+                # after its initial display-retirement receipt was pending.
+                assert receipt.cleanup_status.value == "cleanup_pending"
+                assert run.output is run.session is run.sink is None
+            else:
+                assert receipt.cleanup_status.value == "cleaned"
+            assert executor.close(run.identity).cleanup_status.value == "cleaned"
+            assert closed == [source] and len(finished) == 1
+            assert session.terminal_result.commit_identity is not None
 
 
 def test_complete_eiger_submission_uses_cancel_aware_route_and_publishes_one_fact(
@@ -624,7 +557,7 @@ def test_complete_eiger_submission_uses_cancel_aware_route_and_publishes_one_fac
             )
         submitted: list[int] = []
         run = SimpleNamespace(
-            source=source,
+            configuration=RunIntent().freeze(), source=source,
             frames_by_label={i: SimpleNamespace(index=i) for i in (0, 1)},
             stop_requested=False, stop_signal=Event(), context_runtime=None,
             resource_facts=[], cleanup_failures=[], perf_enabled=False,
@@ -687,7 +620,7 @@ def test_equal_length_noncomplete_eiger_bypass_counts_only_observed_fallbacks(
         source = Source(scenario)
         frames = {i: SimpleNamespace(index=i) for i in (1, 0)}
         run = SimpleNamespace(
-            source=source, frames_by_label=frames,
+            configuration=RunIntent().freeze(), source=source, frames_by_label=frames,
             stop_requested=scenario == "pre-stop", stop_signal=Event(),
             context_runtime=None, resource_facts=[], cleanup_failures=[],
         )

@@ -700,7 +700,7 @@ def test_run_refuses_same_path_replacement_output_parent_before_science(
     assert tuple(held.iterdir()) == ()
 
 
-def test_output_retarget_during_admission_is_refused_before_publication(
+def test_output_retarget_after_admission_fails_before_writing_or_publication(
     tmp_path,
     monkeypatch,
 ):
@@ -711,24 +711,43 @@ def test_output_retarget_during_admission_is_refused_before_publication(
     outside.mkdir()
     original_admit = rsm_operation.admit_module_artifact
     retargets = []
+    outputs = []
+    writes = []
 
     def admit_then_retarget(*args, **kwargs):
         output = original_admit(*args, **kwargs)
         parent.rename(held)
         parent.symlink_to(outside, target_is_directory=True)
         retargets.append(True)
+        outputs.append(output)
         return output
+
+    def forbidden_writer(*_args, **_kwargs):
+        writes.append(True)
+        raise AssertionError("a retargeted output parent reached the writer")
 
     monkeypatch.setattr(
         rsm_operation,
         "admit_module_artifact",
         admit_then_retarget,
     )
+    monkeypatch.setattr(rsm_operation, "write_rsm", forbidden_writer)
     result = run_rsm_operation(request)
 
     assert retargets == [True]
-    assert result.terminal.disposition is ModuleDisposition.REFUSED
-    assert result.terminal.code == "OUTPUT_IDENTITY_MISMATCH"
+    # The finite storage owner now catches the substitution before opening its
+    # document, earlier than the module's scientific prepublication check.
+    assert result.terminal.disposition is ModuleDisposition.FAILED
+    assert result.terminal.code == "OUTPUT_FAILED"
+    assert result.terminal.diagnostic == (
+        "xrd_tools.io.finite_artifact.FiniteArtifactIntegrityError: "
+        "finite output parent changed"
+    )
+    assert result.terminal.commit is None and result.payload is None
+    assert writes == []
+    assert not outputs[0].snapshot.published
+    assert not outputs[0].snapshot.slot_held
+    assert outputs[0].snapshot.artifact.hidden_orphan is None
     assert tuple(outside.iterdir()) == ()
     assert tuple(held.iterdir()) == ()
 
@@ -1166,24 +1185,26 @@ def test_existing_create_new_output_is_late_refusal_without_overwrite(tmp_path):
     assert target.read_bytes() == original
 
 
-def test_create_new_cleanup_retry_does_not_replay_science_or_writer(
+def test_create_new_published_inspection_retry_does_not_replay_science_or_writer(
     tmp_path,
     monkeypatch,
 ):
     request, _frames = _prepared_rsm(tmp_path)
+    target = Path(request.module.output.target)
     coordinator = OutputTransactionCoordinator()
-    real_release = coordinator._release
+    from xrd_tools.io import analysis_artifact as artifact_api
+    real_inspect = artifact_api.inspect_analysis_artifact
     real_write = rsm_operation.write_rsm
     real_science = rsm_operation.run_rsm
     failures = []
     writes = []
     science = []
 
-    def fail_release_once(lease, role, owner):
-        if not failures:
-            failures.append(role)
-            raise OSError("module release transient")
-        return real_release(lease, role, owner)
+    def fail_published_inspection_once(path, **kwargs):
+        if Path(path) == target and not failures:
+            failures.append(path)
+            raise OSError("published inspection transient")
+        return real_inspect(path, **kwargs)
 
     def write_once(*args, **kwargs):
         writes.append("write")
@@ -1193,16 +1214,27 @@ def test_create_new_cleanup_retry_does_not_replay_science_or_writer(
         science.append("science")
         return real_science(*args, **kwargs)
 
-    monkeypatch.setattr(coordinator, "_release", fail_release_once)
+    # Finite publication owns its slot directly; the former streamed
+    # coordinator._release seam is no longer on this path.
+    monkeypatch.setattr(
+        artifact_api, "inspect_analysis_artifact", fail_published_inspection_once,
+    )
     monkeypatch.setattr(rsm_operation, "write_rsm", write_once)
     monkeypatch.setattr(rsm_operation, "run_rsm", science_once)
     with pytest.raises(RSMOperationCleanupPending) as pending:
         run_rsm_operation(request, coordinator=coordinator)
+    assert pending.value.snapshot.published
+    assert not pending.value.snapshot.slot_held
+    assert pending.value.snapshot.artifact.hidden_orphan is None
+    assert tuple(target.parent.iterdir()) == (target,)
+    published_bytes = target.read_bytes()
 
     recovered = pending.value.retry_cleanup()
     assert recovered.terminal.disposition is ModuleDisposition.COMMITTED
     assert recovered.payload is not None
     assert pending.value.execution.retry_cleanup() is recovered
+    assert target.read_bytes() == published_bytes
+    assert tuple(target.parent.iterdir()) == (target,)
     assert len(failures) == 1
     assert writes == ["write"]
     assert science == ["science"]

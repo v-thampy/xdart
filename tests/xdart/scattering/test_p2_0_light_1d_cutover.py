@@ -39,6 +39,7 @@ from xrd_tools.session import (
     Light1DRetentionLease, SessionResourceAuthority,
 )
 from xrd_tools.session.frame_record_store import FrameRecordStore
+from xrd_tools.io.frame_view import read_frame_view
 from xrd_tools.session.intent_store import RunIntent, RunIntentStore
 from xrd_tools.sources.selection import DirectorySourceSpec
 ROOT = Path(__file__).resolve().parents[3]
@@ -654,7 +655,16 @@ def test_p2_0_removes_light_records_and_second_ndarray_owner() -> None:
         function = _function_tree(DISPLAY_RUNTIME, name)
         source = ast.unparse(function)
         assert "self._light_admission_lock" in source
-        assert "with self._lock" not in source
+        # Artifact identity/terminal authority may be read under the display
+        # lock; transport admission and callbacks must remain outside it.
+        display_locked = {
+            id(child)
+            for node in ast.walk(function)
+            if isinstance(node, ast.With)
+            and any(ast.unparse(item.context_expr) == "self._lock"
+                    for item in node.items)
+            for child in ast.walk(node)
+        }
         calls = {
             node.func.attr
             for node in ast.walk(function)
@@ -668,6 +678,12 @@ def test_p2_0_removes_light_records_and_second_ndarray_owner() -> None:
         locked = _light_lock_descendants(function)
         assert len(capture) == 1 and id(capture[0]) in locked
         assert dispatch and all(id(call) not in locked for call in dispatch)
+        assert all(id(call) not in display_locked for call in (*capture, *dispatch))
+        assert not any(
+            id(node) in display_locked & locked
+            for node in ast.walk(function)
+            if isinstance(node, ast.With)
+        )
     assert "_light_admission_lock" not in ast.unparse(
         _function_tree(DISPLAY_RUNTIME, "commit_preview")
     )
@@ -676,7 +692,7 @@ def test_p2_0_removes_light_records_and_second_ndarray_owner() -> None:
         "validate_planned_source"
     ) < construct.index("open_source")
     assert "commit_gate.cancel" not in construct
-def test_p2_0_projection_queue_is_array_free_and_preserves_pair(monkeypatch, tmp_path) -> None:
+def test_p2_0_projection_queue_carries_exact_record_and_preserves_pair(monkeypatch, tmp_path) -> None:
     function = _function_tree(RUN_EXECUTOR, "_frame_ready")
     queued = [
         node
@@ -687,7 +703,18 @@ def test_p2_0_projection_queue_is_array_free_and_preserves_pair(monkeypatch, tmp
     ]
     assert queued
     assert [ast.unparse(call.args[0]) for call in queued] == [
-        "(label, image, session)"
+        "_FrameProjectionItem(label, record, bool(frame is not None and frame.mask is not None))"
+    ]
+    # Carry the writer's exact record across the ordered projection boundary,
+    # without a copied ndarray or a separate image/session payload.
+    record_assignments = [
+        node for node in ast.walk(function)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "record"
+                for target in node.targets)
+    ]
+    assert [ast.unparse(node.value) for node in record_assignments] == [
+        "records.get(label)"
     ]
     executor, identity, _run, artifact, _target, terminal = _terminal_run(
         tmp_path
@@ -718,25 +745,14 @@ def test_p2_0_projection_queue_is_array_free_and_preserves_pair(monkeypatch, tmp
     _write_stack(raw / "a.nxs", 1)
     _write_stack(raw / "b.nxs", 1)
     write_poni(poni)
-    real_plan = run_executor.execution_plan_values
     real_open = dynamic_output.open_headless_scan_session
     sessions = []
-
-    def two_d_only(configuration, detector_mask=None):
-        one, two, values = real_plan(configuration, detector_mask)
-        return one, two, {
-            **values, "integrate_1d": False, "integrate_2d": True,
-        }
 
     def capture_session(*args, **kwargs):
         session = real_open(*args, **kwargs)
         sessions.append(session)
         return session
 
-    monkeypatch.setattr(run_executor, "execution_plan_values", two_d_only)
-    monkeypatch.setattr(
-        dynamic_output, "_mode_tokens", lambda _configuration: ("2d:default",),
-    )
     monkeypatch.setattr(dynamic_output, "open_headless_scan_session", capture_session)
     intent = _directory_intent(raw, target, poni, live=True)
     intent.processing_mode = "Int 2D"
@@ -751,6 +767,7 @@ def test_p2_0_projection_queue_is_array_free_and_preserves_pair(monkeypatch, tmp
     run = executor._exact_run(identity)
     assert run is not None
     owners = tuple(run.display.artifacts.values())
+    current_lease = owners[-1].light_lease
     try:
         assert next(
             event for event in events if event.kind in _TERMINAL
@@ -762,12 +779,22 @@ def test_p2_0_projection_queue_is_array_free_and_preserves_pair(monkeypatch, tmp
         )
         assert tuple(event.frame_key.local_frame_label for event in frames) \
             == (0, 0)
-        assert all(owner.light_lease is owner.light_slot is None for owner in owners)
+        # Int 2D publishes both its 1-D profile and cake.  Switching artifacts
+        # settles and releases the predecessor before retaining the successor.
+        previous, current = owners
+        assert previous.hydration_closed
+        assert previous.light_lease is previous.light_slot is None
+        assert previous.publications._light_1d is None
+        assert type(current_lease) is Light1DRetentionLease
+        assert current_lease.state is Light1DLeaseState.ACTIVE
+        assert current.light_slot.state is Light1DCustodyState.RETAINED
+        assert current.publications._light_1d is current_lease
         assert tuple(
             key.local_frame_label
             for key in run.display.catalog_snapshot().entries
         ) == (0, 0)
-        assert all(owner.publications.get(0).view.intensity_2d is not None for owner in owners)
+        assert current.publications.get(0).view.intensity_2d is not None
+        assert current.publications.get(0).view.intensity_1d is not None
     finally:
         receipt = executor.close(identity)
         leaked = tuple(session for session in sessions if session.is_running)
@@ -775,7 +802,13 @@ def test_p2_0_projection_queue_is_array_free_and_preserves_pair(monkeypatch, tmp
             session.stop()
             session.finish(raise_on_failure=False)
     assert receipt.cleanup_status is CleanupStatus.CLEANED
+    assert current_lease.state is Light1DLeaseState.RELEASED
+    assert all(owner.light_lease is owner.light_slot is None for owner in owners)
     assert leaked == ()
+    for owner in owners:
+        persisted = read_frame_view(owner.artifact, 0)
+        assert persisted.intensity_1d.shape == (8,)
+        assert persisted.intensity_2d.shape == (4, 8)
 
 
 def test_p2_0_acquisition_payload_detaches_light_1d_before_historical_retirement(

@@ -32,68 +32,33 @@ def _frame(identity: RunIdentity) -> DisplayFrameKey:
     return DisplayFrameKey(identity, "scan", "artifact.nxs", 1, 1)
 
 
-def test_primary_finish_failure_requires_explicit_sink_release() -> None:
-    class Scan:
-        name = "Standard"
-        frames = ()
+def test_primary_finish_failure_requires_explicit_sink_release(tmp_path, monkeypatch) -> None:
+    from tests.xdart.scattering.test_e1br_real_scansession_release import _finish_close_failure
 
-        def __len__(self) -> int:
-            return 0
-
-    class Session:
-        frames_completed = 0
-
-        def __init__(self) -> None:
-            self.finish_calls = 0
-
-        def start(self) -> None:
-            return None
-
-        def finish(self, **_kwargs):
-            self.finish_calls += 1
-            if self.finish_calls == 1:
-                raise RuntimeError("primary finish failed after retaining sink")
-            return SimpleNamespace(failed=False, cancelled=False)
-
-    class Sink:
-        def __init__(self) -> None:
-            self.abort_calls = 0
-
-        def abort(self, _result) -> None:
-            self.abort_calls += 1
-
-    class Source:
-        def __init__(self) -> None:
-            self.close_calls = 0
-
-        def close(self) -> None:
-            self.close_calls += 1
-
-    identity = _identity()
-    session, sink, source = Session(), Sink(), Source()
-    run = _StandardRun(
-        None,
-        identity,
-        Scan(),
-        source,
-        session,
-        None,
-        Path("unused.nxs"),
-        sink=sink,
+    executor, run, attempts, closed, remaining = _finish_close_failure(
+        tmp_path, monkeypatch, failures=-1,
     )
-    executor = StandardRunExecutor()
-    executor._active = run
-
-    executor._run(run)
-
-    terminal = executor.drain_events()[-1]
-    assert terminal.kind is StandardEventKind.FAILED
-    assert session.finish_calls == 2
-    assert source.close_calls == 1
-    assert (
-        sink.abort_calls == 1
-        or terminal.cleanup_status is CleanupStatus.CLEANUP_PENDING
-    ), "a retrying finish cannot by itself prove that the acquired sink released"
+    try:
+        executor._run(run)
+        terminal = executor.drain_events()[-1]
+        assert terminal.kind is StandardEventKind.FAILED
+        assert terminal.primary is not None
+        assert "writer handle still open" in terminal.primary.message
+        assert terminal.cleanup_status is CleanupStatus.CLEANUP_PENDING
+        assert run.output is not None and run.session is not None
+        assert len(attempts) == 2 and len(closed) == 1
+        primary = terminal.primary
+    finally:
+        remaining[0] = 0
+        receipt = executor.close(run.identity)
+        assert receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING
+        assert attempts[0]._h5 is None
+        assert run.output is run.session is run.sink is None
+        receipt = executor.close(run.identity)
+        assert receipt.cleanup_status is CleanupStatus.CLEANED
+    assert receipt.primary is primary
+    assert attempts[0]._h5 is None
+    assert run.output is run.session is run.sink is None
 
 
 def test_display_validator_rejects_throwing_nested_axis_before_render() -> None:

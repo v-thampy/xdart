@@ -50,8 +50,6 @@ from xrd_tools.io import (
 from tests.xdart.scattering._admission import await_admission
 from tests.xdart.scattering.test_e2p_rapid_navigation import (
     _TinyIntegrator,
-    _TinySource,
-    _accepted_admission,
     _write_synthetic_series,
 )
 from tests.xdart.scattering.test_e3_context_contract import (
@@ -593,23 +591,18 @@ def test_real_executor_pauses_at_durable_store_boundary(
 
     members = _write_synthetic_series(selected)
     poni = tmp_path / "tiny.poni"
-    poni.write_text("deterministic test calibration")
+    from tests.xdart.scattering._e2sd_support import write_poni
+    write_poni(poni)
     output = tmp_path / "tiny.nexus"
     source_facts = []
     plan_configurations = []
     native_plan = executor_module.native_int_reduction_plan
-    monkeypatch.setattr(
-        executor_module, "build_admission_receipt", _accepted_admission
-    )
-    monkeypatch.setattr(
-        executor_module,
-        "open_source",
-        lambda _spec: _TinySource(members, source_facts),
-    )
+    real_integrator = executor_module.poni_to_integrator
     monkeypatch.setattr(
         executor_module,
         "poni_to_integrator",
-        lambda _poni: _TinyIntegrator(),
+        lambda calibration: (real_integrator(calibration) if gi_enabled
+                             else _TinyIntegrator(real_integrator(calibration))),
     )
 
     def tiny_plan(configuration):

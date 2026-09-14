@@ -35,6 +35,7 @@ from xrd_tools.io.output_transaction import (
 )
 from xrd_tools.io.finite_artifact import _FinitePublicationSession
 from xrd_tools.io.output_safety import check_output_not_source
+from xrd_tools.io.stat_identity import identity_ctime_ns
 
 
 ANALYSIS_SCHEMA_ATTR = "ssrl_schema"
@@ -372,26 +373,24 @@ def _validated_execution_attestation(
         "q_root_policy",
         "xu_runtime",
     }
-    runtime_keys = {
-        "lock_policy",
-        "xrayutilities_distribution_version",
-        "xrayutilities_module_version",
-        "numpy_version",
-        "config_epsilon",
-        "config_digits",
-        "nthreads_before",
-        "nthreads_effective",
-        "nthreads_restored",
-        "restore_passed",
-    }
     runtime = parsed.get("xu_runtime")
     selected = parsed.get("selected_frame_count")
     released = parsed.get("release_check_frame_count")
-    before = runtime.get("nthreads_before") if type(runtime) is dict else None
-    restored = runtime.get("nthreads_restored") if type(runtime) is dict else None
-    if kind is AnalysisArtifactKind.RSM:
+
+    def valid_runtime_projection(value: object) -> bool:
         from xrd_tools.core.geometry.xu_runtime import XuRuntimeExecutionRecord
 
+        if type(value) is not dict:
+            return False
+        try:
+            record = XuRuntimeExecutionRecord(**value)
+        except TypeError:
+            return False
+        # Preserve the original closed shape and admit the complete observed
+        # environment extension. Partial, null, or unknown fields fail equality.
+        return record.to_attestation() == value
+
+    if kind is AnalysisArtifactKind.RSM:
         rsm_top_keys = {
             "schema_version",
             "module_request_fingerprint",
@@ -431,15 +430,6 @@ def _validated_execution_attestation(
         q_released = parsed.get("q_release_check_chunk_count")
         frame_released = parsed.get("frame_release_check_frame_count")
         masks = parsed.get("member_masks")
-
-        def valid_runtime_projection(value: object) -> bool:
-            if type(value) is not dict:
-                return False
-            try:
-                record = XuRuntimeExecutionRecord(**value)
-            except TypeError:
-                return False
-            return record.to_attestation() == value
 
         def valid_shape(value: object) -> bool:
             return (
@@ -589,23 +579,7 @@ def _validated_execution_attestation(
         or parsed.get("release_check_passed") is not True
         or parsed.get("q_root_policy")
         != "shared_ultimate_ndarray_root_weakref_v1"
-        or type(runtime) is not dict
-        or set(runtime) != runtime_keys
-        or runtime.get("lock_policy") != "shared_xrd_tools_xu_rlock_v1"
-        or runtime.get("xrayutilities_distribution_version") != "1.7.12"
-        or runtime.get("xrayutilities_module_version") != "1.7.12"
-        or runtime.get("numpy_version") != "2.5.1"
-        or type(runtime.get("config_epsilon")) is not float
-        or runtime.get("config_epsilon") != 1e-8
-        or type(runtime.get("config_digits")) is not int
-        or runtime.get("config_digits") != 8
-        or type(before) is not int
-        or before < 0
-        or type(runtime.get("nthreads_effective")) is not int
-        or runtime.get("nthreads_effective") != 1
-        or type(restored) is not int
-        or restored != before
-        or runtime.get("restore_passed") is not True
+        or not valid_runtime_projection(runtime)
     ):
         raise ValueError("analysis execution attestation contract is invalid")
     return text, parsed
@@ -1527,12 +1501,13 @@ def _require_bounded_values(
 
 
 def _stat_revision(state: os.stat_result) -> tuple[int, int, int, int, int]:
+    """Comparable identity of one stat view (descriptor or pathname)."""
     return (
         int(state.st_dev),
         int(state.st_ino),
         int(state.st_size),
         int(state.st_mtime_ns),
-        int(state.st_ctime_ns),
+        identity_ctime_ns(state.st_ctime_ns),
     )
 
 
@@ -2820,31 +2795,37 @@ class AnalysisArtifactOutput:
             captured.mtime_ns,
         ):
             raise TargetChanged("analysis artifact changed while sealing commit")
+        # The terminal's object revision is the capture's descriptor view
+        # (its ctime is the change time on win32, never the pathname stat's
+        # creation time), the origin ``revalidate_stream_terminal`` holds
+        # its own descriptor views to.
         terminal = StreamTerminal(
             self.request.target,
             captured.size,
             captured.digest,
             self._ordinal,
-            int(state.st_dev),
-            int(state.st_ino),
-            int(state.st_mtime_ns),
-            int(state.st_ctime_ns),
+            captured.device,
+            captured.inode,
+            captured.mtime_ns,
+            captured.ctime_ns,
         )
         revalidate_stream_terminal(self.request.target, terminal)
         final_capture = capture_target_snapshot(self.request.target)
         final_state = os.stat(self.request.target)
-        if final_capture != captured or (
-            int(final_state.st_dev),
-            int(final_state.st_ino),
-            int(final_state.st_size),
-            int(final_state.st_mtime_ns),
-            int(final_state.st_ctime_ns),
-        ) != (
-            terminal.device,
-            terminal.inode,
-            terminal.size,
-            terminal.mtime_ns,
-            terminal.ctime_ns,
+        if (
+            final_capture != captured
+            or final_capture.ctime_ns != terminal.ctime_ns
+            or (
+                int(final_state.st_dev),
+                int(final_state.st_ino),
+                int(final_state.st_size),
+                int(final_state.st_mtime_ns),
+            ) != (
+                terminal.device,
+                terminal.inode,
+                terminal.size,
+                terminal.mtime_ns,
+            )
         ):
             raise TargetChanged("analysis artifact changed after terminal validation")
         return terminal, inspection
