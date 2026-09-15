@@ -113,13 +113,16 @@ def _run_diagnostic(shell, lifecycle, executor, started: float) -> str:
     )
 
 
-def _completed_acquisition(qapp, page, lifecycle, executor) -> None:
+def _completed_acquisition(
+    qapp, page, lifecycle, executor, *, acquisition_timeout: float = 30.0,
+) -> None:
     """Finish the real terminal Browse handoff, then select retained Run data."""
     shell, controller = _mounted(page)
     started = time.monotonic()
     _wait(
         qapp,
         lambda: _run_finished(lifecycle, executor),
+        timeout=acquisition_timeout,
         diagnostic=lambda: _run_diagnostic(shell, lifecycle, executor, started),
     )
     _wait(
