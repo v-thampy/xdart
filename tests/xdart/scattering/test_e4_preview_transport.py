@@ -3079,7 +3079,11 @@ def test_651_frame_run_hydrates_oldest_frame_with_bounded_opens(
             qapp, lambda: shell.run_controls.startButton.isEnabled()
         )
         shell.run_controls.startButton.click()
-        lv_support._completed_acquisition(qapp, page, lifecycle, _executor)
+        # This is a cache/I/O bound oracle, not a 30-second throughput gate.
+        # Allow the full 651-frame writer/display drain on shared CI runners.
+        lv_support._completed_acquisition(
+            qapp, page, lifecycle, _executor, acquisition_timeout=60.0,
+        )
         display = controller.acquisition_context.publication_store
         keys = controller.frame_keys
         assert keys and keys[-1].local_frame_label == 651
