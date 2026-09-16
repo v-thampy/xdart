@@ -9,6 +9,7 @@ environments, editable source installs, and dependency details.
 - [Conda / mamba](#using-conda--mamba)
 - [pip / uv](#using-pip--uv)
 - [Notebook environments](#headless--notebooks-with-pixi)
+- [Jupyter / VS Code kernel setup and troubleshooting](#jupyter-and-vs-code-kernel-setup)
 - [Editable Pixi installs, including Windows](#editable-install-with-pixi-recommended)
 - [Extras](#extras)
 - [HDF5 and compression performance](#performance-install-the-hdf5-stack-from-conda-forge)
@@ -146,8 +147,9 @@ pixi run jupyter lab
 many-user-directories pattern maps 1:1. Put **one** pixi workspace at a shared path
 (e.g. `/shared/xrd-env/` — its `pixi.toml`, `pixi.lock`, and `.pixi/`); users open
 their own notebook folders in VS Code and select that env's `bin/python` as the
-interpreter/kernel (VS Code auto-discovers pixi envs; "Enter interpreter path"
-always works). Register it by name once so it appears in every kernel picker:
+interpreter/kernel. Automatic discovery can miss a Pixi environment outside the
+open folder; see [kernel setup and troubleshooting](#jupyter-and-vs-code-kernel-setup).
+An administrator can register the shared environment by name:
 
 ```bash
 cd /shared/xrd-env && pixi run python -m ipykernel install --prefix /usr/local \
@@ -156,6 +158,80 @@ cd /shared/xrd-env && pixi run python -m ipykernel install --prefix /usr/local \
 
 Admins update the shared env with `pixi update` in that directory; the lockfile
 rebuilds it identically on a new machine (`pixi install`).
+
+## Jupyter and VS Code kernel setup
+
+Use your [editable Pixi checkout](#editable-install-with-pixi-recommended) or a
+[notebook Pixi workspace](#headless--notebooks-with-pixi). The editable checkout
+already includes `ipykernel`, `ipywidgets`, `anywidget`, and the other notebook
+dependencies. A standalone GUI installation alone is not this notebook workspace.
+
+### Register and select the kernel
+
+From the workspace directory, register its Python once per machine:
+
+```bash
+pixi run --locked python -m ipykernel install --user --name xdart-pixi --display-name "Python (xdart Pixi)"
+```
+
+This uses the existing Pixi environment and its installed `xdart` / `xrd_tools`.
+Registration persists across ordinary code updates; repeat the command if you
+move the workspace. If you use multiple workspaces, give each a distinct
+`--name` and `--display-name`.
+
+In VS Code:
+
+1. Install or update Microsoft's **Python** and **Jupyter** extensions; keep
+   **Python Environments** updated too if installed.
+2. Open the notebook and choose **Select Kernel → Select Another Kernel →
+   Jupyter Kernels → Python (xdart Pixi)**. The registered name appears under
+   **Jupyter Kernels**, not necessarily in **Python Environments**.
+3. Click **Run All** to initialize plots and widgets, then save the notebook
+   with the chosen kernel. Use this kernel for **Analyze Results** exports too.
+
+An older kernel named `xdart` may point to a different Conda environment. To
+verify the selected kernel, run this in a notebook cell:
+
+```python
+import sys
+import xrd_tools
+print(sys.executable)
+print(xrd_tools.__file__)
+```
+
+The executable should be inside the intended workspace's `.pixi/envs/default`
+directory (`bin/python` on macOS/Linux, `python.exe` on Windows). For an editable
+checkout, `xrd_tools.__file__` should point into that checkout's `src/xrd_tools`.
+
+### If the Pixi kernel is missing
+
+1. Confirm the registration command above completed successfully in the intended
+   workspace.
+2. Open VS Code's **Extensions** view and update **Python**, **Python Environments**
+   (if installed), and **Jupyter**, all published by Microsoft.
+3. Save your work, **fully quit VS Code and reopen it**, then open the notebook
+   and return to **Select Another Kernel → Jupyter Kernels**. Extension updates
+   and a full restart can resolve discovery problems even when registration
+   already succeeded; **Developer: Reload Window** may not be sufficient.
+4. If it is still absent, use **Python: Select Interpreter → Enter Interpreter
+   Path…** from the Command Palette and choose the workspace's Python executable
+   shown above, then revisit the notebook kernel picker.
+
+See [VS Code's kernel-selection guide](https://code.visualstudio.com/docs/datascience/jupyter-kernel-management)
+and [Pixi's VS Code guide](https://pixi.prefix.dev/latest/integration/editor/vscode/).
+
+### Plots, widgets, and compressed results
+
+Interactive widgets such as `xrd_tools.gui.widgets.PatternViewer` need a running
+kernel and their setup cells executed. A saved notebook preview alone cannot
+respond to controls. When reading compressed NeXus results, register the
+installed HDF5 filters before reading data:
+
+```python
+import hdf5plugin
+```
+
+To use JupyterLab instead, run `pixi run --locked jupyter lab` from the workspace.
 
 ## Extras
 

@@ -31,23 +31,17 @@ fitting, and analysis of processed results.
 
 ## Quick start
 
-**Jupyter / VS Code: select the xdart Pixi kernel.** If you already use the
-[editable Pixi checkout](docs/INSTALLATION.md#editable-install-with-pixi-recommended)
-or a [notebook Pixi workspace](docs/INSTALLATION.md#headless--notebooks-with-pixi),
-register its Python once per machine. Run this from that workspace directory
-(for example, `~/repos/xdart`):
+**Jupyter / VS Code:** from your editable checkout or notebook Pixi workspace,
+register its kernel once:
 
 ```bash
 pixi run --locked python -m ipykernel install --user --name xdart-pixi --display-name "Python (xdart Pixi)"
 ```
 
-In VS Code, install Microsoft's **Python** and **Jupyter** extensions, then open
-the notebook and choose **Select Kernel → Select Another Kernel → Jupyter
-Kernels → Python (xdart Pixi)**. Click **Run All** to initialize the plots and
-widgets. If the new kernel is missing, run **Developer: Reload Window** from
-the Command Palette and select it again. This uses the existing Pixi Python
-and its installed `xdart` / `xrd_tools`; it does not create another environment.
-See the [notebook setup below](#pixi-notebook-kernel) for details.
+Select **Python (xdart Pixi)** in the notebook's kernel picker, then **Run All**.
+If it is missing, update the VS Code extensions and restart VS Code.
+[Notebook setup and troubleshooting](docs/INSTALLATION.md#jupyter-and-vs-code-kernel-setup)
+covers installation, kernel selection, and the missing-kernel steps.
 
 **Installing the desktop GUI:**
 
@@ -416,35 +410,10 @@ observed and expected identity tuples so the changed field can be read off.
 
 <a id="pixi-notebook-kernel"></a>
 
-**Start here for Jupyter and VS Code.** Use the
-[editable Pixi checkout](docs/INSTALLATION.md#editable-install-with-pixi-recommended)
-or create a [notebook Pixi workspace](docs/INSTALLATION.md#headless--notebooks-with-pixi).
-The editable workspace already includes `ipykernel`, `ipywidgets`, `anywidget`
-and the other notebook dependencies. From the workspace directory, register
-its kernel once per machine:
-
-```bash
-pixi run --locked python -m ipykernel install --user --name xdart-pixi --display-name "Python (xdart Pixi)"
-```
-
-With Microsoft's **Python** and **Jupyter** extensions installed in VS Code,
-open a notebook and choose **Select Kernel → Select Another Kernel → Jupyter
-Kernels → Python (xdart Pixi)**, then **Run All**. If it is missing, use
-**Developer: Reload Window** from the Command Palette. Select this named kernel
-for notebooks exported by **Analyze Results**, too; an older kernel named
-`xdart` may refer to a different environment. Registration persists across
-ordinary code updates; repeat it if the workspace moves to a different path.
-The same environment can also run JupyterLab with `pixi run --locked jupyter lab`.
-
-When reading compressed NeXus results, register the installed HDF5 filters in
-the notebook before reading data:
-
-```python
-import hdf5plugin
-```
-
-Interactive widgets such as `xrd_tools.gui.widgets.PatternViewer` need a running
-notebook kernel. A saved notebook preview alone cannot respond to their controls.
+**Using Jupyter or VS Code?** Select **Python (xdart Pixi)** and **Run All**,
+including for notebooks exported by **Analyze Results**. See
+[notebook setup and troubleshooting](docs/INSTALLATION.md#jupyter-and-vs-code-kernel-setup)
+for one-time registration, missing kernels, and interactive widgets.
 
 The canonical reduction path — the one the GUI itself drives — is the
 streaming reduction spine: choose a `ReductionPlan`, supply a `Scan`, point it
