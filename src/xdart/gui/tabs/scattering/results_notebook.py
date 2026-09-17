@@ -44,15 +44,23 @@ def results_notebook_text(
                 "# Analyze Selected Results\n\n"
                 "This notebook reads the exact result files selected in XDART. "
                 "It does not rerun integration or copy data.\n\n"
-                "Run it in a Python environment with `xrd_tools` and `matplotlib`; "
+                "Run it in the xdart Pixi kernel or an environment with "
+                "`xdart[notebook]`. Matplotlib uses the interactive widget backend "
+                "(`%matplotlib widget`, also called `%matplotlib ipympl`); "
                 "the paths below refer to existing local result files. For a NeXus "
                 "result, `read_selected_cake()` reads one 2-D frame on demand.\n"
             ),
         },
         _code(
             "imports",
+            "import os\n"
             "from pathlib import Path\n"
+            "from IPython import get_ipython\n\n"
+            "# Equivalent to %matplotlib widget; use inline only for headless checks.\n"
+            "if get_ipython() is not None:\n"
+            "    get_ipython().run_line_magic('matplotlib', os.environ.get('XDART_NOTEBOOK_BACKEND', 'widget'))\n\n"
             "import matplotlib.pyplot as plt\n"
+            "import hdf5plugin  # Register filters for compressed NeXus results.\n"
             "from xrd_tools.io import get_metadata, open_scan, read_xye\n\n"
             f"RESULT_KIND = {kind!r}\n"
             f"RESULT_PATHS = tuple(Path(path) for path in {paths!r})\n"

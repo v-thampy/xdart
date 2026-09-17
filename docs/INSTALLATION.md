@@ -222,6 +222,15 @@ and [Pixi's VS Code guide](https://pixi.prefix.dev/latest/integration/editor/vsc
 
 ### Plots, widgets, and compressed results
 
+The example notebooks and new **Analyze Results** exports default to interactive
+Matplotlib using `%matplotlib widget` (equivalent to `%matplotlib ipympl`).
+`ipympl` is already included in the editable Pixi workspace and notebook extra.
+Run the backend setup before importing `matplotlib.pyplot`; restart the kernel
+after changing backends. For headless execution, set
+`XDART_NOTEBOOK_BACKEND=inline` before launching Jupyter. This setting affects
+Matplotlib only; Plotly plots have their own zoom and hover controls.
+See the [ipympl guide](https://matplotlib.org/ipympl/index.html).
+
 Interactive widgets such as `xrd_tools.gui.widgets.PatternViewer` need a running
 kernel and their setup cells executed. A saved notebook preview alone cannot
 respond to controls. When reading compressed NeXus results, register the

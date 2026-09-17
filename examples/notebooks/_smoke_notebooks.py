@@ -95,6 +95,8 @@ def main() -> int:
         os.environ["XDART_NOTEBOOK_SMOKE"] = "1"
         os.environ.pop("XDART_TEST_DATA", None)
     selected = args.only or EXPECTED
+    # No interactive frontend in this gate; user notebooks default to ipympl.
+    os.environ["XDART_NOTEBOOK_BACKEND"] = "inline"
     with tempfile.TemporaryDirectory(prefix="xdart-notebook-smoke-") as tmp:
         for name in EXECUTION_ORDER:
             if name not in selected:

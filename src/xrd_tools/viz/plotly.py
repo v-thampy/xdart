@@ -31,7 +31,7 @@ __all__ = [
     "plot_pattern_fit",
     "plot_phase_fractions",
     "plot_peak_fit",
-    "plot_time_resolved_waterfall",
+    "plot_waterfall",
     "plot_peak_fit_frame",
     "plot_thermal_history",
 ]
@@ -56,26 +56,40 @@ def _import_go():
     return go
 
 
-def plot_time_resolved_waterfall(
+def plot_waterfall(
     dataset: Any,
     *,
     intensity_var: str | None = None,
-    time_coord: str = "time",
+    x_coord: str = "q",
+    y_coord: str = "frame",
     log_intensity: bool = False,
     color_percentiles: tuple[float, float] = (1.0, 99.5),
     colorscale: str = "Viridis",
     title: str | None = None,
     height: int = 620,
 ):
-    """Interactive q-versus-time heatmap from a time-resolved Dataset."""
+    """Plot intensity against any two one-dimensional Dataset coordinates.
+
+    For example, use ``y_coord="time"`` or ``y_coord="temperature"`` for
+    a series indexed by elapsed time or temperature. Coordinate ``long_name``
+    and ``units`` attributes supply axis and hover labels, falling back to
+    the coordinate name. Intensity dimensions are ordered as (y, x) for
+    display; coordinate order and the input Dataset are preserved.
+
+    ``log_intensity`` and ``color_percentiles`` affect only the display.
+    No row normalization is applied.
+    """
     go = _import_go()
     if intensity_var is None:
         intensity_var = (
             "intensity_normalized"
             if "intensity_normalized" in dataset else "intensity")
-    q = np.asarray(dataset.coords["q"].values, dtype=float)
-    time = np.asarray(dataset.coords[time_coord].values, dtype=float)
-    values = np.asarray(dataset[intensity_var].values, dtype=float)
+    x = dataset.coords[x_coord]
+    y = dataset.coords[y_coord]
+    intensity = dataset[intensity_var]
+    if x.ndim != 1 or y.ndim != 1 or x.dims == y.dims:
+        raise ValueError("waterfall coordinates must span two distinct dimensions")
+    values = np.asarray(intensity.transpose(y.dims[0], x.dims[0]).values, dtype=float)
     shown = values
     color_title = intensity_var
     if log_intensity:
@@ -88,24 +102,29 @@ def plot_time_resolved_waterfall(
         zmin, zmax = np.nanpercentile(finite, color_percentiles)
     else:
         zmin = zmax = None
-    time_unit = str(dataset.coords[time_coord].attrs.get("units", ""))
-    q_unit = str(dataset.coords["q"].attrs.get("units", ""))
+    def axis_label(coordinate, name):
+        label = str(coordinate.attrs.get("long_name", name))
+        unit = str(coordinate.attrs.get("units", ""))
+        return f"{label} ({unit})" if unit else label
+
+    x_label, y_label = axis_label(x, x_coord), axis_label(y, y_coord)
     fig = go.Figure(go.Heatmap(
-        x=q,
-        y=time,
+        x=np.asarray(x.values),
+        y=np.asarray(y.values),
         z=shown,
         zmin=zmin,
         zmax=zmax,
         colorscale=colorscale,
         colorbar=dict(title=color_title),
         hovertemplate=(
-            "q=%{x:.5g}<br>time=%{y:.6g}<br>intensity=%{z:.5g}<extra></extra>"),
+            f"{x_label}=%{{x:.5g}}<br>{y_label}=%{{y:.6g}}<br>"
+            f"{color_title}=%{{z:.5g}}<extra></extra>"),
     ))
     fig.update_layout(
         height=height,
-        title=title or f"Time-resolved XRD: {intensity_var}",
-        xaxis_title=f"q ({q_unit})" if q_unit else "q",
-        yaxis_title=f"time ({time_unit})" if time_unit else time_coord,
+        title=title or f"Waterfall: {intensity_var}",
+        xaxis_title=x_label,
+        yaxis_title=y_label,
         margin=dict(l=70, r=30, t=55, b=60),
     )
     return fig

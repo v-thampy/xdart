@@ -28,6 +28,15 @@ def code(source: str):
 
 def notebook(cells: list):
     nb = nbformat.v4.new_notebook(cells=cells)
+    first_code = next(cell for cell in nb.cells if cell.cell_type == "code")
+    first_code.source = dedent("""
+        import os
+        from IPython import get_ipython
+
+        # Equivalent to %matplotlib widget; headless checks explicitly use inline.
+        if get_ipython() is not None:
+            get_ipython().run_line_magic("matplotlib", os.environ.get("XDART_NOTEBOOK_BACKEND", "widget"))
+        """).strip() + "\n\n" + first_code.source
     nb.metadata = {
         "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
         "language_info": {"name": "python", "version": "3"},
@@ -648,7 +657,7 @@ NB_TIME_RESOLVED = [
         from xrd_tools.gui.widgets import ImageViewer, PatternViewer, PeakFitControls
         from xrd_tools.core import IntegrationResult1D, IntegrationResult2D
         from xrd_tools.io.nexus import write_nexus
-        from xrd_tools.viz import plot_peak_fit_frame, plot_thermal_history, plot_time_resolved_waterfall
+        from xrd_tools.viz import plot_peak_fit_frame, plot_thermal_history, plot_waterfall
         """
     ),
     CONFIG,
@@ -781,7 +790,7 @@ NB_TIME_RESOLVED = [
                     normalized = normalize_reference_band(dataset, q_range=tuple(q_band.value), intensity_var=source_var, output_var="intensity_band_normalized")
                     prepared = select_time_zero(bin_time_resolved(flag_normalization_outliers(normalized), bin_size=bin_size.value), zero_pattern=0)
                     NOTEBOOK_STATE.update(preprocesses=NOTEBOOK_STATE["preprocesses"] + 1, prepared=prepared, fits=None, thermal=None)
-                    display(plot_time_resolved_waterfall(prepared, intensity_var="intensity_band_normalized", log_intensity=True))
+                    display(plot_waterfall(prepared, y_coord="time", intensity_var="intensity_band_normalized", log_intensity=True))
                     status.value = "<b>Reference-band preprocessing complete.</b>" if not fallback else "<b>Selected monitor was unavailable; used documented reference-band fallback.</b>"
                 except Exception as exc:
                     status.value = f"<b>Preprocessing failed:</b> {exc}"

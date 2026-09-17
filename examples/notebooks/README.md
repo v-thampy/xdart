@@ -25,11 +25,34 @@ or test-data directories; temporary smoke artifacts use `/tmp`.
 
 ## Interactive behavior
 
+Matplotlib defaults to the interactive **widget** (`ipympl`) backend, equivalent
+to `%matplotlib widget` or `%matplotlib ipympl`. The notebook extra includes
+`ipympl`. The first import cell selects it before importing `pyplot`; restart
+the kernel and run all cells after updating an older notebook. For automated
+execution without a frontend, set `XDART_NOTEBOOK_BACKEND=inline`; the smoke
+runner does this explicitly. Plotly figures remain independently interactive.
+
 Existing `ImageViewer`, `PatternViewer`, `PeakFitControls`, and related
 notebook-safe widgets are reused where their contracts fit. Sliders use
 `continuous_update=False`; integration and fitting actions are explicit
 buttons. Changing a display control does not trigger a reduction or a batch
 fit.
+
+For a waterfall, choose any two one-dimensional coordinates on the intensity
+Dataset:
+
+```python
+from xrd_tools.viz import plot_waterfall
+
+fig = plot_waterfall(dataset, x_coord="q", y_coord="temperature")
+fig.show()
+```
+
+The default coordinates are `q` and `frame`; select `y_coord="time"` for a time
+series. Coordinate `long_name` and `units` attributes set axis and hover labels.
+The helper preserves row order and intensity values; logarithmic colors and
+percentile limits affect only the display. The former time-specific function
+name has been replaced without an alias.
 
 ## Generate and verify
 

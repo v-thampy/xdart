@@ -12,7 +12,7 @@
 | Pilot/batch peak fitting and quality columns | HZO and flash notebooks | `PeakFitPlan`, `PeakFitAnalyzer`, `fit_peak_series`, `flag_fit_quality` | Existing plan/runner reused; runner now projects redchi/chisqr/AIC/BIC for compact results. |
 | q/HKL lattice, calibration, rate, export | flash notebook | `add_lattice_results`, calibration classes, `add_temperature_results`, `export_time_resolved_results` | Standardized with uncertainty propagation, physical-time guard, NetCDF-safe attrs, and CSV tests. |
 | Static pattern/image plotting | every viewer notebook | `viz.plot_1d`, `viz.plot_image` | Existing public helpers reused. |
-| Interactive waterfall, saved-fit, thermal trends | flash notebook | `plot_time_resolved_waterfall`, `plot_peak_fit_frame`, `plot_thermal_history` | General xarray contracts promoted to `viz.plotly` and tested without mutating inputs. |
+| Interactive waterfall, saved-fit, thermal trends | flash notebook | `plot_waterfall`, `plot_peak_fit_frame`, `plot_thermal_history` | General xarray contracts promoted to `viz.plotly` and tested without mutating inputs. |
 | Stitch and RSM gridding | legacy Stitch/RSM notebooks | `StitchPlan/run_stitch`, `RSMPlan/run_rsm`, `RSMVolume` | Existing headless owners reused; experiment geometry remains configuration. |
 
 Deferred: sustained raw-source cursors belong to R2/source ownership; writer/session

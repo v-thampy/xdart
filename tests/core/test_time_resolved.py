@@ -30,7 +30,7 @@ from xrd_tools.io.nexus import write_nexus
 from xrd_tools.viz.plotly import (
     plot_peak_fit_frame,
     plot_thermal_history,
-    plot_time_resolved_waterfall,
+    plot_waterfall,
 )
 
 
@@ -360,7 +360,7 @@ def test_peak_series_lattice_temperature_and_rate(tmp_path):
     np.testing.assert_allclose(table.temperature_derivative_per_A([3.92, 3.93]), [30000, 15000])
 
     original = ds.copy(deep=True)
-    waterfall = plot_time_resolved_waterfall(ds)
+    waterfall = plot_waterfall(ds, y_coord="time")
     fit_figure = plot_peak_fit_frame(thermal, 0)
     thermal_figure = plot_thermal_history(thermal)
     assert len(waterfall.data) == 1
