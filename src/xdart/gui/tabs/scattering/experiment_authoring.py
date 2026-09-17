@@ -1695,6 +1695,8 @@ def _cleanup_at_admitted_parent(
 def _qualify_existing_mask(
     path: Path, expected_shape: tuple[int, int],
 ) -> ExistingMaskProof:
+    if path.suffix.lower() not in {".edf", ".npy"}:
+        raise ValueError("Mask files must use .edf or .npy")
     raw = path.lstat(); before = SourceFileState.capture(path)
     if stat.S_ISLNK(raw.st_mode) or not stat.S_ISREG(raw.st_mode):
         raise ValueError("existing mask is not a regular file")

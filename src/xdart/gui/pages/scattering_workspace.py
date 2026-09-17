@@ -229,7 +229,7 @@ def _control_path_chooser(widget):
             if path == PONI_FILE
             else (
                 "Choose detector mask",
-                "Detector masks (*.edf *.tif *.tiff *.npy);;All files (*)",
+                "Detector masks (*.edf *.npy)",
             ))
         selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
             widget, title, start_directory, file_filter)

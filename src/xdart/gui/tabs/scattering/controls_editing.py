@@ -1080,6 +1080,9 @@ def _control_value(
     value: object,
 ) -> object | EditRefusal:
     if path in {PROJECT_ROOT, SAVE_PATH, PONI_FILE, MASK_FILE}:
+        if (path == MASK_FILE and type(value) is str and value
+                and Path(value).suffix.lower() not in {".edf", ".npy"}):
+            return EditRefusal("Mask files must use .edf or .npy")
         return value if type(value) is str else EditRefusal("A path must be text.")
     if path == OUTPUT_MODE:
         return (

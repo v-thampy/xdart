@@ -292,6 +292,9 @@ are retained regardless of saturation or intensity. Nonfinite values are still
 invalid. The **global mask file is always honored**, whether Threshold is on or
 off, and Threshold also works when no mask file is specified.
 
+**Mask File** accepts `.edf` and `.npy` files only. TIFF detector images can
+still be used as source images in **Make Mask**.
+
 #### Background subtraction
 
 Configure in **Processing → Background**:

@@ -230,7 +230,7 @@ def load_mask(
     mask : ndarray, path-like
         * **ndarray** — used directly.  Boolean arrays are returned as-is.
           Integer/float arrays are converted: non-zero values → ``True`` (bad).
-        * **str / Path** — path to a mask file (e.g. ``.edf``, ``.tif``).
+        * **str / Path** — path to an ``.edf`` or ``.npy`` mask file.
           The file is read via :func:`read_image` and non-zero pixels are
           treated as bad.
     threshold : float, optional
@@ -246,6 +246,8 @@ def load_mask(
         Boolean mask, ``True`` = bad pixel.
     """
     if isinstance(mask, (str, Path)):
+        if Path(mask).suffix.lower() not in {".edf", ".npy"}:
+            raise ValueError("Mask files must use .edf or .npy")
         # Preserve the source dtype while decoding.  The boolean comparison
         # already treats NaN as bad, and avoiding the historical float64
         # promotion keeps the admission bound representative of peak storage.

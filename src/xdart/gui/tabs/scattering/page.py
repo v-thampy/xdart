@@ -1989,7 +1989,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                             directory,
                             "PONI files (*.poni);;All files (*)"
                             if asset == "poni" else
-                            "Detector masks (*.edf *.tif *.tiff *.npy);;All files (*)",
+                            "Detector masks (*.edf *.npy)",
                         )[0])
         except Exception as error:
             self._error_notice("Asset chooser failed", error); return

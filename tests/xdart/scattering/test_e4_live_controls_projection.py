@@ -464,6 +464,20 @@ def test_invalid_integration_edits_leave_snapshot_exact() -> None:
         assert snapshot.thaw() == before
 
 
+def test_mask_file_edits_accept_only_edf_npy_or_clear() -> None:
+    snapshot = RunIntentStore(_intent()).snapshot()
+    before = snapshot.thaw()
+    for value in ("/mask.tif", "/mask.tiff", "/mask.TIFF", "/mask.h5"):
+        refused = reduce_control_edit(snapshot, ("Signal", "mask_file"), value)
+        assert isinstance(refused, EditRefusal)
+        assert ".edf or .npy" in refused.reason
+        assert snapshot.thaw() == before
+    for value in ("/mask.edf", "/mask.npy", "/mask.EDF", "/mask.NPY", ""):
+        changed = reduce_control_edit(snapshot, ("Signal", "mask_file"), value)
+        assert isinstance(changed, RunIntent)
+        assert changed.mask_file == value
+
+
 def test_source_edit_replaces_one_complete_immutable_source_without_io(
     monkeypatch,
 ) -> None:

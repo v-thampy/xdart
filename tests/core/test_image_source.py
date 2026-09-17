@@ -375,13 +375,30 @@ def test_read_image_npy_stack_indexes_frame(tmp_path):
     np.testing.assert_array_equal(read_image(p, frame=1), stack[1].astype(float))
 
 
-def test_load_mask_npy_roundtrip(tmp_path):
-    """A boolean .npy mask round-trips through load_mask (the GUI mask path:
-    str_browse value -> read_image -> bool)."""
+@pytest.mark.parametrize("suffix", (".edf", ".npy", ".EDF", ".NPY"))
+def test_load_mask_file_roundtrip(tmp_path, suffix):
+    """Supported mask files retain their bad-pixel meaning."""
+    from fabio.edfimage import EdfImage
     from xrd_tools.io.image import load_mask
     mask = np.array([[True, False], [False, True]])
-    p = tmp_path / "m.npy"
-    np.save(p, mask)
+    p = tmp_path / f"mask{suffix}"
+    if suffix.lower() == ".npy":
+        with p.open("wb") as stream:
+            np.save(stream, mask)
+    else:
+        EdfImage(data=mask.astype("u1")).write(str(p))
     out = load_mask(p)
     assert out.dtype == bool
     np.testing.assert_array_equal(out, mask)
+
+
+@pytest.mark.parametrize("suffix", (".tif", ".tiff", ".TIFF"))
+def test_tiff_detector_image_cannot_be_loaded_as_mask(tmp_path, suffix):
+    import tifffile
+    from xrd_tools.io.image import load_mask, read_image
+    data = np.array([[0, 1], [1, 0]], dtype="u2")
+    path = tmp_path / f"detector{suffix}"
+    tifffile.imwrite(path, data)
+    np.testing.assert_array_equal(read_image(path), data)
+    with pytest.raises(ValueError, match=r"\.edf or \.npy"):
+        load_mask(path)

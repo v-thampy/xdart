@@ -1004,6 +1004,26 @@ def test_timer_poll_dispatches_exact_mask_update(tmp_path, monkeypatch, qapp) ->
     finally: _close(page, qapp)
 
 
+@pytest.mark.parametrize("suffix", (".edf", ".npy", ".tif", ".tiff"))
+def test_existing_mask_adoption_accepts_only_edf_and_npy(tmp_path, suffix):
+    path = tmp_path / f"mask{suffix}"
+    data = np.array([[0, 1], [1, 0]], dtype="u1")
+    if suffix == ".edf":
+        EdfImage(data=data).write(str(path))
+    elif suffix == ".npy":
+        np.save(path, data)
+    else:
+        tifffile.imwrite(path, data)
+    request = AssetValidationRequest("mask", str(path), data.shape)
+    if suffix in {".edf", ".npy"}:
+        result = authoring.validate_authored_asset(request)
+        assert result.candidate.path == str(path)
+        np.testing.assert_array_equal(load_mask(path), data != 0)
+    else:
+        with pytest.raises(ValueError, match=r"\.edf or \.npy"):
+            authoring.validate_authored_asset(request)
+
+
 def test_mask_confirmation_accept_cancel_and_choose_alternate_are_transactional(
     tmp_path, monkeypatch, qapp,
 ) -> None:
