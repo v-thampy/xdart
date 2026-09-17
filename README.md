@@ -680,12 +680,12 @@ Use the repository's **shared Pixi workspace** for editable source installs.
 the packages locked for its own platform. The xdart source is already editable,
 so source edits take effect when you restart the application.
 
-The checked-in workspace currently includes Apple Silicon macOS (`osx-arm64`)
-and Linux x86-64 (`linux-64`). Windows x86-64 (`win-64`) still needs the
-[one-time platform setup and native validation](docs/INSTALLATION.md#adding-windows-to-the-shared-workspace).
-Once that manifest and lockfile change is committed and merged, future Windows
-clones use the same `pixi install --locked` and `pixi run --locked xdart` commands.
-Users do not add the platform or regenerate the lockfile on each new machine.
+The checked-in workspace includes Apple Silicon macOS (`osx-arm64`), Linux
+x86-64 (`linux-64`), and Windows x86-64 (`win-64`). All three use
+`pixi install --locked` and `pixi run --locked xdart`; users do not add platforms
+or regenerate the lockfile on each machine. See the
+[fresh Windows setup and native checks](docs/INSTALLATION.md#windows-fresh-editable-install).
+Windows dependencies are locked; native application validation remains pending.
 
 After saving or committing local work, update an existing supported checkout with:
 

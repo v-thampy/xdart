@@ -308,7 +308,8 @@ on-disk filter changes.)
 
 ## Editable install with Pixi (recommended)
 
-On **Apple Silicon macOS or Linux x86-64**, use the repository's locked workspace:
+On **Apple Silicon macOS, Linux x86-64, or Windows x86-64**, use the repository's
+locked workspace:
 
 ```bash
 git clone https://github.com/v-thampy/xdart.git
@@ -346,33 +347,38 @@ with `pixi list`, or confirm the source location with:
 pixi run --locked python -c "import xdart; print(xdart.__file__)"
 ```
 
-### Adding Windows to the shared workspace
+### Windows fresh editable install
 
-The checked-in workspace currently locks only `osx-arm64` and `linux-64`.
-Windows x86-64 (`win-64`) needs the following **one-time repository change** and
-native Windows validation. Do this on a feature branch before merging it; a
-separate Windows workspace is unnecessary once the shared lock includes Windows.
+The shared manifest and lockfile include `win-64` for Intel/AMD 64-bit Windows.
+There is no platform-add or lock-generation step on a new machine. Dependency
+resolution has been checked; native Windows application validation remains pending.
 
-From the source checkout, add the platform and generate its lock entries:
+In PowerShell, install Git and Pixi if needed:
 
 ```powershell
-pixi workspace platform add win-64 --no-install
-git diff -- pyproject.toml pixi.lock
+winget install --id Git.Git -e --source winget
+winget install --id prefix-dev.pixi -e --source winget
 ```
 
-The command updates both `pyproject.toml` and `pixi.lock`. Keep the existing
-dependency pins and review any changes to the already locked macOS/Linux
-packages. No blanket `pixi update` is needed. See the
-[Pixi platform command](https://pixi.prefix.dev/latest/reference/cli/pixi/workspace/platform/add/).
-
-On a Windows x86-64 machine, install from that lock and confirm that the imported
-xdart source is inside the checkout's `src` directory:
+These are the official [Git](https://git-scm.com/install/windows) and
+[Pixi](https://pixi.prefix.dev/latest/installation/) installation methods.
+Close and reopen PowerShell so both commands are on PATH. Then clone and install:
 
 ```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\repos" | Out-Null
+Set-Location "$env:USERPROFILE\repos"
+git clone https://github.com/v-thampy/xdart.git
+Set-Location xdart
+git rev-parse HEAD
 pixi install --locked
 pixi run --locked python -c "import sys, xdart; print(sys.version); print(sys.executable); print(xdart.__file__)"
 pixi list
 ```
+
+Expect Python 3.13, the executable under `.pixi\envs\default\python.exe`, and
+xdart under this checkout's `src\xdart`. Pixi installs Python and the editable
+package; a separate Python/Conda install or `pip install -e` command is unnecessary.
+For VS Code/Jupyter, follow the [kernel setup](#jupyter-and-vs-code-kernel-setup) after installation.
 
 Run these small, synthetic-data checks for native HDF5/LZ4, pyFAI, and
 xrayutilities integration:
@@ -386,14 +392,22 @@ $LASTEXITCODE
 ```
 
 Require all three tests to pass without skips and exit normally with code 0.
-Then launch `pixi run --locked xdart`, open representative data, select frames,
-and close the application normally. Record the Windows results with the change;
-generating a lockfile on another OS does not validate native Windows behavior.
+Then launch:
 
-Commit `pyproject.toml` and `pixi.lock` together. Once the change is merged,
-**future Windows clones use the same clone/install/launch commands above**.
-Each machine still installs Git, Pixi, and its own local environment, but users
-do not repeat the platform addition or regenerate the lockfile.
+```powershell
+pixi run --locked xdart
+$LASTEXITCODE
+```
+
+Open representative data, process a scan, select frames, and close normally;
+expect exit 0. The three checks establish basic native-library functionality,
+not full application support or release readiness. Average, Stitch, RSM, and
+reintegration have known Windows portability issues that remain separate from
+installing this environment. Record native results before claiming support for
+those workflows.
+
+Each new machine installs Git, Pixi, and its own local environment; the shared
+Windows platform declaration and lock entries carry over with the repository.
 
 Future dependency changes require maintainers to update the shared lockfile and
 validate affected platforms. Resolving more platforms can take longer or expose
