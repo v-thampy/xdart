@@ -390,6 +390,13 @@ pyFAI-calib2
 
 Refer to the pyFAI documentation for detailed calibration procedures.
 
+For a direct-beam detector-angle scan, the headless
+[`calibrate_direct_beam` and SPEC convenience API](docs/core/direct_beam.md)
+fit sample–detector distance and retain per-frame fit diagnostics. A
+[usage notebook](examples/direct_beam_distance_calibration.ipynb) demonstrates
+explicit arrays, SPEC/raw loading and residual plots. This measures distance
+under a declared flat-detector geometry; it does not generate a full PONI.
+
 ### Troubleshooting
 
 **pyFAI installation fails on macOS/Windows:**
