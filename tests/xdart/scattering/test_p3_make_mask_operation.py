@@ -368,8 +368,8 @@ def test_request_canonicalizes_alias_and_begin_revalidates_fixed_facts(tmp_path,
         request.source_directory, request.directory_identity,
     )
     assert slot.begin_mask(forged, OperationContextStamp(0)) is None
-    Path(request.final_path).write_text("foreign"); assert slot.begin_mask(request, OperationContextStamp(0)) is None and len(calls) == 1
-    assert Path(request.final_path).read_text() == "foreign" and slot.owned is False
+    Path(request.final_path).write_text("existing"); assert slot.begin_mask(request, OperationContextStamp(0)) == OperationIdentity(9) and len(calls) == 2
+    assert Path(request.final_path).read_text() == "existing" and slot.owned is False
     Path(request.final_path).unlink(); binary.unlink(); assert slot.begin_mask(request, OperationContextStamp(0)) is None
 
 
@@ -648,9 +648,10 @@ def test_mask_decoded_encoded_and_inverted_truth_refuse(tmp_path, monkeypatch) -
     monkeypatch.setattr(authoring, "_MASK_LIMIT", 64 << 20); monkeypatch.setattr(authoring, "load_mask", lambda value: np.zeros(value.shape, dtype=bool))
     assert _direct(request)[0].status is OperationTerminalStatus.FAILED
 
-@pytest.mark.parametrize("failure", ("source", "source_sha", "stage", "stage_sha", "seal", "foreign", "nonzero", "missing", "empty"))
-def test_drift_foreign_nonzero_and_missing_output_are_zero_effect(tmp_path, monkeypatch, failure) -> None:
+@pytest.mark.parametrize("failure", ("source", "source_sha", "stage", "stage_sha", "seal", "nonzero", "missing", "empty"))
+def test_drift_nonzero_and_missing_output_keep_existing_mask(tmp_path, monkeypatch, failure) -> None:
     request = _request(tmp_path, monkeypatch); mask = np.ones((2, 4), dtype=np.uint8); outputs = []
+    Path(request.final_path).write_bytes(b"existing mask")
     def same_mtime_drift(path):
         before = path.stat(); payload = bytearray(path.read_bytes()); payload[-1] ^= 1; path.write_bytes(payload)
         os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
@@ -660,13 +661,11 @@ def test_drift_foreign_nonzero_and_missing_output_are_zero_effect(tmp_path, monk
         if failure == "stage": private.write_bytes(b"drift")
         if failure == "stage_sha": same_mtime_drift(private)
         if failure == "seal": outputs.append(_output)
-        if failure == "foreign": Path(request.final_path).write_bytes(b"foreign")
         if failure == "empty": _output.write_bytes(b"")
     _install_process(monkeypatch, mask, code=7 if failure == "nonzero" else 0, hook=hook, missing=failure == "missing")
     seal = (lambda _identity: (outputs[0].write_bytes(b"drift"), True)[1]) if failure == "seal" else (lambda _identity: True)
     terminal, _ = _direct(request, seal=seal); assert terminal.status is OperationTerminalStatus.FAILED and not terminal.payload.published
-    if failure == "foreign": assert Path(request.final_path).read_bytes() == b"foreign"
-    else: assert not Path(request.final_path).exists()
+    assert Path(request.final_path).read_bytes() == b"existing mask"
 
 
 @pytest.mark.parametrize("phase", ("prelaunch", "postprocess"))
@@ -697,16 +696,31 @@ def test_mask_parent_rename_and_symlink_swap_is_zero_effect(
     assert not terminal.payload.published
     assert not Path(request.final_path).exists()
     assert len(calls) == (0 if phase == "prelaunch" else 1)
-def test_link_time_foreign_final_wins_without_open_or_cleanup(tmp_path, monkeypatch) -> None:
+def test_mask_created_during_editing_is_replaced_on_save(tmp_path, monkeypatch) -> None:
     request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8)); real_link = authoring._link
     def race(source, final, **options):
         if options.get("dst_dir_fd") is not None:
             Path(request.final_path).write_bytes(b"foreign")
-            raise FileExistsError(final)
         return real_link(source, final, **options)
     monkeypatch.setattr(authoring, "_link", race); terminal, _ = _direct(request)
-    assert terminal.status is OperationTerminalStatus.FAILED and not terminal.payload.published
-    assert Path(request.final_path).read_bytes() == b"foreign"
+    assert terminal.status is OperationTerminalStatus.RETURNED, terminal.diagnostic
+    assert terminal.payload.published
+    np.testing.assert_array_equal(load_mask(request.final_path), np.ones((2, 4), dtype=bool))
+    assert not tuple(tmp_path.glob(".xdart-mask-*"))
+
+
+def test_failed_mask_replacement_cleans_stage_and_preserves_destination(tmp_path, monkeypatch) -> None:
+    request = _request(tmp_path, monkeypatch)
+    destination = Path(request.final_path)
+    destination.mkdir()
+    existing = destination / "keep"
+    existing.write_bytes(b"existing")
+    _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
+    terminal, _ = _direct(request)
+    assert terminal.status is OperationTerminalStatus.FAILED
+    assert not terminal.payload.published and not terminal.payload.recovery_path
+    assert existing.read_bytes() == b"existing"
+    assert not tuple(tmp_path.glob(".xdart-mask-*"))
 
 
 def test_executable_replacement_after_qualification_refuses_before_popen(

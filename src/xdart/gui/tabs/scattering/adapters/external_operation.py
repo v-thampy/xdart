@@ -207,7 +207,6 @@ class OperationSlot:
             state = source.lstat(); valid = (
                 source.resolve(strict=True) == source
                 and stat.S_ISREG(state.st_mode) and os.access(source, os.R_OK)
-                and not os.path.lexists(request.final_path)
                 and Path(request.executable).stem.casefold() == "pyfai-drawmask" and resolve_mask_executable(request.executable) == request.executable
             )
         except (OSError, ValueError):

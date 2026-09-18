@@ -1345,11 +1345,9 @@ def prepare_mask_request(selected: str, *, current_poni: str = "", current_mask:
             source, exact_hdf_url, read=False,
         )
     final = Path(os.path.splitext(str(source))[0] + "-mask.edf")
-    if os.path.lexists(final):
-        raise ValueError(f"Mask output already exists: {final}\nThe existing mask was left unchanged.")
     key = os.path.normcase(os.path.normpath(str(final)))
-    current = {os.path.normcase(os.path.normpath(str(Path(value).expanduser().resolve(strict=False)))) for value in (current_poni, current_mask) if value}
-    if key in current: raise ValueError("Mask output must differ from current assets.")
+    if current_poni and key == os.path.normcase(os.path.normpath(str(Path(current_poni).expanduser().resolve(strict=False)))):
+        raise ValueError("Mask output must differ from the current calibration.")
     executable = resolve_mask_executable()
     if executable is None: raise ValueError("pyFAI-drawmask is unavailable on PATH.")
     return MaskRequest(
@@ -1845,7 +1843,7 @@ def validate_authored_asset(
     result.__post_init__()
     return result
 def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: object, publish: Callable[[str, int, int], None], seal: Callable[[OperationIdentity], bool]) -> OperationTerminal:
-    stage = private_source = private_mask = None; stage_identity = None
+    stage = private_source = private_mask = publication_alias = None; stage_identity = None
     proof = final_state = None; code = None; argv: tuple[str, ...] = (); published = False; status, diagnostic = OperationTerminalStatus.RETURNED, ""
     publication_fd = None; publication_linked = False
     try:
@@ -1859,7 +1857,6 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
             Path(request.source_directory), request.directory_identity,
         )
         if cancelled.is_set(): raise _Cancelled("mask cancelled")
-        if os.path.lexists(final): raise ValueError("mask request is no longer publishable")
         stage = Path(tempfile.mkdtemp(prefix=".xdart-mask-", dir=final.parent)); created = stage.lstat(); stage_identity = (created.st_dev, created.st_ino)
         os.chmod(stage, 0o700); stage_stat = stage.lstat()
         if (stage_stat.st_dev, stage_stat.st_ino) != stage_identity or not stat.S_ISDIR(stage_stat.st_mode) or not _private_mode(stage_stat.st_mode, 0o700): raise OSError("private mask stage is not mode 0700")
@@ -1929,24 +1926,27 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
             raise ValueError("mask source changed during child execution")
         publish("qualify", 3, 4); proof = _qualify_mask(private_mask, shape, source_dtype, source_sha, staged_sha)
         if (not authoring_source_context_current(request)
-                or not _unchanged(private_mask, proof.state, proof.mask_sha256, _MASK_LIMIT)
-                or os.path.lexists(final)): raise ValueError("qualified mask changed before publication")
+                or not _unchanged(private_mask, proof.state, proof.mask_sha256, _MASK_LIMIT)): raise ValueError("qualified mask changed before publication")
         if not seal(identity): raise _Cancelled("mask cancelled before publication")
         _tighten_qualified(private_mask, proof, _mask_matches)
         publish("publish", 4, 4); link_error = None
+        # Keep the old mask until the edited replacement is qualified. Retain
+        # the private proof file while atomically publishing a second link.
+        publication_alias = stage / ".publish-mask.edf"
         try:
             if _WINDOWS:
-                # Hard-link creation is exclusive on Windows too: an existing
-                # final mask is never replaced. Reconcile identity below.
-                _link(private_mask, final)
+                _link(private_mask, publication_alias)
+                os.replace(publication_alias, final)
             else:
+                relative_alias = str(Path(stage.name) / publication_alias.name)
                 _link(
-                    f"{stage.name}/{private_mask.name}", final.name,
+                    str(Path(stage.name) / private_mask.name), relative_alias,
                     src_dir_fd=publication_fd, dst_dir_fd=publication_fd,
                     follow_symlinks=False,
                 )
+                os.replace(relative_alias, final.name,
+                           src_dir_fd=publication_fd, dst_dir_fd=publication_fd)
             publication_linked = True
-        except FileExistsError as error: raise ValueError("mask output already exists") from error
         except OSError as error: link_error = error
         final_state = (_publication_state(
             publication_fd, final.name, proof, request.final_path,
@@ -1965,7 +1965,7 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
             publication_linked = False
         final_state = None
     names = (() if stage is None else tuple(stage / name for name in (".link-probe-source", ".link-probe-linked", ".link-probe-occupied")))
-    owned = tuple(path for path in (private_source, private_mask) if path is not None)
+    owned = tuple(path for path in (private_source, private_mask, publication_alias) if path is not None)
     recovery = _cleanup(stage, stage_identity, names + owned)
     if recovery and not authoring_source_context_current(request):
         recovery = _cleanup_at_admitted_parent(

@@ -318,6 +318,9 @@ The integrator panel includes **Calibrate** and **Make Mask** buttons:
   geometry and generate a PONI file.
 - **Make Mask** launches the pyFAI mask-drawing tool to interactively draw
   regions on a detector image and create/edit a bad-pixel mask.
+  **Save mask and quit** saves beside the source as `<source-stem>-mask.edf`,
+  replacing an existing mask without an extra warning after validation.
+  Closing the editor without saving leaves the existing mask unchanged.
 
 Load the static mask under **Experiment → Detector → Mask File**. Use
 **Processing → Conditioning → Threshold** for dynamic, per-frame intensity

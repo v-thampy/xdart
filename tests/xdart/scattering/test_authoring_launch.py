@@ -10,11 +10,13 @@ import pytest
 import tifffile
 from pyqtgraph.Qt import QtTest, QtWidgets
 from silx.io.url import DataUrl
+from fabio.edfimage import EdfImage
 
 from xdart.gui.tabs.scattering import experiment_authoring as authoring
+from xdart.gui.tabs.scattering.adapters.external_operation import OperationSlot
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
-from xdart.gui.tabs.scattering.operation_values import OperationIdentity, OperationTerminalStatus
+from xdart.gui.tabs.scattering.operation_values import OperationContextStamp, OperationIdentity, OperationTerminalStatus
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xrd_tools.io.image import load_mask
 from xrd_tools.session.intent_store import RunIntentStore
@@ -37,14 +39,17 @@ def _windows_permissions(monkeypatch):
 
 @pytest.mark.parametrize("portable", [False, True])
 @pytest.mark.parametrize("source_kind", ["tiff", "hdf"])
+@pytest.mark.parametrize("action", ["save", "close", "failure"])
 def test_real_drawmask_child_saves_and_cleans(
-    tmp_path, monkeypatch, source_kind, portable,
+    tmp_path, monkeypatch, source_kind, portable, action,
 ):
-    # Use the native launcher and actual pyFAI window. Only automate its Save
-    # button at event-loop entry; no fake Popen, image reader or publisher.
+    # Use the native launcher and actual pyFAI window. Automate save/close/exit
+    # at event-loop entry; no fake Popen, image reader or publisher.
     hooks = tmp_path / "hooks"
     hooks.mkdir()
     (hooks / "sitecustomize.py").write_text('''
+import os
+from pathlib import Path
 from silx.gui import qt
 original_exec = qt.QApplication.exec
 
@@ -52,7 +57,14 @@ def automated_exec(app):
     def save():
         for widget in app.topLevelWidgets():
             if widget.windowTitle() == "pyFAI drawmask":
-                widget.saveAndClose()
+                (Path(__file__).parent / "opened").write_text("mask")
+                action = os.environ["XDART_TEST_MASK_ACTION"]
+                if action == "save":
+                    widget.saveAndClose()
+                elif action == "close":
+                    widget.close()
+                else:
+                    app.exit(7)
                 return
         app.exit(98)
     qt.QTimer.singleShot(0, save)
@@ -62,6 +74,7 @@ qt.QApplication.exec = automated_exec
 ''')
     monkeypatch.setenv("PYTHONPATH", str(hooks) + os.pathsep + str(Path(__file__).resolve().parents[3] / "src"))
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("XDART_TEST_MASK_ACTION", action)
     # Keep fchmod available: Windows Python 3.13 supports it without POSIX
     # permission semantics. Native Windows CI uses its real implementation.
     if portable:
@@ -77,31 +90,38 @@ qt.QApplication.exec = automated_exec
         selected = DataUrl(file_path=str(source), data_path="/entry/data/data",
                            data_slice=(0,), scheme="silx").path()
     original = source.read_bytes()
-    request = authoring.prepare_mask_request(selected)
-    terminal = authoring.run_mask(request, OperationIdentity(1), Event(),
-                                 lambda *_: None, lambda _: True)
-    assert terminal.status is OperationTerminalStatus.RETURNED, terminal.diagnostic
+    final = source.with_name(source.stem + "-mask.edf")
+    EdfImage(data=np.ones(pixels.shape, dtype=np.uint8)).write(str(final))
+    saved = final.read_bytes()
+    request = authoring.prepare_mask_request(selected, current_mask=str(final))
+    slot = OperationSlot()
+    try:
+        identity = slot.begin_mask(request, OperationContextStamp(0))
+        assert identity is not None
+        terminal = None
+        deadline = time.monotonic() + 25
+        while terminal is None and time.monotonic() < deadline:
+            update = slot.poll(identity)
+            if update is not None:
+                terminal = update.terminal
+            time.sleep(0.01)
+        assert terminal is not None
+        assert not slot.owned
+    finally:
+        slot.close()
+    assert (hooks / "opened").read_text() == "mask"
     assert authoring.mask_terminal_result_valid(terminal, request)
-    assert terminal.payload.exit_code == 0
+    if action == "save":
+        assert terminal.status is OperationTerminalStatus.RETURNED, terminal.diagnostic
+        assert terminal.payload.exit_code == 0
+        np.testing.assert_array_equal(load_mask(final), np.zeros(pixels.shape, dtype=bool))
+    else:
+        assert terminal.status is OperationTerminalStatus.FAILED
+        assert terminal.payload.exit_code == (7 if action == "failure" else 0)
+        assert final.read_bytes() == saved
     assert not terminal.payload.recovery_path
-    np.testing.assert_array_equal(load_mask(request.final_path), np.zeros(pixels.shape, dtype=bool))
     assert source.read_bytes() == original
     assert not list(tmp_path.glob(".xdart-mask-*"))
-    saved = Path(request.final_path).read_bytes()
-    with pytest.raises(ValueError, match="already exists"):
-        authoring.prepare_mask_request(selected)
-    assert Path(request.final_path).read_bytes() == saved
-    if portable and source_kind == "tiff":
-        Path(request.final_path).unlink()
-        def occupy_final(stage, *_):
-            if stage == "publish":
-                Path(request.final_path).write_bytes(b"another mask")
-        terminal = authoring.run_mask(request, OperationIdentity(2), Event(),
-                                     occupy_final, lambda _: True)
-        assert terminal.status is OperationTerminalStatus.FAILED
-        assert "already exists" in terminal.diagnostic
-        assert Path(request.final_path).read_bytes() == b"another mask"
-        assert not list(tmp_path.glob(".xdart-mask-*"))
 
 
 @pytest.mark.parametrize("failure", ["preparation", "worker"])
