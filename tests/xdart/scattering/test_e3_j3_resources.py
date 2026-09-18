@@ -117,10 +117,12 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
                         lambda calibration: _TinyIntegrator(real_integrator(calibration)))
     native_plan = executor_module.native_int_reduction_plan
 
-    def observed_plan(configuration):
+    def observed_plan(configuration, **options):
         assert type(configuration) is FrozenRunConfiguration
         plan_configurations.append(configuration)
-        plan = native_plan(configuration)
+        # An ordinary Run asks the translation to declare its companion maps.
+        assert options == {"companion_modes_2d": True}
+        plan = native_plan(configuration, **options)
         assert plan.integration_1d is not None
         assert plan.integration_1d.npt == 2
         assert plan.integration_2d is None

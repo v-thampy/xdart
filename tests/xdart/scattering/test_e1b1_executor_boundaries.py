@@ -166,8 +166,8 @@ def test_disabled_threshold_does_not_reach_reduction_plan(monkeypatch, tmp_path)
     plans = []
     real_plan = executor_module.native_int_reduction_plan
 
-    def capture_plan(configuration):
-        plan = real_plan(configuration)
+    def capture_plan(configuration, **options):
+        plan = real_plan(configuration, **options)
         plans.append(plan)
         return plan
 
