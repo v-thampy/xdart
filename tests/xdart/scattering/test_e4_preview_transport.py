@@ -1491,7 +1491,17 @@ def test_failed_commit_does_not_publish_detector_outcome(
     monkeypatch, tmp_path
 ):
     """§22.2 row 5: a FAILED hydration cannot leave a terminal scientific
-    result behind."""
+    result behind.
+
+    The failure is injected at the PUBLICATION seam, the one this frame's commit
+    crosses.  It used to name the "light" seam, which is unreachable here (no
+    light lease is active), so the FAILED this row counted came from somewhere
+    else entirely: the "relative publication source has no Project-root owner"
+    refusal.  When a record with a root that is not a path on this host became
+    browsable from its processed artifact, that refusal rightly stopped firing,
+    the frame hydrated, and this row went red without its claim being tested
+    either way.
+    """
     processed, raw_path = _write_processed(
         tmp_path, labels=(1,), thumbnails=False
     )
@@ -1500,13 +1510,14 @@ def test_failed_commit_does_not_publish_detector_outcome(
     state.bind_transport(event_sink=lambda event: None)
     keys = _catalog(state, owner, (1,))
     owner_value, gate = _acquisition_identity(state)
-    _install_seam_failure(monkeypatch, state, owner, "light",
-                          permanent=True)
+    calls = _install_seam_failure(monkeypatch, state, owner, "publication",
+                                  permanent=True)
     rejected = _typed_request(
         state, owner_value, gate, processed, 1, HydrationPurpose.PREVIEW, 1
     )
     assert state.transport.submit(rejected, closed=True) is not None
     assert _wait_transport_idle(state)
+    assert calls["n"] >= 1, "the injected seam was never reached"
     assert _completion_outcomes(state).count(
         (1, HydrationOutcome.FAILED)
     ) == 1
