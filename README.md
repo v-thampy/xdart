@@ -63,6 +63,10 @@ covers installation, kernel selection, and the missing-kernel steps.
 
 To update later, close xdart and run `pixi global update xdart`.
 
+That installation includes JupyterLab and the notebook packages. Run
+`xdart-notebook` to start JupyterLab from it, or `xdart-notebook --register-kernel`
+once to offer it to VS Code as the kernel **Python (xdart)**.
+
 [Alternate installation methods and more details](docs/INSTALLATION.md)
 
 For Python scripts and Jupyter, start with the
@@ -349,7 +353,8 @@ or copy the data files.
 Open it in an environment with `xdart[notebook]`, such as the
 [notebook Pixi workspace](docs/INSTALLATION.md#headless--notebooks-with-pixi) or
 [editable install](docs/INSTALLATION.md#editable-install-with-pixi-recommended),
-and run `pixi run jupyter lab`. If you move the results, update the paths
+and run `pixi run jupyter lab`; with the Pixi global installation, run
+`xdart-notebook exported.ipynb`. If you move the results, update the paths
 in the notebook before running its cells. Figures are interactive when `ipympl`
 is installed in the kernel and static otherwise.
 

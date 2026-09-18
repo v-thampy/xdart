@@ -81,6 +81,7 @@ dev = ["pytest", "pytest-timeout", "pytest-xdist>=3.8", "build", "twine", "tifff
 [project.scripts]
 xdart = "xdart.xdart_main:main"
 xdart-calib2 = "xdart.calib2_main:main"
+xdart-notebook = "xdart.notebook_main:main"
 
 [project.urls]
 Homepage = "https://github.com/v-thampy/xdart"

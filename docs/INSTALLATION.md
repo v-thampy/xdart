@@ -164,7 +164,11 @@ rebuilds it identically on a new machine (`pixi install`).
 Use your [editable Pixi checkout](#editable-install-with-pixi-recommended) or a
 [notebook Pixi workspace](#headless--notebooks-with-pixi). The editable checkout
 already includes `ipykernel`, `ipywidgets`, `anywidget`, and the other notebook
-dependencies. A standalone GUI installation alone is not this notebook workspace.
+dependencies. The Pixi global GUI installation (the conda package) includes them
+too: run `xdart-notebook` to start its JupyterLab, or `xdart-notebook
+--register-kernel` once to register it as **Python (xdart)** for VS Code. Pixi
+global exposes only xdart's own commands, so `jupyter` itself is not on PATH
+there. A plain `pip install xdart` needs `pip install "xdart[notebook]"` first.
 
 ### Register and select the kernel
 

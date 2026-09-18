@@ -55,6 +55,7 @@ build:
     entry_points:
       - xdart = xdart.xdart_main:main
       - xdart-calib2 = xdart.calib2_main:main
+      - xdart-notebook = xdart.notebook_main:main
 
 requirements:
   host:
@@ -99,12 +100,29 @@ requirements:
     - pymatgen                    # Phase Fitting (CIF / structure)
     - xrayutilities ==1.7.12      # match the [rsm] dependency and runtime contract
     - pyevtk                      # RSM VTK export
+    # The [notebook] extra, so the one-line GUI installation can open the
+    # notebooks it exports and the example gallery. `pixi global` exposes only
+    # xdart's own commands, hence the xdart-notebook entry point above.
+    - ipykernel
+    - ipympl
+    - ipywidgets
+    - anywidget
+    - ipyfilechooser
+    - jupyterlab
+    - nbformat
 
 tests:
   - python:
       imports:
         - xrd_tools               # headless core (import-light)
         - xdart                   # GUI package imports without a display
+        - ipykernel               # the notebook stack is part of the package
+        - ipympl
+        - ipywidgets
+        - anywidget
+        - ipyfilechooser
+        - jupyterlab
+        - nbformat
       pip_check: true             # every declared dep resolves in the solved env
   # NB: `xdart --help` is intentionally NOT tested — xdart_main launches the GUI
   # (no arg parsing), which would hang a headless build.  A real launch is the
