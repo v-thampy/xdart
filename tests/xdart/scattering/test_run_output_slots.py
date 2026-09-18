@@ -14,9 +14,15 @@ Reintegrate would resolve a slot in a family the Run never wrote.
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
+
+from xrd_tools.session.run_configuration import (
+    FrozenRunConfiguration,
+    GIIntent,
+    RunIntent,
+)
+from xrd_tools.sources.selection import image_series_spec
 
 from xdart.gui.tabs.scattering.output_preflight import (
     _RUN_MODE_SLOTS,
@@ -26,13 +32,21 @@ from xdart.gui.tabs.scattering.output_preflight import (
 )
 
 
-def _configuration(mode: str, save_path: str) -> SimpleNamespace:
-    """A stand-in carrying only what target selection reads.
+def _configuration(
+    mode: str, save_path: str, *, gi: bool = False,
+) -> FrozenRunConfiguration:
+    """The real frozen configuration target selection reads.
 
-    `_run_output_slot` takes the FrozenRunConfiguration branch for anything that
-    is not an exact OutputCandidate, so a namespace exercises the real branch.
+    Naming now depends on the grazing-incidence choice as well as the mode and
+    the save path, so a stand-in would have to restate the production shape.
     """
-    return SimpleNamespace(processing_mode=mode, save_path=save_path)
+    return RunIntent(
+        source_spec=image_series_spec("/tmp/run-output-slots-source.tif"),
+        poni_file="/tmp/run-output-slots.poni",
+        save_path=save_path,
+        processing_mode=mode,
+        gi=GIIntent(enabled=gi),
+    ).freeze()
 
 
 @pytest.mark.parametrize(
@@ -207,6 +221,119 @@ def test_a_name_that_cannot_be_a_family_is_refused_before_the_run(tmp_path):
     for stem in ("scan12", "Sample A 001", "2026_beamtime_sampleA_gi_0p15deg_0001"):
         configuration = _configuration("Int 1D", str(tmp_path / f"{stem}.nexus"))
         assert _run_artifact_family(configuration, "unused") == stem
+
+
+# ---------------------------------------------------------------------------
+# Grazing-incidence automatic names: `<scan>_gi<slot>.nexus`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("mode", "name"),
+    (
+        ("Int 1D", "scan12_gi_int1d.nexus"),
+        ("Int 2D", "scan12_gi_int2d.nexus"),
+        ("Int 1D (XYE)", "scan12_gi_int1d.nexus"),
+    ),
+)
+def test_an_automatic_gi_run_is_named_with_the_marker_before_the_slot(
+    tmp_path, mode, name,
+):
+    """The marker is part of the FAMILY, so the operation slot stays last."""
+    from xdart.gui.tabs.scattering.output_preflight import (
+        _generated_target_in,
+        _run_output_naming,
+    )
+
+    configuration = _configuration(mode, str(tmp_path), gi=True)
+    directory, family = _run_output_naming(configuration, "scan12")
+    target = _generated_target_in(
+        directory, family, _run_output_slot(configuration),
+    )
+
+    assert target == tmp_path / name
+    # The persisted family and the filename are the same string, used twice.
+    assert family == "scan12_gi"
+    assert _run_artifact_family(configuration, "scan12") == family
+
+
+def test_standard_and_gi_runs_of_one_scan_do_not_share_a_file(tmp_path):
+    from xdart.gui.tabs.scattering.output_preflight import (
+        _generated_target_in,
+        _run_output_naming,
+    )
+
+    names = set()
+    for gi in (False, True):
+        configuration = _configuration("Int 2D", str(tmp_path), gi=gi)
+        directory, family = _run_output_naming(configuration, "scan12")
+        names.add(_generated_target_in(
+            directory, family, _run_output_slot(configuration),
+        ).name)
+
+    assert names == {"scan12_int2d.nexus", "scan12_gi_int2d.nexus"}
+
+
+def test_a_gi_directory_run_marks_each_candidate_beneath_its_own_parent(tmp_path):
+    from xdart.gui.tabs.scattering.output_preflight import (
+        _generated_target_in,
+        _run_output_naming,
+    )
+
+    configuration = _configuration("Int 2D", str(tmp_path / "processed"), gi=True)
+    output_directory = tmp_path / "processed" / "2026.09.04"
+    directory, family = _run_output_naming(
+        configuration, "scan_0001", output_directory,
+    )
+
+    assert directory == output_directory
+    assert _generated_target_in(directory, family, "_int2d") == (
+        output_directory / "scan_0001_gi_int2d.nexus"
+    )
+
+
+def test_an_explicit_gi_filename_is_kept_as_written(tmp_path):
+    """The operator's filename is theirs: no marker is added or removed."""
+    for stem in ("chosen", "chosen_gi"):
+        configuration = _configuration(
+            "Int 2D", str(tmp_path / f"{stem}.nexus"), gi=True,
+        )
+        assert _run_artifact_family(configuration, "scan12") == stem
+
+
+def test_a_gi_average_anchor_carries_the_marker_and_no_run_slot(tmp_path):
+    """Average derives its family from the anchor stem, so the anchor is marked."""
+    from xrd_tools.io.output_path import (
+        artifact_family_from_source,
+        resolve_finite_output_target,
+    )
+
+    anchor = _resolved_generated_target(
+        str(tmp_path), "scan12", grazing_incidence=True,
+    )
+    assert anchor == tmp_path / "scan12_gi.nexus"
+    assert resolve_finite_output_target(
+        anchor.parent, artifact_family_from_source(anchor),
+        operation_token="average",
+    ) == tmp_path / "scan12_gi_average.nexus"
+    # An explicit anchor is the operator's name.
+    assert _resolved_generated_target(
+        str(tmp_path / "chosen.nexus"), "scan12", grazing_incidence=True,
+    ) == tmp_path / "chosen.nexus"
+
+
+def test_a_gi_marker_that_overflows_the_family_limit_is_refused(tmp_path):
+    """A refusal before the run, never a silently unmarked or truncated name."""
+    from xdart.gui.tabs.scattering.output_preflight import _run_output_naming
+
+    scan_name = "s" * 78
+    assert _run_output_naming(
+        _configuration("Int 2D", str(tmp_path)), scan_name,
+    )[1] == scan_name
+    with pytest.raises(ValueError, match="as a processed-result name"):
+        _run_output_naming(
+            _configuration("Int 2D", str(tmp_path), gi=True), scan_name,
+        )
 
 
 # ---------------------------------------------------------------------------

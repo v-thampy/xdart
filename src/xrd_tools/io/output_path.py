@@ -60,6 +60,8 @@ __all__ = [
     "resolve_output_target",
     "is_readable_output_path",
     "artifact_family_from_source",
+    "generated_artifact_family",
+    "GI_FAMILY_MARKER",
     "is_artifact_family",
     "resolve_finite_output_target",
     "FINITE_OPERATION_SLOTS",
@@ -111,6 +113,10 @@ FINITE_OPERATION_SLOTS: dict[str, str] = {
     "stitch-2d": "_stitch2d",
     "rsm": "_rsm",
 }
+
+
+#: Appended to the family of an automatically named grazing-incidence result.
+GI_FAMILY_MARKER = "_gi"
 
 
 def is_readable_output_path(path: "os.PathLike[str] | str") -> bool:
@@ -188,6 +194,24 @@ def is_artifact_family(value: object) -> bool:
     rather than let a run finish and strand its own artifact.
     """
     return type(value) is str and _ARTIFACT_FAMILY.fullmatch(value) is not None
+
+
+def generated_artifact_family(scan_name: str, *, grazing_incidence: bool) -> str:
+    """The root family an AUTOMATICALLY named result starts from a raw scan name.
+
+    A grazing-incidence result is ``<scan>_gi`` so it and the Standard result of
+    the same scan are two files (``sample_gi_int2d.nexus`` beside
+    ``sample_int2d.nexus``).  The marker belongs to the FAMILY, not the slot:
+    the family is what gets persisted and what every later operation consumes
+    verbatim, so an operation on an already processed input can never add the
+    marker a second time, and the operation slot stays last.
+
+    Call this only where a family is first derived from a raw scan name.  An
+    explicit filename is the operator's and is used as written, and nothing
+    reads the marker back: the scientific mode is persisted provenance, never a
+    filename.  The result is not validated here; ask :func:`is_artifact_family`.
+    """
+    return f"{scan_name}{GI_FAMILY_MARKER}" if grazing_incidence else scan_name
 
 
 def artifact_family_from_source(

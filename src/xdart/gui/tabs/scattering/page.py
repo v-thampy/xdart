@@ -2651,7 +2651,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )).stem
             if not name:
                 raise ValueError("Average source scan name is empty.")
-            generated = _resolved_generated_target(intent.save_path, name)
+            generated = _resolved_generated_target(
+                intent.save_path, name,
+                grazing_incidence=bool(intent.gi.enabled),
+            )
             target = os.path.abspath(os.path.expanduser(str(generated)))
         except (TypeError, ValueError, OverflowError) as error:
             self._notice(str(error)); self._refresh_shell(); return

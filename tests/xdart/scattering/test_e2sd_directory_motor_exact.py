@@ -109,6 +109,19 @@ def _tiff_directory_start(
     )
 
 
+def _directory_start(
+    tmp_path: Path, *, gi: bool, output_mode: str,
+) -> StartCapture:
+    start = _tiff_directory_start(tmp_path)
+    intent = start.intent_snapshot.thaw()
+    intent.gi.enabled = gi
+    intent.output_mode = output_mode
+    return StartCapture(
+        start.request_id, start.capture_sequence,
+        RunIntentStore(intent).snapshot(), start.source_capture,
+    )
+
+
 def _wait(qapp: QtWidgets.QApplication, predicate, timeout: float = 3.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -3162,8 +3175,10 @@ def test_exact_tiff_suffix_excludes_edf_mask_candidate(tmp_path: Path) -> None:
     try:
         assert len(receipt.outputs) == 1
         item = receipt.outputs[0].item
-        # The run publishes its stable slot, not the bare scan name.
-        assert item.target.name == "scan_int2d.nexus"
+        # The run publishes its stable slot, not the bare scan name, and this
+        # directory start is grazing incidence, so the family carries the marker.
+        assert item.target.name == "scan_gi_int2d.nexus"
+        assert item.artifact_family == "scan_gi"
         assert tuple(Path(value.path) for value in item.source_stamp.members) == (
             image,
         )
@@ -3405,3 +3420,45 @@ def test_deferred_cursor_rechecks_dependency_after_start_validation(
             assert handle["entry/data/data"][0, 0, 0] == 7
     finally:
         session.close()
+
+
+@pytest.mark.parametrize("output_mode", ("Overwrite", "Append"))
+def test_an_automatic_gi_run_leaves_an_unsuffixed_prior_result_alone(
+    tmp_path: Path, output_mode: str,
+) -> None:
+    """The new automatic name must not migrate, resume or replace the old one.
+
+    Before the marker, a GI run of `scan` and a Standard run of `scan` both
+    published `scan_int2d.nexus`.  A file already at that name is therefore an
+    older GI result or the Standard result.  Either way the GI run now selects
+    its own target, and is admitted exactly as it would be with no such file:
+    Append checks the target it actually selected.
+    """
+    image = tmp_path / "scan_0001.tif"
+    _write_tiff(image, 1)
+    _write_sidecar(image, ("th=0.15", "exposure=1", "sequence=1"))
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    prior = processed / "scan_int2d.nexus"
+    prior.write_bytes(b"an earlier result this run must not touch")
+    before = (prior.read_bytes(), prior.stat().st_mtime_ns)
+
+    dispositions = []
+    for prior_present in (True, False):
+        if not prior_present:
+            prior.unlink()
+        receipt, session = admit_with_session(
+            _directory_start(tmp_path, gi=True, output_mode=output_mode),
+        )
+        try:
+            assert len(receipt.outputs) == 1
+            output = receipt.outputs[0]
+            dispositions.append(output.disposition)
+            assert output.item.target == processed / "scan_gi_int2d.nexus"
+            assert not output.item.target.exists()
+            if prior_present:
+                assert (prior.read_bytes(), prior.stat().st_mtime_ns) == before
+        finally:
+            session.close()
+
+    assert dispositions[0] == dispositions[1]

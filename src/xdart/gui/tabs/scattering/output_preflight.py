@@ -18,6 +18,7 @@ from xrd_tools.io.image import read_detector_image_layout
 from xrd_tools.io.output_path import (
     FINITE_OPERATION_SLOTS,
     OVERWRITE_MODE,
+    generated_artifact_family,
     is_artifact_family,
     resolve_output_target,
 )
@@ -1575,9 +1576,14 @@ def _run_output_naming(
         # the family.  A per-candidate directory does not apply.
         directory, family = requested.parent, requested.stem
     else:
+        # An AUTOMATIC name.  The grazing-incidence marker is decided here, once,
+        # as part of the family, so the persisted family and every filename
+        # derived from it agree and a later operation cannot repeat it.
         directory, family = (
             requested if output_directory is None else output_directory,
-            scan_name,
+            generated_artifact_family(
+                scan_name, grazing_incidence=_gi_enabled(configuration),
+            ),
         )
     if not is_artifact_family(family):
         # REFUSE NOW, ruled 2026-09-04.  This family is what gets written into
@@ -1624,6 +1630,7 @@ def _generated_target_in(directory: Path | str, family: str, slot: str) -> Path:
 
 def _resolved_generated_target(
     save_path: str, scan_name: str, slot: str = "",
+    *, grazing_incidence: bool = False,
 ) -> Path:
     """Delegate vNext's one generated-output naming decision to the shared owner.
 
@@ -1637,6 +1644,9 @@ def _resolved_generated_target(
     chained `<scan>_int2d_average.nexus`.  Callers that name a real run target
     pass the slot from :func:`_run_output_slot`.
 
+    *grazing_incidence* marks an automatic family exactly as
+    :func:`_run_output_naming` does, so a GI Average lands beside the GI run.
+
     This is the NO-per-candidate-directory case (a whole-request target, and
     `page.py`'s Average anchor).  Directory-shaped runs that place each source
     beneath its own parent call :func:`_run_output_naming` with that directory.
@@ -1645,7 +1655,9 @@ def _resolved_generated_target(
     directory, family = (
         (requested.parent, requested.stem)
         if requested.suffix
-        else (requested, scan_name)
+        else (requested, generated_artifact_family(
+            scan_name, grazing_incidence=grazing_incidence,
+        ))
     )
     return _generated_target_in(directory, family, slot)
 
@@ -1708,12 +1720,19 @@ def _series_item(
         source, selected_motor=_selected_tiff_gi_motor(configuration),
         cancelled=cancelled,
     )
+    directory, family = _run_output_naming(configuration, graph.group_key)
     return PlannedOutput(graph,
-        _resolved_generated_target(
-            configuration.save_path, graph.group_key,
-            _run_output_slot(configuration),
-        ),
-        artifact_family=_run_artifact_family(configuration, graph.group_key))
+        _generated_target_in(directory, family, _run_output_slot(configuration)),
+        artifact_family=family)
+
+
+def _gi_enabled(
+    configuration: FrozenRunConfiguration | OutputCandidate,
+) -> bool:
+    if type(configuration) is not OutputCandidate:
+        return bool(configuration.gi.enabled)
+    gi = configuration.processing_mapping().get("gi", {})
+    return bool(type(gi) is dict and gi.get("enabled"))
 
 
 def _uses_eager_directory_descriptors(
@@ -1721,11 +1740,9 @@ def _uses_eager_directory_descriptors(
 ) -> bool:
     if type(configuration) is FrozenRunConfiguration:
         return bool(configuration.gi.enabled or configuration.live_mode)
-    values = configuration.processing_mapping()
-    gi = values.get("gi", {})
     return bool(
-        values.get("live_mode")
-        or (type(gi) is dict and gi.get("enabled"))
+        configuration.processing_mapping().get("live_mode")
+        or _gi_enabled(configuration)
     )
 
 

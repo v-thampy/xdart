@@ -353,6 +353,15 @@ for downstream users:
   `[notebook]` packages (about 30 MB more to download). The new `xdart-notebook`
   command starts that JupyterLab, and `xdart-notebook --register-kernel` offers
   the installation to VS Code as the kernel **Python (xdart)**.
+- **Automatically named grazing-incidence results carry `_gi`.** A GI run of
+  `sample` writes `sample_gi_int1d.nexus` or `sample_gi_int2d.nexus`, and its
+  Average and Reintegration results follow (`sample_gi_average.nexus`,
+  `sample_gi_reintegrate1d.nexus`); Standard names are unchanged, so both
+  results of one scan can sit in one folder. A filename you choose is used as
+  written. Existing `sample_int2d.nexus` GI files still open and are not
+  renamed. With a folder as the output, Append now continues
+  `sample_gi_int2d.nexus`; to continue the older file instead, give the output
+  as `sample.nexus` in that folder (the operation suffix is still added).
 - **Windows is a preview platform.** The Pixi workspace now locks `win-64`,
   with a non-MKL NumExpr because pyFAI's radial coordinates are wrong under the
   MKL build. Known limitation: Reintegrate 1-D/2-D, Average Scan, Stitch 1D,

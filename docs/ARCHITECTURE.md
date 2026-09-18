@@ -56,8 +56,12 @@ operations do not gain a general crash-recovery state machine (ADR-0010).
 The public slots for one `<family>` are `_int1d.nexus`, `_int2d.nexus`,
 `_average.nexus`, `_reintegrate1d.nexus`, `_reintegrate2d.nexus`,
 `_stitch1d.nexus`, `_stitch2d.nexus`, and `_rsm.nexus`.  Public filenames
-never expose a version or hash; exact identities remain in provenance.  Finite
-Average, Reintegration, Stitch, and RSM publish a hidden same-directory
+never expose a version or hash; exact identities remain in provenance.  An
+automatically named grazing-incidence result starts the family `<scan>_gi`
+(`sample_gi_int2d.nexus`), decided once where the family is first derived and
+then persisted, so later operations consume it verbatim; an explicit filename
+is used as written and the scientific mode is never read back from a name.
+Finite Average, Reintegration, Stitch, and RSM publish a hidden same-directory
 candidate only after close and scientific validation.  STOP discards a partial
 candidate.  Run is not converted to that protocol: a hard crash may leave its
 public result or hidden backup unresolved, and automatic recovery is not

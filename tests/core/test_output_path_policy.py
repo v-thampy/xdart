@@ -906,6 +906,47 @@ def test_a_persisted_family_prevents_suffix_chaining(tmp_path):
     assert artifact_family_from_source(published) == "sample_average"
 
 
+def test_the_gi_marker_is_part_of_the_family_and_is_never_repeated(tmp_path):
+    """`sample_gi_int2d.nexus`, then `sample_gi_reintegrate1d.nexus`.
+
+    The marker is decided once, where a family is first derived from a raw scan
+    name.  Every later operation consumes the PERSISTED family verbatim, so an
+    already processed input cannot acquire a second marker, and the operation
+    slot stays last.  Standard names are unchanged.
+    """
+    from xrd_tools.io.output_path import (
+        artifact_family_from_source,
+        generated_artifact_family,
+        is_artifact_family,
+        resolve_finite_output_target,
+    )
+
+    assert generated_artifact_family("sample", grazing_incidence=False) == "sample"
+    family = generated_artifact_family("sample", grazing_incidence=True)
+    assert family == "sample_gi" and is_artifact_family(family)
+
+    run = resolve_finite_output_target(tmp_path, family, operation_token="int-2d")
+    assert run == tmp_path / "sample_gi_int2d.nexus"
+    for token, name in (
+        ("int-1d", "sample_gi_int1d.nexus"),
+        ("reintegrate-1d", "sample_gi_reintegrate1d.nexus"),
+        ("reintegrate-2d", "sample_gi_reintegrate2d.nexus"),
+        ("average", "sample_gi_average.nexus"),
+    ):
+        consumed = artifact_family_from_source(run, family)
+        assert resolve_finite_output_target(
+            tmp_path, consumed, operation_token=token,
+        ) == tmp_path / name
+
+    # An older GI result persisted the unmarked family.  It stays readable under
+    # its own name and its successors stay in ITS family: nothing reads the
+    # scientific mode back out of a filename to rename them.
+    legacy = artifact_family_from_source(tmp_path / "sample_int2d.nexus", "sample")
+    assert resolve_finite_output_target(
+        tmp_path, legacy, operation_token="reintegrate-1d",
+    ) == tmp_path / "sample_reintegrate1d.nexus"
+
+
 def test_readable_stems_stay_readable_and_unsafe_ones_are_refused(tmp_path):
     """Real beamline stems keep their name; only structurally unsafe ones hash.
 
