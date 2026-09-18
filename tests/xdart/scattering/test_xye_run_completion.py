@@ -18,7 +18,7 @@ from xdart.gui.tabs.scattering.events import CleanupStatus
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xrd_tools.session.intent_store import RunIntentStore
-from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.session.run_configuration import GIIntent, RunIntent
 from xrd_tools.sources.selection import image_series_spec
 
 
@@ -176,13 +176,14 @@ def test_completed_run_selected_artifact_enters_2d_viewer(tmp_path, outgoing):
         app.processEvents()
 
 
-@pytest.mark.parametrize("source_kind,batch,unit,prefix", [
-    ("tiff", False, "q_A^-1", "iq"),
-    ("hdf", True, "2th_deg", "itth"),
-    ("tiff-many", False, "q_A^-1", "iq"),
+@pytest.mark.parametrize("source_kind,batch,unit,prefix,gi", [
+    ("tiff", False, "q_A^-1", "iq", False),
+    ("hdf", True, "2th_deg", "itth", False),
+    ("tiff-many", False, "q_A^-1", "iq", False),
+    ("tiff", False, "q_A^-1", "iq", True),
 ])
 def test_completed_xye_run_opens_terminal_file_and_output_folder(
-    tmp_path, monkeypatch, source_kind, batch, unit, prefix,
+    tmp_path, monkeypatch, source_kind, batch, unit, prefix, gi,
 ):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     count = 257 if source_kind == "tiff-many" else 3
@@ -226,9 +227,10 @@ def test_completed_xye_run_opens_terminal_file_and_output_folder(
     page = ScatteringWorkspace(
         intents=RunIntentStore(RunIntent(
             source_spec=image_series_spec(raw), poni_file=str(poni),
-            project_root=str(tmp_path), save_path=str(output / "run.nexus"),
+            project_root=str(tmp_path), save_path=str(output if gi else output / "run.nexus"),
             output_mode="Overwrite", processing_mode="Int 1D (XYE)",
             batch_mode=batch, max_cores=1, bai_1d_args={"npt": 16, "unit": unit},
+            gi=GIIntent(enabled=gi, incidence_motor="Manual", th_val=0.2),
         )),
         lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(),
         executor=StandardRunExecutor(join_timeout=2.0),
@@ -260,6 +262,9 @@ def test_completed_xye_run_opens_terminal_file_and_output_folder(
         generated = tuple(sorted(path for path in output.rglob("*.xye") if path != stale))
         assert len(generated) == count
         assert all(path.name.startswith(prefix + "_") for path in generated)
+        if gi:
+            assert all(path.parent.name == "raw_gi" for path in generated)
+            assert all(path.name.startswith("iq_raw_gi_") for path in generated)
         assert not tuple(output.rglob("*.nexus"))
         assert not tuple(output.rglob("*.h5"))
         assert not Path(terminal.artifact).exists()

@@ -275,6 +275,8 @@ using pyFAI's `FiberIntegrator`:
      the direct map in quantitative χ or texture work.
 4. Process as normal; output reflects the rotated reciprocal-space axes.
    Automatically named GI results carry `_gi` (`sample_gi_int2d.nexus`).
+   XYE exports use the same name (`sample_gi/iq_sample_gi_0001.xye`), keeping
+   Standard and GI results separate.
 5. The 2-D display's axis selector lists the maps a frame actually has. With a
    Q-χ map shown, the 1-D plot offers I–Q and I–χ cuts from it.
 

@@ -16,7 +16,9 @@ from xrd_tools.io.output_transaction import (
 )
 
 from .display_values import DisplayFrameKey, StandardDisplayPayload
-from .scientific_axes import DERIVED_Q_CHI, present_gi_map, trace_projection
+from .scientific_axes import (
+    DERIVED_Q_CHI, native_1d_plot_axis, present_gi_map, trace_projection,
+)
 from .shell_values import (
     FrameNavigationProjection, PinnedTraceProjection, SlicePin, TraceProjection,
 )
@@ -213,10 +215,16 @@ class BrowseSliceLane:
                 observed.st_mtime_ns, observed.st_ctime_ns)
 
     def _cut(self, payload, axis, sliced, center, width, norm):
-        if sliced or axis == "chi":
+        native_axis = native_1d_plot_axis(
+            None if payload.view.axis_1d is None else payload.view.axis_1d.unit,
+        )
+        needs_cake = axis != native_axis and not (
+            {axis, native_axis} <= {"Q", "2theta"}
+        )
+        if sliced or needs_cake:
             if not payload.view.has_2d:
                 raise RuntimeError(f"Browse slice has no saved 2-D data for frame {payload.view.label}")
-            # Cuts and full chi projections require a cake. Neither may fall
+            # Cuts and non-native projections require a cake. Neither may fall
             # back to the stored radial 1-D row while that cake is unavailable.
             payload = replace(payload, view=replace(
                 payload.view, axis_1d=None, intensity_1d=None, sigma_1d=None,

@@ -105,6 +105,7 @@ from xrd_tools.io.processed_scan_id import (
     is_current_processed_xdart_path,
     require_current_writable_processed_groups,
 )
+from xrd_tools.io.output_path import is_artifact_family
 
 logger = logging.getLogger(__name__)
 
@@ -1205,6 +1206,7 @@ class TransactionalXYESink:
     stale_paths: tuple[Path | str, ...] = field(default=(), kw_only=True)
     pattern: str = field(default="{scan}_{frame:04d}.xye", kw_only=True)
     prefix: str | None = field(default=None, kw_only=True)
+    output_family: str | None = field(default=None, kw_only=True)
     _run_owner: OwnerToken = field(init=False, repr=False)
     _transaction: Any = field(init=False, repr=False)
     _canonical_directory: Path = field(init=False, repr=False)
@@ -1235,6 +1237,8 @@ class TransactionalXYESink:
     )
 
     def __post_init__(self) -> None:
+        if self.output_family is not None and not is_artifact_family(self.output_family):
+            raise ValueError("transactional XYE output family is invalid")
         if self.pattern != "{scan}_{frame:04d}.xye":
             raise ValueError(
                 "transactional XYE supports only the direct per-frame pattern"
@@ -1307,7 +1311,7 @@ class TransactionalXYESink:
             )
         ):
             raise ValueError("transactional XYE target cannot satisfy a 2-D mode")
-        self._scan_name = scan.name
+        self._scan_name = self.output_family if self.output_family is not None else scan.name
         self._mode = mode
         self._errors.clear()
         with self._perf_lock:

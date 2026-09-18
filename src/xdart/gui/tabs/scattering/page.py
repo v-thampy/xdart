@@ -221,7 +221,7 @@ from .start_outcomes import (
     executor_closed_is_valid,
 )
 from .start_pipeline import StartPipeline
-from .output_preflight import native_int_reduction_plan
+from .output_preflight import native_int_reduction_plan, _run_artifact_family
 from xrd_tools.session.readiness import GI_COMPANION_MODES_2D_ARG
 from .state_machine import RunPhase
 from .source_selection import (
@@ -5247,11 +5247,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         plan = native_int_reduction_plan(acquisition.run_configuration)
         prefix = xye_prefix_for_unit(plan.integration_1d.unit)
         # The event artifacts are planned NeXus slots, not written files in
-        # XYE-only mode. Match TransactionalXYESink's scan/index naming for
+        # XYE-only mode. Match TransactionalXYESink's output family/index naming for
         # the terminal row; the other generated files remain folder-browsable.
         # Do not turn completion into a multi-file Viewer admission/overlay.
-        current_path = str(Path(frame.artifact).parent / frame.source_scan /
-                           f"{prefix}_{frame.source_scan}_{frame.local_frame_label:04d}.xye")
+        family = _run_artifact_family(acquisition.run_configuration, frame.source_scan)
+        current_path = str(Path(frame.artifact).parent / family /
+                           f"{prefix}_{family}_{frame.local_frame_label:04d}.xye")
         # This viewer handoff replaces the terminal batch paint itself.
         self._retire_batch_presentation(force=True)
         self._set_browser_directory(str(Path(current_path).parent), explicit=False)
@@ -6185,6 +6186,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 share_plot_axis_for_image(self._preferences.image_axis)
                 or requested_plot_axis
             )
+        # Sparse 1-D rows can serve only their native axis (or Q/2theta
+        # conversion). Every other offered axis comes from the selected cake,
+        # including GI chi and Q derived from a qip/qoop-only result.
+        cake_axis_requested = requested_plot_axis == "chi"
+        if browse_selected and browse is not None and navigation.current is not None:
+            catalog = browse.scalar_catalog
+            row = None if catalog is None else catalog.row(navigation.current.local_frame_label)
+            if row is not None:
+                native_axis = next((
+                    native_1d_plot_axis(unit)
+                    for mode, _label, unit, _log in catalog.axes_1d
+                    if mode == row.active_mode_1d
+                ), None)
+                cake_axis_requested = requested_plot_axis != native_axis and not (
+                    {requested_plot_axis, native_axis} <= {"Q", "2theta"}
+                )
         browse_cache_supported = bool(
             browse_selected
             and intent.processing_mode in {"Int 1D", "Int 2D"}
@@ -6199,7 +6216,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and intent.processing_mode == "Int 2D"
             and self._preferences.plot_mode in {"Single", "Overlay", "Waterfall"}
             and (self._preferences.slice_enabled or self._preferences.slice_pins
-                 or requested_plot_axis == "chi")
+                 or cake_axis_requested)
         )
         if not browse_slices:
             self._context_controller.cancel_browse_slices()

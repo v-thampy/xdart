@@ -1287,9 +1287,11 @@ class DynamicOutputAdapter:
                 if policy is None else policy.allocation.reduction_inflight
             )
             if integration_1d is not None and output_diagnostics.save_xye:
+                family = item.artifact_family or str(scan.name)
                 xye = TransactionalXYESink(
-                    target.parent / str(scan.name),
+                    target.parent / family,
                     prefix=xye_prefix_for_unit(integration_1d.unit),
+                    output_family=family,
                 )
                 self._pending_xye.append(xye)
 
