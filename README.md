@@ -320,7 +320,9 @@ The integrator panel includes **Calibrate** and **Make Mask** buttons:
   regions on a detector image and create/edit a bad-pixel mask.
   **Save mask and quit** saves beside the source as `<source-stem>-mask.edf`,
   replacing an existing mask without an extra warning after validation.
-  Closing the editor without saving leaves the existing mask unchanged.
+  The saved mask is selected automatically in **Mask File**, without a
+  confirmation dialog. Closing without saving leaves the existing mask unchanged
+  and does not show an error popup.
 
 Load the static mask under **Experiment → Detector → Mask File**. Use
 **Processing → Conditioning → Threshold** for dynamic, per-frame intensity

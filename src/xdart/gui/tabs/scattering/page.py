@@ -1922,6 +1922,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         authored = self._authored_assets
         stamp = self._operation_context_stamp()
         if authored.phase is AuthoredAssetPhase.TERMINAL_READY:
+            if authored.asset == "mask":
+                request = authored.saved_mask_validation_request(stamp)
+                if request is not None:
+                    self._begin_authored_validation(None, None, request)
+                else:
+                    self._apply_authored_asset_transition(
+                        AuthoredAssetTransition(
+                            AuthoredAssetRefreshEffect.CONTROLS,
+                            "Experiment changed; saved mask was not selected.",
+                        )
+                    )
+                return
             evidence = authored.evidence_identity
             if evidence is not None:
                 self._apply_authored_asset_transition(
@@ -2023,8 +2035,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._begin_authored_validation(identity, dialog, request)
 
     def _begin_authored_validation(
-        self, identity: AuthoredAssetDialogIdentity,
-        dialog: _AuthoredAssetDialog, request: object,
+        self, identity: AuthoredAssetDialogIdentity | None,
+        dialog: _AuthoredAssetDialog | None, request: object,
     ) -> None:
         if (identity is not self._authored_asset_dialog_identity
                 or dialog is not self._authored_asset_dialog

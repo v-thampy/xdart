@@ -121,28 +121,42 @@ qt.QApplication.exec = automated_exec
         assert terminal.status is expected, terminal.diagnostic
         assert terminal.payload.exit_code == (7 if action == "failure" else 0)
         assert final.read_bytes() == saved
-        store = RunIntentStore(RunIntent(project_root=str(tmp_path), mask_file=str(final)))
-        page = ScatteringWorkspace(intents=store, lifecycle=ScatteringCoordinator(),
-                                   sources=FilesystemSourceAdapter())
-        before = store.snapshot()
-        app = _xdart_qt_harness.app
-        try:
-            page._authored_assets.adopt_operation(
-                "mask", request, page._operation_context_stamp(), identity)
-            assert page._consume_authored_asset_update(update)
-            app.processEvents()
-            dialogs = page.findChildren(QtWidgets.QMessageBox)
-            assert len(dialogs) == (0 if action == "close" else 1)
+    store = RunIntentStore(RunIntent(project_root=str(tmp_path),
+                                    mask_file="" if action == "save" else str(final)))
+    page = ScatteringWorkspace(intents=store, lifecycle=ScatteringCoordinator(),
+                               sources=FilesystemSourceAdapter())
+    before = store.snapshot()
+    app = _xdart_qt_harness.app
+    try:
+        page._authored_assets.adopt_operation(
+            "mask", request, page._operation_context_stamp(), identity)
+        assert page._consume_authored_asset_update(update)
+        page._advance_authored_asset_confirmation()
+        deadline = time.monotonic() + 10
+        while page._experiment_operation_busy() and time.monotonic() < deadline:
             assert page._authored_asset_dialog is None
+            page._drain_executor()
+            QtTest.QTest.qWait(10)
+        app.processEvents()
+        assert not page._experiment_operation_busy()
+        dialogs = page.findChildren(QtWidgets.QMessageBox)
+        assert len(dialogs) == (1 if action == "failure" else 0)
+        assert page._authored_asset_dialog is None
+        if action == "save":
+            assert store.snapshot().thaw().mask_file == request.final_path
+            assert store.revision == before.revision + 1
+        else:
             assert store.snapshot() == before
-            if action == "close":
-                assert not terminal.diagnostic
-        finally:
-            for dialog in page.findChildren(QtWidgets.QMessageBox):
-                dialog.close()
-            page.close_workspace()
-            page.deleteLater()
-            app.processEvents()
+        if action == "close":
+            assert not terminal.diagnostic
+    finally:
+        for dialog in page.findChildren(QtWidgets.QMessageBox):
+            dialog.close()
+        if page._authored_asset_dialog is not None:
+            page._authored_asset_dialog.close()
+        page.close_workspace()
+        page.deleteLater()
+        app.processEvents()
     assert not terminal.payload.recovery_path
     assert source.read_bytes() == original
     assert not list(tmp_path.glob(".xdart-mask-*"))

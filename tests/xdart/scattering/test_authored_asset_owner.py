@@ -764,7 +764,14 @@ def test_late_progress_during_closing_never_emits_controls_or_dialog(
 def test_exact_validation_accepts_one_cas_and_duplicate_terminal_is_inert(
     tmp_path: Path, asset: str,
 ) -> None:
-    case, dialog, request, identity = _validating(tmp_path, asset)
+    if asset == "mask":
+        case, _process, _evidence = _terminal_ready(tmp_path, asset)
+        dialog = None
+        request = case.owner.saved_mask_validation_request(case.stamp)
+        identity = OperationIdentity(2)
+        case.owner.adopt_validation(None, request, identity)
+    else:
+        case, dialog, request, identity = _validating(tmp_path, asset)
     terminal = OperationTerminal(
         identity,
         OperationTerminalStatus.RETURNED,
@@ -773,9 +780,13 @@ def test_exact_validation_accepts_one_cas_and_duplicate_terminal_is_inert(
     transition = case.owner.consume_operation_update(
         OperationUpdate(identity, terminal=terminal), case.stamp,
     )
-    assert transition.dialog is not None
-    assert transition.dialog.identity is dialog
-    assert transition.dialog.effect is AuthoredAssetDialogEffect.CLOSE
+    if asset == "mask":
+        assert transition.dialog is None
+        assert transition.refresh is AuthoredAssetRefreshEffect.CONTROLS
+    else:
+        assert transition.dialog is not None
+        assert transition.dialog.identity is dialog
+        assert transition.dialog.effect is AuthoredAssetDialogEffect.CLOSE
     assert transition.adoption is not None
     assert type(transition.adoption.result) is IntentCommitAccepted
     assert transition.adoption.path == case.candidate.path
@@ -783,14 +794,12 @@ def test_exact_validation_accepts_one_cas_and_duplicate_terminal_is_inert(
     intent = case.store.snapshot().thaw()
     selected = intent.poni_file if asset == "poni" else intent.mask_file
     assert selected == case.candidate.path
-    assert case.owner.phase is AuthoredAssetPhase.DISMISSING
-    with pytest.raises(ValueError, match="transition"):
-        replace(
-            transition,
-            dialog=AuthoredAssetDialogCommand(
-                dialog, AuthoredAssetDialogEffect.SET_IDLE,
-            ),
-        )
+    assert case.owner.phase is (AuthoredAssetPhase.IDLE if asset == "mask"
+                                else AuthoredAssetPhase.DISMISSING)
+    if asset == "poni":
+        with pytest.raises(ValueError, match="transition"):
+            replace(transition, dialog=AuthoredAssetDialogCommand(
+                dialog, AuthoredAssetDialogEffect.SET_IDLE))
     assert case.owner.consume_operation_update(
         OperationUpdate(identity, terminal=terminal), case.stamp,
     ) == AuthoredAssetTransition()
