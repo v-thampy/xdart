@@ -46,9 +46,9 @@ def test_requested_hard_capped_at_16(monkeypatch):
 
 
 # ── small-RAM floor ─────────────────────────────────────────────────────────
-def test_small_ram_floors_requested_to_2(monkeypatch):
+def test_small_ram_preserves_explicit_requested_workers(monkeypatch):
     _cpu(monkeypatch, 16)
-    assert reduction_worker_cap(8, total_ram_bytes=SMALL, env={}) == 2
+    assert reduction_worker_cap(8, total_ram_bytes=SMALL, env={}) == 8
 
 
 def test_small_ram_floors_default_to_2(monkeypatch):

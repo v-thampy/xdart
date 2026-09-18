@@ -378,7 +378,7 @@ def _light_policy_layout(
         and policy.allocation.workers == 4
     ):
         policy = resolve_session_policy(
-            requirements, envelope_bytes=policy.allocation.envelope_bytes,
+            requirements,
             requested_workers=requested,
             requests={**requests, "reduction_inflight": 16},
             allocation=accepted_allocation, env=frozen_env,

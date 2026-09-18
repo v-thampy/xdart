@@ -391,6 +391,10 @@ Verify the PONI file is text-based `key=value` pairs and that paths are
 absolute or relative to the working directory.
 
 **Memory use on a low-RAM machine:**
+The default planning target is 40% of physical RAM, with a 16 GiB fallback on
+Windows. This is a development guideline, not a processing limit: when the
+estimated working set exceeds it, xdart logs a warning and continues with the
+requested workers and buffers. The estimate is not a measurement of total RSS.
 Lower **Cores** to reduce simultaneous raw-frame and integration buffers.
 Processed-data browsing loads image data on demand; the frame count alone does
 not determine how many full detector images remain resident.

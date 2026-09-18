@@ -203,7 +203,7 @@ def heavy_window_log_line(
 DEFAULT_REDUCTION_WORKERS = 4
 MAX_REDUCTION_WORKERS = 16
 REDUCTION_WORKERS_ENV = "XDART_REDUCTION_WORKERS"
-#: below this TOTAL RAM the pool is floored to 2 (each worker ~1 GB of
+#: below this TOTAL RAM the default pool is capped at 2 (each worker ~1 GB of
 #: duplicated integrator geometry — the budget pressure heavy_window responds to).
 _SMALL_RAM_FLOOR_BYTES = 16 * _GIB
 
@@ -225,7 +225,7 @@ def reduction_worker_cap(
        ``[1, min(16, cpu)]`` — the cap replaces only the silent default, never a
        deliberate user choice.
     3. else the default knee ``min(4, cpu)``.
-    4. a small-RAM box (< 16 GiB total) floors the result to 2.
+    4. a small-RAM box (< 16 GiB total) caps only the default at 2.
 
     ALWAYS returns >= 1 — never ``None`` (the ``None`` path was the latent
     20-worker-default bug: ``n_workers==1 -> executor=None ->`` a
@@ -251,7 +251,8 @@ def reduction_worker_cap(
         if total_ram_bytes is not None
         else total_physical_ram_bytes()
     )
-    if total and total < _SMALL_RAM_FLOOR_BYTES:
+    if ((requested is None or int(requested) <= 0)
+            and total and total < _SMALL_RAM_FLOOR_BYTES):
         want = min(want, 2)
     return max(1, want)
 

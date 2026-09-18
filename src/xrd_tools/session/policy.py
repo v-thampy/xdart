@@ -3,6 +3,7 @@
 policy built inside the cadence decision is a second owner.  Stdlib only."""
 from __future__ import annotations
 import os
+import logging
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
@@ -15,7 +16,7 @@ __all__ = ["FlushPolicy", "SessionPolicy", "SessionResourceRequirements",
 INTEGRATOR_RESERVE_BYTES = _GIB = 1024 ** 3   #: one worker's integrator copy
 MAX_MODES_1D, MAX_MODES_2D = 5, 3      #: the finite schema maxima
 PREFETCH_QUEUE_ENV = "XDART_PREFETCH_QUEUE_SIZE"   #: the ONE clamped request
-DEFAULT_PREFETCH_QUEUE_DEPTH, DEFAULT_ENVELOPE_FRACTION = 4, 0.25
+DEFAULT_PREFETCH_QUEUE_DEPTH, DEFAULT_ENVELOPE_FRACTION = 4, 0.40
 CATEGORIES = ("source_native", "staging", "records", "publication", "worker")
 #: the one deterministic order spare capacity is granted in
 GRANT_ORDER = ("workers", "reduction_inflight", "queue_depth",
@@ -304,12 +305,15 @@ def _prefetch_queue_request(env) -> int:
     except (TypeError, ValueError):
         return DEFAULT_PREFETCH_QUEUE_DEPTH
 def default_envelope_bytes(env=None) -> int:
-    """A quarter of total RAM; Python/Qt/file handles are OUTSIDE it."""
+    """Advisory target: 40% of RAM, or 16 GiB when detection is unavailable.
+
+    Windows uses the fallback. Python/Qt/file handles are OUTSIDE the model.
+    """
     try:
         total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
     except (ValueError, OSError, AttributeError):
         total = 0
-    return int(total * DEFAULT_ENVELOPE_FRACTION) if total > 0 else 8 * _GIB
+    return int(total * DEFAULT_ENVELOPE_FRACTION) if total > 0 else 16 * _GIB
 def _default_requests(req: SessionResourceRequirements, requested_workers,
                       env) -> dict:
     """These requests feed this ONE resolution; consumers receive grants."""
@@ -374,8 +378,11 @@ def resolve_session_policy(requirements: SessionResourceRequirements, *,
                            flush: FlushPolicy | None = None,
                            requests=None, allocation=None,
                            requested_workers=None, env=None) -> SessionPolicy:
-    """The ONE resolver.  Below ``F`` raises :class:`SessionEnvelopeError`;
-    ``F <= envelope < M`` yields one oversize config at exact minima."""
+    """Preserve requested capacity, warning above the default memory target.
+
+    An explicitly supplied envelope remains a constrained allocation contract:
+    below ``F`` raises; ``F <= envelope < M`` yields exact minimum counts.
+    """
     req = requirements
     # Validate EACH worker spelling alone before comparing: ``True == 1`` and
     # ``1.0 == 1``, so comparing first lets the merge erase a malformed value.
@@ -401,6 +408,20 @@ def resolve_session_policy(requirements: SessionResourceRequirements, *,
                        if envelope_bytes is None else envelope_bytes)
     bounds = _bounds(req, requests)
     floor, minimum = floor_bytes(req), minimum_bytes(req)
+    wanted = None
+    target = envelope
+    if allocation is None:
+        wanted = _bounds(req, {**_default_requests(req, requested_workers,
+                                                   frozen_env),
+                               **(requests or {})})
+        if envelope_bytes is None:
+            # The development target must not trim required retention or stop
+            # a run. Keep finite requested capacities and account for them in
+            # the same allocation consumed/validated by every downstream owner.
+            if not (requests and "reduction_inflight" in requests):
+                wanted["reduction_inflight"] = 2 * wanted["workers"]
+            wanted["workers"] = min(wanted["workers"], wanted["reduction_inflight"])
+            envelope = max(envelope, sum(_categories(req, wanted).values()))
     if envelope < floor:
         raise SessionEnvelopeError(
             required_bytes=minimum, available_bytes=envelope, floor_bytes=floor,
@@ -417,13 +438,17 @@ def resolve_session_policy(requirements: SessionResourceRequirements, *,
         built = _build(req, _minimum_counts(req), envelope, floor, minimum,
                        "automatic", oversize=minimum - envelope)
     else:
-        wanted = _bounds(req, {**_default_requests(req, requested_workers,
-                                                   frozen_env),
-                               **(requests or {})})
         built = _build(req, _grant(
             req, wanted, envelope,
             automatic_inflight=not (requests and "reduction_inflight" in requests),
         ), envelope, floor,
                        minimum, "automatic")
+    if allocation is None and envelope_bytes is None and built.assigned_bytes > target:
+        logging.getLogger(__name__).warning(
+            "[MEMORY-TARGET] estimated=%.2f GiB target=%.2f GiB; "
+            "continuing with requested workers and buffers (workers=%d). "
+            "Lower Cores or buffer settings to reduce memory use.",
+            built.assigned_bytes / _GIB, target / _GIB, built.workers,
+        )
     return SessionPolicy(flush=flush if flush is not None else FlushPolicy(),
                          allocation=built)

@@ -48,6 +48,53 @@ def _requirements(**kw):
     return p.SessionResourceRequirements(**base)
 
 
+@pytest.mark.parametrize("total", (32 * 1024**3, None))
+def test_default_memory_target_is_forty_percent_or_sixteen_gib(monkeypatch, total):
+    p = _policy()
+
+    def sysconf(name):
+        if total is None:
+            raise AttributeError("sysconf is unavailable on Windows")
+        return total // 4096 if name == "SC_PHYS_PAGES" else 4096
+
+    monkeypatch.setattr(p.os, "sysconf", sysconf, raising=False)
+    assert p.default_envelope_bytes() == (
+        int(total * 0.4) if total else 16 * 1024**3
+    )
+
+
+def test_default_memory_target_warns_without_reducing_requested_capacity(
+    monkeypatch, caplog,
+):
+    p = _policy()
+    req = _requirements(height=3072, width=3072)
+    target = 1024**3  # Even below the fixed minimum: advisory, not a refusal.
+    monkeypatch.setattr(p, "default_envelope_bytes", lambda env: target)
+    requests = dict(workers=4, reduction_inflight=8, staging_items=64,
+                    record_heavy_items=64, publication_heavy_items=64,
+                    record_items=4096, publication_items=4096,
+                    thumbnail_items=512, queue_depth=4,
+                    owner_block_bytes=4 * req.native_frame_bytes)
+    policy = p.resolve_session_policy(req, requests=requests, env={})
+    allocation = policy.allocation
+    assert dict(allocation.counts) == requests
+    assert allocation.assigned_bytes > target
+    assert allocation.assigned_bytes <= allocation.envelope_bytes
+    assert "[MEMORY-TARGET]" in caplog.text
+    assert "continuing with requested workers and buffers" in caplog.text
+    # The same allocation must remain acceptable to the consuming session.
+    assert p.resolve_session_policy(req, allocation=allocation).allocation is allocation
+
+
+def test_default_memory_target_keeps_automatic_inflight_for_requested_workers(monkeypatch):
+    p = _policy()
+    monkeypatch.setattr(p, "default_envelope_bytes", lambda env: 1024**3)
+    allocation = p.resolve_session_policy(
+        _requirements(), requests={"workers": 16}, env={},
+    ).allocation
+    assert (allocation.workers, allocation.reduction_inflight) == (16, 32)
+
+
 def _terms(req):
     """P, G, T, A1, A2 recomputed here from the ratified equations."""
     pixels = req.height * req.width
@@ -428,11 +475,12 @@ def test_automatic_inflight_is_twice_the_actual_worker_grant():
             constrained.staging_items) == (3, 6, 30)
 
 
-def test_requested_workers_are_normalized_unless_the_mapping_is_explicit(
+def test_requested_workers_are_preserved_on_small_ram_with_either_spelling(
     monkeypatch,
 ):
     p = _policy()
     from xrd_tools.core import staging
+    monkeypatch.setattr(os, "cpu_count", lambda: 16)
     monkeypatch.setattr(
         staging, "total_physical_ram_bytes", lambda: 8 * 1024 ** 3,
     )
@@ -444,7 +492,7 @@ def test_requested_workers_are_normalized_unless_the_mapping_is_explicit(
         req, envelope_bytes=64 * 1024 ** 3, requested_workers=4,
         requests={"workers": 4}, env={},
     ).allocation
-    assert (normalized.workers, normalized.reduction_inflight) == (2, 4)
+    assert (normalized.workers, normalized.reduction_inflight) == (12, 24)
     assert (explicit.workers, explicit.reduction_inflight) == (4, 8)
     same = p.resolve_session_policy(
         req, allocation=explicit, requests=dict(explicit.counts), env={},
@@ -735,7 +783,7 @@ def test_g12_policy_imports_no_qt_and_stays_stdlib_at_import_time():
         elif isinstance(node, ast.ImportFrom):
             top_level.append(node.module or "")
     assert all(mod.split(".")[0] in {"__future__", "dataclasses", "types",
-                                     "typing", "collections", "os", "math"}
+                                     "typing", "collections", "os", "math", "logging"}
                for mod in top_level), top_level
 
 

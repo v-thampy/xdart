@@ -1,11 +1,63 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from xrd_tools.session.readiness import (
     build_native_int_reduction_plan_from_args,
     build_native_int_reduction_plan_from_scan,
 )
+
+
+@pytest.mark.parametrize("mode_1d,mode_2d", (
+    ("q_total", "qip_qoop"), ("q_ip", "q_chi"),
+    ("q_oop", "exit_angles"), ("exit_angle", "qip_qoop"),
+    ("chi_gi", "q_chi"),
+))
+@pytest.mark.parametrize("dimensions", ((True, True), (True, False), (False, True)))
+def test_gi_resource_modes_match_actual_required_results(mode_1d, mode_2d, dimensions):
+    from types import SimpleNamespace
+    from xrd_tools.session import required_result_modes
+    from xrd_tools.session.policy import requirements_from
+
+    plan = build_native_int_reduction_plan_from_args(
+        {"gi_mode_1d": mode_1d}, {"gi_mode_2d": mode_2d},
+        gi_enabled=True, gi_incident_angle=0.2,
+        integrate_1d=dimensions[0], integrate_2d=dimensions[1],
+    )
+    requirements = requirements_from(SimpleNamespace(
+        frame_shape=(3072, 3072), dtype=np.dtype("uint16"),
+    ), plan)
+    modes = required_result_modes(plan)
+    assert (requirements.modes_1d, requirements.modes_2d) == (
+        sum(mode.kind == "1d" for mode in modes),
+        sum(mode.kind == "2d" for mode in modes),
+    )
+
+
+def test_selected_gi_modes_fit_the_windows_eight_gib_run_budget():
+    from types import SimpleNamespace
+    from xrd_tools.session.policy import requirements_from, resolve_session_policy
+
+    plan = build_native_int_reduction_plan_from_args(
+        {"npt": 1000}, {"npt_rad": 500, "npt_azim": 500},
+        gi_enabled=True, gi_incident_angle=0.2,
+    )
+    requirements = requirements_from(SimpleNamespace(
+        frame_shape=(3072, 3072), dtype=np.dtype("uint16"),
+    ), plan)
+    allocation = resolve_session_policy(
+        requirements, envelope_bytes=8 * 1024**3,
+        requested_workers=4,
+        requests={"workers": 4, "reduction_inflight": 8, "staging_items": 64},
+        env={},
+    ).allocation
+    assert allocation.workers == 4
+    assert allocation.staging_items == 64
+    assert min(allocation.record_items, allocation.publication_items,
+               allocation.record_heavy_items, allocation.publication_heavy_items,
+               allocation.thumbnail_items) >= 16
+    assert allocation.assigned_bytes <= allocation.envelope_bytes
 
 
 def _plain(value):

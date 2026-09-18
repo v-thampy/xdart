@@ -876,6 +876,14 @@ def build_native_int_reduction_plan_from_args(
             extra=args_2d,
         )
 
+    # Native Run produces one selected GI mode per enabled dimension. Declare
+    # those sets so resource accounting does not reserve every schema mode.
+    modes = {}
+    if gi is not None:
+        if integration_1d is not None:
+            modes["enabled_modes_1d"] = (gi.mode_1d.value,)
+        if integration_2d is not None:
+            modes["enabled_modes_2d"] = (gi.mode_2d.value,)
     return ReductionPlan(
         integration_1d=integration_1d,
         integration_2d=integration_2d,
@@ -884,6 +892,7 @@ def build_native_int_reduction_plan_from_args(
         threshold_min=threshold_min,
         threshold_max=threshold_max,
         mask_saturation=bool(mask_saturation),
+        extra=modes,
     )
 
 

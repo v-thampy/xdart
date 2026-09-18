@@ -2652,6 +2652,74 @@ def test_live_gui_checkpoint_crosses_policy_then_stop_commits_exact_prefix(
         )
 
 
+@pytest.mark.parametrize("data", ("synthetic", "combi4"))
+def test_standard_then_grazing_run_can_exceed_memory_target(
+    monkeypatch, tmp_path, caplog, data,
+):
+    from xrd_tools.io import FrameViewReader
+    from xrd_tools.session import policy
+
+    if data == "combi4":
+        root = os.environ.get("XDART_TEST_DATA")
+        if not root:
+            pytest.skip("XDART_TEST_DATA is required for the real Combi4 scan")
+        directory = Path(root) / "Tiff"
+        raw = directory / "Combi4_Angledependence_samz_4p9_03271005_0001.tif"
+        poni = directory / "LaB6_detz190_dety72_th5_03261554_0001.poni"
+        assert raw.is_file() and poni.is_file()
+    else:
+        raw = tmp_path / "grazing_0001.tif"
+        poni = tmp_path / "grazing.poni"
+        for label in range(1, 17):
+            _write_tiff(tmp_path / f"grazing_{label:04d}.tif", label)
+        write_poni(poni)
+
+    # Force only the advisory target low; use the real planner, allocator,
+    # executor, reduction, writer and reader throughout both runs.
+    monkeypatch.setattr(policy, "default_envelope_bytes", lambda env: 1024**3)
+    executor = StandardRunExecutor(join_timeout=5.0)
+    intent = _intent(raw, tmp_path / "standard.nexus", poni, processing_mode="Int 2D")
+    if data == "combi4":
+        intent.source_spec = image_series_spec(raw)
+    intent.max_cores = 4
+    intent.bai_1d_args = {"npt": 1000, "method": "csr", "error_model": "poisson"}
+    intent.bai_2d_args = {
+        "npt_rad": 500, "npt_azim": 500, "method": "csr", "error_model": "poisson",
+    }
+    for gi in (False, True):
+        intent.gi.enabled = gi
+        if data == "combi4":
+            intent.gi.incidence_motor = "th"
+        intent.save_path = str(tmp_path / ("grazing.nexus" if gi else "standard.nexus"))
+        identity = _start(executor, intent, request_value=1790 + int(gi))
+        try:
+            events = _drain_until(
+                executor, lambda values: any(e.kind in _TERMINAL for e in values),
+                timeout=90.0,
+            )
+            terminal = next(e for e in events if e.kind in _TERMINAL)
+            assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
+        finally:
+            assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+        with FrameViewReader(_written(Path(intent.save_path), "Int 2D")) as reader:
+            assert reader.labels() == tuple(range(1, 17))
+            for label in reader.labels():
+                view = reader.read(label)
+                assert view.intensity_1d.shape == (1000,)
+                assert view.intensity_2d.shape == (500, 500)
+                assert view.sigma_1d.shape == (1000,)
+                # The default GI histogram backend can omit 2D uncertainty;
+                # Standard CSR with the requested Poisson model supplies it.
+                if not gi or view.sigma_2d is not None:
+                    assert view.sigma_2d.shape == (500, 500)
+                assert np.isfinite(view.axis_1d.values).all()
+                assert np.isfinite(view.axis_2d_x.values).all()
+                assert np.isfinite(view.axis_2d_y.values).all()
+                assert np.isfinite(view.intensity_1d).any()
+                assert np.isfinite(view.intensity_2d).any()
+    assert "[MEMORY-TARGET]" in caplog.text
+
+
 def test_post_g2_funded_staging_partial_grant_refuses_before_output_and_retries(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
