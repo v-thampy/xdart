@@ -259,6 +259,36 @@ def test_registered_binning_and_unsigned_dummy():
     assert not result.used[2]
 
 
+@pytest.mark.parametrize('mask_matches_image', [False, True])
+def test_registered_binning_preserves_configured_mask(mask_matches_image):
+    from pyFAI.detectors import detector_factory
+    angles = np.array([1., .5, 0., -.5, -1.])
+    shape = (65, 487)
+    images, _, beam = beam_images(angles, shape=shape,
+        pitches=(516e-6, 172e-6), distance=.5, zero=0.)
+    detector = detector_factory('Pilatus100k')
+    if mask_matches_image:
+        assert detector.guess_binning(shape)
+    mask = np.zeros(shape if mask_matches_image else detector.shape, np.int8)
+    mask[:, 243] = 1
+    detector.mask = mask
+
+    if mask_matches_image:
+        result = calibrate_direct_beam(angles, images, detector=detector,
+            beam_pixel=beam, angle_zero_deg=0.)
+        np.testing.assert_array_equal(result.used, [True, True, False, True, True])
+        assert 'masked/gap' in result.rejection_reasons[2]
+        assert result.distance_m == pytest.approx(.5, rel=2e-5)
+    else:
+        with pytest.raises(ValueError, match='detector mask shape differs'):
+            calibrate_direct_beam(angles, images, detector=detector,
+                beam_pixel=beam, angle_zero_deg=0.)
+
+    assert detector.shape == (shape if mask_matches_image else (195, 487))
+    assert detector.binning == ((3, 1) if mask_matches_image else (1, 1))
+    np.testing.assert_array_equal(detector.mask, mask)
+
+
 def test_wide_scan_and_positive_statistical_uncertainty():
     angles=np.array([12.,16.,22.,23.,28.,34.,37.])
     images,centres,beam=beam_images(angles,shape=(41,481),distance=.04,zero=23.)

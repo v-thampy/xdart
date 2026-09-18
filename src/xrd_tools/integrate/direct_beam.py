@@ -70,6 +70,12 @@ def _effective_detector(detector, shape):
     if det.shape is None:
         raise ValueError('detector shape is required (generic: max_shape)')
     if tuple(det.shape) != shape:
+        # pyFAI's guess_binning clears cached masks. Inspect the cache without
+        # materializing a native mask; False/None mean no existing mask array.
+        existing_mask = det._mask
+        if isinstance(existing_mask, np.ndarray) and existing_mask.shape != shape:
+            raise ValueError('detector mask shape differs from image shape; '
+                             'configure binning before assigning the mask')
         if det.max_shape is None or any(m % n for m,n in zip(det.max_shape,shape)):
             raise ValueError(f'image shape {shape} is not an integer binning of {det.max_shape}')
         if det.force_pixel:
@@ -79,6 +85,8 @@ def _effective_detector(detector, shape):
             det.binning = tuple(m // n for m,n in zip(det.max_shape,shape))
         if tuple(det.shape) != shape:
             raise ValueError('effective detector shape differs from image shape')
+        if isinstance(existing_mask, np.ndarray):
+            det.mask = existing_mask
     _uniform_flat(det)
     pitches = np.array([det.pixel1,det.pixel2],dtype=float)
     if not np.all(np.isfinite(pitches) & (pitches > 0)):

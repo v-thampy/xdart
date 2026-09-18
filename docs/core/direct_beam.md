@@ -64,7 +64,8 @@ subsequent frames must have that shape. A smaller cropped image must not be
 presented as a binned full panel. For an already-binned generic detector, supply
 its effective pitches and actual shape, or configure its `.binning` explicitly.
 When an existing detector mask cannot match the resolved shape, the scan fails
-rather than silently losing that mask.
+rather than silently losing that mask. Configure the detector's binning before
+assigning a custom mask in that shape; calibration does not resample masks.
 
 ## SPEC and file references
 
