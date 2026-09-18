@@ -323,8 +323,12 @@ def _default_requests(req: SessionResourceRequirements, requested_workers,
     window = heavy_window(8 * req.pixels, env=env)
     workers = reduction_worker_cap(requested_workers, env=env)
     light = live_record_store_max_items(req.npt_1d or None)
+    # The block budget is a ceiling on whole native frames, so one frame larger
+    # than it would round down to none, below the grant's own one-frame minimum.
+    # `plan_reads` still reads exactly one such frame per block; fund that frame.
     return {"queue_depth": _prefetch_queue_request(env),
-            "owner_block_bytes": source_block_budget_bytes(env=env),
+            "owner_block_bytes": max(source_block_budget_bytes(env=env),
+                                     req.native_frame_bytes),
             "staging_items": window, "record_heavy_items": window,
             "publication_heavy_items": window, "thumbnail_items": 512,
             "record_items": light, "publication_items": light,

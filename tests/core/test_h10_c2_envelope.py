@@ -86,6 +86,56 @@ def test_default_memory_target_warns_without_reducing_requested_capacity(
     assert p.resolve_session_policy(req, allocation=allocation).allocation is allocation
 
 
+# One native frame of 4362 x 4148 uint32 is 72.4 MB: more than the fixed 64 MiB
+# source-block budget that the default owner-block request is taken from.
+_OVERSIZE_FRAME = dict(height=4362, width=4148, native_itemsize=4)
+
+
+@pytest.mark.parametrize("requested_workers", (None, 4))
+def test_default_owner_block_funds_one_frame_larger_than_the_block_budget(requested_workers):
+    """The read plan reads one oversize frame per block; the policy must fund it.
+
+    Whole frames within the budget is zero frames here, which is below the
+    grant's own one-frame minimum, so the automatic route used to refuse the
+    very case `plan_reads` was written to serve.
+    """
+    p = _policy()
+    req = _requirements(**_OVERSIZE_FRAME)
+    assert req.native_frame_bytes > 64 * 1024**2
+    allocation = p.resolve_session_policy(
+        req, requested_workers=requested_workers, env={},
+    ).allocation
+    assert allocation.owner_block_bytes == req.native_frame_bytes
+
+
+@pytest.mark.parametrize("shape, frames", (((1065, 1030), 15), ((3262, 3108), 1)))
+def test_default_owner_block_is_unchanged_when_a_frame_fits_the_budget(shape, frames):
+    p = _policy()
+    req = _requirements(height=shape[0], width=shape[1], native_itemsize=4)
+    allocation = p.resolve_session_policy(req, env={}).allocation
+    assert allocation.owner_block_bytes == frames * req.native_frame_bytes
+    assert allocation.owner_block_bytes <= 64 * 1024**2
+
+
+def test_a_block_budget_override_below_one_frame_still_funds_the_frame():
+    """The reader retains a whole frame whatever the budget says; account for it."""
+    p = _policy()
+    req = _requirements(**_OVERSIZE_FRAME)
+    allocation = p.resolve_session_policy(
+        req, env={"XDART_SOURCE_BLOCK_BYTES": str(1024**2)},
+    ).allocation
+    assert allocation.owner_block_bytes == req.native_frame_bytes
+
+
+def test_an_explicit_owner_block_request_below_one_frame_is_still_refused():
+    p = _policy()
+    req = _requirements(**_OVERSIZE_FRAME)
+    with pytest.raises(ValueError, match="owner_block_bytes"):
+        p.resolve_session_policy(
+            req, requests={"owner_block_bytes": req.native_frame_bytes // 2}, env={},
+        )
+
+
 def test_default_memory_target_keeps_automatic_inflight_for_requested_workers(monkeypatch):
     p = _policy()
     monkeypatch.setattr(p, "default_envelope_bytes", lambda env: 1024**3)
