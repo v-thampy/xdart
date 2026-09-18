@@ -385,13 +385,14 @@ xrayutilities integration:
 
 ```powershell
 pixi run --locked python -m pytest -q -ra --timeout=120 `
+  tests/core/test_single.py::test_pyfai_q_grid_matches_detector_geometry `
   tests/core/test_nexus.py::TestResolveStackCompression::test_lz4_round_trips_when_natively_supported `
   tests/core/test_single.py::test_readonly_mask_detaches_for_pyfai_without_changing_exclusions `
   tests/core/test_circle_angles.py::test_q_identity_through_pixel_q
 $LASTEXITCODE
 ```
 
-Require all three tests to pass without skips and exit normally with code 0.
+Require all four tests to pass without skips and exit normally with code 0.
 Then launch:
 
 ```powershell
@@ -400,11 +401,25 @@ $LASTEXITCODE
 ```
 
 Open representative data, process a scan, select frames, and close normally;
-expect exit 0. The three checks establish basic native-library functionality,
+expect exit 0. The four checks establish basic native-library functionality,
 not full application support or release readiness. Average, Stitch, RSM, and
 reintegration have known Windows portability issues that remain separate from
 installing this environment. Record native results before claiming support for
 those workflows.
+
+The Windows workspace selects NumExpr's non-MKL build because pyFAI 2026.5's
+direct NumExpr calls can produce invalid radial coordinates with the MKL build.
+This also selects OpenBLAS for Windows; macOS/Linux lock entries are unchanged.
+The conda release recipe likewise excludes MKL NumExpr builds. Close xdart and
+notebook kernels, pull the correction, then run `pixi install --locked` before
+restarting them. Check the backend with:
+
+```powershell
+pixi run --locked python -c "import numexpr; print(numexpr.__version__, numexpr.use_vml)"
+```
+
+Expect `2.14.2 False`. Windows performance of this dependency change remains
+unmeasured.
 
 Each new machine installs Git, Pixi, and its own local environment; the shared
 Windows platform declaration and lock entries carry over with the repository.

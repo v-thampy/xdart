@@ -170,3 +170,9 @@ test = { cmd = "pytest tests/core -q", description = "run the headless core test
 # (-n 4) vs ~67 s serial.
 test-fast = { cmd = "pytest tests/core -n auto -q", description = "run the headless core tests in parallel (pytest-xdist)" }
 gui-test = { cmd = "pytest tests/xdart -q -p no:faulthandler", env = { QT_QPA_PLATFORM = "offscreen" }, description = "run the offscreen GUI tests" }
+
+[tool.pixi.target.win-64.dependencies]
+# pyFAI 2026.5 calls compiled NumExpr without VML buffering metadata; MKL
+# builds corrupt radial coordinates for strided inputs/scalar broadcasting.
+# conda-forge non-MKL builds start with py; MKL builds start with mkl_py.
+numexpr = { version = "==2.14.2", build = "py*" }

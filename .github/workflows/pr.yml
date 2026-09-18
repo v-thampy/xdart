@@ -47,6 +47,34 @@ jobs:
           tests/core/test_rsm_corrections.py
           -x -vv --tb=short -m "not slow" --timeout=120
 
+  windows-pixi-native:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v6
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.72.1
+          manifest-path: pyproject.toml
+          locked: true
+      # Require imports so missing native dependencies cannot turn into skips.
+      - run: >-
+          pixi run --locked python -c
+          "import hdf5plugin, xrayutilities, numexpr; print('NumExpr', numexpr.__version__, 'VML', numexpr.use_vml)"
+      - run: >-
+          pixi run --locked python -m pytest
+          tests/core/test_single.py::test_pyfai_q_grid_matches_detector_geometry
+          tests/core/test_single.py::test_readonly_mask_detaches_for_pyfai_without_changing_exclusions
+          tests/core/test_nexus.py::TestResolveStackCompression::test_lz4_round_trips_when_natively_supported
+          tests/core/test_circle_angles.py::test_q_identity_through_pixel_q
+          -q -ra --timeout=120
+        env:
+          XDART_SESSION_FILE: ${{ runner.temp }}/xdart-pixi-session.json
+          XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-pixi-settings.json
+
   architecture-guards:
     runs-on: ubuntu-latest
     timeout-minutes: 15

@@ -9,6 +9,37 @@ from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.integrate.single import integrate_1d, integrate_2d, integrate_scan
 
 
+def test_pyfai_q_grid_matches_detector_geometry():
+    """Catch corrupt radial coordinates in native dependency builds."""
+    from pyFAI.detectors import Detector
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+
+    shape = (32, 32)
+    pixel, distance, wavelength = 1e-4, 0.1, 1e-10
+    ai = AzimuthalIntegrator(
+        dist=distance, wavelength=wavelength,
+        detector=Detector(pixel1=pixel, pixel2=pixel, max_shape=shape),
+    )
+    row, column = np.indices(shape, dtype=np.float64)
+    radius = np.hypot((row + 0.5) * pixel, (column + 0.5) * pixel)
+    expected_q = (
+        4 * np.pi / wavelength
+        * np.sin(np.arctan2(radius, distance) / 2) * 1e-10
+    )
+    actual_q = ai.center_array(shape, unit="q_A^-1")
+    assert np.isfinite(actual_q).all()
+    # Float64 geometry: allow rounding across the equivalent formulae.
+    np.testing.assert_allclose(actual_q, expected_q, rtol=1e-12, atol=0)
+
+    result = integrate_1d(
+        np.ones(shape, dtype=np.float32), ai, npt=16,
+        method="no", correctSolidAngle=False,
+    )
+    assert np.isfinite(result.radial).all()
+    assert np.all(np.diff(result.radial) > 0)
+    np.testing.assert_array_equal(result.intensity, np.ones(16))
+
+
 def test_readonly_mask_detaches_for_pyfai_without_changing_exclusions():
     from pyFAI.detectors import Detector
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator
