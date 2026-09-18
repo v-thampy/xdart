@@ -1768,7 +1768,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         try:
             request = prepare_calibration_request(selected)
         except (OSError, ValueError) as error:
-            self._notice(str(error)); self._refresh_shell(); return
+            self._authoring_error("Calibration not started", str(error)); return
         remember_browse_path(request.source_path)
         stamp = self._operation_context_stamp(snapshot.revision)
         identity = operations.begin_calibrate(request, stamp)
@@ -1811,7 +1811,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         snapshot = self._intents.snapshot(); intent = snapshot.thaw()
         try: request = prepare_mask_request(selected, current_poni=str(intent.poni_file or ""), current_mask=str(intent.mask_file or ""))
         except (OSError, ValueError) as error:
-            self._notice(str(error)); self._refresh_shell(); return
+            self._authoring_error("Make Mask not started", str(error)); return
         remember_browse_path(request.source_path); self._notice(f"Preparing {os.path.basename(request.source_path)}…")
         stamp = self._operation_context_stamp(snapshot.revision)
         identity = operations.begin_mask(request, stamp)
@@ -1824,6 +1824,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._ensure_timer(); return
         self._apply_authored_asset_transition(transition)
         self._notice(f"Making {os.path.basename(request.final_path)}…")
+
+    def _authoring_error(self, title: str, detail: str) -> None:
+        _LOG.warning("%s: %s", title, detail)
+        self._notice(f"{title}: {detail}")
+        if self._closing or self._closed:
+            return
+        dialog = QtWidgets.QMessageBox(
+            QtWidgets.QMessageBox.Icon.Warning, title, title,
+            QtWidgets.QMessageBox.StandardButton.Ok, self,
+        )
+        dialog.setInformativeText(detail)
+        dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dialog.open()
+        self._refresh_shell(preserve_display=True, preserve_scientific=True)
 
     def _apply_authored_asset_transition(
         self, transition: AuthoredAssetTransition,
@@ -1841,7 +1855,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             if adoption.remember_path:
                 remember_browse_path(adoption.path)
-        if transition.notice:
+        if transition.error:
+            self._authoring_error("Experiment tool failed", transition.notice)
+        elif transition.notice:
+            _LOG.info("%s", transition.notice)
             self._notice(transition.notice)
         if transition.cancel_identity is not None:
             self._workspace_operations.cancel(transition.cancel_identity)

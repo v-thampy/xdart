@@ -870,7 +870,17 @@ def calibration_candidate_current(candidate: CalibrationCandidate) -> bool:
                 and SourceFileState.capture(path) == state)
     except (OSError, ValueError):
         return False
+def _private_mode(mode: int, expected: int) -> bool:
+    # Windows inherits the directory ACL; its stat/chmod do not model POSIX
+    # owner/group bits. Object identity and byte checks apply on both platforms.
+    return _WINDOWS or stat.S_IMODE(mode) == expected
+
+
 def _tighten_qualified(path: Path, proof, matcher: Callable = _matches) -> None:
+    if _WINDOWS:
+        if matcher(proof, path) is None:
+            raise ValueError("qualified asset changed before publication")
+        return
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if type(nofollow) is not int or not hasattr(os, "fchmod"): raise OSError("descriptor-bound mode tightening is unavailable")
     fd = os.open(path, os.O_RDONLY | nofollow)
@@ -1336,7 +1346,8 @@ def prepare_mask_request(selected: str, *, current_poni: str = "", current_mask:
             source, exact_hdf_url, read=False,
         )
     final = Path(os.path.splitext(str(source))[0] + "-mask.edf")
-    if os.path.lexists(final): raise ValueError("Mask output already exists.")
+    if os.path.lexists(final):
+        raise ValueError(f"Mask output already exists: {final}\nThe existing mask was left unchanged.")
     key = os.path.normcase(os.path.normpath(str(final)))
     current = {os.path.normcase(os.path.normpath(str(Path(value).expanduser().resolve(strict=False)))) for value in (current_poni, current_mask) if value}
     if key in current: raise ValueError("Mask output must differ from current assets.")
@@ -1401,7 +1412,8 @@ def _copy_tiff(source: Path, private: Path):
         if (not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino, opened.st_size)
                 != (before.device, before.inode, before.size)):
             raise ValueError("TIFF identity changed before copy")
-        os.fchmod(target_fd, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(target_fd, 0o600)
         with os.fdopen(source_fd, "rb", closefd=False) as incoming, os.fdopen(target_fd, "wb", closefd=False) as outgoing:
             if not incoming.seekable() or not outgoing.seekable(): raise OSError("TIFF descriptors must be seekable")
             while chunk := incoming.read(1 << 20):
@@ -1420,7 +1432,7 @@ def _copy_tiff(source: Path, private: Path):
     staged_digest, staged_count = _asset_digest(private, _TIFF_LIMIT)
     if (before != after or digest.hexdigest() != repeated or count != repeated_count
             or count != staged.size or count != staged_count
-            or digest.hexdigest() != staged_digest or stat.S_IMODE(private.lstat().st_mode) != 0o600):
+            or digest.hexdigest() != staged_digest or not _private_mode(private.lstat().st_mode, 0o600)):
         raise ValueError("TIFF changed or staged copy did not match")
     return before, digest.hexdigest(), staged, staged_digest
 def _pillow_header(stream) -> tuple[tuple[int, int], np.dtype, int] | None:
@@ -1538,7 +1550,7 @@ def _stage_hdf_tiff(
         raise ValueError("staged TIFF does not preserve the exact HDF frame")
     staged_file_digest, staged_count = _asset_digest(private, _TIFF_LIMIT)
     if (staged_count != staged.size
-            or stat.S_IMODE(private.lstat().st_mode) != 0o600):
+            or not _private_mode(private.lstat().st_mode, 0o600)):
         raise ValueError("staged HDF frame TIFF changed during qualification")
     return (
         source_state, digest, staged, digest, staged_file_digest,
@@ -1596,19 +1608,23 @@ def _mask_matches(proof: MaskProof, path: Path) -> SourceFileState | None:
     try:
         proof.__post_init__()
         raw = path.lstat()
-        if stat.S_ISLNK(raw.st_mode) or not stat.S_ISREG(raw.st_mode) or stat.S_IMODE(raw.st_mode) != 0o600: return None
+        if stat.S_ISLNK(raw.st_mode) or not stat.S_ISREG(raw.st_mode) or not _private_mode(raw.st_mode, 0o600): return None
         state = SourceFileState.capture(path); latest = path.lstat()
-        same = (stat.S_ISREG(latest.st_mode) and stat.S_IMODE(latest.st_mode) == 0o600 and (latest.st_dev, latest.st_ino, latest.st_size) == (state.device, state.inode, state.size) and (state.device, state.inode, state.size) == (proof.state.device, proof.state.inode, proof.state.size))
+        same = (stat.S_ISREG(latest.st_mode) and _private_mode(latest.st_mode, 0o600) and (latest.st_dev, latest.st_ino, latest.st_size) == (state.device, state.inode, state.size) and (state.device, state.inode, state.size) == (proof.state.device, proof.state.inode, proof.state.size))
         if same:
             digest = _asset_digest(path, _MASK_LIMIT)[0]; after = SourceFileState.capture(path); latest = path.lstat()
-            same = digest == proof.mask_sha256 and after == state and stat.S_ISREG(latest.st_mode) and stat.S_IMODE(latest.st_mode) == 0o600 and (latest.st_dev, latest.st_ino, latest.st_size) == (after.device, after.inode, after.size)
+            same = digest == proof.mask_sha256 and after == state and stat.S_ISREG(latest.st_mode) and _private_mode(latest.st_mode, 0o600) and (latest.st_dev, latest.st_ino, latest.st_size) == (after.device, after.inode, after.size)
     except (OSError, ValueError): return None
     return state if same else None
 
 
 def _open_admitted_directory(
     path: Path, identity: tuple[int, int],
-) -> int:
+) -> int | None:
+    if _WINDOWS:
+        if _directory_identity(path) != identity:
+            raise ValueError("mask publication directory changed")
+        return None
     if not _DIR_FD_PUBLICATION:
         raise OSError("descriptor-bound mask publication is unavailable")
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -1626,8 +1642,15 @@ def _open_admitted_directory(
 
 
 def _publication_state(
-    directory_fd: int, name: str, proof: MaskProof, reported_path: str,
+    directory_fd: int | None, name: str, proof: MaskProof, reported_path: str,
 ) -> SourceFileState:
+    if _WINDOWS:
+        # Capture through the pathname, like all other SourceFileState values;
+        # Windows fstat and stat expose different ctime meanings.
+        state = _mask_matches(proof, Path(reported_path))
+        if state is None or state.mtime_ns != proof.state.mtime_ns:
+            raise ValueError("published mask identity is inexact")
+        return state
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(name, flags, dir_fd=directory_fd)
     try:
@@ -1649,13 +1672,16 @@ def _publication_state(
 
 
 def _unlink_exact_publication(
-    directory_fd: int, name: str, proof: MaskProof,
+    directory_fd: int | None, path: Path, proof: MaskProof,
 ) -> bool:
     try:
-        state = _publication_state(directory_fd, name, proof, proof.state.path)
+        state = _publication_state(directory_fd, path.name, proof, str(path))
         if (state.device, state.inode) != (proof.state.device, proof.state.inode):
             return False
-        os.unlink(name, dir_fd=directory_fd)
+        if _WINDOWS:
+            path.unlink()
+        else:
+            os.unlink(path.name, dir_fd=directory_fd)
         return True
     except (FileNotFoundError, OSError, ValueError):
         return False
@@ -1838,7 +1864,7 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
         if os.path.lexists(final): raise ValueError("mask request is no longer publishable")
         stage = Path(tempfile.mkdtemp(prefix=".xdart-mask-", dir=final.parent)); created = stage.lstat(); stage_identity = (created.st_dev, created.st_ino)
         os.chmod(stage, 0o700); stage_stat = stage.lstat()
-        if (stage_stat.st_dev, stage_stat.st_ino) != stage_identity or not stat.S_ISDIR(stage_stat.st_mode) or stat.S_IMODE(stage_stat.st_mode) != 0o700: raise OSError("private mask stage is not mode 0700")
+        if (stage_stat.st_dev, stage_stat.st_ino) != stage_identity or not stat.S_ISDIR(stage_stat.st_mode) or not _private_mode(stage_stat.st_mode, 0o700): raise OSError("private mask stage is not mode 0700")
         _probe_links(stage)
         private_source = stage / (
             source.name if request.exact_hdf_url is None
@@ -1911,11 +1937,16 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
         _tighten_qualified(private_mask, proof, _mask_matches)
         publish("publish", 4, 4); link_error = None
         try:
-            _link(
-                f"{stage.name}/{private_mask.name}", final.name,
-                src_dir_fd=publication_fd, dst_dir_fd=publication_fd,
-                follow_symlinks=False,
-            )
+            if _WINDOWS:
+                # Hard-link creation is exclusive on Windows too: an existing
+                # final mask is never replaced. Reconcile identity below.
+                _link(private_mask, final)
+            else:
+                _link(
+                    f"{stage.name}/{private_mask.name}", final.name,
+                    src_dir_fd=publication_fd, dst_dir_fd=publication_fd,
+                    follow_symlinks=False,
+                )
             publication_linked = True
         except FileExistsError as error: raise ValueError("mask output already exists") from error
         except OSError as error: link_error = error
@@ -1932,7 +1963,7 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
         status = OperationTerminalStatus.FAILED; module, name, message = detached_exception_strings(error); diagnostic = f"{module}.{name}: {message}"
     if publication_linked and not published and proof is not None:
         if _unlink_exact_publication(
-                publication_fd, Path(request.final_path).name, proof):
+                publication_fd, Path(request.final_path), proof):
             publication_linked = False
         final_state = None
     names = (() if stage is None else tuple(stage / name for name in (".link-probe-source", ".link-probe-linked", ".link-probe-occupied")))
@@ -1962,7 +1993,7 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
                 "published mask changed during terminal cleanup"
             )
             if _unlink_exact_publication(
-                    publication_fd, Path(request.final_path).name, proof):
+                    publication_fd, Path(request.final_path), proof):
                 publication_linked = False
                 published = False
                 final_state = None

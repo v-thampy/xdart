@@ -78,6 +78,7 @@ jobs:
         run: >-
           pixi run --locked python scripts/ci_pytest.py
           tests/xdart/scattering/test_windows_browse_paths.py
+          tests/xdart/scattering/test_authoring_launch.py
           tests/xdart/scattering/test_append_per_frame_saturation.py
           tests/xdart/scattering/test_append_mode_dialog.py
           tests/xdart/scattering/test_gi_motorless_source.py

@@ -164,11 +164,13 @@ class AuthoredAssetTransition:
     dialog: AuthoredAssetDialogCommand | None = None
     cancel_identity: OperationIdentity | None = None
     adoption: AuthoredAssetAdoption | None = None
+    error: bool = False
 
     def __post_init__(self) -> None:
         valid = (
             type(self.refresh) is AuthoredAssetRefreshEffect
             and type(self.notice) is str
+            and type(self.error) is bool
             and (
                 self.issue is None
                 or type(self.issue) is AuthoredAssetDialogIssue
@@ -588,7 +590,8 @@ class AuthoredAssetOwner:
                 else f"{label} failed: {terminal.diagnostic}"
             )
             return AuthoredAssetTransition(
-                AuthoredAssetRefreshEffect.CONTROLS, notice
+                AuthoredAssetRefreshEffect.CONTROLS, notice,
+                error=terminal.status is OperationTerminalStatus.FAILED,
             )
         evidence = _terminal_evidence(state, update)
         if evidence is None:
