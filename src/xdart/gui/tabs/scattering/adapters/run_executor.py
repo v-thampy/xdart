@@ -15,6 +15,7 @@ from xdart.modules.frame_publication import (
     publication_from_frame_view,
 )
 from xrd_tools.core.scan import SourceKind
+from xrd_tools.io.append import AppendRefused
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.reduction.background import (
     _PreparedSingleFrameBackground,
@@ -953,6 +954,7 @@ class StandardRunExecutor:
             result = AdmissionFailure(
                 operation.token,
                 detach_exception(error, 'admission').message,
+                append_refused=isinstance(error, AppendRefused),
             )
         finally:
             operation.finish_worker(result)

@@ -3815,6 +3815,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice(f"Output admission failed: {result.reason}")
             if released.cleanup_status is not CleanupStatus.CLEANED:
                 self._notice("Output cleanup remains pending.")
+            elif result.append_refused:
+                self._confirm_append_overwrite(result)
             return True
         if type(result) is not AdmissionReceipt:
             self._release_admission(token)
@@ -3875,6 +3877,39 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             return True
         return not self._launch(token, result)
+
+    def _confirm_append_overwrite(self, failure: AdmissionFailure) -> None:
+        snapshot = self._intents.snapshot()
+        if (snapshot.revision != failure.token.revision
+                or snapshot.thaw().output_mode != "Append"
+                or not self._start_permitted()[0]):
+            return
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setWindowTitle("Cannot append to existing output")
+        dialog.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        dialog.setText("The existing output is incompatible with this Append run.")
+        dialog.setInformativeText(
+            "Overwrite the existing output and restart from the beginning with "
+            "the selected settings, or cancel to keep the saved results."
+        )
+        dialog.setDetailedText(failure.reason)
+        overwrite = dialog.addButton("Overwrite", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+        cancel = dialog.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(cancel)
+        dialog.setEscapeButton(cancel)
+        dialog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+
+        def finished(_result: int) -> None:
+            if (dialog.clickedButton() is not overwrite
+                    or self._intents.snapshot().revision != snapshot.revision
+                    or not self._start_permitted()[0]):
+                return
+            self._edit_run_strip(ShellCommandKind.SET_OUTPUT_POLICY, "Overwrite")
+            self._run_action()
+
+        dialog.finished.connect(finished)
+        dialog.open()
 
     def _launch(
         self, token: AdmissionToken, receipt: AdmissionReceipt

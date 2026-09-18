@@ -360,9 +360,11 @@ class AdmissionToken:
 class AdmissionFailure:
     token: AdmissionToken
     reason: str
+    append_refused: bool = False
 
     def __post_init__(self) -> None:
-        if type(self.token) is not AdmissionToken or type(self.reason) is not str:
+        if (type(self.token) is not AdmissionToken or type(self.reason) is not str
+                or type(self.append_refused) is not bool):
             raise TypeError("admission failure values are invalid")
 
 @dataclass(frozen=True, slots=True)
