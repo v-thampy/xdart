@@ -41,8 +41,16 @@ from xrd_tools.integrate.refine import (
     RefineResult,
     refine_goniometer,
 )
+from xrd_tools.integrate.direct_beam import (
+    DirectBeamResult,
+    calibrate_direct_beam,
+    calibrate_direct_beam_scan,
+)
 
 __all__ = [
+    "DirectBeamResult",
+    "calibrate_direct_beam",
+    "calibrate_direct_beam_scan",
     "create_fiber_integrator",
     "create_multigeometry_integrators",
     "create_multigeometry_integrators_from_geometry",
