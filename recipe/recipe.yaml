@@ -63,7 +63,10 @@ requirements:
     - pip
     - setuptools
   run:
-    - python >=${{ python_min }}
+    # Capped at the newest Python the project tests and claims (pyproject
+    # classifiers, CI, the Pixi workspace). `pixi global install` takes the newest
+    # interpreter this range allows; left open, users got 3.14, which no job runs.
+    - python >=${{ python_min }},<3.14
     # headless core — conda-forge fast I/O stack
     - numpy ==2.5.1               # match the XU numerical runtime contract
     - scipy

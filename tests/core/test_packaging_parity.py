@@ -55,3 +55,19 @@ def test_conda_recipe_tests_import_the_notebook_stack():
         for name in test.get("python", {}).get("imports", ())
     }
     assert {"ipykernel", "ipympl", "ipywidgets", "jupyterlab"} <= imports
+
+
+def test_conda_recipe_offers_only_the_python_versions_the_project_claims():
+    """An open-ended range hands users a Python that no test has ever run.
+
+    `pixi global install` takes the newest interpreter the recipe allows, so the
+    recipe's upper bound is what decides which Python users actually get.
+    """
+    minors = sorted(
+        int(classifier.rsplit(".", 1)[1])
+        for classifier in _project()["classifiers"]
+        if re.fullmatch(r"Programming Language :: Python :: 3\.\d+", classifier)
+    )
+    assert minors, "pyproject declares no supported Python minor versions"
+    spec = next(r for r in _recipe()["requirements"]["run"] if _name(r) == "python")
+    assert f"<3.{minors[-1] + 1}" in spec.replace(" ", ""), spec
