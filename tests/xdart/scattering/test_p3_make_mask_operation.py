@@ -664,7 +664,10 @@ def test_drift_nonzero_and_missing_output_keep_existing_mask(tmp_path, monkeypat
         if failure == "empty": _output.write_bytes(b"")
     _install_process(monkeypatch, mask, code=7 if failure == "nonzero" else 0, hook=hook, missing=failure == "missing")
     seal = (lambda _identity: (outputs[0].write_bytes(b"drift"), True)[1]) if failure == "seal" else (lambda _identity: True)
-    terminal, _ = _direct(request, seal=seal); assert terminal.status is OperationTerminalStatus.FAILED and not terminal.payload.published
+    terminal, _ = _direct(request, seal=seal)
+    expected = (OperationTerminalStatus.CANCELLED if failure == "missing"
+                else OperationTerminalStatus.FAILED)
+    assert terminal.status is expected and not terminal.payload.published
     assert Path(request.final_path).read_bytes() == b"existing mask"
 
 

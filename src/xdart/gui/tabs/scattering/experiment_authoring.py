@@ -1924,6 +1924,10 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
                     private_source, staged_state, staged_file_sha,
                     _TIFF_LIMIT)):
             raise ValueError("mask source changed during child execution")
+        try:
+            private_mask.lstat()
+        except FileNotFoundError:
+            raise _Cancelled("mask editor closed without saving")
         publish("qualify", 3, 4); proof = _qualify_mask(private_mask, shape, source_dtype, source_sha, staged_sha)
         if (not authoring_source_context_current(request)
                 or not _unchanged(private_mask, proof.state, proof.mask_sha256, _MASK_LIMIT)): raise ValueError("qualified mask changed before publication")

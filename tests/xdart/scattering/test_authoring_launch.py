@@ -41,7 +41,7 @@ def _windows_permissions(monkeypatch):
 @pytest.mark.parametrize("source_kind", ["tiff", "hdf"])
 @pytest.mark.parametrize("action", ["save", "close", "failure"])
 def test_real_drawmask_child_saves_and_cleans(
-    tmp_path, monkeypatch, source_kind, portable, action,
+    tmp_path, monkeypatch, _xdart_qt_harness, source_kind, portable, action,
 ):
     # Use the native launcher and actual pyFAI window. Automate save/close/exit
     # at event-loop entry; no fake Popen, image reader or publisher.
@@ -116,9 +116,33 @@ qt.QApplication.exec = automated_exec
         assert terminal.payload.exit_code == 0
         np.testing.assert_array_equal(load_mask(final), np.zeros(pixels.shape, dtype=bool))
     else:
-        assert terminal.status is OperationTerminalStatus.FAILED
+        expected = (OperationTerminalStatus.CANCELLED if action == "close"
+                    else OperationTerminalStatus.FAILED)
+        assert terminal.status is expected, terminal.diagnostic
         assert terminal.payload.exit_code == (7 if action == "failure" else 0)
         assert final.read_bytes() == saved
+        store = RunIntentStore(RunIntent(project_root=str(tmp_path), mask_file=str(final)))
+        page = ScatteringWorkspace(intents=store, lifecycle=ScatteringCoordinator(),
+                                   sources=FilesystemSourceAdapter())
+        before = store.snapshot()
+        app = _xdart_qt_harness.app
+        try:
+            page._authored_assets.adopt_operation(
+                "mask", request, page._operation_context_stamp(), identity)
+            assert page._consume_authored_asset_update(update)
+            app.processEvents()
+            dialogs = page.findChildren(QtWidgets.QMessageBox)
+            assert len(dialogs) == (0 if action == "close" else 1)
+            assert page._authored_asset_dialog is None
+            assert store.snapshot() == before
+            if action == "close":
+                assert not terminal.diagnostic
+        finally:
+            for dialog in page.findChildren(QtWidgets.QMessageBox):
+                dialog.close()
+            page.close_workspace()
+            page.deleteLater()
+            app.processEvents()
     assert not terminal.payload.recovery_path
     assert source.read_bytes() == original
     assert not list(tmp_path.glob(".xdart-mask-*"))
