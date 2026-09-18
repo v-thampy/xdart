@@ -558,7 +558,9 @@ def _mode_tokens(configuration) -> tuple[str, ...]:
             # identity, so a changed mode set takes the incompatibility flow.
             modes.extend(
                 f"2d:{mode}"
-                for mode in gi_companion_modes_2d(configuration.bai_2d_args)
+                for mode in gi_companion_modes_2d(
+                    configuration.bai_2d_args, primary=two_key,
+                )
             )
     return tuple(modes)
 

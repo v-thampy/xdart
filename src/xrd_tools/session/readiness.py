@@ -734,14 +734,20 @@ def _native_gi_2d_unit_default(unit: Any, mode: str, *, is_gi: bool) -> str:
 GI_COMPANION_MODES_2D_ARG = "gi_companion_modes_2d"
 
 
-def gi_companion_modes_2d(bai_2d_args: Mapping[str, Any] | None) -> tuple[str, ...]:
-    """The declared companion GI 2-D modes of one 2-D argument mapping."""
+def gi_companion_modes_2d(
+    bai_2d_args: Mapping[str, Any] | None, *, primary: str | None = None,
+) -> tuple[str, ...]:
+    """The declared companion GI 2-D modes of one 2-D argument mapping.
+
+    A companion equal to *primary* is not a companion: the selected mode is
+    calculated once, whatever a stale or hand-written selection says.
+    """
     declared = (bai_2d_args or {}).get(GI_COMPANION_MODES_2D_ARG) or ()
     if isinstance(declared, (str, bytes)) or not all(
         type(mode) is str and mode for mode in declared
     ):
         raise ValueError(f"{GI_COMPANION_MODES_2D_ARG} must be a list of mode names")
-    return tuple(declared)
+    return tuple(dict.fromkeys(mode for mode in declared if mode != primary))
 
 
 def build_native_int_reduction_plan_from_args(
@@ -817,7 +823,7 @@ def build_native_int_reduction_plan_from_args(
     gi_mode_2d = str(_native_pop_first(args_2d, ("gi_mode_2d",), "qip_qoop"))
     # Always consumed here, so it can never reach pyFAI as an unknown keyword.
     # Only an ordinary Run declares it; Average and Reintegration stay one-mode.
-    companions_2d = gi_companion_modes_2d(args_2d)
+    companions_2d = gi_companion_modes_2d(args_2d, primary=gi_mode_2d)
     args_2d.pop(GI_COMPANION_MODES_2D_ARG, None)
     npt_oop = _native_pop_first(args_1d, ("npt_oop",), None)
     if npt_oop is None:

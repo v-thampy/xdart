@@ -101,3 +101,14 @@ def test_reintegration_stays_single_mode():
     selected = preparation["selected_plan"]
     assert selected["gi_mode"] == "qip_qoop"
     assert "gi_companion_modes_2d" not in selected["bai_args"]
+
+
+def test_a_stale_selection_naming_the_primary_is_calculated_once():
+    """Q-χ alone is stored once, whatever a hand-written selection says."""
+    intent = _choose(_intent(), "Q-χ")
+    intent.bai_2d_args["gi_companion_modes_2d"] = ["q_chi"]
+    frozen = intent.freeze()
+    plan = native_int_reduction_plan(frozen, companion_modes_2d=True)
+    assert plan.extra["enabled_modes_2d"] == ("q_chi",)
+    assert _mode_tokens(frozen) == ("1d:q_total", "2d:q_chi")
+    assert integration_values(intent)[INT_2D_AXIS] == "Q-χ"
