@@ -323,6 +323,31 @@ for downstream users:
 
 ## What's new in v1.1.5
 
+- **Python 3.13 or newer is required** (previously 3.11).
+- **Mask files are `.edf` or `.npy`.** File pickers, typed paths, saved-mask
+  adoption, and `xrd_tools.io.load_mask` refuse every other format, including
+  TIFF; TIFF remains a supported detector-image format. Convert an existing
+  mask once, for example
+  `np.save("mask.npy", fabio.open("mask.tif").data != 0)` (non-zero = masked).
+- **Make Mask replaces and selects its output.** The mask is written as
+  `<image>-mask.edf` beside the source image. An existing file of that name is
+  replaced, without a prompt, once the edited mask has been validated; the saved
+  mask becomes the Mask File automatically; closing the editor without saving
+  is a quiet cancel that leaves any existing mask untouched.
+- **The last run configuration returns after a normal quit.** Start with
+  `xdart --fresh` to open with defaults instead; a fresh session neither
+  restores nor overwrites the saved configuration.
+- **Memory targets are advisory.** The automatic target (40% of physical RAM)
+  no longer trims the requested workers or buffers: a run whose estimated
+  working set exceeds it logs a `[MEMORY-TARGET]` warning and continues. A new
+  session starts with at most two Cores when less than 16 GiB of RAM is
+  detected; lower **Cores** to reduce memory use.
+- **Processed files move between operating systems.** A scan reduced on
+  Windows opens in Browse on macOS or Linux, and the reverse, with its 1-D
+  patterns, 2-D results, and detector thumbnails. Set the Project folder to the
+  moved project to load full-resolution detector images.
+- **Analyze Results notebooks use interactive Matplotlib** (`ipympl`) and fall
+  back to static inline figures in a kernel that does not have it.
 - **NeXus Directory + Append starts without hydrating every old output.**
   Append resume now reads only the small frame-index datasets for each scan as
   that scan is reached. It no longer constructs a full processed scan for every

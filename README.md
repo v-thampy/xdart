@@ -234,7 +234,10 @@ The **silx HDF5 Viewer** button launches
 [silx view](https://silx.readthedocs.io/en/stable/applications/view.html) to browse
 HDF5 datasets, images, and metadata. Both viewers are included with the GUI
 installation. Processed files may reference their original raw images: retain
-those images when moving a project.
+those images when moving a project. A processed file opened on another computer
+or operating system still shows its 1-D patterns, 2-D results, and detector
+thumbnails; set the **Project folder** to the moved project to load the
+full-resolution detector images.
 
 #### Integration axes and units
 
@@ -347,7 +350,8 @@ Open it in an environment with `xdart[notebook]`, such as the
 [notebook Pixi workspace](docs/INSTALLATION.md#headless--notebooks-with-pixi) or
 [editable install](docs/INSTALLATION.md#editable-install-with-pixi-recommended),
 and run `pixi run jupyter lab`. If you move the results, update the paths
-in the notebook before running its cells.
+in the notebook before running its cells. Figures are interactive when `ipympl`
+is installed in the kernel and static otherwise.
 
 ### Configuration & calibration
 
@@ -400,7 +404,10 @@ The default planning target is 40% of physical RAM, with a 16 GiB fallback on
 Windows. This is a development guideline, not a processing limit: when the
 estimated working set exceeds it, xdart logs a warning and continues with the
 requested workers and buffers. The estimate is not a measurement of total RSS.
-Lower **Cores** to reduce simultaneous raw-frame and integration buffers.
+Lower **Cores** to reduce simultaneous raw-frame and integration buffers. A new
+session starts with at most two Cores when less than 16 GiB of RAM is detected;
+a value you set, or one restored from your last session, is kept as it is.
+Physical RAM is not detected on Windows yet, so that default does not apply there.
 Processed-data browsing loads image data on demand; the frame count alone does
 not determine how many full detector images remain resident.
 
