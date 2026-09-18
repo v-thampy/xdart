@@ -1733,6 +1733,54 @@ def test_canonical_stage_retries_transient_windows_sharing_violation(
     assert result.phase is api.TransactionPhase.COMMITTED
 
 
+@pytest.mark.parametrize("text_side", (None, "read", "write"))
+def test_stream_seed_preserves_binary_bytes(tmp_path, monkeypatch, text_side):
+    # Ordinary HDF5 starts with CRLF and Ctrl-Z. Native Windows must preserve
+    # these bytes too; POSIX rows emulate only the CRT translation boundary.
+    prior = b"\x89HDF\r\n\x1a\n" + bytes(range(256))
+    api, target, _, transaction, tx_owner, target_owner, _, lease = _prepared(
+        tmp_path, prior=prior,
+    )
+    if text_side is not None and os.name != "nt":
+        binary_flag = 0x8000
+        real_open, real_read, real_write = os.open, os.read, os.write
+        binary = {}
+
+        def crt_open(path, flags, *args, **kwargs):
+            descriptor = real_open(path, flags & ~binary_flag, *args, **kwargs)
+            binary[descriptor] = bool(flags & binary_flag)
+            return descriptor
+
+        def crt_read(descriptor, size):
+            data = real_read(descriptor, size)
+            if not binary.get(descriptor, True):
+                data = data.split(b"\x1a", 1)[0].replace(b"\r\n", b"\n")
+            return data
+
+        def crt_write(descriptor, data):
+            if binary.get(descriptor, True):
+                return real_write(descriptor, data)
+            raw = bytes(data)
+            translated = raw.replace(b"\n", b"\r\n")
+            assert real_write(descriptor, translated) == len(translated)
+            return len(raw)
+
+        monkeypatch.setattr(os, "O_BINARY", binary_flag, raising=False)
+        monkeypatch.setattr(os, "open", crt_open)
+        monkeypatch.setattr(os, text_side, crt_read if text_side == "read" else crt_write)
+    attempt = transaction.begin_stream(
+        admission=transaction.admission, transaction_owner=tx_owner,
+        target_owner=target_owner, lease=lease,
+    )
+    try:
+        assert target.read_bytes() == prior
+    finally:
+        result = transaction.abort_stream(attempt, lease=lease)
+        assert result.phase is api.TransactionPhase.ABORTED
+    assert target.read_bytes() == prior
+    assert not transaction.backup.exists()
+
+
 def test_canonical_stream_epoch_extension_retries_under_one_exclusion_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

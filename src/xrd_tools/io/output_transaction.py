@@ -2787,9 +2787,12 @@ class OutputTransaction:
         if target.exists():
             raise TargetChanged(f"stream target appeared before seed: {target}")
         source_descriptor: int | None = None
+        # HDF5 bytes must bypass Windows CRT newline/Ctrl-Z translation on
+        # both sides of the raw descriptor copy.
+        binary = getattr(os, "O_BINARY", 0)
         destination = os.open(
             target,
-            os.O_CREAT | os.O_EXCL | os.O_RDWR,
+            os.O_CREAT | os.O_EXCL | os.O_RDWR | binary,
             0o600,
         )
         try:
@@ -2803,7 +2806,7 @@ class OutputTransaction:
                 and self._prior_receipt is not None
             ):
                 prior = self._prior_receipt
-                source_descriptor = os.open(self.backup, os.O_RDONLY)
+                source_descriptor = os.open(self.backup, os.O_RDONLY | binary)
                 source_expected_stat = _bind_descriptor_to_receipt(
                     source_descriptor,
                     self.backup,

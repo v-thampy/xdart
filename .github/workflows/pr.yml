@@ -78,6 +78,8 @@ jobs:
         run: >-
           pixi run --locked python scripts/ci_pytest.py
           tests/xdart/scattering/test_windows_browse_paths.py
+          tests/xdart/scattering/test_append_per_frame_saturation.py
+          tests/core/test_h23_output_transaction.py::test_stream_seed_preserves_binary_bytes
           tests/xdart/scattering/test_p1b_output_graph.py::test_standard_then_grazing_run_can_exceed_memory_target[synthetic]
           tests/core/test_frame_preview.py::test_reader_decodes_persisted_windows_source_base_for_runtime
           tests/core/test_frame_preview.py::test_mixed_case_project_preview_and_full_raw_use_stored_root

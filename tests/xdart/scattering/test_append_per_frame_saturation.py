@@ -17,7 +17,8 @@ from xdart.gui.tabs.scattering.events import CleanupStatus
 
 
 @pytest.mark.parametrize("mask_enabled", (False, True))
-def test_real_stop_append_matches_one_pass(tmp_path, monkeypatch, mask_enabled):
+@pytest.mark.parametrize("processing_mode", ("Int 1D", "Int 2D"))
+def test_real_stop_append_matches_one_pass(tmp_path, monkeypatch, mask_enabled, processing_mode):
     raw_root = tmp_path / "raw"
     raw_root.mkdir()
     raw = raw_root / "scan_0001.tif"
@@ -33,21 +34,26 @@ def test_real_stop_append_matches_one_pass(tmp_path, monkeypatch, mask_enabled):
     resume_target.parent.mkdir()
 
     def intent(target, mode="Overwrite"):
-        value = _intent(raw, target, poni, output_mode=mode, npt=32)
+        value = _intent(raw, target, poni, output_mode=mode, npt=32,
+                        processing_mode=processing_mode)
         value.threshold.mask_saturation = mask_enabled
         return value
 
     def arrays(target):
-        with h5py.File(_written(target), "r") as handle:
+        with h5py.File(_written(target, processing_mode), "r") as handle:
             group = handle["entry/integrated_1d"]
-            return group["frame_index"][()], group["intensity"][()]
+            two_d = (
+                handle["entry/integrated_2d/intensity"][()]
+                if processing_mode == "Int 2D" else None
+            )
+            return group["frame_index"][()], group["intensity"][()], two_d
 
     full, full_id, full_events = _run_to_terminal(intent(full_target), request_value=9101)
     try:
         assert next(event for event in full_events if event.kind in _TERMINAL).kind is StandardEventKind.FINISHED
     finally:
         assert full.close(full_id).cleanup_status is CleanupStatus.CLEANED
-    full_labels, expected = arrays(full_target)
+    full_labels, expected, expected_2d = arrays(full_target)
 
     entered, release = Event(), Event()
     original_submit = DynamicOutputAdapter.submit
@@ -75,18 +81,23 @@ def test_real_stop_append_matches_one_pass(tmp_path, monkeypatch, mask_enabled):
             release.set()
             if stop_id is not None:
                 assert stopped.close(stop_id).cleanup_status is CleanupStatus.CLEANED
-    prefix_labels, prefix = arrays(resume_target)
+    prefix_labels, prefix, prefix_2d = arrays(resume_target)
     np.testing.assert_array_equal(prefix, expected[:len(prefix)])
+    if expected_2d is not None:
+        np.testing.assert_array_equal(prefix_2d, expected_2d[:len(prefix)])
 
     appended, append_id, append_events = _run_to_terminal(intent(resume_target, "Append"), request_value=9103)
     try:
         assert next(event for event in append_events if event.kind in _TERMINAL).kind is StandardEventKind.FINISHED
     finally:
         assert appended.close(append_id).cleanup_status is CleanupStatus.CLEANED
-    labels, actual = arrays(resume_target)
+    labels, actual, actual_2d = arrays(resume_target)
     np.testing.assert_array_equal(labels, full_labels)
     np.testing.assert_array_equal(actual[:len(prefix)], prefix)
     delta = np.abs(actual[len(prefix):] - expected[len(prefix):])
     print("SATURATION_APPEND", "enabled", mask_enabled, "prefix", prefix_labels.tolist(),
           "different_values", np.count_nonzero(delta), "max_abs", float(delta.max()), flush=True)
     np.testing.assert_array_equal(actual[len(prefix):], expected[len(prefix):])
+    if expected_2d is not None:
+        np.testing.assert_array_equal(actual_2d[:len(prefix)], prefix_2d)
+        np.testing.assert_array_equal(actual_2d, expected_2d)
