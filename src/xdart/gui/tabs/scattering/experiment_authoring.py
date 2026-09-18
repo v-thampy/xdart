@@ -944,12 +944,11 @@ def _private_child_stderr(directory: Path):
     )
     try:
         descriptor = stream.fileno()
-        if hasattr(os, "fchmod"):
+        if not _WINDOWS:
             os.fchmod(descriptor, 0o600)
         observed = os.fstat(descriptor)
         if (not stat.S_ISREG(observed.st_mode)
-                or hasattr(os, "fchmod")
-                and stat.S_IMODE(observed.st_mode) != 0o600):
+                or not _private_mode(observed.st_mode, 0o600)):
             raise OSError("private child stderr is not mode 0600")
     except BaseException:
         stream.close()
@@ -1412,7 +1411,7 @@ def _copy_tiff(source: Path, private: Path):
         if (not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino, opened.st_size)
                 != (before.device, before.inode, before.size)):
             raise ValueError("TIFF identity changed before copy")
-        if hasattr(os, "fchmod"):
+        if not _WINDOWS:
             os.fchmod(target_fd, 0o600)
         with os.fdopen(source_fd, "rb", closefd=False) as incoming, os.fdopen(target_fd, "wb", closefd=False) as outgoing:
             if not incoming.seekable() or not outgoing.seekable(): raise OSError("TIFF descriptors must be seekable")
@@ -1524,13 +1523,12 @@ def _stage_hdf_tiff(
         private, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
-        if hasattr(os, "fchmod"):
+        if not _WINDOWS:
             os.fchmod(descriptor, 0o600)
         raw = os.fstat(descriptor)
         if (not stat.S_ISREG(raw.st_mode) or raw.st_size < 1
                 or raw.st_size > _TIFF_LIMIT
-                or hasattr(os, "fchmod")
-                and stat.S_IMODE(raw.st_mode) != 0o600):
+                or not _private_mode(raw.st_mode, 0o600)):
             raise ValueError("staged HDF frame TIFF is outside its envelope")
     finally:
         os.close(descriptor)

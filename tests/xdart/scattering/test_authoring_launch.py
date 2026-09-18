@@ -21,6 +21,20 @@ from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 
 
+def _windows_permissions(monkeypatch):
+    monkeypatch.setattr(authoring, "_WINDOWS", True)
+    monkeypatch.setattr(authoring, "_DIR_FD_PUBLICATION", False)
+    if os.name != "nt":
+        real_fchmod = os.fchmod
+
+        def windows_fchmod(fd, mode):
+            # Python 3.13 exposes fchmod on Windows, but only the read-only
+            # attribute changes. Model its mode bits on a real local file.
+            real_fchmod(fd, 0o666 if mode & 0o200 else 0o444)
+
+        monkeypatch.setattr(os, "fchmod", windows_fchmod)
+
+
 @pytest.mark.parametrize("portable", [False, True])
 @pytest.mark.parametrize("source_kind", ["tiff", "hdf"])
 def test_real_drawmask_child_saves_and_cleans(
@@ -48,12 +62,10 @@ qt.QApplication.exec = automated_exec
 ''')
     monkeypatch.setenv("PYTHONPATH", str(hooks) + os.pathsep + str(Path(__file__).resolve().parents[3] / "src"))
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    # Exercise the Windows filesystem branch on POSIX too. On Windows these
-    # capabilities really are absent, and the same test runs in locked Pixi CI.
+    # Keep fchmod available: Windows Python 3.13 supports it without POSIX
+    # permission semantics. Native Windows CI uses its real implementation.
     if portable:
-        monkeypatch.setattr(authoring, "_WINDOWS", True)
-        monkeypatch.setattr(authoring, "_DIR_FD_PUBLICATION", False)
-        monkeypatch.delattr(os, "fchmod", raising=False)
+        _windows_permissions(monkeypatch)
     pixels = np.arange(80, dtype=np.uint16).reshape(8, 10)
     source = tmp_path / ("Image.tiff" if source_kind == "tiff" else "Image.h5")
     if source_kind == "tiff":
@@ -124,3 +136,45 @@ def test_authoring_failure_is_visible_and_logged(
         page.close_workspace()
         page.deleteLater()
         app.processEvents()
+
+
+@pytest.mark.parametrize("portable", [False, True])
+def test_real_calibration_child_opens_and_exits(tmp_path, monkeypatch, portable):
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    (hooks / "sitecustomize.py").write_text('''
+from pathlib import Path
+from silx.gui import qt
+scratch = Path(__file__).parent
+qt.QSettings.setPath(qt.QSettings.IniFormat, qt.QSettings.UserScope, str(scratch))
+original_exec = qt.QApplication.exec
+
+def automated_exec(app):
+    def finish():
+        from pyFAI.gui.CalibrationWindow import CalibrationWindow
+        if any(isinstance(w, CalibrationWindow) and w.isVisible()
+               for w in app.topLevelWidgets()):
+            (scratch / "opened").write_text("calibration")
+            app.exit(0)
+        else:
+            app.exit(98)
+    qt.QTimer.singleShot(0, finish)
+    qt.QTimer.singleShot(10000, lambda: app.exit(99))
+    return original_exec()
+qt.QApplication.exec = automated_exec
+''')
+    monkeypatch.setenv("PYTHONPATH", str(hooks) + os.pathsep + str(Path(__file__).resolve().parents[3] / "src"))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    if portable:
+        _windows_permissions(monkeypatch)
+    source = tmp_path / "calibration.tiff"
+    tifffile.imwrite(source, np.arange(80, dtype=np.uint16).reshape(8, 10))
+    original = source.read_bytes()
+    request = authoring.prepare_calibration_request(str(source))
+    terminal = authoring.run_calibration(request, OperationIdentity(1), Event(),
+                                        lambda *_: None, lambda _: True)
+    assert terminal.status is OperationTerminalStatus.RETURNED, terminal.diagnostic
+    assert terminal.payload.exit_code == 0
+    assert (hooks / "opened").read_text() == "calibration"
+    assert source.read_bytes() == original
+    assert not list(tmp_path.glob(".xdart-authoring-stderr-*"))
