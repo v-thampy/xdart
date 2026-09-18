@@ -348,6 +348,11 @@ for downstream users:
   moved project to load full-resolution detector images.
 - **Analyze Results notebooks use interactive Matplotlib** (`ipympl`) and fall
   back to static inline figures in a kernel that does not have it.
+- **Windows is a preview platform.** The Pixi workspace now locks `win-64`,
+  with a non-MKL NumExpr because pyFAI's radial coordinates are wrong under the
+  MKL build. Known limitation: Reintegrate 1-D/2-D, Average Scan, Stitch 1D,
+  and RSM are not yet available on Windows; Run, Append, and Browse do not use
+  their publication path.
 - **NeXus Directory + Append starts without hydrating every old output.**
   Append resume now reads only the small frame-index datasets for each scan as
   that scan is reached. It no longer constructs a full processed scan for every
