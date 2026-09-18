@@ -13,15 +13,18 @@ from xdart.gui.tabs.scattering.display_values import StandardEventKind
 
 
 @pytest.mark.parametrize("processing_mode", ("Int 1D", "Int 1D (XYE)"))
-def test_standard_and_gi_xye_families_coexist(tmp_path, processing_mode):
+@pytest.mark.parametrize("folder_name", ("processed", "2026.09.18", "beamtime.v2", "processed.nexus"))
+def test_standard_and_gi_xye_families_coexist(tmp_path, processing_mode, folder_name):
     raw, poni = tmp_path / "sample_0001.tif", tmp_path / "cal.poni"
     _write_tiff(raw, 50)
     write_poni(poni)
-    standard_xye = tmp_path / "sample" / "iq_sample_0001.xye"
+    output = tmp_path / folder_name
+    output.mkdir()
+    standard_xye = output / "sample" / "iq_sample_0001.xye"
     standard_bytes = None
 
     for gi, family in ((False, "sample"), (True, "sample_gi")):
-        intent = _intent(raw, tmp_path, poni, processing_mode=processing_mode)
+        intent = _intent(raw, output, poni, processing_mode=processing_mode)
         intent.gi.enabled = gi
         intent.gi.incidence_motor = "Manual"
         intent.gi.th_val = 0.2
@@ -31,13 +34,13 @@ def test_standard_and_gi_xye_families_coexist(tmp_path, processing_mode):
         try:
             terminal = next(event for event in events if event.kind in _TERMINAL)
             assert terminal.kind is StandardEventKind.FINISHED, terminal.primary
-            assert (tmp_path / family / f"iq_{family}_0001.xye").is_file()
+            assert (output / family / f"iq_{family}_0001.xye").is_file()
             if gi:
                 assert standard_xye.read_bytes() == standard_bytes
             else:
                 standard_bytes = standard_xye.read_bytes()
             if processing_mode == "Int 1D":
-                assert (tmp_path / f"{family}_int1d.nexus").is_file()
+                assert (output / f"{family}_int1d.nexus").is_file()
             frame = next(event.frame_key for event in events
                          if event.kind is StandardEventKind.FRAME_READY)
             assert frame.source_scan == "sample"

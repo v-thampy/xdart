@@ -163,6 +163,7 @@ def _recursive_container_start(
     tmp_path: Path,
     *,
     save_path: Path | None = None,
+    grazing_incidence: bool = False,
 ) -> tuple[StartCapture, tuple[Path, Path], Path]:
     raw = tmp_path / "raw"
     first = raw / "data" / "scan_0001.nxs"
@@ -184,6 +185,7 @@ def _recursive_container_start(
         poni_file=str(poni),
         save_path=str(output),
         output_mode="Overwrite",
+        gi=GIIntent(enabled=grazing_incidence, incidence_motor="Manual"),
     )).snapshot()
     request = RequestId(719)
     return (
@@ -1842,10 +1844,18 @@ def test_deferred_raw_series_uses_known_shape_and_counts_ready_members(
         sessions[0].close()
 
 
+@pytest.mark.parametrize("grazing_incidence", (False, True))
+@pytest.mark.parametrize("folder_name", ("processed", "2026.09.18", "processed.nexus"))
 def test_recursive_same_named_containers_preserve_relative_output_directories(
     tmp_path: Path,
+    grazing_incidence: bool,
+    folder_name: str,
 ) -> None:
-    start, (first, second), output = _recursive_container_start(tmp_path)
+    output = tmp_path / folder_name
+    output.mkdir()
+    start, (first, second), output = _recursive_container_start(
+        tmp_path, save_path=output, grazing_incidence=grazing_incidence,
+    )
     sessions: list[DirectoryIndexSession] = []
     reservations: list[tuple[Path, ...]] = []
 
@@ -1858,17 +1868,25 @@ def test_recursive_same_named_containers_preserve_relative_output_directories(
     assert len(sessions) == 1
     session = sessions[0]
     try:
-        deferred = receipt.deferred_directory
-        assert deferred is not None
-        targets = {
-            entry.candidates[0].path: entry.target
-            for entry in deferred.entries
-        }
+        if grazing_incidence:
+            assert receipt.deferred_directory is None
+            targets = {
+                output.item.source_path: output.item.target
+                for output in receipt.outputs
+            }
+        else:
+            deferred = receipt.deferred_directory
+            assert deferred is not None
+            targets = {
+                entry.candidates[0].path: entry.target
+                for entry in deferred.entries
+            }
+        family = "scan_0001_gi" if grazing_incidence else "scan_0001"
         assert targets == {
             # Same stem, different relative directories -- the point of this
             # test. The stable slot rides along; it does not disambiguate them.
-            first: output / "data" / "scan_0001_int2d.nexus",
-            second: output / "live_test" / "scan_0001_int2d.nexus",
+            first: output / "data" / f"{family}_int2d.nexus",
+            second: output / "live_test" / f"{family}_int2d.nexus",
         }
         assert len(reservations) == 1
         assert set(reservations[0]) == set(targets.values())

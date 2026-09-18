@@ -194,6 +194,23 @@ def test_an_explicit_file_request_still_gets_a_slot(tmp_path):
         assert resolved == tmp_path / "chosen_int2d.nexus"
 
 
+@pytest.mark.parametrize("folder_name", ("2026.09.18", "beamtime.v2", "processed.nexus"))
+@pytest.mark.parametrize("gi", (False, True))
+def test_existing_dotted_save_folder_keeps_run_and_average_inside(tmp_path, folder_name, gi):
+    from xdart.gui.tabs.scattering.browser_catalog import processed_directory
+    from xdart.gui.tabs.scattering.output_preflight import _run_output_naming
+
+    folder = tmp_path / folder_name
+    folder.mkdir()
+    family = "scan12_gi" if gi else "scan12"
+    configuration = _configuration("Int 2D", str(folder), gi=gi)
+    assert _run_output_naming(configuration, "scan12") == (folder, family)
+    assert _resolved_generated_target(str(folder), "scan12", grazing_incidence=gi) == (
+        folder / f"{family}.nexus"
+    )
+    assert processed_directory(str(folder)) == str(folder)
+
+
 def test_a_name_that_cannot_be_a_family_is_refused_before_the_run(tmp_path):
     """RULED 2026-09-04: refuse at PLAN time, not after hours of integration.
 

@@ -107,7 +107,7 @@ def processed_directory(save_path: str) -> str:
     requested = Path(save_path).expanduser()
     directory = (
         requested.parent
-        if is_readable_output_path(requested)
+        if is_readable_output_path(requested) and not requested.is_dir()
         else requested
     )
     return os.path.abspath(os.fspath(directory))

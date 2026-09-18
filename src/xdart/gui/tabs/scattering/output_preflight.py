@@ -693,6 +693,11 @@ def _directory_candidate_groups(
     return tuple(groups)
 
 
+def _save_path_is_directory(path: Path) -> bool:
+    """An existing folder stays a folder even when its name contains dots."""
+    return not path.suffix or path.is_dir()
+
+
 def _directory_target(
     configuration: FrozenRunConfiguration | OutputCandidate,
     plan: RunCandidatePlan,
@@ -701,7 +706,7 @@ def _directory_target(
 ) -> Path:
     output_root = Path(configuration.save_path)
     output_directory: Path | None = None
-    if not output_root.suffix:
+    if _save_path_is_directory(output_root):
         try:
             relative_parent = candidate.path.parent.relative_to(plan.root)
         except ValueError as error:
@@ -1571,7 +1576,7 @@ def _run_output_naming(
     suffix, which is what makes the dotted sub-folder safe.
     """
     requested = Path(configuration.save_path)
-    if requested.suffix:
+    if not _save_path_is_directory(requested):
         # An explicit FILE request: its parent is the directory and its stem is
         # the family.  A per-candidate directory does not apply.
         directory, family = requested.parent, requested.stem
@@ -1654,7 +1659,7 @@ def _resolved_generated_target(
     requested = Path(save_path)
     directory, family = (
         (requested.parent, requested.stem)
-        if requested.suffix
+        if not _save_path_is_directory(requested)
         else (requested, generated_artifact_family(
             scan_name, grazing_incidence=grazing_incidence,
         ))
@@ -1754,7 +1759,7 @@ def _directory_items(
 ) -> tuple[PlannedOutput, ...]:
     output_root, items, consumed = Path(configuration.save_path), [], set()
     resolved_output_root = None
-    if not output_root.suffix:
+    if _save_path_is_directory(output_root):
         try:
             resolved_output_root = output_root.resolve(strict=False)
         except (OSError, RuntimeError) as error:
@@ -1856,7 +1861,7 @@ def _directory_items(
                 cancelled=cancelled,
             )
         output_directory: Path | None = None
-        if not output_root.suffix:
+        if _save_path_is_directory(output_root):
             try:
                 relative_parent = candidate.path.parent.relative_to(plan.root)
             except ValueError as error:
