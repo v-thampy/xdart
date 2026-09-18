@@ -51,6 +51,49 @@ def _small_nexus(path):
     sink.finish(result=None)
 
 
+def test_results_notebook_first_cell_survives_a_kernel_without_ipympl(tmp_path):
+    """conda installs ship no ipympl; the selected paths must still load.
+
+    The generated cell runs in a real IPython shell, in a child process so the
+    shell singleton and the Matplotlib backend never reach other tests.
+    """
+    import subprocess
+    import sys
+
+    xye_path = tmp_path / "selected.xye"
+    write_xye(xye_path, [1., 2., 3.], [4., 5., 6.])
+    notebook = nbformat.reads(
+        results_notebook_text(kind="xye", paths=(str(xye_path),)), as_version=4,
+    )
+    imports = next(cell for cell in notebook.cells if cell.get("id") == "imports")
+    cell_file = tmp_path / "imports_cell.py"
+    cell_file.write_text(imports.source, encoding="utf-8")
+    driver = (
+        "import sys\n"
+        "sys.modules['ipympl'] = None  # `import ipympl` raises, as when absent\n"
+        "from IPython.core.interactiveshell import InteractiveShell\n"
+        "shell = InteractiveShell.instance()\n"
+        f"result = shell.run_cell(open({str(cell_file)!r}, encoding='utf-8').read())\n"
+        "assert result.error_before_exec is None, result.error_before_exec\n"
+        "assert result.error_in_exec is None, repr(result.error_in_exec)\n"
+        "print('RESULT_PATHS=' + repr([str(p) for p in shell.user_ns['RESULT_PATHS']]))\n"
+        "print('READERS=' + repr(sorted(n for n in ('open_scan', 'read_xye', 'plt') if n in shell.user_ns)))\n"
+    )
+    import os
+
+    environment = {**os.environ, "MPLBACKEND": "agg"}
+    environment.pop("XDART_NOTEBOOK_BACKEND", None)
+    done = subprocess.run(
+        [sys.executable, "-c", driver], capture_output=True, text=True,
+        timeout=120, env=environment,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"RESULT_PATHS={[str(xye_path)]!r}" in done.stdout
+    assert "READERS=['open_scan', 'plt', 'read_xye']" in done.stdout
+    # The reader is told why the figures are static, and how to change that.
+    assert "ipympl" in done.stdout
+
+
 def test_results_notebook_uses_public_readers_for_real_nexus_and_xye(tmp_path):
     nexus_path = tmp_path / "selected.nexus"
     xye_path = tmp_path / "selected.xye"
