@@ -5,7 +5,7 @@ from __future__ import annotations
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from enum import Enum
-from os.path import normcase, normpath
+from os.path import isabs, normcase, normpath
 from pathlib import Path
 import math
 import sys
@@ -1944,6 +1944,14 @@ class FrameViewReader:
         # use native separators and case rules (notably on Windows).
         if source_base is not None:
             source_base = normcase(normpath(source_base))
+            # A record reduced under another operating system keeps a root
+            # that is not a path here ("C:/..." on POSIX; a POSIX root decodes
+            # to a drive-less "\\..." on Windows).  It can own no locator on
+            # this host: bind none, leave the record readable, and let a
+            # selected Project root relocate the raw tree.  The stored
+            # attribute is never rewritten.
+            if not isabs(source_base):
+                source_base = None
         # Admission binds canonical-or-complete-shadow groups and the complete
         # owned mode inventory once; downstream readers do not rediscover it.
         g1 = processed.integrated_1d
@@ -2158,7 +2166,11 @@ class FrameViewReader:
 
     @property
     def source_base(self) -> str | None:
-        """Host-normalized persisted Project root bound by this admission."""
+        """Host-normalized persisted Project root bound by this admission.
+
+        ``None`` when the record has none, or when its root was written under
+        another operating system's path rules and is not a path on this host.
+        """
 
         state = self._require_reader_open()
         value = self._source_base

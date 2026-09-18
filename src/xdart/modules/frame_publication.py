@@ -847,9 +847,24 @@ def canonical_frame_source_identity(
     detector locator (for example a processed-only frame); those payloads use
     the view label as their artifact member even if an orphaned source index is
     still present.
+
+    A reloaded record may also carry a relative locator that has no owner on
+    this host: it stores no Project root, or its root was written under another
+    operating system's path rules and the reader bound none.  Nothing is
+    guessed for such a locator.  Given its processed artifact, the frame is
+    named like a processed-only payload until a Project root is selected;
+    without one the locator is still refused.
     """
 
     view_source = getattr(view, "source_path", None)
+    if (
+        type(view_source) is str
+        and view_source
+        and not os.path.isabs(view_source)
+        and source_base is None
+        and fallback_path is not None
+    ):
+        view_source = None
     source_value = view_source if view_source is not None else fallback_path
     if source_value is None:
         raise ValueError("publication has no source path identity")

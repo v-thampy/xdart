@@ -155,6 +155,77 @@ def test_moved_project_root_flows_through_browse_and_hydration(tmp_path, foreign
     assert publication.view.source_path == str(moved_raw.resolve())
 
 
+def test_record_from_another_os_hydrates_without_a_selected_project_root(tmp_path):
+    """Beamline PC -> analysis laptop: no Project folder has been chosen yet."""
+    import os
+
+    from tests.xdart.scattering.test_e3_context_contract import (
+        _running_controller,
+    )
+    from xdart.gui.tabs.scattering.adapters.browse_loader import BrowseLoader
+    from xdart.gui.tabs.scattering.context_controller import ContextController
+    from xdart.gui.tabs.scattering.context_projection import ContextProjection
+    from xrd_tools.io.schema import (
+        PROCESSED_SCHEMA_NAME,
+        PROCESSED_SCHEMA_VERSION,
+        SCHEMA_NAME_ATTR,
+        SCHEMA_VERSION_ATTR,
+    )
+
+    processed, _raw = _write_processed(
+        tmp_path / "laptop", labels=(1,), thumbnails=True
+    )
+    with h5py.File(processed, "r+") as handle:
+        entry = handle["entry"]
+        entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+        entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+        # Absolute where the record was reduced, but not a path on this host.
+        entry.attrs["source_base"] = (
+            "/old/linux/project" if os.name == "nt" else "C:/Old/Project"
+        )
+
+    _, lifecycle, executor, _, _acquisition = _running_controller()
+    controller = ContextController(
+        lifecycle=lifecycle,
+        executor=executor,
+        browse_loader=BrowseLoader(max_items=8),
+        projection=ContextProjection(),
+    )
+    controller.adopt_acquisition(executor.identity)
+    controller.pause()
+    request = controller.begin_browse(str(processed))
+    deadline = time.monotonic() + 15.0
+    outcome = None
+    while outcome is None and time.monotonic() < deadline:
+        outcome = controller.poll_browse()
+        if outcome is None:
+            time.sleep(0.005)
+    assert outcome is not None and outcome.request is request
+    browse = controller.browse_context
+    assert browse is not None and browse.loaded
+    assert request.source_root is None
+
+    key = _browse_key(controller, 1)
+    assert controller.project(key) is None
+    owner = _bound_owner(controller)
+    _settle_transport(owner.transport)
+    assert controller.poll_browse_preview() is True
+    payload = controller.project(key)
+    assert payload is not None
+    np.testing.assert_allclose(
+        payload.view.intensity_1d,
+        np.array([2.0, 3.0, 4.0]),
+    )
+    publication = browse.publication_store.get(1)
+    assert publication is not None
+    # The detector locator keeps its persisted spelling and gains no guessed
+    # owner; the processed artifact and frame label name the frame instead.
+    assert publication.view.source_path == "raw/image.tif"
+    assert publication.source_base is None
+    artifact = os.path.normcase(os.path.normpath(str(processed.resolve())))
+    assert publication.source_identity == f"{artifact}#1"
+
+
 def _settle_transport(transport, *, timeout=10.0):
     deadline = time.monotonic() + timeout
     while (

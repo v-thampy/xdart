@@ -99,8 +99,8 @@ def test_reader_decodes_persisted_windows_source_base_for_runtime(tmp_path, monk
     frame_view = import_module("xrd_tools.io.frame_view")
     # Use the real Windows stdlib path operations at the reader's decode
     # boundary, without changing the host filesystem or the HDF5 reader.
-    monkeypatch.setattr(frame_view, "normcase", ntpath.normcase, raising=False)
-    monkeypatch.setattr(frame_view, "normpath", ntpath.normpath, raising=False)
+    for name in ("normcase", "normpath", "isabs"):
+        monkeypatch.setattr(frame_view, name, getattr(ntpath, name), raising=False)
     processed, _raw = _write_processed(tmp_path, thumbnail=True)
     stored = "C:/Users/Beamline/Data"
     with h5py.File(processed, "r+") as handle:
@@ -112,6 +112,61 @@ def test_reader_decodes_persisted_windows_source_base_for_runtime(tmp_path, monk
     # Decode never rewrites the portable on-disk representation.
     with h5py.File(processed, "r") as handle:
         assert handle["entry"].attrs["source_base"] == stored
+
+
+def _root_written_by_another_os() -> str:
+    # Absolute where the record was reduced, but not a path on this host.
+    return "/old/linux/project" if os.name == "nt" else "C:/Old/Project"
+
+
+def test_reader_binds_no_root_when_the_persisted_root_is_not_a_path_here(tmp_path):
+    """A record reduced on another operating system stays fully readable."""
+    frame_view = import_module("xrd_tools.io.frame_view")
+    processed, _raw = _write_processed(tmp_path, thumbnail=True)
+    stored = _root_written_by_another_os()
+    with h5py.File(processed, "r+") as handle:
+        handle["entry"].attrs["source_base"] = stored
+    with frame_view.FrameViewReader(processed) as reader:
+        # Only the raw locators lose their owner; nothing is guessed for them.
+        assert reader.source_base is None
+        assert reader.read_scalar_catalog().source_base is None
+        view = reader.read(17)
+        assert view.intensity_2d is not None and view.thumbnail is not None
+        assert view.source_path == "raw/image.tif"
+    api = _api()
+    projection = api.DetectorPreviewProjection.without_static_mask()
+    preview = api.read_frame_preview(
+        _read_key(processed, _hydration().HydrationPurpose.PREVIEW),
+        detector_projection=projection,
+    )
+    assert preview.source_base is None
+    assert preview.thumbnail is not None and preview.view.has_2d
+    full = api.read_frame_preview(
+        _read_key(processed, _hydration().HydrationPurpose.FULL),
+        detector_projection=projection,
+    )
+    assert full.raw is None and full.detector_diagnostic == "raw source unavailable"
+    with h5py.File(processed, "r") as handle:
+        assert handle["entry"].attrs["source_base"] == stored
+
+
+def test_reader_binds_no_root_for_a_posix_root_under_windows_path_rules(
+    tmp_path, monkeypatch,
+):
+    import ntpath
+
+    frame_view = import_module("xrd_tools.io.frame_view")
+    # The mirror direction, with the real Windows stdlib path operations at
+    # the decode boundary: a POSIX root decodes to a drive-less "\\users\\...".
+    for name in ("normcase", "normpath", "isabs"):
+        monkeypatch.setattr(frame_view, name, getattr(ntpath, name), raising=False)
+    processed, _raw = _write_processed(tmp_path, thumbnail=True)
+    with h5py.File(processed, "r+") as handle:
+        handle["entry"].attrs["source_base"] = "/Users/beamline/data"
+    with frame_view.FrameViewReader(processed, resolve_source=False) as reader:
+        assert reader.source_base is None
+        assert reader.read_scalar_catalog().source_base is None
+        assert reader.read(17).intensity_2d is not None
 
 
 def test_mixed_case_project_preview_and_full_raw_use_stored_root(tmp_path):

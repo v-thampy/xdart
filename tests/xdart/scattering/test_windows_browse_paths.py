@@ -155,3 +155,118 @@ def test_mixed_case_run_and_reopened_browse_keep_all_frames(tmp_path):
         wait(lambda: page.close_workspace().cleanup_status is CleanupStatus.CLEANED)
         page.deleteLater()
         app.processEvents()
+
+
+def test_processed_scan_from_another_os_browses_without_a_project_folder(tmp_path):
+    """Beamline PC -> analysis laptop: real Run, then Browse a relocated copy.
+
+    The copy keeps a Project root that is not a path on this host, and no
+    Project folder has been chosen.  Also run natively on Windows CI, where the
+    foreign spelling is the POSIX one.
+    """
+    import os
+    import shutil
+
+    import h5py
+
+    from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
+    from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
+    from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
+    from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+    from xrd_tools.io import FrameViewReader
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from xrd_tools.sources.selection import image_series_spec
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    root = tmp_path / "BeamlineProject"
+    root.mkdir()
+    image = (np.arange(195 * 487) % 1000).astype(np.uint16).reshape(195, 487)
+    for label in range(1, 17):
+        tifffile.imwrite(root / f"Combi4_{label:04d}.tif", image + label)
+    poni = root / "calibration.poni"
+    poni.write_text(
+        "poni_version: 2\nDetector: Pilatus100k\nDetector_config: {}\n"
+        "Distance: 0.1234\nPoni1: 0.01\nPoni2: 0.01\n"
+        "Rot1: 0.0\nRot2: 0.0\nRot3: 0.0\nWavelength: 1.0e-10\n",
+        encoding="utf-8",
+    )
+    processing = dict(
+        output_mode="Overwrite", max_cores=1, processing_mode="Int 2D",
+        bai_1d_args={"npt": 16}, bai_2d_args={"npt_rad": 16, "npt_azim": 8},
+    )
+
+    def build(intent):
+        return ScatteringWorkspace(
+            intents=RunIntentStore(intent), lifecycle=ScatteringCoordinator(),
+            sources=FilesystemSourceAdapter(),
+            executor=StandardRunExecutor(join_timeout=2.0),
+        )
+
+    def wait(page, predicate):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            app.processEvents()
+            if predicate():
+                return
+            time.sleep(0.005)
+        pytest.fail(page._notice_text or "Run/Browse did not settle")
+
+    def ready(page):
+        return (page._capture_current_loaded_browse() is not None
+                and not page._context_controller.browse_pending
+                and page._shell.browser.frame_model.rowCount() == 16
+                and not page._scientific_repaint_pending)
+
+    def close(page):
+        wait(page, lambda: page.close_workspace().cleanup_status is CleanupStatus.CLEANED)
+        page.deleteLater()
+        app.processEvents()
+
+    beamline = build(RunIntent(
+        source_spec=image_series_spec(root / "Combi4_0001.tif"),
+        poni_file=str(poni), project_root=str(root),
+        save_path=str(root / "Combi4.nexus"), **processing,
+    ))
+    try:
+        beamline._shell.run_controls.startButton.click()
+        wait(beamline, lambda: ready(beamline))
+    finally:
+        close(beamline)
+
+    laptop_folder = tmp_path / "AnalysisLaptop"
+    laptop_folder.mkdir()
+    relocated = laptop_folder / "Combi4_int2d.nexus"
+    shutil.copyfile(root / "Combi4_int2d.nexus", relocated)
+    with h5py.File(relocated, "r+") as handle:
+        handle["entry"].attrs["source_base"] = (
+            "/old/linux/project" if os.name == "nt" else "C:/Old/Project"
+        )
+
+    laptop = build(RunIntent(**processing))
+    try:
+        laptop._select_scan(str(relocated), reopen=True)
+        wait(laptop, lambda: ready(laptop))
+        science = laptop._shell.scientific
+        wait(laptop, lambda: (
+            science.raw.image.image is not None
+            and science.cake.image.image is not None
+            and laptop._last_scientific_projection.heavy is not None
+        ))
+        label = laptop._context_controller.navigation.current.local_frame_label
+        heavy = laptop._last_scientific_projection.heavy
+        assert heavy.frame.local_frame_label == label
+        with FrameViewReader(relocated) as reader:
+            expected = reader.read(label)
+        # The raw tree is not here, so the saved thumbnail stands in for it;
+        # the processed cake and 1-D pattern are exact.
+        np.testing.assert_array_equal(heavy.raw, expected.thumbnail)
+        np.testing.assert_array_equal(heavy.cake, expected.intensity_2d)
+        np.testing.assert_array_equal(science.raw.image.image, heavy.raw.T[:, ::-1])
+        np.testing.assert_array_equal(science.cake.image.image, expected.intensity_2d.T)
+        curves = science.curve.listDataItems()
+        assert len(curves) == 1
+        np.testing.assert_array_equal(curves[0].xData, expected.axis_1d.values)
+        np.testing.assert_array_equal(curves[0].yData, expected.intensity_1d)
+    finally:
+        close(laptop)

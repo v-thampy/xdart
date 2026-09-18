@@ -1307,6 +1307,67 @@ def test_processed_only_source_identity_uses_label_not_orphaned_source_index(
     assert reloaded_identity == expected
 
 
+def test_unowned_relative_locator_is_named_by_its_processed_artifact(tmp_path):
+    """A record reduced elsewhere has no Project root that is a path here."""
+    from types import SimpleNamespace
+
+    from xdart.modules.frame_publication import (
+        canonical_frame_source_identity,
+        publication_from_frame_view,
+    )
+
+    artifact = tmp_path / "laptop" / "scan.nexus"
+    reloaded = SimpleNamespace(
+        label=17, source_path="raw/image.tif", source_frame_index=16,
+    )
+    expected = f"{os.path.normcase(os.path.normpath(artifact))}#17"
+    # Nothing is guessed for the detector file: the processed artifact and the
+    # frame label name the frame, exactly as for a processed-only record.
+    assert canonical_frame_source_identity(
+        reloaded, fallback_path=artifact,
+    ) == expected
+
+    # The same rule certifies the publication, or Browse could never admit it.
+    view = FrameView(
+        label=17,
+        axis_1d=Axis("Q", "q_A^-1", values=np.array([1.0, 2.0])),
+        intensity_1d=np.array([3.0, 4.0]),
+        source_path="raw/image.tif",
+        source_frame_index=16,
+    )
+    publication = publication_from_frame_view(
+        view, fallback_path=artifact, validate=False,
+    )
+    assert publication.source_identity == expected
+    assert publication.source_base is None
+    assert publication.view.source_path == "raw/image.tif"
+
+
+def test_unowned_relative_locator_still_refuses_without_an_artifact():
+    from types import SimpleNamespace
+
+    from xdart.modules.frame_publication import (
+        canonical_frame_source_identity,
+        canonical_frame_source_path,
+    )
+
+    reloaded = SimpleNamespace(
+        label=17, source_path="raw/image.tif", source_frame_index=16,
+    )
+    with pytest.raises(ValueError, match="no Project-root owner"):
+        canonical_frame_source_identity(reloaded)
+    # The path owner itself never resolves a relative locator without a root,
+    # and a Project root that is not a normalized absolute path stays refused.
+    with pytest.raises(ValueError, match="no Project-root owner"):
+        canonical_frame_source_path("raw/image.tif")
+    with pytest.raises(TypeError, match="normalized absolute text"):
+        canonical_frame_source_path("raw/image.tif", source_base="relative/root")
+    with pytest.raises(TypeError, match="normalized absolute text"):
+        canonical_frame_source_identity(
+            reloaded, source_base="relative/root", fallback_path="/tmp/scan.nexus",
+        )
+
+
 def test_processed_only_builder_binds_identity_to_independent_fallback(tmp_path):
     artifact = tmp_path / "real" / "average.nexus"
     forged = tmp_path / "forged" / "average.nexus"
