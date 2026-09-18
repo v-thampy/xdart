@@ -689,7 +689,7 @@ def test_moved_source_resolves_only_against_selected_project_root(
         scan_file=processed,
         source_base=old_root.as_posix(),
         source_root=new_root / "nested" / "..",
-    ) is None
+    ) == moved  # The selected Project root is normalized at the public boundary.
 
 
 def test_relative_source_symlink_escape_is_rejected_by_all_consumers(

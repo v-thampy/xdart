@@ -118,6 +118,9 @@ def test_mixed_case_project_preview_and_full_raw_use_stored_root(tmp_path):
     root = tmp_path / "MixedCaseProject"
     root.mkdir()
     processed, raw_path = _write_processed(root, thumbnail=True)
+    with h5py.File(processed, "r") as handle:
+        stored_root = handle["entry"].attrs["source_base"]
+        assert stored_root == root.as_posix()
     native_root = os.path.normcase(os.path.normpath(str(root)))
     api = _api()
     projection = api.DetectorPreviewProjection.without_static_mask()
@@ -132,7 +135,7 @@ def test_mixed_case_project_preview_and_full_raw_use_stored_root(tmp_path):
             np.testing.assert_array_equal(preview.raw, tifffile.imread(raw_path))
             assert preview.detector_diagnostic is None
     with h5py.File(processed, "r") as handle:
-        assert handle["entry"].attrs["source_base"] == Path(native_root).as_posix()
+        assert handle["entry"].attrs["source_base"] == stored_root
 
 
 def _instrument_reads(monkeypatch, processed):
