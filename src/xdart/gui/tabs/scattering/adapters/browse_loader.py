@@ -973,7 +973,9 @@ class BrowseLoader:
             _timing[name] = max(0.0, ended - started)
 
         path = Path(request.source_path).resolve()
-        canonical_path = str(path)
+        # Windows resolve restores on-disk case; requests and hydration use
+        # normcase identities. Keep the scalar catalog in that same domain.
+        canonical_path = os.path.normcase(str(path))
         if _timing is not None:
             _timing["canonical_path"] = canonical_path
         if cancelled.is_set():

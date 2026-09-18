@@ -753,7 +753,8 @@ def relative_source_path(src, root=None) -> str:
     if root:
         root_abs = os.path.abspath(os.path.expanduser(str(root)))
         try:
-            inside = os.path.commonpath([src_abs, root_abs]) == root_abs
+            inside = (os.path.normcase(os.path.commonpath([src_abs, root_abs]))
+                      == os.path.normcase(root_abs))
         except ValueError:          # different drives (Windows) -> not inside
             inside = False
         if inside:

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from os.path import normcase
+from types import MappingProxyType
+from typing import Mapping
 
 import numpy as np
 
@@ -143,6 +146,7 @@ class BrowserScanIndex:
     scans: tuple[BrowserScan, ...] = ()
     identifiers: frozenset[str] = frozenset()
     date_sorted: bool = False
+    paths: Mapping[str, str] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if (
@@ -158,6 +162,11 @@ class BrowserScanIndex:
             or type(self.date_sorted) is not bool
         ):
             raise TypeError("browser scan index is invalid")
+        # Cache filesystem comparison keys with the catalog, preserving the
+        # original spelling for labels, tooltips and selection commands.
+        object.__setattr__(self, "paths", MappingProxyType({
+            normcase(scan.identifier): scan.identifier for scan in self.scans
+        }))
 
 
 def build_browser_scan_index(

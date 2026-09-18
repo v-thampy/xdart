@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from os.path import normcase
 
 from xdart.modules.display_context import (
     AcquisitionContext,
@@ -112,21 +113,21 @@ def build_browser_projection(
         else None
     )
     scans = catalog_index.scans
-    seen_artifacts = catalog_index.identifiers
+    seen_artifacts = catalog_index.paths
     for frame in navigation.frames:
         if (
-            frame.artifact in seen_artifacts
+            normcase(frame.artifact) in seen_artifacts
             or transient_owner is None
             or frame.run_identity is not transient_owner.run_identity
             or frame.artifact != transient_owner.artifact
             or (
                 browser_directory
-                and os.path.abspath(os.path.dirname(frame.artifact))
-                != os.path.abspath(browser_directory)
+                and normcase(os.path.abspath(os.path.dirname(frame.artifact)))
+                != normcase(os.path.abspath(browser_directory))
             )
         ):
             continue
-        seen_artifacts = seen_artifacts | {frame.artifact}
+        seen_artifacts = {**seen_artifacts, normcase(frame.artifact): frame.artifact}
         scans = scans + (
             BrowserScan(
                 frame.artifact,
@@ -139,28 +140,24 @@ def build_browser_projection(
     # an artifact still exists.  Only the exact latest in-flight artifact may
     # lend a transient row while NexusSink is publishing its hidden temp file.
     # Earlier artifacts from the same directory run stay catalog-owned.
-    selected_scan = (
-        current_artifact
-        if current_artifact in seen_artifacts
-        else ""
-    )
+    selected_scan = seen_artifacts.get(normcase(current_artifact), "")
     if (not selected_scan and
         navigation.current is not None
-        and navigation.current.artifact in seen_artifacts
+        and normcase(navigation.current.artifact) in seen_artifacts
     ):
-        selected_scan = navigation.current.artifact
+        selected_scan = seen_artifacts[normcase(navigation.current.artifact)]
     elif (not selected_scan and
         selection is not None
-        and selection.context_token in seen_artifacts
+        and normcase(selection.context_token) in seen_artifacts
     ):
-        selected_scan = selection.context_token
+        selected_scan = seen_artifacts[normcase(selection.context_token)]
     frames = (
         navigation.frames
         if show_all_frames
         else tuple(
             frame
             for frame in navigation.frames
-            if frame.artifact == selected_scan
+            if normcase(frame.artifact) == normcase(selected_scan)
         )
     )
     return BrowserProjection(
@@ -170,7 +167,9 @@ def build_browser_projection(
         date_sorted=date_sorted,
         auto_last=auto_last,
         frames=frames,
-        selected_artifacts=selected_artifacts,
+        selected_artifacts=tuple(
+            seen_artifacts.get(normcase(path), path) for path in selected_artifacts
+        ),
         multi_artifact_selection=multi_artifact_selection,
     )
 

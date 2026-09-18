@@ -54,6 +54,25 @@ def test_relative_source_path_no_root_is_absolute(tmp_path):
     assert relative_source_path(src, None) == Path(src).resolve().as_posix()
 
 
+@pytest.mark.parametrize("source,expected", (
+    (r"C:\Users\Beamline\Data\Tiff\Combi4.tif", "Tiff/Combi4.tif"),
+    (r"C:\Users\Beamline\Database\Combi4.tif", "C:/Users/Beamline/Database/Combi4.tif"),
+    (r"D:\Data\Combi4.tif", "D:/Data/Combi4.tif"),
+))
+def test_relative_source_path_uses_windows_case_rules(monkeypatch, source, expected):
+    import importlib
+    import ntpath
+    from pathlib import PureWindowsPath
+
+    module = importlib.import_module("xrd_tools.io.read")
+    # Actual stdlib Windows path operations; this function performs no I/O.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "path", ntpath)
+        patch.setattr(module, "Path", PureWindowsPath)
+        result = relative_source_path(source, r"c:\users\beamline\data")
+    assert result == expected
+
+
 # ── read-side: resolve_source_master precedence ─────────────────────────────
 
 def test_resolve_relative_against_source_base(tmp_path):

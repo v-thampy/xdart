@@ -74,6 +74,15 @@ jobs:
         env:
           XDART_SESSION_FILE: ${{ runner.temp }}/xdart-pixi-session.json
           XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-pixi-settings.json
+      - name: Run and reopen mixed-case processed scans
+        run: >-
+          pixi run --locked python scripts/ci_pytest.py
+          tests/xdart/scattering/test_windows_browse_paths.py
+          tests/core/test_n1_source_paths.py::test_relative_source_path_uses_windows_case_rules
+          -q -ra --timeout=120
+        env:
+          XDART_SESSION_FILE: ${{ runner.temp }}/xdart-pixi-browse-session.json
+          XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-pixi-browse-settings.ini
 
   architecture-guards:
     runs-on: ubuntu-latest
