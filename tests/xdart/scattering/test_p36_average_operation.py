@@ -240,6 +240,10 @@ def _configuration(
                     tilt_angle=0.04, mode_1d="q_ip",
                     mode_2d="qip_qoop",
                 ),
+                extra={
+                    "enabled_modes_1d": ("q_ip",),
+                    "enabled_modes_2d": ("qip_qoop",),
+                },
             ),
         ),
         (
@@ -253,6 +257,10 @@ def _configuration(
                     incidence_motor="theta", sample_orientation=2,
                     tilt_angle=-0.03, mode_1d="q_oop", mode_2d="q_chi",
                 ),
+                extra={
+                    "enabled_modes_1d": ("q_oop",),
+                    "enabled_modes_2d": ("q_chi",),
+                },
             ),
         ),
         (
