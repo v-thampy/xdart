@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from dataclasses import fields, replace
 from importlib import import_module
+import os
 from pathlib import Path
 import shutil
 
@@ -90,6 +91,48 @@ def _read_key(path: Path, purpose, *, source_root: Path | None = None):
         purpose,
         None if source_root is None else str(source_root),
     )
+
+
+def test_reader_decodes_persisted_windows_source_base_for_runtime(tmp_path, monkeypatch):
+    import ntpath
+
+    frame_view = import_module("xrd_tools.io.frame_view")
+    # Use the real Windows stdlib path operations at the reader's decode
+    # boundary, without changing the host filesystem or the HDF5 reader.
+    monkeypatch.setattr(frame_view, "normcase", ntpath.normcase, raising=False)
+    monkeypatch.setattr(frame_view, "normpath", ntpath.normpath, raising=False)
+    processed, _raw = _write_processed(tmp_path, thumbnail=True)
+    stored = "C:/Users/Beamline/Data"
+    with h5py.File(processed, "r+") as handle:
+        handle["entry"].attrs["source_base"] = stored
+    with frame_view.FrameViewReader(processed, resolve_source=False) as reader:
+        assert reader.source_base == r"c:\users\beamline\data"
+        assert reader.read_scalar_catalog().source_base == reader.source_base
+        assert reader.read(17).intensity_2d is not None
+    # Decode never rewrites the portable on-disk representation.
+    with h5py.File(processed, "r") as handle:
+        assert handle["entry"].attrs["source_base"] == stored
+
+
+def test_mixed_case_project_preview_and_full_raw_use_stored_root(tmp_path):
+    root = tmp_path / "MixedCaseProject"
+    root.mkdir()
+    processed, raw_path = _write_processed(root, thumbnail=True)
+    native_root = os.path.normcase(os.path.normpath(str(root)))
+    api = _api()
+    projection = api.DetectorPreviewProjection.without_static_mask()
+    for purpose in (_hydration().HydrationPurpose.PREVIEW, _hydration().HydrationPurpose.FULL):
+        preview = api.read_frame_preview(
+            _read_key(processed, purpose), detector_projection=projection,
+        )
+        assert preview.source_base == native_root
+        assert preview.thumbnail is not None and preview.view.has_2d
+        assert preview.view.source_path == str(raw_path.resolve())
+        if purpose is _hydration().HydrationPurpose.FULL:
+            np.testing.assert_array_equal(preview.raw, tifffile.imread(raw_path))
+            assert preview.detector_diagnostic is None
+    with h5py.File(processed, "r") as handle:
+        assert handle["entry"].attrs["source_base"] == Path(native_root).as_posix()
 
 
 def _instrument_reads(monkeypatch, processed):

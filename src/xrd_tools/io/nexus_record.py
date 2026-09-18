@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging, hashlib, json, re, struct
 import os
+from os.path import normcase, normpath
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -484,7 +485,7 @@ def validate_source_base(entry_grp: h5py.Group, source_base) -> str | None:
     if existing is not None:
         if isinstance(existing, bytes):
             existing = existing.decode("utf-8", errors="replace")
-        if str(existing) != posix_base:
+        if normcase(normpath(str(existing))) != normcase(normpath(base)):
             raise ValueError(
                 f"cannot append to {os.fspath(entry_grp.file.filename)!r}: its "
                 f"Project Folder (@source_base={str(existing)!r}) differs from "

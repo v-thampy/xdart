@@ -637,7 +637,7 @@ def resolve_source_master(
     if not raw or "\\" in raw:
         return None
     shown = PurePosixPath(raw)
-    if shown.is_absolute():
+    if shown.is_absolute() or Path(raw).is_absolute():
         if str(shown) != raw or "." in shown.parts or ".." in shown.parts:
             return None
         candidate = Path(str(shown))
@@ -646,6 +646,9 @@ def resolve_source_master(
         if selected_root is None:
             return None
         try:
+            # Public callers and stored POSIX roots need native spelling
+            # before entering the strict Project-relative resolver.
+            selected_root = os.path.normcase(os.path.normpath(os.fspath(selected_root)))
             return resolve_project_source_path(
                 raw, selected_root, must_exist=True,
             )

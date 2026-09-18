@@ -77,7 +77,8 @@ def _warm_browse_without_detector(tmp_path):
     return controller, acquisition, browse, processed
 
 
-def test_moved_project_root_flows_through_browse_and_hydration(tmp_path):
+@pytest.mark.parametrize("foreign_root", (False, True))
+def test_moved_project_root_flows_through_browse_and_hydration(tmp_path, foreign_root):
     from tests.xdart.scattering.test_e3_context_contract import (
         _running_controller,
     )
@@ -104,6 +105,12 @@ def test_moved_project_root_flows_through_browse_and_hydration(tmp_path):
         entry = handle["entry"]
         entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
         entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+        if foreign_root:
+            import os
+            # A selected local Project root must override the old host's root.
+            entry.attrs["source_base"] = (
+                "/old/linux/project" if os.name == "nt" else "C:/Old/Project"
+            )
 
     _, lifecycle, executor, _, _acquisition = _running_controller()
     controller = ContextController(

@@ -78,7 +78,11 @@ jobs:
         run: >-
           pixi run --locked python scripts/ci_pytest.py
           tests/xdart/scattering/test_windows_browse_paths.py
+          tests/core/test_frame_preview.py::test_reader_decodes_persisted_windows_source_base_for_runtime
+          tests/core/test_frame_preview.py::test_mixed_case_project_preview_and_full_raw_use_stored_root
           tests/core/test_n1_source_paths.py::test_relative_source_path_uses_windows_case_rules
+          tests/core/test_n1_source_paths.py::test_writer_source_paths_reopen_raw_in_notebooks_and_viewer
+          tests/core/test_n1_source_paths.py::test_append_project_root_uses_native_case_rules
           -q -ra --timeout=120
         env:
           XDART_SESSION_FILE: ${{ runner.temp }}/xdart-pixi-browse-session.json

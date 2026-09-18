@@ -5,6 +5,7 @@ from __future__ import annotations
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from enum import Enum
+from os.path import normcase, normpath
 from pathlib import Path
 import math
 import sys
@@ -1939,6 +1940,10 @@ class FrameViewReader:
             role=f"{entry.name} source base",
             max_bytes=_MAX_SOURCE_PATH_BYTES,
         )
+        # The file stores portable POSIX spelling; runtime source identities
+        # use native separators and case rules (notably on Windows).
+        if source_base is not None:
+            source_base = normcase(normpath(source_base))
         # Admission binds canonical-or-complete-shadow groups and the complete
         # owned mode inventory once; downstream readers do not rediscover it.
         g1 = processed.integrated_1d
@@ -2153,7 +2158,7 @@ class FrameViewReader:
 
     @property
     def source_base(self) -> str | None:
-        """Exact persisted Project root bound by the current admission pass."""
+        """Host-normalized persisted Project root bound by this admission."""
 
         state = self._require_reader_open()
         value = self._source_base

@@ -250,19 +250,13 @@ def canonical_browse_source_identity(
 
     if type(artifact_path) is not str or not artifact_path:
         raise TypeError("browse artifact identity must be a nonempty string")
-    for role, root in (("source base", source_base), ("source root", source_root)):
-        if root is not None and (
-            type(root) is not str
-            or not root
-            or not os.path.isabs(root)
-            or os.path.normcase(os.path.normpath(root)) != root
-        ):
-            raise TypeError(f"browse {role} must be normalized absolute text or None")
     from xdart.modules.frame_publication import canonical_frame_source_identity
 
     # The selected Project root is authoritative for a moved tree.  Only when
     # none was selected may the record's authenticated source_base own the
     # relative locator.  Never guess from the artifact directory.
+    # The publication owner validates that effective root. An overridden root
+    # may legitimately retain another operating system's spelling.
     return canonical_frame_source_identity(
         view,
         source_base=(source_root if source_root is not None else source_base),

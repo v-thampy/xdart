@@ -63,7 +63,9 @@ def test_mixed_case_run_and_reopened_browse_keep_all_frames(tmp_path):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     root = tmp_path / "MixedCaseProject"
     root.mkdir()
-    image = np.arange(195 * 487, dtype=np.uint16).reshape(195, 487)
+    # Stay below saturation so the independent live-thumbnail oracle has no
+    # detector-value exclusions to reconstruct.
+    image = (np.arange(195 * 487) % 1000).astype(np.uint16).reshape(195, 487)
     for label in range(1, 17):
         tifffile.imwrite(root / f"Combi4_{label:04d}.tif", image + label)
     poni = root / "calibration.poni"
@@ -101,6 +103,28 @@ def test_mixed_case_run_and_reopened_browse_keep_all_frames(tmp_path):
                 and page._shell.browser.frame_model.rowCount() == 16
                 and not page._scientific_repaint_pending)
 
+    def assert_images(label, *, allow_live=False):
+        # 1-D cache readiness does not establish that the independent image
+        # hydration completed. Check actual image items and their frame data.
+        science = page._shell.scientific
+        wait(lambda: (science.raw.image.image is not None
+                      and science.cake.image.image is not None
+                      and page._last_scientific_projection.heavy is not None
+                      and page._last_scientific_projection.heavy.frame.local_frame_label == label))
+        with FrameViewReader(output) as reader:
+            expected = reader.read(label)
+        heavy = page._last_scientific_projection.heavy
+        # Terminal Browse may retain the already-painted live thumbnail.
+        # The saved thumbnail is percentile-clipped and quantized; both are
+        # valid here, but a fresh Browse must paint the saved representation.
+        from xrd_tools.io.nexus_record import make_thumbnail_array
+        live = make_thumbnail_array(image + label) if allow_live else None
+        if not (allow_live and np.array_equal(heavy.raw, live, equal_nan=True)):
+            np.testing.assert_array_equal(heavy.raw, expected.thumbnail)
+        np.testing.assert_array_equal(heavy.cake, expected.intensity_2d)
+        np.testing.assert_array_equal(science.raw.image.image, heavy.raw.T[:, ::-1])
+        np.testing.assert_array_equal(science.cake.image.image, expected.intensity_2d.T)
+
     try:
         page._shell.run_controls.startButton.click()
         wait(ready)
@@ -108,9 +132,11 @@ def test_mixed_case_run_and_reopened_browse_keep_all_frames(tmp_path):
         assert capture.labels == tuple(range(1, 17))
         assert capture.context.scalar_catalog.artifact_path == capture.request.source_path
         assert page._context_controller.navigation.current.local_frame_label == 16
+        assert_images(16, allow_live=True)
         # Explicit reopen forces a fresh Browse instead of reusing acquisition.
         page._select_scan(str(output), reopen=True)
         wait(ready)
+        assert_images(page._context_controller.navigation.current.local_frame_label)
         navigation = page._context_controller.navigation
         frame = navigation.frames[4]
         page._handle_shell_command(ShellCommand(
@@ -124,6 +150,7 @@ def test_mixed_case_run_and_reopened_browse_keep_all_frames(tmp_path):
         assert len(curves) == 1
         np.testing.assert_array_equal(curves[0].xData, expected.axis_1d.values)
         np.testing.assert_array_equal(curves[0].yData, expected.intensity_1d)
+        assert_images(5)
     finally:
         wait(lambda: page.close_workspace().cleanup_status is CleanupStatus.CLEANED)
         page.deleteLater()

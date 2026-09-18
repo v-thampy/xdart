@@ -180,6 +180,61 @@ def test_get_raw_frame_resolves_relative_via_source_base(tmp_path):
     np.testing.assert_allclose(get_raw_frame(nxs, frame=0), raw_arr[1])
 
 
+@pytest.mark.parametrize("location", ("inside", "outside", "no-root"))
+@pytest.mark.parametrize("explicit_root", (False, True))
+def test_writer_source_paths_reopen_raw_in_notebooks_and_viewer(tmp_path, location, explicit_root):
+    from xrd_tools.io.image_source import classify_image_source
+    from xrd_tools.io.viewer_2d import (
+        Viewer2DFormatPolicy, Viewer2DSourceKind, catalog_viewer_2d, read_viewer_2d_frame,
+    )
+
+    root = tmp_path / "MixedCaseProject"
+    root.mkdir()
+    raw = np.arange(32, dtype=np.uint16).reshape(2, 4, 4)
+    master = (root if location == "inside" else tmp_path / "Outside") / "Raw.h5"
+    master.parent.mkdir(exist_ok=True)
+    _write_master(master, raw)
+    record = root / "Scan.nexus"
+    _write_processed(record, source_path=master,
+                     source_base=None if location == "no-root" else root,
+                     thumbnail=raw[1, ::2, ::2])
+
+    # Real writer spelling, including C:/... for an absolute Windows source.
+    with h5py.File(record, "r") as handle:
+        source = handle["entry/frames/frame_0000/source/path"].asstr()[()]
+        assert source == ("Raw.h5" if location == "inside" else master.as_posix())
+    selected_root = root if explicit_root else None
+    np.testing.assert_array_equal(get_raw_frame(
+        record, frame=0, allow_thumbnail=False, source_root=selected_root,
+    ), raw[1])
+    assert classify_image_source(record).has_raw
+    policy = Viewer2DFormatPolicy(source_root=str(root) if explicit_root else None)
+    catalog = catalog_viewer_2d(record, policy=policy)
+    result = read_viewer_2d_frame(catalog, 0, policy=policy)
+    assert result.provenance.source_kind is Viewer2DSourceKind.PROCESSED_RAW
+    np.testing.assert_array_equal(result.array, raw[1])
+
+
+def test_append_project_root_uses_native_case_rules(tmp_path, monkeypatch):
+    import ntpath
+    from xrd_tools.io import nexus_record
+
+    record = tmp_path / "Scan.nexus"
+    root = tmp_path / "MixedCaseProject"
+    with h5py.File(record, "w") as handle:
+        entry = handle.create_group("entry")
+        # Same spelling the GUI's normalized Run configuration persists.
+        stored = root.as_posix().lower()
+        entry.attrs["source_base"] = stored
+        # Only the pure comparison uses Windows stdlib rules on other hosts.
+        monkeypatch.setattr(nexus_record, "normcase", ntpath.normcase, raising=False)
+        monkeypatch.setattr(nexus_record, "normpath", ntpath.normpath, raising=False)
+        assert nexus_record.validate_source_base(entry, root) == str(root)
+        with pytest.raises(ValueError, match="differs"):
+            nexus_record.validate_source_base(entry, tmp_path / "AnotherProject")
+        assert entry.attrs["source_base"] == stored
+
+
 def test_get_raw_frame_source_root_overrides_moved_tree(tmp_path):
     """@source_base points at the original root; after the data moves, the
     stored base is stale -> source_root= repoints and the raw loads again."""
