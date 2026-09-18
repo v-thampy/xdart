@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import Enum
 import os
 
 import numpy as np
 
-from xrd_tools.core import Axis, FrameView
+from xrd_tools.core import Axis, FrameRecord, FrameView
 from xrd_tools.io.output_transaction import (
     StreamTerminal,
     stream_terminal_object_revision,
@@ -233,6 +234,24 @@ class StandardDisplayPayload:
     gi_mode_2d: str = ""
     wavelength_m: float | None = None
     averaged: bool = False
+    #: The frame's other DIRECT 2-D maps by GI mode key (``view`` holds the
+    #: primary).  They are what the 2-D pane may show instead; empty for a
+    #: one-map result.
+    extra_views_2d: Mapping[str, FrameView] = field(default_factory=dict)
+    #: True only on a PRESENTED payload whose 2-D map was re-binned from the
+    #: q_ip–q_oop cake for display (never a stored or direct ``q_chi`` result).
+    derived_2d: bool = False
+
+
+def companion_views_2d(record: FrameRecord | None) -> dict[str, FrameView]:
+    """The complete non-active 2-D views of *record*, by mode key."""
+    if record is None or len(record.results_2d) < 2:
+        return {}
+    return {
+        mode: view for mode, view in record.results_2d.items()
+        if mode != record.active_mode_2d and view.has_2d
+    }
+
 
 def standard_event_is_valid(value: object, identity: RunIdentity) -> bool:
     try:
@@ -325,6 +344,11 @@ def display_payload_is_valid(
                 and type(value.gi_resolved_motor) is str
                 and type(value.gi_mode_1d) is str
                 and type(value.gi_mode_2d) is str
+                and all(
+                    type(mode) is str and type(extra) is FrameView
+                    for mode, extra in value.extra_views_2d.items()
+                )
+                and type(value.derived_2d) is bool
                 and (
                     value.wavelength_m is None
                     or type(value.wavelength_m) is float

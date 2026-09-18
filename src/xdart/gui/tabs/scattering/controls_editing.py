@@ -35,6 +35,9 @@ from .controls_inventory import (
     BACKGROUND_TYPE,
     GI_1D_AXES,
     GI_2D_AXES,
+    GI_2D_COMBINED_AXIS,
+    GI_2D_COMBINED_MODES,
+    GI_COMPANION_MODES_2D_ARG,
     GI_ENABLED,
     GI_MOTOR,
     GI_ORIENTATION,
@@ -833,7 +836,12 @@ def _reduce_integration_edit(
             if path == INT_1D_AXIS
             else STANDARD_2D_AXES
         )
-        selected = axes.get(value)
+        companions: tuple[str, ...] = ()
+        if intent.gi.enabled and path == INT_2D_AXIS and value == GI_2D_COMBINED_AXIS:
+            # Two existing modes selected together: qip_qoop stays the primary.
+            selected, companions = GI_2D_COMBINED_MODES
+        else:
+            selected = axes.get(value)
         if selected is None:
             return EditRefusal("Choose a supported integration axis.")
         if value == current:
@@ -857,6 +865,9 @@ def _reduce_integration_edit(
                     else "q_A^-1"
                 )
                 candidate.bai_2d_args.pop("radial_range", None)
+                candidate.bai_2d_args.pop(GI_COMPANION_MODES_2D_ARG, None)
+                if companions:
+                    candidate.bai_2d_args[GI_COMPANION_MODES_2D_ARG] = list(companions)
         elif path == INT_1D_AXIS:
             candidate.bai_1d_args["unit"] = selected
             candidate.bai_1d_args.pop("radial_range", None)

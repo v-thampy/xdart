@@ -507,7 +507,14 @@ class ScientificProjection:
     processing_mode: str = "Int 2D"
     measurement_mode: str = "Standard"
     gi_mode_1d: str = ""
+    #: The GI mode of the 2-D map being SHOWN (the pane's choice among
+    #: ``gi_maps``), which is what the cake-derived 1-D axes follow.
     gi_mode_2d: str = ""
+    #: The 2-D maps available for the current GI frame, primary first; the
+    #: display-only derived q–χ map is ``"q_chi_derived"``.
+    gi_maps: tuple[str, ...] = ()
+    #: The shown map was re-binned from the q_ip–q_oop cake for display.
+    derived_2d: bool = False
     norm_channels: tuple[str, ...] = ("Norm Channel",)
     norm_channel: str = "Norm Channel"
     color_maps: tuple[str, ...] = ("Default", "viridis", "magma")
@@ -569,6 +576,7 @@ class ScientificProjection:
             self.measurement_mode,
             self.gi_mode_1d,
             self.gi_mode_2d,
+            self.derived_2d,
             self.norm_identity,
             self.norm_revision,
             self.norm_channel,

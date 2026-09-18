@@ -605,10 +605,12 @@ def test_real_executor_pauses_at_durable_store_boundary(
                              else _TinyIntegrator(real_integrator(calibration))),
     )
 
-    def tiny_plan(configuration):
+    def tiny_plan(configuration, **options):
         assert type(configuration) is FrozenRunConfiguration
         plan_configurations.append(configuration)
-        plan = native_plan(configuration)
+        # An ordinary Run asks the translation to declare its companion maps.
+        assert options == {"companion_modes_2d": True}
+        plan = native_plan(configuration, **options)
         assert plan.integration_1d is not None
         assert plan.integration_1d.npt == 2
         assert plan.integration_2d is None

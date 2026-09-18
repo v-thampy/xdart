@@ -50,6 +50,7 @@ from xrd_tools.session import (
     resolve_session_policy,
 )
 from xrd_tools.session.policy import requirements_from
+from xrd_tools.session.readiness import gi_companion_modes_2d
 from xrd_tools.core import DEFAULT_MODE_KEY
 from xrd_tools.core.scan import SourceKind
 from xrd_tools.core.staging import (
@@ -552,6 +553,13 @@ def _mode_tokens(configuration) -> tuple[str, ...]:
     modes = [f"1d:{one_key}"]
     if not configuration.skip_2d:
         modes.append(f"2d:{two_key}")
+        if configuration.gi.enabled:
+            # Every DIRECT 2-D result the run writes is part of the Append
+            # identity, so a changed mode set takes the incompatibility flow.
+            modes.extend(
+                f"2d:{mode}"
+                for mode in gi_companion_modes_2d(configuration.bai_2d_args)
+            )
     return tuple(modes)
 
 

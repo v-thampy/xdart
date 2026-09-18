@@ -293,11 +293,8 @@ class _BrowseHydrationOwner:
                 raise RuntimeError(
                     "Browse preview has no exact active 2-D mode"
                 )
-            record = FrameRecord.from_view(
-                view,
-                mode_1d=(mode_1d if view.has_1d else DEFAULT_MODE_KEY),
-                mode_2d=(mode_2d if view.has_2d else DEFAULT_MODE_KEY),
-            )
+            # Browse keeps every direct map the file holds for this frame.
+            record = preview.record(view, mode_1d=mode_1d, mode_2d=mode_2d)
             detector_unavailable = view.raw is None and view.thumbnail is None
             source_identity = canonical_browse_source_identity(
                 view,

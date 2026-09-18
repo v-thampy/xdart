@@ -1939,8 +1939,14 @@ def execution_plan_values(
     }
 
 
-def native_int_reduction_plan(configuration: FrozenRunConfiguration):
+def native_int_reduction_plan(
+    configuration: FrozenRunConfiguration, *, companion_modes_2d: bool = False,
+):
     """Translate one frozen Controls configuration into its mask-free plan.
+
+    *companion_modes_2d* is set only by an ordinary Run: it alone integrates the
+    GI companion map the "Q-χ + Qip-Qoop" choice selects.  Average and the XYE
+    naming lookup stay single-mode.
 
     Scientific assets are admitted independently of control intent. The
     ordinary run path attaches its already-authenticated detector mask after
@@ -1953,7 +1959,9 @@ def native_int_reduction_plan(configuration: FrozenRunConfiguration):
     )
 
     one, two, values = execution_plan_values(configuration)
-    return build_native_int_reduction_plan_from_args(one, two, **values)
+    return build_native_int_reduction_plan_from_args(
+        one, two, declare_companion_modes_2d=companion_modes_2d, **values,
+    )
 def _validate_targets(
     configuration: FrozenRunConfiguration | OutputCandidate,
     source: SourceSpec | DirectorySourceSpec,

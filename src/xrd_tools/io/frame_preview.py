@@ -1,6 +1,7 @@
 """One-open, one-frame processed previews with truthful detector fallback."""
 from __future__ import annotations
-from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 import math
 from pathlib import Path, PurePosixPath
 import numpy as np
@@ -96,7 +97,26 @@ class FramePreview:
     mode_2d: str
     detector_fallback_used: bool = False
     detector_diagnostic: str | None = None
+    #: The frame's other DIRECT 2-D maps by mode key (``view`` holds the
+    #: primary); empty for a single-mode file, which is read exactly as before.
+    extra_views_2d: Mapping[str, FrameView] = field(default_factory=dict)
+    def record(self, view: FrameView | None = None, *, mode_1d: str | None = None, mode_2d: str | None = None):
+        """The frame's record: *view* (default: this preview's) under the primary
+        modes, plus every other direct 2-D map the file holds for the frame."""
+        from xrd_tools.core import DEFAULT_MODE_KEY, FrameRecord
+        view = self.view if view is None else view
+        record = FrameRecord.from_view(
+            view,
+            mode_1d=(mode_1d or self.mode_1d) if view.has_1d else DEFAULT_MODE_KEY,
+            mode_2d=(mode_2d or self.mode_2d) if view.has_2d else DEFAULT_MODE_KEY,
+        )
+        if view.has_2d:
+            for mode, extra in self.extra_views_2d.items():
+                record = record.with_result_2d(mode, extra, make_active=False)
+        return record
     def __post_init__(self):
+        _check(all(type(mode) is str and mode != self.mode_2d and type(extra) is FrameView and extra.has_2d
+                   for mode, extra in self.extra_views_2d.items()), "extra 2-D views must be complete views of other modes")
         _check(type(self.read_key) is HydrationReadKey and type(self.view) is FrameView, "preview identity and view must be exact values")
         _check(type(self.view.label) is type(self.read_key.frame_identity) and self.view.label == self.read_key.frame_identity, "view label must match the exact read identity", ValueError)
         for name in ("thumbnail", "raw"):
@@ -189,6 +209,14 @@ def read_frame_preview(read_key: HydrationReadKey, *, detector_projection: Detec
         view = reader.read(frame)
         mode_1d = reader.primary_mode_1d()
         mode_2d = reader.primary_mode_2d()
+        extra_views_2d = {
+            mode: extra
+            for mode, extra in (
+                reader.read_record(frame).results_2d.items()
+                if len(reader.modes_2d()) > 1 else ()
+            )
+            if mode != mode_2d and extra.has_2d
+        }
         provenance = _source_provenance(reader, frame)
         dataset = None if reader._entry is None else reader._entry.get("instrument/detector/detector_shape")
         try: shape_values = np.asarray(dataset[()]) if dataset is not None else np.asarray(())
@@ -228,4 +256,5 @@ def read_frame_preview(read_key: HydrationReadKey, *, detector_projection: Detec
     return FramePreview(
         read_key, view, view.thumbnail, raw, locator, dataset_path,
         source_index, source_base, mode_1d, mode_2d, fallback, diagnostic,
+        extra_views_2d,
     )

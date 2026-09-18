@@ -34,9 +34,12 @@ from .shell_values import (
     SlicePin,
 )
 from .scientific_axes import (
+    DERIVED_Q_CHI,
+    available_gi_maps,
     heavy_projection,
     image_axis_choice,
     plot_axis_choice,
+    present_gi_map,
     requested_image_axis as project_requested_image_axis,
     resolve_norm_presentation,
     share_plot_axis_for_image,
@@ -203,6 +206,7 @@ def build_scientific_projection(
     projectable_ids = eligible_ids | pin_frame_ids
     accepted_items: list[StandardDisplayPayload] = []
     payload_by_id: dict[int, StandardDisplayPayload] = {}
+    maps_by_id: dict[int, tuple[str, ...]] = {}
     for payload in payloads:
         if type(payload) is not StandardDisplayPayload:
             continue
@@ -225,6 +229,10 @@ def build_scientific_projection(
             valid = False
         if not valid:
             continue
+        # The pane's map choice is pure presentation: from here on every
+        # consumer (cake, 1-D cuts, axis choices, labels) sees the shown map.
+        maps_by_id.setdefault(frame_id, available_gi_maps(payload))
+        payload = present_gi_map(payload, preferences.image_axis)
         payload_by_id.setdefault(frame_id, payload)
         if frame_id in eligible_ids:
             # Pin-only hydration may feed the recipe lookup below, but never
@@ -286,6 +294,14 @@ def build_scientific_projection(
             measurement_mode=measurement_mode,
             gi_mode_2d=gi_mode_2d,
         )
+    )
+    derived_2d = bool(identity_payload is not None and identity_payload.derived_2d)
+    if derived_2d:
+        rendered_image_axis = DERIVED_Q_CHI
+    gi_maps = (
+        ()
+        if identity_payload is None
+        else maps_by_id.get(id(identity_payload.frame_key), ())
     )
     requested_plot_axis = preferences.plot_axis
     if preferences.share_axis:
@@ -375,6 +391,8 @@ def build_scientific_projection(
         measurement_mode=measurement_mode,
         gi_mode_1d=gi_mode_1d,
         gi_mode_2d=gi_mode_2d,
+        gi_maps=gi_maps,
+        derived_2d=derived_2d,
         norm_channels=norm_choices,
         norm_channel=effective_channel or "Norm Channel",
         norm_identity=norm_identity,

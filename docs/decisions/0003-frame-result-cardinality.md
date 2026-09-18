@@ -129,6 +129,32 @@ So: **events single-result, records multi-result, store keyed by frame index.**
 - The `live ≡ batch ≡ reload` spine is unaffected: equivalence is asserted
   per (frame, mode), which a single-result event/record-entry expresses directly.
 
+## Amendment 2026-09-18 — declared companion 2-D results
+
+The decision above rests on a premise: *a completion never produces more than
+one mode*, because other modes are computed lazily, on a user switch. One
+Processing choice now changes that premise on purpose. "Q-χ + Qip-Qoop" asks a
+grazing-incidence run for two direct 2-D maps of every frame, and both are
+integrated from the same conditioned detector image in the same worker call.
+
+- **A completion carries one primary result per dimension plus any DECLARED
+  companion 2-D results.** The plan declares them
+  (`plan.extra["enabled_modes_2d"]`, primary first); `FrameReduction` and
+  `FrameEvent` carry them in `extra_results_2d`, keyed by mode. It is `None` for
+  every run that declares one 2-D mode, so the ordinary completion is unchanged.
+- **The alternative, two completions per frame, was rejected.** It keeps the
+  letter of "single-result" but teaches every per-label owner — progress,
+  the written-frame identity, stage accounting, thumbnails, frame rows — that
+  two events are one physical frame. One widened completion makes "a frame
+  counts once" true by construction.
+- **Records are unchanged.** A companion upserts into the same `FrameRecord`
+  under its own mode key and never becomes the active mode; the writer stores it
+  as the existing nested extra mode. `mode_key` still names the primary.
+- **Scope.** Companions are limited to `qip_qoop` and `q_chi`, and only an
+  ordinary Run declares them. A q–χ view re-binned from a q_ip–q_oop cake for
+  display is not a result at all: it never enters a completion, a record or a
+  file.
+
 ## Status note for the maintainer
 
 This is the single most consequential architectural commitment of the remaining

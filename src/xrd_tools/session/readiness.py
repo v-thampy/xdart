@@ -728,10 +728,27 @@ def _native_gi_2d_unit_default(unit: Any, mode: str, *, is_gi: bool) -> str:
     return text or "q_A^-1"
 
 
+#: 2-D integration argument naming the GI 2-D modes computed ALONGSIDE the
+#: selected one (the Processing "Q-χ + Qip-Qoop" choice is ``qip_qoop`` plus
+#: ``["q_chi"]`` here).  A selection of existing modes, never a mode key.
+GI_COMPANION_MODES_2D_ARG = "gi_companion_modes_2d"
+
+
+def gi_companion_modes_2d(bai_2d_args: Mapping[str, Any] | None) -> tuple[str, ...]:
+    """The declared companion GI 2-D modes of one 2-D argument mapping."""
+    declared = (bai_2d_args or {}).get(GI_COMPANION_MODES_2D_ARG) or ()
+    if isinstance(declared, (str, bytes)) or not all(
+        type(mode) is str and mode for mode in declared
+    ):
+        raise ValueError(f"{GI_COMPANION_MODES_2D_ARG} must be a list of mode names")
+    return tuple(declared)
+
+
 def build_native_int_reduction_plan_from_args(
     bai_1d_args: Mapping[str, Any] | None,
     bai_2d_args: Mapping[str, Any] | None,
     *,
+    declare_companion_modes_2d: bool = False,
     gi_enabled: bool = False,
     gi_incident_angle: Any = None,
     incidence_motor: Any = None,
@@ -798,6 +815,10 @@ def build_native_int_reduction_plan_from_args(
 
     gi_mode_1d = str(_native_pop_first(args_1d, ("gi_mode_1d",), "q_total"))
     gi_mode_2d = str(_native_pop_first(args_2d, ("gi_mode_2d",), "qip_qoop"))
+    # Always consumed here, so it can never reach pyFAI as an unknown keyword.
+    # Only an ordinary Run declares it; Average and Reintegration stay one-mode.
+    companions_2d = gi_companion_modes_2d(args_2d)
+    args_2d.pop(GI_COMPANION_MODES_2D_ARG, None)
     npt_oop = _native_pop_first(args_1d, ("npt_oop",), None)
     if npt_oop is None:
         npt_oop = _native_pop_first(args_2d, ("npt_oop",), None)
@@ -876,14 +897,17 @@ def build_native_int_reduction_plan_from_args(
             extra=args_2d,
         )
 
-    # Native Run produces one selected GI mode per enabled dimension. Declare
-    # those sets so resource accounting does not reserve every schema mode.
+    # Native Run produces one selected GI mode per enabled dimension, plus any
+    # declared companion 2-D modes. Declare those sets so resource accounting
+    # funds exactly them and does not reserve every schema mode.
     modes = {}
     if gi is not None:
         if integration_1d is not None:
             modes["enabled_modes_1d"] = (gi.mode_1d.value,)
         if integration_2d is not None:
-            modes["enabled_modes_2d"] = (gi.mode_2d.value,)
+            modes["enabled_modes_2d"] = (gi.mode_2d.value,) + (
+                companions_2d if declare_companion_modes_2d else ()
+            )
     return ReductionPlan(
         integration_1d=integration_1d,
         integration_2d=integration_2d,

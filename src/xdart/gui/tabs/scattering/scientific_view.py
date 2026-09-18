@@ -112,10 +112,27 @@ _GI_CAKE_PLOT_AXIS_CHOICES = {
     ),
     "exit_angles": (("Exit angle (°)", "exit_angle"),),
 }
+#: A GI q–χ cake written by the fiber integrator stores its azimuth as χGI
+#: (``chigi_deg``).  Asking that cake for the transmission ``chi`` axis matches
+#: nothing, so the χ cut is offered under the axis the cake really has.
+_GI_CHIGI_CAKE_PLOT_AXIS_CHOICES = (
+    ("Q (Å⁻¹)", "Q"),
+    ("χGI (°)", "chi_gi"),
+)
+#: The same two cuts read off the re-binned display map, labelled as such.
+_GI_DERIVED_CAKE_PLOT_AXIS_CHOICES = (
+    ("Q (Å⁻¹, derived)", "Q"),
+    ("χGI (°, derived)", "chi_gi"),
+)
+_GI_IMAGE_AXIS_LABELS = {
+    "qip_qoop": "Qᵢₚ-Qₒₒₚ",
+    "q_chi": "Q-χ",
+    "q_chi_derived": "Q-χ (derived)",
+    "exit_angles": "Exit angles",
+}
 _GI_IMAGE_AXIS_CHOICES = {
-    "qip_qoop": (("Qᵢₚ-Qₒₒₚ", "qip_qoop"),),
-    "q_chi": (("Q-χ", "q_chi"),),
-    "exit_angles": (("Exit angles", "exit_angles"),),
+    mode: ((_GI_IMAGE_AXIS_LABELS[mode], mode),)
+    for mode in ("qip_qoop", "q_chi", "exit_angles")
 }
 
 
@@ -989,7 +1006,10 @@ class ScientificView(QtWidgets.QFrame):
         explanation = state.detector_diagnostic if not state.detector_available else ""
         self.raw_popup_button.setToolTip(explanation or "Show exact-current raw image")
         if replace_presentation:
-            self.image_axis.setEnabled(state.measurement_mode != "GI")
+            # A GI frame offers a choice only when it has more than one map.
+            self.image_axis.setEnabled(
+                state.measurement_mode != "GI" or len(state.gi_maps) > 1
+            )
         if replace_presentation:
             self.title.setText(state.title)
         self._heavy_available = state.heavy_available
@@ -2638,7 +2658,12 @@ class ScientificView(QtWidgets.QFrame):
         )
         plot_choices = self._plot_axis_choices(state, native_key)
         if state.measurement_mode == "GI":
-            image_choices = _GI_IMAGE_AXIS_CHOICES.get(
+            # The maps this frame actually has, primary first; one map keeps the
+            # historical single (disabled) entry.
+            image_choices = tuple(
+                (_GI_IMAGE_AXIS_LABELS[mode], mode)
+                for mode in state.gi_maps if mode in _GI_IMAGE_AXIS_LABELS
+            ) or _GI_IMAGE_AXIS_CHOICES.get(
                 state.gi_mode_2d,
                 _GI_IMAGE_AXIS_CHOICES["q_chi"],
             )
@@ -2662,7 +2687,14 @@ class ScientificView(QtWidgets.QFrame):
                 if state.processing_mode == "Int 1D"
                 else self._merged_axis_choices(
                     native_choices,
-                    _GI_CAKE_PLOT_AXIS_CHOICES.get(state.gi_mode_2d, ()),
+                    _GI_DERIVED_CAKE_PLOT_AXIS_CHOICES
+                    if state.derived_2d
+                    else _GI_CHIGI_CAKE_PLOT_AXIS_CHOICES
+                    if state.gi_mode_2d == "q_chi"
+                    and state.heavy is not None
+                    and state.heavy.cake_y is not None
+                    and self._axis_key(state.heavy.cake_y) == "chigi_deg"
+                    else _GI_CAKE_PLOT_AXIS_CHOICES.get(state.gi_mode_2d, ()),
                 )
             )
         if state.processing_mode == "Int 1D" and native_key == "chi_deg":

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from dataclasses import replace
 import os
+import threading
 
 import numpy as np
 
 from xrd_tools.core import (
+    FrameView,
     TwoDKind,
     axis_from_unit,
     convert_radial_axis,
@@ -17,6 +21,7 @@ from xrd_tools.session.display_logic import (
     canonical_axis_key,
     nanmean_slice,
 )
+from xrd_tools.session.gi_derived_view import derive_q_chi
 from xrd_tools.session.scan_norm import (
     ScanNormAggregate,
     channel_is_partial,
@@ -54,13 +59,24 @@ _PLOT_AXIS_CHOICES = {
     "chigi_deg": "chi_gi",
 }
 _CONVERTIBLE_RADIAL_AXIS_KEYS = frozenset({"q_A^-1", "2th_deg"})
+#: Display-only choice: a q–χ map re-binned from the saved q_ip–q_oop cake.
+#: Never a GI mode key and never written; see ``xrd_tools.session.gi_derived_view``.
+DERIVED_Q_CHI = "q_chi_derived"
 _SHARE_PLOT_AXIS_BY_IMAGE = {
     "Q-Chi": "Q",
     "2Th-Chi": "2theta",
     "qip_qoop": "q_ip",
     "q_chi": "Q",
+    DERIVED_Q_CHI: "Q",
     "exit_angles": "exit_angle",
 }
+#: Derived maps by SOURCE array identity.  The entry keeps its source array
+#: alive so the identity cannot be reused; a handful covers the current frame
+#: and a few selected ones without holding a scan's worth of maps.
+_DERIVED_VIEWS: "OrderedDict[int, tuple[np.ndarray, FrameView]]" = OrderedDict()
+_DERIVED_VIEW_ENTRIES = 8
+#: The pane (GUI thread) and the Browse slice lane (its worker) both present maps.
+_DERIVED_VIEWS_LOCK = threading.Lock()
 _LEGEND_AXIS_LABELS = {
     "q_A^-1": "Q",
     "2th_deg": "2θ",
@@ -70,6 +86,86 @@ _LEGEND_AXIS_LABELS = {
     "exit_angle_deg": "exit",
     "chigi_deg": "χGI",
 }
+
+
+def available_gi_maps(payload: StandardDisplayPayload) -> tuple[str, ...]:
+    """The 2-D maps the pane can show for one GI frame, primary first.
+
+    Direct maps are whatever the frame actually holds.  A q_ip–q_oop frame
+    without a direct q–χ map additionally offers the derived one.
+    """
+    if payload.measurement_mode != "GI" or payload.view.intensity_2d is None:
+        return ()
+    maps = [payload.gi_mode_2d, *payload.extra_views_2d]
+    if payload.gi_mode_2d == "qip_qoop" and "q_chi" not in maps:
+        maps.append(DERIVED_Q_CHI)
+    return tuple(maps)
+
+
+def present_gi_map(
+    payload: StandardDisplayPayload, preference: str,
+) -> StandardDisplayPayload:
+    """Return *payload* showing the preferred available 2-D map.
+
+    Pure presentation: the frame's record, the reduction plan and the file are
+    untouched, and an unavailable preference falls back to the primary map.
+    """
+    if payload.derived_2d or preference == payload.gi_mode_2d:
+        return payload
+    if preference not in available_gi_maps(payload):
+        return payload
+    if preference == DERIVED_Q_CHI:
+        shown = _derived_q_chi_view(payload.view)
+        if shown is None:
+            return payload
+        mode, derived = "q_chi", True
+    else:
+        shown, mode, derived = payload.extra_views_2d[preference], preference, False
+    return replace(
+        payload,
+        view=replace(
+            payload.view,
+            axis_2d_x=shown.axis_2d_x,
+            axis_2d_y=shown.axis_2d_y,
+            intensity_2d=shown.intensity_2d,
+            sigma_2d=shown.sigma_2d,
+            two_d_kind=shown.two_d_kind,
+        ),
+        gi_mode_2d=mode,
+        derived_2d=derived,
+    )
+
+
+def _derived_q_chi_view(view: FrameView) -> FrameView | None:
+    source = view.intensity_2d
+    x_axis, y_axis = view.axis_2d_x, view.axis_2d_y
+    if (source is None or x_axis is None or y_axis is None
+            or x_axis.values is None or y_axis.values is None):
+        return None
+    with _DERIVED_VIEWS_LOCK:
+        cached = _DERIVED_VIEWS.get(id(source))
+        if cached is not None and cached[0] is source:
+            _DERIVED_VIEWS.move_to_end(id(source))
+            return cached[1]
+    try:
+        derived = derive_q_chi(source, x_axis.values, y_axis.values)
+    except (TypeError, ValueError):
+        return None
+    derived.intensity.setflags(write=False)
+    shown = FrameView(
+        label=view.label,
+        axis_2d_x=axis_from_unit("qtot_A^-1", derived.q),
+        axis_2d_y=axis_from_unit("chigi_deg", derived.chi),
+        intensity_2d=derived.intensity,
+        # No uncertainty: re-binning a binned map has no honest sigma.
+        sigma_2d=None,
+        two_d_kind=TwoDKind.QTOT_CHIGI,
+    )
+    with _DERIVED_VIEWS_LOCK:
+        _DERIVED_VIEWS[id(source)] = (source, shown)
+        while len(_DERIVED_VIEWS) > _DERIVED_VIEW_ENTRIES:
+            _DERIVED_VIEWS.popitem(last=False)
+    return shown
 
 
 def share_plot_axis_for_image(image_axis: str) -> str | None:
@@ -204,6 +300,9 @@ def trace_projection(
             if frame.source_scan and frame.source_scan != "null_main"
             else member_label
         )
+        if selected_from_cake and payload.derived_2d:
+            # Any 1-D values read off the re-binned map carry its label.
+            title += " · derived Q-χ"
         if (
             selected_from_cake
             and slice_enabled
@@ -666,11 +765,14 @@ def plot_axis_choice(
 
 
 __all__ = [
+    "DERIVED_Q_CHI",
+    "available_gi_maps",
     "heavy_projection",
     "image_axis_choice",
     "native_1d_plot_axis",
     "payload_is_qualified",
     "plot_axis_choice",
+    "present_gi_map",
     "requested_image_axis",
     "resolve_norm_presentation",
     "share_plot_axis_for_image",

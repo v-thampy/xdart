@@ -16,7 +16,7 @@ from xrd_tools.io.output_transaction import (
 )
 
 from .display_values import DisplayFrameKey, StandardDisplayPayload
-from .scientific_axes import trace_projection
+from .scientific_axes import DERIVED_Q_CHI, present_gi_map, trace_projection
 from .shell_values import (
     FrameNavigationProjection, PinnedTraceProjection, SlicePin, TraceProjection,
 )
@@ -42,6 +42,8 @@ class _Request:
     width: float
     norm: str
     cached_pins: tuple[PinnedTraceProjection, ...]
+    #: The 2-D map the pane shows; cuts are read off that map for every frame.
+    image_map: str = ""
 
 
 @dataclass(slots=True)
@@ -145,10 +147,12 @@ class BrowseSliceLane:
         center, width = float(preferences.slice_center), float(preferences.slice_width)
         if not np.isfinite(center) or not np.isfinite(width) or width < 0:
             raise ValueError("Browse slice settings are invalid")
+        image_map = str(preferences.image_axis)
         key = (
             id(selection), selection.display_generation,
             tuple(id(frame) for frame in navigation.selected), axis,
             sliced, center, width, tuple(pin.projection_id for pin in pins), norm,
+            image_map,
         )
         with self._lock:
             cached = tuple(
@@ -156,7 +160,7 @@ class BrowseSliceLane:
                 if (found := self._pin_cache.get((*pin.projection_id, norm))) is not None
             )
         return _Request(key, selection, navigation.selected, pins,
-                        axis, sliced, center, width, norm, cached)
+                        axis, sliced, center, width, norm, cached, image_map)
 
     def project(self, selection, navigation, *, preferences, norm_channel="") -> BrowseSliceResult:
         try:
@@ -251,14 +255,23 @@ class BrowseSliceLane:
                 if self._cancelled(task):
                     return BrowseSliceResult()
                 row = self._catalog.row(frame.local_frame_label)
+                # Cut the map the pane shows: another DIRECT map the file holds
+                # for this frame is read as such; the display-only derived q–χ
+                # is re-binned from the primary cake, exactly as the pane does.
+                shown = request.image_map
+                direct = shown != row.active_mode_2d and shown in (row.modes_2d or ())
                 view = reader.read(row.label, mode_1d=row.active_mode_1d,
-                                   mode_2d=row.active_mode_2d)
+                                   mode_2d=shown if direct else row.active_mode_2d)
                 if self._cancelled(task):
                     return BrowseSliceResult()
                 payload = StandardDisplayPayload(
                     request.selection.display_generation, frame, "", view,
                     status="browse", wavelength_m=self._wavelength, averaged=row.averaged,
                 )
+                if shown == DERIVED_Q_CHI and row.active_mode_2d == "qip_qoop":
+                    payload = present_gi_map(replace(
+                        payload, measurement_mode="GI", gi_mode_2d="qip_qoop",
+                    ), shown)
                 if id(frame) in selected:
                     trace = self._cut(payload, request.axis, request.sliced,
                                       request.center, request.width, request.norm)

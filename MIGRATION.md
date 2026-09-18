@@ -353,6 +353,20 @@ for downstream users:
   `[notebook]` packages (about 30 MB more to download). The new `xdart-notebook`
   command starts that JupyterLab, and `xdart-notebook --register-kernel` offers
   the installation to VS Code as the kernel **Python (xdart)**.
+- **Q–χ is available for every grazing-incidence q_ip–q_oop result.** The
+  Processing **2D Axis** choices are now Qip-Qoop, Q-χ, **Q-χ + Qip-Qoop**, and
+  Exit. With Qip-Qoop the 2-D display also offers **Q-χ (derived)**, re-binned
+  from the saved cake when you select it: no second integration, no raw images
+  needed, also for scans processed earlier. It is approximate (about 0.5 %
+  median and 3 % at the 95th percentile on one Rayonix scan, worse within two
+  bins of a detector gap and below q ≈ 0.5 Å⁻¹), carries no uncertainty, and is
+  never written to the file. Choose **Q-χ + Qip-Qoop** when you need q–χ
+  quantitatively: both maps are integrated directly and stored
+  (`/entry/integrated_2d` and `/entry/integrated_2d/q_chi`), and the 2-D
+  integration step takes about twice as long. With Q-χ shown, the 1-D plot
+  offers I–Q and I–χ cuts from that map whatever the 1-D axis was; cuts from
+  the derived map are labelled derived. A run made with a different set of 2-D
+  maps cannot be continued with Append.
 - **Automatically named grazing-incidence results carry `_gi`.** A GI run of
   `sample` writes `sample_gi_int1d.nexus` or `sample_gi_int2d.nexus`, and its
   Average and Reintegration results follow (`sample_gi_average.nexus`,

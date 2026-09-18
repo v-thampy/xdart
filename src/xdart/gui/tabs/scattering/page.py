@@ -222,6 +222,7 @@ from .start_outcomes import (
 )
 from .start_pipeline import StartPipeline
 from .output_preflight import native_int_reduction_plan
+from xrd_tools.session.readiness import GI_COMPANION_MODES_2D_ARG
 from .state_machine import RunPhase
 from .source_selection import (
     SourceSelectionTransition,
@@ -2074,6 +2075,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _reintegrate_preparation(intent, dimension) -> dict[str, object]:
         bai = jsonable_run_value(getattr(intent, f"bai_{dimension}_args"), path="reintegrate.selected_plan.bai_args") if type(dimension) is str and dimension in {"1d", "2d"} else (_ for _ in ()).throw(ValueError("Reintegrate dimension is unsupported")); (None if type(bai) is dict else (_ for _ in ()).throw(ValueError("current integration settings are malformed")))
         bai.pop(f"gi_mode_{dimension}", None); mode = getattr(intent.gi, f"mode_{dimension}"); workers = intent.max_cores
+        # Reintegration produces ONE selected mode; the Run-only companion
+        # selection is not part of its science.
+        bai.pop(GI_COMPANION_MODES_2D_ARG, None)
         if type(mode) is not str or mode not in ({"q_total", "q_ip", "q_oop", "exit_angle", "chi_gi"} if dimension == "1d" else {"qip_qoop", "q_chi", "exit_angles"}): raise ValueError("current integration mode is unsupported")
         if type(workers) is not int or workers < 1: raise ValueError("current core request is invalid")
         return {"api_version": 1,
@@ -7213,9 +7217,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 "2Th-Chi",
                 "qip_qoop",
                 "q_chi",
+                "q_chi_derived",
                 "exit_angles",
             }:
                 return False
+            # A display preference only: choosing which available 2-D map the
+            # pane shows never edits the run intent or starts an integration.
             updates["image_axis"] = value
             if self._preferences.share_axis:
                 matching_plot_axis = share_plot_axis_for_image(value)

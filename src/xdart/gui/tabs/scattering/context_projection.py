@@ -33,7 +33,9 @@ from .context_values import (
     TerminalMiss,
 )
 from .controls_readiness import ControlsReadinessProjection
-from .display_values import DisplayFrameKey, StandardDisplayPayload
+from .display_values import (
+    DisplayFrameKey, StandardDisplayPayload, companion_views_2d,
+)
 from .display_runtime import browse_publication_needs_hydration
 from .events import RunIdentity
 from .shell_projection import (
@@ -704,6 +706,9 @@ def _browse_payload(
             else ""
         ),
         wavelength_m=_browse_wavelength(context),
+        extra_views_2d=(
+            companion_views_2d(publication.record) if measurement == "GI" else {}
+        ),
     )
 
 

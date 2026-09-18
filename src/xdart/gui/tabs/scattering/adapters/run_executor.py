@@ -53,6 +53,7 @@ from ..display_values import (
     StandardRunEvent,
     StandardQuartileTiming,
     StandardTerminalTiming,
+    companion_views_2d,
 )
 from ..display_runtime import (
     DisplayArtifact,
@@ -1483,7 +1484,7 @@ class StandardRunExecutor:
             else len(run.scan.frames)
         )
         plan = replace(
-            native_int_reduction_plan(configuration),
+            native_int_reduction_plan(configuration, companion_modes_2d=True),
             mask=None if assets is None else assets.mask,
         )
         try:
@@ -2679,6 +2680,7 @@ class StandardRunExecutor:
             gi_mode_1d=configuration.gi.mode_1d if is_gi else "",
             gi_mode_2d=configuration.gi.mode_2d if is_gi else "",
             wavelength_m=owner.wavelength_m,
+            extra_views_2d=companion_views_2d(record),
         )
         self._publish_payload(
             run,

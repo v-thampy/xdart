@@ -635,6 +635,10 @@ class FrameReduction:
     result_2d: IntegrationResult2D | None = None
     mode_1d: str | None = None
     mode_2d: str | None = None
+    #: Declared companion 2-D results by mode key (ADR-0003 amendment), computed
+    #: from the same conditioned frame as ``result_2d``.  ``None`` on every run
+    #: that declares one 2-D mode, so the ordinary path allocates nothing.
+    extra_results_2d: Mapping[str, IntegrationResult2D] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     corrected_image: np.ndarray | None = field(
         default=None,
@@ -661,6 +665,67 @@ def _plan_mode_keys(plan: ReductionPlan | None) -> tuple[str, str]:
             or DEFAULT_MODE_KEY),
         str(getattr(getattr(gi, "mode_2d", None), "value", getattr(gi, "mode_2d", None))
             or DEFAULT_MODE_KEY),
+    )
+
+
+#: 2-D modes that may be computed alongside a primary.  Exit angles is excluded:
+#: it is not a q-space map and has no companion use.
+_COMPANION_MODES_2D = frozenset({"qip_qoop", "q_chi"})
+#: ``plan.extra`` key: the frozen output ranges of each companion 2-D mode, as
+#: ``{mode: {range_key: (lo, hi)}}``.  A companion never borrows the primary's
+#: ranges -- q/chi limits and qip/qoop limits are different quantities.
+COMPANION_RANGES_2D = "companion_ranges_2d"
+
+
+def companion_modes_2d(plan: ReductionPlan | None) -> tuple[str, ...]:
+    """The declared 2-D modes computed ALONGSIDE the plan's primary GI mode.
+
+    ``plan.extra["enabled_modes_2d"]`` is the existing declaration of a run's
+    2-D results (it already funds their memory).  The primary is
+    ``plan.gi.mode_2d``; any other entry is a companion, integrated directly
+    from the same conditioned frame and stored as an extra mode of the record.
+    """
+    extra = getattr(plan, "extra", None)
+    declared = extra.get("enabled_modes_2d") if isinstance(extra, dict) else None
+    if not declared or len(declared) < 2:
+        return ()
+    if getattr(plan, "gi", None) is None or plan.integration_2d is None:
+        raise ValueError("companion 2-D modes require a GI plan with a 2-D integration")
+    primary = _plan_mode_keys(plan)[1]
+    modes = tuple(str(getattr(mode, "value", mode)) for mode in declared)
+    if modes[0] != primary or len(set(modes)) != len(modes):
+        raise ValueError(
+            "enabled_modes_2d must list the primary GI 2-D mode first, without "
+            f"repeats; got {modes!r} for primary {primary!r}"
+        )
+    companions = modes[1:]
+    if primary not in _COMPANION_MODES_2D or not set(companions) <= _COMPANION_MODES_2D:
+        raise ValueError(
+            "companion 2-D modes are limited to qip_qoop and q_chi; "
+            f"got {modes!r}"
+        )
+    return companions
+
+
+def _companion_plan(plan: ReductionPlan, mode: str) -> ReductionPlan:
+    """A single-mode 2-D plan for companion *mode*, with ITS OWN ranges."""
+    p2d = plan.integration_2d
+    extra_2d = {k: v for k, v in p2d.extra.items() if k not in ("x_range", "y_range")}
+    ranges = dict((plan.extra.get(COMPANION_RANGES_2D) or {}).get(mode) or {})
+    fields = {"radial_range": None, "azimuth_range": None}
+    for key, value in ranges.items():
+        if key in fields:
+            fields[key] = tuple(map(float, value))
+        else:
+            extra_2d[key] = tuple(map(float, value))
+    unit = "q_A^-1" if mode == GI2DMode.Q_CHI.value else _qip_qoop_unit(p2d.unit)
+    return replace(
+        plan,
+        integration_1d=None,
+        integration_2d=replace(p2d, unit=unit, extra=extra_2d, **fields),
+        gi=replace(plan.gi, mode_2d=mode),
+        extra={k: v for k, v in plan.extra.items()
+               if k not in ("enabled_modes_2d", COMPANION_RANGES_2D)},
     )
 
 
@@ -723,6 +788,8 @@ class FrameOutcomeReceipt:
     produced_2d: bool
     error: str | None = None
     attempt: int | None = None
+    #: Mode keys of the companion 2-D results this completion also produced.
+    produced_extra_2d: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1600,6 +1667,12 @@ class NexusSink:
     _settled_buffered_drop_labels: set[int] = field(
         default_factory=set, init=False, repr=False,
     )
+    #: Companion 2-D mode writes awaiting their frame's primary write, by label.
+    #: The writer takes one record per label per batch and accepts a sibling
+    #: mode as a later write for the same frame, so they follow the primary.
+    _companion_record_writes: dict[int, tuple[RecordWrite, ...]] = field(
+        default_factory=dict, init=False, repr=False,
+    )
     _existing_append_intent: AppendIntent | None = field(
         default=None, init=False, repr=False,
     )
@@ -2468,11 +2541,11 @@ class NexusSink:
         if self._perf_nexus_enabled:
             started = time.perf_counter()
             try:
-                writer.write_batch(records)
+                self._write_records(writer, records)
             finally:
                 self._record_nexus_perf("write", started)
         else:
-            writer.write_batch(records)
+            self._write_records(writer, records)
         for (frame, reduction), (_record, dropped) in zip(items, prepared):
             if self._defer_publication_drop_settlement:
                 self._deferred_publication_drops[id(reduction)] = dropped
@@ -2497,11 +2570,11 @@ class NexusSink:
                 if self._perf_nexus_enabled:
                     started = time.perf_counter()
                     try:
-                        writer.write_batch(records)
+                        self._write_records(writer, records)
                     finally:
                         self._record_nexus_perf("write", started)
                 else:
-                    writer.write_batch(records)
+                    self._write_records(writer, records)
                 for record, dropped, key in batch:
                     if self._defer_publication_drop_settlement:
                         if record.label not in self._settled_buffered_drop_labels:
@@ -2513,6 +2586,7 @@ class NexusSink:
             except BaseException:
                 abandoned = batch + tuple(self._pending_record_writes)
                 self._pending_record_writes.clear()
+                self._companion_record_writes.clear()
                 for record, _dropped, key in abandoned:
                     self._settled_buffered_drop_labels.discard(record.label)
                     self._deferred_publication_drops.pop(key, None)
@@ -2530,16 +2604,7 @@ class NexusSink:
         drop_1d = result_1d is not None and not np.isfinite(
             np.asarray(result_1d.intensity, dtype=float)
         ).any()
-        intensity_2d = (
-            None if result_2d is None
-            else np.asarray(result_2d.intensity, dtype=float)
-        )
-        drop_2d = result_2d is not None and (
-            not np.isfinite(intensity_2d).any()
-            or (intensity_2d == -1.0).mean() >= 0.95
-            or not np.isfinite(np.asarray(result_2d.radial, dtype=float)).any()
-            or not np.isfinite(np.asarray(result_2d.azimuthal, dtype=float)).any()
-        )
+        drop_2d = result_2d is not None and self._unusable_2d(result_2d)
         dropped = tuple(
             mode for mode, dropped in (
                 (ResultMode.one_d(mode_1d), drop_1d),
@@ -2556,7 +2621,43 @@ class NexusSink:
             mode_2d=mode_2d,
             replace_existing=replace_existing,
         )
+        extras = reduction.extra_results_2d
+        if extras:
+            companions = []
+            for key, extra in extras.items():
+                if self._unusable_2d(extra):
+                    dropped += (ResultMode.two_d(str(key)),)
+                    continue
+                companions.append(self._write_frame_record(
+                    frame, reduction, result_1d=None, result_2d=extra,
+                    mode_1d=mode_1d, mode_2d=str(key),
+                    replace_existing=replace_existing,
+                ))
+            if companions:
+                self._companion_record_writes[int(frame.index)] = tuple(companions)
         return record, dropped
+
+    @staticmethod
+    def _unusable_2d(result_2d: IntegrationResult2D) -> bool:
+        intensity_2d = np.asarray(result_2d.intensity, dtype=float)
+        return bool(
+            not np.isfinite(intensity_2d).any()
+            or (intensity_2d == -1.0).mean() >= 0.95
+            or not np.isfinite(np.asarray(result_2d.radial, dtype=float)).any()
+            or not np.isfinite(np.asarray(result_2d.azimuthal, dtype=float)).any()
+        )
+
+    def _write_records(self, writer, records: tuple[RecordWrite, ...]) -> None:
+        """Write *records*, then each frame's companion 2-D modes."""
+        writer.write_batch(records)
+        if not self._companion_record_writes:
+            return
+        companions = tuple(
+            companion for record in records
+            for companion in self._companion_record_writes.pop(int(record.label), ())
+        )
+        if companions:
+            writer.write_batch(companions)
 
     def _settle_deferred_publication_drops(
         self, frame: Frame, reduction: FrameReduction,
@@ -3776,6 +3877,9 @@ class ReductionSession:
             produced_2d=getattr(reduction, "result_2d", None) is not None,
             error=error,
             attempt=attempt,
+            produced_extra_2d=tuple(
+                getattr(reduction, "extra_results_2d", None) or ()
+            ),
         )
         authority = self.outcome_authority_cb
         if authority is not None:
@@ -4713,7 +4817,9 @@ def prepare_gi_freeze(
         return plan, PrepareDiagnostics("skip", reason="non-GI plan")
     # Already-pinned ranges: the freeze is a no-op, so don't even enumerate
     # (preserves the T0-3 silent skip).
-    if _gi_1d_freeze_key(plan) is None and not _gi_2d_freeze_keys(plan):
+    if (_gi_1d_freeze_key(plan) is None and not _gi_2d_freeze_keys(plan)
+            and not any(_gi_2d_freeze_keys(_companion_plan(plan, mode))
+                        for mode in companion_modes_2d(plan))):
         return plan, PrepareDiagnostics(
             "skip", reason="GI output ranges already pinned")
     motor = incidence_motor
@@ -4759,6 +4865,39 @@ def _apply_gi_freeze_policy(
 
     if freeze_policy is None or plan.gi is None or not scan.frames:
         return plan
+
+    companions = companion_modes_2d(plan)
+    if companions:
+        # Freeze the primary with the companions set aside (a scout must not
+        # integrate them on an unfrozen grid), then each companion as its own
+        # single-mode plan, so every map gets its own correctly interpreted
+        # ranges from the same scout frames.
+        primary = _apply_gi_freeze_policy(
+            replace(plan, extra={k: v for k, v in plan.extra.items()
+                                 if k != "enabled_modes_2d"}),
+            scan, freeze_policy=freeze_policy, fi=fi,
+            initial_incident_angle=initial_incident_angle,
+            warned_monitor_keys=warned_monitor_keys,
+        )
+        frozen = dict(plan.extra.get(COMPANION_RANGES_2D) or {})
+        for mode in companions:
+            single = _apply_gi_freeze_policy(
+                _companion_plan(plan, mode), scan, freeze_policy=freeze_policy,
+                fi=fi, initial_incident_angle=initial_incident_angle,
+                warned_monitor_keys=warned_monitor_keys,
+            ).integration_2d
+            keys = (("x_range", "y_range") if mode == GI2DMode.QIP_QOOP.value
+                    else ("radial_range", "azimuth_range"))
+            frozen[mode] = {
+                key: value for key in keys
+                if (value := (single.extra.get(key) if key in ("x_range", "y_range")
+                              else getattr(single, key))) is not None
+            }
+        return replace(primary, extra={
+            **primary.extra,
+            "enabled_modes_2d": plan.extra["enabled_modes_2d"],
+            COMPANION_RANGES_2D: frozen,
+        })
 
     needs_1d = _gi_1d_freeze_key(plan)
     needs_2d = _gi_2d_freeze_keys(plan)
@@ -5507,6 +5646,7 @@ def _reduce_frame(
         plan_masks,
     )
     frame_mask = _combined_mask(None, frame.mask, image.shape, frame_masks)
+    extra_results_2d: dict[str, IntegrationResult2D] | None = None
 
     if plan.gi is not None:
         mask = (
@@ -5544,6 +5684,20 @@ def _reduce_frame(
             )
             if plan.integration_2d is not None else None
         )
+        for companion in companion_modes_2d(plan):
+            single = _companion_plan(plan, companion)
+            if extra_results_2d is None:
+                extra_results_2d = {}
+            extra_results_2d[companion] = _run_gi_2d(
+                image,
+                fi,
+                single.integration_2d,
+                single.gi,
+                mask=mask,
+                incident_angle=incident_angle,
+                normalization_factor=_normalization_for(
+                    frame, single.integration_2d, warned_monitor_keys, strict=strict),
+            )
     else:
         p1 = plan.integration_1d
         chi_mode = p1 is not None and str(p1.unit or "").lower() == "chi_deg"
@@ -5689,6 +5843,7 @@ def _reduce_frame(
         result_2d=r2d,
         mode_1d=mode_1d,
         mode_2d=mode_2d,
+        extra_results_2d=extra_results_2d,
         metadata=dict(frame.metadata),
         corrected_image=corrected_image,
     )

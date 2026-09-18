@@ -155,6 +155,7 @@ def test_gi_controls_use_the_production_axis_inventory_and_semantics() -> None:
     assert fields[INT_2D_AXIS].choices == (
         "Qip-Qoop",
         "Q-χ",
+        "Q-χ + Qip-Qoop",
         "Exit",
     )
     assert fields[INT_2D_AXIS].value == "Qip-Qoop"
@@ -197,10 +198,13 @@ def test_gi_qip_qoop_uses_native_toolbar_vocabulary_and_shares_qip() -> None:
             ("Qᵢₚ (Å⁻¹)", "q_ip"),
             ("Qₒₒₚ (Å⁻¹)", "q_oop"),
         )
+        # A q_ip–q_oop frame also offers the display-only re-binned q–χ map, so
+        # the selector is a real choice (GI-COMPANION-20260918).
         assert _combo_items(view.image_axis) == (
             ("Qᵢₚ-Qₒₒₚ", "qip_qoop"),
+            ("Q-χ (derived)", "q_chi_derived"),
         )
-        assert not view.image_axis.isEnabled()
+        assert view.image_axis.isEnabled()
         assert view.share_axis.isEnabled()
         assert view.share_axis.isChecked()
         assert view._share_link_on

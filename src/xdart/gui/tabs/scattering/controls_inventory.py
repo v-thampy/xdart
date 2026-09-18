@@ -13,10 +13,12 @@ from xrd_tools.session.control_labels import (
     range_axis_labels_2d,
 )
 from xrd_tools.session.readiness import (
+    GI_COMPANION_MODES_2D_ARG,
     ControlFieldKind,
     ControlFormField,
     SectionId,
     Tool,
+    gi_companion_modes_2d,
 )
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import (
@@ -275,6 +277,18 @@ GI_2D_AXES = {
     "Q-χ": "q_chi",
     "Exit": "exit_angles",
 }
+#: A SELECTION of two existing modes, not a mode: ``qip_qoop`` stays the primary
+#: result and ``q_chi`` is integrated directly alongside it.
+GI_2D_COMBINED_AXIS = "Q-χ + Qip-Qoop"
+GI_2D_COMBINED_MODES = ("qip_qoop", ("q_chi",))
+GI_2D_AXIS_CHOICES = ("Qip-Qoop", "Q-χ", GI_2D_COMBINED_AXIS, "Exit")
+
+
+def gi_2d_axis_label(mode_2d: str, bai_2d_args) -> str:
+    """The Processing 2D Axis label for one GI intent."""
+    if (mode_2d, gi_companion_modes_2d(bai_2d_args)) == GI_2D_COMBINED_MODES:
+        return GI_2D_COMBINED_AXIS
+    return label_for_value(GI_2D_AXES, mode_2d, "Qip-Qoop")
 SOURCE_FORMAT_SUFFIXES = {
     "tif": (".tif",),
     "tiff": (".tiff",),
@@ -560,7 +574,7 @@ def bound_values(
     if intent.gi.enabled:
         choices.update({
             INT_1D_AXIS: tuple(GI_1D_AXES),
-            INT_2D_AXIS: tuple(GI_2D_AXES),
+            INT_2D_AXIS: GI_2D_AXIS_CHOICES,
         })
     else:
         choices.update({
@@ -685,11 +699,7 @@ def integration_values(
             intent.gi.mode_1d,
             "Q",
         )
-        axis_2d = label_for_value(
-            GI_2D_AXES,
-            intent.gi.mode_2d,
-            "Qip-Qoop",
-        )
+        axis_2d = gi_2d_axis_label(intent.gi.mode_2d, args_2d)
     else:
         axis_1d = label_for_value(
             STANDARD_1D_AXES,

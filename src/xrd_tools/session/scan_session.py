@@ -83,6 +83,7 @@ from xrd_tools.reduction.core import (
     _cancel_requested,
     _request_cancel,
     _worker_process_requires_corrected_image,
+    companion_modes_2d,
 )
 from .dynamic_accounting import (
     DynamicAttemptState,
@@ -147,8 +148,10 @@ class _StageBoundaryFacade:
 
 @dataclass(frozen=True, slots=True)
 class FrameEvent:
-    """One frame finished reducing (ADR-0003: single-result + the mode it was
-    computed under).  Immutable; built from the engine's ``FrameReduction``."""
+    """One frame finished reducing (ADR-0003: one primary result per dimension
+    + the mode it was computed under, plus any DECLARED companion 2-D results
+    computed from the same conditioned frame).  Immutable; built from the
+    engine's ``FrameReduction``."""
 
     frame_index: int
     mode_key: Any                      # GI (mode_1d, mode_2d) value tuple, or None
@@ -157,6 +160,8 @@ class FrameEvent:
     metadata: Mapping[str, Any]
     generation: int                    # caller-owned stale-render stamp (ADR-0004 §2)
     timestamp: float                   # wall-clock completion (time.time())
+    #: Declared companion 2-D results by mode key; ``None`` for a one-mode run.
+    extra_results_2d: Mapping[str, IntegrationResult2D] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +297,7 @@ def _required_modes_from_plan(plan: ReductionPlan, mode_key: Any) -> tuple[Resul
         modes.append(ResultMode.one_d(mode_1d))
     if getattr(plan, "integration_2d", None) is not None:
         modes.append(ResultMode.two_d(mode_2d))
+        modes.extend(ResultMode.two_d(mode) for mode in companion_modes_2d(plan))
     return tuple(modes)
 
 
@@ -327,6 +333,15 @@ def _executor_request(executor, executor_workers) -> tuple[int | None, bool]:
 
 def required_result_modes(plan: ReductionPlan) -> tuple[ResultMode, ...]:
     return _required_modes_from_plan(plan, _mode_key_from_plan(plan))
+
+
+def _frozen_extra_results(reduction):
+    extras = getattr(reduction, "extra_results_2d", None)
+    if not extras:
+        return None
+    return MappingProxyType({
+        str(key): _freeze_result_arrays(result) for key, result in extras.items()
+    })
 
 
 def _freeze_result_arrays(result):
@@ -2124,6 +2139,7 @@ class ScanSession:
                 produced.append(ResultMode.one_d(mode_1d))
             if receipt.produced_2d:
                 produced.append(ResultMode.two_d(mode_2d))
+            produced.extend(map(ResultMode.two_d, receipt.produced_extra_2d))
         label = int(receipt.frame_index)
         with self._projection_lock:
             affected = tuple(produced) or tuple(
@@ -2160,6 +2176,7 @@ class ScanSession:
             modes.append(ResultMode.one_d(mode_1d))
         if receipt.produced_2d:
             modes.append(ResultMode.two_d(mode_2d))
+        modes.extend(map(ResultMode.two_d, receipt.produced_extra_2d))
         return tuple(modes)
 
     def _on_dynamic_outcome(self, receipt: FrameOutcomeReceipt) -> None:
@@ -2204,6 +2221,9 @@ class ScanSession:
             modes.append(ResultMode.one_d(mode_1d))
         if getattr(reduction, "result_2d", None) is not None:
             modes.append(ResultMode.two_d(mode_2d))
+        modes.extend(map(
+            ResultMode.two_d, getattr(reduction, "extra_results_2d", None) or (),
+        ))
         dynamic.record_written(token, modes=modes)
 
     def _on_dynamic_nexus_batch_settled(self, count: int) -> None:
@@ -2300,6 +2320,7 @@ class ScanSession:
             modes.append(ResultMode.one_d(mode_1d))
         if event.result_2d is not None:
             modes.append(ResultMode.two_d(mode_2d))
+        modes.extend(map(ResultMode.two_d, event.extra_results_2d or ()))
         try:
             self._accounting.record_written(event.frame_index, modes)
         except Exception:
@@ -2324,6 +2345,7 @@ class ScanSession:
             metadata=MappingProxyType(dict(getattr(reduction, "metadata", {}) or {})),
             generation=generation,
             timestamp=time.time(),
+            extra_results_2d=_frozen_extra_results(reduction),
         )
         if self._dynamic_accounting is None:
             self._record_written(event)
@@ -2375,10 +2397,8 @@ class ScanSession:
             return
         mode_1d, mode_2d = _dimension_modes(event.mode_key)
         try:
-            view = FrameView.from_results(
+            facts = dict(
                 label=event.frame_index,
-                result_1d=event.result_1d,
-                result_2d=event.result_2d,
                 metadata_raw=event.metadata,
                 metadata_numeric=getattr(frame, "metadata_numeric", None),
                 incident_angle=getattr(getattr(frame, "geometry", None), "incident_angle", None),
@@ -2389,7 +2409,17 @@ class ScanSession:
                 extra={"detector_shape": tuple(np.asarray(frame.image).shape)}
                 if frame.image is not None and np.asarray(frame.image).ndim == 2 and all(np.asarray(frame.image).shape) else {},
             )
+            view = FrameView.from_results(
+                result_1d=event.result_1d, result_2d=event.result_2d, **facts,
+            )
             record = FrameRecord.from_view(view, mode_1d=mode_1d, mode_2d=mode_2d)
+            for key, extra in (event.extra_results_2d or {}).items():
+                # A companion joins the SAME record under its own mode key; the
+                # primary stays the active mode (ADR-0003: records are the union).
+                record = record.with_result_2d(
+                    key, FrameView.from_results(result_2d=extra, **facts),
+                    make_active=False,
+                )
         except Exception:
             logger.exception("ScanSession record_store view build failed")
             raise
@@ -2406,7 +2436,11 @@ class ScanSession:
                         self._accounting.current_revision(label, mode)
                         for mode in self._accounting.required_modes
                         if ((mode.kind == "1d" and event.result_1d is not None)
-                            or (mode.kind == "2d" and event.result_2d is not None))
+                            or (mode.kind == "2d" and (
+                                event.result_2d is not None
+                                if mode.key == mode_2d
+                                else mode.key in (event.extra_results_2d or ())
+                            )))
                     }
                     self._record_store._bind_checkpoint_revisions(
                         label, expected=stored, revisions=revisions,

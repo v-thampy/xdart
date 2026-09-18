@@ -29,7 +29,9 @@ from .browse_1d_hydration import (
     Browse1DModeInventory,
 )
 from .browse_values import canonical_browse_source_identity
-from .display_values import DisplayFrameKey, StandardDisplayPayload
+from .display_values import (
+    DisplayFrameKey, StandardDisplayPayload, companion_views_2d,
+)
 from .shell_values import FrameNavigationProjection
 
 
@@ -595,6 +597,14 @@ def _payload(
         gi_mode_1d=(scalar_row.active_mode_1d or "") if gi else "",
         gi_mode_2d=(scalar_row.active_mode_2d or "") if gi else "",
         averaged=scalar_row.averaged,
+        # The current frame's other direct maps ride with its heavy view; the
+        # publication was ownership-checked by ``_current_heavy`` just above.
+        extra_views_2d=(
+            companion_views_2d(
+                scope.context.publication_store.get(frame.local_frame_label).record
+            )
+            if gi and heavy is not None else {}
+        ),
     )
 
 

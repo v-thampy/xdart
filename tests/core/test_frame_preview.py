@@ -1177,6 +1177,9 @@ def test_preview_value_fields_and_scientific_import_boundary_are_exact():
         "mode_2d",
         "detector_fallback_used",
         "detector_diagnostic",
+        # GI-COMPANION-20260918: the frame's other DIRECT 2-D maps, so a reloaded
+        # two-map result shows either one without recomputation.
+        "extra_views_2d",
     )
     assert api.FramePreview.__annotations__ == {
         "read_key": "HydrationReadKey",
@@ -1191,6 +1194,7 @@ def test_preview_value_fields_and_scientific_import_boundary_are_exact():
         "mode_2d": "str",
         "detector_fallback_used": "bool",
         "detector_diagnostic": "str | None",
+        "extra_views_2d": "Mapping[str, FrameView]",
     }
     source = Path(api.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)

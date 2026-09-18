@@ -267,8 +267,16 @@ using pyFAI's `FiberIntegrator`:
    controls. Use Advanced settings for sample orientation when needed.
 3. The integrator panel switches to GI-specific modes:
    - **1D modes**: Qip (in-plane), Qoop (out-of-plane), Q-total.
-   - **2D modes**: Qip-Qoop, Q-χ.
+   - **2D modes**: Qip-Qoop, Q-χ, Q-χ + Qip-Qoop, Exit. Q-χ + Qip-Qoop
+     integrates and stores both maps directly (the 2-D step takes about twice
+     as long). With Qip-Qoop alone, the 2-D display can still show
+     **Q-χ (derived)**, re-binned from the saved cake on demand: approximate,
+     without uncertainties, never written to the file, and not a substitute for
+     the direct map in quantitative χ or texture work.
 4. Process as normal; output reflects the rotated reciprocal-space axes.
+   Automatically named GI results carry `_gi` (`sample_gi_int2d.nexus`).
+5. The 2-D display's axis selector lists the maps a frame actually has. With a
+   Q-χ map shown, the 1-D plot offers I–Q and I–χ cuts from it.
 
 #### Advanced integration settings
 

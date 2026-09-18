@@ -72,6 +72,7 @@ from .display_values import (
     StandardDisplayPayload,
     StandardEventKind,
     StandardRunEvent,
+    companion_views_2d,
 )
 from .display_catalog import CATALOG_MAX_ITEMS, DisplayCatalogIndex
 from .display_residency import (
@@ -1048,6 +1049,7 @@ class RunDisplayState:
             gi_mode_1d=owner.gi_mode_1d,
             gi_mode_2d=owner.gi_mode_2d,
             wavelength_m=owner.wavelength_m,
+            extra_views_2d=companion_views_2d(publication.record),
         )
 
     def stamp_saturation_ceiling(
@@ -1332,7 +1334,8 @@ class RunDisplayState:
                 detector_outcome = (
                     DetectorHydrationOutcome.DETECTOR_UNAVAILABLE
                 )
-        record = FrameRecord.from_view(
+        # A rehydrated frame keeps every direct map the file holds.
+        record = preview.record(
             view,
             mode_1d=art.gi_mode_1d or DEFAULT_MODE_KEY,
             mode_2d=art.gi_mode_2d or DEFAULT_MODE_KEY,
@@ -1440,11 +1443,7 @@ class RunDisplayState:
         # A sparse Browse store is empty on first hydration.  The reader's
         # selected persisted modes travel with the exact preview, independent
         # of whether this frame has an earlier publication.
-        record = FrameRecord.from_view(
-            view,
-            mode_1d=preview.mode_1d,
-            mode_2d=preview.mode_2d,
-        )
+        record = preview.record(view)
         source_identity = canonical_browse_source_identity(
             view,
             prepared.request.read_key.artifact_identity,
