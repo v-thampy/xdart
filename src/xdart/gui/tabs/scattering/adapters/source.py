@@ -590,6 +590,7 @@ class FilesystemSourceAdapter:
             return self._unavailable(request, "Source metadata is unavailable.", path.name)
         frame_count = None
         default_threshold_max = None
+        gi_motor_choices = None
         if source.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
             # An explicitly selected container is one bounded observation, so
             # its known frame count is useful readiness truth.  Directory
@@ -607,6 +608,7 @@ class FilesystemSourceAdapter:
                 ):
                     frame_count = int(descriptor.frame_count)
                     default_threshold_max = self._threshold_max_for_dtype(descriptor.dtype)
+                    gi_motor_choices = descriptor.motor_names
             except Exception:
                 frame_count = None
         return SourceObservation(
@@ -615,6 +617,7 @@ class FilesystemSourceAdapter:
             state.size, state.mtime_ns, frame_count,
             candidate_fingerprint=self._fingerprint((state,)),
             default_threshold_max=default_threshold_max,
+            gi_motor_choices=gi_motor_choices,
         )
 
     def _observe_directory(self, request: SourceObservationRequest) -> SourceObservation:

@@ -3806,6 +3806,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if result is None:
             return False
         if type(result) is AdmissionFailure:
+            _LOG.warning("Output admission failed: %s", result.reason)
             released = self._release_admission(token)
             self._render_start_outcome(
                 pipeline.refuse(
@@ -3817,6 +3818,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._notice("Output cleanup remains pending.")
             elif result.append_refused:
                 self._confirm_append_overwrite(result)
+            else:
+                dialog = QtWidgets.QMessageBox(
+                    QtWidgets.QMessageBox.Icon.Warning,
+                    "Run not started", "Run not started",
+                    QtWidgets.QMessageBox.StandardButton.Ok, self,
+                )
+                dialog.setInformativeText(result.reason)
+                dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+                dialog.open()
             return True
         if type(result) is not AdmissionReceipt:
             self._release_admission(token)

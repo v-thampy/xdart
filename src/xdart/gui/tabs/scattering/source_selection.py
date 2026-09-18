@@ -529,10 +529,14 @@ class SourceSelectionOwner:
             and observation.source == intent.source_spec
             else None
         )
+        if not permitted or choices is None:
+            return None
+        if not choices:
+            # A known motorless source cannot retain a previous source's motor.
+            # Preserve the stored angle; the Manual field makes it editable.
+            return "Manual" if intent.gi.incidence_motor != "Manual" else None
         if (
-            not permitted
-            or not choices
-            or intent.gi.incidence_motor != "Manual"
+            intent.gi.incidence_motor != "Manual"
             or (
                 self._deliberate_manual_source is not _NO_DELIBERATE_MANUAL
                 and self._deliberate_manual_source == intent.source_spec
