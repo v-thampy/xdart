@@ -71,14 +71,14 @@ def test_catalog_registers_current_workspace_first_and_as_default():
         STITCH_TOOL.category,
         STITCH_TOOL.order,
         STITCH_TOOL.tool_kind,
-    ) == ("Stitching", "analysis", 100, "analysis")
+    ) == ("Stitching", "analysis", 100, "processing")
     assert RSM_TOOL.key == RSM_TOOL_KEY == "rsm"
     assert (
         RSM_TOOL.label,
         RSM_TOOL.category,
         RSM_TOOL.order,
         RSM_TOOL.tool_kind,
-    ) == ("Reciprocal Space Map", "analysis", 110, "analysis")
+    ) == ("Reciprocal Space Map", "analysis", 110, "processing")
 
 
 def test_scattering_descriptor_declares_the_frozen_adoption_ports():
@@ -143,10 +143,7 @@ def test_builtin_stitch_action_constructs_one_idle_tool_only_when_opened(
     window = _mounted_host(None)
     try:
         assert STITCH_TOOL.key not in window._tool_handles
-        assert [action.text() for action in window.ui.menuAnalysis.actions()] == [
-            "Stitching",
-            "Reciprocal Space Map",
-        ]
+        assert window.ui.menuAnalysis is None
         page = window.page_handle.widget
         assert page.findChild(QtWidgets.QToolButton, "analysisMenuButton") is None
         combo = page._shell.run_controls.modeCombo
@@ -192,13 +189,7 @@ def test_builtin_rsm_action_constructs_one_idle_tool_only_when_opened(
         page_widget = window.main_widget
         selected_page_key = window.selected_page_key
         assert RSM_TOOL.key not in window._tool_handles
-        assert [action.text() for action in window.ui.menuAnalysis.actions()] == [
-            "Stitching",
-            "Reciprocal Space Map",
-        ]
-        assert window.ui.menuAnalysis.actions()[1].objectName() == (
-            "actionAnalysisTool_rsm"
-        )
+        assert window.ui.menuAnalysis is None
         page = window.page_handle.widget
         page._shell.run_controls.modeCombo.setCurrentText("RSM")
         assert page._shell.run_controls.startButton.isEnabled()

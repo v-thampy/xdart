@@ -54,6 +54,7 @@ SCATTERING_WORKSPACE_PAGE = PageDescriptor(
 
 BUILTIN_PAGES = (SCATTERING_WORKSPACE_PAGE,)
 
+# Processing tools are launched through the workspace mode selector and Run.
 STITCH_TOOL = ToolDescriptor(
     key=STITCH_TOOL_KEY,
     label="Stitching",
@@ -62,7 +63,7 @@ STITCH_TOOL = ToolDescriptor(
     category="analysis",
     order=100,
     build=_build_stitch_tool,
-    tool_kind="analysis",
+    tool_kind="processing",
 )
 
 RSM_TOOL = ToolDescriptor(
@@ -73,7 +74,7 @@ RSM_TOOL = ToolDescriptor(
     category="analysis",
     order=110,
     build=_build_rsm_tool,
-    tool_kind="analysis",
+    tool_kind="processing",
 )
 
 BUILTIN_DESCRIPTORS = (*BUILTIN_PAGES, STITCH_TOOL, RSM_TOOL)
