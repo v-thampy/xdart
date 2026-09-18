@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
+import h5py
 import pytest
 from pyqtgraph.Qt import QtWidgets
 
@@ -37,7 +37,7 @@ from xrd_tools.session.readiness import (
 )
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.core.scan import SourceKind, SourceSpec
-from xrd_tools.sources.probe import ProbeState
+import xrd_tools.sources.registry  # noqa: F401  # register built-in readers
 from xrd_tools.sources.selection import (
     DirectorySourceSpec,
     image_series_spec,
@@ -197,28 +197,30 @@ def test_explicit_single_image_is_not_reclassified_from_member_count(
 )
 def test_container_directory_counts_files_while_explicit_series_counts_frames(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     suffix: str,
     kind: SourceKind,
 ) -> None:
-    path = tmp_path / f"scan_master{suffix}"
-    path.write_bytes(b"container")
-
-    class _Owner:
-        @staticmethod
-        def probe(candidate: Path) -> object:
-            assert candidate == path
-            return SimpleNamespace(
-                state=ProbeState.READY,
-                descriptor=SimpleNamespace(frame_count=651, dtype="uint32"),
+    directory_path = tmp_path / "raw"
+    directory_path.mkdir()
+    path = directory_path / f"scan_master{suffix}"
+    with h5py.File(path, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        if kind is SourceKind.EIGER_MASTER:
+            member = tmp_path / "scan_data_000001.h5"
+            with h5py.File(member, "w") as segment:
+                segment.create_dataset("entry/data/data", shape=(651, 2, 3), dtype="uint32")
+            data = entry.create_group("data")
+            data.attrs["NX_class"] = "NXdata"
+            data["data_000001"] = h5py.ExternalLink(str(member), "/entry/data/data")
+        else:
+            entry.create_dataset(
+                "instrument/detector/data", shape=(651, 2, 3), dtype="uint32",
             )
 
-    monkeypatch.setattr(
-        source_adapter_module, "candidate_owner", lambda candidate: _Owner()
-    )
     adapter = FilesystemSourceAdapter()
     directory = DirectorySourceSpec(
-        tmp_path,
+        directory_path,
         recursive=False,
         suffixes=(suffix,),
     )
@@ -239,6 +241,7 @@ def test_container_directory_counts_files_while_explicit_series_counts_frames(
         "observed; content is qualified just in time.",
     )
     assert series_observed.direct_child_count == 651
+    assert series_observed.gi_motor_choices == ()
     assert source_header_projection(series_observed).text == (
         "651 frames · Image Series"
     )
