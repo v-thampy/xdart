@@ -484,11 +484,18 @@ def build_scattering_workspace(
     persist_session = intents is None
     if intents is None:
         from xdart.utils.session import load_session
+        from xrd_tools.core.staging import reduction_worker_cap
         from xrd_tools.session.run_intent_profile import load_run_intent_profile
 
+        # A run honours Cores as the user's deliberate request, which the
+        # small-RAM worker cap never trims.  This value is one nobody chose, so
+        # it takes the cap's own default (two workers below 16 GiB); a Cores
+        # edit or a restored session still wins.  One core stays with the GUI.
         intent = RunIntent(
             output_mode="Overwrite",
-            max_cores=min(max(1, (os.cpu_count() or 1) - 1), 4),
+            max_cores=min(
+                max(1, (os.cpu_count() or 1) - 1), reduction_worker_cap(None),
+            ),
         )
         try:
             profile = load_session().get(_SESSION_PROFILE_KEY)

@@ -731,6 +731,50 @@ def test_fresh_application_does_not_restore_or_overwrite_config(
     assert session.read_bytes() == before
 
 
+@pytest.mark.parametrize("total_gib, expected", ((8, 2), (15, 2), (16, 4), (64, 4)))
+def test_default_cores_follow_the_small_ram_worker_cap(
+        qapp, isolated_settings, monkeypatch, total_gib, expected):
+    """The Cores a user never chose must not bypass the small-RAM default.
+
+    The run treats Cores as a deliberate request, which the cap never trims;
+    so the value this factory invents has to be shaped by the cap itself.
+    """
+    from xrd_tools.core import staging
+
+    monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
+    monkeypatch.delenv(staging.REDUCTION_WORKERS_ENV, raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(
+        staging, "total_physical_ram_bytes", lambda: total_gib * 1024 ** 3)
+    handle = _build_mounted_workspace(None, SimpleNamespaceStatus())
+    try:
+        intent = handle.widget._intents.snapshot().thaw()
+        assert intent.max_cores == expected
+        # What the run will resolve from that Cores value, on the same host.
+        assert staging.reduction_worker_cap(intent.max_cores) == expected
+    finally:
+        assert handle.close().status is PageCleanup.CLEAN
+        handle.widget.deleteLater()
+        qapp.processEvents()
+
+
+def test_default_cores_still_leave_one_core_for_the_interface(
+        qapp, isolated_settings, monkeypatch):
+    from xrd_tools.core import staging
+
+    monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
+    monkeypatch.delenv(staging.REDUCTION_WORKERS_ENV, raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    monkeypatch.setattr(staging, "total_physical_ram_bytes", lambda: 64 * 1024 ** 3)
+    handle = _build_mounted_workspace(None, SimpleNamespaceStatus())
+    try:
+        assert handle.widget._intents.snapshot().thaw().max_cores == 3
+    finally:
+        assert handle.close().status is PageCleanup.CLEAN
+        handle.widget.deleteLater()
+        qapp.processEvents()
+
+
 def test_injected_intent_store_does_not_load_or_overwrite_app_session(
         qapp, isolated_settings, tmp_path, monkeypatch):
     from xdart.utils.session import save_session
