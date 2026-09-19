@@ -451,8 +451,10 @@ observed and expected identity tuples so the changed field can be read off.
 
 <a id="pixi-notebook-kernel"></a>
 
-**Using Jupyter or VS Code?** Select **Python (xdart Pixi)** and **Run All**,
-including for notebooks exported by **Analyze Results**. See
+**Using Jupyter or VS Code?** Select **Python (xdart Pixi)** for an editable
+workspace or **Python (xdart)** after `xdart-notebook --register-kernel` with a
+Pixi global installation, then **Run All**, including for notebooks exported by
+**Analyze Results**. See
 [notebook setup and troubleshooting](docs/INSTALLATION.md#jupyter-and-vs-code-kernel-setup)
 for one-time registration, missing kernels, and interactive widgets.
 
