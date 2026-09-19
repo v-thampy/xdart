@@ -75,6 +75,8 @@ requirements:
     - h5py
     - hdf5plugin
     - nexusformat
+    # nexusformat 2.0.3 requires this, but its conda-forge recipe omits it.
+    - chardet
     - fabio
     - silx
     - pyfai >=2026.5,<2026.6     # conda-forge lowercase; audited 2026.5 line

@@ -1119,9 +1119,16 @@ def test_mounted_chooser_cancel_does_not_mutate_or_emit_error(
         qapp.processEvents()
 
 
+@pytest.mark.parametrize("total_gib, expected_cores", ((8, 2), (64, 3)))
 def test_default_fallback_seeds_an_admittable_overwrite_intent(
-        qapp, isolated_settings):
+        qapp, isolated_settings, monkeypatch, total_gib, expected_cores):
     from xdart.gui.pages.services import empty_host_services
+    from xrd_tools.core import staging
+
+    monkeypatch.delenv(staging.REDUCTION_WORKERS_ENV, raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    monkeypatch.setattr(
+        staging, "total_physical_ram_bytes", lambda: total_gib * 1024 ** 3)
 
     services = empty_host_services(SimpleNamespaceStatus()).for_page(
         SCATTERING_WORKSPACE_PAGE.key)
@@ -1129,9 +1136,7 @@ def test_default_fallback_seeds_an_admittable_overwrite_intent(
     try:
         intent = handle.widget._intents.snapshot().thaw()
         assert intent.output_mode == "Overwrite"
-        assert intent.max_cores == min(
-            max(1, (os.cpu_count() or 1) - 1), 4,
-        )
+        assert intent.max_cores == expected_cores
     finally:
         assert handle.close().status is PageCleanup.CLEAN
         handle.widget.deleteLater()
