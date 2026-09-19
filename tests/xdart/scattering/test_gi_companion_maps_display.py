@@ -179,6 +179,60 @@ def test_i_chi_is_available_from_the_derived_map():
     assert np.isfinite(trace.intensity).any()
 
 
+def test_derived_chi_display_bounds_follow_measured_rows_and_preserve_zoom():
+    state, navigation, payload = _state(image_axis=DERIVED_Q_CHI, plot_axis="chi_gi")
+    cake = state.heavy.cake.copy()
+    trace = state.traces[0]
+    chi = trace.axis.values.copy()
+    intensity = trace.intensity.copy()
+    # The rectangular source grid straddles the origin; the measured angular
+    # support is only half of that full-circle derived grid.
+    assert chi[0] < -170 and chi[-1] > 170
+    finite = np.flatnonzero(np.isfinite(intensity))
+    assert chi[finite[0]] > -100 and chi[finite[-1]] < 100
+    view = _reconciled(state, navigation)
+    try:
+        low, high = view.cake.canvas.imageViewBox.viewRange()[1]
+        assert -100 < low <= chi[finite[0]]
+        assert chi[finite[-1]] <= high < 100
+        (item,) = view.curve.listDataItems()
+        assert item.dataBounds(0) == pytest.approx((chi[finite[0]], chi[finite[-1]]))
+        view.cake.canvas.imageViewBox.setYRange(-30, 40, padding=0)
+        view.curve.setXRange(-20, 30, padding=0)
+        view.reconcile(state, navigation, completed=1, total=1, detail="Ready")
+        assert view.cake.canvas.imageViewBox.viewRange()[1] == pytest.approx((-30, 40))
+        assert view.curve.viewRange()[0] == pytest.approx((-20, 30))
+        np.testing.assert_array_equal(state.heavy.cake, cake)
+        np.testing.assert_array_equal(trace.axis.values, chi)
+        np.testing.assert_array_equal(trace.intensity, intensity)
+        assert payload.view.intensity_2d.shape == (QOOP.size, QIP.size)
+    finally:
+        view.close()
+
+
+@pytest.mark.parametrize("measured", (True, False))
+def test_derived_chi_bounds_keep_real_full_circle_coverage_and_handle_empty(measured):
+    state, navigation, _ = _state(image_axis=DERIVED_Q_CHI, plot_axis="chi_gi")
+    fill = 7.0 if measured else np.nan
+    state = replace(
+        state,
+        heavy=replace(state.heavy, cake=np.full_like(state.heavy.cake, fill)),
+        traces=(replace(state.traces[0], intensity=np.full_like(state.traces[0].intensity, fill)),),
+    )
+    view = _reconciled(state, navigation)
+    try:
+        low, high = view.cake.canvas.imageViewBox.viewRange()[1]
+        assert low < -170 and high > 170
+        (item,) = view.curve.listDataItems()
+        if measured:
+            assert item.dataBounds(0)[0] < -170
+            assert item.dataBounds(0)[1] > 170
+        else:
+            assert item.xData is None or item.xData.size == 0
+    finally:
+        view.close()
+
+
 def test_a_frame_with_a_direct_q_chi_offers_it_and_never_a_derived_one():
     state, navigation, payload = _state(image_axis="q_chi", plot_axis="chi_gi", direct=True)
 

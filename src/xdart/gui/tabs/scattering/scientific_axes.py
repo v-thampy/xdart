@@ -182,6 +182,31 @@ def native_1d_plot_axis(value: object) -> str | None:
     return _PLOT_AXIS_CHOICES.get(canonical_axis_key(value))
 
 
+def resolve_gi_display_axes(
+    primary: str, modes: tuple[str, ...], native_axis: str | None,
+    image_axis: str, plot_axis: str, *, allow_cake: bool = True,
+    chi_axis: str = "chi_gi",
+) -> tuple[str, str]:
+    """Resolve map and trace together before selecting a display read lane."""
+    maps = (primary, *modes)
+    if primary == "qip_qoop" and "q_chi" not in maps:
+        maps += (DERIVED_Q_CHI,)
+    image_axis = image_axis if image_axis in maps else primary
+    axes = (() if native_axis is None else (native_axis,))
+    if native_axis in {"Q", "2theta"}:
+        axes = (native_axis, "Q", "2theta")
+    if allow_cake:
+        axes += {
+            "qip_qoop": ("q_ip", "q_oop"),
+            "q_chi": ("Q", chi_axis),
+            DERIVED_Q_CHI: ("Q", "chi_gi"),
+            "exit_angles": ("exit_angle",),
+        }.get(image_axis, ())
+    if axes and plot_axis not in axes:
+        plot_axis = axes[0]
+    return image_axis, plot_axis
+
+
 def payload_is_qualified(
     payload: object,
     navigation: FrameNavigationProjection,

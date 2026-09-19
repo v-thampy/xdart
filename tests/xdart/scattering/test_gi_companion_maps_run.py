@@ -206,3 +206,33 @@ def test_browse_gi_cake_axes_use_the_shown_map_for_every_selected_frame(
             np.testing.assert_array_equal(trace.intensity, native.intensity_1d)
     finally:
         _close(page)
+
+
+@pytest.mark.parametrize("transition", ("dual_run", "primary_map"))
+def test_new_map_replaces_an_unavailable_chi_display_with_native_q(tmp_path, transition):
+    page, artifact = _page(tmp_path, "Qip-Qoop")
+    try:
+        _run(page)
+        pane = page._shell.scientific
+        _wait(page, lambda: pane.image_axis.findData(DERIVED_Q_CHI) >= 0)
+        pane.image_axis.setCurrentIndex(pane.image_axis.findData(DERIVED_Q_CHI))
+        _wait(page, lambda: pane.plot_axis.findData("chi_gi") >= 0)
+        pane.plot_axis.setCurrentIndex(pane.plot_axis.findData("chi_gi"))
+        _wait(page, lambda: bool(page._last_scientific_projection.traces)
+              and page._last_scientific_projection.traces[0].axis.unit == "chigi_deg")
+        if transition == "dual_run":
+            page._on_field_value(INT_2D_AXIS, "Q-χ + Qip-Qoop")
+            _run(page)
+            _wait(page, lambda: pane.image_axis.findData("q_chi") >= 0)
+        else:
+            pane.image_axis.setCurrentIndex(pane.image_axis.findData("qip_qoop"))
+            _wait(page, lambda: pane.rendered_image_axis == "qip_qoop")
+        _wait(page, lambda: bool(page._last_scientific_projection.traces))
+        state = page._last_scientific_projection
+        assert pane.plot_axis.currentData() == state.plot_axis == "Q"
+        assert len(state.traces) == len(pane.curve.listDataItems()) == 1
+        record = read_frame_record(artifact, state.traces[0].frame.local_frame_label)
+        np.testing.assert_array_equal(state.traces[0].intensity, record.view_1d().intensity_1d)
+        assert state.traces[0].axis.unit == "q_A^-1"
+    finally:
+        _close(page)

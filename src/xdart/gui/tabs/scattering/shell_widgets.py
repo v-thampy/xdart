@@ -237,13 +237,14 @@ class ScientificImagePane(QtWidgets.QWidget):
         detector_shape: tuple[int, int] | None,
         color_map: str,
         log_scale: bool,
+        autorange_finite_y: bool = False,
     ) -> tuple[object, ...]:
         source = np.asarray(data)
         return (
             id(source), source.shape, source.dtype.str,
             ScientificImagePane._axis_render_contract(x_axis),
             ScientificImagePane._axis_render_contract(y_axis),
-            detector_shape, color_map, bool(log_scale),
+            detector_shape, color_map, bool(log_scale), autorange_finite_y,
         )
 
     @staticmethod
@@ -286,6 +287,7 @@ class ScientificImagePane(QtWidgets.QWidget):
         detector_shape: tuple[int, int] | None = None,
         color_map: str = "viridis",
         log_scale: bool = False,
+        autorange_finite_y: bool = False,
     ) -> bool:
         source = np.asarray(data)
         axes = tuple(
@@ -302,6 +304,7 @@ class ScientificImagePane(QtWidgets.QWidget):
             detector_shape=detector_shape,
             color_map=color_map,
             log_scale=log_scale,
+            autorange_finite_y=autorange_finite_y,
         )
 
     def render(
@@ -315,6 +318,7 @@ class ScientificImagePane(QtWidgets.QWidget):
         log_scale: bool = False,
         level_scan_token: object | None = None,
         view_range: QtCore.QRectF | None = None,
+        autorange_finite_y: bool = False,
     ) -> None:
         source = np.asarray(data)
         render_contract = ScientificImagePane._image_render_contract(
@@ -324,13 +328,14 @@ class ScientificImagePane(QtWidgets.QWidget):
             detector_shape=detector_shape,
             color_map=color_map,
             log_scale=log_scale,
+            autorange_finite_y=autorange_finite_y,
         )
         geometry_contract = ScientificImagePane._image_geometry_contract(
             source,
             x_axis=x_axis,
             y_axis=y_axis,
             detector_shape=detector_shape,
-        )
+        ) + (autorange_finite_y,)
         axis_presentation = ScientificImagePane._axis_presentation_key(
             x_axis, y_axis,
         )
@@ -392,8 +397,14 @@ class ScientificImagePane(QtWidgets.QWidget):
             or prior_geometry != geometry_contract
             or prior_axis_presentation != axis_presentation
         ):
+            initial_range = rect
+            if autorange_finite_y and y_axis is not None:
+                rows = np.flatnonzero(np.isfinite(source).any(axis=1))
+                if rows.size:
+                    low, high = axis_extent(y_axis.values[rows[[0, -1]]])
+                    initial_range = QtCore.QRectF(x0, low, x1 - x0, high - low)
             self.canvas.imageViewBox.setRange(
-                rect if view_range is None else view_range, padding=0.0,
+                initial_range if view_range is None else view_range, padding=0.0,
             )
         if (
             x_axis is not None and y_axis is not None

@@ -1068,6 +1068,7 @@ class ScientificView(QtWidgets.QFrame):
                         y_axis=state.heavy.cake_y,
                         color_map=color_map,
                         log_scale=state.log_scale,
+                        autorange_finite_y=state.derived_2d,
                         level_scan_token=(
                             id(state.heavy.frame),
                             id(state.heavy.cake),
@@ -2238,6 +2239,14 @@ class ScientificView(QtWidgets.QFrame):
             )
             if data_changed:
                 self._reflow_follows = 0
+                plot_x, plot_y = trace.axis.values, trace.intensity
+                if self._axis_key(trace.axis) == "chigi_deg":
+                    # NaN intensity at finite chi still expands pyqtgraph's X
+                    # bounds. Trim only empty ends of the plotted view; keep
+                    # interior gaps and the scientific projection unchanged.
+                    valid = np.flatnonzero(np.isfinite(plot_x) & np.isfinite(plot_y))
+                    measured = slice(valid[0], valid[-1] + 1) if valid.size else slice(0, 0)
+                    plot_x, plot_y = plot_x[measured], plot_y[measured]
             if item is None:
                 pen = pg.mkPen(
                     color=style_contract,
@@ -2245,9 +2254,9 @@ class ScientificView(QtWidgets.QFrame):
                     style=QtCore.Qt.PenStyle.SolidLine,
                 )
                 item = self.curve.plot(
-                    trace.axis.values,
+                    plot_x,
                     _offset_intensity(
-                        trace.intensity,
+                        plot_y,
                         index,
                         overlay_step,
                     ),
@@ -2263,9 +2272,9 @@ class ScientificView(QtWidgets.QFrame):
             else:
                 if data_changed:
                     item.setData(
-                        trace.axis.values,
+                        plot_x,
                         _offset_intensity(
-                            trace.intensity,
+                            plot_y,
                             index,
                             overlay_step,
                         ),
@@ -2657,6 +2666,11 @@ class ScientificView(QtWidgets.QFrame):
             else self._axis_key(state.traces[0].axis)
         )
         plot_choices = self._plot_axis_choices(state, native_key)
+        self.plot_axis.setToolTip(
+            "To plot χGI, first select Q-χ or Q-χ (derived) in the 2D display selector."
+            if state.measurement_mode == "GI" and state.gi_mode_2d == "qip_qoop"
+            else "Choose the horizontal axis for the 1D plot."
+        )
         if state.measurement_mode == "GI":
             # The maps this frame actually has, primary first; one map keeps the
             # historical single (disabled) entry.

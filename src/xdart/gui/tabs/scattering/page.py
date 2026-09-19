@@ -25,6 +25,7 @@ from xdart.modules.display_context import (
     Viewer2DContext,
     Viewer2DState,
 )
+from xrd_tools.core import TwoDKind
 from xrd_tools.core.scan import SourceSpec
 from xrd_tools.session.intent_store import (
     IntentCommitAccepted,
@@ -169,6 +170,7 @@ from .shell_projection import (
 )
 from .scientific_axes import (
     native_1d_plot_axis,
+    resolve_gi_display_axes,
     resolve_norm_presentation,
     slice_recipe_axes_compatible,
     slice_region_orientation,
@@ -6209,6 +6211,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     for mode, _label, unit, _log in catalog.axes_1d
                     if mode == row.active_mode_1d
                 ), None)
+                if row.active_mode_2d in {"qip_qoop", "q_chi", "exit_angles"}:
+                    image_axis, requested_plot_axis = resolve_gi_display_axes(
+                        row.active_mode_2d, row.modes_2d, native_axis,
+                        self._preferences.image_axis, requested_plot_axis,
+                        allow_cake=intent.processing_mode != "Int 1D",
+                        chi_axis=("chi" if dict(row.two_d_kinds).get("q_chi")
+                                  is TwoDKind.Q_CHI else "chi_gi"),
+                    )
+                    if self._preferences.share_axis:
+                        requested_plot_axis = (
+                            share_plot_axis_for_image(image_axis) or requested_plot_axis
+                        )
+                    self._preferences = replace(
+                        self._preferences, image_axis=image_axis,
+                        plot_axis=requested_plot_axis,
+                    )
                 cake_axis_requested = requested_plot_axis != native_axis and not (
                     {requested_plot_axis, native_axis} <= {"Q", "2theta"}
                 )
