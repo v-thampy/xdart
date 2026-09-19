@@ -707,7 +707,12 @@ def test_p1b_b02_overwrite_native_durable_terminal(
         durable_labels = settlements[0][1]
         assert durable_labels == tuple(range(129))
         assert _nexus_rows(large_decision.item.target) == tuple(range(129))
-        assert len(tuple((tmp_path / scan.name).glob("*.xye"))) == 129
+        # XYE exports follow the output FAMILY (here the requested filename's
+        # stem), like the NeXus slot, not the raw scan name.
+        family = large_decision.item.artifact_family
+        assert family and family != scan.name
+        assert len(tuple((tmp_path / family).glob("*.xye"))) == 129
+        assert not (tmp_path / scan.name).exists()
         assert len(adapter._graphs) == 1
 
         # The shared supported-lineage check runs before target inspection,
@@ -1015,11 +1020,13 @@ def test_p1b_b03_native_cross_run_append_missing_only(
     assert len(output_adapters) == 1
     assert output_adapters[0].persisted_prefix_labels == ()
     assert _nexus_rows(_written(target)) == (1, 2)
-    xye_directory = tmp_path / "series"
+    # XYE exports follow the output family -- `append`, from the requested
+    # `append.nexus` -- so the same family names the NeXus slot and the exports.
+    xye_directory = tmp_path / "append"
     seeded_xye = tuple(sorted(xye_directory.glob("*.xye")))
     assert [path.name for path in seeded_xye] == [
-        "iq_series_0001.xye",
-        "iq_series_0002.xye",
+        "iq_append_0001.xye",
+        "iq_append_0002.xye",
     ]
 
     def xye_facts(paths):
@@ -1122,9 +1129,9 @@ def test_p1b_b03_native_cross_run_append_missing_only(
     assert len(fully_durable) == 1
     missing_xye = tuple(sorted(xye_directory.glob("*.xye")))
     assert [path.name for path in missing_xye] == [
-        "iq_series_0001.xye",
-        "iq_series_0002.xye",
-        "iq_series_0003.xye",
+        "iq_append_0001.xye",
+        "iq_append_0002.xye",
+        "iq_append_0003.xye",
     ], "B03 missing"
     assert {
         name: xye_facts(missing_xye)[name]

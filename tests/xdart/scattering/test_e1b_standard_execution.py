@@ -107,11 +107,16 @@ def _assert_headless_run_is_durable_and_projectable(
         if event.frame_key is not None
     ] == [1, 2, 3, 4, 5]
     assert output.is_file()
+    # XYE exports follow the output FAMILY -- `standard`, from the requested
+    # `standard.nxs` -- not the raw scan name, which stays the source identity.
     scan_name = frame_events[-1].frame_key.source_scan
-    xye_directory = output.parent / scan_name
+    family = "standard"
+    assert family != scan_name
+    xye_directory = output.parent / family
     assert xye_directory.is_dir()
+    assert not (output.parent / scan_name).exists()
     assert tuple(path.name for path in sorted(xye_directory.iterdir())) == tuple(
-        f"iq_{scan_name}_{frame:04d}.xye"
+        f"iq_{family}_{frame:04d}.xye"
         for frame in range(1, 6)
     )
 
