@@ -1897,6 +1897,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._ensure_timer()
         elif transition.refresh is AuthoredAssetRefreshEffect.DIALOG:
             self._ensure_timer()
+        if transition.mask_set_path is not None:
+            dialog = QtWidgets.QMessageBox(
+                QtWidgets.QMessageBox.Icon.Information, "Mask File updated",
+                "Mask File has been set to the newly saved mask.",
+                QtWidgets.QMessageBox.StandardButton.Ok, self,
+            )
+            dialog.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+            dialog.setInformativeText(transition.mask_set_path)
+            dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            dialog.open()
 
     def _apply_authored_asset_dialog_command(
         self, command: AuthoredAssetDialogCommand,

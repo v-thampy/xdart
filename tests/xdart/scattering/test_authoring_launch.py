@@ -39,7 +39,7 @@ def _windows_permissions(monkeypatch):
 
 @pytest.mark.parametrize("portable", [False, True])
 @pytest.mark.parametrize("source_kind", ["tiff", "hdf"])
-@pytest.mark.parametrize("action", ["save", "close", "failure"])
+@pytest.mark.parametrize("action", ["save", "save_selected", "close", "failure"])
 def test_real_drawmask_child_saves_and_cleans(
     tmp_path, monkeypatch, _xdart_qt_harness, source_kind, portable, action,
 ):
@@ -59,7 +59,7 @@ def automated_exec(app):
             if widget.windowTitle() == "pyFAI drawmask":
                 (Path(__file__).parent / "opened").write_text("mask")
                 action = os.environ["XDART_TEST_MASK_ACTION"]
-                if action == "save":
+                if action in ("save", "save_selected"):
                     widget.saveAndClose()
                 elif action == "close":
                     widget.close()
@@ -111,7 +111,7 @@ qt.QApplication.exec = automated_exec
         slot.close()
     assert (hooks / "opened").read_text() == "mask"
     assert authoring.mask_terminal_result_valid(terminal, request)
-    if action == "save":
+    if action in {"save", "save_selected"}:
         assert terminal.status is OperationTerminalStatus.RETURNED, terminal.diagnostic
         assert terminal.payload.exit_code == 0
         np.testing.assert_array_equal(load_mask(final), np.zeros(pixels.shape, dtype=bool))
@@ -135,16 +135,24 @@ qt.QApplication.exec = automated_exec
         deadline = time.monotonic() + 10
         while page._experiment_operation_busy() and time.monotonic() < deadline:
             assert page._authored_asset_dialog is None
+            assert not page.findChildren(QtWidgets.QMessageBox)
             page._drain_executor()
             QtTest.QTest.qWait(10)
         app.processEvents()
         assert not page._experiment_operation_busy()
         dialogs = page.findChildren(QtWidgets.QMessageBox)
-        assert len(dialogs) == (1 if action == "failure" else 0)
+        assert len(dialogs) == (0 if action == "close" else 1)
         assert page._authored_asset_dialog is None
-        if action == "save":
+        if action in {"save", "save_selected"}:
             assert store.snapshot().thaw().mask_file == request.final_path
-            assert store.revision == before.revision + 1
+            assert store.revision == before.revision + (action == "save")
+            assert dialogs[0].icon() is QtWidgets.QMessageBox.Icon.Information
+            assert dialogs[0].isVisible()
+            assert dialogs[0].text() == "Mask File has been set to the newly saved mask."
+            assert dialogs[0].informativeText() == request.final_path
+            assert dialogs[0].standardButtons() == QtWidgets.QMessageBox.StandardButton.Ok
+            assert not page._consume_authored_asset_update(update)
+            assert len(page.findChildren(QtWidgets.QMessageBox)) == 1
         else:
             assert store.snapshot() == before
         if action == "close":

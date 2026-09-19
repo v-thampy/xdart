@@ -166,12 +166,17 @@ class AuthoredAssetTransition:
     cancel_identity: OperationIdentity | None = None
     adoption: AuthoredAssetAdoption | None = None
     error: bool = False
+    mask_set_path: str | None = None
 
     def __post_init__(self) -> None:
         valid = (
             type(self.refresh) is AuthoredAssetRefreshEffect
             and type(self.notice) is str
             and type(self.error) is bool
+            and (self.mask_set_path is None or (
+                type(self.mask_set_path) is str
+                and os.path.isabs(self.mask_set_path)
+            ))
             and (
                 self.issue is None
                 or type(self.issue) is AuthoredAssetDialogIssue
@@ -221,6 +226,7 @@ class AuthoredAssetTransition:
         if self.refresh is AuthoredAssetRefreshEffect.NONE:
             valid = valid and (
                 self.notice == ""
+                and self.mask_set_path is None
                 and self.issue is None
                 and self.dialog is None
                 and self.cancel_identity is None
@@ -893,7 +899,11 @@ class AuthoredAssetOwner:
                 if isinstance(reduced, EditNoChange)
                 else "The selected authored asset could not be adopted."
             )
-            return self._dismiss(state, dialog, notice)
+            transition = self._dismiss(state, dialog, notice)
+            if state.asset == "mask" and isinstance(reduced, EditNoChange):
+                # The editor saved new contents to the already-selected path.
+                transition = replace(transition, mask_set_path=result.candidate.path)
+            return transition
         if (
             not _context_current(state, current_stamp)
             or not _candidate_current(result.candidate)
@@ -938,7 +948,12 @@ class AuthoredAssetOwner:
                 else "Authored asset adoption was superseded."
             ),
         )
-        return replace(transition, adoption=adoption)
+        return replace(
+            transition, adoption=adoption,
+            mask_set_path=(
+                result.candidate.path if accepted and state.asset == "mask" else None
+            ),
+        )
 
     def _dismiss(
         self,

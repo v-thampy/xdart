@@ -1050,8 +1050,10 @@ def test_saved_mask_is_selected_once_without_confirmation(tmp_path, qapp):
         assert page._authored_assets.phase is AuthoredAssetPhase.IDLE
         assert page._authored_asset_dialog is None
         assert not page._experiment_operation_busy()
+        assert len(page.findChildren(QtWidgets.QMessageBox)) == 1
         assert not page._consume_authored_asset_update(update)
         assert store.revision == before + 1
+        assert len(page.findChildren(QtWidgets.QMessageBox)) == 1
     finally:
         _close(page, qapp)
 
@@ -1130,6 +1132,7 @@ def test_automatic_mask_validation_is_quiet_and_refuses_context_drift(
         _begin_mask_validation(page)
         assert entered.wait(2)
         assert page._authored_asset_dialog is None
+        assert not page.findChildren(QtWidgets.QMessageBox)
         assert store.snapshot().thaw().mask_file == ""
         snapshot = store.snapshot()
         changed = snapshot.thaw()
@@ -1144,6 +1147,7 @@ def test_automatic_mask_validation_is_quiet_and_refuses_context_drift(
         assert Path(result.request.final_path).exists()
         assert page._authored_assets.phase is AuthoredAssetPhase.IDLE
         assert page._authored_asset_dialog is None
+        assert not page.findChildren(QtWidgets.QMessageBox)
     finally:
         release.set()
         _close(page, qapp)
