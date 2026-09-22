@@ -161,6 +161,14 @@ jobs:
           done
           exit 139
 
+      - name: Release preflight with GUI dependencies
+        if: matrix.group == 'scattering-other'
+        env:
+          QT_QPA_PLATFORM: offscreen
+          XDART_SESSION_FILE: ${{ runner.temp }}/xdart-release-preflight-session.json
+          XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-release-preflight-settings.ini
+        run: python scripts/release.py check
+
   # Release-readiness preflight: version pins, the audited pyFAI window, and the
   # schema/byte-compat gate must stay green on every PR.  No --strict-tree, so an
   # uncommitted tree only warns (a clean CI checkout passes the tree check anyway).

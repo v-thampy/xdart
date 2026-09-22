@@ -140,7 +140,7 @@ def check_gui_smoke() -> bool:
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
          "tests/xdart/scattering/test_xye_run_completion.py::"
-         "test_completed_xye_run_opens_terminal_file_and_output_folder[hdf-True-2th_deg-itth]",
+         "test_completed_xye_run_opens_terminal_file_and_output_folder[hdf-True-2th_deg-itth-False]",
          "tests/xdart/scattering/test_xye_run_completion.py::"
          "test_completed_run_selected_artifact_enters_2d_viewer[Int 1D]"],
         cwd=ROOT, env=env,
