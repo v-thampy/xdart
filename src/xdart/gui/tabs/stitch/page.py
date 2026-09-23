@@ -38,6 +38,7 @@ from xdart.gui.widgets.scientific_plot import (
 )
 from xdart.gui.tabs.scattering.scientific_plot_options import PlotOptionsDialog
 from xdart.gui.tabs.scattering.shell_values import ScientificPlotOptions
+from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
 from xrd_tools.analysis.stitch_operation import StitchGeometryKind
@@ -739,10 +740,10 @@ class StitchPage(QtWidgets.QWidget):
                 if preflight.requests and preflight.form.backend == "xu_hist":
                     self._refresh_xu_geometry(calibration=preflight.requests[0].plan.calibration)
                 bounds = []
-                for request in preflight.requests:
-                    for member in request.provenance.get("frame_members", ()):
+                for members in preflight.preview_members:
+                    for member in members:
                         dtype = np.dtype(member["source_snapshot"]["raw_dtype"])
-                        bounds.append(float(np.iinfo(dtype).max) if np.issubdtype(dtype, np.integer) else None)
+                        bounds.append(FilesystemSourceAdapter._threshold_max_for_dtype(dtype))
                 self._auto_threshold_max = bounds[0] if bounds and all(value == bounds[0] for value in bounds) else None
                 if not self._threshold_manual:
                     self._fields["threshold"] = replace(self._fields["threshold"], value=self._auto_threshold_max)
@@ -754,7 +755,7 @@ class StitchPage(QtWidgets.QWidget):
                 for index, request in enumerate(preflight.requests, 1):
                     count = len(request.module.source.selected_labels)
                     lines.append(f"\n{index}. {Path(request.module.output.target).name} · {count} frames")
-                    for member in request.provenance.get("frame_members", ()):
+                    for member in preflight.preview_members[index - 1]:
                         identity = member["identity"]
                         lines.append(f"  {identity['scan_id']}-{identity['frame_index']} · {member['source_path']}")
                 if preflight.skipped:

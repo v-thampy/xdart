@@ -710,6 +710,8 @@ class StitchToolPreflight:
     _claim: InitVar[object] = None
     requests: tuple[StitchOperationRequest, ...] = ()
     skipped: tuple[tuple[str, str, str], ...] = ()
+    # Detached display facts only; the request/provenance remain Run authority.
+    preview_members: tuple[tuple[dict, ...], ...] = ()
 
     def __post_init__(self, _claim: object) -> None:
         if type(self.form) is StitchToolForm and self.form.source_selection is not None:
@@ -717,6 +719,10 @@ class StitchToolPreflight:
                 or any(type(item) is not StitchOperationRequest for item in self.requests)
                 or self.request is not (self.requests[0] if self.requests else None)
                 or self.summary is not None or type(self.skipped) is not tuple
+                or type(self.preview_members) is not tuple
+                or len(self.preview_members) != len(self.requests)
+                or any(type(group) is not tuple or any(type(member) is not dict for member in group)
+                       for group in self.preview_members)
                 or any(type(item) is not tuple or len(item) != 3 or any(type(v) is not str for v in item) for item in self.skipped)):
                 raise TypeError("Native Stitch preflight is invalid")
             targets = tuple(item.module.output.target for item in self.requests)

@@ -132,7 +132,7 @@ def prepare_native_stitch_tool(form, project):
         acquisition = calibration.projection.value["acquisition"]
         motors = tuple(acquisition["source_motors"].values())
         energy_name = acquisition["source_energy_selector"]
-    requests = []
+    requests, preview_members = [], []
     # Metadata is loaded once per exact source. The receipt is reused without
     # changing membership when a scan appears in more than one output group.
     cached = {}
@@ -165,11 +165,29 @@ def prepare_native_stitch_tool(form, project):
                     kind=ModuleKind.STITCH, selected_labels=selected, resolved_selectors=selectors)
             receipt = cached[cache_key]
             receipts.append(receipt)
-        source = receipts[0] if len(receipts) == 1 else ModuleSourceGroupReceipt.from_members(
-            tuple(receipts), kind=ModuleKind.STITCH)
         target = resolve_finite_output_target(output_dir, family, operation_token="stitch-1d")
         output = ModuleOutputRequest(target, AnalysisArtifactKind.STITCH_1D,
                                      form.overwrite, artifact_family=family)
-        requests.append(prepare_stitch_operation(source, output, plan, project_root=project))
+        try:
+            source = receipts[0] if len(receipts) == 1 else ModuleSourceGroupReceipt.from_members(
+                tuple(receipts), kind=ModuleKind.STITCH)
+            request = prepare_stitch_operation(source, output, plan, project_root=project)
+            from xrd_tools.analysis.stitch_native import native_frame_members
+            members = tuple(native_frame_members(request))
+        except (ValueError, TypeError) as error:
+            count = sum(len(receipt.selected_labels) for receipt in receipts)
+            code = getattr(error, "code", "STITCH_PREFLIGHT_REFUSED")
+            reason = str(error)
+            if code == "MANIFEST_BYTE_LIMIT_EXCEEDED":
+                reason = "source manifest exceeds 512 KiB; reduce scans or frames in this output"
+            elif "analysis provenance exceeds the bounded input size" in reason:
+                reason = "provenance exceeds 1 MiB; reduce scans or frames in this output"
+            elif len(receipts) > 256:
+                reason = "a grouped result supports at most 256 source entries"
+            raise StitchToolPreflightRefused(code,
+                f"Output {len(requests) + 1} ({family}), {len(receipts)} sources, {count} frames: {reason}") from error
+        requests.append(request)
+        preview_members.append(members)
     return StitchToolPreflight(form, requests[0], None, _PREFLIGHT_FACTORY,
-                               requests=tuple(requests), skipped=resolution.skipped)
+                               requests=tuple(requests), skipped=resolution.skipped,
+                               preview_members=tuple(preview_members))

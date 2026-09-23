@@ -148,6 +148,8 @@ def test_native_preflight_run_jobs_raw_and_stable_replacement(tmp_path, backend,
     assert len(prepared.requests) == 3
     assert prepared.summary is None and prepared.request is prepared.requests[0]
     assert [len(item.manifest.contributions) for item in prepared.requests] == [2, 2, 4]
+    assert [len(members) for members in prepared.preview_members] == [2, 2, 4]
+    assert [member["identity"]["scan_id"] for member in prepared.preview_members[-1]] == ["1.1", "1.1", "2.1", "2.1"]
     targets = [item.module.output.target for item in prepared.requests]
     assert len(set(targets)) == 3
     assert all(Path(target).name.endswith("_stitch1d.nexus") for target in targets)

@@ -137,6 +137,32 @@ def test_native_source_controls_ranges_and_threshold_semantics(qapp, tmp_path):
         page.shutdown()
 
 
+@pytest.mark.parametrize("dtype", ("int32", "uint32"))
+def test_native_minimum_only_threshold_edit_excludes_native_ceiling(qapp, tmp_path, dtype):
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
+    form = replace(_native_form(tmp_path, "multigeometry", scans="1"), raw_dtype=dtype)
+    for path in Path(form.image_dir).glob("*.raw"):
+        np.fromfile(path, dtype=np.int32).astype(dtype).tofile(path)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(form)
+        page.begin_preview()
+        _wait(page, qapp)
+        assert page._owner.prepared is not None, page.run_bar.readinessLabel.full_text()
+        ceiling = np.iinfo(dtype).max
+        assert page._value("threshold") == ceiling - 1
+        page.set_field("threshold_min", "4")
+        policy = page.build_form().conditioning
+        raw = np.array([[3, 4, ceiling - 1, ceiling]], dtype=dtype)
+        original = raw.copy()
+        actual = condition_stitch_frame(raw, policy)
+        np.testing.assert_array_equal(np.isfinite(actual), [[False, True, True, False]])
+        np.testing.assert_array_equal(raw, original)
+    finally:
+        page.shutdown()
+
+
 def test_native_saved_frame_popup_keeps_curve_and_shows_thumbnail_fallback(qapp, tmp_path):
     from tests.core.test_analysis_stitch_auxiliary import _publish
     path, raw, project, _receipt = _publish(tmp_path)
@@ -373,7 +399,7 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
         assert len(requests) == 2
         assert len(page._owner.prepared.skipped) == 1
         assert "No detector images" in page.preview_text.toPlainText()
-        assert page._value("threshold") == np.iinfo(np.int32).max
+        assert page._value("threshold") == np.iinfo(np.int32).max - 1
         assert page.build_form().conditioning.mode == "auto"
         page.run_bar.startButton.click()
         _wait(page, qapp, timeout=60)
@@ -389,7 +415,7 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
         page.viewer_axis.setCurrentIndex(1)
         np.testing.assert_array_equal(page.curve.listDataItems()[0].xData, grouped.radial_axis("2th_deg"))
         page.set_field("threshold_min", "4")
-        assert page.build_form().conditioning == StitchConditioning("manual", 4., float(np.iinfo(np.int32).max))
+        assert page.build_form().conditioning == StitchConditioning("manual", 4., float(np.iinfo(np.int32).max - 1))
         page.set_field("output_path", str(tmp_path / "cancelled"))
         page.begin_preview()
         _wait(page, qapp)
