@@ -113,12 +113,13 @@ def _peak(image, invalid, beam, motion, half_width, roi, saturation):
     lo,hi = max(y0,row-half_width), min(y1,row+half_width+1)
     strip = image[lo:hi,x0:x1]
     bad = invalid[lo:hi,x0:x1] | ~np.isfinite(strip) | (strip < 0)
-    # Do not mask out saturation and then fit the remaining wings as a valid beam.
+    # Static invalid pixels are not measurements. Still reject unmasked saturation
+    # rather than masking it and fitting the remaining wings as a valid beam.
     limit = saturation
     if np.issubdtype(image.dtype,np.integer):
         native_limit = np.iinfo(image.dtype).max
         limit = native_limit if limit is None else min(limit,native_limit)
-    if limit is not None and np.any(strip >= limit):
+    if limit is not None and np.any((strip >= limit) & ~bad):
         raise ValueError('saturated pixels in beam strip/ROI')
     valid = ~bad.any(axis=0)
     x = np.arange(x0,x1,dtype=float)

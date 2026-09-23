@@ -155,6 +155,37 @@ def test_integer_saturation_and_bad_shape():
     assert 'shape' in result.rejection_reasons[3]
 
 
+@pytest.mark.parametrize('damage', ['static_only', 'saturation', 'core'])
+def test_masked_uint32_sentinel_is_not_valid_saturation(damage):
+    angles = [8., 7.5, 7., 6.5, 6.]
+    images, _, _ = beam_images(angles)
+    # Corrected counts above 65535 are valid; the acquisition cutoff is explicit.
+    images = [(image * 25).astype('uint32') for image in images]
+    mask = np.zeros(images[0].shape, bool)
+    mask[22, 12] = True
+    for image in images:
+        image[22, 12] = np.iinfo('uint32').max
+    expected = np.ones(5, bool)
+    if damage == 'saturation':
+        images[1][22, 20] = 200000  # Unmasked and away from the beam core.
+        expected[1] = False
+    elif damage == 'core':
+        mask[22, 80] = True
+        images[2][22, 80] = np.iinfo('uint32').max
+        expected[2] = False
+    result = run(angles, images, mask=mask, saturation=200000)
+    np.testing.assert_array_equal(result.used, expected)
+    assert result.distance_m == pytest.approx(.08, rel=1e-4)
+    assert result.intercept_px == pytest.approx(80., abs=.001)
+    if damage == 'saturation':
+        assert 'saturated' in result.rejection_reasons[1]
+    elif damage == 'core':
+        assert 'masked/gap' in result.rejection_reasons[2]
+    # Removing the static mask makes the very same sentinel invalid saturation.
+    with pytest.raises(ValueError, match='saturated pixels'):
+        run(angles, images, saturation=200000)
+
+
 def test_linear_notebook_comparison():
     angles = np.array([7.15,7.08,7.,6.97,6.88])
     images, centres, _ = beam_images(angles)
@@ -235,6 +266,64 @@ def test_format_reader_and_exact_frame_references(tmp_path,kind):
         refs[2]=(path,99,'/custom/data')
         result=run(angles,refs)
         assert not result.used[2] and result.rejection_reasons[2]
+
+
+@pytest.mark.parametrize('layout', ['nexus', 'external_link', 'bluesky'])
+def test_nexus_native_references_and_streams_preserve_selected_rows(tmp_path, layout):
+    import h5py
+    from xrd_tools.io.image import read_image
+    from xrd_tools.io.nexus import open_nexus_image_stack
+    from xrd_tools.sources import ContainerCursor
+
+    angles = np.array([8., 7.5, 7., 6.5, 6.])
+    images = np.asarray(beam_images(angles)[0])
+    images = (images * 25).astype('uint32')
+    mask = np.zeros(images.shape[1:], bool)
+    mask[22, 12] = True
+    images[:, 22, 12] = np.iinfo('uint32').max
+    path = tmp_path / 'beam_master.h5'
+    if layout == 'external_link':
+        part = tmp_path / 'beam_data_000001.h5'
+        with h5py.File(part, 'w') as f:
+            f['entry/data/data'] = images
+    with h5py.File(path, 'w') as f:
+        entry = f.create_group('entry')
+        entry.attrs['NX_class'] = 'NXentry'
+        data = entry.create_group('data')
+        data.attrs['NX_class'] = 'NXdata'
+        data.attrs['signal'] = 'image'
+        if layout == 'external_link':
+            data['image'] = h5py.ExternalLink(part.name, '/entry/data/data')
+            entry['instrument/detector/detectorSpecific/nimages'] = 1
+        else:
+            data['image'] = images
+        if layout == 'bluesky':
+            f.attrs['creator'] = 'NXWriter'
+            entry['end_time'] = np.bytes_('2026-09-23T00:00:00')
+            entry['instrument/bluesky/metadata/motors'] = np.bytes_('!!python/tuple\n- del\n')
+            entry['instrument/positioners/del/value'] = angles
+            data['del'] = angles
+            data['image'].attrs['signal_type'] = 'detector'
+    with open_nexus_image_stack(path) as stack:
+        assert stack.shape == images.shape  # Actual frames, not header nimages.
+    selected = (4, 0, 2)  # Deliberate reordered subset of a larger container.
+    refs = tuple((path, i) for i in selected)
+    points = tuple(('scan-8', i) for i in selected)
+    kwargs = dict(mask=mask, saturation=200000, frame_ids=refs, point_ids=points)
+    raw = run(angles[list(selected)], refs, **kwargs)
+    masked = run(angles[list(selected)],
+        (read_image(p, frame=i, mask=mask, exact_frame=True) for p, i in refs), **kwargs)
+    with ContainerCursor(path) as cursor:
+        motor = cursor.metadata_provider().motors()['del'] if layout == 'bluesky' else angles
+        assert len(motor) == cursor.frame_count
+        streamed = run(motor[list(selected)],
+            (cursor.read_frame(i) for i in selected), **kwargs)
+    for result in (raw, masked, streamed):
+        assert result.used.all()
+        assert result.frame_ids == refs and result.point_ids == points
+        np.testing.assert_array_equal(result.angles_deg, angles[list(selected)])
+        np.testing.assert_allclose(result.centres_px, raw.centres_px, atol=1e-6, rtol=0)
+        assert result.distance_mm == pytest.approx(80., rel=1e-4)
 
 
 def test_import_is_lazy_and_headless():
@@ -329,6 +418,8 @@ def test_streaming_does_not_retain_input_frames():
             previous.append(weakref.ref(image))
             yield image
             del image
-    result=run(angles,stream())
+    ids = tuple(('run-uid', event) for event in (18, 3, 25, 4, 6))
+    result=run(angles,stream(),frame_ids=ids,point_ids=ids)
     assert result.used.all()
+    assert result.frame_ids == result.point_ids == ids
     assert all(ref() is None for ref in previous)
