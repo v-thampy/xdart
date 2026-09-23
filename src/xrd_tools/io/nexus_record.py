@@ -674,14 +674,20 @@ def write_frame_source_ref(
         "frame_count": "frame_count",
         "dataset_path": "dataset_path",
         "self_contained": "self_contained",
+        "raw_shape": "raw_shape",
+        "raw_dtype": "raw_dtype",
+        "raw_header_bytes": "raw_header_bytes",
+        "rotation": "rotation",
     }
     for key, attr_name in attr_names.items():
         value = snapshot.get(key)
         if value is None:
             continue
         try:
-            if key in {"size", "mtime_ns", "frame_count"}:
+            if key in {"size", "mtime_ns", "frame_count", "raw_header_bytes", "rotation"}:
                 value = int(value)
+            elif key == "raw_shape":
+                value = tuple(int(n) for n in value)
             elif key == "self_contained":
                 value = bool(value)
             else:
@@ -812,7 +818,7 @@ def frame_record_key(scan_label, frame_index: int) -> str:
 
 
 def write_contributing_frames(entry_grp: h5py.Group, records, *,
-                              source_base=None) -> int:
+                              source_base=None, bounded: bool = False) -> int:
     """Write the per-frame **source records** for a Stitch/RSM result — the
     enabler for the raw-image popup (resolve a contributing frame from the saved
     ``.nexus``).  ``records`` is an iterable of mappings with ``frame_index`` and
@@ -832,11 +838,35 @@ def write_contributing_frames(entry_grp: h5py.Group, records, *,
                       if r.get("scan_label") is not None}, key=str):
         _nxcollection(frames, f"scan_{sl}")
     for r in records:
-        write_frame_record(
+        frame = write_frame_record(
             frames, frame_record_key(r.get("scan_label"), r["frame_index"]),
             source_path=r.get("source_path"),
             source_frame_index=int(r.get("source_frame_index") or 0),
-            thumbnail=r.get("thumbnail"), source_base=source_base)
+            thumbnail=r.get("thumbnail"), source_base=source_base,
+            source_snapshot=r.get("source_snapshot"),
+            thumbnail_dtype=r.get("thumbnail_dtype", "uint8"),
+            thumbnail_mask_baked=r.get("thumbnail_mask_baked", True),
+            mask_baked=r.get("mask_baked", True),
+            thumbnail_mask=r.get("thumbnail_mask"))
+        if "identity" in r:
+            frame.create_dataset("identity_json", data=np.bytes_(json.dumps(
+                r["identity"], sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False, allow_nan=False).encode()))
+    if bounded:
+        # Shared record encoding, with finite-artifact bounded text storage.
+        from xrd_tools.io.nexus import _bounded_text_attr
+        _bounded_text_attr(entry_grp, "source_base", str(entry_grp.attrs["source_base"]))
+        def bound_text(_name, obj):
+            for key, value in tuple(obj.attrs.items()):
+                if isinstance(value, str):
+                    _bounded_text_attr(obj, key, value)
+            if isinstance(obj, h5py.Group) and "path" in obj:
+                path = obj["path"]
+                value = path.asstr()[()]
+                del obj["path"]
+                obj.create_dataset("path", data=np.bytes_(value.encode()))
+        bound_text("", frames)
+        frames.visititems(bound_text)
     return len(records)
 
 

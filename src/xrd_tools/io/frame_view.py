@@ -3517,6 +3517,66 @@ class FrameViewReader:
         self._clear_open_state()
 
 
+def read_contributing_frame_view(
+    scan_file: str | Path,
+    frame: int,
+    *,
+    scan: str | None = None,
+    source_root: str | Path | None = None,
+    full_raw: bool = False,
+) -> FrameView:
+    """Read a strictly admitted Stitch source record through shared raw owners.
+
+    A missing original leaves ``raw`` absent and the stored ``thumbnail`` intact,
+    allowing the presenter to label fallback honestly. No integrated-frame rows
+    or display identities are fabricated for this scan-level result.
+    """
+    from xrd_tools.io.analysis_artifact import (
+        AnalysisArtifactKind, AnalysisArtifactInvalid, inspect_analysis_artifact,
+        _stat_revision, _opened_hdf_revision,
+    )
+    from xrd_tools.io.nexus_record import frame_record_key
+    from xrd_tools.io.read import (
+        _raw_frame_parts_from_entry, _frame_group_for_label,
+        _frame_source_read_options, _raw_frame_or_thumbnail,
+    )
+    import json
+    import os
+
+    if type(frame) is not int or frame < 0 or type(full_raw) is not bool:
+        raise TypeError("contributing frame selector is invalid")
+    path = Path(scan_file)
+    inspection = inspect_analysis_artifact(path, expected_kind=AnalysisArtifactKind.STITCH_1D)
+    if inspection.frame_manifest_json is None:
+        raise KeyError("this artifact has no contributing frame records")
+    key = frame_record_key(scan, frame)
+    rows = json.loads(inspection.frame_manifest_json)["records"]
+    selected = next((row for row in rows if row["key"] == key), None)
+    if selected is None:
+        raise KeyError(f"unknown contributing frame {key}")
+    with h5py.File(path, "r") as handle:
+        if _opened_hdf_revision(handle) != inspection.storage_revision:
+            raise AnalysisArtifactInvalid("artifact changed before frame hydration")
+        entry = handle["entry"]
+        master, index, thumbnail = _raw_frame_parts_from_entry(
+            path, entry, frame, scan=scan, source_root=source_root,
+        )
+        group = _frame_group_for_label(entry, frame, scan=scan)
+        options = _frame_source_read_options(group)
+    raw = None
+    if full_raw:
+        try:
+            raw = _raw_frame_or_thumbnail(path, frame, master, index, thumbnail,
+                allow_thumbnail=False, preserve_dtype=True, raw_options=options)
+        except KeyError:
+            pass
+    if _stat_revision(os.stat(path)) != inspection.storage_revision:
+        raise AnalysisArtifactInvalid("artifact changed during frame hydration")
+    return FrameView(label=frame, raw=raw, thumbnail=thumbnail,
+        mask_baked=selected["mask_baked"], metadata_raw=selected["identity"],
+        source_path=None if master is None else str(master), source_frame_index=index)
+
+
 def read_frame_view(
     scan_file: str | Path,
     frame: int,

@@ -811,13 +811,16 @@ def get_raw_frame(
     """
     scan_file = Path(scan_file)
     with h5py.File(scan_file, "r") as f:
+        entry_group = _entry(f, entry)
         master, src_frame_idx, thumb = _raw_frame_parts_from_entry(
             scan_file,
-            _entry(f, entry),
+            entry_group,
             int(frame),
             scan=scan,
             source_root=source_root,
         )
+        frame_group = _frame_group_for_label(entry_group, frame, scan=scan)
+        raw_options = _frame_source_read_options(frame_group)
     return _raw_frame_or_thumbnail(
         scan_file,
         int(frame),
@@ -826,7 +829,27 @@ def get_raw_frame(
         thumb,
         allow_thumbnail=allow_thumbnail,
         preserve_dtype=preserve_dtype,
+        raw_options=raw_options,
     )
+
+
+def _frame_source_read_options(frame_group) -> dict:
+    """Forward the persisted exact decoder/selector to the shared image reader."""
+    source = None if frame_group is None else frame_group.get("source")
+    if not isinstance(source, h5py.Group):
+        return {}
+    options = {}
+    for attr, option in (("dataset_path", "dataset_path"), ("raw_dtype", "raw_dtype")):
+        if attr in source.attrs:
+            options[option] = _decode(source.attrs[attr])
+    if "raw_shape" in source.attrs:
+        options["detector_shape"] = tuple(int(n) for n in source.attrs["raw_shape"])
+    for attr, option in (("raw_header_bytes", "raw_header_skip"), ("rotation", "rotation")):
+        if attr in source.attrs:
+            options[option] = int(source.attrs[attr])
+    if options:
+        options["exact_frame"] = True
+    return options
 
 
 def _raw_frame_from_entry(
@@ -987,6 +1010,7 @@ def _raw_frame_or_thumbnail(
     *,
     allow_thumbnail: bool = True,
     preserve_dtype: bool = False,
+    raw_options: dict | None = None,
 ) -> np.ndarray:
     from xrd_tools.io.image import read_image
 
@@ -996,6 +1020,7 @@ def _raw_frame_or_thumbnail(
                 master,
                 frame=src_frame_idx,
                 preserve_dtype=preserve_dtype,
+                **(raw_options or {}),
             )
             return (
                 np.asarray(image)

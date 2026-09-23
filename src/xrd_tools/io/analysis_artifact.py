@@ -46,8 +46,11 @@ ANALYSIS_SCHEMA_VERSION_V2 = 2
 ANALYSIS_SCHEMA_VERSION_V3 = 3
 ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL = 4
 ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL = 5
+ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE = 6
+ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE = 7
+_STITCH_NATIVE_VERSIONS = {6, 7}
 # Keep ordinary and attested science contracts distinct; only physical names change.
-_STITCH_NEUTRAL_CONTRACTS = {4: 1, 5: 2}
+_STITCH_NEUTRAL_CONTRACTS = {4: 1, 5: 2, 6: 1, 7: 2}
 ANALYSIS_KIND_ATTR = "analysis_kind"
 _ENTRY = "entry"
 _PROVENANCE = "provenance_json"
@@ -696,11 +699,13 @@ class AnalysisArtifactRequest:
             ANALYSIS_SCHEMA_VERSION_V3,
             ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
             ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
+            ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE,
+            ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE,
         }:
             raise TypeError("analysis artifact schema version is unsupported")
         if self.schema_version in _STITCH_NEUTRAL_CONTRACTS and (
             self.kind not in {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}
-            or (self.schema_version == ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL
+            or (self.schema_version in {ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL, *_STITCH_NATIVE_VERSIONS}
                 and self.kind is not AnalysisArtifactKind.STITCH_1D)
         ):
             raise ValueError("neutral analysis artifact requires its Stitch kind")
@@ -786,6 +791,8 @@ class AnalysisArtifactInspection:
     schema_version: int = ANALYSIS_SCHEMA_VERSION
     execution_attestation_digest: str | None = None
     execution_attestation_json: str | None = field(default=None, repr=False)
+    wavelength_A: float | None = None
+    frame_manifest_json: str | None = field(default=None, repr=False)
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -802,6 +809,8 @@ class AnalysisArtifactResultProjection:
     result_fingerprint: str
     policy: str = field(init=False, default=_STORED_RESULT_PROJECTION_POLICY)
     _claim: InitVar[object] = None
+    wavelength_A: float | None = None
+    frame_manifest_json: str | None = field(default=None, repr=False)
 
     def __post_init__(self, _claim: object) -> None:
         arrays = tuple(values for _name, values in self.axes) + (
@@ -1005,6 +1014,30 @@ class AnalysisArtifactPayload:
             )
             for index, (name, buffer) in enumerate(self._axis_buffers)
         )
+
+    @property
+    def wavelength_A(self) -> float | None:
+        return self.inspection.wavelength_A
+
+    @property
+    def native_unit(self) -> str | None:
+        return dict(self.inspection.axis_units).get("q")
+
+    @property
+    def contributing_frames(self) -> tuple[dict, ...]:
+        text = self.inspection.frame_manifest_json
+        return () if text is None else tuple(json.loads(text)["records"])
+
+    def radial_axis(self, unit: str) -> np.ndarray:
+        if self.kind is not AnalysisArtifactKind.STITCH_1D:
+            raise ValueError("radial coordinate switch requires Stitch 1D")
+        if unit == self.native_unit:
+            return self.axis("q")
+        from xrd_tools.io.analysis_stitch_auxiliary import native_stitch_companion
+        target, values = native_stitch_companion(self.axis("q"), self.native_unit, self.wavelength_A)
+        if unit != target:
+            raise ValueError("unsupported Stitch viewer coordinate")
+        return values
 
     @property
     def intensity(self) -> np.ndarray:
@@ -1587,6 +1620,10 @@ def project_analysis_artifact_result(
     coverage: np.ndarray | None,
     normalization: np.ndarray | None,
     _stored_v1_claim: object = None,
+    wavelength_A: float | None = None,
+    frame_records=None,
+    source_base=None,
+    _frame_manifest_json: str | None = None,
 ) -> AnalysisArtifactResultProjection:
     """Project one result exactly once to the bytes stored by the artifact.
 
@@ -1775,6 +1812,29 @@ def project_analysis_artifact_result(
     if projected_coverage is not None:
         _digest_array(digest, "coverage", projected_coverage)
         _digest_array(digest, "normalization", projected_normalization)
+    frame_manifest_json = None
+    if wavelength_A is not None or frame_records is not None or _frame_manifest_json is not None:
+        from xrd_tools.io.analysis_stitch_auxiliary import (
+            native_stitch_companion, analysis_contributing_frames_manifest,
+            canonical_frame_manifest,
+        )
+        if kind is not AnalysisArtifactKind.STITCH_1D:
+            raise AnalysisArtifactProjectionInvalid("native auxiliary records require Stitch 1D")
+        target_unit, companion = native_stitch_companion(
+            projected_axes[0][1], axis_units[0][1], wavelength_A,
+        )
+        if frame_records is not None:
+            frame_manifest_json = canonical_frame_manifest(
+                analysis_contributing_frames_manifest(frame_records, source_base=source_base)
+            )
+        elif _frame_manifest_json is not None:
+            frame_manifest_json = _frame_manifest_json
+        else:
+            raise AnalysisArtifactProjectionInvalid("native Stitch requires contributing frames")
+        _digest_text(digest, "native-stitch-auxiliary-v1")
+        _digest_text(digest, float(wavelength_A).hex())
+        _digest_text(digest, frame_manifest_json)
+        _digest_array(digest, target_unit, companion)
     return AnalysisArtifactResultProjection(
         kind,
         tuple(projected_axes),
@@ -1785,6 +1845,8 @@ def project_analysis_artifact_result(
         projected_normalization,
         digest.hexdigest(),
         _ANALYSIS_PROJECTION_FACTORY,
+        wavelength_A=wavelength_A,
+        frame_manifest_json=frame_manifest_json,
     )
 
 
@@ -1929,6 +1991,8 @@ def inspect_analysis_artifact(
                 ANALYSIS_SCHEMA_VERSION_V3,
                 ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
                 ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
+                ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE,
+                ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE,
             }:
                 raise AnalysisArtifactInvalid(
                     "analysis artifact schema version is unsupported"
@@ -1945,6 +2009,8 @@ def inspect_analysis_artifact(
                 "provenance_digest",
                 "file_name",
             }
+            if version in _STITCH_NATIVE_VERSIONS:
+                expected_entry_attrs.add("source_base")
             if contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
                 expected_entry_attrs.add(_EXECUTION_ATTESTATION_DIGEST_ATTR)
             if len(entry.attrs) != len(expected_entry_attrs) or any(
@@ -1970,7 +2036,7 @@ def inspect_analysis_artifact(
                 )
             if version in _STITCH_NEUTRAL_CONTRACTS and (
                 kind not in {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}
-                or (version == ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL
+                or (version in {ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL, *_STITCH_NATIVE_VERSIONS}
                     and kind is not AnalysisArtifactKind.STITCH_1D)
             ):
                 raise AnalysisArtifactInvalid("neutral analysis artifact requires its Stitch kind")
@@ -2023,6 +2089,8 @@ def inspect_analysis_artifact(
             expected_entry_children = 2 + int(
                 contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}
             )
+            if version in _STITCH_NATIVE_VERSIONS:
+                expected_entry_children += 2
             if len(entry) != expected_entry_children:
                 raise AnalysisArtifactInvalid(
                     "analysis artifact contains an unknown entry graph"
@@ -2038,6 +2106,8 @@ def inspect_analysis_artifact(
             # source identity meanwhile; an unbound raw-popup graph must not
             # acquire artifact authority merely by being local-hard HDF5.
             allowed = {kind.group, _PROVENANCE}
+            if version in _STITCH_NATIVE_VERSIONS:
+                allowed.update({"frames", "contributing_frames_json"})
             if contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
                 allowed.add(_EXECUTION_ATTESTATION)
             if any(name not in allowed for name in entry):
@@ -2131,6 +2201,8 @@ def inspect_analysis_artifact(
             if _bounded_attr_texts(result, "axes") != stored_axis_names:
                 raise AnalysisArtifactInvalid("analysis result axes are invalid")
             allowed_result = {"intensity", _PROVENANCE, *stored_axis_names}
+            if version in _STITCH_NATIVE_VERSIONS:
+                allowed_result.update({"wavelength_A", "companion_axis"})
             if kind in {
                 AnalysisArtifactKind.STITCH_1D,
                 AnalysisArtifactKind.STITCH_2D,
@@ -2154,6 +2226,8 @@ def inspect_analysis_artifact(
                 + int(has_sigma)
                 + 2 * int(has_stitch_diagnostics)
             )
+            if version in _STITCH_NATIVE_VERSIONS:
+                expected_result_size += 2
             if len(result) != expected_result_size:
                 raise AnalysisArtifactInvalid(
                     "analysis result contains an unknown graph"
@@ -2230,7 +2304,10 @@ def inspect_analysis_artifact(
             if contract_version == ANALYSIS_SCHEMA_VERSION_V2:
                 if kind is AnalysisArtifactKind.STITCH_1D:
                     if (
-                        axis_units != [("q", "q_A^-1")]
+                        axis_units[0][1] not in (
+                            {"q_A^-1", "2th_deg"} if version in _STITCH_NATIVE_VERSIONS
+                            else {"q_A^-1"}
+                        )
                         or has_sigma
                         or not has_stitch_diagnostics
                     ):
@@ -2332,7 +2409,15 @@ def inspect_analysis_artifact(
                     require_nonnegative=True,
                 )
             try:
+                wavelength_A = frame_manifest_json = None
+                if version in _STITCH_NATIVE_VERSIONS:
+                    from xrd_tools.io.analysis_stitch_auxiliary import inspect_native_stitch_auxiliary
+                    wavelength_A, frame_manifest_json = inspect_native_stitch_auxiliary(
+                        entry, result, json.loads(provenance), axes[0][1], axis_units[0][1],
+                    )
                 projection = project_analysis_artifact_result(
+                    wavelength_A=wavelength_A,
+                    _frame_manifest_json=frame_manifest_json,
                     kind=kind,
                     axes=axes,
                     axis_units=tuple(axis_units),
@@ -2401,6 +2486,8 @@ def inspect_analysis_artifact(
                 ).hexdigest(),
                 result_fingerprint=projection.result_fingerprint,
                 schema_version=version,
+                wavelength_A=wavelength_A,
+                frame_manifest_json=frame_manifest_json,
                 execution_attestation_digest=execution_attestation_digest,
                 execution_attestation_json=execution_attestation_json,
             )
@@ -2568,6 +2655,8 @@ def read_analysis_artifact(
                         )
             try:
                 projection = project_analysis_artifact_result(
+                    wavelength_A=inspection.wavelength_A,
+                    _frame_manifest_json=inspection.frame_manifest_json,
                     kind=inspection.kind,
                     axes=axes,
                     axis_units=inspection.axis_units,
@@ -2953,6 +3042,8 @@ __all__ = [
     "ANALYSIS_SCHEMA_VERSION_V3",
     "ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL",
     "ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL",
+    "ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE",
+    "ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE",
     "ANALYSIS_SCHEMA_VERSION_ATTR",
     "AnalysisArtifactCleanupPending",
     "AnalysisArtifactError",

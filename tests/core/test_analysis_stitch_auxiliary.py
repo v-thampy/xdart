@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+import shutil
+
+import h5py
+import numpy as np
+import pytest
+
+from xrd_tools.io.analysis_artifact import (
+    AnalysisArtifactKind, AnalysisArtifactRequest, AnalysisArtifactOverwrite,
+    AnalysisArtifactInvalid, admit_analysis_artifact, read_analysis_artifact,
+    project_analysis_artifact_result, analysis_execution_attestation_digest,
+)
+from xrd_tools.io.analysis_stitch_auxiliary import analysis_contributing_frame_members
+from xrd_tools.io.frame_view import read_contributing_frame_view
+from xrd_tools.io.nexus import write_stitched
+from xrd_tools.io.output_transaction import OutputTransactionCoordinator
+from tests.core.test_analysis_artifact import _execution_attestation
+
+
+def _publish(tmp_path, *, unit="q_A^-1", xu=False):
+    project = tmp_path / "project"
+    project.mkdir()
+    raw = np.arange(24, dtype=np.int32).reshape(4, 6)
+    raw_file = project / "frame.raw"
+    raw.tofile(raw_file)
+    records = [dict(frame_index=index, scan_label=str(scan), source_path=str(raw_file),
+        source_frame_index=0, thumbnail=raw.astype(np.float32) + index,
+        mask_baked=False, thumbnail_mask_baked=False,
+        source_snapshot=dict(raw_shape=[4, 6], raw_dtype="int32", raw_header_bytes=0, rotation=0),
+        identity=dict(source_id="sample.spec", scan_id=str(scan), frame_index=index,
+                      contribution_index=global_index))
+        for global_index, (scan, index) in enumerate(((2, 0), (2, 1), (3, 0)))]
+    provenance = {"frame_members": analysis_contributing_frame_members(records, source_base=project)}
+    radial = np.linspace(0.1, 5.0, 40) if unit == "q_A^-1" else np.linspace(1, 100, 40)
+    intensity = np.arange(40, dtype=float) + 1
+    projection = project_analysis_artifact_result(kind=AnalysisArtifactKind.STITCH_1D,
+        axes=(("q", radial),), axis_units=(("q", unit),), intensity=intensity,
+        sigma=None, coverage=np.ones(40), normalization=np.ones(40),
+        wavelength_A=1.0, frame_records=records, source_base=project)
+    digest = hashlib.sha256(b"native-stitch-test").hexdigest()
+    extra = {}
+    if xu:
+        attestation = _execution_attestation(digest, projection.result_fingerprint, frame_count=3)
+        extra = dict(execution_attestation=attestation,
+            execution_attestation_digest=analysis_execution_attestation_digest(
+                AnalysisArtifactKind.STITCH_1D, attestation, request_fingerprint=digest))
+    request = AnalysisArtifactRequest(tmp_path / "stitched.nexus", AnalysisArtifactKind.STITCH_1D,
+        AnalysisArtifactOverwrite.CREATE_NEW, digest, digest, digest, digest, provenance,
+        schema_version=7 if xu else 6, **extra)
+    output = admit_analysis_artifact(request, coordinator=OutputTransactionCoordinator())
+    receipt = output.publish(lambda entry: write_stitched(entry, result_projection=projection,
+        provenance=request.provenance_json, bounded_artifact=True, wavelength_A=1.0,
+        frame_records=records, source_base=project))
+    return request.target, raw, project, receipt
+
+
+@pytest.mark.parametrize("unit", ["q_A^-1", "2th_deg"])
+@pytest.mark.parametrize("xu", [False, True])
+def test_native_axes_contributors_and_raw_relocation_round_trip(tmp_path, unit, xu):
+    path, raw, project, receipt = _publish(tmp_path, unit=unit, xu=xu)
+    payload = read_analysis_artifact(path, expected_receipt=receipt)
+    assert payload.native_unit == unit
+    assert payload.wavelength_A == 1.0
+    companion = payload.radial_axis("2th_deg" if unit == "q_A^-1" else "q_A^-1")
+    assert not np.allclose(np.diff(companion), np.diff(companion)[0])
+    np.testing.assert_array_equal(payload.intensity, np.arange(40) + 1)
+    assert [row["key"] for row in payload.contributing_frames] == [
+        "scan_2/frame_0000", "scan_2/frame_0001", "scan_3/frame_0000"]
+    frame = read_contributing_frame_view(path, 0, scan="3", full_raw=True)
+    np.testing.assert_array_equal(frame.raw, raw)
+    assert frame.metadata_raw["scan_id"] == "3"
+    with h5py.File(path, "r") as handle:
+        source = handle["entry/frames/scan_3/frame_0000/source"]
+        assert source["path"].asstr()[()] == "frame.raw"
+        assert "raw" not in handle["entry/frames/scan_3/frame_0000"]
+    moved = tmp_path / "moved-project"
+    shutil.move(project, moved)
+    # Curve admission never follows raw pointers. Full Raw has explicit fallback.
+    np.testing.assert_array_equal(read_analysis_artifact(path).intensity, payload.intensity)
+    fallback = read_contributing_frame_view(path, 0, scan="3", full_raw=True)
+    assert fallback.raw is None
+    assert fallback.thumbnail.shape == raw.shape
+    relocated = read_contributing_frame_view(path, 0, scan="3", source_root=moved, full_raw=True)
+    np.testing.assert_array_equal(relocated.raw, raw)
+
+
+@pytest.mark.parametrize("mutation", ["thumbnail", "membership", "companion", "raw-copy", "external"])
+def test_strict_native_graph_rejects_corruption(tmp_path, mutation):
+    path, _, _, _ = _publish(tmp_path)
+    with h5py.File(path, "r+") as handle:
+        frame = handle["entry/frames/scan_2/frame_0000"]
+        if mutation == "thumbnail":
+            frame["thumbnail"][0, 0] = 100
+        elif mutation == "membership":
+            del handle["entry/frames/scan_2/frame_0001"]
+        elif mutation == "companion":
+            handle["entry/stitched_1d/companion_axis"][0] = 50
+        elif mutation == "raw-copy":
+            frame.create_dataset("raw", data=np.ones((4, 6)))
+        else:
+            del frame["thumbnail"]
+            frame["thumbnail"] = h5py.ExternalLink("not-opened.h5", "/pixels")
+    with pytest.raises(AnalysisArtifactInvalid):
+        read_analysis_artifact(path)
+
+
+def test_exact_external_hdf_dataset_selector_and_original_frame(tmp_path):
+    path, _, project, _ = _publish(tmp_path)
+    raw_file = project / "linked.h5"
+    external = project / "data.h5"
+    values = np.arange(3 * 4 * 6).reshape(3, 4, 6).astype("uint16")
+    with h5py.File(external, "w") as handle:
+        handle.create_dataset("real", data=values)
+    with h5py.File(raw_file, "w") as handle:
+        handle.create_dataset("distractor", data=np.zeros_like(values))
+        handle["selected"] = h5py.ExternalLink("data.h5", "/real")
+    # Exercise the same shared raw owner with its exact persisted selector.
+    from xrd_tools.io.nexus_record import write_contributing_frames
+    from xrd_tools.io.read import get_raw_frame
+    from tests.core.v2_fixture_factory import make_v2_entry
+    ordinary = tmp_path / "ordinary.nexus"
+    with h5py.File(ordinary, "w") as handle:
+        entry = make_v2_entry(handle, frame_indices=(9,), with_2d=False)
+        write_contributing_frames(entry, [dict(frame_index=9, scan_label="5", source_path=raw_file,
+            source_frame_index=2, thumbnail=np.ones((2, 2)),
+            source_snapshot=dict(dataset_path="/selected"))], source_base=project)
+    np.testing.assert_array_equal(get_raw_frame(ordinary, 9, scan="5", allow_thumbnail=False), values[2])
