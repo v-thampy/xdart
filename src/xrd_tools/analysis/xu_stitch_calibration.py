@@ -358,6 +358,7 @@ def authored_surface_calibration(*, detector, cch1, cch2, distance_m,
         rotation, control_domain, domain, rms_q, condition, n_frames, n_points):
     """Build and strictly admit a fitted SURFACE v2 asset (imports are lazy)."""
     import numpy as np
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
     from xrd_tools.core.geometry import DetectorHeader
     from xrd_tools.corrections.stack import CorrectionStack
     from xrd_tools.rsm.corrections import detector_header_to_ai
@@ -375,7 +376,8 @@ def authored_surface_calibration(*, detector, cch1, cch2, distance_m,
         shape=list(shape), pixel1_m=float(detector.pixel1), pixel2_m=float(detector.pixel2),
         mask_count=int(mask.sum()), mask_sha256=digest(mask, '|u1'))
     value['acquisition'].update(energy_eV=energy_eV,
-        xdart_wavelength_A=1.239841984e4 / energy_eV, xu_mapping_wavelength_A=xu_wavelength_A,
+        xdart_wavelength_A=energy_eV_to_wavelength_m(energy_eV) * 1e10,
+        xu_mapping_wavelength_A=xu_wavelength_A,
         image_rotation_quarter_turns=rotation // 90, source_motors=source_motors,
         detector_offsets_deg={'del': del_offset_deg, 'nu': nu_offset_deg})
     header = DetectorHeader(cch1=cch1, cch2=cch2, pwidth1=float(detector.pixel1) * 1e3,

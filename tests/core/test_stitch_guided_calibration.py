@@ -149,17 +149,23 @@ def test_nexus_staging_uses_complete_metadata_provider_and_exact_frame(tmp_path)
     assert frames[0].source_options['dataset_path'] == '/entry/data/eiger_image'
 
 
-def test_xu_notebook_fit_and_authored_admission_preserve_v1(tmp_path):
+@pytest.mark.parametrize('energy_eV', [None, 17000.004], ids=['canonical', 'fractional-energy'])
+def test_xu_notebook_fit_and_authored_admission_preserve_v1(tmp_path, energy_eV):
     from pyFAI.calibrant import get_calibrant
     from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
     from xrd_tools.core.containers import PONI
     from xrd_tools.integrate.refine import ControlFrame
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    from xrd_tools.integrate.xu_stitch import (
+        resolve_xu_stitch_effective_geometry, XuStitchScienceRefused)
     from xrd_tools.analysis.xu_stitch_calibration import (
         canonical_surface_resource_bytes, capture_xu_stitch_calibration,
         XuStitchCalibrationInput, parse_xu_stitch_calibration_bytes, XuStitchCalibrationRefused)
     calibration = json.loads(canonical_surface_resource_bytes())
     detector, acquisition = calibration['detector'], calibration['acquisition']
-    wl = acquisition['xdart_wavelength_A'] * 1e-10
+    if energy_eV is not None:
+        acquisition['energy_eV'] = energy_eV
+    wl = energy_eV_to_wavelength_m(acquisition['energy_eV'])
     lab6 = get_calibrant('LaB6'); lab6.set_wavelength(wl)
     q_ref = 2 * np.pi / np.asarray(lab6.dSpacing)
     controls = []
@@ -189,6 +195,21 @@ def test_xu_notebook_fit_and_authored_admission_preserve_v1(tmp_path):
     receipt = capture_xu_stitch_calibration(XuStitchCalibrationInput(path), project_root=tmp_path)
     assert receipt.projection.value['version'] == 2
     assert .38 <= receipt.projection.value['detector']['distance_m'] <= .40
+    with xu_runtime_session() as runtime:
+        geometry = resolve_xu_stitch_effective_geometry(receipt, runtime)
+    assert geometry.projection.asset_version == 2
+    assert geometry.projection.energy_eV == acquisition['energy_eV']
+    assert geometry.projection.xdart_wavelength_A == wl * 1e10
+    # The parser deliberately permits this one-ulp difference, while the real
+    # backend refuses it. Save must validate there before creating final files.
+    bad = json.loads(receipt.content)
+    bad['acquisition']['xdart_wavelength_A'] = float(np.nextafter(
+        bad['acquisition']['xdart_wavelength_A'], np.inf))
+    parse_xu_stitch_calibration_bytes(json.dumps(bad, sort_keys=True, separators=(',', ':')).encode())
+    refused = tmp_path / 'refused' / 'xu.json'
+    with pytest.raises(XuStitchScienceRefused, match='xdart wavelength projection changed'):
+        save_calibration_fit(replace(fit, asset={**fit.asset, 'calibration': bad}), refused)
+    assert not refused.parent.exists()
     constrained = fit_calibration(frames, backend='xu_hist', distance_seed_m=.395,
         distance_bounds_m=(.390, .400), domain={'del':[0.,50.], 'nu':[-15.,30.]})
     assert .390 <= constrained.asset['calibration']['detector']['distance_m'] <= .400

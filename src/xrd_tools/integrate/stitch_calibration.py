@@ -501,7 +501,7 @@ def _fit_xu(frames, loaded, del_motor, nu_motor, distance_seed_m, distance_bound
 
 
 def save_calibration_fit(fit: CalibrationFit, path):
-    """Save only a successful fit, then reload through the actual admission owner."""
+    """Validate the fit through its backend before saving the adopted asset."""
     from xrd_tools.core.geometry import Diffractometer
     path = Path(path).resolve()
     provenance = path.with_suffix(path.suffix + '.provenance.json')
@@ -510,8 +510,21 @@ def save_calibration_fit(fit: CalibrationFit, path):
     calibration = fit.asset['calibration']
     raw = json.dumps(calibration, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
     if fit.backend == 'xu_hist':
-        from xrd_tools.analysis.xu_stitch_calibration import parse_xu_stitch_calibration_bytes
-        parse_xu_stitch_calibration_bytes(raw)
+        from tempfile import TemporaryDirectory
+        from xrd_tools.analysis.xu_stitch_calibration import (
+            XuStitchCalibrationInput, capture_xu_stitch_calibration,
+        )
+        from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+        from xrd_tools.integrate.xu_stitch import resolve_xu_stitch_effective_geometry
+        # The backend requires a file-backed receipt. Stage the exact bytes in
+        # private scratch so refusal cannot leave an unusable destination asset.
+        with TemporaryDirectory(prefix='xdart-xu-calibration-') as scratch:
+            staged = Path(scratch).resolve() / 'calibration.json'
+            staged.write_bytes(raw)
+            receipt = capture_xu_stitch_calibration(
+                XuStitchCalibrationInput(staged), project_root=staged.parent)
+            with xu_runtime_session() as runtime:
+                resolve_xu_stitch_effective_geometry(receipt, runtime)
     else:
         Diffractometer.from_pyfai_goniometer(calibration, source_motors={'nu_angle': 'nu', 'del_angle': 'del'})
     path.parent.mkdir(parents=True, exist_ok=True)
