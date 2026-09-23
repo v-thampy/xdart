@@ -6920,6 +6920,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if kind is ShellCommandKind.SET_PROCESSING_MODE:
             if type(value) is not str or not value:
                 return
+            if value == "Stitch 1D":
+                # This selection navigates to its retained page. Keep the
+                # integration intent intact for return navigation; the host
+                # owns the active-operation and pending-cleanup fences.
+                self._refresh_shell()
+                self.toolRequested.emit("stitch")
+                return
             controller = self._context_controller
             target_tool = tool_from_mode_text(value)
             if os.environ.get("XDART_VIEWER_DEBUG") == "1":

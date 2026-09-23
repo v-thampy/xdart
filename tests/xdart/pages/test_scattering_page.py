@@ -138,7 +138,7 @@ def test_catalog_import_does_not_import_the_scattering_package():
     assert "lazy-ok" in result.stdout
 
 
-def test_builtin_stitch_action_retains_native_page_and_integration_workspace(
+def test_builtin_stitch_selection_retains_native_page_and_integration_workspace(
         qapp, isolated_settings):
     from xdart.gui.pages.values import ActionCompleted
 
@@ -155,22 +155,30 @@ def test_builtin_stitch_action_retains_native_page_and_integration_workspace(
         assert combo.findText("RSM") >= 0
         requested = []
         page.toolRequested.connect(requested.append)
+        prior_intent = page._intents.snapshot()
         combo.setCurrentText("Stitch 1D")
-        assert page._shell.run_controls.startButton.isEnabled()
-        page._shell.run_controls.startButton.click()
         qapp.processEvents()
+        assert window.selected_page_key == STITCH_PAGE.key
         handle = window._page_handles[STITCH_PAGE.key]
         assert handle.widget.objectName() == "stitchPage"
         assert not handle.widget.isWindow()
         assert window.centralWidget().currentWidget() is handle.widget
+        assert handle.activity.active() is False
+        assert page._intents.snapshot() == prior_intent
         handle.widget.set_field("scan", "14")
         assert window.select_page(DEFAULT_PAGE_KEY) == ActionCompleted(str(DEFAULT_PAGE_KEY))
         assert window.main_widget is page
+        assert combo.currentText() == prior_intent.thaw().processing_mode
+        combo.setCurrentText("Stitch 1D")
+        qapp.processEvents()
+        assert window.page_handle is handle
+        assert handle.activity.active() is False
+        assert window.select_page(DEFAULT_PAGE_KEY) == ActionCompleted(str(DEFAULT_PAGE_KEY))
         combo.setCurrentText("Stitch 2D")
         assert not page._shell.run_controls.startButton.isEnabled()
         page._shell.run_controls.startButton.click()
         qapp.processEvents()
-        assert requested == ["stitch"]
+        assert requested == ["stitch", "stitch"]
         assert handle.activity.active() is False
         assert window.open_tool(STITCH_TOOL.key) == ActionCompleted("stitch")
         assert window._page_handles[STITCH_PAGE.key] is handle
@@ -178,6 +186,30 @@ def test_builtin_stitch_action_retains_native_page_and_integration_workspace(
         assert STITCH_TOOL.key not in window._tool_handles
         assert RSM_TOOL.key not in window._tool_handles
     finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+
+def test_stitch_selection_obeys_active_integration_page_fence(
+        qapp, isolated_settings):
+    from xdart.gui.tabs.scattering.events import PreflightRefused
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+
+    window = _mounted_host(None)
+    page = window.main_widget
+    request = page._lifecycle.begin_start()
+    try:
+        assert page._lifecycle.phase is RunPhase.PREPARING
+        prior_intent = page._intents.snapshot()
+        page._shell.run_controls.modeCombo.setCurrentText("Stitch 1D")
+        qapp.processEvents()
+        assert window.main_widget is page
+        assert STITCH_PAGE.key not in window._page_handles
+        assert page._intents.snapshot() == prior_intent
+        assert page._lifecycle.phase is RunPhase.PREPARING
+    finally:
+        page._lifecycle.preflight_refused(PreflightRefused(request.request_id))
         window.close()
         window.deleteLater()
         qapp.processEvents()
