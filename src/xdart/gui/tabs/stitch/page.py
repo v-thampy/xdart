@@ -897,7 +897,10 @@ class StitchPage(QtWidgets.QWidget):
         try:
             source = self._source_spec_for_tools()
             dialog = StitchMaskDialog(str(self._value("project_root")), source=source,
-                rotation=int(self._value("image_rotation")), parent=self)
+                rotation=int(self._value("image_rotation")), reader_options=dict(
+                    detector_shape=(int(self._value("detector_rows")), int(self._value("detector_cols"))),
+                    raw_dtype=str(self._value("raw_dtype")), raw_header_skip=int(self._value("raw_header_skip")),
+                    rotation=0), parent=self)
             self._authoring_dialogs.append(dialog)
             revision = self._revision
             dialog.maskSaved.connect(lambda path: self.set_field("mask_path", path)

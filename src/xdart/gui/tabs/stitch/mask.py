@@ -10,12 +10,13 @@ from xdart.gui.pages.values import PageCleanup
 class StitchMaskDialog(QtWidgets.QDialog):
     maskSaved = QtCore.Signal(str)
 
-    def __init__(self, project_root, *, source=None, rotation=0, parent=None):
+    def __init__(self, project_root, *, source=None, rotation=0, reader_options=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Make detector mask")
         self.resize(570, 190)
         self._project_root = str(project_root)
         self._source = source
+        self._reader_options = dict(reader_options or ({} if source is None else source.options.get("read_image_kwargs", {})))
         self._rotation = int(rotation)
         self._closing = False
         self._worker = SingleWorkerOwner(self._run)
@@ -50,15 +51,24 @@ class StitchMaskDialog(QtWidgets.QDialog):
         self._timer.setInterval(50)
         self._timer.timeout.connect(self._poll)
 
-    def _choose(self):
-        from xrd_tools.core.scan import SourceSpec
+    def set_source_path(self, selected):
+        from xrd_tools.core.scan import SourceSpec, SourceKind
         from xrd_tools.sources.registry import guess_source_kind
+        kind = guess_source_kind(selected)
+        if kind not in {SourceKind.IMAGE_FILE, SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
+            raise ValueError("Choose an original detector image or raw NeXus file")
+        options = {key: value for key, value in self._reader_options.items()
+                   if key in {"detector_shape", "detector", "raw_dtype", "raw_header_skip"}} if kind is SourceKind.IMAGE_FILE else {}
+        self._source = SourceSpec(selected, kind, options=options)
+        self.source_label.setText(str(selected))
+
+    def _choose(self):
         selected, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose original detector image", self._project_root)
         if selected:
-            options = {} if self._source is None else dict(self._source.options)
-            options = {key: value for key, value in options.items() if key == "read_image_kwargs"}
-            self._source = SourceSpec(selected, guess_source_kind(selected), options=options)
-            self.source_label.setText(selected)
+            try:
+                self.set_source_path(selected)
+            except (TypeError, ValueError, OSError) as error:
+                self.status.setText(str(error))
 
     @staticmethod
     def _run(request, cancelled, publish):

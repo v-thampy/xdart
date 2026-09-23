@@ -351,3 +351,30 @@ def test_mask_exact_frame_staging_is_unrotated_and_page_shutdown_reaps_worker(qa
         page.shutdown()
         page.deleteLater()
         qapp.processEvents()
+
+
+def test_directory_mask_picker_retains_the_declared_raw_decoder(qapp, tmp_path):
+    from threading import Event
+    import tifffile
+    from xdart.gui.tabs.stitch.mask import StitchMaskDialog
+    form = _form(tmp_path, "xu_hist")
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        _fill_native(page, form)
+        page.set_field("source_kind", "Directory")
+        page.set_sources((str(tmp_path),))
+        page._make_mask()
+        dialog = page._authoring_dialogs[-1]
+        image = Path(form.image_dir) / "sample_scan1_0001.raw"
+        dialog.set_source_path(image)
+        cancelled = Event()
+        cancelled.set()
+        output = tmp_path / "directory-mask-staging"
+        assert StitchMaskDialog._run((dialog._source, 0, str(output), 0), cancelled, lambda *args: None) is None
+        staged, = output.glob("frame-*/selected.tif")
+        assert tifffile.imread(staged).shape == (195, 1475)
+        np.testing.assert_array_equal(tifffile.imread(staged), np.full((195, 1475), 11))
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
