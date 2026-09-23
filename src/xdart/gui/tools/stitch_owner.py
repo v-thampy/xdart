@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from threading import Lock
 
 from xdart.gui.pages.operation_owner import (
@@ -20,6 +21,11 @@ from xrd_tools.analysis.stitch_operation import (
     StitchOperationResult,
     StitchOperationVerificationError,
 )
+from xrd_tools.io.analysis_artifact import (
+    AnalysisArtifactKind,
+    AnalysisArtifactPayload,
+    read_analysis_artifact,
+)
 
 from .stitch_values import (
     StitchToolForm,
@@ -29,6 +35,7 @@ from .stitch_values import (
 
 
 class StitchOwnerAction(str, Enum):
+    REOPEN = "reopen"
     PREFLIGHT = "preflight"
     RUN = "run"
     RETRY_CLEANUP = "retry-cleanup"
@@ -36,6 +43,7 @@ class StitchOwnerAction(str, Enum):
 
 
 class StitchOwnerOutcomeKind(str, Enum):
+    REOPENED = "reopened"
     PREFLIGHT_READY = "preflight-ready"
     RESULT = "result"
     CLEANUP_PENDING = "cleanup-pending"
@@ -56,11 +64,24 @@ class StitchOwnerOutcome:
     preflight: StitchToolPreflight | None = None
     result: StitchOperationResult | None = None
     finalization_message: str = ""
+    payload: AnalysisArtifactPayload | None = None
+    artifact_path: str = ""
 
     def __post_init__(self) -> None:
         if (
             type(self.kind) is not StitchOwnerOutcomeKind
             or type(self.finalization_message) is not str
+            or type(self.artifact_path) is not str
+            or (self.payload is not None and type(self.payload) is not AnalysisArtifactPayload)
+            or (
+                self.kind is StitchOwnerOutcomeKind.REOPENED
+                and (self.payload is None or not self.artifact_path
+                     or self.preflight is not None or self.result is not None)
+            )
+            or (
+                self.kind is not StitchOwnerOutcomeKind.REOPENED
+                and (self.payload is not None or self.artifact_path)
+            )
             or (self.preflight is not None and type(self.preflight) is not StitchToolPreflight)
             or (self.result is not None and type(self.result) is not StitchOperationResult)
             or (
@@ -162,6 +183,7 @@ class _WorkerCommand:
     form: StitchToolForm | None = None
     preflight: StitchToolPreflight | None = None
     execution: StitchOperationExecution | None = None
+    artifact_path: str = ""
 
     def __post_init__(self) -> None:
         if (
@@ -170,6 +192,7 @@ class _WorkerCommand:
             or not self.form_fingerprint
             or type(self.form_revision) is not int
             or self.form_revision < 1
+            or type(self.artifact_path) is not str
             or (self.form is not None and type(self.form) is not StitchToolForm)
             or (
                 self.preflight is not None
@@ -181,7 +204,11 @@ class _WorkerCommand:
             )
         ):
             raise TypeError("Stitch worker command is invalid")
-        if self.action is StitchOwnerAction.PREFLIGHT:
+        if self.action is StitchOwnerAction.REOPEN:
+            valid = bool(self.artifact_path) and all(
+                value is None for value in (self.form, self.preflight, self.execution)
+            )
+        elif self.action is StitchOwnerAction.PREFLIGHT:
             valid = self.form is not None and self.preflight is None and self.execution is None
         else:
             valid = (
@@ -191,7 +218,7 @@ class _WorkerCommand:
                 and self.execution.request is self.preflight.request
                 and self.form_fingerprint == self.preflight.form.fingerprint
             )
-        if not valid:
+        if not valid or (self.action is not StitchOwnerAction.REOPEN and self.artifact_path):
             raise TypeError("Stitch worker command fields disagree")
 
 
@@ -344,6 +371,23 @@ class StitchToolOwner:
                 self._prepared_revision = None
             return identity
 
+    def begin_reopen(self, path: str | Path) -> OperationIdentity | None:
+        """Read one saved result on this owner's worker without run authority.
+
+        The strict reader detaches arrays and closes its handles. Reopening does
+        not reconstruct a source, preflight, execution or output transaction.
+        """
+        shown = str(Path(path).expanduser().absolute())
+        if not str(path).strip() or "\0" in shown:
+            raise ValueError("a saved Stitch result path is required")
+        with self._lock:
+            if self._finalization is not StitchOwnerFinalization.NONE:
+                return None
+            return self._begin_locked(_WorkerCommand(
+                StitchOwnerAction.REOPEN, shown, max(1, self._form_revision),
+                artifact_path=shown,
+            ))
+
     def begin_run(self) -> OperationIdentity | None:
         with self._lock:
             preflight = self._prepared
@@ -434,6 +478,16 @@ class StitchToolOwner:
     def _run_command(self, request, cancel, publish):
         if type(request) is not _WorkerCommand:
             raise TypeError("Stitch worker requires one exact command")
+        if request.action is StitchOwnerAction.REOPEN:
+            publish("reopen", 0, 1)
+            payload = read_analysis_artifact(
+                request.artifact_path, expected_kind=AnalysisArtifactKind.STITCH_1D,
+            )
+            publish("reopen", 1, 1)
+            return StitchOwnerOutcome(
+                StitchOwnerOutcomeKind.REOPENED,
+                payload=payload, artifact_path=request.artifact_path,
+            )
         if request.action is StitchOwnerAction.PREFLIGHT:
             publish("preflight", 0, 1)
             preflight = self._preflight_runner(request.form)
@@ -490,7 +544,7 @@ class StitchToolOwner:
         if type(command) is not _WorkerCommand:
             raise RuntimeError("Stitch worker identity lost its exact command")
         with self._lock:
-            stale = (
+            stale = command.action is not StitchOwnerAction.REOPEN and (
                 self._form is None
                 or self._form.fingerprint != command.form_fingerprint
                 or self._form_revision != command.form_revision

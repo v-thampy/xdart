@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+from xdart.gui.widgets.scientific_plot import (
+    PlotCursorReadout,
+    scaled_intensity as _scaled_intensity,
+    scaled_intensity_label as _scaled_intensity_label,
+    overlay_step,
+    trace_colors,
+)
+
 from dataclasses import dataclass, replace
 import math
 import os
@@ -378,18 +386,9 @@ class ScientificView(QtWidgets.QFrame):
             ONE_D_PLOT_BOTTOM_MARGIN,
         )
         self.legend = self.curve.addLegend()
-        self.cursor_position = pg.LabelItem(justify="right")
-        self.cursor_position.setParentItem(self.curve.getPlotItem())
-        self.cursor_position.anchor(
-            itemPos=(1, 0),
-            parentPos=(1, 0),
-            offset=(-14, 8),
-        )
-        self._mouse_proxy = pg.SignalProxy(
-            signal=self.curve.scene().sigMouseMoved,
-            rateLimit=60,
-            slot=self._mouse_moved,
-        )
+        self._cursor_readout = PlotCursorReadout(self.curve)
+        self.cursor_position = self._cursor_readout.label
+        self._mouse_proxy = self._cursor_readout.proxy
         self.waterfall = ScientificImagePane(lock_aspect=False)
         self.waterfall.setObjectName("e4WaterfallPlot")
         self.bottom_stack = QtWidgets.QStackedWidget()
@@ -2202,10 +2201,7 @@ class ScientificView(QtWidgets.QFrame):
             if prior_contract is not None:
                 self._curve_item_contracts[keys[0]] = prior_contract
 
-        colors = None
-        if color_map != "Default" and color_map in matplotlib_colormaps:
-            positions = [.65] if len(traces) == 1 else np.linspace(.15, .85, len(traces))
-            colors = matplotlib_colormaps[color_map](positions, bytes=True)
+        colors = trace_colors(color_map, len(traces))
         desired_items = []
         for index, (key, trace) in enumerate(
             zip(keys, traces, strict=True)
@@ -2218,11 +2214,7 @@ class ScientificView(QtWidgets.QFrame):
                 offset,
                 title,
             )
-            style_contract = (
-                _TRACE_COLORS[index % len(_TRACE_COLORS)]
-                if colors is None
-                else tuple(int(channel) for channel in colors[index])
-            )
+            style_contract = colors[index]
             item = self._curve_items_by_key.get(key)
             prior_contract = self._curve_item_contracts.get(key)
             clip_eligible = (
@@ -2634,23 +2626,7 @@ class ScientificView(QtWidgets.QFrame):
         return values, y_axis_choice
 
     def _mouse_moved(self, positions: object) -> None:
-        position = positions
-        if type(positions) is tuple:
-            if not positions:
-                return
-            position = positions[0]
-        if not isinstance(position, QtCore.QPointF):
-            return
-        plot = self.curve.getPlotItem()
-        if not plot.sceneBoundingRect().contains(position):
-            self.cursor_position.setText("")
-            self.curve.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
-            return
-        point = plot.vb.mapSceneToView(position)
-        self.cursor_position.setText(
-            f"x={point.x():.2f}, y={point.y():.2e}"
-        )
-        self.curve.setCursor(QtCore.Qt.CursorShape.CrossCursor)
+        self._cursor_readout.mouse_moved(positions)
 
     @staticmethod
     def _set_data_combo(combo: QtWidgets.QComboBox, value: str) -> None:
@@ -3351,31 +3327,6 @@ class ScientificView(QtWidgets.QFrame):
         self.commandRequested.emit(ShellCommand(kind, value, path))
 
 
-def _scaled_intensity(values: np.ndarray, scale: str) -> np.ndarray:
-    if scale == "Linear":
-        return values
-    result = np.asarray(values, dtype=float).copy()
-    finite = result[np.isfinite(result)]
-    if not finite.size:
-        return result
-    if scale == "Log":
-        minimum = float(np.min(finite))
-        if minimum < 1.0:
-            result -= minimum - 1.0
-        return np.log10(result)
-    if scale == "Sqrt":
-        return np.sign(result) * np.sqrt(np.abs(result))
-    raise ValueError(f"unsupported intensity scale: {scale}")
-
-
-def _scaled_intensity_label(label: str, scale: str) -> str:
-    if scale == "Log":
-        return f"Log {label}"
-    if scale == "Sqrt":
-        return f"√{label}"
-    return label
-
-
 def _offset_intensity(
     values: np.ndarray,
     index: int,
@@ -3405,30 +3356,7 @@ def _overlay_step(
     traces,
     offset_percent: float,
 ) -> float:
-    minimum = np.inf
-    maximum = -np.inf
-    for trace in traces:
-        finite = trace.intensity[np.isfinite(trace.intensity)]
-        if finite.size:
-            minimum = min(minimum, float(np.min(finite)))
-            maximum = max(maximum, float(np.max(finite)))
-    if not np.isfinite(minimum) or not np.isfinite(maximum):
-        return 0.0
-    return float(offset_percent) * (maximum - minimum) / 100.0
-
-
-_TRACE_COLORS = (
-    (31, 119, 180),
-    (255, 127, 14),
-    (44, 160, 44),
-    (214, 39, 40),
-    (148, 103, 189),
-    (140, 86, 75),
-    (227, 119, 194),
-    (127, 127, 127),
-    (188, 189, 34),
-    (23, 190, 207),
-)
+    return overlay_step((trace.intensity for trace in traces), offset_percent)
 _MAX_RETAINED_CURVE_ITEMS = 32
 # Axis-re-flow-driven share-link follows allowed between real triggers: a
 # legitimate chain is two (the follow's own Y autorange may re-flow once).

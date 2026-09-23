@@ -32,6 +32,8 @@ class PlotOptionsDialog(QtWidgets.QDialog):
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
+        *,
+        show_waterfall: bool = True,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("e4PlotOptionsDialog")
@@ -41,6 +43,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
         waterfall = self._section(layout, "Waterfall")
+        waterfall.parentWidget().setVisible(show_waterfall)
         waterfall.addWidget(QtWidgets.QLabel("Y-Axis"), 0, 0)
         waterfall.addWidget(QtWidgets.QLabel("Start"), 0, 1)
         waterfall.addWidget(QtWidgets.QLabel("Stop"), 0, 2)

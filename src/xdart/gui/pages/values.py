@@ -26,6 +26,7 @@ class PageCapability(str, Enum):
 
 class PageLifecycle(str, Enum):
     SWITCHABLE = "switchable"
+    RETAINED = "retained"
     EXIT_ONLY = "exit-only"
 
 

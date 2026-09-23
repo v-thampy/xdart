@@ -337,6 +337,9 @@ class Main(QMainWindow):
         self._process_exit_requested = False
         self._tool_handles = {}
         self._tool_actions = {}
+        self._page_handles = {}
+        self._page_stack = QtWidgets.QStackedWidget(self)
+        self.setCentralWidget(self._page_stack)
 
         descriptors = tuple(
             BUILTIN_DESCRIPTORS
@@ -383,18 +386,22 @@ class Main(QMainWindow):
             self.resize(1600, 920)
 
     def _mount_page(self, descriptor):
-        services = self._host_services.for_page(descriptor.key)
-        handle = descriptor.build(services, self)
-        validate_page_handle(descriptor, handle)
+        handle = self._page_handles.get(descriptor.key)
+        if handle is None:
+            services = self._host_services.for_page(descriptor.key)
+            handle = descriptor.build(services, self)
+            validate_page_handle(descriptor, handle)
+            self._page_stack.addWidget(handle.widget)
+            self._page_handles[descriptor.key] = handle
         self.page_descriptor = descriptor
         self.page_handle = handle
         self.selected_page_key = descriptor.key
         # Compatibility name for consumers that need the mounted root widget;
         # host behavior routes only through the typed handle below.
         self.main_widget = handle.widget
-        self.setCentralWidget(handle.widget)
+        self._page_stack.setCurrentWidget(handle.widget)
         self.ui.statusbar.setHidden(
-            descriptor.key == SCATTERING_WORKSPACE_PAGE.key
+            descriptor.lifecycle is PageLifecycle.RETAINED
         )
         if self._menus_initialized:
             self._attach_application_menus()
@@ -597,10 +604,19 @@ class Main(QMainWindow):
         return False
 
     def _run_active(self, *, require_known=False):
-        """Aggregate selected-page and every constructed tool's activity."""
-        return self._page_run_active(
-            require_known=require_known
-        ) or self._tool_run_active()
+        """Aggregate every retained page and constructed tool's activity."""
+        for key, handle in tuple(self._page_handles.items()):
+            if handle.activity is None:
+                if require_known:
+                    return True
+                continue
+            try:
+                if handle.activity.active():
+                    return True
+            except Exception:
+                logger.exception("Page %s activity query failed", key)
+                return True
+        return self._tool_run_active()
 
     def _check_for_updates(self):
         from xdart.modules import updater
@@ -1031,9 +1047,13 @@ class Main(QMainWindow):
         if (PageCapability.RUN_ACTIVITY in self.page_descriptor.capabilities
                 and self._page_run_active()):
             return ActionRefused(PAGE_ACTIVE)
-        receipt = self._close_page()
-        if receipt.status is PageCleanup.PENDING:
-            return ActionRefused(CLEANUP_PENDING)
+        if self.page_descriptor.lifecycle is not PageLifecycle.RETAINED:
+            receipt = self._close_page()
+            if receipt.status is PageCleanup.PENDING:
+                return ActionRefused(CLEANUP_PENDING)
+            previous = self._page_handles.pop(self.selected_page_key)
+            self._page_stack.removeWidget(previous.widget)
+            previous.widget.deleteLater()
         self._mount_page(target)
         _app_settings().setValue("page.selected", str(target.key))
         return ActionCompleted(str(target.key))
@@ -1048,6 +1068,8 @@ class Main(QMainWindow):
 
     def open_tool(self, key):
         descriptor = self.page_registry.get(PageKey(str(key)))
+        if isinstance(descriptor, PageDescriptor):
+            return self._present_action_outcome(self.select_page(descriptor.key))
         if not isinstance(descriptor, ToolDescriptor):
             return ActionRefused(UNKNOWN_PAGE)
         handle = self._tool_handles.get(descriptor.key)
@@ -1094,7 +1116,10 @@ class Main(QMainWindow):
             return CloseReceipt(PageCleanup.PENDING, f"close failed: {exc}")
 
     def _close_page_and_tools(self):
-        receipts = [self._close_page()]
+        receipts = [
+            self._close_tool(key, handle)
+            for key, handle in tuple(self._page_handles.items())
+        ]
         receipts.extend(
             self._close_tool(key, handle)
             for key, handle in tuple(self._tool_handles.items())

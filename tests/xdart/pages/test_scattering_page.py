@@ -27,6 +27,7 @@ from xdart.gui.pages.catalog import (
     RSM_TOOL,
     SCATTERING_WORKSPACE_PAGE,
     STITCH_TOOL,
+    STITCH_PAGE,
 )
 from xdart.gui.pages.registry import PageRegistry
 from xdart.gui.pages.values import (
@@ -61,10 +62,11 @@ def isolated_settings(tmp_path, monkeypatch):
 def test_catalog_registers_current_workspace_first_and_as_default():
     assert tuple(page.key for page in BUILTIN_PAGES) == (
         "scattering-workspace",
+        "stitch",
     )
     assert DEFAULT_PAGE_KEY == "scattering-workspace"
     assert BUILTIN_PAGES[0] is SCATTERING_WORKSPACE_PAGE
-    assert BUILTIN_DESCRIPTORS == (*BUILTIN_PAGES, STITCH_TOOL, RSM_TOOL)
+    assert BUILTIN_DESCRIPTORS == (*BUILTIN_PAGES, RSM_TOOL)
     assert STITCH_TOOL.key == STITCH_TOOL_KEY == "stitch"
     assert (
         STITCH_TOOL.label,
@@ -83,7 +85,7 @@ def test_catalog_registers_current_workspace_first_and_as_default():
 
 def test_scattering_descriptor_declares_the_frozen_adoption_ports():
     page = SCATTERING_WORKSPACE_PAGE
-    assert page.lifecycle is PageLifecycle.EXIT_ONLY
+    assert page.lifecycle is PageLifecycle.RETAINED
     assert page.order == 0
     assert page.capabilities == frozenset({
         PageCapability.OPEN_FOLDER,
@@ -104,7 +106,7 @@ def test_default_selection_is_the_current_workspace():
     assert registry.select(
         "scattering-workspace", DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
     assert registry.select(
-        STITCH_TOOL_KEY, DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
+        STITCH_TOOL_KEY, DEFAULT_PAGE_KEY) is STITCH_PAGE
     assert registry.select(
         RSM_TOOL_KEY, DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
 
@@ -136,7 +138,7 @@ def test_catalog_import_does_not_import_the_scattering_package():
     assert "lazy-ok" in result.stdout
 
 
-def test_builtin_stitch_action_constructs_one_idle_tool_only_when_opened(
+def test_builtin_stitch_action_retains_native_page_and_integration_workspace(
         qapp, isolated_settings):
     from xdart.gui.pages.values import ActionCompleted
 
@@ -157,23 +159,24 @@ def test_builtin_stitch_action_constructs_one_idle_tool_only_when_opened(
         assert page._shell.run_controls.startButton.isEnabled()
         page._shell.run_controls.startButton.click()
         qapp.processEvents()
-        handle = window._tool_handles[STITCH_TOOL.key]
-        assert handle.widget.objectName() == "stitchToolDialog"
-        assert handle.widget.parity_hold.text() == (
-            "Mode: 1-D only · 2-D held pending the scan-14 orientation parity oracle"
-        )
+        handle = window._page_handles[STITCH_PAGE.key]
+        assert handle.widget.objectName() == "stitchPage"
+        assert not handle.widget.isWindow()
+        assert window.centralWidget().currentWidget() is handle.widget
+        handle.widget.set_field("scan", "14")
+        assert window.select_page(DEFAULT_PAGE_KEY) == ActionCompleted(str(DEFAULT_PAGE_KEY))
+        assert window.main_widget is page
         combo.setCurrentText("Stitch 2D")
         assert not page._shell.run_controls.startButton.isEnabled()
         page._shell.run_controls.startButton.click()
         qapp.processEvents()
         assert requested == ["stitch"]
-        assert handle.widget.source_widget._external_execution is True
-        assert handle.widget.source_widget._probe_executor is None
         assert handle.activity.active() is False
         assert window.open_tool(STITCH_TOOL.key) == ActionCompleted("stitch")
-        assert window._tool_handles[STITCH_TOOL.key] is handle
+        assert window._page_handles[STITCH_PAGE.key] is handle
+        assert handle.widget._value("scan") == "14"
+        assert STITCH_TOOL.key not in window._tool_handles
         assert RSM_TOOL.key not in window._tool_handles
-        assert handle.close().status is PageCleanup.CLEAN
     finally:
         window.close()
         window.deleteLater()

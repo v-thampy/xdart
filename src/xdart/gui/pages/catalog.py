@@ -26,6 +26,11 @@ def _build_stitch_tool(services, parent):
     return build_stitch_tool(services, parent)
 
 
+def _build_stitch_page(services, parent):
+    from .stitch_workspace import build_stitch_workspace
+    return build_stitch_workspace(services, parent)
+
+
 def _build_rsm_tool(services, parent):
     from xdart.gui.tools.rsm_tool import build_rsm_tool
 
@@ -39,7 +44,7 @@ SCATTERING_WORKSPACE_PAGE = PageDescriptor(
     icon_key="scattering-workspace",
     category="workspace",
     order=0,
-    lifecycle=PageLifecycle.EXIT_ONLY,
+    lifecycle=PageLifecycle.RETAINED,
     capabilities=frozenset({
         PageCapability.OPEN_FOLDER,
         PageCapability.SETTINGS_PERSISTENCE,
@@ -52,7 +57,22 @@ SCATTERING_WORKSPACE_PAGE = PageDescriptor(
     build=_build_scattering_workspace,
 )
 
-BUILTIN_PAGES = (SCATTERING_WORKSPACE_PAGE,)
+STITCH_PAGE = PageDescriptor(
+    key=STITCH_TOOL_KEY,
+    label="Stitch 1D",
+    description="Native finite Stitch workspace",
+    icon_key="stitch",
+    category="workspace",
+    order=100,
+    lifecycle=PageLifecycle.RETAINED,
+    capabilities=frozenset({
+        PageCapability.OPEN_FOLDER, PageCapability.RUN_CONTROL,
+        PageCapability.RUN_ACTIVITY, PageCapability.APP_MENU_HOSTS,
+    }),
+    build=_build_stitch_page,
+)
+
+BUILTIN_PAGES = (SCATTERING_WORKSPACE_PAGE, STITCH_PAGE)
 
 # Processing tools are launched through the workspace mode selector and Run.
 STITCH_TOOL = ToolDescriptor(
@@ -77,4 +97,4 @@ RSM_TOOL = ToolDescriptor(
     tool_kind="processing",
 )
 
-BUILTIN_DESCRIPTORS = (*BUILTIN_PAGES, STITCH_TOOL, RSM_TOOL)
+BUILTIN_DESCRIPTORS = (*BUILTIN_PAGES, RSM_TOOL)
