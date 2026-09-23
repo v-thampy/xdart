@@ -21,16 +21,18 @@ from xrd_tools.io.output_transaction import OutputTransactionCoordinator
 from tests.core.test_analysis_artifact import _execution_attestation
 
 
-def _publish(tmp_path, *, unit="q_A^-1", xu=False, science_frame_count=3, fractional=False):
+def _publish(tmp_path, *, unit="q_A^-1", xu=False, science_frame_count=3, fractional=False, source_stamp=True):
     project = tmp_path / "project"
     project.mkdir()
     raw = np.arange(24, dtype=np.int32).reshape(4, 6)
     raw_file = project / "frame.raw"
     raw.tofile(raw_file)
+    state = raw_file.stat()
+    snapshot = {"size": state.st_size, "mtime_ns": state.st_mtime_ns} if source_stamp else {}
     records = [dict(frame_index=index, scan_label=str(scan), source_path=str(raw_file),
         source_frame_index=0, thumbnail=raw.astype(np.float32) + index,
         mask_baked=False, thumbnail_mask_baked=False,
-        source_snapshot=dict(raw_shape=[4, 6], raw_dtype="int32", raw_header_bytes=0, rotation=0),
+        source_snapshot=dict(raw_shape=[4, 6], raw_dtype="int32", raw_header_bytes=0, rotation=0, **snapshot),
         identity=dict(source_id="sample.spec", scan_id=str(scan), frame_index=index,
                       contribution_index=global_index))
         for global_index, (scan, index) in enumerate(((2, 0), (2, 1), (3, 0)))]
@@ -145,3 +147,29 @@ def test_native_mg_preserves_fractional_pixel_split_coverage(tmp_path):
     path, _, _, receipt = _publish(tmp_path, fractional=True)
     payload = read_analysis_artifact(path, expected_receipt=receipt)
     np.testing.assert_array_equal(payload.coverage, np.full(40, .25))
+
+
+def test_changed_raw_source_returns_saved_thumbnail_without_changing_curve(tmp_path):
+    import os
+    path, raw, project, receipt = _publish(tmp_path)
+    payload = read_analysis_artifact(path, expected_receipt=receipt)
+    before = read_contributing_frame_view(path, 0, scan="2", full_raw=True, artifact_payload=payload)
+    original = project / "frame.raw"
+    state = original.stat()
+    (raw + 1000).tofile(original)
+    os.utime(original, ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))
+    assert original.stat().st_size == state.st_size
+    changed = read_contributing_frame_view(path, 0, scan="2", full_raw=True, artifact_payload=payload)
+    assert changed.raw is None
+    np.testing.assert_array_equal(changed.thumbnail, before.thumbnail)
+    assert changed.extra["raw_unavailable_reason"] == "raw source changed since processing"
+    np.testing.assert_array_equal(read_analysis_artifact(path).intensity, payload.intensity)
+
+
+def test_unstamped_source_preserves_curve_and_thumbnail_but_cannot_claim_original_raw(tmp_path):
+    path, raw, _project, _receipt = _publish(tmp_path, source_stamp=False)
+    view = read_contributing_frame_view(path, 0, scan="2", full_raw=True)
+    assert view.raw is None
+    assert view.thumbnail.shape == raw.shape
+    assert view.extra["raw_unavailable_reason"] == "saved raw source identity unavailable"
+    assert read_analysis_artifact(path).intensity.size == 40

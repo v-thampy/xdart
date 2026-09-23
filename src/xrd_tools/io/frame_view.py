@@ -3528,7 +3528,8 @@ def read_contributing_frame_view(
 ) -> FrameView:
     """Read a strictly admitted Stitch source record through shared raw owners.
 
-    A missing original leaves ``raw`` absent and the stored ``thumbnail`` intact,
+    An unavailable or changed original leaves ``raw`` absent and the stored
+    ``thumbnail`` intact, with the reason in ``extra["raw_unavailable_reason"]``,
     allowing the presenter to label fallback honestly. No integrated-frame rows
     or display identities are fabricated for this scan-level result.
     """
@@ -3540,8 +3541,9 @@ def read_contributing_frame_view(
     from xrd_tools.io.nexus_record import frame_record_key
     from xrd_tools.io.read import (
         _raw_frame_parts_from_entry, _frame_group_for_label,
-        _frame_source_read_options, _raw_frame_or_thumbnail,
+        _frame_source_read_options, _raw_frame_or_thumbnail, resolve_source_master,
     )
+    from xrd_tools.sources.execution_graph import SourceFileState
     import json
     import os
 
@@ -3561,7 +3563,8 @@ def read_contributing_frame_view(
     if inspection.frame_manifest_json is None:
         raise KeyError("this artifact has no contributing frame records")
     key = frame_record_key(scan, frame)
-    rows = json.loads(inspection.frame_manifest_json)["records"]
+    frame_manifest = json.loads(inspection.frame_manifest_json)
+    rows = frame_manifest["records"]
     selected = next((row for row in rows if row["key"] == key), None)
     if selected is None:
         raise KeyError(f"unknown contributing frame {key}")
@@ -3575,17 +3578,50 @@ def read_contributing_frame_view(
         group = _frame_group_for_label(entry, frame, scan=scan)
         options = _frame_source_read_options(group)
     raw = None
+    raw_reason = ""
     if full_raw:
+        snapshot = selected["source_snapshot"]
+        expected = [(master, snapshot.get("size"), snapshot.get("mtime_ns"))]
+        if snapshot.get("self_contained") is False:
+            # The primary NeXus file can stay unchanged while its linked detector
+            # data changes. Reuse this exact member's existing dependency stamps
+            # and the same relocatable Project resolver as its raw link.
+            manifest = json.loads(inspection.provenance_json).get("source", {}).get("input_manifest", {})
+            member = next((item for item in manifest.get("members", (manifest,))
+                if item.get("source", {}).get("module_source_fingerprint") == selected["identity"]["source_id"]), None)
+            if member is None:
+                expected.append((None, None, None))
+            else:
+                expected.extend((resolve_source_master(item["relative_path"], scan_file=path,
+                    source_base=frame_manifest["source_base"], source_root=source_root),
+                    item["revision"][3], item["revision"][4])
+                    for item in member["files"] if item["revision"] is not None)
         try:
-            raw = _raw_frame_or_thumbnail(path, frame, master, index, thumbnail,
-                allow_thumbnail=False, preserve_dtype=True, raw_options=options)
-        except KeyError:
-            pass
+            states = []
+            for source_path, size, mtime_ns in expected:
+                if size is None or mtime_ns is None:
+                    raw_reason = "saved raw source identity unavailable"
+                    break
+                if source_path is None:
+                    raise FileNotFoundError("raw source unavailable")
+                state = SourceFileState.capture(Path(source_path))
+                if (state.size, state.mtime_ns) != (size, mtime_ns):
+                    raw_reason = "raw source changed since processing"
+                    break
+                states.append(state)
+            if not raw_reason:
+                raw = _raw_frame_or_thumbnail(path, frame, master, index, thumbnail,
+                    allow_thumbnail=False, preserve_dtype=True, raw_options=options)
+                if not all(state.matches_disk() for state in states):
+                    raw, raw_reason = None, "raw source changed during reading"
+        except (KeyError, OSError):
+            raw, raw_reason = None, "raw source unavailable"
     if _stat_revision(os.stat(path)) != inspection.storage_revision:
         raise AnalysisArtifactInvalid("artifact changed during frame hydration")
     return FrameView(label=frame, raw=raw, thumbnail=thumbnail,
         mask_baked=selected["mask_baked"], metadata_raw=selected["identity"],
-        source_path=None if master is None else str(master), source_frame_index=index)
+        source_path=None if master is None else str(master), source_frame_index=index,
+        extra={"raw_unavailable_reason": raw_reason} if raw_reason else {})
 
 
 def read_frame_view(

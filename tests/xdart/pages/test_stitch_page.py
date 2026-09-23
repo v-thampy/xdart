@@ -458,3 +458,28 @@ def test_directory_mask_picker_retains_the_declared_raw_decoder(qapp, tmp_path):
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
         qapp.processEvents()
+
+
+def test_changed_original_frame_is_labelled_thumbnail_in_popup(qapp, tmp_path):
+    import os
+    from tests.core.test_analysis_stitch_auxiliary import _publish
+    path, raw, project, _receipt = _publish(tmp_path)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.open_result(path)
+        _wait(page, qapp)
+        original_y = page.curve.listDataItems()[0].yData.copy()
+        source = project / "frame.raw"
+        state = source.stat()
+        (raw + 100).tofile(source)
+        os.utime(source, ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))
+        page._show_raw()
+        page._raw_popup.mode.setCurrentText("Full Raw")
+        _wait(page, qapp)
+        assert page._raw_frame_view.raw is None
+        assert "Thumbnail · raw source changed since processing" in page._raw_popup.caption.text()
+        np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, original_y)
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()

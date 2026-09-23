@@ -155,6 +155,21 @@ def test_native_nexus_group_keeps_exact_external_dataset_and_raw_dtype(tmp_path)
         frame = read_contributing_frame_view(output.target, row["identity"]["frame_index"],
             scan=row["key"].split("/")[0][5:], full_raw=True, artifact_payload=result.payload)
         np.testing.assert_array_equal(frame.raw, originals[index // 2][(0, 4)[index % 2]])
+    # A changed external detector segment must not inherit the unchanged master
+    # stamp. The same saved result still supplies its original thumbnail/curve.
+    import os
+    dependency = tmp_path / "detector.h5"
+    state = dependency.stat()
+    with h5py.File(dependency, "r+") as stream:
+        stream["frames"][0] = originals[1][0] + 50
+    os.utime(dependency, ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))
+    row = result.payload.contributing_frames[2]
+    changed = read_contributing_frame_view(output.target, row["identity"]["frame_index"],
+        scan=row["key"].split("/")[0][5:], full_raw=True, artifact_payload=result.payload)
+    assert changed.raw is None
+    assert changed.thumbnail is not None
+    assert changed.extra["raw_unavailable_reason"] == "raw source changed since processing"
+    np.testing.assert_array_equal(read_analysis_artifact(output.target).intensity, result.payload.intensity)
 
 
 def test_native_rejects_energy_conflict_in_later_group_member(tmp_path):

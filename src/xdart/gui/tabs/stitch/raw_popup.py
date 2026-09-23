@@ -35,7 +35,7 @@ class StitchRawPopup(QtWidgets.QDialog):
             self.caption.setText(f"{label} · Image unavailable")
             return
         mode = "Full Raw" if raw is not None else (
-            "Thumbnail · raw source unavailable" if full else "Thumbnail")
+            "Thumbnail · " + frame_view.extra.get("raw_unavailable_reason", "raw source unavailable") if full else "Thumbnail")
         self.caption.setText(f"{label} · {mode}")
         self.image.render(image, color_map="viridis" if color_map == "Default" else color_map,
                           log_scale=log)
