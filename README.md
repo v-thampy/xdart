@@ -31,19 +31,7 @@ fitting, and analysis of processed results.
 
 ## Quick start
 
-**Jupyter / VS Code:** from your editable checkout or notebook Pixi workspace,
-register its kernel once:
-
-```bash
-pixi run --locked python -m ipykernel install --user --name xdart-pixi --display-name "Python (xdart Pixi)"
-```
-
-Select **Python (xdart Pixi)** in the notebook's kernel picker, then **Run All**.
-If it is missing, update the VS Code extensions and restart VS Code.
-[Notebook setup and troubleshooting](docs/INSTALLATION.md#jupyter-and-vs-code-kernel-setup)
-covers installation, kernel selection, and the missing-kernel steps.
-
-**Installing the desktop GUI:**
+**Installing the xdart GUI:**
 
 1. **[Install Pixi](https://pixi.sh/latest/installation/)**, then open a new
    terminal. You do not need to install Python or conda separately.
@@ -63,11 +51,25 @@ covers installation, kernel selection, and the missing-kernel steps.
 
 To update later, close xdart and run `pixi global update xdart`.
 
-That installation includes JupyterLab and the notebook packages. Run
+[Alternate installation methods and more details](docs/INSTALLATION.md)
+
+**Jupyter / VS Code (after installation):** the installation above includes
+JupyterLab and the notebook packages. Run
 `xdart-notebook` to start JupyterLab from it, or `xdart-notebook --register-kernel`
 once to offer it to VS Code as the kernel **Python (xdart)**.
 
-[Alternate installation methods and more details](docs/INSTALLATION.md)
+For an installed editable checkout or
+[notebook Pixi workspace](docs/INSTALLATION.md#headless--notebooks-with-pixi),
+register its kernel once instead:
+
+```bash
+pixi run --locked python -m ipykernel install --user --name xdart-pixi --display-name "Python (xdart Pixi)"
+```
+
+Select the matching kernel in the notebook's kernel picker, then **Run All**.
+If it is missing, update the VS Code extensions and restart VS Code.
+[Notebook setup and troubleshooting](docs/INSTALLATION.md#jupyter-and-vs-code-kernel-setup)
+covers installation, kernel selection, and the missing-kernel steps.
 
 For Python scripts and Jupyter, start with the
 [headless integration notebook](examples/notebooks/06_headless_reduction_pipeline.ipynb).
