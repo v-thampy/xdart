@@ -244,8 +244,8 @@ def test_one_and_many_candidates_show_same_nonblocking_dialog_then_accept_worker
         assert page._authored_asset_dialog is None
         dialog = _present_confirmation(page)
         assert dialog.selected_path == newest.path
-        assert dialog.full_path.text() == newest.path
-        assert dialog.full_path.isReadOnly()
+        assert dialog.paths.lineEdit().text() == newest.path
+        assert dialog.paths.lineEdit().isReadOnly()
         assert store.snapshot().thaw().poni_file == ""
 
         page._refresh_shell()
@@ -259,9 +259,9 @@ def test_one_and_many_candidates_show_same_nonblocking_dialog_then_accept_worker
         assert dialog.paths.count() == 2
         dialog.paths.setCurrentIndex(1)
         assert dialog.selected_path == older.path
-        assert dialog.full_path.text() == older.path
+        assert dialog.paths.lineEdit().text() == older.path
         dialog.paths.setCurrentIndex(0)
-        assert dialog.full_path.text() == newest.path
+        assert dialog.paths.lineEdit().text() == newest.path
         dialog.accept_button.click()
         _finish_validation(page)
         assert threads and threads[0].startswith("scattering-operation-")
@@ -331,7 +331,7 @@ def test_cancel_duplicate_stale_and_forged_result_are_zero_write(
         qapp.processEvents()
         assert dialog.isVisible() and dialog.paths.count() == 1
         assert dialog.selected_path == candidate.path
-        assert dialog.full_path.text() == candidate.path
+        assert dialog.paths.lineEdit().text() == candidate.path
         dialog.cancel_button.click()
         qapp.processEvents()
         QtCore.QCoreApplication.sendPostedEvents(

@@ -463,19 +463,16 @@ class _AuthoredAssetDialog(QtWidgets.QDialog):
         layout.addWidget(label)
         self.paths = QtWidgets.QComboBox(self)
         self.paths.setObjectName("authoredAssetPath")
+        # A read-only editor keeps long paths scrollable/copyable in the selector.
+        self.paths.setEditable(True)
+        self.paths.lineEdit().setReadOnly(True)
         for path in paths:
             self.paths.addItem(path, path)
         if not paths:
             self.paths.addItem("No new valid authored file was found.", None)
         self.paths.setToolTip(paths[0] if paths else "")
         layout.addWidget(self.paths)
-        self.full_path = QtWidgets.QLineEdit(self)
-        self.full_path.setObjectName("authoredAssetFullPath")
-        self.full_path.setReadOnly(True)
-        self.full_path.setText(paths[0] if paths else "")
-        self.full_path.setToolTip(paths[0] if paths else "")
         self.paths.currentIndexChanged.connect(self._show_selected_path)
-        layout.addWidget(self.full_path)
         buttons = QtWidgets.QHBoxLayout()
         self.accept_button = QtWidgets.QPushButton("Accept", self)
         self.accept_button.setObjectName("authoredAssetAccept")
@@ -504,7 +501,7 @@ class _AuthoredAssetDialog(QtWidgets.QDialog):
     def set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
         enabled = not busy
-        self.paths.setEnabled(enabled and self.paths.count() > 1)
+        self.paths.setEnabled(enabled)
         self.accept_button.setEnabled(enabled and self.selected_path is not None)
         self.choose_button.setEnabled(enabled)
         self.cancel_button.setEnabled(enabled)
@@ -512,8 +509,6 @@ class _AuthoredAssetDialog(QtWidgets.QDialog):
     def _show_selected_path(self, _index: int) -> None:
         value = self.selected_path or ""
         self.paths.setToolTip(value)
-        self.full_path.setText(value)
-        self.full_path.setToolTip(value)
 
     def close_inert(self) -> None:
         self._inert = True
