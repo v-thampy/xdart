@@ -17,6 +17,7 @@ from xrd_tools.analysis.module_transaction import ModuleDisposition
 from xrd_tools.analysis.stitch_operation import StitchGeometryKind, run_stitch_operation
 from xrd_tools.analysis.xu_stitch_calibration import canonical_surface_resource_bytes
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
+from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from tests.core.test_stitch_operation import _goniometer_record, _ring
 
 
@@ -32,7 +33,8 @@ def qapp():
 
 def _wait(page, qapp, timeout=30):
     until = time.monotonic() + timeout
-    while page._owner.busy and time.monotonic() < until:
+    qapp.processEvents()
+    while (page._owner.busy or page._raw_pending or page._queued_jobs) and time.monotonic() < until:
         qapp.processEvents()
         time.sleep(.005)
     qapp.processEvents()
@@ -73,19 +75,94 @@ def _form(tmp_path, backend):
 
 
 def _fill(page, form):
-    values = {key: getattr(form, key) for key in (
-        "project_root", "spec_path", "scan", "image_dir", "image_stem", "raw_dtype",
-        "raw_header_skip", "geometry_path", "threshold", "npt_1d", "output_path",
-    )}
-    values.update(
-        backend="xrayutilities histogram" if form.backend == "xu_hist" else "pyFAI MultiGeometry",
-        detector_rows=form.detector_shape[0], detector_cols=form.detector_shape[1],
-        source_motors=", ".join(f"{key}={value}" for key, value in form.source_motors),
-        q_min=form.q_range[0], q_max=form.q_range[1],
-    )
-    for key, value in values.items():
-        page.set_field(key, str(value))
+    page.load_form(form)
     assert page.build_form().fingerprint == form.fingerprint
+
+
+def _fill_native(page, form):
+    page.load_form(form)
+    page._native_mode = True
+    page.set_field("output_path", str(Path(form.output_path).parent))
+    page.set_sources((form.spec_path,))
+    page.set_field("radial_auto", True)
+    page.set_field("threshold", "")
+
+
+def test_native_source_controls_ranges_and_threshold_semantics(qapp, tmp_path):
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        _fill_native(page, _form(tmp_path, "multigeometry"))
+        assert page.build_form().q_range is None
+        assert page.build_form().conditioning.mode == "auto"
+        assert not page.radial_range._toggle[1].isChecked()
+        page.radial_range._toggle[1].click()
+        assert page.build_form().q_range is not None
+        page.set_field("unit", "2θ (°)")
+        assert page.build_form().unit == "2th_deg"
+        assert page.radial_range.label.text() == "2θ (°)"
+        page.set_field("threshold", "125")
+        page.set_field("threshold_min", "4")
+        policy = page.build_form().conditioning
+        assert (policy.mode, policy.threshold_min, policy.threshold_max) == ("manual", 4., 125.)
+        page.threshold_range._toggle[1].click()
+        assert page.build_form().conditioning.mode == "off"
+        page.threshold_range._toggle[1].click()
+        assert page.build_form().conditioning.mode == "manual"
+        page.set_field("threshold", "")
+        assert page.build_form().conditioning.mode == "auto"
+        assert page._value("threshold_min") == 0.
+        page.set_field("scan", "1,2,[2-5,8]")
+        assert page.build_form().source_selection.scans == "1,2,[2-5,8]"
+        page.set_field("scan_mode", "Stitch All")
+        assert page.build_form().source_selection.stitch_all
+        assert page._rows["scan"].isHidden()
+        page.set_field("source_kind", "NeXus")
+        files = (str(tmp_path / "one.nxs"), str(tmp_path / "two.nxs"))
+        page.set_sources(files)
+        assert page.build_form().source_selection.paths == files
+        assert page._rows["image_dir"].isHidden()
+        page.set_field("source_kind", "Directory")
+        page.set_sources((str(tmp_path),))
+        assert page.build_form().source_selection.kind == "Directory"
+        assert page._rows["scan_mode"].isHidden()
+    finally:
+        page.shutdown()
+
+
+def test_native_saved_frame_popup_keeps_curve_and_shows_thumbnail_fallback(qapp, tmp_path):
+    from tests.core.test_analysis_stitch_auxiliary import _publish
+    path, raw, project, _receipt = _publish(tmp_path)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.open_result(path)
+        _wait(page, qapp)
+        assert [page.frames.item(i).text() for i in range(page.frames.count())] == ["2-0", "2-1", "3-0"]
+        original_y = page.curve.listDataItems()[0].yData.copy()
+        page.viewer_axis.setCurrentIndex(1)
+        np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, original_y)
+        assert page.curve.getPlotItem().getAxis("bottom").labelText == "2θ"
+        page._show_raw()
+        _wait(page, qapp)
+        assert page._raw_frame_view.thumbnail is not None
+        page._raw_popup.mode.setCurrentText("Full Raw")
+        _wait(page, qapp)
+        np.testing.assert_array_equal(page._raw_frame_view.raw, raw)
+        page.frames.setCurrentRow(2)
+        assert page._raw_popup.image.canvas.raw_image.size == 0
+        assert page._raw_popup.caption.text() == "Loading selected frame…"
+        _wait(page, qapp)
+        assert "3-0" in page._raw_popup.caption.text()
+        np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, original_y)
+        project.rename(tmp_path / "unavailable")
+        page.frames.setCurrentRow(1)
+        _wait(page, qapp)
+        assert page._raw_frame_view.raw is None
+        assert "Thumbnail · raw source unavailable" in page._raw_popup.caption.text()
+        page._raw_popup.close()
+        assert page._raw_frame_view is None
+        assert page._raw_popup.image.canvas.raw_image.size == 0
+    finally:
+        page.shutdown()
 
 
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
@@ -176,5 +253,101 @@ def test_reopen_corrupt_file_cannot_grant_run_or_replace_display(qapp, tmp_path)
         assert page._owner.prepared is None
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
+@pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
+def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qapp, tmp_path, backend):
+    form = _form(tmp_path, backend)
+    spec = Path(form.spec_path)
+    spec.write_text(spec.read_text() +
+        "\n#S 2 ascan del 14 15 1 1\n#D today\n#P0 14 -10 17000.018\n"
+        "#N 3\n#L del  nu  energy\n14 -10 17000.018\n15 -10 17000.018\n"
+        "\n#S 3 ascan del 14 15 1 1\n#D today\n#P0 14 -10 17000.018\n"
+        "#N 3\n#L del  nu  energy\n14 -10 17000.018\n15 -10 17000.018\n")
+    if backend == "multigeometry":
+        spec.write_text(spec.read_text().replace("17000.018", "12398.41984"))
+    for index in range(2):
+        source = Path(form.image_dir) / f"sample_scan1_{index:04d}.raw"
+        (Path(form.image_dir) / f"sample_scan2_{index:04d}.raw").write_bytes(source.read_bytes())
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        _fill_native(page, form)
+        page.set_field("image_stem", "sample_scan{scan}_")
+        page.set_field("scan", "1,[1,2],3")
+        page.set_field("unit", "2θ (°)")
+        page.begin_preview()
+        _wait(page, qapp)
+        assert page._owner.prepared is not None, page.run_bar.readinessLabel.full_text()
+        requests = page._owner.prepared.requests
+        assert len(requests) == 2
+        assert len(page._owner.prepared.skipped) == 1
+        assert "No detector images" in page.preview_text.toPlainText()
+        assert page._value("threshold") == np.iinfo(np.int32).max
+        assert page.build_form().conditioning.mode == "auto"
+        page.run_bar.startButton.click()
+        _wait(page, qapp, timeout=60)
+        assert page.results.count() == 2, page.run_bar.readinessLabel.full_text()
+        assert not page._queued_jobs
+        grouped = read_analysis_artifact(requests[1].module.output.target)
+        assert grouped.native_unit == "2th_deg"
+        assert len(grouped.contributing_frames) == 4
+        assert [page.frames.item(i).text() for i in range(page.frames.count())] == ["1-0", "1-1", "2-0", "2-1"]
+        assert page.build_form().unit == "2th_deg"
+        assert page.viewer_axis.currentData() == "q_A^-1"
+        np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, grouped.intensity)
+        page.viewer_axis.setCurrentIndex(1)
+        np.testing.assert_array_equal(page.curve.listDataItems()[0].xData, grouped.radial_axis("2th_deg"))
+        page.set_field("threshold_min", "4")
+        assert page.build_form().conditioning == StitchConditioning("manual", 4., float(np.iinfo(np.int32).max))
+        page.set_field("output_path", str(tmp_path / "cancelled"))
+        page.begin_preview()
+        _wait(page, qapp)
+        second_target = Path(page._owner.prepared.requests[1].module.output.target)
+        page.begin_run()
+        page.stop()
+        _wait(page, qapp)
+        assert not page._queued_jobs
+        assert not second_target.exists()
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
+def test_mask_exact_frame_staging_is_unrotated_and_page_shutdown_reaps_worker(qapp, tmp_path):
+    from threading import Event
+    import tifffile
+    from xdart.gui.tabs.stitch.mask import StitchMaskDialog
+    form = _form(tmp_path, "multigeometry")
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        _fill_native(page, form)
+        page.set_field("image_rotation", "180")
+        source = page._source_spec_for_tools()
+        cancel = Event()
+        cancel.set()
+        staging = tmp_path / "mask-source"
+        assert StitchMaskDialog._run((source, 1, str(staging), 180), cancel, lambda *args: None) is None
+        images = tuple(staging.glob("frame-*/selected.tif"))
+        assert len(images) == 1
+        original = np.fromfile(Path(form.image_dir) / "sample_scan1_0001.raw", dtype="int32").reshape(form.detector_shape)
+        np.testing.assert_array_equal(tifffile.imread(images[0]), original)
+        page._make_mask()
+        dialog = page._authoring_dialogs[-1]
+        dialog.begin()
+        assert dialog.active()
+        until = time.monotonic() + 10
+        receipt = page.shutdown()
+        while receipt.status is PageCleanup.PENDING and time.monotonic() < until:
+            qapp.processEvents()
+            time.sleep(.005)
+            receipt = page.shutdown()
+        assert receipt.status is PageCleanup.CLEAN
+        assert not dialog.active()
+        assert not page._value("mask_path")
+    finally:
+        page.shutdown()
         page.deleteLater()
         qapp.processEvents()
