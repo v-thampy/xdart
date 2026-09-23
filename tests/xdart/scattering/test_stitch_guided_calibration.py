@@ -159,7 +159,7 @@ def test_direct_beam_window_handoff_uses_actual_api_and_seed_not_bounds(tmp_path
     expected = calibrate_direct_beam(angles, images, detector='Detector', detector_config=config(),
                                      beam_pixel=beam, angle_zero_deg=7.)
     assert result.distance_m == pytest.approx(expected.distance_m)
-    assert result.point_ids == tuple(range(7))
+    assert result.point_ids == tuple(('1.1', index) for index in range(7))
     dialog = StitchCalibrationDialog(tmp_path)
     dialog._distance_result = result
     dialog._apply_distance()
@@ -171,3 +171,78 @@ def test_direct_beam_window_handoff_uses_actual_api_and_seed_not_bounds(tmp_path
     assert dialog._distance_provenance['regression_std_m'] >= 0
     assert 'residuals_px' in dialog._distance_provenance
     dialog.close()
+
+
+@pytest.mark.parametrize('source_kind', ['spec_container', 'nexus'])
+def test_direct_beam_fit_button_reads_container_sources(tmp_path, source_kind):
+    import h5py
+    from pyqtgraph.Qt import QtWidgets, QtTest
+    from tests.core.test_direct_beam import beam_images
+    angles = np.array([1., .5, 0., -.5, -1.])
+    images, _, beam = beam_images(angles, shape=(65, 487),
+        pitches=(516e-6, 172e-6), distance=.5, zero=0)
+    spec = tmp_path / 'direct.spec'
+    spec.write_text('#F direct\n#O0 eta\n#S 8 ascan del 1 -1 4 1\n'
+        '#P0 0\n#N 1\n#L del\n' + '\n'.join(map(str, angles)) + '\n')
+    nexus = tmp_path / 'direct.nxs'
+    with h5py.File(nexus, 'w') as handle:
+        handle.create_group('measurement').attrs['NX_class'] = 'NXentry'
+        handle['measurement/data/image'] = np.asarray(images).astype('uint32')
+        handle['measurement/data/del'] = angles
+    master = tmp_path / 'direct_master.h5'
+    with h5py.File(master, 'w') as handle:
+        handle.create_group('measurement').attrs['NX_class'] = 'NXentry'
+        handle['measurement/data/data_000001'] = h5py.ExternalLink(nexus.name, '/measurement/data/image')
+        handle['measurement/instrument/detector/detectorSpecific/nimages'] = 1
+    dialog = StitchCalibrationDialog(tmp_path)
+    dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData(source_kind))
+    for key, value in dict(beam_source=spec if source_kind == 'spec_container' else nexus,
+            beam_image_file=master, beam_scan='8.1', beam_entry='measurement',
+            beam_detector='Pilatus100k', beam_pixel=', '.join(map(str, beam))).items():
+        dialog._set_field_text(key, value)
+    assert dialog._fields['beam_scan'].isHidden() == (source_kind == 'nexus')
+    assert dialog._fields['beam_images'].parentWidget().isHidden()
+    dialog.beam_button.click()
+    for _ in range(100):
+        QtWidgets.QApplication.processEvents()
+        if not dialog.active():
+            break
+        QtTest.QTest.qWait(20)
+    assert not dialog.active()
+    result = dialog._distance_result
+    assert result is not None, dialog.status.text()
+    path = master if source_kind == 'spec_container' else nexus
+    assert result.frame_ids == tuple((path, i) for i in range(5))
+    assert result.point_ids == (tuple(('8.1', i) for i in range(5))
+                               if source_kind == 'spec_container' else result.frame_ids)
+    assert result.distance_mm == pytest.approx(500., rel=1e-4)
+    assert result.used.all()
+    assert dialog._text('distance_seed') == ''
+    dialog.compatible.setChecked(True)
+    dialog.apply_distance_button.click()
+    assert float(dialog._text('distance_seed')) == pytest.approx(500., rel=1e-4)
+    assert dialog._text('distance_bounds') == ''
+    # The saved fit provenance must remain JSON serializable for NeXus path IDs.
+    json.dumps(dialog._distance_provenance)
+    dialog.close()
+
+
+def test_direct_beam_container_job_refuses_count_mismatch_and_honours_cancel(tmp_path):
+    import h5py
+    from xdart.gui.pages.operation_owner import OperationCancelled
+    from xdart.gui.tabs.stitch.calibration import _run_job
+    spec = tmp_path / 'direct.spec'
+    spec.write_text('#F direct\n#O0 eta\n#S 8 ascan del 1 -1 4 1\n'
+        '#P0 0\n#N 1\n#L del\n1\n.5\n0\n-.5\n-1\n')
+    nexus = tmp_path / 'direct.nxs'
+    with h5py.File(nexus, 'w') as handle:
+        handle.create_group('entry').attrs['NX_class'] = 'NXentry'
+        handle['entry/data/image'] = np.zeros((4, 65, 487), dtype='uint32')
+    source = SourceSpec(spec, SourceKind.SPEC,
+                        options={'scan': '8.1', 'image_file': str(nexus)})
+    options = dict(detector='Pilatus100k', beam_pixel=(243, 32), angle_zero_deg=0., rotation=0)
+    with pytest.raises(ValueError, match='count mismatch'):
+        _run_job(('distance', (source, 'del', options)), Event(), lambda *_: None)
+    cancelled = Event(); cancelled.set()
+    with pytest.raises(OperationCancelled):
+        _run_job(('distance', (source, 'del', options)), cancelled, lambda *_: None)

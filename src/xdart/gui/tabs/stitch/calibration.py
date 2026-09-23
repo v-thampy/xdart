@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+from contextlib import ExitStack
 import json
 import math
 from pathlib import Path
@@ -57,38 +58,42 @@ def _run_job(request, cancelled, publish):
         return fit_calibration(frames, cancelled=cancelled, **options)
     if kind == 'distance':
         from xrd_tools.sources import open_source
-        from xrd_tools.integrate.direct_beam import calibrate_direct_beam
+        from xrd_tools.integrate.direct_beam import calibrate_direct_beam, open_direct_beam_scan
         from xrd_tools.core.geometry import ImageOrientation
         spec, motor, options = arguments
-        choices = source_frame_choices(spec, (motor,))
-        source = open_source(spec)
-        try:
-            read_failures = {}
+        options = dict(options)
+        if cancelled.is_set():
+            raise OperationCancelled('direct-beam calibration cancelled')
+        with ExitStack() as resources:
+            source_options = dict(motor=motor, entry=spec.entry or 'entry')
             if spec.kind is SourceKind.SPEC:
+                source_options['scan'] = spec.options['scan']
                 options['reader_options'] = dict(spec.options.get('read_image_kwargs', {}))
+                if spec.options.get('image_file'):
+                    source_options['image_file'] = spec.options['image_file']
+                else:
+                    # Preserve the shared strict series discovery and exact
+                    # path/frame references; the loader owns SPEC angle pairing.
+                    choices = source_frame_choices(spec, (motor,))
+                    source = open_source(replace(spec, options={**spec.options,
+                                                              'require_complete_images': True}))
+                    if getattr(source, 'close', None) is not None:
+                        resources.callback(source.close)
+                    frames = (source.frame_for(index) for index, _, _ in choices)
+                    source_options['images'] = ((frame.source_path, frame.source_frame_index or 0)
+                        if frame.source_path is not None else None for frame in frames)
+            inputs = resources.enter_context(open_direct_beam_scan(spec.uri, **source_options))
             def images():
-                for index, _, _ in choices:
+                for frame in inputs.images:
                     if cancelled.is_set():
                         raise OperationCancelled('direct-beam calibration cancelled')
-                    if spec.kind is SourceKind.SPEC:
-                        raw = source.frame_for(index)
-                        yield None if raw.source_path is None else (raw.source_path, raw.source_frame_index or 0)
-                        continue
-                    try:
-                        yield source.load_frame(index)
-                    except (OSError, ValueError, IndexError) as error:
-                        read_failures[index] = f'{type(error).__name__}: {error}'
-                        yield None
-            result = calibrate_direct_beam([row[1][motor] for row in choices], images(),
+                    yield frame
+            result = calibrate_direct_beam(inputs.angles_deg, images(),
                 orientation=ImageOrientation(rotation=options.pop('rotation')),
-                frame_ids=[str(source.frame_for(row[0]).source_path or spec.uri) for row in choices],
-                point_ids=[row[0] for row in choices], **options)
-            return replace(result, rejection_reasons=tuple(read_failures.get(index, reason)
-                for (index, _, _), reason in zip(choices, result.rejection_reasons)))
-        finally:
-            close = getattr(source, 'close', None)
-            if close is not None:
-                close()
+                frame_ids=inputs.frame_ids, point_ids=inputs.point_ids, **options)
+            if cancelled.is_set():
+                raise OperationCancelled('direct-beam calibration cancelled')
+            return result
     raise ValueError('unknown calibration operation')
 
 
@@ -122,6 +127,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.saved_image_rotation = 0
         self._owner = SingleWorkerOwner(_run_job)
         self._fields = {}
+        self._path_rows = {}
         outer = QtWidgets.QVBoxLayout(self)
         heading = QtWidgets.QLabel('Select representative frames, calibrate each image, then fit and save one geometry.')
         heading.setWordWrap(True)
@@ -164,6 +170,14 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         return layout, form
 
     def _edit(self, form, key, label, default='', *, chooser=None):
+        if chooser is not None and key.startswith('beam_'):
+            from xdart.gui.widgets.controls_panel import FormRow
+            row = FormRow(label=label, path=('Calibration', key), value=default, browse=True)
+            row.browseRequested.connect(lambda: self._browse(row.editor, chooser, key=key))
+            self._path_rows[key] = row
+            self._fields[key] = row.editor
+            form.addRow(row)
+            return row.editor
         edit = QtWidgets.QLineEdit(str(default))
         edit.setObjectName(key)
         self._fields[key] = edit
@@ -180,13 +194,26 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             form.addRow(label, row)
         return edit
 
-    def _browse(self, edit, chooser):
+    def _browse(self, edit, chooser, *, key=None):
+        current = self._text(key) if key is not None else edit.text()
         if chooser == 'directory':
-            path = QtWidgets.QFileDialog.getExistingDirectory(self, 'Select images directory', edit.text())
+            path = QtWidgets.QFileDialog.getExistingDirectory(self, 'Select images directory', current)
         else:
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Select file', edit.text(), chooser)
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Select file', current, chooser)
         if path:
-            edit.setText(path)
+            if key is not None:
+                self._set_field_text(key, path)
+            else:
+                edit.setText(path)
+
+    def _set_field_text(self, key, value):
+        if key in self._path_rows:
+            from xrd_tools.session.readiness import ControlFormField, SectionId
+            row = self._path_rows[key]
+            row.apply_field(ControlFormField(section=SectionId.EXPERIMENT, path=row.path,
+                label=row.label.text(), value=str(value), browse=True))
+        else:
+            self._fields[key].setText(str(value))
 
     def _build_source(self):
         layout, form = self._form('1 · Select frames')
@@ -281,10 +308,21 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _build_distance(self):
         layout, form = self._form('Optional · Direct beam distance')
-        self._edit(form, 'beam_source', 'Direct-beam SPEC or NeXus file', chooser='All files (*)')
+        self._beam_form = form
+        self.beam_source_kind = QtWidgets.QComboBox()
+        for label, value in [('SPEC + image series', 'spec_series'),
+                             ('SPEC + Eiger / NeXus', 'spec_container'),
+                             ('NeXus images + metadata', 'nexus')]:
+            self.beam_source_kind.addItem(label, value)
+        form.addRow('Source', self.beam_source_kind)
+        self._edit(form, 'beam_source', 'Direct-beam scan file', chooser='All files (*)')
         self._edit(form, 'beam_scan', 'SPEC scan', '1')
+        self._edit(form, 'beam_image_file', 'Eiger / NeXus images', chooser='HDF5 / NeXus (*.h5 *.hdf5 *.nxs *.nexus);;All files (*)')
         self._edit(form, 'beam_images', 'SPEC images directory', chooser='directory')
         self._edit(form, 'beam_stem', 'Image filename stem', '')
+        self._edit(form, 'beam_entry', 'NeXus entry', 'entry')
+        self.beam_source_kind.currentIndexChanged.connect(self._beam_source_changed)
+        self._beam_source_changed()
         self._edit(form, 'beam_motor', 'Two-theta motor (degrees)', 'del')
         self._edit(form, 'beam_zero', 'Known normal-incidence zero (degrees)', '0')
         self._edit(form, 'beam_pixel', 'Approximate beam pixel x, y (oriented image)', '200, 100')
@@ -296,7 +334,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._edit(form, 'beam_roi', 'ROI x0, y0, x1, y1 (optional)', '')
         self._edit(form, 'beam_mask', 'Mask file (optional)', chooser='Masks (*.edf *.tif *.tiff *.npy);;All files (*)')
         self._edit(form, 'beam_saturation', 'Saturation level (optional)', '')
-        note = QtWidgets.QLabel('Uses the source reader settings and image rotation from Select frames. Distance is perpendicular to the detector plane. Regression uncertainty excludes motor, zero and pitch systematics; it does not set bounds automatically.')
+        note = QtWidgets.QLabel('SPEC supplies the angles for an image series or an Eiger/NeXus container; standalone NeXus supplies both. Angle and image counts must match. Uses the image rotation and image-series reader settings from Select frames. Regression uncertainty excludes motor, zero and pitch systematics; it does not set bounds automatically.')
         note.setWordWrap(True)
         layout.addWidget(note)
         self.beam_button = QtWidgets.QPushButton('Fit direct-beam distance')
@@ -310,6 +348,15 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.apply_distance_button = QtWidgets.QPushButton('Use result as distance seed')
         self.apply_distance_button.clicked.connect(self._apply_distance)
         layout.addWidget(self.apply_distance_button)
+
+    def _beam_source_changed(self):
+        kind = self.beam_source_kind.currentData()
+        for key, visible in [('beam_scan', kind != 'nexus'),
+                             ('beam_image_file', kind == 'spec_container'),
+                             ('beam_images', kind == 'spec_series'),
+                             ('beam_stem', kind == 'spec_series'),
+                             ('beam_entry', kind != 'spec_series')]:
+            self._beam_form.setRowVisible(self._path_rows.get(key, self._fields[key]), visible)
 
     def set_source_context(self, source: SourceSpec, *, image_rotation=0, del_motor='del', nu_motor='nu'):
         if self._owner.busy:
@@ -327,6 +374,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.rotation.setCurrentIndex(max(0, self.rotation.findData(image_rotation)))
 
     def _text(self, key):
+        if key in self._path_rows:
+            return str(self._path_rows[key].current_value()).strip()
         return self._fields[key].text().strip()
 
     def _reader(self):
@@ -339,19 +388,23 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         if not path:
             raise ValueError('select a scan metadata source')
         if beam:
-            from xrd_tools.sources.registry import guess_source_kind
-            kind = guess_source_kind(path)
+            kind = SourceKind.NEXUS_STACK if self.beam_source_kind.currentData() == 'nexus' else SourceKind.SPEC
         else:
             kind = SourceKind(self.source_kind.currentData())
         options = {}
         if kind is SourceKind.SPEC:
+            if beam and self.beam_source_kind.currentData() == 'spec_container':
+                if not self._text('beam_image_file'):
+                    raise ValueError('select the Eiger or NeXus image container for this SPEC scan')
+                return SourceSpec(Path(path).resolve(), kind, entry=self._text('beam_entry') or 'entry',
+                    options={'scan': self._text('beam_scan'), 'image_file': self._text('beam_image_file')})
             if not self._text(prefix + 'images'):
                 raise ValueError('SPEC calibration requires an image directory')
             options = {'scan': self._text(prefix + 'scan'), 'image_dir': self._text(prefix + 'images'),
                        'read_image_kwargs': self._reader()}
             if self._text(prefix + 'stem'):
                 options['image_stem'] = self._text(prefix + 'stem')
-        return SourceSpec(Path(path).resolve(), kind, entry=self._text('entry') or 'entry', options=options)
+        return SourceSpec(Path(path).resolve(), kind, entry=self._text('beam_entry' if beam else 'entry') or 'entry', options=options)
 
     def _start(self, kind, arguments):
         if self._owner.busy:
@@ -475,7 +528,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             regression_std_m=result.distance_std_m, angle_zero_deg=result.angle_zero_deg,
             pixel_pitch_m=result.pixel_pitch_m, image_shape=list(result.image_shape),
             model=result.model, frame_ids=[str(v) for v in result.frame_ids],
-            point_ids=list(result.point_ids), angles_deg=result.angles_deg.tolist(),
+            point_ids=[tuple(str(value) if isinstance(value, Path) else value for value in point)
+                       if isinstance(point, tuple) else point for point in result.point_ids],
+            angles_deg=result.angles_deg.tolist(),
             used=result.used.tolist(), rejection_reasons=list(result.rejection_reasons),
             centres_px=[float(v) if math.isfinite(v) else None for v in result.centres_px],
             residuals_px=[float(v) if math.isfinite(v) else None for v in result.residuals_px],
