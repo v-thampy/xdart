@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable
 import numpy as np
 from PIL import Image, ImageMode, UnidentifiedImageError
+from xdart.calib2_main import CALIBRATION_SAVE_REPORT_ENV
 from fabio.TiffIO import TiffIO; from fabio.tifimage import TifImage
 from xrd_tools.io.image import load_mask, read_image
 from xrd_tools.io.stat_identity import identity_ctime_ns
@@ -184,9 +185,15 @@ class CalibrationResult:
     argv: tuple[str, ...]
     cwd: str
     diagnostic: str = ""
+    save_reported: bool = False
+    last_saved_path: str | None = None
 
     def __post_init__(self) -> None:
         if (type(self.request) is not CalibrationRequest
+                or type(self.save_reported) is not bool
+                or self.last_saved_path is not None
+                and (not self.save_reported
+                     or not _absolute_path(self.last_saved_path))
                 or type(self.candidates) is not tuple
                 or len(self.candidates) > _PONI_CHILD_LIMIT
                 or self.exit_code is not None
@@ -222,8 +229,9 @@ class CalibrationResult:
                     or any(type(value) is not float
                            or not np.isfinite(value)
                            for value in proof.geometry)
-                    or Path(path).parent
-                    != Path(self.request.monitored_directory)):
+                    or (Path(path).parent
+                        != Path(self.request.monitored_directory)
+                        and path != self.last_saved_path)):
                 raise ValueError("calibration result candidates are invalid")
             paths.append(path)
             file_bytes += proof.state.size
@@ -237,6 +245,11 @@ class CalibrationResult:
             raise ValueError("calibration result candidates are invalid")
         for candidate in self.candidates:
             candidate.__post_init__()
+        if self.save_reported and (
+                (self.last_saved_path is None and self.candidates)
+                or (self.last_saved_path is not None
+                    and tuple(paths) != (self.last_saved_path,))):
+            raise ValueError("calibration last-save result is invalid")
         if self.candidates != tuple(sorted(
                 self.candidates,
                 key=lambda candidate: (
@@ -996,14 +1009,34 @@ def _cleanup(stage: Path | None, identity: tuple[int, int] | None, names: tuple[
             if not stat.S_ISDIR(path.lstat().st_mode): path.unlink()
         stage.rmdir(); return ""
     except OSError: return str(stage)
+def _read_calibration_save_report(path: Path):
+    if not path.exists():
+        return False, None
+    with path.open("rb") as stream:
+        data = stream.read(_PATH_BYTES_LIMIT + 1024)
+    report = json.loads(data)
+    if report is None:
+        return True, None
+    if (type(report) is not dict or set(report) != {"path", "sha256"}
+            or not _absolute_path(report["path"])
+            or not _sha256(report["sha256"])):
+        raise ValueError("calibration did not report an exact successful save")
+    candidate = qualify_calibration_candidate(report["path"])
+    if candidate.proof.sha256 != report["sha256"]:
+        raise ValueError("last saved PONI changed before adoption")
+    return True, candidate
+
+
 def run_calibration(
     request: CalibrationRequest, identity: OperationIdentity, cancelled: object,
     publish: Callable[[str, int, int], None],
     seal: Callable[[OperationIdentity], bool],
 ) -> OperationTerminal:
-    """Run pyFAI and discover bounded new or changed direct-child PONIs."""
+    """Run pyFAI and qualify its last save, or discover legacy candidates."""
 
     candidates: tuple[CalibrationCandidate, ...] = ()
+    save_reported = False
+    last_saved = None
     code = None; argv: tuple[str, ...] = ()
     status = OperationTerminalStatus.RETURNED; diagnostic = ""
     try:
@@ -1047,11 +1080,14 @@ def run_calibration(
         publish("launch", 1, 2)
         argv = ((request.executable,) if input_argument is None else
                 (request.executable, input_argument))
-        with _private_child_stderr(directory) as child_stderr:
+        with (tempfile.TemporaryDirectory(prefix=".xdart-calibration-", dir=directory) as report_dir,
+              _private_child_stderr(directory) as child_stderr):
+            report_path = Path(report_dir) / "last-save.json"
             options = dict(
                 cwd=str(directory), shell=False, stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=child_stderr,
                 close_fds=True,
+                env={**os.environ, CALIBRATION_SAVE_REPORT_ENV: str(report_path)},
             )
             options["creationflags" if _WINDOWS else "start_new_session"] = (
                 getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -1072,33 +1108,37 @@ def run_calibration(
             if code != 0:
                 raise _nonzero_child_error(
                     "pyFAI-calib2", code, child_diagnostic)
+            save_reported, last_saved = _read_calibration_save_report(report_path)
         if not _source_context_current(
                 source, request.source_state, directory,
                 request.directory_identity):
             raise ValueError("calibration source context changed during child execution")
         publish("discover", 2, 2)
-        final_identity, final_rows = _poni_inventory(directory)
-        if final_identity != request.directory_identity:
-            raise ValueError("calibration source directory changed during discovery")
-        prior = dict(prior_rows)
-        qualified: list[CalibrationCandidate] = []
-        for name, state in final_rows:
-            if prior.get(name) == state:
-                continue
-            path = directory / name
-            try:
-                proof = _qualify(path)
-                candidate = CalibrationCandidate(str(path), proof)
-                if proof.state != state or not calibration_candidate_current(candidate):
+        if save_reported:
+            candidates = (last_saved,) if last_saved is not None else ()
+        else:
+            final_identity, final_rows = _poni_inventory(directory)
+            if final_identity != request.directory_identity:
+                raise ValueError("calibration source directory changed during discovery")
+            prior = dict(prior_rows)
+            qualified: list[CalibrationCandidate] = []
+            for name, state in final_rows:
+                if prior.get(name) == state:
                     continue
-            except (OSError, ValueError, TypeError, OverflowError):
-                continue
-            qualified.append(candidate)
-        candidates = tuple(sorted(
-            qualified,
-            key=lambda candidate: (
-                -candidate.proof.state.mtime_ns, _path_key(candidate.path)),
-        ))
+                path = directory / name
+                try:
+                    proof = _qualify(path)
+                    candidate = CalibrationCandidate(str(path), proof)
+                    if proof.state != state or not calibration_candidate_current(candidate):
+                        continue
+                except (OSError, ValueError, TypeError, OverflowError):
+                    continue
+                qualified.append(candidate)
+            candidates = tuple(sorted(
+                qualified,
+                key=lambda candidate: (
+                    -candidate.proof.state.mtime_ns, _path_key(candidate.path)),
+            ))
         if not _source_context_current(
                 source, request.source_state, directory,
                 request.directory_identity):
@@ -1110,8 +1150,13 @@ def run_calibration(
         status = OperationTerminalStatus.FAILED
         module, name, message = detached_exception_strings(error)
         diagnostic = f"{module}.{name}: {message}"
-    result = CalibrationResult(request, candidates, code, argv,
-                               request.monitored_directory, diagnostic)
+    if status is not OperationTerminalStatus.RETURNED and save_reported:
+        candidates, save_reported, last_saved = (), False, None
+    result = CalibrationResult(
+        request, candidates, code, argv, request.monitored_directory, diagnostic,
+        save_reported=save_reported,
+        last_saved_path=last_saved.path if last_saved is not None else None,
+    )
     return OperationTerminal(identity, status, diagnostic, result)
 _TIFF_LIMIT, _MASK_LIMIT, _PIXEL_LIMIT, _DECODED_LIMIT = 512 << 20, 64 << 20, 1 << 25, 256 << 20
 _MASK_COERCION_POLICY = "zero-false-real-nonzero-true-nan-true-v1"

@@ -152,7 +152,7 @@ class AuthoredAssetAdoption:
             or self.remember_path
             != (type(self.result) is IntentCommitAccepted)
             or not (type(self.dialog_identity) is AuthoredAssetDialogIdentity
-                    or self.asset == "mask" and self.dialog_identity is None)
+                    or self.dialog_identity is None)
         ):
             raise ValueError("authored-asset adoption is invalid")
 
@@ -166,16 +166,18 @@ class AuthoredAssetTransition:
     cancel_identity: OperationIdentity | None = None
     adoption: AuthoredAssetAdoption | None = None
     error: bool = False
-    mask_set_path: str | None = None
+    asset_set: tuple[str, str] | None = None
 
     def __post_init__(self) -> None:
         valid = (
             type(self.refresh) is AuthoredAssetRefreshEffect
             and type(self.notice) is str
             and type(self.error) is bool
-            and (self.mask_set_path is None or (
-                type(self.mask_set_path) is str
-                and os.path.isabs(self.mask_set_path)
+            and (self.asset_set is None or (
+                type(self.asset_set) is tuple and len(self.asset_set) == 2
+                and self.asset_set[0] in {"poni", "mask"}
+                and type(self.asset_set[1]) is str
+                and os.path.isabs(self.asset_set[1])
             ))
             and (
                 self.issue is None
@@ -217,8 +219,7 @@ class AuthoredAssetTransition:
                     and self.dialog is not None
                     and self.dialog.effect is AuthoredAssetDialogEffect.CLOSE
                     and self.dialog.identity is self.adoption.dialog_identity
-                    or self.adoption.asset == "mask"
-                    and self.adoption.dialog_identity is None
+                    or self.adoption.dialog_identity is None
                     and self.dialog is None
                     and self.refresh is AuthoredAssetRefreshEffect.CONTROLS
                 )
@@ -226,7 +227,7 @@ class AuthoredAssetTransition:
         if self.refresh is AuthoredAssetRefreshEffect.NONE:
             valid = valid and (
                 self.notice == ""
-                and self.mask_set_path is None
+                and self.asset_set is None
                 and self.issue is None
                 and self.dialog is None
                 and self.cancel_identity is None
@@ -246,6 +247,7 @@ class _OpenState:
     expected_shape: tuple[int, int] | None = None
     operation_identity: OperationIdentity | None = None
     candidates: tuple[AuthoredAssetCandidate, ...] = ()
+    auto_adopt: bool = False
     evidence_identity: AuthoredAssetEvidenceIdentity | None = None
     dialog_identity: AuthoredAssetDialogIdentity | None = None
     validation_request: AssetValidationRequest | None = None
@@ -624,15 +626,26 @@ class AuthoredAssetOwner:
         )
         self._next_evidence_serial += 1
         candidates, expected_shape = evidence
+        save_reported = (
+            state.asset == "poni" and terminal.payload.save_reported
+        )
+        if save_reported and not candidates:
+            self._state = _OpenState()
+            return AuthoredAssetTransition(
+                AuthoredAssetRefreshEffect.CONTROLS,
+                "Calibration closed without saving.",
+            )
         self._state = replace(
             state,
             phase=AuthoredAssetPhase.TERMINAL_READY,
             operation_identity=None,
             candidates=candidates,
+            auto_adopt=state.asset == "mask" or save_reported,
             expected_shape=expected_shape,
             evidence_identity=evidence_identity,
         )
         notice = (
+            "Calibration saved; updating PONI File…" if save_reported else
             "Choose whether to adopt the authored PONI."
             if state.asset == "poni" and candidates
             else "No new valid PONI was found; choose an existing PONI or cancel."
@@ -652,6 +665,7 @@ class AuthoredAssetOwner:
             or state.phase is not AuthoredAssetPhase.TERMINAL_READY
             or evidence is not state.evidence_identity
             or state.asset != "poni"
+            or state.auto_adopt
             or state.source_directory is None
         ):
             return AuthoredAssetTransition()
@@ -710,11 +724,11 @@ class AuthoredAssetOwner:
             ),
         )
 
-    def saved_mask_validation_request(
+    def saved_asset_validation_request(
         self, current_stamp: object,
     ) -> AssetValidationRequest | None:
         state = self._state
-        if (type(state) is not _OpenState or state.asset != "mask"
+        if (type(state) is not _OpenState or not state.auto_adopt
                 or state.phase is not AuthoredAssetPhase.TERMINAL_READY):
             return None
         if not _context_current(state, current_stamp):
@@ -722,7 +736,7 @@ class AuthoredAssetOwner:
             return None
         candidate, = state.candidates
         return AssetValidationRequest(
-            "mask", candidate.path, state.expected_shape,
+            state.asset, candidate.path, state.expected_shape,
             candidate, state.source_request,
         )
 
@@ -767,7 +781,7 @@ class AuthoredAssetOwner:
         if (
             type(state) is not _OpenState
             or not (state.phase is AuthoredAssetPhase.CONFIRM_PRESENTED
-                    or state.asset == "mask"
+                    or state.auto_adopt
                     and state.phase is AuthoredAssetPhase.TERMINAL_READY
                     and dialog is None)
             or dialog is not state.dialog_identity
@@ -776,6 +790,9 @@ class AuthoredAssetOwner:
             or request.source_request is not state.source_request
             or request.asset != state.asset
             or request.expected_shape != state.expected_shape
+            or (dialog is None and (
+                len(state.candidates) != 1
+                or request.candidate is not state.candidates[0]))
         ):
             return AuthoredAssetTransition()
         try:
@@ -790,7 +807,7 @@ class AuthoredAssetOwner:
         )
         if dialog is None:
             return AuthoredAssetTransition(
-                AuthoredAssetRefreshEffect.CONTROLS, "Validating saved mask…",
+                AuthoredAssetRefreshEffect.CONTROLS, "Validating saved asset…",
             )
         return AuthoredAssetTransition(
             AuthoredAssetRefreshEffect.DIALOG,
@@ -815,7 +832,7 @@ class AuthoredAssetOwner:
                 "Validating the selected authored asset…",
             )
         dialog = state.dialog_identity
-        if dialog is None and state.asset != "mask":
+        if dialog is None and not state.auto_adopt:
             self._state = _OpenState()
             return AuthoredAssetTransition(
                 AuthoredAssetRefreshEffect.CONTROLS,
@@ -834,7 +851,7 @@ class AuthoredAssetOwner:
         if terminal.status is not OperationTerminalStatus.RETURNED:
             if dialog is None:
                 return replace(self._dismiss(
-                    state, None, f"Mask validation failed: {terminal.diagnostic}"
+                    state, None, f"Asset validation failed: {terminal.diagnostic}"
                 ), error=True)
             self._state = replace(
                 state,
@@ -866,7 +883,7 @@ class AuthoredAssetOwner:
         if not valid:
             if dialog is None:
                 return replace(self._dismiss(
-                    state, None, "Mask validation returned an inexact result."
+                    state, None, "Asset validation returned an inexact result."
                 ), error=True)
             self._state = replace(
                 state,
@@ -900,9 +917,9 @@ class AuthoredAssetOwner:
                 else "The selected authored asset could not be adopted."
             )
             transition = self._dismiss(state, dialog, notice)
-            if state.asset == "mask" and isinstance(reduced, EditNoChange):
+            if state.auto_adopt and isinstance(reduced, EditNoChange):
                 # The editor saved new contents to the already-selected path.
-                transition = replace(transition, mask_set_path=result.candidate.path)
+                transition = replace(transition, asset_set=(state.asset, result.candidate.path))
             return transition
         if (
             not _context_current(state, current_stamp)
@@ -950,8 +967,8 @@ class AuthoredAssetOwner:
         )
         return replace(
             transition, adoption=adoption,
-            mask_set_path=(
-                result.candidate.path if accepted and state.asset == "mask" else None
+            asset_set=(
+                (state.asset, result.candidate.path) if accepted and state.auto_adopt else None
             ),
         )
 

@@ -1894,14 +1894,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._ensure_timer()
         elif transition.refresh is AuthoredAssetRefreshEffect.DIALOG:
             self._ensure_timer()
-        if transition.mask_set_path is not None:
+        if transition.asset_set is not None:
+            asset, path = transition.asset_set
+            label = "Mask File" if asset == "mask" else "PONI File"
+            description = "mask" if asset == "mask" else "calibration"
             dialog = QtWidgets.QMessageBox(
-                QtWidgets.QMessageBox.Icon.Information, "Mask File updated",
-                "Mask File has been set to the newly saved mask.",
+                QtWidgets.QMessageBox.Icon.Information, f"{label} updated",
+                f"{label} has been set to the newly saved {description}.",
                 QtWidgets.QMessageBox.StandardButton.Ok, self,
             )
             dialog.setTextFormat(QtCore.Qt.TextFormat.PlainText)
-            dialog.setInformativeText(transition.mask_set_path)
+            dialog.setInformativeText(path)
             dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
             dialog.open()
 
@@ -1930,17 +1933,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         authored = self._authored_assets
         stamp = self._operation_context_stamp()
         if authored.phase is AuthoredAssetPhase.TERMINAL_READY:
-            if authored.asset == "mask":
-                request = authored.saved_mask_validation_request(stamp)
-                if request is not None:
-                    self._begin_authored_validation(None, None, request)
-                else:
-                    self._apply_authored_asset_transition(
-                        AuthoredAssetTransition(
-                            AuthoredAssetRefreshEffect.CONTROLS,
-                            "Experiment changed; saved mask was not selected.",
-                        )
+            request = authored.saved_asset_validation_request(stamp)
+            if request is not None:
+                self._begin_authored_validation(None, None, request)
+                return
+            if authored.phase is not AuthoredAssetPhase.TERMINAL_READY:
+                self._apply_authored_asset_transition(
+                    AuthoredAssetTransition(
+                        AuthoredAssetRefreshEffect.CONTROLS,
+                        "Experiment changed; saved asset was not selected.",
                     )
+                )
                 return
             evidence = authored.evidence_identity
             if evidence is not None:

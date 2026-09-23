@@ -16,7 +16,7 @@ from xdart.gui.tabs.scattering import experiment_authoring as authoring
 from xdart.gui.tabs.scattering.adapters.external_operation import OperationSlot
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
-from xdart.gui.tabs.scattering.operation_values import OperationContextStamp, OperationIdentity, OperationTerminalStatus
+from xdart.gui.tabs.scattering.operation_values import OperationContextStamp, OperationIdentity, OperationTerminalStatus, OperationUpdate
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xrd_tools.io.image import load_mask
 from xrd_tools.session.intent_store import RunIntentStore
@@ -244,3 +244,136 @@ qt.QApplication.exec = automated_exec
     assert (hooks / "opened").read_text() == "calibration"
     assert source.read_bytes() == original
     assert not list(tmp_path.glob(".xdart-authoring-stderr-*"))
+
+
+@pytest.mark.parametrize("action", ["close", "save", "save_selected", "cancel", "failed_save", "changed", "full_directory"])
+def test_real_calibration_last_save_is_selected_and_notified(
+    tmp_path, monkeypatch, _xdart_qt_harness, action,
+):
+    """Actual upstream saves -> child report -> qualification -> GUI adoption.
+
+    Only user file-dialog choices and child event-loop timing are automated.
+    An unrelated newer file, saves outside the source folder, repeated saves,
+    cancelled/failed Save As, and post-save edits distinguish this from mtimes.
+    """
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    (hooks / "sitecustomize.py").write_text('''
+import os
+from pathlib import Path
+from silx.gui import qt
+scratch = Path(__file__).parent
+qt.QSettings.setPath(qt.QSettings.IniFormat, qt.QSettings.UserScope, str(scratch))
+original_exec = qt.QApplication.exec
+
+def automated_exec(app):
+    def finish():
+        try:
+            from pyFAI.gui.tasks.IntegrationTask import IntegrationTask
+            from pyFAI.calibrant import get_calibrant
+            from pyFAI.detectors import detector_factory
+            action = os.environ["XDART_TEST_CALIB_ACTION"]
+            task = next(w for w in app.allWidgets() if isinstance(w, IntegrationTask))
+            if action != "close":
+                settings = task.model().experimentSettingsModel()
+                settings.detectorModel().setDetector(detector_factory("Detector", {"pixel1": 1e-4, "pixel2": 1e-4, "max_shape": [8, 10]}))
+                settings.calibrantModel().setCalibrant(get_calibrant("LaB6"))
+                geometry = task.model().fittedGeometry()
+                with geometry.lockContext():
+                    for name, value in (("distance", .1), ("poni1", .01), ("poni2", .02),
+                                        ("rotation1", 0.), ("rotation2", 0.), ("rotation3", 0.), ("wavelength", 1e-10)):
+                        getattr(geometry, name)().setValue(value)
+                task._geometryTabs.setGeometryModel(geometry)
+                first = scratch.parent / "first.poni"
+                last = scratch / "last.poni"
+                def save_as(path):
+                    def choose(dialog):
+                        if path is None:
+                            return 0
+                        dialog.selectFile(str(path))
+                        return 1
+                    qt.QFileDialog.exec = choose
+                    task._savePoniButton.click()
+                save_as(first)
+                save_as(last)
+                geometry.distance().setValue(.2)
+                save_as(last)
+                if action == "cancel":
+                    save_as(None)
+                elif action == "failed_save":
+                    from pyFAI.gui.dialog import MessageBox
+                    MessageBox.exception = lambda *args, **kwargs: None
+                    save_as(scratch / "missing" / "not-saved.poni")
+                elif action == "changed":
+                    last.write_text(last.read_text() + "# changed after Save\\n")
+                os.utime(first, ns=(1800000000000000000, 1800000000000000000))
+            app.exit(0)
+        except BaseException:
+            import traceback
+            traceback.print_exc()
+            app.exit(98)
+    qt.QTimer.singleShot(0, finish)
+    qt.QTimer.singleShot(15000, lambda: app.exit(99))
+    return original_exec()
+qt.QApplication.exec = automated_exec
+''')
+    monkeypatch.setenv("PYTHONPATH", str(hooks) + os.pathsep + str(Path(__file__).resolve().parents[3] / "src"))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("XDART_TEST_CALIB_ACTION", action)
+    source = tmp_path / "calibration.tiff"
+    tifffile.imwrite(source, np.arange(80, dtype=np.uint16).reshape(8, 10))
+    if action == "full_directory":
+        for index in range(256):
+            (tmp_path / f"prior-{index}.poni").write_text("# unchanged prior PONI\n")
+    request = authoring.prepare_calibration_request(str(source))
+    identity = OperationIdentity(1)
+    terminal = authoring.run_calibration(request, identity, Event(), lambda *_: None, lambda _: True)
+    assert not list(tmp_path.glob(".xdart-calibration-*"))
+    if action == "changed":
+        assert terminal.status is OperationTerminalStatus.FAILED
+        assert "last saved PONI changed" in terminal.diagnostic
+        return
+    assert terminal.status is OperationTerminalStatus.RETURNED, terminal.diagnostic
+    assert terminal.payload.save_reported
+    last = str((hooks / "last.poni").resolve())
+    assert terminal.payload.last_saved_path == (None if action == "close" else last)
+    if action != "close":
+        assert terminal.payload.candidates[0].proof.geometry[0] == .2
+    store = RunIntentStore(RunIntent(
+        project_root=str(tmp_path), poni_file=last if action == "save_selected" else "",
+    ))
+    page = ScatteringWorkspace(intents=store, lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter())
+    before = store.snapshot()
+    app = _xdart_qt_harness.app
+    try:
+        page._authored_assets.adopt_operation("poni", request, page._operation_context_stamp(), identity)
+        update = OperationUpdate(identity, terminal=terminal)
+        assert page._consume_authored_asset_update(update)
+        page._advance_authored_asset_confirmation()
+        deadline = time.monotonic() + 10
+        while page._experiment_operation_busy() and time.monotonic() < deadline:
+            assert page._authored_asset_dialog is None
+            page._drain_executor()
+            QtTest.QTest.qWait(10)
+        app.processEvents()
+        assert not page._experiment_operation_busy()
+        assert page._authored_asset_dialog is None
+        messages = page.findChildren(QtWidgets.QMessageBox)
+        if action == "close":
+            assert not messages
+            assert store.snapshot() == before
+        else:
+            assert store.snapshot().thaw().poni_file == last
+            assert store.revision == before.revision + (action != "save_selected")
+            assert len(messages) == 1 and messages[0].isVisible()
+            assert messages[0].icon() is QtWidgets.QMessageBox.Icon.Information
+            assert messages[0].text() == "PONI File has been set to the newly saved calibration."
+            assert messages[0].informativeText() == last
+            assert not page._consume_authored_asset_update(update)
+            assert len(page.findChildren(QtWidgets.QMessageBox)) == 1
+    finally:
+        for message in page.findChildren(QtWidgets.QMessageBox):
+            message.close()
+        page.close_workspace()
+        page.deleteLater()
+        app.processEvents()

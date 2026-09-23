@@ -767,7 +767,7 @@ def test_exact_validation_accepts_one_cas_and_duplicate_terminal_is_inert(
     if asset == "mask":
         case, _process, _evidence = _terminal_ready(tmp_path, asset)
         dialog = None
-        request = case.owner.saved_mask_validation_request(case.stamp)
+        request = case.owner.saved_asset_validation_request(case.stamp)
         identity = OperationIdentity(2)
         case.owner.adopt_validation(None, request, identity)
     else:
