@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import builtins
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager, ExitStack
 from dataclasses import InitVar, dataclass, field, replace
 from enum import Enum
 import hashlib
@@ -33,6 +34,7 @@ from xrd_tools.analysis.module_transaction import (
     ModuleOutputRequest,
     ModuleProgress,
     ModuleSourceReceipt,
+    ModuleSourceGroupReceipt,
     ModuleTerminalResult,
     admit_module_artifact,
     module_artifact_request,
@@ -60,6 +62,7 @@ from xrd_tools.analysis.xu_stitch_calibration import (
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.core.geometry import AngleMapping, Diffractometer, ImageOrientation
 from xrd_tools.core.scan import SourceKind
+from xrd_tools.sources.composite import CompositeFrameSource
 from xrd_tools.io.analysis_artifact import (
     ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
     ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
@@ -837,6 +840,73 @@ class StitchInputManifestReceipt:
         raise TypeError("Stitch input manifest is not serializable")
 
 
+@dataclass(eq=False, frozen=True, slots=True)
+class StitchGroupManifestReceipt:
+    """Ordered per-source manifests with one explicit global frame map."""
+
+    members: tuple[StitchInputManifestReceipt, ...]
+    module_source_fingerprint: str
+    files: tuple[StitchManifestFile, ...] = field(init=False)
+    contributions: tuple[StitchContribution, ...] = field(init=False)
+    member_frames: tuple[tuple[int, int], ...] = field(init=False)
+    fingerprint: str = field(init=False)
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim):
+        if (_claim is not _REQUEST_FACTORY or type(self.members) is not tuple
+                or not self.members or any(type(m) is not StitchInputManifestReceipt for m in self.members)
+                or len({m.project_root for m in self.members}) != 1):
+            raise TypeError("invalid Stitch group manifest")
+        _sha256(self.module_source_fingerprint, "group source fingerprint")
+        files, contributions, member_frames = [], [], []
+        by_path = {}
+        for index, member in enumerate(self.members):
+            for item in member.files:
+                if item.relative_path not in by_path:
+                    by_path[item.relative_path] = len(files)
+                    files.append(item)
+                elif files[by_path[item.relative_path]] != item:
+                    raise StitchOperationRefused("SOURCE_IDENTITY_MISMATCH")
+            for item in member.contributions:
+                contributions.append(replace(item, label=len(contributions), file_ordinal=
+                    by_path[member.files[item.file_ordinal].relative_path]))
+                member_frames.append((index, item.label))
+        if len(contributions) > _MAX_CONTRIBUTIONS or len(files) > _MAX_MANIFEST_FILES:
+            raise StitchOperationRefused("MANIFEST_CONTRIBUTION_LIMIT_EXCEEDED")
+        object.__setattr__(self, "files", tuple(files))
+        object.__setattr__(self, "contributions", tuple(contributions))
+        object.__setattr__(self, "member_frames", tuple(member_frames))
+        object.__setattr__(self, "fingerprint", module_plan_fingerprint(ModuleKind.STITCH,
+            ("stitch-group-manifest-v1", self.module_source_fingerprint, tuple(m.fingerprint for m in self.members))))
+        if len(json.dumps(self.to_provenance()).encode()) > _MAX_MANIFEST_BYTES:
+            raise StitchOperationRefused("MANIFEST_BYTE_LIMIT_EXCEEDED")
+
+    @property
+    def project_root(self): return self.members[0].project_root
+    @property
+    def source_relative_path(self): return self.members[0].source_relative_path
+    @property
+    def source_scan(self): return None
+
+    def to_provenance(self):
+        return {"schema_version": "stitch-group-manifest-v1",
+                "members": [member.to_provenance() for member in self.members],
+                "member_frames": [list(value) for value in self.member_frames],
+                "fingerprint": self.fingerprint}
+
+
+def _source_members(source):
+    return source.members if type(source) is ModuleSourceGroupReceipt else (source,)
+
+
+def _table_names(table):
+    if type(table) is tuple:
+        names = tuple(column.name for column in table[0].columns)
+        # Every selected motor must have the same unambiguous availability.
+        return names
+    return tuple(column.name for column in table.columns)
+
+
 def _project_source_options(analysis, root: Path) -> str:
     """Return the closed, Project-relative S1 source-policy projection."""
 
@@ -847,7 +917,7 @@ def _project_source_options(analysis, root: Path) -> str:
         )
     options = dict(analysis.source_spec.options)
     if analysis.resolved_kind is SourceKind.SPEC:
-        allowed = {"scan", "image_dir", "image_stem", "read_image_kwargs"}
+        allowed = {"scan", "image_dir", "image_stem", "read_image_kwargs", "require_complete_images"}
         if (
             analysis.resolved_entry is not None
             or not analysis.resolved_scan
@@ -994,6 +1064,10 @@ def _project_source_options(analysis, root: Path) -> str:
                     )
                 )
             projected["admitted_motor_values"] = tuple(projected_rows)
+    elif analysis.resolved_kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
+        if options or not analysis.resolved_entry:
+            raise StitchOperationRefused("SOURCE_SPEC_UNSUPPORTED", "NeXus requires an exact entry and no reader overrides")
+        projected = {}
     else:
         raise StitchOperationRefused("SOURCE_KIND_UNSUPPORTED")
 
@@ -1046,6 +1120,11 @@ def _capture_input_manifest(
     project_root: str | Path,
     selectors: tuple[MetadataColumnSelector, ...],
 ) -> StitchInputManifestReceipt:
+    if type(source) is ModuleSourceGroupReceipt:
+        return StitchGroupManifestReceipt(tuple(
+            _capture_input_manifest(member, member_table, project_root, selectors)
+            for member, member_table in zip(source.members, table, strict=True)
+        ), source.fingerprint, _REQUEST_FACTORY)
     try:
         root = Path(project_root).expanduser().resolve(strict=True)
     except (OSError, TypeError) as error:
@@ -1597,7 +1676,8 @@ def _provenance(
         "schema_version": "stitch-operation-v1",
         "kind": "stitch",
         "source": {
-            "source_fingerprint": source.analysis.source_fingerprint,
+            "source_fingerprint": (source.fingerprint if type(source) is ModuleSourceGroupReceipt
+                                   else source.analysis.source_fingerprint),
             "module_source_fingerprint": source.fingerprint,
             "metadata_table_fingerprint": source.table_fingerprint,
             "selected_labels": list(source.selected_labels),
@@ -1675,7 +1755,8 @@ def _xu_provenance(
         "kind": "stitch",
         "backend": "xu_hist",
         "source": {
-            "source_fingerprint": source.analysis.source_fingerprint,
+            "source_fingerprint": (source.fingerprint if type(source) is ModuleSourceGroupReceipt
+                                   else source.analysis.source_fingerprint),
             "module_source_fingerprint": source.fingerprint,
             "metadata_table_fingerprint": source.table_fingerprint,
             "selected_labels": list(source.selected_labels),
@@ -1759,7 +1840,7 @@ class StitchOperationRequest:
             or type(self.module) is not ModuleOperationRequest
             or self.module.kind is not ModuleKind.STITCH
             or type(self.plan) not in {StitchOperationPlan, XuStitchOperationPlan}
-            or type(self.manifest) is not StitchInputManifestReceipt
+            or type(self.manifest) not in {StitchInputManifestReceipt, StitchGroupManifestReceipt}
             or type(self.provenance_json) is not str
             or self.module.plan_fingerprint != self.plan.fingerprint
             or self.manifest.module_source_fingerprint
@@ -1769,7 +1850,7 @@ class StitchOperationRequest:
         ):
             raise TypeError("stitch operation request is invalid")
         table = _fresh_table(self.module.source)
-        table_names = tuple(column.name for column in table.columns)
+        table_names = _table_names(table)
         required = _required_stitch_selectors(self.plan, table_names)
         expected_manifest = _capture_input_manifest(
             self.module.source,
@@ -1840,6 +1921,8 @@ class StitchOperationRequest:
 
 
 def _fresh_table(source: ModuleSourceReceipt):
+    if type(source) is ModuleSourceGroupReceipt:
+        return tuple(_fresh_table(member) for member in source.members)
     table = run_metadata_table(MetadataTablePlan(source.analysis.source_spec))
     if (
         table.disposition is not AnalysisDisposition.COMPLETED
@@ -1863,16 +1946,18 @@ def prepare_stitch_operation(
     """Bind exact source, geometry, plan, provenance, and output intent."""
 
     if (
-        type(source) is not ModuleSourceReceipt
+        type(source) not in {ModuleSourceReceipt, ModuleSourceGroupReceipt}
         or source.kind is not ModuleKind.STITCH
         or type(output) is not ModuleOutputRequest
         or type(plan) not in {StitchOperationPlan, XuStitchOperationPlan}
     ):
         raise TypeError("stitch preparation requires exact Stitch module values")
-    if source.analysis.resolved_kind not in {
+    if any(member.analysis.resolved_kind not in {
         SourceKind.SPEC,
         SourceKind.TIFF_SERIES,
-    }:
+        SourceKind.NEXUS_STACK,
+        SourceKind.EIGER_MASTER,
+    } for member in _source_members(source)):
         raise StitchOperationRefused(
             "SOURCE_KIND_UNSUPPORTED",
             "S1 Stitch accepts only an extensionless SPEC scan or TIFF series",
@@ -1887,28 +1972,21 @@ def prepare_stitch_operation(
             "OUTPUT_KIND_MISMATCH", "Stitch mode and output artifact kind differ"
         )
     table = _fresh_table(source)
-    names = tuple(column.name for column in table.columns)
+    names = _table_names(table)
     required = _required_stitch_selectors(plan, names)
-    for selector in required:
-        if selector.occurrence != 0 or names.count(selector.name) != 1:
-            raise StitchOperationRefused(
-                "AMBIGUOUS_METADATA_SELECTOR",
-                f"metadata column {selector.name!r} must occur exactly once",
-            )
-        if selector not in source.resolved_selectors:
-            raise StitchOperationRefused(
-                "UNBOUND_METADATA_SELECTOR",
-                f"metadata column {selector.name!r} is not bound by the source receipt",
-            )
-    options = dict(source.analysis.source_spec.options)
-    read_options = options.get("read_image_kwargs", {})
-    if type(read_options) is not dict:
-        read_options = dict(read_options)
-    if read_options.get("rotation", 0) != 0:
-        raise StitchOperationRefused(
-            "SOURCE_ORIENTATION_CONFLICT",
-            "source rotation must be zero; Stitch owns the recorded image orientation",
-        )
+    tables = table if type(table) is tuple else (table,)
+    for member, member_table in zip(_source_members(source), tables, strict=True):
+        member_names = _table_names(member_table)
+        for selector in required:
+            if selector.occurrence != 0 or member_names.count(selector.name) != 1:
+                raise StitchOperationRefused("AMBIGUOUS_METADATA_SELECTOR",
+                    f"metadata column {selector.name!r} must occur exactly once in every member")
+            if selector not in member.resolved_selectors:
+                raise StitchOperationRefused("UNBOUND_METADATA_SELECTOR", selector.name)
+        options = dict(member.analysis.source_spec.options)
+        if dict(options.get("read_image_kwargs", {})).get("rotation", 0) != 0:
+            raise StitchOperationRefused("SOURCE_ORIENTATION_CONFLICT",
+                "source rotation must be zero; Stitch owns image orientation")
     manifest = _capture_input_manifest(source, table, project_root, required)
     if type(plan) is StitchOperationPlan:
         _revalidate_geometry(plan.geometry)
@@ -2001,6 +2079,35 @@ def prepare_stitch_operation(
     )
 
 
+class _SelectedStitchSource(BaseFrameSource):
+    def __init__(self, source, labels):
+        super().__init__(name=source.name, frame_indices=labels, capabilities=source.capabilities)
+        self._source = source
+
+    def load_frame(self, index): return self._source.load_frame(index)
+    def load_native_frame(self, index):
+        return getattr(self._source, "load_native_frame", self._source.load_frame)(index)
+    def metadata_for(self, index): return self._source.metadata_for(index)
+    def frame_for(self, index): return self._source.frame_for(index)
+    @property
+    def motors(self):
+        rows = [self.metadata_for(index) for index in self.frame_indices]
+        keys = set.intersection(*(set(row) for row in rows)) if rows else set()
+        return {key: np.asarray([row[key] for row in rows]) for key in keys}
+
+
+@contextmanager
+def _requalified_stitch_source(source, *, cancel_token=None):
+    with ExitStack() as stack:
+        opened = [stack.enter_context(requalified_analysis_source(member.analysis, cancel_token=cancel_token))
+                  for member in _source_members(source)]
+        if type(source) is ModuleSourceGroupReceipt:
+            yield CompositeFrameSource([_SelectedStitchSource(item, member.selected_labels)
+                                        for item, member in zip(opened, source.members, strict=True)])
+        else:
+            yield opened[0]
+
+
 class _OrientedSource(BaseFrameSource):
     def __init__(
         self,
@@ -2046,6 +2153,12 @@ class _OrientedSource(BaseFrameSource):
 
     def metadata_for(self, index: int) -> Mapping[str, object]:
         return self._source.metadata_for(index)
+
+    def load_native_frame(self, index: int) -> np.ndarray:
+        image = getattr(self._source, "load_native_frame", self._source.load_frame)(index)
+        if image.size * 8 > self._max_frame_bytes:
+            raise MemoryError("oriented float64 frame exceeds max_frame_bytes")
+        return self._orientation.apply(image)
 
     def frame_for(self, index: int):
         return self._source.frame_for(index)
@@ -2346,8 +2459,8 @@ class StitchOperationExecution:
         try:
             revalidate_xu_stitch_calibration(plan.calibration)
             self._emit("calibration", 1, total)
-            with requalified_analysis_source(
-                self.request.module.source.analysis,
+            with _requalified_stitch_source(
+                self.request.module.source,
                 cancel_token=cancel_token,
             ) as source:
 
@@ -2584,8 +2697,8 @@ class StitchOperationExecution:
                 )
             runtime_plan = _runtime_plan(self.request.plan, diffractometer)
             self._emit("geometry", 1, total)
-            with requalified_analysis_source(
-                self.request.module.source.analysis,
+            with _requalified_stitch_source(
+                self.request.module.source,
                 cancel_token=cancel_token,
             ) as source:
                 oriented = _OrientedSource(

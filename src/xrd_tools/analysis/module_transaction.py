@@ -272,7 +272,7 @@ class ModuleSourceReceipt:
 
 @dataclass(eq=False, frozen=True, slots=True)
 class ModuleSourceGroupReceipt:
-    """Ordered exact RSM source receipts for one grouped transaction."""
+    """Ordered exact source receipts for one grouped RSM or Stitch transaction."""
 
     kind: ModuleKind
     members: tuple[ModuleSourceReceipt, ...]
@@ -283,10 +283,10 @@ class ModuleSourceGroupReceipt:
         members = _exact_tuple(self.members, "module source group members")
         if (
             _claim is not _MODULE_SOURCE_GROUP_FACTORY
-            or self.kind is not ModuleKind.RSM
-            or not 1 <= len(members) <= _MAX_RSM_GROUP_MEMBERS
+            or self.kind not in {ModuleKind.RSM, ModuleKind.STITCH}
+            or not 1 <= len(members) <= (256 if self.kind is ModuleKind.STITCH else _MAX_RSM_GROUP_MEMBERS)
             or any(type(member) is not ModuleSourceReceipt for member in members)
-            or any(member.kind is not ModuleKind.RSM for member in members)
+            or any(member.kind is not self.kind for member in members)
             or len({member.fingerprint for member in members}) != len(members)
         ):
             raise TypeError("module source group receipt is invalid")
@@ -305,12 +305,23 @@ class ModuleSourceGroupReceipt:
     def selected_frame_count(self) -> int:
         return sum(len(member.selected_labels) for member in self.members)
 
+    @property
+    def selected_labels(self) -> tuple[int, ...]:
+        return tuple(range(self.selected_frame_count))
+
+    @property
+    def table_fingerprint(self) -> str:
+        return analysis_canonical_fingerprint(
+            "group-metadata-tables-v1", tuple(member.table_fingerprint for member in self.members),
+        )
+
     @classmethod
     def from_members(
         cls,
         members: tuple[ModuleSourceReceipt, ...],
+        *, kind: ModuleKind = ModuleKind.RSM,
     ) -> "ModuleSourceGroupReceipt":
-        return cls(ModuleKind.RSM, members, _MODULE_SOURCE_GROUP_FACTORY)
+        return cls(kind, members, _MODULE_SOURCE_GROUP_FACTORY)
 
     def __copy__(self):
         raise TypeError("module source group receipt is not copyable")
@@ -335,6 +346,7 @@ class ModuleOutputRequest:
     target: str | Path
     kind: AnalysisArtifactKind
     overwrite: AnalysisArtifactOverwrite = AnalysisArtifactOverwrite.CREATE_NEW
+    artifact_family: str | None = None
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -351,13 +363,22 @@ class ModuleOutputRequest:
             raise TypeError("module output target must be path-like") from error
         if Path(target).suffix.casefold() != ".nexus":
             raise ValueError("module output target must end in .nexus")
+        if self.artifact_family is not None:
+            from xrd_tools.io.output_path import resolve_finite_output_target
+            token = {AnalysisArtifactKind.STITCH_1D: "stitch-1d",
+                     AnalysisArtifactKind.STITCH_2D: "stitch-2d"}.get(self.kind)
+            if token is None or str(resolve_finite_output_target(
+                Path(target).parent, self.artifact_family, operation_token=token,
+            )) != target:
+                raise ValueError("module output family does not match its stable slot")
         object.__setattr__(self, "target", target)
         object.__setattr__(
             self,
             "fingerprint",
             analysis_canonical_fingerprint(
                 "module-output-v1",
-                (target, self.kind, self.overwrite),
+                (target, self.kind, self.overwrite) if self.artifact_family is None
+                else (target, self.kind, self.overwrite, self.artifact_family),
             ),
         )
 
@@ -417,7 +438,7 @@ class ModuleOperationRequest:
         if rsm_v2_bound:
             if not group_source:
                 raise TypeError("RSM v2 request requires an exact source group")
-        elif not single_source:
+        elif not single_source and not (group_source and self.source.kind is ModuleKind.STITCH):
             raise TypeError("module request requires one exact source receipt")
         _require_sha256(self.plan_fingerprint, "plan fingerprint")
         _require_sha256(self.provenance_digest, "provenance digest")
@@ -614,7 +635,7 @@ def _validate_xu_stitch_v2_intent(
             "input_manifest",
         }
         or source.get("source_fingerprint")
-        != request.source.analysis.source_fingerprint
+        != request.artifact_source_fingerprint
         or source.get("module_source_fingerprint")
         != request.source.fingerprint
         or source.get("metadata_table_fingerprint")

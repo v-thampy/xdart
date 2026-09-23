@@ -57,6 +57,7 @@ class SpecSource(BaseFrameSource):
     def __init__(self, path: str | Path, *, scan: Any = None,
                  name: str | None = None, image_dir: str | Path | None = None,
                  image_stem: str | None = None,
+                 require_complete_images: bool = False,
                  read_image_kwargs: Mapping[str, Any] | None = None) -> None:
         from xrd_tools.io.spec import (
             get_spec_scanned_axes,
@@ -67,6 +68,8 @@ class SpecSource(BaseFrameSource):
         self.path = Path(path)
         self.available_scans = list_spec_scans(self.path)
         self.scan_key = self._resolve_scan_key(self.available_scans, scan)
+        if require_complete_images and str(scan) not in {self.scan_key, str(self.scan_key).removesuffix(".1")}:
+            raise ValueError(f"SPEC scan {scan!r} is not present")
 
         columns: dict[str, np.ndarray] = {}
         motors: dict[str, float] = {}
@@ -102,7 +105,25 @@ class SpecSource(BaseFrameSource):
             from xrd_tools.io.image import find_image_files
             stem = image_stem or self._default_image_stem(self.scan_key)
             files = list(find_image_files(self.image_dir, stem=stem))
-            if len(files) == 1 and npts and npts > 1:
+            if require_complete_images and files:
+                from xrd_tools.io.image import read_detector_image_layout
+                layouts = [read_detector_image_layout(path, **{
+                    key: value for key, value in self._read_image_kwargs.items()
+                    if key in {"detector_shape", "raw_dtype", "raw_header_skip"}
+                }) for path in files]
+                if sum(layout.frame_count for layout in layouts) != npts:
+                    raise ValueError(f"SPEC scan {self.scan_key}: image count does not match metadata points")
+                if len(files) > 1 and all(layout.frame_count == 1 for layout in layouts):
+                    import re
+                    positions = [re.search(r"(\d+)(?:\.[^.]+)?$", path.name) for path in files]
+                    if all(positions):
+                        numbers = [int(match[1]) for match in positions]
+                        if numbers not in [list(range(npts)), list(range(1, npts + 1))]:
+                            raise ValueError(f"SPEC scan {self.scan_key}: image point numbers contain gaps or duplicates")
+            if require_complete_images and files:
+                self._frame_map = [(path, i) for path, layout in zip(files, layouts)
+                                   for i in range(layout.frame_count)]
+            elif len(files) == 1 and npts and npts > 1:
                 # one multi-frame container -> frame index within it
                 self._frame_map = [(files[0], i) for i in range(npts)]
             else:
@@ -224,6 +245,16 @@ class SpecSource(BaseFrameSource):
         return np.asarray(
             read_image(path, frame=frame, **self._read_image_kwargs),
             dtype=float)
+
+    def load_native_frame(self, index: int) -> np.ndarray:
+        """Decode once with native dtype for the shared conditioning owner."""
+        path, frame = self.raw_locator_for(index)
+        if path is None:
+            raise NotImplementedError("SPEC source has no detector images")
+        from xrd_tools.io.image import read_image
+        options = {key: value for key, value in self._read_image_kwargs.items()
+                   if key not in {"threshold", "mask", "preserve_dtype", "exact_frame"}}
+        return read_image(path, frame=frame, preserve_dtype=True, exact_frame=True, **options)
 
     def raw_locator_for(self, index: int) -> tuple[Path | None, int | None]:
         """Return one raw member locator without constructing frame metadata."""

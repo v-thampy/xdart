@@ -24,6 +24,16 @@ def test_parse_scan_groups_combines_ranges():
         parse_scan_groups("1-x")
 
 
+def test_stitch_brackets_define_explicit_outputs_and_preserve_occurrences():
+    from xrd_tools.sources.grouping import parse_stitch_scan_groups
+    assert parse_stitch_scan_groups("1,2,[2-5, 8]") == (("1",), ("2",), ("2", "3", "4", "5", "8"))
+    assert parse_stitch_scan_groups("1-3, 5") == (("1",), ("2",), ("3",), ("5",))
+    assert parse_stitch_scan_groups("[2.1,2.2],2.1") == (("2.1", "2.2"), ("2.1",))
+    for invalid in ("", "[1", "1]", "[[1]]", "[1,,2]", "1,", "3-1", "[1]2", "0", "1-999999"):
+        with pytest.raises(ValueError):
+            parse_stitch_scan_groups(invalid)
+
+
 # ── CompositeFrameSource ──────────────────────────────────────────────────
 
 
