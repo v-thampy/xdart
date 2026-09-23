@@ -17,6 +17,11 @@ from xrd_tools.core.energy import energy_eV_to_wavelength_m
 from xrd_tools.core.roi import RoiSpec, invalid_pixel_mask, roi_reduce
 from xrd_tools.core.scan import FrameSource, MaskSpec
 from xrd_tools.sources import ensure_frame_source
+from xrd_tools.integrate.stitch_conditioning import (
+    StitchConditioning,
+    condition_stitch_frame,
+    load_stitch_frame,
+)
 from xrd_tools.rsm.coordinate_frame import (
     RSMCoordinateFrame,
     rsm_coordinate_matrix,
@@ -160,6 +165,7 @@ class StitchPlan:
     #: per-frame integration/accumulation equations while retaining one image.
     streaming_multigeometry: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
+    conditioning: StitchConditioning | None = None
 
     def provenance(self) -> dict[str, Any]:
         """A JSON-safe record of this stitch for persistence (pass to
@@ -192,6 +198,8 @@ class StitchPlan:
             ),
         }
         diff = self.diffractometer
+        if self.conditioning is not None:
+            prov["conditioning"] = self.conditioning.to_dict()
         if diff is not None:
             prov["diffractometer"] = (getattr(diff, "preset", None)
                                       or getattr(diff, "convention", None))
@@ -240,6 +248,8 @@ class StitchPlan:
             azimuth_range=tuple(ar) if ar else None,
             monitor_key=prov.get("monitor_key"),
             streaming_multigeometry=streaming_multigeometry,
+            conditioning=(StitchConditioning(**prov["conditioning"])
+                          if prov.get("conditioning") is not None else None),
             corrections=CorrectionStack.from_dict(corr) if corr else None,
             gi=GISettings.from_dict(gi) if gi else None,
         )
@@ -392,6 +402,7 @@ def run_stitch(
     progress_callback: Callable[[int, int], None] | None = None,
     cancel_token: threading.Event | None = None,
     collect_frame_records: bool = True,
+    frame_record_callback: Callable[[int, np.ndarray], None] | None = None,
 ) -> AnalysisResult:
     """Run MultiGeometry stitching over one headless frame source or a GROUP.
 
@@ -406,6 +417,8 @@ def run_stitch(
     image-load work plus one final scientific-completion step. The histogram
     backend reports both bounded-memory passes when it must scout an omitted
     radial/azimuthal range.
+    ``frame_record_callback`` borrows each loaded raw array before conditioning;
+    callers must detach thumbnails and must not retain the full frame.
     """
 
     if progress_callback is not None and not callable(progress_callback):
@@ -414,6 +427,10 @@ def run_stitch(
         raise TypeError("stitch cancellation token must be an exact threading.Event")
     if type(collect_frame_records) is not bool:
         raise TypeError("collect_frame_records must be an exact bool")
+    if frame_record_callback is not None and not callable(frame_record_callback):
+        raise TypeError("stitch frame-record callback must be callable")
+    if plan.conditioning is not None and type(plan.conditioning) is not StitchConditioning:
+        raise TypeError("conditioning must be exact StitchConditioning or absent")
     if type(plan.streaming_multigeometry) is not bool:
         raise TypeError("streaming_multigeometry must be an exact bool")
     if plan.streaming_multigeometry and plan.backend != "multigeometry":
@@ -465,11 +482,19 @@ def run_stitch(
             "StitchPlan.base_poni or source.poni is required (or a Diffractometer "
             "carrying a DetectorCalibration)")
 
+    recorded_labels = set()
+
     def _iter_images():
         nonlocal progress_done
         for label in labels:
             _stitch_cancelled(cancel_token)
-            image = np.asarray(src.load_frame(label), dtype=float)
+            raw = load_stitch_frame(src, label, plan.conditioning)
+            if frame_record_callback is not None and label not in recorded_labels:
+                frame_record_callback(label, raw)
+                recorded_labels.add(label)
+            image = (np.asarray(raw, dtype=float) if plan.conditioning is None
+                     else condition_stitch_frame(raw, plan.conditioning))
+            raw = None
             _stitch_cancelled(cancel_token)
             yield image
             _stitch_cancelled(cancel_token)
