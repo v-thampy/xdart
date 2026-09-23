@@ -93,6 +93,31 @@ def test_native_intent_rejects_changed_unit_records_and_output_family(tmp_path):
             module_artifact_request(request.module, value)
 
 
+def test_native_real_scan14_five_member_preview_keeps_full_members_with_compact_binding(tmp_path):
+    from tests.core.test_stitch_operation_real_data import _scan14_request, _stitching_root
+    root = _stitching_root()
+    prepared = [_scan14_request(root, tmp_path / f"member-{omitted}.nexus",
+        tuple(label for label in range(287) if label != omitted)) for omitted in range(5)]
+    source = ModuleSourceGroupReceipt.from_members(tuple(item.module.source for item in prepared),
+        kind=ModuleKind.STITCH)
+    plan = replace(prepared[0].plan, native_records=True, conditioning=StitchConditioning("auto"))
+    output = ModuleOutputRequest(resolve_finite_output_target(tmp_path, "five-members", operation_token="stitch-1d"),
+        AnalysisArtifactKind.STITCH_1D, artifact_family="five-members")
+    request = prepare_stitch_operation(source, output, plan, project_root=root)
+    assert source.selected_frame_count == 1430
+    assert len(request.provenance_json.encode()) < 1 << 20
+    assert request.provenance["frame_members"]["count"] == 1430
+    from xrd_tools.analysis.stitch_native import native_frame_members
+    members = native_frame_members(request)
+    assert len(members) == 1430
+    assert len({row["identity"]["source_id"] for row in members}) == 5
+    assert len({row["identity"]["contribution_index"] for row in members}) == 1430
+    for index in range(5):
+        assert [row["identity"]["frame_index"] for row in members[index * 286:(index + 1) * 286]] == [
+            label for label in range(287) if label != index]
+    assert not Path(output.target).exists()
+
+
 def test_native_nexus_group_keeps_exact_external_dataset_and_raw_dtype(tmp_path):
     import h5py
     from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter

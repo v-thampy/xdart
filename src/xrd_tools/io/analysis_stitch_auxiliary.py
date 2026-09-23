@@ -123,6 +123,25 @@ def canonical_frame_manifest(value):
     return text
 
 
+def analysis_contributing_frame_binding(members):
+    """Bind the ordered, canonical source-member projection without duplicating it."""
+    if type(members) is not list or not 1 <= len(members) <= _MAX_FRAMES:
+        raise ValueError("contributing frame count is outside the bound")
+    return {"version": 1, "count": len(members),
+            "sha256": hashlib.sha256(canonical_frame_manifest(members).encode("utf-8")).hexdigest()}
+
+
+def analysis_contributing_frame_binding_matches(binding, members):
+    """Accept the original exact list or the strict versioned compact binding."""
+    if type(binding) is list:
+        return binding == members
+    return (type(binding) is dict and set(binding) == {"version", "count", "sha256"}
+            and type(binding["version"]) is int and binding["version"] == 1
+            and type(binding["count"]) is int and 1 <= binding["count"] <= _MAX_FRAMES
+            and type(binding["sha256"]) is str
+            and binding == analysis_contributing_frame_binding(members))
+
+
 def native_stitch_companion(radial, unit, wavelength_A):
     from xrd_tools.core.containers import convert_radial_axis
     if type(wavelength_A) not in {float, int} or not math.isfinite(wavelength_A) or wavelength_A <= 0:
@@ -199,7 +218,7 @@ def inspect_native_stitch_auxiliary(entry, result, provenance, radial, unit):
             source_frame_index=row["source_frame_index"], source_snapshot=row["source_snapshot"]))
     if analysis_contributing_frame_members(originals, source_base=base) != members:
         fail("contributing source identities are not canonical")
-    if provenance.get("frame_members") != members:
+    if not analysis_contributing_frame_binding_matches(provenance.get("frame_members"), members):
         fail("contributing frames differ from the frozen selected members")
     frames = _direct(entry, "frames", h5py.Group)
     expected_parents = {row["key"].split("/")[0] for row in rows}

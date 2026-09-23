@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 import shutil
 
@@ -13,15 +14,19 @@ from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactInvalid, admit_analysis_artifact, read_analysis_artifact,
     project_analysis_artifact_result, analysis_execution_attestation_digest,
     _project_analysis_artifact_result_v1_compat,
+    canonical_analysis_provenance,
 )
-from xrd_tools.io.analysis_stitch_auxiliary import analysis_contributing_frame_members
+from xrd_tools.io.analysis_stitch_auxiliary import (
+    analysis_contributing_frame_binding, analysis_contributing_frame_members, canonical_frame_manifest,
+)
 from xrd_tools.io.frame_view import read_contributing_frame_view
 from xrd_tools.io.nexus import write_stitched
 from xrd_tools.io.output_transaction import OutputTransactionCoordinator
 from tests.core.test_analysis_artifact import _execution_attestation
 
 
-def _publish(tmp_path, *, unit="q_A^-1", xu=False, science_frame_count=3, fractional=False, source_stamp=True):
+def _publish(tmp_path, *, unit="q_A^-1", xu=False, science_frame_count=3, fractional=False, source_stamp=True,
+             legacy_members=False):
     project = tmp_path / "project"
     project.mkdir()
     raw = np.arange(24, dtype=np.int32).reshape(4, 6)
@@ -36,7 +41,8 @@ def _publish(tmp_path, *, unit="q_A^-1", xu=False, science_frame_count=3, fracti
         identity=dict(source_id="sample.spec", scan_id=str(scan), frame_index=index,
                       contribution_index=global_index))
         for global_index, (scan, index) in enumerate(((2, 0), (2, 1), (3, 0)))]
-    provenance = {"frame_members": analysis_contributing_frame_members(records, source_base=project)}
+    members = analysis_contributing_frame_members(records, source_base=project)
+    provenance = {"frame_members": members if legacy_members else analysis_contributing_frame_binding(members)}
     radial = np.linspace(0.1, 5.0, 40) if unit == "q_A^-1" else np.linspace(1, 100, 40)
     intensity = np.arange(40, dtype=float) + 1
     projector = _project_analysis_artifact_result_v1_compat if fractional else project_analysis_artifact_result
@@ -69,8 +75,9 @@ def test_contributors_must_match_attested_science_frame_count(tmp_path):
 
 @pytest.mark.parametrize("unit", ["q_A^-1", "2th_deg"])
 @pytest.mark.parametrize("xu", [False, True])
-def test_native_axes_contributors_and_raw_relocation_round_trip(tmp_path, unit, xu):
-    path, raw, project, receipt = _publish(tmp_path, unit=unit, xu=xu)
+@pytest.mark.parametrize("legacy_members", [False, True])
+def test_native_axes_contributors_and_raw_relocation_round_trip(tmp_path, unit, xu, legacy_members):
+    path, raw, project, receipt = _publish(tmp_path, unit=unit, xu=xu, legacy_members=legacy_members)
     payload = read_analysis_artifact(path, expected_receipt=receipt)
     assert payload.native_unit == unit
     assert payload.wavelength_A == 1.0
@@ -95,6 +102,43 @@ def test_native_axes_contributors_and_raw_relocation_round_trip(tmp_path, unit, 
     assert fallback.thumbnail.shape == raw.shape
     relocated = read_contributing_frame_view(path, 0, scan="3", source_root=moved, full_raw=True)
     np.testing.assert_array_equal(relocated.raw, raw)
+
+
+@pytest.mark.parametrize("xu", [False, True])
+@pytest.mark.parametrize("key,value", [
+    ("version", 2), ("version", True), ("version", 1.0),
+    ("count", 2), ("count", True), ("count", 3.0),
+    ("sha256", "0" * 64), ("sha256", None), ("unexpected", 1),
+])
+def test_compact_member_binding_rejects_corruption(tmp_path, xu, key, value):
+    path, _, _, _ = _publish(tmp_path, xu=xu)
+    with h5py.File(path, "r+") as handle:
+        entry = handle["entry"]
+        provenance = json.loads(bytes(entry["provenance_json"][()]))
+        provenance["frame_members"][key] = value
+        for owner in (entry, entry["stitched_1d"]):
+            del owner["provenance_json"]
+            owner.create_dataset("provenance_json", data=np.bytes_(canonical_analysis_provenance(provenance).encode()))
+    with pytest.raises(AnalysisArtifactInvalid, match="frozen selected members"):
+        read_analysis_artifact(path)
+
+
+@pytest.mark.parametrize("xu", [False, True])
+@pytest.mark.parametrize("legacy_members", [False, True])
+@pytest.mark.parametrize("mutation", ["reorder", "source-identity"])
+def test_member_binding_rejects_changed_full_records(tmp_path, xu, legacy_members, mutation):
+    path, _, _, _ = _publish(tmp_path, xu=xu, legacy_members=legacy_members)
+    with h5py.File(path, "r+") as handle:
+        entry = handle["entry"]
+        manifest = json.loads(bytes(entry["contributing_frames_json"][()]))
+        if mutation == "reorder":
+            manifest["records"].reverse()
+        else:
+            manifest["records"][0]["identity"]["source_id"] = "different.spec"
+        del entry["contributing_frames_json"]
+        entry.create_dataset("contributing_frames_json", data=np.bytes_(canonical_frame_manifest(manifest).encode()))
+    with pytest.raises(AnalysisArtifactInvalid, match="frozen selected members"):
+        read_analysis_artifact(path)
 
 
 @pytest.mark.parametrize("mutation", ["thumbnail", "membership", "companion", "raw-copy", "external"])

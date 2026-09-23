@@ -185,7 +185,9 @@ def frame_seeds(source, manifest, plan):
 
 
 def native_provenance(value, source, output, plan, manifest):
-    from xrd_tools.io.analysis_stitch_auxiliary import analysis_contributing_frame_members
+    from xrd_tools.io.analysis_stitch_auxiliary import (
+        analysis_contributing_frame_binding, analysis_contributing_frame_members,
+    )
     from xrd_tools.analysis.stitch_operation import _relative_locator
     if not plan.native_records:
         return value
@@ -204,8 +206,8 @@ def native_provenance(value, source, output, plan, manifest):
         })
     value["wavelength_A"] = wavelength
     value["source_energy_checks"] = source_energy_checks(source, wavelength)
-    value["frame_members"] = analysis_contributing_frame_members(
-        frame_seeds(source, manifest, plan), source_base=manifest.project_root)
+    value["frame_members"] = analysis_contributing_frame_binding(analysis_contributing_frame_members(
+        frame_seeds(source, manifest, plan), source_base=manifest.project_root))
     value["output"]["artifact_family"] = output.artifact_family
     return value
 
@@ -246,15 +248,28 @@ def source_energy_checks(source, wavelength_A):
     return checks
 
 
+def _validated_native_members(request, seeds):
+    from xrd_tools.io.analysis_stitch_auxiliary import (
+        analysis_contributing_frame_binding_matches, analysis_contributing_frame_members,
+    )
+    members = analysis_contributing_frame_members(seeds, source_base=request.manifest.project_root)
+    if not analysis_contributing_frame_binding_matches(request.provenance["frame_members"], members):
+        _refuse("SOURCE_IDENTITY_MISMATCH", "raw preview facts changed since Preview")
+    return members
+
+
+def native_frame_members(request):
+    """Detach display facts on the worker after checking the frozen Preview binding."""
+    return _validated_native_members(request, frame_seeds(request.module.source, request.manifest, request.plan))
+
+
 def capture_callback(request):
     """Bind the already-previewed seed to each borrowed native science frame."""
     from xrd_tools.io.nexus_record import make_thumbnail_array
-    from xrd_tools.io.analysis_stitch_auxiliary import analysis_contributing_frame_members
     if not request.plan.native_records:
         return [], None
     seeds = frame_seeds(request.module.source, request.manifest, request.plan)
-    if analysis_contributing_frame_members(seeds, source_base=request.manifest.project_root) != request.provenance["frame_members"]:
-        _refuse("SOURCE_IDENTITY_MISMATCH", "raw preview facts changed since Preview")
+    _validated_native_members(request, seeds)
     by_label = dict(zip(request.module.source.selected_labels, seeds, strict=True))
     records = []
     def capture(label, raw):
