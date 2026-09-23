@@ -27,6 +27,9 @@ from xrd_tools.io.analysis_artifact import (
     read_analysis_artifact,
 )
 
+from xrd_tools.core.frame_view import FrameView
+from xrd_tools.io.frame_view import read_contributing_frame_view
+
 from .stitch_values import (
     StitchToolForm,
     StitchToolPreflight,
@@ -36,6 +39,7 @@ from .stitch_values import (
 
 class StitchOwnerAction(str, Enum):
     REOPEN = "reopen"
+    FRAME_READ = "frame-read"
     PREFLIGHT = "preflight"
     RUN = "run"
     RETRY_CLEANUP = "retry-cleanup"
@@ -44,6 +48,7 @@ class StitchOwnerAction(str, Enum):
 
 class StitchOwnerOutcomeKind(str, Enum):
     REOPENED = "reopened"
+    FRAME_READ = "frame-read"
     PREFLIGHT_READY = "preflight-ready"
     RESULT = "result"
     CLEANUP_PENDING = "cleanup-pending"
@@ -66,9 +71,17 @@ class StitchOwnerOutcome:
     finalization_message: str = ""
     payload: AnalysisArtifactPayload | None = None
     artifact_path: str = ""
+    frame_view: FrameView | None = None
 
     def __post_init__(self) -> None:
+        if self.kind is StitchOwnerOutcomeKind.FRAME_READ:
+            if (type(self.frame_view) is not FrameView or not self.artifact_path
+                or self.payload is not None or self.preflight is not None or self.result is not None):
+                raise TypeError("Stitch frame read outcome is invalid")
+            return
         if (
+            self.frame_view is not None
+            or
             type(self.kind) is not StitchOwnerOutcomeKind
             or type(self.finalization_message) is not str
             or type(self.artifact_path) is not str
@@ -176,6 +189,23 @@ class StitchOwnerUpdate:
 
 
 @dataclass(frozen=True, slots=True)
+class _FrameReadRequest:
+    payload: AnalysisArtifactPayload
+    frame_index: int
+    scan: str | None = None
+    source_root: str | None = None
+    full_raw: bool = False
+
+    def __post_init__(self):
+        if (type(self.payload) is not AnalysisArtifactPayload
+            or type(self.frame_index) is not int or self.frame_index < 0
+            or (self.scan is not None and type(self.scan) is not str)
+            or (self.source_root is not None and type(self.source_root) is not str)
+            or type(self.full_raw) is not bool):
+            raise TypeError("Stitch frame read request is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class _WorkerCommand:
     action: StitchOwnerAction
     form_fingerprint: str
@@ -184,6 +214,7 @@ class _WorkerCommand:
     preflight: StitchToolPreflight | None = None
     execution: StitchOperationExecution | None = None
     artifact_path: str = ""
+    frame_request: _FrameReadRequest | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -204,7 +235,10 @@ class _WorkerCommand:
             )
         ):
             raise TypeError("Stitch worker command is invalid")
-        if self.action is StitchOwnerAction.REOPEN:
+        if self.action is StitchOwnerAction.FRAME_READ:
+            valid = (type(self.frame_request) is _FrameReadRequest and bool(self.artifact_path)
+                     and all(value is None for value in (self.form, self.preflight, self.execution)))
+        elif self.action is StitchOwnerAction.REOPEN:
             valid = bool(self.artifact_path) and all(
                 value is None for value in (self.form, self.preflight, self.execution)
             )
@@ -215,10 +249,11 @@ class _WorkerCommand:
                 self.form is None
                 and self.preflight is not None
                 and self.execution is not None
-                and self.execution.request is self.preflight.request
+                and any(self.execution.request is item for item in self.preflight.requests)
                 and self.form_fingerprint == self.preflight.form.fingerprint
             )
-        if not valid or (self.action is not StitchOwnerAction.REOPEN and self.artifact_path):
+        if (not valid or (self.action not in {StitchOwnerAction.REOPEN, StitchOwnerAction.FRAME_READ} and self.artifact_path)
+            or (self.action is not StitchOwnerAction.FRAME_READ and self.frame_request is not None)):
             raise TypeError("Stitch worker command fields disagree")
 
 
@@ -388,7 +423,20 @@ class StitchToolOwner:
                 artifact_path=shown,
             ))
 
-    def begin_run(self) -> OperationIdentity | None:
+    def begin_frame_read(self, payload, frame_index, *, scan=None, source_root=None, full_raw=False):
+        """Hydrate only a selected contributor on the existing serial worker."""
+        request = _FrameReadRequest(payload, frame_index, scan,
+                                    None if source_root is None else str(source_root), full_raw)
+        path = payload.inspection.path
+        with self._lock:
+            if self._finalization is not StitchOwnerFinalization.NONE:
+                return None
+            return self._begin_locked(_WorkerCommand(
+                StitchOwnerAction.FRAME_READ, path, max(1, self._form_revision),
+                artifact_path=path, frame_request=request,
+            ))
+
+    def begin_run(self, job_index: int = 0) -> OperationIdentity | None:
         with self._lock:
             preflight = self._prepared
             if (
@@ -396,14 +444,16 @@ class StitchToolOwner:
                 or not preflight.is_current(self._form)
                 or self._prepared_revision != self._form_revision
                 or self._finalization is not StitchOwnerFinalization.NONE
+                or type(job_index) is not int or not 0 <= job_index < len(preflight.requests)
             ):
                 return None
+            request = preflight.requests[job_index]
             execution = self._execution_factory(
-                preflight.request, coordinator=self._coordinator
+                request, coordinator=self._coordinator
             )
             if (
                 type(execution) is not StitchOperationExecution
-                or execution.request is not preflight.request
+                or execution.request is not request
             ):
                 raise TypeError(
                     "execution factory must return the exact prepared Stitch execution"
@@ -440,7 +490,7 @@ class StitchToolOwner:
             or preflight is None
             or execution is None
             or form_revision is None
-            or execution.request is not preflight.request
+            or not any(execution.request is item for item in preflight.requests)
         ):
             return None
         command = _WorkerCommand(
@@ -478,6 +528,15 @@ class StitchToolOwner:
     def _run_command(self, request, cancel, publish):
         if type(request) is not _WorkerCommand:
             raise TypeError("Stitch worker requires one exact command")
+        if request.action is StitchOwnerAction.FRAME_READ:
+            selected = request.frame_request
+            publish("raw-frame", 0, 1)
+            view = read_contributing_frame_view(request.artifact_path, selected.frame_index,
+                scan=selected.scan, source_root=selected.source_root, full_raw=selected.full_raw,
+                artifact_payload=selected.payload)
+            publish("raw-frame", 1, 1)
+            return StitchOwnerOutcome(StitchOwnerOutcomeKind.FRAME_READ,
+                frame_view=view, artifact_path=request.artifact_path)
         if request.action is StitchOwnerAction.REOPEN:
             publish("reopen", 0, 1)
             payload = read_analysis_artifact(
@@ -544,7 +603,7 @@ class StitchToolOwner:
         if type(command) is not _WorkerCommand:
             raise RuntimeError("Stitch worker identity lost its exact command")
         with self._lock:
-            stale = command.action is not StitchOwnerAction.REOPEN and (
+            stale = command.action not in {StitchOwnerAction.REOPEN, StitchOwnerAction.FRAME_READ} and (
                 self._form is None
                 or self._form.fingerprint != command.form_fingerprint
                 or self._form_revision != command.form_revision
