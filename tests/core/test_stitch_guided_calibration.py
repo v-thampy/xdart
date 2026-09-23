@@ -12,6 +12,7 @@ from xrd_tools.integrate.stitch_calibration import (
     CalibrationFrame, adopt_calibration_pair, capture_calibration_frames,
     fit_calibration, load_calibration_session, load_control_frame,
     save_calibration_fit, suggested_frame_indices,
+    save_calibration_session, validate_frame_files, calibration_image_identity,
 )
 
 
@@ -22,6 +23,8 @@ def _digest(path):
 def _frames(tmp_path, controls, poni, shape=(195, 1475)):
     from pyFAI.control_points import ControlPoints
     from pyFAI.calibrant import get_calibrant
+    from pyFAI.detectors import detector_factory
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
     frames = []
     for index, control in enumerate(controls):
         directory = tmp_path / str(index)
@@ -35,9 +38,9 @@ def _frames(tmp_path, controls, poni, shape=(195, 1475)):
         npt = directory / 'frame.npt'
         points.save(str(npt))
         seed = directory / 'frame.poni'
-        seed.write_text('poni_version: 2.1\nDetector: Pilatus300kw\nDetector_config: {"orientation":3}\n'
-            f'Distance: {poni.dist}\nPoni1: {poni.poni1}\nPoni2: {poni.poni2}\n'
-            f'Rot1: {poni.rot1}\nRot2: {poni.rot2}\nRot3: {poni.rot3}\nWavelength: {poni.wavelength}\n')
+        AzimuthalIntegrator(dist=poni.dist, poni1=poni.poni1, poni2=poni.poni2,
+            rot1=poni.rot1, rot2=poni.rot2, rot3=poni.rot3, wavelength=poni.wavelength,
+            detector=detector_factory('Pilatus300kw', config={'orientation':3})).save(str(seed))
         frame = CalibrationFrame(str(index), str(image), 'image_file', {}, index,
             str(image), 0, str(image), _digest(image), shape, 0, dict(control.motors), None)
         frames.append(adopt_calibration_pair(frame, seed, npt))
@@ -64,6 +67,34 @@ def test_exact_raw_staging_rotation_angles_and_resume(tmp_path):
     assert len(suggested_frame_indices([(f.index, f.motors, None) for f in frames])) == 2
 
 
+def test_resumed_control_points_require_retained_image_binding(tmp_path):
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.integrate.refine import ControlFrame
+    control = ControlFrame([1,2], [3,4], [0,0], {'del':10.,'nu':2.})
+    frame, = _frames(tmp_path, (control,), PONI(dist=.39, poni1=.01, poni2=.02,
+        wavelength=1e-10, detector='Pilatus300kw'))
+    session = save_calibration_session(tmp_path, (frame,))
+    assert load_calibration_session(session)[0].complete
+    value = json.loads(session.read_text())
+    value['frames'][0]['control_image_sha256'] = '0' * 64
+    session.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match='different calibration image'):
+        load_calibration_session(session)
+    # Older sessions preserve their files but cannot inherit automatic binding.
+    value['version'] = 1
+    value['frames'][0].pop('control_image_sha256')
+    value['frames'][0].pop('pairing_policy')
+    session.write_text(json.dumps(value))
+    old, = load_calibration_session(session)
+    assert not old.complete
+    assert old.poni_path == frame.poni_path and old.npt_path == frame.npt_path
+    with pytest.raises(ValueError, match='matched PONI'):
+        validate_frame_files(old)
+    with pytest.raises(ValueError, match='loaded pyFAI image differs'):
+        adopt_calibration_pair(old, frame.poni_path, frame.npt_path,
+                               model_image_sha256=calibration_image_identity(np.ones(frame.shape))[1])
+
+
 def test_mg_fit_saved_json_reloads_actual_importer_and_bad_inputs_refuse(tmp_path):
     from tests.core.test_refine import _truth, _synth_control_frames, _FRAMES
     from xrd_tools.core.geometry import Diffractometer
@@ -79,6 +110,12 @@ def test_mg_fit_saved_json_reloads_actual_importer_and_bad_inputs_refuse(tmp_pat
     assert result.rms_q < .006
     actual = Goniometer.sload(path)
     assert .37 <= actual.get_ai((3., 15.)).dist <= .41
+    from xrd_tools.analysis.stitch_operation import (
+        StitchGeometryInput, StitchGeometryKind, capture_stitch_geometry,
+    )
+    receipt = capture_stitch_geometry(StitchGeometryInput(path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
+        source_motors=(('del_angle','del'),('nu_angle','nu'))))
+    assert json.loads(receipt.content)['detector_config'] == {'orientation':3}
     assert json.loads((tmp_path / 'fitted.json.provenance.json').read_text())['frames'][0]['index'] == 0
     with pytest.raises(FileExistsError):
         save_calibration_fit(result, path)

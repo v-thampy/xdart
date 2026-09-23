@@ -15,7 +15,7 @@ from xdart.gui.tabs.stitch.calibration import StitchCalibrationDialog
 from xrd_tools.core.scan import SourceSpec, SourceKind
 
 
-@pytest.mark.parametrize('action', ['save', 'close', 'missing_points', 'failed_save', 'child_failure'])
+@pytest.mark.parametrize('action', ['save', 'switched_image', 'close', 'missing_points', 'failed_save', 'child_failure'])
 def test_real_guided_child_save_captures_only_matched_enabled_points(tmp_path, monkeypatch, action):
     hooks = tmp_path / 'hooks'; hooks.mkdir()
     (hooks/'sitecustomize.py').write_text('''
@@ -38,6 +38,12 @@ def automated_exec(app):
             task = next(w for w in app.allWidgets() if isinstance(w, IntegrationTask))
             if action != 'close':
                 settings = task.model().experimentSettingsModel()
+                if action == 'switched_image':
+                    from pyFAI.io import image as image_io
+                    with settings.image().lockContext() as model:
+                        model.setFilename(str(scratch / 'other.tif'))
+                        model.setValue(image_io.read_image_data(str(scratch / 'other.tif')))
+                        model.setSynchronized(True)
                 settings.detectorModel().setDetector(detector_factory('Detector', {'pixel1': 1e-4, 'pixel2': 1e-4, 'max_shape': [8, 10]}))
                 settings.calibrantModel().setCalibrant(get_calibrant('LaB6'))
                 settings.wavelength().setValue(1e-10)
@@ -71,12 +77,16 @@ qt.QApplication.exec = automated_exec
     monkeypatch.setenv('XDART_TEST_GUIDED_ACTION', action)
     image = tmp_path/'selected.tif'
     tifffile.imwrite(image, np.arange(80, dtype=np.uint16).reshape(8,10))
+    tifffile.imwrite(hooks/'other.tif', (100 + np.arange(80, dtype=np.uint16)).reshape(8,10))
     request = replace(prepare_calibration_request(str(image)), points_directory=str(tmp_path))
     terminal = run_calibration(request, OperationIdentity(1), Event(), lambda *_: None, lambda _: True)
-    if action in ('missing_points', 'child_failure'):
+    if action in ('switched_image', 'missing_points', 'child_failure'):
         assert terminal.status is OperationTerminalStatus.FAILED
         assert terminal.payload.control_points_path is None
         assert not terminal.payload.candidates
+        assert terminal.payload.loaded_image_sha256 is None
+        if action == 'switched_image':
+            assert 'loaded pyFAI image differs' in terminal.diagnostic
     else:
         assert terminal.status is OperationTerminalStatus.RETURNED, terminal.diagnostic
         if action == 'save':
@@ -89,6 +99,23 @@ qt.QApplication.exec = automated_exec
             assert group.ring == 0
             assert group.points == [[1.,2.],[3.,4.]]
             assert Path(result.control_points_path).is_file()
+            from xrd_tools.integrate.stitch_calibration import (
+                CalibrationFrame, adopt_calibration_pair, calibration_image_identity,
+                save_calibration_session, load_calibration_session,
+            )
+            import hashlib
+            frame = CalibrationFrame('selected', str(image), 'image_file', {}, 4,
+                str(image), 0, str(image), hashlib.sha256(image.read_bytes()).hexdigest(),
+                (8,10), 0, {'del':12.,'nu':3.}, None)
+            assert result.loaded_image_shape == frame.shape
+            assert result.loaded_image_sha256 == calibration_image_identity(tifffile.imread(image))[1]
+            adopted = adopt_calibration_pair(frame, result.last_saved_path, result.control_points_path,
+                                             model_image_sha256=result.loaded_image_sha256)
+            assert adopted.complete
+            assert adopted.motors == {'del':12.,'nu':3.}
+            assert adopted.pairing_policy == 'pyfai-model-image-v1'
+            session = save_calibration_session(tmp_path, (adopted,))
+            assert load_calibration_session(session) == (adopted,)
         else:
             assert terminal.payload.last_saved_path is None
             assert terminal.payload.control_points_path is None

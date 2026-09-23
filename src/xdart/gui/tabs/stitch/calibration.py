@@ -45,7 +45,8 @@ def _run_job(request, cancelled, publish):
         if not result.control_points_path:
             raise ValueError('the saved PONI has no matching enabled control points')
         validate_frame_files(frame, require_points=False)
-        adopted = adopt_calibration_pair(frame, result.last_saved_path, result.control_points_path)
+        adopted = adopt_calibration_pair(frame, result.last_saved_path, result.control_points_path,
+                                         model_image_sha256=result.loaded_image_sha256)
         if adopted.poni_sha256 != result.candidates[0].proof.sha256 or adopted.npt_sha256 != result.control_points_sha256:
             raise ValueError('saved PONI or points changed during adoption')
         return adopted

@@ -193,10 +193,17 @@ class CalibrationResult:
     last_saved_path: str | None = None
     control_points_path: str | None = None
     control_points_sha256: str | None = None
+    loaded_image_shape: tuple[int, int] | None = None
+    loaded_image_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if (type(self.request) is not CalibrationRequest
                 or (self.control_points_path is None) != (self.control_points_sha256 is None)
+                or (self.control_points_path is None) != (self.loaded_image_shape is None)
+                or (self.loaded_image_shape is None) != (self.loaded_image_sha256 is None)
+                or self.loaded_image_shape is not None
+                and (not _shape_valid(self.loaded_image_shape)
+                     or not _sha256(self.loaded_image_sha256))
                 or self.control_points_path is not None
                 and (not self.save_reported or self.last_saved_path is None
                      or not _absolute_path(self.control_points_path)
@@ -1020,17 +1027,18 @@ def _cleanup(stage: Path | None, identity: tuple[int, int] | None, names: tuple[
             if not stat.S_ISDIR(path.lstat().st_mode): path.unlink()
         stage.rmdir(); return ""
     except OSError: return str(stage)
-def _read_calibration_save_report(path: Path, *, points_directory: str | None = None):
+def _read_calibration_save_report(path: Path, *, points_directory: str | None = None,
+                                  source_path: str | None = None):
     if not path.exists():
-        return False, None, None, None
+        return False, None, None, None, None, None
     with path.open("rb") as stream:
         data = stream.read(2 * _PATH_BYTES_LIMIT + 2048)
     report = json.loads(data)
     if report is None:
-        return True, None, None, None
+        return True, None, None, None, None, None
     keys = {"path", "sha256"}
     if points_directory is not None:
-        keys |= {"npt_path", "npt_sha256"}
+        keys |= {"npt_path", "npt_sha256", "image_shape", "image_sha256"}
     if (type(report) is not dict or set(report) != keys
             or not _absolute_path(report["path"])
             or not _sha256(report["sha256"])):
@@ -1039,7 +1047,17 @@ def _read_calibration_save_report(path: Path, *, points_directory: str | None = 
     if candidate.proof.sha256 != report["sha256"]:
         raise ValueError("last saved PONI changed before adoption")
     npt_path, npt_sha = report.get("npt_path"), report.get("npt_sha256")
+    image_shape = image_sha = None
     if points_directory is not None:
+        from xrd_tools.integrate.stitch_calibration import calibration_image_identity
+        if (type(report['image_shape']) is not list
+                or not _shape_valid(tuple(report['image_shape']))
+                or not _sha256(report['image_sha256']) or source_path is None):
+            raise ValueError('calibration did not report the actual model image')
+        image_shape, image_sha = calibration_image_identity(
+            read_image(source_path, preserve_dtype=True, exact_frame=True))
+        if image_shape != tuple(report['image_shape']) or image_sha != report['image_sha256']:
+            raise ValueError('loaded pyFAI image differs from selected calibration frame')
         if (not _absolute_path(npt_path) or not _sha256(npt_sha)
                 or Path(npt_path).parent != Path(points_directory)
                 or not stat.S_ISREG(Path(npt_path).lstat().st_mode)):
@@ -1048,7 +1066,7 @@ def _read_calibration_save_report(path: Path, *, points_directory: str | None = 
             content = stream.read((4 << 20) + 1)
         if not 0 < len(content) <= 4 << 20 or hashlib.sha256(content).hexdigest() != npt_sha:
             raise ValueError("saved control points changed before adoption")
-    return True, candidate, npt_path, npt_sha
+    return True, candidate, npt_path, npt_sha, image_shape, image_sha
 
 
 def run_calibration(
@@ -1062,6 +1080,7 @@ def run_calibration(
     save_reported = False
     last_saved = None
     npt_path = npt_sha = None
+    image_shape = image_sha = None
     code = None; argv: tuple[str, ...] = ()
     status = OperationTerminalStatus.RETURNED; diagnostic = ""
     try:
@@ -1137,8 +1156,8 @@ def run_calibration(
             if code != 0:
                 raise _nonzero_child_error(
                     "pyFAI-calib2", code, child_diagnostic)
-            save_reported, last_saved, npt_path, npt_sha = _read_calibration_save_report(
-                report_path, points_directory=request.points_directory)
+            save_reported, last_saved, npt_path, npt_sha, image_shape, image_sha = _read_calibration_save_report(
+                report_path, points_directory=request.points_directory, source_path=request.source_path)
             if request.points_directory is not None and not save_reported:
                 raise ValueError("guided calibration requires an exact successful save report")
         if not _source_context_current(
@@ -1185,11 +1204,13 @@ def run_calibration(
     if status is not OperationTerminalStatus.RETURNED and save_reported:
         candidates, save_reported, last_saved = (), False, None
         npt_path = npt_sha = None
+        image_shape = image_sha = None
     result = CalibrationResult(
         request, candidates, code, argv, request.monitored_directory, diagnostic,
         save_reported=save_reported,
         last_saved_path=last_saved.path if last_saved is not None else None,
         control_points_path=npt_path, control_points_sha256=npt_sha,
+        loaded_image_shape=image_shape, loaded_image_sha256=image_sha,
     )
     return OperationTerminal(identity, status, diagnostic, result)
 _TIFF_LIMIT, _MASK_LIMIT, _PIXEL_LIMIT, _DECODED_LIMIT = 512 << 20, 64 << 20, 1 << 25, 256 << 20

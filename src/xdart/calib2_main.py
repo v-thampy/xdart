@@ -47,6 +47,10 @@ def capture_poni_saves(report_path, *, points_directory=None):
                 captured = {"path": str(path), "sha256": hashlib.sha256(data).hexdigest()}
                 if points_directory is not None:
                     from pyFAI.gui.helper import model_transform
+                    from xrd_tools.integrate.stitch_calibration import calibration_image_identity
+                    shape, image_sha = calibration_image_identity(
+                        task.model().experimentSettingsModel().image().value())
+                    captured.update(image_shape=list(shape), image_sha256=image_sha)
                     points = model_transform.createControlPoints(task.model())
                     if not points.get_labels() or not any(
                             points.get(lbl=label).points for label in points.get_labels()):

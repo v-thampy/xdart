@@ -32,6 +32,34 @@ def _sha(path: str | Path, cap: int = 512 << 20) -> str:
     return digest.hexdigest()
 
 
+def calibration_image_identity(image):
+    """Shape and content of the actual calibration image, independent of file encoding.
+
+    The guided input is a decoded float64 TIFF. Use canonical little-endian
+    float64 pixels, including canonical NaNs, for the child/model comparison.
+    Shape participates in the digest so a reshape cannot preserve identity.
+    """
+    values = np.asarray(image)
+    if (values.ndim != 2 or not all(values.shape) or values.size > 1 << 25
+            or values.dtype.kind not in 'iuf'):
+        raise ValueError('calibration image must be a bounded real two-dimensional array')
+    values = np.array(values, dtype='<f8', order='C', copy=True)
+    values[np.isnan(values)] = np.nan
+    shape = tuple(int(v) for v in values.shape)
+    digest = hashlib.sha256(b'xdart-calibration-image-float64-v1\0')
+    digest.update(np.asarray(shape, dtype='<u8').tobytes())
+    digest.update(values.tobytes())
+    return shape, digest.hexdigest()
+
+
+def _staged_image_identity(frame):
+    from xrd_tools.io.image import read_image
+    shape, digest = calibration_image_identity(read_image(frame.image_path, preserve_dtype=True))
+    if shape != frame.shape:
+        raise ValueError(f'frame {frame.index}: staged image shape changed')
+    return digest
+
+
 @dataclass(frozen=True)
 class CalibrationFrame:
     identity: str
@@ -51,10 +79,13 @@ class CalibrationFrame:
     poni_sha256: str = ''
     npt_path: str = ''
     npt_sha256: str = ''
+    pairing_policy: str = ''
+    control_image_sha256: str = ''
 
     @property
     def complete(self) -> bool:
-        return bool(self.poni_path and self.npt_path)
+        return bool(self.poni_path and self.npt_path and self.control_image_sha256
+                    and self.pairing_policy in {'pyfai-model-image-v1', 'explicit-import-v1'})
 
 
 @contextmanager
@@ -217,7 +248,7 @@ def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
 
 def save_calibration_session(directory, frames):
     path = Path(directory) / 'calibration-session.json'
-    payload = {'schema': 'xdart.stitch_calibration_session', 'version': 1,
+    payload = {'schema': 'xdart.stitch_calibration_session', 'version': 2,
                'frames': [asdict(frame) for frame in frames]}
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(payload, indent=2, allow_nan=False))
@@ -230,12 +261,14 @@ def load_calibration_session(path):
     if path.stat().st_size > 1 << 20:
         raise ValueError('calibration session exceeds the size limit')
     value = json.loads(path.read_text())
-    if set(value) != {'schema', 'version', 'frames'} or value['schema'] != 'xdart.stitch_calibration_session' or value['version'] != 1:
+    if set(value) != {'schema', 'version', 'frames'} or value['schema'] != 'xdart.stitch_calibration_session' or value['version'] not in (1, 2):
         raise ValueError('unsupported calibration session')
     if not 1 <= len(value['frames']) <= 32:
         raise ValueError('invalid calibration frame count')
     frames = tuple(CalibrationFrame(**{**row, 'shape': tuple(row['shape'])}) for row in value['frames'])
     for frame in frames:
+        # Legacy rows retain their files, but absent model/image binding means
+        # they are incomplete until the user recalibrates or explicitly imports.
         validate_frame_files(frame, require_points=frame.complete)
     return frames
 
@@ -246,6 +279,8 @@ def validate_frame_files(frame, *, require_points=True):
     if require_points:
         if not frame.complete:
             raise ValueError(f'frame {frame.index}: matched PONI and NPT are required')
+        if _staged_image_identity(frame) != frame.control_image_sha256:
+            raise ValueError(f'frame {frame.index}: control points belong to a different calibration image')
         if _sha(frame.poni_path, 1 << 20) != frame.poni_sha256 or _sha(frame.npt_path, 4 << 20) != frame.npt_sha256:
             raise ValueError(f'frame {frame.index}: saved PONI or control points changed')
 
@@ -278,9 +313,13 @@ def load_control_frame(frame):
     return control, points.calibrant, calibration
 
 
-def adopt_calibration_pair(frame, poni_path, npt_path):
+def adopt_calibration_pair(frame, poni_path, npt_path, *, model_image_sha256=None):
     """Import an explicitly matched pair, retaining independent local copies."""
     import shutil
+    validate_frame_files(frame, require_points=False)
+    image_sha = _staged_image_identity(frame)
+    if model_image_sha256 is not None and model_image_sha256 != image_sha:
+        raise ValueError('loaded pyFAI image differs from selected calibration frame')
     row = Path(frame.image_path).parent
     token = uuid.uuid4().hex
     poni = row / f'calibration-{token}.poni'
@@ -289,7 +328,9 @@ def adopt_calibration_pair(frame, poni_path, npt_path):
     shutil.copyfile(poni_path, poni)
     shutil.copyfile(npt_path, points)
     result = replace(frame, poni_path=str(poni), poni_sha256=_sha(poni),
-                     npt_path=str(points), npt_sha256=_sha(points))
+                     npt_path=str(points), npt_sha256=_sha(points),
+                     pairing_policy='explicit-import-v1' if model_image_sha256 is None else 'pyfai-model-image-v1',
+                     control_image_sha256=image_sha)
     load_control_frame(result)
     return result
 
@@ -302,6 +343,30 @@ class CalibrationFit:
     condition_number: float
     n_points: int
     message: str
+
+
+def _mg_detector_config(calibration):
+    """Use the existing Stitch JSON config without dropping detector geometry.
+
+    pyFAI saves fixed detector pitches redundantly in PONI files. They can be
+    omitted from a goniometer record only when the registered detector with
+    the admitted orientation/binning reproduces the exact full configuration.
+    Generic/custom pitches, shapes and sensor configurations stay unsupported.
+    """
+    config = dict(calibration.detector_config)
+    admitted = {key: value for key, value in config.items() if key in {'orientation', 'binning'}}
+    extra = config.keys() - admitted.keys()
+    if not extra:
+        return admitted
+    if extra - {'pixel1', 'pixel2', 'max_shape'}:
+        raise ValueError('MG Stitch JSON does not support this detector configuration')
+    from pyFAI.detectors import detector_factory
+    full = detector_factory(calibration.poni.detector, config=config)
+    compact = detector_factory(calibration.poni.detector, config=admitted)
+    if (type(full) is not type(compact) or full.shape != compact.shape
+            or full.get_config() != compact.get_config()):
+        raise ValueError('MG Stitch JSON requires the registered detector pitch and shape')
+    return admitted
 
 
 def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_motor='nu',
@@ -325,6 +390,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     if cancelled is not None and cancelled.is_set():
         raise InterruptedError('calibration fit cancelled')
     if backend == 'multigeometry':
+        exported_config = _mg_detector_config(base)
         result = refine_goniometer(frames[0].poni_path, controls, rot1_motor=nu_motor,
                                   rot2_motor=del_motor, calibrant=calibrants[0],
                                   fit_scales=fit_scales, distance_seed_m=distance_seed_m,
@@ -336,7 +402,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
         # Standard pyFAI GeometryTransformation JSON, admitted by the existing
         # importer with the page's del/nu source-motor mapping.
         asset = {'content': 'Goniometer calibration v2', 'detector': base.poni.detector,
-                 'detector_config': dict(base.detector_config), 'wavelength': base.poni.wavelength,
+                 'detector_config': exported_config, 'wavelength': base.poni.wavelength,
                  'param_names': names, 'param': list(params.values()),
                  'pos_names': ['nu_angle', 'del_angle'],
                  'trans_function': {'content': 'GeometryTransformation', 'param_names': names,
@@ -451,6 +517,13 @@ def save_calibration_fit(fit: CalibrationFit, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('xb') as stream:
         stream.write(raw)
+    if fit.backend == 'multigeometry':
+        from xrd_tools.analysis.stitch_operation import (
+            StitchGeometryInput, StitchGeometryKind, capture_stitch_geometry,
+        )
+        capture_stitch_geometry(StitchGeometryInput(path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
+            source_motors=tuple(sorted(fit.asset['provenance']['source_motors'].items())),
+            image_rotation=fit.asset['provenance']['image_rotation']))
     with provenance.open('x') as stream:
         json.dump(fit.asset['provenance'], stream, indent=2, allow_nan=False)
     return str(path)
