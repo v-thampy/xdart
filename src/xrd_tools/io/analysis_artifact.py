@@ -1859,6 +1859,9 @@ def _project_analysis_artifact_result_v1_compat(
     sigma: np.ndarray | None,
     coverage: np.ndarray | None,
     normalization: np.ndarray | None,
+    wavelength_A: float | None = None,
+    frame_records=None,
+    source_base=None,
 ) -> AnalysisArtifactResultProjection:
     """Use the central projection for byte-compatible historical v1 Stitch."""
 
@@ -1871,6 +1874,9 @@ def _project_analysis_artifact_result_v1_compat(
         coverage=coverage,
         normalization=normalization,
         _stored_v1_claim=_ANALYSIS_V1_DECODE_PROJECTION,
+        wavelength_A=wavelength_A,
+        frame_records=frame_records,
+        source_base=source_base,
     )
 
 

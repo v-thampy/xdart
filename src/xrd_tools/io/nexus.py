@@ -3880,7 +3880,6 @@ def write_stitched(
         from xrd_tools.io.analysis_artifact import (
             AnalysisArtifactKind,
             _project_analysis_artifact_result_v1_compat,
-            project_analysis_artifact_result,
         )
 
         if (coverage is None) != (normalization is None):
@@ -3923,9 +3922,8 @@ def write_stitched(
                 ("q", value.unit),
                 ("chi", value.azimuthal_unit),
             )
-        projector = project_analysis_artifact_result if native else _project_analysis_artifact_result_v1_compat
         auxiliary = dict(wavelength_A=wavelength_A, frame_records=frame_records, source_base=source_base) if native else {}
-        projection = projector(
+        projection = _project_analysis_artifact_result_v1_compat(
             kind=kind,
             axes=axes,
             axis_units=axis_units,

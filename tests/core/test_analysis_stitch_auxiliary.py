@@ -12,6 +12,7 @@ from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactKind, AnalysisArtifactRequest, AnalysisArtifactOverwrite,
     AnalysisArtifactInvalid, admit_analysis_artifact, read_analysis_artifact,
     project_analysis_artifact_result, analysis_execution_attestation_digest,
+    _project_analysis_artifact_result_v1_compat,
 )
 from xrd_tools.io.analysis_stitch_auxiliary import analysis_contributing_frame_members
 from xrd_tools.io.frame_view import read_contributing_frame_view
@@ -20,7 +21,7 @@ from xrd_tools.io.output_transaction import OutputTransactionCoordinator
 from tests.core.test_analysis_artifact import _execution_attestation
 
 
-def _publish(tmp_path, *, unit="q_A^-1", xu=False, science_frame_count=3):
+def _publish(tmp_path, *, unit="q_A^-1", xu=False, science_frame_count=3, fractional=False):
     project = tmp_path / "project"
     project.mkdir()
     raw = np.arange(24, dtype=np.int32).reshape(4, 6)
@@ -36,9 +37,10 @@ def _publish(tmp_path, *, unit="q_A^-1", xu=False, science_frame_count=3):
     provenance = {"frame_members": analysis_contributing_frame_members(records, source_base=project)}
     radial = np.linspace(0.1, 5.0, 40) if unit == "q_A^-1" else np.linspace(1, 100, 40)
     intensity = np.arange(40, dtype=float) + 1
-    projection = project_analysis_artifact_result(kind=AnalysisArtifactKind.STITCH_1D,
+    projector = _project_analysis_artifact_result_v1_compat if fractional else project_analysis_artifact_result
+    projection = projector(kind=AnalysisArtifactKind.STITCH_1D,
         axes=(("q", radial),), axis_units=(("q", unit),), intensity=intensity,
-        sigma=None, coverage=np.ones(40), normalization=np.ones(40),
+        sigma=None, coverage=np.full(40, 0.25 if fractional else 1.), normalization=np.ones(40),
         wavelength_A=1.0, frame_records=records, source_base=project)
     digest = hashlib.sha256(b"native-stitch-test").hexdigest()
     extra = {}
@@ -137,3 +139,9 @@ def test_exact_external_hdf_dataset_selector_and_original_frame(tmp_path):
             source_frame_index=2, thumbnail=np.ones((2, 2)),
             source_snapshot=dict(dataset_path="/selected"))], source_base=project)
     np.testing.assert_array_equal(get_raw_frame(ordinary, 9, scan="5", allow_thumbnail=False), values[2])
+
+
+def test_native_mg_preserves_fractional_pixel_split_coverage(tmp_path):
+    path, _, _, receipt = _publish(tmp_path, fractional=True)
+    payload = read_analysis_artifact(path, expected_receipt=receipt)
+    np.testing.assert_array_equal(payload.coverage, np.full(40, .25))
