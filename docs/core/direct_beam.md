@@ -1,9 +1,14 @@
 # Direct-beam distance calibration
 
-`xrd_tools.integrate.calibrate_direct_beam` accepts degree angles and an ordered
-iterable of arrays or image references. `calibrate_direct_beam_scan` reads one
-SPEC scan and calls the same numerical owner. Both return `DirectBeamResult`;
-neither writes files, plots, changes application state or constructs a PONI.
+Three functions separate source handling from the numerical fit:
+
+- `calibrate_direct_beam(angles_deg, images, ...)` fits explicit inputs.
+- `open_direct_beam_scan(source, ...)` extracts paired angles and lazy images.
+- `calibrate_direct_beam_scan(source, ...)` combines both in one call, returning
+  `DirectBeamResult` and closing the files it opened.
+
+They use existing readers, write no files, and construct no GUI or PONI. The
+numerical options and result are the same for SPEC, Eiger and NeXus inputs.
 
 ## Geometry and coordinates
 
@@ -99,6 +104,90 @@ belongs to `read_image`; do not pass pyFAI objects as its `detector` argument.
 Masks, rotation and thresholds belong to calibration's explicit arguments.
 Only one frame is processed at a time; results retain scalar summaries, not images.
 
+### Eiger masters with SPEC angles
+
+Pass the master directly; the wrapper reads the SPEC angles, counts actual
+acquired images through the existing container reader, and streams exact frames.
+It resolves ExternalLinks and rejects mismatched all-frame counts without trimming.
+The master's `nimages` and configured trigger count are not used as acquired counts.
+
+```python
+result = calibrate_direct_beam_scan(
+    scan_file, "8.1", motor="del", image_file=master_file,
+    detector="Eiger2_500k", beam_pixel=(514, 256), angle_zero_deg=0.0,
+    mask=pixel_mask, saturation=corrected_count_cutoff,
+)
+```
+
+Here `(514, 256)` is an explicitly chosen strip seed for a `(512, 1028)` image,
+not an inferred detector centre or a constraint on the fitted intercept. Choose
+the actual detector model (`Eiger2_500k` and `Eiger500k` have different layouts).
+The caller supplies the static pixel mask and acquisition cutoff. A corrected
+uint32 image can legitimately exceed 65535 despite a 16-bit readout header.
+Masking in an existing `read_image(..., mask=pixel_mask)` generator remains valid;
+pre-masking is not required for native file references.
+
+### NeXus images and angles in one file
+
+Omit the SPEC scan number. The wrapper uses `read_nexus` for the requested motor
+column and `ContainerCursor` for native image frames:
+
+```python
+result = calibrate_direct_beam_scan(
+    nexus_file, motor="del",
+    detector="Eiger2_500k", beam_pixel=(514, 256), angle_zero_deg=0.0,
+    mask=pixel_mask, saturation=corrected_count_cutoff,
+)
+```
+
+The existing reader supports Bluesky/NXWriter and generic NeXus motor tables
+under `data`, `scan_data`, or sample positioners. Use `entry="measurement"` for
+a nondefault NXentry. A metadata-free Eiger/NeXus stack can instead be passed as
+`calibrate_direct_beam_scan(master_file, angles_deg=angles_deg, ...)`.
+
+The caller must establish that the chosen motor is the detector arm and its
+values are degrees. An absent motor is not replaced with a sample motor or a
+constant header position. Detector choice, explicit beam pixel, masks, acquisition
+cutoff and known angular zero stay in the fit options for every input format.
+
+`frame_indices=(0, 25, 50)` selects original frame labels and corresponding angle
+rows, in that order. This explicit subset need not cover the whole container;
+only the selected pairs must exist. File labels are zero-based and SPEC point IDs
+retain their scan/repetition and original row. To associate different image and
+angle indices, use the numerical function with explicitly matched sequences.
+`reader_options` applies to explicit file references and filename templates;
+the container route uses the shared native reader and the selected NXentry.
+
+### Source loading separately, including future adapters
+
+The loader is available when a caller needs to inspect or fit the inputs itself:
+
+```python
+from xrd_tools.integrate import open_direct_beam_scan, calibrate_direct_beam
+
+with open_direct_beam_scan(nexus_file, motor="del") as inputs:
+    result = calibrate_direct_beam(
+        inputs.angles_deg, inputs.images,
+        frame_ids=inputs.frame_ids, point_ids=inputs.point_ids,
+        detector="Eiger2_500k", beam_pixel=(514, 256), angle_zero_deg=0.0,
+        mask=pixel_mask, saturation=corrected_count_cutoff,
+    )
+```
+
+`DirectBeamScanInput` holds angles, images, frame IDs and point IDs. Consume its
+images inside the context: file handles close on both success and failure. Lazy
+`ScanFrame` inputs defer source reads until the numerical owner's per-row error
+handler, retaining the failed row and its original read-error reason.
+
+Both loader and wrapper also accept an existing `FrameSource`. Its original
+`frame_indices` identify rows; angles come from `motors`, `metadata_for`, or an
+explicit `angles_deg` array aligned with the full source label order. This is
+the extension point for a future Tiled adapter. Source names should be stable
+run identities; the fitter/wrapper also accepts explicit `frame_ids`/`point_ids`.
+Caller-owned sources remain open. No Tiled image/network adapter is bundled yet.
+Existing arrays and arbitrary generators remain valid numerical inputs; generator
+exceptions outside a lazy `ScanFrame` load still propagate to the caller.
+
 ## Rejections, fit quality and uncertainty
 
 `angles_deg`, `frame_ids`, `point_ids`, `centres_px`, `centre_std_px`, `used`,
@@ -111,8 +200,10 @@ used/rejected row indices. No skipped image renumbers the angles. Pixel zero is 
 Static/user masks, detector dummy values, negative and nonfinite pixels exclude
 whole profile bins rather than reducing their summed intensity. A missing bin
 within two fitted Gaussian sigmas rejects that frame. Supply `saturation` as an
-inclusive acquisition threshold; saturated pixels anywhere in the selected strip
-reject the frame. Integer dtype maxima are also rejected. Clipping below those
+inclusive acquisition threshold; unmasked saturated pixels anywhere in the selected
+strip reject the frame, including integer dtype maxima. Already invalid/static-masked
+pixels do not count as saturated measurements, but a missing bin in the fitted beam
+core still rejects the frame. Clipping below those
 limits, count-rate nonlinearity and detector-specific corrections require caller
 knowledge. This routine does not infer that an apparently smooth peak is unsaturated.
 Fewer than three usable rows/distinct angles, unresolved fits or insignificant
