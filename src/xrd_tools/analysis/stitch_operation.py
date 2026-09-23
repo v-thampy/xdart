@@ -41,6 +41,7 @@ from xrd_tools.analysis.module_transaction import (
     module_plan_fingerprint,
     module_provenance_digest,
     xu_stitch_module_request,
+    _native_stitch_module_request,
 )
 from xrd_tools.analysis.plans import (
     StitchCancelled,
@@ -66,6 +67,8 @@ from xrd_tools.sources.composite import CompositeFrameSource
 from xrd_tools.io.analysis_artifact import (
     ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
     ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
+    ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE,
+    ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE,
     AnalysisArtifactCleanupPending,
     AnalysisArtifactKind,
     AnalysisArtifactPayload,
@@ -78,6 +81,11 @@ from xrd_tools.io.analysis_artifact import (
 from xrd_tools.io.nexus import write_stitched
 from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.integrate.multi import StitchDiagnostics
+from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+from xrd_tools.analysis.stitch_native import (
+    capture_mask, revalidate_mask, native_mask, native_plan_identity,
+    native_provenance, capture_callback, geometry_facts,
+)
 from xrd_tools.integrate.xu_stitch import (
     XuStitchCancelled,
     XuStitchEffectiveGeometryProjection,
@@ -1300,6 +1308,10 @@ class StitchOperationPlan:
     monitor_selector: MetadataColumnSelector | None = None
     use_detector_mask: bool = True
     max_frame_bytes: int = 256 * 1024 * 1024
+    native_records: bool = False
+    conditioning: StitchConditioning | None = None
+    mask_path: str | Path | None = None
+    _mask_receipt: object = field(init=False, default=None, repr=False)
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1315,7 +1327,8 @@ class StitchOperationPlan:
                 raise ValueError(f"{name} must be a bounded positive exact integer")
         if self.npt_rad_2d * self.npt_azim_2d > _MAX_2D_POINTS:
             raise ValueError("2-D Stitch output exceeds the bounded artifact point limit")
-        radial = _range(self.radial_range, "radial range", required=True)
+        _native_plan_fields(self)
+        radial = _range(self.radial_range, "radial range", required=not self.native_records)
         azimuth = _range(
             self.azimuth_range,
             "azimuth range",
@@ -1324,7 +1337,7 @@ class StitchOperationPlan:
 
         if self.mode == "1d" and azimuth is not None:
             raise ValueError("a 1-D Stitch plan cannot carry an azimuth range")
-        if self.unit != "q_A^-1" or self.method != "full":
+        if self.unit not in ({"q_A^-1", "2th_deg"} if self.native_records else {"q_A^-1"}) or self.method != "full":
             raise ValueError("S1 requires unit='q_A^-1' and notebook method='full'")
         if (
             self.monitor_selector is not None
@@ -1348,7 +1361,7 @@ class StitchOperationPlan:
 
     def _canonical_value(self) -> tuple[object, ...]:
         selector = self.monitor_selector
-        return (
+        value = (
             "stitch-operation-plan-v1",
             self.geometry.fingerprint,
             self.backend,
@@ -1365,36 +1378,46 @@ class StitchOperationPlan:
             "streaming-multigeometry-v1",
             self.max_frame_bytes,
         )
+        return value + native_plan_identity(self) if self.native_records else value
 
 
 @dataclass(frozen=True, slots=True)
 class XuStitchOperationPlan:
     calibration: XuStitchCalibrationReceipt
     effective_geometry: XuStitchEffectiveGeometryProjection
-    q_min_A_inverse: float
-    q_max_A_inverse: float
+    q_min_A_inverse: float | None = None
+    q_max_A_inverse: float | None = None
     npt_1d: int = 1500
     monitor_selector: MetadataColumnSelector | None = None
     max_frame_bytes: int = 256 * 1024 * 1024
+    unit: str = "q_A^-1"
+    radial_range: tuple[float, float] | None = None
+    native_records: bool = False
+    conditioning: StitchConditioning | None = None
+    mask_path: str | Path | None = None
+    _mask_receipt: object = field(init=False, default=None, repr=False)
     backend: str = field(init=False, default="xu_hist")
     mode: str = field(init=False, default="1d")
-    unit: str = field(init=False, default="q_A^-1")
     method: str = field(init=False, default="numpy_histogram_center_v1")
     use_detector_mask: bool = field(init=False, default=True)
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
+        _native_plan_fields(self)
+        if self.q_min_A_inverse is not None or self.q_max_A_inverse is not None:
+            if (type(self.q_min_A_inverse) is not float or type(self.q_max_A_inverse) is not float
+                    or self.unit != "q_A^-1" or self.radial_range not in
+                    (None, (self.q_min_A_inverse, self.q_max_A_inverse))):
+                raise TypeError("legacy XU bounds require two floats and no competing range")
+            object.__setattr__(self, "radial_range", (self.q_min_A_inverse, self.q_max_A_inverse))
+        object.__setattr__(self, "radial_range", _range(self.radial_range, "radial range", required=not self.native_records))
         if (
             type(self.calibration) is not XuStitchCalibrationReceipt
             or type(self.effective_geometry)
             is not XuStitchEffectiveGeometryProjection
             or self.effective_geometry.asset_semantic_fingerprint
             != self.calibration.semantic_fingerprint
-            or type(self.q_min_A_inverse) is not float
-            or type(self.q_max_A_inverse) is not float
-            or not math.isfinite(self.q_min_A_inverse)
-            or not math.isfinite(self.q_max_A_inverse)
-            or self.q_min_A_inverse >= self.q_max_A_inverse
+            or self.unit not in ({"q_A^-1", "2th_deg"} if self.native_records else {"q_A^-1"})
             or type(self.npt_1d) is not int
             or not 1 <= self.npt_1d <= _MAX_AXIS_POINTS
             or (
@@ -1416,7 +1439,7 @@ class XuStitchOperationPlan:
                     self.mode,
                     self.unit,
                     self.method,
-                    (self.q_min_A_inverse, self.q_max_A_inverse),
+                    self.radial_range,
                     self.npt_1d,
                     None
                     if self.monitor_selector is None
@@ -1428,13 +1451,25 @@ class XuStitchOperationPlan:
                     self.max_frame_bytes,
                     self.calibration.fingerprint,
                     self.effective_geometry.fingerprint,
-                ),
+                ) + (native_plan_identity(self) if self.native_records else ()),
             ),
         )
 
-    @property
-    def radial_range(self) -> tuple[float, float]:
-        return (self.q_min_A_inverse, self.q_max_A_inverse)
+def _native_plan_fields(plan):
+    if type(plan.native_records) is not bool:
+        raise TypeError("native_records must be an exact bool")
+    if plan.conditioning is not None and type(plan.conditioning) is not StitchConditioning:
+        raise TypeError("conditioning must be exact StitchConditioning")
+    if not plan.native_records and (plan.conditioning is not None or plan.mask_path is not None):
+        raise ValueError("native conditioning and mask require native_records")
+    if plan.native_records and plan.mode != "1d":
+        raise ValueError("native frame artifacts require Stitch 1-D")
+    if plan.native_records and plan.conditioning is None:
+        object.__setattr__(plan, "conditioning", StitchConditioning("off"))
+    if plan.mask_path is not None:
+        receipt = capture_mask(plan.mask_path)
+        object.__setattr__(plan, "mask_path", receipt.lexical_path)
+        object.__setattr__(plan, "_mask_receipt", receipt)
 
 
 def _required_stitch_selectors(
@@ -1459,7 +1494,7 @@ def _required_stitch_selectors(
                 "AMBIGUOUS_METADATA_SELECTOR",
                 f"metadata column {energy_name!r} must occur at most once",
             )
-        if energy_count == 1:
+        if energy_count == 1 and not plan.native_records:
             requested += (MetadataColumnSelector(energy_name, 0),)
     else:
         raise TypeError("stitch selectors require an exact Stitch plan")
@@ -1479,6 +1514,9 @@ def _xu_energy_selector(
     plan: XuStitchOperationPlan,
     table_names: tuple[str, ...],
 ) -> MetadataColumnSelector | None:
+    if plan.native_records:
+        # Each member's optional energy is bound independently by native provenance.
+        return None
     name = str(
         plan.calibration.projection.value["acquisition"][
             "source_energy_selector"
@@ -1672,7 +1710,7 @@ def _provenance(
     )
     if effective_calibration is not None:
         geometry_projection["effective_calibration"] = effective_calibration
-    return {
+    value = {
         "schema_version": "stitch-operation-v1",
         "kind": "stitch",
         "source": {
@@ -1690,7 +1728,7 @@ def _provenance(
             "npt_1d": plan.npt_1d,
             "npt_rad_2d": plan.npt_rad_2d,
             "npt_azim_2d": plan.npt_azim_2d,
-            "radial_range": list(plan.radial_range),
+            "radial_range": None if plan.radial_range is None else list(plan.radial_range),
             "azimuth_range": (
                 None if plan.azimuth_range is None else list(plan.azimuth_range)
             ),
@@ -1713,6 +1751,7 @@ def _provenance(
             "gi-and-custom-corrections",
         ],
     }
+    return native_provenance(value, source, output, plan, manifest)
 
 
 def _xu_provenance(
@@ -1750,7 +1789,7 @@ def _xu_provenance(
             ),
         }
     )
-    return {
+    value = {
         "schema_version": "stitch-operation-v2-xu-intent",
         "kind": "stitch",
         "backend": "xu_hist",
@@ -1778,7 +1817,7 @@ def _xu_provenance(
             "mode": plan.mode,
             "unit": plan.unit,
             "method": plan.method,
-            "radial_range": list(plan.radial_range),
+            "radial_range": None if plan.radial_range is None else list(plan.radial_range),
             "npt_1d": plan.npt_1d,
             "monitor_selector": (
                 None
@@ -1824,6 +1863,7 @@ def _xu_provenance(
             "unvalidated-platforms-and-live-gates",
         ],
     }
+    return native_provenance(value, source, output, plan, manifest)
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -2069,6 +2109,9 @@ def prepare_stitch_operation(
             plan.fingerprint,
             module_provenance_digest(ModuleKind.STITCH, provenance),
         )
+    if plan.native_records:
+        native_mask(plan)  # Admit mask orientation/shape before any detector read.
+        module = _native_stitch_module_request(source, output, plan, manifest, provenance)
     canonical = module_artifact_request(module, provenance).provenance_json
     return StitchOperationRequest(
         module,
@@ -2213,6 +2256,10 @@ def _detector_mask(diffractometer) -> np.ndarray | None:
 
 
 def _runtime_plan(plan: StitchOperationPlan, diffractometer) -> StitchPlan:
+    mask = _detector_mask(diffractometer) if plan.use_detector_mask else None
+    external = native_mask(plan)
+    if external is not None:
+        mask = external if mask is None else np.logical_or(mask, external)
     return StitchPlan(
         diffractometer=diffractometer,
         backend=plan.backend,
@@ -2227,7 +2274,8 @@ def _runtime_plan(plan: StitchOperationPlan, diffractometer) -> StitchPlan:
         monitor_key=(
             None if plan.monitor_selector is None else plan.monitor_selector.name
         ),
-        mask=_detector_mask(diffractometer) if plan.use_detector_mask else None,
+        mask=mask,
+        conditioning=plan.conditioning,
         max_eager_bytes=None,
         streaming_multigeometry=True,
     )
@@ -2263,6 +2311,9 @@ def _protected_stitch_inputs(request: StitchOperationRequest) -> tuple[Path, ...
     root = Path(request.manifest.project_root)
     inputs = [root / request.manifest.source_relative_path]
     inputs.extend(root / item.relative_path for item in request.manifest.files)
+    if request.plan._mask_receipt is not None:
+        inputs.extend((Path(request.plan._mask_receipt.lexical_path),
+                       Path(request.plan._mask_receipt.resolved_path)))
     if type(request.plan) is XuStitchOperationPlan:
         geometry = request.plan.calibration
         inputs.extend((
@@ -2273,6 +2324,15 @@ def _protected_stitch_inputs(request: StitchOperationRequest) -> tuple[Path, ...
         geometry = request.plan.geometry
         inputs.extend((Path(geometry.lexical_path), Path(geometry.resolved_path)))
     return tuple(dict.fromkeys(inputs))
+
+
+def _native_artifact_args(request, records):
+    if not request.plan.native_records:
+        return {}
+    if len(records) != len(request.module.source.selected_labels):
+        raise StitchOperationRefused("FRAME_RECORD_COUNT_MISMATCH")
+    return {"wavelength_A": request.provenance["wavelength_A"],
+            "frame_records": records, "source_base": request.manifest.project_root}
 
 
 class StitchOperationExecution:
@@ -2403,7 +2463,8 @@ class StitchOperationExecution:
             )
         if type(self.request.plan) is XuStitchOperationPlan:
             if (
-                payload.schema_version != ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL
+                payload.schema_version != (ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE
+                    if self.request.plan.native_records else ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL)
                 or payload.execution_attestation_json
                 != self._execution_attestation_json
                 or payload.execution_attestation_digest
@@ -2418,7 +2479,8 @@ class StitchOperationExecution:
                     "strict XU Stitch attestation no longer matches execution",
                 )
         elif (
-            payload.schema_version != ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL
+            payload.schema_version != (ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE
+                if self.request.plan.native_records else ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL)
             or payload.execution_attestation_json is not None
             or payload.execution_attestation_digest is not None
             or terminal.commit.execution_attestation_digest is not None
@@ -2458,11 +2520,16 @@ class StitchOperationExecution:
         )
         try:
             revalidate_xu_stitch_calibration(plan.calibration)
+            records, frame_callback = capture_callback(self.request)
+            external_mask = native_mask(plan)
             self._emit("calibration", 1, total)
             with _requalified_stitch_source(
                 self.request.module.source,
                 cancel_token=cancel_token,
             ) as source:
+                if plan.native_records:
+                    _wavelength, _shape, orientation = geometry_facts(plan)
+                    source = _OrientedSource(source, orientation, plan.max_frame_bytes)
 
                 def science_progress(done: int, _inner_total: int) -> None:
                     self._emit("science", 1 + done, total)
@@ -2471,8 +2538,11 @@ class StitchOperationExecution:
                     plan.calibration,
                     source,
                     frame_indices=labels,
-                    q_min_A_inverse=plan.q_min_A_inverse,
-                    q_max_A_inverse=plan.q_max_A_inverse,
+                    unit=plan.unit,
+                    radial_range=plan.radial_range,
+                    conditioning=plan.conditioning,
+                    mask=external_mask,
+                    frame_record_callback=frame_callback,
                     npt=plan.npt_1d,
                     monitor_key=(
                         None
@@ -2485,6 +2555,7 @@ class StitchOperationExecution:
                     progress_callback=science_progress,
                 )
             revalidate_xu_stitch_calibration(plan.calibration)
+            revalidate_mask(plan._mask_receipt)
         except XuStitchCancelled:
             return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
         except AnalysisSourceLeaseRefused as error:
@@ -2495,6 +2566,7 @@ class StitchOperationExecution:
             XuRuntimeUnsupported,
             XuStitchCalibrationRefused,
             XuStitchScienceRefused,
+            StitchOperationRefused,
         ) as error:
             return self._terminal(ModuleDisposition.REFUSED, error.code)
         except BaseException as error:
@@ -2534,6 +2606,7 @@ class StitchOperationExecution:
                 sigma=payload.sigma,
                 coverage=diagnostics.coverage,
                 normalization=diagnostics.normalization,
+                **_native_artifact_args(self.request, records),
             )
         except AnalysisArtifactProjectionInvalid:
             return self._terminal(
@@ -2593,6 +2666,7 @@ class StitchOperationExecution:
 
         def require_current_effective_geometry() -> None:
             try:
+                revalidate_mask(plan._mask_receipt)
                 revalidate_xu_stitch_calibration(plan.calibration)
                 runtime_owner = xu_runtime_session()
                 with runtime_owner as session:
@@ -2615,6 +2689,7 @@ class StitchOperationExecution:
                 XuRuntimeUnsupported,
                 XuStitchCalibrationRefused,
                 XuStitchScienceRefused,
+                StitchOperationRefused,
             ) as error:
                 raise ModuleArtifactRefused(error.code) from error
 
@@ -2625,6 +2700,7 @@ class StitchOperationExecution:
                 result_projection=result_projection,
                 provenance=bound.provenance_json,
                 bounded_artifact=True,
+                **_native_artifact_args(self.request, records),
             )
             revalidate_xu_stitch_calibration(plan.calibration)
 
@@ -2664,6 +2740,7 @@ class StitchOperationExecution:
             return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
         try:
             raw = _revalidate_geometry(self.request.plan.geometry)
+            records, frame_callback = capture_callback(self.request)
             diffractometer, orientation = _runtime_geometry(
                 self.request.plan.geometry, raw
             )
@@ -2717,8 +2794,10 @@ class StitchOperationExecution:
                     progress_callback=science_progress,
                     cancel_token=cancel_token,
                     collect_frame_records=False,
+                    frame_record_callback=frame_callback,
                 )
             _revalidate_geometry(self.request.plan.geometry)
+            revalidate_mask(self.request.plan._mask_receipt)
         except StitchCancelled:
             return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
         except AnalysisSourceLeaseRefused as error:
@@ -2770,6 +2849,7 @@ class StitchOperationExecution:
                 sigma=payload.sigma,
                 coverage=diagnostics.coverage,
                 normalization=diagnostics.normalization,
+                **_native_artifact_args(self.request, records),
             )
         except AnalysisArtifactProjectionInvalid:
             return self._terminal(
@@ -2810,12 +2890,14 @@ class StitchOperationExecution:
                 legacy_v1_unit_layout=False,
                 provenance=bound.provenance_json,
                 bounded_artifact=True,
+                **_native_artifact_args(self.request, records),
             )
             _revalidate_geometry(self.request.plan.geometry)
 
         def prepublish_check() -> None:
             try:
                 _revalidate_geometry(self.request.plan.geometry)
+                revalidate_mask(self.request.plan._mask_receipt)
             except StitchOperationRefused as error:
                 raise ModuleArtifactRefused(error.code) from error
 
