@@ -257,6 +257,86 @@ def test_reopen_corrupt_file_cannot_grant_run_or_replace_display(qapp, tmp_path)
         qapp.processEvents()
 
 
+def test_selecting_existing_result_fences_pending_reopen(qapp, tmp_path, monkeypatch):
+    from threading import Event
+    from tests.core.test_analysis_stitch_auxiliary import _publish
+    from xdart.gui.tools import stitch_owner
+    first_dir, second_dir = tmp_path / "first", tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first, *_ = _publish(first_dir)
+    second, *_ = _publish(second_dir)
+    page = StitchPage(empty_host_services(_Status()))
+    entered, release = Event(), Event()
+    original = stitch_owner.read_analysis_artifact
+    try:
+        page.open_result(first)
+        _wait(page, qapp)
+        page.open_result(second)
+        _wait(page, qapp)
+        page.results.setCurrentRow(0)
+
+        def delayed(*args, **kwargs):
+            entered.set()
+            assert release.wait(10)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(stitch_owner, "read_analysis_artifact", delayed)
+        page.open_result(first)
+        assert entered.wait(5)
+        page.results.setCurrentRow(1)
+        expected_y = page.curve.listDataItems()[0].yData.copy()
+        release.set()
+        _wait(page, qapp)
+        assert page._current_payload().inspection.path == str(second)
+        assert page.results.currentRow() == 1
+        np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, expected_y)
+    finally:
+        release.set()
+        _wait(page, qapp)
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
+def test_native_xu_displays_admitted_mapping_and_rotation_read_only(qapp, tmp_path):
+    from pyFAI.detectors import detector_factory
+    from xrd_tools.analysis.xu_stitch_calibration import authored_surface_calibration
+    form = _form(tmp_path, "xu_hist")
+    asset = authored_surface_calibration(detector=detector_factory("Pilatus300kw"),
+        cch1=220., cch2=235., distance_m=.395, del_offset_deg=3., nu_offset_deg=1.,
+        energy_eV=17000.018, xu_wavelength_A=12398.41984 / 17000.018,
+        source_motors={"del": "gamma", "nu": "delta"}, rotation=180,
+        control_domain={"del": [5., 40.], "nu": [-10., 10.]},
+        domain={"del": [0., 50.], "nu": [-15., 30.]},
+        rms_q=.001, condition=100., n_frames=4, n_points=200)
+    asset_path = tmp_path / "authored.json"
+    asset_path.write_text(json.dumps(asset, sort_keys=True, separators=(",", ":")))
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        _fill_native(page, form)
+        page.set_field("geometry_path", str(asset_path))
+        assert page._value("source_motors") == "del=gamma, nu=delta"
+        assert int(page._value("image_rotation")) == 180
+        for key in ("source_motors", "image_rotation", "geometry_kind", "poni_references"):
+            assert not page._rows[key].isEnabled()
+        # Raw decoding is still an actual input, independent of the fitted asset.
+        assert page._rows["raw_dtype"].isEnabled()
+        page.set_field("geometry_path", "")
+        assert page._value("source_motors") == ""
+        assert page._value("image_rotation") == ""
+        page._calibrate()
+        assert page._calibration_dialog.isVisible()
+        page._calibration_dialog.close()
+        page.set_field("backend", "pyFAI MultiGeometry")
+        assert page._rows["source_motors"].isEnabled()
+        assert page._rows["image_rotation"].isEnabled()
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
 def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qapp, tmp_path, backend):
     form = _form(tmp_path, backend)

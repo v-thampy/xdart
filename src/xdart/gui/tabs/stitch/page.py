@@ -273,6 +273,7 @@ class StitchPage(QtWidgets.QWidget):
             self.controls.source_card, self.controls.processing_card,
         )
         self._field(project, SectionId.PROJECT, "project_root", "Folder", browse=True)
+        self._rows["project_root"].valueChanged.connect(self._refresh_xu_geometry)
         self._field(project, SectionId.PROJECT, "output_path", "Save Path", browse=True)
         self._field(experiment, SectionId.EXPERIMENT, "backend", "Backend",
                     "pyFAI MultiGeometry", choices=("pyFAI MultiGeometry", "xrayutilities histogram"))
@@ -287,6 +288,7 @@ class StitchPage(QtWidgets.QWidget):
         authoring_layout.addWidget(self.mask_button)
         experiment.add_row(authoring)
         self._field(experiment, SectionId.EXPERIMENT, "geometry_path", "Calibration", browse=True)
+        self._rows["geometry_path"].valueChanged.connect(self._refresh_xu_geometry)
         self._field(experiment, SectionId.EXPERIMENT, "mask_path", "Mask File", browse=True)
         self._rows["backend"].valueChanged.connect(self._backend_changed)
         self._field(source, SectionId.SOURCE, "source_kind", "Source", "Spec",
@@ -463,6 +465,8 @@ class StitchPage(QtWidgets.QWidget):
             self._processing_axis_changed()
         elif key == "project_root" and not self._value("output_path"):
             self.set_field("output_path", str(Path(value) / "xdart_processed_data"))
+        if key in {"geometry_path", "project_root"}:
+            self._refresh_xu_geometry()
 
     def _value(self, key):
         if key in self._range_keys:
@@ -480,6 +484,8 @@ class StitchPage(QtWidgets.QWidget):
     def _backend_changed(self, *_args):
         xu = self._value("backend") == "xrayutilities histogram"
         self.set_field("source_motors", "del=del, nu=nu" if xu else "del_angle=del, nu_angle=nu")
+        if not xu and not str(self._value("image_rotation")).strip():
+            self.set_field("image_rotation", "0")
         self.set_field("q_max", "5.2" if xu else "6.2")
         if xu and not self._native_mode:
             for key, value in (
@@ -489,7 +495,36 @@ class StitchPage(QtWidgets.QWidget):
                 ("image_rotation", "0"), ("threshold", "800000"),
             ):
                 self.set_field(key, value)
+        self._refresh_xu_geometry()
         self._sync_actions()
+
+    def _refresh_xu_geometry(self, *_args, calibration=None):
+        """Present asset-owned settings through the existing strict admission owner."""
+        if not self._native_mode or self._value("backend") != "xrayutilities histogram":
+            return
+        from xrd_tools.analysis.xu_stitch_calibration import (
+            XuStitchCalibrationInput, capture_xu_stitch_calibration,
+        )
+        try:
+            if calibration is None:
+                calibration = capture_xu_stitch_calibration(
+                    XuStitchCalibrationInput(self._value("geometry_path")),
+                    project_root=Path(self._value("project_root")))
+            acquisition = calibration.projection.value["acquisition"]
+        except (ValueError, TypeError, OSError):
+            values = {"source_motors": "", "image_rotation": ""}
+            tip = "Select a valid XU calibration to inspect its angle mapping and rotation."
+        else:
+            values = dict(source_motors=", ".join(
+                f"{name}={source}" for name, source in acquisition["source_motors"].items()),
+                image_rotation=90 * acquisition["image_rotation_quarter_turns"])
+            tip = "Defined by the selected XU calibration; change it in Calibrate."
+        values.update(geometry_kind="Goniometer JSON", poni_references="")
+        for key, value in values.items():
+            field = replace(self._fields[key], value=value)
+            self._fields[key] = field
+            self._rows[key].apply_field(field)
+            self._rows[key].setToolTip(tip)
 
     def _browse(self, key):
         start = str(self._value("project_root") or Path.home())
@@ -587,6 +622,8 @@ class StitchPage(QtWidgets.QWidget):
                                ("threshold", policy.threshold_max), ("threshold_enabled", policy.mode != "off")):
                 self._fields[key] = replace(self._fields[key], value=value)
             self._render_ranges()
+
+        self._refresh_xu_geometry()
 
     def _start(self, action, begin):
         if self._closing:
@@ -689,6 +726,8 @@ class StitchPage(QtWidgets.QWidget):
             self._prepared_revision = self._revision
             preflight = outcome.preflight
             if self._native_mode:
+                if preflight.requests and preflight.form.backend == "xu_hist":
+                    self._refresh_xu_geometry(calibration=preflight.requests[0].plan.calibration)
                 bounds = []
                 for request in preflight.requests:
                     for member in request.provenance.get("frame_members", ()):
@@ -748,6 +787,7 @@ class StitchPage(QtWidgets.QWidget):
         return None if item is None else self._payloads.get(item.data(QtCore.Qt.ItemDataRole.UserRole))
 
     def _current_result_changed(self, *_args):
+        self._view_revision += 1
         self._raw_revision += 1
         self._raw_frame_view = None
         self.frames.clear()
@@ -866,8 +906,8 @@ class StitchPage(QtWidgets.QWidget):
                 self._authoring_dialogs.append(self._calibration_dialog)
             source = self._source_spec_for_tools()
             if source is not None:
-                motors = dict(StitchToolDialog._parse_pairs(self._value("source_motors")))
-                self._calibration_dialog.set_source_context(source, image_rotation=int(self._value("image_rotation")),
+                motors = dict(StitchToolDialog._parse_pairs(self._value("source_motors") or "del=del, nu=nu"))
+                self._calibration_dialog.set_source_context(source, image_rotation=int(self._value("image_rotation") or 0),
                     del_motor=motors.get("del_angle", motors.get("del", "del")),
                     nu_motor=motors.get("nu_angle", motors.get("nu", "nu")))
             self._calibration_dialog.show()
@@ -1064,9 +1104,11 @@ class StitchPage(QtWidgets.QWidget):
             self._authoring_timer.stop()
         for row in self._rows.values():
             row.setEnabled(idle)
-        if not self._native_mode and self._value("backend") == "xrayutilities histogram":
-            for key in ("geometry_kind", "source_motors", "poni_references", "image_rotation",
-                        "detector_rows", "detector_cols", "raw_dtype", "raw_header_skip"):
+        if self._value("backend") == "xrayutilities histogram":
+            locked = ("geometry_kind", "source_motors", "poni_references", "image_rotation")
+            if not self._native_mode:
+                locked += ("detector_rows", "detector_cols", "raw_dtype", "raw_header_skip")
+            for key in locked:
                 self._rows[key].setEnabled(False)
         elif self._value("geometry_kind") != "PONI + offsets":
             self._rows["poni_references"].setEnabled(False)
