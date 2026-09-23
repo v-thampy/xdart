@@ -400,13 +400,14 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
         params = dict(result.params)
         names = list(params)
         # Standard pyFAI GeometryTransformation JSON, admitted by the existing
-        # importer with the page's del/nu source-motor mapping.
+        # importer with the page's del/nu source-motor mapping and the
+        # notebooks' positional (del, nu) Goniometer.get_ai calls.
         asset = {'content': 'Goniometer calibration v2', 'detector': base.poni.detector,
                  'detector_config': exported_config, 'wavelength': base.poni.wavelength,
                  'param_names': names, 'param': list(params.values()),
-                 'pos_names': ['nu_angle', 'del_angle'],
+                 'pos_names': ['del_angle', 'nu_angle'],
                  'trans_function': {'content': 'GeometryTransformation', 'param_names': names,
-                    'pos_names': ['nu_angle', 'del_angle'], 'dist_expr': 'dist', 'poni1_expr': 'poni1',
+                    'pos_names': ['del_angle', 'nu_angle'], 'dist_expr': 'dist', 'poni1_expr': 'poni1',
                     'poni2_expr': 'poni2', 'rot1_expr': 'rot1_scale * nu_angle + rot1_offset',
                     'rot2_expr': 'rot2_scale * del_angle + rot2_offset', 'rot3_expr': 'rot3_offset',
                     'constants': {'pi': float(np.pi)}}}

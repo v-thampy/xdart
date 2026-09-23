@@ -98,6 +98,7 @@ def test_resumed_control_points_require_retained_image_binding(tmp_path):
 def test_mg_fit_saved_json_reloads_actual_importer_and_bad_inputs_refuse(tmp_path):
     from tests.core.test_refine import _truth, _synth_control_frames, _FRAMES
     from xrd_tools.core.geometry import Diffractometer
+    from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry
     from pyFAI.goniometer import Goniometer
     truth = _truth()
     controls = _synth_control_frames(truth, _FRAMES, per_ring=8)
@@ -109,7 +110,15 @@ def test_mg_fit_saved_json_reloads_actual_importer_and_bad_inputs_refuse(tmp_pat
     assert .37 <= loaded.calibration.poni.dist <= .41
     assert result.rms_q < .006
     actual = Goniometer.sload(path)
-    assert .37 <= actual.get_ai((3., 15.)).dist <= .41
+    motors = {'del': np.array([15., 37.]), 'nu': np.array([3., -4.])}
+    named = create_multigeometry_integrators_from_geometry(loaded, motors)
+    for index, (del_angle, nu_angle) in enumerate(zip(motors['del'], motors['nu'])):
+        # The reference notebooks pass (del, nu) positionally to pyFAI.
+        positional = actual.get_ai((float(del_angle), float(nu_angle)))
+        for name in ('dist', 'poni1', 'poni2', 'rot1', 'rot2', 'rot3', 'wavelength'):
+            assert getattr(positional, name) == pytest.approx(getattr(named[index], name), abs=1e-12)
+    exported = json.loads((tmp_path / 'fitted.json').read_text())
+    assert exported['pos_names'] == exported['trans_function']['pos_names'] == ['del_angle', 'nu_angle']
     from xrd_tools.analysis.stitch_operation import (
         StitchGeometryInput, StitchGeometryKind, capture_stitch_geometry,
     )

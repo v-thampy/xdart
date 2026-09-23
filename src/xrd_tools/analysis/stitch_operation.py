@@ -1428,6 +1428,8 @@ class XuStitchOperationPlan:
             or not 1 <= self.max_frame_bytes <= 4 * 1024 * 1024 * 1024
         ):
             raise TypeError("XU Stitch operation plan is invalid")
+        if not self.native_records and self.calibration.projection.value["version"] != 1:
+            raise ValueError("non-native XU plans require canonical version 1 calibration")
         object.__setattr__(
             self,
             "fingerprint",

@@ -191,7 +191,8 @@ def test_native_rejects_energy_conflict_in_later_group_member(tmp_path):
         prepare_stitch_operation(group, output, plan, project_root=tmp_path)
 
 
-def test_authored_xu_operation_uses_fitted_geometry_mapping_and_orientation(tmp_path):
+@pytest.mark.parametrize("rotation", [0, 180])
+def test_authored_xu_operation_uses_fitted_geometry_mapping_and_orientation(tmp_path, rotation):
     from pyFAI.detectors import detector_factory
     from xrd_tools.analysis.xu_stitch_calibration import (
         authored_surface_calibration, capture_xu_stitch_calibration, XuStitchCalibrationInput,
@@ -214,7 +215,7 @@ def test_authored_xu_operation_uses_fitted_geometry_mapping_and_orientation(tmp_
         asset = authored_surface_calibration(detector=detector_factory("Pilatus300kw"),
             cch1=220., cch2=235., distance_m=.395, del_offset_deg=3., nu_offset_deg=1.,
             energy_eV=17000.018, xu_wavelength_A=float(runtime.xu.en2lam(17000.018)),
-            source_motors={"del": "gamma", "nu": "delta"}, rotation=180,
+            source_motors={"del": "gamma", "nu": "delta"}, rotation=rotation,
             control_domain={"del": [5., 40.], "nu": [-10., 10.]},
             domain={"del": [0., 50.], "nu": [-15., 30.]}, rms_q=.001, condition=100., n_frames=4, n_points=200)
     asset_path = tmp_path / "authored.json"
@@ -224,6 +225,8 @@ def test_authored_xu_operation_uses_fitted_geometry_mapping_and_orientation(tmp_
         effective = resolve_xu_stitch_effective_geometry(receipt, runtime).projection
     assert effective.asset_version == 2
     assert effective.solid_angle_sha256 != original.plan.effective_geometry.solid_angle_sha256
+    with pytest.raises(ValueError, match="canonical version 1"):
+        XuStitchOperationPlan(receipt, effective, 1.0, 5.2, npt_1d=64)
     plan = XuStitchOperationPlan(receipt, effective, native_records=True, unit="2th_deg", npt_1d=64,
                                 conditioning=StitchConditioning("auto"))
     output = ModuleOutputRequest(resolve_finite_output_target(tmp_path, "authored", operation_token="stitch-1d"),
@@ -231,8 +234,9 @@ def test_authored_xu_operation_uses_fitted_geometry_mapping_and_orientation(tmp_
     request = prepare_stitch_operation(source, output, plan, project_root=tmp_path)
     result = run_stitch_operation(request)
     assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    assert result.payload.schema_version == 7
     row = result.payload.contributing_frames[0]
-    assert row["source_snapshot"]["rotation"] == 180
+    assert row["source_snapshot"]["rotation"] == rotation
     frame = read_contributing_frame_view(output.target, 1, scan=row["key"].split("/")[0][5:],
         full_raw=True, artifact_payload=result.payload)
-    np.testing.assert_array_equal(frame.raw, np.rot90(raw, 2))
+    np.testing.assert_array_equal(frame.raw, np.rot90(raw, rotation // 90))
