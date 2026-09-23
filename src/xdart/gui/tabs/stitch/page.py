@@ -75,6 +75,9 @@ class StitchPage(QtWidgets.QWidget):
         self._raw_popup = None
         self._raw_frame_view = None
         self._calibration_dialog = None
+        self._metadata_dialog = None
+        self._metadata_request_dialog = None
+        self._metadata_view_revision = None
         self._authoring_dialogs = []
         self._fields = {}
         self._rows = {}
@@ -715,6 +718,8 @@ class StitchPage(QtWidgets.QWidget):
             elif update.terminal_status is OperationTerminalStatus.FAILED:
                 self._queued_jobs.clear()
                 self._status(update.failure_message or update.failure_type, ready=False)
+                if update.action is StitchOwnerAction.METADATA and self._metadata_current():
+                    self._metadata_dialog.status.setText(update.failure_message or update.failure_type)
                 if update.action is StitchOwnerAction.FRAME_READ and self._raw_popup is not None and self._raw_request_revision == self._raw_revision:
                     self._raw_popup.caption.setText("Image unavailable · " + (update.failure_message or update.failure_type))
             elif update.terminal_status is OperationTerminalStatus.CANCELLED:
@@ -730,7 +735,11 @@ class StitchPage(QtWidgets.QWidget):
 
     def _accept_outcome(self, update):
         outcome = update.outcome
-        if outcome.kind is StitchOwnerOutcomeKind.PREFLIGHT_READY:
+        if outcome.kind is StitchOwnerOutcomeKind.METADATA:
+            if self._metadata_current():
+                self._metadata_dialog.adopt_sources(outcome.metadata)
+            self._status("Ready · saved Stitch 1D result")
+        elif outcome.kind is StitchOwnerOutcomeKind.PREFLIGHT_READY:
             if update.stale or self._action_revision != self._revision:
                 self._status("Inputs changed · Preview required", ready=False)
                 return
@@ -798,6 +807,8 @@ class StitchPage(QtWidgets.QWidget):
         return None if item is None else self._payloads.get(item.data(QtCore.Qt.ItemDataRole.UserRole))
 
     def _current_result_changed(self, *_args):
+        if self._metadata_dialog is not None:
+            self._metadata_dialog.close()
         self._view_revision += 1
         self._raw_revision += 1
         self._raw_frame_view = None
@@ -1089,20 +1100,34 @@ class StitchPage(QtWidgets.QWidget):
         self._draw()
 
     def _show_metadata(self):
-        current = self.results.currentItem()
-        if current is None:
+        payload = self._current_payload()
+        if payload is None or self._owner.busy or self._closing:
             return
-        payload = self._payloads[current.data(QtCore.Qt.ItemDataRole.UserRole)]
-        dialog = QtWidgets.QDialog(self)
+        from .metadata import StitchMetadataDialog
+        if self._metadata_dialog is not None:
+            self._metadata_dialog.close()
+        dialog = StitchMetadataDialog(payload.provenance_json, self)
+        self._metadata_dialog = self._metadata_request_dialog = dialog
+        self._metadata_view_revision = self._view_revision
         dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
-        dialog.setWindowTitle("Saved Stitch provenance")
-        layout = QtWidgets.QVBoxLayout(dialog)
-        text = QtWidgets.QPlainTextEdit()
-        text.setReadOnly(True)
-        text.setPlainText(payload.provenance_json)
-        layout.addWidget(text)
-        dialog.resize(680, 450)
+        dialog.finished.connect(lambda _result: self._metadata_closed(dialog))
+        dialog.status.setText("Loading experimental metadata…")
         dialog.show()
+        if not self._start("Loading experimental metadata…", lambda: self._owner.begin_metadata(
+                payload, source_root=str(self._value("project_root")) or None)):
+            dialog.status.setText("Metadata reader is busy; close and retry")
+
+    def _metadata_current(self):
+        return (not self._closing and self._metadata_dialog is not None
+                and self._metadata_dialog is self._metadata_request_dialog
+                and self._metadata_view_revision == self._view_revision)
+
+    def _metadata_closed(self, dialog):
+        if self._metadata_dialog is dialog:
+            self._metadata_dialog = None
+            identity = self._owner.current_identity
+            if identity is not None and identity.request.action is StitchOwnerAction.METADATA:
+                self._owner.cancel()
 
     def _sync_actions(self):
         busy, final = self._owner.busy, self._owner.finalization
@@ -1130,6 +1155,7 @@ class StitchPage(QtWidgets.QWidget):
         self.raw_button.setEnabled(self.frames.count() > 0 and not self._closing)
         self.advanced.setEnabled(idle)
         self.open_button.setEnabled(idle)
+        self.metadata_button.setEnabled(idle and self._current_payload() is not None)
         self.preview_button.setEnabled(idle)
         self.run_bar.startButton.setEnabled(idle and self._prepared_revision == self._revision
                                             and self._owner.prepared is not None

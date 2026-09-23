@@ -88,6 +88,61 @@ def _fill_native(page, form):
     page.set_field("threshold", "")
 
 
+@pytest.mark.parametrize("grouped", [False, True])
+def test_metadata_shows_experimental_columns_and_separate_provenance(qapp, tmp_path, grouped):
+    from xdart.gui.tabs.scattering.analysis_mount import MetadataResultDialog
+    form = _form(tmp_path, "multigeometry")
+    spec = Path(form.spec_path)
+    content = spec.read_text().replace("17000.018", "12398.41984")
+    content = content.replace("#N 3", "#N 4").replace("#L del  nu  energy", "#L del  nu  energy  diode")
+    content = content.replace("14 -10 12398.41984\n", "14 -10 12398.41984 123\n")
+    content = content.replace("15 -10 12398.41984\n", "15 -10 12398.41984 456\n")
+    if grouped:
+        content += "\n" + content[content.index("#S 1"):].replace("#S 1", "#S 2").replace(" 123\n", " 789\n")
+        for index in range(2):
+            image = Path(form.image_dir) / f"sample_scan1_{index:04d}.raw"
+            image.with_name(f"sample_scan2_{index:04d}.raw").write_bytes(image.read_bytes())
+    spec.write_text(content)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        _fill_native(page, form)
+        if grouped:
+            page.set_field("image_stem", "sample_scan{scan}_")
+            page.set_field("scan", "[1,2]")
+            page.set_field("output_family", "combined")
+        page.begin_preview(); _wait(page, qapp)
+        assert page._owner.prepared is not None, page.run_bar.readinessLabel.full_text()
+        page.run_bar.startButton.click(); _wait(page, qapp)
+        assert page._current_payload() is not None
+        page.metadata_button.click(); _wait(page, qapp)
+        dialog = page._metadata_dialog
+        assert isinstance(dialog, MetadataResultDialog)
+        assert dialog.source_selector.count() == (2 if grouped else 1)
+        headers = [dialog.table.horizontalHeaderItem(col).text() for col in range(dialog.table.columnCount())]
+        diode = headers.index("diode")
+        assert dialog.table.rowCount() == 2
+        assert float(dialog.table.item(0, diode).text()) == 123
+        assert dialog.table.verticalHeaderItem(0).text() == ("1-0" if grouped else "0")
+        if grouped:
+            dialog.source_selector.setCurrentIndex(1)
+            assert float(dialog.table.item(0, diode).text()) == 789
+            assert dialog.table.verticalHeaderItem(0).text() == "2-0"
+        dialog.provenance_button.click()
+        assert json.loads(dialog.provenance_text.toPlainText()) == json.loads(page._current_payload().provenance_json)
+        assert dialog.provenance_text.isReadOnly()
+        dialog.close()
+        # Reopening does not pass stale cached metadata off as saved experimental data.
+        spec.write_text(content + "\n#C changed since stitching\n")
+        page.metadata_button.click(); _wait(page, qapp)
+        assert page._metadata_dialog.table.rowCount() == 0
+        assert "changed" in page._metadata_dialog.status.text().lower()
+        assert page._metadata_dialog.provenance_button.isEnabled()
+    finally:
+        until = time.monotonic() + 5
+        while page.shutdown().status is PageCleanup.PENDING and time.monotonic() < until:
+            qapp.processEvents(); time.sleep(.01)
+
+
 def test_native_source_controls_ranges_and_threshold_semantics(qapp, tmp_path):
     page = StitchPage(empty_host_services(_Status()))
     try:

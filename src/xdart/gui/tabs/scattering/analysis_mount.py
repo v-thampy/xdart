@@ -276,14 +276,19 @@ class MetadataResultDialog(QtWidgets.QDialog):
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
         self.status.clear()
-    def adopt_result(self, result: object) -> None:
+    def adopt_result(self, result: object, *, selected_labels=None, row_labels=None) -> None:
         columns = tuple(getattr(result, "columns", ()))
         labels = tuple(getattr(result, "labels", ()))
-        self.table.setColumnCount(len(columns)); self.table.setRowCount(len(labels))
+        selected = labels if selected_labels is None else tuple(selected_labels)
+        positions = {label: index for index, label in enumerate(labels)}
+        rows = [positions[label] for label in selected]
+        self.table.setColumnCount(len(columns)); self.table.setRowCount(len(rows))
         self.table.setHorizontalHeaderLabels([column.name for column in columns])
+        self.table.setVerticalHeaderLabels([str(label) for label in (selected if row_labels is None else row_labels)])
         for col, column in enumerate(columns):
             values = column.numeric if column.numeric is not None else column.text
-            for row, value in enumerate(() if values is None else values):
+            for row, index in enumerate(() if values is None else rows):
+                value = values[index]
                 self.table.setItem(row, col, QtWidgets.QTableWidgetItem(
                     "" if value is None else str(value)))
         self.status.setText(getattr(result, "code", ""))

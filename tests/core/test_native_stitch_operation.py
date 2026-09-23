@@ -174,6 +174,15 @@ def test_native_nexus_group_keeps_exact_external_dataset_and_raw_dtype(tmp_path)
     request = prepare_stitch_operation(source, output, plan, project_root=tmp_path)
     result = run_stitch_operation(request)
     assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    from xrd_tools.analysis.stitch_metadata import read_stitch_metadata
+    tables = read_stitch_metadata(result.payload)
+    assert len(tables) == 2
+    for table in tables:
+        assert table.table.disposition is AnalysisDisposition.COMPLETED, table
+        assert table.selected_labels == (0, 4)
+        assert {column.name for column in table.table.columns} >= {"del", "nu"}
+        np.testing.assert_array_equal(next(column.numeric for column in table.table.columns
+            if column.name == "del"), np.linspace(5., 10., 5))
     for index, row in enumerate(result.payload.contributing_frames):
         assert row["source_snapshot"]["dataset_path"] == "/sample/data/eiger_image"
         assert np.dtype(row["source_snapshot"]["raw_dtype"]) == np.dtype("uint32")
