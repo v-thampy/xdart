@@ -69,7 +69,7 @@ def test_native_axes_contributors_and_raw_relocation_round_trip(tmp_path, unit, 
     np.testing.assert_array_equal(payload.intensity, np.arange(40) + 1)
     assert [row["key"] for row in payload.contributing_frames] == [
         "scan_2/frame_0000", "scan_2/frame_0001", "scan_3/frame_0000"]
-    frame = read_contributing_frame_view(path, 0, scan="3", full_raw=True)
+    frame = read_contributing_frame_view(path, 0, scan="3", full_raw=True, artifact_payload=payload)
     np.testing.assert_array_equal(frame.raw, raw)
     assert frame.metadata_raw["scan_id"] == "3"
     with h5py.File(path, "r") as handle:
@@ -90,6 +90,7 @@ def test_native_axes_contributors_and_raw_relocation_round_trip(tmp_path, unit, 
 @pytest.mark.parametrize("mutation", ["thumbnail", "membership", "companion", "raw-copy", "external"])
 def test_strict_native_graph_rejects_corruption(tmp_path, mutation):
     path, _, _, _ = _publish(tmp_path)
+    payload = read_analysis_artifact(path)
     with h5py.File(path, "r+") as handle:
         frame = handle["entry/frames/scan_2/frame_0000"]
         if mutation == "thumbnail":
@@ -105,6 +106,8 @@ def test_strict_native_graph_rejects_corruption(tmp_path, mutation):
             frame["thumbnail"] = h5py.ExternalLink("not-opened.h5", "/pixels")
     with pytest.raises(AnalysisArtifactInvalid):
         read_analysis_artifact(path)
+    with pytest.raises(AnalysisArtifactInvalid, match="changed since detached"):
+        read_contributing_frame_view(path, 0, scan="2", artifact_payload=payload)
 
 
 def test_exact_external_hdf_dataset_selector_and_original_frame(tmp_path):

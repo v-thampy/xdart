@@ -3524,6 +3524,7 @@ def read_contributing_frame_view(
     scan: str | None = None,
     source_root: str | Path | None = None,
     full_raw: bool = False,
+    artifact_payload=None,
 ) -> FrameView:
     """Read a strictly admitted Stitch source record through shared raw owners.
 
@@ -3532,7 +3533,8 @@ def read_contributing_frame_view(
     or display identities are fabricated for this scan-level result.
     """
     from xrd_tools.io.analysis_artifact import (
-        AnalysisArtifactKind, AnalysisArtifactInvalid, inspect_analysis_artifact,
+        AnalysisArtifactKind, AnalysisArtifactInvalid, AnalysisArtifactPayload,
+        inspect_analysis_artifact,
         _stat_revision, _opened_hdf_revision,
     )
     from xrd_tools.io.nexus_record import frame_record_key
@@ -3546,7 +3548,16 @@ def read_contributing_frame_view(
     if type(frame) is not int or frame < 0 or type(full_raw) is not bool:
         raise TypeError("contributing frame selector is invalid")
     path = Path(scan_file)
-    inspection = inspect_analysis_artifact(path, expected_kind=AnalysisArtifactKind.STITCH_1D)
+    if artifact_payload is None:
+        inspection = inspect_analysis_artifact(path, expected_kind=AnalysisArtifactKind.STITCH_1D)
+    else:
+        if type(artifact_payload) is not AnalysisArtifactPayload:
+            raise TypeError("contributing frame payload must be strictly admitted")
+        inspection = artifact_payload.inspection
+        if inspection.path != str(path.expanduser().absolute()) or inspection.kind is not AnalysisArtifactKind.STITCH_1D:
+            raise ValueError("contributing frame payload belongs to another artifact")
+        if _stat_revision(os.stat(path)) != inspection.storage_revision:
+            raise AnalysisArtifactInvalid("artifact changed since detached admission")
     if inspection.frame_manifest_json is None:
         raise KeyError("this artifact has no contributing frame records")
     key = frame_record_key(scan, frame)
