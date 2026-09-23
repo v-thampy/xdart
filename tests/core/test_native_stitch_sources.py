@@ -59,3 +59,53 @@ def test_strict_spec_refuses_partial_images_and_native_read_retains_saturation(t
     assert source.metadata_for(1)["th"] == 1
     empty = SpecSource(spec, scan="6.1", image_dir=images, require_complete_images=True)
     assert not empty.capabilities.has_raw_references
+
+
+def test_native_selection_brackets_all_and_directory_mixed_formats(tmp_path):
+    from xrd_tools.analysis.stitch_sources import StitchSourceSelection, resolve_stitch_sources
+    from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
+    spec = _spec(tmp_path)
+    for index in range(3):
+        np.ones((2, 2), dtype=np.uint16).tofile(tmp_path / f"myscan_scan5_{index}.raw")
+    decode = {"detector_shape": (2, 2), "raw_dtype": "uint16"}
+    selected = resolve_stitch_sources(StitchSourceSelection("Spec", (str(spec),), "5,[5,6]"), decode)
+    assert len(selected.groups) == 2
+    assert [member.options["scan"] for group in selected.groups for member in group] == ["5.1", "5.1"]
+    assert selected.skipped == ((str(spec), "6.1", "No detector images"),)
+    all_spec = resolve_stitch_sources(StitchSourceSelection("Spec", (str(spec),), stitch_all=True), decode)
+    assert len(all_spec.groups) == 1
+    first = _write_bluesky_nxwriter(tmp_path / "a.nxs")
+    second = _write_bluesky_nxwriter(tmp_path / "b.nxs")
+    nexus = resolve_stitch_sources(StitchSourceSelection("NeXus", (str(first), str(second))), decode)
+    assert len(nexus.groups) == 1 and len(nexus.groups[0]) == 2
+    directory = resolve_stitch_sources(StitchSourceSelection("Directory", (str(tmp_path),)), decode)
+    assert len(directory.groups) == 3
+    assert directory.skipped == all_spec.skipped
+
+
+def test_nexus_metadata_preserves_external_dependency_and_native_dtype(tmp_path):
+    import h5py
+    from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
+    from xrd_tools.analysis.stitch_sources import StitchSourceSelection, resolve_stitch_sources
+    from xrd_tools.analysis.scan_operations import (
+        AnalysisDisposition, MetadataTablePlan, MetadataTableRequalificationPlan,
+        run_metadata_table, run_metadata_table_requalification,
+    )
+    path = _write_bluesky_nxwriter(tmp_path / "angles.nxs")
+    sidecar = tmp_path / "detector.h5"
+    with h5py.File(path, "r+") as stream, h5py.File(sidecar, "w") as detector:
+        image = np.asarray(stream["entry/data/eiger_image"])
+        detector.create_dataset("frames", data=image)
+        del stream["entry/data/eiger_image"]
+        del stream["entry/instrument/detectors/eiger/data"]
+        stream["entry/data/eiger_image"] = h5py.ExternalLink(sidecar.name, "/frames")
+        detector["frames"].attrs["signal_type"] = "detector"
+    selection = resolve_stitch_sources(StitchSourceSelection("NeXus", (str(path),)), {})
+    spec = selection.groups[0][0]
+    table = run_metadata_table(MetadataTablePlan(spec))
+    assert table.disposition is AnalysisDisposition.COMPLETED, (table.code, table.diagnostics)
+    assert table.labels == tuple(range(5))
+    with h5py.File(sidecar, "r+") as stream:
+        stream["frames"][0, 0, 0] = 1234
+    repeated = run_metadata_table_requalification(MetadataTableRequalificationPlan(table.receipt, table.table_fingerprint))
+    assert repeated.disposition is AnalysisDisposition.REFUSED

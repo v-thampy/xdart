@@ -711,10 +711,10 @@ class _CursorSource:
         self.cursor = cursor
         try:
             self.descriptor = cursor.descriptor
+            self.provider = cursor.metadata_provider()
             self.path = self.descriptor.path
             self.kind = self.descriptor.kind
             self.name = self.descriptor.scan_name
-            self.provider = cursor.metadata_provider()
             self.frame_indices = range(self.descriptor.frame_count)
             self.scanned_axes = tuple(self.provider.motors())
             self.capabilities = SourceCapabilities(supports_random_access=True, supports_chunks=True, has_metadata=True, has_raw_references=True)

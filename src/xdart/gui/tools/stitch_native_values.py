@@ -33,7 +33,7 @@ def _family(group, selected, project, prefix=None):
         Path(spec.uri).stem + ("-" + str(spec.options["scan"]).removesuffix(".1")
                                if "scan" in spec.options else "")
         for spec in group)
-    readable = re.sub(r"[^A-Za-z0-9_-]+", "-", readable).strip("-_")[:66] or "stitch"
+    readable = re.sub(r"[^A-Za-z0-9_-]+", "-", readable).strip("-_")[:60] or "stitch"
     digest = analysis_canonical_fingerprint("stitch-family-v1", identity)[:12]
     return f"{readable}-{digest}"
 
@@ -82,6 +82,7 @@ def prepare_native_stitch_tool(form, project):
         motors = tuple(acquisition["source_motors"].values())
         energy_name = acquisition["source_energy_selector"]
     requests = []
+    family_occurrences = {}
     # Metadata is loaded once per exact source. The receipt is reused without
     # changing membership when a scan appears in more than one output group.
     cached = {}
@@ -112,6 +113,9 @@ def prepare_native_stitch_tool(form, project):
         source = receipts[0] if len(receipts) == 1 else ModuleSourceGroupReceipt.from_members(
             tuple(receipts), kind=ModuleKind.STITCH)
         family = _family(group, labels, project, form.output_family)
+        family_occurrences[family] = family_occurrences.get(family, 0) + 1
+        if family_occurrences[family] > 1:
+            family = family + f"-{family_occurrences[family]}"
         target = resolve_finite_output_target(output_dir, family, operation_token="stitch-1d")
         output = ModuleOutputRequest(target, AnalysisArtifactKind.STITCH_1D,
                                      form.overwrite, artifact_family=family)
