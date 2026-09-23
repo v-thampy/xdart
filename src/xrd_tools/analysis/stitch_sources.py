@@ -6,9 +6,10 @@ from pathlib import Path
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.io.nexus import list_entries
 from xrd_tools.io.spec import list_spec_scans
+from xrd_tools.sources.descriptor import describe_container
 from xrd_tools.sources.discover import discover_scans
 from xrd_tools.sources.grouping import parse_stitch_scan_groups
-from xrd_tools.sources.registry import guess_source_kind, open_source
+from xrd_tools.sources.registry import open_source
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +85,7 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
                 groups.append(tuple(members))
 
     def nexus_members(path):
-        kind = guess_source_kind(path)
+        kind = describe_container(path).kind
         if kind not in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
             raise ValueError(f"{path.name} is not a raw NeXus detector source")
         entries = tuple(list_entries(path))
@@ -105,9 +106,14 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
         specs = discover_scans(directory, SourceKind.SPEC)
         for path in dict.fromkeys(str(spec.uri) for spec in specs):
             spec_file(Path(path), True)
+        seen_nexus = set()
         for kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER):
             for spec in discover_scans(directory, kind):
-                groups.append(nexus_members(Path(spec.uri)))
+                path = Path(spec.uri)
+                resolved = path.resolve()
+                if resolved not in seen_nexus:
+                    seen_nexus.add(resolved)
+                    groups.append(nexus_members(path))
     if len(groups) > 4096:
         raise ValueError("Selection exceeds 4096 result groups")
     return StitchSourceResolution(tuple(groups), tuple(skipped))

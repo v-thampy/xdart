@@ -83,6 +83,32 @@ def test_native_selection_brackets_all_and_directory_mixed_formats(tmp_path):
     assert directory.skipped == all_spec.skipped
 
 
+@pytest.mark.parametrize("mode,alias", (("NeXus", False), ("Directory", False), ("Directory", True)))
+def test_eiger_master_selection_keeps_identity_and_admits_metadata_once(tmp_path, mode, alias):
+    from xrd_tools.analysis.scan_operations import AnalysisDisposition, MetadataTablePlan, run_metadata_table
+    from xrd_tools.analysis.stitch_sources import StitchSourceSelection, resolve_stitch_sources
+    from xrd_tools.core.scan import SourceKind
+    from tests.core.test_source_edge_contract import _dangling_canonical, _land_canonical
+
+    master, sidecar = _dangling_canonical(tmp_path)
+    _land_canonical(sidecar)
+    if alias:
+        (tmp_path / "scan_alias_master.h5").symlink_to(master)
+    selected_path = master if mode == "NeXus" else tmp_path
+    selection = resolve_stitch_sources(StitchSourceSelection(mode, (str(selected_path),)), {})
+
+    assert len(selection.groups) == 1
+    assert len(selection.groups[0]) == 1
+    source = selection.groups[0][0]
+    assert Path(source.uri).resolve() == master
+    table = run_metadata_table(MetadataTablePlan(source))
+    assert table.disposition is AnalysisDisposition.COMPLETED, (table.code, table.diagnostics)
+    assert source.kind is SourceKind.EIGER_MASTER
+    assert source.entry == "entry"
+    assert table.labels == (0, 1, 2)
+    assert table.receipt.resolved_entry == "entry"
+
+
 def test_nexus_metadata_preserves_external_dependency_and_native_dtype(tmp_path):
     import h5py
     from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
