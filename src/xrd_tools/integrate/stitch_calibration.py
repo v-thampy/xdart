@@ -69,6 +69,17 @@ def _metadata_reader(source):
         yield source.metadata_for
 
 
+def _exact_source(spec):
+    if spec.kind is SourceKind.SPEC:
+        options = dict(spec.options)
+        options['require_complete_images'] = True
+        reader = dict(options.get('read_image_kwargs', {}))
+        reader['rotation'] = 0
+        options['read_image_kwargs'] = reader
+        return replace(spec, options=options)
+    return spec
+
+
 def source_frame_choices(spec: SourceSpec, motor_names=('del', 'nu')):
     """Metadata-only enumeration; requested SPEC selectors never fall back."""
     from xrd_tools.sources import open_source
@@ -80,6 +91,7 @@ def source_frame_choices(spec: SourceSpec, motor_names=('del', 'nu')):
         keys = list_spec_scans(spec.uri)
         if requested not in keys and f'{requested}.1' not in keys:
             raise ValueError('select an existing SPEC scan explicitly')
+    spec = _exact_source(spec)
     source = open_source(spec)
     try:
         indices = source.frame_indices
@@ -134,6 +146,15 @@ def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
     from xrd_tools.sources import open_source
     from fabio.tifimage import TifImage
     from xrd_tools.io.image import read_image
+    spec = _exact_source(spec)
+    graph = None
+    if spec.kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER):
+        from xrd_tools.sources.execution_graph import (
+            qualify_source_execution_graph, requalify_source_execution_graph,
+        )
+        graph = qualify_source_execution_graph(spec,
+            cancelled=None if cancelled is None else cancelled.is_set)
+        spec = graph.execution_source
     source_state = Path(spec.uri).stat()
     choices = {row[0]: row for row in source_frame_choices(spec, motor_names)}
     indices = tuple(indices)
@@ -160,7 +181,11 @@ def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
                 raise ValueError('source angle metadata changed during preparation')
             original = source.frame_for(index)
             before = Path(original.source_path or spec.uri).stat()
-            pixels = ImageOrientation(rotation=rotation).apply(source.load_frame(index))
+            loader = getattr(source, 'load_native_frame', source.load_frame)
+            pixels = ImageOrientation(rotation=rotation).apply(loader(index))
+            if graph is not None:
+                requalify_source_execution_graph(spec, graph,
+                    cancelled=None if cancelled is None else cancelled.is_set)
             after = Path(original.source_path or spec.uri).stat()
             if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
                 raise ValueError('selected raw image changed while preparing calibration')

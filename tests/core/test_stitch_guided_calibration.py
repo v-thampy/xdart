@@ -178,3 +178,15 @@ def test_mg_distance_bounds_constrain_optimizer_not_only_initial_seed():
         distance_bounds_m=(lower,upper))
     assert lower <= result.params['dist'] <= upper
     assert result.params['dist'] > distance
+
+
+def test_calibration_refuses_same_count_missing_interior_raw_frame(tmp_path):
+    from tests.core.test_spec_source import _spec
+    from xrd_tools.integrate.stitch_calibration import source_frame_choices
+    path = _spec(tmp_path)
+    for index in (0, 2, 3):
+        np.ones((2, 3), dtype=np.uint16).tofile(tmp_path / f'myscan_scan5_{index}.raw')
+    spec = SourceSpec(path, SourceKind.SPEC, options={'scan': '5', 'image_dir': str(tmp_path),
+        'read_image_kwargs': {'detector_shape': (2, 3), 'raw_dtype': 'uint16'}})
+    with pytest.raises(ValueError, match='number'):
+        source_frame_choices(spec, ('th', 'chi'))
