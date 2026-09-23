@@ -1,13 +1,12 @@
 """Native Stitch selections projected onto existing finite operation owners."""
 from pathlib import Path
-import re
 
 from xrd_tools.analysis.module_transaction import (
     MetadataColumnSelector, ModuleKind, ModuleOutputRequest, ModuleSourceReceipt,
     ModuleSourceGroupReceipt,
 )
 from xrd_tools.analysis.scan_operations import (
-    AnalysisDisposition, MetadataTablePlan, analysis_canonical_fingerprint,
+    AnalysisDisposition, MetadataTablePlan,
     run_metadata_table,
 )
 from xrd_tools.analysis.stitch_operation import (
@@ -21,21 +20,74 @@ from xrd_tools.analysis.xu_stitch_calibration import (
 from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
 from xrd_tools.integrate.xu_stitch import resolve_xu_stitch_effective_geometry
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind
-from xrd_tools.io.output_path import resolve_finite_output_target
+from xrd_tools.io.output_path import is_artifact_family, resolve_finite_output_target
 
 
-def _family(group, selected, project, prefix=None):
-    """Persist explicit identity, independent of processing/settings revisions."""
-    identity = tuple((str(Path(spec.uri).resolve().relative_to(project)), spec.entry,
-                      spec.options.get("scan"), labels)
-                     for spec, labels in zip(group, selected))
-    readable = prefix or "-".join(
-        Path(spec.uri).stem + ("-" + str(spec.options["scan"]).removesuffix(".1")
-                               if "scan" in spec.options else "")
-        for spec in group)
-    readable = re.sub(r"[^A-Za-z0-9_-]+", "-", readable).strip("-_")[:60] or "stitch"
-    digest = analysis_canonical_fingerprint("stitch-family-v1", identity)[:12]
-    return f"{readable}-{digest}"
+def _combined(group):
+    # Multiple entries of one NeXus file remain one source/file output.
+    return len({(str(Path(spec.uri).resolve()), spec.options.get("scan"))
+                for spec in group}) > 1
+
+
+def _families(form, groups, project):
+    """Readable slots are independent of frame subsets and processing settings."""
+    from .stitch_values import StitchToolPreflightRefused
+    explicit = list(form.output_families or ("",) * len(groups))
+    if len(explicit) != len(groups):
+        raise StitchToolPreflightRefused("OUTPUT_FAMILY_COUNT_MISMATCH",
+            "Enter one result name per output, separated by ; (blank names use single-source defaults)")
+    if form.output_family:
+        combined = [i for i, group in enumerate(groups) if _combined(group)]
+        if len(groups) == 1:
+            explicit[0] = form.output_family
+        elif len(combined) == 1:
+            explicit[combined[0]] = form.output_family
+        else:
+            raise StitchToolPreflightRefused("OUTPUT_FAMILY_COUNT_MISMATCH",
+                "For multiple outputs, enter result names in output order separated by ;")
+    families, seen = [], set()
+    for index, (group, name) in enumerate(zip(groups, explicit), 1):
+        if not name:
+            if _combined(group):
+                raise StitchToolPreflightRefused("OUTPUT_FAMILY_REQUIRED",
+                    f"Output {index} combines sources; enter an explicit result name")
+            spec = group[0]
+            relative = Path(spec.uri).resolve().relative_to(project)
+            # Keep source suffixes meaningful to identity: SPEC may have a suffix.
+            stem = relative if spec.options.get("scan") is not None else relative.with_suffix("")
+            name = "-".join(stem.parts)
+            if "scan" in spec.options:
+                name += "-" + str(spec.options["scan"]).removesuffix(".1")
+        if not is_artifact_family(name):
+            raise StitchToolPreflightRefused("OUTPUT_FAMILY_INVALID",
+                f"Output {index} name {name!r} is invalid; choose a readable name of at most 80 characters")
+        if name.casefold() in seen:
+            raise StitchToolPreflightRefused("OUTPUT_FAMILY_COLLISION",
+                f"Multiple outputs use {name!r}; choose distinct result names")
+        seen.add(name.casefold())
+        families.append(name)
+    return tuple(families)
+
+
+def _check_output_directory(target, project):
+    """Qualify existing ancestry without creating directories during Preview."""
+    from .stitch_values import StitchToolPreflightRefused, _inside_project
+    _inside_project(target, project, "output")
+    ancestor = Path(target).parent
+    while not ancestor.exists() and not ancestor.is_symlink():
+        ancestor = ancestor.parent
+    if not ancestor.is_dir():
+        raise StitchToolPreflightRefused("OUTPUT_PARENT_UNAVAILABLE",
+            f"Output ancestor is not a directory: {ancestor}")
+
+
+def create_native_output_directory(request):
+    """Run-only setup; the existing publisher still owns target admission."""
+    target = Path(request.module.output.target)
+    project = Path(request.manifest.project_root)
+    _check_output_directory(target, project)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _check_output_directory(target, project)
 
 
 def prepare_native_stitch_tool(form, project):
@@ -44,15 +96,7 @@ def prepare_native_stitch_tool(form, project):
         _inside_project,
     )
     output_dir = Path(form.output_path).parent
-    _inside_project(form.output_path, project, "output")
-    # Native Save Path behaves like the integration workspace: materialize the
-    # requested directory before freezing finite output ancestry. This is the
-    # only Preview setup write; source/science qualification remains read-only.
-    try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise StitchToolPreflightRefused("OUTPUT_PARENT_UNAVAILABLE", str(error)) from error
-    _inside_project(form.output_path, project, "output")
+    _check_output_directory(form.output_path, project)
     for path in form.source_selection.paths:
         # The Project root itself is a valid directory input.
         if Path(path).resolve() != project:
@@ -63,6 +107,7 @@ def prepare_native_stitch_tool(form, project):
     if not resolution.groups:
         return StitchToolPreflight(form, None, None, _PREFLIGHT_FACTORY,
                                    requests=(), skipped=resolution.skipped)
+    families = _families(form, resolution.groups, project)
     common = dict(npt_1d=form.npt_1d, unit=form.unit, radial_range=form.q_range,
                   monitor_selector=form.monitor_selector, max_frame_bytes=form.max_frame_bytes,
                   native_records=True, conditioning=form.conditioning, mask_path=form.mask_path)
@@ -88,19 +133,19 @@ def prepare_native_stitch_tool(form, project):
         motors = tuple(acquisition["source_motors"].values())
         energy_name = acquisition["source_energy_selector"]
     requests = []
-    family_occurrences = {}
     # Metadata is loaded once per exact source. The receipt is reused without
     # changing membership when a scan appears in more than one output group.
     cached = {}
-    for group in resolution.groups:
-        receipts, labels = [], []
+    for group, family in zip(resolution.groups, families):
+        receipts = []
         for spec in group:
             cache_key = (str(spec.uri), spec.entry, str(spec.options))
             if cache_key not in cached:
                 table = run_metadata_table(MetadataTablePlan(spec))
                 if table.disposition is not AnalysisDisposition.COMPLETED:
                     raise StitchToolPreflightRefused(table.code or "SOURCE_PREFLIGHT_REFUSED",
-                        "Source metadata could not be admitted", diagnostics=table.diagnostics)
+                        f"Source metadata could not be admitted: {spec.uri} (entry {spec.entry or '-'}, scan {spec.options.get('scan', '-')})",
+                        diagnostics=table.diagnostics)
                 selected = form.frame_selector.select(table.labels)
                 selectors = tuple(MetadataColumnSelector(str(name)) for name in motors)
                 selectors += () if form.monitor_selector is None else (form.monitor_selector,)
@@ -111,17 +156,17 @@ def prepare_native_stitch_tool(form, project):
                     selectors += (MetadataColumnSelector(energy_name),)
                 selectors = tuple(sorted({(s.name, s.occurrence): s for s in selectors}.values(),
                                          key=lambda s: (s.name, s.occurrence)))
+                missing = tuple(s.name for s in selectors if names.count(s.name) <= s.occurrence)
+                if missing:
+                    raise StitchToolPreflightRefused("MISSING_REQUIRED_METADATA",
+                        f"{spec.uri} (entry {spec.entry or '-'}, scan {spec.options.get('scan', '-')}): "
+                        f"missing required column(s): {', '.join(missing)}")
                 cached[cache_key] = ModuleSourceReceipt.from_metadata_table(table,
                     kind=ModuleKind.STITCH, selected_labels=selected, resolved_selectors=selectors)
             receipt = cached[cache_key]
             receipts.append(receipt)
-            labels.append(receipt.selected_labels)
         source = receipts[0] if len(receipts) == 1 else ModuleSourceGroupReceipt.from_members(
             tuple(receipts), kind=ModuleKind.STITCH)
-        family = _family(group, labels, project, form.output_family)
-        family_occurrences[family] = family_occurrences.get(family, 0) + 1
-        if family_occurrences[family] > 1:
-            family = family + f"-{family_occurrences[family]}"
         target = resolve_finite_output_target(output_dir, family, operation_token="stitch-1d")
         output = ModuleOutputRequest(target, AnalysisArtifactKind.STITCH_1D,
                                      form.overwrite, artifact_family=family)

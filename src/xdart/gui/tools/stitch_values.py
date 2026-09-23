@@ -254,9 +254,15 @@ class StitchToolForm:
     conditioning: StitchConditioning | None = None
     mask_path: str | None = None
     output_family: str | None = None
+    output_families: tuple[str, ...] = ()
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
+        if (self.output_family is not None and type(self.output_family) is not str
+            or type(self.output_families) is not tuple
+            or any(type(value) is not str for value in self.output_families)
+            or self.output_family and self.output_families):
+            raise ValueError("Specify one result family or ordered output families")
         project = _absolute_path(self.project_root, "Project root")
         spec = _absolute_path(self.spec_path, "SPEC path")
         image_dir = _absolute_path(self.image_dir, "image directory")
@@ -459,7 +465,7 @@ class StitchToolForm:
                          self.source_selection.fingerprint_value, self.unit,
                          None if self.conditioning is None else
                          (self.conditioning.mode, self.conditioning.threshold_min, self.conditioning.threshold_max),
-                         self.mask_path, self.output_family)
+                         self.mask_path, self.output_family, self.output_families)
         object.__setattr__(
             self,
             "fingerprint",

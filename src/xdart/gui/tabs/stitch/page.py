@@ -299,6 +299,12 @@ class StitchPage(QtWidgets.QWidget):
                     choices=("Stitch All", "Select Scans"))
         self._field(source, SectionId.SOURCE, "scan", "Selection", "1")
         self._rows["scan"].setToolTip("1,2,[2-5,8] produces three outputs. Brackets combine scans into one result.")
+        self._field(source, SectionId.SOURCE, "output_family", "Result names")
+        self._rows["output_family"].setToolTip(
+            "Required when combining sources. One name applies to the sole combined result. "
+            "For several outputs, separate names in output order with ; and leave single-source "
+            "names blank for automatic naming. Example for 1,2,[1,2]: ;;combined. "
+            "Names are at most 80 characters; processing and frame selection keep the same name.")
         self._rows["source_kind"].valueChanged.connect(self._source_changed)
         self._rows["scan_mode"].valueChanged.connect(self._source_changed)
         self._rows["spec_path"].valueChanged.connect(self._source_path_edited)
@@ -558,7 +564,10 @@ class StitchPage(QtWidgets.QWidget):
             native = dict(source_selection=selection,
                 unit="q_A^-1" if value("unit") == "Q (Å⁻¹)" else "2th_deg",
                 conditioning=conditioning, mask_path=str(value("mask_path")) or None,
-                output_family=None)
+                output_family=str(value("output_family")).strip() or None)
+            if ";" in str(value("output_family")):
+                native.update(output_family=None,
+                    output_families=tuple(part.strip() for part in str(value("output_family")).split(";")))
             if not output:
                 output = str(Path(value("project_root")) / "xdart_processed_data")
             directory = Path(output)
@@ -593,6 +602,7 @@ class StitchPage(QtWidgets.QWidget):
             "project_root", "spec_path", "scan", "image_dir", "image_stem", "raw_dtype",
             "raw_header_skip", "geometry_path", "threshold", "npt_1d", "output_path")}
         fields.update(unit="Q (Å⁻¹)" if form.unit == "q_A^-1" else "2θ (°)",
+            output_family=";".join(form.output_families) if form.output_families else form.output_family or "",
             mask_path=form.mask_path or "",
             geometry_kind="PONI + offsets" if form.geometry_kind is StitchGeometryKind.PONI else "Goniometer JSON",
             poni_references=", ".join(f"{key}={value}" for key, value in form.poni_references),

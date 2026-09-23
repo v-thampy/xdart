@@ -113,6 +113,14 @@ def test_native_source_controls_ranges_and_threshold_semantics(qapp, tmp_path):
         assert page._value("threshold_min") == 0.
         page.set_field("scan", "1,2,[2-5,8]")
         assert page.build_form().source_selection.scans == "1,2,[2-5,8]"
+        page.set_field("output_family", "combined")
+        assert page.build_form().output_family == "combined"
+        page.set_field("output_family", ";;combined")
+        assert page.build_form().output_families == ("", "", "combined")
+        assert page.build_form().output_family is None
+        restored = page.build_form()
+        page.load_form(restored)
+        assert page.build_form().fingerprint == restored.fingerprint
         page.set_field("scan_mode", "Stitch All")
         assert page.build_form().source_selection.stitch_all
         assert page._rows["scan"].isHidden()
@@ -356,6 +364,7 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
         _fill_native(page, form)
         page.set_field("image_stem", "sample_scan{scan}_")
         page.set_field("scan", "1,[1,2],3")
+        page.set_field("output_family", "combined")
         page.set_field("unit", "2θ (°)")
         page.begin_preview()
         _wait(page, qapp)

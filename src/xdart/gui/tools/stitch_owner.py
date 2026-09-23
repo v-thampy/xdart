@@ -564,6 +564,9 @@ class StitchToolOwner:
             raise TypeError("Stitch execution command lost its owner")
         try:
             if request.action is StitchOwnerAction.RUN:
+                if request.preflight.form.source_selection is not None:
+                    from .stitch_native_values import create_native_output_directory
+                    create_native_output_directory(execution.request)
                 result = execution.run(
                     cancel_token=cancel,
                     progress_callback=lambda progress: publish(

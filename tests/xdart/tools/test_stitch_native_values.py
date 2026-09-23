@@ -16,6 +16,109 @@ from tests.xdart.pages.test_stitch_page import _form
 from tests.xdart.tools.test_stitch_owner import _poll_terminal
 
 
+def test_native_family_preserves_readable_source_and_frame_subset_slot(tmp_path):
+    from xdart.gui.tools.stitch_values import StitchFrameSelector
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    first = prepare_stitch_tool(form).request
+    subset = prepare_stitch_tool(replace(form,
+        frame_selector=StitchFrameSelector(0, 0))).request
+    assert Path(first.module.output.target).name == "source-sample-1_stitch1d.nexus"
+    assert subset.module.output.target == first.module.output.target
+
+
+def test_native_group_requires_and_preserves_explicit_family(tmp_path):
+    from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
+    form = replace(_native_form(tmp_path, "multigeometry", scans="[1,2]"), output_family=None)
+    with pytest.raises(StitchToolPreflightRefused, match="OUTPUT_FAMILY_REQUIRED"):
+        prepare_stitch_tool(form)
+    prepared = prepare_stitch_tool(replace(form, output_family="Sample A é"))
+    assert Path(prepared.request.module.output.target).name == "Sample A é_stitch1d.nexus"
+
+
+def test_native_repeated_output_refuses_without_counter(tmp_path):
+    from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
+    form = _native_form(tmp_path, "multigeometry", scans="1,1")
+    with pytest.raises(StitchToolPreflightRefused, match="OUTPUT_FAMILY_COLLISION"):
+        prepare_stitch_tool(form)
+
+
+def test_native_named_multiple_groups_and_invalid_names(tmp_path):
+    from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
+    form = replace(_native_form(tmp_path, "multigeometry", scans="1,[1,2],[2,1]"),
+                   output_family=None, output_families=("", "sample-up", "sample-down"))
+    prepared = prepare_stitch_tool(form)
+    assert [Path(item.module.output.target).name for item in prepared.requests] == [
+        "source-sample-1_stitch1d.nexus", "sample-up_stitch1d.nexus", "sample-down_stitch1d.nexus"]
+    for names, code in [(("", "x" * 81, "fine"), "OUTPUT_FAMILY_INVALID"),
+                        (("", "../bad", "fine"), "OUTPUT_FAMILY_INVALID"),
+                        (("", "same", "SAME"), "OUTPUT_FAMILY_COLLISION"),
+                        (("only", "two"), "OUTPUT_FAMILY_COUNT_MISMATCH")]:
+        with pytest.raises(StitchToolPreflightRefused, match=code):
+            prepare_stitch_tool(replace(form, output_families=names))
+
+
+def test_native_refused_preview_does_not_create_save_path(tmp_path):
+    from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
+    form = replace(_native_form(tmp_path, "multigeometry", scans="[1,2]"),
+                   output_family=None, output_path=tmp_path / "new" / "result.nexus")
+    with pytest.raises(StitchToolPreflightRefused, match="OUTPUT_FAMILY_REQUIRED"):
+        prepare_stitch_tool(form)
+    assert not (tmp_path / "new").exists()
+
+
+def test_native_preview_missing_save_path_is_read_only_and_run_creates_it(tmp_path):
+    form = replace(_native_form(tmp_path, "multigeometry", scans="1"),
+                   output_path=tmp_path / "new" / "nested" / "result_stitch1d.nexus")
+    owner = StitchToolOwner()
+    try:
+        owner.set_form(form)
+        assert owner.begin_preflight()
+        preview = _poll_terminal(owner, timeout=20)
+        assert preview.terminal_status is OperationTerminalStatus.RETURNED, preview.failure_message
+        assert not (tmp_path / "new").exists()
+        assert owner.begin_run()
+        terminal = _poll_terminal(owner, timeout=30)
+        assert terminal.terminal_status is OperationTerminalStatus.RETURNED, terminal.failure_message
+        assert terminal.outcome.result.terminal.disposition is ModuleDisposition.COMMITTED
+        assert Path(terminal.outcome.result.request.module.output.target).is_file()
+    finally:
+        assert owner.close().status is PageCleanup.CLEAN
+
+
+def test_native_run_rechecks_save_directory_stays_in_project(tmp_path):
+    project, outside = tmp_path / "project", tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    form = replace(_native_form(project, "multigeometry", scans="1"),
+                   output_path=project / "new" / "nested" / "result.nexus")
+    owner = StitchToolOwner()
+    try:
+        owner.set_form(form)
+        assert owner.begin_preflight()
+        assert _poll_terminal(owner).terminal_status is OperationTerminalStatus.RETURNED
+        (project / "new").symlink_to(outside, target_is_directory=True)
+        assert owner.begin_run()
+        terminal = _poll_terminal(owner)
+        assert terminal.terminal_status is OperationTerminalStatus.FAILED
+        assert "OUTPUT_OUTSIDE_PROJECT" in terminal.failure_message
+        assert list(outside.iterdir()) == []
+    finally:
+        assert owner.close().status is PageCleanup.CLEAN
+
+
+def test_native_eiger_missing_angles_names_source_and_entry(tmp_path):
+    from tests.core.test_source_edge_contract import _dangling_canonical, _land_canonical
+    from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    master, sidecar = _dangling_canonical(tmp_path)
+    _land_canonical(sidecar)
+    form = replace(form, source_selection=StitchSourceSelection("NeXus", (str(master),)))
+    with pytest.raises(StitchToolPreflightRefused, match="MISSING_REQUIRED_METADATA") as error:
+        prepare_stitch_tool(form)
+    assert str(master) in str(error.value)
+    assert "entry entry" in str(error.value)
+
+
 def _native_form(tmp_path, backend, *, scans="1,2,[1,2]", unit="q_A^-1"):
     form = _form(tmp_path, backend)
     path = Path(form.spec_path)
@@ -32,7 +135,8 @@ def _native_form(tmp_path, backend, *, scans="1,2,[1,2]", unit="q_A^-1"):
         destination.write_bytes(source.read_bytes())
     return replace(form, source_selection=StitchSourceSelection(
         "Spec", (str(path),), scans=scans, image_dir=str(form.image_dir)),
-        unit=unit, q_range=None, conditioning=StitchConditioning("auto"))
+        unit=unit, q_range=None, conditioning=StitchConditioning("auto"),
+        output_family="combined" if "[" in scans and "," in scans else None)
 
 
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
@@ -150,7 +254,7 @@ def test_native_nexus_group_uses_metadata_and_exact_raw_dataset(tmp_path):
     geometry["wavelength"] = wavelength * 1e-10
     Path(form.geometry_path).write_text(json.dumps(geometry))
     form = replace(form, source_selection=StitchSourceSelection("NeXus", tuple(map(str, files))),
-                   detector_shape=(195, 487), raw_dtype="uint32")
+                   detector_shape=(195, 487), raw_dtype="uint32", output_family="joined-nexus")
     prepared = prepare_stitch_tool(form)
     assert len(prepared.requests) == 1
     result = run_stitch_operation(prepared.request)
