@@ -161,6 +161,9 @@ def refine_goniometer(
     base: Diffractometer | None = None,
     preset: str = "fitted",
     max_nfev: int = 400,
+    distance_seed_m: float | None = None,
+    distance_bounds_m: tuple[float, float] | None = None,
+    cancelled=None,
 ) -> RefineResult:
     """Fit an axis-separable goniometer to powder control points.
 
@@ -186,6 +189,11 @@ def refine_goniometer(
         scales at ``deg2rad`` and fits only the motor-zero offsets + base.
     base : Diffractometer
         Donates the xrayutilities half (circle stacks, ``camera``, HXRD refs).
+    distance_seed_m, distance_bounds_m
+        Optional perpendicular detector distance seed and explicit fit bounds,
+        in metres. A seed alone does not constrain the fitted distance. Bounds
+        use the bounded trust-region solver; the historical unconstrained LM
+        path is unchanged when bounds are absent.
 
     Returns
     -------
@@ -255,7 +263,15 @@ def refine_goniometer(
 
     # --- parameter packing (rot3 is NEVER fit; pinned at base) -------------
     # p = [dist, poni1, poni2, rot1_offset, rot2_offset, (rot1_scale?), (rot2_scale?)]
-    seed = [base_poni.dist, base_poni.poni1, base_poni.poni2, 0.0, 0.0]
+    distance = base_poni.dist if distance_seed_m is None else float(distance_seed_m)
+    if not np.isfinite(distance) or distance <= 0:
+        raise ValueError("distance seed must be finite and positive metres")
+    if distance_bounds_m is not None:
+        lo, hi = (float(v) for v in distance_bounds_m)
+        if not (np.isfinite([lo, hi]).all() and 0 < lo < hi
+                and lo <= distance <= hi):
+            raise ValueError("distance bounds require 0 < low < high and a seed inside them")
+    seed = [distance, base_poni.poni1, base_poni.poni2, 0.0, 0.0]
     if fit_r1s:
         seed.append(_DEG2RAD)
     if fit_r2s:
@@ -272,6 +288,8 @@ def refine_goniometer(
         return dist, poni1, poni2, r1o, r2o, r3_pinned, r1s, r2s
 
     def _residual(p):
+        if cancelled is not None and cancelled.is_set():
+            raise InterruptedError("goniometer refinement cancelled")
         dist, poni1, poni2, r1o, r2o, r3o, r1s, r2s = _unpack(p)
         out = []
         for f in frames:
@@ -288,8 +306,14 @@ def refine_goniometer(
             out.append(q_pred - q_ring[f.rings])
         return np.concatenate(out)
 
-    res = least_squares(_residual, seed, method="lm", max_nfev=max_nfev,
-                        x_scale="jac")
+    bounds = (-np.inf, np.inf)
+    if distance_bounds_m is not None:
+        lower, upper = np.full(len(seed), -np.inf), np.full(len(seed), np.inf)
+        lower[0], upper[0] = lo, hi
+        bounds = (lower, upper)
+    res = least_squares(_residual, seed,
+                        method="lm" if distance_bounds_m is None else "trf",
+                        bounds=bounds, max_nfev=max_nfev, x_scale="jac")
     rms = float(np.sqrt(np.mean(res.fun ** 2)))
     dist, poni1, poni2, r1o, r2o, r3o, r1s, r2s = _unpack(res.x)
 

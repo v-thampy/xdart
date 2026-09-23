@@ -11,13 +11,15 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import uuid
 
 
 CALIBRATION_SAVE_REPORT_ENV = "XDART_CALIBRATION_SAVE_REPORT"
+CALIBRATION_POINTS_DIRECTORY_ENV = "XDART_CALIBRATION_POINTS_DIRECTORY"
 
 
 @contextmanager
-def capture_poni_saves(report_path):
+def capture_poni_saves(report_path, *, points_directory=None):
     """Report the last successful upstream GUI save, never directory mtimes.
 
     pyFAI's save method synchronizes its filename model only after the file
@@ -42,7 +44,23 @@ def capture_poni_saves(report_path):
                     data = stream.read((1 << 20) + 1)
                 if len(data) > 1 << 20:
                     raise ValueError("saved PONI exceeds the size limit")
-                last_saved = {"path": str(path), "sha256": hashlib.sha256(data).hexdigest()}
+                captured = {"path": str(path), "sha256": hashlib.sha256(data).hexdigest()}
+                if points_directory is not None:
+                    from pyFAI.gui.helper import model_transform
+                    points = model_transform.createControlPoints(task.model())
+                    if not points.get_labels() or not any(
+                            points.get(lbl=label).points for label in points.get_labels()):
+                        raise ValueError("saved calibration has no enabled control points")
+                    # Each successful Save gets a fresh companion. A failed
+                    # later export can never adopt points from an earlier Save.
+                    companion = Path(points_directory) / f"points-{uuid.uuid4().hex}.npt"
+                    points.save(str(companion))
+                    content = companion.read_bytes()
+                    if not 0 < len(content) <= 4 << 20:
+                        raise ValueError("control points exceed the size limit")
+                    captured.update(npt_path=str(companion.resolve()),
+                                    npt_sha256=hashlib.sha256(content).hexdigest())
+                last_saved = captured
             except Exception as error:
                 # Do not accidentally report an earlier save after a later
                 # successful write whose contents could not be captured.
@@ -104,7 +122,8 @@ def main():
 
     report_path = os.environ.get(CALIBRATION_SAVE_REPORT_ENV)
     if report_path:
-        with capture_poni_saves(report_path):
+        with capture_poni_saves(
+                report_path, points_directory=os.environ.get(CALIBRATION_POINTS_DIRECTORY_ENV)):
             return upstream_main()
     return upstream_main()
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Callable
 import numpy as np
 from PIL import Image, ImageMode, UnidentifiedImageError
-from xdart.calib2_main import CALIBRATION_SAVE_REPORT_ENV
+from xdart.calib2_main import CALIBRATION_SAVE_REPORT_ENV, CALIBRATION_POINTS_DIRECTORY_ENV
 from fabio.TiffIO import TiffIO; from fabio.tifimage import TifImage
 from xrd_tools.io.image import load_mask, read_image
 from xrd_tools.io.stat_identity import identity_ctime_ns
@@ -119,8 +119,12 @@ class CalibrationRequest:
     source_state: SourceFileState
     monitored_directory: str
     directory_identity: tuple[int, int]
+    points_directory: str | None = None
     def __post_init__(self) -> None:
-        if (not all(_absolute_path(value)
+        if (self.points_directory is not None
+                and (not _absolute_path(self.points_directory)
+                     or self.points_directory != self.monitored_directory)
+                or not all(_absolute_path(value)
                     for value in (self.source_path, self.executable,
                                   self.monitored_directory))
                 or self.exact_hdf_url is not None
@@ -187,9 +191,16 @@ class CalibrationResult:
     diagnostic: str = ""
     save_reported: bool = False
     last_saved_path: str | None = None
+    control_points_path: str | None = None
+    control_points_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if (type(self.request) is not CalibrationRequest
+                or (self.control_points_path is None) != (self.control_points_sha256 is None)
+                or self.control_points_path is not None
+                and (not self.save_reported or self.last_saved_path is None
+                     or not _absolute_path(self.control_points_path)
+                     or not _sha256(self.control_points_sha256))
                 or type(self.save_reported) is not bool
                 or self.last_saved_path is not None
                 and (not self.save_reported
@@ -1009,22 +1020,35 @@ def _cleanup(stage: Path | None, identity: tuple[int, int] | None, names: tuple[
             if not stat.S_ISDIR(path.lstat().st_mode): path.unlink()
         stage.rmdir(); return ""
     except OSError: return str(stage)
-def _read_calibration_save_report(path: Path):
+def _read_calibration_save_report(path: Path, *, points_directory: str | None = None):
     if not path.exists():
-        return False, None
+        return False, None, None, None
     with path.open("rb") as stream:
-        data = stream.read(_PATH_BYTES_LIMIT + 1024)
+        data = stream.read(2 * _PATH_BYTES_LIMIT + 2048)
     report = json.loads(data)
     if report is None:
-        return True, None
-    if (type(report) is not dict or set(report) != {"path", "sha256"}
+        return True, None, None, None
+    keys = {"path", "sha256"}
+    if points_directory is not None:
+        keys |= {"npt_path", "npt_sha256"}
+    if (type(report) is not dict or set(report) != keys
             or not _absolute_path(report["path"])
             or not _sha256(report["sha256"])):
         raise ValueError("calibration did not report an exact successful save")
     candidate = qualify_calibration_candidate(report["path"])
     if candidate.proof.sha256 != report["sha256"]:
         raise ValueError("last saved PONI changed before adoption")
-    return True, candidate
+    npt_path, npt_sha = report.get("npt_path"), report.get("npt_sha256")
+    if points_directory is not None:
+        if (not _absolute_path(npt_path) or not _sha256(npt_sha)
+                or Path(npt_path).parent != Path(points_directory)
+                or not stat.S_ISREG(Path(npt_path).lstat().st_mode)):
+            raise ValueError("calibration did not report exact matched control points")
+        with open(npt_path, "rb") as stream:
+            content = stream.read((4 << 20) + 1)
+        if not 0 < len(content) <= 4 << 20 or hashlib.sha256(content).hexdigest() != npt_sha:
+            raise ValueError("saved control points changed before adoption")
+    return True, candidate, npt_path, npt_sha
 
 
 def run_calibration(
@@ -1037,6 +1061,7 @@ def run_calibration(
     candidates: tuple[CalibrationCandidate, ...] = ()
     save_reported = False
     last_saved = None
+    npt_path = npt_sha = None
     code = None; argv: tuple[str, ...] = ()
     status = OperationTerminalStatus.RETURNED; diagnostic = ""
     try:
@@ -1087,7 +1112,11 @@ def run_calibration(
                 cwd=str(directory), shell=False, stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=child_stderr,
                 close_fds=True,
-                env={**os.environ, CALIBRATION_SAVE_REPORT_ENV: str(report_path)},
+                env={**{key: value for key, value in os.environ.items()
+                        if key != CALIBRATION_POINTS_DIRECTORY_ENV},
+                     CALIBRATION_SAVE_REPORT_ENV: str(report_path),
+                     **({CALIBRATION_POINTS_DIRECTORY_ENV: request.points_directory}
+                        if request.points_directory is not None else {})},
             )
             options["creationflags" if _WINDOWS else "start_new_session"] = (
                 getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -1108,7 +1137,10 @@ def run_calibration(
             if code != 0:
                 raise _nonzero_child_error(
                     "pyFAI-calib2", code, child_diagnostic)
-            save_reported, last_saved = _read_calibration_save_report(report_path)
+            save_reported, last_saved, npt_path, npt_sha = _read_calibration_save_report(
+                report_path, points_directory=request.points_directory)
+            if request.points_directory is not None and not save_reported:
+                raise ValueError("guided calibration requires an exact successful save report")
         if not _source_context_current(
                 source, request.source_state, directory,
                 request.directory_identity):
@@ -1152,10 +1184,12 @@ def run_calibration(
         diagnostic = f"{module}.{name}: {message}"
     if status is not OperationTerminalStatus.RETURNED and save_reported:
         candidates, save_reported, last_saved = (), False, None
+        npt_path = npt_sha = None
     result = CalibrationResult(
         request, candidates, code, argv, request.monitored_directory, diagnostic,
         save_reported=save_reported,
         last_saved_path=last_saved.path if last_saved is not None else None,
+        control_points_path=npt_path, control_points_sha256=npt_sha,
     )
     return OperationTerminal(identity, status, diagnostic, result)
 _TIFF_LIMIT, _MASK_LIMIT, _PIXEL_LIMIT, _DECODED_LIMIT = 512 << 20, 64 << 20, 1 << 25, 256 << 20

@@ -1,0 +1,431 @@
+"""Guided powder calibration values and notebook-derived fitting adapters.
+
+Frames are decoded once through the registered source owner and retained as
+exact TIFF inputs. The manifest records the original locator, metadata and
+image/PONI/NPT hashes; fitting never guesses a filename-to-angle association.
+"""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, replace
+from contextlib import contextmanager
+import hashlib
+import json
+import math
+from pathlib import Path
+import uuid
+
+import numpy as np
+
+from xrd_tools.core.scan import SourceKind, SourceSpec
+from xrd_tools.core.geometry import ImageOrientation
+from xrd_tools.integrate.refine import ControlFrame, refine_goniometer
+
+
+def _sha(path: str | Path, cap: int = 512 << 20) -> str:
+    path = Path(path)
+    if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= cap:
+        raise ValueError(f"invalid calibration file: {path}")
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1 << 20), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class CalibrationFrame:
+    identity: str
+    source_uri: str
+    source_kind: str
+    source_options: dict
+    index: int
+    raw_path: str
+    raw_index: int | None
+    image_path: str
+    image_sha256: str
+    shape: tuple[int, int]
+    rotation: int
+    motors: dict[str, float]
+    energy_eV: float | None
+    poni_path: str = ''
+    poni_sha256: str = ''
+    npt_path: str = ''
+    npt_sha256: str = ''
+
+    @property
+    def complete(self) -> bool:
+        return bool(self.poni_path and self.npt_path)
+
+
+@contextmanager
+def _metadata_reader(source):
+    # A NeXus source's presentation metadata_for excludes scanned motors.
+    # The cursor provider is the existing complete-row authority.
+    opener = getattr(source, 'open_cursor', None)
+    if opener is not None:
+        with opener() as cursor:
+            yield cursor.metadata_provider().complete_metadata_for
+    else:
+        yield source.metadata_for
+
+
+def source_frame_choices(spec: SourceSpec, motor_names=('del', 'nu')):
+    """Metadata-only enumeration; requested SPEC selectors never fall back."""
+    from xrd_tools.sources import open_source
+    from xrd_tools.io.spec import list_spec_scans
+    if len(set(motor_names)) != len(motor_names) or any(not name for name in motor_names):
+        raise ValueError('choose distinct, nonempty angle metadata columns')
+    if spec.kind is SourceKind.SPEC:
+        requested = str(spec.options.get('scan', ''))
+        keys = list_spec_scans(spec.uri)
+        if requested not in keys and f'{requested}.1' not in keys:
+            raise ValueError('select an existing SPEC scan explicitly')
+    source = open_source(spec)
+    try:
+        indices = source.frame_indices
+        if len(indices) > 100000:
+            raise ValueError('calibration scan exceeds the frame selection limit')
+        if spec.kind is SourceKind.SPEC:
+            from xrd_tools.io.spec import read_spec_scan_columns
+            _, _, expected = read_spec_scan_columns(spec.uri, source.scan_key)
+            if len(indices) != expected:
+                raise ValueError('SPEC image count differs from metadata; exact frame association is required')
+        rows = []
+        with _metadata_reader(source) as read_metadata:
+            for index in indices:
+                metadata = read_metadata(index)
+                try:
+                    motors = {name: float(metadata[name]) for name in motor_names}
+                except KeyError as error:
+                    raise ValueError(f'frame {index}: required angle column {error.args[0]!r} is absent') from error
+                if not all(math.isfinite(v) for v in motors.values()):
+                    raise ValueError(f'frame {index}: diffraction angles must be finite')
+                energy = metadata.get('energy')
+                if energy is not None:
+                    energy = float(energy)
+                    if not math.isfinite(energy) or energy <= 0:
+                        raise ValueError(f'frame {index}: invalid energy in eV')
+                rows.append((int(index), motors, energy))
+        return rows
+    finally:
+        close = getattr(source, 'close', None)
+        if close is not None:
+            close()
+
+
+def suggested_frame_indices(rows, count=5):
+    """Greedy angular coverage suggestions; count is not fit sufficiency."""
+    if not rows:
+        return ()
+    values = np.asarray([list(row[1].values()) for row in rows], dtype=float)
+    spans = np.ptp(values, axis=0)
+    values = (values - values.min(axis=0)) / np.where(spans > 0, spans, 1)
+    selected = [0]
+    while len(selected) < min(count, len(rows)):
+        distance = np.min(np.sum((values[:, None] - values[selected]) ** 2, axis=2), axis=1)
+        distance[selected] = -1
+        selected.append(int(np.argmax(distance)))
+    return tuple(rows[i][0] for i in sorted(selected))
+
+
+def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
+                               rotation=0, motor_names=('del', 'nu'), cancelled=None):
+    """Persist the exact selected detector pixels and their source angles."""
+    from xrd_tools.sources import open_source
+    from fabio.tifimage import TifImage
+    from xrd_tools.io.image import read_image
+    source_state = Path(spec.uri).stat()
+    choices = {row[0]: row for row in source_frame_choices(spec, motor_names)}
+    indices = tuple(indices)
+    if not 1 <= len(indices) <= 32 or len(set(indices)) != len(indices):
+        raise ValueError('select 1–32 distinct calibration frames (3–5 suggested)')
+    root = Path(directory).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    source = open_source(spec)
+    frames = []
+    source_options = {'entry': spec.entry, 'options': dict(spec.options)}
+    descriptor = getattr(source, 'container_descriptor', None)
+    if descriptor is not None:
+        source_options['dataset_path'] = descriptor().dataset_path
+    try:
+        for index in indices:
+            if cancelled is not None and cancelled.is_set():
+                raise InterruptedError('calibration preparation cancelled')
+            if index not in choices:
+                raise ValueError(f'frame {index} is not in the selected scan')
+            _, motors, energy = choices[index]
+            with _metadata_reader(source) as read_metadata:
+                metadata = read_metadata(index)
+            if any(float(metadata[name]) != value for name, value in motors.items()):
+                raise ValueError('source angle metadata changed during preparation')
+            original = source.frame_for(index)
+            before = Path(original.source_path or spec.uri).stat()
+            pixels = ImageOrientation(rotation=rotation).apply(source.load_frame(index))
+            after = Path(original.source_path or spec.uri).stat()
+            if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+                raise ValueError('selected raw image changed while preparing calibration')
+            if pixels.ndim != 2 or pixels.size > 1 << 25 or pixels.dtype.kind not in 'iuf':
+                raise ValueError('calibration requires a bounded real two-dimensional image')
+            row_dir = root / f'frame-{index}-{uuid.uuid4().hex[:12]}'
+            row_dir.mkdir()
+            image = row_dir / 'selected.tif'
+            TifImage(data=np.asarray(pixels, dtype=np.float64)).write(str(image))
+            if not np.array_equal(read_image(image), pixels, equal_nan=True):
+                raise ValueError('staged calibration pixels differ from the selected image')
+            frames.append(CalibrationFrame(
+                row_dir.name, str(Path(spec.uri).resolve()), spec.kind.value,
+                json.loads(json.dumps(source_options, default=str)), int(index),
+                str(Path(original.source_path or spec.uri).resolve()),
+                original.source_frame_index, str(image), _sha(image), tuple(pixels.shape),
+                int(rotation), dict(motors), energy))
+            current = Path(spec.uri).stat()
+            if (current.st_ino, current.st_size, current.st_mtime_ns) != (source_state.st_ino, source_state.st_size, source_state.st_mtime_ns):
+                raise ValueError('scan metadata changed during preparation')
+            save_calibration_session(root, frames)
+    finally:
+        close = getattr(source, 'close', None)
+        if close is not None:
+            close()
+    save_calibration_session(root, frames)
+    return tuple(frames)
+
+
+def save_calibration_session(directory, frames):
+    path = Path(directory) / 'calibration-session.json'
+    payload = {'schema': 'xdart.stitch_calibration_session', 'version': 1,
+               'frames': [asdict(frame) for frame in frames]}
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(payload, indent=2, allow_nan=False))
+    temporary.replace(path)
+    return path
+
+
+def load_calibration_session(path):
+    path = Path(path)
+    if path.stat().st_size > 1 << 20:
+        raise ValueError('calibration session exceeds the size limit')
+    value = json.loads(path.read_text())
+    if set(value) != {'schema', 'version', 'frames'} or value['schema'] != 'xdart.stitch_calibration_session' or value['version'] != 1:
+        raise ValueError('unsupported calibration session')
+    if not 1 <= len(value['frames']) <= 32:
+        raise ValueError('invalid calibration frame count')
+    frames = tuple(CalibrationFrame(**{**row, 'shape': tuple(row['shape'])}) for row in value['frames'])
+    for frame in frames:
+        validate_frame_files(frame, require_points=frame.complete)
+    return frames
+
+
+def validate_frame_files(frame, *, require_points=True):
+    if _sha(frame.image_path) != frame.image_sha256:
+        raise ValueError(f'frame {frame.index}: staged image changed')
+    if require_points:
+        if not frame.complete:
+            raise ValueError(f'frame {frame.index}: matched PONI and NPT are required')
+        if _sha(frame.poni_path, 1 << 20) != frame.poni_sha256 or _sha(frame.npt_path, 4 << 20) != frame.npt_sha256:
+            raise ValueError(f'frame {frame.index}: saved PONI or control points changed')
+
+
+def load_control_frame(frame):
+    from pyFAI.control_points import ControlPoints
+    from xrd_tools.integrate.calibration import load_detector_calibration
+    validate_frame_files(frame)
+    calibration = load_detector_calibration(frame.poni_path)
+    points = ControlPoints(frame.npt_path)
+    values = [(y, x, points.get(lbl=label).ring)
+              for label in points.get_labels() for y, x in points.get(lbl=label).points]
+    if not values:
+        raise ValueError(f'frame {frame.index}: no control points')
+    values = np.asarray(values, dtype=float)
+    if not np.isfinite(values).all() or np.any(values < 0) or np.any(values[:, 0] >= frame.shape[0]) or np.any(values[:, 1] >= frame.shape[1]):
+        raise ValueError(f'frame {frame.index}: control points are outside the staged image')
+    if not np.all(values[:, 2] == values[:, 2].astype(int)):
+        raise ValueError('control point rings must be integer indices')
+    wl = float(points.calibrant.wavelength or 0)
+    if not math.isclose(wl, calibration.poni.wavelength, rel_tol=1e-6):
+        raise ValueError(f'frame {frame.index}: PONI and NPT wavelengths differ')
+    if frame.energy_eV is not None:
+        from xrd_tools.core.energy import energy_eV_to_wavelength_m
+        if not math.isclose(float(energy_eV_to_wavelength_m(frame.energy_eV)), wl, rel_tol=1e-3):
+            raise ValueError(f'frame {frame.index}: source energy and calibration wavelength differ')
+    control = ControlFrame(values[:, 0], values[:, 1], values[:, 2], frame.motors)
+    if control.rings.max() >= len(points.calibrant.dSpacing):
+        raise ValueError('control point ring has no calibrant d-spacing')
+    return control, points.calibrant, calibration
+
+
+def adopt_calibration_pair(frame, poni_path, npt_path):
+    """Import an explicitly matched pair, retaining independent local copies."""
+    import shutil
+    row = Path(frame.image_path).parent
+    token = uuid.uuid4().hex
+    poni = row / f'calibration-{token}.poni'
+    points = row / f'calibration-{token}.npt'
+    _sha(poni_path, 1 << 20); _sha(npt_path, 4 << 20)
+    shutil.copyfile(poni_path, poni)
+    shutil.copyfile(npt_path, points)
+    result = replace(frame, poni_path=str(poni), poni_sha256=_sha(poni),
+                     npt_path=str(points), npt_sha256=_sha(points))
+    load_control_frame(result)
+    return result
+
+
+@dataclass(frozen=True)
+class CalibrationFit:
+    backend: str
+    asset: dict
+    rms_q: float
+    condition_number: float
+    n_points: int
+    message: str
+
+
+def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_motor='nu',
+                    fit_scales=True, distance_seed_m=None, distance_bounds_m=None,
+                    max_rms_q=0.03, domain=None, distance_provenance=None, cancelled=None):
+    """Fit the matched rows and refuse unconverged, degenerate or poor fits."""
+    if not 3 <= len(frames) <= 32:
+        raise ValueError('fit requires at least three completed frames spanning the angles')
+    loaded = [load_control_frame(frame) for frame in frames]
+    controls, calibrants, calibrations = zip(*loaded)
+    base = calibrations[0]
+    for frame, cal, calibrant in zip(frames, calibrations, calibrants):
+        if frame.shape != frames[0].shape or frame.rotation != frames[0].rotation:
+            raise ValueError('all calibration frames must share shape and orientation')
+        if dict(cal.detector_config) != dict(base.detector_config) or cal.poni.detector != base.poni.detector:
+            raise ValueError('calibration frames have different detector configurations')
+        if not math.isclose(cal.poni.wavelength, base.poni.wavelength, rel_tol=1e-6) or not np.array_equal(calibrant.dSpacing, calibrants[0].dSpacing):
+            raise ValueError('calibration frames must share wavelength and calibrant')
+    if not math.isfinite(max_rms_q) or max_rms_q <= 0:
+        raise ValueError('maximum RMS must be finite and positive')
+    if cancelled is not None and cancelled.is_set():
+        raise InterruptedError('calibration fit cancelled')
+    if backend == 'multigeometry':
+        result = refine_goniometer(frames[0].poni_path, controls, rot1_motor=nu_motor,
+                                  rot2_motor=del_motor, calibrant=calibrants[0],
+                                  fit_scales=fit_scales, distance_seed_m=distance_seed_m,
+                                  distance_bounds_m=distance_bounds_m, cancelled=cancelled)
+        if not result.success or result.rms_q > max_rms_q:
+            raise ValueError(result.message or f'fit RMS {result.rms_q:.5g} exceeds {max_rms_q:g} Å⁻¹')
+        params = dict(result.params)
+        names = list(params)
+        # Standard pyFAI GeometryTransformation JSON, admitted by the existing
+        # importer with the page's del/nu source-motor mapping.
+        asset = {'content': 'Goniometer calibration v2', 'detector': base.poni.detector,
+                 'detector_config': dict(base.detector_config), 'wavelength': base.poni.wavelength,
+                 'param_names': names, 'param': list(params.values()),
+                 'pos_names': ['nu_angle', 'del_angle'],
+                 'trans_function': {'content': 'GeometryTransformation', 'param_names': names,
+                    'pos_names': ['nu_angle', 'del_angle'], 'dist_expr': 'dist', 'poni1_expr': 'poni1',
+                    'poni2_expr': 'poni2', 'rot1_expr': 'rot1_scale * nu_angle + rot1_offset',
+                    'rot2_expr': 'rot2_scale * del_angle + rot2_offset', 'rot3_expr': 'rot3_offset',
+                    'constants': {'pi': float(np.pi)}}}
+        if base.parallax is not None:
+            asset['parallax'] = base.parallax
+        rms, condition, count = result.rms_q, result.condition_number, result.n_points
+        message = 'Frozen motor scales: ' + ', '.join(result.frozen_scales) if result.frozen_scales else 'Converged'
+    elif backend == 'xu_hist':
+        asset, rms, condition, count = _fit_xu(frames, loaded, del_motor, nu_motor,
+            distance_seed_m, distance_bounds_m, max_rms_q, domain, cancelled)
+        message = 'Converged; fixed SURFACE camera x−, z+ and PSIC circle convention'
+    else:
+        raise ValueError('unknown calibration backend')
+    provenance = {'frames': [asdict(frame) for frame in frames], 'rms_q_A^-1': rms,
+                  'condition_number': condition, 'n_points': count,
+                  'distance_seed_m': distance_seed_m, 'distance_bounds_m': distance_bounds_m,
+                  'source_motors': ({'nu_angle': nu_motor, 'del_angle': del_motor}
+                                    if backend == 'multigeometry' else {'nu': nu_motor, 'del': del_motor}),
+                  'image_rotation': frames[0].rotation,
+                  'direct_beam': distance_provenance}
+    if backend == 'xu_hist':
+        seed = base.poni.dist if distance_seed_m is None else distance_seed_m
+        provenance['effective_distance_bounds_m'] = distance_bounds_m or (max(1e-5, seed * .5), seed * 1.5)
+    if cancelled is not None and cancelled.is_set():
+        raise InterruptedError('calibration fit cancelled')
+    # Provenance is a separate adjacent document for standard pyFAI files.
+    return CalibrationFit(backend, {'calibration': asset, 'provenance': provenance}, rms, condition, count, message)
+
+
+def _fit_xu(frames, loaded, del_motor, nu_motor, distance_seed_m, distance_bounds_m,
+            max_rms_q, domain, cancelled):
+    from scipy.optimize import least_squares
+    from pyFAI.detectors import detector_factory
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    base = loaded[0][2]
+    detector = detector_factory(base.poni.detector, config=dict(base.detector_config))
+    if detector.sensor is not None or base.parallax is True or not detector.IS_FLAT or not detector.uniform_pixel:
+        raise ValueError('authored SURFACE calibration requires a flat uniform detector without sensor/parallax')
+    shape = frames[0].shape
+    if tuple(detector.shape) != shape:
+        raise ValueError('PONI detector shape differs from the selected oriented image')
+    energy = float(wavelength_m_to_energy_eV(base.poni.wavelength))
+    pitch1, pitch2 = float(detector.pixel1), float(detector.pixel2)
+    seed_distance = base.poni.dist if distance_seed_m is None else float(distance_seed_m)
+    bounds = (max(1e-5, seed_distance * .5), seed_distance * 1.5) if distance_bounds_m is None else tuple(distance_bounds_m)
+    if not (0 < bounds[0] < bounds[1] and bounds[0] <= seed_distance <= bounds[1]):
+        raise ValueError('distance bounds require 0 < low < high and an enclosed seed')
+    seed = [base.poni.poni1 / pitch1, base.poni.poni2 / pitch2, seed_distance * 1e3, 0., 0.]
+    # Notebook SURFACE cell 11: five parameters, fixed circle/camera convention,
+    # physical bounds and direct ring-q residuals. Bounds scale with this panel.
+    lower = [-shape[0], -shape[1], bounds[0] * 1e3, -5., -5.]
+    upper = [2 * shape[0], 2 * shape[1], bounds[1] * 1e3, 5., 5.]
+    with xu_runtime_session() as runtime:
+        xu = runtime.xu
+        def residual(params):
+            if cancelled is not None and cancelled.is_set():
+                raise InterruptedError('calibration fit cancelled')
+            c1, c2, dist, do, no = params
+            qc = xu.QConversion(['x+', 'z-', 'y+', 'z-'], ['x+', 'z-'], [0, 1, 0])
+            hx = xu.HXRD([0, 1, 0], [0, 0, 1], geometry='real', en=energy, qconv=qc)
+            hx.Ang2Q.init_area('x-', 'z+', cch1=c1, cch2=c2, Nch1=shape[0], Nch2=shape[1],
+                              pwidth1=pitch1 * 1e3, pwidth2=pitch2 * 1e3, distance=dist)
+            out = []
+            for control, calibrant, _ in loaded:
+                qx, qy, qz = hx.Ang2Q.area(0., 0., 0., 0., control.motors[nu_motor] - no,
+                                          control.motors[del_motor] - do)
+                q = np.hypot(np.hypot(qx, qy), qz)
+                reference = 2 * np.pi / np.asarray(calibrant.dSpacing)[control.rings]
+                out.append(q[control.rows, control.cols] - reference)
+            return np.concatenate(out)
+        result = least_squares(residual, seed, bounds=(lower, upper), method='trf',
+                               max_nfev=300, xtol=1e-12, x_scale='jac')
+        xu_wavelength = float(xu.en2lam(energy))
+    rms = float(np.sqrt(np.mean(result.fun ** 2)))
+    singular = np.linalg.svd(result.jac, compute_uv=False)
+    condition = float(singular[0] / singular[-1]) if singular[-1] > 0 else float('inf')
+    if not result.success or not math.isfinite(condition) or condition > 1e8 or rms > max_rms_q:
+        raise ValueError(f'XU fit refused: {result.message}; RMS {rms:.5g} Å⁻¹; condition {condition:.3g}')
+    from xrd_tools.analysis.xu_stitch_calibration import authored_surface_calibration
+    params = [float(v) for v in result.x]
+    control_domain = {key: [min(f.motors[motor] for f in frames), max(f.motors[motor] for f in frames)]
+                      for key, motor in [('del', del_motor), ('nu', nu_motor)]}
+    asset = authored_surface_calibration(
+        detector=detector, cch1=params[0], cch2=params[1], distance_m=params[2] / 1e3,
+        del_offset_deg=params[3], nu_offset_deg=params[4], energy_eV=energy,
+        xu_wavelength_A=xu_wavelength, source_motors={'del': del_motor, 'nu': nu_motor},
+        rotation=frames[0].rotation, control_domain=control_domain,
+        domain=domain or control_domain, rms_q=rms, condition=condition,
+        n_frames=len(frames), n_points=len(result.fun))
+    return asset, rms, condition, len(result.fun)
+
+
+def save_calibration_fit(fit: CalibrationFit, path):
+    """Save only a successful fit, then reload through the actual admission owner."""
+    from xrd_tools.core.geometry import Diffractometer
+    path = Path(path).resolve()
+    provenance = path.with_suffix(path.suffix + '.provenance.json')
+    if path.exists() or provenance.exists():
+        raise FileExistsError('choose a new calibration filename; existing files are preserved')
+    calibration = fit.asset['calibration']
+    raw = json.dumps(calibration, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+    if fit.backend == 'xu_hist':
+        from xrd_tools.analysis.xu_stitch_calibration import parse_xu_stitch_calibration_bytes
+        parse_xu_stitch_calibration_bytes(raw)
+    else:
+        Diffractometer.from_pyfai_goniometer(calibration, source_motors={'nu_angle': 'nu', 'del_angle': 'del'})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('xb') as stream:
+        stream.write(raw)
+    with provenance.open('x') as stream:
+        json.dump(fit.asset['provenance'], stream, indent=2, allow_nan=False)
+    return str(path)
