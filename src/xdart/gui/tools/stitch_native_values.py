@@ -45,8 +45,14 @@ def prepare_native_stitch_tool(form, project):
     )
     output_dir = Path(form.output_path).parent
     _inside_project(form.output_path, project, "output")
-    if not output_dir.is_dir():
-        raise StitchToolPreflightRefused("OUTPUT_PARENT_UNAVAILABLE", "Choose an existing save directory")
+    # Native Save Path behaves like the integration workspace: materialize the
+    # requested directory before freezing finite output ancestry. This is the
+    # only Preview setup write; source/science qualification remains read-only.
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise StitchToolPreflightRefused("OUTPUT_PARENT_UNAVAILABLE", str(error)) from error
+    _inside_project(form.output_path, project, "output")
     for path in form.source_selection.paths:
         # The Project root itself is a valid directory input.
         if Path(path).resolve() != project:
