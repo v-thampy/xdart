@@ -20,7 +20,7 @@ from xrd_tools.io.output_transaction import OutputTransactionCoordinator
 from tests.core.test_analysis_artifact import _execution_attestation
 
 
-def _publish(tmp_path, *, unit="q_A^-1", xu=False):
+def _publish(tmp_path, *, unit="q_A^-1", xu=False, science_frame_count=3):
     project = tmp_path / "project"
     project.mkdir()
     raw = np.arange(24, dtype=np.int32).reshape(4, 6)
@@ -43,7 +43,7 @@ def _publish(tmp_path, *, unit="q_A^-1", xu=False):
     digest = hashlib.sha256(b"native-stitch-test").hexdigest()
     extra = {}
     if xu:
-        attestation = _execution_attestation(digest, projection.result_fingerprint, frame_count=3)
+        attestation = _execution_attestation(digest, projection.result_fingerprint, frame_count=science_frame_count)
         extra = dict(execution_attestation=attestation,
             execution_attestation_digest=analysis_execution_attestation_digest(
                 AnalysisArtifactKind.STITCH_1D, attestation, request_fingerprint=digest))
@@ -55,6 +55,12 @@ def _publish(tmp_path, *, unit="q_A^-1", xu=False):
         provenance=request.provenance_json, bounded_artifact=True, wavelength_A=1.0,
         frame_records=records, source_base=project))
     return request.target, raw, project, receipt
+
+
+def test_contributors_must_match_attested_science_frame_count(tmp_path):
+    with pytest.raises(AnalysisArtifactInvalid, match="science execution count"):
+        _publish(tmp_path, xu=True, science_frame_count=2)
+    assert not (tmp_path / "stitched.nexus").exists()
 
 
 @pytest.mark.parametrize("unit", ["q_A^-1", "2th_deg"])

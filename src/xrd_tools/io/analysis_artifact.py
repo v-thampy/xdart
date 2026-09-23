@@ -2415,6 +2415,13 @@ def inspect_analysis_artifact(
                     wavelength_A, frame_manifest_json = inspect_native_stitch_auxiliary(
                         entry, result, json.loads(provenance), axes[0][1], axis_units[0][1],
                     )
+                    if execution_attestation_json is not None and (
+                        len(json.loads(frame_manifest_json)["records"])
+                        != json.loads(execution_attestation_json)["selected_frame_count"]
+                    ):
+                        raise AnalysisArtifactInvalid(
+                            "contributing frames differ from the science execution count"
+                        )
                 projection = project_analysis_artifact_result(
                     wavelength_A=wavelength_A,
                     _frame_manifest_json=frame_manifest_json,
