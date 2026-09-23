@@ -6,6 +6,7 @@ No integration, plotting, GUI, file writes or calibration-asset construction.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 import copy
 from pathlib import Path
@@ -15,6 +16,7 @@ import numpy as np
 from scipy.optimize import OptimizeWarning, curve_fit
 
 from xrd_tools.core.geometry.diffractometer import ImageOrientation
+from xrd_tools.core.scan import FrameSource, ScanFrame
 from xrd_tools.integrate.calibration import get_detector
 from xrd_tools.io.image import read_image
 
@@ -54,6 +56,20 @@ class DirectBeamResult:
     @property
     def motion_sign(self) -> int:
         return int(np.sign(self.slope_deg_per_pixel))
+
+
+@dataclass(frozen=True)
+class DirectBeamScanInput:
+    """Source inputs valid inside :func:`open_direct_beam_scan`'s context.
+
+    Images are lazy; the caller still supplies detector, beam pixel and fit
+    settings. ``frame_ids=None`` lets the fitter retain explicit image references.
+    """
+
+    angles_deg: np.ndarray
+    images: Iterable
+    frame_ids: tuple | None
+    point_ids: tuple
 
 
 def _uniform_flat(detector):
@@ -166,7 +182,8 @@ def calibrate_direct_beam(
 ) -> DirectBeamResult:
     """Fit distance from explicit degree angles and ordered images/references.
 
-    An item is a 2-D array, path, ``(path, frame)`` or ``(path, frame, dataset)``;
+    An item is a 2-D array, lazy ``ScanFrame``, path, ``(path, frame)`` or
+    ``(path, frame, dataset)``;
     ``None`` denotes a missing frame. References use ``read_image`` with exact
     frame selection. ``reader_options`` accepts raw dtype/header/shape and HDF
     dataset/frame options, never image transforms or masking.
@@ -250,12 +267,16 @@ def calibrate_direct_beam(
             item = next(iterator)
         except StopIteration as exc:
             raise ValueError('image and angle lengths differ') from exc
-        references.append(index if isinstance(item,np.ndarray) or item is None else item)
+        reference = ((item.source_identity, item.index) if isinstance(item, ScanFrame)
+                     else index if isinstance(item, np.ndarray) or item is None else item)
+        references.append(reference)
         try:
             if item is None:
                 raise ValueError('missing frame')
             if isinstance(item,np.ndarray):
                 image = item
+            elif isinstance(item, ScanFrame):
+                image = item.load_image()
             else:
                 opts = options.copy()
                 path = item
@@ -344,37 +365,161 @@ def calibrate_direct_beam(
         effective_shape,slope_deg,float(intercept_px))
 
 
-def calibrate_direct_beam_scan(
-    scan_file: str | Path, scan: str | int, *, images: Iterable | None = None,
+@contextmanager
+def open_direct_beam_scan(
+    scan_file: str | Path | FrameSource, scan: str | int | None = None, *,
+    images: Iterable | None = None, image_file: str | Path | None = None,
     image_dir: str | Path | None = None, filename_template: str | None = None,
-    point_index_origin: int = 0, motor: str = 'del', **calibration_options,
-) -> DirectBeamResult:
-    """Thin SPEC adapter; ``scan=23`` means key ``'23.1'``, never list index.
+    point_index_origin: int = 0, motor: str = 'del',
+    angles_deg: Sequence[float] | None = None,
+    frame_indices: Sequence[int] | None = None, entry: str = 'entry',
+):
+    """Load paired angles and lazy images from SPEC, raw NeXus or FrameSource.
 
-    Supply ordered ``images`` OR ``image_dir`` and an explicit filename template
-    with ``{point}`` (and optionally ``{scan}``, ``{repetition}``). Row numbers
-    start at ``point_index_origin``; no missing-path discovery or renumbering.
-    All numerical/reader options pass to :func:`calibrate_direct_beam`.
+    SPEC requires an exact scan number/repetition and either ``image_file``
+    (an Eiger/NeXus container), ordered ``images``, or ``image_dir`` plus a
+    filename template. Raw NeXus needs no scan selector; the existing metadata
+    reader supplies ``motor``, or ``angles_deg`` supplies explicit degree angles.
+    Beam pixel, mask, detector and acquisition cutoff are never inferred here.
+
+    ``frame_indices`` selects ordered original labels (zero-based for files),
+    and their corresponding metadata rows. Automatic whole-container pairing
+    requires equal counts; an explicit subset requires only its paired rows.
+    For an arbitrary different angle/frame association use the numerical API.
+    Explicit ``images`` already defines its own order and cannot be reselected.
+
+    A caller-owned FrameSource supplies raw frames and either ``motors`` arrays,
+    per-frame ``metadata_for`` values, or explicit ``angles_deg`` aligned with
+    its full ``frame_indices`` order. Its name/path labels provenance; callers
+    can override IDs in the fitter. It is never closed here. Container handles
+    opened here close on context exit, including errors. Consume images inside
+    the context. Units and detector-arm motor meaning remain caller choices.
     """
-    from xrd_tools.io.spec import read_spec_scan_table
-    key = str(scan)
-    if '.' not in key:
-        key += '.1'
-    columns,_,count = read_spec_scan_table(scan_file,key)
-    if motor not in columns:
-        raise ValueError(f'{motor!r} is not a scanned column in SPEC {key}')
-    if not isinstance(point_index_origin,int):
+    from xrd_tools.io.spec import is_spec_file, read_spec_scan_table
+    from xrd_tools.io.nexus import read_nexus
+    from xrd_tools.sources.cursor import ContainerCursor
+
+    if not isinstance(point_index_origin, int):
         raise ValueError('point_index_origin must be an integer')
-    points = tuple((key,i+point_index_origin) for i in range(count))
-    if images is None:
-        if image_dir is None or filename_template is None or '{point' not in filename_template:
-            raise ValueError('supply images or image_dir and filename_template with {point}')
-        number,repetition = key.split('.')
-        images = (Path(image_dir)/filename_template.format(point=point,scan=int(number),
-                   repetition=int(repetition)) for _,point in points)
-    elif image_dir is not None or filename_template is not None:
-        raise ValueError('supply either images or image_dir/filename_template')
-    return calibrate_direct_beam(columns[motor],images,point_ids=points,**calibration_options)
+    template_input = image_dir is not None or filename_template is not None
+    if sum((images is not None, image_file is not None, template_input)) > 1:
+        raise ValueError('supply only one of images, image_file, or image_dir/filename_template')
+    with ExitStack() as resources:
+        key = None
+        references = False
+        if isinstance(scan_file, FrameSource):
+            if scan is not None or images is not None or image_file is not None or template_input:
+                raise ValueError('FrameSource already supplies images; no scan or image options allowed')
+            labels = tuple(scan_file.frame_indices)
+            identity = getattr(scan_file, 'path', getattr(scan_file, 'name', 'source'))
+            load = scan_file.load_frame
+            if angles_deg is None:
+                motors = getattr(scan_file, 'motors', {})
+                if motor in motors:
+                    angles_deg = motors[motor]
+                else:
+                    metadata = getattr(scan_file, 'metadata_for', None)
+                    if metadata is None:
+                        raise ValueError(f'source has no {motor!r} metadata; supply angles_deg')
+                    try:
+                        angles_deg = [metadata(label)[motor] for label in labels]
+                    except KeyError as exc:
+                        raise ValueError(f'source has no {motor!r} angle column') from exc
+        else:
+            path = Path(scan_file)
+            if scan is not None or is_spec_file(path):
+                if scan is None:
+                    raise ValueError('SPEC input requires an explicit scan number/repetition')
+                if angles_deg is not None:
+                    raise ValueError('SPEC supplies angles; use the numerical API for explicit angles')
+                key = str(scan)
+                if '.' not in key:
+                    key += '.1'
+                columns, _, count = read_spec_scan_table(path, key)
+                if motor not in columns:
+                    raise ValueError(f'{motor!r} is not a scanned column in SPEC {key}')
+                angles_deg = columns[motor]
+                if images is not None:
+                    if frame_indices is not None:
+                        raise ValueError('explicit images already select their rows; omit frame_indices')
+                    yield DirectBeamScanInput(np.array(angles_deg, dtype=float), images, None,
+                        tuple((key, i + point_index_origin) for i in range(count)))
+                    return
+                if image_file is None:
+                    if image_dir is None or filename_template is None or '{point' not in filename_template:
+                        raise ValueError('supply image_file, images, or image_dir/template with {point}')
+                    number, repetition = key.split('.')
+                    labels = tuple(range(count))
+                    identity = path
+                    def load(index):
+                        return Path(image_dir) / filename_template.format(
+                            point=index + point_index_origin, scan=int(number), repetition=int(repetition))
+                    references = True
+                else:
+                    path = Path(image_file)
+            else:
+                if images is not None or image_file is not None or template_input:
+                    raise ValueError('NeXus input already supplies images; omit image options')
+                if angles_deg is None:
+                    metadata = read_nexus(path, entry, motor_names=[motor], counter_names=[])
+                    if motor not in metadata.angles:
+                        raise ValueError(f'NeXus has no {motor!r} angle column; supply angles_deg')
+                    angles_deg = metadata.angles[motor]
+            if not references:
+                cursor = resources.enter_context(ContainerCursor(path, entry=entry))
+                labels = tuple(range(cursor.frame_count))
+                identity, load = path, cursor.read_frame
+
+        angles = np.array(angles_deg, dtype=float, copy=True)
+        if angles.ndim != 1 or not np.isfinite(angles).all():
+            raise ValueError('angles_deg must be a finite one-dimensional array')
+        if frame_indices is None and len(angles) != len(labels):
+            raise ValueError(f'angle/image count mismatch: {len(angles)} angles, {len(labels)} frames')
+        selected = labels if frame_indices is None else tuple(frame_indices)
+        if (any(isinstance(i, (bool, np.bool_)) or not isinstance(i, (int, np.integer)) for i in selected)
+                or len(set(selected)) != len(selected)):
+            raise ValueError('frame_indices must contain unique integer labels')
+        positions = {label: i for i, label in enumerate(labels)}
+        if any(label not in positions for label in selected):
+            raise ValueError('selected frame label is absent from source')
+        rows = [positions[label] for label in selected]
+        if any(row >= len(angles) for row in rows):
+            raise ValueError('selected frame has no corresponding angle row')
+        points = (tuple((key, row + point_index_origin) for row in rows) if key is not None
+                  else tuple((identity, label) for label in selected))
+        if references:
+            image_items = (load(label) for label in selected)
+            ids = None
+        else:
+            image_items = (ScanFrame(index=label, source_identity=str(identity),
+                loader=lambda frame: load(frame.index)) for label in selected)
+            ids = tuple((identity, label) for label in selected)
+        yield DirectBeamScanInput(angles[rows], image_items, ids, points)
 
 
-__all__ = ['DirectBeamResult','calibrate_direct_beam','calibrate_direct_beam_scan']
+def calibrate_direct_beam_scan(
+    scan_file: str | Path | FrameSource, scan: str | int | None = None, *,
+    images: Iterable | None = None, image_file: str | Path | None = None,
+    image_dir: str | Path | None = None, filename_template: str | None = None,
+    point_index_origin: int = 0, motor: str = 'del',
+    angles_deg: Sequence[float] | None = None,
+    frame_indices: Sequence[int] | None = None, entry: str = 'entry',
+    **calibration_options,
+) -> DirectBeamResult:
+    """One-call wrapper around source loading and the numerical distance fit.
+
+    See :func:`open_direct_beam_scan` for sources/selection and
+    :func:`calibrate_direct_beam` for detector, explicit beam pixel and fit options.
+    Existing SPEC calls retain their scan-number/repetition and image semantics.
+    """
+    with open_direct_beam_scan(scan_file, scan, images=images, image_file=image_file,
+            image_dir=image_dir, filename_template=filename_template,
+            point_index_origin=point_index_origin, motor=motor, angles_deg=angles_deg,
+            frame_indices=frame_indices, entry=entry) as inputs:
+        calibration_options.setdefault('frame_ids', inputs.frame_ids)
+        calibration_options.setdefault('point_ids', inputs.point_ids)
+        return calibrate_direct_beam(inputs.angles_deg, inputs.images, **calibration_options)
+
+
+__all__ = ['DirectBeamResult', 'DirectBeamScanInput', 'open_direct_beam_scan',
+           'calibrate_direct_beam', 'calibrate_direct_beam_scan']

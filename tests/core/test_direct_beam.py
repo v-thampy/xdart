@@ -324,6 +324,169 @@ def test_nexus_native_references_and_streams_preserve_selected_rows(tmp_path, la
         np.testing.assert_array_equal(result.angles_deg, angles[list(selected)])
         np.testing.assert_allclose(result.centres_px, raw.centres_px, atol=1e-6, rtol=0)
         assert result.distance_mm == pytest.approx(80., rel=1e-4)
+    if layout == 'bluesky':
+        automatic = calibrate_direct_beam_scan(path, detector='Detector', detector_config=config(),
+            beam_pixel=(80, 22), angle_zero_deg=7., mask=mask, saturation=200000)
+        assert automatic.used.all()
+        np.testing.assert_array_equal(automatic.angles_deg, angles)
+
+
+@pytest.fixture
+def direct_beam_sources(tmp_path):
+    import h5py
+    angles = np.array([8., 7.5, 7., 6.5, 6.])
+    images = (np.asarray(beam_images(angles)[0]) * 25).astype('uint32')
+    images[:, 22, 12] = np.iinfo('uint32').max
+    mask = np.zeros(images.shape[1:], bool)
+    mask[22, 12] = True
+    spec = tmp_path / 'beam.spec'
+    spec.write_text('#F beam\n#O0 eta\n\n#S 8 ascan del 8 6 4 1\n#P0 0\n#N 1\n#L del\n'
+                    + '\n'.join(str(a) for a in angles) + '\n')
+    nexus = tmp_path / 'beam.nxs'
+    with h5py.File(nexus, 'w') as f:
+        f.create_group('entry').attrs['NX_class'] = 'NXentry'
+        f['entry/data/del'] = angles
+        f['entry/data/image'] = images
+    master = tmp_path / 'beam_master.h5'
+    with h5py.File(master, 'w') as f:
+        f.create_group('entry').attrs['NX_class'] = 'NXentry'
+        f['entry/data/data_000001'] = h5py.ExternalLink(nexus.name, '/entry/data/image')
+        f['entry/instrument/detector/detectorSpecific/nimages'] = 1
+    options = dict(detector='Detector', detector_config=config(),
+                   beam_pixel=(71, 22), angle_zero_deg=7., mask=mask, saturation=200000)
+    return spec, nexus, master, angles, options
+
+
+@pytest.mark.parametrize('kind', ['spec_eiger', 'nexus', 'explicit_eiger'])
+def test_single_scan_wrapper_loads_sources(direct_beam_sources, kind):
+    spec, nexus, master, angles, options = direct_beam_sources
+    if kind == 'spec_eiger':
+        result = calibrate_direct_beam_scan(spec, '8.1', image_file=master, **options)
+        assert result.point_ids == tuple(('8.1', i) for i in range(5))
+    elif kind == 'nexus':
+        result = calibrate_direct_beam_scan(nexus, **options)
+    else:
+        result = calibrate_direct_beam_scan(master, angles_deg=angles, **options)
+    path = nexus if kind == 'nexus' else master
+    assert result.frame_ids == tuple((path, i) for i in range(5))
+    np.testing.assert_array_equal(result.angles_deg, angles)
+    assert result.used.all()
+    assert result.distance_mm == pytest.approx(80., rel=1e-4)
+    assert result.intercept_px == pytest.approx(80., abs=.001)  # Free, not beam x=71.
+
+
+def test_source_loader_is_lazy_closes_and_preserves_subset(direct_beam_sources):
+    import h5py
+    from xrd_tools.integrate import open_direct_beam_scan
+    spec, nexus, master, angles, options = direct_beam_sources
+    before = h5py.h5f.get_obj_count()
+    with open_direct_beam_scan(spec, '8.1', image_file=master,
+                               frame_indices=(4, 0, 2)) as inputs:
+        frames = list(inputs.images)
+        assert all(frame.image is None for frame in frames)
+        np.testing.assert_array_equal(inputs.angles_deg, angles[[4, 0, 2]])
+        assert inputs.frame_ids == tuple((master, i) for i in (4, 0, 2))
+        assert inputs.point_ids == tuple(('8.1', i) for i in (4, 0, 2))
+        result = calibrate_direct_beam(inputs.angles_deg, frames,
+            frame_ids=inputs.frame_ids, point_ids=inputs.point_ids, **options)
+        assert result.used.all()
+    assert h5py.h5f.get_obj_count() == before
+    with pytest.raises(ValueError):
+        calibrate_direct_beam_scan(nexus, **{**options, 'beam_pixel': (-1, -1)})
+    assert h5py.h5f.get_obj_count() == before
+
+
+def test_source_wrapper_count_mismatch_and_explicit_subset(direct_beam_sources):
+    import h5py
+    spec, nexus, master, angles, options = direct_beam_sources
+    with h5py.File(nexus, 'r+') as f:
+        del f['entry/data/del']
+        f['entry/data/del'] = angles[:4]
+    with pytest.raises(ValueError, match='count'):
+        calibrate_direct_beam_scan(nexus, **options)
+    result = calibrate_direct_beam_scan(nexus, frame_indices=(3, 0, 2), **options)
+    np.testing.assert_array_equal(result.angles_deg, angles[[3, 0, 2]])
+    assert result.frame_ids == tuple((nexus, i) for i in (3, 0, 2))
+    with pytest.raises(ValueError, match='angle'):
+        calibrate_direct_beam_scan(nexus, frame_indices=(0, 2, 4), **options)
+
+
+def test_source_wrapper_rejects_missing_motor_and_conflicting_inputs(direct_beam_sources):
+    spec, nexus, master, angles, options = direct_beam_sources
+    with pytest.raises(ValueError, match='del'):
+        calibrate_direct_beam_scan(master, **options)
+    with pytest.raises(ValueError, match='eta'):
+        calibrate_direct_beam_scan(spec, 8, motor='eta', image_file=master, **options)
+    with pytest.raises(ValueError, match='either|only one'):
+        calibrate_direct_beam_scan(spec, 8, images=(), image_file=master, **options)
+
+
+def test_frame_source_labels_metadata_and_read_rejections(tmp_path):
+    import tifffile
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.sources import MemoryFrameSource
+    angles = [8., 7.5, 7., 6.5, 6.]
+    labels = (10, 20, 30, 40, 50)
+    frames = []
+    for label, angle, image in zip(labels, angles, beam_images(angles)[0]):
+        path = tmp_path / f'{label}.tif'
+        if label != 30:
+            tifffile.imwrite(path, image.astype('float32'))
+        frames.append(ScanFrame(index=label, source_path=path, metadata={'del': angle}))
+    source = MemoryFrameSource(frames, name='run-uid')
+    result = calibrate_direct_beam_scan(source, detector='Detector', detector_config=config(),
+                                       beam_pixel=(80, 22), angle_zero_deg=7.)
+    assert result.frame_ids == tuple(('run-uid', label) for label in labels)
+    assert result.point_ids == result.frame_ids
+    np.testing.assert_array_equal(result.angles_deg, angles)
+    np.testing.assert_array_equal(result.used, [1, 1, 0, 1, 1])
+    assert 'FileNotFoundError' in result.rejection_reasons[2]
+    assert source.load_frame(10).shape == (45, 161)  # Caller still owns its source.
+
+
+def test_caller_source_explicit_angles_and_original_labels():
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.sources import MemoryFrameSource
+    angles = np.array([8., 7.5, 7., 6.5, 6.])
+    labels = (10, 20, 30, 40, 50)
+    source = MemoryFrameSource([ScanFrame(index=i, image=image)
+        for i, image in zip(labels, beam_images(angles)[0])], name='remote-run-uid')
+    result = calibrate_direct_beam_scan(source, angles_deg=angles, frame_indices=(50, 10, 30),
+        detector='Detector', detector_config=config(), beam_pixel=(80, 22), angle_zero_deg=7.)
+    np.testing.assert_array_equal(result.angles_deg, angles[[4, 0, 2]])
+    assert result.frame_ids == tuple(('remote-run-uid', i) for i in (50, 10, 30))
+    assert result.used.all()
+
+
+def test_caller_cursor_remains_open_and_nondefault_entry(direct_beam_sources):
+    import h5py
+    from xrd_tools.sources import ContainerCursor, NexusStackSource
+    _, nexus, master, angles, options = direct_beam_sources
+    with ContainerCursor(master) as cursor:
+        source = NexusStackSource(master, cursor=cursor)
+        result = calibrate_direct_beam_scan(source, angles_deg=angles, **options)
+        assert result.used.all()
+        assert cursor.read_frame(0).dtype == np.dtype('uint32')
+    with h5py.File(nexus, 'r+') as f:
+        f.move('entry', 'measurement')
+    result = calibrate_direct_beam_scan(nexus, entry='measurement', **options)
+    assert result.used.all()
+    np.testing.assert_array_equal(result.angles_deg, angles)
+
+
+def test_nexus_angle_read_does_not_materialize_images(direct_beam_sources, monkeypatch):
+    import h5py
+    from xrd_tools.io.nexus import read_nexus
+    _, nexus, _, angles, _ = direct_beam_sources
+    reads = []
+    original = h5py.Dataset.__array__
+    def observed_read(dataset, *args, **kwargs):
+        reads.append(dataset.name)
+        return original(dataset, *args, **kwargs)  # Spy only; actual HDF5 reads.
+    monkeypatch.setattr(h5py.Dataset, '__array__', observed_read)
+    result = read_nexus(nexus, motor_names=['del'], counter_names=[])
+    np.testing.assert_array_equal(result.angles['del'], angles)
+    assert '/entry/data/image' not in reads
 
 
 def test_import_is_lazy_and_headless():

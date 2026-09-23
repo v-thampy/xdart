@@ -1,9 +1,14 @@
 # Direct-beam distance calibration
 
-`xrd_tools.integrate.calibrate_direct_beam` accepts degree angles and an ordered
-iterable of arrays or image references. `calibrate_direct_beam_scan` reads one
-SPEC scan and calls the same numerical owner. Both return `DirectBeamResult`;
-neither writes files, plots, changes application state or constructs a PONI.
+Three functions separate source handling from the numerical fit:
+
+- `calibrate_direct_beam(angles_deg, images, ...)` fits explicit inputs.
+- `open_direct_beam_scan(source, ...)` extracts paired angles and lazy images.
+- `calibrate_direct_beam_scan(source, ...)` combines both in one call, returning
+  `DirectBeamResult` and closing the files it opened.
+
+They use existing readers, write no files, and construct no GUI or PONI. The
+numerical options and result are the same for SPEC, Eiger and NeXus inputs.
 
 ## Geometry and coordinates
 
@@ -101,18 +106,14 @@ Only one frame is processed at a time; results retain scalar summaries, not imag
 
 ### Eiger masters with SPEC angles
 
-An Eiger master is already a supported image reference: `read_image` resolves
-its ExternalLinks. Count acquired images with `open_nexus_image_stack`, not the
-master's `nimages` or configured trigger count. For automatic all-frame pairing,
-the caller should check that this count equals the SPEC row count before calling
-`calibrate_direct_beam_scan`. Do not silently trim either sequence. Deliberate
-subsets can use `calibrate_direct_beam` with the corresponding selected angles
-and original `point_ids` and `frame_ids`, in the same order.
+Pass the master directly; the wrapper reads the SPEC angles, counts actual
+acquired images through the existing container reader, and streams exact frames.
+It resolves ExternalLinks and rejects mismatched all-frame counts without trimming.
+The master's `nimages` and configured trigger count are not used as acquired counts.
 
 ```python
-frame_refs = tuple((master_file, i) for i in range(frame_count))
 result = calibrate_direct_beam_scan(
-    scan_file, "8.1", motor="del", images=frame_refs,
+    scan_file, "8.1", motor="del", image_file=master_file,
     detector="Eiger2_500k", beam_pixel=(514, 256), angle_zero_deg=0.0,
     mask=pixel_mask, saturation=corrected_count_cutoff,
 )
@@ -126,42 +127,66 @@ uint32 image can legitimately exceed 65535 despite a 16-bit readout header.
 Masking in an existing `read_image(..., mask=pixel_mask)` generator remains valid;
 pre-masking is not required for native file references.
 
-### NeXus metadata and lazy sources
+### NeXus images and angles in one file
 
-For supported Bluesky/NXWriter NeXus files, the existing `ContainerCursor` owns
-both image reads and scanned-motor metadata. Keep it open while fitting:
+Omit the SPEC scan number. The wrapper uses `read_nexus` for the requested motor
+column and `ContainerCursor` for native image frames:
 
 ```python
-from xrd_tools.integrate import calibrate_direct_beam
-from xrd_tools.sources import ContainerCursor
+result = calibrate_direct_beam_scan(
+    nexus_file, motor="del",
+    detector="Eiger2_500k", beam_pixel=(514, 256), angle_zero_deg=0.0,
+    mask=pixel_mask, saturation=corrected_count_cutoff,
+)
+```
 
-with ContainerCursor(nexus_file) as cursor:
-    angles_deg = cursor.metadata_provider().motors()["del"]
-    if len(angles_deg) != cursor.frame_count:
-        raise ValueError("angle and detector-frame counts differ")
-    labels = tuple(range(cursor.frame_count))
-    ids = tuple((str(nexus_file), i) for i in labels)
+The existing reader supports Bluesky/NXWriter and generic NeXus motor tables
+under `data`, `scan_data`, or sample positioners. Use `entry="measurement"` for
+a nondefault NXentry. A metadata-free Eiger/NeXus stack can instead be passed as
+`calibrate_direct_beam_scan(master_file, angles_deg=angles_deg, ...)`.
+
+The caller must establish that the chosen motor is the detector arm and its
+values are degrees. An absent motor is not replaced with a sample motor or a
+constant header position. Detector choice, explicit beam pixel, masks, acquisition
+cutoff and known angular zero stay in the fit options for every input format.
+
+`frame_indices=(0, 25, 50)` selects original frame labels and corresponding angle
+rows, in that order. This explicit subset need not cover the whole container;
+only the selected pairs must exist. File labels are zero-based and SPEC point IDs
+retain their scan/repetition and original row. To associate different image and
+angle indices, use the numerical function with explicitly matched sequences.
+`reader_options` applies to explicit file references and filename templates;
+the container route uses the shared native reader and the selected NXentry.
+
+### Source loading separately, including future adapters
+
+The loader is available when a caller needs to inspect or fit the inputs itself:
+
+```python
+from xrd_tools.integrate import open_direct_beam_scan, calibrate_direct_beam
+
+with open_direct_beam_scan(nexus_file, motor="del") as inputs:
     result = calibrate_direct_beam(
-        angles_deg, (cursor.read_frame(i) for i in labels),
-        frame_ids=ids, point_ids=ids,
+        inputs.angles_deg, inputs.images,
+        frame_ids=inputs.frame_ids, point_ids=inputs.point_ids,
         detector="Eiger2_500k", beam_pixel=(514, 256), angle_zero_deg=0.0,
         mask=pixel_mask, saturation=corrected_count_cutoff,
     )
 ```
 
-The caller must establish that the chosen motor is the detector arm and its
-values are degrees. Plain NeXus/Eiger files without supported scanned-motor
-metadata require explicit angles or the SPEC adapter; a constant motor or a
-different sample motor is not a replacement. For other detector dataset layouts,
-use explicit `(path, frame, dataset_path)` references.
+`DirectBeamScanInput` holds angles, images, frame IDs and point IDs. Consume its
+images inside the context: file handles close on both success and failure. Lazy
+`ScanFrame` inputs defer source reads until the numerical owner's per-row error
+handler, retaining the failed row and its original read-error reason.
 
-The same numerical API can consume a future Tiled image source: supply an ordered
-lazy iterable of native-dtype NumPy frames, matched angles, and stable identities
-such as `(run_uid, original_event_id)`. Connection, field selection and remote
-fetching stay with the source/caller. The current Tiled reader supplies metadata,
-not an image adapter; do not route detector images through scalar counters.
-Yield `None` for an explicitly known missing row to retain its rejection and
-identity. An exception raised by the generator itself propagates to the caller.
+Both loader and wrapper also accept an existing `FrameSource`. Its original
+`frame_indices` identify rows; angles come from `motors`, `metadata_for`, or an
+explicit `angles_deg` array aligned with the full source label order. This is
+the extension point for a future Tiled adapter. Source names should be stable
+run identities; the fitter/wrapper also accepts explicit `frame_ids`/`point_ids`.
+Caller-owned sources remain open. No Tiled image/network adapter is bundled yet.
+Existing arrays and arbitrary generators remain valid numerical inputs; generator
+exceptions outside a lazy `ScanFrame` load still propagate to the caller.
 
 ## Rejections, fit quality and uncertainty
 

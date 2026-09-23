@@ -5105,6 +5105,8 @@ def _read_data_group(
             # user-selected foreign file.  ``dtype.kind`` is metadata — no read.
             if getattr(obj.dtype, "kind", "O") not in "fiub":
                 continue
+            if obj.ndim != 1:
+                continue  # Metadata reads must not materialize detector stacks.
             try:
                 arr = np.asarray(obj, dtype=float)
             except (TypeError, ValueError, OSError):
