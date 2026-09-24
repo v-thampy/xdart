@@ -19,6 +19,7 @@ from xrd_tools.analysis.xu_stitch_calibration import (
     XuStitchCalibrationInput, capture_xu_stitch_calibration,
 )
 from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+from xrd_tools.integrate.frame_screen import FrameScreenPolicy
 from xrd_tools.integrate.xu_stitch import resolve_xu_stitch_effective_geometry
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind
 from xrd_tools.io.output_path import is_artifact_family, resolve_finite_output_target
@@ -161,14 +162,19 @@ def prepare_native_stitch_tool(form, project):
     families = _families(form, resolution, project)
     common = dict(npt_1d=form.npt_1d, unit=form.unit, radial_range=form.q_range,
                   monitor_selector=form.monitor_selector, max_frame_bytes=form.max_frame_bytes,
-                  native_records=True, conditioning=form.conditioning, mask_path=form.mask_path)
+                  native_records=True, conditioning=form.conditioning, mask_path=form.mask_path,
+                  frame_screen=FrameScreenPolicy(exclude=form.frame_screen))
     if form.backend == "multigeometry":
         geometry = capture_stitch_geometry(StitchGeometryInput(
             form.geometry_path, form.geometry_kind,
             expected_sha256=form.expected_geometry_sha256, source_motors=form.source_motors,
             reference_motor_positions=form.poni_references, image_rotation=form.image_rotation,
         ))
-        plan = StitchOperationPlan(geometry, use_detector_mask=form.use_detector_mask, **common)
+        plan = StitchOperationPlan(
+            geometry, use_detector_mask=form.use_detector_mask,
+            sample_position=form.sample_position, correct_solid_angle=form.correct_solid_angle,
+            polarization_factor=form.polarization_factor, error_model=form.error_model,
+            dark_path=form.dark_path, flat_path=form.flat_path, **common)
         motors = tuple(source for _name, source in form.source_motors)
         energy_name = "energy"
     else:

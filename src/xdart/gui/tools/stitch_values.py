@@ -32,6 +32,8 @@ from xrd_tools.analysis.scan_operations import (
     run_metadata_table,
 )
 from xrd_tools.analysis.stitch_operation import (
+    SAMPLE_POSITIONS,
+    STITCH_ERROR_MODELS,
     StitchGeometryInput,
     StitchGeometryKind,
     StitchOperationPlan,
@@ -41,6 +43,7 @@ from xrd_tools.analysis.stitch_operation import (
     capture_stitch_geometry,
     prepare_stitch_operation,
 )
+from xrd_tools.integrate.frame_screen import EXCLUDE_CHOICES
 from xrd_tools.analysis.xu_stitch_calibration import (
     XuStitchCalibrationInput,
     XuStitchCalibrationRefused,
@@ -255,6 +258,15 @@ class StitchToolForm:
     mask_path: str | None = None
     output_family: str | None = None
     output_families: tuple[str, ...] = ()
+    #: Native options: dropped-frame check, sample position and the pyFAI
+    #: corrections. The XU backend takes the frame check only.
+    frame_screen: str = "empty"
+    sample_position: str = "calibrated"
+    correct_solid_angle: bool = True
+    polarization_factor: float | None = 0.99
+    error_model: str | None = None
+    dark_path: str | None = None
+    flat_path: str | None = None
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -281,6 +293,7 @@ class StitchToolForm:
             raise ValueError("native processing requires a native source selection")
         if self.mask_path is not None:
             object.__setattr__(self, "mask_path", _absolute_path(self.mask_path, "mask path"))
+        self._native_options(native)
         if not native and Path(spec).suffix:
             raise ValueError("Stitch SPEC path must be extensionless")
         if Path(output).suffix.casefold() != ".nexus":
@@ -465,12 +478,42 @@ class StitchToolForm:
                          self.source_selection.fingerprint_value, self.unit,
                          None if self.conditioning is None else
                          (self.conditioning.mode, self.conditioning.threshold_min, self.conditioning.threshold_max),
-                         self.mask_path, self.output_family, self.output_families)
+                         self.mask_path, self.output_family, self.output_families,
+                         ("native-options-v1", self.frame_screen, self.sample_position,
+                          self.correct_solid_angle, self.polarization_factor, self.error_model,
+                          self.dark_path, self.flat_path))
         object.__setattr__(
             self,
             "fingerprint",
             analysis_canonical_fingerprint(domain, canonical),
         )
+
+    def _native_options(self, native: bool) -> None:
+        if self.frame_screen not in EXCLUDE_CHOICES:
+            raise ValueError(f"frame check must be one of {EXCLUDE_CHOICES}")
+        if self.sample_position not in SAMPLE_POSITIONS:
+            raise ValueError(f"sample position must be one of {SAMPLE_POSITIONS}")
+        if type(self.correct_solid_angle) is not bool:
+            raise TypeError("solid angle correction must be an exact bool")
+        factor = self.polarization_factor
+        if factor is not None:
+            if (type(factor) not in {int, float} or not math.isfinite(float(factor))
+                    or not -1.0 <= float(factor) <= 1.0):
+                raise ValueError("polarization factor must be from -1 to 1, or absent")
+            object.__setattr__(self, "polarization_factor", float(factor))
+        if self.error_model not in STITCH_ERROR_MODELS:
+            raise ValueError(f"error model must be one of {STITCH_ERROR_MODELS}")
+        for name in ("dark_path", "flat_path"):
+            if getattr(self, name) is not None:
+                object.__setattr__(self, name, _absolute_path(getattr(self, name), name.replace("_", " ")))
+        pyfai_only = (self.sample_position != "calibrated" or not self.correct_solid_angle
+                      or self.polarization_factor != 0.99 or self.error_model is not None
+                      or self.dark_path is not None or self.flat_path is not None)
+        if not native and (pyfai_only or self.frame_screen != "empty"):
+            raise ValueError("native processing requires a native source selection")
+        if self.backend == "xu_hist" and pyfai_only:
+            raise ValueError("the XU backend applies its pinned solid angle only; "
+                             "sample position and corrections need pyFAI MultiGeometry")
 
 
 @dataclass(frozen=True, slots=True)

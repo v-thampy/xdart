@@ -50,6 +50,28 @@ from xrd_tools.session.threshold_editing import (
     ThresholdEditRefusal, ThresholdState, threshold_transition,
 )
 
+_FRAME_CHECKS = {"Exclude empty frames": "empty", "Exclude empty and partial frames": "partial",
+                 "Keep all frames": "none"}
+_SAMPLE_POSITIONS = {"As calibrated": "calibrated", "On rotation axis": "rotation_axis"}
+
+
+def _choice(choices, value):
+    return next(label for label, key in choices.items() if key == value)
+
+
+def frame_screen_note(summary):
+    """One status phrase for the frames the dropped-frame check excluded or flagged."""
+    if not summary:
+        return ""
+    excluded, partial = list(summary["excluded"]), list(summary["partial"])
+    flagged = [label for label in partial if label not in excluded]
+    parts = []
+    if excluded:
+        parts.append(f"excluded dropped frames {', '.join(map(str, excluded))}")
+    if flagged:
+        parts.append(f"partial frames kept {', '.join(map(str, flagged))}")
+    return " · ".join(parts)
+
 
 class StitchPage(QtWidgets.QWidget):
     """One retained page; one worker owns preview, science and strict reopen."""
@@ -345,6 +367,31 @@ class StitchPage(QtWidgets.QWidget):
                     "Goniometer JSON", choices=("Goniometer JSON", "PONI + offsets"))
         for key, label, value in fields:
             self._field(advanced_card, SectionId.SOURCE, key, label, value)
+        frames_card = SubsectionCard("Frames and sample")
+        advanced_layout.addWidget(frames_card)
+        self._field(frames_card, SectionId.PROCESSING, "frame_check", "Frame check",
+                    "Exclude empty frames", choices=tuple(_FRAME_CHECKS))
+        self._rows["frame_check"].setToolTip(
+            "Compares each frame's counts with its neighbours on the same outer-circle row: "
+            "below 1 % is an empty (dropped) frame, below 20 % a partial one.")
+        self._field(frames_card, SectionId.PROCESSING, "sample_position", "Sample",
+                    "As calibrated", choices=tuple(_SAMPLE_POSITIONS))
+        self._rows["sample_position"].setToolTip(
+            "On rotation axis drops a stacked-arm calibration's fitted sample offset, "
+            "for a sample aligned onto the axis (for example after GI alignment).")
+        self.corrections_card = SubsectionCard("Corrections (pyFAI)")
+        advanced_layout.addWidget(self.corrections_card)
+        card = self.corrections_card
+        self._field(card, SectionId.PROCESSING, "solid_angle", "Solid angle", "On", choices=("On", "Off"))
+        self._rows["solid_angle"].setToolTip(
+            "Keep on for a stacked-arm calibration with a sample offset: its frames sit at "
+            "different distances.")
+        self._field(card, SectionId.PROCESSING, "polarization", "Polarization", "0.99")
+        self._rows["polarization"].setToolTip("Polarization factor from -1 to 1; leave blank for none.")
+        self._field(card, SectionId.PROCESSING, "error_model", "Error model", "None",
+                    choices=("None", "Poisson"))
+        self._field(card, SectionId.PROCESSING, "dark_path", "Dark", browse=True)
+        self._field(card, SectionId.PROCESSING, "flat_path", "Flat field", browse=True)
         close = QtWidgets.QPushButton("Close")
         close.clicked.connect(self.advanced.close)
         advanced_layout.addWidget(close)
@@ -511,6 +558,10 @@ class StitchPage(QtWidgets.QWidget):
 
     def _backend_changed(self, *_args):
         xu = self._value("backend") == "xrayutilities histogram"
+        # XU applies its pinned solid angle only; the frame check applies to both.
+        self.corrections_card.setEnabled(not xu)
+        self._fields["sample_position"] = replace(self._fields["sample_position"], enabled=not xu)
+        self._rows["sample_position"].apply_field(self._fields["sample_position"])
         self.set_field("source_motors", "del=del, nu=nu" if xu else "del_angle=del, nu_angle=nu")
         if not xu and not str(self._value("image_rotation")).strip():
             self.set_field("image_rotation", "0")
@@ -586,7 +637,21 @@ class StitchPage(QtWidgets.QWidget):
             native = dict(source_selection=selection,
                 unit="q_A^-1" if value("unit") == "Q (Å⁻¹)" else "2th_deg",
                 conditioning=conditioning, mask_path=str(value("mask_path")) or None,
-                output_family=str(value("output_family")).strip() or None)
+                output_family=str(value("output_family")).strip() or None,
+                frame_screen=_FRAME_CHECKS[value("frame_check")])
+            if value("backend") != "xrayutilities histogram":
+                polarization = str(value("polarization")).strip()
+                try:
+                    factor = float(polarization) if polarization else None
+                except ValueError as error:
+                    raise ValueError("Polarization must be a number from -1 to 1, or blank") from error
+                native.update(
+                    sample_position=_SAMPLE_POSITIONS[value("sample_position")],
+                    correct_solid_angle=value("solid_angle") == "On",
+                    polarization_factor=factor,
+                    error_model="poisson" if value("error_model") == "Poisson" else None,
+                    dark_path=str(value("dark_path")).strip() or None,
+                    flat_path=str(value("flat_path")).strip() or None)
             if ";" in str(value("output_family")):
                 native.update(output_family=None,
                     output_families=tuple(part.strip() for part in str(value("output_family")).split(";")))
@@ -634,7 +699,13 @@ class StitchPage(QtWidgets.QWidget):
             source_motors=", ".join(f"{key}={value}" for key, value in form.source_motors),
             image_rotation=form.image_rotation, frame_start=form.frame_selector.start_label,
             frame_stop="" if form.frame_selector.stop_label is None else form.frame_selector.stop_label,
-            frame_step=form.frame_selector.step, radial_auto=form.q_range is None)
+            frame_step=form.frame_selector.step, radial_auto=form.q_range is None,
+            frame_check=_choice(_FRAME_CHECKS, form.frame_screen),
+            sample_position=_choice(_SAMPLE_POSITIONS, form.sample_position),
+            solid_angle="On" if form.correct_solid_angle else "Off",
+            polarization="" if form.polarization_factor is None else form.polarization_factor,
+            error_model="Poisson" if form.error_model == "poisson" else "None",
+            dark_path=form.dark_path or "", flat_path=form.flat_path or "")
         if form.q_range is not None:
             fields.update(q_min=form.q_range[0], q_max=form.q_range[1])
         for key, value in fields.items():
@@ -813,7 +884,8 @@ class StitchPage(QtWidgets.QWidget):
                     self._mount_payload(result.request.module.output.target, result.payload)
                 elapsed = time.monotonic() - (self._batch_started or self._started)
                 count = len(result.request.module.source.selected_labels)
-                self._status(f"Complete · {count} frames · {elapsed:.2f} s")
+                note = frame_screen_note(result.frame_screen)
+                self._status(f"Complete · {count} frames · {elapsed:.2f} s" + (f" · {note}" if note else ""))
                 if self._queued_jobs and not update.stale and self._action_revision == self._revision:
                     self._run_next_job()
             else:
