@@ -436,6 +436,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     if arm_model == 'stacked_extended':
         provenance['arm_model'] = arm_model
         provenance['parameter_errors'] = dict(result.param_errors)
+        provenance['parameter_correlations'] = dict(result.param_correlations)
     if backend == 'xu_hist':
         seed = base.poni.dist if distance_seed_m is None else distance_seed_m
         provenance['effective_distance_bounds_m'] = distance_bounds_m or (max(1e-5, seed * .5), seed * 1.5)

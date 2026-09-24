@@ -214,3 +214,90 @@ def test_guided_fit_rejects_unknown_or_xu_arm_extension():
         fit_calibration([object()] * 3, arm_model='surface')
     with pytest.raises(ValueError, match='MultiGeometry-only'):
         fit_calibration([object()] * 3, backend='xu_hist', arm_model='stacked_extended')
+
+
+@pytest.mark.slow
+def test_parallax_fit_matches_the_runtime_geometry_it_returns(tmp_path):
+    from pyFAI.calibrant import get_calibrant
+    config = {'pixel1': 172e-6, 'pixel2': 172e-6, 'orientation': 3,
+              'sensor': {'material': 'Si', 'thickness': 450e-6}}
+    seed = tmp_path / 'parallax.poni'
+    seed.write_text('poni_version: 3\nDetector: Pilatus300kw\n'
+                    f'Detector_config: {json.dumps(config)}\nDistance: 0.39\nPoni1: 0.035\n'
+                    f'Poni2: 0.045\nRot1: 0.0\nRot2: 0.0\nRot3: 0.0\nWavelength: {WAVELENGTH}\nParallax: True\n')
+    from xrd_tools.integrate.calibration import load_detector_calibration
+    cal = load_detector_calibration(seed)
+    assert cal.parallax is True
+    truth = Diffractometer.from_pyfai_goniometer(
+        StackedDetectorArm(**TRUTH).to_pyfai_goniometer(cal), source_motors=SOURCES)
+    calibrant = get_calibrant('LaB6')
+    calibrant.wavelength = WAVELENGTH
+    q_ring = 2 * np.pi / np.asarray(calibrant.dSpacing)
+    angles = ANGLES[::2]
+    motors = {'del': np.array([a[0] for a in angles]), 'nu': np.array([a[1] for a in angles])}
+    grid, columns = np.arange(0., 194.5, .5), np.arange(5.1, 1475., 29.3)
+    rows_g, cols_g = np.meshgrid(grid, columns, indexing='ij')
+    controls = []
+    for (delta, nu), ai in zip(angles, create_multigeometry_integrators_from_geometry(truth, motors)):
+        q = ai.qFunction(rows_g, cols_g) / 10
+        points = []
+        for ring, target in enumerate(q_ring[:30]):
+            s = q - target
+            i, j = np.nonzero(s[:-1] * s[1:] < 0)
+            r = grid[i] + .5 * s[i, j] / (s[i, j] - s[i + 1, j])
+            c = columns[j]
+            for _ in range(3):
+                slope = (ai.qFunction(r + 1e-3, c) - ai.qFunction(r - 1e-3, c)) / 2e-2
+                r = r - (ai.qFunction(r, c) / 10 - target) / slope
+            points += [(a, b, ring) for a, b in zip(r, c)]
+        y, x, rings = np.asarray(points).T
+        controls.append(ControlFrame(y, x, rings, {'del': delta, 'nu': nu}))
+    fit = refine_stacked_arm(seed, controls, nu_motor='nu', del_motor='del', calibrant=calibrant)
+    assert fit.success, fit.message
+    assert fit.diffractometer.calibration.parallax is True
+    residual = np.concatenate([
+        ai.qFunction(c.row_positions, c.col_positions) / 10 - q_ring[c.rings]
+        for c, ai in zip(controls, create_multigeometry_integrators_from_geometry(fit.diffractometer, motors))])
+    runtime_rms = float(np.sqrt(np.mean(residual ** 2)))
+    assert runtime_rms < 1e-6, (runtime_rms, fit.rms_q)
+    assert abs(runtime_rms - fit.rms_q) < 1e-7, (runtime_rms, fit.rms_q)
+
+
+def test_extended_angles_broadcast_scalar_and_array_motors():
+    arm = StackedDetectorArm(**TRUTH)
+    paired = np.array(arm.angles(np.array([5., 25.]), np.array([3., 3.])))
+    mixed = np.array(arm.angles(np.array([5., 25.]), 3.))
+    np.testing.assert_array_equal(paired, mixed)
+
+
+def test_fit_carries_beam_rotation_and_reports_correlations():
+    truth = _calibration()
+    controls, calibrant = _ring_controls(TRUTH, truth, ANGLES[::2])
+    fit = refine_stacked_arm(truth.poni, controls, nu_motor='nu', del_motor='del', calibrant=calibrant,
+                             detector_config={'orientation': 3}, beam_rotation=.25)
+    assert fit.diffractometer.stacked_arm.beam_rotation == .25
+    names, matrix = fit.param_correlations['names'], np.asarray(fit.param_correlations['matrix'])
+    assert names[:5] == ['dist', 'poni1', 'poni2', 'nu_offset', 'del_offset'] and len(names) == 10
+    assert matrix.shape == (10, 10)
+    np.testing.assert_allclose(np.diag(matrix), 1.0, atol=1e-9)
+
+
+def test_stratified_selection_reaches_every_nu_row_first():
+    from xrd_tools.integrate.stitch_autocalibration import stratified_frame_indices
+    rows = [(r * 41 + d, {'nu': nu, 'del': 5. + d}, None)
+            for r, nu in enumerate((-10., -3.5, 3., 9.5, 16., 22.5, 29.)) for d in range(41)]
+    def per_row(selection):
+        counts = {}
+        for index in selection:
+            counts[rows[index][1]['nu']] = counts.get(rows[index][1]['nu'], 0) + 1
+        return counts
+    seven, coverage = stratified_frame_indices(rows, 7, 'nu', 'del')
+    assert len(seven) == 7 and set(per_row(seven).values()) == {1} and len(per_row(seven)) == 7
+    assert coverage == {'nu_rows_available': 7, 'nu_rows_selected': 7}
+    assert [rows[i][1]['del'] for i in seven][:1] == [25.]  # centred in del, not the first frame
+    fourteen, _ = stratified_frame_indices(rows, 14, 'nu', 'del')
+    assert set(per_row(fourteen).values()) == {2}
+    five, coverage = stratified_frame_indices(rows, 5, 'nu', 'del')
+    assert len(five) == 5 and coverage == {'nu_rows_available': 7, 'nu_rows_selected': 5}
+    forty_eight, _ = stratified_frame_indices(rows, 48, 'nu', 'del')
+    assert len(forty_eight) == 48 and min(per_row(forty_eight).values()) >= 6

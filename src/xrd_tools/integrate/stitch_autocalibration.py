@@ -28,7 +28,7 @@ from xrd_tools.core.geometry import Diffractometer, ImageOrientation
 from xrd_tools.integrate.refine import ControlFrame, refine_stacked_arm
 from xrd_tools.integrate.stitch_calibration import (
     CalibrationFit, _exact_source, _mg_detector_config, calibration_image_identity,
-    source_frame_choices, suggested_frame_indices,
+    source_frame_choices,
 )
 
 _SOURCE_MOTORS = (('del_angle', 'del'), ('nu_angle', 'nu'))
@@ -42,6 +42,48 @@ class ScanRingPoints:
     frames: tuple[dict, ...]
     excluded: tuple[dict, ...]
     calibrant: object
+    coverage: dict
+
+
+def stratified_frame_indices(rows, count, nu_motor, del_motor):
+    """Choose frames from every nu row first, then spread the rest over the angles.
+
+    Each nu row gets an equal share of the budget, centred and evenly spaced in
+    del; the remainder goes to the frames farthest from those already chosen.
+    When the budget is smaller than the number of rows, evenly spaced rows get
+    one frame each, and the returned coverage says how many rows were reached.
+    """
+    groups = {}
+    for index, motors, _energy in rows:
+        groups.setdefault(round(float(motors[nu_motor]), 6), []).append(
+            (float(motors[del_motor]), int(index)))
+    keys = sorted(groups)
+    count = int(count)
+    if count < 1 or not keys:
+        raise ValueError('choose at least one frame from a nonempty scan')
+    kept = keys if count >= len(keys) else sorted(
+        {keys[int(i)] for i in np.round(np.linspace(0, len(keys) - 1, count))})
+    share = max(1, count // len(kept))
+    chosen = []
+    for key in kept:
+        group = sorted(groups[key])
+        k = min(share, len(group))
+        picks = np.unique(np.round((np.arange(k) + 0.5) * len(group) / k - 0.5).astype(int))
+        chosen += [group[i][1] for i in picks]
+    order = [int(row[0]) for row in rows]
+    values = np.array([[float(row[1][del_motor]), float(row[1][nu_motor])] for row in rows])
+    spans = np.ptp(values, axis=0)
+    values = (values - values.min(axis=0)) / np.where(spans > 0, spans, 1.0)
+    position = {index: k for k, index in enumerate(order)}
+    distance = np.min(np.sum((values[:, None] - values[[position[i] for i in chosen]][None]) ** 2,
+                             axis=2), axis=1)
+    distance[[position[i] for i in chosen]] = -1.0
+    while len(chosen) < min(count, len(order)):
+        k = int(np.argmax(distance))
+        chosen.append(order[k])
+        distance = np.minimum(distance, np.sum((values - values[k]) ** 2, axis=1))
+        distance[[position[i] for i in chosen]] = -1.0
+    return tuple(sorted(chosen)), {'nu_rows_available': len(keys), 'nu_rows_selected': len(kept)}
 
 
 def _seed(geometry, source_motors):
@@ -91,11 +133,14 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
     rows = source_frame_choices(spec, (arm.del_motor, arm.nu_motor))
     by_index = {row[0]: row for row in rows}
     if frame_indices is None:
-        selected = suggested_frame_indices(rows, count=min(int(max_frames), len(rows)))
+        selected, coverage = stratified_frame_indices(
+            rows, min(int(max_frames), len(rows)), arm.nu_motor, arm.del_motor)
     else:
         selected = tuple(int(i) for i in frame_indices)
         if len(set(selected)) != len(selected) or any(i not in by_index for i in selected):
             raise ValueError('choose distinct frames from the selected scan')
+        coverage = {'nu_rows_available': len({round(row[1][arm.nu_motor], 6) for row in rows}),
+                    'nu_rows_selected': len({round(by_index[i][1][arm.nu_motor], 6) for i in selected})}
     if not 3 <= len(selected) <= 256:
         raise ValueError('automatic refinement needs 3-256 frames')
     for index in selected:
@@ -172,7 +217,7 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
             close()
     if len(controls) < 3:
         raise ValueError('automatic refinement found ring points on fewer than three frames')
-    return ScanRingPoints(tuple(controls), tuple(frames), tuple(excluded), cal)
+    return ScanRingPoints(tuple(controls), tuple(frames), tuple(excluded), cal, coverage)
 
 
 def _held_out(result, controls, calibrant, nu_motor, del_motor):
@@ -218,25 +263,34 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
         return refine_stacked_arm(poni, controls, nu_motor=arm.nu_motor, del_motor=arm.del_motor,
                                   calibrant=points.calibrant, detector_config=config,
                                   extended=extended, reject_outliers=reject_outliers,
-                                  cancelled=cancelled)
+                                  beam_rotation=arm.beam_rotation, cancelled=cancelled)
 
     controls = points.controls
     rows = sorted({round(c.motors[arm.nu_motor], 6) for c in controls})
-    validation = {'method': 'leave-one-nu-row-out', 'nu_rows': rows, 'min_improvement': min_improvement}
+    validation = {'method': 'leave-one-nu-row-out', 'nu_rows': rows, 'min_improvement': min_improvement,
+                  'coverage': dict(points.coverage)}
     chosen, reason = 'stacked', ''
     if len(rows) < 4:
         reason = 'fewer than four nu rows: the extension cannot be validated'
+        if points.coverage['nu_rows_selected'] < points.coverage['nu_rows_available']:
+            reason += (f" (the frame budget reached {points.coverage['nu_rows_selected']} of "
+                       f"{points.coverage['nu_rows_available']} nu rows)")
     else:
         held = {'stacked': [], 'stacked_extended': []}
+        folds = []
         for row in rows:
             train = [c for c in controls if round(c.motors[arm.nu_motor], 6) != row]
             test = [c for c in controls if round(c.motors[arm.nu_motor], 6) == row]
+            fold = {'nu': row, 'points': int(sum(len(c.rows) for c in test))}
             for name, extended in (('stacked', False), ('stacked_extended', True)):
-                held[name].append(_held_out(fit(train, extended), test, points.calibrant,
-                                            arm.nu_motor, arm.del_motor))
+                trained = fit(train, extended)
+                residual = _held_out(trained, test, points.calibrant, arm.nu_motor, arm.del_motor)
+                held[name].append(residual)
+                fold[name] = {'held_out_sigma_A^-1': _robust_sigma(residual), 'success': trained.success}
+            folds.append(fold)
         sigma = {name: _robust_sigma(np.concatenate(parts)) for name, parts in held.items()}
         improvement = 1.0 - sigma['stacked_extended'] / sigma['stacked'] if sigma['stacked'] > 0 else 0.0
-        validation.update({'held_out_sigma_A^-1': sigma, 'improvement': improvement})
+        validation.update({'held_out_sigma_A^-1': sigma, 'improvement': improvement, 'folds': folds})
         if improvement >= min_improvement:
             chosen = 'stacked_extended'
         else:
@@ -258,6 +312,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                   'source_motors': {'nu_angle': arm.nu_motor, 'del_angle': arm.del_motor},
                   'image_rotation': int(image_rotation), 'direct_beam': None,
                   'arm_model': chosen, 'parameter_errors': dict(result.param_errors),
+                  'parameter_correlations': dict(result.param_correlations),
                   'automatic_refinement': {
                       'method': 'pyFAI SingleGeometry.extract_cp seeded by a stacked calibration',
                       'seed_sha256': digest, 'source': source, 'calibrant': str(calibrant),
@@ -272,4 +327,5 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                           result.rms_q, result.condition_number, result.n_points, message)
 
 
-__all__ = ['ScanRingPoints', 'extract_scan_ring_points', 'refine_arm_from_scan']
+__all__ = ['ScanRingPoints', 'extract_scan_ring_points', 'refine_arm_from_scan',
+           'stratified_frame_indices']

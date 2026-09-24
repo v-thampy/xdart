@@ -106,8 +106,9 @@ class StackedDetectorArm:
 
     def _pose(self, delta, nu):
         """M0 = R1(n) R2(d) R3(roll) R1(tilt) for each frame, shape (..., 3, 3)."""
-        d = self.del_offset + self.del_scale * np.asarray(delta, dtype=float)
-        n = self.nu_offset + self.nu_scale * np.asarray(nu, dtype=float)
+        delta, nu = np.broadcast_arrays(np.asarray(delta, dtype=float), np.asarray(nu, dtype=float))
+        d = self.del_offset + self.del_scale * delta
+        n = self.nu_offset + self.nu_scale * nu
         cn, sn, cd, sd = np.cos(n), np.sin(n), np.cos(d), np.sin(d)
         zero = np.zeros_like(d)
         arm = np.stack([np.stack([cd, zero, -sd], -1), np.stack([sn * sd, cn, sn * cd], -1),

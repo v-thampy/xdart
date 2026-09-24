@@ -84,8 +84,8 @@ def guided(tmp_path_factory):
             'extended_path': Path(save_calibration_fit(extended, project / 'fits/extended.json'))}
 
 
-def _row_centres(root, geometry_path, output_dir):
-    """Ring-centre error per nu row from the product Stitch (Å⁻¹)."""
+def _row_centres(root, geometry_path, output_dir, rows=None, count=3):
+    """Ring-centre error per nu row from the product Stitch, {ring: {nu: error}} (Å⁻¹)."""
     from pyFAI.calibrant import get_calibrant
     spec = _spec(root)
     table = run_metadata_table(MetadataTablePlan(spec))
@@ -93,14 +93,14 @@ def _row_centres(root, geometry_path, output_dir):
     record = json.loads(geometry_path.read_text())
     calibrant = get_calibrant('LaB6')
     calibrant.wavelength = record['wavelength']
-    rings = (2 * np.pi / np.asarray(calibrant.dSpacing))[:3]
+    rings = (2 * np.pi / np.asarray(calibrant.dSpacing))[:count]
     geometry = capture_stitch_geometry(StitchGeometryInput(
         geometry_path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
         source_motors=(('del_angle', 'del'), ('nu_angle', 'nu')), image_rotation=0))
     plan = StitchOperationPlan(geometry, mode='1d', npt_1d=1500, radial_range=(1.0, 6.2),
                                use_detector_mask=True, max_frame_bytes=64 * 1024 * 1024)
-    centres = {float(q): [] for q in rings}
-    for row in np.unique(nu):
+    centres = {float(q): {} for q in rings}
+    for row in (np.unique(nu) if rows is None else rows):
         labels = tuple(int(i) for i in np.flatnonzero(nu == row))
         source = ModuleSourceReceipt.from_metadata_table(
             table, kind=ModuleKind.STITCH, selected_labels=labels,
@@ -122,13 +122,14 @@ def _row_centres(root, geometry_path, output_dir):
             if not 0 < i < len(signal) - 1 or signal[i] < 0.3 * baseline[i]:
                 continue
             a, b, c = signal[i - 1:i + 2]
-            centres[float(target)].append(x[i] + 0.5 * (a - c) / (a - 2 * b + c) * (x[1] - x[0]) - target)
+            centres[float(target)][float(row)] = (
+                x[i] + 0.5 * (a - c) / (a - 2 * b + c) * (x[1] - x[0]) - target)
     return centres
 
 
 def _spreads(centres):
     assert all(len(values) >= 4 for values in centres.values()), centres
-    return [max(values) - min(values) for values in centres.values()]
+    return [max(values.values()) - min(values.values()) for values in centres.values()]
 
 
 @pytest.mark.slow
@@ -165,9 +166,42 @@ def test_scan14_automatic_refinement_from_the_calibrant_scan(guided, tmp_path):
     assert automatic['validation']['improvement'] >= 0.4, automatic['validation']
     assert {frame['motors']['nu'] for frame in provenance['frames']} == {-10., -3.5, 3., 9.5, 16., 22.5, 29.}
     excluded = {frame['index'] for frame in automatic['excluded_frames']}
-    assert excluded and excluded <= _DROPPED, automatic['excluded_frames']
+    assert excluded <= _DROPPED, automatic['excluded_frames']
+    assert automatic['validation']['coverage'] == {'nu_rows_available': 7, 'nu_rows_selected': 7}
+    assert [fold['nu'] for fold in automatic['validation']['folds']] == [-10., -3.5, 3., 9.5, 16., 22.5, 29.]
     path = Path(save_calibration_fit(fit, guided['root'] / 'fits/automatic.json'))
     fixed = _spreads(_row_centres(guided['root'], path, tmp_path))
     print(f"automatic: {len(provenance['frames'])} frames, excluded {sorted(excluded)}, "
           f"held-out {automatic['validation']['held_out_sigma_A^-1']}, nu-row spread {np.round(fixed, 4).tolist()}")
     assert max(fixed) <= 0.005, fixed
+
+
+@pytest.mark.slow
+def test_scan14_small_frame_budget_still_spans_every_nu_row(guided):
+    from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
+    fit = refine_arm_from_scan(_spec(guided['root']), guided['five_path'], max_frames=7, max_counts=8e5)
+    provenance = fit.asset['provenance']
+    validation = provenance['automatic_refinement']['validation']
+    assert validation['coverage'] == {'nu_rows_available': 7, 'nu_rows_selected': 7}
+    assert len({frame['motors']['nu'] for frame in provenance['frames']}) == 7
+    assert 'fewer than four nu rows' not in validation['reason'], validation
+    assert len(validation['folds']) == 7
+
+
+@pytest.mark.slow
+def test_scan14_automatic_fit_predicts_held_out_nu_rows(guided, tmp_path):
+    """The frozen O4 oracle: rows never seen by the fit land within 0.002 Å⁻¹."""
+    from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
+    from xrd_tools.integrate.stitch_calibration import save_calibration_fit
+    table = run_metadata_table(MetadataTablePlan(_spec(guided['root'])))
+    column = {c.name: np.asarray(c.numeric, dtype=float) for c in table.columns if c.name in ('nu', 'del')}
+    train = tuple(int(i) for i in np.flatnonzero(
+        np.isin(column['nu'], (-10., 3., 16., 29.)) & np.isin(column['del'], np.arange(5., 46., 5.))))
+    fit = refine_arm_from_scan(_spec(guided['root']), guided['five_path'], frame_indices=train, max_counts=8e5)
+    assert fit.asset['provenance']['arm_model'] == 'stacked_extended'
+    path = Path(save_calibration_fit(fit, guided['root'] / 'fits/held-out.json'))
+    centres = _row_centres(guided['root'], path, tmp_path, rows=(-3.5, 9.5, 22.5), count=6)
+    errors = [value for ring in centres.values() for value in ring.values()]
+    print(f'held-out rows: {len(errors)} ring centres, max |error| {max(abs(e) for e in errors):.4f} Å⁻¹')
+    assert len(errors) >= 14, centres
+    assert max(abs(e) for e in errors) <= 0.002, centres

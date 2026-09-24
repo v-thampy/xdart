@@ -123,6 +123,8 @@ class RefineResult:
     param_errors: Mapping[str, float] = field(default_factory=dict)
     #: control points dropped by robust outlier rejection
     rejected_points: int = 0
+    #: parameter correlation matrix {"names": [...], "matrix": [[...]]} (arm fits only)
+    param_correlations: Mapping[str, Any] = field(default_factory=dict)
 
 
 def _resolve_calibrant_q(calibrant: Any, wavelength_m: float,
@@ -475,6 +477,7 @@ def refine_stacked_arm(
     detector_config: Mapping[str, Any] | None = None,
     extended: bool = True,
     reject_outliers: float | None = None,
+    beam_rotation: float = 0.0,
     base: Diffractometer | None = None,
     preset: str = "fitted",
     distance_seed_m: float | None = None,
@@ -494,7 +497,12 @@ def refine_stacked_arm(
     determined is reported unsuccessful.
 
     ``reject_outliers`` drops points beyond that many robust (MAD) sigmas and
-    refits, twice; use it for automatically extracted points.
+    refits, twice; use it for automatically extracted points. ``beam_rotation``
+    is carried unchanged: |q| cannot see it, but it sets the chi reference.
+
+    With a parallax-enabled calibration every trial pose is evaluated through
+    the runtime integrator builder, because pyFAI's parallax correction reads
+    the integrator's own pose rather than a trial ``param``.
     """
     from scipy.optimize import least_squares  # noqa: PLC0415
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator  # noqa: PLC0415
@@ -516,8 +524,19 @@ def refine_stacked_arm(
     q_ring = _resolve_calibrant_q(calibrant, wl_m, max_ring)
     targets = [q_ring[f.rings] for f in frames]
     geometry = AzimuthalIntegrator(detector=det, wavelength=wl_m)
+    runtime = None
     if base_parallax is True:
-        geometry.enable_parallax()
+        from xrd_tools.integrate.calibration import (  # noqa: PLC0415
+            detector_calibration_to_integrator,
+        )
+        template = DetectorCalibration(
+            replace(base_poni, rot1=0., rot2=0., rot3=0., wavelength=wl_m, detector=det_name),
+            detector_config=dict(detector_config or {}), parallax=True)
+
+        def runtime(param):
+            return detector_calibration_to_integrator(
+                template, dist=param[0], poni1=param[1], poni2=param[2],
+                rot1=param[3], rot2=param[4], rot3=param[5])
 
     distance = base_poni.dist if distance_seed_m is None else float(distance_seed_m)
     if not np.isfinite(distance) or distance <= 0:
@@ -531,7 +550,8 @@ def refine_stacked_arm(
     def arm_for(p):
         extension = dict(zip(_EXTENSION_NAMES, p[5:])) if len(p) > 5 else {}
         return StackedDetectorArm(nu_motor=nu_motor, del_motor=del_motor,
-                                  nu_offset=p[3], del_offset=p[4], **extension)
+                                  nu_offset=p[3], del_offset=p[4],
+                                  beam_rotation=beam_rotation, **extension)
 
     def predicted(p, keep):
         arm = arm_for(p)
@@ -541,7 +561,10 @@ def refine_stacked_arm(
         for i, f in enumerate(frames):
             param = [p[0] + d_dist[i], p[1] + d_poni1[i], p[2] + d_poni2[i],
                      rot1[i], rot2[i], rot3[i]]
-            q = geometry.qFunction(f.row_positions[keep[i]], f.col_positions[keep[i]], param=param)
+            if runtime is None:
+                q = geometry.qFunction(f.row_positions[keep[i]], f.col_positions[keep[i]], param=param)
+            else:
+                q = runtime(param).qFunction(f.row_positions[keep[i]], f.col_positions[keep[i]])
             out.append(np.asarray(q, dtype=float) / 10.0 - targets[i][keep[i]])
         return np.concatenate(out)
 
@@ -580,11 +603,17 @@ def refine_stacked_arm(
         sv = np.linalg.svd(jac, compute_uv=False)
         condition = float(sv[0] / sv[-1]) if sv[-1] > 0 else float("inf")
         dof = max(1, n_points - len(p))
-        errors = np.sqrt(np.clip(np.diag(np.linalg.pinv(jac.T @ jac)) * float(res.fun @ res.fun) / dof, 0, None))
+        covariance = np.linalg.pinv(jac.T @ jac) * float(res.fun @ res.fun) / dof
+        errors = np.sqrt(np.clip(np.diag(covariance), 0, None))
+        scale = np.where(errors > 0, errors, 1.0)
+        correlation = covariance / np.outer(scale, scale)
     except Exception:  # noqa: BLE001
         condition, errors = float("inf"), np.full(len(p), np.inf)
+        correlation = np.full((len(p), len(p)), np.nan)
     names = _ARM_NAMES + (_EXTENSION_NAMES if extended else ())
     param_errors = dict(zip(names, (float(e) for e in errors)))
+    param_correlations = {"names": list(names),
+                          "matrix": [[float(v) for v in row] for row in correlation]}
 
     problems: list[str] = []
     if not res.success:
@@ -624,6 +653,7 @@ def refine_stacked_arm(
         params=dict(zip(gonio["param_names"], gonio["param"])), success=ok,
         condition_number=condition, frozen_scales=(), message=message,
         param_errors=param_errors, rejected_points=rejected,
+        param_correlations=param_correlations,
     )
 
 
