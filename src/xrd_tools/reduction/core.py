@@ -618,6 +618,12 @@ class ReductionPlan:
             )
         if self.threshold_min is not None or self.threshold_max is not None:
             self.mask_saturation = False
+        if self.flat is not None:
+            flat = np.asarray(self.flat)
+            if flat.ndim != 2:
+                raise ValueError("ReductionPlan.flat must be a 2-D array.")
+            # pyFAI's compiled kernels refuse a read-only buffer; copy once here.
+            self.flat = flat if flat.flags.writeable else flat.copy()
 
 
 @dataclass(frozen=True, slots=True)

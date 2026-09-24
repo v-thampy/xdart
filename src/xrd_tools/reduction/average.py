@@ -1,6 +1,6 @@
 from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from enum import Enum
 import hashlib, json, math, os
 from pathlib import Path
@@ -33,7 +33,7 @@ from xrd_tools.io.record_writer import WriterIncomplete
 from xrd_tools.io.schema import PROCESSED_SCHEMA_VERSION
 from xrd_tools.reduction.background import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.reduction.core import GIMode, Integration1DPlan, Integration2DPlan, NexusSink, ReductionPlan, run_reduction
-from xrd_tools.session.experiment_state import CalibrationState, FactStatus, MaskState, PoniValues
+from xrd_tools.session.experiment_state import CalibrationState, FactStatus, FlatState, MaskState, PoniValues
 from xrd_tools.session import policy as _resource_policy
 from xrd_tools.session.policy import SessionResourceAllocation, requirements_from, resolve_session_policy
 from xrd_tools.session.run_configuration import FrozenSourceSpec
@@ -101,7 +101,8 @@ def _copy_calibration(value: CalibrationState) -> CalibrationState:
     _reject(type(value) is not CalibrationState, 'Average calibration must be an exact CalibrationState', TypeError); poni = value.values
     copied_values = None if poni is None else PoniValues(*(getattr(poni, item.name) for item in fields(PoniValues)))
     mask = value.mask; copied_mask = MaskState(mask.source_uri, mask.sha256, mask.dtype, tuple(mask.shape), mask.status)
-    return CalibrationState(copied_values, value.detector_id, dict(value.detector_config), value.value_fingerprint, value.source_sha256, value.source_uri, copied_mask, value.status, value.parallax)
+    flat = value.flat; copied_flat = FlatState(flat.source_uri, flat.sha256, tuple(flat.shape), flat.status)
+    return CalibrationState(copied_values, value.detector_id, dict(value.detector_config), value.value_fingerprint, value.source_sha256, value.source_uri, copied_mask, value.status, value.parallax, copied_flat)
 def _copy_background(value: FrameBackgroundPlan | None) -> FrameBackgroundPlan | None:
     if value is None: return None
     _reject(type(value) is not FrameBackgroundPlan, 'Average background must be an exact FrameBackgroundPlan', TypeError)
@@ -192,7 +193,7 @@ class AverageScanRecipe:
             for name, item in values.items():
                 object.__setattr__(self, name, item)
             return
-        _reject(canonical or type(reduction) is not ReductionPlan or reduction.mask is not None, 'Average recipe requires one exact mask-free ReductionPlan', TypeError)
+        _reject(canonical or type(reduction) is not ReductionPlan or reduction.mask is not None or reduction.flat is not None, 'Average recipe requires one exact mask-free, flat-free ReductionPlan', TypeError)
         _reject(type(entry) is not str or not entry or '/' in entry or (entry in {'.', '..'}), 'Average entry must be one nonempty component')
         mode = str(output_mode).strip().casefold()
         _reject(mode not in {'append', 'overwrite'}, 'Average output mode is invalid')
@@ -223,6 +224,9 @@ def _calibration_payload(value: CalibrationState) -> dict[str, Any]:
     poni = value.values
     payload = {'values': None if poni is None else {item.name: getattr(poni, item.name) for item in fields(PoniValues)}, 'detector_id': value.detector_id, 'detector_config': _plain_json(value.detector_config), 'value_fingerprint': value.value_fingerprint, 'source_sha256': value.source_sha256, 'source_uri': value.source_uri, 'mask': {item.name: getattr(value.mask, item.name).value if item.name == 'status' else getattr(value.mask, item.name) for item in fields(MaskState)}, 'status': value.status.value}
     if value.parallax is not None: payload['parallax'] = value.parallax
+    if value.flat.status is not FactStatus.ABSENT:
+        payload['flat'] = {'source_uri': value.flat.source_uri, 'sha256': value.flat.sha256,
+                           'shape': list(value.flat.shape), 'status': value.flat.status.value}
     return payload
 def _plain_json(value: Any) -> Any:
     if isinstance(value, Mapping):
@@ -527,6 +531,9 @@ def _admitted_input_paths(graph, recipe=None) -> tuple[str, ...]:
     mask_uri = getattr(mask, 'source_uri', None)
     if type(mask_uri) is str and mask_uri:
         paths.append(mask_uri)
+    flat_uri = getattr(getattr(calibration, 'flat', None), 'source_uri', None)
+    if type(flat_uri) is str and flat_uri:
+        paths.append(flat_uri)
     return tuple(path for path in paths if type(path) is str and path)
 
 
@@ -804,6 +811,43 @@ def _load_static_mask(
     result = np.frombuffer(np.ascontiguousarray(value).tobytes(), dtype=bool).reshape(shape)
     result.setflags(write=False)
     return result
+def _load_static_flat(
+    recipe: AverageScanRecipe, shape: tuple[int, int],
+    token: threading.Event | None = None,
+) -> np.ndarray | None:
+    """Read the recipe's flat field, verify its digest, and prepare it."""
+    from xrd_tools.corrections import prepare_flatfield
+    from xrd_tools.io.image import read_image
+    state = recipe.calibration.flat
+    if state.status is not FactStatus.PRESENT:
+        return None
+    _poll(token)
+    path = Path(state.source_uri)
+    limit = _static_mask_snapshot_limit(shape)
+    with tempfile.TemporaryDirectory(prefix="xdart-average-flat-") as root:
+        snapshot = Path(root) / ("flat" + path.suffix)
+        digest = hashlib.sha256()
+        copied = 0
+        with path.open("rb") as source, snapshot.open("xb") as target:
+            while True:
+                _poll(token)
+                payload = source.read(_STATIC_MASK_COPY_CHUNK_BYTES)
+                if not payload:
+                    break
+                copied += len(payload)
+                _reject(copied > limit, 'AVERAGE_FLAT_FILE_TOO_LARGE')
+                digest.update(payload)
+                target.write(payload)
+        _reject(digest.hexdigest() != state.sha256, 'AVERAGE_FLAT_DIGEST_CHANGED')
+        raw = (np.load(snapshot, allow_pickle=False) if snapshot.suffix.casefold() == '.npy'
+               else read_image(snapshot))
+    _reject(tuple(raw.shape) != tuple(shape) or tuple(raw.shape) != tuple(state.shape),
+            'AVERAGE_FLAT_SHAPE_INVALID')
+    result = np.ascontiguousarray(prepare_flatfield(raw), dtype=np.float32)
+    result.setflags(write=False)
+    return result
+
+
 def _static_mask_snapshot_limit(shape: tuple[int, int]) -> int:
     pixels = int(shape[0]) * int(shape[1])
     _reject(pixels <= 0, 'AVERAGE_STATIC_MASK_SHAPE_INVALID')
@@ -1076,7 +1120,12 @@ def _reduce_average(plan: AverageScanPlan, science: dict[str, Any], token: threa
     provenance = {**_science_payload(plan.recipe, plan.numeric_metadata_keys, plan.invariant_metadata_keys), 'science_identity': plan.science_identity, 'operation_identity': plan.operation_identity, 'source_graph_digest': plan.source_graph_digest, 'contributor_extent': plan.contributor_extent, 'metadata_denominators': science['denominators'], 'direct_eiger_eligible': plan.direct_eiger_eligible, 'direct_eiger_execution': science['direct_eiger_execution']}
     scan = Scan('average', [frame], poni=poni, integrator=integrator, output_path=plan.output_artifact, extra={'average_finite_counts': science['finite'], 'average_scan_provenance': provenance, 'detector_shape': plan.detector_shape, **({'detector_calibration': detector_values} if detector_values is not None else {})})
     progress('reduce', 0, 1)
-    reduced = run_reduction(_derived_reduction(plan.recipe), scan, cancel_token=token, execution='chunked', retain_products=True, strict=StrictPolicy(True, True, True))
+    flat = _load_static_flat(plan.recipe, plan.detector_shape, token)
+    reduction = _derived_reduction(plan.recipe)
+    if flat is not None:
+        reduction = replace(reduction, flat=flat)
+        scan.extra = {**scan.extra, 'flatfield': flat}
+    reduced = run_reduction(reduction, scan, cancel_token=token, execution='chunked', retain_products=True, strict=StrictPolicy(True, True, True))
     progress('reduce', 1, 1)
     if reduced.failed and type(reduced.error) is str and reduced.error.startswith('monitor ') and reduced.error.endswith('Pass StrictPolicy.graceful() to allow it.'): raise MissingNormalizationError(reduced.error)
     _reject(reduced.failed or 1 not in reduced.frames, reduced.error or 'AVERAGE_REDUCTION_FAILED')

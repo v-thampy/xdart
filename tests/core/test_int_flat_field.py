@@ -82,3 +82,70 @@ def test_a_flat_turns_off_the_float32_fast_path_and_corrects_thumbnails():
     assert not _can_use_owned_float32_csr(raw, None, with_flat, integrator_input_safe=True)
     thumbnail = _thumbnail_corrected_image(raw, None, flat)
     assert thumbnail[1, 1] == 25.0 and np.isnan(thumbnail[0, 0])
+
+
+def test_average_applies_records_and_authenticates_its_flat(tmp_path):
+    import hashlib
+
+    import h5py
+    import tifffile
+
+    from xrd_tools.io import get_1d
+    from xrd_tools.reduction import AverageScanRecipe
+    from xrd_tools.reduction import average as module
+    from xrd_tools.session.experiment_state import (
+        CalibrationState, FactStatus, FlatState, PoniValues,
+    )
+    from xrd_tools.sources.selection import image_series_spec
+
+    flat_path = tmp_path / "flat.npy"
+    np.save(flat_path, np.full((4, 4), 2.0))
+    digest = hashlib.sha256(flat_path.read_bytes()).hexdigest()
+
+    def run(name, flat):
+        folder = tmp_path / name
+        folder.mkdir()
+        for index in range(1, 4):
+            tifffile.imwrite(folder / f"scan_{index:04d}.tif", np.full((4, 4), 20 * index, np.uint32))
+        calibration = CalibrationState(
+            PoniValues(0.2, 0.001, 0.001, 0.0, 0.0, 0.0, 1e-10), "Detector",
+            {"pixel1": 1e-4, "pixel2": 1e-4, "max_shape": [4, 4], "orientation": 3},
+            status=FactStatus.PRESENT, flat=flat)
+        runner = module.AverageScanRunner(AverageScanRecipe(
+            image_series_spec(folder / "scan_0001.tif", metadata_format=None),
+            folder / "scan.nexus",
+            ReductionPlan(integration_1d=Integration1DPlan(npt=4, method="numpy")),
+            calibration=calibration))
+        result = runner.start()
+        runner.close()
+        return result
+
+    plain = run("plain", FlatState.absent())
+    flat = run("flat", FlatState(str(flat_path), digest, (4, 4), FactStatus.PRESENT))
+    assert plain.disposition == flat.disposition == "COMMITTED", (plain, flat)
+    before, after = get_1d(plain.target, frame=1), get_1d(flat.target, frame=1)
+    finite = np.isfinite(before.intensity)
+    assert finite.any()
+    np.testing.assert_allclose(after.intensity[finite], before.intensity[finite] / 2, rtol=1e-6)
+    with h5py.File(flat.target, "r") as handle:
+        stored = handle["entry/instrument/detector/flatfield"]
+        assert stored.attrs["sha256"] == hashlib.sha256(
+            np.full((4, 4), 2.0, np.float32).tobytes()).hexdigest()
+    with h5py.File(plain.target, "r") as handle:
+        assert "flatfield" not in handle["entry/instrument/detector"]
+
+    changed = run("changed", FlatState(str(flat_path), "0" * 64, (4, 4), FactStatus.PRESENT))
+    assert changed.disposition != "COMMITTED"
+    assert "AVERAGE_FLAT_DIGEST_CHANGED" in f"{changed.diagnostic_code} {changed.diagnostic}"
+
+
+def test_a_read_only_flat_is_accepted():
+    flat = np.full(SHAPE, 2.0, dtype=np.float32)
+    flat.setflags(write=False)
+    plan = ReductionPlan(integration_1d=Integration1DPlan(npt=40), integration_2d=None, flat=flat)
+    assert plan.flat.flags.writeable
+    halved = _reduce(plan).result_1d
+    plain = _reduce(ReductionPlan(integration_1d=Integration1DPlan(npt=40), integration_2d=None)).result_1d
+    np.testing.assert_allclose(halved.intensity, plain.intensity / 2, rtol=1e-6)
+    with pytest.raises(ValueError):
+        ReductionPlan(flat=np.ones(4))
