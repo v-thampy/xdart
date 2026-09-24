@@ -123,7 +123,7 @@ def test_rows_follow_the_nu_motor_for_both_geometry_kinds(tmp_path):
     )
     from tests.core.test_stitch_operation import _poni_record, _prepared
     request = _prepared(tmp_path)
-    assert _frame_screen_rows(request) == (0.0, 2.0)  # goniometer JSON: nu_angle ← nu
+    assert _frame_screen_rows(request) == ((0, 0.0), (0, 2.0))  # goniometer JSON: nu_angle ← nu
     path = tmp_path / 'geometry.poni'
     path.write_text(_poni_record(), encoding='utf-8')
     geometry = capture_stitch_geometry(StitchGeometryInput(
@@ -134,4 +134,65 @@ def test_rows_follow_the_nu_motor_for_both_geometry_kinds(tmp_path):
     poni = prepare_stitch_operation(request.module.source, output,
                                     StitchOperationPlan(geometry, npt_1d=96, radial_range=(.1, 6.)),
                                     project_root=tmp_path)
-    assert _frame_screen_rows(poni) == (0.0, 2.0)
+    assert _frame_screen_rows(poni) == ((0, 0.0), (0, 2.0))
+
+
+def _constant_series(root, values, nu):
+    import tifffile
+    from xrd_tools.analysis.module_transaction import (
+        MetadataColumnSelector, ModuleKind, ModuleSourceReceipt,
+    )
+    from xrd_tools.analysis.scan_operations import MetadataTablePlan, run_metadata_table
+    from xrd_tools.sources.selection import image_series_spec
+    root.mkdir(parents=True)
+    for index, value in enumerate(values):
+        image = root / f'scan_{index + 1:04d}.tif'
+        tifffile.imwrite(image, np.full((195, 487), value, dtype=np.float32))
+        image.with_suffix('.txt').write_text(
+            f'# Counters\nI0 = 1\n# Motors\ndel = {5 * index}, nu = {nu}\n'
+            'User: stitch, time: Mon Jan 15 10:30:00 2024  # Temp\n', encoding='utf-8')
+    table = run_metadata_table(MetadataTablePlan(image_series_spec(root / 'scan_0001.tif', metadata_format='txt')))
+    return ModuleSourceReceipt.from_metadata_table(
+        table, kind=ModuleKind.STITCH, selected_labels=tuple(range(1, len(values) + 1)),
+        resolved_selectors=tuple(MetadataColumnSelector(name) for name in ('I0', 'del', 'nu')))
+
+
+def test_grouped_scans_are_screened_only_against_themselves(tmp_path):
+    import json as _json
+    from xrd_tools.analysis.module_transaction import (
+        ModuleDisposition, ModuleKind, ModuleOutputRequest, ModuleSourceGroupReceipt,
+    )
+    from xrd_tools.analysis.stitch_operation import (
+        StitchGeometryInput, StitchGeometryKind, StitchOperationPlan, capture_stitch_geometry,
+        prepare_stitch_operation, run_stitch_operation,
+    )
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind
+    from xrd_tools.io.output_path import resolve_finite_output_target
+    from tests.core.test_stitch_operation import _goniometer_record
+    # Two healthy scans at very different count levels on the same nu row; the dim
+    # scan's last frame is genuinely dead.
+    bright = _constant_series(tmp_path / 'bright', [10000.] * 4, -10)
+    dim = _constant_series(tmp_path / 'dim', [10., 10., 10., 0.], -10)
+    group = ModuleSourceGroupReceipt.from_members((bright, dim), kind=ModuleKind.STITCH)
+    geometry_path = tmp_path / 'geometry.json'
+    geometry_path.write_text(_json.dumps(_goniometer_record()), encoding='utf-8')
+    geometry = capture_stitch_geometry(StitchGeometryInput(
+        geometry_path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
+        source_motors=(('del_angle', 'del'), ('nu_angle', 'nu'))))
+    plan = StitchOperationPlan(geometry, native_records=True, npt_1d=96,
+                               conditioning=StitchConditioning('off'))
+    target = resolve_finite_output_target(tmp_path, 'grouped', operation_token='stitch-1d')
+    output = ModuleOutputRequest(target, AnalysisArtifactKind.STITCH_1D, artifact_family='grouped')
+    request = prepare_stitch_operation(group, output, plan, project_root=tmp_path)
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    assert result.frame_screen['excluded'] == [7]
+    assert result.frame_screen['empty'] == [7] and result.frame_screen['partial'] == []
+
+
+def test_grouped_xu_rows_keep_their_member(tmp_path):
+    from xrd_tools.analysis.stitch_operation import _frame_screen_rows
+    from tests.core.test_native_stitch_operation import _native
+    rows = _frame_screen_rows(_native(tmp_path, 'xu_hist', 'q_A^-1', grouped=True))
+    assert {member for member, _nu in rows} == {0, 1}

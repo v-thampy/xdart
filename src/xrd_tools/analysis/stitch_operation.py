@@ -2415,9 +2415,15 @@ def _frame_screen_rows(request: StitchOperationRequest) -> tuple[float, ...]:
         # A goniometer JSON names the position nu_angle; a PONI geometry names it nu.
         motors = dict(plan.geometry.request.source_motors)
         name = motors.get("nu_angle") or motors.get("nu", "")
+    manifest = request.manifest
     values = {item.label: {(n, o): v for n, o, v in item.values}
-              for item in request.manifest.contributions}
-    return tuple(round(float(values[label].get((name, 0), 0.0)), 6) if name else 0.0
+              for item in manifest.contributions}
+    # A group's members are separate scans; never compare frames across them.
+    members = ({item.label: member for item, (member, _label)
+                in zip(manifest.contributions, manifest.member_frames, strict=True)}
+               if type(manifest) is StitchGroupManifestReceipt else {})
+    return tuple((members.get(label, 0),
+                  round(float(values[label].get((name, 0), 0.0)), 6) if name else 0.0)
                  for label in request.module.source.selected_labels)
 
 
