@@ -205,7 +205,6 @@ def _control_path_chooser(widget):
     from xdart.gui.tabs.scattering.controls_projection import (
         BACKGROUND_DIRECTORY,
         BACKGROUND_FILE,
-        FLAT_FILE,
         PONI_FILE,
         PROJECT_ROOT,
         SAVE_PATH,
@@ -228,10 +227,6 @@ def _control_path_chooser(widget):
             else
             ("Choose PONI calibration", "PONI files (*.poni);;All files (*)")
             if path == PONI_FILE
-            else
-            ("Choose flat field",
-             "Flat fields (*.npy *.edf *.tif *.tiff *.cbf);;All files (*)")
-            if path == FLAT_FILE
             else (
                 "Choose detector mask",
                 "Detector masks (*.edf *.npy)",

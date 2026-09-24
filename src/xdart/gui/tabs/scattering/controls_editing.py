@@ -41,7 +41,6 @@ from .controls_inventory import (
     GI_2D_COMBINED_AXIS,
     GI_2D_COMBINED_MODES,
     GI_COMPANION_MODES_2D_ARG,
-    FLAT_FILE,
     GI_ENABLED,
     GI_MOTOR,
     GI_ORIENTATION,
@@ -162,6 +161,9 @@ class AdvancedSettingsValues:
     poni_v3_material: object = "Si"
     poni_v3_thickness_m: object = 0.00045
     poni_v3_parallax: object = False
+    #: Detector corrections: dark-current and flat-field image files ("" = none).
+    dark_file: object = ""
+    flat_file: object = ""
 
 
 def advanced_settings_values(
@@ -190,6 +192,8 @@ def advanced_settings_values(
             0.00045 if override is None else override.thickness_m
         ),
         poni_v3_parallax=False if override is None else override.parallax,
+        dark_file=intent.dark_file,
+        flat_file=intent.flat_file,
     )
 
 
@@ -265,6 +269,8 @@ def reduce_advanced_settings(
         )
     if type(values.poni_v3_parallax) is not bool:
         return EditRefusal("PONI v3 parallax requires true or false.")
+    if type(values.dark_file) is not str or type(values.flat_file) is not str:
+        return EditRefusal("Dark and flat-field paths must be text.")
     desired = AdvancedSettingsValues(
         one_d=one_d,
         two_d=two_d,
@@ -274,6 +280,8 @@ def reduce_advanced_settings(
         poni_v3_material=values.poni_v3_material,
         poni_v3_thickness_m=thickness,
         poni_v3_parallax=values.poni_v3_parallax,
+        dark_file=values.dark_file.strip(),
+        flat_file=values.flat_file.strip(),
     )
     if desired == current:
         return EditNoChange()
@@ -304,6 +312,8 @@ def reduce_advanced_settings(
         )
         if desired.poni_v3_override_enabled else None
     )
+    candidate.dark_file = desired.dark_file
+    candidate.flat_file = desired.flat_file
     return candidate
 
 
@@ -1076,7 +1086,7 @@ def _control_value(
     path: tuple[str, ...],
     value: object,
 ) -> object | EditRefusal:
-    if path in {PROJECT_ROOT, SAVE_PATH, PONI_FILE, MASK_FILE, FLAT_FILE}:
+    if path in {PROJECT_ROOT, SAVE_PATH, PONI_FILE, MASK_FILE}:
         if (path == MASK_FILE and type(value) is str and value
                 and Path(value).suffix.lower() not in {".edf", ".npy"}):
             return EditRefusal("Mask files must use .edf or .npy")
@@ -1138,7 +1148,6 @@ def _current_value(intent: RunIntent, path: tuple[str, ...]) -> object:
         OUTPUT_MODE: intent.output_mode,
         PONI_FILE: intent.poni_file,
         MASK_FILE: intent.mask_file,
-        FLAT_FILE: intent.flat_file,
         GI_ENABLED: intent.gi.enabled,
         GI_MOTOR: intent.gi.incidence_motor,
         GI_THETA: intent.gi.th_val,
@@ -1164,8 +1173,6 @@ def _install_value(
         intent.poni_file = value  # type: ignore[assignment]
     elif path == MASK_FILE:
         intent.mask_file = value  # type: ignore[assignment]
-    elif path == FLAT_FILE:
-        intent.flat_file = value  # type: ignore[assignment]
     elif path == GI_ENABLED:
         intent.gi.enabled = value  # type: ignore[assignment]
     elif path == GI_MOTOR:
