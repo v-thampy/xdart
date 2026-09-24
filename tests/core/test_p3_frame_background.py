@@ -769,6 +769,9 @@ def test_directory_last_saved_before_frame(monkeypatch, tmp_path: Path) -> None:
     np.testing.assert_array_equal(resolve_frame_background(plan, _fact(second)).background,
                                   np.full((2, 2), 3.0))
     moved = resolve_frame_background(plan, _fact(second))
+    later = root / "dark_z.tif"; later.write_bytes(b"later")  # saved after the frame
+    os.utime(later, ns=(90 * second_s, 90 * second_s))
+    assert resolve_frame_background(plan, _fact(second)).fingerprint == moved.fingerprint
     os.utime(tied, ns=(31 * second_s, 31 * second_s))  # a changed file time changes the record
     assert resolve_frame_background(plan, _fact(second)).fingerprint != moved.fingerprint
     container = resolve_frame_background(plan, _fact(first, dataset="/entry/data/data"))

@@ -791,6 +791,10 @@ def _saved_times(candidates, cancelled) -> dict[Path, int]:
     for candidate in candidates:
         _poll(cancelled); times[candidate] = candidate.stat().st_mtime_ns
     return times
+def _saved_by(candidates, before_ns: int, cancelled) -> tuple[Path, ...]:
+    """Only files saved by the frame can be chosen, so only they are recorded: darks
+    saved later in the scan leave the frame's dependency unchanged."""
+    return tuple(path for path, when in _saved_times(candidates, cancelled).items() if when <= before_ns)
 def _last_saved(times: dict[Path, int], before_ns: int) -> Path | None:
     """The Background file saved last, not after the frame; the later name breaks a tie."""
     saved = [path for path, when in times.items() if when <= before_ns]
@@ -916,6 +920,7 @@ def resolve_frame_background(
                 raise ValueError("Last Saved Before Frame: the Background folder holds the frames; "
                                  "set a Filename Filter that selects only the Background files")
             saved_before = target_path.stat().st_mtime_ns
+            candidates = _saved_by(candidates, saved_before, cancelled)
             pick = _last_saved(_saved_times(candidates, cancelled), saved_before)
             if pick is None: raise ValueError("no Background file was saved before this frame")
         for candidate in candidates:
@@ -947,6 +952,7 @@ def resolve_frame_background(
             candidates, plan, target_tag, target_match, chosen, selected_facts,
             shape, cancelled, saved_before), cancelled); del candidates
         fresh = _directory_paths(root, target_path, predicate, cancelled)
+        if saved_before is not None: fresh = _saved_by(fresh, saved_before, cancelled)
         second = _manifest(prefix, _directory_receipts(
             fresh, plan, target_tag, target_match, chosen, selected_facts,
             shape, cancelled, saved_before), cancelled); del fresh

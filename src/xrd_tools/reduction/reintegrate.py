@@ -1989,6 +1989,8 @@ def _validated_shared_science(run: Mapping[str, Any], requested: Mapping[str, An
     outer = dict(run); signed = outer.pop("scientific_signature", None); _reject(type(signed) is not dict, "persisted scientific signature is missing"); signed = dict(signed); assets = signed.pop("accepted_scientific_assets", None); _reject(signed != outer, "persisted duplicated scientific signature differs"); expected = {"schema_version", "generation", "fingerprint", "source", "processing_mode", "output_mode", "live_mode", "batch_mode", "max_cores", "gi", "threshold", "poni_file", "poni_values", "mask_file", "project_root", "save_path", "bai_1d_args", "bai_2d_args", "run_options"}; optional = ({"background"} if "background" in outer else set()) | ({"poni_v3_override"} if "poni_v3_override" in outer else set()) | {key for key in ("flat_file", "flat_min_fraction", "dark_file", "background_dark") if key in outer}; _reject(set(outer) != expected | optional, "persisted run configuration has a noncanonical keyset")
     background = outer.get("background", {"version": 1, "mode": "None"}); both = type(background) is dict and background.get("mode") != "None" and "dark_file" in outer
     _reject("background_dark" in outer and (not both or outer["background_dark"] not in ("subtracted", "as_is") or (outer["background_dark"] == "as_is") != (background.get("dark_corrected") is True)), "persisted Background dark rule is malformed")
+    # Earlier test builds combined the two without recording how, and not all the same way.
+    _reject(both and "background_dark" not in outer, "this output combined its Background and dark without recording how (an earlier test build); re-run it")
     _reject("flat_min_fraction" in outer and ("flat_file" not in outer or type(outer["flat_min_fraction"]) is not float or not 0.0 <= outer["flat_min_fraction"] < 1.0), "persisted flat cutoff is malformed")
     for key, name in (("flat", "flat field"), ("dark", "dark current")):
         _reject(f"{key}_file" in outer and (type(outer[f"{key}_file"]) is not str or not outer[f"{key}_file"]), f"persisted {name} is malformed")
@@ -2005,8 +2007,7 @@ def _validated_shared_science(run: Mapping[str, Any], requested: Mapping[str, An
     gi_projection = {key: persisted_gi[key] for key in ("enabled", "incidence_motor", "resolved_motor", "th_val", "sample_orientation", "tilt_angle")}
     if decoded_gi.enabled: gi_projection["gi_exit_angle_convention"] = decoded_gi.gi_exit_angle_convention
     projection = {"version": 1, "gi": gi_projection, "threshold": outer.get("threshold"), "poni_values": accepted_poni if persisted_poni is None else persisted_poni, "accepted_scientific_assets": assets, "geometry": geometry, "background": background}
-    # Outputs from before the rule was recorded subtracted a Background as it was.
-    if both: projection["background_dark"] = outer.get("background_dark", "as_is")
+    if both: projection["background_dark"] = outer["background_dark"]
     _reject(requested is not None and projection != _plain(requested), "requested shared science differs from acquisition"); return projection
 def _validate_science(selected, shared, dimension):
     from xrd_tools.reduction.background import FrameBackgroundPlan; _keys(selected, {"version", "dimension", "bai_args", "gi_mode"}, "selected_plan"); _keys(shared, {"version", "gi", "threshold", "poni_values", "accepted_scientific_assets", "geometry", "background"} | ({"background_dark"} if "background_dark" in shared else set()), "requested_shared_science"); _reject("background_dark" in shared and shared["background_dark"] not in ("subtracted", "as_is"), "Background dark rule is malformed")

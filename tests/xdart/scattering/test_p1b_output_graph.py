@@ -3317,15 +3317,17 @@ def test_darks_collected_during_a_scan_as_last_saved_background(tmp_path):
     for label in (1, 2, 3):
         np.testing.assert_allclose(get_1d(corrected, frame=label).intensity,
                                    get_1d(reference, frame=label).intensity, rtol=1e-6)
+    _write_tiff(darks / "dark_c.tif", 30)  # a dark saved after the scan changes nothing
+    os.utime(darks / "dark_c.tif", ns=(70 * second, 70 * second))
     again = _reintegrated_1d(corrected, frames)
     for label in (1, 2, 3):
         original, redone = get_1d(corrected, frame=label), get_1d(again, frame=label)
         np.testing.assert_array_equal(redone.intensity, original.intensity)
         np.testing.assert_array_equal(redone.sigma, original.sigma)
-def test_an_output_from_before_the_background_dark_rule_keeps_its_rule(tmp_path, monkeypatch):
+def test_an_output_from_before_the_background_dark_rule_is_refused(tmp_path, monkeypatch):
     # The build before 3b614512 subtracted a Background as it was and recorded no rule
-    # (Codex round-3/4 review F1): emulated at its two seams. Append now refuses such an
-    # output, and Reintegrate keeps its rule.
+    # (Codex round-3/4 review F1), emulated at its two seams; builds from 3b614512 removed
+    # the dark first, also unrecorded. Append and Reintegrate refuse such an output.
     from xrd_tools.io import get_1d
     from xrd_tools.reduction import FrameBackgroundPlan
     from xrd_tools.reduction import background as background_module
@@ -3361,11 +3363,8 @@ def test_an_output_from_before_the_background_dark_rule_keeps_its_rule(tmp_path,
                                    get_1d(reference, frame=label).intensity, rtol=1e-6)
     assert not _append_admitted(tmp_path, poni, tmp_path / "old.nexus",
                                 tmp_path / "frame_0001.tif", 1836, **corrections)
-    again = _reintegrated_1d(old, tmp_path)
-    for label in (1, 2, 3):
-        original, redone = get_1d(old, frame=label), get_1d(again, frame=label)
-        np.testing.assert_array_equal(redone.intensity, original.intensity)
-        np.testing.assert_array_equal(redone.sigma, original.sigma)
+    with pytest.raises(ValueError, match="without recording how"):
+        _reintegrated_1d(old, tmp_path)
 @pytest.mark.parametrize("role", ("flat_file", "dark_file"))
 def test_admission_refuses_an_output_that_would_overwrite_the_flat_or_dark(tmp_path, role):
     _write_tiff(tmp_path / "frame_0001.tif", 5)
