@@ -1442,7 +1442,13 @@ class XuStitchOperationPlan:
     conditioning: StitchConditioning | None = None
     mask_path: str | Path | None = None
     frame_screen: FrameScreenPolicy = field(default_factory=FrameScreenPolicy)
+    #: pyFAI's polarization, dark and flat, applied like MultiGeometry; None = off.
+    polarization_factor: float | None = 0.99
+    dark_path: str | Path | None = None
+    flat_path: str | Path | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
+    _dark_receipt: object = field(init=False, default=None, repr=False)
+    _flat_receipt: object = field(init=False, default=None, repr=False)
     backend: str = field(init=False, default="xu_hist")
     mode: str = field(init=False, default="1d")
     method: str = field(init=False, default="numpy_histogram_center_v1")
@@ -1453,6 +1459,10 @@ class XuStitchOperationPlan:
         _native_plan_fields(self)
         if type(self.frame_screen) is not FrameScreenPolicy:
             raise TypeError("frame screen must be an exact FrameScreenPolicy")
+        if not self.native_records and (self.dark_path is not None or self.flat_path is not None):
+            raise ValueError("XU dark and flat corrections require native records")
+        _polarization_field(self)
+        _detector_image_fields(self)
         if self.q_min_A_inverse is not None or self.q_max_A_inverse is not None:
             if (type(self.q_min_A_inverse) is not float or type(self.q_max_A_inverse) is not float
                     or self.unit != "q_A^-1" or self.radial_range not in
@@ -1503,21 +1513,39 @@ class XuStitchOperationPlan:
                     self.calibration.fingerprint,
                     self.effective_geometry.fingerprint,
                     self.frame_screen.identity(),
-                ) + (native_plan_identity(self) if self.native_records else ()),
+                ) + _xu_corrections_identity(self)
+                + (native_plan_identity(self) if self.native_records else ()),
             ),
         )
+
+def _xu_corrections_identity(plan):
+    """Only a corrected XU plan changes its identity; an uncorrected one keeps the old one."""
+    if plan.polarization_factor is None and plan._dark_receipt is None and plan._flat_receipt is None:
+        return ()
+    return (("xu-corrections-v1", plan.polarization_factor,
+             None if plan._dark_receipt is None else plan._dark_receipt.fingerprint,
+             None if plan._flat_receipt is None else plan._flat_receipt.fingerprint),)
+
 
 def _correction_fields(plan):
     if type(plan.correct_solid_angle) is not bool:
         raise TypeError("correct_solid_angle must be an exact bool")
+    _polarization_field(plan)
+    if plan.error_model not in STITCH_ERROR_MODELS:
+        raise ValueError(f"Stitch error model must be one of {STITCH_ERROR_MODELS}")
+    _detector_image_fields(plan)
+
+
+def _polarization_field(plan):
     factor = plan.polarization_factor
     if factor is not None:
         if (isinstance(factor, bool) or not isinstance(factor, (int, float))
                 or not math.isfinite(factor) or not -1.0 <= factor <= 1.0):
             raise ValueError("polarization factor must be a finite number from -1 to 1, or None")
         object.__setattr__(plan, "polarization_factor", float(factor))
-    if plan.error_model not in STITCH_ERROR_MODELS:
-        raise ValueError(f"Stitch error model must be one of {STITCH_ERROR_MODELS}")
+
+
+def _detector_image_fields(plan):
     for role in ("dark", "flat"):
         path = getattr(plan, f"{role}_path")
         if path is not None:
@@ -1909,6 +1937,13 @@ def _xu_provenance(
             "use_detector_mask": plan.use_detector_mask,
             "max_frame_bytes": plan.max_frame_bytes,
             "frame_screen": plan.frame_screen.to_provenance(),
+            **({} if not _xu_corrections_identity(plan) else {"corrections": {
+                "polarization_factor": plan.polarization_factor,
+                "dark": (None if plan._dark_receipt is None
+                         else plan._dark_receipt.to_provenance(Path(manifest.project_root))),
+                "flat": (None if plan._flat_receipt is None
+                         else plan._flat_receipt.to_provenance(Path(manifest.project_root))),
+            }}),
             "asset_receipt_fingerprint": receipt.fingerprint,
             "effective_geometry_fingerprint": plan.effective_geometry.fingerprint,
             "plan_fingerprint": plan.fingerprint,
@@ -1940,7 +1975,7 @@ def _xu_provenance(
             "generic-xu-diffractometers-and-detectors",
             "external-or-combined-masks",
             "sensor-parallax-xu-geometry",
-            "new-corrections-and-variance",
+            "xu-sigma-and-variance",
             "mixed-energy-grouped-xu-stitch",
             "historical-json-migration",
             "unvalidated-platforms-and-live-gates",
@@ -2685,6 +2720,9 @@ class StitchOperationExecution:
                     conditioning=plan.conditioning,
                     mask=external_mask,
                     frame_record_callback=frame_callback,
+                    polarization_factor=plan.polarization_factor,
+                    dark=native_detector_image(plan, plan._dark_receipt),
+                    flat=native_detector_image(plan, plan._flat_receipt),
                     npt=plan.npt_1d,
                     monitor_key=(
                         None

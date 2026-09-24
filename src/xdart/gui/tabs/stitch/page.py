@@ -395,7 +395,7 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["sample_position"].setToolTip(
             "On rotation axis drops a stacked-arm calibration's fitted sample offset, "
             "for a sample aligned onto the axis (for example after GI alignment).")
-        self.corrections_card = SubsectionCard("Corrections (pyFAI)")
+        self.corrections_card = SubsectionCard("Corrections")
         advanced_layout.addWidget(self.corrections_card)
         card = self.corrections_card
         self._field(card, SectionId.PROCESSING, "solid_angle", "Solid angle", "On", choices=("On", "Off"))
@@ -574,10 +574,11 @@ class StitchPage(QtWidgets.QWidget):
 
     def _backend_changed(self, *_args):
         xu = self._value("backend") == "xrayutilities histogram"
-        # XU applies its pinned solid angle only; the frame check applies to both.
-        self.corrections_card.setEnabled(not xu)
-        self._fields["sample_position"] = replace(self._fields["sample_position"], enabled=not xu)
-        self._rows["sample_position"].apply_field(self._fields["sample_position"])
+        # XU always applies its solid angle and has no uncertainty or sample-position
+        # model; polarization, dark, flat and the frame check apply to both backends.
+        for key in ("sample_position", "solid_angle", "error_model"):
+            self._fields[key] = replace(self._fields[key], enabled=not xu)
+            self._rows[key].apply_field(self._fields[key])
         self.set_field("source_motors", "del=del, nu=nu" if xu else "del_angle=del, nu_angle=nu")
         if not xu and not str(self._value("image_rotation")).strip():
             self.set_field("image_rotation", "0")
@@ -655,19 +656,19 @@ class StitchPage(QtWidgets.QWidget):
                 conditioning=conditioning, mask_path=str(value("mask_path")) or None,
                 output_family=str(value("output_family")).strip() or None,
                 frame_screen=_FRAME_CHECKS[value("frame_check")])
+            polarization = str(value("polarization")).strip()
+            try:
+                factor = float(polarization) if polarization else None
+            except ValueError as error:
+                raise ValueError("Polarization must be a number from -1 to 1, or blank") from error
+            native.update(polarization_factor=factor,
+                          dark_path=str(value("dark_path")).strip() or None,
+                          flat_path=str(value("flat_path")).strip() or None)
             if value("backend") != "xrayutilities histogram":
-                polarization = str(value("polarization")).strip()
-                try:
-                    factor = float(polarization) if polarization else None
-                except ValueError as error:
-                    raise ValueError("Polarization must be a number from -1 to 1, or blank") from error
                 native.update(
                     sample_position=_SAMPLE_POSITIONS[value("sample_position")],
                     correct_solid_angle=value("solid_angle") == "On",
-                    polarization_factor=factor,
-                    error_model="poisson" if value("error_model") == "Poisson" else None,
-                    dark_path=str(value("dark_path")).strip() or None,
-                    flat_path=str(value("flat_path")).strip() or None)
+                    error_model="poisson" if value("error_model") == "Poisson" else None)
             if ";" in str(value("output_family")):
                 native.update(output_family=None,
                     output_families=tuple(part.strip() for part in str(value("output_family")).split(";")))

@@ -185,7 +185,8 @@ def prepare_native_stitch_tool(form, project):
             effective = resolve_xu_stitch_effective_geometry(calibration, session).projection
         if runtime_owner.execution_record is None:
             raise StitchToolPreflightRefused("XU_RUNTIME_CONFIG_RESTORE_FAILED")
-        plan = XuStitchOperationPlan(calibration, effective, **common)
+        plan = XuStitchOperationPlan(calibration, effective, polarization_factor=form.polarization_factor,
+                                     dark_path=form.dark_path, flat_path=form.flat_path, **common)
         acquisition = calibration.projection.value["acquisition"]
         motors = tuple(acquisition["source_motors"].values())
         energy_name = acquisition["source_energy_selector"]

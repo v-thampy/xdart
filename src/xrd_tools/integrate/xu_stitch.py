@@ -525,6 +525,39 @@ class XuPowderQFrameLease:
             )
         return q
 
+    def polarization(self, factor: float, wavelength_A: float, beam, vertical) -> np.ndarray:
+        """pyFAI's polarization factor per pixel, from the elastic scattered direction.
+
+        ``P = ½(1 + cos²2θ − f·cos2χ·sin²2θ)`` with χ measured from the horizontal
+        axis (perpendicular to the beam and the vertical), so ``f = 1`` is fully
+        horizontal polarization, as in pyFAI.
+        """
+        if self._released:
+            raise RuntimeError("XU q-frame lease is released")
+        k = 2 * math.pi / wavelength_A
+        horizontal = np.cross(beam, vertical)
+        qx, qy, qz = self._values
+        # k_f = q + k·beam; beam, vertical and horizontal are orthonormal.
+        along = qx * beam[0] + qy * beam[1] + qz * beam[2] + k
+        up = qx * vertical[0] + qy * vertical[1] + qz * vertical[2]
+        side = qx * horizontal[0] + qy * horizontal[1] + qz * horizontal[2]
+        along *= along
+        up *= up
+        side *= side
+        norm = along + up + side
+        finite = np.isfinite(norm)
+        if np.any(np.abs(norm[finite] / (k * k) - 1.0) > 1e-9):
+            raise XuStitchScienceRefused(
+                "XU_POLARIZATION_GEOMETRY", "XU q is not elastic for the mapping wavelength",
+            )
+        side -= up
+        side *= -factor
+        side += along
+        side /= norm
+        side += 1.0
+        side *= 0.5
+        return side
+
     def release(self) -> None:
         if self._released:
             return
@@ -574,6 +607,27 @@ class XuPowderQProvider:
         return XuPowderQFrameLease(area, self.geometry.projection.shape)
 
 
+_AXES = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
+
+
+def _polarization_axes(asset) -> tuple[np.ndarray, np.ndarray]:
+    """The beam and the lab vertical of an XU asset.
+
+    The outer detector circle (nu) scatters in the horizontal plane, so its
+    rotation axis is the vertical, whatever the asset's axis names.
+    """
+    xu_asset = asset["xrayutilities"]
+    beam = np.asarray(xu_asset["incident_beam"], dtype=np.float64)
+    axis = str(xu_asset["detector_axes"][0])
+    if beam.shape != (3,) or not np.isfinite(beam).all() or axis[:1] not in _AXES:
+        raise XuStitchScienceRefused("XU_POLARIZATION_GEOMETRY", "XU beam or detector axis is unsupported")
+    beam = beam / np.linalg.norm(beam)
+    vertical = np.asarray(_AXES[axis[0]])
+    if abs(float(beam @ vertical)) > 1e-12:
+        raise XuStitchScienceRefused("XU_POLARIZATION_GEOMETRY", "the nu circle axis is not perpendicular to the beam")
+    return beam, vertical
+
+
 def _radial_coordinates(q, unit, wavelength_A):
     if unit == "q_A^-1":
         return q
@@ -619,10 +673,17 @@ def _checked_frame_histograms(
     conditioning: StitchConditioning | None = None,
     mask: np.ndarray | None = None,
     frame_record_callback: Callable[[int, np.ndarray], None] | None = None,
+    polarization: tuple | None = None,
+    dark: np.ndarray | None = None,
+    flat: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Produce one frame's 1-D contributions and prove frame release."""
+    """Produce one frame's 1-D contributions and prove frame release.
 
-    raw_image = image = q = valid = None
+    As in pyFAI, a dark is subtracted from the conditioned frame, and the flat
+    and polarization weight the normalization next to the solid angle.
+    """
+
+    raw_image = image = q = valid = weights = factor = None
     lease: XuPowderQFrameLease | None = None
     owned_refs: list[weakref.ReferenceType] = []
     pending: BaseException | None = None
@@ -646,6 +707,8 @@ def _checked_frame_histograms(
                 "XU_FRAME_SHAPE_UNSUPPORTED",
                 "oriented float64 frame differs from SURFACE shape/envelope",
             )
+        if dark is not None:
+            np.subtract(image, dark, out=image)
         try:
             with np.errstate(divide="raise", invalid="ignore", over="raise"):
                 np.divide(image, monitor, out=image)
@@ -668,8 +731,19 @@ def _checked_frame_histograms(
         d_signal = np.histogram(
             q[valid], q_edges, weights=image[valid]
         )[0]
+        weights = geometry.solid_angle
+        if polarization is not None or flat is not None:
+            weights = np.array(geometry.solid_angle, dtype=np.float64, copy=True)
+            owned_refs.append(weakref.ref(weights))
+            if polarization is not None:
+                factor = lease.polarization(*polarization)
+                owned_refs.append(weakref.ref(factor))
+                np.multiply(weights, factor, out=weights)
+                factor = None
+            if flat is not None:
+                np.multiply(weights, flat, out=weights)
         d_normalization = np.histogram(
-            q[valid], q_edges, weights=geometry.solid_angle[valid]
+            q[valid], q_edges, weights=weights[valid]
         )[0]
         d_count = np.histogram(q[valid], q_edges)[0].astype(
             np.float64,
@@ -681,7 +755,7 @@ def _checked_frame_histograms(
     except BaseException as error:
         pending = error.with_traceback(None)
     finally:
-        raw_image = image = q = valid = None
+        raw_image = image = q = valid = weights = factor = None
         release_error: BaseException | None = None
         if lease is not None:
             try:
@@ -819,6 +893,9 @@ def run_xu_hist_stitch_1d(
     mask: np.ndarray | None = None,
     frame_record_callback: Callable[[int, np.ndarray], None] | None = None,
     frame_screen: object = None,
+    polarization_factor: float | None = None,
+    dark: np.ndarray | None = None,
+    flat: np.ndarray | None = None,
 ) -> XuStitchScienceResult:
     """Run native Q or 2theta histogram bins; omitted bounds scout all geometry.
 
@@ -829,6 +906,8 @@ def run_xu_hist_stitch_1d(
     ``image_rotation_quarter_turns``. This kernel does not rotate them;
     ``StitchOperationExecution`` applies the rotation for native plans.
     ``frame_record_callback`` borrows each raw frame before conditioning.
+    ``polarization_factor``, ``dark`` and ``flat`` (oriented like the frames)
+    apply pyFAI's corrections; an unusable dark or flat pixel joins the mask.
     """
     if type(receipt) is not XuStitchCalibrationReceipt:
         raise TypeError("XU Stitch science requires exact calibration receipt")
@@ -847,6 +926,10 @@ def run_xu_hist_stitch_1d(
         raise ValueError("Stitch radial range must be finite and increasing")
     if conditioning is not None and type(conditioning) is not StitchConditioning:
         raise TypeError("conditioning must be exact StitchConditioning or absent")
+    if polarization_factor is not None and (
+            isinstance(polarization_factor, bool) or not isinstance(polarization_factor, (int, float))
+            or not math.isfinite(polarization_factor) or not -1.0 <= polarization_factor <= 1.0):
+        raise ValueError("polarization factor must be a finite number from -1 to 1, or None")
     if frame_record_callback is not None and not callable(frame_record_callback):
         raise TypeError("frame-record callback must be callable")
     labels = tuple(frame_indices)
@@ -1029,6 +1112,18 @@ def run_xu_hist_stitch_1d(
         if mask is not None:
             if type(mask) is not np.ndarray or mask.dtype != np.dtype(bool) or mask.shape != geometry.projection.shape:
                 raise ValueError("external mask must be boolean with the calibrated detector shape")
+        from xrd_tools.integrate.multi import _detector_correction
+        dark, dark_invalid = _detector_correction(dark, "dark", 0.0)
+        flat, flat_invalid = _detector_correction(flat, "flat", 1.0)
+        for name, value, invalid in (("dark", dark, dark_invalid), ("flat", flat, flat_invalid)):
+            if value is not None and value.shape != geometry.projection.shape:
+                raise ValueError(f"Stitch {name} must have the calibrated detector shape")
+            if invalid is not None:
+                mask = invalid if mask is None else np.logical_or(mask, invalid)
+        polarization = None
+        if polarization_factor is not None:
+            polarization = (float(polarization_factor), geometry.projection.xu_mapping_wavelength_A,
+                            *_polarization_axes(asset))
         bounds = radial_range if radial_range is not None else _scout_radial_range(
             provider, frame_inputs, unit, wavelength_A, cancel_token,
         )
@@ -1056,6 +1151,9 @@ def run_xu_hist_stitch_1d(
                 conditioning=conditioning,
                 mask=mask,
                 frame_record_callback=frame_record_callback,
+                polarization=polarization,
+                dark=dark,
+                flat=flat,
             )
             release_count += 1
             if (

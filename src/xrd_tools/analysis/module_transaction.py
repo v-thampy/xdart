@@ -716,7 +716,7 @@ def _validate_xu_stitch_v2_intent(
         or type(corrections) is not dict
         or not corrections
         or type(plan) is not dict
-        or set(plan) - {"frame_screen"}
+        or set(plan) - {"frame_screen", "corrections"}
         != {
             "backend",
             "mode",
@@ -732,6 +732,8 @@ def _validate_xu_stitch_v2_intent(
             "plan_fingerprint",
         } | ({"native_records", "conditioning", "mask"} if native else set())
         or ("frame_screen" in plan and type(plan["frame_screen"]) is not dict)
+        or ("corrections" in plan and (type(plan["corrections"]) is not dict
+                                       or set(plan["corrections"]) != {"polarization_factor", "dark", "flat"}))
         or plan.get("backend") != "xu_hist"
         or plan.get("mode") != "1d"
         or plan.get("unit") not in ({"q_A^-1", "2th_deg"} if native else {"q_A^-1"})

@@ -337,3 +337,44 @@ def test_scan14_native_result_records_the_frame_check(isolated_scan14_project):
     assert sorted(label for label, (screen, excluded) in verdicts.items()
                   if screen == "partial" and not excluded) == [99, 106, 120, 272]
     assert result.frame_screen["excluded"] == [52, 164]
+
+
+@pytest.mark.slow
+def test_scan14_xu_polarization_tracks_multigeometry(isolated_scan14_project):
+    """XU applies pyFAI's polarization: the XU/MultiGeometry ratio is unchanged by it."""
+    project = isolated_scan14_project
+    labels = tuple(range(0, 287, 11))
+    mg = _scan14_request(project, project / "pol-mg-legacy.nexus", labels)
+    calibration = install_canonical_xu_stitch_calibration(project_root=project)
+    with xu_runtime_session() as runtime:
+        effective = resolve_xu_stitch_effective_geometry(calibration, runtime).projection
+    table = run_metadata_table(MetadataTablePlan(mg.module.source.analysis.source_spec))
+    xu_source = ModuleSourceReceipt.from_metadata_table(
+        table, kind=ModuleKind.STITCH, selected_labels=labels,
+        resolved_selectors=tuple(MetadataColumnSelector(name) for name in ("del", "nu", "energy")
+                                 if name in {column.name for column in table.columns}))
+    intensity = {}
+    for factor in (None, .99):
+        plans = {
+            "mg": (mg.module.source, replace(mg.plan, npt_1d=760, radial_range=(1.0, 5.2),
+                                             polarization_factor=factor)),
+            "xu": (xu_source, XuStitchOperationPlan(calibration, effective, 1.0, 5.2, npt_1d=760,
+                                                    max_frame_bytes=64 * 1024 * 1024,
+                                                    polarization_factor=factor)),
+        }
+        for name, (source, plan) in plans.items():
+            output = ModuleOutputRequest(project / f"pol-{name}-{factor}.nexus", AnalysisArtifactKind.STITCH_1D,
+                                         AnalysisArtifactOverwrite.CREATE_NEW)
+            result = run_stitch_operation(prepare_stitch_operation(source, output, plan, project_root=project))
+            assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+            intensity[name, factor] = np.asarray(result.payload.intensity, dtype=float)
+    plain = intensity["mg", None]
+    rings = np.isfinite(np.stack(list(intensity.values()))).all(axis=0) & (plain > np.nanmedian(plain))
+    effect = np.median(np.abs(intensity["mg", .99][rings] / plain[rings] - 1))
+    ratio_on = intensity["xu", .99][rings] / intensity["mg", .99][rings]
+    ratio_off = intensity["xu", None][rings] / plain[rings]
+    drift = np.abs(ratio_on / ratio_off - 1)
+    print(f"polarization effect median {effect:.4g}; XU/MG ratio drift median {np.median(drift):.4g} "
+          f"p90 {np.percentile(drift, 90):.4g} max {drift.max():.4g}; bins {int(rings.sum())}")
+    assert effect > .02, effect  # polarization moves the MultiGeometry intensities
+    assert np.median(drift) < effect / 10

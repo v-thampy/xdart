@@ -51,30 +51,41 @@ def test_advanced_options_reach_the_prepared_plan(qapp, tmp_path):
         _close(page, qapp)
 
 
-def test_xu_backend_greys_pyfai_options_and_keeps_the_frame_check(qapp, tmp_path):
+def test_xu_backend_takes_polarization_dark_and_flat_and_greys_the_rest(qapp, tmp_path):
     form = _native_form(tmp_path, "xu_hist", scans="1")
+    dark = tmp_path / "dark.npy"
+    np.save(dark, np.zeros((195, 1475)))
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(form)
-        assert not page.corrections_card.isEnabled()
-        assert not page._rows["sample_position"].editor.isEnabled()
+        assert page.corrections_card.isEnabled()
+        for key in ("sample_position", "solid_angle", "error_model"):
+            assert not page._rows[key].editor.isEnabled(), key
+        for key in ("polarization", "dark_path", "flat_path"):
+            assert page._rows[key].editor.isEnabled(), key
         for key, value in (("frame_check", "Keep all frames"), ("polarization", "0.5"),
-                           ("dark_path", str(tmp_path / "absent.npy"))):
+                           ("dark_path", str(dark)), ("error_model", "Poisson")):
             page.set_field(key, value)
         built = page.build_form()
-        assert (built.frame_screen, built.polarization_factor, built.dark_path) == ("none", .99, None)
+        assert (built.frame_screen, built.polarization_factor, built.dark_path) == ("none", .5, str(dark))
+        assert built.error_model is None  # greyed for XU: never forwarded
         plan = prepare_stitch_tool(built).request.plan
         assert type(plan) is XuStitchOperationPlan and plan.frame_screen.exclude == "none"
+        assert plan.polarization_factor == .5 and plan._dark_receipt is not None
         page.set_field("backend", "pyFAI MultiGeometry")
-        assert page.corrections_card.isEnabled() and page._rows["sample_position"].editor.isEnabled()
+        assert page._rows["sample_position"].editor.isEnabled()
+        assert page._rows["solid_angle"].editor.isEnabled() and page._rows["error_model"].editor.isEnabled()
     finally:
         _close(page, qapp)
 
 
 def test_form_refuses_pyfai_options_outside_native_pyfai(tmp_path):
     xu = _native_form(tmp_path, "xu_hist", scans="1")
-    with pytest.raises(ValueError, match="pinned solid angle"):
+    with pytest.raises(ValueError, match="no uncertainty"):
         replace(xu, error_model="poisson")
+    with pytest.raises(ValueError, match="no uncertainty"):
+        replace(xu, correct_solid_angle=False)
+    assert replace(xu, polarization_factor=None).polarization_factor is None
     (tmp_path / "legacy").mkdir()
     legacy = _form(tmp_path / "legacy", "multigeometry")
     with pytest.raises(ValueError, match="native source selection"):

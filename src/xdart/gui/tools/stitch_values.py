@@ -506,14 +506,15 @@ class StitchToolForm:
         for name in ("dark_path", "flat_path"):
             if getattr(self, name) is not None:
                 object.__setattr__(self, name, _absolute_path(getattr(self, name), name.replace("_", " ")))
+        corrected = (self.polarization_factor != 0.99 or self.dark_path is not None
+                     or self.flat_path is not None)
         pyfai_only = (self.sample_position != "calibrated" or not self.correct_solid_angle
-                      or self.polarization_factor != 0.99 or self.error_model is not None
-                      or self.dark_path is not None or self.flat_path is not None)
-        if not native and (pyfai_only or self.frame_screen != "empty"):
+                      or self.error_model is not None)
+        if not native and (pyfai_only or corrected or self.frame_screen != "empty"):
             raise ValueError("native processing requires a native source selection")
         if self.backend == "xu_hist" and pyfai_only:
-            raise ValueError("the XU backend applies its pinned solid angle only; "
-                             "sample position and corrections need pyFAI MultiGeometry")
+            raise ValueError("the XU backend always applies solid angle and has no uncertainty "
+                             "or sample position; those need pyFAI MultiGeometry")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1046,7 +1047,7 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
                 "xu-2d-and-chi",
                 "gi-stitch-on-xu",
                 "sensor-parallax-xu-geometry",
-                "new-corrections-and-variance",
+                "xu-sigma-and-variance",
                 "mixed-energy-grouped-xu-stitch",
                 "unvalidated-platforms-and-live-gates",
             )
