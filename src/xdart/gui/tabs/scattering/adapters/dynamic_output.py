@@ -652,6 +652,10 @@ def _science_projection(
         "poni_values": values["poni_values"],
         "accepted_scientific_assets": assets,
         **({"background": values["background"]} if "background" in values else {}),
+        # The flat's digest covers its file; a cutoff away from the default
+        # changes which pixels it masks, so Append must match it too.
+        **({"flat_min_fraction": values["flat_min_fraction"]}
+           if "flat_min_fraction" in values else {}),
     }
 
 
