@@ -47,16 +47,21 @@ def test_one_frame_matches_pyfai_with_dark_flat_polarization_and_poisson():
     invalid = np.zeros(SHAPE, bool)
     invalid[0, 0] = invalid[1, 1] = True
     solid = ai.detector.pixel1 * ai.detector.pixel2 / ai.dist ** 2
-    expected = ai.integrate1d_ng(
-        raw, npt, correctSolidAngle=True, polarization_factor=.95, error_model='poisson',
-        dark=np.where(invalid, 0., dark), flat=np.where(invalid, 1., flat),
-        mask=mask_with_detector(ai, invalid), radial_range=fixed_radial,
-        azimuth_range=fixed_azimuth, unit='q_A^-1', method='full', safe=True,
-        normalization_factor=monitor * solid)
+    common = dict(correctSolidAngle=True, polarization_factor=.95,
+                  dark=np.where(invalid, 0., dark), flat=np.where(invalid, 1., flat),
+                  mask=mask_with_detector(ai, invalid), radial_range=fixed_radial,
+                  azimuth_range=fixed_azimuth, unit='q_A^-1', method='full', safe=True,
+                  normalization_factor=monitor * solid)
+    # pyFAI's Poisson model treats the dark as noiseless; a measured dark adds its counts.
+    expected = ai.integrate1d_ng(raw, npt, variance=np.maximum(raw, 1.) + np.where(invalid, 0., dark),
+                                 **common)
     np.testing.assert_allclose(payload.intensity, expected.intensity, rtol=1e-12, atol=0)
     np.testing.assert_allclose(payload.sigma, expected.sigma, rtol=1e-12, atol=0)
+    noiseless = ai.integrate1d_ng(raw, npt, error_model='poisson', **common)
+    finite = np.isfinite(payload.sigma) & (payload.sigma > 0)
+    assert np.all(payload.sigma[finite] > noiseless.sigma[finite])
 
-    # Subtracting the dark before pyFAI would lose its variance: sigma shrinks.
+    # Subtracting the dark before pyFAI would also lose the raw frame's full counts.
     subtracted, _ = stitch_1d_streaming([raw - np.nan_to_num(dark)], 1, lambda: iter([_ai()]),
                                         flat=flat, **kwargs)
     finite = np.isfinite(payload.sigma) & (payload.sigma > 0)

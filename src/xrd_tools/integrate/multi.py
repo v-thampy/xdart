@@ -194,8 +194,10 @@ def _streaming_multigeometry(
     if mode not in {"1d", "2d"}:
         raise ValueError(f"mode must be '1d' or '2d', got {mode!r}")
     factors = _normalization_factors(normalization, image_count)
-    # pyFAI applies both: the dark in its preprocessing (so the Poisson variance
-    # is raw + dark) and the flat in the normalization, like solid angle.
+    # pyFAI subtracts the dark in its preprocessing and applies the flat in the
+    # normalization, like solid angle. Its Poisson model treats the dark as
+    # noiseless (variance max(1, raw)); a measured dark carries its own counting
+    # noise, so with a dark the variance max(1, raw) + dark is passed explicitly.
     dark, dark_invalid = _detector_correction(dark, "dark", 0.0)
     flat, flat_invalid = _detector_correction(flat, "flat", 1.0)
     invalid = (dark_invalid if flat_invalid is None else flat_invalid if dark_invalid is None
@@ -250,6 +252,10 @@ def _streaming_multigeometry(
             integrator.reset(collect_garbage=False)
             raise
         monitor = 1.0 if factors is None else float(factors[index])
+        variance = None
+        if dark is not None and error_model == "poisson":
+            variance = np.maximum(image, 1.0)
+            variance += np.clip(dark, 0.0, None)
         try:
             multigeometry = MultiGeometry(
                 [integrator],
@@ -267,7 +273,8 @@ def _streaming_multigeometry(
                     [image],
                     npt_rad,
                     correctSolidAngle=correct_solid_angle,
-                    error_model=error_model,
+                    error_model=error_model if variance is None else None,
+                    lst_variance=None if variance is None else [variance],
                     polarization_factor=polarization_factor,
                     normalization_factor=[monitor],
                     lst_mask=None if frame_mask is None else [frame_mask],
@@ -281,7 +288,8 @@ def _streaming_multigeometry(
                     npt_rad,
                     npt_azim,
                     correctSolidAngle=correct_solid_angle,
-                    error_model=error_model,
+                    error_model=error_model if variance is None else None,
+                    lst_variance=None if variance is None else [variance],
                     polarization_factor=polarization_factor,
                     normalization_factor=[monitor],
                     lst_mask=None if frame_mask is None else [frame_mask],

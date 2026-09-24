@@ -168,8 +168,9 @@ class StitchPlan:
     extra: dict[str, Any] = field(default_factory=dict)
     conditioning: StitchConditioning | None = None
     #: streaming multigeometry only: pyFAI error model ("poisson" gives sigma),
-    #: and detector dark / flat images in the frames' orientation, which pyFAI
-    #: applies (the dark before the variance, the flat in the normalization).
+    #: and detector dark / flat images in the frames' orientation. pyFAI
+    #: subtracts the dark and applies the flat in the normalization; with a dark,
+    #: the Poisson variance is max(1, raw) + dark (the dark's counting noise).
     error_model: str | None = None
     dark: np.ndarray | None = field(default=None, repr=False, compare=False)
     flat: np.ndarray | None = field(default=None, repr=False, compare=False)
