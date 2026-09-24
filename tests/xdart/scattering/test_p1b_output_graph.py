@@ -2727,6 +2727,35 @@ def test_standard_then_grazing_run_can_exceed_memory_target(
     assert "[MEMORY-TARGET]" in caplog.text
 
 
+@pytest.mark.parametrize("unit", ("chi_deg", "q_A^-1"))
+def test_poisson_chi_profile_runs_and_saves_no_sigma(tmp_path, unit):
+    from xrd_tools.io import FrameViewReader
+
+    for label in range(1, 4):
+        _write_tiff(tmp_path / f"frame_{label:04d}.tif", label)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    intent = _intent(tmp_path / "frame_0001.tif", tmp_path / "out.nexus", poni)
+    intent.bai_1d_args = {"npt": 64, "method": "csr", "error_model": "poisson"}
+    if unit == "chi_deg":
+        # pyFAI integrates the chi profile without variance.
+        intent.bai_1d_args.update(unit="chi_deg", radial_range=(0.5, 2.0))
+    executor = StandardRunExecutor(join_timeout=5.0)
+    identity = _start(executor, intent, request_value=1795)
+    try:
+        events = _drain_until(
+            executor, lambda values: any(e.kind in _TERMINAL for e in values),
+            timeout=90.0,
+        )
+        terminal = next(e for e in events if e.kind in _TERMINAL)
+        assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
+    finally:
+        assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+    with FrameViewReader(_written(Path(intent.save_path))) as reader:
+        view = reader.read(reader.labels()[0])
+        assert (view.sigma_1d is None) == (unit == "chi_deg")
+
+
 def test_post_g2_funded_staging_partial_grant_refuses_before_output_and_retries(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

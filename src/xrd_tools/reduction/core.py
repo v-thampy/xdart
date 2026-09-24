@@ -5585,6 +5585,16 @@ def _can_use_owned_float32_csr(
     )
 
 
+def standard_chi_profile(plan: ReductionPlan) -> bool:
+    """Whether the 1-D output is the standard (non-GI) χ profile.
+
+    pyFAI integrates that profile without variance, so it carries no sigma
+    even when an error model is set.
+    """
+    p1 = plan.integration_1d
+    return plan.gi is None and p1 is not None and str(p1.unit or "").lower() == "chi_deg"
+
+
 def _reduce_frame(
     frame: Frame,
     raw_image: np.ndarray | None,
@@ -5704,7 +5714,7 @@ def _reduce_frame(
             )
     else:
         p1 = plan.integration_1d
-        chi_mode = p1 is not None and str(p1.unit or "").lower() == "chi_deg"
+        chi_mode = standard_chi_profile(plan)
         unsafe_dynamic_mask_cache = any(
             item is not None
             and "safe" in item.extra
