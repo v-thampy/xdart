@@ -161,6 +161,7 @@ def _streaming_multigeometry(
     correct_solid_angle: bool,
     error_model: str | None,
     polarization_factor: float | None,
+    frame_screen: Any = None,
 ):
     from pyFAI.multi_geometry import MultiGeometry
 
@@ -278,11 +279,24 @@ def _streaming_multigeometry(
                     azimuthal = current_azimuthal.copy()
                 elif not np.array_equal(azimuthal, current_azimuthal):
                     raise ValueError("pyFAI returned inconsistent Stitch azimuth axes")
-            aggregate = (
-                copy.deepcopy(result)
-                if aggregate is None
-                else aggregate.union(result)
-            )
+            if frame_screen is None:
+                aggregate = (
+                    copy.deepcopy(result)
+                    if aggregate is None
+                    else aggregate.union(result)
+                )
+            else:
+                # Hold this frame until its row neighbours are known; merge the
+                # released frames in their original order.
+                # Whole-frame monitor-normalised total over valid pixels: the
+                # in-range signal legitimately shrinks at the output range edges.
+                valid = np.isfinite(image) & (image >= 0)
+                if frame_mask is not None:
+                    valid &= ~frame_mask
+                total = float(image[valid].sum()) / monitor
+                for held, verdict in frame_screen.push(total, copy.deepcopy(result)):
+                    if not verdict.excluded:
+                        aggregate = held if aggregate is None else aggregate.union(held)
         finally:
             integrator.reset(collect_garbage=False)
         # Release the detector-sized frame before asking the source for its
@@ -300,6 +314,12 @@ def _streaming_multigeometry(
         pass
     else:
         raise ValueError("streaming Stitch received more integrators than declared")
+    if frame_screen is not None:
+        for held, verdict in frame_screen.finish():
+            if not verdict.excluded:
+                aggregate = held if aggregate is None else aggregate.union(held)
+        if aggregate is None:
+            raise ValueError("every Stitch frame was excluded as a dropped frame")
     if aggregate is None or radial is None:
         raise ValueError("streaming Stitch produced no result")
     return aggregate
@@ -318,6 +338,7 @@ def stitch_1d_streaming(
     correct_solid_angle: bool = True,
     error_model: str | None = None,
     polarization_factor: float | None = None,
+    frame_screen: Any = None,
 ) -> tuple[IntegrationResult1D, StitchDiagnostics]:
     """Sequential MultiGeometry merge that retains only one detector frame."""
 
@@ -337,6 +358,7 @@ def stitch_1d_streaming(
         correct_solid_angle=correct_solid_angle,
         error_model=error_model,
         polarization_factor=polarization_factor,
+        frame_screen=frame_screen,
     )
     sigma = result.sigma if result.sigma is not None else None
     radial_unit = str(result.unit) if result.unit is not None else unit
@@ -365,6 +387,7 @@ def stitch_2d_streaming(
     correct_solid_angle: bool = True,
     error_model: str | None = None,
     polarization_factor: float | None = None,
+    frame_screen: Any = None,
 ) -> tuple[IntegrationResult2D, StitchDiagnostics]:
     """Sequential 2-D MultiGeometry merge retaining one detector frame."""
 
@@ -384,6 +407,7 @@ def stitch_2d_streaming(
         correct_solid_angle=correct_solid_angle,
         error_model=error_model,
         polarization_factor=polarization_factor,
+        frame_screen=frame_screen,
     )
     sigma = result.sigma if result.sigma is not None else None
     radial_unit = str(result.radial_unit)

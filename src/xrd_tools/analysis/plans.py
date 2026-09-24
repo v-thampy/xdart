@@ -403,8 +403,13 @@ def run_stitch(
     cancel_token: threading.Event | None = None,
     collect_frame_records: bool = True,
     frame_record_callback: Callable[[int, np.ndarray], None] | None = None,
+    frame_screen: Any = None,
 ) -> AnalysisResult:
     """Run MultiGeometry stitching over one headless frame source or a GROUP.
+
+    ``frame_screen`` (a :class:`xrd_tools.integrate.frame_screen.FrameScreen`)
+    screens dropped frames during the streaming MultiGeometry merge; the eager
+    paths refuse it rather than ignore it.
 
     A group (a sequence of sources — a multi-scan stitch) is concatenated into one
     :class:`~xrd_tools.sources.composite.CompositeFrameSource` and merged as a
@@ -435,6 +440,9 @@ def run_stitch(
         raise TypeError("streaming_multigeometry must be an exact bool")
     if plan.streaming_multigeometry and plan.backend != "multigeometry":
         raise ValueError("streaming_multigeometry requires the multigeometry backend")
+    if frame_screen is not None and not (
+            plan.streaming_multigeometry and plan.backend == "multigeometry"):
+        raise ValueError("frame screening needs the streaming MultiGeometry stitch")
     _stitch_cancelled(cancel_token)
 
     # A group (sequence of sources) → one CompositeFrameSource; a single source
@@ -672,6 +680,7 @@ def run_stitch(
                 radial_range=plan.radial_range,
                 azimuth_range=plan.azimuth_range,
                 mask=plan.mask, normalization=normalization,
+                frame_screen=frame_screen,
             )
         elif plan.mode == "2d":
             assert integrators is not None
@@ -688,6 +697,7 @@ def run_stitch(
                 npt=plan.npt_1d, unit=plan.unit, method=plan.method,
                 radial_range=plan.radial_range,
                 mask=plan.mask, normalization=normalization,
+                frame_screen=frame_screen,
             )
         else:
             assert integrators is not None
@@ -735,6 +745,7 @@ def run_stitch(
                     radial_range=plan.radial_range,
                     mask=plan.mask,
                     normalization=normalization,
+                    frame_screen=frame_screen,
                 )
             elif plan.mode == "2d":
                 payload, auxiliary = stitch_2d_streaming(
@@ -749,6 +760,7 @@ def run_stitch(
                     azimuth_range=plan.azimuth_range,
                     mask=plan.mask,
                     normalization=normalization,
+                    frame_screen=frame_screen,
                 )
             else:
                 raise ValueError(f"mode must be '1d' or '2d', got {plan.mode!r}")

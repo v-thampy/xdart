@@ -3,8 +3,9 @@
 The refinement starts from an existing stacked (del-on-nu) calibration. Ring
 points are extracted from frames spread over the scan's angle grid with pyFAI's
 own ring finder (``SingleGeometry.extract_cp``, the machinery pyFAI-calib2
-uses), seeded by that calibration. Frames with far fewer counts than the rest
-of their nu row are excluded: the beam monitor does not see a dropped frame.
+uses), seeded by that calibration. Dropped frames are excluded with the shared
+screen (:mod:`xrd_tools.integrate.frame_screen`): the beam monitor does not see a
+frame whose detector counts collapsed.
 
 The arm is refined with and without the detector-mount/sample-offset
 extension. Leave-one-nu-row-out validation decides whether the extension is
@@ -25,6 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from xrd_tools.core.geometry import Diffractometer, ImageOrientation
+from xrd_tools.integrate.frame_screen import FrameScreenPolicy, screen_totals
 from xrd_tools.integrate.refine import ControlFrame, refine_stacked_arm
 from xrd_tools.integrate.stitch_calibration import (
     CalibrationFit, _exact_source, _mg_detector_config, calibration_image_identity,
@@ -32,6 +34,8 @@ from xrd_tools.integrate.stitch_calibration import (
 )
 
 _SOURCE_MOTORS = (('del_angle', 'del'), ('nu_angle', 'nu'))
+#: Calibration excludes partial frames as well as empty ones.
+_CALIBRATION_SCREEN = FrameScreenPolicy(exclude='partial')
 
 
 @dataclass(frozen=True)
@@ -120,7 +124,7 @@ def _ring_indices(calibrant, wavelength_m):
 
 def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_rotation=0,
                              calibrant='LaB6', frame_indices=None, max_frames=48,
-                             points_per_degree=2.0, max_counts=None, min_count_ratio=0.2,
+                             points_per_degree=2.0, max_counts=None, frame_screen=_CALIBRATION_SCREEN,
                              cancelled=None) -> ScanRingPoints:
     """Extract calibrant ring points from frames across the scan's angle grid."""
     from pyFAI.goniometer import SingleGeometry  # noqa: PLC0415
@@ -177,16 +181,13 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
                 raise InterruptedError('automatic refinement cancelled')
             image, valid = pixels(index, integrator)
             totals.append(float(image[valid].sum()))
-        totals = np.array(totals)
-        nu = np.round(motors[arm.nu_motor], 6)
+        verdicts = screen_totals(totals, [int(i) for i in selected],
+                                 np.round(motors[arm.nu_motor], 6).tolist(), frame_screen)
         excluded, keep = [], []
-        for k, index in enumerate(selected):
-            peers = totals[nu == nu[k]]
-            reference = float(np.median(peers if peers.size >= 3 else totals))
-            ratio = totals[k] / reference if reference > 0 else 0.0
-            if ratio < min_count_ratio:
-                excluded.append({'index': int(index), 'reason': 'dropped frame: counts far below its nu row',
-                                 'count_ratio': float(ratio)})
+        for k, verdict in enumerate(verdicts):
+            if verdict.excluded:
+                excluded.append({'index': int(verdict.label), 'count_ratio': verdict.ratio,
+                                 'reason': f'{verdict.status} frame: counts far below its nu-row neighbours'})
             else:
                 keep.append(k)
         controls, frames = [], []
@@ -240,7 +241,7 @@ def _robust_sigma(values):
 
 def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_rotation=0,
                          calibrant='LaB6', frame_indices=None, max_frames=48, points_per_degree=2.0,
-                         max_counts=None, min_count_ratio=0.2, reject_outliers=4.5,
+                         max_counts=None, frame_screen=_CALIBRATION_SCREEN, reject_outliers=4.5,
                          min_improvement=0.2, max_rms_q=0.03, cancelled=None) -> CalibrationFit:
     """Refine a stacked-arm calibration from its calibrant scan, automatically.
 
@@ -255,7 +256,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
         spec, record, source_motors=source_motors, image_rotation=image_rotation,
         calibrant=calibrant, frame_indices=frame_indices, max_frames=max_frames,
         points_per_degree=points_per_degree, max_counts=max_counts,
-        min_count_ratio=min_count_ratio, cancelled=cancelled)
+        frame_screen=frame_screen, cancelled=cancelled)
     poni = diff.calibration.poni
     config = dict(diff.calibration.detector_config)
 
@@ -317,7 +318,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                       'method': 'pyFAI SingleGeometry.extract_cp seeded by a stacked calibration',
                       'seed_sha256': digest, 'source': source, 'calibrant': str(calibrant),
                       'points_per_degree': float(points_per_degree), 'max_counts': max_counts,
-                      'min_count_ratio': float(min_count_ratio), 'excluded_frames': list(points.excluded),
+                      'frame_screen': frame_screen.to_provenance(), 'excluded_frames': list(points.excluded),
                       'outlier_threshold_sigma': reject_outliers, 'rejected_points': result.rejected_points,
                       'validation': validation}}
     provenance = json.loads(json.dumps(provenance, default=float))

@@ -1,0 +1,113 @@
+"""Dropped-frame screening: the rule, the streaming window, and both Stitch kernels."""
+import json
+
+import numpy as np
+import pytest
+
+from xrd_tools.integrate.frame_screen import FrameScreen, FrameScreenPolicy, screen_totals
+
+
+def test_rule_classifies_against_same_row_neighbours():
+    totals = [100., 101., 0.5, 99., 102., 15., 100., 98., 50., 51., 49.]
+    rows = [0] * 8 + [1] * 3
+    verdicts = screen_totals(totals, list(range(11)), rows, FrameScreenPolicy())
+    status = [v.status for v in verdicts]
+    assert status[2] == 'empty' and verdicts[2].excluded
+    assert status[5] == 'partial' and not verdicts[5].excluded
+    assert status[8:] == ['ok', 'ok', 'ok']  # row 1 is judged against row 1 only
+    partial = screen_totals(totals, list(range(11)), rows, FrameScreenPolicy(exclude='partial'))
+    assert [v.label for v in partial if v.excluded] == [2, 5]
+    lone = screen_totals([10., 0., 10.], [0, 1, 2], [0, 1, 2], FrameScreenPolicy())
+    assert {v.status for v in lone} == {'unscreened'}
+
+
+def test_streaming_window_matches_the_complete_rule_and_keeps_order():
+    rng = np.random.default_rng(5)
+    totals = rng.uniform(50, 150, 60)
+    totals[[7, 31, 32]] = [0., 3., 12.]
+    rows = np.repeat(np.arange(6), 10)
+    policy = FrameScreenPolicy(exclude='partial', window=2)
+    screen = FrameScreen(policy, list(range(60)), rows.tolist())
+    released = []
+    for index, total in enumerate(totals):
+        released += screen.push(total, index)
+        assert len(screen._pending) <= policy.window
+    released += screen.finish()
+    assert [item for item, _ in released] == list(range(60))
+    assert screen.verdicts == screen_totals(totals, list(range(60)), rows.tolist(), policy)
+    assert screen.summary()['excluded'] == [7, 31, 32]
+
+
+def test_policy_validation():
+    with pytest.raises(ValueError):
+        FrameScreenPolicy(exclude='all')
+    with pytest.raises(ValueError):
+        FrameScreenPolicy(empty_ratio=.3, partial_ratio=.2)
+    with pytest.raises(ValueError):
+        FrameScreenPolicy(window=0)
+
+
+def _ai(delta):
+    from pyFAI.detectors import Detector
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+    return AzimuthalIntegrator(dist=.39, poni1=3.7 * 75e-6, poni2=5.9 * 172e-6, rot2=np.deg2rad(delta),
+                               detector=Detector(pixel1=75e-6, pixel2=172e-6, max_shape=(9, 13)),
+                               wavelength=.729e-10)
+
+
+def test_multigeometry_stream_excludes_an_empty_frame_exactly():
+    from xrd_tools.integrate.multi import stitch_1d_streaming
+    angles = [2., 4., 6., 8., 10., 12.]
+    images = [np.full((9, 13), 100.) for _ in angles]
+    images[3] = np.zeros((9, 13))
+
+    def run(indices, screen=None):
+        return stitch_1d_streaming([images[i] for i in indices], len(indices),
+                                   lambda: (_ai(angles[i]) for i in indices), npt=40,
+                                   radial_range=(0., 3.), method='full', frame_screen=screen)[0]
+
+    everything = list(range(6))
+    screen = FrameScreen(FrameScreenPolicy(), everything, [0] * 6)
+    screened = run(everything, screen)
+    assert screen.summary()['excluded'] == [3]
+    reference = run([0, 1, 2, 4, 5])
+    np.testing.assert_array_equal(screened.intensity, reference.intensity)
+    kept = run(everything, FrameScreen(FrameScreenPolicy(exclude='none'), everything, [0] * 6))
+    np.testing.assert_array_equal(kept.intensity, run(everything).intensity)
+    assert not np.array_equal(kept.intensity, screened.intensity, equal_nan=True)
+
+
+def test_xu_histogram_stream_excludes_an_empty_frame_exactly(tmp_path):
+    from pyFAI.detectors import Detector
+    from xrd_tools.analysis.xu_stitch_calibration import (
+        XuStitchCalibrationInput, authored_surface_calibration, capture_xu_stitch_calibration,
+    )
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.integrate.xu_stitch import resolve_xu_stitch_effective_geometry, run_xu_hist_stitch_1d
+    from xrd_tools.sources.memory import MemoryFrameSource
+    with xu_runtime_session() as session:
+        wavelength = float(session.xu.en2lam(17000.004))
+    value = authored_surface_calibration(
+        detector=Detector(pixel1=75e-6, pixel2=172e-6, max_shape=(9, 13)), cch1=3.2, cch2=5.4,
+        distance_m=.39, del_offset_deg=1.7, nu_offset_deg=-.8, energy_eV=17000.004,
+        xu_wavelength_A=wavelength, source_motors={'del': 'del', 'nu': 'nu'}, rotation=0,
+        control_domain={'del': [-50., 50.], 'nu': [-35., 35.]}, domain={'del': [-50., 50.], 'nu': [-35., 35.]},
+        rms_q=.001, condition=10., n_frames=5, n_points=40)
+    (tmp_path / 'geometry.json').write_bytes(json.dumps(value, sort_keys=True, separators=(',', ':')).encode())
+    receipt = capture_xu_stitch_calibration(XuStitchCalibrationInput('geometry.json'), project_root=tmp_path)
+    with xu_runtime_session() as session:
+        solid = resolve_xu_stitch_effective_geometry(receipt, session).solid_angle.copy()
+    deltas = [2., 4., 6., 8., 10., 12.]
+    frames = [ScanFrame(index=i, image=(0. if i == 3 else 100.) * solid,
+                        metadata={'del': d, 'nu': 0., 'monitor': 1.}) for i, d in enumerate(deltas)]
+
+    def run(indices, screen=None):
+        return run_xu_hist_stitch_1d(receipt, MemoryFrameSource(frames), frame_indices=tuple(indices),
+                                     npt=20, radial_range=(0., 3.), monitor_key='monitor',
+                                     max_frame_bytes=1 << 20, frame_screen=screen)
+
+    screen = FrameScreen(FrameScreenPolicy(), list(range(6)), [0.] * 6)
+    screened = run(range(6), screen)
+    assert screen.summary()['excluded'] == [3]
+    np.testing.assert_array_equal(screened.payload.intensity, run([0, 1, 2, 4, 5]).payload.intensity)

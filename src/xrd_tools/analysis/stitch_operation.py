@@ -80,6 +80,7 @@ from xrd_tools.io.analysis_artifact import (
 )
 from xrd_tools.io.nexus import write_stitched
 from xrd_tools.io.stat_identity import identity_ctime_ns
+from xrd_tools.integrate.frame_screen import FrameScreen, FrameScreenPolicy
 from xrd_tools.integrate.multi import StitchDiagnostics
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xrd_tools.analysis.stitch_native import (
@@ -1326,6 +1327,7 @@ class StitchOperationPlan:
     native_records: bool = False
     conditioning: StitchConditioning | None = None
     mask_path: str | Path | None = None
+    frame_screen: FrameScreenPolicy = field(default_factory=FrameScreenPolicy)
     _mask_receipt: object = field(init=False, default=None, repr=False)
     fingerprint: str = field(init=False)
 
@@ -1361,6 +1363,8 @@ class StitchOperationPlan:
             raise TypeError("monitor selector must be exact MetadataColumnSelector")
         if type(self.use_detector_mask) is not bool:
             raise TypeError("use_detector_mask must be an exact bool")
+        if type(self.frame_screen) is not FrameScreenPolicy:
+            raise TypeError("frame screen must be an exact FrameScreenPolicy")
         if (
             type(self.max_frame_bytes) is not int
             or not 1 <= self.max_frame_bytes <= 4 * 1024 * 1024 * 1024
@@ -1392,6 +1396,7 @@ class StitchOperationPlan:
             self.use_detector_mask,
             "streaming-multigeometry-v1",
             self.max_frame_bytes,
+            self.frame_screen.identity(),
         )
         return value + native_plan_identity(self) if self.native_records else value
 
@@ -1410,6 +1415,7 @@ class XuStitchOperationPlan:
     native_records: bool = False
     conditioning: StitchConditioning | None = None
     mask_path: str | Path | None = None
+    frame_screen: FrameScreenPolicy = field(default_factory=FrameScreenPolicy)
     _mask_receipt: object = field(init=False, default=None, repr=False)
     backend: str = field(init=False, default="xu_hist")
     mode: str = field(init=False, default="1d")
@@ -1419,6 +1425,8 @@ class XuStitchOperationPlan:
 
     def __post_init__(self) -> None:
         _native_plan_fields(self)
+        if type(self.frame_screen) is not FrameScreenPolicy:
+            raise TypeError("frame screen must be an exact FrameScreenPolicy")
         if self.q_min_A_inverse is not None or self.q_max_A_inverse is not None:
             if (type(self.q_min_A_inverse) is not float or type(self.q_max_A_inverse) is not float
                     or self.unit != "q_A^-1" or self.radial_range not in
@@ -1468,6 +1476,7 @@ class XuStitchOperationPlan:
                     self.max_frame_bytes,
                     self.calibration.fingerprint,
                     self.effective_geometry.fingerprint,
+                    self.frame_screen.identity(),
                 ) + (native_plan_identity(self) if self.native_records else ()),
             ),
         )
@@ -1758,6 +1767,7 @@ def _provenance(
             ),
             "use_detector_mask": plan.use_detector_mask,
             "streaming_multigeometry": True,
+            "frame_screen": plan.frame_screen.to_provenance(),
             "max_frame_bytes": plan.max_frame_bytes,
             "plan_fingerprint": plan.fingerprint,
         },
@@ -1843,6 +1853,7 @@ def _xu_provenance(
             ),
             "use_detector_mask": plan.use_detector_mask,
             "max_frame_bytes": plan.max_frame_bytes,
+            "frame_screen": plan.frame_screen.to_provenance(),
             "asset_receipt_fingerprint": receipt.fingerprint,
             "effective_geometry_fingerprint": plan.effective_geometry.fingerprint,
             "plan_fingerprint": plan.fingerprint,
@@ -2303,6 +2314,8 @@ class StitchOperationResult:
     request: StitchOperationRequest
     terminal: ModuleTerminalResult
     payload: AnalysisArtifactPayload | None = None
+    #: dropped-frame screening summary (policy, excluded/empty/partial labels)
+    frame_screen: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         committed = self.terminal.disposition is ModuleDisposition.COMMITTED
@@ -2322,6 +2335,19 @@ class StitchOperationResult:
             )
         ):
             raise TypeError("stitch operation result is invalid")
+
+
+def _frame_screen_rows(request: StitchOperationRequest) -> tuple[float, ...]:
+    """Each selected frame's outer-circle (nu) value: its dropped-frame screening row."""
+    plan = request.plan
+    if type(plan) is XuStitchOperationPlan:
+        name = str(plan.calibration.projection.value["acquisition"]["source_motors"].get("nu", ""))
+    else:
+        name = dict(plan.geometry.request.source_motors).get("nu_angle", "")
+    values = {item.label: {(n, o): v for n, o, v in item.values}
+              for item in request.manifest.contributions}
+    return tuple(round(float(values[label].get((name, 0), 0.0)), 6) if name else 0.0
+                 for label in request.module.source.selected_labels)
 
 
 def _protected_stitch_inputs(request: StitchOperationRequest) -> tuple[Path, ...]:
@@ -2367,6 +2393,7 @@ class StitchOperationExecution:
         self._execution_attestation_json: str | None = None
         self._execution_attestation_digest: str | None = None
         self._revision = 0
+        self._frame_screen = None
         self._progress_callback: Callable[[ModuleProgress], object] | None = None
 
     def __copy__(self):
@@ -2422,7 +2449,7 @@ class StitchOperationExecution:
         total: int,
     ) -> StitchOperationResult:
         if terminal.disposition is not ModuleDisposition.COMMITTED:
-            value = StitchOperationResult(self.request, terminal)
+            value = StitchOperationResult(self.request, terminal, frame_screen=self._frame_screen)
             self._result = value
             self._state = "done"
             return value
@@ -2509,7 +2536,7 @@ class StitchOperationExecution:
                 "strict MultiGeometry Stitch unexpectedly changed artifact version",
             )
         self._emit("reload", total, total)
-        value = StitchOperationResult(self.request, terminal, payload)
+        value = StitchOperationResult(self.request, terminal, payload, frame_screen=self._frame_screen)
         self._result = value
         self._verification_terminal = terminal
         self._state = "done"
@@ -2551,10 +2578,12 @@ class StitchOperationExecution:
                 def science_progress(done: int, _inner_total: int) -> None:
                     self._emit("science", 1 + done, total)
 
+                screen = FrameScreen(plan.frame_screen, labels, _frame_screen_rows(self.request))
                 scientific = run_xu_hist_stitch_1d(
                     plan.calibration,
                     source,
                     frame_indices=labels,
+                    frame_screen=screen,
                     unit=plan.unit,
                     radial_range=plan.radial_range,
                     conditioning=plan.conditioning,
@@ -2571,6 +2600,7 @@ class StitchOperationExecution:
                     cancel_token=cancel_token,
                     progress_callback=science_progress,
                 )
+                self._frame_screen = screen.summary()
             revalidate_xu_stitch_calibration(plan.calibration)
             revalidate_mask(plan._mask_receipt)
         except XuStitchCancelled:
@@ -2804,6 +2834,8 @@ class StitchOperationExecution:
                 def science_progress(done: int, _inner_total: int) -> None:
                     self._emit("science", 1 + done, total)
 
+                screen = FrameScreen(self.request.plan.frame_screen, labels,
+                                     _frame_screen_rows(self.request))
                 scientific = run_stitch(
                     runtime_plan,
                     oriented,
@@ -2812,7 +2844,9 @@ class StitchOperationExecution:
                     cancel_token=cancel_token,
                     collect_frame_records=False,
                     frame_record_callback=frame_callback,
+                    frame_screen=screen,
                 )
+                self._frame_screen = screen.summary()
             _revalidate_geometry(self.request.plan.geometry)
             revalidate_mask(self.request.plan._mask_receipt)
         except StitchCancelled:

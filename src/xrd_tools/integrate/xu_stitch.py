@@ -675,6 +675,9 @@ def _checked_frame_histograms(
             np.float64,
             copy=False,
         )
+        # Whole-frame monitor-normalised total: the dropped-frame statistic. Not
+        # the in-range histogram, which legitimately shrinks at the range edges.
+        d_total = float(image[valid].sum())
     except BaseException as error:
         pending = error.with_traceback(None)
     finally:
@@ -707,7 +710,7 @@ def _checked_frame_histograms(
         raise XuStitchScienceRefused(
             "STITCH_NUMERIC_OVERFLOW", "frame histograms were not produced"
         )
-    return d_signal, d_normalization, d_count
+    return d_signal, d_normalization, d_count, d_total
 
 
 @dataclass(frozen=True, slots=True)
@@ -815,6 +818,7 @@ def run_xu_hist_stitch_1d(
     conditioning: StitchConditioning | None = None,
     mask: np.ndarray | None = None,
     frame_record_callback: Callable[[int, np.ndarray], None] | None = None,
+    frame_screen: object = None,
 ) -> XuStitchScienceResult:
     """Run native Q or 2theta histogram bins; omitted bounds scout all geometry.
 
@@ -987,6 +991,36 @@ def run_xu_hist_stitch_1d(
     normalization = np.zeros(npt, dtype=np.float64)
     count = np.zeros(npt, dtype=np.float64)
     release_count = 0
+
+    def accumulate(d_signal, d_normalization, d_count):
+        nonlocal signal, normalization, count
+        try:
+            with np.errstate(over="raise", invalid="raise"):
+                candidate_count = count + d_count
+                candidate_signal = signal + d_signal
+                candidate_normalization = normalization + d_normalization
+        except FloatingPointError as error:
+            raise XuStitchScienceRefused(
+                "STITCH_NUMERIC_OVERFLOW",
+                "cumulative histogram overflowed",
+            ) from error
+        if np.any(candidate_count > _MAX_COUNT):
+            raise XuStitchScienceRefused(
+                "STITCH_COVERAGE_STORAGE_EXACTNESS_EXCEEDED",
+                "histogram count exceeds exact float32 storage",
+            )
+        if (
+            not np.isfinite(candidate_signal).all()
+            or not np.isfinite(candidate_normalization).all()
+        ):
+            raise XuStitchScienceRefused(
+                "STITCH_NUMERIC_OVERFLOW", "cumulative histogram is invalid"
+            )
+        signal, normalization, count = (
+            candidate_signal,
+            candidate_normalization,
+            candidate_count,
+        )
     runtime_owner = xu_runtime_session()
     with runtime_owner as session:
         geometry = resolve_xu_stitch_effective_geometry(receipt, session)
@@ -1007,7 +1041,7 @@ def run_xu_hist_stitch_1d(
         for index, (label, del_value, nu_value, monitor) in enumerate(frame_inputs):
             if cancel_token is not None and cancel_token.is_set():
                 raise XuStitchCancelled("CANCELLED")
-            d_signal, d_normalization, d_count = _checked_frame_histograms(
+            d_signal, d_normalization, d_count, d_total = _checked_frame_histograms(
                 source,
                 label,
                 provider=provider,
@@ -1035,35 +1069,24 @@ def run_xu_hist_stitch_1d(
                 raise XuStitchScienceRefused(
                     "STITCH_NUMERIC_OVERFLOW", "per-frame histogram is invalid"
                 )
-            try:
-                with np.errstate(over="raise", invalid="raise"):
-                    candidate_count = count + d_count
-                    candidate_signal = signal + d_signal
-                    candidate_normalization = normalization + d_normalization
-            except FloatingPointError as error:
-                raise XuStitchScienceRefused(
-                    "STITCH_NUMERIC_OVERFLOW",
-                    "cumulative histogram overflowed",
-                ) from error
-            if np.any(candidate_count > _MAX_COUNT):
-                raise XuStitchScienceRefused(
-                    "STITCH_COVERAGE_STORAGE_EXACTNESS_EXCEEDED",
-                    "histogram count exceeds exact float32 storage",
-                )
-            if (
-                not np.isfinite(candidate_signal).all()
-                or not np.isfinite(candidate_normalization).all()
-            ):
-                raise XuStitchScienceRefused(
-                    "STITCH_NUMERIC_OVERFLOW", "cumulative histogram is invalid"
-                )
-            signal, normalization, count = (
-                candidate_signal,
-                candidate_normalization,
-                candidate_count,
-            )
+            if frame_screen is None:
+                accumulate(d_signal, d_normalization, d_count)
+            else:
+                # Hold the frame until its row neighbours are known.
+                for held, verdict in frame_screen.push(
+                        d_total, (d_signal, d_normalization, d_count)):
+                    if not verdict.excluded:
+                        accumulate(*held)
             if progress_callback is not None:
                 progress_callback(index + 1, len(labels))
+        if frame_screen is not None:
+            for held, verdict in frame_screen.finish():
+                if not verdict.excluded:
+                    accumulate(*held)
+            if not any(not verdict.excluded for verdict in frame_screen.verdicts):
+                raise XuStitchScienceRefused(
+                    "STITCH_ALL_FRAMES_DROPPED", "every frame was excluded as a dropped frame"
+                )
         revalidate_xu_stitch_calibration(receipt)
         intensity = np.full(npt, np.nan, dtype=np.float64)
         occupied = normalization > 0

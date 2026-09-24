@@ -34,7 +34,7 @@ from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifac
 
 _NPT_FRAMES = (0, 9, 18, 27, 35, 55, 65, 75, 130)
 #: frames the automatic check may exclude: detector counts collapse while i0 stays normal
-_DROPPED = {52, 99, 113, 120, 164, 272}
+_DROPPED = {52, 99, 106, 113, 120, 164, 272}
 
 
 def _root() -> Path:
