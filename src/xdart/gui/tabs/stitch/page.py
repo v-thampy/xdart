@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 import json
+import logging
+import os
 import time
 
 import re
@@ -23,7 +25,7 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 from xdart.gui.pages.handle import AppMenuHosts, PageHandle
 from xdart.gui.pages.operation_owner import OperationTerminalStatus
 from xdart.gui.pages.values import (
-    ActionAccepted, PageCleanup,
+    ActionAccepted, ActionCompleted, ActionRefused, PageCleanup,
     SCATTERING_PAGE_KEY, STITCH_TOOL_KEY,
 )
 from xdart.gui.themes import apply_seaborn_plot_style
@@ -56,6 +58,7 @@ _FRAME_CHECKS = {"Exclude empty frames": "empty", "Exclude empty and partial fra
 _SAMPLE_POSITIONS = {"As calibrated": "calibrated", "On rotation axis": "rotation_axis"}
 
 
+_LOG = logging.getLogger(__name__)
 _PAIR_SEPARATOR = re.compile(r"[,;\n]+")
 
 
@@ -136,6 +139,12 @@ class StitchPage(QtWidgets.QWidget):
         self._raw_popup = None
         self._raw_frame_view = None
         self._calibration_dialog = None
+        # Saved calibration-dialog inputs, applied when the dialog is created.
+        self._calibration_settings = None
+        # (action, start directory) -> path for File ▸ Save/Load Settings; tests replace it.
+        self._settings_path_chooser = self._choose_settings_path
+        self._closing_settings = None
+        self._settings_remembered = False
         self._metadata_dialog = None
         self._metadata_request_dialog = None
         self._metadata_view_revision = None
@@ -1064,11 +1073,14 @@ class StitchPage(QtWidgets.QWidget):
             if not project:
                 raise ValueError("Choose a Project folder first")
             if self._calibration_dialog is not None and (self._calibration_project, self._calibration_backend) != (project, backend):
+                self._calibration_settings = self._calibration_dialog.settings()
                 self._calibration_dialog.hide()
                 self._calibration_dialog = None
             if self._calibration_dialog is None:
                 self._calibration_dialog = StitchCalibrationDialog(str(self._value("project_root")),
                     backend=backend, parent=self)
+                if self._calibration_settings:
+                    self._calibration_dialog.apply_settings(self._calibration_settings)
                 self._calibration_project, self._calibration_backend = project, backend
                 self._calibration_dialog.calibrationSaved.connect(self._adopt_calibration)
                 self._authoring_dialogs.append(self._calibration_dialog)
@@ -1335,6 +1347,108 @@ class StitchPage(QtWidgets.QWidget):
             self._payloads.clear()
         return receipt
 
+    # -- saved settings (File ▸ Save/Load Settings and the last session) -----------------
+
+    def settings(self):
+        """Every input, the source files, the threshold policy and the calibration dialog."""
+        from .settings import page_settings
+        return page_settings(self)
+
+    def apply_settings(self, document):
+        from .settings import apply_page_settings
+        apply_page_settings(self, document)
+
+    def _calibration_settings_now(self):
+        dialog = self._calibration_dialog
+        return dialog.settings() if dialog is not None else self._calibration_settings
+
+    def _set_calibration_settings(self, values):
+        self._calibration_settings = values if isinstance(values, dict) else None
+        if self._calibration_dialog is not None and self._calibration_settings:
+            self._calibration_dialog.apply_settings(self._calibration_settings)
+
+    def _choose_settings_path(self, action, start):
+        caption, file_filter = "Stitch settings", "Stitch settings (*.json);;All files (*)"
+        if action == "save":
+            selected, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save " + caption, start, file_filter)
+        else:
+            selected, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load " + caption, start, file_filter)
+        return selected or None
+
+    def _settings_path(self, action):
+        from xdart.utils.browse import browse_start_dir, remember_browse_path
+        selected = self._settings_path_chooser(action, browse_start_dir("", fallback=self._value("project_root")))
+        if not selected:
+            return None
+        path = Path(selected).expanduser()
+        if action == "save" and not path.suffix:
+            path = path.with_suffix(".json")
+        remember_browse_path(path)
+        return path
+
+    def save(self):
+        """File ▸ Save Settings."""
+        from .settings import dump_settings
+        path = self._settings_path("save")
+        if path is None:
+            return ActionCompleted("stitch-settings-save-cancelled")
+        try:
+            text = dump_settings(self.settings())
+            temporary = path.with_name(f".{path.name}.tmp")
+            temporary.write_text(text, encoding="utf-8")
+            os.replace(temporary, path)
+        except (OSError, ValueError) as error:
+            self._status(f"Could not save the Stitch settings: {error}", ready=False)
+            return ActionRefused(str(error))
+        self._status(f"Stitch settings saved: {path.name}")
+        return ActionCompleted("stitch-settings-saved")
+
+    def load(self):
+        """File ▸ Load Settings."""
+        from .settings import load_settings
+        if self._owner.busy:
+            return ActionRefused("Stitch is busy; load settings when it is idle")
+        path = self._settings_path("load")
+        if path is None:
+            return ActionCompleted("stitch-settings-load-cancelled")
+        try:
+            document = load_settings(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            self._status(f"Could not load the Stitch settings: {error}", ready=False)
+            return ActionRefused(str(error))
+        self.apply_settings(document)
+        self._status(f"Stitch settings loaded: {path.name} · Preview required", ready=False)
+        return ActionCompleted("stitch-settings-loaded")
+
+    def restore_last_settings(self):
+        """Restore the settings the last session left (nothing in a fresh session)."""
+        from xdart.utils.session import load_session
+        from .settings import SESSION_KEY
+        document = load_session().get(SESSION_KEY)
+        if document is None:
+            return
+        try:
+            self.apply_settings(document)
+        except Exception:  # noqa: BLE001 - saved settings are a convenience
+            _LOG.warning("Could not restore the last Stitch settings", exc_info=True)
+            self._status("Could not restore the last Stitch settings", ready=False)
+
+    def close_and_remember(self):
+        """Close the page and keep its settings for the next session once it is clean."""
+        if self._closing_settings is None and not self._closing:
+            try:
+                self._closing_settings = self.settings()
+            except Exception:  # noqa: BLE001
+                _LOG.warning("Could not capture the Stitch settings", exc_info=True)
+        receipt = self.shutdown()
+        if (receipt.status is PageCleanup.CLEAN and not self._settings_remembered
+                and self._closing_settings is not None):
+            from xdart.utils.session import save_session
+            from .settings import SESSION_KEY
+            save_session({SESSION_KEY: self._closing_settings})
+            self._settings_remembered = True
+        return receipt
+
     def mount_points(self):
         return AppMenuHosts(self.config_menu, self.help_menu, tool_requested=self.toolRequested)
 
@@ -1349,5 +1463,7 @@ class StitchPage(QtWidgets.QWidget):
 
 def build_stitch_page(services, parent):
     page = StitchPage(services, parent)
-    return PageHandle(key=STITCH_TOOL_KEY, widget=page, close=page.shutdown,
-                      open_folder=page, run_control=page, activity=page, app_menus=page)
+    page.restore_last_settings()
+    return PageHandle(key=STITCH_TOOL_KEY, widget=page, close=page.close_and_remember,
+                      open_folder=page, settings_io=page, run_control=page, activity=page,
+                      app_menus=page)

@@ -42,14 +42,16 @@ def _edit(row, field, value):
         editor.editingFinished.emit()
 
 
-def test_restoring_legacy_empty_threshold_clears_prior_manual_band(qapp, tmp_path):
-    form = _form(tmp_path, "multigeometry")
+def test_restoring_an_automatic_threshold_clears_a_prior_manual_band(qapp, tmp_path):
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    manual = StitchConditioning("manual", None, 800000.)
     page = StitchPage(empty_host_services(_Status()))
     try:
-        page.load_form(form)
-        assert page.build_form().threshold == 800000.
-        page.load_form(replace(form, threshold=None))
-        assert page.build_form().threshold is None
+        page.load_form(replace(form, conditioning=manual))
+        assert page.build_form().conditioning == manual
+        page.load_form(replace(form, conditioning=StitchConditioning("auto")))
+        assert page.build_form().conditioning.mode == "auto"
     finally:
         page.shutdown()
 

@@ -57,6 +57,7 @@ def test_closed_values_and_frozen_outcomes_are_exact():
     )
     assert tuple(PageLifecycle) == (
         PageLifecycle.SWITCHABLE,
+        PageLifecycle.RETAINED,  # added with the native Stitch page (e2938575)
         PageLifecycle.EXIT_ONLY,
     )
     assert tuple(PageCleanup) == (PageCleanup.CLEAN, PageCleanup.PENDING)

@@ -60,8 +60,8 @@ STITCH_PAGE = PageDescriptor(
     order=100,
     lifecycle=PageLifecycle.RETAINED,
     capabilities=frozenset({
-        PageCapability.OPEN_FOLDER, PageCapability.RUN_CONTROL,
-        PageCapability.RUN_ACTIVITY, PageCapability.APP_MENU_HOSTS,
+        PageCapability.OPEN_FOLDER, PageCapability.SETTINGS_PERSISTENCE,
+        PageCapability.RUN_CONTROL, PageCapability.RUN_ACTIVITY, PageCapability.APP_MENU_HOSTS,
     }),
     build=_build_stitch_page,
 )

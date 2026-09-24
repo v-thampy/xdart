@@ -162,6 +162,11 @@ def fit_summary_text(fit):
     return '\n'.join(lines) + '\n\n' + json.dumps(fit.asset['calibration'], indent=2)
 
 
+def _plain_choice(value):
+    """A combo's data as a JSON value (None when it is not one)."""
+    return value if value is None or isinstance(value, (bool, int, float, str)) else None
+
+
 class StitchCalibrationDialog(QtWidgets.QDialog):
     """Retained window. ``calibrationSaved(path, backend)`` adopts a fitted asset.
 
@@ -194,6 +199,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._owner = SingleWorkerOwner(_run_job)
         self._fields = {}
         self._path_rows = {}
+        # The arm model the user chose; applied whenever it is available.
+        self._preferred_arm_model = None
         outer = QtWidgets.QVBoxLayout(self)
         heading = QtWidgets.QLabel('Select representative frames, calibrate each image, then fit and save one geometry.')
         heading.setWordWrap(True)
@@ -353,6 +360,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.arm_model.addItem('Stacked arm (5 parameters)', 'stacked')
         self.arm_model.addItem('Stacked arm + detector mount and sample offset', 'stacked_extended')
         form.addRow('Arm model', self.arm_model)
+        self.arm_model.activated.connect(self._arm_model_chosen)
         self._edit(form, 'rms', 'Maximum RMS |q| (Å⁻¹)', '.03')
         self._edit(form, 'distance_seed', 'Distance seed (mm; optional)', '')
         self._edit(form, 'distance_bounds', 'Explicit distance bounds (min, max mm)', '')
@@ -475,6 +483,54 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             self._fields[key].setText(str(value))
         self.rotation.setCurrentIndex(max(0, self.rotation.findData(image_rotation)))
 
+    #: Choices saved with the Stitch settings. The calibrant-scan and same-detector
+    #: confirmations are per use and never saved.
+    _SAVED_CHOICES = ('source_kind', 'rotation', 'backend', 'arm_model', 'refine_calibrant',
+                      'refine_seed', 'beam_source_kind', 'motion')
+
+    def settings(self):
+        """This dialog's inputs as plain values, for the saved Stitch settings."""
+        choices = {name: {'data': _plain_choice(getattr(self, name).currentData()),
+                          'text': getattr(self, name).currentText()}
+                   for name in self._SAVED_CHOICES}
+        preferred = self.arm_model.findData(self._preferred_arm_model)
+        if preferred >= 0:  # the choice, even while the rules show the five-parameter arm
+            choices['arm_model'] = {'data': self._preferred_arm_model,
+                                    'text': self.arm_model.itemText(preferred)}
+        return {
+            'fields': {key: self._text(key) for key in self._fields},
+            'choices': choices,
+            'fit_motor_scales': self.scales.isChecked(),
+        }
+
+    def apply_settings(self, values):
+        """Restore saved inputs; unknown entries are ignored."""
+        if not isinstance(values, dict):
+            return
+        for key, text in (values.get('fields') or {}).items():
+            if key in self._fields and isinstance(text, str):
+                self._set_field_text(key, text)
+        for name, choice in (values.get('choices') or {}).items():
+            combo = getattr(self, name, None) if name in self._SAVED_CHOICES else None
+            if combo is None or not isinstance(choice, dict):
+                continue
+            data = choice.get('data')
+            # A combo without item data holds None for every item: match its text.
+            index = -1 if data is None else combo.findData(data)
+            if index < 0:
+                index = combo.findText(str(choice.get('text', '')))
+            if index < 0:
+                if combo.isEditable() and choice.get('text'):  # a typed-in entry, e.g. a calibrant
+                    combo.setCurrentText(str(choice['text']))
+                continue
+            if combo is self.arm_model:
+                self._preferred_arm_model = combo.itemData(index)
+            else:
+                combo.setCurrentIndex(index)
+        if isinstance(values.get('fit_motor_scales'), bool):
+            self.scales.setChecked(values['fit_motor_scales'])
+        self._sync_arm_model()
+
     def _text(self, key):
         if key in self._path_rows:
             return str(self._path_rows[key].current_value()).strip()
@@ -579,9 +635,16 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                   else 'needs completed frames on at least 3 nu positions' if len(rows) < 3 else '')
         if reason:
             self.arm_model.setCurrentIndex(0)
+        elif self._preferred_arm_model is not None:
+            index = self.arm_model.findData(self._preferred_arm_model)
+            if index >= 0 and index != self.arm_model.currentIndex():
+                self.arm_model.setCurrentIndex(index)
         self.arm_model.setEnabled(not reason)
         self.arm_model.setToolTip(reason or 'Also fits the detector mount (tilt, roll) on the arm and '
                                   'the sample offset from the rotation centre.')
+
+    def _arm_model_chosen(self, _index):
+        self._preferred_arm_model = self.arm_model.currentData()
 
     def _fit(self):
         def go():
