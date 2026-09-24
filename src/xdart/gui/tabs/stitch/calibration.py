@@ -19,8 +19,28 @@ from xrd_tools.integrate.stitch_calibration import (
 )
 
 
+#: Share of the progress bar per automatic-refinement stage (the owner needs one fixed total).
+_REFINE_STAGES = {'Reading frames': (0, 200), 'Finding ring points': (200, 700),
+                  'Validating models': (700, 980), 'Fitting': (980, 1000)}
+
+
 def _run_job(request, cancelled, publish):
+    try:
+        return _dispatch_job(request, cancelled, publish)
+    except InterruptedError as error:  # the numerical owners' cancellation
+        raise OperationCancelled(str(error)) from error
+
+
+def _dispatch_job(request, cancelled, publish):
     kind, arguments = request
+    if kind == 'refine':
+        from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
+        spec, seed, options = arguments
+
+        def progress(stage, done, total):
+            low, high = _REFINE_STAGES[stage]
+            publish(f'{stage} {done}/{total}', low + (high - low) * done // max(total, 1), 1000)
+        return refine_arm_from_scan(spec, seed, cancelled=cancelled, progress=progress, **options)
     if kind == 'enumerate':
         return source_frame_choices(*arguments)
     if kind == 'prepare':
@@ -97,12 +117,58 @@ def _run_job(request, cancelled, publish):
     raise ValueError('unknown calibration operation')
 
 
+def fit_summary_text(fit):
+    """Plain-text diagnostics for a fitted calibration (guided or automatic)."""
+    provenance = fit.asset.get('provenance', {})
+    lines = [f'RMS |q|: {fit.rms_q:.6g} Å⁻¹', f'Jacobian condition: {fit.condition_number:.4g}',
+             f'Control points: {fit.n_points}']
+    if fit.message:
+        lines.append(fit.message)
+    errors = provenance.get('parameter_errors') or {}
+    if provenance.get('arm_model') == 'stacked_extended' and errors:
+        record = fit.asset['calibration']
+        lines.append('Parameters (± 1σ):')
+        for name, value in zip(record['param_names'], record['param']):
+            if name not in errors:
+                continue
+            scale, unit = ((1e3, 'mm') if name.startswith(('dist', 'poni', 'sample_offset'))
+                           else (180 / math.pi, '°'))
+            lines.append(f'  {name}: {value * scale:.6g} ± {errors[name] * scale:.2g} {unit}')
+        correlations = provenance.get('parameter_correlations') or {}
+        names, matrix = correlations.get('names', []), correlations.get('matrix', [])
+        strong = [f'{names[i]}–{names[j]} {matrix[i][j]:+.2f}' for i in range(len(names))
+                  for j in range(i + 1, len(names)) if abs(matrix[i][j]) > .9]
+        if strong:
+            lines.append('Strong correlations (|r| > 0.9): ' + ', '.join(strong))
+    automatic = provenance.get('automatic_refinement')
+    if automatic:
+        validation = automatic['validation']
+        chosen = {'stacked': 'five-parameter arm',
+                  'stacked_extended': 'detector mount and sample offset'}[validation['chosen']]
+        lines.append(f'Automatic refinement chose the {chosen}'
+                     + (f": {validation['reason']}" if validation.get('reason') else ''))
+        sigma = validation.get('held_out_sigma_A^-1')
+        if sigma:
+            lines.append(f"Held-out σ: five-parameter {sigma['stacked']:.3g} Å⁻¹, "
+                         f"extended {sigma['stacked_extended']:.3g} Å⁻¹ "
+                         f"(improvement {validation['improvement']:.0%})")
+        coverage = validation.get('coverage', {})
+        if coverage:
+            lines.append(f"nu rows used: {coverage['nu_rows_selected']} of {coverage['nu_rows_available']}")
+        excluded = automatic.get('excluded_frames') or []
+        lines.append('Excluded frames: ' + (', '.join(f"{item['index']} ({item['reason']})"
+                                                     for item in excluded) or 'none'))
+        lines.append(f"Rejected outlier points: {automatic.get('rejected_points', 0)}")
+    return '\n'.join(lines) + '\n\n' + json.dumps(fit.asset['calibration'], indent=2)
+
+
 class StitchCalibrationDialog(QtWidgets.QDialog):
     """Retained window. ``calibrationSaved(path, backend)`` adopts a fitted asset.
 
     ``set_source_context(SourceSpec, image_rotation=0, del_motor='del',
-    nu_motor='nu')`` seeds the source controls without selecting frames or
-    changing previously completed rows. Call ``show/raise_/activateWindow``.
+    nu_motor='nu', geometry_path=None)`` seeds the source controls (and the
+    automatic refinement's seed geometry) without selecting frames or changing
+    previously completed rows. Call ``show/raise_/activateWindow``.
     """
     calibrationSaved = QtCore.Signal(str, str)
 
@@ -283,6 +349,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.scales = QtWidgets.QCheckBox('Fit MG motor scales when angle coverage identifies them')
         self.scales.setChecked(False)
         form.addRow(self.scales)
+        self.arm_model = QtWidgets.QComboBox()
+        self.arm_model.addItem('Stacked arm (5 parameters)', 'stacked')
+        self.arm_model.addItem('Stacked arm + detector mount and sample offset', 'stacked_extended')
+        form.addRow('Arm model', self.arm_model)
         self._edit(form, 'rms', 'Maximum RMS |q| (Å⁻¹)', '.03')
         self._edit(form, 'distance_seed', 'Distance seed (mm; optional)', '')
         self._edit(form, 'distance_bounds', 'Explicit distance bounds (min, max mm)', '')
@@ -294,6 +364,29 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.fit_button = QtWidgets.QPushButton('Fit completed frames')
         self.fit_button.clicked.connect(self._fit)
         layout.addWidget(self.fit_button)
+        box = QtWidgets.QGroupBox('Automatic refinement from a calibrant scan (MultiGeometry)')
+        auto = QtWidgets.QFormLayout(box)
+        self.refine_calibrant = QtWidgets.QComboBox()
+        self.refine_calibrant.setEditable(True)
+        self.refine_calibrant.addItems(['LaB6', 'CeO2', 'Si', 'Al2O3', 'Cr2O3', 'AgBh'])
+        auto.addRow('Calibrant', self.refine_calibrant)
+        self.refine_confirm = QtWidgets.QCheckBox(
+            'The scan in Select frames is this calibrant, not a sample')
+        auto.addRow(self.refine_confirm)
+        self.refine_seed = QtWidgets.QComboBox()
+        self.refine_seed.addItem('Current fit (unsaved)', 'fit')
+        self.refine_seed.addItem('Geometry file', 'file')
+        auto.addRow('Start from', self.refine_seed)
+        self._edit(auto, 'refine_seed_path', 'Seed geometry JSON', chooser='JSON (*.json);;All files (*)')
+        self._edit(auto, 'refine_frames', 'Frame budget', '48')
+        self._edit(auto, 'refine_max_counts', 'Maximum valid counts (optional)', '')
+        self.refine_button = QtWidgets.QPushButton('Refine automatically')
+        self.refine_button.setToolTip('Finds ring points on frames across the scan, starting from the seed '
+                                      'geometry, and keeps the detector mount and sample offset only when '
+                                      'they predict held-out nu rows better.')
+        self.refine_button.clicked.connect(self._refine)
+        auto.addRow(self.refine_button)
+        layout.addWidget(box)
         self.fit_summary = QtWidgets.QPlainTextEdit()
         self.fit_summary.setReadOnly(True)
         layout.addWidget(self.fit_summary, 1)
@@ -305,6 +398,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             self._fields[key].textChanged.connect(self._invalidate_fit)
         self.backend.currentIndexChanged.connect(self._invalidate_fit)
         self.scales.toggled.connect(self._invalidate_fit)
+        self.arm_model.currentIndexChanged.connect(self._invalidate_fit)
+        self.backend.currentIndexChanged.connect(self._sync_arm_model)
+        self.scales.toggled.connect(self._sync_arm_model)
+        self._sync_arm_model()
 
     def _build_distance(self):
         layout, form = self._form('Optional · Direct beam distance')
@@ -358,9 +455,14 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                              ('beam_entry', kind != 'spec_series')]:
             self._beam_form.setRowVisible(self._path_rows.get(key, self._fields[key]), visible)
 
-    def set_source_context(self, source: SourceSpec, *, image_rotation=0, del_motor='del', nu_motor='nu'):
+    def set_source_context(self, source: SourceSpec, *, image_rotation=0, del_motor='del', nu_motor='nu',
+                           geometry_path=None):
         if self._owner.busy:
             return
+        if geometry_path:
+            self._fields['refine_seed_path'].setText(str(geometry_path))
+            if self.fit is None:
+                self.refine_seed.setCurrentIndex(self.refine_seed.findData('file'))
         self.source_kind.setCurrentIndex(0 if source.kind is SourceKind.SPEC else 1)
         opts = source.options
         for key, value in [('source', source.uri), ('scan', opts.get('scan', '1')),
@@ -466,6 +568,20 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
     def _invalidate_fit(self):
         self.fit = None
         self.save_button.setEnabled(False)
+        self.fit_summary.clear()
+
+    def _sync_arm_model(self):
+        rows = {round(float(frame.motors[self._frame_motors[1]]), 6)
+                for frame in self.frames if frame.complete and self._frame_motors[1] in frame.motors}
+        reason = ('xrayutilities has no detector mount or sample offset model'
+                  if self.backend.currentData() == 'xu_hist'
+                  else 'fitting motor scales keeps the five-parameter arm' if self.scales.isChecked()
+                  else 'needs completed frames on at least 3 nu positions' if len(rows) < 3 else '')
+        if reason:
+            self.arm_model.setCurrentIndex(0)
+        self.arm_model.setEnabled(not reason)
+        self.arm_model.setToolTip(reason or 'Also fits the detector mount (tilt, roll) on the arm and '
+                                  'the sample offset from the rotation centre.')
 
     def _fit(self):
         def go():
@@ -477,10 +593,36 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 domain = {motor: [float(v) for v in self._text(motor + '_domain').split(',')] for motor in ('del', 'nu')}
             options = dict(backend=self.backend.currentData(), del_motor=self._frame_motors[0],
                 nu_motor=self._frame_motors[1], fit_scales=self.scales.isChecked(),
+                arm_model=self.arm_model.currentData(),
                 distance_seed_m=seed, distance_bounds_m=bounds, max_rms_q=float(self._text('rms')), domain=domain,
                 distance_provenance=self._distance_provenance if hasattr(self, '_distance_provenance') else None)
             self._invalidate_fit()
             self._start('fit', (frames, options))
+        self._guard(go)
+
+    def _refine(self):
+        def go():
+            if not self.refine_confirm.isChecked():
+                raise ValueError('confirm that the scan is a calibrant scan; never refine the geometry on a sample')
+            spec = self._spec()
+            if self.refine_seed.currentData() == 'fit':
+                if self.fit is None or self.fit.backend != 'multigeometry':
+                    raise ValueError('fit a MultiGeometry arm first, or start from a geometry file')
+                seed = self.fit.asset['calibration']
+            else:
+                if not self._text('refine_seed_path'):
+                    raise ValueError('choose the seed geometry JSON')
+                seed = str(Path(self._text('refine_seed_path')).resolve())
+            options = dict(source_motors=(('del_angle', self._text('del_motor')),
+                                          ('nu_angle', self._text('nu_motor'))),
+                           image_rotation=self.rotation.currentData(),
+                           calibrant=self.refine_calibrant.currentText().strip() or 'LaB6',
+                           max_frames=int(self._text('refine_frames')),
+                           max_counts=(float(self._text('refine_max_counts'))
+                                       if self._text('refine_max_counts') else None),
+                           max_rms_q=float(self._text('rms')))
+            self._invalidate_fit()
+            self._start('refine', (spec, seed, options))
         self._guard(go)
 
     def _save(self):
@@ -552,6 +694,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         if self.frames:
             self.frame_table.selectRow(0)
         self.session_label.setText(f'Session: {self.session_dir / "calibration-session.json"}')
+        self._sync_arm_model()
 
     def _new_session(self):
         if self._owner.busy:
@@ -584,7 +727,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _poll(self):
         update = self._owner.poll(self._identity)
-        if update is None or update.terminal is None:
+        if update is None:
+            return
+        if update.terminal is None:
+            self.status.setText(f'{self._job.capitalize()}: {update.progress.stage}…')
             return
         terminal, kind = update.terminal, self._job
         self._identity = None
@@ -615,9 +761,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     save_calibration_session(self.session_dir, self.frames)
                     self._invalidate_fit()
                     self._render_frames()
-                elif kind == 'fit':
+                elif kind in ('fit', 'refine'):
                     self.fit = result
-                    self.fit_summary.setPlainText(f'RMS |q|: {result.rms_q:.6g} Å⁻¹\nJacobian condition: {result.condition_number:.4g}\nControl points: {result.n_points}\n{result.message}\n\n' + json.dumps(result.asset['calibration'], indent=2))
+                    self.fit_summary.setPlainText(fit_summary_text(result))
                     self.save_button.setEnabled(True)
                 elif kind == 'distance':
                     self._distance_result = result

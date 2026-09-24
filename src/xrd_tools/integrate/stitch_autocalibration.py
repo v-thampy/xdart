@@ -125,8 +125,12 @@ def _ring_indices(calibrant, wavelength_m):
 def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_rotation=0,
                              calibrant='LaB6', frame_indices=None, max_frames=48,
                              points_per_degree=2.0, max_counts=None, frame_screen=_CALIBRATION_SCREEN,
-                             cancelled=None) -> ScanRingPoints:
-    """Extract calibrant ring points from frames across the scan's angle grid."""
+                             cancelled=None, progress=None) -> ScanRingPoints:
+    """Extract calibrant ring points from frames across the scan's angle grid.
+
+    ``progress(stage, done, total)`` is called after each frame is read and
+    after each frame's ring points are found.
+    """
     from pyFAI.goniometer import SingleGeometry  # noqa: PLC0415
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
     from xrd_tools.sources import open_source  # noqa: PLC0415
@@ -181,6 +185,8 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
                 raise InterruptedError('automatic refinement cancelled')
             image, valid = pixels(index, integrator)
             totals.append(float(image[valid].sum()))
+            if progress is not None:
+                progress('Reading frames', len(totals), len(selected))
         verdicts = screen_totals(totals, [int(i) for i in selected],
                                  np.round(motors[arm.nu_motor], 6).tolist(), frame_screen)
         excluded, keep = [], []
@@ -191,9 +197,11 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
             else:
                 keep.append(k)
         controls, frames = [], []
-        for k in keep:
+        for done, k in enumerate(keep, 1):
             if cancelled is not None and cancelled.is_set():
                 raise InterruptedError('automatic refinement cancelled')
+            if progress is not None:
+                progress('Finding ring points', done - 1, len(keep))
             index, integrator = selected[k], integrators[k]
             image, valid = pixels(index, integrator)
             geometry_ = SingleGeometry(int(index), image=np.where(valid, image, 0.0), calibrant=cal,
@@ -242,13 +250,15 @@ def _robust_sigma(values):
 def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_rotation=0,
                          calibrant='LaB6', frame_indices=None, max_frames=48, points_per_degree=2.0,
                          max_counts=None, frame_screen=_CALIBRATION_SCREEN, reject_outliers=4.5,
-                         min_improvement=0.2, max_rms_q=0.03, cancelled=None) -> CalibrationFit:
+                         min_improvement=0.2, max_rms_q=0.03, cancelled=None,
+                         progress=None) -> CalibrationFit:
     """Refine a stacked-arm calibration from its calibrant scan, automatically.
 
     Returns a MultiGeometry :class:`CalibrationFit` for :func:`save_calibration_fit`.
     Its provenance records the extracted frames, the excluded frames and the
     held-out validation that chose between the five-parameter arm and the
-    detector-mount/sample-offset extension.
+    detector-mount/sample-offset extension. ``progress(stage, done, total)``
+    reports frames read, frames searched and validation folds.
     """
     record, diff, digest = _seed(geometry, source_motors)
     arm = diff.stacked_arm
@@ -256,7 +266,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
         spec, record, source_motors=source_motors, image_rotation=image_rotation,
         calibrant=calibrant, frame_indices=frame_indices, max_frames=max_frames,
         points_per_degree=points_per_degree, max_counts=max_counts,
-        frame_screen=frame_screen, cancelled=cancelled)
+        frame_screen=frame_screen, cancelled=cancelled, progress=progress)
     poni = diff.calibration.poni
     config = dict(diff.calibration.detector_config)
 
@@ -280,6 +290,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
         held = {'stacked': [], 'stacked_extended': []}
         folds = []
         for row in rows:
+            if progress is not None:
+                progress('Validating models', len(folds), len(rows))
             train = [c for c in controls if round(c.motors[arm.nu_motor], 6) != row]
             test = [c for c in controls if round(c.motors[arm.nu_motor], 6) == row]
             fold = {'nu': row, 'points': int(sum(len(c.rows) for c in test))}
@@ -296,6 +308,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
             chosen = 'stacked_extended'
         else:
             reason = f'the extension improved held-out error by only {improvement:.0%}'
+    if progress is not None:
+        progress('Fitting', 0, 1)
     result = fit(controls, chosen == 'stacked_extended')
     if chosen == 'stacked_extended' and not result.success:
         reason = f'the extended fit was refused ({result.message})'

@@ -1052,7 +1052,9 @@ class StitchPage(QtWidgets.QWidget):
                 motors = dict(StitchToolDialog._parse_pairs(self._value("source_motors") or "del=del, nu=nu"))
                 self._calibration_dialog.set_source_context(source, image_rotation=int(self._value("image_rotation") or 0),
                     del_motor=motors.get("del_angle", motors.get("del", "del")),
-                    nu_motor=motors.get("nu_angle", motors.get("nu", "nu")))
+                    nu_motor=motors.get("nu_angle", motors.get("nu", "nu")),
+                    geometry_path=(self._value("geometry_path") or None
+                                   if self._value("geometry_kind") == "Goniometer JSON" else None))
             self._calibration_dialog.show()
             self._calibration_dialog.raise_()
             self._authoring_timer.start()
