@@ -1933,10 +1933,10 @@ def _source_fact(fact, *, raw_options=None, read=False, token=None,
     except Exception as error: raise (error if isinstance(error, ReintegrateCancelled) or type(error) is ValueError and str(error).startswith("REPLACEMENT_") else ValueError("REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED" if Path(str(fact.get("path", ""))).suffix.lower() in {".h5", ".hdf5", ".nxs", ".cxi"} else "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"))
 def _background_fact(fact, shared, shape, path, token):
     from xrd_tools.reduction.background import FrameBackgroundPlan, _frame, _one, _tag, resolve_frame_background; plan = FrameBackgroundPlan.from_mapping(_plain(shared["background"])); pair = fact["background_dependency"]
-    if plan.mode == "None": _reject(pair is not None, "replacement inactive Background differs"); return (None, None), None
+    if plan.mode == "None": _reject(pair is not None, "replacement inactive Background differs"); return (None, None, None), None
     _reject(pair is None, "replacement active Background is absent"); keys = tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key))); items = tuple((key, _tag(_one(fact["metadata"], key))) for key in keys); current = _frame((fact["label"], str(path.resolve(strict=True)), fact["snapshot"]["dataset_path"] or None, fact["frame_index"], tuple(shape), items)); result = resolve_frame_background(plan, current, cancelled=token)
     if result.disposition == "CANCELLED": _event(token); raise RuntimeError("Background returned CANCELLED without requested cancellation")
-    _reject(result.disposition != "RESOLVED" or (result.descriptor_bytes, result.fingerprint) != pair, "replacement Background dependency differs"); return (result.background, result.variance_factor), pair
+    _reject(result.disposition != "RESOLVED" or (result.descriptor_bytes, result.fingerprint) != pair, "replacement Background dependency differs"); return (result.background, result.variance_factor, result.scale), pair
 def _fact_projection(selected, shared):
     from xrd_tools.reduction.background import FrameBackgroundPlan
     background = FrameBackgroundPlan.from_mapping(_plain(shared["background"]))
@@ -2030,7 +2030,7 @@ def _validate_science(selected, shared, dimension):
     domains = {"1d": {"q_total", "q_ip", "q_oop", "exit_angle", "chi_gi"}, "2d": {"qip_qoop", "q_chi", "exit_angles"}}; _reject(gi["enabled"] != (selected["gi_mode"] is not None) or selected["gi_mode"] is not None and selected["gi_mode"] not in domains[dimension] or normalized != selected["bai_args"], "selected GI mode/BAI differs"); return plan
 def _dimension_audit(*, dimension: str, operation_identity: str, science_identity: str, acquisition_fingerprint: str, requested_shared_science: Mapping[str, Any], selected_plan: Mapping[str, Any], append_lineage: bytes | None): return {"schema_version": 1, "operation": "existing_dimension_replacement", "dimension": dimension, "operation_identity": operation_identity, "science_identity": science_identity, "acquisition_fingerprint": acquisition_fingerprint, "shared_science_fingerprint": science_fingerprint(_plain(requested_shared_science)), "selected_plan": _plain(selected_plan), "selected_gi_mode": selected_plan.get("gi_mode"), "append_lineage_action": ("already_absent" if append_lineage is None else "preserved_append_disabled"), "append_lineage_sha256": (None if append_lineage is None else hashlib.sha256(append_lineage).hexdigest())}
 def _audit_identity(audit: Mapping[str, Any]) -> str: return hashlib.sha256(_canonical(audit)).hexdigest()
-def _scrub_frame(frame): frame.image = frame.background = frame.background_variance_factor = frame.geometry = frame.source_identity = frame.source_path = frame.loader = frame.mask = None; frame.source_frame_index = frame.normalization_factor = None; frame.background_dependency_bytes = frame.background_dependency_fingerprint = None; frame.metadata.clear()
+def _scrub_frame(frame): frame.image = frame.background = frame.background_variance_factor = frame.background_scale = frame.geometry = frame.source_identity = frame.source_path = frame.loader = frame.mask = None; frame.source_frame_index = frame.normalization_factor = None; frame.background_dependency_bytes = frame.background_dependency_fingerprint = None; frame.metadata.clear()
 
 
 def _target_stat_revision(value):
@@ -2479,8 +2479,8 @@ def _prepare_gi_scouts(target, entry, observed, selected, shared, snapshot, targ
                 _target_hdf_fence(handle, target, snapshot, target_revision)
                 fact = _decode_replacement_fact(handle, label, entry=entry, context=(observed.source_base, observed.topology.lineage, observed.topology.execution), metadata_keys=metadata_keys, include_geometry=include_geometry)
                 _target_hdf_fence(handle, target, snapshot, target_revision)
-            path, image, (background, variance_factor), pair = _load_fact(fact, observed.detector_shape, observed.native_dtype, shared, cancel_token, observed.raw_options, observed.topology)
-            current.source_path, current.source_frame_index, current.source_identity = path, fact["frame_index"], fact; current.metadata.update(fact["metadata"]); current.background = background; current.background_variance_factor = variance_factor; current.geometry = _geometry_fact(fact, shared)
+            path, image, (background, variance_factor, background_scale), pair = _load_fact(fact, observed.detector_shape, observed.native_dtype, shared, cancel_token, observed.raw_options, observed.topology)
+            current.source_path, current.source_frame_index, current.source_identity = path, fact["frame_index"], fact; current.metadata.update(fact["metadata"]); current.background = background; current.background_variance_factor = variance_factor; current.background_scale = background_scale; current.geometry = _geometry_fact(fact, shared)
             if pair is not None: current.background_dependency_bytes, current.background_dependency_fingerprint = pair
             holder["frame"] = current; return image
         frame.loader = load
@@ -2892,9 +2892,9 @@ class _ReintegrateFrameSource:
             _reject(self._topology is None,
                     "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
             _require_fact_topology(fact, self._topology)
-            path, image, (background, variance_factor), pair = _load_fact(fact, self.plan.detector_shape, self.plan.native_dtype, self.plan.requested_shared_science, self.token, self.raw_options, self._topology, self._direct_hdf)
+            path, image, (background, variance_factor, background_scale), pair = _load_fact(fact, self.plan.detector_shape, self.plan.native_dtype, self.plan.requested_shared_science, self.token, self.raw_options, self._topology, self._direct_hdf)
             revision = int(fact["snapshot"]["mtime_ns"]); gi = self.plan.requested_shared_science["gi"]; incidence = fact["metadata"].get(gi["resolved_motor"]); _reject(gi["enabled"] and gi["resolved_motor"] != "Manual" and (type(incidence) is not float or not math.isfinite(incidence) or frame.index == self.plan.labels[0] and incidence != self.plan.gi_bootstrap_incidence), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
-            frame.source_path, frame.source_frame_index, frame.source_identity = path, fact["frame_index"], fact; frame.metadata.update(fact["metadata"]); frame.background = background; frame.background_variance_factor = variance_factor
+            frame.source_path, frame.source_frame_index, frame.source_identity = path, fact["frame_index"], fact; frame.metadata.update(fact["metadata"]); frame.background = background; frame.background_variance_factor = variance_factor; frame.background_scale = background_scale
             frame.geometry = _geometry_fact(fact, self.plan.requested_shared_science)
             if pair is not None: frame.background_dependency_bytes, frame.background_dependency_fingerprint = pair
             geometry = None if frame.geometry is None else {key: getattr(frame.geometry, key) for key in ("rot1", "rot2", "rot3", "incident_angle")}; dependency = None if frame.background_dependency_bytes is None and frame.background_dependency_fingerprint is None else (frame.background_dependency_bytes, frame.background_dependency_fingerprint); _reject(frame.index != fact["label"] or frame.source_path != path or frame.source_frame_index != fact["frame_index"] or frame.source_identity is not fact or dict(frame.metadata) != dict(fact["metadata"]) or geometry != (None if not fact["geometry"] else dict(fact["geometry"])) or dependency != fact["background_dependency"], "replacement local JIT stub differs")

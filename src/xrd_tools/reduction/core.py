@@ -2723,14 +2723,15 @@ class NexusSink:
             return None, False
         raw = np.asarray(frame.image)
         if corrected_image is None:
-            background = frame.background
+            # The worker skips the corrected copy for this sink, so apply the
+            # plan's flat and dark here as the reduction does.
+            plan = self._plan
+            background = (frame.background if plan is None
+                          else _dark_corrected_background(frame, plan))
             if background is not None:
                 bg = np.asarray(background)
                 if bg.shape != () and bg.shape != raw.shape:
                     background = None
-            # The worker skips the corrected copy for this sink, so apply the
-            # plan's flat and dark here as the reduction does.
-            plan = self._plan
             image = _thumbnail_corrected_image(
                 raw, background,
                 None if plan is None else plan.flat,
@@ -5683,8 +5684,9 @@ def _reduce_frame(
     if image.ndim != 2:
         raise ValueError(f"Frame {frame.index} image must be 2D; got shape {image.shape}")
     _validate_frame_inputs(frame, image.shape, frame_masks)
+    background = _dark_corrected_background(frame, plan)
     corrected_image = (
-        _thumbnail_corrected_image(raw_image_arr, frame.background, plan.flat, plan.dark)
+        _thumbnail_corrected_image(raw_image_arr, background, plan.flat, plan.dark)
         if include_corrected_image
         else None
     )
@@ -5705,7 +5707,7 @@ def _reduce_frame(
     if not use_float32_csr:
         image = _apply_thresholds_owned(image, plan)
         variance = _poisson_variance(image, frame, plan)
-        image = _subtract_background(image, frame.background)
+        image = _subtract_background(image, background)
     # Poisson plans with a dark or background integrate with an explicit variance.
     p1_frame = _with_variance(plan.integration_1d, variance)
     p2_frame = _with_variance(plan.integration_2d, variance)
@@ -5955,7 +5957,10 @@ def _poisson_variance(image, frame, plan: ReductionPlan) -> np.ndarray | None:
     noiseless. The variance of the difference is pyFAI's max(1, raw), plus the
     dark's counts (the counting noise of a single-exposure dark; one averaged from
     many exposures is overstated), plus the background's own (its variance factor
-    times the background). A NaN dark pixel gives NaN, a pixel pyFAI masks.
+    times the background). A dark-corrected background (see
+    ``_dark_corrected_background``) returns part of the dark, so the dark's
+    counts are weighted by (1 − scale)². A NaN dark pixel gives NaN, a pixel pyFAI
+    masks.
     """
     factor = getattr(frame, "background_variance_factor", None)
     background = None if factor is None else frame.background
@@ -5965,10 +5970,30 @@ def _poisson_variance(image, frame, plan: ReductionPlan) -> np.ndarray | None:
         return None
     variance = np.maximum(image, 1.0)
     if plan.dark is not None:
-        variance += np.clip(plan.dark, 0.0, None)
+        # raw − dark − scale·(background − dark) holds the dark with weight 1 − scale.
+        scale = (None if frame.background is None
+                 else getattr(frame, "background_scale", None))
+        weight = 1.0 if scale is None else (1.0 - float(scale)) ** 2
+        if weight:
+            variance += weight * np.clip(plan.dark, 0.0, None)
     if background is not None:
         variance += np.clip(np.asarray(factor) * np.asarray(background, dtype=float), 0.0, None)
     return variance
+
+
+def _dark_corrected_background(frame, plan: ReductionPlan):
+    """The background as subtracted from the frame.
+
+    A background image taken with the same detector holds the dark too, and pyFAI
+    already subtracts the dark from the frame; so with a dark the frame loses
+    scale · (background − dark), where scale is the factor the background image
+    was multiplied by. A background without a recorded scale is taken as it is.
+    """
+    background = frame.background
+    scale = getattr(frame, "background_scale", None)
+    if background is None or plan.dark is None or scale is None:
+        return background
+    return np.asarray(background, dtype=float) - float(scale) * np.asarray(plan.dark, dtype=float)
 
 
 def _with_variance(item, variance):

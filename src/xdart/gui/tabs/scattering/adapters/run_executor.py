@@ -136,6 +136,7 @@ def _resolve_background_before_submit(frame, plan: FrameBackgroundPlan, binding,
         capsule_owner.background_capsule = candidate
     frame.background = result.background
     frame.background_variance_factor = result.variance_factor
+    frame.background_scale = result.scale
     frame.background_dependency_bytes, frame.background_dependency_fingerprint = pair
     return True
 

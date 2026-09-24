@@ -338,6 +338,9 @@ class FrameBackgroundResult:
     #: (scale × normalization ratio, divided by each pixel's member count for a
     #: series). A float, or a per-pixel array only for a series with uneven counts.
     variance_factor: float | np.ndarray | None = None
+    #: The factor the background image was multiplied by (scale × normalization
+    #: ratio). With a dark, the reducer removes the background's own dark first.
+    scale: float | None = None
     def __post_init__(self) -> None:
         active = self.disposition == "RESOLVED" and self.background is not None
         pair = self.descriptor_bytes is not None or self.fingerprint is not None
@@ -357,6 +360,9 @@ class FrameBackgroundResult:
                 type(factor) is not np.ndarray or factor.dtype != np.dtype(np.float64)
                 or factor.shape != self.background.shape or not _is_bytes_backed(factor))):
             raise ValueError("frame-background variance factor is invalid")
+        if self.scale is not None and (
+                not active or type(self.scale) is not float or not math.isfinite(self.scale)):
+            raise ValueError("frame-background scale is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -625,6 +631,7 @@ def _rebind_single_frame_background(
             hashlib.sha256(raw).hexdigest(),
             prepared.result.diagnostics,
             prepared.result.variance_factor,
+            prepared.result.scale,
         )
     except InterruptedError:
         return FrameBackgroundResult(
@@ -794,7 +801,7 @@ def _directory_receipts(candidates, plan, target_tag, target_match, chosen,
             receipt["source"] = source; del image
         yield receipt
     if matches != 1: raise RuntimeError("Background Directory match changed")
-def _result(plan, frame_fact, background, body, cancelled, variance_factor=None) -> FrameBackgroundResult:
+def _result(plan, frame_fact, background, body, cancelled, variance_factor=None, scale=None) -> FrameBackgroundResult:
     _poll(cancelled)
     if not np.isfinite(background).any(): raise ValueError("Background contains no finite pixels")
     _poll(cancelled); body["result_sha256"] = _array_digest(background, cancelled, np.float64)
@@ -805,7 +812,7 @@ def _result(plan, frame_fact, background, body, cancelled, variance_factor=None)
     if type(variance_factor) is np.ndarray:
         variance_factor = _bytes_array(variance_factor)
     return FrameBackgroundResult("RESOLVED", frozen, raw,
-                                 hashlib.sha256(raw).hexdigest(), (), variance_factor)
+                                 hashlib.sha256(raw).hexdigest(), (), variance_factor, scale)
 def resolve_frame_background(
     plan: FrameBackgroundPlan, frame_fact: tuple[object, ...], *,
     cancelled: Event | Callable[[], bool] | None = None,
@@ -831,7 +838,7 @@ def resolve_frame_background(
             return _result(plan, frame_fact, image, {"version": 1, "mode": plan.mode,
                 "policy": policy, "frame_fact": frame_fact, "source": source,
                 "metadata_items": metadata, "metadata_source": metadata_source,
-                "decoded": source["decoded"]}, cancelled, factor)
+                "decoded": source["decoded"]}, cancelled, factor, factor)
         if plan.mode == "Series Average":
             members = _series_paths(plan.locator or "", cancelled)
             sums = np.zeros(shape, np.float64); counts = np.zeros(shape, np.uint64)
@@ -867,7 +874,7 @@ def resolve_frame_background(
                     "version": 1, "count": len(members), "receipt_bytes": receipt_bytes,
                     "sha256": manifest.hexdigest()}, "selected": str(Path(plan.locator or "").resolve()),
                 "normalization": {"target": _tag(target_norm), "denominator": _tag(denominator)}},
-                cancelled, variance_factor)
+                cancelled, variance_factor, factor)
         root = Path(plan.locator or "").resolve(strict=True)
         if not root.is_dir(): raise ValueError("Background Directory is not a directory")
         predicate = compile_filter(plan.filename_filter)
@@ -913,7 +920,7 @@ def resolve_frame_background(
             "policy": policy, "frame_fact": frame_fact, "manifest": {"version": 1,
                 "count": count, "receipt_bytes": receipt_bytes, "sha256": digest},
             "selected": str(chosen), "metadata_items": projected,
-            "metadata_source": metadata_source, "decoded": source["decoded"]}, cancelled, factor)
+            "metadata_source": metadata_source, "decoded": source["decoded"]}, cancelled, factor, factor)
     except InterruptedError:
         return FrameBackgroundResult("CANCELLED", None, None, None, ("cancelled",))
     except (FileNotFoundError, PermissionError, OSError, RuntimeError) as error:

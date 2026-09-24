@@ -65,6 +65,26 @@ def test_dark_and_background_noise_add_up():
     np.testing.assert_allclose(reduced.sigma, direct.sigma, rtol=1e-12)
 
 
+@pytest.mark.parametrize("scale", (1.0, 2.0))
+def test_a_background_with_a_dark_loses_its_own_dark(scale):
+    """raw − dark − scale·(background − dark): a background image holds the dark too.
+
+    The measured dark then enters with weight 1 − scale, so at scale 1 it cancels.
+    """
+    from xrd_tools.integrate.single import integrate_1d
+    dark = np.full(SHAPE, 8.0)
+    background = np.full(SHAPE, 20.0)  # the background image, its dark included
+    reduced = _reduce(ReductionPlan(integration_1d=Integration1DPlan(npt=60, error_model="poisson"),
+                                    integration_2d=None, dark=dark),
+                      background=scale * background, background_variance_factor=scale,
+                      background_scale=scale).result_1d
+    variance = np.maximum(_IMAGE, 1.0) + (1 - scale) ** 2 * dark + scale * scale * background
+    direct = integrate_1d(_IMAGE - scale * (background - dark), poni_to_integrator(_PONI), npt=60,
+                          method="csr", dark=dark, variance=variance)
+    np.testing.assert_allclose(reduced.intensity, direct.intensity, rtol=1e-12)
+    np.testing.assert_allclose(reduced.sigma, direct.sigma, rtol=1e-12)
+
+
 @pytest.mark.parametrize("output", ("1d", "2d", "chi", "gi_q_total", "gi_q_ip"))
 def test_a_dark_is_subtracted_from_every_output(output):
     gi = None

@@ -162,6 +162,9 @@ class ScanFrame:
     background_dependency_fingerprint: str | None = None
     #: Poisson variance of ``background`` per unit of it (see FrameBackgroundResult)
     background_variance_factor: float | np.ndarray | None = None
+    #: The factor ``background`` was scaled by; with a dark, the reducer removes the
+    #: background's own dark (scale · dark). None: the background carries no dark.
+    background_scale: float | None = None
 
     def __post_init__(self) -> None:
         self.metadata = dict(self.metadata or {})
