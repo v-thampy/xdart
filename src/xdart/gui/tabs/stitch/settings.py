@@ -61,7 +61,8 @@ def validate_settings(document: Any) -> dict[str, Any]:
         if type(document.get(key, {})) is not kind:
             raise ValueError(f"Stitch settings {key} are malformed")
     calibration = document.get("calibration")
-    if calibration is not None and type(calibration) is not dict:
+    if calibration is not None and (type(calibration) is not dict or any(
+            type(calibration.get(key, {})) is not dict for key in ("fields", "choices"))):
         raise ValueError("Stitch settings calibration is malformed")
     return document
 

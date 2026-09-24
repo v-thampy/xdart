@@ -135,6 +135,12 @@ def test_file_save_and_load_through_the_settings_port(qapp, tmp_path):
         refused = handle.settings_io.load()
         assert type(refused) is ActionRefused and "not an xdart Stitch settings file" in refused.reason
         assert other.settings() == before
+        malformed = page.settings()
+        malformed["calibration"] = {"fields": ["rms"], "choices": {}}
+        foreign.write_text(json.dumps(malformed))
+        refused = handle.settings_io.load()
+        assert type(refused) is ActionRefused and "calibration is malformed" in refused.reason
+        assert other.settings() == before
     finally:
         _close(page, qapp)
         _close(other, qapp)
