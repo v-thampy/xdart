@@ -205,3 +205,38 @@ def test_scan14_automatic_fit_predicts_held_out_nu_rows(guided, tmp_path):
     print(f'held-out rows: {len(errors)} ring centres, max |error| {max(abs(e) for e in errors):.4f} Å⁻¹')
     assert len(errors) >= 14, centres
     assert max(abs(e) for e in errors) <= 0.002, centres
+
+
+def _stitch(root, geometry_path, labels, target, **plan_fields):
+    table = run_metadata_table(MetadataTablePlan(_spec(root)))
+    source = ModuleSourceReceipt.from_metadata_table(
+        table, kind=ModuleKind.STITCH, selected_labels=labels,
+        resolved_selectors=(MetadataColumnSelector('del'), MetadataColumnSelector('nu')))
+    geometry = capture_stitch_geometry(StitchGeometryInput(
+        geometry_path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
+        source_motors=(('del_angle', 'del'), ('nu_angle', 'nu')), image_rotation=0))
+    plan = StitchOperationPlan(geometry, mode='1d', npt_1d=1500, radial_range=(1.0, 6.2),
+                               use_detector_mask=True, max_frame_bytes=64 * 1024 * 1024, **plan_fields)
+    output = ModuleOutputRequest(target, AnalysisArtifactKind.STITCH_1D, AnalysisArtifactOverwrite.CREATE_NEW)
+    result = run_stitch_operation(prepare_stitch_operation(source, output, plan, project_root=root))
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED
+    return result
+
+
+@pytest.mark.slow
+def test_scan14_sample_on_rotation_axis_drops_the_calibrant_offset(guided, tmp_path):
+    from xrd_tools.core.geometry import Diffractometer
+    record = json.loads(guided['extended_path'].read_text())
+    diff = Diffractometer.from_pyfai_goniometer(record, source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
+    assert diff.stacked_arm.has_sample_offset
+    zeroed = diff.stacked_arm.without_sample_offset().to_pyfai_goniometer(diff.calibration)
+    zeroed_path = guided['root'] / 'fits/extended-without-offset.json'
+    zeroed_path.write_text(json.dumps(zeroed))
+    labels = tuple(range(0, 287, 7))
+    on_axis = _stitch(guided['root'], guided['extended_path'], labels, tmp_path / 'axis.nexus',
+                      sample_position='rotation_axis')
+    reference = _stitch(guided['root'], zeroed_path, labels, tmp_path / 'zeroed.nexus')
+    calibrated = _stitch(guided['root'], guided['extended_path'], labels, tmp_path / 'calibrated.nexus')
+    np.testing.assert_array_equal(on_axis.payload.intensity, reference.payload.intensity)
+    assert not np.array_equal(on_axis.payload.intensity, calibrated.payload.intensity, equal_nan=True)
+    assert json.loads(on_axis.payload.provenance_json)['plan']['sample_position'] == 'rotation_axis'

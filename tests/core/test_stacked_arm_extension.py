@@ -301,3 +301,28 @@ def test_stratified_selection_reaches_every_nu_row_first():
     assert len(five) == 5 and coverage == {'nu_rows_available': 7, 'nu_rows_selected': 5}
     forty_eight, _ = stratified_frame_indices(rows, 48, 'nu', 'del')
     assert len(forty_eight) == 48 and min(per_row(forty_eight).values()) >= 6
+
+
+def test_stitch_plan_sample_position_policy(tmp_path):
+    from xrd_tools.analysis.stitch_operation import (
+        StitchGeometryInput, StitchGeometryKind, StitchOperationPlan, _sample_positioned,
+        capture_stitch_geometry,
+    )
+    path = tmp_path / 'extended.json'
+    path.write_text(json.dumps(StackedDetectorArm(**TRUTH).to_pyfai_goniometer(_calibration())))
+    geometry = capture_stitch_geometry(StitchGeometryInput(
+        path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
+        source_motors=(('del_angle', 'del'), ('nu_angle', 'nu')), image_rotation=0))
+    calibrated = StitchOperationPlan(geometry, radial_range=(1., 5.))
+    on_axis = StitchOperationPlan(geometry, radial_range=(1., 5.), sample_position='rotation_axis')
+    assert calibrated.sample_position == 'calibrated'
+    assert calibrated.fingerprint != on_axis.fingerprint
+    with pytest.raises(ValueError, match='sample position'):
+        StitchOperationPlan(geometry, radial_range=(1., 5.), sample_position='sample')
+    diff = Diffractometer.from_pyfai_goniometer(json.loads(path.read_text()), source_motors=SOURCES)
+    assert _sample_positioned(calibrated, diff) is diff
+    moved = _sample_positioned(on_axis, diff).stacked_arm
+    assert not moved.has_sample_offset and moved.mount_tilt == diff.stacked_arm.mount_tilt
+    plain = Diffractometer.from_pyfai_goniometer(
+        StackedDetectorArm().to_pyfai_goniometer(_calibration()), source_motors=SOURCES)
+    assert _sample_positioned(on_axis, plain) is plain

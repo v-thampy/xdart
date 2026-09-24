@@ -113,6 +113,8 @@ _MAX_AXIS_POINTS = 1_000_000
 _MAX_2D_POINTS = 64_000_000
 _GEOMETRY_FACTORY = object()
 _REQUEST_FACTORY = object()
+#: Where the sample sits relative to a stacked arm's calibrated sample offset.
+SAMPLE_POSITIONS = ("calibrated", "rotation_axis")
 
 
 class StitchGeometryKind(str, Enum):
@@ -1328,6 +1330,9 @@ class StitchOperationPlan:
     conditioning: StitchConditioning | None = None
     mask_path: str | Path | None = None
     frame_screen: FrameScreenPolicy = field(default_factory=FrameScreenPolicy)
+    #: 'calibrated' keeps a stacked arm's fitted sample offset; 'rotation_axis'
+    #: drops it for a sample centred on the rotation axis (e.g. after GI alignment).
+    sample_position: str = "calibrated"
     _mask_receipt: object = field(init=False, default=None, repr=False)
     fingerprint: str = field(init=False)
 
@@ -1365,6 +1370,8 @@ class StitchOperationPlan:
             raise TypeError("use_detector_mask must be an exact bool")
         if type(self.frame_screen) is not FrameScreenPolicy:
             raise TypeError("frame screen must be an exact FrameScreenPolicy")
+        if self.sample_position not in SAMPLE_POSITIONS:
+            raise ValueError(f"sample position must be one of {SAMPLE_POSITIONS}")
         if (
             type(self.max_frame_bytes) is not int
             or not 1 <= self.max_frame_bytes <= 4 * 1024 * 1024 * 1024
@@ -1397,6 +1404,7 @@ class StitchOperationPlan:
             "streaming-multigeometry-v1",
             self.max_frame_bytes,
             self.frame_screen.identity(),
+            ("sample-position", self.sample_position),
         )
         return value + native_plan_identity(self) if self.native_records else value
 
@@ -1768,6 +1776,7 @@ def _provenance(
             "use_detector_mask": plan.use_detector_mask,
             "streaming_multigeometry": True,
             "frame_screen": plan.frame_screen.to_provenance(),
+            "sample_position": plan.sample_position,
             "max_frame_bytes": plan.max_frame_bytes,
             "plan_fingerprint": plan.fingerprint,
         },
@@ -2283,7 +2292,16 @@ def _detector_mask(diffractometer) -> np.ndarray | None:
     return mask
 
 
+def _sample_positioned(plan: StitchOperationPlan, diffractometer):
+    """Apply the plan's sample position to a stacked arm's calibrated sample offset."""
+    arm = getattr(diffractometer, "stacked_arm", None)
+    if plan.sample_position == "rotation_axis" and arm is not None and arm.has_sample_offset:
+        return replace(diffractometer, stacked_arm=arm.without_sample_offset())
+    return diffractometer
+
+
 def _runtime_plan(plan: StitchOperationPlan, diffractometer) -> StitchPlan:
+    diffractometer = _sample_positioned(plan, diffractometer)
     mask = _detector_mask(diffractometer) if plan.use_detector_mask else None
     external = native_mask(plan)
     if external is not None:
