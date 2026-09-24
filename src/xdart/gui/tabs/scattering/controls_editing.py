@@ -18,6 +18,9 @@ from xrd_tools.session.intent_store import (
 from xrd_tools.session.readiness import Tool, tool_from_mode_text
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.session.run_configuration import PoniV3OverrideIntent
+from xrd_tools.session.threshold_editing import (
+    ThresholdEditRefusal, ThresholdState, threshold_transition,
+)
 from xrd_tools.integrate.calibration import PONI_V3_SENSOR_MATERIALS
 from xrd_tools.sources.selection import DirectorySourceSpec
 
@@ -489,38 +492,29 @@ def reduce_control_edit(
             reset_auto_gi_motor=reset_auto_gi_motor,
         )
     intent = snapshot.thaw()
+    if path in {THRESHOLD_MIN, THRESHOLD_MAX, THRESHOLD_ENABLED}:
+        threshold = intent.threshold
+        result = threshold_transition(
+            ThresholdState(threshold.apply_threshold, threshold.threshold_min,
+                           threshold.threshold_max, threshold.mask_saturation),
+            {THRESHOLD_MIN: "min", THRESHOLD_MAX: "max", THRESHOLD_ENABLED: "enabled"}[path],
+            value, observed_threshold_max(intent, observation))
+        if isinstance(result, ThresholdEditRefusal):
+            return EditRefusal(result.reason)
+        if result is None:
+            return EditNoChange()
+        threshold.apply_threshold = result.apply_threshold
+        threshold.threshold_min = result.threshold_min
+        threshold.threshold_max = result.threshold_max
+        threshold.mask_saturation = result.mask_saturation
+        return intent
     parsed = _control_value(intent, path, value)
     if isinstance(parsed, EditRefusal):
         return parsed
     current = _current_value(intent, path)
-    if (
-        path in {THRESHOLD_MIN, THRESHOLD_MAX}
-        and intent.threshold.mask_saturation
-        and not intent.threshold.apply_threshold
-    ):
-        # Focusing a projected default is not an explicit range edit.
-        current = 0.0 if path == THRESHOLD_MIN else observed_threshold_max(intent, observation)
-    # A touch of any threshold control must not absorb as EditNoChange while
-    # the active manual band's displayed defaults are still unmaterialized.
-    # The probe runs on a detached thawed copy.
-    noncanonical_threshold_touch = (
-        path in {
-            THRESHOLD_ENABLED, THRESHOLD_MIN, THRESHOLD_MAX,
-        }
-        and canonicalize_threshold_intent(snapshot.thaw())
-    )
-    if parsed == current and not noncanonical_threshold_touch:
+    if parsed == current:
         return EditNoChange()
-    if path in {THRESHOLD_MIN, THRESHOLD_MAX}:
-        automatic = intent.threshold.mask_saturation and not intent.threshold.apply_threshold
-        low = parsed if path == THRESHOLD_MIN else (0.0 if automatic else intent.threshold.threshold_min)
-        high = parsed if path == THRESHOLD_MAX else (observed_threshold_max(intent, observation) if automatic else intent.threshold.threshold_max)
-        if low is not None and high is not None and low > high:
-            return EditRefusal("Threshold minimum cannot exceed maximum.")
     candidate = snapshot.thaw()
-    if path in {THRESHOLD_MIN, THRESHOLD_MAX} and automatic:
-        # Old sessions may retain inactive manual values behind automatic mode.
-        candidate.threshold.threshold_min = candidate.threshold.threshold_max = None
     _install_value(candidate, path, parsed)
     prior_default_save_path = (
         str(Path(str(intent.project_root)).expanduser() / "xdart_processed_data")
@@ -543,30 +537,6 @@ def reduce_control_edit(
             candidate,
             was_enabled=intent.gi.enabled,
         )
-    elif path in {THRESHOLD_MIN, THRESHOLD_MAX}:
-        threshold = candidate.threshold
-        if path == THRESHOLD_MAX and parsed is None:
-            # Clearing the upper bound restores the entire automatic band.
-            threshold.threshold_min = threshold.threshold_max = None
-            threshold.apply_threshold = False
-            threshold.mask_saturation = True
-            return candidate
-        if threshold.threshold_max is None:
-            threshold.threshold_max = observed_threshold_max(candidate, observation)
-            if threshold.threshold_max is None:
-                return EditRefusal("Select an integer detector input or enter an upper threshold first.")
-        threshold.apply_threshold = True
-        threshold.mask_saturation = False
-        canonicalize_threshold_intent(candidate)
-        if threshold.threshold_min > threshold.threshold_max:
-            return EditRefusal("Threshold minimum cannot exceed maximum.")
-    elif path == THRESHOLD_ENABLED:
-        threshold = candidate.threshold
-        if not parsed and intent.threshold.mask_saturation and not intent.threshold.apply_threshold:
-            threshold.threshold_min = threshold.threshold_max = None
-        threshold.apply_threshold = bool(parsed and threshold.threshold_max is not None)
-        threshold.mask_saturation = bool(parsed and not threshold.apply_threshold)
-        canonicalize_threshold_intent(candidate)
     return candidate
 
 
@@ -1101,7 +1071,7 @@ def _control_value(
             if value in {"Overwrite", "Append"}
             else EditRefusal("Output mode must be Overwrite or Append.")
         )
-    if path in {GI_ENABLED, THRESHOLD_ENABLED, MASK_SATURATION}:
+    if path in {GI_ENABLED, MASK_SATURATION}:
         return (
             value
             if type(value) is bool
@@ -1120,10 +1090,6 @@ def _control_value(
                 "Sample orientation must be an integer from 1 through 8."
             )
         return parsed
-    if path in {THRESHOLD_MIN, THRESHOLD_MAX}:
-        if type(value) is str and not value.strip():
-            return None
-        return _finite_float(value)
     return EditRefusal("Unknown control.")
 
 
@@ -1161,9 +1127,6 @@ def _current_value(intent: RunIntent, path: tuple[str, ...]) -> object:
         GI_THETA: intent.gi.th_val,
         GI_ORIENTATION: intent.gi.sample_orientation,
         GI_TILT: intent.gi.tilt_angle,
-        THRESHOLD_ENABLED: intent.threshold.apply_threshold or intent.threshold.mask_saturation,
-        THRESHOLD_MIN: intent.threshold.threshold_min,
-        THRESHOLD_MAX: intent.threshold.threshold_max,
         MASK_SATURATION: intent.threshold.mask_saturation,
     }
     return values[path]
@@ -1194,11 +1157,5 @@ def _install_value(
         intent.gi.sample_orientation = value  # type: ignore[assignment]
     elif path == GI_TILT:
         intent.gi.tilt_angle = value  # type: ignore[assignment]
-    elif path == THRESHOLD_ENABLED:
-        intent.threshold.apply_threshold = value  # type: ignore[assignment]
-    elif path == THRESHOLD_MIN:
-        intent.threshold.threshold_min = value  # type: ignore[assignment]
-    elif path == THRESHOLD_MAX:
-        intent.threshold.threshold_max = value  # type: ignore[assignment]
     else:
         intent.threshold.mask_saturation = value  # type: ignore[assignment]

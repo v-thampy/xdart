@@ -46,6 +46,9 @@ from xrd_tools.analysis.stitch_sources import StitchSourceSelection
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifactPayload
 from xrd_tools.session.readiness import ControlFieldKind, ControlFormField, SectionId
+from xrd_tools.session.threshold_editing import (
+    ThresholdEditRefusal, ThresholdState, threshold_transition,
+)
 
 
 class StitchPage(QtWidgets.QWidget):
@@ -63,8 +66,7 @@ class StitchPage(QtWidgets.QWidget):
         self._paths_by_kind = {}
         self._range_rows = []
         self._range_keys = set()
-        self._threshold_mode = "auto"
-        self._threshold_manual = False
+        self._threshold_state = ThresholdState()
         self._auto_threshold_max = None
         self._queued_jobs = []
         self._job_total = 0
@@ -389,10 +391,40 @@ class StitchPage(QtWidgets.QWidget):
         for row in self._range_rows:
             row.apply_fields(values)
 
+    @property
+    def _threshold_mode(self):
+        state = self._threshold_state
+        return "manual" if state.apply_threshold else "auto" if state.mask_saturation else "off"
+
+    @property
+    def _threshold_manual(self):
+        state = self._threshold_state
+        return state.apply_threshold or state.threshold_min is not None or state.threshold_max is not None
+
     def _range_edited(self, path, value):
         key = path[-1]
+        if key in {"threshold_min", "threshold", "threshold_enabled"}:
+            result = threshold_transition(self._threshold_state,
+                {"threshold_min": "min", "threshold": "max", "threshold_enabled": "enabled"}[key],
+                value, self._auto_threshold_max)
+            if isinstance(result, ThresholdEditRefusal):
+                self._render_ranges()
+                self._status(result.reason, ready=False)
+                return
+            if result is None:
+                self._render_ranges()
+                return
+            self._threshold_state = result
+            for name, projected in (
+                    ("threshold_min", 0.0 if result.threshold_min is None else result.threshold_min),
+                    ("threshold", result.threshold_max if result.threshold_max is not None or result.apply_threshold else self._auto_threshold_max),
+                    ("threshold_enabled", result.apply_threshold or result.mask_saturation)):
+                self._fields[name] = replace(self._fields[name], value=projected)
+            self._render_ranges()
+            self._edited()
+            return
         old = self._fields[key].value
-        if key not in {"radial_auto", "threshold_enabled"}:
+        if key != "radial_auto":
             try:
                 value = None if value is None or not str(value).strip() else float(value)
             except ValueError:
@@ -401,20 +433,6 @@ class StitchPage(QtWidgets.QWidget):
         if value == old:
             return
         self._fields[key] = replace(self._fields[key], value=value)
-        if key == "threshold" and value is None:
-            self._threshold_mode, self._threshold_manual = "auto", False
-            self._fields["threshold_min"] = replace(self._fields["threshold_min"], value=0.)
-            self._fields["threshold"] = replace(self._fields["threshold"], value=self._auto_threshold_max)
-            self._fields["threshold_enabled"] = replace(self._fields["threshold_enabled"], value=True)
-        elif key in {"threshold_min", "threshold"}:
-            if self._fields["threshold"].value is None:
-                self._status("Enter an upper threshold before selecting a manual lower bound", ready=False)
-                self._fields[key] = replace(self._fields[key], value=old)
-            else:
-                self._threshold_mode, self._threshold_manual = "manual", True
-                self._fields["threshold_enabled"] = replace(self._fields["threshold_enabled"], value=True)
-        elif key == "threshold_enabled":
-            self._threshold_mode = ("manual" if self._threshold_manual else "auto") if value else "off"
         self._render_ranges()
         self._edited()
 
@@ -605,6 +623,7 @@ class StitchPage(QtWidgets.QWidget):
         fields = {key: getattr(form, key) for key in (
             "project_root", "spec_path", "scan", "image_dir", "image_stem", "raw_dtype",
             "raw_header_skip", "geometry_path", "threshold", "npt_1d", "output_path")}
+        fields["threshold"] = "" if form.threshold is None else form.threshold
         fields.update(unit="Q (Å⁻¹)" if form.unit == "q_A^-1" else "2θ (°)",
             output_family=";".join(form.output_families) if form.output_families else form.output_family or "",
             mask_path=form.mask_path or "",
@@ -630,8 +649,8 @@ class StitchPage(QtWidgets.QWidget):
             self.set_field("image_dir", selection.image_dir)
             self.set_field("image_stem", selection.image_stem)
             policy = form.conditioning or StitchConditioning()
-            self._threshold_mode = policy.mode
-            self._threshold_manual = policy.mode == "manual"
+            self._threshold_state = ThresholdState(policy.mode == "manual",
+                policy.threshold_min, policy.threshold_max, policy.mode == "auto")
             for key, value in (("threshold_min", policy.threshold_min if policy.mode == "manual" else 0.),
                                ("threshold", policy.threshold_max), ("threshold_enabled", policy.mode != "off")):
                 self._fields[key] = replace(self._fields[key], value=value)
