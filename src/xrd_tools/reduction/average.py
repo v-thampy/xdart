@@ -32,7 +32,7 @@ from xrd_tools.io.read import _read_average_lineage, get_average_finite_counts, 
 from xrd_tools.io.record_writer import WriterIncomplete
 from xrd_tools.io.schema import PROCESSED_SCHEMA_VERSION
 from xrd_tools.reduction.background import FrameBackgroundPlan, resolve_frame_background
-from xrd_tools.reduction.core import GIMode, Integration1DPlan, Integration2DPlan, NexusSink, ReductionPlan, run_reduction
+from xrd_tools.reduction.core import GIMode, Integration1DPlan, Integration2DPlan, NexusSink, ReductionPlan, _with_variance, run_reduction
 from xrd_tools.session.experiment_state import CalibrationState, FactStatus, FlatState, MaskState, PoniValues
 from xrd_tools.session import policy as _resource_policy
 from xrd_tools.session.policy import SessionResourceAllocation, requirements_from, resolve_session_policy
@@ -1125,6 +1125,15 @@ def _reduce_average(plan: AverageScanPlan, science: dict[str, Any], token: threa
     if flat is not None:
         reduction = replace(reduction, flat=flat)
         scan.extra = {**scan.extra, 'flatfield': flat}
+    if any(item is not None and item.error_model == 'poisson' and 'variance' not in item.extra
+           for item in (reduction.integration_1d, reduction.integration_2d)):
+        # The averaged frame is a mean of N counts: its Poisson variance is the
+        # mean over N (pyFAI's floor of one count), not the mean itself.
+        counts = np.asarray(science['finite'].values)
+        variance = np.divide(np.maximum(science['average'], 1.0), counts,
+                             out=np.zeros(counts.shape), where=counts > 0)
+        reduction = replace(reduction, integration_1d=_with_variance(reduction.integration_1d, variance),
+                            integration_2d=_with_variance(reduction.integration_2d, variance))
     reduced = run_reduction(reduction, scan, cancel_token=token, execution='chunked', retain_products=True, strict=StrictPolicy(True, True, True))
     progress('reduce', 1, 1)
     if reduced.failed and type(reduced.error) is str and reduced.error.startswith('monitor ') and reduced.error.endswith('Pass StrictPolicy.graceful() to allow it.'): raise MissingNormalizationError(reduced.error)

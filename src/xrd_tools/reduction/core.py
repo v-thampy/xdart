@@ -5686,9 +5686,14 @@ def _reduce_frame(
         # Keep the native dtype for detection and the static geometric mask for
         # integration axes/cache reuse; a recovered pixel is valid next frame.
         image[value_mask] = np.nan
+    variance = None
     if not use_float32_csr:
         image = _apply_thresholds_owned(image, plan)
+        variance = _background_poisson_variance(image, frame, plan)
         image = _subtract_background(image, frame.background)
+    # Poisson plans with a background integrate raw − background with its variance.
+    p1_frame = _with_variance(plan.integration_1d, variance)
+    p2_frame = _with_variance(plan.integration_2d, variance)
     plan_mask = _cached_mask_for_shape(
         plan.mask,
         image.shape,
@@ -5712,7 +5717,7 @@ def _reduce_frame(
             _run_gi_1d(
                 image,
                 fi,
-                plan.integration_1d,
+                p1_frame,
                 plan.gi,
                 mask=mask,
                 incident_angle=incident_angle,
@@ -5726,7 +5731,7 @@ def _reduce_frame(
             _run_gi_2d(
                 image,
                 fi,
-                plan.integration_2d,
+                p2_frame,
                 plan.gi,
                 mask=mask,
                 incident_angle=incident_angle,
@@ -5752,7 +5757,7 @@ def _reduce_frame(
                 flat=plan.flat,
             )
     else:
-        p1 = plan.integration_1d
+        p1 = p1_frame
         chi_mode = standard_chi_profile(plan)
         unsafe_dynamic_mask_cache = any(
             item is not None
@@ -5859,20 +5864,20 @@ def _reduce_frame(
             integrate_2d(
                 image,
                 ai,
-                npt_rad=plan.integration_2d.npt_rad,
-                npt_azim=plan.integration_2d.npt_azim,
-                unit=plan.integration_2d.unit,
-                method=plan.integration_2d.method,
+                npt_rad=p2_frame.npt_rad,
+                npt_azim=p2_frame.npt_azim,
+                unit=p2_frame.unit,
+                method=p2_frame.method,
                 mask=integration_mask,
-                radial_range=plan.integration_2d.radial_range,
-                azimuth_range=_integration_azimuth_range(plan.integration_2d),
-                error_model=plan.integration_2d.error_model,
-                polarization_factor=plan.integration_2d.polarization_factor,
+                radial_range=p2_frame.radial_range,
+                azimuth_range=_integration_azimuth_range(p2_frame),
+                error_model=p2_frame.error_model,
+                polarization_factor=p2_frame.polarization_factor,
                 normalization_factor=_normalization_for(
-                    frame, plan.integration_2d, warned_monitor_keys, strict=strict),
+                    frame, p2_frame, warned_monitor_keys, strict=strict),
                 _detector_mask_is_bound=detector_mask_is_bound,
                 **_flat_kwargs(plan),
-                **plan.integration_2d.extra,
+                **p2_frame.extra,
             )
             if plan.integration_2d is not None else None
         )
@@ -5923,6 +5928,30 @@ def _reduce_frame(
         )
         reduction._worker_thumbnail_prep = _WorkerThumbnailPrep(thumbnail_mask)
     return reduction
+
+
+def _background_poisson_variance(image, frame, plan: ReductionPlan) -> np.ndarray | None:
+    """Poisson variance of raw − background, for plans that ask for Poisson sigma.
+
+    Subtracting before integration would leave pyFAI's Poisson model only the
+    difference; the variance of a difference is pyFAI's max(1, raw) plus the
+    background's own (its variance factor times the background).
+    """
+    factor = getattr(frame, "background_variance_factor", None)
+    if frame.background is None or factor is None or not any(
+            item is not None and item.error_model == "poisson" and "variance" not in item.extra
+            for item in (plan.integration_1d, plan.integration_2d)):
+        return None
+    variance = np.maximum(image, 1.0)
+    variance += np.clip(np.asarray(factor) * np.asarray(frame.background, dtype=float), 0.0, None)
+    return variance
+
+
+def _with_variance(item, variance):
+    """The integration with an explicit variance in place of its Poisson model."""
+    if variance is None or item is None or item.error_model != "poisson" or "variance" in item.extra:
+        return item
+    return replace(item, error_model=None, extra={**item.extra, "variance": variance})
 
 
 def _flat_kwargs(plan: ReductionPlan) -> dict[str, Any]:

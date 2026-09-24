@@ -135,6 +135,7 @@ def _resolve_background_before_submit(frame, plan: FrameBackgroundPlan, binding,
     if candidate is not None and capsule_owner is not None:
         capsule_owner.background_capsule = candidate
     frame.background = result.background
+    frame.background_variance_factor = result.variance_factor
     frame.background_dependency_bytes, frame.background_dependency_fingerprint = pair
     return True
 

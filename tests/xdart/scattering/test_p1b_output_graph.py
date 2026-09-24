@@ -3376,3 +3376,66 @@ for name in tuple(sys.modules):
     assert _constructor_sites("DynamicRunAccounting") == {
         "src/xdart/gui/tabs/scattering/adapters/dynamic_output.py"
     }
+
+
+def test_background_poisson_sigma_propagates_and_reintegrate_reproduces_it(tmp_path):
+    from xrd_tools.io import get_1d
+    from xrd_tools.io.finite_artifact import _snapshot_path
+    from xrd_tools.reduction import FrameBackgroundPlan, ReintegrateSuccessorPlan, run_reintegrate_successor
+    from xrd_tools.reduction.reintegrate_prepared import _target_snapshot
+
+    for label in range(1, 4):
+        _write_tiff(tmp_path / f"frame_{label:04d}.tif", 40 + label)
+    _write_tiff(tmp_path / "background.tif", 30)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+
+    def run(name, request_value, background):
+        intent = _intent(tmp_path / "frame_0001.tif", tmp_path / f"{name}.nexus", poni)
+        intent.bai_1d_args = {**intent.bai_1d_args, "error_model": "poisson"}
+        intent.background = background
+        executor = StandardRunExecutor(join_timeout=5.0)
+        identity = _start(executor, intent, request_value=request_value)
+        try:
+            events = _drain_until(
+                executor, lambda values: any(e.kind in _TERMINAL for e in values),
+                timeout=90.0,
+            )
+            terminal = next(e for e in events if e.kind in _TERMINAL)
+            assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
+        finally:
+            assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+        return _written(Path(intent.save_path))
+
+    subtracted = run("subtracted", 1801, FrameBackgroundPlan(
+        mode="Single BG File", locator=str(tmp_path / "background.tif"), scale=2.0))
+    plain = run("plain", 1802, FrameBackgroundPlan())
+    labels = (1, 2, 3)
+    for label in labels:
+        with_background, without = get_1d(subtracted, frame=label), get_1d(plain, frame=label)
+        covered = np.isfinite(with_background.sigma) & (with_background.sigma > 0)
+        assert covered.any()
+        # raw 40 + label counts, background 2 × 30: variance (40 + label) + 2 × 60 per pixel
+        np.testing.assert_allclose(
+            (with_background.sigma / without.sigma)[covered],
+            np.sqrt((40 + label + 120) / (40 + label)), rtol=1e-5)
+    preparation = {
+        "api_version": 1,
+        "selected_plan": {"version": 1, "dimension": "1d",
+                          "bai_args": {"npt": 8, "method": "numpy", "error_model": "poisson"},
+                          "gi_mode": "q_total"},
+        "requested_shared_science": {"version": 1, "kind": "persisted_target"},
+        "resource_policy": {"version": 1, "kind": "resolve", "envelope_bytes": 8 << 30,
+                            "requests": {"workers": 1, "reduction_inflight": 1}},
+    }
+    plan = ReintegrateSuccessorPlan.from_artifact(
+        str(subtracted), entry="entry", dimension="1d", preparation=preparation,
+        source_root=str(tmp_path), expected_labels=labels,
+        expected_target_snapshot=_target_snapshot(_snapshot_path(subtracted)),
+    )
+    result = run_reintegrate_successor(plan)
+    assert result.output_artifact is not None, result.diagnostics
+    for label in labels:
+        original, again = get_1d(subtracted, frame=label), get_1d(result.output_artifact, frame=label)
+        np.testing.assert_array_equal(again.intensity, original.intensity)
+        np.testing.assert_array_equal(again.sigma, original.sigma)

@@ -334,6 +334,10 @@ class FrameBackgroundResult:
     descriptor_bytes: bytes | None
     fingerprint: str | None
     diagnostics: tuple[str, ...] = ()
+    #: Poisson variance of ``background`` per unit of it: var = factor · background
+    #: (scale × normalization ratio, divided by each pixel's member count for a
+    #: series). A float, or a per-pixel array only for a series with uneven counts.
+    variance_factor: float | np.ndarray | None = None
     def __post_init__(self) -> None:
         active = self.disposition == "RESOLVED" and self.background is not None
         pair = self.descriptor_bytes is not None or self.fingerprint is not None
@@ -347,6 +351,12 @@ class FrameBackgroundResult:
                              or _json(json.loads(self.descriptor_bytes.decode("utf-8", "strict"))) != self.descriptor_bytes or hashlib.sha256(self.descriptor_bytes).hexdigest() != self.fingerprint) \
                 or not active and any(v is not None for v in (self.background, self.descriptor_bytes, self.fingerprint)):
             raise ValueError("frame-background result is invalid")
+        factor = self.variance_factor
+        if factor is not None and (not active or (
+                type(factor) is not float or not math.isfinite(factor)) and (
+                type(factor) is not np.ndarray or factor.dtype != np.dtype(np.float64)
+                or factor.shape != self.background.shape or not _is_bytes_backed(factor))):
+            raise ValueError("frame-background variance factor is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -614,6 +624,7 @@ def _rebind_single_frame_background(
             raw,
             hashlib.sha256(raw).hexdigest(),
             prepared.result.diagnostics,
+            prepared.result.variance_factor,
         )
     except InterruptedError:
         return FrameBackgroundResult(
@@ -783,7 +794,7 @@ def _directory_receipts(candidates, plan, target_tag, target_match, chosen,
             receipt["source"] = source; del image
         yield receipt
     if matches != 1: raise RuntimeError("Background Directory match changed")
-def _result(plan, frame_fact, background, body, cancelled) -> FrameBackgroundResult:
+def _result(plan, frame_fact, background, body, cancelled, variance_factor=None) -> FrameBackgroundResult:
     _poll(cancelled)
     if not np.isfinite(background).any(): raise ValueError("Background contains no finite pixels")
     _poll(cancelled); body["result_sha256"] = _array_digest(background, cancelled, np.float64)
@@ -791,8 +802,10 @@ def _result(plan, frame_fact, background, body, cancelled) -> FrameBackgroundRes
     cap = _MAX_RECEIPT if plan.mode in {"Series Average", "BG Directory"} else _MAX_DESCRIPTOR
     if len(raw) > cap: raise ValueError("Background descriptor exceeds cap")
     frozen = _bytes_array(background); _poll(cancelled)
+    if type(variance_factor) is np.ndarray:
+        variance_factor = _bytes_array(variance_factor)
     return FrameBackgroundResult("RESOLVED", frozen, raw,
-                                 hashlib.sha256(raw).hexdigest())
+                                 hashlib.sha256(raw).hexdigest(), (), variance_factor)
 def resolve_frame_background(
     plan: FrameBackgroundPlan, frame_fact: tuple[object, ...], *,
     cancelled: Event | Callable[[], bool] | None = None,
@@ -813,11 +826,12 @@ def resolve_frame_background(
             metadata, metadata_source = _metadata(Path(source["locator"]), plan,
                 tuple(key for key in (plan.normalization_key,) if key), cancelled)
             denominator = _target_metadata(metadata, plan.normalization_key)
-            image *= plan.scale * target_norm / denominator
+            factor = float(plan.scale * target_norm / denominator)
+            image *= factor
             return _result(plan, frame_fact, image, {"version": 1, "mode": plan.mode,
                 "policy": policy, "frame_fact": frame_fact, "source": source,
                 "metadata_items": metadata, "metadata_source": metadata_source,
-                "decoded": source["decoded"]}, cancelled)
+                "decoded": source["decoded"]}, cancelled, factor)
         if plan.mode == "Series Average":
             members = _series_paths(plan.locator or "", cancelled)
             sums = np.zeros(shape, np.float64); counts = np.zeros(shape, np.uint64)
@@ -841,12 +855,19 @@ def resolve_frame_background(
                 manifest.update(struct.pack(">Q", len(raw))); manifest.update(raw); receipt_bytes += len(raw)
                 del image, finite, source, metadata, metadata_source, raw
             np.divide(sums, counts, out=sums, where=counts > 0); sums[counts == 0] = np.nan
-            denominator = norm_sum / len(members); sums *= plan.scale * target_norm / denominator
+            denominator = norm_sum / len(members); factor = float(plan.scale * target_norm / denominator)
+            sums *= factor
+            # var(f · mean of n counts) = f · (f · mean) / n: one scalar when every
+            # covered pixel has all members, else per pixel.
+            covered = counts[counts > 0]
+            variance_factor = (factor / float(covered[0]) if covered.size and np.all(covered == covered[0])
+                               else np.divide(factor, counts, out=np.zeros(shape), where=counts > 0))
             return _result(plan, frame_fact, sums, {"version": 1, "mode": plan.mode,
                 "policy": policy, "frame_fact": frame_fact, "manifest": {
                     "version": 1, "count": len(members), "receipt_bytes": receipt_bytes,
                     "sha256": manifest.hexdigest()}, "selected": str(Path(plan.locator or "").resolve()),
-                "normalization": {"target": _tag(target_norm), "denominator": _tag(denominator)}}, cancelled)
+                "normalization": {"target": _tag(target_norm), "denominator": _tag(denominator)}},
+                cancelled, variance_factor)
         root = Path(plan.locator or "").resolve(strict=True)
         if not root.is_dir(): raise ValueError("Background Directory is not a directory")
         predicate = compile_filter(plan.filename_filter)
@@ -875,7 +896,8 @@ def resolve_frame_background(
         image, source = _read(str(chosen), plan, shape, cancelled)
         if plan.normalization_key and not projected:
             projected, metadata_source = _metadata(chosen, plan, (plan.normalization_key,), cancelled)
-        image *= plan.scale * target_norm / _target_metadata(projected, plan.normalization_key)
+        factor = float(plan.scale * target_norm / _target_metadata(projected, plan.normalization_key))
+        image *= factor
         prefix = b"XDART-FRAME-BG-DIRECTORY-MANIFEST-V1\0"
         selected_facts = (projected, metadata_source, source)
         first = _manifest(prefix, _directory_receipts(
@@ -891,7 +913,7 @@ def resolve_frame_background(
             "policy": policy, "frame_fact": frame_fact, "manifest": {"version": 1,
                 "count": count, "receipt_bytes": receipt_bytes, "sha256": digest},
             "selected": str(chosen), "metadata_items": projected,
-            "metadata_source": metadata_source, "decoded": source["decoded"]}, cancelled)
+            "metadata_source": metadata_source, "decoded": source["decoded"]}, cancelled, factor)
     except InterruptedError:
         return FrameBackgroundResult("CANCELLED", None, None, None, ("cancelled",))
     except (FileNotFoundError, PermissionError, OSError, RuntimeError) as error:
