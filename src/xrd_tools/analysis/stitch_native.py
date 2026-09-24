@@ -117,7 +117,7 @@ def capture_detector_image(path, role, max_bytes):
 
     Returns the receipt and the decoded float64 pixels in file orientation.
     """
-    from xrd_tools.io.image import read_image
+    from xrd_tools.io.image import read_detector_image_layout, read_image
     code = role.upper()
     lexical = Path(path).expanduser().absolute()
     try:
@@ -130,6 +130,10 @@ def capture_detector_image(path, role, max_bytes):
         before = _state(resolved)
         if not stat.S_ISREG(before[0]) or not 0 < before[3] <= max_bytes:
             _refuse(f"{code}_SIZE_UNSUPPORTED", f"{role} must be a bounded regular file")
+        if (resolved.suffix.lower() != ".npy"
+                and read_detector_image_layout(resolved).frame_count != 1):
+            # read_image would silently take the first frame of a stack.
+            _refuse(f"{code}_FORMAT_UNSUPPORTED", f"{role} must hold exactly one image")
         digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
         pixels = (np.load(resolved, allow_pickle=False) if resolved.suffix.lower() == ".npy"
                   else read_image(resolved))

@@ -229,3 +229,27 @@ def test_one_frame_stitch_matches_int_up_to_multigeometry_solid_angle_scale():
     assert finite.sum() > npt // 2
     np.testing.assert_allclose(stitched.intensity[finite], single.intensity[finite] * scale, rtol=1e-6)
     np.testing.assert_allclose(stitched.sigma[finite], single.sigma[finite] * scale, rtol=1e-6)
+
+
+def test_a_multi_frame_dark_is_refused(tmp_path):
+    import tifffile
+    plan = _prepared(tmp_path).plan
+    tifffile.imwrite(tmp_path / 'darks.tif', np.ones((2, 195, 487), dtype=np.float32))
+    with pytest.raises(StitchOperationRefused) as refused:
+        replace(plan, dark_path=tmp_path / 'darks.tif')
+    assert refused.value.code == 'DARK_FORMAT_UNSUPPORTED'
+    tifffile.imwrite(tmp_path / 'dark.tif', np.ones((195, 487), dtype=np.float32))
+    assert replace(plan, dark_path=tmp_path / 'dark.tif')._dark_receipt.shape == (195, 487)
+
+
+def test_native_run_persists_poisson_sigma_with_its_frame_records(tmp_path):
+    from tests.core.test_native_stitch_operation import _native
+    native = _native(tmp_path, 'multigeometry', 'q_A^-1', grouped=False)
+    request = prepare_stitch_operation(native.module.source, native.module.output,
+                                       replace(native.plan, error_model='poisson'), project_root=tmp_path)
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    payload = read_analysis_artifact(request.module.output.target)
+    assert payload.schema_version == 6 and payload.sigma is not None
+    assert np.isfinite(payload.sigma).any()
+    assert len(payload.contributing_frames) == len(request.module.source.selected_labels)
