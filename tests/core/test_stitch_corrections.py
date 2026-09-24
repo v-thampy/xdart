@@ -253,3 +253,17 @@ def test_native_run_persists_poisson_sigma_with_its_frame_records(tmp_path):
     assert payload.schema_version == 6 and payload.sigma is not None
     assert np.isfinite(payload.sigma).any()
     assert len(payload.contributing_frames) == len(request.module.source.selected_labels)
+
+
+def test_two_dimensional_merge_applies_dark_and_flat():
+    from xrd_tools.integrate.multi import stitch_2d_streaming
+    raw = np.random.default_rng(5).poisson(60, SHAPE).astype(float) + 7.
+    kwargs = dict(npt_rad=12, npt_azim=8, method='full', radial_range=None, azimuth_range=None)
+    plain, plain_diag = stitch_2d_streaming([raw], 1, lambda: iter([_ai()]), **kwargs)
+    dark, dark_diag = stitch_2d_streaming([raw], 1, lambda: iter([_ai()]),
+                                          dark=np.full(SHAPE, 7.), **kwargs)
+    covered = np.asarray(plain_diag.coverage) > 0
+    removed = (plain.intensity - dark.intensity) * np.asarray(dark_diag.normalization)
+    np.testing.assert_allclose(removed[covered], 7. * np.asarray(dark_diag.coverage)[covered], rtol=1e-5)
+    flat, _ = stitch_2d_streaming([raw], 1, lambda: iter([_ai()]), flat=np.full(SHAPE, 2.), **kwargs)
+    np.testing.assert_allclose(flat.intensity[covered], plain.intensity[covered] / 2., rtol=1e-6)
