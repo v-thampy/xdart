@@ -3140,6 +3140,29 @@ def test_dark_and_background_subtract_the_dark_once(tmp_path):
         np.testing.assert_array_equal(again.sigma, original.sigma)
 
 
+@pytest.mark.parametrize("role", ("flat_file", "dark_file"))
+def test_admission_refuses_an_output_that_would_overwrite_the_flat_or_dark(tmp_path, role):
+    _write_tiff(tmp_path / "frame_0001.tif", 5)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    target = tmp_path / "out.nexus"
+    planned = _written(target)
+    shape = fabio.open(str(tmp_path / "frame_0001.tif")).data.shape
+    with h5py.File(planned, "w") as handle:  # a readable correction at the run's own output name
+        handle.create_dataset("entry/instrument/detector/data", data=np.full(shape, 2.0, np.float32))
+    before = planned.read_bytes()
+    intent = _intent(tmp_path / "frame_0001.tif", target, poni)
+    setattr(intent, role, str(planned))
+    executor = StandardRunExecutor()
+    admission, _capture, token = _admit(executor, intent, request_value=1810 + (role == "dark_file"))
+    try:
+        assert type(admission) is AdmissionFailure, admission
+        assert "same file as input" in admission.reason
+        assert planned.read_bytes() == before
+    finally:
+        executor.cancel_admission(token)
+
+
 def test_append_refuses_a_changed_dark(tmp_path):
     for label in range(1, 4):
         _write_tiff(tmp_path / f"frame_{label:04d}.tif", 20 + label)

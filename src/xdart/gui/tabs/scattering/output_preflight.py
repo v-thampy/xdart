@@ -969,6 +969,19 @@ def _deferred_directory_plan(
     )
 
 
+def _correction_paths(configuration: object) -> tuple[str, ...]:
+    """The flat-field and dark files an output must never overwrite.
+
+    Admission guards receive the signed ``OutputCandidate``, which carries them
+    only in its processing mapping; a frozen configuration has them as fields.
+    """
+    if type(configuration) is OutputCandidate:
+        values = configuration.processing_mapping()
+    else:
+        values = {key: getattr(configuration, key, "") for key in ("flat_file", "dark_file")}
+    return tuple(str(values[key]) for key in ("flat_file", "dark_file") if values.get(key))
+
+
 def _validate_deferred_targets(
     configuration: OutputCandidate,
     plan: RunCandidatePlan,
@@ -995,8 +1008,7 @@ def _validate_deferred_targets(
     protected = tuple(
         Path(value)
         for value in (configuration.poni_file, configuration.mask_file,
-                      getattr(configuration, "flat_file", ""),
-                      getattr(configuration, "dark_file", ""))
+                      *_correction_paths(configuration))
         if value
     )
     seen: set[str] = set()
@@ -2002,8 +2014,7 @@ def _validate_targets(
     protected = tuple(
         Path(value) for value in (
             configuration.poni_file, configuration.mask_file,
-            getattr(configuration, "flat_file", ""),
-            getattr(configuration, "dark_file", ""),
+            *_correction_paths(configuration),
             source.metadata_uri if type(source) is SourceSpec else None,
         ) if value
     )
