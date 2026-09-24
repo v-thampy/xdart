@@ -195,6 +195,7 @@ def check_detector_image(
     detector_shape: tuple[int, int] | None = None,
     detector_mask: np.ndarray | None = None,
     min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
+    prepared: np.ndarray | None = None,
 ) -> DetectorImageCheck:
     """
     Check a dark (``role="dark"``) or flat field (``role="flat"``) before a run.
@@ -217,6 +218,8 @@ def check_detector_image(
         The detector's own mask (gaps, dead modules), excluded from the counts.
     min_fraction : float, optional
         The flat cutoff (see :func:`prepare_flatfield`).
+    prepared : ndarray, optional
+        The image already prepared with the same cutoff, to avoid a second copy.
 
     Returns
     -------
@@ -225,7 +228,7 @@ def check_detector_image(
     if role not in {"dark", "flat"}:
         raise ValueError("role must be 'dark' or 'flat'")
     name = "flat field" if role == "flat" else "dark"
-    array = np.asarray(image, dtype=np.float64)
+    array = np.asarray(image)
     shape = tuple(int(value) for value in array.shape)
     if array.ndim != 2:
         return DetectorImageCheck(role, shape, errors=(f"the {name} must be one 2-D image",))
@@ -233,11 +236,14 @@ def check_detector_image(
         return DetectorImageCheck(role, shape, errors=(
             f"the {name} is {shape[0]} × {shape[1]} pixels but the detector is "
             f"{detector_shape[0]} × {detector_shape[1]}",))
-    try:
-        prepared = (prepare_flatfield(array, min_fraction) if role == "flat"
-                    else prepare_dark(array))
-    except ValueError as error:
-        return DetectorImageCheck(role, shape, errors=(f"the {name} is unusable: {error}",))
+    if prepared is None:
+        try:
+            prepared = (prepare_flatfield(array, min_fraction) if role == "flat"
+                        else prepare_dark(array))
+        except ValueError as error:
+            return DetectorImageCheck(role, shape, errors=(f"the {name} is unusable: {error}",))
+    elif np.shape(prepared) != shape:
+        raise ValueError("the prepared image does not match the image")
     usable = np.ones(shape, dtype=bool)
     if detector_mask is not None and np.shape(detector_mask) == shape:
         usable = ~np.asarray(detector_mask, dtype=bool)

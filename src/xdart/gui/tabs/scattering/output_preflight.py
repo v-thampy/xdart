@@ -2363,13 +2363,19 @@ def _load_stable_correction_asset(
             raw = _read_correction_image(snapshot, name)
         except ValueError as exc:
             raise ValueError(f"the {name} must be one 2-D image: {path}") from exc
+        try:
+            prepared = (prepare_flatfield(raw, min_fraction) if role == "flat"
+                        else prepare_dark(raw))
+        except ValueError as exc:
+            raise ValueError(f"the {name} is unusable: {exc}: {path}") from exc
         shape, mask = (None, None) if detector is None else detector
+        # One prepared copy serves the check and the admitted value.
         check = check_detector_image(raw, role, detector_shape=shape, detector_mask=mask,
-                                     min_fraction=min_fraction)
+                                     min_fraction=min_fraction, prepared=prepared)
         if check.errors:
             raise ValueError(f"{check.errors[0]}: {path}")
-        value = (prepare_flatfield(raw, min_fraction) if role == "flat"
-                 else prepare_dark(raw)).astype(np.float32)
+        value = prepared.astype(np.float32)
+        del prepared, raw
         try:
             after_state, after_digest = _stream_asset(
                 path, max_bytes=_SCIENTIFIC_MASK_MAX_DECODED_BYTES, cancelled=cancelled,
