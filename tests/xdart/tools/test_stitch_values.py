@@ -117,7 +117,7 @@ def test_preflight_binds_exact_frame_labels_members_and_request(stitch_form):
     assert summary.output_relative_path == "output/stitched.nexus"
     assert summary.holds == (
         "2d-orientation-parity",
-        "gi-and-custom-corrections",
+        "gi-corrections",
     )
     assert len(summary.dependency_files) == 4
     assert len(summary.fingerprint) == 64

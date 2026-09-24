@@ -997,7 +997,7 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
         overwrite=form.overwrite,
         max_frame_bytes=form.max_frame_bytes,
         holds=(
-            ("2d-orientation-parity", "gi-and-custom-corrections")
+            ("2d-orientation-parity", "gi-corrections")
             if form.backend == "multigeometry"
             else (
                 "xu-2d-and-chi",

@@ -82,6 +82,23 @@ def _normalization_factors(
     return values
 
 
+def _detector_correction(value: np.ndarray | None, name: str, fill: float):
+    """Split a dark or flat image into finite values and the pixels it invalidates.
+
+    A non-finite dark pixel, or a flat pixel that is non-finite or not positive,
+    cannot be corrected: it joins the frame mask and carries a neutral value.
+    """
+    if value is None:
+        return None, None
+    array = np.asarray(value, dtype=float)
+    if array.ndim != 2:
+        raise ValueError(f"Stitch {name} must be a 2-D detector image")
+    invalid = ~np.isfinite(array) if name == "dark" else ~(np.isfinite(array) & (array > 0))
+    if not invalid.any():
+        return array, None
+    return np.where(invalid, fill, array), invalid
+
+
 def _resolve_streaming_ranges(
     integrator_factory: Callable[[], Iterator[AzimuthalIntegrator]],
     image_count: int,
@@ -162,6 +179,8 @@ def _streaming_multigeometry(
     error_model: str | None,
     polarization_factor: float | None,
     frame_screen: Any = None,
+    dark: np.ndarray | None = None,
+    flat: np.ndarray | None = None,
 ):
     from pyFAI.multi_geometry import MultiGeometry
 
@@ -170,6 +189,12 @@ def _streaming_multigeometry(
     if mode not in {"1d", "2d"}:
         raise ValueError(f"mode must be '1d' or '2d', got {mode!r}")
     factors = _normalization_factors(normalization, image_count)
+    # pyFAI applies both: the dark in its preprocessing (so the Poisson variance
+    # is raw + dark) and the flat in the normalization, like solid angle.
+    dark, dark_invalid = _detector_correction(dark, "dark", 0.0)
+    flat, flat_invalid = _detector_correction(flat, "flat", 1.0)
+    invalid = (dark_invalid if flat_invalid is None else flat_invalid if dark_invalid is None
+               else dark_invalid | flat_invalid)
     fixed_radial, fixed_azimuth = _resolve_streaming_ranges(
         integrator_factory,
         image_count,
@@ -200,12 +225,22 @@ def _streaming_multigeometry(
             raise ValueError(
                 f"streaming Stitch image must be 2-D, got shape {image.shape}"
             )
+        for name, value in (("dark", dark), ("flat", flat)):
+            if value is not None and value.shape != image.shape:
+                integrator.reset(collect_garbage=False)
+                raise ValueError(
+                    f"Stitch {name} shape {value.shape} does not match the frame {image.shape}"
+                )
         try:
             frame_mask = (
                 None
-                if mask is None
-                else np.asarray(mask_with_detector(integrator, mask), dtype=bool)
+                if mask is None and invalid is None
+                else np.asarray(mask_with_detector(
+                    integrator, invalid if mask is None else
+                    mask if invalid is None else np.logical_or(mask, invalid)), dtype=bool)
             )
+            if dark is not None:
+                integrator.detector.darkcurrent = dark
         except BaseException:
             integrator.reset(collect_garbage=False)
             raise
@@ -231,6 +266,7 @@ def _streaming_multigeometry(
                     polarization_factor=polarization_factor,
                     normalization_factor=[monitor],
                     lst_mask=None if frame_mask is None else [frame_mask],
+                    lst_flat=None if flat is None else [flat],
                     method=method,
                 )
                 current_shape = (npt_rad,)
@@ -244,6 +280,7 @@ def _streaming_multigeometry(
                     polarization_factor=polarization_factor,
                     normalization_factor=[monitor],
                     lst_mask=None if frame_mask is None else [frame_mask],
+                    lst_flat=None if flat is None else [flat],
                     method=method,
                 )
                 current_shape = (npt_azim, npt_rad)
@@ -293,7 +330,11 @@ def _streaming_multigeometry(
                 valid = np.isfinite(image) & (image >= 0)
                 if frame_mask is not None:
                     valid &= ~frame_mask
-                total = float(image[valid].sum()) / monitor
+                signal = float(image[valid].sum())
+                if dark is not None:
+                    # A dropped frame on a detector with a pedestal still holds the dark.
+                    signal -= float(dark[valid].sum())
+                total = signal / monitor
                 for held, verdict in frame_screen.push(total, copy.deepcopy(result)):
                     if not verdict.excluded:
                         aggregate = held if aggregate is None else aggregate.union(held)
@@ -339,6 +380,8 @@ def stitch_1d_streaming(
     error_model: str | None = None,
     polarization_factor: float | None = None,
     frame_screen: Any = None,
+    dark: np.ndarray | None = None,
+    flat: np.ndarray | None = None,
 ) -> tuple[IntegrationResult1D, StitchDiagnostics]:
     """Sequential MultiGeometry merge that retains only one detector frame."""
 
@@ -359,6 +402,8 @@ def stitch_1d_streaming(
         error_model=error_model,
         polarization_factor=polarization_factor,
         frame_screen=frame_screen,
+        dark=dark,
+        flat=flat,
     )
     sigma = result.sigma if result.sigma is not None else None
     radial_unit = str(result.unit) if result.unit is not None else unit
@@ -388,6 +433,8 @@ def stitch_2d_streaming(
     error_model: str | None = None,
     polarization_factor: float | None = None,
     frame_screen: Any = None,
+    dark: np.ndarray | None = None,
+    flat: np.ndarray | None = None,
 ) -> tuple[IntegrationResult2D, StitchDiagnostics]:
     """Sequential 2-D MultiGeometry merge retaining one detector frame."""
 
@@ -408,6 +455,8 @@ def stitch_2d_streaming(
         error_model=error_model,
         polarization_factor=polarization_factor,
         frame_screen=frame_screen,
+        dark=dark,
+        flat=flat,
     )
     sigma = result.sigma if result.sigma is not None else None
     radial_unit = str(result.radial_unit)

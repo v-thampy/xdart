@@ -81,6 +81,91 @@ def revalidate_mask(receipt):
         _refuse("MASK_IDENTITY_MISMATCH", "mask no longer matches Preview")
 
 
+_DETECTOR_IMAGE_SUFFIXES = frozenset({".npy", ".tif", ".tiff", ".edf", ".cbf"})
+
+
+@dataclass(frozen=True, slots=True)
+class StitchImageReceipt:
+    """A dark or flat detector image bound to its exact file revision."""
+
+    role: str
+    lexical_path: str
+    resolved_path: str
+    revision: tuple[int, ...]
+    sha256: str
+    shape: tuple[int, int]
+    pixels_sha256: str
+
+    @property
+    def fingerprint(self):
+        from xrd_tools.analysis.module_transaction import module_plan_fingerprint, ModuleKind
+        return module_plan_fingerprint(ModuleKind.STITCH, (
+            "stitch-detector-image-v1", self.role, self.lexical_path, self.resolved_path,
+            self.revision, self.sha256, self.shape, self.pixels_sha256,
+        ))
+
+    def to_provenance(self, project_root):
+        from xrd_tools.analysis.stitch_operation import _relative_locator
+        return {"relative_path": _relative_locator(self.resolved_path, project_root, self.role),
+                "lexical_relative_path": _relative_locator(self.lexical_path, project_root, self.role),
+                "sha256": self.sha256, "revision": list(self.revision), "shape": list(self.shape),
+                "receipt_fingerprint": self.fingerprint}
+
+
+def capture_detector_image(path, role, max_bytes):
+    """Decode a single-image dark or flat file and bind its exact revision.
+
+    Returns the receipt and the decoded float64 pixels in file orientation.
+    """
+    from xrd_tools.io.image import read_image
+    code = role.upper()
+    lexical = Path(path).expanduser().absolute()
+    try:
+        if lexical.is_symlink():
+            _refuse(f"{code}_SYMLINK_REFUSED", f"{role} cannot be a symlink")
+        resolved = lexical.resolve(strict=True)
+        if resolved.suffix.lower() not in _DETECTOR_IMAGE_SUFFIXES:
+            _refuse(f"{code}_FORMAT_UNSUPPORTED",
+                    f"{role} must be one .npy, .tif, .edf or .cbf detector image")
+        before = _state(resolved)
+        if not stat.S_ISREG(before[0]) or not 0 < before[3] <= max_bytes:
+            _refuse(f"{code}_SIZE_UNSUPPORTED", f"{role} must be a bounded regular file")
+        digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        pixels = (np.load(resolved, allow_pickle=False) if resolved.suffix.lower() == ".npy"
+                  else read_image(resolved))
+        pixels = np.array(pixels, dtype=np.float64, order="C", copy=True)
+        if pixels.ndim != 2 or min(pixels.shape) < 1 or pixels.nbytes > max_bytes:
+            _refuse(f"{code}_SIZE_UNSUPPORTED", f"{role} must decode to one bounded 2-D image")
+        after = _state(resolved)
+        if before != after or lexical.resolve(strict=True) != resolved:
+            _refuse(f"{code}_IDENTITY_MISMATCH", f"{role} changed during capture")
+    except (OSError, ValueError) as error:
+        from xrd_tools.analysis.stitch_operation import StitchOperationRefused
+        if isinstance(error, StitchOperationRefused):
+            raise
+        _refuse(f"{code}_UNAVAILABLE", str(error))
+    pixels.setflags(write=False)
+    receipt = StitchImageReceipt(role, str(lexical), str(resolved), after, digest,
+                                 tuple(pixels.shape), hashlib.sha256(pixels.tobytes()).hexdigest())
+    return receipt, pixels
+
+
+def native_detector_image(plan, receipt):
+    """Re-decode a bound dark or flat image and orient it into the calibrated frame."""
+    if receipt is None:
+        return None
+    current, pixels = capture_detector_image(receipt.lexical_path, receipt.role, plan.max_frame_bytes)
+    if current != receipt:
+        _refuse(f"{receipt.role.upper()}_IDENTITY_MISMATCH", f"{receipt.role} no longer matches Preview")
+    _wavelength, shape, orientation = geometry_facts(plan)
+    value = np.array(orientation.apply(pixels), dtype=np.float64, order="C", copy=True)
+    if value.shape != tuple(shape):
+        _refuse(f"{receipt.role.upper()}_SHAPE_MISMATCH",
+                f"{receipt.role} shape does not match the calibrated detector")
+    value.setflags(write=False)
+    return value
+
+
 def geometry_facts(plan):
     from xrd_tools.analysis.stitch_operation import XuStitchOperationPlan, _runtime_geometry
     if type(plan) is XuStitchOperationPlan:

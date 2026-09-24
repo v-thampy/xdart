@@ -86,7 +86,9 @@ from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xrd_tools.analysis.stitch_native import (
     capture_mask, revalidate_mask, native_mask, native_plan_identity,
     native_provenance, capture_callback, geometry_facts,
+    capture_detector_image, native_detector_image,
 )
+from xrd_tools.corrections.stack import CorrectionStack
 from xrd_tools.integrate.xu_stitch import (
     XuStitchCancelled,
     XuStitchEffectiveGeometryProjection,
@@ -115,6 +117,8 @@ _GEOMETRY_FACTORY = object()
 _REQUEST_FACTORY = object()
 #: Where the sample sits relative to a stacked arm's calibrated sample offset.
 SAMPLE_POSITIONS = ("calibrated", "rotation_axis")
+#: pyFAI error models a MultiGeometry Stitch may request (None = no sigma).
+STITCH_ERROR_MODELS = (None, "poisson")
 
 
 class StitchGeometryKind(str, Enum):
@@ -1333,7 +1337,16 @@ class StitchOperationPlan:
     #: 'calibrated' keeps a stacked arm's fitted sample offset; 'rotation_axis'
     #: drops it for a sample centred on the rotation axis (e.g. after GI alignment).
     sample_position: str = "calibrated"
+    #: pyFAI corrections. Solid angle stays on for a stacked arm with a sample
+    #: offset, whose per-frame distances differ. polarization_factor None = off.
+    correct_solid_angle: bool = True
+    polarization_factor: float | None = 0.99
+    error_model: str | None = None
+    dark_path: str | Path | None = None
+    flat_path: str | Path | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
+    _dark_receipt: object = field(init=False, default=None, repr=False)
+    _flat_receipt: object = field(init=False, default=None, repr=False)
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1377,6 +1390,7 @@ class StitchOperationPlan:
             or not 1 <= self.max_frame_bytes <= 4 * 1024 * 1024 * 1024
         ):
             raise ValueError("max_frame_bytes must be a bounded positive exact integer")
+        _correction_fields(self)
         object.__setattr__(self, "radial_range", radial)
         object.__setattr__(self, "azimuth_range", azimuth)
         object.__setattr__(
@@ -1405,6 +1419,10 @@ class StitchOperationPlan:
             self.max_frame_bytes,
             self.frame_screen.identity(),
             ("sample-position", self.sample_position),
+            ("corrections-v1", self.correct_solid_angle, self.polarization_factor,
+             self.error_model,
+             None if self._dark_receipt is None else self._dark_receipt.fingerprint,
+             None if self._flat_receipt is None else self._flat_receipt.fingerprint),
         )
         return value + native_plan_identity(self) if self.native_records else value
 
@@ -1488,6 +1506,25 @@ class XuStitchOperationPlan:
                 ) + (native_plan_identity(self) if self.native_records else ()),
             ),
         )
+
+def _correction_fields(plan):
+    if type(plan.correct_solid_angle) is not bool:
+        raise TypeError("correct_solid_angle must be an exact bool")
+    factor = plan.polarization_factor
+    if factor is not None:
+        if (isinstance(factor, bool) or not isinstance(factor, (int, float))
+                or not math.isfinite(factor) or not -1.0 <= factor <= 1.0):
+            raise ValueError("polarization factor must be a finite number from -1 to 1, or None")
+        object.__setattr__(plan, "polarization_factor", float(factor))
+    if plan.error_model not in STITCH_ERROR_MODELS:
+        raise ValueError(f"Stitch error model must be one of {STITCH_ERROR_MODELS}")
+    for role in ("dark", "flat"):
+        path = getattr(plan, f"{role}_path")
+        if path is not None:
+            receipt, _pixels = capture_detector_image(path, role, plan.max_frame_bytes)
+            object.__setattr__(plan, f"{role}_path", receipt.lexical_path)
+            object.__setattr__(plan, f"_{role}_receipt", receipt)
+
 
 def _native_plan_fields(plan):
     if type(plan.native_records) is not bool:
@@ -1777,6 +1814,15 @@ def _provenance(
             "streaming_multigeometry": True,
             "frame_screen": plan.frame_screen.to_provenance(),
             "sample_position": plan.sample_position,
+            "corrections": {
+                "solid_angle": plan.correct_solid_angle,
+                "polarization_factor": plan.polarization_factor,
+                "error_model": plan.error_model,
+                "dark": (None if plan._dark_receipt is None
+                         else plan._dark_receipt.to_provenance(Path(manifest.project_root))),
+                "flat": (None if plan._flat_receipt is None
+                         else plan._flat_receipt.to_provenance(Path(manifest.project_root))),
+            },
             "max_frame_bytes": plan.max_frame_bytes,
             "plan_fingerprint": plan.fingerprint,
         },
@@ -1784,7 +1830,7 @@ def _provenance(
         "output": {"kind": output.kind.value},
         "holds": [
             "2d-orientation-parity",
-            "gi-and-custom-corrections",
+            "gi-corrections",
         ],
     }
     return native_provenance(value, source, output, plan, manifest)
@@ -2307,6 +2353,11 @@ def _runtime_plan(plan: StitchOperationPlan, diffractometer) -> StitchPlan:
     if external is not None:
         mask = external if mask is None else np.logical_or(mask, external)
     return StitchPlan(
+        corrections=CorrectionStack(solid_angle=plan.correct_solid_angle,
+                                    polarization_factor=plan.polarization_factor),
+        error_model=plan.error_model,
+        dark=native_detector_image(plan, plan._dark_receipt),
+        flat=native_detector_image(plan, plan._flat_receipt),
         diffractometer=diffractometer,
         backend=plan.backend,
         mode=plan.mode,
@@ -2372,9 +2423,11 @@ def _protected_stitch_inputs(request: StitchOperationRequest) -> tuple[Path, ...
     root = Path(request.manifest.project_root)
     inputs = [root / request.manifest.source_relative_path]
     inputs.extend(root / item.relative_path for item in request.manifest.files)
-    if request.plan._mask_receipt is not None:
-        inputs.extend((Path(request.plan._mask_receipt.lexical_path),
-                       Path(request.plan._mask_receipt.resolved_path)))
+    receipts = (request.plan._mask_receipt, getattr(request.plan, "_dark_receipt", None),
+                getattr(request.plan, "_flat_receipt", None))
+    for receipt in receipts:
+        if receipt is not None:
+            inputs.extend((Path(receipt.lexical_path), Path(receipt.resolved_path)))
     if type(request.plan) is XuStitchOperationPlan:
         geometry = request.plan.calibration
         inputs.extend((
