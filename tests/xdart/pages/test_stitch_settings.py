@@ -204,3 +204,29 @@ def test_settings_that_cannot_apply_are_refused_and_leave_the_inputs(qapp, tmp_p
     finally:
         _close(restored, qapp)
         _close(default, qapp)
+
+
+def _calibration_source(dialog):
+    return dialog._text("source"), dialog._text("scan"), dialog.rotation.currentData()
+
+
+def test_calibrate_keeps_a_calibration_source_other_than_the_processing_scan(qapp, tmp_path):
+    page = _edited_page(tmp_path)
+    restored = StitchPage(empty_host_services(_Status()))
+    calibrant = (str(tmp_path / "powder-calibration.spec"), "2", 90)
+    try:
+        page._calibrate()  # a new dialog starts from the processing scan
+        dialog = page._calibration_dialog
+        assert _calibration_source(dialog)[1:] == ("1", 0)
+        dialog._set_field_text("source", calibrant[0])
+        dialog._set_field_text("scan", calibrant[1])
+        dialog.rotation.setCurrentIndex(dialog.rotation.findData(calibrant[2]))
+        page._calibrate()  # opening it again keeps the calibrant scan
+        assert _calibration_source(dialog) == calibrant
+
+        restored.apply_settings(page.settings())
+        restored._calibrate()  # so do the saved settings
+        assert _calibration_source(restored._calibration_dialog) == calibrant
+    finally:
+        _close(page, qapp)
+        _close(restored, qapp)

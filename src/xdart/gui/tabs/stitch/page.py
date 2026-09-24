@@ -1076,15 +1076,20 @@ class StitchPage(QtWidgets.QWidget):
                 self._calibration_settings = self._calibration_dialog.settings()
                 self._calibration_dialog.hide()
                 self._calibration_dialog = None
+            # The processing scan only fills a new, unconfigured dialog: the calibrant
+            # scan is usually another scan, and saved or edited inputs are kept.
+            unconfigured = False
             if self._calibration_dialog is None:
                 self._calibration_dialog = StitchCalibrationDialog(str(self._value("project_root")),
                     backend=backend, parent=self)
                 if self._calibration_settings:
                     self._calibration_dialog.apply_settings(self._calibration_settings)
+                else:
+                    unconfigured = True
                 self._calibration_project, self._calibration_backend = project, backend
                 self._calibration_dialog.calibrationSaved.connect(self._adopt_calibration)
                 self._authoring_dialogs.append(self._calibration_dialog)
-            source = self._source_spec_for_tools()
+            source = self._source_spec_for_tools() if unconfigured else None
             if source is not None:
                 motors = dict(_parse_pairs(self._value("source_motors") or "del=del, nu=nu"))
                 self._calibration_dialog.set_source_context(source, image_rotation=int(self._value("image_rotation") or 0),
