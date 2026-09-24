@@ -84,6 +84,50 @@ def apply_flatfield(
     return corrected
 
 
+#: Flat pixels below this fraction of the flat's median are treated as dead.
+DEFAULT_MIN_FLAT_FRACTION = 0.1
+
+
+def prepare_flatfield(
+    flat: np.ndarray,
+    min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
+) -> np.ndarray:
+    """
+    Return a flat field whose unusable pixels are NaN, which pyFAI masks.
+
+    pyFAI applies a flat in the normalization denominator; a pixel is unusable
+    when its flat is not finite, not positive, or below ``min_fraction`` of the
+    median of the positive finite flat, because dividing by a (nearly) dead
+    pixel amplifies its noise. ``min_fraction=0`` keeps every positive pixel.
+    The flat is not rescaled: pyFAI divides by it as given.
+
+    Parameters
+    ----------
+    flat : ndarray
+        2-D flat-field image.
+    min_fraction : float, optional
+        Fraction of the median below which a pixel is masked.
+
+    Returns
+    -------
+    np.ndarray
+        Float64 copy with unusable pixels set to NaN.
+    """
+    array = np.array(flat, dtype=np.float64)
+    if array.ndim != 2:
+        raise ValueError("flat field must be a 2-D detector image")
+    fraction = float(min_fraction)
+    if not np.isfinite(fraction) or not 0.0 <= fraction < 1.0:
+        raise ValueError("minimum flat fraction must be from 0 to below 1")
+    valid = np.isfinite(array) & (array > 0)
+    if not valid.any():
+        raise ValueError("flat field has no positive finite pixel")
+    if fraction:
+        valid &= array >= fraction * float(np.median(array[valid]))
+    array[~valid] = np.nan
+    return array
+
+
 def apply_threshold(
     image: np.ndarray,
     threshold: float,
@@ -224,10 +268,12 @@ def correct_image(
 
 
 __all__ = [
+    "DEFAULT_MIN_FLAT_FRACTION",
     "apply_flatfield",
     "apply_mask",
     "apply_threshold",
     "combine_masks",
     "correct_image",
+    "prepare_flatfield",
     "subtract_dark",
 ]

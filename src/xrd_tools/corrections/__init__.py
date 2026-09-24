@@ -8,7 +8,9 @@ from xrd_tools.corrections.beam import (
     solid_angle_correction,
 )
 from xrd_tools.corrections.detector import (
+    DEFAULT_MIN_FLAT_FRACTION,
     apply_flatfield,
+    prepare_flatfield,
     apply_mask,
     apply_threshold,
     combine_masks,
@@ -50,7 +52,9 @@ __all__ = [
     "polarization_correction",
     "solid_angle_correction",
     # detector
+    "DEFAULT_MIN_FLAT_FRACTION",
     "apply_flatfield",
+    "prepare_flatfield",
     "apply_mask",
     "apply_threshold",
     "combine_masks",

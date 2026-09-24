@@ -607,6 +607,9 @@ class ReductionPlan:
     # precedence; only static masks determine integration geometry.
     mask_saturation: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
+    #: Flat field applied in pyFAI's normalization; unusable pixels are NaN
+    #: (see ``prepare_flatfield``), which pyFAI masks.
+    flat: np.ndarray | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.integration_1d is None and self.integration_2d is None:
@@ -5577,6 +5580,7 @@ def _can_use_owned_float32_csr(
         and raw_image.flags.c_contiguous
         and plan.gi is None
         and background is None
+        and plan.flat is None
         and integrator_input_safe is True
         and bool(enabled)
         and not (
@@ -5658,7 +5662,7 @@ def _reduce_frame(
         raise ValueError(f"Frame {frame.index} image must be 2D; got shape {image.shape}")
     _validate_frame_inputs(frame, image.shape, frame_masks)
     corrected_image = (
-        _thumbnail_corrected_image(raw_image_arr, frame.background)
+        _thumbnail_corrected_image(raw_image_arr, frame.background, plan.flat)
         if include_corrected_image
         else None
     )
@@ -5707,6 +5711,7 @@ def _reduce_frame(
                 incident_angle=incident_angle,
                 normalization_factor=_normalization_for(
                     frame, plan.integration_1d, warned_monitor_keys, strict=strict),
+                flat=plan.flat,
             )
             if plan.integration_1d is not None else None
         )
@@ -5720,6 +5725,7 @@ def _reduce_frame(
                 incident_angle=incident_angle,
                 normalization_factor=_normalization_for(
                     frame, plan.integration_2d, warned_monitor_keys, strict=strict),
+                flat=plan.flat,
             )
             if plan.integration_2d is not None else None
         )
@@ -5736,6 +5742,7 @@ def _reduce_frame(
                 incident_angle=incident_angle,
                 normalization_factor=_normalization_for(
                     frame, single.integration_2d, warned_monitor_keys, strict=strict),
+                flat=plan.flat,
             )
     else:
         p1 = plan.integration_1d
@@ -5808,6 +5815,7 @@ def _reduce_frame(
                 polarization_factor=p1.polarization_factor,
                 normalization_factor=_normalization_for(
                     frame, p1, warned_monitor_keys, strict=strict),
+                **_flat_kwargs(plan),
                 **chi_extra,
             )
         else:
@@ -5826,6 +5834,7 @@ def _reduce_frame(
                     normalization_factor=_normalization_for(
                         frame, p1, warned_monitor_keys, strict=strict),
                     _detector_mask_is_bound=detector_mask_is_bound,
+                    **_flat_kwargs(plan),
                     **p1.extra,
                 )
                 if p1 is not None else None
@@ -5855,6 +5864,7 @@ def _reduce_frame(
                 normalization_factor=_normalization_for(
                     frame, plan.integration_2d, warned_monitor_keys, strict=strict),
                 _detector_mask_is_bound=detector_mask_is_bound,
+                **_flat_kwargs(plan),
                 **plan.integration_2d.extra,
             )
             if plan.integration_2d is not None else None
@@ -5908,19 +5918,25 @@ def _reduce_frame(
     return reduction
 
 
+def _flat_kwargs(plan: ReductionPlan) -> dict[str, Any]:
+    """pyFAI's ``flat`` keyword when the plan carries one; nothing otherwise."""
+    return {} if plan.flat is None else {"flat": plan.flat}
+
+
 def _thumbnail_corrected_image(
     raw_image: np.ndarray,
     background: np.ndarray | float | None,
+    flat: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Return a float32 raw-minus-background image for transient thumbnails."""
+    """Return a float32 raw-minus-background image, flat-corrected, for thumbnails."""
     raw = np.asarray(raw_image)
     corrected = np.array(raw, dtype=np.float32, copy=True)
-    if background is None:
-        return corrected
-    bg = np.asarray(background, dtype=np.float32)
-    if bg.ndim == 0 and float(bg) == 0.0:
-        return corrected
-    np.subtract(corrected, bg, out=corrected)
+    bg = None if background is None else np.asarray(background, dtype=np.float32)
+    if bg is not None and not (bg.ndim == 0 and float(bg) == 0.0):
+        np.subtract(corrected, bg, out=corrected)
+    if flat is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            np.divide(corrected, np.asarray(flat, dtype=np.float32), out=corrected)
     return corrected
 
 
@@ -6108,8 +6124,11 @@ def _run_gi_1d(
     mask: np.ndarray | None,
     incident_angle: float,
     normalization_factor: float | None,
+    flat: np.ndarray | None = None,
 ) -> IntegrationResult1D:
     extra = _gi_plan_extra(plan, normalization_factor)
+    if flat is not None:
+        extra["flat"] = flat
     npt_oop = extra.pop("npt_oop", gi.npt_oop if gi.npt_oop is not None else plan.npt)
     common = dict(
         npt=plan.npt,
@@ -6178,8 +6197,11 @@ def _run_gi_2d(
     mask: np.ndarray | None,
     incident_angle: float,
     normalization_factor: float | None,
+    flat: np.ndarray | None = None,
 ) -> IntegrationResult2D:
     extra = _gi_plan_extra(plan, normalization_factor)
+    if flat is not None:
+        extra["flat"] = flat
     # The qip/qoop output ranges ride in plan.extra as x_range/y_range; they
     # are only meaningful for the QIP_QOOP transform.  Pop them BEFORE
     # branching so they never leak into pyFAI's polar/exit-angle calls as

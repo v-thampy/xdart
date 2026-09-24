@@ -85,15 +85,20 @@ def _normalization_factors(
 def _detector_correction(value: np.ndarray | None, name: str, fill: float):
     """Split a dark or flat image into finite values and the pixels it invalidates.
 
-    A non-finite dark pixel, or a flat pixel that is non-finite or not positive,
-    cannot be corrected: it joins the frame mask and carries a neutral value.
+    A non-finite dark pixel, or a flat pixel that ``prepare_flatfield`` finds
+    unusable (non-finite, not positive, or nearly dead), cannot be corrected: it
+    joins the frame mask and carries a neutral value.
     """
     if value is None:
         return None, None
     array = np.asarray(value, dtype=float)
     if array.ndim != 2:
         raise ValueError(f"Stitch {name} must be a 2-D detector image")
-    invalid = ~np.isfinite(array) if name == "dark" else ~(np.isfinite(array) & (array > 0))
+    if name == "flat":
+        from xrd_tools.corrections.detector import prepare_flatfield  # noqa: PLC0415
+        invalid = ~np.isfinite(prepare_flatfield(array))
+    else:
+        invalid = ~np.isfinite(array)
     if not invalid.any():
         return array, None
     return np.where(invalid, fill, array), invalid
