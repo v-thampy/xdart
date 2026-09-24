@@ -2878,6 +2878,12 @@ def test_flat_field_run_persists_the_flat_and_applies_it(tmp_path):
         for label in (1, 2, 3):
             np.testing.assert_allclose(a.read(label).intensity_1d,
                                        b.read(label).intensity_1d / 2, rtol=1e-6)
+    # The stored thumbnail is flat-corrected too: frame 1 is 1 count over a flat of 2.
+    from xrd_tools.io.read import _dequantize_thumbnail
+    with h5py.File(flattened, "r") as handle:
+        thumbnail = _dequantize_thumbnail(handle["entry/frames/frame_0001/thumbnail"])
+    assert np.isfinite(thumbnail).any()
+    np.testing.assert_allclose(thumbnail[np.isfinite(thumbnail)], 0.5, rtol=1e-3)
 
     # Reintegrate reuses the persisted flat and reproduces the original exactly.
     from xrd_tools.io.finite_artifact import _snapshot_path
@@ -3028,12 +3034,29 @@ def test_dark_run_subtracts_persists_and_reintegrates_the_dark(tmp_path):
         )
         return run_reintegrate_successor(plan)
 
+    # The stored thumbnail is dark-corrected too: raw 41 less the 10-count dark.
+    from xrd_tools.io.read import _dequantize_thumbnail
+    with h5py.File(darkened, "r") as handle:
+        thumbnail = _dequantize_thumbnail(handle["entry/frames/frame_0001/thumbnail"])
+    assert np.isfinite(thumbnail).any()
+    np.testing.assert_allclose(thumbnail[np.isfinite(thumbnail)], 31.0, rtol=1e-3)
+
     result = reintegrate(darkened)
     assert result.output_artifact is not None, result.diagnostics
     for label in (1, 2, 3):
         original, again = get_1d(darkened, frame=label), get_1d(result.output_artifact, frame=label)
         np.testing.assert_array_equal(again.intensity, original.intensity)
         np.testing.assert_array_equal(again.sigma, original.sigma)
+    # The reintegrated output keeps the stored dark and its signed digest, so a later
+    # operation on it applies the same dark.
+    with h5py.File(darkened, "r") as a, h5py.File(result.output_artifact, "r") as b:
+        kept = b["entry/instrument/detector/darkcurrent"]
+        np.testing.assert_array_equal(kept[()], a["entry/instrument/detector/darkcurrent"][()])
+        assert kept.attrs["sha256"] == a["entry/instrument/detector/darkcurrent"].attrs["sha256"]
+        kept_configuration = json.loads(b["entry/reduction/config/run_configuration"][()])
+    assert kept_configuration["dark_file"] == run_configuration["dark_file"]
+    assert (kept_configuration["scientific_signature"]["accepted_scientific_assets"]["dark_sha256"]
+            == signed["dark_sha256"])
     # A changed persisted dark is refused, never silently used.
     with h5py.File(darkened, "r+") as handle:
         handle["entry/instrument/detector/darkcurrent"][5, 5] = 7.0

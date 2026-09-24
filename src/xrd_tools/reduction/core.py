@@ -2728,7 +2728,14 @@ class NexusSink:
                 bg = np.asarray(background)
                 if bg.shape != () and bg.shape != raw.shape:
                     background = None
-            image = _thumbnail_corrected_image(raw, background)
+            # The worker skips the corrected copy for this sink, so apply the
+            # plan's flat and dark here as the reduction does.
+            plan = self._plan
+            image = _thumbnail_corrected_image(
+                raw, background,
+                None if plan is None else plan.flat,
+                None if plan is None else plan.dark,
+            )
             owns_image = True
         else:
             image = np.asarray(corrected_image, dtype=np.float32)
