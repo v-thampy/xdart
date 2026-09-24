@@ -2875,6 +2875,7 @@ class NexusSink:
             detector_calibration=(scan.extra or {}).get("detector_calibration"),
             global_mask=(scan.extra or {}).get("global_mask"),
             detector_shape=(scan.extra or {}).get("detector_shape"),
+            flatfield=(scan.extra or {}).get("flatfield"),
             stitched_1d=(scan.extra or {}).get("stitched_1d"),
             stitched_2d=(scan.extra or {}).get("stitched_2d"),
             stitched_provenance=(scan.extra or {}).get("stitched_provenance"),

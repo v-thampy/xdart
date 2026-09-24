@@ -1984,7 +1984,9 @@ def _calibration(shared, incidence=None):
     )
     return calibration, ai, fi
 def _validated_shared_science(run: Mapping[str, Any], requested: Mapping[str, Any] | None = None, *, geometry=None):
-    outer = dict(run); signed = outer.pop("scientific_signature", None); _reject(type(signed) is not dict, "persisted scientific signature is missing"); signed = dict(signed); assets = signed.pop("accepted_scientific_assets", None); _reject(signed != outer, "persisted duplicated scientific signature differs"); expected = {"schema_version", "generation", "fingerprint", "source", "processing_mode", "output_mode", "live_mode", "batch_mode", "max_cores", "gi", "threshold", "poni_file", "poni_values", "mask_file", "project_root", "save_path", "bai_1d_args", "bai_2d_args", "run_options"}; optional = ({"background"} if "background" in outer else set()) | ({"poni_v3_override"} if "poni_v3_override" in outer else set()); _reject(set(outer) != expected | optional, "persisted run configuration has a noncanonical keyset")
+    outer = dict(run); signed = outer.pop("scientific_signature", None); _reject(type(signed) is not dict, "persisted scientific signature is missing"); signed = dict(signed); assets = signed.pop("accepted_scientific_assets", None); _reject(signed != outer, "persisted duplicated scientific signature differs"); expected = {"schema_version", "generation", "fingerprint", "source", "processing_mode", "output_mode", "live_mode", "batch_mode", "max_cores", "gi", "threshold", "poni_file", "poni_values", "mask_file", "project_root", "save_path", "bai_1d_args", "bai_2d_args", "run_options"}; optional = ({"background"} if "background" in outer else set()) | ({"poni_v3_override"} if "poni_v3_override" in outer else set()) | ({"flat_file"} if "flat_file" in outer else set()); _reject(set(outer) != expected | optional, "persisted run configuration has a noncanonical keyset")
+    _reject("flat_file" in outer and (type(outer["flat_file"]) is not str or not outer["flat_file"]), "persisted flat field is malformed")
+    _reject(("flat_file" in outer) != (type(assets) is dict and "flat_sha256" in assets), "persisted flat field and its accepted digest must be paired")
     if "poni_v3_override" in outer:
         try: override = __import__("xrd_tools.session.run_configuration", fromlist=["PoniV3OverrideIntent"]).PoniV3OverrideIntent.from_mapping(outer["poni_v3_override"])
         except (TypeError, ValueError) as error: raise ValueError("persisted PONI v3 override is malformed") from error
@@ -2007,7 +2009,7 @@ def _validate_science(selected, shared, dimension):
         except (TypeError, ValueError, KeyError) as error: raise ValueError("geometry science is malformed") from error
         _reject(parsed_geometry.to_json() != mapping_json or geometry["convention"] != getattr(parsed_geometry, "preset", getattr(parsed_geometry, "convention", None)) or geometry["motor_sources"] != {motor: motor for motor in parsed_geometry.all_referenced_motors()}, "geometry science is malformed")
     gi_keys = {"enabled", "incidence_motor", "resolved_motor", "th_val", "sample_orientation", "tilt_angle"}
-    _keys(gi, gi_keys | ({"gi_exit_angle_convention"} if gi.get("enabled") else set()), "gi"); _keys(threshold, {"apply_threshold", "threshold_min", "threshold_max", "mask_saturation"}, "threshold"); _keys(assets, {"poni_values", "poni_detector_config_json", "poni_sha256", "mask_sha256"}, "accepted_scientific_assets")
+    _keys(gi, gi_keys | ({"gi_exit_angle_convention"} if gi.get("enabled") else set()), "gi"); _keys(threshold, {"apply_threshold", "threshold_min", "threshold_max", "mask_saturation"}, "threshold"); _keys(assets, {"poni_values", "poni_detector_config_json", "poni_sha256", "mask_sha256"} | ({"flat_sha256"} if "flat_sha256" in assets else set()), "accepted_scientific_assets")
     finite = lambda value: type(value) is float and math.isfinite(value)
     if gi["enabled"]:
         from xrd_tools.corrections.grazing import validate_gi_exit_angle_convention
@@ -2015,7 +2017,7 @@ def _validate_science(selected, shared, dimension):
         except ValueError as error: raise ValueError("GI science is malformed") from error
     _reject(type(gi["enabled"]) is not bool or any(type(gi[k]) is not str or not gi[k] for k in ("incidence_motor", "resolved_motor")) or gi["enabled"] and gi["incidence_motor"] != gi["resolved_motor"] or not finite(gi["th_val"]) or type(gi["sample_orientation"]) is not int or not 1 <= gi["sample_orientation"] <= 8 or not finite(gi["tilt_angle"]), "GI science is malformed"); _reject(any(type(threshold[k]) is not bool for k in ("apply_threshold", "mask_saturation")) or any(v is not None and not finite(v) for v in (threshold["threshold_min"], threshold["threshold_max"])) or threshold["threshold_min"] is not None and threshold["threshold_max"] is not None and threshold["threshold_min"] > threshold["threshold_max"], "threshold science is malformed")
     digest = lambda value: value is None or type(value) is str and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
-    _reject(shared["poni_values"] != assets["poni_values"] or (assets["poni_values"] is None) != (assets["poni_detector_config_json"] is None) or not all(digest(assets[k]) for k in ("poni_sha256", "mask_sha256")), "accepted scientific assets are malformed")
+    _reject(shared["poni_values"] != assets["poni_values"] or (assets["poni_values"] is None) != (assets["poni_detector_config_json"] is None) or not all(digest(assets[k]) for k in ("poni_sha256", "mask_sha256")) or "flat_sha256" in assets and (assets["flat_sha256"] is None or not digest(assets["flat_sha256"])), "accepted scientific assets are malformed")
     if assets["poni_detector_config_json"] is not None:
         try: parsed = json.loads(assets["poni_detector_config_json"]); canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":"), allow_nan=False)
         except (TypeError, ValueError, json.JSONDecodeError) as error: raise ValueError("accepted detector config is malformed") from error
@@ -2219,6 +2221,34 @@ def _persisted_mask(group, shape, *, read: bool):
     return spec, mask
 
 
+def _load_persisted_flat(target, entry, shape, snapshot, target_revision, shared):
+    """Read and verify the output's persisted flat field, or None without one."""
+
+    import hashlib
+    import h5py
+    import numpy as np
+
+    assets = shared.get("accepted_scientific_assets")
+    if not isinstance(assets, Mapping) or assets.get("flat_sha256") is None:
+        return None
+    with _open_target_hdf(target) as handle:
+        _target_hdf_fence(handle, target, snapshot, target_revision)
+        group = _replacement_hard_group(handle, entry)
+        _reject(group is None, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
+        node = _replacement_hard_group(group, "instrument/detector/flatfield", h5py.Dataset)
+        _reject(node is None, "processed flat field is missing")
+        _reject(node.dtype != np.dtype(np.float32) or tuple(node.shape) != tuple(shape)
+                or set(node.attrs) != {"description", "sha256"},
+                "processed flat field is malformed")
+        flat = np.asarray(node[()], dtype=np.float32)
+        recorded = node.attrs["sha256"]
+        recorded = recorded.decode() if isinstance(recorded, bytes) else str(recorded)
+        _reject(hashlib.sha256(np.ascontiguousarray(flat).tobytes()).hexdigest() != recorded,
+                "processed flat field changed")
+        _target_hdf_fence(handle, target, snapshot, target_revision)
+    return flat
+
+
 def _load_persisted_mask(target, entry, shape, snapshot, target_revision,
                          expected):
     """Materialize only after the mask-bearing resource floor is admitted."""
@@ -2414,10 +2444,10 @@ def _inspect_artifact(target: Path, entry: str, dimension: str,
         mask_spec, mask = _persisted_mask(group, shape, read=read_mask)
         _target_hdf_fence(handle, target, snapshot, target_revision)
     fingerprint = run.get("fingerprint"); _reject(type(fingerprint) is not str or len(fingerprint) != 64 or any(c not in "0123456789abcdef" for c in fingerprint), "processed acquisition identity is malformed"); return _ArtifactInspection(labels, shape, dtype, shared, selected, fingerprint, source_base, lineage, MappingProxyType(values), mask_spec, mask, raw, topology)
-def _core_plan(selected: Mapping[str, Any], shared: Mapping[str, Any], mask=None):
+def _core_plan(selected: Mapping[str, Any], shared: Mapping[str, Any], mask=None, flat=None):
     from xrd_tools.session.readiness import build_native_int_reduction_plan_from_args; args = dict(selected["bai_args"]); dimension = selected["dimension"]; gi = shared["gi"]; threshold = shared["threshold"]
     if gi["enabled"]: args[f"gi_mode_{dimension}"] = selected["gi_mode"]
-    plan = build_native_int_reduction_plan_from_args(args if dimension == "1d" else None, args if dimension == "2d" else None, gi_enabled=gi["enabled"], gi_incident_angle=(gi["th_val"] if gi["enabled"] and gi["resolved_motor"] == "Manual" else None), incidence_motor=(None if not gi["enabled"] or gi["resolved_motor"] == "Manual" else gi["resolved_motor"]), tilt_angle=gi["tilt_angle"], sample_orientation=gi["sample_orientation"], gi_exit_angle_convention=gi.get("gi_exit_angle_convention", "xdart_reflection_qoop_v1"), integrate_1d=dimension == "1d", integrate_2d=dimension == "2d", threshold_min=(threshold["threshold_min"] if threshold["apply_threshold"] else None), threshold_max=(threshold["threshold_max"] if threshold["apply_threshold"] else None), mask_saturation=threshold["mask_saturation"]); plan.mask = mask; return plan
+    plan = build_native_int_reduction_plan_from_args(args if dimension == "1d" else None, args if dimension == "2d" else None, gi_enabled=gi["enabled"], gi_incident_angle=(gi["th_val"] if gi["enabled"] and gi["resolved_motor"] == "Manual" else None), incidence_motor=(None if not gi["enabled"] or gi["resolved_motor"] == "Manual" else gi["resolved_motor"]), tilt_angle=gi["tilt_angle"], sample_orientation=gi["sample_orientation"], gi_exit_angle_convention=gi.get("gi_exit_angle_convention", "xdart_reflection_qoop_v1"), integrate_1d=dimension == "1d", integrate_2d=dimension == "2d", threshold_min=(threshold["threshold_min"] if threshold["apply_threshold"] else None), threshold_max=(threshold["threshold_max"] if threshold["apply_threshold"] else None), mask_saturation=threshold["mask_saturation"]); plan.mask = mask; plan.flat = flat; return plan
 def _prepare_gi_scouts(target, entry, observed, selected, shared, snapshot, target_revision, *, cancel_token=None):
     _event(cancel_token); gi = shared["gi"]
     if not gi["enabled"] or gi["resolved_motor"] == "Manual": return selected, None
@@ -2461,19 +2491,28 @@ def _requirements(shape, dtype, selected, shared):
         background_binding_bytes=terms[3],
     )
 def _allocation_recipe(allocation: SessionResourceAllocation) -> dict[str, Any]: return {"requirements": {f.name: getattr(allocation.requirements, f.name) for f in fields(SessionResourceRequirements)}, "envelope_bytes": allocation.envelope_bytes, "counts": dict(allocation.counts), "categories": dict(allocation.categories), "minimum_bytes": allocation.minimum_bytes, "floor_bytes": allocation.floor_bytes, "assigned_bytes": allocation.assigned_bytes, "origin": allocation.origin, "oversize_excess_bytes": allocation.oversize_excess_bytes}
-def _mask_owner_block_bytes(req, mask_spec):
-    """Return the exact frame-quantized owner needed at mask decode peak."""
+def _persisted_flat_bytes(shared, shape) -> int:
+    """The retained bytes of the persisted float32 flat field, or 0 without one."""
+    assets = shared.get("accepted_scientific_assets") if isinstance(shared, Mapping) else None
+    if not isinstance(assets, Mapping) or assets.get("flat_sha256") is None:
+        return 0
+    return 4 * int(shape[0]) * int(shape[1])
 
-    if not mask_spec.retained_bytes:
+
+def _mask_owner_block_bytes(req, mask_spec, flat_bytes=0):
+    """Return the exact frame-quantized owner needed at mask decode peak,
+    including the retained flat field."""
+
+    if not mask_spec.retained_bytes and not flat_bytes:
         return None
-    peak = mask_spec.retained_bytes + mask_spec.decode_bytes
+    peak = mask_spec.retained_bytes + mask_spec.decode_bytes + int(flat_bytes)
     frame = req.native_frame_bytes
     return max(frame, ((peak + frame - 1) // frame) * frame)
 
 
-def _policy(req, spec: Mapping[str, Any], mask_spec=None) -> SessionPolicy:
+def _policy(req, spec: Mapping[str, Any], mask_spec=None, flat_bytes=0) -> SessionPolicy:
     mask_spec = mask_spec or _PersistedMaskSpec(0, 0)
-    owner = _mask_owner_block_bytes(req, mask_spec)
+    owner = _mask_owner_block_bytes(req, mask_spec, flat_bytes)
     _keys(spec, ({"version", "kind", "envelope_bytes", "requests"} if spec.get("kind") == "resolve" else {"version", "kind", "allocation"}), "resource_policy"); _reject(type(spec["version"]) is not int or spec["version"] != 1, "resource policy version")
     if spec["kind"] == "resolve":
         requests = spec["requests"]
@@ -2529,7 +2568,7 @@ class ReintegratePlan:
         _reject(expected_labels is not None and labels != expected_labels, "EXPECTED_LABELS_CHANGED")
         if persisted: shared = _plain(observed.persisted_shared_science); selected = _resolve_persisted_selected(selected, shared, dimension, None)
         else: _reject(_plain(observed.persisted_shared_science) != shared, "shared science differs")
-        req = _requirements(observed.detector_shape, observed.native_dtype, selected, shared); policy = _policy(req, preparation["resource_policy"], observed.mask_spec)
+        req = _requirements(observed.detector_shape, observed.native_dtype, selected, shared); policy = _policy(req, preparation["resource_policy"], observed.mask_spec, _persisted_flat_bytes(shared, observed.detector_shape))
         mask = _load_persisted_mask(path, entry, observed.detector_shape, snapshot, target_revision, observed.mask_spec) if observed.mask_spec.retained_bytes else None
         observed = observed._replace(mask=mask)
         selected, bootstrap = _prepare_gi_scouts(path, entry, observed, selected, shared, snapshot, target_revision, cancel_token=cancel_token); _event(cancel_token); _reject(capture_target_snapshot(path) != snapshot or _target_object_revision(path, snapshot) != target_revision, "TARGET_SNAPSHOT_CHANGED"); _event(cancel_token); return _make_plan(str(path), entry, observed.source_base, dimension, labels, observed.detector_shape, observed.native_dtype, selected, shared, bootstrap, observed.mask_spec.retained_bytes, observed.mask_spec.decode_bytes, policy, snapshot=snapshot)
@@ -2545,7 +2584,7 @@ class ReintegratePlan:
         _reject(session["flush"] != {"interval": 8, "cap": 64, "margin": 8}, "recipe flush policy")
         _reject(type(value["labels"]) is not list or type(value["detector_shape"]) is not list, "recipe tuple fields are not JSON arrays"); selected, shared = _plain(_freeze(value["selected_plan"])), _plain(_freeze(value["requested_shared_science"])); _validate_science(selected, shared, value["dimension"])
         mask_spec = _mask_spec(value["retained_mask_bytes"], value["mask_decode_bytes"], value["detector_shape"], "recipe persisted-mask resources")
-        req = _requirements(tuple(value["detector_shape"]), value["native_dtype"], selected, shared); policy = _policy(req, {"version": 1, "kind": "explicit", "allocation": session["allocation"]}, mask_spec)
+        req = _requirements(tuple(value["detector_shape"]), value["native_dtype"], selected, shared); policy = _policy(req, {"version": 1, "kind": "explicit", "allocation": session["allocation"]}, mask_spec, _persisted_flat_bytes(shared, value["detector_shape"]))
         return _make_plan(value["target"], value["entry"], value["source_root"], value["dimension"], tuple(value["labels"]), tuple(value["detector_shape"]), value["native_dtype"], selected, shared, value["gi_bootstrap_incidence"], value["retained_mask_bytes"], value["mask_decode_bytes"], policy, snapshot=snapshot, expected_science=value["science_identity"], expected_operation=value["operation_identity"])
 def _plan_mapping(plan: ReintegratePlan) -> dict[str, Any]: return {"api_version": _REINTEGRATE_PLAN_API_VERSION, "target": plan.target, "entry": plan.entry, "source_root": plan.source_root, "expected_target_snapshot": _snapshot_mapping(plan.expected_target_snapshot), "dimension": plan.dimension, "labels": list(plan.labels), "detector_shape": list(plan.detector_shape), "native_dtype": plan.native_dtype, "selected_plan": _plain(plan.selected_plan), "requested_shared_science": _plain(plan.requested_shared_science), "gi_bootstrap_incidence": plan.gi_bootstrap_incidence, "retained_mask_bytes": plan.retained_mask_bytes, "mask_decode_bytes": plan.mask_decode_bytes, "session_policy": {"flush": {"interval": 8, "cap": 64, "margin": 8}, "allocation": _allocation_recipe(plan.resource_allocation)}, "rollback_policy": plan.rollback_policy, "science_identity": plan.science_identity, "operation_identity": plan.operation_identity}
 def _make_plan(path, entry, source_root, dimension, labels, shape, dtype, selected, shared, bootstrap, retained_mask_bytes, mask_decode_bytes, policy, *, snapshot=None, expected_science=None, expected_operation=None):
@@ -2554,7 +2593,7 @@ def _make_plan(path, entry, source_root, dimension, labels, shape, dtype, select
     mask_spec = _mask_spec(retained_mask_bytes, mask_decode_bytes, shape,
                            "plan persisted-mask resources")
     expected_owner = _mask_owner_block_bytes(policy.allocation.requirements,
-                                             mask_spec)
+                                             mask_spec, _persisted_flat_bytes(shared, shape))
     _reject(expected_owner is not None
             and policy.allocation.owner_block_bytes != expected_owner,
             "REINTEGRATE_MASK_OWNER_BLOCK_GRANT_CHANGED")

@@ -888,6 +888,8 @@ class FrozenRunConfiguration:
     threshold: FrozenThresholdPolicy
     poni_file: str = ""
     mask_file: str = ""
+    #: Flat-field image applied in the integration normalization ("" = none).
+    flat_file: str = ""
     poni_v3_override: PoniV3OverrideIntent | None = None
     background: Any = field(default_factory=_default_background)
     project_root: str = ""
@@ -1007,6 +1009,8 @@ class FrozenRunConfiguration:
         )
         if self.background.mode != "None":
             value += (("background", _freeze_value(self.background.to_mapping())),)
+        if self.flat_file:
+            value += (("flat_file", str(self.flat_file)),)
         if self.poni_v3_override is not None:
             value += ((
                 "poni_v3_override",
@@ -1124,6 +1128,8 @@ class FrozenRunConfiguration:
         }
         if self.background.mode != "None":
             values["background"] = self.background.to_mapping()
+        if self.flat_file:
+            values["flat_file"] = self.flat_file
         if self.poni_v3_override is not None:
             values["poni_v3_override"] = self.poni_v3_override.as_dict()
         return values
@@ -1165,6 +1171,8 @@ class RunIntent:
     poni_file: str = ""
     poni_values: Mapping[Any, Any] | None = None
     mask_file: str = ""
+    #: Flat-field image applied in the integration normalization ("" = none).
+    flat_file: str = ""
     poni_v3_override: PoniV3OverrideIntent | None = None
     background: Any = field(default_factory=_default_background)
     project_root: str = ""
@@ -1250,6 +1258,7 @@ class RunIntent:
             threshold=self.threshold.freeze(),
             poni_file=str(self.poni_file or ""),
             mask_file=str(self.mask_file or ""),
+            flat_file=str(self.flat_file or ""),
             poni_v3_override=self.poni_v3_override,
             background=self.background,
             project_root=str(self.project_root or ""),
@@ -1342,6 +1351,7 @@ class RunIntent:
                 else _detached_value(dict(self.poni_values))
             ),
             mask_file=self.mask_file,
+            flat_file=self.flat_file,
             poni_v3_override=self.poni_v3_override,
             background=self.background,
             project_root=self.project_root,
@@ -1372,6 +1382,7 @@ class RunIntent:
             poni_file=value.poni_file,
             poni_values=value.poni_values,
             mask_file=value.mask_file,
+            flat_file=value.flat_file,
             poni_v3_override=value.poni_v3_override,
             background=value.background,
             project_root=value.project_root,

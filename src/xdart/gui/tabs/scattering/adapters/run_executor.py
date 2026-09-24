@@ -1456,11 +1456,15 @@ class StandardRunExecutor:
                 )
                 run.scan.extra = extra
             mask = None if assets is None else assets.mask
-            if mask is not None:
-                # Persist the applied mask: Reintegrate reuses only the output's
-                # own mask, never the mask file.
+            flat = None if assets is None else assets.flat
+            if mask is not None or flat is not None:
+                # Persist the applied mask and flat: Reintegrate reuses only the
+                # output's own copies, never the source files.
                 extra = dict(getattr(run.scan, "extra", None) or {})
-                extra["global_mask"] = np.flatnonzero(np.asarray(mask, dtype=bool))
+                if mask is not None:
+                    extra["global_mask"] = np.flatnonzero(np.asarray(mask, dtype=bool))
+                if flat is not None:
+                    extra["flatfield"] = flat
                 run.scan.extra = extra
         except SourceRevisionChanged:
             discard_source()
@@ -1490,9 +1494,13 @@ class StandardRunExecutor:
             if item is not None
             else len(run.scan.frames)
         )
+        if getattr(configuration, "flat_file", "") and (
+                assets is None or assets.flat_bytes is None):
+            raise ValueError("the configured flat field was not admitted")
         plan = replace(
             native_int_reduction_plan(configuration, companion_modes_2d=True),
             mask=None if assets is None else assets.mask,
+            flat=None if assets is None else assets.flat,
         )
         try:
             npt = int(configuration.bai_1d_args.get("npt", 0))

@@ -206,8 +206,20 @@ class AcceptedScientificAssets:
     mask_sha256: str | None
     poni_detector_config_json: str | None = None
     poni_parallax: bool | None = None
+    #: The admitted flat field as prepared float32 (unusable pixels NaN).
+    flat_shape: tuple[int, int] | None = None
+    flat_bytes: bytes | None = None
+    flat_sha256: str | None = None
 
     def __post_init__(self) -> None:
+        flat_parts = (self.flat_shape, self.flat_bytes, self.flat_sha256)
+        if any(value is not None for value in flat_parts) and not (
+                type(self.flat_shape) is tuple and len(self.flat_shape) == 2
+                and all(type(value) is int and value > 0 for value in self.flat_shape)
+                and type(self.flat_bytes) is bytes
+                and len(self.flat_bytes) == 4 * self.flat_shape[0] * self.flat_shape[1]
+                and type(self.flat_sha256) is str and len(self.flat_sha256) == 64):
+            raise TypeError("accepted flat field is invalid")
         values = self.poni_values
         if values is not None and not (
                 type(values) is tuple and len(values) == 8
@@ -299,6 +311,11 @@ class AcceptedScientificAssets:
         return None if self.mask_bytes is None else np.frombuffer(
             self.mask_bytes, dtype=np.dtype(self.mask_dtype)).reshape(
                 self.mask_shape).copy()
+
+    @property
+    def flat(self) -> np.ndarray | None:
+        return None if self.flat_bytes is None else np.frombuffer(
+            self.flat_bytes, dtype=np.float32).reshape(self.flat_shape).copy()
 
 def _copy_source(value: SourceSelection) -> SourceSelection:
     if type(value) is SourceSpec:

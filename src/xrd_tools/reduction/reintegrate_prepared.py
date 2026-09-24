@@ -2023,6 +2023,7 @@ def _initial_artifact_miss(inspection: Any) -> PreparedCapsuleMissCode | None:
         or inspection.mask_spec.decode_bytes
         or shared.get("geometry") is not None
         or shared.get("background", {}).get("mode") != "None"
+        or shared.get("accepted_scientific_assets", {}).get("flat_sha256") is not None
         or shared.get("gi", {}).get("enabled") is not False
         or inspection.gi_values
     ):

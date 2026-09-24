@@ -646,6 +646,7 @@ def _qualified_from_prepared(
             or shared["background"]["mode"] != "None"
             or shared["geometry"] is not None
             or shared["gi"]["enabled"]
+            or shared["accepted_scientific_assets"].get("flat_sha256") is not None
         ):
             raise PreparedCapsuleMiss(
                 PreparedCapsuleMissCode.REQUEST_REQUIRES_UNPREPARED_FACTS
@@ -1253,6 +1254,7 @@ class ReintegrateSuccessorPlan:
             requirements,
             {"version": 1, "kind": "explicit", "allocation": session["allocation"]},
             mask_spec,
+            _support._persisted_flat_bytes(shared, shape),
         )
         qualified = _support._make_plan(
             qualification["target"], qualification["entry"],
@@ -2479,6 +2481,10 @@ class _SuccessorRuntime:
             if prepared is None and inspected.mask_spec.retained_bytes else None
         )
         inspected = inspected._replace(mask=mask)
+        flat = _support._load_persisted_flat(
+            source_path, plan.entry, inspected.detector_shape,
+            source_snapshot, revision, plan.requested_shared_science,
+        )
         try:
             _support._event(self.token)
         except _support.ReintegrateCancelled:
@@ -2557,7 +2563,7 @@ class _SuccessorRuntime:
 
             self.source.bind_fact_reader(prepared_fact)
         core_plan = _support._core_plan(
-            plan.selected_plan, plan.requested_shared_science, inspected.mask,
+            plan.selected_plan, plan.requested_shared_science, inspected.mask, flat,
         )
         modes = required_result_modes(core_plan)
         targets = {

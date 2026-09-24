@@ -579,7 +579,7 @@ def _science_projection(
         raise ValueError(
             "signed science mapping differs from the frozen run configuration"
         )
-    if type(assets) is not dict or set(assets) != {
+    if type(assets) is not dict or set(assets) - {"flat_sha256"} != {
         "poni_values", "poni_detector_config_json", "poni_sha256", "mask_sha256",
     }:
         raise TypeError("accepted scientific asset identity is malformed")
@@ -617,8 +617,10 @@ def _science_projection(
             raise ValueError(
                 "accepted PONI projection differs from frozen calibration"
             )
-    for key in ("poni_sha256", "mask_sha256"):
-        digest = assets[key]
+    for key in ("poni_sha256", "mask_sha256", "flat_sha256"):
+        digest = assets.get(key)
+        if key == "flat_sha256" and key in assets and digest is None:
+            raise TypeError("accepted flat_sha256 is malformed")
         if digest is not None and (
             type(digest) is not str
             or len(digest) != 64

@@ -2829,6 +2829,90 @@ def test_masked_run_persists_its_mask_and_reintegrate_keeps_it(tmp_path):
             assert not np.array_equal(value, unmasked.read(label).intensity_1d, equal_nan=True)
 
 
+def test_flat_field_run_persists_the_flat_and_applies_it(tmp_path):
+    import hashlib
+    from xrd_tools.io import FrameViewReader
+
+    for label in range(1, 4):
+        _write_tiff(tmp_path / f"frame_{label:04d}.tif", label)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    shape = fabio.open(str(tmp_path / "frame_0001.tif")).data.shape
+    flat = np.full(shape, 2.0)
+    flat[:3] = 0.0  # dead rows: masked, not divided by zero
+    np.save(tmp_path / "flat.npy", flat)
+    mask = np.zeros(shape, dtype=np.uint8)
+    mask[:3] = 1
+    np.save(tmp_path / "mask.npy", mask)
+
+    def run(name, request_value, **files):
+        intent = _intent(tmp_path / "frame_0001.tif", tmp_path / f"{name}.nexus", poni)
+        for key, value in files.items():
+            setattr(intent, key, value)
+        executor = StandardRunExecutor(join_timeout=5.0)
+        identity = _start(executor, intent, request_value=request_value)
+        try:
+            events = _drain_until(
+                executor, lambda values: any(e.kind in _TERMINAL for e in values),
+                timeout=90.0,
+            )
+            terminal = next(e for e in events if e.kind in _TERMINAL)
+            assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
+        finally:
+            assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+        return _written(Path(intent.save_path))
+
+    flattened = run("flattened", 1799, flat_file=str(tmp_path / "flat.npy"))
+    masked = run("masked", 1800, mask_file=str(tmp_path / "mask.npy"))
+    with h5py.File(flattened, "r") as handle:
+        stored = handle["entry/instrument/detector/flatfield"]
+        expected = np.where(flat > 0, 2.0, np.nan).astype(np.float32)
+        np.testing.assert_array_equal(stored[()], expected)
+        assert stored.attrs["sha256"] == hashlib.sha256(expected.tobytes()).hexdigest()
+        run_configuration = json.loads(handle["entry/reduction/config/run_configuration"][()])
+    file_digest = hashlib.sha256((tmp_path / "flat.npy").read_bytes()).hexdigest()
+    assert run_configuration["flat_file"] == str(tmp_path / "flat.npy")
+    signed = run_configuration["scientific_signature"]["accepted_scientific_assets"]
+    assert signed["flat_sha256"] == file_digest
+    with FrameViewReader(flattened) as a, FrameViewReader(masked) as b:
+        for label in (1, 2, 3):
+            np.testing.assert_allclose(a.read(label).intensity_1d,
+                                       b.read(label).intensity_1d / 2, rtol=1e-6)
+
+    # Reintegrate reuses the persisted flat and reproduces the original exactly.
+    from xrd_tools.io.finite_artifact import _snapshot_path
+    from xrd_tools.reduction import ReintegrateSuccessorPlan, run_reintegrate_successor
+    from xrd_tools.reduction.reintegrate_prepared import _target_snapshot
+
+    preparation = {
+        "api_version": 1,
+        "selected_plan": {"version": 1, "dimension": "1d",
+                          "bai_args": {"npt": 8, "method": "numpy"}, "gi_mode": "q_total"},
+        "requested_shared_science": {"version": 1, "kind": "persisted_target"},
+        "resource_policy": {"version": 1, "kind": "resolve", "envelope_bytes": 8 << 30,
+                            "requests": {"workers": 1, "reduction_inflight": 1}},
+    }
+
+    def reintegrate(target):
+        plan = ReintegrateSuccessorPlan.from_artifact(
+            str(target), entry="entry", dimension="1d", preparation=preparation,
+            source_root=str(tmp_path), expected_labels=(1, 2, 3),
+            expected_target_snapshot=_target_snapshot(_snapshot_path(target)),
+        )
+        return run_reintegrate_successor(plan)
+
+    result = reintegrate(flattened)
+    assert result.output_artifact is not None, result.diagnostics
+    with FrameViewReader(flattened) as a, FrameViewReader(Path(result.output_artifact)) as b:
+        for label in (1, 2, 3):
+            np.testing.assert_array_equal(b.read(label).intensity_1d, a.read(label).intensity_1d)
+    # A changed persisted flat is refused, never silently used.
+    with h5py.File(flattened, "r+") as handle:
+        handle["entry/instrument/detector/flatfield"][5, 5] = 7.0
+    with pytest.raises(ValueError, match="processed flat field changed"):
+        reintegrate(flattened)
+
+
 def test_post_g2_funded_staging_partial_grant_refuses_before_output_and_retries(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

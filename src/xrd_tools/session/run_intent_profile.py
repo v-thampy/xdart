@@ -466,12 +466,10 @@ def _decode_versioned(document: dict[str, Any]) -> RunIntent:
         raise RunIntentProfileError("profile version is unsupported")
     data = _mapping(document["intent"], path="intent")
     intent_keys = set(data)
-    if (
-        intent_keys != set(_INTENT_KEYS)
-        and intent_keys != set(_INTENT_KEYS) | {"poni_v3_override"}
-    ):
+    optional = {"poni_v3_override", "flat_file"}
+    if not set(_INTENT_KEYS) <= intent_keys <= set(_INTENT_KEYS) | optional:
         missing = sorted(_INTENT_KEYS - intent_keys)
-        extra = sorted(intent_keys - _INTENT_KEYS - {"poni_v3_override"})
+        extra = sorted(intent_keys - _INTENT_KEYS - optional)
         raise RunIntentProfileError(
             "intent has an invalid keyset "
             f"(missing={missing}, extra={extra})"
@@ -540,6 +538,7 @@ def _decode_versioned(document: dict[str, Any]) -> RunIntent:
         poni_file=_text(data["poni_file"], path="intent.poni_file"),
         poni_values=poni_values,
         mask_file=_text(data["mask_file"], path="intent.mask_file"),
+        flat_file=_text(data.get("flat_file", ""), path="intent.flat_file"),
         poni_v3_override=override,
         background=background,
         project_root=_text(data["project_root"], path="intent.project_root"),
@@ -616,6 +615,8 @@ def dump_run_intent_profile(intent: RunIntent) -> str:
                 ),
             },
         }
+        if frozen.flat_file:
+            document["intent"]["flat_file"] = frozen.flat_file
         if frozen.poni_v3_override is not None:
             document["intent"]["poni_v3_override"] = (
                 frozen.poni_v3_override.as_dict()
