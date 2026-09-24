@@ -14,10 +14,10 @@ from xdart.gui.tabs.stitch.calibration import StitchCalibrationDialog, _run_job
 from xdart.gui.tabs.stitch.page import StitchPage
 from xrd_tools.core.geometry.stacked_arm import EXTENDED_ARM_MARKER
 from xrd_tools.core.scan import SourceKind, SourceSpec
-from tests.core.test_stacked_arm_extension import ANGLES, TRUTH, _calibration, _ray, _ring_controls
-
-_ROW_ANGLES = [(d, n) for n in (-10., -3., 4., 11.) for d in (6., 20., 34.)]
-
+from tests.core.test_stacked_arm_extension import ANGLES, TRUTH, _calibration, _ring_controls
+from tests.core.test_stitch_autocalibration import (
+    ROW_ANGLES as _ROW_ANGLES, five_parameter_seed as _five_parameter_seed, ring_scan as _ring_scan,
+)
 
 class _Status:
     def show(self, text, timeout_ms=0):
@@ -39,40 +39,6 @@ def _wait(dialog, timeout=60):
         time.sleep(.06)
     QtWidgets.QApplication.processEvents()
     assert not dialog.active(), dialog.status.text()
-
-
-def _five_parameter_seed(angles):
-    """The guided five-parameter fit of exact controls: the usual refinement seed."""
-    from xrd_tools.core.containers import PONI
-    from xrd_tools.integrate.refine import refine_stacked_arm
-    controls, calibrant = _ring_controls(TRUTH, _calibration(), angles)
-    seed = PONI(dist=.392, poni1=.0353, poni2=.0447, wavelength=.7293e-10, detector='Pilatus300kw')
-    five = refine_stacked_arm(seed, controls, nu_motor='nu', del_motor='del', calibrant=calibrant,
-                              detector_config={'orientation': 3}, extended=False)
-    record = five.diffractometer.stacked_arm.to_pyfai_goniometer(five.diffractometer.calibration)
-    record['detector_config'] = {'orientation': 3}
-    return record
-
-
-def _ring_scan(root):
-    """A SPEC scan of LaB6 ring images from the independent extended-arm ray."""
-    from pyFAI.calibrant import get_calibrant
-    calibrant = get_calibrant('LaB6')
-    calibrant.wavelength = .7293e-10
-    q_rings = 2 * np.pi / np.asarray(calibrant.dSpacing)[:25]
-    rows, cols = np.indices((195, 1475), dtype=float)
-    images = root / 'images'
-    images.mkdir(parents=True)
-    for index, (delta, nu) in enumerate(_ROW_ANGLES):
-        q, _ = _ray(TRUTH, _calibration(), delta, nu, rows, cols)
-        image = 10 + 5000 * np.exp(-((q[..., None] - q_rings) ** 2) / (2 * .008 ** 2)).sum(-1)
-        image.astype('<i4').tofile(images / f'ring_scan1_{index:04d}.raw')
-    lines = '\n'.join(f'{d} {n}' for d, n in _ROW_ANGLES)
-    (root / 'ring').write_text('#F ring\n#E 1\n#D today\n#O0 del nu\n#S 1 ascan del 6 34 11 1\n'
-                               f'#D today\n#P0 0 0\n#N 2\n#L del  nu\n{lines}\n')
-    return SourceSpec(root / 'ring', SourceKind.SPEC, options={
-        'scan': '1', 'image_dir': str(images), 'image_stem': 'ring_scan1_',
-        'read_image_kwargs': {'detector_shape': (195, 1475), 'raw_dtype': 'int32'}})
 
 
 def _page_with_dialog(tmp_path, spec=None, seed_path=None):
@@ -219,7 +185,7 @@ def test_cancelled_refinement_ends_cancelled_and_a_refusal_saves_nothing(qapp, t
     assert [done for _stage, done, _total in seen] == sorted(done for _stage, done, _total in seen)
     assert {total for _stage, _done, total in seen} == {1000}
     assert {stage.rsplit(' ', 1)[0] for stage, _done, _total in seen} == {
-        'Reading frames', 'Finding ring points', 'Validating models', 'Fitting'}
+        'Screening the scan', 'Finding ring points', 'Validating models', 'Fitting'}
 
     seed_path = tmp_path / 'five.json'
     seed_path.write_text(json.dumps(seed))

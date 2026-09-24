@@ -20,7 +20,7 @@ from xrd_tools.integrate.stitch_calibration import (
 
 
 #: Share of the progress bar per automatic-refinement stage (the owner needs one fixed total).
-_REFINE_STAGES = {'Reading frames': (0, 200), 'Finding ring points': (200, 700),
+_REFINE_STAGES = {'Screening the scan': (0, 250), 'Finding ring points': (250, 700),
                   'Validating models': (700, 980), 'Fitting': (980, 1000)}
 
 

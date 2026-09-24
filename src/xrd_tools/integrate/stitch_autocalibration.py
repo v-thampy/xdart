@@ -122,14 +122,56 @@ def _ring_indices(calibrant, wavelength_m):
     return index
 
 
+def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen, cancelled, progress):
+    """Frames of the whole scan that the dropped-frame check excludes, before any selection."""
+    from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
+    from xrd_tools.sources import open_source  # noqa: PLC0415
+    arm = diff.stacked_arm
+    labels = [int(row[0]) for row in rows]
+    if progress is not None:
+        progress('Screening the scan', 0, len(labels))
+    nu = [round(float(row[1][arm.nu_motor]), 6) for row in rows]
+    motors = {arm.del_motor: np.array([row[1][arm.del_motor] for row in rows], dtype=float),
+              arm.nu_motor: np.array(nu, dtype=float)}
+    # The detector mask does not depend on the pose: one integrator supplies it.
+    integrator = next(iter(create_multigeometry_integrator_series_from_geometry(
+        diff, {name: values[:1] for name, values in motors.items()})))
+    detector_mask = (None if integrator.detector.mask is None
+                     else np.asarray(integrator.detector.mask, dtype=bool))
+    source = open_source(exact)
+    try:
+        loader = getattr(source, 'load_native_frame', source.load_frame)
+        totals = []
+        for index in labels:
+            if cancelled is not None and cancelled.is_set():
+                raise InterruptedError('automatic refinement cancelled')
+            image = np.asarray(orientation.apply(loader(index)), dtype=np.float64)
+            valid = np.isfinite(image) & (image >= 0)
+            if detector_mask is not None and detector_mask.shape == image.shape:
+                valid &= ~detector_mask
+            if max_counts is not None:
+                valid &= image <= float(max_counts)
+            totals.append(float(image[valid].sum()))
+            if progress is not None:
+                progress('Screening the scan', len(totals), len(labels))
+    finally:
+        close = getattr(source, 'close', None)
+        if close is not None:
+            close()
+    return [{'index': int(verdict.label), 'count_ratio': verdict.ratio,
+             'reason': f'{verdict.status} frame: counts far below its nu-row neighbours'}
+            for verdict in screen_totals(totals, labels, nu, frame_screen) if verdict.excluded]
+
+
 def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_rotation=0,
                              calibrant='LaB6', frame_indices=None, max_frames=48,
                              points_per_degree=2.0, max_counts=None, frame_screen=_CALIBRATION_SCREEN,
                              cancelled=None, progress=None) -> ScanRingPoints:
     """Extract calibrant ring points from frames across the scan's angle grid.
 
-    ``progress(stage, done, total)`` is called after each frame is read and
-    after each frame's ring points are found.
+    Every frame of the scan is screened for dropped frames first, then frames
+    are chosen among the rest. ``progress(stage, done, total)`` reports the
+    screened frames and each frame's ring search.
     """
     from pyFAI.goniometer import SingleGeometry  # noqa: PLC0415
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
@@ -140,9 +182,17 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
     wavelength = float(diff.calibration.poni.wavelength)
     rows = source_frame_choices(spec, (arm.del_motor, arm.nu_motor))
     by_index = {row[0]: row for row in rows}
+    orientation = ImageOrientation(rotation=image_rotation)
+    exact = _exact_source(spec)
+    # Screen every frame of the scan (cheap totals) before choosing, so each frame
+    # is compared with all of its nu-row neighbours, not with a sparse selection.
+    scan_excluded = _screen_scan_frames(exact, rows, diff, orientation, max_counts,
+                                        frame_screen, cancelled, progress)
+    dropped = {item['index'] for item in scan_excluded}
     if frame_indices is None:
         selected, coverage = stratified_frame_indices(
-            rows, min(int(max_frames), len(rows)), arm.nu_motor, arm.del_motor)
+            [row for row in rows if row[0] not in dropped],
+            min(int(max_frames), len(rows) - len(dropped)), arm.nu_motor, arm.del_motor)
     else:
         selected = tuple(int(i) for i in frame_indices)
         if len(set(selected)) != len(selected) or any(i not in by_index for i in selected):
@@ -161,8 +211,6 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
     ring_index = _ring_indices(cal, wavelength)
     motors = {arm.del_motor: np.array([by_index[i][1][arm.del_motor] for i in selected]),
               arm.nu_motor: np.array([by_index[i][1][arm.nu_motor] for i in selected])}
-    orientation = ImageOrientation(rotation=image_rotation)
-    exact = _exact_source(spec)
     source = open_source(exact)
     try:
         loader = getattr(source, 'load_native_frame', source.load_frame)
@@ -179,23 +227,9 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
             return image, valid
 
         integrators = list(create_multigeometry_integrator_series_from_geometry(diff, motors))
-        totals = []
-        for index, integrator in zip(selected, integrators):
-            if cancelled is not None and cancelled.is_set():
-                raise InterruptedError('automatic refinement cancelled')
-            image, valid = pixels(index, integrator)
-            totals.append(float(image[valid].sum()))
-            if progress is not None:
-                progress('Reading frames', len(totals), len(selected))
-        verdicts = screen_totals(totals, [int(i) for i in selected],
-                                 np.round(motors[arm.nu_motor], 6).tolist(), frame_screen)
-        excluded, keep = [], []
-        for k, verdict in enumerate(verdicts):
-            if verdict.excluded:
-                excluded.append({'index': int(verdict.label), 'count_ratio': verdict.ratio,
-                                 'reason': f'{verdict.status} frame: counts far below its nu-row neighbours'})
-            else:
-                keep.append(k)
+        # An explicit selection may name a dropped frame; an automatic one never does.
+        excluded = [item for item in scan_excluded if frame_indices is None or item['index'] in selected]
+        keep = [k for k, index in enumerate(selected) if index not in dropped]
         controls, frames = [], []
         for done, k in enumerate(keep, 1):
             if cancelled is not None and cancelled.is_set():

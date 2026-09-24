@@ -574,11 +574,7 @@ class StitchPage(QtWidgets.QWidget):
 
     def _backend_changed(self, *_args):
         xu = self._value("backend") == "xrayutilities histogram"
-        # XU always applies its solid angle and has no uncertainty or sample-position
-        # model; polarization, dark, flat and the frame check apply to both backends.
-        for key in ("sample_position", "solid_angle", "error_model"):
-            self._fields[key] = replace(self._fields[key], enabled=not xu)
-            self._rows[key].apply_field(self._fields[key])
+        self._sync_advanced()
         self.set_field("source_motors", "del=del, nu=nu" if xu else "del_angle=del, nu_angle=nu")
         if not xu and not str(self._value("image_rotation")).strip():
             self.set_field("image_rotation", "0")
@@ -593,6 +589,18 @@ class StitchPage(QtWidgets.QWidget):
                 self.set_field(key, value)
         self._refresh_xu_geometry()
         self._sync_actions()
+
+    def _sync_advanced(self):
+        """Advanced options apply to native Stitch only. XU always applies its solid
+        angle and has no uncertainty or sample-position model; polarization, dark,
+        flat and the frame check apply to both backends."""
+        native = self._native_mode
+        xu = self._value("backend") == "xrayutilities histogram"
+        self.corrections_card.setEnabled(native)
+        for key, enabled in (("frame_check", native), ("sample_position", native and not xu),
+                             ("solid_angle", native and not xu), ("error_model", native and not xu)):
+            self._fields[key] = replace(self._fields[key], enabled=enabled)
+            self._rows[key].apply_field(self._fields[key])
 
     def _refresh_xu_geometry(self, *_args, calibration=None):
         """Present asset-owned settings through the existing strict admission owner."""
@@ -743,7 +751,7 @@ class StitchPage(QtWidgets.QWidget):
                                ("threshold", policy.threshold_max), ("threshold_enabled", policy.mode != "off")):
                 self._fields[key] = replace(self._fields[key], value=value)
             self._render_ranges()
-
+        self._sync_advanced()
         self._refresh_xu_geometry()
 
     def _start(self, action, begin):

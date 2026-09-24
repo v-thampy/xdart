@@ -98,3 +98,29 @@ def test_frame_screen_note_names_excluded_and_kept_partial_frames():
     assert frame_screen_note({"excluded": [52, 164], "partial": [99, 106]}) == (
         "excluded dropped frames 52, 164 · partial frames kept 99, 106")
     assert frame_screen_note({"excluded": [52, 99], "partial": [99]}) == "excluded dropped frames 52, 99"
+
+
+def test_legacy_mode_greys_the_native_only_options(qapp, tmp_path):
+    (tmp_path / "legacy").mkdir()
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(_form(tmp_path / "legacy", "multigeometry"))
+        assert not page.corrections_card.isEnabled()
+        for key in ("frame_check", "sample_position", "solid_angle", "error_model"):
+            assert not page._rows[key].editor.isEnabled(), key
+        page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        assert page.corrections_card.isEnabled()
+        for key in ("frame_check", "sample_position", "solid_angle", "error_model"):
+            assert page._rows[key].editor.isEnabled(), key
+    finally:
+        _close(page, qapp)
+
+
+def test_preview_warns_when_the_flat_median_is_far_from_one(tmp_path):
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    rows, cols = form.detector_shape
+    for name, value, warned in (("counts.npy", 1000., True), ("unit.npy", 1., False)):
+        flat = tmp_path / name
+        np.save(flat, np.full((rows, cols), value))
+        warnings = prepare_stitch_tool(replace(form, flat_path=str(flat))).warnings
+        assert any(item.startswith("Flat field median 1000") for item in warnings) is warned

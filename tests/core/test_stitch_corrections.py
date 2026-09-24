@@ -165,6 +165,8 @@ def test_dark_and_flat_reach_pyfai_through_the_operation(tmp_path):
     flat_value[:, :40] = 0.  # dead columns are masked, not divided by zero
     flat_path = _project_file(tmp_path, 'flat', 'flat.npy', flat_value)
     _, flat = _run(tmp_path, 'flat', flat_path=flat_path)
+    recorded = json.loads(flat.provenance_json)['plan']['corrections']['flat']
+    assert (recorded['min_fraction'], recorded['masked_pixels'], recorded['median']) == (.1, 40 * 195, 2.)
     assert np.all(flat.coverage <= plain.coverage + 1e-9) and np.any(flat.coverage < plain.coverage - 1e-6)
     same = (flat.coverage > 0) & np.isclose(flat.coverage, plain.coverage)
     np.testing.assert_allclose(flat.intensity[same], plain.intensity[same] / 2., rtol=1e-6)
@@ -267,3 +269,20 @@ def test_two_dimensional_merge_applies_dark_and_flat():
     np.testing.assert_allclose(removed[covered], 7. * np.asarray(dark_diag.coverage)[covered], rtol=1e-5)
     flat, _ = stitch_2d_streaming([raw], 1, lambda: iter([_ai()]), flat=np.full(SHAPE, 2.), **kwargs)
     np.testing.assert_allclose(flat.intensity[covered], plain.intensity[covered] / 2., rtol=1e-6)
+
+
+def test_a_rebuilt_old_multigeometry_record_drops_corrections_it_never_applied():
+    from xrd_tools.analysis.plans import StitchPlan
+    from xrd_tools.corrections.stack import CorrectionStack
+    record = {'backend': 'multigeometry', 'streaming_multigeometry': True,
+              'corrections': CorrectionStack(polarization_factor=.9).to_dict()}
+    assert StitchPlan.from_provenance(record).corrections is None  # written before corrections applied
+    current = StitchPlan.from_provenance({**record, 'error_model': None})
+    assert current.corrections.polarization_factor == .9
+    histogram = StitchPlan.from_provenance({**record, 'backend': 'pyfai_hist', 'streaming_multigeometry': False})
+    assert histogram.corrections.polarization_factor == .9  # histogram backends always applied them
+
+
+def test_the_frame_screen_statistic_names_the_dark():
+    from xrd_tools.integrate.frame_screen import FrameScreenPolicy
+    assert 'dark-subtracted' in FrameScreenPolicy().to_provenance()['statistic']

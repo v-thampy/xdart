@@ -56,7 +56,8 @@ class FrameScreenPolicy:
     def to_provenance(self) -> dict[str, object]:
         return {'exclude': self.exclude, 'empty_ratio': self.empty_ratio,
                 'partial_ratio': self.partial_ratio, 'window': self.window,
-                'statistic': 'monitor-normalised total of valid detector pixels'}
+                'statistic': 'monitor-normalised total of valid detector pixels, '
+                             'dark-subtracted when a dark is set'}
 
 
 @dataclass(frozen=True)

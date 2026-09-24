@@ -12,6 +12,7 @@ import stat
 import numpy as np
 
 from xrd_tools.core.geometry import ImageOrientation
+from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION, prepare_flatfield
 from xrd_tools.io.stat_identity import identity_ctime_ns
 
 
@@ -95,6 +96,9 @@ class StitchImageReceipt:
     sha256: str
     shape: tuple[int, int]
     pixels_sha256: str
+    #: flats only (derived from the pixels): pixels prepare_flatfield masks, and the median
+    flat_masked_pixels: int | None = None
+    flat_median: float | None = None
 
     @property
     def fingerprint(self):
@@ -109,7 +113,10 @@ class StitchImageReceipt:
         return {"relative_path": _relative_locator(self.resolved_path, project_root, self.role),
                 "lexical_relative_path": _relative_locator(self.lexical_path, project_root, self.role),
                 "sha256": self.sha256, "revision": list(self.revision), "shape": list(self.shape),
-                "receipt_fingerprint": self.fingerprint}
+                "receipt_fingerprint": self.fingerprint,
+                **({} if self.role != "flat" else {
+                    "min_fraction": DEFAULT_MIN_FLAT_FRACTION, "masked_pixels": self.flat_masked_pixels,
+                    "median": self.flat_median})}
 
 
 def capture_detector_image(path, role, max_bytes):
@@ -149,8 +156,17 @@ def capture_detector_image(path, role, max_bytes):
             raise
         _refuse(f"{code}_UNAVAILABLE", str(error))
     pixels.setflags(write=False)
+    masked = median = None
+    if role == "flat":
+        finite = pixels[np.isfinite(pixels)]
+        median = float(np.median(finite)) if finite.size else None
+        try:
+            masked = int(np.isnan(prepare_flatfield(pixels)).sum())
+        except ValueError:
+            _refuse("FLAT_UNUSABLE", "the flat field has no usable pixels")
     receipt = StitchImageReceipt(role, str(lexical), str(resolved), after, digest,
-                                 tuple(pixels.shape), hashlib.sha256(pixels.tobytes()).hexdigest())
+                                 tuple(pixels.shape), hashlib.sha256(pixels.tobytes()).hexdigest(),
+                                 masked, median)
     return receipt, pixels
 
 

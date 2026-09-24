@@ -260,7 +260,11 @@ class StitchPlan:
             streaming_multigeometry=streaming_multigeometry,
             conditioning=(StitchConditioning(**prov["conditioning"])
                           if prov.get("conditioning") is not None else None),
-            corrections=CorrectionStack.from_dict(corr) if corr else None,
+            # MultiGeometry records from before it applied its corrections (they
+            # carry no error_model) recorded a CorrectionStack it never applied.
+            corrections=(CorrectionStack.from_dict(corr) if corr and (
+                prov.get("backend", "multigeometry") != "multigeometry" or "error_model" in prov)
+                else None),
             gi=GISettings.from_dict(gi) if gi else None,
             error_model=prov.get("error_model"),
         )

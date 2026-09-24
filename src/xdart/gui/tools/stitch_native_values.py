@@ -249,6 +249,11 @@ def prepare_native_stitch_tool(form, project):
         warning = _affine_geometry_warning(request)
         if warning is not None:
             warnings.append(warning)
+        flat = getattr(request.plan, "_flat_receipt", None)
+        if (flat is not None and flat.flat_median is not None and not .5 <= flat.flat_median <= 2
+                and not any(item.startswith("Flat field median") for item in warnings)):
+            warnings.append(f"Flat field median {flat.flat_median:.4g} is far from 1: pyFAI divides by "
+                            "the flat as given, so intensities scale by its inverse")
     return StitchToolPreflight(form, requests[0], None, _PREFLIGHT_FACTORY,
                                requests=tuple(requests), skipped=resolution.skipped,
                                preview_members=tuple(preview_members), warnings=tuple(warnings))
