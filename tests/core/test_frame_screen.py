@@ -189,6 +189,62 @@ def test_grouped_scans_are_screened_only_against_themselves(tmp_path):
     assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
     assert result.frame_screen['excluded'] == [7]
     assert result.frame_screen['empty'] == [7] and result.frame_screen['partial'] == []
+    return target
+
+
+def _verdicts(target):
+    from xrd_tools.io.analysis_artifact import read_analysis_artifact
+    rows = read_analysis_artifact(target).contributing_frames
+    return [(row['identity']['scan_id'], row['identity']['frame_index'],
+             row.get('screen'), row.get('excluded')) for row in rows]
+
+
+def test_a_saved_grouped_result_records_each_frames_verdict(tmp_path):
+    target = test_grouped_scans_are_screened_only_against_themselves(tmp_path)
+    verdicts = _verdicts(target)
+    # Both members have a frame 4; only the dim member's (stream position 7) is excluded.
+    assert [(frame, screen, excluded) for _scan, frame, screen, excluded in verdicts if excluded] == [
+        (4, 'empty', True)]
+    assert verdicts[7][2:] == ('empty', True) and verdicts[3][2:] == ('ok', False)
+    assert {screen for _s, _f, screen, _e in verdicts} <= {'ok', 'unscreened', 'empty'}
+
+
+def test_a_tampered_frame_verdict_refuses_an_attested_xu_result(tmp_path):
+    # XU's execution attestation binds the result fingerprint, which covers the
+    # manifest. MultiGeometry artifacts carry no stored result digest for any dataset.
+    import h5py
+    from xrd_tools.analysis.module_transaction import ModuleDisposition
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactInvalid, read_analysis_artifact
+    from xrd_tools.io.analysis_stitch_auxiliary import canonical_frame_manifest
+    from tests.core.test_native_stitch_operation import _native
+    request = _native(tmp_path, 'xu_hist', 'q_A^-1', grouped=False)
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    target = request.module.output.target
+    rows = read_analysis_artifact(target).contributing_frames
+    assert all(row['screen'] in {'ok', 'unscreened'} and row['excluded'] is False for row in rows)
+    with h5py.File(target, 'r+') as handle:
+        manifest = json.loads(bytes(handle['entry/contributing_frames_json'][()]))
+        manifest['records'][0]['screen'] = 'partial'
+        del handle['entry/contributing_frames_json']
+        handle['entry'].create_dataset('contributing_frames_json',
+                                       data=np.bytes_(canonical_frame_manifest(manifest).encode()))
+    with pytest.raises(AnalysisArtifactInvalid, match='attestation result changed'):
+        read_analysis_artifact(target)
+
+
+def test_a_result_saved_without_verdicts_still_reads(tmp_path, monkeypatch):
+    from xrd_tools.analysis import stitch_operation
+    from xdart.gui.tabs.stitch.page import saved_frame_screen_note
+    monkeypatch.setattr(stitch_operation, '_record_frame_screen', lambda records, verdicts: None)
+    target = test_grouped_scans_are_screened_only_against_themselves(tmp_path)
+    verdicts = _verdicts(target)
+    assert all(screen is None and excluded is None for _s, _f, screen, excluded in verdicts)
+    from xrd_tools.io.analysis_artifact import read_analysis_artifact
+    rows = read_analysis_artifact(target).contributing_frames
+    assert saved_frame_screen_note(rows) == 'frame check not recorded'
+    assert saved_frame_screen_note([{**row, 'screen': 'ok', 'excluded': False} for row in rows]) == ''
 
 
 def test_grouped_xu_rows_keep_their_member(tmp_path):

@@ -311,3 +311,29 @@ def test_scan14_native_records_preserve_legacy_science_and_raw_links(
         )
         np.testing.assert_array_equal(frame.raw, expected_raw)
         assert frame.thumbnail is not None
+
+
+@pytest.mark.slow
+def test_scan14_native_result_records_the_frame_check(isolated_scan14_project):
+    # Contiguous runs around every flagged frame keep each frame's same-row
+    # neighbours, so the verdicts equal the full 287-frame screen's.
+    project = isolated_scan14_project
+    labels = tuple(label for low, high in ((47, 58), (94, 126), (159, 170), (267, 278))
+                   for label in range(low, high))
+    legacy = _scan14_request(project, project / "screen-legacy.nexus", labels)
+    plan = replace(legacy.plan, native_records=True,
+                   conditioning=StitchConditioning("manual", threshold_max=800_000.0))
+    output = ModuleOutputRequest(
+        resolve_finite_output_target(project, "scan14-screen", operation_token="stitch-1d"),
+        AnalysisArtifactKind.STITCH_1D, artifact_family="scan14-screen",
+    )
+    result = run_stitch_operation(
+        prepare_stitch_operation(legacy.module.source, output, plan, project_root=project))
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    rows = read_analysis_artifact(output.target).contributing_frames
+    verdicts = {row["identity"]["frame_index"]: (row["screen"], row["excluded"]) for row in rows}
+    assert sorted(verdicts) == sorted(labels)
+    assert sorted(label for label, (_screen, excluded) in verdicts.items() if excluded) == [52, 164]
+    assert sorted(label for label, (screen, excluded) in verdicts.items()
+                  if screen == "partial" and not excluded) == [99, 106, 120, 272]
+    assert result.frame_screen["excluded"] == [52, 164]

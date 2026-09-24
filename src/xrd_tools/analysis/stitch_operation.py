@@ -2448,6 +2448,23 @@ def _protected_stitch_inputs(request: StitchOperationRequest) -> tuple[Path, ...
     return tuple(dict.fromkeys(inputs))
 
 
+def _record_frame_screen(records, verdicts):
+    """Stamp each captured frame record with its dropped-frame verdict.
+
+    Verdicts join on stream position, which is the record's contribution index;
+    grouped sources repeat frame labels across members.
+    """
+    if not records:
+        return
+    by_position = {verdict.position: verdict for verdict in verdicts}
+    if sorted(by_position) != list(range(len(records))):
+        raise StitchOperationRefused("FRAME_SCREEN_VERDICT_MISMATCH",
+                                     "frame check verdicts differ from the captured frames")
+    for record in records:
+        verdict = by_position[record["identity"]["contribution_index"]]
+        record["screen"], record["excluded"] = verdict.status, verdict.excluded
+
+
 def _native_artifact_args(request, records):
     if not request.plan.native_records:
         return {}
@@ -2680,6 +2697,7 @@ class StitchOperationExecution:
                     progress_callback=science_progress,
                 )
                 self._frame_screen = screen.summary()
+                _record_frame_screen(records, screen.verdicts)
             revalidate_xu_stitch_calibration(plan.calibration)
             revalidate_mask(plan._mask_receipt)
         except XuStitchCancelled:
@@ -2926,6 +2944,7 @@ class StitchOperationExecution:
                     frame_screen=screen,
                 )
                 self._frame_screen = screen.summary()
+                _record_frame_screen(records, screen.verdicts)
             _revalidate_geometry(self.request.plan.geometry)
             revalidate_mask(self.request.plan._mask_receipt)
         except StitchCancelled:

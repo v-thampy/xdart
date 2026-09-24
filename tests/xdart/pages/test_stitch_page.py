@@ -594,3 +594,29 @@ def test_changed_original_frame_is_labelled_thumbnail_in_popup(qapp, tmp_path):
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
         qapp.processEvents()
+
+
+@pytest.mark.parametrize("recorded", (True, False))
+def test_reopened_result_marks_the_frames_the_check_excluded(qapp, tmp_path, monkeypatch, recorded):
+    from xrd_tools.analysis import stitch_operation
+    from tests.core.test_frame_screen import test_grouped_scans_are_screened_only_against_themselves
+    if not recorded:  # the writer before verdicts were persisted
+        monkeypatch.setattr(stitch_operation, "_record_frame_screen", lambda records, verdicts: None)
+    target = test_grouped_scans_are_screened_only_against_themselves(tmp_path)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.open_result(target)
+        _wait(page, qapp)
+        items = [page.frames.item(i) for i in range(page.frames.count())]
+        status = page.run_bar.readinessLabel.full_text()
+        if recorded:
+            assert [item.text() for item in items][-2:] == ["dim-3", "dim-4 · excluded"]
+            assert "Frame check: empty, excluded from the result" in items[-1].toolTip()
+            assert "Frame check: ok" in items[3].toolTip() and "excluded" not in items[3].text()
+            assert "1 dropped frame excluded" in status
+        else:
+            assert not any("·" in item.text() for item in items)
+            assert all("Frame check: not recorded" in item.toolTip() for item in items)
+            assert "frame check not recorded" in status
+    finally:
+        page.shutdown()

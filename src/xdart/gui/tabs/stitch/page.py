@@ -16,7 +16,7 @@ import numpy as np
 
 import pyqtgraph as pg
 from matplotlib import colormaps
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xdart.gui.pages.handle import AppMenuHosts, PageHandle
 from xdart.gui.pages.operation_owner import OperationTerminalStatus
@@ -70,6 +70,22 @@ def frame_screen_note(summary):
         parts.append(f"excluded dropped frames {', '.join(map(str, excluded))}")
     if flagged:
         parts.append(f"partial frames kept {', '.join(map(str, flagged))}")
+    return " · ".join(parts)
+
+
+def saved_frame_screen_note(records):
+    """One status phrase for the frame check verdicts a saved result recorded."""
+    if not records:
+        return ""
+    if any("screen" not in record for record in records):
+        return "frame check not recorded"
+    excluded = sum(record["excluded"] for record in records)
+    partial = sum(record["screen"] == "partial" and not record["excluded"] for record in records)
+    parts = []
+    if excluded:
+        parts.append(f"{excluded} dropped frame{'' if excluded == 1 else 's'} excluded")
+    if partial:
+        parts.append(f"{partial} partial frame{'' if partial == 1 else 's'} kept")
     return " · ".join(parts)
 
 
@@ -876,7 +892,8 @@ class StitchPage(QtWidgets.QWidget):
         elif outcome.kind is StitchOwnerOutcomeKind.REOPENED:
             if self._action_view_revision == self._view_revision and not self._closing:
                 self._mount_payload(outcome.artifact_path, outcome.payload)
-                self._status("Ready · saved Stitch 1D result")
+                note = saved_frame_screen_note(outcome.payload.contributing_frames)
+                self._status("Ready · saved Stitch 1D result" + (f" · {note}" if note else ""))
         elif outcome.kind is StitchOwnerOutcomeKind.RESULT:
             result = outcome.result
             if result.terminal.disposition is ModuleDisposition.COMMITTED:
@@ -926,9 +943,20 @@ class StitchPage(QtWidgets.QWidget):
                     path = Path(sources.get(identity["source_id"], record["source_path"]))
                     scan = f"{path.as_posix()} · {scan}"
                 label = str(frame) if len(members) == 1 else f"{scan}-{frame}"
+                screen = record.get("screen")
+                if record.get("excluded"):
+                    label += " · excluded"
+                elif screen == "partial":
+                    label += " · partial"
                 item = QtWidgets.QListWidgetItem(label)
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, (storage_scan, frame))
-                item.setToolTip(f"{record['source_path']}\nscan {identity['scan_id']} · frame {frame}")
+                if record.get("excluded"):
+                    item.setForeground(self.frames.palette().color(
+                        QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.Text))
+                check = ("not recorded" if screen is None
+                         else f"{screen}, excluded from the result" if record["excluded"] else screen)
+                item.setToolTip(f"{record['source_path']}\nscan {identity['scan_id']} · frame {frame}"
+                                f"\nFrame check: {check}")
                 self.frames.addItem(item)
         if self.frames.count():
             self.frames.setCurrentRow(0)

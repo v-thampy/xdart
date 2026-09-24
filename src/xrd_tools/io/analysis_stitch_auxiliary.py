@@ -16,6 +16,8 @@ import numpy as np
 _MAX_FRAMES = 100_000
 _MAX_MANIFEST_BYTES = 64 << 20
 _MAX_TEXT = 4096
+_SCREEN_KEYS = frozenset({"screen", "excluded"})
+_SCREEN_STATUSES = frozenset({"ok", "empty", "partial", "unscreened"})
 _SNAPSHOT_ATTRS = {
     "adapter_id": "adapter_id", "size": "file_size", "mtime_ns": "file_mtime_ns",
     "frame_count": "frame_count", "dataset_path": "dataset_path",
@@ -103,6 +105,18 @@ def _thumbnail_manifest(array, lut, mask, mask_baked):
             "mask_sha256": None if mask is None else hashlib.sha256(np.asarray(mask, dtype=bool).tobytes()).hexdigest()}
 
 
+def _screen_fields(value):
+    """The dropped-frame check's verdict for one frame; empty when it was not recorded."""
+    present = _SCREEN_KEYS & set(value)
+    if not present:
+        return {}
+    screen, excluded = value.get("screen"), value.get("excluded")
+    if (present != _SCREEN_KEYS or screen not in _SCREEN_STATUSES or type(excluded) is not bool
+            or (excluded and screen not in {"empty", "partial"})):
+        raise ValueError("contributing frame screen verdict is invalid")
+    return {"screen": screen, "excluded": excluded}
+
+
 def analysis_contributing_frames_manifest(records, *, source_base):
     """Bind shared encoded thumbnails captured during the qualified science read."""
     from xrd_tools.io.nexus_record import _prepare_thumbnail
@@ -112,7 +126,8 @@ def analysis_contributing_frames_manifest(records, *, source_base):
     for record, member in zip(records, members, strict=True):
         prepared = _prepare_thumbnail(record["thumbnail"], dtype=record.get("thumbnail_dtype", "uint8"), thumbnail_mask=record.get("thumbnail_mask"))
         result.append({**member, "mask_baked": bool(record.get("mask_baked", True)),
-                       "thumbnail": _thumbnail_manifest(prepared.array, prepared.lut, prepared.mask, record.get("thumbnail_mask_baked", True))})
+                       "thumbnail": _thumbnail_manifest(prepared.array, prepared.lut, prepared.mask, record.get("thumbnail_mask_baked", True)),
+                       **_screen_fields(record)})
     return {"source_base": str(Path(source_base).expanduser().absolute()), "records": result}
 
 
@@ -204,11 +219,18 @@ def inspect_native_stitch_auxiliary(entry, result, provenance, radial, unit):
     base = _text(manifest["source_base"], "Project root")
     if str(Path(base).expanduser().absolute()) != base:
         fail("contributing frame Project root is not absolute")
-    members = [{k: v for k, v in row.items() if k not in {"thumbnail", "mask_baked"}} for row in rows]
+    members = [{k: v for k, v in row.items() if k not in {"thumbnail", "mask_baked", *_SCREEN_KEYS}} for row in rows]
+    screened = {bool(_SCREEN_KEYS & set(row)) for row in rows}
+    if len(screened) != 1:
+        fail("contributing frame screen verdicts are partial")
     originals = []
     for row in rows:
-        if set(row) != {"key", "identity", "source_path", "source_frame_index", "source_snapshot", "mask_baked", "thumbnail"}:
+        if set(row) - _SCREEN_KEYS != {"key", "identity", "source_path", "source_frame_index", "source_snapshot", "mask_baked", "thumbnail"}:
             fail("contributing manifest fields differ")
+        try:
+            _screen_fields(row)
+        except ValueError:
+            fail("contributing frame screen verdict is invalid")
         parts = row["key"].split("/")
         if len(parts) not in {1, 2} or (len(parts) == 2 and not parts[0].startswith("scan_")):
             fail("contributing record address is invalid")
