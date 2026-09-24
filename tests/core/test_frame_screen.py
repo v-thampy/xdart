@@ -111,3 +111,27 @@ def test_xu_histogram_stream_excludes_an_empty_frame_exactly(tmp_path):
     screened = run(range(6), screen)
     assert screen.summary()['excluded'] == [3]
     np.testing.assert_array_equal(screened.payload.intensity, run([0, 1, 2, 4, 5]).payload.intensity)
+
+
+def test_rows_follow_the_nu_motor_for_both_geometry_kinds(tmp_path):
+    from xrd_tools.analysis.module_transaction import (
+        AnalysisArtifactKind, AnalysisArtifactOverwrite, ModuleOutputRequest,
+    )
+    from xrd_tools.analysis.stitch_operation import (
+        StitchGeometryInput, StitchGeometryKind, StitchOperationPlan, _frame_screen_rows,
+        capture_stitch_geometry, prepare_stitch_operation,
+    )
+    from tests.core.test_stitch_operation import _poni_record, _prepared
+    request = _prepared(tmp_path)
+    assert _frame_screen_rows(request) == (0.0, 2.0)  # goniometer JSON: nu_angle ← nu
+    path = tmp_path / 'geometry.poni'
+    path.write_text(_poni_record(), encoding='utf-8')
+    geometry = capture_stitch_geometry(StitchGeometryInput(
+        path, StitchGeometryKind.PONI, source_motors=(('del', 'del'), ('nu', 'nu')),
+        reference_motor_positions=(('del', 0.0), ('nu', 0.0))))
+    output = ModuleOutputRequest(tmp_path / 'output' / 'poni.nexus', AnalysisArtifactKind.STITCH_1D,
+                                 AnalysisArtifactOverwrite.CREATE_NEW)
+    poni = prepare_stitch_operation(request.module.source, output,
+                                    StitchOperationPlan(geometry, npt_1d=96, radial_range=(.1, 6.)),
+                                    project_root=tmp_path)
+    assert _frame_screen_rows(poni) == (0.0, 2.0)

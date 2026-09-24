@@ -2412,7 +2412,9 @@ def _frame_screen_rows(request: StitchOperationRequest) -> tuple[float, ...]:
     if type(plan) is XuStitchOperationPlan:
         name = str(plan.calibration.projection.value["acquisition"]["source_motors"].get("nu", ""))
     else:
-        name = dict(plan.geometry.request.source_motors).get("nu_angle", "")
+        # A goniometer JSON names the position nu_angle; a PONI geometry names it nu.
+        motors = dict(plan.geometry.request.source_motors)
+        name = motors.get("nu_angle") or motors.get("nu", "")
     values = {item.label: {(n, o): v for n, o, v in item.values}
               for item in request.manifest.contributions}
     return tuple(round(float(values[label].get((name, 0), 0.0)), 6) if name else 0.0
