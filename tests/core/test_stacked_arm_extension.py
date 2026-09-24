@@ -190,6 +190,16 @@ def test_refine_stacked_arm_recovers_an_extended_truth():
     assert worst['five'] > 1e-3, worst
 
 
+def test_outlier_rejection_keeps_near_perfect_points():
+    truth = _calibration()
+    controls, calibrant = _ring_controls(TRUTH, truth, ANGLES[::2])
+    fit = refine_stacked_arm(truth.poni, controls, nu_motor='nu', del_motor='del', calibrant=calibrant,
+                             detector_config={'orientation': 3}, reject_outliers=4.5)
+    assert fit.success, fit.message
+    assert fit.rejected_points == 0
+    assert fit.n_points == sum(len(c.rows) for c in controls)
+
+
 def test_arm_extension_needs_three_nu_positions():
     truth = _calibration()
     controls, calibrant = _ring_controls(TRUTH, truth, [(10., 0.), (30., 0.), (20., 5.)])

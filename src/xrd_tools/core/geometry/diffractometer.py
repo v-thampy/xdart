@@ -996,6 +996,11 @@ class Diffractometer:
         ``rot1/rot2/rot3`` come back in **radians**; ``incident_angle`` in
         **degrees**.  Byte-equal to ``DiffractometerGeometry.derive_per_frame``
         — the GI incidence is intentionally *not* ``deg2rad``-converted.
+
+        A stacked arm with a sample offset also moves each frame's distance and
+        PONI, which this rotation-only view does not carry. Build integrators
+        through :func:`create_multigeometry_integrator_series_from_geometry`,
+        never from these rotations and the base calibration alone.
         """
         stacked = None if self.stacked_arm is None else self.stacked_arm.rotations(motors)
         active_arrays: list[np.ndarray] = [] if stacked is None else [stacked['rot1']]

@@ -270,7 +270,7 @@ def refine_goniometer(
             calibrant=calibrant, wavelength=wavelength, detector=detector,
             detector_config=detector_config, base=base, preset=preset,
             distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
-            cancelled=cancelled)
+            max_nfev=max(max_nfev, 2000), cancelled=cancelled)
     if model not in {'affine', 'stacked_del_on_nu'}:
         raise ValueError('unknown goniometer model')
 
@@ -456,6 +456,9 @@ _MAX_MOUNT_ERROR_RAD = float(np.deg2rad(0.5))
 _MAX_SAMPLE_OFFSET_ERROR_M = 0.002
 #: The extension is identified only by frames from several nu positions.
 _MIN_NU_POSITIONS = 3
+#: Robust outlier cuts never go below this |q| residual (about 3e-4 px), so
+#: near-perfect control points are all kept instead of a zero-width cut.
+_MIN_OUTLIER_CUT_Q = 1e-6
 _ARM_NAMES = ("dist", "poni1", "poni2", "nu_offset", "del_offset")
 _EXTENSION_NAMES = ("mount_tilt", "mount_roll", "sample_offset1", "sample_offset2", "sample_offset3")
 
@@ -563,7 +566,8 @@ def refine_stacked_arm(
     if reject_outliers is not None:
         for _ in range(2):
             r = predicted(res.x, [np.ones(len(f.rows), dtype=bool) for f in frames])
-            cut = float(reject_outliers) * 1.4826 * float(np.median(np.abs(r - np.median(r))))
+            cut = max(_MIN_OUTLIER_CUT_Q,
+                      float(reject_outliers) * 1.4826 * float(np.median(np.abs(r - np.median(r)))))
             split = np.cumsum([len(f.rows) for f in frames])[:-1]
             keep = [np.abs(part) <= cut for part in np.split(r, split)]
             rejected = int(sum((~k).sum() for k in keep))
