@@ -2727,8 +2727,11 @@ def test_standard_then_grazing_run_can_exceed_memory_target(
     assert "[MEMORY-TARGET]" in caplog.text
 
 
-@pytest.mark.parametrize("unit", ("chi_deg", "q_A^-1"))
-def test_poisson_chi_profile_runs_and_saves_no_sigma(tmp_path, unit):
+@pytest.mark.parametrize(("output", "has_sigma"), (
+    ("q", True), ("chi", False), ("gi:q_total", True), ("gi:q_ip", False),
+    ("gi:q_oop", False), ("gi:exit_angle", False), ("gi:chi_gi", False),
+))
+def test_poisson_1d_outputs_without_sigma_run_and_save_none(tmp_path, output, has_sigma):
     from xrd_tools.io import FrameViewReader
 
     for label in range(1, 4):
@@ -2737,9 +2740,13 @@ def test_poisson_chi_profile_runs_and_saves_no_sigma(tmp_path, unit):
     write_poni(poni)
     intent = _intent(tmp_path / "frame_0001.tif", tmp_path / "out.nexus", poni)
     intent.bai_1d_args = {"npt": 64, "method": "csr", "error_model": "poisson"}
-    if unit == "chi_deg":
+    if output == "chi":
         # pyFAI integrates the chi profile without variance.
         intent.bai_1d_args.update(unit="chi_deg", radial_range=(0.5, 2.0))
+    elif output.startswith("gi:"):
+        intent.gi.enabled = True
+        intent.gi.th_val = 0.2
+        intent.gi.mode_1d = output[3:]
     executor = StandardRunExecutor(join_timeout=5.0)
     identity = _start(executor, intent, request_value=1795)
     try:
@@ -2753,7 +2760,7 @@ def test_poisson_chi_profile_runs_and_saves_no_sigma(tmp_path, unit):
         assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
     with FrameViewReader(_written(Path(intent.save_path))) as reader:
         view = reader.read(reader.labels()[0])
-        assert (view.sigma_1d is None) == (unit == "chi_deg")
+        assert (view.sigma_1d is not None) is has_sigma
 
 
 def test_post_g2_funded_staging_partial_grant_refuses_before_output_and_retries(

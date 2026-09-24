@@ -5595,6 +5595,21 @@ def standard_chi_profile(plan: ReductionPlan) -> bool:
     return plan.gi is None and p1 is not None and str(p1.unit or "").lower() == "chi_deg"
 
 
+def result_1d_has_sigma(plan: ReductionPlan) -> bool:
+    """Whether the 1-D result carries sigma.
+
+    Only pyFAI's standard radial integration and the grazing-incidence total-q
+    profile propagate an error model; the χ profile and the other
+    grazing-incidence 1-D modes return no sigma.
+    """
+    p1 = plan.integration_1d
+    if p1 is None or p1.error_model is None:
+        return False
+    if plan.gi is None:
+        return not standard_chi_profile(plan)
+    return plan.gi.mode_1d is GI1DMode.Q_TOTAL
+
+
 def _reduce_frame(
     frame: Frame,
     raw_image: np.ndarray | None,
@@ -5836,6 +5851,10 @@ def _reduce_frame(
         )
         if r2d is not None and plan.integration_2d.azimuth_offset:
             r2d.azimuthal = r2d.azimuthal + float(plan.integration_2d.azimuth_offset)
+
+    # Publication reserves sigma by the same rule; never hand it an extra one.
+    if r1d is not None and r1d.sigma is not None and not result_1d_has_sigma(plan):
+        r1d.sigma = None
 
     # D7 loud: a 2D integration with no usable data (all-dummy) would persist
     # nothing meaningful.  Under a loud policy RAISE (the streaming writer

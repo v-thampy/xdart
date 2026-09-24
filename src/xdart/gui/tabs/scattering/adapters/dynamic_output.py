@@ -31,7 +31,7 @@ from xrd_tools.reduction import (
     NexusSink,
     TransactionalXYESink,
 )
-from xrd_tools.reduction.core import standard_chi_profile
+from xrd_tools.reduction.core import result_1d_has_sigma
 from xrd_tools.session import (
     DynamicAccountingLimits,
     DynamicFrameIdentity,
@@ -496,9 +496,8 @@ def _light_policy_layout(
         tuple(
             Light1DModeLayout(
                 mode, buffer(mode, "coordinate"), buffer(mode, "intensity"),
-                # The standard χ profile has no sigma even with an error model.
-                (buffer(mode, "uncertainty")
-                 if one_d.error_model and not standard_chi_profile(plan) else None),
+                # Only some 1-D outputs carry sigma under an error model.
+                buffer(mode, "uncertainty") if result_1d_has_sigma(plan) else None,
             )
             for mode in modes
         ),
