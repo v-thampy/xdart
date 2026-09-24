@@ -787,3 +787,29 @@ def test_directory_last_saved_before_frame(monkeypatch, tmp_path: Path) -> None:
         FrameBackgroundPlan(mode="BG Directory", locator=str(frames), filename_filter="dark",
                             match_rule="Last Saved Before Frame"), _fact(second))
     np.testing.assert_array_equal(filtered.background, np.full((2, 2), 4.0))
+
+
+def test_the_dark_comes_off_the_background_before_scale_and_normalization(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """With a dark (and "BG dark-corrected" unticked) the frame loses
+    factor · (Background − dark), factor = Scale × monitor ratio."""
+    from xrd_tools.reduction import Frame, ReductionPlan
+    from xrd_tools.reduction import background as module
+    from xrd_tools.reduction.core import _dark_corrected_background
+
+    source, target = _files(tmp_path, ("background.tif", "target.tif"))
+    sidecar = source.with_suffix(".txt"); sidecar.write_text("monitor=2")
+    _decoder(monkeypatch, {source.name: np.full((2, 2), 30.0)})
+    monkeypatch.setattr(module, "read_image_metadata_observed",
+                        lambda *_args, **_kwargs: ImageMetadataRead({"monitor": 2.0}, sidecar))
+    plan = FrameBackgroundPlan(mode="Single BG File", locator=str(source), scale=1.5,
+                               normalization_key="monitor", metadata_format="txt")
+    result = resolve_frame_background(
+        plan, _fact(target, metadata=(("monitor", ("number", float(4.0).hex())),)))
+    assert result.disposition == "RESOLVED" and result.scale == 3.0  # 1.5 × 4 / 2
+    np.testing.assert_array_equal(result.background, np.full((2, 2), 90.0))
+    frame = Frame(0, image=np.zeros((2, 2)), metadata={}, background=result.background,
+                  background_scale=result.scale)
+    corrected = _dark_corrected_background(frame, ReductionPlan(dark=np.full((2, 2), 10.0)))
+    np.testing.assert_array_equal(corrected, np.full((2, 2), 60.0))  # 3 × (30 − 10)
