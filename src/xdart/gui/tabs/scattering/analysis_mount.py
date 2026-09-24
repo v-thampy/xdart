@@ -284,7 +284,8 @@ class MetadataResultDialog(QtWidgets.QDialog):
         rows = [positions[label] for label in selected]
         self.table.setColumnCount(len(columns)); self.table.setRowCount(len(rows))
         self.table.setHorizontalHeaderLabels([column.name for column in columns])
-        self.table.setVerticalHeaderLabels([str(label) for label in (selected if row_labels is None else row_labels)])
+        if selected_labels is not None or row_labels is not None:
+            self.table.setVerticalHeaderLabels([str(label) for label in (selected if row_labels is None else row_labels)])
         for col, column in enumerate(columns):
             values = column.numeric if column.numeric is not None else column.text
             for row, index in enumerate(() if values is None else rows):

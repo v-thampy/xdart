@@ -57,6 +57,22 @@ def test_native_named_multiple_groups_and_invalid_names(tmp_path):
             prepare_stitch_tool(replace(form, output_families=names))
 
 
+@pytest.mark.parametrize("name, code", [(None, "OUTPUT_FAMILY_COLLISION"),
+                                       ("combined", "OUTPUT_FAMILY_COUNT_MISMATCH")])
+def test_native_naming_refusal_explains_skipped_group_members(tmp_path, name, code):
+    from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
+    form = replace(_native_form(tmp_path, "multigeometry", scans="1,[1,3]"), output_family=name)
+    with pytest.raises(StitchToolPreflightRefused, match=code) as refused:
+        prepare_stitch_tool(form)
+    assert "Skipped" in str(refused.value)
+    assert "source/sample · scan 3.1" in str(refused.value)
+    assert "No detector images" in str(refused.value)
+    prepared = prepare_stitch_tool(replace(form, output_family=None,
+                                          output_families=("single", "combined")))
+    assert len(prepared.requests) == 2
+    assert prepared.skipped[0][1:] == ("3.1", "No detector images")
+
+
 def test_native_refused_preview_does_not_create_save_path(tmp_path):
     from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
     form = replace(_native_form(tmp_path, "multigeometry", scans="[1,2]"),

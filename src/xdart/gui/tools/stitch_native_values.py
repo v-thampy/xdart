@@ -29,12 +29,21 @@ def _combined(group):
                 for spec in group}) > 1
 
 
-def _families(form, groups, project):
+def _families(form, resolution, project):
     """Readable slots are independent of frame subsets and processing settings."""
     from .stitch_values import StitchToolPreflightRefused
+    groups = resolution.groups
+
+    def refused(code, message):
+        if resolution.skipped:
+            skipped = "; ".join(f"{Path(path).relative_to(project)} · scan {scan}: {reason}"
+                                for path, scan, reason in resolution.skipped)
+            message += f". Skipped scans: {skipped}"
+        return StitchToolPreflightRefused(code, message)
+
     explicit = list(form.output_families or ("",) * len(groups))
     if len(explicit) != len(groups):
-        raise StitchToolPreflightRefused("OUTPUT_FAMILY_COUNT_MISMATCH",
+        raise refused("OUTPUT_FAMILY_COUNT_MISMATCH",
             "Enter one result name per output, separated by ; (blank names use single-source defaults)")
     if form.output_family:
         combined = [i for i, group in enumerate(groups) if _combined(group)]
@@ -43,13 +52,13 @@ def _families(form, groups, project):
         elif len(combined) == 1:
             explicit[combined[0]] = form.output_family
         else:
-            raise StitchToolPreflightRefused("OUTPUT_FAMILY_COUNT_MISMATCH",
+            raise refused("OUTPUT_FAMILY_COUNT_MISMATCH",
                 "For multiple outputs, enter result names in output order separated by ;")
     families, seen = [], set()
     for index, (group, name) in enumerate(zip(groups, explicit), 1):
         if not name:
             if _combined(group):
-                raise StitchToolPreflightRefused("OUTPUT_FAMILY_REQUIRED",
+                raise refused("OUTPUT_FAMILY_REQUIRED",
                     f"Output {index} combines sources; enter an explicit result name")
             spec = group[0]
             relative = Path(spec.uri).resolve().relative_to(project)
@@ -59,10 +68,10 @@ def _families(form, groups, project):
             if "scan" in spec.options:
                 name += "-" + str(spec.options["scan"]).removesuffix(".1")
         if not is_artifact_family(name):
-            raise StitchToolPreflightRefused("OUTPUT_FAMILY_INVALID",
+            raise refused("OUTPUT_FAMILY_INVALID",
                 f"Output {index} name {name!r} is invalid; choose a readable name of at most 80 characters")
         if name.casefold() in seen:
-            raise StitchToolPreflightRefused("OUTPUT_FAMILY_COLLISION",
+            raise refused("OUTPUT_FAMILY_COLLISION",
                 f"Multiple outputs use {name!r}; choose distinct result names")
         seen.add(name.casefold())
         families.append(name)
@@ -107,7 +116,7 @@ def prepare_native_stitch_tool(form, project):
     if not resolution.groups:
         return StitchToolPreflight(form, None, None, _PREFLIGHT_FACTORY,
                                    requests=(), skipped=resolution.skipped)
-    families = _families(form, resolution.groups, project)
+    families = _families(form, resolution, project)
     common = dict(npt_1d=form.npt_1d, unit=form.unit, radial_range=form.q_range,
                   monitor_selector=form.monitor_selector, max_frame_bytes=form.max_frame_bytes,
                   native_records=True, conditioning=form.conditioning, mask_path=form.mask_path)

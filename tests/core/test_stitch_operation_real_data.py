@@ -264,7 +264,8 @@ def test_scan14_native_records_preserve_legacy_science_and_raw_links(
         legacy.module.source, native_output, native_plan, project_root=project,
     )
     assert [item.label for item in native.manifest.contributions] == list(labels)
-    assert len(native.provenance["frame_members"]) == 16
+    binding = native.provenance["frame_members"]
+    assert (binding["version"], binding["count"]) == (1, 16)
     for request in (legacy, native):
         result = run_stitch_operation(request)
         assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal

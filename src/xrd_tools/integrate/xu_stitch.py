@@ -821,6 +821,9 @@ def run_xu_hist_stitch_1d(
     Legacy q_min/q_max calls and an absent conditioning policy retain the
     canonical input-reader behavior. ``mask`` is already in calibrated image
     coordinates and is combined with, never substituted for, the detector mask.
+    The caller must supply frames already oriented by the calibration asset's
+    ``image_rotation_quarter_turns``. This kernel does not rotate them;
+    ``StitchOperationExecution`` applies the rotation for native plans.
     ``frame_record_callback`` borrows each raw frame before conditioning.
     """
     if type(receipt) is not XuStitchCalibrationReceipt:
