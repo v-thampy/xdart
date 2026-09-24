@@ -3223,6 +3223,30 @@ def test_admission_refuses_a_flat_or_dark_of_the_wrong_size(tmp_path, role):
         executor.cancel_admission(token)
 
 
+@pytest.mark.parametrize("role", ("flat_file", "dark_file"))
+def test_admission_refuses_a_flat_or_dark_usable_only_in_detector_gaps(tmp_path, role):
+    from pyFAI.detectors import detector_factory
+
+    shape = (195, 1475)  # a Pilatus 300K-W: 2,730 pixels in its module gaps
+    fabio.tifimage.TifImage(data=np.full(shape, 5, dtype=np.uint16)).write(
+        str(tmp_path / "frame_0001.tif"))
+    poni = tmp_path / "cal.poni"
+    poni.write_text(
+        "poni_version: 2\nDetector: Pilatus300kw\nDetector_config: {}\n"
+        "Distance: 0.1234\nPoni1: 0.01\nPoni2: 0.06\n"
+        "Rot1: 0.0\nRot2: 0.0\nRot3: 0.0\nWavelength: 1.0e-10\n")
+    gaps = detector_factory("Pilatus300kw").mask.astype(bool)
+    image = np.where(gaps, 1.0, 0.0) if role == "flat_file" else np.where(gaps, 5.0, np.nan)
+    np.save(tmp_path / "correction.npy", image)
+    intent = _intent(tmp_path / "frame_0001.tif", tmp_path / "out.nexus", poni)
+    setattr(intent, role, str(tmp_path / "correction.npy"))
+    executor = StandardRunExecutor()
+    admission, _capture, token = _admit(executor, intent, request_value=1820 + (role == "dark_file"))
+    try:
+        assert type(admission) is AdmissionFailure, admission
+        assert "no usable detector pixel" in admission.reason
+    finally:
+        executor.cancel_admission(token)
 def test_flat_cutoff_masks_the_flat_warns_and_reintegrates(tmp_path):
     from xrd_tools.io import get_1d
     from xrd_tools.io.finite_artifact import _snapshot_path

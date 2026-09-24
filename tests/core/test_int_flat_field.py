@@ -173,6 +173,10 @@ def test_check_detector_image_reports_errors_and_warnings():
     dark = np.full((10, 20), 5.0)
     dark[:2] = np.nan
     assert "not finite" in check_detector_image(dark, "dark").warnings[0]
+    # usable only where the detector masks itself: nothing is left to integrate
+    for image, role in ((np.where(gaps, 1.0, 0.0), "flat"), (np.where(gaps, 5.0, np.nan), "dark")):
+        check = check_detector_image(image, role, detector_mask=gaps)
+        assert check.errors and "no usable detector pixel" in check.errors[0], check
 
 
 def test_average_applies_the_flat_cutoff(tmp_path):

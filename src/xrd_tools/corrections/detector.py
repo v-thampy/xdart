@@ -201,7 +201,8 @@ def check_detector_image(
     Check a dark (``role="dark"``) or flat field (``role="flat"``) before a run.
 
     Errors make the image unusable: it is not one 2-D image, its shape differs
-    from the detector's, or no pixel is usable. Warnings flag a usable but
+    from the detector's, or it leaves no pixel usable that the detector itself
+    does not mask. Warnings flag a usable but
     suspicious image: a flat whose median is far from 1 (pyFAI divides by the
     flat as given, so every intensity scales by its inverse), or an image that
     masks more than 1 % of the pixels the detector itself leaves usable.
@@ -248,7 +249,11 @@ def check_detector_image(
     if detector_mask is not None and np.shape(detector_mask) == shape:
         usable = ~np.asarray(detector_mask, dtype=bool)
     count = int(usable.sum())
-    fraction = int((np.isnan(prepared) & usable).sum()) / count if count else 0.0
+    masked = int((np.isnan(prepared) & usable).sum())
+    if masked == count:  # usable only where the detector masks itself
+        return DetectorImageCheck(role, shape, masked_fraction=1.0, errors=(
+            f"the {name} leaves no usable detector pixel",))
+    fraction = masked / count
     median = None
     warnings = []
     if role == "flat":
