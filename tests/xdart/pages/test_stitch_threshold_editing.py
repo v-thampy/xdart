@@ -24,7 +24,7 @@ from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent, ThresholdIntent
 from xrd_tools.sources.selection import image_series_spec
-from tests.xdart.pages.test_stitch_page import _Status, _form, _wait, qapp
+from tests.xdart.pages.test_stitch_page import _Status, _wait, qapp
 from tests.xdart.tools.test_stitch_native_values import _native_form
 
 
