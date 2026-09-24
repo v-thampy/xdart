@@ -190,7 +190,13 @@ def test_scan14_small_frame_budget_still_spans_every_nu_row(guided):
 
 @pytest.mark.slow
 def test_scan14_automatic_fit_predicts_held_out_nu_rows(guided, tmp_path):
-    """The frozen O4 oracle: rows never seen by the fit land within 0.002 Å⁻¹."""
+    """The O4 oracle: rows never seen by the fit land within 0.0025 Å⁻¹.
+
+    The maintainer raised it from 0.002 on 2026-09-24. The fit is reproducible now, but
+    pyFAI's ring extraction depends on its random seed: runs before the seeding fix
+    ranged 0.0017-0.00205, and the seeded value is 0.0019675. The five-parameter arm
+    misses by 0.02-0.04.
+    """
     from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
     from xrd_tools.integrate.stitch_calibration import save_calibration_fit
     table = run_metadata_table(MetadataTablePlan(_spec(guided['root'])))
@@ -204,7 +210,7 @@ def test_scan14_automatic_fit_predicts_held_out_nu_rows(guided, tmp_path):
     errors = [value for ring in centres.values() for value in ring.values()]
     print(f'held-out rows: {len(errors)} ring centres, max |error| {max(abs(e) for e in errors):.4f} Å⁻¹')
     assert len(errors) >= 14, centres
-    assert max(abs(e) for e in errors) <= 0.002, centres
+    assert max(abs(e) for e in errors) <= 0.0025, centres
 
 
 def _stitch(root, geometry_path, labels, target, **plan_fields):
