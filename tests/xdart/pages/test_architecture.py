@@ -37,7 +37,6 @@ import xdart.gui.pages.services
 for name in (
     'xdart.gui.tabs.scattering',
     'xdart.gui.tabs.scattering.page',
-    'xdart.gui.tools.stitch_tool',
     'xdart.gui.tools.stitch_owner',
     'xdart.gui.tools.rsm_tool',
     'xdart.gui.tools.rsm_owner',
@@ -150,7 +149,7 @@ def test_catalog_is_the_only_builtin_registration_point():
     assert "STATIC_SCAN_PAGE_KEY" not in catalog
     assert "build_legacy_static" not in catalog
     assert catalog.count("PageDescriptor(") == 2
-    assert catalog.count("ToolDescriptor(") == 2
+    assert catalog.count("ToolDescriptor(") == 1  # RSM; the old Stitch dialog was retired
     assert "BUILTIN_PAGES" in catalog
     assert "BUILTIN_DESCRIPTORS" in catalog
     assert "BUILTIN_DESCRIPTORS" in main

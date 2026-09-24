@@ -12,7 +12,9 @@ from pyqtgraph.Qt import QtWidgets
 from xdart.gui.pages.services import empty_host_services
 from xdart.gui.pages.values import PageCleanup
 from xdart.gui.tabs.stitch.page import StitchPage
-from xdart.gui.tools.stitch_values import StitchFrameSelector, StitchToolForm, prepare_stitch_tool
+from xdart.gui.tools.stitch_values import (
+    StitchFrameSelector, StitchSourceSelection, StitchToolForm, prepare_stitch_tool,
+)
 from xrd_tools.analysis.module_transaction import ModuleDisposition
 from xrd_tools.analysis.stitch_operation import StitchGeometryKind, run_stitch_operation
 from xrd_tools.analysis.xu_stitch_calibration import canonical_surface_resource_bytes
@@ -74,14 +76,15 @@ def _form(tmp_path, backend):
     )
 
 
-def _fill(page, form):
-    page.load_form(form)
-    assert page.build_form().fingerprint == form.fingerprint
+def _as_native(form, scans="1"):
+    """The same synthetic source as a native one-scan Spec selection."""
+    return replace(form, source_selection=StitchSourceSelection(
+        "Spec", (str(form.spec_path),), scans=scans, image_dir=str(form.image_dir),
+        image_stem=form.image_stem), q_range=None, conditioning=StitchConditioning("auto"))
 
 
 def _fill_native(page, form):
-    page.load_form(form)
-    page._native_mode = True
+    page.load_form(_as_native(form))
     page.set_field("output_path", str(Path(form.output_path).parent))
     page.set_sources((form.spec_path,))
     page.set_field("radial_auto", True)
@@ -277,20 +280,24 @@ def test_native_saved_frame_popup_keeps_curve_and_shows_thumbnail_fallback(qapp,
 
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
 def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_path, backend):
-    form = _form(tmp_path, backend)
-    reference_form = replace(form, output_path=tmp_path / "output" / "reference.nexus")
-    reference = run_stitch_operation(prepare_stitch_tool(reference_form).request)
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    form = _native_form(tmp_path, backend, scans="1")
+    (tmp_path / "reference").mkdir()
+    reference_request = prepare_stitch_tool(
+        replace(form, output_path=tmp_path / "reference" / "reference_stitch1d.nexus")).request
+    reference = run_stitch_operation(reference_request)
     assert reference.terminal.disposition is ModuleDisposition.COMMITTED
     page = StitchPage(empty_host_services(_Status()))
     reopened = None
     try:
-        _fill(page, form)
+        page.load_form(form)
         page.preview_button.click()
         _wait(page, qapp)
         assert page.run_bar.startButton.isEnabled(), page.run_bar.readinessLabel.full_text()
+        target = Path(page._owner.prepared.request.module.output.target)
         page.run_bar.startButton.click()
         _wait(page, qapp)
-        payload = read_analysis_artifact(form.output_path, expected_kind=AnalysisArtifactKind.STITCH_1D)
+        payload = read_analysis_artifact(target, expected_kind=AnalysisArtifactKind.STITCH_1D)
         for name in ("intensity", "coverage", "normalization"):
             np.testing.assert_array_equal(getattr(payload, name), getattr(reference.payload, name))
         np.testing.assert_array_equal(page.curve.listDataItems()[0].xData, payload.axis("q"))
@@ -305,20 +312,20 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
         _wait(page, qapp)
         page.begin_run()
         _wait(page, qapp)
-        replacement = read_analysis_artifact(form.output_path)
+        replacement = read_analysis_artifact(target)
         assert replacement.intensity.shape == (80,)
         assert page.results.count() == 1
         assert page.shutdown().status is PageCleanup.CLEAN
         (tmp_path / "source").rename(tmp_path / "source-unavailable")
 
         reopened = StitchPage(empty_host_services(_Status()))
-        reopened.open_result(form.output_path)
+        reopened.open_result(target)
         _wait(reopened, qapp)
         assert reopened._owner.form is None
         assert reopened._owner.prepared is None
         assert not reopened.run_bar.startButton.isEnabled()
         np.testing.assert_array_equal(reopened.curve.listDataItems()[0].yData, replacement.intensity)
-        reopened.open_result(reference_form.output_path)
+        reopened.open_result(reference_request.module.output.target)
         _wait(reopened, qapp)
         reopened.display_mode.setCurrentText("Overlay")
         reopened.results.selectAll()

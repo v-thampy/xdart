@@ -20,12 +20,6 @@ def _build_scattering_workspace(services, parent):
     return build_scattering_workspace(services, parent)
 
 
-def _build_stitch_tool(services, parent):
-    from xdart.gui.tools.stitch_tool import build_stitch_tool
-
-    return build_stitch_tool(services, parent)
-
-
 def _build_stitch_page(services, parent):
     from .stitch_workspace import build_stitch_workspace
     return build_stitch_workspace(services, parent)
@@ -73,18 +67,6 @@ STITCH_PAGE = PageDescriptor(
 )
 
 BUILTIN_PAGES = (SCATTERING_WORKSPACE_PAGE, STITCH_PAGE)
-
-# Processing tools are launched through the workspace mode selector and Run.
-STITCH_TOOL = ToolDescriptor(
-    key=STITCH_TOOL_KEY,
-    label="Stitching",
-    description="Combine an exact scan selection into one stitched pattern",
-    icon_key="stitch",
-    category="analysis",
-    order=100,
-    build=_build_stitch_tool,
-    tool_kind="processing",
-)
 
 RSM_TOOL = ToolDescriptor(
     key=RSM_TOOL_KEY,

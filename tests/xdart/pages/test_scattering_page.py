@@ -26,7 +26,6 @@ from xdart.gui.pages.catalog import (
     DEFAULT_PAGE_KEY,
     RSM_TOOL,
     SCATTERING_WORKSPACE_PAGE,
-    STITCH_TOOL,
     STITCH_PAGE,
 )
 from xdart.gui.pages.registry import PageRegistry
@@ -67,13 +66,7 @@ def test_catalog_registers_current_workspace_first_and_as_default():
     assert DEFAULT_PAGE_KEY == "scattering-workspace"
     assert BUILTIN_PAGES[0] is SCATTERING_WORKSPACE_PAGE
     assert BUILTIN_DESCRIPTORS == (*BUILTIN_PAGES, RSM_TOOL)
-    assert STITCH_TOOL.key == STITCH_TOOL_KEY == "stitch"
-    assert (
-        STITCH_TOOL.label,
-        STITCH_TOOL.category,
-        STITCH_TOOL.order,
-        STITCH_TOOL.tool_kind,
-    ) == ("Stitching", "analysis", 100, "processing")
+    assert STITCH_PAGE.key == STITCH_TOOL_KEY == "stitch"
     assert RSM_TOOL.key == RSM_TOOL_KEY == "rsm"
     assert (
         RSM_TOOL.label,
@@ -144,7 +137,7 @@ def test_builtin_stitch_selection_retains_native_page_and_integration_workspace(
 
     window = _mounted_host(None)
     try:
-        assert STITCH_TOOL.key not in window._tool_handles
+        assert STITCH_TOOL_KEY not in window._tool_handles
         assert window.ui.menuAnalysis is None
         page = window.page_handle.widget
         assert page.findChild(QtWidgets.QToolButton, "analysisMenuButton") is None
@@ -180,10 +173,10 @@ def test_builtin_stitch_selection_retains_native_page_and_integration_workspace(
         qapp.processEvents()
         assert requested == ["stitch", "stitch"]
         assert handle.activity.active() is False
-        assert window.open_tool(STITCH_TOOL.key) == ActionCompleted("stitch")
+        assert window.open_tool(STITCH_TOOL_KEY) == ActionCompleted("stitch")
         assert window._page_handles[STITCH_PAGE.key] is handle
         assert handle.widget._value("scan") == "14"
-        assert STITCH_TOOL.key not in window._tool_handles
+        assert STITCH_TOOL_KEY not in window._tool_handles
         assert RSM_TOOL.key not in window._tool_handles
     finally:
         window.close()
@@ -245,7 +238,7 @@ def test_builtin_rsm_action_constructs_one_idle_tool_only_when_opened(
         assert window._tool_handles[RSM_TOOL.key].widget is dialog
         assert window.main_widget is page_widget
         assert window.selected_page_key == selected_page_key
-        assert STITCH_TOOL.key not in window._tool_handles
+        assert STITCH_TOOL_KEY not in window._tool_handles
     finally:
         window.close()
         window.deleteLater()

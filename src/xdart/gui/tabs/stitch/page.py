@@ -12,6 +12,8 @@ from pathlib import Path
 import json
 import time
 
+import re
+
 import numpy as np
 
 import pyqtgraph as pg
@@ -29,7 +31,6 @@ from xdart.gui.tools.stitch_owner import (
     StitchOwnerAction, StitchOwnerFinalization, StitchOwnerOutcomeKind,
     StitchToolOwner,
 )
-from xdart.gui.tools.stitch_tool import StitchToolDialog
 from xdart.gui.tools.stitch_values import StitchFrameSelector, StitchToolForm
 from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow, RangeRow, SubsectionCard
 from xdart.gui.widgets.run_controls import RunControlsBar
@@ -53,6 +54,27 @@ from xrd_tools.session.threshold_editing import (
 _FRAME_CHECKS = {"Exclude empty frames": "empty", "Exclude empty and partial frames": "partial",
                  "Keep all frames": "none"}
 _SAMPLE_POSITIONS = {"As calibrated": "calibrated", "On rotation axis": "rotation_axis"}
+
+
+_PAIR_SEPARATOR = re.compile(r"[,;\n]+")
+
+
+def _parse_pairs(text):
+    """``name=value`` entries separated by commas, semicolons or lines, sorted."""
+    pairs = []
+    for token in _PAIR_SEPARATOR.split(str(text)):
+        token = token.strip()
+        if not token:
+            continue
+        left, separator, right = token.partition("=")
+        if not separator or not left.strip() or not right.strip():
+            raise ValueError("mapping entries must use name=value")
+        pairs.append((left.strip(), right.strip()))
+    return tuple(sorted(pairs))
+
+
+def _parse_references(text):
+    return tuple((name, float(value)) for name, value in _parse_pairs(text))
 
 
 def _choice(choices, value):
@@ -99,7 +121,6 @@ class StitchPage(QtWidgets.QWidget):
         self.setObjectName("stitchPage")
         self._services = services
         self._owner = StitchToolOwner()
-        self._native_mode = True
         self._source_paths = ()
         self._paths_by_kind = {}
         self._range_rows = []
@@ -584,32 +605,21 @@ class StitchPage(QtWidgets.QWidget):
         if not xu and not str(self._value("image_rotation")).strip():
             self.set_field("image_rotation", "0")
         self.set_field("q_max", "5.2" if xu else "6.2")
-        if xu and not self._native_mode:
-            for key, value in (
-                ("geometry_kind", "Goniometer JSON"), ("poni_references", ""),
-                ("detector_rows", "195"), ("detector_cols", "1475"),
-                ("raw_dtype", "int32"), ("raw_header_skip", "0"),
-                ("image_rotation", "0"), ("threshold", "800000"),
-            ):
-                self.set_field(key, value)
         self._refresh_xu_geometry()
         self._sync_actions()
 
     def _sync_advanced(self):
-        """Advanced options apply to native Stitch only. XU always applies its solid
-        angle and has no uncertainty or sample-position model; polarization, dark,
-        flat and the frame check apply to both backends."""
-        native = self._native_mode
+        """XU always applies its solid angle and has no uncertainty or sample-position
+        model; polarization, dark, flat and the frame check apply to both backends."""
         xu = self._value("backend") == "xrayutilities histogram"
-        self.corrections_card.setEnabled(native)
-        for key, enabled in (("frame_check", native), ("sample_position", native and not xu),
-                             ("solid_angle", native and not xu), ("error_model", native and not xu)):
+        for key, enabled in (("frame_check", True), ("sample_position", not xu),
+                             ("solid_angle", not xu), ("error_model", not xu)):
             self._fields[key] = replace(self._fields[key], enabled=enabled)
             self._rows[key].apply_field(self._fields[key])
 
     def _refresh_xu_geometry(self, *_args, calibration=None):
         """Present asset-owned settings through the existing strict admission owner."""
-        if not self._native_mode or self._value("backend") != "xrayutilities histogram":
+        if self._value("backend") != "xrayutilities histogram":
             return
         from xrd_tools.analysis.xu_stitch_calibration import (
             XuStitchCalibrationInput, capture_xu_stitch_calibration,
@@ -655,63 +665,61 @@ class StitchPage(QtWidgets.QWidget):
         kind = (StitchGeometryKind.PYFAI_GONIOMETER_JSON if value("geometry_kind") == "Goniometer JSON"
                 else StitchGeometryKind.PONI)
         monitor = str(value("monitor")).strip()
-        native = {}
+        selection = StitchSourceSelection(value("source_kind"), self._source_paths,
+            scans=str(value("scan")), stitch_all=value("scan_mode") == "Stitch All",
+            image_dir=str(value("image_dir")), image_stem=str(value("image_stem")))
+        conditioning = StitchConditioning(self._threshold_mode,
+            value("threshold_min") if self._threshold_mode == "manual" else None,
+            value("threshold") if self._threshold_mode == "manual" else None)
+        native = dict(source_selection=selection,
+            unit="q_A^-1" if value("unit") == "Q (Å⁻¹)" else "2th_deg",
+            conditioning=conditioning, mask_path=str(value("mask_path")) or None,
+            output_family=str(value("output_family")).strip() or None,
+            frame_screen=_FRAME_CHECKS[value("frame_check")])
+        polarization = str(value("polarization")).strip()
+        try:
+            factor = float(polarization) if polarization else None
+        except ValueError as error:
+            raise ValueError("Polarization must be a number from -1 to 1, or blank") from error
+        cutoff = str(value("flat_cutoff")).strip()
+        try:
+            fraction = float(cutoff) / 100.0 if cutoff else 0.1
+        except ValueError as error:
+            raise ValueError("Flat cutoff must be a percentage from 0 to below 100") from error
+        native.update(polarization_factor=factor,
+                      dark_path=str(value("dark_path")).strip() or None,
+                      flat_path=str(value("flat_path")).strip() or None,
+                      flat_min_fraction=fraction)
+        if value("backend") != "xrayutilities histogram":
+            native.update(
+                sample_position=_SAMPLE_POSITIONS[value("sample_position")],
+                correct_solid_angle=value("solid_angle") == "On",
+                error_model="poisson" if value("error_model") == "Poisson" else None)
+        if ";" in str(value("output_family")):
+            native.update(output_family=None,
+                output_families=tuple(part.strip() for part in str(value("output_family")).split(";")))
         output = str(value("output_path"))
-        if self._native_mode:
-            selection = StitchSourceSelection(value("source_kind"), self._source_paths,
-                scans=str(value("scan")), stitch_all=value("scan_mode") == "Stitch All",
-                image_dir=str(value("image_dir")), image_stem=str(value("image_stem")))
-            conditioning = StitchConditioning(self._threshold_mode,
-                value("threshold_min") if self._threshold_mode == "manual" else None,
-                value("threshold") if self._threshold_mode == "manual" else None)
-            native = dict(source_selection=selection,
-                unit="q_A^-1" if value("unit") == "Q (Å⁻¹)" else "2th_deg",
-                conditioning=conditioning, mask_path=str(value("mask_path")) or None,
-                output_family=str(value("output_family")).strip() or None,
-                frame_screen=_FRAME_CHECKS[value("frame_check")])
-            polarization = str(value("polarization")).strip()
-            try:
-                factor = float(polarization) if polarization else None
-            except ValueError as error:
-                raise ValueError("Polarization must be a number from -1 to 1, or blank") from error
-            cutoff = str(value("flat_cutoff")).strip()
-            try:
-                fraction = float(cutoff) / 100.0 if cutoff else 0.1
-            except ValueError as error:
-                raise ValueError("Flat cutoff must be a percentage from 0 to below 100") from error
-            native.update(polarization_factor=factor,
-                          dark_path=str(value("dark_path")).strip() or None,
-                          flat_path=str(value("flat_path")).strip() or None,
-                          flat_min_fraction=fraction)
-            if value("backend") != "xrayutilities histogram":
-                native.update(
-                    sample_position=_SAMPLE_POSITIONS[value("sample_position")],
-                    correct_solid_angle=value("solid_angle") == "On",
-                    error_model="poisson" if value("error_model") == "Poisson" else None)
-            if ";" in str(value("output_family")):
-                native.update(output_family=None,
-                    output_families=tuple(part.strip() for part in str(value("output_family")).split(";")))
-            if not output:
-                output = str(Path(value("project_root")) / "xdart_processed_data")
-            directory = Path(output)
-            if not directory.is_absolute():
-                directory = Path(value("project_root")) / directory
-            output = str(directory / "stitch_stitch1d.nexus")
+        if not output:
+            output = str(Path(value("project_root")) / "xdart_processed_data")
+        directory = Path(output)
+        if not directory.is_absolute():
+            directory = Path(value("project_root")) / directory
+        output = str(directory / "stitch_stitch1d.nexus")
         return StitchToolForm(
             project_root=value("project_root"),
-            spec_path=self._source_paths[0] if self._native_mode else value("spec_path"), scan=value("scan"),
-            image_dir=(value("image_dir") or value("project_root")) if self._native_mode else value("image_dir"), image_stem=value("image_stem"),
+            spec_path=self._source_paths[0], scan=value("scan"),
+            image_dir=value("image_dir") or value("project_root"), image_stem=value("image_stem"),
             detector_shape=(int(value("detector_rows")), int(value("detector_cols"))),
             raw_dtype=value("raw_dtype"), raw_header_skip=int(value("raw_header_skip")),
             frame_selector=StitchFrameSelector(int(value("frame_start")),
                 None if not str(value("frame_stop")).strip() else int(value("frame_stop")), int(value("frame_step"))),
             geometry_path=value("geometry_path"), geometry_kind=kind,
-            source_motors=StitchToolDialog._parse_pairs(value("source_motors")),
-            poni_references=(StitchToolDialog._parse_references(value("poni_references"))
+            source_motors=_parse_pairs(value("source_motors")),
+            poni_references=(_parse_references(value("poni_references"))
                              if kind is StitchGeometryKind.PONI else ()),
             image_rotation=int(value("image_rotation")),
             threshold=None if value("threshold") is None or not str(value("threshold")).strip() else float(value("threshold")),
-            q_range=None if self._native_mode and value("radial_auto") else (float(value("q_min")), float(value("q_max"))), npt_1d=int(value("npt_1d")),
+            q_range=None if value("radial_auto") else (float(value("q_min")), float(value("q_max"))), npt_1d=int(value("npt_1d")),
             output_path=output, monitor_selector=MetadataColumnSelector(monitor) if monitor else None,
             backend="xu_hist" if value("backend") == "xrayutilities histogram" else "multigeometry",
             max_frame_bytes=int(value("max_frame_mib")) * 1024 * 1024,
@@ -720,7 +728,8 @@ class StitchPage(QtWidgets.QWidget):
 
     def load_form(self, form):
         """Restore a prepared form, including native source and conditioning intent."""
-        self._native_mode = form.source_selection is not None
+        if form.source_selection is None:
+            raise ValueError("the Stitch page takes a native source selection")
         fields = {key: getattr(form, key) for key in (
             "project_root", "spec_path", "scan", "image_dir", "image_stem", "raw_dtype",
             "raw_header_skip", "geometry_path", "threshold", "npt_1d", "output_path")}
@@ -747,22 +756,21 @@ class StitchPage(QtWidgets.QWidget):
             fields.update(q_min=form.q_range[0], q_max=form.q_range[1])
         for key, value in fields.items():
             self.set_field(key, value)
-        if form.source_selection is not None:
-            selection = form.source_selection
-            self.set_field("source_kind", selection.kind)
-            self.set_sources(selection.paths)
-            self.set_field("scan_mode", "Stitch All" if selection.stitch_all else "Select Scans")
-            self.set_field("scan", selection.scans)
-            self.set_field("output_path", str(Path(form.output_path).parent))
-            self.set_field("image_dir", selection.image_dir)
-            self.set_field("image_stem", selection.image_stem)
-            policy = form.conditioning or StitchConditioning()
-            self._threshold_state = ThresholdState(policy.mode == "manual",
-                policy.threshold_min, policy.threshold_max, policy.mode == "auto")
-            for key, value in (("threshold_min", policy.threshold_min if policy.mode == "manual" else 0.),
-                               ("threshold", policy.threshold_max), ("threshold_enabled", policy.mode != "off")):
-                self._fields[key] = replace(self._fields[key], value=value)
-            self._render_ranges()
+        selection = form.source_selection
+        self.set_field("source_kind", selection.kind)
+        self.set_sources(selection.paths)
+        self.set_field("scan_mode", "Stitch All" if selection.stitch_all else "Select Scans")
+        self.set_field("scan", selection.scans)
+        self.set_field("output_path", str(Path(form.output_path).parent))
+        self.set_field("image_dir", selection.image_dir)
+        self.set_field("image_stem", selection.image_stem)
+        policy = form.conditioning or StitchConditioning()
+        self._threshold_state = ThresholdState(policy.mode == "manual",
+            policy.threshold_min, policy.threshold_max, policy.mode == "auto")
+        for key, value in (("threshold_min", policy.threshold_min if policy.mode == "manual" else 0.),
+                           ("threshold", policy.threshold_max), ("threshold_enabled", policy.mode != "off")):
+            self._fields[key] = replace(self._fields[key], value=value)
+        self._render_ranges()
         self._sync_advanced()
         self._refresh_xu_geometry()
 
@@ -872,34 +880,30 @@ class StitchPage(QtWidgets.QWidget):
                 return
             self._prepared_revision = self._revision
             preflight = outcome.preflight
-            if self._native_mode:
-                if preflight.requests and preflight.form.backend == "xu_hist":
-                    self._refresh_xu_geometry(calibration=preflight.requests[0].plan.calibration)
-                bounds = []
-                for members in preflight.preview_members:
-                    for member in members:
-                        dtype = np.dtype(member["source_snapshot"]["raw_dtype"])
-                        bounds.append(FilesystemSourceAdapter._threshold_max_for_dtype(dtype))
-                self._auto_threshold_max = bounds[0] if bounds and all(value == bounds[0] for value in bounds) else None
-                if not self._threshold_manual:
-                    self._fields["threshold"] = replace(self._fields["threshold"], value=self._auto_threshold_max)
-                    self._render_ranges()
-            if preflight.summary is not None:
-                StitchToolDialog._render_preflight(self, preflight.summary)
-            else:
-                lines = [f"{len(preflight.requests)} stitched outputs"]
-                if preflight.warnings:
-                    lines.extend(("\nWarnings", *preflight.warnings))
-                for index, request in enumerate(preflight.requests, 1):
-                    count = len(request.module.source.selected_labels)
-                    lines.append(f"\n{index}. {Path(request.module.output.target).name} · {count} frames")
-                    for member in preflight.preview_members[index - 1]:
-                        identity = member["identity"]
-                        lines.append(f"  {identity['scan_id']}-{identity['frame_index']} · {member['source_path']}")
-                if preflight.skipped:
-                    lines.append("\nSkipped scans")
-                    lines.extend(f"{Path(path).name} · scan {scan}: {reason}" for path, scan, reason in preflight.skipped)
-                self.preview_text.setPlainText("\n".join(lines))
+            if preflight.requests and preflight.form.backend == "xu_hist":
+                self._refresh_xu_geometry(calibration=preflight.requests[0].plan.calibration)
+            bounds = []
+            for members in preflight.preview_members:
+                for member in members:
+                    dtype = np.dtype(member["source_snapshot"]["raw_dtype"])
+                    bounds.append(FilesystemSourceAdapter._threshold_max_for_dtype(dtype))
+            self._auto_threshold_max = bounds[0] if bounds and all(value == bounds[0] for value in bounds) else None
+            if not self._threshold_manual:
+                self._fields["threshold"] = replace(self._fields["threshold"], value=self._auto_threshold_max)
+                self._render_ranges()
+            lines = [f"{len(preflight.requests)} stitched outputs"]
+            if preflight.warnings:
+                lines.extend(("\nWarnings", *preflight.warnings))
+            for index, request in enumerate(preflight.requests, 1):
+                count = len(request.module.source.selected_labels)
+                lines.append(f"\n{index}. {Path(request.module.output.target).name} · {count} frames")
+                for member in preflight.preview_members[index - 1]:
+                    identity = member["identity"]
+                    lines.append(f"  {identity['scan_id']}-{identity['frame_index']} · {member['source_path']}")
+            if preflight.skipped:
+                lines.append("\nSkipped scans")
+                lines.extend(f"{Path(path).name} · scan {scan}: {reason}" for path, scan, reason in preflight.skipped)
+            self.preview_text.setPlainText("\n".join(lines))
             self.preview_dialog.show()
             self._status(f"Ready · Stitch 1D · {len(preflight.requests)} outputs", ready=bool(preflight.requests))
         elif outcome.kind is StitchOwnerOutcomeKind.FRAME_READ:
@@ -1070,7 +1074,7 @@ class StitchPage(QtWidgets.QWidget):
                 self._authoring_dialogs.append(self._calibration_dialog)
             source = self._source_spec_for_tools()
             if source is not None:
-                motors = dict(StitchToolDialog._parse_pairs(self._value("source_motors") or "del=del, nu=nu"))
+                motors = dict(_parse_pairs(self._value("source_motors") or "del=del, nu=nu"))
                 self._calibration_dialog.set_source_context(source, image_rotation=int(self._value("image_rotation") or 0),
                     del_motor=motors.get("del_angle", motors.get("del", "del")),
                     nu_motor=motors.get("nu_angle", motors.get("nu", "nu")),
@@ -1286,8 +1290,6 @@ class StitchPage(QtWidgets.QWidget):
             row.setEnabled(idle)
         if self._value("backend") == "xrayutilities histogram":
             locked = ("geometry_kind", "source_motors", "poni_references", "image_rotation")
-            if not self._native_mode:
-                locked += ("detector_rows", "detector_cols", "raw_dtype", "raw_header_skip")
             for key in locked:
                 self._rows[key].setEnabled(False)
         elif self._value("geometry_kind") != "PONI + offsets":
