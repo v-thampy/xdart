@@ -512,6 +512,12 @@ class GeometryIntegratorSeries:
 
     calibration: Any
     rotations: tuple[tuple[float, float, float], ...]
+    #: Per-frame (dist, poni1, poni2) when the sample is off the rotation centre.
+    translations: tuple[tuple[float, float, float], ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.translations is not None and len(self.translations) != len(self.rotations):
+            raise ValueError("per-frame translations and rotations differ in length")
 
     def __len__(self) -> int:
         return len(self.rotations)
@@ -521,12 +527,15 @@ class GeometryIntegratorSeries:
             detector_calibration_to_integrator,
         )
 
-        for rot1, rot2, rot3 in self.rotations:
+        for index, (rot1, rot2, rot3) in enumerate(self.rotations):
+            position = {} if self.translations is None else dict(
+                zip(("dist", "poni1", "poni2"), self.translations[index]))
             yield detector_calibration_to_integrator(
                 self.calibration,
                 rot1=rot1,
                 rot2=rot2,
                 rot3=rot3,
+                **position,
             )
 
 
@@ -578,9 +587,10 @@ def create_multigeometry_integrator_series_from_geometry(
     if getattr(diffractometer, 'stacked_arm', None) is not None:
         if any(getattr(cal.poni, axis) != 0 for axis in ('rot1', 'rot2', 'rot3')):
             raise ValueError('stacked arm requires zero base PONI rotations')
-        values = diffractometer.stacked_arm.rotations(motors)
+        arm = diffractometer.stacked_arm
+        values = arm.rotations(motors)
         rotations = tuple(zip(values['rot1'], values['rot2'], values['rot3']))
-        return GeometryIntegratorSeries(cal, rotations)
+        return GeometryIntegratorSeries(cal, rotations, arm.translations(motors, cal.poni))
 
     # Compute ONLY the per-frame detector rotations (rot1/2/3) directly — a stitch
     # never needs the GI incidence, so a stitch scan that lacks the incidence motor

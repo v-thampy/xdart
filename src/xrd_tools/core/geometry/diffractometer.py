@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Literal, Mapping, Sequence
 import numpy as np
 
 from xrd_tools.core.containers import PONI
-from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
+from xrd_tools.core.geometry.stacked_arm import ARM_EXTENSION_FIELDS, StackedDetectorArm
 
 if TYPE_CHECKING:  # Only needed for type checkers; avoided at runtime.
     import xrayutilities as xu
@@ -805,10 +805,15 @@ class Diffractometer:
                     )
             return f0
 
-        # Base geometry (constant for a standard GeometryTransformation).
-        dist = _require_pos_independent("dist", trans["dist_expr"])
-        poni1 = _require_pos_independent("poni1", trans["poni1_expr"])
-        poni2 = _require_pos_independent("poni2", trans["poni2_expr"])
+        # Base geometry (constant for a standard GeometryTransformation). A
+        # stacked arm's sample offset moves dist/poni per frame, so its base is
+        # the parameter itself (identical to the v1 constant expression).
+        if stacked_arm is not None:
+            dist, poni1, poni2 = (float(params[name]) for name in ("dist", "poni1", "poni2"))
+        else:
+            dist = _require_pos_independent("dist", trans["dist_expr"])
+            poni1 = _require_pos_independent("poni1", trans["poni1_expr"])
+            poni2 = _require_pos_independent("poni2", trans["poni2_expr"])
 
         rot_mappings: dict[str, AngleMapping] = {}
         base_rots: dict[str, float] = {}
@@ -1121,6 +1126,10 @@ class Diffractometer:
         value = asdict(self)
         if self.stacked_arm is None:
             value.pop('stacked_arm')  # Preserve historical affine mapping_json bytes.
+        else:
+            # A zero arm extension keeps the v1 stacked mapping_json bytes.
+            value['stacked_arm'] = {key: item for key, item in value['stacked_arm'].items()
+                                    if key not in ARM_EXTENSION_FIELDS or item != 0}
         return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
     @classmethod

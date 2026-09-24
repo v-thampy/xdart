@@ -371,10 +371,20 @@ def _mg_detector_config(calibration):
 
 def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_motor='nu',
                     fit_scales=False, distance_seed_m=None, distance_bounds_m=None,
-                    max_rms_q=0.03, domain=None, distance_provenance=None, cancelled=None):
-    """Fit the matched rows and refuse unconverged, degenerate or poor fits."""
+                    max_rms_q=0.03, domain=None, distance_provenance=None, cancelled=None,
+                    arm_model='stacked'):
+    """Fit the matched rows and refuse unconverged, degenerate or poor fits.
+
+    ``arm_model='stacked_extended'`` (MultiGeometry only) also fits the detector
+    mount on the arm and the sample offset from the rotation centre; it needs
+    frames from at least three nu positions and fixed motor scales.
+    """
     if not 3 <= len(frames) <= 32:
         raise ValueError('fit requires at least three completed frames spanning the angles')
+    if arm_model not in ('stacked', 'stacked_extended'):
+        raise ValueError('unknown arm model')
+    if arm_model == 'stacked_extended' and backend != 'multigeometry':
+        raise ValueError('the detector mount and sample offset refinement is MultiGeometry-only')
     loaded = [load_control_frame(frame) for frame in frames]
     controls, calibrants, calibrations = zip(*loaded)
     base = calibrations[0]
@@ -395,7 +405,8 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                                   rot2_motor=del_motor, calibrant=calibrants[0],
                                   fit_scales=fit_scales, distance_seed_m=distance_seed_m,
                                   distance_bounds_m=distance_bounds_m, cancelled=cancelled,
-                                  model='stacked_del_on_nu')
+                                  model='stacked_del_on_nu' if arm_model == 'stacked'
+                                  else 'stacked_del_on_nu_extended')
         if not result.success or result.rms_q > max_rms_q:
             raise ValueError(result.message or f'fit RMS {result.rms_q:.5g} exceeds {max_rms_q:g} Å⁻¹')
         asset = result.diffractometer.stacked_arm.to_pyfai_goniometer(
@@ -406,6 +417,8 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                    if result.frozen_scales else 'Converged; del mounted on nu')
         if not fit_scales:
             message += '; motor scales fixed at degrees'
+        if arm_model == 'stacked_extended':
+            message += '; detector mount and sample offset refined'
     elif backend == 'xu_hist':
         asset, rms, condition, count = _fit_xu(frames, loaded, del_motor, nu_motor,
             distance_seed_m, distance_bounds_m, max_rms_q, domain, cancelled)
@@ -420,6 +433,9 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                                     if backend == 'multigeometry' else {'nu': nu_motor, 'del': del_motor}),
                   'image_rotation': frames[0].rotation,
                   'direct_beam': distance_provenance}
+    if arm_model == 'stacked_extended':
+        provenance['arm_model'] = arm_model
+        provenance['parameter_errors'] = dict(result.param_errors)
     if backend == 'xu_hist':
         seed = base.poni.dist if distance_seed_m is None else distance_seed_m
         provenance['effective_distance_bounds_m'] = distance_bounds_m or (max(1e-5, seed * .5), seed * 1.5)

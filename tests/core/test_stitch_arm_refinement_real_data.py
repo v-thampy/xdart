@@ -1,0 +1,173 @@
+"""Scan 14: the arm extension removes the nu-dependent low-q ring shift.
+
+The oracle is the product MultiGeometry Stitch run separately on each nu row:
+a LaB6 ring must land at the same q whichever row recorded it. The five-parameter
+arm leaves a row-to-row spread of several hundredths of an inverse angstrom at
+low q; the extension (guided or automatic) brings it within 0.005.
+"""
+import json
+import os
+import shutil
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from xrd_tools.analysis.module_transaction import (
+    MetadataColumnSelector,
+    ModuleDisposition,
+    ModuleKind,
+    ModuleOutputRequest,
+    ModuleSourceReceipt,
+)
+from xrd_tools.analysis.scan_operations import MetadataTablePlan, run_metadata_table
+from xrd_tools.analysis.stitch_operation import (
+    StitchGeometryInput,
+    StitchGeometryKind,
+    StitchOperationPlan,
+    capture_stitch_geometry,
+    prepare_stitch_operation,
+    run_stitch_operation,
+)
+from xrd_tools.core.scan import SourceKind, SourceSpec
+from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifactOverwrite
+
+_NPT_FRAMES = (0, 9, 18, 27, 35, 55, 65, 75, 130)
+#: frames the automatic check may exclude: detector counts collapse while i0 stays normal
+_DROPPED = {52, 99, 113, 120, 164, 272}
+
+
+def _root() -> Path:
+    configured = os.environ.get('XDART_TEST_DATA')
+    if not configured:
+        pytest.skip('XDART_TEST_DATA is not configured')
+    root = Path(configured) / 'stitching'
+    if not root.is_dir():
+        pytest.skip('authenticated Stitching test data is unavailable')
+    return root
+
+
+def _spec(root):
+    data = root / 'data'
+    return SourceSpec(data / 'calibration/LaB6_17keV', SourceKind.SPEC, options={
+        'scan': '14.1', 'image_dir': str(data / 'images'),
+        'image_stem': 'b_thampy_LaB6_17keV_scan14_',
+        'read_image_kwargs': {'detector_shape': (195, 1475), 'raw_dtype': 'int32',
+                              'threshold': 8e5, 'rotation': 0}})
+
+
+@pytest.fixture(scope='module')
+def guided(tmp_path_factory):
+    from xrd_tools.integrate.stitch_calibration import (
+        adopt_calibration_pair, capture_calibration_frames, fit_calibration, save_calibration_fit,
+    )
+    root = _root()
+    # Stitch geometry must resolve inside its Project; copy the scan like the
+    # existing Scan 14 fixture so the original files keep their identities.
+    project = tmp_path_factory.mktemp('arm-refinement-project')
+    (project / 'data/calibration').mkdir(parents=True)
+    (project / 'data/images').mkdir()
+    shutil.copy2(root / 'data/calibration/LaB6_17keV', project / 'data/calibration/LaB6_17keV')
+    images = sorted((root / 'data/images').glob('b_thampy_LaB6_17keV_scan14_*.raw'))
+    assert len(images) == 287
+    for image in images:
+        shutil.copy2(image, project / 'data/images' / image.name)
+    staged = capture_calibration_frames(_spec(project), _NPT_FRAMES, project / 'session')
+    controls = root / 'data/LaB6_Calibration_Poni_and_Data'
+    frames = tuple(adopt_calibration_pair(
+        frame, controls / f'LaB6_17keV_scan14_{frame.index:04d}.poni',
+        controls / f'LaB6_17keV_scan14_{frame.index:04d}.npt') for frame in staged)
+    five = fit_calibration(frames)
+    extended = fit_calibration(frames, arm_model='stacked_extended')
+    return {'root': project, 'five': five, 'extended': extended,
+            'five_path': Path(save_calibration_fit(five, project / 'fits/five.json')),
+            'extended_path': Path(save_calibration_fit(extended, project / 'fits/extended.json'))}
+
+
+def _row_centres(root, geometry_path, output_dir):
+    """Ring-centre error per nu row from the product Stitch (Å⁻¹)."""
+    from pyFAI.calibrant import get_calibrant
+    spec = _spec(root)
+    table = run_metadata_table(MetadataTablePlan(spec))
+    nu = np.asarray(next(c for c in table.columns if c.name == 'nu').numeric, dtype=float)
+    record = json.loads(geometry_path.read_text())
+    calibrant = get_calibrant('LaB6')
+    calibrant.wavelength = record['wavelength']
+    rings = (2 * np.pi / np.asarray(calibrant.dSpacing))[:3]
+    geometry = capture_stitch_geometry(StitchGeometryInput(
+        geometry_path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
+        source_motors=(('del_angle', 'del'), ('nu_angle', 'nu')), image_rotation=0))
+    plan = StitchOperationPlan(geometry, mode='1d', npt_1d=1500, radial_range=(1.0, 6.2),
+                               use_detector_mask=True, max_frame_bytes=64 * 1024 * 1024)
+    centres = {float(q): [] for q in rings}
+    for row in np.unique(nu):
+        labels = tuple(int(i) for i in np.flatnonzero(nu == row))
+        source = ModuleSourceReceipt.from_metadata_table(
+            table, kind=ModuleKind.STITCH, selected_labels=labels,
+            resolved_selectors=(MetadataColumnSelector('del'), MetadataColumnSelector('nu')))
+        output = ModuleOutputRequest(output_dir / f'{geometry_path.stem}-nu{row:+.1f}.nexus',
+                                     AnalysisArtifactKind.STITCH_1D, AnalysisArtifactOverwrite.CREATE_NEW)
+        result = run_stitch_operation(prepare_stitch_operation(source, output, plan, project_root=root))
+        assert result.terminal.disposition is ModuleDisposition.COMMITTED
+        q = np.asarray(result.payload.axis('q'), dtype=float)
+        intensity = np.asarray(result.payload.intensity, dtype=float)
+        for target in rings:
+            window = np.abs(q - target) <= 0.035
+            x, y = q[window], intensity[window]
+            if not np.isfinite(y).all():
+                continue  # this row does not cover the ring
+            baseline = np.linspace(np.median(y[:3]), np.median(y[-3:]), len(y))
+            signal = y - baseline
+            i = int(np.argmax(signal))
+            if not 0 < i < len(signal) - 1 or signal[i] < 0.3 * baseline[i]:
+                continue
+            a, b, c = signal[i - 1:i + 2]
+            centres[float(target)].append(x[i] + 0.5 * (a - c) / (a - 2 * b + c) * (x[1] - x[0]) - target)
+    return centres
+
+
+def _spreads(centres):
+    assert all(len(values) >= 4 for values in centres.values()), centres
+    return [max(values) - min(values) for values in centres.values()]
+
+
+@pytest.mark.slow
+def test_scan14_guided_arm_extension_aligns_the_nu_rows(guided, tmp_path):
+    from pyFAI.goniometer import Goniometer
+    from xrd_tools.core.geometry import Diffractometer
+    from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry
+    extended = guided['extended']
+    assert extended.asset['provenance']['arm_model'] == 'stacked_extended'
+    record = json.loads(guided['extended_path'].read_text())
+    assert 'xdart_stacked_arm_v2' in record['trans_function']['constants']
+    loaded = Diffractometer.from_pyfai_goniometer(
+        record, source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
+    ai, = create_multigeometry_integrators_from_geometry(loaded, {'del': np.array([25.]), 'nu': np.array([22.5])})
+    stock = Goniometer.sload(str(guided['extended_path'])).get_ai((25., 22.5))
+    np.testing.assert_allclose(ai.qArray(), stock.qArray(), atol=2e-12, rtol=0)
+    assert extended.rms_q < 0.6 * guided['five'].rms_q
+    five = _spreads(_row_centres(guided['root'], guided['five_path'], tmp_path))
+    fixed = _spreads(_row_centres(guided['root'], guided['extended_path'], tmp_path))
+    print(f'nu-row spread (Å⁻¹, rings 100/110/111): five-parameter {np.round(five, 4).tolist()} '
+          f'extended {np.round(fixed, 4).tolist()}; rms {guided["five"].rms_q:.5f} -> {extended.rms_q:.5f}')
+    assert five[0] > 0.02, five  # the five-parameter arm shifts LaB6 (100) with nu
+    assert max(fixed) <= 0.005, (fixed, five)
+
+
+@pytest.mark.slow
+def test_scan14_automatic_refinement_from_the_calibrant_scan(guided, tmp_path):
+    from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
+    from xrd_tools.integrate.stitch_calibration import save_calibration_fit
+    fit = refine_arm_from_scan(_spec(guided['root']), guided['five_path'], max_counts=8e5)
+    provenance = fit.asset['provenance']
+    automatic = provenance['automatic_refinement']
+    assert provenance['arm_model'] == 'stacked_extended', automatic['validation']
+    assert automatic['validation']['improvement'] >= 0.4, automatic['validation']
+    assert {frame['motors']['nu'] for frame in provenance['frames']} == {-10., -3.5, 3., 9.5, 16., 22.5, 29.}
+    excluded = {frame['index'] for frame in automatic['excluded_frames']}
+    assert excluded and excluded <= _DROPPED, automatic['excluded_frames']
+    path = Path(save_calibration_fit(fit, guided['root'] / 'fits/automatic.json'))
+    fixed = _spreads(_row_centres(guided['root'], path, tmp_path))
+    print(f"automatic: {len(provenance['frames'])} frames, excluded {sorted(excluded)}, "
+          f"held-out {automatic['validation']['held_out_sigma_A^-1']}, nu-row spread {np.round(fixed, 4).tolist()}")
+    assert max(fixed) <= 0.005, fixed

@@ -530,10 +530,10 @@ def capture_stitch_geometry(request: StitchGeometryInput) -> StitchGeometryRecei
                 "goniometer JSON source mapping must bind every declared "
                 "position exactly once and no others",
             )
-        from xrd_tools.core.geometry.stacked_arm import STACKED_ARM_MARKER
+        from xrd_tools.core.geometry.stacked_arm import STACKED_ARM_MARKERS
 
         constants = record["trans_function"].get("constants", {})
-        if type(constants) is dict and STACKED_ARM_MARKER in constants:
+        if type(constants) is dict and any(marker in constants for marker in STACKED_ARM_MARKERS):
             from xrd_tools.core.geometry import Diffractometer
 
             try:

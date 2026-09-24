@@ -33,7 +33,7 @@ to the caller — powder |q| has real blind spots):
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -62,14 +62,23 @@ class ControlFrame:
     lying on powder rings; ``rings`` is the integer ring index of each point
     (into the calibrant d-spacing list).  ``motors`` maps the goniometer motor
     names (e.g. ``{"nu": 5.0, "del": 20.0}``, degrees) to this frame's values.
+    ``row_positions``/``col_positions`` keep the sub-pixel coordinates (pyFAI
+    convention: an integer is a pixel centre); they default to the values given
+    for ``rows``/``cols`` before those are truncated to indices.
     """
 
     rows: np.ndarray
     cols: np.ndarray
     rings: np.ndarray
     motors: Mapping[str, float]
+    row_positions: np.ndarray | None = None
+    col_positions: np.ndarray | None = None
 
     def __post_init__(self) -> None:
+        row_positions = np.asarray(
+            self.rows if self.row_positions is None else self.row_positions, dtype=float)
+        col_positions = np.asarray(
+            self.cols if self.col_positions is None else self.col_positions, dtype=float)
         rows = np.asarray(self.rows, dtype=int)
         cols = np.asarray(self.cols, dtype=int)
         rings = np.asarray(self.rings, dtype=int)
@@ -83,9 +92,14 @@ class ControlFrame:
                     f"control point {name} has a negative index "
                     f"{int(arr.min())} (motors={dict(self.motors)}); pixel/ring "
                     "indices must be non-negative")
+        if (row_positions.shape != rows.shape or col_positions.shape != cols.shape
+                or not np.isfinite(row_positions).all() or not np.isfinite(col_positions).all()):
+            raise ValueError("sub-pixel control point positions must be finite and match the indices")
         object.__setattr__(self, "rows", rows)
         object.__setattr__(self, "cols", cols)
         object.__setattr__(self, "rings", rings)
+        object.__setattr__(self, "row_positions", row_positions)
+        object.__setattr__(self, "col_positions", col_positions)
 
 
 @dataclass(frozen=True)
@@ -105,6 +119,10 @@ class RefineResult:
     condition_number: float           # Jacobian condition number (∞ if unavailable)
     frozen_scales: tuple[str, ...]    # axes whose scale was frozen (motor un-spanned)
     message: str                      # "" when good; else why the fit is unusable
+    #: one-sigma parameter errors from the Jacobian (arm extension fits only)
+    param_errors: Mapping[str, float] = field(default_factory=dict)
+    #: control points dropped by robust outlier rejection
+    rejected_points: int = 0
 
 
 def _resolve_calibrant_q(calibrant: Any, wavelength_m: float,
@@ -146,6 +164,40 @@ def _detector_config_from_poni(path: str | Path) -> dict[str, Any]:
     for k, v in cfg.items():
         out[k] = int(v) if hasattr(v, "__int__") and not isinstance(v, bool) else v
     return out
+
+
+def _base_geometry(base_calibration, wavelength, detector, detector_config):
+    """Seed PONI, parallax, detector config, wavelength and detector for a fit."""
+    base_poni: PONI
+    base_parallax: bool | None = None
+    if isinstance(base_calibration, PONI):
+        base_poni = base_calibration
+    else:
+        from xrd_tools.integrate.calibration import (  # noqa: PLC0415
+            load_detector_calibration,
+        )
+        strict_calibration = load_detector_calibration(base_calibration)
+        base_poni = strict_calibration.poni
+        if detector_config is None:
+            detector_config = dict(strict_calibration.detector_config)
+        elif (
+            strict_calibration.parallax is not None
+            and dict(detector_config) != dict(strict_calibration.detector_config)
+        ):
+            raise ValueError(
+                "PONI v3 refinement cannot replace its accepted detector config"
+            )
+        base_parallax = strict_calibration.parallax
+    wl_m = float(wavelength if wavelength is not None else base_poni.wavelength)
+    if not wl_m:
+        raise ValueError("wavelength is required (give wavelength= or a base "
+                         ".poni carrying one)")
+    det_name = detector or base_poni.detector
+    if not det_name:
+        raise ValueError("detector is required (give detector= or a base .poni "
+                         "naming one)")
+    det = _build_detector(det_name, detector_config)
+    return base_poni, base_parallax, detector_config, wl_m, det_name, det
 
 
 def refine_goniometer(
@@ -196,11 +248,13 @@ def refine_goniometer(
         in metres. A seed alone does not constrain the fitted distance. Bounds
         use the bounded trust-region solver; the historical unconstrained LM
         path is unchanged when bounds are absent.
-    model : {'affine', 'stacked_del_on_nu'}
+    model : {'affine', 'stacked_del_on_nu', 'stacked_del_on_nu_extended'}
         Explicitly choose the physical nesting. The legacy default stays affine.
         In stacked mode rot1_motor is outer nu and rot2_motor is inner del;
         both offsets are motor zero offsets in radians. The induced rot3
         is computed from the pose, not fitted as an unconstrained powder angle.
+        The extended model also fits the detector mount (tilt, roll) and the
+        sample offset from the rotation centre; see :func:`refine_stacked_arm`.
 
     Returns
     -------
@@ -208,39 +262,21 @@ def refine_goniometer(
     """
     from scipy.optimize import least_squares  # noqa: PLC0415
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator  # noqa: PLC0415
+    if model == 'stacked_del_on_nu_extended':
+        if fit_scales:
+            raise ValueError('motor scales are not fitted together with the arm extension')
+        return refine_stacked_arm(
+            base_calibration, control_frames, nu_motor=rot1_motor, del_motor=rot2_motor,
+            calibrant=calibrant, wavelength=wavelength, detector=detector,
+            detector_config=detector_config, base=base, preset=preset,
+            distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
+            cancelled=cancelled)
     if model not in {'affine', 'stacked_del_on_nu'}:
         raise ValueError('unknown goniometer model')
 
     # --- base geometry -----------------------------------------------------
-    base_poni: PONI
-    base_parallax: bool | None = None
-    if isinstance(base_calibration, PONI):
-        base_poni = base_calibration
-    else:
-        from xrd_tools.integrate.calibration import (  # noqa: PLC0415
-            load_detector_calibration,
-        )
-        strict_calibration = load_detector_calibration(base_calibration)
-        base_poni = strict_calibration.poni
-        if detector_config is None:
-            detector_config = dict(strict_calibration.detector_config)
-        elif (
-            strict_calibration.parallax is not None
-            and dict(detector_config) != dict(strict_calibration.detector_config)
-        ):
-            raise ValueError(
-                "PONI v3 refinement cannot replace its accepted detector config"
-            )
-        base_parallax = strict_calibration.parallax
-    wl_m = float(wavelength if wavelength is not None else base_poni.wavelength)
-    if not wl_m:
-        raise ValueError("wavelength is required (give wavelength= or a base "
-                         ".poni carrying one)")
-    det_name = detector or base_poni.detector
-    if not det_name:
-        raise ValueError("detector is required (give detector= or a base .poni "
-                         "naming one)")
-    det = _build_detector(det_name, detector_config)
+    base_poni, base_parallax, detector_config, wl_m, det_name, det = _base_geometry(
+        base_calibration, wavelength, detector, detector_config)
 
     # --- control points ----------------------------------------------------
     frames = [f if isinstance(f, ControlFrame) else ControlFrame(**f)
@@ -412,4 +448,179 @@ def refine_goniometer(
     )
 
 
-__all__ = ["ControlFrame", "RefineResult", "refine_goniometer"]
+#: Plausibility of the arm extension. The scan-14 prototype fitted a mount tilt
+#: of about 1 degree, a roll of about -0.3 degree and sample offsets of about 2 mm.
+_MAX_MOUNT_RAD = float(np.deg2rad(5.0))
+_MAX_SAMPLE_OFFSET_M = 0.02
+_MAX_MOUNT_ERROR_RAD = float(np.deg2rad(0.5))
+_MAX_SAMPLE_OFFSET_ERROR_M = 0.002
+#: The extension is identified only by frames from several nu positions.
+_MIN_NU_POSITIONS = 3
+_ARM_NAMES = ("dist", "poni1", "poni2", "nu_offset", "del_offset")
+_EXTENSION_NAMES = ("mount_tilt", "mount_roll", "sample_offset1", "sample_offset2", "sample_offset3")
+
+
+def refine_stacked_arm(
+    base_calibration: PONI | str | Path,
+    control_frames: Sequence[ControlFrame | Mapping[str, Any]],
+    *,
+    nu_motor: str,
+    del_motor: str,
+    calibrant: Any = "LaB6",
+    wavelength: float | None = None,
+    detector: str | None = None,
+    detector_config: Mapping[str, Any] | None = None,
+    extended: bool = True,
+    reject_outliers: float | None = None,
+    base: Diffractometer | None = None,
+    preset: str = "fitted",
+    distance_seed_m: float | None = None,
+    distance_bounds_m: tuple[float, float] | None = None,
+    max_nfev: int = 2000,
+    cancelled=None,
+) -> RefineResult:
+    """Fit the del-on-nu arm at sub-pixel control-point positions.
+
+    The five arm parameters are the distance, the PONI and the nu and del zero
+    offsets. ``extended=True`` adds the detector mount on the arm (tilt, roll)
+    and the sample offset from the rotation centre. Motor scales stay at one
+    degree per degree and the beam rotation is pinned at zero, because |q|
+    cannot see either; a mount rotation about the del axis is excluded because
+    it duplicates the del offset. The extension needs frames from at least
+    three nu positions, and a fit whose extension is implausible or poorly
+    determined is reported unsuccessful.
+
+    ``reject_outliers`` drops points beyond that many robust (MAD) sigmas and
+    refits, twice; use it for automatically extracted points.
+    """
+    from scipy.optimize import least_squares  # noqa: PLC0415
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator  # noqa: PLC0415
+
+    base_poni, base_parallax, detector_config, wl_m, det_name, det = _base_geometry(
+        base_calibration, wavelength, detector, detector_config)
+    frames = [f if isinstance(f, ControlFrame) else ControlFrame(**f)
+              for f in control_frames]
+    frames = [f for f in frames if len(f.rows)]
+    if not frames:
+        raise ValueError("control_frames is empty")
+    nu_deg = np.array([float(f.motors[nu_motor]) for f in frames])
+    del_deg = np.array([float(f.motors[del_motor]) for f in frames])
+    if extended and len(np.unique(np.round(nu_deg, 6))) < _MIN_NU_POSITIONS:
+        raise ValueError(
+            f"the arm extension needs control frames from at least {_MIN_NU_POSITIONS} "
+            "nu positions; add frames spanning nu or fit without the extension")
+    max_ring = max(int(f.rings.max()) for f in frames) + 1
+    q_ring = _resolve_calibrant_q(calibrant, wl_m, max_ring)
+    targets = [q_ring[f.rings] for f in frames]
+    geometry = AzimuthalIntegrator(detector=det, wavelength=wl_m)
+    if base_parallax is True:
+        geometry.enable_parallax()
+
+    distance = base_poni.dist if distance_seed_m is None else float(distance_seed_m)
+    if not np.isfinite(distance) or distance <= 0:
+        raise ValueError("distance seed must be finite and positive metres")
+    bounds = (-np.inf, np.inf)
+    if distance_bounds_m is not None:
+        lo, hi = (float(v) for v in distance_bounds_m)
+        if not (np.isfinite([lo, hi]).all() and 0 < lo < hi and lo <= distance <= hi):
+            raise ValueError("distance bounds require 0 < low < high and a seed inside them")
+
+    def arm_for(p):
+        extension = dict(zip(_EXTENSION_NAMES, p[5:])) if len(p) > 5 else {}
+        return StackedDetectorArm(nu_motor=nu_motor, del_motor=del_motor,
+                                  nu_offset=p[3], del_offset=p[4], **extension)
+
+    def predicted(p, keep):
+        arm = arm_for(p)
+        rot1, rot2, rot3 = arm.angles(del_deg, nu_deg)
+        d_dist, d_poni1, d_poni2 = arm.displacements(del_deg, nu_deg)
+        out = []
+        for i, f in enumerate(frames):
+            param = [p[0] + d_dist[i], p[1] + d_poni1[i], p[2] + d_poni2[i],
+                     rot1[i], rot2[i], rot3[i]]
+            q = geometry.qFunction(f.row_positions[keep[i]], f.col_positions[keep[i]], param=param)
+            out.append(np.asarray(q, dtype=float) / 10.0 - targets[i][keep[i]])
+        return np.concatenate(out)
+
+    def solve(p0, keep):
+        def residual(p):
+            if cancelled is not None and cancelled.is_set():
+                raise InterruptedError("goniometer refinement cancelled")
+            return predicted(p, keep)
+        if distance_bounds_m is None:
+            return least_squares(residual, p0, method="lm", x_scale="jac", max_nfev=max_nfev)
+        lower, upper = np.full(len(p0), -np.inf), np.full(len(p0), np.inf)
+        lower[0], upper[0] = lo, hi
+        return least_squares(residual, p0, method="trf", bounds=(lower, upper),
+                             x_scale="jac", max_nfev=max_nfev)
+
+    keep = [np.ones(len(f.rows), dtype=bool) for f in frames]
+    p0 = np.array([distance, base_poni.poni1, base_poni.poni2, 0.0, 0.0])
+    res = solve(p0, keep)
+    if extended:
+        res = solve(np.r_[res.x, np.zeros(len(_EXTENSION_NAMES))], keep)
+    rejected = 0
+    if reject_outliers is not None:
+        for _ in range(2):
+            r = predicted(res.x, [np.ones(len(f.rows), dtype=bool) for f in frames])
+            cut = float(reject_outliers) * 1.4826 * float(np.median(np.abs(r - np.median(r))))
+            split = np.cumsum([len(f.rows) for f in frames])[:-1]
+            keep = [np.abs(part) <= cut for part in np.split(r, split)]
+            rejected = int(sum((~k).sum() for k in keep))
+            res = solve(res.x, keep)
+    p = res.x
+    rms = float(np.sqrt(np.mean(res.fun ** 2)))
+    n_points = int(len(res.fun))
+    jac = np.asarray(res.jac)
+    try:
+        sv = np.linalg.svd(jac, compute_uv=False)
+        condition = float(sv[0] / sv[-1]) if sv[-1] > 0 else float("inf")
+        dof = max(1, n_points - len(p))
+        errors = np.sqrt(np.clip(np.diag(np.linalg.pinv(jac.T @ jac)) * float(res.fun @ res.fun) / dof, 0, None))
+    except Exception:  # noqa: BLE001
+        condition, errors = float("inf"), np.full(len(p), np.inf)
+    names = _ARM_NAMES + (_EXTENSION_NAMES if extended else ())
+    param_errors = dict(zip(names, (float(e) for e in errors)))
+
+    problems: list[str] = []
+    if not res.success:
+        problems.append(f"optimiser did not converge (status={res.status})")
+    if not (0.0 < p[0] < 100.0):
+        problems.append(f"non-physical dist={p[0]:.4g} m")
+    if abs(p[3]) > np.pi or abs(p[4]) > np.pi:
+        problems.append("non-physical rotation offset (> π rad)")
+    if condition > _MAX_CONDITION:
+        problems.append(f"under-determined fit (Jacobian condition {condition:.2g} > {_MAX_CONDITION:.0g})")
+    if extended:
+        if max(abs(p[5]), abs(p[6])) > _MAX_MOUNT_RAD:
+            problems.append("detector mount tilt/roll exceeds 5 degrees")
+        if np.max(np.abs(p[7:10])) > _MAX_SAMPLE_OFFSET_M:
+            problems.append("sample offset exceeds 20 mm")
+        if max(errors[5], errors[6]) > _MAX_MOUNT_ERROR_RAD or np.max(errors[7:10]) > _MAX_SAMPLE_OFFSET_ERROR_M:
+            problems.append("arm extension is poorly determined; add frames spanning nu and del")
+    ok = not problems
+    message = "" if ok else "; ".join(problems)
+    (logger.info if ok else logger.warning)(
+        "refine_stacked_arm: RMS |q| = %.5g Å⁻¹ over %d points (%d frames, %d rejected), "
+        "extended=%s, cond=%.3g, success=%s%s", rms, n_points, len(frames), rejected,
+        extended, condition, ok, "" if ok else f" — {message}")
+
+    arm = arm_for(p)
+    calibration = DetectorCalibration(
+        replace(base_poni, dist=float(p[0]), poni1=float(p[1]), poni2=float(p[2]),
+                rot1=0., rot2=0., rot3=0., wavelength=wl_m, detector=det_name),
+        detector_config=dict(detector_config or {}), parallax=base_parallax,
+    )
+    gonio = arm.to_pyfai_goniometer(calibration)
+    diff = Diffractometer.from_pyfai_goniometer(
+        gonio, source_motors={"nu_angle": nu_motor, "del_angle": del_motor},
+        base=base, preset=preset)
+    return RefineResult(
+        diffractometer=diff, rms_q=rms, n_points=n_points,
+        params=dict(zip(gonio["param_names"], gonio["param"])), success=ok,
+        condition_number=condition, frozen_scales=(), message=message,
+        param_errors=param_errors, rejected_points=rejected,
+    )
+
+
+__all__ = ["ControlFrame", "RefineResult", "refine_goniometer", "refine_stacked_arm"]

@@ -3,20 +3,39 @@
 Angles in source metadata are degrees; fitted scales are radians per degree.
 The physical pose is R3(beam_rotation) R1(nu_offset+nu_scale*nu)
 R2(del_offset+del_scale*del), using pyFAI's left-handed R1/R2.
+
+The optional arm extension adds the detector mount on the arm and the sample
+offset from the rotation centre::
+
+    M = R3(beam_rotation) R1(n) R2(d) R3(mount_roll) R1(mount_tilt)
+    lab = M v - R3(beam_rotation) s,  s = (sample_offset1, 2, 3) in metres
+
+A mount rotation about the del axis is absent on purpose: it only duplicates
+``del_offset``. The sample term moves the effective PONI and distance of every
+frame (u = M0^T s: poni1 + u1, poni2 + u2, dist - u3), so it is carried by
+:meth:`StackedDetectorArm.translations`; :meth:`rotations` stays rotation-only.
+An arm whose extension is zero encodes and evaluates exactly as before.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 import numpy as np
 
 
 STACKED_ARM_MARKER = 'xdart_stacked_arm_v1'
+EXTENDED_ARM_MARKER = 'xdart_stacked_arm_v2'
+STACKED_ARM_MARKERS = (STACKED_ARM_MARKER, EXTENDED_ARM_MARKER)
 _PARAM_NAMES = ('dist', 'poni1', 'poni2', 'nu_offset', 'nu_scale',
                 'del_offset', 'del_scale', 'beam_rotation')
+_EXTENDED_NAMES = ('mount_tilt', 'mount_roll',
+                   'sample_offset1', 'sample_offset2', 'sample_offset3')
+ARM_EXTENSION_FIELDS = _EXTENDED_NAMES
 
 
-def stacked_arm_transformation():
+def stacked_arm_transformation(extended=False):
     """Closed-form Euler decomposition; numexpr-compatible, ordinary pyFAI JSON."""
+    if extended:
+        return _extended_transformation()
     n, d = '(nu_offset+nu_scale*nu_angle)', '(del_offset+del_scale*del_angle)'
     x = f'(cos({n})*sin({d}))'
     y = f'sin({n})'
@@ -29,6 +48,27 @@ def stacked_arm_transformation():
         constants={'pi': math.pi, STACKED_ARM_MARKER: 1})
 
 
+def _extended_transformation():
+    """Generic decomposition of M0 = R1(n) R2(d) R3(roll) R1(tilt), plus u = M0^T s."""
+    n, d = '(nu_offset+nu_scale*nu_angle)', '(del_offset+del_scale*del_angle)'
+    arm = [[f'cos({d})', '', f'(-sin({d}))'],
+           [f'(sin({n})*sin({d}))', f'cos({n})', f'(sin({n})*cos({d}))'],
+           [f'(cos({n})*sin({d}))', f'(-sin({n}))', f'(cos({n})*cos({d}))']]
+    mount = [['cos(mount_roll)', '(-sin(mount_roll)*cos(mount_tilt))', '(-sin(mount_roll)*sin(mount_tilt))'],
+             ['sin(mount_roll)', '(cos(mount_roll)*cos(mount_tilt))', '(cos(mount_roll)*sin(mount_tilt))'],
+             ['', '(-sin(mount_tilt))', 'cos(mount_tilt)']]
+    m = [['(' + '+'.join(f'{arm[i][k]}*{mount[k][j]}' for k in range(3)
+                         if arm[i][k] and mount[k][j]) + ')' for j in range(3)] for i in range(3)]
+    u = ['(' + '+'.join(f'{m[i][j]}*sample_offset{i + 1}' for i in range(3)) + ')' for j in range(3)]
+    return dict(content='GeometryTransformation', param_names=list(_PARAM_NAMES + _EXTENDED_NAMES),
+        pos_names=['del_angle', 'nu_angle'], dist_expr=f'dist-{u[2]}',
+        poni1_expr=f'poni1+{u[0]}', poni2_expr=f'poni2+{u[1]}',
+        rot1_expr=f'arctan2(-{m[2][1]},{m[2][2]})',
+        rot2_expr=f'arctan2({m[2][0]},sqrt({m[2][1]}**2+{m[2][2]}**2))',
+        rot3_expr=f'beam_rotation+arctan2({m[1][0]},{m[0][0]})',
+        constants={'pi': math.pi, EXTENDED_ARM_MARKER: 1})
+
+
 @dataclass(frozen=True)
 class StackedDetectorArm:
     """An explicit nu-outer, del-inner pose; not independent Euler mappings."""
@@ -39,19 +79,51 @@ class StackedDetectorArm:
     del_offset: float = 0.
     del_scale: float = math.pi / 180
     beam_rotation: float = 0.
+    mount_tilt: float = 0.
+    mount_roll: float = 0.
+    sample_offset1: float = 0.
+    sample_offset2: float = 0.
+    sample_offset3: float = 0.
 
     def __post_init__(self):
         if (any(not isinstance(name, str) or not name for name in (self.nu_motor, self.del_motor))
                 or self.nu_motor == self.del_motor):
             raise ValueError('stacked arm requires distinct, nonempty motor names')
-        for name in _PARAM_NAMES[3:]:
+        for name in _PARAM_NAMES[3:] + _EXTENDED_NAMES:
             value = getattr(self, name)
             if isinstance(value, (bool, str)) or not math.isfinite(float(value)):
                 raise ValueError('stacked arm parameters must be finite numbers')
             object.__setattr__(self, name, float(value))
 
+    @property
+    def extended(self):
+        """True when the mount or sample-offset extension is in use."""
+        return any(getattr(self, name) != 0 for name in _EXTENDED_NAMES)
+
+    @property
+    def has_sample_offset(self):
+        return any(getattr(self, name) != 0 for name in _EXTENDED_NAMES[2:])
+
+    def _pose(self, delta, nu):
+        """M0 = R1(n) R2(d) R3(roll) R1(tilt) for each frame, shape (..., 3, 3)."""
+        d = self.del_offset + self.del_scale * np.asarray(delta, dtype=float)
+        n = self.nu_offset + self.nu_scale * np.asarray(nu, dtype=float)
+        cn, sn, cd, sd = np.cos(n), np.sin(n), np.cos(d), np.sin(d)
+        zero = np.zeros_like(d)
+        arm = np.stack([np.stack([cd, zero, -sd], -1), np.stack([sn * sd, cn, sn * cd], -1),
+                        np.stack([cn * sd, -sn, cn * cd], -1)], -2)
+        ct, st = math.cos(self.mount_tilt), math.sin(self.mount_tilt)
+        cr, sr = math.cos(self.mount_roll), math.sin(self.mount_roll)
+        mount = np.array([[cr, -sr * ct, -sr * st], [sr, cr * ct, cr * st], [0., -st, ct]])
+        return arm @ mount
+
     def angles(self, delta, nu):
         """Return pyFAI Euler angles in radians, including the induced roll."""
+        if self.mount_tilt or self.mount_roll:
+            m = self._pose(delta, nu)
+            return (np.arctan2(-m[..., 2, 1], m[..., 2, 2]),
+                    np.arctan2(m[..., 2, 0], np.hypot(m[..., 2, 1], m[..., 2, 2])),
+                    self.beam_rotation + np.arctan2(m[..., 1, 0], m[..., 0, 0]))
         d = self.del_offset + self.del_scale * np.asarray(delta, dtype=float)
         n = self.nu_offset + self.nu_scale * np.asarray(nu, dtype=float)
         x = np.cos(n) * np.sin(d)
@@ -60,46 +132,82 @@ class StackedDetectorArm:
         return (np.arctan2(y, z), np.arctan2(x, np.hypot(y, z)),
                 self.beam_rotation + np.arctan2(np.sin(n) * np.sin(d), np.cos(d)))
 
-    def rotations(self, motors):
+    def displacements(self, delta, nu):
+        """Per-frame (d_dist, d_poni1, d_poni2) in metres from the sample offset."""
+        s = np.array([self.sample_offset1, self.sample_offset2, self.sample_offset3])
+        u = np.einsum('...ij,i->...j', self._pose(delta, nu), s)
+        return -u[..., 2], u[..., 0], u[..., 1]
+
+    def _arrays(self, motors):
         arrays = [np.atleast_1d(np.asarray(motors[name], dtype=float))
                   for name in (self.del_motor, self.nu_motor)]
         if (any(a.ndim != 1 or not a.size or not np.isfinite(a).all() for a in arrays)
                 or arrays[0].shape != arrays[1].shape):
             raise ValueError('stacked arm needs finite paired motor arrays')
+        return arrays
+
+    def rotations(self, motors):
+        arrays = self._arrays(motors)
         result = dict(zip(('rot1', 'rot2', 'rot3'), self.angles(*arrays)))
         if any(not np.isfinite(a).all() for a in result.values()):
             raise ValueError('stacked arm rotations are not finite')
         return result
+
+    def translations(self, motors, poni):
+        """Per-frame (dist, poni1, poni2), or None when there is no sample offset."""
+        if not self.has_sample_offset:
+            return None
+        values = self.displacements(*self._arrays(motors))
+        dist, poni1, poni2 = (float(poni.dist) + values[0], float(poni.poni1) + values[1],
+                              float(poni.poni2) + values[2])
+        if not (np.isfinite(dist).all() and np.isfinite(poni1).all() and np.isfinite(poni2).all()
+                and (dist > 0).all()):
+            raise ValueError('stacked arm sample offset gives a non-physical detector distance')
+        return tuple(zip(dist.tolist(), poni1.tolist(), poni2.tolist()))
+
+    def without_sample_offset(self):
+        """The instrument part only, for a sample centred on the rotation axis."""
+        return replace(self, sample_offset1=0., sample_offset2=0., sample_offset3=0.)
 
     def to_pyfai_goniometer(self, calibration):
         """Encode the exact pose without a pyFAI plugin or custom evaluator."""
         poni = calibration.poni
         if any(getattr(poni, axis) != 0 for axis in ('rot1', 'rot2', 'rot3')):
             raise ValueError('stacked arm carries all rotations; base PONI rotations must be zero')
+        names = _PARAM_NAMES + (_EXTENDED_NAMES if self.extended else ())
         values = [float(getattr(poni, name)) for name in _PARAM_NAMES[:3]]
-        values += [getattr(self, name) for name in _PARAM_NAMES[3:]]
+        values += [getattr(self, name) for name in names[3:]]
         record = dict(content='Goniometer calibration v2', detector=poni.detector,
             detector_config=dict(calibration.detector_config), wavelength=poni.wavelength,
-            param_names=list(_PARAM_NAMES), param=values, pos_names=['del_angle', 'nu_angle'],
-            trans_function=stacked_arm_transformation())
+            param_names=list(names), param=values, pos_names=['del_angle', 'nu_angle'],
+            trans_function=stacked_arm_transformation(self.extended))
         if calibration.parallax is not None:
             record['parallax'] = calibration.parallax
         return record
 
     @classmethod
     def from_pyfai_goniometer(cls, data, motor_for):
-        """Admit only this explicit model; never approximate arbitrary expressions."""
+        """Admit only these explicit models; never approximate arbitrary expressions."""
         trans = data['trans_function']
-        if STACKED_ARM_MARKER not in trans.get('constants', {}):
+        constants = trans.get('constants', {})
+        if STACKED_ARM_MARKER in constants:
+            marker, names, expected = STACKED_ARM_MARKER, _PARAM_NAMES, stacked_arm_transformation()
+        elif EXTENDED_ARM_MARKER in constants:
+            marker, names = EXTENDED_ARM_MARKER, _PARAM_NAMES + _EXTENDED_NAMES
+            expected = stacked_arm_transformation(extended=True)
+        else:
             return None
-        if (trans != stacked_arm_transformation()
-                or type(trans['constants'][STACKED_ARM_MARKER]) not in (int, float)
-                or data.get('param_names') != list(_PARAM_NAMES)
+        if (trans != expected
+                or type(trans['constants'][marker]) not in (int, float)
+                or data.get('param_names') != list(names)
                 or data.get('pos_names') != ['del_angle', 'nu_angle']
-                or len(data.get('param', ())) != len(_PARAM_NAMES)
+                or len(data.get('param', ())) != len(names)
                 or any(isinstance(v, (bool, str)) or not math.isfinite(float(v))
                        for v in data['param'])):
             raise ValueError('unsupported or inconsistent stacked arm transformation')
-        params = dict(zip(_PARAM_NAMES, data['param']))
-        return cls(nu_motor=motor_for['nu_angle'], del_motor=motor_for['del_angle'],
-                   **{name: params[name] for name in _PARAM_NAMES[3:]})
+        params = dict(zip(names, data['param']))
+        arm = cls(nu_motor=motor_for['nu_angle'], del_motor=motor_for['del_angle'],
+                  **{name: params[name] for name in names[3:]})
+        if marker == EXTENDED_ARM_MARKER and not arm.extended:
+            raise ValueError('an extended stacked arm record must carry a nonzero extension')
+        return arm

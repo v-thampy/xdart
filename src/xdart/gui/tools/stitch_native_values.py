@@ -109,8 +109,9 @@ def _affine_geometry_warning(request):
         return None
     asset = json.loads(geometry.content)
     constants = asset["trans_function"].get("constants", {})
-    marker = constants.get("xdart_stacked_arm_v1") if type(constants) is dict else None
-    if type(marker) in (int, float) and marker == 1:
+    from xrd_tools.core.geometry.stacked_arm import STACKED_ARM_MARKERS
+    markers = [constants.get(name) for name in STACKED_ARM_MARKERS] if type(constants) is dict else []
+    if any(type(marker) in (int, float) and marker == 1 for marker in markers):
         return None
     bindings = dict(geometry.request.source_motors)
     nu = bindings.get("nu_angle", bindings.get("nu"))
