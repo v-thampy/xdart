@@ -1,8 +1,8 @@
 """Exact del-on-nu detector pose and its standard pyFAI JSON encoding.
 
 Angles in source metadata are degrees; fitted scales are radians per degree.
-The physical pose is R3(beam_rotation) R1(nu_scale*nu)
-R2(del_offset+del_scale*del) R1(rot1_base), using pyFAI's left-handed R1/R2.
+The physical pose is R3(beam_rotation) R1(nu_offset+nu_scale*nu)
+R2(del_offset+del_scale*del), using pyFAI's left-handed R1/R2.
 """
 from dataclasses import dataclass
 import math
@@ -11,16 +11,16 @@ import numpy as np
 
 
 STACKED_ARM_MARKER = 'xdart_stacked_arm_v1'
-_PARAM_NAMES = ('dist', 'poni1', 'poni2', 'rot1_base', 'nu_scale',
+_PARAM_NAMES = ('dist', 'poni1', 'poni2', 'nu_offset', 'nu_scale',
                 'del_offset', 'del_scale', 'beam_rotation')
 
 
 def stacked_arm_transformation():
     """Closed-form Euler decomposition; numexpr-compatible, ordinary pyFAI JSON."""
-    n, d, b = '(nu_scale*nu_angle)', '(del_offset+del_scale*del_angle)', 'rot1_base'
+    n, d = '(nu_offset+nu_scale*nu_angle)', '(del_offset+del_scale*del_angle)'
     x = f'(cos({n})*sin({d}))'
-    y = f'(cos({n})*cos({d})*sin({b})+sin({n})*cos({b}))'
-    z = f'(cos({n})*cos({d})*cos({b})-sin({n})*sin({b}))'
+    y = f'sin({n})'
+    z = f'(cos({n})*cos({d}))'
     return dict(content='GeometryTransformation', param_names=list(_PARAM_NAMES),
         pos_names=['del_angle', 'nu_angle'], dist_expr='dist', poni1_expr='poni1',
         poni2_expr='poni2', rot1_expr=f'arctan2({y},{z})',
@@ -34,7 +34,7 @@ class StackedDetectorArm:
     """An explicit nu-outer, del-inner pose; not independent Euler mappings."""
     nu_motor: str = 'nu'
     del_motor: str = 'del'
-    rot1_base: float = 0.
+    nu_offset: float = 0.
     nu_scale: float = math.pi / 180
     del_offset: float = 0.
     del_scale: float = math.pi / 180
@@ -53,11 +53,10 @@ class StackedDetectorArm:
     def angles(self, delta, nu):
         """Return pyFAI Euler angles in radians, including the induced roll."""
         d = self.del_offset + self.del_scale * np.asarray(delta, dtype=float)
-        n = self.nu_scale * np.asarray(nu, dtype=float)
-        b = self.rot1_base
+        n = self.nu_offset + self.nu_scale * np.asarray(nu, dtype=float)
         x = np.cos(n) * np.sin(d)
-        y = np.cos(n) * np.cos(d) * np.sin(b) + np.sin(n) * np.cos(b)
-        z = np.cos(n) * np.cos(d) * np.cos(b) - np.sin(n) * np.sin(b)
+        y = np.sin(n)
+        z = np.cos(n) * np.cos(d)
         return (np.arctan2(y, z), np.arctan2(x, np.hypot(y, z)),
                 self.beam_rotation + np.arctan2(np.sin(n) * np.sin(d), np.cos(d)))
 

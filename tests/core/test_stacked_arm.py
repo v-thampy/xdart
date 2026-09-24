@@ -30,7 +30,7 @@ def _model():
     from xrd_tools.core.geometry import StackedDetectorArm
     return StackedDetectorArm(nu_motor='pitch', del_motor='swing',
         nu_scale=np.deg2rad(1.006), del_scale=np.deg2rad(.997),
-        rot1_base=.031, del_offset=-.043, beam_rotation=.017)
+        nu_offset=.031, del_offset=-.043, beam_rotation=.017)
 
 
 def _calibration():
@@ -52,9 +52,8 @@ def _independent_stacked_controls():
     rng = np.random.default_rng(12)
     controls = []
     for delta, nu in ((6., -10.), (15., 3.), (25., 6.), (40., 9.), (20., 16.)):
-        rotation = (_r1(model.nu_scale * nu)
-                    @ _r2(model.del_offset + model.del_scale * delta)
-                    @ _r1(model.rot1_base))
+        rotation = (_r1(model.nu_offset + model.nu_scale * nu)
+                    @ _r2(model.del_offset + model.del_scale * delta))
         lab = np.einsum('ij,jkl->ikl', rotation, ray)
         lab /= np.linalg.norm(lab, axis=0)
         lab[2] -= 1
@@ -84,9 +83,8 @@ def test_stacked_json_and_runtime_match_independent_matrix(tmp_path):
     assert set(loaded.all_referenced_motors()) == {'swing', 'pitch'}
     for delta in (-45., -20., 0., 20., 45.):
         for nu in (-29., -10., 0., 10., 29.):
-            expected = (_r3(model.beam_rotation) @ _r1(model.nu_scale * nu)
-                        @ _r2(model.del_offset + model.del_scale * delta)
-                        @ _r1(model.rot1_base))
+            expected = (_r3(model.beam_rotation) @ _r1(model.nu_offset + model.nu_scale * nu)
+                        @ _r2(model.del_offset + model.del_scale * delta))
             ai, = create_multigeometry_integrators_from_geometry(loaded,
                 {'swing': np.array([delta]), 'pitch': np.array([nu])})
             np.testing.assert_allclose(ai.rotation_matrix(), expected, atol=2e-14, rtol=0)
@@ -109,6 +107,41 @@ def test_stacked_requires_finite_paired_motor_arrays(motors):
     loaded = Diffractometer(stacked_arm=_model(), calibration=_calibration())
     with pytest.raises((KeyError, ValueError)):
         create_multigeometry_integrators_from_geometry(loaded, motors)
+
+
+def test_imported_stacked_q_and_chi_match_canonical_xu(tmp_path):
+    from tests.core.test_stitch_two_angle_math import _receipt
+    from xrd_tools.core.geometry import StackedDetectorArm
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+    from xrd_tools.integrate.xu_stitch import resolve_xu_stitch_effective_geometry
+    receipt = _receipt(tmp_path, canonical=True)
+    det = receipt.projection.value['detector']
+    acq = receipt.projection.value['acquisition']
+    offsets = acq['detector_offsets_deg']
+    cal = DetectorCalibration(PONI(dist=det['distance_m'],
+        poni1=(det['cch1_px'] + .5) * det['pixel1_m'],
+        poni2=(det['cch2_px'] + .5) * det['pixel2_m'],
+        wavelength=acq['xu_mapping_wavelength_A'] * 1e-10, detector='Pilatus300kw'),
+        detector_config={'orientation': 3})
+    model = StackedDetectorArm(nu_offset=-np.deg2rad(offsets['nu']),
+                              del_offset=-np.deg2rad(offsets['del']))
+    geometry = Diffractometer.from_pyfai_goniometer(model.to_pyfai_goniometer(cal),
+        source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
+    # Float64 point calls isolate mapping arithmetic from qArray's float32 grid.
+    rows, cols = np.array([0., 0., 194., 194., 97.]), np.array([0., 1474., 0., 1474., 737.])
+    with xu_runtime_session() as session:
+        effective = resolve_xu_stitch_effective_geometry(receipt, session)
+        for delta, nu in ((-40., -29.), (0., 0.), (20., 10.), (40., 29.), (40., -29.)):
+            ai, = create_multigeometry_integrators_from_geometry(geometry,
+                {'del': [delta], 'nu': [nu]})
+            qx, qy, qz = effective.hxrd.Ang2Q.area(0., 0., 0., 0.,
+                nu - offsets['nu'], delta - offsets['del'])
+            points = (rows.astype(int), cols.astype(int))
+            q = np.hypot(np.hypot(qx, qy), qz)[points]
+            chi = -np.arctan2(qx, qz)[points]
+            np.testing.assert_allclose(ai.qFunction(rows, cols) / 10, q, atol=8e-14, rtol=0)
+            error = np.angle(np.exp(1j * (ai.chi(rows, cols) - chi)))
+            np.testing.assert_allclose(error, 0, atol=2e-13, rtol=0)
 
 
 def test_stacked_marker_cannot_override_other_expressions(tmp_path):

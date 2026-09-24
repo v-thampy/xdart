@@ -199,7 +199,7 @@ def refine_goniometer(
     model : {'affine', 'stacked_del_on_nu'}
         Explicitly choose the physical nesting. The legacy default stays affine.
         In stacked mode rot1_motor is outer nu and rot2_motor is inner del;
-        rot1_offset becomes the fixed inner mounting angle. The induced rot3
+        both offsets are motor zero offsets in radians. The induced rot3
         is computed from the pose, not fitted as an unconstrained powder angle.
 
     Returns
@@ -307,7 +307,7 @@ def refine_goniometer(
             rotations = (r1s * m1 + r1o, r2s * m2 + r2o, r3o)
             if model == 'stacked_del_on_nu':
                 rotations = StackedDetectorArm(nu_motor=rot1_motor, del_motor=rot2_motor,
-                    rot1_base=r1o, nu_scale=r1s, del_offset=r2o, del_scale=r2s,
+                    nu_offset=r1o, nu_scale=r1s, del_offset=r2o, del_scale=r2s,
                     beam_rotation=r3o).angles(m2, m1)
             ai = AzimuthalIntegrator(
                 dist=dist, poni1=poni1, poni2=poni2,
@@ -392,7 +392,7 @@ def refine_goniometer(
     sources = {"rot1_pos": rot1_motor, "rot2_pos": rot2_motor}
     if model == 'stacked_del_on_nu':
         arm = StackedDetectorArm(nu_motor=rot1_motor, del_motor=rot2_motor,
-            rot1_base=r1o, nu_scale=r1s, del_offset=r2o, del_scale=r2s,
+            nu_offset=r1o, nu_scale=r1s, del_offset=r2o, del_scale=r2s,
             beam_rotation=r3o)
         calibration = DetectorCalibration(
             replace(base_poni, dist=dist, poni1=poni1, poni2=poni2,

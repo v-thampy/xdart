@@ -69,6 +69,38 @@ def test_native_affine_warning_does_not_apply_to_xu(tmp_path):
     assert prepared.warnings == ()
 
 
+def test_native_stacked_calibration_previews_runs_and_reloads(tmp_path):
+    import json
+    from xrd_tools.core.geometry import Diffractometer, StackedDetectorArm
+    from xrd_tools.io.analysis_artifact import read_analysis_artifact
+    form = _native_form(tmp_path, 'multigeometry', scans='1')
+    path = Path(form.geometry_path)
+    calibration = Diffractometer.from_pyfai_goniometer(path).calibration
+    path.write_text(json.dumps(StackedDetectorArm().to_pyfai_goniometer(calibration)))
+    owner = StitchToolOwner()
+    try:
+        owner.set_form(form)
+        assert owner.begin_preflight()
+        preview = _poll_terminal(owner)
+        assert preview.terminal_status is OperationTerminalStatus.RETURNED, preview.failure_message
+        prepared = owner.prepared
+        assert prepared.warnings == ()
+        assert owner.begin_run()
+        terminal = _poll_terminal(owner, timeout=30)
+        assert terminal.terminal_status is OperationTerminalStatus.RETURNED, terminal.failure_message
+        result = terminal.outcome.result
+        assert result.terminal.disposition is ModuleDisposition.COMMITTED
+        reloaded = read_analysis_artifact(prepared.request.module.output.target)
+        np.testing.assert_array_equal(reloaded.intensity, result.payload.intensity)
+        assert np.isfinite(reloaded.intensity).any()
+        assert len(reloaded.contributing_frames) == 2
+        assert prepared.request.plan.geometry.sha256 in reloaded.provenance_json
+        assert reloaded.radial_axis('q_A^-1').shape == (64,)
+        assert reloaded.radial_axis('2th_deg').shape == (64,)
+    finally:
+        assert owner.close().status is PageCleanup.CLEAN
+
+
 def test_native_group_requires_and_preserves_explicit_family(tmp_path):
     from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
     form = replace(_native_form(tmp_path, "multigeometry", scans="[1,2]"), output_family=None)
