@@ -656,6 +656,9 @@ def _science_projection(
         # changes which pixels it masks, so Append must match it too.
         **({"flat_min_fraction": values["flat_min_fraction"]}
            if "flat_min_fraction" in values else {}),
+        # How a Background and a dark combine; unrecorded before 3b614512.
+        **({"background_dark": values["background_dark"]}
+           if "background_dark" in values else {}),
     }
 
 

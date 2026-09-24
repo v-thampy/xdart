@@ -86,6 +86,18 @@ class PoniV3OverrideIntent:
         )
 
 
+def background_dark_rule(background) -> str:
+    """How a run with both a Background and a dark combines them.
+
+    ``"subtracted"``: the reducer removes the dark from the Background images
+    (frame − dark − scale·(Background − dark)); ``"as_is"``: they are already
+    dark-corrected (frame − dark − scale·Background). Recorded with every run that
+    has both, so outputs from before the rule was recorded (which used "as_is")
+    are told apart.
+    """
+    return "as_is" if background.dark_corrected else "subtracted"
+
+
 def _default_background():
     from xrd_tools.reduction.background import FrameBackgroundPlan
     return FrameBackgroundPlan()
@@ -1020,6 +1032,8 @@ class FrozenRunConfiguration:
                 value += (("flat_min_fraction", float(self.flat_min_fraction)),)
         if self.dark_file:
             value += (("dark_file", str(self.dark_file)),)
+            if self.background.mode != "None":
+                value += (("background_dark", background_dark_rule(self.background)),)
         if self.poni_v3_override is not None:
             value += ((
                 "poni_v3_override",
@@ -1143,6 +1157,8 @@ class FrozenRunConfiguration:
                 values["flat_min_fraction"] = float(self.flat_min_fraction)
         if self.dark_file:
             values["dark_file"] = self.dark_file
+            if self.background.mode != "None":
+                values["background_dark"] = background_dark_rule(self.background)
         if self.poni_v3_override is not None:
             values["poni_v3_override"] = self.poni_v3_override.as_dict()
         return values

@@ -3183,6 +3183,156 @@ def test_dark_and_background_subtract_the_dark_once(tmp_path):
         np.testing.assert_array_equal(again.sigma, original.sigma)
 
 
+def _finished_output(tmp_path, poni, target, source, request_value, **fields):
+    intent = _intent(source, target, poni)
+    intent.bai_1d_args = {**intent.bai_1d_args, "error_model": "poisson"}
+    for key, value in fields.items():
+        setattr(intent, key, value)
+    executor = StandardRunExecutor(join_timeout=5.0)
+    identity = _start(executor, intent, request_value=request_value)
+    try:
+        events = _drain_until(
+            executor, lambda values: any(e.kind in _TERMINAL for e in values), timeout=90.0,
+        )
+        terminal = next(e for e in events if e.kind in _TERMINAL)
+        assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
+    finally:
+        assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+    return _written(Path(intent.save_path))
+
+
+def _append_admitted(tmp_path, poni, target, source, request_value, **fields):
+    append = _intent(source, target, poni, output_mode="Append")
+    append.bai_1d_args = {**append.bai_1d_args, "error_model": "poisson"}
+    for key, value in fields.items():
+        setattr(append, key, value)
+    executor = StandardRunExecutor()
+    admission, _capture, token = _admit(executor, append, request_value=request_value)
+    try:
+        if type(admission) is AdmissionFailure:
+            assert "Append" in admission.reason, admission.reason
+        return type(admission) is AdmissionReceipt
+    finally:
+        executor.cancel_admission(token)
+
+
+def _reintegrated_1d(output, tmp_path, labels=(1, 2, 3)):
+    from xrd_tools.io.finite_artifact import _snapshot_path
+    from xrd_tools.reduction import ReintegrateSuccessorPlan, run_reintegrate_successor
+    from xrd_tools.reduction.reintegrate_prepared import _target_snapshot
+
+    preparation = {
+        "api_version": 1,
+        "selected_plan": {"version": 1, "dimension": "1d",
+                          "bai_args": {"npt": 8, "method": "numpy", "error_model": "poisson"},
+                          "gi_mode": "q_total"},
+        "requested_shared_science": {"version": 1, "kind": "persisted_target"},
+        "resource_policy": {"version": 1, "kind": "resolve", "envelope_bytes": 8 << 30,
+                            "requests": {"workers": 1, "reduction_inflight": 1}},
+    }
+    plan = ReintegrateSuccessorPlan.from_artifact(
+        str(output), entry="entry", dimension="1d", preparation=preparation,
+        source_root=str(tmp_path), expected_labels=labels,
+        expected_target_snapshot=_target_snapshot(_snapshot_path(output)),
+    )
+    result = run_reintegrate_successor(plan)
+    assert result.output_artifact is not None, result.diagnostics
+    return result.output_artifact
+
+
+def test_a_dark_corrected_background_is_subtracted_as_it_is(tmp_path):
+    from dataclasses import replace
+    from xrd_tools.io import get_1d
+    from xrd_tools.io.read import _dequantize_thumbnail
+    from xrd_tools.reduction import FrameBackgroundPlan
+
+    reference_folder = tmp_path / "reference"
+    reference_folder.mkdir()
+    for label in range(1, 4):
+        _write_tiff(tmp_path / f"frame_{label:04d}.tif", 100 + label)
+        # 100 + label − dark 10 − 0.5 × background 30, which already lacks its dark
+        _write_tiff(reference_folder / f"frame_{label:04d}.tif", 75 + label)
+    _write_tiff(tmp_path / "background.tif", 30)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    shape = fabio.open(str(tmp_path / "frame_0001.tif")).data.shape
+    np.save(tmp_path / "dark.npy", np.full(shape, 10.0))
+    background = FrameBackgroundPlan(mode="Single BG File", locator=str(tmp_path / "background.tif"),
+                                     scale=0.5, dark_corrected=True)
+    corrections = {"dark_file": str(tmp_path / "dark.npy"), "background": background}
+    corrected = _finished_output(tmp_path, poni, tmp_path / "corrected.nexus",
+                                 tmp_path / "frame_0001.tif", 1830, **corrections)
+    reference = _finished_output(tmp_path, poni, tmp_path / "reference.nexus",
+                                 reference_folder / "frame_0001.tif", 1831)
+    for label in (1, 2, 3):
+        got, want = get_1d(corrected, frame=label), get_1d(reference, frame=label)
+        covered = np.isfinite(want.sigma) & (want.sigma > 0)
+        assert covered.any()
+        np.testing.assert_allclose(got.intensity, want.intensity, rtol=1e-6)
+        # variance raw + all of the dark + 0.5 × (0.5 × background), against 75 + label
+        np.testing.assert_allclose((got.sigma / want.sigma)[covered],
+                                   np.sqrt((117.5 + label) / (75 + label)), rtol=1e-5)
+    with h5py.File(corrected, "r") as handle:
+        thumbnail = _dequantize_thumbnail(handle["entry/frames/frame_0001/thumbnail"])
+        run_configuration = json.loads(handle["entry/reduction/config/run_configuration"][()])
+    np.testing.assert_allclose(thumbnail[np.isfinite(thumbnail)], 76.0, rtol=1e-3)
+    assert run_configuration["background_dark"] == "as_is"
+    assert run_configuration["background"]["dark_corrected"] is True
+    again = _reintegrated_1d(corrected, tmp_path)
+    for label in (1, 2, 3):
+        original, redone = get_1d(corrected, frame=label), get_1d(again, frame=label)
+        np.testing.assert_array_equal(redone.intensity, original.intensity)
+        np.testing.assert_array_equal(redone.sigma, original.sigma)
+    target, source = tmp_path / "corrected.nexus", tmp_path / "frame_0001.tif"
+    assert _append_admitted(tmp_path, poni, target, source, 1832, **corrections)
+    assert not _append_admitted(tmp_path, poni, target, source, 1833, **{
+        **corrections, "background": replace(background, dark_corrected=False)})
+
+
+def test_an_output_from_before_the_background_dark_rule_keeps_its_rule(tmp_path, monkeypatch):
+    # The build before 3b614512 subtracted a Background as it was and recorded no rule
+    # (Codex round-3/4 review F1): emulated at its two seams. Append now refuses such an
+    # output, and Reintegrate keeps its rule.
+    from xrd_tools.io import get_1d
+    from xrd_tools.reduction import FrameBackgroundPlan
+    from xrd_tools.reduction import background as background_module
+    from xrd_tools.session.run_configuration import FrozenRunConfiguration
+
+    reference_folder = tmp_path / "reference"
+    reference_folder.mkdir()
+    for label in range(1, 4):
+        _write_tiff(tmp_path / f"frame_{label:04d}.tif", 100 + label)
+        _write_tiff(reference_folder / f"frame_{label:04d}.tif", 30 + label)  # − 10 − 2 × 30
+    _write_tiff(tmp_path / "background.tif", 30)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    shape = fabio.open(str(tmp_path / "frame_0001.tif")).data.shape
+    np.save(tmp_path / "dark.npy", np.full(shape, 10.0))
+    corrections = {"dark_file": str(tmp_path / "dark.npy"), "background": FrameBackgroundPlan(
+        mode="Single BG File", locator=str(tmp_path / "background.tif"), scale=2.0)}
+    provenance, result = FrozenRunConfiguration.as_provenance, background_module._result
+    with monkeypatch.context() as older:
+        older.setattr(FrozenRunConfiguration, "as_provenance", lambda self: {
+            key: value for key, value in provenance(self).items() if key != "background_dark"})
+        older.setattr(background_module, "_result",
+                      lambda plan, fact, image, body, cancelled, variance_factor=None, scale=None:
+                      result(plan, fact, image, body, cancelled, variance_factor))
+        old = _finished_output(tmp_path, poni, tmp_path / "old.nexus",
+                               tmp_path / "frame_0001.tif", 1834, **corrections)
+    reference = _finished_output(tmp_path, poni, tmp_path / "reference.nexus",
+                                 reference_folder / "frame_0001.tif", 1835)
+    with h5py.File(old, "r") as handle:
+        assert "background_dark" not in json.loads(handle["entry/reduction/config/run_configuration"][()])
+    for label in (1, 2, 3):
+        np.testing.assert_allclose(get_1d(old, frame=label).intensity,
+                                   get_1d(reference, frame=label).intensity, rtol=1e-6)
+    assert not _append_admitted(tmp_path, poni, tmp_path / "old.nexus",
+                                tmp_path / "frame_0001.tif", 1836, **corrections)
+    again = _reintegrated_1d(old, tmp_path)
+    for label in (1, 2, 3):
+        original, redone = get_1d(old, frame=label), get_1d(again, frame=label)
+        np.testing.assert_array_equal(redone.intensity, original.intensity)
+        np.testing.assert_array_equal(redone.sigma, original.sigma)
 @pytest.mark.parametrize("role", ("flat_file", "dark_file"))
 def test_admission_refuses_an_output_that_would_overwrite_the_flat_or_dark(tmp_path, role):
     _write_tiff(tmp_path / "frame_0001.tif", 5)

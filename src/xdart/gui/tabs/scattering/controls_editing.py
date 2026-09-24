@@ -36,6 +36,7 @@ from .controls_inventory import (
     BACKGROUND_METADATA_KEY,
     BACKGROUND_NORMALIZE,
     BACKGROUND_SCALE,
+    BACKGROUND_DARK_CORRECTED,
     BACKGROUND_TYPE,
     GI_1D_AXES,
     GI_2D_AXES,
@@ -587,7 +588,8 @@ def _reduce_background_edit(
             desired = replace(plan, mode=value, locator=None,
                 dataset_path=None, frame_index=None,
                 match_rule=("Scan Root + Frame Number" if value == "BG Directory" else None),
-                metadata_key=None, filename_filter="", scale=1.0, normalization_key=None)
+                metadata_key=None, filename_filter="", scale=1.0, normalization_key=None,
+                dark_corrected=False)
         elif path in {BACKGROUND_FILE, BACKGROUND_DIRECTORY}:
             if type(value) is not str or not value.strip():
                 return EditRefusal("A Background path is required.")
@@ -615,6 +617,10 @@ def _reduce_background_edit(
             if plan.mode != "BG Directory" or type(value) is not str:
                 return EditRefusal("Background Filter is available only for BG Directory.")
             compile_filter(value); desired = replace(plan, filename_filter=value.strip())
+        elif path == BACKGROUND_DARK_CORRECTED:
+            if plan.mode == "None" or type(value) is not bool:
+                return EditRefusal("Choose a Background, then mark whether it is dark-corrected.")
+            desired = replace(plan, dark_corrected=value)
         elif path == BACKGROUND_SCALE:
             if type(value) is bool:
                 return EditRefusal("Background Scale must be finite.")

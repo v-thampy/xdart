@@ -184,3 +184,21 @@ def test_average_applies_records_and_authenticates_its_dark(tmp_path):
     changed = run("changed", DetectorImageState(str(dark_path), "0" * 64, (4, 4), FactStatus.PRESENT))
     assert changed.disposition != "COMMITTED"
     assert "AVERAGE_DARK_DIGEST_CHANGED" in f"{changed.diagnostic_code} {changed.diagnostic}"
+
+
+def test_a_run_with_background_and_dark_records_how_they_combine(tmp_path):
+    from dataclasses import replace
+    from xrd_tools.reduction import FrameBackgroundPlan
+    from xrd_tools.session.run_configuration import RunIntent
+
+    background = tmp_path / "background.tif"
+    background.write_bytes(b"background")
+    dark = str(tmp_path / "dark.npy")
+    plain = FrameBackgroundPlan(mode="Single BG File", locator=str(background))
+    subtracted = RunIntent(background=plain, dark_file=dark).freeze()
+    as_is = RunIntent(background=replace(plain, dark_corrected=True), dark_file=dark).freeze()
+    assert subtracted.as_provenance()["background_dark"] == "subtracted"
+    assert as_is.as_provenance()["background_dark"] == "as_is"
+    assert subtracted.fingerprint != as_is.fingerprint
+    for alone in (RunIntent(background=plain).freeze(), RunIntent(dark_file=dark).freeze()):
+        assert "background_dark" not in alone.as_provenance()

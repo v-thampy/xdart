@@ -253,9 +253,15 @@ class FrameBackgroundPlan:
     normalization_key: str | None = None
     metadata_format: str = "Auto"
     stable_read_policy: str = _STABLE_POLICY
+    #: The Background images already have the dark subtracted: with a dark set, the
+    #: reducer subtracts them as they are instead of removing the dark from them.
+    #: Recorded only when set, so existing records keep their mappings.
+    dark_corrected: bool = False
     def __post_init__(self) -> None:
         if type(self.version) is not int or self.version != 1 or type(self.mode) is not str or self.mode not in _FRAME_MODES:
             raise ValueError("frame-background policy version/mode is invalid")
+        if type(self.dark_corrected) is not bool:
+            raise ValueError("frame-background dark-corrected flag must be a boolean")
         if type(self.scale) is bool or not isinstance(self.scale, (int, float)) \
                 or isinstance(self.scale, int) and abs(self.scale) > float.fromhex("0x1.fffffffffffffp+1023") \
                 or not math.isfinite(float(self.scale)):
@@ -309,16 +315,19 @@ class FrameBackgroundPlan:
     def to_mapping(self) -> dict[str, object]:
         self._complete()
         if self.mode == "None": return {"version": 1, "mode": "None"}
-        return {name: getattr(self, name) for name in self.__slots__}
+        values = {name: getattr(self, name) for name in self.__slots__ if name != "dark_corrected"}
+        if self.dark_corrected: values["dark_corrected"] = True
+        return values
     @classmethod
     def from_mapping(cls, value: Mapping[str, object] | None) -> "FrameBackgroundPlan":
         if value is None: return cls()
         if not isinstance(value, Mapping): raise ValueError("background provenance must be a mapping")
         if set(value) == {"version", "mode"} and type(value["version"]) is int and type(value["mode"]) is str and dict(value) == {"version": 1, "mode": "None"}: return cls()
-        if set(value) != set(cls.__slots__): raise ValueError("background provenance has an invalid keyset")
+        if set(value) - {"dark_corrected"} != set(cls.__slots__) - {"dark_corrected"}:
+            raise ValueError("background provenance has an invalid keyset")
         raw = dict(value); plan = cls(**{**raw, "locator": None})
         if type(raw["scale"]) is not float or plan.scale != raw["scale"]: raise ValueError("background provenance is not canonical")
-        for name in cls.__slots__: object.__setattr__(plan, name, raw[name])
+        for name in raw: object.__setattr__(plan, name, raw[name])
         plan._complete()
         if plan.to_mapping() != raw: raise ValueError("background provenance is not canonical")
         return plan
@@ -339,7 +348,8 @@ class FrameBackgroundResult:
     #: series). A float, or a per-pixel array only for a series with uneven counts.
     variance_factor: float | np.ndarray | None = None
     #: The factor the background image was multiplied by (scale × normalization
-    #: ratio). With a dark, the reducer removes the background's own dark first.
+    #: ratio). With a dark, the reducer removes the background's own dark first;
+    #: None when the plan marks the Background as already dark-corrected.
     scale: float | None = None
     def __post_init__(self) -> None:
         active = self.disposition == "RESOLVED" and self.background is not None
@@ -812,7 +822,8 @@ def _result(plan, frame_fact, background, body, cancelled, variance_factor=None,
     if type(variance_factor) is np.ndarray:
         variance_factor = _bytes_array(variance_factor)
     return FrameBackgroundResult("RESOLVED", frozen, raw,
-                                 hashlib.sha256(raw).hexdigest(), (), variance_factor, scale)
+                                 hashlib.sha256(raw).hexdigest(), (), variance_factor,
+                                 None if plan.dark_corrected else scale)
 def resolve_frame_background(
     plan: FrameBackgroundPlan, frame_fact: tuple[object, ...], *,
     cancelled: Event | Callable[[], bool] | None = None,
