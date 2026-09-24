@@ -222,7 +222,7 @@ def run_display_background(
         (f"contributors={len(contributors)}", f"finite={int(counts.sum())}"))
 
 _FRAME_MODES = frozenset({"None", "Single BG File", "Series Average", "BG Directory"}); _NONCONTAINER_SUFFIXES = frozenset({".cbf", ".edf", ".img", ".mar3450", ".raw", ".tif", ".tiff"})
-_CONTAINER_SUFFIXES = frozenset({".h5", ".hdf5", ".nxs"}); _MATCH_RULES = frozenset({"Scan Root + Frame Number", "Metadata Key"})
+_CONTAINER_SUFFIXES = frozenset({".h5", ".hdf5", ".nxs"}); _LAST_SAVED = "Last Saved Before Frame"; _MATCH_RULES = frozenset({"Scan Root + Frame Number", "Metadata Key", _LAST_SAVED})
 _STABLE_POLICY = "stat-sha256-decode-stat-v1"; _MEMBER = re.compile(r"^(.*?)[_-](\d+)$")
 _MAX_FILE = 256 * 1024 ** 2; _MAX_PIXELS = 67_108_864
 _MAX_MEMBERS = 10_000; _MAX_PATH_BYTES = 4 * 1024 ** 2
@@ -786,14 +786,26 @@ def _series_paths(value: str, cancelled) -> tuple[Path, ...]:
     members = tuple(value[-1] for value in sorted(values))
     if members.count(anchor) != 1: raise ValueError("Background Series anchor is absent or ambiguous")
     return members
+def _saved_times(candidates, cancelled) -> dict[Path, int]:
+    times = {}
+    for candidate in candidates:
+        _poll(cancelled); times[candidate] = candidate.stat().st_mtime_ns
+    return times
+def _last_saved(times: dict[Path, int], before_ns: int) -> Path | None:
+    """The Background file saved last, not after the frame; the later name breaks a tie."""
+    saved = [path for path, when in times.items() if when <= before_ns]
+    return max(saved, key=lambda path: (times[path], path.name.casefold(), path.name)) if saved else None
 def _directory_receipts(candidates, plan, target_tag, target_match, chosen,
-                        selected_facts, shape, cancelled):
+                        selected_facts, shape, cancelled, saved_before=None):
     matches = 0
+    times = _saved_times(candidates, cancelled) if plan.match_rule == _LAST_SAVED else None
+    pick = None if times is None else _last_saved(times, saved_before)
     for ordinal, candidate in enumerate(candidates):
         if _cancelled(cancelled): raise InterruptedError
         keys = tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key)))
         projected, metadata_source = _metadata(candidate, plan, keys, cancelled) if keys else ((), None)
         if plan.match_rule == "Metadata Key": match = dict(projected).get(plan.metadata_key) == target_tag
+        elif times is not None: match = candidate == pick
         else:
             parsed = _MEMBER.match(candidate.stem)
             match = bool(target_match and parsed and int(parsed.group(2)) == int(target_match.group(2)) and
@@ -803,6 +815,7 @@ def _directory_receipts(candidates, plan, target_tag, target_match, chosen,
         if match != (candidate == chosen): raise RuntimeError("Background Directory match changed")
         receipt = {"ordinal": ordinal, "candidate": str(candidate), "match": match,
                    "metadata_items": projected, "metadata_source": metadata_source}
+        if times is not None: receipt["saved_ns"] = times[candidate]
         if candidate == chosen:
             if (projected, metadata_source) != selected_facts[:2]:
                 raise RuntimeError("Background Directory selected metadata changed")
@@ -894,10 +907,22 @@ def resolve_frame_background(
         chosen = None
         target_tag = dict(target_items).get(plan.metadata_key) if plan.metadata_key else None
         target_match = _MEMBER.match(target_path.stem)
+        saved_before = None
+        if plan.match_rule == _LAST_SAVED:
+            # Each frame needs its own file time; frames in one container share one.
+            if target_selector is not None or target_path.suffix.casefold() in _CONTAINER_SUFFIXES:
+                raise ValueError("Last Saved Before Frame needs one image file per frame")
+            if root == target_path.parent and not plan.filename_filter.strip():
+                raise ValueError("Last Saved Before Frame: the Background folder holds the frames; "
+                                 "set a Filename Filter that selects only the Background files")
+            saved_before = target_path.stat().st_mtime_ns
+            pick = _last_saved(_saved_times(candidates, cancelled), saved_before)
+            if pick is None: raise ValueError("no Background file was saved before this frame")
         for candidate in candidates:
             if _cancelled(cancelled): raise InterruptedError
             projected = (); metadata_source = None; match = False
-            if plan.match_rule == "Metadata Key":
+            if plan.match_rule == _LAST_SAVED: match = candidate == pick
+            elif plan.match_rule == "Metadata Key":
                 projected, metadata_source = _metadata(candidate, plan,
                     tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key))), cancelled)
                 match = dict(projected).get(plan.metadata_key) == target_tag
@@ -920,18 +945,19 @@ def resolve_frame_background(
         selected_facts = (projected, metadata_source, source)
         first = _manifest(prefix, _directory_receipts(
             candidates, plan, target_tag, target_match, chosen, selected_facts,
-            shape, cancelled), cancelled); del candidates
+            shape, cancelled, saved_before), cancelled); del candidates
         fresh = _directory_paths(root, target_path, predicate, cancelled)
         second = _manifest(prefix, _directory_receipts(
             fresh, plan, target_tag, target_match, chosen, selected_facts,
-            shape, cancelled), cancelled); del fresh
+            shape, cancelled, saved_before), cancelled); del fresh
         if first != second: raise RuntimeError("Background Directory membership changed")
         count, receipt_bytes, digest = first
         return _result(plan, frame_fact, image, {"version": 1, "mode": plan.mode,
             "policy": policy, "frame_fact": frame_fact, "manifest": {"version": 1,
                 "count": count, "receipt_bytes": receipt_bytes, "sha256": digest},
             "selected": str(chosen), "metadata_items": projected,
-            "metadata_source": metadata_source, "decoded": source["decoded"]}, cancelled, factor, factor)
+            "metadata_source": metadata_source, "decoded": source["decoded"],
+            **({} if saved_before is None else {"frame_saved_ns": saved_before})}, cancelled, factor, factor)
     except InterruptedError:
         return FrameBackgroundResult("CANCELLED", None, None, None, ("cancelled",))
     except (FileNotFoundError, PermissionError, OSError, RuntimeError) as error:

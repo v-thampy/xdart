@@ -604,7 +604,7 @@ def _reduce_background_edit(
             desired = replace(plan, locator=str(Path(value).expanduser().absolute()))
         elif path == BACKGROUND_MATCH:
             if plan.mode != "BG Directory" or value not in {
-                "Scan Root + Frame Number", "Metadata Key"}:
+                "Scan Root + Frame Number", "Metadata Key", "Last Saved Before Frame"}:
                 return EditRefusal("Choose a supported Background match rule.")
             desired = replace(plan, match_rule=str(value),
                               metadata_key=None if value != "Metadata Key" else plan.metadata_key)

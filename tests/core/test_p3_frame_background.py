@@ -740,3 +740,47 @@ def test_dark_corrected_flag_keeps_older_mappings_and_reports_no_scale(
     # the reducer then subtracts the Background as it is: no factor to remove a dark with
     assert result.disposition == "RESOLVED" and result.scale is None
     np.testing.assert_array_equal(result.background, np.full((2, 2), 60.0))
+
+
+def test_directory_last_saved_before_frame(monkeypatch, tmp_path: Path) -> None:
+    """Darks collected during a scan: each frame takes the Background file saved last,
+    not after the frame's own file."""
+    root = tmp_path / "darks"; root.mkdir()
+    frames = tmp_path / "frames"; frames.mkdir()
+    early, late, tied = _files(root, ("dark_a.tif", "dark_b.tif", "dark_c.tif"))
+    first, second, before_any = _files(frames, ("scan_0001.tif", "scan_0002.tif", "scan_0000.tif"))
+    second_s = 1_000_000_000
+    for path, seconds in ((early, 10), (first, 20), (late, 30), (second, 40), (before_any, 5),
+                          (tied, 100)):
+        os.utime(path, ns=(seconds * second_s, seconds * second_s))
+    _decoder(monkeypatch, {early.name: np.full((2, 2), 1.0), late.name: np.full((2, 2), 2.0),
+                           tied.name: np.full((2, 2), 3.0)})
+    plan = FrameBackgroundPlan(mode="BG Directory", locator=str(root),
+                               match_rule="Last Saved Before Frame")
+    for frame, value in ((first, 1.0), (second, 2.0)):
+        result = resolve_frame_background(plan, _fact(frame))
+        assert result.disposition == "RESOLVED", result.diagnostics
+        np.testing.assert_array_equal(result.background, np.full((2, 2), value))
+    body = _payload(resolve_frame_background(plan, _fact(second)))
+    assert body["selected"] == str(late.resolve()) and body["frame_saved_ns"] == 40 * second_s
+    refused = resolve_frame_background(plan, _fact(before_any))
+    assert refused.disposition == "REFUSED" and "no Background file was saved before" in refused.diagnostics[0]
+    os.utime(tied, ns=(30 * second_s, 30 * second_s))  # saved together with dark_b: the later name
+    np.testing.assert_array_equal(resolve_frame_background(plan, _fact(second)).background,
+                                  np.full((2, 2), 3.0))
+    moved = resolve_frame_background(plan, _fact(second))
+    os.utime(tied, ns=(31 * second_s, 31 * second_s))  # a changed file time changes the record
+    assert resolve_frame_background(plan, _fact(second)).fingerprint != moved.fingerprint
+    container = resolve_frame_background(plan, _fact(first, dataset="/entry/data/data"))
+    assert container.disposition == "REFUSED" and "one image file per frame" in container.diagnostics[0]
+    shared = FrameBackgroundPlan(mode="BG Directory", locator=str(frames),
+                                 match_rule="Last Saved Before Frame")
+    for name in ("dark_d.tif",):
+        (frames / name).write_bytes(b"dark"); os.utime(frames / name, ns=(15 * second_s, 15 * second_s))
+    _decoder(monkeypatch, {"dark_d.tif": np.full((2, 2), 4.0)})
+    unfiltered = resolve_frame_background(shared, _fact(second))
+    assert unfiltered.disposition == "REFUSED" and "Filename Filter" in unfiltered.diagnostics[0]
+    filtered = resolve_frame_background(
+        FrameBackgroundPlan(mode="BG Directory", locator=str(frames), filename_filter="dark",
+                            match_rule="Last Saved Before Frame"), _fact(second))
+    np.testing.assert_array_equal(filtered.background, np.full((2, 2), 4.0))

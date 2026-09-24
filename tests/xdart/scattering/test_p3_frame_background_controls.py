@@ -142,3 +142,21 @@ def test_background_dark_corrected_checkbox(tmp_path: Path) -> None:
     assert marked.background.dark_corrected is True
     other = reduce_control_edit(RunIntentStore(marked).snapshot(), BACKGROUND_TYPE, "BG Directory")
     assert other.background.dark_corrected is False  # a new mode starts unmarked
+
+
+def test_background_directory_offers_last_saved_before_frame(tmp_path: Path) -> None:
+    from xdart.gui.tabs.scattering.controls_inventory import (
+        BACKGROUND_MATCH, BACKGROUND_METADATA_KEY,
+    )
+
+    directory = RunIntentStore(reduce_control_edit(_snapshot(tmp_path), BACKGROUND_TYPE,
+                                                   "BG Directory")).snapshot()
+    match = next(field for field in project_controls(directory, None, RunPhase.IDLE).fields
+                 if field.path == BACKGROUND_MATCH)
+    assert "Last Saved Before Frame" in match.choices
+    chosen = reduce_control_edit(directory, BACKGROUND_MATCH, "Last Saved Before Frame")
+    assert chosen.background.match_rule == "Last Saved Before Frame"
+    assert chosen.background.metadata_key is None
+    fields = {field.path for field in project_controls(
+        RunIntentStore(chosen).snapshot(), None, RunPhase.IDLE).fields}
+    assert BACKGROUND_METADATA_KEY not in fields

@@ -580,7 +580,7 @@ def bound_values(
             "Series Average",
             "BG Directory",
         ),
-        BACKGROUND_MATCH: ("Scan Root + Frame Number", "Metadata Key"),
+        BACKGROUND_MATCH: ("Scan Root + Frame Number", "Metadata Key", "Last Saved Before Frame"),
     }
     if intent.gi.enabled:
         choices.update({

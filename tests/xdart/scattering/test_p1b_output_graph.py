@@ -3216,7 +3216,7 @@ def _append_admitted(tmp_path, poni, target, source, request_value, **fields):
         executor.cancel_admission(token)
 
 
-def _reintegrated_1d(output, tmp_path, labels=(1, 2, 3)):
+def _reintegrated_1d(output, source_root, labels=(1, 2, 3)):
     from xrd_tools.io.finite_artifact import _snapshot_path
     from xrd_tools.reduction import ReintegrateSuccessorPlan, run_reintegrate_successor
     from xrd_tools.reduction.reintegrate_prepared import _target_snapshot
@@ -3232,7 +3232,7 @@ def _reintegrated_1d(output, tmp_path, labels=(1, 2, 3)):
     }
     plan = ReintegrateSuccessorPlan.from_artifact(
         str(output), entry="entry", dimension="1d", preparation=preparation,
-        source_root=str(tmp_path), expected_labels=labels,
+        source_root=str(source_root), expected_labels=labels,
         expected_target_snapshot=_target_snapshot(_snapshot_path(output)),
     )
     result = run_reintegrate_successor(plan)
@@ -3289,6 +3289,39 @@ def test_a_dark_corrected_background_is_subtracted_as_it_is(tmp_path):
         **corrections, "background": replace(background, dark_corrected=False)})
 
 
+def test_darks_collected_during_a_scan_as_last_saved_background(tmp_path):
+    from xrd_tools.io import get_1d
+    from xrd_tools.reduction import FrameBackgroundPlan
+
+    frames, darks, reference_folder = (tmp_path / name for name in ("frames", "darks", "reference"))
+    for folder in (frames, darks, reference_folder):
+        folder.mkdir()
+    second = 1_000_000_000
+    for label, saved in ((1, 20), (2, 40), (3, 60)):
+        _write_tiff(frames / f"frame_{label:04d}.tif", 100 + label)
+        os.utime(frames / f"frame_{label:04d}.tif", ns=(saved * second, saved * second))
+    for name, value, saved in (("dark_a.tif", 10, 10), ("dark_b.tif", 20, 50)):
+        _write_tiff(darks / name, value)
+        os.utime(darks / name, ns=(saved * second, saved * second))
+    # frames 1 and 2 were taken after dark_a, frame 3 after dark_b
+    for label, value in ((1, 91), (2, 92), (3, 83)):
+        _write_tiff(reference_folder / f"frame_{label:04d}.tif", value)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    background = FrameBackgroundPlan(mode="BG Directory", locator=str(darks),
+                                     match_rule="Last Saved Before Frame")
+    corrected = _finished_output(tmp_path, poni, tmp_path / "corrected.nexus",
+                                 frames / "frame_0001.tif", 1837, background=background)
+    reference = _finished_output(tmp_path, poni, tmp_path / "reference.nexus",
+                                 reference_folder / "frame_0001.tif", 1838)
+    for label in (1, 2, 3):
+        np.testing.assert_allclose(get_1d(corrected, frame=label).intensity,
+                                   get_1d(reference, frame=label).intensity, rtol=1e-6)
+    again = _reintegrated_1d(corrected, frames)
+    for label in (1, 2, 3):
+        original, redone = get_1d(corrected, frame=label), get_1d(again, frame=label)
+        np.testing.assert_array_equal(redone.intensity, original.intensity)
+        np.testing.assert_array_equal(redone.sigma, original.sigma)
 def test_an_output_from_before_the_background_dark_rule_keeps_its_rule(tmp_path, monkeypatch):
     # The build before 3b614512 subtracted a Background as it was and recorded no rule
     # (Codex round-3/4 review F1): emulated at its two seams. Append now refuses such an
