@@ -22,10 +22,10 @@ def _close(page, qapp):
     qapp.processEvents()
 
 
-def _edited_page(tmp_path):
-    form = _native_form(tmp_path, "multigeometry", scans="1")
+def _edited_page(tmp_path, backend="multigeometry"):
+    form = _native_form(tmp_path, backend, scans="1")
     dark = tmp_path / "dark.npy"
-    np.save(dark, np.ones((195, 487)))
+    np.save(dark, np.ones(form.detector_shape))
     page = StitchPage(empty_host_services(_Status()))
     page.load_form(form)
     for key, value in (("frame_check", "Exclude empty and partial frames"),
@@ -36,9 +36,10 @@ def _edited_page(tmp_path):
     return page
 
 
-@pytest.mark.parametrize("manual", (False, True))
-def test_settings_round_trip_every_input(qapp, tmp_path, manual):
-    page = _edited_page(tmp_path)
+@pytest.mark.parametrize(("backend", "manual"), (("multigeometry", False), ("multigeometry", True),
+                                                 ("xu_hist", False)))
+def test_settings_round_trip_every_input(qapp, tmp_path, backend, manual):
+    page = _edited_page(tmp_path, backend)
     restored = StitchPage(empty_host_services(_Status()))
     try:
         if manual:  # a 2θ axis with a manual range and a manual intensity threshold
@@ -56,6 +57,9 @@ def test_settings_round_trip_every_input(qapp, tmp_path, manual):
         again = restored.build_form()
         assert again.fingerprint == built.fingerprint
         assert (again.flat_min_fraction, again.polarization_factor, again.npt_1d) == (.25, .95, 80)
+        if backend == "xu_hist":  # the asset-owned rows are shown from the asset and locked
+            assert restored._value("source_motors") == page._value("source_motors")
+            assert not restored._rows["source_motors"].isEnabled()
     finally:
         _close(page, qapp)
         _close(restored, qapp)

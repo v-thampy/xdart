@@ -96,6 +96,9 @@ def apply_page_settings(page, document: Any) -> None:
             page._fields[key] = replace(page._fields[key], value=value)
         page._render_ranges()
     page._set_calibration_settings(document.get("calibration"))
+    # As after load_form: the XU asset owns some fields, now that its paths are back.
+    page._sync_advanced()
+    page._refresh_xu_geometry()
 
 
 def dump_settings(document: dict[str, Any]) -> str:
