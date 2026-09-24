@@ -117,6 +117,9 @@ ADVANCED_METHODS_2D = (
 GI_HISTOGRAM_METHODS = ("cython", "python")
 DEFAULT_GI_HISTOGRAM_METHOD = "cython"
 DEFAULT_POLARIZATION_FACTOR = 0.99
+#: Error models the Advanced editor offers (None = no sigma). A persisted
+#: custom model is kept while it is left unchanged.
+ADVANCED_ERROR_MODELS = (None, "poisson")
 _ADVANCED_LEAVES = (
     "correctSolidAngle",
     "apply_polarization",
@@ -126,6 +129,7 @@ _ADVANCED_LEAVES = (
     "delta_dummy",
     "chi_offset",
     "safe",
+    "error_model",
 )
 ADVANCED_FIELD_PATHS = tuple(
     (root, leaf)
@@ -144,6 +148,7 @@ class AdvancedDimensionValues:
     delta_dummy: object
     chi_offset: object
     safe: object
+    error_model: object = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,6 +346,7 @@ def _advanced_dimension_values(
         args.get("delta_dummy"),
         offset,
         bool(args.get("safe", True)),
+        args.get("error_model"),
     )
 
 
@@ -384,6 +390,9 @@ def _validate_advanced_dimension(
     chi_offset = _finite_float(values.chi_offset)
     if isinstance(chi_offset, EditRefusal):
         return EditRefusal(f"{root} chi offset must be finite.")
+    if (values.error_model not in ADVANCED_ERROR_MODELS
+            and values.error_model != current.error_model):
+        return EditRefusal(f"{root} error model is unsupported.")
     return AdvancedDimensionValues(
         values.correct_solid_angle,
         values.apply_polarization,
@@ -397,6 +406,7 @@ def _validate_advanced_dimension(
         delta_dummy,
         chi_offset,
         values.safe,
+        values.error_model,
     )
 
 
@@ -445,6 +455,11 @@ def _install_advanced_dimension(
         args["chi_offset"] = desired.chi_offset
     if desired.safe != current.safe:
         args["safe"] = desired.safe
+    if desired.error_model != current.error_model:
+        if desired.error_model is None:
+            args.pop("error_model", None)
+        else:
+            args["error_model"] = desired.error_model
 
 
 def reduce_control_edit(

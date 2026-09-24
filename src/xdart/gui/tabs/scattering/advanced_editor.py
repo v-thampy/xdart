@@ -29,6 +29,7 @@ class _DimensionEditors:
     delta_dummy: QtWidgets.QLineEdit
     chi_offset: QtWidgets.QLineEdit
     safe: QtWidgets.QCheckBox
+    error_model: QtWidgets.QComboBox
 
 
 class AdvancedSettingsDialog(QtWidgets.QDialog):
@@ -160,6 +161,13 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         delta_dummy = QtWidgets.QLineEdit()
         chi_offset = QtWidgets.QLineEdit()
         safe = QtWidgets.QCheckBox("Safe integration")
+        error_model = QtWidgets.QComboBox()
+        error_model.addItem("None", None)
+        error_model.addItem("Poisson", "poisson")
+        error_model.setToolTip(
+            "Poisson propagates counting uncertainty and saves sigma with the "
+            "result. The χ profile has no sigma."
+        )
 
         form.addRow(solid_angle)
         form.addRow(apply_polarization)
@@ -168,6 +176,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         form.addRow("Dummy", dummy)
         form.addRow("Dummy tolerance", delta_dummy)
         form.addRow("χ offset (°)", chi_offset)
+        form.addRow("Error model", error_model)
         form.addRow(safe)
         apply_polarization.toggled.connect(
             polarization_factor.setEnabled
@@ -182,6 +191,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
             delta_dummy,
             chi_offset,
             safe,
+            error_model,
         )
 
     def edit(
@@ -265,6 +275,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
                 editors.delta_dummy,
                 editors.chi_offset,
                 editors.safe,
+                editors.error_model,
             )
         )
         editors.solid_angle.setChecked(bool(values.correct_solid_angle))
@@ -289,6 +300,17 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         editors.delta_dummy.setText(_optional_text(values.delta_dummy))
         editors.chi_offset.setText(str(values.chi_offset))
         editors.safe.setChecked(bool(values.safe))
+        model = values.error_model
+        index = editors.error_model.findData(model)
+        if index < 0:
+            editors.error_model.addItem(str(model), model)
+            index = editors.error_model.count() - 1
+            editors.error_model.setItemData(
+                index,
+                "Current custom error model.",
+                QtCore.Qt.ItemDataRole.ToolTipRole,
+            )
+        editors.error_model.setCurrentIndex(index)
         editors.polarization_factor.setEnabled(
             bool(values.apply_polarization)
         )
@@ -319,6 +341,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
             editors.delta_dummy.text(),
             editors.chi_offset.text(),
             editors.safe.isChecked(),
+            editors.error_model.currentData(),
         )
 
 
