@@ -10,6 +10,7 @@ from xrd_tools.corrections.beam import (
 from xrd_tools.corrections.detector import (
     DEFAULT_MIN_FLAT_FRACTION,
     apply_flatfield,
+    prepare_dark,
     prepare_flatfield,
     apply_mask,
     apply_threshold,
@@ -54,6 +55,7 @@ __all__ = [
     # detector
     "DEFAULT_MIN_FLAT_FRACTION",
     "apply_flatfield",
+    "prepare_dark",
     "prepare_flatfield",
     "apply_mask",
     "apply_threshold",

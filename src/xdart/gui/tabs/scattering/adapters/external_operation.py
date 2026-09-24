@@ -62,7 +62,7 @@ class _ScanPlotRequest:
     roi_result: object | None
 def _average_calibration(configuration: FrozenRunConfiguration, cancelled=None):
     from .. import output_preflight
-    from xrd_tools.session.experiment_state import CalibrationState, FactStatus, FlatState, MaskState, PoniValues
+    from xrd_tools.session.experiment_state import CalibrationState, DetectorImageState, FactStatus, MaskState, PoniValues
     assets = output_preflight._load_scientific_assets(
         configuration,
         cancelled=(lambda: False) if cancelled is None else cancelled.is_set,
@@ -71,6 +71,8 @@ def _average_calibration(configuration: FrozenRunConfiguration, cancelled=None):
     if configuration.mask_file and assets.mask_bytes is None: raise ValueError("AVERAGE_MASK_UNAVAILABLE")
     flat_file = getattr(configuration, "flat_file", "")
     if flat_file and assets.flat_bytes is None: raise ValueError("AVERAGE_FLAT_UNAVAILABLE")
+    dark_file = getattr(configuration, "dark_file", "")
+    if dark_file and assets.dark_bytes is None: raise ValueError("AVERAGE_DARK_UNAVAILABLE")
     config = None
     if assets.poni_values is not None:
         text = assets.poni_detector_config_json
@@ -101,14 +103,16 @@ def _average_calibration(configuration: FrozenRunConfiguration, cancelled=None):
             np.frombuffer(assets.mask_bytes, dtype=dtype).reshape(shape)
             mask_state = MaskState(configuration.mask_file, assets.mask_sha256 or "", dtype.str, shape, FactStatus.PRESENT)
         except (TypeError, ValueError, OverflowError) as error: raise ValueError("AVERAGE_MASK_UNREPRESENTABLE") from error
-    flat_state = FlatState.absent()
-    if assets.flat_bytes is not None:
-        flat_state = FlatState(flat_file, assets.flat_sha256 or "",
-                               assets.flat_shape, FactStatus.PRESENT)
-    state = (CalibrationState(mask=mask_state, flat=flat_state) if values is None else
+    flat_state, dark_state = (
+        DetectorImageState.absent() if payload is None
+        else DetectorImageState(path, digest or "", shape, FactStatus.PRESENT)
+        for path, payload, digest, shape in (
+            (flat_file, assets.flat_bytes, assets.flat_sha256, assets.flat_shape),
+            (dark_file, assets.dark_bytes, assets.dark_sha256, assets.dark_shape)))
+    state = (CalibrationState(mask=mask_state, flat=flat_state, dark=dark_state) if values is None else
         CalibrationState(values, assets.poni_values[7], config, "",
             assets.poni_sha256 or "", configuration.poni_file, mask_state,
-            FactStatus.PRESENT, assets.poni_parallax, flat_state))
+            FactStatus.PRESENT, assets.poni_parallax, flat_state, dark_state))
     if values is None: return state
     try:
         from xrd_tools.core import PONI

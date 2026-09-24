@@ -94,7 +94,7 @@ def test_average_applies_records_and_authenticates_its_flat(tmp_path):
     from xrd_tools.reduction import AverageScanRecipe
     from xrd_tools.reduction import average as module
     from xrd_tools.session.experiment_state import (
-        CalibrationState, FactStatus, FlatState, PoniValues,
+        CalibrationState, FactStatus, DetectorImageState, PoniValues,
     )
     from xrd_tools.sources.selection import image_series_spec
 
@@ -120,8 +120,8 @@ def test_average_applies_records_and_authenticates_its_flat(tmp_path):
         runner.close()
         return result
 
-    plain = run("plain", FlatState.absent())
-    flat = run("flat", FlatState(str(flat_path), digest, (4, 4), FactStatus.PRESENT))
+    plain = run("plain", DetectorImageState.absent())
+    flat = run("flat", DetectorImageState(str(flat_path), digest, (4, 4), FactStatus.PRESENT))
     assert plain.disposition == flat.disposition == "COMMITTED", (plain, flat)
     before, after = get_1d(plain.target, frame=1), get_1d(flat.target, frame=1)
     finite = np.isfinite(before.intensity)
@@ -134,7 +134,7 @@ def test_average_applies_records_and_authenticates_its_flat(tmp_path):
     with h5py.File(plain.target, "r") as handle:
         assert "flatfield" not in handle["entry/instrument/detector"]
 
-    changed = run("changed", FlatState(str(flat_path), "0" * 64, (4, 4), FactStatus.PRESENT))
+    changed = run("changed", DetectorImageState(str(flat_path), "0" * 64, (4, 4), FactStatus.PRESENT))
     assert changed.disposition != "COMMITTED"
     assert "AVERAGE_FLAT_DIGEST_CHANGED" in f"{changed.diagnostic_code} {changed.diagnostic}"
 

@@ -138,8 +138,9 @@ class OutputCandidate:
             "poni_sha256": accepted.poni_sha256,
             "mask_sha256": accepted.mask_sha256,
         }
-        if accepted.flat_sha256 is not None:
-            processing["accepted_scientific_assets"]["flat_sha256"] = accepted.flat_sha256
+        for key in ("flat_sha256", "dark_sha256"):
+            if getattr(accepted, key) is not None:
+                processing["accepted_scientific_assets"][key] = getattr(accepted, key)
         return cls(
             source, str(intent.poni_file), str(intent.mask_file), str(intent.save_path),
             json.dumps(
@@ -993,7 +994,9 @@ def _validate_deferred_targets(
         raw_inodes.add((int(stat.st_dev), int(stat.st_ino)))
     protected = tuple(
         Path(value)
-        for value in (configuration.poni_file, configuration.mask_file)
+        for value in (configuration.poni_file, configuration.mask_file,
+                      getattr(configuration, "flat_file", ""),
+                      getattr(configuration, "dark_file", ""))
         if value
     )
     seen: set[str] = set()
@@ -1999,6 +2002,8 @@ def _validate_targets(
     protected = tuple(
         Path(value) for value in (
             configuration.poni_file, configuration.mask_file,
+            getattr(configuration, "flat_file", ""),
+            getattr(configuration, "dark_file", ""),
             source.metadata_uri if type(source) is SourceSpec else None,
         ) if value
     )
@@ -2044,8 +2049,11 @@ def _load_scientific_assets(
     mask, mask_digest = _load_stable_mask_asset(
         intent.mask_file, calibration, cancelled=cancelled,
     )
-    flat, flat_digest = _load_stable_flat_asset(
-        getattr(intent, "flat_file", ""), cancelled=cancelled,
+    flat, flat_digest = _load_stable_correction_asset(
+        getattr(intent, "flat_file", ""), "flat", cancelled=cancelled,
+    )
+    dark, dark_digest = _load_stable_correction_asset(
+        getattr(intent, "dark_file", ""), "dark", cancelled=cancelled,
     )
     poni = None if calibration is None else calibration.poni
     poni_values = None if poni is None else (
@@ -2070,6 +2078,9 @@ def _load_scientific_assets(
         flat_shape=None if flat is None else tuple(int(v) for v in flat.shape),
         flat_bytes=None if flat is None else flat.tobytes(),
         flat_sha256=flat_digest,
+        dark_shape=None if dark is None else tuple(int(v) for v in dark.shape),
+        dark_bytes=None if dark is None else dark.tobytes(),
+        dark_sha256=dark_digest,
     )
 def _scientific_mask_layout(path: Path) -> tuple[tuple[int, int], np.dtype]:
     if path.suffix.casefold() == ".npy":
@@ -2240,40 +2251,43 @@ def _load_stable_mask_asset(
     if value.dtype != np.dtype(bool) or tuple(value.shape) != shape:
         raise ValueError(f"scientific mask schema is unsupported: {path}")
     return value, before_digest
-def _load_stable_flat_asset(
+def _load_stable_correction_asset(
     path_text: object,
+    role: str,
     *,
     cancelled: Callable[[], bool] = _not_cancelled,
 ) -> tuple[np.ndarray | None, str | None]:
-    """Admit a flat field: one bounded 2-D image, prepared, stable while read.
+    """Admit a flat field or dark: one bounded 2-D image, prepared, stable while read.
 
     A missing file is refused, not skipped: dropping a requested correction
     would change the science silently.
     """
     if type(path_text) is not str or not path_text:
         return None, None
-    from xrd_tools.corrections import prepare_flatfield
+    from xrd_tools.corrections import prepare_dark, prepare_flatfield
+    prepare, name = ((prepare_flatfield, "flat field") if role == "flat"
+                     else (prepare_dark, "dark"))
     path = Path(path_text)
     if cancelled():
         raise RuntimeError("admission cancelled")
-    with tempfile.TemporaryDirectory(prefix="xdart-flat-preflight-") as root:
-        snapshot = Path(root) / ("flat" + path.suffix)
+    with tempfile.TemporaryDirectory(prefix=f"xdart-{role}-preflight-") as root:
+        snapshot = Path(root) / (role + path.suffix)
         try:
             before_state, before_digest = _stream_asset(
                 path, target=snapshot, max_bytes=_SCIENTIFIC_MASK_MAX_DECODED_BYTES,
                 cancelled=cancelled,
             )
         except FileNotFoundError as exc:
-            raise ValueError(f"flat field file is unavailable: {path}") from exc
+            raise ValueError(f"{name} file is unavailable: {path}") from exc
         _scientific_mask_layout(snapshot)
         if cancelled():
             raise RuntimeError("admission cancelled")
         raw = (np.load(snapshot, allow_pickle=False) if snapshot.suffix.casefold() == ".npy"
                else read_image(snapshot))
         try:
-            value = prepare_flatfield(raw).astype(np.float32)
+            value = prepare(raw).astype(np.float32)
         except ValueError as exc:
-            raise ValueError(f"flat field is unusable: {path}: {exc}") from exc
+            raise ValueError(f"{name} is unusable: {path}: {exc}") from exc
         try:
             after_state, after_digest = _stream_asset(
                 path, max_bytes=_SCIENTIFIC_MASK_MAX_DECODED_BYTES, cancelled=cancelled,

@@ -2948,6 +2948,140 @@ def test_append_refuses_a_changed_flat_field(tmp_path):
         append_executor.cancel_admission(token)
 
 
+def test_dark_run_subtracts_persists_and_reintegrates_the_dark(tmp_path):
+    import hashlib
+    from xrd_tools.io import get_1d
+    from xrd_tools.io.finite_artifact import _snapshot_path
+    from xrd_tools.reduction import ReintegrateSuccessorPlan, run_reintegrate_successor
+    from xrd_tools.reduction.reintegrate_prepared import _target_snapshot
+
+    subtracted_folder = tmp_path / "subtracted"
+    subtracted_folder.mkdir()
+    for label in range(1, 4):
+        _write_tiff(tmp_path / f"frame_{label:04d}.tif", 40 + label)
+        _write_tiff(subtracted_folder / f"frame_{label:04d}.tif", 30 + label)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    shape = fabio.open(str(tmp_path / "frame_0001.tif")).data.shape
+    dark = np.full(shape, 10.0)
+    dark[:3] = np.nan  # unusable dark rows are masked, like the mask below
+    np.save(tmp_path / "dark.npy", dark)
+    mask = np.zeros(shape, dtype=np.uint8)
+    mask[:3] = 1
+    np.save(tmp_path / "mask.npy", mask)
+
+    def run(name, source, request_value, **files):
+        intent = _intent(source, tmp_path / f"{name}.nexus", poni)
+        intent.bai_1d_args = {**intent.bai_1d_args, "error_model": "poisson"}
+        for key, value in files.items():
+            setattr(intent, key, value)
+        executor = StandardRunExecutor(join_timeout=5.0)
+        identity = _start(executor, intent, request_value=request_value)
+        try:
+            events = _drain_until(
+                executor, lambda values: any(e.kind in _TERMINAL for e in values),
+                timeout=90.0,
+            )
+            terminal = next(e for e in events if e.kind in _TERMINAL)
+            assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
+        finally:
+            assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+        return _written(Path(intent.save_path))
+
+    darkened = run("darkened", tmp_path / "frame_0001.tif", 1803, dark_file=str(tmp_path / "dark.npy"))
+    reference = run("reference", subtracted_folder / "frame_0001.tif", 1804,
+                    mask_file=str(tmp_path / "mask.npy"))
+    with h5py.File(darkened, "r") as handle:
+        stored = handle["entry/instrument/detector/darkcurrent"]
+        expected = dark.astype(np.float32)
+        np.testing.assert_array_equal(stored[()], expected)
+        assert stored.attrs["sha256"] == hashlib.sha256(expected.tobytes()).hexdigest()
+        assert "flatfield" not in handle["entry/instrument/detector"]
+        run_configuration = json.loads(handle["entry/reduction/config/run_configuration"][()])
+    assert run_configuration["dark_file"] == str(tmp_path / "dark.npy")
+    signed = run_configuration["scientific_signature"]["accepted_scientific_assets"]
+    assert signed["dark_sha256"] == hashlib.sha256((tmp_path / "dark.npy").read_bytes()).hexdigest()
+    for label in (1, 2, 3):
+        with_dark, pre_subtracted = get_1d(darkened, frame=label), get_1d(reference, frame=label)
+        covered = np.isfinite(with_dark.sigma) & (with_dark.sigma > 0)
+        assert covered.any()
+        np.testing.assert_allclose(with_dark.intensity, pre_subtracted.intensity, rtol=1e-6)
+        # raw 40 + label counts less a 10-count dark: variance raw + dark, not raw - dark
+        np.testing.assert_allclose((with_dark.sigma / pre_subtracted.sigma)[covered],
+                                   np.sqrt((50 + label) / (30 + label)), rtol=1e-5)
+
+    preparation = {
+        "api_version": 1,
+        "selected_plan": {"version": 1, "dimension": "1d",
+                          "bai_args": {"npt": 8, "method": "numpy", "error_model": "poisson"},
+                          "gi_mode": "q_total"},
+        "requested_shared_science": {"version": 1, "kind": "persisted_target"},
+        "resource_policy": {"version": 1, "kind": "resolve", "envelope_bytes": 8 << 30,
+                            "requests": {"workers": 1, "reduction_inflight": 1}},
+    }
+
+    def reintegrate(target):
+        plan = ReintegrateSuccessorPlan.from_artifact(
+            str(target), entry="entry", dimension="1d", preparation=preparation,
+            source_root=str(tmp_path), expected_labels=(1, 2, 3),
+            expected_target_snapshot=_target_snapshot(_snapshot_path(target)),
+        )
+        return run_reintegrate_successor(plan)
+
+    result = reintegrate(darkened)
+    assert result.output_artifact is not None, result.diagnostics
+    for label in (1, 2, 3):
+        original, again = get_1d(darkened, frame=label), get_1d(result.output_artifact, frame=label)
+        np.testing.assert_array_equal(again.intensity, original.intensity)
+        np.testing.assert_array_equal(again.sigma, original.sigma)
+    # A changed persisted dark is refused, never silently used.
+    with h5py.File(darkened, "r+") as handle:
+        handle["entry/instrument/detector/darkcurrent"][5, 5] = 7.0
+    with pytest.raises(ValueError, match="processed dark current changed"):
+        reintegrate(darkened)
+
+
+def test_append_refuses_a_changed_dark(tmp_path):
+    for label in range(1, 4):
+        _write_tiff(tmp_path / f"frame_{label:04d}.tif", 20 + label)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    shape = fabio.open(str(tmp_path / "frame_0001.tif")).data.shape
+    dark = tmp_path / "dark.npy"
+    np.save(dark, np.full(shape, 2.0))
+    target = tmp_path / "out.nexus"
+    first = _intent(tmp_path / "frame_0001.tif", target, poni)
+    first.dark_file = str(dark)
+    executor = StandardRunExecutor(join_timeout=5.0)
+    identity = _start(executor, first, request_value=1805)
+    try:
+        events = _drain_until(
+            executor, lambda values: any(e.kind in _TERMINAL for e in values), timeout=90.0,
+        )
+        terminal = next(e for e in events if e.kind in _TERMINAL)
+        assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
+    finally:
+        assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+    before = _written(target).read_bytes()
+    append = _intent(tmp_path / "frame_0001.tif", target, poni, output_mode="Append")
+    append.dark_file = str(dark)
+    same_executor = StandardRunExecutor()
+    admission, _capture, token = _admit(same_executor, append, request_value=1806)
+    try:
+        assert type(admission) is AdmissionReceipt  # the unchanged dark is admitted
+    finally:
+        same_executor.cancel_admission(token)
+    np.save(dark, np.full(shape, 3.0))  # same path, different dark
+    append_executor = StandardRunExecutor()
+    admission, _capture, token = _admit(append_executor, append, request_value=1807)
+    try:
+        assert type(admission) is AdmissionFailure
+        assert "Append" in admission.reason
+        assert _written(target).read_bytes() == before
+    finally:
+        append_executor.cancel_admission(token)
+
+
 def test_post_g2_funded_staging_partial_grant_refuses_before_output_and_retries(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

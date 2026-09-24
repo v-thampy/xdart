@@ -1458,14 +1458,17 @@ class StandardRunExecutor:
                 run.scan.extra = extra
             mask = None if assets is None else assets.mask
             flat = None if assets is None else assets.flat
-            if mask is not None or flat is not None:
-                # Persist the applied mask and flat: Reintegrate reuses only the
-                # output's own copies, never the source files.
+            dark = None if assets is None else assets.dark
+            if mask is not None or flat is not None or dark is not None:
+                # Persist the applied mask, flat and dark: Reintegrate reuses only
+                # the output's own copies, never the source files.
                 extra = dict(getattr(run.scan, "extra", None) or {})
                 if mask is not None:
                     extra["global_mask"] = np.flatnonzero(np.asarray(mask, dtype=bool))
                 if flat is not None:
                     extra["flatfield"] = flat
+                if dark is not None:
+                    extra["darkcurrent"] = dark
                 run.scan.extra = extra
         except SourceRevisionChanged:
             discard_source()
@@ -1495,13 +1498,15 @@ class StandardRunExecutor:
             if item is not None
             else len(run.scan.frames)
         )
-        if getattr(configuration, "flat_file", "") and (
-                assets is None or assets.flat_bytes is None):
-            raise ValueError("the configured flat field was not admitted")
+        for key, name in (("flat", "flat field"), ("dark", "dark")):
+            if getattr(configuration, f"{key}_file", "") and (
+                    assets is None or getattr(assets, f"{key}_bytes") is None):
+                raise ValueError(f"the configured {name} was not admitted")
         plan = replace(
             native_int_reduction_plan(configuration, companion_modes_2d=True),
             mask=None if assets is None else assets.mask,
             flat=None if assets is None else assets.flat,
+            dark=None if assets is None else assets.dark,
         )
         try:
             npt = int(configuration.bai_1d_args.get("npt", 0))

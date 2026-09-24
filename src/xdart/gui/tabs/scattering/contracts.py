@@ -206,20 +206,24 @@ class AcceptedScientificAssets:
     mask_sha256: str | None
     poni_detector_config_json: str | None = None
     poni_parallax: bool | None = None
-    #: The admitted flat field as prepared float32 (unusable pixels NaN).
+    #: The admitted flat field and dark as prepared float32 (unusable pixels NaN).
     flat_shape: tuple[int, int] | None = None
     flat_bytes: bytes | None = None
     flat_sha256: str | None = None
+    dark_shape: tuple[int, int] | None = None
+    dark_bytes: bytes | None = None
+    dark_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        flat_parts = (self.flat_shape, self.flat_bytes, self.flat_sha256)
-        if any(value is not None for value in flat_parts) and not (
-                type(self.flat_shape) is tuple and len(self.flat_shape) == 2
-                and all(type(value) is int and value > 0 for value in self.flat_shape)
-                and type(self.flat_bytes) is bytes
-                and len(self.flat_bytes) == 4 * self.flat_shape[0] * self.flat_shape[1]
-                and type(self.flat_sha256) is str and len(self.flat_sha256) == 64):
-            raise TypeError("accepted flat field is invalid")
+        for role, name in (("flat", "flat field"), ("dark", "dark")):
+            shape, payload, digest = (getattr(self, f"{role}_{part}")
+                                      for part in ("shape", "bytes", "sha256"))
+            if any(value is not None for value in (shape, payload, digest)) and not (
+                    type(shape) is tuple and len(shape) == 2
+                    and all(type(value) is int and value > 0 for value in shape)
+                    and type(payload) is bytes and len(payload) == 4 * shape[0] * shape[1]
+                    and type(digest) is str and len(digest) == 64):
+                raise TypeError(f"accepted {name} is invalid")
         values = self.poni_values
         if values is not None and not (
                 type(values) is tuple and len(values) == 8
@@ -316,6 +320,11 @@ class AcceptedScientificAssets:
     def flat(self) -> np.ndarray | None:
         return None if self.flat_bytes is None else np.frombuffer(
             self.flat_bytes, dtype=np.float32).reshape(self.flat_shape).copy()
+
+    @property
+    def dark(self) -> np.ndarray | None:
+        return None if self.dark_bytes is None else np.frombuffer(
+            self.dark_bytes, dtype=np.float32).reshape(self.dark_shape).copy()
 
 def _copy_source(value: SourceSelection) -> SourceSelection:
     if type(value) is SourceSpec:

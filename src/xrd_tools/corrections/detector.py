@@ -128,6 +128,34 @@ def prepare_flatfield(
     return array
 
 
+def prepare_dark(dark: np.ndarray) -> np.ndarray:
+    """
+    Return a dark-current image whose unusable pixels are NaN, which pyFAI masks.
+
+    A non-finite dark pixel cannot be subtracted. The dark is not clipped or
+    rescaled: pyFAI subtracts it as given. With the Poisson error model xdart adds
+    its counts to the variance, the counting noise of a single-exposure dark.
+
+    Parameters
+    ----------
+    dark : ndarray
+        2-D dark-current image.
+
+    Returns
+    -------
+    np.ndarray
+        Float64 copy with non-finite pixels set to NaN.
+    """
+    array = np.array(dark, dtype=np.float64)
+    if array.ndim != 2:
+        raise ValueError("dark must be a 2-D detector image")
+    valid = np.isfinite(array)
+    if not valid.any():
+        raise ValueError("dark has no finite pixel")
+    array[~valid] = np.nan
+    return array
+
+
 def apply_threshold(
     image: np.ndarray,
     threshold: float,
@@ -274,6 +302,7 @@ __all__ = [
     "apply_threshold",
     "combine_masks",
     "correct_image",
+    "prepare_dark",
     "prepare_flatfield",
     "subtract_dark",
 ]

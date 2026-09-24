@@ -271,6 +271,8 @@ class WriterFinalization:
     detector_shape: tuple[int, ...] | None = None
     #: The applied flat field (unusable pixels NaN), persisted for Reintegrate.
     flatfield: Any | None = None
+    #: The subtracted dark current (unusable pixels NaN), persisted for Reintegrate.
+    darkcurrent: Any | None = None
     stitched_1d: Any | None = None
     stitched_2d: Any | None = None
     stitched_provenance: Mapping[str, Any] | str | None = None
@@ -6111,7 +6113,8 @@ class NexusRecordWriter:
         calibration = dict(finalization.detector_calibration or {})
         if (not calibration and finalization.global_mask is None
                 and finalization.detector_shape is None
-                and finalization.flatfield is None):
+                and finalization.flatfield is None
+                and finalization.darkcurrent is None):
             return
         instrument = self._entry_group().require_group("instrument")
         instrument.attrs["NX_class"] = "NXinstrument"
@@ -6151,17 +6154,22 @@ class NexusRecordWriter:
             if mask.size:
                 dataset = detector.create_dataset("mask", data=mask)
                 dataset.attrs["description"] = "flat pixel indices, shape (N,)"
-        if "flatfield" in detector:
-            del detector["flatfield"]
-        if finalization.flatfield is not None:
-            flat = np.ascontiguousarray(finalization.flatfield, dtype=np.float32)
-            if flat.ndim != 2:
-                raise ValueError("detector flat field must be 2-D")
-            dataset = detector.create_dataset("flatfield", data=flat)
-            dataset.attrs["description"] = (
-                "flat field applied in the integration normalization; NaN = masked"
-            )
-            dataset.attrs["sha256"] = hashlib.sha256(flat.tobytes()).hexdigest()
+        for name, value, description in (
+            ("flatfield", finalization.flatfield,
+             "flat field applied in the integration normalization; NaN = masked"),
+            ("darkcurrent", finalization.darkcurrent,
+             "dark current subtracted before integration; NaN = masked"),
+        ):
+            if name in detector:
+                del detector[name]
+            if value is None:
+                continue
+            image = np.ascontiguousarray(value, dtype=np.float32)
+            if image.ndim != 2:
+                raise ValueError(f"detector {name} must be 2-D")
+            dataset = detector.create_dataset(name, data=image)
+            dataset.attrs["description"] = description
+            dataset.attrs["sha256"] = hashlib.sha256(image.tobytes()).hexdigest()
         if "detector_shape" in detector:
             del detector["detector_shape"]
         if finalization.detector_shape is not None:

@@ -170,8 +170,8 @@ class MaskState:
         return cls()
 
 @dataclass(frozen=True, slots=True)
-class FlatState:
-    """The flat-field file an experiment applies, by content digest."""
+class DetectorImageState:
+    """A dark or flat-field file an experiment applies, by content digest."""
 
     source_uri: str = ""
     sha256: str = ""
@@ -183,12 +183,12 @@ class FlatState:
             object.__setattr__(self, name, _text(getattr(self, name), name))
         shape = tuple(self.shape)
         if any(type(value) is not int or value <= 0 for value in shape):
-            raise ValueError("flat shape entries must be positive integers")
+            raise ValueError("detector image shape entries must be positive integers")
         object.__setattr__(self, "shape", shape)
         if self.status is FactStatus.PRESENT and not (self.sha256 and self.source_uri):
-            raise ValueError("a present flat field needs a file and a content digest")
+            raise ValueError("a present dark or flat field needs a file and a content digest")
     @classmethod
-    def absent(cls) -> FlatState:
+    def absent(cls) -> DetectorImageState:
         return cls()
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +202,8 @@ class CalibrationState:
     mask: MaskState = field(default_factory=MaskState.absent)
     status: FactStatus = FactStatus.ABSENT
     parallax: bool | None = None
-    flat: FlatState = field(default_factory=FlatState.absent)
+    flat: DetectorImageState = field(default_factory=DetectorImageState.absent)
+    dark: DetectorImageState = field(default_factory=DetectorImageState.absent)
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", FactStatus(self.status))
         for name in ("detector_id", "value_fingerprint", "source_sha256", "source_uri"):
@@ -214,8 +215,9 @@ class CalibrationState:
             raise TypeError("values must be PoniValues or None")
         if not isinstance(self.mask, MaskState):
             raise TypeError("mask must be MaskState")
-        if not isinstance(self.flat, FlatState):
-            raise TypeError("flat must be FlatState")
+        for name in ("flat", "dark"):
+            if not isinstance(getattr(self, name), DetectorImageState):
+                raise TypeError(f"{name} must be DetectorImageState")
         if (self.status is FactStatus.PRESENT) != (self.values is not None):
             raise ValueError("calibration status and PONI values disagree")
         sensor = self.detector_config.get("sensor")
@@ -422,12 +424,13 @@ class ExperimentState:
         }
         if calibration.parallax is not None:
             calibration_content["parallax"] = calibration.parallax
-        flat = calibration.flat
-        if flat.status is not FactStatus.ABSENT:
-            calibration_content["flat"] = {
-                "source_uri": flat.source_uri, "sha256": flat.sha256,
-                "shape": list(flat.shape), "status": flat.status.value,
-            }
+        for name in ("flat", "dark"):
+            image = getattr(calibration, name)
+            if image.status is not FactStatus.ABSENT:
+                calibration_content[name] = {
+                    "source_uri": image.source_uri, "sha256": image.sha256,
+                    "shape": list(image.shape), "status": image.status.value,
+                }
         return {
             "schema_version": self.schema_version,
             "calibration": calibration_content,
@@ -477,10 +480,11 @@ class ExperimentState:
         calibration["mask"] = MaskState(**dict(_mapping(
             calibration.get("mask"), "calibration mask"
         )))
-        if "flat" in calibration:
-            calibration["flat"] = FlatState(**dict(_mapping(
-                calibration.get("flat"), "calibration flat"
-            )))
+        for name in ("flat", "dark"):
+            if name in calibration:
+                calibration[name] = DetectorImageState(**dict(_mapping(
+                    calibration.get(name), f"calibration {name}"
+                )))
         geometry["incidence"] = IncidenceState(**dict(_mapping(
             geometry.get("incidence"), "geometry incidence"
         )))
