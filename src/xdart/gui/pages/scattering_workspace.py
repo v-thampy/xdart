@@ -488,6 +488,9 @@ def build_scattering_workspace(
     intents = services.run_intents.store_for(key)
     persist_session = intents is None
     if intents is None:
+        from xdart.gui.tabs.scattering.controls_editing import (
+            DEFAULT_POLARIZATION_FACTOR,
+        )
         from xdart.utils.session import load_session
         from xrd_tools.core.staging import reduction_worker_cap
         from xrd_tools.session.run_intent_profile import load_run_intent_profile
@@ -496,11 +499,17 @@ def build_scattering_workspace(
         # small-RAM worker cap never trims.  This value is one nobody chose, so
         # it takes the cap's own default (two workers below 16 GiB); a Cores
         # edit or a restored session still wins.  One core stays with the GUI.
+        # SSRL beams are strongly horizontally polarized, so a fresh session
+        # corrects for it (POL-1); unticking it stores None, and a restored
+        # session keeps its own choice.
+        polarization = {"polarization_factor": DEFAULT_POLARIZATION_FACTOR}
         intent = RunIntent(
             output_mode="Overwrite",
             max_cores=min(
                 max(1, (os.cpu_count() or 1) - 1), reduction_worker_cap(None),
             ),
+            bai_1d_args=dict(polarization),
+            bai_2d_args=dict(polarization),
         )
         try:
             profile = load_session().get(_SESSION_PROFILE_KEY)

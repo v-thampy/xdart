@@ -793,6 +793,28 @@ def test_default_cores_follow_the_small_ram_worker_cap(
         qapp.processEvents()
 
 
+def test_a_fresh_session_applies_polarization_by_default(
+        qapp, isolated_settings, monkeypatch):
+    """POL-1: SSRL beams are strongly horizontally polarized; fresh runs correct for it."""
+    from xdart.gui.tabs.scattering.controls_editing import advanced_settings_values
+
+    monkeypatch.setenv("XDART_SESSION_FRESH", "1")
+    handle = _build_mounted_workspace(None, SimpleNamespaceStatus())
+    try:
+        snapshot = handle.widget._intents.snapshot()
+        values = advanced_settings_values(snapshot)
+        for dimension in (values.one_d, values.two_d):
+            assert dimension.apply_polarization is True
+            assert dimension.polarization_factor == 0.99
+        frozen = snapshot.thaw().freeze()
+        assert frozen.bai_1d_args["polarization_factor"] == 0.99
+        assert frozen.bai_2d_args["polarization_factor"] == 0.99
+    finally:
+        assert handle.close().status is PageCleanup.CLEAN
+        handle.widget.deleteLater()
+        qapp.processEvents()
+
+
 def test_default_cores_still_leave_one_core_for_the_interface(
         qapp, isolated_settings, monkeypatch):
     from xrd_tools.core import staging
