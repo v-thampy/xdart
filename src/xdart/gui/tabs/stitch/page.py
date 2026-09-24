@@ -1355,8 +1355,14 @@ class StitchPage(QtWidgets.QWidget):
         return page_settings(self)
 
     def apply_settings(self, document):
+        """Restore a settings document; one that cannot apply leaves the inputs as they were."""
         from .settings import apply_page_settings
-        apply_page_settings(self, document)
+        before = self.settings()
+        try:
+            apply_page_settings(self, document)
+        except Exception:
+            apply_page_settings(self, before)
+            raise
 
     def _calibration_settings_now(self):
         dialog = self._calibration_dialog
@@ -1412,11 +1418,12 @@ class StitchPage(QtWidgets.QWidget):
         if path is None:
             return ActionCompleted("stitch-settings-load-cancelled")
         try:
-            document = load_settings(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as error:
-            self._status(f"Could not load the Stitch settings: {error}", ready=False)
-            return ActionRefused(str(error))
-        self.apply_settings(document)
+            self.apply_settings(load_settings(path.read_text(encoding="utf-8")))
+        except Exception as error:  # noqa: BLE001 - a settings file is user input
+            reason = str(error) if isinstance(error, (OSError, ValueError)) else (
+                f"these Stitch settings cannot be applied here ({type(error).__name__}: {error})")
+            self._status(f"Could not load the Stitch settings: {reason}", ready=False)
+            return ActionRefused(reason)
         self._status(f"Stitch settings loaded: {path.name} · Preview required", ready=False)
         return ActionCompleted("stitch-settings-loaded")
 

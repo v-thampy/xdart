@@ -41,7 +41,7 @@ def page_settings(page) -> dict[str, Any]:
         "version": SETTINGS_VERSION,
         "fields": {key: _plain(page._value(key)) for key in page._fields if key not in _DERIVED},
         "sources": {str(kind): [str(path) for path in paths]
-                    for kind, paths in page._paths_by_kind.items()},
+                    for kind, paths in page._paths_by_kind.items() if paths},
         "threshold": {"apply_threshold": bool(state.apply_threshold),
                       "threshold_min": _plain(state.threshold_min),
                       "threshold_max": _plain(state.threshold_max),

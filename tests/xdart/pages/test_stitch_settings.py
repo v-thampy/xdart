@@ -170,3 +170,31 @@ def test_the_last_session_is_restored_and_a_fresh_start_ignores_it(qapp, tmp_pat
         fresh.widget.deleteLater()
         qapp.processEvents()
     assert session.read_bytes() == before
+
+
+def test_settings_that_cannot_apply_are_refused_and_leave_the_inputs(qapp, tmp_path, monkeypatch):
+    page = _edited_page(tmp_path)
+    document = page.settings()
+    document["fields"]["source_kind"] = "TIFF stack"  # a source kind this version lacks
+    broken = tmp_path / "broken.json"
+    broken.write_text(json.dumps(document))
+    before = page.settings()
+    try:
+        page._settings_path_chooser = lambda action, start: str(broken)
+        refused = page.load()
+        assert type(refused) is ActionRefused and "cannot be applied" in refused.reason
+        assert page.settings() == before
+    finally:
+        _close(page, qapp)
+
+    session = tmp_path / "session.json"  # the same document as the last session's
+    session.write_text(json.dumps({SESSION_KEY: document}))
+    monkeypatch.setenv("XDART_SESSION_FILE", str(session))
+    monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
+    restored = build_stitch_page(empty_host_services(_Status()), None).widget
+    default = StitchPage(empty_host_services(_Status()))
+    try:
+        assert restored.settings() == default.settings()
+    finally:
+        _close(restored, qapp)
+        _close(default, qapp)
