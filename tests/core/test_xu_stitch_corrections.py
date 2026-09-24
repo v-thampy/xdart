@@ -139,3 +139,27 @@ def test_only_a_corrected_xu_plan_changes_its_identity(tmp_path):
     np.save(dark, np.zeros(SHAPE))
     with pytest.raises(ValueError, match="native records"):
         XuStitchOperationPlan(receipt, effective, 1.0, 5.2, npt_1d=64, dark_path=dark)
+
+
+class _PedestalSource:
+    """Five frames on one nu row over a dark pedestal of 100; frame 3's signal dropped."""
+    frame_indices = (1, 2, 3, 4, 5)
+
+    def metadata_for(self, label):
+        return {"del": 10.0 + label, "nu": -5.0, "monitor": 1.0}
+
+    def load_frame(self, label):
+        return np.full(SHAPE, 100.0 if label == 3 else 150.0, dtype=np.float32)
+
+
+def test_a_pedestal_dropped_frame_is_excluded_only_when_the_dark_is_set(tmp_path):
+    from xrd_tools.integrate.frame_screen import FrameScreen, FrameScreenPolicy
+    receipt = _receipt(tmp_path)
+    verdicts = {}
+    for name, dark in (("plain", None), ("dark", np.full(SHAPE, 100.0))):
+        screen = FrameScreen(FrameScreenPolicy(), (1, 2, 3, 4, 5), (-5.0,) * 5)
+        run_xu_hist_stitch_1d(receipt, _PedestalSource(), frame_indices=(1, 2, 3, 4, 5),
+                              q_min_A_inverse=1.0, q_max_A_inverse=5.2, npt=64, monitor_key="monitor",
+                              max_frame_bytes=4 * 1024 * 1024, frame_screen=screen, dark=dark)
+        verdicts[name] = screen.summary()["excluded"]
+    assert verdicts == {"plain": [], "dark": [3]}
