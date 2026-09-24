@@ -72,8 +72,10 @@ def test_the_runtime_reproduces_the_arm_q_and_its_per_frame_solid_angle(tmp_path
             finally:
                 lease.release()
             assert float(np.max(np.abs(q - integrator.qFunction(rows, cols) / 10))) < 1e-8
+            # pyFAI's relative solid angle, scaled by the frame's distance (see below)
+            distance = (asset['corrections']['solid_angle_arm']['dist_m'] / integrator.dist) ** 2
             np.testing.assert_array_equal(geometry.frame_solid_angle(nu, delta),
-                                          CorrectionStack().normalization(integrator, SHAPE))
+                                          CorrectionStack().normalization(integrator, SHAPE) * distance)
 
 
 def test_the_xu_stitch_kernel_runs_on_a_v3_asset(tmp_path, transferred):
@@ -94,6 +96,47 @@ def test_the_xu_stitch_kernel_runs_on_a_v3_asset(tmp_path, transferred):
                                    max_frame_bytes=8 * 1024 * 1024)
     occupied = result.diagnostics.normalization > 0
     assert occupied.any() and np.isfinite(result.payload.intensity[occupied]).all()
+
+
+class _OneFrame:
+    frame_indices = (1,)
+
+    def __init__(self, delta, nu, image):
+        self.pose, self.image = {'del': delta, 'nu': nu}, image
+
+    def metadata_for(self, label):
+        return self.pose
+
+    def load_frame(self, label):
+        return self.image
+
+
+def test_v3_keeps_uniform_radiance_uniform_at_every_pose(tmp_path, transferred):
+    """A sample offset changes each frame's distance; its solid angle must follow.
+
+    Counts from a uniform radiance integrate to one level at every pose, as in
+    pyFAI MultiGeometry. v3 keeps XU's relative units: the level is that of the
+    arm's reference distance.
+    """
+    from xrd_tools.integrate.xu_stitch import run_xu_hist_stitch_1d
+
+    asset = transferred[0]
+    receipt = _receipt(tmp_path, asset)
+    diff = Diffractometer.from_pyfai_goniometer(_record(), source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
+    radiance, distances = 1e7, []
+    for delta, nu in ((6., -10.), (42., 18.)):
+        integrator, = create_multigeometry_integrators_from_geometry(
+            diff, {'del': np.array([delta]), 'nu': np.array([nu])})
+        pixel_area = integrator.detector.pixel1 * integrator.detector.pixel2
+        counts = radiance * CorrectionStack().normalization(integrator, SHAPE) * pixel_area / integrator.dist ** 2
+        distances.append(integrator.dist)
+        result = run_xu_hist_stitch_1d(receipt, _OneFrame(delta, nu, counts), frame_indices=(1,), npt=16,
+                                       monitor_key=None, max_frame_bytes=8 * 1024 * 1024)
+        occupied = result.diagnostics.normalization > 0
+        assert occupied.sum() >= 8
+        level = radiance * pixel_area / asset['corrections']['solid_angle_arm']['dist_m'] ** 2
+        np.testing.assert_allclose(result.payload.intensity[occupied], level, rtol=1e-9)
+    assert abs(distances[1] / distances[0] - 1) > 3e-3  # the offset moves the detector
 
 
 @pytest.mark.parametrize(('changes', 'message'), [

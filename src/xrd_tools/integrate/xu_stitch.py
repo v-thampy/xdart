@@ -329,7 +329,10 @@ def _extended_solid_angle(corrections, shape):
     """Version 3: per-frame solid angle from the attested pyFAI extended arm.
 
     The same per-frame integrators MultiGeometry uses, so the two backends weight
-    each frame alike; a sample offset changes the distances frame by frame.
+    each frame alike. MultiGeometry weights a frame by its absolute solid angle,
+    the relative one times pixel area / dist²; a sample offset changes dist frame
+    by frame. XU keeps its relative units: dist² is taken relative to the arm's
+    reference distance, so a frame at that distance is weighted as before.
     """
     from xrd_tools.analysis.xu_stitch_calibration import (
         EXTENDED_SOLID_ANGLE_POLICY, extended_arm_digest,
@@ -354,10 +357,13 @@ def _extended_solid_angle(corrections, shape):
     diffractometer = Diffractometer.from_pyfai_goniometer(
         stacked.to_pyfai_goniometer(calibration), source_motors={"nu_angle": "nu", "del_angle": "del"})
 
+    reference_dist = float(arm["dist_m"])
+
     def frame_solid_angle(nu: float, del_: float) -> np.ndarray:
         integrator, = create_multigeometry_integrators_from_geometry(
             diffractometer, {"del": np.array([float(del_)]), "nu": np.array([float(nu)])})
-        value = np.ascontiguousarray(CorrectionStack().normalization(integrator, shape), dtype=np.float64)
+        relative = np.ascontiguousarray(CorrectionStack().normalization(integrator, shape), dtype=np.float64)
+        value = relative * (reference_dist / float(integrator.dist)) ** 2
         if value.shape != shape or not np.isfinite(value).all() or np.any(value <= 0):
             raise XuStitchScienceRefused("XU_SOLID_ANGLE_MISMATCH", "per-frame solid angle is not finite and positive")
         return value
