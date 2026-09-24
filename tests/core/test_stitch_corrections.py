@@ -291,3 +291,36 @@ def test_a_rebuilt_old_multigeometry_record_drops_corrections_it_never_applied()
 def test_the_frame_screen_statistic_names_the_dark():
     from xrd_tools.integrate.frame_screen import FrameScreenPolicy
     assert 'dark-subtracted' in FrameScreenPolicy().to_provenance()['statistic']
+
+
+def test_the_flat_cutoff_reaches_the_streaming_merge():
+    rng = np.random.default_rng(5)
+    raw = rng.poisson(60, SHAPE).astype(float)
+    flat = np.full(SHAPE, 2.0)
+    flat[:, :3] = 0.6  # 30 % of the median: kept at the default 10 %, masked at 50 %
+    kwargs = dict(npt=24, radial_range=(0., 2.), method='full')
+    cut, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), flat=flat, flat_min_fraction=.5, **kwargs)
+    premasked = flat.copy()
+    premasked[:, :3] = np.nan
+    expected, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), flat=premasked, **kwargs)
+    np.testing.assert_array_equal(cut.intensity, expected.intensity)
+    kept, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), flat=flat, **kwargs)
+    assert not np.array_equal(kept.intensity, cut.intensity, equal_nan=True)
+
+
+def test_the_flat_cutoff_is_recorded_and_joins_the_plan_identity(tmp_path):
+    flat_value = np.full((195, 487), 2.)
+    flat_value[:, :40] = 0.6  # 30 % of the median
+    _, kept = _run(tmp_path, 'kept', flat_path=_project_file(tmp_path, 'kept', 'flat.npy', flat_value))
+    request, cut = _run(tmp_path, 'cut', flat_path=_project_file(tmp_path, 'cut', 'flat.npy', flat_value),
+                        flat_min_fraction=.5)
+    recorded = json.loads(cut.provenance_json)['plan']['corrections']['flat']
+    assert (recorded['min_fraction'], recorded['masked_pixels']) == (.5, 40 * 195)
+    assert json.loads(kept.provenance_json)['plan']['corrections']['flat']['masked_pixels'] == 0
+    assert np.all(cut.coverage <= kept.coverage + 1e-9) and np.any(cut.coverage < kept.coverage - 1e-6)
+    plan = request.plan
+    assert replace(plan, flat_min_fraction=.1).fingerprint != plan.fingerprint
+    assert replace(plan, flat_path=None, flat_min_fraction=.5).fingerprint \
+        == replace(plan, flat_path=None).fingerprint  # no flat: the cutoff changes nothing
+    with pytest.raises(ValueError, match="flat cutoff"):
+        replace(plan, flat_min_fraction=1.)

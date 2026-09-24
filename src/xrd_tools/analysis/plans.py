@@ -174,6 +174,8 @@ class StitchPlan:
     error_model: str | None = None
     dark: np.ndarray | None = field(default=None, repr=False, compare=False)
     flat: np.ndarray | None = field(default=None, repr=False, compare=False)
+    #: Flat pixels below this fraction of the flat's median are masked as dead.
+    flat_min_fraction: float = 0.1
 
     def provenance(self) -> dict[str, Any]:
         """A JSON-safe record of this stitch for persistence (pass to
@@ -203,6 +205,7 @@ class StitchPlan:
             "error_model": self.error_model,
             "dark": self.dark is not None,
             "flat": self.flat is not None,
+            **_flat_cutoff_record(self),
             "gi": _gi_settings_provenance(
                 self.gi,
                 wavelength_m=_stitch_plan_wavelength_m(self),
@@ -268,7 +271,15 @@ class StitchPlan:
                 else None),
             gi=GISettings.from_dict(gi) if gi else None,
             error_model=prov.get("error_model"),
+            flat_min_fraction=float(prov.get("flat_min_fraction", 0.1)),
         )
+
+
+def _flat_cutoff_record(plan: StitchPlan) -> dict[str, float]:
+    """The flat cutoff for a plan record: only with a flat and away from 10 %."""
+    if plan.flat is None or plan.flat_min_fraction == 0.1:
+        return {}
+    return {"flat_min_fraction": float(plan.flat_min_fraction)}
 
 
 def _multigeometry_corrections(plan: StitchPlan) -> dict[str, Any]:
@@ -286,6 +297,7 @@ def _multigeometry_corrections(plan: StitchPlan) -> dict[str, Any]:
         "error_model": plan.error_model,
         "dark": plan.dark,
         "flat": plan.flat,
+        "flat_min_fraction": plan.flat_min_fraction,
     }
 
 
@@ -834,9 +846,12 @@ def run_stitch(
         provenance={
             "plan": {
                 # Dark and flat are detector images: record their presence only.
-                **_plan_dict(replace(plan, dark=None, flat=None)),
+                **{key: value for key, value in
+                   _plan_dict(replace(plan, dark=None, flat=None)).items()
+                   if key != "flat_min_fraction"},
                 "dark": plan.dark is not None,
                 "flat": plan.flat is not None,
+                **_flat_cutoff_record(plan),
                 "gi": _gi_settings_provenance(
                     plan.gi,
                     wavelength_m=_stitch_plan_wavelength_m(plan, src),

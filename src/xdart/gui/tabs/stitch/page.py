@@ -408,6 +408,11 @@ class StitchPage(QtWidgets.QWidget):
                     choices=("None", "Poisson"))
         self._field(card, SectionId.PROCESSING, "dark_path", "Dark", browse=True)
         self._field(card, SectionId.PROCESSING, "flat_path", "Flat field", browse=True)
+        self._field(card, SectionId.PROCESSING, "flat_cutoff", "Flat cutoff (% of median)", "10")
+        self._rows["flat_cutoff"].setToolTip(
+            "Flat pixels below this share of the flat's median are treated as dead and masked. "
+            "Raise it to mask a region shadowed in the flat; lower it to keep weak but "
+            "working pixels. 0 masks only zero, negative and non-finite pixels.")
         close = QtWidgets.QPushButton("Close")
         close.clicked.connect(self.advanced.close)
         advanced_layout.addWidget(close)
@@ -669,9 +674,15 @@ class StitchPage(QtWidgets.QWidget):
                 factor = float(polarization) if polarization else None
             except ValueError as error:
                 raise ValueError("Polarization must be a number from -1 to 1, or blank") from error
+            cutoff = str(value("flat_cutoff")).strip()
+            try:
+                fraction = float(cutoff) / 100.0 if cutoff else 0.1
+            except ValueError as error:
+                raise ValueError("Flat cutoff must be a percentage from 0 to below 100") from error
             native.update(polarization_factor=factor,
                           dark_path=str(value("dark_path")).strip() or None,
-                          flat_path=str(value("flat_path")).strip() or None)
+                          flat_path=str(value("flat_path")).strip() or None,
+                          flat_min_fraction=fraction)
             if value("backend") != "xrayutilities histogram":
                 native.update(
                     sample_position=_SAMPLE_POSITIONS[value("sample_position")],
@@ -730,7 +741,8 @@ class StitchPage(QtWidgets.QWidget):
             solid_angle="On" if form.correct_solid_angle else "Off",
             polarization="" if form.polarization_factor is None else form.polarization_factor,
             error_model="Poisson" if form.error_model == "poisson" else "None",
-            dark_path=form.dark_path or "", flat_path=form.flat_path or "")
+            dark_path=form.dark_path or "", flat_path=form.flat_path or "",
+            flat_cutoff=f"{100 * form.flat_min_fraction:g}")
         if form.q_range is not None:
             fields.update(q_min=form.q_range[0], q_max=form.q_range[1])
         for key, value in fields.items():

@@ -42,6 +42,15 @@ def test_advanced_options_reach_the_prepared_plan(qapp, tmp_path):
         assert plan._dark_receipt.sha256 == hashlib.sha256(dark.read_bytes()).hexdigest()
         page.load_form(built)
         assert page.build_form().fingerprint == built.fingerprint
+        assert page._rows["flat_cutoff"].editor.isEnabled() and built.flat_min_fraction == .1
+        page.set_field("flat_cutoff", "50")
+        assert page.build_form().flat_min_fraction == .5
+        assert prepare_stitch_tool(page.build_form()).request.plan.flat_min_fraction == .5
+        page.set_field("flat_cutoff", "many")
+        with pytest.raises(ValueError, match="Flat cutoff"):
+            page.build_form()
+        page.set_field("flat_cutoff", "10")
+        assert page.build_form().fingerprint == built.fingerprint  # the default changes nothing
         page.set_field("polarization", "")
         assert page.build_form().polarization_factor is None
         page.set_field("polarization", "strong")

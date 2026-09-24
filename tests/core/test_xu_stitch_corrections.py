@@ -163,3 +163,16 @@ def test_a_pedestal_dropped_frame_is_excluded_only_when_the_dark_is_set(tmp_path
                               max_frame_bytes=4 * 1024 * 1024, frame_screen=screen, dark=dark)
         verdicts[name] = screen.summary()["excluded"]
     assert verdicts == {"plain": [], "dark": [3]}
+
+
+def test_the_flat_cutoff_reaches_the_xu_kernel(tmp_path):
+    receipt = _receipt(tmp_path)
+    flat = np.full(SHAPE, 2.0)
+    flat[:, :700] = 0.6  # 30 % of the median
+    kept = _run(receipt, flat=flat)
+    cut = _run(receipt, flat=flat, flat_min_fraction=0.5)
+    premasked = flat.copy()
+    premasked[:, :700] = np.nan
+    expected = _run(receipt, flat=premasked)
+    assert np.array_equal(cut.payload.intensity, expected.payload.intensity, equal_nan=True)
+    assert cut.diagnostics.coverage.sum() < kept.diagnostics.coverage.sum()

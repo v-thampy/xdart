@@ -174,7 +174,8 @@ def prepare_native_stitch_tool(form, project):
             geometry, use_detector_mask=form.use_detector_mask,
             sample_position=form.sample_position, correct_solid_angle=form.correct_solid_angle,
             polarization_factor=form.polarization_factor, error_model=form.error_model,
-            dark_path=form.dark_path, flat_path=form.flat_path, **common)
+            dark_path=form.dark_path, flat_path=form.flat_path,
+            flat_min_fraction=form.flat_min_fraction, **common)
         motors = tuple(source for _name, source in form.source_motors)
         energy_name = "energy"
     else:
@@ -186,7 +187,8 @@ def prepare_native_stitch_tool(form, project):
         if runtime_owner.execution_record is None:
             raise StitchToolPreflightRefused("XU_RUNTIME_CONFIG_RESTORE_FAILED")
         plan = XuStitchOperationPlan(calibration, effective, polarization_factor=form.polarization_factor,
-                                     dark_path=form.dark_path, flat_path=form.flat_path, **common)
+                                     dark_path=form.dark_path, flat_path=form.flat_path,
+                                     flat_min_fraction=form.flat_min_fraction, **common)
         acquisition = calibration.projection.value["acquisition"]
         motors = tuple(acquisition["source_motors"].values())
         energy_name = acquisition["source_energy_selector"]

@@ -267,6 +267,8 @@ class StitchToolForm:
     error_model: str | None = None
     dark_path: str | None = None
     flat_path: str | None = None
+    #: Flat pixels below this fraction of the flat's median are masked as dead.
+    flat_min_fraction: float = 0.1
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -481,7 +483,10 @@ class StitchToolForm:
                          self.mask_path, self.output_family, self.output_families,
                          ("native-options-v1", self.frame_screen, self.sample_position,
                           self.correct_solid_angle, self.polarization_factor, self.error_model,
-                          self.dark_path, self.flat_path))
+                          self.dark_path, self.flat_path)
+                         # a cutoff away from 10 % changes the form; the default keeps it
+                         + (() if self.flat_min_fraction == 0.1
+                            else (("flat-min-fraction", self.flat_min_fraction),)))
         object.__setattr__(
             self,
             "fingerprint",
@@ -506,8 +511,13 @@ class StitchToolForm:
         for name in ("dark_path", "flat_path"):
             if getattr(self, name) is not None:
                 object.__setattr__(self, name, _absolute_path(getattr(self, name), name.replace("_", " ")))
+        cutoff = self.flat_min_fraction
+        if (isinstance(cutoff, bool) or not isinstance(cutoff, (int, float))
+                or not math.isfinite(cutoff) or not 0.0 <= cutoff < 1.0):
+            raise ValueError("flat cutoff must be from 0 % to below 100 % of the median")
+        object.__setattr__(self, "flat_min_fraction", float(cutoff))
         corrected = (self.polarization_factor != 0.99 or self.dark_path is not None
-                     or self.flat_path is not None)
+                     or self.flat_path is not None or self.flat_min_fraction != 0.1)
         pyfai_only = (self.sample_position != "calibrated" or not self.correct_solid_angle
                       or self.error_model is not None)
         if not native and (pyfai_only or corrected or self.frame_screen != "empty"):

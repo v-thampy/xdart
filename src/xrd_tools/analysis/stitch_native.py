@@ -99,6 +99,8 @@ class StitchImageReceipt:
     #: flats only (derived from the pixels): pixels prepare_flatfield masks, and the median
     flat_masked_pixels: int | None = None
     flat_median: float | None = None
+    #: flats only: the cutoff those masked pixels were counted with
+    flat_min_fraction: float | None = None
 
     @property
     def fingerprint(self):
@@ -115,11 +117,13 @@ class StitchImageReceipt:
                 "sha256": self.sha256, "revision": list(self.revision), "shape": list(self.shape),
                 "receipt_fingerprint": self.fingerprint,
                 **({} if self.role != "flat" else {
-                    "min_fraction": DEFAULT_MIN_FLAT_FRACTION, "masked_pixels": self.flat_masked_pixels,
+                    "min_fraction": (DEFAULT_MIN_FLAT_FRACTION if self.flat_min_fraction is None
+                                     else self.flat_min_fraction),
+                    "masked_pixels": self.flat_masked_pixels,
                     "median": self.flat_median})}
 
 
-def capture_detector_image(path, role, max_bytes):
+def capture_detector_image(path, role, max_bytes, min_fraction=DEFAULT_MIN_FLAT_FRACTION):
     """Decode a single-image dark or flat file and bind its exact revision.
 
     Returns the receipt and the decoded float64 pixels in file orientation.
@@ -161,12 +165,13 @@ def capture_detector_image(path, role, max_bytes):
         finite = pixels[np.isfinite(pixels)]
         median = float(np.median(finite)) if finite.size else None
         try:
-            masked = int(np.isnan(prepare_flatfield(pixels)).sum())
+            masked = int(np.isnan(prepare_flatfield(pixels, min_fraction)).sum())
         except ValueError:
             _refuse("FLAT_UNUSABLE", "the flat field has no usable pixels")
     receipt = StitchImageReceipt(role, str(lexical), str(resolved), after, digest,
                                  tuple(pixels.shape), hashlib.sha256(pixels.tobytes()).hexdigest(),
-                                 masked, median)
+                                 masked, median,
+                                 float(min_fraction) if role == "flat" else None)
     return receipt, pixels
 
 
@@ -174,7 +179,9 @@ def native_detector_image(plan, receipt):
     """Re-decode a bound dark or flat image and orient it into the calibrated frame."""
     if receipt is None:
         return None
-    current, pixels = capture_detector_image(receipt.lexical_path, receipt.role, plan.max_frame_bytes)
+    current, pixels = capture_detector_image(
+        receipt.lexical_path, receipt.role, plan.max_frame_bytes,
+        DEFAULT_MIN_FLAT_FRACTION if receipt.flat_min_fraction is None else receipt.flat_min_fraction)
     if current != receipt:
         _refuse(f"{receipt.role.upper()}_IDENTITY_MISMATCH", f"{receipt.role} no longer matches Preview")
     _wavelength, shape, orientation = geometry_facts(plan)

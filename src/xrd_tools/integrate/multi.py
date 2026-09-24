@@ -25,6 +25,7 @@ from xrd_tools.core.containers import (
     IntegrationResult1D,
     IntegrationResult2D,
 )
+from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
 from xrd_tools.integrate.detector_mask import mask_with_detector
 from xrd_tools.integrate.calibration import poni_to_integrator
 
@@ -82,12 +83,13 @@ def _normalization_factors(
     return values
 
 
-def _detector_correction(value: np.ndarray | None, name: str, fill: float):
+def _detector_correction(value: np.ndarray | None, name: str, fill: float,
+                         min_fraction: float = DEFAULT_MIN_FLAT_FRACTION):
     """Split a dark or flat image into finite values and the pixels it invalidates.
 
     A non-finite dark pixel, or a flat pixel that ``prepare_flatfield`` finds
-    unusable (non-finite, not positive, or nearly dead), cannot be corrected: it
-    joins the frame mask and carries a neutral value.
+    unusable (non-finite, not positive, or below ``min_fraction`` of the median),
+    cannot be corrected: it joins the frame mask and carries a neutral value.
     """
     if value is None:
         return None, None
@@ -96,7 +98,7 @@ def _detector_correction(value: np.ndarray | None, name: str, fill: float):
         raise ValueError(f"Stitch {name} must be a 2-D detector image")
     if name == "flat":
         from xrd_tools.corrections.detector import prepare_flatfield  # noqa: PLC0415
-        invalid = ~np.isfinite(prepare_flatfield(array))
+        invalid = ~np.isfinite(prepare_flatfield(array, min_fraction))
     else:
         invalid = ~np.isfinite(array)
     if not invalid.any():
@@ -186,6 +188,7 @@ def _streaming_multigeometry(
     frame_screen: Any = None,
     dark: np.ndarray | None = None,
     flat: np.ndarray | None = None,
+    flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
 ):
     from pyFAI.multi_geometry import MultiGeometry
 
@@ -199,7 +202,7 @@ def _streaming_multigeometry(
     # noiseless (variance max(1, raw)); a measured dark carries its own counting
     # noise, so with a dark the variance max(1, raw) + dark is passed explicitly.
     dark, dark_invalid = _detector_correction(dark, "dark", 0.0)
-    flat, flat_invalid = _detector_correction(flat, "flat", 1.0)
+    flat, flat_invalid = _detector_correction(flat, "flat", 1.0, flat_min_fraction)
     invalid = (dark_invalid if flat_invalid is None else flat_invalid if dark_invalid is None
                else dark_invalid | flat_invalid)
     fixed_radial, fixed_azimuth = _resolve_streaming_ranges(
@@ -395,6 +398,7 @@ def stitch_1d_streaming(
     frame_screen: Any = None,
     dark: np.ndarray | None = None,
     flat: np.ndarray | None = None,
+    flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
 ) -> tuple[IntegrationResult1D, StitchDiagnostics]:
     """Sequential MultiGeometry merge that retains only one detector frame."""
 
@@ -417,6 +421,7 @@ def stitch_1d_streaming(
         frame_screen=frame_screen,
         dark=dark,
         flat=flat,
+        flat_min_fraction=flat_min_fraction,
     )
     sigma = result.sigma if result.sigma is not None else None
     radial_unit = str(result.unit) if result.unit is not None else unit
@@ -448,6 +453,7 @@ def stitch_2d_streaming(
     frame_screen: Any = None,
     dark: np.ndarray | None = None,
     flat: np.ndarray | None = None,
+    flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
 ) -> tuple[IntegrationResult2D, StitchDiagnostics]:
     """Sequential 2-D MultiGeometry merge retaining one detector frame."""
 
@@ -470,6 +476,7 @@ def stitch_2d_streaming(
         frame_screen=frame_screen,
         dark=dark,
         flat=flat,
+        flat_min_fraction=flat_min_fraction,
     )
     sigma = result.sigma if result.sigma is not None else None
     radial_unit = str(result.radial_unit)

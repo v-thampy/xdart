@@ -88,6 +88,7 @@ from xrd_tools.analysis.stitch_native import (
     native_provenance, capture_callback, geometry_facts,
     capture_detector_image, native_detector_image,
 )
+from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
 from xrd_tools.corrections.stack import CorrectionStack
 from xrd_tools.integrate.xu_stitch import (
     XuStitchCancelled,
@@ -1344,6 +1345,8 @@ class StitchOperationPlan:
     error_model: str | None = None
     dark_path: str | Path | None = None
     flat_path: str | Path | None = None
+    #: Flat pixels below this fraction of the flat's median are masked as dead.
+    flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
@@ -1423,7 +1426,7 @@ class StitchOperationPlan:
              self.error_model,
              None if self._dark_receipt is None else self._dark_receipt.fingerprint,
              None if self._flat_receipt is None else self._flat_receipt.fingerprint),
-        )
+        ) + _flat_cutoff_identity(self)
         return value + native_plan_identity(self) if self.native_records else value
 
 
@@ -1446,6 +1449,7 @@ class XuStitchOperationPlan:
     polarization_factor: float | None = 0.99
     dark_path: str | Path | None = None
     flat_path: str | Path | None = None
+    flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
@@ -1524,7 +1528,15 @@ def _xu_corrections_identity(plan):
         return ()
     return (("xu-corrections-v1", plan.polarization_factor,
              None if plan._dark_receipt is None else plan._dark_receipt.fingerprint,
-             None if plan._flat_receipt is None else plan._flat_receipt.fingerprint),)
+             None if plan._flat_receipt is None else plan._flat_receipt.fingerprint),
+            ) + _flat_cutoff_identity(plan)
+
+
+def _flat_cutoff_identity(plan):
+    """A flat cutoff away from 10 % changes the identity; the default keeps the old one."""
+    if plan._flat_receipt is None or plan.flat_min_fraction == DEFAULT_MIN_FLAT_FRACTION:
+        return ()
+    return (("flat-min-fraction", plan.flat_min_fraction),)
 
 
 def _correction_fields(plan):
@@ -1546,10 +1558,16 @@ def _polarization_field(plan):
 
 
 def _detector_image_fields(plan):
+    fraction = plan.flat_min_fraction
+    if (isinstance(fraction, bool) or not isinstance(fraction, (int, float))
+            or not math.isfinite(fraction) or not 0.0 <= fraction < 1.0):
+        raise ValueError("the flat cutoff must be a number from 0 to below 1")
+    object.__setattr__(plan, "flat_min_fraction", float(fraction))
     for role in ("dark", "flat"):
         path = getattr(plan, f"{role}_path")
         if path is not None:
-            receipt, _pixels = capture_detector_image(path, role, plan.max_frame_bytes)
+            receipt, _pixels = capture_detector_image(path, role, plan.max_frame_bytes,
+                                                      plan.flat_min_fraction)
             object.__setattr__(plan, f"{role}_path", receipt.lexical_path)
             object.__setattr__(plan, f"_{role}_receipt", receipt)
 
@@ -2393,6 +2411,7 @@ def _runtime_plan(plan: StitchOperationPlan, diffractometer) -> StitchPlan:
         error_model=plan.error_model,
         dark=native_detector_image(plan, plan._dark_receipt),
         flat=native_detector_image(plan, plan._flat_receipt),
+        flat_min_fraction=plan.flat_min_fraction,
         diffractometer=diffractometer,
         backend=plan.backend,
         mode=plan.mode,
@@ -2723,6 +2742,7 @@ class StitchOperationExecution:
                     polarization_factor=plan.polarization_factor,
                     dark=native_detector_image(plan, plan._dark_receipt),
                     flat=native_detector_image(plan, plan._flat_receipt),
+                    flat_min_fraction=plan.flat_min_fraction,
                     npt=plan.npt_1d,
                     monitor_key=(
                         None

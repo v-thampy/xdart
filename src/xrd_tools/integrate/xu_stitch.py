@@ -896,6 +896,7 @@ def run_xu_hist_stitch_1d(
     polarization_factor: float | None = None,
     dark: np.ndarray | None = None,
     flat: np.ndarray | None = None,
+    flat_min_fraction: float = 0.1,
 ) -> XuStitchScienceResult:
     """Run native Q or 2theta histogram bins; omitted bounds scout all geometry.
 
@@ -1114,7 +1115,7 @@ def run_xu_hist_stitch_1d(
                 raise ValueError("external mask must be boolean with the calibrated detector shape")
         from xrd_tools.integrate.multi import _detector_correction
         dark, dark_invalid = _detector_correction(dark, "dark", 0.0)
-        flat, flat_invalid = _detector_correction(flat, "flat", 1.0)
+        flat, flat_invalid = _detector_correction(flat, "flat", 1.0, flat_min_fraction)
         for name, value, invalid in (("dark", dark, dark_invalid), ("flat", flat, flat_invalid)):
             if value is not None and value.shape != geometry.projection.shape:
                 raise ValueError(f"Stitch {name} must have the calibrated detector shape")
