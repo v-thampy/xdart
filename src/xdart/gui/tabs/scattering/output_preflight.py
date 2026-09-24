@@ -2,12 +2,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import tempfile
 from typing import Any, Callable
 import numpy as np
 from xrd_tools.core.filters import compile_filter
+from xrd_tools.corrections.detector import (
+    DEFAULT_MIN_FLAT_FRACTION,
+    DetectorImageCheck,
+    check_detector_image,
+)
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.integrate.calibration import (
     apply_sensor_parallax,
@@ -60,6 +66,7 @@ from .contracts import (
 from .source_metadata import ordered_motor_intersection
 
 load_poni = load_detector_calibration
+_LOG = logging.getLogger(__name__)
 
 _SCIENTIFIC_ASSET_STREAM_CHUNK_BYTES = 1 << 16
 _SCIENTIFIC_MASK_COMPATIBILITY_FLOOR_BYTES = 64 << 20
@@ -2060,11 +2067,16 @@ def _load_scientific_assets(
     mask, mask_digest = _load_stable_mask_asset(
         intent.mask_file, calibration, cancelled=cancelled,
     )
-    flat, flat_digest = _load_stable_correction_asset(
-        getattr(intent, "flat_file", ""), "flat", cancelled=cancelled,
+    detector = (
+        _detector_facts(calibration)
+        if getattr(intent, "flat_file", "") or getattr(intent, "dark_file", "") else None
     )
-    dark, dark_digest = _load_stable_correction_asset(
-        getattr(intent, "dark_file", ""), "dark", cancelled=cancelled,
+    flat, flat_digest, flat_warnings = _load_stable_correction_asset(
+        getattr(intent, "flat_file", ""), "flat", cancelled=cancelled, detector=detector,
+        min_fraction=getattr(intent, "flat_min_fraction", DEFAULT_MIN_FLAT_FRACTION),
+    )
+    dark, dark_digest, dark_warnings = _load_stable_correction_asset(
+        getattr(intent, "dark_file", ""), "dark", cancelled=cancelled, detector=detector,
     )
     poni = None if calibration is None else calibration.poni
     poni_values = None if poni is None else (
@@ -2092,6 +2104,7 @@ def _load_scientific_assets(
         dark_shape=None if dark is None else tuple(int(v) for v in dark.shape),
         dark_bytes=None if dark is None else dark.tobytes(),
         dark_sha256=dark_digest,
+        correction_warnings=flat_warnings + dark_warnings,
     )
 def _scientific_mask_layout(path: Path) -> tuple[tuple[int, int], np.dtype]:
     if path.suffix.casefold() == ".npy":
@@ -2262,22 +2275,76 @@ def _load_stable_mask_asset(
     if value.dtype != np.dtype(bool) or tuple(value.shape) != shape:
         raise ValueError(f"scientific mask schema is unsupported: {path}")
     return value, before_digest
+def _detector_facts(calibration: object | None) -> tuple[tuple[int, int] | None, np.ndarray | None] | None:
+    """The calibrated detector's shape and own mask (gaps), or None when unknown."""
+    if calibration is None:
+        return None
+    try:
+        from xrd_tools.integrate.calibration import detector_calibration_to_integrator
+        detector = detector_calibration_to_integrator(calibration).detector
+        shape = None if detector.shape is None else tuple(int(v) for v in detector.shape)
+        mask = detector.mask
+    except Exception:  # noqa: BLE001 - an unknown detector only skips the checks
+        _LOG.debug("detector facts unavailable for the correction checks", exc_info=True)
+        return None
+    return shape, (None if mask is None else np.asarray(mask, dtype=bool))
+
+
+def _read_correction_image(path: Path, name: str) -> np.ndarray:
+    """Decode one dark or flat-field image, refusing anything but one 2-D image."""
+    try:
+        _scientific_mask_layout(path)
+    except ValueError as exc:
+        raise ValueError(f"the {name} must be one 2-D image: {path}") from exc
+    return (np.load(path, allow_pickle=False) if path.suffix.casefold() == ".npy"
+            else read_image(path))
+
+
+def inspect_detector_correction(
+    poni_file: str, path_text: str, role: str,
+    min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
+) -> DetectorImageCheck:
+    """Check a dark or flat-field file before a run: for the Advanced dialog.
+
+    Uses the selected PONI's detector for the shape and gap checks when one is set.
+    """
+    name = "flat field" if role == "flat" else "dark"
+    path = Path(path_text)
+    try:
+        raw = _read_correction_image(path, name)
+    except FileNotFoundError:
+        return DetectorImageCheck(role, (), errors=(f"the {name} file does not exist",))
+    except (OSError, ValueError) as exc:
+        return DetectorImageCheck(role, (), errors=(str(exc),))
+    detector = None
+    if poni_file:
+        try:
+            detector = _detector_facts(load_poni(Path(poni_file)))
+        except Exception:  # noqa: BLE001 - an unreadable PONI only skips the checks
+            detector = None
+    shape, mask = (None, None) if detector is None else detector
+    return check_detector_image(raw, role, detector_shape=shape, detector_mask=mask,
+                                min_fraction=min_fraction)
+
+
 def _load_stable_correction_asset(
     path_text: object,
     role: str,
     *,
     cancelled: Callable[[], bool] = _not_cancelled,
-) -> tuple[np.ndarray | None, str | None]:
+    min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
+    detector: tuple[tuple[int, int] | None, np.ndarray | None] | None = None,
+) -> tuple[np.ndarray | None, str | None, tuple[str, ...]]:
     """Admit a flat field or dark: one bounded 2-D image, prepared, stable while read.
 
     A missing file is refused, not skipped: dropping a requested correction
-    would change the science silently.
+    would change the science silently. So is an image that does not match the
+    calibrated detector; warnings (see ``check_detector_image``) are returned.
     """
     if type(path_text) is not str or not path_text:
-        return None, None
+        return None, None, ()
     from xrd_tools.corrections import prepare_dark, prepare_flatfield
-    prepare, name = ((prepare_flatfield, "flat field") if role == "flat"
-                     else (prepare_dark, "dark"))
+    name = "flat field" if role == "flat" else "dark"
     path = Path(path_text)
     if cancelled():
         raise RuntimeError("admission cancelled")
@@ -2290,15 +2357,19 @@ def _load_stable_correction_asset(
             )
         except FileNotFoundError as exc:
             raise ValueError(f"{name} file is unavailable: {path}") from exc
-        _scientific_mask_layout(snapshot)
         if cancelled():
             raise RuntimeError("admission cancelled")
-        raw = (np.load(snapshot, allow_pickle=False) if snapshot.suffix.casefold() == ".npy"
-               else read_image(snapshot))
         try:
-            value = prepare(raw).astype(np.float32)
+            raw = _read_correction_image(snapshot, name)
         except ValueError as exc:
-            raise ValueError(f"{name} is unusable: {path}: {exc}") from exc
+            raise ValueError(f"the {name} must be one 2-D image: {path}") from exc
+        shape, mask = (None, None) if detector is None else detector
+        check = check_detector_image(raw, role, detector_shape=shape, detector_mask=mask,
+                                     min_fraction=min_fraction)
+        if check.errors:
+            raise ValueError(f"{check.errors[0]}: {path}")
+        value = (prepare_flatfield(raw, min_fraction) if role == "flat"
+                 else prepare_dark(raw)).astype(np.float32)
         try:
             after_state, after_digest = _stream_asset(
                 path, max_bytes=_SCIENTIFIC_MASK_MAX_DECODED_BYTES, cancelled=cancelled,
@@ -2307,7 +2378,7 @@ def _load_stable_correction_asset(
             raise ValueError(f"scientific asset changed while admitted: {path}") from exc
     if after_state != before_state or after_digest != before_digest:
         raise ValueError(f"scientific asset changed while admitted: {path}")
-    return np.ascontiguousarray(value), before_digest
+    return np.ascontiguousarray(value), before_digest, check.warnings
 
 
 def _load_stable_asset(

@@ -177,6 +177,8 @@ class DetectorImageState:
     sha256: str = ""
     shape: tuple[int, ...] = ()
     status: FactStatus = FactStatus.ABSENT
+    #: Flat only: the cutoff below which flat pixels are masked (None = the default).
+    min_fraction: float | None = None
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", FactStatus(self.status))
         for name in ("source_uri", "sha256"):
@@ -185,6 +187,11 @@ class DetectorImageState:
         if any(type(value) is not int or value <= 0 for value in shape):
             raise ValueError("detector image shape entries must be positive integers")
         object.__setattr__(self, "shape", shape)
+        fraction = self.min_fraction
+        if fraction is not None and (
+                type(fraction) is not float or not math.isfinite(fraction)
+                or not 0.0 <= fraction < 1.0):
+            raise ValueError("a flat cutoff must be a float from 0 to below 1")
         if self.status is FactStatus.PRESENT and not (self.sha256 and self.source_uri):
             raise ValueError("a present dark or flat field needs a file and a content digest")
     @classmethod
@@ -430,6 +437,8 @@ class ExperimentState:
                 calibration_content[name] = {
                     "source_uri": image.source_uri, "sha256": image.sha256,
                     "shape": list(image.shape), "status": image.status.value,
+                    **({} if image.min_fraction is None
+                       else {"min_fraction": image.min_fraction}),
                 }
         return {
             "schema_version": self.schema_version,

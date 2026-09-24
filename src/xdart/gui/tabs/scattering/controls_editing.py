@@ -8,6 +8,7 @@ from pathlib import Path
 
 from xrd_tools.core.scan import SourceSpec
 from xrd_tools.core.filters import compile_filter
+from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
 from xrd_tools.reduction.background import FrameBackgroundPlan
 from xrd_tools.session.intent_store import (
     IntentCommitAccepted,
@@ -161,9 +162,11 @@ class AdvancedSettingsValues:
     poni_v3_material: object = "Si"
     poni_v3_thickness_m: object = 0.00045
     poni_v3_parallax: object = False
-    #: Detector corrections: dark-current and flat-field image files ("" = none).
+    #: Detector corrections: dark-current and flat-field image files ("" = none),
+    #: and the fraction of the flat's median below which flat pixels are masked.
     dark_file: object = ""
     flat_file: object = ""
+    flat_min_fraction: object = DEFAULT_MIN_FLAT_FRACTION
 
 
 def advanced_settings_values(
@@ -194,6 +197,7 @@ def advanced_settings_values(
         poni_v3_parallax=False if override is None else override.parallax,
         dark_file=intent.dark_file,
         flat_file=intent.flat_file,
+        flat_min_fraction=intent.flat_min_fraction,
     )
 
 
@@ -271,6 +275,9 @@ def reduce_advanced_settings(
         return EditRefusal("PONI v3 parallax requires true or false.")
     if type(values.dark_file) is not str or type(values.flat_file) is not str:
         return EditRefusal("Dark and flat-field paths must be text.")
+    cutoff = _finite_float(values.flat_min_fraction)
+    if isinstance(cutoff, EditRefusal) or not 0.0 <= cutoff < 1.0:
+        return EditRefusal("The flat cutoff must be from 0 % to below 100 % of the median.")
     desired = AdvancedSettingsValues(
         one_d=one_d,
         two_d=two_d,
@@ -282,6 +289,7 @@ def reduce_advanced_settings(
         poni_v3_parallax=values.poni_v3_parallax,
         dark_file=values.dark_file.strip(),
         flat_file=values.flat_file.strip(),
+        flat_min_fraction=cutoff,
     )
     if desired == current:
         return EditNoChange()
@@ -314,6 +322,7 @@ def reduce_advanced_settings(
     )
     candidate.dark_file = desired.dark_file
     candidate.flat_file = desired.flat_file
+    candidate.flat_min_fraction = desired.flat_min_fraction
     return candidate
 
 

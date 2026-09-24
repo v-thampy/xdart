@@ -3163,6 +3163,85 @@ def test_admission_refuses_an_output_that_would_overwrite_the_flat_or_dark(tmp_p
         executor.cancel_admission(token)
 
 
+@pytest.mark.parametrize("role", ("flat_file", "dark_file"))
+def test_admission_refuses_a_flat_or_dark_of_the_wrong_size(tmp_path, role):
+    _write_tiff(tmp_path / "frame_0001.tif", 5)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    np.save(tmp_path / "wrong.npy", np.ones((100, 100)))
+    intent = _intent(tmp_path / "frame_0001.tif", tmp_path / "out.nexus", poni)
+    setattr(intent, role, str(tmp_path / "wrong.npy"))
+    executor = StandardRunExecutor()
+    admission, _capture, token = _admit(executor, intent, request_value=1812 + (role == "dark_file"))
+    try:
+        assert type(admission) is AdmissionFailure, admission
+        assert "100 × 100 pixels but the detector is 195 × 487" in admission.reason
+    finally:
+        executor.cancel_admission(token)
+
+
+def test_flat_cutoff_masks_the_flat_warns_and_reintegrates(tmp_path):
+    from xrd_tools.io import get_1d
+    from xrd_tools.io.finite_artifact import _snapshot_path
+    from xrd_tools.reduction import ReintegrateSuccessorPlan, run_reintegrate_successor
+    from xrd_tools.reduction.reintegrate_prepared import _target_snapshot
+    from xdart.gui.tabs.scattering import output_preflight
+
+    for label in range(1, 4):
+        _write_tiff(tmp_path / f"frame_{label:04d}.tif", 10 * label)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    shape = fabio.open(str(tmp_path / "frame_0001.tif")).data.shape
+    flat = np.full(shape, 2.0)
+    flat[:10] = 0.6  # ten rows (5.1 % of the pixels) at 30 % of the median
+    np.save(tmp_path / "flat.npy", flat)
+    intent = _intent(tmp_path / "frame_0001.tif", tmp_path / "cut.nexus", poni)
+    intent.flat_file = str(tmp_path / "flat.npy")
+    kept = output_preflight._load_scientific_assets(intent)
+    np.testing.assert_array_equal(kept.flat[:10], np.float32(0.6))  # admitted as float32
+    assert kept.correction_warnings == ()
+    intent.flat_min_fraction = 0.5
+    cut = output_preflight._load_scientific_assets(intent)
+    assert np.isnan(cut.flat[:10]).all() and np.all(cut.flat[10:] == 2.0)
+    assert cut.correction_warnings == (
+        "the flat field masks 5.1 % of the detector's usable pixels "
+        "(dead or below 50 % of its median)",)
+
+    executor = StandardRunExecutor(join_timeout=5.0)
+    identity = _start(executor, intent, request_value=1814)
+    try:
+        events = _drain_until(
+            executor, lambda values: any(e.kind in _TERMINAL for e in values), timeout=90.0,
+        )
+        terminal = next(e for e in events if e.kind in _TERMINAL)
+        assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
+    finally:
+        assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+    output = _written(Path(intent.save_path))
+    with h5py.File(output, "r") as handle:
+        assert np.isnan(handle["entry/instrument/detector/flatfield"][:10]).all()
+        run_configuration = json.loads(handle["entry/reduction/config/run_configuration"][()])
+    assert run_configuration["flat_min_fraction"] == 0.5
+    preparation = {
+        "api_version": 1,
+        "selected_plan": {"version": 1, "dimension": "1d",
+                          "bai_args": {"npt": 8, "method": "numpy"}, "gi_mode": "q_total"},
+        "requested_shared_science": {"version": 1, "kind": "persisted_target"},
+        "resource_policy": {"version": 1, "kind": "resolve", "envelope_bytes": 8 << 30,
+                            "requests": {"workers": 1, "reduction_inflight": 1}},
+    }
+    plan = ReintegrateSuccessorPlan.from_artifact(
+        str(output), entry="entry", dimension="1d", preparation=preparation,
+        source_root=str(tmp_path), expected_labels=(1, 2, 3),
+        expected_target_snapshot=_target_snapshot(_snapshot_path(output)),
+    )
+    result = run_reintegrate_successor(plan)
+    assert result.output_artifact is not None, result.diagnostics
+    for label in (1, 2, 3):
+        np.testing.assert_array_equal(get_1d(result.output_artifact, frame=label).intensity,
+                                      get_1d(output, frame=label).intensity)
+
+
 def test_append_refuses_a_changed_dark(tmp_path):
     for label in range(1, 4):
         _write_tiff(tmp_path / f"frame_{label:04d}.tif", 20 + label)

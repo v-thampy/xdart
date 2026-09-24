@@ -213,6 +213,9 @@ class AcceptedScientificAssets:
     dark_shape: tuple[int, int] | None = None
     dark_bytes: bytes | None = None
     dark_sha256: str | None = None
+    #: Readiness warnings about the flat or dark (see check_detector_image), shown
+    #: when the run starts; they change nothing about the science.
+    correction_warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for role, name in (("flat", "flat field"), ("dark", "dark")):
@@ -224,6 +227,9 @@ class AcceptedScientificAssets:
                     and type(payload) is bytes and len(payload) == 4 * shape[0] * shape[1]
                     and type(digest) is str and len(digest) == 64):
                 raise TypeError(f"accepted {name} is invalid")
+        if type(self.correction_warnings) is not tuple or not all(
+                type(item) is str for item in self.correction_warnings):
+            raise TypeError("accepted correction warnings are invalid")
         values = self.poni_values
         if values is not None and not (
                 type(values) is tuple and len(values) == 8

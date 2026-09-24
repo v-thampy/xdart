@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from xrd_tools.core.scan import SourceSpec
+from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
 from xrd_tools.reduction.background import FrameBackgroundPlan
 from xrd_tools.reduction.provenance_config import jsonable_run_value
 from xrd_tools.session.run_configuration import (
@@ -458,6 +459,14 @@ def _validate_candidate(candidate: RunIntent) -> RunIntent:
     return candidate
 
 
+def _flat_cutoff(value: object) -> float:
+    """The saved flat cutoff, refused unless a number from 0 to below 1."""
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(float(value)) or not 0.0 <= float(value) < 1.0):
+        raise RunIntentProfileError("intent.flat_min_fraction must be from 0 to below 1")
+    return float(value)
+
+
 def _decode_versioned(document: dict[str, Any]) -> RunIntent:
     _keyset(document, _ENVELOPE_KEYS, path="profile")
     if document["schema"] != PROFILE_SCHEMA:
@@ -466,7 +475,7 @@ def _decode_versioned(document: dict[str, Any]) -> RunIntent:
         raise RunIntentProfileError("profile version is unsupported")
     data = _mapping(document["intent"], path="intent")
     intent_keys = set(data)
-    optional = {"poni_v3_override", "flat_file", "dark_file"}
+    optional = {"poni_v3_override", "flat_file", "flat_min_fraction", "dark_file"}
     if not set(_INTENT_KEYS) <= intent_keys <= set(_INTENT_KEYS) | optional:
         missing = sorted(_INTENT_KEYS - intent_keys)
         extra = sorted(intent_keys - _INTENT_KEYS - optional)
@@ -539,6 +548,7 @@ def _decode_versioned(document: dict[str, Any]) -> RunIntent:
         poni_values=poni_values,
         mask_file=_text(data["mask_file"], path="intent.mask_file"),
         flat_file=_text(data.get("flat_file", ""), path="intent.flat_file"),
+        flat_min_fraction=_flat_cutoff(data.get("flat_min_fraction", DEFAULT_MIN_FLAT_FRACTION)),
         dark_file=_text(data.get("dark_file", ""), path="intent.dark_file"),
         poni_v3_override=override,
         background=background,
@@ -618,6 +628,8 @@ def dump_run_intent_profile(intent: RunIntent) -> str:
         }
         if frozen.flat_file:
             document["intent"]["flat_file"] = frozen.flat_file
+        if frozen.flat_min_fraction != DEFAULT_MIN_FLAT_FRACTION:
+            document["intent"]["flat_min_fraction"] = frozen.flat_min_fraction
         if frozen.dark_file:
             document["intent"]["dark_file"] = frozen.dark_file
         if frozen.poni_v3_override is not None:

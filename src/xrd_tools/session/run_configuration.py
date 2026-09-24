@@ -33,6 +33,7 @@ from xrd_tools.corrections.grazing import (
     validate_gi_exit_angle_convention,
 )
 from xrd_tools.core.scan import SourceSpec
+from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
 from xrd_tools.reduction.provenance_config import jsonable_run_value
 from xrd_tools.session.gi_motor import pick_default_gi_motor
 from xrd_tools.sources.selection import (
@@ -890,6 +891,8 @@ class FrozenRunConfiguration:
     mask_file: str = ""
     #: Flat-field image applied in the integration normalization ("" = none).
     flat_file: str = ""
+    #: Flat pixels below this fraction of the flat's median are masked as dead.
+    flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
     #: Dark-current image subtracted before integration ("" = none).
     dark_file: str = ""
     poni_v3_override: PoniV3OverrideIntent | None = None
@@ -1013,6 +1016,8 @@ class FrozenRunConfiguration:
             value += (("background", _freeze_value(self.background.to_mapping())),)
         if self.flat_file:
             value += (("flat_file", str(self.flat_file)),)
+            if self.flat_min_fraction != DEFAULT_MIN_FLAT_FRACTION:
+                value += (("flat_min_fraction", float(self.flat_min_fraction)),)
         if self.dark_file:
             value += (("dark_file", str(self.dark_file)),)
         if self.poni_v3_override is not None:
@@ -1134,6 +1139,8 @@ class FrozenRunConfiguration:
             values["background"] = self.background.to_mapping()
         if self.flat_file:
             values["flat_file"] = self.flat_file
+            if self.flat_min_fraction != DEFAULT_MIN_FLAT_FRACTION:
+                values["flat_min_fraction"] = float(self.flat_min_fraction)
         if self.dark_file:
             values["dark_file"] = self.dark_file
         if self.poni_v3_override is not None:
@@ -1160,6 +1167,16 @@ class FrozenRunConfiguration:
         return values
 
 
+def _flat_min_fraction(value: object) -> float:
+    """The flat cutoff as a float from 0 to below 1."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("the flat cutoff must be a number")
+    fraction = float(value)
+    if not math.isfinite(fraction) or not 0.0 <= fraction < 1.0:
+        raise ValueError("the flat cutoff must be from 0 to below 1")
+    return fraction
+
+
 @dataclass(slots=True)
 class RunIntent:
     """Mutable Controls-owned intent that freezes into one run generation."""
@@ -1179,6 +1196,8 @@ class RunIntent:
     mask_file: str = ""
     #: Flat-field image applied in the integration normalization ("" = none).
     flat_file: str = ""
+    #: Flat pixels below this fraction of the flat's median are masked as dead.
+    flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
     #: Dark-current image subtracted before integration ("" = none).
     dark_file: str = ""
     poni_v3_override: PoniV3OverrideIntent | None = None
@@ -1267,6 +1286,7 @@ class RunIntent:
             poni_file=str(self.poni_file or ""),
             mask_file=str(self.mask_file or ""),
             flat_file=str(self.flat_file or ""),
+            flat_min_fraction=_flat_min_fraction(self.flat_min_fraction),
             dark_file=str(self.dark_file or ""),
             poni_v3_override=self.poni_v3_override,
             background=self.background,
@@ -1361,6 +1381,7 @@ class RunIntent:
             ),
             mask_file=self.mask_file,
             flat_file=self.flat_file,
+            flat_min_fraction=self.flat_min_fraction,
             dark_file=self.dark_file,
             poni_v3_override=self.poni_v3_override,
             background=self.background,
@@ -1393,6 +1414,7 @@ class RunIntent:
             poni_values=value.poni_values,
             mask_file=value.mask_file,
             flat_file=value.flat_file,
+            flat_min_fraction=value.flat_min_fraction,
             dark_file=value.dark_file,
             poni_v3_override=value.poni_v3_override,
             background=value.background,

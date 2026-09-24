@@ -45,6 +45,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         parent: QtWidgets.QWidget | None = None,
         *,
         path_chooser: Callable[[str, str], str | None] | None = None,
+        correction_inspector: Callable[[str, str, float], object] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("vnextAdvancedSettingsDialog")
@@ -54,6 +55,8 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         self._path_chooser = (
             path_chooser if path_chooser is not None else self._choose_file
         )
+        # (role, path, flat cutoff) -> DetectorImageCheck, for the status lines.
+        self._correction_inspector = correction_inspector
         layout = QtWidgets.QVBoxLayout(self)
         self.gi_group = QtWidgets.QGroupBox(
             "Grazing-incidence Fiber integration"
@@ -124,17 +127,33 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         self.corrections_group = QtWidgets.QGroupBox("Detector corrections")
         self.corrections_group.setObjectName("vnextDetectorCorrectionsGroup")
         corrections_form = QtWidgets.QFormLayout(self.corrections_group)
-        self.dark_file = self._correction_row(
+        self.dark_file, self.dark_status = self._correction_row(
             corrections_form, "dark", "Dark",
             "Dark-current image subtracted from every frame before integration. "
             "With the Poisson error model its counts add to the variance. "
-            "Background, if set, is subtracted as well.",
+            "Background, if set, is subtracted as well, less its own dark.",
         )
-        self.flat_file = self._correction_row(
+        self.flat_file, self.flat_status = self._correction_row(
             corrections_form, "flat", "Flat field",
             "Flat-field image the integration divides by. Dead pixels and pixels "
-            "below 10 % of its median are masked.",
+            "below the cutoff are masked.",
         )
+        self.flat_min_percent = QtWidgets.QDoubleSpinBox()
+        self.flat_min_percent.setObjectName("vnextFlatMinPercent")
+        self.flat_min_percent.setRange(0.0, 99.0)
+        self.flat_min_percent.setDecimals(1)
+        self.flat_min_percent.setSingleStep(1.0)
+        self.flat_min_percent.setSuffix(" % of median")
+        self.flat_min_percent.setToolTip(
+            "Flat pixels below this share of the flat's median are treated as dead "
+            "and masked. Raise it to mask a region shadowed in the flat; lower it to "
+            "keep weak but working pixels. 0 masks only zero, negative and "
+            "non-finite pixels."
+        )
+        self.flat_min_percent.valueChanged.connect(
+            lambda _value: self._refresh_status("flat")
+        )
+        corrections_form.addRow("Mask flat pixels below", self.flat_min_percent)
         layout.addWidget(self.corrections_group)
         forms = QtWidgets.QHBoxLayout()
         forms.setSpacing(12)
@@ -156,7 +175,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        self.resize(700, 660)
+        self.resize(700, 720)
 
     def _correction_row(
         self,
@@ -164,11 +183,12 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         role: str,
         label: str,
         tooltip: str,
-    ) -> QtWidgets.QLineEdit:
+    ) -> tuple[QtWidgets.QLineEdit, QtWidgets.QLabel]:
         path = QtWidgets.QLineEdit()
         path.setObjectName(f"vnext{role.title()}File")
         path.setPlaceholderText("None")
         path.setToolTip(tooltip)
+        path.editingFinished.connect(lambda: self._refresh_status(role))
         browse = QtWidgets.QPushButton("Browse…")
         browse.setObjectName(f"vnext{role.title()}FileBrowse")
         browse.clicked.connect(lambda _checked=False: self._browse(role, path))
@@ -176,12 +196,36 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         row.addWidget(path, 1)
         row.addWidget(browse)
         form.addRow(label, row)
-        return path
+        status = QtWidgets.QLabel()
+        status.setObjectName(f"vnext{role.title()}FileStatus")
+        status.setWordWrap(True)
+        status.setVisible(False)
+        form.addRow("", status)
+        return path, status
 
     def _browse(self, role: str, editor: QtWidgets.QLineEdit) -> None:
         selected = self._path_chooser(role, editor.text())
         if type(selected) is str and selected:
             editor.setText(selected)
+            self._refresh_status(role)
+
+    def _refresh_status(self, role: str) -> None:
+        """Check the dark or flat file and show what it would do, before a run."""
+        editor, status = ((self.dark_file, self.dark_status) if role == "dark"
+                          else (self.flat_file, self.flat_status))
+        path = editor.text().strip()
+        inspector = self._correction_inspector
+        if not path or inspector is None:
+            status.clear()
+            status.setVisible(False)
+            return
+        try:
+            check = inspector(role, path, self.flat_min_percent.value() / 100.0)
+            text = ("Not usable: " if check.errors else "") + check.summary()
+        except Exception as error:  # noqa: BLE001 - a failed check must not block editing
+            text = f"Could not check the file: {error}"
+        status.setText(text)
+        status.setVisible(True)
 
     def _choose_file(self, role: str, current: str) -> str | None:
         from xdart.utils.browse import browse_start_dir, remember_browse_path
@@ -315,6 +359,11 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         )
         self.dark_file.setText(str(values.dark_file))
         self.flat_file.setText(str(values.flat_file))
+        blocker = QtCore.QSignalBlocker(self.flat_min_percent)
+        self.flat_min_percent.setValue(100.0 * float(values.flat_min_fraction))
+        del blocker
+        for role in ("dark", "flat"):
+            self._refresh_status(role)
         standard_method_tooltip = (
             "This standard integration method is not used by "
             "FiberIntegrator in Grazing mode."
@@ -394,6 +443,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
             poni_v3_parallax=self.poni_v3_parallax.isChecked(),
             dark_file=self.dark_file.text(),
             flat_file=self.flat_file.text(),
+            flat_min_fraction=round(self.flat_min_percent.value(), 1) / 100.0,
         )
 
     @staticmethod

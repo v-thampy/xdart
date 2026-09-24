@@ -9,6 +9,8 @@ from xrd_tools.corrections.beam import (
 )
 from xrd_tools.corrections.detector import (
     DEFAULT_MIN_FLAT_FRACTION,
+    DetectorImageCheck,
+    check_detector_image,
     apply_flatfield,
     prepare_dark,
     prepare_flatfield,
@@ -54,6 +56,8 @@ __all__ = [
     "solid_angle_correction",
     # detector
     "DEFAULT_MIN_FLAT_FRACTION",
+    "DetectorImageCheck",
+    "check_detector_image",
     "apply_flatfield",
     "prepare_dark",
     "prepare_flatfield",

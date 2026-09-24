@@ -101,7 +101,7 @@ def _copy_calibration(value: CalibrationState) -> CalibrationState:
     _reject(type(value) is not CalibrationState, 'Average calibration must be an exact CalibrationState', TypeError); poni = value.values
     copied_values = None if poni is None else PoniValues(*(getattr(poni, item.name) for item in fields(PoniValues)))
     mask = value.mask; copied_mask = MaskState(mask.source_uri, mask.sha256, mask.dtype, tuple(mask.shape), mask.status)
-    flat, dark = (DetectorImageState(item.source_uri, item.sha256, tuple(item.shape), item.status) for item in (value.flat, value.dark))
+    flat, dark = (DetectorImageState(item.source_uri, item.sha256, tuple(item.shape), item.status, item.min_fraction) for item in (value.flat, value.dark))
     return CalibrationState(copied_values, value.detector_id, dict(value.detector_config), value.value_fingerprint, value.source_sha256, value.source_uri, copied_mask, value.status, value.parallax, flat, dark)
 def _copy_background(value: FrameBackgroundPlan | None) -> FrameBackgroundPlan | None:
     if value is None: return None
@@ -228,7 +228,8 @@ def _calibration_payload(value: CalibrationState) -> dict[str, Any]:
         image = getattr(value, name)
         if image.status is not FactStatus.ABSENT:
             payload[name] = {'source_uri': image.source_uri, 'sha256': image.sha256,
-                             'shape': list(image.shape), 'status': image.status.value}
+                             'shape': list(image.shape), 'status': image.status.value,
+                             **({} if image.min_fraction is None else {'min_fraction': image.min_fraction})}
     return payload
 def _plain_json(value: Any) -> Any:
     if isinstance(value, Mapping):
@@ -819,7 +820,7 @@ def _load_static_correction(
     token: threading.Event | None = None, role: str = 'flat',
 ) -> np.ndarray | None:
     """Read the recipe's flat field or dark, verify its digest, and prepare it."""
-    from xrd_tools.corrections import prepare_dark, prepare_flatfield
+    from xrd_tools.corrections import DEFAULT_MIN_FLAT_FRACTION, prepare_dark, prepare_flatfield
     from xrd_tools.io.image import read_image
     state = getattr(recipe.calibration, role)
     if state.status is not FactStatus.PRESENT:
@@ -847,8 +848,12 @@ def _load_static_correction(
                else read_image(snapshot))
     _reject(tuple(raw.shape) != tuple(shape) or tuple(raw.shape) != tuple(state.shape),
             f'{code}_SHAPE_INVALID')
-    prepare = prepare_flatfield if role == 'flat' else prepare_dark
-    result = np.ascontiguousarray(prepare(raw), dtype=np.float32)
+    if role == 'flat':
+        cutoff = DEFAULT_MIN_FLAT_FRACTION if state.min_fraction is None else state.min_fraction
+        prepared = prepare_flatfield(raw, cutoff)
+    else:
+        prepared = prepare_dark(raw)
+    result = np.ascontiguousarray(prepared, dtype=np.float32)
     result.setflags(write=False)
     return result
 

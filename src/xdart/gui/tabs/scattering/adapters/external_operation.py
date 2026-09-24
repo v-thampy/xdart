@@ -103,12 +103,15 @@ def _average_calibration(configuration: FrozenRunConfiguration, cancelled=None):
             np.frombuffer(assets.mask_bytes, dtype=dtype).reshape(shape)
             mask_state = MaskState(configuration.mask_file, assets.mask_sha256 or "", dtype.str, shape, FactStatus.PRESENT)
         except (TypeError, ValueError, OverflowError) as error: raise ValueError("AVERAGE_MASK_UNREPRESENTABLE") from error
+    from xrd_tools.corrections import DEFAULT_MIN_FLAT_FRACTION
+    cutoff = float(getattr(configuration, "flat_min_fraction", DEFAULT_MIN_FLAT_FRACTION))
     flat_state, dark_state = (
         DetectorImageState.absent() if payload is None
-        else DetectorImageState(path, digest or "", shape, FactStatus.PRESENT)
-        for path, payload, digest, shape in (
-            (flat_file, assets.flat_bytes, assets.flat_sha256, assets.flat_shape),
-            (dark_file, assets.dark_bytes, assets.dark_sha256, assets.dark_shape)))
+        else DetectorImageState(path, digest or "", shape, FactStatus.PRESENT, fraction)
+        for path, payload, digest, shape, fraction in (
+            (flat_file, assets.flat_bytes, assets.flat_sha256, assets.flat_shape,
+             None if cutoff == DEFAULT_MIN_FLAT_FRACTION else cutoff),
+            (dark_file, assets.dark_bytes, assets.dark_sha256, assets.dark_shape, None)))
     state = (CalibrationState(mask=mask_state, flat=flat_state, dark=dark_state) if values is None else
         CalibrationState(values, assets.poni_values[7], config, "",
             assets.poni_sha256 or "", configuration.poni_file, mask_state,

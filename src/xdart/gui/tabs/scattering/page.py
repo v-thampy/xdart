@@ -4012,7 +4012,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._progress = ProgressProjection(
                 detail="Run started"
             )
-            self._notice("")
+            # A usable but suspicious flat or dark (median far from 1, many
+            # masked pixels) runs; say so where the run starts.
+            warnings = getattr(receipt.scientific_assets, "correction_warnings", ())
+            self._notice("; ".join(item[:1].upper() + item[1:] for item in warnings))
             self._refresh_shell(preserve_display=True)
             self._ensure_timer()
             return True
@@ -7582,9 +7585,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     ) -> AdvancedSettingsValues | None:
         dialog = self._advanced_dialog
         if dialog is None:
-            dialog = AdvancedSettingsDialog(self)
+            dialog = AdvancedSettingsDialog(
+                self, correction_inspector=self._inspect_detector_correction,
+            )
             self._advanced_dialog = dialog
         return dialog.edit(snapshot)
+
+    def _inspect_detector_correction(
+        self, role: str, path: str, min_fraction: float,
+    ) -> object:
+        """Check a dark or flat file against the current PONI's detector."""
+        from .output_preflight import inspect_detector_correction
+
+        poni_file = str(self._intents.snapshot().thaw().poni_file or "")
+        return inspect_detector_correction(poni_file, path, role, min_fraction)
 
     def _show_performance_diagnostics_dialog(
         self,

@@ -87,3 +87,42 @@ def test_controls_no_longer_list_a_flat_field(tmp_path: Path) -> None:
     fields = project_controls(_snapshot(tmp_path), None, RunPhase.IDLE).fields
     assert not any(field.path[-1] in {"flat_file", "dark_file"} for field in fields)
     assert not any(field.label in {"Flat Field", "Dark"} for field in fields)
+
+
+def test_the_cutoff_edits_and_the_status_lines_report_the_checks(qapp, tmp_path: Path) -> None:
+    import numpy as np
+
+    from tests.xdart.scattering._e2sd_support import write_poni
+    from xdart.gui.tabs.scattering.output_preflight import inspect_detector_correction
+
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)  # Pilatus100k: 195 × 487
+    flat = np.full((195, 487), 2.0)
+    flat[:10] = 0.6
+    np.save(tmp_path / "flat.npy", flat)
+    np.save(tmp_path / "wrong.npy", np.ones((100, 100)))
+    snapshot = _snapshot(tmp_path)
+    dialog = AdvancedSettingsDialog(
+        correction_inspector=lambda role, path, fraction: inspect_detector_correction(
+            str(poni), path, role, fraction))
+    try:
+        dialog.load_values(advanced_settings_values(snapshot))
+        assert dialog.flat_min_percent.value() == 10.0 and dialog.flat_status.isHidden()
+        dialog.flat_file.setText(str(tmp_path / "flat.npy"))
+        dialog.flat_file.editingFinished.emit()
+        assert dialog.flat_status.text() == "195 × 487 · median 2 · 0 % masked"
+        dialog.flat_min_percent.setValue(50.0)
+        assert dialog.flat_status.text().endswith(
+            "the flat field masks 5.1 % of the detector's usable pixels "
+            "(dead or below 50 % of its median)")
+        dialog.dark_file.setText(str(tmp_path / "wrong.npy"))
+        dialog.dark_file.editingFinished.emit()
+        assert dialog.dark_status.text() == (
+            "Not usable: the dark is 100 × 100 pixels but the detector is 195 × 487")
+        values = dialog.values()
+        assert values.flat_min_fraction == 0.5
+        assert reduce_advanced_settings(snapshot, values).freeze().flat_min_fraction == 0.5
+        assert type(reduce_advanced_settings(snapshot, replace(values, flat_min_fraction=1.0))) \
+            is EditRefusal
+    finally:
+        dialog.close()

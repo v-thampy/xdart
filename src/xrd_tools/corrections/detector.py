@@ -4,6 +4,8 @@ Detector-level correction helpers applied before azimuthal integration.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 
@@ -156,6 +158,107 @@ def prepare_dark(dark: np.ndarray) -> np.ndarray:
     return array
 
 
+#: A flat or dark masking more than this fraction of the usable detector pixels
+#: is reported by :func:`check_detector_image`.
+MASKED_FRACTION_WARNING = 0.01
+
+
+@dataclass(frozen=True, slots=True)
+class DetectorImageCheck:
+    """What a dark or flat-field image would do, reported before a run uses it."""
+
+    role: str
+    shape: tuple[int, ...]
+    #: Flat only: the median of its usable pixels.
+    median: float | None = None
+    #: Share of the detector's own usable pixels this image masks.
+    masked_fraction: float | None = None
+    errors: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+    def summary(self) -> str:
+        """One line: the error, or the facts followed by any warnings."""
+        if self.errors:
+            return "; ".join(self.errors)
+        facts = [" × ".join(str(value) for value in self.shape)]
+        if self.median is not None:
+            facts.append(f"median {self.median:.4g}")
+        if self.masked_fraction is not None:
+            facts.append(f"{100 * self.masked_fraction:.2g} % masked")
+        return " · ".join(facts) + "".join(f" — {item}" for item in self.warnings)
+
+
+def check_detector_image(
+    image: np.ndarray,
+    role: str,
+    *,
+    detector_shape: tuple[int, int] | None = None,
+    detector_mask: np.ndarray | None = None,
+    min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
+) -> DetectorImageCheck:
+    """
+    Check a dark (``role="dark"``) or flat field (``role="flat"``) before a run.
+
+    Errors make the image unusable: it is not one 2-D image, its shape differs
+    from the detector's, or no pixel is usable. Warnings flag a usable but
+    suspicious image: a flat whose median is far from 1 (pyFAI divides by the
+    flat as given, so every intensity scales by its inverse), or an image that
+    masks more than 1 % of the pixels the detector itself leaves usable.
+
+    Parameters
+    ----------
+    image : ndarray
+        The decoded dark or flat-field image.
+    role : {"dark", "flat"}
+        Which correction the image is.
+    detector_shape : tuple of int, optional
+        The detector's shape; checked when given.
+    detector_mask : ndarray, optional
+        The detector's own mask (gaps, dead modules), excluded from the counts.
+    min_fraction : float, optional
+        The flat cutoff (see :func:`prepare_flatfield`).
+
+    Returns
+    -------
+    DetectorImageCheck
+    """
+    if role not in {"dark", "flat"}:
+        raise ValueError("role must be 'dark' or 'flat'")
+    name = "flat field" if role == "flat" else "dark"
+    array = np.asarray(image, dtype=np.float64)
+    shape = tuple(int(value) for value in array.shape)
+    if array.ndim != 2:
+        return DetectorImageCheck(role, shape, errors=(f"the {name} must be one 2-D image",))
+    if detector_shape is not None and tuple(detector_shape) != shape:
+        return DetectorImageCheck(role, shape, errors=(
+            f"the {name} is {shape[0]} × {shape[1]} pixels but the detector is "
+            f"{detector_shape[0]} × {detector_shape[1]}",))
+    try:
+        prepared = (prepare_flatfield(array, min_fraction) if role == "flat"
+                    else prepare_dark(array))
+    except ValueError as error:
+        return DetectorImageCheck(role, shape, errors=(f"the {name} is unusable: {error}",))
+    usable = np.ones(shape, dtype=bool)
+    if detector_mask is not None and np.shape(detector_mask) == shape:
+        usable = ~np.asarray(detector_mask, dtype=bool)
+    count = int(usable.sum())
+    fraction = int((np.isnan(prepared) & usable).sum()) / count if count else 0.0
+    median = None
+    warnings = []
+    if role == "flat":
+        values = array[usable & np.isfinite(array) & (array > 0)]
+        median = float(np.median(values)) if values.size else None
+        if median is not None and not 0.5 <= median <= 2.0:
+            warnings.append(f"flat field median {median:.4g} is far from 1, so intensities "
+                            "scale by its inverse")
+    if fraction > MASKED_FRACTION_WARNING:
+        reason = (f"dead or below {100 * float(min_fraction):g} % of its median" if role == "flat"
+                  else "not finite")
+        warnings.append(f"the {name} masks {100 * fraction:.1f} % of the detector's usable "
+                        f"pixels ({reason})")
+    return DetectorImageCheck(role, shape, median, fraction, (), tuple(warnings))
+
+
 def apply_threshold(
     image: np.ndarray,
     threshold: float,
@@ -297,6 +400,9 @@ def correct_image(
 
 __all__ = [
     "DEFAULT_MIN_FLAT_FRACTION",
+    "DetectorImageCheck",
+    "MASKED_FRACTION_WARNING",
+    "check_detector_image",
     "apply_flatfield",
     "apply_mask",
     "apply_threshold",

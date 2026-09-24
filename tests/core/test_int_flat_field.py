@@ -149,3 +149,71 @@ def test_a_read_only_flat_is_accepted():
     np.testing.assert_allclose(halved.intensity, plain.intensity / 2, rtol=1e-6)
     with pytest.raises(ValueError):
         ReductionPlan(flat=np.ones(4))
+
+
+def test_check_detector_image_reports_errors_and_warnings():
+    from xrd_tools.corrections import check_detector_image
+    flat = np.ones((10, 20))
+    clean = check_detector_image(flat, "flat", detector_shape=(10, 20))
+    assert clean.errors == clean.warnings == () and clean.median == 1.0
+    wrong = check_detector_image(flat, "flat", detector_shape=(20, 10))
+    assert wrong.errors == ("the flat field is 10 × 20 pixels but the detector is 20 × 10",)
+    assert check_detector_image(np.zeros((4, 4)), "flat").errors  # no usable pixel
+    counts = check_detector_image(flat * 5000, "flat")
+    assert counts.median == 5000 and any("far from 1" in item for item in counts.warnings)
+    shadowed = flat.copy()
+    shadowed[0, :6] = 0.3  # 3 % of the pixels at 30 % of the median
+    assert check_detector_image(shadowed, "flat").warnings == ()  # kept at the default 10 %
+    raised = check_detector_image(shadowed, "flat", min_fraction=0.5)
+    assert raised.masked_fraction == pytest.approx(0.03)
+    assert "masks 3.0 %" in raised.warnings[0] and "below 50 %" in raised.warnings[0]
+    gaps = np.zeros((10, 20), bool)
+    gaps[0, :6] = True  # pixels the detector masks itself are not counted
+    assert check_detector_image(shadowed, "flat", min_fraction=0.5, detector_mask=gaps).warnings == ()
+    dark = np.full((10, 20), 5.0)
+    dark[:2] = np.nan
+    assert "not finite" in check_detector_image(dark, "dark").warnings[0]
+
+
+def test_average_applies_the_flat_cutoff(tmp_path):
+    import hashlib
+
+    import h5py
+    import tifffile
+
+    from xrd_tools.reduction import AverageScanRecipe
+    from xrd_tools.reduction import average as module
+    from xrd_tools.session.experiment_state import (
+        CalibrationState, DetectorImageState, FactStatus, PoniValues,
+    )
+    from xrd_tools.sources.selection import image_series_spec
+
+    flat = np.full((4, 4), 2.0)
+    flat[0] = 0.6  # 30 % of the median
+    flat_path = tmp_path / "flat.npy"
+    np.save(flat_path, flat)
+    digest = hashlib.sha256(flat_path.read_bytes()).hexdigest()
+
+    def stored(name, cutoff):
+        folder = tmp_path / name
+        folder.mkdir()
+        for index in range(1, 4):
+            tifffile.imwrite(folder / f"scan_{index:04d}.tif", np.full((4, 4), 20 * index, np.uint32))
+        calibration = CalibrationState(
+            PoniValues(0.2, 0.001, 0.001, 0.0, 0.0, 0.0, 1e-10), "Detector",
+            {"pixel1": 1e-4, "pixel2": 1e-4, "max_shape": [4, 4], "orientation": 3},
+            status=FactStatus.PRESENT,
+            flat=DetectorImageState(str(flat_path), digest, (4, 4), FactStatus.PRESENT, cutoff))
+        runner = module.AverageScanRunner(AverageScanRecipe(
+            image_series_spec(folder / "scan_0001.tif", metadata_format=None), folder / "scan.nexus",
+            ReductionPlan(integration_1d=Integration1DPlan(npt=4, method="numpy")),
+            calibration=calibration))
+        result = runner.start()
+        runner.close()
+        assert result.disposition == "COMMITTED", result
+        with h5py.File(result.target, "r") as handle:
+            return handle["entry/instrument/detector/flatfield"][()]
+
+    default, raised = stored("default", None), stored("raised", 0.5)
+    np.testing.assert_array_equal(default[0], np.float32(0.6))  # stored as float32
+    assert np.isnan(raised[0]).all() and np.all(raised[1:] == 2.0)
