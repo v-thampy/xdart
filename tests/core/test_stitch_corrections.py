@@ -205,3 +205,27 @@ def test_dark_is_oriented_like_the_mask(tmp_path):
     dark = native_detector_image(oriented, oriented._dark_receipt)
     assert dark.shape == (195, 487)
     np.testing.assert_array_equal(dark > 0, native_mask(oriented))
+
+
+def test_one_frame_stitch_matches_int_up_to_multigeometry_solid_angle_scale():
+    from xrd_tools.integrate.single import integrate_1d
+    rng = np.random.default_rng(11)
+    raw = rng.poisson(80, SHAPE).astype(float)
+    monitor, npt = 2., 24
+    radial, fixed_azimuth = _resolve_streaming_ranges(
+        lambda: iter([_ai()]), 1, unit='q_A^-1', radial_range=None, azimuth_range=None)
+    stitched, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), npt=npt, radial_range=radial,
+                                      method='full', normalization=[monitor], polarization_factor=.95,
+                                      error_model='poisson')
+    ai = _ai()
+    ai.setChiDiscAtPi()
+    single = integrate_1d(raw, ai, npt=npt, unit='q_A^-1', method='full', radial_range=radial,
+                          azimuth_range=fixed_azimuth, error_model='poisson',
+                          polarization_factor=.95, normalization_factor=monitor)
+    # MultiGeometry normalizes by the absolute solid angle pixel1·pixel2/dist²; pyFAI
+    # returns float32, so the two agree to its precision.
+    scale = ai.dist ** 2 / (ai.detector.pixel1 * ai.detector.pixel2)
+    finite = np.isfinite(single.intensity) & (single.intensity != 0)
+    assert finite.sum() > npt // 2
+    np.testing.assert_allclose(stitched.intensity[finite], single.intensity[finite] * scale, rtol=1e-6)
+    np.testing.assert_allclose(stitched.sigma[finite], single.sigma[finite] * scale, rtol=1e-6)
