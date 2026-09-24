@@ -90,9 +90,12 @@ def test_an_averaged_frame_has_the_uncertainty_of_the_mean(tmp_path):
         tifffile.imwrite(tmp_path / f"scan_{index:04d}.tif", frame)
     config = {"pixel1": 1e-4, "pixel2": 1e-4, "max_shape": [16, 16], "orientation": 3}
     values = PoniValues(0.2, 0.0008, 0.0008, 0.0, 0.0, 0.0, 1e-10)
+    from xrd_tools.reduction import Integration2DPlan
     runner = module.AverageScanRunner(AverageScanRecipe(
         image_series_spec(tmp_path / "scan_0001.tif", metadata_format=None), tmp_path / "scan.nexus",
-        ReductionPlan(integration_1d=Integration1DPlan(npt=8, method="numpy", error_model="poisson")),
+        ReductionPlan(integration_1d=Integration1DPlan(npt=8, method="numpy", error_model="poisson"),
+                      integration_2d=Integration2DPlan(npt_rad=8, npt_azim=6, method="numpy",
+                                                       error_model="poisson")),
         calibration=CalibrationState(values, "Detector", config, status=FactStatus.PRESENT)))
     result = runner.start()
     runner.close()
@@ -107,3 +110,26 @@ def test_an_averaged_frame_has_the_uncertainty_of_the_mean(tmp_path):
     assert finite.any()
     np.testing.assert_allclose(saved.sigma[finite], expected.sigma[finite], rtol=1e-6)
     np.testing.assert_allclose(poisson_on_mean.sigma[finite] / saved.sigma[finite], 2.0, rtol=1e-6)
+
+
+def test_a_subtracted_background_propagates_its_variance_in_2d():
+    from xrd_tools.integrate.single import integrate_2d
+    from xrd_tools.reduction import Integration2DPlan
+    rng = np.random.default_rng(11)
+    raw = rng.poisson(60, SHAPE).astype(float)
+    background = 1.5 * rng.poisson(30, SHAPE).astype(float)
+    plan = ReductionPlan(integration_1d=None,
+                         integration_2d=Integration2DPlan(npt_rad=30, npt_azim=24, error_model="poisson"))
+    scan = Scan("bg2d", [Frame(0, image=raw.copy(), metadata={}, background=background,
+                               background_variance_factor=1.5)],
+                poni=_PONI, integrator=poni_to_integrator(_PONI))
+    result = run_reduction(plan, scan, executor=1)
+    assert not result.failed, result.error
+    reduced = result.frames[0].result_2d
+    direct = integrate_2d(raw - background, poni_to_integrator(_PONI), npt_rad=30, npt_azim=24,
+                          method=plan.integration_2d.method,
+                          variance=np.maximum(raw, 1.0) + 1.5 * background)
+    finite = np.isfinite(direct.sigma)
+    assert finite.any()
+    np.testing.assert_allclose(reduced.sigma[finite], direct.sigma[finite], rtol=1e-12)
+    np.testing.assert_allclose(reduced.intensity[finite], direct.intensity[finite], rtol=1e-12)
