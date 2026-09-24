@@ -5458,6 +5458,8 @@ def _wait_pending_futures(pending: list[tuple[Frame, Any]], *, worker: Any | Non
             pass
 
 
+#: Env-gated diagnostic: log which 1-D producer ran and whether it returned sigma.
+_DEBUG_UNCERTAINTY = os.environ.get("XDART_DEBUG_UNCERTAINTY") == "1"
 _FLOAT32_CSR_ERROR_MODELS = frozenset((None, "no", "poisson", "azimuthal", "hybrid"))
 _FLOAT32_CSR_EXTRAS = frozenset(("correctSolidAngle", "dummy", "delta_dummy", "safe"))
 
@@ -5598,16 +5600,24 @@ def standard_chi_profile(plan: ReductionPlan) -> bool:
 def result_1d_has_sigma(plan: ReductionPlan) -> bool:
     """Whether the 1-D result carries sigma.
 
-    Only pyFAI's standard radial integration and the grazing-incidence total-q
-    profile propagate an error model; the χ profile and the other
-    grazing-incidence 1-D modes return no sigma.
+    Uncertainty is requested by an error model other than ``"no"`` or by an
+    explicit ``variance``. Only pyFAI's radial integration propagates it: the
+    standard q/2θ profile and the grazing-incidence total-q profile over the full
+    χ range. The χ profile, a total-q χ wedge (``integrate1d_polar``) and the
+    other grazing-incidence profiles return none. The dispatch uses the same
+    predicates, and a test pins this rule to every producer's actual output.
     """
     p1 = plan.integration_1d
-    if p1 is None or p1.error_model is None:
+    if p1 is None:
+        return False
+    model = p1.error_model
+    if (model is None or str(model).strip().lower() == "no") and "variance" not in p1.extra:
         return False
     if plan.gi is None:
         return not standard_chi_profile(plan)
-    return plan.gi.mode_1d is GI1DMode.Q_TOTAL
+    from xrd_tools.integrate.gid import gi_total_q_uses_radial
+
+    return plan.gi.mode_1d is GI1DMode.Q_TOTAL and gi_total_q_uses_radial(p1.azimuth_range)
 
 
 def _reduce_frame(
@@ -5852,9 +5862,17 @@ def _reduce_frame(
         if r2d is not None and plan.integration_2d.azimuth_offset:
             r2d.azimuthal = r2d.azimuthal + float(plan.integration_2d.azimuth_offset)
 
-    # Publication reserves sigma by the same rule; never hand it an extra one.
-    if r1d is not None and r1d.sigma is not None and not result_1d_has_sigma(plan):
-        r1d.sigma = None
+    if _DEBUG_UNCERTAINTY and r1d is not None:
+        p1 = plan.integration_1d
+        logger.info("xdart-uncertainty %s", {
+            "frame": frame.index,
+            "gi_mode": None if plan.gi is None else plan.gi.mode_1d.value,
+            "gi_method": None if plan.gi is None else plan.gi.method,
+            "unit": str(p1.unit), "method": p1.method,
+            "azimuth_range": p1.azimuth_range is not None,
+            "error_model": p1.error_model, "variance": "variance" in p1.extra,
+            "sigma": r1d.sigma is not None,
+        })
 
     # D7 loud: a 2D integration with no usable data (all-dummy) would persist
     # nothing meaningful.  Under a loud policy RAISE (the streaming writer

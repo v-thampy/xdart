@@ -2728,8 +2728,9 @@ def test_standard_then_grazing_run_can_exceed_memory_target(
 
 
 @pytest.mark.parametrize(("output", "has_sigma"), (
-    ("q", True), ("chi", False), ("gi:q_total", True), ("gi:q_ip", False),
-    ("gi:q_oop", False), ("gi:exit_angle", False), ("gi:chi_gi", False),
+    ("q", True), ("q:no-model", False), ("chi", False), ("gi:q_total", True),
+    ("gi:q_total-wedge", False), ("gi:q_ip", False), ("gi:q_oop", False),
+    ("gi:exit_angle", False), ("gi:chi_gi", False),
 ))
 def test_poisson_1d_outputs_without_sigma_run_and_save_none(tmp_path, output, has_sigma):
     from xrd_tools.io import FrameViewReader
@@ -2740,13 +2741,18 @@ def test_poisson_1d_outputs_without_sigma_run_and_save_none(tmp_path, output, ha
     write_poni(poni)
     intent = _intent(tmp_path / "frame_0001.tif", tmp_path / "out.nexus", poni)
     intent.bai_1d_args = {"npt": 64, "method": "csr", "error_model": "poisson"}
-    if output == "chi":
+    if output == "q:no-model":
+        intent.bai_1d_args["error_model"] = "no"  # a persisted custom model without variance
+    elif output == "chi":
         # pyFAI integrates the chi profile without variance.
         intent.bai_1d_args.update(unit="chi_deg", radial_range=(0.5, 2.0))
     elif output.startswith("gi:"):
         intent.gi.enabled = True
         intent.gi.th_val = 0.2
-        intent.gi.mode_1d = output[3:]
+        mode, _, wedge = output[3:].partition("-")
+        intent.gi.mode_1d = mode
+        if wedge:  # a chi range sends total q through integrate1d_polar, which has no sigma
+            intent.bai_1d_args["azimuth_range"] = (-90.0, 90.0)
     executor = StandardRunExecutor(join_timeout=5.0)
     identity = _start(executor, intent, request_value=1795)
     try:

@@ -166,8 +166,9 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         error_model.addItem("Poisson", "poisson")
         error_model.setToolTip(
             "Poisson propagates counting uncertainty and saves sigma with the "
-            "result where pyFAI provides it: the q and 2θ profiles and the "
-            "grazing-incidence total-q profile. The χ profile and the other "
+            "result where pyFAI provides it: the q and 2θ profiles, and the "
+            "grazing-incidence total-q profile over the full χ range. The χ "
+            "profile, a χ-restricted total-q profile and the other "
             "grazing-incidence 1D profiles have none."
         )
 
