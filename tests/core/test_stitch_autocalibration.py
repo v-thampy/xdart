@@ -53,3 +53,18 @@ def test_a_partial_frame_is_screened_against_the_whole_scan_before_selection(tmp
     assert 'partial frame' in automatic['excluded_frames'][0]['reason']
     used = [frame['index'] for frame in fit.asset['provenance']['frames']]
     assert partial not in used and len(used) == 8
+
+
+def test_automatic_refinement_is_reproducible_and_leaves_the_global_generator_alone(tmp_path):
+    from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
+    spec = ring_scan(tmp_path / 'scan')
+    seed = five_parameter_seed(ROW_ANGLES)
+    np.random.seed(1)
+    first = refine_arm_from_scan(spec, seed, max_frames=12)
+    after = np.random.random()
+    np.random.seed(2)  # a different prior state must not change the refinement
+    second = refine_arm_from_scan(spec, seed, max_frames=12)
+    assert first.asset['calibration'] == second.asset['calibration']
+    assert first.n_points == second.n_points and first.rms_q == second.rms_q
+    np.random.seed(1)
+    assert np.random.random() == after  # the caller's generator state is restored

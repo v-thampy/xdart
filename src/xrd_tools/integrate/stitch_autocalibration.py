@@ -122,6 +122,21 @@ def _ring_indices(calibrant, wavelength_m):
     return index
 
 
+def _seeded_extract(geometry, index, points_per_degree):
+    """pyFAI's ring points for one frame, reproducibly.
+
+    pyFAI's massif draws its peak seeds with the global ``numpy.random.shuffle``;
+    seeding it by the frame index makes a refinement repeatable (and independent
+    of whatever used the global generator before). The caller's state is restored.
+    """
+    state = np.random.get_state()
+    np.random.seed(index & 0xFFFFFFFF)
+    try:
+        return geometry.extract_cp(pts_per_deg=points_per_degree).getList()
+    finally:
+        np.random.set_state(state)
+
+
 def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen, cancelled, progress):
     """Frames of the whole scan that the dropped-frame check excludes, before any selection."""
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
@@ -240,7 +255,7 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
             image, valid = pixels(index, integrator)
             geometry_ = SingleGeometry(int(index), image=np.where(valid, image, 0.0), calibrant=cal,
                                        geometry=integrator)
-            points = np.asarray(geometry_.extract_cp(pts_per_deg=float(points_per_degree)).getList(),
+            points = np.asarray(_seeded_extract(geometry_, int(index), float(points_per_degree)),
                                 dtype=float).reshape(-1, 3)
             inside = ((points[:, 0] >= 0) & (points[:, 0] < image.shape[0])
                       & (points[:, 1] >= 0) & (points[:, 1] < image.shape[1]))
@@ -364,6 +379,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                   'parameter_correlations': dict(result.param_correlations),
                   'automatic_refinement': {
                       'method': 'pyFAI SingleGeometry.extract_cp seeded by a stacked calibration',
+                      'extraction_seed': 'numpy global generator seeded by frame index, restored after',
                       'seed_sha256': digest, 'source': source, 'calibrant': str(calibrant),
                       'points_per_degree': float(points_per_degree), 'max_counts': max_counts,
                       'frame_screen': frame_screen.to_provenance(), 'excluded_frames': list(points.excluded),
