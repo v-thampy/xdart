@@ -22,7 +22,7 @@ import json
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -1305,7 +1305,10 @@ class RunIntent:
             flat_min_fraction=_flat_min_fraction(self.flat_min_fraction),
             dark_file=str(self.dark_file or ""),
             poni_v3_override=self.poni_v3_override,
-            background=self.background,
+            # "Already dark-corrected" matters only with a dark; without one it is
+            # not recorded, so it cannot set two runs apart.
+            background=(self.background if self.dark_file or not self.background.dark_corrected
+                        else replace(self.background, dark_corrected=False)),
             project_root=str(self.project_root or ""),
             save_path=str(self.save_path or ""),
             _bai_1d_args=_mapping_value(self.bai_1d_args),

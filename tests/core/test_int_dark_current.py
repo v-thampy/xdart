@@ -202,3 +202,7 @@ def test_a_run_with_background_and_dark_records_how_they_combine(tmp_path):
     assert subtracted.fingerprint != as_is.fingerprint
     for alone in (RunIntent(background=plain).freeze(), RunIntent(dark_file=dark).freeze()):
         assert "background_dark" not in alone.as_provenance()
+    # without a dark the mark changes nothing, so it is not recorded
+    unmarked = RunIntent(background=replace(plain, dark_corrected=True)).freeze()
+    assert "dark_corrected" not in unmarked.as_provenance()["background"]
+    assert unmarked.fingerprint == RunIntent(background=plain).freeze().fingerprint
