@@ -2913,6 +2913,41 @@ def test_flat_field_run_persists_the_flat_and_applies_it(tmp_path):
         reintegrate(flattened)
 
 
+def test_append_refuses_a_changed_flat_field(tmp_path):
+    for label in range(1, 4):
+        _write_tiff(tmp_path / f"frame_{label:04d}.tif", label)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    shape = fabio.open(str(tmp_path / "frame_0001.tif")).data.shape
+    flat = tmp_path / "flat.npy"
+    np.save(flat, np.full(shape, 2.0))
+    target = tmp_path / "out.nexus"
+    first = _intent(tmp_path / "frame_0001.tif", target, poni)
+    first.flat_file = str(flat)
+    executor = StandardRunExecutor(join_timeout=5.0)
+    identity = _start(executor, first, request_value=1801)
+    try:
+        events = _drain_until(
+            executor, lambda values: any(e.kind in _TERMINAL for e in values), timeout=90.0,
+        )
+        terminal = next(e for e in events if e.kind in _TERMINAL)
+        assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
+    finally:
+        assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+    before = _written(target).read_bytes()
+    np.save(flat, np.full(shape, 3.0))  # same path, different flat
+    append = _intent(tmp_path / "frame_0001.tif", target, poni, output_mode="Append")
+    append.flat_file = str(flat)
+    append_executor = StandardRunExecutor()
+    admission, _capture, token = _admit(append_executor, append, request_value=1802)
+    try:
+        assert type(admission) is AdmissionFailure
+        assert "Append" in admission.reason
+        assert _written(target).read_bytes() == before
+    finally:
+        append_executor.cancel_admission(token)
+
+
 def test_post_g2_funded_staging_partial_grant_refuses_before_output_and_retries(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
