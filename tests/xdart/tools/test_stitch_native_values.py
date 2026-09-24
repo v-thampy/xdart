@@ -26,6 +26,49 @@ def test_native_family_preserves_readable_source_and_frame_subset_slot(tmp_path)
     assert subset.module.output.target == first.module.output.target
 
 
+@pytest.mark.parametrize("rows, first_only, expected", [
+    (("14 -10", "15 -10"), False, True),
+    (("14 0", "0 -10"), False, False),
+    (("14 0", "15 1e-12"), False, True),
+    (("14 0", "15 -10"), True, False),
+])
+def test_native_affine_warning_uses_selected_coupled_angles(tmp_path, rows, first_only, expected):
+    from xdart.gui.tools.stitch_values import StitchFrameSelector
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    spec = Path(form.spec_path)
+    spec.write_text(spec.read_text().replace("14 -10\n15 -10\n", "\n".join(rows) + "\n"))
+    if first_only:
+        form = replace(form, frame_selector=StitchFrameSelector(0, 0))
+    original = Path(form.geometry_path).read_bytes()
+    prepared = prepare_stitch_tool(form)
+    assert bool(prepared.warnings) is expected
+    if expected:
+        assert len(prepared.warnings) == 1
+        warning = prepared.warnings[0]
+        assert "source-sample-1_stitch1d.nexus" in warning
+        assert "independent Euler" in warning
+        assert "If del is mounted on nu" in warning
+        assert "stacked calibration" in warning
+    assert Path(form.geometry_path).read_bytes() == original
+    assert prepared.request.plan.geometry.content == original
+
+
+def test_native_affine_warning_does_not_assume_other_instrument_axes(tmp_path):
+    import json
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    path = Path(form.geometry_path)
+    path.write_text(path.read_text().replace("nu_angle", "tilt_angle").replace("del_angle", "two_theta"))
+    form = replace(form, source_motors=(("tilt_angle", "nu"), ("two_theta", "del")))
+    prepared = prepare_stitch_tool(form)
+    assert prepared.warnings == ()
+    assert json.loads(prepared.request.plan.geometry.content)["pos_names"] == ["two_theta", "tilt_angle"]
+
+
+def test_native_affine_warning_does_not_apply_to_xu(tmp_path):
+    prepared = prepare_stitch_tool(_native_form(tmp_path, "xu_hist", scans="1"))
+    assert prepared.warnings == ()
+
+
 def test_native_group_requires_and_preserves_explicit_family(tmp_path):
     from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
     form = replace(_native_form(tmp_path, "multigeometry", scans="[1,2]"), output_family=None)

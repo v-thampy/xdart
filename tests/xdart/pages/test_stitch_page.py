@@ -88,6 +88,27 @@ def _fill_native(page, form):
     page.set_field("threshold", "")
 
 
+def test_native_preview_displays_conditional_affine_warning_and_keeps_run_available(qapp, tmp_path):
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(form)
+        page.preview_button.click()
+        _wait(page, qapp)
+        assert page.run_bar.startButton.isEnabled(), page.run_bar.readinessLabel.full_text()
+        assert page._owner.prepared.warnings
+        text = page.preview_text.toPlainText()
+        assert "Warnings" in text
+        assert "If del is mounted on nu" in text
+        assert "stacked calibration" in text
+        assert not list(Path(form.output_path).parent.glob("*.nexus"))
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
 @pytest.mark.parametrize("grouped", [False, True])
 def test_metadata_shows_experimental_columns_and_separate_provenance(qapp, tmp_path, grouped):
     from xdart.gui.tabs.scattering.analysis_mount import MetadataResultDialog

@@ -780,6 +780,8 @@ class StitchPage(QtWidgets.QWidget):
                 StitchToolDialog._render_preflight(self, preflight.summary)
             else:
                 lines = [f"{len(preflight.requests)} stitched outputs"]
+                if preflight.warnings:
+                    lines.extend(("\nWarnings", *preflight.warnings))
                 for index, request in enumerate(preflight.requests, 1):
                     count = len(request.module.source.selected_labels)
                     lines.append(f"\n{index}. {Path(request.module.output.target).name} · {count} frames")

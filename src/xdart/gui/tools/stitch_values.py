@@ -712,6 +712,7 @@ class StitchToolPreflight:
     skipped: tuple[tuple[str, str, str], ...] = ()
     # Detached display facts only; the request/provenance remain Run authority.
     preview_members: tuple[tuple[dict, ...], ...] = ()
+    warnings: tuple[str, ...] = ()
 
     def __post_init__(self, _claim: object) -> None:
         if type(self.form) is StitchToolForm and self.form.source_selection is not None:
@@ -720,6 +721,8 @@ class StitchToolPreflight:
                 or self.request is not (self.requests[0] if self.requests else None)
                 or self.summary is not None or type(self.skipped) is not tuple
                 or type(self.preview_members) is not tuple
+                or type(self.warnings) is not tuple
+                or any(type(warning) is not str or not warning for warning in self.warnings)
                 or len(self.preview_members) != len(self.requests)
                 or any(type(group) is not tuple or any(type(member) is not dict for member in group)
                        for group in self.preview_members)

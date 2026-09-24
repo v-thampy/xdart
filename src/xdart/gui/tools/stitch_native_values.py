@@ -1,4 +1,5 @@
 """Native Stitch selections projected onto existing finite operation owners."""
+import json
 from pathlib import Path
 
 from xrd_tools.analysis.module_transaction import (
@@ -10,7 +11,7 @@ from xrd_tools.analysis.scan_operations import (
     run_metadata_table,
 )
 from xrd_tools.analysis.stitch_operation import (
-    StitchGeometryInput, StitchOperationPlan, XuStitchOperationPlan,
+    StitchGeometryInput, StitchGeometryKind, StitchOperationPlan, XuStitchOperationPlan,
     capture_stitch_geometry, prepare_stitch_operation,
 )
 from xrd_tools.analysis.stitch_sources import resolve_stitch_sources
@@ -99,6 +100,46 @@ def create_native_output_directory(request):
     _check_output_directory(target, project)
 
 
+def _affine_geometry_warning(request):
+    """Display-only caution from captured geometry and selected motor facts."""
+    if type(request.plan) is not StitchOperationPlan:
+        return None
+    geometry = request.plan.geometry
+    if geometry.request.kind is not StitchGeometryKind.PYFAI_GONIOMETER_JSON:
+        return None
+    asset = json.loads(geometry.content)
+    constants = asset["trans_function"].get("constants", {})
+    marker = constants.get("xdart_stacked_arm_v1") if type(constants) is dict else None
+    if type(marker) in (int, float) and marker == 1:
+        return None
+    bindings = dict(geometry.request.source_motors)
+    nu = bindings.get("nu_angle", bindings.get("nu"))
+    delta = bindings.get("del_angle", bindings.get("del"))
+    if not nu or not delta:
+        return None
+    from xrd_tools.core.geometry import Diffractometer
+    try:
+        instrument = Diffractometer.from_pyfai_goniometer(asset, source_motors=bindings)
+    except (KeyError, ValueError, TypeError, NotImplementedError, SyntaxError):
+        # Preview's warning does not change existing model admission semantics.
+        return None
+    if (getattr(instrument, "stacked_arm", None) is not None
+        or not instrument.rot1.is_active or instrument.rot1.source_motor != nu
+        or not instrument.rot2.is_active or instrument.rot2.source_motor != delta
+        or instrument.rot3.is_active):
+        return None
+    for contribution in request.manifest.contributions:
+        values = {(name, occurrence): value for name, occurrence, value in contribution.values}
+        if values[(nu, 0)] != 0 and values[(delta, 0)] != 0:
+            return (
+                f"{Path(request.module.output.target).name}: this calibration uses independent Euler "
+                "mappings, and selected frames have both del and nu nonzero. If del is mounted on nu, "
+                "these mappings do not describe that rotation order; create a stacked calibration "
+                "before using these results."
+            )
+    return None
+
+
 def prepare_native_stitch_tool(form, project):
     from .stitch_values import (
         StitchToolPreflight, StitchToolPreflightRefused, _PREFLIGHT_FACTORY,
@@ -141,7 +182,7 @@ def prepare_native_stitch_tool(form, project):
         acquisition = calibration.projection.value["acquisition"]
         motors = tuple(acquisition["source_motors"].values())
         energy_name = acquisition["source_energy_selector"]
-    requests, preview_members = [], []
+    requests, preview_members, warnings = [], [], []
     # Metadata is loaded once per exact source. The receipt is reused without
     # changing membership when a scan appears in more than one output group.
     cached = {}
@@ -197,6 +238,9 @@ def prepare_native_stitch_tool(form, project):
                 f"Output {len(requests) + 1} ({family}), {len(receipts)} sources, {count} frames: {reason}") from error
         requests.append(request)
         preview_members.append(members)
+        warning = _affine_geometry_warning(request)
+        if warning is not None:
+            warnings.append(warning)
     return StitchToolPreflight(form, requests[0], None, _PREFLIGHT_FACTORY,
                                requests=tuple(requests), skipped=resolution.skipped,
-                               preview_members=tuple(preview_members))
+                               preview_members=tuple(preview_members), warnings=tuple(warnings))
