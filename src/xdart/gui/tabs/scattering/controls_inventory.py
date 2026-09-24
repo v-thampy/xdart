@@ -34,6 +34,7 @@ SAVE_PATH = ("Project", "h5_dir")
 OUTPUT_MODE = ("Project", "output_mode")
 PONI_FILE = ("Signal", "poni_file")
 MASK_FILE = ("Signal", "mask_file")
+FLAT_FILE = ("Signal", "flat_file")
 GI_ENABLED = ("GI", "Grazing")
 GI_MOTOR = ("GI", "th_motor")
 GI_THETA = ("GI", "th_val")
@@ -382,6 +383,7 @@ def project_control_fields(
     )
     add(SectionId.EXPERIMENT, "Poni", PONI_FILE, browse=True)
     add(SectionId.EXPERIMENT, "Mask File", MASK_FILE, browse=True)
+    add(SectionId.EXPERIMENT, "Flat Field", FLAT_FILE, browse=True)
 
     for spec in CONTROL_FIELD_SPECS:
         if tool is not None and tool not in spec.tools:
@@ -517,6 +519,7 @@ def bound_values(
         SAVE_PATH: intent.save_path,
         PONI_FILE: intent.poni_file,
         MASK_FILE: intent.mask_file,
+        FLAT_FILE: intent.flat_file,
         GI_ENABLED: intent.gi.enabled,
         GI_MOTOR: motor_value,
         GI_THETA: intent.gi.th_val,

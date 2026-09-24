@@ -41,6 +41,7 @@ from .controls_inventory import (
     GI_2D_COMBINED_AXIS,
     GI_2D_COMBINED_MODES,
     GI_COMPANION_MODES_2D_ARG,
+    FLAT_FILE,
     GI_ENABLED,
     GI_MOTOR,
     GI_ORIENTATION,
@@ -1075,7 +1076,7 @@ def _control_value(
     path: tuple[str, ...],
     value: object,
 ) -> object | EditRefusal:
-    if path in {PROJECT_ROOT, SAVE_PATH, PONI_FILE, MASK_FILE}:
+    if path in {PROJECT_ROOT, SAVE_PATH, PONI_FILE, MASK_FILE, FLAT_FILE}:
         if (path == MASK_FILE and type(value) is str and value
                 and Path(value).suffix.lower() not in {".edf", ".npy"}):
             return EditRefusal("Mask files must use .edf or .npy")
@@ -1137,6 +1138,7 @@ def _current_value(intent: RunIntent, path: tuple[str, ...]) -> object:
         OUTPUT_MODE: intent.output_mode,
         PONI_FILE: intent.poni_file,
         MASK_FILE: intent.mask_file,
+        FLAT_FILE: intent.flat_file,
         GI_ENABLED: intent.gi.enabled,
         GI_MOTOR: intent.gi.incidence_motor,
         GI_THETA: intent.gi.th_val,
@@ -1162,6 +1164,8 @@ def _install_value(
         intent.poni_file = value  # type: ignore[assignment]
     elif path == MASK_FILE:
         intent.mask_file = value  # type: ignore[assignment]
+    elif path == FLAT_FILE:
+        intent.flat_file = value  # type: ignore[assignment]
     elif path == GI_ENABLED:
         intent.gi.enabled = value  # type: ignore[assignment]
     elif path == GI_MOTOR:
