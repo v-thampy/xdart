@@ -1455,6 +1455,13 @@ class StandardRunExecutor:
                     calibration, integrator=integrator,
                 )
                 run.scan.extra = extra
+            mask = None if assets is None else assets.mask
+            if mask is not None:
+                # Persist the applied mask: Reintegrate reuses only the output's
+                # own mask, never the mask file.
+                extra = dict(getattr(run.scan, "extra", None) or {})
+                extra["global_mask"] = np.flatnonzero(np.asarray(mask, dtype=bool))
+                run.scan.extra = extra
         except SourceRevisionChanged:
             discard_source()
             raise
