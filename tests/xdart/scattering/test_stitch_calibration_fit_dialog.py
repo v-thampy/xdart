@@ -345,7 +345,7 @@ def test_the_model_choice_is_disabled_with_its_reason(qapp, tmp_path):
         dialog.frames = frames
         dialog._frame_motors = ('del', 'nu')
         dialog._render_frames()
-        assert not dialog.arm_model.isEnabled() and 'xrayutilities' in dialog.arm_model.toolTip()
+        assert dialog.arm_model.isEnabled() and 'xrayutilities' in dialog.arm_model.toolTip()
         dialog.backend.setCurrentIndex(dialog.backend.findData('multigeometry'))
         assert dialog.arm_model.isEnabled()
         dialog.arm_model.setCurrentIndex(1)
@@ -381,5 +381,33 @@ def test_an_independent_angle_page_geometry_does_not_become_the_refinement_seed(
         assert dialog._text('refine_seed_path') == str(older) and dialog.refine_seed.currentData() == 'fit'
         dialog.refine_seed.setCurrentIndex(dialog.refine_seed.findData('file'))  # chosen anyway: said at once
         assert 'independent angles' in dialog.refine_seed_note.text()
+    finally:
+        dialog.close()
+
+
+def test_an_xu_extended_fit_is_transferred_and_gated_over_the_scan(qapp, tmp_path, monkeypatch):
+    (tmp_path / 'frames').mkdir()
+    frames = _guided_frames(tmp_path)
+    dialog = StitchCalibrationDialog(tmp_path, backend='xu_hist')
+    try:
+        dialog.frames = frames
+        dialog._frame_motors = ('del', 'nu')
+        dialog._choices = [(index, {'del': d, 'nu': n}, None) for index, (d, n) in enumerate(ANGLES)]
+        dialog._render_frames()
+        assert dialog.arm_model.isEnabled()
+        dialog.arm_model.setCurrentIndex(dialog.arm_model.findData('stacked_extended'))
+        dialog.fit_button.click()
+        _wait(dialog, timeout=180)
+        assert dialog.fit is not None and dialog.fit.backend == 'xu_hist', dialog.status.text()
+        transfer = dialog.fit.asset['provenance']['xu_transfer']
+        assert transfer['validation_frames'] == len(ANGLES) and transfer['max_abs_dq_A^-1'] <= 1e-8
+        assert 'Transferred to xrayutilities' in dialog.fit_summary.toPlainText()
+        target = (tmp_path / 'calibration' / 'xu-extended.json').resolve()
+        _save_to(monkeypatch, target)
+        saved = []
+        dialog.calibrationSaved.connect(lambda path, backend: saved.append((path, backend)))
+        dialog.save_button.click()
+        assert saved == [(str(target), 'xu_hist')]
+        assert json.loads(target.read_text())['version'] == 3
     finally:
         dialog.close()

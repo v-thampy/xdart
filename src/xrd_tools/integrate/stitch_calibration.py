@@ -424,12 +424,16 @@ def _mg_detector_config(calibration):
 def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_motor='nu',
                     fit_scales=False, distance_seed_m=None, distance_bounds_m=None,
                     max_rms_q=0.03, domain=None, distance_provenance=None, cancelled=None,
-                    arm_model='stacked', instrument_geometry=None, min_frames=3):
+                    arm_model='stacked', validation_angles=None, progress=None,
+                    instrument_geometry=None, min_frames=3):
     """Fit the matched rows and refuse unconverged, degenerate or poor fits.
 
-    ``arm_model='stacked_extended'`` (MultiGeometry only) also fits the detector
-    mount on the arm and the sample offset from the rotation centre; it needs
-    frames from at least three nu positions and fixed motor scales.
+    ``arm_model='stacked_extended'`` also fits the detector mount on the arm and
+    the sample offset from the rotation centre; it needs frames from at least
+    three nu positions and fixed motor scales. For the XU backend the extended
+    pyFAI arm is fitted, then transferred to xrayutilities (asset version 3) and
+    checked on every pixel of ``validation_angles`` ((del, nu) pairs; default: a
+    grid over ``domain``, else over the control frames).
     ``nu_motor=None`` or ``del_motor=None`` is a single detector arm (a fourc or
     twoc 2θ): psic's arm with that circle held at zero (vertical: del moves;
     horizontal: nu moves).
@@ -441,8 +445,6 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                          if min_frames == 3 else f'fit requires at least {min_frames} completed frames')
     if arm_model not in ('stacked', 'stacked_extended'):
         raise ValueError('unknown arm model')
-    if arm_model == 'stacked_extended' and backend != 'multigeometry':
-        raise ValueError('the detector mount and sample offset refinement is MultiGeometry-only')
     if nu_motor is None and del_motor is None:
         raise ValueError('a detector arm needs at least one moving circle')
     held = 'nu' if nu_motor is None else 'del' if del_motor is None else None
@@ -453,6 +455,11 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     if single and backend == 'xu_hist':
         raise ValueError('the xrayutilities backend fits psic\'s two detector circles; fit a single '
                          '2θ arm with the MultiGeometry backend')
+    if arm_model == 'stacked_extended' and backend == 'xu_hist':
+        return _fit_xu_extended(frames, del_motor=del_motor, nu_motor=nu_motor,
+                                distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
+                                max_rms_q=max_rms_q, domain=domain, distance_provenance=distance_provenance,
+                                cancelled=cancelled, validation_angles=validation_angles, progress=progress)
     loaded = [load_control_frame(frame) for frame in frames]
     controls, calibrants, calibrations = zip(*loaded)
     base = calibrations[0]
@@ -583,6 +590,30 @@ def _fit_xu(frames, loaded, del_motor, nu_motor, distance_seed_m, distance_bound
         domain=domain or control_domain, rms_q=rms, condition=condition,
         n_frames=len(frames), n_points=len(result.fun))
     return asset, rms, condition, len(result.fun)
+
+
+def _fit_xu_extended(frames, *, del_motor, nu_motor, distance_seed_m, distance_bounds_m, max_rms_q,
+                     domain, distance_provenance, cancelled, validation_angles, progress):
+    """The extended pyFAI arm, transferred to an XU SURFACE v3 asset."""
+    from xrd_tools.integrate.xu_transfer import transfer_extended_arm_to_xu
+    extended = fit_calibration(frames, backend='multigeometry', del_motor=del_motor, nu_motor=nu_motor,
+                               distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
+                               max_rms_q=max_rms_q, distance_provenance=distance_provenance,
+                               cancelled=cancelled, arm_model='stacked_extended')
+    if validation_angles is None:
+        limits = domain or {key: [min(f.motors[motor] for f in frames), max(f.motors[motor] for f in frames)]
+                            for key, motor in (('del', del_motor), ('nu', nu_motor))}
+        validation_angles = [(d, n) for d in np.linspace(*limits['del'], 7) for n in np.linspace(*limits['nu'], 7)]
+    asset, transfer = transfer_extended_arm_to_xu(
+        extended.asset['calibration'], validation_angles=validation_angles,
+        source_motors=(del_motor, nu_motor), image_rotation=frames[0].rotation,
+        cancelled=cancelled, progress=progress)
+    provenance = {**extended.asset['provenance'], 'source_motors': {'nu': nu_motor, 'del': del_motor},
+                  'xu_transfer': transfer, 'pyfai_extended_arm': extended.asset['calibration']}
+    message = (f"{extended.message}; transferred to xrayutilities: max |Δq| {transfer['max_abs_dq_A^-1']:.2g} Å⁻¹ "
+               f"over every pixel of {transfer['validation_frames']} frames (gate {transfer['gate_A^-1']:.0e})")
+    return CalibrationFit('xu_hist', {'calibration': asset, 'provenance': provenance},
+                          extended.rms_q, extended.condition_number, extended.n_points, message)
 
 
 def save_calibration_fit(fit: CalibrationFit, path):

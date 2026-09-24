@@ -84,29 +84,53 @@ def guided(tmp_path_factory):
             'extended_path': Path(save_calibration_fit(extended, project / 'fits/extended.json'))}
 
 
-def _row_centres(root, geometry_path, output_dir, rows=None, count=3):
-    """Ring-centre error per nu row from the product Stitch, {ring: {nu: error}} (Å⁻¹)."""
+def _row_centres(root, geometry_path, output_dir, rows=None, count=3, xu_receipt=None):
+    """Ring-centre error per nu row from the product Stitch, {ring: {nu: error}} (Å⁻¹).
+
+    With ``xu_receipt`` (an XU calibration) the rows are stitched by the XU backend.
+    """
     from pyFAI.calibrant import get_calibrant
     spec = _spec(root)
     table = run_metadata_table(MetadataTablePlan(spec))
     nu = np.asarray(next(c for c in table.columns if c.name == 'nu').numeric, dtype=float)
-    record = json.loads(geometry_path.read_text())
     calibrant = get_calibrant('LaB6')
-    calibrant.wavelength = record['wavelength']
+    if xu_receipt is None:
+        record = json.loads(geometry_path.read_text())
+        calibrant.wavelength = record['wavelength']
+        geometry = capture_stitch_geometry(StitchGeometryInput(
+            geometry_path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
+            source_motors=(('del_angle', 'del'), ('nu_angle', 'nu')), image_rotation=0))
+        plan = StitchOperationPlan(geometry, mode='1d', npt_1d=1500, radial_range=(1.0, 6.2),
+                                   use_detector_mask=True, max_frame_bytes=64 * 1024 * 1024)
+        selectors = (MetadataColumnSelector('del'), MetadataColumnSelector('nu'))
+    else:
+        from xrd_tools.analysis.stitch_operation import XuStitchOperationPlan
+        from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+        from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+        from xrd_tools.integrate.xu_stitch import resolve_xu_stitch_effective_geometry
+        calibrant.wavelength = xu_receipt.projection.value['acquisition']['xdart_wavelength_A'] * 1e-10
+        with xu_runtime_session() as runtime:
+            effective = resolve_xu_stitch_effective_geometry(xu_receipt, runtime).projection
+        plan = XuStitchOperationPlan(
+            xu_receipt, effective, npt_1d=1500, radial_range=(1.0, 6.2), native_records=True,
+            conditioning=StitchConditioning('manual', threshold_max=800_000.0),
+            max_frame_bytes=64 * 1024 * 1024)
+        selectors = tuple(MetadataColumnSelector(name) for name in ('del', 'nu', 'energy')
+                          if name in {column.name for column in table.columns})
     rings = (2 * np.pi / np.asarray(calibrant.dspacing))[:count]
-    geometry = capture_stitch_geometry(StitchGeometryInput(
-        geometry_path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
-        source_motors=(('del_angle', 'del'), ('nu_angle', 'nu')), image_rotation=0))
-    plan = StitchOperationPlan(geometry, mode='1d', npt_1d=1500, radial_range=(1.0, 6.2),
-                               use_detector_mask=True, max_frame_bytes=64 * 1024 * 1024)
     centres = {float(q): {} for q in rings}
     for row in (np.unique(nu) if rows is None else rows):
         labels = tuple(int(i) for i in np.flatnonzero(nu == row))
         source = ModuleSourceReceipt.from_metadata_table(
-            table, kind=ModuleKind.STITCH, selected_labels=labels,
-            resolved_selectors=(MetadataColumnSelector('del'), MetadataColumnSelector('nu')))
-        output = ModuleOutputRequest(output_dir / f'{geometry_path.stem}-nu{row:+.1f}.nexus',
-                                     AnalysisArtifactKind.STITCH_1D, AnalysisArtifactOverwrite.CREATE_NEW)
+            table, kind=ModuleKind.STITCH, selected_labels=labels, resolved_selectors=selectors)
+        if xu_receipt is None:
+            output = ModuleOutputRequest(output_dir / f'{geometry_path.stem}-nu{row:+.1f}.nexus',
+                                         AnalysisArtifactKind.STITCH_1D, AnalysisArtifactOverwrite.CREATE_NEW)
+        else:
+            from xrd_tools.io.output_path import resolve_finite_output_target
+            family = f'xu-nu{row:+.1f}'.replace('+', 'p').replace('-', 'm').replace('.', 'd')
+            output = ModuleOutputRequest(resolve_finite_output_target(root, family, operation_token='stitch-1d'),
+                                         AnalysisArtifactKind.STITCH_1D, artifact_family=family)
         result = run_stitch_operation(prepare_stitch_operation(source, output, plan, project_root=root))
         assert result.terminal.disposition is ModuleDisposition.COMMITTED
         q = np.asarray(result.payload.axis('q'), dtype=float)
@@ -246,3 +270,31 @@ def test_scan14_sample_on_rotation_axis_drops_the_calibrant_offset(guided, tmp_p
     np.testing.assert_array_equal(on_axis.payload.intensity, reference.payload.intensity)
     assert not np.array_equal(on_axis.payload.intensity, calibrated.payload.intensity, equal_nan=True)
     assert json.loads(on_axis.payload.provenance_json)['plan']['sample_position'] == 'rotation_axis'
+
+
+@pytest.mark.slow
+def test_scan14_xu_transfer_holds_on_every_pixel_and_aligns_the_nu_rows(guided, tmp_path):
+    """P5 O1/O2: the extended arm in xrayutilities, gated on all 287 frames, and its Stitch."""
+    from xrd_tools.analysis.xu_stitch_calibration import (
+        XuStitchCalibrationInput, _canonical_bytes, capture_xu_stitch_calibration,
+    )
+    from xrd_tools.integrate.xu_transfer import transfer_extended_arm_to_xu
+    table = run_metadata_table(MetadataTablePlan(_spec(guided['root'])))
+    column = {c.name: np.asarray(c.numeric, dtype=float) for c in table.columns if c.name in ('nu', 'del')}
+    angles = list(zip(column['del'], column['nu']))
+    asset, transfer = transfer_extended_arm_to_xu(guided['extended'].asset['calibration'],
+                                                  validation_angles=angles)
+    print(f"XU transfer: max |dq| {transfer['max_abs_dq_A^-1']:.3g} over {transfer['validation_frames']} frames")
+    assert transfer['validation_frames'] == 287 and transfer['max_abs_dq_A^-1'] <= 1e-8
+    target = guided['root'] / 'calibration/xu/extended-v3.json'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(_canonical_bytes(asset))
+    receipt = capture_xu_stitch_calibration(XuStitchCalibrationInput('calibration/xu/extended-v3.json'),
+                                            project_root=guided['root'])
+    xu = _row_centres(guided['root'], None, tmp_path, xu_receipt=receipt)
+    mg = _row_centres(guided['root'], guided['extended_path'], tmp_path)
+    differences = [xu[ring][row] - mg[ring][row] for ring in mg for row in mg[ring] if row in xu[ring]]
+    print(f'XU v3 nu-row spread {np.round(_spreads(xu), 4).tolist()}; '
+          f'max |XU - MultiGeometry| ring centre {max(abs(d) for d in differences):.2e} Å⁻¹')
+    assert max(_spreads(xu)) <= 0.005
+    assert len(differences) >= 10 and max(abs(d) for d in differences) <= 1e-3

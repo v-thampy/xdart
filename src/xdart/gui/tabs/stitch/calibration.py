@@ -29,6 +29,16 @@ from xrd_tools.integrate.stitch_calibration import (
 #: Share of the progress bar per automatic-refinement stage (the owner needs one fixed total).
 _REFINE_STAGES = {'Screening the scan': (0, 250), 'Finding ring points': (250, 700),
                   'Validating models': (700, 980), 'Fitting': (980, 1000)}
+#: The XU extended fit: the pyFAI fit is quick; the transfer and its gate are not.
+_TRANSFER_STAGES = {'Transferring to xrayutilities': (0, 800), 'Validating the transfer': (800, 1000)}
+
+
+def _staged_progress(publish, stages):
+    """One fixed-total progress bar over named stages (the owner refuses a changing total)."""
+    def progress(stage, done, total):
+        low, high = stages[stage]
+        publish(f'{stage} {done}/{total}', low + (high - low) * done // max(total, 1), 1000)
+    return progress
 
 
 def _run_job(request, cancelled, publish):
@@ -94,11 +104,8 @@ def _dispatch_job(request, cancelled, publish):
     if kind == 'refine':
         from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
         spec, seed, options = arguments
-
-        def progress(stage, done, total):
-            low, high = _REFINE_STAGES[stage]
-            publish(f'{stage} {done}/{total}', low + (high - low) * done // max(total, 1), 1000)
-        return refine_arm_from_scan(spec, seed, cancelled=cancelled, progress=progress, **options)
+        return refine_arm_from_scan(spec, seed, cancelled=cancelled,
+                                    progress=_staged_progress(publish, _REFINE_STAGES), **options)
     if kind == 'enumerate':
         spec, record = arguments
         names = scan_motor_names(spec)
@@ -147,7 +154,8 @@ def _dispatch_job(request, cancelled, publish):
                                        nu_motor=seed['nu_motor'], cancelled=cancelled)
     if kind == 'fit':
         frames, options = arguments
-        return fit_calibration(frames, cancelled=cancelled, **options)
+        return fit_calibration(frames, cancelled=cancelled,
+                               progress=_staged_progress(publish, _TRANSFER_STAGES), **options)
     if kind == 'distance':
         from xrd_tools.sources import open_source
         from xrd_tools.integrate.direct_beam import calibrate_direct_beam, open_direct_beam_scan
@@ -198,7 +206,8 @@ def fit_summary_text(fit):
         lines.append(fit.message)
     errors = provenance.get('parameter_errors') or {}
     if provenance.get('arm_model') == 'stacked_extended' and errors:
-        record = fit.asset['calibration']
+        # An XU fit's calibration is the transferred asset; the fitted arm is in provenance.
+        record = provenance.get('pyfai_extended_arm') or fit.asset['calibration']
         lines.append('Parameters (± 1σ):')
         for name, value in zip(record['param_names'], record['param']):
             if name not in errors:
@@ -212,6 +221,10 @@ def fit_summary_text(fit):
                   for j in range(i + 1, len(names)) if abs(matrix[i][j]) > .9]
         if strong:
             lines.append('Strong correlations (|r| > 0.9): ' + ', '.join(strong))
+    transfer = provenance.get('xu_transfer')
+    if transfer:
+        lines.append(f"Transferred to xrayutilities: max |Δq| {transfer['max_abs_dq_A^-1']:.3g} Å⁻¹ over every "
+                     f"pixel of {transfer['validation_frames']} frames (gate {transfer['gate_A^-1']:.0e})")
     automatic = provenance.get('automatic_refinement')
     if automatic:
         validation = automatic['validation']
@@ -1117,9 +1130,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         nu = None if None in arm else arm[1]  # a single arm holds one circle: no nu rows
         rows = {round(float(frame.motors[nu]), 6)
                 for frame in self.frames if frame.complete and nu in frame.motors}
-        reason = ('xrayutilities has no detector mount or sample offset model'
-                  if self.backend.currentData() == 'xu_hist'
-                  else 'a single 2θ arm holds one circle at zero; the extension needs both' if nu is None
+        reason = ('a single 2θ arm holds one circle at zero; the extension needs both' if nu is None
                   else 'fitting motor scales keeps the five-parameter arm' if self.scales.isChecked()
                   else 'needs completed frames on at least 3 nu positions' if len(rows) < 3 else '')
         if reason:
@@ -1130,7 +1141,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 self.arm_model.setCurrentIndex(index)
         self.arm_model.setEnabled(not reason)
         self.arm_model.setToolTip(reason or 'Also fits the detector mount (tilt, roll) on the arm and '
-                                  'the sample offset from the rotation centre.')
+                                  'the sample offset from the rotation centre. For xrayutilities the '
+                                  'pyFAI fit is transferred and checked on every pixel of the scan.')
 
     def _arm_model_chosen(self, _index):
         self._preferred_arm_model = self.arm_model.currentData()
@@ -1151,6 +1163,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 arm_model=self.arm_model.currentData(),
                 distance_seed_m=seed, distance_bounds_m=bounds, max_rms_q=float(self._text('rms')), domain=domain,
                 distance_provenance=self._distance_provenance if hasattr(self, '_distance_provenance') else None)
+            if options['backend'] == 'xu_hist' and options['arm_model'] == 'stacked_extended' and self._choices:
+                # Gate the transfer on every frame of the scan whose metadata was read.
+                options['validation_angles'] = [(motors[self._frame_motors[0]], motors[self._frame_motors[1]])
+                                                for _index, motors, _energy in self._choices]
             self._invalidate_fit()
             self._start('fit', (frames, options))
         self._guard(go)
@@ -1370,11 +1386,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     self._prediction = result
                     self._render_frames()
                 elif kind in ('fit', 'refine'):
+                    summary = fit_summary_text(result)  # before adopting: a failure leaves no fit
                     self.fit = result
                     if result.backend == 'multigeometry':  # the refinement now starts from it
                         self.refine_seed.setCurrentIndex(self.refine_seed.findData('fit'))
                     self._fit_instrument = result.asset['provenance'].get('instrument_geometry')
-                    self.fit_summary.setPlainText(fit_summary_text(result))
+                    self.fit_summary.setPlainText(summary)
                     self.save_button.setEnabled(True)
                 elif kind == 'distance':
                     self._distance_result = result

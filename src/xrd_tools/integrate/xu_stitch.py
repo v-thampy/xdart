@@ -152,7 +152,7 @@ class XuStitchEffectiveGeometryProjection:
             or (self.solid_angle_match == "exact")
             != (self.solid_angle_max_rel_dev == 0.0)
             or type(self.asset_version) is not int
-            or self.asset_version not in {1, 2}
+            or self.asset_version not in {1, 2, 3}
             or type(self.detector_type) is not str
             or not self.detector_type.startswith("pyFAI.detectors.")
             or len(self.shape) != 2
@@ -240,10 +240,16 @@ class XuStitchRuntimeGeometry:
     projection: XuStitchEffectiveGeometryProjection
     hxrd: object
     mask: np.ndarray
-    solid_angle: np.ndarray
+    #: The static solid angle (versions 1 and 2), or None for version 3,
+    #: whose ``frame_solid_angle(nu, del)`` comes from the attested pyFAI arm.
+    solid_angle: np.ndarray | None
     _claim: InitVar[object] = None
+    frame_solid_angle: Callable[[float, float], np.ndarray] | None = None
+    #: xrayutilities sample displacement in mm (the detector distance's units), version 3 only.
+    sampledis: tuple[float, float, float] | None = None
 
     def __post_init__(self, _claim: object) -> None:
+        static = self.solid_angle is not None
         if (
             _claim is not _RUNTIME_GEOMETRY_FACTORY
             or type(self.projection) is not XuStitchEffectiveGeometryProjection
@@ -251,12 +257,111 @@ class XuStitchRuntimeGeometry:
             or self.mask.shape != self.projection.shape
             or self.mask.dtype != np.dtype(bool)
             or self.mask.flags.writeable
-            or type(self.solid_angle) is not np.ndarray
-            or self.solid_angle.shape != self.projection.shape
-            or self.solid_angle.dtype != np.dtype(np.float64)
-            or self.solid_angle.flags.writeable
+            or static == (self.frame_solid_angle is not None)
+            or static != (self.projection.asset_version != 3)
+            or (static and (
+                type(self.solid_angle) is not np.ndarray
+                or self.solid_angle.shape != self.projection.shape
+                or self.solid_angle.dtype != np.dtype(np.float64)
+                or self.solid_angle.flags.writeable))
+            or (self.sampledis is not None and (
+                type(self.sampledis) is not tuple or len(self.sampledis) != 3
+                or not all(type(v) is float and math.isfinite(v) for v in self.sampledis)))
         ):
             raise TypeError("XU runtime geometry is invalid")
+
+
+def _static_solid_angle(asset_version, corrections, header, shape):
+    """Versions 1 and 2: one solid-angle array from the detector header, digest-bound."""
+    if asset_version != 1 and corrections["solid_angle_policy"] != "calibrated_pyfai_detector_header_v1":
+        raise XuStitchScienceRefused("XU_SOLID_ANGLE_MISMATCH", "unsupported calibrated solid-angle policy")
+    solid_values = CorrectionStack().normalization(detector_header_to_ai(header), shape)
+    solid = np.asarray(
+        solid_values,
+        dtype=np.float64,
+        order="C",
+    )
+    solid_sha256 = _sha256_array(solid, "<f8")
+    reference_solid_sha256 = str(corrections["solid_angle_sha256"])
+    if solid.shape != shape or not np.isfinite(solid).all() or np.any(solid <= 0):
+        raise XuStitchScienceRefused(
+            "XU_SOLID_ANGLE_MISMATCH",
+            "solid-angle projection is not a finite positive SURFACE v1 array "
+            f"(host sha256={solid_sha256})",
+        )
+    if asset_version == 1:
+        reference_solid = _solid_angle_reference(reference_solid_sha256, shape)
+    else:
+        if solid_sha256 != reference_solid_sha256:
+            raise XuStitchScienceRefused(
+                "XU_SOLID_ANGLE_MISMATCH", "calibrated solid-angle digest differs from authored asset",
+            )
+        reference_solid = solid
+    if solid_sha256 == reference_solid_sha256:
+        solid_match = "exact"
+        solid_max_rel_dev = 0.0
+    else:
+        solid_max_rel_dev = float(
+            np.max(np.abs(solid - reference_solid) / reference_solid)
+        )
+        if not solid_max_rel_dev <= _SOLID_ANGLE_RTOL:
+            raise XuStitchScienceRefused(
+                "XU_SOLID_ANGLE_MISMATCH",
+                "solid-angle projection differs from SURFACE v1 "
+                f"(host sha256={solid_sha256}; "
+                f"reference sha256={reference_solid_sha256}; "
+                f"max_rel_dev={solid_max_rel_dev:.3e}; "
+                f"rtol={_SOLID_ANGLE_RTOL:.0e})",
+            )
+        solid_match = "tolerance"
+    return solid_sha256, solid_match, solid_max_rel_dev, reference_solid
+
+
+def _thaw(value):
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if type(value) is tuple:
+        return [_thaw(item) for item in value]
+    return value
+
+
+def _extended_solid_angle(corrections, shape):
+    """Version 3: per-frame solid angle from the attested pyFAI extended arm.
+
+    The same per-frame integrators MultiGeometry uses, so the two backends weight
+    each frame alike; a sample offset changes the distances frame by frame.
+    """
+    from xrd_tools.analysis.xu_stitch_calibration import (
+        EXTENDED_SOLID_ANGLE_POLICY, extended_arm_digest,
+    )
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.geometry import DetectorCalibration, Diffractometer
+    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
+    from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry
+    arm = _thaw(corrections["solid_angle_arm"])
+    if (corrections["solid_angle_policy"] != EXTENDED_SOLID_ANGLE_POLICY
+            or extended_arm_digest(arm) != corrections["solid_angle_sha256"]):
+        raise XuStitchScienceRefused("XU_SOLID_ANGLE_MISMATCH", "the extended solid-angle arm is not attested")
+    calibration = DetectorCalibration(
+        PONI(dist=arm["dist_m"], poni1=arm["poni1_m"], poni2=arm["poni2_m"],
+             wavelength=arm["wavelength_m"], detector=arm["detector"]),
+        detector_config=dict(arm["detector_config"]))
+    stacked = StackedDetectorArm(
+        nu_motor="nu", del_motor="del", nu_offset=arm["nu_offset"], nu_scale=arm["nu_scale"],
+        del_offset=arm["del_offset"], del_scale=arm["del_scale"], beam_rotation=arm["beam_rotation"],
+        mount_tilt=arm["mount_tilt"], mount_roll=arm["mount_roll"], sample_offset1=arm["sample_offset1"],
+        sample_offset2=arm["sample_offset2"], sample_offset3=arm["sample_offset3"])
+    diffractometer = Diffractometer.from_pyfai_goniometer(
+        stacked.to_pyfai_goniometer(calibration), source_motors={"nu_angle": "nu", "del_angle": "del"})
+
+    def frame_solid_angle(nu: float, del_: float) -> np.ndarray:
+        integrator, = create_multigeometry_integrators_from_geometry(
+            diffractometer, {"del": np.array([float(del_)]), "nu": np.array([float(nu)])})
+        value = np.ascontiguousarray(CorrectionStack().normalization(integrator, shape), dtype=np.float64)
+        if value.shape != shape or not np.isfinite(value).all() or np.any(value <= 0):
+            raise XuStitchScienceRefused("XU_SOLID_ANGLE_MISMATCH", "per-frame solid angle is not finite and positive")
+        return value
+    return frame_solid_angle
 
 
 def resolve_xu_stitch_effective_geometry(
@@ -357,47 +462,14 @@ def resolve_xu_stitch_effective_geometry(
         Nch1=shape[0],
         Nch2=shape[1],
     )
-    if asset_version != 1 and corrections["solid_angle_policy"] != "calibrated_pyfai_detector_header_v1":
-        raise XuStitchScienceRefused("XU_SOLID_ANGLE_MISMATCH", "unsupported calibrated solid-angle policy")
-    solid_values = CorrectionStack().normalization(detector_header_to_ai(header), shape)
-    solid = np.asarray(
-        solid_values,
-        dtype=np.float64,
-        order="C",
-    )
-    solid_sha256 = _sha256_array(solid, "<f8")
-    reference_solid_sha256 = str(corrections["solid_angle_sha256"])
-    if solid.shape != shape or not np.isfinite(solid).all() or np.any(solid <= 0):
-        raise XuStitchScienceRefused(
-            "XU_SOLID_ANGLE_MISMATCH",
-            "solid-angle projection is not a finite positive SURFACE v1 array "
-            f"(host sha256={solid_sha256})",
-        )
-    if asset_version == 1:
-        reference_solid = _solid_angle_reference(reference_solid_sha256, shape)
+    if asset_version == 3:
+        frame_solid_angle = _extended_solid_angle(corrections, shape)
+        solid_sha256 = str(corrections["solid_angle_sha256"])
+        solid_match, solid_max_rel_dev, reference_solid = "exact", 0.0, None
     else:
-        if solid_sha256 != reference_solid_sha256:
-            raise XuStitchScienceRefused(
-                "XU_SOLID_ANGLE_MISMATCH", "calibrated solid-angle digest differs from authored asset",
-            )
-        reference_solid = solid
-    if solid_sha256 == reference_solid_sha256:
-        solid_match = "exact"
-        solid_max_rel_dev = 0.0
-    else:
-        solid_max_rel_dev = float(
-            np.max(np.abs(solid - reference_solid) / reference_solid)
-        )
-        if not solid_max_rel_dev <= _SOLID_ANGLE_RTOL:
-            raise XuStitchScienceRefused(
-                "XU_SOLID_ANGLE_MISMATCH",
-                "solid-angle projection differs from SURFACE v1 "
-                f"(host sha256={solid_sha256}; "
-                f"reference sha256={reference_solid_sha256}; "
-                f"max_rel_dev={solid_max_rel_dev:.3e}; "
-                f"rtol={_SOLID_ANGLE_RTOL:.0e})",
-            )
-        solid_match = "tolerance"
+        frame_solid_angle = None
+        solid_sha256, solid_match, solid_max_rel_dev, reference_solid = _static_solid_angle(
+            asset_version, corrections, header, shape)
     energy = float(acquisition["energy_eV"])
     if energy_eV_to_wavelength_m(energy) * 1e10 != acquisition["xdart_wavelength_A"]:
         raise XuStitchScienceRefused(
@@ -423,6 +495,9 @@ def resolve_xu_stitch_effective_geometry(
         raise XuStitchScienceRefused(
             "XU_WAVELENGTH_MISMATCH", "XU mapping wavelength projection changed"
         )
+    extended = {} if asset_version != 3 else {
+        "detrot": float(detector_asset["detrot_deg"]), "tilt": float(detector_asset["tilt_deg"]),
+        "tiltazimuth": float(detector_asset["tiltazimuth_deg"])}
     hxrd.Ang2Q.init_area(
         *xu_asset["camera"],
         cch1=float(detector_asset["cch1_px"]),
@@ -432,6 +507,7 @@ def resolve_xu_stitch_effective_geometry(
         pwidth1=float(detector_asset["pixel1_m"]) * 1e3,
         pwidth2=float(detector_asset["pixel2_m"]) * 1e3,
         distance=float(detector_asset["distance_m"]) * 1e3,
+        **extended,
     )
     projection = XuStitchEffectiveGeometryProjection(
         receipt.semantic_fingerprint,
@@ -453,6 +529,12 @@ def resolve_xu_stitch_effective_geometry(
         asset_version,
     )
     frozen_mask = np.frombuffer(mask.tobytes(order="C"), dtype=bool).reshape(shape)
+    if asset_version == 3:
+        # xrayutilities takes the displacement in the detector distance's units (mm).
+        return XuStitchRuntimeGeometry(
+            projection, hxrd, frozen_mask, None, _RUNTIME_GEOMETRY_FACTORY,
+            frame_solid_angle, tuple(float(value) for value in acquisition["sampledis_mm"]),
+        )
     # The reference bytes, not the host's: every host integrates with the
     # array the projection's solid_angle_sha256 names.
     frozen_solid = np.frombuffer(
@@ -596,6 +678,10 @@ class XuPowderQProvider:
             raise XuStitchScienceRefused(
                 "INVALID_METADATA_VALUE", "XU detector angles must be finite"
             )
+        # xrayutilities switches to its sample-displacement path whenever
+        # ``sampledis`` is passed, so it is passed only when it is nonzero.
+        displaced = ({} if self.geometry.sampledis is None or not any(self.geometry.sampledis)
+                     else {"sampledis": list(self.geometry.sampledis)})
         area = self.geometry.hxrd.Ang2Q.area(
             0.0,
             0.0,
@@ -603,6 +689,7 @@ class XuPowderQProvider:
             0.0,
             float(nu) - self._nu_offset,
             float(del_) - self._del_offset,
+            **displaced,
         )
         return XuPowderQFrameLease(area, self.geometry.projection.shape)
 
@@ -683,7 +770,7 @@ def _checked_frame_histograms(
     and polarization weight the normalization next to the solid angle.
     """
 
-    raw_image = image = q = valid = weights = factor = None
+    raw_image = image = q = valid = weights = factor = solid = None
     lease: XuPowderQFrameLease | None = None
     owned_refs: list[weakref.ReferenceType] = []
     pending: BaseException | None = None
@@ -726,14 +813,18 @@ def _checked_frame_histograms(
             np.logical_and(valid, np.logical_not(mask), out=valid)
         np.logical_and(valid, np.isfinite(q), out=valid)
         np.logical_and(valid, np.isfinite(image), out=valid)
-        np.logical_and(valid, np.isfinite(geometry.solid_angle), out=valid)
-        np.logical_and(valid, geometry.solid_angle > 0, out=valid)
+        solid = geometry.solid_angle
+        if solid is None:
+            solid = geometry.frame_solid_angle(nu_value, del_value)
+            owned_refs.append(weakref.ref(solid))
+        np.logical_and(valid, np.isfinite(solid), out=valid)
+        np.logical_and(valid, solid > 0, out=valid)
         d_signal = np.histogram(
             q[valid], q_edges, weights=image[valid]
         )[0]
-        weights = geometry.solid_angle
+        weights = solid
         if polarization is not None or flat is not None:
-            weights = np.array(geometry.solid_angle, dtype=np.float64, copy=True)
+            weights = np.array(solid, dtype=np.float64, copy=True)
             owned_refs.append(weakref.ref(weights))
             if polarization is not None:
                 factor = lease.polarization(*polarization)
@@ -755,7 +846,7 @@ def _checked_frame_histograms(
     except BaseException as error:
         pending = error.with_traceback(None)
     finally:
-        raw_image = image = q = valid = weights = factor = None
+        raw_image = image = q = valid = weights = factor = solid = None
         release_error: BaseException | None = None
         if lease is not None:
             try:

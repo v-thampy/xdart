@@ -250,12 +250,10 @@ def test_arm_extension_needs_three_nu_positions():
                            calibrant=calibrant, detector_config={'orientation': 3})
 
 
-def test_guided_fit_rejects_unknown_or_xu_arm_extension():
+def test_guided_fit_rejects_an_unknown_arm_model():
     from xrd_tools.integrate.stitch_calibration import fit_calibration
     with pytest.raises(ValueError, match='unknown arm model'):
         fit_calibration([object()] * 3, arm_model='surface')
-    with pytest.raises(ValueError, match='MultiGeometry-only'):
-        fit_calibration([object()] * 3, backend='xu_hist', arm_model='stacked_extended')
 
 
 @pytest.mark.slow
