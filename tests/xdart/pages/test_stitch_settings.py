@@ -212,7 +212,7 @@ def _calibration_source(dialog):
 
 def test_calibrate_keeps_a_calibration_source_other_than_the_processing_scan(qapp, tmp_path):
     page = _edited_page(tmp_path)
-    restored = StitchPage(empty_host_services(_Status()))
+    restored, sourceless = (StitchPage(empty_host_services(_Status())) for _ in range(2))
     calibrant = (str(tmp_path / "powder-calibration.spec"), "2", 90)
     try:
         page._calibrate()  # a new dialog starts from the processing scan
@@ -227,6 +227,12 @@ def test_calibrate_keeps_a_calibration_source_other_than_the_processing_scan(qap
         restored.apply_settings(page.settings())
         restored._calibrate()  # so do the saved settings
         assert _calibration_source(restored._calibration_dialog) == calibrant
+        unnamed = page.settings()
+        unnamed["calibration"]["fields"]["source"] = ""  # saved without a calibration source
+        sourceless.apply_settings(unnamed)
+        sourceless._calibrate()
+        assert _calibration_source(sourceless._calibration_dialog)[1:] == ("1", 0)
     finally:
         _close(page, qapp)
         _close(restored, qapp)
+        _close(sourceless, qapp)
