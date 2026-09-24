@@ -521,7 +521,8 @@ def capture_stitch_geometry(request: StitchGeometryInput) -> StitchGeometryRecei
             "GEOMETRY_HASH_MISMATCH", "geometry digest does not match expectation"
         )
     if request.kind is StitchGeometryKind.PYFAI_GONIOMETER_JSON:
-        declared_positions = _json_position_names(_json_mapping(raw))
+        record = _json_mapping(raw)
+        declared_positions = _json_position_names(record)
         bound_positions = tuple(name for name, _source in request.source_motors)
         if set(bound_positions) != set(declared_positions):
             raise StitchOperationRefused(
@@ -529,6 +530,20 @@ def capture_stitch_geometry(request: StitchGeometryInput) -> StitchGeometryRecei
                 "goniometer JSON source mapping must bind every declared "
                 "position exactly once and no others",
             )
+        from xrd_tools.core.geometry.stacked_arm import STACKED_ARM_MARKER
+
+        constants = record["trans_function"].get("constants", {})
+        if type(constants) is dict and STACKED_ARM_MARKER in constants:
+            from xrd_tools.core.geometry import Diffractometer
+
+            try:
+                Diffractometer.from_pyfai_goniometer(
+                    record, source_motors=dict(request.source_motors)
+                )
+            except (KeyError, TypeError, ValueError, NotImplementedError) as error:
+                raise StitchOperationRefused(
+                    "GEOMETRY_PARSE_FAILED", "invalid stacked-arm calibration"
+                ) from error
     else:
         try:
             from xrd_tools.integrate.calibration import load_detector_calibration

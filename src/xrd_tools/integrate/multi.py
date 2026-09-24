@@ -3,7 +3,7 @@
 Multi-image stitching via pyFAI MultiGeometry.
 
 The key pattern: when the detector is scanned to different angular positions
-(in-plane ``del`` / ``rot1`` and out-of-plane ``nu`` / ``rot2``), every image
+(for example ``del`` and ``nu`` on a stacked detector arm), every image
 gets its own AzimuthalIntegrator with the detector angle encoded.
 ``create_multigeometry_integrators`` builds that list; ``stitch_1d`` /
 ``stitch_2d`` perform the stitched integration.
@@ -574,6 +574,14 @@ def create_multigeometry_integrator_series_from_geometry(
             "Diffractometer carrying one (from_pyfai_goniometer / a fitted "
             "geometry). The base dist/poni/Detector_config is required to stitch.")
 
+    # A coupled model owns all Euler rotations and still needs no GI incidence.
+    if getattr(diffractometer, 'stacked_arm', None) is not None:
+        if any(getattr(cal.poni, axis) != 0 for axis in ('rot1', 'rot2', 'rot3')):
+            raise ValueError('stacked arm requires zero base PONI rotations')
+        values = diffractometer.stacked_arm.rotations(motors)
+        rotations = tuple(zip(values['rot1'], values['rot2'], values['rot3']))
+        return GeometryIntegratorSeries(cal, rotations)
+
     # Compute ONLY the per-frame detector rotations (rot1/2/3) directly — a stitch
     # never needs the GI incidence, so a stitch scan that lacks the incidence motor
     # (e.g. psic's `eta`) must not crash; to_pyfai_per_frame stays strict for GI.
@@ -621,7 +629,7 @@ def create_multigeometry_integrator_series_from_geometry(
         )
     series = GeometryIntegratorSeries(cal, tuple(rotations))
     logger.debug("Prepared %d lazy per-frame integrators from a Diffractometer "
-                 "(preset=%s)", len(series),
+                         "(preset=%s)", len(series),
                  getattr(diffractometer, "preset", "?"))
     return series
 

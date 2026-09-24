@@ -370,7 +370,7 @@ def _mg_detector_config(calibration):
 
 
 def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_motor='nu',
-                    fit_scales=True, distance_seed_m=None, distance_bounds_m=None,
+                    fit_scales=False, distance_seed_m=None, distance_bounds_m=None,
                     max_rms_q=0.03, domain=None, distance_provenance=None, cancelled=None):
     """Fit the matched rows and refuse unconverged, degenerate or poor fits."""
     if not 3 <= len(frames) <= 32:
@@ -394,27 +394,18 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
         result = refine_goniometer(frames[0].poni_path, controls, rot1_motor=nu_motor,
                                   rot2_motor=del_motor, calibrant=calibrants[0],
                                   fit_scales=fit_scales, distance_seed_m=distance_seed_m,
-                                  distance_bounds_m=distance_bounds_m, cancelled=cancelled)
+                                  distance_bounds_m=distance_bounds_m, cancelled=cancelled,
+                                  model='stacked_del_on_nu')
         if not result.success or result.rms_q > max_rms_q:
             raise ValueError(result.message or f'fit RMS {result.rms_q:.5g} exceeds {max_rms_q:g} Å⁻¹')
-        params = dict(result.params)
-        names = list(params)
-        # Standard pyFAI GeometryTransformation JSON, admitted by the existing
-        # importer with the page's del/nu source-motor mapping and the
-        # notebooks' positional (del, nu) Goniometer.get_ai calls.
-        asset = {'content': 'Goniometer calibration v2', 'detector': base.poni.detector,
-                 'detector_config': exported_config, 'wavelength': base.poni.wavelength,
-                 'param_names': names, 'param': list(params.values()),
-                 'pos_names': ['del_angle', 'nu_angle'],
-                 'trans_function': {'content': 'GeometryTransformation', 'param_names': names,
-                    'pos_names': ['del_angle', 'nu_angle'], 'dist_expr': 'dist', 'poni1_expr': 'poni1',
-                    'poni2_expr': 'poni2', 'rot1_expr': 'rot1_scale * nu_angle + rot1_offset',
-                    'rot2_expr': 'rot2_scale * del_angle + rot2_offset', 'rot3_expr': 'rot3_offset',
-                    'constants': {'pi': float(np.pi)}}}
-        if base.parallax is not None:
-            asset['parallax'] = base.parallax
+        asset = result.diffractometer.stacked_arm.to_pyfai_goniometer(
+            result.diffractometer.calibration)
+        asset['detector_config'] = exported_config
         rms, condition, count = result.rms_q, result.condition_number, result.n_points
-        message = 'Frozen motor scales: ' + ', '.join(result.frozen_scales) if result.frozen_scales else 'Converged'
+        message = ('Del mounted on nu; frozen motor scales: ' + ', '.join(result.frozen_scales)
+                   if result.frozen_scales else 'Converged; del mounted on nu')
+        if not fit_scales:
+            message += '; motor scales fixed at degrees'
     elif backend == 'xu_hist':
         asset, rms, condition, count = _fit_xu(frames, loaded, del_motor, nu_motor,
             distance_seed_m, distance_bounds_m, max_rms_q, domain, cancelled)
@@ -424,6 +415,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     provenance = {'frames': [asdict(frame) for frame in frames], 'rms_q_A^-1': rms,
                   'condition_number': condition, 'n_points': count,
                   'distance_seed_m': distance_seed_m, 'distance_bounds_m': distance_bounds_m,
+                  'fit_motor_scales': bool(fit_scales) if backend == 'multigeometry' else False,
                   'source_motors': ({'nu_angle': nu_motor, 'del_angle': del_motor}
                                     if backend == 'multigeometry' else {'nu': nu_motor, 'del': del_motor}),
                   'image_rotation': frames[0].rotation,

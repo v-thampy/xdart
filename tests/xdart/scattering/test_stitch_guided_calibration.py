@@ -131,6 +131,7 @@ def test_modeless_window_exposes_guided_source_controls_and_preserves_session(tm
     assert dialog._spec().options['scan'] == '14'
     assert dialog.rotation.currentData() == 180
     assert dialog.backend.currentData() == 'xu_hist'
+    assert not dialog.scales.isChecked()
     assert dialog._text('del_motor') == 'delta'
     previous = dialog.session_dir
     dialog._new_session()

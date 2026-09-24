@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Literal, Mapping, Sequence
 import numpy as np
 
 from xrd_tools.core.containers import PONI
+from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
 
 if TYPE_CHECKING:  # Only needed for type checkers; avoided at runtime.
     import xrayutilities as xu
@@ -507,6 +508,9 @@ class Diffractometer:
       in); ``incident_angle`` stays in **degrees**.  ``AngleMapping.sign``
       doubles as a fitted dimensionless scale, so a calibrated goniometer
       (``rot = scale·motor + offset``) maps on with no extra field.
+      Alternatively, ``stacked_arm`` carries an exact nu-outer, del-inner
+      pose and derives all three rotations together; its affine mappings
+      and base PONI rotations must be inactive/zero.
     * **xrayutilities / RSM** — the ordered ``sample_circles`` /
       ``detector_circles`` axis-direction stacks, ``r_i`` (primary-beam
       direction), the ``camera`` orientation ``(init_area_detrot,
@@ -557,8 +561,18 @@ class Diffractometer:
     #: image mount).  Per-frame full geometry = this base ⊕
     #: :meth:`to_pyfai_per_frame`.  ``None`` for a bare preset.
     calibration: "DetectorCalibration | None" = None
+    stacked_arm: "StackedDetectorArm | None" = None
 
     def __post_init__(self) -> None:
+        if self.stacked_arm is not None:
+            if not isinstance(self.stacked_arm, StackedDetectorArm):
+                raise TypeError('stacked_arm must be a StackedDetectorArm')
+            if any(mapping.is_active for mapping in (self.rot1, self.rot2, self.rot3)):
+                raise ValueError('stacked arm cannot also have independent rotation mappings')
+            if self.calibration is not None and any(
+                getattr(self.calibration.poni, axis) != 0 for axis in ('rot1', 'rot2', 'rot3')
+            ):
+                raise ValueError('stacked arm carries all rotations; base PONI rotations must be zero')
         # store the free-form xu passthrough dicts JSON-canonical so to_json
         # never crashes on a numpy scalar and a round-trip is idempotent
         # (tuple -> list); these are written verbatim into the JSON blob.
@@ -700,7 +714,9 @@ class Diffractometer:
         beamline can calibrate in pyFAI and stitch/RSM headlessly with no
         pyFAI ``Goniometer`` at runtime (design §3.2a, closes stitching GAP D).
 
-        Decomposition (each ``rotN_expr`` is linear in the position axes):
+        An explicitly marked :class:`StackedDetectorArm` transformation is
+        preserved as a coupled pose, including its motor-dependent roll.
+        Other supported transformations are decomposed per axis:
 
         * a **constant** rotation (no position dependence, e.g. ``rot1_expr =
           "rot1"`` or ``rot3_expr = "0.0"``) → the base ``PONI.rotN`` (radians),
@@ -735,7 +751,7 @@ class Diffractometer:
         ------
         NotImplementedError
             For custom goniometer subclasses (no ``trans_function`` /
-            ``ExtendedTransformation`` / non-linear position dependence).
+            ``ExtendedTransformation`` / unrecognized non-linear expressions).
         """
         if isinstance(gonio, Mapping):
             data: dict[str, Any] = dict(gonio)
@@ -769,6 +785,7 @@ class Diffractometer:
         constants = {"pi": float(np.pi), **dict(trans.get("constants", {}))}
         local_base = {**constants, **params}
         motor_for = _resolve_source_motors(pos_names, source_motors)
+        stacked_arm = StackedDetectorArm.from_pyfai_goniometer(data, motor_for)
 
         pos_zero = {n: 0.0 for n in pos_names}
 
@@ -796,6 +813,10 @@ class Diffractometer:
         rot_mappings: dict[str, AngleMapping] = {}
         base_rots: dict[str, float] = {}
         for axis in ("rot1", "rot2", "rot3"):
+            if stacked_arm is not None:
+                base_rots[axis] = 0.0
+                rot_mappings[axis] = AngleMapping()
+                continue
             expr = trans[f"{axis}_expr"]
             f0 = _ev(expr, pos_zero)
             scales = []
@@ -877,6 +898,7 @@ class Diffractometer:
             rot3=rot_mappings["rot3"],
             incident_angle=AngleMapping(),  # pyFAI gonios carry no GI incidence
             calibration=cal,
+            stacked_arm=stacked_arm,
             **xu_fields,
         )
 
@@ -911,6 +933,8 @@ class Diffractometer:
 
     def to_diffractometer_geometry(self) -> "DiffractometerGeometry":
         """Lower to the legacy pyFAI per-frame view (byte-equal mappings)."""
+        if self.stacked_arm is not None:
+            raise NotImplementedError('legacy geometry cannot represent a stacked arm')
         conv = (self.preset
                 if self.preset in ("two_circle", "psic", "psic_halpha", "custom")
                 else "custom")
@@ -968,7 +992,8 @@ class Diffractometer:
         **degrees**.  Byte-equal to ``DiffractometerGeometry.derive_per_frame``
         — the GI incidence is intentionally *not* ``deg2rad``-converted.
         """
-        active_arrays: list[np.ndarray] = []
+        stacked = None if self.stacked_arm is None else self.stacked_arm.rotations(motors)
+        active_arrays: list[np.ndarray] = [] if stacked is None else [stacked['rot1']]
         for mapping in (self.rot1, self.rot2, self.rot3, self.incident_angle):
             if mapping.is_active:
                 if mapping.source_motor not in motors:
@@ -992,6 +1017,9 @@ class Diffractometer:
 
         out: dict[str, np.ndarray] = {}
         for key in ("rot1", "rot2", "rot3"):
+            if stacked is not None:
+                out[key] = stacked[key]
+                continue
             mapping = getattr(self, key)
             if mapping.is_active:
                 out[key] = np.deg2rad(mapping.apply(motors[mapping.source_motor]))
@@ -1076,6 +1104,8 @@ class Diffractometer:
     def all_referenced_motors(self) -> tuple[str, ...]:
         """All motor columns this instrument needs from the meta file."""
         seen: dict[str, None] = {}
+        if self.stacked_arm is not None:
+            seen.update({self.stacked_arm.del_motor: None, self.stacked_arm.nu_motor: None})
         for mapping in (self.rot1, self.rot2, self.rot3, self.incident_angle):
             if mapping.is_active and mapping.source_motor not in seen:
                 seen[mapping.source_motor] = None
@@ -1088,7 +1118,10 @@ class Diffractometer:
         return tuple(seen.keys())
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), separators=(",", ":"), sort_keys=True)
+        value = asdict(self)
+        if self.stacked_arm is None:
+            value.pop('stacked_arm')  # Preserve historical affine mapping_json bytes.
+        return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
     @classmethod
     def from_json(cls, s: str) -> "Diffractometer":
@@ -1123,6 +1156,7 @@ class Diffractometer:
                 DetectorCalibration.from_dict(d["calibration"])
                 if d.get("calibration") is not None else None
             ),
+            stacked_arm=(StackedDetectorArm(**d['stacked_arm']) if d.get('stacked_arm') is not None else None),
         )
 
 

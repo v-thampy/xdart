@@ -1,11 +1,11 @@
 """Headless goniometer refinement — the producer/inverse of
 :meth:`Diffractometer.from_pyfai_goniometer`.
 
-Fits a per-axis-linear pyFAI ``GeometryTransformation`` (``rotN = scale·motor +
-offset``) to identified powder control points across calibration frames at known
-motor positions, by minimising the per-control-point |q| residual with
+Fits an affine or exact del-on-nu pyFAI ``GeometryTransformation`` to identified
+powder control points across calibration frames at known motor positions,
+by minimising the per-control-point |q| residual with
 ``scipy.least_squares`` (NOT pyFAI ``refine3``, whose simplex diverges for the
-stacked psic — design §3.5).  The result is a fitted, axis-separable
+stacked psic — design §3.5).  The result is a fitted
 ``GeometryTransformation`` that round-trips straight through
 ``from_pyfai_goniometer`` into the canonical :class:`Diffractometer`.
 
@@ -17,8 +17,9 @@ so importing :mod:`xrd_tools.core` never pulls them in.
 What the |q| residual **can** and **cannot** constrain (enforced here, not left
 to the caller — powder |q| has real blind spots):
 
-* ``rot3`` (rotation about the beam) leaves |q| invariant, so it is **never
-  fit** — it is pinned at the base value.  Fitting it as a free LM parameter let
+* A free beam-axis rotation leaves |q| invariant, so it is **never fit** —
+  it is pinned at the base value. The stacked model additionally derives a
+  motor-dependent Euler ``rot3`` from the physical pose. Fitting beam rotation as a free parameter let
   it diverge to ~1e9 rad and silently corrupted the azimuth/cake/GI-χ/RSM of the
   returned object.
 * a per-axis ``scale`` is only identifiable if that motor **spans** a range; a
@@ -32,14 +33,14 @@ to the caller — powder |q| has real blind spots):
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
 from xrd_tools.core.containers import PONI
-from xrd_tools.core.geometry import Diffractometer
+from xrd_tools.core.geometry import Diffractometer, DetectorCalibration, StackedDetectorArm
 
 logger = logging.getLogger(__name__)
 
@@ -164,8 +165,9 @@ def refine_goniometer(
     distance_seed_m: float | None = None,
     distance_bounds_m: tuple[float, float] | None = None,
     cancelled=None,
+    model: str = 'affine',
 ) -> RefineResult:
-    """Fit an axis-separable goniometer to powder control points.
+    """Fit affine or exact del-on-nu geometry to powder control points.
 
     Parameters
     ----------
@@ -194,6 +196,11 @@ def refine_goniometer(
         in metres. A seed alone does not constrain the fitted distance. Bounds
         use the bounded trust-region solver; the historical unconstrained LM
         path is unchanged when bounds are absent.
+    model : {'affine', 'stacked_del_on_nu'}
+        Explicitly choose the physical nesting. The legacy default stays affine.
+        In stacked mode rot1_motor is outer nu and rot2_motor is inner del;
+        rot1_offset becomes the fixed inner mounting angle. The induced rot3
+        is computed from the pose, not fitted as an unconstrained powder angle.
 
     Returns
     -------
@@ -201,6 +208,8 @@ def refine_goniometer(
     """
     from scipy.optimize import least_squares  # noqa: PLC0415
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator  # noqa: PLC0415
+    if model not in {'affine', 'stacked_del_on_nu'}:
+        raise ValueError('unknown goniometer model')
 
     # --- base geometry -----------------------------------------------------
     base_poni: PONI
@@ -295,9 +304,14 @@ def refine_goniometer(
         for f in frames:
             m1 = float(f.motors[rot1_motor])
             m2 = float(f.motors[rot2_motor])
+            rotations = (r1s * m1 + r1o, r2s * m2 + r2o, r3o)
+            if model == 'stacked_del_on_nu':
+                rotations = StackedDetectorArm(nu_motor=rot1_motor, del_motor=rot2_motor,
+                    rot1_base=r1o, nu_scale=r1s, del_offset=r2o, del_scale=r2s,
+                    beam_rotation=r3o).angles(m2, m1)
             ai = AzimuthalIntegrator(
                 dist=dist, poni1=poni1, poni2=poni2,
-                rot1=r1s * m1 + r1o, rot2=r2s * m2 + r2o, rot3=r3o,
+                rot1=rotations[0], rot2=rotations[1], rot3=rotations[2],
                 detector=det, wavelength=wl_m,
             )
             if base_parallax is True:
@@ -375,8 +389,21 @@ def refine_goniometer(
     }
     if base_parallax is not None:
         gonio["parallax"] = base_parallax
+    sources = {"rot1_pos": rot1_motor, "rot2_pos": rot2_motor}
+    if model == 'stacked_del_on_nu':
+        arm = StackedDetectorArm(nu_motor=rot1_motor, del_motor=rot2_motor,
+            rot1_base=r1o, nu_scale=r1s, del_offset=r2o, del_scale=r2s,
+            beam_rotation=r3o)
+        calibration = DetectorCalibration(
+            replace(base_poni, dist=dist, poni1=poni1, poni2=poni2,
+                    rot1=0., rot2=0., rot3=0., wavelength=wl_m, detector=det_name),
+            detector_config=dict(detector_config or {}), parallax=base_parallax,
+        )
+        gonio = arm.to_pyfai_goniometer(calibration)
+        param_names, param = gonio['param_names'], gonio['param']
+        sources = {'nu_angle': rot1_motor, 'del_angle': rot2_motor}
     diff = Diffractometer.from_pyfai_goniometer(
-        gonio, source_motors={"rot1_pos": rot1_motor, "rot2_pos": rot2_motor},
+        gonio, source_motors=sources,
         base=base, preset=preset)
     return RefineResult(
         diffractometer=diff, rms_q=rms, n_points=n_points,

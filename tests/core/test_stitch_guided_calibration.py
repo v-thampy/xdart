@@ -96,13 +96,12 @@ def test_resumed_control_points_require_retained_image_binding(tmp_path):
 
 
 def test_mg_fit_saved_json_reloads_actual_importer_and_bad_inputs_refuse(tmp_path):
-    from tests.core.test_refine import _truth, _synth_control_frames, _FRAMES
+    from tests.core.test_stacked_arm import _independent_stacked_controls
     from xrd_tools.core.geometry import Diffractometer
     from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry
     from pyFAI.goniometer import Goniometer
-    truth = _truth()
-    controls = _synth_control_frames(truth, _FRAMES, per_ring=8)
-    frames = _frames(tmp_path, controls, truth.calibration.poni)
+    controls, calibration = _independent_stacked_controls()
+    frames = _frames(tmp_path, controls, calibration.poni)
     result = fit_calibration(frames, distance_bounds_m=(.37, .41))
     path = save_calibration_fit(result, tmp_path / 'fitted.json')
     loaded = Diffractometer.from_pyfai_goniometer(path,

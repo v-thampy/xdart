@@ -281,7 +281,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.backend.setCurrentIndex(max(0, self.backend.findData(backend)))
         form.addRow('Geometry model', self.backend)
         self.scales = QtWidgets.QCheckBox('Fit MG motor scales when angle coverage identifies them')
-        self.scales.setChecked(True)
+        self.scales.setChecked(False)
         form.addRow(self.scales)
         self._edit(form, 'rms', 'Maximum RMS |q| (Å⁻¹)', '.03')
         self._edit(form, 'distance_seed', 'Distance seed (mm; optional)', '')

@@ -30,6 +30,7 @@ from xrd_tools.core.geometry.pixel_q import (
     DetectorHeader,
     PixelQMap,
 )
+from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
 
 __all__ = [
     # Per-frame, scalar (motor → pyFAI rotation / GI incidence)
@@ -39,6 +40,7 @@ __all__ = [
     "DiffractometerGeometry",
     # Canonical one-object geometry (two derived adapter views)
     "Diffractometer",
+    "StackedDetectorArm",
     "assemble_circle_angles",
     # Static detector calibration (PONI + Detector_config + image mount)
     "DetectorCalibration",
