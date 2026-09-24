@@ -2303,25 +2303,41 @@ def _read_correction_image(path: Path, name: str) -> np.ndarray:
 def inspect_detector_correction(
     poni_file: str, path_text: str, role: str,
     min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
+    cache: dict | None = None,
 ) -> DetectorImageCheck:
     """Check a dark or flat-field file before a run: for the Advanced dialog.
 
     Uses the selected PONI's detector for the shape and gap checks when one is set.
+    ``cache`` (owned by the caller, e.g. for one dialog session) keeps the last
+    decoded image per role, so a cutoff change does not re-read the file.
     """
     name = "flat field" if role == "flat" else "dark"
     path = Path(path_text)
     try:
-        raw = _read_correction_image(path, name)
+        stat = path.stat()
     except FileNotFoundError:
         return DetectorImageCheck(role, (), errors=(f"the {name} file does not exist",))
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
         return DetectorImageCheck(role, (), errors=(str(exc),))
-    detector = None
-    if poni_file:
+    key = (str(path), stat.st_mtime_ns, stat.st_size, str(poni_file))
+    loaded = None if cache is None else cache.get(role)
+    if loaded is None or loaded[0] != key:
         try:
-            detector = _detector_facts(load_poni(Path(poni_file)))
-        except Exception:  # noqa: BLE001 - an unreadable PONI only skips the checks
-            detector = None
+            raw = _read_correction_image(path, name)
+        except FileNotFoundError:
+            return DetectorImageCheck(role, (), errors=(f"the {name} file does not exist",))
+        except (OSError, ValueError) as exc:
+            return DetectorImageCheck(role, (), errors=(str(exc),))
+        detector = None
+        if poni_file:
+            try:
+                detector = _detector_facts(load_poni(Path(poni_file)))
+            except Exception:  # noqa: BLE001 - an unreadable PONI only skips the checks
+                detector = None
+        loaded = (key, raw, detector)
+        if cache is not None:
+            cache[role] = loaded
+    _key, raw, detector = loaded
     shape, mask = (None, None) if detector is None else detector
     return check_detector_image(raw, role, detector_shape=shape, detector_mask=mask,
                                 min_fraction=min_fraction)

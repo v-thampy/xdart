@@ -102,16 +102,20 @@ def test_the_cutoff_edits_and_the_status_lines_report_the_checks(qapp, tmp_path:
     np.save(tmp_path / "flat.npy", flat)
     np.save(tmp_path / "wrong.npy", np.ones((100, 100)))
     snapshot = _snapshot(tmp_path)
+    cache = {}
     dialog = AdvancedSettingsDialog(
         correction_inspector=lambda role, path, fraction: inspect_detector_correction(
-            str(poni), path, role, fraction))
+            str(poni), path, role, fraction, cache=cache))
     try:
         dialog.load_values(advanced_settings_values(snapshot))
         assert dialog.flat_min_percent.value() == 10.0 and dialog.flat_status.isHidden()
+        assert not dialog.flat_min_percent.keyboardTracking()  # re-check on commit only
         dialog.flat_file.setText(str(tmp_path / "flat.npy"))
         dialog.flat_file.editingFinished.emit()
         assert dialog.flat_status.text() == "195 × 487 · median 2 · 0 % masked"
+        decoded = cache["flat"][1]
         dialog.flat_min_percent.setValue(50.0)
+        assert cache["flat"][1] is decoded  # a cutoff change reuses the decoded flat
         assert dialog.flat_status.text().endswith(
             "the flat field masks 5.1 % of the detector's usable pixels "
             "(dead or below 50 % of its median)")

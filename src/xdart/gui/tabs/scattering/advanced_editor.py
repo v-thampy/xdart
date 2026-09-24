@@ -144,6 +144,8 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         self.flat_min_percent.setDecimals(1)
         self.flat_min_percent.setSingleStep(1.0)
         self.flat_min_percent.setSuffix(" % of median")
+        # Re-check on a committed value, not on every keystroke.
+        self.flat_min_percent.setKeyboardTracking(False)
         self.flat_min_percent.setToolTip(
             "Flat pixels below this share of the flat's median are treated as dead "
             "and masked. Raise it to mask a region shadowed in the flat; lower it to "

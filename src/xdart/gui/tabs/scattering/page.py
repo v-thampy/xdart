@@ -658,6 +658,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             else self._choose_results_notebook_dialog
         )
         self._advanced_dialog: AdvancedSettingsDialog | None = None
+        # Decoded dark/flat images for the open Advanced dialog's checks.
+        self._correction_inspections: dict = {}
         self._advanced_settings_editor = (
             advanced_settings_editor
             if advanced_settings_editor is not None
@@ -7589,7 +7591,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self, correction_inspector=self._inspect_detector_correction,
             )
             self._advanced_dialog = dialog
-        return dialog.edit(snapshot)
+        self._correction_inspections = {}
+        try:
+            return dialog.edit(snapshot)
+        finally:
+            self._correction_inspections = {}
 
     def _inspect_detector_correction(
         self, role: str, path: str, min_fraction: float,
@@ -7598,7 +7604,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         from .output_preflight import inspect_detector_correction
 
         poni_file = str(self._intents.snapshot().thaw().poni_file or "")
-        return inspect_detector_correction(poni_file, path, role, min_fraction)
+        return inspect_detector_correction(
+            poni_file, path, role, min_fraction, cache=self._correction_inspections,
+        )
 
     def _show_performance_diagnostics_dialog(
         self,
