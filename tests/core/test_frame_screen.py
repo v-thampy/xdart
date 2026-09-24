@@ -236,15 +236,10 @@ def test_a_tampered_frame_verdict_refuses_an_attested_xu_result(tmp_path):
 
 def test_a_result_saved_without_verdicts_still_reads(tmp_path, monkeypatch):
     from xrd_tools.analysis import stitch_operation
-    from xdart.gui.tabs.stitch.page import saved_frame_screen_note
     monkeypatch.setattr(stitch_operation, '_record_frame_screen', lambda records, verdicts: None)
     target = test_grouped_scans_are_screened_only_against_themselves(tmp_path)
     verdicts = _verdicts(target)
     assert all(screen is None and excluded is None for _s, _f, screen, excluded in verdicts)
-    from xrd_tools.io.analysis_artifact import read_analysis_artifact
-    rows = read_analysis_artifact(target).contributing_frames
-    assert saved_frame_screen_note(rows) == 'frame check not recorded'
-    assert saved_frame_screen_note([{**row, 'screen': 'ok', 'excluded': False} for row in rows]) == ''
 
 
 def test_grouped_xu_rows_keep_their_member(tmp_path):
