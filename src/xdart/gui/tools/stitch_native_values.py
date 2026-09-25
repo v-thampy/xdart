@@ -1,6 +1,5 @@
 """Native Stitch selections projected onto existing finite operation owners."""
 import json
-import re
 from pathlib import Path
 
 from xrd_tools.analysis.module_transaction import (
@@ -23,67 +22,15 @@ from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
 from xrd_tools.integrate.frame_screen import FrameScreenPolicy
 from xrd_tools.integrate.xu_stitch import resolve_xu_stitch_effective_geometry
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind
-from xrd_tools.io.output_path import is_artifact_family, resolve_finite_output_target
+from xrd_tools.io.output_path import (
+    automatic_artifact_family, is_artifact_family, resolve_finite_output_target,
+)
 
 
 def _combined(group):
     # Multiple entries of one NeXus file remain one source/file output.
     return len({(str(Path(spec.uri).resolve()), spec.options.get("scan"))
                 for spec in group}) > 1
-
-
-def _listed(entries):
-    """Members joined by +; consecutive numbers under one head form a range.
-
-    ``entries`` are ``(order, head, number, text)``: SPEC scans 2,3,4,5,8 give
-    ``2-5+8`` and NeXus names a_0001..a_0003 give ``a_0001-0003``.
-    """
-    parts = []
-    for _order, head, number, text in sorted(set(entries)):
-        last = parts[-1] if parts else None
-        if number is not None and last and last[0] == head and last[1] == number - 1:
-            parts[-1] = (head, number, last[2], text[len(head):])
-        else:
-            parts.append((head, number, text, ""))
-    return "+".join(start + (f"-{end}" if end else "") for _head, _number, start, end in parts)
-
-
-def _scan_entry(scan):
-    # A first occurrence is the plain scan number; a later one (2.3) stands alone.
-    label = str(scan).removesuffix(".1")
-    number, _, occurrence = label.partition(".")
-    return ((int(number), int(occurrence or 1)), "" if not occurrence else label,
-            None if occurrence else int(number), label)
-
-
-def _name_entry(name):
-    match = re.fullmatch(r"(.*?)(\d+)", name)
-    return ((match[1], int(match[2])), match[1], int(match[2]), name) if match else ((name, -1), name, None, name)
-
-
-def automatic_family(members, project):
-    """The result name of one output from its ``(source path, scan or None)`` members.
-
-    One source is ``<path parts>-<scan>`` (``data-sample-14``). An output that
-    combines scans of one SPEC file lists them after the file (``[2-5,8]`` gives
-    ``data-sample-2-5+8``); other combinations list their sources' names.
-    """
-    project = Path(project).resolve()
-
-    def source(path, scan):
-        relative = Path(path).resolve().relative_to(project)
-        # Keep source suffixes meaningful to identity: SPEC may have a suffix.
-        return "-".join((relative if scan is not None else relative.with_suffix("")).parts)
-
-    def single(path, scan):
-        return source(path, scan) + ("" if scan is None else "-" + str(scan).removesuffix(".1"))
-
-    members = tuple(dict.fromkeys((str(Path(path).resolve()), scan) for path, scan in members))
-    if len(members) == 1:
-        return single(*members[0])
-    if len({path for path, _scan in members}) == 1 and all(scan is not None for _path, scan in members):
-        return source(*members[0]) + "-" + _listed(_scan_entry(scan) for _path, scan in members)
-    return _listed(_name_entry(single(path, scan)) for path, scan in members)
 
 
 def _families(form, resolution, project):
@@ -114,7 +61,7 @@ def _families(form, resolution, project):
     families, seen = [], set()
     for index, (group, name) in enumerate(zip(groups, explicit), 1):
         if not name:
-            name = automatic_family(((spec.uri, spec.options.get("scan")) for spec in group), project)
+            name = automatic_artifact_family(((spec.uri, spec.options.get("scan")) for spec in group), project)
             if _combined(group) and not is_artifact_family(name):
                 raise refused("OUTPUT_FAMILY_REQUIRED",
                     f"Output {index} combines sources and its automatic name {name!r} is not a "

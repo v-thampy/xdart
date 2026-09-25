@@ -991,3 +991,28 @@ def test_readable_stems_stay_readable_and_unsafe_ones_are_refused(tmp_path):
     # stripping, including one that merely LOOKS like a slot name.
     for stem in ("scan_12-a.b", "sample_average"):
         assert artifact_family_from_source(tmp_path / f"{stem}.nexus") == stem
+
+
+def test_a_combined_result_is_named_from_its_members(tmp_path):
+    # Maintainer ruling 2026-09-25: automatic combined names, members joined by the
+    # portable "_" (not "+"), consecutive numbers as a range, sorted, nothing hashed.
+    from xrd_tools.io.output_path import automatic_artifact_family, is_artifact_family
+
+    spec = tmp_path / "data" / "sample"
+
+    def name(*scans):
+        return automatic_artifact_family([(spec, scan) for scan in scans], tmp_path)
+
+    assert name("14.1") == "data-sample-14"  # one source: the single-scan name
+    assert name("14.1", "15.1", "16.1") == name("16", "14", "15") == "data-sample-14-16"
+    assert name("8", "2", "3", "4", "5") == "data-sample-2-5_8"
+    assert name("2.1", "2.3", "3.1") == "data-sample-2_2.3_3"  # a later occurrence stands alone
+    runs = [(tmp_path / "raw" / f"run_{n:04d}.nxs", None) for n in (11, 9, 10, 20)]
+    assert automatic_artifact_family(runs, tmp_path) == "raw-run_0009-0011_raw-run_0020"
+    pair = [(tmp_path / "b.h5", None), (tmp_path / "a.nxs", None)]
+    assert automatic_artifact_family(pair, tmp_path) == "a_b"
+    for family in ("data-sample-2-5_8", "raw-run_0009-0011_raw-run_0020"):
+        assert is_artifact_family(family)
+        assert re.fullmatch(r"[A-Za-z0-9._-]+", family)  # POSIX portable filename characters
+    # long selections are refused by the caller, never truncated or hashed
+    assert not is_artifact_family(name(*(str(n) for n in range(1, 80, 2))))

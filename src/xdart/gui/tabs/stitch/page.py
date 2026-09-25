@@ -415,7 +415,7 @@ class StitchPage(QtWidgets.QWidget):
         self._field(advanced_card, SectionId.SOURCE, "output_family", "Result names")
         self._rows["output_family"].setToolTip(
             "Blank names are automatic: <file>-<scan> for one scan, and the scans listed for a "
-            "combined result ([2-5,8] gives <file>-2-5+8). To override, enter one name, or names in "
+            "combined result ([2-5,8] gives <file>-2-5_8). To override, enter one name, or names in "
             "output order separated by ; (a blank entry stays automatic). At most 80 characters; "
             "processing and frame selection keep the same name.")
         for key in ("geometry_path", "geometry_kind"):
@@ -625,7 +625,7 @@ class StitchPage(QtWidgets.QWidget):
 
     def _automatic_names(self, kind, sources, scans):
         """The result names the selection gets when Result names is blank (Preview confirms)."""
-        from xdart.gui.tools.stitch_native_values import automatic_family
+        from xrd_tools.io.output_path import automatic_artifact_family
         from xrd_tools.sources.grouping import parse_stitch_scan_groups
         project = str(self._value("project_root") or "").strip()
         try:
@@ -634,7 +634,7 @@ class StitchPage(QtWidgets.QWidget):
                           for path in sources for group in parse_stitch_scan_groups(scans)]
             else:
                 groups = [[(path, None) for path in sources]] if kind == "NeXus" and sources else []
-            names = [automatic_family(group, project) for group in groups[:3]] if project else []
+            names = [automatic_artifact_family(group, project) for group in groups[:3]] if project else []
         except ValueError:
             names = []
         if not names:

@@ -109,24 +109,11 @@ def test_native_group_is_named_automatically_or_as_entered(tmp_path):
     assert Path(prepared.request.module.output.target).name == "Sample A é_stitch1d.nexus"
 
 
-def test_automatic_result_names_list_what_an_output_combines(tmp_path):
+def test_an_automatic_name_over_80_characters_asks_for_one(tmp_path):
     from types import SimpleNamespace
-    from xdart.gui.tools.stitch_native_values import _families, automatic_family
+    from xdart.gui.tools.stitch_native_values import _families
     from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
     spec = tmp_path / "data" / "sample"
-
-    def name(*scans):
-        return automatic_family([(spec, scan) for scan in scans], tmp_path)
-
-    assert name("14.1") == "data-sample-14"
-    assert name("14.1", "15.1", "16.1") == name("16", "14", "15") == "data-sample-14-16"
-    assert name("8", "2", "3", "4", "5") == "data-sample-2-5+8"
-    assert name("2.1", "2.3", "3.1") == "data-sample-2+2.3+3"  # a later occurrence stands alone
-    runs = [(tmp_path / "raw" / f"run_{n:04d}.nxs", None) for n in (11, 9, 10, 20)]
-    assert automatic_family(runs, tmp_path) == "raw-run_0009-0011+raw-run_0020"
-    assert automatic_family([(tmp_path / "b.h5", None), (tmp_path / "a.nxs", None)], tmp_path) == "a+b"
-
-    # an automatic name over 80 characters asks for one
     odd = tuple(SimpleNamespace(uri=str(spec), options={"scan": f"{n}.1"}) for n in range(1, 80, 2))
     resolution = SimpleNamespace(groups=(odd,), skipped=())
     with pytest.raises(StitchToolPreflightRefused, match="OUTPUT_FAMILY_REQUIRED"):
