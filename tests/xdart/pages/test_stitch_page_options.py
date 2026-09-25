@@ -181,3 +181,23 @@ def test_browse_opens_at_the_last_folder_with_int_file_types(qapp, tmp_path, mon
         assert seen[-1] == ("Choose detector mask", str(calibration), file_dialogs.MASK_FILTER)
     finally:
         _close(page, qapp)
+
+
+def test_the_mode_box_lists_int_modes_and_leaves_for_them(qapp):
+    from xdart.gui.pages.values import RSM_TOOL_KEY, SCATTERING_PAGE_KEY
+    from xdart.gui.tabs.scattering.run_mode_projection import RUN_MODE_CHOICES
+
+    page = StitchPage(empty_host_services(_Status()))
+    requested = []
+    page.toolRequested.connect(requested.append)
+    try:
+        combo = page.run_bar.modeCombo
+        assert tuple(combo.itemText(row) for row in range(combo.count())) == RUN_MODE_CHOICES
+        assert combo.currentText() == "Stitch 1D"
+        assert not combo.model().item(combo.findText("Stitch 2D")).isEnabled()  # as on Int
+        combo.setCurrentText("Int 2D")  # back to the integration workspace; the box stays
+        assert requested == [str(SCATTERING_PAGE_KEY)] and combo.currentText() == "Stitch 1D"
+        combo.setCurrentText("RSM")
+        assert requested[-1] == str(RSM_TOOL_KEY) and combo.currentText() == "Stitch 1D"
+    finally:
+        _close(page, qapp)

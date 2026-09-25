@@ -26,7 +26,7 @@ from xdart.gui.pages.handle import AppMenuHosts, PageHandle
 from xdart.gui.pages.operation_owner import OperationTerminalStatus
 from xdart.gui.pages.values import (
     ActionAccepted, ActionCompleted, ActionRefused, PageCleanup,
-    SCATTERING_PAGE_KEY, STITCH_TOOL_KEY,
+    RSM_TOOL_KEY, SCATTERING_PAGE_KEY, STITCH_TOOL_KEY,
 )
 from xdart.gui.themes import apply_seaborn_plot_style
 from xdart.gui.tools.stitch_owner import (
@@ -332,7 +332,14 @@ class StitchPage(QtWidgets.QWidget):
         self._source_changed()
         self._render_ranges()
         self.run_bar = RunControlsBar()
-        self.run_bar.apply_profile(modes=("Stitch 1D",), live=False, batch=False, cores=False)
+        # The same modes as Int: another one leaves for the integration workspace.
+        from xdart.gui.tabs.scattering.run_mode_projection import (
+            RUN_MODE_CHOICES, UNOWNED_RUN_MODE_REASONS,
+        )
+        self.run_bar.apply_profile(modes=RUN_MODE_CHOICES, live=False, batch=False, cores=False)
+        self.run_bar.set_unavailable_modes(UNOWNED_RUN_MODE_REASONS)
+        self.run_bar.modeCombo.setCurrentText("Stitch 1D")
+        self.run_bar.modeChanged.connect(self._mode_chosen)
         self.run_bar.writeModeButton.setText("Replace ⇄")
         self.run_bar.writeModeButton.setChecked(True)
         self.run_bar.writeModeButton.setEnabled(False)
@@ -345,6 +352,15 @@ class StitchPage(QtWidgets.QWidget):
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setStretchFactor(2, 0)
         self.splitter.setSizes([230, 720, 360])
+
+    def _mode_chosen(self, mode):
+        """Leave for the chosen mode's page (the host refuses while Stitch runs)."""
+        if mode == "Stitch 1D":
+            return
+        blocker = QtCore.QSignalBlocker(self.run_bar.modeCombo)
+        self.run_bar.modeCombo.setCurrentText("Stitch 1D")
+        del blocker
+        self.toolRequested.emit(str(RSM_TOOL_KEY if mode == "RSM" else SCATTERING_PAGE_KEY))
 
     def _field(self, card, section, key, label, value="", *, choices=(), browse=False):
         kind = ControlFieldKind.COMBO if choices else ControlFieldKind.LINE
