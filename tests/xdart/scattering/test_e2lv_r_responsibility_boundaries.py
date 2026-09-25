@@ -369,7 +369,11 @@ def test_delayed_frame_event_routes_its_exact_artifact_key(
                 navigation_delta=DisplayNavigationDelta(delayed),
             )
         )
-        page._drain_executor()
+        # Executor events reach the page only on its run timer, which a drain
+        # keeps running while a throttled repaint is due. The run is idle, so
+        # that timer may have stopped: wake it as event delivery would. A hand
+        # drain here could defer the repaint with no tick left to paint it.
+        page._ensure_timer()
 
         # Cold cross-artifact hydration keeps the outgoing plot until the exact
         # replacement is ready; event acceptance alone is not a paint receipt,
