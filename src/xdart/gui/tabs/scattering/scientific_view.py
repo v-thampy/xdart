@@ -276,6 +276,10 @@ def _pixmap_pixel_count(pixmap) -> int:
 
 class ScientificView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
+    #: The plot-options dialog was accepted. Emitted after the view has read its own options
+    #: and before it emits their commands, so a host reads the rows it added
+    #: (``plot_options_dialog.add_row``) before any of its own redraws resets them.
+    plotOptionsAccepted = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -748,9 +752,7 @@ class ScientificView(QtWidgets.QFrame):
         self.slice_width = spin(0.0, 360.0, 10.0)
         self.pin = QtWidgets.QPushButton("Pin")
         self.plot_mode = ContentFitComboBox()
-        self.plot_mode.addItems(
-            ["Single", "Overlay", "Average", "Sum", "Waterfall"]
-        )
+        self.plot_mode.addItems(list(self._PLOT_MODES))
         self.options = _CompactMenuButton("Options")
         self.plot_options_dialog = PlotOptionsDialog(self)
         self.clear = QtWidgets.QPushButton("Clear")
@@ -854,6 +856,7 @@ class ScientificView(QtWidgets.QFrame):
     def _accept_plot_options(self) -> None:
         prior = self.plot_options_dialog.projection
         edited = self.plot_options_dialog.edited_options()
+        self.plotOptionsAccepted.emit()
         for field, path in zip(
             _PLOT_OPTION_FIELDS,
             PLOT_OPTION_COMMAND_PATHS,
@@ -2808,6 +2811,21 @@ class ScientificView(QtWidgets.QFrame):
 
     #: Top-bar tools a host page may leave out, by name.
     _HOST_TOOLS = {"norm": "norm", "background": "background", "raw": "raw_popup_button"}
+    _PLOT_MODES = ("Single", "Overlay", "Average", "Sum", "Waterfall")
+
+    def set_plot_modes(self, *names: str) -> None:
+        """Offer only the plot modes the host can show (Stitch: Single and Overlay); Int
+        offers all. Without Waterfall, the options dialog leaves out its Waterfall section."""
+        unknown = set(names) - set(self._PLOT_MODES)
+        if not names or unknown:
+            raise ValueError(f"unknown plot modes: {sorted(unknown) or 'none given'}")
+        current = self.plot_mode.currentText()
+        blocker = QtCore.QSignalBlocker(self.plot_mode)
+        self.plot_mode.clear()
+        self.plot_mode.addItems([mode for mode in self._PLOT_MODES if mode in names])
+        self.plot_mode.setCurrentIndex(max(0, self.plot_mode.findText(current)))
+        del blocker
+        self.plot_options_dialog.set_waterfall_visible("Waterfall" in names)
 
     def set_hidden_tools(self, *names: str) -> None:
         """Leave out top-bar tools the host page has no operation for (Stitch: no

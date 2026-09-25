@@ -169,8 +169,9 @@ class StitchPage(QtWidgets.QWidget):
         self._rows = {}
         self._revision = 0
         self._prepared_revision = None
-        #: Run prepares changed inputs itself (Preview's checks), then continues into the jobs.
-        self._run_after_prepare = False
+        #: What follows the preflight: "preview" shows the plan, "run" continues into the jobs
+        #: (Run prepares changed inputs itself), "stopped" does neither (Stop while preparing).
+        self._after_prepare = None
         #: Skipped scans and warnings of the prepared plan, for the status line.
         self._prepared_notes = ""
         #: Int's readiness line: (summary, ready) from the section checks.
@@ -263,6 +264,7 @@ class StitchPage(QtWidgets.QWidget):
         # Stitch results are integrated 1-D curves (Int 1D's layout: Q or 2θ); Stitch has no
         # normalization channel, 1-D Background or raw popup on this pane.
         self.scientific.set_hidden_tools("norm", "background", "raw")
+        self.scientific.set_plot_modes("Single", "Overlay")
         self.scientific.commandRequested.connect(self._view_command)
         self.curve = self.scientific.curve
         self._install_diagnostic_option()
@@ -924,21 +926,21 @@ class StitchPage(QtWidgets.QWidget):
         return True
 
     def begin_preview(self):
-        self._prepare("Preparing Preview…")
+        self._prepare("Preparing Preview…", then="preview")
 
-    def _prepare(self, action, *, run=False):
+    def _prepare(self, action, *, then):
         def begin():
             self._owner.set_form(self.build_form())
             self._prepared_revision = None
             return self._owner.begin_preflight()
-        self._run_after_prepare = run
+        self._after_prepare = then
         if not self._start(action, begin):
-            self._run_after_prepare = False
+            self._after_prepare = None
 
     def begin_run(self):
         if self._prepared_revision != self._revision or self._owner.prepared is None:
             # As Int's Run: the inputs are checked on the way (Preview's preflight), then run.
-            self._prepare("Checking the inputs…", run=True)
+            self._prepare("Checking the inputs…", then="run")
             return
         self._run_prepared()
 
@@ -948,6 +950,7 @@ class StitchPage(QtWidgets.QWidget):
             self._status("Nothing to stitch" + self._prepared_notes, ready=False)
             return
         self._queued_jobs = list(range(count))
+        self._prepared_revision = None  # a run uses its plan once: the next Run checks again
         self._job_total = count
         self._batch_started = time.monotonic()
         self._run_next_job()
@@ -974,8 +977,12 @@ class StitchPage(QtWidgets.QWidget):
 
     def stop(self):
         self._queued_jobs.clear()
+        if self._after_prepare == "run":  # the check finishes; nothing is stitched after it
+            self._after_prepare = "stopped"
+            self._status("Stopping…")
         if self._owner.cancel():
             self._status("Stopping…")
+        self._sync_actions()
         return ActionAccepted("stitch-stop")
 
     def _retry(self):
@@ -994,7 +1001,7 @@ class StitchPage(QtWidgets.QWidget):
                 self._status(f"{p.stage} · {p.completed}/{p.total}")
             elif update.terminal_status is OperationTerminalStatus.FAILED:
                 self._queued_jobs.clear()
-                self._run_after_prepare = False
+                self._after_prepare = None
                 self._status(update.failure_message or update.failure_type, ready=False)
                 if update.action is StitchOwnerAction.METADATA and self._metadata_current():
                     self._metadata_dialog.status.setText(update.failure_message or update.failure_type)
@@ -1002,7 +1009,7 @@ class StitchPage(QtWidgets.QWidget):
                     self._raw_popup.caption.setText("Image unavailable · " + (update.failure_message or update.failure_type))
             elif update.terminal_status is OperationTerminalStatus.CANCELLED:
                 self._queued_jobs.clear()
-                self._run_after_prepare = False
+                self._after_prepare = None
                 self._status("Cancelled")
             elif update.outcome is not None:
                 self._accept_outcome(update)
@@ -1019,9 +1026,13 @@ class StitchPage(QtWidgets.QWidget):
                 self._metadata_dialog.adopt_sources(outcome.metadata)
             self._status("Ready · saved Stitch 1D result")
         elif outcome.kind is StitchOwnerOutcomeKind.PREFLIGHT_READY:
-            run, self._run_after_prepare = self._run_after_prepare, False
+            then, self._after_prepare = self._after_prepare, None
+            if then == "stopped":
+                self._status("Stopped before stitching", ready=False)
+                return
             if update.stale or self._action_revision != self._revision:
-                self._status("Inputs changed while checking · " + ("Run" if run else "Preview") + " again", ready=False)
+                self._status("Inputs changed while checking · " + ("Run" if then == "run" else "Preview")
+                             + " again", ready=False)
                 return
             self._prepared_revision = self._revision
             preflight = outcome.preflight
@@ -1053,7 +1064,7 @@ class StitchPage(QtWidgets.QWidget):
                       (len(preflight.warnings), "warning", "warnings"))
             notes = [f"{n} {one if n == 1 else many}" for n, one, many in counts if n]
             self._prepared_notes = f" · {', '.join(notes)} (Preview lists them)" if notes else ""
-            if run:
+            if then == "run":
                 self._run_prepared()
                 return
             self.preview_dialog.show()
@@ -1395,8 +1406,9 @@ class StitchPage(QtWidgets.QWidget):
         elif kind is ShellCommandKind.SET_COLOR_MAP:
             self._color_map = str(value)
             self._render_raw()
-        elif kind is ShellCommandKind.SET_LOG_SCALE:
+        elif kind is ShellCommandKind.SET_LOG_SCALE:  # as Int: the image and the curve
             self._log_scale = bool(value)
+            self._plot_options = replace(self._plot_options, intensity_scale="Log" if value else "Linear")
             self._render_raw()
         elif kind is ShellCommandKind.SET_PLOT_OPTION:
             field = dict(zip(PLOT_OPTION_COMMAND_PATHS, _PLOT_OPTION_FIELDS)).get(command.path)
@@ -1416,13 +1428,10 @@ class StitchPage(QtWidgets.QWidget):
         dialog = self.scientific.plot_options_dialog
         self._diagnostic_combo = QtWidgets.QComboBox()
         self._diagnostic_combo.addItems(("Intensity", "Coverage", "Normalization"))
-        row = QtWidgets.QWidget()
-        layout = QtWidgets.QHBoxLayout(row)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QtWidgets.QLabel("Diagnostic"))
-        layout.addWidget(self._diagnostic_combo)
-        dialog.layout().insertWidget(dialog.layout().count() - 1, row)
-        dialog.accepted.connect(self._diagnostic_accepted)
+        dialog.add_row("Diagnostic", self._diagnostic_combo)
+        # read before the view's own option commands redraw (and so reset) the row
+        self.scientific.plotOptionsAccepted.connect(self._diagnostic_accepted)
+        dialog.rejected.connect(lambda: self._diagnostic_combo.setCurrentText(self._diagnostic))
 
     def _diagnostic_accepted(self):
         if self._diagnostic_combo.currentText() != self._diagnostic:
@@ -1492,7 +1501,9 @@ class StitchPage(QtWidgets.QWidget):
         self.metadata_button.setEnabled(idle and self._current_payload() is not None)
         self.preview_button.setEnabled(idle)
         self.run_bar.startButton.setEnabled(idle and self._readiness[1])  # Run prepares the inputs itself
-        self.run_bar.set_stop_enabled(busy and self._owner.current_identity.request.action is StitchOwnerAction.RUN)
+        action = self._owner.current_identity.request.action if busy else None
+        self.run_bar.set_stop_enabled(action is StitchOwnerAction.RUN or (
+            action is StitchOwnerAction.PREFLIGHT and self._after_prepare == "run"))
         self.retry_button.setVisible(final is not StitchOwnerFinalization.NONE)
         self.retry_button.setEnabled(not busy)
 

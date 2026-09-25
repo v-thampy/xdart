@@ -283,5 +283,17 @@ def test_the_stitch_display_is_ints_scientific_view(qapp):
         assert view.title.text() == "Current"
         with pytest.raises(ValueError, match="unknown scientific-view tools"):
             view.set_hidden_tools("slice")
+        # Stitch offers Single and Overlay only, and no Waterfall options; Int keeps them all
+        modes = lambda combo: [combo.itemText(row) for row in range(combo.count())]  # noqa: E731
+        assert modes(view.plot_mode) == ["Single", "Overlay"]
+        assert view.plot_options_dialog._waterfall_group.isHidden()
+        with pytest.raises(ValueError, match="unknown plot modes"):
+            view.set_plot_modes("Stack")
+        int_view = ScientificView()
+        try:
+            assert modes(int_view.plot_mode) == ["Single", "Overlay", "Average", "Sum", "Waterfall"]
+            assert not int_view.plot_options_dialog._waterfall_group.isHidden()
+        finally:
+            int_view.deleteLater()
     finally:
         _close(page, qapp)

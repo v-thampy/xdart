@@ -20,6 +20,7 @@ from xrd_tools.analysis.stitch_operation import StitchGeometryKind, run_stitch_o
 from xrd_tools.analysis.xu_stitch_calibration import canonical_surface_resource_bytes
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+from xdart.gui.widgets.scientific_plot import scaled_intensity
 from tests.core.test_stitch_operation import _goniometer_record, _ring
 
 
@@ -297,6 +298,7 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
         target = Path(page._owner.prepared.request.module.output.target)
         page.run_bar.startButton.click()
         _wait(page, qapp)
+        assert page._prepared_revision is None  # a run uses its plan once: the next Run checks again
         payload = read_analysis_artifact(target, expected_kind=AnalysisArtifactKind.STITCH_1D)
         for name in ("intensity", "coverage", "normalization"):
             np.testing.assert_array_equal(getattr(payload, name), getattr(reference.payload, name))
@@ -339,19 +341,30 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
         assert reopened.results.currentRow() == 1
         assert len(reopened.results.selectedItems()) == 2
         reopened.scientific.color_map.setCurrentText("viridis")
-        reopened.scientific.log_scale.click()  # as on Int: the image log scale (the frame popup)
+        reopened.scientific.log_scale.click()  # as on Int: the image and the curve's intensity scale
         assert reopened._log_scale is True and reopened._color_map == "viridis"
+        assert reopened._plot_options.intensity_scale == "Log"
         assert len(reopened.curve.listDataItems()) == 2
         options = reopened.scientific.plot_options_dialog  # Int's dialog, with Stitch's Diagnostic
         assert options.isAncestorOf(reopened._diagnostic_combo)
         reopened.scientific.plot_mode.setCurrentText("Single")
         shown = reopened._current_payload()
-        reopened._diagnostic_combo.setCurrentText("Coverage")
-        options.accept()
+        np.testing.assert_array_equal(reopened.curve.listDataItems()[0].yData,
+                                      scaled_intensity(shown.intensity, "Log"))
+        reopened._diagnostic_combo.setCurrentText("Coverage")  # Stitch's row and a view option,
+        options.intensity_scale.setCurrentText("Sqrt")  # accepted together
+        options.accept_button.click()
         assert reopened._diagnostic == "Coverage"  # the plot follows, not a cached trace
-        np.testing.assert_array_equal(reopened.curve.listDataItems()[0].yData, shown.coverage)
+        assert reopened._plot_options.intensity_scale == "Sqrt"
+        assert reopened._diagnostic_combo.currentText() == "Coverage"
+        np.testing.assert_array_equal(reopened.curve.listDataItems()[0].yData,
+                                      scaled_intensity(shown.coverage, "Sqrt"))
+        reopened._diagnostic_combo.setCurrentText("Normalization")
+        options.cancel_button.click()  # Cancel keeps the accepted Diagnostic
+        assert reopened._diagnostic == "Coverage" and reopened._diagnostic_combo.currentText() == "Coverage"
         reopened._diagnostic_combo.setCurrentText("Intensity")
-        options.accept()
+        options.intensity_scale.setCurrentText("Linear")
+        options.accept_button.click()
         np.testing.assert_array_equal(reopened.curve.listDataItems()[0].yData, shown.intensity)
         reopened.scientific.plot_mode.setCurrentText("Single")
         assert len(reopened.results.selectedItems()) == 1
@@ -457,6 +470,31 @@ def test_native_xu_displays_admitted_mapping_and_rotation_read_only(qapp, tmp_pa
         page.set_field("backend", "pyFAI MultiGeometry")
         assert page._rows["source_motors"].isEnabled()
         assert page._rows["image_rotation"].isEnabled()
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
+def test_stop_while_run_checks_the_inputs_stitches_nothing(qapp, tmp_path):
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        page.run_bar.startButton.click()
+        _wait(page, qapp)
+        assert page.results.count() == 1, page.run_bar.readinessLabel.full_text()
+        target = Path(page._owner.prepared.request.module.output.target)
+        before = target.read_bytes()
+        page.set_field("npt_1d", "80")
+        page.run_bar.startButton.click()
+        assert page._owner.busy and page.run_bar.stopButton.isEnabled()  # offered while checking
+        page.stop()  # the port the host's Run → Stop (Ctrl+Shift+C) calls
+        assert not page.run_bar.stopButton.isEnabled()
+        _wait(page, qapp)
+        assert page.run_bar.readinessLabel.full_text() == "Stopped before stitching"
+        assert page._owner.prepared is not None  # the check itself finished
+        assert target.read_bytes() == before and page.results.count() == 1  # nothing replaced
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
