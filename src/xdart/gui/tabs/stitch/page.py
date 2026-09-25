@@ -19,7 +19,6 @@ import re
 import numpy as np
 
 import pyqtgraph as pg
-from matplotlib import colormaps
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xdart.gui.pages.handle import AppMenuHosts, PageHandle
@@ -28,7 +27,6 @@ from xdart.gui.pages.values import (
     ActionAccepted, ActionCompleted, ActionRefused, PageCleanup,
     RSM_TOOL_KEY, SCATTERING_PAGE_KEY, STITCH_TOOL_KEY,
 )
-from xdart.gui.themes import apply_seaborn_plot_style
 from xdart.gui.tools.stitch_owner import (
     StitchOwnerAction, StitchOwnerFinalization, StitchOwnerOutcomeKind,
     StitchToolOwner,
@@ -38,10 +36,7 @@ from xdart.gui.widgets.controls_panel import (
     PROCESSING_ROW_GAP, PROCESSING_ROW_LABEL_WIDTH, ControlsPanel, FormRow, RangeRow, SubsectionCard,
 )
 from xdart.gui.widgets.run_controls import RunControlsBar
-from xdart.gui.widgets.scientific_plot import (
-    PlotCursorReadout, scaled_intensity, scaled_intensity_label, overlay_step, trace_colors,
-)
-from xdart.gui.tabs.scattering.scientific_plot_options import PlotOptionsDialog
+from xdart.gui.widgets.scientific_plot import scaled_intensity_label
 from xdart.gui.tabs.scattering.shell_values import ScientificPlotOptions
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
@@ -182,7 +177,10 @@ class StitchPage(QtWidgets.QWidget):
         self._payloads = {}
         self._plot_options = ScientificPlotOptions()
         self._diagnostic = "Intensity"
-        self._options = None
+        #: One display key per result, created once: the view compares keys by identity.
+        self._result_keys = {}
+        self._plot_mode, self._plot_axis = "Single", "Q"
+        self._color_map, self._log_scale = "Default", False
         self._build_ui()
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(50)
@@ -192,6 +190,8 @@ class StitchPage(QtWidgets.QWidget):
         self._authoring_timer.timeout.connect(self._sync_actions)
         self._status("Ready · Stitch 1D")
         self._sync_actions()
+        self._refresh_inputs_view()
+        self._draw()  # the view takes Stitch's layout before the first result
 
     def _build_ui(self):
         outer = QtWidgets.QHBoxLayout(self)
@@ -251,73 +251,16 @@ class StitchPage(QtWidgets.QWidget):
         left_layout.addLayout(browse_actions)
         self.splitter.addWidget(left)
 
-        centre = QtWidgets.QWidget()
-        centre_layout = QtWidgets.QVBoxLayout(centre)
-        centre_layout.setContentsMargins(0, 5, 0, 0)
-        header = QtWidgets.QHBoxLayout()
-        self.result_title = QtWidgets.QLabel("Current")
-        self.result_title.setTextFormat(QtCore.Qt.TextFormat.PlainText)
-        self.result_title.setMinimumWidth(0)
-        self.color_map = QtWidgets.QComboBox()
-        self.color_map.setObjectName("stitchColorMap")
-        self.color_map.addItems(("Default", *tuple(colormaps)))
-        self.color_map.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.color_map.setMinimumContentsLength(9)
-        self.log_button = QtWidgets.QPushButton("Log")
-        self.log_button.setObjectName("stitchLog")
-        self.log_button.setCheckable(True)
-        self.log_button.toggled.connect(self._set_log)
-        self.color_map.currentTextChanged.connect(self._display_changed)
-        header.addWidget(self.result_title, 1)
-        header.addWidget(self.color_map)
-        header.addWidget(self.log_button)
-        centre_layout.addLayout(header)
-        self.curve = pg.PlotWidget()
-        self.curve.setObjectName("stitchCurve")
-        apply_seaborn_plot_style(self.curve)
-        self.legend = self.curve.addLegend()
-        self._cursor_readout = PlotCursorReadout(self.curve)
-        centre_layout.addWidget(self.curve, 1)
-        plot_bar = QtWidgets.QHBoxLayout()
-        self.viewer_axis = QtWidgets.QComboBox()
-        self.viewer_axis.addItem("Q (Å⁻¹)", "q_A^-1")
-        self.viewer_axis.addItem("2θ (°)", "2th_deg")
-        self.viewer_axis.currentIndexChanged.connect(self._draw)
-        self.viewer_axis.setToolTip("Saved radial coordinate")
-        self.display_mode = QtWidgets.QComboBox()
-        self.display_mode.setObjectName("stitchDisplayMode")
-        self.display_mode.addItems(("Single", "Overlay"))
-        self.display_mode.currentTextChanged.connect(self._display_mode_changed)
-        options = QtWidgets.QPushButton("Options")
-        options.clicked.connect(self._show_options)
-        clear = QtWidgets.QPushButton("Clear")
-        clear.clicked.connect(self.clear_plot)
-        plot_bar.addWidget(self.viewer_axis)
-        plot_bar.addStretch(1)
-        plot_bar.addWidget(self.display_mode)
-        plot_bar.addWidget(options)
-        plot_bar.addWidget(clear)
-        centre_layout.addLayout(plot_bar)
-        footer = QtWidgets.QHBoxLayout()
-        self.result_status = QtWidgets.QLabel("")
-        self.result_status.setTextFormat(QtCore.Qt.TextFormat.PlainText)
-        self.result_status.setMinimumWidth(0)
-        self.result_status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
-                                         QtWidgets.QSizePolicy.Policy.Preferred)
-        self.previous = QtWidgets.QPushButton("<")
-        self.next = QtWidgets.QPushButton(">")
-        for button in (self.previous, self.next):
-            button.setMaximumWidth(32)
-        self.result_selector = QtWidgets.QComboBox()
-        self.result_selector.setMinimumWidth(45)
-        self.result_selector.currentIndexChanged.connect(self._select_result)
-        self.result_count = QtWidgets.QLabel("0/0")
-        self.previous.clicked.connect(lambda: self._step_result(-1))
-        self.next.clicked.connect(lambda: self._step_result(1))
-        for widget in (self.result_status, self.previous, self.result_selector, self.next, self.result_count):
-            footer.addWidget(widget, 1 if widget is self.result_status else 0)
-        centre_layout.addLayout(footer)
-        self.splitter.addWidget(centre)
+        # Int's scientific display, fed Stitch results: one pane for both pages, not a copy.
+        from xdart.gui.tabs.scattering.scientific_view import ScientificView
+        self.scientific = ScientificView()
+        # Stitch results are integrated 1-D curves (Int 1D's layout: Q or 2θ); Stitch has no
+        # normalization channel, 1-D Background or raw popup on this pane.
+        self.scientific.set_hidden_tools("norm", "background", "raw")
+        self.scientific.commandRequested.connect(self._view_command)
+        self.curve = self.scientific.curve
+        self._install_diagnostic_option()
+        self.splitter.addWidget(self.scientific)
 
         right = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right)
@@ -1191,7 +1134,7 @@ class StitchPage(QtWidgets.QWidget):
         item = self.frames.currentItem()
         if self._raw_popup is not None and self._raw_popup.isVisible() and self._raw_frame_view is not None and item is not None:
             self._raw_popup.render(self._raw_frame_view, label=item.text(),
-                color_map=self.color_map.currentText(), log=self._plot_options.intensity_scale == "Log")
+                color_map=self._color_map, log=self._log_scale)
 
     def _raw_closed(self):
         self._raw_revision += 1
@@ -1301,118 +1244,144 @@ class StitchPage(QtWidgets.QWidget):
             item.setData(QtCore.Qt.ItemDataRole.UserRole, key)
             item.setToolTip(key)
             self.results.addItem(item)
-            self.result_selector.addItem(str(self.results.count()))
+            self._result_key(key)
         self.results.setCurrentItem(item)
         self._current_result_changed()
 
     def _selected(self):
         items = self.results.selectedItems()
-        if self.display_mode.currentText() == "Single":
+        if self._plot_mode == "Single":
             item = self.results.currentItem()
             items = [] if item is None else [item]
         return [(item, self._payloads[item.data(QtCore.Qt.ItemDataRole.UserRole)]) for item in items]
 
+    def _result_key(self, path):
+        """The result's display key (one object per result; results share one run and one
+        navigation artifact, so the footer steps through them)."""
+        from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
+        from xdart.gui.tabs.scattering.events import RunIdentity
+        key = self._result_keys.get(path)
+        if key is None:
+            number = len(self._result_keys) + 1
+            key = DisplayFrameKey(RunIdentity(1, "stitch-page"), Path(path).name,
+                                  "stitch-results", number, number)
+            self._result_keys[path] = key
+        return key
+
     def _draw(self, *_args):
-        if not hasattr(self, "curve"):
+        """Project the selected results into Int's scientific view."""
+        if not hasattr(self, "scientific"):
             return
-        self.curve.clear()
-        self.legend.clear()
+        from xdart.gui.tabs.scattering.shell_values import (
+            AxisProjection, FrameNavigationProjection, ScientificProjection, TraceProjection,
+        )
+        role = QtCore.Qt.ItemDataRole.UserRole
+        items = [self.results.item(row) for row in range(self.results.count())]
+        keys = tuple(self._result_key(item.data(role)) for item in items)
         selected = self._selected()
-        scale = self._plot_options.intensity_scale
         available = all(payload.wavelength_A is not None for _, payload in selected)
-        self.viewer_axis.model().item(1).setEnabled(available)
-        if not available and self.viewer_axis.currentIndex() == 1:
-            blocker = QtCore.QSignalBlocker(self.viewer_axis)
-            self.viewer_axis.setCurrentIndex(0)
-            del blocker
-        self.viewer_axis.setToolTip("Saved radial coordinate" if available else "This earlier result has no saved wavelength for 2θ conversion")
-        unit = self.viewer_axis.currentData()
-        self.curve.setLabel("bottom", "Q" if unit == "q_A^-1" else "2θ", units="Å⁻¹" if unit == "q_A^-1" else "°")
-        self.curve.setLabel("left", scaled_intensity_label(self._diagnostic, scale))
-        arrays, items = [], []
+        if not available and self._plot_axis == "2theta":
+            self._plot_axis = "Q"
+        unit = "q_A^-1" if self._plot_axis == "Q" else "2th_deg"
+        axis_label, axis_unit = ("Q", "Å⁻¹") if unit == "q_A^-1" else ("2θ", "°")
+        traces = []
         for item, payload in selected:
             values = {"Intensity": payload.intensity, "Coverage": payload.coverage,
                       "Normalization": payload.normalization}[self._diagnostic]
             if values is None:
                 continue
-            arrays.append(scaled_intensity(values, scale))
-            items.append((item, payload))
-        step = overlay_step(arrays, self._plot_options.overlay_offset)
-        colors = trace_colors(self.color_map.currentText(), len(items))
-        for index, ((item, payload), values, color) in enumerate(zip(items, arrays, colors)):
             try:
                 radial = payload.radial_axis(unit)
             except ValueError:
                 if payload.native_unit != unit:
                     continue
                 radial = payload.axis("q")
-            self.curve.plot(radial, values + index * step,
-                            pen=pg.mkPen(color, width=1.4), symbol="o", symbolSize=4,
-                            symbolBrush=color, symbolPen=color, connect="finite", name=item.text())
-        self.legend.setVisible(self._plot_options.show_legend)
+            traces.append(TraceProjection(
+                self._result_key(item.data(role)),
+                AxisProjection(np.asarray(radial, dtype=float), axis_label, axis_unit),
+                np.asarray(values, dtype=float), title=item.text()))
         current = self.results.currentItem()
-        self.result_title.setText(current.text() if current else "Current")
-        self.result_status.setText(current.text() if current else "")
-        index = self.results.currentRow()
-        blocked = QtCore.QSignalBlocker(self.result_selector)
-        self.result_selector.setCurrentIndex(index)
-        del blocked
-        self.result_count.setText(f"{index + 1}/{self.results.count()}")
+        state = ScientificProjection(
+            heavy_available=frozenset(keys), traces=tuple(traces),
+            title=current.text() if current else "Current", processing_mode="Int 1D",
+            plot_axis=self._plot_axis, plot_mode=self._plot_mode, plot_options=self._plot_options,
+            color_map=self._color_map, log_scale=self._log_scale, background_enabled=False,
+            status=current.text() if current else "")
+        navigation = FrameNavigationProjection(
+            frames=keys, current=None if current is None else self._result_key(current.data(role)),
+            selected=tuple(self._result_key(item.data(role)) for item, _ in selected))
+        self.scientific.reconcile(state, navigation, completed=self.results.currentRow() + 1,
+                                  total=len(keys), detail="")
+        self.curve.setLabel("left", scaled_intensity_label(self._diagnostic,
+                                                           self._plot_options.intensity_scale))
+        blocker = QtCore.QSignalBlocker(self._diagnostic_combo)
+        self._diagnostic_combo.setCurrentText(self._diagnostic)
+        del blocker
+
+    def _view_command(self, command):
+        """The view's typed commands, for the Stitch results it shows."""
+        from xdart.gui.tabs.scattering.scientific_view import _PLOT_OPTION_FIELDS
+        from xdart.gui.tabs.scattering.scientific_plot_options import PLOT_OPTION_COMMAND_PATHS
+        from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
+        kind, value = command.kind, command.value
+        if kind in {ShellCommandKind.SELECT_FRAME, ShellCommandKind.HYDRATE_FRAME}:
+            path = next((path for path, key in self._result_keys.items() if key is command.frame), None)
+            role = QtCore.Qt.ItemDataRole.UserRole
+            row = next((row for row in range(self.results.count())
+                        if self.results.item(row).data(role) == path), -1)
+            if row >= 0 and row != self.results.currentRow():
+                flag = (QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
+                        if self._plot_mode == "Single" else QtCore.QItemSelectionModel.SelectionFlag.NoUpdate)
+                self.results.setCurrentRow(row, flag)
+            return
+        if kind is ShellCommandKind.SET_PLOT_MODE:
+            self._plot_mode = str(value)
+            if self._plot_mode == "Single":
+                self.results.setCurrentRow(self.results.currentRow(),
+                                           QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        elif kind is ShellCommandKind.SET_PLOT_AXIS and value in {"Q", "2theta"}:
+            self._plot_axis = value
+        elif kind is ShellCommandKind.SET_COLOR_MAP:
+            self._color_map = str(value)
+            self._render_raw()
+        elif kind is ShellCommandKind.SET_LOG_SCALE:
+            self._log_scale = bool(value)
+            self._render_raw()
+        elif kind is ShellCommandKind.SET_PLOT_OPTION:
+            field = dict(zip(PLOT_OPTION_COMMAND_PATHS, _PLOT_OPTION_FIELDS)).get(command.path)
+            if field is None:
+                return
+            self._plot_options = replace(self._plot_options, **{field: value})
+        elif kind is ShellCommandKind.CLEAR_1D:
+            self.clear_plot()
+            return
+        else:
+            return
+        self._draw()
+
+    def _install_diagnostic_option(self):
+        """Stitch's Diagnostic (Intensity, Coverage or Normalization) as a row of the view's
+        own plot-options dialog."""
+        dialog = self.scientific.plot_options_dialog
+        self._diagnostic_combo = QtWidgets.QComboBox()
+        self._diagnostic_combo.addItems(("Intensity", "Coverage", "Normalization"))
+        row = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QtWidgets.QLabel("Diagnostic"))
+        layout.addWidget(self._diagnostic_combo)
+        dialog.layout().insertWidget(dialog.layout().count() - 1, row)
+        dialog.accepted.connect(self._diagnostic_accepted)
+
+    def _diagnostic_accepted(self):
+        if self._diagnostic_combo.currentText() != self._diagnostic:
+            self._diagnostic = self._diagnostic_combo.currentText()
+            self._draw()
 
     def clear_plot(self):
         self._view_revision += 1
         self.results.clearSelection()
         self.results.setCurrentRow(-1)
-        self._draw()
-
-    def _select_result(self, index):
-        if index >= 0 and index != self.results.currentRow():
-            flag = (QtCore.QItemSelectionModel.SelectionFlag.NoUpdate
-                    if self.display_mode.currentText() == "Overlay"
-                    else QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
-            self.results.setCurrentRow(index, flag)
-
-    def _step_result(self, step):
-        index = self.results.currentRow() + step
-        if 0 <= index < self.results.count():
-            self._select_result(index)
-
-    def _display_mode_changed(self, mode):
-        if mode == "Single":
-            self.results.setCurrentRow(self.results.currentRow(),
-                QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
-        self._draw()
-
-    def _set_log(self, checked):
-        self._plot_options = replace(self._plot_options, intensity_scale="Log" if checked else "Linear")
-        self._display_changed()
-
-    def _display_changed(self, *_args):
-        self._draw()
-        self._render_raw()
-
-    def _show_options(self):
-        if self._options is None:
-            self._options = PlotOptionsDialog(self, show_waterfall=False)
-            self._diagnostics_combo = QtWidgets.QComboBox()
-            self._diagnostics_combo.addItems(("Intensity", "Coverage", "Normalization"))
-            row = QtWidgets.QWidget()
-            layout = QtWidgets.QHBoxLayout(row)
-            layout.addWidget(QtWidgets.QLabel("Diagnostic"))
-            layout.addWidget(self._diagnostics_combo)
-            self._options.layout().insertWidget(self._options.layout().count() - 1, row)
-            self._options.accepted.connect(self._accept_options)
-        self._options.reconcile(self._plot_options)
-        self._diagnostics_combo.setCurrentText(self._diagnostic)
-        self._options.show()
-        self._options.raise_()
-
-    def _accept_options(self):
-        self._plot_options = self._options.edited_options()
-        self._diagnostic = self._diagnostics_combo.currentText()
-        blocker = QtCore.QSignalBlocker(self.log_button)
-        self.log_button.setChecked(self._plot_options.intensity_scale == "Log")
-        del blocker
         self._draw()
 
     def _show_metadata(self):

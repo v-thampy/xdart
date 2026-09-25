@@ -1085,15 +1085,22 @@ QToolButton#controlsAutoButton:disabled {
     color: $text_muted;
     border-color: $field_border;
 }
-/* The complete vNext shell uses one compact square interactive surface.
+/* The complete vNext shell uses one compact square interactive surface; the Stitch page
+   (a page built from the same components) shares it.
    Cards may still use the independent Controls-card corner option; values,
    combos and action/toggle buttons do not. */
 QWidget#scatteringWorkspaceShell QLineEdit,
+QWidget#stitchPage QLineEdit,
 QWidget#scatteringWorkspaceShell QComboBox,
+QWidget#stitchPage QComboBox,
 QWidget#scatteringWorkspaceShell QSpinBox,
+QWidget#stitchPage QSpinBox,
 QWidget#scatteringWorkspaceShell QDoubleSpinBox,
+QWidget#stitchPage QDoubleSpinBox,
 QWidget#scatteringWorkspaceShell QPushButton,
-QWidget#scatteringWorkspaceShell QToolButton#e4FrameNavigationButton {
+QWidget#stitchPage QPushButton,
+QWidget#scatteringWorkspaceShell QToolButton#e4FrameNavigationButton,
+QWidget#stitchPage QToolButton#e4FrameNavigationButton {
     min-height: $control_interactive_height;
     max-height: $control_interactive_height;
     padding-top: 0px;
@@ -1101,22 +1108,33 @@ QWidget#scatteringWorkspaceShell QToolButton#e4FrameNavigationButton {
     border-radius: 0px;
 }
 QWidget#scatteringWorkspaceShell QComboBox::drop-down,
+QWidget#stitchPage QComboBox::drop-down,
 QWidget#scatteringWorkspaceShell QSpinBox::up-button,
+QWidget#stitchPage QSpinBox::up-button,
 QWidget#scatteringWorkspaceShell QSpinBox::down-button,
+QWidget#stitchPage QSpinBox::down-button,
 QWidget#scatteringWorkspaceShell QDoubleSpinBox::up-button,
-QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-button {
+QWidget#stitchPage QDoubleSpinBox::up-button,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-button,
+QWidget#stitchPage QDoubleSpinBox::down-button {
     border-radius: 0px;
 }
 QWidget#scatteringWorkspaceShell QSpinBox::up-button,
+QWidget#stitchPage QSpinBox::up-button,
 QWidget#scatteringWorkspaceShell QSpinBox::down-button,
+QWidget#stitchPage QSpinBox::down-button,
 QWidget#scatteringWorkspaceShell QDoubleSpinBox::up-button,
-QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-button {
+QWidget#stitchPage QDoubleSpinBox::up-button,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-button,
+QWidget#stitchPage QDoubleSpinBox::down-button {
     width: 14px;
     background-color: $field;
     border-left: 1px solid $field_border;
 }
 QWidget#scatteringWorkspaceShell QSpinBox::up-arrow,
-QWidget#scatteringWorkspaceShell QDoubleSpinBox::up-arrow {
+QWidget#stitchPage QSpinBox::up-arrow,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox::up-arrow,
+QWidget#stitchPage QDoubleSpinBox::up-arrow {
     image: none;
     width: 0px;
     height: 0px;
@@ -1125,7 +1143,9 @@ QWidget#scatteringWorkspaceShell QDoubleSpinBox::up-arrow {
     border-bottom: 4px solid $text_muted;
 }
 QWidget#scatteringWorkspaceShell QSpinBox::down-arrow,
-QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-arrow {
+QWidget#stitchPage QSpinBox::down-arrow,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-arrow,
+QWidget#stitchPage QDoubleSpinBox::down-arrow {
     image: none;
     width: 0px;
     height: 0px;
@@ -1133,10 +1153,12 @@ QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-arrow {
     border-right: 3px solid transparent;
     border-top: 4px solid $text_muted;
 }
-QWidget#scatteringWorkspaceShell QComboBox::drop-down {
+QWidget#scatteringWorkspaceShell QComboBox::drop-down,
+QWidget#stitchPage QComboBox::drop-down {
     width: 16px;
 }
-QWidget#scatteringWorkspaceShell QComboBox::down-arrow {
+QWidget#scatteringWorkspaceShell QComboBox::down-arrow,
+QWidget#stitchPage QComboBox::down-arrow {
     image: none;
     width: 0px;
     height: 0px;

@@ -281,6 +281,7 @@ class ScientificView(QtWidgets.QFrame):
         super().__init__(parent)
         self.setObjectName("e3ScientificView")
         self.setMinimumWidth(300)
+        self._hidden_tools: frozenset[str] = frozenset()
         self._heavy_available: frozenset[DisplayFrameKey] = frozenset()
         self._frame_keys: tuple[DisplayFrameKey, ...] = ()
         self._current_key: DisplayFrameKey | None = None
@@ -2805,7 +2806,27 @@ class ScientificView(QtWidgets.QFrame):
             self._reflow_follows = 0
             self._align_curve_under_cake()
 
+    #: Top-bar tools a host page may leave out, by name.
+    _HOST_TOOLS = {"norm": "norm", "background": "background", "raw": "raw_popup_button"}
+
+    def set_hidden_tools(self, *names: str) -> None:
+        """Leave out top-bar tools the host page has no operation for (Stitch: no
+        normalization channel, 1-D Background or raw popup). Int shows them all."""
+        unknown = set(names) - set(self._HOST_TOOLS)
+        if unknown:
+            raise ValueError(f"unknown scientific-view tools: {sorted(unknown)}")
+        self._hidden_tools = frozenset(names)
+        self._apply_hidden_tools()
+
+    def _apply_hidden_tools(self) -> None:
+        for name in self._hidden_tools:
+            getattr(self, self._HOST_TOOLS[name]).setVisible(False)
+
     def _apply_processing_layout(self, mode: str) -> None:
+        self._apply_mode_layout(mode)
+        self._apply_hidden_tools()
+
+    def _apply_mode_layout(self, mode: str) -> None:
         normalized = str(mode or "")
         if (
             self._viewer_loading_mode is not None

@@ -251,7 +251,7 @@ def test_native_saved_frame_popup_keeps_curve_and_shows_thumbnail_fallback(qapp,
         _wait(page, qapp)
         assert [page.frames.item(i).text() for i in range(page.frames.count())] == ["2-0", "2-1", "3-0"]
         original_y = page.curve.listDataItems()[0].yData.copy()
-        page.viewer_axis.setCurrentIndex(1)
+        page.scientific.plot_axis.setCurrentIndex(page.scientific.plot_axis.findData("2theta"))
         np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, original_y)
         assert page.curve.getPlotItem().getAxis("bottom").labelText == "2θ"
         page._show_raw()
@@ -327,24 +327,29 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
         np.testing.assert_array_equal(reopened.curve.listDataItems()[0].yData, replacement.intensity)
         reopened.open_result(reference_request.module.output.target)
         _wait(reopened, qapp)
-        reopened.display_mode.setCurrentText("Overlay")
+        reopened.scientific.plot_mode.setCurrentText("Overlay")
         reopened.results.selectAll()
         assert len(reopened.curve.listDataItems()) == 2
         assert reopened.curve.listDataItems()[0].opts["pen"].color().getRgb() == (31, 119, 180, 255)
-        reopened.previous.click()
+        reopened.scientific.previous_frame.click()
         assert reopened.results.currentRow() == 0
         assert len(reopened.results.selectedItems()) == 2
         assert len(reopened.curve.listDataItems()) == 2
-        reopened.next.click()
+        reopened.scientific.next_frame.click()
         assert reopened.results.currentRow() == 1
         assert len(reopened.results.selectedItems()) == 2
-        reopened.color_map.setCurrentText("viridis")
-        reopened.log_button.click()
-        assert reopened._plot_options.intensity_scale == "Log"
+        reopened.scientific.color_map.setCurrentText("viridis")
+        reopened.scientific.log_scale.click()  # as on Int: the image log scale (the frame popup)
+        assert reopened._log_scale is True and reopened._color_map == "viridis"
         assert len(reopened.curve.listDataItems()) == 2
-        reopened._show_options()
-        assert reopened._options.waterfall_start.isVisible() is False
-        reopened.display_mode.setCurrentText("Single")
+        options = reopened.scientific.plot_options_dialog  # Int's dialog, with Stitch's Diagnostic
+        assert options.isAncestorOf(reopened._diagnostic_combo)
+        reopened._diagnostic_combo.setCurrentText("Coverage")
+        options.accept()
+        assert reopened._diagnostic == "Coverage"
+        reopened._diagnostic_combo.setCurrentText("Intensity")
+        options.accept()
+        reopened.scientific.plot_mode.setCurrentText("Single")
         assert len(reopened.results.selectedItems()) == 1
         assert len(reopened.curve.listDataItems()) == 1
     finally:
@@ -493,9 +498,9 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
         assert len(grouped.contributing_frames) == 4
         assert [page.frames.item(i).text() for i in range(page.frames.count())] == ["1-0", "1-1", "2-0", "2-1"]
         assert page.build_form().unit == "2th_deg"
-        assert page.viewer_axis.currentData() == "q_A^-1"
+        assert page.scientific.plot_axis.currentData() == "Q"
         np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, grouped.intensity)
-        page.viewer_axis.setCurrentIndex(1)
+        page.scientific.plot_axis.setCurrentIndex(page.scientific.plot_axis.findData("2theta"))
         np.testing.assert_array_equal(page.curve.listDataItems()[0].xData, grouped.radial_axis("2th_deg"))
         page.set_field("threshold_min", "4")
         assert page.build_form().conditioning == StitchConditioning("manual", 4., float(np.iinfo(np.int32).max - 1))

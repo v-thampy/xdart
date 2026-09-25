@@ -257,3 +257,24 @@ def test_inputs_view_follows_int(qapp, tmp_path):
         assert cards.source_card.status.text() == "1 SPEC file · 1 output"
     finally:
         _close(page, qapp)
+
+
+def test_the_stitch_display_is_ints_scientific_view(qapp):
+    from xdart.gui.tabs.scattering.scientific_view import ScientificView
+
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        view = page.scientific
+        assert type(view) is ScientificView and page.curve is view.curve
+        # Int 1D's layout without the tools Stitch has no operation for, through every redraw
+        for _ in range(2):
+            assert view.norm.isHidden() and view.background.isHidden()
+            assert view.raw_popup_button.isHidden() and view.image_splitter.isHidden()
+            page._draw()
+        choices = [view.plot_axis.itemData(row) for row in range(view.plot_axis.count())]
+        assert choices == ["Q", "2theta"] and not view.plot_axis.isHidden()
+        assert view.title.text() == "Current"
+        with pytest.raises(ValueError, match="unknown scientific-view tools"):
+            view.set_hidden_tools("slice")
+    finally:
+        _close(page, qapp)
