@@ -169,6 +169,12 @@ class StitchPage(QtWidgets.QWidget):
         self._rows = {}
         self._revision = 0
         self._prepared_revision = None
+        #: Run prepares changed inputs itself (Preview's checks), then continues into the jobs.
+        self._run_after_prepare = False
+        #: Skipped scans and warnings of the prepared plan, for the status line.
+        self._prepared_notes = ""
+        #: Int's readiness line: (summary, ready) from the section checks.
+        self._readiness = ("", False)
         self._action_revision = None
         self._view_revision = 0
         self._action_view_revision = None
@@ -188,9 +194,9 @@ class StitchPage(QtWidgets.QWidget):
         self._authoring_timer = QtCore.QTimer(self)
         self._authoring_timer.setInterval(50)
         self._authoring_timer.timeout.connect(self._sync_actions)
-        self._status("Ready · Stitch 1D")
-        self._sync_actions()
         self._refresh_inputs_view()
+        self._status(self._readiness[0], ready=self._readiness[1])
+        self._sync_actions()
         self._draw()  # the view takes Stitch's layout before the first result
 
     def _build_ui(self):
@@ -611,9 +617,9 @@ class StitchPage(QtWidgets.QWidget):
         self._prepared_revision = None
         self._queued_jobs.clear()
         if hasattr(self, "run_bar"):
-            self._status("Inputs changed · Preview required", ready=False)
-            self._sync_actions()
             self._refresh_inputs_view()
+            self._status(self._readiness[0], ready=self._readiness[1])
+            self._sync_actions()
 
     def _automatic_names(self, kind, sources, scans):
         """The result names the selection gets when Result names is blank (Preview confirms)."""
@@ -652,14 +658,11 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["output_family"].editor.setPlaceholderText(self._automatic_names(kind, sources, scans))
         project = Path(str(value("project_root") or ""))
         project_ready = bool(str(value("project_root")).strip()) and project.is_dir()
-        self.controls.project_card.set_valid_marker(project_ready, "" if project_ready else "Choose an existing Project folder")
         calibration = str(value("geometry_path") or "").strip()
         mask = str(value("mask_path") or "").strip()
         experiment_ready = bool(calibration) and Path(calibration).is_file() and (not mask or Path(mask).is_file())
         xu = value("backend") == "xrayutilities histogram"
         self.controls.experiment_card.set_status_text("xrayutilities" if xu else "multigeometry")
-        self.controls.experiment_card.set_valid_marker(
-            experiment_ready, "" if experiment_ready else "Choose an existing calibration (and mask)")
         present = bool(sources) and all(path.exists() for path in sources)
         try:
             groups = len(parse_stitch_scan_groups(scans)) if kind == "Spec" and value("scan_mode") != "Stitch All" else None
@@ -672,13 +675,20 @@ class StitchPage(QtWidgets.QWidget):
             text = f"{len(sources)} {kind} source{'s' * (len(sources) != 1)}"
         source_ready = present and groups != 0
         self.controls.source_card.set_status_text(text if sources else "")
-        self.controls.source_card.set_valid_marker(source_ready, "" if source_ready else "Choose sources and scans")
         try:
             processing_ready = int(str(value("npt_1d"))) > 0
         except ValueError:
             processing_ready = False
         self.controls.processing_card.set_status_text("stitch 1d")
-        self.controls.processing_card.set_valid_marker(processing_ready, "" if processing_ready else "Enter the number of points")
+        checks = ((self.controls.project_card, project_ready, "Choose an existing Project folder"),
+                  (self.controls.experiment_card, experiment_ready, "Choose an existing calibration (and mask)"),
+                  (self.controls.source_card, source_ready, "Choose sources and scans"),
+                  (self.controls.processing_card, processing_ready, "Enter the number of points"))
+        for card, ready, reason in checks:
+            card.set_valid_marker(ready, "" if ready else reason)
+        # As Int's readiness line; Run then checks the inputs in full (Preview's preflight).
+        missing = [reason for _card, ready, reason in checks if not ready]
+        self._readiness = (missing[0], False) if missing else (f"Ready · Stitch 1D · {text}", True)
 
     def _backend_changed(self, *_args):
         xu = self._value("backend") == "xrayutilities histogram"
@@ -903,7 +913,7 @@ class StitchPage(QtWidgets.QWidget):
             self._status(str(error), ready=False)
             return False
         if identity is None:
-            self._status("Finish the current operation or refresh Preview", ready=False)
+            self._status("Finish the current operation first", ready=False)
             return False
         self._action_revision = self._revision
         self._action_view_revision = self._view_revision
@@ -914,17 +924,29 @@ class StitchPage(QtWidgets.QWidget):
         return True
 
     def begin_preview(self):
+        self._prepare("Preparing Preview…")
+
+    def _prepare(self, action, *, run=False):
         def begin():
             self._owner.set_form(self.build_form())
             self._prepared_revision = None
             return self._owner.begin_preflight()
-        self._start("Preparing Preview…", begin)
+        self._run_after_prepare = run
+        if not self._start(action, begin):
+            self._run_after_prepare = False
 
     def begin_run(self):
         if self._prepared_revision != self._revision or self._owner.prepared is None:
-            self._status("Preview the current selection before Run", ready=False)
+            # As Int's Run: the inputs are checked on the way (Preview's preflight), then run.
+            self._prepare("Checking the inputs…", run=True)
             return
-        count = len(self._owner.prepared.requests)
+        self._run_prepared()
+
+    def _run_prepared(self):
+        count = len(self._owner.prepared.requests) if self._owner.prepared is not None else 0
+        if not count:
+            self._status("Nothing to stitch" + self._prepared_notes, ready=False)
+            return
         self._queued_jobs = list(range(count))
         self._job_total = count
         self._batch_started = time.monotonic()
@@ -934,9 +956,10 @@ class StitchPage(QtWidgets.QWidget):
         if not self._queued_jobs or self._closing:
             return
         index = self._queued_jobs.pop(0)
-        if not self._start(f"Running · Stitch 1D · {index + 1}/{self._job_total}",
+        if not self._start(f"Running · Stitch 1D · {index + 1}/{self._job_total}{self._prepared_notes}",
                            lambda: self._owner.begin_run(job_index=index)):
             self._queued_jobs.clear()
+            self._prepared_revision = None  # the next Run prepares again
 
     def open_result(self, path=None):
         if path is None or isinstance(path, bool):
@@ -971,6 +994,7 @@ class StitchPage(QtWidgets.QWidget):
                 self._status(f"{p.stage} · {p.completed}/{p.total}")
             elif update.terminal_status is OperationTerminalStatus.FAILED:
                 self._queued_jobs.clear()
+                self._run_after_prepare = False
                 self._status(update.failure_message or update.failure_type, ready=False)
                 if update.action is StitchOwnerAction.METADATA and self._metadata_current():
                     self._metadata_dialog.status.setText(update.failure_message or update.failure_type)
@@ -978,6 +1002,7 @@ class StitchPage(QtWidgets.QWidget):
                     self._raw_popup.caption.setText("Image unavailable · " + (update.failure_message or update.failure_type))
             elif update.terminal_status is OperationTerminalStatus.CANCELLED:
                 self._queued_jobs.clear()
+                self._run_after_prepare = False
                 self._status("Cancelled")
             elif update.outcome is not None:
                 self._accept_outcome(update)
@@ -994,8 +1019,9 @@ class StitchPage(QtWidgets.QWidget):
                 self._metadata_dialog.adopt_sources(outcome.metadata)
             self._status("Ready · saved Stitch 1D result")
         elif outcome.kind is StitchOwnerOutcomeKind.PREFLIGHT_READY:
+            run, self._run_after_prepare = self._run_after_prepare, False
             if update.stale or self._action_revision != self._revision:
-                self._status("Inputs changed · Preview required", ready=False)
+                self._status("Inputs changed while checking · " + ("Run" if run else "Preview") + " again", ready=False)
                 return
             self._prepared_revision = self._revision
             preflight = outcome.preflight
@@ -1023,8 +1049,16 @@ class StitchPage(QtWidgets.QWidget):
                 lines.append("\nSkipped scans")
                 lines.extend(f"{Path(path).name} · scan {scan}: {reason}" for path, scan, reason in preflight.skipped)
             self.preview_text.setPlainText("\n".join(lines))
+            counts = ((len(preflight.skipped), "scan skipped", "scans skipped"),
+                      (len(preflight.warnings), "warning", "warnings"))
+            notes = [f"{n} {one if n == 1 else many}" for n, one, many in counts if n]
+            self._prepared_notes = f" · {', '.join(notes)} (Preview lists them)" if notes else ""
+            if run:
+                self._run_prepared()
+                return
             self.preview_dialog.show()
-            self._status(f"Ready · Stitch 1D · {len(preflight.requests)} outputs", ready=bool(preflight.requests))
+            self._status(f"Ready · Stitch 1D · {len(preflight.requests)} outputs" + self._prepared_notes,
+                         ready=bool(preflight.requests))
         elif outcome.kind is StitchOwnerOutcomeKind.FRAME_READ:
             if (self._raw_request_revision == self._raw_revision and not self._closing
                     and self._raw_popup is not None and self._raw_popup.isVisible()
@@ -1046,7 +1080,8 @@ class StitchPage(QtWidgets.QWidget):
                 elapsed = time.monotonic() - (self._batch_started or self._started)
                 count = len(result.request.module.source.selected_labels)
                 note = frame_screen_note(result.frame_screen)
-                self._status(f"Complete · {count} frames · {elapsed:.2f} s" + (f" · {note}" if note else ""))
+                self._status(f"Complete · {count} frames · {elapsed:.2f} s" + (f" · {note}" if note else "")
+                             + self._prepared_notes)
                 if self._queued_jobs and not update.stale and self._action_revision == self._revision:
                     self._run_next_job()
             else:
@@ -1456,9 +1491,7 @@ class StitchPage(QtWidgets.QWidget):
         self.open_button.setEnabled(idle)
         self.metadata_button.setEnabled(idle and self._current_payload() is not None)
         self.preview_button.setEnabled(idle)
-        self.run_bar.startButton.setEnabled(idle and self._prepared_revision == self._revision
-                                            and self._owner.prepared is not None
-                                            and bool(self._owner.prepared.requests))
+        self.run_bar.startButton.setEnabled(idle and self._readiness[1])  # Run prepares the inputs itself
         self.run_bar.set_stop_enabled(busy and self._owner.current_identity.request.action is StitchOwnerAction.RUN)
         self.retry_button.setVisible(final is not StitchOwnerFinalization.NONE)
         self.retry_button.setEnabled(not busy)
@@ -1565,7 +1598,7 @@ class StitchPage(QtWidgets.QWidget):
                 f"these Stitch settings cannot be applied here ({type(error).__name__}: {error})")
             self._status(f"Could not load the Stitch settings: {reason}", ready=False)
             return ActionRefused(reason)
-        self._status(f"Stitch settings loaded: {path.name} · Preview required", ready=False)
+        self._status(f"Stitch settings loaded: {path.name}", ready=self._readiness[1])
         return ActionCompleted("stitch-settings-loaded")
 
     def restore_last_settings(self):

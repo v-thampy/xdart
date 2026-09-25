@@ -304,17 +304,17 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
         np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, payload.intensity)
         assert page.results.count() == 1
 
-        page.set_field("npt_1d", "80")
-        page.set_field("npt_1d", "64")
-        assert not page.run_bar.startButton.isEnabled()
-        page.set_field("npt_1d", "80")
-        page.begin_preview()
-        _wait(page, qapp)
-        page.begin_run()
+        page.preview_dialog.close()
+        page.set_field("npt_1d", "80")  # changed inputs: Run checks them itself, as Int's Run
+        assert page._prepared_revision is None
+        assert page.run_bar.startButton.isEnabled(), page.run_bar.readinessLabel.full_text()
+        page.run_bar.startButton.click()
         _wait(page, qapp)
         replacement = read_analysis_artifact(target)
         assert replacement.intensity.shape == (80,)
         assert page.results.count() == 1
+        assert not page.preview_dialog.isVisible()  # Preview stays optional
+        assert page.run_bar.readinessLabel.full_text().startswith("Complete · ")
         assert page.shutdown().status is PageCleanup.CLEAN
         (tmp_path / "source").rename(tmp_path / "source-unavailable")
 
@@ -463,6 +463,24 @@ def test_native_xu_displays_admitted_mapping_and_rotation_read_only(qapp, tmp_pa
         qapp.processEvents()
 
 
+def test_run_checks_the_inputs_itself_and_stops_when_nothing_is_left_to_stitch(qapp, tmp_path):
+    form = _form(tmp_path, "multigeometry")
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        _fill_native(page, form)
+        page.set_field("image_stem", "missing_")  # scan 1 has no images under this stem
+        assert page.run_bar.startButton.isEnabled(), page.run_bar.readinessLabel.full_text()
+        page.run_bar.startButton.click()
+        _wait(page, qapp)
+        assert page.run_bar.readinessLabel.full_text() == "Nothing to stitch · 1 scan skipped (Preview lists them)"
+        assert page._owner.prepared is not None and not page._owner.prepared.requests
+        assert page.results.count() == 0 and not page.preview_dialog.isVisible()
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
 def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qapp, tmp_path, backend):
     form = _form(tmp_path, backend)
@@ -491,11 +509,15 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
         assert len(requests) == 2
         assert len(page._owner.prepared.skipped) == 1
         assert "No detector images" in page.preview_text.toPlainText()
+        status = page.run_bar.readinessLabel.full_text()  # skips and warnings stay on the status line
+        assert "· 1 scan skipped" in status and status.endswith("(Preview lists them)")
         assert page._value("threshold") == np.iinfo(np.int32).max - 1
         assert page.build_form().conditioning.mode == "auto"
         page.run_bar.startButton.click()
         _wait(page, qapp, timeout=60)
         assert page.results.count() == 2, page.run_bar.readinessLabel.full_text()
+        status = page.run_bar.readinessLabel.full_text()  # skips and warnings stay on the status line
+        assert "· 1 scan skipped" in status and status.endswith("(Preview lists them)")
         assert not page._queued_jobs
         grouped = read_analysis_artifact(requests[1].module.output.target)
         assert grouped.native_unit == "2th_deg"
