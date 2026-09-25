@@ -344,11 +344,15 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
         assert len(reopened.curve.listDataItems()) == 2
         options = reopened.scientific.plot_options_dialog  # Int's dialog, with Stitch's Diagnostic
         assert options.isAncestorOf(reopened._diagnostic_combo)
+        reopened.scientific.plot_mode.setCurrentText("Single")
+        shown = reopened._current_payload()
         reopened._diagnostic_combo.setCurrentText("Coverage")
         options.accept()
-        assert reopened._diagnostic == "Coverage"
+        assert reopened._diagnostic == "Coverage"  # the plot follows, not a cached trace
+        np.testing.assert_array_equal(reopened.curve.listDataItems()[0].yData, shown.coverage)
         reopened._diagnostic_combo.setCurrentText("Intensity")
         options.accept()
+        np.testing.assert_array_equal(reopened.curve.listDataItems()[0].yData, shown.intensity)
         reopened.scientific.plot_mode.setCurrentText("Single")
         assert len(reopened.results.selectedItems()) == 1
         assert len(reopened.curve.listDataItems()) == 1
