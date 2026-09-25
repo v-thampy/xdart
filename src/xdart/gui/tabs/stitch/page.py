@@ -362,13 +362,6 @@ class StitchPage(QtWidgets.QWidget):
                     choices=("Stitch All", "Select Scans"))
         self._field(source, SectionId.SOURCE, "scan", "Selection", "1")
         self._rows["scan"].setToolTip("1,2,[2-5,8] produces three outputs. Brackets combine scans into one result.")
-        self._field(source, SectionId.SOURCE, "output_family", "Result names")
-        self._rows["output_family"].editor.setPlaceholderText("auto · set when combining scans")
-        self._rows["output_family"].setToolTip(
-            "Required when combining sources. One name applies to the sole combined result. "
-            "For several outputs, separate names in output order with ; and leave single-source "
-            "names blank for automatic naming. Example for 1,2,[1,2]: ;;combined. "
-            "Names are at most 80 characters; processing and frame selection keep the same name.")
         self._rows["source_kind"].valueChanged.connect(self._source_changed)
         self._rows["scan_mode"].valueChanged.connect(self._source_changed)
         self._rows["spec_path"].valueChanged.connect(self._source_path_edited)
@@ -411,6 +404,12 @@ class StitchPage(QtWidgets.QWidget):
                     "Goniometer JSON", choices=("Goniometer JSON", "PONI + offsets"))
         for key, label, value in fields:
             self._field(advanced_card, SectionId.SOURCE, key, label, value)
+        self._field(advanced_card, SectionId.SOURCE, "output_family", "Result names")
+        self._rows["output_family"].setToolTip(
+            "Blank names are automatic: <file>-<scan> for one scan, and the scans listed for a "
+            "combined result ([2-5,8] gives <file>-2-5+8). To override, enter one name, or names in "
+            "output order separated by ; (a blank entry stays automatic). At most 80 characters; "
+            "processing and frame selection keep the same name.")
         for key in ("geometry_path", "geometry_kind"):
             self._rows[key].valueChanged.connect(self._sync_goniometer_mapping)
         frames_card = SubsectionCard("Frames and sample")
@@ -616,10 +615,28 @@ class StitchPage(QtWidgets.QWidget):
             self._sync_actions()
             self._refresh_inputs_view()
 
+    def _automatic_names(self, kind, sources, scans):
+        """The result names the selection gets when Result names is blank (Preview confirms)."""
+        from xdart.gui.tools.stitch_native_values import automatic_family
+        from xrd_tools.sources.grouping import parse_stitch_scan_groups
+        project = str(self._value("project_root") or "").strip()
+        try:
+            if kind == "Spec" and self._value("scan_mode") != "Stitch All":
+                groups = [[(path, scan) for scan in group]
+                          for path in sources for group in parse_stitch_scan_groups(scans)]
+            else:
+                groups = [[(path, None) for path in sources]] if kind == "NeXus" and sources else []
+            names = [automatic_family(group, project) for group in groups[:3]] if project else []
+        except ValueError:
+            names = []
+        if not names:
+            return "automatic"
+        more = f"; … {len(groups)} outputs" if len(groups) > 3 else ""
+        return "auto · " + "; ".join(names) + more
+
     def _refresh_inputs_view(self):
-        """Int's section headers, the automatic image folder and stem, and Result names
-        only where an output combines sources."""
-        if not hasattr(self, "advanced"):
+        """Int's section headers; the automatic image folder, stem and result names."""
+        if "output_family" not in self._rows:  # the Advanced rows are still being built
             return
         from xrd_tools.sources.grouping import parse_stitch_scan_groups
         value = self._value
@@ -632,8 +649,7 @@ class StitchPage(QtWidgets.QWidget):
             f"auto · {spec.parent}" if spec else "auto · the SPEC file's folder")
         self._rows["image_stem"].editor.setPlaceholderText(
             f"auto · {spec.stem if spec else '<SPEC name>'}_scan{first[1] if first else '<N>'}_")
-        combining = (kind == "Spec" and "[" in scans) or (kind == "NeXus" and len(sources) > 1)
-        self._rows["output_family"].setVisible(combining or bool(str(value("output_family")).strip()))
+        self._rows["output_family"].editor.setPlaceholderText(self._automatic_names(kind, sources, scans))
         project = Path(str(value("project_root") or ""))
         project_ready = bool(str(value("project_root")).strip()) and project.is_dir()
         self.controls.project_card.set_valid_marker(project_ready, "" if project_ready else "Choose an existing Project folder")

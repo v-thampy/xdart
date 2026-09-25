@@ -248,9 +248,11 @@ def test_inputs_view_follows_int(qapp, tmp_path):
         page.set_field("scan", "14.1")
         assert page._rows["image_dir"].editor.placeholderText() == f"auto · {spec.parent}"
         assert page._rows["image_stem"].editor.placeholderText() == "auto · LaB6_17keV_scan14_"
-        assert page._rows["output_family"].isHidden()  # single scans are named automatically
-        page.set_field("scan", "[14,15]")
-        assert not page._rows["output_family"].isHidden()  # a combined output needs a name
+        names = page._rows["output_family"]  # an optional override under Advanced
+        assert names.window() is page.advanced
+        assert names.editor.placeholderText() == "auto · data-LaB6_17keV-14"
+        page.set_field("scan", "[14,15]")  # a combined output is named automatically too
+        assert names.editor.placeholderText() == "auto · data-LaB6_17keV-14-15"
         cards = page.controls
         for card in (cards.project_card, cards.experiment_card, cards.source_card, cards.processing_card):
             assert not card.valid_marker.isHidden(), card.title.text()

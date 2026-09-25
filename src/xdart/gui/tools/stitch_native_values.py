@@ -1,5 +1,6 @@
 """Native Stitch selections projected onto existing finite operation owners."""
 import json
+import re
 from pathlib import Path
 
 from xrd_tools.analysis.module_transaction import (
@@ -31,6 +32,60 @@ def _combined(group):
                 for spec in group}) > 1
 
 
+def _listed(entries):
+    """Members joined by +; consecutive numbers under one head form a range.
+
+    ``entries`` are ``(order, head, number, text)``: SPEC scans 2,3,4,5,8 give
+    ``2-5+8`` and NeXus names a_0001..a_0003 give ``a_0001-0003``.
+    """
+    parts = []
+    for _order, head, number, text in sorted(set(entries)):
+        last = parts[-1] if parts else None
+        if number is not None and last and last[0] == head and last[1] == number - 1:
+            parts[-1] = (head, number, last[2], text[len(head):])
+        else:
+            parts.append((head, number, text, ""))
+    return "+".join(start + (f"-{end}" if end else "") for _head, _number, start, end in parts)
+
+
+def _scan_entry(scan):
+    # A first occurrence is the plain scan number; a later one (2.3) stands alone.
+    label = str(scan).removesuffix(".1")
+    number, _, occurrence = label.partition(".")
+    return ((int(number), int(occurrence or 1)), "" if not occurrence else label,
+            None if occurrence else int(number), label)
+
+
+def _name_entry(name):
+    match = re.fullmatch(r"(.*?)(\d+)", name)
+    return ((match[1], int(match[2])), match[1], int(match[2]), name) if match else ((name, -1), name, None, name)
+
+
+def automatic_family(members, project):
+    """The result name of one output from its ``(source path, scan or None)`` members.
+
+    One source is ``<path parts>-<scan>`` (``data-sample-14``). An output that
+    combines scans of one SPEC file lists them after the file (``[2-5,8]`` gives
+    ``data-sample-2-5+8``); other combinations list their sources' names.
+    """
+    project = Path(project).resolve()
+
+    def source(path, scan):
+        relative = Path(path).resolve().relative_to(project)
+        # Keep source suffixes meaningful to identity: SPEC may have a suffix.
+        return "-".join((relative if scan is not None else relative.with_suffix("")).parts)
+
+    def single(path, scan):
+        return source(path, scan) + ("" if scan is None else "-" + str(scan).removesuffix(".1"))
+
+    members = tuple(dict.fromkeys((str(Path(path).resolve()), scan) for path, scan in members))
+    if len(members) == 1:
+        return single(*members[0])
+    if len({path for path, _scan in members}) == 1 and all(scan is not None for _path, scan in members):
+        return source(*members[0]) + "-" + _listed(_scan_entry(scan) for _path, scan in members)
+    return _listed(_name_entry(single(path, scan)) for path, scan in members)
+
+
 def _families(form, resolution, project):
     """Readable slots are independent of frame subsets and processing settings."""
     from .stitch_values import StitchToolPreflightRefused
@@ -46,7 +101,7 @@ def _families(form, resolution, project):
     explicit = list(form.output_families or ("",) * len(groups))
     if len(explicit) != len(groups):
         raise refused("OUTPUT_FAMILY_COUNT_MISMATCH",
-            "Enter one result name per output, separated by ; (blank names use single-source defaults)")
+            "Enter one result name per output, separated by ; (blank names are automatic)")
     if form.output_family:
         combined = [i for i, group in enumerate(groups) if _combined(group)]
         if len(groups) == 1:
@@ -59,16 +114,11 @@ def _families(form, resolution, project):
     families, seen = [], set()
     for index, (group, name) in enumerate(zip(groups, explicit), 1):
         if not name:
-            if _combined(group):
+            name = automatic_family(((spec.uri, spec.options.get("scan")) for spec in group), project)
+            if _combined(group) and not is_artifact_family(name):
                 raise refused("OUTPUT_FAMILY_REQUIRED",
-                    f"Output {index} combines sources; enter an explicit result name")
-            spec = group[0]
-            relative = Path(spec.uri).resolve().relative_to(project)
-            # Keep source suffixes meaningful to identity: SPEC may have a suffix.
-            stem = relative if spec.options.get("scan") is not None else relative.with_suffix("")
-            name = "-".join(stem.parts)
-            if "scan" in spec.options:
-                name += "-" + str(spec.options["scan"]).removesuffix(".1")
+                    f"Output {index} combines sources and its automatic name {name!r} is not a "
+                    "result name of at most 80 characters; enter one under Advanced · Result names")
         if not is_artifact_family(name):
             raise refused("OUTPUT_FAMILY_INVALID",
                 f"Output {index} name {name!r} is invalid; choose a readable name of at most 80 characters")

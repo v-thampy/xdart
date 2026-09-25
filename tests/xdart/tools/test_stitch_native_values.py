@@ -101,13 +101,38 @@ def test_native_stacked_calibration_previews_runs_and_reloads(tmp_path):
         assert owner.close().status is PageCleanup.CLEAN
 
 
-def test_native_group_requires_and_preserves_explicit_family(tmp_path):
-    from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
+def test_native_group_is_named_automatically_or_as_entered(tmp_path):
     form = replace(_native_form(tmp_path, "multigeometry", scans="[1,2]"), output_family=None)
-    with pytest.raises(StitchToolPreflightRefused, match="OUTPUT_FAMILY_REQUIRED"):
-        prepare_stitch_tool(form)
+    prepared = prepare_stitch_tool(form)
+    assert Path(prepared.request.module.output.target).name == "source-sample-1-2_stitch1d.nexus"
     prepared = prepare_stitch_tool(replace(form, output_family="Sample A é"))
     assert Path(prepared.request.module.output.target).name == "Sample A é_stitch1d.nexus"
+
+
+def test_automatic_result_names_list_what_an_output_combines(tmp_path):
+    from types import SimpleNamespace
+    from xdart.gui.tools.stitch_native_values import _families, automatic_family
+    from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
+    spec = tmp_path / "data" / "sample"
+
+    def name(*scans):
+        return automatic_family([(spec, scan) for scan in scans], tmp_path)
+
+    assert name("14.1") == "data-sample-14"
+    assert name("14.1", "15.1", "16.1") == name("16", "14", "15") == "data-sample-14-16"
+    assert name("8", "2", "3", "4", "5") == "data-sample-2-5+8"
+    assert name("2.1", "2.3", "3.1") == "data-sample-2+2.3+3"  # a later occurrence stands alone
+    runs = [(tmp_path / "raw" / f"run_{n:04d}.nxs", None) for n in (11, 9, 10, 20)]
+    assert automatic_family(runs, tmp_path) == "raw-run_0009-0011+raw-run_0020"
+    assert automatic_family([(tmp_path / "b.h5", None), (tmp_path / "a.nxs", None)], tmp_path) == "a+b"
+
+    # an automatic name over 80 characters asks for one
+    odd = tuple(SimpleNamespace(uri=str(spec), options={"scan": f"{n}.1"}) for n in range(1, 80, 2))
+    resolution = SimpleNamespace(groups=(odd,), skipped=())
+    with pytest.raises(StitchToolPreflightRefused, match="OUTPUT_FAMILY_REQUIRED"):
+        _families(SimpleNamespace(output_families=(), output_family=None), resolution, tmp_path.resolve())
+    assert _families(SimpleNamespace(output_families=(), output_family="odd scans"), resolution,
+                     tmp_path.resolve()) == ("odd scans",)
 
 
 def test_native_repeated_output_refuses_without_counter(tmp_path):
@@ -152,9 +177,9 @@ def test_native_naming_refusal_explains_skipped_group_members(tmp_path, name, co
 
 def test_native_refused_preview_does_not_create_save_path(tmp_path):
     from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
-    form = replace(_native_form(tmp_path, "multigeometry", scans="[1,2]"),
+    form = replace(_native_form(tmp_path, "multigeometry", scans="1,1"),
                    output_family=None, output_path=tmp_path / "new" / "result.nexus")
-    with pytest.raises(StitchToolPreflightRefused, match="OUTPUT_FAMILY_REQUIRED"):
+    with pytest.raises(StitchToolPreflightRefused, match="OUTPUT_FAMILY_COLLISION"):
         prepare_stitch_tool(form)
     assert not (tmp_path / "new").exists()
 
