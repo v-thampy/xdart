@@ -34,7 +34,9 @@ from xdart.gui.tools.stitch_owner import (
     StitchToolOwner,
 )
 from xdart.gui.tools.stitch_values import StitchFrameSelector, StitchToolForm
-from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow, RangeRow, SubsectionCard
+from xdart.gui.widgets.controls_panel import (
+    PROCESSING_ROW_GAP, PROCESSING_ROW_LABEL_WIDTH, ControlsPanel, FormRow, RangeRow, SubsectionCard,
+)
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xdart.gui.widgets.scientific_plot import (
     PlotCursorReadout, scaled_intensity, scaled_intensity_label, overlay_step, trace_colors,
@@ -368,13 +370,22 @@ class StitchPage(QtWidgets.QWidget):
         field = ControlFormField(section, label, path, value, kind, tuple(choices), browse)
         row = FormRow(label=label, path=path, value=value, kind=kind.value,
                       choices=choices, browse=browse)
-        row.editor.setObjectName("stitch_" + key)
+        # The editor keeps the shared Controls object name, so Int's styling (one height
+        # for every box) applies here too.
+        row.editor.setProperty("stitchField", key)
         row.valueChanged.connect(self._edited)
         row.draftChanged.connect(self._edited)
         row.browseRequested.connect(lambda _path, name=key: self._browse(name))
-        card.add_row(row)
+        if card is not None:
+            card.add_row(row)
         self._fields[key], self._rows[key] = field, row
         return row
+
+    @staticmethod
+    def _align_to_ranges(row):
+        """As Int's Axis row: this box shares the range boxes' left edge."""
+        row.label.setMinimumWidth(PROCESSING_ROW_LABEL_WIDTH)
+        row.layout().setSpacing(PROCESSING_ROW_GAP)
 
     def _build_controls(self):
         project, experiment, source, processing = (
@@ -409,6 +420,7 @@ class StitchPage(QtWidgets.QWidget):
         self._field(source, SectionId.SOURCE, "scan", "Selection", "1")
         self._rows["scan"].setToolTip("1,2,[2-5,8] produces three outputs. Brackets combine scans into one result.")
         self._field(source, SectionId.SOURCE, "output_family", "Result names")
+        self._rows["output_family"].editor.setPlaceholderText("auto · set when combining scans")
         self._rows["output_family"].setToolTip(
             "Required when combining sources. One name applies to the sole combined result. "
             "For several outputs, separate names in output order with ; and leave single-source "
@@ -420,15 +432,23 @@ class StitchPage(QtWidgets.QWidget):
         source.set_status_text("metadata required")
         grid = SubsectionCard("1-D", accent="processing")
         processing.add_row(grid)
-        self._field(grid, SectionId.PROCESSING, "unit", "Axis", "Q (Å⁻¹)", choices=("Q (Å⁻¹)", "2θ (°)"))
+        axis = self._field(grid, SectionId.PROCESSING, "unit", "Axis", "Q (Å⁻¹)", choices=("Q (Å⁻¹)", "2θ (°)"))
         self._rows["unit"].valueChanged.connect(self._processing_axis_changed)
-        self._field(grid, SectionId.PROCESSING, "npt_1d", "Pts", "1500")
+        # As Int: the Pts cluster sits on the Axis row (ControlsPanel._attach_points_to_row).
+        self._align_to_ranges(axis)
+        points_label = QtWidgets.QLabel("Pts")
+        points_label.setObjectName("controlsHeaderLabel")
+        axis.add_trailing_widget(points_label)
+        points = self._field(None, SectionId.PROCESSING, "npt_1d", "Pts", "1500")
+        points.label.hide()
+        points.setMaximumWidth(58)
+        axis.add_trailing_widget(points)
         self.radial_range = self._range(grid, "Q (Å⁻¹)", ("q_min", "q_max", "radial_auto"), (0., 6.2, True))
         conditioning = SubsectionCard("Conditioning", accent="processing")
         processing.add_row(conditioning)
         self.threshold_range = self._range(conditioning, "Threshold", ("threshold_min", "threshold", "threshold_enabled"), (0., None, True))
         self.threshold_range._high.setPlaceholderText("Auto")
-        self._field(conditioning, SectionId.PROCESSING, "monitor", "Monitor")
+        self._align_to_ranges(self._field(conditioning, SectionId.PROCESSING, "monitor", "Monitor"))
         self.advanced = QtWidgets.QDialog(self)
         self.advanced.setWindowTitle("Advanced — Stitch 1D")
         advanced_layout = QtWidgets.QVBoxLayout(self.advanced)

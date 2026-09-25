@@ -201,3 +201,27 @@ def test_the_mode_box_lists_int_modes_and_leaves_for_them(qapp):
         assert requested[-1] == str(RSM_TOOL_KEY) and combo.currentText() == "Stitch 1D"
     finally:
         _close(page, qapp)
+
+
+def test_processing_rows_are_laid_out_as_int(qapp):
+    from pyqtgraph.Qt import QtCore
+    from xdart.gui.widgets.controls_panel import PROCESSING_ROW_LABEL_WIDTH, ControlsPanel
+
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        rows = page._rows
+        # the shared Controls names, so Int's styling (one box height) applies
+        assert rows["unit"].editor.objectName() == "controlsComboBox"
+        assert rows["npt_1d"].editor.objectName() == "controlsLineEdit"
+        assert rows["npt_1d"].parent() is rows["unit"]  # Pts on the Axis row
+        assert rows["unit"].label.minimumWidth() == PROCESSING_ROW_LABEL_WIDTH
+        page.resize(1400, 1000)
+        page.show()
+        qapp.processEvents()
+        panel = page.findChild(ControlsPanel)
+        left = lambda editor: editor.mapTo(panel, QtCore.QPoint(0, 0)).x()
+        edges = {left(rows["unit"].editor), left(page.radial_range._low),
+                 left(page.threshold_range._low), left(rows["monitor"].editor)}
+        assert len(edges) == 1, edges  # one left edge for Axis, ranges, Threshold, Monitor
+    finally:
+        _close(page, qapp)
