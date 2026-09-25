@@ -536,7 +536,9 @@ def capture_stitch_geometry(request: StitchGeometryInput) -> StitchGeometryRecei
             raise StitchOperationRefused(
                 "GEOMETRY_MOTOR_MAPPING_MISMATCH",
                 "goniometer JSON source mapping must bind every declared "
-                "position exactly once and no others",
+                "position exactly once and no others (declared: "
+                f"{', '.join(declared_positions)}; bound: "
+                f"{', '.join(bound_positions) or 'none'})",
             )
         from xrd_tools.core.geometry.stacked_arm import STACKED_ARM_MARKERS
 

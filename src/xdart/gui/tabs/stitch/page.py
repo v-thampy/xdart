@@ -76,6 +76,25 @@ def _parse_pairs(text):
     return tuple(sorted(pairs))
 
 
+#: A position's motor defaults to its name without one of these (del_value → del).
+_POSITION_SUFFIX = re.compile(r"(?:_angle|_value|_deg|_pos|_position)$", re.IGNORECASE)
+
+
+def _goniometer_positions(path) -> tuple[str, ...]:
+    """The positions a pyFAI goniometer JSON declares, or () when it cannot be read."""
+    try:
+        file = Path(str(path or "").strip())
+        if file.suffix.lower() != ".json" or file.stat().st_size > 1 << 20:
+            return ()
+        names = json.loads(file.read_text(encoding="utf-8"))["trans_function"]["pos_names"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return ()
+    if type(names) is not list or not names or any(type(name) is not str or not name.strip()
+                                                   for name in names):
+        return ()
+    return tuple(names)
+
+
 def _parse_references(text):
     return tuple((name, float(value)) for name, value in _parse_pairs(text))
 
@@ -413,6 +432,8 @@ class StitchPage(QtWidgets.QWidget):
                     "Goniometer JSON", choices=("Goniometer JSON", "PONI + offsets"))
         for key, label, value in fields:
             self._field(advanced_card, SectionId.SOURCE, key, label, value)
+        for key in ("geometry_path", "geometry_kind"):
+            self._rows[key].valueChanged.connect(self._sync_goniometer_mapping)
         frames_card = SubsectionCard("Frames and sample")
         advanced_layout.addWidget(frames_card)
         self._field(frames_card, SectionId.PROCESSING, "frame_check", "Frame check",
@@ -593,6 +614,8 @@ class StitchPage(QtWidgets.QWidget):
             self.set_field("output_path", str(Path(value) / "xdart_processed_data"))
         if key in {"geometry_path", "project_root"}:
             self._refresh_xu_geometry()
+        if key in {"geometry_path", "geometry_kind"}:
+            self._sync_goniometer_mapping()
 
     def _value(self, key):
         if key in self._range_keys:
@@ -615,6 +638,7 @@ class StitchPage(QtWidgets.QWidget):
             self.set_field("image_rotation", "0")
         self.set_field("q_max", "5.2" if xu else "6.2")
         self._refresh_xu_geometry()
+        self._sync_goniometer_mapping()
         self._sync_actions()
 
     def _sync_advanced(self):
@@ -625,6 +649,28 @@ class StitchPage(QtWidgets.QWidget):
                              ("solid_angle", not xu), ("error_model", not xu)):
             self._fields[key] = replace(self._fields[key], enabled=enabled)
             self._rows[key].apply_field(self._fields[key])
+
+    def _sync_goniometer_mapping(self, *_args):
+        """Bind every position the goniometer JSON declares (Angle mapping, Advanced).
+
+        A position's motor defaults to its name without its suffix; a mapping that already
+        binds exactly these positions is the user's and stays. XU owns its own mapping.
+        """
+        if (not hasattr(self, "advanced") or self._value("backend") == "xrayutilities histogram"
+                or self._value("geometry_kind") != "Goniometer JSON"):
+            return
+        positions = _goniometer_positions(self._value("geometry_path"))
+        if not positions:
+            return
+        try:
+            current = dict(_parse_pairs(self._value("source_motors") or ""))
+        except ValueError:
+            current = {}
+        if set(current) == set(positions):
+            return
+        self.set_field("source_motors", ", ".join(
+            f"{name}={current.get(name) or _POSITION_SUFFIX.sub('', name) or name}"
+            for name in positions))
 
     def _refresh_xu_geometry(self, *_args, calibration=None):
         """Present asset-owned settings through the existing strict admission owner."""

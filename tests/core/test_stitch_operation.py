@@ -426,6 +426,7 @@ def test_json_geometry_requires_exact_declared_position_mapping(
             )
         )
     assert refused.value.code == "GEOMETRY_MOTOR_MAPPING_MISMATCH"
+    assert "(declared: " in str(refused.value) and "; bound: " in str(refused.value)
 
 
 @pytest.mark.parametrize(

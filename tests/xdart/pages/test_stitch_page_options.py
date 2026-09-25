@@ -132,3 +132,21 @@ def test_preview_warns_when_the_flat_median_is_far_from_one(tmp_path):
         np.save(flat, np.full((rows, cols), value))
         warnings = prepare_stitch_tool(replace(form, flat_path=str(flat))).warnings
         assert any(item.startswith("Flat field median 1000") for item in warnings) is warned
+
+
+def test_a_goniometer_json_sets_the_angle_mapping_from_its_positions(qapp, tmp_path):
+    import json
+
+    values = tmp_path / "MG_gonio_object.json"  # declares del_value/nu_value, not del_angle/nu_angle
+    values.write_text(json.dumps({"trans_function": {"pos_names": ["del_value", "nu_value"]}}))
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.set_field("geometry_path", str(values))
+        assert page._value("source_motors") == "del_value=del, nu_value=nu"
+        page.set_field("source_motors", "del_value=delta, nu_value=nu")  # the user's motors stay
+        page.set_field("geometry_path", str(values))
+        assert page._value("source_motors") == "del_value=delta, nu_value=nu"
+        page.set_field("geometry_path", str(tmp_path / "missing.json"))  # unreadable: untouched
+        assert page._value("source_motors") == "del_value=delta, nu_value=nu"
+    finally:
+        _close(page, qapp)
