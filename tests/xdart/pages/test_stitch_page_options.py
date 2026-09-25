@@ -150,3 +150,34 @@ def test_a_goniometer_json_sets_the_angle_mapping_from_its_positions(qapp, tmp_p
         assert page._value("source_motors") == "del_value=delta, nu_value=nu"
     finally:
         _close(page, qapp)
+
+
+def test_browse_opens_at_the_last_folder_with_int_file_types(qapp, tmp_path, monkeypatch):
+    from pyqtgraph.Qt import QtWidgets
+    from xdart.gui.widgets import file_dialogs
+    from xdart.utils.browse import last_browse_dir, remember_browse_path
+
+    monkeypatch.setenv("XDART_SESSION_FILE", str(tmp_path / "session.json"))
+    monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
+    last, calibration = tmp_path / "last", tmp_path / "calibration"
+    last.mkdir(), calibration.mkdir()
+    remember_browse_path(last)
+    chosen = calibration / "MG_gonio_object.json"
+    chosen.write_text("{}")
+    seen = []
+
+    def open_file(parent, title, start, file_filter):
+        seen.append((title, start, file_filter))
+        return str(chosen), file_filter
+
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", open_file)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page._browse("geometry_path")  # poni/json only, from the last folder picked anywhere
+        assert seen == [("Choose calibration", str(last), file_dialogs.CALIBRATION_FILTER)]
+        assert page._value("geometry_path") == str(chosen)
+        assert last_browse_dir() == str(calibration)
+        page._browse("mask_path")  # Int's mask types, from the folder just used
+        assert seen[-1] == ("Choose detector mask", str(calibration), file_dialogs.MASK_FILTER)
+    finally:
+        _close(page, qapp)

@@ -202,6 +202,9 @@ def _control_path_chooser(widget):
     """File-dialog chooser for Controls path fields (from the live launcher)."""
     from pyqtgraph.Qt import QtWidgets
 
+    from xdart.gui.widgets.file_dialogs import (
+        BACKGROUND_IMAGE_FILTER, MASK_FILTER, PONI_FILTER,
+    )
     from xdart.gui.tabs.scattering.controls_projection import (
         BACKGROUND_DIRECTORY,
         BACKGROUND_FILE,
@@ -221,16 +224,12 @@ def _control_path_chooser(widget):
                 widget, "Choose processed-data folder", start_directory)
             return selected or None
         title, file_filter = (
-            ("Choose Background detector image",
-             "Detector images (*.tif *.tiff *.cbf *.edf *.img *.mar3450 *.raw)")
+            ("Choose Background detector image", BACKGROUND_IMAGE_FILTER)
             if path == BACKGROUND_FILE
             else
-            ("Choose PONI calibration", "PONI files (*.poni);;All files (*)")
+            ("Choose PONI calibration", PONI_FILTER)
             if path == PONI_FILE
-            else (
-                "Choose detector mask",
-                "Detector masks (*.edf *.npy)",
-            ))
+            else ("Choose detector mask", MASK_FILTER))
         selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
             widget, title, start_directory, file_filter)
         return selected or None

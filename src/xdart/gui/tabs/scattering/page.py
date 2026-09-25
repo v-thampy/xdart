@@ -56,6 +56,7 @@ from xrd_tools.sources.selection import (
     is_single_image_spec,
 )
 from xdart.utils.browse import browse_start_dir, remember_browse_path
+from xdart.gui.widgets.file_dialogs import MASK_FILTER, PONI_FILTER
 from .advanced_editor import AdvancedSettingsDialog
 from .adapters.browse_loader import BrowseLoader
 from .adapters.external_operation import OperationSlot
@@ -2029,9 +2030,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                             "Choose existing PONI" if asset == "poni"
                             else "Choose existing detector mask",
                             directory,
-                            "PONI files (*.poni);;All files (*)"
-                            if asset == "poni" else
-                            "Detector masks (*.edf *.npy)",
+                            PONI_FILTER if asset == "poni" else MASK_FILTER,
                         )[0])
         except Exception as error:
             self._error_notice("Asset chooser failed", error); return

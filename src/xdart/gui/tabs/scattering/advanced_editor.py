@@ -18,10 +18,10 @@ from .controls_editing import (
     advanced_settings_values,
 )
 from xrd_tools.integrate.calibration import PONI_V3_SENSOR_MATERIALS
+from xdart.gui.widgets.file_dialogs import CORRECTION_FILTER as _CORRECTION_FILTER
 
 #: Browse titles for the detector-correction images, by role.
 _CORRECTION_TITLES = {"dark": "Choose dark", "flat": "Choose flat field"}
-_CORRECTION_FILTER = "Detector images (*.npy *.edf *.tif *.tiff *.cbf);;All files (*)"
 
 
 @dataclass(slots=True)

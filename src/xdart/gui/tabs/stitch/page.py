@@ -701,19 +701,30 @@ class StitchPage(QtWidgets.QWidget):
             self._rows[key].setToolTip(tip)
 
     def _browse(self, key):
-        start = str(self._value("project_root") or Path.home())
-        if key in {"project_root", "image_dir", "output_path"} or key == "spec_path" and self._value("source_kind") == "Directory":
-            value = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose folder", start)
+        """Browse as Int does: the last folder picked, the same file types for the same inputs."""
+        from xdart.gui.widgets import file_dialogs as dialogs
+        kind = self._value("source_kind")
+        folders = {"project_root": "Choose folder", "output_path": "Choose processed-data folder",
+                   "image_dir": "Choose images folder"}
+        files = {"geometry_path": ("Choose calibration", dialogs.CALIBRATION_FILTER),
+                 "mask_path": ("Choose detector mask", dialogs.MASK_FILTER),
+                 "dark_path": ("Choose dark", dialogs.CORRECTION_FILTER),
+                 "flat_path": ("Choose flat field", dialogs.CORRECTION_FILTER)}
+        current = self._source_paths[0] if key == "spec_path" and self._source_paths else self._value(key)
+        common = dict(current=str(current or ""), fallback=str(self._value("project_root") or ""))
+        if key in folders or key == "spec_path" and kind == "Directory":
+            picks = dialogs.browse(self, folders.get(key, "Choose folder"), folder=True, **common)
         elif key == "spec_path":
-            files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Choose source files", start,
-                "NeXus / HDF5 (*.nexus *.nxs *.h5 *.hdf5);;All files (*)" if self._value("source_kind") == "NeXus" else "All files (*)")
-            if files:
-                self.set_sources(files)
+            picks = dialogs.browse(self, "Choose source files", many=True, **common,
+                                   file_filter=dialogs.NEXUS_FILTER if kind == "NeXus" else dialogs.ANY_FILTER)
+            if picks:
+                self.set_sources(picks)
             return
         else:
-            value, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose " + self._fields[key].label, start)
-        if value:
-            self.set_field(key, value)
+            title, file_filter = files.get(key, ("Choose " + self._fields[key].label, dialogs.ANY_FILTER))
+            picks = dialogs.browse(self, title, file_filter=file_filter, **common)
+        if picks:
+            self.set_field(key, picks[0])
 
     def build_form(self):
         value = self._value
@@ -879,7 +890,10 @@ class StitchPage(QtWidgets.QWidget):
 
     def open_result(self, path=None):
         if path is None or isinstance(path, bool):
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open stitched result", "", "NeXus (*.nexus)")
+            from xdart.gui.widgets.file_dialogs import browse
+            picks = browse(self, "Open stitched result", file_filter="NeXus (*.nexus)",
+                           fallback=str(self._value("project_root") or ""))
+            path = picks[0] if picks else ""
         if not path:
             return
         self._view_revision += 1

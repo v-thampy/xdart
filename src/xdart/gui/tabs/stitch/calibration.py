@@ -268,11 +268,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         return edit
 
     def _browse(self, edit, chooser, *, key=None):
+        from xdart.gui.widgets.file_dialogs import browse
         current = self._text(key) if key is not None else edit.text()
-        if chooser == 'directory':
-            path = QtWidgets.QFileDialog.getExistingDirectory(self, 'Select images directory', current)
-        else:
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Select file', current, chooser)
+        folder = chooser == 'directory'
+        picks = browse(self, 'Select images directory' if folder else 'Select file', folder=folder,
+                       file_filter='All files (*)' if folder else chooser, current=current,
+                       fallback=str(self.project_root))
+        path = picks[0] if picks else ''
         if path:
             if key is not None:
                 self._set_field_text(key, path)
@@ -613,12 +615,16 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
     def _import(self):
         def go():
             frame = self._selected_frame()
-            poni, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'PONI for this exact frame', str(self.session_dir), 'PONI (*.poni)')
-            if not poni:
+            from xdart.gui.widgets.file_dialogs import browse
+            picks = browse(self, 'PONI for this exact frame', file_filter='PONI (*.poni)',
+                           fallback=str(self.session_dir))
+            if not picks:
                 return
-            npt, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Matching control points for this exact frame', str(Path(poni).parent), 'Control points (*.npt)')
-            if npt:
-                self._start('import', (frame, poni, npt))
+            poni = picks[0]
+            picks = browse(self, 'Matching control points for this exact frame',
+                           file_filter='Control points (*.npt)', current=poni)
+            if picks:
+                self._start('import', (frame, poni, picks[0]))
         self._guard(go)
 
     def _invalidate_fit(self):
@@ -700,6 +706,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             if not selected.is_relative_to(self.project_root):
                 raise ValueError('save the geometry inside the Stitch project')
             saved = save_calibration_fit(self.fit, selected)
+            from xdart.utils.browse import remember_browse_path
+            remember_browse_path(selected)
             self.saved_source_motors = self.fit.asset['provenance']['source_motors']
             self.saved_image_rotation = self.fit.asset['provenance']['image_rotation']
             self.status.setText(f'Saved geometry and provenance: {saved}')
@@ -773,7 +781,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         if self._owner.busy:
             return
         def go():
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Open calibration session', str(self.project_root), 'Calibration session (*.json)')
+            from xdart.gui.widgets.file_dialogs import browse
+            picks = browse(self, 'Open calibration session', file_filter='Calibration session (*.json)',
+                           fallback=str(self.project_root))
+            path = picks[0] if picks else ''
             if path:
                 self.frames = load_calibration_session(path)
                 self._frame_motors = tuple(self.frames[0].motors)
