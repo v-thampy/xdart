@@ -61,7 +61,9 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
         source = open_source(spec)
         try:
             if not source.capabilities.has_raw_references:
-                skipped.append((str(path), key, "No detector images"))
+                folder = selection.image_dir or str(path.parent)
+                searched = stem or f"{path.stem}_scan{key.split('.')[0]}_"
+                skipped.append((str(path), key, f"No detector images named *{searched}* in {folder}"))
                 return None
             return spec
         finally:

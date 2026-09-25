@@ -71,7 +71,9 @@ def test_native_selection_brackets_all_and_directory_mixed_formats(tmp_path):
     selected = resolve_stitch_sources(StitchSourceSelection("Spec", (str(spec),), "5,[5,6]"), decode)
     assert len(selected.groups) == 2
     assert [member.options["scan"] for group in selected.groups for member in group] == ["5.1", "5.1"]
-    assert selected.skipped == ((str(spec), "6.1", "No detector images"),)
+    # no Images folder: the SPEC file's own folder is searched, for the scan's automatic stem
+    assert selected.skipped == ((str(spec), "6.1",
+                                 f"No detector images named *{spec.stem}_scan6_* in {spec.parent}"),)
     all_spec = resolve_stitch_sources(StitchSourceSelection("Spec", (str(spec),), stitch_all=True), decode)
     assert len(all_spec.groups) == 1
     first = _write_bluesky_nxwriter(tmp_path / "a.nxs")

@@ -225,3 +225,35 @@ def test_processing_rows_are_laid_out_as_int(qapp):
         assert len(edges) == 1, edges  # one left edge for Axis, ranges, Threshold, Monitor
     finally:
         _close(page, qapp)
+
+
+def test_inputs_view_follows_int(qapp, tmp_path):
+    spec = tmp_path / "data" / "LaB6_17keV"
+    spec.parent.mkdir()
+    spec.write_text("#F LaB6_17keV\n")
+    calibration = tmp_path / "MG_gonio_object.json"
+    calibration.write_text("{}")
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        low, high = page.threshold_range._low, page.threshold_range._high
+        page._range_edited(("Stitch", "threshold_enabled"), False)  # Threshold off: limits greyed
+        assert not low.isEnabled() and not high.isEnabled()
+        page._range_edited(("Stitch", "threshold"), 700000.0)  # a manual band: editable, whole numbers
+        page._range_edited(("Stitch", "threshold_enabled"), True)
+        assert low.isEnabled() and high.isEnabled() and high.text() == "700000"
+
+        page.set_field("project_root", str(tmp_path))
+        page.set_field("geometry_path", str(calibration))
+        page.set_sources([str(spec)])
+        page.set_field("scan", "14.1")
+        assert page._rows["image_dir"].editor.placeholderText() == f"auto · {spec.parent}"
+        assert page._rows["image_stem"].editor.placeholderText() == "auto · LaB6_17keV_scan14_"
+        assert page._rows["output_family"].isHidden()  # single scans are named automatically
+        page.set_field("scan", "[14,15]")
+        assert not page._rows["output_family"].isHidden()  # a combined output needs a name
+        cards = page.controls
+        for card in (cards.project_card, cards.experiment_card, cards.source_card, cards.processing_card):
+            assert not card.valid_marker.isHidden(), card.title.text()
+        assert cards.source_card.status.text() == "1 SPEC file · 1 output"
+    finally:
+        _close(page, qapp)

@@ -429,7 +429,6 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["source_kind"].valueChanged.connect(self._source_changed)
         self._rows["scan_mode"].valueChanged.connect(self._source_changed)
         self._rows["spec_path"].valueChanged.connect(self._source_path_edited)
-        source.set_status_text("metadata required")
         grid = SubsectionCard("1-D", accent="processing")
         processing.add_row(grid)
         axis = self._field(grid, SectionId.PROCESSING, "unit", "Axis", "Q (Å⁻¹)", choices=("Q (Å⁻¹)", "2θ (°)"))
@@ -446,7 +445,8 @@ class StitchPage(QtWidgets.QWidget):
         self.radial_range = self._range(grid, "Q (Å⁻¹)", ("q_min", "q_max", "radial_auto"), (0., 6.2, True))
         conditioning = SubsectionCard("Conditioning", accent="processing")
         processing.add_row(conditioning)
-        self.threshold_range = self._range(conditioning, "Threshold", ("threshold_min", "threshold", "threshold_enabled"), (0., None, True))
+        self.threshold_range = self._range(conditioning, "Threshold", ("threshold_min", "threshold", "threshold_enabled"), (0., None, True),
+                                           display_decimals=0)  # as Int's threshold row
         self.threshold_range._high.setPlaceholderText("Auto")
         self._align_to_ranges(self._field(conditioning, SectionId.PROCESSING, "monitor", "Monitor"))
         self.advanced = QtWidgets.QDialog(self)
@@ -523,7 +523,7 @@ class StitchPage(QtWidgets.QWidget):
         preview_layout.addWidget(self.preview_text)
         self.preview_dialog.resize(680, 480)
 
-    def _range(self, card, label, keys, values):
+    def _range(self, card, label, keys, values, *, display_decimals=None):
         specs = []
         for key, value in zip(keys, values):
             field = ControlFormField(SectionId.PROCESSING, label, ("Stitch", key), value,
@@ -531,7 +531,8 @@ class StitchPage(QtWidgets.QWidget):
             self._fields[key] = field
             self._range_keys.add(key)
             specs.append(dict(path=field.path, value=value))
-        row = RangeRow(label=label, low=specs[0], high=specs[1], toggle=specs[2])
+        row = RangeRow(label=label, low=specs[0], high=specs[1], toggle=specs[2],
+                       display_decimals=display_decimals)
         row.valueChanged.connect(self._range_edited)
         row.draftChanged.connect(self._edited)
         self._range_rows.append(row)
@@ -542,7 +543,12 @@ class StitchPage(QtWidgets.QWidget):
         values = {field.path: field for key, field in self._fields.items() if key in self._range_keys}
         auto = bool(self._fields["radial_auto"].value)
         for key in ("q_min", "q_max"):
-            values[("Stitch", key)] = replace(self._fields[key], enabled=not auto)
+            values[("Stitch", key)] = replace(self._fields[key], enabled=not auto,
+                                              reason="Disable Auto to edit this range." if auto else "")
+        off = self._threshold_mode == "off"  # Int's rule: the limits follow the Threshold toggle
+        for key in ("threshold_min", "threshold"):
+            values[("Stitch", key)] = replace(self._fields[key], enabled=not off,
+                                              reason="Enable Threshold to edit this limit." if off else "")
         for row in self._range_rows:
             row.apply_fields(values)
 
@@ -665,6 +671,55 @@ class StitchPage(QtWidgets.QWidget):
         if hasattr(self, "run_bar"):
             self._status("Inputs changed · Preview required", ready=False)
             self._sync_actions()
+            self._refresh_inputs_view()
+
+    def _refresh_inputs_view(self):
+        """Int's section headers, the automatic image folder and stem, and Result names
+        only where an output combines sources."""
+        if not hasattr(self, "advanced"):
+            return
+        from xrd_tools.sources.grouping import parse_stitch_scan_groups
+        value = self._value
+        kind = value("source_kind")
+        sources = tuple(Path(path) for path in self._source_paths)
+        spec = sources[0] if sources and kind == "Spec" else None
+        scans = str(value("scan") or "")
+        first = re.match(r"\s*\[?\s*(\d+)", scans)
+        self._rows["image_dir"].editor.setPlaceholderText(
+            f"auto · {spec.parent}" if spec else "auto · the SPEC file's folder")
+        self._rows["image_stem"].editor.setPlaceholderText(
+            f"auto · {spec.stem if spec else '<SPEC name>'}_scan{first[1] if first else '<N>'}_")
+        combining = (kind == "Spec" and "[" in scans) or (kind == "NeXus" and len(sources) > 1)
+        self._rows["output_family"].setVisible(combining or bool(str(value("output_family")).strip()))
+        project = Path(str(value("project_root") or ""))
+        project_ready = bool(str(value("project_root")).strip()) and project.is_dir()
+        self.controls.project_card.set_valid_marker(project_ready, "" if project_ready else "Choose an existing Project folder")
+        calibration = str(value("geometry_path") or "").strip()
+        mask = str(value("mask_path") or "").strip()
+        experiment_ready = bool(calibration) and Path(calibration).is_file() and (not mask or Path(mask).is_file())
+        xu = value("backend") == "xrayutilities histogram"
+        self.controls.experiment_card.set_status_text("xrayutilities" if xu else "multigeometry")
+        self.controls.experiment_card.set_valid_marker(
+            experiment_ready, "" if experiment_ready else "Choose an existing calibration (and mask)")
+        present = bool(sources) and all(path.exists() for path in sources)
+        try:
+            groups = len(parse_stitch_scan_groups(scans)) if kind == "Spec" and value("scan_mode") != "Stitch All" else None
+        except ValueError:
+            groups = 0
+        if kind == "Spec":
+            text = f"{len(sources)} SPEC file{'s' * (len(sources) != 1)} · " + (
+                "all scans" if groups is None else f"{groups} output{'s' * (groups != 1)}")
+        else:
+            text = f"{len(sources)} {kind} source{'s' * (len(sources) != 1)}"
+        source_ready = present and groups != 0
+        self.controls.source_card.set_status_text(text if sources else "")
+        self.controls.source_card.set_valid_marker(source_ready, "" if source_ready else "Choose sources and scans")
+        try:
+            processing_ready = int(str(value("npt_1d"))) > 0
+        except ValueError:
+            processing_ready = False
+        self.controls.processing_card.set_status_text("stitch 1d")
+        self.controls.processing_card.set_valid_marker(processing_ready, "" if processing_ready else "Enter the number of points")
 
     def _backend_changed(self, *_args):
         xu = self._value("backend") == "xrayutilities histogram"

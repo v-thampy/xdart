@@ -145,7 +145,9 @@ def test_native_naming_refusal_explains_skipped_group_members(tmp_path, name, co
     prepared = prepare_stitch_tool(replace(form, output_family=None,
                                           output_families=("single", "combined")))
     assert len(prepared.requests) == 2
-    assert prepared.skipped[0][1:] == ("3.1", "No detector images")
+    # the reason names what was searched: the scan's automatic stem in the images folder
+    assert prepared.skipped[0][1:] == (
+        "3.1", f"No detector images named *{Path(form.spec_path).stem}_scan3_* in {form.image_dir}")
 
 
 def test_native_refused_preview_does_not_create_save_path(tmp_path):
@@ -288,7 +290,9 @@ def test_no_image_scans_skip_without_execution_authority(tmp_path):
     form = _native_form(tmp_path, "multigeometry", scans="3")
     prepared = prepare_stitch_tool(form)
     assert prepared.requests == () and prepared.request is None
-    assert prepared.skipped == ((str(form.spec_path), "3.1", "No detector images"),)
+    assert prepared.skipped == ((str(form.spec_path), "3.1",
+                                 f"No detector images named *{Path(form.spec_path).stem}_scan3_* "
+                                 f"in {form.image_dir}"),)
     owner = StitchToolOwner()
     try:
         owner.set_form(form)
