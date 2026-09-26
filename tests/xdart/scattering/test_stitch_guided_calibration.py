@@ -208,7 +208,7 @@ def test_the_frame_table_lists_each_frames_expected_rings(tmp_path):
     dialog.frames = (replace(_frame({'del': 20., 'nu': 0.}), identity='frame-20'),)
     dialog._render_frames()
     assert dialog.frame_table.item(0, 5).text() == '—'  # nothing to predict from yet
-    assert 'three' in dialog.frame_table.item(0, 5).toolTip()
+    assert 'calibrate one frame' in dialog.frame_table.item(0, 5).toolTip()  # it then predicts the rest
     dialog._fields['refine_seed_path'].setText(str(_record(tmp_path)))
     dialog._render_frames()
     cell = dialog.frame_table.item(0, 5)
@@ -553,3 +553,46 @@ def test_the_detector_and_its_orientation_are_choices_saved_with_the_settings(tm
     finally:
         dialog.close()
         again.close()
+
+
+def test_after_one_calibrated_frame_the_others_are_predicted_from_it(tmp_path):
+    """The rough geometry is 200 px off; once frame 0 is calibrated its arm predicts the rest,
+    in the table and in the seed pyFAI opens with."""
+    import time
+    from pyFAI.io.ponifile import PoniFile
+    from pyqtgraph.Qt import QtWidgets
+    from xdart.gui.tabs.stitch.calibration import _pyfai_arguments
+    from tests.core.test_stacked_arm_extension import _calibration, _ring_controls
+    from tests.core.test_stitch_guided_calibration import _frames
+    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
+    from xrd_tools.integrate.calibration_seed import predict_frame_seed, ring_summary
+    truth = {'nu_offset': .02, 'del_offset': -.05}
+    controls, _calibrant = _ring_controls(truth, _calibration(), [(5., -10.), (45., -10.), (25., 9.5), (5., 29.)])
+    (tmp_path / 'frames').mkdir()
+    calibrated = _frames(tmp_path / 'frames', controls, _calibration().poni)
+    waiting = tuple(replace(frame, poni_path='', poni_sha256='', npt_path='', npt_sha256='', pairing_policy='',
+                            control_image_sha256='') for frame in calibrated[1:])
+    true_arm = StackedDetectorArm(**truth).to_pyfai_goniometer(_calibration())
+    dialog = StitchCalibrationDialog(tmp_path)
+    try:
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        for key, value in (('rough_distance', '390'), ('beam_pixel', f'{.045 / 172e-6 + 200:.1f}, {.035 / 172e-6:.1f}')):
+            dialog._set_field_text(key, value)
+        dialog.frames = (calibrated[0], *waiting)
+        dialog._render_frames()
+        expected = [ring_summary(predict_frame_seed(true_arm, frame).rings) for frame in waiting]
+        assert dialog.frame_table.item(1, 5).text() != expected[0]  # the rough guess misnumbers them
+        dialog._start('predict', (dialog._calibrated_key(), dialog._seed_options()))
+        until = time.monotonic() + 60
+        while dialog.active() and time.monotonic() < until:  # sleep, as the app's event loop idles:
+            QtWidgets.QApplication.processEvents()        # qWait holds the GIL from the worker
+            time.sleep(.005)
+        assert not dialog.active() and dialog._prediction is not None, dialog.status.text()
+        assert [dialog.frame_table.item(row, 5).text() for row in (1, 2, 3)] == expected
+        seeded = PoniFile(_pyfai_arguments(waiting[0], dialog._seed_options())[3])
+        true_seed = predict_frame_seed(true_arm, waiting[0]).integrator
+        assert (seeded.poni1, seeded.poni2) == pytest.approx((true_seed.poni1, true_seed.poni2), abs=1e-3)
+        dialog._prediction = (('another frame', ''), dialog._prediction[1])  # fitted to other frames: unused
+        assert dialog._seed_options()['prediction'] is None
+    finally:
+        dialog.close()

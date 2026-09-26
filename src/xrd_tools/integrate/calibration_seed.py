@@ -94,6 +94,22 @@ def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_m
     return FrameSeed(integrator, expected_rings(integrator, calibrant, frame.shape))
 
 
+def session_prediction(frames, *, del_motor='del', nu_motor='nu', cancelled=None):
+    """The arm fitted to this session's calibrated frames, to predict the others' rings and
+    seed pyFAI with them: one calibrated frame is enough to place the rest (a saved
+    calibration still needs three). None without a calibrated frame, or when they do not fit.
+    """
+    from xrd_tools.integrate.stitch_calibration import fit_calibration
+    done = tuple(frame for frame in frames if frame.complete)
+    if not done:
+        return None
+    try:
+        return fit_calibration(done, backend='multigeometry', del_motor=del_motor, nu_motor=nu_motor,
+                               cancelled=cancelled, min_frames=1).asset['calibration']
+    except (ValueError, RuntimeError, KeyError):
+        return None
+
+
 #: Listed first, in this order; then every other pyFAI detector by name.
 _PREFERRED_DETECTORS = ('Pilatus100k', 'Pilatus300kw', 'Eiger1M', 'Eiger2_500k', 'Eiger4M',
                         'RayonixMx225', 'RayonixMx300')

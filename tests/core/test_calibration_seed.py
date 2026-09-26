@@ -114,3 +114,30 @@ def test_the_detector_orientation_reaches_the_seed_pyfai_opens(tmp_path, orienta
     # the beam pixel is where the direct beam hits at normal incidence, in every orientation
     beam = seed.integrator.tth(np.array([97]), np.array([737]))
     assert float(beam[0]) == pytest.approx(0, abs=1e-12)
+
+
+def test_one_calibrated_frame_predicts_the_other_frames_rings(tmp_path):
+    """A rough guess 200 px off misnumbers a far frame's rings; the arm fitted to the first
+    calibrated frame places every frame's rings as the true arm does."""
+    from tests.core.test_stacked_arm_extension import _calibration, _ring_controls
+    from tests.core.test_stitch_guided_calibration import _frames
+    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
+    from xrd_tools.integrate.calibration_seed import session_prediction
+    truth = {'nu_offset': .02, 'del_offset': -.05}
+    controls, _calibrant = _ring_controls(truth, _calibration(), [(5., -10.), (45., -10.), (25., 9.5), (5., 29.)])
+    frames = _frames(tmp_path, controls, _calibration().poni)
+    true_arm = StackedDetectorArm(**truth).to_pyfai_goniometer(_calibration())
+
+    def two_theta(record, frame):
+        seed = predict_frame_seed(record, frame)
+        return np.degrees(seed.integrator.center_array(frame.shape, unit='2th_rad', scale=False))
+
+    rough = rough_arm_record(distance_m=.39, detector='Pilatus300kw', beam_px=(.045 / 172e-6 + 200, .035 / 172e-6))
+    assert (ring_summary(predict_frame_seed(rough, frames[1]).rings)
+            != ring_summary(predict_frame_seed(true_arm, frames[1]).rings))
+    assert session_prediction(frames[:0]) is None
+    predicted = session_prediction(frames[:1])
+    for frame in frames:
+        assert np.abs(two_theta(predicted, frame) - two_theta(true_arm, frame)).max() < .05
+        assert (ring_summary(predict_frame_seed(predicted, frame).rings)
+                == ring_summary(predict_frame_seed(true_arm, frame).rings))

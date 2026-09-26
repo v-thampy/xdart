@@ -38,18 +38,28 @@ def _run_job(request, cancelled, publish):
 
 
 def _seed_record(seed, cancelled):
-    """The calibration a frame's geometry is predicted from: this session's fit, a fit of
-    three or more saved frames, else the page's calibration file (None without one)."""
+    """The calibration a frame's geometry is predicted from: this session's fit, else the arm
+    fitted to the frames calibrated so far (one is enough), else the rough geometry or the
+    page's calibration file (None without one)."""
     if seed.get('record') is not None:
         return seed['record']
-    if len(seed.get('frames', ())) >= 3:
-        try:
-            fit = fit_calibration(seed['frames'], backend='multigeometry', del_motor=seed['del_motor'],
-                                  nu_motor=seed['nu_motor'], cancelled=cancelled)
-            return fit.asset['calibration']
-        except (ValueError, RuntimeError, KeyError):
-            pass  # the saved frames do not fit yet: fall back to the rough geometry or the file
+    if seed.get('prediction') is not None:
+        return seed['prediction']
+    if seed.get('frames'):
+        from xrd_tools.integrate.calibration_seed import session_prediction
+        record = session_prediction(seed['frames'], del_motor=seed['del_motor'], nu_motor=seed['nu_motor'],
+                                    cancelled=cancelled)
+        if record is not None:
+            return record  # else the saved frames do not fit yet: the rough geometry or the file
     return seed.get('rough') if seed.get('rough') is not None else seed.get('file')
+
+
+def _prediction_after(seed, adopted, cancelled):
+    """The arm fitted to the calibrated frames with this one: it predicts the rest (or None)."""
+    from xrd_tools.integrate.calibration_seed import session_prediction
+    frames = tuple(frame for frame in seed.get('frames', ()) if frame.identity != adopted.identity)
+    return session_prediction((*frames, adopted), del_motor=seed['del_motor'], nu_motor=seed['nu_motor'],
+                              cancelled=cancelled)
 
 
 def _pyfai_arguments(frame, seed, cancelled=None):
@@ -120,9 +130,16 @@ def _dispatch_job(request, cancelled, publish):
                                          model_image_sha256=result.loaded_image_sha256)
         if adopted.poni_sha256 != result.candidates[0].proof.sha256 or adopted.npt_sha256 != result.control_points_sha256:
             raise ValueError('saved PONI or points changed during adoption')
-        return adopted
+        return adopted, _prediction_after(seed, adopted, cancelled)
     if kind == 'import':
-        return adopt_calibration_pair(*arguments)
+        frame, poni, npt, seed = arguments
+        adopted = adopt_calibration_pair(frame, poni, npt)
+        return adopted, _prediction_after(seed, adopted, cancelled)
+    if kind == 'predict':
+        key, seed = arguments
+        from xrd_tools.integrate.calibration_seed import session_prediction
+        return key, session_prediction(seed['frames'], del_motor=seed['del_motor'],
+                                       nu_motor=seed['nu_motor'], cancelled=cancelled)
     if kind == 'fit':
         frames, options = arguments
         return fit_calibration(frames, cancelled=cancelled, **options)
@@ -239,6 +256,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.session_dir = self.project_root / 'calibration' / f'session-{uuid.uuid4().hex[:12]}'
         self.frames = ()
         self.fit = None
+        #: The arm fitted to the calibrated frames: (their identities, record); see _seed_options.
+        self._prediction = None
         #: Predicted rings per (frame, calibrant, calibration): see _expected_rings.
         self._ring_cache = {}
         self._choices = []
@@ -661,7 +680,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                                                                ('Enter the distance', 'manual'), ('Skip', 'skip')],
             tip='A first guess of where the detector is, so pyFAI opens each frame with its rings roughly in '
                 'place and the table lists which rings to expect. A direct-beam scan measures the distance; '
-                'or type it. Rough values are enough.')
+                'or type it. Rough values are enough: once one frame is calibrated, the others are predicted '
+                'from it instead.')
         self._edit(form, 'rough_distance', 'Sample–detector distance (mm)', '',
                    tip='Sample to detector, in millimetres, with the detector facing the beam squarely.')
         self.beam_source_kind = self._combo(form, 'Source', [('SPEC + image series', 'spec_series'),
@@ -737,9 +757,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 'image-series reader settings from Select frames. Its distance, with the beam pixel and zero, '
                 'predicts each frame\'s rings; the regression uncertainty excludes motor, zero and pitch systematics.',
         'manual': 'The distance, the pixel the direct beam hits at normal incidence and that zero predict each '
-                  'frame\'s rings (the Geometry\'s arm, one degree per degree); the fit refines them.',
-        'skip': 'No rough geometry: each frame\'s rings are predicted from a calibration file (Fit and save · Seed '
-                'geometry JSON), or from this session\'s fit once three frames are saved.',
+                  'frame\'s rings (the Geometry\'s arm, one degree per degree) until the first frame is '
+                  'calibrated; that frame then predicts the others, and the fit refines them all.',
+        'skip': 'No rough geometry: each frame\'s rings are predicted from a geometry file (Fit and save), '
+                'or from the first frame you calibrate.',
     }
     _GEOMETRY_ROWS = ('beam_motor', 'beam_zero', 'beam_pixel', 'beam_detector', 'beam_orientation')
 
@@ -972,18 +993,24 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             detector = next((line.split(':', 1)[1].strip() for line in lines if line.startswith('Detector:')), None)
             if detector:
                 break
+        prediction = (self._prediction[1] if self._prediction is not None
+                      and self._prediction[0] == self._calibrated_key() else None)
         return dict(calibrant=self.refine_calibrant.currentText().strip() or 'LaB6',
-                    del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1],
+                    del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1], prediction=prediction,
                     record=(self.fit.asset.get('calibration')
                             if self.fit is not None and self.fit.backend == 'multigeometry' else None),
                     frames=done, rough=self._rough_record(),
                     file=str(Path(path).resolve()) if path and Path(path).is_file() else None,
                     detector=detector)
 
+    def _calibrated_key(self):
+        return tuple((frame.identity, frame.poni_sha256) for frame in self.frames if frame.complete)
+
     def _expected_rings(self, frame):
         """The calibrant rings predicted on this frame (None without a calibration)."""
         seed = self._seed_options()
-        record = next((value for value in (seed['record'], seed['rough'], seed['file']) if value is not None), None)
+        record = next((value for value in (seed['record'], seed['prediction'], seed['rough'], seed['file'])
+                       if value is not None), None)
         if record is None:
             return None
         import hashlib
@@ -1011,7 +1038,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             picks = browse(self, 'Matching control points for this exact frame',
                            file_filter='Control points (*.npt)', current=poni)
             if picks:
-                self._start('import', (frame, poni, picks[0]))
+                self._start('import', (frame, poni, picks[0], self._seed_options()))
         self._guard(go)
 
     def _invalidate_fit(self):
@@ -1193,8 +1220,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                       'Complete' if frame.complete else 'Needs PONI + points']
             rings = self._expected_rings(frame)
             values.append('—' if rings is None else ring_summary(rings) or 'none')
-            ring_tip = ('No calibration to predict from yet: choose a calibration file, or save three '
-                        'frames and their rings are predicted from this session\'s fit.' if rings is None
+            ring_tip = ('No calibration to predict from yet: enter a rough geometry (1 · Geometry) or a '
+                        'geometry file, or calibrate one frame: the others are then predicted from it.'
+                        if rings is None
                         else '\n'.join(f'Ring {ring.number} · 2θ {ring.two_theta_deg:.2f}° · d {ring.d_spacing_A:.4f} Å'
                                         for ring in rings) or 'No calibrant ring reaches this frame.')
             for column, value in enumerate(values):
@@ -1213,6 +1241,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             return
         self.session_dir = self.project_root / 'calibration' / f'session-{uuid.uuid4().hex[:12]}'
         self.frames = ()
+        self._prediction = None
         self._invalidate_fit()
         self._render_frames()
         self._show_tab('select')
@@ -1232,8 +1261,11 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 self._frame_motors = arm or (tuple(self.frames[0].motors) + (None,))[:2]
                 self.session_dir = Path(path).parent
                 self._invalidate_fit()
+                self._prediction = None
                 self._render_frames()
                 self._show_tab('calibrate')
+                if any(frame.complete for frame in self.frames):  # its calibrated frames predict the rest
+                    self._start('predict', (self._calibrated_key(), self._seed_options()))
         self._guard(go)
 
     def _cancel(self):
@@ -1280,11 +1312,16 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     self._render_frames()
                     self._show_tab('calibrate')
                 elif kind in ('calibrate', 'import') and result is not None:
+                    result, prediction = result
                     self.frames = tuple(result if frame.identity == self._row_identity else frame for frame in self.frames)
+                    self._prediction = (self._calibrated_key(), prediction)
                     save_calibration_session(self.session_dir, self.frames, arm=self._frame_motors)
                     self._invalidate_fit()
                     self._render_frames()
                     self._select_next_frame(result)
+                elif kind == 'predict':
+                    self._prediction = result
+                    self._render_frames()
                 elif kind in ('fit', 'refine'):
                     self.fit = result
                     if result.backend == 'multigeometry':  # the refinement now starts from it

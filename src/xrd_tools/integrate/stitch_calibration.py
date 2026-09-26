@@ -424,7 +424,7 @@ def _mg_detector_config(calibration):
 def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_motor='nu',
                     fit_scales=False, distance_seed_m=None, distance_bounds_m=None,
                     max_rms_q=0.03, domain=None, distance_provenance=None, cancelled=None,
-                    arm_model='stacked', instrument_geometry=None):
+                    arm_model='stacked', instrument_geometry=None, min_frames=3):
     """Fit the matched rows and refuse unconverged, degenerate or poor fits.
 
     ``arm_model='stacked_extended'`` (MultiGeometry only) also fits the detector
@@ -433,9 +433,12 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     ``nu_motor=None`` or ``del_motor=None`` is a single detector arm (a fourc or
     twoc 2θ): psic's arm with that circle held at zero (vertical: del moves;
     horizontal: nu moves).
+    ``min_frames=1`` is for predicting the other frames' rings from those calibrated so
+    far (calibration_seed.session_prediction); a saved calibration needs three.
     """
-    if not 3 <= len(frames) <= 32:
-        raise ValueError('fit requires at least three completed frames spanning the angles')
+    if not max(1, int(min_frames)) <= len(frames) <= 32:
+        raise ValueError('fit requires at least three completed frames spanning the angles'
+                         if min_frames == 3 else f'fit requires at least {min_frames} completed frames')
     if arm_model not in ('stacked', 'stacked_extended'):
         raise ValueError('unknown arm model')
     if arm_model == 'stacked_extended' and backend != 'multigeometry':
