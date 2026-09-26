@@ -336,6 +336,15 @@ def test_a_poni_form_keeps_its_mapping_and_references_under_any_geometry(qapp, t
         assert not page._readiness[1] and "fourc has one detector circle" in page._readiness[0]
         with pytest.raises(ValueError, match="one detector circle"):
             page.build_form()
+        restored = StitchPage(empty_host_services(_Status()))  # the saved-settings entry point too
+        try:
+            restored.apply_settings(page.settings())
+            assert restored._instrument().geometry == "fourc"
+            assert (restored._value("source_motors"), restored._value("poni_references")) == (
+                "del=del, nu=nu", "del=0.0, nu=3.0")
+            assert not restored._readiness[1] and "fourc has one detector circle" in restored._readiness[0]
+        finally:
+            _close(restored, qapp)
         page._set_instrument(InstrumentGeometry("psic"))
         assert page._readiness[1], page._readiness
         built = page.build_form()
