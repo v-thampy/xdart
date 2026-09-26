@@ -609,7 +609,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                    tip='At most this many frames of the calibrant scan are searched for ring points, spread '
                        'across its angles. More: better coverage, slower.')
         self._edit(auto, 'refine_max_counts', 'Maximum valid counts (optional)', '',
-                   tip='Pixels at or above this count are ignored when finding ring points (e.g. saturation).')
+                   tip='Pixels above this count are ignored when finding ring points (e.g. saturated ones).')
         self.refine_button = QtWidgets.QPushButton('Refine automatically')
         self.refine_button.setToolTip('Finds ring points on frames across the whole calibrant scan, starting '
                                       'from the geometry above, and keeps the detector mount and sample offset '
@@ -717,8 +717,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                      'Pilatus300kw', tip='The detector model (pyFAI); it sets the pixel size and shape.')
         self._choice(form, 'beam_orientation', 'Detector orientation',
                      [(f'{code} · {name}', code) for code, name in DETECTOR_ORIENTATIONS], 3,
-                     tip='pyFAI\'s detector orientation: which corner its first pixel is in, seen from the '
-                         'sample. Keep 3, pyFAI\'s default, unless pyFAI shows this detector\'s images '
+                     tip='pyFAI\'s detector orientation: the corner holding the image\'s first pixel, seen '
+                         'from behind the detector looking at the sample. Keep 3, pyFAI\'s default, unless '
+                         'pyFAI shows this detector\'s images '
                          'mirrored; it is saved with every PONI and fit. (The image rotation under Select '
                          'frames is separate: it turns the image arrays.)')
         self.motion = self._combo(form, 'Beam motion', [('horizontal', None), ('vertical', None)],
@@ -730,7 +731,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._edit(form, 'beam_mask', 'Mask file (optional)', chooser='Masks (*.edf *.tif *.tiff *.npy);;All files (*)',
                    tip='Pixels to ignore when finding the beam spot.')
         self._edit(form, 'beam_saturation', 'Saturation level (optional)', '',
-                   tip='Counts at or above this are saturated and ignored.')
+                   tip='A frame with a beam-strip pixel at or above this count is saturated and left out '
+                       'of the fit.')
         self.rough_note = QtWidgets.QLabel()
         self.rough_note.setWordWrap(True)
         layout.addWidget(self.rough_note)
