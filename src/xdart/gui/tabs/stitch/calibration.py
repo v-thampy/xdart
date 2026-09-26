@@ -648,19 +648,23 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._refine_card.setVisible(mg)
         from_file = self.refine_seed.currentData() == 'file'
         self._show('refine_seed_path', from_file)
-        note = ''
-        if from_file and self._text('refine_seed_path'):
-            from xrd_tools.core.geometry.stacked_arm import is_arm_record
-            try:
-                record = json.loads(Path(self._text('refine_seed_path')).read_text(encoding='utf-8'))
-            except (OSError, ValueError):
-                note = 'This file cannot be read as a geometry JSON.'
-            else:
-                if not is_arm_record(record):
-                    note = ('This file uses independent angles (an older MultiGeometry format), so it cannot '
-                            'start the refinement. Fit the calibrated frames and start from the current fit.')
+        note = (self._seed_file_problem(self._text('refine_seed_path'))
+                if from_file and self._text('refine_seed_path') else None) or ''
         self.refine_seed_note.setText(note)
         self.refine_seed_note.setVisible(bool(note))
+
+    @staticmethod
+    def _seed_file_problem(path):
+        """Why this geometry file cannot start the refinement, or None (a detector arm)."""
+        from xrd_tools.core.geometry.stacked_arm import is_arm_record
+        try:
+            record = json.loads(Path(path).read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return 'This file cannot be read as a geometry JSON.'
+        if not is_arm_record(record):
+            return ('This file uses independent angles (an older MultiGeometry format), so it cannot start the '
+                    'refinement. Fit the calibrated frames and start from the current fit.')
+        return None
 
     def _build_distance(self):
         layout, form = self._form('1 · Geometry', 'rough')
@@ -827,7 +831,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             return
         if geometry_path:
             self._fields['refine_seed_path'].setText(str(geometry_path))
-            if self.fit is None and not self.refine_seed_note.text():  # an arm the refinement can start from
+            if self.fit is None and self._seed_file_problem(geometry_path) is None:  # an arm it can start from
                 self.refine_seed.setCurrentIndex(self.refine_seed.findData('file'))
         self.source_kind.setCurrentIndex(0 if source.kind is SourceKind.SPEC else 1)
         opts = source.options

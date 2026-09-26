@@ -367,3 +367,19 @@ def test_a_cancelled_guided_fit_ends_cancelled_not_failed(tmp_path):
     cancelled.set()
     with pytest.raises(OperationCancelled):
         _run_job(('fit', (frames, {'arm_model': 'stacked_extended'})), cancelled, lambda *_: True)
+
+
+def test_an_independent_angle_page_geometry_does_not_become_the_refinement_seed(qapp, tmp_path):
+    """The page's older independent-angle calibration still predicts rings, but the refinement
+    keeps starting from the current fit instead of refusing later."""
+    older = tmp_path / 'older.json'
+    older.write_text(json.dumps({'trans_function': {'constants': {'pi': 3.141592653589793}}}))
+    dialog = StitchCalibrationDialog(tmp_path)
+    try:
+        dialog.set_source_context(SourceSpec(tmp_path / 'scan', SourceKind.SPEC, options={'scan': '1'}),
+                                  geometry_path=older)
+        assert dialog._text('refine_seed_path') == str(older) and dialog.refine_seed.currentData() == 'fit'
+        dialog.refine_seed.setCurrentIndex(dialog.refine_seed.findData('file'))  # chosen anyway: said at once
+        assert 'independent angles' in dialog.refine_seed_note.text()
+    finally:
+        dialog.close()
