@@ -120,8 +120,14 @@ class CalibrationRequest:
     monitored_directory: str
     directory_identity: tuple[int, int]
     points_directory: str | None = None
+    #: Extra pyFAI-calib2 options for a guided frame (calibrant, energy, --poni seed).
+    arguments: tuple[str, ...] = ()
     def __post_init__(self) -> None:
-        if (self.points_directory is not None
+        if (type(self.arguments) is not tuple
+                or len(self.arguments) > 16
+                or any(not _bounded_text(value, _PATH_BYTES_LIMIT) or "\0" in value
+                       for value in self.arguments)
+                or self.points_directory is not None
                 and (not _absolute_path(self.points_directory)
                      or self.points_directory != self.monitored_directory)
                 or not all(_absolute_path(value)
@@ -217,7 +223,8 @@ class CalibrationResult:
                 or self.exit_code is not None
                 and type(self.exit_code) is not int
                 or type(self.argv) is not tuple
-                or len(self.argv) > 2
+                or len(self.argv) > 2 + len(self.request.arguments)
+                or self.argv[1:1 + len(self.request.arguments)] != self.request.arguments
                 or any(not _bounded_text(value, _URL_BYTES_LIMIT)
                        for value in self.argv)
                 or not _absolute_path(self.cwd)
@@ -1122,8 +1129,8 @@ def run_calibration(
             raise ValueError("calibration source directory changed before launch")
         if cancelled.is_set(): raise _Cancelled("calibration cancelled")
         publish("launch", 1, 2)
-        argv = ((request.executable,) if input_argument is None else
-                (request.executable, input_argument))
+        argv = ((request.executable, *request.arguments) if input_argument is None else
+                (request.executable, *request.arguments, input_argument))
         with (tempfile.TemporaryDirectory(prefix=".xdart-calibration-", dir=directory) as report_dir,
               _private_child_stderr(directory) as child_stderr):
             report_path = Path(report_dir) / "last-save.json"

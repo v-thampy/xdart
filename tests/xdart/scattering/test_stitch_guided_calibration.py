@@ -15,7 +15,7 @@ from xdart.gui.tabs.stitch.calibration import StitchCalibrationDialog
 from xrd_tools.core.scan import SourceSpec, SourceKind
 
 
-@pytest.mark.parametrize('action', ['save', 'one_click', 'switched_image', 'close', 'missing_points', 'failed_save', 'child_failure'])
+@pytest.mark.parametrize('action', ['save', 'one_click', 'seeded', 'switched_image', 'close', 'missing_points', 'failed_save', 'child_failure'])
 def test_real_guided_child_save_captures_only_matched_enabled_points(tmp_path, monkeypatch, action):
     hooks = tmp_path / 'hooks'; hooks.mkdir()
     (hooks/'sitecustomize.py').write_text('''
@@ -36,6 +36,12 @@ def automated_exec(app):
             from pyFAI.detectors import detector_factory
             action = os.environ['XDART_TEST_GUIDED_ACTION']
             task = next(w for w in app.allWidgets() if isinstance(w, IntegrationTask))
+            if action == 'seeded':  # what pyFAI opened with, before anything is changed
+                import json
+                model = task.model()
+                (scratch / 'seeded.json').write_text(json.dumps({
+                    'valid': model.fittedGeometry().isValid(),
+                    'calibrant': model.experimentSettingsModel().calibrantModel().calibrant().name}))
             if action != 'close':
                 settings = task.model().experimentSettingsModel()
                 if action == 'switched_image':
@@ -64,7 +70,7 @@ def automated_exec(app):
                     IntegrationTask._IntegrationTask__getPoni = broken
                 qt.QFileDialog.exec = lambda dialog: 0  # a guided frame saves without a file dialog
                 task._savePoniButton.click()
-                if action == 'one_click':
+                if action in ('one_click', 'seeded'):
                     return  # the save itself closes pyFAI and returns to xdart
             app.exit(7 if action == 'child_failure' else 0)
         except BaseException:
@@ -79,7 +85,16 @@ qt.QApplication.exec = automated_exec
     image = tmp_path/'selected.tif'
     tifffile.imwrite(image, np.arange(80, dtype=np.uint16).reshape(8,10))
     tifffile.imwrite(hooks/'other.tif', (100 + np.arange(80, dtype=np.uint16)).reshape(8,10))
-    request = replace(prepare_calibration_request(str(image)), points_directory=str(tmp_path))
+    arguments = ()
+    if action == 'seeded':  # a predicted geometry and the calibrant, as a guided frame opens
+        from pyFAI.detectors import Detector
+        from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+        from xrd_tools.integrate.calibration_seed import FrameSeed, write_seed_poni
+        ai = AzimuthalIntegrator(dist=.1, poni1=.0004, poni2=.0005, wavelength=1e-10,
+                                 detector=Detector(1e-4, 1e-4, max_shape=(8, 10)))
+        arguments = ('-c', 'LaB6', '--poni', str(write_seed_poni(FrameSeed(ai, ()), tmp_path / 'seed.poni')))
+    request = replace(prepare_calibration_request(str(image)), points_directory=str(tmp_path),
+                      arguments=arguments)
     terminal = run_calibration(request, OperationIdentity(1), Event(), lambda *_: None, lambda _: True)
     if action in ('switched_image', 'missing_points', 'child_failure'):
         assert terminal.status is OperationTerminalStatus.FAILED
@@ -90,7 +105,9 @@ qt.QApplication.exec = automated_exec
             assert 'loaded pyFAI image differs' in terminal.diagnostic
     else:
         assert terminal.status is OperationTerminalStatus.RETURNED, terminal.diagnostic
-        if action in ('save', 'one_click'):
+        if action == 'seeded':
+            assert json.loads((hooks / 'seeded.json').read_text()) == {'valid': True, 'calibrant': 'LaB6'}
+        if action in ('save', 'one_click', 'seeded'):
             result = terminal.payload
             saved = Path(result.last_saved_path)  # named by xdart in the frame's folder
             assert saved.parent == tmp_path and saved.name.startswith('pyfai-') and saved.suffix == '.poni'
@@ -119,7 +136,7 @@ qt.QApplication.exec = automated_exec
             assert adopted.pairing_policy == 'pyfai-model-image-v1'
             session = save_calibration_session(tmp_path, (adopted,))
             assert load_calibration_session(session) == (adopted,)
-        elif action != 'one_click':
+        elif action not in ('one_click', 'seeded'):
             assert terminal.payload.last_saved_path is None
             assert terminal.payload.control_points_path is None
     assert not list(tmp_path.glob('.xdart-calibration-*'))
@@ -164,6 +181,71 @@ def test_calibration_rows_name_their_source_image_and_a_save_selects_the_next_fr
     assert dialog._selected_frame().index == 143
     dialog._select_next_frame(dialog.frames[2])  # none after it: the first still pending
     assert dialog._selected_frame().index == 0
+    from xdart.gui.pages.values import PageCleanup
+    assert dialog.shutdown().status is PageCleanup.CLEAN
+    dialog.close()
+
+
+def test_a_frame_opens_pyfai_with_its_calibrant_energy_and_predicted_geometry(tmp_path):
+    from xdart.gui.tabs.stitch.calibration import _pyfai_arguments
+    from tests.core.test_calibration_seed import _frame, _record
+    folder = tmp_path / 'frame-20'
+    folder.mkdir()
+    frame = replace(_frame({'del': 20., 'nu': 0.}), image_path=str(folder / 'scan14_0020.edf'))
+    seed = dict(calibrant='LaB6', del_motor='del', nu_motor='nu', record=None, frames=(),
+                file=str(_record(tmp_path)), detector=None)
+    arguments = _pyfai_arguments(frame, seed)
+    assert arguments[:3] == ('-c', 'LaB6', '--poni')
+    assert Path(arguments[3]).parent == folder and Path(arguments[3]).is_file()
+    # no calibration yet: the calibrant, the frame's energy and a saved frame's detector
+    assert _pyfai_arguments(frame, dict(seed, file=None, detector='PilatusCdTe300kw')) == (
+        '-c', 'LaB6', '-e', '17.000018', '-D', 'PilatusCdTe300kw')
+
+
+def test_the_frame_table_lists_each_frames_expected_rings(tmp_path):
+    from tests.core.test_calibration_seed import _frame, _record
+    dialog = StitchCalibrationDialog(tmp_path, backend='multigeometry')
+    dialog.frames = (replace(_frame({'del': 20., 'nu': 0.}), identity='frame-20'),)
+    dialog._render_frames()
+    assert dialog.frame_table.item(0, 5).text() == '—'  # nothing to predict from yet
+    assert 'three' in dialog.frame_table.item(0, 5).toolTip()
+    dialog._fields['refine_seed_path'].setText(str(_record(tmp_path)))
+    dialog._render_frames()
+    cell = dialog.frame_table.item(0, 5)
+    assert cell.text() and cell.text() != '—' and cell.toolTip().startswith('Ring ')
+    from xdart.gui.pages.values import PageCleanup
+    assert dialog.shutdown().status is PageCleanup.CLEAN
+    dialog.close()
+
+
+def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
+    from xdart.gui.tabs.stitch.calibration import _pyfai_arguments
+    from pyFAI.io.ponifile import PoniFile
+    from tests.core.test_calibration_seed import _frame, _record
+    dialog = StitchCalibrationDialog(tmp_path, backend='multigeometry')
+    assert [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())] == [
+        '1 · Rough geometry', '2 · Select frames', '3 · Calibrate each frame', '4 · Fit and save']
+    form = dialog._beam_form
+    visible = lambda key: form.isRowVisible(dialog._path_rows.get(key, dialog._fields[key]))  # noqa: E731
+    assert visible('beam_source') and not visible('rough_distance')  # a direct-beam scan by default
+    dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+    assert visible('rough_distance') and visible('beam_pixel') and not visible('beam_source')
+    folder = tmp_path / 'frame-20'
+    folder.mkdir()
+    dialog.frames = (replace(_frame({'del': 20., 'nu': 0.}), identity='frame-20',
+                             image_path=str(folder / 'scan14_0020.edf')),)
+    dialog._render_frames()
+    assert dialog.frame_table.item(0, 5).text() == '—'  # no distance typed yet
+    for key, value in (('rough_distance', '500'), ('beam_pixel', '737, 97'), ('beam_detector', 'Pilatus300kw')):
+        dialog._fields[key].setText(value)
+    dialog._fields['refine_seed_path'].setText(str(_record(tmp_path)))  # a calibration file too
+    dialog._render_frames()
+    assert dialog.frame_table.item(0, 5).toolTip().startswith('Ring ')
+    arguments = _pyfai_arguments(dialog.frames[0], dialog._seed_options())
+    assert PoniFile(arguments[3]).dist == pytest.approx(0.5)  # this session's rough geometry, not the file
+    dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
+    assert not visible('beam_pixel') and dialog._seed_options()['rough'] is None
+    assert PoniFile(_pyfai_arguments(dialog.frames[0], dialog._seed_options())[3]).dist == pytest.approx(0.39)
     from xdart.gui.pages.values import PageCleanup
     assert dialog.shutdown().status is PageCleanup.CLEAN
     dialog.close()

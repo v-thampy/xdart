@@ -12,6 +12,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.pages.operation_owner import SingleWorkerOwner, OperationCancelled, OperationTerminalStatus
 from xrd_tools.core.scan import SourceKind, SourceSpec
+from xrd_tools.integrate.calibration_seed import ring_summary, rough_arm_record
 from xrd_tools.integrate.stitch_calibration import (
     adopt_calibration_pair, capture_calibration_frames, fit_calibration,
     load_calibration_session, save_calibration_fit, save_calibration_session,
@@ -29,6 +30,43 @@ def _run_job(request, cancelled, publish):
         return _dispatch_job(request, cancelled, publish)
     except InterruptedError as error:  # the numerical owners' cancellation
         raise OperationCancelled(str(error)) from error
+
+
+def _seed_record(seed, cancelled):
+    """The calibration a frame's geometry is predicted from: this session's fit, a fit of
+    three or more saved frames, else the page's calibration file (None without one)."""
+    if seed.get('record') is not None:
+        return seed['record']
+    if len(seed.get('frames', ())) >= 3:
+        try:
+            fit = fit_calibration(seed['frames'], backend='multigeometry', del_motor=seed['del_motor'],
+                                  nu_motor=seed['nu_motor'], cancelled=cancelled)
+            return fit.asset['calibration']
+        except (ValueError, RuntimeError, KeyError):
+            pass  # the saved frames do not fit yet: fall back to the rough geometry or the file
+    return seed.get('rough') if seed.get('rough') is not None else seed.get('file')
+
+
+def _pyfai_arguments(frame, seed, cancelled=None):
+    """pyFAI-calib2 options for one guided frame: its calibrant and energy, and the frame's
+    predicted geometry when a calibration is at hand, so "extract rings" numbers the rings."""
+    arguments = ['-c', seed['calibrant']]
+    record = _seed_record(seed, cancelled)
+    if record is not None:
+        from xrd_tools.integrate.calibration_seed import predict_frame_seed, write_seed_poni
+        try:
+            predicted = predict_frame_seed(record, frame, calibrant=seed['calibrant'],
+                                           del_motor=seed['del_motor'], nu_motor=seed['nu_motor'])
+            path = write_seed_poni(predicted, Path(frame.image_path).parent / f'seed-{uuid.uuid4().hex}.poni',
+                                   calibrant=seed['calibrant'])
+            return (*arguments, '--poni', str(path))
+        except (ValueError, KeyError, OSError):
+            pass  # an unusable calibration only loses the head start
+    if frame.energy_eV:
+        arguments += ['-e', f'{frame.energy_eV / 1000:.9g}']
+    if seed.get('detector'):
+        arguments += ['-D', seed['detector']]
+    return tuple(arguments)
 
 
 def _dispatch_job(request, cancelled, publish):
@@ -50,10 +88,11 @@ def _dispatch_job(request, cancelled, publish):
     if kind == 'calibrate':
         from xdart.gui.tabs.scattering.experiment_authoring import prepare_calibration_request, run_calibration
         from xdart.gui.tabs.scattering.operation_values import OperationIdentity, OperationTerminalStatus as ChildStatus
-        frame = arguments
+        frame, seed = arguments
         validate_frame_files(frame, require_points=False)
         child_request = prepare_calibration_request(frame.image_path)
-        child_request = replace(child_request, points_directory=str(Path(frame.image_path).parent))
+        child_request = replace(child_request, points_directory=str(Path(frame.image_path).parent),
+                                arguments=_pyfai_arguments(frame, seed, cancelled))
         child = run_calibration(child_request, OperationIdentity(1), cancelled, publish,
                                 lambda identity: not cancelled.is_set())
         if child.status is ChildStatus.CANCELLED:
@@ -187,6 +226,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.session_dir = self.project_root / 'calibration' / f'session-{uuid.uuid4().hex[:12]}'
         self.frames = ()
         self.fit = None
+        #: Predicted rings per (frame, calibrant, calibration): see _expected_rings.
+        self._ring_cache = {}
         self._choices = []
         self._identity = None
         self._job = None
@@ -202,15 +243,18 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         # The arm model the user chose; applied whenever it is available.
         self._preferred_arm_model = None
         outer = QtWidgets.QVBoxLayout(self)
-        heading = QtWidgets.QLabel('Select representative frames, calibrate each image, then fit and save one geometry.')
+        heading = QtWidgets.QLabel('Start from a rough geometry (a direct-beam scan, a typed distance, or skip), select '
+                                   'representative frames, calibrate each image, then fit and save one geometry.')
         heading.setWordWrap(True)
         outer.addWidget(heading)
         self.tabs = QtWidgets.QTabWidget()
+        self._tab_pages = {}
         outer.addWidget(self.tabs, 1)
+        self._build_distance()  # a rough geometry first: it predicts every frame's rings
         self._build_source()
         self._build_frames()
         self._build_fit(backend)
-        self._build_distance()
+        self._rough_mode_changed()
         self.status = QtWidgets.QLabel('Ready. Three to five frames are suggested; angle coverage and fit diagnostics determine sufficiency.')
         self.status.setWordWrap(True)
         outer.addWidget(self.status)
@@ -234,13 +278,17 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._timer.setInterval(50)
         self._timer.timeout.connect(self._poll)
 
-    def _form(self, title):
+    def _form(self, title, key):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
         form = QtWidgets.QFormLayout()
         layout.addLayout(form)
         self.tabs.addTab(widget, title)
+        self._tab_pages[key] = widget
         return layout, form
+
+    def _show_tab(self, key):
+        self.tabs.setCurrentWidget(self._tab_pages[key])
 
     def _edit(self, form, key, label, default='', *, chooser=None):
         if chooser is not None and key.startswith('beam_'):
@@ -291,7 +339,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             self._fields[key].setText(str(value))
 
     def _build_source(self):
-        layout, form = self._form('1 · Select frames')
+        layout, form = self._form('2 · Select frames', 'select')
         self.source_kind = QtWidgets.QComboBox()
         self.source_kind.addItem('SPEC + scan + images', 'spec')
         self.source_kind.addItem('NeXus images + metadata', 'nexus_stack')
@@ -326,12 +374,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         layout.addWidget(self.prepare_button)
 
     def _build_frames(self):
-        layout, form = self._form('2 · Calibrate each frame')
+        layout, form = self._form('3 · Calibrate each frame', 'calibrate')
         hint = QtWidgets.QLabel('Calibrate each frame in pyFAI: pick its rings, then press Save as PONI-file. xdart keeps the PONI and its enabled control points, closes pyFAI and selects the next frame. Completed rows and files remain when another frame is cancelled.')
         hint.setWordWrap(True)
         layout.addWidget(hint)
-        self.frame_table = QtWidgets.QTableWidget(0, 5)
-        self.frame_table.setHorizontalHeaderLabels(['Frame', 'Delta / Nu (°)', 'Image', 'PONI / points', 'Status'])
+        self.frame_table = QtWidgets.QTableWidget(0, 6)
+        self.frame_table.setHorizontalHeaderLabels(['Frame', 'Delta / Nu (°)', 'Image', 'PONI / points', 'Status',
+                                                    'Expected rings'])
         self.frame_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.frame_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self.frame_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
@@ -349,7 +398,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         layout.addWidget(self.session_label)
 
     def _build_fit(self, backend):
-        layout, form = self._form('3 · Fit and save')
+        layout, form = self._form('4 · Fit and save', 'fit')
         self.backend = QtWidgets.QComboBox()
         self.backend.addItem('pyFAI MultiGeometry', 'multigeometry')
         self.backend.addItem('xrayutilities · PSIC SURFACE', 'xu_hist')
@@ -388,6 +437,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.refine_seed.addItem('Geometry file', 'file')
         auto.addRow('Start from', self.refine_seed)
         self._edit(auto, 'refine_seed_path', 'Seed geometry JSON', chooser='JSON (*.json);;All files (*)')
+        # the same calibrant and calibration predict each frame's rings (Calibrate each frame)
+        self._fields['refine_seed_path'].editingFinished.connect(self._render_frames)
+        self.refine_calibrant.currentTextChanged.connect(self._render_frames)
         self._edit(auto, 'refine_frames', 'Frame budget', '48')
         self._edit(auto, 'refine_max_counts', 'Maximum valid counts (optional)', '')
         self.refine_button = QtWidgets.QPushButton('Refine automatically')
@@ -414,8 +466,14 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._sync_arm_model()
 
     def _build_distance(self):
-        layout, form = self._form('Optional · Direct beam distance')
+        layout, form = self._form('1 · Rough geometry', 'rough')
         self._beam_form = form
+        self.rough_mode = QtWidgets.QComboBox()
+        for label, value in [('Direct-beam scan', 'scan'), ('Enter the distance', 'manual'),
+                             ('Skip', 'skip')]:
+            self.rough_mode.addItem(label, value)
+        form.addRow('Rough geometry', self.rough_mode)
+        self._edit(form, 'rough_distance', 'Sample–detector distance (mm)', '')
         self.beam_source_kind = QtWidgets.QComboBox()
         for label, value in [('SPEC + image series', 'spec_series'),
                              ('SPEC + Eiger / NeXus', 'spec_container'),
@@ -441,9 +499,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._edit(form, 'beam_roi', 'ROI x0, y0, x1, y1 (optional)', '')
         self._edit(form, 'beam_mask', 'Mask file (optional)', chooser='Masks (*.edf *.tif *.tiff *.npy);;All files (*)')
         self._edit(form, 'beam_saturation', 'Saturation level (optional)', '')
-        note = QtWidgets.QLabel('SPEC supplies the angles for an image series or an Eiger/NeXus container; standalone NeXus supplies both. Angle and image counts must match. Uses the image rotation and image-series reader settings from Select frames. Regression uncertainty excludes motor, zero and pitch systematics; it does not set bounds automatically.')
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        self.rough_note = QtWidgets.QLabel()
+        self.rough_note.setWordWrap(True)
+        layout.addWidget(self.rough_note)
         self.beam_button = QtWidgets.QPushButton('Fit direct-beam distance')
         self.beam_button.clicked.connect(self._distance)
         layout.addWidget(self.beam_button)
@@ -455,8 +513,64 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.apply_distance_button = QtWidgets.QPushButton('Use result as distance seed')
         self.apply_distance_button.clicked.connect(self._apply_distance)
         layout.addWidget(self.apply_distance_button)
+        self.rough_mode.currentIndexChanged.connect(self._rough_mode_changed)
+        for key in ('rough_distance', 'beam_pixel', 'beam_zero', 'beam_motor', 'beam_detector'):
+            self._fields[key].editingFinished.connect(self._render_frames)
+
+    _ROUGH_NOTES = {
+        'scan': 'A direct-beam scan: SPEC supplies the angles for an image series or an Eiger/NeXus container; '
+                'standalone NeXus supplies both. Angle and image counts must match. Uses the image rotation and '
+                'image-series reader settings from Select frames. Its distance, with the beam pixel and zero, '
+                'predicts each frame\'s rings; the regression uncertainty excludes motor, zero and pitch systematics.',
+        'manual': 'The distance, the pixel the direct beam hits at normal incidence and that zero predict each '
+                  'frame\'s rings (a del-on-nu arm, one degree per degree); the fit refines them.',
+        'skip': 'No rough geometry: each frame\'s rings are predicted from a calibration file (Fit and save · Seed '
+                'geometry JSON), or from this session\'s fit once three frames are saved.',
+    }
+    _SCAN_ROWS = ('beam_source', 'beam_scan', 'beam_image_file', 'beam_images', 'beam_stem', 'beam_entry',
+                  'beam_strip', 'beam_roi', 'beam_mask', 'beam_saturation')
+    _GEOMETRY_ROWS = ('beam_motor', 'beam_zero', 'beam_pixel', 'beam_detector')
+
+    def _rough_mode_changed(self, *_args):
+        mode = self.rough_mode.currentData()
+        form = self._beam_form
+        form.setRowVisible(self.beam_source_kind, mode == 'scan')
+        form.setRowVisible(self.motion, mode == 'scan')
+        form.setRowVisible(self._fields['rough_distance'], mode == 'manual')
+        for key in self._GEOMETRY_ROWS:
+            form.setRowVisible(self._path_rows.get(key, self._fields[key]), mode != 'skip')
+        for widget in (self.beam_button, self.beam_summary, self.compatible, self.apply_distance_button):
+            widget.setVisible(mode == 'scan')
+        self.rough_note.setText(self._ROUGH_NOTES[mode])
+        if mode == 'scan':
+            self._beam_source_changed()
+        else:
+            for key in self._SCAN_ROWS:
+                form.setRowVisible(self._path_rows.get(key, self._fields[key]), False)
+        if hasattr(self, 'frame_table'):
+            self._render_frames()
+
+    def _rough_record(self):
+        """Step 1 as a nominal arm, or None (skipped, not yet measured, or incomplete)."""
+        mode = self.rough_mode.currentData()
+        try:
+            if mode == 'manual':
+                distance = float(self._text('rough_distance')) / 1000
+            elif mode == 'scan' and self._distance_result is not None:
+                distance = self._distance_result.distance_m
+            else:
+                return None
+            return rough_arm_record(
+                distance_m=distance, detector=self._text('beam_detector'),
+                beam_px=tuple(float(v) for v in self._text('beam_pixel').split(',')),
+                zero_deg=float(self._text('beam_zero') or 0), zero_motor=self._text('beam_motor'),
+                del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1])
+        except (ValueError, TypeError, KeyError, RuntimeError):
+            return None
 
     def _beam_source_changed(self):
+        if self.rough_mode.currentData() != 'scan':
+            return
         kind = self.beam_source_kind.currentData()
         for key, visible in [('beam_scan', kind != 'nexus'),
                              ('beam_image_file', kind == 'spec_container'),
@@ -488,7 +602,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
     #: Choices saved with the Stitch settings. The calibrant-scan and same-detector
     #: confirmations are per use and never saved.
     _SAVED_CHOICES = ('source_kind', 'rotation', 'backend', 'arm_model', 'refine_calibrant',
-                      'refine_seed', 'beam_source_kind', 'motion')
+                      'refine_seed', 'beam_source_kind', 'motion', 'rough_mode')
 
     def settings(self):
         """This dialog's inputs as plain values, for the saved Stitch settings."""
@@ -610,7 +724,47 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         return frame
 
     def _calibrate(self):
-        self._guard(lambda: self._start('calibrate', self._selected_frame()))
+        self._guard(lambda: self._start('calibrate', (self._selected_frame(), self._seed_options())))
+
+    def _seed_options(self):
+        """What pyFAI opens a frame with (see ``_pyfai_arguments``)."""
+        done = tuple(frame for frame in self.frames if frame.complete)
+        path = self._text('refine_seed_path')
+        detector = None
+        for frame in done:  # a saved frame's detector (its PONI names it)
+            try:
+                lines = Path(frame.poni_path).read_text(encoding='utf-8').splitlines()
+            except OSError:
+                continue
+            detector = next((line.split(':', 1)[1].strip() for line in lines if line.startswith('Detector:')), None)
+            if detector:
+                break
+        return dict(calibrant=self.refine_calibrant.currentText().strip() or 'LaB6',
+                    del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1],
+                    record=(self.fit.asset.get('calibration')
+                            if self.fit is not None and self.fit.backend == 'multigeometry' else None),
+                    frames=done, rough=self._rough_record(),
+                    file=str(Path(path).resolve()) if path and Path(path).is_file() else None,
+                    detector=detector)
+
+    def _expected_rings(self, frame):
+        """The calibrant rings predicted on this frame (None without a calibration)."""
+        seed = self._seed_options()
+        record = next((value for value in (seed['record'], seed['rough'], seed['file']) if value is not None), None)
+        if record is None:
+            return None
+        import hashlib
+        key = (frame.identity, seed['calibrant'], hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+               if isinstance(record, dict) else record)
+        if key not in self._ring_cache:
+            from xrd_tools.integrate.calibration_seed import predict_frame_seed
+            try:
+                self._ring_cache[key] = predict_frame_seed(
+                    record, frame, calibrant=seed['calibrant'], del_motor=seed['del_motor'],
+                    nu_motor=seed['nu_motor']).rings
+            except (ValueError, KeyError, OSError):
+                self._ring_cache[key] = None
+        return self._ring_cache[key]
 
     def _import(self):
         def go():
@@ -749,7 +903,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             residuals_px=[float(v) if math.isfinite(v) else None for v in result.residuals_px],
             uncertainty_policy='conditional_regression_standard_error_not_total_accuracy',
             compatibility_confirmed=True)
-        self.tabs.setCurrentIndex(2)
+        self._show_tab('fit')
 
     def _select_next_frame(self, saved):
         """After a saved frame, select the next one still needing a PONI (after it, then from the top)."""
@@ -766,11 +920,17 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             values = [str(frame.index), ', '.join(f'{k}={v:g}' for k, v in frame.motors.items()),
                       image, Path(frame.poni_path).name if frame.complete else '—',
                       'Complete' if frame.complete else 'Needs PONI + points']
+            rings = self._expected_rings(frame)
+            values.append('—' if rings is None else ring_summary(rings) or 'none')
+            ring_tip = ('No calibration to predict from yet: choose a calibration file, or save three '
+                        'frames and their rings are predicted from this session\'s fit.' if rings is None
+                        else '\n'.join(f'Ring {ring.number} · 2θ {ring.two_theta_deg:.2f}° · d {ring.d_spacing_A:.4f} Å'
+                                        for ring in rings) or 'No calibrant ring reaches this frame.')
             for column, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
                 item.setToolTip(f'{frame.raw_path}\nstaged for pyFAI: {frame.image_path}' if column == 2
-                                else f'{frame.poni_path}\n{frame.npt_path}')
+                                else ring_tip if column == 5 else f'{frame.poni_path}\n{frame.npt_path}')
                 self.frame_table.setItem(row, column, item)
         if self.frames:
             self.frame_table.selectRow(0)
@@ -784,7 +944,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.frames = ()
         self._invalidate_fit()
         self._render_frames()
-        self.tabs.setCurrentIndex(0)
+        self._show_tab('select')
         self.status.setText('New session. Earlier saved session files remain available.')
 
     def _resume(self):
@@ -801,7 +961,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 self.session_dir = Path(path).parent
                 self._invalidate_fit()
                 self._render_frames()
-                self.tabs.setCurrentIndex(1)
+                self._show_tab('calibrate')
         self._guard(go)
 
     def _cancel(self):
@@ -839,7 +999,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     self.frames = result
                     self._frame_motors = self._enumerated_motors
                     self._render_frames()
-                    self.tabs.setCurrentIndex(1)
+                    self._show_tab('calibrate')
                 elif kind in ('calibrate', 'import') and result is not None:
                     self.frames = tuple(result if frame.identity == self._row_identity else frame for frame in self.frames)
                     save_calibration_session(self.session_dir, self.frames)
@@ -856,6 +1016,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                             'Frame · angle (°) · centre (px) · residual (px) · status']
                     rows += [f'{result.point_ids[i]} · {result.angles_deg[i]:.6g} · {result.centres_px[i]:.5g} · {result.residuals_px[i]:.4g} · {"used" if result.used[i] else result.rejection_reasons[i]}' for i in range(len(result.angles_deg))]
                     self.beam_summary.setPlainText('\n'.join(rows))
+                    self._render_frames()  # the measured distance now predicts the rings
                 if kind == 'calibrate' and result is not None:
                     pending = [frame for frame in self.frames if not frame.complete]
                     self.status.setText(f'Frame {result.index} saved. ' + (
