@@ -9,6 +9,7 @@ upstream replacement; this is not a second calibration implementation.
 from contextlib import contextmanager
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import uuid
@@ -16,6 +17,50 @@ import uuid
 
 CALIBRATION_SAVE_REPORT_ENV = "XDART_CALIBRATION_SAVE_REPORT"
 CALIBRATION_POINTS_DIRECTORY_ENV = "XDART_CALIBRATION_POINTS_DIRECTORY"
+_LOG = logging.getLogger(__name__)
+
+
+def _save_poni_in(task, directory):
+    """pyFAI's own "Save as PONI file" steps, the file named here (a guided Stitch frame).
+
+    The same writer and model updates as pyFAI's ``IntegrationTask.__saveAsPoni``,
+    without its file dialog, inside xdart's existing save hook (pyFAI's files are not
+    changed). Returns False when this pyFAI lacks those steps, so its dialog saves.
+    """
+    get_poni = getattr(task, "_IntegrationTask__getPoni", None)
+    if get_poni is None:
+        return False
+    settings = task.model().experimentSettingsModel()
+    path = Path(directory) / f"pyfai-{uuid.uuid4().hex}.poni"
+    try:
+        writer = get_poni()
+        writer.extra["Calibrant"] = settings.calibrantModel().calibrant().name
+        writer.extra["Image"] = settings.image().filename()
+        with open(path, "wt") as stream:
+            writer.write(stream)
+    except Exception as error:
+        from pyFAI.gui.dialog import MessageBox
+        MessageBox.exception(task, "Error while saving poni file", error, _LOG)
+        return True
+    poni_file = settings.poniFile()
+    with poni_file.lockContext():
+        poni_file.setValue(str(path))
+        poni_file.setSynchronized(True)
+    return True
+
+
+def _return_to_xdart(task, captured):
+    """After a guided save: close pyFAI (xdart takes the next frame), or say why not."""
+    from silx.gui import qt
+    if captured is not None and "error" not in captured:
+        qt.QTimer.singleShot(0, task.window().close)
+        return
+    if captured is not None:
+        box = qt.QMessageBox(task)
+        box.setWindowTitle("xdart")
+        box.setText(f"xdart cannot use this save: {captured['error']}. Fix it and save again.")
+        box.setModal(False)
+        box.show()
 
 
 @contextmanager
@@ -70,11 +115,19 @@ def capture_poni_saves(report_path, *, points_directory=None):
                 # successful write whose contents could not be captured.
                 last_saved = {"error": str(error)}
 
+        before = last_saved
         filename.changed.connect(saved)
         try:
-            return original(task)
+            # A guided frame saves straight into its folder; ordinary Int keeps the dialog.
+            if points_directory is None or not _save_poni_in(task, points_directory):
+                result = original(task)
+            else:
+                result = None
         finally:
             filename.changed.disconnect(saved)
+        if points_directory is not None and last_saved is not before:
+            _return_to_xdart(task, last_saved)
+        return result
 
     IntegrationTask._IntegrationTask__saveAsPoni = save
     try:

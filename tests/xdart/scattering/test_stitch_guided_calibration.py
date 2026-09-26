@@ -15,7 +15,7 @@ from xdart.gui.tabs.stitch.calibration import StitchCalibrationDialog
 from xrd_tools.core.scan import SourceSpec, SourceKind
 
 
-@pytest.mark.parametrize('action', ['save', 'switched_image', 'close', 'missing_points', 'failed_save', 'child_failure'])
+@pytest.mark.parametrize('action', ['save', 'one_click', 'switched_image', 'close', 'missing_points', 'failed_save', 'child_failure'])
 def test_real_guided_child_save_captures_only_matched_enabled_points(tmp_path, monkeypatch, action):
     hooks = tmp_path / 'hooks'; hooks.mkdir()
     (hooks/'sitecustomize.py').write_text('''
@@ -56,15 +56,16 @@ def automated_exec(app):
                     peak = PeakModel(); peak.setName('ring'); peak.setRingNumber(1)
                     peak.setCoords(np.array([[1.,2.],[3.,4.]])); peak.setEnabled(True)
                     task.model().peakSelectionModel().append(peak)
-                target = scratch / 'saved.poni'
                 if action == 'failed_save':
                     from pyFAI.gui.dialog import MessageBox
                     MessageBox.exception = lambda *args, **kwargs: None
-                    target = scratch / 'missing' / 'saved.poni'
-                def choose(dialog):
-                    dialog.selectFile(str(target)); return 1
-                qt.QFileDialog.exec = choose
+                    def broken(self):
+                        raise RuntimeError('writer unavailable')
+                    IntegrationTask._IntegrationTask__getPoni = broken
+                qt.QFileDialog.exec = lambda dialog: 0  # a guided frame saves without a file dialog
                 task._savePoniButton.click()
+                if action == 'one_click':
+                    return  # the save itself closes pyFAI and returns to xdart
             app.exit(7 if action == 'child_failure' else 0)
         except BaseException:
             import traceback; traceback.print_exc(); app.exit(98)
@@ -89,9 +90,11 @@ qt.QApplication.exec = automated_exec
             assert 'loaded pyFAI image differs' in terminal.diagnostic
     else:
         assert terminal.status is OperationTerminalStatus.RETURNED, terminal.diagnostic
-        if action == 'save':
+        if action in ('save', 'one_click'):
             result = terminal.payload
-            assert result.last_saved_path == str(hooks/'saved.poni')
+            saved = Path(result.last_saved_path)  # named by xdart in the frame's folder
+            assert saved.parent == tmp_path and saved.name.startswith('pyfai-') and saved.suffix == '.poni'
+        if action == 'save':
             assert Path(result.control_points_path).parent == tmp_path
             from pyFAI.control_points import ControlPoints
             points = ControlPoints(result.control_points_path)
@@ -116,7 +119,7 @@ qt.QApplication.exec = automated_exec
             assert adopted.pairing_policy == 'pyfai-model-image-v1'
             session = save_calibration_session(tmp_path, (adopted,))
             assert load_calibration_session(session) == (adopted,)
-        else:
+        elif action != 'one_click':
             assert terminal.payload.last_saved_path is None
             assert terminal.payload.control_points_path is None
     assert not list(tmp_path.glob('.xdart-calibration-*'))
@@ -140,6 +143,54 @@ def test_modeless_window_exposes_guided_source_controls_and_preserves_session(tm
     from xdart.gui.pages.values import PageCleanup
     assert dialog.shutdown().status is PageCleanup.CLEAN
     dialog.close()
+
+
+def test_calibration_rows_name_their_source_image_and_a_save_selects_the_next_frame(tmp_path):
+    from xrd_tools.integrate.stitch_calibration import CalibrationFrame
+    dialog = StitchCalibrationDialog(tmp_path, backend='multigeometry')
+
+    def frame(index, raw, within=0):
+        return CalibrationFrame(f'frame-{index}', str(tmp_path/'beam'), 'spec', {}, index,
+            str(tmp_path/'images'/raw), within, str(tmp_path/f'frame-{index}'/f'{Path(raw).stem}.edf'),
+            'sha', (8, 10), 0, {'del': 5., 'nu': 0.}, None)
+    done = dict(poni_path='p', npt_path='n', control_image_sha256='c', pairing_policy='pyfai-model-image-v1')
+    dialog.frames = (frame(0, 'scan14_0000.raw'), replace(frame(40, 'scan14_0040.raw'), **done),
+                     frame(143, 'run.h5', 7))
+    dialog._render_frames()
+    assert dialog.frame_table.item(0, 2).text() == 'scan14_0000.raw'  # the source, not the staged copy
+    assert dialog.frame_table.item(2, 2).text() == 'run.h5 #7'
+    assert 'staged for pyFAI' in dialog.frame_table.item(0, 2).toolTip()
+    dialog._select_next_frame(dialog.frames[0])  # 40 is complete: 143 is next
+    assert dialog._selected_frame().index == 143
+    dialog._select_next_frame(dialog.frames[2])  # none after it: the first still pending
+    assert dialog._selected_frame().index == 0
+    from xdart.gui.pages.values import PageCleanup
+    assert dialog.shutdown().status is PageCleanup.CLEAN
+    dialog.close()
+
+
+def test_staged_frames_survive_pyfai_ring_extraction(tmp_path):
+    # pyFAI's ring extractor converts to float32 without copying float32 input and fills
+    # the detector gaps in place; a float64 staged frame keeps the image xdart checks.
+    from pyFAI.detectors import detector_factory
+    from pyFAI.gui.peak_picker import PeakPicker
+    from pyFAI.io import image as pyfai_image
+    from xrd_tools.integrate.stitch_calibration import calibration_image_identity, capture_calibration_frames
+    spec = tmp_path / 'beam'
+    spec.write_text('#F beam\n#E 1\n#D Thu Jan 1 00:00:00 1970\n#C test\n'
+                    '#O0 del nu\n#S 1 ascan del 1 2 1 1\n#D today\n#P0 0 4\n#N 2\n#L del  nu\n1 4\n2 5\n')
+    images = tmp_path / 'images'; images.mkdir()
+    counts = np.arange(195 * 1475, dtype='<i4').reshape(195, 1475) % 1000
+    counts[:, 487:494] = -1  # the module gap, as a Pilatus writes it
+    for index in range(2):
+        (images / f'beam_scan1_{index:04d}.raw').write_bytes(counts.tobytes())
+    source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(images),
+        'read_image_kwargs': {'detector_shape': (195, 1475), 'raw_dtype': '<i4'}})
+    staged, = capture_calibration_frames(source, (0,), tmp_path / 'session')
+    image = pyfai_image.read_image_data(staged.image_path)  # what pyFAI-calib2 loads
+    before = calibration_image_identity(image)
+    PeakPicker(data=image, mask=None, detector=detector_factory('Pilatus300kw'))
+    assert calibration_image_identity(image) == before
 
 
 def test_direct_beam_window_handoff_uses_actual_api_and_seed_not_bounds(tmp_path):

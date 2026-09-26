@@ -327,7 +327,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _build_frames(self):
         layout, form = self._form('2 · Calibrate each frame')
-        hint = QtWidgets.QLabel('Open each staged image in pyFAI, select rings and save the PONI. Its enabled control points are captured automatically. Completed rows and files remain when another frame is cancelled.')
+        hint = QtWidgets.QLabel('Calibrate each frame in pyFAI: pick its rings, then press Save as PONI-file. xdart keeps the PONI and its enabled control points, closes pyFAI and selects the next frame. Completed rows and files remain when another frame is cancelled.')
         hint.setWordWrap(True)
         layout.addWidget(hint)
         self.frame_table = QtWidgets.QTableWidget(0, 5)
@@ -751,16 +751,26 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             compatibility_confirmed=True)
         self.tabs.setCurrentIndex(2)
 
+    def _select_next_frame(self, saved):
+        """After a saved frame, select the next one still needing a PONI (after it, then from the top)."""
+        rows = [row for row, frame in enumerate(self.frames) if not frame.complete]
+        after = next((row for row, frame in enumerate(self.frames) if frame.identity == saved.identity), -1)
+        if rows:
+            self.frame_table.selectRow(next((row for row in rows if row > after), rows[0]))
+
     def _render_frames(self):
         self.frame_table.setRowCount(len(self.frames))
         for row, frame in enumerate(self.frames):
+            # the frame's own detector image (and its frame number inside a multi-frame file)
+            image = Path(frame.raw_path).name + (f' #{frame.raw_index}' if frame.raw_index else '')
             values = [str(frame.index), ', '.join(f'{k}={v:g}' for k, v in frame.motors.items()),
-                      Path(frame.image_path).name, Path(frame.poni_path).name if frame.complete else '—',
+                      image, Path(frame.poni_path).name if frame.complete else '—',
                       'Complete' if frame.complete else 'Needs PONI + points']
             for column, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
-                item.setToolTip(frame.image_path if column == 2 else f'{frame.poni_path}\n{frame.npt_path}')
+                item.setToolTip(f'{frame.raw_path}\nstaged for pyFAI: {frame.image_path}' if column == 2
+                                else f'{frame.poni_path}\n{frame.npt_path}')
                 self.frame_table.setItem(row, column, item)
         if self.frames:
             self.frame_table.selectRow(0)
@@ -835,6 +845,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     save_calibration_session(self.session_dir, self.frames)
                     self._invalidate_fit()
                     self._render_frames()
+                    self._select_next_frame(result)
                 elif kind in ('fit', 'refine'):
                     self.fit = result
                     self.fit_summary.setPlainText(fit_summary_text(result))
@@ -845,7 +856,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                             'Frame · angle (°) · centre (px) · residual (px) · status']
                     rows += [f'{result.point_ids[i]} · {result.angles_deg[i]:.6g} · {result.centres_px[i]:.5g} · {result.residuals_px[i]:.4g} · {"used" if result.used[i] else result.rejection_reasons[i]}' for i in range(len(result.angles_deg))]
                     self.beam_summary.setPlainText('\n'.join(rows))
-                self.status.setText('No PONI was saved; the frame remains unchanged.' if kind == 'calibrate' and result is None else f'{kind.capitalize()} complete.')
+                if kind == 'calibrate' and result is not None:
+                    pending = [frame for frame in self.frames if not frame.complete]
+                    self.status.setText(f'Frame {result.index} saved. ' + (
+                        'Next: Calibrate selected frame…' if pending else 'All frames calibrated: Fit and save.'))
+                else:
+                    self.status.setText('No PONI was saved; the frame remains unchanged.' if kind == 'calibrate' and result is None else f'{kind.capitalize()} complete.')
             except Exception as error:
                 self.status.setText(str(error))
         elif terminal.status is OperationTerminalStatus.CANCELLED:
