@@ -357,11 +357,11 @@ class StitchToolForm:
         if self.geometry_kind is StitchGeometryKind.PYFAI_GONIOMETER_JSON:
             if references:
                 raise ValueError("fitted JSON geometry cannot carry PONI references")
-        elif (
-            {name for name, _source in motors} != {"del", "nu"}
-            or {name for name, _value in references} != {"del", "nu"}
+        elif (  # a single detector arm (fourc/twoc 2θ as del) maps del alone
+            {name for name, _source in motors} not in ({"del", "nu"}, {"del"})
+            or {name for name, _value in references} != {name for name, _source in motors}
         ):
-            raise ValueError("PONI geometry requires del/nu mappings and references")
+            raise ValueError("PONI geometry requires del (and nu) mappings and references")
         if type(self.image_rotation) is not int or self.image_rotation not in {
             0,
             90,

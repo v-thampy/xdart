@@ -399,12 +399,13 @@ class StitchGeometryInput:
             raise ValueError("Stitch geometry requires an explicit source motor mapping")
         if self.kind is StitchGeometryKind.PYFAI_GONIOMETER_JSON and references:
             raise ValueError("fitted goniometer JSON cannot carry PONI references")
+        # A single detector arm (fourc/twoc 2θ as del) maps del alone; nu is held at zero.
         if self.kind is StitchGeometryKind.PONI and (
-            {name for name, _source in motors} != {"del", "nu"}
-            or {name for name, _value in references} != {"del", "nu"}
+            {name for name, _source in motors} not in ({"del", "nu"}, {"del"})
+            or {name for name, _value in references} != {name for name, _source in motors}
         ):
             raise ValueError(
-                "PONI geometry requires del/nu source mappings and reference positions"
+                "PONI geometry requires del (and nu) source mappings and reference positions"
             )
         if type(self.image_rotation) is not int or self.image_rotation not in {0, 90, 180, 270}:
             raise ValueError("image rotation must be an exact 0/90/180/270 integer")
@@ -2363,13 +2364,11 @@ def _runtime_geometry(receipt: StitchGeometryReceipt, raw: bytes):
         calibration = replace(calibration, image_orientation=orientation)
         motors = dict(request.source_motors)
         references = dict(request.reference_motor_positions)
-        base = Diffractometer.psic(del_=motors["del"], nu=motors["nu"])
+        base = Diffractometer.psic(del_=motors["del"], nu=motors.get("nu", "nu"))
         base = replace(
             base,
-            rot1=AngleMapping(
-                source_motor=motors["nu"],
-                offset=-references["nu"],
-            ),
+            rot1=(AngleMapping(source_motor=motors["nu"], offset=-references["nu"])
+                  if "nu" in motors else AngleMapping()),  # a single arm: nu held at zero
             rot2=AngleMapping(
                 source_motor=motors["del"],
                 offset=-references["del"],

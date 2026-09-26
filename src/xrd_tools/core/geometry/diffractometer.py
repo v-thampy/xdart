@@ -1115,7 +1115,8 @@ class Diffractometer:
         """All motor columns this instrument needs from the meta file."""
         seen: dict[str, None] = {}
         if self.stacked_arm is not None:
-            seen.update({self.stacked_arm.del_motor: None, self.stacked_arm.nu_motor: None})
+            seen.update({name: None for name in (self.stacked_arm.del_motor, self.stacked_arm.nu_motor)
+                         if name is not None})  # a single arm has no nu motor
         for mapping in (self.rot1, self.rot2, self.rot3, self.incident_angle):
             if mapping.is_active and mapping.source_motor not in seen:
                 seen[mapping.source_motor] = None

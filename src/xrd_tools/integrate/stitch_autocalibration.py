@@ -10,7 +10,8 @@ frame whose detector counts collapsed.
 The arm is refined with and without the detector-mount/sample-offset
 extension. Leave-one-nu-row-out validation decides whether the extension is
 kept: each nu row is predicted from a fit to the other rows, and the extension
-must reduce the held-out error by ``min_improvement``. The geometry is fitted
+must reduce the held-out error by ``min_improvement``. A single detector arm
+(fourc/twoc 2θ, nu held at zero) has one row and keeps the five-parameter arm. The geometry is fitted
 on the calibrant only; never run this on sample data, whose peaks can move and
 broaden with angle for physical reasons.
 """
@@ -49,6 +50,16 @@ class ScanRingPoints:
     coverage: dict
 
 
+def _nu_of(nu_motor):
+    """A frame's nu from its motors; a single arm (``nu_motor=None``) holds it at zero."""
+    return (lambda motors: 0.0) if nu_motor is None else (lambda motors: float(motors[nu_motor]))
+
+
+def _arm_motors(arm):
+    """The scan motors an arm reads: del, and nu unless it is held at zero."""
+    return (arm.del_motor,) if arm.single else (arm.del_motor, arm.nu_motor)
+
+
 def stratified_frame_indices(rows, count, nu_motor, del_motor):
     """Choose frames from every nu row first, then spread the rest over the angles.
 
@@ -56,10 +67,12 @@ def stratified_frame_indices(rows, count, nu_motor, del_motor):
     del; the remainder goes to the frames farthest from those already chosen.
     When the budget is smaller than the number of rows, evenly spaced rows get
     one frame each, and the returned coverage says how many rows were reached.
+    A single arm (``nu_motor=None``) is one row.
     """
+    nu_of = _nu_of(nu_motor)
     groups = {}
     for index, motors, _energy in rows:
-        groups.setdefault(round(float(motors[nu_motor]), 6), []).append(
+        groups.setdefault(round(nu_of(motors), 6), []).append(
             (float(motors[del_motor]), int(index)))
     keys = sorted(groups)
     count = int(count)
@@ -75,7 +88,7 @@ def stratified_frame_indices(rows, count, nu_motor, del_motor):
         picks = np.unique(np.round((np.arange(k) + 0.5) * len(group) / k - 0.5).astype(int))
         chosen += [group[i][1] for i in picks]
     order = [int(row[0]) for row in rows]
-    values = np.array([[float(row[1][del_motor]), float(row[1][nu_motor])] for row in rows])
+    values = np.array([[float(row[1][del_motor]), nu_of(row[1])] for row in rows])
     spans = np.ptp(values, axis=0)
     values = (values - values.min(axis=0)) / np.where(spans > 0, spans, 1.0)
     position = {index: k for k, index in enumerate(order)}
@@ -97,7 +110,7 @@ def _seed(geometry, source_motors):
         record = json.loads(Path(geometry).read_text())
     diff = Diffractometer.from_pyfai_goniometer(record, source_motors=dict(source_motors))
     if diff.stacked_arm is None or diff.calibration is None:
-        raise ValueError('automatic refinement starts from a stacked (del-on-nu) calibration')
+        raise ValueError('automatic refinement starts from a stacked (del-on-nu) or single-arm calibration')
     if diff.calibration.parallax is True:
         raise ValueError('automatic refinement does not yet support parallax-corrected calibrations')
     digest = hashlib.sha256(json.dumps(record, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
@@ -145,9 +158,9 @@ def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen
     labels = [int(row[0]) for row in rows]
     if progress is not None:
         progress('Screening the scan', 0, len(labels))
-    nu = [round(float(row[1][arm.nu_motor]), 6) for row in rows]
-    motors = {arm.del_motor: np.array([row[1][arm.del_motor] for row in rows], dtype=float),
-              arm.nu_motor: np.array(nu, dtype=float)}
+    nu_of = _nu_of(arm.nu_motor)
+    nu = [round(nu_of(row[1]), 6) for row in rows]
+    motors = {name: np.array([row[1][name] for row in rows], dtype=float) for name in _arm_motors(arm)}
     # The detector mask does not depend on the pose: one integrator supplies it.
     integrator = next(iter(create_multigeometry_integrator_series_from_geometry(
         diff, {name: values[:1] for name, values in motors.items()})))
@@ -195,7 +208,8 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
     _record, diff, _digest = _seed(geometry, source_motors)
     arm = diff.stacked_arm
     wavelength = float(diff.calibration.poni.wavelength)
-    rows = source_frame_choices(spec, (arm.del_motor, arm.nu_motor))
+    rows = source_frame_choices(spec, _arm_motors(arm))
+    nu_of = _nu_of(arm.nu_motor)
     by_index = {row[0]: row for row in rows}
     orientation = ImageOrientation(rotation=image_rotation)
     exact = _exact_source(spec)
@@ -212,8 +226,8 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
         selected = tuple(int(i) for i in frame_indices)
         if len(set(selected)) != len(selected) or any(i not in by_index for i in selected):
             raise ValueError('choose distinct frames from the selected scan')
-        coverage = {'nu_rows_available': len({round(row[1][arm.nu_motor], 6) for row in rows}),
-                    'nu_rows_selected': len({round(by_index[i][1][arm.nu_motor], 6) for i in selected})}
+        coverage = {'nu_rows_available': len({round(nu_of(row[1]), 6) for row in rows}),
+                    'nu_rows_selected': len({round(nu_of(by_index[i][1]), 6) for i in selected})}
     if not 3 <= len(selected) <= 256:
         raise ValueError('automatic refinement needs 3-256 frames')
     for index in selected:
@@ -224,8 +238,7 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
                 raise ValueError(f'frame {index}: source energy and calibration wavelength differ')
     cal = _calibrant(calibrant, wavelength)
     ring_index = _ring_indices(cal, wavelength)
-    motors = {arm.del_motor: np.array([by_index[i][1][arm.del_motor] for i in selected]),
-              arm.nu_motor: np.array([by_index[i][1][arm.nu_motor] for i in selected])}
+    motors = {name: np.array([by_index[i][1][name] for i in selected]) for name in _arm_motors(arm)}
     source = open_source(exact)
     try:
         loader = getattr(source, 'load_native_frame', source.load_frame)
@@ -263,8 +276,7 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
             if not len(points):
                 excluded.append({'index': int(index), 'reason': 'no ring points found', 'count_ratio': None})
                 continue
-            frame_motors = {arm.nu_motor: float(motors[arm.nu_motor][k]),
-                            arm.del_motor: float(motors[arm.del_motor][k])}
+            frame_motors = {name: float(motors[name][k]) for name in reversed(_arm_motors(arm))}
             controls.append(ControlFrame(points[:, 0], points[:, 1],
                                          ring_index[points[:, 2].astype(int)], frame_motors))
             frames.append({'index': int(index), 'motors': frame_motors, 'points': int(len(points)),
@@ -281,8 +293,8 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
 def _held_out(result, controls, calibrant, nu_motor, del_motor):
     """Residuals of a fitted arm on frames it did not see (sub-pixel positions)."""
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
-    motors = {nu_motor: np.array([c.motors[nu_motor] for c in controls]),
-              del_motor: np.array([c.motors[del_motor] for c in controls])}
+    motors = {name: np.array([c.motors[name] for c in controls])
+              for name in (nu_motor, del_motor) if name is not None}
     q_d = 2 * math.pi / np.asarray(calibrant.dSpacing, dtype=float)
     out = []
     for control, integrator in zip(controls, create_multigeometry_integrator_series_from_geometry(
@@ -300,7 +312,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                          calibrant='LaB6', frame_indices=None, max_frames=48, points_per_degree=2.0,
                          max_counts=None, frame_screen=_CALIBRATION_SCREEN, reject_outliers=4.5,
                          min_improvement=0.2, max_rms_q=0.03, cancelled=None,
-                         progress=None) -> CalibrationFit:
+                         progress=None, instrument_geometry=None) -> CalibrationFit:
     """Refine a stacked-arm calibration from its calibrant scan, automatically.
 
     Returns a MultiGeometry :class:`CalibrationFit` for :func:`save_calibration_fit`.
@@ -308,6 +320,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
     held-out validation that chose between the five-parameter arm and the
     detector-mount/sample-offset extension. ``progress(stage, done, total)``
     reports frames read, frames searched and validation folds.
+    ``instrument_geometry`` (which motor drives which circle) is recorded as given.
     """
     record, diff, digest = _seed(geometry, source_motors)
     arm = diff.stacked_arm
@@ -326,11 +339,14 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                                   beam_rotation=arm.beam_rotation, cancelled=cancelled)
 
     controls = points.controls
-    rows = sorted({round(c.motors[arm.nu_motor], 6) for c in controls})
+    nu_of = _nu_of(arm.nu_motor)
+    rows = sorted({round(nu_of(c.motors), 6) for c in controls})
     validation = {'method': 'leave-one-nu-row-out', 'nu_rows': rows, 'min_improvement': min_improvement,
                   'coverage': dict(points.coverage)}
     chosen, reason = 'stacked', ''
-    if len(rows) < 4:
+    if arm.single:
+        reason = 'a single detector arm has no nu rows: the extension does not apply'
+    elif len(rows) < 4:
         reason = 'fewer than four nu rows: the extension cannot be validated'
         if points.coverage['nu_rows_selected'] < points.coverage['nu_rows_available']:
             reason += (f" (the frame budget reached {points.coverage['nu_rows_selected']} of "
@@ -341,8 +357,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
         for row in rows:
             if progress is not None:
                 progress('Validating models', len(folds), len(rows))
-            train = [c for c in controls if round(c.motors[arm.nu_motor], 6) != row]
-            test = [c for c in controls if round(c.motors[arm.nu_motor], 6) == row]
+            train = [c for c in controls if round(nu_of(c.motors), 6) != row]
+            test = [c for c in controls if round(nu_of(c.motors), 6) == row]
             fold = {'nu': row, 'points': int(sum(len(c.rows) for c in test))}
             for name, extended in (('stacked', False), ('stacked_extended', True)):
                 trained = fit(train, extended)
@@ -373,7 +389,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
     provenance = {'frames': list(points.frames), 'rms_q_A^-1': result.rms_q,
                   'condition_number': result.condition_number, 'n_points': result.n_points,
                   'distance_seed_m': None, 'distance_bounds_m': None, 'fit_motor_scales': False,
-                  'source_motors': {'nu_angle': arm.nu_motor, 'del_angle': arm.del_motor},
+                  'source_motors': ({'del_angle': arm.del_motor} if arm.single
+                                    else {'nu_angle': arm.nu_motor, 'del_angle': arm.del_motor}),
                   'image_rotation': int(image_rotation), 'direct_beam': None,
                   'arm_model': chosen, 'parameter_errors': dict(result.param_errors),
                   'parameter_correlations': dict(result.param_correlations),
@@ -385,6 +402,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                       'frame_screen': frame_screen.to_provenance(), 'excluded_frames': list(points.excluded),
                       'outlier_threshold_sigma': reject_outliers, 'rejected_points': result.rejected_points,
                       'validation': validation}}
+    if instrument_geometry is not None:  # which motor drives which circle, as the guided fit records it
+        provenance['instrument_geometry'] = dict(instrument_geometry)
     provenance = json.loads(json.dumps(provenance, default=float))
     message = ('Automatic refinement: detector mount and sample offset refined'
                if chosen == 'stacked_extended' else f'Automatic refinement: five-parameter arm kept ({reason})')

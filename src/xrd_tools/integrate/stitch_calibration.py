@@ -404,6 +404,8 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     ``arm_model='stacked_extended'`` (MultiGeometry only) also fits the detector
     mount on the arm and the sample offset from the rotation centre; it needs
     frames from at least three nu positions and fixed motor scales.
+    ``nu_motor=None`` is a single detector arm (a fourc or twoc 2θ as
+    ``del_motor``): psic's arm with nu held at zero.
     """
     if not 3 <= len(frames) <= 32:
         raise ValueError('fit requires at least three completed frames spanning the angles')
@@ -411,6 +413,13 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
         raise ValueError('unknown arm model')
     if arm_model == 'stacked_extended' and backend != 'multigeometry':
         raise ValueError('the detector mount and sample offset refinement is MultiGeometry-only')
+    single = nu_motor is None
+    if single and arm_model == 'stacked_extended':
+        raise ValueError('a single detector arm has no nu positions; the detector mount and '
+                         'sample offset refinement needs frames from several')
+    if single and backend == 'xu_hist':
+        raise ValueError('the xrayutilities backend fits psic\'s two detector circles; fit a single '
+                         '2θ arm with the MultiGeometry backend')
     loaded = [load_control_frame(frame) for frame in frames]
     controls, calibrants, calibrations = zip(*loaded)
     base = calibrations[0]
@@ -439,8 +448,9 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
             result.diffractometer.calibration)
         asset['detector_config'] = exported_config
         rms, condition, count = result.rms_q, result.condition_number, result.n_points
-        message = ('Del mounted on nu; frozen motor scales: ' + ', '.join(result.frozen_scales)
-                   if result.frozen_scales else 'Converged; del mounted on nu')
+        arm = 'one detector arm, nu held at zero' if single else 'del mounted on nu'
+        message = (f'{arm[0].upper()}{arm[1:]}; frozen motor scales: ' + ', '.join(result.frozen_scales)
+                   if result.frozen_scales else f'Converged; {arm}')
         if not fit_scales:
             message += '; motor scales fixed at degrees'
         if arm_model == 'stacked_extended':
@@ -455,7 +465,8 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                   'condition_number': condition, 'n_points': count,
                   'distance_seed_m': distance_seed_m, 'distance_bounds_m': distance_bounds_m,
                   'fit_motor_scales': bool(fit_scales) if backend == 'multigeometry' else False,
-                  'source_motors': ({'nu_angle': nu_motor, 'del_angle': del_motor}
+                  'source_motors': ({'del_angle': del_motor} if single
+                                    else {'nu_angle': nu_motor, 'del_angle': del_motor}
                                     if backend == 'multigeometry' else {'nu': nu_motor, 'del': del_motor}),
                   'image_rotation': frames[0].rotation,
                   'direct_beam': distance_provenance}

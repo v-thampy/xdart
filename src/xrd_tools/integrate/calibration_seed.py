@@ -2,6 +2,7 @@
 
 The seed is a goniometer calibration (this session's fit, a calibration file, or a
 rough geometry) evaluated at the frame's own del/nu, with the frame's own energy.
+A single detector arm (fourc/twoc: ``nu_motor=None``) holds nu at zero.
 pyFAI-calib2 opens with it, so its ring extraction ("Fit screen") places and numbers
 the rings; the same prediction lists which calibrant rings reach the detector.
 """
@@ -28,13 +29,20 @@ class FrameSeed:
     rings: tuple[ExpectedRing, ...]
 
 
+#: A single arm's nu, for a calibration that has a nu position: held at zero.
+_HELD_NU = 'nu (held at zero)'
+
+
 def _source_motors(record, del_motor, nu_motor):
-    """The calibration's angle names (del_angle / del_value ...) bound to the scan's motors."""
+    """The calibration's angle names (del_angle / del_value ...) bound to the scan's motors;
+    a single-arm calibration has del alone."""
     trans = record.get('trans_function') or {}
     names = list(trans.get('pos_names') or record.get('pos_names') or ())
     mapping = {name: del_motor for name in names if 'del' in name.casefold()}
-    mapping.update({name: nu_motor for name in names if 'nu' in name.casefold() and name not in mapping})
-    if len(names) != 2 or len(mapping) != 2 or len(set(mapping.values())) != 2:
+    nu = _HELD_NU if nu_motor is None else nu_motor
+    mapping.update({name: nu for name in names if 'nu' in name.casefold() and name not in mapping})
+    if (len(mapping) != len(names) or len(set(mapping.values())) != len(names)
+            or del_motor not in mapping.values()):
         raise ValueError("the calibration's angles are not one del and one nu")
     return mapping
 
@@ -66,9 +74,13 @@ def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_m
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
     if not isinstance(record, dict):
         record = json.loads(Path(record).read_text(encoding='utf-8'))
-    diff = Diffractometer.from_pyfai_goniometer(record, source_motors=_source_motors(record, del_motor, nu_motor))
-    motors = {del_motor: np.array([float(frame.motors[del_motor])]),
-              nu_motor: np.array([float(frame.motors[nu_motor])])}
+    bound = _source_motors(record, del_motor, nu_motor)
+    if nu_motor is not None and nu_motor not in bound.values() and float(frame.motors[nu_motor]) != 0:
+        raise ValueError('a single-arm calibration holds nu at zero; this frame has nu '
+                         f'{float(frame.motors[nu_motor]):g}')
+    diff = Diffractometer.from_pyfai_goniometer(record, source_motors=bound)
+    motors = {motor: np.array([0.0 if motor == _HELD_NU else float(frame.motors[motor])])
+              for motor in bound.values()}
     integrator = next(iter(create_multigeometry_integrator_series_from_geometry(diff, motors)))
     if tuple(integrator.detector.shape) != tuple(frame.shape):
         raise ValueError('the calibration detector does not match the staged frame')
@@ -85,6 +97,7 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
     beam hits ``beam_px`` (x, y in the oriented image) with the detector ``distance_m``
     from the sample; the angles move the detector as a del-on-nu arm, one degree per
     degree. Good enough to predict which rings a frame shows; the fit refines it.
+    ``nu_motor=None`` is a single arm (fourc/twoc 2θ as del), nu held at zero.
     """
     from pyFAI.detectors import detector_factory
     from xrd_tools.core.containers import PONI
@@ -94,8 +107,9 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
         raise ValueError('the rough distance must be a positive number')
     pixels = detector_factory(detector)
     x, y = (float(value) for value in beam_px)
-    if zero_motor not in (del_motor, nu_motor):
-        raise ValueError(f'the normal-incidence zero names {zero_motor!r}, neither {del_motor!r} nor {nu_motor!r}')
+    if zero_motor not in (del_motor, nu_motor) or zero_motor is None:
+        raise ValueError(f'the normal-incidence zero names {zero_motor!r}, '
+                         + (f'not {del_motor!r}' if nu_motor is None else f'neither {del_motor!r} nor {nu_motor!r}'))
     offset = {('del_offset' if zero_motor == del_motor else 'nu_offset'): -math.radians(float(zero_deg))}
     poni = PONI(dist=float(distance_m), poni1=(y + .5) * pixels.pixel1, poni2=(x + .5) * pixels.pixel2,
                 wavelength=float(wavelength_m), detector=str(detector))
