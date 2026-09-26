@@ -63,6 +63,16 @@ def _guided_frames(tmp_path):
     return _frames(tmp_path / 'frames', controls, _calibration().poni)
 
 
+def _single_arm_frames(tmp_path):
+    """Guided frames of twoc's 2θ arm: psic's arm at nu = 0, read from the 2θ motor alone."""
+    from dataclasses import replace
+    from tests.core.test_stitch_guided_calibration import _frames
+    controls, _calibrant = _ring_controls({'nu_offset': .02, 'del_offset': -.05}, _calibration(),
+                                          [(delta, 0.) for delta in (6., 18., 30., 42.)])
+    controls = [replace(control, motors={'tth': control.motors['del']}) for control in controls]
+    return _frames(tmp_path / 'frames', controls, _calibration().poni)
+
+
 def _save_to(monkeypatch, target):
     monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName',
                         staticmethod(lambda *args, **kwargs: (str(target), '')))
@@ -115,6 +125,81 @@ def test_guided_extended_fit_saves_a_v2_arm_that_the_page_adopts(qapp, tmp_path,
         page.shutdown()
 
 
+def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_path, monkeypatch):
+    from xrd_tools.core.geometry.stacked_arm import is_single_arm
+    from xrd_tools.session.instrument import InstrumentGeometry
+    (tmp_path / 'frames').mkdir()
+    frames = _single_arm_frames(tmp_path)
+    page, dialog = _page_with_dialog(tmp_path)
+    try:
+        dialog.set_instrument(InstrumentGeometry('twoc'))
+        dialog.frames, dialog._frame_motors = frames, ('tth', None)
+        dialog._render_frames()
+        assert not dialog.arm_model.isEnabled() and 'no nu positions' in dialog.arm_model.toolTip()
+        dialog.fit_button.click()
+        _wait(dialog)
+        assert dialog.fit is not None, dialog.status.text()
+        assert dialog.fit.message == 'Converged; one detector arm, nu held at zero; motor scales fixed at degrees'
+        provenance, record = dialog.fit.asset['provenance'], dialog.fit.asset['calibration']
+        assert provenance['source_motors'] == {'del_angle': 'tth'}
+        assert provenance['instrument_geometry'] == InstrumentGeometry('twoc').to_record()
+        assert is_single_arm(record) and record['pos_names'] == ['del_angle']
+        fitted = dict(zip(record['param_names'], record['param']))
+        assert fitted['nu_offset'] == pytest.approx(.02, abs=2e-3)  # the arm's yaw
+        assert fitted['del_offset'] == pytest.approx(-.05, abs=2e-3)
+        target = (tmp_path / 'calibration' / 'twoc.json').resolve()
+        _save_to(monkeypatch, target)
+        dialog.save_button.click()
+        assert Path(page._value("geometry_path")) == target
+        assert page._instrument() == InstrumentGeometry('twoc')
+        assert page._value("source_motors") == "del_angle=tth"
+        assert page._arm_problem() is None
+    finally:
+        dialog.close()
+        page.shutdown()
+
+
+def test_a_fit_belongs_to_the_instrument_its_frames_were_staged_with(qapp, tmp_path, monkeypatch):
+    # Codex round 11 F1: motors renamed after staging, and the geometry changed after a fit
+    from xrd_tools.session.instrument import InstrumentGeometry
+    (tmp_path / 'frames').mkdir()
+    frames = _guided_frames(tmp_path)
+    page, dialog = _page_with_dialog(tmp_path)
+    try:
+        dialog.frames, dialog._frame_motors = frames, ('del', 'nu')
+        dialog._render_frames()
+        dialog.set_instrument(InstrumentGeometry('psic', (('del', 'delta'), ('nu', 'gamma'))))
+        dialog.fit_button.click()
+        assert dialog.fit is None and not dialog.active()
+        assert 'staged reading del and nu; the Geometry now names delta and gamma' in dialog.status.text()
+        dialog.set_instrument(InstrumentGeometry('psic'))
+        dialog.fit_button.click()
+        _wait(dialog)
+        assert dialog.fit is not None and dialog.save_button.isEnabled(), dialog.status.text()
+        dialog.set_instrument(InstrumentGeometry('psic'))  # the same instrument keeps the fit
+        assert dialog.fit is not None
+        dialog.set_instrument(InstrumentGeometry('fourc'))  # another one leaves it unsaveable
+        assert dialog.fit is None and not dialog.save_button.isEnabled()
+        dialog.set_instrument(InstrumentGeometry('psic', (('eta', 'halpha'),)))  # any circle counts
+        dialog.fit_button.click()
+        _wait(dialog)
+        dialog.geometry_editor.motor_edit('chi').setText('chi2')
+        assert dialog.fit is None
+        dialog.fit_button.click()
+        _wait(dialog)
+        fitted = dialog.fit.asset['provenance']['instrument_geometry']
+        assert fitted == dialog.geometry_editor.value().to_record()
+        target = (tmp_path / 'calibration' / 'psic.json').resolve()
+        _save_to(monkeypatch, target)
+        dialog.save_button.click()
+        # adoption keeps the fitted instrument and its motors
+        assert page._instrument().to_record() == fitted
+        assert page._value("source_motors") == "del_angle=del, nu_angle=nu"
+    finally:
+        dialog.close()
+        page.shutdown()
+
+
 def test_five_parameter_guided_save_equals_the_core_save(qapp, tmp_path, monkeypatch):
     from xrd_tools.integrate.stitch_calibration import fit_calibration, save_calibration_fit
     (tmp_path / 'frames').mkdir()
@@ -159,6 +244,8 @@ def test_automatic_refinement_from_the_pages_geometry_saves_and_is_adopted(qapp,
         assert dialog.fit is not None, dialog.status.text()
         automatic = dialog.fit.asset['provenance']['automatic_refinement']
         assert automatic['calibrant'] == 'LaB6' and automatic['validation']['chosen'] == 'stacked_extended'
+        # as the guided fit, it records which motor drives which circle (Codex round 11 residual)
+        assert dialog.fit.asset['provenance']['instrument_geometry'] == dialog.geometry_editor.value().to_record()
         summary = dialog.fit_summary.toPlainText()
         assert 'Automatic refinement chose the detector mount and sample offset' in summary
         assert 'Held-out σ: five-parameter' in summary and 'nu rows used: 4 of 4' in summary

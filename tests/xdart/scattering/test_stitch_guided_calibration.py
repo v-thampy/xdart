@@ -267,11 +267,67 @@ def test_the_geometry_comes_first_and_names_the_arm_motors(tmp_path):
     assert dialog.geometry_editor.value().stitch_arm() == ('delta', 'nu')
     assert dialog.settings()['instrument_geometry']['motors']['del'] == 'delta'
     dialog.geometry_editor.geometry.setCurrentIndex(dialog.geometry_editor.geometry.findData('twoc'))
-    dialog._enumerate()
-    assert 'single 2θ arm' in dialog.status.text()  # Stitch's arm needs nu and del
+    assert dialog.geometry_editor.value().stitch_arm() == ('tth', None)  # psic's arm, nu held at zero
+    label = dialog.geometry_editor._form.labelForField(dialog.geometry_editor._motors['tth']).text()
+    assert label == 'tth (detector)  ·  used by Stitch'
     from xdart.gui.pages.values import PageCleanup
     assert dialog.shutdown().status is PageCleanup.CLEAN
     dialog.close()
+
+
+def _finish(dialog, timeout=30):
+    import time
+    from pyqtgraph.Qt import QtWidgets
+    until = time.monotonic() + timeout
+    while dialog.active() and time.monotonic() < until:
+        QtWidgets.QApplication.processEvents()
+        time.sleep(.005)
+    for _ in range(5):  # the 50 ms poll delivers the terminal
+        QtWidgets.QApplication.processEvents()
+        time.sleep(.06)
+    assert not dialog.active(), dialog.status.text()
+
+
+def test_a_twoc_scan_is_read_and_staged_as_one_2theta_arm(tmp_path):
+    from xrd_tools.core.geometry.stacked_arm import is_single_arm
+    from xrd_tools.session.instrument import InstrumentGeometry
+    spec = tmp_path / 'powder'
+    spec.write_text('#F powder\n#E 1\n#D Thu Jan 1 00:00:00 1970\n#C test\n'
+                    '#O0 tth th\n#S 1 ascan tth 10 30 2 1\n#D today\n#P0 10 5\n#N 1\n#L tth\n10\n20\n30\n')
+    images = tmp_path / 'images'
+    images.mkdir()
+    for index in range(3):
+        (images / f'powder_scan1_{index:04d}.raw').write_bytes(np.zeros((4, 6), '<i4').tobytes())
+    source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(images),
+        'image_stem': 'powder_scan1_', 'read_image_kwargs': {'detector_shape': (4, 6), 'raw_dtype': '<i4'}})
+    dialog = StitchCalibrationDialog(tmp_path, backend='multigeometry')
+    try:
+        dialog.set_instrument(InstrumentGeometry('twoc'))
+        dialog.set_source_context(source)
+        dialog._enumerate()
+        _finish(dialog)
+        assert dialog.selection.columnCount() == 3, dialog.status.text()  # Use, Frame, tth: no nu
+        assert dialog.selection.horizontalHeaderItem(2).text() == 'tth (°)'
+        assert [dialog.selection.item(row, 2).text() for row in range(3)] == ['10', '20', '30']
+        dialog._prepare()
+        _finish(dialog)
+        assert dialog._frame_motors == ('tth', None)
+        assert [frame.motors for frame in dialog.frames] == [{'tth': 10.}, {'tth': 20.}, {'tth': 30.}]
+        assert not dialog.arm_model.isEnabled() and 'no nu positions' in dialog.arm_model.toolTip()
+        # the direct-beam zero "del" names twoc's 2θ: the rough geometry is a single arm
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        for key, value in (('rough_distance', '500'), ('beam_pixel', '3, 2'), ('beam_detector', 'Pilatus300kw')):
+            dialog._fields[key].setText(value)
+        assert dialog._text('beam_motor') == 'del' and is_single_arm(dialog._rough_record())
+        # renaming the 2θ motor after staging: the frames read tth, so Fit refuses
+        dialog.set_instrument(InstrumentGeometry('twoc', (('tth', 'ttheta'),)))
+        dialog._fit()
+        assert 'staged reading tth; the Geometry now names ttheta' in dialog.status.text()
+        assert dialog.fit is None
+    finally:
+        from xdart.gui.pages.values import PageCleanup
+        assert dialog.shutdown().status is PageCleanup.CLEAN
+        dialog.close()
 
 
 def test_reading_metadata_takes_each_circles_motor_from_the_scan(tmp_path):

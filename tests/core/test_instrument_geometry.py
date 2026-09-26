@@ -39,5 +39,28 @@ def test_stitch_takes_psics_detector_arm_and_the_core_preset_carries_the_names()
     assert (diff.rot2.source_motor, diff.rot1.source_motor, diff.incident_angle.source_motor) == (
         'delta', 'nu', 'halpha')
     assert InstrumentGeometry.from_record(geometry.to_record()) == geometry
-    with pytest.raises(ValueError, match='single 2θ arm'):
-        InstrumentGeometry('twoc').stitch_arm()
+
+
+def test_fourc_and_twoc_are_psics_arm_with_nu_held_at_zero():
+    # psic with mu = nu = 0 is the four-circle: the 2θ circle plays del, and there is no nu
+    fourc = InstrumentGeometry('fourc', (('tth', 'ttheta'),))
+    assert fourc.stitch_arm() == ('ttheta', None)
+    assert InstrumentGeometry('twoc').stitch_arm() == ('tth', None)
+    # psic's names (a calibration's del_angle, the direct-beam "del") are the circle playing them
+    names = ('del_angle', 'delta', 'tth', 'two_theta', 'ttheta', 'eta', 'nu_angle')
+    assert [fourc.circle_for_position(name) for name in names] == ['tth'] * 5 + ['th', None]
+    assert [fourc.arm_motor(name) for name in ('del', 'tth', 'ttheta', 'nu', 'th')] == ['ttheta'] * 3 + [None] * 2
+    assert InstrumentGeometry('psic', (('del', 'delta'),)).arm_motor('del_value') == 'delta'
+    assert InstrumentGeometry('psic').arm_motor('nu_angle') == 'nu'
+
+
+def test_a_calibration_must_drive_the_geometrys_arm():
+    psic_arm = ('del_angle', 'nu_angle')
+    assert 'one detector circle' in InstrumentGeometry('fourc').arm_mismatch(psic_arm)
+    assert 'one detector circle' in InstrumentGeometry('twoc').arm_mismatch(('del_value', 'nu_value'))
+    assert InstrumentGeometry('twoc').arm_mismatch(('del_angle',), single_arm=True) is None
+    assert 'nu held at zero' in InstrumentGeometry('psic').arm_mismatch(('del_angle',), single_arm=True)
+    assert InstrumentGeometry('psic').arm_mismatch(psic_arm) is None
+    # custom positions carry the user's own binding; a legacy one-position file is unchanged
+    assert InstrumentGeometry('fourc').arm_mismatch(('dval', 'nval')) is None
+    assert InstrumentGeometry('psic').arm_mismatch(('del_value',)) is None

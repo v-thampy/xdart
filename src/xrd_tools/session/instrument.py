@@ -5,6 +5,10 @@ circle (Stitch and its calibration now, RSM next). The geometry names the circle
 motors are whatever the beamline calls them, defaulting to the standard names. The
 existing :class:`Diffractometer` presets carry the circle conventions.
 
+fourc and twoc are psic's special cases (psic with mu = nu = 0 is the four-circle):
+their 2θ circle plays psic's del and their θ plays eta, so Stitch's detector arm is
+psic's with nu held at zero.
+
 ``halpha`` is a motor name (for the incidence circle, ``eta`` or ``th``), not a geometry.
 xdart's ``sixc`` is an alias of psic; SPEC's own sixc is a different geometry and has no
 preset here.
@@ -26,8 +30,12 @@ GEOMETRIES = {
 GEOMETRY_LABELS = {'psic': 'psic (6-circle)', 'fourc': 'fourc (4-circle)', 'twoc': 'twoc (2-circle)'}
 #: The incidence circle, whose motor is often named differently (halpha, th, ...).
 INCIDENCE_CIRCLE = {'psic': 'eta', 'fourc': 'th', 'twoc': 'th'}
+#: The psic circle each circle of a special case plays.
+AS_PSIC = {'psic': {}, 'fourc': {'th': 'eta', 'chi': 'chi', 'phi': 'phi', 'tth': 'del'},
+           'twoc': {'th': 'eta', 'tth': 'del'}}
 #: Other names beamlines give a circle's motor (matched whole, ignoring case).
-_ALIASES = {'del': ('delta',), 'tth': ('2theta', 'twotheta', 'tt'), 'th': ('theta', 'om', 'omega')}
+_ALIASES = {'del': ('delta',), 'tth': ('2theta', 'twotheta', 'two_theta', 'tt'),
+            'th': ('theta', 'om', 'omega')}
 #: Suffixes a calibration file's position names carry (del_angle, nu_value, ...).
 _POSITION_SUFFIX = re.compile(r'[_\-. ]?(angle|value|pos|position|deg)$', re.IGNORECASE)
 
@@ -57,23 +65,51 @@ class InstrumentGeometry:
     def role(self, circle) -> str:
         return dict(GEOMETRIES[self.geometry])[circle]
 
-    def stitch_arm(self) -> tuple[str, str]:
-        """The (del, nu) motors of Stitch's del-on-nu detector arm."""
-        if self.geometry != 'psic':
-            raise ValueError("Stitch's detector arm needs nu and del (psic); a single 2θ arm "
-                             f"({self.geometry}) is not supported yet")
-        return self.motor('del'), self.motor('nu')
+    def stitch_arm(self) -> tuple[str, str | None]:
+        """The (del, nu) motors of Stitch's del-on-nu detector arm. fourc and twoc have one
+        detector circle, their 2θ, which plays del; their nu is None, held at zero."""
+        if self.geometry == 'psic':
+            return self.motor('del'), self.motor('nu')
+        return self.motor('tth'), None
+
+    def arm_role(self, name) -> str | None:
+        """The arm circle ('del' or 'nu', psic's names) a circle, motor or position name
+        refers to; in fourc or twoc the 2θ circle is del."""
+        circle = self.circle_for_position(name)
+        role = AS_PSIC[self.geometry].get(circle, circle)
+        return role if role in ('del', 'nu') else None
+
+    def arm_motor(self, name) -> str | None:
+        """The arm's motor (del's, or nu's) that a circle, motor or position name refers to."""
+        return dict(zip(('del', 'nu'), self.stitch_arm())).get(self.arm_role(name))
+
+    def arm_mismatch(self, positions, *, single_arm=False) -> str | None:
+        """Why a calibration with these positions cannot drive this geometry's arm (None
+        when it can). ``single_arm``: the calibration holds nu at zero (a 2θ arm)."""
+        has_nu = any(InstrumentGeometry().circle_for_position(name) == 'nu' for name in positions)
+        if self.stitch_arm()[1] is None and has_nu:
+            return (f"This calibration is psic's del-on-nu arm; {self.geometry} has one detector circle "
+                    "(2θ). Calibrate its 2θ arm, or choose psic under Calibrate ▸ 1 · Geometry.")
+        if self.stitch_arm()[1] is not None and single_arm:
+            return ("This calibration is a single 2θ arm (nu held at zero), but psic's nu moves. Choose "
+                    "fourc or twoc under Calibrate ▸ 1 · Geometry, or calibrate psic's arm.")
+        return None
 
     def circle_for_position(self, name) -> str | None:
-        """The circle a calibration file's position (del_angle, nu_value, ...) belongs to."""
+        """The circle a calibration file's position (del_angle, nu_value, ...) belongs to;
+        in fourc or twoc, psic's name is the circle that plays it (del_angle: tth)."""
         base = _POSITION_SUFFIX.sub('', str(name).strip()).casefold()
         for circle in self.circles:
             if base == circle or base in _ALIASES.get(circle, ()) or base == self.motor(circle).casefold():
                 return circle
+        for circle, psic in AS_PSIC[self.geometry].items():
+            if base == psic or base in _ALIASES.get(psic, ()):
+                return circle
         return None
 
     def diffractometer(self):
-        """The core Diffractometer preset with these motor names."""
+        """The core Diffractometer preset with these motor names. The fourc and twoc
+        presets put 2θ on rot1 (unvalidated); Stitch never uses them (its arm is psic's)."""
         from xrd_tools.core.geometry import Diffractometer
         m = dict(self.motors)
         if self.geometry == 'psic':
@@ -112,4 +148,4 @@ class InstrumentGeometry:
         return cls(geometry, tuple(chosen))
 
 
-__all__ = ['GEOMETRIES', 'GEOMETRY_LABELS', 'INCIDENCE_CIRCLE', 'InstrumentGeometry']
+__all__ = ['AS_PSIC', 'GEOMETRIES', 'GEOMETRY_LABELS', 'INCIDENCE_CIRCLE', 'InstrumentGeometry']

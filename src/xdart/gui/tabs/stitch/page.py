@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import functools
 import json
 import logging
 import os
@@ -77,19 +78,35 @@ def _parse_pairs(text):
 _POSITION_SUFFIX = re.compile(r"(?:_angle|_value|_deg|_pos|_position)$", re.IGNORECASE)
 
 
-def _goniometer_positions(path) -> tuple[str, ...]:
-    """The positions a pyFAI goniometer JSON declares, or () when it cannot be read."""
+def _goniometer_record(path):
+    """A pyFAI goniometer JSON with valid position names, or None when it cannot be read."""
     try:
         file = Path(str(path or "").strip())
-        if file.suffix.lower() != ".json" or file.stat().st_size > 1 << 20:
-            return ()
-        names = json.loads(file.read_text(encoding="utf-8"))["trans_function"]["pos_names"]
+        state = file.stat()
+        if file.suffix.lower() != ".json" or state.st_size > 1 << 20:
+            return None
+        return _read_goniometer(str(file), state.st_mtime_ns, state.st_size)
+    except OSError:
+        return None
+
+
+@functools.lru_cache(maxsize=4)
+def _read_goniometer(path, _mtime_ns, _size):  # the readiness line asks on every edit
+    try:
+        record = json.loads(Path(path).read_text(encoding="utf-8"))
+        names = record["trans_function"]["pos_names"]
     except (OSError, ValueError, KeyError, TypeError):
-        return ()
+        return None
     if type(names) is not list or not names or any(type(name) is not str or not name.strip()
                                                    for name in names):
-        return ()
-    return tuple(names)
+        return None
+    return record
+
+
+def _goniometer_positions(path) -> tuple[str, ...]:
+    """The positions a pyFAI goniometer JSON declares, or () when it cannot be read."""
+    record = _goniometer_record(path)
+    return () if record is None else tuple(record["trans_function"]["pos_names"])
 
 
 def _parse_references(text):
@@ -402,7 +419,7 @@ class StitchPage(QtWidgets.QWidget):
             ("image_stem", "Image stem", ""),
             ("detector_rows", "Rows", "195"), ("detector_cols", "Columns", "1475"),
             ("raw_dtype", "Data type", "int32"), ("raw_header_skip", "Header bytes", "0"),
-            ("source_motors", "Angle mapping (from Geometry)", "del_angle=del, nu_angle=nu"),
+            ("source_motors", "Angle mapping", "del_angle=del, nu_angle=nu"),
             ("poni_references", "PONI reference", "del=0, nu=0"),
             ("image_rotation", "Rotation (°)", "0"),
             ("frame_start", "First frame", "0"), ("frame_stop", "Last frame", ""),
@@ -420,10 +437,12 @@ class StitchPage(QtWidgets.QWidget):
             "processing and frame selection keep the same name.")
         for key in ("geometry_path", "geometry_kind"):
             self._rows[key].valueChanged.connect(self._sync_goniometer_mapping)
-        self._rows["source_motors"].editor.setReadOnly(True)
+        self._rows["source_motors"].valueChanged.connect(self._mapping_edited)
         self._rows["source_motors"].setToolTip(
-            "Which motor each calibration position reads: it follows the diffractometer and motor "
-            "names under Calibrate ▸ 1 · Geometry (an XU calibration defines its own).")
+            "Which motor each calibration position reads. A position naming a circle (del_angle, "
+            "nu_value; in fourc or twoc, del is the 2θ circle) follows that circle's motor under "
+            "Calibrate ▸ 1 · Geometry, and editing it here renames that motor there. Any other "
+            "position keeps the motor given here. An XU calibration defines its own.")
         frames_card = SubsectionCard("Frames and sample")
         advanced_layout.addWidget(frames_card)
         self._field(frames_card, SectionId.PROCESSING, "frame_check", "Frame check",
@@ -667,6 +686,8 @@ class StitchPage(QtWidgets.QWidget):
         calibration = str(value("geometry_path") or "").strip()
         mask = str(value("mask_path") or "").strip()
         experiment_ready = bool(calibration) and Path(calibration).is_file() and (not mask or Path(mask).is_file())
+        arm_problem = self._arm_problem() if experiment_ready else None
+        experiment_ready = experiment_ready and arm_problem is None
         xu = value("backend") == "xrayutilities histogram"
         self.controls.experiment_card.set_status_text("xrayutilities" if xu else "multigeometry")
         present = bool(sources) and all(path.exists() for path in sources)
@@ -687,7 +708,8 @@ class StitchPage(QtWidgets.QWidget):
             processing_ready = False
         self.controls.processing_card.set_status_text("stitch 1d")
         checks = ((self.controls.project_card, project_ready, "Choose an existing Project folder"),
-                  (self.controls.experiment_card, experiment_ready, "Choose an existing calibration (and mask)"),
+                  (self.controls.experiment_card, experiment_ready,
+                   arm_problem or "Choose an existing calibration (and mask)"),
                   (self.controls.source_card, source_ready, "Choose sources and scans"),
                   (self.controls.processing_card, processing_ready, "Enter the number of points"))
         for card, ready, reason in checks:
@@ -718,29 +740,69 @@ class StitchPage(QtWidgets.QWidget):
 
     def _sync_goniometer_mapping(self, *_args):
         """Bind every position the goniometer JSON declares (Angle mapping, Advanced) to the
-        motor of its circle under Calibrate ▸ Geometry (del_value → the del motor), so a
-        calibration file's position names never have to match the scan's. A position that
-        names no circle keeps its name without its suffix. XU owns its own mapping.
+        motor of its circle under Calibrate ▸ Geometry (del_value → the del motor; in fourc or
+        twoc del is the 2θ circle), so a calibration file's position names never have to match
+        the scan's. A position that names no circle keeps the motor the mapping gives it, else
+        its name without its suffix. PONI + offsets maps the Geometry's arm (del, and nu unless
+        it is a single 2θ arm) with one reference each. XU owns its own mapping.
         """
         if not hasattr(self, "advanced") or self._value("backend") == "xrayutilities histogram":
             return
+        geometry = self._instrument()
+        try:
+            given = dict(_parse_pairs(self._value("source_motors") or ""))
+        except ValueError:
+            given = {}
         if self._value("geometry_kind") == "Goniometer JSON":
             positions = _goniometer_positions(self._value("geometry_path"))
-        else:  # PONI + offsets: the mapping's own positions
-            try:
-                positions = tuple(name for name, _motor in _parse_pairs(self._value("source_motors") or ""))
-            except ValueError:
-                positions = ()
-            positions = positions or ("del_angle", "nu_angle")
+        else:
+            positions = ("del",) if geometry.stitch_arm()[1] is None else ("del", "nu")
+            self._sync_poni_references(positions)
         if not positions:
             return
-        geometry = self._instrument()
         pairs = []
         for name in positions:
             circle = geometry.circle_for_position(name)
-            pairs.append(f"{name}={geometry.motor(circle) if circle else _POSITION_SUFFIX.sub('', name) or name}")
+            motor = geometry.motor(circle) if circle else given.get(name) or _POSITION_SUFFIX.sub("", name) or name
+            pairs.append(f"{name}={motor}")
         if ", ".join(pairs) != self._value("source_motors"):
             self.set_field("source_motors", ", ".join(pairs))
+
+    def _sync_poni_references(self, positions):
+        """PONI + offsets: one reference angle per arm circle (0 unless one is given)."""
+        try:
+            given = dict(_parse_pairs(self._value("poni_references") or ""))
+        except ValueError:
+            given = {}
+        text = ", ".join(f"{name}={given.get(name, '0')}" for name in positions)
+        if text != self._value("poni_references"):
+            self.set_field("poni_references", text)
+
+    def _mapping_edited(self, *_args):
+        """An edited Angle mapping: a circle's position renames that circle's motor under
+        Geometry; any other position keeps the motor given here."""
+        try:
+            pairs = _parse_pairs(self._value("source_motors") or "")
+        except ValueError as error:
+            self._status(str(error), ready=False)
+            return
+        self._adopt_mapping(pairs)
+
+    def _arm_problem(self):
+        """Why the calibration cannot drive the Geometry's detector arm (None when it can):
+        fourc and twoc have one 2θ circle, psic's del on nu."""
+        from xrd_tools.core.geometry.stacked_arm import is_single_arm
+        geometry = self._instrument()
+        if self._value("backend") == "xrayutilities histogram":
+            return (None if geometry.stitch_arm()[1] is not None else
+                    "The xrayutilities backend fits psic's del-on-nu arm; choose psic under Calibrate ▸ "
+                    "1 · Geometry, or the pyFAI MultiGeometry backend for a single 2θ arm.")
+        if self._value("geometry_kind") != "Goniometer JSON":
+            return None  # PONI + offsets maps the Geometry's own arm
+        record = _goniometer_record(self._value("geometry_path"))
+        if record is None:
+            return None  # an unreadable calibration is refused where it is read
+        return geometry.arm_mismatch(record["trans_function"]["pos_names"], single_arm=is_single_arm(record))
 
     def _instrument(self):
         """The diffractometer and motor names: Calibrate ▸ 1 · Geometry (saved with the
@@ -774,7 +836,13 @@ class StitchPage(QtWidgets.QWidget):
         saved = dict(self._calibration_settings or {"fields": {}, "choices": {}})
         saved["instrument_geometry"] = geometry.to_record()
         self._calibration_settings = saved
+        self._instrument_changed()
+
+    def _instrument_changed(self, *_args):
+        """The mapping follows the new geometry, and readiness and any prepared plan are
+        rechecked: the calibration may no longer drive its arm."""
         self._sync_goniometer_mapping()
+        self._edited()
 
     def _adopt_mapping(self, pairs):
         """Explicit position → motor pairs (a loaded form) become the geometry's motors."""
@@ -842,6 +910,9 @@ class StitchPage(QtWidgets.QWidget):
             self.set_field(key, picks[0])
 
     def build_form(self):
+        problem = self._arm_problem()  # Run and Preview never stitch another instrument's arm
+        if problem:
+            raise ValueError(problem)
         value = self._value
         kind = (StitchGeometryKind.PYFAI_GONIOMETER_JSON if value("geometry_kind") == "Goniometer JSON"
                 else StitchGeometryKind.PONI)
@@ -1297,17 +1368,14 @@ class StitchPage(QtWidgets.QWidget):
                 if saved:
                     self._calibration_dialog.apply_settings(saved)
                 self._calibration_dialog.set_instrument(geometry)
-                self._calibration_dialog.geometryChanged.connect(self._sync_goniometer_mapping)
+                self._calibration_dialog.geometryChanged.connect(self._instrument_changed)
                 unconfigured = not (saved.get("fields") or {}).get("source")
                 self._calibration_project, self._calibration_backend = project, backend
                 self._calibration_dialog.calibrationSaved.connect(self._adopt_calibration)
                 self._authoring_dialogs.append(self._calibration_dialog)
             source = self._source_spec_for_tools() if unconfigured else None
-            if source is not None:
-                geometry = self._instrument()
+            if source is not None:  # the window names the motors from the geometry it was given
                 self._calibration_dialog.set_source_context(source, image_rotation=int(self._value("image_rotation") or 0),
-                    del_motor=geometry.motor("del") if "del" in geometry.circles else "del",
-                    nu_motor=geometry.motor("nu") if "nu" in geometry.circles else "nu",
                     geometry_path=(self._value("geometry_path") or None
                                    if self._value("geometry_kind") == "Goniometer JSON" else None))
             self._calibration_dialog.show()
@@ -1324,7 +1392,15 @@ class StitchPage(QtWidgets.QWidget):
         self.set_field("geometry_kind", "Goniometer JSON")
         self.set_field("geometry_path", path)
         dialog = self._calibration_dialog
-        if dialog is not None:  # the mapping follows the geometry (synced with the new file)
+        if dialog is not None:  # the fit's own instrument and motors, as saved with it
+            from xrd_tools.session.instrument import InstrumentGeometry
+            try:
+                fitted = InstrumentGeometry.from_record(dialog.saved_instrument_geometry)
+            except (ValueError, TypeError):
+                fitted = None
+            if fitted is not None and fitted != self._instrument():
+                self._set_instrument(fitted)
+            self._adopt_mapping(tuple(dialog.saved_source_motors.items()))
             self._sync_goniometer_mapping()
             self.set_field("image_rotation", dialog.saved_image_rotation)
 

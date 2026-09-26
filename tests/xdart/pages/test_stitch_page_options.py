@@ -142,7 +142,6 @@ def test_the_angle_mapping_follows_the_geometry_not_the_files_position_names(qap
     values.write_text(json.dumps({"trans_function": {"pos_names": ["del_value", "nu_value"]}}))
     page = StitchPage(empty_host_services(_Status()))
     try:
-        assert page._rows["source_motors"].editor.isReadOnly()  # derived, set under Geometry
         page.set_field("geometry_path", str(values))
         assert page._value("source_motors") == "del_value=del, nu_value=nu"
         # the beamline calls del "delta": set once on the circle, every file maps to it
@@ -164,6 +163,106 @@ def test_the_angle_mapping_follows_the_geometry_not_the_files_position_names(qap
             assert (restored._instrument().motor("del"), restored._instrument().motor("nu")) == ("tth2", "gam")
         finally:
             _close(restored, qapp)
+    finally:
+        _close(page, qapp)
+
+
+def _edit_mapping(page, text):
+    """As the user does: type in the Angle mapping and leave the box."""
+    editor = page._rows["source_motors"].editor
+    editor.setText(text)
+    editor.editingFinished.emit()
+
+
+def test_a_custom_position_keeps_its_explicit_motor(qapp, tmp_path):
+    # Codex round 11 F2: a calibration's own position names, bound explicitly
+    import json
+    from pathlib import Path
+    from xrd_tools.session.instrument import InstrumentGeometry
+
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    record = json.loads(Path(form.geometry_path).read_text())
+    record["pos_names"] = record["trans_function"]["pos_names"] = ["dval", "nval"]
+    record["trans_function"].update(rot1_expr="rot1_scale * nval + rot1_offset",
+                                    rot2_expr="rot2_scale * dval + rot2_offset")
+    custom = tmp_path / "custom.json"
+    custom.write_text(json.dumps(record))
+    form = replace(form, geometry_path=custom, source_motors=(("dval", "del"), ("nval", "nu")))
+    assert prepare_stitch_tool(form).request is not None  # the headless owner admits it
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(form)
+        assert page._value("source_motors") == "dval=del, nval=nu"
+        assert page.build_form().source_motors == (("dval", "del"), ("nval", "nu"))
+        assert prepare_stitch_tool(page.build_form()).request is not None
+        page._set_instrument(InstrumentGeometry("psic", (("del", "delta"),)))  # names neither position
+        assert page._value("source_motors") == "dval=del, nval=nu"
+        restored = StitchPage(empty_host_services(_Status()))
+        try:
+            restored.apply_settings(page.settings())
+            assert restored._value("source_motors") == "dval=del, nval=nu"
+        finally:
+            _close(restored, qapp)
+        # editable: a custom position's motor is set here; a circle's renames it under Geometry
+        assert not page._rows["source_motors"].editor.isReadOnly()
+        _edit_mapping(page, "dval=del, nval=nu2")
+        assert page._value("source_motors") == "dval=del, nval=nu2"
+        page.set_field("geometry_path", str(tmp_path / "source" / "geometry.json"))  # del/nu positions
+        assert page._value("source_motors") == "del_angle=delta, nu_angle=nu"
+        _edit_mapping(page, "del_angle=tth9, nu_angle=nu")
+        assert page._instrument().motor("del") == "tth9"
+        assert page._value("source_motors") == "del_angle=tth9, nu_angle=nu"
+    finally:
+        _close(page, qapp)
+
+
+def test_the_calibration_must_drive_the_geometrys_arm(qapp, tmp_path):
+    # Codex round 11 F3: choosing fourc must not stitch with psic's del-on-nu calibration
+    import json
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.geometry import DetectorCalibration
+    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
+    from xrd_tools.session.instrument import InstrumentGeometry
+
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(form)
+        assert page._readiness[1], page._readiness
+        page._calibrate()  # through the window, as a user chooses the geometry
+        editor = page._calibration_dialog.geometry_editor
+        editor.geometry.setCurrentIndex(editor.geometry.findData("fourc"))
+        editor.motor_edit("tth").setText("del")
+        page._calibration_dialog.hide()
+        assert not page._readiness[1] and "fourc has one detector circle" in page._readiness[0]
+        assert not page.run_bar.startButton.isEnabled()
+        with pytest.raises(ValueError, match="one detector circle"):
+            page.build_form()
+        page.begin_run()  # refused before anything is written
+        assert not list((tmp_path / "output").glob("*.nexus"))
+        # the same detector calibrated as fourc's 2θ arm: del is its motor, nu is never read
+        calibration = DetectorCalibration(PONI(dist=.2, poni1=.01677, poni2=.04188, wavelength=1e-10,
+                                               detector="Pilatus100k"), detector_config={"orientation": 3})
+        single = tmp_path / "single.json"
+        single.write_text(json.dumps(StackedDetectorArm(nu_motor=None, del_motor="tth")
+                                     .to_pyfai_goniometer(calibration)))
+        page.set_field("geometry_path", str(single))
+        assert page._value("source_motors") == "del_angle=del"
+        assert page._readiness[1], page._readiness
+        request = prepare_stitch_tool(page.build_form()).request
+        assert {name for item in request.manifest.contributions for name, _o, _v in item.values} == {"del"}
+        page._set_instrument(InstrumentGeometry("psic"))  # psic's nu moves
+        assert not page._readiness[1] and "nu held at zero" in page._readiness[0]
+        # PONI + offsets maps the Geometry's own arm, with one reference per circle
+        page.set_field("geometry_kind", "PONI + offsets")
+        assert (page._value("source_motors"), page._value("poni_references")) == ("del=del, nu=nu", "del=0, nu=0")
+        page.set_field("poni_references", "del=12.5, nu=0")
+        page._set_instrument(InstrumentGeometry("twoc", (("tth", "del"),)))
+        assert (page._value("source_motors"), page._value("poni_references")) == ("del=del", "del=12.5")
+        # xrayutilities fits psic's arm only (its single arm comes with the XU calibration work)
+        page.set_field("geometry_kind", "Goniometer JSON")
+        page.set_field("backend", "xrayutilities histogram")
+        assert not page._readiness[1] and "xrayutilities backend" in page._readiness[0]
     finally:
         _close(page, qapp)
 
