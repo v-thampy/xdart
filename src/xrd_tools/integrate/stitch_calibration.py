@@ -523,6 +523,9 @@ def _fit_xu(frames, loaded, del_motor, nu_motor, distance_seed_m, distance_bound
     from xrd_tools.core.energy import wavelength_m_to_energy_eV
     base = loaded[0][2]
     detector = detector_factory(base.poni.detector, config=dict(base.detector_config))
+    if int(dict(base.detector_config).get('orientation', 3)) != 3:  # the SURFACE camera assumes it
+        raise ValueError("the xrayutilities model takes pyFAI's default detector orientation (3); fit "
+                         'this calibration with pyFAI MultiGeometry')
     if detector.sensor is not None or base.parallax is True or not detector.IS_FLAT or not detector.uniform_pixel:
         raise ValueError('authored SURFACE calibration requires a flat uniform detector without sensor/parallax')
     shape = frames[0].shape

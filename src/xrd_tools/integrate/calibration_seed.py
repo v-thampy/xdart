@@ -10,6 +10,7 @@ the rings; the same prediction lists which calibrant rings reach the detector.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import json
 import math
 from pathlib import Path
@@ -93,8 +94,49 @@ def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_m
     return FrameSeed(integrator, expected_rings(integrator, calibrant, frame.shape))
 
 
+#: Listed first, in this order; then every other pyFAI detector by name.
+_PREFERRED_DETECTORS = ('Pilatus100k', 'Pilatus300kw', 'Eiger1M', 'Eiger2_500k', 'Eiger4M',
+                        'RayonixMx225', 'RayonixMx300')
+_DETECTOR_LABELS = {'RayonixMx225': 'MarCCD 225 / Rayonix MX225', 'RayonixMx300': 'Rayonix MX300'}
+
+#: pyFAI's detector orientations it supports (EXIF codes); 3 is its default.
+DETECTOR_ORIENTATIONS = ((3, 'BottomRight (pyFAI default)'), (1, 'TopLeft'), (2, 'TopRight'),
+                         (4, 'BottomLeft'))
+
+
+@lru_cache(maxsize=1)
+def detector_choices() -> tuple[tuple[str, str], ...]:
+    """pyFAI's detectors as (label, factory name): the common ones first, then the rest by label.
+    Only detectors built from their name alone are listed (not the generic pixel-size one)."""
+    from pyFAI.detectors import ALL_DETECTORS, detector_factory
+    labels = {}
+    for cls in set(ALL_DETECTORS.values()):
+        name = cls.__name__
+        try:
+            detector = detector_factory(name)
+        except Exception:
+            continue
+        if detector.shape is None or not detector.pixel1 or not detector.pixel2:
+            continue
+        labels[name] = _DETECTOR_LABELS.get(name, (getattr(cls, 'aliases', None) or [name])[0])
+    first = [(labels[name], name) for name in _PREFERRED_DETECTORS if name in labels]
+    rest = sorted(((label, name) for name, label in labels.items() if name not in _PREFERRED_DETECTORS),
+                  key=lambda item: item[0].casefold())
+    return tuple(first + rest)
+
+
+def detector_shape(detector) -> tuple[int, int] | None:
+    """The detector's (rows, columns), or None for a name pyFAI does not know."""
+    from pyFAI.detectors import detector_factory
+    try:
+        rows, columns = detector_factory(detector).shape
+        return int(rows), int(columns)
+    except Exception:
+        return None
+
+
 def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='del',
-                     del_motor='del', nu_motor='nu', wavelength_m=1e-10) -> dict:
+                     del_motor='del', nu_motor='nu', wavelength_m=1e-10, orientation=3) -> dict:
     """A nominal stacked (del-on-nu) arm from a rough distance, for a new setup.
 
     At normal incidence (``zero_motor`` at ``zero_deg``, the other angle at 0) the direct
@@ -102,7 +144,9 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
     from the sample; the angles move the detector as a del-on-nu arm, one degree per
     degree. Good enough to predict which rings a frame shows; the fit refines it.
     ``nu_motor=None`` or ``del_motor=None`` is a single arm (a fourc/twoc 2θ): that
-    circle is held at zero.
+    circle is held at zero. ``orientation`` is pyFAI's detector orientation; the PONI is
+    the pixel's centre for each of them, and a non-default one travels in the detector
+    config (the seed PONI pyFAI opens with, and so its saved PONIs).
     """
     from pyFAI.detectors import detector_factory
     from xrd_tools.core.containers import PONI
@@ -110,7 +154,8 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
     from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
     if not math.isfinite(float(distance_m)) or float(distance_m) <= 0:
         raise ValueError('the rough distance must be a positive number')
-    pixels = detector_factory(detector)
+    config = {} if int(orientation) == 3 else {'orientation': int(orientation)}
+    pixels = detector_factory(detector, config=config or None)
     x, y = (float(value) for value in beam_px)
     present = tuple(motor for motor in (del_motor, nu_motor) if motor is not None)
     if zero_motor is None or zero_motor not in present:
@@ -120,7 +165,7 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
     poni = PONI(dist=float(distance_m), poni1=(y + .5) * pixels.pixel1, poni2=(x + .5) * pixels.pixel2,
                 wavelength=float(wavelength_m), detector=str(detector))
     arm = StackedDetectorArm(nu_motor=nu_motor, del_motor=del_motor, **offset)
-    return arm.to_pyfai_goniometer(DetectorCalibration(poni=poni))
+    return arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
 
 
 def write_seed_poni(seed: FrameSeed, path, *, calibrant='LaB6') -> Path:

@@ -14,7 +14,9 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from xdart.gui.pages.operation_owner import SingleWorkerOwner, OperationCancelled, OperationTerminalStatus
 from xdart.gui.widgets.controls_panel import ControlsComboBox, browse_button
 from xrd_tools.core.scan import SourceKind, SourceSpec
-from xrd_tools.integrate.calibration_seed import ring_summary, rough_arm_record
+from xrd_tools.integrate.calibration_seed import (
+    DETECTOR_ORIENTATIONS, detector_choices, detector_shape, ring_summary, rough_arm_record,
+)
 from xrd_tools.session.instrument import InstrumentGeometry
 from xrd_tools.integrate.stitch_calibration import (
     adopt_calibration_pair, capture_calibration_frames, fit_calibration, scan_motor_names,
@@ -325,6 +327,14 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._tip(tip, combo, form.labelForField(combo))
         return combo
 
+    def _choice(self, form, key, label, items, default, *, tip=''):
+        """A Controls combo read and saved like a text field (its data: a factory name, a code)."""
+        combo = self._combo(form, label, items, tip=tip)
+        self._fields[key] = combo
+        self._rows[key] = (form, combo)
+        self._set_field_text(key, default)
+        return combo
+
     def _edit(self, form, key, label, default='', *, chooser=None, tip='', placeholder=''):
         """One text field, with the Controls 📁 button when ``chooser`` names a file filter or 'directory'."""
         edit = QtWidgets.QLineEdit(str(default))
@@ -401,7 +411,17 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             edit.setText(picks[0])
 
     def _set_field_text(self, key, value):
-        self._fields[key].setText(str(value))
+        field, value = self._fields[key], str(value)
+        if isinstance(field, QtWidgets.QComboBox):
+            index = next((row for row in range(field.count())
+                          if value.casefold() in (str(field.itemData(row)).casefold(), field.itemText(row).casefold())), -1)
+            if index < 0 and value:  # a name this pyFAI lists differently, or no longer: kept, not lost
+                field.addItem(value, value)
+                index = field.count() - 1
+            if index >= 0:
+                field.setCurrentIndex(index)
+            return
+        field.setText(value)
 
     _SCAN_TIP = 'The SPEC scan number, e.g. 14 (or 14.1 for a repeated number).'
     _FOLDER_TIP = "The folder holding this scan's image files. Blank: the SPEC file's folder."
@@ -669,8 +689,14 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                    placeholder='column, row — e.g. 737, 97',
                    tip='Column, row of the pixel the direct beam hits with the detector facing it squarely (the '
                        'motor at the zero above), in the image as displayed. Rough is fine.')
-        self._edit(form, 'beam_detector', 'Detector factory name', 'Pilatus300kw',
-                   tip='The detector model; it sets the pixel size and shape.')
+        self._choice(form, 'beam_detector', 'Detector', [(label, name) for label, name in detector_choices()],
+                     'Pilatus300kw', tip='The detector model (pyFAI); it sets the pixel size and shape.')
+        self._choice(form, 'beam_orientation', 'Detector orientation',
+                     [(f'{code} · {name}', code) for code, name in DETECTOR_ORIENTATIONS], 3,
+                     tip='pyFAI\'s detector orientation: which corner its first pixel is in, seen from the '
+                         'sample. Keep 3, pyFAI\'s default, unless pyFAI shows this detector\'s images '
+                         'mirrored; it is saved with every PONI and fit. (The image rotation under Select '
+                         'frames is separate: it turns the image arrays.)')
         self.motion = self._combo(form, 'Beam motion', [('horizontal', None), ('vertical', None)],
                                   tip='The direction the beam spot moves across the image as the motor turns.')
         self._edit(form, 'beam_strip', 'Strip half width (pixels)', '2',
@@ -699,8 +725,11 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         layout.addWidget(self.apply_distance_button)
         layout.addStretch(1)
         self.rough_mode.currentIndexChanged.connect(self._sync_rough_rows)
-        for key in ('rough_distance', 'beam_pixel', 'beam_zero', 'beam_motor', 'beam_detector'):
+        for key in ('rough_distance', 'beam_pixel', 'beam_zero', 'beam_motor'):
             self._fields[key].editingFinished.connect(self._render_frames)
+        for key in ('beam_detector', 'beam_orientation'):
+            self._fields[key].currentIndexChanged.connect(self._render_frames)
+        self._fields['beam_detector'].currentIndexChanged.connect(self._detector_chosen)
 
     _ROUGH_NOTES = {
         'scan': 'A direct-beam scan: SPEC supplies the angles for an image series or an Eiger/NeXus container; '
@@ -712,7 +741,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         'skip': 'No rough geometry: each frame\'s rings are predicted from a calibration file (Fit and save · Seed '
                 'geometry JSON), or from this session\'s fit once three frames are saved.',
     }
-    _GEOMETRY_ROWS = ('beam_motor', 'beam_zero', 'beam_pixel', 'beam_detector')
+    _GEOMETRY_ROWS = ('beam_motor', 'beam_zero', 'beam_pixel', 'beam_detector', 'beam_orientation')
+
+    def _detector_chosen(self, *_args):
+        """The chosen detector's shape becomes the RAW reader's rows and columns (Select frames)."""
+        shape = detector_shape(self._text('beam_detector'))
+        if shape is not None and 'shape' in self._fields:
+            self._fields['shape'].setText(f'{shape[0]}, {shape[1]}')
 
     def _sync_rough_rows(self, *_args):
         """Every Geometry row's visibility, from the rough mode and the direct-beam source together."""
@@ -751,7 +786,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 distance_m=distance, detector=self._text('beam_detector'),
                 beam_px=tuple(float(v) for v in self._text('beam_pixel').split(',')),
                 zero_deg=float(self._text('beam_zero') or 0), zero_motor=zero,
-                del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1])
+                del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1],
+                orientation=int(self._text('beam_orientation')))
         except (ValueError, TypeError, KeyError, RuntimeError):
             return None
 
@@ -843,7 +879,11 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._sync_arm_model()
 
     def _text(self, key):
-        return self._fields[key].text().strip()
+        field = self._fields[key]
+        if isinstance(field, QtWidgets.QComboBox):
+            data = field.currentData()
+            return str(field.currentText() if data is None else data).strip()
+        return field.text().strip()
 
     def _reader(self):
         return {'detector_shape': tuple(int(v) for v in self._text('shape').split(',')),
@@ -1097,7 +1137,11 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _distance(self):
         def go():
+            if not self._text('beam_pixel'):
+                raise ValueError('Enter the approximate beam pixel (column, row) under 1 · Geometry.')
+            orientation = int(self._text('beam_orientation'))
             options = dict(detector=self._text('beam_detector'),
+                detector_config={'orientation': orientation} if orientation != 3 else None,
                 beam_pixel=tuple(float(v) for v in self._text('beam_pixel').split(',')),
                 motion=self.motion.currentText(), strip_half_width=int(self._text('beam_strip')),
                 model='tangent', angle_zero_deg=float(self._text('beam_zero')),

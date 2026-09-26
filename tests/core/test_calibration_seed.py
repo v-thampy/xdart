@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from xrd_tools.integrate.calibration_seed import (
-    expected_rings, predict_frame_seed, ring_summary, write_seed_poni,
+    expected_rings, predict_frame_seed, ring_summary, rough_arm_record, write_seed_poni,
 )
 from xrd_tools.integrate.stitch_calibration import CalibrationFrame
 
@@ -82,3 +82,35 @@ def test_the_old_calibration_predicts_the_rings_of_the_fitted_first_frame():
     seed = predict_frame_seed(calibration, _frame({'del': 5., 'nu': -10.}))
     assert [ring.number for ring in seed.rings] == [1, 2, 3]
     assert [round(ring.two_theta_deg, 2) for ring in seed.rings] == [10.07, 14.25, 17.48]
+
+
+def test_detector_choices_list_the_common_detectors_first_and_every_one_builds():
+    from pyFAI.detectors import detector_factory
+    from xrd_tools.integrate.calibration_seed import detector_choices, detector_shape
+    choices = detector_choices()
+    names = [name for _label, name in choices]
+    assert names[:7] == ['Pilatus100k', 'Pilatus300kw', 'Eiger1M', 'Eiger2_500k', 'Eiger4M',
+                         'RayonixMx225', 'RayonixMx300']
+    assert choices[5][0] == 'MarCCD 225 / Rayonix MX225' and len(set(names)) == len(names) > 7
+    assert 'Detector' not in names  # the generic one needs pixel sizes, not a name
+    assert all(detector_factory(name).shape is not None for name in names)
+    rest = [label.casefold() for label, _name in choices[7:]]
+    assert rest == sorted(rest)
+    assert detector_shape('Pilatus100k') == (195, 487) and detector_shape('no such detector') is None
+
+
+@pytest.mark.parametrize('orientation', [3, 2])
+def test_the_detector_orientation_reaches_the_seed_pyfai_opens(tmp_path, orientation):
+    from pyFAI.io.ponifile import PoniFile
+    from xrd_tools.integrate.calibration_seed import write_seed_poni
+    record = rough_arm_record(distance_m=.4, detector='Pilatus300kw', beam_px=(737, 97),
+                              orientation=orientation)
+    # the default leaves the record as it was; another orientation travels in the detector config
+    assert record['detector_config'] == ({} if orientation == 3 else {'orientation': orientation})
+    seed = predict_frame_seed(record, _frame({'del': 0., 'nu': 0.}))
+    assert int(seed.integrator.detector.orientation) == orientation
+    poni = PoniFile(str(write_seed_poni(seed, tmp_path / 'seed.poni')))
+    assert int(poni.detector.orientation) == orientation
+    # the beam pixel is where the direct beam hits at normal incidence, in every orientation
+    beam = seed.integrator.tth(np.array([97]), np.array([737]))
+    assert float(beam[0]) == pytest.approx(0, abs=1e-12)

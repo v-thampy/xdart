@@ -22,7 +22,7 @@ def _digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _frames(tmp_path, controls, poni, shape=(195, 1475)):
+def _frames(tmp_path, controls, poni, shape=(195, 1475), orientation=3):
     from pyFAI.control_points import ControlPoints
     from pyFAI.calibrant import get_calibrant
     from pyFAI.detectors import detector_factory
@@ -42,7 +42,7 @@ def _frames(tmp_path, controls, poni, shape=(195, 1475)):
         seed = directory / 'frame.poni'
         AzimuthalIntegrator(dist=poni.dist, poni1=poni.poni1, poni2=poni.poni2,
             rot1=poni.rot1, rot2=poni.rot2, rot3=poni.rot3, wavelength=poni.wavelength,
-            detector=detector_factory('Pilatus300kw', config={'orientation':3})).save(str(seed))
+            detector=detector_factory('Pilatus300kw', config={'orientation': orientation})).save(str(seed))
         frame = CalibrationFrame(str(index), str(image), 'image_file', {}, index,
             str(image), 0, str(image), _digest(image), shape, 0, dict(control.motors), None)
         frames.append(adopt_calibration_pair(frame, seed, npt))
@@ -207,6 +207,10 @@ def test_xu_notebook_fit_and_authored_admission_preserve_v1(tmp_path, energy_eV)
     fit = fit_calibration(frames, backend='xu_hist', distance_bounds_m=(.38,.40),
                           domain={'del':[0.,50.], 'nu':[-15.,30.]})
     assert fit.rms_q < .002
+    (tmp_path / 'turned').mkdir()  # PONIs in another pyFAI detector orientation: refused, not ignored
+    with pytest.raises(ValueError, match='default detector orientation'):
+        fit_calibration(_frames(tmp_path / 'turned', controls, poni, orientation=2), backend='xu_hist',
+                        distance_bounds_m=(.38, .40))
     path = save_calibration_fit(fit, tmp_path/'xu.json')
     receipt = capture_xu_stitch_calibration(XuStitchCalibrationInput(path), project_root=tmp_path)
     assert receipt.projection.value['version'] == 2

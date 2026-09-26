@@ -240,7 +240,7 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     dialog._render_frames()
     assert dialog.frame_table.item(0, 5).text() == '—'  # no distance typed yet
     for key, value in (('rough_distance', '500'), ('beam_pixel', '737, 97'), ('beam_detector', 'Pilatus300kw')):
-        dialog._fields[key].setText(value)
+        dialog._set_field_text(key, value)
     dialog._fields['refine_seed_path'].setText(str(_record(tmp_path)))  # a calibration file too
     dialog._render_frames()
     assert dialog.frame_table.item(0, 5).toolTip().startswith('Ring ')
@@ -320,7 +320,7 @@ def test_a_twoc_scan_is_read_and_staged_as_one_2theta_arm(tmp_path):
         # the direct-beam zero "del" names twoc's 2θ: the rough geometry is a single arm
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         for key, value in (('rough_distance', '500'), ('beam_pixel', '3, 2'), ('beam_detector', 'Pilatus300kw')):
-            dialog._fields[key].setText(value)
+            dialog._set_field_text(key, value)
         assert dialog._text('beam_motor') == 'del' and is_single_arm(dialog._rough_record())
         # renaming the 2θ motor after staging: the frames read tth, so Fit refuses
         dialog.set_instrument(InstrumentGeometry('twoc', (('tth', 'ttheta'),)))
@@ -364,7 +364,7 @@ def test_a_horizontal_twoc_scan_is_staged_and_resumed_as_nu(tmp_path, monkeypatc
         # the direct-beam default "del" means the arm's one circle: the rough geometry holds del
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         for key, value in (('rough_distance', '500'), ('beam_pixel', '3, 2'), ('beam_detector', 'Pilatus300kw')):
-            dialog._fields[key].setText(value)
+            dialog._set_field_text(key, value)
         rough = dialog._rough_record()
         assert dialog._text('beam_motor') == 'del' and is_single_arm(rough) and rough['pos_names'] == ['nu_angle']
         # the same motor name, resumed in a window set to the vertical plane: the session keeps its plane
@@ -525,3 +525,31 @@ def test_direct_beam_container_job_refuses_count_mismatch_and_honours_cancel(tmp
     cancelled = Event(); cancelled.set()
     with pytest.raises(OperationCancelled):
         _run_job(('distance', (source, 'del', options)), cancelled, lambda *_: None)
+
+
+def test_the_detector_and_its_orientation_are_choices_saved_with_the_settings(tmp_path):
+    from pyqtgraph.Qt import QtWidgets
+    dialog = StitchCalibrationDialog(tmp_path)
+    again = StitchCalibrationDialog(tmp_path)
+    try:
+        detector, orientation = dialog._fields['beam_detector'], dialog._fields['beam_orientation']
+        assert isinstance(detector, QtWidgets.QComboBox) and isinstance(orientation, QtWidgets.QComboBox)
+        assert [detector.itemData(row) for row in range(3)] == ['Pilatus100k', 'Pilatus300kw', 'Eiger1M']
+        assert dialog._text('beam_detector') == 'Pilatus300kw' and dialog._text('beam_orientation') == '3'
+        dialog._set_field_text('beam_detector', 'Pilatus100k')
+        assert dialog._text('shape') == '195, 487'  # the RAW reader follows the detector
+        dialog._set_field_text('beam_orientation', '2')
+        for key, value in (('rough_distance', '400'), ('beam_pixel', '240, 97')):
+            dialog._set_field_text(key, value)
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        assert dialog._rough_record()['detector_config'] == {'orientation': 2}
+        again.apply_settings(dialog.settings())
+        assert (again._text('beam_detector'), again._text('beam_orientation')) == ('Pilatus100k', '2')
+        assert again._text('shape') == '195, 487'
+        saved = dialog.settings()
+        saved['fields']['beam_detector'] = 'SomeFutureDetector'  # a name this pyFAI does not list
+        again.apply_settings(saved)
+        assert again._text('beam_detector') == 'SomeFutureDetector'  # kept, not replaced
+    finally:
+        dialog.close()
+        again.close()
