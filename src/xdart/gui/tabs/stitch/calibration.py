@@ -267,7 +267,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._build_source()
         self._build_frames()
         self._build_fit(backend)
-        self._rough_mode_changed()
+        self._sync_rough_rows()
         self.status = QtWidgets.QLabel('Ready. Three to five frames are suggested; angle coverage and fit diagnostics determine sufficiency.')
         self.status.setWordWrap(True)
         outer.addWidget(self.status)
@@ -502,14 +502,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                              ('NeXus images + metadata', 'nexus')]:
             self.beam_source_kind.addItem(label, value)
         form.addRow('Source', self.beam_source_kind)
-        self._edit(form, 'beam_source', 'Direct-beam scan file', chooser='All files (*)')
+        self._edit(form, 'beam_source', 'SPEC file', chooser='All files (*)')
         self._edit(form, 'beam_scan', 'SPEC scan', '1')
         self._edit(form, 'beam_image_file', 'Eiger / NeXus images', chooser='HDF5 / NeXus (*.h5 *.hdf5 *.nxs *.nexus);;All files (*)')
         self._edit(form, 'beam_images', 'SPEC images directory', chooser='directory')
         self._edit(form, 'beam_stem', 'Image filename stem', '')
         self._edit(form, 'beam_entry', 'NeXus entry', 'entry')
-        self.beam_source_kind.currentIndexChanged.connect(self._beam_source_changed)
-        self._beam_source_changed()
+        self.beam_source_kind.currentIndexChanged.connect(self._sync_rough_rows)
         self._edit(form, 'beam_motor', 'Two-theta motor (degrees)', 'del')
         self._edit(form, 'beam_zero', 'Known normal-incidence zero (degrees)', '0')
         self._edit(form, 'beam_pixel', 'Approximate beam pixel x, y (oriented image)', '200, 100')
@@ -530,12 +529,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.beam_summary = QtWidgets.QPlainTextEdit()
         self.beam_summary.setReadOnly(True)
         layout.addWidget(self.beam_summary, 1)
-        self.compatible = QtWidgets.QCheckBox('I confirm this is the same detector plane and orientation as the powder calibration')
-        layout.addWidget(self.compatible)
         self.apply_distance_button = QtWidgets.QPushButton('Use result as distance seed')
         self.apply_distance_button.clicked.connect(self._apply_distance)
         layout.addWidget(self.apply_distance_button)
-        self.rough_mode.currentIndexChanged.connect(self._rough_mode_changed)
+        self.rough_mode.currentIndexChanged.connect(self._sync_rough_rows)
         for key in ('rough_distance', 'beam_pixel', 'beam_zero', 'beam_motor', 'beam_detector'):
             self._fields[key].editingFinished.connect(self._render_frames)
 
@@ -549,26 +546,27 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         'skip': 'No rough geometry: each frame\'s rings are predicted from a calibration file (Fit and save · Seed '
                 'geometry JSON), or from this session\'s fit once three frames are saved.',
     }
-    _SCAN_ROWS = ('beam_source', 'beam_scan', 'beam_image_file', 'beam_images', 'beam_stem', 'beam_entry',
-                  'beam_strip', 'beam_roi', 'beam_mask', 'beam_saturation')
     _GEOMETRY_ROWS = ('beam_motor', 'beam_zero', 'beam_pixel', 'beam_detector')
 
-    def _rough_mode_changed(self, *_args):
-        mode = self.rough_mode.currentData()
+    def _sync_rough_rows(self, *_args):
+        """Every Geometry row's visibility, from the rough mode and the direct-beam source together."""
+        mode, kind = self.rough_mode.currentData(), self.beam_source_kind.currentData()
+        scan = mode == 'scan'
+        visible = {'rough_distance': mode == 'manual', 'beam_source': scan,
+                   'beam_scan': scan and kind != 'nexus', 'beam_image_file': scan and kind == 'spec_container',
+                   'beam_images': scan and kind == 'spec_series', 'beam_stem': scan and kind == 'spec_series',
+                   'beam_entry': scan and kind != 'spec_series',
+                   **dict.fromkeys(('beam_strip', 'beam_roi', 'beam_mask', 'beam_saturation'), scan),
+                   **dict.fromkeys(self._GEOMETRY_ROWS, mode != 'skip')}
         form = self._beam_form
-        form.setRowVisible(self.beam_source_kind, mode == 'scan')
-        form.setRowVisible(self.motion, mode == 'scan')
-        form.setRowVisible(self._fields['rough_distance'], mode == 'manual')
-        for key in self._GEOMETRY_ROWS:
-            form.setRowVisible(self._path_rows.get(key, self._fields[key]), mode != 'skip')
-        for widget in (self.beam_button, self.beam_summary, self.compatible, self.apply_distance_button):
-            widget.setVisible(mode == 'scan')
+        for key, shown in visible.items():
+            form.setRowVisible(self._path_rows.get(key, self._fields[key]), shown)
+        form.setRowVisible(self.beam_source_kind, scan)
+        form.setRowVisible(self.motion, scan)
+        for widget in (self.beam_button, self.beam_summary, self.apply_distance_button):
+            widget.setVisible(scan)
+        self._path_rows['beam_source'].label.setText('NeXus file' if kind == 'nexus' else 'SPEC file')
         self.rough_note.setText(self._ROUGH_NOTES[mode])
-        if mode == 'scan':
-            self._beam_source_changed()
-        else:
-            for key in self._SCAN_ROWS:
-                form.setRowVisible(self._path_rows.get(key, self._fields[key]), False)
         if hasattr(self, 'frame_table'):
             self._render_frames()
 
@@ -599,17 +597,6 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         if role is None and None in geometry.stitch_arm():
             role = 'del' if geometry.stitch_arm()[0] else 'nu'
         return role
-
-    def _beam_source_changed(self):
-        if self.rough_mode.currentData() != 'scan':
-            return
-        kind = self.beam_source_kind.currentData()
-        for key, visible in [('beam_scan', kind != 'nexus'),
-                             ('beam_image_file', kind == 'spec_container'),
-                             ('beam_images', kind == 'spec_series'),
-                             ('beam_stem', kind == 'spec_series'),
-                             ('beam_entry', kind != 'spec_series')]:
-            self._beam_form.setRowVisible(self._path_rows.get(key, self._fields[key]), visible)
 
     def set_source_context(self, source: SourceSpec, *, image_rotation=0, del_motor=None, nu_motor=None,
                            geometry_path=None):
@@ -964,8 +951,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._guard(go)
 
     def _apply_distance(self):
-        if self._distance_result is None or not self.compatible.isChecked():
-            self.status.setText('Fit a direct-beam scan and confirm compatible detector geometry first.')
+        if self._distance_result is None:
+            self.status.setText('Fit a direct-beam scan first.')
             return
         result = self._distance_result
         self._fields['distance_seed'].setText(f'{result.distance_mm:.12g}')
@@ -979,8 +966,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             used=result.used.tolist(), rejection_reasons=list(result.rejection_reasons),
             centres_px=[float(v) if math.isfinite(v) else None for v in result.centres_px],
             residuals_px=[float(v) if math.isfinite(v) else None for v in result.residuals_px],
-            uncertainty_policy='conditional_regression_standard_error_not_total_accuracy',
-            compatibility_confirmed=True)
+            uncertainty_policy='conditional_regression_standard_error_not_total_accuracy')
         self._show_tab('fit')
 
     def _select_next_frame(self, saved):

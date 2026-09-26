@@ -230,6 +230,10 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     assert visible('beam_source') and not visible('rough_distance')  # a direct-beam scan by default
     dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
     assert visible('rough_distance') and visible('beam_pixel') and not visible('beam_source')
+    dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('scan'))  # and back: every scan row returns
+    assert all(visible(key) for key in ('beam_source', 'beam_scan', 'beam_images', 'beam_stem', 'beam_strip',
+                                        'beam_roi', 'beam_mask', 'beam_saturation'))
+    dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
     folder = tmp_path / 'frame-20'
     folder.mkdir()
     dialog.frames = (replace(_frame({'del': 20., 'nu': 0.}), identity='frame-20',
@@ -442,10 +446,7 @@ def test_direct_beam_window_handoff_uses_actual_api_and_seed_not_bounds(tmp_path
     assert result.point_ids == tuple(('1.1', index) for index in range(7))
     dialog = StitchCalibrationDialog(tmp_path)
     dialog._distance_result = result
-    dialog._apply_distance()
-    assert dialog._text('distance_seed') == ''
-    dialog.compatible.setChecked(True)
-    dialog._apply_distance()
+    dialog._apply_distance()  # no confirmation: the result applies
     assert float(dialog._text('distance_seed')) == pytest.approx(80., rel=2e-5)
     assert dialog._text('distance_bounds') == ''
     assert dialog._distance_provenance['regression_std_m'] >= 0
@@ -498,7 +499,6 @@ def test_direct_beam_fit_button_reads_container_sources(tmp_path, source_kind):
     assert result.distance_mm == pytest.approx(500., rel=1e-4)
     assert result.used.all()
     assert dialog._text('distance_seed') == ''
-    dialog.compatible.setChecked(True)
     dialog.apply_distance_button.click()
     assert float(dialog._text('distance_seed')) == pytest.approx(500., rel=1e-4)
     assert dialog._text('distance_bounds') == ''
