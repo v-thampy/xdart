@@ -175,7 +175,7 @@ def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
                                rotation=0, motor_names=('del', 'nu'), cancelled=None):
     """Persist the exact selected detector pixels and their source angles."""
     from xrd_tools.sources import open_source
-    from fabio.tifimage import TifImage
+    from fabio.edfimage import EdfImage
     from xrd_tools.io.image import read_image
     spec = _exact_source(spec)
     graph = None
@@ -224,9 +224,17 @@ def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
                 raise ValueError('calibration requires a bounded real two-dimensional image')
             row_dir = root / f'frame-{index}-{uuid.uuid4().hex[:12]}'
             row_dir.mkdir()
-            image = row_dir / 'selected.tif'
-            TifImage(data=np.asarray(pixels, dtype=np.float64)).write(str(image))
-            if not np.array_equal(read_image(image), pixels, equal_nan=True):
+            # Named after its source image, so pyFAI's window and the saved PONI's Image
+            # line name the real frame (with its number inside a multi-frame file).
+            raw = Path(original.source_path or spec.uri)
+            within = original.source_frame_index
+            image = row_dir / f'{raw.stem}{f"_{within}" if within else ""}.edf'
+            # float64 on disk (EDF; fabio's TIFF writer stores float32): pyFAI's ring
+            # extraction converts to float32 "as a copy" and, given float32, fills the
+            # detector gaps in the loaded image itself, which the save check refuses.
+            EdfImage(data=np.asarray(pixels, dtype=np.float64)).write(str(image))
+            staged = read_image(image, preserve_dtype=True)
+            if staged.dtype != np.float64 or not np.array_equal(staged, pixels, equal_nan=True):
                 raise ValueError('staged calibration pixels differ from the selected image')
             frames.append(CalibrationFrame(
                 row_dir.name, str(Path(spec.uri).resolve()), spec.kind.value,

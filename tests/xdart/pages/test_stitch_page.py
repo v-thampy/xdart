@@ -585,7 +585,7 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
 
 def test_mask_exact_frame_staging_is_unrotated_and_page_shutdown_reaps_worker(qapp, tmp_path):
     from threading import Event
-    import tifffile
+    import fabio
     from xdart.gui.tabs.stitch.mask import StitchMaskDialog
     form = _form(tmp_path, "multigeometry")
     page = StitchPage(empty_host_services(_Status()))
@@ -597,10 +597,10 @@ def test_mask_exact_frame_staging_is_unrotated_and_page_shutdown_reaps_worker(qa
         cancel.set()
         staging = tmp_path / "mask-source"
         assert StitchMaskDialog._run((source, 1, str(staging), 180), cancel, lambda *args: None) is None
-        images = tuple(staging.glob("frame-*/selected.tif"))
+        images = tuple(staging.glob("frame-*/sample_scan1_0001.edf"))  # named after its source image
         assert len(images) == 1
         original = np.fromfile(Path(form.image_dir) / "sample_scan1_0001.raw", dtype="int32").reshape(form.detector_shape)
-        np.testing.assert_array_equal(tifffile.imread(images[0]), original)
+        np.testing.assert_array_equal(fabio.open(images[0]).data, original)
         page._make_mask()
         dialog = page._authoring_dialogs[-1]
         dialog.begin()
@@ -622,7 +622,7 @@ def test_mask_exact_frame_staging_is_unrotated_and_page_shutdown_reaps_worker(qa
 
 def test_directory_mask_picker_retains_the_declared_raw_decoder(qapp, tmp_path):
     from threading import Event
-    import tifffile
+    import fabio
     from xdart.gui.tabs.stitch.mask import StitchMaskDialog
     form = _form(tmp_path, "xu_hist")
     page = StitchPage(empty_host_services(_Status()))
@@ -638,9 +638,9 @@ def test_directory_mask_picker_retains_the_declared_raw_decoder(qapp, tmp_path):
         cancelled.set()
         output = tmp_path / "directory-mask-staging"
         assert StitchMaskDialog._run((dialog._source, 0, str(output), 0), cancelled, lambda *args: None) is None
-        staged, = output.glob("frame-*/selected.tif")
-        assert tifffile.imread(staged).shape == (195, 1475)
-        np.testing.assert_array_equal(tifffile.imread(staged), np.full((195, 1475), 11))
+        staged, = output.glob("frame-*/sample_scan1_0001.edf")  # named after its source image
+        assert fabio.open(staged).data.shape == (195, 1475)
+        np.testing.assert_array_equal(fabio.open(staged).data, np.full((195, 1475), 11))
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()

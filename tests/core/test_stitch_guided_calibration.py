@@ -2,7 +2,9 @@
 from dataclasses import replace
 import hashlib
 import json
+from pathlib import Path
 
+import fabio
 import numpy as np
 import pytest
 import tifffile
@@ -60,7 +62,9 @@ def test_exact_raw_staging_rotation_angles_and_resume(tmp_path):
     frames = capture_calibration_frames(source, (2, 0), tmp_path / 'session', rotation=180)
     assert [f.index for f in frames] == [2, 0]
     assert [f.motors for f in frames] == [{'del': 3., 'nu': 6.}, {'del': 1., 'nu': 4.}]
-    assert np.array_equal(tifffile.imread(frames[0].image_path), np.rot90(original + 200, 2))
+    staged = fabio.open(frames[0].image_path).data  # float64 EDF named after its source image
+    assert Path(frames[0].image_path).name == 'beam_scan1_0002.edf' and staged.dtype == np.float64
+    assert np.array_equal(staged, np.rot90(original + 200, 2))
     assert load_calibration_session(tmp_path / 'session/calibration-session.json') == frames
     with pytest.raises(ValueError, match='existing SPEC'):
         capture_calibration_frames(replace(source, options={**source.options, 'scan': '999'}), (0,), tmp_path / 'invalid')
@@ -150,7 +154,8 @@ def test_nexus_staging_uses_complete_metadata_provider_and_exact_frame(tmp_path)
     frames = capture_calibration_frames(spec, (2,), tmp_path/'staged', motor_names=('hy','i0'))
     source = open_source(spec)
     try:
-        assert np.array_equal(tifffile.imread(frames[0].image_path), source.load_frame(2))
+        assert np.array_equal(fabio.open(frames[0].image_path).data, source.load_frame(2))
+        assert Path(frames[0].image_path).name == 'raw_2.edf'  # frame 2 inside raw.nxs
     finally:
         source.close()
     assert frames[0].raw_index == 2
