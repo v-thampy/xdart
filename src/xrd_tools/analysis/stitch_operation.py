@@ -399,13 +399,14 @@ class StitchGeometryInput:
             raise ValueError("Stitch geometry requires an explicit source motor mapping")
         if self.kind is StitchGeometryKind.PYFAI_GONIOMETER_JSON and references:
             raise ValueError("fitted goniometer JSON cannot carry PONI references")
-        # A single detector arm (fourc/twoc 2θ as del) maps del alone; nu is held at zero.
+        # A single detector arm (a fourc/twoc 2θ) maps its one moving circle, del
+        # (vertical) or nu (horizontal); the other is held at zero.
         if self.kind is StitchGeometryKind.PONI and (
-            {name for name, _source in motors} not in ({"del", "nu"}, {"del"})
+            {name for name, _source in motors} not in ({"del", "nu"}, {"del"}, {"nu"})
             or {name for name, _value in references} != {name for name, _source in motors}
         ):
             raise ValueError(
-                "PONI geometry requires del (and nu) source mappings and reference positions"
+                "PONI geometry requires del and/or nu source mappings and reference positions"
             )
         if type(self.image_rotation) is not int or self.image_rotation not in {0, 90, 180, 270}:
             raise ValueError("image rotation must be an exact 0/90/180/270 integer")
@@ -2364,15 +2365,13 @@ def _runtime_geometry(receipt: StitchGeometryReceipt, raw: bytes):
         calibration = replace(calibration, image_orientation=orientation)
         motors = dict(request.source_motors)
         references = dict(request.reference_motor_positions)
-        base = Diffractometer.psic(del_=motors["del"], nu=motors.get("nu", "nu"))
-        base = replace(
+        base = Diffractometer.psic(del_=motors.get("del", "del"), nu=motors.get("nu", "nu"))
+        base = replace(  # a single arm's unmapped circle is held at zero
             base,
             rot1=(AngleMapping(source_motor=motors["nu"], offset=-references["nu"])
-                  if "nu" in motors else AngleMapping()),  # a single arm: nu held at zero
-            rot2=AngleMapping(
-                source_motor=motors["del"],
-                offset=-references["del"],
-            ),
+                  if "nu" in motors else AngleMapping()),
+            rot2=(AngleMapping(source_motor=motors["del"], offset=-references["del"])
+                  if "del" in motors else AngleMapping()),
         )
         diffractometer = replace(base, calibration=calibration)
     return diffractometer, orientation
@@ -2462,14 +2461,17 @@ class StitchOperationResult:
 
 
 def _frame_screen_rows(request: StitchOperationRequest) -> tuple[float, ...]:
-    """Each selected frame's outer-circle (nu) value: its dropped-frame screening row."""
+    """Each selected frame's outer-circle (nu) value: its dropped-frame screening row. A
+    single arm (one circle held at zero) is one row, whichever circle moves."""
     plan = request.plan
     if type(plan) is XuStitchOperationPlan:
-        name = str(plan.calibration.projection.value["acquisition"]["source_motors"].get("nu", ""))
+        motors = plan.calibration.projection.value["acquisition"]["source_motors"]
+        name = str(motors.get("nu") or "") if motors.get("del") else ""
     else:
-        # A goniometer JSON names the position nu_angle; a PONI geometry names it nu.
+        # A goniometer JSON names the positions del_angle/nu_angle; a PONI geometry del/nu.
         motors = dict(plan.geometry.request.source_motors)
-        name = motors.get("nu_angle") or motors.get("nu", "")
+        both = (motors.get("del_angle") or motors.get("del")) and (motors.get("nu_angle") or motors.get("nu"))
+        name = (motors.get("nu_angle") or motors.get("nu", "")) if both else ""
     manifest = request.manifest
     values = {item.label: {(n, o): v for n, o, v in item.values}
               for item in manifest.contributions}

@@ -90,11 +90,136 @@ def test_stitch_admits_a_single_arm_calibration_and_a_del_only_poni(tmp_path):
     receipt = capture_stitch_geometry(request)
     diff = _runtime_geometry(receipt, receipt.content)[0]
     assert not diff.rot1.is_active and diff.rot2.source_motor == 'tth' and diff.rot2.offset == -11.5
+    # a horizontal 2θ arm maps nu alone: rot1 follows it, rot2 stays at the PONI's
+    receipt = capture_stitch_geometry(StitchGeometryInput(poni, StitchGeometryKind.PONI,
+        source_motors=(('nu', 'tth'),), reference_motor_positions=(('nu', 11.5),)))
+    diff = _runtime_geometry(receipt, receipt.content)[0]
+    assert not diff.rot2.is_active and diff.rot1.source_motor == 'tth' and diff.rot1.offset == -11.5
     for motors, references in (((('del', 'tth'),), (('del', 1.), ('nu', 0.))),
-                               ((('nu', 'nu'),), (('nu', 0.),))):
-        with pytest.raises(ValueError, match=r'del \(and nu\)'):
+                               ((('tth', 'tth'),), (('tth', 0.),))):
+        with pytest.raises(ValueError, match='del and/or nu'):
             StitchGeometryInput(poni, StitchGeometryKind.PONI, source_motors=motors,
                                 reference_motor_positions=references)
+
+
+def test_a_horizontal_2theta_arm_is_psics_arm_with_del_held_at_zero(tmp_path):
+    from pyFAI.goniometer import Goniometer
+    from xrd_tools.core.geometry.stacked_arm import stacked_arm_transformation
+    tth = np.array([5., 12.5, 33., 71.])
+    horizontal = StackedDetectorArm(nu_motor='tth', del_motor=None, nu_offset=-.02, nu_scale=math.radians(.999),
+                                    del_offset=.0117, beam_rotation=.003)
+    psic = replace(horizontal, del_motor='del')
+    assert horizontal.held == 'del' and _arm().held == 'nu' and psic.held is None
+    ours = horizontal.rotations({'tth': tth})
+    theirs = psic.rotations({'tth': tth, 'del': np.zeros(4)})
+    assert all(np.array_equal(ours[key], theirs[key]) for key in ours)
+    record = horizontal.to_pyfai_goniometer(_calibration())
+    assert record['pos_names'] == ['nu_angle'] and 'del_scale' not in record['param_names']
+    assert is_single_arm(record)
+    diff = Diffractometer.from_pyfai_goniometer(record, source_motors={'nu_angle': 'tth'})
+    assert diff.stacked_arm == horizontal and diff.all_referenced_motors() == ('tth',)
+    assert Diffractometer.from_json(diff.to_json()).stacked_arm == horizontal
+    path = tmp_path / 'horizontal.json'
+    path.write_text(json.dumps(record))
+    series = list(create_multigeometry_integrator_series_from_geometry(diff, {'tth': tth}))
+    # pyFAI's numexpr evaluates the same expressions in another order: equal to rounding
+    assert _worst(series, [Goniometer.sload(str(path)).get_ai((value,)) for value in tth]) < 1e-15
+    two = Diffractometer.from_pyfai_goniometer(psic.to_pyfai_goniometer(_calibration()),
+                                               source_motors={'del_angle': 'del', 'nu_angle': 'tth'})
+    assert _worst(series, list(create_multigeometry_integrator_series_from_geometry(
+        two, {'tth': tth, 'del': np.zeros(4)}))) == 0
+    # the vertical record saved since round 12 keeps its exact transformation
+    assert stacked_arm_transformation(held='nu') == {
+        'content': 'GeometryTransformation',
+        'param_names': ['dist', 'poni1', 'poni2', 'nu_offset', 'del_offset', 'del_scale', 'beam_rotation'],
+        'pos_names': ['del_angle'], 'dist_expr': 'dist', 'poni1_expr': 'poni1', 'poni2_expr': 'poni2',
+        'rot1_expr': 'arctan2(sin((nu_offset)),(cos((nu_offset))*cos((del_offset+del_scale*del_angle))))',
+        'rot2_expr': 'arctan2((cos((nu_offset))*sin((del_offset+del_scale*del_angle))),sqrt(sin((nu_offset))**2'
+                     '+(cos((nu_offset))*cos((del_offset+del_scale*del_angle)))**2))',
+        'rot3_expr': 'beam_rotation+arctan2(sin((nu_offset))*sin((del_offset+del_scale*del_angle)),'
+                     'cos((del_offset+del_scale*del_angle)))',
+        'constants': {'pi': math.pi, 'xdart_single_arm_v1': 1}}
+    # a single-arm record declares one moving position; anything else is refused
+    mixed = json.loads(json.dumps(record))
+    mixed['pos_names'] = mixed['trans_function']['pos_names'] = ['tth_angle']
+    with pytest.raises(ValueError, match='stacked arm'):
+        Diffractometer.from_pyfai_goniometer(mixed, source_motors={'tth_angle': 'tth'})
+    with pytest.raises(ValueError, match='distinct, nonempty'):
+        StackedDetectorArm(nu_motor=None, del_motor=None)
+
+
+def test_the_fit_and_seeds_take_a_horizontal_arm():
+    from xrd_tools.integrate.calibration_seed import predict_frame_seed, rough_arm_record
+    from xrd_tools.integrate.refine import refine_goniometer
+    from tests.core.test_stacked_arm_extension import _calibration as _truth_calibration, _ring_controls
+    controls, calibrant = _ring_controls({'nu_offset': -.03, 'del_offset': .012}, _truth_calibration(),
+                                         [(0., nu) for nu in (4., 15., 26., 37.)])
+    poni = _truth_calibration().poni
+    kwargs = dict(calibrant=calibrant, fit_scales=False, model='stacked_del_on_nu', detector='Pilatus300kw',
+                  detector_config={'orientation': 3})
+    single = refine_goniometer(poni, [replace(c, motors={'tth': c.motors['nu']}) for c in controls],
+                               rot1_motor='tth', rot2_motor=None, **kwargs)
+    psic = refine_goniometer(poni, [replace(c, motors={'tth': c.motors['nu'], 'del': 0.}) for c in controls],
+                             rot1_motor='tth', rot2_motor='del', **kwargs)
+    assert single.success and single.diffractometer.stacked_arm.held == 'del'
+    assert {key: psic.params[key] for key in single.params} == single.params
+    # this fit reads whole-pixel control points, so it recovers the truth approximately
+    assert single.params['nu_offset'] == pytest.approx(-.03, abs=2e-3)
+    assert single.params['del_offset'] == pytest.approx(.012, abs=2e-3)  # the detector's fixed pitch
+    record = single.diffractometer.stacked_arm.to_pyfai_goniometer(single.diffractometer.calibration)
+    frame = _frame({'tth': 20.})
+    seeded = predict_frame_seed(record, frame, del_motor=None, nu_motor='tth')
+    reference = predict_frame_seed(psic.diffractometer.stacked_arm.to_pyfai_goniometer(
+        psic.diffractometer.calibration), _frame({'tth': 20., 'del': 0.}), del_motor='del', nu_motor='tth')
+    assert _worst([seeded.integrator], [reference.integrator]) == 0 and seeded.rings == reference.rings
+    with pytest.raises(ValueError, match='holds del at zero'):  # a horizontal calibration, del moved
+        predict_frame_seed(record, _frame({'tth': 20., 'del': 3.}), del_motor='del', nu_motor='tth')
+    rough = rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(737, 97), zero_deg=2.,
+                             zero_motor='tth', del_motor=None, nu_motor='tth')
+    assert rough['pos_names'] == ['nu_angle']
+    assert dict(zip(rough['param_names'], rough['param']))['nu_offset'] == pytest.approx(-math.radians(2.))
+
+
+def test_a_single_arm_is_one_screening_row_whichever_circle_moves():
+    from types import SimpleNamespace
+    from xrd_tools.analysis.stitch_operation import _frame_screen_rows
+    from xrd_tools.integrate.stitch_autocalibration import stratified_frame_indices
+
+    def rows(bound, columns):
+        values = [(label, tuple((name, 0, value) for name, value in zip(columns, frame)))
+                  for label, frame in enumerate(((10., -3.), (20., -3.), (30., 4.)))]
+        request = SimpleNamespace(
+            plan=SimpleNamespace(geometry=SimpleNamespace(request=SimpleNamespace(source_motors=bound))),
+            manifest=SimpleNamespace(contributions=[SimpleNamespace(label=label, values=frame)
+                                                    for label, frame in values]),
+            module=SimpleNamespace(source=SimpleNamespace(selected_labels=(0, 1, 2))))
+        return [row for _member, row in _frame_screen_rows(request)]
+    assert rows((('del_angle', 'del'), ('nu_angle', 'nu')), ('del', 'nu')) == [-3., -3., 4.]
+    assert rows((('nu_angle', 'tth'),), ('tth', 'th')) == [0., 0., 0.]  # not a row per frame
+    assert rows((('del_angle', 'tth'),), ('tth', 'th')) == [0., 0., 0.]
+    assert rows((('del', 'del'), ('nu', 'nu')), ('del', 'nu')) == [-3., -3., 4.]  # PONI + offsets
+    assert rows((('nu', 'tth'),), ('tth', 'th')) == [0., 0., 0.]
+    frames = [(index, {'tth': 5. + index}, None) for index in range(20)]
+    chosen, coverage = stratified_frame_indices(frames, 5, 'tth', None)
+    assert coverage == {'nu_rows_available': 1, 'nu_rows_selected': 1}
+    assert len(chosen) == 5 and chosen[0] < 4 and chosen[-1] > 15  # spread over the moving nu
+
+
+def test_a_session_records_its_arm(tmp_path):
+    from xrd_tools.integrate.stitch_calibration import load_calibration_session, save_calibration_session
+    frame = replace(_frame({'tth': 20.}), image_path=str(tmp_path / 'frame.edf'))
+    Path(frame.image_path).write_bytes(b'x')
+    frame = replace(frame, image_sha256=hashlib.sha256(b'x').hexdigest())
+    for arm in ((None, 'tth'), ('tth', None)):  # one motor name, either plane
+        path = save_calibration_session(tmp_path, (frame,), arm=arm)
+        assert json.loads(path.read_text())['version'] == 3
+        assert load_calibration_session(path, with_arm=True) == ((frame,), arm)
+        assert load_calibration_session(path) == (frame,)
+    path = save_calibration_session(tmp_path, (frame,))  # an older session: version 2, no arm
+    assert load_calibration_session(path, with_arm=True) == ((frame,), None)
+    path = save_calibration_session(tmp_path, (frame,), arm=('del', 'nu'))  # frames read tth only
+    with pytest.raises(ValueError, match='do not read its arm'):
+        load_calibration_session(path, with_arm=True)
 
 
 def _frame(motors, shape=(195, 1475)):
@@ -129,8 +254,11 @@ def test_a_single_arm_fit_refuses_what_needs_nu():
     from xrd_tools.integrate.stitch_autocalibration import stratified_frame_indices
     from xrd_tools.integrate.stitch_calibration import fit_calibration
     frames = (None,) * 3  # refused before any frame is read
-    with pytest.raises(ValueError, match='no nu positions'):
-        fit_calibration(frames, del_motor='tth', nu_motor=None, arm_model='stacked_extended')
+    for delta, nu in (('tth', None), (None, 'tth')):
+        with pytest.raises(ValueError, match='no nu positions'):
+            fit_calibration(frames, del_motor=delta, nu_motor=nu, arm_model='stacked_extended')
+    with pytest.raises(ValueError, match='at least one moving circle'):
+        fit_calibration(frames, del_motor=None, nu_motor=None)
     with pytest.raises(ValueError, match='MultiGeometry backend'):
         fit_calibration(frames, backend='xu_hist', del_motor='tth', nu_motor=None)
     rows = [(index, {'tth': 5. + index}, None) for index in range(20)]
@@ -179,7 +307,7 @@ def test_a_twoc_scan_refines_its_arm_automatically(tmp_path):
     assert is_single_arm(fit.asset['calibration']) and provenance['source_motors'] == {'del_angle': 'tth'}
     assert provenance['instrument_geometry'] == geometry and provenance['arm_model'] == 'stacked'
     assert provenance['automatic_refinement']['validation']['reason'] == (
-        'a single detector arm has no nu rows: the extension does not apply')
+        'a single detector arm holds one circle at zero: the extension does not apply')
     assert all(set(frame['motors']) == {'tth'} for frame in provenance['frames'])
     params = dict(zip(fit.asset['calibration']['param_names'], fit.asset['calibration']['param']))
     assert fit.rms_q < 2e-3

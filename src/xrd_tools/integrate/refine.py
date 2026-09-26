@@ -207,7 +207,7 @@ def refine_goniometer(
     control_frames: Sequence[ControlFrame | Mapping[str, Any]],
     *,
     rot1_motor: str | None,
-    rot2_motor: str,
+    rot2_motor: str | None,
     calibrant: Any = "LaB6",
     wavelength: float | None = None,
     detector: str | None = None,
@@ -238,8 +238,10 @@ def refine_goniometer(
         Which motor drives ``rot1`` / ``rot2`` (e.g. ``"nu"`` / ``"del"`` for a
         psic).  The fit is ``rotN = scale·motor + offset``; ``rot3`` is pinned at
         the base value (powder |q| cannot constrain a beam-axis rotation).
-        ``rot1_motor=None`` is a single detector arm (a fourc or twoc 2θ circle
-        as ``rot2_motor``): nu is held at zero and only its offset is fitted.
+        One of them ``None`` is a single detector arm (a fourc or twoc 2θ
+        circle): that circle is held at zero and only its offset is fitted —
+        ``rot1_motor=None`` for a vertical 2θ arm (del), ``rot2_motor=None``
+        for a horizontal one (nu).
     fit_scales : bool
         Fit the per-axis scales (default).  A scale is fit ONLY if its motor
         spans ≥ 1°; an un-spanned axis's scale is frozen at ``deg2rad`` (it is
@@ -277,8 +279,10 @@ def refine_goniometer(
             max_nfev=max(max_nfev, 2000), cancelled=cancelled)
     if model not in {'affine', 'stacked_del_on_nu'}:
         raise ValueError('unknown goniometer model')
-    if rot1_motor is None and model != 'stacked_del_on_nu':
-        raise ValueError('a single detector arm is fitted as the stacked arm with nu held at zero')
+    if rot1_motor is None and rot2_motor is None:
+        raise ValueError('a detector arm needs at least one moving circle')
+    if (rot1_motor is None or rot2_motor is None) and model != 'stacked_del_on_nu':
+        raise ValueError('a single detector arm is fitted as the stacked arm with one circle held at zero')
 
     # --- base geometry -----------------------------------------------------
     base_poni, base_parallax, detector_config, wl_m, det_name, det = _base_geometry(
@@ -294,20 +298,23 @@ def refine_goniometer(
     n_points = int(sum(len(f.rows) for f in frames))
 
     # --- identifiability: a scale needs its motor to span a range ----------
-    single = rot1_motor is None  # a single detector arm: nu held at zero
-    motor1 = (lambda f: 0.0) if single else (lambda f: float(f.motors[rot1_motor]))
+    single = rot1_motor is None or rot2_motor is None  # a single detector arm: one circle held
+
+    def reader(name):  # a held circle reads zero
+        return (lambda f: 0.0) if name is None else (lambda f: float(f.motors[name]))
+    motor1, motor2 = reader(rot1_motor), reader(rot2_motor)
     span1 = float(np.ptp([motor1(f) for f in frames]))
-    span2 = float(np.ptp([f.motors[rot2_motor] for f in frames]))
-    fit_r1s = fit_scales and not single and span1 >= _MIN_SPAN_DEG
-    fit_r2s = fit_scales and span2 >= _MIN_SPAN_DEG
+    span2 = float(np.ptp([motor2(f) for f in frames]))
+    fit_r1s = fit_scales and rot1_motor is not None and span1 >= _MIN_SPAN_DEG
+    fit_r2s = fit_scales and rot2_motor is not None and span2 >= _MIN_SPAN_DEG
     frozen: list[str] = []
-    if fit_scales and not single and not fit_r1s:
+    if fit_scales and rot1_motor is not None and not fit_r1s:
         frozen.append(rot1_motor)
         logger.warning("refine_goniometer: %s spans only %.3g° (< %g°) — its "
                        "scale is unidentifiable and frozen at deg2rad; add "
                        "frames spanning %s.", rot1_motor, span1, _MIN_SPAN_DEG,
                        rot1_motor)
-    if fit_scales and not fit_r2s:
+    if fit_scales and rot2_motor is not None and not fit_r2s:
         frozen.append(rot2_motor)
         logger.warning("refine_goniometer: %s spans only %.3g° (< %g°) — its "
                        "scale is unidentifiable and frozen at deg2rad; add "
@@ -347,7 +354,7 @@ def refine_goniometer(
         out = []
         for f in frames:
             m1 = motor1(f)
-            m2 = float(f.motors[rot2_motor])
+            m2 = motor2(f)
             rotations = (r1s * m1 + r1o, r2s * m2 + r2o, r3o)
             if model == 'stacked_del_on_nu':
                 rotations = StackedDetectorArm(nu_motor=rot1_motor, del_motor=rot2_motor,
@@ -445,8 +452,8 @@ def refine_goniometer(
         )
         gonio = arm.to_pyfai_goniometer(calibration)
         param_names, param = gonio['param_names'], gonio['param']
-        sources = ({'del_angle': rot2_motor} if single
-                   else {'nu_angle': rot1_motor, 'del_angle': rot2_motor})
+        sources = {name: motor for name, motor in (('nu_angle', rot1_motor), ('del_angle', rot2_motor))
+                   if motor is not None}
     diff = Diffractometer.from_pyfai_goniometer(
         gonio, source_motors=sources,
         base=base, preset=preset)
@@ -477,7 +484,7 @@ def refine_stacked_arm(
     control_frames: Sequence[ControlFrame | Mapping[str, Any]],
     *,
     nu_motor: str | None,
-    del_motor: str,
+    del_motor: str | None,
     calibrant: Any = "LaB6",
     wavelength: float | None = None,
     detector: str | None = None,
@@ -495,8 +502,9 @@ def refine_stacked_arm(
     """Fit the del-on-nu arm at sub-pixel control-point positions.
 
     The five arm parameters are the distance, the PONI and the nu and del zero
-    offsets. ``nu_motor=None`` is a single detector arm with nu held at zero;
-    its nu offset (the arm's yaw) is still fitted, and it has no extension.
+    offsets. ``nu_motor=None`` or ``del_motor=None`` is a single detector arm
+    with that circle held at zero; its offset (the arm's yaw, or the detector's
+    pitch) is still fitted, and it has no extension.
     ``extended=True`` adds the detector mount on the arm (tilt, roll)
     and the sample offset from the rotation centre. Motor scales stay at one
     degree per degree and the beam rotation is pinned at zero, because |q|
@@ -523,9 +531,11 @@ def refine_stacked_arm(
     frames = [f for f in frames if len(f.rows)]
     if not frames:
         raise ValueError("control_frames is empty")
+    if nu_motor is None and del_motor is None:
+        raise ValueError("a detector arm needs at least one moving circle")
     nu_deg = np.array([0.0 if nu_motor is None else float(f.motors[nu_motor]) for f in frames])
-    del_deg = np.array([float(f.motors[del_motor]) for f in frames])
-    if extended and nu_motor is None:
+    del_deg = np.array([0.0 if del_motor is None else float(f.motors[del_motor]) for f in frames])
+    if extended and (nu_motor is None or del_motor is None):
         raise ValueError("a single detector arm has no nu positions, which the arm extension "
                          "needs; fit it without the extension")
     if extended and len(np.unique(np.round(nu_deg, 6))) < _MIN_NU_POSITIONS:
@@ -658,8 +668,8 @@ def refine_stacked_arm(
     )
     gonio = arm.to_pyfai_goniometer(calibration)
     diff = Diffractometer.from_pyfai_goniometer(
-        gonio, source_motors=({"del_angle": del_motor} if nu_motor is None
-                              else {"nu_angle": nu_motor, "del_angle": del_motor}),
+        gonio, source_motors={name: motor for name, motor in (("nu_angle", nu_motor), ("del_angle", del_motor))
+                              if motor is not None},
         base=base, preset=preset)
     return RefineResult(
         diffractometer=diff, rms_q=rms, n_points=n_points,

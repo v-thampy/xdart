@@ -11,7 +11,7 @@ The arm is refined with and without the detector-mount/sample-offset
 extension. Leave-one-nu-row-out validation decides whether the extension is
 kept: each nu row is predicted from a fit to the other rows, and the extension
 must reduce the held-out error by ``min_improvement``. A single detector arm
-(fourc/twoc 2θ, nu held at zero) has one row and keeps the five-parameter arm. The geometry is fitted
+(fourc/twoc 2θ, one circle held at zero) is one row and keeps the five-parameter arm. The geometry is fitted
 on the calibrant only; never run this on sample data, whose peaks can move and
 broaden with angle for physical reasons.
 """
@@ -50,14 +50,17 @@ class ScanRingPoints:
     coverage: dict
 
 
-def _nu_of(nu_motor):
-    """A frame's nu from its motors; a single arm (``nu_motor=None``) holds it at zero."""
-    return (lambda motors: 0.0) if nu_motor is None else (lambda motors: float(motors[nu_motor]))
+def _row_of(nu_motor, del_motor):
+    """A frame's row: its outer circle (nu) on psic's arm. A single arm (one circle held at
+    zero) is one row, whichever circle moves."""
+    if nu_motor is None or del_motor is None:
+        return lambda motors: 0.0
+    return lambda motors: float(motors[nu_motor])
 
 
 def _arm_motors(arm):
-    """The scan motors an arm reads: del, and nu unless it is held at zero."""
-    return (arm.del_motor,) if arm.single else (arm.del_motor, arm.nu_motor)
+    """The scan motors an arm reads (del, nu), without a circle it holds at zero."""
+    return tuple(motor for motor in (arm.del_motor, arm.nu_motor) if motor is not None)
 
 
 def stratified_frame_indices(rows, count, nu_motor, del_motor):
@@ -67,13 +70,14 @@ def stratified_frame_indices(rows, count, nu_motor, del_motor):
     del; the remainder goes to the frames farthest from those already chosen.
     When the budget is smaller than the number of rows, evenly spaced rows get
     one frame each, and the returned coverage says how many rows were reached.
-    A single arm (``nu_motor=None``) is one row.
+    A single arm (one motor ``None``) is one row, spread over its moving circle.
     """
-    nu_of = _nu_of(nu_motor)
+    row_of = _row_of(nu_motor, del_motor)
+    along = del_motor if del_motor is not None else nu_motor
     groups = {}
     for index, motors, _energy in rows:
-        groups.setdefault(round(nu_of(motors), 6), []).append(
-            (float(motors[del_motor]), int(index)))
+        groups.setdefault(round(row_of(motors), 6), []).append(
+            (float(motors[along]), int(index)))
     keys = sorted(groups)
     count = int(count)
     if count < 1 or not keys:
@@ -88,7 +92,8 @@ def stratified_frame_indices(rows, count, nu_motor, del_motor):
         picks = np.unique(np.round((np.arange(k) + 0.5) * len(group) / k - 0.5).astype(int))
         chosen += [group[i][1] for i in picks]
     order = [int(row[0]) for row in rows]
-    values = np.array([[float(row[1][del_motor]), nu_of(row[1])] for row in rows])
+    values = np.array([[float(row[1][name]) for name in (del_motor, nu_motor) if name is not None]
+                       for row in rows])
     spans = np.ptp(values, axis=0)
     values = (values - values.min(axis=0)) / np.where(spans > 0, spans, 1.0)
     position = {index: k for k, index in enumerate(order)}
@@ -158,8 +163,8 @@ def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen
     labels = [int(row[0]) for row in rows]
     if progress is not None:
         progress('Screening the scan', 0, len(labels))
-    nu_of = _nu_of(arm.nu_motor)
-    nu = [round(nu_of(row[1]), 6) for row in rows]
+    row_of = _row_of(arm.nu_motor, arm.del_motor)
+    nu = [round(row_of(row[1]), 6) for row in rows]
     motors = {name: np.array([row[1][name] for row in rows], dtype=float) for name in _arm_motors(arm)}
     # The detector mask does not depend on the pose: one integrator supplies it.
     integrator = next(iter(create_multigeometry_integrator_series_from_geometry(
@@ -209,7 +214,7 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
     arm = diff.stacked_arm
     wavelength = float(diff.calibration.poni.wavelength)
     rows = source_frame_choices(spec, _arm_motors(arm))
-    nu_of = _nu_of(arm.nu_motor)
+    row_of = _row_of(arm.nu_motor, arm.del_motor)
     by_index = {row[0]: row for row in rows}
     orientation = ImageOrientation(rotation=image_rotation)
     exact = _exact_source(spec)
@@ -226,8 +231,8 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
         selected = tuple(int(i) for i in frame_indices)
         if len(set(selected)) != len(selected) or any(i not in by_index for i in selected):
             raise ValueError('choose distinct frames from the selected scan')
-        coverage = {'nu_rows_available': len({round(nu_of(row[1]), 6) for row in rows}),
-                    'nu_rows_selected': len({round(nu_of(by_index[i][1]), 6) for i in selected})}
+        coverage = {'nu_rows_available': len({round(row_of(row[1]), 6) for row in rows}),
+                    'nu_rows_selected': len({round(row_of(by_index[i][1]), 6) for i in selected})}
     if not 3 <= len(selected) <= 256:
         raise ValueError('automatic refinement needs 3-256 frames')
     for index in selected:
@@ -339,13 +344,13 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                                   beam_rotation=arm.beam_rotation, cancelled=cancelled)
 
     controls = points.controls
-    nu_of = _nu_of(arm.nu_motor)
-    rows = sorted({round(nu_of(c.motors), 6) for c in controls})
+    row_of = _row_of(arm.nu_motor, arm.del_motor)
+    rows = sorted({round(row_of(c.motors), 6) for c in controls})
     validation = {'method': 'leave-one-nu-row-out', 'nu_rows': rows, 'min_improvement': min_improvement,
                   'coverage': dict(points.coverage)}
     chosen, reason = 'stacked', ''
     if arm.single:
-        reason = 'a single detector arm has no nu rows: the extension does not apply'
+        reason = 'a single detector arm holds one circle at zero: the extension does not apply'
     elif len(rows) < 4:
         reason = 'fewer than four nu rows: the extension cannot be validated'
         if points.coverage['nu_rows_selected'] < points.coverage['nu_rows_available']:
@@ -357,8 +362,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
         for row in rows:
             if progress is not None:
                 progress('Validating models', len(folds), len(rows))
-            train = [c for c in controls if round(nu_of(c.motors), 6) != row]
-            test = [c for c in controls if round(nu_of(c.motors), 6) == row]
+            train = [c for c in controls if round(row_of(c.motors), 6) != row]
+            test = [c for c in controls if round(row_of(c.motors), 6) == row]
             fold = {'nu': row, 'points': int(sum(len(c.rows) for c in test))}
             for name, extended in (('stacked', False), ('stacked_extended', True)):
                 trained = fit(train, extended)
@@ -389,8 +394,9 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
     provenance = {'frames': list(points.frames), 'rms_q_A^-1': result.rms_q,
                   'condition_number': result.condition_number, 'n_points': result.n_points,
                   'distance_seed_m': None, 'distance_bounds_m': None, 'fit_motor_scales': False,
-                  'source_motors': ({'del_angle': arm.del_motor} if arm.single
-                                    else {'nu_angle': arm.nu_motor, 'del_angle': arm.del_motor}),
+                  'source_motors': {name: motor for name, motor in (('nu_angle', arm.nu_motor),
+                                                                    ('del_angle', arm.del_motor))
+                                    if motor is not None},
                   'image_rotation': int(image_rotation), 'direct_beam': None,
                   'arm_model': chosen, 'parameter_errors': dict(result.param_errors),
                   'parameter_correlations': dict(result.param_correlations),

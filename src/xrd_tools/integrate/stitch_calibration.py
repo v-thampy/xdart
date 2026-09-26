@@ -190,8 +190,14 @@ def suggested_frame_indices(rows, count=5):
 
 
 def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
-                               rotation=0, motor_names=('del', 'nu'), cancelled=None):
-    """Persist the exact selected detector pixels and their source angles."""
+                               rotation=0, motor_names=('del', 'nu'), cancelled=None, arm=None):
+    """Persist the exact selected detector pixels and their source angles.
+
+    ``arm`` is the detector arm's (del, nu) motors, ``None`` for a circle a single arm
+    holds at zero; it names the angles read and is recorded with the session.
+    """
+    if arm is not None:
+        motor_names = tuple(motor for motor in arm if motor is not None)
     from xrd_tools.sources import open_source
     from fabio.edfimage import EdfImage
     from xrd_tools.io.image import read_image
@@ -263,31 +269,49 @@ def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
             current = Path(spec.uri).stat()
             if (current.st_ino, current.st_size, current.st_mtime_ns) != (source_state.st_ino, source_state.st_size, source_state.st_mtime_ns):
                 raise ValueError('scan metadata changed during preparation')
-            save_calibration_session(root, frames)
+            save_calibration_session(root, frames, arm=arm)
     finally:
         close = getattr(source, 'close', None)
         if close is not None:
             close()
-    save_calibration_session(root, frames)
+    save_calibration_session(root, frames, arm=arm)
     return tuple(frames)
 
 
-def save_calibration_session(directory, frames):
+def _session_arm(value, frames):
+    """A version-3 session's arm (del, nu), checked against its frames' angles."""
+    arm = value.get('arm')
+    if (type(arm) is not dict or set(arm) != {'del', 'nu'}
+            or any(motor is not None and (type(motor) is not str or not motor) for motor in arm.values())
+            or arm['del'] is None and arm['nu'] is None or arm['del'] == arm['nu']):
+        raise ValueError('invalid calibration session arm')
+    if any(set(frame.motors) != {motor for motor in arm.values() if motor is not None} for frame in frames):
+        raise ValueError('calibration session frames do not read its arm')
+    return arm['del'], arm['nu']
+
+
+def save_calibration_session(directory, frames, *, arm=None):
+    """``arm`` (del, nu motors; None for a held circle) makes it version 3: a resumed
+    session then knows which circle a single arm's one motor is (vertical or horizontal)."""
     path = Path(directory) / 'calibration-session.json'
     payload = {'schema': 'xdart.stitch_calibration_session', 'version': 2,
                'frames': [asdict(frame) for frame in frames]}
+    if arm is not None:
+        payload.update(version=3, arm={'del': arm[0], 'nu': arm[1]})
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(payload, indent=2, allow_nan=False))
     temporary.replace(path)
     return path
 
 
-def load_calibration_session(path):
+def load_calibration_session(path, *, with_arm=False):
+    """The session's frames; with ``with_arm``, also its arm (None before version 3)."""
     path = Path(path)
     if path.stat().st_size > 1 << 20:
         raise ValueError('calibration session exceeds the size limit')
     value = json.loads(path.read_text())
-    if set(value) != {'schema', 'version', 'frames'} or value['schema'] != 'xdart.stitch_calibration_session' or value['version'] not in (1, 2):
+    keys = {'schema', 'version', 'frames'} | ({'arm'} if value.get('version') == 3 else set())
+    if set(value) != keys or value['schema'] != 'xdart.stitch_calibration_session' or value['version'] not in (1, 2, 3):
         raise ValueError('unsupported calibration session')
     if not 1 <= len(value['frames']) <= 32:
         raise ValueError('invalid calibration frame count')
@@ -296,7 +320,9 @@ def load_calibration_session(path):
         # Legacy rows retain their files, but absent model/image binding means
         # they are incomplete until the user recalibrates or explicitly imports.
         validate_frame_files(frame, require_points=frame.complete)
-    return frames
+    if not with_arm:
+        return frames
+    return frames, (_session_arm(value, frames) if value['version'] == 3 else None)
 
 
 def validate_frame_files(frame, *, require_points=True):
@@ -404,8 +430,9 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     ``arm_model='stacked_extended'`` (MultiGeometry only) also fits the detector
     mount on the arm and the sample offset from the rotation centre; it needs
     frames from at least three nu positions and fixed motor scales.
-    ``nu_motor=None`` is a single detector arm (a fourc or twoc 2θ as
-    ``del_motor``): psic's arm with nu held at zero.
+    ``nu_motor=None`` or ``del_motor=None`` is a single detector arm (a fourc or
+    twoc 2θ): psic's arm with that circle held at zero (vertical: del moves;
+    horizontal: nu moves).
     """
     if not 3 <= len(frames) <= 32:
         raise ValueError('fit requires at least three completed frames spanning the angles')
@@ -413,7 +440,10 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
         raise ValueError('unknown arm model')
     if arm_model == 'stacked_extended' and backend != 'multigeometry':
         raise ValueError('the detector mount and sample offset refinement is MultiGeometry-only')
-    single = nu_motor is None
+    if nu_motor is None and del_motor is None:
+        raise ValueError('a detector arm needs at least one moving circle')
+    held = 'nu' if nu_motor is None else 'del' if del_motor is None else None
+    single = held is not None
     if single and arm_model == 'stacked_extended':
         raise ValueError('a single detector arm has no nu positions; the detector mount and '
                          'sample offset refinement needs frames from several')
@@ -448,7 +478,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
             result.diffractometer.calibration)
         asset['detector_config'] = exported_config
         rms, condition, count = result.rms_q, result.condition_number, result.n_points
-        arm = 'one detector arm, nu held at zero' if single else 'del mounted on nu'
+        arm = f'one detector arm, {held} held at zero' if single else 'del mounted on nu'
         message = (f'{arm[0].upper()}{arm[1:]}; frozen motor scales: ' + ', '.join(result.frozen_scales)
                    if result.frozen_scales else f'Converged; {arm}')
         if not fit_scales:
@@ -465,8 +495,8 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                   'condition_number': condition, 'n_points': count,
                   'distance_seed_m': distance_seed_m, 'distance_bounds_m': distance_bounds_m,
                   'fit_motor_scales': bool(fit_scales) if backend == 'multigeometry' else False,
-                  'source_motors': ({'del_angle': del_motor} if single
-                                    else {'nu_angle': nu_motor, 'del_angle': del_motor}
+                  'source_motors': ({name: motor for name, motor in (('nu_angle', nu_motor), ('del_angle', del_motor))
+                                     if motor is not None}
                                     if backend == 'multigeometry' else {'nu': nu_motor, 'del': del_motor}),
                   'image_rotation': frames[0].rotation,
                   'direct_beam': distance_provenance}
