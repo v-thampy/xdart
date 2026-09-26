@@ -110,22 +110,28 @@ def infer_raw_detector_shape(
     if header_skip < 0:
         raise ValueError("raw_header_skip must be non-negative")
     payload_bytes = path.stat().st_size - header_skip
-    dtype = np.dtype(raw_dtype)
-    if payload_bytes < 0 or payload_bytes % dtype.itemsize:
+    shape = raw_detector_shape_for_payload(payload_bytes, raw_dtype=raw_dtype)
+    if shape is not None:
+        logger.debug(
+            "Inferred headerless RAW shape %sx%s for %s from %d payload bytes",
+            shape[0], shape[1], path, payload_bytes,
+        )
+    return shape
+
+
+def raw_detector_shape_for_payload(
+    payload_bytes: int, *, raw_dtype: str = "int32",
+) -> tuple[int, int] | None:
+    """The one established layout whose frame is exactly ``payload_bytes`` long, else ``None``."""
+    itemsize = np.dtype(raw_dtype).itemsize
+    if payload_bytes < 0 or payload_bytes % itemsize:
         return None
-    pixel_count = payload_bytes // dtype.itemsize
+    pixel_count = payload_bytes // itemsize
     matches = {
         shape for _name, shape in COMMON_RAW_DETECTOR_SHAPES
         if int(shape[0]) * int(shape[1]) == pixel_count
     }
-    if len(matches) != 1:
-        return None
-    shape = matches.pop()
-    logger.debug(
-        "Inferred headerless RAW shape %sx%s for %s from %d payload bytes",
-        shape[0], shape[1], path, payload_bytes,
-    )
-    return shape
+    return matches.pop() if len(matches) == 1 else None
 
 
 def read_detector_image_layout(
