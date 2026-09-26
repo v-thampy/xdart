@@ -225,8 +225,7 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     dialog = StitchCalibrationDialog(tmp_path, backend='multigeometry')
     assert [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())] == [
         '1 · Geometry', '2 · Select frames', '3 · Calibrate each frame', '4 · Fit and save']
-    form = dialog._beam_form
-    visible = lambda key: form.isRowVisible(dialog._path_rows.get(key, dialog._fields[key]))  # noqa: E731
+    visible = dialog._row_visible
     assert visible('beam_source') and not visible('rough_distance')  # a direct-beam scan by default
     dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
     assert visible('rough_distance') and visible('beam_pixel') and not visible('beam_source')

@@ -6,11 +6,13 @@ from contextlib import ExitStack
 import json
 import math
 from pathlib import Path
+import re
 import uuid
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.pages.operation_owner import SingleWorkerOwner, OperationCancelled, OperationTerminalStatus
+from xdart.gui.widgets.controls_panel import ControlsComboBox, browse_button
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.integrate.calibration_seed import ring_summary, rough_arm_record
 from xrd_tools.session.instrument import InstrumentGeometry
@@ -252,7 +254,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.saved_image_rotation = 0
         self._owner = SingleWorkerOwner(_run_job)
         self._fields = {}
-        self._path_rows = {}
+        #: key -> (form, row widget); a field sharing another's row is in _parts instead
+        self._rows = {}
+        self._parts = {}
         # The arm model the user chose; applied whenever it is available.
         self._preferred_arm_model = None
         outer = QtWidgets.QVBoxLayout(self)
@@ -295,6 +299,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
         form = QtWidgets.QFormLayout()
+        # The fields take the width; macOS would centre them at their size hints.
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
         layout.addLayout(form)
         self.tabs.addTab(widget, title)
         self._tab_pages[key] = widget
@@ -303,77 +310,143 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
     def _show_tab(self, key):
         self.tabs.setCurrentWidget(self._tab_pages[key])
 
-    def _edit(self, form, key, label, default='', *, chooser=None):
-        if chooser is not None and key.startswith('beam_'):
-            from xdart.gui.widgets.controls_panel import FormRow
-            row = FormRow(label=label, path=('Calibration', key), value=default, browse=True)
-            row.browseRequested.connect(lambda: self._browse(row.editor, chooser, key=key))
-            self._path_rows[key] = row
-            self._fields[key] = row.editor
-            form.addRow(row)
-            return row.editor
+    @staticmethod
+    def _tip(tip, *widgets):
+        for widget in widgets:
+            if tip and widget is not None:
+                widget.setToolTip(tip)
+
+    def _combo(self, form, label, items, *, tip=''):
+        """A Controls combo (readable popup rows) of ``(text, data)`` items, as one form row."""
+        combo = ControlsComboBox()
+        for text, value in items:
+            combo.addItem(text, value)
+        form.addRow(label, combo)
+        self._tip(tip, combo, form.labelForField(combo))
+        return combo
+
+    def _edit(self, form, key, label, default='', *, chooser=None, tip='', placeholder=''):
+        """One text field, with the Controls 📁 button when ``chooser`` names a file filter or 'directory'."""
         edit = QtWidgets.QLineEdit(str(default))
         edit.setObjectName(key)
+        edit.setPlaceholderText(placeholder)
         self._fields[key] = edit
-        if chooser is None:
-            form.addRow(label, edit)
-        else:
+        row = edit
+        if chooser is not None:
             row = QtWidgets.QWidget()
             layout = QtWidgets.QHBoxLayout(row)
             layout.setContentsMargins(0, 0, 0, 0)
-            layout.addWidget(edit)
-            button = QtWidgets.QPushButton('Browse…')
+            layout.addWidget(edit, 1)
+            button = browse_button(label)
             button.clicked.connect(lambda: self._browse(edit, chooser))
             layout.addWidget(button)
-            form.addRow(label, row)
+        form.addRow(label, row)
+        self._rows[key] = (form, row)
+        self._tip(tip, edit, form.labelForField(row))
         return edit
 
-    def _browse(self, edit, chooser, *, key=None):
+    def _attach(self, key, host, label, default='', *, tip='', placeholder='', width=None):
+        """A second field on a file row (the scan beside its SPEC file, the stem beside its folder)."""
+        caption = QtWidgets.QLabel(label)
+        edit = QtWidgets.QLineEdit(str(default))
+        edit.setObjectName(key)
+        edit.setPlaceholderText(placeholder)
+        if width:
+            edit.setMaximumWidth(width)
+        layout = self._rows[host][1].layout()
+        layout.addWidget(caption)
+        layout.addWidget(edit, 0 if width else 1)
+        self._fields[key] = edit
+        self._parts[key] = (host, caption, edit)
+        self._tip(tip, caption, edit)
+        return edit
+
+    def _show(self, key, shown):
+        """Show or hide a field: its form row, or itself when it shares another field's row."""
+        if key in self._parts:
+            for widget in self._parts[key][1:]:
+                widget.setVisible(shown)
+        else:
+            form, row = self._rows[key]
+            form.setRowVisible(row, shown)
+
+    def _row_visible(self, key):
+        if key in self._parts:
+            host, _caption, edit = self._parts[key]
+            return self._row_visible(host) and not edit.isHidden()
+        form, row = self._rows[key]
+        return form.isRowVisible(row)
+
+    def _label(self, key):
+        form, row = self._rows[key]
+        return form.labelForField(row)
+
+    def _auto_placeholders(self, prefix=''):
+        """The automatic image folder and stem for a blank field, as the Stitch page shows them."""
+        spec = self._text(prefix + 'source')
+        path = Path(spec) if spec else None
+        first = re.match(r'\s*(\d+)', self._text(prefix + 'scan'))
+        self._fields[prefix + 'images'].setPlaceholderText(
+            f'auto · {path.parent}' if path else "auto · the SPEC file's folder")
+        self._fields[prefix + 'stem'].setPlaceholderText(
+            f"auto · {path.stem if path else '<SPEC name>'}_scan{first[1] if first else '<N>'}_")
+
+    def _browse(self, edit, chooser):
         from xdart.gui.widgets.file_dialogs import browse
-        current = self._text(key) if key is not None else edit.text()
         folder = chooser == 'directory'
         picks = browse(self, 'Select images directory' if folder else 'Select file', folder=folder,
-                       file_filter='All files (*)' if folder else chooser, current=current,
+                       file_filter='All files (*)' if folder else chooser, current=edit.text(),
                        fallback=str(self.project_root))
-        path = picks[0] if picks else ''
-        if path:
-            if key is not None:
-                self._set_field_text(key, path)
-            else:
-                edit.setText(path)
+        if picks and picks[0]:
+            edit.setText(picks[0])
 
     def _set_field_text(self, key, value):
-        if key in self._path_rows:
-            from xrd_tools.session.readiness import ControlFormField, SectionId
-            row = self._path_rows[key]
-            row.apply_field(ControlFormField(section=SectionId.EXPERIMENT, path=row.path,
-                label=row.label.text(), value=str(value), browse=True))
-        else:
-            self._fields[key].setText(str(value))
+        self._fields[key].setText(str(value))
+
+    _SCAN_TIP = 'The SPEC scan number, e.g. 14 (or 14.1 for a repeated number).'
+    _FOLDER_TIP = "The folder holding this scan's image files. Blank: the SPEC file's folder."
+    _STEM_TIP = ("Text every image file name of this scan contains. Blank: <SPEC name>_scan<N>_, "
+                 "the beamline's naming.")
 
     def _build_source(self):
         layout, form = self._form('2 · Select frames', 'select')
-        self.source_kind = QtWidgets.QComboBox()
-        self.source_kind.addItem('SPEC + scan + images', 'spec')
-        self.source_kind.addItem('NeXus images + metadata', 'nexus_stack')
-        form.addRow('Source type', self.source_kind)
-        self._edit(form, 'source', 'Scan metadata file', chooser='All files (*)')
-        self._edit(form, 'scan', 'SPEC scan', '1')
-        self._edit(form, 'images', 'SPEC images directory', chooser='directory')
-        self._edit(form, 'stem', 'Image filename stem', '')
-        self._edit(form, 'entry', 'NeXus entry', 'entry')
-        reader = QtWidgets.QHBoxLayout()
-        for key, label, default in [('shape', 'RAW rows, columns', '195, 1475'), ('dtype', 'RAW dtype', 'int32'), ('header', 'Header bytes', '0')]:
-            reader.addWidget(QtWidgets.QLabel(label))
+        self.source_kind = self._combo(form, 'Source type', [('SPEC + scan + images', 'spec'),
+                                                             ('NeXus images + metadata', 'nexus_stack')],
+            tip='SPEC + images: a SPEC file lists each frame\'s angles and image files hold the frames. '
+                'NeXus: one file holds both.')
+        self._edit(form, 'source', 'SPEC file', chooser='All files (*)',
+                   tip='The calibrant scan: its SPEC file, or its NeXus file.')
+        self._attach('scan', 'source', 'Scan', '1', tip=self._SCAN_TIP, width=90)
+        self._edit(form, 'images', 'Images folder', chooser='directory', tip=self._FOLDER_TIP)
+        self._attach('stem', 'images', 'Stem', '', tip=self._STEM_TIP)
+        self._edit(form, 'entry', 'NeXus entry', 'entry', tip='The NeXus entry (group) holding the frames and angles.')
+        reader = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(reader)
+        row.setContentsMargins(0, 0, 0, 0)
+        raw_tip = 'Only for headerless .raw images: the frame\'s rows and columns, pixel type and header size.'
+        for key, label, default in [('shape', 'rows, columns', '195, 1475'), ('dtype', 'type', 'int32'),
+                                    ('header', 'header bytes', '0')]:
+            caption = QtWidgets.QLabel(label)
             edit = QtWidgets.QLineEdit(default)
+            edit.setObjectName(key)
             self._fields[key] = edit
-            reader.addWidget(edit)
-        layout.addLayout(reader)
-        self.rotation = QtWidgets.QComboBox()
-        for value in (0, 90, 180, 270):
-            self.rotation.addItem(f'{value}° counterclockwise', value)
-        form.addRow('Image rotation (applied once)', self.rotation)
+            self._tip(raw_tip, caption, edit)
+            row.addWidget(caption)
+            row.addWidget(edit, 1)
+        form.addRow('RAW images', reader)
+        self._rows['raw'] = (form, reader)
+        self._tip(raw_tip, form.labelForField(reader))
+        self.rotation = self._combo(form, 'Image rotation (applied once)',
+                                    [(f'{value}° counterclockwise', value) for value in (0, 90, 180, 270)],
+                                    tip='Rotates every image once before calibration; use it when the stored '
+                                        'images are turned relative to the detector view you calibrate in.')
+        self.source_kind.currentIndexChanged.connect(self._sync_source_rows)
+        for key in ('source', 'scan'):
+            self._fields[key].textChanged.connect(lambda _text: self._auto_placeholders())
+        self._sync_source_rows()
+        self._auto_placeholders()
         self.list_button = QtWidgets.QPushButton('Read metadata and suggest 5 frames')
+        self.list_button.setToolTip('Lists the scan\'s frames with their angles and ticks five that span them.')
         self.list_button.clicked.connect(self._enumerate)
         layout.addWidget(self.list_button)
         self.selection = QtWidgets.QTableWidget(0, 4)
@@ -381,8 +454,15 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.selection.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.selection, 1)
         self.prepare_button = QtWidgets.QPushButton('Prepare selected images')
+        self.prepare_button.setToolTip('Copies the ticked frames into this session\'s folder, ready for pyFAI.')
         self.prepare_button.clicked.connect(self._prepare)
         layout.addWidget(self.prepare_button)
+
+    def _sync_source_rows(self, *_args):
+        spec = self.source_kind.currentData() == 'spec'
+        for key, shown in (('scan', spec), ('images', spec), ('raw', spec), ('entry', not spec)):
+            self._show(key, shown)
+        self._label('source').setText('SPEC file' if spec else 'NeXus file')
 
     def _build_frames(self):
         layout, form = self._form('3 · Calibrate each frame', 'calibrate')
@@ -410,7 +490,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _build_fit(self, backend):
         layout, form = self._form('4 · Fit and save', 'fit')
-        self.backend = QtWidgets.QComboBox()
+        self.backend = ControlsComboBox()
         self.backend.addItem('pyFAI MultiGeometry', 'multigeometry')
         self.backend.addItem('xrayutilities · PSIC SURFACE', 'xu_hist')
         self.backend.setCurrentIndex(max(0, self.backend.findData(backend)))
@@ -418,7 +498,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.scales = QtWidgets.QCheckBox('Fit MG motor scales when angle coverage identifies them')
         self.scales.setChecked(False)
         form.addRow(self.scales)
-        self.arm_model = QtWidgets.QComboBox()
+        self.arm_model = ControlsComboBox()
         self.arm_model.addItem('Stacked arm (5 parameters)', 'stacked')
         self.arm_model.addItem('Stacked arm + detector mount and sample offset', 'stacked_extended')
         form.addRow('Arm model', self.arm_model)
@@ -436,14 +516,14 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         layout.addWidget(self.fit_button)
         box = QtWidgets.QGroupBox('Automatic refinement from a calibrant scan (MultiGeometry)')
         auto = QtWidgets.QFormLayout(box)
-        self.refine_calibrant = QtWidgets.QComboBox()
+        self.refine_calibrant = ControlsComboBox()
         self.refine_calibrant.setEditable(True)
         self.refine_calibrant.addItems(['LaB6', 'CeO2', 'Si', 'Al2O3', 'Cr2O3', 'AgBh'])
         auto.addRow('Calibrant', self.refine_calibrant)
         self.refine_confirm = QtWidgets.QCheckBox(
             'The scan in Select frames is this calibrant, not a sample')
         auto.addRow(self.refine_confirm)
-        self.refine_seed = QtWidgets.QComboBox()
+        self.refine_seed = ControlsComboBox()
         self.refine_seed.addItem('Current fit (unsaved)', 'fit')
         self.refine_seed.addItem('Geometry file', 'file')
         auto.addRow('Start from', self.refine_seed)
@@ -490,48 +570,67 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         # the arm's motors are these circles' (read by name as before)
         self._fields['del_motor'] = self.geometry_editor.motor_edit('del')
         self._fields['nu_motor'] = self.geometry_editor.motor_edit('nu')
-        self.rough_mode = QtWidgets.QComboBox()
-        for label, value in [('Direct-beam scan', 'scan'), ('Enter the distance', 'manual'),
-                             ('Skip', 'skip')]:
-            self.rough_mode.addItem(label, value)
-        form.addRow('Rough geometry', self.rough_mode)
-        self._edit(form, 'rough_distance', 'Sample–detector distance (mm)', '')
-        self.beam_source_kind = QtWidgets.QComboBox()
-        for label, value in [('SPEC + image series', 'spec_series'),
-                             ('SPEC + Eiger / NeXus', 'spec_container'),
-                             ('NeXus images + metadata', 'nexus')]:
-            self.beam_source_kind.addItem(label, value)
-        form.addRow('Source', self.beam_source_kind)
-        self._edit(form, 'beam_source', 'SPEC file', chooser='All files (*)')
-        self._edit(form, 'beam_scan', 'SPEC scan', '1')
-        self._edit(form, 'beam_image_file', 'Eiger / NeXus images', chooser='HDF5 / NeXus (*.h5 *.hdf5 *.nxs *.nexus);;All files (*)')
-        self._edit(form, 'beam_images', 'SPEC images directory', chooser='directory')
-        self._edit(form, 'beam_stem', 'Image filename stem', '')
-        self._edit(form, 'beam_entry', 'NeXus entry', 'entry')
+        self.rough_mode = self._combo(form, 'Rough geometry', [('Direct-beam scan', 'scan'),
+                                                               ('Enter the distance', 'manual'), ('Skip', 'skip')],
+            tip='A first guess of where the detector is, so pyFAI opens each frame with its rings roughly in '
+                'place and the table lists which rings to expect. A direct-beam scan measures the distance; '
+                'or type it. Rough values are enough.')
+        self._edit(form, 'rough_distance', 'Sample–detector distance (mm)', '',
+                   tip='Sample to detector, in millimetres, with the detector facing the beam squarely.')
+        self.beam_source_kind = self._combo(form, 'Source', [('SPEC + image series', 'spec_series'),
+                                                             ('SPEC + Eiger / NeXus', 'spec_container'),
+                                                             ('NeXus images + metadata', 'nexus')],
+            tip='Where the direct-beam scan\'s angles and images come from.')
+        self._edit(form, 'beam_source', 'SPEC file', chooser='All files (*)',
+                   tip='The direct-beam scan: its SPEC file (the angles), or its NeXus file.')
+        self._attach('beam_scan', 'beam_source', 'Scan', '1', tip=self._SCAN_TIP, width=90)
+        self._edit(form, 'beam_image_file', 'Eiger / NeXus images',
+                   chooser='HDF5 / NeXus (*.h5 *.hdf5 *.nxs *.nexus);;All files (*)',
+                   tip='The Eiger master or NeXus file holding this scan\'s images.')
+        self._edit(form, 'beam_images', 'Images folder', chooser='directory', tip=self._FOLDER_TIP)
+        self._attach('beam_stem', 'beam_images', 'Stem', '', tip=self._STEM_TIP)
+        self._edit(form, 'beam_entry', 'NeXus entry', 'entry', tip='The NeXus entry (group) holding the images.')
         self.beam_source_kind.currentIndexChanged.connect(self._sync_rough_rows)
-        self._edit(form, 'beam_motor', 'Two-theta motor (degrees)', 'del')
-        self._edit(form, 'beam_zero', 'Known normal-incidence zero (degrees)', '0')
-        self._edit(form, 'beam_pixel', 'Approximate beam pixel x, y (oriented image)', '200, 100')
-        self._edit(form, 'beam_detector', 'Detector factory name', 'Pilatus300kw')
-        self.motion = QtWidgets.QComboBox()
-        self.motion.addItems(['horizontal', 'vertical'])
-        form.addRow('Beam motion', self.motion)
-        self._edit(form, 'beam_strip', 'Strip half width (pixels)', '2')
-        self._edit(form, 'beam_roi', 'ROI x0, y0, x1, y1 (optional)', '')
-        self._edit(form, 'beam_mask', 'Mask file (optional)', chooser='Masks (*.edf *.tif *.tiff *.npy);;All files (*)')
-        self._edit(form, 'beam_saturation', 'Saturation level (optional)', '')
+        for key in ('beam_source', 'beam_scan'):
+            self._fields[key].textChanged.connect(lambda _text: self._auto_placeholders('beam_'))
+        self._auto_placeholders('beam_')
+        self._edit(form, 'beam_motor', 'Two-theta motor (degrees)', 'del',
+                   tip='The motor that swings the detector in the direct-beam scan (del for psic\'s vertical arm).')
+        self._edit(form, 'beam_zero', 'Known normal-incidence zero (degrees)', '0',
+                   tip='That motor\'s reading when the detector faces the beam squarely; 0 unless it is offset.')
+        self._edit(form, 'beam_pixel', 'Approximate beam pixel x, y (oriented image)', '',
+                   placeholder='column, row — e.g. 737, 97',
+                   tip='Column, row of the pixel the direct beam hits with the detector facing it squarely (the '
+                       'motor at the zero above), in the image as displayed. Rough is fine.')
+        self._edit(form, 'beam_detector', 'Detector factory name', 'Pilatus300kw',
+                   tip='The detector model; it sets the pixel size and shape.')
+        self.motion = self._combo(form, 'Beam motion', [('horizontal', None), ('vertical', None)],
+                                  tip='The direction the beam spot moves across the image as the motor turns.')
+        self._edit(form, 'beam_strip', 'Strip half width (pixels)', '2',
+                   tip='The beam spot is searched in a strip this many pixels either side of its path.')
+        self._edit(form, 'beam_roi', 'ROI x0, y0, x1, y1 (optional)', '',
+                   tip='Search only this pixel box (columns x0–x1, rows y0–y1).')
+        self._edit(form, 'beam_mask', 'Mask file (optional)', chooser='Masks (*.edf *.tif *.tiff *.npy);;All files (*)',
+                   tip='Pixels to ignore when finding the beam spot.')
+        self._edit(form, 'beam_saturation', 'Saturation level (optional)', '',
+                   tip='Counts at or above this are saturated and ignored.')
         self.rough_note = QtWidgets.QLabel()
         self.rough_note.setWordWrap(True)
         layout.addWidget(self.rough_note)
         self.beam_button = QtWidgets.QPushButton('Fit direct-beam distance')
+        self.beam_button.setToolTip('Finds the beam spot in each image and fits the distance from how far '
+                                    'it moves per degree.')
         self.beam_button.clicked.connect(self._distance)
         layout.addWidget(self.beam_button)
         self.beam_summary = QtWidgets.QPlainTextEdit()
         self.beam_summary.setReadOnly(True)
-        layout.addWidget(self.beam_summary, 1)
+        self.beam_summary.setMaximumHeight(self.beam_summary.fontMetrics().lineSpacing() * 9)
+        layout.addWidget(self.beam_summary)
         self.apply_distance_button = QtWidgets.QPushButton('Use result as distance seed')
+        self.apply_distance_button.setToolTip('Starts the final fit (4 · Fit and save) from this distance.')
         self.apply_distance_button.clicked.connect(self._apply_distance)
         layout.addWidget(self.apply_distance_button)
+        layout.addStretch(1)
         self.rough_mode.currentIndexChanged.connect(self._sync_rough_rows)
         for key in ('rough_distance', 'beam_pixel', 'beam_zero', 'beam_motor', 'beam_detector'):
             self._fields[key].editingFinished.connect(self._render_frames)
@@ -560,12 +659,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                    **dict.fromkeys(self._GEOMETRY_ROWS, mode != 'skip')}
         form = self._beam_form
         for key, shown in visible.items():
-            form.setRowVisible(self._path_rows.get(key, self._fields[key]), shown)
+            self._show(key, shown)
         form.setRowVisible(self.beam_source_kind, scan)
         form.setRowVisible(self.motion, scan)
         for widget in (self.beam_button, self.beam_summary, self.apply_distance_button):
             widget.setVisible(scan)
-        self._path_rows['beam_source'].label.setText('NeXus file' if kind == 'nexus' else 'SPEC file')
+        self._label('beam_source').setText('NeXus file' if kind == 'nexus' else 'SPEC file')
         self.rough_note.setText(self._ROUGH_NOTES[mode])
         if hasattr(self, 'frame_table'):
             self._render_frames()
@@ -677,8 +776,6 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._sync_arm_model()
 
     def _text(self, key):
-        if key in self._path_rows:
-            return str(self._path_rows[key].current_value()).strip()
         return self._fields[key].text().strip()
 
     def _reader(self):
@@ -701,9 +798,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     raise ValueError('select the Eiger or NeXus image container for this SPEC scan')
                 return SourceSpec(Path(path).resolve(), kind, entry=self._text('beam_entry') or 'entry',
                     options={'scan': self._text('beam_scan'), 'image_file': self._text('beam_image_file')})
-            if not self._text(prefix + 'images'):
-                raise ValueError('SPEC calibration requires an image directory')
-            options = {'scan': self._text(prefix + 'scan'), 'image_dir': self._text(prefix + 'images'),
+            # a blank folder is the SPEC file's, as in Stitch; a blank stem is the source's default
+            options = {'scan': self._text(prefix + 'scan'),
+                       'image_dir': self._text(prefix + 'images') or str(Path(path).resolve().parent),
                        'read_image_kwargs': self._reader()}
             if self._text(prefix + 'stem'):
                 options['image_stem'] = self._text(prefix + 'stem')

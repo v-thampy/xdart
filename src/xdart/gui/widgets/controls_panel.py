@@ -568,6 +568,30 @@ class _ControlsComboBox(QtWidgets.QComboBox):
         super().showPopup()
 
 
+class ControlsComboBox(_ControlsComboBox):
+    """The Controls combo for any host: popup rows at the closed control's height, never elided.
+
+    Qt's native popup ignores the QSS item-height floor on some platforms; the
+    parented delegate keeps a Tight live-theme change from compressing choices.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("controlsComboBox")
+        self.setItemDelegate(_ComboPopupItemDelegate(self))
+
+
+def browse_button(label: str) -> QtWidgets.QToolButton:
+    """The Controls 📁 browse button; the host connects ``clicked``."""
+    button = QtWidgets.QToolButton()
+    button.setText("📁")
+    button.setObjectName("controlsBrowseButton")
+    button.setToolTip(f"Browse {label}")
+    button.setMinimumWidth(31)
+    button.setMaximumWidth(36)
+    return button
+
+
 class FormRow(QtWidgets.QWidget):
     """One editable row in the Controls form."""
 
@@ -630,13 +654,8 @@ class FormRow(QtWidgets.QWidget):
             lay.addWidget(editor, 1)
         elif kind == "combo":
             lay.addWidget(self.label)
-            editor = _ControlsComboBox()
-            editor.setObjectName("controlsComboBox")
-            # Qt's native popup ignores the QSS item-height floor on some
-            # platforms.  Keep this parented delegate alive with the row so a
-            # Tight live-theme change cannot compress choices into one line.
-            self._combo_popup_delegate = _ComboPopupItemDelegate(editor)
-            editor.setItemDelegate(self._combo_popup_delegate)
+            editor = ControlsComboBox()
+            self._combo_popup_delegate = editor.itemDelegate()
             values = [str(choice) for choice in choices]
             if not values and value not in (None, ""):
                 values = [str(value)]
@@ -681,13 +700,8 @@ class FormRow(QtWidgets.QWidget):
             self.editor.setCursorPosition(0)
         self.browse_button = None
         if browse:
-            btn = QtWidgets.QToolButton()
-            btn.setText("📁")
-            btn.setObjectName("controlsBrowseButton")
-            btn.setToolTip(f"Browse {label}")
+            btn = browse_button(label)
             btn.clicked.connect(lambda _=False, p=self._path: self.browseRequested.emit(p))
-            btn.setMinimumWidth(31)
-            btn.setMaximumWidth(36)
             btn.setEnabled(self._enabled)
             lay.addWidget(btn)
             self.browse_button = btn

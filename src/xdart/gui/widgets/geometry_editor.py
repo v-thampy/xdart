@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
+from xdart.gui.widgets.controls_panel import ControlsComboBox
 from xrd_tools.session.instrument import GEOMETRIES, GEOMETRY_LABELS, PLANE_LABELS, InstrumentGeometry
 
 #: Every circle any geometry has, in display order (a row each; a geometry shows its own).
@@ -25,11 +26,12 @@ class GeometryEditor(QtWidgets.QWidget):
         self._used, self._used_by = frozenset(used), str(used_by)
         self._form = QtWidgets.QFormLayout(self)
         self._form.setContentsMargins(0, 0, 0, 0)
-        self.geometry = QtWidgets.QComboBox()
+        self._form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
+        self.geometry = ControlsComboBox()
         for key, label in GEOMETRY_LABELS.items():
             self.geometry.addItem(label, key)
         self._form.addRow('Diffractometer', self.geometry)
-        self.plane = QtWidgets.QComboBox()
+        self.plane = ControlsComboBox()
         for key, label in PLANE_LABELS.items():
             self.plane.addItem(label, key)
         self.plane.setToolTip('The 2θ arm\'s scattering plane. Vertical: the detector turns about a '
@@ -38,7 +40,7 @@ class GeometryEditor(QtWidgets.QWidget):
         self._form.addRow('Scattering plane', self.plane)
         self._motors = {}
         for circle in _ALL_CIRCLES:
-            combo = QtWidgets.QComboBox()
+            combo = ControlsComboBox()
             combo.setEditable(True)
             combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
             combo.setEditText(circle)
