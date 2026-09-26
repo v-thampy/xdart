@@ -246,6 +246,10 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     assert seeded.dist == pytest.approx(0.5)  # this session's rough geometry, not the file
     # the beam pixel is (x, y) = (column, row), as the direct-beam fit reads it
     assert (seeded.poni2, seeded.poni1) == pytest.approx((737.5 * 172e-6, 97.5 * 172e-6))
+    # a beamline whose del motor is "delta": the zero motor "del" names the circle
+    dialog._frame_motors = ('delta', 'nu')
+    dialog.frames = (replace(dialog.frames[0], motors={'delta': 20., 'nu': 0.}),)
+    assert dialog._rough_record() is not None
     dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
     assert not visible('beam_pixel') and dialog._seed_options()['rough'] is None
     assert PoniFile(_pyfai_arguments(dialog.frames[0], dialog._seed_options())[3]).dist == pytest.approx(0.39)

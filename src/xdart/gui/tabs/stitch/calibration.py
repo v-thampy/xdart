@@ -576,10 +576,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 distance = self._distance_result.distance_m
             else:
                 return None
+            zero = self._text('beam_motor')  # a circle ("del") or its motor, through the geometry
+            circle = self.geometry_editor.value().circle_for_position(zero)
+            zero = {'del': self._frame_motors[0], 'nu': self._frame_motors[1]}.get(circle, zero)
             return rough_arm_record(
                 distance_m=distance, detector=self._text('beam_detector'),
                 beam_px=tuple(float(v) for v in self._text('beam_pixel').split(',')),
-                zero_deg=float(self._text('beam_zero') or 0), zero_motor=self._text('beam_motor'),
+                zero_deg=float(self._text('beam_zero') or 0), zero_motor=zero,
                 del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1])
         except (ValueError, TypeError, KeyError, RuntimeError):
             return None
