@@ -73,6 +73,16 @@ def _single_arm_frames(tmp_path):
     return _frames(tmp_path / 'frames', controls, _calibration().poni)
 
 
+def _horizontal_frames(tmp_path):
+    """Guided frames of a horizontal twoc arm: psic's arm at del = 0, read from the 2θ motor alone."""
+    from dataclasses import replace
+    from tests.core.test_stitch_guided_calibration import _frames
+    controls, _calibrant = _ring_controls({'nu_offset': -.02, 'del_offset': .03}, _calibration(),
+                                          [(0., nu) for nu in (6., 18., 30., 42.)])
+    controls = [replace(control, motors={'tth': control.motors['nu']}) for control in controls]
+    return _frames(tmp_path / 'frames', controls, _calibration().poni)
+
+
 def _save_to(monkeypatch, target):
     monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName',
                         staticmethod(lambda *args, **kwargs: (str(target), '')))
@@ -135,7 +145,7 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
         dialog.set_instrument(InstrumentGeometry('twoc'))
         dialog.frames, dialog._frame_motors = frames, ('tth', None)
         dialog._render_frames()
-        assert not dialog.arm_model.isEnabled() and 'no nu positions' in dialog.arm_model.toolTip()
+        assert not dialog.arm_model.isEnabled() and 'holds one circle at zero' in dialog.arm_model.toolTip()
         dialog.fit_button.click()
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
@@ -154,6 +164,38 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
         assert page._instrument() == InstrumentGeometry('twoc')
         assert page._value("source_motors") == "del_angle=tth"
         assert page._arm_problem() is None
+    finally:
+        dialog.close()
+        page.shutdown()
+
+
+def test_a_horizontal_twoc_arm_is_fitted_saved_and_adopted_with_del_held_at_zero(qapp, tmp_path, monkeypatch):
+    from xrd_tools.session.instrument import InstrumentGeometry
+    (tmp_path / 'frames').mkdir()
+    frames = _horizontal_frames(tmp_path)
+    page, dialog = _page_with_dialog(tmp_path)
+    try:
+        dialog.set_instrument(InstrumentGeometry('twoc', plane='horizontal'))
+        dialog.frames, dialog._frame_motors = frames, (None, 'tth')
+        dialog._render_frames()
+        dialog.fit_button.click()
+        _wait(dialog)
+        assert dialog.fit is not None, dialog.status.text()
+        assert dialog.fit.message == 'Converged; one detector arm, del held at zero; motor scales fixed at degrees'
+        provenance, record = dialog.fit.asset['provenance'], dialog.fit.asset['calibration']
+        assert provenance['source_motors'] == {'nu_angle': 'tth'} and record['pos_names'] == ['nu_angle']
+        assert provenance['instrument_geometry'] == InstrumentGeometry('twoc', plane='horizontal').to_record()
+        fitted = dict(zip(record['param_names'], record['param']))
+        assert fitted['nu_offset'] == pytest.approx(-.02, abs=2e-3)
+        assert fitted['del_offset'] == pytest.approx(.03, abs=2e-3)  # the detector's fixed pitch
+        target = (tmp_path / 'calibration' / 'twoc-horizontal.json').resolve()
+        _save_to(monkeypatch, target)
+        dialog.save_button.click()
+        assert page._instrument() == InstrumentGeometry('twoc', plane='horizontal')
+        assert page._value("source_motors") == "nu_angle=tth"
+        assert page._arm_problem() is None
+        page._set_instrument(InstrumentGeometry('twoc'))  # the vertical plane cannot take it
+        assert 'Choose the horizontal scattering plane' in page._arm_problem()
     finally:
         dialog.close()
         page.shutdown()

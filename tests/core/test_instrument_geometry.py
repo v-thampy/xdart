@@ -58,13 +58,72 @@ def test_fourc_and_twoc_are_psics_arm_with_nu_held_at_zero():
     assert InstrumentGeometry.pick('fourc', ['tth', 'del', 'th']).motor('tth') == 'tth'  # its own name first
 
 
+def test_the_scattering_plane_says_which_psic_circle_a_2theta_arm_plays():
+    vertical, horizontal = InstrumentGeometry('twoc'), InstrumentGeometry('twoc', plane='horizontal')
+    assert (vertical.stitch_arm(), horizontal.stitch_arm()) == (('tth', None), (None, 'tth'))
+    assert horizontal.as_psic() == {'th': 'mu', 'tth': 'nu'} and InstrumentGeometry().as_psic() == {}
+    assert [horizontal.circle_for_position(name) for name in ('nu_angle', 'del_angle', 'mu')] == ['tth', None, 'th']
+    assert [horizontal.arm_role(name) for name in ('nu', 'tth', 'del')] == ['nu', 'nu', None]
+    picked = InstrumentGeometry.pick('twoc', ['nu', 'mu', 'del'], keep=horizontal)
+    assert (picked.plane, picked.motor('tth'), picked.motor('th')) == ('horizontal', 'nu', 'mu')
+    fourc = InstrumentGeometry('fourc', (('tth', 'gam'),), 'horizontal')
+    assert InstrumentGeometry.from_record(fourc.to_record()) == fourc
+    assert fourc.to_record()['plane'] == 'horizontal' and 'plane' not in InstrumentGeometry().to_record()
+    older = {'geometry': 'twoc', 'motors': {'th': 'th', 'tth': 'tth'}}  # a round-12 record: no plane
+    assert InstrumentGeometry.from_record(older) == vertical
+    with pytest.raises(ValueError, match='fourc and twoc'):
+        InstrumentGeometry('psic', plane='horizontal')
+    with pytest.raises(ValueError, match='unknown scattering plane'):
+        InstrumentGeometry('twoc', plane='tilted')
+
+
+def _affine(positions):
+    """An independent-Euler goniometer file: rot1 follows its last position, rot2 its first."""
+    names = ['dist', 'poni1', 'poni2', 'rot1_offset', 'rot1_scale', 'rot2_offset', 'rot2_scale']
+    rot1 = f'rot1_scale * {positions[-1]} + rot1_offset' if len(positions) > 1 else 'rot1_offset'
+    return {'content': 'Goniometer calibration v2', 'detector': 'Pilatus300kw', 'wavelength': 1e-10,
+            'param_names': names, 'param': [.39, .035, .045, 0., .0174533, 0., .0174533],
+            'pos_names': list(positions),
+            'trans_function': {'content': 'GeometryTransformation', 'param_names': names,
+                               'pos_names': list(positions), 'dist_expr': 'dist', 'poni1_expr': 'poni1',
+                               'poni2_expr': 'poni2', 'rot1_expr': rot1,
+                               'rot2_expr': f'rot2_scale * {positions[0]} + rot2_offset', 'rot3_expr': '0.0',
+                               'constants': {}}}
+
+
+def test_a_calibrations_arm_comes_from_its_transformation_not_its_names():
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.geometry import DetectorCalibration
+    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
+    from xrd_tools.session.instrument import calibration_arm
+    calibration = DetectorCalibration(PONI(dist=.39, poni1=.035, poni2=.045, wavelength=1e-10,
+                                           detector='Pilatus300kw'), detector_config={'orientation': 3})
+    record = lambda **motors: StackedDetectorArm(**motors).to_pyfai_goniometer(calibration)  # noqa: E731
+    assert calibration_arm(record(), {'del_angle': 'del', 'nu_angle': 'nu'}) == ({'del', 'nu'}, set())
+    assert calibration_arm(record(nu_motor=None), {'del_angle': 'tth'}) == ({'del'}, {'nu'})
+    assert calibration_arm(record(del_motor=None), {'nu_angle': 'tth'}) == ({'nu'}, {'del'})
+    # custom position names bound explicitly (Codex round 12 F1): the transformation says del and nu
+    assert calibration_arm(_affine(['dval', 'nval']), {'dval': 'del', 'nval': 'nu'}) == ({'del', 'nu'}, set())
+    assert calibration_arm(_affine(['pos']), {'pos': 'tth'}) == ({'del'}, set())  # rot2 alone: del
+    turned = _affine(['dval', 'nval'])
+    turned['trans_function']['rot3_expr'] = 'rot2_scale * dval'
+    with pytest.raises(ValueError, match='beam-axis rotation'):
+        calibration_arm(turned, {'dval': 'del', 'nval': 'nu'})
+    with pytest.raises(ValueError, match='cannot be read'):
+        calibration_arm({'content': 'x'}, {})
+
+
 def test_a_calibration_must_drive_the_geometrys_arm():
-    psic_arm = ('del_angle', 'nu_angle')
-    assert 'one detector circle' in InstrumentGeometry('fourc').arm_mismatch(psic_arm)
-    assert 'one detector circle' in InstrumentGeometry('twoc').arm_mismatch(('del_value', 'nu_value'))
-    assert InstrumentGeometry('twoc').arm_mismatch(('del_angle',), single_arm=True) is None
-    assert 'nu held at zero' in InstrumentGeometry('psic').arm_mismatch(('del_angle',), single_arm=True)
-    assert InstrumentGeometry('psic').arm_mismatch(psic_arm) is None
-    # custom positions carry the user's own binding; a legacy one-position file is unchanged
-    assert InstrumentGeometry('fourc').arm_mismatch(('dval', 'nval')) is None
-    assert InstrumentGeometry('psic').arm_mismatch(('del_value',)) is None
+    fourc, twoc_h, psic = InstrumentGeometry('fourc'), InstrumentGeometry('twoc', plane='horizontal'), InstrumentGeometry()
+    both, vertical, horizontal = ({'del', 'nu'}, set()), ({'del'}, {'nu'}), ({'nu'}, {'del'})
+    assert 'fourc has one detector circle' in fourc.arm_mismatch(*both)
+    assert 'twoc has one detector circle' in twoc_h.arm_mismatch(*both)
+    assert fourc.arm_mismatch(*vertical) is None and twoc_h.arm_mismatch(*horizontal) is None
+    assert 'Choose the horizontal scattering plane' in fourc.arm_mismatch(*horizontal)
+    assert 'Choose the vertical scattering plane' in twoc_h.arm_mismatch(*vertical)
+    assert 'nu held at zero' in psic.arm_mismatch(*vertical)
+    assert 'del held at zero' in psic.arm_mismatch(*horizontal)
+    assert psic.arm_mismatch(*both) is None
+    # a legacy one-position file moves del and holds nothing: psic keeps admitting it
+    assert psic.arm_mismatch({'del'}) is None and fourc.arm_mismatch({'del'}) is None
+    assert 'vertical' in twoc_h.arm_mismatch({'del'})

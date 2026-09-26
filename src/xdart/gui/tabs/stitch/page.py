@@ -103,6 +103,17 @@ def _read_goniometer(path, _mtime_ns, _size):  # the readiness line asks on ever
     return record
 
 
+@functools.lru_cache(maxsize=8)
+def _bound_arm(path, _mtime_ns, _size, bindings):
+    """The detector circles a goniometer JSON moves and holds, as bound to the scan's
+    motors: ("ok", moving, holds) or ("unknown", why)."""
+    from xrd_tools.session.instrument import calibration_arm
+    try:
+        return ("ok", *calibration_arm(_read_goniometer(path, _mtime_ns, _size), dict(bindings)))
+    except ValueError as error:
+        return ("unknown", str(error))
+
+
 def _goniometer_positions(path) -> tuple[str, ...]:
     """The positions a pyFAI goniometer JSON declares, or () when it cannot be read."""
     record = _goniometer_record(path)
@@ -743,8 +754,8 @@ class StitchPage(QtWidgets.QWidget):
         motor of its circle under Calibrate ▸ Geometry (del_value → the del motor; in fourc or
         twoc del is the 2θ circle), so a calibration file's position names never have to match
         the scan's. A position that names no circle keeps the motor the mapping gives it, else
-        its name without its suffix. PONI + offsets maps the Geometry's arm (del, and nu unless
-        it is a single 2θ arm) with one reference each. XU owns its own mapping.
+        its name without its suffix. PONI + offsets keeps the del/nu positions its mapping
+        names (a fresh one maps the Geometry's arm), one reference each. XU owns its mapping.
         """
         if not hasattr(self, "advanced") or self._value("backend") == "xrayutilities histogram":
             return
@@ -755,8 +766,10 @@ class StitchPage(QtWidgets.QWidget):
             given = {}
         if self._value("geometry_kind") == "Goniometer JSON":
             positions = _goniometer_positions(self._value("geometry_path"))
-        else:
-            positions = ("del",) if geometry.stitch_arm()[1] is None else ("del", "nu")
+        else:  # PONI + offsets: the circles the mapping names (a loaded form's, kept as it is);
+            # a fresh mapping takes the Geometry's arm
+            positions = tuple(name for name in ("del", "nu") if name in given) or tuple(
+                circle for circle, motor in zip(("del", "nu"), geometry.stitch_arm()) if motor is not None)
             self._sync_poni_references(positions)
         if not positions:
             return
@@ -790,19 +803,33 @@ class StitchPage(QtWidgets.QWidget):
 
     def _arm_problem(self):
         """Why the calibration cannot drive the Geometry's detector arm (None when it can):
-        fourc and twoc have one 2θ circle, psic's del on nu."""
-        from xrd_tools.core.geometry.stacked_arm import is_single_arm
+        the circles it moves and holds come from what it is bound to — a goniometer JSON's
+        transformation, a PONI + offsets form's del/nu mapping — never from position names."""
         geometry = self._instrument()
         if self._value("backend") == "xrayutilities histogram":
             return (None if geometry.stitch_arm()[1] is not None else
                     "The xrayutilities backend fits psic's del-on-nu arm; choose psic under Calibrate ▸ "
                     "1 · Geometry, or the pyFAI MultiGeometry backend for a single 2θ arm.")
-        if self._value("geometry_kind") != "Goniometer JSON":
-            return None  # PONI + offsets maps the Geometry's own arm
-        record = _goniometer_record(self._value("geometry_path"))
-        if record is None:
+        try:
+            bindings = tuple(_parse_pairs(self._value("source_motors") or ""))
+        except ValueError:
+            return None  # the form refuses a malformed mapping itself
+        if self._value("geometry_kind") != "Goniometer JSON":  # PONI + offsets: del and/or nu
+            moving = {name for name, _motor in bindings} & {"del", "nu"}
+            # a mapping naming neither is refused by the form itself
+            return geometry.arm_mismatch(moving, {"del", "nu"} - moving) if moving else None
+        path = Path(str(self._value("geometry_path") or "").strip())
+        if _goniometer_record(path) is None:
             return None  # an unreadable calibration is refused where it is read
-        return geometry.arm_mismatch(record["trans_function"]["pos_names"], single_arm=is_single_arm(record))
+        state = path.stat()
+        found = _bound_arm(str(path), state.st_mtime_ns, state.st_size, bindings)
+        if found[0] == "ok":
+            return geometry.arm_mismatch(found[1], found[2])
+        if None not in geometry.stitch_arm():
+            return None  # psic holds no circle: the operation reads the calibration itself
+        return (f"This calibration's detector arm cannot be established ({found[1]}), and "
+                f"{geometry.geometry} holds a detector circle at zero. Choose psic under Calibrate ▸ "
+                "1 · Geometry, or calibrate its 2θ arm.")
 
     def _instrument(self):
         """The diffractometer and motor names: Calibrate ▸ 1 · Geometry (saved with the
@@ -853,7 +880,7 @@ class StitchPage(QtWidgets.QWidget):
             circle = geometry.circle_for_position(position)
             if circle is not None:
                 motors[circle] = motor
-        self._set_instrument(InstrumentGeometry(geometry.geometry, tuple(motors.items())))
+        self._set_instrument(InstrumentGeometry(geometry.geometry, tuple(motors.items()), geometry.plane))
 
     def _refresh_xu_geometry(self, *_args, calibration=None):
         """Present asset-owned settings through the existing strict admission owner."""
@@ -1008,6 +1035,10 @@ class StitchPage(QtWidgets.QWidget):
             fields.update(q_min=form.q_range[0], q_max=form.q_range[1])
         for key, value in fields.items():
             self.set_field(key, value)
+        # the form's own mapping and references, as saved: an earlier field change may have
+        # synced them to the page's geometry meanwhile
+        for key in ("source_motors", "poni_references"):
+            self.set_field(key, fields[key])
         self._adopt_mapping(form.source_motors)  # the form's motors become the geometry's
         selection = form.source_selection
         self.set_field("source_kind", selection.kind)

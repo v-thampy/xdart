@@ -27,3 +27,24 @@ def test_the_editor_shows_each_geometrys_circles_and_takes_the_scans_names(qapp)
     editor.set_value(InstrumentGeometry('twoc'))
     assert editor.value() == InstrumentGeometry('twoc') and shown() == ['th', 'tth']
     editor.deleteLater()
+
+
+def test_fourc_and_twoc_take_a_scattering_plane(qapp):
+    editor = GeometryEditor(used=('nu', 'del', 'tth'), used_by='Stitch')
+    changed = []
+    editor.changed.connect(lambda: changed.append(True))
+    assert not editor._form.isRowVisible(editor.plane)  # psic moves both detector circles
+    editor.geometry.setCurrentIndex(editor.geometry.findData('twoc'))
+    assert editor._form.isRowVisible(editor.plane) and editor.value().plane == 'vertical'
+    assert "psic's del" in editor._motors['tth'].toolTip()
+    changed.clear()
+    editor.plane.setCurrentIndex(editor.plane.findData('horizontal'))
+    assert changed and editor.value() == InstrumentGeometry('twoc', plane='horizontal')
+    assert editor.value().stitch_arm() == (None, 'tth') and "psic's nu" in editor._motors['tth'].toolTip()
+    editor.set_available_motors(['nu', 'mu'])  # a psic run as a horizontal twoc: its nu is the 2θ
+    assert (editor.value().plane, editor.value().motor('tth'), editor.value().motor('th')) == ('horizontal', 'nu', 'mu')
+    editor.set_value(InstrumentGeometry('fourc', plane='vertical'))
+    assert editor.plane.currentData() == 'vertical' and editor._form.isRowVisible(editor.plane)
+    editor.set_value(InstrumentGeometry())
+    assert not editor._form.isRowVisible(editor.plane) and editor.value().plane == 'vertical'
+    editor.deleteLater()

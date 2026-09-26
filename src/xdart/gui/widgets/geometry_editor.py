@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from xrd_tools.session.instrument import GEOMETRIES, GEOMETRY_LABELS, InstrumentGeometry
+from xrd_tools.session.instrument import GEOMETRIES, GEOMETRY_LABELS, PLANE_LABELS, InstrumentGeometry
 
 #: Every circle any geometry has, in display order (a row each; a geometry shows its own).
 _ALL_CIRCLES = ('mu', 'eta', 'th', 'chi', 'phi', 'nu', 'del', 'tth')
@@ -29,6 +29,13 @@ class GeometryEditor(QtWidgets.QWidget):
         for key, label in GEOMETRY_LABELS.items():
             self.geometry.addItem(label, key)
         self._form.addRow('Diffractometer', self.geometry)
+        self.plane = QtWidgets.QComboBox()
+        for key, label in PLANE_LABELS.items():
+            self.plane.addItem(label, key)
+        self.plane.setToolTip('The 2θ arm\'s scattering plane. Vertical: the detector turns about a '
+                              'horizontal axis, as psic\'s del. Horizontal: about the vertical axis, as '
+                              'psic\'s nu. The other psic detector circle is held at zero.')
+        self._form.addRow('Scattering plane', self.plane)
         self._motors = {}
         for circle in _ALL_CIRCLES:
             combo = QtWidgets.QComboBox()
@@ -39,6 +46,7 @@ class GeometryEditor(QtWidgets.QWidget):
             self._motors[circle] = combo
             self._form.addRow(QtWidgets.QLabel(), combo)
         self.geometry.currentIndexChanged.connect(self._geometry_changed)
+        self.plane.currentIndexChanged.connect(self._geometry_changed)
         self._geometry_changed()
 
     def motor_edit(self, circle) -> QtWidgets.QLineEdit:
@@ -48,11 +56,14 @@ class GeometryEditor(QtWidgets.QWidget):
     def value(self) -> InstrumentGeometry:
         geometry = self.geometry.currentData()
         return InstrumentGeometry(geometry, tuple((circle, self._motors[circle].currentText())
-                                                  for circle, _role in GEOMETRIES[geometry]))
+                                                  for circle, _role in GEOMETRIES[geometry]),
+                                  'vertical' if geometry == 'psic' else self.plane.currentData())
 
     def set_value(self, value: InstrumentGeometry):
-        blockers = [QtCore.QSignalBlocker(widget) for widget in (self.geometry, *self._motors.values())]
+        blockers = [QtCore.QSignalBlocker(widget)
+                    for widget in (self.geometry, self.plane, *self._motors.values())]
         self.geometry.setCurrentIndex(max(0, self.geometry.findData(value.geometry)))
+        self.plane.setCurrentIndex(max(0, self.plane.findData(value.plane)))
         for circle, motor in value.motors:
             self._motors[circle].setEditText(motor)
         del blockers
@@ -80,14 +91,19 @@ class GeometryEditor(QtWidgets.QWidget):
         self.changed.emit()
 
     def _show_rows(self):
-        circles = dict(GEOMETRIES[self.geometry.currentData()])
+        geometry = self.geometry.currentData()
+        circles = dict(GEOMETRIES[geometry])
+        self._form.setRowVisible(self.plane, geometry != 'psic')
+        plays = ({} if geometry == 'psic'
+                 else InstrumentGeometry(geometry, plane=self.plane.currentData()).as_psic())
         for circle, combo in self._motors.items():
             self._form.setRowVisible(combo, circle in circles)
             label = self._form.labelForField(combo)
             if circle in circles:
                 used = f'  ·  used by {self._used_by}' if circle in self._used and self._used_by else ''
                 label.setText(f'{circle} ({circles[circle]}){used}')
-                combo.setToolTip(f'The scan motor that drives the {circle} circle')
+                combo.setToolTip(f'The scan motor that drives the {circle} circle'
+                                 + (f" (it plays psic's {plays[circle]})" if circle in plays else ''))
 
     def _edited(self, *_args):
         self.changed.emit()

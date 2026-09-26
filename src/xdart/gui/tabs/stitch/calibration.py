@@ -89,9 +89,9 @@ def _dispatch_job(request, cancelled, publish):
         motors = tuple(motor for motor in geometry.stitch_arm() if motor)  # a 2θ arm reads one
         return source_frame_choices(spec, motors), names, geometry.to_record()
     if kind == 'prepare':
-        spec, indices, directory, rotation, motors = arguments
+        spec, indices, directory, rotation, arm = arguments
         return capture_calibration_frames(spec, indices, directory, rotation=rotation,
-                                           motor_names=motors, cancelled=cancelled)
+                                           arm=arm, cancelled=cancelled)
     if kind == 'calibrate':
         from xdart.gui.tabs.scattering.experiment_authoring import prepare_calibration_request, run_calibration
         from xdart.gui.tabs.scattering.operation_values import OperationIdentity, OperationTerminalStatus as ChildStatus
@@ -582,9 +582,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 distance = self._distance_result.distance_m
             else:
                 return None
-            zero = self._text('beam_motor')  # a circle ("del", "tth") or its motor: the staged frames' motor
-            role = self.geometry_editor.value().arm_role(zero)
-            zero = dict(zip(('del', 'nu'), self._frame_motors)).get(role) or zero
+            zero = dict(zip(('del', 'nu'), self._frame_motors)).get(self._beam_role()) or self._text('beam_motor')
             return rough_arm_record(
                 distance_m=distance, detector=self._text('beam_detector'),
                 beam_px=tuple(float(v) for v in self._text('beam_pixel').split(',')),
@@ -592,6 +590,15 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1])
         except (ValueError, TypeError, KeyError, RuntimeError):
             return None
+
+    def _beam_role(self):
+        """The arm circle the direct-beam motor names ("del", "tth", or a motor), by the
+        Geometry; a single 2θ arm has one circle, whatever the default text says."""
+        geometry = self.geometry_editor.value()
+        role = geometry.arm_role(self._text('beam_motor'))
+        if role is None and None in geometry.stitch_arm():
+            role = 'del' if geometry.stitch_arm()[0] else 'nu'
+        return role
 
     def _beam_source_changed(self):
         if self.rough_mode.currentData() != 'scan':
@@ -747,7 +754,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             if self.frames:
                 raise ValueError('this session already has staged frames; open another calibration window for a new selection')
             self._start('prepare', (self._enumerated_spec, indices, self.session_dir, self.rotation.currentData(),
-                                   tuple(motor for motor in self._enumerated_motors if motor)))
+                                   self._enumerated_motors))
         self._guard(go)
 
     def _selected_frame(self):
@@ -831,17 +838,23 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._sync_arm_model()
 
     def _staged_arm_message(self, arm):
-        staged, now = (' and '.join(motor for motor in pair if motor) for pair in (self._frame_motors, arm))
-        return (f'The frames were staged reading {staged}; the Geometry now names {now}. Restore those '
-                'motors under 1 · Geometry, or start a New session to stage frames with these.')
+        def described(pair):  # a single arm's one motor, with the plane that says which circle it is
+            delta, nu = pair
+            if delta and nu:
+                return f'{delta} and {nu}'
+            return f'{delta or nu} as a {"vertical" if delta else "horizontal"} 2θ arm'
+        return (f'The frames were staged reading {described(self._frame_motors)}; the Geometry now names '
+                f'{described(arm)}. Restore those motors under 1 · Geometry, or start a New session to '
+                'stage frames with these.')
 
     def _sync_arm_model(self):
-        nu = (self._frame_motors if self.frames else self.geometry_editor.value().stitch_arm())[1]
+        arm = self._frame_motors if self.frames else self.geometry_editor.value().stitch_arm()
+        nu = None if None in arm else arm[1]  # a single arm holds one circle: no nu rows
         rows = {round(float(frame.motors[nu]), 6)
                 for frame in self.frames if frame.complete and nu in frame.motors}
         reason = ('xrayutilities has no detector mount or sample offset model'
                   if self.backend.currentData() == 'xu_hist'
-                  else 'a single 2θ arm has no nu positions, which the extension needs' if nu is None
+                  else 'a single 2θ arm holds one circle at zero; the extension needs both' if nu is None
                   else 'fitting motor scales keeps the five-parameter arm' if self.scales.isChecked()
                   else 'needs completed frames on at least 3 nu positions' if len(rows) < 3 else '')
         if reason:
@@ -893,12 +906,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     raise ValueError('choose the seed geometry JSON')
                 seed = str(Path(self._text('refine_seed_path')).resolve())
             record = seed if isinstance(seed, dict) else json.loads(Path(seed).read_text(encoding='utf-8'))
-            from xrd_tools.core.geometry.stacked_arm import is_single_arm
-            problem = geometry.arm_mismatch(record.get('trans_function', {}).get('pos_names', ()),
-                                            single_arm=is_single_arm(record))
+            source_motors = tuple((position, motor) for position, motor in (('del_angle', delta), ('nu_angle', nu))
+                                  if motor is not None)
+            from xrd_tools.session.instrument import calibration_arm
+            problem = geometry.arm_mismatch(*calibration_arm(record, source_motors))
             if problem:
                 raise ValueError(problem.replace('This calibration', 'The seed geometry', 1))
-            options = dict(source_motors=(('del_angle', delta),) + ((('nu_angle', nu),) if nu else ()),
+            options = dict(source_motors=source_motors,
                            instrument_geometry=geometry.to_record(),
                            image_rotation=self.rotation.currentData(),
                            calibrant=self.refine_calibrant.currentText().strip() or 'LaB6',
@@ -945,9 +959,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 options['mask'] = load_mask(self._text('beam_mask'))
             if self._text('beam_saturation'):
                 options['saturation'] = float(self._text('beam_saturation'))
-            motor = self._text('beam_motor')  # a circle ("del", "tth") or the scan's motor
-            self._start('distance', (self._spec(beam=True), self.geometry_editor.value().arm_motor(motor) or motor,
-                                     options))
+            motor = dict(zip(('del', 'nu'), self.geometry_editor.value().stitch_arm())).get(self._beam_role())
+            self._start('distance', (self._spec(beam=True), motor or self._text('beam_motor'), options))
         self._guard(go)
 
     def _apply_distance(self):
@@ -1021,8 +1034,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                            fallback=str(self.project_root))
             path = picks[0] if picks else ''
             if path:
-                self.frames = load_calibration_session(path)
-                self._frame_motors = (tuple(self.frames[0].motors) + (None,))[:2]  # (2θ, None): one arm
+                self.frames, arm = load_calibration_session(path, with_arm=True)
+                # an older session names no arm: del and nu in order, or a vertical 2θ arm
+                self._frame_motors = arm or (tuple(self.frames[0].motors) + (None,))[:2]
                 self.session_dir = Path(path).parent
                 self._invalidate_fit()
                 self._render_frames()
@@ -1074,7 +1088,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     self._show_tab('calibrate')
                 elif kind in ('calibrate', 'import') and result is not None:
                     self.frames = tuple(result if frame.identity == self._row_identity else frame for frame in self.frames)
-                    save_calibration_session(self.session_dir, self.frames)
+                    save_calibration_session(self.session_dir, self.frames, arm=self._frame_motors)
                     self._invalidate_fit()
                     self._render_frames()
                     self._select_next_frame(result)

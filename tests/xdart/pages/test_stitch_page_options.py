@@ -253,16 +253,132 @@ def test_the_calibration_must_drive_the_geometrys_arm(qapp, tmp_path):
         assert {name for item in request.manifest.contributions for name, _o, _v in item.values} == {"del"}
         page._set_instrument(InstrumentGeometry("psic"))  # psic's nu moves
         assert not page._readiness[1] and "nu held at zero" in page._readiness[0]
-        # PONI + offsets maps the Geometry's own arm, with one reference per circle
+        # PONI + offsets: a fresh mapping takes the Geometry's arm, one reference per circle
         page.set_field("geometry_kind", "PONI + offsets")
         assert (page._value("source_motors"), page._value("poni_references")) == ("del=del, nu=nu", "del=0, nu=0")
         page.set_field("poni_references", "del=12.5, nu=0")
+        # an explicit mapping is kept as it is (Codex round 12 F2): twoc refuses psic's del and nu
         page._set_instrument(InstrumentGeometry("twoc", (("tth", "del"),)))
+        assert (page._value("source_motors"), page._value("poni_references")) == ("del=del, nu=nu",
+                                                                                  "del=12.5, nu=0")
+        assert not page._readiness[1] and "twoc has one detector circle" in page._readiness[0]
+        _edit_mapping(page, "del=del")  # the user maps twoc's arm alone
         assert (page._value("source_motors"), page._value("poni_references")) == ("del=del", "del=12.5")
+        assert page._readiness[1], page._readiness
         # xrayutilities fits psic's arm only (its single arm comes with the XU calibration work)
         page.set_field("geometry_kind", "Goniometer JSON")
         page.set_field("backend", "xrayutilities histogram")
         assert not page._readiness[1] and "xrayutilities backend" in page._readiness[0]
+    finally:
+        _close(page, qapp)
+
+
+def _custom_positions_form(tmp_path):
+    """A valid goniometer JSON whose positions are named dval and nval, bound to del and nu."""
+    import json
+    from pathlib import Path
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    record = json.loads(Path(form.geometry_path).read_text())
+    record["pos_names"] = record["trans_function"]["pos_names"] = ["dval", "nval"]
+    record["trans_function"].update(rot1_expr="rot1_scale * nval + rot1_offset",
+                                    rot2_expr="rot2_scale * dval + rot2_offset")
+    custom = tmp_path / "custom.json"
+    custom.write_text(json.dumps(record))
+    return replace(form, geometry_path=custom, source_motors=(("dval", "del"), ("nval", "nu")))
+
+
+def _read_columns(form):
+    request = prepare_stitch_tool(form).request
+    return {name for item in request.manifest.contributions for name, _o, _v in item.values}
+
+
+def test_a_custom_position_calibration_is_checked_by_the_circles_it_moves(qapp, tmp_path):
+    # Codex round 12 F1: dval/nval bound to del and nu move both circles, whatever their names
+    from xrd_tools.session.instrument import InstrumentGeometry
+    form = _custom_positions_form(tmp_path)
+    assert _read_columns(form) == {"del", "nu"}
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page._set_instrument(InstrumentGeometry("fourc", (("tth", "del"),)))  # chosen before the form
+        page.load_form(form)
+        assert page._value("source_motors") == "dval=del, nval=nu"  # kept (round 11 F2)
+        assert not page._readiness[1] and "fourc has one detector circle" in page._readiness[0]
+        assert not page.run_bar.startButton.isEnabled()
+        with pytest.raises(ValueError, match="one detector circle"):
+            page.build_form()
+        page.begin_run()  # refused before anything is written
+        assert not list((tmp_path / "output").glob("*.nexus"))
+        page._set_instrument(InstrumentGeometry("psic"))
+        assert page._readiness[1], page._readiness
+        assert _read_columns(page.build_form()) == {"del", "nu"}
+    finally:
+        _close(page, qapp)
+
+
+def test_a_poni_form_keeps_its_mapping_and_references_under_any_geometry(qapp, tmp_path):
+    # Codex round 12 F2: loading never drops a PONI form's nu mapping or reference
+    from xrd_tools.analysis.stitch_operation import StitchGeometryKind
+    from xrd_tools.session.instrument import InstrumentGeometry
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    poni = tmp_path / "frame.poni"
+    poni.write_text('poni_version: 2.1\nDetector: Pilatus100k\nDetector_config: {"orientation": 3}\n'
+                    'Distance: 0.2\nPoni1: 0.01677\nPoni2: 0.04188\nRot1: 0\nRot2: 0\nRot3: 0\n'
+                    'Wavelength: 1e-10\n')
+    two = replace(form, geometry_path=poni, geometry_kind=StitchGeometryKind.PONI,
+                  source_motors=(("del", "del"), ("nu", "nu")), poni_references=(("del", 0.), ("nu", 3.)))
+    assert _read_columns(two) == {"del", "nu"}  # the headless owner reads both
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page._set_instrument(InstrumentGeometry("fourc", (("tth", "del"),)))  # the other geometry first
+        page.load_form(two)
+        assert (page._value("source_motors"), page._value("poni_references")) == ("del=del, nu=nu",
+                                                                                  "del=0.0, nu=3.0")
+        assert not page._readiness[1] and "fourc has one detector circle" in page._readiness[0]
+        with pytest.raises(ValueError, match="one detector circle"):
+            page.build_form()
+        page._set_instrument(InstrumentGeometry("psic"))
+        assert page._readiness[1], page._readiness
+        built = page.build_form()
+        assert (built.source_motors, built.poni_references) == ((("del", "del"), ("nu", "nu")),
+                                                                (("del", 0.), ("nu", 3.)))
+        assert _read_columns(built) == {"del", "nu"}
+        # the reverse: a form mapping del alone, loaded under psic, stays del alone and is refused
+        page.load_form(replace(two, source_motors=(("del", "del"),), poni_references=(("del", 0.),)))
+        assert (page._value("source_motors"), page._value("poni_references")) == ("del=del", "del=0.0")
+        assert not page._readiness[1] and "nu held at zero" in page._readiness[0]
+        page._set_instrument(InstrumentGeometry("twoc", (("tth", "del"),)))
+        assert page._readiness[1], page._readiness
+        assert _read_columns(page.build_form()) == {"del"}
+    finally:
+        _close(page, qapp)
+
+
+def test_a_horizontal_2theta_arm_maps_nu_and_refuses_a_vertical_calibration(qapp, tmp_path):
+    import json
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.geometry import DetectorCalibration
+    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
+    from xrd_tools.session.instrument import InstrumentGeometry
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    calibration = DetectorCalibration(PONI(dist=.2, poni1=.01677, poni2=.04188, wavelength=1e-10,
+                                           detector="Pilatus100k"), detector_config={"orientation": 3})
+    files = {}
+    for name, arm in (("horizontal", StackedDetectorArm(nu_motor="tth", del_motor=None)),
+                      ("vertical", StackedDetectorArm(nu_motor=None, del_motor="tth"))):
+        files[name] = tmp_path / f"{name}.json"
+        files[name].write_text(json.dumps(arm.to_pyfai_goniometer(calibration)))
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(form)
+        page._set_instrument(InstrumentGeometry("twoc", (("tth", "nu"),), "horizontal"))  # the scan's nu is 2θ
+        page.set_field("geometry_path", str(files["horizontal"]))
+        assert page._value("source_motors") == "nu_angle=nu"
+        assert page._readiness[1], page._readiness
+        assert _read_columns(page.build_form()) == {"nu"}
+        page.set_field("geometry_path", str(files["vertical"]))
+        assert not page._readiness[1] and "Choose the vertical scattering plane" in page._readiness[0]
+        page.set_field("geometry_kind", "PONI + offsets")  # a fresh PONI mapping: the horizontal arm, nu
+        assert (page._value("source_motors"), page._value("poni_references")) == ("nu=nu", "nu=0")
     finally:
         _close(page, qapp)
 

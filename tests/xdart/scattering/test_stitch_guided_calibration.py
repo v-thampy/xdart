@@ -313,7 +313,7 @@ def test_a_twoc_scan_is_read_and_staged_as_one_2theta_arm(tmp_path):
         _finish(dialog)
         assert dialog._frame_motors == ('tth', None)
         assert [frame.motors for frame in dialog.frames] == [{'tth': 10.}, {'tth': 20.}, {'tth': 30.}]
-        assert not dialog.arm_model.isEnabled() and 'no nu positions' in dialog.arm_model.toolTip()
+        assert not dialog.arm_model.isEnabled() and 'holds one circle at zero' in dialog.arm_model.toolTip()
         # the direct-beam zero "del" names twoc's 2θ: the rough geometry is a single arm
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         for key, value in (('rough_distance', '500'), ('beam_pixel', '3, 2'), ('beam_detector', 'Pilatus300kw')):
@@ -322,12 +322,61 @@ def test_a_twoc_scan_is_read_and_staged_as_one_2theta_arm(tmp_path):
         # renaming the 2θ motor after staging: the frames read tth, so Fit refuses
         dialog.set_instrument(InstrumentGeometry('twoc', (('tth', 'ttheta'),)))
         dialog._fit()
-        assert 'staged reading tth; the Geometry now names ttheta' in dialog.status.text()
+        assert ('staged reading tth as a vertical 2θ arm; the Geometry now names ttheta as a vertical 2θ arm'
+                in dialog.status.text())
         assert dialog.fit is None
     finally:
         from xdart.gui.pages.values import PageCleanup
         assert dialog.shutdown().status is PageCleanup.CLEAN
         dialog.close()
+
+
+def test_a_horizontal_twoc_scan_is_staged_and_resumed_as_nu(tmp_path, monkeypatch):
+    from xdart.gui.widgets import file_dialogs
+    from xrd_tools.core.geometry.stacked_arm import is_single_arm
+    from xrd_tools.session.instrument import InstrumentGeometry
+    spec = tmp_path / 'powder'
+    spec.write_text('#F powder\n#E 1\n#D Thu Jan 1 00:00:00 1970\n#C test\n'
+                    '#O0 tth th\n#S 1 ascan tth 10 30 2 1\n#D today\n#P0 10 5\n#N 1\n#L tth\n10\n20\n30\n')
+    images = tmp_path / 'images'
+    images.mkdir()
+    for index in range(3):
+        (images / f'powder_scan1_{index:04d}.raw').write_bytes(np.zeros((4, 6), '<i4').tobytes())
+    source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(images),
+        'image_stem': 'powder_scan1_', 'read_image_kwargs': {'detector_shape': (4, 6), 'raw_dtype': '<i4'}})
+    dialog = StitchCalibrationDialog(tmp_path, backend='multigeometry')
+    other = StitchCalibrationDialog(tmp_path, backend='multigeometry')
+    try:
+        dialog.set_instrument(InstrumentGeometry('twoc', plane='horizontal'))
+        dialog.set_source_context(source)
+        dialog._enumerate()
+        _finish(dialog)
+        assert dialog._enumerated_motors == (None, 'tth'), dialog.status.text()
+        dialog._prepare()
+        _finish(dialog)
+        assert dialog._frame_motors == (None, 'tth')
+        session = dialog.session_dir / 'calibration-session.json'
+        assert json.loads(session.read_text())['arm'] == {'del': None, 'nu': 'tth'}
+        assert 'holds one circle at zero' in dialog.arm_model.toolTip()
+        # the direct-beam default "del" means the arm's one circle: the rough geometry holds del
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        for key, value in (('rough_distance', '500'), ('beam_pixel', '3, 2'), ('beam_detector', 'Pilatus300kw')):
+            dialog._fields[key].setText(value)
+        rough = dialog._rough_record()
+        assert dialog._text('beam_motor') == 'del' and is_single_arm(rough) and rough['pos_names'] == ['nu_angle']
+        # the same motor name, resumed in a window set to the vertical plane: the session keeps its plane
+        monkeypatch.setattr(file_dialogs, 'browse', lambda *args, **kwargs: [str(session)])
+        other.set_instrument(InstrumentGeometry('twoc'))
+        other._resume()
+        assert other._frame_motors == (None, 'tth')
+        other._fit()
+        assert ('staged reading tth as a horizontal 2θ arm; the Geometry now names tth as a vertical 2θ arm'
+                in other.status.text())
+    finally:
+        from xdart.gui.pages.values import PageCleanup
+        for window in (dialog, other):
+            assert window.shutdown().status is PageCleanup.CLEAN
+            window.close()
 
 
 def test_reading_metadata_takes_each_circles_motor_from_the_scan(tmp_path):
