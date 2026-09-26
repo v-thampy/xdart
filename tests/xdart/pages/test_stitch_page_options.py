@@ -265,10 +265,15 @@ def test_the_calibration_must_drive_the_geometrys_arm(qapp, tmp_path):
         _edit_mapping(page, "del=del")  # the user maps twoc's arm alone
         assert (page._value("source_motors"), page._value("poni_references")) == ("del=del", "del=12.5")
         assert page._readiness[1], page._readiness
-        # xrayutilities fits psic's arm only (its single arm comes with the XU calibration work)
+        # an xrayutilities calibration names its own arm: psic's canonical one cannot drive twoc's
+        from xrd_tools.analysis.xu_stitch_calibration import canonical_surface_resource_bytes
+        xu = tmp_path / "xu.json"
+        xu.write_bytes(canonical_surface_resource_bytes())
         page.set_field("geometry_kind", "Goniometer JSON")
         page.set_field("backend", "xrayutilities histogram")
-        assert not page._readiness[1] and "xrayutilities backend" in page._readiness[0]
+        page.set_field("geometry_path", str(xu))
+        assert page._value("source_motors") == "del=del, nu=nu"
+        assert not page._readiness[1] and "twoc has one detector circle" in page._readiness[0]
     finally:
         _close(page, qapp)
 

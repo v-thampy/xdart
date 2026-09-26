@@ -452,9 +452,6 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     if single and arm_model == 'stacked_extended':
         raise ValueError('a single detector arm has no nu positions; the detector mount and '
                          'sample offset refinement needs frames from several')
-    if single and backend == 'xu_hist':
-        raise ValueError('the xrayutilities backend fits psic\'s two detector circles; fit a single '
-                         '2θ arm with the MultiGeometry backend')
     if arm_model == 'stacked_extended' and backend == 'xu_hist':
         return _fit_xu_extended(frames, del_motor=del_motor, nu_motor=nu_motor,
                                 distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
@@ -565,7 +562,8 @@ def _fit_xu(frames, loaded, del_motor, nu_motor, distance_seed_m, distance_bound
                               pwidth1=pitch1 * 1e3, pwidth2=pitch2 * 1e3, distance=dist)
             out = []
             for control, calibrant, _ in loaded:
-                qx, qy, qz = hx.Ang2Q.area(0., 0., 0., 0., control.motors[nu_motor] - no,
+                nu = 0. if nu_motor is None else control.motors[nu_motor]  # a 2θ arm holds nu at zero
+                qx, qy, qz = hx.Ang2Q.area(0., 0., 0., 0., nu - no,
                                           control.motors[del_motor] - do)
                 q = np.hypot(np.hypot(qx, qy), qz)
                 reference = 2 * np.pi / np.asarray(calibrant.dspacing)[control.rings]
@@ -582,7 +580,9 @@ def _fit_xu(frames, loaded, del_motor, nu_motor, distance_seed_m, distance_bound
     from xrd_tools.analysis.xu_stitch_calibration import authored_surface_calibration
     params = [float(v) for v in result.x]
     control_domain = {key: [min(f.motors[motor] for f in frames), max(f.motors[motor] for f in frames)]
-                      for key, motor in [('del', del_motor), ('nu', nu_motor)]}
+                      if motor is not None else [0., 0.] for key, motor in [('del', del_motor), ('nu', nu_motor)]}
+    if nu_motor is None and domain is not None:  # a single 2θ arm's asset holds nu at zero
+        domain = {**domain, 'nu': [0., 0.]}
     asset = authored_surface_calibration(
         detector=detector, cch1=params[0], cch2=params[1], distance_m=params[2] / 1e3,
         del_offset_deg=params[3], nu_offset_deg=params[4], energy_eV=energy,

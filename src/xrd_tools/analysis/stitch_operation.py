@@ -1607,6 +1607,7 @@ def _required_stitch_selectors(
         requested = tuple(
             MetadataColumnSelector(str(name), 0)
             for name in acquisition["source_motors"].values()
+            if name is not None  # a single 2θ arm reads no nu
         )
         energy_name = str(acquisition["source_energy_selector"])
         energy_count = table_names.count(energy_name)
@@ -1661,7 +1662,8 @@ def _xu_observations(
     acquisition = asset["acquisition"]
     validation = asset["validation"]
     del_key = (str(acquisition["source_motors"]["del"]), 0)
-    nu_key = (str(acquisition["source_motors"]["nu"]), 0)
+    nu_name = acquisition["source_motors"]["nu"]  # None: a single 2θ arm, nu held at zero
+    nu_key = None if nu_name is None else (str(nu_name), 0)
     monitor_key = (
         None
         if plan.monitor_selector is None
@@ -1686,7 +1688,7 @@ def _xu_observations(
         }
         try:
             del_value = float(values[del_key])
-            nu_value = float(values[nu_key])
+            nu_value = 0.0 if nu_key is None else float(values[nu_key])
         except KeyError as error:
             raise StitchOperationRefused(
                 "UNBOUND_METADATA_SELECTOR",

@@ -377,3 +377,30 @@ def test_native_nexus_group_uses_metadata_and_exact_raw_dataset(tmp_path):
         int(frame.removeprefix("frame_")), scan=scan.removeprefix("scan_"), source_root=tmp_path,
         full_raw=True, artifact_payload=payload)
     np.testing.assert_array_equal(view.raw, np.arange(195 * 487).reshape(195, 487))
+
+
+def test_a_single_arm_xu_calibration_reads_only_its_2theta_motor(tmp_path):
+    """Preview and Run of an xrayutilities calibration for a fourc/twoc arm: nu held at zero."""
+    import json
+    from pyFAI.detectors import detector_factory
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation
+    from xrd_tools.analysis.xu_stitch_calibration import (
+        _canonical_bytes, authored_surface_calibration, canonical_surface_resource_bytes,
+    )
+    form = _native_form(tmp_path, "xu_hist", scans="1")
+    canonical = json.loads(canonical_surface_resource_bytes())
+    asset = authored_surface_calibration(
+        detector=detector_factory("Pilatus300kw", config={"orientation": 3}),
+        cch1=canonical["detector"]["cch1_px"], cch2=canonical["detector"]["cch2_px"],
+        distance_m=canonical["detector"]["distance_m"], del_offset_deg=3., nu_offset_deg=1.2,
+        energy_eV=canonical["acquisition"]["energy_eV"],
+        xu_wavelength_A=canonical["acquisition"]["xu_mapping_wavelength_A"],
+        source_motors={"del": "del", "nu": None}, rotation=0,
+        control_domain={"del": [14., 15.], "nu": [0., 0.]}, domain={"del": [0., 50.], "nu": [0., 0.]},
+        rms_q=1e-3, condition=10., n_frames=3, n_points=100)
+    path = tmp_path / "xu-single.json"
+    path.write_bytes(_canonical_bytes(asset))
+    request = prepare_stitch_tool(replace(form, geometry_path=path, source_motors=(("del", "del"),))).request
+    assert {name for item in request.manifest.contributions for name, _o, _v in item.values} == {"del"}
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal

@@ -1089,7 +1089,8 @@ def run_xu_hist_stitch_1d(
             )
         try:
             del_value = float(metadata[acquisition["source_motors"]["del"]])
-            nu_value = float(metadata[acquisition["source_motors"]["nu"]])
+            nu_name = acquisition["source_motors"]["nu"]  # None: a single 2θ arm, nu held at zero
+            nu_value = 0.0 if nu_name is None else float(metadata[nu_name])
         except (KeyError, TypeError, ValueError) as error:
             raise XuStitchScienceRefused(
                 "INVALID_METADATA_VALUE", "required XU angle is unavailable"

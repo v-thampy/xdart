@@ -187,7 +187,8 @@ def prepare_native_stitch_tool(form, project):
                                      dark_path=form.dark_path, flat_path=form.flat_path,
                                      flat_min_fraction=form.flat_min_fraction, **common)
         acquisition = calibration.projection.value["acquisition"]
-        motors = tuple(acquisition["source_motors"].values())
+        motors = tuple(name for name in acquisition["source_motors"].values()
+                       if name is not None)  # a single 2θ arm reads no nu
         energy_name = acquisition["source_energy_selector"]
     requests, preview_members, warnings = [], [], []
     # Metadata is loaded once per exact source. The receipt is reused without

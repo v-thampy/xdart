@@ -331,13 +331,13 @@ def test_a_single_arm_fit_refuses_what_needs_nu():
     from xrd_tools.integrate.stitch_autocalibration import stratified_frame_indices
     from xrd_tools.integrate.stitch_calibration import fit_calibration
     frames = (None,) * 3  # refused before any frame is read
-    for delta, nu in (('tth', None), (None, 'tth')):
-        with pytest.raises(ValueError, match='no nu positions'):
-            fit_calibration(frames, del_motor=delta, nu_motor=nu, arm_model='stacked_extended')
+    for backend in ('multigeometry', 'xu_hist'):  # the extension (and its XU transfer) needs both circles
+        for delta, nu in (('tth', None), (None, 'tth')):
+            with pytest.raises(ValueError, match='no nu positions'):
+                fit_calibration(frames, backend=backend, del_motor=delta, nu_motor=nu,
+                                arm_model='stacked_extended')
     with pytest.raises(ValueError, match='at least one moving circle'):
         fit_calibration(frames, del_motor=None, nu_motor=None)
-    with pytest.raises(ValueError, match='MultiGeometry backend'):
-        fit_calibration(frames, backend='xu_hist', del_motor='tth', nu_motor=None)
     rows = [(index, {'tth': 5. + index}, None) for index in range(20)]
     chosen, coverage = stratified_frame_indices(rows, 5, None, 'tth')
     assert coverage == {'nu_rows_available': 1, 'nu_rows_selected': 1}
@@ -435,6 +435,109 @@ def test_the_real_del_only_scan_fits_the_same_as_a_2theta_arm_and_as_psic():
     assert _worst(create_multigeometry_integrator_series_from_geometry(single.diffractometer, {'del': delta}),
                   create_multigeometry_integrator_series_from_geometry(
                       psic.diffractometer, {'del': delta, 'nu': np.zeros(5)})) == 0
+
+
+def _scan7_frames(root, directory, *, nu):
+    """Scan 7's saved control points as guided frames (scan 7's recorded energy is invalid, so
+    the frames carry none: only the points and the angles matter to a fit)."""
+    from xrd_tools.integrate.calibration import load_detector_calibration
+    from tests.core.test_stitch_guided_calibration import _frames
+    controls, _calibrant = _scan7_controls(root, nu=nu)
+    directory.mkdir(parents=True)
+    poni = load_detector_calibration(root / 'processed_data/b_thampy_LaB6_16keV_scan7_0002.poni').poni
+    return _frames(directory, controls, poni)
+
+
+def _copied_scan8_project(root, project):
+    """A Project holding the SPEC file and scan 8's images: a calibration must resolve inside it."""
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    (project / 'images').mkdir(parents=True)
+    shutil.copy2(root / 'calibration/LaB6_16keV', project / 'LaB6_16keV')
+    images = sorted((root / 'images').glob('b_thampy_LaB6_16keV_scan8_*.raw'))
+    assert len(images) == 41
+    for image in images:
+        shutil.copy2(image, project / 'images' / image.name)
+    # scan 8 repeats scan 7's del positions with a valid recorded energy (scan 7's is -2165 eV)
+    return SourceSpec(project / 'LaB6_16keV', SourceKind.SPEC, options={
+        'scan': '8.1', 'image_dir': str(project / 'images'), 'image_stem': 'b_thampy_LaB6_16keV_scan8_',
+        'read_image_kwargs': {'detector_shape': (195, 1475), 'raw_dtype': 'int32', 'rotation': 0}})
+
+
+def test_an_xu_calibration_holds_a_2theta_arms_nu_at_zero(tmp_path):
+    from xrd_tools.analysis.xu_stitch_calibration import (
+        XuStitchCalibrationRefused, _canonical_bytes, parse_xu_stitch_calibration_bytes,
+    )
+    from xrd_tools.integrate.stitch_calibration import fit_calibration
+    root = _del_only_root()
+    fits = {nu: fit_calibration(_scan7_frames(root, tmp_path / str(nu), nu=nu), backend='xu_hist',
+                                del_motor='del', nu_motor='nu' if nu else None)
+            for nu in (False, True)}
+    single, psic = (fits[nu].asset['calibration'] for nu in (False, True))
+    assert single['acquisition']['source_motors'] == {'del': 'del', 'nu': None}
+    assert fits[False].asset['provenance']['source_motors'] == {'del': 'del', 'nu': None}
+    assert single['validation']['control_domain_source_deg']['nu'] == [0., 0.]
+    # the same SURFACE fit as psic at nu = 0: only the source motors differ
+    assert single['detector'] == psic['detector'] and fits[False].rms_q == fits[True].rms_q
+    assert single['acquisition']['detector_offsets_deg'] == psic['acquisition']['detector_offsets_deg']
+    moved = json.loads(json.dumps(single))
+    moved['validation']['validated_scan_domain_source_deg']['nu'] = [-1., 1.]
+    with pytest.raises(XuStitchCalibrationRefused, match='holds nu at zero'):
+        parse_xu_stitch_calibration_bytes(_canonical_bytes(moved))
+
+
+@pytest.mark.slow
+def test_the_real_del_only_scan_stitches_the_same_with_xrayutilities(tmp_path):
+    from xrd_tools.analysis.module_transaction import (
+        MetadataColumnSelector, ModuleDisposition, ModuleKind, ModuleOutputRequest, ModuleSourceReceipt,
+    )
+    from xrd_tools.analysis.scan_operations import MetadataTablePlan, run_metadata_table
+    from xrd_tools.analysis.stitch_operation import (
+        XuStitchOperationPlan, prepare_stitch_operation, run_stitch_operation,
+    )
+    from xrd_tools.analysis.xu_stitch_calibration import XuStitchCalibrationInput, capture_xu_stitch_calibration
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+    from xrd_tools.integrate.stitch_calibration import fit_calibration, save_calibration_fit
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    from xrd_tools.integrate.xu_stitch import resolve_xu_stitch_effective_geometry
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
+    from xrd_tools.io.output_path import resolve_finite_output_target
+    root = _del_only_root()
+    project = tmp_path / 'project'
+    source = _copied_scan8_project(root, project)
+    table = run_metadata_table(MetadataTablePlan(source))
+    labels = tuple(range(0, 41, 4))
+    curves = {}
+    for name, nu in (('single', False), ('psic', True)):
+        fit = fit_calibration(_scan7_frames(root, project / 'frames' / name, nu=nu), backend='xu_hist',
+                              del_motor='del', nu_motor='nu' if nu else None,
+                              domain={'del': [4., 25.], 'nu': [0., 0.]})
+        path = save_calibration_fit(fit, project / f'xu-{name}.json')
+        calibration = capture_xu_stitch_calibration(XuStitchCalibrationInput(path), project_root=project)
+        with xu_runtime_session() as runtime:
+            effective = resolve_xu_stitch_effective_geometry(calibration, runtime).projection
+        plan = XuStitchOperationPlan(calibration, effective, 1., 5.2, npt_1d=760, max_frame_bytes=64 << 20,
+                                     native_records=True, conditioning=StitchConditioning('manual', threshold_max=8e5))
+        receipt = ModuleSourceReceipt.from_metadata_table(
+            table, kind=ModuleKind.STITCH, selected_labels=labels,
+            resolved_selectors=tuple(MetadataColumnSelector(column)
+                                     for column in (('del', 'nu', 'energy') if nu else ('del', 'energy'))))
+        family = f'xu-{name}'
+        output = ModuleOutputRequest(resolve_finite_output_target(project, family, operation_token='stitch-1d'),
+                                     AnalysisArtifactKind.STITCH_1D, artifact_family=family)
+        request = prepare_stitch_operation(receipt, output, plan, project_root=project)
+        read = {column for item in request.manifest.contributions for column, _occurrence, _value in item.values}
+        assert read == ({'del', 'nu'} if nu else {'del'})  # the 2θ arm never reads nu
+        result = run_stitch_operation(request)
+        assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+        payload = read_analysis_artifact(output.target)
+        curves[name] = (payload.axis('q'), payload.intensity)
+    (q, single), (q_psic, psic) = curves['single'], curves['psic']
+    assert np.array_equal(q, q_psic)
+    np.testing.assert_array_equal(single, psic)
+    for d_spacing in (4.1569, 2.9394, 2.4000, 2.0785):  # LaB6 100, 110, 111, 200
+        expected = 2 * math.pi / d_spacing
+        window = (q > expected - .08) & (q < expected + .08)
+        assert abs(q[window][np.nanargmax(single[window])] - expected) < .01
 
 
 @pytest.mark.slow

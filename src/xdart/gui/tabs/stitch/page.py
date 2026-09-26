@@ -841,14 +841,15 @@ class StitchPage(QtWidgets.QWidget):
         the circles it moves and holds come from what it is bound to — a goniometer JSON's
         transformation, a PONI + offsets form's del/nu mapping — never from position names."""
         geometry = self._instrument()
-        if self._value("backend") == "xrayutilities histogram":
-            return (None if geometry.stitch_arm()[1] is not None else
-                    "The xrayutilities backend fits psic's del-on-nu arm; choose psic under Calibrate ▸ "
-                    "1 · Geometry, or the pyFAI MultiGeometry backend for a single 2θ arm.")
         try:
             bindings = tuple(_parse_pairs(self._value("source_motors") or ""))
         except ValueError:
             return None  # the form refuses a malformed mapping itself
+        if self._value("backend") == "xrayutilities histogram":  # the XU calibration's own mapping
+            moving = {name for name, _motor in bindings} & {"del", "nu"}
+            if not moving:
+                return None  # an unusable XU calibration is refused where it is read
+            return geometry.arm_mismatch(moving, {"del", "nu"} - moving)
         if self._value("geometry_kind") != "Goniometer JSON":  # PONI + offsets: del and/or nu
             moving = {name for name, _motor in bindings} & {"del", "nu"}
             # a mapping naming neither is refused by the form itself
@@ -934,8 +935,8 @@ class StitchPage(QtWidgets.QWidget):
             values = {"source_motors": "", "image_rotation": ""}
             tip = "Select a valid XU calibration to inspect its angle mapping and rotation."
         else:
-            values = dict(source_motors=", ".join(
-                f"{name}={source}" for name, source in acquisition["source_motors"].items()),
+            values = dict(source_motors=", ".join(  # a single 2θ arm's asset names no nu motor
+                f"{name}={source}" for name, source in acquisition["source_motors"].items() if source),
                 image_rotation=90 * acquisition["image_rotation_quarter_turns"])
             tip = "Defined by the selected XU calibration; change it in Calibrate."
         values.update(geometry_kind="Goniometer JSON", poni_references="")
@@ -944,6 +945,7 @@ class StitchPage(QtWidgets.QWidget):
             self._fields[key] = field
             self._rows[key].apply_field(field)
             self._rows[key].setToolTip(tip)
+        self._edited()  # readiness rechecks the arm the calibration's own mapping names
 
     def _browse(self, key):
         """Browse as Int does: the last folder picked, the same file types for the same inputs."""

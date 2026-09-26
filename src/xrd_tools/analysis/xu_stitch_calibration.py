@@ -326,8 +326,11 @@ def _validate_authored_surface(value):
     require(type(acquisition['image_rotation_quarter_turns']) is int and acquisition['image_rotation_quarter_turns'] in range(4), 'invalid image rotation')
     for key in ('source_motors', 'detector_offsets_deg'):
         require(type(acquisition[key]) is dict and set(acquisition[key]) == {'del', 'nu'}, 'two detector motors required')
-    require(all(type(v) is str and v for v in acquisition['source_motors'].values())
-            and len(set(acquisition['source_motors'].values())) == 2, 'distinct source motors required')
+    motors = acquisition['source_motors']
+    single = motors['nu'] is None  # a single 2θ arm (fourc, twoc): nu held at zero
+    require(type(motors['del']) is str and bool(motors['del']) and (single or (
+        type(motors['nu']) is str and bool(motors['nu']) and motors['nu'] != motors['del'])),
+        'distinct source motors required')
     require(all(number(v) and abs(v) <= 5 for v in acquisition['detector_offsets_deg'].values()), 'motor offsets exceed fit bounds')
     require(number(acquisition['energy_eV']) and acquisition['energy_eV'] > 0, 'positive energy required')
     expected = 1.239841984e4 / acquisition['energy_eV']
@@ -353,6 +356,8 @@ def _validate_authored_surface(value):
     require(all(validation['validated_scan_domain_source_deg'][motor][0] <= limits[0] <= limits[1]
                 <= validation['validated_scan_domain_source_deg'][motor][1]
                 for motor, limits in validation['control_domain_source_deg'].items()), 'run domain must enclose control coverage')
+    require(not single or all(validation[name]['nu'] == [0, 0] for name in (
+        'control_domain_source_deg', 'validated_scan_domain_source_deg')), 'a single 2θ arm holds nu at zero')
 
 
 #: Version 3: the SURFACE model plus xrayutilities' detector tilt/rotation and sample
