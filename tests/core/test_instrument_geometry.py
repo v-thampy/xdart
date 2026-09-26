@@ -52,6 +52,10 @@ def test_fourc_and_twoc_are_psics_arm_with_nu_held_at_zero():
     assert [fourc.arm_motor(name) for name in ('del', 'tth', 'ttheta', 'nu', 'th')] == ['ttheta'] * 3 + [None] * 2
     assert InstrumentGeometry('psic', (('del', 'delta'),)).arm_motor('del_value') == 'delta'
     assert InstrumentGeometry('psic').arm_motor('nu_angle') == 'nu'
+    # a 2θ arm named as psic's del (a psic run as twoc, nu parked) is picked for tth
+    picked = InstrumentGeometry.pick('twoc', ['Delta', 'eta', 'nu', 'mu'])
+    assert (picked.motor('tth'), picked.motor('th')) == ('Delta', 'eta')
+    assert InstrumentGeometry.pick('fourc', ['tth', 'del', 'th']).motor('tth') == 'tth'  # its own name first
 
 
 def test_a_calibration_must_drive_the_geometrys_arm():

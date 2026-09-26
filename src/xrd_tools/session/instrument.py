@@ -131,8 +131,8 @@ class InstrumentGeometry:
     @classmethod
     def pick(cls, geometry, available, *, keep=None) -> 'InstrumentGeometry':
         """Each circle's motor from a scan's motors: an existing choice that the scan has,
-        else the standard name or an alias, else (incidence) the GI preference, else the
-        standard name."""
+        else the standard name or an alias (in fourc or twoc also psic's names for the circle
+        it plays: tth ← del), else (incidence) the GI preference, else the standard name."""
         names = [str(name) for name in available or ()]
         lower = {name.casefold(): name for name in names}
         kept = dict((keep.motors if keep is not None and keep.geometry == geometry else ()))
@@ -141,7 +141,10 @@ class InstrumentGeometry:
             if kept.get(circle, '').casefold() in lower:
                 chosen.append((circle, lower[kept[circle].casefold()]))
                 continue
-            match = next((lower[alias] for alias in (circle, *_ALIASES.get(circle, ())) if alias in lower), None)
+            psic = AS_PSIC[geometry].get(circle)
+            aliases = (circle, *_ALIASES.get(circle, ()),
+                       *((psic, *_ALIASES.get(psic, ())) if psic and psic != circle else ()))
+            match = next((lower[alias] for alias in aliases if alias in lower), None)
             if match is None and circle == INCIDENCE_CIRCLE[geometry]:  # the incidence rule Int uses
                 match = next((lower[name] for name in GI_MOTOR_PREFERENCE if name in lower), None)
             chosen.append((circle, match or kept.get(circle) or circle))
