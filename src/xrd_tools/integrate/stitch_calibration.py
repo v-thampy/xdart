@@ -459,7 +459,8 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
         return _fit_xu_extended(frames, del_motor=del_motor, nu_motor=nu_motor,
                                 distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
                                 max_rms_q=max_rms_q, domain=domain, distance_provenance=distance_provenance,
-                                cancelled=cancelled, validation_angles=validation_angles, progress=progress)
+                                cancelled=cancelled, validation_angles=validation_angles, progress=progress,
+                                instrument_geometry=instrument_geometry)
     loaded = [load_control_frame(frame) for frame in frames]
     controls, calibrants, calibrations = zip(*loaded)
     base = calibrations[0]
@@ -593,13 +594,15 @@ def _fit_xu(frames, loaded, del_motor, nu_motor, distance_seed_m, distance_bound
 
 
 def _fit_xu_extended(frames, *, del_motor, nu_motor, distance_seed_m, distance_bounds_m, max_rms_q,
-                     domain, distance_provenance, cancelled, validation_angles, progress):
+                     domain, distance_provenance, cancelled, validation_angles, progress,
+                     instrument_geometry=None):
     """The extended pyFAI arm, transferred to an XU SURFACE v3 asset."""
     from xrd_tools.integrate.xu_transfer import transfer_extended_arm_to_xu
     extended = fit_calibration(frames, backend='multigeometry', del_motor=del_motor, nu_motor=nu_motor,
                                distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
                                max_rms_q=max_rms_q, distance_provenance=distance_provenance,
-                               cancelled=cancelled, arm_model='stacked_extended')
+                               cancelled=cancelled, arm_model='stacked_extended',
+                               instrument_geometry=instrument_geometry)
     if validation_angles is None:
         limits = domain or {key: [min(f.motors[motor] for f in frames), max(f.motors[motor] for f in frames)]
                             for key, motor in (('del', del_motor), ('nu', nu_motor))}

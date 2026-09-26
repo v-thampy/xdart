@@ -401,6 +401,8 @@ def test_an_xu_extended_fit_is_transferred_and_gated_over_the_scan(qapp, tmp_pat
         assert dialog.fit is not None and dialog.fit.backend == 'xu_hist', dialog.status.text()
         transfer = dialog.fit.asset['provenance']['xu_transfer']
         assert transfer['validation_frames'] == len(ANGLES) and transfer['max_abs_dq_A^-1'] <= 1e-8
+        # the transferred fit records its instrument too (Codex round 11 residual)
+        assert dialog.fit.asset['provenance']['instrument_geometry'] == dialog.geometry_editor.value().to_record()
         assert 'Transferred to xrayutilities' in dialog.fit_summary.toPlainText()
         target = (tmp_path / 'calibration' / 'xu-extended.json').resolve()
         _save_to(monkeypatch, target)
