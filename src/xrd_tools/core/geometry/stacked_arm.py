@@ -98,6 +98,14 @@ def is_single_arm(record) -> bool:
     return isinstance(constants, dict) and SINGLE_ARM_MARKER in constants
 
 
+def is_arm_record(record) -> bool:
+    """Whether a goniometer record is one of these arms (stacked, extended or single), not
+    an independent-angle calibration."""
+    trans = record.get('trans_function') if isinstance(record, dict) else None
+    constants = trans.get('constants') if isinstance(trans, dict) else None
+    return isinstance(constants, dict) and any(marker in constants for marker in STACKED_ARM_MARKERS)
+
+
 @dataclass(frozen=True)
 class StackedDetectorArm:
     """An explicit nu-outer, del-inner pose; not independent Euler mappings.

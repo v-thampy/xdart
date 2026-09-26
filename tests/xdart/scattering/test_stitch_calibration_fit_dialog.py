@@ -277,13 +277,18 @@ def test_automatic_refinement_from_the_pages_geometry_saves_and_is_adopted(qapp,
     try:
         assert dialog.refine_seed.currentData() == 'file'
         assert dialog._text('refine_seed_path') == str(seed_path)
-        dialog.refine_button.click()  # the calibrant confirmation is required
-        assert 'calibrant scan' in dialog.status.text() and not dialog.active()
-        dialog.refine_confirm.setChecked(True)
+        assert not dialog.refine_seed_note.text()  # a detector arm: it can start the refinement
+        older = tmp_path / 'calibration' / 'independent.json'  # an independent-angle calibration
+        older.write_text(json.dumps({'trans_function': {'constants': {'pi': 3.141592653589793}}}))
+        dialog._fields['refine_seed_path'].setText(str(older))
+        assert 'independent angles' in dialog.refine_seed_note.text()  # said at once, not after Refine
+        dialog._fields['refine_seed_path'].setText(str(seed_path))
+        assert not dialog.refine_seed_note.text()
         dialog._fields['refine_frames'].setText('12')
-        dialog.refine_button.click()
+        dialog.refine_button.click()  # no calibrant confirmation: the calibrant chosen says what it is
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
+        assert dialog.refine_seed.currentData() == 'fit'  # a further refinement starts from this one
         automatic = dialog.fit.asset['provenance']['automatic_refinement']
         assert automatic['calibrant'] == 'LaB6' and automatic['validation']['chosen'] == 'stacked_extended'
         # as the guided fit, it records which motor drives which circle (Codex round 11 residual)
@@ -323,7 +328,6 @@ def test_cancelled_refinement_ends_cancelled_and_a_refusal_saves_nothing(qapp, t
     dialog = StitchCalibrationDialog(tmp_path)
     try:
         dialog.set_source_context(spec, geometry_path=seed_path)
-        dialog.refine_confirm.setChecked(True)
         dialog._fields['refine_frames'].setText('2')
         dialog.refine_button.click()
         _wait(dialog)

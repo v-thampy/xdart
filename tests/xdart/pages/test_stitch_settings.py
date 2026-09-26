@@ -86,11 +86,9 @@ def test_calibration_dialog_settings_are_kept_but_not_its_confirmations(qapp, tm
         dialog.arm_model.activated.emit(extended)  # the user's choice
         dialog.refine_calibrant.setCurrentIndex(dialog.refine_calibrant.count() - 1)
         dialog._set_field_text("rms", ".02")
-        dialog.refine_confirm.setChecked(True)
         saved = page.settings()["calibration"]
         assert saved["choices"]["arm_model"]["data"] == "stacked_extended"
         assert saved["fields"]["rms"] == ".02"
-        assert "refine_confirm" not in json.dumps(saved)
 
         restored.apply_settings(page.settings())
         restored._calibrate()
@@ -101,7 +99,6 @@ def test_calibration_dialog_settings_are_kept_but_not_its_confirmations(qapp, tm
         again.apply_settings(custom)  # an editable choice keeps a typed-in entry
         assert again.refine_calibrant.currentText() == "NIST-SRM-660c"
         assert again._text("rms") == ".02"
-        assert not again.refine_confirm.isChecked()
         # a new session has no completed frames: five-parameter shown, the choice kept
         assert again.arm_model.currentData() == "stacked"
         assert again.settings()["choices"]["arm_model"]["data"] == "stacked_extended"
