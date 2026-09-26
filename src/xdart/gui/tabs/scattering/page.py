@@ -6413,6 +6413,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         viewer_current, viewer_paths = (
             self._context_controller.viewer_1d_artifact_selection
             if viewer_1d else ("", ()))
+        # The 2D file intent: a deferred open, else the open context's file
+        # (still loading its catalog, or clearing).
+        context_2d = self._context_controller.viewer_2d_context
+        viewer_2d_current = (self._pending_viewer_2d_path
+                             or getattr(context_2d, "original_path", "") or ""
+                             ) if tool is Tool.IMAGE_VIEWER else ""
         projection = self._context_projection.build_shell(
             revision=self._shell_revision,
             controls=controls,
@@ -6430,6 +6436,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             browser_catalog_index=browser.scan_index,
             browser_transient_frame=browser.transient_frame,
             viewer_1d_current_path=viewer_current,
+            viewer_2d_current_path=(os.path.abspath(viewer_2d_current)
+                                    if viewer_2d_current else ""),
             viewer_1d_selected_paths=viewer_paths,
             viewer_waterfall_active=self._shell.scientific.bottom_waterfall_active,
             date_sorted=browser.date_sorted,
