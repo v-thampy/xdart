@@ -1088,8 +1088,9 @@ def run_xu_hist_stitch_1d(
                 "INVALID_METADATA_VALUE", "frame metadata is not a mapping"
             )
         try:
-            del_value = float(metadata[acquisition["source_motors"]["del"]])
-            nu_name = acquisition["source_motors"]["nu"]  # None: a single 2θ arm, nu held at zero
+            # None: the circle a single 2θ arm holds at zero
+            del_name, nu_name = (acquisition["source_motors"][circle] for circle in ("del", "nu"))
+            del_value = 0.0 if del_name is None else float(metadata[del_name])
             nu_value = 0.0 if nu_name is None else float(metadata[nu_name])
         except (KeyError, TypeError, ValueError) as error:
             raise XuStitchScienceRefused(

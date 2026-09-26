@@ -485,6 +485,37 @@ def test_an_xu_calibration_holds_a_2theta_arms_nu_at_zero(tmp_path):
         parse_xu_stitch_calibration_bytes(_canonical_bytes(moved))
 
 
+def test_an_xu_calibration_holds_a_horizontal_arms_del_at_zero(tmp_path):
+    from xrd_tools.analysis.xu_stitch_calibration import (
+        XuStitchCalibrationRefused, _canonical_bytes, parse_xu_stitch_calibration_bytes,
+    )
+    from xrd_tools.integrate.stitch_calibration import fit_calibration
+    from tests.core.test_stacked_arm_extension import _calibration as _truth_calibration, _ring_controls
+    from tests.core.test_stitch_guided_calibration import _frames
+    controls, _calibrant = _ring_controls({'nu_offset': -.02, 'del_offset': .01}, _truth_calibration(),
+                                          [(0., nu) for nu in (6., 18., 30., 42.)])
+    fits = {}
+    for held in (True, False):  # a horizontal arm (del held), and psic reading a del of zero
+        directory = tmp_path / str(held)
+        directory.mkdir()
+        motors = [{'tth': c.motors['nu']} if held else {'tth': c.motors['nu'], 'del': 0.} for c in controls]
+        frames = _frames(directory, [replace(c, motors=m) for c, m in zip(controls, motors)], _truth_calibration().poni)
+        fits[held] = fit_calibration(frames, backend='xu_hist', del_motor=None if held else 'del', nu_motor='tth')
+    single, psic = fits[True].asset['calibration'], fits[False].asset['calibration']
+    assert single['acquisition']['source_motors'] == {'del': None, 'nu': 'tth'}
+    assert single['validation']['control_domain_source_deg']['del'] == [0., 0.]
+    assert single['detector'] == psic['detector'] and fits[True].rms_q == fits[False].rms_q
+    assert single['acquisition']['detector_offsets_deg'] == psic['acquisition']['detector_offsets_deg']
+    moved = json.loads(json.dumps(single))
+    moved['validation']['validated_scan_domain_source_deg']['del'] = [-1., 1.]
+    with pytest.raises(XuStitchCalibrationRefused, match='holds del at zero'):
+        parse_xu_stitch_calibration_bytes(_canonical_bytes(moved))
+    neither = json.loads(json.dumps(single))
+    neither['acquisition']['source_motors']['nu'] = None
+    with pytest.raises(XuStitchCalibrationRefused, match='distinct source motors'):
+        parse_xu_stitch_calibration_bytes(_canonical_bytes(neither))
+
+
 @pytest.mark.slow
 def test_the_real_del_only_scan_stitches_the_same_with_xrayutilities(tmp_path):
     from xrd_tools.analysis.module_transaction import (

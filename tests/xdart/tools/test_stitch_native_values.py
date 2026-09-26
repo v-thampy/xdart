@@ -379,8 +379,10 @@ def test_native_nexus_group_uses_metadata_and_exact_raw_dataset(tmp_path):
     np.testing.assert_array_equal(view.raw, np.arange(195 * 487).reshape(195, 487))
 
 
-def test_a_single_arm_xu_calibration_reads_only_its_2theta_motor(tmp_path):
-    """Preview and Run of an xrayutilities calibration for a fourc/twoc arm: nu held at zero."""
+@pytest.mark.parametrize("held", ("nu", "del"))
+def test_a_single_arm_xu_calibration_reads_only_its_2theta_motor(tmp_path, held):
+    """Preview and Run of an xrayutilities calibration for a fourc/twoc arm: vertical (nu held
+    at zero) or horizontal (del held at zero)."""
     import json
     from pyFAI.detectors import detector_factory
     from xrd_tools.analysis.stitch_operation import run_stitch_operation
@@ -395,12 +397,14 @@ def test_a_single_arm_xu_calibration_reads_only_its_2theta_motor(tmp_path):
         distance_m=canonical["detector"]["distance_m"], del_offset_deg=3., nu_offset_deg=1.2,
         energy_eV=canonical["acquisition"]["energy_eV"],
         xu_wavelength_A=canonical["acquisition"]["xu_mapping_wavelength_A"],
-        source_motors={"del": "del", "nu": None}, rotation=0,
-        control_domain={"del": [14., 15.], "nu": [0., 0.]}, domain={"del": [0., 50.], "nu": [0., 0.]},
+        source_motors={"del": "del", "nu": None} if held == "nu" else {"del": None, "nu": "del"}, rotation=0,
+        control_domain={"del": [14., 15.], "nu": [0., 0.]} if held == "nu" else {"del": [0., 0.], "nu": [14., 15.]},
+        domain={"del": [0., 50.], "nu": [0., 0.]} if held == "nu" else {"del": [0., 0.], "nu": [0., 50.]},
         rms_q=1e-3, condition=10., n_frames=3, n_points=100)
     path = tmp_path / "xu-single.json"
     path.write_bytes(_canonical_bytes(asset))
-    request = prepare_stitch_tool(replace(form, geometry_path=path, source_motors=(("del", "del"),))).request
+    mapping = (("del", "del"),) if held == "nu" else (("nu", "del"),)  # the scan's del column is the 2θ
+    request = prepare_stitch_tool(replace(form, geometry_path=path, source_motors=mapping)).request
     assert {name for item in request.manifest.contributions for name, _o, _v in item.values} == {"del"}
     result = run_stitch_operation(request)
     assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal

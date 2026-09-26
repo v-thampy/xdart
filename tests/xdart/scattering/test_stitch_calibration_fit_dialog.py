@@ -232,6 +232,37 @@ def test_a_twoc_arm_is_fitted_for_xrayutilities_with_nu_held_at_zero(qapp, tmp_p
         page.shutdown()
 
 
+def test_a_horizontal_twoc_arm_is_fitted_for_xrayutilities_with_del_held_at_zero(qapp, tmp_path, monkeypatch):
+    from xrd_tools.session.instrument import InstrumentGeometry
+    (tmp_path / 'frames').mkdir()
+    frames = _horizontal_frames(tmp_path)
+    page, dialog = _page_with_dialog(tmp_path)
+    try:
+        dialog.set_instrument(InstrumentGeometry('twoc', plane='horizontal'))
+        dialog.backend.setCurrentIndex(dialog.backend.findData('xu_hist'))
+        dialog.frames, dialog._frame_motors = frames, (None, 'tth')
+        dialog._render_frames()
+        assert not dialog.arm_model.isEnabled()
+        dialog._fields['nu_domain'].setText('0, 50')  # the typed range covers 2θ; del stays at zero
+        dialog.fit_button.click()
+        _wait(dialog, timeout=120)
+        assert dialog.fit is not None and dialog.fit.backend == 'xu_hist', dialog.status.text()
+        asset = dialog.fit.asset['calibration']
+        assert asset['acquisition']['source_motors'] == {'del': None, 'nu': 'tth'}
+        assert asset['validation']['validated_scan_domain_source_deg'] == {'del': [0., 0.], 'nu': [0., 50.]}
+        target = (tmp_path / 'calibration' / 'xu-twoc-horizontal.json').resolve()
+        _save_to(monkeypatch, target)
+        dialog.save_button.click()
+        assert page._value("backend") == "xrayutilities histogram"
+        assert page._value("source_motors") == "nu=tth"
+        assert page._arm_problem() is None
+        page._set_instrument(InstrumentGeometry('twoc'))  # the vertical plane cannot take it
+        assert 'Choose the horizontal scattering plane' in page._arm_problem()
+    finally:
+        dialog.close()
+        page.shutdown()
+
+
 def test_a_fit_belongs_to_the_instrument_its_frames_were_staged_with(qapp, tmp_path, monkeypatch):
     # Codex round 11 F1: motors renamed after staging, and the geometry changed after a fit
     from xrd_tools.session.instrument import InstrumentGeometry

@@ -1661,9 +1661,9 @@ def _xu_observations(
     asset = plan.calibration.projection.value
     acquisition = asset["acquisition"]
     validation = asset["validation"]
-    del_key = (str(acquisition["source_motors"]["del"]), 0)
-    nu_name = acquisition["source_motors"]["nu"]  # None: a single 2θ arm, nu held at zero
-    nu_key = None if nu_name is None else (str(nu_name), 0)
+    # None: the circle a single 2θ arm holds at zero
+    del_key, nu_key = (None if acquisition["source_motors"][circle] is None
+                       else (str(acquisition["source_motors"][circle]), 0) for circle in ("del", "nu"))
     monitor_key = (
         None
         if plan.monitor_selector is None
@@ -1687,7 +1687,7 @@ def _xu_observations(
             for name, occurrence, value in contribution.values
         }
         try:
-            del_value = float(values[del_key])
+            del_value = 0.0 if del_key is None else float(values[del_key])
             nu_value = 0.0 if nu_key is None else float(values[nu_key])
         except KeyError as error:
             raise StitchOperationRefused(

@@ -1156,7 +1156,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             seed = float(self._text('distance_seed')) / 1000 if self._text('distance_seed') else None
             domain = None
             if self._text('del_domain') or self._text('nu_domain'):
-                circles = ('del',) if self._frame_motors[1] is None else ('del', 'nu')  # a 2θ arm: nu at zero
+                circles = tuple(circle for circle, motor in zip(('del', 'nu'), self._frame_motors)
+                                if motor is not None)  # a 2θ arm's held circle stays at zero
                 domain = {motor: [float(v) for v in self._text(motor + '_domain').split(',')] for motor in circles}
             options = dict(backend=self.backend.currentData(), del_motor=self._frame_motors[0],
                 nu_motor=self._frame_motors[1], fit_scales=self.scales.isChecked(),

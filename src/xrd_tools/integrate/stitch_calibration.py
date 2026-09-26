@@ -562,9 +562,10 @@ def _fit_xu(frames, loaded, del_motor, nu_motor, distance_seed_m, distance_bound
                               pwidth1=pitch1 * 1e3, pwidth2=pitch2 * 1e3, distance=dist)
             out = []
             for control, calibrant, _ in loaded:
-                nu = 0. if nu_motor is None else control.motors[nu_motor]  # a 2θ arm holds nu at zero
-                qx, qy, qz = hx.Ang2Q.area(0., 0., 0., 0., nu - no,
-                                          control.motors[del_motor] - do)
+                # a single 2θ arm holds its other circle at zero
+                nu = 0. if nu_motor is None else control.motors[nu_motor]
+                delta = 0. if del_motor is None else control.motors[del_motor]
+                qx, qy, qz = hx.Ang2Q.area(0., 0., 0., 0., nu - no, delta - do)
                 q = np.hypot(np.hypot(qx, qy), qz)
                 reference = 2 * np.pi / np.asarray(calibrant.dspacing)[control.rings]
                 out.append(q[control.rows, control.cols] - reference)
@@ -581,8 +582,9 @@ def _fit_xu(frames, loaded, del_motor, nu_motor, distance_seed_m, distance_bound
     params = [float(v) for v in result.x]
     control_domain = {key: [min(f.motors[motor] for f in frames), max(f.motors[motor] for f in frames)]
                       if motor is not None else [0., 0.] for key, motor in [('del', del_motor), ('nu', nu_motor)]}
-    if nu_motor is None and domain is not None:  # a single 2θ arm's asset holds nu at zero
-        domain = {**domain, 'nu': [0., 0.]}
+    if domain is not None:  # a single 2θ arm's asset holds its other circle at zero
+        domain = {**domain, **{circle: [0., 0.] for circle, motor in (('del', del_motor), ('nu', nu_motor))
+                               if motor is None}}
     asset = authored_surface_calibration(
         detector=detector, cch1=params[0], cch2=params[1], distance_m=params[2] / 1e3,
         del_offset_deg=params[3], nu_offset_deg=params[4], energy_eV=energy,

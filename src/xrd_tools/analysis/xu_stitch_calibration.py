@@ -327,10 +327,12 @@ def _validate_authored_surface(value):
     for key in ('source_motors', 'detector_offsets_deg'):
         require(type(acquisition[key]) is dict and set(acquisition[key]) == {'del', 'nu'}, 'two detector motors required')
     motors = acquisition['source_motors']
-    single = motors['nu'] is None  # a single 2θ arm (fourc, twoc): nu held at zero
-    require(type(motors['del']) is str and bool(motors['del']) and (single or (
-        type(motors['nu']) is str and bool(motors['nu']) and motors['nu'] != motors['del'])),
-        'distinct source motors required')
+    # a single 2θ arm (fourc, twoc) names no motor (null) for the circle it holds at zero:
+    # nu for a vertical arm, del for a horizontal one
+    held = [circle for circle, motor in motors.items() if motor is None]
+    require(len(held) <= 1 and all(type(motor) is str and motor for motor in motors.values() if motor is not None)
+            and len({motor for motor in motors.values() if motor is not None}) == 2 - len(held),
+            'distinct source motors required')
     require(all(number(v) and abs(v) <= 5 for v in acquisition['detector_offsets_deg'].values()), 'motor offsets exceed fit bounds')
     require(number(acquisition['energy_eV']) and acquisition['energy_eV'] > 0, 'positive energy required')
     expected = 1.239841984e4 / acquisition['energy_eV']
@@ -356,8 +358,9 @@ def _validate_authored_surface(value):
     require(all(validation['validated_scan_domain_source_deg'][motor][0] <= limits[0] <= limits[1]
                 <= validation['validated_scan_domain_source_deg'][motor][1]
                 for motor, limits in validation['control_domain_source_deg'].items()), 'run domain must enclose control coverage')
-    require(not single or all(validation[name]['nu'] == [0, 0] for name in (
-        'control_domain_source_deg', 'validated_scan_domain_source_deg')), 'a single 2θ arm holds nu at zero')
+    require(all(validation[name][circle] == [0, 0] for circle in held for name in (
+        'control_domain_source_deg', 'validated_scan_domain_source_deg')),
+        f'a single 2θ arm holds {" and ".join(held) or "a circle"} at zero')
 
 
 #: Version 3: the SURFACE model plus xrayutilities' detector tilt/rotation and sample
