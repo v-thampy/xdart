@@ -127,8 +127,15 @@ def test_catalog_first_controller_mounts_exact_identity_and_navigation(tmp_path,
     if policy is not None:
         monkeypatch.setattr("xdart.gui.tabs.scattering.context_controller.Viewer2DFormatPolicy", lambda: policy)
     controller = _controller()
+    release, catalog = Event(), viewer_api.catalog_viewer_2d
+    def held(path, **values):
+        assert release.wait(4)
+        return catalog(path, **values)
+    # The transport thread's completion clears loading; hold the read so the flag is observable.
+    monkeypatch.setattr("xdart.gui.tabs.scattering.hydration_transport.catalog_viewer_2d", held)
     request = controller.open_viewer_2d(str(path))
     assert (request.path, controller.viewer_2d_loading) == (str(path), True)
+    release.set()
     _await_viewer(controller)
     owner = controller._viewer_2d
     context = controller.viewer_2d_context
