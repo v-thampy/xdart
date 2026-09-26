@@ -13,8 +13,9 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from xdart.gui.pages.operation_owner import SingleWorkerOwner, OperationCancelled, OperationTerminalStatus
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.integrate.calibration_seed import ring_summary, rough_arm_record
+from xrd_tools.session.instrument import InstrumentGeometry
 from xrd_tools.integrate.stitch_calibration import (
-    adopt_calibration_pair, capture_calibration_frames, fit_calibration,
+    adopt_calibration_pair, capture_calibration_frames, fit_calibration, scan_motor_names,
     load_calibration_session, save_calibration_fit, save_calibration_session,
     source_frame_choices, suggested_frame_indices, validate_frame_files,
 )
@@ -80,7 +81,12 @@ def _dispatch_job(request, cancelled, publish):
             publish(f'{stage} {done}/{total}', low + (high - low) * done // max(total, 1), 1000)
         return refine_arm_from_scan(spec, seed, cancelled=cancelled, progress=progress, **options)
     if kind == 'enumerate':
-        return source_frame_choices(*arguments)
+        spec, record = arguments
+        names = scan_motor_names(spec)
+        geometry = InstrumentGeometry.from_record(record)
+        if names:  # the scan's own motor for each circle (a choice the scan has stays)
+            geometry = InstrumentGeometry.pick(geometry.geometry, names, keep=geometry)
+        return source_frame_choices(spec, geometry.stitch_arm()), names, geometry.to_record()
     if kind == 'prepare':
         spec, indices, directory, rotation, motors = arguments
         return capture_calibration_frames(spec, indices, directory, rotation=rotation,
@@ -215,6 +221,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
     previously completed rows. Call ``show/raise_/activateWindow``.
     """
     calibrationSaved = QtCore.Signal(str, str)
+    #: The diffractometer or a circle's motor changed (the page keeps the same geometry).
+    geometryChanged = QtCore.Signal()
 
     def __init__(self, project_root: str | Path, *, backend='multigeometry', parent=None):
         super().__init__(parent)
@@ -349,8 +357,6 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._edit(form, 'images', 'SPEC images directory', chooser='directory')
         self._edit(form, 'stem', 'Image filename stem', '')
         self._edit(form, 'entry', 'NeXus entry', 'entry')
-        self._edit(form, 'del_motor', 'Detector delta column (degrees)', 'del')
-        self._edit(form, 'nu_motor', 'Detector nu column (degrees)', 'nu')
         reader = QtWidgets.QHBoxLayout()
         for key, label, default in [('shape', 'RAW rows, columns', '195, 1475'), ('dtype', 'RAW dtype', 'int32'), ('header', 'Header bytes', '0')]:
             reader.addWidget(QtWidgets.QLabel(label))
@@ -466,8 +472,18 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._sync_arm_model()
 
     def _build_distance(self):
-        layout, form = self._form('1 · Rough geometry', 'rough')
+        layout, form = self._form('1 · Geometry', 'rough')
         self._beam_form = form
+        from xdart.gui.widgets.geometry_editor import GeometryEditor
+        diffractometer = QtWidgets.QGroupBox('Diffractometer')
+        box = QtWidgets.QVBoxLayout(diffractometer)
+        self.geometry_editor = GeometryEditor(used=('nu', 'del'), used_by='Stitch')
+        box.addWidget(self.geometry_editor)
+        layout.insertWidget(0, diffractometer)
+        self.geometry_editor.changed.connect(self.geometryChanged.emit)
+        # the arm's motors are these circles' (read by name as before)
+        self._fields['del_motor'] = self.geometry_editor.motor_edit('del')
+        self._fields['nu_motor'] = self.geometry_editor.motor_edit('nu')
         self.rough_mode = QtWidgets.QComboBox()
         for label, value in [('Direct-beam scan', 'scan'), ('Enter the distance', 'manual'),
                              ('Skip', 'skip')]:
@@ -617,12 +633,21 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             'fields': {key: self._text(key) for key in self._fields},
             'choices': choices,
             'fit_motor_scales': self.scales.isChecked(),
+            'instrument_geometry': self.geometry_editor.value().to_record(),
         }
+
+    def set_instrument(self, geometry: InstrumentGeometry):
+        """The diffractometer and motor names (the page's, shared by Stitch)."""
+        self.geometry_editor.set_value(geometry)
 
     def apply_settings(self, values):
         """Restore saved inputs; unknown entries are ignored."""
         if not isinstance(values, dict):
             return
+        try:
+            self.geometry_editor.set_value(InstrumentGeometry.from_record(values.get('instrument_geometry')))
+        except (ValueError, TypeError):
+            pass  # an older settings file: the del/nu fields below still name the arm
         for key, text in (values.get('fields') or {}).items():
             if key in self._fields and isinstance(text, str):
                 self._set_field_text(key, text)
@@ -698,9 +723,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _enumerate(self):
         def go():
+            self.geometry_editor.value().stitch_arm()  # refuses a single-2θ-arm geometry here
             self._enumerated_spec = self._spec()
-            self._enumerated_motors = (self._text('del_motor'), self._text('nu_motor'))
-            self._start('enumerate', (self._enumerated_spec, self._enumerated_motors))
+            self._start('enumerate', (self._enumerated_spec, self.geometry_editor.value().to_record()))
         self._guard(go)
 
     def _prepare(self):
@@ -808,6 +833,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _fit(self):
         def go():
+            self.geometry_editor.value().stitch_arm()  # Stitch's arm needs nu and del
             frames = tuple(frame for frame in self.frames if frame.complete)
             bounds = tuple(float(v) / 1000 for v in self._text('distance_bounds').split(',')) if self._text('distance_bounds') else None
             seed = float(self._text('distance_seed')) / 1000 if self._text('distance_seed') else None
@@ -816,6 +842,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 domain = {motor: [float(v) for v in self._text(motor + '_domain').split(',')] for motor in ('del', 'nu')}
             options = dict(backend=self.backend.currentData(), del_motor=self._frame_motors[0],
                 nu_motor=self._frame_motors[1], fit_scales=self.scales.isChecked(),
+                instrument_geometry=self.geometry_editor.value().to_record(),
                 arm_model=self.arm_model.currentData(),
                 distance_seed_m=seed, distance_bounds_m=bounds, max_rms_q=float(self._text('rms')), domain=domain,
                 distance_provenance=self._distance_provenance if hasattr(self, '_distance_provenance') else None)
@@ -825,6 +852,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _refine(self):
         def go():
+            self.geometry_editor.value().stitch_arm()  # Stitch's arm needs nu and del
             if not self.refine_confirm.isChecked():
                 raise ValueError('confirm that the scan is a calibrant scan; never refine the geometry on a sample')
             spec = self._spec()
@@ -985,6 +1013,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             result = terminal.payload
             try:
                 if kind == 'enumerate':
+                    result, names, record = result
+                    self.geometry_editor.set_available_motors(names)
+                    self.geometry_editor.set_value(InstrumentGeometry.from_record(record))
+                    self._enumerated_motors = (self._text('del_motor'), self._text('nu_motor'))
                     self._choices = result
                     suggested = suggested_frame_indices(result)
                     self.selection.setRowCount(len(result))

@@ -224,7 +224,7 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     from tests.core.test_calibration_seed import _frame, _record
     dialog = StitchCalibrationDialog(tmp_path, backend='multigeometry')
     assert [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())] == [
-        '1 · Rough geometry', '2 · Select frames', '3 · Calibrate each frame', '4 · Fit and save']
+        '1 · Geometry', '2 · Select frames', '3 · Calibrate each frame', '4 · Fit and save']
     form = dialog._beam_form
     visible = lambda key: form.isRowVisible(dialog._path_rows.get(key, dialog._fields[key]))  # noqa: E731
     assert visible('beam_source') and not visible('rough_distance')  # a direct-beam scan by default
@@ -252,6 +252,40 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     from xdart.gui.pages.values import PageCleanup
     assert dialog.shutdown().status is PageCleanup.CLEAN
     dialog.close()
+
+
+def test_the_geometry_comes_first_and_names_the_arm_motors(tmp_path):
+    dialog = StitchCalibrationDialog(tmp_path, backend='multigeometry')
+    assert dialog.tabs.tabText(0) == '1 · Geometry'
+    assert dialog._tab_pages['rough'].isAncestorOf(dialog.geometry_editor)
+    source = SourceSpec(tmp_path/'beam', SourceKind.SPEC, options={'scan': '14'})
+    dialog.set_source_context(source, del_motor='delta', nu_motor='nu')
+    assert dialog.geometry_editor.value().stitch_arm() == ('delta', 'nu')
+    assert dialog.settings()['instrument_geometry']['motors']['del'] == 'delta'
+    dialog.geometry_editor.geometry.setCurrentIndex(dialog.geometry_editor.geometry.findData('twoc'))
+    dialog._enumerate()
+    assert 'single 2θ arm' in dialog.status.text()  # Stitch's arm needs nu and del
+    from xdart.gui.pages.values import PageCleanup
+    assert dialog.shutdown().status is PageCleanup.CLEAN
+    dialog.close()
+
+
+def test_reading_metadata_takes_each_circles_motor_from_the_scan(tmp_path):
+    from xdart.gui.tabs.stitch.calibration import _dispatch_job
+    from xrd_tools.session.instrument import InstrumentGeometry
+    spec = tmp_path / 'beam'
+    spec.write_text('#F beam\n#E 1\n#D Thu Jan 1 00:00:00 1970\n#C test\n'
+                    '#O0 delta nu\n#S 1 ascan delta 1 3 2 1\n#D today\n#P0 0 4\n#N 2\n#L delta  nu\n1 4\n2 5\n3 6\n')
+    images = tmp_path / 'images'
+    images.mkdir()
+    for index in range(3):
+        (images / f'beam_scan1_{index:04d}.raw').write_bytes(np.zeros((4, 6), '<i4').tobytes())
+    source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(images),
+        'read_image_kwargs': {'detector_shape': (4, 6), 'raw_dtype': '<i4'}})
+    rows, names, record = _dispatch_job(('enumerate', (source, InstrumentGeometry().to_record())),
+                                        Event(), lambda *_: None)
+    assert 'delta' in names and InstrumentGeometry.from_record(record).stitch_arm() == ('delta', 'nu')
+    assert rows[0][1] == {'delta': 1.0, 'nu': 4.0}
 
 
 def test_staged_frames_survive_pyfai_ring_extraction(tmp_path):

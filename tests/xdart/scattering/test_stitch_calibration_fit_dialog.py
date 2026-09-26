@@ -131,7 +131,9 @@ def test_five_parameter_guided_save_equals_the_core_save(qapp, tmp_path, monkeyp
         target = (tmp_path / 'calibration' / 'dialog.json').resolve()
         _save_to(monkeypatch, target)
         dialog.save_button.click()
-        direct = Path(save_calibration_fit(fit_calibration(frames), tmp_path / 'calibration' / 'core.json'))
+        geometry = dialog.geometry_editor.value().to_record()  # the window records its diffractometer
+        direct = Path(save_calibration_fit(fit_calibration(frames, instrument_geometry=geometry),
+                                           tmp_path / 'calibration' / 'core.json'))
         assert target.read_bytes() == direct.read_bytes()
         assert (Path(f'{target}.provenance.json').read_bytes()
                 == Path(f'{direct}.provenance.json').read_bytes())

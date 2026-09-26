@@ -106,7 +106,10 @@ def test_mg_fit_saved_json_reloads_actual_importer_and_bad_inputs_refuse(tmp_pat
     from pyFAI.goniometer import Goniometer
     controls, calibration = _independent_stacked_controls()
     frames = _frames(tmp_path, controls, calibration.poni)
-    result = fit_calibration(frames, distance_bounds_m=(.37, .41))
+    geometry = {'geometry': 'psic', 'motors': {'mu': 'mu', 'eta': 'halpha', 'chi': 'chi', 'phi': 'phi',
+                                               'nu': 'nu', 'del': 'del'}}
+    result = fit_calibration(frames, distance_bounds_m=(.37, .41), instrument_geometry=geometry)
+    assert result.asset['provenance']['instrument_geometry'] == geometry  # saved beside the file
     path = save_calibration_fit(result, tmp_path / 'fitted.json')
     loaded = Diffractometer.from_pyfai_goniometer(path,
         source_motors={'nu_angle': 'nu', 'del_angle': 'del'})

@@ -134,20 +134,36 @@ def test_preview_warns_when_the_flat_median_is_far_from_one(tmp_path):
         assert any(item.startswith("Flat field median 1000") for item in warnings) is warned
 
 
-def test_a_goniometer_json_sets_the_angle_mapping_from_its_positions(qapp, tmp_path):
+def test_the_angle_mapping_follows_the_geometry_not_the_files_position_names(qapp, tmp_path):
     import json
+    from xrd_tools.session.instrument import InstrumentGeometry
 
     values = tmp_path / "MG_gonio_object.json"  # declares del_value/nu_value, not del_angle/nu_angle
     values.write_text(json.dumps({"trans_function": {"pos_names": ["del_value", "nu_value"]}}))
     page = StitchPage(empty_host_services(_Status()))
     try:
+        assert page._rows["source_motors"].editor.isReadOnly()  # derived, set under Geometry
         page.set_field("geometry_path", str(values))
         assert page._value("source_motors") == "del_value=del, nu_value=nu"
-        page.set_field("source_motors", "del_value=delta, nu_value=nu")  # the user's motors stay
-        page.set_field("geometry_path", str(values))
+        # the beamline calls del "delta": set once on the circle, every file maps to it
+        page._set_instrument(InstrumentGeometry("psic", (("del", "delta"),)))
         assert page._value("source_motors") == "del_value=delta, nu_value=nu"
+        other = tmp_path / "stacked.json"
+        other.write_text(json.dumps({"trans_function": {"pos_names": ["del_angle", "nu_angle"]}}))
+        page.set_field("geometry_path", str(other))
+        assert page._value("source_motors") == "del_angle=delta, nu_angle=nu"
         page.set_field("geometry_path", str(tmp_path / "missing.json"))  # unreadable: untouched
-        assert page._value("source_motors") == "del_value=delta, nu_value=nu"
+        assert page._value("source_motors") == "del_angle=delta, nu_angle=nu"
+        # the geometry travels with the settings, and older settings' del/nu names migrate
+        restored = StitchPage(empty_host_services(_Status()))
+        try:
+            restored.apply_settings(page.settings())
+            assert restored._instrument().motor("del") == "delta"
+            legacy = {"fields": {"del_motor": "tth2", "nu_motor": "gam"}, "choices": {}}
+            restored._set_calibration_settings(legacy)
+            assert (restored._instrument().motor("del"), restored._instrument().motor("nu")) == ("tth2", "gam")
+        finally:
+            _close(restored, qapp)
     finally:
         _close(page, qapp)
 

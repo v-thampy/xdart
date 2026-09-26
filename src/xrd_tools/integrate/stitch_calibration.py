@@ -156,6 +156,24 @@ def source_frame_choices(spec: SourceSpec, motor_names=('del', 'nu')):
             close()
 
 
+def scan_motor_names(spec: SourceSpec) -> tuple[str, ...]:
+    """The scan's motor names (SPEC #O/#P positioners, NeXus positioners), for choosing
+    which motor drives which circle; () when the source does not list them."""
+    from xrd_tools.sources import open_source
+    source = open_source(_exact_source(spec))
+    try:
+        motors = getattr(source, 'motors', None)
+        if isinstance(motors, dict):
+            return tuple(str(name) for name in motors)
+        describe = getattr(source, 'container_descriptor', None)
+        names = getattr(describe(), 'motor_names', None) if describe is not None else None
+        return tuple(str(name) for name in names or ())
+    finally:
+        close = getattr(source, 'close', None)
+        if close is not None:
+            close()
+
+
 def suggested_frame_indices(rows, count=5):
     """Greedy angular coverage suggestions; count is not fit sufficiency."""
     if not rows:
@@ -380,7 +398,7 @@ def _mg_detector_config(calibration):
 def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_motor='nu',
                     fit_scales=False, distance_seed_m=None, distance_bounds_m=None,
                     max_rms_q=0.03, domain=None, distance_provenance=None, cancelled=None,
-                    arm_model='stacked'):
+                    arm_model='stacked', instrument_geometry=None):
     """Fit the matched rows and refuse unconverged, degenerate or poor fits.
 
     ``arm_model='stacked_extended'`` (MultiGeometry only) also fits the detector
@@ -441,6 +459,8 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                                     if backend == 'multigeometry' else {'nu': nu_motor, 'del': del_motor}),
                   'image_rotation': frames[0].rotation,
                   'direct_beam': distance_provenance}
+    if instrument_geometry is not None:  # which motor drives which circle, for RSM and later reads
+        provenance['instrument_geometry'] = dict(instrument_geometry)
     if arm_model == 'stacked_extended':
         provenance['arm_model'] = arm_model
         provenance['parameter_errors'] = dict(result.param_errors)
