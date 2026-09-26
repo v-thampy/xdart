@@ -180,29 +180,106 @@ def test_the_fit_and_seeds_take_a_horizontal_arm():
     assert dict(zip(rough['param_names'], rough['param']))['nu_offset'] == pytest.approx(-math.radians(2.))
 
 
-def test_a_single_arm_is_one_screening_row_whichever_circle_moves():
-    from types import SimpleNamespace
-    from xrd_tools.analysis.stitch_operation import _frame_screen_rows
-    from xrd_tools.integrate.stitch_autocalibration import stratified_frame_indices
+def _affine(positions, detector='Pilatus100k'):
+    """An independent-Euler goniometer record: rot2 follows the first position, rot1 the last."""
+    names = ['dist', 'poni1', 'poni2', 'rot1_offset', 'rot1_scale', 'rot2_offset', 'rot2_scale']
+    rot1 = f'rot1_scale * {positions[-1]} + rot1_offset' if len(positions) > 1 else 'rot1_offset'
+    return {'content': 'Goniometer calibration v2', 'detector': detector, 'detector_config': {'orientation': 3},
+            'wavelength': 1e-10, 'param': [.2, .01677, .04188, 0., math.pi / 180, 0., math.pi / 180],
+            'param_names': names, 'pos_names': list(positions),
+            'trans_function': {'content': 'GeometryTransformation', 'param_names': names,
+                               'pos_names': list(positions), 'dist_expr': 'dist', 'poni1_expr': 'poni1',
+                               'poni2_expr': 'poni2', 'rot1_expr': rot1,
+                               'rot2_expr': f'rot2_scale * {positions[0]} + rot2_offset', 'rot3_expr': '0.0',
+                               'constants': {'pi': math.pi}}}
 
-    def rows(bound, columns):
-        values = [(label, tuple((name, 0, value) for name, value in zip(columns, frame)))
-                  for label, frame in enumerate(((10., -3.), (20., -3.), (30., 4.)))]
+
+def test_screening_rows_follow_the_calibrations_circles_not_its_position_names(tmp_path):
+    from types import SimpleNamespace
+    from xrd_tools.analysis.stitch_operation import (
+        StitchGeometryInput, StitchGeometryKind, _frame_screen_rows, capture_stitch_geometry,
+    )
+    frames = ((10., -3.), (20., -3.), (30., 4.))
+
+    def rows(record_or_poni, bindings, columns, references=()):
+        if isinstance(record_or_poni, dict):
+            path = tmp_path / f'{len(list(tmp_path.iterdir()))}.json'
+            path.write_text(json.dumps(record_or_poni))
+            kind = StitchGeometryKind.PYFAI_GONIOMETER_JSON
+        else:
+            path, kind = record_or_poni, StitchGeometryKind.PONI
+        receipt = capture_stitch_geometry(StitchGeometryInput(path, kind, source_motors=bindings,
+                                                              reference_motor_positions=references))
         request = SimpleNamespace(
-            plan=SimpleNamespace(geometry=SimpleNamespace(request=SimpleNamespace(source_motors=bound))),
-            manifest=SimpleNamespace(contributions=[SimpleNamespace(label=label, values=frame)
-                                                    for label, frame in values]),
+            plan=SimpleNamespace(geometry=receipt),
+            manifest=SimpleNamespace(contributions=[
+                SimpleNamespace(label=label, values=tuple((name, 0, value) for name, value in zip(columns, frame)))
+                for label, frame in enumerate(frames)]),
             module=SimpleNamespace(source=SimpleNamespace(selected_labels=(0, 1, 2))))
         return [row for _member, row in _frame_screen_rows(request)]
-    assert rows((('del_angle', 'del'), ('nu_angle', 'nu')), ('del', 'nu')) == [-3., -3., 4.]
-    assert rows((('nu_angle', 'tth'),), ('tth', 'th')) == [0., 0., 0.]  # not a row per frame
-    assert rows((('del_angle', 'tth'),), ('tth', 'th')) == [0., 0., 0.]
-    assert rows((('del', 'del'), ('nu', 'nu')), ('del', 'nu')) == [-3., -3., 4.]  # PONI + offsets
-    assert rows((('nu', 'tth'),), ('tth', 'th')) == [0., 0., 0.]
-    frames = [(index, {'tth': 5. + index}, None) for index in range(20)]
-    chosen, coverage = stratified_frame_indices(frames, 5, 'tth', None)
+    by_nu, one = [-3., -3., 4.], [0., 0., 0.]
+    psic = _arm('nu').to_pyfai_goniometer(_calibration())
+    assert rows(psic, (('del_angle', 'del'), ('nu_angle', 'tth')), ('del', 'tth')) == by_nu
+    # Codex round 13 F1: a two-circle file whose positions are named otherwise is still rows by nu
+    for positions in (('del_angle', 'nu_angle'), ('dval', 'nu_angle'), ('dval', 'nval')):
+        assert rows(_affine(positions), tuple(zip(positions, ('del', 'nu'))), ('del', 'nu')) == by_nu
+    assert rows(_affine(('pos',)), (('pos', 'del'),), ('del', 'nu')) == one  # rot2 alone
+    # a single arm is one row, whichever circle moves (the 2θ column here is tth)
+    assert rows(_arm().to_pyfai_goniometer(_calibration()), (('del_angle', 'tth'),), ('tth', 'th')) == one
+    horizontal = StackedDetectorArm(nu_motor='tth', del_motor=None).to_pyfai_goniometer(_calibration())
+    assert rows(horizontal, (('nu_angle', 'tth'),), ('tth', 'th')) == one
+    poni = tmp_path / 'frame.poni'
+    poni.write_text('poni_version: 2.1\nDetector: Pilatus300kw\nDetector_config: {"orientation": 3}\n'
+                    'Distance: 0.39\nPoni1: 0.033\nPoni2: 0.052\nRot1: 0\nRot2: 0\nRot3: 0\nWavelength: 7.75e-11\n')
+    assert rows(poni, (('del', 'del'), ('nu', 'nu')), ('del', 'nu'), (('del', 0.), ('nu', 0.))) == by_nu
+    assert rows(poni, (('nu', 'tth'),), ('tth', 'th'), (('nu', 0.),)) == one
+    frames_rows = [(index, {'tth': 5. + index}, None) for index in range(20)]
+    from xrd_tools.integrate.stitch_autocalibration import stratified_frame_indices
+    chosen, coverage = stratified_frame_indices(frames_rows, 5, 'tth', None)
     assert coverage == {'nu_rows_available': 1, 'nu_rows_selected': 1}
     assert len(chosen) == 5 and chosen[0] < 4 and chosen[-1] > 15  # spread over the moving nu
+
+
+def test_renaming_a_calibration_position_changes_no_screening_or_intensity(tmp_path):
+    """Codex round 13 F1, through the operation: frames at nu -5, 0, 5 with counts 10000, 1,
+    10000 are three screening rows whatever the del position is called, so none is dropped."""
+    import tifffile
+    from xrd_tools.analysis.module_transaction import (
+        MetadataColumnSelector, ModuleDisposition, ModuleKind, ModuleOutputRequest, ModuleSourceReceipt,
+    )
+    from xrd_tools.analysis.scan_operations import MetadataTablePlan, run_metadata_table
+    from xrd_tools.analysis.stitch_operation import (
+        StitchGeometryInput, StitchGeometryKind, StitchOperationPlan, capture_stitch_geometry,
+        prepare_stitch_operation, run_stitch_operation,
+    )
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
+    from xrd_tools.sources.selection import image_series_spec
+    images = tmp_path / 'images'
+    images.mkdir()
+    for index, (nu, count) in enumerate(((-5, 10000), (0, 1), (5, 10000)), 1):
+        image = images / f'scan_{index:04d}.tif'
+        tifffile.imwrite(image, np.full((195, 487), count, dtype=np.uint16))
+        image.with_suffix('.txt').write_text(f'# Counters\nI0 = 1\n# Motors\ndel = {index * 5}, nu = {nu}\n'
+                                             'User: stitch, time: Mon Jan 15 10:30:00 2024  # Temp\n')
+    table = run_metadata_table(MetadataTablePlan(image_series_spec(images / 'scan_0001.tif', metadata_format='txt')))
+    source = ModuleSourceReceipt.from_metadata_table(table, kind=ModuleKind.STITCH, selected_labels=(1, 2, 3),
+        resolved_selectors=(MetadataColumnSelector('del'), MetadataColumnSelector('nu')))
+    curves, screens = [], []
+    for delta in ('del_angle', 'dval'):
+        path = tmp_path / f'{delta}.json'
+        path.write_text(json.dumps(_affine((delta, 'nu_angle'))))
+        geometry = capture_stitch_geometry(StitchGeometryInput(path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
+                                                               source_motors=((delta, 'del'), ('nu_angle', 'nu'))))
+        output = ModuleOutputRequest(tmp_path / f'{delta}.nexus', AnalysisArtifactKind.STITCH_1D)
+        request = prepare_stitch_operation(source, output, StitchOperationPlan(geometry, npt_1d=96,
+                                                                               radial_range=(.1, 6.)),
+                                           project_root=tmp_path)
+        result = run_stitch_operation(request)
+        assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+        screens.append(result.frame_screen['excluded'])
+        curves.append(read_analysis_artifact(output.target).intensity)
+    assert screens == [[], []]
+    np.testing.assert_array_equal(curves[0], curves[1])
 
 
 def test_a_session_records_its_arm(tmp_path):

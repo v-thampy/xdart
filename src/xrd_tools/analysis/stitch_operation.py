@@ -2460,18 +2460,27 @@ class StitchOperationResult:
             raise TypeError("stitch operation result is invalid")
 
 
+def _screen_row_motor(plan) -> str:
+    """The scan motor whose value is a frame's screening row: psic's outer circle (nu), when
+    the calibration moves both detector circles — read from its geometry as bound to the
+    scan, never from how its positions are spelled. A single arm is one row ('')."""
+    if type(plan) is XuStitchOperationPlan:  # the asset's keys are del and nu themselves
+        motors = plan.calibration.projection.value["acquisition"]["source_motors"]
+        return str(motors.get("nu") or "") if motors.get("del") else ""
+    diffractometer, _orientation = _runtime_geometry(plan.geometry, plan.geometry.content)
+    arm = diffractometer.stacked_arm
+    if arm is not None:
+        return arm.nu_motor if arm.nu_motor and arm.del_motor else ""
+    # independent mappings (a goniometer JSON, or PONI + offsets), as psic's: rot1 follows
+    # nu, rot2 follows del
+    rot1, rot2 = diffractometer.rot1, diffractometer.rot2
+    return rot1.source_motor if rot1.is_active and rot2.is_active else ""
+
+
 def _frame_screen_rows(request: StitchOperationRequest) -> tuple[float, ...]:
     """Each selected frame's outer-circle (nu) value: its dropped-frame screening row. A
     single arm (one circle held at zero) is one row, whichever circle moves."""
-    plan = request.plan
-    if type(plan) is XuStitchOperationPlan:
-        motors = plan.calibration.projection.value["acquisition"]["source_motors"]
-        name = str(motors.get("nu") or "") if motors.get("del") else ""
-    else:
-        # A goniometer JSON names the positions del_angle/nu_angle; a PONI geometry del/nu.
-        motors = dict(plan.geometry.request.source_motors)
-        both = (motors.get("del_angle") or motors.get("del")) and (motors.get("nu_angle") or motors.get("nu"))
-        name = (motors.get("nu_angle") or motors.get("nu", "")) if both else ""
+    name = _screen_row_motor(request.plan)
     manifest = request.manifest
     values = {item.label: {(n, o): v for n, o, v in item.values}
               for item in manifest.contributions}
