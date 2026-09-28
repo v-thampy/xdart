@@ -55,11 +55,15 @@ def _seed_record(seed, cancelled):
 
 
 def _prediction_after(seed, adopted, cancelled):
-    """The arm fitted to the calibrated frames with this one: it predicts the rest (or None)."""
+    """The arm fitted to the calibrated frames with this one: it predicts the rest (or None).
+    A cancel while it is fitted drops only the prediction: the frame pyFAI saved is kept."""
     from xrd_tools.integrate.calibration_seed import session_prediction
     frames = tuple(frame for frame in seed.get('frames', ()) if frame.identity != adopted.identity)
-    return session_prediction((*frames, adopted), del_motor=seed['del_motor'], nu_motor=seed['nu_motor'],
-                              cancelled=cancelled)
+    try:
+        return session_prediction((*frames, adopted), del_motor=seed['del_motor'], nu_motor=seed['nu_motor'],
+                                  cancelled=cancelled)
+    except InterruptedError:
+        return None
 
 
 def _pyfai_arguments(frame, seed, cancelled=None):

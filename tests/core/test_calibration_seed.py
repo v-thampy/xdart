@@ -99,21 +99,28 @@ def test_detector_choices_list_the_common_detectors_first_and_every_one_builds()
     assert detector_shape('Pilatus100k') == (195, 487) and detector_shape('no such detector') is None
 
 
-@pytest.mark.parametrize('orientation', [3, 2])
+@pytest.mark.parametrize('orientation', [3, 1, 2, 4])
 def test_the_detector_orientation_reaches_the_seed_pyfai_opens(tmp_path, orientation):
+    import pyFAI
     from pyFAI.io.ponifile import PoniFile
     from xrd_tools.integrate.calibration_seed import write_seed_poni
-    record = rough_arm_record(distance_m=.4, detector='Pilatus300kw', beam_px=(737, 97),
+    # off-centre: a reflection moves this pixel (the detector's centre, 737, 97, hid it; Codex R16-F1)
+    x, y = 100, 40
+    record = rough_arm_record(distance_m=.4, detector='Pilatus300kw', beam_px=(x, y),
                               orientation=orientation)
     # the default leaves the record as it was; another orientation travels in the detector config
     assert record['detector_config'] == ({} if orientation == 3 else {'orientation': orientation})
     seed = predict_frame_seed(record, _frame({'del': 0., 'nu': 0.}))
     assert int(seed.integrator.detector.orientation) == orientation
-    poni = PoniFile(str(write_seed_poni(seed, tmp_path / 'seed.poni')))
-    assert int(poni.detector.orientation) == orientation
-    # the beam pixel is where the direct beam hits at normal incidence, in every orientation
-    beam = seed.integrator.tth(np.array([97]), np.array([737]))
-    assert float(beam[0]) == pytest.approx(0, abs=1e-12)
+    path = write_seed_poni(seed, tmp_path / 'seed.poni')
+    assert int(PoniFile(str(path)).detector.orientation) == orientation
+    # the beam pixel is where the direct beam hits at normal incidence, in every orientation,
+    # in the seed as pyFAI reloads it
+    for geometry in (seed.integrator, pyFAI.load(str(path))):
+        assert float(geometry.tth(np.array([y]), np.array([x]))[0]) == pytest.approx(0, abs=1e-12)
+    if orientation == 3:  # the default record is the pitch formula it always was, to the bit
+        params = dict(zip(record['param_names'], record['param']))
+        assert (params['poni1'], params['poni2']) == ((y + .5) * 172e-6, (x + .5) * 172e-6)
 
 
 def test_one_calibrated_frame_predicts_the_other_frames_rings(tmp_path):

@@ -160,8 +160,9 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
     from the sample; the angles move the detector as a del-on-nu arm, one degree per
     degree. Good enough to predict which rings a frame shows; the fit refines it.
     ``nu_motor=None`` or ``del_motor=None`` is a single arm (a fourc/twoc 2θ): that
-    circle is held at zero. ``orientation`` is pyFAI's detector orientation; the PONI is
-    the pixel's centre for each of them, and a non-default one travels in the detector
+    circle is held at zero. ``orientation`` is pyFAI's detector orientation: the PONI is
+    the beam pixel's centre as that oriented detector places it (1, 2 and 4 reflect the
+    row, the column or both), and a non-default one travels in the detector
     config (the seed PONI pyFAI opens with, and so its saved PONIs).
     """
     from pyFAI.detectors import detector_factory
@@ -178,7 +179,9 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
         raise ValueError(f'the normal-incidence zero names {zero_motor!r}, '
                          + (f'not {present[0]!r}' if len(present) == 1 else f'neither {del_motor!r} nor {nu_motor!r}'))
     offset = {('del_offset' if zero_motor == del_motor else 'nu_offset'): -math.radians(float(zero_deg))}
-    poni = PONI(dist=float(distance_m), poni1=(y + .5) * pixels.pixel1, poni2=(x + .5) * pixels.pixel2,
+    # the configured detector's own conversion; for orientation 3 it is (y + .5, x + .5) pitches exactly
+    poni1, poni2, _ = pixels.calc_cartesian_positions(d1=np.array([y]), d2=np.array([x]))
+    poni = PONI(dist=float(distance_m), poni1=float(poni1[0]), poni2=float(poni2[0]),
                 wavelength=float(wavelength_m), detector=str(detector))
     arm = StackedDetectorArm(nu_motor=nu_motor, del_motor=del_motor, **offset)
     return arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))

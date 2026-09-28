@@ -596,3 +596,25 @@ def test_after_one_calibrated_frame_the_others_are_predicted_from_it(tmp_path):
         assert dialog._seed_options()['prediction'] is None
     finally:
         dialog.close()
+
+
+def test_a_cancel_during_the_prediction_keeps_the_frame_pyfai_saved(tmp_path):
+    """The prediction runs after the frame's PONI and points are adopted: a cancel there drops
+    only the prediction, never the calibrated frame (Codex round 16)."""
+    from xdart.gui.tabs.stitch.calibration import _run_job
+    from tests.core.test_stacked_arm_extension import _calibration, _ring_controls
+    from tests.core.test_stitch_guided_calibration import _frames
+    (tmp_path / 'frames').mkdir()
+    controls, _calibrant = _ring_controls({'nu_offset': .02, 'del_offset': -.05}, _calibration(),
+                                          [(5., -10.), (45., -10.)])
+    calibrated = _frames(tmp_path / 'frames', controls, _calibration().poni)
+    waiting = replace(calibrated[0], poni_path='', poni_sha256='', npt_path='', npt_sha256='', pairing_policy='',
+                      control_image_sha256='')
+    seed = {'frames': (), 'del_motor': 'del', 'nu_motor': 'nu'}
+    request = ('import', (waiting, calibrated[0].poni_path, calibrated[0].npt_path, seed))
+    cancelled = Event()
+    cancelled.set()
+    adopted, prediction = _run_job(request, cancelled, lambda *_: True)
+    assert adopted.complete and prediction is None
+    adopted, prediction = _run_job(request, Event(), lambda *_: True)
+    assert adopted.complete and prediction is not None
