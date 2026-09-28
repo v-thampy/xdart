@@ -536,8 +536,15 @@ def test_the_detector_and_its_orientation_are_choices_saved_with_the_settings(tm
         assert isinstance(detector, QtWidgets.QComboBox) and isinstance(orientation, QtWidgets.QComboBox)
         assert [detector.itemData(row) for row in range(3)] == ['Pilatus100k', 'Pilatus300kw', 'Eiger1M']
         assert dialog._text('beam_detector') == 'Pilatus300kw' and dialog._text('beam_orientation') == '3'
+        # the image the beam pixel is read in: width (x, columns) × height (y, rows)
+        assert dialog._image_size.text().startswith('1475 × 195 px (x × y): x 0–1474, y 0–194')
+        assert dialog._row_visible('beam_size') and '737, 97' in dialog._fields['beam_pixel'].placeholderText()
         dialog._set_field_text('beam_detector', 'Pilatus100k')
         assert dialog._text('shape') == '195, 487'  # the RAW reader follows the detector
+        assert dialog._image_size.text().startswith('487 × 195 px')
+        dialog.rotation.setCurrentIndex(dialog.rotation.findData(90))  # a turned image swaps x and y
+        assert dialog._image_size.text().startswith('195 × 487 px') and 'turned' in dialog._image_size.text()
+        dialog.rotation.setCurrentIndex(dialog.rotation.findData(0))
         dialog._set_field_text('beam_orientation', '2')
         for key, value in (('rough_distance', '400'), ('beam_pixel', '240, 97')):
             dialog._set_field_text(key, value)
