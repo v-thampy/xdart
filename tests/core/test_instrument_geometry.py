@@ -127,3 +127,18 @@ def test_a_calibration_must_drive_the_geometrys_arm():
     # a legacy one-position file moves del and holds nothing: psic keeps admitting it
     assert psic.arm_mismatch({'del'}) is None and fourc.arm_mismatch({'del'}) is None
     assert 'vertical' in twoc_h.arm_mismatch({'del'})
+
+
+def test_each_circle_turns_about_psics_axis_for_the_circle_it_plays():
+    from xrd_tools.core.geometry import Diffractometer
+    from xrd_tools.session.instrument import LAB_FRAME, PSIC_AXES
+    psic = Diffractometer.psic()  # the same lists as the RSM notebooks, in one lab frame
+    assert tuple(PSIC_AXES[c] for c in ('mu', 'eta', 'chi', 'phi')) == tuple(psic.sample_circles)
+    assert tuple(PSIC_AXES[c] for c in ('nu', 'del')) == tuple(psic.detector_circles)
+    assert tuple(psic.r_i) == (0., 1., 0.) and LAB_FRAME.startswith('x up, y along the beam')
+    assert InstrumentGeometry().circle_axes() == (('mu', 'x+'), ('eta', 'z-'), ('chi', 'y+'), ('phi', 'z-'),
+                                                  ('nu', 'x+'), ('del', 'z-'))
+    assert InstrumentGeometry('fourc').circle_axes() == (('th', 'z-'), ('chi', 'y+'), ('phi', 'z-'), ('tth', 'z-'))
+    assert InstrumentGeometry('fourc', plane='horizontal').circle_axes() == (
+        ('th', 'x+'), ('chi', 'y+'), ('phi', 'z-'), ('tth', 'x+'))
+    assert InstrumentGeometry('twoc', plane='horizontal').circle_axes() == (('th', 'x+'), ('tth', 'x+'))

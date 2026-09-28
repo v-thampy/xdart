@@ -48,3 +48,14 @@ def test_fourc_and_twoc_take_a_scattering_plane(qapp):
     editor.set_value(InstrumentGeometry())
     assert not editor._form.isRowVisible(editor.plane) and editor.value().plane == 'vertical'
     editor.deleteLater()
+
+
+def test_the_editor_states_the_lab_frame_and_each_circles_axis(qapp):
+    editor = GeometryEditor()
+    label = lambda circle: editor._form.labelForField(editor._motors[circle]).text()  # noqa: E731
+    assert 'x up, y along the beam' in editor.frame_note.text()
+    assert label('mu').startswith('mu (sample) · x+') and label('del').startswith('del (detector) · z-')
+    editor.set_value(InstrumentGeometry('twoc', plane='horizontal'))
+    assert label('th').startswith('th (sample) · x+') and label('tth').startswith('tth (detector) · x+')
+    editor.set_value(InstrumentGeometry('twoc'))
+    assert label('tth').startswith('tth (detector) · z-')

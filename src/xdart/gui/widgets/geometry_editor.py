@@ -10,7 +10,9 @@ from __future__ import annotations
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.widgets.controls_panel import ControlsComboBox
-from xrd_tools.session.instrument import GEOMETRIES, GEOMETRY_LABELS, PLANE_LABELS, InstrumentGeometry
+from xrd_tools.session.instrument import (
+    GEOMETRIES, GEOMETRY_LABELS, LAB_FRAME, PLANE_LABELS, InstrumentGeometry,
+)
 
 #: Every circle any geometry has, in display order (a row each; a geometry shows its own).
 _ALL_CIRCLES = ('mu', 'eta', 'th', 'chi', 'phi', 'nu', 'del', 'tth')
@@ -47,6 +49,12 @@ class GeometryEditor(QtWidgets.QWidget):
             combo.editTextChanged.connect(self._edited)
             self._motors[circle] = combo
             self._form.addRow(QtWidgets.QLabel(), combo)
+        # the frame the axes below are given in (a small schematic can replace this line later)
+        self.frame_note = QtWidgets.QLabel(f'Lab frame: {LAB_FRAME}. Each circle turns right-handed about '
+                                           'the axis beside it for a positive angle.')
+        self.frame_note.setObjectName('geometryFrameNote')
+        self.frame_note.setWordWrap(True)
+        self._form.addRow(self.frame_note)
         self.geometry.currentIndexChanged.connect(self._geometry_changed)
         self.plane.currentIndexChanged.connect(self._geometry_changed)
         self._geometry_changed()
@@ -96,14 +104,14 @@ class GeometryEditor(QtWidgets.QWidget):
         geometry = self.geometry.currentData()
         circles = dict(GEOMETRIES[geometry])
         self._form.setRowVisible(self.plane, geometry != 'psic')
-        plays = ({} if geometry == 'psic'
-                 else InstrumentGeometry(geometry, plane=self.plane.currentData()).as_psic())
+        shown = InstrumentGeometry(geometry, plane='vertical' if geometry == 'psic' else self.plane.currentData())
+        plays, axes = shown.as_psic(), dict(shown.circle_axes())
         for circle, combo in self._motors.items():
             self._form.setRowVisible(combo, circle in circles)
             label = self._form.labelForField(combo)
             if circle in circles:
                 used = f'  ·  used by {self._used_by}' if circle in self._used and self._used_by else ''
-                label.setText(f'{circle} ({circles[circle]}){used}')
+                label.setText(f'{circle} ({circles[circle]}) · {axes[circle]}{used}')
                 combo.setToolTip(f'The scan motor that drives the {circle} circle'
                                  + (f" (it plays psic's {plays[circle]})" if circle in plays else ''))
 

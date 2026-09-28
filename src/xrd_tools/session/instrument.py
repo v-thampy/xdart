@@ -40,6 +40,11 @@ PLANE_LABELS = {'vertical': 'Vertical (2θ plays del)', 'horizontal': 'Horizonta
 _AS_PSIC = {'vertical': {'th': 'eta', 'tth': 'del'}, 'horizontal': {'th': 'mu', 'tth': 'nu'}}
 #: The scattering plane a 2θ arm moving one psic circle lies in.
 _PLANE_OF = {'del': 'vertical', 'nu': 'horizontal'}
+#: The lab frame every geometry is described in (psic's, You 1999).
+LAB_FRAME = 'x up, y along the beam, z = x × y (left, looking downstream)'
+#: psic's rotation axes (a positive angle turns right-handed about it); the same lists as
+#: ``Diffractometer.psic`` and the RSM notebooks: sample (mu, eta, chi, phi), detector (nu, del).
+PSIC_AXES = {'mu': 'x+', 'eta': 'z-', 'chi': 'y+', 'phi': 'z-', 'nu': 'x+', 'del': 'z-'}
 #: Other names beamlines give a circle's motor (matched whole, ignoring case).
 _ALIASES = {'del': ('delta',), 'tth': ('2theta', 'twotheta', 'two_theta', 'tt'),
             'th': ('theta', 'om', 'omega')}
@@ -101,6 +106,12 @@ class InstrumentGeometry:
     def as_psic(self) -> dict[str, str]:
         """The psic circle each renamed circle of this geometry plays (none for psic)."""
         return {} if self.geometry == 'psic' else dict(_AS_PSIC[self.plane])
+
+    def circle_axes(self) -> tuple[tuple[str, str], ...]:
+        """Each circle's rotation axis in the lab frame (``LAB_FRAME``): the axis of the psic
+        circle it plays, as xrayutilities writes it."""
+        played = self.as_psic()
+        return tuple((circle, PSIC_AXES[played.get(circle, circle)]) for circle in self.circles)
 
     def stitch_arm(self) -> tuple[str | None, str | None]:
         """The (del, nu) motors of Stitch's del-on-nu detector arm. fourc and twoc have one
