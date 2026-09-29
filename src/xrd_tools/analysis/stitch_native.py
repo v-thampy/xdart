@@ -316,6 +316,8 @@ def native_provenance(value, source, output, plan, manifest):
             "sha256": receipt.sha256, "revision": list(receipt.revision),
             "shape": list(receipt.shape), "receipt_fingerprint": receipt.fingerprint,
         })
+    if plan.gi is not None:  # how the GI cuts were made, as the record's reader sees it
+        value["plan"]["gi"] = plan.gi.to_provenance()
     value["wavelength_A"] = wavelength
     value["source_energy_checks"] = source_energy_checks(source, wavelength)
     value["frame_members"] = analysis_contributing_frame_binding(analysis_contributing_frame_members(

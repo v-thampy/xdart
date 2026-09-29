@@ -2017,7 +2017,6 @@ def _xu_provenance(
         },
         "holds": [
             "xu-2d-and-chi",
-            "gi-stitch-on-xu",
             "explicit-ub-and-sample-placement",
             "operator-configured-sample-circles",
             "generic-xu-diffractometers-and-detectors",

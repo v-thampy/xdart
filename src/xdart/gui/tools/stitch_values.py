@@ -1062,7 +1062,6 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
             if form.backend == "multigeometry"
             else (
                 "xu-2d-and-chi",
-                "gi-stitch-on-xu",
                 "sensor-parallax-xu-geometry",
                 "xu-sigma-and-variance",
                 "mixed-energy-grouped-xu-stitch",

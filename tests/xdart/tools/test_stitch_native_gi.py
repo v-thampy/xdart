@@ -57,8 +57,12 @@ def test_a_gi_stitch_binds_every_frames_incidence_and_changes_the_plan(tmp_path,
     bound = {name: value for item in request.manifest.contributions for name, _occurrence, value in item.values}
     expected = {"eta": .3} if backend == "multigeometry" else {"eta": .3, "mu": 0., "chi": 90., "phi": -1.7}
     assert {name: bound[name] for name in expected} == expected
-    plain = prepare_stitch_tool(replace(form, gi=None)).request.plan
+    plain_request = prepare_stitch_tool(replace(form, gi=None)).request
+    plain = plain_request.plan
     assert plain.fingerprint != request.plan.fingerprint and replace(form, gi=None).fingerprint != form.fingerprint
+    # the provenance says how the cuts are made; a plain Stitch's has no GI
+    assert request.provenance["plan"]["gi"] == gi.to_provenance() and "gi" not in plain_request.provenance["plan"]
+    assert "gi-stitch-on-xu" not in request.provenance.get("holds", ())
     both = prepare_stitch_tool(replace(form, gi=replace(gi, cuts=("q_ip", "q_oop")))).request.plan
     assert both.fingerprint not in {plain.fingerprint, request.plan.fingerprint}
     # a motor the scan does not record is refused by name, as an arm motor is
@@ -130,6 +134,10 @@ def test_a_gi_stitch_publishes_i_of_q_and_its_cuts_as_one_int_record(tmp_path, b
         np.testing.assert_array_equal(value.coverage, cast(diagnostics.coverage))
         np.testing.assert_array_equal(value.normalization, cast(diagnostics.normalization))
     assert len(json.loads(stored.frames_json)["records"]) == len(request.module.source.selected_labels)
+    import h5py
+    with h5py.File(target, "r") as handle:  # the record's own provenance names the cuts
+        recorded = json.loads(handle["entry/stitch/provenance_json"][()])
+    assert recorded["plan"]["gi"]["cuts"] == list(cuts)
     assert result.payload.inspection.result_fingerprint == result.terminal.commit.result_fingerprint
 
 
