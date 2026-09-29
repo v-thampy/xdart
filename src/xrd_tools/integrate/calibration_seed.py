@@ -169,7 +169,9 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
     config (the seed PONI pyFAI opens with, and so its saved PONIs). The motor scales
     take its signs (``orientation_signs``), so every orientation predicts the same rings.
     ``mount_deg`` holds the detector mount's tilt and roll fixed (the arm's extension; a single
-    arm has none), zero for a detector facing the beam squarely at every angle.
+    arm has none), zero for a detector facing the beam squarely at every angle. With a tilted
+    mount the beam still hits ``beam_px`` at the zero pose, and ``distance_m`` is the distance
+    along the direct beam there (pyFAI's direct distance), not the PONI's.
     """
     from pyFAI.detectors import detector_factory
     from xrd_tools.core.containers import PONI
@@ -195,7 +197,35 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
     tilt, roll = (math.radians(float(value)) for value in mount_deg)
     arm = StackedDetectorArm(nu_motor=nu_motor, del_motor=del_motor, **scales, **offset,
                              mount_tilt=tilt, mount_roll=roll)
-    return arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
+    record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
+    if tilt or roll:  # the tilted plane moves the beam off its pixel (Codex review F2): put it back
+        pose = dict(del_motor=del_motor, nu_motor=nu_motor, zero_motor=zero_motor, zero_deg=zero_deg)
+        along = _direct_beam_hit(record, **pose)[1]
+        poni.dist *= float(distance_m) / along  # the plane's distance scales the one along the beam
+        record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
+        (hit1, hit2), _ = _direct_beam_hit(record, **pose)
+        at1, at2, _ = pixels.calc_cartesian_positions(d1=np.array([hit1]), d2=np.array([hit2]))
+        poni.poni1 += float(poni1[0] - at1[0])  # moving the PONI translates the pattern in the plane
+        poni.poni2 += float(poni2[0] - at2[0])
+        record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
+    return record
+
+
+def _direct_beam_hit(record, *, del_motor, nu_motor, zero_motor, zero_deg):
+    """Where the direct beam meets the detector at the zero pose: its (row, column) pixel
+    coordinate, and its distance from the sample along the beam (m)."""
+    from xrd_tools.core.geometry import Diffractometer
+    from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
+    bound = _source_motors(record, del_motor, nu_motor)
+    motors = {motor: np.array([float(zero_deg) if motor == zero_motor else 0.]) for motor in bound.values()}
+    integrator = next(iter(create_multigeometry_integrator_series_from_geometry(
+        Diffractometer.from_pyfai_goniometer(record, source_motors=bound), motors)))
+    # lab positions are affine in the pixel coordinates (a flat detector): solve for x = y = 0
+    z, y, x = integrator.calc_pos_zyx(d1=np.array([0., 1., 0.]), d2=np.array([0., 0., 1.]))
+    z, y, x = (np.ravel(v) for v in (z, y, x))
+    step = np.array([[y[1] - y[0], y[2] - y[0]], [x[1] - x[0], x[2] - x[0]]])
+    rows, columns = np.linalg.solve(step, -np.array([y[0], x[0]]))
+    return (float(rows), float(columns)), float(z[0] + (z[1] - z[0]) * rows + (z[2] - z[0]) * columns)
 
 
 def write_seed_poni(seed: FrameSeed, path, *, calibrant='LaB6') -> Path:

@@ -216,3 +216,22 @@ def test_a_circle_with_no_frames_and_no_range_is_checked_at_zero():
     angles = pair_validation_angles(fit, domain={'del': [0., 30.]}, grid=4)
     assert angles == [(0., 0.), (10., 0.), (20., 0.), (30., 0.)]
     assert pair_validation_angles(fit) == []
+
+
+@pytest.mark.parametrize('orientation', [3, 1, 2, 4])
+@pytest.mark.parametrize('zero_motor,zero_deg', [('del', 0.), ('del', 4.), ('nu', -3.)])
+def test_a_tilted_mount_keeps_the_direct_beam_on_its_pixel_at_the_given_distance(orientation, zero_motor, zero_deg):
+    """Codex review F2: the rough arm promises the beam hits beam_px at the zero pose; with a tilted
+    mount the PONI moves to keep that, and the distance is the direct beam's (pyFAI's directDist)."""
+    x, y = 700, 95
+
+    def seed(**mount):
+        record = rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(x, y), orientation=orientation,
+                                  zero_deg=zero_deg, zero_motor=zero_motor, **mount)
+        motors = {'del': 0., 'nu': 0., zero_motor: zero_deg}
+        return predict_frame_seed(record, _frame(motors)).integrator
+
+    for mount in ((0., 0.), (.5, 0.), (.5, -.3), (-1.2, .8)):
+        integrator = seed(mount_deg=mount)
+        assert float(integrator.tth(np.array([y]), np.array([x]))[0]) == pytest.approx(0, abs=1e-9), mount
+        assert integrator.getFit2D()['directDist'] == pytest.approx(500., abs=1e-6), mount
