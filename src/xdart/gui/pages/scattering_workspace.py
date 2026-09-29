@@ -22,8 +22,10 @@ from typing import TYPE_CHECKING
 from .handle import AppMenuHosts, PageHandle
 from .services import HostServices
 from .values import (
+    MODE_REFUSED,
     ActionAccepted,
     ActionCompleted,
+    ActionRefused,
     CloseReceipt,
     PageCleanup,
     SCATTERING_PAGE_KEY,
@@ -187,6 +189,20 @@ class _WorkspaceSettings:
     def save(self):
         _dispatch(self.widget, "MENU", "Config:Save")
         return ActionCompleted("profile-save-requested")
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkspaceProcessingMode:
+    """Another page's request for a mode by name (Stitch's mode box, Codex audit G-F3), through the
+    page's own mode command; completed only when the page took it."""
+
+    widget: "ScatteringWorkspace"
+
+    def select(self, mode):
+        _dispatch(self.widget, "SET_PROCESSING_MODE", str(mode))
+        if self.widget._intents.snapshot().thaw().processing_mode == mode:
+            return ActionCompleted(f"processing-mode-{mode}")
+        return ActionRefused(MODE_REFUSED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -548,6 +564,7 @@ def build_scattering_workspace(
         run_control=_WorkspaceRunControl(widget),
         write_mode=_WorkspaceWriteMode(widget),
         slice_pin=_WorkspaceSlicePin(widget),
+        processing_mode=_WorkspaceProcessingMode(widget),
         activity=_WorkspaceActivity(
             lifecycle, widget._workspace_operations,
             widget._experiment_operation_busy,

@@ -257,6 +257,8 @@ class StitchPage(QtWidgets.QWidget):
     """One retained page; one worker owns preview, science and strict reopen."""
 
     toolRequested = QtCore.Signal(str)
+    #: (page key, processing mode): open that page in that mode (Codex audit G-F3)
+    modeRequested = QtCore.Signal(str, str)
 
     def __init__(self, services, parent=None):
         super().__init__(parent)
@@ -437,7 +439,10 @@ class StitchPage(QtWidgets.QWidget):
         blocker = QtCore.QSignalBlocker(self.run_bar.modeCombo)
         self.run_bar.modeCombo.setCurrentText("Stitch 1D")
         del blocker
-        self.toolRequested.emit(str(RSM_TOOL_KEY if mode == "RSM" else SCATTERING_PAGE_KEY))
+        if mode == "RSM":
+            self.toolRequested.emit(str(RSM_TOOL_KEY))
+        else:  # the integration page, in the mode chosen here
+            self.modeRequested.emit(str(SCATTERING_PAGE_KEY), str(mode))
 
     def _field(self, card, section, key, label, value="", *, choices=(), browse=False):
         kind = ControlFieldKind.COMBO if choices else ControlFieldKind.LINE
@@ -2262,7 +2267,8 @@ class StitchPage(QtWidgets.QWidget):
         return receipt
 
     def mount_points(self):
-        return AppMenuHosts(self.config_menu, self.help_menu, tool_requested=self.toolRequested)
+        return AppMenuHosts(self.config_menu, self.help_menu, tool_requested=self.toolRequested,
+                            mode_requested=self.modeRequested)
 
     def request(self):
         self.open_result()

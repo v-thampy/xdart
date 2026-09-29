@@ -433,17 +433,18 @@ def test_the_mode_box_lists_int_modes_and_leaves_for_them(qapp):
     from xdart.gui.tabs.scattering.run_mode_projection import RUN_MODE_CHOICES
 
     page = StitchPage(empty_host_services(_Status()))
-    requested = []
+    requested, modes = [], []
     page.toolRequested.connect(requested.append)
+    page.modeRequested.connect(lambda key, mode: modes.append((key, mode)))
     try:
         combo = page.run_bar.modeCombo
         assert tuple(combo.itemText(row) for row in range(combo.count())) == RUN_MODE_CHOICES
         assert combo.currentText() == "Stitch 1D"
         assert not combo.model().item(combo.findText("Stitch 2D")).isEnabled()  # as on Int
-        combo.setCurrentText("Int 2D")  # back to the integration workspace; the box stays
-        assert requested == [str(SCATTERING_PAGE_KEY)] and combo.currentText() == "Stitch 1D"
+        combo.setCurrentText("Int 2D")  # the integration workspace, in that mode; the box stays
+        assert modes == [(str(SCATTERING_PAGE_KEY), "Int 2D")] and combo.currentText() == "Stitch 1D"
         combo.setCurrentText("RSM")
-        assert requested[-1] == str(RSM_TOOL_KEY) and combo.currentText() == "Stitch 1D"
+        assert requested == [str(RSM_TOOL_KEY)] and combo.currentText() == "Stitch 1D"
     finally:
         _close(page, qapp)
 

@@ -47,6 +47,7 @@ SCATTERING_WORKSPACE_PAGE = PageDescriptor(
         PageCapability.SLICE_PIN,
         PageCapability.RUN_ACTIVITY,
         PageCapability.APP_MENU_HOSTS,
+        PageCapability.PROCESSING_MODE,
     }),
     build=_build_scattering_workspace,
 )

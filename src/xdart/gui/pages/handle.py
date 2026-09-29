@@ -44,6 +44,14 @@ class AppMenuHosts:
     help_menu: "QtWidgets.QMenu"
     analysis_menu: "QtWidgets.QMenu | None" = None
     tool_requested: object | None = None
+    #: a signal (page key, processing mode): open that page in that mode (Codex audit G-F3)
+    mode_requested: object | None = None
+
+
+class ProcessingModePort(Protocol):
+    """Select one of the page's processing modes (another page asked for it by name)."""
+
+    def select(self, mode: str) -> ActionOutcome: ...
 
 
 class AppMenusPort(Protocol):
@@ -67,6 +75,7 @@ class PageHandle:
     activity: RunActivityPort | None = None
     app_menus: AppMenusPort | None = None
     diagnostics: LayoutDiagnosticsPort | None = None
+    processing_mode: ProcessingModePort | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, str) or not self.key:
@@ -90,6 +99,7 @@ _PORTS = {
     PageCapability.RUN_ACTIVITY: "activity",
     PageCapability.APP_MENU_HOSTS: "app_menus",
     PageCapability.LAYOUT_DIAGNOSTICS: "diagnostics",
+    PageCapability.PROCESSING_MODE: "processing_mode",
 }
 
 

@@ -88,6 +88,7 @@ def test_scattering_descriptor_declares_the_frozen_adoption_ports():
         PageCapability.SLICE_PIN,
         PageCapability.RUN_ACTIVITY,
         PageCapability.APP_MENU_HOSTS,
+        PageCapability.PROCESSING_MODE,  # another page's mode box selects a mode here (Codex audit G-F3)
     })
 
 
@@ -178,6 +179,37 @@ def test_builtin_stitch_selection_retains_native_page_and_integration_workspace(
         assert handle.widget._value("scan") == "14"
         assert STITCH_TOOL_KEY not in window._tool_handles
         assert RSM_TOOL.key not in window._tool_handles
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+
+def test_a_mode_chosen_on_stitch_opens_the_integration_page_in_that_mode(qapp, isolated_settings):
+    """Codex audit G-F3: Int 1D/2D and the Viewers chosen on Stitch's mode box reach the integration
+    page as that mode (combo and intent), through its own mode command; the generic return keeps it."""
+    window = _mounted_host(None)
+    try:
+        page = window.page_handle.widget
+        combo = page._shell.run_controls.modeCombo
+        combo.setCurrentText("Stitch 1D")
+        qapp.processEvents()
+        stitch = window._page_handles[STITCH_PAGE.key].widget
+        for mode in ("1D Viewer", "2D Viewer", "Int 1D", "Int 2D"):
+            assert window.selected_page_key == STITCH_PAGE.key
+            stitch.run_bar.modeCombo.setCurrentText(mode)
+            qapp.processEvents()
+            assert window.selected_page_key == SCATTERING_WORKSPACE_PAGE.key, mode
+            assert combo.currentText() == mode
+            assert page._intents.snapshot().thaw().processing_mode == mode
+            assert stitch.run_bar.modeCombo.currentText() == "Stitch 1D"  # Stitch's own box is unchanged
+            combo.setCurrentText("Stitch 1D")
+            qapp.processEvents()
+        # the generic return (Stitch's menu entry) leaves the integration page's mode as it was
+        stitch.toolRequested.emit(str(SCATTERING_WORKSPACE_PAGE.key))
+        qapp.processEvents()
+        assert window.selected_page_key == SCATTERING_WORKSPACE_PAGE.key
+        assert page._intents.snapshot().thaw().processing_mode == "Int 2D"
     finally:
         window.close()
         window.deleteLater()
