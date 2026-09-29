@@ -111,8 +111,11 @@ class SpecSource(BaseFrameSource):
                     key: value for key, value in self._read_image_kwargs.items()
                     if key in {"detector_shape", "raw_dtype", "raw_header_skip"}
                 }) for path in files]
-                if sum(layout.frame_count for layout in layouts) != npts:
-                    raise ValueError(f"SPEC scan {self.scan_key}: image count does not match metadata points")
+                frames = sum(layout.frame_count for layout in layouts)
+                if frames != npts:  # name the numbers, the stem and the folder: a stale stem is the usual cause
+                    raise ValueError(
+                        f"SPEC scan {self.scan_key}: {npts} metadata points but {frames} image frames in "
+                        f"{len(files)} files matching *{stem}* in {self.image_dir}; check the image stem and folder")
                 if len(files) > 1 and all(layout.frame_count == 1 for layout in layouts):
                     import re
                     positions = [re.search(r"(\d+)(?:\.[^.]+)?$", path.name) for path in files]

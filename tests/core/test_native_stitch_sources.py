@@ -49,7 +49,9 @@ def test_strict_spec_refuses_partial_images_and_native_read_retains_saturation(t
         values.tofile(images / f"myscan_scan5_{index:04}.raw")
     options = dict(scan="5.1", image_dir=images, require_complete_images=True,
         read_image_kwargs={"detector_shape": (2, 2), "raw_dtype": "uint16", "threshold": 100})
-    with pytest.raises(ValueError, match="image count"):
+    # the refusal says what it counted, and where (a stale image stem was the live cause)
+    with pytest.raises(ValueError, match=r"scan 5\.1: 3 metadata points but 2 image frames in 2 files matching "
+                                         r"\*myscan_scan5_\* in .*images; check the image stem and folder"):
         SpecSource(spec, **options)
     values.tofile(images / "myscan_scan5_0001.raw")
     source = SpecSource(spec, **options)
