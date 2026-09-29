@@ -1093,12 +1093,22 @@ class StitchPage(QtWidgets.QWidget):
         self._sync_advanced()
         self._refresh_xu_geometry()
 
+    def _commit_typing(self):
+        """Commit a field still being typed in, before an action reads the inputs. A click on Run
+        leaves the focus in the field on macOS, and disabling the controls for the action then
+        committed it mid-check, which discarded the check as "Inputs changed" (live)."""
+        focused = QtWidgets.QApplication.focusWidget()
+        if isinstance(focused, QtWidgets.QLineEdit) and (self.isAncestorOf(focused)
+                                                         or self.advanced.isAncestorOf(focused)):
+            focused.clearFocus()  # the row commits on the focus-out, as Return or Tab would
+
     def _start(self, action, begin):
         if self._closing:
             return False
         if self._authoring_active():
             self._status("Finish the calibration or mask editor before starting another operation", ready=False)
             return False
+        self._commit_typing()
         try:
             identity = begin()
         except (TypeError, ValueError, OSError) as error:

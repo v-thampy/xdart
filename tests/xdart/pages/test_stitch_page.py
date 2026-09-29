@@ -278,6 +278,34 @@ def test_clearing_the_source_box_clears_the_selection_and_refuses_run(qapp, tmp_
         page.shutdown()
 
 
+def test_run_right_after_typing_in_a_field_checks_and_runs(qapp, tmp_path):
+    """Live: typing a scan into Selection and clicking Run (on macOS the click leaves the focus in
+    the field) came back "Inputs changed while checking · Run again": disabling the controls for
+    the check committed the typing mid-check. The typing now commits before the check starts."""
+    from PySide6.QtTest import QTest
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    page = StitchPage(empty_host_services(_Status()))
+    page.show()
+    try:
+        page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        page.activateWindow()
+        page.run_bar.startButton.click()
+        _wait(page, qapp)
+        assert page.run_bar.readinessLabel.full_text().startswith("Complete"), page.run_bar.readinessLabel.full_text()
+        editor = page._rows["scan"].editor
+        editor.setFocus()
+        qapp.processEvents()
+        editor.selectAll()
+        QTest.keyClicks(editor, "1")  # typed, not committed: no Return or Tab
+        assert editor.hasFocus()
+        page.run_bar.startButton.click()  # a click that leaves the focus in the field
+        _wait(page, qapp)
+        assert page.run_bar.readinessLabel.full_text().startswith("Complete"), page.run_bar.readinessLabel.full_text()
+        assert page.build_form().source_selection.scans == "1"
+    finally:
+        page.shutdown()
+
+
 @pytest.mark.parametrize("dtype", ("int32", "uint32"))
 def test_native_minimum_only_threshold_edit_excludes_native_ceiling(qapp, tmp_path, dtype):
     from tests.xdart.tools.test_stitch_native_values import _native_form
