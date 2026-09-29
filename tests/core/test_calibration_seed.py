@@ -123,6 +123,34 @@ def test_the_detector_orientation_reaches_the_seed_pyfai_opens(tmp_path, orienta
         assert (params['poni1'], params['poni2']) == ((y + .5) * 172e-6, (x + .5) * 172e-6)
 
 
+@pytest.mark.parametrize('orientation', [1, 2, 4])
+def test_every_orientation_predicts_orientation_3s_geometry_with_the_arm_tilted(orientation):
+    """pyFAI reflects before rotating and after (F·R·F, Codex R18-F1): with one-degree scales the
+    seed turned the detector the wrong way once the arm moved (24° off at nu 12°). The scales
+    carry the orientation's signs, so every orientation predicts orientation 3's geometry."""
+    shape, (x, y) = (195, 1475), (100, 40)
+
+    def seed(orientation, motors, **zero):
+        record = rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(x, y),
+                                  orientation=orientation, **zero)
+        return predict_frame_seed(record, _frame(motors))
+
+    away = np.ones(shape, bool)
+    away[y, x] = False  # χ is undefined at the beam
+    for pose in ((30., 0.), (0., 12.), (30., 12.), (-20., -7.)):
+        seeds = [seed(code, {'del': pose[0], 'nu': pose[1]}) for code in (3, orientation)]
+        (tth3, chi3), (tth, chi) = ([s.integrator.center_array(shape, unit=unit, scale=False)
+                                     for unit in ('2th_rad', 'chi_rad')] for s in seeds)
+        assert np.abs(tth - tth3)[away].max() < 1e-9
+        assert np.abs(np.angle(np.exp(1j * (chi - chi3))))[away].max() < 1e-9
+        assert seeds[0].rings == seeds[1].rings
+    # a known normal-incidence zero on a reversed circle still puts the beam on its pixel
+    for circle in ('del', 'nu'):
+        at_zero = seed(orientation, {'del': 4. if circle == 'del' else 0., 'nu': 4. if circle == 'nu' else 0.},
+                       zero_deg=4., zero_motor=circle)
+        assert float(at_zero.integrator.tth(np.array([y]), np.array([x]))[0]) == pytest.approx(0, abs=1e-12)
+
+
 def test_one_calibrated_frame_predicts_the_other_frames_rings(tmp_path):
     """A rough guess 200 px off misnumbers a far frame's rings; the arm fitted to the first
     calibrated frame places every frame's rings as the true arm does."""

@@ -190,6 +190,48 @@ def test_refine_stacked_arm_recovers_an_extended_truth():
     assert worst['five'] > 1e-3, worst
 
 
+@pytest.mark.parametrize('orientation', [1, 2, 4])
+def test_every_pyfai_orientation_fits_the_same_physical_arm(orientation):
+    """pyFAI reflects before rotating and after (F·R·F, Codex R18-F1), so one-degree scales in
+    orientation 1, 2 or 4 turned the detector the wrong way and no tilted frame could fit. The
+    scales carry the orientation's signs: every fit recovers what it does in orientation 3."""
+    from pyFAI.detectors import detector_factory
+    from xrd_tools.integrate.refine import refine_goniometer
+    truth = _calibration()
+    # the orientation-3 seed's normal-incidence pixel, as this orientation places it
+    rows, cols = np.array([.0353 / 172e-6 - .5]), np.array([.0447 / 172e-6 - .5])
+    poni1, poni2, _ = detector_factory('Pilatus300kw', config={'orientation': orientation}
+                                       ).calc_cartesian_positions(d1=rows, d2=cols)
+    seeds = {3: PONI(dist=.392, poni1=.0353, poni2=.0447, wavelength=WAVELENGTH, detector='Pilatus300kw'),
+             orientation: PONI(dist=.392, poni1=float(poni1[0]), poni2=float(poni2[0]),
+                               wavelength=WAVELENGTH, detector='Pilatus300kw')}
+    motors = {'del': np.array([a[0] for a in ANGLES]), 'nu': np.array([a[1] for a in ANGLES])}
+    pixels = np.indices((195, 1475), dtype=float)
+
+    def q_maps(fit):
+        return [ai.qFunction(*pixels) / 10
+                for ai in create_multigeometry_integrators_from_geometry(fit.diffractometer, motors)]
+
+    # the sub-pixel arm fit (automatic refinement) recovers the truth itself, with the extension too
+    for params, extended in ((dict(nu_offset=.02, del_offset=-.05), False), (TRUTH, True)):
+        controls, calibrant = _ring_controls(params, truth, ANGLES)
+        fit = refine_stacked_arm(seeds[orientation], controls, nu_motor='nu', del_motor='del',
+                                 calibrant=calibrant, detector_config={'orientation': orientation},
+                                 extended=extended)
+        assert fit.success and fit.rms_q < 1e-8, fit.message
+        assert max(float(np.abs(q - _ray(params, truth, d, n, *pixels)[0]).max())
+                   for (d, n), q in zip(ANGLES, q_maps(fit))) < 1e-7
+    # the MultiGeometry fit of completed frames (pixel-centre points) gives its orientation-3
+    # geometry, with the motor scales fixed or fitted
+    controls, calibrant = _ring_controls(dict(nu_offset=.02, del_offset=-.05), truth, ANGLES)
+    for fit_scales in (False, True):
+        fits = [refine_goniometer(seeds[code], controls, rot1_motor='nu', rot2_motor='del',
+                                  calibrant=calibrant, detector_config={'orientation': code},
+                                  fit_scales=fit_scales, model='stacked_del_on_nu') for code in (3, orientation)]
+        assert all(fit.success for fit in fits), [fit.message for fit in fits]
+        assert max(float(np.abs(a - b).max()) for a, b in zip(*map(q_maps, fits))) < 1e-6
+
+
 def test_outlier_rejection_keeps_near_perfect_points():
     truth = _calibration()
     controls, calibrant = _ring_controls(TRUTH, truth, ANGLES[::2])

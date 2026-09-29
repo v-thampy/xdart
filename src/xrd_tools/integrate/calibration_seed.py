@@ -163,12 +163,13 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
     circle is held at zero. ``orientation`` is pyFAI's detector orientation: the PONI is
     the beam pixel's centre as that oriented detector places it (1, 2 and 4 reflect the
     row, the column or both), and a non-default one travels in the detector
-    config (the seed PONI pyFAI opens with, and so its saved PONIs).
+    config (the seed PONI pyFAI opens with, and so its saved PONIs). The motor scales
+    take its signs (``orientation_signs``), so every orientation predicts the same rings.
     """
     from pyFAI.detectors import detector_factory
     from xrd_tools.core.containers import PONI
     from xrd_tools.core.geometry import DetectorCalibration
-    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
+    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm, orientation_signs
     if not math.isfinite(float(distance_m)) or float(distance_m) <= 0:
         raise ValueError('the rough distance must be a positive number')
     config = {} if int(orientation) == 3 else {'orientation': int(orientation)}
@@ -178,12 +179,15 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
     if zero_motor is None or zero_motor not in present:
         raise ValueError(f'the normal-incidence zero names {zero_motor!r}, '
                          + (f'not {present[0]!r}' if len(present) == 1 else f'neither {del_motor!r} nor {nu_motor!r}'))
-    offset = {('del_offset' if zero_motor == del_motor else 'nu_offset'): -math.radians(float(zero_deg))}
+    nu_sign, del_sign = orientation_signs(pixels.orientation)
+    scales = dict(nu_scale=nu_sign * math.pi / 180, del_scale=del_sign * math.pi / 180)
+    zero_circle = 'del' if zero_motor == del_motor else 'nu'
+    offset = {f'{zero_circle}_offset': -scales[f'{zero_circle}_scale'] * float(zero_deg)}
     # the configured detector's own conversion; for orientation 3 it is (y + .5, x + .5) pitches exactly
     poni1, poni2, _ = pixels.calc_cartesian_positions(d1=np.array([y]), d2=np.array([x]))
     poni = PONI(dist=float(distance_m), poni1=float(poni1[0]), poni2=float(poni2[0]),
                 wavelength=float(wavelength_m), detector=str(detector))
-    arm = StackedDetectorArm(nu_motor=nu_motor, del_motor=del_motor, **offset)
+    arm = StackedDetectorArm(nu_motor=nu_motor, del_motor=del_motor, **scales, **offset)
     return arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
 
 

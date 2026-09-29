@@ -37,6 +37,22 @@ _PARAM_NAMES = ('dist', 'poni1', 'poni2', 'nu_offset', 'nu_scale',
                 'del_offset', 'del_scale', 'beam_rotation')
 _SINGLE_NAMES = ('dist', 'poni1', 'poni2', 'nu_offset', 'del_offset', 'del_scale', 'beam_rotation')
 _SINGLE_NU_NAMES = ('dist', 'poni1', 'poni2', 'nu_offset', 'nu_scale', 'del_offset', 'beam_rotation')
+
+
+def orientation_signs(orientation=3) -> tuple[int, int]:
+    """The signs of rot1 (nu's) and rot2 (del's) that keep the arm physical in pyFAI's
+    detector ``orientation``.
+
+    pyFAI reflects the pixel coordinates before rotating and the transverse output after
+    (F·R·F; Codex R18-F1), so the same rot1/rot2/rot3 tilt the detector another way in another
+    orientation: rot1 turns the other way in 1 and 4, rot2 in 1 and 2, and the induced rot3
+    follows their product. Motor scales carrying these signs give orientation 3's geometry in
+    every orientation, which then changes only how the PONI and the arm are written.
+    """
+    orientation = int(orientation)
+    if orientation not in (1, 2, 3, 4):
+        raise ValueError(f"pyFAI's detector orientation is 1 to 4, not {orientation}")
+    return (-1 if orientation in (1, 4) else 1), (-1 if orientation in (1, 2) else 1)
 #: A single arm's moving position and parameters, by the circle it holds at zero.
 _SINGLE = {'nu': ('del_angle', _SINGLE_NAMES), 'del': ('nu_angle', _SINGLE_NU_NAMES)}
 _EXTENDED_NAMES = ('mount_tilt', 'mount_roll',

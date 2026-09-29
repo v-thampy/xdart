@@ -721,9 +721,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                      [(f'{code} · {name}', code) for code, name in DETECTOR_ORIENTATIONS], 3,
                      tip='pyFAI\'s detector orientation: the corner holding the image\'s first pixel, seen '
                          'from behind the detector looking at the sample. Keep 3, pyFAI\'s default, unless '
-                         'pyFAI shows this detector\'s images '
-                         'mirrored; it is saved with every PONI and fit. (The image rotation under Select '
-                         'frames is separate: it turns the image arrays.)')
+                         'pyFAI shows this detector\'s images mirrored. It changes how the PONIs are written, '
+                         'not the geometry: the arm\'s motor scales take its signs. It is saved with every '
+                         'PONI and fit. (The image rotation under Select frames is separate: it turns the '
+                         'image arrays.)')
         self._image_size = QtWidgets.QLabel()
         form.addRow('Image size', self._image_size)
         self._rows['beam_size'] = (form, self._image_size)

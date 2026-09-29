@@ -41,6 +41,7 @@ import numpy as np
 
 from xrd_tools.core.containers import PONI
 from xrd_tools.core.geometry import Diffractometer, DetectorCalibration, StackedDetectorArm
+from xrd_tools.core.geometry.stacked_arm import orientation_signs
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +248,9 @@ def refine_goniometer(
         spans ≥ 1°; an un-spanned axis's scale is frozen at ``deg2rad`` (it is
         unidentifiable) and reported in ``frozen_scales``.  ``False`` fixes both
         scales at ``deg2rad`` and fits only the motor-zero offsets + base.
+        ``deg2rad`` carries the detector orientation's sign for that rotation
+        (:func:`~xrd_tools.core.geometry.stacked_arm.orientation_signs`), so a
+        motor turns the detector the same way in every pyFAI orientation.
     base : Diffractometer
         Donates the xrayutilities half (circle stacks, ``camera``, HXRD refs).
     distance_seed_m, distance_bounds_m
@@ -332,19 +336,21 @@ def refine_goniometer(
                 and lo <= distance <= hi):
             raise ValueError("distance bounds require 0 < low < high and a seed inside them")
     seed = [distance, base_poni.poni1, base_poni.poni2, 0.0, 0.0]
+    r1_sign, r2_sign = orientation_signs(det.orientation)
+    r1_nominal, r2_nominal = r1_sign * _DEG2RAD, r2_sign * _DEG2RAD
     if fit_r1s:
-        seed.append(_DEG2RAD)
+        seed.append(r1_nominal)
     if fit_r2s:
-        seed.append(_DEG2RAD)
+        seed.append(r2_nominal)
     seed = np.asarray(seed, dtype=float)
     r3_pinned = float(base_poni.rot3)
 
     def _unpack(p):
         dist, poni1, poni2, r1o, r2o = p[:5]
         i = 5
-        r1s = p[i] if fit_r1s else _DEG2RAD
+        r1s = p[i] if fit_r1s else r1_nominal
         i += int(fit_r1s)
-        r2s = p[i] if fit_r2s else _DEG2RAD
+        r2s = p[i] if fit_r2s else r2_nominal
         return dist, poni1, poni2, r1o, r2o, r3_pinned, r1s, r2s
 
     def _residual(p):
@@ -397,11 +403,12 @@ def refine_goniometer(
         problems.append(f"non-physical dist={dist:.4g} m")
     if abs(r1o) > np.pi or abs(r2o) > np.pi:
         problems.append("non-physical rotation offset (> π rad)")
-    for fit_s, sc, mot in ((fit_r1s, r1s, rot1_motor), (fit_r2s, r2s, rot2_motor)):
-        if fit_s and abs(sc - _DEG2RAD) > _SCALE_TOL_REL * _DEG2RAD:
+    for fit_s, sc, mot, nominal in ((fit_r1s, r1s, rot1_motor, r1_nominal),
+                                    (fit_r2s, r2s, rot2_motor, r2_nominal)):
+        if fit_s and abs(sc - nominal) > _SCALE_TOL_REL * _DEG2RAD:
             problems.append(
                 f"{mot} scale {sc:.4g} is implausible (expected ≈ deg2rad "
-                f"{_DEG2RAD:.4g}) — likely under-constrained")
+                f"{nominal:.4g}) — likely under-constrained")
     if condition > _MAX_CONDITION:
         problems.append(f"under-determined fit (Jacobian condition {condition:.2g}"
                         f" > {_MAX_CONDITION:.0g}); add frames spanning each motor")
@@ -507,7 +514,8 @@ def refine_stacked_arm(
     pitch) is still fitted, and it has no extension.
     ``extended=True`` adds the detector mount on the arm (tilt, roll)
     and the sample offset from the rotation centre. Motor scales stay at one
-    degree per degree and the beam rotation is pinned at zero, because |q|
+    degree per degree (signed for the detector orientation, see
+    :func:`~xrd_tools.core.geometry.stacked_arm.orientation_signs`) and the beam rotation is pinned at zero, because |q|
     cannot see either; a mount rotation about the del axis is excluded because
     it duplicates the del offset. The extension needs frames from at least
     three nu positions, and a fit whose extension is implausible or poorly
@@ -569,10 +577,13 @@ def refine_stacked_arm(
         if not (np.isfinite([lo, hi]).all() and 0 < lo < hi and lo <= distance <= hi):
             raise ValueError("distance bounds require 0 < low < high and a seed inside them")
 
+    nu_sign, del_sign = orientation_signs(det.orientation)
+
     def arm_for(p):
         extension = dict(zip(_EXTENSION_NAMES, p[5:])) if len(p) > 5 else {}
         return StackedDetectorArm(nu_motor=nu_motor, del_motor=del_motor,
                                   nu_offset=p[3], del_offset=p[4],
+                                  nu_scale=nu_sign * _DEG2RAD, del_scale=del_sign * _DEG2RAD,
                                   beam_rotation=beam_rotation, **extension)
 
     def predicted(p, keep):
