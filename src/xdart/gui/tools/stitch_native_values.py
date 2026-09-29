@@ -1,5 +1,6 @@
 """Native Stitch selections projected onto existing finite operation owners."""
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from xrd_tools.analysis.module_transaction import (
@@ -75,6 +76,29 @@ def _families(form, resolution, project):
         seen.add(name.casefold())
         families.append(name)
     return tuple(families)
+
+
+def _recorded_gi(gi, tables):
+    """The form's grazing incidence as the selected scans record it: a sample circle (mu, phi) no
+    selected scan records reads 0 (bound to None, and returned so Preview says so); one only some
+    scans record is refused, naming a scan without it (Codex review F3: every scan decides)."""
+    from .stitch_values import StitchToolPreflightRefused
+    if gi is None:
+        return None, ()
+    names = [(spec, {column.name for column in table.columns}) for spec, table in tables]
+    pairs, unrecorded = [], []
+    for role, motor in gi.sample_motors:
+        lacking = [spec for spec, recorded in names if motor is not None and motor not in recorded]
+        if motor is not None and len(lacking) == len(names):
+            motor = None
+            unrecorded.append(role)
+        elif lacking:
+            spec = lacking[0]
+            raise StitchToolPreflightRefused("GI_SAMPLE_CIRCLE_MIXED",
+                f"{role} ({motor}) is recorded by some selected scans and not others, not by {spec.uri} "
+                f"(scan {spec.options.get('scan', '-')}): select scans that record the same sample circles")
+        pairs.append((role, motor))
+    return replace(gi, sample_motors=tuple(pairs)), tuple(unrecorded)
 
 
 def _check_output_directory(target, project):
@@ -157,10 +181,23 @@ def prepare_native_stitch_tool(form, project):
         return StitchToolPreflight(form, None, None, _PREFLIGHT_FACTORY,
                                    requests=(), skipped=resolution.skipped)
     families = _families(form, resolution, project)
+    # Metadata is loaded once per exact source. The table is reused without
+    # changing membership when a scan appears in more than one output group.
+    tables = {}
+    for spec in (spec for group in resolution.groups for spec in group):
+        cache_key = (str(spec.uri), spec.entry, str(spec.options))
+        if cache_key not in tables:
+            table = run_metadata_table(MetadataTablePlan(spec))
+            if table.disposition is not AnalysisDisposition.COMPLETED:
+                raise StitchToolPreflightRefused(table.code or "SOURCE_PREFLIGHT_REFUSED",
+                    f"Source metadata could not be admitted: {spec.uri} (entry {spec.entry or '-'}, scan {spec.options.get('scan', '-')})",
+                    diagnostics=table.diagnostics)
+            tables[cache_key] = (spec, table)
+    gi, unrecorded = _recorded_gi(form.gi, tables.values())
     common = dict(npt_1d=form.npt_1d, unit=form.unit, radial_range=form.q_range,
                   monitor_selector=form.monitor_selector, max_frame_bytes=form.max_frame_bytes,
                   native_records=True, conditioning=form.conditioning, mask_path=form.mask_path,
-                  frame_screen=FrameScreenPolicy(exclude=form.frame_screen), gi=form.gi)
+                  frame_screen=FrameScreenPolicy(exclude=form.frame_screen), gi=gi)
     if form.backend == "multigeometry":
         geometry = capture_stitch_geometry(StitchGeometryInput(
             form.geometry_path, form.geometry_kind,
@@ -191,22 +228,18 @@ def prepare_native_stitch_tool(form, project):
         motors = tuple(name for name in acquisition["source_motors"].values()
                        if name is not None)  # a single 2θ arm reads no nu
         energy_name = acquisition["source_energy_selector"]
-    if form.gi is not None:  # every frame's sample circles: the incidence, the tilt, mu and phi
-        motors += form.gi.metadata_names()
+    if gi is not None:  # every frame's sample circles: the incidence, the tilt, mu and phi
+        motors += gi.metadata_names()
     requests, preview_members, warnings = [], [], []
-    # Metadata is loaded once per exact source. The receipt is reused without
-    # changing membership when a scan appears in more than one output group.
+    if unrecorded:
+        warnings.append(f"Grazing: no selected scan records {', '.join(unrecorded)}; read as 0")
     cached = {}
     for group, family in zip(resolution.groups, families):
         receipts = []
         for spec in group:
             cache_key = (str(spec.uri), spec.entry, str(spec.options))
             if cache_key not in cached:
-                table = run_metadata_table(MetadataTablePlan(spec))
-                if table.disposition is not AnalysisDisposition.COMPLETED:
-                    raise StitchToolPreflightRefused(table.code or "SOURCE_PREFLIGHT_REFUSED",
-                        f"Source metadata could not be admitted: {spec.uri} (entry {spec.entry or '-'}, scan {spec.options.get('scan', '-')})",
-                        diagnostics=table.diagnostics)
+                table = tables[cache_key][1]
                 selected = form.frame_selector.select(table.labels)
                 selectors = tuple(MetadataColumnSelector(str(name)) for name in motors)
                 selectors += () if form.monitor_selector is None else (form.monitor_selector,)
@@ -235,9 +268,9 @@ def prepare_native_stitch_tool(form, project):
             request = prepare_stitch_operation(source, output, plan, project_root=project)
             from xrd_tools.analysis.stitch_native import native_frame_members
             members = tuple(native_frame_members(request))
-            if form.gi is not None:  # every frame's sample normal suits the pyFAI sample orientation
+            if gi is not None:  # every frame's sample normal suits the pyFAI sample orientation
                 for item in request.manifest.contributions:
-                    form.gi.pyfai_angles(form.gi.normal({name: value for name, _occurrence, value in item.values}))
+                    gi.pyfai_angles(gi.normal({name: value for name, _occurrence, value in item.values}))
         except (ValueError, TypeError) as error:
             count = sum(len(receipt.selected_labels) for receipt in receipts)
             code = getattr(error, "code", "STITCH_PREFLIGHT_REFUSED")

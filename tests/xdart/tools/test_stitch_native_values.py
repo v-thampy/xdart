@@ -110,6 +110,18 @@ def test_native_group_is_named_automatically_or_as_entered(tmp_path):
     assert Path(prepared.request.module.output.target).name == "Sample A é_stitch1d.nexus"
 
 
+def test_native_automatic_name_fills_the_stem_with_the_scans_occurrence_key(tmp_path):
+    """Codex re-review (P3), now Preview's alone (Codex audit G-F2: the page lists no image folder):
+    a stem with {occurrence} is filled with SPEC's N.M key, and the automatic name is Int's name of
+    the images it finds."""
+    form = replace(_native_form(tmp_path, "multigeometry", scans="1"), output_family=None)
+    for source in Path(form.image_dir).glob("*scan1_*"):
+        source.rename(source.with_name("sample_occ1.1_" + source.name.rsplit("_", 1)[1]))
+    selection = replace(form.source_selection, image_stem="sample_occ{occurrence}_")
+    prepared = prepare_stitch_tool(replace(form, source_selection=selection))
+    assert Path(prepared.request.module.output.target).name == "sample_occ1.1_stitch1d.nexus"
+
+
 def test_an_automatic_name_over_80_characters_asks_for_one(tmp_path):
     from types import SimpleNamespace
     from xdart.gui.tools.stitch_native_values import _families

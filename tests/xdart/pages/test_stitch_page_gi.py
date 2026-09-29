@@ -134,6 +134,9 @@ def test_a_manual_angle_axis_and_ranges_reach_the_form_and_round_trip(qapp, tmp_
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
 @pytest.mark.parametrize("recorded", (True, False))
 def test_both_backends_read_the_geometrys_sample_circles_or_say_one_reads_zero(qapp, tmp_path, recorded, backend):
+    """The page binds the Geometry's circles; Preview (on the worker) reads a circle no scan records
+    as 0 and says so (Codex audit G-F2: the page reads no scan's table)."""
+    from xdart.gui.tools.stitch_values import prepare_stitch_tool
     page = _page(tmp_path, backend)
     try:
         if not recorded:  # a scan whose header has no phi
@@ -143,9 +146,12 @@ def test_both_backends_read_the_geometrys_sample_circles_or_say_one_reads_zero(q
         _click(page, "Grazing")
         page.set_field("unit", "Qip (Å⁻¹)")
         gi = page.build_form().gi
+        assert gi.incidence_motor == "eta" and gi.tilt_motor == "chi" and gi.sample_motors == _SAMPLE
+        prepared = prepare_stitch_tool(page.build_form())
         expected = _SAMPLE if recorded else (("mu", "mu"), ("phi", None))
-        assert gi.incidence_motor == "eta" and gi.tilt_motor == "chi" and gi.sample_motors == expected
-        assert ("phi read as 0" in _status(page)) is not recorded
+        assert all(request.plan.gi.sample_motors == expected for request in prepared.requests)
+        said = [item for item in prepared.warnings if "read as 0" in item]
+        assert said == ([] if recorded else ["Grazing: no selected scan records phi; read as 0"])
     finally:
         _close(page, qapp)
 
@@ -176,8 +182,9 @@ def _status(page):
 @pytest.mark.parametrize("dropped", [(), (("phi", "-1.7"),), "both"])
 def test_a_sample_circle_is_decided_by_every_selected_scan(qapp, tmp_path, dropped):
     """Codex review F3: the first scan's motors never decide for the others. Recorded by every scan:
-    bound (and each scan's own value frozen); by none: read as 0, said; by only some: refused."""
-    from xdart.gui.tools.stitch_values import prepare_stitch_tool
+    bound (and each scan's own value frozen); by none: read as 0, said; by only some: refused, naming
+    a scan without it. Preview decides, not the page (Codex audit G-F2)."""
+    from xdart.gui.tools.stitch_values import StitchToolPreflightRefused, prepare_stitch_tool
     page = _two_files(tmp_path, "xu_hist", (("phi", "-1.7"),) if dropped == "both" else dropped)
     try:
         if dropped == "both":  # neither file records phi
@@ -186,17 +193,19 @@ def test_a_sample_circle_is_decided_by_every_selected_scan(qapp, tmp_path, dropp
             page.set_field("image_stem", "sample_scan{scan}_")
         _click(page, "Grazing")
         page.set_field("unit", "Qip (Å⁻¹)")
+        assert page.build_form().gi.sample_motors == _SAMPLE  # the page binds the Geometry's names
         if dropped == (("phi", "-1.7"),):
-            assert "phi recorded by only some scans" in _status(page)
-            with pytest.raises(ValueError, match="phi is recorded by some selected scans and not others"):
-                page.build_form()
+            with pytest.raises(StitchToolPreflightRefused) as refused:
+                prepare_stitch_tool(page.build_form())
+            assert refused.value.code == "GI_SAMPLE_CIRCLE_MIXED"
+            assert f"phi (phi) is recorded by some selected scans and not others, not by {page._source_paths[0]}" in str(refused.value)
             return
-        gi = page.build_form().gi
-        if dropped == "both":
-            assert dict(gi.sample_motors)["phi"] is None and "phi read as 0" in _status(page)
-            return
-        assert gi.sample_motors == _SAMPLE
         prepared = prepare_stitch_tool(page.build_form())
+        if dropped == "both":
+            assert all(dict(request.plan.gi.sample_motors)["phi"] is None for request in prepared.requests)
+            assert "Grazing: no selected scan records phi; read as 0" in prepared.warnings
+            return
+        assert all(request.plan.gi.sample_motors == _SAMPLE for request in prepared.requests)
         bound = [{name: value for name, _occurrence, value in item.values}
                  for request in prepared.requests for item in request.manifest.contributions]
         assert len(bound) == 4 and all(item["chi"] == 90. and item["phi"] == -1.7 for item in bound)
@@ -257,11 +266,44 @@ def test_a_sample_circle_recorded_per_point_is_bound_not_read_as_zero(qapp, tmp_
         page.set_sources((str(spec),))
         _click(page, "Grazing")
         page.set_field("unit", "Qip (Å⁻¹)")
-        gi = page.build_form().gi
-        assert dict(gi.sample_motors)["mu"] == "mu" and "read as 0" not in _status(page)
         prepared = prepare_stitch_tool(page.build_form())
+        assert all(dict(request.plan.gi.sample_motors)["mu"] == "mu" for request in prepared.requests)
+        assert not any("read as 0" in item for item in prepared.warnings)
         bound = [{name: value for name, _occurrence, value in item.values}
                  for request in prepared.requests for item in request.manifest.contributions]
         assert [item["mu"] for item in bound] == [.5, 1.5]
+    finally:
+        _close(page, qapp)
+
+
+def test_an_edit_reads_no_scan_table_and_lists_no_image_folder(qapp, tmp_path, monkeypatch):
+    """Codex audit G-F2: the page's edits (drafts and commits, Grazing on, every scan, the form) read
+    no SPEC data table and list no image folder; Preview does that on the worker. The page's one
+    source read is the first scan's header (the incidence and tilt choices), on a committed source
+    or scan edit only."""
+    import xrd_tools.io.image as image
+    import xrd_tools.io.spec as spec_io
+    from xdart.gui.tabs.stitch import page as page_module
+    calls = []
+    for module, name in ((spec_io, "read_spec_scan_columns"), (spec_io, "list_spec_scans"),
+                         (image, "find_image_files"), (spec_io, "read_spec_scan_motor_names")):
+        real = getattr(module, name)
+        monkeypatch.setattr(module, name, lambda *args, real=real, name=name, **kwargs:
+                            (calls.append(name), real(*args, **kwargs))[1])
+    page_module._spec_motor_names.cache_clear()
+    page = _page(tmp_path, "multigeometry")
+    try:
+        _click(page, "Grazing")
+        assert page._gi_catalog == _MOTORS
+        calls.clear()
+        page._rows["scan"].draftChanged.emit(("Stitch", "scan"), "1, 2")  # a draft: no read
+        page.set_field("image_stem", "sample_scan{scan}_")
+        page.set_field("unit", "Qip (Å⁻¹)")
+        page.build_form()
+        assert calls == []
+        page.set_field("scan_mode", "Stitch All")  # a commit: the first scan's header, nothing else
+        page.build_form()
+        assert calls == ["read_spec_scan_motor_names"] and page._gi_catalog == _MOTORS
+        assert page._rows["output_family"].editor.placeholderText() == "auto · as Int names the scan's images, with _gi"
     finally:
         _close(page, qapp)

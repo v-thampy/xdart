@@ -47,6 +47,19 @@ def list_spec_scans(spec_file: Path | str) -> list[str]:
     return list(SpecFile(str(spec_file)).keys())
 
 
+def read_spec_scan_motor_names(
+    spec_file: Path | str, scan_num: str | None = None
+) -> tuple[str, ...]:
+    """One scan's ``#O`` motor names from its header alone (its data table is not
+    read); ``scan_num`` None: the file's first scan. KeyError when there is no such scan."""
+    spec = SpecFile(str(spec_file))
+    keys = spec.keys()
+    if scan_num is None and not len(keys):
+        raise KeyError("the SPEC file has no scans")
+    key = keys[0] if scan_num is None else scan_num
+    return tuple(str(name) for name in spec[key].motor_names)
+
+
 def read_spec_scan_table(
     spec_file: Path | str, scan_num: str
 ) -> tuple[dict[str, np.ndarray], dict[str, float], int]:

@@ -126,51 +126,14 @@ def _bound_arm(path, _mtime_ns, _size, bindings):
 
 @functools.lru_cache(maxsize=8)
 def _spec_motor_names(path, _state, scan):
-    """The real motors a SPEC scan records (its ``#O``/``#P`` motors, the scanned one among
-    them; no counters), or None when the scan cannot be read. ``scan`` None: the file's first."""
-    from xrd_tools.io.spec import list_spec_scans, read_spec_scan_table
+    """The real motors a SPEC scan records (its ``#O`` motors, the scanned one among them; no
+    counters) from its header alone, or None when the scan cannot be read. ``scan`` None: the
+    file's first. The only source read the page makes: on a committed source or scan edit (Codex
+    audit G-F2; Preview decides everything else on the worker)."""
+    from xrd_tools.io.spec import read_spec_scan_motor_names
     try:
-        scans = list_spec_scans(path)
-        key = scan if scan is not None else scans[0] if scans else None
-        if key is None:
-            return None
-        return tuple(read_spec_scan_table(path, key)[1])
+        return read_spec_scan_motor_names(path, scan)
     except (OSError, ValueError, KeyError, IndexError):
-        return None
-
-
-@functools.lru_cache(maxsize=16)
-def _spec_recorded_names(path, _state, scan):
-    """Every name a SPEC scan records a value for, as the preflight's metadata table has them: its
-    ``#O``/``#P`` motors and its per-point ``#L`` columns (Codex re-review R2-F2: a motor recorded
-    only per point is recorded). None when the scan cannot be read."""
-    from xrd_tools.io.spec import read_spec_scan_table
-    try:
-        columns, motors, _npts = read_spec_scan_table(path, scan)
-    except (OSError, ValueError, KeyError, IndexError):
-        return None
-    return tuple(dict.fromkeys((*motors, *columns)))
-
-
-@functools.lru_cache(maxsize=16)
-def _spec_image_scan_name(path, _states, scan, image_dir, image_stem):
-    """Int's name for one SPEC scan's images (the automatic result name), or None when no image
-    matches or the folder cannot be read. ``_states``: the SPEC file's and the folder's."""
-    from xrd_tools.analysis.stitch_sources import spec_scan_name
-    stem = image_stem.format(spec=Path(path).stem, scan=str(scan).split(".")[0], occurrence=scan) if image_stem else ""
-    try:
-        return spec_scan_name(path, scan, image_dir or str(Path(path).parent), stem or None)
-    except (OSError, ValueError, KeyError, IndexError):
-        return None
-
-
-@functools.lru_cache(maxsize=8)
-def _spec_scan_keys(path, _state):
-    """A SPEC file's scan keys (N.M), or None when it cannot be read."""
-    from xrd_tools.io.spec import list_spec_scans
-    try:
-        return tuple(list_spec_scans(path))
-    except (OSError, ValueError, KeyError):
         return None
 
 
@@ -514,6 +477,7 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["source_kind"].valueChanged.connect(self._source_changed)
         self._rows["scan_mode"].valueChanged.connect(self._source_changed)
         self._rows["spec_path"].valueChanged.connect(self._source_path_edited)
+        self._rows["scan"].valueChanged.connect(self._refresh_gi_catalog)  # committed, not drafts
         # A calibration serves both backends (its xrayutilities file is saved beside it), so the
         # backend is a processing choice (maintainer, 2026-09-29).
         self._field(processing, SectionId.PROCESSING, "backend", "Backend",
@@ -669,54 +633,15 @@ class StitchPage(QtWidgets.QWidget):
                 else first[0] if "." in first[0] else f"{first[0]}.1")  # SPEC's N.M key
         return _spec_motor_names(path, _file_states(path), scan)
 
-    def _gi_scan_catalogs(self):
-        """What every selected SPEC scan records (one tuple each: its motors and per-point columns),
-        or None when the selection cannot say (another source kind, or a scan that cannot be read)."""
-        if self._value("source_kind") != "Spec" or not self._source_paths:
-            return None
-        from xrd_tools.sources.grouping import parse_stitch_scan_groups
-        catalogs = []
-        for path in self._source_paths:
-            keys = _spec_scan_keys(path, _file_states(path))
-            if keys is None:
-                return None
-            try:
-                tokens = (keys if self._value("scan_mode") == "Stitch All" else
-                          tuple(token for group in parse_stitch_scan_groups(str(self._value("scan") or ""))
-                                for token in group))
-            except ValueError:
-                return None
-            for token in tokens:
-                names = _spec_recorded_names(path, _file_states(path), token if token in keys else f"{token}.1")
-                if names is None:
-                    return None
-                catalogs.append(names)
-        return tuple(catalogs) or None
-
-    def _gi_sample_binding(self):
-        """The Geometry's other sample circles (mu, phi) by its motor names, and those only some
-        selected scans record (both backends read them with the incidence and tilt). A circle no selected scan records reads 0 (None; the
-        Experiment status says so); when the selection cannot say, the name stays and Preview refuses
-        a scan without it. A first-scan catalog never decides for the others (Codex review F3)."""
+    def _gi_sample_motors(self):
+        """The Geometry's other sample circles (mu, phi) by its motor names: both backends read them
+        with the incidence and tilt. Preview decides from every selected scan (Codex review F3): a
+        circle no scan records reads 0 and Preview says so; one only some scans record is refused."""
         from xrd_tools.integrate.stitch_gi import GI_SAMPLE_ROLES
         geometry = self._instrument()
         circles = {role: circle for circle, role in geometry.as_psic().items()}
         names = dict(geometry.motors)
-        catalogs = self._gi_scan_catalogs()
-        pairs, mixed = [], []
-        for role in GI_SAMPLE_ROLES:
-            motor = names.get(circles.get(role, role))
-            if motor is not None and catalogs is not None:
-                recorded = [motor in catalog for catalog in catalogs]
-                if not any(recorded):
-                    motor = None
-                elif not all(recorded):
-                    mixed.append(role)
-            pairs.append((role, motor))
-        return tuple(pairs), tuple(mixed)
-
-    def _gi_sample_motors(self):
-        return self._gi_sample_binding()[0]
+        return tuple((role, names.get(circles.get(role, role))) for role in GI_SAMPLE_ROLES)
 
     def _gi_fields(self):
         """Int's GI fields (its paths and rows) for this page's values."""
@@ -740,10 +665,7 @@ class StitchPage(QtWidgets.QWidget):
             return "standard"
         if self._value("unit") not in _GI_AXES:  # Q or 2θ: a plain result
             return "grazing · choose Qip or Qoop as the Axis"
-        pairs, mixed = self._gi_sample_binding()
-        zero = [role for role, motor in pairs if motor is None]
-        return ("grazing" + (f" · {', '.join(zero)} read as 0" if zero else "")
-                + (f" · {', '.join(mixed)} recorded by only some scans" if mixed else ""))
+        return "grazing"
 
     def _render_gi(self):
         """Int's GI rows in the Experiment section, rebuilt from this page's values; the incidence
@@ -831,10 +753,6 @@ class StitchPage(QtWidgets.QWidget):
         motor, tilt = self._gi["motor"] or "Manual", self._gi["tilt_motor"] or "Manual"
         ip, oop = ((None if value(f"{prefix}_auto") else (float(value(f"{prefix}_min")), float(value(f"{prefix}_max"))))
                    for prefix in ("gi_ip", "gi_oop"))
-        mixed = self._gi_sample_binding()[1]
-        if mixed:
-            raise ValueError(f"{', '.join(mixed)} is recorded by some selected scans and not others: "
-                             "select scans that record the same sample circles")
         return StitchGI(
             GI_CUTS, incidence_motor=None if motor == "Manual" else motor,
             incident_angle_deg=float(self._gi["angle"]) if motor == "Manual" else None,
@@ -951,6 +869,7 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["spec_path"].apply_field(field)
         self._show_source_tip()
         self._edited()
+        self._refresh_gi_catalog()
 
     def _source_path_edited(self, _path, value):
         """A committed edit of the source box. Only a typed path is a selection: the box's own
@@ -963,6 +882,7 @@ class StitchPage(QtWidgets.QWidget):
         self._source_shown = text
         self._show_source_tip()
         self._edited()  # the row's own edit signal refreshed readiness before the selection changed
+        self._refresh_gi_catalog()
 
     def _adopt_sources(self, paths):
         """The selection Run, Preview and the saved settings use, with what depends on it."""
@@ -988,6 +908,7 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["spec_path"].label.setText({"Spec": "SPEC files", "NeXus": "NeXus files", "Directory": "Folder"}[kind])
         if _args and _args[0][-1] == "source_kind":
             self.set_sources(self._paths_by_kind.get(kind, ()))
+        self._refresh_gi_catalog()
 
     def _processing_axis_changed(self, *_args):
         if self._value("unit") in _GI_AXES:
@@ -1016,6 +937,8 @@ class StitchPage(QtWidgets.QWidget):
             self._source_path_edited(field.path, value)
         elif key in {"source_kind", "scan_mode"}:
             self._source_changed(field.path, value)
+        elif key == "scan":
+            self._refresh_gi_catalog()
         elif key == "unit":
             self._processing_axis_changed()
         elif key == "project_root" and not self._value("output_path"):
@@ -1034,43 +957,34 @@ class StitchPage(QtWidgets.QWidget):
         self._revision += 1
         self._prepared_revision = None
         self._queued_jobs.clear()
-        if getattr(self, "_gi", {}).get("enabled") and self._gi_catalog_now() != self._gi_catalog:
-            self._render_gi()  # another scan: its motors are the incidence choices
         if hasattr(self, "run_bar"):
             self._refresh_inputs_view()
             self._status(self._readiness[0], ready=self._readiness[1])
             self._sync_actions()
 
-    def _automatic_names(self, kind, sources, scans):
+    def _refresh_gi_catalog(self, *_args):
+        """On a committed source or scan edit, never a draft: another first scan's motors are the
+        incidence and tilt choices (the page's one source read, Codex audit G-F2)."""
+        if self._gi["enabled"] and self._gi_catalog_now() != self._gi_catalog:
+            self._render_gi()
+            self._edited()  # a default motor may have changed
+
+    def _automatic_names(self, kind, sources):
         """The result names the selection gets when Result names is blank, as Int names results:
-        the scan's image name, _gi for grazing incidence (Preview confirms)."""
+        a NeXus container's stem, _gi for grazing incidence. A SPEC scan's is its images' name, which
+        only Preview reads (Codex audit G-F2: no folder is listed on an edit)."""
         from xrd_tools.analysis.stitch_sources import int_scan_name
         from xrd_tools.io.output_path import generated_artifact_family, scan_family
-        from xrd_tools.sources.grouping import parse_stitch_scan_groups
-        image_dir, stem = str(self._value("image_dir") or ""), str(self._value("image_stem") or "")
         gi = self._gi["enabled"] and self._value("unit") in _GI_AXES
-        try:
-            if kind == "Spec" and self._value("scan_mode") != "Stitch All":
-                groups = [[(path, scan) for scan in group]
-                          for path in sources for group in parse_stitch_scan_groups(scans)]
-                def key(path, token):  # SPEC's N.M key, as Preview resolves it (so {occurrence} matches)
-                    keys = _spec_scan_keys(path, _file_states(path)) or ()
-                    return token if token in keys else f"{token}.1"
-
-                members = [[_spec_image_scan_name(path, _file_states(path, image_dir or Path(path).parent),
-                                                  key(path, scan), image_dir, stem) for path, scan in group]
-                           for group in groups[:3]]
-            else:
-                groups = [list(sources)] if kind == "NeXus" and sources else []
-                members = [[int_scan_name(path) for path in group] for group in groups]
-            names = [generated_artifact_family(scan_family(group), grazing_incidence=gi)
-                     for group in members if None not in group]
-        except ValueError:
-            names = []
-        if not names:
+        if kind == "Spec":
+            return "auto · as Int names the scan's images" + (", with _gi" if gi else "")
+        if kind != "NeXus" or not sources:
             return "automatic"
-        more = f"; … {len(groups)} outputs" if len(groups) > 3 else ""
-        return "auto · " + "; ".join(names) + more
+        try:
+            return "auto · " + generated_artifact_family(
+                scan_family([int_scan_name(path) for path in sources]), grazing_incidence=gi)
+        except ValueError:
+            return "automatic"
 
     def _refresh_inputs_view(self):
         """Int's section headers; the automatic image folder, stem and result names."""
@@ -1088,7 +1002,7 @@ class StitchPage(QtWidgets.QWidget):
             f"auto · {spec.parent}" if spec else "auto · the SPEC file's folder")
         self._rows["image_stem"].editor.setPlaceholderText(
             f"auto · {spec.stem if spec else '<SPEC name>'}_scan{first[1] if first else '<N>'}_")
-        self._rows["output_family"].editor.setPlaceholderText(self._automatic_names(kind, sources, scans))
+        self._rows["output_family"].editor.setPlaceholderText(self._automatic_names(kind, sources))
         project = Path(str(value("project_root") or ""))
         project_ready = bool(str(value("project_root")).strip()) and project.is_dir()
         calibration = str(value("geometry_path") or "").strip()
