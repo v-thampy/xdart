@@ -296,6 +296,7 @@ def test_an_edit_reads_no_scan_table_and_lists_no_image_folder(qapp, tmp_path, m
         _click(page, "Grazing")
         assert page._gi_catalog == _MOTORS
         calls.clear()
+        page_module._spec_motor_names.cache_clear()  # a warm cache would hide a read on a draft
         page._rows["scan"].draftChanged.emit(("Stitch", "scan"), "1, 2")  # a draft: no read
         page.set_field("image_stem", "sample_scan{scan}_")
         page.set_field("unit", "Qip (Å⁻¹)")
