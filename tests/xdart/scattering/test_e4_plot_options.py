@@ -546,3 +546,54 @@ def test_reconciled_plot_options_slice_scale_and_hide_line_legend(
         assert not view.legend.isVisible()
     finally:
         view.close()
+
+
+def test_left_drag_zooms_the_1d_plot_into_a_box_and_shift_drag_pans(qapp):
+    """Live: a left-drag panned the 1-D plot (Int 1-D and Stitch) while it drew a zoom box on the
+    2-D views, as the retired Static Scan page's 1-D plot also did. The 1-D curve now uses the
+    2-D views' RectViewBox: a real left-drag zooms to the box (a pan keeps the width), and
+    Shift+left-drag pans (a trackpad has no middle button)."""
+    from pyqtgraph.Qt import QtCore, QtGui
+    from xdart.gui.gui_utils import RectViewBox
+
+    view = ScientificView()
+    view.resize(1000, 800)
+    view.show()
+    try:
+        box = view.curve.getPlotItem().getViewBox()
+        assert isinstance(box, RectViewBox) and box.state["mouseMode"] == box.RectMode
+        x = np.linspace(0., 10., 101)
+        view.curve.getPlotItem().plot(x, x ** 2)
+        viewport = view.curve.viewport()
+
+        def at(fx, fy):  # a point of the plot area, in the widget's viewport pixels
+            corner = box.boundingRect()
+            local = QtCore.QPointF(corner.left() + fx * corner.width(), corner.top() + fy * corner.height())
+            return view.curve.mapFromScene(box.mapToScene(local))
+
+        def drag(start, end, modifiers=QtCore.Qt.KeyboardModifier.NoModifier):
+            """A real left-button press, ten moves and a release; the x range after it."""
+            box.setRange(xRange=(0., 10.), yRange=(0., 100.), padding=0)
+            qapp.processEvents()
+
+            def send(kind, point, button, buttons):
+                QtWidgets.QApplication.sendEvent(viewport, QtGui.QMouseEvent(
+                    kind, QtCore.QPointF(point), QtCore.QPointF(viewport.mapToGlobal(point)),
+                    button, buttons, modifiers))
+            left, none = QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.MouseButton.NoButton
+            start, end = at(*start), at(*end)
+            send(QtCore.QEvent.Type.MouseButtonPress, start, left, left)
+            for step in range(1, 11):
+                send(QtCore.QEvent.Type.MouseMove, start + (end - start) * (step / 10), none, left)
+                qapp.processEvents()
+            send(QtCore.QEvent.Type.MouseButtonRelease, end, left, none)
+            qapp.processEvents()
+            return box.viewRange()[0]
+
+        a, b = drag((.3, .3), (.6, .7))
+        assert 0. < a < b < 10. and (b - a) < 5., (a, b)  # zoomed to the box
+        a, b = drag((.6, .5), (.3, .5), QtCore.Qt.KeyboardModifier.ShiftModifier)
+        assert (b - a) == pytest.approx(10., rel=1e-6) and a > 1., (a, b)  # panned right by ~3
+    finally:
+        view.close()
+        view.deleteLater()

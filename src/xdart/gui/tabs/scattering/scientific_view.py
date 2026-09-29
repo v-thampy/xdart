@@ -23,6 +23,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from xdart.modules.display_context import (
     Viewer2DRendererClearReceipt, Viewer2DRendererClearRequest,
 )
+from xdart.gui.gui_utils import RectViewBox
 from xdart.gui.themes import apply_seaborn_plot_style
 from xdart.gui.widgets.intensity_controls import IntensityControls
 from xrd_tools.session.display_logic import (
@@ -381,7 +382,9 @@ class ScientificView(QtWidgets.QFrame):
         one_d = QtWidgets.QFrame()
         one_d_layout = QtWidgets.QVBoxLayout(one_d)
         one_d_layout.setContentsMargins(0, 0, 0, 0)
-        self.curve = pg.PlotWidget()
+        # as the 2-D views and the retired Static Scan page: left-drag draws a box to zoom into
+        # (pyqtgraph's default pans), middle-click shows all, right-click keeps pyqtgraph's menu
+        self.curve = pg.PlotWidget(viewBox=RectViewBox())
         self.curve.setObjectName("e3OneDPlot")
         apply_seaborn_plot_style(self.curve.getPlotItem(), grid=True)
         self.curve.getPlotItem().layout.setContentsMargins(
