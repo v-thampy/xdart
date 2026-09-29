@@ -54,6 +54,8 @@ from xrd_tools.session.threshold_editing import (
 _FRAME_CHECKS = {"Exclude empty frames": "empty", "Exclude empty and partial frames": "partial",
                  "Keep all frames": "none"}
 _SAMPLE_POSITIONS = {"As calibrated": "calibrated", "On rotation axis": "rotation_axis"}
+#: A GI result's cut: its plot-axis key (Int's) and axis label and unit.
+_CUT_AXES = {"q_ip": ("Qᵢₚ", "Å⁻¹"), "q_oop": ("Qₒₒₚ", "Å⁻¹")}
 
 
 _LOG = logging.getLogger(__name__)
@@ -1602,31 +1604,48 @@ class StitchPage(QtWidgets.QWidget):
         items = [self.results.item(row) for row in range(self.results.count())]
         keys = tuple(self._result_key(item.data(role)) for item in items)
         selected = self._selected()
+        # A GI result's cut is its record's second 1-D mode; the plot axis chooses it, as Int's does.
+        cuts = {payload.gi[0] for _item, payload in selected if payload.gi is not None}
+        if self._plot_axis in _CUT_AXES and self._plot_axis not in cuts:
+            self._plot_axis = "Q"
         available = all(payload.wavelength_A is not None for _, payload in selected)
         if not available and self._plot_axis == "2theta":
             self._plot_axis = "Q"
+        cut = self._plot_axis if self._plot_axis in cuts else None
         unit = "q_A^-1" if self._plot_axis == "Q" else "2th_deg"
-        axis_label, axis_unit = ("Q", "Å⁻¹") if unit == "q_A^-1" else ("2θ", "°")
+        axis_label, axis_unit = (_CUT_AXES[cut] if cut is not None
+                                 else ("Q", "Å⁻¹") if unit == "q_A^-1" else ("2θ", "°"))
         traces = []
         for item, payload in selected:
-            values = {"Intensity": payload.intensity, "Coverage": payload.coverage,
-                      "Normalization": payload.normalization}[self._diagnostic]
+            if cut is not None:
+                if payload.gi is None or payload.gi[0] != cut:
+                    continue
+                shown = payload.gi[1]
+                radial = shown.axes[0][1]
+            else:
+                shown = payload
+            values = {"Intensity": shown.intensity, "Coverage": shown.coverage,
+                      "Normalization": shown.normalization}[self._diagnostic]
             if values is None:
                 continue
-            try:
-                radial = payload.radial_axis(unit)
-            except ValueError:
-                if payload.native_unit != unit:
-                    continue
-                radial = payload.axis("q")
+            if cut is None:
+                try:
+                    radial = payload.radial_axis(unit)
+                except ValueError:
+                    if payload.native_unit != unit:
+                        continue
+                    radial = payload.axis("q")
             traces.append(TraceProjection(
                 self._result_key(item.data(role)),
                 AxisProjection(np.asarray(radial, dtype=float), axis_label, axis_unit),
                 np.asarray(values, dtype=float), title=item.text()))
+        gi_modes = ("q_total", *sorted(cuts)) if cuts else ()
         current = self.results.currentItem()
         state = ScientificProjection(
             heavy_available=frozenset(keys), traces=tuple(traces),
             title=current.text() if current else "Current", processing_mode="Int 1D",
+            measurement_mode="GI" if gi_modes else "Standard",
+            gi_mode_1d=(cut or "q_total") if gi_modes else "", gi_modes_1d=gi_modes,
             plot_axis=self._plot_axis, plot_mode=self._plot_mode, plot_options=self._plot_options,
             color_map=self._color_map, log_scale=self._log_scale, background_enabled=False,
             status=current.text() if current else "")
@@ -1662,7 +1681,7 @@ class StitchPage(QtWidgets.QWidget):
             if self._plot_mode == "Single":
                 self.results.setCurrentRow(self.results.currentRow(),
                                            QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
-        elif kind is ShellCommandKind.SET_PLOT_AXIS and value in {"Q", "2theta"}:
+        elif kind is ShellCommandKind.SET_PLOT_AXIS and value in {"Q", "2theta", *_CUT_AXES}:
             self._plot_axis = value
         elif kind is ShellCommandKind.SET_COLOR_MAP:
             self._color_map = str(value)

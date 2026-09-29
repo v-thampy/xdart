@@ -882,6 +882,8 @@ class AnalysisArtifactPayload:
     _sigma_buffer: bytes | None = field(init=False, repr=False)
     _coverage_buffer: bytes | None = field(init=False, repr=False)
     _normalization_buffer: bytes | None = field(init=False, repr=False)
+    #: A GI Stitch 1D's cut beside I(q): (its mode, its read-only projection), or None.
+    gi: tuple[str, AnalysisArtifactResultProjection] | None = None
 
     def __post_init__(
         self,
@@ -892,6 +894,12 @@ class AnalysisArtifactPayload:
         _normalization_values: np.ndarray | None,
         _claim: object,
     ) -> None:
+        if self.gi is not None and (
+            type(self.gi) is not tuple or len(self.gi) != 2 or self.gi[0] not in _STITCH_GI_MODES
+            or type(self.gi[1]) is not AnalysisArtifactResultProjection
+            or self.inspection.group != _STITCH_RECORD_RESULT
+        ):
+            raise TypeError("analysis artifact payload GI cut is invalid")
         if (
             _claim is not _ANALYSIS_PAYLOAD_FACTORY
             or type(self.inspection) is not AnalysisArtifactInspection
@@ -2831,6 +2839,7 @@ def read_analysis_artifact(
                 projection.coverage,
                 projection.normalization,
                 _ANALYSIS_PAYLOAD_FACTORY,
+                gi=projection.gi,
             )
 
         with h5py.File(shown, "r") as handle:

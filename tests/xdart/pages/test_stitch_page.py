@@ -791,3 +791,33 @@ def test_reopened_result_marks_the_frames_the_check_excluded(qapp, tmp_path, mon
             assert "frame check not recorded" in status
     finally:
         page.shutdown()
+
+
+def test_a_gi_result_offers_its_cut_on_the_plot_axis_beside_q_and_two_theta(qapp, tmp_path):
+    """A GI stitched record is Int's (maintainer, 2026-09-29): I(q) with Q and 2θ, and its cut as the
+    record's second 1-D mode, chosen on the view's plot axis as Int chooses GI axes."""
+    from xrd_tools.integrate.stitch_gi import StitchGI
+    from xdart.gui.tools.stitch_values import prepare_stitch_tool
+    from tests.xdart.tools.test_stitch_native_gi import _SAMPLE, _gi_form
+
+    request = prepare_stitch_tool(_gi_form(tmp_path, "multigeometry", StitchGI(
+        "q_ip", incidence_motor="eta", sample_motors=_SAMPLE))).request
+    assert run_stitch_operation(request).terminal.disposition is ModuleDisposition.COMMITTED
+    payload = read_analysis_artifact(request.module.output.target)
+    cut = payload.gi[1]
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.open_result(request.module.output.target)
+        _wait(page, qapp)
+        axis = page.scientific.plot_axis
+        assert [axis.itemData(index) for index in range(axis.count())] == ["Q", "2theta", "q_ip"]
+        np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, payload.intensity)
+        axis.setCurrentIndex(axis.findData("q_ip"))
+        np.testing.assert_array_equal(page.curve.listDataItems()[0].xData, cut.axes[0][1])
+        np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, cut.intensity)
+        axis.setCurrentIndex(axis.findData("Q"))
+        np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, payload.intensity)
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()

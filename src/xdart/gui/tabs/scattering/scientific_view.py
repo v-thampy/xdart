@@ -2675,7 +2675,9 @@ class ScientificView(QtWidgets.QFrame):
         native_key: str | None,
     ) -> tuple[tuple[str, str], ...]:
         if state.measurement_mode == "GI":
-            native_choices = _GI_PLOT_AXIS_CHOICES.get(
+            native_choices = self._merged_axis_choices(*(
+                _GI_PLOT_AXIS_CHOICES.get(mode, ()) for mode in state.gi_modes_1d
+            )) if state.gi_modes_1d else _GI_PLOT_AXIS_CHOICES.get(
                 state.gi_mode_1d,
                 _GI_PLOT_AXIS_CHOICES["q_total"],
             )
