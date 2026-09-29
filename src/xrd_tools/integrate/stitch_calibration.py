@@ -656,6 +656,11 @@ def _fit_xu_extended(frames, *, del_motor, nu_motor, distance_seed_m, distance_b
                           extended.rms_q, extended.condition_number, extended.n_points, message)
 
 
+def _calibration_bytes(calibration) -> bytes:
+    """The exact bytes a saved calibration file holds."""
+    return json.dumps(calibration, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+
+
 def save_calibration_fit(fit: CalibrationFit, path):
     """Validate the fit through its backend before saving the adopted asset."""
     from xrd_tools.core.geometry import Diffractometer
@@ -664,7 +669,7 @@ def save_calibration_fit(fit: CalibrationFit, path):
     if path.exists() or provenance.exists():
         raise FileExistsError('choose a new calibration filename; existing files are preserved')
     calibration = fit.asset['calibration']
-    raw = json.dumps(calibration, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+    raw = _calibration_bytes(calibration)
     if fit.backend == 'xu_hist':
         from tempfile import TemporaryDirectory
         from xrd_tools.analysis.xu_stitch_calibration import (
@@ -766,8 +771,11 @@ def save_calibration_pair(fit: CalibrationFit, path, *, validation_angles, cance
         return SavedCalibration(saved, None, f'no xrayutilities file: {refusal}')
     except InterruptedError:
         return SavedCalibration(saved, None, 'no xrayutilities file: cancelled; save again to make it')
+    # both files' bytes: the pair is the pyFAI file and exactly this partner (Codex review F5)
     xu_provenance = {**provenance, 'source_motors': {'del': del_motor, 'nu': nu_motor}, 'xu_transfer': transfer,
-                     'pyfai_calibration': {'file': Path(saved).name, 'sha256': _sha(saved)}}
+                     'pyfai_calibration': {'file': Path(saved).name, 'sha256': _sha(saved)},
+                     'xu_calibration': {'file': partner.name,
+                                        'sha256': hashlib.sha256(_calibration_bytes(asset)).hexdigest()}}
     try:  # the pyFAI file is saved and adopted whatever happens to its partner
         xu_saved = save_calibration_fit(CalibrationFit('xu_hist', {'calibration': asset, 'provenance': xu_provenance},
                                                        fit.rms_q, fit.condition_number, fit.n_points, fit.message),
@@ -789,10 +797,13 @@ def paired_xu_calibration(path) -> Path:
     try:
         provenance = json.loads(partner.with_suffix(partner.suffix + '.provenance.json').read_text(encoding='utf-8'))
         recorded = provenance['pyfai_calibration']['sha256']
+        written = provenance['xu_calibration']['sha256']
     except (OSError, ValueError, KeyError, TypeError):
         raise ValueError(f'{path.name} has no xrayutilities partner ({partner.name}): {advice}') from None
     if not partner.is_file() or recorded != _sha(path):
         raise ValueError(f'{partner.name} was not made from this {path.name}: {advice}')
+    if written != _sha(partner):
+        raise ValueError(f'{partner.name} is not the xrayutilities file saved with {path.name}: {advice}')
     return partner
 
 

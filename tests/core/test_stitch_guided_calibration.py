@@ -304,6 +304,20 @@ def test_a_saved_fit_writes_its_xrayutilities_partner_bound_by_hash(tmp_path):
     assert provenance['pyfai_calibration'] == {'file': 'arm.json', 'sha256': _digest(Path(saved.pyfai_path))}
     assert paired_xu_calibration(saved.pyfai_path) == Path(saved.xu_path)
     capture_xu_stitch_calibration(XuStitchCalibrationInput(Path(saved.xu_path)), project_root=tmp_path)
+    assert provenance['xu_calibration'] == {'file': 'arm.xu.json', 'sha256': _digest(Path(saved.xu_path))}
+    # another pair's partner copied over this one's (Codex review F5): the pair binds the partner's bytes
+    import copy
+    from dataclasses import replace
+    other = copy.deepcopy(fit.asset['calibration'])
+    other['param'][other['param_names'].index('dist')] += .05
+    other_saved = save_calibration_pair(replace(fit, asset={**fit.asset, 'calibration': other}),
+                                        tmp_path / 'calibration' / 'other.json', validation_angles=angles)
+    original = Path(saved.xu_path).read_bytes()
+    Path(saved.xu_path).write_bytes(Path(other_saved.xu_path).read_bytes())
+    with pytest.raises(ValueError, match='arm.xu.json is not the xrayutilities file saved with arm.json'):
+        paired_xu_calibration(saved.pyfai_path)
+    Path(saved.xu_path).write_bytes(original)
+    assert paired_xu_calibration(saved.pyfai_path) == Path(saved.xu_path)
     Path(saved.pyfai_path).write_text(Path(saved.pyfai_path).read_text() + '\n')  # other bytes: not its pair
     with pytest.raises(ValueError, match='arm.xu.json was not made from this arm.json'):
         paired_xu_calibration(saved.pyfai_path)
