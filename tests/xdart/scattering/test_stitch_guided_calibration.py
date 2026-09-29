@@ -537,13 +537,19 @@ def test_the_detector_and_its_orientation_are_choices_saved_with_the_settings(tm
         assert [detector.itemData(row) for row in range(3)] == ['Pilatus100k', 'Pilatus300kw', 'Eiger1M']
         assert dialog._text('beam_detector') == 'Pilatus300kw' and dialog._text('beam_orientation') == '3'
         # the image the beam pixel is read in: width (x, columns) × height (y, rows)
-        assert dialog._image_size.text().startswith('1475 × 195 px (x × y): x 0–1474, y 0–194')
-        assert dialog._row_visible('beam_size') and '737, 97' in dialog._fields['beam_pixel'].placeholderText()
+        assert dialog._image_size.text() == '1475 × 195 px (x × y): x 0–1474, y 0–194 · image rotation 0° (2 · Select frames)'
+        # the hint does not suggest the centre: the beam need not be there (the 17-2 nu scan's is at 279, 97)
+        assert dialog._row_visible('beam_size') and 'direct beam' in dialog._fields['beam_pixel'].placeholderText()
+        # the first-pixel corner is not a rotation: it never swaps x and y
+        assert [orientation.itemText(row).split(' · ')[1].startswith('first pixel') for row in range(4)] == [True] * 4
+        dialog._set_field_text('beam_orientation', '2')
+        assert dialog._image_size.text().startswith('1475 × 195 px')
+        dialog._set_field_text('beam_orientation', '3')
         dialog._set_field_text('beam_detector', 'Pilatus100k')
         assert dialog._text('shape') == '195, 487'  # the RAW reader follows the detector
         assert dialog._image_size.text().startswith('487 × 195 px')
         dialog.rotation.setCurrentIndex(dialog.rotation.findData(90))  # a turned image swaps x and y
-        assert dialog._image_size.text().startswith('195 × 487 px') and 'turned' in dialog._image_size.text()
+        assert dialog._image_size.text().startswith('195 × 487 px') and 'image rotation 90°' in dialog._image_size.text()
         dialog.rotation.setCurrentIndex(dialog.rotation.findData(0))
         dialog._set_field_text('beam_orientation', '2')
         for key, value in (('rough_distance', '400'), ('beam_pixel', '240, 97')):

@@ -725,24 +725,29 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                    tip='That motor\'s reading when the detector faces the beam squarely; 0 unless it is offset.')
         self._choice(form, 'beam_detector', 'Detector', [(label, name) for label, name in detector_choices()],
                      'Pilatus300kw', tip='The detector model (pyFAI); it sets the pixel size and shape.')
-        self._choice(form, 'beam_orientation', 'Detector orientation',
-                     [(f'{code} · {name}', code) for code, name in DETECTOR_ORIENTATIONS], 3,
+        corners = {3: 'bottom right (pyFAI default)', 1: 'top left', 2: 'top right', 4: 'bottom left'}
+        self._choice(form, 'beam_orientation', 'First pixel (pyFAI orientation)',
+                     [(f'{code} · first pixel {corners[code]}', code) for code, _name in DETECTOR_ORIENTATIONS], 3,
                      tip='pyFAI\'s detector orientation: the corner holding the image\'s first pixel, seen '
-                         'from behind the detector looking at the sample. Keep 3, pyFAI\'s default, unless '
-                         'pyFAI shows this detector\'s images mirrored. It changes how the PONIs are written, '
-                         'not the geometry: the arm\'s motor scales take its signs. It is saved with every '
-                         'PONI and fit. (The image rotation under Select frames is separate: it turns the '
-                         'image arrays.)')
+                         'from behind the detector looking at the sample. It is not a rotation: it never turns '
+                         'the image or swaps x and y (the image rotation under 2 · Select frames does). It '
+                         'changes how the PONIs are written, not the geometry: the arm\'s motor scales take '
+                         'its signs. Keep 3, pyFAI\'s default, unless pyFAI shows this detector\'s images '
+                         'mirrored. It is saved with every PONI and fit.')
         self._image_size = QtWidgets.QLabel()
         form.addRow('Image size', self._image_size)
         self._rows['beam_size'] = (form, self._image_size)
         self._tip('The detector image\'s width (x, columns) and height (y, rows) in pixels, as the beam '
                   'pixel below is read: the detector\'s own layout, turned by the image rotation under '
-                  'Select frames. The orientation above does not change it.',
+                  '2 · Select frames (90° and 270° swap x and y). The first-pixel corner above does not '
+                  'change it.',
                   self._image_size, form.labelForField(self._image_size))
         self._edit(form, 'beam_pixel', 'Approximate beam pixel x, y (oriented image)', '',
                    tip='Column, row of the pixel the direct beam hits with the detector facing it squarely (the '
-                       'motor at the zero above), in the image as displayed. Rough is fine.')
+                       'motor at the zero above), in the image as displayed: read it off the scan\'s frame at '
+                       'that angle; it is not necessarily the centre. Along the beam\'s motion it can be '
+                       'rough. Across it (the row for horizontal motion, the column for vertical) it must be '
+                       'within the strip half width, because the spot is searched only in that strip.')
         self.motion = self._combo(form, 'Beam motion', [('horizontal', None), ('vertical', None)],
                                   tip='The direction the beam spot moves across the image as the motor turns.')
         self._edit(form, 'beam_strip', 'Strip half width (pixels)', '2',
@@ -800,11 +805,11 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             self._fields['beam_pixel'].setPlaceholderText('column, row')
             return
         rows, columns = shape
-        turned = hasattr(self, 'rotation') and self.rotation.currentData() in (90, 270)
-        width, height = (rows, columns) if turned else (columns, rows)
-        self._image_size.setText(f'{width} × {height} px (x × y): x 0–{width - 1}, y 0–{height - 1}'
-                                 + (', turned by the image rotation' if turned else ''))
-        self._fields['beam_pixel'].setPlaceholderText(f'column, row — the centre is {width // 2}, {height // 2}')
+        rotation = int(self.rotation.currentData() or 0) if hasattr(self, 'rotation') else 0
+        width, height = (rows, columns) if rotation in (90, 270) else (columns, rows)
+        self._image_size.setText(f'{width} × {height} px (x × y): x 0–{width - 1}, y 0–{height - 1} · '
+                                 f'image rotation {rotation}° (2 · Select frames)')
+        self._fields['beam_pixel'].setPlaceholderText('column, row where the direct beam hits at the zero')
 
     def _detector_chosen(self, *_args):
         """The chosen detector's shape becomes the RAW reader's rows and columns (Select frames)."""
