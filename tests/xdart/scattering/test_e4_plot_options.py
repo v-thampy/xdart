@@ -566,12 +566,19 @@ def test_left_drag_zooms_the_1d_plot_into_a_box_and_shift_drag_pans(qapp):
         view.curve.getPlotItem().plot(x, x ** 2)
         viewport = view.curve.viewport()
 
-        def at(fx, fy):  # a point of the plot area, in the widget's viewport pixels
-            corner = box.boundingRect()
+        def at(fx, fy, item=box):
+            """A point in viewport pixels: fractions of the plot area, or with ``item=None`` a scene
+            coordinate on the axis whose fraction is not given (fx or fy > 1 is a scene position)."""
+            area = box.sceneBoundingRect()
+            if item is None:
+                sx = fx if fx > 1 else area.left() + fx * area.width()
+                sy = fy if fy > 1 else area.top() + fy * area.height()
+                return view.curve.mapFromScene(QtCore.QPointF(sx, sy))
+            corner = item.boundingRect()
             local = QtCore.QPointF(corner.left() + fx * corner.width(), corner.top() + fy * corner.height())
-            return view.curve.mapFromScene(box.mapToScene(local))
+            return view.curve.mapFromScene(item.mapToScene(local))
 
-        def drag(start, end, modifiers=QtCore.Qt.KeyboardModifier.NoModifier):
+        def drag(start, end, modifiers=QtCore.Qt.KeyboardModifier.NoModifier, item=box, both=False):
             """A real left-button press, ten moves and a release; the x range after it."""
             box.setRange(xRange=(0., 10.), yRange=(0., 100.), padding=0)
             qapp.processEvents()
@@ -581,19 +588,30 @@ def test_left_drag_zooms_the_1d_plot_into_a_box_and_shift_drag_pans(qapp):
                     kind, QtCore.QPointF(point), QtCore.QPointF(viewport.mapToGlobal(point)),
                     button, buttons, modifiers))
             left, none = QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.MouseButton.NoButton
-            start, end = at(*start), at(*end)
+            start, end = at(*start, item=item), at(*end, item=item)
             send(QtCore.QEvent.Type.MouseButtonPress, start, left, left)
             for step in range(1, 11):
                 send(QtCore.QEvent.Type.MouseMove, start + (end - start) * (step / 10), none, left)
                 qapp.processEvents()
             send(QtCore.QEvent.Type.MouseButtonRelease, end, left, none)
             qapp.processEvents()
-            return box.viewRange()[0]
+            return box.viewRange() if both else box.viewRange()[0]
 
         a, b = drag((.3, .3), (.6, .7))
         assert 0. < a < b < 10. and (b - a) < 5., (a, b)  # zoomed to the box
         a, b = drag((.6, .5), (.3, .5), QtCore.Qt.KeyboardModifier.ShiftModifier)
         assert (b - a) == pytest.approx(10., rel=1e-6) and a > 1., (a, b)  # panned right by ~3
+        # a drag on an axis's tick labels pans that axis only, as the plain view did (Codex R20-F1);
+        # the axes draw the grid across the plot, so their labels are the strip outside the plot area
+        plot = view.curve.getPlotItem()
+        area = box.sceneBoundingRect()
+        bottom, left = plot.getAxis("bottom").sceneBoundingRect(), plot.getAxis("left").sceneBoundingRect()
+        labels_y, labels_x = (area.bottom() + bottom.bottom()) / 2, (left.left() + area.left()) / 2
+        assert labels_y > area.bottom() and labels_x < area.left()
+        (a, b), y = drag((.3, labels_y), (.6, labels_y), item=None, both=True)
+        assert (b - a) == pytest.approx(10., rel=1e-6) and a < -1. and y == pytest.approx([0., 100.]), (a, b, y)
+        x, (c, d) = drag((labels_x, .3), (labels_x, .6), item=None, both=True)
+        assert (d - c) == pytest.approx(100., rel=1e-6) and c > 10. and x == pytest.approx([0., 10.]), (x, c, d)
     finally:
         view.close()
         view.deleteLater()

@@ -94,7 +94,9 @@ class RectViewBox(pg.ViewBox):
         
         elif (ev.button() == QtCore.Qt.LeftButton
               and not ev.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier):
-            pg.ViewBox.mouseDragEvent(self, ev)
+            # the axis a drag on an AxisItem names: pyqtgraph pans along it, and draws the zoom
+            # box only for a drag in the plot area (axis None) (Codex R20-F1)
+            pg.ViewBox.mouseDragEvent(self, ev, axis=axis)
         
         else:  # Shift+left or middle: pan
             tr = dif*mask
