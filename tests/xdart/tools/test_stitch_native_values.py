@@ -326,7 +326,8 @@ def test_native_preview_never_decodes_and_partial_images_refuse(tmp_path, monkey
     monkeypatch.setattr(image_api, "read_image", forbidden)
     assert len(prepare_stitch_tool(form).requests) == 3
     next(Path(form.image_dir).glob("*scan2_*")).unlink()
-    with pytest.raises(ValueError, match="image count"):
+    with pytest.raises(ValueError, match=r"scan 2\.1: 2 metadata points but 1 image frames in 1 files matching "
+                                         r"\*sample_scan2_\*"):
         prepare_stitch_tool(form)
 
 
