@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import json
+import re
 from pathlib import Path
 import time
 
@@ -356,8 +357,14 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
         _wait(page, qapp)
         assert page.run_bar.startButton.isEnabled(), page.run_bar.readinessLabel.full_text()
         target = Path(page._owner.prepared.request.module.output.target)
+        shown, summary = [], page.run_bar.set_readiness_summary
+        page.run_bar.set_readiness_summary = lambda text, **k: (shown.append(str(text)), summary(text, **k))[1]
         page.run_bar.startButton.click()
         _wait(page, qapp)
+        page.run_bar.set_readiness_summary = summary
+        # the run bar says what it is doing, frames while stitching; never the raw stage names
+        assert any(text.startswith("Stitching · frame ") for text in shown), shown
+        assert not any("science" in text or re.fullmatch(r"[a-z]+ · \d+/\d+", text) for text in shown), shown
         assert page._prepared_revision is None  # a run uses its plan once: the next Run checks again
         payload = read_analysis_artifact(target, expected_kind=AnalysisArtifactKind.STITCH_1D)
         for name in ("intensity", "coverage", "normalization"):

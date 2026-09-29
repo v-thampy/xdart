@@ -158,6 +158,19 @@ def saved_frame_screen_note(records):
     return " · ".join(parts)
 
 
+#: What a Stitch run is doing, by the operation's stage names.
+_STAGE_TEXT = {"calibration": "Checking the calibration", "geometry": "Checking the geometry",
+               "science": "Stitching", "projection": "Building the result", "publish": "Saving",
+               "reload": "Checking the saved result"}
+
+
+def _progress_text(stage, completed, total):
+    """A run's progress in words. The operation counts steps, its frames plus four (the geometry,
+    closing the stitch, saving, the check), and its "science" stage reports 1 + the frames done."""
+    if stage == "science" and total > 4:
+        return f"Stitching · frame {max(0, min(completed - 1, total - 4))} of {total - 4}"
+    return f"{_STAGE_TEXT.get(stage, stage)}…"
+
 class StitchPage(QtWidgets.QWidget):
     """One retained page; one worker owns preview, science and strict reopen."""
 
@@ -395,6 +408,12 @@ class StitchPage(QtWidgets.QWidget):
                     choices=("Spec", "NeXus", "Directory"))
         self._field(source, SectionId.SOURCE, "spec_path", "SPEC files", browse=True)
         self._field(source, SectionId.SOURCE, "image_dir", "Images", browse=True)
+        # on the card, not in Advanced: a stem left from another dataset matches the wrong images
+        self._field(source, SectionId.SOURCE, "image_stem", "Image stem")
+        self._rows["image_stem"].setToolTip(
+            "The part of the image file names that identifies the scan; any prefix before it is "
+            "fine (b_thampy_R1C2_scan3_0000.raw has R1C2_scan3_). Blank: <SPEC name>_scan<N>_ for "
+            "each scan. {spec} and {scan} fill in the SPEC name and scan number.")
         self._field(source, SectionId.SOURCE, "scan_mode", "Scans", "Select Scans",
                     choices=("Stitch All", "Select Scans"))
         self._field(source, SectionId.SOURCE, "scan", "Selection", "1")
@@ -428,7 +447,6 @@ class StitchPage(QtWidgets.QWidget):
         advanced_card = SubsectionCard("Source and geometry")
         advanced_layout.addWidget(advanced_card)
         fields = (
-            ("image_stem", "Image stem", ""),
             ("detector_rows", "Rows", "195"), ("detector_cols", "Columns", "1475"),
             ("raw_dtype", "Data type", "int32"), ("raw_header_skip", "Header bytes", "0"),
             ("source_motors", "Angle mapping", "del_angle=del, nu_angle=nu"),
@@ -620,7 +638,7 @@ class StitchPage(QtWidgets.QWidget):
 
     def _source_changed(self, *_args):
         kind = self._value("source_kind")
-        for key in ("image_dir", "scan_mode", "scan"):
+        for key in ("image_dir", "image_stem", "scan_mode", "scan"):
             self._rows[key].setVisible(kind != "NeXus" and (key == "image_dir" or kind == "Spec"))
         self._rows["scan"].setVisible(kind == "Spec" and self._value("scan_mode") == "Select Scans")
         self._rows["spec_path"].label.setText({"Spec": "SPEC files", "NeXus": "NeXus files", "Directory": "Folder"}[kind])
@@ -1171,7 +1189,7 @@ class StitchPage(QtWidgets.QWidget):
         if update is not None:
             if update.progress is not None:
                 p = update.progress
-                self._status(f"{p.stage} · {p.completed}/{p.total}")
+                self._status(_progress_text(p.stage, p.completed, p.total))
             elif update.terminal_status is OperationTerminalStatus.FAILED:
                 self._queued_jobs.clear()
                 self._after_prepare = None

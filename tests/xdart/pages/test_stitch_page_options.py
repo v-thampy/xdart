@@ -491,6 +491,15 @@ def test_inputs_view_follows_int(qapp, tmp_path):
         page.set_field("scan", "14.1")
         assert page._rows["image_dir"].editor.placeholderText() == f"auto · {spec.parent}"
         assert page._rows["image_stem"].editor.placeholderText() == "auto · LaB6_17keV_scan14_"
+        # the stem is on the Source card, blank = auto as in the calibration window (a stem left in
+        # Advanced from another dataset matched the wrong images, live); only SPEC sources use it
+        stem = page._rows["image_stem"]
+        assert page.controls.source_card.isAncestorOf(stem) and stem.window() is not page.advanced
+        assert stem.current_value() == "" and not stem.isHidden()
+        for kind, shown in (("NeXus", False), ("Directory", False), ("Spec", True)):
+            page.set_field("source_kind", kind)
+            assert stem.isHidden() is not shown, kind
+        page.set_sources([str(spec)])
         names = page._rows["output_family"]  # an optional override under Advanced
         assert names.window() is page.advanced
         assert names.editor.placeholderText() == "auto · data-LaB6_17keV-14"
@@ -504,6 +513,21 @@ def test_inputs_view_follows_int(qapp, tmp_path):
         assert page.run_bar.startButton.isEnabled()
     finally:
         _close(page, qapp)
+
+
+def test_run_progress_reads_as_words_and_frames():
+    """The run bar showed the operation's step count under its stage name ("science · 317/319"
+    for 315 frames, live); it now says what is happening, with frames while stitching."""
+    from xdart.gui.tabs.stitch.page import _progress_text
+    frames = 315
+    total = frames + 4  # the operation's steps: its frames plus the geometry, close, save and check
+    assert _progress_text("geometry", 0, total) == "Checking the geometry…"
+    assert _progress_text("science", 1, total) == "Stitching · frame 0 of 315"
+    assert _progress_text("science", 1 + 200, total) == "Stitching · frame 200 of 315"
+    assert _progress_text("science", 317, total) == "Stitching · frame 315 of 315"  # its close step
+    assert [_progress_text(stage, 0, total) for stage in ("projection", "publish", "reload")] == [
+        "Building the result…", "Saving…", "Checking the saved result…"]
+    assert _progress_text("something new", 3, 9) == "something new…"
 
 
 def test_the_stitch_display_is_ints_scientific_view(qapp):
