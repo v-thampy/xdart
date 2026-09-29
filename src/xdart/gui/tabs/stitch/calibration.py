@@ -945,7 +945,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             distance = self._distance_result.distance_m
         else:
             return None
-        zero = dict(zip(('del', 'nu'), self._frame_motors)).get(self._beam_role()) or self._text('beam_motor')
+        # the Geometry shown owns tab 1's arm, not the arm frames were staged with (Codex review F4)
+        delta, nu = self.geometry_editor.value().stitch_arm()
+        zero = dict(zip(('del', 'nu'), (delta, nu))).get(self._beam_role()) or self._text('beam_motor')
         # blank with a measured scan: the pixel the fit found
         # a fitted scan says where the beam hits at the zero (the fit's intercept along the motion);
         # a typed or found pixel only placed its strips (Codex review F1)
@@ -962,7 +964,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             distance_m=distance, detector=self._text('beam_detector'),
             beam_px=beam,
             zero_deg=float(self._text('beam_zero') or 0), zero_motor=zero,
-            del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1],
+            del_motor=delta, nu_motor=nu,
             orientation=int(self._text('beam_orientation')), mount_deg=mount,
             wavelength_m=wavelength * 1e-10 if wavelength is not None else 1e-10)
 
@@ -1344,7 +1346,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             raise ValueError('measure or type the distance and the beam pixel first (1 · Geometry)')
         if self._rough_wavelength_A() is None:
             raise ValueError('type the wavelength to save this geometry as a calibration')
-        delta, nu = self._frame_motors
+        delta, nu = self.geometry_editor.value().stitch_arm()  # as _rough_arm
         direct = (self._distance_record(self._distance_result)
                   if self.rough_mode.currentData() == 'scan' and self._distance_result is not None else None)
         provenance = {

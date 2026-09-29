@@ -590,3 +590,26 @@ def test_automatic_refinement_can_start_from_the_direct_beam_geometry(qapp, tmp_
     finally:
         dialog.close()
         page.shutdown()
+
+
+@pytest.mark.parametrize('plane,position', [('vertical', 'del_angle'), ('horizontal', 'nu_angle')])
+def test_the_quick_save_builds_the_arm_the_geometry_shows(qapp, tmp_path, plane, position):
+    """Codex review F4: a fresh window, no frame staged, a single 2θ arm with its motor renamed: the
+    direct-beam calibration is that arm, not the default del-on-nu one."""
+    from xrd_tools.core.geometry.stacked_arm import is_single_arm
+    from xrd_tools.session.instrument import InstrumentGeometry, calibration_arm
+    dialog = StitchCalibrationDialog(tmp_path)
+    try:
+        geometry = InstrumentGeometry('twoc', (('tth', 'two_theta'),), plane)
+        dialog.set_instrument(geometry)
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        for key, value in (('rough_distance', '150'), ('beam_pixel', '700, 100'), ('rough_wavelength', '0.7293')):
+            dialog._fields[key].setText(value)
+        fit = dialog._rough_fit()
+        assert fit.asset['provenance']['source_motors'] == {position: 'two_theta'}
+        record = fit.asset['calibration']
+        assert is_single_arm(record)
+        assert not geometry.arm_mismatch(*calibration_arm(record, ((position, 'two_theta'),)))
+        assert fit.asset['provenance']['instrument_geometry'] == geometry.to_record()
+    finally:
+        dialog.close()
