@@ -61,7 +61,7 @@ def test_each_camera_is_one_image_transform_into_pyfais_frame(camera):
     assert DetectorCamera.from_image_orientation(camera.image_orientation()) == camera
 
 
-def test_pyfais_detector_orientation_moves_only_the_poni_origin():
+def test_untilted_pyfais_detector_orientation_moves_only_the_poni_origin():
     camera = DetectorCamera('x-', 'z+')
     reference = _pyfai_maps(camera.image_orientation())
     for code in (1, 2, 4):
@@ -78,6 +78,27 @@ def test_the_cameras_in_use_and_equivalent_transforms():
     assert DetectorCamera.from_image_orientation(both_flips) == DetectorCamera('x-', 'z+')
     assert DetectorCamera.from_image_orientation(ImageOrientation(transpose=True)) == DetectorCamera('z-', 'x+')
     assert DetectorCamera.from_image_orientation(ImageOrientation()) == DetectorCamera('x+', 'z-')
+
+
+def test_tilted_another_pyfai_orientation_is_another_geometry():
+    """Codex R18-F1: pyFAI reflects the pixel coordinates before rotating and the transverse output
+    after (F·R·F), so with the detector tilted another orientation changes 2θ and χ, even with the
+    true direct beam on the same pixel. The untilted equivalence above does not extend to arm poses."""
+    from pyFAI.detectors import Detector
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+    maps = {}
+    for code in (3, 2):
+        detector = Detector(pixel1=PITCH_MM * 1e-3, pixel2=PITCH_MM * 1e-3, max_shape=SHAPE, orientation=code)
+        poni1, poni2, _ = detector.calc_cartesian_positions(d1=np.array([BEAM[0]]), d2=np.array([BEAM[1]]))
+        ai = AzimuthalIntegrator(dist=DIST_MM * 1e-3, poni1=float(poni1[0]), poni2=float(poni2[0]), rot1=.13,
+                                 rot2=-.09, rot3=.21, detector=detector, wavelength=WAVELENGTH_A * 1e-10)
+        rotation = ai.rotation_matrix()  # move the PONI so the true direct beam hits the beam pixel
+        ai.poni1 -= ai.dist * rotation[2, 0] / rotation[2, 2]
+        ai.poni2 -= ai.dist * rotation[2, 1] / rotation[2, 2]
+        assert float(ai.tth(np.array([BEAM[0]]), np.array([BEAM[1]]))[0]) == pytest.approx(0, abs=1e-12)
+        maps[code] = [ai.center_array(SHAPE, unit=unit, scale=False) for unit in ('2th_rad', 'chi_rad')]
+    two_theta, chi = _differences(maps[3], maps[2])
+    assert two_theta > 1e-5 and chi > np.radians(1)
 
 
 @pytest.mark.parametrize('pair', [('x+', 'x-'), ('z-', 'z+'), ('y+', 'z-'), ('x+', 'up')])

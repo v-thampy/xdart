@@ -10,8 +10,11 @@ the detector is mounted another way; only the camera changes.
 pyFAI's frame (its ``Geometry`` docstring: dim1 up, dim2 horizontal, dim3 along the beam) is
 t1 = x, t2 = -z, so the camera ``('x+', 'z-')`` is its own. Each camera has one image transform
 bringing the raw array into that frame, found and pinned against xrayutilities and pyFAI on both
-2θ and χ at every pixel (tests/core/test_detector_camera.py). pyFAI's detector orientation (1–4)
-does not enter: with the beam pixel fixed it moves only the PONI's origin, not 2θ or χ.
+2θ and χ at every pixel (tests/core/test_detector_camera.py), for pyFAI orientation 3. pyFAI's
+detector orientation (1–4) is not an image transform: with the detector untilted and the beam
+pixel fixed it moves only the PONI's origin, but once the detector is tilted (rot1/rot2/rot3, as
+every arm pose is) it changes 2θ and χ — pyFAI reflects the pixel coordinates before rotating and
+the transverse output after, so the effective rotation is F·R·F (Codex R18-F1, pinned by a test).
 
 The legacy ``DiffractometerConfig.init_area_detrot`` / ``init_area_tiltazimuth`` fields hold these
 two directions (not xrayutilities' detrot / tiltazimuth angles); the names stay for saved
