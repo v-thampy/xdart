@@ -3539,6 +3539,7 @@ def read_contributing_frame_view(
         _stat_revision, _opened_hdf_revision,
     )
     from xrd_tools.io.nexus_record import frame_record_key
+    from xrd_tools.io.stitch_record import STITCH_GROUP
     from xrd_tools.io.read import (
         _raw_frame_parts_from_entry, _frame_group_for_label,
         _frame_source_read_options, _raw_frame_or_thumbnail, resolve_source_master,
@@ -3572,10 +3573,12 @@ def read_contributing_frame_view(
         if _opened_hdf_revision(handle) != inspection.storage_revision:
             raise AnalysisArtifactInvalid("artifact changed before frame hydration")
         entry = handle["entry"]
+        # a stitched record keeps its contributors (and their source base) under entry/stitch
+        container = entry[STITCH_GROUP] if STITCH_GROUP in entry else entry
         master, index, thumbnail = _raw_frame_parts_from_entry(
-            path, entry, frame, scan=scan, source_root=source_root,
+            path, container, frame, scan=scan, source_root=source_root,
         )
-        group = _frame_group_for_label(entry, frame, scan=scan)
+        group = _frame_group_for_label(container, frame, scan=scan)
         options = _frame_source_read_options(group)
     raw = None
     raw_reason = ""

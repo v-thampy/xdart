@@ -79,6 +79,7 @@ from xrd_tools.io.analysis_artifact import (
     read_analysis_artifact,
 )
 from xrd_tools.io.nexus import write_stitched
+from xrd_tools.io.stitch_record import write_stitch_projection
 from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.integrate.frame_screen import FrameScreen, FrameScreenPolicy
 from xrd_tools.integrate.multi import StitchDiagnostics
@@ -2566,6 +2567,19 @@ def _native_artifact_args(request, records):
             "frame_records": records, "source_base": request.manifest.project_root}
 
 
+def _gi_cut(plan, cut, diagnostics):
+    """A GI Stitch 1D's cut as the projection takes it (None without GI)."""
+    if plan.gi is None:
+        return None
+    return (plan.gi.cut, cut.unit, cut.radial, cut.intensity, diagnostics.coverage, diagnostics.normalization)
+
+
+def _write_record(entry, target, projection, native_args) -> None:
+    """A Stitch 1D result as an Int record (``stitch_record``), from its exact projection."""
+    write_stitch_projection(entry, target, projection, frame_records=native_args.get("frame_records"),
+                            source_base=native_args.get("source_base"))
+
+
 class StitchOperationExecution:
     """One-shot execution owner retained across retryable artifact cleanup."""
 
@@ -2848,6 +2862,8 @@ class StitchOperationExecution:
                 coverage=diagnostics.coverage,
                 normalization=diagnostics.normalization,
                 **_native_artifact_args(self.request, records),
+                gi_cut=(None if scientific.gi_payload is None
+                        else _gi_cut(plan, scientific.gi_payload, scientific.gi_diagnostics)),
             )
         except AnalysisArtifactProjectionInvalid:
             return self._terminal(
@@ -2936,13 +2952,8 @@ class StitchOperationExecution:
 
         def writer(entry) -> None:
             revalidate_xu_stitch_calibration(plan.calibration)
-            write_stitched(
-                entry,
-                result_projection=result_projection,
-                provenance=bound.provenance_json,
-                bounded_artifact=True,
-                **_native_artifact_args(self.request, records),
-            )
+            _write_record(entry, self.request.module.output.target, result_projection,
+                          _native_artifact_args(self.request, records))
             revalidate_xu_stitch_calibration(plan.calibration)
 
         try:
@@ -3096,6 +3107,8 @@ class StitchOperationExecution:
                 coverage=diagnostics.coverage,
                 normalization=diagnostics.normalization,
                 **_native_artifact_args(self.request, records),
+                gi_cut=(None if scientific.gi_cut is None
+                        else _gi_cut(self.request.plan, *scientific.gi_cut)),
             )
         except AnalysisArtifactProjectionInvalid:
             return self._terminal(
@@ -3130,14 +3143,18 @@ class StitchOperationExecution:
 
         def writer(entry) -> None:
             _revalidate_geometry(self.request.plan.geometry)
-            write_stitched(
-                entry,
-                result_projection=result_projection,
-                legacy_v1_unit_layout=False,
-                provenance=bound.provenance_json,
-                bounded_artifact=True,
-                **_native_artifact_args(self.request, records),
-            )
+            if self.request.plan.mode == "1d":
+                _write_record(entry, self.request.module.output.target, result_projection,
+                              _native_artifact_args(self.request, records))
+            else:
+                write_stitched(
+                    entry,
+                    result_projection=result_projection,
+                    legacy_v1_unit_layout=False,
+                    provenance=bound.provenance_json,
+                    bounded_artifact=True,
+                    **_native_artifact_args(self.request, records),
+                )
             _revalidate_geometry(self.request.plan.geometry)
 
         def prepublish_check() -> None:

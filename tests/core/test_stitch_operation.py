@@ -666,7 +666,7 @@ def test_xu_transient_reload_retry_never_replays_science_or_writer(
 ):
     request = _xu_prepared(tmp_path)
     real_read = stitch_operation.read_analysis_artifact
-    real_write = stitch_operation.write_stitched
+    real_write = stitch_operation.write_stitch_projection
     real_science = stitch_operation.run_xu_hist_stitch_1d
     reads = []
     writes = []
@@ -680,7 +680,6 @@ def test_xu_transient_reload_retry_never_replays_science_or_writer(
 
     def write_once(*args, **kwargs):
         writes.append("write")
-        assert kwargs.get("legacy_v1_unit_layout", False) is False
         return real_write(*args, **kwargs)
 
     def science_once(*args, **kwargs):
@@ -688,7 +687,7 @@ def test_xu_transient_reload_retry_never_replays_science_or_writer(
         return real_science(*args, **kwargs)
 
     monkeypatch.setattr(stitch_operation, "read_analysis_artifact", fail_read_once)
-    monkeypatch.setattr(stitch_operation, "write_stitched", write_once)
+    monkeypatch.setattr(stitch_operation, "write_stitch_projection", write_once)
     monkeypatch.setattr(
         stitch_operation,
         "run_xu_hist_stitch_1d",
@@ -1181,7 +1180,7 @@ def test_transient_strict_reload_retry_does_not_replay_science_or_writer(
 ):
     request = _prepared(tmp_path)
     real_read = stitch_operation.read_analysis_artifact
-    real_write = stitch_operation.write_stitched
+    real_write = stitch_operation.write_stitch_projection
     real_science = stitch_operation.run_stitch
     reads = []
     writes = []
@@ -1195,7 +1194,6 @@ def test_transient_strict_reload_retry_does_not_replay_science_or_writer(
 
     def write_once(*args, **kwargs):
         writes.append("write")
-        assert kwargs["legacy_v1_unit_layout"] is False
         return real_write(*args, **kwargs)
 
     def science_once(*args, **kwargs):
@@ -1203,7 +1201,7 @@ def test_transient_strict_reload_retry_does_not_replay_science_or_writer(
         return real_science(*args, **kwargs)
 
     monkeypatch.setattr(stitch_operation, "read_analysis_artifact", fail_read_once)
-    monkeypatch.setattr(stitch_operation, "write_stitched", write_once)
+    monkeypatch.setattr(stitch_operation, "write_stitch_projection", write_once)
     monkeypatch.setattr(stitch_operation, "run_stitch", science_once)
     with pytest.raises(StitchOperationVerificationError) as failed:
         run_stitch_operation(request)
@@ -1254,7 +1252,7 @@ def test_published_inspection_retry_does_not_replay_science_or_writer(
     coordinator = OutputTransactionCoordinator()
     from xrd_tools.io import analysis_artifact as artifact_api
     real_inspect = artifact_api.inspect_analysis_artifact
-    real_write = stitch_operation.write_stitched
+    real_write = stitch_operation.write_stitch_projection
     real_science = stitch_operation.run_stitch
     failures = []
     writes = []
@@ -1275,7 +1273,7 @@ def test_published_inspection_retry_does_not_replay_science_or_writer(
         return real_science(*args, **kwargs)
 
     monkeypatch.setattr(artifact_api, "inspect_analysis_artifact", fail_published_inspection_once)
-    monkeypatch.setattr(stitch_operation, "write_stitched", write_once)
+    monkeypatch.setattr(stitch_operation, "write_stitch_projection", write_once)
     monkeypatch.setattr(stitch_operation, "run_stitch", science_once)
     with pytest.raises(StitchOperationCleanupPending) as pending:
         run_stitch_operation(request, coordinator=coordinator)

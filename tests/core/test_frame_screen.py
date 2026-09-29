@@ -225,10 +225,10 @@ def test_a_tampered_frame_verdict_refuses_an_attested_xu_result(tmp_path):
     rows = read_analysis_artifact(target).contributing_frames
     assert all(row['screen'] in {'ok', 'unscreened'} and row['excluded'] is False for row in rows)
     with h5py.File(target, 'r+') as handle:
-        manifest = json.loads(bytes(handle['entry/contributing_frames_json'][()]))
+        manifest = json.loads(bytes(handle['entry/stitch/contributing_frames_json'][()]))
         manifest['records'][0]['screen'] = 'partial'
-        del handle['entry/contributing_frames_json']
-        handle['entry'].create_dataset('contributing_frames_json',
+        del handle['entry/stitch/contributing_frames_json']
+        handle['entry/stitch'].create_dataset('contributing_frames_json',
                                        data=np.bytes_(canonical_frame_manifest(manifest).encode()))
     with pytest.raises(AnalysisArtifactInvalid, match='attestation result changed'):
         read_analysis_artifact(target)

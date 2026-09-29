@@ -787,7 +787,7 @@ CAPABILITIES = MappingProxyType({
     "stitch": CapabilityAttr(
         "stitch", "", "group",
         "a stitched record's coverage and normalization (a GI cut's under stitch/<cut>/), its "
-        "contributing frames (stitch/frames, stitch/frames_json) and the Stitch output envelope"),
+        "contributing frames (stitch/frames, stitch/contributing_frames_json) and the Stitch output envelope"),
     "rsm": CapabilityAttr(
         "rsm", "", "group",
         "gridded reciprocal-space-map volume (h/k/l NXdata) + provenance_json "

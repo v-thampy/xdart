@@ -99,3 +99,24 @@ def test_a_gi_stitch_writes_its_cut_as_the_rows_extra_mode(tmp_path, cut, unit):
 def test_a_stitched_record_takes_only_the_q_ip_and_q_oop_cuts(tmp_path):
     with pytest.raises(ValueError, match="q_ip"):
         _write(tmp_path, _pattern(10, "q_A^-1", seed=4), gi=("exit_angle", _pattern(10, "exit_angle_deg", seed=5)))
+
+
+def test_the_gi_cut_folds_into_the_result_fingerprint_only_when_present():
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, project_analysis_artifact_result
+
+    pattern, cut = _pattern(20, "q_A^-1", seed=6), _pattern(12, "qip_A^-1", seed=7)
+
+    def fingerprint(gi_cut=None, **plain):
+        return project_analysis_artifact_result(
+            kind=AnalysisArtifactKind.STITCH_1D, axes=(("q", pattern.axis),), axis_units=(("q", pattern.unit),),
+            intensity=pattern.intensity, sigma=None, coverage=pattern.coverage,
+            normalization=pattern.normalization, **({} if gi_cut is None else {"gi_cut": gi_cut}), **plain,
+        ).result_fingerprint
+
+    changed = cut.intensity.copy()
+    changed[np.flatnonzero(np.isfinite(changed))[0]] += 1.
+    cuts = [("q_ip", cut.unit, cut.axis, cut.intensity, cut.coverage, cut.normalization),
+            ("q_ip", cut.unit, cut.axis, changed, cut.coverage, cut.normalization),
+            ("q_oop", cut.unit, cut.axis, cut.intensity, cut.coverage, cut.normalization)]
+    assert len({fingerprint(), *(fingerprint(value) for value in cuts)}) == 4
+    assert fingerprint() == fingerprint(gi_cut=None)  # no cut: the plain result's own fingerprint

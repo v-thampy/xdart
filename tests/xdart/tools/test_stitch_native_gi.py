@@ -70,3 +70,53 @@ def test_stitch_picks_its_incidence_motor_as_int_does_with_eta_first():
     assert pick_default_gi_motor(["halpha", "del"], STITCH_GI_MOTOR_PREFERENCE) == "halpha"
     assert pick_default_gi_motor(["del", "nu"], STITCH_GI_MOTOR_PREFERENCE) == "Manual"
     assert pick_default_gi_motor(["th", "eta"]) == "th"  # Int's own order is unchanged
+
+
+@pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
+def test_a_gi_stitch_publishes_i_of_q_and_its_cut_as_one_int_record(tmp_path, backend, monkeypatch):
+    """The committed file is an Int record (maintainer, 2026-09-29): Int's reader reads I(q) and the cut
+    as the exact float32 cast of what the kernel computed; the cut's coverage, normalization and the
+    contributing frames are in entry/stitch."""
+    import json
+
+    import numpy as np
+
+    from xrd_tools.analysis import stitch_operation
+    from xrd_tools.analysis.module_transaction import ModuleDisposition
+    from xrd_tools.io.frame_view import read_frame_view
+    from xrd_tools.io.processed_scan_id import is_current_processed_xdart_path
+    from xrd_tools.io.stitch_record import read_stitch_record
+
+    request = prepare_stitch_tool(_gi_form(tmp_path, backend, StitchGI(
+        "q_ip", incidence_motor="eta", sample_motors=_SAMPLE))).request
+    kernel = "run_stitch" if backend == "multigeometry" else "run_xu_hist_stitch_1d"
+    real, science = getattr(stitch_operation, kernel), []
+
+    def spy(*args, **kwargs):
+        science.append(real(*args, **kwargs))
+        return science[-1]
+
+    monkeypatch.setattr(stitch_operation, kernel, spy)
+    result = stitch_operation.run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    target = request.module.output.target
+    assert is_current_processed_xdart_path(target)
+    if backend == "multigeometry":
+        iq, (cut, diagnostics) = science[0].payload, science[0].gi_cut
+    else:
+        iq, cut, diagnostics = science[0].payload, science[0].gi_payload, science[0].gi_diagnostics
+
+    def cast(values):
+        return np.asarray(values, dtype="<f4").astype(float)
+
+    np.testing.assert_array_equal(read_frame_view(target, 1, mode_1d="q_total").intensity_1d, cast(iq.intensity))
+    view = read_frame_view(target, 1, mode_1d="q_ip")
+    assert view.axis_1d.unit == "qip_A^-1"
+    np.testing.assert_array_equal(view.axis_1d.values, cast(cut.radial))
+    np.testing.assert_array_equal(view.intensity_1d, cast(cut.intensity))
+    stored = read_stitch_record(target)
+    assert stored.gi[0] == "q_ip" and stored.gi[1].coverage.sum() > 0
+    np.testing.assert_array_equal(stored.gi[1].coverage, cast(diagnostics.coverage))
+    np.testing.assert_array_equal(stored.gi[1].normalization, cast(diagnostics.normalization))
+    assert len(json.loads(stored.frames_json)["records"]) == len(request.module.source.selected_labels)
+    assert result.payload.inspection.result_fingerprint == result.terminal.commit.result_fingerprint

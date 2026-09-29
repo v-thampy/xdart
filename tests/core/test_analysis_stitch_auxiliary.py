@@ -20,7 +20,7 @@ from xrd_tools.io.analysis_stitch_auxiliary import (
     analysis_contributing_frame_binding, analysis_contributing_frame_members, canonical_frame_manifest,
 )
 from xrd_tools.io.frame_view import read_contributing_frame_view
-from xrd_tools.io.nexus import write_stitched
+from xrd_tools.io.stitch_record import write_stitch_projection
 from xrd_tools.io.output_transaction import OutputTransactionCoordinator
 from tests.core.test_analysis_artifact import _execution_attestation
 
@@ -61,8 +61,7 @@ def _publish(tmp_path, *, unit="q_A^-1", xu=False, science_frame_count=3, fracti
         AnalysisArtifactOverwrite.CREATE_NEW, digest, digest, digest, digest, provenance,
         schema_version=7 if xu else 6, **extra)
     output = admit_analysis_artifact(request, coordinator=OutputTransactionCoordinator())
-    receipt = output.publish(lambda entry: write_stitched(entry, result_projection=projection,
-        provenance=request.provenance_json, bounded_artifact=True, wavelength_A=1.0,
+    receipt = output.publish(lambda entry: write_stitch_projection(entry, request.target, projection,
         frame_records=records, source_base=project))
     return request.target, raw, project, receipt
 
@@ -90,9 +89,9 @@ def test_native_axes_contributors_and_raw_relocation_round_trip(tmp_path, unit, 
     np.testing.assert_array_equal(frame.raw, raw)
     assert frame.metadata_raw["scan_id"] == "3"
     with h5py.File(path, "r") as handle:
-        source = handle["entry/frames/scan_3/frame_0000/source"]
+        source = handle["entry/stitch/frames/scan_3/frame_0000/source"]
         assert source["path"].asstr()[()] == "frame.raw"
-        assert "raw" not in handle["entry/frames/scan_3/frame_0000"]
+        assert "raw" not in handle["entry/stitch/frames/scan_3/frame_0000"]
     moved = tmp_path / "moved-project"
     shutil.move(project, moved)
     # Curve admission never follows raw pointers. Full Raw has explicit fallback.
@@ -113,12 +112,11 @@ def test_native_axes_contributors_and_raw_relocation_round_trip(tmp_path, unit, 
 def test_compact_member_binding_rejects_corruption(tmp_path, xu, key, value):
     path, _, _, _ = _publish(tmp_path, xu=xu)
     with h5py.File(path, "r+") as handle:
-        entry = handle["entry"]
-        provenance = json.loads(bytes(entry["provenance_json"][()]))
+        envelope = handle["entry/stitch"]
+        provenance = json.loads(bytes(envelope["provenance_json"][()]))
         provenance["frame_members"][key] = value
-        for owner in (entry, entry["stitched_1d"]):
-            del owner["provenance_json"]
-            owner.create_dataset("provenance_json", data=np.bytes_(canonical_analysis_provenance(provenance).encode()))
+        del envelope["provenance_json"]
+        envelope.create_dataset("provenance_json", data=np.bytes_(canonical_analysis_provenance(provenance).encode()))
     with pytest.raises(AnalysisArtifactInvalid, match="frozen selected members"):
         read_analysis_artifact(path)
 
@@ -129,7 +127,7 @@ def test_compact_member_binding_rejects_corruption(tmp_path, xu, key, value):
 def test_member_binding_rejects_changed_full_records(tmp_path, xu, legacy_members, mutation):
     path, _, _, _ = _publish(tmp_path, xu=xu, legacy_members=legacy_members)
     with h5py.File(path, "r+") as handle:
-        entry = handle["entry"]
+        entry = handle["entry/stitch"]
         manifest = json.loads(bytes(entry["contributing_frames_json"][()]))
         if mutation == "reorder":
             manifest["records"].reverse()
@@ -141,18 +139,16 @@ def test_member_binding_rejects_changed_full_records(tmp_path, xu, legacy_member
         read_analysis_artifact(path)
 
 
-@pytest.mark.parametrize("mutation", ["thumbnail", "membership", "companion", "raw-copy", "external"])
+@pytest.mark.parametrize("mutation", ["thumbnail", "membership", "raw-copy", "external"])
 def test_strict_native_graph_rejects_corruption(tmp_path, mutation):
     path, _, _, _ = _publish(tmp_path)
     payload = read_analysis_artifact(path)
     with h5py.File(path, "r+") as handle:
-        frame = handle["entry/frames/scan_2/frame_0000"]
+        frame = handle["entry/stitch/frames/scan_2/frame_0000"]
         if mutation == "thumbnail":
             frame["thumbnail"][0, 0] = 100
         elif mutation == "membership":
-            del handle["entry/frames/scan_2/frame_0001"]
-        elif mutation == "companion":
-            handle["entry/stitched_1d/companion_axis"][0] = 50
+            del handle["entry/stitch/frames/scan_2/frame_0001"]
         elif mutation == "raw-copy":
             frame.create_dataset("raw", data=np.ones((4, 6)))
         else:
