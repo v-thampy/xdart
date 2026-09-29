@@ -91,8 +91,11 @@ def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_m
     integrator = next(iter(create_multigeometry_integrator_series_from_geometry(diff, motors)))
     if tuple(integrator.detector.shape) != tuple(frame.shape):
         raise ValueError('the calibration detector does not match the staged frame')
-    if frame.energy_eV:  # the frame's own energy, as the scan recorded it
-        integrator.wavelength = units.hc / (float(frame.energy_eV) / 1000.) * 1e-10
+    # the frame's own energy, as the scan recorded it; else an energy-refined calibration's recorded
+    # one, so every frame of a session is calibrated at the same (recorded) energy
+    energy_eV = frame.energy_eV or record.get('source_energy_eV')
+    if energy_eV:
+        integrator.wavelength = units.hc / (float(energy_eV) / 1000.) * 1e-10
     return FrameSeed(integrator, expected_rings(integrator, calibrant, frame.shape, mask))
 
 

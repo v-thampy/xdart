@@ -545,7 +545,7 @@ def test_a_direct_beam_geometry_saves_as_the_calibration_pair_without_a_ring_fit
         saved = Diffractometer.from_pyfai_goniometer(
             json.loads(target.read_text()), source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
         assert saved.calibration.poni.dist == pytest.approx(.15)
-        assert saved.calibration.poni.wavelength == pytest.approx(.7293e-10)
+        assert saved.calibration.poni.wavelength == pytest.approx(.7293e-10, abs=0)  # metres: no 1e-12 abs
         assert not saved.stacked_arm.extended  # the mount held at 0, 0
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
         assert dialog.save_rough_button.isHidden()
@@ -651,7 +651,7 @@ def test_refine_energy_fits_the_energy_within_the_bound_and_saves_the_recorded_o
         _wait(dialog)
         record = json.loads(target.read_text())
         assert record['source_energy_eV'] == pytest.approx(recorded)
-        assert record['wavelength'] == pytest.approx(energy_eV_to_wavelength_m(energy['refined_eV']), rel=1e-12)
+        assert record['wavelength'] == pytest.approx(energy_eV_to_wavelength_m(energy['refined_eV']), rel=1e-12, abs=0)
         partner = json.loads((tmp_path / 'calibration' / 'energy.xu.json').read_text())['acquisition']
         assert partner['source_energy_eV'] == pytest.approx(recorded)
         assert partner['energy_eV'] == pytest.approx(energy['refined_eV'], rel=1e-9)

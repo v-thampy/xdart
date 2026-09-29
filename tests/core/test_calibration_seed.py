@@ -41,7 +41,7 @@ def test_a_frame_is_seeded_at_its_own_angles_with_pyfai_ring_numbers(tmp_path, n
     seed = predict_frame_seed(_record(tmp_path, names), _frame({'del': 20., 'nu': 0.}))
     ai = seed.integrator
     assert (ai.rot1, ai.rot2) == pytest.approx((0., math.radians(20.)))  # nu -> rot1, del -> rot2
-    assert ai.wavelength == pytest.approx(12.398419843320026 / 17.000018 * 1e-10)  # the frame's energy
+    assert ai.wavelength == pytest.approx(12.398419843320026 / 17.000018 * 1e-10, abs=0)  # the frame's energy
     reference = get_calibrant('LaB6')
     reference.wavelength = ai.wavelength
     two_theta = np.degrees(ai.center_array((195, 1475), unit='2th_rad', scale=False))
@@ -235,3 +235,19 @@ def test_a_tilted_mount_keeps_the_direct_beam_on_its_pixel_at_the_given_distance
         integrator = seed(mount_deg=mount)
         assert float(integrator.tth(np.array([y]), np.array([x]))[0]) == pytest.approx(0, abs=1e-9), mount
         assert integrator.getFit2D()['directDist'] == pytest.approx(500., abs=1e-6), mount
+
+
+def test_an_energy_refined_calibration_seeds_frames_at_the_recorded_energy():
+    """CAL-2: frames are calibrated at the energy the scan recorded, so a seed from an energy-refined
+    calibration uses its recorded energy (source_energy_eV) when the frame has none of its own."""
+    from pyFAI import units
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    from xrd_tools.integrate.calibration_seed import predict_frame_seed
+    record = rough_arm_record(distance_m=.4, detector='Pilatus300kw', beam_px=(200., 90.), zero_deg=0.,
+                              zero_motor='del', wavelength_m=energy_eV_to_wavelength_m(17100.))
+    frame = _frame({'del': 20., 'nu': 0.}, energy_eV=None)  # a scan without an energy column
+    assert predict_frame_seed(record, frame).integrator.wavelength == pytest.approx(
+        energy_eV_to_wavelength_m(17100.), rel=1e-12, abs=0)  # metres: no default 1e-12 abs
+    refined = {**record, 'source_energy_eV': 17000.}
+    assert predict_frame_seed(refined, frame).integrator.wavelength == pytest.approx(
+        units.hc / 17.0 * 1e-10, rel=1e-12, abs=0)
