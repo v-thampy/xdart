@@ -361,3 +361,33 @@ def test_pyfai_takes_the_incidence_and_tilt_that_give_the_circles_surface_normal
                 for name, ours in (('qip_A^-1', q_ip), ('qoop_A^-1', q_oop)):
                     theirs = np.asarray(fiber.array_from_unit(SHAPE, 'center', get_unit_fiber(name, **unit), scale=True))
                     np.testing.assert_allclose(ours, theirs, rtol=0, atol=1e-8, err_msg=f'{name} {orientation} {chi}')
+
+
+def test_an_xu_auto_gi_range_windows_every_pixel_as_a_covering_one_does(tmp_path, transferred):
+    """C12 for xrayutilities: a cut's window on Auto keeps every pixel, as a covering range does."""
+    from xrd_tools.integrate.stitch_gi import StitchGI
+    from xrd_tools.integrate.xu_stitch import run_xu_hist_stitch_1d
+    angles = {1: (12., -7.), 2: (26., 4.)}
+
+    class Source:
+        frame_indices = (1, 2)
+
+        def metadata_for(self, label):
+            return {'del': angles[label][0], 'nu': angles[label][1]}
+
+        def load_frame(self, label):
+            return np.full(SHAPE, 10.0, dtype=np.float32)
+
+    receipt = _receipt(tmp_path, transferred[0])
+    common = dict(frame_indices=(1, 2), npt=48, radial_range=(.5, 6.), monitor_key=None,
+                  max_frame_bytes=8 * 1024 * 1024)
+    for name, own, other in (('q_ip', 'ip_range', 'oop_range'), ('q_oop', 'oop_range', 'ip_range')):
+        bins = {own: (-4., 4.) if name == 'q_ip' else (-1., 3.)}
+        auto = run_xu_hist_stitch_1d(receipt, Source(), gi=StitchGI((name,), incident_angle_deg=.4, **bins), **common)
+        wide = run_xu_hist_stitch_1d(receipt, Source(), gi=StitchGI((name,), incident_angle_deg=.4, **bins,
+                                                                   **{other: (-50., 50.)}), **common)
+        (cut, diagnostics), = auto.gi_cuts
+        (wide_cut, wide_diagnostics), = wide.gi_cuts
+        assert diagnostics.coverage.sum() > 0
+        np.testing.assert_array_equal(diagnostics.coverage, wide_diagnostics.coverage)
+        np.testing.assert_array_equal(cut.intensity, wide_cut.intensity)

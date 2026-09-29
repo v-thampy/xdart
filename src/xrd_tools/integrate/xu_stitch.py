@@ -916,10 +916,12 @@ def _checked_frame_histograms(
 
 
 def _scout_gi_bins(provider, frame_inputs, normals, axes, gi, cancel_token):
-    """Each GI cut's bin range: its own range, else its full geometry extent inside its window over
-    every selected frame (one pass)."""
-    bins = {cut: gi.bins(cut) for cut in gi.cuts}
-    scouted = [cut for cut in gi.cuts if bins[cut] is None]
+    """Both GI coordinates' ranges, as the pyFAI kernel resolves them (``multi._gi_bins``): each its
+    own range, else its full geometry extent inside the other's range over every selected frame (one
+    pass); a cut is binned over its own and windowed by the other's."""
+    from xrd_tools.integrate.stitch_gi import GI_CUTS
+    bins = {cut: gi.bins(cut) for cut in GI_CUTS}
+    scouted = [cut for cut in GI_CUTS if bins[cut] is None]
     if not scouted:
         return bins
     low, high = dict.fromkeys(scouted, math.inf), dict.fromkeys(scouted, -math.inf)
@@ -1326,7 +1328,8 @@ def run_xu_hist_stitch_1d(
             axes = [gi.in_plane_axis(normal) for normal in normals]
             gi_bins = _scout_gi_bins(provider, frame_inputs, normals, axes, gi, cancel_token)
             gi_edges = {cut: np.linspace(*gi_bins[cut], npt + 1, dtype=np.float64) for cut in gi.cuts}
-            cuts = tuple((cut, gi.window(cut), gi_edges[cut]) for cut in gi.cuts)
+            other = {"q_ip": "q_oop", "q_oop": "q_ip"}
+            cuts = tuple((cut, gi_bins[other[cut]], gi_edges[cut]) for cut in gi.cuts)
             gi_cuts = [(normal, axis, cuts) for normal, axis in zip(normals, axes)]
         for index, (label, del_value, nu_value, monitor) in enumerate(frame_inputs):
             if cancel_token is not None and cancel_token.is_set():

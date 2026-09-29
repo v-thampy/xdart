@@ -802,3 +802,36 @@ def test_the_streaming_gi_cuts_equal_pyfais_multigeometryfiber_and_leave_iq_alon
         assert filled.sum() > 20
         np.testing.assert_array_equal(cut_diagnostics.coverage, reference.count)
         np.testing.assert_allclose(cut.intensity[filled], np.asarray(reference.intensity)[filled], rtol=1e-12)
+
+
+def test_an_auto_gi_range_windows_every_pixel_as_a_covering_one_does():
+    """C12: a cut's window on Auto keeps every pixel. The one 2-D pass needs both ranges, so Auto is
+    the scouted span; the cut equals the same cut windowed by a range that covers every pixel (no
+    pixel lost at the span's edges)."""
+    import numpy as np
+    from xrd_tools.core.geometry import Diffractometer
+    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
+    from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
+    from xrd_tools.integrate.stitch_gi import StitchGI
+    from tests.core.test_stacked_arm_extension import _calibration
+    arm = StackedDetectorArm(nu_motor='nu', del_motor='del', nu_offset=.01, del_offset=-.02)
+    diff = Diffractometer.from_pyfai_goniometer(arm.to_pyfai_goniometer(_calibration()),
+                                                source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
+    series = create_multigeometry_integrator_series_from_geometry(
+        diff, {'del': np.array([10., 24.]), 'nu': np.array([2., 9.])})
+    rng = np.random.default_rng(7)
+    images = [rng.uniform(5., 50., (195, 1475)) for _ in range(2)]
+
+    def cut(name, **ranges):
+        gi = StitchGI((name,), incident_angle_deg=.4, **ranges)
+        (result, diagnostics), = stitch_1d_streaming(images, 2, series.__iter__, npt=64, gi=gi,
+                                                     gi_angles=[(.4, 0.)] * 2)[2]
+        return result, diagnostics
+
+    for name, own, other in (('q_ip', 'ip_range', 'oop_range'), ('q_oop', 'oop_range', 'ip_range')):
+        bins = {own: (-2., 2.) if name == 'q_ip' else (0., 6.)}
+        auto, auto_diagnostics = cut(name, **bins)
+        wide, wide_diagnostics = cut(name, **bins, **{other: (-50., 50.)})
+        assert auto_diagnostics.coverage.sum() > 0
+        np.testing.assert_array_equal(auto_diagnostics.coverage, wide_diagnostics.coverage)
+        np.testing.assert_array_equal(auto.intensity, wide.intensity)

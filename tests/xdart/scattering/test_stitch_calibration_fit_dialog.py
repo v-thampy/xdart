@@ -63,12 +63,12 @@ def _guided_frames(tmp_path, energy_ratio=1.0):
     return _frames(tmp_path / 'frames', controls, _calibration().poni)
 
 
-def _single_arm_frames(tmp_path):
+def _single_arm_frames(tmp_path, energy_ratio=1.0):
     """Guided frames of twoc's 2θ arm: psic's arm at nu = 0, read from the 2θ motor alone."""
     from dataclasses import replace
     from tests.core.test_stitch_guided_calibration import _frames
     controls, _calibrant = _ring_controls({'nu_offset': .02, 'del_offset': -.05}, _calibration(),
-                                          [(delta, 0.) for delta in (6., 18., 30., 42.)])
+                                          [(delta, 0.) for delta in (6., 18., 30., 42.)], energy_ratio=energy_ratio)
     controls = [replace(control, motors={'tth': control.motors['del']}) for control in controls]
     return _frames(tmp_path / 'frames', controls, _calibration().poni)
 
@@ -661,6 +661,39 @@ def test_refine_energy_fits_the_energy_within_the_bound_and_saves_the_recorded_o
         assert dialog.fit is None
         dialog.apply_settings(settings)
         assert dialog.refine_energy.isChecked()
+    finally:
+        dialog.close()
+        page.shutdown()
+
+
+def test_a_twoc_arm_refines_the_energy_and_saves_its_xrayutilities_partner(qapp, tmp_path, monkeypatch):
+    """CAL-2 on a single 2θ arm (twoc, nu held at zero): the energy is refined with the arm, and the
+    xrayutilities partner is written with the recorded energy beside the refined one."""
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    from xrd_tools.session.instrument import InstrumentGeometry
+    recorded = float(wavelength_m_to_energy_eV(_calibration().poni.wavelength))
+    (tmp_path / 'frames').mkdir()
+    frames = _single_arm_frames(tmp_path, energy_ratio=(recorded + 60.) / recorded)
+    page, dialog = _page_with_dialog(tmp_path)
+    try:
+        dialog.set_instrument(InstrumentGeometry('twoc'))
+        dialog.frames, dialog._frame_motors = frames, ('tth', None)
+        dialog._render_frames()
+        dialog.refine_energy.setChecked(True)
+        dialog.fit_button.click()
+        _wait(dialog)
+        assert dialog.fit is not None, dialog.status.text()
+        energy = dialog.fit.asset['provenance']['energy_refinement']
+        assert abs(energy['refined_eV'] - (recorded + 60.)) < max(3 * energy['sigma_eV'], 1.), energy
+        target = (tmp_path / 'calibration' / 'twoc.json').resolve()
+        _save_to(monkeypatch, target)
+        dialog.save_button.click()
+        _wait(dialog)
+        assert Path(page._value("geometry_path")) == target, dialog.status.text()
+        partner = json.loads((tmp_path / 'calibration' / 'twoc.xu.json').read_text())['acquisition']
+        assert partner['source_energy_eV'] == pytest.approx(recorded)
+        assert partner['energy_eV'] == pytest.approx(energy['refined_eV'], rel=1e-9)
+        assert partner['source_motors'] == {'del': 'tth', 'nu': None}
     finally:
         dialog.close()
         page.shutdown()
