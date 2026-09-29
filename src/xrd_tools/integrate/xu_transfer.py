@@ -68,6 +68,9 @@ def transfer_extended_arm_to_xu(geometry, *, validation_angles, fit_angles=None,
     arm, calibration = diff.stacked_arm, diff.calibration
     if arm is None or calibration is None or not arm.extended:
         raise XuTransferRefused('XU_TRANSFER_UNSUPPORTED', 'the transfer needs an extended stacked (del-on-nu) arm')
+    if int(dict(calibration.detector_config).get('orientation', 3)) != 3:  # as the XU fit refuses it
+        raise XuTransferRefused('XU_TRANSFER_UNSUPPORTED', "the XU model takes pyFAI's default detector "
+                                'orientation (3): fit the arm in orientation 3 to transfer it')
     if arm.nu_scale != math.pi / 180 or arm.del_scale != math.pi / 180:
         raise XuTransferRefused('XU_TRANSFER_UNSUPPORTED', 'XU takes angles in degrees: fitted motor scales cannot be transferred')
     if arm.beam_rotation != 0:

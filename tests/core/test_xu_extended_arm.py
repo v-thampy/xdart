@@ -148,6 +148,15 @@ def test_the_transfer_refuses_what_xu_cannot_express(changes, message):
         transfer_extended_arm_to_xu(_record(**changes), validation_angles=ANGLES)
 
 
+def test_the_transfer_takes_pyfais_default_orientation():
+    # an arm fitted in orientation 4 carries that orientation's nu sign (orientation_signs); XU's
+    # model takes orientation 3, as the XU fit does, and the refusal says so (not "fitted scales")
+    record = _record(nu_scale=-np.pi / 180)
+    record['detector_config'] = {'orientation': 4}
+    with pytest.raises(XuTransferRefused, match='orientation'):
+        transfer_extended_arm_to_xu(record, validation_angles=ANGLES)
+
+
 def test_a_failed_gate_and_a_changed_arm_refuse():
     with pytest.raises(XuTransferRefused, match='gate'):
         transfer_extended_arm_to_xu(_record(), validation_angles=ANGLES[:6], gate=1e-16)
