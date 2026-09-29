@@ -2454,6 +2454,7 @@ def _runtime_plan(plan: StitchOperationPlan, diffractometer) -> StitchPlan:
         conditioning=plan.conditioning,
         max_eager_bytes=None,
         streaming_multigeometry=True,
+        gi_cut=plan.gi,
     )
 
 
@@ -2790,6 +2791,7 @@ class StitchOperationExecution:
                     max_frame_bytes=plan.max_frame_bytes,
                     cancel_token=cancel_token,
                     progress_callback=science_progress,
+                    gi=plan.gi,
                 )
                 self._frame_screen = screen.summary()
                 _record_frame_screen(records, screen.verdicts)

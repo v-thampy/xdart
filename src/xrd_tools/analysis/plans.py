@@ -89,6 +89,8 @@ class AnalysisResult:
     #: detached non-primary data for an operation-specific persistence layer
     #: (for Stitch, exact per-bin coverage and normalization weight).
     auxiliary: Any = field(default=None, repr=False, compare=False)
+    #: a GI Stitch's cut beside the payload: (IntegrationResult1D, StitchDiagnostics).
+    gi_cut: Any = field(default=None, repr=False, compare=False)
 
     def to_dict(self, *, include_payload: bool = True) -> dict[str, Any]:
         data = {
@@ -176,6 +178,9 @@ class StitchPlan:
     flat: np.ndarray | None = field(default=None, repr=False, compare=False)
     #: Flat pixels below this fraction of the flat's median are masked as dead.
     flat_min_fraction: float = 0.1
+    #: streaming multigeometry 1-D only: a native GI cut (``integrate.stitch_gi.StitchGI``)
+    #: binned beside I(q) from the same frames; the result's ``gi_cut``.
+    gi_cut: Any = None
 
     def provenance(self) -> dict[str, Any]:
         """A JSON-safe record of this stitch for persistence (pass to
@@ -603,8 +608,11 @@ def run_stitch(
             f"grouped/composite source is NaN-padding a member that lacks this "
             f"monitor. Every member of a multi-source stitch must provide it.")
 
-    auxiliary = None
+    auxiliary = gi_cut = None
     diffractometer = plan.diffractometer or getattr(src, "diffractometer", None)
+    if plan.gi_cut is not None and (diffractometer is None or not plan.streaming_multigeometry
+                                    or plan.mode != "1d"):
+        raise ValueError("a GI cut needs the streaming 1-D Stitch with a Diffractometer")
     if diffractometer is not None:
         # GAP-A path: per-frame rotations from the calibrated Diffractometer.
         from xrd_tools.integrate.multi import (  # noqa: PLC0415
@@ -744,13 +752,19 @@ def run_stitch(
                 mask=plan.mask, normalization=normalization, **extra)
             auxiliary = None
         elif plan.streaming_multigeometry:
-            payload, auxiliary = stitch_1d_streaming(
+            incidences = None
+            if plan.gi_cut is not None:  # every frame's incidence: its motor, or the Manual angle
+                incidences = (np.full(len(labels), plan.gi_cut.incident_angle_deg)
+                              if plan.gi_cut.incidence_motor is None
+                              else _metadata_series(src, labels, plan.gi_cut.incidence_motor))
+            payload, auxiliary, *rest = stitch_1d_streaming(
                 _iter_images(), len(labels), integrator_series.__iter__,
                 npt=plan.npt_1d, unit=plan.unit, method=plan.method,
                 radial_range=plan.radial_range,
                 mask=plan.mask, normalization=normalization,
-                frame_screen=frame_screen, **corrections,
+                frame_screen=frame_screen, gi=plan.gi_cut, incidences=incidences, **corrections,
             )
+            gi_cut = rest[0] if rest else None
         else:
             assert integrators is not None
             images = _load_images_eager()
@@ -872,6 +886,7 @@ def run_stitch(
             else None
         ),
         auxiliary=auxiliary,
+        gi_cut=gi_cut,
     )
 
 

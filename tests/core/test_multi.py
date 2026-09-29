@@ -350,7 +350,7 @@ def test_streaming_multigeometry_matches_native_union_result(
         npt_rad = 80
         npt_azim = 36
 
-    streamed = _streaming_multigeometry(
+    streamed, _gi = _streaming_multigeometry(
         images,
         len(images),
         lambda: iter(_make_small_integrators(poni_fixture, angles)),
@@ -468,7 +468,7 @@ def test_streaming_multigeometry_preserves_native_mixed_variance_union(
         lambda _owner, *_args, **_kwargs: next(results),
     )
 
-    streamed = _streaming_multigeometry(
+    streamed, _gi = _streaming_multigeometry(
         images,
         len(images),
         lambda: iter(_make_small_integrators(poni_fixture, angles)),
@@ -747,3 +747,41 @@ def test_stitch_images_rejects_unknown_backend(monkeypatch):
     with pytest.raises(ValueError, match="backend"):
         multi.stitch_images(np.zeros((1, 3, 3)), "PONI", [10.0],
                             mode="1d", backend="bogus")
+
+
+def test_the_streaming_gi_cut_equals_pyfais_multigeometryfiber_and_leaves_iq_alone():
+    """A GI Stitch 1D with pyFAI (maintainer, 2026-09-29/30): the q_oop cut, streamed one frame at a
+    time, equals pyFAI's MultiGeometryFiber over all frames at once (its accumulators are sized for
+    a q_oop cut); I(q) beside it is the plain streaming result."""
+    import numpy as np
+    from pyFAI.multi_geometry import MultiGeometryFiber
+    from xrd_tools.core.geometry import Diffractometer
+    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
+    from xrd_tools.integrate.gid import _fiber_from_integrator
+    from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
+    from xrd_tools.integrate.stitch_gi import StitchGI
+    from tests.core.test_stacked_arm_extension import _calibration
+    arm = StackedDetectorArm(nu_motor='nu', del_motor='del', nu_offset=.01, del_offset=-.02)
+    diff = Diffractometer.from_pyfai_goniometer(arm.to_pyfai_goniometer(_calibration()),
+                                                source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
+    motors = {'del': np.array([10., 24., 38.]), 'nu': np.array([2., 9., 15.])}
+    series = create_multigeometry_integrator_series_from_geometry(diff, motors)
+    rng = np.random.default_rng(5)
+    images = [rng.uniform(5., 50., (195, 1475)) for _ in range(3)]
+    gi = StitchGI('q_oop', incident_angle_deg=.4, npt=64, cut_range=(0., 6.), window=(-2.5, 2.5))
+    common = dict(npt=200, radial_range=(.5, 6.), correct_solid_angle=True, polarization_factor=.99)
+    payload, diagnostics, (cut, cut_diagnostics) = stitch_1d_streaming(
+        images, 3, series.__iter__, gi=gi, incidences=[.4] * 3, **common)
+    plain, _ = stitch_1d_streaming(images, 3, series.__iter__, **common)
+    np.testing.assert_array_equal(payload.intensity, plain.intensity)
+    fibers = [_fiber_from_integrator(ai, incident_angle=.4, sample_orientation=4) for ai in series]
+    reference = MultiGeometryFiber(fibers, unit=('qip_A^-1', 'qoop_A^-1'), ip_range=(-2.5, 2.5), oop_range=(0., 6.),
+                                   incident_angle=np.radians(.4), tilt_angle=0., sample_orientation=4
+                                   ).integrate1d_grazing_incidence(images, npt_ip=64, npt_oop=64, vertical_integration=True,
+                                                                   polarization_factor=.99)
+    assert cut.unit == 'qoop_A^-1'
+    np.testing.assert_allclose(cut.radial, reference.radial, rtol=0, atol=1e-12)
+    filled = np.asarray(reference.count) > 0
+    assert filled.sum() > 20
+    np.testing.assert_array_equal(cut_diagnostics.coverage, reference.count)
+    np.testing.assert_allclose(cut.intensity[filled], np.asarray(reference.intensity)[filled], rtol=1e-12)

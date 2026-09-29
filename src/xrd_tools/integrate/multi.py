@@ -189,7 +189,10 @@ def _streaming_multigeometry(
     dark: np.ndarray | None = None,
     flat: np.ndarray | None = None,
     flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
+    gi=None,
+    incidences: Sequence[float] | None = None,
 ):
+    """Returns (pyFAI's merged result, the GI cut's [signal, normalization, count, axis] or None)."""
     from pyFAI.multi_geometry import MultiGeometry
 
     if type(image_count) is not int or image_count < 1:
@@ -212,6 +215,17 @@ def _streaming_multigeometry(
         radial_range=radial_range,
         azimuth_range=azimuth_range,
     )
+    if gi is not None and (mode != "1d" or incidences is None or len(incidences) != image_count):
+        raise ValueError("a GI cut needs a 1-D Stitch and one incidence per frame")
+    gi_range = None if gi is None else gi.cut_range or _scout_gi_range(integrator_factory, incidences, gi)
+    gi_totals = None
+
+    def add_gi(part):
+        nonlocal gi_totals
+        if part is not None:
+            gi_totals = list(part) if gi_totals is None else [
+                total + value for total, value in zip(gi_totals[:3], part[:3])] + [gi_totals[3]]
+
     image_iterator = iter(images)
     integrator_iterator = iter(integrator_factory())
     aggregate = None
@@ -332,12 +346,17 @@ def _streaming_multigeometry(
                     azimuthal = current_azimuthal.copy()
                 elif not np.array_equal(azimuthal, current_azimuthal):
                     raise ValueError("pyFAI returned inconsistent Stitch azimuth axes")
+            gi_part = None if gi is None else _gi_frame_sums(
+                integrator, image, float(incidences[index]), gi, gi_range, mask=frame_mask,
+                correct_solid_angle=correct_solid_angle, polarization_factor=polarization_factor,
+                dark=dark, flat=flat, monitor=monitor)
             if frame_screen is None:
                 aggregate = (
                     copy.deepcopy(result)
                     if aggregate is None
                     else aggregate.union(result)
                 )
+                add_gi(gi_part)
             else:
                 # Hold this frame until its row neighbours are known; merge the
                 # released frames in their original order.
@@ -351,9 +370,10 @@ def _streaming_multigeometry(
                     # A dropped frame on a detector with a pedestal still holds the dark.
                     signal -= float(dark[valid].sum())
                 total = signal / monitor
-                for held, verdict in frame_screen.push(total, copy.deepcopy(result)):
+                for (held, held_gi), verdict in frame_screen.push(total, (copy.deepcopy(result), gi_part)):
                     if not verdict.excluded:
                         aggregate = held if aggregate is None else aggregate.union(held)
+                        add_gi(held_gi)
         finally:
             integrator.reset(collect_garbage=False)
         # Release the detector-sized frame before asking the source for its
@@ -372,14 +392,76 @@ def _streaming_multigeometry(
     else:
         raise ValueError("streaming Stitch received more integrators than declared")
     if frame_screen is not None:
-        for held, verdict in frame_screen.finish():
+        for (held, held_gi), verdict in frame_screen.finish():
             if not verdict.excluded:
                 aggregate = held if aggregate is None else aggregate.union(held)
+                add_gi(held_gi)
         if aggregate is None:
             raise ValueError("every Stitch frame was excluded as a dropped frame")
     if aggregate is None or radial is None:
         raise ValueError("streaming Stitch produced no result")
-    return aggregate
+    return aggregate, gi_totals
+
+
+def _gi_frame_sums(integrator, image, incidence, gi, gi_range, *, mask, correct_solid_angle,
+                   polarization_factor, dark, flat, monitor):
+    """One frame's GI cut as pyFAI's fiber sums: [signal, normalization × pixel area/dist², count,
+    axis], accumulated across frames as pyFAI's MultiGeometryFiber does."""
+    from xrd_tools.integrate.gid import _effective_gi_params, _fiber_from_integrator
+    fiber = _fiber_from_integrator(integrator, incident_angle=incidence, tilt_angle=gi.tilt_deg,
+                                   sample_orientation=gi.sample_orientation)
+    angle, tilt, orientation = _effective_gi_params(fiber, None, None, None)
+    ranges = ({"ip_range": gi_range, "oop_range": gi.window} if gi.cut == "q_ip"
+              else {"ip_range": gi.window, "oop_range": gi_range})
+    cut = fiber.integrate_fiber(
+        image, npt_ip=gi.npt, unit_ip="qip_A^-1", npt_oop=gi.npt, unit_oop="qoop_A^-1",
+        vertical_integration=gi.cut == "q_oop", correctSolidAngle=correct_solid_angle, mask=mask,
+        polarization_factor=polarization_factor, dark=dark, flat=flat,
+        method=("no", "histogram", "cython"), normalization_factor=monitor,
+        incident_angle=angle, tilt_angle=tilt, sample_orientation=orientation, **ranges)
+    scale = fiber.pixel1 * fiber.pixel2 / fiber.dist ** 2 if correct_solid_angle else 1.0
+    axis = getattr(cut, "integrated", None)
+    return [np.asarray(cut.sum_signal, dtype=np.float64),
+            np.asarray(cut.sum_normalization, dtype=np.float64) * scale,
+            np.asarray(cut.count, dtype=np.float64),
+            np.asarray(cut.radial if axis is None else axis, dtype=np.float64)]
+
+
+def _scout_gi_range(integrator_factory, incidences, gi):
+    """The cut's full extent inside the window over every frame (no image reads)."""
+    from pyFAI.units import get_unit_fiber
+    from xrd_tools.integrate.gid import _fiber_from_integrator
+    low, high = np.inf, -np.inf
+    for integrator, incidence in zip(integrator_factory(), incidences):
+        try:
+            fiber = _fiber_from_integrator(integrator, incident_angle=float(incidence), tilt_angle=gi.tilt_deg,
+                                           sample_orientation=gi.sample_orientation)
+            unit = dict(incident_angle=float(incidence), tilt_angle=gi.tilt_deg,
+                        sample_orientation=gi.sample_orientation, angle_unit="deg")
+            shape = fiber.detector.shape
+            q_ip = np.asarray(fiber.array_from_unit(shape, "center", get_unit_fiber("qip_A^-1", **unit), scale=True))
+            q_oop = np.asarray(fiber.array_from_unit(shape, "center", get_unit_fiber("qoop_A^-1", **unit), scale=True))
+            cut, other = (q_ip, q_oop) if gi.cut == "q_ip" else (q_oop, q_ip)
+            inside = np.isfinite(cut)
+            if gi.window is not None:
+                inside &= (other >= gi.window[0]) & (other <= gi.window[1])
+            if inside.any():
+                low, high = min(low, float(cut[inside].min())), max(high, float(cut[inside].max()))
+        finally:
+            integrator.reset(collect_garbage=False)
+    if not low < high:
+        raise ValueError("no pixel lies inside the GI window")
+    return (low, high)
+
+
+def gi_cut_result(totals, unit):
+    """The GI cut's Σ signal / Σ normalization where a bin has weight (NaN elsewhere), and its
+    diagnostics."""
+    signal, normalization, count, axis = totals
+    intensity = np.full(len(axis), np.nan, dtype=np.float64)
+    occupied = normalization > 0
+    intensity[occupied] = signal[occupied] / normalization[occupied]
+    return IntegrationResult1D(axis, intensity, None, unit), StitchDiagnostics(count, normalization)
 
 
 def stitch_1d_streaming(
@@ -399,10 +481,16 @@ def stitch_1d_streaming(
     dark: np.ndarray | None = None,
     flat: np.ndarray | None = None,
     flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
+    gi=None,
+    incidences: Sequence[float] | None = None,
 ) -> tuple[IntegrationResult1D, StitchDiagnostics]:
-    """Sequential MultiGeometry merge that retains only one detector frame."""
+    """Sequential MultiGeometry merge that retains only one detector frame.
 
-    result = _streaming_multigeometry(
+    With ``gi`` (a ``StitchGI``) and one incidence per frame, a third value is the GI cut
+    (``gi_cut_result``), binned from the same frames by pyFAI's fiber model.
+    """
+
+    result, gi_totals = _streaming_multigeometry(
         images,
         image_count,
         integrator_factory,
@@ -422,6 +510,8 @@ def stitch_1d_streaming(
         dark=dark,
         flat=flat,
         flat_min_fraction=flat_min_fraction,
+        gi=gi,
+        incidences=incidences,
     )
     sigma = result.sigma if result.sigma is not None else None
     radial_unit = str(result.unit) if result.unit is not None else unit
@@ -432,6 +522,8 @@ def stitch_1d_streaming(
         unit=radial_unit,
     )
     diagnostics = StitchDiagnostics(result.count, result.sum_normalization)
+    if gi is not None:
+        return payload, diagnostics, gi_cut_result(gi_totals, gi.unit)
     return payload, diagnostics
 
 
@@ -457,7 +549,7 @@ def stitch_2d_streaming(
 ) -> tuple[IntegrationResult2D, StitchDiagnostics]:
     """Sequential 2-D MultiGeometry merge retaining one detector frame."""
 
-    result = _streaming_multigeometry(
+    result, _gi = _streaming_multigeometry(
         images,
         image_count,
         integrator_factory,
