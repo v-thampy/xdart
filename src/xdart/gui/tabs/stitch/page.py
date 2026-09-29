@@ -939,8 +939,11 @@ class StitchPage(QtWidgets.QWidget):
         if key in folders or key == "spec_path" and kind == "Directory":
             picks = dialogs.browse(self, folders.get(key, "Choose folder"), folder=True, **common)
         elif key == "spec_path":
-            picks = dialogs.browse(self, "Choose source files", many=True, **common,
-                                   file_filter=dialogs.NEXUS_FILTER if kind == "NeXus" else dialogs.ANY_FILTER)
+            if kind == "Spec":  # SPEC files have no extension: only they are listed
+                picks = dialogs.browse_spec(self, "Choose SPEC files", many=True, **common)
+            else:
+                picks = dialogs.browse(self, "Choose source files", many=True, **common,
+                                       file_filter=dialogs.NEXUS_FILTER)
             if picks:
                 self.set_sources(picks)
             return

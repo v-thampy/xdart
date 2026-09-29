@@ -13,6 +13,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.pages.operation_owner import SingleWorkerOwner, OperationCancelled, OperationTerminalStatus
 from xdart.gui.widgets.controls_panel import ControlsComboBox, browse_button
+from xdart.gui.widgets.file_dialogs import NEXUS_FILTER
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.integrate.calibration_seed import (
     DETECTOR_ORIENTATIONS, detector_choices, detector_shape, ring_summary, rough_arm_record,
@@ -359,7 +360,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         return combo
 
     def _edit(self, form, key, label, default='', *, chooser=None, tip='', placeholder=''):
-        """One text field, with the Controls 📁 button when ``chooser`` names a file filter or 'directory'."""
+        """One text field, with the Controls 📁 button when ``chooser`` names a file filter,
+        'directory' or 'spec' (SPEC files only), or is a function returning one at the click."""
         edit = QtWidgets.QLineEdit(str(default))
         edit.setObjectName(key)
         edit.setPlaceholderText(placeholder)
@@ -425,11 +427,15 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             f"auto · {path.stem if path else '<SPEC name>'}_scan{first[1] if first else '<N>'}_")
 
     def _browse(self, edit, chooser):
-        from xdart.gui.widgets.file_dialogs import browse
+        from xdart.gui.widgets.file_dialogs import browse, browse_spec
+        chooser = chooser() if callable(chooser) else chooser
         folder = chooser == 'directory'
-        picks = browse(self, 'Select images directory' if folder else 'Select file', folder=folder,
-                       file_filter='All files (*)' if folder else chooser, current=edit.text(),
-                       fallback=str(self.project_root))
+        if chooser == 'spec':
+            picks = browse_spec(self, 'Select SPEC file', current=edit.text(), fallback=str(self.project_root))
+        else:
+            picks = browse(self, 'Select images directory' if folder else 'Select file', folder=folder,
+                           file_filter='All files (*)' if folder else chooser, current=edit.text(),
+                           fallback=str(self.project_root))
         if picks and picks[0]:
             edit.setText(picks[0])
 
@@ -457,7 +463,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                                                              ('NeXus images + metadata', 'nexus_stack')],
             tip='SPEC + images: a SPEC file lists each frame\'s angles and image files hold the frames. '
                 'NeXus: one file holds both.')
-        self._edit(form, 'source', 'SPEC file', chooser='All files (*)',
+        self._edit(form, 'source', 'SPEC file',
+                   chooser=lambda: 'spec' if self.source_kind.currentData() == 'spec' else NEXUS_FILTER,
                    tip='The calibrant scan: its SPEC file, or its NeXus file.')
         self._attach('scan', 'source', 'Scan', '1', tip=self._SCAN_TIP, width=90)
         self._edit(form, 'images', 'Images folder', chooser='directory', tip=self._FOLDER_TIP)
@@ -698,7 +705,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                                                              ('SPEC + Eiger / NeXus', 'spec_container'),
                                                              ('NeXus images + metadata', 'nexus')],
             tip='Where the direct-beam scan\'s angles and images come from.')
-        self._edit(form, 'beam_source', 'SPEC file', chooser='All files (*)',
+        self._edit(form, 'beam_source', 'SPEC file',
+                   chooser=lambda: NEXUS_FILTER if self.beam_source_kind.currentData() == 'nexus' else 'spec',
                    tip='The direct-beam scan: its SPEC file (the angles), or its NeXus file.')
         self._attach('beam_scan', 'beam_source', 'Scan', '1', tip=self._SCAN_TIP, width=90)
         self._edit(form, 'beam_image_file', 'Eiger / NeXus images',

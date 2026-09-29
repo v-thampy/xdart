@@ -42,7 +42,66 @@ def browse(parent, title: str, *, folder: bool = False, many: bool = False,
     return picks
 
 
+#: The file types a SPEC picker offers: SPEC-named files first (``is_spec_name``), then all.
+SPEC_LABEL = "SPEC files"
+SPEC_FILTERS = (f"{SPEC_LABEL} (*)", ANY_FILTER)
+
+
+def is_spec_name(name: str) -> bool:
+    """A SPEC data file's name: no extension, as SPEC writes them, or ``.spec``."""
+    if name.startswith("."):
+        return False
+    _stem, dot, suffix = name.rpartition(".")
+    return not dot or suffix.casefold() == "spec"
+
+
+def spec_dialog(parent, title: str, start: str, *, many: bool = False, places=()):
+    """The SPEC picker, unopened: folders and SPEC-named files, "All files" one choice away.
+
+    Qt's own dialog, because a native one filters only by extension patterns and a SPEC
+    file has no extension (the images and .pdi/.csv files beside it would all show).
+    """
+    from pyqtgraph.Qt import QtCore, QtWidgets
+
+    class SpecNames(QtCore.QSortFilterProxyModel):
+        spec_only = True
+
+        def filterAcceptsRow(self, row, parent_index):
+            model = self.sourceModel()
+            index = model.index(row, 0, parent_index)
+            return not self.spec_only or model.isDir(index) or is_spec_name(model.fileName(index))
+
+    dialog = QtWidgets.QFileDialog(parent, title, start)
+    dialog.setOption(QtWidgets.QFileDialog.Option.DontUseNativeDialog, True)
+    dialog.setOption(QtWidgets.QFileDialog.Option.HideNameFilterDetails, True)
+    dialog.setFileMode(QtWidgets.QFileDialog.FileMode.ExistingFiles if many
+                       else QtWidgets.QFileDialog.FileMode.ExistingFile)
+    names = SpecNames(dialog)
+    dialog.setProxyModel(names)
+    dialog.setNameFilters(list(SPEC_FILTERS))
+
+    def filter_chosen(text):  # the type list's text, which hides the "(*)"
+        names.spec_only = text.startswith(SPEC_LABEL)
+        names.invalidate()
+    dialog.filterSelected.connect(filter_chosen)
+    places = [QtCore.QDir.homePath(), start, *places]  # its sidebar: home, the start and project folders
+    dialog.setSidebarUrls([QtCore.QUrl.fromLocalFile(place) for place in dict.fromkeys(places) if place])
+    return dialog
+
+
+def browse_spec(parent, title: str, *, many: bool = False, current: str = "",
+                fallback: str = "") -> list[str]:
+    """Ask for SPEC files (as :func:`browse`: the last folder picked first); [] when cancelled."""
+    dialog = spec_dialog(parent, title, browse_start_dir(current, fallback=fallback), many=many,
+                         places=(fallback,))
+    picks = [path for path in dialog.selectedFiles() if path] if dialog.exec() else []
+    if picks:
+        remember_browse_path(picks[0])
+    return picks
+
+
 __all__ = [
     "ANY_FILTER", "BACKGROUND_IMAGE_FILTER", "CALIBRATION_FILTER", "CORRECTION_FILTER",
-    "MASK_FILTER", "NEXUS_FILTER", "PONI_FILTER", "browse",
+    "MASK_FILTER", "NEXUS_FILTER", "PONI_FILTER", "SPEC_FILTERS", "browse", "browse_spec",
+    "is_spec_name", "spec_dialog",
 ]
