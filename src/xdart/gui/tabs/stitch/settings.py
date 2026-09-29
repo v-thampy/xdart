@@ -47,6 +47,8 @@ def page_settings(page) -> dict[str, Any]:
                       "threshold_max": _plain(state.threshold_max),
                       "mask_saturation": bool(state.mask_saturation)},
         "calibration": page._calibration_settings_now(),
+        # grazing incidence as Int sets it (its cut and ranges are fields above)
+        "gi": dict(page._gi),
     }
 
 
@@ -57,7 +59,7 @@ def validate_settings(document: Any) -> dict[str, Any]:
         raise ValueError("not an xdart Stitch settings file")
     if document["version"] > SETTINGS_VERSION:
         raise ValueError("these Stitch settings come from a newer xdart")
-    for key, kind in (("fields", dict), ("sources", dict), ("threshold", dict)):
+    for key, kind in (("fields", dict), ("sources", dict), ("threshold", dict), ("gi", dict)):
         if type(document.get(key, {})) is not kind:
             raise ValueError(f"Stitch settings {key} are malformed")
     calibration = document.get("calibration")
@@ -97,11 +99,15 @@ def apply_page_settings(page, document: Any) -> None:
             page._fields[key] = replace(page._fields[key], value=value)
         page._render_ranges()
     page._set_calibration_settings(document.get("calibration"))
+    gi = document.get("gi", {})
+    page._gi.update({key: bool(value) if key == "enabled" else None if value is None else str(value)
+                     for key, value in gi.items() if key in page._gi})
     # the mapping follows the restored geometry, and readiness rechecks the calibration's arm
     page._instrument_changed()
     # As after load_form: the XU asset owns some fields, now that its paths are back.
     page._sync_advanced()
     page._refresh_xu_geometry()
+    page._render_gi()
 
 
 def dump_settings(document: dict[str, Any]) -> str:

@@ -47,6 +47,9 @@ from xrd_tools.analysis.stitch_sources import StitchSourceSelection
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifactPayload
 from xrd_tools.session.readiness import ControlFieldKind, ControlFormField, SectionId
+from xdart.gui.tabs.scattering.controls_inventory import (
+    GI_ENABLED, GI_MOTOR, GI_ORIENTATION, GI_THETA, GI_TILT,
+)
 from xrd_tools.session.threshold_editing import (
     ThresholdEditRefusal, ThresholdState, threshold_transition,
 )
@@ -114,6 +117,21 @@ def _bound_arm(path, _mtime_ns, _size, bindings):
         return ("ok", *calibration_arm(_read_goniometer(path, _mtime_ns, _size), dict(bindings)))
     except ValueError as error:
         return ("unknown", str(error))
+
+
+@functools.lru_cache(maxsize=8)
+def _spec_motor_names(path, _state, scan):
+    """The real motors a SPEC scan records (its ``#O``/``#P`` motors, the scanned one among
+    them; no counters), or None when the scan cannot be read. ``scan`` None: the file's first."""
+    from xrd_tools.io.spec import list_spec_scans, read_spec_scan_table
+    try:
+        scans = list_spec_scans(path)
+        key = scan if scan is not None else scans[0] if scans else None
+        if key is None:
+            return None
+        return tuple(read_spec_scan_table(path, key)[1])
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
 
 
 def _file_states(*paths):
@@ -425,6 +443,14 @@ class StitchPage(QtWidgets.QWidget):
         self._field(experiment, SectionId.EXPERIMENT, "geometry_path", "Calibration", browse=True)
         self._rows["geometry_path"].valueChanged.connect(self._refresh_xu_geometry)
         self._field(experiment, SectionId.EXPERIMENT, "mask_path", "Mask File", browse=True)
+        # Grazing incidence as Int sets it, in the Experiment section (maintainer, 2026-09-29):
+        # Int's own rows, rebuilt from this page's values (_render_gi).
+        self._gi = dict(enabled=False, motor=None, angle="0.1", orientation="4", tilt="0")
+        self._gi_catalog = None
+        self._gi_host = QtWidgets.QWidget()
+        QtWidgets.QVBoxLayout(self._gi_host).setContentsMargins(0, 0, 0, 0)
+        experiment.add_row(self._gi_host)
+        self.controls.fieldValueChanged.connect(self._gi_edited)
         self._field(source, SectionId.SOURCE, "source_kind", "Source", "Spec",
                     choices=("Spec", "NeXus", "Directory"))
         self._field(source, SectionId.SOURCE, "spec_path", "SPEC files", browse=True)
@@ -465,6 +491,23 @@ class StitchPage(QtWidgets.QWidget):
         points.setMaximumWidth(58)
         axis.add_trailing_widget(points)
         self.radial_range = self._range(grid, "Q (Å⁻¹)", ("q_min", "q_max", "radial_auto"), (0., 6.2, True))
+        # The GI cut beside I(q), with Int's two ranges: Qᵢₚ first, Qₒₒₚ second; the cut's own
+        # range bins it (Auto: the data's span) and the other one is its window (Auto: every pixel).
+        cut = self._field(grid, SectionId.PROCESSING, "gi_cut", "GI cut", "Qᵢₚ", choices=("Qᵢₚ", "Qₒₒₚ"))
+        cut.setToolTip("The grazing-incidence cut written beside I(q): Qᵢₚ inside the Qₒₒₚ range, or "
+                       "Qₒₒₚ inside the Qᵢₚ range.")
+        self._align_to_ranges(cut)
+        cut_label = QtWidgets.QLabel("Pts")
+        cut_label.setObjectName("controlsHeaderLabel")
+        cut.add_trailing_widget(cut_label)
+        cut_points = self._field(None, SectionId.PROCESSING, "gi_npt", "Pts", "1000")
+        cut_points.label.hide()
+        cut_points.setMaximumWidth(58)
+        cut.add_trailing_widget(cut_points)
+        self._gi_rows = (cut,
+                         self._range(grid, "Qᵢₚ (Å⁻¹)", ("gi_ip_min", "gi_ip_max", "gi_ip_auto"), (-2., 2., True)),
+                         self._range(grid, "Qₒₒₚ (Å⁻¹)", ("gi_oop_min", "gi_oop_max", "gi_oop_auto"), (0., 1., True)))
+        self._render_gi()
         conditioning = SubsectionCard("Conditioning", accent="processing")
         processing.add_row(conditioning)
         self.threshold_range = self._range(conditioning, "Threshold", ("threshold_min", "threshold", "threshold_enabled"), (0., None, True),
@@ -556,6 +599,130 @@ class StitchPage(QtWidgets.QWidget):
         preview_layout.addWidget(self.preview_text)
         self.preview_dialog.resize(680, 480)
 
+    _GI_KEYS = {GI_ENABLED: "enabled", GI_MOTOR: "motor", GI_THETA: "angle", GI_ORIENTATION: "orientation",
+                GI_TILT: "tilt"}
+
+    def _gi_catalog_now(self):
+        """The real motors of the first selected SPEC scan (Int's incidence choices), or None when
+        the source does not say (another source kind, or an unreadable file)."""
+        if self._value("source_kind") != "Spec" or not self._source_paths:
+            return None
+        path = self._source_paths[0]
+        first = re.search(r"\d+(?:\.\d+)?", str(self._value("scan") or ""))
+        scan = (None if self._value("scan_mode") == "Stitch All" or first is None
+                else first[0] if "." in first[0] else f"{first[0]}.1")  # SPEC's N.M key
+        return _spec_motor_names(path, _file_states(path), scan)
+
+    def _gi_sample_motors(self):
+        """xrayutilities' other sample circles (mu, chi, phi) by the Geometry's motor names: None,
+        read as 0, when the scan is known to record no such motor (the Experiment status says so)."""
+        from xrd_tools.integrate.stitch_gi import GI_SAMPLE_ROLES
+        geometry = self._instrument()
+        circles = {role: circle for circle, role in geometry.as_psic().items()}
+        names = dict(geometry.motors)
+        pairs = []
+        for role in GI_SAMPLE_ROLES:
+            motor = names.get(circles.get(role, role))
+            if motor is not None and self._gi_catalog is not None and motor not in self._gi_catalog:
+                motor = None
+            pairs.append((role, motor))
+        return tuple(pairs)
+
+    def _gi_fields(self):
+        """Int's GI fields (its paths and rows) for this page's values."""
+        gi = self._gi
+        fields = [ControlFormField(SectionId.EXPERIMENT, "Grazing", GI_ENABLED, gi["enabled"], ControlFieldKind.BOOL)]
+        if not gi["enabled"]:
+            return tuple(fields)
+        motor = gi["motor"] or "Manual"
+        catalog = self._gi_catalog
+        choices = ("Manual", *(catalog if catalog is not None else (() if motor == "Manual" else (motor,))))
+        fields.append(ControlFormField(SectionId.EXPERIMENT, "Incidence motor", GI_MOTOR, motor,
+                                       ControlFieldKind.COMBO, tuple(dict.fromkeys(choices))))
+        if motor == "Manual":
+            fields.append(ControlFormField(SectionId.EXPERIMENT, "Incidence angle", GI_THETA, gi["angle"]))
+        fields += [ControlFormField(SectionId.EXPERIMENT, "Sample orientation", GI_ORIENTATION, gi["orientation"]),
+                   ControlFormField(SectionId.EXPERIMENT, "Tilt angle", GI_TILT, gi["tilt"])]
+        return tuple(fields)
+
+    def _gi_status(self):
+        if not self._gi["enabled"]:
+            return "standard"
+        if self._value("backend") != "xrayutilities histogram":
+            return "grazing"
+        zero = [role for role, motor in self._gi_sample_motors() if motor is None]
+        return "grazing" + (f" · {', '.join(zero)} read as 0" if zero else "")
+
+    def _render_gi(self):
+        """Int's GI rows in the Experiment section, rebuilt from this page's values; the incidence
+        motor defaults as Int's does, in Stitch's order (eta, gonth, halpha, …), never to a motor
+        the scan does not record."""
+        from xrd_tools.session.gi_motor import STITCH_GI_MOTOR_PREFERENCE, pick_default_gi_motor
+        self._gi_catalog = catalog = self._gi_catalog_now() if self._gi["enabled"] else None
+        motor = self._gi["motor"]
+        if catalog is not None and (motor is None or (motor != "Manual" and motor not in catalog)):
+            self._gi["motor"] = pick_default_gi_motor(catalog, STITCH_GI_MOTOR_PREFERENCE)
+        layout = self._gi_host.layout()
+        while layout.count():
+            widget = layout.takeAt(0).widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        group = SubsectionCard(self.controls.experiment_title, status=self._gi_status(), accent="experiment")
+        self.controls.render_gi_rows(group, self._gi_fields())
+        layout.addWidget(group)
+        for row in self._gi_rows:
+            row.setVisible(self._gi["enabled"])
+
+    def _gi_edited(self, path, value):
+        key = self._GI_KEYS.get(tuple(path))
+        if key is None:
+            return
+        value = bool(value) if key == "enabled" else str(value)
+        if self._gi[key] == value:
+            return
+        self._gi[key] = value
+        if key in ("enabled", "motor"):  # the rows shown change
+            self._render_gi()
+        self._edited()
+
+    def _gi_value(self):
+        """The form's grazing incidence: a StitchGI, or None in Standard."""
+        if not self._gi["enabled"]:
+            return None
+        from xrd_tools.integrate.stitch_gi import GI_SAMPLE_ROLES, StitchGI
+        value = self._value
+        motor = self._gi["motor"] or "Manual"
+        cut = "q_ip" if value("gi_cut") == "Qᵢₚ" else "q_oop"
+        ip, oop = ((None if value(f"{prefix}_auto") else (float(value(f"{prefix}_min")), float(value(f"{prefix}_max"))))
+                   for prefix in ("gi_ip", "gi_oop"))
+        xu = value("backend") == "xrayutilities histogram"
+        return StitchGI(
+            cut, incidence_motor=None if motor == "Manual" else motor,
+            incident_angle_deg=float(self._gi["angle"]) if motor == "Manual" else None,
+            tilt_deg=float(self._gi["tilt"]), sample_orientation=int(self._gi["orientation"]),
+            sample_motors=self._gi_sample_motors() if xu else tuple((role, None) for role in GI_SAMPLE_ROLES),
+            npt=int(value("gi_npt")), cut_range=ip if cut == "q_ip" else oop, window=oop if cut == "q_ip" else ip)
+
+    def _load_gi(self, gi):
+        """A form's (or settings') grazing incidence onto the page."""
+        self._gi["enabled"] = gi is not None
+        if gi is not None:
+            self._gi.update(motor=gi.incidence_motor or "Manual", tilt=f"{gi.tilt_deg:g}",
+                            orientation=str(gi.sample_orientation))
+            if gi.incident_angle_deg is not None:
+                self._gi["angle"] = f"{gi.incident_angle_deg:g}"
+            self.set_field("gi_cut", "Qᵢₚ" if gi.cut == "q_ip" else "Qₒₒₚ")
+            self.set_field("gi_npt", str(gi.npt))
+            ip, oop = (gi.cut_range, gi.window) if gi.cut == "q_ip" else (gi.window, gi.cut_range)
+            for prefix, bounds in (("gi_ip", ip), ("gi_oop", oop)):
+                self.set_field(f"{prefix}_auto", bounds is None)
+                if bounds is not None:
+                    self.set_field(f"{prefix}_min", bounds[0])
+                    self.set_field(f"{prefix}_max", bounds[1])
+        self._render_gi()
+        self._edited()
+
     def _range(self, card, label, keys, values, *, display_decimals=None):
         specs = []
         for key, value in zip(keys, values):
@@ -574,10 +741,12 @@ class StitchPage(QtWidgets.QWidget):
 
     def _render_ranges(self):
         values = {field.path: field for key, field in self._fields.items() if key in self._range_keys}
-        auto = bool(self._fields["radial_auto"].value)
-        for key in ("q_min", "q_max"):
-            values[("Stitch", key)] = replace(self._fields[key], enabled=not auto,
-                                              reason="Disable Auto to edit this range." if auto else "")
+        for low, high, toggle in (("q_min", "q_max", "radial_auto"), ("gi_ip_min", "gi_ip_max", "gi_ip_auto"),
+                                  ("gi_oop_min", "gi_oop_max", "gi_oop_auto")):
+            auto = bool(self._fields[toggle].value)
+            for key in (low, high):
+                values[("Stitch", key)] = replace(self._fields[key], enabled=not auto,
+                                                  reason="Disable Auto to edit this range." if auto else "")
         off = self._threshold_mode == "off"  # Int's rule: the limits follow the Threshold toggle
         for key in ("threshold_min", "threshold"):
             values[("Stitch", key)] = replace(self._fields[key], enabled=not off,
@@ -618,7 +787,7 @@ class StitchPage(QtWidgets.QWidget):
             self._edited()
             return
         old = self._fields[key].value
-        if key != "radial_auto":
+        if not key.endswith("_auto"):
             try:
                 value = None if value is None or not str(value).strip() else float(value)
             except ValueError:
@@ -716,6 +885,8 @@ class StitchPage(QtWidgets.QWidget):
         self._revision += 1
         self._prepared_revision = None
         self._queued_jobs.clear()
+        if getattr(self, "_gi", {}).get("enabled") and self._gi_catalog_now() != self._gi_catalog:
+            self._render_gi()  # another scan: its motors are the incidence choices
         if hasattr(self, "run_bar"):
             self._refresh_inputs_view()
             self._status(self._readiness[0], ready=self._readiness[1])
@@ -1092,6 +1263,7 @@ class StitchPage(QtWidgets.QWidget):
             output_path=output, monitor_selector=MetadataColumnSelector(monitor) if monitor else None,
             backend="xu_hist" if value("backend") == "xrayutilities histogram" else "multigeometry",
             max_frame_bytes=int(value("max_frame_mib")) * 1024 * 1024,
+            gi=self._gi_value(),
             **native,
         )
 
@@ -1147,6 +1319,7 @@ class StitchPage(QtWidgets.QWidget):
         self._render_ranges()
         self._sync_advanced()
         self._refresh_xu_geometry()
+        self._load_gi(form.gi)
 
     def _commit_typing(self):
         """Commit a field still being typed in, before an action reads the inputs. A click on Run

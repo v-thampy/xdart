@@ -1874,6 +1874,21 @@ class ControlsPanel(QtWidgets.QWidget):
                     self._add_bound_row(group, field)
             self.experiment_card.add_row(group)
 
+    @property
+    def experiment_title(self) -> str:
+        """The Sample & measurement subsection's title, for another page's GI rows."""
+        return self._experiment_title
+
+    def render_gi_rows(
+        self,
+        group: "SubsectionCard",
+        fields: tuple[ControlFormField, ...],
+    ) -> None:
+        """Int's grazing-incidence rows for another page's own GI values (Stitch): the
+        Standard|Grazing control, the incidence motor and Manual angle, and '…' for the
+        orientation and tilt. Edits emit ``fieldValueChanged`` with Int's GI paths."""
+        self._render_sample_measurement_rows(group, fields)
+
     def _render_sample_measurement_rows(
         self,
         group: "SubsectionCard",
