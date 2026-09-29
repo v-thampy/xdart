@@ -160,7 +160,7 @@ def prepare_native_stitch_tool(form, project):
     common = dict(npt_1d=form.npt_1d, unit=form.unit, radial_range=form.q_range,
                   monitor_selector=form.monitor_selector, max_frame_bytes=form.max_frame_bytes,
                   native_records=True, conditioning=form.conditioning, mask_path=form.mask_path,
-                  frame_screen=FrameScreenPolicy(exclude=form.frame_screen))
+                  frame_screen=FrameScreenPolicy(exclude=form.frame_screen), gi=form.gi)
     if form.backend == "multigeometry":
         geometry = capture_stitch_geometry(StitchGeometryInput(
             form.geometry_path, form.geometry_kind,
@@ -191,6 +191,8 @@ def prepare_native_stitch_tool(form, project):
         motors = tuple(name for name in acquisition["source_motors"].values()
                        if name is not None)  # a single 2θ arm reads no nu
         energy_name = acquisition["source_energy_selector"]
+    if form.gi is not None:  # every frame's incidence (and xrayutilities' other sample circles)
+        motors += form.gi.metadata_names(form.backend)
     requests, preview_members, warnings = [], [], []
     # Metadata is loaded once per exact source. The receipt is reused without
     # changing membership when a scan appears in more than one output group.

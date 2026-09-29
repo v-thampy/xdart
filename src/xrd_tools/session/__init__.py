@@ -41,6 +41,7 @@ _EXPORTS = {
     "FrozenThresholdPolicy": "xrd_tools.session.run_configuration",
     "get_pool": "xrd_tools.session.io_coordination",
     "GI_MOTOR_PREFERENCE": "xrd_tools.session.gi_motor",
+    "STITCH_GI_MOTOR_PREFERENCE": "xrd_tools.session.gi_motor",
     "GIIntent": "xrd_tools.session.run_configuration",
     "GUIThreadHydrationRefused": "xrd_tools.session.light_1d_retention",
     "H5FilePool": "xrd_tools.session.io_coordination",

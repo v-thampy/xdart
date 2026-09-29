@@ -17,6 +17,11 @@ import re
 GI_MOTOR_PREFERENCE = (
     "th", "eta", "halpha", "gonth", "theta", "alpha_i", "mu", "incidence",
 )
+#: Stitch's order (maintainer, 2026-09-30): the arm's diffractometer tilts the sample with
+#: eta, special setups with gonth or halpha; then Int's other names.
+STITCH_GI_MOTOR_PREFERENCE = (
+    "eta", "gonth", "halpha", "th", "theta", "alpha_i", "mu", "incidence",
+)
 
 #: Rotation hints with PER-HINT affix rules (review wf_3614041c: a single
 #: equals/starts/ends rule still fired through unrelated words at token EDGES —
@@ -82,18 +87,19 @@ def _looks_like_rotation(name: str) -> bool:
     return False
 
 
-def pick_default_gi_motor(motors) -> str:
+def pick_default_gi_motor(motors, preference=GI_MOTOR_PREFERENCE) -> str:
     """Choose the default GI incidence motor from *motors*.
 
-    Returns a motor NAME from *motors* (the named-preference match, else the
-    first rotation-sounding motor) or the literal ``'Manual'`` when nothing
-    looks like an incidence axis.  Never returns a name that is not in *motors*.
+    Returns a motor NAME from *motors* (the first match in *preference*, Int's
+    order by default, else the first rotation-sounding motor) or the literal
+    ``'Manual'`` when nothing looks like an incidence axis.  Never returns a
+    name that is not in *motors*.
     """
     names = [str(m) for m in (motors or []) if str(m)]
     if not names:
         return "Manual"
     lower = {m.lower(): m for m in names}
-    for pref in GI_MOTOR_PREFERENCE:
+    for pref in preference:
         if pref in lower:
             return lower[pref]
     for m in names:

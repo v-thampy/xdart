@@ -83,6 +83,7 @@ from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.integrate.frame_screen import FrameScreen, FrameScreenPolicy
 from xrd_tools.integrate.multi import StitchDiagnostics
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+from xrd_tools.integrate.stitch_gi import StitchGI
 from xrd_tools.analysis.stitch_native import (
     capture_mask, revalidate_mask, native_mask, native_plan_identity,
     native_provenance, capture_callback, geometry_facts,
@@ -1351,6 +1352,8 @@ class StitchOperationPlan:
     flat_path: str | Path | None = None
     #: Flat pixels below this fraction of the flat's median are masked as dead.
     flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
+    #: Grazing incidence: a GI cut written beside I(q) (native Stitch 1D only).
+    gi: StitchGI | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
@@ -1398,6 +1401,7 @@ class StitchOperationPlan:
         ):
             raise ValueError("max_frame_bytes must be a bounded positive exact integer")
         _correction_fields(self)
+        _gi_field(self)
         object.__setattr__(self, "radial_range", radial)
         object.__setattr__(self, "azimuth_range", azimuth)
         object.__setattr__(
@@ -1430,7 +1434,7 @@ class StitchOperationPlan:
              self.error_model,
              None if self._dark_receipt is None else self._dark_receipt.fingerprint,
              None if self._flat_receipt is None else self._flat_receipt.fingerprint),
-        ) + _flat_cutoff_identity(self)
+        ) + _flat_cutoff_identity(self) + _gi_identity(self)
         return value + native_plan_identity(self) if self.native_records else value
 
 
@@ -1454,6 +1458,8 @@ class XuStitchOperationPlan:
     dark_path: str | Path | None = None
     flat_path: str | Path | None = None
     flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
+    #: Grazing incidence: a GI cut written beside I(q) (native Stitch 1D only).
+    gi: StitchGI | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
@@ -1471,6 +1477,7 @@ class XuStitchOperationPlan:
             raise ValueError("XU dark and flat corrections require native records")
         _polarization_field(self)
         _detector_image_fields(self)
+        _gi_field(self)
         if self.q_min_A_inverse is not None or self.q_max_A_inverse is not None:
             if (type(self.q_min_A_inverse) is not float or type(self.q_max_A_inverse) is not float
                     or self.unit != "q_A^-1" or self.radial_range not in
@@ -1521,7 +1528,7 @@ class XuStitchOperationPlan:
                     self.calibration.fingerprint,
                     self.effective_geometry.fingerprint,
                     self.frame_screen.identity(),
-                ) + _xu_corrections_identity(self)
+                ) + _xu_corrections_identity(self) + _gi_identity(self)
                 + (native_plan_identity(self) if self.native_records else ()),
             ),
         )
@@ -1534,6 +1541,20 @@ def _xu_corrections_identity(plan):
              None if plan._dark_receipt is None else plan._dark_receipt.fingerprint,
              None if plan._flat_receipt is None else plan._flat_receipt.fingerprint),
             ) + _flat_cutoff_identity(plan)
+
+
+def _gi_field(plan):
+    if plan.gi is None:
+        return
+    if type(plan.gi) is not StitchGI:
+        raise TypeError("Stitch GI must be an exact StitchGI")
+    if not plan.native_records or plan.mode != "1d" or plan.unit != "q_A^-1":
+        raise ValueError("a GI cut is written beside I(q) by a native Stitch 1D in Q")
+
+
+def _gi_identity(plan):
+    """Only a GI plan changes its identity; every other plan keeps the one it had."""
+    return () if plan.gi is None else (plan.gi.identity(),)
 
 
 def _flat_cutoff_identity(plan):
@@ -1621,6 +1642,8 @@ def _required_stitch_selectors(
     else:
         raise TypeError("stitch selectors require an exact Stitch plan")
     requested += (() if plan.monitor_selector is None else (plan.monitor_selector,))
+    if plan.gi is not None:  # the incidence (and xrayutilities' sample circles), per frame
+        requested += tuple(MetadataColumnSelector(name, 0) for name in plan.gi.metadata_names(plan.backend))
     return tuple(
         sorted(
             {
