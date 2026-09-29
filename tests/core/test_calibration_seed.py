@@ -176,3 +176,15 @@ def test_one_calibrated_frame_predicts_the_other_frames_rings(tmp_path):
         assert np.abs(two_theta(predicted, frame) - two_theta(true_arm, frame)).max() < .05
         assert (ring_summary(predict_frame_seed(predicted, frame).rings)
                 == ring_summary(predict_frame_seed(true_arm, frame).rings))
+
+
+def test_the_calibrations_mask_removes_the_rings_that_fall_only_on_it(tmp_path):
+    frame = _frame({'del': 20., 'nu': 0.})
+    seed = predict_frame_seed(_record(tmp_path), frame)
+    assert len(seed.rings) >= 2
+    two_theta = np.degrees(seed.integrator.center_array((195, 1475), unit='2th_rad', scale=False))
+    mask = two_theta >= (seed.rings[-2].two_theta_deg + seed.rings[-1].two_theta_deg) / 2
+    masked = predict_frame_seed(_record(tmp_path), frame, mask=mask)
+    assert [ring.number for ring in masked.rings] == [ring.number for ring in seed.rings[:-1]]
+    # a mask of another shape is not this frame's: the rings are predicted without it
+    assert predict_frame_seed(_record(tmp_path), frame, mask=np.ones((2, 2), bool)).rings == seed.rings

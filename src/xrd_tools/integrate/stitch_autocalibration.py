@@ -155,7 +155,16 @@ def _seeded_extract(geometry, index, points_per_degree):
         np.random.set_state(state)
 
 
-def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen, cancelled, progress):
+def _masked(valid, mask):
+    """Leave out the calibration's mask (True: excluded), given in the oriented image."""
+    if mask is not None:
+        if np.shape(mask) != valid.shape:
+            raise ValueError(f'the mask is {np.shape(mask)}, the oriented image {valid.shape}')
+        valid &= ~mask
+    return valid
+
+
+def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen, cancelled, progress, mask=None):
     """Frames of the whole scan that the dropped-frame check excludes, before any selection."""
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
     from xrd_tools.sources import open_source  # noqa: PLC0415
@@ -184,6 +193,7 @@ def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen
                 valid &= ~detector_mask
             if max_counts is not None:
                 valid &= image <= float(max_counts)
+            valid = _masked(valid, mask)
             totals.append(float(image[valid].sum()))
             if progress is not None:
                 progress('Screening the scan', len(totals), len(labels))
@@ -199,12 +209,13 @@ def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen
 def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_rotation=0,
                              calibrant='LaB6', frame_indices=None, max_frames=48,
                              points_per_degree=2.0, max_counts=None, frame_screen=_CALIBRATION_SCREEN,
-                             cancelled=None, progress=None) -> ScanRingPoints:
+                             cancelled=None, progress=None, mask=None) -> ScanRingPoints:
     """Extract calibrant ring points from frames across the scan's angle grid.
 
     Every frame of the scan is screened for dropped frames first, then frames
     are chosen among the rest. ``progress(stage, done, total)`` reports the
-    screened frames and each frame's ring search.
+    screened frames and each frame's ring search. ``mask`` (True: left out) is
+    the calibration's mask in the oriented image, applied with the detector's.
     """
     from pyFAI.goniometer import SingleGeometry  # noqa: PLC0415
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
@@ -220,8 +231,9 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
     exact = _exact_source(spec)
     # Screen every frame of the scan (cheap totals) before choosing, so each frame
     # is compared with all of its nu-row neighbours, not with a sparse selection.
+    mask = None if mask is None else np.asarray(mask, dtype=bool)
     scan_excluded = _screen_scan_frames(exact, rows, diff, orientation, max_counts,
-                                        frame_screen, cancelled, progress)
+                                        frame_screen, cancelled, progress, mask)
     dropped = {item['index'] for item in scan_excluded}
     if frame_indices is None:
         selected, coverage = stratified_frame_indices(
@@ -257,7 +269,7 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
                 valid &= ~np.asarray(integrator.detector.mask, dtype=bool)
             if max_counts is not None:
                 valid &= image <= float(max_counts)
-            return image, valid
+            return image, _masked(valid, mask)
 
         integrators = list(create_multigeometry_integrator_series_from_geometry(diff, motors))
         # An explicit selection may name a dropped frame; an automatic one never does.
@@ -317,7 +329,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                          calibrant='LaB6', frame_indices=None, max_frames=48, points_per_degree=2.0,
                          max_counts=None, frame_screen=_CALIBRATION_SCREEN, reject_outliers=4.5,
                          min_improvement=0.2, max_rms_q=0.03, cancelled=None,
-                         progress=None, instrument_geometry=None) -> CalibrationFit:
+                         progress=None, instrument_geometry=None, mask=None) -> CalibrationFit:
     """Refine a stacked-arm calibration from its calibrant scan, automatically.
 
     Returns a MultiGeometry :class:`CalibrationFit` for :func:`save_calibration_fit`.
@@ -326,6 +338,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
     detector-mount/sample-offset extension. ``progress(stage, done, total)``
     reports frames read, frames searched and validation folds.
     ``instrument_geometry`` (which motor drives which circle) is recorded as given.
+    ``mask`` (True: left out, in the oriented image) is kept out of the ring search;
+    its SHA-256 is recorded.
     """
     record, diff, digest = _seed(geometry, source_motors)
     arm = diff.stacked_arm
@@ -333,7 +347,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
         spec, record, source_motors=source_motors, image_rotation=image_rotation,
         calibrant=calibrant, frame_indices=frame_indices, max_frames=max_frames,
         points_per_degree=points_per_degree, max_counts=max_counts,
-        frame_screen=frame_screen, cancelled=cancelled, progress=progress)
+        frame_screen=frame_screen, cancelled=cancelled, progress=progress, mask=mask)
     poni = diff.calibration.poni
     config = dict(diff.calibration.detector_config)
 
@@ -405,6 +419,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                       'extraction_seed': 'numpy global generator seeded by frame index, restored after',
                       'seed_sha256': digest, 'source': source, 'calibrant': str(calibrant),
                       'points_per_degree': float(points_per_degree), 'max_counts': max_counts,
+                      'mask_sha256': None if mask is None else hashlib.sha256(repr(np.shape(mask)).encode()
+                          + np.packbits(np.asarray(mask, dtype=bool)).tobytes()).hexdigest(),
                       'frame_screen': frame_screen.to_provenance(), 'excluded_frames': list(points.excluded),
                       'outlier_threshold_sigma': reject_outliers, 'rejected_points': result.rejected_points,
                       'validation': validation}}

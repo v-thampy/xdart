@@ -638,3 +638,27 @@ def test_a_cancel_during_the_prediction_keeps_the_frame_pyfai_saved(tmp_path):
     assert adopted.complete and prediction is None
     adopted, prediction = _run_job(request, Event(), lambda *_: True)
     assert adopted.complete and prediction is not None
+
+
+def test_the_detector_mask_reaches_pyfai_turned_as_the_frames_are(tmp_path):
+    import fabio
+    from xdart.gui.tabs.stitch.calibration import _pyfai_arguments
+    from tests.core.test_calibration_seed import _frame
+    mask = np.zeros((195, 1475), bool)
+    mask[:10, :20] = True  # drawn on the stored image
+    np.save(tmp_path / 'mask.npy', mask)
+    dialog = StitchCalibrationDialog(tmp_path)
+    try:
+        dialog._fields['mask'].setText(str(tmp_path / 'mask.npy'))
+        dialog.rotation.setCurrentIndex(dialog.rotation.findData(90))
+        path = dialog._pyfai_mask()
+        np.testing.assert_array_equal(fabio.open(path).data.astype(bool), np.rot90(mask))  # 90° counterclockwise
+        np.testing.assert_array_equal(dialog._loaded_mask(), np.rot90(mask))  # the expected rings' mask too
+        seed = {**dialog._seed_options(), 'mask': path}
+        arguments = _pyfai_arguments(_frame({'del': 20., 'nu': 0.}, shape=(1475, 195)), seed)
+        assert arguments[arguments.index('-m') + 1] == path
+        dialog._fields['mask'].setText(str(tmp_path / 'missing.npy'))
+        with pytest.raises(ValueError, match="the Detector panel's mask cannot be read"):
+            dialog._pyfai_mask()
+    finally:
+        dialog.close()

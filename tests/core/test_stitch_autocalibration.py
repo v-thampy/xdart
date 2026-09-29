@@ -79,3 +79,22 @@ def test_a_seed_beam_rotation_is_not_carried_into_the_refined_arm(tmp_path):
     fit = refine_arm_from_scan(ring_scan(tmp_path / 'scan'), seed, max_frames=12)
     calibration = fit.asset['calibration']
     assert dict(zip(calibration['param_names'], calibration['param']))['beam_rotation'] == 0.
+
+
+def test_the_calibrations_mask_keeps_ring_points_off_its_pixels(tmp_path):
+    """One mask for the whole calibration (maintainer, 2026-09-29): the ring search skips its pixels,
+    the refinement records which mask it used, and a mask of another shape is refused."""
+    import pytest
+    from xrd_tools.integrate.stitch_autocalibration import extract_scan_ring_points, refine_arm_from_scan
+    spec = ring_scan(tmp_path / 'scan')
+    seed = five_parameter_seed(ROW_ANGLES)
+    mask = np.zeros((195, 1475), bool)
+    mask[:, :700] = True
+    unmasked = extract_scan_ring_points(spec, seed, max_frames=12)
+    assert any(control.col_positions.min() < 600 for control in unmasked.controls)
+    masked = extract_scan_ring_points(spec, seed, max_frames=12, mask=mask)
+    assert all(control.col_positions.min() >= 699 for control in masked.controls)
+    fit = refine_arm_from_scan(spec, seed, max_frames=12, mask=mask)
+    assert len(fit.asset['provenance']['automatic_refinement']['mask_sha256']) == 64
+    with pytest.raises(ValueError, match=r'the mask is \(2, 2\), the oriented image \(195, 1475\)'):
+        extract_scan_ring_points(spec, seed, max_frames=12, mask=np.zeros((2, 2), bool))

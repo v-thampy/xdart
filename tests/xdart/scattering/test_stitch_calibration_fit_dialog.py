@@ -122,6 +122,7 @@ def test_the_guided_fit_takes_the_extension_and_saves_both_files(qapp, tmp_path,
         _wait(dialog)
         assert adopted == [(str(target), 'multigeometry')]  # once, with both files written
         assert Path(page._value("geometry_path")) == target
+        assert page._value("mask_path") == ""  # no calibration mask: Stitch's Mask File is left alone
         assert page._value("geometry_kind") == "Goniometer JSON"
         record = json.loads(target.read_text())
         assert EXTENDED_ARM_MARKER in record['trans_function']['constants']
@@ -170,11 +171,15 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
         fitted = dict(zip(record['param_names'], record['param']))
         assert fitted['nu_offset'] == pytest.approx(.02, abs=2e-3)  # the arm's yaw
         assert fitted['del_offset'] == pytest.approx(-.05, abs=2e-3)
+        mask = tmp_path / 'detector-mask.npy'
+        np.save(mask, np.zeros((195, 1475), bool))
+        dialog._fields['mask'].setText(str(mask))  # the calibration's mask becomes Stitch's Mask File
         target = (tmp_path / 'calibration' / 'twoc.json').resolve()
         _save_to(monkeypatch, target)
         dialog.save_button.click()
         _wait(dialog)
         assert Path(page._value("geometry_path")) == target
+        assert page._value("mask_path") == str(mask)
         assert page._instrument() == InstrumentGeometry('twoc')
         assert page._value("source_motors") == "del_angle=tth"
         assert page._arm_problem() is None

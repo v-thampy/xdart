@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import uuid
 
+import numpy as np
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.pages.operation_owner import SingleWorkerOwner, OperationCancelled, OperationTerminalStatus
@@ -81,6 +82,8 @@ def _pyfai_arguments(frame, seed, cancelled=None):
     """pyFAI-calib2 options for one guided frame: its calibrant and energy, and the frame's
     predicted geometry when a calibration is at hand, so "extract rings" numbers the rings."""
     arguments = ['-c', seed['calibrant']]
+    if seed.get('mask'):  # the Detector panel's mask, turned as the staged frame is
+        arguments += ['-m', seed['mask']]
     record = _seed_record(seed, cancelled)
     if record is not None:
         from xrd_tools.integrate.calibration_seed import predict_frame_seed, write_seed_poni
@@ -308,6 +311,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.saved_source_motors = {}
         self.saved_instrument_geometry = None
         self.saved_image_rotation = 0
+        self.saved_mask = ''
         self._owner = SingleWorkerOwner(_run_job)
         self._fields = {}
         #: key -> (form, row widget); a field sharing another's row is in _parts instead
@@ -820,8 +824,11 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                        'beam strip is left out, and the automatic refinement picks no ring points above it. '
                        'Blank: the image type\'s maximum.')
         self._edit(form, 'mask', 'Mask file', chooser='Masks (*.edf *.tif *.tiff *.npy);;All files (*)',
-                   tip='Pixels to leave out when finding the direct beam, drawn on the stored image (before '
-                       'the image rotation), as the Stitch Mask File is.')
+                   tip='Pixels to leave out everywhere in this calibration: the direct-beam fit, pyFAI-calib2 '
+                       '(its mask), the automatic refinement\'s ring search and the expected rings. Drawn on '
+                       'the stored image (before the image rotation), as the Stitch Mask File is; saving the '
+                       'calibration makes it Stitch\'s Mask File.')
+        self._fields['mask'].editingFinished.connect(self._render_frames)
         return panel
 
     _ROUGH_NOTES = {
@@ -1061,7 +1068,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         return frame
 
     def _calibrate(self):
-        self._guard(lambda: self._start('calibrate', (self._selected_frame(), self._seed_options())))
+        self._guard(lambda: self._start('calibrate', (self._selected_frame(),
+                                                      {**self._seed_options(), 'mask': self._pyfai_mask()})))
 
     def _seed_options(self):
         """What pyFAI opens a frame with (see ``_pyfai_arguments``)."""
@@ -1097,13 +1105,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             return None
         import hashlib
         key = (frame.identity, seed['calibrant'], hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
-               if isinstance(record, dict) else record)
+               if isinstance(record, dict) else record, self._mask_state())
         if key not in self._ring_cache:
             from xrd_tools.integrate.calibration_seed import predict_frame_seed
             try:
                 self._ring_cache[key] = predict_frame_seed(
                     record, frame, calibrant=seed['calibrant'], del_motor=seed['del_motor'],
-                    nu_motor=seed['nu_motor']).rings
+                    nu_motor=seed['nu_motor'], mask=self._loaded_mask()).rings
             except (ValueError, KeyError, OSError):
                 self._ring_cache[key] = None
         return self._ring_cache[key]
@@ -1203,6 +1211,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                            calibrant=self.refine_calibrant.currentText().strip() or 'LaB6',
                            max_frames=int(self._text('refine_frames')),
                            max_counts=float(self._text('saturation')) if self._text('saturation') else None,
+                           mask=self._oriented_mask() if self._text('mask') else None,
                            max_rms_q=float(self._text('rms')))
             self._invalidate_fit()
             self._start('refine', (spec, seed, options))
@@ -1251,6 +1260,45 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         from xrd_tools.io.image import load_mask
         return ImageOrientation(rotation=int(self.rotation.currentData() or 0)).apply(
             load_mask(self._text('mask'))).astype(bool)
+
+    def _mask_state(self):
+        """The mask as used: its file's state and the rotation (None without a mask)."""
+        if not self._text('mask'):
+            return None
+        try:
+            state = Path(self._text('mask')).stat()
+        except OSError:
+            return (self._text('mask'), None)
+        return (self._text('mask'), state.st_mtime_ns, state.st_size, self.rotation.currentData())
+
+    def _loaded_mask(self):
+        """The turned mask for the expected rings, loaded once per mask state (None when it
+        cannot be read: the rings are then predicted without it)."""
+        state = self._mask_state()
+        if state is None:
+            return None
+        if getattr(self, '_mask_cache', (None,))[0] != state:
+            try:
+                self._mask_cache = (state, self._oriented_mask())
+            except (OSError, ValueError):
+                self._mask_cache = (state, None)
+        return self._mask_cache[1]
+
+    def _pyfai_mask(self):
+        """The turned mask as a file pyFAI-calib2 reads (non-zero: masked), in the session folder."""
+        mask = self._loaded_mask()
+        if mask is None:
+            if self._text('mask'):
+                raise ValueError(f"the Detector panel's mask cannot be read: {self._text('mask')}")
+            return None
+        import hashlib
+        import fabio
+        digest = hashlib.sha256(repr(mask.shape).encode() + np.packbits(mask).tobytes()).hexdigest()[:16]
+        path = self.session_dir / 'masks' / f'mask-{digest}.edf'
+        if not path.is_file():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fabio.edfimage.EdfImage(data=mask.astype(np.int8)).write(str(path))
+        return str(path)
 
     def _distance(self):
         def go():
@@ -1423,6 +1471,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     self.saved_source_motors = provenance['source_motors']
                     self.saved_instrument_geometry = provenance.get('instrument_geometry')
                     self.saved_image_rotation = provenance['image_rotation']
+                    self.saved_mask = self._text('mask')  # becomes Stitch's Mask File when set
                     from xdart.utils.browse import remember_browse_path
                     remember_browse_path(Path(result.pyfai_path))
                     self.fit_summary.appendPlainText('\n' + saved_pair_text(result))

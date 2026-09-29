@@ -1526,6 +1526,8 @@ class StitchPage(QtWidgets.QWidget):
                 fitted = None
             if fitted is not None and fitted != self._instrument():
                 self._set_instrument(fitted)
+            if dialog.saved_mask:  # the calibration's mask is this detector's: Stitch leaves it out too
+                self.set_field("mask_path", dialog.saved_mask)
             if self._value("backend") == "xrayutilities histogram":  # the partner owns its mapping
                 self._refresh_xu_geometry()
                 return

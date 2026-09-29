@@ -51,16 +51,17 @@ def _source_motors(record, del_motor, nu_motor):
     return mapping
 
 
-def expected_rings(integrator, calibrant, shape) -> tuple[ExpectedRing, ...]:
-    """The calibrant rings whose 2θ falls on an unmasked pixel of this geometry."""
+def expected_rings(integrator, calibrant, shape, mask=None) -> tuple[ExpectedRing, ...]:
+    """The calibrant rings whose 2θ falls on an unmasked pixel of this geometry: the detector's
+    mask and ``mask`` (True: left out, in the frame's image), when it has the frame's shape."""
     from pyFAI.calibrant import get_calibrant
     reference = get_calibrant(calibrant) if isinstance(calibrant, str) else calibrant
     reference.wavelength = float(integrator.wavelength)
     two_theta = np.asarray(integrator.center_array(tuple(shape), unit='2th_rad', scale=False), dtype=float)
     valid = np.isfinite(two_theta)
-    mask = getattr(integrator.detector, 'mask', None)
-    if mask is not None and np.shape(mask) == two_theta.shape:
-        valid &= ~np.asarray(mask, dtype=bool)
+    for excluded in (getattr(integrator.detector, 'mask', None), mask):
+        if excluded is not None and np.shape(excluded) == two_theta.shape:
+            valid &= ~np.asarray(excluded, dtype=bool)
     if not valid.any():
         return ()
     low, high = float(two_theta[valid].min()), float(two_theta[valid].max())
@@ -71,8 +72,9 @@ def expected_rings(integrator, calibrant, shape) -> tuple[ExpectedRing, ...]:
     return tuple(rings)
 
 
-def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_motor='nu') -> FrameSeed:
-    """The frame's geometry predicted from a goniometer calibration, with its rings."""
+def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_motor='nu', mask=None) -> FrameSeed:
+    """The frame's geometry predicted from a goniometer calibration, with its rings (none on
+    ``mask``, the calibration's mask in the frame's image)."""
     from pyFAI import units
     from xrd_tools.core.geometry import Diffractometer
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
@@ -91,7 +93,7 @@ def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_m
         raise ValueError('the calibration detector does not match the staged frame')
     if frame.energy_eV:  # the frame's own energy, as the scan recorded it
         integrator.wavelength = units.hc / (float(frame.energy_eV) / 1000.) * 1e-10
-    return FrameSeed(integrator, expected_rings(integrator, calibrant, frame.shape))
+    return FrameSeed(integrator, expected_rings(integrator, calibrant, frame.shape, mask))
 
 
 def session_prediction(frames, *, del_motor='del', nu_motor='nu', cancelled=None):
