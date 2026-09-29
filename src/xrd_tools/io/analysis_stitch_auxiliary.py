@@ -175,39 +175,6 @@ def native_stitch_companion(radial, unit, wavelength_A):
     return target, converted
 
 
-def write_native_stitch_auxiliary(entry, projection, records, source_base):
-    from xrd_tools.io.nexus_record import write_contributing_frames
-    from xrd_tools.io.nexus import _bounded_text_attr
-    manifest = analysis_contributing_frames_manifest(records, source_base=source_base)
-    if canonical_frame_manifest(manifest) != projection.frame_manifest_json:
-        raise ValueError("contributing frames changed after stored result projection")
-    write_contributing_frames(entry, records, source_base=source_base, bounded=True)
-    entry.create_dataset("contributing_frames_json", data=np.bytes_(projection.frame_manifest_json.encode()))
-    group = entry["stitched_1d"]
-    unit, axis = native_stitch_companion(projection.axes[0][1], projection.axis_units[0][1], projection.wavelength_A)
-    ds = group.create_dataset("companion_axis", data=axis)
-    _bounded_text_attr(ds, "units", unit)
-    group.create_dataset("wavelength_A", data=float(projection.wavelength_A))
-
-
-def inspect_native_stitch_auxiliary(entry, result, provenance, radial, unit):
-    """Admit the exact local auxiliary graph, without following raw source paths."""
-    from xrd_tools.io.analysis_artifact import (
-        _direct, _require_bounded_chunk, _bounded_attr_text, AnalysisArtifactInvalid,
-    )
-    raw = inspect_contributing_frames(entry, provenance)
-    wavelength = _direct(result, "wavelength_A", h5py.Dataset)
-    if wavelength.shape != () or wavelength.dtype != np.dtype("float64") or len(wavelength.attrs):
-        raise AnalysisArtifactInvalid("native Stitch wavelength storage differs")
-    wavelength_A = float(wavelength[()])
-    companion = _direct(result, "companion_axis", h5py.Dataset)
-    _require_bounded_chunk(companion)
-    companion_unit, expected_axis = native_stitch_companion(radial, unit, wavelength_A)
-    if companion.shape != radial.shape or companion.dtype != np.dtype("float32") or set(companion.attrs) != {"units"} or _bounded_attr_text(companion, "units") != companion_unit or not np.array_equal(companion[()], expected_axis):
-        raise AnalysisArtifactInvalid("native Stitch companion coordinate differs from conversion")
-    return wavelength_A, raw
-
-
 def inspect_contributing_frames(entry, provenance):
     """Admit the exact contributing-frames graph of ``entry`` (a stitched record's ``stitch`` group, or
     an older artifact's entry) against the frozen selected members in ``provenance``, without following

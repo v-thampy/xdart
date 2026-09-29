@@ -3751,7 +3751,6 @@ def write_stitched(
     normalization: np.ndarray | None = None,
     compression: str | None = None,
     bounded_artifact: bool = False,
-    wavelength_A: float | None = None,
 ) -> None:
     """Write ``/entry/stitched_1d`` / ``/entry/stitched_2d`` — the symmetric
     counterpart to :func:`read_stitched`.
@@ -3781,8 +3780,7 @@ def write_stitched(
     if type(legacy_v1_unit_layout) is not bool:
         raise TypeError("legacy_v1_unit_layout must be an exact bool")
     neutral_axes = _uses_neutral_stitch_axes(entry_grp, bounded_artifact=bounded_artifact)
-    from xrd_tools.io.analysis_artifact import _STITCH_NATIVE_VERSIONS
-    native = bounded_artifact and entry_grp.attrs.get(SCHEMA_VERSION_ATTR) in _STITCH_NATIVE_VERSIONS
+    # A native Stitch 1D result is an Int record (stitch_record), never written here.
     if result_projection is not None:
         from xrd_tools.io.analysis_artifact import (
             AnalysisArtifactKind,
@@ -3805,7 +3803,8 @@ def write_stitched(
             or stitched_2d is not None
             or coverage is not None
             or normalization is not None
-            or (not native and (frame_records is not None or source_base is not None))
+            or frame_records is not None
+            or source_base is not None
         ):
             raise ValueError(
                 "stored Stitch projection is exclusive to a bounded artifact"
@@ -3870,11 +3869,6 @@ def write_stitched(
         )
         if neutral_axes:
             _finish_stitch_axis_layout(group, bounded=True)
-        if native:
-            from xrd_tools.io.analysis_stitch_auxiliary import write_native_stitch_auxiliary
-            if result_projection.wavelength_A != wavelength_A:
-                raise ValueError("native Stitch wavelength differs from stored projection")
-            write_native_stitch_auxiliary(entry_grp, result_projection, frame_records, source_base)
         return
     if bounded_artifact:
         from xrd_tools.io.analysis_artifact import (
@@ -3890,7 +3884,7 @@ def write_stitched(
             raise ValueError(
                 "bounded analysis artifact requires exactly one stitched result"
             )
-        if not native and (frame_records is not None or source_base is not None):
+        if frame_records is not None or source_base is not None:
             raise ValueError(
                 "bounded analysis artifact does not accept unbound frame records"
             )
@@ -3922,7 +3916,6 @@ def write_stitched(
                 ("q", value.unit),
                 ("chi", value.azimuthal_unit),
             )
-        auxiliary = dict(wavelength_A=wavelength_A, frame_records=frame_records, source_base=source_base) if native else {}
         projection = _project_analysis_artifact_result_v1_compat(
             kind=kind,
             axes=axes,
@@ -3931,7 +3924,6 @@ def write_stitched(
             sigma=value.sigma,
             coverage=coverage,
             normalization=normalization,
-            **auxiliary,
         )
         return write_stitched(
             entry_grp,
@@ -3940,7 +3932,6 @@ def write_stitched(
             provenance=provenance,
             compression=compression,
             bounded_artifact=True,
-            **auxiliary,
         )
     if legacy_v1_unit_layout:
         raise ValueError(

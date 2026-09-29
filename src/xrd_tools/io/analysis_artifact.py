@@ -2269,6 +2269,10 @@ def inspect_analysis_artifact(
                 kind = AnalysisArtifactKind(_bounded_attr_text(entry, ANALYSIS_KIND_ATTR))
             except ValueError as error:
                 raise AnalysisArtifactInvalid("analysis artifact kind is invalid") from error
+            if kind is AnalysisArtifactKind.STITCH_1D:  # an Int record now (stitch_record, admitted above)
+                raise AnalysisArtifactInvalid(
+                    "a Stitch 1D result is an Int record; this older Stitch artifact is not read"
+                )
             if (
                 version == ANALYSIS_SCHEMA_VERSION_V3
                 and kind is not AnalysisArtifactKind.RSM
@@ -2652,18 +2656,6 @@ def inspect_analysis_artifact(
                 )
             try:
                 wavelength_A = frame_manifest_json = None
-                if version in _STITCH_NATIVE_VERSIONS:
-                    from xrd_tools.io.analysis_stitch_auxiliary import inspect_native_stitch_auxiliary
-                    wavelength_A, frame_manifest_json = inspect_native_stitch_auxiliary(
-                        entry, result, json.loads(provenance), axes[0][1], axis_units[0][1],
-                    )
-                    if execution_attestation_json is not None and (
-                        len(json.loads(frame_manifest_json)["records"])
-                        != json.loads(execution_attestation_json)["selected_frame_count"]
-                    ):
-                        raise AnalysisArtifactInvalid(
-                            "contributing frames differ from the science execution count"
-                        )
                 projection = project_analysis_artifact_result(
                     wavelength_A=wavelength_A,
                     _frame_manifest_json=frame_manifest_json,

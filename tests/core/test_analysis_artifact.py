@@ -2558,3 +2558,16 @@ def test_win32_identity_inspects_and_reads_the_pathname_ctime_shape(
     assert inspection.storage_revision[4] == 0
     payload = read_analysis_artifact(request.target)
     assert payload.inspection == inspection
+
+
+def test_an_older_stitch_1d_artifact_is_refused(tmp_path):
+    """A Stitch 1D result is an Int record (maintainer, 2026-09-29: no compatibility with earlier
+    Stitch outputs); a file in the older artifact layout that says Stitch 1D is not read."""
+    request = _request(tmp_path / "older-stitch-1d.nexus", AnalysisArtifactKind.STITCH_2D)
+    admit_analysis_artifact(request, coordinator=OutputTransactionCoordinator()).publish(_writer(request))
+    with h5py.File(request.target, "r+") as handle:
+        entry = handle["entry"]
+        del entry.attrs[ANALYSIS_KIND_ATTR]
+        entry.attrs.create(ANALYSIS_KIND_ATTR, np.bytes_(AnalysisArtifactKind.STITCH_1D.value.encode()))
+    with pytest.raises(AnalysisArtifactInvalid, match="Int record"):
+        inspect_analysis_artifact(request.target)
