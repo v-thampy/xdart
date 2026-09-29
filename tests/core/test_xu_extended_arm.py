@@ -259,7 +259,7 @@ def test_a_guided_xu_extended_fit_saves_a_v3_asset_the_runtime_admits(tmp_path):
 
 
 def test_an_xu_gi_cut_bins_pyfais_fiber_coordinates_and_leaves_iq_alone(tmp_path, transferred):
-    """GI Stitch 1D with xrayutilities (maintainer, 2026-09-29/30): every frame's sample normal comes
+    """GI Stitch 1D with xrayutilities (maintainer, 2026-09-29): every frame's sample normal comes
     from all four sample angles (17-2's mounting: chi 90, eta the incidence), and the cut bins exactly
     the pixels pyFAI's fiber model puts there (orientation 4, the same incidence), sample offset and
     all; I(q) beside it is unchanged."""

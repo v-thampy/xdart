@@ -750,7 +750,7 @@ def test_stitch_images_rejects_unknown_backend(monkeypatch):
 
 
 def test_the_streaming_gi_cut_equals_pyfais_multigeometryfiber_and_leaves_iq_alone():
-    """A GI Stitch 1D with pyFAI (maintainer, 2026-09-29/30): the q_oop cut, streamed one frame at a
+    """A GI Stitch 1D with pyFAI (maintainer, 2026-09-29): the q_oop cut, streamed one frame at a
     time, equals pyFAI's MultiGeometryFiber over all frames at once (its accumulators are sized for
     a q_oop cut); I(q) beside it is the plain streaming result."""
     import numpy as np

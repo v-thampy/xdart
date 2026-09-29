@@ -1,4 +1,4 @@
-"""Grazing incidence for a native Stitch 1D (maintainer, 2026-09-29/30): the GI value, and the
+"""Grazing incidence for a native Stitch 1D (maintainer, 2026-09-29): the GI value, and the
 incidence (and xrayutilities' other sample circles) bound per frame like the arm's motors."""
 from dataclasses import replace
 from pathlib import Path
