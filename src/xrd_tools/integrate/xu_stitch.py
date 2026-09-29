@@ -646,6 +646,13 @@ class XuPowderQFrameLease:
         side *= 0.5
         return side
 
+    def gi_coordinates(self, normal, beam) -> tuple[np.ndarray, np.ndarray]:
+        """(q_ip, q_oop) for the sample normal ``normal`` in the lab (see ``stitch_gi``)."""
+        if self._released:
+            raise RuntimeError("XU q-frame lease is released")
+        from xrd_tools.integrate.stitch_gi import gi_coordinates
+        return gi_coordinates(*self._values, normal, beam)
+
     def release(self) -> None:
         if self._released:
             return
@@ -769,14 +776,19 @@ def _checked_frame_histograms(
     polarization: tuple | None = None,
     dark: np.ndarray | None = None,
     flat: np.ndarray | None = None,
+    gi_cut: tuple | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Produce one frame's 1-D contributions and prove frame release.
 
     As in pyFAI, a dark is subtracted from the conditioned frame, and the flat
     and polarization weight the normalization next to the solid angle.
+    ``gi_cut`` (normal, beam, cut, window, edges) also bins the frame's GI cut,
+    from the same pixels and weights; its histograms are the fifth value.
     """
 
     raw_image = image = q = valid = weights = factor = solid = None
+    cut = other = inside = q_ip = q_oop = None
+    gi_histograms = None
     lease: XuPowderQFrameLease | None = None
     owned_refs: list[weakref.ReferenceType] = []
     pending: BaseException | None = None
@@ -846,6 +858,18 @@ def _checked_frame_histograms(
             np.float64,
             copy=False,
         )
+        if gi_cut is not None:
+            normal, beam, axis, window, gi_edges = gi_cut
+            q_ip, q_oop = lease.gi_coordinates(normal, beam)
+            cut, other = (q_ip, q_oop) if axis == "q_ip" else (q_oop, q_ip)
+            q_ip = q_oop = None
+            owned_refs.extend((weakref.ref(cut), weakref.ref(other)))
+            inside = np.logical_and(valid, np.isfinite(cut))
+            if window is not None:
+                np.logical_and(inside, (other >= window[0]) & (other <= window[1]), out=inside)
+            gi_histograms = (np.histogram(cut[inside], gi_edges, weights=image[inside])[0],
+                             np.histogram(cut[inside], gi_edges, weights=weights[inside])[0],
+                             np.histogram(cut[inside], gi_edges)[0].astype(np.float64, copy=False))
         # Whole-frame monitor-normalised total: the dropped-frame statistic. Not
         # the in-range histogram, which legitimately shrinks at the range edges.
         d_total = float(image[valid].sum())
@@ -853,6 +877,7 @@ def _checked_frame_histograms(
         pending = error.with_traceback(None)
     finally:
         raw_image = image = q = valid = weights = factor = solid = None
+        cut = other = inside = q_ip = q_oop = None
         release_error: BaseException | None = None
         if lease is not None:
             try:
@@ -881,7 +906,30 @@ def _checked_frame_histograms(
         raise XuStitchScienceRefused(
             "STITCH_NUMERIC_OVERFLOW", "frame histograms were not produced"
         )
-    return d_signal, d_normalization, d_count, d_total
+    return d_signal, d_normalization, d_count, d_total, gi_histograms
+
+
+def _scout_gi_range(provider, frame_inputs, normals, beam, gi, cancel_token):
+    """The GI cut's full geometry extent inside the window, over every selected frame."""
+    low, high = math.inf, -math.inf
+    for (_label, del_value, nu_value, _monitor), normal in zip(frame_inputs, normals):
+        if cancel_token is not None and cancel_token.is_set():
+            raise XuStitchCancelled("CANCELLED")
+        lease = provider.frame(nu=nu_value, del_=del_value)
+        try:
+            q_ip, q_oop = lease.gi_coordinates(normal, beam)
+            cut, other = (q_ip, q_oop) if gi.cut == "q_ip" else (q_oop, q_ip)
+            inside = np.isfinite(cut)
+            if gi.window is not None:
+                inside &= (other >= gi.window[0]) & (other <= gi.window[1])
+            if inside.any():
+                low, high = min(low, float(cut[inside].min())), max(high, float(cut[inside].max()))
+        finally:
+            q_ip = q_oop = cut = other = inside = None
+            lease.release()
+    if not low < high:
+        raise XuStitchScienceRefused("STITCH_GI_RANGE_EMPTY", "no pixel lies inside the GI window")
+    return low, high
 
 
 @dataclass(frozen=True, slots=True)
@@ -955,8 +1003,15 @@ class XuStitchScienceResult:
     observations: XuStitchScienceObservations
     selected_frame_count: int
     release_check_frame_count: int
+    #: A GI Stitch's cut, beside I(q) (``stitch_gi``); None otherwise.
+    gi_payload: IntegrationResult1D | None = None
+    gi_diagnostics: StitchDiagnostics | None = None
 
     def __post_init__(self) -> None:
+        if (self.gi_payload is None) != (self.gi_diagnostics is None) or (
+                self.gi_payload is not None and (type(self.gi_payload) is not IntegrationResult1D
+                                                 or type(self.gi_diagnostics) is not StitchDiagnostics)):
+            raise TypeError("XU Stitch GI result is invalid")
         if (
             type(self.payload) is not IntegrationResult1D
             or type(self.diagnostics) is not StitchDiagnostics
@@ -994,6 +1049,7 @@ def run_xu_hist_stitch_1d(
     dark: np.ndarray | None = None,
     flat: np.ndarray | None = None,
     flat_min_fraction: float = 0.1,
+    gi=None,
 ) -> XuStitchScienceResult:
     """Run native Q or 2theta histogram bins; omitted bounds scout all geometry.
 
@@ -1006,7 +1062,13 @@ def run_xu_hist_stitch_1d(
     ``frame_record_callback`` borrows each raw frame before conditioning.
     ``polarization_factor``, ``dark`` and ``flat`` (oriented like the frames)
     apply pyFAI's corrections; an unusable dark or flat pixel joins the mask.
+    ``gi`` (a ``StitchGI``) also bins the GI cut beside I(q): every frame's sample
+    normal comes from xrayutilities' sample transform with all four sample angles
+    (eta from the incidence), and the result carries it as ``gi_payload``.
     """
+    from xrd_tools.integrate.stitch_gi import StitchGI, xu_sample_normal
+    if gi is not None and (type(gi) is not StitchGI or unit != "q_A^-1"):
+        raise TypeError("an XU GI cut needs an exact StitchGI beside I(q) in Q")
     if type(receipt) is not XuStitchCalibrationReceipt:
         raise TypeError("XU Stitch science requires exact calibration receipt")
     if unit not in {"q_A^-1", "2th_deg"}:
@@ -1073,6 +1135,7 @@ def run_xu_hist_stitch_1d(
     acquisition = asset["acquisition"]
     validation = asset["validation"]
     frame_inputs: list[tuple[int, float, float, float]] = []
+    sample_angles: list[tuple[float, float, float, float]] = []  # GI: (mu, eta, chi, phi) per frame
     del_values: list[float] = []
     nu_values: list[float] = []
     energy_values: list[float] = []
@@ -1152,6 +1215,18 @@ def run_xu_hist_stitch_1d(
                     "source energy conflicts with the calibrated XU energy",
                 )
             energy_values.append(energy)
+        if gi is not None:
+            try:
+                circles = {role: 0.0 if motor is None else float(metadata[motor])
+                           for role, motor in gi.sample_motors}
+                angles = (circles["mu"], gi.incidence(metadata), circles["chi"], circles["phi"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise XuStitchScienceRefused(
+                    "INVALID_METADATA_VALUE", "a GI sample angle is unavailable"
+                ) from error
+            if not all(math.isfinite(value) for value in angles):
+                raise XuStitchScienceRefused("INVALID_METADATA_VALUE", "a GI sample angle is nonfinite")
+            sample_angles.append(angles)
         del_values.append(del_value)
         nu_values.append(nu_value)
         frame_inputs.append((label, del_value, nu_value, monitor))
@@ -1170,40 +1245,35 @@ def run_xu_hist_stitch_1d(
             else ("XU_CALIBRATION_EXTRAPOLATION_WITHIN_VALIDATED_SCAN",)
         ),
     )
-    signal = np.zeros(npt, dtype=np.float64)
-    normalization = np.zeros(npt, dtype=np.float64)
-    count = np.zeros(npt, dtype=np.float64)
+    # [signal, normalization, count] of I(q) and, for GI, of the cut
+    totals = [np.zeros(npt, dtype=np.float64) for _ in range(3)]
+    gi_totals = None if gi is None else [np.zeros(gi.npt, dtype=np.float64) for _ in range(3)]
     release_count = 0
 
-    def accumulate(d_signal, d_normalization, d_count):
-        nonlocal signal, normalization, count
+    def add(target, d_signal, d_normalization, d_count):
         try:
             with np.errstate(over="raise", invalid="raise"):
-                candidate_count = count + d_count
-                candidate_signal = signal + d_signal
-                candidate_normalization = normalization + d_normalization
+                candidate = [target[0] + d_signal, target[1] + d_normalization, target[2] + d_count]
         except FloatingPointError as error:
             raise XuStitchScienceRefused(
                 "STITCH_NUMERIC_OVERFLOW",
                 "cumulative histogram overflowed",
             ) from error
-        if np.any(candidate_count > _MAX_COUNT):
+        if np.any(candidate[2] > _MAX_COUNT):
             raise XuStitchScienceRefused(
                 "STITCH_COVERAGE_STORAGE_EXACTNESS_EXCEEDED",
                 "histogram count exceeds exact float32 storage",
             )
-        if (
-            not np.isfinite(candidate_signal).all()
-            or not np.isfinite(candidate_normalization).all()
-        ):
+        if not np.isfinite(candidate[0]).all() or not np.isfinite(candidate[1]).all():
             raise XuStitchScienceRefused(
                 "STITCH_NUMERIC_OVERFLOW", "cumulative histogram is invalid"
             )
-        signal, normalization, count = (
-            candidate_signal,
-            candidate_normalization,
-            candidate_count,
-        )
+        target[:] = candidate
+
+    def accumulate(d_signal, d_normalization, d_count, gi_histograms=None):
+        add(totals, d_signal, d_normalization, d_count)
+        if gi_totals is not None:
+            add(gi_totals, *gi_histograms)
     runtime_owner = xu_runtime_session()
     with runtime_owner as session:
         geometry = resolve_xu_stitch_effective_geometry(receipt, session)
@@ -1233,10 +1303,21 @@ def run_xu_hist_stitch_1d(
                 or np.any(np.diff(q_edges) <= 0)
                 or (centres.size > 1 and np.any(np.diff(centres) <= 0))):
             raise XuStitchScienceRefused("STITCH_Q_GRID_INVALID", "radial grid is not finite and strictly increasing")
+        gi_cuts = [None] * len(frame_inputs)
+        if gi is not None:
+            beam = np.asarray(asset["xrayutilities"]["incident_beam"], dtype=np.float64)
+            beam /= np.linalg.norm(beam)
+            surface = asset["xrayutilities"]["surface_normal_reference"]
+            normals = [xu_sample_normal(geometry.hxrd.Ang2Q, *angles, surface_normal=surface)
+                       for angles in sample_angles]
+            gi_bounds = gi.cut_range if gi.cut_range is not None else _scout_gi_range(
+                provider, frame_inputs, normals, beam, gi, cancel_token)
+            gi_edges = np.linspace(*gi_bounds, gi.npt + 1, dtype=np.float64)
+            gi_cuts = [(normal, beam, gi.cut, gi.window, gi_edges) for normal in normals]
         for index, (label, del_value, nu_value, monitor) in enumerate(frame_inputs):
             if cancel_token is not None and cancel_token.is_set():
                 raise XuStitchCancelled("CANCELLED")
-            d_signal, d_normalization, d_count, d_total = _checked_frame_histograms(
+            d_signal, d_normalization, d_count, d_total, d_gi = _checked_frame_histograms(
                 source,
                 label,
                 provider=provider,
@@ -1254,6 +1335,7 @@ def run_xu_hist_stitch_1d(
                 polarization=polarization,
                 dark=dark,
                 flat=flat,
+                gi_cut=gi_cuts[index],
             )
             release_count += 1
             if (
@@ -1268,11 +1350,11 @@ def run_xu_hist_stitch_1d(
                     "STITCH_NUMERIC_OVERFLOW", "per-frame histogram is invalid"
                 )
             if frame_screen is None:
-                accumulate(d_signal, d_normalization, d_count)
+                accumulate(d_signal, d_normalization, d_count, d_gi)
             else:
                 # Hold the frame until its row neighbours are known.
                 for held, verdict in frame_screen.push(
-                        d_total, (d_signal, d_normalization, d_count)):
+                        d_total, (d_signal, d_normalization, d_count, d_gi)):
                     if not verdict.excluded:
                         accumulate(*held)
             if progress_callback is not None:
@@ -1286,22 +1368,11 @@ def run_xu_hist_stitch_1d(
                     "STITCH_ALL_FRAMES_DROPPED", "every frame was excluded as a dropped frame"
                 )
         revalidate_xu_stitch_calibration(receipt)
-        intensity = np.full(npt, np.nan, dtype=np.float64)
-        occupied = normalization > 0
-        try:
-            with np.errstate(divide="raise", invalid="raise", over="raise"):
-                intensity[occupied] = signal[occupied] / normalization[occupied]
-        except FloatingPointError as error:
-            raise XuStitchScienceRefused(
-                "STITCH_NUMERIC_OVERFLOW",
-                "final Stitch normalization overflowed",
-            ) from error
-        if not np.isfinite(intensity[occupied]).all():
-            raise XuStitchScienceRefused(
-                "STITCH_NUMERIC_OVERFLOW", "normalized histogram is invalid"
-            )
-        payload = IntegrationResult1D(centres, intensity, None, unit)
-        diagnostics = StitchDiagnostics(count, normalization)
+        payload, diagnostics = _normalized(centres, *totals, unit)
+        gi_payload = gi_diagnostics = None
+        if gi is not None:
+            gi_payload, gi_diagnostics = _normalized(
+                (gi_edges[:-1] + gi_edges[1:]) * 0.5, *gi_totals, gi.unit)
         effective_projection = geometry.projection
     if runtime_owner.execution_record is None:
         raise XuStitchScienceRefused(
@@ -1315,7 +1386,28 @@ def run_xu_hist_stitch_1d(
         observations,
         len(labels),
         release_count,
+        gi_payload,
+        gi_diagnostics,
     )
+
+
+def _normalized(centres, signal, normalization, count, unit):
+    """Σ signal / Σ normalization where a bin has any weight (NaN elsewhere), with its diagnostics."""
+    intensity = np.full(len(centres), np.nan, dtype=np.float64)
+    occupied = normalization > 0
+    try:
+        with np.errstate(divide="raise", invalid="raise", over="raise"):
+            intensity[occupied] = signal[occupied] / normalization[occupied]
+    except FloatingPointError as error:
+        raise XuStitchScienceRefused(
+            "STITCH_NUMERIC_OVERFLOW",
+            "final Stitch normalization overflowed",
+        ) from error
+    if not np.isfinite(intensity[occupied]).all():
+        raise XuStitchScienceRefused(
+            "STITCH_NUMERIC_OVERFLOW", "normalized histogram is invalid"
+        )
+    return IntegrationResult1D(centres, intensity, None, unit), StitchDiagnostics(count, normalization)
 
 
 __all__ = [

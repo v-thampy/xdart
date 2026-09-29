@@ -124,21 +124,20 @@ class StitchGI:
         return _finite(float(metadata[self.incidence_motor]), "incident angle")
 
 
-def gi_coordinates(q_lab: np.ndarray, normal: np.ndarray, beam: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """(q_ip, q_oop) of lab-frame q vectors ``q_lab`` (3, ...) for the unit surface normal ``normal``
-    and incident beam direction ``beam`` (lab frame): q_oop = q·n̂; q_ip the in-plane magnitude,
-    signed along normalize(n̂ × beam)."""
+def gi_coordinates(qx: np.ndarray, qy: np.ndarray, qz: np.ndarray, normal, beam) -> tuple[np.ndarray, np.ndarray]:
+    """(q_ip, q_oop) of lab-frame q components for the unit surface normal ``normal`` and the incident
+    beam direction ``beam`` (lab frame): q_oop = q·n̂; q_ip the in-plane magnitude, signed along
+    normalize(n̂ × beam)."""
     normal = np.asarray(normal, dtype=np.float64)
     axis = np.cross(normal, np.asarray(beam, dtype=np.float64))
     length = float(np.linalg.norm(axis))
     if not length > 1e-9:
         raise ValueError("the sample normal lies along the beam: no grazing geometry")
     axis /= length
-    shape = (3,) + (1,) * (q_lab.ndim - 1)
-    q_oop = np.tensordot(normal, q_lab, axes=1)
-    inplane = q_lab - normal.reshape(shape) * q_oop
-    q_ip = np.sqrt(np.sum(inplane * inplane, axis=0))
-    q_ip *= np.sign(np.tensordot(axis, inplane, axes=1))
+    q_oop = qx * normal[0] + qy * normal[1] + qz * normal[2]
+    ix, iy, iz = qx - normal[0] * q_oop, qy - normal[1] * q_oop, qz - normal[2] * q_oop
+    q_ip = np.sqrt(ix * ix + iy * iy + iz * iz)
+    q_ip *= np.sign(ix * axis[0] + iy * axis[1] + iz * axis[2])
     return q_ip, q_oop
 
 
