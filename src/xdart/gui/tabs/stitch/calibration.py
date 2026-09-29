@@ -628,8 +628,11 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._edit(options, 'del_domain', 'Supported del range (min, max °)', '', tip=range_tip.format('del'))
         self._edit(options, 'nu_domain', 'Supported nu range (min, max °)', '', tip=range_tip.format('nu'))
         self._refine_card, auto = self._card(layout, 'Refine from the whole scan (optional)')
-        self.refine_seed = self._combo(auto, 'Start from', [('Current fit (unsaved)', 'fit'), ('Geometry file', 'file')],
-            tip='Current fit: the fit just made above. Geometry file: a geometry this window saved.')
+        self.refine_seed = self._combo(auto, 'Start from', [('Current fit (unsaved)', 'fit'), ('Geometry file', 'file'),
+                                                            ('Rough geometry (1 · Geometry)', 'rough')],
+            tip='Current fit: the fit just made above. Geometry file: a geometry this window saved. Rough '
+                'geometry: the distance and direct-beam pixel of 1 · Geometry, with no frame calibrated '
+                '(on 17-2\'s LaB6 scan it refines about as well as from a ring fit).')
         self._edit(auto, 'refine_seed_path', 'Geometry file', chooser='JSON (*.json);;All files (*)',
                    tip='A geometry this window saved (a stacked or single detector arm). Until this session '
                        'has its own fit, it also predicts each frame\'s rings.')
@@ -750,9 +753,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._edit(form, 'rough_mount', 'Detector mount tilt, roll (°)', '0, 0',
                    tip='The detector mount\'s tilt and roll, held fixed (the arm\'s mount extension; a '
                        'single 2θ arm has none). 0, 0: the detector faces the beam squarely at every angle.')
-        self._edit(form, 'rough_wavelength', 'Wavelength (Å)', '', placeholder='needed to save, e.g. 0.7293',
-                   tip='The X-ray wavelength. Save as calibration needs it (Stitch checks each scan\'s '
-                       'energy against it); blank predicts rings at 1 Å.')
+        self._edit(form, 'rough_wavelength', 'Wavelength (Å)', '', placeholder="blank: the calibrant scan's energy",
+                   tip='The X-ray wavelength of this geometry. Blank: the calibrant scan\'s recorded energy (2 · '
+                       'Select frames), when it has one. Save as calibration and a refinement started from this '
+                       'geometry need it (Stitch checks each scan\'s energy against it).')
         self._fit_options, options = self._card(layout, 'Fit options')
         self._edit(options, 'beam_strip', 'Strip half width (pixels)', '2',
                    tip='The beam spot is searched in a strip this many pixels either side of its path.')
@@ -950,14 +954,25 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         mount = tuple(float(v) for v in (self._text('rough_mount') or '0, 0').split(','))
         if len(mount) != 2:
             raise ValueError('type the mount tilt and roll as two numbers, e.g. 0, 0')
-        wavelength = self._text('rough_wavelength')
+        wavelength = self._rough_wavelength_A()
         return rough_arm_record(
             distance_m=distance, detector=self._text('beam_detector'),
             beam_px=beam,
             zero_deg=float(self._text('beam_zero') or 0), zero_motor=zero,
             del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1],
             orientation=int(self._text('beam_orientation')), mount_deg=mount,
-            wavelength_m=float(wavelength) * 1e-10 if wavelength else 1e-10)
+            wavelength_m=wavelength * 1e-10 if wavelength is not None else 1e-10)
+
+    def _rough_wavelength_A(self):
+        """The typed wavelength (Å), else the calibrant scan's when every frame read records the same
+        energy, else None."""
+        if self._text('rough_wavelength'):
+            return float(self._text('rough_wavelength'))
+        energies = {energy for _index, _values, energy in self._choices if energy is not None}
+        if len(energies) != 1:
+            return None
+        from xrd_tools.core.energy import energy_eV_to_wavelength_m
+        return float(energy_eV_to_wavelength_m(energies.pop())) * 1e10
 
     def _beam_role(self):
         """The arm circle the direct-beam motor names ("del", "tth", or a motor), by the
@@ -1248,6 +1263,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 if self.fit is None:
                     raise ValueError('Fit the calibrated frames first, or start from a geometry file')
                 seed = self.fit.asset['calibration']
+            elif self.refine_seed.currentData() == 'rough':  # no frame calibrated (maintainer, 2026-09-29)
+                seed = self._rough_arm()
+                if seed is None:
+                    raise ValueError('measure or type the distance and the beam pixel first (1 · Geometry)')
+                if self._rough_wavelength_A() is None:
+                    raise ValueError('type the wavelength in 1 · Geometry: the rings are predicted with it')
             else:
                 if not self._text('refine_seed_path'):
                     raise ValueError('choose the seed geometry JSON')
@@ -1318,7 +1339,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         record = self._rough_arm()
         if record is None:
             raise ValueError('measure or type the distance and the beam pixel first (1 · Geometry)')
-        if not self._text('rough_wavelength'):
+        if self._rough_wavelength_A() is None:
             raise ValueError('type the wavelength to save this geometry as a calibration')
         delta, nu = self._frame_motors
         direct = (self._distance_record(self._distance_result)

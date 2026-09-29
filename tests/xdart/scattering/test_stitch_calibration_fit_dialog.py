@@ -552,3 +552,41 @@ def test_a_direct_beam_geometry_saves_as_the_calibration_pair_without_a_ring_fit
     finally:
         dialog.close()
         page.shutdown()
+
+
+def test_automatic_refinement_can_start_from_the_direct_beam_geometry(qapp, tmp_path):
+    """Maintainer, 2026-09-29: can the refinement run "just with the rough poni file made with the
+    direct beam scan"? It starts from 1 · Geometry's distance and beam pixel, no frame calibrated
+    (on 17-2's LaB6 scan 14: held-out σ 0.0045 Å⁻¹ from the direct-beam arm, 0.0039 from a ring fit)."""
+    from xrd_tools.integrate.calibration_seed import predict_frame_seed
+    from tests.core.test_calibration_seed import _frame
+    spec = _ring_scan(tmp_path / 'scan')
+    page, dialog = _page_with_dialog(tmp_path, spec)
+    try:
+        ring_fit = _five_parameter_seed(_ROW_ANGLES)
+        beam = predict_frame_seed(ring_fit, _frame({'del': 0., 'nu': 0.})).integrator.getFit2D()
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        # a rough geometry: 2 % off in distance, a few pixels off in the beam spot
+        for key, value in (('rough_distance', f"{beam['directDist'] * 1.02:.2f}"),
+                           ('beam_pixel', f"{beam['centerX'] + 3:.1f}, {beam['centerY'] - 2:.1f}")):
+            dialog._fields[key].setText(value)
+        dialog.refine_seed.setCurrentIndex(dialog.refine_seed.findData('rough'))
+        dialog._fields['refine_frames'].setText('12')
+        dialog.refine_button.click()  # no wavelength typed and the scan records no energy: said at once
+        _wait(dialog)
+        assert 'wavelength' in dialog.status.text() and dialog.fit is None
+        dialog._fields['rough_wavelength'].setText('0.7293')
+        dialog.refine_button.click()
+        _wait(dialog)
+        assert dialog.fit is not None, dialog.status.text()
+        automatic = dialog.fit.asset['provenance']['automatic_refinement']
+        assert automatic['validation']['chosen'] == 'stacked_extended'
+        assert automatic['validation']['coverage'] == {'nu_rows_available': 4, 'nu_rows_selected': 4}
+        refined = dict(zip(dialog.fit.asset['calibration']['param_names'], dialog.fit.asset['calibration']['param']))
+        assert refined['dist'] == pytest.approx(_calibration().poni.dist, abs=1e-3)
+        assert refined['nu_offset'] == pytest.approx(TRUTH['nu_offset'], abs=2e-3)
+        assert refined['mount_tilt'] == pytest.approx(TRUTH['mount_tilt'], abs=2e-3)
+        assert dialog.fit.rms_q < .005, dialog.fit.rms_q
+    finally:
+        dialog.close()
+        page.shutdown()
