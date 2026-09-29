@@ -143,14 +143,13 @@ qt.QApplication.exec = automated_exec
 
 
 def test_modeless_window_exposes_guided_source_controls_and_preserves_session(tmp_path):
-    dialog = StitchCalibrationDialog(tmp_path, backend='xu_hist')
+    dialog = StitchCalibrationDialog(tmp_path)
     source = SourceSpec(tmp_path/'beam', SourceKind.SPEC, options={'scan':'14', 'image_dir':str(tmp_path/'images')})
     dialog.set_source_context(source, image_rotation=180, del_motor='delta', nu_motor='gamma')
     assert not dialog.isModal()
     assert dialog.tabs.count() == 4
     assert dialog._spec().options['scan'] == '14'
     assert dialog.rotation.currentData() == 180
-    assert dialog.backend.currentData() == 'xu_hist'
     assert not dialog.scales.isChecked()
     assert dialog._text('del_motor') == 'delta'
     previous = dialog.session_dir
@@ -164,7 +163,7 @@ def test_modeless_window_exposes_guided_source_controls_and_preserves_session(tm
 
 def test_calibration_rows_name_their_source_image_and_a_save_selects_the_next_frame(tmp_path):
     from xrd_tools.integrate.stitch_calibration import CalibrationFrame
-    dialog = StitchCalibrationDialog(tmp_path, backend='multigeometry')
+    dialog = StitchCalibrationDialog(tmp_path)
 
     def frame(index, raw, within=0):
         return CalibrationFrame(f'frame-{index}', str(tmp_path/'beam'), 'spec', {}, index,
@@ -204,7 +203,7 @@ def test_a_frame_opens_pyfai_with_its_calibrant_energy_and_predicted_geometry(tm
 
 def test_the_frame_table_lists_each_frames_expected_rings(tmp_path):
     from tests.core.test_calibration_seed import _frame, _record
-    dialog = StitchCalibrationDialog(tmp_path, backend='multigeometry')
+    dialog = StitchCalibrationDialog(tmp_path)
     dialog.frames = (replace(_frame({'del': 20., 'nu': 0.}), identity='frame-20'),)
     dialog._render_frames()
     assert dialog.frame_table.item(0, 5).text() == '—'  # nothing to predict from yet
@@ -222,7 +221,7 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     from xdart.gui.tabs.stitch.calibration import _pyfai_arguments
     from pyFAI.io.ponifile import PoniFile
     from tests.core.test_calibration_seed import _frame, _record
-    dialog = StitchCalibrationDialog(tmp_path, backend='multigeometry')
+    dialog = StitchCalibrationDialog(tmp_path)
     assert [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())] == [
         '1 · Geometry', '2 · Select frames', '3 · Calibrate each frame', '4 · Fit and save']
     visible = dialog._row_visible
@@ -262,7 +261,7 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
 
 
 def test_the_geometry_comes_first_and_names_the_arm_motors(tmp_path):
-    dialog = StitchCalibrationDialog(tmp_path, backend='multigeometry')
+    dialog = StitchCalibrationDialog(tmp_path)
     assert dialog.tabs.tabText(0) == '1 · Geometry'
     assert dialog._tab_pages['rough'].isAncestorOf(dialog.geometry_editor)
     source = SourceSpec(tmp_path/'beam', SourceKind.SPEC, options={'scan': '14'})
@@ -303,7 +302,7 @@ def test_a_twoc_scan_is_read_and_staged_as_one_2theta_arm(tmp_path):
         (images / f'powder_scan1_{index:04d}.raw').write_bytes(np.zeros((4, 6), '<i4').tobytes())
     source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(images),
         'image_stem': 'powder_scan1_', 'read_image_kwargs': {'detector_shape': (4, 6), 'raw_dtype': '<i4'}})
-    dialog = StitchCalibrationDialog(tmp_path, backend='multigeometry')
+    dialog = StitchCalibrationDialog(tmp_path)
     try:
         dialog.set_instrument(InstrumentGeometry('twoc'))
         dialog.set_source_context(source)
@@ -316,7 +315,7 @@ def test_a_twoc_scan_is_read_and_staged_as_one_2theta_arm(tmp_path):
         _finish(dialog)
         assert dialog._frame_motors == ('tth', None)
         assert [frame.motors for frame in dialog.frames] == [{'tth': 10.}, {'tth': 20.}, {'tth': 30.}]
-        assert not dialog.arm_model.isEnabled() and 'holds one circle at zero' in dialog.arm_model.toolTip()
+        assert 'holds one circle at zero' in dialog.arm_note.text()
         # the direct-beam zero "del" names twoc's 2θ: the rough geometry is a single arm
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         for key, value in (('rough_distance', '500'), ('beam_pixel', '3, 2'), ('beam_detector', 'Pilatus300kw')):
@@ -347,8 +346,8 @@ def test_a_horizontal_twoc_scan_is_staged_and_resumed_as_nu(tmp_path, monkeypatc
         (images / f'powder_scan1_{index:04d}.raw').write_bytes(np.zeros((4, 6), '<i4').tobytes())
     source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(images),
         'image_stem': 'powder_scan1_', 'read_image_kwargs': {'detector_shape': (4, 6), 'raw_dtype': '<i4'}})
-    dialog = StitchCalibrationDialog(tmp_path, backend='multigeometry')
-    other = StitchCalibrationDialog(tmp_path, backend='multigeometry')
+    dialog = StitchCalibrationDialog(tmp_path)
+    other = StitchCalibrationDialog(tmp_path)
     try:
         dialog.set_instrument(InstrumentGeometry('twoc', plane='horizontal'))
         dialog.set_source_context(source)
@@ -360,7 +359,7 @@ def test_a_horizontal_twoc_scan_is_staged_and_resumed_as_nu(tmp_path, monkeypatc
         assert dialog._frame_motors == (None, 'tth')
         session = dialog.session_dir / 'calibration-session.json'
         assert json.loads(session.read_text())['arm'] == {'del': None, 'nu': 'tth'}
-        assert 'holds one circle at zero' in dialog.arm_model.toolTip()
+        assert 'holds one circle at zero' in dialog.arm_note.text()
         # the direct-beam default "del" means the arm's one circle: the rough geometry holds del
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         for key, value in (('rough_distance', '500'), ('beam_pixel', '3, 2'), ('beam_detector', 'Pilatus300kw')):

@@ -87,7 +87,7 @@ def test_calibration_source_fields_pick_spec_or_nexus_by_their_source_type(qapp,
     calls = []
     monkeypatch.setattr(file_dialogs, "browse_spec", lambda *a, **k: calls.append("spec") or [])
     monkeypatch.setattr(file_dialogs, "browse", lambda *a, **k: calls.append(k.get("file_filter")) or [])
-    dialog = StitchCalibrationDialog(tmp_path, backend="multigeometry")
+    dialog = StitchCalibrationDialog(tmp_path)
     try:
         def click(key):
             dialog._rows[key][1].findChild(QtWidgets.QAbstractButton).click()

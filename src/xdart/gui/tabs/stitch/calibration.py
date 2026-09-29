@@ -20,17 +20,17 @@ from xrd_tools.integrate.calibration_seed import (
 )
 from xrd_tools.session.instrument import InstrumentGeometry
 from xrd_tools.integrate.stitch_calibration import (
-    adopt_calibration_pair, capture_calibration_frames, fit_calibration, scan_motor_names,
-    load_calibration_session, save_calibration_fit, save_calibration_session,
-    source_frame_choices, suggested_frame_indices, validate_frame_files,
+    adopt_calibration_pair, automatic_arm_reason, capture_calibration_frames, fit_calibration,
+    load_calibration_session, pair_validation_angles, save_calibration_pair, save_calibration_session,
+    scan_motor_names, source_frame_choices, suggested_frame_indices, validate_frame_files, xu_partner_path,
 )
 
 
 #: Share of the progress bar per automatic-refinement stage (the owner needs one fixed total).
 _REFINE_STAGES = {'Screening the scan': (0, 250), 'Finding ring points': (250, 700),
                   'Validating models': (700, 980), 'Fitting': (980, 1000)}
-#: The XU extended fit: the pyFAI fit is quick; the transfer and its gate are not.
-_TRANSFER_STAGES = {'Transferring to xrayutilities': (0, 800), 'Validating the transfer': (800, 1000)}
+#: Save: the pyFAI file is quick; the xrayutilities transfer and its gates take seconds.
+_TRANSFER_STAGES = {'Transferring to xrayutilities': (0, 500), 'Validating the transfer': (500, 1000)}
 
 
 def _staged_progress(publish, stages):
@@ -156,6 +156,10 @@ def _dispatch_job(request, cancelled, publish):
         frames, options = arguments
         return fit_calibration(frames, cancelled=cancelled,
                                progress=_staged_progress(publish, _TRANSFER_STAGES), **options)
+    if kind == 'save':  # the pyFAI file, then its xrayutilities partner beside it
+        fit, path, angles = arguments
+        return save_calibration_pair(fit, path, validation_angles=angles, cancelled=cancelled,
+                                     progress=_staged_progress(publish, _TRANSFER_STAGES))
     if kind == 'distance':
         from xrd_tools.sources import open_source
         from xrd_tools.integrate.direct_beam import calibrate_direct_beam, open_direct_beam_scan
@@ -247,13 +251,26 @@ def fit_summary_text(fit):
     return '\n'.join(lines) + '\n\n' + json.dumps(fit.asset['calibration'], indent=2)
 
 
+def saved_pair_text(saved):
+    """What Save wrote: both files, or the pyFAI file and why it has no xrayutilities partner."""
+    if saved.xu_path is None:
+        return f'Saved {saved.pyfai_path}; {saved.xu_refusal}'
+    transfer = saved.xu_transfer
+    return (f"Saved {saved.pyfai_path} and its xrayutilities file {Path(saved.xu_path).name} "
+            f"(|Δq| {transfer['stitch_path_max_abs_dq_A^-1']:.2g} Å⁻¹, polarization "
+            f"{transfer['polarization_max_relative']:.2g} relative, over every pixel of "
+            f"{transfer['validation_frames']} frames)")
+
+
 def _plain_choice(value):
     """A combo's data as a JSON value (None when it is not one)."""
     return value if value is None or isinstance(value, (bool, int, float, str)) else None
 
 
 class StitchCalibrationDialog(QtWidgets.QDialog):
-    """Retained window. ``calibrationSaved(path, backend)`` adopts a fitted asset.
+    """Retained window. ``calibrationSaved(path, backend)`` adopts a saved pyFAI calibration
+    (``backend`` 'multigeometry'); its xrayutilities partner, when one was made, is beside it
+    (``xu_partner_path``).
 
     ``set_source_context(SourceSpec, image_rotation=0, del_motor='del',
     nu_motor='nu', geometry_path=None)`` seeds the source controls (and the
@@ -264,7 +281,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
     #: The diffractometer or a circle's motor changed (the page keeps the same geometry).
     geometryChanged = QtCore.Signal()
 
-    def __init__(self, project_root: str | Path, *, backend='multigeometry', parent=None):
+    def __init__(self, project_root: str | Path, *, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Stitch calibration')
         self.setObjectName('stitchCalibrationDialog')
@@ -296,8 +313,6 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         #: key -> (form, row widget); a field sharing another's row is in _parts instead
         self._rows = {}
         self._parts = {}
-        # The arm model the user chose; applied whenever it is available.
-        self._preferred_arm_model = None
         outer = QtWidgets.QVBoxLayout(self)
         heading = QtWidgets.QLabel('Start from a rough geometry (a direct-beam scan, a typed distance, or skip), select '
                                    'representative frames, calibrate each image, then fit and save one geometry.')
@@ -309,7 +324,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._build_distance()  # a rough geometry first: it predicts every frame's rings
         self._build_source()
         self._build_frames()
-        self._build_fit(backend)
+        self._build_fit()
         self._sync_rough_rows()
         self.status = QtWidgets.QLabel('Ready. Three to five frames are suggested; angle coverage and fit diagnostics determine sufficiency.')
         self.status.setWordWrap(True)
@@ -581,28 +596,27 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         layout.addWidget(card)
         return card, form
 
-    def _build_fit(self, backend):
+    def _build_fit(self):
         layout, form = self._form('4 · Fit and save', 'fit')
-        self.backend = self._combo(form, 'Geometry model', [('pyFAI MultiGeometry', 'multigeometry'),
-                                                            ('xrayutilities · PSIC SURFACE', 'xu_hist')],
-            tip='pyFAI MultiGeometry saves a pyFAI goniometer file, for Stitch with pyFAI. xrayutilities '
-                'saves the same calibration in its SURFACE convention, for Stitch with xrayutilities.')
-        self.backend.setCurrentIndex(max(0, self.backend.findData(backend)))
+        self.arm_note = QtWidgets.QLabel()
+        self.arm_note.setWordWrap(True)
+        self.arm_note.setToolTip('The arm model is chosen for you: the detector mount (tilt, roll) and the '
+                                 'sample offset whenever the frames can determine them, else the '
+                                 'five-parameter arm (the distance, the beam position and the circles\' '
+                                 'zero offsets). The fit summary says which was fitted.')
+        layout.addWidget(self.arm_note)
         self.fit_button = QtWidgets.QPushButton('Fit the calibrated frames')
-        self.fit_button.setToolTip('Fits one detector-arm geometry (the distance, the beam position and the '
-                                   'detector circles\' zero offsets) to the ring points picked on the frames '
+        self.fit_button.setToolTip('Fits one detector-arm geometry to the ring points picked on the frames '
                                    'marked Complete in 3 · Calibrate each frame. Needs three of them.')
         self.fit_button.clicked.connect(self._fit)
         layout.addWidget(self.fit_button)
         self._advanced_card, options = self._card(layout, 'Advanced')
-        self.arm_model = self._combo(options, 'Arm model', [('Stacked arm (5 parameters)', 'stacked'),
-            ('Stacked arm + detector mount and sample offset', 'stacked_extended')])
-        self.arm_model.activated.connect(self._arm_model_chosen)
         self.scales = QtWidgets.QCheckBox('Fit motor scales')
         self.scales.setChecked(False)
         self.scales.setToolTip('Also fits each motor\'s scale (degrees of arm rotation per motor degree), '
                                'where the frames span enough angle to tell. Off: exactly one degree per '
-                               'degree, which is right for almost every diffractometer.')
+                               'degree, which is right for almost every diffractometer. A calibration with '
+                               'fitted scales has no xrayutilities file: xrayutilities takes angles in degrees.')
         options.addRow(self.scales)
         self._edit(options, 'rms', 'Maximum RMS |q| (Å⁻¹)', '.03',
                    tip='A fit whose RMS ring-position error, in |q|, exceeds this is refused.')
@@ -610,14 +624,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                    tip='Where the fit starts, e.g. the direct-beam distance. Blank: the first calibrated '
                        'frame\'s.')
         self._edit(options, 'distance_bounds', 'Distance bounds (min, max mm)', '',
-                   tip='Keeps the fitted distance between these. Blank: unbounded for pyFAI; 0.5–1.5 × the '
-                       'seed for xrayutilities.')
-        self._edit(options, 'del_domain', 'Supported del range (min, max °)', '',
-                   tip='The del angles this calibration may be used for; Stitch refuses frames outside it. '
-                       'Blank: the calibrated frames\' span.')
-        self._edit(options, 'nu_domain', 'Supported nu range (min, max °)', '',
-                   tip='The nu angles this calibration may be used for; Stitch refuses frames outside it. '
-                       'Blank: the calibrated frames\' span.')
+                   tip='Keeps the fitted distance between these. Blank: unbounded.')
+        range_tip = ('The {} angles Stitch with xrayutilities may use this calibration for: its xrayutilities '
+                     'file is checked on every pixel over this range (with the calibrant frames and the scan\'s '
+                     'frames), and Stitch refuses frames outside what was checked. Blank: the calibrant '
+                     'scan\'s span. pyFAI MultiGeometry has no such limit.')
+        self._edit(options, 'del_domain', 'Supported del range (min, max °)', '', tip=range_tip.format('del'))
+        self._edit(options, 'nu_domain', 'Supported nu range (min, max °)', '', tip=range_tip.format('nu'))
         self._refine_card, auto = self._card(layout, 'Refine from the whole scan (optional)')
         self.refine_seed = self._combo(auto, 'Start from', [('Current fit (unsaved)', 'fit'), ('Geometry file', 'file')],
             tip='Current fit: the fit just made above. Geometry file: a geometry this window saved.')
@@ -645,33 +658,24 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.fit_summary = QtWidgets.QPlainTextEdit()
         self.fit_summary.setReadOnly(True)
         layout.addWidget(self.fit_summary, 1)
-        self.save_button = QtWidgets.QPushButton('Save geometry JSON and use in Stitch')
-        self.save_button.setToolTip('Saves the fitted geometry as JSON inside the project and makes it '
-                                    'Stitch\'s calibration.')
+        self.save_button = QtWidgets.QPushButton('Save geometry and use in Stitch')
+        self.save_button.setToolTip('Saves the fitted geometry inside the project as a pyFAI goniometer JSON and, '
+                                    'beside it, the same calibration for xrayutilities (<name>.xu.json, checked '
+                                    'against pyFAI on every pixel), and makes it Stitch\'s calibration: the Backend '
+                                    'under Processing chooses which of the two Stitch uses.')
         self.save_button.setEnabled(False)
         self.save_button.clicked.connect(self._save)
         layout.addWidget(self.save_button)
-        for key in ('rms', 'distance_seed', 'distance_bounds', 'del_domain', 'nu_domain'):
+        for key in ('rms', 'distance_seed', 'distance_bounds'):
             self._fields[key].textChanged.connect(self._invalidate_fit)
-        self.backend.currentIndexChanged.connect(self._invalidate_fit)
         self.scales.toggled.connect(self._invalidate_fit)
-        self.arm_model.currentIndexChanged.connect(self._invalidate_fit)
-        self.backend.currentIndexChanged.connect(self._sync_arm_model)
-        self.backend.currentIndexChanged.connect(self._sync_refine_rows)
         self.scales.toggled.connect(self._sync_arm_model)
         self._sync_arm_model()
         self._sync_refine_rows()
 
     def _sync_refine_rows(self, *_args):
-        """Show only what the chosen model uses, and say at once whether the geometry file can seed
-        the refinement (a detector arm, not an older independent-angle calibration)."""
-        mg = self.backend.currentData() == 'multigeometry'
-        options = self._rows['rms'][0]
-        options.setRowVisible(self.arm_model, mg)
-        options.setRowVisible(self.scales, mg)
-        for key in ('del_domain', 'nu_domain'):
-            self._show(key, not mg)
-        self._refine_card.setVisible(mg)
+        """Say at once whether the geometry file can seed the refinement (a detector arm, not an
+        older independent-angle calibration)."""
         from_file = self.refine_seed.currentData() == 'file'
         self._show('refine_seed_path', from_file)
         note = (self._seed_file_problem(self._text('refine_seed_path'))
@@ -904,18 +908,14 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     #: Choices saved with the Stitch settings. The calibrant-scan and same-detector
     #: confirmations are per use and never saved.
-    _SAVED_CHOICES = ('source_kind', 'rotation', 'backend', 'arm_model', 'refine_calibrant',
-                      'refine_seed', 'beam_source_kind', 'motion', 'rough_mode')
+    _SAVED_CHOICES = ('source_kind', 'rotation', 'refine_calibrant', 'refine_seed', 'beam_source_kind',
+                      'motion', 'rough_mode')
 
     def settings(self):
         """This dialog's inputs as plain values, for the saved Stitch settings."""
         choices = {name: {'data': _plain_choice(getattr(self, name).currentData()),
                           'text': getattr(self, name).currentText()}
                    for name in self._SAVED_CHOICES}
-        preferred = self.arm_model.findData(self._preferred_arm_model)
-        if preferred >= 0:  # the choice, even while the rules show the five-parameter arm
-            choices['arm_model'] = {'data': self._preferred_arm_model,
-                                    'text': self.arm_model.itemText(preferred)}
         return {
             'fields': {key: self._text(key) for key in self._fields},
             'choices': choices,
@@ -951,10 +951,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 if combo.isEditable() and choice.get('text'):  # a typed-in entry, e.g. a calibrant
                     combo.setCurrentText(str(choice['text']))
                 continue
-            if combo is self.arm_model:
-                self._preferred_arm_model = combo.itemData(index)
-            else:
-                combo.setCurrentIndex(index)
+            combo.setCurrentIndex(index)
         if isinstance(values.get('fit_motor_scales'), bool):
             self.scales.setChecked(values['fit_motor_scales'])
         self._sync_arm_model()
@@ -1057,8 +1054,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                       and self._prediction[0] == self._calibrated_key() else None)
         return dict(calibrant=self.refine_calibrant.currentText().strip() or 'LaB6',
                     del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1], prediction=prediction,
-                    record=(self.fit.asset.get('calibration')
-                            if self.fit is not None and self.fit.backend == 'multigeometry' else None),
+                    record=self.fit.asset.get('calibration') if self.fit is not None else None,
                     frames=done, rough=self._rough_record(),
                     file=str(Path(path).resolve()) if path and Path(path).is_file() else None,
                     detector=detector)
@@ -1126,26 +1122,19 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 'stage frames with these.')
 
     def _sync_arm_model(self):
-        arm = self._frame_motors if self.frames else self.geometry_editor.value().stitch_arm()
-        nu = None if None in arm else arm[1]  # a single arm holds one circle: no nu rows
-        rows = {round(float(frame.motors[nu]), 6)
-                for frame in self.frames if frame.complete and nu in frame.motors}
-        reason = ('a single 2θ arm holds one circle at zero; the extension needs both' if nu is None
-                  else 'fitting motor scales keeps the five-parameter arm' if self.scales.isChecked()
-                  else 'needs completed frames on at least 3 nu positions' if len(rows) < 3 else '')
-        if reason:
-            self.arm_model.setCurrentIndex(0)
-        elif self._preferred_arm_model is not None:
-            index = self.arm_model.findData(self._preferred_arm_model)
-            if index >= 0 and index != self.arm_model.currentIndex():
-                self.arm_model.setCurrentIndex(index)
-        self.arm_model.setEnabled(not reason)
-        self.arm_model.setToolTip(reason or 'Also fits the detector mount (tilt, roll) on the arm and '
-                                  'the sample offset from the rotation centre. For xrayutilities the '
-                                  'pyFAI fit is transferred and checked on every pixel of the scan.')
-
-    def _arm_model_chosen(self, _index):
-        self._preferred_arm_model = self.arm_model.currentData()
+        """Say which arm model the next fit takes, and why (decision 40: automatic)."""
+        delta, nu = self._frame_motors if self.frames else self.geometry_editor.value().stitch_arm()
+        done = tuple(frame for frame in self.frames if frame.complete)
+        reason = automatic_arm_reason(done, del_motor=delta, nu_motor=nu, fit_scales=self.scales.isChecked())
+        if not reason:
+            text = ('Arm model (automatic): the detector mount and sample offset, which the frames on '
+                    f'{len({round(float(frame.motors[nu]), 6) for frame in done})} nu positions determine; the '
+                    'five-parameter arm if that fit is refused.')
+        else:
+            text = f'Arm model (automatic): the five-parameter arm; {reason}.'
+        if self.scales.isChecked():
+            text += ' With fitted motor scales, Save writes no xrayutilities file.'
+        self.arm_note.setText(text)
 
     def _fit(self):
         def go():
@@ -1154,21 +1143,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             frames = tuple(frame for frame in self.frames if frame.complete)
             bounds = tuple(float(v) / 1000 for v in self._text('distance_bounds').split(',')) if self._text('distance_bounds') else None
             seed = float(self._text('distance_seed')) / 1000 if self._text('distance_seed') else None
-            domain = None
-            if self._text('del_domain') or self._text('nu_domain'):
-                circles = tuple(circle for circle, motor in zip(('del', 'nu'), self._frame_motors)
-                                if motor is not None)  # a 2θ arm's held circle stays at zero
-                domain = {motor: [float(v) for v in self._text(motor + '_domain').split(',')] for motor in circles}
-            options = dict(backend=self.backend.currentData(), del_motor=self._frame_motors[0],
-                nu_motor=self._frame_motors[1], fit_scales=self.scales.isChecked(),
-                instrument_geometry=self.geometry_editor.value().to_record(),
-                arm_model=self.arm_model.currentData(),
-                distance_seed_m=seed, distance_bounds_m=bounds, max_rms_q=float(self._text('rms')), domain=domain,
+            options = dict(del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1],
+                fit_scales=self.scales.isChecked(), instrument_geometry=self.geometry_editor.value().to_record(),
+                arm_model='auto', distance_seed_m=seed, distance_bounds_m=bounds, max_rms_q=float(self._text('rms')),
                 distance_provenance=self._distance_provenance if hasattr(self, '_distance_provenance') else None)
-            if options['backend'] == 'xu_hist' and options['arm_model'] == 'stacked_extended' and self._choices:
-                # Gate the transfer on every frame of the scan whose metadata was read.
-                options['validation_angles'] = [(motors[self._frame_motors[0]], motors[self._frame_motors[1]])
-                                                for _index, motors, _energy in self._choices]
             self._invalidate_fit()
             self._start('fit', (frames, options))
         self._guard(go)
@@ -1179,9 +1157,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             delta, nu = geometry.stitch_arm()
             spec = self._spec()
             if self.refine_seed.currentData() == 'fit':
-                if self.fit is None or self.fit.backend != 'multigeometry':
-                    raise ValueError('Fit the calibrated frames first (pyFAI MultiGeometry), or start from '
-                                     'a geometry file')
+                if self.fit is None:
+                    raise ValueError('Fit the calibrated frames first, or start from a geometry file')
                 seed = self.fit.asset['calibration']
             else:
                 if not self._text('refine_seed_path'):
@@ -1211,21 +1188,37 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             if self.fit is None:
                 raise ValueError('fit the current controls before saving')
             path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Save calibrated geometry',
-                str(self.project_root / 'calibration' / f'{self.fit.backend}-{uuid.uuid4().hex[:8]}.json'), 'JSON (*.json)')
+                str(self.project_root / 'calibration' / f'multigeometry-{uuid.uuid4().hex[:8]}.json'), 'JSON (*.json)')
             if not path:
                 return
             selected = Path(path).resolve()
             if not selected.is_relative_to(self.project_root):
                 raise ValueError('save the geometry inside the Stitch project')
-            saved = save_calibration_fit(self.fit, selected)
-            from xdart.utils.browse import remember_browse_path
-            remember_browse_path(selected)
-            self.saved_source_motors = self.fit.asset['provenance']['source_motors']
-            self.saved_instrument_geometry = self.fit.asset['provenance'].get('instrument_geometry')
-            self.saved_image_rotation = self.fit.asset['provenance']['image_rotation']
-            self.status.setText(f'Saved geometry and provenance: {saved}')
-            self.calibrationSaved.emit(saved, self.fit.backend)
+            if selected.exists() or xu_partner_path(selected).exists():
+                raise ValueError(f'{selected.name} or {xu_partner_path(selected).name} exists: choose a new name')
+            self._start('save', (self.fit, selected, pair_validation_angles(
+                self.fit, scan_angles=self._scan_angles(), domain=self._typed_domain())))
         self._guard(go)
+
+    def _scan_angles(self):
+        """(del, nu) of every calibrant-scan frame whose metadata was read, by the fit's motors."""
+        motors = self.fit.asset['provenance']['source_motors']
+        del_motor, nu_motor = motors.get('del_angle'), motors.get('nu_angle')
+        return [(values.get(del_motor, 0.) if del_motor else 0., values.get(nu_motor, 0.) if nu_motor else 0.)
+                for _index, values, _energy in self._choices
+                if all(motor is None or motor in values for motor in (del_motor, nu_motor))]
+
+    def _typed_domain(self):
+        """The supported del/nu ranges typed under Advanced ({} when blank: the scan's span)."""
+        domain = {}
+        for circle in ('del', 'nu'):
+            text = self._text(circle + '_domain')
+            if text:
+                low, high = (float(value) for value in text.split(','))
+                if not low <= high:
+                    raise ValueError(f'the supported {circle} range needs min ≤ max')
+                domain[circle] = [low, high]
+        return domain
 
     def _distance(self):
         def go():
@@ -1390,11 +1383,18 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 elif kind in ('fit', 'refine'):
                     summary = fit_summary_text(result)  # before adopting: a failure leaves no fit
                     self.fit = result
-                    if result.backend == 'multigeometry':  # the refinement now starts from it
-                        self.refine_seed.setCurrentIndex(self.refine_seed.findData('fit'))
+                    self.refine_seed.setCurrentIndex(self.refine_seed.findData('fit'))  # it starts from this
                     self._fit_instrument = result.asset['provenance'].get('instrument_geometry')
                     self.fit_summary.setPlainText(summary)
                     self.save_button.setEnabled(True)
+                elif kind == 'save':
+                    provenance = self.fit.asset['provenance']
+                    self.saved_source_motors = provenance['source_motors']
+                    self.saved_instrument_geometry = provenance.get('instrument_geometry')
+                    self.saved_image_rotation = provenance['image_rotation']
+                    from xdart.utils.browse import remember_browse_path
+                    remember_browse_path(Path(result.pyfai_path))
+                    self.fit_summary.appendPlainText('\n' + saved_pair_text(result))
                 elif kind == 'distance':
                     self._distance_result = result
                     rows = [f'Distance: {result.distance_mm:.6g} mm; regression SE: {result.distance_std_m * 1000:.3g} mm',
@@ -1406,6 +1406,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     pending = [frame for frame in self.frames if not frame.complete]
                     self.status.setText(f'Frame {result.index} saved. ' + (
                         'Next: Calibrate selected frame…' if pending else 'All frames calibrated: Fit and save.'))
+                elif kind == 'save':
+                    self.status.setText(saved_pair_text(result))
+                    self.calibrationSaved.emit(result.pyfai_path, 'multigeometry')  # once, with both files written
                 else:
                     self.status.setText('No PONI was saved; the frame remains unchanged.' if kind == 'calibrate' and result is None else f'{kind.capitalize()} complete.')
             except Exception as error:

@@ -77,17 +77,14 @@ def test_calibration_dialog_settings_are_kept_but_not_its_confirmations(qapp, tm
         page._calibrate()
         dialog = page._calibration_dialog
         assert dialog is not None
-        # the extended arm needs completed frames on 3 nu positions before it can be chosen
+        # the arm model is automatic (decision 40): nothing to save; the note follows the frames
         dialog.frames = _three_nu_rows()
         dialog._sync_arm_model()
-        extended = dialog.arm_model.findData("stacked_extended")
-        assert dialog.arm_model.isEnabled()
-        dialog.arm_model.setCurrentIndex(extended)
-        dialog.arm_model.activated.emit(extended)  # the user's choice
+        assert 'the detector mount and sample offset, which the frames on 3 nu positions' in dialog.arm_note.text()
         dialog.refine_calibrant.setCurrentIndex(dialog.refine_calibrant.count() - 1)
         dialog._set_field_text("rms", ".02")
         saved = page.settings()["calibration"]
-        assert saved["choices"]["arm_model"]["data"] == "stacked_extended"
+        assert "arm_model" not in saved["choices"] and "backend" not in saved["choices"]
         assert saved["fields"]["rms"] == ".02"
 
         restored.apply_settings(page.settings())
@@ -99,12 +96,12 @@ def test_calibration_dialog_settings_are_kept_but_not_its_confirmations(qapp, tm
         again.apply_settings(custom)  # an editable choice keeps a typed-in entry
         assert again.refine_calibrant.currentText() == "NIST-SRM-660c"
         assert again._text("rms") == ".02"
-        # a new session has no completed frames: five-parameter shown, the choice kept
-        assert again.arm_model.currentData() == "stacked"
-        assert again.settings()["choices"]["arm_model"]["data"] == "stacked_extended"
-        again.frames = _three_nu_rows()  # once it can apply, the saved choice does
-        again._sync_arm_model()
-        assert again.arm_model.currentData() == "stacked_extended"
+        # an older settings file's model and backend choices are ignored, the rest applies
+        older = {**custom, "choices": {**custom["choices"], "arm_model": {"data": "stacked_extended", "text": "x"},
+                                        "backend": {"data": "xu_hist", "text": "y"}},
+                 "fields": {**custom["fields"], "rms": ".025"}}
+        again.apply_settings(older)
+        assert again._text("rms") == ".025"
     finally:
         _close(page, qapp)
         _close(restored, qapp)

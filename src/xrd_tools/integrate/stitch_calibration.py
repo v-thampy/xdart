@@ -439,7 +439,25 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     horizontal: nu moves).
     ``min_frames=1`` is for predicting the other frames' rings from those calibrated so
     far (calibration_seed.session_prediction); a saved calibration needs three.
+    ``arm_model='auto'`` fits the extended arm whenever it applies
+    (:func:`automatic_arm_reason`) and the five-parameter arm otherwise, or when the
+    extension is refused; the message and provenance say which, and why.
     """
+    if arm_model == 'auto':
+        options = dict(backend=backend, del_motor=del_motor, nu_motor=nu_motor, fit_scales=fit_scales,
+                       distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m, max_rms_q=max_rms_q,
+                       domain=domain, distance_provenance=distance_provenance, cancelled=cancelled,
+                       validation_angles=validation_angles, progress=progress,
+                       instrument_geometry=instrument_geometry, min_frames=min_frames)
+        reason = automatic_arm_reason(frames, del_motor=del_motor, nu_motor=nu_motor, fit_scales=fit_scales)
+        if not reason:
+            try:
+                return fit_calibration(frames, arm_model='stacked_extended', **options)
+            except ValueError as error:  # implausible or under-determined: the five parameters
+                reason = f'the detector mount and sample offset were refused: {error}'
+        fit = fit_calibration(frames, arm_model='stacked', **options)
+        fit.asset['provenance'].update(arm_model='stacked', arm_model_reason=reason)
+        return replace(fit, message=f'{fit.message}; five-parameter arm: {reason}')
     if not max(1, int(min_frames)) <= len(frames) <= 32:
         raise ValueError('fit requires at least three completed frames spanning the angles'
                          if min_frames == 3 else f'fit requires at least {min_frames} completed frames')
@@ -522,6 +540,22 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
         raise InterruptedError('calibration fit cancelled')
     # Provenance is a separate adjacent document for standard pyFAI files.
     return CalibrationFit(backend, {'calibration': asset, 'provenance': provenance}, rms, condition, count, message)
+
+
+def automatic_arm_reason(frames, *, del_motor='del', nu_motor='nu', fit_scales=False) -> str:
+    """Why the automatic arm model keeps five parameters ('' when the extension applies).
+
+    The detector mount and sample offset need both circles, fixed motor scales and
+    completed frames on at least three nu positions (maintainer decision 40).
+    """
+    if del_motor is None or nu_motor is None:
+        return 'a single 2θ arm holds one circle at zero; the extension needs both'
+    if fit_scales:
+        return 'motor scales are fitted, which the extension does not take'
+    rows = {round(float(frame.motors[nu_motor]), 6) for frame in frames if nu_motor in frame.motors}
+    if len(rows) < 3:
+        return f'the extension needs frames on at least 3 nu positions ({len(rows)} so far)'
+    return ''
 
 
 def _fit_xu(frames, loaded, del_motor, nu_motor, distance_seed_m, distance_bounds_m,
@@ -675,7 +709,8 @@ def pair_validation_angles(fit: CalibrationFit, *, scan_angles=(), domain=None, 
 
     The calibrant frames the fit used, every scan frame whose angles are given (``scan_angles``,
     (del, nu) pairs) and a ``grid`` × ``grid`` grid over ``domain`` ({'del': [lo, hi], 'nu': [lo, hi]},
-    the range the calibration is to serve). The partner is admitted only where it was checked.
+    the range the calibration is to serve; a circle left out spans the other angles). The partner
+    is admitted only where it was checked.
     """
     motors = fit.asset['provenance']['source_motors']
     del_motor, nu_motor = motors.get('del_angle'), motors.get('nu_angle')
@@ -686,8 +721,10 @@ def pair_validation_angles(fit: CalibrationFit, *, scan_angles=(), domain=None, 
               for frame in fit.asset['provenance']['frames']]
     angles += [(0.0 if del_motor is None else float(d), 0.0 if nu_motor is None else float(n)) for d, n in scan_angles]
     if domain:
-        steps = {name: [0.0] if motor is None else np.linspace(*map(float, domain[name]), grid).tolist()
-                 for name, motor in (('del', del_motor), ('nu', nu_motor))}
+        steps = {}
+        for column, (name, motor) in enumerate((('del', del_motor), ('nu', nu_motor))):
+            limits = domain.get(name) or [min(a[column] for a in angles), max(a[column] for a in angles)]
+            steps[name] = [0.0] if motor is None else np.linspace(*map(float, limits), grid).tolist()
         angles += [(d, n) for d in steps['del'] for n in steps['nu']]
     return list(dict.fromkeys(angles))
 

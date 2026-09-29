@@ -1431,10 +1431,9 @@ class StitchPage(QtWidgets.QWidget):
             return
         try:
             project = str(self._value("project_root"))
-            backend = "xu_hist" if self._value("backend") == "xrayutilities histogram" else "multigeometry"
             if not project:
                 raise ValueError("Choose a Project folder first")
-            if self._calibration_dialog is not None and (self._calibration_project, self._calibration_backend) != (project, backend):
+            if self._calibration_dialog is not None and self._calibration_project != project:
                 self._calibration_settings = self._calibration_dialog.settings()
                 self._calibration_dialog.hide()
                 self._calibration_dialog = None
@@ -1443,15 +1442,14 @@ class StitchPage(QtWidgets.QWidget):
             unconfigured = False
             if self._calibration_dialog is None:
                 geometry = self._instrument()  # before the window exists: settings, or migrated
-                self._calibration_dialog = StitchCalibrationDialog(str(self._value("project_root")),
-                    backend=backend, parent=self)
+                self._calibration_dialog = StitchCalibrationDialog(str(self._value("project_root")), parent=self)
                 saved = self._calibration_settings or {}
                 if saved:
                     self._calibration_dialog.apply_settings(saved)
                 self._calibration_dialog.set_instrument(geometry)
                 self._calibration_dialog.geometryChanged.connect(self._instrument_changed)
                 unconfigured = not (saved.get("fields") or {}).get("source")
-                self._calibration_project, self._calibration_backend = project, backend
+                self._calibration_project = project
                 self._calibration_dialog.calibrationSaved.connect(self._adopt_calibration)
                 self._authoring_dialogs.append(self._calibration_dialog)
             source = self._source_spec_for_tools() if unconfigured else None

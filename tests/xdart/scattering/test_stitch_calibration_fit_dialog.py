@@ -1,4 +1,4 @@
-"""Calibrate dialog: arm model choice, automatic refinement, cancel, summary, save and adoption."""
+"""Calibrate dialog: automatic arm model, automatic refinement, cancel, summary, saving both files and adoption."""
 import json
 from pathlib import Path
 from threading import Event
@@ -88,32 +88,39 @@ def _save_to(monkeypatch, target):
                         staticmethod(lambda *args, **kwargs: (str(target), '')))
 
 
-def test_guided_extended_fit_saves_a_v2_arm_that_the_page_adopts(qapp, tmp_path, monkeypatch):
+def test_the_guided_fit_takes_the_extension_and_saves_both_files(qapp, tmp_path, monkeypatch):
+    """Decision 40 and always-both: the extension whenever the frames determine it (no model
+    choice), and Save writes the pyFAI file and its xrayutilities partner before adopting."""
     (tmp_path / 'frames').mkdir()
     frames = _guided_frames(tmp_path)
     page, dialog = _page_with_dialog(tmp_path)
     try:
-        assert not dialog.arm_model.isEnabled()  # no frames yet
+        assert 'five-parameter arm; the extension needs frames on at least 3 nu positions' in dialog.arm_note.text()
         dialog.frames = frames
         dialog._frame_motors = ('del', 'nu')
         dialog._render_frames()
-        assert dialog.arm_model.isEnabled()
-        dialog.arm_model.setCurrentIndex(dialog.arm_model.findData('stacked_extended'))
+        assert 'the detector mount and sample offset, which the frames on 5 nu positions' in dialog.arm_note.text()
         dialog.fit_button.click()
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
         assert dialog.fit.asset['provenance']['arm_model'] == 'stacked_extended'
         summary = dialog.fit_summary.toPlainText()
         assert 'Parameters (± 1σ):' in summary and 'mount_tilt' in summary and 'sample_offset3' in summary
-        dialog.arm_model.setCurrentIndex(0)  # a changed choice invalidates the fit and its summary
+        dialog.scales.setChecked(True)  # a changed option invalidates the fit and says what it changes
         assert dialog.fit is None and not dialog.fit_summary.toPlainText()
         assert not dialog.save_button.isEnabled()
-        dialog.arm_model.setCurrentIndex(1)
+        assert ('five-parameter arm; motor scales are fitted' in dialog.arm_note.text()
+                and 'Save writes no xrayutilities file' in dialog.arm_note.text())
+        dialog.scales.setChecked(False)
         dialog.fit_button.click()
         _wait(dialog)
         target = (tmp_path / 'calibration' / 'extended.json').resolve()
         _save_to(monkeypatch, target)
+        adopted = []
+        dialog.calibrationSaved.connect(lambda path, backend: adopted.append((path, backend)))
         dialog.save_button.click()
+        _wait(dialog)
+        assert adopted == [(str(target), 'multigeometry')]  # once, with both files written
         assert Path(page._value("geometry_path")) == target
         assert page._value("geometry_kind") == "Goniometer JSON"
         record = json.loads(target.read_text())
@@ -130,6 +137,10 @@ def test_guided_extended_fit_saves_a_v2_arm_that_the_page_adopts(qapp, tmp_path,
         saved = dict(zip(record['param_names'], record['param']))
         assert arm.extended and arm.mount_tilt == saved['mount_tilt'] != 0
         assert abs(arm.mount_tilt - TRUTH['mount_tilt']) < 2e-3  # NPT files round the points
+        partner = json.loads((tmp_path / 'calibration' / 'extended.xu.json').read_text())
+        assert partner['version'] == 3  # its mount is the arm's own tilt
+        assert partner['detector']['tilt_deg'] == pytest.approx(abs(np.degrees(arm.mount_tilt)), abs=1e-6)
+        assert 'extended.xu.json' in dialog.status.text() and 'extended.xu.json' in dialog.fit_summary.toPlainText()
     finally:
         dialog.close()
         page.shutdown()
@@ -145,11 +156,13 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
         dialog.set_instrument(InstrumentGeometry('twoc'))
         dialog.frames, dialog._frame_motors = frames, ('tth', None)
         dialog._render_frames()
-        assert not dialog.arm_model.isEnabled() and 'holds one circle at zero' in dialog.arm_model.toolTip()
+        assert 'five-parameter arm; a single 2θ arm holds one circle at zero' in dialog.arm_note.text()
         dialog.fit_button.click()
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
-        assert dialog.fit.message == 'Converged; one detector arm, nu held at zero; motor scales fixed at degrees'
+        assert dialog.fit.message == ('Converged; one detector arm, nu held at zero; motor scales fixed at degrees; '
+                                      'five-parameter arm: a single 2θ arm holds one circle at zero; the extension '
+                                      'needs both')
         provenance, record = dialog.fit.asset['provenance'], dialog.fit.asset['calibration']
         assert provenance['source_motors'] == {'del_angle': 'tth'}
         assert provenance['instrument_geometry'] == InstrumentGeometry('twoc').to_record()
@@ -160,10 +173,13 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
         target = (tmp_path / 'calibration' / 'twoc.json').resolve()
         _save_to(monkeypatch, target)
         dialog.save_button.click()
+        _wait(dialog)
         assert Path(page._value("geometry_path")) == target
         assert page._instrument() == InstrumentGeometry('twoc')
         assert page._value("source_motors") == "del_angle=tth"
         assert page._arm_problem() is None
+        partner = json.loads((tmp_path / 'calibration' / 'twoc.xu.json').read_text())
+        assert partner['acquisition']['source_motors'] == {'del': 'tth', 'nu': None}
     finally:
         dialog.close()
         page.shutdown()
@@ -181,7 +197,7 @@ def test_a_horizontal_twoc_arm_is_fitted_saved_and_adopted_with_del_held_at_zero
         dialog.fit_button.click()
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
-        assert dialog.fit.message == 'Converged; one detector arm, del held at zero; motor scales fixed at degrees'
+        assert dialog.fit.message.startswith('Converged; one detector arm, del held at zero; motor scales fixed at degrees')
         provenance, record = dialog.fit.asset['provenance'], dialog.fit.asset['calibration']
         assert provenance['source_motors'] == {'nu_angle': 'tth'} and record['pos_names'] == ['nu_angle']
         assert provenance['instrument_geometry'] == InstrumentGeometry('twoc', plane='horizontal').to_record()
@@ -191,6 +207,7 @@ def test_a_horizontal_twoc_arm_is_fitted_saved_and_adopted_with_del_held_at_zero
         target = (tmp_path / 'calibration' / 'twoc-horizontal.json').resolve()
         _save_to(monkeypatch, target)
         dialog.save_button.click()
+        _wait(dialog)
         assert page._instrument() == InstrumentGeometry('twoc', plane='horizontal')
         assert page._value("source_motors") == "nu_angle=tth"
         assert page._arm_problem() is None
@@ -201,63 +218,51 @@ def test_a_horizontal_twoc_arm_is_fitted_saved_and_adopted_with_del_held_at_zero
         page.shutdown()
 
 
-def test_a_twoc_arm_is_fitted_for_xrayutilities_with_nu_held_at_zero(qapp, tmp_path, monkeypatch):
+def test_a_twoc_arms_xrayutilities_file_covers_the_typed_range_with_nu_at_zero(qapp, tmp_path, monkeypatch):
+    """Was: the window's xrayutilities fit of a twoc arm. Now every save writes the partner, checked
+    over the typed range; the held circle stays at zero."""
     from xrd_tools.session.instrument import InstrumentGeometry
     (tmp_path / 'frames').mkdir()
     frames = _single_arm_frames(tmp_path)
     page, dialog = _page_with_dialog(tmp_path)
     try:
         dialog.set_instrument(InstrumentGeometry('twoc'))
-        dialog.backend.setCurrentIndex(dialog.backend.findData('xu_hist'))
         dialog.frames, dialog._frame_motors = frames, ('tth', None)
         dialog._render_frames()
-        assert not dialog.arm_model.isEnabled()  # no extension, and so no v3 transfer, for one arm
         dialog._fields['del_domain'].setText('0, 50')  # the typed range covers 2θ; nu stays at zero
         dialog.fit_button.click()
-        _wait(dialog, timeout=120)
-        assert dialog.fit is not None and dialog.fit.backend == 'xu_hist', dialog.status.text()
-        asset = dialog.fit.asset['calibration']
-        assert asset['version'] == 2 and asset['acquisition']['source_motors'] == {'del': 'tth', 'nu': None}
-        assert asset['validation']['validated_scan_domain_source_deg'] == {'del': [0., 50.], 'nu': [0., 0.]}
-        target = (tmp_path / 'calibration' / 'xu-twoc.json').resolve()
+        _wait(dialog)
+        target = (tmp_path / 'calibration' / 'twoc.json').resolve()
         _save_to(monkeypatch, target)
         dialog.save_button.click()
-        assert page._value("backend") == "xrayutilities histogram"
-        assert page._value("source_motors") == "del=tth"
-        assert page._arm_problem() is None
-        page._set_instrument(InstrumentGeometry('psic'))  # psic's nu moves
-        assert 'nu held at zero' in page._arm_problem()
+        _wait(dialog)
+        asset = json.loads((tmp_path / 'calibration' / 'twoc.xu.json').read_text())
+        assert asset['version'] == 3 and asset['acquisition']['source_motors'] == {'del': 'tth', 'nu': None}
+        assert asset['validation']['validated_scan_domain_source_deg'] == {'del': [0., 50.], 'nu': [0., 0.]}
     finally:
         dialog.close()
         page.shutdown()
 
 
-def test_a_horizontal_twoc_arm_is_fitted_for_xrayutilities_with_del_held_at_zero(qapp, tmp_path, monkeypatch):
+def test_a_horizontal_twoc_arms_xrayutilities_file_covers_the_typed_range_with_del_at_zero(qapp, tmp_path, monkeypatch):
     from xrd_tools.session.instrument import InstrumentGeometry
     (tmp_path / 'frames').mkdir()
     frames = _horizontal_frames(tmp_path)
     page, dialog = _page_with_dialog(tmp_path)
     try:
         dialog.set_instrument(InstrumentGeometry('twoc', plane='horizontal'))
-        dialog.backend.setCurrentIndex(dialog.backend.findData('xu_hist'))
         dialog.frames, dialog._frame_motors = frames, (None, 'tth')
         dialog._render_frames()
-        assert not dialog.arm_model.isEnabled()
         dialog._fields['nu_domain'].setText('0, 50')  # the typed range covers 2θ; del stays at zero
         dialog.fit_button.click()
-        _wait(dialog, timeout=120)
-        assert dialog.fit is not None and dialog.fit.backend == 'xu_hist', dialog.status.text()
-        asset = dialog.fit.asset['calibration']
-        assert asset['acquisition']['source_motors'] == {'del': None, 'nu': 'tth'}
-        assert asset['validation']['validated_scan_domain_source_deg'] == {'del': [0., 0.], 'nu': [0., 50.]}
-        target = (tmp_path / 'calibration' / 'xu-twoc-horizontal.json').resolve()
+        _wait(dialog)
+        target = (tmp_path / 'calibration' / 'twoc-horizontal.json').resolve()
         _save_to(monkeypatch, target)
         dialog.save_button.click()
-        assert page._value("backend") == "xrayutilities histogram"
-        assert page._value("source_motors") == "nu=tth"
-        assert page._arm_problem() is None
-        page._set_instrument(InstrumentGeometry('twoc'))  # the vertical plane cannot take it
-        assert 'Choose the horizontal scattering plane' in page._arm_problem()
+        _wait(dialog)
+        asset = json.loads((tmp_path / 'calibration' / 'twoc-horizontal.xu.json').read_text())
+        assert asset['acquisition']['source_motors'] == {'del': None, 'nu': 'tth'}
+        assert asset['validation']['validated_scan_domain_source_deg'] == {'del': [0., 0.], 'nu': [0., 50.]}
     finally:
         dialog.close()
         page.shutdown()
@@ -296,6 +301,7 @@ def test_a_fit_belongs_to_the_instrument_its_frames_were_staged_with(qapp, tmp_p
         target = (tmp_path / 'calibration' / 'psic.json').resolve()
         _save_to(monkeypatch, target)
         dialog.save_button.click()
+        _wait(dialog)
         # adoption keeps the fitted instrument and its motors
         assert page._instrument().to_record() == fitted
         assert page._value("source_motors") == "del_angle=del, nu_angle=nu"
@@ -304,8 +310,10 @@ def test_a_fit_belongs_to_the_instrument_its_frames_were_staged_with(qapp, tmp_p
         page.shutdown()
 
 
-def test_five_parameter_guided_save_equals_the_core_save(qapp, tmp_path, monkeypatch):
-    from xrd_tools.integrate.stitch_calibration import fit_calibration, save_calibration_fit
+def test_the_guided_save_equals_the_core_save(qapp, tmp_path, monkeypatch):
+    from xrd_tools.integrate.stitch_calibration import (
+        fit_calibration, pair_validation_angles, save_calibration_pair,
+    )
     (tmp_path / 'frames').mkdir()
     frames = _guided_frames(tmp_path)
     dialog = StitchCalibrationDialog(tmp_path)
@@ -313,19 +321,21 @@ def test_five_parameter_guided_save_equals_the_core_save(qapp, tmp_path, monkeyp
         dialog.frames = frames
         dialog._frame_motors = ('del', 'nu')
         dialog._render_frames()
-        assert dialog.arm_model.currentData() == 'stacked'
         dialog.fit_button.click()
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
         target = (tmp_path / 'calibration' / 'dialog.json').resolve()
         _save_to(monkeypatch, target)
         dialog.save_button.click()
+        _wait(dialog)
         geometry = dialog.geometry_editor.value().to_record()  # the window records its diffractometer
-        direct = Path(save_calibration_fit(fit_calibration(frames, instrument_geometry=geometry),
-                                           tmp_path / 'calibration' / 'core.json'))
-        assert target.read_bytes() == direct.read_bytes()
+        fit = fit_calibration(frames, instrument_geometry=geometry, arm_model='auto')
+        direct = save_calibration_pair(fit, tmp_path / 'calibration' / 'core.json',
+                                       validation_angles=pair_validation_angles(fit))
+        assert target.read_bytes() == Path(direct.pyfai_path).read_bytes()
         assert (Path(f'{target}.provenance.json').read_bytes()
-                == Path(f'{direct}.provenance.json').read_bytes())
+                == Path(f'{direct.pyfai_path}.provenance.json').read_bytes())
+        assert (tmp_path / 'calibration' / 'dialog.xu.json').read_bytes() == Path(direct.xu_path).read_bytes()
     finally:
         dialog.close()
 
@@ -361,6 +371,7 @@ def test_automatic_refinement_from_the_pages_geometry_saves_and_is_adopted(qapp,
         target = (tmp_path / 'calibration' / 'refined.json').resolve()
         _save_to(monkeypatch, target)
         dialog.save_button.click()
+        _wait(dialog)
         assert Path(page._value("geometry_path")) == target
         saved = json.loads(Path(f'{target}.provenance.json').read_text())
         assert saved['automatic_refinement']['validation']['chosen'] == 'stacked_extended'
@@ -399,25 +410,22 @@ def test_cancelled_refinement_ends_cancelled_and_a_refusal_saves_nothing(qapp, t
         dialog.close()
 
 
-def test_the_model_choice_is_disabled_with_its_reason(qapp, tmp_path):
+def test_the_arm_note_says_which_model_and_why(qapp, tmp_path):
     (tmp_path / 'frames').mkdir()
     frames = _guided_frames(tmp_path)
-    dialog = StitchCalibrationDialog(tmp_path, backend='xu_hist')
+    dialog = StitchCalibrationDialog(tmp_path)
     try:
         dialog.frames = frames
         dialog._frame_motors = ('del', 'nu')
         dialog._render_frames()
-        assert dialog.arm_model.isEnabled() and 'xrayutilities' in dialog.arm_model.toolTip()
-        dialog.backend.setCurrentIndex(dialog.backend.findData('multigeometry'))
-        assert dialog.arm_model.isEnabled()
-        dialog.arm_model.setCurrentIndex(1)
+        assert 'the detector mount and sample offset' in dialog.arm_note.text()
         dialog.scales.setChecked(True)
-        assert not dialog.arm_model.isEnabled() and dialog.arm_model.currentData() == 'stacked'
-        assert 'motor scales' in dialog.arm_model.toolTip()
+        assert 'five-parameter arm; motor scales are fitted' in dialog.arm_note.text()
+        assert 'no xrayutilities file' in dialog.arm_note.text()
         dialog.scales.setChecked(False)
         dialog.frames = tuple(frame for frame in frames if frame.motors['nu'] in (-10., -3.))
         dialog._render_frames()
-        assert not dialog.arm_model.isEnabled() and '3 nu positions' in dialog.arm_model.toolTip()
+        assert 'at least 3 nu positions (2 so far)' in dialog.arm_note.text()
     finally:
         dialog.close()
 
@@ -447,31 +455,40 @@ def test_an_independent_angle_page_geometry_does_not_become_the_refinement_seed(
         dialog.close()
 
 
-def test_an_xu_extended_fit_is_transferred_and_gated_over_the_scan(qapp, tmp_path, monkeypatch):
+def test_the_xrayutilities_file_is_checked_over_the_scan_and_a_refusal_keeps_the_pyfai_file(qapp, tmp_path, monkeypatch):
+    """Was: the window's XU extended fit. Now Save checks the partner on every frame of the scan
+    whose metadata was read; a fit xrayutilities cannot take is saved and adopted without one."""
     (tmp_path / 'frames').mkdir()
     frames = _guided_frames(tmp_path)
-    dialog = StitchCalibrationDialog(tmp_path, backend='xu_hist')
+    dialog = StitchCalibrationDialog(tmp_path)
     try:
         dialog.frames = frames
         dialog._frame_motors = ('del', 'nu')
         dialog._choices = [(index, {'del': d, 'nu': n}, None) for index, (d, n) in enumerate(ANGLES)]
         dialog._render_frames()
-        assert dialog.arm_model.isEnabled()
-        dialog.arm_model.setCurrentIndex(dialog.arm_model.findData('stacked_extended'))
         dialog.fit_button.click()
-        _wait(dialog, timeout=180)
-        assert dialog.fit is not None and dialog.fit.backend == 'xu_hist', dialog.status.text()
-        transfer = dialog.fit.asset['provenance']['xu_transfer']
-        assert transfer['validation_frames'] == len(ANGLES) and transfer['max_abs_dq_A^-1'] <= 1e-8
-        # the transferred fit records its instrument too (Codex round 11 residual)
-        assert dialog.fit.asset['provenance']['instrument_geometry'] == dialog.geometry_editor.value().to_record()
-        assert 'Transferred to xrayutilities' in dialog.fit_summary.toPlainText()
-        target = (tmp_path / 'calibration' / 'xu-extended.json').resolve()
+        _wait(dialog)
+        target = (tmp_path / 'calibration' / 'arm.json').resolve()
         _save_to(monkeypatch, target)
-        saved = []
-        dialog.calibrationSaved.connect(lambda path, backend: saved.append((path, backend)))
+        adopted = []
+        dialog.calibrationSaved.connect(lambda path, backend: adopted.append((path, backend)))
         dialog.save_button.click()
-        assert saved == [(str(target), 'xu_hist')]
-        assert json.loads(target.read_text())['version'] == 3
+        _wait(dialog, timeout=120)
+        assert adopted == [(str(target), 'multigeometry')], dialog.status.text()
+        provenance = json.loads((tmp_path / 'calibration' / 'arm.xu.json.provenance.json').read_text())
+        transfer = provenance['xu_transfer']
+        assert transfer['validation_frames'] == len(ANGLES) and transfer['max_abs_dq_A^-1'] <= 1e-8
+        # the partner records its instrument too (Codex round 11 residual)
+        assert provenance['instrument_geometry'] == dialog.geometry_editor.value().to_record()
+        dialog.scales.setChecked(True)
+        dialog.fit_button.click()
+        _wait(dialog)
+        target = (tmp_path / 'calibration' / 'scaled.json').resolve()
+        _save_to(monkeypatch, target)
+        dialog.save_button.click()
+        _wait(dialog)
+        assert adopted[-1] == (str(target), 'multigeometry') and target.is_file()
+        assert not (tmp_path / 'calibration' / 'scaled.xu.json').exists()
+        assert 'no xrayutilities file' in dialog.status.text() and 'motor scales' in dialog.status.text()
     finally:
         dialog.close()

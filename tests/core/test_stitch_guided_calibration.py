@@ -338,3 +338,28 @@ def test_a_single_arms_partner_is_checked_with_its_held_circle_at_zero(held):
     expected = ([(10., 0.), (20., 0.), (30., 0.), (0., 0.), (40., 0.)] if held == 'nu'
                 else [(0., 10.), (0., 20.), (0., 7.), (0., 0.), (0., 40.)])
     assert angles == expected
+
+
+def test_the_automatic_arm_model_takes_the_extension_when_it_applies_and_says_why_not(tmp_path):
+    """Decision 40: the detector mount and sample offset whenever the frames can determine them;
+    otherwise, or when that fit is refused, the five-parameter arm with the reason."""
+    from tests.core.test_stacked_arm_extension import ANGLES, TRUTH, _calibration, _ring_controls
+    from xrd_tools.integrate.stitch_calibration import automatic_arm_reason
+    controls, _ = _ring_controls(TRUTH, _calibration(), ANGLES[::2])
+    (tmp_path / 'wide').mkdir()
+    wide = _frames(tmp_path / 'wide', controls, _calibration().poni)
+    assert automatic_arm_reason(wide) == ''
+    assert fit_calibration(wide, arm_model='auto').asset['provenance']['arm_model'] == 'stacked_extended'
+    two_rows = tuple(frame for frame in wide if frame.motors['nu'] in (-10., -3.))
+    assert automatic_arm_reason(two_rows) == 'the extension needs frames on at least 3 nu positions (2 so far)'
+    assert 'motor scales' in automatic_arm_reason(wide, fit_scales=True)
+    assert 'single 2θ arm' in automatic_arm_reason(wide, nu_motor=None)
+    # three nu positions 0.3° apart: the extension is refused as poorly determined, five parameters fit
+    controls, _ = _ring_controls({'nu_offset': .02, 'del_offset': -.05}, _calibration(),
+                                 [(d, n) for n in (-.3, 0., .3) for d in (6., 30.)])
+    (tmp_path / 'narrow').mkdir()
+    fit = fit_calibration(_frames(tmp_path / 'narrow', controls, _calibration().poni), arm_model='auto')
+    provenance = fit.asset['provenance']
+    assert provenance['arm_model'] == 'stacked' and 'poorly determined' in provenance['arm_model_reason']
+    assert fit.message.endswith('five-parameter arm: the detector mount and sample offset were refused: '
+                                'arm extension is poorly determined; add frames spanning nu and del')
