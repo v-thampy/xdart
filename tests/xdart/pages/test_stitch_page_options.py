@@ -492,13 +492,22 @@ def test_inputs_view_follows_int(qapp, tmp_path):
         assert page._rows["image_dir"].editor.placeholderText() == f"auto · {spec.parent}"
         assert page._rows["image_stem"].editor.placeholderText() == "auto · LaB6_17keV_scan14_"
         # the stem is on the Source card, blank = auto as in the calibration window (a stem left in
-        # Advanced from another dataset matched the wrong images, live); only SPEC sources use it
+        # Advanced from another dataset matched the wrong images, live); SPEC sources and the SPEC
+        # scans a Directory finds use it, so it shows for both (Codex R20-F2), not for NeXus
         stem = page._rows["image_stem"]
         assert page.controls.source_card.isAncestorOf(stem) and stem.window() is not page.advanced
         assert stem.current_value() == "" and not stem.isHidden()
-        for kind, shown in (("NeXus", False), ("Directory", False), ("Spec", True)):
+        page.set_field("image_stem", "not_this_scan_")
+        for kind, shown in (("NeXus", False), ("Directory", True), ("Spec", True)):
             page.set_field("source_kind", kind)
             assert stem.isHidden() is not shown, kind
+        page.set_field("source_kind", "Directory")  # the value that governs Directory is on view
+        page.set_sources([str(spec.parent)])
+        assert not stem.isHidden() and stem.current_value() == "not_this_scan_"
+        assert page.build_form().source_selection.image_stem == "not_this_scan_"
+        assert stem.editor.placeholderText() == "auto · <SPEC name>_scan<N>_"  # no hidden Selection
+        page.set_field("image_stem", "")
+        page.set_field("source_kind", "Spec")
         page.set_sources([str(spec)])
         names = page._rows["output_family"]  # an optional override under Advanced
         assert names.window() is page.advanced

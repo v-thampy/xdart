@@ -638,8 +638,10 @@ class StitchPage(QtWidgets.QWidget):
 
     def _source_changed(self, *_args):
         kind = self._value("source_kind")
+        # the stem also names the images of the SPEC scans a Directory finds: shown for both, so no
+        # hidden value governs them (Codex R20-F2); NeXus sources have no stem
         for key in ("image_dir", "image_stem", "scan_mode", "scan"):
-            self._rows[key].setVisible(kind != "NeXus" and (key == "image_dir" or kind == "Spec"))
+            self._rows[key].setVisible(kind != "NeXus" and (key in ("image_dir", "image_stem") or kind == "Spec"))
         self._rows["scan"].setVisible(kind == "Spec" and self._value("scan_mode") == "Select Scans")
         self._rows["spec_path"].label.setText({"Spec": "SPEC files", "NeXus": "NeXus files", "Directory": "Folder"}[kind])
         if _args and _args[0][-1] == "source_kind":
@@ -718,7 +720,8 @@ class StitchPage(QtWidgets.QWidget):
         sources = tuple(Path(path) for path in self._source_paths)
         spec = sources[0] if sources and kind == "Spec" else None
         scans = str(value("scan") or "")
-        first = re.match(r"\s*\[?\s*(\d+)", scans)
+        # a Directory stitches every scan it finds: its stem hint names no scan number
+        first = re.match(r"\s*\[?\s*(\d+)", scans) if kind == "Spec" else None
         self._rows["image_dir"].editor.setPlaceholderText(
             f"auto · {spec.parent}" if spec else "auto · the SPEC file's folder")
         self._rows["image_stem"].editor.setPlaceholderText(
