@@ -636,3 +636,23 @@ def test_the_beam_spot_is_found_on_the_real_17_2_direct_beam_scan():
     typed = calibrate_direct_beam_scan(root / "direct_beam", beam_pixel=(279., 97.), **common)
     assert found.beam_pixel == pytest.approx((279., 97.), abs=.5)
     assert found.used.all() and found.distance_m == typed.distance_m
+
+
+@pytest.mark.parametrize('motion,shape,pitches,true_zero', [
+    ('horizontal', (45, 161), (120e-6, 80e-6), (70., 22.)),
+    ('vertical', (171, 39), (55e-6, 130e-6), (19., 80.)),
+])
+def test_the_zero_angle_beam_pixel_is_the_fits_intercept_not_the_strip_locator(motion, shape, pitches, true_zero):
+    """Codex review F1: with no frame at the zero, the spot found on the nearest frame only places
+    the strips; the zero-angle beam is the fitted centre along the motion, the strip across it."""
+    angles = np.array([6.6, 6.8, 7.2, 7.4])  # the zero is 7°, and no frame is at it
+    images, _expected, origin = beam_images(angles, shape=shape, pitches=pitches, motion=motion,
+                                            centre=true_zero)
+    result = calibrate_direct_beam(angles, images, detector='Detector', detector_config=config(shape, pitches),
+                                   beam_pixel=None, angle_zero_deg=7., motion=motion)
+    axis = 0 if motion == 'horizontal' else 1
+    assert abs(result.beam_pixel[axis] - origin[axis]) > 1  # the nearest frame is not at the zero
+    assert result.zero_beam_pixel == pytest.approx(origin, abs=.05)
+    linear = calibrate_direct_beam(angles, images, detector='Detector', detector_config=config(shape, pitches),
+                                   beam_pixel=None, angle_zero_deg=7., motion=motion, model='linear')
+    assert linear.zero_beam_pixel == pytest.approx(origin, abs=.2)

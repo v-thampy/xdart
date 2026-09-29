@@ -947,8 +947,11 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             return None
         zero = dict(zip(('del', 'nu'), self._frame_motors)).get(self._beam_role()) or self._text('beam_motor')
         # blank with a measured scan: the pixel the fit found
-        beam = (tuple(float(v) for v in self._text('beam_pixel').split(',')) if self._text('beam_pixel')
-                else self._distance_result.beam_pixel if mode == 'scan' else None)
+        # a fitted scan says where the beam hits at the zero (the fit's intercept along the motion);
+        # a typed or found pixel only placed its strips (Codex review F1)
+        beam = (self._distance_result.zero_beam_pixel if mode == 'scan'
+                else tuple(float(v) for v in self._text('beam_pixel').split(',')) if self._text('beam_pixel')
+                else None)
         if beam is None:
             return None
         mount = tuple(float(v) for v in (self._text('rough_mount') or '0, 0').split(','))
@@ -1458,7 +1461,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         return dict(distance_m=result.distance_m,
             regression_std_m=result.distance_std_m, angle_zero_deg=result.angle_zero_deg,
             pixel_pitch_m=result.pixel_pitch_m, image_shape=list(result.image_shape),
-            beam_pixel=list(result.beam_pixel),
+            beam_pixel=list(result.beam_pixel), zero_beam_pixel=list(result.zero_beam_pixel),
             model=result.model, frame_ids=[str(v) for v in result.frame_ids],
             point_ids=[tuple(str(value) if isinstance(value, Path) else value for value in point)
                        if isinstance(point, tuple) else point for point in result.point_ids],
@@ -1606,8 +1609,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 elif kind == 'distance':
                     self._distance_result = result
                     rows = [f'Distance: {result.distance_mm:.6g} mm; regression SE: {result.distance_std_m * 1000:.3g} mm',
-                            f'Beam pixel: {result.beam_pixel[0]:.1f}, {result.beam_pixel[1]:.1f}'
-                            + ('' if self._text('beam_pixel') else ' (found on the frame nearest the zero)'),
+                            f'Beam pixel at the zero: {result.zero_beam_pixel[0]:.2f}, {result.zero_beam_pixel[1]:.2f} '
+                            f'(strips placed at {result.beam_pixel[0]:.1f}, {result.beam_pixel[1]:.1f}'
+                            + (')' if self._text('beam_pixel') else ', found on the frame nearest the zero)'),
                             'Frame · angle (°) · centre (px) · residual (px) · status']
                     rows += [f'{result.point_ids[i]} · {result.angles_deg[i]:.6g} · {result.centres_px[i]:.5g} · {result.residuals_px[i]:.4g} · {"used" if result.used[i] else result.rejection_reasons[i]}' for i in range(len(result.angles_deg))]
                     self.beam_summary.setPlainText('\n'.join(rows))

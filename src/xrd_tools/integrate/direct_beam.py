@@ -50,10 +50,25 @@ class DirectBeamResult:
     intercept_px: float
     #: The (x, y) beam pixel the strips were placed by: as given, or found (``find_beam_spot``).
     beam_pixel: tuple[float, float] | None = None
+    #: The direction the spot moves ('horizontal': along x, 'vertical': along y).
+    motion: str | None = None
 
     @property
     def distance_mm(self) -> float:
         return self.distance_m * 1000.0
+
+    @property
+    def zero_beam_pixel(self) -> tuple[float, float] | None:
+        """The (x, y) pixel the direct beam hits at the zero angle: the fitted centre along the
+        motion (at ``angle_zero_deg``; the linear model's intercept is at angle 0) and the strips'
+        position across it. ``beam_pixel`` only placed the strips; found on the frame nearest the
+        zero, it is off the zero-angle beam along the motion whenever that frame is not at it."""
+        if self.beam_pixel is None or self.motion not in ('horizontal', 'vertical'):
+            return None
+        centre = (self.intercept_px if self.model == 'tangent'
+                  else self.intercept_px + (self.angle_zero_deg or 0.) / self.slope_deg_per_pixel)
+        x, y = self.beam_pixel
+        return (float(centre), float(y)) if self.motion == 'horizontal' else (float(x), float(centre))
 
     @property
     def motion_sign(self) -> int:
@@ -425,7 +440,7 @@ def calibrate_direct_beam(
     return DirectBeamResult(float(distance),float(uncertainty),angles,
         tuple(references) if ids is None else ids,points,centres,errors,used,
         tuple(reasons),predictions,centres-predictions,model,angle_zero_deg,pitch,
-        effective_shape,slope_deg,float(intercept_px),(float(beam[0]),float(beam[1])))
+        effective_shape,slope_deg,float(intercept_px),(float(beam[0]),float(beam[1])),motion)
 
 
 @contextmanager

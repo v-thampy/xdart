@@ -669,3 +669,44 @@ def test_the_detector_mask_reaches_pyfai_turned_as_the_frames_are(tmp_path):
             dialog._pyfai_mask()
     finally:
         dialog.close()
+
+
+def test_the_rough_geometry_puts_the_beam_where_the_fit_says_it_is_at_the_zero(tmp_path):
+    """Codex review F1: with no frame at the zero, the spot found on the nearest frame only places the
+    strips; the rough geometry (ring prediction, Save as calibration, the refinement seed) takes the
+    fitted zero-angle beam."""
+    import h5py
+    from pyqtgraph.Qt import QtWidgets, QtTest
+    from tests.core.test_calibration_seed import _frame
+    from tests.core.test_direct_beam import beam_images
+    from xrd_tools.integrate.calibration_seed import predict_frame_seed
+    angles = np.array([1., .6, -.6, -1.])  # the zero is 0°, and no frame is at it
+    images, _, beam = beam_images(angles, shape=(65, 487), pitches=(516e-6, 172e-6), distance=.5, zero=0)
+    nexus = tmp_path / 'direct.nxs'
+    with h5py.File(nexus, 'w') as handle:
+        handle.create_group('measurement').attrs['NX_class'] = 'NXentry'
+        handle['measurement/data/image'] = np.asarray(images).astype('uint32')
+        handle['measurement/data/del'] = angles
+    dialog = StitchCalibrationDialog(tmp_path)
+    try:
+        dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('nexus'))
+        for key, value in dict(beam_source=nexus, beam_entry='measurement', beam_detector='Pilatus100k',
+                               beam_pixel='', rough_wavelength='1').items():
+            dialog._set_field_text(key, value)
+        dialog.beam_button.click()
+        for _ in range(1500):
+            QtWidgets.QApplication.processEvents()
+            if not dialog.active():
+                break
+            QtTest.QTest.qWait(20)
+        QtTest.QTest.qWait(200)  # the poll delivers the terminal
+        result = dialog._distance_result
+        assert result is not None, dialog.status.text()
+        assert abs(result.beam_pixel[0] - beam[0]) > 1  # found on a frame off the zero
+        assert result.zero_beam_pixel == pytest.approx(beam, abs=.05)
+        assert 'Beam pixel at the zero' in dialog.beam_summary.toPlainText()
+        seed = predict_frame_seed(dialog._rough_arm(), _frame({'del': 0., 'nu': 0.}, shape=(195, 487)))
+        x, y = beam
+        assert float(seed.integrator.tth(np.array([y]), np.array([x]))[0]) == pytest.approx(0, abs=1e-4)
+    finally:
+        dialog.close()
