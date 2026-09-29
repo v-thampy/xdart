@@ -6075,10 +6075,11 @@ def _run_gi_1d(
         sample_orientation=gi.sample_orientation,
     )
     if gi.mode_1d is GI1DMode.Q_IP:
+        # integrate_gi_1d's ``unit`` is the out-of-plane axis (the window, q_oop); its in-plane
+        # axis, the cut's, is q_ip by default
         return integrate_gi_1d(
             image,
             fi,
-            unit="qip_A^-1",
             npt_oop=npt_oop,
             vertical_integration=False,
             **common,
