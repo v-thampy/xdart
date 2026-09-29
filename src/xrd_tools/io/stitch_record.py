@@ -104,13 +104,15 @@ def write_stitch_record(entry: h5py.Group, target: str | Path, pattern: Stitched
             label=LABEL, result_1d=IntegrationResult1D(value.axis, value.intensity, value.sigma, value.unit),
             mode_1d=mode, write_frame_record=position == 0)])  # an extra mode joins the row's record
     writer.finish()
+    from xrd_tools.io.nexus import _bounded_text_attr  # the strict envelope's fixed-width text
+
     stitch = entry.create_group(STITCH_GROUP)
-    stitch.attrs["NX_class"] = "NXcollection"
+    _bounded_text_attr(stitch, "NX_class", "NXcollection")
     _float32(stitch, "coverage", pattern.coverage)
     _float32(stitch, "normalization", pattern.normalization)
     if gi is not None:
         cut = stitch.create_group(gi[0])
-        cut.attrs["NX_class"] = "NXcollection"
+        _bounded_text_attr(cut, "NX_class", "NXcollection")
         _float32(cut, "coverage", gi[1].coverage)
         _float32(cut, "normalization", gi[1].normalization)
     if frame_records:
@@ -191,6 +193,8 @@ def _read(handle: h5py.File, entry: str, container: Path) -> StitchRecord:
         if not isinstance(cut, h5py.Group):
             raise ValueError(f"the stitched GI cut {mode} has no coverage or normalization")
         gi = (mode, _pattern(groups.mode_group("1d", mode), _stored(cut, "coverage"), _stored(cut, "normalization")))
+        if gi[1].sigma is not None:  # no fingerprint covers one (Codex review F6)
+            raise ValueError("a stitched GI cut carries no sigma")
     text = stitch.get(FRAMES_JSON)
     if text is not None and not isinstance(text, h5py.Dataset):
         raise ValueError("the stitched frames manifest must be a dataset")

@@ -2071,11 +2071,8 @@ def _inspect_stitch_record(
         expected_request.target if expected_request is not None else shown
     ):
         raise AnalysisArtifactInvalid("stitched record records a private candidate path")
-    allowed = {"coverage", "normalization", _PROVENANCE, *_STITCH_GI_MODES}
-    allowed |= {"frames", _STITCH_FRAMES_JSON} if native else set()
-    allowed |= {_EXECUTION_ATTESTATION} if attested else set()
-    if any(name not in allowed for name in stitch) or (native and "frames" not in stitch):
-        raise AnalysisArtifactInvalid("stitched record contains an unknown stitch graph")
+    if _bounded_attr_text(stitch, "NX_class") != "NXcollection":
+        raise AnalysisArtifactInvalid("stitched record envelope is not an NXcollection")
     provenance = _read_scalar_text(stitch, _PROVENANCE)
     if expected_request is not None and provenance != expected_request.provenance_json:
         raise AnalysisArtifactInvalid("stitched record provenance changed")
@@ -2095,6 +2092,18 @@ def _inspect_stitch_record(
         ):
             raise AnalysisArtifactInvalid("stitched record execution attestation changed")
     content, projection = _stitch_record_projection(entry.file, version)
+    # exactly the stitch graph this record's modes and version call for (Codex review F6)
+    expected_children = {"coverage", "normalization", _PROVENANCE}
+    expected_children |= {"frames", _STITCH_FRAMES_JSON} if native else set()
+    expected_children |= {_EXECUTION_ATTESTATION} if attested else set()
+    expected_children |= set() if content.gi is None else {content.gi[0]}
+    if set(stitch) != expected_children:
+        raise AnalysisArtifactInvalid("stitched record contains an unknown stitch graph")
+    if content.gi is not None:
+        cut = _direct(stitch, content.gi[0], h5py.Group)
+        if (set(cut) != {"coverage", "normalization"} or set(cut.attrs) != {"NX_class"}
+                or _bounded_attr_text(cut, "NX_class") != "NXcollection"):
+            raise AnalysisArtifactInvalid("stitched record's GI cut diagnostics are not exact")
     if native:
         from xrd_tools.io.analysis_stitch_auxiliary import inspect_contributing_frames
 

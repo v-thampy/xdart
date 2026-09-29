@@ -120,3 +120,41 @@ def test_a_gi_stitch_publishes_i_of_q_and_its_cut_as_one_int_record(tmp_path, ba
     np.testing.assert_array_equal(stored.gi[1].normalization, cast(diagnostics.normalization))
     assert len(json.loads(stored.frames_json)["records"]) == len(request.module.source.selected_labels)
     assert result.payload.inspection.result_fingerprint == result.terminal.commit.result_fingerprint
+
+
+@pytest.mark.parametrize("tamper", ["gi-sigma", "other-cut", "cut-extra", "cut-class", "stitch-class", "plain-cut"])
+def test_record_admission_takes_exactly_the_stitch_graph_the_record_calls_for(tmp_path, tamper):
+    """Codex review F6: a GI cut has no sigma (none is fingerprinted), and entry/stitch holds exactly
+    what the record's modes call for, each an NXcollection; anything else is refused."""
+    import h5py
+    import numpy as np
+
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactInvalid, inspect_analysis_artifact
+
+    gi = None if tamper == "plain-cut" else StitchGI("q_ip", incidence_motor="eta", sample_motors=_SAMPLE)
+    request = prepare_stitch_tool(_gi_form(tmp_path, "xu_hist", gi)).request
+    assert run_stitch_operation(request).terminal.disposition.name == "COMMITTED"
+    target = request.module.output.target
+    inspect_analysis_artifact(target)  # as written: admitted
+    with h5py.File(target, "r+") as handle:
+        stitch = handle["entry/stitch"]
+        if tamper == "gi-sigma":
+            cut = handle["entry/integrated_1d/q_ip"]  # a valid float32 row, as Int would write one
+            cut.create_dataset("sigma", data=np.full(cut["intensity"].shape, 123, "<f4"), chunks=True,
+                               maxshape=(None, cut["intensity"].shape[1]))
+        elif tamper == "other-cut":
+            stitch.create_group("q_oop").attrs["NX_class"] = "NXcollection"
+        elif tamper == "cut-extra":
+            stitch["q_ip"].create_dataset("garbage", data=np.ones(3))
+        elif tamper == "cut-class":
+            stitch["q_ip"].attrs["NX_class"] = np.bytes_(b"NXdata")  # well-formed, wrong class
+        elif tamper == "stitch-class":
+            stitch.attrs["NX_class"] = np.bytes_(b"NXdata")
+        else:  # a plain record given a cut group
+            stitch.create_group("q_ip").attrs["NX_class"] = "NXcollection"
+    reason = {"gi-sigma": "carries no sigma", "cut-extra": "GI cut diagnostics are not exact",
+              "cut-class": "GI cut diagnostics are not exact", "stitch-class": "not an NXcollection"
+              }.get(tamper, "unknown stitch graph")
+    with pytest.raises(AnalysisArtifactInvalid, match=reason):
+        inspect_analysis_artifact(target)
