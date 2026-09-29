@@ -37,6 +37,13 @@ coordinate only checks the seed lies inside the selected image/ROI. The Gaussian
 plus linear-background fit locates the strongest peak in that strip. Choose an
 ROI if another bright feature is present. `strip_half_width=2` gives up to five
 rows/columns, clipped to the ROI/image without wrapping at an edge.
+`beam_pixel=None` finds it on the frame nearest `angle_zero_deg` (the middle angle
+without a zero; a missing or unreadable frame passes to the next nearest) with
+`find_beam_spot`: the brightest 5×5 sum, so a lone hot pixel is diluted, refined as
+the background-subtracted centroid of the 11×11 pixels around it. The result's
+`beam_pixel` records the pixel used. Only this search gathers the rows' items before
+reading; with lazy references (paths, `ScanFrame`s) nothing is decoded early, while
+in-memory arrays are held until their row is read.
 
 Use the existing `ImageOrientation` (CCW rotation, transpose and flips) to
 transform raw frames and the detector's native mask once. Supply `beam_pixel`,

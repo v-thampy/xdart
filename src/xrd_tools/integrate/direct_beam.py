@@ -48,6 +48,8 @@ class DirectBeamResult:
     image_shape: tuple[int, int]
     slope_deg_per_pixel: float
     intercept_px: float
+    #: The (x, y) beam pixel the strips were placed by: as given, or found (``find_beam_spot``).
+    beam_pixel: tuple[float, float] | None = None
 
     @property
     def distance_mm(self) -> float:
@@ -170,9 +172,38 @@ def _peak(image, invalid, beam, motion, half_width, roi, saturation):
     return float(centre),error
 
 
+def find_beam_spot(image, invalid=None, *, box: int = 5) -> tuple[float, float]:
+    """Where the direct beam hits an oriented frame, as (x, y) = (column, row).
+
+    The brightest ``box`` × ``box`` sum (a lone hot pixel is diluted ``box``² times),
+    refined as the background-subtracted intensity centroid of the 11 × 11 pixels around
+    it (a narrower window biases it toward the brightest pixel). Invalid pixels (``invalid``, negative or nonfinite) count as zero. A frame with no
+    spot clear of its background is refused.
+    """
+    from scipy.ndimage import uniform_filter
+    values = np.asarray(image, dtype=float)
+    bad = ~np.isfinite(values) | (values < 0)
+    if invalid is not None:
+        bad |= np.asarray(invalid, dtype=bool)
+    if values.ndim != 2 or bad.all():
+        raise ValueError('no valid pixels to find the direct beam on')
+    clean = np.where(bad, 0.0, values)
+    summed = uniform_filter(clean, size=box, mode='constant')
+    row, col = np.unravel_index(int(np.argmax(summed)), summed.shape)
+    level = float(np.median(summed[~bad]))
+    spread = 1.4826 * float(np.median(np.abs(summed[~bad] - level)))
+    if not summed[row, col] - level > max(10 * spread, .5 * abs(level), 1e-12):
+        raise ValueError('no direct-beam spot stands clear of the background')
+    rows, cols = slice(max(row - 5, 0), row + 6), slice(max(col - 5, 0), col + 6)
+    weights = np.where(bad[rows, cols], 0., np.clip(clean[rows, cols] - float(np.median(clean[~bad])), 0., None))
+    grid_rows, grid_cols = np.mgrid[rows, cols][:, :weights.shape[0], :weights.shape[1]]
+    total = float(weights.sum())
+    return float((weights * grid_cols).sum() / total), float((weights * grid_rows).sum() / total)
+
+
 def calibrate_direct_beam(
     angles_deg: Sequence[float], images: Iterable, *, detector,
-    beam_pixel: tuple[float, float], detector_config: Mapping | None = None,
+    beam_pixel: tuple[float, float] | None = None, detector_config: Mapping | None = None,
     motion: str = 'horizontal', strip_half_width: int = 2,
     model: str = 'tangent', angle_zero_deg: float | None = None,
     orientation: ImageOrientation | None = None, roi: tuple[int,int,int,int] | None = None,
@@ -204,7 +235,10 @@ def calibrate_direct_beam(
     perpendicular sample-to-plane separation for a sample-centred detector arm.
     ``model='linear'`` uses the notebook's inverse regression and local distance
     approximation, without needing a known zero. No tilt/wavelength/PONI is fit.
-    The beam pixel selects the strip only, not the fitted intercept.
+    The beam pixel selects the strip only, not the fitted intercept. Without one
+    (``beam_pixel=None``) it is found (:func:`find_beam_spot`) on the frame nearest
+    ``angle_zero_deg`` (the middle angle without a zero), a missing or unreadable
+    frame passing to the next nearest; the result's ``beam_pixel`` says which.
 
     Negative/nonfinite pixels and masks exclude whole strip-profile bins; invalid
     beam cores and saturation reject a frame. Set ``saturation`` to the detector's
@@ -230,8 +264,8 @@ def calibrate_direct_beam(
         raise ValueError("motion must be 'horizontal' or 'vertical'")
     if not isinstance(strip_half_width,(int,np.integer)) or strip_half_width < 0:
         raise ValueError('strip_half_width must be a nonnegative integer')
-    beam = np.asarray(beam_pixel,dtype=float)
-    if beam.shape != (2,) or not np.isfinite(beam).all():
+    beam = None if beam_pixel is None else np.asarray(beam_pixel,dtype=float)
+    if beam is not None and (beam.shape != (2,) or not np.isfinite(beam).all()):
         raise ValueError('beam_pixel must be finite (x,y)')
     if roi is not None and (len(roi) != 4 or any(not isinstance(v,(int,np.integer)) for v in roi)):
         raise ValueError('ROI must contain four integer bounds')
@@ -259,9 +293,75 @@ def calibrate_direct_beam(
     centres = np.full(len(angles),np.nan)
     errors = centres.copy()
     reasons, references = [],[]
-    raw_shape = None
-    pitch = effective_shape = detector_mask = None
-    iterator = iter(images)
+    state = {}  # the first readable image's layout: raw shape, effective detector, its mask, the pitch
+
+    def load(item):
+        if item is None:
+            raise ValueError('missing frame')
+        if isinstance(item,np.ndarray):
+            return item
+        if isinstance(item, ScanFrame):
+            return item.load_image()
+        opts = options.copy()
+        path = item
+        if isinstance(item,tuple):
+            if len(item) not in (2,3):
+                raise ValueError('frame reference must be (path,frame[,dataset])')
+            path,opts['frame'] = item[:2]
+            if len(item) == 3:
+                opts['dataset_path'] = item[2]
+        return read_image(path,preserve_dtype=True,exact_frame=True,**opts)
+
+    def oriented_and_invalid(image):
+        if image.ndim != 2 or not all(image.shape):
+            raise ValueError('image shape must be nonempty 2-D')
+        if not state:
+            effective,pitches = _effective_detector(det,image.shape)
+            detector_mask = effective.mask
+            if detector_mask is not None:
+                if detector_mask.shape != image.shape:
+                    raise ValueError('detector mask shape differs from image shape')
+                detector_mask = orient.apply(detector_mask).astype(bool)
+            if orient.swaps_axes:
+                pitches = pitches[::-1]
+            state.update(raw_shape=image.shape, effective=effective, detector_mask=detector_mask,
+                         pitch=float(pitches[1 if motion == 'horizontal' else 0]))
+        if image.shape != state['raw_shape']:
+            raise ValueError(f"image shape {image.shape} differs from {state['raw_shape']}")
+        oriented = orient.apply(image)
+        invalid = (np.zeros(oriented.shape,bool) if state['detector_mask'] is None
+                   else state['detector_mask'].copy())
+        dummy, tolerance = state['effective'].get_dummies(image)
+        if dummy is not None:
+            invalid |= np.abs(oriented.astype(np.float32)-dummy) <= tolerance
+        if mask is not None:
+            if np.shape(mask) != oriented.shape:
+                raise ValueError('mask shape must match the oriented image')
+            invalid |= np.asarray(mask,dtype=bool)
+        return oriented, invalid
+
+    iterator = iter(images)  # streamed: no frame is kept past its row
+    if beam is None:  # the zero frame first: the rows' items are gathered (lazy references stay undecoded)
+        items = list(iterator)
+        if len(items) != len(angles):
+            raise ValueError('image and angle lengths differ')
+        zero = np.median(angles) if angle_zero_deg is None else angle_zero_deg
+        problems = []
+        for index in np.argsort(np.abs(angles-zero), kind='stable'):
+            try:
+                beam = np.asarray(find_beam_spot(*oriented_and_invalid(load(items[index]))), dtype=float)
+                break
+            except (OSError,ValueError,IndexError,KeyError,RuntimeError) as exc:
+                problems.append(f'row {int(index)}: {exc}')
+        else:
+            raise ValueError('no frame shows the direct beam; enter the beam pixel ('
+                             + '; '.join(problems[:3]) + ')')
+
+        def released():
+            for index in range(len(items)):
+                item, items[index] = items[index], None
+                yield item
+        iterator = released()
     for index in range(len(angles)):
         try:
             item = next(iterator)
@@ -271,47 +371,7 @@ def calibrate_direct_beam(
                      else index if isinstance(item, np.ndarray) or item is None else item)
         references.append(reference)
         try:
-            if item is None:
-                raise ValueError('missing frame')
-            if isinstance(item,np.ndarray):
-                image = item
-            elif isinstance(item, ScanFrame):
-                image = item.load_image()
-            else:
-                opts = options.copy()
-                path = item
-                if isinstance(item,tuple):
-                    if len(item) not in (2,3):
-                        raise ValueError('frame reference must be (path,frame[,dataset])')
-                    path,opts['frame'] = item[:2]
-                    if len(item) == 3:
-                        opts['dataset_path'] = item[2]
-                image = read_image(path,preserve_dtype=True,exact_frame=True,**opts)
-            if image.ndim != 2 or not all(image.shape):
-                raise ValueError('image shape must be nonempty 2-D')
-            if raw_shape is None:
-                effective,pitches = _effective_detector(det,image.shape)
-                raw_shape = image.shape
-                detector_mask = effective.mask
-                if detector_mask is not None:
-                    if detector_mask.shape != raw_shape:
-                        raise ValueError('detector mask shape differs from image shape')
-                    detector_mask = orient.apply(detector_mask).astype(bool)
-                if orient.swaps_axes:
-                    pitches = pitches[::-1]
-                pitch = float(pitches[1 if motion == 'horizontal' else 0])
-            if image.shape != raw_shape:
-                raise ValueError(f'image shape {image.shape} differs from {raw_shape}')
-            oriented = orient.apply(image)
-            effective_shape = oriented.shape
-            invalid = np.zeros(effective_shape,bool) if detector_mask is None else detector_mask.copy()
-            dummy, tolerance = effective.get_dummies(image)
-            if dummy is not None:
-                invalid |= np.abs(oriented.astype(np.float32)-dummy) <= tolerance
-            if mask is not None:
-                if np.shape(mask) != effective_shape:
-                    raise ValueError('mask shape must match the oriented image')
-                invalid |= np.asarray(mask,dtype=bool)
+            oriented, invalid = oriented_and_invalid(load(item))
             centres[index],errors[index] = _peak(oriented,invalid,beam,motion,
                 strip_half_width,roi,saturation)
         except (OSError,ValueError,IndexError,KeyError,RuntimeError,OptimizeWarning) as exc:
@@ -319,10 +379,13 @@ def calibrate_direct_beam(
         else:
             reasons.append(None)
         # No scan stack or array-valued frame identifiers are retained.
-        item = image = oriented = None
+        item = oriented = invalid = None
     sentinel = object()
     if next(iterator,sentinel) is not sentinel:
         raise ValueError('image and angle lengths differ')
+    pitch = state.get('pitch')
+    effective_shape = None if not state else tuple(state['raw_shape'][::-1] if orient.swaps_axes
+                                                   else state['raw_shape'])
     used = np.isfinite(centres)
     if used.sum() < 3 or np.unique(angles[used]).size < 3:
         detail = '; '.join(f'row {i}: {r}' for i,r in enumerate(reasons) if r)
@@ -362,7 +425,7 @@ def calibrate_direct_beam(
     return DirectBeamResult(float(distance),float(uncertainty),angles,
         tuple(references) if ids is None else ids,points,centres,errors,used,
         tuple(reasons),predictions,centres-predictions,model,angle_zero_deg,pitch,
-        effective_shape,slope_deg,float(intercept_px))
+        effective_shape,slope_deg,float(intercept_px),(float(beam[0]),float(beam[1])))
 
 
 @contextmanager

@@ -730,9 +730,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                    tip='That motor\'s reading when the detector faces the beam squarely; 0 unless it is offset.')
         self._edit(form, 'beam_pixel', 'Approximate beam pixel x, y (oriented image)', '',
                    tip='Column, row of the pixel the direct beam hits with the detector facing it squarely (the '
-                       'motor at the zero above), in the image as displayed: read it off the scan\'s frame at '
-                       'that angle; it is not necessarily the centre. Along the beam\'s motion it can be '
-                       'rough. Across it (the row for horizontal motion, the column for vertical) it must be '
+                       'motor at the zero above), in the image as displayed; it is not necessarily the centre. '
+                       'Blank with a direct-beam scan: found on the scan\'s frame nearest the zero (the '
+                       'brightest spot, a lone hot pixel ignored). Typed: along the beam\'s motion it can be '
+                       'rough; across it (the row for horizontal motion, the column for vertical) it must be '
                        'within the strip half width, because the spot is searched only in that strip.')
         self.motion = self._combo(form, 'Beam motion', [('horizontal', None), ('vertical', None)],
                                   tip='The direction the beam spot moves across the image as the motor turns.')
@@ -856,7 +857,17 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         width, height = (rows, columns) if rotation in (90, 270) else (columns, rows)
         self._image_size.setText(f'{width} × {height} px (x × y): x 0–{width - 1}, y 0–{height - 1} · '
                                  f'image rotation {rotation}°')
-        self._fields['beam_pixel'].setPlaceholderText('column, row where the direct beam hits at the zero')
+        self._beam_pixel_hint()
+
+    def _beam_pixel_hint(self, *_args):
+        """A direct-beam scan finds the beam pixel when it is blank; a typed distance needs it."""
+        if not hasattr(self, 'rough_mode'):  # still being built
+            return
+        found = getattr(self._distance_result, 'beam_pixel', None)
+        self._fields['beam_pixel'].setPlaceholderText(
+            'column, row where the direct beam hits at the zero' if self.rough_mode.currentData() != 'scan'
+            else f'auto · the direct beam found at {found[0]:.1f}, {found[1]:.1f}' if found is not None
+            else 'auto · where the direct beam hits, found on the frame nearest the zero')
 
     def _detector_chosen(self, *_args):
         """The chosen detector's shape becomes the RAW reader's rows and columns (Select frames)."""
@@ -882,6 +893,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             widget.setVisible(scan)
         self._label('beam_source').setText('NeXus file' if kind == 'nexus' else 'SPEC file')
         self.rough_note.setText(self._ROUGH_NOTES[mode])
+        self._beam_pixel_hint()
         if hasattr(self, 'frame_table'):
             self._render_frames()
 
@@ -896,9 +908,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             else:
                 return None
             zero = dict(zip(('del', 'nu'), self._frame_motors)).get(self._beam_role()) or self._text('beam_motor')
+            # blank with a measured scan: the pixel the fit found
+            beam = (tuple(float(v) for v in self._text('beam_pixel').split(',')) if self._text('beam_pixel')
+                    else self._distance_result.beam_pixel if mode == 'scan' else None)
             return rough_arm_record(
                 distance_m=distance, detector=self._text('beam_detector'),
-                beam_px=tuple(float(v) for v in self._text('beam_pixel').split(',')),
+                beam_px=beam,
                 zero_deg=float(self._text('beam_zero') or 0), zero_motor=zero,
                 del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1],
                 orientation=int(self._text('beam_orientation')))
@@ -1302,12 +1317,11 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _distance(self):
         def go():
-            if not self._text('beam_pixel'):
-                raise ValueError('Enter the approximate beam pixel (column, row) under 1 · Geometry.')
             orientation = int(self._text('beam_orientation'))
             options = dict(detector=self._text('beam_detector'),
                 detector_config={'orientation': orientation} if orientation != 3 else None,
-                beam_pixel=tuple(float(v) for v in self._text('beam_pixel').split(',')),
+                beam_pixel=(tuple(float(v) for v in self._text('beam_pixel').split(','))
+                            if self._text('beam_pixel') else None),  # blank: found at the zero
                 motion=self.motion.currentText(), strip_half_width=int(self._text('beam_strip')),
                 model='tangent', angle_zero_deg=float(self._text('beam_zero')),
                 rotation=self.rotation.currentData())
@@ -1330,6 +1344,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._distance_provenance = dict(distance_m=result.distance_m,
             regression_std_m=result.distance_std_m, angle_zero_deg=result.angle_zero_deg,
             pixel_pitch_m=result.pixel_pitch_m, image_shape=list(result.image_shape),
+            beam_pixel=list(result.beam_pixel),
             model=result.model, frame_ids=[str(v) for v in result.frame_ids],
             point_ids=[tuple(str(value) if isinstance(value, Path) else value for value in point)
                        if isinstance(point, tuple) else point for point in result.point_ids],
@@ -1478,9 +1493,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 elif kind == 'distance':
                     self._distance_result = result
                     rows = [f'Distance: {result.distance_mm:.6g} mm; regression SE: {result.distance_std_m * 1000:.3g} mm',
+                            f'Beam pixel: {result.beam_pixel[0]:.1f}, {result.beam_pixel[1]:.1f}'
+                            + ('' if self._text('beam_pixel') else ' (found on the frame nearest the zero)'),
                             'Frame · angle (°) · centre (px) · residual (px) · status']
                     rows += [f'{result.point_ids[i]} · {result.angles_deg[i]:.6g} · {result.centres_px[i]:.5g} · {result.residuals_px[i]:.4g} · {"used" if result.used[i] else result.rejection_reasons[i]}' for i in range(len(result.angles_deg))]
                     self.beam_summary.setPlainText('\n'.join(rows))
+                    self._beam_pixel_hint()
                     self._render_frames()  # the measured distance now predicts the rings
                 if kind == 'calibrate' and result is not None:
                     pending = [frame for frame in self.frames if not frame.complete]

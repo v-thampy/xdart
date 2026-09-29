@@ -478,10 +478,13 @@ def test_direct_beam_fit_button_reads_container_sources(tmp_path, source_kind):
         handle['measurement/instrument/detector/detectorSpecific/nimages'] = 1
     dialog = StitchCalibrationDialog(tmp_path)
     dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData(source_kind))
+    # the NeXus case leaves the beam pixel blank: it is found on the frame at the zero
+    typed = ', '.join(map(str, beam)) if source_kind == 'spec_container' else ''
     for key, value in dict(beam_source=spec if source_kind == 'spec_container' else nexus,
             beam_image_file=master, beam_scan='8.1', beam_entry='measurement',
-            beam_detector='Pilatus100k', beam_pixel=', '.join(map(str, beam))).items():
+            beam_detector='Pilatus100k', beam_pixel=typed).items():
         dialog._set_field_text(key, value)
+    assert dialog._fields['beam_pixel'].placeholderText().startswith('auto · where the direct beam hits')
     assert dialog._fields['beam_scan'].isHidden() == (source_kind == 'nexus')
     assert dialog._fields['beam_images'].parentWidget().isHidden()
     dialog.beam_button.click()
@@ -499,6 +502,10 @@ def test_direct_beam_fit_button_reads_container_sources(tmp_path, source_kind):
                                if source_kind == 'spec_container' else result.frame_ids)
     assert result.distance_mm == pytest.approx(500., rel=1e-4)
     assert result.used.all()
+    assert result.beam_pixel == pytest.approx(beam, abs=.1)
+    if not typed:
+        assert 'found on the frame nearest the zero' in dialog.beam_summary.toPlainText()
+        assert dialog._fields['beam_pixel'].placeholderText().startswith('auto · the direct beam found at 243.0, 32.0')
     assert dialog._text('distance_seed') == ''
     dialog.apply_distance_button.click()
     assert float(dialog._text('distance_seed')) == pytest.approx(500., rel=1e-4)

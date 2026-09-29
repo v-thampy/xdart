@@ -586,3 +586,32 @@ def test_streaming_does_not_retain_input_frames():
     assert result.used.all()
     assert result.frame_ids == result.point_ids == ids
     assert all(ref() is None for ref in previous)
+
+
+def test_find_beam_spot_ignores_a_hot_pixel_and_a_gap():
+    """The automatic beam pixel (maintainer, 2026-09-29): the brightest 5×5 sum, refined as a
+    centroid; a lone hot pixel brighter than the beam's peak and a module gap do not attract it."""
+    from xrd_tools.integrate.direct_beam import find_beam_spot
+    yy, xx = np.indices((45, 161))
+    image = 12 + .015*xx + 4000*np.exp(-.5*(((xx-80.3)/1.6)**2+((yy-22.6)/1.6)**2))
+    image[5, 150] = 30000.  # hotter than the beam's peak, alone
+    gap = np.zeros(image.shape, bool)
+    gap[:, 60:64] = True  # a module gap crossing the beam's row
+    image[gap] = -1
+    assert find_beam_spot(image, gap) == pytest.approx((80.3, 22.6), abs=.05)
+    with pytest.raises(ValueError, match='no direct-beam spot stands clear'):
+        find_beam_spot(12 + .015*xx)
+
+
+def test_the_beam_pixel_is_found_on_the_frame_nearest_the_zero():
+    angles = np.array([8.1, 7.7, 7.13, 7., 6.82, 6.2, 5.7])
+    images, expected, beam = beam_images(angles)
+    images[3] = None  # the zero frame is missing: the next nearest, 7.13°, shows the beam
+    found = calibrate_direct_beam(angles, iter(images), detector='Detector', detector_config=config(),
+                                  angle_zero_deg=7.)
+    assert found.beam_pixel == pytest.approx((expected[2], beam[1]), abs=.05)
+    given = run(angles, iter(images), beam=beam)  # the same strips as a typed beam pixel
+    assert given.beam_pixel == beam and found.distance_m == given.distance_m
+    flat = [np.full((45, 161), 12.) for _ in angles]
+    with pytest.raises(ValueError, match='no frame shows the direct beam; enter the beam pixel'):
+        calibrate_direct_beam(angles, iter(flat), detector='Detector', detector_config=config(), angle_zero_deg=7.)
