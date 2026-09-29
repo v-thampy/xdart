@@ -412,6 +412,48 @@ def test_a_single_arm_xu_calibration_reads_only_its_2theta_motor(tmp_path, held)
     assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
 
 
+def test_an_energy_refined_calibration_checks_the_scans_against_their_recorded_energy(tmp_path):
+    """Maintainer, 2026-09-29: "add a refine energy toggle". A calibration refined to 17 100 eV keeps the
+    17 000.018 eV the scans recorded (source_energy_eV, in the pyFAI file and its xrayutilities partner):
+    both backends check the scans against it, and Stitch runs; without it, the scans are refused."""
+    import json
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    from xrd_tools.core.geometry import DetectorCalibration
+    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
+    from xrd_tools.integrate.stitch_calibration import CalibrationFit, save_calibration_pair
+    from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
+    form = _native_form(tmp_path, "xu_hist", scans="1")
+    calibration = DetectorCalibration(PONI(dist=.39, poni1=.02, poni2=.04, detector="Pilatus300kw",
+                                           wavelength=energy_eV_to_wavelength_m(17100.)),
+                                      detector_config={"orientation": 3})
+    record = StackedDetectorArm(nu_motor="nu", del_motor="del", nu_offset=.01,
+                                del_offset=-.02).to_pyfai_goniometer(calibration)
+    record["detector_config"] = {"orientation": 3}
+
+    def pair(name, **extra):
+        fit = CalibrationFit("multigeometry", {"calibration": {**record, **extra}, "provenance": {
+            "source_motors": {"del_angle": "del", "nu_angle": "nu"}, "image_rotation": 0, "frames": []}},
+            1e-3, 10., 100, "")
+        return save_calibration_pair(fit, tmp_path / "calibration" / f"{name}.json",
+                                     validation_angles=[(12., -12.), (14., -10.), (17., -8.)])
+
+    refined = pair("refined", source_energy_eV=17000.018)
+    partner = json.loads(Path(refined.xu_path).read_text())["acquisition"]
+    assert partner["source_energy_eV"] == 17000.018 and partner["energy_eV"] == pytest.approx(17100.)
+    mg = replace(form, backend="multigeometry", source_motors=(("del_angle", "del"), ("nu_angle", "nu")))
+    for backend_form in (form, mg):
+        prepared = prepare_stitch_tool(replace(backend_form, geometry_path=Path(refined.pyfai_path)))
+        assert prepared.requests[0].provenance["source_energy_checks"]  # the scans' energies were checked
+        result = run_stitch_operation(prepared.requests[0])
+        assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    unrecorded = pair("unrecorded")
+    for backend_form in (form, mg):
+        with pytest.raises(StitchToolPreflightRefused, match="ENERGY"):
+            prepare_stitch_tool(replace(backend_form, geometry_path=Path(unrecorded.pyfai_path)))
+
+
 def test_an_xu_stitch_reads_the_partner_saved_beside_a_pyfai_calibration(tmp_path):
     """Always both (maintainer, 2026-09-29): Backend xrayutilities with the Calibration's pyFAI file
     reads the xrayutilities file saved with it; a pyFAI file saved alone (as the fits before, e.g. the

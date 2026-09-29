@@ -57,9 +57,9 @@ def _page_with_dialog(tmp_path, spec=None, seed_path=None):
     return page, page._calibration_dialog
 
 
-def _guided_frames(tmp_path):
+def _guided_frames(tmp_path, energy_ratio=1.0):
     from tests.core.test_stitch_guided_calibration import _frames
-    controls, _calibrant = _ring_controls(TRUTH, _calibration(), ANGLES[::2])
+    controls, _calibrant = _ring_controls(TRUTH, _calibration(), ANGLES[::2], energy_ratio=energy_ratio)
     return _frames(tmp_path / 'frames', controls, _calibration().poni)
 
 
@@ -613,3 +613,54 @@ def test_the_quick_save_builds_the_arm_the_geometry_shows(qapp, tmp_path, plane,
         assert fit.asset['provenance']['instrument_geometry'] == geometry.to_record()
     finally:
         dialog.close()
+
+
+def test_refine_energy_fits_the_energy_within_the_bound_and_saves_the_recorded_one(qapp, tmp_path, monkeypatch):
+    """Maintainer, 2026-09-29: "add a refine energy toggle. If selected there should be an option to set
+    the constraint - just one number for +-that number". Frames of a beam 100 eV above the recorded
+    energy: the fit finds it; Save writes the refined wavelength and keeps the recorded energy in the
+    pyFAI file and its xrayutilities partner; the toggle and bound are saved settings."""
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m, wavelength_m_to_energy_eV
+    recorded = float(wavelength_m_to_energy_eV(_calibration().poni.wavelength))
+    (tmp_path / 'frames').mkdir()
+    frames = _guided_frames(tmp_path, energy_ratio=(recorded + 100.) / recorded)
+    page, dialog = _page_with_dialog(tmp_path)
+    try:
+        dialog.frames = frames
+        dialog._frame_motors = ('del', 'nu')
+        dialog._render_frames()
+        assert not dialog.refine_energy.isChecked() and not dialog._fields['energy_bound'].isEnabled()
+        dialog.refine_energy.setChecked(True)
+        assert dialog._fields['energy_bound'].isEnabled() and dialog._text('energy_bound') == '200'
+        dialog._set_field_text('energy_bound', 'many')
+        dialog.fit_button.click()
+        assert dialog.fit is None and 'energy bound' in dialog.status.text()
+        dialog._set_field_text('energy_bound', '200')
+        dialog.fit_button.click()
+        _wait(dialog)
+        assert dialog.fit is not None, dialog.status.text()
+        energy = dialog.fit.asset['provenance']['energy_refinement']
+        # NPT files round the points: within the fit's own 3σ (the extended arm; the five-parameter
+        # arm would take up the mount and sample offset in the energy)
+        assert abs(energy['refined_eV'] - (recorded + 100.)) < 3 * energy['sigma_eV'] < 30 and not energy['at_bound']
+        assert dialog.fit.asset['provenance']['arm_model'] == 'stacked_extended'
+        assert f"energy {energy['refined_eV']:.1f}" in dialog.fit_summary.toPlainText()
+        target = (tmp_path / 'calibration' / 'energy.json').resolve()
+        _save_to(monkeypatch, target)
+        dialog.save_button.click()
+        _wait(dialog)
+        record = json.loads(target.read_text())
+        assert record['source_energy_eV'] == pytest.approx(recorded)
+        assert record['wavelength'] == pytest.approx(energy_eV_to_wavelength_m(energy['refined_eV']), rel=1e-12)
+        partner = json.loads((tmp_path / 'calibration' / 'energy.xu.json').read_text())['acquisition']
+        assert partner['source_energy_eV'] == pytest.approx(recorded)
+        assert partner['energy_eV'] == pytest.approx(energy['refined_eV'], rel=1e-9)
+        settings = dialog.settings()
+        assert settings['refine_energy'] is True and settings['fields']['energy_bound'] == '200'
+        dialog.refine_energy.setChecked(False)  # a changed option invalidates the fit
+        assert dialog.fit is None
+        dialog.apply_settings(settings)
+        assert dialog.refine_energy.isChecked()
+    finally:
+        dialog.close()
+        page.shutdown()

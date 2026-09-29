@@ -20,12 +20,13 @@ def five_parameter_seed(angles):
     return record
 
 
-def ring_scan(root, angles=ROW_ANGLES, scale=None):
-    """A SPEC scan of LaB6 ring images; ``scale`` maps a frame index to a count factor."""
+def ring_scan(root, angles=ROW_ANGLES, scale=None, energy_ratio=1.0):
+    """A SPEC scan of LaB6 ring images; ``scale`` maps a frame index to a count factor;
+    ``energy_ratio``: the beam's true energy over the recorded one."""
     from pyFAI.calibrant import get_calibrant
     calibrant = get_calibrant('LaB6')
     calibrant.wavelength = .7293e-10
-    q_rings = 2 * np.pi / np.asarray(calibrant.dspacing)[:25]
+    q_rings = 2 * np.pi / np.asarray(calibrant.dspacing)[:25] / energy_ratio
     rows, cols = np.indices((195, 1475), dtype=float)
     images = root / 'images'
     images.mkdir(parents=True)
@@ -98,3 +99,26 @@ def test_the_calibrations_mask_keeps_ring_points_off_its_pixels(tmp_path):
     assert len(fit.asset['provenance']['automatic_refinement']['mask_sha256']) == 64
     with pytest.raises(ValueError, match=r'the mask is \(2, 2\), the oriented image \(195, 1475\)'):
         extract_scan_ring_points(spec, seed, max_frames=12, mask=np.zeros((2, 2), bool))
+
+
+def test_the_automatic_refinement_refines_the_energy_within_its_bound(tmp_path):
+    """Maintainer, 2026-09-29: "add a refine energy toggle … just one number for +-that number". A scan
+    of a beam 40 eV above the recorded energy: Refine finds it within its uncertainty and keeps the
+    recorded energy with the calibration; refining again from that calibration is still ± the
+    recorded energy, not the refined one."""
+    import pytest
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
+    recorded = float(wavelength_m_to_energy_eV(.7293e-10))
+    spec = ring_scan(tmp_path / 'scan', energy_ratio=(recorded + 40.) / recorded)
+    fit = refine_arm_from_scan(spec, five_parameter_seed(ROW_ANGLES), max_frames=12, energy_bound_eV=200.)
+    energy = fit.asset['provenance']['energy_refinement']
+    assert abs(energy['refined_eV'] - (recorded + 40.)) < max(3 * energy['sigma_eV'], 1.), energy
+    assert fit.asset['calibration']['source_energy_eV'] == pytest.approx(recorded)
+    assert f"energy {energy['refined_eV']:.1f}" in fit.message
+    again = refine_arm_from_scan(spec, fit.asset['calibration'], max_frames=12, energy_bound_eV=200.)
+    assert again.asset['provenance']['energy_refinement']['recorded_eV'] == pytest.approx(recorded)
+    assert again.asset['calibration']['source_energy_eV'] == pytest.approx(recorded)
+    kept = refine_arm_from_scan(spec, fit.asset['calibration'], max_frames=12)  # not refined: the energy stays
+    assert 'energy_refinement' not in kept.asset['provenance']
+    assert kept.asset['calibration']['source_energy_eV'] == pytest.approx(recorded)

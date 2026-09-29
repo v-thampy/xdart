@@ -138,12 +138,13 @@ def test_control_frame_keeps_subpixel_positions():
         ControlFrame([1, 2], [3, 4], [0, 1], {'nu': 0.}, row_positions=[1.])
 
 
-def _ring_controls(params, cal, angles):
-    """Exact sub-pixel ring points from the independent ray (Newton along rows)."""
+def _ring_controls(params, cal, angles, energy_ratio=1.0):
+    """Exact sub-pixel ring points from the independent ray (Newton along rows); ``energy_ratio``:
+    the beam's true energy over the recorded one (the ray's)."""
     from pyFAI.calibrant import get_calibrant
     calibrant = get_calibrant('LaB6')
     calibrant.wavelength = WAVELENGTH
-    q_ring = 2 * np.pi / np.asarray(calibrant.dspacing)
+    q_ring = 2 * np.pi / np.asarray(calibrant.dspacing) / energy_ratio
     grid = np.arange(0., 194.75, .25)
     columns = np.arange(3.3, 1475., 17.7)
     controls = []
@@ -366,3 +367,36 @@ def test_stitch_plan_sample_position_policy(tmp_path):
     plain = Diffractometer.from_pyfai_goniometer(
         StackedDetectorArm().to_pyfai_goniometer(_calibration()), source_motors=SOURCES)
     assert _sample_positioned(on_axis, plain) is plain
+
+
+@pytest.mark.parametrize('extended', [True, False])
+def test_the_energy_is_refined_within_its_bound(extended):
+    """Maintainer, 2026-09-29: "add a refine energy toggle … just one number for +-that number". Rings
+    of a beam 100 eV above the recorded energy: with the energy refined the arm fits them exactly at
+    the true energy; a 50 eV bound holds it there, and says so; off, nothing is refined."""
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    recorded = float(wavelength_m_to_energy_eV(WAVELENGTH))
+    truth = TRUTH if extended else dict(nu_offset=.02, del_offset=-.05)
+    controls, calibrant = _ring_controls(truth, _calibration(), ANGLES, energy_ratio=(recorded + 100.) / recorded)
+    seed = PONI(dist=.392, poni1=.0353, poni2=.0447, wavelength=WAVELENGTH, detector='Pilatus300kw')
+
+    def fit(bound):
+        return refine_stacked_arm(seed, controls, nu_motor='nu', del_motor='del', calibrant=calibrant,
+                                  detector_config={'orientation': 3}, extended=extended, energy_bound_eV=bound)
+
+    refined = fit(200.)
+    assert refined.success, refined.message
+    energy = refined.energy_refinement
+    assert energy['recorded_eV'] == pytest.approx(recorded) and not energy['at_bound']
+    assert energy['refined_eV'] == pytest.approx(recorded + 100., abs=1e-3) and energy['sigma_eV'] < 1.
+    assert refined.rms_q < 1e-8 and refined.param_errors['energy_eV'] == energy['sigma_eV']
+    assert float(wavelength_m_to_energy_eV(refined.diffractometer.calibration.poni.wavelength)) == pytest.approx(
+        recorded + 100., abs=1e-3)
+    for name, value in truth.items():  # the arm is the true one
+        assert refined.params[name] == pytest.approx(value, abs=1e-7), name
+    held = fit(50.)
+    assert held.energy_refinement['at_bound'] and held.energy_refinement['refined_eV'] == pytest.approx(recorded + 50.)
+    assert held.rms_q > 1e-4  # the rest of the error stays in the fit
+    assert fit(None).energy_refinement == {} and fit(None).rms_q > 1e-4
+    with pytest.raises(ValueError, match='energy bound'):
+        fit(0.)

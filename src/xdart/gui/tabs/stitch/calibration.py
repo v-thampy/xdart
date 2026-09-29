@@ -601,6 +601,30 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                                  'five-parameter arm (the distance, the beam position and the circles\' '
                                  'zero offsets). The fit summary says which was fitted.')
         layout.addWidget(self.arm_note)
+        # The energy, refined within ± a bound of the recorded one (maintainer, 2026-09-29: "add a
+        # refine energy toggle. If selected there should be an option to set the constraint - just
+        # one number for +-that number"); Fit and Refine both take it.
+        energy_row = QtWidgets.QWidget()
+        energy_layout = QtWidgets.QHBoxLayout(energy_row)
+        energy_layout.setContentsMargins(0, 0, 0, 0)
+        self.refine_energy = QtWidgets.QCheckBox('Refine energy')
+        energy_tip = ('Also fits the beam energy, within ± the bound of the frames\' recorded energy. The arm\'s '
+                      'known angles give an absolute 2θ scale, so the calibrant rings can fix it; with frames on only '
+                      'one side of zero it trades off against the zero offsets and the sample offset, and the fit '
+                      'summary gives its uncertainty. The saved calibration keeps the recorded energy, which '
+                      'Stitch checks the scans\' energies against.')
+        self.refine_energy.setToolTip(energy_tip)
+        bound = QtWidgets.QLineEdit('200')
+        bound.setObjectName('energy_bound')
+        bound.setMaximumWidth(64)
+        bound.setToolTip('The refined energy stays within this many eV of the recorded one.')
+        self._fields['energy_bound'] = bound
+        energy_layout.addWidget(self.refine_energy)
+        energy_layout.addWidget(QtWidgets.QLabel('±'))
+        energy_layout.addWidget(bound)
+        energy_layout.addWidget(QtWidgets.QLabel('eV'))
+        energy_layout.addStretch(1)
+        layout.addWidget(energy_row)
         self.fit_button = QtWidgets.QPushButton('Fit the calibrated frames')
         self.fit_button.setToolTip('Fits one detector-arm geometry to the ring points picked on the frames '
                                    'marked Complete above. Needs three of them.')
@@ -664,9 +688,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.save_button.setEnabled(False)
         self.save_button.clicked.connect(self._save)
         layout.addWidget(self.save_button)
-        for key in ('rms', 'distance_seed', 'distance_bounds'):
+        for key in ('rms', 'distance_seed', 'distance_bounds', 'energy_bound'):
             self._fields[key].textChanged.connect(self._invalidate_fit)
         self.scales.toggled.connect(self._invalidate_fit)
+        self.refine_energy.toggled.connect(self._invalidate_fit)
+        self.refine_energy.toggled.connect(self._fields['energy_bound'].setEnabled)
+        self._fields['energy_bound'].setEnabled(False)
         self.scales.toggled.connect(self._sync_arm_model)
         self._sync_arm_model()
         self._sync_refine_rows()
@@ -1023,6 +1050,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             'fields': {key: self._text(key) for key in self._fields},
             'choices': choices,
             'fit_motor_scales': self.scales.isChecked(),
+            'refine_energy': self.refine_energy.isChecked(),
             'instrument_geometry': self.geometry_editor.value().to_record(),
         }
 
@@ -1061,6 +1089,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             combo.setCurrentIndex(index)
         if isinstance(values.get('fit_motor_scales'), bool):
             self.scales.setChecked(values['fit_motor_scales'])
+        if isinstance(values.get('refine_energy'), bool):
+            self.refine_energy.setChecked(values['refine_energy'])
         self._sync_arm_model()
 
     def _text(self, key):
@@ -1254,10 +1284,23 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             options = dict(del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1],
                 fit_scales=self.scales.isChecked(), instrument_geometry=self.geometry_editor.value().to_record(),
                 arm_model='auto', distance_seed_m=seed, distance_bounds_m=bounds, max_rms_q=float(self._text('rms')),
-                distance_provenance=self._distance_provenance if hasattr(self, '_distance_provenance') else None)
+                distance_provenance=self._distance_provenance if hasattr(self, '_distance_provenance') else None,
+                energy_bound_eV=self._energy_bound())
             self._invalidate_fit()
             self._start('fit', (frames, options))
         self._guard(go)
+
+    def _energy_bound(self):
+        """The ± eV the energy is refined within, or None when it is not refined."""
+        if not self.refine_energy.isChecked():
+            return None
+        try:
+            bound = float(self._text('energy_bound'))
+        except ValueError:
+            bound = math.nan
+        if not math.isfinite(bound) or bound <= 0:
+            raise ValueError('type the energy bound as a positive number of eV')
+        return bound
 
     def _refine(self):
         def go():
@@ -1292,7 +1335,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                            max_frames=int(self._text('refine_frames')),
                            max_counts=float(self._text('saturation')) if self._text('saturation') else None,
                            mask=self._oriented_mask() if self._text('mask') else None,
-                           max_rms_q=float(self._text('rms')))
+                           max_rms_q=float(self._text('rms')), energy_bound_eV=self._energy_bound())
             self._invalidate_fit()
             self._start('refine', (spec, seed, options))
         self._guard(go)

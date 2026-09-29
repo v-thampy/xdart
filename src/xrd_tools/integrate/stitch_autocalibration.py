@@ -18,7 +18,7 @@ broaden with angle for physical reasons.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -221,9 +221,10 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
     from xrd_tools.sources import open_source  # noqa: PLC0415
 
-    _record, diff, _digest = _seed(geometry, source_motors)
+    record, diff, _digest = _seed(geometry, source_motors)
     arm = diff.stacked_arm
     wavelength = float(diff.calibration.poni.wavelength)
+    recorded = record.get('source_energy_eV')  # an energy-refined seed: the scans recorded this one
     rows = source_frame_choices(spec, _arm_motors(arm))
     row_of = _row_of(arm.nu_motor, arm.del_motor)
     by_index = {row[0]: row for row in rows}
@@ -251,7 +252,8 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
         energy = by_index[index][2]
         if energy is not None:
             from xrd_tools.core.energy import energy_eV_to_wavelength_m  # noqa: PLC0415
-            if not math.isclose(float(energy_eV_to_wavelength_m(energy)), wavelength, rel_tol=1e-3):
+            if not math.isclose(float(energy), float(recorded), rel_tol=1e-3) if recorded is not None else \
+                    not math.isclose(float(energy_eV_to_wavelength_m(energy)), wavelength, rel_tol=1e-3):
                 raise ValueError(f'frame {index}: source energy and calibration wavelength differ')
     cal = _calibrant(calibrant, wavelength)
     ring_index = _ring_indices(cal, wavelength)
@@ -329,7 +331,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                          calibrant='LaB6', frame_indices=None, max_frames=48, points_per_degree=2.0,
                          max_counts=None, frame_screen=_CALIBRATION_SCREEN, reject_outliers=4.5,
                          min_improvement=0.2, max_rms_q=0.03, cancelled=None,
-                         progress=None, instrument_geometry=None, mask=None) -> CalibrationFit:
+                         progress=None, instrument_geometry=None, mask=None,
+                         energy_bound_eV=None) -> CalibrationFit:
     """Refine a stacked-arm calibration from its calibrant scan, automatically.
 
     Returns a MultiGeometry :class:`CalibrationFit` for :func:`save_calibration_fit`.
@@ -339,7 +342,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
     reports frames read, frames searched and validation folds.
     ``instrument_geometry`` (which motor drives which circle) is recorded as given.
     ``mask`` (True: left out, in the oriented image) is kept out of the ring search;
-    its SHA-256 is recorded.
+    its SHA-256 is recorded. ``energy_bound_eV`` also refines the energy within that many eV
+    of the scans' recorded one (as :func:`fit_calibration`).
     """
     record, diff, digest = _seed(geometry, source_motors)
     arm = diff.stacked_arm
@@ -349,13 +353,18 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
         points_per_degree=points_per_degree, max_counts=max_counts,
         frame_screen=frame_screen, cancelled=cancelled, progress=progress, mask=mask)
     poni = diff.calibration.poni
+    recorded = record.get('source_energy_eV')
+    if energy_bound_eV is not None and recorded is not None:  # ± the recorded energy, not a refined seed's
+        from xrd_tools.core.energy import energy_eV_to_wavelength_m  # noqa: PLC0415
+        poni = replace(poni, wavelength=float(energy_eV_to_wavelength_m(float(recorded))))
     config = dict(diff.calibration.detector_config)
 
     def fit(controls, extended):
         return refine_stacked_arm(poni, controls, nu_motor=arm.nu_motor, del_motor=arm.del_motor,
                                   calibrant=points.calibrant, detector_config=config,
                                   extended=extended, reject_outliers=reject_outliers,
-                                  beam_rotation=0., cancelled=cancelled)  # never the seed's: |q| cannot measure it
+                                  beam_rotation=0., cancelled=cancelled,  # never the seed's: |q| cannot measure it
+                                  energy_bound_eV=energy_bound_eV)
 
     controls = points.controls
     row_of = _row_of(arm.nu_motor, arm.del_motor)
@@ -403,6 +412,9 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
         raise ValueError(result.message or f'fit RMS {result.rms_q:.5g} exceeds {max_rms_q:g} Å⁻¹')
     asset = result.diffractometer.stacked_arm.to_pyfai_goniometer(result.diffractometer.calibration)
     asset['detector_config'] = _mg_detector_config(diff.calibration)
+    energy = dict(result.energy_refinement)
+    if energy or recorded is not None:  # the energy the scans recorded stays with the calibration
+        asset['source_energy_eV'] = energy['recorded_eV'] if energy else float(recorded)
     source = {'uri': str(Path(spec.uri).resolve()), 'kind': spec.kind.value, 'entry': spec.entry,
               'options': json.loads(json.dumps(dict(spec.options), default=str))}
     provenance = {'frames': list(points.frames), 'rms_q_A^-1': result.rms_q,
@@ -426,9 +438,15 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                       'validation': validation}}
     if instrument_geometry is not None:  # which motor drives which circle, as the guided fit records it
         provenance['instrument_geometry'] = dict(instrument_geometry)
+    if energy:
+        provenance['energy_refinement'] = energy
     provenance = json.loads(json.dumps(provenance, default=float))
     message = ('Automatic refinement: detector mount and sample offset refined'
                if chosen == 'stacked_extended' else f'Automatic refinement: five-parameter arm kept ({reason})')
+    if energy:
+        message += (f"; energy {energy['refined_eV']:.1f} ± {energy['sigma_eV']:.1f} eV (recorded "
+                    f"{energy['recorded_eV']:.1f}" + (f", held at ±{energy['bound_eV']:g} eV)"
+                                                       if energy['at_bound'] else ")"))
     return CalibrationFit('multigeometry', {'calibration': asset, 'provenance': provenance},
                           result.rms_q, result.condition_number, result.n_points, message)
 

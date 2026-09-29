@@ -33,6 +33,7 @@ to the caller — powder |q| has real blind spots):
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -126,6 +127,8 @@ class RefineResult:
     rejected_points: int = 0
     #: parameter correlation matrix {"names": [...], "matrix": [[...]]} (arm fits only)
     param_correlations: Mapping[str, Any] = field(default_factory=dict)
+    #: with the energy refined: recorded_eV, refined_eV, sigma_eV, bound_eV, at_bound
+    energy_refinement: Mapping[str, Any] = field(default_factory=dict)
 
 
 def _resolve_calibrant_q(calibrant: Any, wavelength_m: float,
@@ -222,6 +225,7 @@ def refine_goniometer(
     cancelled=None,
     model: str = 'affine',
     beam_rotation: float | None = None,
+    energy_bound_eV: float | None = None,
 ) -> RefineResult:
     """Fit affine or exact del-on-nu geometry to powder control points.
 
@@ -277,16 +281,20 @@ def refine_goniometer(
     """
     from scipy.optimize import least_squares  # noqa: PLC0415
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator  # noqa: PLC0415
-    if model == 'stacked_del_on_nu_extended':
+    if model == 'stacked_del_on_nu_extended' or energy_bound_eV is not None:
         if fit_scales:
-            raise ValueError('motor scales are not fitted together with the arm extension')
+            raise ValueError('motor scales are not fitted together with the arm extension or the energy')
+        if model not in {'stacked_del_on_nu', 'stacked_del_on_nu_extended'}:
+            raise ValueError('the energy is refined with a stacked arm')
         return refine_stacked_arm(
             base_calibration, control_frames, nu_motor=rot1_motor, del_motor=rot2_motor,
             calibrant=calibrant, wavelength=wavelength, detector=detector,
             detector_config=detector_config, base=base, preset=preset,
+            extended=model == 'stacked_del_on_nu_extended',
             distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
             max_nfev=max(max_nfev, 2000), cancelled=cancelled,
-            beam_rotation=0. if beam_rotation is None else float(beam_rotation))
+            beam_rotation=0. if beam_rotation is None else float(beam_rotation),
+            energy_bound_eV=energy_bound_eV)
     if model not in {'affine', 'stacked_del_on_nu'}:
         raise ValueError('unknown goniometer model')
     if rot1_motor is None and rot2_motor is None:
@@ -511,6 +519,7 @@ def refine_stacked_arm(
     distance_bounds_m: tuple[float, float] | None = None,
     max_nfev: int = 2000,
     cancelled=None,
+    energy_bound_eV: float | None = None,
 ) -> RefineResult:
     """Fit the del-on-nu arm at sub-pixel control-point positions.
 
@@ -534,6 +543,12 @@ def refine_stacked_arm(
     With a parallax-enabled calibration every trial pose is evaluated through
     the runtime integrator builder, because pyFAI's parallax correction reads
     the integrator's own pose rather than a trial ``param``.
+
+    ``energy_bound_eV`` also refines the energy within that many eV of the recorded one
+    (the wavelength's): known arm angles give an absolute 2θ scale, so the rings' q fix it
+    (maintainer, 2026-09-29). Each predicted q scales as E / E₀; the result's
+    ``energy_refinement`` gives the refined energy, its one-sigma error and whether the bound
+    held it.
     """
     from scipy.optimize import least_squares  # noqa: PLC0415
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator  # noqa: PLC0415
@@ -584,6 +599,18 @@ def refine_stacked_arm(
             raise ValueError("distance bounds require 0 < low < high and a seed inside them")
 
     nu_sign, del_sign = orientation_signs(det.orientation)
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV  # noqa: PLC0415
+    fit_energy = energy_bound_eV is not None
+    recorded_eV = float(wavelength_m_to_energy_eV(wl_m))
+    if fit_energy:
+        bound_eV = float(energy_bound_eV)
+        if not math.isfinite(bound_eV) or not 0 < bound_eV < .05 * recorded_eV:
+            raise ValueError("the energy bound must be positive eV, under 5 % of the energy")
+        span = bound_eV / recorded_eV
+
+    def energy_split(p):
+        """(the arm's parameters, the energy scale E / E₀)."""
+        return (p[:-1], float(p[-1])) if fit_energy else (p, 1.0)
 
     def arm_for(p):
         extension = dict(zip(_EXTENSION_NAMES, p[5:])) if len(p) > 5 else {}
@@ -593,6 +620,7 @@ def refine_stacked_arm(
                                   beam_rotation=beam_rotation, **extension)
 
     def predicted(p, keep):
+        p, scale = energy_split(p)
         arm = arm_for(p)
         rot1, rot2, rot3 = arm.angles(del_deg, nu_deg)
         d_dist, d_poni1, d_poni2 = arm.displacements(del_deg, nu_deg)
@@ -604,7 +632,7 @@ def refine_stacked_arm(
                 q = geometry.qFunction(f.row_positions[keep[i]], f.col_positions[keep[i]], param=param)
             else:
                 q = runtime(param).qFunction(f.row_positions[keep[i]], f.col_positions[keep[i]])
-            out.append(np.asarray(q, dtype=float) / 10.0 - targets[i][keep[i]])
+            out.append(scale * np.asarray(q, dtype=float) / 10.0 - targets[i][keep[i]])
         return np.concatenate(out)
 
     def solve(p0, keep):
@@ -612,18 +640,23 @@ def refine_stacked_arm(
             if cancelled is not None and cancelled.is_set():
                 raise InterruptedError("goniometer refinement cancelled")
             return predicted(p, keep)
-        if distance_bounds_m is None:
+        if distance_bounds_m is None and not fit_energy:
             return least_squares(residual, p0, method="lm", x_scale="jac", max_nfev=max_nfev)
         lower, upper = np.full(len(p0), -np.inf), np.full(len(p0), np.inf)
-        lower[0], upper[0] = lo, hi
+        if distance_bounds_m is not None:
+            lower[0], upper[0] = lo, hi
+        if fit_energy:
+            lower[-1], upper[-1] = 1.0 - span, 1.0 + span
         return least_squares(residual, p0, method="trf", bounds=(lower, upper),
                              x_scale="jac", max_nfev=max_nfev)
 
     keep = [np.ones(len(f.rows), dtype=bool) for f in frames]
-    p0 = np.array([distance, base_poni.poni1, base_poni.poni2, 0.0, 0.0])
+    energy = [1.0] if fit_energy else []
+    p0 = np.array([distance, base_poni.poni1, base_poni.poni2, 0.0, 0.0, *energy])
     res = solve(p0, keep)
     if extended:
-        res = solve(np.r_[res.x, np.zeros(len(_EXTENSION_NAMES))], keep)
+        core, scale = energy_split(res.x)
+        res = solve(np.r_[core, np.zeros(len(_EXTENSION_NAMES)), [scale] if fit_energy else []], keep)
     rejected = 0
     if reject_outliers is not None:
         for _ in range(2):
@@ -649,10 +682,16 @@ def refine_stacked_arm(
     except Exception:  # noqa: BLE001
         condition, errors = float("inf"), np.full(len(p), np.inf)
         correlation = np.full((len(p), len(p)), np.nan)
-    names = _ARM_NAMES + (_EXTENSION_NAMES if extended else ())
+    names = _ARM_NAMES + (_EXTENSION_NAMES if extended else ()) + (("energy_eV",) if fit_energy else ())
+    if fit_energy:  # the scale's error, in eV
+        errors = np.r_[errors[:-1], errors[-1] * recorded_eV]
     param_errors = dict(zip(names, (float(e) for e in errors)))
     param_correlations = {"names": list(names),
                           "matrix": [[float(v) for v in row] for row in correlation]}
+    p, scale = energy_split(p)
+    energy_refinement = {} if not fit_energy else {
+        "recorded_eV": recorded_eV, "refined_eV": recorded_eV * scale, "sigma_eV": float(errors[-1]),
+        "bound_eV": bound_eV, "at_bound": bool(abs(scale - 1.0) >= span * (1 - 1e-6))}
 
     problems: list[str] = []
     if not res.success:
@@ -680,7 +719,7 @@ def refine_stacked_arm(
     arm = arm_for(p)
     calibration = DetectorCalibration(
         replace(base_poni, dist=float(p[0]), poni1=float(p[1]), poni2=float(p[2]),
-                rot1=0., rot2=0., rot3=0., wavelength=wl_m, detector=det_name),
+                rot1=0., rot2=0., rot3=0., wavelength=wl_m / scale, detector=det_name),
         detector_config=dict(detector_config or {}), parallax=base_parallax,
     )
     gonio = arm.to_pyfai_goniometer(calibration)
@@ -693,7 +732,7 @@ def refine_stacked_arm(
         params=dict(zip(gonio["param_names"], gonio["param"])), success=ok,
         condition_number=condition, frozen_scales=(), message=message,
         param_errors=param_errors, rejected_points=rejected,
-        param_correlations=param_correlations,
+        param_correlations=param_correlations, energy_refinement=energy_refinement,
     )
 
 

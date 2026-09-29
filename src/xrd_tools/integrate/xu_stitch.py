@@ -1221,7 +1221,8 @@ def run_xu_hist_stitch_1d(
                     "XU_SOURCE_ENERGY_CONFLICT",
                     "source energy is unavailable",
                 ) from error
-            expected_energy = float(acquisition["energy_eV"])
+            # a refined calibration's scans are checked against the energy they recorded
+            expected_energy = float(acquisition.get("source_energy_eV", acquisition["energy_eV"]))
             if (
                 not math.isfinite(energy)
                 or energy <= 0

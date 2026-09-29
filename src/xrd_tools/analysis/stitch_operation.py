@@ -1704,7 +1704,8 @@ def _xu_observations(
     extrapolation_count = 0
     validated = validation["validated_scan_domain_source_deg"]
     control = validation["control_domain_source_deg"]
-    expected_energy = float(acquisition["energy_eV"])
+    # a refined calibration's scans are checked against the energy they recorded
+    expected_energy = float(acquisition.get("source_energy_eV", acquisition["energy_eV"]))
     for contribution in manifest.contributions:
         values = {
             (name, occurrence): value

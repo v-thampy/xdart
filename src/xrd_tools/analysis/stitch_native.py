@@ -319,20 +319,35 @@ def native_provenance(value, source, output, plan, manifest):
     if plan.gi is not None:  # how the GI cuts were made, as the record's reader sees it
         value["plan"]["gi"] = plan.gi.to_provenance()
     value["wavelength_A"] = wavelength
-    value["source_energy_checks"] = source_energy_checks(source, wavelength)
+    value["source_energy_checks"] = source_energy_checks(source, wavelength, recorded_energy_eV(plan))
     value["frame_members"] = analysis_contributing_frame_binding(analysis_contributing_frame_members(
         frame_seeds(source, manifest, plan), source_base=manifest.project_root))
     value["output"]["artifact_family"] = output.artifact_family
     return value
 
 
-def source_energy_checks(source, wavelength_A):
+def recorded_energy_eV(plan):
+    """The energy the scans recorded when the calibration's energy was refined (``source_energy_eV``,
+    saved with it), else None: the scans are checked against it rather than the refined one."""
+    from xrd_tools.analysis.stitch_operation import XuStitchOperationPlan
+    if type(plan) is XuStitchOperationPlan:
+        value = plan.calibration.projection.value["acquisition"].get("source_energy_eV")
+    else:
+        try:  # a goniometer calibration's record; a PONI calibration has none
+            record = json.loads(plan.geometry.content)
+        except (TypeError, ValueError):
+            record = None
+        value = record.get("source_energy_eV") if isinstance(record, dict) else None
+    return None if value is None else float(value)
+
+
+def source_energy_checks(source, wavelength_A, recorded_eV=None):
     from xrd_tools.analysis.module_transaction import MetadataColumnSelector
     from xrd_tools.analysis.stitch_operation import _fresh_table, _source_members, _manifest_numeric_lookup
     from xrd_tools.core.energy import wavelength_m_to_energy_eV
     from xrd_tools.core.scan import SourceKind
     from xrd_tools.sources.descriptor import describe_container
-    expected = wavelength_m_to_energy_eV(wavelength_A * 1e-10)
+    expected = wavelength_m_to_energy_eV(wavelength_A * 1e-10) if recorded_eV is None else float(recorded_eV)
     checks = []
     for member in _source_members(source):
         table = _fresh_table(member)

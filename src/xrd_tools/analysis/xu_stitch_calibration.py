@@ -404,8 +404,14 @@ def _validate_extended_surface(value):
     detector, acquisition, correction, validation = (value[k] for k in ('detector', 'acquisition', 'corrections', 'validation'))
     require(type(detector) is dict and set(detector) == set(reference['detector']) | _EXTENDED_DETECTOR_KEYS,
             'extended detector keys differ')
-    require(type(acquisition) is dict and set(acquisition) == set(reference['acquisition']) | {'sampledis_mm'},
+    require(type(acquisition) is dict
+            and set(acquisition) - {'source_energy_eV'} == set(reference['acquisition']) | {'sampledis_mm'},
             'extended acquisition keys differ')
+    # a refined energy keeps the recorded one, which the scans' energies are checked against
+    require('source_energy_eV' not in acquisition or (
+        number(acquisition['source_energy_eV']) and number(acquisition['energy_eV'])
+        and abs(acquisition['source_energy_eV'] - acquisition['energy_eV']) < .05 * acquisition['energy_eV']),
+        'the recorded energy must be within 5 % of the refined one')
     require(type(correction) is dict and set(correction) == set(reference['corrections']) | {'solid_angle_arm'},
             'extended correction keys differ')
     for key in ('mask_policy', 'sensor_policy', 'sensor_material', 'sensor_thickness_m', 'parallax', 'pyfai_validated_version'):
@@ -493,7 +499,7 @@ def _validate_extended_surface(value):
 
 def extended_surface_calibration(*, detector, xu_parameters, arm, energy_eV, xu_wavelength_A,
                                  source_motors, rotation, control_domain, domain, fit_frames,
-                                 validation_frames, validation_pixels, max_dq):
+                                 validation_frames, validation_pixels, max_dq, source_energy_eV=None):
     """Build and strictly admit a transferred SURFACE v3 asset (imports are lazy).
 
     ``xu_parameters`` holds cch1/cch2 (px), distance_m, del/nu offsets (deg),
@@ -522,6 +528,8 @@ def extended_surface_calibration(*, detector, xu_parameters, arm, energy_eV, xu_
         image_rotation_quarter_turns=rotation // 90, source_motors=source_motors,
         detector_offsets_deg={'del': p['del_offset_deg'], 'nu': p['nu_offset_deg']},
         sampledis_mm=[float(v) for v in p['sampledis_mm']])
+    if source_energy_eV is not None:  # a refined energy: the recorded one the scans are checked against
+        value['acquisition']['source_energy_eV'] = float(source_energy_eV)
     arm = json.loads(json.dumps(arm))
     arm['detector_config'] = config
     value['corrections'].update(solid_angle_policy=EXTENDED_SOLID_ANGLE_POLICY,
