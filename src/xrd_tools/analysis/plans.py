@@ -757,14 +757,13 @@ def run_stitch(
                 incidences = (np.full(len(labels), plan.gi_cut.incident_angle_deg)
                               if plan.gi_cut.incidence_motor is None
                               else _metadata_series(src, labels, plan.gi_cut.incidence_motor))
-            payload, auxiliary, *rest = stitch_1d_streaming(
+            payload, auxiliary, gi_cut = stitch_1d_streaming(
                 _iter_images(), len(labels), integrator_series.__iter__,
                 npt=plan.npt_1d, unit=plan.unit, method=plan.method,
                 radial_range=plan.radial_range,
                 mask=plan.mask, normalization=normalization,
                 frame_screen=frame_screen, gi=plan.gi_cut, incidences=incidences, **corrections,
             )
-            gi_cut = rest[0] if rest else None
         else:
             assert integrators is not None
             images = _load_images_eager()
@@ -801,7 +800,7 @@ def run_stitch(
                 rot2_angles=rot2,
             )
             if plan.mode == "1d":
-                payload, auxiliary = stitch_1d_streaming(
+                payload, auxiliary, _gi = stitch_1d_streaming(
                     _iter_images(),
                     len(labels),
                     integrator_series.__iter__,

@@ -63,7 +63,7 @@ def test_a_gi_cut_needs_a_native_stitch_1d_in_q(tmp_path):
 
 
 def test_stitch_picks_its_incidence_motor_as_int_does_with_eta_first():
-    """Maintainer, 2026-09-30: "Defaulting to eta if it is there, gonth, halpha and so on"."""
+    """Maintainer, 2026-09-29: "Defaulting to eta if it is there, gonth, halpha and so on"."""
     from xrd_tools.session.gi_motor import STITCH_GI_MOTOR_PREFERENCE, pick_default_gi_motor
     assert pick_default_gi_motor(["halpha", "gonth", "Eta", "del"], STITCH_GI_MOTOR_PREFERENCE) == "Eta"
     assert pick_default_gi_motor(["halpha", "gonth", "del"], STITCH_GI_MOTOR_PREFERENCE) == "gonth"

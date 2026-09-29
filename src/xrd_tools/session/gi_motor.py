@@ -17,7 +17,7 @@ import re
 GI_MOTOR_PREFERENCE = (
     "th", "eta", "halpha", "gonth", "theta", "alpha_i", "mu", "incidence",
 )
-#: Stitch's order (maintainer, 2026-09-30): the arm's diffractometer tilts the sample with
+#: Stitch's order (maintainer, 2026-09-29): the arm's diffractometer tilts the sample with
 #: eta, special setups with gonth or halpha; then Int's other names.
 STITCH_GI_MOTOR_PREFERENCE = (
     "eta", "gonth", "halpha", "th", "theta", "alpha_i", "mu", "incidence",

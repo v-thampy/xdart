@@ -1,6 +1,6 @@
 """Grazing incidence for a native Stitch 1D: the plan's GI value and the GI coordinates.
 
-A GI Stitch 1D writes I(q) and, beside it, a GI cut (maintainer, 2026-09-30): I(q_ip) inside a q_oop
+A GI Stitch 1D writes I(q) and, beside it, a GI cut (maintainer, 2026-09-29): I(q_ip) inside a q_oop
 window, or I(q_oop) inside a q_ip window, q_ip and q_oop taken relative to the sample surface.
 
 The two backends give the same coordinates (probe G1, ≤ 2e-9 Å⁻¹ per pixel, arms off nu = 0 too).
@@ -13,7 +13,7 @@ pyFAI's fiber model reproduces this with incident angle α (the incidence motor,
 tilt 0 and sample orientation 4 for psic mounted at chi 90 with eta the incidence (17-2), or 7 at
 chi 0 with mu the incidence. xrayutilities takes n̂ from its own sample transform of the SURFACE
 asset's surface normal, with every sample circle's angle: mu, chi and phi from their motors, and
-eta from the incidence (maintainer, 2026-09-30).
+eta from the incidence (maintainer, 2026-09-29).
 """
 from __future__ import annotations
 

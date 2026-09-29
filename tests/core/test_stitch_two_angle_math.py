@@ -126,7 +126,7 @@ def test_pyfai_exact_stacked_pose_q_and_streamed_constant_radiance():
         np.testing.assert_allclose(ai.qArray() / 10, expected, atol=5e-8, rtol=0)
         images.append(7.5 * monitor * solid_angle)
         ai.reset(collect_garbage=False)
-    result, diagnostics = stitch_1d_streaming(
+    result, diagnostics, _ = stitch_1d_streaming(
         images, len(images), lambda: (_exact_pose_ai(*a) for a in angles),
         npt=80, radial_range=(0., 9.), normalization=monitors, method='full',
     )
@@ -143,7 +143,7 @@ def test_overlap_uses_the_declared_backend_monitor_weighting(tmp_path, backend):
     monitors, signals = (1., 3.), (10., 90.)
     if backend == 'multigeometry':
         images = [np.full((9, 13), signal) for signal in signals]
-        result, diagnostics = stitch_1d_streaming(
+        result, diagnostics, _ = stitch_1d_streaming(
             images, 2, lambda: (_exact_pose_ai(*a) for a in angles),
             npt=2, radial_range=(0., 18.), normalization=monitors,
             correct_solid_angle=False, method='full',

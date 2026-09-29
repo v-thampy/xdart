@@ -483,11 +483,13 @@ def stitch_1d_streaming(
     flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
     gi=None,
     incidences: Sequence[float] | None = None,
-) -> tuple[IntegrationResult1D, StitchDiagnostics]:
+) -> tuple[IntegrationResult1D, StitchDiagnostics,
+           tuple[IntegrationResult1D, StitchDiagnostics] | None]:
     """Sequential MultiGeometry merge that retains only one detector frame.
 
-    With ``gi`` (a ``StitchGI``) and one incidence per frame, a third value is the GI cut
-    (``gi_cut_result``), binned from the same frames by pyFAI's fiber model.
+    Returns (I(q), diagnostics, the GI cut): with ``gi`` (a ``StitchGI``) and one incidence per
+    frame, the cut (``gi_cut_result``) is binned from the same frames by pyFAI's fiber model;
+    otherwise it is None.
     """
 
     result, gi_totals = _streaming_multigeometry(
@@ -522,9 +524,7 @@ def stitch_1d_streaming(
         unit=radial_unit,
     )
     diagnostics = StitchDiagnostics(result.count, result.sum_normalization)
-    if gi is not None:
-        return payload, diagnostics, gi_cut_result(gi_totals, gi.unit)
-    return payload, diagnostics
+    return payload, diagnostics, None if gi is None else gi_cut_result(gi_totals, gi.unit)
 
 
 def stitch_2d_streaming(

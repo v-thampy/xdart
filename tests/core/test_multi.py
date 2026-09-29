@@ -253,7 +253,7 @@ def test_one_ai_streaming_matches_multigeometry_raw_accumulators(
             normalization_factor=monitor,
             lst_mask=masks,
         )
-        streamed, diagnostics = stitch_1d_streaming(
+        streamed, diagnostics, _ = stitch_1d_streaming(
             images,
             len(images),
             lambda: iter(_make_small_integrators(poni_fixture, angles)),
@@ -553,7 +553,7 @@ def test_one_ai_streaming_uses_bounded_range_scout_and_cache_residency(
     monkeypatch.setattr(MultiGeometry, "integrate1d", observe_caches)
     monkeypatch.setattr(MultiGeometry, "_guess_radial_range", forbidden_guess)
     monkeypatch.setattr(MultiGeometry, "_guess_azimuth_range", forbidden_guess)
-    result, diagnostics = stitch_1d_streaming(
+    result, diagnostics, _ = stitch_1d_streaming(
         image_stream(),
         3,
         factory,
@@ -772,7 +772,7 @@ def test_the_streaming_gi_cut_equals_pyfais_multigeometryfiber_and_leaves_iq_alo
     common = dict(npt=200, radial_range=(.5, 6.), correct_solid_angle=True, polarization_factor=.99)
     payload, diagnostics, (cut, cut_diagnostics) = stitch_1d_streaming(
         images, 3, series.__iter__, gi=gi, incidences=[.4] * 3, **common)
-    plain, _ = stitch_1d_streaming(images, 3, series.__iter__, **common)
+    plain, _, _ = stitch_1d_streaming(images, 3, series.__iter__, **common)
     np.testing.assert_array_equal(payload.intensity, plain.intensity)
     fibers = [_fiber_from_integrator(ai, incident_angle=.4, sample_orientation=4) for ai in series]
     reference = MultiGeometryFiber(fibers, unit=('qip_A^-1', 'qoop_A^-1'), ip_range=(-2.5, 2.5), oop_range=(0., 6.),

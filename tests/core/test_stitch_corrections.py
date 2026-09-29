@@ -38,7 +38,7 @@ def test_one_frame_matches_pyfai_with_dark_flat_polarization_and_poisson():
     monitor, npt, radial = 3., 24, (0., 2.)
     kwargs = dict(npt=npt, radial_range=radial, method='full', normalization=[monitor],
                   polarization_factor=.95, error_model='poisson')
-    payload, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), dark=dark, flat=flat, **kwargs)
+    payload, _, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), dark=dark, flat=flat, **kwargs)
 
     fixed_radial, fixed_azimuth = _resolve_streaming_ranges(
         lambda: iter([_ai()]), 1, unit='q_A^-1', radial_range=radial, azimuth_range=None)
@@ -62,7 +62,7 @@ def test_one_frame_matches_pyfai_with_dark_flat_polarization_and_poisson():
     assert np.all(payload.sigma[finite] > noiseless.sigma[finite])
 
     # Subtracting the dark before pyFAI would also lose the raw frame's full counts.
-    subtracted, _ = stitch_1d_streaming([raw - np.nan_to_num(dark)], 1, lambda: iter([_ai()]),
+    subtracted, _, _ = stitch_1d_streaming([raw - np.nan_to_num(dark)], 1, lambda: iter([_ai()]),
                                         flat=flat, **kwargs)
     finite = np.isfinite(payload.sigma) & (payload.sigma > 0)
     assert np.all(subtracted.sigma[finite] < payload.sigma[finite])
@@ -221,7 +221,7 @@ def test_one_frame_stitch_matches_int_up_to_multigeometry_solid_angle_scale():
     monitor, npt = 2., 24
     radial, fixed_azimuth = _resolve_streaming_ranges(
         lambda: iter([_ai()]), 1, unit='q_A^-1', radial_range=None, azimuth_range=None)
-    stitched, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), npt=npt, radial_range=radial,
+    stitched, _, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), npt=npt, radial_range=radial,
                                       method='full', normalization=[monitor], polarization_factor=.95,
                                       error_model='poisson')
     ai = _ai()
@@ -299,12 +299,12 @@ def test_the_flat_cutoff_reaches_the_streaming_merge():
     flat = np.full(SHAPE, 2.0)
     flat[:, :3] = 0.6  # 30 % of the median: kept at the default 10 %, masked at 50 %
     kwargs = dict(npt=24, radial_range=(0., 2.), method='full')
-    cut, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), flat=flat, flat_min_fraction=.5, **kwargs)
+    cut, _, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), flat=flat, flat_min_fraction=.5, **kwargs)
     premasked = flat.copy()
     premasked[:, :3] = np.nan
-    expected, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), flat=premasked, **kwargs)
+    expected, _, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), flat=premasked, **kwargs)
     np.testing.assert_array_equal(cut.intensity, expected.intensity)
-    kept, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), flat=flat, **kwargs)
+    kept, _, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), flat=flat, **kwargs)
     assert not np.array_equal(kept.intensity, cut.intensity, equal_nan=True)
 
 
