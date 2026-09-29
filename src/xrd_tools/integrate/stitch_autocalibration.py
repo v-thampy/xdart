@@ -26,6 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
+from xrd_tools.core.energy import calibration_recorded_energy_eV
 from xrd_tools.core.geometry import Diffractometer, ImageOrientation
 from xrd_tools.integrate.frame_screen import FrameScreenPolicy, screen_totals
 from xrd_tools.integrate.refine import ControlFrame, refine_stacked_arm
@@ -224,7 +225,7 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
     record, diff, _digest = _seed(geometry, source_motors)
     arm = diff.stacked_arm
     wavelength = float(diff.calibration.poni.wavelength)
-    recorded = record.get('source_energy_eV')  # an energy-refined seed: the scans recorded this one
+    recorded = calibration_recorded_energy_eV(record)  # an energy-refined seed: the scans recorded this one
     rows = source_frame_choices(spec, _arm_motors(arm))
     row_of = _row_of(arm.nu_motor, arm.del_motor)
     by_index = {row[0]: row for row in rows}
@@ -353,7 +354,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
         points_per_degree=points_per_degree, max_counts=max_counts,
         frame_screen=frame_screen, cancelled=cancelled, progress=progress, mask=mask)
     poni = diff.calibration.poni
-    recorded = record.get('source_energy_eV')
+    recorded = calibration_recorded_energy_eV(record)
     if energy_bound_eV is not None and recorded is not None:  # ± the recorded energy, not a refined seed's
         from xrd_tools.core.energy import energy_eV_to_wavelength_m  # noqa: PLC0415
         poni = replace(poni, wavelength=float(energy_eV_to_wavelength_m(float(recorded))))

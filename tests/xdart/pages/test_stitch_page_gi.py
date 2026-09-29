@@ -222,3 +222,46 @@ def test_the_gi_axes_keep_the_typed_q_range_and_only_2theta_resets_it(qapp, tmp_
         assert page.build_form().q_range == (0., 90.)
     finally:
         _close(page, qapp)
+
+
+def _mu_per_point(spec, values=(.5, 1.5)):
+    """Move mu from the scans' #O/#P headers to a per-point #L column with ``values``."""
+    lines, rows = [], None
+    for line in spec.read_text().splitlines():
+        if line.startswith("#O0"):
+            line = line.replace("  mu", "")
+        elif line.startswith("#P0"):  # the header order is del nu eta mu chi phi: drop mu's 0
+            parts = line.split()
+            line = " ".join(parts[:4] + parts[5:])
+        elif line.startswith("#N "):
+            line = f"#N {int(line.split()[1]) + 1}"
+        elif line.startswith("#L"):
+            line, rows = line + "  mu", 0
+        elif rows is not None and line.strip() and not line.startswith("#"):
+            line, rows = f"{line} {values[rows]}", rows + 1
+        else:
+            rows = None
+        lines.append(line)
+    spec.write_text("\n".join(lines) + "\n")
+
+
+@pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
+def test_a_sample_circle_recorded_per_point_is_bound_not_read_as_zero(qapp, tmp_path, backend):
+    """Codex re-review R2-F2: a circle a scan records only per point (an #L column, not #O/#P) is
+    recorded: it is bound, each frame's own value reaches the plan, and nothing says it reads 0."""
+    from xdart.gui.tools.stitch_values import prepare_stitch_tool
+    page = _page(tmp_path, backend)
+    try:
+        spec = Path(page._source_paths[0])
+        _mu_per_point(spec)
+        page.set_sources((str(spec),))
+        _click(page, "Grazing")
+        page.set_field("unit", "Qip (Å⁻¹)")
+        gi = page.build_form().gi
+        assert dict(gi.sample_motors)["mu"] == "mu" and "read as 0" not in _status(page)
+        prepared = prepare_stitch_tool(page.build_form())
+        bound = [{name: value for name, _occurrence, value in item.values}
+                 for request in prepared.requests for item in request.manifest.contributions]
+        assert [item["mu"] for item in bound] == [.5, 1.5]
+    finally:
+        _close(page, qapp)

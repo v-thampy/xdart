@@ -104,7 +104,7 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
     from xrd_tools.analysis.xu_stitch_calibration import (
         EXTENDED_TRANSFER_GATE_A, extended_surface_calibration,
     )
-    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    from xrd_tools.core.energy import calibration_recorded_energy_eV, wavelength_m_to_energy_eV
     from xrd_tools.core.geometry import Diffractometer
     from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
     from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry
@@ -258,7 +258,7 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
                            'tilt_deg': params[6], 'tiltazimuth_deg': params[7],
                            'sampledis_mm': list(params[8:11])},
             arm=compact, energy_eV=energy, xu_wavelength_A=xu_wavelength,
-            source_energy_eV=record.get('source_energy_eV'),
+            source_energy_eV=calibration_recorded_energy_eV(record),
             source_motors={'del': del_motor, 'nu': nu_motor}, rotation=int(image_rotation),
             control_domain=domain(fit if fitted else validation), domain=domain(validation),
             fit_frames=len(fit) if fitted else 0, validation_frames=len(validation),

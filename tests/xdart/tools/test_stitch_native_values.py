@@ -452,6 +452,13 @@ def test_an_energy_refined_calibration_checks_the_scans_against_their_recorded_e
     for backend_form in (form, mg):
         with pytest.raises(StitchToolPreflightRefused, match="ENERGY"):
             prepare_stitch_tool(replace(backend_form, geometry_path=Path(unrecorded.pyfai_path)))
+    # Codex re-review R2-F1: a recorded energy no comparison can fail (NaN, infinity, a string) or one
+    # far from the calibration's own is refused at Preview, never taken as the reference
+    for index, bad in enumerate(("nan", "inf", "17000", 16000.)):
+        saved = pair(f"bad{index}", source_energy_eV=bad)
+        assert saved.xu_refusal  # its xrayutilities partner is refused too
+        with pytest.raises(StitchToolPreflightRefused, match="STITCH_CALIBRATION_ENERGY_INVALID"):
+            prepare_stitch_tool(replace(mg, geometry_path=Path(saved.pyfai_path)))
 
 
 def test_an_xu_stitch_reads_the_partner_saved_beside_a_pyfai_calibration(tmp_path):

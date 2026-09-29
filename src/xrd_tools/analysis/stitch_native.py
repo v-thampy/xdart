@@ -333,11 +333,15 @@ def recorded_energy_eV(plan):
     if type(plan) is XuStitchOperationPlan:
         value = plan.calibration.projection.value["acquisition"].get("source_energy_eV")
     else:
+        from xrd_tools.core.energy import calibration_recorded_energy_eV
         try:  # a goniometer calibration's record; a PONI calibration has none
             record = json.loads(plan.geometry.content)
         except (TypeError, ValueError):
-            record = None
-        value = record.get("source_energy_eV") if isinstance(record, dict) else None
+            return None
+        try:
+            return calibration_recorded_energy_eV(record)
+        except ValueError as error:  # never a reference no comparison can fail (Codex re-review R2-F1)
+            _refuse("STITCH_CALIBRATION_ENERGY_INVALID", str(error))
     return None if value is None else float(value)
 
 

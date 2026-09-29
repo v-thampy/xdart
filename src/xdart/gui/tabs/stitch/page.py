@@ -140,6 +140,19 @@ def _spec_motor_names(path, _state, scan):
 
 
 @functools.lru_cache(maxsize=16)
+def _spec_recorded_names(path, _state, scan):
+    """Every name a SPEC scan records a value for, as the preflight's metadata table has them: its
+    ``#O``/``#P`` motors and its per-point ``#L`` columns (Codex re-review R2-F2: a motor recorded
+    only per point is recorded). None when the scan cannot be read."""
+    from xrd_tools.io.spec import read_spec_scan_table
+    try:
+        columns, motors, _npts = read_spec_scan_table(path, scan)
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+    return tuple(dict.fromkeys((*motors, *columns)))
+
+
+@functools.lru_cache(maxsize=16)
 def _spec_image_scan_name(path, _states, scan, image_dir, image_stem):
     """Int's name for one SPEC scan's images (the automatic result name), or None when no image
     matches or the folder cannot be read. ``_states``: the SPEC file's and the folder's."""
@@ -652,8 +665,8 @@ class StitchPage(QtWidgets.QWidget):
         return _spec_motor_names(path, _file_states(path), scan)
 
     def _gi_scan_catalogs(self):
-        """The real motors of every selected SPEC scan (one tuple each), or None when the
-        selection cannot say (another source kind, or a scan that cannot be read)."""
+        """What every selected SPEC scan records (one tuple each: its motors and per-point columns),
+        or None when the selection cannot say (another source kind, or a scan that cannot be read)."""
         if self._value("source_kind") != "Spec" or not self._source_paths:
             return None
         from xrd_tools.sources.grouping import parse_stitch_scan_groups
@@ -669,7 +682,7 @@ class StitchPage(QtWidgets.QWidget):
             except ValueError:
                 return None
             for token in tokens:
-                names = _spec_motor_names(path, _file_states(path), token if token in keys else f"{token}.1")
+                names = _spec_recorded_names(path, _file_states(path), token if token in keys else f"{token}.1")
                 if names is None:
                     return None
                 catalogs.append(names)
@@ -826,7 +839,9 @@ class StitchPage(QtWidgets.QWidget):
             ip_range=ip, oop_range=oop)
 
     def _load_gi(self, gi):
-        """A form's (or settings') grazing incidence onto the page."""
+        """A form's (or settings') grazing incidence onto the page. A GI form writes both cuts; the cut a
+        result opens on is the page's view (the GI axis last chosen, which settings keep), not the
+        form's."""
         self._gi["enabled"] = gi is not None
         if gi is not None:
             self._gi.update(motor=gi.incidence_motor or "Manual", tilt_motor=gi.tilt_motor or "Manual",
@@ -1033,8 +1048,13 @@ class StitchPage(QtWidgets.QWidget):
             if kind == "Spec" and self._value("scan_mode") != "Stitch All":
                 groups = [[(path, scan) for scan in group]
                           for path in sources for group in parse_stitch_scan_groups(scans)]
-                members = [[_spec_image_scan_name(path, _file_states(path, image_dir or Path(path).parent), scan,
-                                                  image_dir, stem) for path, scan in group] for group in groups[:3]]
+                def key(path, token):  # SPEC's N.M key, as Preview resolves it (so {occurrence} matches)
+                    keys = _spec_scan_keys(path, _file_states(path)) or ()
+                    return token if token in keys else f"{token}.1"
+
+                members = [[_spec_image_scan_name(path, _file_states(path, image_dir or Path(path).parent),
+                                                  key(path, scan), image_dir, stem) for path, scan in group]
+                           for group in groups[:3]]
             else:
                 groups = [list(sources)] if kind == "NeXus" and sources else []
                 members = [[int_scan_name(path) for path in group] for group in groups]
@@ -1406,7 +1426,9 @@ class StitchPage(QtWidgets.QWidget):
         )
 
     def load_form(self, form):
-        """Restore a prepared form, including native source and conditioning intent."""
+        """Restore a prepared form, including native source and conditioning intent. A GI form's
+        results open on the GI axis this page last chose (view state, restored with the settings;
+        Codex re-review R2-F3)."""
         if form.source_selection is None:
             raise ValueError("the Stitch page takes a native source selection")
         fields = {key: getattr(form, key) for key in (

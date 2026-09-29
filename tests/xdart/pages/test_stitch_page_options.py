@@ -601,3 +601,21 @@ def test_backend_is_a_processing_choice_and_a_missing_partner_is_named(qapp, tmp
         assert "partner" not in page._readiness[0]
     finally:
         _close(page, qapp)
+
+
+def test_the_result_name_hint_resolves_the_scan_key_as_preview_does(qapp, tmp_path):
+    """Codex re-review (P3): a stem with {occurrence} is filled with SPEC's N.M key, as Preview does, so
+    the hint names the images Preview will stitch."""
+    spec = tmp_path / "data" / "sample"
+    spec.parent.mkdir()
+    spec.write_text("#F sample\n")
+    (spec.parent / "sample_occ1.1_0000.raw").write_bytes(b"")
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.set_field("project_root", str(tmp_path))
+        page.set_sources([str(spec)])
+        page.set_field("scan", "1")
+        page.set_field("image_stem", "sample_occ{occurrence}_")
+        assert page._rows["output_family"].editor.placeholderText() == "auto · sample_occ1.1"
+    finally:
+        _close(page, qapp)
