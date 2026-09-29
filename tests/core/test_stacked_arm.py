@@ -48,7 +48,7 @@ def _independent_stacked_controls():
     ray = np.stack(((rows + .5) * .000172 - cal.poni.poni1,
                     (cols + .5) * .000172 - cal.poni.poni2,
                     np.full(rows.shape, cal.poni.dist)))
-    ring_q = 2 * np.pi / np.asarray(get_calibrant('LaB6').get_dSpacing())
+    ring_q = 2 * np.pi / np.asarray(get_calibrant('LaB6').dspacing)
     rng = np.random.default_rng(12)
     controls = []
     for delta, nu in ((6., -10.), (15., 3.), (25., 6.), (40., 9.), (20., 16.)):
@@ -237,7 +237,7 @@ def test_real_guided_stacked_fit_save_reload_and_holdout(tmp_path):
         control, calibrant, _ = load_control_frame(frame)
         ai, = create_multigeometry_integrators_from_geometry(heldout,
             {key: np.array([value]) for key, value in frame.motors.items()})
-        expected = 2 * np.pi / np.asarray(calibrant.get_dSpacing())[control.rings]
+        expected = 2 * np.pi / np.asarray(calibrant.dspacing)[control.rings]
         residuals.extend(ai.qArray()[control.rows, control.cols] / 10 - expected)
     heldout_rms = float(np.sqrt(np.mean(np.square(residuals))))
     assert heldout_rms < .018, heldout_rms

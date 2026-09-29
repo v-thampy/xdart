@@ -25,7 +25,7 @@ def ring_scan(root, angles=ROW_ANGLES, scale=None):
     from pyFAI.calibrant import get_calibrant
     calibrant = get_calibrant('LaB6')
     calibrant.wavelength = .7293e-10
-    q_rings = 2 * np.pi / np.asarray(calibrant.dSpacing)[:25]
+    q_rings = 2 * np.pi / np.asarray(calibrant.dspacing)[:25]
     rows, cols = np.indices((195, 1475), dtype=float)
     images = root / 'images'
     images.mkdir(parents=True)

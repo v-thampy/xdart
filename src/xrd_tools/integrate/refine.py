@@ -136,8 +136,8 @@ def _resolve_calibrant_q(calibrant: Any, wavelength_m: float,
         cal = get_calibrant(calibrant)
     else:
         cal = calibrant
-    cal.set_wavelength(float(wavelength_m))
-    d = np.asarray(cal.get_dSpacing(), dtype=float)  # Å, descending
+    cal.wavelength = float(wavelength_m)
+    d = np.asarray(cal.dspacing, dtype=float)  # Å, descending
     if n_rings > len(d):
         raise ValueError(
             f"control points reference ring {n_rings - 1} but the calibrant "

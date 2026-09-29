@@ -143,7 +143,7 @@ def _ring_controls(params, cal, angles):
     from pyFAI.calibrant import get_calibrant
     calibrant = get_calibrant('LaB6')
     calibrant.wavelength = WAVELENGTH
-    q_ring = 2 * np.pi / np.asarray(calibrant.dSpacing)
+    q_ring = 2 * np.pi / np.asarray(calibrant.dspacing)
     grid = np.arange(0., 194.75, .25)
     columns = np.arange(3.3, 1475., 17.7)
     controls = []
@@ -274,7 +274,7 @@ def test_parallax_fit_matches_the_runtime_geometry_it_returns(tmp_path):
         StackedDetectorArm(**TRUTH).to_pyfai_goniometer(cal), source_motors=SOURCES)
     calibrant = get_calibrant('LaB6')
     calibrant.wavelength = WAVELENGTH
-    q_ring = 2 * np.pi / np.asarray(calibrant.dSpacing)
+    q_ring = 2 * np.pi / np.asarray(calibrant.dspacing)
     angles = ANGLES[::2]
     motors = {'del': np.array([a[0] for a in angles]), 'nu': np.array([a[1] for a in angles])}
     grid, columns = np.arange(0., 194.5, .5), np.arange(5.1, 1475., 29.3)

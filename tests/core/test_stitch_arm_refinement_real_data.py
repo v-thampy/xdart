@@ -93,7 +93,7 @@ def _row_centres(root, geometry_path, output_dir, rows=None, count=3):
     record = json.loads(geometry_path.read_text())
     calibrant = get_calibrant('LaB6')
     calibrant.wavelength = record['wavelength']
-    rings = (2 * np.pi / np.asarray(calibrant.dSpacing))[:count]
+    rings = (2 * np.pi / np.asarray(calibrant.dspacing))[:count]
     geometry = capture_stitch_geometry(StitchGeometryInput(
         geometry_path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
         source_motors=(('del_angle', 'del'), ('nu_angle', 'nu')), image_rotation=0))

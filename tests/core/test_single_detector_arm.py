@@ -351,7 +351,7 @@ def _powder_scan(root, angles, truth):
     from tests.core.test_stacked_arm_extension import WAVELENGTH, _calibration, _ray
     calibrant = get_calibrant('LaB6')
     calibrant.wavelength = WAVELENGTH
-    q_rings = 2 * np.pi / np.asarray(calibrant.dSpacing)[:25]
+    q_rings = 2 * np.pi / np.asarray(calibrant.dspacing)[:25]
     rows, cols = np.indices((195, 1475), dtype=float)
     images = root / 'images'
     images.mkdir(parents=True)

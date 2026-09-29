@@ -182,8 +182,8 @@ def test_xu_notebook_fit_and_authored_admission_preserve_v1(tmp_path, energy_eV)
     if energy_eV is not None:
         acquisition['energy_eV'] = energy_eV
     wl = energy_eV_to_wavelength_m(acquisition['energy_eV'])
-    lab6 = get_calibrant('LaB6'); lab6.set_wavelength(wl)
-    q_ref = 2 * np.pi / np.asarray(lab6.dSpacing)
+    lab6 = get_calibrant('LaB6'); lab6.wavelength = wl
+    q_ref = 2 * np.pi / np.asarray(lab6.dspacing)
     controls = []
     with xu_runtime_session() as runtime:
         xu = runtime.xu

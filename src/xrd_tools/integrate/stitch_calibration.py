@@ -360,7 +360,7 @@ def load_control_frame(frame):
         if not math.isclose(float(energy_eV_to_wavelength_m(frame.energy_eV)), wl, rel_tol=1e-3):
             raise ValueError(f'frame {frame.index}: source energy and calibration wavelength differ')
     control = ControlFrame(values[:, 0], values[:, 1], values[:, 2], frame.motors)
-    if control.rings.max() >= len(points.calibrant.dSpacing):
+    if control.rings.max() >= len(points.calibrant.dspacing):
         raise ValueError('control point ring has no calibrant d-spacing')
     return control, points.calibrant, calibration
 
@@ -461,7 +461,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
             raise ValueError('all calibration frames must share shape and orientation')
         if dict(cal.detector_config) != dict(base.detector_config) or cal.poni.detector != base.poni.detector:
             raise ValueError('calibration frames have different detector configurations')
-        if not math.isclose(cal.poni.wavelength, base.poni.wavelength, rel_tol=1e-6) or not np.array_equal(calibrant.dSpacing, calibrants[0].dSpacing):
+        if not math.isclose(cal.poni.wavelength, base.poni.wavelength, rel_tol=1e-6) or not np.array_equal(calibrant.dspacing, calibrants[0].dspacing):
             raise ValueError('calibration frames must share wavelength and calibrant')
     if not math.isfinite(max_rms_q) or max_rms_q <= 0:
         raise ValueError('maximum RMS must be finite and positive')
@@ -560,7 +560,7 @@ def _fit_xu(frames, loaded, del_motor, nu_motor, distance_seed_m, distance_bound
                 qx, qy, qz = hx.Ang2Q.area(0., 0., 0., 0., control.motors[nu_motor] - no,
                                           control.motors[del_motor] - do)
                 q = np.hypot(np.hypot(qx, qy), qz)
-                reference = 2 * np.pi / np.asarray(calibrant.dSpacing)[control.rings]
+                reference = 2 * np.pi / np.asarray(calibrant.dspacing)[control.rings]
                 out.append(q[control.rows, control.cols] - reference)
             return np.concatenate(out)
         result = least_squares(residual, seed, bounds=(lower, upper), method='trf',

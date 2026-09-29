@@ -133,7 +133,7 @@ def _ring_indices(calibrant, wavelength_m):
     """Map extract_cp ring numbers (unique 2-theta order) to d-spacing indices."""
     tth = np.unique(np.array([t for t in calibrant.get_2th() if t is not None], dtype=float))
     q_ring = 4e-10 * math.pi / wavelength_m * np.sin(tth / 2)
-    q_d = 2 * math.pi / np.asarray(calibrant.dSpacing, dtype=float)
+    q_d = 2 * math.pi / np.asarray(calibrant.dspacing, dtype=float)
     index = np.array([int(np.argmin(np.abs(q_d - q))) for q in q_ring], dtype=int)
     if index.size and np.max(np.abs(q_d[index] - q_ring) / q_ring) > 1e-9:
         raise ValueError('calibrant ring order is inconsistent with its d-spacings')
@@ -300,7 +300,7 @@ def _held_out(result, controls, calibrant, nu_motor, del_motor):
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
     motors = {name: np.array([c.motors[name] for c in controls])
               for name in (nu_motor, del_motor) if name is not None}
-    q_d = 2 * math.pi / np.asarray(calibrant.dSpacing, dtype=float)
+    q_d = 2 * math.pi / np.asarray(calibrant.dspacing, dtype=float)
     out = []
     for control, integrator in zip(controls, create_multigeometry_integrator_series_from_geometry(
             result.diffractometer, motors)):
