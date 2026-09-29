@@ -600,7 +600,7 @@ def _fit_xu_extended(frames, *, del_motor, nu_motor, distance_seed_m, distance_b
                      domain, distance_provenance, cancelled, validation_angles, progress,
                      instrument_geometry=None):
     """The extended pyFAI arm, transferred to an XU SURFACE v3 asset."""
-    from xrd_tools.integrate.xu_transfer import transfer_extended_arm_to_xu
+    from xrd_tools.integrate.xu_transfer import transfer_arm_to_xu
     extended = fit_calibration(frames, backend='multigeometry', del_motor=del_motor, nu_motor=nu_motor,
                                distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
                                max_rms_q=max_rms_q, distance_provenance=distance_provenance,
@@ -610,7 +610,7 @@ def _fit_xu_extended(frames, *, del_motor, nu_motor, distance_seed_m, distance_b
         limits = domain or {key: [min(f.motors[motor] for f in frames), max(f.motors[motor] for f in frames)]
                             for key, motor in (('del', del_motor), ('nu', nu_motor))}
         validation_angles = [(d, n) for d in np.linspace(*limits['del'], 7) for n in np.linspace(*limits['nu'], 7)]
-    asset, transfer = transfer_extended_arm_to_xu(
+    asset, transfer = transfer_arm_to_xu(
         extended.asset['calibration'], validation_angles=validation_angles,
         source_motors=(del_motor, nu_motor), image_rotation=frames[0].rotation,
         cancelled=cancelled, progress=progress)

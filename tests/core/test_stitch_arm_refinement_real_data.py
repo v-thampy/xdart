@@ -278,12 +278,11 @@ def test_scan14_xu_transfer_holds_on_every_pixel_and_aligns_the_nu_rows(guided, 
     from xrd_tools.analysis.xu_stitch_calibration import (
         XuStitchCalibrationInput, _canonical_bytes, capture_xu_stitch_calibration,
     )
-    from xrd_tools.integrate.xu_transfer import transfer_extended_arm_to_xu
+    from xrd_tools.integrate.xu_transfer import transfer_arm_to_xu
     table = run_metadata_table(MetadataTablePlan(_spec(guided['root'])))
     column = {c.name: np.asarray(c.numeric, dtype=float) for c in table.columns if c.name in ('nu', 'del')}
     angles = list(zip(column['del'], column['nu']))
-    asset, transfer = transfer_extended_arm_to_xu(guided['extended'].asset['calibration'],
-                                                  validation_angles=angles)
+    asset, transfer = transfer_arm_to_xu(guided['extended'].asset['calibration'], validation_angles=angles)
     print(f"XU transfer: max |dq| {transfer['max_abs_dq_A^-1']:.3g} over {transfer['validation_frames']} frames")
     assert transfer['validation_frames'] == 287 and transfer['max_abs_dq_A^-1'] <= 1e-8
     target = guided['root'] / 'calibration/xu/extended-v3.json'

@@ -437,8 +437,11 @@ def _validate_extended_surface(value):
     require(type(acquisition['image_rotation_quarter_turns']) is int and acquisition['image_rotation_quarter_turns'] in range(4), 'invalid image rotation')
     for key in ('source_motors', 'detector_offsets_deg'):
         require(type(acquisition[key]) is dict and set(acquisition[key]) == {'del', 'nu'}, 'two detector motors required')
-    require(all(type(v) is str and v for v in acquisition['source_motors'].values())
-            and len(set(acquisition['source_motors'].values())) == 2, 'distinct source motors required')
+    motors = acquisition['source_motors']
+    held = [circle for circle, motor in motors.items() if motor is None]  # a single 2θ arm, as in v2
+    require(len(held) <= 1 and all(type(motor) is str and motor for motor in motors.values() if motor is not None)
+            and len({motor for motor in motors.values() if motor is not None}) == 2 - len(held),
+            'distinct source motors required')
     require(all(number(v) and abs(v) <= 10 for v in acquisition['detector_offsets_deg'].values()), 'motor offsets exceed fit bounds')
     sampledis = acquisition['sampledis_mm']
     require(type(sampledis) is list and len(sampledis) == 3 and all(number(v) and abs(v) <= 20 for v in sampledis),
@@ -467,7 +470,8 @@ def _validate_extended_surface(value):
     require(correction['solid_angle_sha256'] == extended_arm_digest(arm), 'solid-angle arm digest differs')
     require(type(validation) is dict and set(validation) == _EXTENDED_VALIDATION_KEYS, 'extended diagnostics required')
     require(validation['authoring_policy'] == EXTENDED_AUTHORING_POLICY, 'unsupported authoring policy')
-    for key, low in (('transfer_frame_count', 3), ('validation_frame_count', 3), ('validation_pixel_count', 1)):
+    # a five-parameter or single arm transfers by formula, fitted on no frame
+    for key, low in (('transfer_frame_count', 0), ('validation_frame_count', 3), ('validation_pixel_count', 1)):
         require(type(validation[key]) is int and validation[key] >= low, f'insufficient {key}')
     gate = validation['transfer_gate_A^-1']
     require(number(gate) and 0 < gate <= EXTENDED_TRANSFER_GATE_A, 'transfer gate exceeds 1e-8 A^-1')
@@ -482,6 +486,9 @@ def _validate_extended_surface(value):
     require(all(validation['validated_scan_domain_source_deg'][motor][0] <= limits[0] <= limits[1]
                 <= validation['validated_scan_domain_source_deg'][motor][1]
                 for motor, limits in validation['control_domain_source_deg'].items()), 'run domain must enclose control coverage')
+    require(all(validation[name][circle] == [0, 0] for circle in held for name in (
+        'control_domain_source_deg', 'validated_scan_domain_source_deg')),
+        f'a single 2θ arm holds {" and ".join(held) or "a circle"} at zero')
 
 
 def extended_surface_calibration(*, detector, xu_parameters, arm, energy_eV, xu_wavelength_A,
