@@ -479,7 +479,8 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                                   fit_scales=fit_scales, distance_seed_m=distance_seed_m,
                                   distance_bounds_m=distance_bounds_m, cancelled=cancelled,
                                   model='stacked_del_on_nu' if arm_model == 'stacked'
-                                  else 'stacked_del_on_nu_extended')
+                                  else 'stacked_del_on_nu_extended',
+                                  beam_rotation=0.)  # the design geometry; |q| cannot measure it
         if not result.success or result.rms_q > max_rms_q:
             raise ValueError(result.message or f'fit RMS {result.rms_q:.5g} exceeds {max_rms_q:g} Å⁻¹')
         asset = result.diffractometer.stacked_arm.to_pyfai_goniometer(

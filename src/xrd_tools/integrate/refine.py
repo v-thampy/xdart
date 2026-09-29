@@ -221,6 +221,7 @@ def refine_goniometer(
     distance_bounds_m: tuple[float, float] | None = None,
     cancelled=None,
     model: str = 'affine',
+    beam_rotation: float | None = None,
 ) -> RefineResult:
     """Fit affine or exact del-on-nu geometry to powder control points.
 
@@ -265,6 +266,10 @@ def refine_goniometer(
         is computed from the pose, not fitted as an unconstrained powder angle.
         The extended model also fits the detector mount (tilt, roll) and the
         sample offset from the rotation centre; see :func:`refine_stacked_arm`.
+    beam_rotation : float, optional
+        The pinned rotation about the beam (``rot3``'s offset, radians); |q|
+        cannot see it. ``None`` keeps the base PONI's ``rot3`` (the extended
+        model: zero).
 
     Returns
     -------
@@ -280,7 +285,8 @@ def refine_goniometer(
             calibrant=calibrant, wavelength=wavelength, detector=detector,
             detector_config=detector_config, base=base, preset=preset,
             distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
-            max_nfev=max(max_nfev, 2000), cancelled=cancelled)
+            max_nfev=max(max_nfev, 2000), cancelled=cancelled,
+            beam_rotation=0. if beam_rotation is None else float(beam_rotation))
     if model not in {'affine', 'stacked_del_on_nu'}:
         raise ValueError('unknown goniometer model')
     if rot1_motor is None and rot2_motor is None:
@@ -343,7 +349,7 @@ def refine_goniometer(
     if fit_r2s:
         seed.append(r2_nominal)
     seed = np.asarray(seed, dtype=float)
-    r3_pinned = float(base_poni.rot3)
+    r3_pinned = float(base_poni.rot3 if beam_rotation is None else beam_rotation)
 
     def _unpack(p):
         dist, poni1, poni2, r1o, r2o = p[:5]

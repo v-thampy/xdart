@@ -341,7 +341,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
         return refine_stacked_arm(poni, controls, nu_motor=arm.nu_motor, del_motor=arm.del_motor,
                                   calibrant=points.calibrant, detector_config=config,
                                   extended=extended, reject_outliers=reject_outliers,
-                                  beam_rotation=arm.beam_rotation, cancelled=cancelled)
+                                  beam_rotation=0., cancelled=cancelled)  # never the seed's: |q| cannot measure it
 
     controls = points.controls
     row_of = _row_of(arm.nu_motor, arm.del_motor)

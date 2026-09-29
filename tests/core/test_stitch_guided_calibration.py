@@ -146,6 +146,17 @@ def test_mg_fit_saved_json_reloads_actual_importer_and_bad_inputs_refuse(tmp_pat
         fit_calibration(frames)
 
 
+@pytest.mark.parametrize('arm_model', ['stacked', 'stacked_extended'])
+def test_a_fit_pins_the_beam_rotation_at_zero_whatever_the_first_poni_holds(tmp_path, arm_model):
+    """pyFAI-calib2 leaves each frame's rot3 wherever its seed put it, and |q| cannot measure it:
+    the guided fit takes the design value 0, not the first frame's rot3."""
+    from tests.core.test_stacked_arm import _independent_stacked_controls
+    controls, calibration = _independent_stacked_controls()
+    frames = _frames(tmp_path, controls, replace(calibration.poni, rot3=np.radians(-.87)))
+    record = fit_calibration(frames, distance_bounds_m=(.37, .41), arm_model=arm_model).asset['calibration']
+    assert dict(zip(record['param_names'], record['param']))['beam_rotation'] == 0.
+
+
 def test_nexus_staging_uses_complete_metadata_provider_and_exact_frame(tmp_path):
     from tests.core.test_metadata_provider import _bluesky
     from xrd_tools.integrate.stitch_calibration import source_frame_choices

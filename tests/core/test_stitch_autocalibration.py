@@ -68,3 +68,14 @@ def test_automatic_refinement_is_reproducible_and_leaves_the_global_generator_al
     assert first.n_points == second.n_points and first.rms_q == second.rms_q
     np.random.seed(1)
     assert np.random.random() == after  # the caller's generator state is restored
+
+
+def test_a_seed_beam_rotation_is_not_carried_into_the_refined_arm(tmp_path):
+    """|q| cannot measure a rotation about the beam: a new fit takes the design value 0, whatever
+    the seed geometry held (the maintainer's saved calibration carried −0.87° from its seed)."""
+    from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
+    seed = five_parameter_seed(ROW_ANGLES)
+    seed['param'][seed['param_names'].index('beam_rotation')] = np.radians(-.87)
+    fit = refine_arm_from_scan(ring_scan(tmp_path / 'scan'), seed, max_frames=12)
+    calibration = fit.asset['calibration']
+    assert dict(zip(calibration['param_names'], calibration['param']))['beam_rotation'] == 0.
