@@ -376,3 +376,21 @@ def test_stitch_with_xrayutilities_reads_an_xu_file_itself_and_a_pyfai_files_par
     assert xu_calibration_path('calibration/arm.json', tmp_path) == Path(saved.xu_path)  # the project's
     assert xu_calibration_path(saved.xu_path) == Path(saved.xu_path)  # an xrayutilities file is read as is
     assert xu_calibration_path('calibration/none.json', tmp_path) == Path('calibration/none.json')
+
+
+def test_an_arm_xrayutilities_refuses_still_saves_and_names_the_bound(tmp_path):
+    """The v3 admission bounds the motor offsets (10°): its refusal is the transfer's, so Save keeps
+    the pyFAI file and says why instead of failing after writing it."""
+    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
+    from xrd_tools.integrate.stitch_calibration import CalibrationFit, save_calibration_pair
+    from tests.core.test_stacked_arm_extension import _calibration
+    record = StackedDetectorArm(nu_motor='nu', del_motor='del', del_offset=np.radians(12.)).to_pyfai_goniometer(
+        _calibration())
+    record['detector_config'] = {'orientation': 3}
+    fit = CalibrationFit('multigeometry', {'calibration': record, 'provenance': {
+        'source_motors': {'del_angle': 'del', 'nu_angle': 'nu'}, 'image_rotation': 0, 'frames': []}}, 1e-3, 10., 100, '')
+    saved = save_calibration_pair(fit, tmp_path / 'calibration' / 'offset.json',
+                                  validation_angles=[(6., -10.), (15., 3.), (25., 6.)])
+    assert Path(saved.pyfai_path).is_file() and saved.xu_path is None
+    assert saved.xu_refusal == ('no xrayutilities file: xrayutilities refuses the transferred calibration: '
+                                'motor offsets exceed fit bounds')

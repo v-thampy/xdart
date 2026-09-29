@@ -114,6 +114,28 @@ def _bound_arm(path, _mtime_ns, _size, bindings):
         return ("unknown", str(error))
 
 
+def _file_states(*paths):
+    """Each file's (mtime, size), or None when it is absent: a cache key that follows edits."""
+    states = []
+    for path in paths:
+        try:
+            state = Path(path).stat()
+            states.append((state.st_mtime_ns, state.st_size))
+        except OSError:
+            states.append(None)
+    return tuple(states)
+
+
+@functools.lru_cache(maxsize=4)
+def _xu_partner(path, project, _states):  # the readiness line asks on every edit
+    """(the xrayutilities file Stitch reads for this pyFAI calibration, "") or ("", why none)."""
+    from xrd_tools.integrate.stitch_calibration import xu_calibration_path
+    try:
+        return str(xu_calibration_path(path, project or None)), ""
+    except ValueError as error:
+        return "", str(error)
+
+
 def _goniometer_positions(path) -> tuple[str, ...]:
     """The positions a pyFAI goniometer JSON declares, or () when it cannot be read."""
     record = _goniometer_record(path)
@@ -844,17 +866,18 @@ class StitchPage(QtWidgets.QWidget):
     def _calibration_pair(self, calibration, xu):
         """Name the Calibration's files on its row; return why Backend xrayutilities cannot use
         it (a pyFAI file with no partner made from it), else None."""
-        from xrd_tools.integrate.stitch_calibration import xu_calibration_path, xu_partner_path
+        from xrd_tools.integrate.stitch_calibration import xu_partner_path
         path = Path(calibration)
         if _goniometer_record(path) is None:  # an xrayutilities calibration, or a PONI
             self._rows["geometry_path"].setToolTip("")
             return None
-        try:
-            partner = xu_calibration_path(path, self._value("project_root") or None)
-        except ValueError as error:
+        partner_file = xu_partner_path(path)
+        partner, problem = _xu_partner(str(path), str(self._value("project_root") or ""), _file_states(
+            path, partner_file, partner_file.with_name(partner_file.name + ".provenance.json")))
+        if problem:
             self._rows["geometry_path"].setToolTip(
-                f"pyFAI MultiGeometry reads {path.name}; it has no xrayutilities file ({xu_partner_path(path).name}).")
-            return str(error) if xu else None
+                f"pyFAI MultiGeometry reads {path.name}; it has no xrayutilities file ({partner_file.name}).")
+            return problem if xu else None
         self._rows["geometry_path"].setToolTip(
             f"pyFAI MultiGeometry reads {path.name}; xrayutilities histogram reads {Path(partner).name}, saved with it.")
         return None

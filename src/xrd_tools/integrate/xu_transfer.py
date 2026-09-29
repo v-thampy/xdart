@@ -108,6 +108,7 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
     from xrd_tools.core.geometry import Diffractometer
     from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
     from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry
+    from xrd_tools.integrate.xu_stitch import XuStitchScienceRefused
 
     gate = EXTENDED_TRANSFER_GATE_A if gate is None else float(gate)
     del_motor, nu_motor = source_motors
@@ -249,19 +250,23 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
                 'nu': [min(a[1] for a in angles), max(a[1] for a in angles)]}
     fitted = attempts[-1]['method'] == 'coarse_fit'
     worst_dq = attempts[-1]['max_abs_dq_A^-1']
-    asset = extended_surface_calibration(
-        detector=detector,
-        xu_parameters={'cch1_px': params[0], 'cch2_px': params[1], 'distance_m': params[2] / 1e3,
-                       'del_offset_deg': params[3], 'nu_offset_deg': params[4], 'detrot_deg': params[5],
-                       'tilt_deg': params[6], 'tiltazimuth_deg': params[7],
-                       'sampledis_mm': list(params[8:11])},
-        arm=compact, energy_eV=energy, xu_wavelength_A=xu_wavelength,
-        source_motors={'del': del_motor, 'nu': nu_motor}, rotation=int(image_rotation),
-        control_domain=domain(fit if fitted else validation), domain=domain(validation),
-        fit_frames=len(fit) if fitted else 0, validation_frames=len(validation),
-        validation_pixels=len(validation) * shape[0] * shape[1], max_dq=worst_dq)
-    stitch_dq, polarization = _stitch_path_gate(asset, validation, integrators(validation), shape,
-                                                cancelled, progress)
+    try:  # the v3 admission and Stitch's own XU path refuse in their own terms: said as the transfer's
+        asset = extended_surface_calibration(
+            detector=detector,
+            xu_parameters={'cch1_px': params[0], 'cch2_px': params[1], 'distance_m': params[2] / 1e3,
+                           'del_offset_deg': params[3], 'nu_offset_deg': params[4], 'detrot_deg': params[5],
+                           'tilt_deg': params[6], 'tiltazimuth_deg': params[7],
+                           'sampledis_mm': list(params[8:11])},
+            arm=compact, energy_eV=energy, xu_wavelength_A=xu_wavelength,
+            source_motors={'del': del_motor, 'nu': nu_motor}, rotation=int(image_rotation),
+            control_domain=domain(fit if fitted else validation), domain=domain(validation),
+            fit_frames=len(fit) if fitted else 0, validation_frames=len(validation),
+            validation_pixels=len(validation) * shape[0] * shape[1], max_dq=worst_dq)
+        stitch_dq, polarization = _stitch_path_gate(asset, validation, integrators(validation), shape,
+                                                    cancelled, progress)
+    except (ValueError, XuStitchScienceRefused) as error:
+        raise XuTransferRefused('XU_TRANSFER_UNSUPPORTED',
+                                f'xrayutilities refuses the transferred calibration: {error}') from error
     if not stitch_dq <= gate:
         raise XuTransferRefused('XU_TRANSFER_GATE_FAILED', f"Stitch's XU path reaches {stitch_dq:.3g} Å⁻¹ on a "
                                 f'validation pixel (gate {gate:.0e})')

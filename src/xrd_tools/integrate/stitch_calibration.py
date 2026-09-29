@@ -766,9 +766,12 @@ def save_calibration_pair(fit: CalibrationFit, path, *, validation_angles, cance
         return SavedCalibration(saved, None, 'no xrayutilities file: cancelled; save again to make it')
     xu_provenance = {**provenance, 'source_motors': {'del': del_motor, 'nu': nu_motor}, 'xu_transfer': transfer,
                      'pyfai_calibration': {'file': Path(saved).name, 'sha256': _sha(saved)}}
-    xu_saved = save_calibration_fit(CalibrationFit('xu_hist', {'calibration': asset, 'provenance': xu_provenance},
-                                                   fit.rms_q, fit.condition_number, fit.n_points, fit.message),
-                                    partner)
+    try:  # the pyFAI file is saved and adopted whatever happens to its partner
+        xu_saved = save_calibration_fit(CalibrationFit('xu_hist', {'calibration': asset, 'provenance': xu_provenance},
+                                                       fit.rms_q, fit.condition_number, fit.n_points, fit.message),
+                                        partner)
+    except (OSError, ValueError) as error:
+        return SavedCalibration(saved, None, f'no xrayutilities file: it could not be written ({error})')
     return SavedCalibration(saved, xu_saved, '', transfer)
 
 
