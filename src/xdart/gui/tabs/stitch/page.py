@@ -59,10 +59,11 @@ _FRAME_CHECKS = {"Exclude empty frames": "empty", "Exclude empty and partial fra
 _SAMPLE_POSITIONS = {"As calibrated": "calibrated", "On rotation axis": "rotation_axis"}
 #: A GI result's cut: its plot-axis key (Int's) and axis label and unit.
 _CUT_AXES = {"q_ip": ("Qᵢₚ", "Å⁻¹"), "q_oop": ("Qₒₒₚ", "Å⁻¹")}
-#: The Axis choices: Q and 2θ, and in Grazing the GI cuts each writes beside I(q) (maintainer,
-#: 2026-09-29: "q/2th/qip/qoop/qip+qoop"), named as Int's GI axes.
+#: The Axis choices: Q and 2θ, and in Grazing the GI cuts (named as Int's GI axes). A GI axis writes
+#: I(q) and both cuts, which one pass gives (maintainer, 2026-09-29: "it will be good to save both by
+#: default along with I(q)"); the choice is the cut a result opens on.
 _STANDARD_AXES = ("Q (Å⁻¹)", "2θ (°)")
-_GI_AXES = {"Qip (Å⁻¹)": ("q_ip",), "Qoop (Å⁻¹)": ("q_oop",), "Qip + Qoop (Å⁻¹)": ("q_ip", "q_oop")}
+_GI_AXES = {"Qip (Å⁻¹)": "q_ip", "Qoop (Å⁻¹)": "q_oop"}
 
 
 _LOG = logging.getLogger(__name__)
@@ -507,9 +508,10 @@ class StitchPage(QtWidgets.QWidget):
         grid = SubsectionCard("1-D", accent="processing")
         processing.add_row(grid)
         axis = self._field(grid, SectionId.PROCESSING, "unit", "Axis", "Q (Å⁻¹)", choices=_STANDARD_AXES)
-        axis.setToolTip("Grazing adds Qip, Qoop and Qip + Qoop: I(q) is written with the chosen GI "
-                        "cut(s) beside it, binned with the same points.")
+        axis.setToolTip("Grazing adds Qip and Qoop: I(q), I(Qip) and I(Qoop) are written (one pass gives "
+                        "both cuts), and the result opens on the one chosen.")
         self._axis_q = True  # the Q range's unit (every axis but 2θ bins I(q))
+        self._gi_axis = "Qip (Å⁻¹)"  # the GI axis last chosen: the cut a loaded GI form opens on
         self._rows["unit"].valueChanged.connect(self._processing_axis_changed)
         # As Int: the Pts cluster sits on the Axis row (ControlsPanel._attach_points_to_row).
         self._align_to_ranges(axis)
@@ -719,7 +721,7 @@ class StitchPage(QtWidgets.QWidget):
         if not self._gi["enabled"]:
             return "standard"
         if self._value("unit") not in _GI_AXES:  # Q or 2θ: a plain result
-            return "grazing · choose Qip, Qoop or Qip + Qoop as the Axis"
+            return "grazing · choose Qip or Qoop as the Axis"
         pairs, mixed = self._gi_sample_binding()
         zero = [role for role, motor in pairs if motor is None]
         return ("grazing" + (f" · {', '.join(zero)} read as 0" if zero else "")
@@ -807,7 +809,7 @@ class StitchPage(QtWidgets.QWidget):
         value = self._value
         if not self._gi["enabled"] or value("unit") not in _GI_AXES:
             return None
-        from xrd_tools.integrate.stitch_gi import StitchGI
+        from xrd_tools.integrate.stitch_gi import GI_CUTS, StitchGI
         motor, tilt = self._gi["motor"] or "Manual", self._gi["tilt_motor"] or "Manual"
         ip, oop = ((None if value(f"{prefix}_auto") else (float(value(f"{prefix}_min")), float(value(f"{prefix}_max"))))
                    for prefix in ("gi_ip", "gi_oop"))
@@ -816,7 +818,7 @@ class StitchPage(QtWidgets.QWidget):
             raise ValueError(f"{', '.join(mixed)} is recorded by some selected scans and not others: "
                              "select scans that record the same sample circles")
         return StitchGI(
-            _GI_AXES[value("unit")], incidence_motor=None if motor == "Manual" else motor,
+            GI_CUTS, incidence_motor=None if motor == "Manual" else motor,
             incident_angle_deg=float(self._gi["angle"]) if motor == "Manual" else None,
             tilt_motor=None if tilt == "Manual" else tilt,
             tilt_chi_deg=float(self._gi["tilt_chi"]) if tilt == "Manual" else None,
@@ -834,7 +836,8 @@ class StitchPage(QtWidgets.QWidget):
             if gi.tilt_chi_deg is not None:
                 self._gi["tilt_chi"] = f"{gi.tilt_chi_deg:g}"
             self._render_gi()  # Grazing's axis choices, before choosing one
-            self.set_field("unit", next(label for label, cuts in _GI_AXES.items() if cuts == gi.cuts))
+            if self._value("unit") not in _GI_AXES:  # the cut it opens on: the one last chosen
+                self.set_field("unit", self._gi_axis)
             for prefix, bounds in (("gi_ip", gi.ip_range), ("gi_oop", gi.oop_range)):
                 self.set_field(f"{prefix}_auto", bounds is None)
                 if bounds is not None:
@@ -967,6 +970,8 @@ class StitchPage(QtWidgets.QWidget):
             self.set_sources(self._paths_by_kind.get(kind, ()))
 
     def _processing_axis_changed(self, *_args):
+        if self._value("unit") in _GI_AXES:
+            self._gi_axis = self._value("unit")
         q = self._value("unit") != "2θ (°)"
         if q != self._axis_q:  # only a change of unit resets the range: every GI axis bins I(q) too
             self._axis_q = q
@@ -1876,8 +1881,13 @@ class StitchPage(QtWidgets.QWidget):
             item.setToolTip(key)
             self.results.addItem(item)
             self._result_key(key)
-        if payload.gi and self._plot_axis not in {mode for mode, _cut in payload.gi}:
-            self._plot_axis = payload.gi[0][0]  # a GI result opens on its (first) cut
+        if payload.gi:  # a GI result opens on the cut the Axis chose, else on a cut it has
+            modes = {mode for mode, _cut in payload.gi}
+            chosen = _GI_AXES.get(self._value("unit"))
+            if chosen in modes:
+                self._plot_axis = chosen
+            elif self._plot_axis not in modes:
+                self._plot_axis = payload.gi[0][0]
         self.results.setCurrentItem(item)
         self._current_result_changed()
 

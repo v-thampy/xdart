@@ -796,7 +796,7 @@ def test_reopened_result_marks_the_frames_the_check_excluded(qapp, tmp_path, mon
 def test_a_gi_result_opens_on_its_cut_and_offers_its_cuts_beside_q_and_two_theta(qapp, tmp_path):
     """A GI stitched record is Int's (maintainer, 2026-09-29): I(q) with Q and 2θ, and its cuts (here
     Qip + Qoop) as the record's other 1-D modes, chosen on the view's plot axis as Int chooses GI axes;
-    the result opens on the first cut, the axis the run asked for."""
+    the result opens on the cut the Axis chose (here none: the first)."""
     from xrd_tools.integrate.stitch_gi import StitchGI
     from xdart.gui.tools.stitch_values import prepare_stitch_tool
     from tests.xdart.tools.test_stitch_native_gi import _SAMPLE, _gi_form
@@ -819,6 +819,14 @@ def test_a_gi_result_opens_on_its_cut_and_offers_its_cuts_beside_q_and_two_theta
             np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, cuts[mode].intensity)
         axis.setCurrentIndex(axis.findData("Q"))
         np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, payload.intensity)
+        # with Qoop chosen on the Axis, a GI result opens on Qoop
+        next(button for button in page._gi_host.findChildren(QtWidgets.QPushButton)
+             if button.text() == "Grazing").click()
+        page.set_field("unit", "Qoop (Å⁻¹)")
+        page.open_result(request.module.output.target)
+        _wait(page, qapp)
+        assert page.scientific.plot_axis.currentData() == "q_oop"
+        np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, cuts["q_oop"].intensity)
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()

@@ -1,7 +1,7 @@
 """Grazing incidence on the Stitch page, set as Int sets it in the Experiment section (maintainer,
 2026-09-29): Int's own rows (Standard|Grazing, the incidence motor, the Manual angle, '…' for the
-orientation), with Stitch's default order; Grazing's Axis adds Qip, Qoop and Qip + Qoop; the tilt motor
-(chi, gonchi, else Manual) is in Advanced."""
+orientation), with Stitch's default order; Grazing's Axis adds Qip and Qoop, each writing I(q) and both
+cuts; the tilt motor (chi, gonchi, else Manual) is in Advanced."""
 from pathlib import Path
 
 import pytest
@@ -72,17 +72,18 @@ def test_grazing_shows_ints_rows_with_the_scans_motors_and_eta_first(qapp, tmp_p
         tilt, chi = page._tilt_rows
         assert [tilt.editor.itemText(index) for index in range(tilt.editor.count())] == ["Manual", *_MOTORS]
         assert tilt.editor.currentText() == "chi" and chi.isHidden()  # Stitch's tilt order: chi, gonchi, …
-        # the maintainer's axes (2026-09-29): Q and 2θ stay plain; a GI axis writes its cut(s) beside I(q)
-        assert _axes(page) == ["Q (Å⁻¹)", "2θ (°)", "Qip (Å⁻¹)", "Qoop (Å⁻¹)", "Qip + Qoop (Å⁻¹)"]
-        assert page.build_form().gi is None and "choose Qip, Qoop or Qip + Qoop" in _status(page)
+        # the maintainer's axes (2026-09-29): Q and 2θ stay plain; a GI axis writes I(q) and both cuts
+        # ("it will be good to save both by default along with I(q)"), opening on the one chosen
+        assert _axes(page) == ["Q (Å⁻¹)", "2θ (°)", "Qip (Å⁻¹)", "Qoop (Å⁻¹)"]
+        assert page.build_form().gi is None and "choose Qip or Qoop" in _status(page)
         assert all(row.isHidden() for row in page._gi_rows)
         page.set_field("unit", "Qip (Å⁻¹)")
         assert not any(row.isHidden() for row in page._gi_rows) and "choose" not in _status(page)
         # both backends read psic's circles: the incidence as eta, the tilt as chi, and mu and phi
-        assert page.build_form().gi == StitchGI(("q_ip",), incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE)
-        page.set_field("unit", "Qip + Qoop (Å⁻¹)")
-        assert page.build_form().gi == StitchGI(("q_ip", "q_oop"), incidence_motor="eta", tilt_motor="chi",
-                                                sample_motors=_SAMPLE)
+        both = StitchGI(("q_ip", "q_oop"), incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE)
+        assert page.build_form().gi == both
+        page.set_field("unit", "Qoop (Å⁻¹)")
+        assert page.build_form().gi == both
         assert page.build_form().unit == "q_A^-1"
         _click(page, "Standard")
         assert page.build_form().gi is None and all(row.isHidden() for row in page._gi_rows)
@@ -91,8 +92,9 @@ def test_grazing_shows_ints_rows_with_the_scans_motors_and_eta_first(qapp, tmp_p
         _close(page, qapp)
 
 
-@pytest.mark.parametrize("axis, cuts", [("Qoop (Å⁻¹)", ("q_oop",)), ("Qip + Qoop (Å⁻¹)", ("q_ip", "q_oop"))])
-def test_a_manual_angle_axis_and_ranges_reach_the_form_and_round_trip(qapp, tmp_path, axis, cuts):
+@pytest.mark.parametrize("axis", ["Qoop (Å⁻¹)", "Qip (Å⁻¹)"])
+def test_a_manual_angle_axis_and_ranges_reach_the_form_and_round_trip(qapp, tmp_path, axis):
+    cuts = ("q_ip", "q_oop")  # either GI axis writes both cuts
     page = _page(tmp_path, "multigeometry")
     other = None
     try:
@@ -211,7 +213,7 @@ def test_the_gi_axes_keep_the_typed_q_range_and_only_2theta_resets_it(qapp, tmp_
         page.set_field("radial_auto", False)
         page.set_field("q_min", 1.)
         page.set_field("q_max", 3.)
-        for axis in ("Qip (Å⁻¹)", "Qip + Qoop (Å⁻¹)", "Qoop (Å⁻¹)", "Q (Å⁻¹)", "Qip (Å⁻¹)"):
+        for axis in ("Qip (Å⁻¹)", "Qoop (Å⁻¹)", "Q (Å⁻¹)", "Qip (Å⁻¹)"):
             page.set_field("unit", axis)
             assert page.build_form().q_range == (1., 3.)
         _click(page, "Standard")  # the GI axis becomes Q: the same unit, the same range
