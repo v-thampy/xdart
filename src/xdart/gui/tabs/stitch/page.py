@@ -138,6 +138,18 @@ def _spec_motor_names(path, _state, scan):
         return None
 
 
+@functools.lru_cache(maxsize=16)
+def _spec_image_scan_name(path, _states, scan, image_dir, image_stem):
+    """Int's name for one SPEC scan's images (the automatic result name), or None when no image
+    matches or the folder cannot be read. ``_states``: the SPEC file's and the folder's."""
+    from xrd_tools.analysis.stitch_sources import spec_scan_name
+    stem = image_stem.format(spec=Path(path).stem, scan=str(scan).split(".")[0], occurrence=scan) if image_stem else ""
+    try:
+        return spec_scan_name(path, scan, image_dir or str(Path(path).parent), stem or None)
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+
+
 @functools.lru_cache(maxsize=8)
 def _spec_scan_keys(path, _state):
     """A SPEC file's scan keys (N.M), or None when it cannot be read."""
@@ -1005,17 +1017,24 @@ class StitchPage(QtWidgets.QWidget):
             self._sync_actions()
 
     def _automatic_names(self, kind, sources, scans):
-        """The result names the selection gets when Result names is blank (Preview confirms)."""
-        from xrd_tools.io.output_path import automatic_artifact_family
+        """The result names the selection gets when Result names is blank, as Int names results:
+        the scan's image name, _gi for grazing incidence (Preview confirms)."""
+        from xrd_tools.analysis.stitch_sources import int_scan_name
+        from xrd_tools.io.output_path import generated_artifact_family, scan_family
         from xrd_tools.sources.grouping import parse_stitch_scan_groups
-        project = str(self._value("project_root") or "").strip()
+        image_dir, stem = str(self._value("image_dir") or ""), str(self._value("image_stem") or "")
+        gi = self._gi["enabled"] and self._value("unit") in _GI_AXES
         try:
             if kind == "Spec" and self._value("scan_mode") != "Stitch All":
                 groups = [[(path, scan) for scan in group]
                           for path in sources for group in parse_stitch_scan_groups(scans)]
+                members = [[_spec_image_scan_name(path, _file_states(path, image_dir or Path(path).parent), scan,
+                                                  image_dir, stem) for path, scan in group] for group in groups[:3]]
             else:
-                groups = [[(path, None) for path in sources]] if kind == "NeXus" and sources else []
-            names = [automatic_artifact_family(group, project) for group in groups[:3]] if project else []
+                groups = [list(sources)] if kind == "NeXus" and sources else []
+                members = [[int_scan_name(path) for path in group] for group in groups]
+            names = [generated_artifact_family(scan_family(group), grazing_incidence=gi)
+                     for group in members if None not in group]
         except ValueError:
             names = []
         if not names:

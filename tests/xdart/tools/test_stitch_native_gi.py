@@ -126,6 +126,7 @@ def test_a_gi_stitch_publishes_i_of_q_and_its_cuts_as_one_int_record(tmp_path, b
     result = stitch_operation.run_stitch_operation(request)
     assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
     target = request.module.output.target
+    assert Path(target).name == "sample_scan1_gi_stitch1d.nexus"  # as Int names a GI result
     assert is_current_processed_xdart_path(target)
     iq, computed = science[0].payload, science[0].gi_cuts
 

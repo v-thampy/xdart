@@ -161,6 +161,8 @@ def _two_files(tmp_path, backend, drop=()):
     path.write_text(text)
     page.set_sources((str(path), str(other)))
     page.set_field("image_stem", "sample_scan{scan}_")
+    # both files name the same images, so Int's automatic names would collide: name the outputs
+    page.set_field("output_family", "first; second")
     return page
 
 

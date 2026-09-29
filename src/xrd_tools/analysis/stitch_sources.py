@@ -43,13 +43,34 @@ class StitchSourceSelection:
 class StitchSourceResolution:
     groups: tuple[tuple[SourceSpec, ...], ...]
     skipped: tuple[tuple[str, str, str], ...]
+    #: each group's members' scan names, as Int names them (``int_scan_name``)
+    names: tuple[tuple[str, ...], ...] = ()
+
+
+def int_scan_name(path) -> str:
+    """The scan name Int gives a raw file (its source adapter's): an image series' stem without its
+    frame number (``b_thampy_sample_scan14_0000.raw`` gives ``b_thampy_sample_scan14``), a NeXus
+    container's full stem."""
+    from xrd_tools.sources.adapters import candidate_owner
+    path = Path(path)
+    adapter = candidate_owner(path)
+    return adapter.scan_name(path) if adapter is not None else path.stem
+
+
+def spec_scan_name(path, key, image_dir, image_stem) -> str | None:
+    """Int's scan name for one SPEC scan's images (its first image's), or None when none match: the
+    automatic result name before Preview, from the files the source would read."""
+    from xrd_tools.io.image import find_image_files
+    stem = image_stem or f"{Path(path).stem}_scan{str(key).split('.')[0]}_"
+    files = list(find_image_files(Path(image_dir or Path(path).parent), stem=stem))
+    return int_scan_name(files[0]) if files else None
 
 
 def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) -> StitchSourceResolution:
     """Freeze discovery and skips once at Preview; never rediscover during Run."""
     if type(selection) is not StitchSourceSelection:
         raise TypeError("exact Stitch source selection required")
-    groups, skipped = [], []
+    groups, skipped, names = [], [], {}
 
     def spec_member(path, key):
         stem = selection.image_stem.format(spec=path.stem, scan=key.split(".")[0], occurrence=key)
@@ -65,6 +86,7 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
                 searched = stem or f"{path.stem}_scan{key.split('.')[0]}_"
                 skipped.append((str(path), key, f"No detector images named *{searched}* in {folder}"))
                 return None
+            names[id(spec)] = int_scan_name(source.raw_locator_for(0)[0])  # as Int names these images
             return spec
         finally:
             close = getattr(source, "close", None)
@@ -94,7 +116,9 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
         if not entries:
             raise ValueError(f"{path.name} has no NeXus entries")
         # Each file remains one output/group; its exact entries contribute.
-        return tuple(SourceSpec(path, kind, entry=entry) for entry in entries)
+        members = tuple(SourceSpec(path, kind, entry=entry) for entry in entries)
+        names.update(dict.fromkeys(map(id, members), int_scan_name(path)))
+        return members
 
     if selection.kind == "Spec":
         for path in selection.paths:
@@ -118,4 +142,5 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
                     groups.append(nexus_members(path))
     if len(groups) > 4096:
         raise ValueError("Selection exceeds 4096 result groups")
-    return StitchSourceResolution(tuple(groups), tuple(skipped))
+    return StitchSourceResolution(tuple(groups), tuple(skipped),
+                                  tuple(tuple(names[id(spec)] for spec in group) for group in groups))

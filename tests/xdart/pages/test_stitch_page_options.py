@@ -476,6 +476,8 @@ def test_inputs_view_follows_int(qapp, tmp_path):
     spec = tmp_path / "data" / "LaB6_17keV"
     spec.parent.mkdir()
     spec.write_text("#F LaB6_17keV\n")
+    for scan in (14, 15):  # 17-2's image names: the automatic result name is Int's name for them
+        (spec.parent / f"b_thampy_LaB6_17keV_scan{scan}_0000.raw").write_bytes(b"")
     calibration = tmp_path / "MG_gonio_object.json"
     calibration.write_text("{}")
     page = StitchPage(empty_host_services(_Status()))
@@ -516,9 +518,10 @@ def test_inputs_view_follows_int(qapp, tmp_path):
         page.set_sources([str(spec)])
         names = page._rows["output_family"]  # an optional override under Advanced
         assert names.window() is page.advanced
-        assert names.editor.placeholderText() == "auto · data-LaB6_17keV-14"
+        # named as Int names these images' results (maintainer, 2026-09-29), before the suffix
+        assert names.editor.placeholderText() == "auto · b_thampy_LaB6_17keV_scan14"
         page.set_field("scan", "[14,15]")  # a combined output is named automatically too
-        assert names.editor.placeholderText() == "auto · data-LaB6_17keV-14-15"
+        assert names.editor.placeholderText() == "auto · b_thampy_LaB6_17keV_scan14-15"
         cards = page.controls
         for card in (cards.project_card, cards.experiment_card, cards.source_card, cards.processing_card):
             assert not card.valid_marker.isHidden(), card.title.text()

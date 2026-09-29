@@ -1016,3 +1016,15 @@ def test_a_combined_result_is_named_from_its_members(tmp_path):
         assert re.fullmatch(r"[A-Za-z0-9._-]+", family)  # POSIX portable filename characters
     # long selections are refused by the caller, never truncated or hashed
     assert not is_artifact_family(name(*(str(n) for n in range(1, 80, 2))))
+
+
+def test_scan_family_names_an_output_as_int_names_its_scans():
+    """Maintainer, 2026-09-29: Stitch names its results as Int 1D/2D does; a combined output lists
+    its scans after their shared stem, consecutive ones as a range."""
+    from xrd_tools.io.output_path import scan_family
+    assert scan_family(["b_thampy_LaB6_17keV_scan14"]) == "b_thampy_LaB6_17keV_scan14"
+    assert scan_family(["s_scan2", "s_scan3", "s_scan4", "s_scan5", "s_scan8", "s_scan3"]) == "s_scan2-5_8"
+    assert scan_family(["run_0001", "run_0002", "run_0007"]) == "run_0001-0002_0007"
+    assert scan_family(["a_scan1", "b_scan2"]) == "a_scan1_b_scan2"
+    with pytest.raises(ValueError):
+        scan_family([])

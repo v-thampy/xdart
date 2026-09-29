@@ -23,7 +23,7 @@ from xrd_tools.integrate.frame_screen import FrameScreenPolicy
 from xrd_tools.integrate.xu_stitch import resolve_xu_stitch_effective_geometry
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind
 from xrd_tools.io.output_path import (
-    automatic_artifact_family, is_artifact_family, resolve_finite_output_target,
+    generated_artifact_family, is_artifact_family, resolve_finite_output_target, scan_family,
 )
 
 
@@ -59,9 +59,9 @@ def _families(form, resolution, project):
             raise refused("OUTPUT_FAMILY_COUNT_MISMATCH",
                 "For multiple outputs, enter result names in output order separated by ;")
     families, seen = [], set()
-    for index, (group, name) in enumerate(zip(groups, explicit), 1):
-        if not name:
-            name = automatic_artifact_family(((spec.uri, spec.options.get("scan")) for spec in group), project)
+    for index, (group, name, members) in enumerate(zip(groups, explicit, resolution.names), 1):
+        if not name:  # as Int names a result: the scan's name, _gi for grazing incidence
+            name = generated_artifact_family(scan_family(members), grazing_incidence=form.gi is not None)
             if _combined(group) and not is_artifact_family(name):
                 raise refused("OUTPUT_FAMILY_REQUIRED",
                     f"Output {index} combines sources and its automatic name {name!r} is not a "

@@ -22,7 +22,7 @@ def test_native_family_preserves_readable_source_and_frame_subset_slot(tmp_path)
     first = prepare_stitch_tool(form).request
     subset = prepare_stitch_tool(replace(form,
         frame_selector=StitchFrameSelector(0, 0))).request
-    assert Path(first.module.output.target).name == "source-sample-1_stitch1d.nexus"
+    assert Path(first.module.output.target).name == "sample_scan1_stitch1d.nexus"
     assert subset.module.output.target == first.module.output.target
 
 
@@ -45,7 +45,7 @@ def test_native_affine_warning_uses_selected_coupled_angles(tmp_path, rows, firs
     if expected:
         assert len(prepared.warnings) == 1
         warning = prepared.warnings[0]
-        assert "source-sample-1_stitch1d.nexus" in warning
+        assert "sample_scan1_stitch1d.nexus" in warning
         assert "independent Euler" in warning
         assert "If del is mounted on nu" in warning
         assert "stacked calibration" in warning
@@ -104,7 +104,8 @@ def test_native_stacked_calibration_previews_runs_and_reloads(tmp_path):
 def test_native_group_is_named_automatically_or_as_entered(tmp_path):
     form = replace(_native_form(tmp_path, "multigeometry", scans="[1,2]"), output_family=None)
     prepared = prepare_stitch_tool(form)
-    assert Path(prepared.request.module.output.target).name == "source-sample-1-2_stitch1d.nexus"
+    # as Int names a result (maintainer, 2026-09-29): the images' scan name, then the slot
+    assert Path(prepared.request.module.output.target).name == "sample_scan1-2_stitch1d.nexus"
     prepared = prepare_stitch_tool(replace(form, output_family="Sample A é"))
     assert Path(prepared.request.module.output.target).name == "Sample A é_stitch1d.nexus"
 
@@ -115,10 +116,11 @@ def test_an_automatic_name_over_80_characters_asks_for_one(tmp_path):
     from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
     spec = tmp_path / "data" / "sample"
     odd = tuple(SimpleNamespace(uri=str(spec), options={"scan": f"{n}.1"}) for n in range(1, 80, 2))
-    resolution = SimpleNamespace(groups=(odd,), skipped=())
+    resolution = SimpleNamespace(groups=(odd,), skipped=(),
+                                 names=(tuple(f"sample_scan{n}" for n in range(1, 80, 2)),))
     with pytest.raises(StitchToolPreflightRefused, match="OUTPUT_FAMILY_REQUIRED"):
-        _families(SimpleNamespace(output_families=(), output_family=None), resolution, tmp_path.resolve())
-    assert _families(SimpleNamespace(output_families=(), output_family="odd scans"), resolution,
+        _families(SimpleNamespace(output_families=(), output_family=None, gi=None), resolution, tmp_path.resolve())
+    assert _families(SimpleNamespace(output_families=(), output_family="odd scans", gi=None), resolution,
                      tmp_path.resolve()) == ("odd scans",)
 
 
@@ -135,7 +137,7 @@ def test_native_named_multiple_groups_and_invalid_names(tmp_path):
                    output_family=None, output_families=("", "sample-up", "sample-down"))
     prepared = prepare_stitch_tool(form)
     assert [Path(item.module.output.target).name for item in prepared.requests] == [
-        "source-sample-1_stitch1d.nexus", "sample-up_stitch1d.nexus", "sample-down_stitch1d.nexus"]
+        "sample_scan1_stitch1d.nexus", "sample-up_stitch1d.nexus", "sample-down_stitch1d.nexus"]
     for names, code in [(("", "x" * 81, "fine"), "OUTPUT_FAMILY_INVALID"),
                         (("", "../bad", "fine"), "OUTPUT_FAMILY_INVALID"),
                         (("", "same", "SAME"), "OUTPUT_FAMILY_COLLISION"),

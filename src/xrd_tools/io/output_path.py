@@ -62,6 +62,7 @@ __all__ = [
     "artifact_family_from_source",
     "generated_artifact_family",
     "automatic_artifact_family",
+    "scan_family",
     "GI_FAMILY_MARKER",
     "is_artifact_family",
     "resolve_finite_output_target",
@@ -213,6 +214,24 @@ def generated_artifact_family(scan_name: str, *, grazing_incidence: bool) -> str
     filename.  The result is not validated here; ask :func:`is_artifact_family`.
     """
     return f"{scan_name}{GI_FAMILY_MARKER}" if grazing_incidence else scan_name
+
+
+def scan_family(names) -> str:
+    """One output's automatic family from the Int scan names of its members (maintainer, 2026-09-29:
+    Stitch names its results as Int 1D/2D does, ``<scan>_stitch1d.nexus``). One member keeps its
+    name (``sample_scan14``); members sharing a stem list their numbers after it, consecutive ones as
+    a range (``sample_scan2-5_8``); other members are listed by name, joined by ``_``. The result is
+    not validated here; ask :func:`is_artifact_family`."""
+    names = tuple(dict.fromkeys(str(name) for name in names))
+    if not names:
+        raise ValueError("an output needs at least one member name")
+    if len(names) == 1:
+        return names[0]
+    entries = [_name_entry(name) for name in names]
+    head = entries[0][1]
+    if all(entry[1] == head and entry[2] is not None for entry in entries):
+        return head + _listed((entry[0], "", entry[2], entry[3][len(head):]) for entry in entries)
+    return _listed(entries)
 
 
 def _listed(entries):
