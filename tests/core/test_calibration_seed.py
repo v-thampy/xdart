@@ -188,3 +188,31 @@ def test_the_calibrations_mask_removes_the_rings_that_fall_only_on_it(tmp_path):
     assert [ring.number for ring in masked.rings] == [ring.number for ring in seed.rings[:-1]]
     # a mask of another shape is not this frame's: the rings are predicted without it
     assert predict_frame_seed(_record(tmp_path), frame, mask=np.ones((2, 2), bool)).rings == seed.rings
+
+
+def test_a_rough_arm_holds_the_mount_tilt_and_roll_it_is_given():
+    """A direct-beam calibration holds the detector's other rotations fixed (maintainer, 2026-09-29:
+    "all other rots held to zero or some fixed value"): the zeros, and the mount's tilt and roll."""
+    from xrd_tools.core.geometry import Diffractometer
+
+    def arm(**mount):
+        record = rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(100, 40), **mount)
+        return Diffractometer.from_pyfai_goniometer(record, source_motors={'del_angle': 'del', 'nu_angle': 'nu'}).stacked_arm
+
+    assert not arm().extended
+    tilted = arm(mount_deg=(.5, -.3))
+    assert tilted.extended and (tilted.mount_tilt, tilted.mount_roll) == pytest.approx(
+        (math.radians(.5), math.radians(-.3)))
+    with pytest.raises(ValueError, match="single detector arm"):
+        rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(100, 40), nu_motor=None,
+                         mount_deg=(.5, 0.))
+
+
+def test_a_circle_with_no_frames_and_no_range_is_checked_at_zero():
+    """With nu fixed at 0 a direct-beam calibration types only del's range: nu is checked at 0."""
+    from xrd_tools.integrate.stitch_calibration import CalibrationFit, pair_validation_angles
+    fit = CalibrationFit('multigeometry', {'provenance': {'frames': [], 'source_motors': {
+        'del_angle': 'del', 'nu_angle': 'nu'}}}, 0., 0., 0, '')
+    angles = pair_validation_angles(fit, domain={'del': [0., 30.]}, grid=4)
+    assert angles == [(0., 0.), (10., 0.), (20., 0.), (30., 0.)]
+    assert pair_validation_angles(fit) == []

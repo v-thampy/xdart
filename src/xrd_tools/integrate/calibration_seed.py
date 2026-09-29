@@ -154,7 +154,8 @@ def detector_shape(detector) -> tuple[int, int] | None:
 
 
 def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='del',
-                     del_motor='del', nu_motor='nu', wavelength_m=1e-10, orientation=3) -> dict:
+                     del_motor='del', nu_motor='nu', wavelength_m=1e-10, orientation=3,
+                     mount_deg=(0., 0.)) -> dict:
     """A nominal stacked (del-on-nu) arm from a rough distance, for a new setup.
 
     At normal incidence (``zero_motor`` at ``zero_deg``, the other angle at 0) the direct
@@ -167,6 +168,8 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
     row, the column or both), and a non-default one travels in the detector
     config (the seed PONI pyFAI opens with, and so its saved PONIs). The motor scales
     take its signs (``orientation_signs``), so every orientation predicts the same rings.
+    ``mount_deg`` holds the detector mount's tilt and roll fixed (the arm's extension; a single
+    arm has none), zero for a detector facing the beam squarely at every angle.
     """
     from pyFAI.detectors import detector_factory
     from xrd_tools.core.containers import PONI
@@ -189,7 +192,9 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
     poni1, poni2, _ = pixels.calc_cartesian_positions(d1=np.array([y]), d2=np.array([x]))
     poni = PONI(dist=float(distance_m), poni1=float(poni1[0]), poni2=float(poni2[0]),
                 wavelength=float(wavelength_m), detector=str(detector))
-    arm = StackedDetectorArm(nu_motor=nu_motor, del_motor=del_motor, **scales, **offset)
+    tilt, roll = (math.radians(float(value)) for value in mount_deg)
+    arm = StackedDetectorArm(nu_motor=nu_motor, del_motor=del_motor, **scales, **offset,
+                             mount_tilt=tilt, mount_roll=roll)
     return arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
 
 

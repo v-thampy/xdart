@@ -512,3 +512,43 @@ def test_the_xrayutilities_file_is_checked_over_the_scan_and_a_refusal_keeps_the
         assert 'no xrayutilities file' in dialog.status.text() and 'motor scales' in dialog.status.text()
     finally:
         dialog.close()
+
+def test_a_direct_beam_geometry_saves_as_the_calibration_pair_without_a_ring_fit(qapp, tmp_path, monkeypatch):
+    """CAL-1 (maintainer, 2026-09-29): "a quick multigeometry calibration json file from just the
+    sample detector distance, and direct beam pixel with all other rots held to zero or some fixed
+    value … especially when nu is fixed at 0"."""
+    from xrd_tools.core.geometry import Diffractometer
+    from xrd_tools.integrate.stitch_calibration import xu_partner_path
+    page, dialog = _page_with_dialog(tmp_path)
+    try:
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        assert not dialog.save_rough_button.isHidden() and not dialog._fields['rough_mount'].isHidden()
+        for key, value in (('rough_distance', '150'), ('beam_pixel', '700, 100')):
+            dialog._fields[key].setText(value)
+        target = (tmp_path / 'calibration' / 'direct.json').resolve()
+        _save_to(monkeypatch, target)
+        dialog.save_rough_button.click()  # Stitch checks each scan's energy against the wavelength
+        _wait(dialog)
+        assert 'wavelength' in dialog.status.text() and not target.exists()
+        dialog._fields['rough_wavelength'].setText('0.7293')
+        dialog._fields['del_domain'].setText('0, 40')  # nu stays at 0: only del's range is typed
+        adopted = []
+        dialog.calibrationSaved.connect(lambda path, backend: adopted.append((path, backend)))
+        dialog.save_rough_button.click()
+        _wait(dialog)
+        assert adopted == [(str(target), 'multigeometry')], dialog.status.text()
+        assert Path(page._value("geometry_path")) == target
+        provenance = json.loads(target.with_suffix('.json.provenance.json').read_text())
+        assert provenance['calibration_kind'] == 'direct_beam_not_ring_fitted' and provenance['frames'] == []
+        assert provenance['fixed_mount_deg'] == [0., 0.]
+        assert xu_partner_path(target).exists(), dialog.status.text()
+        saved = Diffractometer.from_pyfai_goniometer(
+            json.loads(target.read_text()), source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
+        assert saved.calibration.poni.dist == pytest.approx(.15)
+        assert saved.calibration.poni.wavelength == pytest.approx(.7293e-10)
+        assert not saved.stacked_arm.extended  # the mount held at 0, 0
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
+        assert dialog.save_rough_button.isHidden()
+    finally:
+        dialog.close()
+        page.shutdown()

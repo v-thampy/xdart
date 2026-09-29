@@ -538,7 +538,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._label('source').setText('SPEC file' if spec else 'NeXus file')
 
     def _build_frames(self):
-        layout, form = self._form('3 · Calibrate each frame', 'calibrate')
+        # Calibrating the frames and fitting them are one loop: one tab (maintainer, 2026-09-29)
+        layout, form = self._form('3 · Calibrate and fit', 'calibrate')
+        self._calibrate_layout = layout
         hint = QtWidgets.QLabel('Calibrate each frame in pyFAI: pick its rings, then press Save as PONI-file. xdart keeps the PONI and its enabled control points, closes pyFAI and selects the next frame. Completed rows and files remain when another frame is cancelled.')
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -553,6 +555,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                             (5, 'The calibrant rings predicted to reach this frame; hover a cell for each '
                                 'ring\'s 2θ.')):
             self.frame_table.horizontalHeaderItem(column).setToolTip(tip)
+        # the fit shares the tab: the table keeps room for about six frames, the tab scrolls
+        self.frame_table.setMinimumHeight(self.frame_table.verticalHeader().defaultSectionSize() * 6
+                                          + self.frame_table.horizontalHeader().sizeHint().height() + 4)
         layout.addWidget(self.frame_table, 1)
         buttons = QtWidgets.QHBoxLayout()
         self.calibrate_button = QtWidgets.QPushButton('Calibrate selected frame…')
@@ -584,7 +589,11 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         return card, form
 
     def _build_fit(self):
-        layout, form = self._form('4 · Fit and save', 'fit')
+        layout = self._calibrate_layout  # under the frames it fits
+        rule = QtWidgets.QFrame()
+        rule.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        rule.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+        layout.addWidget(rule)
         self.arm_note = QtWidgets.QLabel()
         self.arm_note.setWordWrap(True)
         self.arm_note.setToolTip('The arm model is chosen for you: the detector mount (tilt, roll) and the '
@@ -594,7 +603,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         layout.addWidget(self.arm_note)
         self.fit_button = QtWidgets.QPushButton('Fit the calibrated frames')
         self.fit_button.setToolTip('Fits one detector-arm geometry to the ring points picked on the frames '
-                                   'marked Complete in 3 · Calibrate each frame. Needs three of them.')
+                                   'marked Complete above. Needs three of them.')
         self.fit_button.clicked.connect(self._fit)
         layout.addWidget(self.fit_button)
         self._advanced_card, options = self._card(layout, 'Advanced')
@@ -642,6 +651,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         auto.addRow(self.refine_button)
         self.fit_summary = QtWidgets.QPlainTextEdit()
         self.fit_summary.setReadOnly(True)
+        self.fit_summary.setMinimumHeight(self.fit_summary.fontMetrics().lineSpacing() * 8)
         layout.addWidget(self.fit_summary, 1)
         self.save_button = QtWidgets.QPushButton('Save geometry and use in Stitch')
         self.save_button.setToolTip('Saves the fitted geometry inside the project as a pyFAI goniometer JSON and, '
@@ -737,6 +747,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                        'within the strip half width, because the spot is searched only in that strip.')
         self.motion = self._combo(form, 'Beam motion', [('horizontal', None), ('vertical', None)],
                                   tip='The direction the beam spot moves across the image as the motor turns.')
+        self._edit(form, 'rough_mount', 'Detector mount tilt, roll (°)', '0, 0',
+                   tip='The detector mount\'s tilt and roll, held fixed (the arm\'s mount extension; a '
+                       'single 2θ arm has none). 0, 0: the detector faces the beam squarely at every angle.')
+        self._edit(form, 'rough_wavelength', 'Wavelength (Å)', '', placeholder='needed to save, e.g. 0.7293',
+                   tip='The X-ray wavelength. Save as calibration needs it (Stitch checks each scan\'s '
+                       'energy against it); blank predicts rings at 1 Å.')
         self._fit_options, options = self._card(layout, 'Fit options')
         self._edit(options, 'beam_strip', 'Strip half width (pixels)', '2',
                    tip='The beam spot is searched in a strip this many pixels either side of its path.')
@@ -755,12 +771,23 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.beam_summary.setMaximumHeight(self.beam_summary.fontMetrics().lineSpacing() * 9)
         layout.addWidget(self.beam_summary)
         self.apply_distance_button = QtWidgets.QPushButton('Use result as distance seed')
-        self.apply_distance_button.setToolTip('Starts the final fit (4 · Fit and save) from this distance.')
+        self.apply_distance_button.setToolTip('Starts the final fit (3 · Calibrate and fit) from this distance.')
         self.apply_distance_button.clicked.connect(self._apply_distance)
         layout.addWidget(self.apply_distance_button)
+        # A calibration from this geometry alone (maintainer, 2026-09-29: "a quick multigeometry
+        # calibration json file from just the sample detector distance, and direct beam pixel")
+        self.save_rough_button = QtWidgets.QPushButton('Save as calibration…')
+        self.save_rough_button.setToolTip(
+            'Saves this geometry, with no ring fit, as Stitch\'s calibration: the distance and beam pixel '
+            'above, the rotations held as typed, one degree per degree. As Save does, it writes the pyFAI '
+            'file and, beside it, the xrayutilities file, checked on the direct-beam scan\'s angles, the '
+            'calibrant scan\'s and the supported ranges under 3 · Calibrate and fit ▸ Advanced. Useful when '
+            'nu stays at 0; the file records that it is a direct-beam calibration.')
+        self.save_rough_button.clicked.connect(self._save_rough)
+        layout.addWidget(self.save_rough_button)
         layout.addStretch(1)
         self.rough_mode.currentIndexChanged.connect(self._sync_rough_rows)
-        for key in ('rough_distance', 'beam_pixel', 'beam_zero', 'beam_motor'):
+        for key in ('rough_distance', 'beam_pixel', 'beam_zero', 'beam_motor', 'rough_mount', 'rough_wavelength'):
             self._fields[key].editingFinished.connect(self._render_frames)
         for key in ('beam_detector', 'beam_orientation'):
             self._fields[key].currentIndexChanged.connect(self._render_frames)
@@ -840,10 +867,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         'manual': 'The distance, the pixel the direct beam hits at normal incidence and that zero predict each '
                   'frame\'s rings (the Geometry\'s arm, one degree per degree) until the first frame is '
                   'calibrated; that frame then predicts the others, and the fit refines them all.',
-        'skip': 'No rough geometry: each frame\'s rings are predicted from a geometry file (Fit and save), '
+        'skip': 'No rough geometry: each frame\'s rings are predicted from a geometry file (3 · Calibrate and fit), '
                 'or from the first frame you calibrate.',
     }
-    _GEOMETRY_ROWS = ('beam_motor', 'beam_zero', 'beam_pixel')
+    _GEOMETRY_ROWS = ('beam_motor', 'beam_zero', 'beam_pixel', 'rough_mount', 'rough_wavelength')
 
     def _update_image_size(self, *_args):
         """The detector image's x × y size, as the beam pixel is read (after the Select-frames rotation)."""
@@ -891,6 +918,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         form.setRowVisible(self.motion, scan)
         for widget in (self._fit_options, self.beam_button, self.beam_summary, self.apply_distance_button):
             widget.setVisible(scan)
+        self.save_rough_button.setVisible(mode != 'skip')
         self._label('beam_source').setText('NeXus file' if kind == 'nexus' else 'SPEC file')
         self.rough_note.setText(self._ROUGH_NOTES[mode])
         self._beam_pixel_hint()
@@ -899,26 +927,37 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _rough_record(self):
         """Step 1 as a nominal arm, or None (skipped, not yet measured, or incomplete)."""
-        mode = self.rough_mode.currentData()
         try:
-            if mode == 'manual':
-                distance = float(self._text('rough_distance')) / 1000
-            elif mode == 'scan' and self._distance_result is not None:
-                distance = self._distance_result.distance_m
-            else:
-                return None
-            zero = dict(zip(('del', 'nu'), self._frame_motors)).get(self._beam_role()) or self._text('beam_motor')
-            # blank with a measured scan: the pixel the fit found
-            beam = (tuple(float(v) for v in self._text('beam_pixel').split(',')) if self._text('beam_pixel')
-                    else self._distance_result.beam_pixel if mode == 'scan' else None)
-            return rough_arm_record(
-                distance_m=distance, detector=self._text('beam_detector'),
-                beam_px=beam,
-                zero_deg=float(self._text('beam_zero') or 0), zero_motor=zero,
-                del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1],
-                orientation=int(self._text('beam_orientation')))
+            return self._rough_arm()
         except (ValueError, TypeError, KeyError, RuntimeError):
             return None
+
+    def _rough_arm(self):
+        """Step 1 as a nominal arm, None when skipped or not yet measured; malformed input raises."""
+        mode = self.rough_mode.currentData()
+        if mode == 'manual' and self._text('rough_distance'):
+            distance = float(self._text('rough_distance')) / 1000
+        elif mode == 'scan' and self._distance_result is not None:
+            distance = self._distance_result.distance_m
+        else:
+            return None
+        zero = dict(zip(('del', 'nu'), self._frame_motors)).get(self._beam_role()) or self._text('beam_motor')
+        # blank with a measured scan: the pixel the fit found
+        beam = (tuple(float(v) for v in self._text('beam_pixel').split(',')) if self._text('beam_pixel')
+                else self._distance_result.beam_pixel if mode == 'scan' else None)
+        if beam is None:
+            return None
+        mount = tuple(float(v) for v in (self._text('rough_mount') or '0, 0').split(','))
+        if len(mount) != 2:
+            raise ValueError('type the mount tilt and roll as two numbers, e.g. 0, 0')
+        wavelength = self._text('rough_wavelength')
+        return rough_arm_record(
+            distance_m=distance, detector=self._text('beam_detector'),
+            beam_px=beam,
+            zero_deg=float(self._text('beam_zero') or 0), zero_motor=zero,
+            del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1],
+            orientation=int(self._text('beam_orientation')), mount_deg=mount,
+            wavelength_m=float(wavelength) * 1e-10 if wavelength else 1e-10)
 
     def _beam_role(self):
         """The arm circle the direct-beam motor names ("del", "tth", or a motor), by the
@@ -1236,22 +1275,70 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         def go():
             if self.fit is None:
                 raise ValueError('fit the current controls before saving')
-            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Save calibrated geometry',
-                str(self.project_root / 'calibration' / f'multigeometry-{uuid.uuid4().hex[:8]}.json'), 'JSON (*.json)')
-            if not path:
-                return
-            selected = Path(path).resolve()
-            if not selected.is_relative_to(self.project_root):
-                raise ValueError('save the geometry inside the Stitch project')
-            if selected.exists() or xu_partner_path(selected).exists():
-                raise ValueError(f'{selected.name} or {xu_partner_path(selected).name} exists: choose a new name')
-            self._start('save', (self.fit, selected, pair_validation_angles(
-                self.fit, scan_angles=self._scan_angles(), domain=self._typed_domain())))
+            selected = self._save_path()
+            if selected is not None:
+                self._saving = self.fit
+                self._start('save', (self.fit, selected, pair_validation_angles(
+                    self.fit, scan_angles=self._scan_angles(self.fit), domain=self._typed_domain())))
         self._guard(go)
 
-    def _scan_angles(self):
+    def _save_path(self):
+        """The new calibration file the person chooses inside the project, or None."""
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Save calibrated geometry',
+            str(self.project_root / 'calibration' / f'multigeometry-{uuid.uuid4().hex[:8]}.json'), 'JSON (*.json)')
+        if not path:
+            return None
+        selected = Path(path).resolve()
+        if not selected.is_relative_to(self.project_root):
+            raise ValueError('save the geometry inside the Stitch project')
+        if selected.exists() or xu_partner_path(selected).exists():
+            raise ValueError(f'{selected.name} or {xu_partner_path(selected).name} exists: choose a new name')
+        return selected
+
+    def _save_rough(self):
+        """Save step 1's geometry as the calibration pair, without a ring fit."""
+        def go():
+            fit = self._rough_fit()
+            selected = self._save_path()
+            if selected is not None:
+                angles = self._scan_angles(fit)
+                if self.rough_mode.currentData() == 'scan' and self._distance_result is not None:
+                    role = self._beam_role()
+                    angles += [(angle, 0.) if role == 'del' else (0., angle)
+                               for angle in self._distance_result.angles_deg.tolist()]
+                self._saving = fit
+                self._start('save', (fit, selected, pair_validation_angles(
+                    fit, scan_angles=angles, domain=self._typed_domain())))
+        self._guard(go)
+
+    def _rough_fit(self):
+        """Step 1's geometry as a calibration the save job takes; its provenance says it is a
+        direct-beam calibration, not ring-fitted."""
+        from xrd_tools.integrate.stitch_calibration import CalibrationFit
+        record = self._rough_arm()
+        if record is None:
+            raise ValueError('measure or type the distance and the beam pixel first (1 · Geometry)')
+        if not self._text('rough_wavelength'):
+            raise ValueError('type the wavelength to save this geometry as a calibration')
+        delta, nu = self._frame_motors
+        direct = (self._distance_record(self._distance_result)
+                  if self.rough_mode.currentData() == 'scan' and self._distance_result is not None else None)
+        provenance = {
+            'frames': [], 'rms_q_A^-1': None, 'condition_number': None, 'n_points': 0,
+            'distance_seed_m': None, 'distance_bounds_m': None, 'fit_motor_scales': False,
+            'source_motors': {name: motor for name, motor in (('nu_angle', nu), ('del_angle', delta))
+                              if motor is not None},
+            'image_rotation': self.rotation.currentData(), 'direct_beam': direct,
+            'calibration_kind': 'direct_beam_not_ring_fitted',
+            'fixed_mount_deg': [float(v) for v in (self._text('rough_mount') or '0, 0').split(',')],
+            'instrument_geometry': self.geometry_editor.value().to_record(),
+        }
+        return CalibrationFit('multigeometry', {'calibration': record, 'provenance': provenance}, 0.0, 0.0, 0,
+                              'Direct beam: the distance and beam pixel, rotations held; not ring-fitted')
+
+    def _scan_angles(self, fit):
         """(del, nu) of every calibrant-scan frame whose metadata was read, by the fit's motors."""
-        motors = self.fit.asset['provenance']['source_motors']
+        motors = fit.asset['provenance']['source_motors']
         del_motor, nu_motor = motors.get('del_angle'), motors.get('nu_angle')
         return [(values.get(del_motor, 0.) if del_motor else 0., values.get(nu_motor, 0.) if nu_motor else 0.)
                 for _index, values, _energy in self._choices
@@ -1341,7 +1428,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             return
         result = self._distance_result
         self._fields['distance_seed'].setText(f'{result.distance_mm:.12g}')
-        self._distance_provenance = dict(distance_m=result.distance_m,
+        self._distance_provenance = self._distance_record(result)
+        self._show_tab('calibrate')
+
+    @staticmethod
+    def _distance_record(result):
+        """A direct-beam fit's provenance record."""
+        return dict(distance_m=result.distance_m,
             regression_std_m=result.distance_std_m, angle_zero_deg=result.angle_zero_deg,
             pixel_pitch_m=result.pixel_pitch_m, image_shape=list(result.image_shape),
             beam_pixel=list(result.beam_pixel),
@@ -1353,7 +1446,6 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             centres_px=[float(v) if math.isfinite(v) else None for v in result.centres_px],
             residuals_px=[float(v) if math.isfinite(v) else None for v in result.residuals_px],
             uncertainty_policy='conditional_regression_standard_error_not_total_accuracy')
-        self._show_tab('fit')
 
     def _select_next_frame(self, saved):
         """After a saved frame, select the next one still needing a PONI (after it, then from the top)."""
@@ -1481,8 +1573,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     self._fit_instrument = result.asset['provenance'].get('instrument_geometry')
                     self.fit_summary.setPlainText(summary)
                     self.save_button.setEnabled(True)
-                elif kind == 'save':
-                    provenance = self.fit.asset['provenance']
+                elif kind == 'save':  # the ring fit, or the direct-beam geometry (_save_rough)
+                    provenance = self._saving.asset['provenance']
                     self.saved_source_motors = provenance['source_motors']
                     self.saved_instrument_geometry = provenance.get('instrument_geometry')
                     self.saved_image_rotation = provenance['image_rotation']
@@ -1503,7 +1595,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 if kind == 'calibrate' and result is not None:
                     pending = [frame for frame in self.frames if not frame.complete]
                     self.status.setText(f'Frame {result.index} saved. ' + (
-                        'Next: Calibrate selected frame…' if pending else 'All frames calibrated: Fit and save.'))
+                        'Next: Calibrate selected frame…' if pending else 'All frames calibrated: fit them below, then save.'))
                 elif kind == 'save':
                     self.status.setText(saved_pair_text(result))
                     self.calibrationSaved.emit(result.pyfai_path, 'multigeometry')  # once, with both files written

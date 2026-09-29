@@ -147,7 +147,7 @@ def test_modeless_window_exposes_guided_source_controls_and_preserves_session(tm
     source = SourceSpec(tmp_path/'beam', SourceKind.SPEC, options={'scan':'14', 'image_dir':str(tmp_path/'images')})
     dialog.set_source_context(source, image_rotation=180, del_motor='delta', nu_motor='gamma')
     assert not dialog.isModal()
-    assert dialog.tabs.count() == 4
+    assert dialog.tabs.count() == 3  # 3 · Calibrate and fit holds the fit (maintainer, 2026-09-29)
     assert dialog._spec().options['scan'] == '14'
     assert dialog.rotation.currentData() == 180
     assert not dialog.scales.isChecked()
@@ -223,7 +223,7 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     from tests.core.test_calibration_seed import _frame, _record
     dialog = StitchCalibrationDialog(tmp_path)
     assert [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())] == [
-        '1 · Geometry', '2 · Select frames', '3 · Calibrate each frame', '4 · Fit and save']
+        '1 · Geometry', '2 · Select frames', '3 · Calibrate and fit']
     visible = dialog._row_visible
     assert visible('beam_source') and not visible('rough_distance')  # a direct-beam scan by default
     dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))

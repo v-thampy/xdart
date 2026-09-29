@@ -723,8 +723,10 @@ def pair_validation_angles(fit: CalibrationFit, *, scan_angles=(), domain=None, 
     if domain:
         steps = {}
         for column, (name, motor) in enumerate((('del', del_motor), ('nu', nu_motor))):
-            limits = domain.get(name) or [min(a[column] for a in angles), max(a[column] for a in angles)]
-            steps[name] = [0.0] if motor is None else np.linspace(*map(float, limits), grid).tolist()
+            # a circle with no range and no frames (a direct-beam calibration with nu at 0) is held at 0
+            limits = domain.get(name) or ([min(a[column] for a in angles), max(a[column] for a in angles)]
+                                          if angles else None)
+            steps[name] = [0.0] if motor is None or limits is None else np.linspace(*map(float, limits), grid).tolist()
         angles += [(d, n) for d in steps['del'] for n in steps['nu']]
     return list(dict.fromkeys(angles))
 
