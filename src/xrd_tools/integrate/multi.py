@@ -411,30 +411,33 @@ def _gi_frame_sums(integrator, image, angles, gi, bins, npt, *, mask, correct_so
     """One frame's GI cuts as pyFAI's fiber sums, each [signal, normalization × pixel area/dist²,
     count, axis] in ``gi.cuts`` order, accumulated across frames as pyFAI's MultiGeometryFiber does.
 
-    pyFAI's own 1-D fiber cut is the sum of its 2-D q_ip × q_oop histogram over one axis
-    (``integrate_fiber`` sums ``integrate2d_fiber``); with one pair of ranges for both cuts (Int's),
-    the two cuts are the two sums of one histogram, so one pass gives both. ``angles`` are the
-    frame's (incident angle, tilt) in degrees (``StitchGI.pyfai_angles``); ``bins`` each cut's range.
+    pyFAI's own 1-D fiber cut sums its 2-D q_ip × q_oop histogram over one axis. Here each cut is a
+    thin 2-D pass, its own axis in ``npt`` bins and the other coordinate's range in ONE bin, so the
+    scratch is O(npt), not npt² (Codex audit G-F1: an unbounded square), and the sums equal the
+    square's bit for bit. Both passes share one fiber integrator, which keeps its per-pixel
+    coordinates. ``angles`` are the frame's (incident angle, tilt) in degrees
+    (``StitchGI.pyfai_angles``); ``bins`` both coordinates' ranges.
     """
     from xrd_tools.integrate.gid import _effective_gi_params, _fiber_from_integrator
     incidence, tilt = angles
     fiber = _fiber_from_integrator(integrator, incident_angle=incidence, tilt_angle=tilt,
                                    sample_orientation=gi.sample_orientation)
     angle, tilt, orientation = _effective_gi_params(fiber, None, None, None)
-    result = fiber.integrate2d_fiber(
-        image, npt_ip=npt, unit_ip="qip_A^-1", ip_range=bins["q_ip"], npt_oop=npt, unit_oop="qoop_A^-1",
-        oop_range=bins["q_oop"], correctSolidAngle=correct_solid_angle, mask=mask,
-        polarization_factor=polarization_factor, dark=dark, flat=flat,
-        method=("no", "histogram", "cython"), normalization_factor=monitor,
-        incident_angle=angle, tilt_angle=tilt, sample_orientation=orientation)
     scale = fiber.pixel1 * fiber.pixel2 / fiber.dist ** 2 if correct_solid_angle else 1.0
     sums = []
-    for cut in gi.cuts:  # as integrate_fiber: q_ip sums over q_oop (axis −2), q_oop over q_ip (−1)
-        axis = -2 if cut == "q_ip" else -1
+    for cut in gi.cuts:
+        in_plane = cut == "q_ip"
+        result = fiber.integrate2d_fiber(
+            image, npt_ip=npt if in_plane else 1, unit_ip="qip_A^-1", ip_range=bins["q_ip"],
+            npt_oop=1 if in_plane else npt, unit_oop="qoop_A^-1", oop_range=bins["q_oop"],
+            correctSolidAngle=correct_solid_angle, mask=mask, polarization_factor=polarization_factor,
+            dark=dark, flat=flat, method=("no", "histogram", "cython"), normalization_factor=monitor,
+            incident_angle=angle, tilt_angle=tilt, sample_orientation=orientation)
+        axis = -2 if in_plane else -1  # the other coordinate's one bin, as integrate_fiber sums
         sums.append([np.asarray(result.sum_signal, dtype=np.float64).sum(axis=axis),
                      np.asarray(result._sum_normalization, dtype=np.float64).sum(axis=axis) * scale,
                      np.asarray(result.count, dtype=np.float64).sum(axis=axis),
-                     np.asarray(result.inplane if cut == "q_ip" else result.outofplane, dtype=np.float64)])
+                     np.asarray(result.inplane if in_plane else result.outofplane, dtype=np.float64)])
     return tuple(sums)
 
 

@@ -835,3 +835,32 @@ def test_an_auto_gi_range_windows_every_pixel_as_a_covering_one_does():
         assert auto_diagnostics.coverage.sum() > 0
         np.testing.assert_array_equal(auto_diagnostics.coverage, wide_diagnostics.coverage)
         np.testing.assert_array_equal(auto.intensity, wide.intensity)
+
+
+def test_a_gi_cuts_scratch_grows_with_its_points_not_their_square():
+    """Codex audit G-F1: each cut is a thin pass (its axis in npt bins, the other coordinate in one),
+    so a frame's working memory stays O(npt); the square npt × npt histogram grew 12× from 160 to
+    640 points (1.7 → 21.6 MB traced on a 48 × 60 detector)."""
+    import gc
+    import tracemalloc
+    import numpy as np
+    from pyFAI.detectors import Detector
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+    from xrd_tools.integrate.multi import _gi_frame_sums
+    from xrd_tools.integrate.stitch_gi import StitchGI
+    image = np.full((48, 60), 100.)
+    gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.2, ip_range=(-1., 1.), oop_range=(-1., 1.))
+    peaks = {}
+    for npt in (160, 640):
+        integrator = AzimuthalIntegrator(dist=.2, poni1=21.1 * 75e-6, poni2=30.3 * 75e-6, rot1=.02, rot2=.05,
+                                         rot3=.01, wavelength=1e-10,
+                                         detector=Detector(pixel1=75e-6, pixel2=75e-6, max_shape=image.shape))
+        gc.collect()
+        tracemalloc.start()
+        sums = _gi_frame_sums(integrator, image, (.2, 0.), gi, {"q_ip": (-1., 1.), "q_oop": (-1., 1.)}, npt,
+                              mask=None, correct_solid_angle=True, polarization_factor=None, dark=None, flat=None,
+                              monitor=1.)
+        peaks[npt] = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        assert [len(values[0]) for values in sums] == [npt, npt]
+    assert peaks[640] < 2 * peaks[160], peaks  # O(npt): the square grew 12x
