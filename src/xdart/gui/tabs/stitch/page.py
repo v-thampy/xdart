@@ -169,6 +169,7 @@ class StitchPage(QtWidgets.QWidget):
         self._services = services
         self._owner = StitchToolOwner()
         self._source_paths = ()
+        self._source_shown = ""  # the source box's display of the selection ("3 files selected")
         self._paths_by_kind = {}
         self._range_rows = []
         self._range_keys = set()
@@ -582,27 +583,40 @@ class StitchPage(QtWidgets.QWidget):
         self._edited()
 
     def set_sources(self, paths):
+        self._adopt_sources(paths)
+        count = len(self._source_paths)
+        self._source_shown = "" if not count else self._source_paths[0] if count == 1 else f"{count} files selected"
+        field = replace(self._fields["spec_path"], value=self._source_shown)
+        self._fields["spec_path"] = field
+        self._rows["spec_path"].apply_field(field)
+        self._show_source_tip()
+        self._edited()
+
+    def _source_path_edited(self, _path, value):
+        """A committed edit of the source box. Only a typed path is a selection: the box's own
+        display of the current one ("3 files selected") is not a path, and an empty box is no
+        source (Codex R19-F1: it kept the previous one, and Run stayed ready)."""
+        text = str(value or "").strip()
+        if text == self._source_shown:
+            return
+        self._adopt_sources((text,) if text else ())
+        self._source_shown = text
+        self._show_source_tip()
+        self._edited()  # the row's own edit signal refreshed readiness before the selection changed
+
+    def _adopt_sources(self, paths):
+        """The selection Run, Preview and the saved settings use, with what depends on it."""
         self._auto_threshold_max = None
         if not self._threshold_manual:
             self._fields["threshold"] = replace(self._fields["threshold"], value=None)
             self._render_ranges()
         self._source_paths = tuple(str(path) for path in paths)
         self._paths_by_kind[self._value("source_kind")] = self._source_paths
-        shown = self._source_paths[0] if len(self._source_paths) == 1 else f"{len(self._source_paths)} files selected"
-        field = replace(self._fields["spec_path"], value=shown)
-        self._fields["spec_path"] = field
-        self._rows["spec_path"].apply_field(field)
-        self._rows["spec_path"].setToolTip("\n".join(self._source_paths))
-        self._edited()
 
-    def _source_path_edited(self, _path, value):
-        if str(value) and not str(value).endswith("files selected"):
-            self._auto_threshold_max = None
-            if not self._threshold_manual:
-                self._fields["threshold"] = replace(self._fields["threshold"], value=None)
-                self._render_ranges()
-            self._source_paths = (str(value),)
-            self._paths_by_kind[self._value("source_kind")] = self._source_paths
+    def _show_source_tip(self):
+        row = self._rows["spec_path"]
+        for widget in (row, row.editor, row.label):
+            widget.setToolTip("\n".join(self._source_paths))
 
     def _source_changed(self, *_args):
         kind = self._value("source_kind")

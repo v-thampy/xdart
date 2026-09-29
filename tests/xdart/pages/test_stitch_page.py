@@ -217,6 +217,66 @@ def test_native_source_controls_ranges_and_threshold_semantics(qapp, tmp_path):
         page.shutdown()
 
 
+def _commit_source_box(page, qapp, text, *, key="Tab"):
+    """Edit the source box as a user does: select all, type (or Backspace), commit with Tab/Return."""
+    from PySide6.QtTest import QTest
+    from pyqtgraph.Qt import QtCore
+    editor = page._rows["spec_path"].editor
+    editor.setFocus()
+    qapp.processEvents()
+    editor.selectAll()
+    if text:
+        QTest.keyClicks(editor, text)
+    elif text == "":
+        QTest.keyClick(editor, QtCore.Qt.Key.Key_Backspace)
+    QTest.keyClick(editor, getattr(QtCore.Qt.Key, f"Key_{key}"))
+    qapp.processEvents()
+
+
+def test_clearing_the_source_box_clears_the_selection_and_refuses_run(qapp, tmp_path):
+    """Codex R19-F1: an emptied source box kept the previous source, which Run, Preview and the
+    saved settings still used, with Run ready. Clearing it empties the selection (SPEC, NeXus,
+    Directory), drops a prepared plan and the tooltip; a typed path is the selection at once."""
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    page = StitchPage(empty_host_services(_Status()))
+    page.show()
+    try:
+        page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        page.preview_button.click()
+        _wait(page, qapp)
+        assert page._prepared_revision == page._revision and page.run_bar.startButton.isEnabled()
+        page.preview_dialog.close()
+        page.activateWindow()
+        spec, row = page._source_paths, page._rows["spec_path"]
+        _commit_source_box(page, qapp, "")
+        assert row.current_value() == "" and row.editor.text() == ""
+        assert page._source_paths == () and "Spec" not in page.settings()["sources"]
+        assert page._prepared_revision is None and not page._queued_jobs
+        assert not page.run_bar.startButton.isEnabled()
+        assert page.run_bar.readinessLabel.full_text() == "Choose sources and scans"
+        assert all(not widget.toolTip() for widget in (row, row.editor, row.label))
+        page.preview_button.click()  # nothing is checked without a source
+        assert "source path" in page.run_bar.readinessLabel.full_text() and not page._owner.busy
+        # a typed path is the selection, and the readiness line follows it at once
+        _commit_source_box(page, qapp, spec[0], key="Return")
+        assert page._source_paths == spec and page.settings()["sources"]["Spec"] == list(spec)
+        assert page.run_bar.readinessLabel.full_text().startswith("Ready · Stitch 1D · 1 SPEC file")
+        assert page.run_bar.startButton.isEnabled() and row.toolTip() == spec[0]
+        for kind, paths in (("NeXus", (str(tmp_path / "one.nxs"), str(tmp_path / "two.nxs"))),
+                            ("Directory", (str(tmp_path),))):
+            page.set_field("source_kind", kind)
+            page.set_sources(paths)
+            _commit_source_box(page, qapp, None, key="Return")  # its own display is not a path
+            assert page.build_form().source_selection.paths == paths
+            _commit_source_box(page, qapp, "")
+            assert page._source_paths == () and kind not in page.settings()["sources"]
+            with pytest.raises(ValueError, match="source path"):
+                page.build_form()
+            assert not page.run_bar.startButton.isEnabled()
+    finally:
+        page.shutdown()
+
+
 @pytest.mark.parametrize("dtype", ("int32", "uint32"))
 def test_native_minimum_only_threshold_edit_excludes_native_ceiling(qapp, tmp_path, dtype):
     from tests.xdart.tools.test_stitch_native_values import _native_form
