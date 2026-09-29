@@ -279,3 +279,62 @@ def test_calibration_refuses_same_count_missing_interior_raw_frame(tmp_path):
         'read_image_kwargs': {'detector_shape': (2, 3), 'raw_dtype': 'uint16'}})
     with pytest.raises(ValueError, match='number'):
         source_frame_choices(spec, ('th', 'chi'))
+
+
+def test_a_saved_fit_writes_its_xrayutilities_partner_bound_by_hash(tmp_path):
+    """Always both (maintainer, 2026-09-29): the pyFAI file, then its xrayutilities partner beside it,
+    checked on the calibrant frames, the scan's frames and the typed range, and bound to the pyFAI bytes."""
+    from tests.core.test_stacked_arm import _independent_stacked_controls
+    from xrd_tools.analysis.xu_stitch_calibration import XuStitchCalibrationInput, capture_xu_stitch_calibration
+    from xrd_tools.integrate.stitch_calibration import (
+        pair_validation_angles, paired_xu_calibration, save_calibration_pair,
+    )
+    controls, calibration = _independent_stacked_controls()
+    frames = _frames(tmp_path, controls, calibration.poni)
+    fit = fit_calibration(frames, distance_bounds_m=(.37, .41))
+    domain = {'del': [5., 42.], 'nu': [-11., 17.]}
+    angles = pair_validation_angles(fit, scan_angles=[(10., 0.), (30., 12.), (6., -10.)], domain=domain)
+    assert len(angles) == 5 + 2 + 49  # the calibrant frames, two more scan frames (one repeats), the grid
+    saved = save_calibration_pair(fit, tmp_path / 'calibration' / 'arm.json', validation_angles=angles)
+    assert Path(saved.xu_path).name == 'arm.xu.json' and saved.xu_refusal == ''
+    assert saved.xu_transfer['method'] == 'formula' and saved.xu_transfer['validation_frames'] == len(angles)
+    asset = json.loads(Path(saved.xu_path).read_text())
+    assert asset['version'] == 3 and asset['validation']['validated_scan_domain_source_deg'] == domain
+    provenance = json.loads(Path(saved.xu_path + '.provenance.json').read_text())
+    assert provenance['pyfai_calibration'] == {'file': 'arm.json', 'sha256': _digest(Path(saved.pyfai_path))}
+    assert paired_xu_calibration(saved.pyfai_path) == Path(saved.xu_path)
+    capture_xu_stitch_calibration(XuStitchCalibrationInput(Path(saved.xu_path)), project_root=tmp_path)
+    Path(saved.pyfai_path).write_text(Path(saved.pyfai_path).read_text() + '\n')  # other bytes: not its pair
+    with pytest.raises(ValueError, match='arm.xu.json was not made from this arm.json'):
+        paired_xu_calibration(saved.pyfai_path)
+    (tmp_path / 'calibration' / 'taken.xu.json').write_text('{}')
+    with pytest.raises(FileExistsError):  # the partner's name is taken: nothing is written
+        save_calibration_pair(fit, tmp_path / 'calibration' / 'taken.json', validation_angles=angles)
+    assert not (tmp_path / 'calibration' / 'taken.json').exists()
+
+
+def test_a_fit_xrayutilities_cannot_express_saves_the_pyfai_file_alone(tmp_path):
+    from tests.core.test_stacked_arm import _independent_stacked_controls
+    from xrd_tools.integrate.stitch_calibration import paired_xu_calibration, save_calibration_pair
+    controls, calibration = _independent_stacked_controls()
+    fit = fit_calibration(_frames(tmp_path, controls, calibration.poni), fit_scales=True)
+    saved = save_calibration_pair(fit, tmp_path / 'calibration' / 'scaled.json',
+                                  validation_angles=[(6., -10.), (15., 3.), (25., 6.)])
+    assert Path(saved.pyfai_path).is_file() and saved.xu_path is None
+    assert 'motor scales' in saved.xu_refusal and not (tmp_path / 'calibration' / 'scaled.xu.json').exists()
+    with pytest.raises(ValueError, match='scaled.json has no xrayutilities partner .scaled.xu.json.: save'):
+        paired_xu_calibration(saved.pyfai_path)
+
+
+@pytest.mark.parametrize('held', ['nu', 'del'])
+def test_a_single_arms_partner_is_checked_with_its_held_circle_at_zero(held):
+    from xrd_tools.integrate.stitch_calibration import CalibrationFit, pair_validation_angles
+    motors = {'del_angle': 'del'} if held == 'nu' else {'nu_angle': 'tth'}
+    moving = 'del' if held == 'nu' else 'tth'
+    fit = CalibrationFit('multigeometry', {'calibration': {}, 'provenance': {
+        'source_motors': motors, 'frames': [{'motors': {moving: 10., 'other': 3.}}, {'motors': {moving: 20.}}]}},
+        0., 1., 1, '')
+    angles = pair_validation_angles(fit, scan_angles=[(30., 7.)], domain={'del': [0., 40.], 'nu': [0., 40.]}, grid=3)
+    expected = ([(10., 0.), (20., 0.), (30., 0.), (0., 0.), (40., 0.)] if held == 'nu'
+                else [(0., 10.), (0., 20.), (0., 7.), (0., 0.), (0., 40.)])
+    assert angles == expected

@@ -662,3 +662,93 @@ def save_calibration_fit(fit: CalibrationFit, path):
     with provenance.open('x') as stream:
         json.dump(fit.asset['provenance'], stream, indent=2, allow_nan=False)
     return str(path)
+
+
+def xu_partner_path(path) -> Path:
+    """Where a pyFAI calibration's xrayutilities partner is saved: ``<name>.xu.json`` beside it."""
+    path = Path(path)
+    return path.with_name(f'{path.stem}.xu{path.suffix or ".json"}')
+
+
+def pair_validation_angles(fit: CalibrationFit, *, scan_angles=(), domain=None, grid=7):
+    """The (del, nu) circle angles an xrayutilities partner is checked on, a held circle at 0.
+
+    The calibrant frames the fit used, every scan frame whose angles are given (``scan_angles``,
+    (del, nu) pairs) and a ``grid`` × ``grid`` grid over ``domain`` ({'del': [lo, hi], 'nu': [lo, hi]},
+    the range the calibration is to serve). The partner is admitted only where it was checked.
+    """
+    motors = fit.asset['provenance']['source_motors']
+    del_motor, nu_motor = motors.get('del_angle'), motors.get('nu_angle')
+
+    def circle(values, motor):
+        return 0.0 if motor is None else float(values[motor])
+    angles = [(circle(frame['motors'], del_motor), circle(frame['motors'], nu_motor))
+              for frame in fit.asset['provenance']['frames']]
+    angles += [(0.0 if del_motor is None else float(d), 0.0 if nu_motor is None else float(n)) for d, n in scan_angles]
+    if domain:
+        steps = {name: [0.0] if motor is None else np.linspace(*map(float, domain[name]), grid).tolist()
+                 for name, motor in (('del', del_motor), ('nu', nu_motor))}
+        angles += [(d, n) for d in steps['del'] for n in steps['nu']]
+    return list(dict.fromkeys(angles))
+
+
+@dataclass(frozen=True)
+class SavedCalibration:
+    """A saved pyFAI calibration and its xrayutilities partner, or why it has none."""
+    pyfai_path: str
+    xu_path: str | None
+    xu_refusal: str = ''
+    xu_transfer: dict | None = None
+
+
+def save_calibration_pair(fit: CalibrationFit, path, *, validation_angles, cancelled=None,
+                          progress=None) -> SavedCalibration:
+    """Save a pyFAI fit and its xrayutilities partner beside it (``xu_partner_path``).
+
+    The pyFAI file is saved first and stays saved when the transfer is refused (fitted
+    motor scales, another detector orientation, parallax or a sensor model), fails its
+    gates or is cancelled: ``xu_refusal`` says why. The partner's provenance records the
+    pyFAI file's SHA-256, which binds the pair (``paired_xu_calibration``).
+    """
+    from xrd_tools.integrate.xu_transfer import XuTransferRefused, transfer_arm_to_xu
+    if fit.backend != 'multigeometry':
+        raise ValueError('a calibration pair starts from a pyFAI fit')
+    partner = xu_partner_path(Path(path).resolve())
+    if partner.exists() or partner.with_suffix(partner.suffix + '.provenance.json').exists():
+        raise FileExistsError('choose a new calibration filename; existing files are preserved')
+    saved = save_calibration_fit(fit, path)
+    provenance = fit.asset['provenance']
+    del_motor, nu_motor = (provenance['source_motors'].get(name) for name in ('del_angle', 'nu_angle'))
+    try:
+        asset, transfer = transfer_arm_to_xu(
+            fit.asset['calibration'], validation_angles=validation_angles, source_motors=(del_motor, nu_motor),
+            image_rotation=provenance['image_rotation'], cancelled=cancelled, progress=progress)
+    except XuTransferRefused as refusal:
+        return SavedCalibration(saved, None, f'no xrayutilities file: {refusal}')
+    except InterruptedError:
+        return SavedCalibration(saved, None, 'no xrayutilities file: cancelled; save again to make it')
+    xu_provenance = {**provenance, 'source_motors': {'del': del_motor, 'nu': nu_motor}, 'xu_transfer': transfer,
+                     'pyfai_calibration': {'file': Path(saved).name, 'sha256': _sha(saved)}}
+    xu_saved = save_calibration_fit(CalibrationFit('xu_hist', {'calibration': asset, 'provenance': xu_provenance},
+                                                   fit.rms_q, fit.condition_number, fit.n_points, fit.message),
+                                    partner)
+    return SavedCalibration(saved, xu_saved, '', transfer)
+
+
+def paired_xu_calibration(path) -> Path:
+    """The xrayutilities partner saved with this pyFAI calibration, checked against its bytes.
+
+    Raises ValueError, saying what to do, when there is none or it was made from other bytes.
+    """
+    path = Path(path).resolve()
+    partner = xu_partner_path(path)
+    advice = ('save the calibration again from the Calibration window, which writes both files '
+              '(a fit with motor scales, detector orientation 1/2/4 or a sensor model has no xrayutilities file)')
+    try:
+        provenance = json.loads(partner.with_suffix(partner.suffix + '.provenance.json').read_text(encoding='utf-8'))
+        recorded = provenance['pyfai_calibration']['sha256']
+    except (OSError, ValueError, KeyError, TypeError):
+        raise ValueError(f'{path.name} has no xrayutilities partner ({partner.name}): {advice}') from None
+    if not partner.is_file() or recorded != _sha(path):
+        raise ValueError(f'{partner.name} was not made from this {path.name}: {advice}')
+    return partner
