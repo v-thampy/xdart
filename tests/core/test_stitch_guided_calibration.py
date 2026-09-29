@@ -363,3 +363,16 @@ def test_the_automatic_arm_model_takes_the_extension_when_it_applies_and_says_wh
     assert provenance['arm_model'] == 'stacked' and 'poorly determined' in provenance['arm_model_reason']
     assert fit.message.endswith('five-parameter arm: the detector mount and sample offset were refused: '
                                 'arm extension is poorly determined; add frames spanning nu and del')
+
+
+def test_stitch_with_xrayutilities_reads_an_xu_file_itself_and_a_pyfai_files_partner(tmp_path):
+    from tests.core.test_stacked_arm import _independent_stacked_controls
+    from xrd_tools.integrate.stitch_calibration import save_calibration_pair, xu_calibration_path
+    controls, calibration = _independent_stacked_controls()
+    fit = fit_calibration(_frames(tmp_path, controls, calibration.poni), distance_bounds_m=(.37, .41))
+    saved = save_calibration_pair(fit, tmp_path / 'calibration' / 'arm.json',
+                                  validation_angles=[(6., -10.), (15., 3.), (25., 6.)])
+    assert xu_calibration_path(saved.pyfai_path) == Path(saved.xu_path)
+    assert xu_calibration_path('calibration/arm.json', tmp_path) == Path(saved.xu_path)  # the project's
+    assert xu_calibration_path(saved.xu_path) == Path(saved.xu_path)  # an xrayutilities file is read as is
+    assert xu_calibration_path('calibration/none.json', tmp_path) == Path('calibration/none.json')

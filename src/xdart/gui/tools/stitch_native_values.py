@@ -176,8 +176,9 @@ def prepare_native_stitch_tool(form, project):
         motors = tuple(source for _name, source in form.source_motors)
         energy_name = "energy"
     else:
-        calibration = capture_xu_stitch_calibration(
-            XuStitchCalibrationInput(form.geometry_path), project_root=project)
+        from xrd_tools.integrate.stitch_calibration import xu_calibration_path
+        calibration = capture_xu_stitch_calibration(  # a pyFAI file's partner, saved beside it
+            XuStitchCalibrationInput(xu_calibration_path(form.geometry_path, project)), project_root=project)
         runtime_owner = xu_runtime_session()
         with runtime_owner as session:
             effective = resolve_xu_stitch_effective_geometry(calibration, session).projection

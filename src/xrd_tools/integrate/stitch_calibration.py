@@ -789,3 +789,21 @@ def paired_xu_calibration(path) -> Path:
     if not partner.is_file() or recorded != _sha(path):
         raise ValueError(f'{partner.name} was not made from this {path.name}: {advice}')
     return partner
+
+
+def xu_calibration_path(path, project_root=None):
+    """What Stitch with xrayutilities reads for this Calibration: the file itself when it is an
+    xrayutilities asset (an XU-only calibration), else the partner saved beside a pyFAI goniometer
+    JSON (``paired_xu_calibration``, which says what to do when there is none). A relative path is
+    the project's."""
+    given = Path(path)
+    file = given if given.is_absolute() or project_root is None else Path(project_root) / given
+    try:
+        if file.stat().st_size > 1 << 20:
+            return given  # no calibration JSON: the XU admission refuses it with its reason
+        record = json.loads(file.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return given
+    if isinstance(record, dict) and 'trans_function' in record:  # a pyFAI goniometer JSON
+        return paired_xu_calibration(file)
+    return given

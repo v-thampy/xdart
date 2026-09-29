@@ -232,6 +232,7 @@ def test_a_twoc_arms_xrayutilities_file_covers_the_typed_range_with_nu_at_zero(q
         dialog._fields['del_domain'].setText('0, 50')  # the typed range covers 2θ; nu stays at zero
         dialog.fit_button.click()
         _wait(dialog)
+        page.set_field("backend", "xrayutilities histogram")
         target = (tmp_path / 'calibration' / 'twoc.json').resolve()
         _save_to(monkeypatch, target)
         dialog.save_button.click()
@@ -239,6 +240,14 @@ def test_a_twoc_arms_xrayutilities_file_covers_the_typed_range_with_nu_at_zero(q
         asset = json.loads((tmp_path / 'calibration' / 'twoc.xu.json').read_text())
         assert asset['version'] == 3 and asset['acquisition']['source_motors'] == {'del': 'tth', 'nu': None}
         assert asset['validation']['validated_scan_domain_source_deg'] == {'del': [0., 50.], 'nu': [0., 0.]}
+        # adoption keeps the backend; the Calibration names the pyFAI file, xrayutilities reads its partner
+        assert page._value("backend") == "xrayutilities histogram"
+        assert Path(page._value("geometry_path")) == target
+        assert 'twoc.xu.json' in page._rows["geometry_path"].toolTip()
+        assert page._value("source_motors") == "del=tth"
+        assert page._arm_problem() is None
+        page._set_instrument(InstrumentGeometry('psic'))  # psic's nu moves
+        assert 'nu held at zero' in page._arm_problem()
     finally:
         dialog.close()
         page.shutdown()
@@ -256,6 +265,7 @@ def test_a_horizontal_twoc_arms_xrayutilities_file_covers_the_typed_range_with_d
         dialog._fields['nu_domain'].setText('0, 50')  # the typed range covers 2θ; del stays at zero
         dialog.fit_button.click()
         _wait(dialog)
+        page.set_field("backend", "xrayutilities histogram")
         target = (tmp_path / 'calibration' / 'twoc-horizontal.json').resolve()
         _save_to(monkeypatch, target)
         dialog.save_button.click()
@@ -263,6 +273,11 @@ def test_a_horizontal_twoc_arms_xrayutilities_file_covers_the_typed_range_with_d
         asset = json.loads((tmp_path / 'calibration' / 'twoc-horizontal.xu.json').read_text())
         assert asset['acquisition']['source_motors'] == {'del': None, 'nu': 'tth'}
         assert asset['validation']['validated_scan_domain_source_deg'] == {'del': [0., 0.], 'nu': [0., 50.]}
+        assert page._value("backend") == "xrayutilities histogram"
+        assert page._value("source_motors") == "nu=tth"
+        assert page._arm_problem() is None
+        page._set_instrument(InstrumentGeometry('twoc'))  # the vertical plane cannot take it
+        assert 'Choose the horizontal scattering plane' in page._arm_problem()
     finally:
         dialog.close()
         page.shutdown()

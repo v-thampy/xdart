@@ -408,3 +408,36 @@ def test_a_single_arm_xu_calibration_reads_only_its_2theta_motor(tmp_path, held)
     assert {name for item in request.manifest.contributions for name, _o, _v in item.values} == {"del"}
     result = run_stitch_operation(request)
     assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+
+
+def test_an_xu_stitch_reads_the_partner_saved_beside_a_pyfai_calibration(tmp_path):
+    """Always both (maintainer, 2026-09-29): Backend xrayutilities with the Calibration's pyFAI file
+    reads the xrayutilities file saved with it; a pyFAI file saved alone (as the fits before, e.g. the
+    −0.87° test calibration) is refused with what to do."""
+    import hashlib
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    from xrd_tools.core.geometry import DetectorCalibration
+    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
+    from xrd_tools.integrate.stitch_calibration import CalibrationFit, save_calibration_fit, save_calibration_pair
+    form = _native_form(tmp_path, "xu_hist", scans="1")
+    calibration = DetectorCalibration(PONI(dist=.39, poni1=.02, poni2=.04, detector="Pilatus300kw",
+                                           wavelength=energy_eV_to_wavelength_m(17000.018)),
+                                      detector_config={"orientation": 3})
+    record = StackedDetectorArm(nu_motor="nu", del_motor="del", nu_offset=.01,
+                                del_offset=-.02).to_pyfai_goniometer(calibration)
+    record["detector_config"] = {"orientation": 3}
+    fit = CalibrationFit("multigeometry", {"calibration": record, "provenance": {
+        "source_motors": {"del_angle": "del", "nu_angle": "nu"}, "image_rotation": 0, "frames": []}},
+        1e-3, 10., 100, "")
+    saved = save_calibration_pair(fit, tmp_path / "calibration" / "arm.json",
+                                  validation_angles=[(12., -12.), (14., -10.), (17., -8.)])
+    prepared = prepare_stitch_tool(replace(form, geometry_path=Path(saved.pyfai_path)))
+    receipt = prepared.requests[0].plan.calibration
+    assert receipt.raw_sha256 == hashlib.sha256(Path(saved.xu_path).read_bytes()).hexdigest()
+    result = run_stitch_operation(prepared.requests[0])
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    alone = save_calibration_fit(fit, tmp_path / "calibration" / "alone.json")
+    with pytest.raises(ValueError, match=r"alone.json has no xrayutilities partner \(alone.xu.json\): save"):
+        prepare_stitch_tool(replace(form, geometry_path=Path(alone)))

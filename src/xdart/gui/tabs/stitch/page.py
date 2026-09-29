@@ -388,8 +388,6 @@ class StitchPage(QtWidgets.QWidget):
         self._field(project, SectionId.PROJECT, "project_root", "Folder", browse=True)
         self._rows["project_root"].valueChanged.connect(self._refresh_xu_geometry)
         self._field(project, SectionId.PROJECT, "output_path", "Save Path", browse=True)
-        self._field(experiment, SectionId.EXPERIMENT, "backend", "Backend",
-                    "pyFAI MultiGeometry", choices=("pyFAI MultiGeometry", "xrayutilities histogram"))
         authoring = QtWidgets.QWidget()
         authoring_layout = QtWidgets.QHBoxLayout(authoring)
         authoring_layout.setContentsMargins(0, 0, 0, 0)
@@ -403,7 +401,6 @@ class StitchPage(QtWidgets.QWidget):
         self._field(experiment, SectionId.EXPERIMENT, "geometry_path", "Calibration", browse=True)
         self._rows["geometry_path"].valueChanged.connect(self._refresh_xu_geometry)
         self._field(experiment, SectionId.EXPERIMENT, "mask_path", "Mask File", browse=True)
-        self._rows["backend"].valueChanged.connect(self._backend_changed)
         self._field(source, SectionId.SOURCE, "source_kind", "Source", "Spec",
                     choices=("Spec", "NeXus", "Directory"))
         self._field(source, SectionId.SOURCE, "spec_path", "SPEC files", browse=True)
@@ -421,6 +418,15 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["source_kind"].valueChanged.connect(self._source_changed)
         self._rows["scan_mode"].valueChanged.connect(self._source_changed)
         self._rows["spec_path"].valueChanged.connect(self._source_path_edited)
+        # A calibration serves both backends (its xrayutilities file is saved beside it), so the
+        # backend is a processing choice (maintainer, 2026-09-29).
+        self._field(processing, SectionId.PROCESSING, "backend", "Backend",
+                    "pyFAI MultiGeometry", choices=("pyFAI MultiGeometry", "xrayutilities histogram"))
+        self._rows["backend"].setToolTip(
+            "pyFAI MultiGeometry reads the Calibration's pyFAI file; xrayutilities histogram reads the "
+            "xrayutilities file saved beside it (<name>.xu.json), or an xrayutilities calibration chosen "
+            "directly.")
+        self._rows["backend"].valueChanged.connect(self._backend_changed)
         grid = SubsectionCard("1-D", accent="processing")
         processing.add_row(grid)
         axis = self._field(grid, SectionId.PROCESSING, "unit", "Axis", "Q (Å⁻¹)", choices=("Q (Å⁻¹)", "2θ (°)"))
@@ -732,10 +738,9 @@ class StitchPage(QtWidgets.QWidget):
         calibration = str(value("geometry_path") or "").strip()
         mask = str(value("mask_path") or "").strip()
         experiment_ready = bool(calibration) and Path(calibration).is_file() and (not mask or Path(mask).is_file())
-        arm_problem = self._arm_problem() if experiment_ready else None
-        experiment_ready = experiment_ready and arm_problem is None
         xu = value("backend") == "xrayutilities histogram"
-        self.controls.experiment_card.set_status_text("xrayutilities" if xu else "multigeometry")
+        arm_problem = (self._calibration_pair(calibration, xu) or self._arm_problem()) if experiment_ready else None
+        experiment_ready = experiment_ready and arm_problem is None
         present = bool(sources) and all(path.exists() for path in sources)
         try:
             groups = len(parse_stitch_scan_groups(scans)) if kind == "Spec" and value("scan_mode") != "Stitch All" else None
@@ -752,7 +757,7 @@ class StitchPage(QtWidgets.QWidget):
             processing_ready = int(str(value("npt_1d"))) > 0
         except ValueError:
             processing_ready = False
-        self.controls.processing_card.set_status_text("stitch 1d")
+        self.controls.processing_card.set_status_text("stitch 1d · " + ("xrayutilities" if xu else "multigeometry"))
         checks = ((self.controls.project_card, project_ready, "Choose an existing Project folder"),
                   (self.controls.experiment_card, experiment_ready,
                    arm_problem or "Choose an existing calibration (and mask)"),
@@ -835,6 +840,24 @@ class StitchPage(QtWidgets.QWidget):
             self._status(str(error), ready=False)
             return
         self._adopt_mapping(pairs)
+
+    def _calibration_pair(self, calibration, xu):
+        """Name the Calibration's files on its row; return why Backend xrayutilities cannot use
+        it (a pyFAI file with no partner made from it), else None."""
+        from xrd_tools.integrate.stitch_calibration import xu_calibration_path, xu_partner_path
+        path = Path(calibration)
+        if _goniometer_record(path) is None:  # an xrayutilities calibration, or a PONI
+            self._rows["geometry_path"].setToolTip("")
+            return None
+        try:
+            partner = xu_calibration_path(path, self._value("project_root") or None)
+        except ValueError as error:
+            self._rows["geometry_path"].setToolTip(
+                f"pyFAI MultiGeometry reads {path.name}; it has no xrayutilities file ({xu_partner_path(path).name}).")
+            return str(error) if xu else None
+        self._rows["geometry_path"].setToolTip(
+            f"pyFAI MultiGeometry reads {path.name}; xrayutilities histogram reads {Path(partner).name}, saved with it.")
+        return None
 
     def _arm_problem(self):
         """Why the calibration cannot drive the Geometry's detector arm (None when it can):
@@ -927,9 +950,11 @@ class StitchPage(QtWidgets.QWidget):
         )
         try:
             if calibration is None:
+                from xrd_tools.integrate.stitch_calibration import xu_calibration_path
+                project = Path(self._value("project_root"))
                 calibration = capture_xu_stitch_calibration(
-                    XuStitchCalibrationInput(self._value("geometry_path")),
-                    project_root=Path(self._value("project_root")))
+                    XuStitchCalibrationInput(xu_calibration_path(self._value("geometry_path"), project)),
+                    project_root=project)
             acquisition = calibration.projection.value["acquisition"]
         except (ValueError, TypeError, OSError):
             values = {"source_motors": "", "image_rotation": ""}
@@ -1467,7 +1492,6 @@ class StitchPage(QtWidgets.QWidget):
         if self._closing or self._calibration_project != str(self._value("project_root")):
             self._status(f"Calibration saved: {path} · Project changed; select the calibration to use it")
             return
-        self.set_field("backend", "xrayutilities histogram" if backend == "xu_hist" else "pyFAI MultiGeometry")
         self.set_field("geometry_kind", "Goniometer JSON")
         self.set_field("geometry_path", path)
         dialog = self._calibration_dialog
@@ -1479,6 +1503,9 @@ class StitchPage(QtWidgets.QWidget):
                 fitted = None
             if fitted is not None and fitted != self._instrument():
                 self._set_instrument(fitted)
+            if self._value("backend") == "xrayutilities histogram":  # the partner owns its mapping
+                self._refresh_xu_geometry()
+                return
             self._adopt_mapping(tuple(dialog.saved_source_motors.items()))
             self._sync_goniometer_mapping()
             self.set_field("image_rotation", dialog.saved_image_rotation)

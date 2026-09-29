@@ -575,3 +575,26 @@ def test_the_stitch_display_is_ints_scientific_view(qapp):
             int_view.deleteLater()
     finally:
         _close(page, qapp)
+
+
+def test_backend_is_a_processing_choice_and_a_missing_partner_is_named(qapp, tmp_path):
+    """Maintainer, 2026-09-29: one calibration serves both backends, so Backend sits under
+    Processing; a pyFAI file with no xrayutilities partner says so for Backend xrayutilities."""
+    import json
+    from tests.xdart.pages.test_stitch_page import _goniometer_record
+    alone = tmp_path / "alone.json"
+    alone.write_text(json.dumps(_goniometer_record()))
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        assert page.controls.processing_card.isAncestorOf(page._rows["backend"])
+        assert not page.controls.experiment_card.isAncestorOf(page._rows["backend"])
+        page.set_field("project_root", str(tmp_path))
+        page.set_field("geometry_kind", "Goniometer JSON")
+        page.set_field("geometry_path", str(alone))
+        page.set_field("backend", "xrayutilities histogram")
+        assert "alone.json has no xrayutilities partner (alone.xu.json): save" in page._readiness[0]
+        assert "no xrayutilities file (alone.xu.json)" in page._rows["geometry_path"].toolTip()
+        page.set_field("backend", "pyFAI MultiGeometry")  # pyFAI reads the file itself
+        assert "partner" not in page._readiness[0]
+    finally:
+        _close(page, qapp)

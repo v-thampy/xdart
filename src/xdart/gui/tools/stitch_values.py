@@ -947,8 +947,9 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
                 max_frame_bytes=form.max_frame_bytes,
             )
         else:
-            calibration = capture_xu_stitch_calibration(
-                XuStitchCalibrationInput(form.geometry_path),
+            from xrd_tools.integrate.stitch_calibration import xu_calibration_path
+            calibration = capture_xu_stitch_calibration(  # a pyFAI file's partner, saved beside it
+                XuStitchCalibrationInput(xu_calibration_path(form.geometry_path, project)),
                 project_root=project,
             )
             runtime_owner = xu_runtime_session()
