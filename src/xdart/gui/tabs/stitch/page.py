@@ -48,7 +48,7 @@ from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifactPayload
 from xrd_tools.session.readiness import ControlFieldKind, ControlFormField, SectionId
 from xdart.gui.tabs.scattering.controls_inventory import (
-    GI_ENABLED, GI_MOTOR, GI_ORIENTATION, GI_THETA, GI_TILT,
+    GI_ENABLED, GI_MOTOR, GI_ORIENTATION, GI_THETA,
 )
 from xrd_tools.session.threshold_editing import (
     ThresholdEditRefusal, ThresholdState, threshold_transition,
@@ -459,7 +459,8 @@ class StitchPage(QtWidgets.QWidget):
         self._field(experiment, SectionId.EXPERIMENT, "mask_path", "Mask File", browse=True)
         # Grazing incidence as Int sets it, in the Experiment section (maintainer, 2026-09-29):
         # Int's own rows, rebuilt from this page's values (_render_gi).
-        self._gi = dict(enabled=False, motor=None, angle="0.1", orientation="4", tilt="0")
+        # tilt_motor None: the default (chi, gonchi, else Manual) once the scan's motors are known
+        self._gi = dict(enabled=False, motor=None, angle="0.1", orientation="4", tilt_motor=None, tilt_chi="90")
         self._gi_catalog = None
         self._gi_host = QtWidgets.QWidget()
         QtWidgets.QVBoxLayout(self._gi_host).setContentsMargins(0, 0, 0, 0)
@@ -565,6 +566,23 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["sample_position"].setToolTip(
             "On rotation axis drops a stacked-arm calibration's fitted sample offset, "
             "for a sample aligned onto the axis (for example after GI alignment).")
+        # Grazing incidence's tilt, read per frame like the incidence (maintainer, 2026-09-29): the
+        # motor is psic's chi circle; Manual takes one χ for every frame. Rendered from self._gi.
+        self._tilt_rows = (
+            FormRow(label="GI tilt motor", path=("Stitch", "gi_tilt_motor"), value="Manual", kind="combo",
+                    choices=("Manual",)),
+            FormRow(label="GI tilt χ (°)", path=("Stitch", "gi_tilt_chi"), value="90", kind="line"))
+        self._tilt_rows[0].setToolTip(
+            "Grazing incidence: the motor giving each frame's chi circle (psic's χ; 90° is level at a "
+            "chi-90 mounting). With the incidence, mu and phi it sets the sample surface for both "
+            "backends. Default: chi, then gonchi, else Manual.")
+        self._tilt_rows[1].setToolTip("Manual tilt motor: psic's χ for every frame (90° is level at a "
+                                      "chi-90 mounting).")
+        for row in self._tilt_rows:
+            row.valueChanged.connect(self._tilt_edited)
+            row.draftChanged.connect(self._edited)
+            frames_card.add_row(row)
+        self._render_tilt(self._gi_catalog)
         self.corrections_card = SubsectionCard("Corrections")
         advanced_layout.addWidget(self.corrections_card)
         card = self.corrections_card
@@ -606,8 +624,7 @@ class StitchPage(QtWidgets.QWidget):
         preview_layout.addWidget(self.preview_text)
         self.preview_dialog.resize(680, 480)
 
-    _GI_KEYS = {GI_ENABLED: "enabled", GI_MOTOR: "motor", GI_THETA: "angle", GI_ORIENTATION: "orientation",
-                GI_TILT: "tilt"}
+    _GI_KEYS = {GI_ENABLED: "enabled", GI_MOTOR: "motor", GI_THETA: "angle", GI_ORIENTATION: "orientation"}
 
     def _gi_catalog_now(self):
         """The real motors of the first selected SPEC scan (Int's incidence choices), or None when
@@ -645,8 +662,8 @@ class StitchPage(QtWidgets.QWidget):
         return tuple(catalogs) or None
 
     def _gi_sample_binding(self):
-        """xrayutilities' other sample circles (mu, chi, phi) by the Geometry's motor names, and
-        those only some selected scans record. A circle no selected scan records reads 0 (None; the
+        """The Geometry's other sample circles (mu, phi) by its motor names, and those only some
+        selected scans record (both backends read them with the incidence and tilt). A circle no selected scan records reads 0 (None; the
         Experiment status says so); when the selection cannot say, the name stays and Preview refuses
         a scan without it. A first-scan catalog never decides for the others (Codex review F3)."""
         from xrd_tools.integrate.stitch_gi import GI_SAMPLE_ROLES
@@ -682,8 +699,8 @@ class StitchPage(QtWidgets.QWidget):
                                        ControlFieldKind.COMBO, tuple(dict.fromkeys(choices))))
         if motor == "Manual":
             fields.append(ControlFormField(SectionId.EXPERIMENT, "Incidence angle", GI_THETA, gi["angle"]))
-        fields += [ControlFormField(SectionId.EXPERIMENT, "Sample orientation", GI_ORIENTATION, gi["orientation"]),
-                   ControlFormField(SectionId.EXPERIMENT, "Tilt angle", GI_TILT, gi["tilt"])]
+        # the tilt is read per frame like the incidence: Advanced ▸ GI tilt motor
+        fields.append(ControlFormField(SectionId.EXPERIMENT, "Sample orientation", GI_ORIENTATION, gi["orientation"]))
         return tuple(fields)
 
     def _gi_status(self):
@@ -691,8 +708,6 @@ class StitchPage(QtWidgets.QWidget):
             return "standard"
         if self._value("unit") not in _GI_AXES:  # Q or 2θ: a plain result
             return "grazing · choose Qip, Qoop or Qip + Qoop as the Axis"
-        if self._value("backend") != "xrayutilities histogram":
-            return "grazing"
         pairs, mixed = self._gi_sample_binding()
         zero = [role for role, motor in pairs if motor is None]
         return ("grazing" + (f" · {', '.join(zero)} read as 0" if zero else "")
@@ -702,11 +717,19 @@ class StitchPage(QtWidgets.QWidget):
         """Int's GI rows in the Experiment section, rebuilt from this page's values; the incidence
         motor defaults as Int's does, in Stitch's order (eta, gonth, halpha, …), never to a motor
         the scan does not record."""
-        from xrd_tools.session.gi_motor import STITCH_GI_MOTOR_PREFERENCE, pick_default_gi_motor
+        from xrd_tools.session.gi_motor import (
+            STITCH_GI_MOTOR_PREFERENCE, STITCH_TILT_MOTOR_PREFERENCE, pick_default_gi_motor,
+        )
         self._gi_catalog = catalog = self._gi_catalog_now() if self._gi["enabled"] else None
         motor = self._gi["motor"]
         if catalog is not None and (motor is None or (motor != "Manual" and motor not in catalog)):
             self._gi["motor"] = pick_default_gi_motor(catalog, STITCH_GI_MOTOR_PREFERENCE)
+        tilt = self._gi["tilt_motor"]
+        if catalog is not None and (tilt is None or (tilt != "Manual" and tilt not in catalog)):
+            self._gi["tilt_motor"] = pick_default_gi_motor(catalog, STITCH_TILT_MOTOR_PREFERENCE,
+                                                           rotation_fallback=False)
+        if hasattr(self, "_tilt_rows"):  # built with the Advanced dialog, after Experiment
+            self._render_tilt(catalog)
         layout = self._gi_host.layout()
         while layout.count():
             widget = layout.takeAt(0).widget()
@@ -718,6 +741,25 @@ class StitchPage(QtWidgets.QWidget):
         self.controls.render_gi_rows(group, self._gi_fields())
         layout.addWidget(group)
         self._render_gi_axis()
+
+    def _render_tilt(self, catalog):
+        """The Advanced tilt rows from this page's values: the scan's motors as choices."""
+        tilt = self._gi["tilt_motor"] or "Manual"
+        choices = ("Manual", *(catalog if catalog is not None else (() if tilt == "Manual" else (tilt,))))
+        motor, chi = self._tilt_rows
+        motor.apply_field(ControlFormField(SectionId.PROCESSING, "GI tilt motor", motor._path, tilt,
+                                           ControlFieldKind.COMBO, tuple(dict.fromkeys(choices))))
+        chi.apply_field(ControlFormField(SectionId.PROCESSING, "GI tilt χ (°)", chi._path, self._gi["tilt_chi"],
+                                         ControlFieldKind.LINE))
+        chi.setVisible(tilt == "Manual")
+
+    def _tilt_edited(self, path, value):
+        key = {"gi_tilt_motor": "tilt_motor", "gi_tilt_chi": "tilt_chi"}[path[-1]]
+        if self._gi[key] == str(value):
+            return
+        self._gi[key] = str(value)
+        self._tilt_rows[1].setVisible((self._gi["tilt_motor"] or "Manual") == "Manual")
+        self._edited()
 
     def _render_gi_axis(self):
         """The Axis choices (Grazing adds the GI cuts), the GI ranges when a GI axis is chosen, and
@@ -753,30 +795,32 @@ class StitchPage(QtWidgets.QWidget):
         value = self._value
         if not self._gi["enabled"] or value("unit") not in _GI_AXES:
             return None
-        from xrd_tools.integrate.stitch_gi import GI_SAMPLE_ROLES, StitchGI
-        motor = self._gi["motor"] or "Manual"
+        from xrd_tools.integrate.stitch_gi import StitchGI
+        motor, tilt = self._gi["motor"] or "Manual", self._gi["tilt_motor"] or "Manual"
         ip, oop = ((None if value(f"{prefix}_auto") else (float(value(f"{prefix}_min")), float(value(f"{prefix}_max"))))
                    for prefix in ("gi_ip", "gi_oop"))
-        xu = value("backend") == "xrayutilities histogram"
-        mixed = self._gi_sample_binding()[1] if xu else ()
+        mixed = self._gi_sample_binding()[1]
         if mixed:
             raise ValueError(f"{', '.join(mixed)} is recorded by some selected scans and not others: "
                              "select scans that record the same sample circles")
         return StitchGI(
             _GI_AXES[value("unit")], incidence_motor=None if motor == "Manual" else motor,
             incident_angle_deg=float(self._gi["angle"]) if motor == "Manual" else None,
-            tilt_deg=float(self._gi["tilt"]), sample_orientation=int(self._gi["orientation"]),
-            sample_motors=self._gi_sample_motors() if xu else tuple((role, None) for role in GI_SAMPLE_ROLES),
+            tilt_motor=None if tilt == "Manual" else tilt,
+            tilt_chi_deg=float(self._gi["tilt_chi"]) if tilt == "Manual" else None,
+            sample_orientation=int(self._gi["orientation"]), sample_motors=self._gi_sample_motors(),
             ip_range=ip, oop_range=oop)
 
     def _load_gi(self, gi):
         """A form's (or settings') grazing incidence onto the page."""
         self._gi["enabled"] = gi is not None
         if gi is not None:
-            self._gi.update(motor=gi.incidence_motor or "Manual", tilt=f"{gi.tilt_deg:g}",
+            self._gi.update(motor=gi.incidence_motor or "Manual", tilt_motor=gi.tilt_motor or "Manual",
                             orientation=str(gi.sample_orientation))
             if gi.incident_angle_deg is not None:
                 self._gi["angle"] = f"{gi.incident_angle_deg:g}"
+            if gi.tilt_chi_deg is not None:
+                self._gi["tilt_chi"] = f"{gi.tilt_chi_deg:g}"
             self._render_gi()  # Grazing's axis choices, before choosing one
             self.set_field("unit", next(label for label, cuts in _GI_AXES.items() if cuts == gi.cuts))
             for prefix, bounds in (("gi_ip", gi.ip_range), ("gi_oop", gi.oop_range)):
@@ -1042,8 +1086,6 @@ class StitchPage(QtWidgets.QWidget):
         self._refresh_xu_geometry()
         self._sync_goniometer_mapping()
         self._sync_actions()
-        if hasattr(self, "_gi_host"):
-            self._render_gi()  # xrayutilities reads the sample circles: its status differs (Codex review P3)
 
     def _sync_advanced(self):
         """XU always applies its solid angle and has no uncertainty or sample-position

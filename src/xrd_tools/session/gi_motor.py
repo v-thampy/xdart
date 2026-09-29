@@ -22,6 +22,9 @@ GI_MOTOR_PREFERENCE = (
 STITCH_GI_MOTOR_PREFERENCE = (
     "eta", "gonth", "halpha", "th", "theta", "alpha_i", "mu", "incidence",
 )
+#: Stitch's tilt motor (maintainer, 2026-09-29): "The default motors for that should be chi, go chi,
+#: and then the rest, along with the manual option" — psic's chi circle, or a goniometer's.
+STITCH_TILT_MOTOR_PREFERENCE = ("chi", "gonchi")
 
 #: Rotation hints with PER-HINT affix rules (review wf_3614041c: a single
 #: equals/starts/ends rule still fired through unrelated words at token EDGES —
@@ -87,13 +90,13 @@ def _looks_like_rotation(name: str) -> bool:
     return False
 
 
-def pick_default_gi_motor(motors, preference=GI_MOTOR_PREFERENCE) -> str:
+def pick_default_gi_motor(motors, preference=GI_MOTOR_PREFERENCE, *, rotation_fallback=True) -> str:
     """Choose the default GI incidence motor from *motors*.
 
     Returns a motor NAME from *motors* (the first match in *preference*, Int's
-    order by default, else the first rotation-sounding motor) or the literal
-    ``'Manual'`` when nothing looks like an incidence axis.  Never returns a
-    name that is not in *motors*.
+    order by default, else — with *rotation_fallback* — the first rotation-sounding
+    motor) or the literal ``'Manual'`` when nothing looks like an incidence axis.
+    Never returns a name that is not in *motors*.
     """
     names = [str(m) for m in (motors or []) if str(m)]
     if not names:
@@ -102,7 +105,7 @@ def pick_default_gi_motor(motors, preference=GI_MOTOR_PREFERENCE) -> str:
     for pref in preference:
         if pref in lower:
             return lower[pref]
-    for m in names:
+    for m in names if rotation_fallback else ():
         if _looks_like_rotation(m):
             return m
     return "Manual"

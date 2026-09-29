@@ -752,17 +752,18 @@ def run_stitch(
                 mask=plan.mask, normalization=normalization, **extra)
             auxiliary = None
         elif plan.streaming_multigeometry:
-            incidences = None
-            if plan.stitch_gi is not None:  # every frame's incidence: its motor, or the Manual angle
-                incidences = (np.full(len(labels), plan.stitch_gi.incident_angle_deg)
-                              if plan.stitch_gi.incidence_motor is None
-                              else _metadata_series(src, labels, plan.stitch_gi.incidence_motor))
+            gi_angles = None
+            if plan.stitch_gi is not None:  # every frame's pyFAI incidence and tilt, from psic's circles
+                gi = plan.stitch_gi
+                series = {name: _metadata_series(src, labels, name) for name in gi.metadata_names()}
+                gi_angles = [gi.pyfai_angles(gi.normal({name: values[i] for name, values in series.items()}))
+                             for i in range(len(labels))]
             payload, auxiliary, gi_cuts = stitch_1d_streaming(
                 _iter_images(), len(labels), integrator_series.__iter__,
                 npt=plan.npt_1d, unit=plan.unit, method=plan.method,
                 radial_range=plan.radial_range,
                 mask=plan.mask, normalization=normalization,
-                frame_screen=frame_screen, gi=plan.stitch_gi, incidences=incidences, **corrections,
+                frame_screen=frame_screen, gi=plan.stitch_gi, gi_angles=gi_angles, **corrections,
             )
         else:
             assert integrators is not None

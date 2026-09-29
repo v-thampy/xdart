@@ -258,12 +258,13 @@ def test_a_guided_xu_extended_fit_saves_a_v3_asset_the_runtime_admits(tmp_path):
     assert json.loads(open(path).read())['version'] == 3
 
 
-def test_xu_gi_cuts_bin_pyfais_fiber_coordinates_and_leave_iq_alone(tmp_path, transferred):
+@pytest.mark.parametrize("pose", [{'eta': .4, 'chi': 90., 'mu': 0.}, {'eta': .4, 'chi': 88., 'mu': .5}])
+def test_xu_gi_cuts_bin_pyfais_fiber_coordinates_and_leave_iq_alone(tmp_path, transferred, pose):
     """GI Stitch 1D with xrayutilities (maintainer, 2026-09-29): every frame's sample normal comes
-    from all four sample angles (17-2's mounting: chi 90, eta the incidence), and each cut bins
-    exactly the pixels pyFAI's fiber model puts there (orientation 4, the same incidence), sample
-    offset and all; Qip + Qoop gives exactly the two single-cut results; I(q) beside them is
-    unchanged."""
+    from psic's four sample circles (17-2's mounting: chi 90, eta the incidence; here also tilted by
+    chi and mu), and each cut bins exactly the pixels pyFAI's fiber model puts there (orientation 4,
+    the incidence and tilt solved from the same normal), sample offset and all; Qip + Qoop gives
+    exactly the two single-cut results; I(q) beside them is unchanged."""
     from pyFAI.units import get_unit_fiber
     from xrd_tools.integrate.gid import _fiber_from_integrator
     from xrd_tools.integrate.stitch_gi import GI_UNITS, StitchGI
@@ -274,7 +275,7 @@ def test_xu_gi_cuts_bin_pyfais_fiber_coordinates_and_leave_iq_alone(tmp_path, tr
         frame_indices = (1, 2, 3)
 
         def metadata_for(self, label):
-            return {'del': angles[label][0], 'nu': angles[label][1], 'eta': .4, 'chi': 90.}
+            return {'del': angles[label][0], 'nu': angles[label][1], **pose}
 
         def load_frame(self, label):
             return np.full(SHAPE, 10.0, dtype=np.float32)
@@ -285,9 +286,8 @@ def test_xu_gi_cuts_bin_pyfais_fiber_coordinates_and_leave_iq_alone(tmp_path, tr
                   max_frame_bytes=8 * 1024 * 1024)
 
     def stitch(*cuts):
-        gi = None if not cuts else StitchGI(cuts, incidence_motor='eta', ip_range=ranges['q_ip'],
-                                            oop_range=ranges['q_oop'],
-                                            sample_motors=(('mu', None), ('chi', 'chi'), ('phi', None)))
+        gi = None if not cuts else StitchGI(cuts, incidence_motor='eta', tilt_motor='chi', ip_range=ranges['q_ip'],
+                                            oop_range=ranges['q_oop'], sample_motors=(('mu', 'mu'), ('phi', None)))
         return run_xu_hist_stitch_1d(receipt, Source(), gi=gi, **common)
 
     result, plain = stitch('q_ip', 'q_oop'), stitch()
@@ -295,10 +295,14 @@ def test_xu_gi_cuts_bin_pyfais_fiber_coordinates_and_leave_iq_alone(tmp_path, tr
     assert plain.gi_cuts == () and [cut.unit for cut, _ in result.gi_cuts] == [GI_UNITS['q_ip'], GI_UNITS['q_oop']]
     diff = Diffractometer.from_pyfai_goniometer(_record(), source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
     expected = {name: np.zeros(48) for name in ranges}
+    gi = StitchGI(('q_ip',), incidence_motor='eta', tilt_motor='chi', sample_motors=(('mu', 'mu'), ('phi', None)))
+    incidence, tilt = gi.pyfai_angles(gi.normal(pose))
+    assert abs(tilt) == pytest.approx(0. if pose['chi'] == 90. else 2., abs=.01)
     for (delta, nu) in angles.values():
         integrator, = create_multigeometry_integrators_from_geometry(diff, {'del': np.array([delta]), 'nu': np.array([nu])})
-        fiber = _fiber_from_integrator(integrator, incident_angle=.4, tilt_angle=0., sample_orientation=4, angle_unit='deg')
-        unit = dict(incident_angle=.4, tilt_angle=0., sample_orientation=4, angle_unit='deg')
+        fiber = _fiber_from_integrator(integrator, incident_angle=incidence, tilt_angle=tilt, sample_orientation=4,
+                                       angle_unit='deg')
+        unit = dict(incident_angle=incidence, tilt_angle=tilt, sample_orientation=4, angle_unit='deg')
         values = {'q_ip': np.asarray(fiber.array_from_unit(SHAPE, 'center', get_unit_fiber('qip_A^-1', **unit), scale=True)),
                   'q_oop': np.asarray(fiber.array_from_unit(SHAPE, 'center', get_unit_fiber('qoop_A^-1', **unit), scale=True))}
         mask = integrator.detector.mask
@@ -312,3 +316,48 @@ def test_xu_gi_cuts_bin_pyfais_fiber_coordinates_and_leave_iq_alone(tmp_path, tr
         (single, single_diagnostics), = stitch(name).gi_cuts
         np.testing.assert_array_equal(cut.intensity, single.intensity)
         np.testing.assert_array_equal(diagnostics.normalization, single_diagnostics.normalization)
+
+
+@pytest.mark.parametrize('orientation, poses', [
+    (4, [(0., .4, 90., 0.), (.5, .4, 88., -1.7), (0., .3, 85., 3.)]),  # 17-2: chi 90, eta incidence
+    (3, [(0., .4, 88., 0.)]),  # the same mounting, q_ip the other way
+    (7, [(.4, 0., 0., 0.), (.4, .5, -1.5, -1.7)]),  # chi 0, mu incidence
+    (6, [(.4, 0., 2., 0.)])])
+def test_pyfai_takes_the_incidence_and_tilt_that_give_the_circles_surface_normal(tmp_path, transferred, orientation,
+                                                                               poses):
+    """Maintainer, 2026-09-29: "pyfai should get the tilt from the data as well just like the incidence
+    angle". psic_normal is xrayutilities' own sample transform; pyFAI's fiber q_ip/q_oop at the incidence
+    and tilt StitchGI solves from that normal equal what both backends bin (q_oop = q·n̂, q_ip signed
+    along the orientation's horizontal axis in the surface), per pixel, on off-axis frames of the
+    extended arm, level and tilted."""
+    from pyFAI.units import get_unit_fiber
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+    from xrd_tools.integrate.gid import _fiber_from_integrator
+    from xrd_tools.integrate.stitch_gi import StitchGI, psic_normal
+    asset = transferred[0]
+    frames = [(10., 0.), (30., 14.), (6., -7.)]
+    diff = Diffractometer.from_pyfai_goniometer(_record(), source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
+    integrators = create_multigeometry_integrators_from_geometry(
+        diff, {'del': np.array([d for d, _ in frames]), 'nu': np.array([n for _, n in frames])})
+    gi = StitchGI(('q_ip',), incidence_motor='eta', tilt_motor='chi', sample_orientation=orientation,
+                  sample_motors=(('mu', 'mu'), ('phi', 'phi')))
+    with xu_runtime_session() as runtime:
+        geometry = resolve_xu_stitch_effective_geometry(_receipt(tmp_path, asset), runtime)
+        provider = XuPowderQProvider(geometry, asset['acquisition'])
+        for mu, eta, chi, phi in poses:
+            normal = gi.normal({'mu': mu, 'eta': eta, 'chi': chi, 'phi': phi})
+            np.testing.assert_allclose(normal, geometry.hxrd._A2QConversion.transformSample2Lab(
+                np.array([0., 0., 1.]), mu, eta, chi, phi), rtol=0, atol=1e-15)
+            np.testing.assert_allclose(normal, psic_normal(mu, eta, chi, phi), rtol=0, atol=0)
+            incidence, tilt = gi.pyfai_angles(normal)
+            unit = dict(incident_angle=incidence, tilt_angle=tilt, sample_orientation=orientation, angle_unit='deg')
+            for (delta, nu), integrator in zip(frames, integrators):
+                lease = provider.frame(nu=nu, del_=delta)  # the XU kernel's own path
+                try:
+                    q_ip, q_oop = lease.gi_coordinates(normal, gi.in_plane_axis(normal))
+                finally:
+                    lease.release()
+                fiber = _fiber_from_integrator(integrator, **unit)
+                for name, ours in (('qip_A^-1', q_ip), ('qoop_A^-1', q_oop)):
+                    theirs = np.asarray(fiber.array_from_unit(SHAPE, 'center', get_unit_fiber(name, **unit), scale=True))
+                    np.testing.assert_allclose(ours, theirs, rtol=0, atol=1e-8, err_msg=f'{name} {orientation} {chi}')

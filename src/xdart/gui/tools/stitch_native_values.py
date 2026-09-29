@@ -191,8 +191,8 @@ def prepare_native_stitch_tool(form, project):
         motors = tuple(name for name in acquisition["source_motors"].values()
                        if name is not None)  # a single 2θ arm reads no nu
         energy_name = acquisition["source_energy_selector"]
-    if form.gi is not None:  # every frame's incidence (and xrayutilities' other sample circles)
-        motors += form.gi.metadata_names(form.backend)
+    if form.gi is not None:  # every frame's sample circles: the incidence, the tilt, mu and phi
+        motors += form.gi.metadata_names()
     requests, preview_members, warnings = [], [], []
     # Metadata is loaded once per exact source. The receipt is reused without
     # changing membership when a scan appears in more than one output group.
@@ -235,6 +235,9 @@ def prepare_native_stitch_tool(form, project):
             request = prepare_stitch_operation(source, output, plan, project_root=project)
             from xrd_tools.analysis.stitch_native import native_frame_members
             members = tuple(native_frame_members(request))
+            if form.gi is not None:  # every frame's sample normal suits the pyFAI sample orientation
+                for item in request.manifest.contributions:
+                    form.gi.pyfai_angles(form.gi.normal({name: value for name, _occurrence, value in item.values}))
         except (ValueError, TypeError) as error:
             count = sum(len(receipt.selected_labels) for receipt in receipts)
             code = getattr(error, "code", "STITCH_PREFLIGHT_REFUSED")

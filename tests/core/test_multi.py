@@ -749,11 +749,12 @@ def test_stitch_images_rejects_unknown_backend(monkeypatch):
                             mode="1d", backend="bogus")
 
 
-def test_the_streaming_gi_cuts_equal_pyfais_multigeometryfiber_and_leave_iq_alone():
-    """A GI Stitch 1D with pyFAI (maintainer, 2026-09-29): each cut, streamed one frame at a time,
-    equals pyFAI's MultiGeometryFiber over all frames at once (npt_ip = npt_oop, the size pyFAI's
-    accumulators take); Qip + Qoop gives exactly the two single-cut results; I(q) beside them is the
-    plain streaming result."""
+@pytest.mark.parametrize("angles", [(.4, 0.), (.4, 2.)])
+def test_the_streaming_gi_cuts_equal_pyfais_multigeometryfiber_and_leave_iq_alone(angles):
+    """A GI Stitch 1D with pyFAI (maintainer, 2026-09-29): each cut, streamed one frame at a time with
+    the frame's incidence and tilt, equals pyFAI's MultiGeometryFiber over all frames at once
+    (npt_ip = npt_oop, the size pyFAI's accumulators take), level or tilted; Qip + Qoop gives exactly
+    the two single-cut results; I(q) beside them is the plain streaming result."""
     import numpy as np
     from pyFAI.multi_geometry import MultiGeometryFiber
     from xrd_tools.core.geometry import Diffractometer
@@ -774,22 +775,24 @@ def test_the_streaming_gi_cuts_equal_pyfais_multigeometryfiber_and_leave_iq_alon
 
     def stitch(*cuts):
         gi = StitchGI(cuts, incident_angle_deg=.4, **ranges) if cuts else None
-        return stitch_1d_streaming(images, 3, series.__iter__, gi=gi, incidences=[.4] * 3 if cuts else None,
+        return stitch_1d_streaming(images, 3, series.__iter__, gi=gi, gi_angles=[angles] * 3 if cuts else None,
                                    **common)
 
     payload, _diagnostics, both = stitch('q_oop', 'q_ip')
     plain, _, none = stitch()
     assert none == () and len(both) == 2
     np.testing.assert_array_equal(payload.intensity, plain.intensity)
-    fibers = [_fiber_from_integrator(ai, incident_angle=.4, sample_orientation=4) for ai in series]
+    incidence, tilt = angles
+    fibers = [_fiber_from_integrator(ai, incident_angle=incidence, tilt_angle=tilt, sample_orientation=4)
+              for ai in series]
     for name, (cut, cut_diagnostics) in zip(('q_ip', 'q_oop'), both):
         (single, single_diagnostics), = stitch(name)[2]
         for mine, theirs in ((cut.radial, single.radial), (cut.intensity, single.intensity),
                              (cut_diagnostics.coverage, single_diagnostics.coverage),
                              (cut_diagnostics.normalization, single_diagnostics.normalization)):
             np.testing.assert_array_equal(mine, theirs)
-        reference = MultiGeometryFiber(fibers, unit=('qip_A^-1', 'qoop_A^-1'), incident_angle=np.radians(.4),
-                                       tilt_angle=0., sample_orientation=4, **ranges
+        reference = MultiGeometryFiber(fibers, unit=('qip_A^-1', 'qoop_A^-1'), incident_angle=np.radians(incidence),
+                                       tilt_angle=np.radians(tilt), sample_orientation=4, **ranges
                                        ).integrate1d_grazing_incidence(images, npt_ip=64, npt_oop=64,
                                                                        vertical_integration=name == 'q_oop',
                                                                        polarization_factor=.99)

@@ -1,5 +1,6 @@
-"""Grazing incidence for a native Stitch 1D (maintainer, 2026-09-29): the GI value, and the
-incidence (and xrayutilities' other sample circles) bound per frame like the arm's motors."""
+"""Grazing incidence for a native Stitch 1D (maintainer, 2026-09-29): the GI value, and psic's sample
+circles (the incidence as eta, the tilt as chi, mu and phi) bound per frame like the arm's motors, for
+both backends."""
 from dataclasses import replace
 from pathlib import Path
 import re
@@ -10,7 +11,7 @@ from xdart.gui.tools.stitch_values import prepare_stitch_tool
 from xrd_tools.integrate.stitch_gi import GI_UNITS, StitchGI
 from tests.xdart.tools.test_stitch_native_values import _native_form
 
-_SAMPLE = (("mu", "mu"), ("chi", "chi"), ("phi", "phi"))
+_SAMPLE = (("mu", "mu"), ("phi", "phi"))
 
 
 def _gi_form(tmp_path, backend, gi):
@@ -23,39 +24,44 @@ def _gi_form(tmp_path, backend, gi):
     return replace(form, gi=gi)
 
 
-def test_the_gi_value_takes_one_incidence_and_names_the_motors_it_reads():
-    motor = StitchGI(("q_ip",), incidence_motor="eta", sample_motors=_SAMPLE, oop_range=(0., .5))
+def test_the_gi_value_takes_one_incidence_and_one_tilt_and_names_the_motors_it_reads():
+    motor = StitchGI(("q_ip",), incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE, oop_range=(0., .5))
     assert GI_UNITS == {"q_ip": "qip_A^-1", "q_oop": "qoop_A^-1"}
-    assert motor.metadata_names("multigeometry") == ("eta",)  # pyFAI: the incidence
-    assert motor.metadata_names("xu_hist") == ("eta", "mu", "chi", "phi")  # xrayutilities: every circle
-    assert StitchGI(("q_ip",), incident_angle_deg=.2).metadata_names("xu_hist") == ()  # Manual, circles at zero
-    assert motor.incidence({"eta": .3}) == .3 and StitchGI(("q_ip",), incident_angle_deg=.2).incidence({}) == .2
+    assert motor.metadata_names() == ("eta", "chi", "mu", "phi")  # both backends: every circle
+    manual = StitchGI(("q_ip",), incident_angle_deg=.2)
+    assert manual.metadata_names() == () and manual.tilt_chi_deg == 90.  # Manual: level at a chi-90 mounting
+    assert motor.circles({"eta": .3, "chi": 88., "mu": .5, "phi": -1.7}) == (.5, .3, 88., -1.7)
+    assert manual.circles({}) == (0., .2, 90., 0.)
+    # pyFAI's incidence and tilt come from the circles' surface normal: chi 90 is no tilt
+    assert manual.pyfai_angles(manual.normal({})) == pytest.approx((.2, 0.), abs=1e-12)
+    assert motor.pyfai_angles(motor.normal({"eta": .4, "chi": 88., "mu": 0., "phi": 0.})) == pytest.approx((.4, -2.), abs=1e-9)
     # Int's two ranges serve both cuts: each is binned over its own, windowed by the other
     both = StitchGI(("q_oop", "q_ip"), incident_angle_deg=.2, ip_range=(-1., 1.), oop_range=(0., .5))
     assert both.cuts == ("q_ip", "q_oop")  # one order
     assert (both.bins("q_ip"), both.window("q_ip"), both.bins("q_oop"), both.window("q_oop")) == (
         (-1., 1.), (0., .5), (0., .5), (-1., 1.))
-    for bad, message in ((dict(cuts=("q_total",), incident_angle_deg=.2), "cuts"),
+    for bad, message in ((dict(cuts=("q_ip",), incident_angle_deg=.2, tilt_motor="chi", tilt_chi_deg=90.), "exactly one"),
+                         (dict(cuts=("q_total",), incident_angle_deg=.2), "cuts"),
                          (dict(cuts=(), incident_angle_deg=.2), "cuts"),
                          (dict(cuts=("q_ip", "q_ip"), incident_angle_deg=.2), "cuts"),
                          (dict(cuts="q_ip", incident_angle_deg=.2), "cuts"),
                          (dict(cuts=("q_ip",)), "exactly one"),
                          (dict(cuts=("q_ip",), incidence_motor="eta", incident_angle_deg=.2), "exactly one"),
                          (dict(cuts=("q_ip",), incident_angle_deg=.2, sample_orientation=9), "orientation"),
-                         (dict(cuts=("q_ip",), incident_angle_deg=.2, sample_motors=(("chi", "chi"),)), "sample motors"),
+                         (dict(cuts=("q_ip",), incident_angle_deg=.2, sample_motors=(("mu", "mu"), ("chi", "chi"), ("phi", "phi"))), "sample motors"),
                          (dict(cuts=("q_ip",), incident_angle_deg=.2, oop_range=(.5, .5)), "min < max")):
         with pytest.raises(ValueError, match=message):
             StitchGI(**bad)
 
 
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
-def test_a_gi_stitch_binds_every_frames_incidence_and_changes_the_plan(tmp_path, backend):
-    gi = StitchGI(("q_ip",), incidence_motor="eta", sample_motors=_SAMPLE, oop_range=(0., .5))
+def test_a_gi_stitch_binds_every_frames_sample_circles_and_changes_the_plan(tmp_path, backend):
+    gi = StitchGI(("q_ip",), incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE, oop_range=(0., .5))
     form = _gi_form(tmp_path, backend, gi)
     request = prepare_stitch_tool(form).request
     assert request.plan.gi == gi
     bound = {name: value for item in request.manifest.contributions for name, _occurrence, value in item.values}
-    expected = {"eta": .3} if backend == "multigeometry" else {"eta": .3, "mu": 0., "chi": 90., "phi": -1.7}
+    expected = {"eta": .3, "mu": 0., "chi": 90., "phi": -1.7}  # both backends: psic's four circles
     assert {name: bound[name] for name in expected} == expected
     plain_request = prepare_stitch_tool(replace(form, gi=None)).request
     plain = plain_request.plan
@@ -68,6 +74,11 @@ def test_a_gi_stitch_binds_every_frames_incidence_and_changes_the_plan(tmp_path,
     # a motor the scan does not record is refused by name, as an arm motor is
     with pytest.raises(Exception, match="missing required column.*halpha"):
         prepare_stitch_tool(replace(form, gi=replace(gi, incidence_motor="halpha")))
+    with pytest.raises(Exception, match="missing required column.*gonchi"):
+        prepare_stitch_tool(replace(form, gi=replace(gi, tilt_motor="gonchi")))
+    # a surface far from the pyFAI sample orientation's level is refused at Preview, before a run
+    with pytest.raises(Exception, match="choose the orientation of this mounting"):
+        prepare_stitch_tool(replace(form, gi=replace(gi, sample_orientation=7)))
 
 
 def test_a_gi_cut_needs_a_native_stitch_1d_in_q(tmp_path):
@@ -103,7 +114,7 @@ def test_a_gi_stitch_publishes_i_of_q_and_its_cuts_as_one_int_record(tmp_path, b
     from xrd_tools.io.stitch_record import read_stitch_record
 
     request = prepare_stitch_tool(_gi_form(tmp_path, backend, StitchGI(
-        cuts, incidence_motor="eta", sample_motors=_SAMPLE))).request
+        cuts, incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE))).request
     kernel = "run_stitch" if backend == "multigeometry" else "run_xu_hist_stitch_1d"
     real, science = getattr(stitch_operation, kernel), []
 
@@ -153,7 +164,8 @@ def test_record_admission_takes_exactly_the_stitch_graph_the_record_calls_for(tm
     from xrd_tools.io.analysis_artifact import AnalysisArtifactInvalid, inspect_analysis_artifact
 
     cuts = ("q_ip", "q_oop") if tamper.startswith("second-cut") else ("q_ip",)
-    gi = None if tamper == "plain-cut" else StitchGI(cuts, incidence_motor="eta", sample_motors=_SAMPLE)
+    gi = None if tamper == "plain-cut" else StitchGI(cuts, incidence_motor="eta", tilt_motor="chi",
+                                                      sample_motors=_SAMPLE)
     request = prepare_stitch_tool(_gi_form(tmp_path, "xu_hist", gi)).request
     assert run_stitch_operation(request).terminal.disposition.name == "COMMITTED"
     target = request.module.output.target

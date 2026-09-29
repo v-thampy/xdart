@@ -1644,7 +1644,7 @@ def _required_stitch_selectors(
         raise TypeError("stitch selectors require an exact Stitch plan")
     requested += (() if plan.monitor_selector is None else (plan.monitor_selector,))
     if plan.gi is not None:  # the incidence (and xrayutilities' sample circles), per frame
-        requested += tuple(MetadataColumnSelector(name, 0) for name in plan.gi.metadata_names(plan.backend))
+        requested += tuple(MetadataColumnSelector(name, 0) for name in plan.gi.metadata_names())
     return tuple(
         sorted(
             {

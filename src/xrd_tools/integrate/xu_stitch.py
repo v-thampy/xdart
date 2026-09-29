@@ -646,12 +646,13 @@ class XuPowderQFrameLease:
         side *= 0.5
         return side
 
-    def gi_coordinates(self, normal, beam) -> tuple[np.ndarray, np.ndarray]:
-        """(q_ip, q_oop) for the sample normal ``normal`` in the lab (see ``stitch_gi``)."""
+    def gi_coordinates(self, normal, axis) -> tuple[np.ndarray, np.ndarray]:
+        """(q_ip, q_oop) for the sample normal ``normal`` in the lab and the q_ip sign ``axis``
+        (see ``stitch_gi``)."""
         if self._released:
             raise RuntimeError("XU q-frame lease is released")
         from xrd_tools.integrate.stitch_gi import gi_coordinates
-        return gi_coordinates(*self._values, normal, beam)
+        return gi_coordinates(*self._values, normal, axis)
 
     def release(self) -> None:
         if self._released:
@@ -782,7 +783,7 @@ def _checked_frame_histograms(
 
     As in pyFAI, a dark is subtracted from the conditioned frame, and the flat
     and polarization weight the normalization next to the solid angle.
-    ``gi_cuts`` (normal, beam, ((cut, window, edges), …)) also bins the frame's GI
+    ``gi_cuts`` (normal, axis, ((cut, window, edges), …)) also bins the frame's GI
     cuts from the same pixels and weights, the GI coordinates computed once; their
     histograms, one triple per cut, are the fifth value.
     """
@@ -860,8 +861,8 @@ def _checked_frame_histograms(
             copy=False,
         )
         if gi_cuts is not None:
-            normal, beam, cuts = gi_cuts
-            q_ip, q_oop = lease.gi_coordinates(normal, beam)
+            normal, axis, cuts = gi_cuts
+            q_ip, q_oop = lease.gi_coordinates(normal, axis)
             owned_refs.extend((weakref.ref(q_ip), weakref.ref(q_oop)))
             histograms = []
             for axis, window, gi_edges in cuts:
@@ -914,7 +915,7 @@ def _checked_frame_histograms(
     return d_signal, d_normalization, d_count, d_total, gi_histograms
 
 
-def _scout_gi_bins(provider, frame_inputs, normals, beam, gi, cancel_token):
+def _scout_gi_bins(provider, frame_inputs, normals, axes, gi, cancel_token):
     """Each GI cut's bin range: its own range, else its full geometry extent inside its window over
     every selected frame (one pass)."""
     bins = {cut: gi.bins(cut) for cut in gi.cuts}
@@ -922,12 +923,12 @@ def _scout_gi_bins(provider, frame_inputs, normals, beam, gi, cancel_token):
     if not scouted:
         return bins
     low, high = dict.fromkeys(scouted, math.inf), dict.fromkeys(scouted, -math.inf)
-    for (_label, del_value, nu_value, _monitor), normal in zip(frame_inputs, normals):
+    for (_label, del_value, nu_value, _monitor), normal, axis in zip(frame_inputs, normals, axes):
         if cancel_token is not None and cancel_token.is_set():
             raise XuStitchCancelled("CANCELLED")
         lease = provider.frame(nu=nu_value, del_=del_value)
         try:
-            q_ip, q_oop = lease.gi_coordinates(normal, beam)
+            q_ip, q_oop = lease.gi_coordinates(normal, axis)
             for cut in scouted:
                 values, other = (q_ip, q_oop) if cut == "q_ip" else (q_oop, q_ip)
                 inside = np.isfinite(values)
@@ -1078,11 +1079,11 @@ def run_xu_hist_stitch_1d(
     ``polarization_factor``, ``dark`` and ``flat`` (oriented like the frames)
     apply pyFAI's corrections; an unusable dark or flat pixel joins the mask.
     ``gi`` (a ``StitchGI``) also bins its GI cuts beside I(q), with ``npt`` points:
-    every frame's sample normal comes from xrayutilities' sample transform with all
-    four sample angles (eta from the incidence), and the result carries them as
-    ``gi_cuts``.
+    every frame's sample normal comes from psic's four sample circles (eta from the
+    incidence, chi from the tilt; ``StitchGI.normal``, xrayutilities' own transform
+    for the SURFACE asset), and the result carries them as ``gi_cuts``.
     """
-    from xrd_tools.integrate.stitch_gi import GI_UNITS, StitchGI, xu_sample_normal
+    from xrd_tools.integrate.stitch_gi import GI_UNITS, StitchGI
     if gi is not None and (type(gi) is not StitchGI or unit != "q_A^-1"):
         raise TypeError("an XU GI cut needs an exact StitchGI beside I(q) in Q")
     if type(receipt) is not XuStitchCalibrationReceipt:
@@ -1151,7 +1152,7 @@ def run_xu_hist_stitch_1d(
     acquisition = asset["acquisition"]
     validation = asset["validation"]
     frame_inputs: list[tuple[int, float, float, float]] = []
-    sample_angles: list[tuple[float, float, float, float]] = []  # GI: (mu, eta, chi, phi) per frame
+    normals: list[np.ndarray] = []  # GI: each frame's sample normal, from psic's circles
     del_values: list[float] = []
     nu_values: list[float] = []
     energy_values: list[float] = []
@@ -1233,16 +1234,11 @@ def run_xu_hist_stitch_1d(
             energy_values.append(energy)
         if gi is not None:
             try:
-                circles = {role: 0.0 if motor is None else float(metadata[motor])
-                           for role, motor in gi.sample_motors}
-                angles = (circles["mu"], gi.incidence(metadata), circles["chi"], circles["phi"])
+                normals.append(gi.normal(metadata))
             except (KeyError, TypeError, ValueError) as error:
                 raise XuStitchScienceRefused(
-                    "INVALID_METADATA_VALUE", "a GI sample angle is unavailable"
+                    "INVALID_METADATA_VALUE", "a GI sample angle is unavailable or nonfinite"
                 ) from error
-            if not all(math.isfinite(value) for value in angles):
-                raise XuStitchScienceRefused("INVALID_METADATA_VALUE", "a GI sample angle is nonfinite")
-            sample_angles.append(angles)
         del_values.append(del_value)
         nu_values.append(nu_value)
         frame_inputs.append((label, del_value, nu_value, monitor))
@@ -1322,15 +1318,15 @@ def run_xu_hist_stitch_1d(
             raise XuStitchScienceRefused("STITCH_Q_GRID_INVALID", "radial grid is not finite and strictly increasing")
         gi_cuts = [None] * len(frame_inputs)
         if gi is not None:
-            beam = np.asarray(asset["xrayutilities"]["incident_beam"], dtype=np.float64)
-            beam /= np.linalg.norm(beam)
-            surface = asset["xrayutilities"]["surface_normal_reference"]
-            normals = [xu_sample_normal(geometry.hxrd.Ang2Q, *angles, surface_normal=surface)
-                       for angles in sample_angles]
-            gi_bins = _scout_gi_bins(provider, frame_inputs, normals, beam, gi, cancel_token)
+            frame = asset["xrayutilities"]
+            if (list(frame["incident_beam"]) != [0.0, 1.0, 0.0]
+                    or list(frame["surface_normal_reference"]) != [0.0, 0.0, 1.0]):
+                raise XuStitchScienceRefused("XU_GI_FRAME_UNSUPPORTED", "GI takes psic's SURFACE frame")
+            axes = [gi.in_plane_axis(normal) for normal in normals]
+            gi_bins = _scout_gi_bins(provider, frame_inputs, normals, axes, gi, cancel_token)
             gi_edges = {cut: np.linspace(*gi_bins[cut], npt + 1, dtype=np.float64) for cut in gi.cuts}
             cuts = tuple((cut, gi.window(cut), gi_edges[cut]) for cut in gi.cuts)
-            gi_cuts = [(normal, beam, cuts) for normal in normals]
+            gi_cuts = [(normal, axis, cuts) for normal, axis in zip(normals, axes)]
         for index, (label, del_value, nu_value, monitor) in enumerate(frame_inputs):
             if cancel_token is not None and cancel_token.is_set():
                 raise XuStitchCancelled("CANCELLED")
