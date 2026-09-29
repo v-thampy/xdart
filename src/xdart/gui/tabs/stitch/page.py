@@ -1528,12 +1528,11 @@ class StitchPage(QtWidgets.QWidget):
                 self._set_instrument(fitted)
             if dialog.saved_mask:  # the calibration's mask is this detector's: Stitch leaves it out too
                 self.set_field("mask_path", dialog.saved_mask)
-            if self._value("backend") == "xrayutilities histogram":  # the partner owns its mapping
-                self._refresh_xu_geometry()
-                return
+            # the pyFAI side always (Backend may change later); xrayutilities then shows its partner's
             self._adopt_mapping(tuple(dialog.saved_source_motors.items()))
             self._sync_goniometer_mapping()
             self.set_field("image_rotation", dialog.saved_image_rotation)
+            self._refresh_xu_geometry()
 
     def _make_mask(self):
         from .mask import StitchMaskDialog
