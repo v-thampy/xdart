@@ -615,3 +615,24 @@ def test_the_beam_pixel_is_found_on_the_frame_nearest_the_zero():
     flat = [np.full((45, 161), 12.) for _ in angles]
     with pytest.raises(ValueError, match='no frame shows the direct beam; enter the beam pixel'):
         calibrate_direct_beam(angles, iter(flat), detector='Detector', detector_config=config(), angle_zero_deg=7.)
+
+
+def test_the_beam_spot_is_found_on_the_real_17_2_direct_beam_scan():
+    """17-2's direct-beam scan 3 (nu −5…5°, Pilatus 300K-W .raw, headerless): the spot found at the
+    zero is the beamline's recorded direct-beam pixel (its ROIs centre on 279, 97), and the fit equals
+    the one from that pixel typed in."""
+    import os
+    from xrd_tools.integrate.direct_beam import calibrate_direct_beam_scan
+    configured = os.environ.get("XDART_TEST_DATA")
+    if not configured:
+        pytest.skip("XDART_TEST_DATA is not configured")
+    root = Path(configured) / "stitching" / "data" / "direct_beam"
+    if not (root / "direct_beam").is_file():
+        pytest.skip("XDART_TEST_DATA lacks stitching/data/direct_beam")
+    common = dict(scan="3", motor="nu", image_dir=root, filename_template="b_thampy_direct_beam_scan{scan}_{point:04d}.raw",
+                  reader_options={"detector_shape": (195, 1475), "raw_dtype": "int32", "raw_header_skip": 0},
+                  detector="Pilatus300kw", motion="horizontal", angle_zero_deg=0.)
+    found = calibrate_direct_beam_scan(root / "direct_beam", beam_pixel=None, **common)
+    typed = calibrate_direct_beam_scan(root / "direct_beam", beam_pixel=(279., 97.), **common)
+    assert found.beam_pixel == pytest.approx((279., 97.), abs=.5)
+    assert found.used.all() and found.distance_m == typed.distance_m
