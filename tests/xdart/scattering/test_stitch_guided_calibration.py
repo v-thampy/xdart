@@ -229,9 +229,12 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
     assert visible('rough_distance') and visible('beam_pixel') and not visible('beam_source')
     dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('scan'))  # and back: every scan row returns
-    assert all(visible(key) for key in ('beam_source', 'beam_scan', 'beam_images', 'beam_stem', 'beam_strip',
-                                        'beam_roi', 'beam_mask', 'beam_saturation'))
+    assert all(visible(key) for key in ('beam_source', 'beam_scan', 'beam_images', 'beam_stem'))
+    assert not dialog._fit_options.isHidden()  # the strip and ROI, under Fit options
     dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+    assert dialog._fit_options.isHidden()
+    # the Detector panel serves every step: its rows stay, whatever the rough geometry
+    assert all(visible(key) for key in ('beam_detector', 'raw', 'beam_size', 'beam_orientation', 'saturation', 'mask'))
     folder = tmp_path / 'frame-20'
     folder.mkdir()
     dialog.frames = (replace(_frame({'del': 20., 'nu': 0.}), identity='frame-20',
@@ -536,7 +539,7 @@ def test_the_detector_and_its_orientation_are_choices_saved_with_the_settings(tm
         assert [detector.itemData(row) for row in range(3)] == ['Pilatus100k', 'Pilatus300kw', 'Eiger1M']
         assert dialog._text('beam_detector') == 'Pilatus300kw' and dialog._text('beam_orientation') == '3'
         # the image the beam pixel is read in: width (x, columns) × height (y, rows)
-        assert dialog._image_size.text() == '1475 × 195 px (x × y): x 0–1474, y 0–194 · image rotation 0° (2 · Select frames)'
+        assert dialog._image_size.text() == '1475 × 195 px (x × y): x 0–1474, y 0–194 · image rotation 0°'
         # the hint does not suggest the centre: the beam need not be there (the 17-2 nu scan's is at 279, 97)
         assert dialog._row_visible('beam_size') and 'direct beam' in dialog._fields['beam_pixel'].placeholderText()
         # the first-pixel corner is not a rotation: it never swaps x and y
@@ -558,6 +561,11 @@ def test_the_detector_and_its_orientation_are_choices_saved_with_the_settings(tm
         again.apply_settings(dialog.settings())
         assert (again._text('beam_detector'), again._text('beam_orientation')) == ('Pilatus100k', '2')
         assert again._text('shape') == '195, 487'
+        # an older window's direct-beam mask and saturation and the refinement's count limit are now
+        # the Detector panel's saturation and mask
+        again.apply_settings({'fields': {'beam_mask': str(tmp_path / 'm.edf'), 'beam_saturation': '',
+                                         'refine_max_counts': '900000'}})
+        assert (again._text('mask'), again._text('saturation')) == (str(tmp_path / 'm.edf'), '900000')
         saved = dialog.settings()
         saved['fields']['beam_detector'] = 'SomeFutureDetector'  # a name this pyFAI does not list
         again.apply_settings(saved)

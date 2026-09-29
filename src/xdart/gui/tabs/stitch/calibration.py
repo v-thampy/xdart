@@ -357,8 +357,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
         layout.addLayout(form)
-        self.tabs.addTab(widget, title)
-        self._tab_pages[key] = widget
+        # A tab taller than the window scrolls rather than squeezing its rows (wrapped notes clip).
+        page = QtWidgets.QScrollArea()
+        page.setWidgetResizable(True)
+        page.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        page.setWidget(widget)
+        self.tabs.addTab(page, title)
+        self._tab_pages[key] = page
         return layout, form
 
     def _show_tab(self, key):
@@ -498,34 +503,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._edit(form, 'images', 'Images folder', chooser='directory', tip=self._FOLDER_TIP)
         self._attach('stem', 'images', 'Stem', '', tip=self._STEM_TIP)
         self._edit(form, 'entry', 'NeXus entry', 'entry', tip='The NeXus entry (group) holding the frames and angles.')
-        reader = QtWidgets.QWidget()
-        row = QtWidgets.QHBoxLayout(reader)
-        row.setContentsMargins(0, 0, 0, 0)
-        raw_tip = 'Only for headerless .raw images: the frame\'s rows and columns, pixel type and header size.'
-        for key, label, default in [('shape', 'rows, columns', '195, 1475'), ('dtype', 'type', 'int32'),
-                                    ('header', 'header bytes', '0')]:
-            caption = QtWidgets.QLabel(label)
-            edit = QtWidgets.QLineEdit(default)
-            edit.setObjectName(key)
-            self._fields[key] = edit
-            self._tip(raw_tip, caption, edit)
-            row.addWidget(caption)
-            row.addWidget(edit, 1)
-        form.addRow('RAW images', reader)
-        self._rows['raw'] = (form, reader)
-        self._tip(raw_tip, form.labelForField(reader))
-        self.rotation = self._combo(form, 'Image rotation (applied once)',
-                                    [(f'{value}° counterclockwise', value) for value in (0, 90, 180, 270)],
-                                    tip='Rotates every image once before calibration; use it when the stored '
-                                        'images are turned relative to the detector view you calibrate in.')
         self.refine_calibrant = self._combo(form, 'Calibrant', [(name, None) for name in (
             'LaB6', 'CeO2', 'Si', 'Al2O3', 'Cr2O3', 'AgBh')],
             tip='The powder standard in this scan: pyFAI opens each frame with it, the table predicts its '
                 'rings, and the refinement fits them. Another pyFAI calibrant name may be typed.')
         self.refine_calibrant.setEditable(True)
         self.refine_calibrant.currentTextChanged.connect(self._render_frames)
-        self.rotation.currentIndexChanged.connect(self._update_image_size)  # the beam pixel's image turns
-        self._update_image_size()
         self.source_kind.currentIndexChanged.connect(self._sync_source_rows)
         for key in ('source', 'scan'):
             self._fields[key].textChanged.connect(lambda _text: self._auto_placeholders())
@@ -546,7 +529,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _sync_source_rows(self, *_args):
         spec = self.source_kind.currentData() == 'spec'
-        for key, shown in (('scan', spec), ('images', spec), ('raw', spec), ('entry', not spec)):
+        for key, shown in (('scan', spec), ('images', spec), ('entry', not spec)):
             self._show(key, shown)
         self._label('source').setText('SPEC file' if spec else 'NeXus file')
 
@@ -647,8 +630,6 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._edit(auto, 'refine_frames', 'Frame budget', '48',
                    tip='At most this many frames of the calibrant scan are searched for ring points, spread '
                        'across its angles. More: better coverage, slower.')
-        self._edit(auto, 'refine_max_counts', 'Maximum valid counts (optional)', '',
-                   tip='Pixels above this count are ignored when finding ring points (e.g. saturated ones).')
         self.refine_button = QtWidgets.QPushButton('Refine automatically')
         self.refine_button.setToolTip('Finds ring points on frames across the whole calibrant scan, starting '
                                       'from the geometry above, and keeps the detector mount and sample offset '
@@ -704,7 +685,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         box = QtWidgets.QVBoxLayout(diffractometer)
         self.geometry_editor = GeometryEditor(used=('nu', 'del', 'tth'), used_by='Stitch')
         box.addWidget(self.geometry_editor)
-        layout.insertWidget(0, diffractometer)
+        top = QtWidgets.QHBoxLayout()  # the instrument: its circles, and the detector every step reads
+        top.addWidget(diffractometer, 1)
+        top.addWidget(self._build_detector(), 1)
+        layout.insertLayout(0, top)
         self.geometry_editor.changed.connect(self._geometry_edited)
         self.geometry_editor.changed.connect(self.geometryChanged.emit)
         # the arm's motors are these circles' (read by name as before)
@@ -740,25 +724,6 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                    tip='The motor that swings the detector in the direct-beam scan (del for psic\'s vertical arm).')
         self._edit(form, 'beam_zero', 'Known normal-incidence zero (degrees)', '0',
                    tip='That motor\'s reading when the detector faces the beam squarely; 0 unless it is offset.')
-        self._choice(form, 'beam_detector', 'Detector', [(label, name) for label, name in detector_choices()],
-                     'Pilatus300kw', tip='The detector model (pyFAI); it sets the pixel size and shape.')
-        corners = {3: 'bottom right (pyFAI default)', 1: 'top left', 2: 'top right', 4: 'bottom left'}
-        self._choice(form, 'beam_orientation', 'First pixel (pyFAI orientation)',
-                     [(f'{code} · first pixel {corners[code]}', code) for code, _name in DETECTOR_ORIENTATIONS], 3,
-                     tip='pyFAI\'s detector orientation: the corner holding the image\'s first pixel, seen '
-                         'from behind the detector looking at the sample. It is not a rotation: it never turns '
-                         'the image or swaps x and y (the image rotation under 2 · Select frames does). It '
-                         'changes how the PONIs are written, not the geometry: the arm\'s motor scales take '
-                         'its signs. Keep 3, pyFAI\'s default, unless pyFAI shows this detector\'s images '
-                         'mirrored. It is saved with every PONI and fit.')
-        self._image_size = QtWidgets.QLabel()
-        form.addRow('Image size', self._image_size)
-        self._rows['beam_size'] = (form, self._image_size)
-        self._tip('The detector image\'s width (x, columns) and height (y, rows) in pixels, as the beam '
-                  'pixel below is read: the detector\'s own layout, turned by the image rotation under '
-                  '2 · Select frames (90° and 270° swap x and y). The first-pixel corner above does not '
-                  'change it.',
-                  self._image_size, form.labelForField(self._image_size))
         self._edit(form, 'beam_pixel', 'Approximate beam pixel x, y (oriented image)', '',
                    tip='Column, row of the pixel the direct beam hits with the detector facing it squarely (the '
                        'motor at the zero above), in the image as displayed: read it off the scan\'s frame at '
@@ -767,15 +732,11 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                        'within the strip half width, because the spot is searched only in that strip.')
         self.motion = self._combo(form, 'Beam motion', [('horizontal', None), ('vertical', None)],
                                   tip='The direction the beam spot moves across the image as the motor turns.')
-        self._edit(form, 'beam_strip', 'Strip half width (pixels)', '2',
+        self._fit_options, options = self._card(layout, 'Fit options')
+        self._edit(options, 'beam_strip', 'Strip half width (pixels)', '2',
                    tip='The beam spot is searched in a strip this many pixels either side of its path.')
-        self._edit(form, 'beam_roi', 'ROI x0, y0, x1, y1 (optional)', '',
+        self._edit(options, 'beam_roi', 'ROI x0, y0, x1, y1 (optional)', '',
                    tip='Search only this pixel box (columns x0–x1, rows y0–y1).')
-        self._edit(form, 'beam_mask', 'Mask file (optional)', chooser='Masks (*.edf *.tif *.tiff *.npy);;All files (*)',
-                   tip='Pixels to ignore when finding the beam spot.')
-        self._edit(form, 'beam_saturation', 'Saturation level (optional)', '',
-                   tip='A frame with a beam-strip pixel at or above this count is saturated and left out '
-                       'of the fit.')
         self.rough_note = QtWidgets.QLabel()
         self.rough_note.setWordWrap(True)
         layout.addWidget(self.rough_note)
@@ -800,11 +761,73 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             self._fields[key].currentIndexChanged.connect(self._render_frames)
         self._fields['beam_detector'].currentIndexChanged.connect(self._detector_chosen)
         self._fields['beam_detector'].currentIndexChanged.connect(self._update_image_size)
+        self.rotation.currentIndexChanged.connect(self._update_image_size)  # the beam pixel's image turns
+        self._update_image_size()
+
+    def _build_detector(self):
+        """The detector every step reads the images with: its model, the stored image's layout and
+        turn, its saturation and one mask for the whole calibration (maintainer, 2026-09-29)."""
+        panel = QtWidgets.QGroupBox('Detector')
+        form = QtWidgets.QFormLayout(panel)
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self._choice(form, 'beam_detector', 'Model', [(label, name) for label, name in detector_choices()],
+                     'Pilatus300kw', tip='The detector model (pyFAI); it sets the pixel size and shape.')
+        reader = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(reader)
+        row.setContentsMargins(0, 0, 0, 0)
+        raw_tip = ('Only for headerless .raw images (the calibrant and direct-beam scans): the frame\'s rows '
+                   'and columns (set from the model), pixel type and header size.')
+        for key, label, default, stretch in [('shape', 'rows, cols', '195, 1475', 3), ('dtype', 'type', 'int32', 2),
+                                             ('header', 'header', '0', 1)]:
+            caption = QtWidgets.QLabel(label)
+            edit = QtWidgets.QLineEdit(default)
+            edit.setObjectName(key)
+            edit.setMinimumWidth(edit.fontMetrics().horizontalAdvance(default + '0'))
+            self._fields[key] = edit
+            self._tip(raw_tip, caption, edit)
+            row.addWidget(caption)
+            row.addWidget(edit, stretch)
+        form.addRow('RAW images', reader)
+        self._rows['raw'] = (form, reader)
+        self._tip(raw_tip, form.labelForField(reader))
+        self.rotation = self._combo(form, 'Image rotation (applied once)',
+                                    [(f'{value}° counterclockwise', value) for value in (0, 90, 180, 270)],
+                                    tip='Rotates every image once before calibration; use it when the stored '
+                                        'images are turned relative to the detector view you calibrate in.')
+        self._image_size = QtWidgets.QLabel()
+        self._image_size.setWordWrap(True)
+        form.addRow('Image size', self._image_size)
+        self._rows['beam_size'] = (form, self._image_size)
+        self._tip('The detector image\'s width (x, columns) and height (y, rows) in pixels, as the beam '
+                  'pixel is read: the detector\'s own layout, turned by the image rotation above (90° and '
+                  '270° swap x and y). The first-pixel corner below does not change it.',
+                  self._image_size, form.labelForField(self._image_size))
+        corners = {3: 'bottom right (pyFAI default)', 1: 'top left', 2: 'top right', 4: 'bottom left'}
+        self._choice(form, 'beam_orientation', 'First pixel (pyFAI orientation)',
+                     [(f'{code} · first pixel {corners[code]}', code) for code, _name in DETECTOR_ORIENTATIONS], 3,
+                     tip='pyFAI\'s detector orientation: the corner holding the image\'s first pixel, seen '
+                         'from behind the detector looking at the sample. It is not a rotation: it never turns '
+                         'the image or swaps x and y (the image rotation above does). It changes how the PONIs '
+                         'are written, not the geometry: the arm\'s motor scales take its signs. Keep 3, '
+                         'pyFAI\'s default, unless pyFAI shows this detector\'s images mirrored. It is saved '
+                         'with every PONI and fit.')
+        for combo in (self._fields['beam_detector'], self.rotation, self._fields['beam_orientation']):
+            # half the window's width: long entries elide instead of widening the panel
+            combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(12)
+        self._edit(form, 'saturation', 'Saturation (counts)', '',
+                   tip='Counts at or above this are saturated: a direct-beam frame with such a pixel in its '
+                       'beam strip is left out, and the automatic refinement picks no ring points above it. '
+                       'Blank: the image type\'s maximum.')
+        self._edit(form, 'mask', 'Mask file', chooser='Masks (*.edf *.tif *.tiff *.npy);;All files (*)',
+                   tip='Pixels to leave out when finding the direct beam, drawn on the stored image (before '
+                       'the image rotation), as the Stitch Mask File is.')
+        return panel
 
     _ROUGH_NOTES = {
         'scan': 'A direct-beam scan: SPEC supplies the angles for an image series or an Eiger/NeXus container; '
-                'standalone NeXus supplies both. Angle and image counts must match. Uses the image rotation and '
-                'image-series reader settings from Select frames. Its distance, with the beam pixel and zero, '
+                'standalone NeXus supplies both. Angle and image counts must match. Uses the Detector panel\'s '
+                'image rotation, RAW settings, saturation and mask. Its distance, with the beam pixel and zero, '
                 'predicts each frame\'s rings; the regression uncertainty excludes motor, zero and pitch systematics.',
         'manual': 'The distance, the pixel the direct beam hits at normal incidence and that zero predict each '
                   'frame\'s rings (the Geometry\'s arm, one degree per degree) until the first frame is '
@@ -812,7 +835,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         'skip': 'No rough geometry: each frame\'s rings are predicted from a geometry file (Fit and save), '
                 'or from the first frame you calibrate.',
     }
-    _GEOMETRY_ROWS = ('beam_motor', 'beam_zero', 'beam_pixel', 'beam_detector', 'beam_orientation', 'beam_size')
+    _GEOMETRY_ROWS = ('beam_motor', 'beam_zero', 'beam_pixel')
 
     def _update_image_size(self, *_args):
         """The detector image's x × y size, as the beam pixel is read (after the Select-frames rotation)."""
@@ -822,10 +845,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             self._fields['beam_pixel'].setPlaceholderText('column, row')
             return
         rows, columns = shape
-        rotation = int(self.rotation.currentData() or 0) if hasattr(self, 'rotation') else 0
+        rotation = int(self.rotation.currentData() or 0)
         width, height = (rows, columns) if rotation in (90, 270) else (columns, rows)
         self._image_size.setText(f'{width} × {height} px (x × y): x 0–{width - 1}, y 0–{height - 1} · '
-                                 f'image rotation {rotation}° (2 · Select frames)')
+                                 f'image rotation {rotation}°')
         self._fields['beam_pixel'].setPlaceholderText('column, row where the direct beam hits at the zero')
 
     def _detector_chosen(self, *_args):
@@ -842,14 +865,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                    'beam_scan': scan and kind != 'nexus', 'beam_image_file': scan and kind == 'spec_container',
                    'beam_images': scan and kind == 'spec_series', 'beam_stem': scan and kind == 'spec_series',
                    'beam_entry': scan and kind != 'spec_series',
-                   **dict.fromkeys(('beam_strip', 'beam_roi', 'beam_mask', 'beam_saturation'), scan),
                    **dict.fromkeys(self._GEOMETRY_ROWS, mode != 'skip')}
         form = self._beam_form
         for key, shown in visible.items():
             self._show(key, shown)
         form.setRowVisible(self.beam_source_kind, scan)
         form.setRowVisible(self.motion, scan)
-        for widget in (self.beam_button, self.beam_summary, self.apply_distance_button):
+        for widget in (self._fit_options, self.beam_button, self.beam_summary, self.apply_distance_button):
             widget.setVisible(scan)
         self._label('beam_source').setText('NeXus file' if kind == 'nexus' else 'SPEC file')
         self.rough_note.setText(self._ROUGH_NOTES[mode])
@@ -935,7 +957,11 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             self.geometry_editor.set_value(InstrumentGeometry.from_record(values.get('instrument_geometry')))
         except (ValueError, TypeError):
             pass  # an older settings file: the del/nu fields below still name the arm
-        for key, text in (values.get('fields') or {}).items():
+        fields = dict(values.get('fields') or {})
+        for old, new in (('beam_mask', 'mask'), ('beam_saturation', 'saturation'), ('refine_max_counts', 'saturation')):
+            if fields.get(old) and not fields.get(new):  # an older window's field, now the Detector panel's
+                fields[new] = fields[old]
+        for key, text in fields.items():
             if key in self._fields and isinstance(text, str):
                 self._set_field_text(key, text)
         for name, choice in (values.get('choices') or {}).items():
@@ -1176,8 +1202,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                            image_rotation=self.rotation.currentData(),
                            calibrant=self.refine_calibrant.currentText().strip() or 'LaB6',
                            max_frames=int(self._text('refine_frames')),
-                           max_counts=(float(self._text('refine_max_counts'))
-                                       if self._text('refine_max_counts') else None),
+                           max_counts=float(self._text('saturation')) if self._text('saturation') else None,
                            max_rms_q=float(self._text('rms')))
             self._invalidate_fit()
             self._start('refine', (spec, seed, options))
@@ -1220,6 +1245,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 domain[circle] = [low, high]
         return domain
 
+    def _oriented_mask(self):
+        """The Detector panel's mask, drawn on the stored image, turned as the images are."""
+        from xrd_tools.core.geometry import ImageOrientation
+        from xrd_tools.io.image import load_mask
+        return ImageOrientation(rotation=int(self.rotation.currentData() or 0)).apply(
+            load_mask(self._text('mask'))).astype(bool)
+
     def _distance(self):
         def go():
             if not self._text('beam_pixel'):
@@ -1233,11 +1265,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 rotation=self.rotation.currentData())
             if self._text('beam_roi'):
                 options['roi'] = tuple(int(v) for v in self._text('beam_roi').split(','))
-            if self._text('beam_mask'):
-                from xrd_tools.io.image import load_mask
-                options['mask'] = load_mask(self._text('beam_mask'))
-            if self._text('beam_saturation'):
-                options['saturation'] = float(self._text('beam_saturation'))
+            if self._text('mask'):
+                options['mask'] = self._oriented_mask()
+            if self._text('saturation'):
+                options['saturation'] = float(self._text('saturation'))
             motor = dict(zip(('del', 'nu'), self.geometry_editor.value().stitch_arm())).get(self._beam_role())
             self._start('distance', (self._spec(beam=True), motor or self._text('beam_motor'), options))
         self._guard(go)
