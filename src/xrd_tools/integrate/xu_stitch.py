@@ -776,19 +776,20 @@ def _checked_frame_histograms(
     polarization: tuple | None = None,
     dark: np.ndarray | None = None,
     flat: np.ndarray | None = None,
-    gi_cut: tuple | None = None,
+    gi_cuts: tuple | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Produce one frame's 1-D contributions and prove frame release.
 
     As in pyFAI, a dark is subtracted from the conditioned frame, and the flat
     and polarization weight the normalization next to the solid angle.
-    ``gi_cut`` (normal, beam, cut, window, edges) also bins the frame's GI cut,
-    from the same pixels and weights; its histograms are the fifth value.
+    ``gi_cuts`` (normal, beam, ((cut, window, edges), …)) also bins the frame's GI
+    cuts from the same pixels and weights, the GI coordinates computed once; their
+    histograms, one triple per cut, are the fifth value.
     """
 
     raw_image = image = q = valid = weights = factor = solid = None
     cut = other = inside = q_ip = q_oop = None
-    gi_histograms = None
+    gi_histograms = ()
     lease: XuPowderQFrameLease | None = None
     owned_refs: list[weakref.ReferenceType] = []
     pending: BaseException | None = None
@@ -858,18 +859,22 @@ def _checked_frame_histograms(
             np.float64,
             copy=False,
         )
-        if gi_cut is not None:
-            normal, beam, axis, window, gi_edges = gi_cut
+        if gi_cuts is not None:
+            normal, beam, cuts = gi_cuts
             q_ip, q_oop = lease.gi_coordinates(normal, beam)
-            cut, other = (q_ip, q_oop) if axis == "q_ip" else (q_oop, q_ip)
-            q_ip = q_oop = None
-            owned_refs.extend((weakref.ref(cut), weakref.ref(other)))
-            inside = np.logical_and(valid, np.isfinite(cut))
-            if window is not None:
-                np.logical_and(inside, (other >= window[0]) & (other <= window[1]), out=inside)
-            gi_histograms = (np.histogram(cut[inside], gi_edges, weights=image[inside])[0],
-                             np.histogram(cut[inside], gi_edges, weights=weights[inside])[0],
-                             np.histogram(cut[inside], gi_edges)[0].astype(np.float64, copy=False))
+            owned_refs.extend((weakref.ref(q_ip), weakref.ref(q_oop)))
+            histograms = []
+            for axis, window, gi_edges in cuts:
+                cut, other = (q_ip, q_oop) if axis == "q_ip" else (q_oop, q_ip)
+                inside = np.logical_and(valid, np.isfinite(cut))
+                if window is not None:
+                    np.logical_and(inside, (other >= window[0]) & (other <= window[1]), out=inside)
+                histograms.append((np.histogram(cut[inside], gi_edges, weights=image[inside])[0],
+                                   np.histogram(cut[inside], gi_edges, weights=weights[inside])[0],
+                                   np.histogram(cut[inside], gi_edges)[0].astype(np.float64, copy=False)))
+                inside = None
+            gi_histograms = tuple(histograms)
+            cut = other = q_ip = q_oop = None
         # Whole-frame monitor-normalised total: the dropped-frame statistic. Not
         # the in-range histogram, which legitimately shrinks at the range edges.
         d_total = float(image[valid].sum())
@@ -909,27 +914,37 @@ def _checked_frame_histograms(
     return d_signal, d_normalization, d_count, d_total, gi_histograms
 
 
-def _scout_gi_range(provider, frame_inputs, normals, beam, gi, cancel_token):
-    """The GI cut's full geometry extent inside the window, over every selected frame."""
-    low, high = math.inf, -math.inf
+def _scout_gi_bins(provider, frame_inputs, normals, beam, gi, cancel_token):
+    """Each GI cut's bin range: its own range, else its full geometry extent inside its window over
+    every selected frame (one pass)."""
+    bins = {cut: gi.bins(cut) for cut in gi.cuts}
+    scouted = [cut for cut in gi.cuts if bins[cut] is None]
+    if not scouted:
+        return bins
+    low, high = dict.fromkeys(scouted, math.inf), dict.fromkeys(scouted, -math.inf)
     for (_label, del_value, nu_value, _monitor), normal in zip(frame_inputs, normals):
         if cancel_token is not None and cancel_token.is_set():
             raise XuStitchCancelled("CANCELLED")
         lease = provider.frame(nu=nu_value, del_=del_value)
         try:
             q_ip, q_oop = lease.gi_coordinates(normal, beam)
-            cut, other = (q_ip, q_oop) if gi.cut == "q_ip" else (q_oop, q_ip)
-            inside = np.isfinite(cut)
-            if gi.window is not None:
-                inside &= (other >= gi.window[0]) & (other <= gi.window[1])
-            if inside.any():
-                low, high = min(low, float(cut[inside].min())), max(high, float(cut[inside].max()))
+            for cut in scouted:
+                values, other = (q_ip, q_oop) if cut == "q_ip" else (q_oop, q_ip)
+                inside = np.isfinite(values)
+                window = gi.window(cut)
+                if window is not None:
+                    inside &= (other >= window[0]) & (other <= window[1])
+                if inside.any():
+                    low[cut] = min(low[cut], float(values[inside].min()))
+                    high[cut] = max(high[cut], float(values[inside].max()))
         finally:
-            q_ip = q_oop = cut = other = inside = None
+            q_ip = q_oop = values = other = inside = None
             lease.release()
-    if not low < high:
-        raise XuStitchScienceRefused("STITCH_GI_RANGE_EMPTY", "no pixel lies inside the GI window")
-    return low, high
+    for cut in scouted:
+        if not low[cut] < high[cut]:
+            raise XuStitchScienceRefused("STITCH_GI_RANGE_EMPTY", "no pixel lies inside the GI window")
+        bins[cut] = (low[cut], high[cut])
+    return bins
 
 
 @dataclass(frozen=True, slots=True)
@@ -1003,14 +1018,14 @@ class XuStitchScienceResult:
     observations: XuStitchScienceObservations
     selected_frame_count: int
     release_check_frame_count: int
-    #: A GI Stitch's cut, beside I(q) (``stitch_gi``); None otherwise.
-    gi_payload: IntegrationResult1D | None = None
-    gi_diagnostics: StitchDiagnostics | None = None
+    #: A GI Stitch's cuts beside I(q) (``stitch_gi``), each (result, diagnostics) in the plan's
+    #: order; () otherwise.
+    gi_cuts: tuple[tuple[IntegrationResult1D, StitchDiagnostics], ...] = ()
 
     def __post_init__(self) -> None:
-        if (self.gi_payload is None) != (self.gi_diagnostics is None) or (
-                self.gi_payload is not None and (type(self.gi_payload) is not IntegrationResult1D
-                                                 or type(self.gi_diagnostics) is not StitchDiagnostics)):
+        if type(self.gi_cuts) is not tuple or any(
+                type(cut) is not tuple or len(cut) != 2 or type(cut[0]) is not IntegrationResult1D
+                or type(cut[1]) is not StitchDiagnostics for cut in self.gi_cuts):
             raise TypeError("XU Stitch GI result is invalid")
         if (
             type(self.payload) is not IntegrationResult1D
@@ -1062,11 +1077,12 @@ def run_xu_hist_stitch_1d(
     ``frame_record_callback`` borrows each raw frame before conditioning.
     ``polarization_factor``, ``dark`` and ``flat`` (oriented like the frames)
     apply pyFAI's corrections; an unusable dark or flat pixel joins the mask.
-    ``gi`` (a ``StitchGI``) also bins the GI cut beside I(q): every frame's sample
-    normal comes from xrayutilities' sample transform with all four sample angles
-    (eta from the incidence), and the result carries it as ``gi_payload``.
+    ``gi`` (a ``StitchGI``) also bins its GI cuts beside I(q), with ``npt`` points:
+    every frame's sample normal comes from xrayutilities' sample transform with all
+    four sample angles (eta from the incidence), and the result carries them as
+    ``gi_cuts``.
     """
-    from xrd_tools.integrate.stitch_gi import StitchGI, xu_sample_normal
+    from xrd_tools.integrate.stitch_gi import GI_UNITS, StitchGI, xu_sample_normal
     if gi is not None and (type(gi) is not StitchGI or unit != "q_A^-1"):
         raise TypeError("an XU GI cut needs an exact StitchGI beside I(q) in Q")
     if type(receipt) is not XuStitchCalibrationReceipt:
@@ -1247,7 +1263,8 @@ def run_xu_hist_stitch_1d(
     )
     # [signal, normalization, count] of I(q) and, for GI, of the cut
     totals = [np.zeros(npt, dtype=np.float64) for _ in range(3)]
-    gi_totals = None if gi is None else [np.zeros(gi.npt, dtype=np.float64) for _ in range(3)]
+    gi_totals = () if gi is None else tuple([np.zeros(npt, dtype=np.float64) for _ in range(3)]
+                                            for _cut in gi.cuts)
     release_count = 0
 
     def add(target, d_signal, d_normalization, d_count):
@@ -1270,10 +1287,10 @@ def run_xu_hist_stitch_1d(
             )
         target[:] = candidate
 
-    def accumulate(d_signal, d_normalization, d_count, gi_histograms=None):
+    def accumulate(d_signal, d_normalization, d_count, gi_histograms=()):
         add(totals, d_signal, d_normalization, d_count)
-        if gi_totals is not None:
-            add(gi_totals, *gi_histograms)
+        for target, histograms in zip(gi_totals, gi_histograms, strict=True):
+            add(target, *histograms)
     runtime_owner = xu_runtime_session()
     with runtime_owner as session:
         geometry = resolve_xu_stitch_effective_geometry(receipt, session)
@@ -1310,10 +1327,10 @@ def run_xu_hist_stitch_1d(
             surface = asset["xrayutilities"]["surface_normal_reference"]
             normals = [xu_sample_normal(geometry.hxrd.Ang2Q, *angles, surface_normal=surface)
                        for angles in sample_angles]
-            gi_bounds = gi.cut_range if gi.cut_range is not None else _scout_gi_range(
-                provider, frame_inputs, normals, beam, gi, cancel_token)
-            gi_edges = np.linspace(*gi_bounds, gi.npt + 1, dtype=np.float64)
-            gi_cuts = [(normal, beam, gi.cut, gi.window, gi_edges) for normal in normals]
+            gi_bins = _scout_gi_bins(provider, frame_inputs, normals, beam, gi, cancel_token)
+            gi_edges = {cut: np.linspace(*gi_bins[cut], npt + 1, dtype=np.float64) for cut in gi.cuts}
+            cuts = tuple((cut, gi.window(cut), gi_edges[cut]) for cut in gi.cuts)
+            gi_cuts = [(normal, beam, cuts) for normal in normals]
         for index, (label, del_value, nu_value, monitor) in enumerate(frame_inputs):
             if cancel_token is not None and cancel_token.is_set():
                 raise XuStitchCancelled("CANCELLED")
@@ -1335,7 +1352,7 @@ def run_xu_hist_stitch_1d(
                 polarization=polarization,
                 dark=dark,
                 flat=flat,
-                gi_cut=gi_cuts[index],
+                gi_cuts=gi_cuts[index],
             )
             release_count += 1
             if (
@@ -1369,10 +1386,9 @@ def run_xu_hist_stitch_1d(
                 )
         revalidate_xu_stitch_calibration(receipt)
         payload, diagnostics = _normalized(centres, *totals, unit)
-        gi_payload = gi_diagnostics = None
-        if gi is not None:
-            gi_payload, gi_diagnostics = _normalized(
-                (gi_edges[:-1] + gi_edges[1:]) * 0.5, *gi_totals, gi.unit)
+        gi_results = tuple(
+            _normalized((gi_edges[cut][:-1] + gi_edges[cut][1:]) * 0.5, *cut_totals, GI_UNITS[cut])
+            for cut, cut_totals in zip(() if gi is None else gi.cuts, gi_totals))
         effective_projection = geometry.projection
     if runtime_owner.execution_record is None:
         raise XuStitchScienceRefused(
@@ -1386,8 +1402,7 @@ def run_xu_hist_stitch_1d(
         observations,
         len(labels),
         release_count,
-        gi_payload,
-        gi_diagnostics,
+        gi_results,
     )
 
 

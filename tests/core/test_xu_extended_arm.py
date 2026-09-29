@@ -258,14 +258,15 @@ def test_a_guided_xu_extended_fit_saves_a_v3_asset_the_runtime_admits(tmp_path):
     assert json.loads(open(path).read())['version'] == 3
 
 
-def test_an_xu_gi_cut_bins_pyfais_fiber_coordinates_and_leaves_iq_alone(tmp_path, transferred):
+def test_xu_gi_cuts_bin_pyfais_fiber_coordinates_and_leave_iq_alone(tmp_path, transferred):
     """GI Stitch 1D with xrayutilities (maintainer, 2026-09-29): every frame's sample normal comes
-    from all four sample angles (17-2's mounting: chi 90, eta the incidence), and the cut bins exactly
-    the pixels pyFAI's fiber model puts there (orientation 4, the same incidence), sample offset and
-    all; I(q) beside it is unchanged."""
+    from all four sample angles (17-2's mounting: chi 90, eta the incidence), and each cut bins
+    exactly the pixels pyFAI's fiber model puts there (orientation 4, the same incidence), sample
+    offset and all; Qip + Qoop gives exactly the two single-cut results; I(q) beside them is
+    unchanged."""
     from pyFAI.units import get_unit_fiber
     from xrd_tools.integrate.gid import _fiber_from_integrator
-    from xrd_tools.integrate.stitch_gi import StitchGI
+    from xrd_tools.integrate.stitch_gi import GI_UNITS, StitchGI
     from xrd_tools.integrate.xu_stitch import run_xu_hist_stitch_1d
     angles = {1: (12., -7.), 2: (26., 4.), 3: (38., 16.)}
 
@@ -278,25 +279,36 @@ def test_an_xu_gi_cut_bins_pyfais_fiber_coordinates_and_leaves_iq_alone(tmp_path
         def load_frame(self, label):
             return np.full(SHAPE, 10.0, dtype=np.float32)
 
-    gi = StitchGI('q_ip', incidence_motor='eta', sample_motors=(('mu', None), ('chi', 'chi'), ('phi', None)),
-                  npt=48, cut_range=(-4., 4.), window=(0., 1.5))
+    ranges = {'q_ip': (-4., 4.), 'q_oop': (0., 1.5)}
     receipt = _receipt(tmp_path, transferred[0])
-    common = dict(frame_indices=(1, 2, 3), npt=64, radial_range=(.5, 6.), monitor_key=None,
+    common = dict(frame_indices=(1, 2, 3), npt=48, radial_range=(.5, 6.), monitor_key=None,
                   max_frame_bytes=8 * 1024 * 1024)
-    result = run_xu_hist_stitch_1d(receipt, Source(), gi=gi, **common)
-    plain = run_xu_hist_stitch_1d(receipt, Source(), **common)
+
+    def stitch(*cuts):
+        gi = None if not cuts else StitchGI(cuts, incidence_motor='eta', ip_range=ranges['q_ip'],
+                                            oop_range=ranges['q_oop'],
+                                            sample_motors=(('mu', None), ('chi', 'chi'), ('phi', None)))
+        return run_xu_hist_stitch_1d(receipt, Source(), gi=gi, **common)
+
+    result, plain = stitch('q_ip', 'q_oop'), stitch()
     np.testing.assert_array_equal(result.payload.intensity, plain.payload.intensity)
-    assert result.gi_payload.unit == 'qip_A^-1' and plain.gi_payload is None
+    assert plain.gi_cuts == () and [cut.unit for cut, _ in result.gi_cuts] == [GI_UNITS['q_ip'], GI_UNITS['q_oop']]
     diff = Diffractometer.from_pyfai_goniometer(_record(), source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
-    edges = np.linspace(-4., 4., 49)
-    expected = np.zeros(48)
+    expected = {name: np.zeros(48) for name in ranges}
     for (delta, nu) in angles.values():
         integrator, = create_multigeometry_integrators_from_geometry(diff, {'del': np.array([delta]), 'nu': np.array([nu])})
         fiber = _fiber_from_integrator(integrator, incident_angle=.4, tilt_angle=0., sample_orientation=4, angle_unit='deg')
         unit = dict(incident_angle=.4, tilt_angle=0., sample_orientation=4, angle_unit='deg')
-        qip = np.asarray(fiber.array_from_unit(SHAPE, 'center', get_unit_fiber('qip_A^-1', **unit), scale=True))
-        qoop = np.asarray(fiber.array_from_unit(SHAPE, 'center', get_unit_fiber('qoop_A^-1', **unit), scale=True))
+        values = {'q_ip': np.asarray(fiber.array_from_unit(SHAPE, 'center', get_unit_fiber('qip_A^-1', **unit), scale=True)),
+                  'q_oop': np.asarray(fiber.array_from_unit(SHAPE, 'center', get_unit_fiber('qoop_A^-1', **unit), scale=True))}
         mask = integrator.detector.mask
-        keep = (qoop >= 0.) & (qoop <= 1.5) & np.isfinite(qip) & (True if mask is None else ~np.asarray(mask, bool))
-        expected += np.histogram(qip[keep], edges)[0]
-    np.testing.assert_array_equal(result.gi_diagnostics.coverage, expected)
+        for name, other in (('q_ip', 'q_oop'), ('q_oop', 'q_ip')):
+            low, high = ranges[other]
+            keep = ((values[other] >= low) & (values[other] <= high) & np.isfinite(values[name])
+                    & (True if mask is None else ~np.asarray(mask, bool)))
+            expected[name] += np.histogram(values[name][keep], np.linspace(*ranges[name], 49))[0]
+    for name, (cut, diagnostics) in zip(('q_ip', 'q_oop'), result.gi_cuts):
+        np.testing.assert_array_equal(diagnostics.coverage, expected[name])
+        (single, single_diagnostics), = stitch(name).gi_cuts
+        np.testing.assert_array_equal(cut.intensity, single.intensity)
+        np.testing.assert_array_equal(diagnostics.normalization, single_diagnostics.normalization)

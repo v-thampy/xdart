@@ -1,11 +1,12 @@
 """Stitched results as Int records (maintainer, 2026-09-29).
 
-A stitched pattern is an Int 1D record: I(q) is row 1 of ``integrated_1d`` and a GI cut is that row's
-second mode (the primary mode is then ``q_total``), so Int's reader, view, units and shared axes apply
-unchanged. ``entry/stitch`` holds what an Int record has no place for:
+A stitched pattern is an Int 1D record: I(q) is row 1 of ``integrated_1d`` and each GI cut (q_ip,
+q_oop or both) is another mode of that row (the primary mode is then ``q_total``), so Int's reader,
+view, units and shared axes apply unchanged. ``entry/stitch`` holds what an Int record has no place
+for:
 
 - each pattern's ``coverage`` (pixels per bin) and ``normalization`` (Σ weights, the denominator of I),
-  the GI cut's under ``stitch/<cut>/``;
+  a GI cut's under ``stitch/<cut>/``;
 - the contributing frames: their source records under ``stitch/frames/`` (the raw popup and the
   metadata dialog read them) and their manifest, ``stitch/contributing_frames_json``;
 - the Stitch output owner's request envelope (``analysis_artifact``).
@@ -24,7 +25,7 @@ STITCH_GROUP = "stitch"
 FRAMES_JSON = "contributing_frames_json"
 #: The record's one row.
 LABEL = 1
-#: The GI cuts a stitched record may carry beside I(q) (Int's GI 1-D mode keys).
+#: The GI cuts a stitched record may carry beside I(q) (Int's GI 1-D mode keys), in their one order.
 GI_MODES = ("q_ip", "q_oop")
 _PRIMARY_GI = "q_total"
 
@@ -52,11 +53,12 @@ class StitchedPattern:
 
 @dataclass(frozen=True, eq=False)
 class StitchRecord:
-    """A stitched record as read back: I(q), the GI cut as ``(mode, pattern)`` or None, the
-    wavelength (Å) or None, and the contributing-frames manifest (JSON) or None."""
+    """A stitched record as read back: I(q), the GI cuts as ``(mode, pattern)`` pairs in
+    ``GI_MODES`` order (() without GI), the wavelength (Å) or None, and the contributing-frames
+    manifest (JSON) or None."""
 
     pattern: StitchedPattern
-    gi: tuple[str, StitchedPattern] | None
+    gi: tuple[tuple[str, StitchedPattern], ...]
     wavelength_A: float | None
     frames_json: str | None
 
@@ -66,23 +68,26 @@ def _float32(group: h5py.Group, name: str, values) -> None:
 
 
 def write_stitch_record(entry: h5py.Group, target: str | Path, pattern: StitchedPattern, *,
-                        gi: tuple[str, StitchedPattern] | None = None, wavelength_A: float | None = None,
+                        gi: tuple[tuple[str, StitchedPattern], ...] = (), wavelength_A: float | None = None,
                         frame_records=None, frames_json: str | None = None,
                         source_base: str | Path | None = None) -> h5py.Group:
     """Write a stitched pattern into ``entry`` of a fresh document from ``open_nexus_writer`` whose
     logical path is ``target``, and return the new ``entry/stitch`` group.
 
-    ``gi`` is ``(mode, pattern)`` with mode 'q_ip' or 'q_oop'. ``frame_records`` are
-    ``write_contributing_frames`` records and ``frames_json`` their manifest.
+    ``gi`` holds ``(mode, pattern)`` pairs with distinct modes 'q_ip' and 'q_oop', written in
+    ``GI_MODES`` order. ``frame_records`` are ``write_contributing_frames`` records and ``frames_json``
+    their manifest.
     """
     from xrd_tools.core.containers import IntegrationResult1D
     from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
     from xrd_tools.io.nexus_record import write_contributing_frames
     from xrd_tools.io.record_writer import NexusRecordWriter, RecordWrite
 
-    if gi is not None and gi[0] not in GI_MODES:
-        raise ValueError(f"a stitched GI cut must be one of {GI_MODES}")
-    for value in (pattern, *(() if gi is None else (gi[1],))):
+    modes = [mode for mode, _value in gi]
+    if any(mode not in GI_MODES for mode in modes) or len(set(modes)) != len(modes):
+        raise ValueError(f"stitched GI cuts must be distinct modes of {GI_MODES}")
+    gi = tuple(sorted(gi, key=lambda cut: GI_MODES.index(cut[0])))
+    for value in (pattern, *(value for _mode, value in gi)):
         if value.coverage is None or value.normalization is None:
             raise ValueError("a stitched pattern needs its coverage and normalization")
     if STITCH_GROUP in entry:
@@ -96,9 +101,9 @@ def write_stitch_record(entry: h5py.Group, target: str | Path, pattern: Stitched
                                             wavelength=float(wavelength_A), angles={}, counters={}), {})
     writer = NexusRecordWriter.for_finite_document(target, entry.file, entry=str(entry.name).strip("/"),
                                                    source_base=None)
-    primary = _PRIMARY_GI if gi is not None else DEFAULT_MODE_KEY
+    primary = _PRIMARY_GI if gi else DEFAULT_MODE_KEY
     writer.begin(primary_mode_1d=primary)
-    rows = [(primary, pattern)] + ([gi] if gi is not None else [])
+    rows = [(primary, pattern), *gi]
     for position, (mode, value) in enumerate(rows):
         writer.write_batch([RecordWrite(
             label=LABEL, result_1d=IntegrationResult1D(value.axis, value.intensity, value.sigma, value.unit),
@@ -110,11 +115,11 @@ def write_stitch_record(entry: h5py.Group, target: str | Path, pattern: Stitched
     _bounded_text_attr(stitch, "NX_class", "NXcollection")
     _float32(stitch, "coverage", pattern.coverage)
     _float32(stitch, "normalization", pattern.normalization)
-    if gi is not None:
-        cut = stitch.create_group(gi[0])
+    for mode, value in gi:
+        cut = stitch.create_group(mode)
         _bounded_text_attr(cut, "NX_class", "NXcollection")
-        _float32(cut, "coverage", gi[1].coverage)
-        _float32(cut, "normalization", gi[1].normalization)
+        _float32(cut, "coverage", value.coverage)
+        _float32(cut, "normalization", value.normalization)
     if frame_records:
         write_contributing_frames(stitch, frame_records, source_base=source_base, bounded=True)
     if frames_json is not None:
@@ -125,10 +130,9 @@ def write_stitch_record(entry: h5py.Group, target: str | Path, pattern: Stitched
 def write_stitch_projection(entry: h5py.Group, target: str | Path, projection, *, frame_records=None,
                             source_base: str | Path | None = None) -> h5py.Group:
     """Write a Stitch 1D result projection (``analysis_artifact``), the exact bytes its fingerprint
-    describes: I(q), its GI cut, the wavelength and contributors manifest it carries."""
-    gi = projection.gi
+    describes: I(q), its GI cuts, the wavelength and contributors manifest it carries."""
     return write_stitch_record(entry, target, StitchedPattern.from_projection(projection),
-                               gi=None if gi is None else (gi[0], StitchedPattern.from_projection(gi[1])),
+                               gi=tuple((mode, StitchedPattern.from_projection(cut)) for mode, cut in projection.gi),
                                wavelength_A=projection.wavelength_A, frame_records=frame_records,
                                frames_json=projection.frame_manifest_json, source_base=source_base)
 
@@ -183,24 +187,25 @@ def _read(handle: h5py.File, entry: str, container: Path) -> StitchRecord:
     stitch = root.get(STITCH_GROUP)
     if not isinstance(stitch, h5py.Group):
         raise ValueError("the record has no stitch group")
-    extras = tuple(mode for mode, _group in groups.mode_groups_1d if mode != groups.primary_mode_1d)
-    if extras and (groups.primary_mode_1d != _PRIMARY_GI or len(extras) != 1 or extras[0] not in GI_MODES):
-        raise ValueError("a stitched record carries at most one GI cut beside q_total")
+    extras = {mode for mode, _group in groups.mode_groups_1d if mode != groups.primary_mode_1d}
+    if extras and (groups.primary_mode_1d != _PRIMARY_GI or not extras <= set(GI_MODES)):
+        raise ValueError(f"a stitched record carries only the GI cuts {GI_MODES} beside q_total")
     pattern = _pattern(groups.integrated_1d, _stored(stitch, "coverage"), _stored(stitch, "normalization"))
-    gi = None
-    for mode in extras:
+    gi = []
+    for mode in (mode for mode in GI_MODES if mode in extras):  # one order, not the file's
         cut = stitch.get(mode)
         if not isinstance(cut, h5py.Group):
             raise ValueError(f"the stitched GI cut {mode} has no coverage or normalization")
-        gi = (mode, _pattern(groups.mode_group("1d", mode), _stored(cut, "coverage"), _stored(cut, "normalization")))
-        if gi[1].sigma is not None:  # no fingerprint covers one (Codex review F6)
+        value = _pattern(groups.mode_group("1d", mode), _stored(cut, "coverage"), _stored(cut, "normalization"))
+        if value.sigma is not None:  # no fingerprint covers one (Codex review F6)
             raise ValueError("a stitched GI cut carries no sigma")
+        gi.append((mode, value))
     text = stitch.get(FRAMES_JSON)
     if text is not None and not isinstance(text, h5py.Dataset):
         raise ValueError("the stitched frames manifest must be a dataset")
     frames_json = None if text is None else bytes(text[()]).decode("utf-8")
     wavelength = float(_read_wavelength(root, _read_energy(root))) if "instrument" in root else None
-    return StitchRecord(pattern, gi, wavelength, frames_json)
+    return StitchRecord(pattern, tuple(gi), wavelength, frames_json)
 
 
 def read_stitch_record(source: str | Path | h5py.File, *, entry: str = "entry") -> StitchRecord:

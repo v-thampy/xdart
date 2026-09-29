@@ -28,6 +28,7 @@ from xrd_tools.core.containers import (
 from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
 from xrd_tools.integrate.detector_mask import mask_with_detector
 from xrd_tools.integrate.calibration import poni_to_integrator
+from xrd_tools.integrate.stitch_gi import GI_UNITS
 
 if TYPE_CHECKING:
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator
@@ -192,7 +193,8 @@ def _streaming_multigeometry(
     gi=None,
     incidences: Sequence[float] | None = None,
 ):
-    """Returns (pyFAI's merged result, the GI cut's [signal, normalization, count, axis] or None)."""
+    """Returns (pyFAI's merged result, each GI cut's [signal, normalization, count, axis] in the plan's
+    order, or () without GI)."""
     from pyFAI.multi_geometry import MultiGeometry
 
     if type(image_count) is not int or image_count < 1:
@@ -217,14 +219,15 @@ def _streaming_multigeometry(
     )
     if gi is not None and (mode != "1d" or incidences is None or len(incidences) != image_count):
         raise ValueError("a GI cut needs a 1-D Stitch and one incidence per frame")
-    gi_range = None if gi is None else gi.cut_range or _scout_gi_range(integrator_factory, incidences, gi)
+    gi_bins = {} if gi is None else _gi_bins(integrator_factory, incidences, gi)
     gi_totals = None
 
-    def add_gi(part):
+    def add_gi(parts):
         nonlocal gi_totals
-        if part is not None:
-            gi_totals = list(part) if gi_totals is None else [
-                total + value for total, value in zip(gi_totals[:3], part[:3])] + [gi_totals[3]]
+        if parts:
+            gi_totals = [list(part) for part in parts] if gi_totals is None else [
+                [total + value for total, value in zip(totals[:3], part[:3])] + [totals[3]]
+                for totals, part in zip(gi_totals, parts)]
 
     image_iterator = iter(images)
     integrator_iterator = iter(integrator_factory())
@@ -346,10 +349,10 @@ def _streaming_multigeometry(
                     azimuthal = current_azimuthal.copy()
                 elif not np.array_equal(azimuthal, current_azimuthal):
                     raise ValueError("pyFAI returned inconsistent Stitch azimuth axes")
-            gi_part = None if gi is None else _gi_frame_sums(
-                integrator, image, float(incidences[index]), gi, gi_range, mask=frame_mask,
+            gi_part = () if gi is None else tuple(_gi_frame_sums(
+                integrator, image, float(incidences[index]), gi, cut, gi_bins[cut], npt_rad, mask=frame_mask,
                 correct_solid_angle=correct_solid_angle, polarization_factor=polarization_factor,
-                dark=dark, flat=flat, monitor=monitor)
+                dark=dark, flat=flat, monitor=monitor) for cut in gi.cuts)
             if frame_screen is None:
                 aggregate = (
                     copy.deepcopy(result)
@@ -400,38 +403,43 @@ def _streaming_multigeometry(
             raise ValueError("every Stitch frame was excluded as a dropped frame")
     if aggregate is None or radial is None:
         raise ValueError("streaming Stitch produced no result")
-    return aggregate, gi_totals
+    return aggregate, () if gi_totals is None else tuple(gi_totals)
 
 
-def _gi_frame_sums(integrator, image, incidence, gi, gi_range, *, mask, correct_solid_angle,
+def _gi_frame_sums(integrator, image, incidence, gi, cut, bins, npt, *, mask, correct_solid_angle,
                    polarization_factor, dark, flat, monitor):
-    """One frame's GI cut as pyFAI's fiber sums: [signal, normalization × pixel area/dist², count,
-    axis], accumulated across frames as pyFAI's MultiGeometryFiber does."""
+    """One frame's GI cut ``cut`` as pyFAI's fiber sums: [signal, normalization × pixel area/dist²,
+    count, axis], accumulated across frames as pyFAI's MultiGeometryFiber does."""
     from xrd_tools.integrate.gid import _effective_gi_params, _fiber_from_integrator
     fiber = _fiber_from_integrator(integrator, incident_angle=incidence, tilt_angle=gi.tilt_deg,
                                    sample_orientation=gi.sample_orientation)
     angle, tilt, orientation = _effective_gi_params(fiber, None, None, None)
-    ranges = ({"ip_range": gi_range, "oop_range": gi.window} if gi.cut == "q_ip"
-              else {"ip_range": gi.window, "oop_range": gi_range})
-    cut = fiber.integrate_fiber(
-        image, npt_ip=gi.npt, unit_ip="qip_A^-1", npt_oop=gi.npt, unit_oop="qoop_A^-1",
-        vertical_integration=gi.cut == "q_oop", correctSolidAngle=correct_solid_angle, mask=mask,
+    ranges = ({"ip_range": bins, "oop_range": gi.window(cut)} if cut == "q_ip"
+              else {"ip_range": gi.window(cut), "oop_range": bins})
+    result = fiber.integrate_fiber(
+        image, npt_ip=npt, unit_ip="qip_A^-1", npt_oop=npt, unit_oop="qoop_A^-1",
+        vertical_integration=cut == "q_oop", correctSolidAngle=correct_solid_angle, mask=mask,
         polarization_factor=polarization_factor, dark=dark, flat=flat,
         method=("no", "histogram", "cython"), normalization_factor=monitor,
         incident_angle=angle, tilt_angle=tilt, sample_orientation=orientation, **ranges)
     scale = fiber.pixel1 * fiber.pixel2 / fiber.dist ** 2 if correct_solid_angle else 1.0
-    axis = getattr(cut, "integrated", None)
-    return [np.asarray(cut.sum_signal, dtype=np.float64),
-            np.asarray(cut.sum_normalization, dtype=np.float64) * scale,
-            np.asarray(cut.count, dtype=np.float64),
-            np.asarray(cut.radial if axis is None else axis, dtype=np.float64)]
+    axis = getattr(result, "integrated", None)
+    return [np.asarray(result.sum_signal, dtype=np.float64),
+            np.asarray(result.sum_normalization, dtype=np.float64) * scale,
+            np.asarray(result.count, dtype=np.float64),
+            np.asarray(result.radial if axis is None else axis, dtype=np.float64)]
 
 
-def _scout_gi_range(integrator_factory, incidences, gi):
-    """The cut's full extent inside the window over every frame (no image reads)."""
+def _gi_bins(integrator_factory, incidences, gi):
+    """Each cut's bin range: its own range, else its full extent inside its window over every
+    frame (one pass, no image reads)."""
+    bins = {cut: gi.bins(cut) for cut in gi.cuts}
+    scouted = [cut for cut in gi.cuts if bins[cut] is None]
+    if not scouted:
+        return bins
     from pyFAI.units import get_unit_fiber
     from xrd_tools.integrate.gid import _fiber_from_integrator
-    low, high = np.inf, -np.inf
+    low, high = dict.fromkeys(scouted, np.inf), dict.fromkeys(scouted, -np.inf)
     for integrator, incidence in zip(integrator_factory(), incidences):
         try:
             fiber = _fiber_from_integrator(integrator, incident_angle=float(incidence), tilt_angle=gi.tilt_deg,
@@ -441,17 +449,22 @@ def _scout_gi_range(integrator_factory, incidences, gi):
             shape = fiber.detector.shape
             q_ip = np.asarray(fiber.array_from_unit(shape, "center", get_unit_fiber("qip_A^-1", **unit), scale=True))
             q_oop = np.asarray(fiber.array_from_unit(shape, "center", get_unit_fiber("qoop_A^-1", **unit), scale=True))
-            cut, other = (q_ip, q_oop) if gi.cut == "q_ip" else (q_oop, q_ip)
-            inside = np.isfinite(cut)
-            if gi.window is not None:
-                inside &= (other >= gi.window[0]) & (other <= gi.window[1])
-            if inside.any():
-                low, high = min(low, float(cut[inside].min())), max(high, float(cut[inside].max()))
+            for cut in scouted:
+                values, other = (q_ip, q_oop) if cut == "q_ip" else (q_oop, q_ip)
+                inside = np.isfinite(values)
+                window = gi.window(cut)
+                if window is not None:
+                    inside &= (other >= window[0]) & (other <= window[1])
+                if inside.any():
+                    low[cut] = min(low[cut], float(values[inside].min()))
+                    high[cut] = max(high[cut], float(values[inside].max()))
         finally:
             integrator.reset(collect_garbage=False)
-    if not low < high:
-        raise ValueError("no pixel lies inside the GI window")
-    return (low, high)
+    for cut in scouted:
+        if not low[cut] < high[cut]:
+            raise ValueError("no pixel lies inside the GI window")
+        bins[cut] = (low[cut], high[cut])
+    return bins
 
 
 def gi_cut_result(totals, unit):
@@ -484,12 +497,12 @@ def stitch_1d_streaming(
     gi=None,
     incidences: Sequence[float] | None = None,
 ) -> tuple[IntegrationResult1D, StitchDiagnostics,
-           tuple[IntegrationResult1D, StitchDiagnostics] | None]:
+           tuple[tuple[IntegrationResult1D, StitchDiagnostics], ...]]:
     """Sequential MultiGeometry merge that retains only one detector frame.
 
-    Returns (I(q), diagnostics, the GI cut): with ``gi`` (a ``StitchGI``) and one incidence per
-    frame, the cut (``gi_cut_result``) is binned from the same frames by pyFAI's fiber model;
-    otherwise it is None.
+    Returns (I(q), diagnostics, the GI cuts): with ``gi`` (a ``StitchGI``) and one incidence per
+    frame, each of its cuts (``gi_cut_result``, in ``gi.cuts`` order) is binned with ``npt`` points
+    from the same frames by pyFAI's fiber model; otherwise the cuts are ().
     """
 
     result, gi_totals = _streaming_multigeometry(
@@ -524,7 +537,8 @@ def stitch_1d_streaming(
         unit=radial_unit,
     )
     diagnostics = StitchDiagnostics(result.count, result.sum_normalization)
-    return payload, diagnostics, None if gi is None else gi_cut_result(gi_totals, gi.unit)
+    return payload, diagnostics, tuple(gi_cut_result(totals, GI_UNITS[cut])
+                                       for cut, totals in zip(() if gi is None else gi.cuts, gi_totals))
 
 
 def stitch_2d_streaming(

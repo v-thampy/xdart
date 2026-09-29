@@ -2455,7 +2455,7 @@ def _runtime_plan(plan: StitchOperationPlan, diffractometer) -> StitchPlan:
         conditioning=plan.conditioning,
         max_eager_bytes=None,
         streaming_multigeometry=True,
-        gi_cut=plan.gi,
+        stitch_gi=plan.gi,
     )
 
 
@@ -2567,11 +2567,12 @@ def _native_artifact_args(request, records):
             "frame_records": records, "source_base": request.manifest.project_root}
 
 
-def _gi_cut(plan, cut, diagnostics):
-    """A GI Stitch 1D's cut as the projection takes it (None without GI)."""
-    if plan.gi is None:
-        return None
-    return (plan.gi.cut, cut.unit, cut.radial, cut.intensity, diagnostics.coverage, diagnostics.normalization)
+def _gi_cuts(plan, cuts):
+    """A GI Stitch 1D's cuts as the projection takes them, in the plan's order (() without GI)."""
+    if len(cuts) != (0 if plan.gi is None else len(plan.gi.cuts)):
+        raise AnalysisArtifactProjectionInvalid("the science returned other GI cuts than the plan's")
+    return tuple((mode, cut.unit, cut.radial, cut.intensity, diagnostics.coverage, diagnostics.normalization)
+                 for mode, (cut, diagnostics) in zip(() if plan.gi is None else plan.gi.cuts, cuts))
 
 
 def _write_record(entry, target, projection, native_args) -> None:
@@ -2862,8 +2863,7 @@ class StitchOperationExecution:
                 coverage=diagnostics.coverage,
                 normalization=diagnostics.normalization,
                 **_native_artifact_args(self.request, records),
-                gi_cut=(None if scientific.gi_payload is None
-                        else _gi_cut(plan, scientific.gi_payload, scientific.gi_diagnostics)),
+                gi_cuts=_gi_cuts(plan, scientific.gi_cuts),
             )
         except AnalysisArtifactProjectionInvalid:
             return self._terminal(
@@ -3107,8 +3107,7 @@ class StitchOperationExecution:
                 coverage=diagnostics.coverage,
                 normalization=diagnostics.normalization,
                 **_native_artifact_args(self.request, records),
-                gi_cut=(None if scientific.gi_cut is None
-                        else _gi_cut(self.request.plan, *scientific.gi_cut)),
+                gi_cuts=_gi_cuts(self.request.plan, scientific.gi_cuts),
             )
         except AnalysisArtifactProjectionInvalid:
             return self._terminal(

@@ -1,6 +1,6 @@
 """Grazing incidence on the Stitch page, set as Int sets it in the Experiment section (maintainer,
 2026-09-29): Int's own rows (Standard|Grazing, the incidence motor, the Manual angle, '…' for the
-orientation and tilt), with Stitch's default order, and the GI cut beside the 1-D axis."""
+orientation and tilt), with Stitch's default order; Grazing's Axis adds Qip, Qoop and Qip + Qoop."""
 from pathlib import Path
 
 import pytest
@@ -43,11 +43,16 @@ def _close(page, qapp):
     qapp.processEvents()
 
 
+def _axes(page):
+    editor = page._rows["unit"].editor
+    return [editor.itemText(index) for index in range(editor.count())]
+
+
 def test_grazing_shows_ints_rows_with_the_scans_motors_and_eta_first(qapp, tmp_path):
     page = _page(tmp_path, "multigeometry")
     try:
         assert page.build_form().gi is None and _row(page, GI_MOTOR) is None
-        assert all(row.isHidden() for row in page._gi_rows)
+        assert all(row.isHidden() for row in page._gi_rows) and _axes(page) == ["Q (Å⁻¹)", "2θ (°)"]
         _click(page, "Grazing")
         motor = _row(page, GI_MOTOR).editor
         assert [motor.itemText(index) for index in range(motor.count())] == ["Manual", *_MOTORS]
@@ -55,15 +60,25 @@ def test_grazing_shows_ints_rows_with_the_scans_motors_and_eta_first(qapp, tmp_p
         assert _row(page, GI_THETA) is None  # a motor gives the angle
         assert any(button.isVisibleTo(page._gi_host)  # '…': Orientation, Tilt
                    for button in page._gi_host.findChildren(QtWidgets.QToolButton, "controlsMoreButton"))
-        assert not any(row.isHidden() for row in page._gi_rows)
-        assert page.build_form().gi == StitchGI("q_ip", incidence_motor="eta")  # pyFAI reads no sample circles
+        # the maintainer's axes (2026-09-29): Q and 2θ stay plain; a GI axis writes its cut(s) beside I(q)
+        assert _axes(page) == ["Q (Å⁻¹)", "2θ (°)", "Qip (Å⁻¹)", "Qoop (Å⁻¹)", "Qip + Qoop (Å⁻¹)"]
+        assert page.build_form().gi is None and "choose Qip, Qoop or Qip + Qoop" in _status(page)
+        assert all(row.isHidden() for row in page._gi_rows)
+        page.set_field("unit", "Qip (Å⁻¹)")
+        assert not any(row.isHidden() for row in page._gi_rows) and "choose" not in _status(page)
+        assert page.build_form().gi == StitchGI(("q_ip",), incidence_motor="eta")  # pyFAI reads no sample circles
+        page.set_field("unit", "Qip + Qoop (Å⁻¹)")
+        assert page.build_form().gi == StitchGI(("q_ip", "q_oop"), incidence_motor="eta")
+        assert page.build_form().unit == "q_A^-1"
         _click(page, "Standard")
         assert page.build_form().gi is None and all(row.isHidden() for row in page._gi_rows)
+        assert _axes(page) == ["Q (Å⁻¹)", "2θ (°)"] and page._value("unit") == "Q (Å⁻¹)"
     finally:
         _close(page, qapp)
 
 
-def test_a_manual_angle_cut_and_ranges_reach_the_form_and_round_trip(qapp, tmp_path):
+@pytest.mark.parametrize("axis, cuts", [("Qoop (Å⁻¹)", ("q_oop",)), ("Qip + Qoop (Å⁻¹)", ("q_ip", "q_oop"))])
+def test_a_manual_angle_axis_and_ranges_reach_the_form_and_round_trip(qapp, tmp_path, axis, cuts):
     page = _page(tmp_path, "multigeometry")
     other = None
     try:
@@ -75,11 +90,11 @@ def test_a_manual_angle_cut_and_ranges_reach_the_form_and_round_trip(qapp, tmp_p
         angle = _row(page, GI_THETA).editor
         angle.setText("0.3")
         angle.editingFinished.emit()
-        page.set_field("gi_cut", "Qₒₒₚ")
+        page.set_field("unit", axis)
         page.set_field("gi_ip_auto", False)
         page.set_field("gi_ip_min", -1.)
         page.set_field("gi_ip_max", 1.5)
-        expected = StitchGI("q_oop", incident_angle_deg=.3, window=(-1., 1.5))
+        expected = StitchGI(cuts, incident_angle_deg=.3, ip_range=(-1., 1.5))
         assert page.build_form().gi == expected
         (tmp_path / "other").mkdir()
         other = StitchPage(empty_host_services(_Status()))
@@ -88,6 +103,7 @@ def test_a_manual_angle_cut_and_ranges_reach_the_form_and_round_trip(qapp, tmp_p
         assert other.build_form().gi == expected
         other.load_form(page.build_form())  # a prepared form restores it too
         assert other.build_form().gi == expected and _row(other, GI_THETA).editor.text() == "0.3"
+        assert other._value("unit") == axis
     finally:
         _close(page, qapp)
         if other is not None:
@@ -103,6 +119,7 @@ def test_xrayutilities_reads_the_geometrys_sample_circles_or_says_one_reads_zero
             spec.write_text(spec.read_text().replace("  phi", "").replace(" -1.7", ""))
             page.set_sources((str(spec),))
         _click(page, "Grazing")
+        page.set_field("unit", "Qip (Å⁻¹)")
         gi = page.build_form().gi
         expected = _SAMPLE if recorded else (("mu", "mu"), ("chi", "chi"), ("phi", None))
         assert gi.incidence_motor == "eta" and gi.sample_motors == expected
@@ -144,6 +161,7 @@ def test_a_sample_circle_is_decided_by_every_selected_scan(qapp, tmp_path, dropp
             other.write_text(other.read_text().replace("  chi", "").replace(" 90", ""))
             page.set_field("image_stem", "sample_scan{scan}_")
         _click(page, "Grazing")
+        page.set_field("unit", "Qip (Å⁻¹)")
         if dropped == (("chi", "90"),):
             assert "chi recorded by only some scans" in _status(page)
             with pytest.raises(ValueError, match="chi is recorded by some selected scans and not others"):
@@ -171,8 +189,29 @@ def test_the_status_follows_a_backend_switch(qapp, tmp_path):
         path.write_text(path.read_text().replace("  phi", "").replace(" -1.7", ""))
         page.set_sources((str(path),))
         _click(page, "Grazing")
+        page.set_field("unit", "Qip (Å⁻¹)")
         assert "read as 0" not in _status(page)
         page.set_field("backend", "xrayutilities histogram")
         assert "phi read as 0" in _status(page)
+    finally:
+        _close(page, qapp)
+
+
+def test_the_gi_axes_keep_the_typed_q_range_and_only_2theta_resets_it(qapp, tmp_path):
+    """Every GI axis bins I(q) too, so moving among Q, Qip, Qoop and Qip + Qoop keeps a typed Q range;
+    2θ changes the unit and resets it, as before."""
+    page = _page(tmp_path, "multigeometry")
+    try:
+        _click(page, "Grazing")
+        page.set_field("radial_auto", False)
+        page.set_field("q_min", 1.)
+        page.set_field("q_max", 3.)
+        for axis in ("Qip (Å⁻¹)", "Qip + Qoop (Å⁻¹)", "Qoop (Å⁻¹)", "Q (Å⁻¹)", "Qip (Å⁻¹)"):
+            page.set_field("unit", axis)
+            assert page.build_form().q_range == (1., 3.)
+        _click(page, "Standard")  # the GI axis becomes Q: the same unit, the same range
+        assert page._value("unit") == "Q (Å⁻¹)" and page.build_form().q_range == (1., 3.)
+        page.set_field("unit", "2θ (°)")
+        assert page.build_form().q_range == (0., 90.)
     finally:
         _close(page, qapp)

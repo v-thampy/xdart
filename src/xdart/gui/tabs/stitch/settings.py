@@ -47,7 +47,7 @@ def page_settings(page) -> dict[str, Any]:
                       "threshold_max": _plain(state.threshold_max),
                       "mask_saturation": bool(state.mask_saturation)},
         "calibration": page._calibration_settings_now(),
-        # grazing incidence as Int sets it (its cut and ranges are fields above)
+        # grazing incidence as Int sets it (its axis and ranges are fields above)
         "gi": dict(page._gi),
     }
 
@@ -108,6 +108,8 @@ def apply_page_settings(page, document: Any) -> None:
     page._sync_advanced()
     page._refresh_xu_geometry()
     page._render_gi()
+    if fields.get("unit") in page._fields["unit"].choices:  # a GI axis exists once Grazing is back
+        page.set_field("unit", fields["unit"])
 
 
 def dump_settings(document: dict[str, Any]) -> str:

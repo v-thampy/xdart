@@ -1,7 +1,10 @@
 """Grazing incidence for a native Stitch 1D: the plan's GI value and the GI coordinates.
 
-A GI Stitch 1D writes I(q) and, beside it, a GI cut (maintainer, 2026-09-29): I(q_ip) inside a q_oop
-window, or I(q_oop) inside a q_ip window, q_ip and q_oop taken relative to the sample surface.
+A GI Stitch 1D writes I(q) and, beside it, one or both GI cuts (maintainer, 2026-09-29: the axis is
+Q, 2θ, Qip, Qoop or Qip + Qoop): I(q_ip) and I(q_oop), q_ip and q_oop taken relative to the sample
+surface. As Int's GI ranges, a Qip range and a Qoop range serve both cuts: each cut is binned over
+its own coordinate's range and keeps the pixels whose other coordinate lies in the other range, so
+Qip + Qoop gives exactly the two single-cut results.
 
 The two backends give the same coordinates (probe G1, ≤ 2e-9 Å⁻¹ per pixel, arms off nu = 0 too).
 With n̂ the sample normal in the lab and q the lab-frame scattering vector:
@@ -22,11 +25,12 @@ import math
 
 import numpy as np
 
-#: The GI cut: its output axis, and the other coordinate's window.
+#: The GI cuts, in their one order (the plan's, the kernels', the record's and the fingerprint's).
 GI_CUTS = ("q_ip", "q_oop")
+#: Each cut's axis unit (pyFAI's fiber unit names).
+GI_UNITS = {"q_ip": "qip_A^-1", "q_oop": "qoop_A^-1"}
 #: xrayutilities' sample circles other than the incidence (psic's eta), in the SURFACE order.
 GI_SAMPLE_ROLES = ("mu", "chi", "phi")
-_MAX_POINTS = 1_000_000
 
 
 def _finite(value, name):
@@ -50,26 +54,30 @@ def _window(value, name):
 class StitchGI:
     """The GI part of a native Stitch 1D plan.
 
-    ``cut`` is the GI output axis ('q_ip' or 'q_oop'), binned with ``npt`` points over ``cut_range``
-    (None: the data's span), keeping pixels whose other coordinate lies in ``window`` (None: all).
-    The incidence is ``incidence_motor``'s value per frame, or ``incident_angle_deg`` (Manual).
-    ``tilt_deg`` and ``sample_orientation`` are pyFAI's fiber parameters. ``sample_motors`` names
-    the motors of xrayutilities' other sample circles (mu, chi, phi); None reads zero.
+    ``cuts`` are the GI output axes ('q_ip', 'q_oop' or both, kept in ``GI_CUTS`` order), binned
+    with the plan's 1-D points. ``ip_range`` and ``oop_range`` are Int's two GI ranges: a cut is
+    binned over its own coordinate's range (None: the data's span) and keeps the pixels whose other
+    coordinate lies in the other range (None: all). The incidence is ``incidence_motor``'s value per
+    frame, or ``incident_angle_deg`` (Manual). ``tilt_deg`` and ``sample_orientation`` are pyFAI's
+    fiber parameters. ``sample_motors`` names the motors of xrayutilities' other sample circles
+    (mu, chi, phi); None reads zero.
     """
 
-    cut: str
+    cuts: tuple[str, ...]
     incidence_motor: str | None = None
     incident_angle_deg: float | None = None
     tilt_deg: float = 0.0
     sample_orientation: int = 4
     sample_motors: tuple[tuple[str, str | None], ...] = tuple((role, None) for role in GI_SAMPLE_ROLES)
-    npt: int = 1000
-    cut_range: tuple[float, float] | None = None
-    window: tuple[float, float] | None = None
+    ip_range: tuple[float, float] | None = None
+    oop_range: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
-        if self.cut not in GI_CUTS:
-            raise ValueError(f"GI cut must be one of {GI_CUTS}")
+        cuts = self.cuts
+        if (type(cuts) not in (tuple, list) or not cuts or any(cut not in GI_CUTS for cut in cuts)
+                or len(set(cuts)) != len(cuts)):
+            raise ValueError(f"GI cuts must be one or both of {GI_CUTS}")
+        object.__setattr__(self, "cuts", tuple(cut for cut in GI_CUTS if cut in cuts))
         manual = self.incident_angle_deg is not None
         if manual == (self.incidence_motor is not None):
             raise ValueError("GI needs exactly one of an incidence motor or a Manual incident angle")
@@ -86,15 +94,16 @@ class StitchGI:
                        for _role, motor in motors)):
             raise ValueError(f"GI sample motors must name {GI_SAMPLE_ROLES} in order (None reads zero)")
         object.__setattr__(self, "sample_motors", motors)
-        if type(self.npt) is not int or not 1 <= self.npt <= _MAX_POINTS:
-            raise ValueError("GI points must be a bounded positive exact integer")
-        object.__setattr__(self, "cut_range", _window(self.cut_range, "cut range"))
-        object.__setattr__(self, "window", _window(self.window, "window"))
+        object.__setattr__(self, "ip_range", _window(self.ip_range, "Qip range"))
+        object.__setattr__(self, "oop_range", _window(self.oop_range, "Qoop range"))
 
-    @property
-    def unit(self) -> str:
-        """The cut's axis unit (pyFAI's fiber unit names)."""
-        return "qip_A^-1" if self.cut == "q_ip" else "qoop_A^-1"
+    def bins(self, cut: str) -> tuple[float, float] | None:
+        """The range ``cut`` is binned over (None: the data's span)."""
+        return self.ip_range if cut == "q_ip" else self.oop_range
+
+    def window(self, cut: str) -> tuple[float, float] | None:
+        """The range of the other coordinate that ``cut`` keeps (None: every pixel)."""
+        return self.oop_range if cut == "q_ip" else self.ip_range
 
     def metadata_names(self, backend: str) -> tuple[str, ...]:
         """The metadata columns every frame needs: the incidence motor and, for xrayutilities,
@@ -106,16 +115,16 @@ class StitchGI:
 
     def identity(self) -> tuple[object, ...]:
         """Canonical value for a plan fingerprint."""
-        return ("stitch-gi-v1", self.cut, self.incidence_motor, self.incident_angle_deg, self.tilt_deg,
-                self.sample_orientation, self.sample_motors, self.npt, self.cut_range, self.window)
+        return ("stitch-gi-v2", self.cuts, self.incidence_motor, self.incident_angle_deg, self.tilt_deg,
+                self.sample_orientation, self.sample_motors, self.ip_range, self.oop_range)
 
     def to_provenance(self) -> dict[str, object]:
-        return {"cut": self.cut, "unit": self.unit, "incidence_motor": self.incidence_motor,
-                "incident_angle_deg": self.incident_angle_deg, "tilt_deg": self.tilt_deg,
-                "sample_orientation": self.sample_orientation,
+        return {"cuts": list(self.cuts), "units": {cut: GI_UNITS[cut] for cut in self.cuts},
+                "incidence_motor": self.incidence_motor, "incident_angle_deg": self.incident_angle_deg,
+                "tilt_deg": self.tilt_deg, "sample_orientation": self.sample_orientation,
                 "sample_motors": {role: motor for role, motor in self.sample_motors},
-                "npt": self.npt, "cut_range": None if self.cut_range is None else list(self.cut_range),
-                "window": None if self.window is None else list(self.window)}
+                "ip_range": None if self.ip_range is None else list(self.ip_range),
+                "oop_range": None if self.oop_range is None else list(self.oop_range)}
 
     def incidence(self, metadata) -> float:
         """This frame's incident angle in degrees."""
@@ -149,4 +158,4 @@ def xu_sample_normal(qconversion, mu: float, eta: float, chi: float, phi: float,
     return normal / np.linalg.norm(normal)
 
 
-__all__ = ["GI_CUTS", "GI_SAMPLE_ROLES", "StitchGI", "gi_coordinates", "xu_sample_normal"]
+__all__ = ["GI_CUTS", "GI_SAMPLE_ROLES", "GI_UNITS", "StitchGI", "gi_coordinates", "xu_sample_normal"]
