@@ -134,6 +134,16 @@ def _spec_motor_names(path, _state, scan):
         return None
 
 
+@functools.lru_cache(maxsize=8)
+def _spec_scan_keys(path, _state):
+    """A SPEC file's scan keys (N.M), or None when it cannot be read."""
+    from xrd_tools.io.spec import list_spec_scans
+    try:
+        return tuple(list_spec_scans(path))
+    except (OSError, ValueError, KeyError):
+        return None
+
+
 def _file_states(*paths):
     """Each file's (mtime, size), or None when it is absent: a cache key that follows edits."""
     states = []
@@ -613,20 +623,54 @@ class StitchPage(QtWidgets.QWidget):
                 else first[0] if "." in first[0] else f"{first[0]}.1")  # SPEC's N.M key
         return _spec_motor_names(path, _file_states(path), scan)
 
-    def _gi_sample_motors(self):
-        """xrayutilities' other sample circles (mu, chi, phi) by the Geometry's motor names: None,
-        read as 0, when the scan is known to record no such motor (the Experiment status says so)."""
+    def _gi_scan_catalogs(self):
+        """The real motors of every selected SPEC scan (one tuple each), or None when the
+        selection cannot say (another source kind, or a scan that cannot be read)."""
+        if self._value("source_kind") != "Spec" or not self._source_paths:
+            return None
+        from xrd_tools.sources.grouping import parse_stitch_scan_groups
+        catalogs = []
+        for path in self._source_paths:
+            keys = _spec_scan_keys(path, _file_states(path))
+            if keys is None:
+                return None
+            try:
+                tokens = (keys if self._value("scan_mode") == "Stitch All" else
+                          tuple(token for group in parse_stitch_scan_groups(str(self._value("scan") or ""))
+                                for token in group))
+            except ValueError:
+                return None
+            for token in tokens:
+                names = _spec_motor_names(path, _file_states(path), token if token in keys else f"{token}.1")
+                if names is None:
+                    return None
+                catalogs.append(names)
+        return tuple(catalogs) or None
+
+    def _gi_sample_binding(self):
+        """xrayutilities' other sample circles (mu, chi, phi) by the Geometry's motor names, and
+        those only some selected scans record. A circle no selected scan records reads 0 (None; the
+        Experiment status says so); when the selection cannot say, the name stays and Preview refuses
+        a scan without it. A first-scan catalog never decides for the others (Codex review F3)."""
         from xrd_tools.integrate.stitch_gi import GI_SAMPLE_ROLES
         geometry = self._instrument()
         circles = {role: circle for circle, role in geometry.as_psic().items()}
         names = dict(geometry.motors)
-        pairs = []
+        catalogs = self._gi_scan_catalogs()
+        pairs, mixed = [], []
         for role in GI_SAMPLE_ROLES:
             motor = names.get(circles.get(role, role))
-            if motor is not None and self._gi_catalog is not None and motor not in self._gi_catalog:
-                motor = None
+            if motor is not None and catalogs is not None:
+                recorded = [motor in catalog for catalog in catalogs]
+                if not any(recorded):
+                    motor = None
+                elif not all(recorded):
+                    mixed.append(role)
             pairs.append((role, motor))
-        return tuple(pairs)
+        return tuple(pairs), tuple(mixed)
+
+    def _gi_sample_motors(self):
+        return self._gi_sample_binding()[0]
 
     def _gi_fields(self):
         """Int's GI fields (its paths and rows) for this page's values."""
@@ -650,8 +694,10 @@ class StitchPage(QtWidgets.QWidget):
             return "standard"
         if self._value("backend") != "xrayutilities histogram":
             return "grazing"
-        zero = [role for role, motor in self._gi_sample_motors() if motor is None]
-        return "grazing" + (f" · {', '.join(zero)} read as 0" if zero else "")
+        pairs, mixed = self._gi_sample_binding()
+        zero = [role for role, motor in pairs if motor is None]
+        return ("grazing" + (f" · {', '.join(zero)} read as 0" if zero else "")
+                + (f" · {', '.join(mixed)} recorded by only some scans" if mixed else ""))
 
     def _render_gi(self):
         """Int's GI rows in the Experiment section, rebuilt from this page's values; the incidence
@@ -665,8 +711,8 @@ class StitchPage(QtWidgets.QWidget):
         layout = self._gi_host.layout()
         while layout.count():
             widget = layout.takeAt(0).widget()
-            if widget is not None:
-                widget.setParent(None)
+            if widget is not None:  # hidden, not orphaned: a parentless widget is a top-level window
+                widget.hide()
                 widget.deleteLater()
         group = SubsectionCard(self.controls.experiment_title, status=self._gi_status(), accent="experiment")
         self.controls.render_gi_rows(group, self._gi_fields())
@@ -697,6 +743,10 @@ class StitchPage(QtWidgets.QWidget):
         ip, oop = ((None if value(f"{prefix}_auto") else (float(value(f"{prefix}_min")), float(value(f"{prefix}_max"))))
                    for prefix in ("gi_ip", "gi_oop"))
         xu = value("backend") == "xrayutilities histogram"
+        mixed = self._gi_sample_binding()[1] if xu else ()
+        if mixed:
+            raise ValueError(f"{', '.join(mixed)} is recorded by some selected scans and not others: "
+                             "select scans that record the same sample circles")
         return StitchGI(
             cut, incidence_motor=None if motor == "Manual" else motor,
             incident_angle_deg=float(self._gi["angle"]) if motor == "Manual" else None,
@@ -974,6 +1024,8 @@ class StitchPage(QtWidgets.QWidget):
         self._refresh_xu_geometry()
         self._sync_goniometer_mapping()
         self._sync_actions()
+        if hasattr(self, "_gi_host"):
+            self._render_gi()  # xrayutilities reads the sample circles: its status differs (Codex review P3)
 
     def _sync_advanced(self):
         """XU always applies its solid angle and has no uncertainty or sample-position
@@ -1125,6 +1177,8 @@ class StitchPage(QtWidgets.QWidget):
         rechecked: the calibration may no longer drive its arm."""
         self._sync_goniometer_mapping()
         self._edited()
+        if hasattr(self, "_gi_host"):
+            self._render_gi()  # the Geometry names the sample circles' motors
 
     def _adopt_mapping(self, pairs):
         """Explicit position → motor pairs (a loaded form) become the geometry's motors."""
