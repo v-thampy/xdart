@@ -1315,3 +1315,6 @@ def test_plan_rejects_unbounded_or_unsupported_science(tmp_path):
             radial_range=(0.1, 1.0),
             azimuth_range=(-1.0, 1.0),
         )
+    # the old Stitch 2D layout was removed (maintainer, 2026-09-30: "Remove old format")
+    with pytest.raises(ValueError, match="a Stitch 2D is a native record"):
+        StitchOperationPlan(geometry, mode="2d", radial_range=(0.1, 1.0), azimuth_range=(-1.0, 1.0))

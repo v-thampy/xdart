@@ -80,7 +80,6 @@ from xrd_tools.io.analysis_artifact import (
     read_analysis_artifact,
     stitch_record_identity,
 )
-from xrd_tools.io.nexus import write_stitched
 from xrd_tools.io.stitch_record import write_stitch_projection
 from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.integrate.frame_screen import FrameScreen, FrameScreenPolicy
@@ -1383,14 +1382,12 @@ class StitchOperationPlan:
                 raise ValueError(f"{name} must be a bounded positive exact integer")
         if self.npt_rad_2d * self.npt_azim_2d > _MAX_2D_POINTS:
             raise ValueError("2-D Stitch output exceeds the bounded artifact point limit")
+        if self.mode == "2d" and not self.native_records:  # the old Stitch 2D layout was removed
+            raise ValueError("a Stitch 2D is a native record")
         _native_plan_fields(self)
         radial = _range(self.radial_range, "radial range", required=not self.native_records)
-        azimuth = _range(
-            self.azimuth_range,
-            "azimuth range",
-            # a native map's None: its frames' own χ extent, scouted as the radial one is
-            required=self.mode == "2d" and not self.native_records,
-        )
+        # a map's None: its frames' own χ extent, scouted as the radial one is
+        azimuth = _range(self.azimuth_range, "azimuth range", required=False)
 
         if self.mode == "1d" and azimuth is not None:
             raise ValueError("a 1-D Stitch plan cannot carry an azimuth range")
@@ -3292,7 +3289,6 @@ class StitchOperationExecution:
                 "STITCH_RESULT_STORAGE_PROJECTION_INVALID",
             )
         provenance = self.request.provenance
-        bound = module_artifact_request(self.request.module, provenance)
         try:
             self._output = admit_module_artifact(
                 self.request.module,
@@ -3319,18 +3315,8 @@ class StitchOperationExecution:
 
         def writer(entry) -> None:
             _revalidate_geometry(self.request.plan.geometry)
-            if self.request.plan.mode == "1d" or native_map:
-                _write_record(entry, self.request.module.output.target, result_projection,
-                              _native_artifact_args(self.request, records))
-            else:
-                write_stitched(
-                    entry,
-                    result_projection=result_projection,
-                    legacy_v1_unit_layout=False,
-                    provenance=bound.provenance_json,
-                    bounded_artifact=True,
-                    **_native_artifact_args(self.request, records),
-                )
+            _write_record(entry, self.request.module.output.target, result_projection,
+                          _native_artifact_args(self.request, records))
             _revalidate_geometry(self.request.plan.geometry)
 
         def prepublish_check() -> None:
