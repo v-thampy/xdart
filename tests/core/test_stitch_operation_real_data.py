@@ -367,6 +367,36 @@ def test_scan14_native_stitch_2d_merges_past_pyfais_unsplit_bins(isolated_scan14
 
 
 @pytest.mark.slow
+def test_scan14_frame_workers_write_the_same_record_bit_for_bit(isolated_scan14_project):
+    """PERF-STITCH-2: a native Stitch 2D with I(q) and the frame check over 48 of scan 14's frames, on one worker
+    and on four, writes the same numbers in every dataset of its record (the full scan: 587 datasets, the
+    handoff's benchmark)."""
+    import h5py
+
+    project = isolated_scan14_project
+    legacy = _scan14_request(project, project / "workers-legacy.nexus", tuple(range(0, 287, 6)))
+    plan = replace(legacy.plan, mode="2d", npt_rad_2d=500, npt_azim_2d=180, azimuth_range=(-180.0, 180.0),
+                   native_records=True, conditioning=StitchConditioning("manual", threshold_max=800_000.0))
+    records = []
+    for workers in (1, 4):
+        family = f"scan14-workers-{workers}"
+        output = ModuleOutputRequest(resolve_finite_output_target(project, family, operation_token="stitch-2d"),
+                                     AnalysisArtifactKind.STITCH_2D, artifact_family=family)
+        result = run_stitch_operation(
+            prepare_stitch_operation(legacy.module.source, output, plan, project_root=project), workers=workers)
+        assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+        numbers = {}
+        with h5py.File(output.target, "r") as handle:
+            handle.visititems(lambda name, node: numbers.__setitem__(name, node[()])
+                              if isinstance(node, h5py.Dataset) and node.dtype.kind in "fiu" else None)
+        records.append(numbers)
+    one, four = records
+    assert len(one) > 100 and one.keys() == four.keys()
+    assert [name for name in one if not np.array_equal(one[name], four[name], equal_nan=one[name].dtype.kind == "f")
+            ] == []
+
+
+@pytest.mark.slow
 def test_scan14_xu_polarization_tracks_multigeometry(isolated_scan14_project):
     """XU applies pyFAI's polarization: the XU/MultiGeometry ratio is unchanged by it."""
     project = isolated_scan14_project
