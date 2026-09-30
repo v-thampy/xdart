@@ -20,12 +20,16 @@ from xrd_tools.session.instrument import (
 
 #: Every circle any geometry has, in display order (a row each; a geometry shows its own).
 _ALL_CIRCLES = ('mu', 'eta', 'th', 'chi', 'phi', 'nu', 'del', 'tth')
-#: The circles whose motor-zero reading is edited beside their motor (the detector arm's).
+#: The detector arm's circles: their motor-zero readings seed the fits.
 _ZERO_CIRCLES = ('nu', 'del', 'tth')
 _ZERO_TIP = ("{circle}'s motor-zero reading (degrees): the motor's readback where the circle is at zero, "
              "so its physical angle = readback − this. The fits start here and stay within ± the zero "
              "freedom under 3 · Calibrate and fit ▸ Advanced. Blank: 0, or the seed calibration's own "
              "zero when refining from one.")
+#: The sample's circles: their motor-zero readings correct the angles Stitch's grazing incidence reads
+#: (maintainer, 2026-09-30: "a place to enter a zero offset for each angle ... set to 0 by default").
+_SAMPLE_ZERO_TIP = ("{circle}'s motor-zero reading (degrees): the motor's readback where the circle is at "
+                    "zero, so its physical angle = readback − this (grazing incidence reads it). Blank: 0.")
 
 
 class GeometryEditor(QtWidgets.QWidget):
@@ -58,22 +62,22 @@ class GeometryEditor(QtWidgets.QWidget):
             combo.setEditText(circle)
             combo.editTextChanged.connect(self._edited)
             self._motors[circle] = combo
-            row = QtWidgets.QWidget()  # the motor, and beside a detector circle's its zero
+            row = QtWidgets.QWidget()  # the motor, and beside it its zero
             layout = QtWidgets.QHBoxLayout(row)
             layout.setContentsMargins(0, 0, 0, 0)
             layout.addWidget(combo, 1)
-            if circle in _ZERO_CIRCLES:
-                zero = QtWidgets.QLineEdit()
-                zero.setPlaceholderText('0')
-                zero.setValidator(QtGui.QDoubleValidator(-360., 360., 6, zero))
-                zero.setMaximumWidth(72)
-                zero.setToolTip(_ZERO_TIP.format(circle=circle))
-                zero.textChanged.connect(self._edited)
-                label = QtWidgets.QLabel('zero (°)')
-                label.setToolTip(zero.toolTip())
-                layout.addWidget(label)
-                layout.addWidget(zero)
-                self._zeros[circle] = zero
+            # every circle's zero: the arm's seed the fits, the sample's correct grazing incidence
+            zero = QtWidgets.QLineEdit()
+            zero.setPlaceholderText('0')
+            zero.setValidator(QtGui.QDoubleValidator(-360., 360., 6, zero))
+            zero.setMaximumWidth(72)
+            zero.setToolTip((_ZERO_TIP if circle in _ZERO_CIRCLES else _SAMPLE_ZERO_TIP).format(circle=circle))
+            zero.textChanged.connect(self._edited)
+            label = QtWidgets.QLabel('zero (°)')
+            label.setToolTip(zero.toolTip())
+            layout.addWidget(label)
+            layout.addWidget(zero)
+            self._zeros[circle] = zero
             self._rows[circle] = row
             self._form.addRow(QtWidgets.QLabel(), row)
         # the frame the axes below are given in (a small schematic can replace this line later)

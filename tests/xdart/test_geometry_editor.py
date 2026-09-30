@@ -70,8 +70,9 @@ def test_each_detector_circle_takes_its_motor_zero_beside_its_motor(qapp):
     boxes = lambda: [c for c in editor._zeros if editor._zeros[c].isVisibleTo(editor)  # noqa: E731
                      and editor._form.isRowVisible(editor._rows[c])]
     editor.show()
-    assert boxes() == ['nu', 'del'] and editor.value().zeros == ()
-    assert set(editor._zeros) == {'nu', 'del', 'tth'}  # the sample circles have none yet
+    # deferred item 7: every circle has its zero beside its motor, the sample's too (blank: 0)
+    assert boxes() == ['mu', 'eta', 'chi', 'phi', 'nu', 'del'] and editor.value().zeros == ()
+    assert set(editor._zeros) == {'mu', 'eta', 'th', 'chi', 'phi', 'nu', 'del', 'tth'}
     editor.zero_edit('del').setText('2.3')
     assert changed and editor.value().zeros == (('del', 2.3),) and editor.value().arm_zeros() == {'del': 2.3}
     editor.zero_edit('nu').setText('-')  # half typed: none yet
@@ -79,7 +80,7 @@ def test_each_detector_circle_takes_its_motor_zero_beside_its_motor(qapp):
     editor.zero_edit('nu').setText('-0.8')
     assert editor.value().arm_zeros() == {'del': 2.3, 'nu': -.8}
     editor.set_value(InstrumentGeometry('twoc', zeros=(('tth', 1.5),)))
-    assert boxes() == ['tth'] and editor.zero_edit('tth').text() == '1.5'
+    assert boxes() == ['th', 'tth'] and editor.zero_edit('tth').text() == '1.5'
     assert editor.value() == InstrumentGeometry('twoc', zeros=(('tth', 1.5),))
     assert editor.value().arm_zeros() == {'del': 1.5}
     editor.set_value(InstrumentGeometry('psic', zeros=(('del', 2.636063),)))

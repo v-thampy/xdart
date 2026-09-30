@@ -838,13 +838,19 @@ class StitchPage(QtWidgets.QWidget):
         motor, tilt = self._gi["motor"] or "Manual", self._gi["tilt_motor"] or "Manual"
         ip, oop = ((None if value(f"{prefix}_auto") else (float(value(f"{prefix}_min")), float(value(f"{prefix}_max"))))
                    for prefix in ("gi_ip", "gi_oop"))
+        sample_motors = self._gi_sample_motors()
+        read = {None if motor == "Manual" else motor, None if tilt == "Manual" else tilt,
+                *(name for _role, name in sample_motors)} - {None}
+        geometry = self._instrument()  # the Diffractometer panel's motor zeros (item 7)
+        zeros = tuple((name, geometry.zero(circle)) for circle, name in geometry.motors
+                      if name in read and geometry.zero(circle) is not None)
         return StitchGI(
             GI_CUTS, incidence_motor=None if motor == "Manual" else motor,
             incident_angle_deg=float(self._gi["angle"]) if motor == "Manual" else None,
             tilt_motor=None if tilt == "Manual" else tilt,
             tilt_chi_deg=float(self._gi["tilt_chi"]) if tilt == "Manual" else None,
-            sample_orientation=int(self._gi["orientation"]), sample_motors=self._gi_sample_motors(),
-            ip_range=ip, oop_range=oop)
+            sample_orientation=int(self._gi["orientation"]), sample_motors=sample_motors,
+            ip_range=ip, oop_range=oop, motor_zeros=zeros)
 
     def _load_gi(self, gi):
         """A form's (or settings') grazing incidence onto the page. A GI form writes both cuts; the cut a

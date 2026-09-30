@@ -374,3 +374,29 @@ def test_a_geometry_edit_leaves_the_gi_card_and_a_rebuild_makes_no_window(qapp, 
         if page._calibration_dialog is not None:
             page._calibration_dialog.close()
         _close(page, qapp)
+
+
+def test_the_diffractometer_panels_sample_zeros_reach_grazing_incidence(qapp, tmp_path):
+    """Deferred item 7: the Diffractometer panel's zero beside each sample circle (blank: 0) is
+    subtracted from its motor's reading wherever grazing incidence reads it."""
+    from xrd_tools.session.instrument import InstrumentGeometry
+    from xdart.gui.widgets.geometry_editor import GeometryEditor
+    editor = GeometryEditor()
+    try:
+        for circle in ("mu", "eta", "chi", "phi", "del", "nu"):
+            assert editor.zero_edit(circle).placeholderText() == "0"
+        editor.zero_edit("eta").setText("0.5")
+        assert editor.value().zero("eta") == 0.5 and editor.value().zero("phi") is None
+    finally:
+        editor.deleteLater()
+    page = _page(tmp_path, "multigeometry")
+    try:
+        geometry = page._instrument()
+        page._set_instrument(InstrumentGeometry(geometry.geometry, geometry.motors, geometry.plane,
+                                                (("eta", 0.5), ("phi", -1.0))))
+        _click(page, "Grazing")
+        page.set_field("unit", "Qip (Å⁻¹)")
+        gi = page.build_form().gi
+        assert dict(gi.motor_zeros) == {"eta": 0.5, "phi": -1.0}
+    finally:
+        _close(page, qapp)

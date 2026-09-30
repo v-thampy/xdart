@@ -438,6 +438,30 @@ def _nan_empty_2d(arr, result):
     return arr
 
 
+def exact_window_mask(fi, shape, windows, incident_angle, tilt_angle, sample_orientation, mask):
+    """``mask`` with every pixel outside the explicit GI ranges masked: a pixel counts only when each
+    coordinate with a range lies inside it, bounds included (Stitch's GI cuts, ``multi._gi_window_mask``).
+
+    pyFAI's histogram admits pixels up to one bin below an explicit range and a hair above it (it
+    truncates a fractional bin index in (-1, 0) to bin 0 and stretches the top edge). ``windows`` are
+    (fiber unit, range or None) pairs; angles are in radians, as the integration's. The coordinates are
+    computed after ``reset_integrator`` for these angles, which pyFAI's own call then keeps (its
+    center-array cache is keyed by the unit alone). No explicit range: ``mask`` unchanged.
+    """
+    windows = tuple((name, bounds) for name, bounds in windows if bounds is not None)
+    if not windows:
+        return mask
+    from pyFAI.units import get_unit_fiber
+    outside = np.zeros(shape, dtype=bool)
+    for name, (low, high) in windows:
+        unit = get_unit_fiber(str(name), incident_angle=incident_angle, tilt_angle=tilt_angle,
+                              sample_orientation=sample_orientation, angle_unit="rad")
+        fi.reset_integrator(unit.incident_angle, unit.tilt_angle, unit.sample_orientation)
+        values = np.asarray(fi.array_from_unit(shape, "center", unit, scale=True))
+        outside |= ~((values >= low) & (values <= high))
+    return outside if mask is None else np.logical_or(mask, outside)
+
+
 def integrate_gi_1d(
     image: np.ndarray,
     fi: FiberIntegrator,
@@ -500,6 +524,9 @@ def integrate_gi_1d(
     _npt_oop = npt_oop if npt_oop is not None else npt
 
     mask = mask_with_detector(fi, mask)   # geometric gaps: always-on
+    # exactly the explicit window, as Stitch's GI cuts (deferred item 8, GI-WIN)
+    mask = exact_window_mask(fi, np.shape(image), ((unit_ip, radial_range), (unit, azimuth_range)),
+                             inc, tilt, orient, mask)
     result = fi.integrate1d_grazing_incidence(
         image,
         npt_ip=npt,
