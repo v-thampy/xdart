@@ -8,7 +8,7 @@ import pytest
 from xdart.gui.pages.operation_owner import OperationTerminalStatus
 from xdart.gui.pages.values import PageCleanup
 from xdart.gui.tools.stitch_owner import StitchOwnerOutcomeKind, StitchToolOwner
-from xdart.gui.tools.stitch_values import prepare_stitch_tool
+from xdart.gui.tools.stitch_values import StitchFrameSelector, prepare_stitch_tool
 from xrd_tools.analysis.module_transaction import ModuleDisposition
 from xrd_tools.analysis.stitch_sources import StitchSourceSelection
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
@@ -24,6 +24,44 @@ def test_native_family_preserves_readable_source_and_frame_subset_slot(tmp_path)
         frame_selector=StitchFrameSelector(0, 0))).request
     assert Path(first.module.output.target).name == "sample_scan1_stitch1d.nexus"
     assert subset.module.output.target == first.module.output.target
+
+
+@pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
+def test_a_preflight_marks_the_outputs_already_stitched_from_the_same_frames_with_the_same_settings(
+        tmp_path, backend):
+    """What a Run in Append mode skips (maintainer, 2026-09-29: "skip if something has already been
+    processed with the same settings as before, else overwrite"): the same settings over the same
+    frames, whatever the source files' revisions."""
+    import os
+    import time
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation
+    form = _native_form(tmp_path, backend, scans="1,[1,2]")
+    prepared = prepare_stitch_tool(form)
+    assert prepared.unchanged == ()  # nothing stitched yet
+    first, grouped = prepared.requests
+    assert run_stitch_operation(first).terminal.disposition is ModuleDisposition.COMMITTED
+    assert prepare_stitch_tool(form).unchanged == (0,)
+    spec = Path(form.spec_path)  # the SPEC file grows by a later scan: its revision changes
+    spec.write_text(spec.read_text() + "\n#S 9 ascan del 14 15 1 1\n#D today\n#P0 14 -10\n#N 2\n#L del  nu\n14 -10\n15 -10\n")
+    image = next(Path(form.image_dir).glob("sample_scan1_0000*"))
+    data = image.read_bytes()
+    time.sleep(.01)
+    image.write_bytes(data)  # the same bytes under a new revision
+    os.utime(image, ns=(time.time_ns() + 10**9,) * 2)
+    again = prepare_stitch_tool(form)
+    assert again.requests[0].module.fingerprint != first.module.fingerprint  # the revisions differ
+    assert again.unchanged == (0,)
+    assert run_stitch_operation(again.requests[1]).terminal.disposition is ModuleDisposition.COMMITTED
+    assert prepare_stitch_tool(form).unchanged == (0, 1)
+    assert prepare_stitch_tool(replace(form, npt_1d=80)).unchanged == ()  # another setting
+    subset = replace(form, frame_selector=StitchFrameSelector(0, 0))
+    assert prepare_stitch_tool(subset).unchanged == ()  # other frames
+    text = spec.read_text()
+    start, end = text.index("#S 2 "), text.index("#S 3 ")
+    spec.write_text(text[:start] + text[start:end].replace("\n15 -10", "\n15.5 -10", 1) + text[end:])
+    assert prepare_stitch_tool(form).unchanged == (0,)  # scan 2 read another angle: its output changed
+    Path(first.module.output.target).write_bytes(b"not a stitch")
+    assert prepare_stitch_tool(form).unchanged == ()  # an unreadable file is stitched again
 
 
 @pytest.mark.parametrize("rows, first_only, expected", [

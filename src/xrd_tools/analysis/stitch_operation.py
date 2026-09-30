@@ -70,11 +70,13 @@ from xrd_tools.io.analysis_artifact import (
     ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE,
     ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE,
     AnalysisArtifactCleanupPending,
+    AnalysisArtifactError,
     AnalysisArtifactKind,
     AnalysisArtifactPayload,
     AnalysisArtifactProjectionInvalid,
     _project_analysis_artifact_result_v1_compat,
     analysis_execution_attestation_digest,
+    inspect_analysis_artifact,
     project_analysis_artifact_result,
     read_analysis_artifact,
 )
@@ -3203,6 +3205,41 @@ class StitchOperationExecution:
         return self._strict_result(self._verification_terminal, total=total)
 
 
+#: What a source file's revision changes in a stored input manifest.
+_REVISION_KEYS = frozenset({"fingerprint", "revision", "primary_revision",
+                            "module_source_fingerprint", "source_fingerprint"})
+
+
+def _without_revisions(value):
+    if type(value) is dict:
+        return {key: _without_revisions(item) for key, item in value.items() if key not in _REVISION_KEYS}
+    if type(value) is list:
+        return [_without_revisions(item) for item in value]
+    return value
+
+
+def stitch_output_current(request: StitchOperationRequest) -> bool:
+    """Whether ``request``'s output already holds its stitch: the same settings (the plan) over the
+    same frames (sources, scans, images and motor readings). A Run in Append mode skips such an output
+    (maintainer, 2026-09-29: "skip if something has already been processed with the same settings as
+    before, else overwrite").
+
+    File revisions are left out, so a SPEC file that grew by later scans leaves an earlier scan's
+    stitch standing; so does an image rewritten under the same name, which this does not detect. A
+    missing, unreadable or foreign file at the target is not current."""
+    target = Path(request.module.output.target)
+    if not target.is_file():
+        return False
+    try:
+        seen = inspect_analysis_artifact(target, expected_kind=AnalysisArtifactKind.STITCH_1D)
+        stored = json.loads(seen.provenance_json)["source"]["input_manifest"]
+        planned = json.loads(json.dumps(request.manifest.to_provenance()))
+    except (AnalysisArtifactError, OSError, ValueError, KeyError, TypeError):
+        return False
+    return (seen.plan_fingerprint == request.module.plan_fingerprint
+            and _without_revisions(stored) == _without_revisions(planned))
+
+
 def run_stitch_operation(
     request: StitchOperationRequest,
     *,
@@ -3237,4 +3274,5 @@ __all__ = [
     "capture_stitch_geometry",
     "prepare_stitch_operation",
     "run_stitch_operation",
+    "stitch_output_current",
 ]

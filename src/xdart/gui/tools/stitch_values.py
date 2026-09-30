@@ -773,6 +773,8 @@ class StitchToolPreflight:
     # Detached display facts only; the request/provenance remain Run authority.
     preview_members: tuple[tuple[dict, ...], ...] = ()
     warnings: tuple[str, ...] = ()
+    #: The outputs (request indices) already stitched with these settings, which Append skips.
+    unchanged: tuple[int, ...] = ()
 
     def __post_init__(self, _claim: object) -> None:
         if type(self.form) is StitchToolForm and self.form.source_selection is not None:
@@ -786,7 +788,11 @@ class StitchToolPreflight:
                 or len(self.preview_members) != len(self.requests)
                 or any(type(group) is not tuple or any(type(member) is not dict for member in group)
                        for group in self.preview_members)
-                or any(type(item) is not tuple or len(item) != 3 or any(type(v) is not str for v in item) for item in self.skipped)):
+                or any(type(item) is not tuple or len(item) != 3 or any(type(v) is not str for v in item) for item in self.skipped)
+                or type(self.unchanged) is not tuple
+                or any(type(index) is not int for index in self.unchanged)
+                or list(self.unchanged) != sorted(set(self.unchanged))
+                or any(not 0 <= index < len(self.requests) for index in self.unchanged)):
                 raise TypeError("Native Stitch preflight is invalid")
             targets = tuple(item.module.output.target for item in self.requests)
             if len(set(targets)) != len(targets):
@@ -794,6 +800,7 @@ class StitchToolPreflight:
             return
         if (
             _claim is not _PREFLIGHT_FACTORY
+            or self.unchanged != ()
             or type(self.form) is not StitchToolForm
             or type(self.request) is not StitchOperationRequest
             or type(self.summary) is not StitchPreflightSummary

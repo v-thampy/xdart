@@ -13,7 +13,7 @@ from xrd_tools.analysis.scan_operations import (
 )
 from xrd_tools.analysis.stitch_operation import (
     StitchGeometryInput, StitchGeometryKind, StitchOperationPlan, XuStitchOperationPlan,
-    capture_stitch_geometry, prepare_stitch_operation,
+    capture_stitch_geometry, prepare_stitch_operation, stitch_output_current,
 )
 from xrd_tools.analysis.stitch_sources import resolve_stitch_sources
 from xrd_tools.analysis.xu_stitch_calibration import (
@@ -293,6 +293,8 @@ def prepare_native_stitch_tool(form, project):
                 and not any(item.startswith("Flat field median") for item in warnings)):
             warnings.append(f"Flat field median {flat.flat_median:.4g} is far from 1: pyFAI divides by "
                             "the flat as given, so intensities scale by its inverse")
+    unchanged = tuple(index for index, request in enumerate(requests) if stitch_output_current(request))
     return StitchToolPreflight(form, requests[0], None, _PREFLIGHT_FACTORY,
                                requests=tuple(requests), skipped=resolution.skipped,
-                               preview_members=tuple(preview_members), warnings=tuple(warnings))
+                               preview_members=tuple(preview_members), warnings=tuple(warnings),
+                               unchanged=unchanged)

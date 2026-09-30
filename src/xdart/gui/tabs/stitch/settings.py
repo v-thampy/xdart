@@ -49,6 +49,8 @@ def page_settings(page) -> dict[str, Any]:
         "calibration": page._calibration_settings_now(),
         # grazing incidence as Int sets it (its axis and ranges are fields above)
         "gi": dict(page._gi),
+        # Append skips an output already stitched with these settings; "Overwrite" is Replace
+        "write_mode": page.run_bar.write_mode(),
     }
 
 
@@ -99,6 +101,9 @@ def apply_page_settings(page, document: Any) -> None:
             page._fields[key] = replace(page._fields[key], value=value)
         page._render_ranges()
     page._set_calibration_settings(document.get("calibration"))
+    if document.get("write_mode") in ("Append", "Overwrite"):
+        page.run_bar.set_write_mode(document["write_mode"])
+        page._write_mode_changed()
     gi = document.get("gi", {})
     page._gi.update({key: bool(value) if key == "enabled" else None if value is None else str(value)
                      for key, value in gi.items() if key in page._gi})

@@ -288,6 +288,7 @@ def test_run_right_after_typing_in_a_field_checks_and_runs(qapp, tmp_path):
     page.show()
     try:
         page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        page.run_bar.writeModeButton.click()  # Replace: the same inputs stitch again (Append skips them)
         page.activateWindow()
         page.run_bar.startButton.click()
         _wait(page, qapp)
@@ -673,6 +674,74 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
         assert not page._queued_jobs
         assert not second_target.exists()
     finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
+def test_append_skips_the_outputs_already_stitched_and_replace_stitches_them_again(qapp, tmp_path):
+    """Maintainer, 2026-09-29: "the append/overwrite button was disabled. all this should do is skip if
+    something has already been processed with the same settings as before, else overwrite"."""
+    import os
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    form = _native_form(tmp_path, "multigeometry", scans="1,2")
+    page = StitchPage(empty_host_services(_Status()))
+    summary = page.run_bar.set_readiness_summary
+    try:
+        page.load_form(form)
+        assert page.run_bar.writeModeButton.isEnabled()
+        assert page.run_bar.write_mode() == "Append"
+        assert page.run_bar.writeModeButton.toolTip().startswith("Append: skip each output already stitched")
+        page.run_bar.startButton.click()
+        _wait(page, qapp, timeout=60)
+        targets = [Path(request.module.output.target) for request in page._owner.prepared.requests]
+        assert len(targets) == 2 and all(target.is_file() for target in targets)
+
+        def revisions():
+            return [(os.stat(target).st_ino, os.stat(target).st_mtime_ns) for target in targets]
+
+        stitched = revisions()
+        shown = []
+        page.run_bar.set_readiness_summary = lambda text, **k: (shown.append(str(text)), summary(text, **k))[1]
+        page.run_bar.startButton.click()  # nothing changed: nothing is stitched
+        _wait(page, qapp)
+        assert revisions() == stitched
+        assert page.run_bar.readinessLabel.full_text().startswith(
+            "Up to date · 2 outputs already stitched with these settings (Replace ⇄ stitches again)")
+        # The SPEC file grows by a later scan, and scan 2 now reads another angle: only its output changed.
+        spec = Path(form.spec_path)
+        text = spec.read_text()
+        start, end = text.index("#S 2 "), text.index("#S 3 ")
+        spec.write_text(text[:start] + text[start:end].replace("\n15 -10", "\n15.5 -10", 1) + text[end:]
+                        + "\n#S 9 ascan del 14 15 1 1\n#D today\n#P0 14 -10\n#N 2\n#L del  nu\n14 -10\n15 -10\n")
+        page.run_bar.startButton.click()
+        _wait(page, qapp, timeout=60)
+        now = revisions()
+        assert now[0] == stitched[0] and now[1] != stitched[1]
+        assert any(text.startswith("Running · Stitch 1D · 1/1 · 1 already stitched, skipped") for text in shown), shown
+        status = page.run_bar.readinessLabel.full_text()
+        assert status.startswith("Complete · 2 frames") and "· 1 already stitched, skipped" in status, status
+        page.begin_preview()
+        _wait(page, qapp)
+        listed = page.preview_text.toPlainText()
+        assert listed.startswith("2 stitched outputs · 2 already stitched with these settings (Append skips them)")
+        assert listed.count(" · already stitched") == 2
+        page.preview_dialog.close()
+        page.run_bar.writeModeButton.click()  # Replace: every output again
+        assert page.run_bar.write_mode() == "Overwrite"
+        assert page.run_bar.writeModeButton.toolTip().startswith("Replace: stitch every output again")
+        before = revisions()
+        page.run_bar.startButton.click()
+        _wait(page, qapp, timeout=60)
+        assert all(after != earlier for after, earlier in zip(revisions(), before))
+        document = page.settings()  # the choice is saved with the page's settings
+        assert document["write_mode"] == "Overwrite"
+        document["write_mode"] = "Append"
+        page.apply_settings(document)
+        assert page.run_bar.write_mode() == "Append"
+        assert page.run_bar.writeModeButton.toolTip().startswith("Append:")
+    finally:
+        page.run_bar.set_readiness_summary = summary
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
         qapp.processEvents()

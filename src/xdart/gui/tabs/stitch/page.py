@@ -263,6 +263,8 @@ class StitchPage(QtWidgets.QWidget):
         self._after_prepare = None
         #: Skipped scans and warnings of the prepared plan, for the status line.
         self._prepared_notes = ""
+        #: The outputs a Run in Append mode skipped as already stitched, for the status line.
+        self._skip_note = ""
         #: Int's readiness line: (summary, ready) from the section checks.
         self._readiness = ("", False)
         self._action_revision = None
@@ -382,10 +384,11 @@ class StitchPage(QtWidgets.QWidget):
         self.run_bar.set_unavailable_modes(UNOWNED_RUN_MODE_REASONS)
         self.run_bar.modeCombo.setCurrentText("Stitch 1D")
         self.run_bar.modeChanged.connect(self._mode_chosen)
-        self.run_bar.writeModeButton.setText("Replace ⇄")
-        self.run_bar.writeModeButton.setChecked(True)
-        self.run_bar.writeModeButton.setEnabled(False)
-        self.run_bar.writeModeButton.setToolTip("Replace only this output after successful publication")
+        # Append skips an output already stitched with these settings; Replace stitches every one again
+        # (maintainer, 2026-09-29: "skip if something has already been processed with the same
+        # settings as before, else overwrite").
+        self.run_bar.writeModeChanged.connect(self._write_mode_changed)
+        self._write_mode_changed()
         self.run_bar.actionClicked.connect(self.begin_run)
         self.run_bar.stopClicked.connect(self.stop)
         right_layout.addWidget(self.run_bar)
@@ -394,6 +397,12 @@ class StitchPage(QtWidgets.QWidget):
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setStretchFactor(2, 0)
         self.splitter.setSizes([230, 720, 360])
+
+    def _write_mode_changed(self, _mode=None):
+        self.run_bar.writeModeButton.setToolTip(
+            "Append: skip each output already stitched from the same frames with the same settings, "
+            "and stitch the rest" if self.run_bar.write_mode() == "Append" else
+            "Replace: stitch every output again; each file is replaced once its new stitch is written")
 
     def _mode_chosen(self, mode):
         """Leave for the chosen mode's page (the host refuses while Stitch runs)."""
@@ -1457,13 +1466,20 @@ class StitchPage(QtWidgets.QWidget):
         self._run_prepared()
 
     def _run_prepared(self):
-        count = len(self._owner.prepared.requests) if self._owner.prepared is not None else 0
+        prepared = self._owner.prepared
+        count = len(prepared.requests) if prepared is not None else 0
         if not count:
             self._status("Nothing to stitch" + self._prepared_notes, ready=False)
             return
-        self._queued_jobs = list(range(count))
         self._prepared_revision = None  # a run uses its plan once: the next Run checks again
-        self._job_total = count
+        kept = prepared.unchanged if self.run_bar.write_mode() == "Append" else ()
+        self._queued_jobs = [index for index in range(count) if index not in kept]
+        if not self._queued_jobs:
+            self._status(f"Up to date · {count} {'output' if count == 1 else 'outputs'} already stitched "
+                         "with these settings (Replace ⇄ stitches again)" + self._prepared_notes)
+            return
+        self._skip_note = f" · {len(kept)} already stitched, skipped" if kept else ""
+        self._job_total = len(self._queued_jobs)
         self._batch_started = time.monotonic()
         self._run_next_job()
 
@@ -1471,7 +1487,8 @@ class StitchPage(QtWidgets.QWidget):
         if not self._queued_jobs or self._closing:
             return
         index = self._queued_jobs.pop(0)
-        if not self._start(f"Running · Stitch 1D · {index + 1}/{self._job_total}{self._prepared_notes}",
+        position = self._job_total - len(self._queued_jobs)
+        if not self._start(f"Running · Stitch 1D · {position}/{self._job_total}{self._skip_note}{self._prepared_notes}",
                            lambda: self._owner.begin_run(job_index=index)):
             self._queued_jobs.clear()
             self._prepared_revision = None  # the next Run prepares again
@@ -1559,12 +1576,15 @@ class StitchPage(QtWidgets.QWidget):
             if not self._threshold_manual:
                 self._fields["threshold"] = replace(self._fields["threshold"], value=self._auto_threshold_max)
                 self._render_ranges()
-            lines = [f"{len(preflight.requests)} stitched outputs"]
+            done = len(preflight.unchanged)
+            lines = [f"{len(preflight.requests)} stitched outputs"
+                     + (f" · {done} already stitched with these settings (Append skips them)" if done else "")]
             if preflight.warnings:
                 lines.extend(("\nWarnings", *preflight.warnings))
             for index, request in enumerate(preflight.requests, 1):
                 count = len(request.module.source.selected_labels)
-                lines.append(f"\n{index}. {Path(request.module.output.target).name} · {count} frames")
+                lines.append(f"\n{index}. {Path(request.module.output.target).name} · {count} frames"
+                             + (" · already stitched" if index - 1 in preflight.unchanged else ""))
                 for member in preflight.preview_members[index - 1]:
                     identity = member["identity"]
                     lines.append(f"  {identity['scan_id']}-{identity['frame_index']} · {member['source_path']}")
@@ -1580,7 +1600,8 @@ class StitchPage(QtWidgets.QWidget):
                 self._run_prepared()
                 return
             self.preview_dialog.show()
-            self._status(f"Ready · Stitch 1D · {len(preflight.requests)} outputs" + self._prepared_notes,
+            self._status(f"Ready · Stitch 1D · {len(preflight.requests)} outputs"
+                         + (f" · {done} already stitched" if done else "") + self._prepared_notes,
                          ready=bool(preflight.requests))
         elif outcome.kind is StitchOwnerOutcomeKind.FRAME_READ:
             if (self._raw_request_revision == self._raw_revision and not self._closing
@@ -1604,7 +1625,7 @@ class StitchPage(QtWidgets.QWidget):
                 count = len(result.request.module.source.selected_labels)
                 note = frame_screen_note(result.frame_screen)
                 self._status(f"Complete · {count} frames · {elapsed:.2f} s" + (f" · {note}" if note else "")
-                             + self._prepared_notes)
+                             + self._skip_note + self._prepared_notes)
                 if self._queued_jobs and not update.stale and self._action_revision == self._revision:
                     self._run_next_job()
             else:
