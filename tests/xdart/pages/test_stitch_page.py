@@ -936,6 +936,12 @@ def test_a_gi_result_opens_on_its_cut_and_offers_its_cuts_beside_q_and_two_theta
         _wait(page, qapp)
         assert page.scientific.plot_axis.currentData() == "q_oop"
         np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, cuts["q_oop"].intensity)
+        # in Stitch 2D's layout (the mode's, as Int's) the record's cuts stay on offer and shown
+        page.run_bar.modeCombo.setCurrentText("Stitch 2D")
+        state = page._last_map_state
+        assert state.processing_mode == "Int 2D" and state.measurement_mode == "GI"
+        assert {"q_ip", "q_oop"} <= {axis.itemData(index) for index in range(axis.count())}
+        np.testing.assert_array_equal(state.traces[0].intensity, cuts["q_oop"].intensity)
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()

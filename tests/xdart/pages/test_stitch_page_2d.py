@@ -5,6 +5,7 @@ its slices and pins as Int 2D makes them from the same map, and the contributing
 """
 import numpy as np
 import pytest
+from pyqtgraph.Qt import QtCore
 
 from xdart.gui.pages.services import empty_host_services
 from xdart.gui.pages.values import PageCleanup
@@ -65,15 +66,61 @@ def test_a_stitch_2d_shows_its_map_as_int_2d_without_the_raw_pane(qapp, tmp_path
         assert frame.thumbnail is not None
         document = page.settings()  # the mode is a setting, with the map's rows
         assert (document["mode"], document["fields"]["npt_rad_2d"]) == ("Stitch 2D", "48")
-        # a Stitch 1D result still shows in Int 1D's layout
+        # The layout is the mode's, as Int's follows its run-bar mode: a Stitch 1D result in Int 1D's
+        _command(page, ShellCommandKind.SET_PLOT_MODE, "Single")
         page.run_bar.modeCombo.setCurrentText("Stitch 1D")
         page.run_bar.startButton.click()
         _wait(page, qapp)
-        assert page._current_payload().kind is AnalysisArtifactKind.STITCH_1D
+        one_d = page._current_payload()
+        assert one_d.kind is AnalysisArtifactKind.STITCH_1D
         assert page._last_map_state is None and view.image_splitter.isHidden()
+        # a Stitch 2D result there too, as its I(q) (Int 1D shows a 2-D record's I(q))
+        role = QtCore.Qt.ItemDataRole.UserRole
+        rows = {page.results.item(row).data(role): row for row in range(page.results.count())}
+        page.results.setCurrentRow(rows[target])
+        _wait(page, qapp)
+        assert page._current_payload().kind is AnalysisArtifactKind.STITCH_2D
+        assert page._last_map_state is None and view.image_splitter.isHidden()
+        np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, payload.profile.intensity)
+        # and in Stitch 2D a Stitch 1D result shows in Int 2D's layout, its I(q) below an empty map
         page.apply_settings(document)
         assert page._mode == "Stitch 2D" and not page._map_card.isHidden()
+        page.results.setCurrentRow(rows[page._owner.prepared.request.module.output.target])
+        _wait(page, qapp)
+        assert page._current_payload().kind is AnalysisArtifactKind.STITCH_1D
+        state = page._last_map_state
+        assert state.processing_mode == "Int 2D" and not view.image_splitter.isHidden()
+        assert state.traces == ()  # Int's rule: a slice is never the full I(q) of a result without a map
+        _command(page, ShellCommandKind.SET_SLICE_ENABLED, False)
+        (trace,) = page._last_map_state.traces
+        np.testing.assert_array_equal(trace.intensity, one_d.intensity)
     finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
+def test_the_layout_is_the_modes_as_int_2ds(qapp):
+    """Maintainer, 2026-09-30: "when stitch 2d is selected, the plot display doesn't change ... to show two rows
+    equally sized for the 2d stitch on top and 1d bottom, see how this is done in int 2d". The layout follows the
+    mode, as Int's follows its run-bar mode (Int's ``_apply_mode_layout``), before any result."""
+    page = StitchPage(empty_host_services(_Status()))
+    page.resize(1400, 900)
+    page.show()
+    try:
+        qapp.processEvents()
+        view = page.scientific
+        assert view.image_splitter.isHidden()  # Stitch 1D: Int 1D's layout
+        page.run_bar.modeCombo.setCurrentText("Stitch 2D")
+        qapp.processEvents()
+        assert not view.image_splitter.isHidden() and page._last_map_state.processing_mode == "Int 2D"
+        top, bottom = view.vertical_splitter.sizes()
+        assert top > 0 and abs(top - bottom) <= 1  # Int 2D's two equal rows
+        page.run_bar.modeCombo.setCurrentText("Stitch 1D")
+        qapp.processEvents()
+        assert view.image_splitter.isHidden() and page._last_map_state is None
+    finally:
+        page.close()
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
         qapp.processEvents()

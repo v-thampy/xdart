@@ -399,7 +399,7 @@ class StitchPage(QtWidgets.QWidget):
         right = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        self.controls = ControlsPanel(show_section_numbers=False)
+        self.controls = ControlsPanel(experiment_title="Configuration", show_section_numbers=False)  # as Int's
         self.controls.experiment_card.title.setText("EXPERIMENT")
         scroll = _HugWidthScrollArea()
         scroll.setWidgetResizable(True)
@@ -468,6 +468,7 @@ class StitchPage(QtWidgets.QWidget):
             self._map_card.setVisible(mode == "Stitch 2D")
             self.advanced.setWindowTitle(f"Advanced — {mode}")
             self._edited()  # a prepared plan is another mode's; readiness checks this one
+            self._draw()  # the mode's layout, as Int's follows its run-bar mode
         return True
 
     def _field(self, card, section, key, label, value="", *, choices=(), browse=False):
@@ -752,11 +753,9 @@ class StitchPage(QtWidgets.QWidget):
         return tuple(fields)
 
     def _gi_status(self):
-        if not self._gi["enabled"]:
-            return "standard"
-        if self._value("unit") not in _GI_AXES:  # Q or 2θ: a plain result
-            return "grazing · choose Qip or Qoop as the Axis"
-        return "grazing"
+        """Int's fixed status (``ControlsPanel._experiment_status``): a longer one widened the panel (maintainer,
+        2026-09-30); what a Q or 2θ Axis gives in Grazing is on the eliding readiness line."""
+        return ControlsPanel._experiment_status(self._gi_fields())
 
     def _render_gi(self):
         """Int's GI rows in the Experiment section, rebuilt from this page's values; the incidence
@@ -818,10 +817,11 @@ class StitchPage(QtWidgets.QWidget):
             self._rows["unit"].apply_field(self._fields["unit"])
         for row in self._gi_rows:
             row.setVisible(self._gi["enabled"] and self._value("unit") in _GI_AXES)
+        status = self._gi_status()
         if getattr(self, "_gi_card", None) is not None:
-            status = self._gi_status()
             self._gi_card.status.setText(status)
             self._gi_card.status.setVisible(bool(status))
+        self.controls.experiment_card.set_status_text(status)  # as Int's EXPERIMENT header
 
     def _gi_edited(self, path, value):
         key = self._GI_KEYS.get(tuple(path))
@@ -1203,8 +1203,9 @@ class StitchPage(QtWidgets.QWidget):
         else:  # a kind a settings file names that this version lacks (it is refused before a Run)
             text = f"{len(sources)} {kind} source{'s' * (len(sources) != 1)}"
         text += " · " + ("xrayutilities" if value("backend") == "xrayutilities histogram" else "pyFAI MultiGeometry")
-        if self._gi["enabled"] and value("unit") in _GI_AXES:
-            text += f" · grazing {str(value('unit')).split(' ')[0]}"
+        if self._gi["enabled"]:
+            text += (f" · grazing {str(value('unit')).split(' ')[0]}" if value("unit") in _GI_AXES
+                     else " · no grazing cuts: choose Qip or Qoop as the Axis")
         return text
 
     def _backend_changed(self, *_args):
@@ -2141,12 +2142,13 @@ class StitchPage(QtWidgets.QWidget):
         return key
 
     def _draw(self, *_args):
-        """Project the selected results into Int's scientific view: a Stitch 2D current result in Int
-        2D's layout (the map, with I(q) and its slices below), else Int 1D's."""
+        """Project the selected results into Int's scientific view in the mode's layout, as Int's follows
+        its run-bar mode (maintainer, 2026-09-30: "see how this is done in int 2d"): Stitch 2D in Int 2D's
+        (the map, with I(q) and its slices below; no map for a Stitch 1D result), Stitch 1D in Int 1D's
+        (a Stitch 2D result's I(q), as Int 1D shows a 2-D record's)."""
         if not hasattr(self, "scientific"):
             return
-        current = self._current_payload()
-        if current is not None and current.kind is AnalysisArtifactKind.STITCH_2D:
+        if self._mode == "Stitch 2D":
             self._draw_map()
         else:
             self._draw_patterns()
@@ -2169,8 +2171,8 @@ class StitchPage(QtWidgets.QWidget):
     def _display_payload(self, item, payload):
         """A result as Int's frame (``StandardDisplayPayload``), through Int's conversion
         (``FrameView.from_results``): a Stitch 2D's map and the I(q) beside it, a Stitch 1D's I(q); the
-        Diagnostic shows their coverage or normalization instead. A GI Stitch 2D is a GI frame, as Int's:
-        its q_ip-q_oop map beside the (χ, q) one, and the GI cut the plot axis chooses as its pattern."""
+        Diagnostic shows their coverage or normalization instead. A GI result is a GI frame, as Int's: the
+        GI cut the plot axis chooses as its pattern, and a Stitch 2D's q_ip-q_oop map beside the (χ, q) one."""
         from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
         from xrd_tools.core.frame_view import FrameView
         from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
@@ -2183,23 +2185,28 @@ class StitchPage(QtWidgets.QWidget):
             return IntegrationResult2D(x, y, getattr(projection, shown), None, x_unit, y_unit)
         map_result, cut = None, dict(payload.gi).get(self._view.plot_axis)
         if payload.kind is AnalysisArtifactKind.STITCH_2D:
-            pattern = payload.profile if cut is None else cut
-            (_q, radial), = pattern.axes
-            (_q, unit), = pattern.axis_units
             (_q, q), (_chi, chi) = payload.axes
             (_q, q_unit), (_chi, chi_unit) = payload.inspection.axis_units
             map_result = IntegrationResult2D(q, chi, getattr(payload, shown), None, q_unit, chi_unit)
+            pattern = payload.profile if cut is None else cut
         else:
-            pattern, radial, unit = payload, payload.axis("q"), payload.native_unit
+            pattern = payload if cut is None else cut
+        if pattern is payload:
+            radial, unit = payload.axis("q"), payload.native_unit
+        else:
+            (_q, radial), = pattern.axes
+            (_q, unit), = pattern.axis_units
         view = FrameView.from_results(label=key.local_frame_label,
                                       result_1d=IntegrationResult1D(radial, getattr(pattern, shown), None, unit),
                                       result_2d=map_result)
         gi = {}
+        if payload.gi_map is not None or payload.gi:
+            gi = dict(measurement_mode="GI", gi_resolved_motor=_gi_motor(payload),
+                      gi_mode_2d="" if map_result is None else "q_chi",
+                      gi_mode_1d="q_total" if cut is None else self._view.plot_axis)
         if payload.gi_map is not None:
-            extra = FrameView.from_results(label=key.local_frame_label, result_2d=as_2d(payload.gi_map))
-            gi = dict(measurement_mode="GI", gi_resolved_motor=_gi_motor(payload), gi_mode_2d="q_chi",
-                      gi_mode_1d="q_total" if cut is None else self._view.plot_axis,
-                      extra_views_2d={"qip_qoop": extra})
+            gi["extra_views_2d"] = {"qip_qoop": FrameView.from_results(
+                label=key.local_frame_label, result_2d=as_2d(payload.gi_map))}
         return StandardDisplayPayload(0, key, item.text(), view, status="complete",
             wavelength_m=None if payload.wavelength_A is None else float(payload.wavelength_A) * 1e-10, **gi)
 

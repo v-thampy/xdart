@@ -75,10 +75,14 @@ def test_grazing_shows_ints_rows_with_the_scans_motors_and_eta_first(qapp, tmp_p
         # the maintainer's axes (2026-09-29): Q and 2θ stay plain; a GI axis writes I(q) and both cuts
         # ("it will be good to save both by default along with I(q)"), opening on the one chosen
         assert _axes(page) == ["Q (Å⁻¹)", "2θ (°)", "Qip (Å⁻¹)", "Qoop (Å⁻¹)"]
-        assert page.build_form().gi is None and "choose Qip or Qoop" in _status(page)
+        # Int's fixed statuses (a longer one widened the panel); the hint is on the eliding readiness line
+        assert page.build_form().gi is None and page._gi_card.status.text() == "grazing"
+        assert page.controls.experiment_card.status.text() == "grazing"
+        assert "choose Qip or Qoop" in page.run_bar.readinessLabel.full_text()
         assert all(row.isHidden() for row in page._gi_rows)
         page.set_field("unit", "Qip (Å⁻¹)")
-        assert not any(row.isHidden() for row in page._gi_rows) and "choose" not in _status(page)
+        assert not any(row.isHidden() for row in page._gi_rows)
+        assert "choose" not in page.run_bar.readinessLabel.full_text() + _status(page)
         # both backends read psic's circles: the incidence as eta, the tilt as chi, and mu and phi
         both = StitchGI(("q_ip", "q_oop"), incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE)
         assert page.build_form().gi == both
@@ -88,7 +92,26 @@ def test_grazing_shows_ints_rows_with_the_scans_motors_and_eta_first(qapp, tmp_p
         _click(page, "Standard")
         assert page.build_form().gi is None and all(row.isHidden() for row in page._gi_rows)
         assert _axes(page) == ["Q (Å⁻¹)", "2θ (°)"] and page._value("unit") == "Q (Å⁻¹)"
+        assert page._gi_card.status.text() == page.controls.experiment_card.status.text() == "standard"
     finally:
+        _close(page, qapp)
+
+
+def test_grazing_keeps_the_controls_width_as_ints(qapp, tmp_path):
+    """Maintainer, 2026-09-30: "when grazing is toggled, the horizontal size of the right control panel changes
+    and expands ... this was also fixed in int 2d". Measured: the long status ("grazing · choose Qip or Qoop as
+    the Axis") raised the panel's minimum width from 288 to 434 px; Int's fixed "grazing" keeps it."""
+    page = _page(tmp_path, "multigeometry")
+    try:
+        page.show()
+        qapp.processEvents()
+        standard = page.controls.minimumSizeHint().width()
+        _click(page, "Grazing")
+        qapp.processEvents()
+        assert page.controls.minimumSizeHint().width() == standard
+        assert page.controls.experiment_title == "Configuration"  # Int's title (workspace_shell)
+    finally:
+        page.close()
         _close(page, qapp)
 
 
