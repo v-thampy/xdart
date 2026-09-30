@@ -610,25 +610,13 @@ def _admitted_saturation(
     the documented limit alone. None: the data type's rule, as before.
     """
     from xrd_tools.core.invalid import resolve_detector_saturation
+    from xrd_tools.sources.execution_graph import graph_saturation
 
     detector = None if assets.poni_values is None else assets.poni_values[7]
-    recorded = dtype = None
-    if type(source) is SourceSpec and items:
-        graph = items[0].graph
-        if graph.descriptor is not None:
-            recorded, dtype = graph.descriptor.saturation, graph.descriptor.dtype
-        elif graph.stamp.members:
-            options = dict(graph.execution_source.options)
-            layout = read_detector_image_layout(
-                graph.stamp.members[0].path,
-                raw_dtype=str(options.get("raw_dtype", "int32")),
-                raw_header_skip=int(options.get("raw_header_skip", 0)),
-                detector_shape=options.get("detector_shape"),
-                detector=options.get("detector"),
-            )
-            recorded, dtype = layout.saturation, layout.dtype
-    resolved = resolve_detector_saturation(
-        recorded=recorded, detector=detector, dtype=dtype,
+    resolved = (
+        graph_saturation(items[0].graph, detector=detector)
+        if type(source) is SourceSpec and items
+        else resolve_detector_saturation(detector=detector)
     )
     return None if resolved is None or resolved.source == "dtype" else resolved.value
 def inspect_output(

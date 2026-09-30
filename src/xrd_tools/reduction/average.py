@@ -38,7 +38,7 @@ from xrd_tools.session import policy as _resource_policy
 from xrd_tools.session.policy import SessionResourceAllocation, requirements_from, resolve_session_policy
 from xrd_tools.session.run_configuration import FrozenSourceSpec
 from xrd_tools.session.scan_session import required_result_modes
-from xrd_tools.sources.execution_graph import PreparedSourceExecutionGraph, SourceCleanupFailed, SourceCleanupPending, SourceRevisionChanged, append_source_from_execution_graph, open_source_execution_graph, qualify_source_execution_graph, requalify_source_execution_graph, source_execution_projection, source_graph_digest, source_snapshots_projection, stable_lineage_projection, validate_source_state_sweep
+from xrd_tools.sources.execution_graph import PreparedSourceExecutionGraph, SourceCleanupFailed, SourceCleanupPending, SourceRevisionChanged, append_source_from_execution_graph, graph_saturation, open_source_execution_graph, qualify_source_execution_graph, requalify_source_execution_graph, source_execution_projection, source_graph_digest, source_snapshots_projection, stable_lineage_projection, validate_source_state_sweep
 from xrd_tools.sources.selection import image_series_spec, is_single_image_spec, single_image_spec
 _COUNT_POLICY = 'average_scan_v1'
 _COUNT_DTYPE = np.dtype('<u4')
@@ -251,6 +251,9 @@ class AverageScanPlan:
     numeric_metadata_keys: tuple[str, ...]; invariant_metadata_keys: tuple[str, ...]; allocation: SessionResourceAllocation
     direct_eiger_eligible: bool; science_identity: str; operation_identity: str
     logical_labels: tuple[int, ...] = (1,)
+    #: The source's resolved automatic ceiling when it is not the data type's maximum (decision 39):
+    #: each contributor also leaves out native values at or above it. In the science identity only when set.
+    saturation: int | None = None
     def __post_init__(self) -> None:
         _reject(type(self.recipe) is not AverageScanRecipe or type(self.contributor_extent) is not int or (not 1 <= self.contributor_extent <= _MAX_CONTRIBUTORS) or (type(self.detector_shape) is not tuple) or (len(self.detector_shape) != 2) or any((type(item) is not int or item <= 0 for item in self.detector_shape)) or (type(self.output_artifact) is not str or not os.path.isabs(self.output_artifact)) or _COUNT_DIGEST.fullmatch(self.version_identity) is None or (type(self.expected_target_snapshot) is not TargetSnapshot) or (type(self.allocation) is not SessionResourceAllocation) or type(self.direct_eiger_eligible) is not bool or (self.logical_labels != (1,)), 'Average scan plan is invalid')
 @dataclass(frozen=True, slots=True)
@@ -480,10 +483,14 @@ def _science_payload(
     recipe: AverageScanRecipe,
     numeric_metadata_keys: tuple[str, ...],
     invariant_metadata_keys: tuple[str, ...],
+    saturation: int | None = None,
 ) -> dict[str, Any]:
     payload = _recipe_payload(recipe)
     modes = required_result_modes(_derived_reduction(recipe))
-    return {'api_version': _COUNT_POLICY, 'integration_1d': payload['integration_1d'], 'integration_2d': payload['integration_2d'], 'integrator_gi': payload['integrator_gi'], 'threshold_min': recipe.threshold_min, 'threshold_max': recipe.threshold_max, 'mask_saturation': recipe.mask_saturation, 'reduction_extra': payload['reduction_extra'], 'calibration': payload['calibration'], 'background': payload['background'], 'pixel_accumulator_policy': 'float64_ordered_inplace_v1', 'finite_count_policy': 'uint32_per_pixel_extent_1000000_v1', 'zero_count_policy': 'nan_and_all_zero_refusal_v1', 'overflow_policy': 'post_add_nonfinite_refusal_v1', 'numeric_metadata_keys': numeric_metadata_keys, 'invariant_metadata_keys': invariant_metadata_keys, 'numeric_metadata_policy': 'binary64_neumaier_per_key_denominator_v1', 'invariant_metadata_policy': 'canonical_json_scalar_exact_all_v1', 'metadata_row_policy': 'graph_bound_complete_scalar_row_256_names_65536_bytes_v1', 'metadata_source_policy': 'container_metadata_inputs_and_tiff_preparse_bounded_v2', 'configured_metadata_lookup_policy': 'exact_first_unique_casefold_single_output_domain_v2', 'default_optional_lookup_policy': 'exact_source_spelling_omit_configured_alias_v2', 'conditioning_order': ['threshold', 'frame_background', 'static_frame_mask', 'detector_value_mask', 'finite_accumulate'], 'result_modes': [f'{mode.kind}:{mode.key}' for mode in modes], 'reduction_strict_policy': {'policy': 'average_reduction_strict_v1', 'missing_normalization': True, 'gi_all_dummy': True, 'thumbnail_fallback': True}}
+    value = {'api_version': _COUNT_POLICY, 'integration_1d': payload['integration_1d'], 'integration_2d': payload['integration_2d'], 'integrator_gi': payload['integrator_gi'], 'threshold_min': recipe.threshold_min, 'threshold_max': recipe.threshold_max, 'mask_saturation': recipe.mask_saturation, 'reduction_extra': payload['reduction_extra'], 'calibration': payload['calibration'], 'background': payload['background'], 'pixel_accumulator_policy': 'float64_ordered_inplace_v1', 'finite_count_policy': 'uint32_per_pixel_extent_1000000_v1', 'zero_count_policy': 'nan_and_all_zero_refusal_v1', 'overflow_policy': 'post_add_nonfinite_refusal_v1', 'numeric_metadata_keys': numeric_metadata_keys, 'invariant_metadata_keys': invariant_metadata_keys, 'numeric_metadata_policy': 'binary64_neumaier_per_key_denominator_v1', 'invariant_metadata_policy': 'canonical_json_scalar_exact_all_v1', 'metadata_row_policy': 'graph_bound_complete_scalar_row_256_names_65536_bytes_v1', 'metadata_source_policy': 'container_metadata_inputs_and_tiff_preparse_bounded_v2', 'configured_metadata_lookup_policy': 'exact_first_unique_casefold_single_output_domain_v2', 'default_optional_lookup_policy': 'exact_source_spelling_omit_configured_alias_v2', 'conditioning_order': ['threshold', 'frame_background', 'static_frame_mask', 'detector_value_mask', 'finite_accumulate'], 'result_modes': [f'{mode.kind}:{mode.key}' for mode in modes], 'reduction_strict_policy': {'policy': 'average_reduction_strict_v1', 'missing_normalization': True, 'gi_all_dummy': True, 'thumbnail_fallback': True}}
+    if saturation is not None:  # decision 39; absent: the data type's rule, as before
+        value['saturation'] = int(saturation)
+    return value
 def _allocation_payload(value: SessionResourceAllocation) -> dict[str, Any]:
     return {'requirements': {item.name: getattr(value.requirements, item.name) for item in fields(value.requirements)}, 'envelope_bytes': value.envelope_bytes, 'counts': dict(value.counts), 'categories': dict(value.categories), 'minimum_bytes': value.minimum_bytes, 'floor_bytes': value.floor_bytes, 'assigned_bytes': value.assigned_bytes, 'origin': value.origin, 'oversize_excess_bytes': value.oversize_excess_bytes}
 def _operation_payload(plan: AverageScanPlan) -> dict[str, Any]:
@@ -600,7 +607,9 @@ def _plan_from_prepared_graph(
         direct_eiger_eligible=direct_eiger_eligible,
     )
     graph_digest = source_graph_digest(graph)
-    science = hashlib.sha256(b'xdart.average-science.v1\x00' + _canonical(_science_payload(recipe, numeric, invariant))).hexdigest()
+    ceiling = graph_saturation(graph, detector=recipe.calibration.detector_id) if recipe.mask_saturation else None
+    saturation = None if ceiling is None or ceiling.source == 'dtype' else ceiling.value
+    science = hashlib.sha256(b'xdart.average-science.v1\x00' + _canonical(_science_payload(recipe, numeric, invariant, saturation))).hexdigest()
     version = _average_version_identity(
         source_graph_digest=graph_digest,
         science_identity=science,
@@ -625,9 +634,9 @@ def _plan_from_prepared_graph(
     # hand.  `snapshot` is still captured: it is the plan-time identity of the
     # public slot, and `_target_sweep` still uses it to refuse if the slot
     # changes underneath a running Average.
-    prospective = AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, output, version, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, '')
+    prospective = AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, output, version, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, '', saturation=saturation)
     operation = hashlib.sha256(b'xdart.average-operation.v1\x00' + _canonical(_operation_payload(prospective))).hexdigest()
-    return AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, output, version, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, operation)
+    return AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, output, version, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, operation, saturation=saturation)
 
 
 def _seal_published(path: str, ordinal: int) -> StreamTerminal:
@@ -1040,7 +1049,7 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
                     np.logical_and(valid, target, out=valid)
                 predicates += 1
             if plan.recipe.mask_saturation:
-                detector_mask = detector_value_mask(None, native, enabled=True)
+                detector_mask = detector_value_mask(None, native, enabled=True, saturation=plan.saturation)
                 target = valid if predicates == 0 else scratch
                 if detector_mask is None:
                     target.fill(True)
@@ -1127,7 +1136,7 @@ def _reduce_average(plan: AverageScanPlan, science: dict[str, Any], token: threa
                 calibration, integrator=integrator,
             )
     frame = ScanFrame(1, image=science['average'], metadata=dict(science['metadata']), source_path=None, source_frame_index=0, background=None, mask=science['zero'])
-    provenance = {**_science_payload(plan.recipe, plan.numeric_metadata_keys, plan.invariant_metadata_keys), 'science_identity': plan.science_identity, 'operation_identity': plan.operation_identity, 'source_graph_digest': plan.source_graph_digest, 'contributor_extent': plan.contributor_extent, 'metadata_denominators': science['denominators'], 'direct_eiger_eligible': plan.direct_eiger_eligible, 'direct_eiger_execution': science['direct_eiger_execution']}
+    provenance = {**_science_payload(plan.recipe, plan.numeric_metadata_keys, plan.invariant_metadata_keys, plan.saturation), 'science_identity': plan.science_identity, 'operation_identity': plan.operation_identity, 'source_graph_digest': plan.source_graph_digest, 'contributor_extent': plan.contributor_extent, 'metadata_denominators': science['denominators'], 'direct_eiger_eligible': plan.direct_eiger_eligible, 'direct_eiger_execution': science['direct_eiger_execution']}
     scan = Scan('average', [frame], poni=poni, integrator=integrator, output_path=plan.output_artifact, extra={'average_finite_counts': science['finite'], 'average_scan_provenance': provenance, 'detector_shape': plan.detector_shape, **({'detector_calibration': detector_values} if detector_values is not None else {})})
     progress('reduce', 0, 1)
     flat, dark = (_load_static_correction(plan.recipe, plan.detector_shape, token, role)

@@ -1436,6 +1436,26 @@ def _reduce_signal(img, mask, signal):
     return val, n_valid
 
 
+def _recorded_saturation(source, label, cache):
+    """The saturation the frame's own file records (a NeXus/Eiger container's, a PILATUS header's), read once
+    per file, or None: its data type's rule. ROI has no calibration, so no documented counter limit."""
+    from xrd_tools.core.invalid import saturation_count
+    from xrd_tools.io.image import read_detector_image_layout
+    try:
+        path = source.frame_for(label).source_path
+    except Exception:  # noqa: BLE001 - a source without locators keeps the data type's rule
+        return None
+    if path is None or str(path).lower().endswith(".raw"):
+        return None
+    key = str(path)
+    if key not in cache:
+        try:
+            cache[key] = saturation_count(read_detector_image_layout(path).saturation)
+        except Exception:  # noqa: BLE001 - an unreadable header keeps the data type's rule
+            cache[key] = None
+    return cache[key]
+
+
 def run_roi_signals(
     signals,
     source,
@@ -1476,6 +1496,7 @@ def run_roi_signals(
     static_mask = None          # resolved lazily on the first frame (uniform shape)
     mask_resolution_attempted = False
     mask_resolved = False
+    recorded: dict = {}         # each source file's recorded saturation, read once (decision 39)
 
     for done, f in enumerate(all_frames, start=1):
         if should_cancel is not None and should_cancel():
@@ -1495,7 +1516,9 @@ def run_roi_signals(
                 mask_resolution_attempted = True
                 static_mask = _resolve_static_mask(mask, img.shape)
                 mask_resolved = static_mask is not None
-            frame_mask = invalid_pixel_mask(img, mask_saturation=mask_saturation)
+            frame_mask = invalid_pixel_mask(
+                img, mask_saturation=mask_saturation,
+                saturation=_recorded_saturation(src, f, recorded) if mask_saturation else None)
             if static_mask is not None and static_mask.shape == img.shape:
                 frame_mask = frame_mask | static_mask
             row = {}

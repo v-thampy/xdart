@@ -2535,3 +2535,32 @@ def test_average_refuses_a_slot_that_is_its_own_active_mask(tmp_path, monkeypatc
     assert result.diagnostic_code == "AVERAGE_OUTPUT_IS_SOURCE"
     # The operator's mask survives byte for byte.
     assert mask_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("detector, dtype", [("Pilatus100k", np.int32), ("Detector", np.int32),
+                                             ("Pilatus100k", np.uint16)])
+def test_average_leaves_out_counts_at_the_detectors_saturation(tmp_path, detector, dtype):
+    """Decision 39: Average resolves its source's automatic ceiling (here the calibration's PILATUS counter
+    limit, 1,048,575) and each contributor leaves out native values at or above it; the science identity
+    records it only when it is not the data type's rule."""
+    frames = [np.full((4, 4), 20, dtype=dtype) for _ in range(3)]
+    for index, frame in enumerate(frames):
+        frame[index, 0] = 2_000_000 if np.iinfo(dtype).max > 2_000_000 else 60000
+        frame[index, 1] = 1_000_000 if np.iinfo(dtype).max > 2_000_000 else 50000
+    source = _series(tmp_path, frames)
+    calibration = CalibrationState(
+        PoniValues(0.2, 0.001, 0.001, 0.0, 0.0, 0.0, 1e-10), detector,
+        {"pixel1": 1e-4, "pixel2": 1e-4, "max_shape": [4, 4], "orientation": 3}, status=FactStatus.PRESENT)
+    recipe = AverageScanRecipe(source, tmp_path / "scan.nexus", ReductionPlan(
+        integration_1d=Integration1DPlan(npt=4, method="numpy"), mask_saturation=True), calibration=calibration)
+    resolved = detector == "Pilatus100k" and dtype is np.int32
+    plan = _prepare_average_scan(recipe)
+    assert plan.saturation == (1048575 if resolved else None)
+    assert ("saturation" in module._science_payload(
+        plan.recipe, plan.numeric_metadata_keys, plan.invariant_metadata_keys, plan.saturation)) is resolved
+    result = _run_average_scan(recipe)
+    assert result.disposition == "COMMITTED", result
+    expected = np.full((4, 4), 3, dtype=np.uint32)
+    if resolved:
+        expected[:3, 0] = 2  # each frame's 2,000,000 count is left out
+    np.testing.assert_array_equal(module.get_average_finite_counts(result.target).values, expected)

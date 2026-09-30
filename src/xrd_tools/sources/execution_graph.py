@@ -529,6 +529,30 @@ class PreparedSourceExecutionGraph:
             raise TypeError("ordinary source graph cannot retain scanned motors")
         if type(self.dataset_paths) is not tuple or any(type(value) is not str or not value for value in self.dataset_paths):
             raise TypeError("source graph dataset paths are invalid")
+def graph_saturation(graph: PreparedSourceExecutionGraph, *, detector: object = None):
+    """The admitted source's automatic ceiling (decision 39): the value its container or first image
+    records (one scan's images share their header), else the calibration ``detector``'s documented counter
+    limit for integer data, else its data type's maximum; None when none is known."""
+    from xrd_tools.core.invalid import resolve_detector_saturation
+
+    recorded, dtype = None, graph.native_dtype
+    if graph.descriptor is not None:
+        recorded = graph.descriptor.saturation
+        if dtype is None and graph.descriptor.dtype is not None:
+            dtype = np.dtype(graph.descriptor.dtype).str
+    elif graph.stamp.members:
+        options = dict(graph.execution_source.options)
+        layout = read_detector_image_layout(
+            graph.stamp.members[0].path,
+            raw_dtype=str(options.get("raw_dtype", "int32")),
+            raw_header_skip=int(options.get("raw_header_skip", 0)),
+            detector_shape=options.get("detector_shape"),
+            detector=options.get("detector"),
+        )
+        recorded, dtype = layout.saturation, dtype or layout.dtype
+    return resolve_detector_saturation(recorded=recorded, detector=detector, dtype=dtype)
+
+
 def _frozen_options(value: Any) -> Any:
     if isinstance(value, dict): return {str(key): _frozen_options(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)): return tuple(_frozen_options(item) for item in value)
