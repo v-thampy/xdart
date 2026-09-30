@@ -2068,11 +2068,11 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _save_session_quietly(self):
         """At close: the session keeps the policy last shown (combined Stitch review F2); a failure to
-        write it never keeps the window open."""
+        write it never keeps the window open, nor the page from closing."""
         try:
             self._save_session()
-        except (OSError, ValueError) as error:
-            _LOG.warning('Could not record the calibration session: %s', error)
+        except Exception:  # noqa: BLE001 - a close-time record; the log keeps what went wrong
+            _LOG.warning('Could not record the calibration session', exc_info=True)
 
     def active(self):
         """Whether host navigation must retain this window's worker."""
