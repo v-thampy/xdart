@@ -109,6 +109,19 @@ def test_grazing_keeps_the_controls_width_as_ints(qapp, tmp_path):
         qapp.processEvents()
         assert page.controls.minimumSizeHint().width() == standard
         assert page.controls.experiment_title == "Configuration"  # Int's title (workspace_shell)
+        # Int's columns: the same proportions, so the two pages switch in place
+        from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
+        shell = ScatteringWorkspaceShell()
+        try:
+            assert page.splitter.widget(0).minimumWidth() == shell.splitter.widget(0).minimumWidth() == 255
+            for widget in (page, shell):  # Int's own layout test's window
+                widget.resize(1488, 1080)
+                widget.show()
+            qapp.processEvents()
+            assert page.splitter.sizes() == shell.splitter.sizes() == [289, 868, 323]
+        finally:
+            shell.close()
+            shell.deleteLater()
     finally:
         page.close()
         _close(page, qapp)

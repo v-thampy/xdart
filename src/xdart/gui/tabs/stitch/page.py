@@ -495,10 +495,12 @@ class StitchPage(QtWidgets.QWidget):
         self.run_bar.stopClicked.connect(self.stop)
         right_layout.addWidget(self.run_bar)
         self.splitter.addWidget(right)
-        self.splitter.setStretchFactor(0, 0)
-        self.splitter.setStretchFactor(1, 1)
-        self.splitter.setStretchFactor(2, 0)
-        self.splitter.setSizes([230, 720, 360])
+        # Int's columns (workspace_shell): the same proportions, so the two pages switch in place
+        left.setMinimumWidth(255)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 3)
+        self.splitter.setStretchFactor(2, 1)
+        self.splitter.setSizes([289, 868, 323])
 
     def _control_action(self, action):
         """Int's action buttons on this page (``ControlsPanel.controlActionRequested``)."""
