@@ -70,15 +70,14 @@ from xrd_tools.io.analysis_artifact import (
     ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE,
     ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE,
     AnalysisArtifactCleanupPending,
-    AnalysisArtifactError,
     AnalysisArtifactKind,
     AnalysisArtifactPayload,
     AnalysisArtifactProjectionInvalid,
     _project_analysis_artifact_result_v1_compat,
     analysis_execution_attestation_digest,
-    inspect_analysis_artifact,
     project_analysis_artifact_result,
     read_analysis_artifact,
+    stitch_record_identity,
 )
 from xrd_tools.io.nexus import write_stitched
 from xrd_tools.io.stitch_record import write_stitch_projection
@@ -3225,18 +3224,20 @@ def stitch_output_current(request: StitchOperationRequest) -> bool:
     before, else overwrite").
 
     File revisions are left out, so a SPEC file that grew by later scans leaves an earlier scan's
-    stitch standing; so does an image rewritten under the same name, which this does not detect. A
-    missing, unreadable or foreign file at the target is not current."""
+    stitch standing; so does an image rewritten under the same name, which this does not detect. It
+    reads the file's envelope only (``stitch_record_identity``): a processed file can always be stitched
+    again, with Replace. A missing, unreadable or foreign file at the target is not current."""
     target = Path(request.module.output.target)
-    if not target.is_file():
+    identity = stitch_record_identity(target) if target.is_file() else None
+    if identity is None:
         return False
+    plan_fingerprint, provenance = identity
     try:
-        seen = inspect_analysis_artifact(target, expected_kind=AnalysisArtifactKind.STITCH_1D)
-        stored = json.loads(seen.provenance_json)["source"]["input_manifest"]
+        stored = json.loads(provenance)["source"]["input_manifest"]
         planned = json.loads(json.dumps(request.manifest.to_provenance()))
-    except (AnalysisArtifactError, OSError, ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError):
         return False
-    return (seen.plan_fingerprint == request.module.plan_fingerprint
+    return (plan_fingerprint == request.module.plan_fingerprint
             and _without_revisions(stored) == _without_revisions(planned))
 
 

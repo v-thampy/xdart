@@ -28,7 +28,7 @@ def test_native_family_preserves_readable_source_and_frame_subset_slot(tmp_path)
 
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
 def test_a_preflight_marks_the_outputs_already_stitched_from_the_same_frames_with_the_same_settings(
-        tmp_path, backend):
+        tmp_path, backend, monkeypatch):
     """What a Run in Append mode skips (maintainer, 2026-09-29: "skip if something has already been
     processed with the same settings as before, else overwrite"): the same settings over the same
     frames, whatever the source files' revisions."""
@@ -41,6 +41,13 @@ def test_a_preflight_marks_the_outputs_already_stitched_from_the_same_frames_wit
     first, grouped = prepared.requests
     assert run_stitch_operation(first).terminal.disposition is ModuleDisposition.COMMITTED
     assert prepare_stitch_tool(form).unchanged == (0,)
+    # the envelope alone: the stored result is neither re-read nor re-hashed (maintainer, 2026-09-30:
+    # a processed file can always be regenerated, so its full check is not worth the time)
+    from xrd_tools.io import analysis_artifact
+    monkeypatch.setattr(analysis_artifact, "_stitch_record_projection",
+                        lambda *args: pytest.fail("the check re-read the stored result"))
+    assert prepare_stitch_tool(form).unchanged == (0,)
+    monkeypatch.undo()
     spec = Path(form.spec_path)  # the SPEC file grows by a later scan: its revision changes
     spec.write_text(spec.read_text() + "\n#S 9 ascan del 14 15 1 1\n#D today\n#P0 14 -10\n#N 2\n#L del  nu\n14 -10\n15 -10\n")
     image = next(Path(form.image_dir).glob("sample_scan1_0000*"))

@@ -2160,6 +2160,26 @@ def _inspect_stitch_record(
     )
 
 
+def stitch_record_identity(path: str | Path) -> tuple[str, str] | None:
+    """A saved Stitch 1D record's plan fingerprint and provenance JSON, from its envelope alone (None
+    when the file is not one). Its stored result is not verified: a processed file can always be
+    stitched again from the raw data, so knowing whether it holds a stitch is not worth re-reading and
+    re-hashing every stored pattern (maintainer, 2026-09-30: "we don't want to sacrifice perf ... to
+    avoid rare edge cases where a processed file might get corrupted")."""
+    try:
+        with h5py.File(_absolute_path(path), "r") as handle:
+            entry = handle.get(_ENTRY)
+            if not isinstance(entry, h5py.Group) or not _is_stitch_record(entry):
+                return None
+            stitch = _direct(entry, _STITCH_GROUP, h5py.Group)
+            if _bounded_attr_text(stitch, ANALYSIS_KIND_ATTR) != AnalysisArtifactKind.STITCH_1D.value:
+                return None
+            return (_sha256(_bounded_attr_text(stitch, "plan_fingerprint"), "plan_fingerprint"),
+                    _read_scalar_text(stitch, _PROVENANCE))
+    except (OSError, KeyError, ValueError, TypeError, AnalysisArtifactError):
+        return None
+
+
 def inspect_analysis_artifact(
     path: str | Path,
     *,
@@ -3364,6 +3384,7 @@ __all__ = [
     "canonical_analysis_execution_attestation",
     "canonical_analysis_provenance",
     "inspect_analysis_artifact",
+    "stitch_record_identity",
     "project_analysis_artifact_result",
     "read_analysis_artifact",
 ]
