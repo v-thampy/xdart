@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import builtins
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager, ExitStack
 from dataclasses import InitVar, dataclass, field, replace
 from enum import Enum
 import hashlib
@@ -33,12 +34,14 @@ from xrd_tools.analysis.module_transaction import (
     ModuleOutputRequest,
     ModuleProgress,
     ModuleSourceReceipt,
+    ModuleSourceGroupReceipt,
     ModuleTerminalResult,
     admit_module_artifact,
     module_artifact_request,
     module_plan_fingerprint,
     module_provenance_digest,
     xu_stitch_module_request,
+    _native_stitch_module_request,
 )
 from xrd_tools.analysis.plans import (
     StitchCancelled,
@@ -60,9 +63,12 @@ from xrd_tools.analysis.xu_stitch_calibration import (
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.core.geometry import AngleMapping, Diffractometer, ImageOrientation
 from xrd_tools.core.scan import SourceKind
+from xrd_tools.sources.composite import CompositeFrameSource
 from xrd_tools.io.analysis_artifact import (
     ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
     ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
+    ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE,
+    ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE,
     AnalysisArtifactCleanupPending,
     AnalysisArtifactKind,
     AnalysisArtifactPayload,
@@ -73,8 +79,19 @@ from xrd_tools.io.analysis_artifact import (
     read_analysis_artifact,
 )
 from xrd_tools.io.nexus import write_stitched
+from xrd_tools.io.stitch_record import write_stitch_projection
 from xrd_tools.io.stat_identity import identity_ctime_ns
+from xrd_tools.integrate.frame_screen import FrameScreen, FrameScreenPolicy
 from xrd_tools.integrate.multi import StitchDiagnostics
+from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+from xrd_tools.integrate.stitch_gi import StitchGI
+from xrd_tools.analysis.stitch_native import (
+    capture_mask, revalidate_mask, native_mask, native_plan_identity,
+    native_provenance, capture_callback, geometry_facts,
+    capture_detector_image, native_detector_image,
+)
+from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
+from xrd_tools.corrections.stack import CorrectionStack
 from xrd_tools.integrate.xu_stitch import (
     XuStitchCancelled,
     XuStitchEffectiveGeometryProjection,
@@ -101,6 +118,10 @@ _MAX_AXIS_POINTS = 1_000_000
 _MAX_2D_POINTS = 64_000_000
 _GEOMETRY_FACTORY = object()
 _REQUEST_FACTORY = object()
+#: Where the sample sits relative to a stacked arm's calibrated sample offset.
+SAMPLE_POSITIONS = ("calibrated", "rotation_axis")
+#: pyFAI error models a MultiGeometry Stitch may request (None = no sigma).
+STITCH_ERROR_MODELS = (None, "poisson")
 
 
 class StitchGeometryKind(str, Enum):
@@ -380,12 +401,14 @@ class StitchGeometryInput:
             raise ValueError("Stitch geometry requires an explicit source motor mapping")
         if self.kind is StitchGeometryKind.PYFAI_GONIOMETER_JSON and references:
             raise ValueError("fitted goniometer JSON cannot carry PONI references")
+        # A single detector arm (a fourc/twoc 2θ) maps its one moving circle, del
+        # (vertical) or nu (horizontal); the other is held at zero.
         if self.kind is StitchGeometryKind.PONI and (
-            {name for name, _source in motors} != {"del", "nu"}
-            or {name for name, _value in references} != {"del", "nu"}
+            {name for name, _source in motors} not in ({"del", "nu"}, {"del"}, {"nu"})
+            or {name for name, _value in references} != {name for name, _source in motors}
         ):
             raise ValueError(
-                "PONI geometry requires del/nu source mappings and reference positions"
+                "PONI geometry requires del and/or nu source mappings and reference positions"
             )
         if type(self.image_rotation) is not int or self.image_rotation not in {0, 90, 180, 270}:
             raise ValueError("image rotation must be an exact 0/90/180/270 integer")
@@ -510,14 +533,31 @@ def capture_stitch_geometry(request: StitchGeometryInput) -> StitchGeometryRecei
             "GEOMETRY_HASH_MISMATCH", "geometry digest does not match expectation"
         )
     if request.kind is StitchGeometryKind.PYFAI_GONIOMETER_JSON:
-        declared_positions = _json_position_names(_json_mapping(raw))
+        record = _json_mapping(raw)
+        declared_positions = _json_position_names(record)
         bound_positions = tuple(name for name, _source in request.source_motors)
         if set(bound_positions) != set(declared_positions):
             raise StitchOperationRefused(
                 "GEOMETRY_MOTOR_MAPPING_MISMATCH",
                 "goniometer JSON source mapping must bind every declared "
-                "position exactly once and no others",
+                "position exactly once and no others (declared: "
+                f"{', '.join(declared_positions)}; bound: "
+                f"{', '.join(bound_positions) or 'none'})",
             )
+        from xrd_tools.core.geometry.stacked_arm import STACKED_ARM_MARKERS
+
+        constants = record["trans_function"].get("constants", {})
+        if type(constants) is dict and any(marker in constants for marker in STACKED_ARM_MARKERS):
+            from xrd_tools.core.geometry import Diffractometer
+
+            try:
+                Diffractometer.from_pyfai_goniometer(
+                    record, source_motors=dict(request.source_motors)
+                )
+            except (KeyError, TypeError, ValueError, NotImplementedError) as error:
+                raise StitchOperationRefused(
+                    "GEOMETRY_PARSE_FAILED", "invalid stacked-arm calibration"
+                ) from error
     else:
         try:
             from xrd_tools.integrate.calibration import load_detector_calibration
@@ -837,6 +877,73 @@ class StitchInputManifestReceipt:
         raise TypeError("Stitch input manifest is not serializable")
 
 
+@dataclass(eq=False, frozen=True, slots=True)
+class StitchGroupManifestReceipt:
+    """Ordered per-source manifests with one explicit global frame map."""
+
+    members: tuple[StitchInputManifestReceipt, ...]
+    module_source_fingerprint: str
+    files: tuple[StitchManifestFile, ...] = field(init=False)
+    contributions: tuple[StitchContribution, ...] = field(init=False)
+    member_frames: tuple[tuple[int, int], ...] = field(init=False)
+    fingerprint: str = field(init=False)
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim):
+        if (_claim is not _REQUEST_FACTORY or type(self.members) is not tuple
+                or not self.members or any(type(m) is not StitchInputManifestReceipt for m in self.members)
+                or len({m.project_root for m in self.members}) != 1):
+            raise TypeError("invalid Stitch group manifest")
+        _sha256(self.module_source_fingerprint, "group source fingerprint")
+        files, contributions, member_frames = [], [], []
+        by_path = {}
+        for index, member in enumerate(self.members):
+            for item in member.files:
+                if item.relative_path not in by_path:
+                    by_path[item.relative_path] = len(files)
+                    files.append(item)
+                elif files[by_path[item.relative_path]] != item:
+                    raise StitchOperationRefused("SOURCE_IDENTITY_MISMATCH")
+            for item in member.contributions:
+                contributions.append(replace(item, label=len(contributions), file_ordinal=
+                    by_path[member.files[item.file_ordinal].relative_path]))
+                member_frames.append((index, item.label))
+        if len(contributions) > _MAX_CONTRIBUTIONS or len(files) > _MAX_MANIFEST_FILES:
+            raise StitchOperationRefused("MANIFEST_CONTRIBUTION_LIMIT_EXCEEDED")
+        object.__setattr__(self, "files", tuple(files))
+        object.__setattr__(self, "contributions", tuple(contributions))
+        object.__setattr__(self, "member_frames", tuple(member_frames))
+        object.__setattr__(self, "fingerprint", module_plan_fingerprint(ModuleKind.STITCH,
+            ("stitch-group-manifest-v1", self.module_source_fingerprint, tuple(m.fingerprint for m in self.members))))
+        if len(json.dumps(self.to_provenance()).encode()) > _MAX_MANIFEST_BYTES:
+            raise StitchOperationRefused("MANIFEST_BYTE_LIMIT_EXCEEDED")
+
+    @property
+    def project_root(self): return self.members[0].project_root
+    @property
+    def source_relative_path(self): return self.members[0].source_relative_path
+    @property
+    def source_scan(self): return None
+
+    def to_provenance(self):
+        return {"schema_version": "stitch-group-manifest-v1",
+                "members": [member.to_provenance() for member in self.members],
+                "member_frames": [list(value) for value in self.member_frames],
+                "fingerprint": self.fingerprint}
+
+
+def _source_members(source):
+    return source.members if type(source) is ModuleSourceGroupReceipt else (source,)
+
+
+def _table_names(table):
+    if type(table) is tuple:
+        names = tuple(column.name for column in table[0].columns)
+        # Every selected motor must have the same unambiguous availability.
+        return names
+    return tuple(column.name for column in table.columns)
+
+
 def _project_source_options(analysis, root: Path) -> str:
     """Return the closed, Project-relative S1 source-policy projection."""
 
@@ -847,7 +954,7 @@ def _project_source_options(analysis, root: Path) -> str:
         )
     options = dict(analysis.source_spec.options)
     if analysis.resolved_kind is SourceKind.SPEC:
-        allowed = {"scan", "image_dir", "image_stem", "read_image_kwargs"}
+        allowed = {"scan", "image_dir", "image_stem", "read_image_kwargs", "require_complete_images"}
         if (
             analysis.resolved_entry is not None
             or not analysis.resolved_scan
@@ -994,6 +1101,10 @@ def _project_source_options(analysis, root: Path) -> str:
                     )
                 )
             projected["admitted_motor_values"] = tuple(projected_rows)
+    elif analysis.resolved_kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
+        if options or not analysis.resolved_entry:
+            raise StitchOperationRefused("SOURCE_SPEC_UNSUPPORTED", "NeXus requires an exact entry and no reader overrides")
+        projected = {}
     else:
         raise StitchOperationRefused("SOURCE_KIND_UNSUPPORTED")
 
@@ -1046,6 +1157,11 @@ def _capture_input_manifest(
     project_root: str | Path,
     selectors: tuple[MetadataColumnSelector, ...],
 ) -> StitchInputManifestReceipt:
+    if type(source) is ModuleSourceGroupReceipt:
+        return StitchGroupManifestReceipt(tuple(
+            _capture_input_manifest(member, member_table, project_root, selectors)
+            for member, member_table in zip(source.members, table, strict=True)
+        ), source.fingerprint, _REQUEST_FACTORY)
     try:
         root = Path(project_root).expanduser().resolve(strict=True)
     except (OSError, TypeError) as error:
@@ -1221,6 +1337,27 @@ class StitchOperationPlan:
     monitor_selector: MetadataColumnSelector | None = None
     use_detector_mask: bool = True
     max_frame_bytes: int = 256 * 1024 * 1024
+    native_records: bool = False
+    conditioning: StitchConditioning | None = None
+    mask_path: str | Path | None = None
+    frame_screen: FrameScreenPolicy = field(default_factory=FrameScreenPolicy)
+    #: 'calibrated' keeps a stacked arm's fitted sample offset; 'rotation_axis'
+    #: drops it for a sample centred on the rotation axis (e.g. after GI alignment).
+    sample_position: str = "calibrated"
+    #: pyFAI corrections. Solid angle stays on for a stacked arm with a sample
+    #: offset, whose per-frame distances differ. polarization_factor None = off.
+    correct_solid_angle: bool = True
+    polarization_factor: float | None = 0.99
+    error_model: str | None = None
+    dark_path: str | Path | None = None
+    flat_path: str | Path | None = None
+    #: Flat pixels below this fraction of the flat's median are masked as dead.
+    flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
+    #: Grazing incidence: a GI cut written beside I(q) (native Stitch 1D only).
+    gi: StitchGI | None = None
+    _mask_receipt: object = field(init=False, default=None, repr=False)
+    _dark_receipt: object = field(init=False, default=None, repr=False)
+    _flat_receipt: object = field(init=False, default=None, repr=False)
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1236,7 +1373,8 @@ class StitchOperationPlan:
                 raise ValueError(f"{name} must be a bounded positive exact integer")
         if self.npt_rad_2d * self.npt_azim_2d > _MAX_2D_POINTS:
             raise ValueError("2-D Stitch output exceeds the bounded artifact point limit")
-        radial = _range(self.radial_range, "radial range", required=True)
+        _native_plan_fields(self)
+        radial = _range(self.radial_range, "radial range", required=not self.native_records)
         azimuth = _range(
             self.azimuth_range,
             "azimuth range",
@@ -1245,7 +1383,7 @@ class StitchOperationPlan:
 
         if self.mode == "1d" and azimuth is not None:
             raise ValueError("a 1-D Stitch plan cannot carry an azimuth range")
-        if self.unit != "q_A^-1" or self.method != "full":
+        if self.unit not in ({"q_A^-1", "2th_deg"} if self.native_records else {"q_A^-1"}) or self.method != "full":
             raise ValueError("S1 requires unit='q_A^-1' and notebook method='full'")
         if (
             self.monitor_selector is not None
@@ -1254,11 +1392,17 @@ class StitchOperationPlan:
             raise TypeError("monitor selector must be exact MetadataColumnSelector")
         if type(self.use_detector_mask) is not bool:
             raise TypeError("use_detector_mask must be an exact bool")
+        if type(self.frame_screen) is not FrameScreenPolicy:
+            raise TypeError("frame screen must be an exact FrameScreenPolicy")
+        if self.sample_position not in SAMPLE_POSITIONS:
+            raise ValueError(f"sample position must be one of {SAMPLE_POSITIONS}")
         if (
             type(self.max_frame_bytes) is not int
             or not 1 <= self.max_frame_bytes <= 4 * 1024 * 1024 * 1024
         ):
             raise ValueError("max_frame_bytes must be a bounded positive exact integer")
+        _correction_fields(self)
+        _gi_field(self)
         object.__setattr__(self, "radial_range", radial)
         object.__setattr__(self, "azimuth_range", azimuth)
         object.__setattr__(
@@ -1269,7 +1413,7 @@ class StitchOperationPlan:
 
     def _canonical_value(self) -> tuple[object, ...]:
         selector = self.monitor_selector
-        return (
+        value = (
             "stitch-operation-plan-v1",
             self.geometry.fingerprint,
             self.backend,
@@ -1285,37 +1429,70 @@ class StitchOperationPlan:
             self.use_detector_mask,
             "streaming-multigeometry-v1",
             self.max_frame_bytes,
-        )
+            self.frame_screen.identity(),
+            ("sample-position", self.sample_position),
+            ("corrections-v1", self.correct_solid_angle, self.polarization_factor,
+             self.error_model,
+             None if self._dark_receipt is None else self._dark_receipt.fingerprint,
+             None if self._flat_receipt is None else self._flat_receipt.fingerprint),
+        ) + _flat_cutoff_identity(self) + _gi_identity(self)
+        return value + native_plan_identity(self) if self.native_records else value
 
 
 @dataclass(frozen=True, slots=True)
 class XuStitchOperationPlan:
     calibration: XuStitchCalibrationReceipt
     effective_geometry: XuStitchEffectiveGeometryProjection
-    q_min_A_inverse: float
-    q_max_A_inverse: float
+    q_min_A_inverse: float | None = None
+    q_max_A_inverse: float | None = None
     npt_1d: int = 1500
     monitor_selector: MetadataColumnSelector | None = None
     max_frame_bytes: int = 256 * 1024 * 1024
+    unit: str = "q_A^-1"
+    radial_range: tuple[float, float] | None = None
+    native_records: bool = False
+    conditioning: StitchConditioning | None = None
+    mask_path: str | Path | None = None
+    frame_screen: FrameScreenPolicy = field(default_factory=FrameScreenPolicy)
+    #: pyFAI's polarization, dark and flat, applied like MultiGeometry; None = off.
+    polarization_factor: float | None = 0.99
+    dark_path: str | Path | None = None
+    flat_path: str | Path | None = None
+    flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
+    #: Grazing incidence: a GI cut written beside I(q) (native Stitch 1D only).
+    gi: StitchGI | None = None
+    _mask_receipt: object = field(init=False, default=None, repr=False)
+    _dark_receipt: object = field(init=False, default=None, repr=False)
+    _flat_receipt: object = field(init=False, default=None, repr=False)
     backend: str = field(init=False, default="xu_hist")
     mode: str = field(init=False, default="1d")
-    unit: str = field(init=False, default="q_A^-1")
     method: str = field(init=False, default="numpy_histogram_center_v1")
     use_detector_mask: bool = field(init=False, default=True)
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
+        _native_plan_fields(self)
+        if type(self.frame_screen) is not FrameScreenPolicy:
+            raise TypeError("frame screen must be an exact FrameScreenPolicy")
+        if not self.native_records and (self.dark_path is not None or self.flat_path is not None):
+            raise ValueError("XU dark and flat corrections require native records")
+        _polarization_field(self)
+        _detector_image_fields(self)
+        _gi_field(self)
+        if self.q_min_A_inverse is not None or self.q_max_A_inverse is not None:
+            if (type(self.q_min_A_inverse) is not float or type(self.q_max_A_inverse) is not float
+                    or self.unit != "q_A^-1" or self.radial_range not in
+                    (None, (self.q_min_A_inverse, self.q_max_A_inverse))):
+                raise TypeError("legacy XU bounds require two floats and no competing range")
+            object.__setattr__(self, "radial_range", (self.q_min_A_inverse, self.q_max_A_inverse))
+        object.__setattr__(self, "radial_range", _range(self.radial_range, "radial range", required=not self.native_records))
         if (
             type(self.calibration) is not XuStitchCalibrationReceipt
             or type(self.effective_geometry)
             is not XuStitchEffectiveGeometryProjection
             or self.effective_geometry.asset_semantic_fingerprint
             != self.calibration.semantic_fingerprint
-            or type(self.q_min_A_inverse) is not float
-            or type(self.q_max_A_inverse) is not float
-            or not math.isfinite(self.q_min_A_inverse)
-            or not math.isfinite(self.q_max_A_inverse)
-            or self.q_min_A_inverse >= self.q_max_A_inverse
+            or self.unit not in ({"q_A^-1", "2th_deg"} if self.native_records else {"q_A^-1"})
             or type(self.npt_1d) is not int
             or not 1 <= self.npt_1d <= _MAX_AXIS_POINTS
             or (
@@ -1326,6 +1503,8 @@ class XuStitchOperationPlan:
             or not 1 <= self.max_frame_bytes <= 4 * 1024 * 1024 * 1024
         ):
             raise TypeError("XU Stitch operation plan is invalid")
+        if not self.native_records and self.calibration.projection.value["version"] != 1:
+            raise ValueError("non-native XU plans require canonical version 1 calibration")
         object.__setattr__(
             self,
             "fingerprint",
@@ -1337,7 +1516,7 @@ class XuStitchOperationPlan:
                     self.mode,
                     self.unit,
                     self.method,
-                    (self.q_min_A_inverse, self.q_max_A_inverse),
+                    self.radial_range,
                     self.npt_1d,
                     None
                     if self.monitor_selector is None
@@ -1349,13 +1528,91 @@ class XuStitchOperationPlan:
                     self.max_frame_bytes,
                     self.calibration.fingerprint,
                     self.effective_geometry.fingerprint,
-                ),
+                    self.frame_screen.identity(),
+                ) + _xu_corrections_identity(self) + _gi_identity(self)
+                + (native_plan_identity(self) if self.native_records else ()),
             ),
         )
 
-    @property
-    def radial_range(self) -> tuple[float, float]:
-        return (self.q_min_A_inverse, self.q_max_A_inverse)
+def _xu_corrections_identity(plan):
+    """Only a corrected XU plan changes its identity; an uncorrected one keeps the old one."""
+    if plan.polarization_factor is None and plan._dark_receipt is None and plan._flat_receipt is None:
+        return ()
+    return (("xu-corrections-v1", plan.polarization_factor,
+             None if plan._dark_receipt is None else plan._dark_receipt.fingerprint,
+             None if plan._flat_receipt is None else plan._flat_receipt.fingerprint),
+            ) + _flat_cutoff_identity(plan)
+
+
+def _gi_field(plan):
+    if plan.gi is None:
+        return
+    if type(plan.gi) is not StitchGI:
+        raise TypeError("Stitch GI must be an exact StitchGI")
+    if not plan.native_records or plan.mode != "1d" or plan.unit != "q_A^-1":
+        raise ValueError("a GI cut is written beside I(q) by a native Stitch 1D in Q")
+
+
+def _gi_identity(plan):
+    """Only a GI plan changes its identity; every other plan keeps the one it had."""
+    return () if plan.gi is None else (plan.gi.identity(),)
+
+
+def _flat_cutoff_identity(plan):
+    """A flat cutoff away from 10 % changes the identity; the default keeps the old one."""
+    if plan._flat_receipt is None or plan.flat_min_fraction == DEFAULT_MIN_FLAT_FRACTION:
+        return ()
+    return (("flat-min-fraction", plan.flat_min_fraction),)
+
+
+def _correction_fields(plan):
+    if type(plan.correct_solid_angle) is not bool:
+        raise TypeError("correct_solid_angle must be an exact bool")
+    _polarization_field(plan)
+    if plan.error_model not in STITCH_ERROR_MODELS:
+        raise ValueError(f"Stitch error model must be one of {STITCH_ERROR_MODELS}")
+    _detector_image_fields(plan)
+
+
+def _polarization_field(plan):
+    factor = plan.polarization_factor
+    if factor is not None:
+        if (isinstance(factor, bool) or not isinstance(factor, (int, float))
+                or not math.isfinite(factor) or not -1.0 <= factor <= 1.0):
+            raise ValueError("polarization factor must be a finite number from -1 to 1, or None")
+        object.__setattr__(plan, "polarization_factor", float(factor))
+
+
+def _detector_image_fields(plan):
+    fraction = plan.flat_min_fraction
+    if (isinstance(fraction, bool) or not isinstance(fraction, (int, float))
+            or not math.isfinite(fraction) or not 0.0 <= fraction < 1.0):
+        raise ValueError("the flat cutoff must be a number from 0 to below 1")
+    object.__setattr__(plan, "flat_min_fraction", float(fraction))
+    for role in ("dark", "flat"):
+        path = getattr(plan, f"{role}_path")
+        if path is not None:
+            receipt, _pixels = capture_detector_image(path, role, plan.max_frame_bytes,
+                                                      plan.flat_min_fraction)
+            object.__setattr__(plan, f"{role}_path", receipt.lexical_path)
+            object.__setattr__(plan, f"_{role}_receipt", receipt)
+
+
+def _native_plan_fields(plan):
+    if type(plan.native_records) is not bool:
+        raise TypeError("native_records must be an exact bool")
+    if plan.conditioning is not None and type(plan.conditioning) is not StitchConditioning:
+        raise TypeError("conditioning must be exact StitchConditioning")
+    if not plan.native_records and (plan.conditioning is not None or plan.mask_path is not None):
+        raise ValueError("native conditioning and mask require native_records")
+    if plan.native_records and plan.mode != "1d":
+        raise ValueError("native frame artifacts require Stitch 1-D")
+    if plan.native_records and plan.conditioning is None:
+        object.__setattr__(plan, "conditioning", StitchConditioning("off"))
+    if plan.mask_path is not None:
+        receipt = capture_mask(plan.mask_path)
+        object.__setattr__(plan, "mask_path", receipt.lexical_path)
+        object.__setattr__(plan, "_mask_receipt", receipt)
 
 
 def _required_stitch_selectors(
@@ -1372,6 +1629,7 @@ def _required_stitch_selectors(
         requested = tuple(
             MetadataColumnSelector(str(name), 0)
             for name in acquisition["source_motors"].values()
+            if name is not None  # a single 2θ arm reads no nu
         )
         energy_name = str(acquisition["source_energy_selector"])
         energy_count = table_names.count(energy_name)
@@ -1380,11 +1638,13 @@ def _required_stitch_selectors(
                 "AMBIGUOUS_METADATA_SELECTOR",
                 f"metadata column {energy_name!r} must occur at most once",
             )
-        if energy_count == 1:
+        if energy_count == 1 and not plan.native_records:
             requested += (MetadataColumnSelector(energy_name, 0),)
     else:
         raise TypeError("stitch selectors require an exact Stitch plan")
     requested += (() if plan.monitor_selector is None else (plan.monitor_selector,))
+    if plan.gi is not None:  # the incidence (and xrayutilities' sample circles), per frame
+        requested += tuple(MetadataColumnSelector(name, 0) for name in plan.gi.metadata_names())
     return tuple(
         sorted(
             {
@@ -1400,6 +1660,9 @@ def _xu_energy_selector(
     plan: XuStitchOperationPlan,
     table_names: tuple[str, ...],
 ) -> MetadataColumnSelector | None:
+    if plan.native_records:
+        # Each member's optional energy is bound independently by native provenance.
+        return None
     name = str(
         plan.calibration.projection.value["acquisition"][
             "source_energy_selector"
@@ -1422,8 +1685,9 @@ def _xu_observations(
     asset = plan.calibration.projection.value
     acquisition = asset["acquisition"]
     validation = asset["validation"]
-    del_key = (str(acquisition["source_motors"]["del"]), 0)
-    nu_key = (str(acquisition["source_motors"]["nu"]), 0)
+    # None: the circle a single 2θ arm holds at zero
+    del_key, nu_key = (None if acquisition["source_motors"][circle] is None
+                       else (str(acquisition["source_motors"][circle]), 0) for circle in ("del", "nu"))
     monitor_key = (
         None
         if plan.monitor_selector is None
@@ -1440,15 +1704,16 @@ def _xu_observations(
     extrapolation_count = 0
     validated = validation["validated_scan_domain_source_deg"]
     control = validation["control_domain_source_deg"]
-    expected_energy = float(acquisition["energy_eV"])
+    # a refined calibration's scans are checked against the energy they recorded
+    expected_energy = float(acquisition.get("source_energy_eV", acquisition["energy_eV"]))
     for contribution in manifest.contributions:
         values = {
             (name, occurrence): value
             for name, occurrence, value in contribution.values
         }
         try:
-            del_value = float(values[del_key])
-            nu_value = float(values[nu_key])
+            del_value = 0.0 if del_key is None else float(values[del_key])
+            nu_value = 0.0 if nu_key is None else float(values[nu_key])
         except KeyError as error:
             raise StitchOperationRefused(
                 "UNBOUND_METADATA_SELECTOR",
@@ -1593,11 +1858,12 @@ def _provenance(
     )
     if effective_calibration is not None:
         geometry_projection["effective_calibration"] = effective_calibration
-    return {
+    value = {
         "schema_version": "stitch-operation-v1",
         "kind": "stitch",
         "source": {
-            "source_fingerprint": source.analysis.source_fingerprint,
+            "source_fingerprint": (source.fingerprint if type(source) is ModuleSourceGroupReceipt
+                                   else source.analysis.source_fingerprint),
             "module_source_fingerprint": source.fingerprint,
             "metadata_table_fingerprint": source.table_fingerprint,
             "selected_labels": list(source.selected_labels),
@@ -1610,7 +1876,7 @@ def _provenance(
             "npt_1d": plan.npt_1d,
             "npt_rad_2d": plan.npt_rad_2d,
             "npt_azim_2d": plan.npt_azim_2d,
-            "radial_range": list(plan.radial_range),
+            "radial_range": None if plan.radial_range is None else list(plan.radial_range),
             "azimuth_range": (
                 None if plan.azimuth_range is None else list(plan.azimuth_range)
             ),
@@ -1623,6 +1889,17 @@ def _provenance(
             ),
             "use_detector_mask": plan.use_detector_mask,
             "streaming_multigeometry": True,
+            "frame_screen": plan.frame_screen.to_provenance(),
+            "sample_position": plan.sample_position,
+            "corrections": {
+                "solid_angle": plan.correct_solid_angle,
+                "polarization_factor": plan.polarization_factor,
+                "error_model": plan.error_model,
+                "dark": (None if plan._dark_receipt is None
+                         else plan._dark_receipt.to_provenance(Path(manifest.project_root))),
+                "flat": (None if plan._flat_receipt is None
+                         else plan._flat_receipt.to_provenance(Path(manifest.project_root))),
+            },
             "max_frame_bytes": plan.max_frame_bytes,
             "plan_fingerprint": plan.fingerprint,
         },
@@ -1630,9 +1907,10 @@ def _provenance(
         "output": {"kind": output.kind.value},
         "holds": [
             "2d-orientation-parity",
-            "gi-and-custom-corrections",
+            "gi-corrections",
         ],
     }
+    return native_provenance(value, source, output, plan, manifest)
 
 
 def _xu_provenance(
@@ -1670,12 +1948,13 @@ def _xu_provenance(
             ),
         }
     )
-    return {
+    value = {
         "schema_version": "stitch-operation-v2-xu-intent",
         "kind": "stitch",
         "backend": "xu_hist",
         "source": {
-            "source_fingerprint": source.analysis.source_fingerprint,
+            "source_fingerprint": (source.fingerprint if type(source) is ModuleSourceGroupReceipt
+                                   else source.analysis.source_fingerprint),
             "module_source_fingerprint": source.fingerprint,
             "metadata_table_fingerprint": source.table_fingerprint,
             "selected_labels": list(source.selected_labels),
@@ -1697,7 +1976,7 @@ def _xu_provenance(
             "mode": plan.mode,
             "unit": plan.unit,
             "method": plan.method,
-            "radial_range": list(plan.radial_range),
+            "radial_range": None if plan.radial_range is None else list(plan.radial_range),
             "npt_1d": plan.npt_1d,
             "monitor_selector": (
                 None
@@ -1706,6 +1985,14 @@ def _xu_provenance(
             ),
             "use_detector_mask": plan.use_detector_mask,
             "max_frame_bytes": plan.max_frame_bytes,
+            "frame_screen": plan.frame_screen.to_provenance(),
+            **({} if not _xu_corrections_identity(plan) else {"corrections": {
+                "polarization_factor": plan.polarization_factor,
+                "dark": (None if plan._dark_receipt is None
+                         else plan._dark_receipt.to_provenance(Path(manifest.project_root))),
+                "flat": (None if plan._flat_receipt is None
+                         else plan._flat_receipt.to_provenance(Path(manifest.project_root))),
+            }}),
             "asset_receipt_fingerprint": receipt.fingerprint,
             "effective_geometry_fingerprint": plan.effective_geometry.fingerprint,
             "plan_fingerprint": plan.fingerprint,
@@ -1731,18 +2018,18 @@ def _xu_provenance(
         },
         "holds": [
             "xu-2d-and-chi",
-            "gi-stitch-on-xu",
             "explicit-ub-and-sample-placement",
             "operator-configured-sample-circles",
             "generic-xu-diffractometers-and-detectors",
             "external-or-combined-masks",
             "sensor-parallax-xu-geometry",
-            "new-corrections-and-variance",
+            "xu-sigma-and-variance",
             "mixed-energy-grouped-xu-stitch",
             "historical-json-migration",
             "unvalidated-platforms-and-live-gates",
         ],
     }
+    return native_provenance(value, source, output, plan, manifest)
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -1759,7 +2046,7 @@ class StitchOperationRequest:
             or type(self.module) is not ModuleOperationRequest
             or self.module.kind is not ModuleKind.STITCH
             or type(self.plan) not in {StitchOperationPlan, XuStitchOperationPlan}
-            or type(self.manifest) is not StitchInputManifestReceipt
+            or type(self.manifest) not in {StitchInputManifestReceipt, StitchGroupManifestReceipt}
             or type(self.provenance_json) is not str
             or self.module.plan_fingerprint != self.plan.fingerprint
             or self.manifest.module_source_fingerprint
@@ -1769,7 +2056,7 @@ class StitchOperationRequest:
         ):
             raise TypeError("stitch operation request is invalid")
         table = _fresh_table(self.module.source)
-        table_names = tuple(column.name for column in table.columns)
+        table_names = _table_names(table)
         required = _required_stitch_selectors(self.plan, table_names)
         expected_manifest = _capture_input_manifest(
             self.module.source,
@@ -1840,6 +2127,8 @@ class StitchOperationRequest:
 
 
 def _fresh_table(source: ModuleSourceReceipt):
+    if type(source) is ModuleSourceGroupReceipt:
+        return tuple(_fresh_table(member) for member in source.members)
     table = run_metadata_table(MetadataTablePlan(source.analysis.source_spec))
     if (
         table.disposition is not AnalysisDisposition.COMPLETED
@@ -1863,16 +2152,18 @@ def prepare_stitch_operation(
     """Bind exact source, geometry, plan, provenance, and output intent."""
 
     if (
-        type(source) is not ModuleSourceReceipt
+        type(source) not in {ModuleSourceReceipt, ModuleSourceGroupReceipt}
         or source.kind is not ModuleKind.STITCH
         or type(output) is not ModuleOutputRequest
         or type(plan) not in {StitchOperationPlan, XuStitchOperationPlan}
     ):
         raise TypeError("stitch preparation requires exact Stitch module values")
-    if source.analysis.resolved_kind not in {
+    if any(member.analysis.resolved_kind not in {
         SourceKind.SPEC,
         SourceKind.TIFF_SERIES,
-    }:
+        SourceKind.NEXUS_STACK,
+        SourceKind.EIGER_MASTER,
+    } for member in _source_members(source)):
         raise StitchOperationRefused(
             "SOURCE_KIND_UNSUPPORTED",
             "S1 Stitch accepts only an extensionless SPEC scan or TIFF series",
@@ -1887,28 +2178,21 @@ def prepare_stitch_operation(
             "OUTPUT_KIND_MISMATCH", "Stitch mode and output artifact kind differ"
         )
     table = _fresh_table(source)
-    names = tuple(column.name for column in table.columns)
+    names = _table_names(table)
     required = _required_stitch_selectors(plan, names)
-    for selector in required:
-        if selector.occurrence != 0 or names.count(selector.name) != 1:
-            raise StitchOperationRefused(
-                "AMBIGUOUS_METADATA_SELECTOR",
-                f"metadata column {selector.name!r} must occur exactly once",
-            )
-        if selector not in source.resolved_selectors:
-            raise StitchOperationRefused(
-                "UNBOUND_METADATA_SELECTOR",
-                f"metadata column {selector.name!r} is not bound by the source receipt",
-            )
-    options = dict(source.analysis.source_spec.options)
-    read_options = options.get("read_image_kwargs", {})
-    if type(read_options) is not dict:
-        read_options = dict(read_options)
-    if read_options.get("rotation", 0) != 0:
-        raise StitchOperationRefused(
-            "SOURCE_ORIENTATION_CONFLICT",
-            "source rotation must be zero; Stitch owns the recorded image orientation",
-        )
+    tables = table if type(table) is tuple else (table,)
+    for member, member_table in zip(_source_members(source), tables, strict=True):
+        member_names = _table_names(member_table)
+        for selector in required:
+            if selector.occurrence != 0 or member_names.count(selector.name) != 1:
+                raise StitchOperationRefused("AMBIGUOUS_METADATA_SELECTOR",
+                    f"metadata column {selector.name!r} must occur exactly once in every member")
+            if selector not in member.resolved_selectors:
+                raise StitchOperationRefused("UNBOUND_METADATA_SELECTOR", selector.name)
+        options = dict(member.analysis.source_spec.options)
+        if dict(options.get("read_image_kwargs", {})).get("rotation", 0) != 0:
+            raise StitchOperationRefused("SOURCE_ORIENTATION_CONFLICT",
+                "source rotation must be zero; Stitch owns image orientation")
     manifest = _capture_input_manifest(source, table, project_root, required)
     if type(plan) is StitchOperationPlan:
         _revalidate_geometry(plan.geometry)
@@ -1991,6 +2275,9 @@ def prepare_stitch_operation(
             plan.fingerprint,
             module_provenance_digest(ModuleKind.STITCH, provenance),
         )
+    if plan.native_records:
+        native_mask(plan)  # Admit mask orientation/shape before any detector read.
+        module = _native_stitch_module_request(source, output, plan, manifest, provenance)
     canonical = module_artifact_request(module, provenance).provenance_json
     return StitchOperationRequest(
         module,
@@ -1999,6 +2286,35 @@ def prepare_stitch_operation(
         canonical,
         _REQUEST_FACTORY,
     )
+
+
+class _SelectedStitchSource(BaseFrameSource):
+    def __init__(self, source, labels):
+        super().__init__(name=source.name, frame_indices=labels, capabilities=source.capabilities)
+        self._source = source
+
+    def load_frame(self, index): return self._source.load_frame(index)
+    def load_native_frame(self, index):
+        return getattr(self._source, "load_native_frame", self._source.load_frame)(index)
+    def metadata_for(self, index): return self._source.metadata_for(index)
+    def frame_for(self, index): return self._source.frame_for(index)
+    @property
+    def motors(self):
+        rows = [self.metadata_for(index) for index in self.frame_indices]
+        keys = set.intersection(*(set(row) for row in rows)) if rows else set()
+        return {key: np.asarray([row[key] for row in rows]) for key in keys}
+
+
+@contextmanager
+def _requalified_stitch_source(source, *, cancel_token=None):
+    with ExitStack() as stack:
+        opened = [stack.enter_context(requalified_analysis_source(member.analysis, cancel_token=cancel_token))
+                  for member in _source_members(source)]
+        if type(source) is ModuleSourceGroupReceipt:
+            yield CompositeFrameSource([_SelectedStitchSource(item, member.selected_labels)
+                                        for item, member in zip(opened, source.members, strict=True)])
+        else:
+            yield opened[0]
 
 
 class _OrientedSource(BaseFrameSource):
@@ -2047,6 +2363,12 @@ class _OrientedSource(BaseFrameSource):
     def metadata_for(self, index: int) -> Mapping[str, object]:
         return self._source.metadata_for(index)
 
+    def load_native_frame(self, index: int) -> np.ndarray:
+        image = getattr(self._source, "load_native_frame", self._source.load_frame)(index)
+        if image.size * 8 > self._max_frame_bytes:
+            raise MemoryError("oriented float64 frame exceeds max_frame_bytes")
+        return self._orientation.apply(image)
+
     def frame_for(self, index: int):
         return self._source.frame_for(index)
 
@@ -2069,17 +2391,13 @@ def _runtime_geometry(receipt: StitchGeometryReceipt, raw: bytes):
         calibration = replace(calibration, image_orientation=orientation)
         motors = dict(request.source_motors)
         references = dict(request.reference_motor_positions)
-        base = Diffractometer.psic(del_=motors["del"], nu=motors["nu"])
-        base = replace(
+        base = Diffractometer.psic(del_=motors.get("del", "del"), nu=motors.get("nu", "nu"))
+        base = replace(  # a single arm's unmapped circle is held at zero
             base,
-            rot1=AngleMapping(
-                source_motor=motors["nu"],
-                offset=-references["nu"],
-            ),
-            rot2=AngleMapping(
-                source_motor=motors["del"],
-                offset=-references["del"],
-            ),
+            rot1=(AngleMapping(source_motor=motors["nu"], offset=-references["nu"])
+                  if "nu" in motors else AngleMapping()),
+            rot2=(AngleMapping(source_motor=motors["del"], offset=-references["del"])
+                  if "del" in motors else AngleMapping()),
         )
         diffractometer = replace(base, calibration=calibration)
     return diffractometer, orientation
@@ -2099,8 +2417,27 @@ def _detector_mask(diffractometer) -> np.ndarray | None:
     return mask
 
 
+def _sample_positioned(plan: StitchOperationPlan, diffractometer):
+    """Apply the plan's sample position to a stacked arm's calibrated sample offset."""
+    arm = getattr(diffractometer, "stacked_arm", None)
+    if plan.sample_position == "rotation_axis" and arm is not None and arm.has_sample_offset:
+        return replace(diffractometer, stacked_arm=arm.without_sample_offset())
+    return diffractometer
+
+
 def _runtime_plan(plan: StitchOperationPlan, diffractometer) -> StitchPlan:
+    diffractometer = _sample_positioned(plan, diffractometer)
+    mask = _detector_mask(diffractometer) if plan.use_detector_mask else None
+    external = native_mask(plan)
+    if external is not None:
+        mask = external if mask is None else np.logical_or(mask, external)
     return StitchPlan(
+        corrections=CorrectionStack(solid_angle=plan.correct_solid_angle,
+                                    polarization_factor=plan.polarization_factor),
+        error_model=plan.error_model,
+        dark=native_detector_image(plan, plan._dark_receipt),
+        flat=native_detector_image(plan, plan._flat_receipt),
+        flat_min_fraction=plan.flat_min_fraction,
         diffractometer=diffractometer,
         backend=plan.backend,
         mode=plan.mode,
@@ -2114,9 +2451,11 @@ def _runtime_plan(plan: StitchOperationPlan, diffractometer) -> StitchPlan:
         monitor_key=(
             None if plan.monitor_selector is None else plan.monitor_selector.name
         ),
-        mask=_detector_mask(diffractometer) if plan.use_detector_mask else None,
+        mask=mask,
+        conditioning=plan.conditioning,
         max_eager_bytes=None,
         streaming_multigeometry=True,
+        stitch_gi=plan.gi,
     )
 
 
@@ -2125,6 +2464,8 @@ class StitchOperationResult:
     request: StitchOperationRequest
     terminal: ModuleTerminalResult
     payload: AnalysisArtifactPayload | None = None
+    #: dropped-frame screening summary (policy, excluded/empty/partial labels)
+    frame_screen: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         committed = self.terminal.disposition is ModuleDisposition.COMMITTED
@@ -2146,10 +2487,48 @@ class StitchOperationResult:
             raise TypeError("stitch operation result is invalid")
 
 
+def _screen_row_motor(plan) -> str:
+    """The scan motor whose value is a frame's screening row: psic's outer circle (nu), when
+    the calibration moves both detector circles — read from its geometry as bound to the
+    scan, never from how its positions are spelled. A single arm is one row ('')."""
+    if type(plan) is XuStitchOperationPlan:  # the asset's keys are del and nu themselves
+        motors = plan.calibration.projection.value["acquisition"]["source_motors"]
+        return str(motors.get("nu") or "") if motors.get("del") else ""
+    diffractometer, _orientation = _runtime_geometry(plan.geometry, plan.geometry.content)
+    arm = diffractometer.stacked_arm
+    if arm is not None:
+        return arm.nu_motor if arm.nu_motor and arm.del_motor else ""
+    # independent mappings (a goniometer JSON, or PONI + offsets), as psic's: rot1 follows
+    # nu, rot2 follows del
+    rot1, rot2 = diffractometer.rot1, diffractometer.rot2
+    return rot1.source_motor if rot1.is_active and rot2.is_active else ""
+
+
+def _frame_screen_rows(request: StitchOperationRequest) -> tuple[float, ...]:
+    """Each selected frame's outer-circle (nu) value: its dropped-frame screening row. A
+    single arm (one circle held at zero) is one row, whichever circle moves."""
+    name = _screen_row_motor(request.plan)
+    manifest = request.manifest
+    values = {item.label: {(n, o): v for n, o, v in item.values}
+              for item in manifest.contributions}
+    # A group's members are separate scans; never compare frames across them.
+    members = ({item.label: member for item, (member, _label)
+                in zip(manifest.contributions, manifest.member_frames, strict=True)}
+               if type(manifest) is StitchGroupManifestReceipt else {})
+    return tuple((members.get(label, 0),
+                  round(float(values[label].get((name, 0), 0.0)), 6) if name else 0.0)
+                 for label in request.module.source.selected_labels)
+
+
 def _protected_stitch_inputs(request: StitchOperationRequest) -> tuple[Path, ...]:
     root = Path(request.manifest.project_root)
     inputs = [root / request.manifest.source_relative_path]
     inputs.extend(root / item.relative_path for item in request.manifest.files)
+    receipts = (request.plan._mask_receipt, getattr(request.plan, "_dark_receipt", None),
+                getattr(request.plan, "_flat_receipt", None))
+    for receipt in receipts:
+        if receipt is not None:
+            inputs.extend((Path(receipt.lexical_path), Path(receipt.resolved_path)))
     if type(request.plan) is XuStitchOperationPlan:
         geometry = request.plan.calibration
         inputs.extend((
@@ -2160,6 +2539,46 @@ def _protected_stitch_inputs(request: StitchOperationRequest) -> tuple[Path, ...
         geometry = request.plan.geometry
         inputs.extend((Path(geometry.lexical_path), Path(geometry.resolved_path)))
     return tuple(dict.fromkeys(inputs))
+
+
+def _record_frame_screen(records, verdicts):
+    """Stamp each captured frame record with its dropped-frame verdict.
+
+    Verdicts join on stream position, which is the record's contribution index;
+    grouped sources repeat frame labels across members.
+    """
+    if not records:
+        return
+    by_position = {verdict.position: verdict for verdict in verdicts}
+    if sorted(by_position) != list(range(len(records))):
+        raise StitchOperationRefused("FRAME_SCREEN_VERDICT_MISMATCH",
+                                     "frame check verdicts differ from the captured frames")
+    for record in records:
+        verdict = by_position[record["identity"]["contribution_index"]]
+        record["screen"], record["excluded"] = verdict.status, verdict.excluded
+
+
+def _native_artifact_args(request, records):
+    if not request.plan.native_records:
+        return {}
+    if len(records) != len(request.module.source.selected_labels):
+        raise StitchOperationRefused("FRAME_RECORD_COUNT_MISMATCH")
+    return {"wavelength_A": request.provenance["wavelength_A"],
+            "frame_records": records, "source_base": request.manifest.project_root}
+
+
+def _gi_cuts(plan, cuts):
+    """A GI Stitch 1D's cuts as the projection takes them, in the plan's order (() without GI)."""
+    if len(cuts) != (0 if plan.gi is None else len(plan.gi.cuts)):
+        raise AnalysisArtifactProjectionInvalid("the science returned other GI cuts than the plan's")
+    return tuple((mode, cut.unit, cut.radial, cut.intensity, diagnostics.coverage, diagnostics.normalization)
+                 for mode, (cut, diagnostics) in zip(() if plan.gi is None else plan.gi.cuts, cuts))
+
+
+def _write_record(entry, target, projection, native_args) -> None:
+    """A Stitch 1D result as an Int record (``stitch_record``), from its exact projection."""
+    write_stitch_projection(entry, target, projection, frame_records=native_args.get("frame_records"),
+                            source_base=native_args.get("source_base"))
 
 
 class StitchOperationExecution:
@@ -2177,6 +2596,7 @@ class StitchOperationExecution:
         self._execution_attestation_json: str | None = None
         self._execution_attestation_digest: str | None = None
         self._revision = 0
+        self._frame_screen = None
         self._progress_callback: Callable[[ModuleProgress], object] | None = None
 
     def __copy__(self):
@@ -2232,7 +2652,7 @@ class StitchOperationExecution:
         total: int,
     ) -> StitchOperationResult:
         if terminal.disposition is not ModuleDisposition.COMMITTED:
-            value = StitchOperationResult(self.request, terminal)
+            value = StitchOperationResult(self.request, terminal, frame_screen=self._frame_screen)
             self._result = value
             self._state = "done"
             return value
@@ -2290,7 +2710,8 @@ class StitchOperationExecution:
             )
         if type(self.request.plan) is XuStitchOperationPlan:
             if (
-                payload.schema_version != ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL
+                payload.schema_version != (ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE
+                    if self.request.plan.native_records else ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL)
                 or payload.execution_attestation_json
                 != self._execution_attestation_json
                 or payload.execution_attestation_digest
@@ -2305,7 +2726,8 @@ class StitchOperationExecution:
                     "strict XU Stitch attestation no longer matches execution",
                 )
         elif (
-            payload.schema_version != ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL
+            payload.schema_version != (ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE
+                if self.request.plan.native_records else ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL)
             or payload.execution_attestation_json is not None
             or payload.execution_attestation_digest is not None
             or terminal.commit.execution_attestation_digest is not None
@@ -2317,7 +2739,7 @@ class StitchOperationExecution:
                 "strict MultiGeometry Stitch unexpectedly changed artifact version",
             )
         self._emit("reload", total, total)
-        value = StitchOperationResult(self.request, terminal, payload)
+        value = StitchOperationResult(self.request, terminal, payload, frame_screen=self._frame_screen)
         self._result = value
         self._verification_terminal = terminal
         self._state = "done"
@@ -2345,21 +2767,35 @@ class StitchOperationExecution:
         )
         try:
             revalidate_xu_stitch_calibration(plan.calibration)
+            records, frame_callback = capture_callback(self.request)
+            external_mask = native_mask(plan)
             self._emit("calibration", 1, total)
-            with requalified_analysis_source(
-                self.request.module.source.analysis,
+            with _requalified_stitch_source(
+                self.request.module.source,
                 cancel_token=cancel_token,
             ) as source:
+                if plan.native_records:
+                    _wavelength, _shape, orientation = geometry_facts(plan)
+                    source = _OrientedSource(source, orientation, plan.max_frame_bytes)
 
                 def science_progress(done: int, _inner_total: int) -> None:
                     self._emit("science", 1 + done, total)
 
+                screen = FrameScreen(plan.frame_screen, labels, _frame_screen_rows(self.request))
                 scientific = run_xu_hist_stitch_1d(
                     plan.calibration,
                     source,
                     frame_indices=labels,
-                    q_min_A_inverse=plan.q_min_A_inverse,
-                    q_max_A_inverse=plan.q_max_A_inverse,
+                    frame_screen=screen,
+                    unit=plan.unit,
+                    radial_range=plan.radial_range,
+                    conditioning=plan.conditioning,
+                    mask=external_mask,
+                    frame_record_callback=frame_callback,
+                    polarization_factor=plan.polarization_factor,
+                    dark=native_detector_image(plan, plan._dark_receipt),
+                    flat=native_detector_image(plan, plan._flat_receipt),
+                    flat_min_fraction=plan.flat_min_fraction,
                     npt=plan.npt_1d,
                     monitor_key=(
                         None
@@ -2370,8 +2806,12 @@ class StitchOperationExecution:
                     max_frame_bytes=plan.max_frame_bytes,
                     cancel_token=cancel_token,
                     progress_callback=science_progress,
+                    gi=plan.gi,
                 )
+                self._frame_screen = screen.summary()
+                _record_frame_screen(records, screen.verdicts)
             revalidate_xu_stitch_calibration(plan.calibration)
+            revalidate_mask(plan._mask_receipt)
         except XuStitchCancelled:
             return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
         except AnalysisSourceLeaseRefused as error:
@@ -2382,6 +2822,7 @@ class StitchOperationExecution:
             XuRuntimeUnsupported,
             XuStitchCalibrationRefused,
             XuStitchScienceRefused,
+            StitchOperationRefused,
         ) as error:
             return self._terminal(ModuleDisposition.REFUSED, error.code)
         except BaseException as error:
@@ -2421,6 +2862,8 @@ class StitchOperationExecution:
                 sigma=payload.sigma,
                 coverage=diagnostics.coverage,
                 normalization=diagnostics.normalization,
+                **_native_artifact_args(self.request, records),
+                gi_cuts=_gi_cuts(plan, scientific.gi_cuts),
             )
         except AnalysisArtifactProjectionInvalid:
             return self._terminal(
@@ -2480,6 +2923,7 @@ class StitchOperationExecution:
 
         def require_current_effective_geometry() -> None:
             try:
+                revalidate_mask(plan._mask_receipt)
                 revalidate_xu_stitch_calibration(plan.calibration)
                 runtime_owner = xu_runtime_session()
                 with runtime_owner as session:
@@ -2502,17 +2946,14 @@ class StitchOperationExecution:
                 XuRuntimeUnsupported,
                 XuStitchCalibrationRefused,
                 XuStitchScienceRefused,
+                StitchOperationRefused,
             ) as error:
                 raise ModuleArtifactRefused(error.code) from error
 
         def writer(entry) -> None:
             revalidate_xu_stitch_calibration(plan.calibration)
-            write_stitched(
-                entry,
-                result_projection=result_projection,
-                provenance=bound.provenance_json,
-                bounded_artifact=True,
-            )
+            _write_record(entry, self.request.module.output.target, result_projection,
+                          _native_artifact_args(self.request, records))
             revalidate_xu_stitch_calibration(plan.calibration)
 
         try:
@@ -2551,6 +2992,7 @@ class StitchOperationExecution:
             return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
         try:
             raw = _revalidate_geometry(self.request.plan.geometry)
+            records, frame_callback = capture_callback(self.request)
             diffractometer, orientation = _runtime_geometry(
                 self.request.plan.geometry, raw
             )
@@ -2584,8 +3026,8 @@ class StitchOperationExecution:
                 )
             runtime_plan = _runtime_plan(self.request.plan, diffractometer)
             self._emit("geometry", 1, total)
-            with requalified_analysis_source(
-                self.request.module.source.analysis,
+            with _requalified_stitch_source(
+                self.request.module.source,
                 cancel_token=cancel_token,
             ) as source:
                 oriented = _OrientedSource(
@@ -2597,6 +3039,8 @@ class StitchOperationExecution:
                 def science_progress(done: int, _inner_total: int) -> None:
                     self._emit("science", 1 + done, total)
 
+                screen = FrameScreen(self.request.plan.frame_screen, labels,
+                                     _frame_screen_rows(self.request))
                 scientific = run_stitch(
                     runtime_plan,
                     oriented,
@@ -2604,8 +3048,13 @@ class StitchOperationExecution:
                     progress_callback=science_progress,
                     cancel_token=cancel_token,
                     collect_frame_records=False,
+                    frame_record_callback=frame_callback,
+                    frame_screen=screen,
                 )
+                self._frame_screen = screen.summary()
+                _record_frame_screen(records, screen.verdicts)
             _revalidate_geometry(self.request.plan.geometry)
+            revalidate_mask(self.request.plan._mask_receipt)
         except StitchCancelled:
             return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
         except AnalysisSourceLeaseRefused as error:
@@ -2657,6 +3106,8 @@ class StitchOperationExecution:
                 sigma=payload.sigma,
                 coverage=diagnostics.coverage,
                 normalization=diagnostics.normalization,
+                **_native_artifact_args(self.request, records),
+                gi_cuts=_gi_cuts(self.request.plan, scientific.gi_cuts),
             )
         except AnalysisArtifactProjectionInvalid:
             return self._terminal(
@@ -2691,18 +3142,24 @@ class StitchOperationExecution:
 
         def writer(entry) -> None:
             _revalidate_geometry(self.request.plan.geometry)
-            write_stitched(
-                entry,
-                result_projection=result_projection,
-                legacy_v1_unit_layout=False,
-                provenance=bound.provenance_json,
-                bounded_artifact=True,
-            )
+            if self.request.plan.mode == "1d":
+                _write_record(entry, self.request.module.output.target, result_projection,
+                              _native_artifact_args(self.request, records))
+            else:
+                write_stitched(
+                    entry,
+                    result_projection=result_projection,
+                    legacy_v1_unit_layout=False,
+                    provenance=bound.provenance_json,
+                    bounded_artifact=True,
+                    **_native_artifact_args(self.request, records),
+                )
             _revalidate_geometry(self.request.plan.geometry)
 
         def prepublish_check() -> None:
             try:
                 _revalidate_geometry(self.request.plan.geometry)
+                revalidate_mask(self.request.plan._mask_receipt)
             except StitchOperationRefused as error:
                 raise ModuleArtifactRefused(error.code) from error
 

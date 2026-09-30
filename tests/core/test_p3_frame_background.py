@@ -717,3 +717,99 @@ def test_shape_nonfinite_and_stable_read_refusals(monkeypatch, tmp_path: Path) -
         dataset_path="/entry/data/data_000001", frame_index=0), _fact(target))
     assert processed.disposition == "REFUSED"
     monkeypatch.setattr(processed_scan_id, "has_processed_output_markers_file", real_processed)
+
+
+def test_dark_corrected_flag_keeps_older_mappings_and_reports_no_scale(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    source, target = _files(tmp_path, ("background.tif", "target.tif"))
+    _decoder(monkeypatch, {source.name: np.full((2, 2), 30, dtype=np.uint16)})
+    plain = FrameBackgroundPlan(mode="Single BG File", locator=str(source), scale=2.0)
+    marked = FrameBackgroundPlan(mode="Single BG File", locator=str(source), scale=2.0,
+                                 dark_corrected=True)
+    assert "dark_corrected" not in plain.to_mapping()  # existing records keep their mapping
+    assert marked.to_mapping() == {**plain.to_mapping(), "dark_corrected": True}
+    assert FrameBackgroundPlan.from_mapping(plain.to_mapping()) == plain
+    assert FrameBackgroundPlan.from_mapping(marked.to_mapping()) == marked
+    for bad in ({**plain.to_mapping(), "dark_corrected": False},
+                {**plain.to_mapping(), "dark_corrected": 1}):
+        with pytest.raises(ValueError):
+            FrameBackgroundPlan.from_mapping(bad)
+    assert resolve_frame_background(plain, _fact(target)).scale == 2.0
+    result = resolve_frame_background(marked, _fact(target))
+    # the reducer then subtracts the Background as it is: no factor to remove a dark with
+    assert result.disposition == "RESOLVED" and result.scale is None
+    np.testing.assert_array_equal(result.background, np.full((2, 2), 60.0))
+
+
+def test_directory_last_saved_before_frame(monkeypatch, tmp_path: Path) -> None:
+    """Darks collected during a scan: each frame takes the Background file saved last,
+    not after the frame's own file."""
+    root = tmp_path / "darks"; root.mkdir()
+    frames = tmp_path / "frames"; frames.mkdir()
+    early, late, tied = _files(root, ("dark_a.tif", "dark_b.tif", "dark_c.tif"))
+    first, second, before_any = _files(frames, ("scan_0001.tif", "scan_0002.tif", "scan_0000.tif"))
+    second_s = 1_000_000_000
+    for path, seconds in ((early, 10), (first, 20), (late, 30), (second, 40), (before_any, 5),
+                          (tied, 100)):
+        os.utime(path, ns=(seconds * second_s, seconds * second_s))
+    _decoder(monkeypatch, {early.name: np.full((2, 2), 1.0), late.name: np.full((2, 2), 2.0),
+                           tied.name: np.full((2, 2), 3.0)})
+    plan = FrameBackgroundPlan(mode="BG Directory", locator=str(root),
+                               match_rule="Last Saved Before Frame")
+    for frame, value in ((first, 1.0), (second, 2.0)):
+        result = resolve_frame_background(plan, _fact(frame))
+        assert result.disposition == "RESOLVED", result.diagnostics
+        np.testing.assert_array_equal(result.background, np.full((2, 2), value))
+    body = _payload(resolve_frame_background(plan, _fact(second)))
+    assert body["selected"] == str(late.resolve()) and body["frame_saved_ns"] == 40 * second_s
+    refused = resolve_frame_background(plan, _fact(before_any))
+    assert refused.disposition == "REFUSED" and "no Background file was saved before" in refused.diagnostics[0]
+    os.utime(tied, ns=(30 * second_s, 30 * second_s))  # saved together with dark_b: the later name
+    np.testing.assert_array_equal(resolve_frame_background(plan, _fact(second)).background,
+                                  np.full((2, 2), 3.0))
+    moved = resolve_frame_background(plan, _fact(second))
+    later = root / "dark_z.tif"; later.write_bytes(b"later")  # saved after the frame
+    os.utime(later, ns=(90 * second_s, 90 * second_s))
+    assert resolve_frame_background(plan, _fact(second)).fingerprint == moved.fingerprint
+    os.utime(tied, ns=(31 * second_s, 31 * second_s))  # a changed file time changes the record
+    assert resolve_frame_background(plan, _fact(second)).fingerprint != moved.fingerprint
+    container = resolve_frame_background(plan, _fact(first, dataset="/entry/data/data"))
+    assert container.disposition == "REFUSED" and "one image file per frame" in container.diagnostics[0]
+    shared = FrameBackgroundPlan(mode="BG Directory", locator=str(frames),
+                                 match_rule="Last Saved Before Frame")
+    for name in ("dark_d.tif",):
+        (frames / name).write_bytes(b"dark"); os.utime(frames / name, ns=(15 * second_s, 15 * second_s))
+    _decoder(monkeypatch, {"dark_d.tif": np.full((2, 2), 4.0)})
+    unfiltered = resolve_frame_background(shared, _fact(second))
+    assert unfiltered.disposition == "REFUSED" and "Filename Filter" in unfiltered.diagnostics[0]
+    filtered = resolve_frame_background(
+        FrameBackgroundPlan(mode="BG Directory", locator=str(frames), filename_filter="dark",
+                            match_rule="Last Saved Before Frame"), _fact(second))
+    np.testing.assert_array_equal(filtered.background, np.full((2, 2), 4.0))
+
+
+def test_the_dark_comes_off_the_background_before_scale_and_normalization(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """With a dark (and "BG dark-corrected" unticked) the frame loses
+    factor · (Background − dark), factor = Scale × monitor ratio."""
+    from xrd_tools.reduction import Frame, ReductionPlan
+    from xrd_tools.reduction import background as module
+    from xrd_tools.reduction.core import _dark_corrected_background
+
+    source, target = _files(tmp_path, ("background.tif", "target.tif"))
+    sidecar = source.with_suffix(".txt"); sidecar.write_text("monitor=2")
+    _decoder(monkeypatch, {source.name: np.full((2, 2), 30.0)})
+    monkeypatch.setattr(module, "read_image_metadata_observed",
+                        lambda *_args, **_kwargs: ImageMetadataRead({"monitor": 2.0}, sidecar))
+    plan = FrameBackgroundPlan(mode="Single BG File", locator=str(source), scale=1.5,
+                               normalization_key="monitor", metadata_format="txt")
+    result = resolve_frame_background(
+        plan, _fact(target, metadata=(("monitor", ("number", float(4.0).hex())),)))
+    assert result.disposition == "RESOLVED" and result.scale == 3.0  # 1.5 × 4 / 2
+    np.testing.assert_array_equal(result.background, np.full((2, 2), 90.0))
+    frame = Frame(0, image=np.zeros((2, 2)), metadata={}, background=result.background,
+                  background_scale=result.scale)
+    corrected = _dark_corrected_background(frame, ReductionPlan(dark=np.full((2, 2), 10.0)))
+    np.testing.assert_array_equal(corrected, np.full((2, 2), 60.0))  # 3 × (30 − 10)

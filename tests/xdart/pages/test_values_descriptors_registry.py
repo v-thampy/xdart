@@ -54,9 +54,11 @@ def test_closed_values_and_frozen_outcomes_are_exact():
         PageCapability.RUN_ACTIVITY,
         PageCapability.APP_MENU_HOSTS,
         PageCapability.LAYOUT_DIAGNOSTICS,
+        PageCapability.PROCESSING_MODE,  # another page's mode box selects a mode (Codex audit G-F3)
     )
     assert tuple(PageLifecycle) == (
         PageLifecycle.SWITCHABLE,
+        PageLifecycle.RETAINED,  # added with the native Stitch page (e2938575)
         PageLifecycle.EXIT_ONLY,
     )
     assert tuple(PageCleanup) == (PageCleanup.CLEAN, PageCleanup.PENDING)

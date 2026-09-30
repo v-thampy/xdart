@@ -459,6 +459,17 @@ def test_raw_tiff_and_hdf5_catalogs_read_only_one_selected_frame(tmp_path, monke
     raw_catalog = api.catalog_viewer_2d(raw_path, policy=policy)
     _assert_canonical(api.read_viewer_2d_frame(raw_catalog, 0, policy=policy), raw_data)
     assert admissions[2:4] == [0, 0]
+    # No declared shape: a headerless frame of a known detector (Pilatus 100k) is named by its size.
+    pilatus = np.arange(195 * 487, dtype=np.int32).reshape(195, 487)
+    pilatus_path = tmp_path / "pilatus.raw"
+    pilatus_path.write_bytes(pilatus.tobytes())
+    inferred = api.catalog_viewer_2d(pilatus_path)
+    assert inferred.source_shape == (195, 487)
+    _assert_canonical(api.read_viewer_2d_frame(inferred, 0), pilatus)
+    admissions[:] = admissions[:4]
+    (tmp_path / "unknown.raw").write_bytes(bytes(4 * 7))
+    with pytest.raises(api.Viewer2DReadError, match="RAW detector shape is not uniquely known"):
+        api.catalog_viewer_2d(tmp_path / "unknown.raw")
 
     h5_data = np.arange(2 * 4 * 5, dtype=np.int32).reshape(2, 4, 5)
     h5_path = tmp_path / "master.nxs"

@@ -337,6 +337,9 @@ class Main(QMainWindow):
         self._process_exit_requested = False
         self._tool_handles = {}
         self._tool_actions = {}
+        self._page_handles = {}
+        self._page_stack = QtWidgets.QStackedWidget(self)
+        self.setCentralWidget(self._page_stack)
 
         descriptors = tuple(
             BUILTIN_DESCRIPTORS
@@ -383,18 +386,22 @@ class Main(QMainWindow):
             self.resize(1600, 920)
 
     def _mount_page(self, descriptor):
-        services = self._host_services.for_page(descriptor.key)
-        handle = descriptor.build(services, self)
-        validate_page_handle(descriptor, handle)
+        handle = self._page_handles.get(descriptor.key)
+        if handle is None:
+            services = self._host_services.for_page(descriptor.key)
+            handle = descriptor.build(services, self)
+            validate_page_handle(descriptor, handle)
+            self._page_stack.addWidget(handle.widget)
+            self._page_handles[descriptor.key] = handle
         self.page_descriptor = descriptor
         self.page_handle = handle
         self.selected_page_key = descriptor.key
         # Compatibility name for consumers that need the mounted root widget;
         # host behavior routes only through the typed handle below.
         self.main_widget = handle.widget
-        self.setCentralWidget(handle.widget)
+        self._page_stack.setCurrentWidget(handle.widget)
         self.ui.statusbar.setHidden(
-            descriptor.key == SCATTERING_WORKSPACE_PAGE.key
+            descriptor.lifecycle is PageLifecycle.RETAINED
         )
         if self._menus_initialized:
             self._attach_application_menus()
@@ -508,6 +515,7 @@ class Main(QMainWindow):
         self._attached_help_menu = None
         self._attached_analysis_menu = None
         self._attached_tool_requested = None
+        self._attached_mode_requested = None
 
     def _attach_application_menus(self):
         if PageCapability.APP_MENU_HOSTS in self.page_descriptor.capabilities:
@@ -515,13 +523,16 @@ class Main(QMainWindow):
             config_menu, help_menu = points.config_menu, points.help_menu
             analysis_menu = points.analysis_menu
             tool_requested = points.tool_requested
+            mode_requested = points.mode_requested
         else:
             config_menu, help_menu = self.host_config_menu, self.host_help_menu
             analysis_menu = None
-            tool_requested = None
+            tool_requested = mode_requested = None
         try:
             if self._attached_tool_requested is not None:
                 self._attached_tool_requested.disconnect(self.open_tool)
+            if self._attached_mode_requested is not None:
+                self._attached_mode_requested.disconnect(self.open_page_mode)
             if self._attached_config_menu is not None:
                 for action in self.application_config_actions:
                     self._attached_config_menu.removeAction(action)
@@ -549,6 +560,9 @@ class Main(QMainWindow):
         if tool_requested is not None:
             tool_requested.connect(self.open_tool)
         self._attached_tool_requested = tool_requested
+        if mode_requested is not None:
+            mode_requested.connect(self.open_page_mode)
+        self._attached_mode_requested = mode_requested
 
     def _open_log_location(self):
         """Help ▸ Open Log Location — reveal the rotating log file in the OS file
@@ -597,10 +611,19 @@ class Main(QMainWindow):
         return False
 
     def _run_active(self, *, require_known=False):
-        """Aggregate selected-page and every constructed tool's activity."""
-        return self._page_run_active(
-            require_known=require_known
-        ) or self._tool_run_active()
+        """Aggregate every retained page and constructed tool's activity."""
+        for key, handle in tuple(self._page_handles.items()):
+            if handle.activity is None:
+                if require_known:
+                    return True
+                continue
+            try:
+                if handle.activity.active():
+                    return True
+            except Exception:
+                logger.exception("Page %s activity query failed", key)
+                return True
+        return self._tool_run_active()
 
     def _check_for_updates(self):
         from xdart.modules import updater
@@ -1031,9 +1054,13 @@ class Main(QMainWindow):
         if (PageCapability.RUN_ACTIVITY in self.page_descriptor.capabilities
                 and self._page_run_active()):
             return ActionRefused(PAGE_ACTIVE)
-        receipt = self._close_page()
-        if receipt.status is PageCleanup.PENDING:
-            return ActionRefused(CLEANUP_PENDING)
+        if self.page_descriptor.lifecycle is not PageLifecycle.RETAINED:
+            receipt = self._close_page()
+            if receipt.status is PageCleanup.PENDING:
+                return ActionRefused(CLEANUP_PENDING)
+            previous = self._page_handles.pop(self.selected_page_key)
+            self._page_stack.removeWidget(previous.widget)
+            previous.widget.deleteLater()
         self._mount_page(target)
         _app_settings().setValue("page.selected", str(target.key))
         return ActionCompleted(str(target.key))
@@ -1046,8 +1073,20 @@ class Main(QMainWindow):
             from xdart.gui.pages.values import CloseReceipt
             return CloseReceipt(PageCleanup.PENDING, f"close failed: {exc}")
 
+    def open_page_mode(self, key, mode):
+        """Open page ``key`` in processing ``mode`` (a mode chosen on another page's mode box, Codex
+        audit G-F3): the page is selected as ``open_tool`` would, then asked for the mode through its
+        own mode port; a refused selection or mode is reported and leaves the page as it was."""
+        outcome = self.select_page(key)
+        if (isinstance(outcome, ActionCompleted)
+                and PageCapability.PROCESSING_MODE in self.page_descriptor.capabilities):
+            outcome = self.page_handle.processing_mode.select(str(mode))
+        return self._present_action_outcome(outcome)
+
     def open_tool(self, key):
         descriptor = self.page_registry.get(PageKey(str(key)))
+        if isinstance(descriptor, PageDescriptor):
+            return self._present_action_outcome(self.select_page(descriptor.key))
         if not isinstance(descriptor, ToolDescriptor):
             return ActionRefused(UNKNOWN_PAGE)
         handle = self._tool_handles.get(descriptor.key)
@@ -1094,7 +1133,10 @@ class Main(QMainWindow):
             return CloseReceipt(PageCleanup.PENDING, f"close failed: {exc}")
 
     def _close_page_and_tools(self):
-        receipts = [self._close_page()]
+        receipts = [
+            self._close_tool(key, handle)
+            for key, handle in tuple(self._page_handles.items())
+        ]
         receipts.extend(
             self._close_tool(key, handle)
             for key, handle in tuple(self._tool_handles.items())

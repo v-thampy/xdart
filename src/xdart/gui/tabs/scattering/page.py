@@ -56,6 +56,7 @@ from xrd_tools.sources.selection import (
     is_single_image_spec,
 )
 from xdart.utils.browse import browse_start_dir, remember_browse_path
+from xdart.gui.widgets.file_dialogs import MASK_FILTER, PONI_FILTER
 from .advanced_editor import AdvancedSettingsDialog
 from .adapters.browse_loader import BrowseLoader
 from .adapters.external_operation import OperationSlot
@@ -658,6 +659,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             else self._choose_results_notebook_dialog
         )
         self._advanced_dialog: AdvancedSettingsDialog | None = None
+        # Decoded dark/flat images for the open Advanced dialog's checks.
+        self._correction_inspections: dict = {}
         self._advanced_settings_editor = (
             advanced_settings_editor
             if advanced_settings_editor is not None
@@ -2027,9 +2030,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                             "Choose existing PONI" if asset == "poni"
                             else "Choose existing detector mask",
                             directory,
-                            "PONI files (*.poni);;All files (*)"
-                            if asset == "poni" else
-                            "Detector masks (*.edf *.npy)",
+                            PONI_FILTER if asset == "poni" else MASK_FILTER,
                         )[0])
         except Exception as error:
             self._error_notice("Asset chooser failed", error); return
@@ -4012,7 +4013,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._progress = ProgressProjection(
                 detail="Run started"
             )
-            self._notice("")
+            # A usable but suspicious flat or dark (median far from 1, many
+            # masked pixels) runs; say so where the run starts.
+            warnings = getattr(receipt.scientific_assets, "correction_warnings", ())
+            self._notice("; ".join(item[:1].upper() + item[1:] for item in warnings))
             self._refresh_shell(preserve_display=True)
             self._ensure_timer()
             return True
@@ -6409,6 +6413,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         viewer_current, viewer_paths = (
             self._context_controller.viewer_1d_artifact_selection
             if viewer_1d else ("", ()))
+        # The 2D file intent: a deferred open, else the open context's file
+        # (still loading its catalog, or clearing).
+        context_2d = self._context_controller.viewer_2d_context
+        viewer_2d_current = (self._pending_viewer_2d_path
+                             or getattr(context_2d, "original_path", "") or ""
+                             ) if tool is Tool.IMAGE_VIEWER else ""
         projection = self._context_projection.build_shell(
             revision=self._shell_revision,
             controls=controls,
@@ -6426,6 +6436,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             browser_catalog_index=browser.scan_index,
             browser_transient_frame=browser.transient_frame,
             viewer_1d_current_path=viewer_current,
+            viewer_2d_current_path=(os.path.abspath(viewer_2d_current)
+                                    if viewer_2d_current else ""),
             viewer_1d_selected_paths=viewer_paths,
             viewer_waterfall_active=self._shell.scientific.bottom_waterfall_active,
             date_sorted=browser.date_sorted,
@@ -6919,6 +6931,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         browse_source = None
         if kind is ShellCommandKind.SET_PROCESSING_MODE:
             if type(value) is not str or not value:
+                return
+            if value == "Stitch 1D":
+                # This selection navigates to its retained page. Keep the
+                # integration intent intact for return navigation; the host
+                # owns the active-operation and pending-cleanup fences.
+                self._refresh_shell()
+                self.toolRequested.emit("stitch")
                 return
             controller = self._context_controller
             target_tool = tool_from_mode_text(value)
@@ -7575,9 +7594,26 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     ) -> AdvancedSettingsValues | None:
         dialog = self._advanced_dialog
         if dialog is None:
-            dialog = AdvancedSettingsDialog(self)
+            dialog = AdvancedSettingsDialog(
+                self, correction_inspector=self._inspect_detector_correction,
+            )
             self._advanced_dialog = dialog
-        return dialog.edit(snapshot)
+        self._correction_inspections = {}
+        try:
+            return dialog.edit(snapshot)
+        finally:
+            self._correction_inspections = {}
+
+    def _inspect_detector_correction(
+        self, role: str, path: str, min_fraction: float,
+    ) -> object:
+        """Check a dark or flat file against the current PONI's detector."""
+        from .output_preflight import inspect_detector_correction
+
+        poni_file = str(self._intents.snapshot().thaw().poni_file or "")
+        return inspect_detector_correction(
+            poni_file, path, role, min_fraction, cache=self._correction_inspections,
+        )
 
     def _show_performance_diagnostics_dialog(
         self,

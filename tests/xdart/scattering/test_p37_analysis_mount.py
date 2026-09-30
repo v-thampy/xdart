@@ -228,6 +228,25 @@ def _check_item(widget, name, checked=True):
                              QtCore.Qt.CheckState.Unchecked)
 
 
+def test_metadata_row_headers_remain_default_unless_explicitly_selected(qapp):
+    from xdart.gui.tabs.scattering.analysis_mount import MetadataResultDialog
+    result = _table()
+    dialog = MetadataResultDialog()
+    try:
+        dialog.adopt_result(result)
+        assert dialog.table.verticalHeaderItem(0) is None
+        dialog.adopt_result(result, selected_labels=(3, 1), row_labels=("2-3", "2-1"))
+        assert dialog.table.verticalHeaderItem(0).text() == "2-3"
+        assert dialog.table.rowCount() == 2
+        for index, original in enumerate((2, 0)):
+            assert float(dialog.table.item(index, 0).text()) == result.columns[0].numeric[original]
+        dialog.clear_result()
+        dialog.adopt_result(result)
+        assert dialog.table.verticalHeaderItem(0) is None
+    finally:
+        dialog.close()
+
+
 def test_p37b_literal_commands_open_four_singletons_and_share_scan_roi_mount() -> None:
     # This is the genuine parent RED: the terminal P3-7A parent has only three
     # tools and no ROI route.  The production fix adds the literal fourth row.

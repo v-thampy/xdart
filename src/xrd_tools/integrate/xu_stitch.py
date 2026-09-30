@@ -19,7 +19,7 @@ from xrd_tools.analysis.xu_stitch_calibration import (
     XuStitchCalibrationReceipt,
     revalidate_xu_stitch_calibration,
 )
-from xrd_tools.core.containers import IntegrationResult1D
+from xrd_tools.core.containers import IntegrationResult1D, convert_radial_axis
 from xrd_tools.core.energy import energy_eV_to_wavelength_m
 from xrd_tools.core.geometry import DetectorHeader
 from xrd_tools.core.geometry.xu_runtime import (
@@ -29,6 +29,11 @@ from xrd_tools.core.geometry.xu_runtime import (
 )
 from xrd_tools.corrections.stack import CorrectionStack
 from xrd_tools.integrate.multi import StitchDiagnostics
+from xrd_tools.integrate.stitch_conditioning import (
+    StitchConditioning,
+    condition_stitch_frame,
+    load_stitch_frame,
+)
 from xrd_tools.rsm.corrections import detector_header_to_ai
 
 
@@ -113,7 +118,7 @@ def _solid_angle_reference(
 class XuStitchEffectiveGeometryProjection:
     asset_semantic_fingerprint: str
     detector_type: str
-    detector_config: tuple[tuple[str, float | int], ...]
+    detector_config: tuple[tuple[str, float | int | tuple[int, int]], ...]
     shape: tuple[int, int]
     mask_count: int
     mask_sha256: str
@@ -129,6 +134,7 @@ class XuStitchEffectiveGeometryProjection:
     solid_angle_sha256_host: str
     solid_angle_match: str
     solid_angle_max_rel_dev: float
+    asset_version: int = 1
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -145,7 +151,26 @@ class XuStitchEffectiveGeometryProjection:
             or not 0.0 <= self.solid_angle_max_rel_dev <= _SOLID_ANGLE_RTOL
             or (self.solid_angle_match == "exact")
             != (self.solid_angle_max_rel_dev == 0.0)
-            or self.detector_type != "pyFAI.detectors._dectris.Pilatus300kw"
+            or type(self.asset_version) is not int
+            or self.asset_version not in {1, 2, 3}
+            or type(self.detector_type) is not str
+            or not self.detector_type.startswith("pyFAI.detectors.")
+            or len(self.shape) != 2
+            or any(type(value) is not int or value <= 0 for value in self.shape)
+            or type(self.mask_count) is not int
+            or not 0 <= self.mask_count <= math.prod(self.shape)
+            or any(type(value) is not str or len(value) != 64
+                   for value in (self.mask_sha256, self.solid_angle_sha256))
+            or any(not math.isfinite(value) or value <= 0 for value in (
+                self.energy_eV, self.xdart_wavelength_A, self.xu_mapping_wavelength_A,
+            ))
+            or self.sample_axes != ("x+", "z-", "y+", "z-")
+            or self.detector_axes != ("x+", "z-")
+            or self.camera != ("x-", "z+")
+        ):
+            raise TypeError("XU effective geometry projection is invalid")
+        if self.asset_version == 1 and (
+            self.detector_type != "pyFAI.detectors._dectris.Pilatus300kw"
             or self.detector_config
             != (
                 ("orientation", 3),
@@ -161,16 +186,13 @@ class XuStitchEffectiveGeometryProjection:
             or self.energy_eV != 17000.018
             or self.xdart_wavelength_A != 0.7293180418985439
             or self.xu_mapping_wavelength_A != 0.7293180420938394
-            or self.sample_axes != ("x+", "z-", "y+", "z-")
-            or self.detector_axes != ("x+", "z-")
-            or self.camera != ("x-", "z+")
         ):
             raise TypeError("XU effective geometry projection is invalid")
         object.__setattr__(
             self,
             "fingerprint",
             analysis_canonical_fingerprint(
-                "xu-stitch-effective-geometry-v1",
+                f"xu-stitch-effective-geometry-v{self.asset_version}",
                 (
                     self.asset_semantic_fingerprint,
                     self.detector_type,
@@ -190,7 +212,7 @@ class XuStitchEffectiveGeometryProjection:
         )
 
     def to_provenance(self) -> dict[str, object]:
-        return {
+        value = {
             "fingerprint": self.fingerprint,
             "detector_type": self.detector_type,
             "detector_config": dict(self.detector_config),
@@ -208,6 +230,9 @@ class XuStitchEffectiveGeometryProjection:
             "detector_axes": list(self.detector_axes),
             "camera": list(self.camera),
         }
+        if self.asset_version != 1:
+            value["asset_version"] = self.asset_version
+        return value
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -215,10 +240,16 @@ class XuStitchRuntimeGeometry:
     projection: XuStitchEffectiveGeometryProjection
     hxrd: object
     mask: np.ndarray
-    solid_angle: np.ndarray
+    #: The static solid angle (versions 1 and 2), or None for version 3,
+    #: whose ``frame_solid_angle(nu, del)`` comes from the attested pyFAI arm.
+    solid_angle: np.ndarray | None
     _claim: InitVar[object] = None
+    frame_solid_angle: Callable[[float, float], np.ndarray] | None = None
+    #: xrayutilities sample displacement in mm (the detector distance's units), version 3 only.
+    sampledis: tuple[float, float, float] | None = None
 
     def __post_init__(self, _claim: object) -> None:
+        static = self.solid_angle is not None
         if (
             _claim is not _RUNTIME_GEOMETRY_FACTORY
             or type(self.projection) is not XuStitchEffectiveGeometryProjection
@@ -226,12 +257,117 @@ class XuStitchRuntimeGeometry:
             or self.mask.shape != self.projection.shape
             or self.mask.dtype != np.dtype(bool)
             or self.mask.flags.writeable
-            or type(self.solid_angle) is not np.ndarray
-            or self.solid_angle.shape != self.projection.shape
-            or self.solid_angle.dtype != np.dtype(np.float64)
-            or self.solid_angle.flags.writeable
+            or static == (self.frame_solid_angle is not None)
+            or static != (self.projection.asset_version != 3)
+            or (static and (
+                type(self.solid_angle) is not np.ndarray
+                or self.solid_angle.shape != self.projection.shape
+                or self.solid_angle.dtype != np.dtype(np.float64)
+                or self.solid_angle.flags.writeable))
+            or (self.sampledis is not None and (
+                type(self.sampledis) is not tuple or len(self.sampledis) != 3
+                or not all(type(v) is float and math.isfinite(v) for v in self.sampledis)))
         ):
             raise TypeError("XU runtime geometry is invalid")
+
+
+def _static_solid_angle(asset_version, corrections, header, shape):
+    """Versions 1 and 2: one solid-angle array from the detector header, digest-bound."""
+    if asset_version != 1 and corrections["solid_angle_policy"] != "calibrated_pyfai_detector_header_v1":
+        raise XuStitchScienceRefused("XU_SOLID_ANGLE_MISMATCH", "unsupported calibrated solid-angle policy")
+    solid_values = CorrectionStack().normalization(detector_header_to_ai(header), shape)
+    solid = np.asarray(
+        solid_values,
+        dtype=np.float64,
+        order="C",
+    )
+    solid_sha256 = _sha256_array(solid, "<f8")
+    reference_solid_sha256 = str(corrections["solid_angle_sha256"])
+    if solid.shape != shape or not np.isfinite(solid).all() or np.any(solid <= 0):
+        raise XuStitchScienceRefused(
+            "XU_SOLID_ANGLE_MISMATCH",
+            "solid-angle projection is not a finite positive SURFACE v1 array "
+            f"(host sha256={solid_sha256})",
+        )
+    if asset_version == 1:
+        reference_solid = _solid_angle_reference(reference_solid_sha256, shape)
+    else:
+        if solid_sha256 != reference_solid_sha256:
+            raise XuStitchScienceRefused(
+                "XU_SOLID_ANGLE_MISMATCH", "calibrated solid-angle digest differs from authored asset",
+            )
+        reference_solid = solid
+    if solid_sha256 == reference_solid_sha256:
+        solid_match = "exact"
+        solid_max_rel_dev = 0.0
+    else:
+        solid_max_rel_dev = float(
+            np.max(np.abs(solid - reference_solid) / reference_solid)
+        )
+        if not solid_max_rel_dev <= _SOLID_ANGLE_RTOL:
+            raise XuStitchScienceRefused(
+                "XU_SOLID_ANGLE_MISMATCH",
+                "solid-angle projection differs from SURFACE v1 "
+                f"(host sha256={solid_sha256}; "
+                f"reference sha256={reference_solid_sha256}; "
+                f"max_rel_dev={solid_max_rel_dev:.3e}; "
+                f"rtol={_SOLID_ANGLE_RTOL:.0e})",
+            )
+        solid_match = "tolerance"
+    return solid_sha256, solid_match, solid_max_rel_dev, reference_solid
+
+
+def _thaw(value):
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if type(value) is tuple:
+        return [_thaw(item) for item in value]
+    return value
+
+
+def _extended_solid_angle(corrections, shape):
+    """Version 3: per-frame solid angle from the attested pyFAI extended arm.
+
+    The same per-frame integrators MultiGeometry uses, so the two backends weight
+    each frame alike. MultiGeometry weights a frame by its absolute solid angle,
+    the relative one times pixel area / dist²; a sample offset changes dist frame
+    by frame. XU keeps its relative units: dist² is taken relative to the arm's
+    reference distance, so a frame at that distance is weighted as before.
+    """
+    from xrd_tools.analysis.xu_stitch_calibration import (
+        EXTENDED_SOLID_ANGLE_POLICY, extended_arm_digest,
+    )
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.geometry import DetectorCalibration, Diffractometer
+    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
+    from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry
+    arm = _thaw(corrections["solid_angle_arm"])
+    if (corrections["solid_angle_policy"] != EXTENDED_SOLID_ANGLE_POLICY
+            or extended_arm_digest(arm) != corrections["solid_angle_sha256"]):
+        raise XuStitchScienceRefused("XU_SOLID_ANGLE_MISMATCH", "the extended solid-angle arm is not attested")
+    calibration = DetectorCalibration(
+        PONI(dist=arm["dist_m"], poni1=arm["poni1_m"], poni2=arm["poni2_m"],
+             wavelength=arm["wavelength_m"], detector=arm["detector"]),
+        detector_config=dict(arm["detector_config"]))
+    stacked = StackedDetectorArm(
+        nu_motor="nu", del_motor="del", nu_offset=arm["nu_offset"], nu_scale=arm["nu_scale"],
+        del_offset=arm["del_offset"], del_scale=arm["del_scale"], beam_rotation=arm["beam_rotation"],
+        mount_tilt=arm["mount_tilt"], mount_roll=arm["mount_roll"], sample_offset1=arm["sample_offset1"],
+        sample_offset2=arm["sample_offset2"], sample_offset3=arm["sample_offset3"])
+    diffractometer = Diffractometer.from_pyfai_goniometer(
+        stacked.to_pyfai_goniometer(calibration), source_motors={"nu_angle": "nu", "del_angle": "del"})
+
+    reference_dist = float(arm["dist_m"])
+
+    def frame_solid_angle(nu: float, del_: float) -> np.ndarray:
+        integrator, = create_multigeometry_integrators_from_geometry(
+            diffractometer, {"del": np.array([float(del_)]), "nu": np.array([float(nu)])})
+        relative = np.ascontiguousarray(CorrectionStack().normalization(integrator, shape), dtype=np.float64)
+        value = relative * (reference_dist / float(integrator.dist)) ** 2
+        if value.shape != shape or not np.isfinite(value).all() or np.any(value <= 0):
+            raise XuStitchScienceRefused("XU_SOLID_ANGLE_MISMATCH", "per-frame solid angle is not finite and positive")
+        return value
+    return frame_solid_angle
 
 
 def resolve_xu_stitch_effective_geometry(
@@ -247,6 +383,7 @@ def resolve_xu_stitch_effective_geometry(
         raise TypeError("effective XU geometry requires an active exact runtime")
     revalidate_xu_stitch_calibration(receipt)
     asset = receipt.projection.value
+    asset_version = asset["version"]
     detector_asset = asset["detector"]
     acquisition = asset["acquisition"]
     xu_asset = asset["xrayutilities"]
@@ -280,17 +417,27 @@ def resolve_xu_stitch_effective_geometry(
         ("pixel1", float(config["pixel1"])),
         ("pixel2", float(config["pixel2"])),
     )
+    expected_config = dict(detector_asset["detector_config"])
+    if "max_shape" in expected_config:
+        expected_config["max_shape"] = tuple(expected_config["max_shape"])
+        normalized_config = tuple(sorted((
+            *normalized_config, ("max_shape", tuple(detector.max_shape)),
+        )))
     if (
-        f"{type(detector).__module__}.{type(detector).__qualname__}"
-        != "pyFAI.detectors._dectris.Pilatus300kw"
+        (asset_version == 1 and (
+            f"{type(detector).__module__}.{type(detector).__qualname__}"
+            != "pyFAI.detectors._dectris.Pilatus300kw"
+            or normalized_config != (
+                ("orientation", 3),
+                ("pixel1", 0.000172),
+                ("pixel2", 0.000172),
+            )
+        ))
         or tuple(detector.shape) != shape
         or tuple(detector.max_shape) != shape
-        or normalized_config
-        != (
-            ("orientation", 3),
-            ("pixel1", 0.000172),
-            ("pixel2", 0.000172),
-        )
+        or normalized_config != tuple(sorted(expected_config.items()))
+        or float(detector.pixel1) != detector_asset["pixel1_m"]
+        or float(detector.pixel2) != detector_asset["pixel2_m"]
         or detector.sensor is not None
         or any(
             detector_asset[name] is not None
@@ -299,9 +446,10 @@ def resolve_xu_stitch_effective_geometry(
     ):
         raise XuStitchScienceRefused(
             "XU_SENSOR_PARALLAX_UNSUPPORTED",
-            "detector or sensor reconstruction differs from SURFACE v1",
+            "detector or sensor reconstruction differs from calibration",
         )
-    mask = np.ascontiguousarray(detector.calc_mask(), dtype=bool)
+    detector_mask = detector.calc_mask()
+    mask = np.zeros(shape, dtype=bool) if detector_mask is None else np.ascontiguousarray(detector_mask, dtype=bool)
     if (
         mask.shape != shape
         or int(mask.sum()) != detector_asset["mask_count"]
@@ -309,7 +457,7 @@ def resolve_xu_stitch_effective_geometry(
     ):
         raise XuStitchScienceRefused(
             "XU_DETECTOR_MASK_MISMATCH",
-            "registered detector mask differs from SURFACE v1",
+            "registered detector mask differs from calibration",
         )
     header = DetectorHeader(
         cch1=float(detector_asset["cch1_px"]),
@@ -320,37 +468,14 @@ def resolve_xu_stitch_effective_geometry(
         Nch1=shape[0],
         Nch2=shape[1],
     )
-    solid = np.asarray(
-        CorrectionStack().normalization(detector_header_to_ai(header), shape),
-        dtype=np.float64,
-        order="C",
-    )
-    solid_sha256 = _sha256_array(solid, "<f8")
-    reference_solid_sha256 = str(corrections["solid_angle_sha256"])
-    if solid.shape != shape or not np.isfinite(solid).all() or np.any(solid <= 0):
-        raise XuStitchScienceRefused(
-            "XU_SOLID_ANGLE_MISMATCH",
-            "solid-angle projection is not a finite positive SURFACE v1 array "
-            f"(host sha256={solid_sha256})",
-        )
-    reference_solid = _solid_angle_reference(reference_solid_sha256, shape)
-    if solid_sha256 == reference_solid_sha256:
-        solid_match = "exact"
-        solid_max_rel_dev = 0.0
+    if asset_version == 3:
+        frame_solid_angle = _extended_solid_angle(corrections, shape)
+        solid_sha256 = str(corrections["solid_angle_sha256"])
+        solid_match, solid_max_rel_dev, reference_solid = "exact", 0.0, None
     else:
-        solid_max_rel_dev = float(
-            np.max(np.abs(solid - reference_solid) / reference_solid)
-        )
-        if not solid_max_rel_dev <= _SOLID_ANGLE_RTOL:
-            raise XuStitchScienceRefused(
-                "XU_SOLID_ANGLE_MISMATCH",
-                "solid-angle projection differs from SURFACE v1 "
-                f"(host sha256={solid_sha256}; "
-                f"reference sha256={reference_solid_sha256}; "
-                f"max_rel_dev={solid_max_rel_dev:.3e}; "
-                f"rtol={_SOLID_ANGLE_RTOL:.0e})",
-            )
-        solid_match = "tolerance"
+        frame_solid_angle = None
+        solid_sha256, solid_match, solid_max_rel_dev, reference_solid = _static_solid_angle(
+            asset_version, corrections, header, shape)
     energy = float(acquisition["energy_eV"])
     if energy_eV_to_wavelength_m(energy) * 1e10 != acquisition["xdart_wavelength_A"]:
         raise XuStitchScienceRefused(
@@ -376,6 +501,9 @@ def resolve_xu_stitch_effective_geometry(
         raise XuStitchScienceRefused(
             "XU_WAVELENGTH_MISMATCH", "XU mapping wavelength projection changed"
         )
+    extended = {} if asset_version != 3 else {
+        "detrot": float(detector_asset["detrot_deg"]), "tilt": float(detector_asset["tilt_deg"]),
+        "tiltazimuth": float(detector_asset["tiltazimuth_deg"])}
     hxrd.Ang2Q.init_area(
         *xu_asset["camera"],
         cch1=float(detector_asset["cch1_px"]),
@@ -385,6 +513,7 @@ def resolve_xu_stitch_effective_geometry(
         pwidth1=float(detector_asset["pixel1_m"]) * 1e3,
         pwidth2=float(detector_asset["pixel2_m"]) * 1e3,
         distance=float(detector_asset["distance_m"]) * 1e3,
+        **extended,
     )
     projection = XuStitchEffectiveGeometryProjection(
         receipt.semantic_fingerprint,
@@ -403,8 +532,15 @@ def resolve_xu_stitch_effective_geometry(
         solid_sha256,
         solid_match,
         solid_max_rel_dev,
+        asset_version,
     )
     frozen_mask = np.frombuffer(mask.tobytes(order="C"), dtype=bool).reshape(shape)
+    if asset_version == 3:
+        # xrayutilities takes the displacement in the detector distance's units (mm).
+        return XuStitchRuntimeGeometry(
+            projection, hxrd, frozen_mask, None, _RUNTIME_GEOMETRY_FACTORY,
+            frame_solid_angle, tuple(float(value) for value in acquisition["sampledis_mm"]),
+        )
     # The reference bytes, not the host's: every host integrates with the
     # array the projection's solid_angle_sha256 names.
     frozen_solid = np.frombuffer(
@@ -477,6 +613,47 @@ class XuPowderQFrameLease:
             )
         return q
 
+    def polarization(self, factor: float, wavelength_A: float, beam, vertical) -> np.ndarray:
+        """pyFAI's polarization factor per pixel, from the elastic scattered direction.
+
+        ``P = ½(1 + cos²2θ − f·cos2χ·sin²2θ)`` with χ measured from the horizontal
+        axis (perpendicular to the beam and the vertical), so ``f = 1`` is fully
+        horizontal polarization, as in pyFAI.
+        """
+        if self._released:
+            raise RuntimeError("XU q-frame lease is released")
+        k = 2 * math.pi / wavelength_A
+        horizontal = np.cross(beam, vertical)
+        qx, qy, qz = self._values
+        # k_f = q + k·beam; beam, vertical and horizontal are orthonormal.
+        along = qx * beam[0] + qy * beam[1] + qz * beam[2] + k
+        up = qx * vertical[0] + qy * vertical[1] + qz * vertical[2]
+        side = qx * horizontal[0] + qy * horizontal[1] + qz * horizontal[2]
+        along *= along
+        up *= up
+        side *= side
+        norm = along + up + side
+        finite = np.isfinite(norm)
+        if np.any(np.abs(norm[finite] / (k * k) - 1.0) > 1e-9):
+            raise XuStitchScienceRefused(
+                "XU_POLARIZATION_GEOMETRY", "XU q is not elastic for the mapping wavelength",
+            )
+        side -= up
+        side *= -factor
+        side += along
+        side /= norm
+        side += 1.0
+        side *= 0.5
+        return side
+
+    def gi_coordinates(self, normal, axis) -> tuple[np.ndarray, np.ndarray]:
+        """(q_ip, q_oop) for the sample normal ``normal`` in the lab and the q_ip sign ``axis``
+        (see ``stitch_gi``)."""
+        if self._released:
+            raise RuntimeError("XU q-frame lease is released")
+        from xrd_tools.integrate.stitch_gi import gi_coordinates
+        return gi_coordinates(*self._values, normal, axis)
+
     def release(self) -> None:
         if self._released:
             return
@@ -515,6 +692,10 @@ class XuPowderQProvider:
             raise XuStitchScienceRefused(
                 "INVALID_METADATA_VALUE", "XU detector angles must be finite"
             )
+        # xrayutilities switches to its sample-displacement path whenever
+        # ``sampledis`` is passed, so it is passed only when it is nonzero.
+        displaced = ({} if self.geometry.sampledis is None or not any(self.geometry.sampledis)
+                     else {"sampledis": list(self.geometry.sampledis)})
         area = self.geometry.hxrd.Ang2Q.area(
             0.0,
             0.0,
@@ -522,8 +703,59 @@ class XuPowderQProvider:
             0.0,
             float(nu) - self._nu_offset,
             float(del_) - self._del_offset,
+            **displaced,
         )
         return XuPowderQFrameLease(area, self.geometry.projection.shape)
+
+
+_AXES = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
+
+
+def _polarization_axes(asset) -> tuple[np.ndarray, np.ndarray]:
+    """The beam and the lab vertical of an XU asset.
+
+    The outer detector circle (nu) scatters in the horizontal plane, so its
+    rotation axis is the vertical, whatever the asset's axis names.
+    """
+    xu_asset = asset["xrayutilities"]
+    beam = np.asarray(xu_asset["incident_beam"], dtype=np.float64)
+    axis = str(xu_asset["detector_axes"][0])
+    if beam.shape != (3,) or not np.isfinite(beam).all() or axis[:1] not in _AXES:
+        raise XuStitchScienceRefused("XU_POLARIZATION_GEOMETRY", "XU beam or detector axis is unsupported")
+    beam = beam / np.linalg.norm(beam)
+    vertical = np.asarray(_AXES[axis[0]])
+    if abs(float(beam @ vertical)) > 1e-12:
+        raise XuStitchScienceRefused("XU_POLARIZATION_GEOMETRY", "the nu circle axis is not perpendicular to the beam")
+    return beam, vertical
+
+
+def _radial_coordinates(q, unit, wavelength_A):
+    if unit == "q_A^-1":
+        return q
+    argument = q * (wavelength_A / (4 * np.pi))
+    if not np.isfinite(argument).all() or np.any(argument < 0) or np.any(argument > 1 + 1e-12):
+        raise XuStitchScienceRefused("STITCH_RADIAL_DOMAIN_INVALID", "Q is outside the physical two-theta domain")
+    return convert_radial_axis(q, "q_A^-1", "2th_deg", wavelength_A)
+
+
+def _scout_radial_range(provider, frame_inputs, unit, wavelength_A, cancel_token):
+    """Full geometry extent over every selected angle, without image rereads."""
+    low, high = math.inf, -math.inf
+    for _label, del_value, nu_value, _monitor in frame_inputs:
+        if cancel_token is not None and cancel_token.is_set():
+            raise XuStitchCancelled("CANCELLED")
+        lease = provider.frame(nu=nu_value, del_=del_value)
+        values = None
+        try:
+            values = _radial_coordinates(lease.q_magnitude(), unit, wavelength_A)
+            if not np.isfinite(values).all():
+                raise XuStitchScienceRefused("STITCH_Q_GRID_INVALID", "nonfinite detector coordinates")
+            low = min(low, float(values.min()))
+            high = max(high, float(values.max()))
+        finally:
+            values = None
+            lease.release()
+    return low, high
 
 
 def _checked_frame_histograms(
@@ -537,21 +769,41 @@ def _checked_frame_histograms(
     del_value: float,
     monitor: float,
     max_frame_bytes: int,
+    unit: str = "q_A^-1",
+    wavelength_A: float | None = None,
+    conditioning: StitchConditioning | None = None,
+    mask: np.ndarray | None = None,
+    frame_record_callback: Callable[[int, np.ndarray], None] | None = None,
+    polarization: tuple | None = None,
+    dark: np.ndarray | None = None,
+    flat: np.ndarray | None = None,
+    gi_cuts: tuple | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Produce one frame's 1-D contributions and prove frame release."""
+    """Produce one frame's 1-D contributions and prove frame release.
 
-    raw_image = image = q = valid = None
+    As in pyFAI, a dark is subtracted from the conditioned frame, and the flat
+    and polarization weight the normalization next to the solid angle.
+    ``gi_cuts`` (normal, axis, ((cut, window, edges), …)) also bins the frame's GI
+    cuts from the same pixels and weights, the GI coordinates computed once; their
+    histograms, one triple per cut, are the fifth value.
+    """
+
+    raw_image = image = q = valid = weights = factor = solid = None
+    cut = other = inside = q_ip = q_oop = None
+    gi_histograms = ()
     lease: XuPowderQFrameLease | None = None
     owned_refs: list[weakref.ReferenceType] = []
     pending: BaseException | None = None
     d_signal = d_normalization = d_count = None
     try:
-        raw_image = np.asarray(source.load_frame(label))
+        raw_image = load_stitch_frame(source, label, conditioning)
         if raw_image.nbytes > max_frame_bytes:
             raise XuStitchScienceRefused(
                 "XU_FRAME_TOO_LARGE", "source frame exceeds max_frame_bytes"
             )
-        image = np.array(raw_image, dtype=np.float64, order="C", copy=True)
+        if frame_record_callback is not None:
+            frame_record_callback(label, raw_image)
+        image = condition_stitch_frame(raw_image, conditioning)
         owned_refs.append(weakref.ref(image))
         raw_image = None
         if (
@@ -562,6 +814,8 @@ def _checked_frame_histograms(
                 "XU_FRAME_SHAPE_UNSUPPORTED",
                 "oriented float64 frame differs from SURFACE shape/envelope",
             )
+        if dark is not None:
+            np.subtract(image, dark, out=image)
         try:
             with np.errstate(divide="raise", invalid="ignore", over="raise"):
                 np.divide(image, monitor, out=image)
@@ -571,28 +825,65 @@ def _checked_frame_histograms(
                 "monitor normalization overflowed a finite signal",
             ) from error
         lease = provider.frame(nu=nu_value, del_=del_value)
-        q = lease.q_magnitude()
+        q = _radial_coordinates(lease.q_magnitude(), unit, wavelength_A)
         owned_refs.append(weakref.ref(q))
         valid = np.logical_not(geometry.mask)
         owned_refs.append(weakref.ref(valid))
+        if mask is not None:
+            np.logical_and(valid, np.logical_not(mask), out=valid)
         np.logical_and(valid, np.isfinite(q), out=valid)
         np.logical_and(valid, np.isfinite(image), out=valid)
-        np.logical_and(valid, np.isfinite(geometry.solid_angle), out=valid)
-        np.logical_and(valid, geometry.solid_angle > 0, out=valid)
+        solid = geometry.solid_angle
+        if solid is None:
+            solid = geometry.frame_solid_angle(nu_value, del_value)
+            owned_refs.append(weakref.ref(solid))
+        np.logical_and(valid, np.isfinite(solid), out=valid)
+        np.logical_and(valid, solid > 0, out=valid)
         d_signal = np.histogram(
             q[valid], q_edges, weights=image[valid]
         )[0]
+        weights = solid
+        if polarization is not None or flat is not None:
+            weights = np.array(solid, dtype=np.float64, copy=True)
+            owned_refs.append(weakref.ref(weights))
+            if polarization is not None:
+                factor = lease.polarization(*polarization)
+                owned_refs.append(weakref.ref(factor))
+                np.multiply(weights, factor, out=weights)
+                factor = None
+            if flat is not None:
+                np.multiply(weights, flat, out=weights)
         d_normalization = np.histogram(
-            q[valid], q_edges, weights=geometry.solid_angle[valid]
+            q[valid], q_edges, weights=weights[valid]
         )[0]
         d_count = np.histogram(q[valid], q_edges)[0].astype(
             np.float64,
             copy=False,
         )
+        if gi_cuts is not None:
+            normal, axis, cuts = gi_cuts
+            q_ip, q_oop = lease.gi_coordinates(normal, axis)
+            owned_refs.extend((weakref.ref(q_ip), weakref.ref(q_oop)))
+            histograms = []
+            for axis, window, gi_edges in cuts:
+                cut, other = (q_ip, q_oop) if axis == "q_ip" else (q_oop, q_ip)
+                inside = np.logical_and(valid, np.isfinite(cut))
+                if window is not None:
+                    np.logical_and(inside, (other >= window[0]) & (other <= window[1]), out=inside)
+                histograms.append((np.histogram(cut[inside], gi_edges, weights=image[inside])[0],
+                                   np.histogram(cut[inside], gi_edges, weights=weights[inside])[0],
+                                   np.histogram(cut[inside], gi_edges)[0].astype(np.float64, copy=False)))
+                inside = None
+            gi_histograms = tuple(histograms)
+            cut = other = q_ip = q_oop = None
+        # Whole-frame monitor-normalised total: the dropped-frame statistic. Not
+        # the in-range histogram, which legitimately shrinks at the range edges.
+        d_total = float(image[valid].sum())
     except BaseException as error:
         pending = error.with_traceback(None)
     finally:
-        raw_image = image = q = valid = None
+        raw_image = image = q = valid = weights = factor = solid = None
+        cut = other = inside = q_ip = q_oop = None
         release_error: BaseException | None = None
         if lease is not None:
             try:
@@ -621,7 +912,42 @@ def _checked_frame_histograms(
         raise XuStitchScienceRefused(
             "STITCH_NUMERIC_OVERFLOW", "frame histograms were not produced"
         )
-    return d_signal, d_normalization, d_count
+    return d_signal, d_normalization, d_count, d_total, gi_histograms
+
+
+def _scout_gi_bins(provider, frame_inputs, normals, axes, gi, cancel_token):
+    """Both GI coordinates' ranges, as the pyFAI kernel resolves them (``multi._gi_bins``): each its
+    own range, else its full geometry extent inside the other's range over every selected frame (one
+    pass); a cut is binned over its own and windowed by the other's."""
+    from xrd_tools.integrate.stitch_gi import GI_CUTS
+    bins = {cut: gi.bins(cut) for cut in GI_CUTS}
+    scouted = [cut for cut in GI_CUTS if bins[cut] is None]
+    if not scouted:
+        return bins
+    low, high = dict.fromkeys(scouted, math.inf), dict.fromkeys(scouted, -math.inf)
+    for (_label, del_value, nu_value, _monitor), normal, axis in zip(frame_inputs, normals, axes):
+        if cancel_token is not None and cancel_token.is_set():
+            raise XuStitchCancelled("CANCELLED")
+        lease = provider.frame(nu=nu_value, del_=del_value)
+        try:
+            q_ip, q_oop = lease.gi_coordinates(normal, axis)
+            for cut in scouted:
+                values, other = (q_ip, q_oop) if cut == "q_ip" else (q_oop, q_ip)
+                inside = np.isfinite(values)
+                window = gi.window(cut)
+                if window is not None:
+                    inside &= (other >= window[0]) & (other <= window[1])
+                if inside.any():
+                    low[cut] = min(low[cut], float(values[inside].min()))
+                    high[cut] = max(high[cut], float(values[inside].max()))
+        finally:
+            q_ip = q_oop = values = other = inside = None
+            lease.release()
+    for cut in scouted:
+        if not low[cut] < high[cut]:
+            raise XuStitchScienceRefused("STITCH_GI_RANGE_EMPTY", "no pixel lies inside the GI window")
+        bins[cut] = (low[cut], high[cut])
+    return bins
 
 
 @dataclass(frozen=True, slots=True)
@@ -695,8 +1021,15 @@ class XuStitchScienceResult:
     observations: XuStitchScienceObservations
     selected_frame_count: int
     release_check_frame_count: int
+    #: A GI Stitch's cuts beside I(q) (``stitch_gi``), each (result, diagnostics) in the plan's
+    #: order; () otherwise.
+    gi_cuts: tuple[tuple[IntegrationResult1D, StitchDiagnostics], ...] = ()
 
     def __post_init__(self) -> None:
+        if type(self.gi_cuts) is not tuple or any(
+                type(cut) is not tuple or len(cut) != 2 or type(cut[0]) is not IntegrationResult1D
+                or type(cut[1]) is not StitchDiagnostics for cut in self.gi_cuts):
+            raise TypeError("XU Stitch GI result is invalid")
         if (
             type(self.payload) is not IntegrationResult1D
             or type(self.diagnostics) is not StitchDiagnostics
@@ -716,26 +1049,72 @@ def run_xu_hist_stitch_1d(
     source,
     *,
     frame_indices: Sequence[int],
-    q_min_A_inverse: float,
-    q_max_A_inverse: float,
+    q_min_A_inverse: float | None = None,
+    q_max_A_inverse: float | None = None,
     npt: int,
     monitor_key: str | None,
     source_energy_key: str | None = None,
     max_frame_bytes: int,
     cancel_token: threading.Event | None = None,
     progress_callback: Callable[[int, int], object] | None = None,
+    unit: str = "q_A^-1",
+    radial_range: tuple[float, float] | None = None,
+    conditioning: StitchConditioning | None = None,
+    mask: np.ndarray | None = None,
+    frame_record_callback: Callable[[int, np.ndarray], None] | None = None,
+    frame_screen: object = None,
+    polarization_factor: float | None = None,
+    dark: np.ndarray | None = None,
+    flat: np.ndarray | None = None,
+    flat_min_fraction: float = 0.1,
+    gi=None,
 ) -> XuStitchScienceResult:
+    """Run native Q or 2theta histogram bins; omitted bounds scout all geometry.
+
+    Legacy q_min/q_max calls and an absent conditioning policy retain the
+    canonical input-reader behavior. ``mask`` is already in calibrated image
+    coordinates and is combined with, never substituted for, the detector mask.
+    The caller must supply frames already oriented by the calibration asset's
+    ``image_rotation_quarter_turns``. This kernel does not rotate them;
+    ``StitchOperationExecution`` applies the rotation for native plans.
+    ``frame_record_callback`` borrows each raw frame before conditioning.
+    ``polarization_factor``, ``dark`` and ``flat`` (oriented like the frames)
+    apply pyFAI's corrections; an unusable dark or flat pixel joins the mask.
+    ``gi`` (a ``StitchGI``) also bins its GI cuts beside I(q), with ``npt`` points:
+    every frame's sample normal comes from psic's four sample circles (eta from the
+    incidence, chi from the tilt; ``StitchGI.normal``, xrayutilities' own transform
+    for the SURFACE asset), and the result carries them as ``gi_cuts``.
+    """
+    from xrd_tools.integrate.stitch_gi import GI_UNITS, StitchGI
+    if gi is not None and (type(gi) is not StitchGI or unit != "q_A^-1"):
+        raise TypeError("an XU GI cut needs an exact StitchGI beside I(q) in Q")
     if type(receipt) is not XuStitchCalibrationReceipt:
         raise TypeError("XU Stitch science requires exact calibration receipt")
+    if unit not in {"q_A^-1", "2th_deg"}:
+        raise ValueError("XU Stitch supports Q or two-theta native bins")
+    if q_min_A_inverse is not None or q_max_A_inverse is not None:
+        if (type(q_min_A_inverse) is not float or type(q_max_A_inverse) is not float
+                or unit != "q_A^-1" or radial_range is not None):
+            raise TypeError("legacy Q bounds require two floats and cannot be combined with another axis/range")
+        radial_range = (q_min_A_inverse, q_max_A_inverse)
+    if radial_range is not None and (
+        type(radial_range) is not tuple or len(radial_range) != 2
+        or any(type(v) not in {int, float} or not math.isfinite(v) for v in radial_range)
+        or radial_range[0] >= radial_range[1]
+    ):
+        raise ValueError("Stitch radial range must be finite and increasing")
+    if conditioning is not None and type(conditioning) is not StitchConditioning:
+        raise TypeError("conditioning must be exact StitchConditioning or absent")
+    if polarization_factor is not None and (
+            isinstance(polarization_factor, bool) or not isinstance(polarization_factor, (int, float))
+            or not math.isfinite(polarization_factor) or not -1.0 <= polarization_factor <= 1.0):
+        raise ValueError("polarization factor must be a finite number from -1 to 1, or None")
+    if frame_record_callback is not None and not callable(frame_record_callback):
+        raise TypeError("frame-record callback must be callable")
     labels = tuple(frame_indices)
     if (
         not labels
         or any(type(label) is not int for label in labels)
-        or type(q_min_A_inverse) is not float
-        or type(q_max_A_inverse) is not float
-        or not math.isfinite(q_min_A_inverse)
-        or not math.isfinite(q_max_A_inverse)
-        or q_min_A_inverse >= q_max_A_inverse
         or type(npt) is not int
         or not 1 <= npt <= 1_000_000
         or (monitor_key is not None and (type(monitor_key) is not str or not monitor_key))
@@ -775,6 +1154,7 @@ def run_xu_hist_stitch_1d(
     acquisition = asset["acquisition"]
     validation = asset["validation"]
     frame_inputs: list[tuple[int, float, float, float]] = []
+    normals: list[np.ndarray] = []  # GI: each frame's sample normal, from psic's circles
     del_values: list[float] = []
     nu_values: list[float] = []
     energy_values: list[float] = []
@@ -790,8 +1170,10 @@ def run_xu_hist_stitch_1d(
                 "INVALID_METADATA_VALUE", "frame metadata is not a mapping"
             )
         try:
-            del_value = float(metadata[acquisition["source_motors"]["del"]])
-            nu_value = float(metadata[acquisition["source_motors"]["nu"]])
+            # None: the circle a single 2θ arm holds at zero
+            del_name, nu_name = (acquisition["source_motors"][circle] for circle in ("del", "nu"))
+            del_value = 0.0 if del_name is None else float(metadata[del_name])
+            nu_value = 0.0 if nu_name is None else float(metadata[nu_name])
         except (KeyError, TypeError, ValueError) as error:
             raise XuStitchScienceRefused(
                 "INVALID_METADATA_VALUE", "required XU angle is unavailable"
@@ -841,7 +1223,8 @@ def run_xu_hist_stitch_1d(
                     "XU_SOURCE_ENERGY_CONFLICT",
                     "source energy is unavailable",
                 ) from error
-            expected_energy = float(acquisition["energy_eV"])
+            # a refined calibration's scans are checked against the energy they recorded
+            expected_energy = float(acquisition.get("source_energy_eV", acquisition["energy_eV"]))
             if (
                 not math.isfinite(energy)
                 or energy <= 0
@@ -852,6 +1235,13 @@ def run_xu_hist_stitch_1d(
                     "source energy conflicts with the calibrated XU energy",
                 )
             energy_values.append(energy)
+        if gi is not None:
+            try:
+                normals.append(gi.normal(metadata))
+            except (KeyError, TypeError, ValueError) as error:
+                raise XuStitchScienceRefused(
+                    "INVALID_METADATA_VALUE", "a GI sample angle is unavailable or nonfinite"
+                ) from error
         del_values.append(del_value)
         nu_values.append(nu_value)
         frame_inputs.append((label, del_value, nu_value, monitor))
@@ -870,35 +1260,81 @@ def run_xu_hist_stitch_1d(
             else ("XU_CALIBRATION_EXTRAPOLATION_WITHIN_VALIDATED_SCAN",)
         ),
     )
-    q_edges = np.linspace(
-        q_min_A_inverse,
-        q_max_A_inverse,
-        npt + 1,
-        dtype=np.float64,
-    )
-    centres = (q_edges[:-1] + q_edges[1:]) * 0.5
-    if (
-        not np.isfinite(q_edges).all()
-        or not np.isfinite(centres).all()
-        or np.any(np.diff(q_edges) <= 0)
-        or (centres.size > 1 and np.any(np.diff(centres) <= 0))
-    ):
-        raise XuStitchScienceRefused(
-            "STITCH_Q_GRID_INVALID",
-            "q edges or centers are not finite and strictly increasing",
-        )
-    signal = np.zeros(npt, dtype=np.float64)
-    normalization = np.zeros(npt, dtype=np.float64)
-    count = np.zeros(npt, dtype=np.float64)
+    # [signal, normalization, count] of I(q) and, for GI, of the cut
+    totals = [np.zeros(npt, dtype=np.float64) for _ in range(3)]
+    gi_totals = () if gi is None else tuple([np.zeros(npt, dtype=np.float64) for _ in range(3)]
+                                            for _cut in gi.cuts)
     release_count = 0
+
+    def add(target, d_signal, d_normalization, d_count):
+        try:
+            with np.errstate(over="raise", invalid="raise"):
+                candidate = [target[0] + d_signal, target[1] + d_normalization, target[2] + d_count]
+        except FloatingPointError as error:
+            raise XuStitchScienceRefused(
+                "STITCH_NUMERIC_OVERFLOW",
+                "cumulative histogram overflowed",
+            ) from error
+        if np.any(candidate[2] > _MAX_COUNT):
+            raise XuStitchScienceRefused(
+                "STITCH_COVERAGE_STORAGE_EXACTNESS_EXCEEDED",
+                "histogram count exceeds exact float32 storage",
+            )
+        if not np.isfinite(candidate[0]).all() or not np.isfinite(candidate[1]).all():
+            raise XuStitchScienceRefused(
+                "STITCH_NUMERIC_OVERFLOW", "cumulative histogram is invalid"
+            )
+        target[:] = candidate
+
+    def accumulate(d_signal, d_normalization, d_count, gi_histograms=()):
+        add(totals, d_signal, d_normalization, d_count)
+        for target, histograms in zip(gi_totals, gi_histograms, strict=True):
+            add(target, *histograms)
     runtime_owner = xu_runtime_session()
     with runtime_owner as session:
         geometry = resolve_xu_stitch_effective_geometry(receipt, session)
         provider = XuPowderQProvider(geometry, acquisition)
+        wavelength_A = energy_eV_to_wavelength_m(geometry.projection.energy_eV) * 1e10
+        if mask is not None:
+            if type(mask) is not np.ndarray or mask.dtype != np.dtype(bool) or mask.shape != geometry.projection.shape:
+                raise ValueError("external mask must be boolean with the calibrated detector shape")
+        from xrd_tools.integrate.multi import _detector_correction
+        dark, dark_invalid = _detector_correction(dark, "dark", 0.0)
+        flat, flat_invalid = _detector_correction(flat, "flat", 1.0, flat_min_fraction)
+        for name, value, invalid in (("dark", dark, dark_invalid), ("flat", flat, flat_invalid)):
+            if value is not None and value.shape != geometry.projection.shape:
+                raise ValueError(f"Stitch {name} must have the calibrated detector shape")
+            if invalid is not None:
+                mask = invalid if mask is None else np.logical_or(mask, invalid)
+        polarization = None
+        if polarization_factor is not None:
+            polarization = (float(polarization_factor), geometry.projection.xu_mapping_wavelength_A,
+                            *_polarization_axes(asset))
+        bounds = radial_range if radial_range is not None else _scout_radial_range(
+            provider, frame_inputs, unit, wavelength_A, cancel_token,
+        )
+        q_edges = np.linspace(*bounds, npt + 1, dtype=np.float64)
+        centres = (q_edges[:-1] + q_edges[1:]) * 0.5
+        if (not np.isfinite(q_edges).all() or not np.isfinite(centres).all()
+                or np.any(np.diff(q_edges) <= 0)
+                or (centres.size > 1 and np.any(np.diff(centres) <= 0))):
+            raise XuStitchScienceRefused("STITCH_Q_GRID_INVALID", "radial grid is not finite and strictly increasing")
+        gi_cuts = [None] * len(frame_inputs)
+        if gi is not None:
+            frame = asset["xrayutilities"]
+            if (list(frame["incident_beam"]) != [0.0, 1.0, 0.0]
+                    or list(frame["surface_normal_reference"]) != [0.0, 0.0, 1.0]):
+                raise XuStitchScienceRefused("XU_GI_FRAME_UNSUPPORTED", "GI takes psic's SURFACE frame")
+            axes = [gi.in_plane_axis(normal) for normal in normals]
+            gi_bins = _scout_gi_bins(provider, frame_inputs, normals, axes, gi, cancel_token)
+            gi_edges = {cut: np.linspace(*gi_bins[cut], npt + 1, dtype=np.float64) for cut in gi.cuts}
+            other = {"q_ip": "q_oop", "q_oop": "q_ip"}
+            cuts = tuple((cut, gi_bins[other[cut]], gi_edges[cut]) for cut in gi.cuts)
+            gi_cuts = [(normal, axis, cuts) for normal, axis in zip(normals, axes)]
         for index, (label, del_value, nu_value, monitor) in enumerate(frame_inputs):
             if cancel_token is not None and cancel_token.is_set():
                 raise XuStitchCancelled("CANCELLED")
-            d_signal, d_normalization, d_count = _checked_frame_histograms(
+            d_signal, d_normalization, d_count, d_total, d_gi = _checked_frame_histograms(
                 source,
                 label,
                 provider=provider,
@@ -908,6 +1344,15 @@ def run_xu_hist_stitch_1d(
                 del_value=del_value,
                 monitor=monitor,
                 max_frame_bytes=max_frame_bytes,
+                unit=unit,
+                wavelength_A=wavelength_A,
+                conditioning=conditioning,
+                mask=mask,
+                frame_record_callback=frame_record_callback,
+                polarization=polarization,
+                dark=dark,
+                flat=flat,
+                gi_cuts=gi_cuts[index],
             )
             release_count += 1
             if (
@@ -921,52 +1366,29 @@ def run_xu_hist_stitch_1d(
                 raise XuStitchScienceRefused(
                     "STITCH_NUMERIC_OVERFLOW", "per-frame histogram is invalid"
                 )
-            try:
-                with np.errstate(over="raise", invalid="raise"):
-                    candidate_count = count + d_count
-                    candidate_signal = signal + d_signal
-                    candidate_normalization = normalization + d_normalization
-            except FloatingPointError as error:
-                raise XuStitchScienceRefused(
-                    "STITCH_NUMERIC_OVERFLOW",
-                    "cumulative histogram overflowed",
-                ) from error
-            if np.any(candidate_count > _MAX_COUNT):
-                raise XuStitchScienceRefused(
-                    "STITCH_COVERAGE_STORAGE_EXACTNESS_EXCEEDED",
-                    "histogram count exceeds exact float32 storage",
-                )
-            if (
-                not np.isfinite(candidate_signal).all()
-                or not np.isfinite(candidate_normalization).all()
-            ):
-                raise XuStitchScienceRefused(
-                    "STITCH_NUMERIC_OVERFLOW", "cumulative histogram is invalid"
-                )
-            signal, normalization, count = (
-                candidate_signal,
-                candidate_normalization,
-                candidate_count,
-            )
+            if frame_screen is None:
+                accumulate(d_signal, d_normalization, d_count, d_gi)
+            else:
+                # Hold the frame until its row neighbours are known.
+                for held, verdict in frame_screen.push(
+                        d_total, (d_signal, d_normalization, d_count, d_gi)):
+                    if not verdict.excluded:
+                        accumulate(*held)
             if progress_callback is not None:
                 progress_callback(index + 1, len(labels))
+        if frame_screen is not None:
+            for held, verdict in frame_screen.finish():
+                if not verdict.excluded:
+                    accumulate(*held)
+            if not any(not verdict.excluded for verdict in frame_screen.verdicts):
+                raise XuStitchScienceRefused(
+                    "STITCH_ALL_FRAMES_DROPPED", "every frame was excluded as a dropped frame"
+                )
         revalidate_xu_stitch_calibration(receipt)
-        intensity = np.full(npt, np.nan, dtype=np.float64)
-        occupied = normalization > 0
-        try:
-            with np.errstate(divide="raise", invalid="raise", over="raise"):
-                intensity[occupied] = signal[occupied] / normalization[occupied]
-        except FloatingPointError as error:
-            raise XuStitchScienceRefused(
-                "STITCH_NUMERIC_OVERFLOW",
-                "final Stitch normalization overflowed",
-            ) from error
-        if not np.isfinite(intensity[occupied]).all():
-            raise XuStitchScienceRefused(
-                "STITCH_NUMERIC_OVERFLOW", "normalized histogram is invalid"
-            )
-        payload = IntegrationResult1D(centres, intensity, None, "q_A^-1")
-        diagnostics = StitchDiagnostics(count, normalization)
+        payload, diagnostics = _normalized(centres, *totals, unit)
+        gi_results = tuple(
+            _normalized((gi_edges[cut][:-1] + gi_edges[cut][1:]) * 0.5, *cut_totals, GI_UNITS[cut])
+            for cut, cut_totals in zip(() if gi is None else gi.cuts, gi_totals))
         effective_projection = geometry.projection
     if runtime_owner.execution_record is None:
         raise XuStitchScienceRefused(
@@ -980,7 +1402,27 @@ def run_xu_hist_stitch_1d(
         observations,
         len(labels),
         release_count,
+        gi_results,
     )
+
+
+def _normalized(centres, signal, normalization, count, unit):
+    """Σ signal / Σ normalization where a bin has any weight (NaN elsewhere), with its diagnostics."""
+    intensity = np.full(len(centres), np.nan, dtype=np.float64)
+    occupied = normalization > 0
+    try:
+        with np.errstate(divide="raise", invalid="raise", over="raise"):
+            intensity[occupied] = signal[occupied] / normalization[occupied]
+    except FloatingPointError as error:
+        raise XuStitchScienceRefused(
+            "STITCH_NUMERIC_OVERFLOW",
+            "final Stitch normalization overflowed",
+        ) from error
+    if not np.isfinite(intensity[occupied]).all():
+        raise XuStitchScienceRefused(
+            "STITCH_NUMERIC_OVERFLOW", "normalized histogram is invalid"
+        )
+    return IntegrationResult1D(centres, intensity, None, unit), StitchDiagnostics(count, normalization)
 
 
 __all__ = [

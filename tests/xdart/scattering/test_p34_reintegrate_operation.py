@@ -293,7 +293,7 @@ def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch)
         "append_lineage": None, "source_base": "/",
     }
     monkeypatch.setattr(record_writer, "_decode_replacement_fact", lambda *_a, **_k: trace.append("detach") or fact)
-    marker = object(); monkeypatch.setattr(module, "_load_fact", lambda *_a, **_k: trace.append("raw") or (Path("/raw"), marker, None, None))
+    marker = object(); monkeypatch.setattr(module, "_load_fact", lambda *_a, **_k: trace.append("raw") or (Path("/raw"), marker, (None, None, None), None))
     shared = {"background": {"version": 1, "mode": "None"}, "gi": {"enabled": False, "resolved_motor": "Manual"}, "geometry": None}
     allocation = SimpleNamespace(reduction_inflight=1)
     source_plan = SimpleNamespace(requested_shared_science=shared, labels=(7,), detector_shape=(2, 2), native_dtype="<u2", resource_allocation=allocation)

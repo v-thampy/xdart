@@ -27,6 +27,7 @@ from xrd_tools.io.nexus import (
 )
 from xrd_tools.io.output_transaction import OutputTransactionCoordinator
 from xrd_tools.io.schema import axis_display_metadata
+from xrd_tools.io.stitch_record import write_stitch_projection
 from tests.core.test_analysis_artifact import _execution_attestation
 from tests.core.test_headless_write_roundtrip import (
     _add_current_result, _current_entry, _r1d, _r2d,
@@ -55,6 +56,19 @@ def _assert_neutral(group, payload=None):
         np.testing.assert_array_equal(group["intensity"][()], payload.intensity)
 
 
+def _assert_record(entry, payload):
+    """A Stitch 1D result is an Int record: its neutral axis and one row (``stitch_record``)."""
+    group = entry["integrated_1d"]
+    axis = group["axis_1"]
+    units = axis.attrs["units"]
+    units = units.decode() if isinstance(units, bytes) else units
+    label = axis.attrs["long_name"]
+    label = label.decode() if isinstance(label, bytes) else label
+    assert "q" not in group and label == axis_display_metadata(units)["long_name"]
+    np.testing.assert_array_equal(axis[()], payload.axis("q"))
+    np.testing.assert_array_equal(group["intensity"][0], payload.intensity)
+
+
 @pytest.mark.parametrize("backend,mode,version", [
     ("multigeometry", "1d", 4), ("multigeometry", "2d", 4), ("xu_hist", "1d", 5),
 ])
@@ -67,7 +81,10 @@ def test_real_stitch_operation_writes_neutral_axes(tmp_path, backend, mode, vers
                                      expected_kind=request.module.output.kind)
     assert reloaded.result_fingerprint == result.payload.result_fingerprint
     with h5py.File(request.module.output.target, "r") as handle:
-        _assert_neutral(handle[f"entry/stitched_{mode}"], reloaded)
+        if mode == "1d":
+            _assert_record(handle["entry"], reloaded)
+        else:
+            _assert_neutral(handle["entry/stitched_2d"], reloaded)
 
 
 def _publish_fixture(directory, version, mode):
@@ -93,8 +110,9 @@ def _publish_fixture(directory, version, mode):
         execution_attestation=attestation, execution_attestation_digest=attestation_digest,
     )
     receipt = admit_analysis_artifact(request, coordinator=OutputTransactionCoordinator()).publish(
-        lambda entry: write_stitched(entry, result_projection=projection,
-                                     bounded_artifact=True, provenance=request.provenance_json),
+        (lambda entry: write_stitch_projection(entry, request.target, projection)) if mode == "1d" else
+        (lambda entry: write_stitched(entry, result_projection=projection,
+                                      bounded_artifact=True, provenance=request.provenance_json)),
     )
     return request, read_analysis_artifact(request.target, expected_receipt=receipt)
 
@@ -112,17 +130,20 @@ def test_neutral_stitch_preserves_legacy_scientific_fingerprint(tmp_path, old_ve
     for name in (("q",) if mode == "1d" else ("q", "chi")):
         np.testing.assert_array_equal(old.axis(name), new.axis(name))
     with h5py.File(new_request.target, "r") as handle:
-        _assert_neutral(handle[f"entry/stitched_{mode}"], new)
+        if mode == "1d":
+            _assert_record(handle["entry"], new)
+        else:
+            _assert_neutral(handle["entry/stitched_2d"], new)
     assert hashlib.sha256(Path(old_request.target).read_bytes()).hexdigest() == before
 
 
-@pytest.mark.parametrize("version", [4, 5])
-def test_neutral_artifact_refuses_old_physical_names_under_new_version(tmp_path, version):
-    request, _ = _publish_fixture(tmp_path, version, "1d")
+def test_neutral_artifact_refuses_old_physical_names_under_new_version(tmp_path):
+    # the old Stitch layout (Stitch 2D's until its record branch; Stitch 1D is an Int record)
+    request, _ = _publish_fixture(tmp_path, 4, "2d")
     with h5py.File(request.target, "r+") as handle:
-        group = handle["entry/stitched_1d"]
+        group = handle["entry/stitched_2d"]
         group.move("axis_1", "q")
-        group.attrs["axes"] = ["q"]
+        group.attrs["axes"] = ["q", "axis_2"]
     with pytest.raises(AnalysisArtifactInvalid, match="axes"):
         inspect_analysis_artifact(request.target)
 

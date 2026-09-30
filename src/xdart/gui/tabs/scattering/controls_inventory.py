@@ -60,9 +60,11 @@ BACKGROUND_METADATA_KEY = ("BG", "Metadata Key")
 BACKGROUND_FILTER = ("BG", "Filter")
 BACKGROUND_SCALE = ("BG", "Scale")
 BACKGROUND_NORMALIZE = ("BG", "Normalize")
+BACKGROUND_DARK_CORRECTED = ("BG", "Dark corrected")
 BACKGROUND_EDIT_PATHS = frozenset({BACKGROUND_TYPE, BACKGROUND_FILE,
     BACKGROUND_DIRECTORY, BACKGROUND_MATCH, BACKGROUND_METADATA_KEY,
-    BACKGROUND_FILTER, BACKGROUND_SCALE, BACKGROUND_NORMALIZE})
+    BACKGROUND_FILTER, BACKGROUND_SCALE, BACKGROUND_NORMALIZE,
+    BACKGROUND_DARK_CORRECTED})
 
 INT_1D_AXIS = ("Int1D", "axis")
 INT_1D_POINTS = ("Int1D", "points")
@@ -449,6 +451,14 @@ def project_control_fields(
             "Normalize",
             BACKGROUND_NORMALIZE,
         )
+        # With a dark set (Advanced), a Background that already has the dark
+        # subtracted is subtracted as it is.
+        add(
+            SectionId.PROCESSING,
+            "BG dark-corrected",
+            BACKGROUND_DARK_CORRECTED,
+            kind=ControlFieldKind.BOOL,
+        )
 
     return tuple(projected)
 
@@ -534,6 +544,7 @@ def bound_values(
         BACKGROUND_FILTER: intent.background.filename_filter,
         BACKGROUND_SCALE: intent.background.scale,
         BACKGROUND_NORMALIZE: intent.background.normalization_key or "None",
+        BACKGROUND_DARK_CORRECTED: intent.background.dark_corrected,
     }
     values.update(source_values(intent.source_spec, source_mode=source_mode))
     average = intent.run_options.get("series_average", False)
@@ -569,7 +580,7 @@ def bound_values(
             "Series Average",
             "BG Directory",
         ),
-        BACKGROUND_MATCH: ("Scan Root + Frame Number", "Metadata Key"),
+        BACKGROUND_MATCH: ("Scan Root + Frame Number", "Metadata Key", "Last Saved Before Frame"),
     }
     if intent.gi.enabled:
         choices.update({

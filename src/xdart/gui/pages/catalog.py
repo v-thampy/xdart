@@ -20,10 +20,9 @@ def _build_scattering_workspace(services, parent):
     return build_scattering_workspace(services, parent)
 
 
-def _build_stitch_tool(services, parent):
-    from xdart.gui.tools.stitch_tool import build_stitch_tool
-
-    return build_stitch_tool(services, parent)
+def _build_stitch_page(services, parent):
+    from .stitch_workspace import build_stitch_workspace
+    return build_stitch_workspace(services, parent)
 
 
 def _build_rsm_tool(services, parent):
@@ -39,7 +38,7 @@ SCATTERING_WORKSPACE_PAGE = PageDescriptor(
     icon_key="scattering-workspace",
     category="workspace",
     order=0,
-    lifecycle=PageLifecycle.EXIT_ONLY,
+    lifecycle=PageLifecycle.RETAINED,
     capabilities=frozenset({
         PageCapability.OPEN_FOLDER,
         PageCapability.SETTINGS_PERSISTENCE,
@@ -48,23 +47,27 @@ SCATTERING_WORKSPACE_PAGE = PageDescriptor(
         PageCapability.SLICE_PIN,
         PageCapability.RUN_ACTIVITY,
         PageCapability.APP_MENU_HOSTS,
+        PageCapability.PROCESSING_MODE,
     }),
     build=_build_scattering_workspace,
 )
 
-BUILTIN_PAGES = (SCATTERING_WORKSPACE_PAGE,)
-
-# Processing tools are launched through the workspace mode selector and Run.
-STITCH_TOOL = ToolDescriptor(
+STITCH_PAGE = PageDescriptor(
     key=STITCH_TOOL_KEY,
-    label="Stitching",
-    description="Combine an exact scan selection into one stitched pattern",
+    label="Stitch 1D",
+    description="Native finite Stitch workspace",
     icon_key="stitch",
-    category="analysis",
+    category="workspace",
     order=100,
-    build=_build_stitch_tool,
-    tool_kind="processing",
+    lifecycle=PageLifecycle.RETAINED,
+    capabilities=frozenset({
+        PageCapability.OPEN_FOLDER, PageCapability.SETTINGS_PERSISTENCE,
+        PageCapability.RUN_CONTROL, PageCapability.RUN_ACTIVITY, PageCapability.APP_MENU_HOSTS,
+    }),
+    build=_build_stitch_page,
 )
+
+BUILTIN_PAGES = (SCATTERING_WORKSPACE_PAGE, STITCH_PAGE)
 
 RSM_TOOL = ToolDescriptor(
     key=RSM_TOOL_KEY,
@@ -77,4 +80,4 @@ RSM_TOOL = ToolDescriptor(
     tool_kind="processing",
 )
 
-BUILTIN_DESCRIPTORS = (*BUILTIN_PAGES, STITCH_TOOL, RSM_TOOL)
+BUILTIN_DESCRIPTORS = (*BUILTIN_PAGES, RSM_TOOL)

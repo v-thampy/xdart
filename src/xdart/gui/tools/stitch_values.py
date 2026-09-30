@@ -23,6 +23,7 @@ from xrd_tools.analysis.module_transaction import (
     ModuleKind,
     ModuleOutputRequest,
     ModuleSourceReceipt,
+    ModuleSourceGroupReceipt,
 )
 from xrd_tools.analysis.scan_operations import (
     AnalysisDisposition,
@@ -31,6 +32,8 @@ from xrd_tools.analysis.scan_operations import (
     run_metadata_table,
 )
 from xrd_tools.analysis.stitch_operation import (
+    SAMPLE_POSITIONS,
+    STITCH_ERROR_MODELS,
     StitchGeometryInput,
     StitchGeometryKind,
     StitchOperationPlan,
@@ -40,6 +43,7 @@ from xrd_tools.analysis.stitch_operation import (
     capture_stitch_geometry,
     prepare_stitch_operation,
 )
+from xrd_tools.integrate.frame_screen import EXCLUDE_CHOICES
 from xrd_tools.analysis.xu_stitch_calibration import (
     XuStitchCalibrationInput,
     XuStitchCalibrationRefused,
@@ -54,6 +58,9 @@ from xrd_tools.integrate.xu_stitch import (
     resolve_xu_stitch_effective_geometry,
 )
 from xrd_tools.core.scan import SourceKind, SourceSpec
+from xrd_tools.analysis.stitch_sources import StitchSourceSelection
+from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+from xrd_tools.integrate.stitch_gi import StitchGI
 from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactKind,
     AnalysisArtifactOverwrite,
@@ -232,7 +239,7 @@ class StitchToolForm:
     geometry_path: str | Path
     geometry_kind: StitchGeometryKind
     source_motors: tuple[tuple[str, str], ...]
-    q_range: tuple[float, float]
+    q_range: tuple[float, float] | None
     npt_1d: int
     output_path: str | Path
     raw_header_skip: int = 0
@@ -246,9 +253,33 @@ class StitchToolForm:
     max_frame_bytes: int = 256 * 1024 * 1024
     mode: str = "1d"
     backend: str = "multigeometry"
+    source_selection: StitchSourceSelection | None = None
+    unit: str = "q_A^-1"
+    conditioning: StitchConditioning | None = None
+    mask_path: str | None = None
+    output_family: str | None = None
+    output_families: tuple[str, ...] = ()
+    #: Native options: dropped-frame check, sample position and the pyFAI
+    #: corrections. The XU backend takes the frame check only.
+    frame_screen: str = "empty"
+    sample_position: str = "calibrated"
+    correct_solid_angle: bool = True
+    polarization_factor: float | None = 0.99
+    error_model: str | None = None
+    dark_path: str | None = None
+    flat_path: str | None = None
+    #: Flat pixels below this fraction of the flat's median are masked as dead.
+    flat_min_fraction: float = 0.1
+    #: Grazing incidence: a GI cut written beside I(q) (native Stitch 1D in Q).
+    gi: StitchGI | None = None
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
+        if (self.output_family is not None and type(self.output_family) is not str
+            or type(self.output_families) is not tuple
+            or any(type(value) is not str for value in self.output_families)
+            or self.output_family and self.output_families):
+            raise ValueError("Specify one result family or ordered output families")
         project = _absolute_path(self.project_root, "Project root")
         spec = _absolute_path(self.spec_path, "SPEC path")
         image_dir = _absolute_path(self.image_dir, "image directory")
@@ -256,15 +287,29 @@ class StitchToolForm:
         output = _absolute_path(self.output_path, "output path")
         if self.backend not in {"multigeometry", "xu_hist"}:
             raise ValueError("Stitch backend must be multigeometry or xu_hist")
-        if Path(spec).suffix:
+        native = self.source_selection is not None
+        if native and type(self.source_selection) is not StitchSourceSelection:
+            raise TypeError("native source selection must be exact StitchSourceSelection")
+        if self.unit not in {"q_A^-1", "2th_deg"}:
+            raise ValueError("Choose Q or 2theta for Stitch binning")
+        if self.conditioning is not None and type(self.conditioning) is not StitchConditioning:
+            raise TypeError("conditioning must be exact StitchConditioning")
+        if not native and (self.unit != "q_A^-1" or self.conditioning is not None or self.mask_path is not None):
+            raise ValueError("native processing requires a native source selection")
+        if self.mask_path is not None:
+            object.__setattr__(self, "mask_path", _absolute_path(self.mask_path, "mask path"))
+        self._native_options(native)
+        if self.gi is not None and (type(self.gi) is not StitchGI or not native or self.unit != "q_A^-1"):
+            raise ValueError("a GI cut needs a native Stitch 1D in Q")
+        if not native and Path(spec).suffix:
             raise ValueError("Stitch SPEC path must be extensionless")
         if Path(output).suffix.casefold() != ".nexus":
             raise ValueError("Stitch output path must end in .nexus")
-        if type(self.scan) is not str or _SCAN.fullmatch(self.scan) is None:
+        if not native and (type(self.scan) is not str or _SCAN.fullmatch(self.scan) is None):
             raise ValueError("SPEC scan must be an exact N or N.M selector")
         if (
             type(self.image_stem) is not str
-            or not self.image_stem
+            or (not native and not self.image_stem)
             or self.image_stem.strip() != self.image_stem
             or len(self.image_stem.encode("utf-8")) > 4096
             or any(mark in self.image_stem for mark in ("\0", "/", "\\"))
@@ -317,11 +362,11 @@ class StitchToolForm:
         if self.geometry_kind is StitchGeometryKind.PYFAI_GONIOMETER_JSON:
             if references:
                 raise ValueError("fitted JSON geometry cannot carry PONI references")
-        elif (
-            {name for name, _source in motors} != {"del", "nu"}
-            or {name for name, _value in references} != {"del", "nu"}
+        elif (  # a single detector arm maps its one moving circle, del or nu
+            {name for name, _source in motors} not in ({"del", "nu"}, {"del"}, {"nu"})
+            or {name for name, _value in references} != {name for name, _source in motors}
         ):
-            raise ValueError("PONI geometry requires del/nu mappings and references")
+            raise ValueError("PONI geometry requires del and/or nu mappings and references")
         if type(self.image_rotation) is not int or self.image_rotation not in {
             0,
             90,
@@ -329,7 +374,7 @@ class StitchToolForm:
             270,
         }:
             raise ValueError("image rotation must be 0, 90, 180, or 270")
-        q_range = _ordered_range(self.q_range, "q range")
+        q_range = None if native and self.q_range is None else _ordered_range(self.q_range, "radial range")
         if type(self.npt_1d) is not int or not 1 <= self.npt_1d <= 1_000_000:
             raise ValueError("1-D bin count must be a bounded positive integer")
         if self.monitor_selector is not None and type(
@@ -349,7 +394,7 @@ class StitchToolForm:
             raise ValueError("float64 detector frame exceeds max frame bytes")
         if self.mode != "1d":
             raise ValueError("2-D Stitch remains held pending orientation parity")
-        if self.backend == "xu_hist" and (
+        if not native and self.backend == "xu_hist" and (
             self.geometry_kind is not StitchGeometryKind.PYFAI_GONIOMETER_JSON
             or self.expected_geometry_sha256 is not None
             or motors != (("del", "del"), ("nu", "nu"))
@@ -409,7 +454,7 @@ class StitchToolForm:
             self.mode,
         )
         domain = "stitch-tool-form-v1"
-        if self.backend == "xu_hist":
+        if self.backend == "xu_hist" and not native:
             domain = "stitch-tool-form-v2-xu-hist"
             canonical = (
                 domain,
@@ -434,11 +479,58 @@ class StitchToolForm:
                 self.max_frame_bytes,
                 self.mode,
             )
+        if native:
+            domain = "stitch-tool-native-form-v1"
+            canonical = (domain, canonical, self.backend,
+                         self.source_selection.fingerprint_value, self.unit,
+                         None if self.conditioning is None else
+                         (self.conditioning.mode, self.conditioning.threshold_min, self.conditioning.threshold_max),
+                         self.mask_path, self.output_family, self.output_families,
+                         ("native-options-v1", self.frame_screen, self.sample_position,
+                          self.correct_solid_angle, self.polarization_factor, self.error_model,
+                          self.dark_path, self.flat_path)
+                         # a cutoff away from 10 % changes the form; the default keeps it
+                         + (() if self.flat_min_fraction == 0.1
+                            else (("flat-min-fraction", self.flat_min_fraction),))
+                         + (() if self.gi is None else (self.gi.identity(),)))
         object.__setattr__(
             self,
             "fingerprint",
             analysis_canonical_fingerprint(domain, canonical),
         )
+
+    def _native_options(self, native: bool) -> None:
+        if self.frame_screen not in EXCLUDE_CHOICES:
+            raise ValueError(f"frame check must be one of {EXCLUDE_CHOICES}")
+        if self.sample_position not in SAMPLE_POSITIONS:
+            raise ValueError(f"sample position must be one of {SAMPLE_POSITIONS}")
+        if type(self.correct_solid_angle) is not bool:
+            raise TypeError("solid angle correction must be an exact bool")
+        factor = self.polarization_factor
+        if factor is not None:
+            if (type(factor) not in {int, float} or not math.isfinite(float(factor))
+                    or not -1.0 <= float(factor) <= 1.0):
+                raise ValueError("polarization factor must be from -1 to 1, or absent")
+            object.__setattr__(self, "polarization_factor", float(factor))
+        if self.error_model not in STITCH_ERROR_MODELS:
+            raise ValueError(f"error model must be one of {STITCH_ERROR_MODELS}")
+        for name in ("dark_path", "flat_path"):
+            if getattr(self, name) is not None:
+                object.__setattr__(self, name, _absolute_path(getattr(self, name), name.replace("_", " ")))
+        cutoff = self.flat_min_fraction
+        if (isinstance(cutoff, bool) or not isinstance(cutoff, (int, float))
+                or not math.isfinite(cutoff) or not 0.0 <= cutoff < 1.0):
+            raise ValueError("flat cutoff must be from 0 % to below 100 % of the median")
+        object.__setattr__(self, "flat_min_fraction", float(cutoff))
+        corrected = (self.polarization_factor != 0.99 or self.dark_path is not None
+                     or self.flat_path is not None or self.flat_min_fraction != 0.1)
+        pyfai_only = (self.sample_position != "calibrated" or not self.correct_solid_angle
+                      or self.error_model is not None)
+        if not native and (pyfai_only or corrected or self.frame_screen != "empty"):
+            raise ValueError("native processing requires a native source selection")
+        if self.backend == "xu_hist" and pyfai_only:
+            raise ValueError("the XU backend always applies solid angle and has no uncertainty "
+                             "or sample position; those need pyFAI MultiGeometry")
 
 
 @dataclass(frozen=True, slots=True)
@@ -673,11 +765,33 @@ class StitchToolPreflight:
     """The exact request and summary admitted for a specific frozen form."""
 
     form: StitchToolForm
-    request: StitchOperationRequest
-    summary: StitchPreflightSummary
+    request: StitchOperationRequest | None
+    summary: StitchPreflightSummary | None
     _claim: InitVar[object] = None
+    requests: tuple[StitchOperationRequest, ...] = ()
+    skipped: tuple[tuple[str, str, str], ...] = ()
+    # Detached display facts only; the request/provenance remain Run authority.
+    preview_members: tuple[tuple[dict, ...], ...] = ()
+    warnings: tuple[str, ...] = ()
 
     def __post_init__(self, _claim: object) -> None:
+        if type(self.form) is StitchToolForm and self.form.source_selection is not None:
+            if (_claim is not _PREFLIGHT_FACTORY or type(self.requests) is not tuple
+                or any(type(item) is not StitchOperationRequest for item in self.requests)
+                or self.request is not (self.requests[0] if self.requests else None)
+                or self.summary is not None or type(self.skipped) is not tuple
+                or type(self.preview_members) is not tuple
+                or type(self.warnings) is not tuple
+                or any(type(warning) is not str or not warning for warning in self.warnings)
+                or len(self.preview_members) != len(self.requests)
+                or any(type(group) is not tuple or any(type(member) is not dict for member in group)
+                       for group in self.preview_members)
+                or any(type(item) is not tuple or len(item) != 3 or any(type(v) is not str for v in item) for item in self.skipped)):
+                raise TypeError("Native Stitch preflight is invalid")
+            targets = tuple(item.module.output.target for item in self.requests)
+            if len(set(targets)) != len(targets):
+                raise ValueError("Stitch outputs must have distinct stable families")
+            return
         if (
             _claim is not _PREFLIGHT_FACTORY
             or type(self.form) is not StitchToolForm
@@ -711,6 +825,7 @@ class StitchToolPreflight:
             != self.request.module.source.selected_labels
         ):
             raise TypeError("Stitch tool preflight is invalid")
+        object.__setattr__(self, "requests", (self.request,))
 
     def is_current(self, form: StitchToolForm | None) -> bool:
         return type(form) is StitchToolForm and form.fingerprint == self.form.fingerprint
@@ -747,6 +862,9 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
         raise StitchToolPreflightRefused(
             "PROJECT_UNAVAILABLE", "selected Project root is not a directory"
         )
+    if form.source_selection is not None:
+        from .stitch_native_values import prepare_native_stitch_tool
+        return prepare_native_stitch_tool(form, project)
     output_relative = _inside_project(form.output_path, project, "output")
     if not Path(form.output_path).parent.is_dir():
         raise StitchToolPreflightRefused(
@@ -835,8 +953,9 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
                 max_frame_bytes=form.max_frame_bytes,
             )
         else:
-            calibration = capture_xu_stitch_calibration(
-                XuStitchCalibrationInput(form.geometry_path),
+            from xrd_tools.integrate.stitch_calibration import xu_calibration_path
+            calibration = capture_xu_stitch_calibration(  # a pyFAI file's partner, saved beside it
+                XuStitchCalibrationInput(xu_calibration_path(form.geometry_path, project)),
                 project_root=project,
             )
             runtime_owner = xu_runtime_session()
@@ -939,13 +1058,12 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
         overwrite=form.overwrite,
         max_frame_bytes=form.max_frame_bytes,
         holds=(
-            ("2d-orientation-parity", "gi-and-custom-corrections")
+            ("2d-orientation-parity", "gi-corrections")
             if form.backend == "multigeometry"
             else (
                 "xu-2d-and-chi",
-                "gi-stitch-on-xu",
                 "sensor-parallax-xu-geometry",
-                "new-corrections-and-variance",
+                "xu-sigma-and-variance",
                 "mixed-energy-grouped-xu-stitch",
                 "unvalidated-platforms-and-live-gates",
             )

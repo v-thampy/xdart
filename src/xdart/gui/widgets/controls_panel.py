@@ -568,6 +568,30 @@ class _ControlsComboBox(QtWidgets.QComboBox):
         super().showPopup()
 
 
+class ControlsComboBox(_ControlsComboBox):
+    """The Controls combo for any host: popup rows at the closed control's height, never elided.
+
+    Qt's native popup ignores the QSS item-height floor on some platforms; the
+    parented delegate keeps a Tight live-theme change from compressing choices.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("controlsComboBox")
+        self.setItemDelegate(_ComboPopupItemDelegate(self))
+
+
+def browse_button(label: str) -> QtWidgets.QToolButton:
+    """The Controls 📁 browse button; the host connects ``clicked``."""
+    button = QtWidgets.QToolButton()
+    button.setText("📁")
+    button.setObjectName("controlsBrowseButton")
+    button.setToolTip(f"Browse {label}")
+    button.setMinimumWidth(31)
+    button.setMaximumWidth(36)
+    return button
+
+
 class FormRow(QtWidgets.QWidget):
     """One editable row in the Controls form."""
 
@@ -630,13 +654,8 @@ class FormRow(QtWidgets.QWidget):
             lay.addWidget(editor, 1)
         elif kind == "combo":
             lay.addWidget(self.label)
-            editor = _ControlsComboBox()
-            editor.setObjectName("controlsComboBox")
-            # Qt's native popup ignores the QSS item-height floor on some
-            # platforms.  Keep this parented delegate alive with the row so a
-            # Tight live-theme change cannot compress choices into one line.
-            self._combo_popup_delegate = _ComboPopupItemDelegate(editor)
-            editor.setItemDelegate(self._combo_popup_delegate)
+            editor = ControlsComboBox()
+            self._combo_popup_delegate = editor.itemDelegate()
             values = [str(choice) for choice in choices]
             if not values and value not in (None, ""):
                 values = [str(value)]
@@ -681,13 +700,8 @@ class FormRow(QtWidgets.QWidget):
             self.editor.setCursorPosition(0)
         self.browse_button = None
         if browse:
-            btn = QtWidgets.QToolButton()
-            btn.setText("📁")
-            btn.setObjectName("controlsBrowseButton")
-            btn.setToolTip(f"Browse {label}")
+            btn = browse_button(label)
             btn.clicked.connect(lambda _=False, p=self._path: self.browseRequested.emit(p))
-            btn.setMinimumWidth(31)
-            btn.setMaximumWidth(36)
             btn.setEnabled(self._enabled)
             lay.addWidget(btn)
             self.browse_button = btn
@@ -1859,6 +1873,21 @@ class ControlsPanel(QtWidgets.QWidget):
                 for field in group_fields:
                     self._add_bound_row(group, field)
             self.experiment_card.add_row(group)
+
+    @property
+    def experiment_title(self) -> str:
+        """The Sample & measurement subsection's title, for another page's GI rows."""
+        return self._experiment_title
+
+    def render_gi_rows(
+        self,
+        group: "SubsectionCard",
+        fields: tuple[ControlFormField, ...],
+    ) -> None:
+        """Int's grazing-incidence rows for another page's own GI values (Stitch): the
+        Standard|Grazing control, the incidence motor and Manual angle, and '…' for the
+        orientation and tilt. Edits emit ``fieldValueChanged`` with Int's GI paths."""
+        self._render_sample_measurement_rows(group, fields)
 
     def _render_sample_measurement_rows(
         self,

@@ -103,3 +103,19 @@ def test_migrated_sentinel_helpers_keep_legacy_behavior():
     assert wavelength_angstrom_to_m(1.54) == pytest.approx(1.54e-10)
     assert wavelength_angstrom_to_m(-2.0) is None
     assert wavelength_angstrom_to_m("x") is None
+
+
+def test_a_calibrations_recorded_energy_is_a_finite_number_near_its_own():
+    """Codex re-review R2-F1: the recorded energy an energy-refined calibration keeps is what the
+    scans are checked against, so only an actual finite positive number within 5 % of the
+    calibration's own energy is taken."""
+    import pytest
+    from xrd_tools.core.energy import calibration_recorded_energy_eV, energy_eV_to_wavelength_m
+    record = {"wavelength": energy_eV_to_wavelength_m(17100.)}
+    assert calibration_recorded_energy_eV(record) is None
+    assert calibration_recorded_energy_eV({**record, "source_energy_eV": 17000.}) == 17000.
+    for bad in ("nan", "inf", float("nan"), float("inf"), -1., 0, True, "17000", 16000., None):
+        with pytest.raises(ValueError, match="recorded energy"):
+            calibration_recorded_energy_eV({**record, "source_energy_eV": bad})
+    with pytest.raises(ValueError, match="recorded energy"):
+        calibration_recorded_energy_eV({"wavelength": "7e-11", "source_energy_eV": 17000.})

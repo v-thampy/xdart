@@ -3780,6 +3780,7 @@ def write_stitched(
     if type(legacy_v1_unit_layout) is not bool:
         raise TypeError("legacy_v1_unit_layout must be an exact bool")
     neutral_axes = _uses_neutral_stitch_axes(entry_grp, bounded_artifact=bounded_artifact)
+    # A native Stitch 1D result is an Int record (stitch_record), never written here.
     if result_projection is not None:
         from xrd_tools.io.analysis_artifact import (
             AnalysisArtifactKind,
@@ -5105,6 +5106,8 @@ def _read_data_group(
             # user-selected foreign file.  ``dtype.kind`` is metadata — no read.
             if getattr(obj.dtype, "kind", "O") not in "fiub":
                 continue
+            if obj.ndim != 1:
+                continue  # Metadata reads must not materialize detector stacks.
             try:
                 arr = np.asarray(obj, dtype=float)
             except (TypeError, ValueError, OSError):

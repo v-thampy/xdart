@@ -170,6 +170,35 @@ class MaskState:
         return cls()
 
 @dataclass(frozen=True, slots=True)
+class DetectorImageState:
+    """A dark or flat-field file an experiment applies, by content digest."""
+
+    source_uri: str = ""
+    sha256: str = ""
+    shape: tuple[int, ...] = ()
+    status: FactStatus = FactStatus.ABSENT
+    #: Flat only: the cutoff below which flat pixels are masked (None = the default).
+    min_fraction: float | None = None
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", FactStatus(self.status))
+        for name in ("source_uri", "sha256"):
+            object.__setattr__(self, name, _text(getattr(self, name), name))
+        shape = tuple(self.shape)
+        if any(type(value) is not int or value <= 0 for value in shape):
+            raise ValueError("detector image shape entries must be positive integers")
+        object.__setattr__(self, "shape", shape)
+        fraction = self.min_fraction
+        if fraction is not None and (
+                type(fraction) is not float or not math.isfinite(fraction)
+                or not 0.0 <= fraction < 1.0):
+            raise ValueError("a flat cutoff must be a float from 0 to below 1")
+        if self.status is FactStatus.PRESENT and not (self.sha256 and self.source_uri):
+            raise ValueError("a present dark or flat field needs a file and a content digest")
+    @classmethod
+    def absent(cls) -> DetectorImageState:
+        return cls()
+
+@dataclass(frozen=True, slots=True)
 class CalibrationState:
     values: PoniValues | None = None
     detector_id: str = ""
@@ -180,6 +209,8 @@ class CalibrationState:
     mask: MaskState = field(default_factory=MaskState.absent)
     status: FactStatus = FactStatus.ABSENT
     parallax: bool | None = None
+    flat: DetectorImageState = field(default_factory=DetectorImageState.absent)
+    dark: DetectorImageState = field(default_factory=DetectorImageState.absent)
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", FactStatus(self.status))
         for name in ("detector_id", "value_fingerprint", "source_sha256", "source_uri"):
@@ -191,6 +222,9 @@ class CalibrationState:
             raise TypeError("values must be PoniValues or None")
         if not isinstance(self.mask, MaskState):
             raise TypeError("mask must be MaskState")
+        for name in ("flat", "dark"):
+            if not isinstance(getattr(self, name), DetectorImageState):
+                raise TypeError(f"{name} must be DetectorImageState")
         if (self.status is FactStatus.PRESENT) != (self.values is not None):
             raise ValueError("calibration status and PONI values disagree")
         sensor = self.detector_config.get("sensor")
@@ -397,6 +431,15 @@ class ExperimentState:
         }
         if calibration.parallax is not None:
             calibration_content["parallax"] = calibration.parallax
+        for name in ("flat", "dark"):
+            image = getattr(calibration, name)
+            if image.status is not FactStatus.ABSENT:
+                calibration_content[name] = {
+                    "source_uri": image.source_uri, "sha256": image.sha256,
+                    "shape": list(image.shape), "status": image.status.value,
+                    **({} if image.min_fraction is None
+                       else {"min_fraction": image.min_fraction}),
+                }
         return {
             "schema_version": self.schema_version,
             "calibration": calibration_content,
@@ -446,6 +489,11 @@ class ExperimentState:
         calibration["mask"] = MaskState(**dict(_mapping(
             calibration.get("mask"), "calibration mask"
         )))
+        for name in ("flat", "dark"):
+            if name in calibration:
+                calibration[name] = DetectorImageState(**dict(_mapping(
+                    calibration.get(name), f"calibration {name}"
+                )))
         geometry["incidence"] = IncidenceState(**dict(_mapping(
             geometry.get("incidence"), "geometry incidence"
         )))

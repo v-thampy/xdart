@@ -61,6 +61,8 @@ __all__ = [
     "is_readable_output_path",
     "artifact_family_from_source",
     "generated_artifact_family",
+    "automatic_artifact_family",
+    "scan_family",
     "GI_FAMILY_MARKER",
     "is_artifact_family",
     "resolve_finite_output_target",
@@ -212,6 +214,82 @@ def generated_artifact_family(scan_name: str, *, grazing_incidence: bool) -> str
     filename.  The result is not validated here; ask :func:`is_artifact_family`.
     """
     return f"{scan_name}{GI_FAMILY_MARKER}" if grazing_incidence else scan_name
+
+
+def scan_family(names) -> str:
+    """One output's automatic family from the Int scan names of its members (maintainer, 2026-09-29:
+    Stitch names its results as Int 1D/2D does, ``<scan>_stitch1d.nexus``). One member keeps its
+    name (``sample_scan14``); members sharing a stem list their numbers after it, consecutive ones as
+    a range (``sample_scan2-5_8``); other members are listed by name, joined by ``_``. The result is
+    not validated here; ask :func:`is_artifact_family`."""
+    names = tuple(dict.fromkeys(str(name) for name in names))
+    if not names:
+        raise ValueError("an output needs at least one member name")
+    if len(names) == 1:
+        return names[0]
+    entries = [_name_entry(name) for name in names]
+    head = entries[0][1]
+    if all(entry[1] == head and entry[2] is not None for entry in entries):
+        return head + _listed((entry[0], "", entry[2], entry[3][len(head):]) for entry in entries)
+    return _listed(entries)
+
+
+def _listed(entries):
+    """Members joined by ``_``; consecutive numbers under one head form a range.
+
+    ``entries`` are ``(order, head, number, text)``: SPEC scans 2,3,4,5,8 give
+    ``2-5_8`` and NeXus names a_0001..a_0003 give ``a_0001-0003``.
+    """
+    parts = []
+    for _order, head, number, text in sorted(set(entries)):
+        last = parts[-1] if parts else None
+        if number is not None and last and last[0] == head and last[1] == number - 1:
+            parts[-1] = (head, number, last[2], text[len(head):])
+        else:
+            parts.append((head, number, text, ""))
+    return "_".join(start + (f"-{end}" if end else "") for _head, _number, start, end in parts)
+
+
+def _scan_entry(scan):
+    # A first occurrence is the plain scan number; a later one (2.3) stands alone.
+    label = str(scan).removesuffix(".1")
+    number, _, occurrence = label.partition(".")
+    return ((int(number), int(occurrence or 1)), "" if not occurrence else label,
+            None if occurrence else int(number), label)
+
+
+def _name_entry(name):
+    match = re.fullmatch(r"(.*?)(\d+)", name)
+    return ((match[1], int(match[2])), match[1], int(match[2]), name) if match else ((name, -1), name, None, name)
+
+
+def automatic_artifact_family(members, project) -> str:
+    """The automatic family of one output from its ``(source path, scan or None)`` members.
+
+    One source is ``<path parts>-<scan>`` (``data-sample-14``). An output that
+    combines scans of one SPEC file lists them after the file, sorted, consecutive
+    scans as a range and the rest joined by ``_`` (``[2-5,8]`` gives
+    ``data-sample-2-5_8``); other combinations list their sources' names the same
+    way. Only ``-`` and ``_`` are added (the POSIX portable filename characters).
+    Nothing is truncated or hashed: ask :func:`is_artifact_family` of the result,
+    and require an explicit family when it fails (see the slot policy).
+    """
+    project = Path(project).resolve()
+
+    def source(path, scan):
+        relative = Path(path).resolve().relative_to(project)
+        # Keep source suffixes meaningful to identity: SPEC may have a suffix.
+        return "-".join((relative if scan is not None else relative.with_suffix("")).parts)
+
+    def single(path, scan):
+        return source(path, scan) + ("" if scan is None else "-" + str(scan).removesuffix(".1"))
+
+    members = tuple(dict.fromkeys((str(Path(path).resolve()), scan) for path, scan in members))
+    if len(members) == 1:
+        return single(*members[0])
+    if len({path for path, _scan in members}) == 1 and all(scan is not None for _path, scan in members):
+        return source(*members[0]) + "-" + _listed(_scan_entry(scan) for _path, scan in members)
+    return _listed(_name_entry(single(path, scan)) for path, scan in members)
 
 
 def artifact_family_from_source(

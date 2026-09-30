@@ -32,6 +32,8 @@ from xrd_tools.io.analysis_artifact import (
     ANALYSIS_SCHEMA_VERSION_V3,
     ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
     ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
+    ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE,
+    ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE,
     AnalysisArtifactCleanupPending,
     AnalysisArtifactInvalid,
     AnalysisArtifactKind,
@@ -58,6 +60,7 @@ _MODULE_SOURCE_FACTORY = object()
 _MODULE_SOURCE_GROUP_FACTORY = object()
 _MODULE_RECEIPT_FACTORY = object()
 _XU_STITCH_REQUEST_FACTORY = object()
+_NATIVE_STITCH_REQUEST_FACTORY = object()
 _RSM_V2_REQUEST_FACTORY = object()
 _MAX_RSM_GROUP_MEMBERS = 16
 _MAX_RSM_GROUP_FRAMES = 4096
@@ -272,7 +275,7 @@ class ModuleSourceReceipt:
 
 @dataclass(eq=False, frozen=True, slots=True)
 class ModuleSourceGroupReceipt:
-    """Ordered exact RSM source receipts for one grouped transaction."""
+    """Ordered exact source receipts for one grouped RSM or Stitch transaction."""
 
     kind: ModuleKind
     members: tuple[ModuleSourceReceipt, ...]
@@ -283,10 +286,10 @@ class ModuleSourceGroupReceipt:
         members = _exact_tuple(self.members, "module source group members")
         if (
             _claim is not _MODULE_SOURCE_GROUP_FACTORY
-            or self.kind is not ModuleKind.RSM
-            or not 1 <= len(members) <= _MAX_RSM_GROUP_MEMBERS
+            or self.kind not in {ModuleKind.RSM, ModuleKind.STITCH}
+            or not 1 <= len(members) <= (256 if self.kind is ModuleKind.STITCH else _MAX_RSM_GROUP_MEMBERS)
             or any(type(member) is not ModuleSourceReceipt for member in members)
-            or any(member.kind is not ModuleKind.RSM for member in members)
+            or any(member.kind is not self.kind for member in members)
             or len({member.fingerprint for member in members}) != len(members)
         ):
             raise TypeError("module source group receipt is invalid")
@@ -305,12 +308,23 @@ class ModuleSourceGroupReceipt:
     def selected_frame_count(self) -> int:
         return sum(len(member.selected_labels) for member in self.members)
 
+    @property
+    def selected_labels(self) -> tuple[int, ...]:
+        return tuple(range(self.selected_frame_count))
+
+    @property
+    def table_fingerprint(self) -> str:
+        return analysis_canonical_fingerprint(
+            "group-metadata-tables-v1", tuple(member.table_fingerprint for member in self.members),
+        )
+
     @classmethod
     def from_members(
         cls,
         members: tuple[ModuleSourceReceipt, ...],
+        *, kind: ModuleKind = ModuleKind.RSM,
     ) -> "ModuleSourceGroupReceipt":
-        return cls(ModuleKind.RSM, members, _MODULE_SOURCE_GROUP_FACTORY)
+        return cls(kind, members, _MODULE_SOURCE_GROUP_FACTORY)
 
     def __copy__(self):
         raise TypeError("module source group receipt is not copyable")
@@ -335,6 +349,7 @@ class ModuleOutputRequest:
     target: str | Path
     kind: AnalysisArtifactKind
     overwrite: AnalysisArtifactOverwrite = AnalysisArtifactOverwrite.CREATE_NEW
+    artifact_family: str | None = None
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -351,13 +366,22 @@ class ModuleOutputRequest:
             raise TypeError("module output target must be path-like") from error
         if Path(target).suffix.casefold() != ".nexus":
             raise ValueError("module output target must end in .nexus")
+        if self.artifact_family is not None:
+            from xrd_tools.io.output_path import resolve_finite_output_target
+            token = {AnalysisArtifactKind.STITCH_1D: "stitch-1d",
+                     AnalysisArtifactKind.STITCH_2D: "stitch-2d"}.get(self.kind)
+            if token is None or str(resolve_finite_output_target(
+                Path(target).parent, self.artifact_family, operation_token=token,
+            )) != target:
+                raise ValueError("module output family does not match its stable slot")
         object.__setattr__(self, "target", target)
         object.__setattr__(
             self,
             "fingerprint",
             analysis_canonical_fingerprint(
                 "module-output-v1",
-                (target, self.kind, self.overwrite),
+                (target, self.kind, self.overwrite) if self.artifact_family is None
+                else (target, self.kind, self.overwrite, self.artifact_family),
             ),
         )
 
@@ -393,6 +417,8 @@ class ModuleOperationRequest:
     fingerprint: str = field(init=False)
     _xu_stitch_claim: InitVar[object] = None
     _rsm_v2_owner: InitVar[object] = None
+    _native_stitch_owner: InitVar[object] = None
+    _native_stitch_intent_owner: object = field(init=False, default=None, repr=False)
     _xu_stitch_v2_bound: bool = field(init=False, default=False, repr=False)
     _rsm_v2_bound: bool = field(init=False, default=False, repr=False)
     _rsm_v2_intent_owner: object = field(
@@ -405,11 +431,18 @@ class ModuleOperationRequest:
         self,
         _xu_stitch_claim: object,
         _rsm_v2_owner: object,
+        _native_stitch_owner: object,
     ) -> None:
         single_source = type(self.source) is ModuleSourceReceipt
         group_source = type(self.source) is ModuleSourceGroupReceipt
         xu_bound = _xu_stitch_claim is _XU_STITCH_REQUEST_FACTORY
         rsm_v2_bound = _xu_stitch_claim is _RSM_V2_REQUEST_FACTORY
+        native_bound = _xu_stitch_claim is _NATIVE_STITCH_REQUEST_FACTORY
+        if _native_stitch_owner is not None:
+            if (not (xu_bound or native_bound) or rsm_v2_bound
+                    or type(_native_stitch_owner) is not tuple or len(_native_stitch_owner) != 3):
+                raise TypeError("native Stitch requires factory-owned intent")
+            object.__setattr__(self, "_native_stitch_intent_owner", _native_stitch_owner)
         if type(self.output) is not ModuleOutputRequest:
             raise TypeError("module request requires exact source and output values")
         if xu_bound and rsm_v2_bound:
@@ -417,7 +450,7 @@ class ModuleOperationRequest:
         if rsm_v2_bound:
             if not group_source:
                 raise TypeError("RSM v2 request requires an exact source group")
-        elif not single_source:
+        elif not single_source and not (group_source and self.source.kind is ModuleKind.STITCH):
             raise TypeError("module request requires one exact source receipt")
         _require_sha256(self.plan_fingerprint, "plan fingerprint")
         _require_sha256(self.provenance_digest, "provenance digest")
@@ -440,7 +473,7 @@ class ModuleOperationRequest:
             raise ValueError(
                 "standalone module output must create one new immutable artifact"
             )
-        if xu_bound and (
+        if (xu_bound or native_bound) and (
             self.source.kind is not ModuleKind.STITCH
             or self.output.kind is not AnalysisArtifactKind.STITCH_1D
         ):
@@ -475,6 +508,14 @@ class ModuleOperationRequest:
                     self.provenance_digest,
                 )
                 if rsm_v2_bound
+                else (
+                    "native-stitch-bound-v1",
+                    self.source.fingerprint,
+                    self.output.fingerprint,
+                    self.plan_fingerprint,
+                    self.provenance_digest,
+                )
+                if _native_stitch_owner is not None
                 else (
                     "xu-stitch-v2-bound",
                     self.source.fingerprint,
@@ -533,6 +574,31 @@ def xu_stitch_module_request(
         provenance_digest,
         _XU_STITCH_REQUEST_FACTORY,
     )
+
+
+def _native_stitch_module_request(source, output, plan, manifest, provenance):
+    """Bind native schema choice to the exact prepared operation owners."""
+    return ModuleOperationRequest(source, output, plan.fingerprint,
+        module_provenance_digest(ModuleKind.STITCH, provenance),
+        _XU_STITCH_REQUEST_FACTORY if plan.backend == "xu_hist" else _NATIVE_STITCH_REQUEST_FACTORY,
+        _native_stitch_owner=(plan, manifest, canonical_analysis_provenance(provenance)))
+
+
+def _validate_native_stitch_intent(request, provenance):
+    from xrd_tools.analysis.stitch_operation import StitchOperationPlan, XuStitchOperationPlan
+    owner = request._native_stitch_intent_owner
+    if type(owner) is not tuple or len(owner) != 3:
+        raise ModuleArtifactRefused("NATIVE_STITCH_INTENT_MISMATCH")
+    plan, manifest, frozen = owner
+    if (type(plan) not in {StitchOperationPlan, XuStitchOperationPlan}
+            or plan.native_records is not True or plan.mode != "1d"
+            or plan.fingerprint != request.plan_fingerprint
+            or manifest.module_source_fingerprint != request.source.fingerprint
+            or request.output.artifact_family is None
+            or provenance.get("output", {}).get("artifact_family") != request.output.artifact_family
+            or canonical_analysis_provenance(provenance) != frozen
+            or module_provenance_digest(ModuleKind.STITCH, provenance) != request.provenance_digest):
+        raise ModuleArtifactRefused("NATIVE_STITCH_INTENT_MISMATCH")
 
 
 def _rsm_v2_module_request(
@@ -597,9 +663,12 @@ def _validate_xu_stitch_v2_intent(
     runtime = provenance.get("runtime_requirements")
     output = provenance.get("output")
     holds = provenance.get("holds")
+    native = request._native_stitch_intent_owner is not None
+    if native:
+        _validate_native_stitch_intent(request, provenance)
     if (
         request._xu_stitch_v2_bound is not True
-        or set(provenance) != _XU_INTENT_TOP_KEYS
+        or set(provenance) != _XU_INTENT_TOP_KEYS | ({"frame_members", "wavelength_A", "source_energy_checks"} if native else set())
         or provenance.get("schema_version")
         != "stitch-operation-v2-xu-intent"
         or provenance.get("kind") != "stitch"
@@ -614,7 +683,7 @@ def _validate_xu_stitch_v2_intent(
             "input_manifest",
         }
         or source.get("source_fingerprint")
-        != request.source.analysis.source_fingerprint
+        != request.artifact_source_fingerprint
         or source.get("module_source_fingerprint")
         != request.source.fingerprint
         or source.get("metadata_table_fingerprint")
@@ -647,7 +716,7 @@ def _validate_xu_stitch_v2_intent(
         or type(corrections) is not dict
         or not corrections
         or type(plan) is not dict
-        or set(plan)
+        or set(plan) - {"frame_screen", "corrections", "gi"}
         != {
             "backend",
             "mode",
@@ -661,10 +730,14 @@ def _validate_xu_stitch_v2_intent(
             "asset_receipt_fingerprint",
             "effective_geometry_fingerprint",
             "plan_fingerprint",
-        }
+        } | ({"native_records", "conditioning", "mask"} if native else set())
+        or ("frame_screen" in plan and type(plan["frame_screen"]) is not dict)
+        or ("gi" in plan and (not native or type(plan["gi"]) is not dict))
+        or ("corrections" in plan and (type(plan["corrections"]) is not dict
+                                       or set(plan["corrections"]) != {"polarization_factor", "dark", "flat"}))
         or plan.get("backend") != "xu_hist"
         or plan.get("mode") != "1d"
-        or plan.get("unit") != "q_A^-1"
+        or plan.get("unit") not in ({"q_A^-1", "2th_deg"} if native else {"q_A^-1"})
         or plan.get("method") != "numpy_histogram_center_v1"
         or plan.get("use_detector_mask") is not True
         or plan.get("plan_fingerprint") != request.plan_fingerprint
@@ -683,6 +756,7 @@ def _validate_xu_stitch_v2_intent(
             "kind": request.output.kind.value,
             "overwrite": request.output.overwrite.value,
             "output_fingerprint": request.output.fingerprint,
+            **({"artifact_family": request.output.artifact_family} if native else {}),
         }
         or type(holds) is not list
         or not holds
@@ -1019,6 +1093,14 @@ def module_artifact_request(
         raise TypeError("artifact binding requires exact ModuleOperationRequest")
     if type(provenance) is not dict:
         raise TypeError("module provenance must be an exact dictionary")
+    native = request._native_stitch_intent_owner is not None
+    if native:
+        _validate_native_stitch_intent(request, provenance)
+        if request._xu_stitch_v2_bound:
+            _validate_xu_stitch_v2_intent(request, provenance)
+    elif (isinstance(provenance.get("plan"), Mapping)
+          and provenance["plan"].get("native_records") is True) or "frame_members" in provenance:
+        raise ModuleArtifactRefused("NATIVE_STITCH_INTENT_MISMATCH")
     if not request._rsm_v2_bound and rsm_mask_receipts is not None:
         raise TypeError("only an RSM v2 request may carry mask receipts")
     carries_attestation = (
@@ -1174,10 +1256,13 @@ def module_artifact_request(
                     "EXECUTION_ATTESTATION_COUNT_MISMATCH"
                 )
     if request.kind is ModuleKind.STITCH:
-        schema_version = (
+        schema_version = ((
+            ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE if carries_attestation
+            else ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE
+        ) if native else (
             ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL
             if carries_attestation else ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL
-        )
+        ))
     elif rsm_uses_cartesian_q:
         schema_version = ANALYSIS_SCHEMA_VERSION_V3
     else:

@@ -607,6 +607,12 @@ class ReductionPlan:
     # precedence; only static masks determine integration geometry.
     mask_saturation: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
+    #: Flat field applied in pyFAI's normalization; unusable pixels are NaN
+    #: (see ``prepare_flatfield``), which pyFAI masks.
+    flat: np.ndarray | None = field(default=None, repr=False, compare=False)
+    #: Dark current pyFAI subtracts before integration; unusable pixels are NaN
+    #: (see ``prepare_dark``), which pyFAI masks.
+    dark: np.ndarray | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.integration_1d is None and self.integration_2d is None:
@@ -615,6 +621,15 @@ class ReductionPlan:
             )
         if self.threshold_min is not None or self.threshold_max is not None:
             self.mask_saturation = False
+        for name in ("flat", "dark"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            value = np.asarray(value)
+            if value.ndim != 2:
+                raise ValueError(f"ReductionPlan.{name} must be a 2-D array.")
+            # pyFAI's compiled kernels refuse a read-only buffer; copy once here.
+            setattr(self, name, value if value.flags.writeable else value.copy())
 
 
 @dataclass(frozen=True, slots=True)
@@ -2708,12 +2723,20 @@ class NexusSink:
             return None, False
         raw = np.asarray(frame.image)
         if corrected_image is None:
-            background = frame.background
+            # The worker skips the corrected copy for this sink, so apply the
+            # plan's flat and dark here as the reduction does.
+            plan = self._plan
+            background = (frame.background if plan is None
+                          else _dark_corrected_background(frame, plan))
             if background is not None:
                 bg = np.asarray(background)
                 if bg.shape != () and bg.shape != raw.shape:
                     background = None
-            image = _thumbnail_corrected_image(raw, background)
+            image = _thumbnail_corrected_image(
+                raw, background,
+                None if plan is None else plan.flat,
+                None if plan is None else plan.dark,
+            )
             owns_image = True
         else:
             image = np.asarray(corrected_image, dtype=np.float32)
@@ -2872,6 +2895,8 @@ class NexusSink:
             detector_calibration=(scan.extra or {}).get("detector_calibration"),
             global_mask=(scan.extra or {}).get("global_mask"),
             detector_shape=(scan.extra or {}).get("detector_shape"),
+            flatfield=(scan.extra or {}).get("flatfield"),
+            darkcurrent=(scan.extra or {}).get("darkcurrent"),
             stitched_1d=(scan.extra or {}).get("stitched_1d"),
             stitched_2d=(scan.extra or {}).get("stitched_2d"),
             stitched_provenance=(scan.extra or {}).get("stitched_provenance"),
@@ -5458,6 +5483,8 @@ def _wait_pending_futures(pending: list[tuple[Frame, Any]], *, worker: Any | Non
             pass
 
 
+#: Env-gated diagnostic: log which 1-D producer ran and whether it returned sigma.
+_DEBUG_UNCERTAINTY = os.environ.get("XDART_DEBUG_UNCERTAINTY") == "1"
 _FLOAT32_CSR_ERROR_MODELS = frozenset((None, "no", "poisson", "azimuthal", "hybrid"))
 _FLOAT32_CSR_EXTRAS = frozenset(("correctSolidAngle", "dummy", "delta_dummy", "safe"))
 
@@ -5575,6 +5602,8 @@ def _can_use_owned_float32_csr(
         and raw_image.flags.c_contiguous
         and plan.gi is None
         and background is None
+        and plan.flat is None
+        and plan.dark is None
         and integrator_input_safe is True
         and bool(enabled)
         and not (
@@ -5583,6 +5612,39 @@ def _can_use_owned_float32_csr(
         )
         and all(_float32_csr_options_are_safe(item) for item in enabled)
     )
+
+
+def standard_chi_profile(plan: ReductionPlan) -> bool:
+    """Whether the 1-D output is the standard (non-GI) χ profile.
+
+    pyFAI integrates that profile without variance, so it carries no sigma
+    even when an error model is set.
+    """
+    p1 = plan.integration_1d
+    return plan.gi is None and p1 is not None and str(p1.unit or "").lower() == "chi_deg"
+
+
+def result_1d_has_sigma(plan: ReductionPlan) -> bool:
+    """Whether the 1-D result carries sigma.
+
+    Uncertainty is requested by an error model other than ``"no"`` or by an
+    explicit ``variance``. Only pyFAI's radial integration propagates it: the
+    standard q/2θ profile and the grazing-incidence total-q profile over the full
+    χ range. The χ profile, a total-q χ wedge (``integrate1d_polar``) and the
+    other grazing-incidence profiles return none. The dispatch uses the same
+    predicates, and a test pins this rule to every producer's actual output.
+    """
+    p1 = plan.integration_1d
+    if p1 is None:
+        return False
+    model = p1.error_model
+    if (model is None or str(model).strip().lower() == "no") and "variance" not in p1.extra:
+        return False
+    if plan.gi is None:
+        return not standard_chi_profile(plan)
+    from xrd_tools.integrate.gid import gi_total_q_uses_radial
+
+    return plan.gi.mode_1d is GI1DMode.Q_TOTAL and gi_total_q_uses_radial(p1.azimuth_range)
 
 
 def _reduce_frame(
@@ -5622,8 +5684,9 @@ def _reduce_frame(
     if image.ndim != 2:
         raise ValueError(f"Frame {frame.index} image must be 2D; got shape {image.shape}")
     _validate_frame_inputs(frame, image.shape, frame_masks)
+    background = _dark_corrected_background(frame, plan)
     corrected_image = (
-        _thumbnail_corrected_image(raw_image_arr, frame.background)
+        _thumbnail_corrected_image(raw_image_arr, background, plan.flat, plan.dark)
         if include_corrected_image
         else None
     )
@@ -5640,9 +5703,14 @@ def _reduce_frame(
         # Keep the native dtype for detection and the static geometric mask for
         # integration axes/cache reuse; a recovered pixel is valid next frame.
         image[value_mask] = np.nan
+    variance = None
     if not use_float32_csr:
         image = _apply_thresholds_owned(image, plan)
-        image = _subtract_background(image, frame.background)
+        variance = _poisson_variance(image, frame, plan)
+        image = _subtract_background(image, background)
+    # Poisson plans with a dark or background integrate with an explicit variance.
+    p1_frame = _with_variance(plan.integration_1d, variance)
+    p2_frame = _with_variance(plan.integration_2d, variance)
     plan_mask = _cached_mask_for_shape(
         plan.mask,
         image.shape,
@@ -5666,12 +5734,14 @@ def _reduce_frame(
             _run_gi_1d(
                 image,
                 fi,
-                plan.integration_1d,
+                p1_frame,
                 plan.gi,
                 mask=mask,
                 incident_angle=incident_angle,
                 normalization_factor=_normalization_for(
                     frame, plan.integration_1d, warned_monitor_keys, strict=strict),
+                flat=plan.flat,
+                dark=plan.dark,
             )
             if plan.integration_1d is not None else None
         )
@@ -5679,12 +5749,14 @@ def _reduce_frame(
             _run_gi_2d(
                 image,
                 fi,
-                plan.integration_2d,
+                p2_frame,
                 plan.gi,
                 mask=mask,
                 incident_angle=incident_angle,
                 normalization_factor=_normalization_for(
                     frame, plan.integration_2d, warned_monitor_keys, strict=strict),
+                flat=plan.flat,
+                dark=plan.dark,
             )
             if plan.integration_2d is not None else None
         )
@@ -5701,10 +5773,12 @@ def _reduce_frame(
                 incident_angle=incident_angle,
                 normalization_factor=_normalization_for(
                     frame, single.integration_2d, warned_monitor_keys, strict=strict),
+                flat=plan.flat,
+                dark=plan.dark,
             )
     else:
-        p1 = plan.integration_1d
-        chi_mode = p1 is not None and str(p1.unit or "").lower() == "chi_deg"
+        p1 = p1_frame
+        chi_mode = standard_chi_profile(plan)
         unsafe_dynamic_mask_cache = any(
             item is not None
             and "safe" in item.extra
@@ -5773,6 +5847,7 @@ def _reduce_frame(
                 polarization_factor=p1.polarization_factor,
                 normalization_factor=_normalization_for(
                     frame, p1, warned_monitor_keys, strict=strict),
+                **_detector_kwargs(plan),
                 **chi_extra,
             )
         else:
@@ -5791,6 +5866,7 @@ def _reduce_frame(
                     normalization_factor=_normalization_for(
                         frame, p1, warned_monitor_keys, strict=strict),
                     _detector_mask_is_bound=detector_mask_is_bound,
+                    **_detector_kwargs(plan),
                     **p1.extra,
                 )
                 if p1 is not None else None
@@ -5808,24 +5884,37 @@ def _reduce_frame(
             integrate_2d(
                 image,
                 ai,
-                npt_rad=plan.integration_2d.npt_rad,
-                npt_azim=plan.integration_2d.npt_azim,
-                unit=plan.integration_2d.unit,
-                method=plan.integration_2d.method,
+                npt_rad=p2_frame.npt_rad,
+                npt_azim=p2_frame.npt_azim,
+                unit=p2_frame.unit,
+                method=p2_frame.method,
                 mask=integration_mask,
-                radial_range=plan.integration_2d.radial_range,
-                azimuth_range=_integration_azimuth_range(plan.integration_2d),
-                error_model=plan.integration_2d.error_model,
-                polarization_factor=plan.integration_2d.polarization_factor,
+                radial_range=p2_frame.radial_range,
+                azimuth_range=_integration_azimuth_range(p2_frame),
+                error_model=p2_frame.error_model,
+                polarization_factor=p2_frame.polarization_factor,
                 normalization_factor=_normalization_for(
-                    frame, plan.integration_2d, warned_monitor_keys, strict=strict),
+                    frame, p2_frame, warned_monitor_keys, strict=strict),
                 _detector_mask_is_bound=detector_mask_is_bound,
-                **plan.integration_2d.extra,
+                **_detector_kwargs(plan),
+                **p2_frame.extra,
             )
             if plan.integration_2d is not None else None
         )
         if r2d is not None and plan.integration_2d.azimuth_offset:
             r2d.azimuthal = r2d.azimuthal + float(plan.integration_2d.azimuth_offset)
+
+    if _DEBUG_UNCERTAINTY and r1d is not None:
+        p1 = plan.integration_1d
+        logger.info("xdart-uncertainty %s", {
+            "frame": frame.index,
+            "gi_mode": None if plan.gi is None else plan.gi.mode_1d.value,
+            "gi_method": None if plan.gi is None else plan.gi.method,
+            "unit": str(p1.unit), "method": p1.method,
+            "azimuth_range": p1.azimuth_range is not None,
+            "error_model": p1.error_model, "variance": "variance" in p1.extra,
+            "sigma": r1d.sigma is not None,
+        })
 
     # D7 loud: a 2D integration with no usable data (all-dummy) would persist
     # nothing meaningful.  Under a loud policy RAISE (the streaming writer
@@ -5861,19 +5950,82 @@ def _reduce_frame(
     return reduction
 
 
+def _poisson_variance(image, frame, plan: ReductionPlan) -> np.ndarray | None:
+    """Poisson variance of raw − dark − background, for plans that ask for Poisson sigma.
+
+    pyFAI's Poisson model sees only the image it integrates and treats a dark as
+    noiseless. The variance of the difference is pyFAI's max(1, raw), plus the
+    dark's counts (the counting noise of a single-exposure dark; one averaged from
+    many exposures is overstated), plus the background's own (its variance factor
+    times the background). A dark-corrected background (see
+    ``_dark_corrected_background``) returns part of the dark, so the dark's
+    counts are weighted by (1 − scale)². A NaN dark pixel gives NaN, a pixel pyFAI
+    masks.
+    """
+    factor = getattr(frame, "background_variance_factor", None)
+    background = None if factor is None else frame.background
+    if (background is None and plan.dark is None) or not any(
+            item is not None and item.error_model == "poisson" and "variance" not in item.extra
+            for item in (plan.integration_1d, plan.integration_2d)):
+        return None
+    variance = np.maximum(image, 1.0)
+    if plan.dark is not None:
+        # raw − dark − scale·(background − dark) holds the dark with weight 1 − scale.
+        scale = (None if frame.background is None
+                 else getattr(frame, "background_scale", None))
+        weight = 1.0 if scale is None else (1.0 - float(scale)) ** 2
+        if weight:
+            variance += weight * np.clip(plan.dark, 0.0, None)
+    if background is not None:
+        variance += np.clip(np.asarray(factor) * np.asarray(background, dtype=float), 0.0, None)
+    return variance
+
+
+def _dark_corrected_background(frame, plan: ReductionPlan):
+    """The background as subtracted from the frame.
+
+    A background image taken with the same detector holds the dark too, and pyFAI
+    already subtracts the dark from the frame; so with a dark the frame loses
+    scale · (background − dark), where scale is the factor the background image
+    was multiplied by. A background without a recorded scale is taken as it is.
+    """
+    background = frame.background
+    scale = getattr(frame, "background_scale", None)
+    if background is None or plan.dark is None or scale is None:
+        return background
+    return np.asarray(background, dtype=float) - float(scale) * np.asarray(plan.dark, dtype=float)
+
+
+def _with_variance(item, variance):
+    """The integration with an explicit variance in place of its Poisson model."""
+    if variance is None or item is None or item.error_model != "poisson" or "variance" in item.extra:
+        return item
+    return replace(item, error_model=None, extra={**item.extra, "variance": variance})
+
+
+def _detector_kwargs(plan: ReductionPlan) -> dict[str, Any]:
+    """pyFAI's ``flat`` and ``dark`` keywords for those the plan carries."""
+    return {name: value for name, value in (("flat", plan.flat), ("dark", plan.dark))
+            if value is not None}
+
+
 def _thumbnail_corrected_image(
     raw_image: np.ndarray,
     background: np.ndarray | float | None,
+    flat: np.ndarray | None = None,
+    dark: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Return a float32 raw-minus-background image for transient thumbnails."""
+    """Return a float32 raw − dark − background image, flat-corrected, for thumbnails."""
     raw = np.asarray(raw_image)
     corrected = np.array(raw, dtype=np.float32, copy=True)
-    if background is None:
-        return corrected
-    bg = np.asarray(background, dtype=np.float32)
-    if bg.ndim == 0 and float(bg) == 0.0:
-        return corrected
-    np.subtract(corrected, bg, out=corrected)
+    if dark is not None:
+        np.subtract(corrected, np.asarray(dark, dtype=np.float32), out=corrected)
+    bg = None if background is None else np.asarray(background, dtype=np.float32)
+    if bg is not None and not (bg.ndim == 0 and float(bg) == 0.0):
+        np.subtract(corrected, bg, out=corrected)
+    if flat is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            np.divide(corrected, np.asarray(flat, dtype=np.float32), out=corrected)
     return corrected
 
 
@@ -6061,8 +6213,13 @@ def _run_gi_1d(
     mask: np.ndarray | None,
     incident_angle: float,
     normalization_factor: float | None,
+    flat: np.ndarray | None = None,
+    dark: np.ndarray | None = None,
 ) -> IntegrationResult1D:
     extra = _gi_plan_extra(plan, normalization_factor)
+    for name, value in (("flat", flat), ("dark", dark)):
+        if value is not None:
+            extra[name] = value
     npt_oop = extra.pop("npt_oop", gi.npt_oop if gi.npt_oop is not None else plan.npt)
     common = dict(
         npt=plan.npt,
@@ -6132,8 +6289,13 @@ def _run_gi_2d(
     mask: np.ndarray | None,
     incident_angle: float,
     normalization_factor: float | None,
+    flat: np.ndarray | None = None,
+    dark: np.ndarray | None = None,
 ) -> IntegrationResult2D:
     extra = _gi_plan_extra(plan, normalization_factor)
+    for name, value in (("flat", flat), ("dark", dark)):
+        if value is not None:
+            extra[name] = value
     # The qip/qoop output ranges ride in plan.extra as x_range/y_range; they
     # are only meaningful for the QIP_QOOP transform.  Pop them BEFORE
     # branching so they never leak into pyFAI's polar/exit-angle calls as

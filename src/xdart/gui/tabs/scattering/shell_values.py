@@ -507,6 +507,9 @@ class ScientificProjection:
     processing_mode: str = "Int 2D"
     measurement_mode: str = "Standard"
     gi_mode_1d: str = ""
+    #: Every 1-D GI mode the shown results carry (a stitched GI result: q_total and its cut); the
+    #: 1-D plot then offers all their axes. Empty: ``gi_mode_1d``'s alone.
+    gi_modes_1d: tuple[str, ...] = ()
     #: The GI mode of the 2-D map being SHOWN (the pane's choice among
     #: ``gi_maps``), which is what the cake-derived 1-D axes follow.
     gi_mode_2d: str = ""

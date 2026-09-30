@@ -135,6 +135,8 @@ def _resolve_background_before_submit(frame, plan: FrameBackgroundPlan, binding,
     if candidate is not None and capsule_owner is not None:
         capsule_owner.background_capsule = candidate
     frame.background = result.background
+    frame.background_variance_factor = result.variance_factor
+    frame.background_scale = result.scale
     frame.background_dependency_bytes, frame.background_dependency_fingerprint = pair
     return True
 
@@ -1455,6 +1457,20 @@ class StandardRunExecutor:
                     calibration, integrator=integrator,
                 )
                 run.scan.extra = extra
+            mask = None if assets is None else assets.mask
+            flat = None if assets is None else assets.flat
+            dark = None if assets is None else assets.dark
+            if mask is not None or flat is not None or dark is not None:
+                # Persist the applied mask, flat and dark: Reintegrate reuses only
+                # the output's own copies, never the source files.
+                extra = dict(getattr(run.scan, "extra", None) or {})
+                if mask is not None:
+                    extra["global_mask"] = np.flatnonzero(np.asarray(mask, dtype=bool))
+                if flat is not None:
+                    extra["flatfield"] = flat
+                if dark is not None:
+                    extra["darkcurrent"] = dark
+                run.scan.extra = extra
         except SourceRevisionChanged:
             discard_source()
             raise
@@ -1483,9 +1499,15 @@ class StandardRunExecutor:
             if item is not None
             else len(run.scan.frames)
         )
+        for key, name in (("flat", "flat field"), ("dark", "dark")):
+            if getattr(configuration, f"{key}_file", "") and (
+                    assets is None or getattr(assets, f"{key}_bytes") is None):
+                raise ValueError(f"the configured {name} was not admitted")
         plan = replace(
             native_int_reduction_plan(configuration, companion_modes_2d=True),
             mask=None if assets is None else assets.mask,
+            flat=None if assets is None else assets.flat,
+            dark=None if assets is None else assets.dark,
         )
         try:
             npt = int(configuration.bai_1d_args.get("npt", 0))

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 import numpy as np
@@ -17,6 +17,11 @@ from xrd_tools.core.energy import energy_eV_to_wavelength_m
 from xrd_tools.core.roi import RoiSpec, invalid_pixel_mask, roi_reduce
 from xrd_tools.core.scan import FrameSource, MaskSpec
 from xrd_tools.sources import ensure_frame_source
+from xrd_tools.integrate.stitch_conditioning import (
+    StitchConditioning,
+    condition_stitch_frame,
+    load_stitch_frame,
+)
 from xrd_tools.rsm.coordinate_frame import (
     RSMCoordinateFrame,
     rsm_coordinate_matrix,
@@ -84,6 +89,8 @@ class AnalysisResult:
     #: detached non-primary data for an operation-specific persistence layer
     #: (for Stitch, exact per-bin coverage and normalization weight).
     auxiliary: Any = field(default=None, repr=False, compare=False)
+    #: a GI Stitch's cuts beside the payload, each (IntegrationResult1D, StitchDiagnostics).
+    gi_cuts: tuple = field(default=(), repr=False, compare=False)
 
     def to_dict(self, *, include_payload: bool = True) -> dict[str, Any]:
         data = {
@@ -134,9 +141,10 @@ class StitchPlan:
     #: the streaming Σraw/Σnorm histogram), or "xu_hist" (xu q-provider; not built
     #: yet). Histogram backends require the geometry path (a Diffractometer).
     backend: str = "multigeometry"
-    #: per-pixel CorrectionStack for the histogram backends (solid-angle /
-    #: polarization …); None = unit weight. Ignored by the multigeometry backend
-    #: (which carries pyFAI's own correctSolidAngle + polarization_factor).
+    #: per-pixel CorrectionStack (solid-angle / polarization …). The histogram
+    #: backends weight by it (None = unit weight); the streaming multigeometry
+    #: backend passes its solid angle and polarization to pyFAI (None = solid
+    #: angle only) and refuses air absorption, which pyFAI does not apply.
     corrections: Any = None
     #: grazing-incidence settings (a GISettings: the GICorrectionStack +
     #: incident_angle_deg / sample_orientation / tilt). pyfai_hist backend only.
@@ -160,6 +168,19 @@ class StitchPlan:
     #: per-frame integration/accumulation equations while retaining one image.
     streaming_multigeometry: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
+    conditioning: StitchConditioning | None = None
+    #: streaming multigeometry only: pyFAI error model ("poisson" gives sigma),
+    #: and detector dark / flat images in the frames' orientation. pyFAI
+    #: subtracts the dark and applies the flat in the normalization; with a dark,
+    #: the Poisson variance is max(1, raw) + dark (the dark's counting noise).
+    error_model: str | None = None
+    dark: np.ndarray | None = field(default=None, repr=False, compare=False)
+    flat: np.ndarray | None = field(default=None, repr=False, compare=False)
+    #: Flat pixels below this fraction of the flat's median are masked as dead.
+    flat_min_fraction: float = 0.1
+    #: streaming multigeometry 1-D only: native GI (``integrate.stitch_gi.StitchGI``), its cuts
+    #: binned beside I(q) from the same frames; the result's ``gi_cuts``.
+    stitch_gi: Any = None
 
     def provenance(self) -> dict[str, Any]:
         """A JSON-safe record of this stitch for persistence (pass to
@@ -186,12 +207,18 @@ class StitchPlan:
             "monitor_key": self.monitor_key,
             "streaming_multigeometry": self.streaming_multigeometry,
             "corrections": _ser(self.corrections),
+            "error_model": self.error_model,
+            "dark": self.dark is not None,
+            "flat": self.flat is not None,
+            **_flat_cutoff_record(self),
             "gi": _gi_settings_provenance(
                 self.gi,
                 wavelength_m=_stitch_plan_wavelength_m(self),
             ),
         }
         diff = self.diffractometer
+        if self.conditioning is not None:
+            prov["conditioning"] = self.conditioning.to_dict()
         if diff is not None:
             prov["diffractometer"] = (getattr(diff, "preset", None)
                                       or getattr(diff, "convention", None))
@@ -240,9 +267,43 @@ class StitchPlan:
             azimuth_range=tuple(ar) if ar else None,
             monitor_key=prov.get("monitor_key"),
             streaming_multigeometry=streaming_multigeometry,
-            corrections=CorrectionStack.from_dict(corr) if corr else None,
+            conditioning=(StitchConditioning(**prov["conditioning"])
+                          if prov.get("conditioning") is not None else None),
+            # MultiGeometry records from before it applied its corrections (they
+            # carry no error_model) recorded a CorrectionStack it never applied.
+            corrections=(CorrectionStack.from_dict(corr) if corr and (
+                prov.get("backend", "multigeometry") != "multigeometry" or "error_model" in prov)
+                else None),
             gi=GISettings.from_dict(gi) if gi else None,
+            error_model=prov.get("error_model"),
+            flat_min_fraction=float(prov.get("flat_min_fraction", 0.1)),
         )
+
+
+def _flat_cutoff_record(plan: StitchPlan) -> dict[str, float]:
+    """The flat cutoff for a plan record: only with a flat and away from 10 %."""
+    if plan.flat is None or plan.flat_min_fraction == 0.1:
+        return {}
+    return {"flat_min_fraction": float(plan.flat_min_fraction)}
+
+
+def _multigeometry_corrections(plan: StitchPlan) -> dict[str, Any]:
+    """pyFAI MultiGeometry correction arguments for a streaming plan."""
+    stack = plan.corrections
+    if stack is not None and stack.air_absorption_mu is not None:
+        raise ValueError(
+            "air absorption is not a pyFAI MultiGeometry correction; use the "
+            "'pyfai_hist' backend")
+    if plan.error_model not in (None, "poisson"):
+        raise ValueError("the MultiGeometry stitch error model must be 'poisson' or absent")
+    return {
+        "correct_solid_angle": True if stack is None else bool(stack.solid_angle),
+        "polarization_factor": None if stack is None else stack.polarization_factor,
+        "error_model": plan.error_model,
+        "dark": plan.dark,
+        "flat": plan.flat,
+        "flat_min_fraction": plan.flat_min_fraction,
+    }
 
 
 def _harvest_frame_records(source, scan_labels, *, selected_labels=None):
@@ -392,8 +453,14 @@ def run_stitch(
     progress_callback: Callable[[int, int], None] | None = None,
     cancel_token: threading.Event | None = None,
     collect_frame_records: bool = True,
+    frame_record_callback: Callable[[int, np.ndarray], None] | None = None,
+    frame_screen: Any = None,
 ) -> AnalysisResult:
     """Run MultiGeometry stitching over one headless frame source or a GROUP.
+
+    ``frame_screen`` (a :class:`xrd_tools.integrate.frame_screen.FrameScreen`)
+    screens dropped frames during the streaming MultiGeometry merge; the eager
+    paths refuse it rather than ignore it.
 
     A group (a sequence of sources — a multi-scan stitch) is concatenated into one
     :class:`~xrd_tools.sources.composite.CompositeFrameSource` and merged as a
@@ -406,6 +473,8 @@ def run_stitch(
     image-load work plus one final scientific-completion step. The histogram
     backend reports both bounded-memory passes when it must scout an omitted
     radial/azimuthal range.
+    ``frame_record_callback`` borrows each loaded raw array before conditioning;
+    callers must detach thumbnails and must not retain the full frame.
     """
 
     if progress_callback is not None and not callable(progress_callback):
@@ -414,10 +483,29 @@ def run_stitch(
         raise TypeError("stitch cancellation token must be an exact threading.Event")
     if type(collect_frame_records) is not bool:
         raise TypeError("collect_frame_records must be an exact bool")
+    if frame_record_callback is not None and not callable(frame_record_callback):
+        raise TypeError("stitch frame-record callback must be callable")
+    if plan.conditioning is not None and type(plan.conditioning) is not StitchConditioning:
+        raise TypeError("conditioning must be exact StitchConditioning or absent")
     if type(plan.streaming_multigeometry) is not bool:
         raise TypeError("streaming_multigeometry must be an exact bool")
     if plan.streaming_multigeometry and plan.backend != "multigeometry":
         raise ValueError("streaming_multigeometry requires the multigeometry backend")
+    if frame_screen is not None and not (
+            plan.streaming_multigeometry and plan.backend == "multigeometry"):
+        raise ValueError("frame screening needs the streaming MultiGeometry stitch")
+    streaming_corrections = (plan.error_model, plan.dark, plan.flat)
+    if plan.backend == "multigeometry" and not plan.streaming_multigeometry and (
+            plan.corrections is not None
+            or any(value is not None for value in streaming_corrections)):
+        raise ValueError(
+            "MultiGeometry corrections, error model, dark and flat need the "
+            "streaming MultiGeometry stitch")
+    if plan.backend != "multigeometry" and any(
+            value is not None for value in streaming_corrections):
+        raise ValueError(
+            "the stitch error model, dark and flat apply only to the "
+            "streaming MultiGeometry backend")
     _stitch_cancelled(cancel_token)
 
     # A group (sequence of sources) → one CompositeFrameSource; a single source
@@ -447,15 +535,9 @@ def run_stitch(
     progress_total = len(labels) * image_passes + 1
     progress_done = 0
     _stitch_progress(progress_callback, 0, progress_total)
-    # The multigeometry backend uses pyFAI's OWN correctSolidAngle/polarization,
-    # NOT the shared CorrectionStack/GISettings — surface the silent drop so a
-    # caller (and the GUI) doesn't believe it applied the shared pre-weight.
-    if plan.backend == "multigeometry" and (
-            plan.corrections is not None or plan.gi is not None):
-        logger.warning(
-            "StitchPlan.corrections/gi are IGNORED by the 'multigeometry' backend "
-            "(it uses pyFAI's own correctSolidAngle/polarization). Use the "
-            "'pyfai_hist' backend to apply the shared CorrectionStack/GI weight.")
+    corrections = (_multigeometry_corrections(plan)
+                   if plan.backend == "multigeometry" and plan.streaming_multigeometry
+                   else {})
     base_poni = plan.base_poni or getattr(src, "poni", None)
     # base_poni is required UNLESS a calibrated Diffractometer supplies the base
     # geometry itself (its DetectorCalibration carries dist/poni/Detector_config).
@@ -465,11 +547,19 @@ def run_stitch(
             "StitchPlan.base_poni or source.poni is required (or a Diffractometer "
             "carrying a DetectorCalibration)")
 
+    recorded_labels = set()
+
     def _iter_images():
         nonlocal progress_done
         for label in labels:
             _stitch_cancelled(cancel_token)
-            image = np.asarray(src.load_frame(label), dtype=float)
+            raw = load_stitch_frame(src, label, plan.conditioning)
+            if frame_record_callback is not None and label not in recorded_labels:
+                frame_record_callback(label, raw)
+                recorded_labels.add(label)
+            image = (np.asarray(raw, dtype=float) if plan.conditioning is None
+                     else condition_stitch_frame(raw, plan.conditioning))
+            raw = None
             _stitch_cancelled(cancel_token)
             yield image
             _stitch_cancelled(cancel_token)
@@ -518,8 +608,11 @@ def run_stitch(
             f"grouped/composite source is NaN-padding a member that lacks this "
             f"monitor. Every member of a multi-source stitch must provide it.")
 
-    auxiliary = None
+    auxiliary, gi_cuts = None, ()
     diffractometer = plan.diffractometer or getattr(src, "diffractometer", None)
+    if plan.stitch_gi is not None and (diffractometer is None or not plan.streaming_multigeometry
+                                    or plan.mode != "1d"):
+        raise ValueError("a GI cut needs the streaming 1-D Stitch with a Diffractometer")
     if diffractometer is not None:
         # GAP-A path: per-frame rotations from the calibrated Diffractometer.
         from xrd_tools.integrate.multi import (  # noqa: PLC0415
@@ -647,6 +740,7 @@ def run_stitch(
                 radial_range=plan.radial_range,
                 azimuth_range=plan.azimuth_range,
                 mask=plan.mask, normalization=normalization,
+                frame_screen=frame_screen, **corrections,
             )
         elif plan.mode == "2d":
             assert integrators is not None
@@ -658,11 +752,18 @@ def run_stitch(
                 mask=plan.mask, normalization=normalization, **extra)
             auxiliary = None
         elif plan.streaming_multigeometry:
-            payload, auxiliary = stitch_1d_streaming(
+            gi_angles = None
+            if plan.stitch_gi is not None:  # every frame's pyFAI incidence and tilt, from psic's circles
+                gi = plan.stitch_gi
+                series = {name: _metadata_series(src, labels, name) for name in gi.metadata_names()}
+                gi_angles = [gi.pyfai_angles(gi.normal({name: values[i] for name, values in series.items()}))
+                             for i in range(len(labels))]
+            payload, auxiliary, gi_cuts = stitch_1d_streaming(
                 _iter_images(), len(labels), integrator_series.__iter__,
                 npt=plan.npt_1d, unit=plan.unit, method=plan.method,
                 radial_range=plan.radial_range,
                 mask=plan.mask, normalization=normalization,
+                frame_screen=frame_screen, gi=plan.stitch_gi, gi_angles=gi_angles, **corrections,
             )
         else:
             assert integrators is not None
@@ -700,7 +801,7 @@ def run_stitch(
                 rot2_angles=rot2,
             )
             if plan.mode == "1d":
-                payload, auxiliary = stitch_1d_streaming(
+                payload, auxiliary, _gi = stitch_1d_streaming(
                     _iter_images(),
                     len(labels),
                     integrator_series.__iter__,
@@ -710,6 +811,8 @@ def run_stitch(
                     radial_range=plan.radial_range,
                     mask=plan.mask,
                     normalization=normalization,
+                    frame_screen=frame_screen,
+                    **corrections,
                 )
             elif plan.mode == "2d":
                 payload, auxiliary = stitch_2d_streaming(
@@ -724,6 +827,8 @@ def run_stitch(
                     azimuth_range=plan.azimuth_range,
                     mask=plan.mask,
                     normalization=normalization,
+                    frame_screen=frame_screen,
+                    **corrections,
                 )
             else:
                 raise ValueError(f"mode must be '1d' or '2d', got {plan.mode!r}")
@@ -754,7 +859,13 @@ def run_stitch(
         payload=payload,
         provenance={
             "plan": {
-                **_plan_dict(plan),
+                # Dark and flat are detector images: record their presence only.
+                **{key: value for key, value in
+                   _plan_dict(replace(plan, dark=None, flat=None)).items()
+                   if key != "flat_min_fraction"},
+                "dark": plan.dark is not None,
+                "flat": plan.flat is not None,
+                **_flat_cutoff_record(plan),
                 "gi": _gi_settings_provenance(
                     plan.gi,
                     wavelength_m=_stitch_plan_wavelength_m(plan, src),
@@ -775,6 +886,7 @@ def run_stitch(
             else None
         ),
         auxiliary=auxiliary,
+        gi_cuts=gi_cuts,
     )
 
 

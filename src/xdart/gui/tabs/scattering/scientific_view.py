@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+from xdart.gui.widgets.scientific_plot import (
+    PlotCursorReadout,
+    scaled_intensity as _scaled_intensity,
+    scaled_intensity_label as _scaled_intensity_label,
+    overlay_step,
+    trace_colors,
+)
+
 from dataclasses import dataclass, replace
 import math
 import os
@@ -15,6 +23,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from xdart.modules.display_context import (
     Viewer2DRendererClearReceipt, Viewer2DRendererClearRequest,
 )
+from xdart.gui.gui_utils import RectViewBox
 from xdart.gui.themes import apply_seaborn_plot_style
 from xdart.gui.widgets.intensity_controls import IntensityControls
 from xrd_tools.session.display_logic import (
@@ -268,11 +277,16 @@ def _pixmap_pixel_count(pixmap) -> int:
 
 class ScientificView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
+    #: The plot-options dialog was accepted. Emitted after the view has read its own options
+    #: and before it emits their commands, so a host reads the rows it added
+    #: (``plot_options_dialog.add_row``) before any of its own redraws resets them.
+    plotOptionsAccepted = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("e3ScientificView")
         self.setMinimumWidth(300)
+        self._hidden_tools: frozenset[str] = frozenset()
         self._heavy_available: frozenset[DisplayFrameKey] = frozenset()
         self._frame_keys: tuple[DisplayFrameKey, ...] = ()
         self._current_key: DisplayFrameKey | None = None
@@ -368,7 +382,9 @@ class ScientificView(QtWidgets.QFrame):
         one_d = QtWidgets.QFrame()
         one_d_layout = QtWidgets.QVBoxLayout(one_d)
         one_d_layout.setContentsMargins(0, 0, 0, 0)
-        self.curve = pg.PlotWidget()
+        # as the 2-D views and the retired Static Scan page: left-drag draws a box to zoom into
+        # (pyqtgraph's default pans), middle-click shows all, right-click keeps pyqtgraph's menu
+        self.curve = pg.PlotWidget(viewBox=RectViewBox())
         self.curve.setObjectName("e3OneDPlot")
         apply_seaborn_plot_style(self.curve.getPlotItem(), grid=True)
         self.curve.getPlotItem().layout.setContentsMargins(
@@ -378,18 +394,9 @@ class ScientificView(QtWidgets.QFrame):
             ONE_D_PLOT_BOTTOM_MARGIN,
         )
         self.legend = self.curve.addLegend()
-        self.cursor_position = pg.LabelItem(justify="right")
-        self.cursor_position.setParentItem(self.curve.getPlotItem())
-        self.cursor_position.anchor(
-            itemPos=(1, 0),
-            parentPos=(1, 0),
-            offset=(-14, 8),
-        )
-        self._mouse_proxy = pg.SignalProxy(
-            signal=self.curve.scene().sigMouseMoved,
-            rateLimit=60,
-            slot=self._mouse_moved,
-        )
+        self._cursor_readout = PlotCursorReadout(self.curve)
+        self.cursor_position = self._cursor_readout.label
+        self._mouse_proxy = self._cursor_readout.proxy
         self.waterfall = ScientificImagePane(lock_aspect=False)
         self.waterfall.setObjectName("e4WaterfallPlot")
         self.bottom_stack = QtWidgets.QStackedWidget()
@@ -748,9 +755,7 @@ class ScientificView(QtWidgets.QFrame):
         self.slice_width = spin(0.0, 360.0, 10.0)
         self.pin = QtWidgets.QPushButton("Pin")
         self.plot_mode = ContentFitComboBox()
-        self.plot_mode.addItems(
-            ["Single", "Overlay", "Average", "Sum", "Waterfall"]
-        )
+        self.plot_mode.addItems(list(self._PLOT_MODES))
         self.options = _CompactMenuButton("Options")
         self.plot_options_dialog = PlotOptionsDialog(self)
         self.clear = QtWidgets.QPushButton("Clear")
@@ -854,6 +859,7 @@ class ScientificView(QtWidgets.QFrame):
     def _accept_plot_options(self) -> None:
         prior = self.plot_options_dialog.projection
         edited = self.plot_options_dialog.edited_options()
+        self.plotOptionsAccepted.emit()
         for field, path in zip(
             _PLOT_OPTION_FIELDS,
             PLOT_OPTION_COMMAND_PATHS,
@@ -2202,10 +2208,7 @@ class ScientificView(QtWidgets.QFrame):
             if prior_contract is not None:
                 self._curve_item_contracts[keys[0]] = prior_contract
 
-        colors = None
-        if color_map != "Default" and color_map in matplotlib_colormaps:
-            positions = [.65] if len(traces) == 1 else np.linspace(.15, .85, len(traces))
-            colors = matplotlib_colormaps[color_map](positions, bytes=True)
+        colors = trace_colors(color_map, len(traces))
         desired_items = []
         for index, (key, trace) in enumerate(
             zip(keys, traces, strict=True)
@@ -2218,11 +2221,7 @@ class ScientificView(QtWidgets.QFrame):
                 offset,
                 title,
             )
-            style_contract = (
-                _TRACE_COLORS[index % len(_TRACE_COLORS)]
-                if colors is None
-                else tuple(int(channel) for channel in colors[index])
-            )
+            style_contract = colors[index]
             item = self._curve_items_by_key.get(key)
             prior_contract = self._curve_item_contracts.get(key)
             clip_eligible = (
@@ -2634,23 +2633,7 @@ class ScientificView(QtWidgets.QFrame):
         return values, y_axis_choice
 
     def _mouse_moved(self, positions: object) -> None:
-        position = positions
-        if type(positions) is tuple:
-            if not positions:
-                return
-            position = positions[0]
-        if not isinstance(position, QtCore.QPointF):
-            return
-        plot = self.curve.getPlotItem()
-        if not plot.sceneBoundingRect().contains(position):
-            self.cursor_position.setText("")
-            self.curve.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
-            return
-        point = plot.vb.mapSceneToView(position)
-        self.cursor_position.setText(
-            f"x={point.x():.2f}, y={point.y():.2e}"
-        )
-        self.curve.setCursor(QtCore.Qt.CursorShape.CrossCursor)
+        self._cursor_readout.mouse_moved(positions)
 
     @staticmethod
     def _set_data_combo(combo: QtWidgets.QComboBox, value: str) -> None:
@@ -2692,7 +2675,9 @@ class ScientificView(QtWidgets.QFrame):
         native_key: str | None,
     ) -> tuple[tuple[str, str], ...]:
         if state.measurement_mode == "GI":
-            native_choices = _GI_PLOT_AXIS_CHOICES.get(
+            native_choices = self._merged_axis_choices(*(
+                _GI_PLOT_AXIS_CHOICES.get(mode, ()) for mode in state.gi_modes_1d
+            )) if state.gi_modes_1d else _GI_PLOT_AXIS_CHOICES.get(
                 state.gi_mode_1d,
                 _GI_PLOT_AXIS_CHOICES["q_total"],
             )
@@ -2829,7 +2814,42 @@ class ScientificView(QtWidgets.QFrame):
             self._reflow_follows = 0
             self._align_curve_under_cake()
 
+    #: Top-bar tools a host page may leave out, by name.
+    _HOST_TOOLS = {"norm": "norm", "background": "background", "raw": "raw_popup_button"}
+    _PLOT_MODES = ("Single", "Overlay", "Average", "Sum", "Waterfall")
+
+    def set_plot_modes(self, *names: str) -> None:
+        """Offer only the plot modes the host can show (Stitch: Single and Overlay); Int
+        offers all. Without Waterfall, the options dialog leaves out its Waterfall section."""
+        unknown = set(names) - set(self._PLOT_MODES)
+        if not names or unknown:
+            raise ValueError(f"unknown plot modes: {sorted(unknown) or 'none given'}")
+        current = self.plot_mode.currentText()
+        blocker = QtCore.QSignalBlocker(self.plot_mode)
+        self.plot_mode.clear()
+        self.plot_mode.addItems([mode for mode in self._PLOT_MODES if mode in names])
+        self.plot_mode.setCurrentIndex(max(0, self.plot_mode.findText(current)))
+        del blocker
+        self.plot_options_dialog.set_waterfall_visible("Waterfall" in names)
+
+    def set_hidden_tools(self, *names: str) -> None:
+        """Leave out top-bar tools the host page has no operation for (Stitch: no
+        normalization channel, 1-D Background or raw popup). Int shows them all."""
+        unknown = set(names) - set(self._HOST_TOOLS)
+        if unknown:
+            raise ValueError(f"unknown scientific-view tools: {sorted(unknown)}")
+        self._hidden_tools = frozenset(names)
+        self._apply_hidden_tools()
+
+    def _apply_hidden_tools(self) -> None:
+        for name in self._hidden_tools:
+            getattr(self, self._HOST_TOOLS[name]).setVisible(False)
+
     def _apply_processing_layout(self, mode: str) -> None:
+        self._apply_mode_layout(mode)
+        self._apply_hidden_tools()
+
+    def _apply_mode_layout(self, mode: str) -> None:
         normalized = str(mode or "")
         if (
             self._viewer_loading_mode is not None
@@ -3351,31 +3371,6 @@ class ScientificView(QtWidgets.QFrame):
         self.commandRequested.emit(ShellCommand(kind, value, path))
 
 
-def _scaled_intensity(values: np.ndarray, scale: str) -> np.ndarray:
-    if scale == "Linear":
-        return values
-    result = np.asarray(values, dtype=float).copy()
-    finite = result[np.isfinite(result)]
-    if not finite.size:
-        return result
-    if scale == "Log":
-        minimum = float(np.min(finite))
-        if minimum < 1.0:
-            result -= minimum - 1.0
-        return np.log10(result)
-    if scale == "Sqrt":
-        return np.sign(result) * np.sqrt(np.abs(result))
-    raise ValueError(f"unsupported intensity scale: {scale}")
-
-
-def _scaled_intensity_label(label: str, scale: str) -> str:
-    if scale == "Log":
-        return f"Log {label}"
-    if scale == "Sqrt":
-        return f"√{label}"
-    return label
-
-
 def _offset_intensity(
     values: np.ndarray,
     index: int,
@@ -3405,30 +3400,7 @@ def _overlay_step(
     traces,
     offset_percent: float,
 ) -> float:
-    minimum = np.inf
-    maximum = -np.inf
-    for trace in traces:
-        finite = trace.intensity[np.isfinite(trace.intensity)]
-        if finite.size:
-            minimum = min(minimum, float(np.min(finite)))
-            maximum = max(maximum, float(np.max(finite)))
-    if not np.isfinite(minimum) or not np.isfinite(maximum):
-        return 0.0
-    return float(offset_percent) * (maximum - minimum) / 100.0
-
-
-_TRACE_COLORS = (
-    (31, 119, 180),
-    (255, 127, 14),
-    (44, 160, 44),
-    (214, 39, 40),
-    (148, 103, 189),
-    (140, 86, 75),
-    (227, 119, 194),
-    (127, 127, 127),
-    (188, 189, 34),
-    (23, 190, 207),
-)
+    return overlay_step((trace.intensity for trace in traces), offset_percent)
 _MAX_RETAINED_CURVE_ITEMS = 32
 # Axis-re-flow-driven share-link follows allowed between real triggers: a
 # legitimate chain is two (the follow's own Y autorange may re-flow once).

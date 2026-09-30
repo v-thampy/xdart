@@ -773,6 +773,15 @@ def integrate_gi_exitangles(
                          azim_unit_fallback="exit_angle_vert_deg")
 
 
+def gi_total_q_uses_radial(azimuth_range) -> bool:
+    """Whether the total-q profile uses pyFAI's radial integration (full χ).
+
+    Only that path propagates an error model or explicit variance into sigma;
+    a χ wedge goes through ``integrate1d_polar``, which returns none.
+    """
+    return azimuth_range is None
+
+
 def integrate_gi_polar_1d(
     image: np.ndarray,
     fi: FiberIntegrator,
@@ -839,7 +848,7 @@ def integrate_gi_polar_1d(
     radial_unit = "A^-1" if "A^-1" in unit else "nm^-1"
 
     # --- fast path: full χ → standard 1D azimuthal integration --------------
-    if azimuth_range is None:
+    if gi_total_q_uses_radial(azimuth_range):
         # Strip kwargs only meaningful to fiber-specific methods so they
         # don't poison the standard integrate1d call.
         _fiber_only = {

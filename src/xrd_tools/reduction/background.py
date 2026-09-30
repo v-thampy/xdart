@@ -222,7 +222,7 @@ def run_display_background(
         (f"contributors={len(contributors)}", f"finite={int(counts.sum())}"))
 
 _FRAME_MODES = frozenset({"None", "Single BG File", "Series Average", "BG Directory"}); _NONCONTAINER_SUFFIXES = frozenset({".cbf", ".edf", ".img", ".mar3450", ".raw", ".tif", ".tiff"})
-_CONTAINER_SUFFIXES = frozenset({".h5", ".hdf5", ".nxs"}); _MATCH_RULES = frozenset({"Scan Root + Frame Number", "Metadata Key"})
+_CONTAINER_SUFFIXES = frozenset({".h5", ".hdf5", ".nxs"}); _LAST_SAVED = "Last Saved Before Frame"; _MATCH_RULES = frozenset({"Scan Root + Frame Number", "Metadata Key", _LAST_SAVED})
 _STABLE_POLICY = "stat-sha256-decode-stat-v1"; _MEMBER = re.compile(r"^(.*?)[_-](\d+)$")
 _MAX_FILE = 256 * 1024 ** 2; _MAX_PIXELS = 67_108_864
 _MAX_MEMBERS = 10_000; _MAX_PATH_BYTES = 4 * 1024 ** 2
@@ -253,9 +253,15 @@ class FrameBackgroundPlan:
     normalization_key: str | None = None
     metadata_format: str = "Auto"
     stable_read_policy: str = _STABLE_POLICY
+    #: The Background images already have the dark subtracted: with a dark set, the
+    #: reducer subtracts them as they are instead of removing the dark from them.
+    #: Recorded only when set, so existing records keep their mappings.
+    dark_corrected: bool = False
     def __post_init__(self) -> None:
         if type(self.version) is not int or self.version != 1 or type(self.mode) is not str or self.mode not in _FRAME_MODES:
             raise ValueError("frame-background policy version/mode is invalid")
+        if type(self.dark_corrected) is not bool:
+            raise ValueError("frame-background dark-corrected flag must be a boolean")
         if type(self.scale) is bool or not isinstance(self.scale, (int, float)) \
                 or isinstance(self.scale, int) and abs(self.scale) > float.fromhex("0x1.fffffffffffffp+1023") \
                 or not math.isfinite(float(self.scale)):
@@ -309,16 +315,19 @@ class FrameBackgroundPlan:
     def to_mapping(self) -> dict[str, object]:
         self._complete()
         if self.mode == "None": return {"version": 1, "mode": "None"}
-        return {name: getattr(self, name) for name in self.__slots__}
+        values = {name: getattr(self, name) for name in self.__slots__ if name != "dark_corrected"}
+        if self.dark_corrected: values["dark_corrected"] = True
+        return values
     @classmethod
     def from_mapping(cls, value: Mapping[str, object] | None) -> "FrameBackgroundPlan":
         if value is None: return cls()
         if not isinstance(value, Mapping): raise ValueError("background provenance must be a mapping")
         if set(value) == {"version", "mode"} and type(value["version"]) is int and type(value["mode"]) is str and dict(value) == {"version": 1, "mode": "None"}: return cls()
-        if set(value) != set(cls.__slots__): raise ValueError("background provenance has an invalid keyset")
+        if set(value) - {"dark_corrected"} != set(cls.__slots__) - {"dark_corrected"}:
+            raise ValueError("background provenance has an invalid keyset")
         raw = dict(value); plan = cls(**{**raw, "locator": None})
         if type(raw["scale"]) is not float or plan.scale != raw["scale"]: raise ValueError("background provenance is not canonical")
-        for name in cls.__slots__: object.__setattr__(plan, name, raw[name])
+        for name in raw: object.__setattr__(plan, name, raw[name])
         plan._complete()
         if plan.to_mapping() != raw: raise ValueError("background provenance is not canonical")
         return plan
@@ -334,6 +343,14 @@ class FrameBackgroundResult:
     descriptor_bytes: bytes | None
     fingerprint: str | None
     diagnostics: tuple[str, ...] = ()
+    #: Poisson variance of ``background`` per unit of it: var = factor · background
+    #: (scale × normalization ratio, divided by each pixel's member count for a
+    #: series). A float, or a per-pixel array only for a series with uneven counts.
+    variance_factor: float | np.ndarray | None = None
+    #: The factor the background image was multiplied by (scale × normalization
+    #: ratio). With a dark, the reducer removes the background's own dark first;
+    #: None when the plan marks the Background as already dark-corrected.
+    scale: float | None = None
     def __post_init__(self) -> None:
         active = self.disposition == "RESOLVED" and self.background is not None
         pair = self.descriptor_bytes is not None or self.fingerprint is not None
@@ -347,6 +364,15 @@ class FrameBackgroundResult:
                              or _json(json.loads(self.descriptor_bytes.decode("utf-8", "strict"))) != self.descriptor_bytes or hashlib.sha256(self.descriptor_bytes).hexdigest() != self.fingerprint) \
                 or not active and any(v is not None for v in (self.background, self.descriptor_bytes, self.fingerprint)):
             raise ValueError("frame-background result is invalid")
+        factor = self.variance_factor
+        if factor is not None and (not active or (
+                type(factor) is not float or not math.isfinite(factor)) and (
+                type(factor) is not np.ndarray or factor.dtype != np.dtype(np.float64)
+                or factor.shape != self.background.shape or not _is_bytes_backed(factor))):
+            raise ValueError("frame-background variance factor is invalid")
+        if self.scale is not None and (
+                not active or type(self.scale) is not float or not math.isfinite(self.scale)):
+            raise ValueError("frame-background scale is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -614,6 +640,8 @@ def _rebind_single_frame_background(
             raw,
             hashlib.sha256(raw).hexdigest(),
             prepared.result.diagnostics,
+            prepared.result.variance_factor,
+            prepared.result.scale,
         )
     except InterruptedError:
         return FrameBackgroundResult(
@@ -758,14 +786,30 @@ def _series_paths(value: str, cancelled) -> tuple[Path, ...]:
     members = tuple(value[-1] for value in sorted(values))
     if members.count(anchor) != 1: raise ValueError("Background Series anchor is absent or ambiguous")
     return members
+def _saved_times(candidates, cancelled) -> dict[Path, int]:
+    times = {}
+    for candidate in candidates:
+        _poll(cancelled); times[candidate] = candidate.stat().st_mtime_ns
+    return times
+def _saved_by(candidates, before_ns: int, cancelled) -> tuple[Path, ...]:
+    """Only files saved by the frame can be chosen, so only they are recorded: darks
+    saved later in the scan leave the frame's dependency unchanged."""
+    return tuple(path for path, when in _saved_times(candidates, cancelled).items() if when <= before_ns)
+def _last_saved(times: dict[Path, int], before_ns: int) -> Path | None:
+    """The Background file saved last, not after the frame; the later name breaks a tie."""
+    saved = [path for path, when in times.items() if when <= before_ns]
+    return max(saved, key=lambda path: (times[path], path.name.casefold(), path.name)) if saved else None
 def _directory_receipts(candidates, plan, target_tag, target_match, chosen,
-                        selected_facts, shape, cancelled):
+                        selected_facts, shape, cancelled, saved_before=None):
     matches = 0
+    times = _saved_times(candidates, cancelled) if plan.match_rule == _LAST_SAVED else None
+    pick = None if times is None else _last_saved(times, saved_before)
     for ordinal, candidate in enumerate(candidates):
         if _cancelled(cancelled): raise InterruptedError
         keys = tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key)))
         projected, metadata_source = _metadata(candidate, plan, keys, cancelled) if keys else ((), None)
         if plan.match_rule == "Metadata Key": match = dict(projected).get(plan.metadata_key) == target_tag
+        elif times is not None: match = candidate == pick
         else:
             parsed = _MEMBER.match(candidate.stem)
             match = bool(target_match and parsed and int(parsed.group(2)) == int(target_match.group(2)) and
@@ -775,6 +819,7 @@ def _directory_receipts(candidates, plan, target_tag, target_match, chosen,
         if match != (candidate == chosen): raise RuntimeError("Background Directory match changed")
         receipt = {"ordinal": ordinal, "candidate": str(candidate), "match": match,
                    "metadata_items": projected, "metadata_source": metadata_source}
+        if times is not None: receipt["saved_ns"] = times[candidate]
         if candidate == chosen:
             if (projected, metadata_source) != selected_facts[:2]:
                 raise RuntimeError("Background Directory selected metadata changed")
@@ -783,7 +828,7 @@ def _directory_receipts(candidates, plan, target_tag, target_match, chosen,
             receipt["source"] = source; del image
         yield receipt
     if matches != 1: raise RuntimeError("Background Directory match changed")
-def _result(plan, frame_fact, background, body, cancelled) -> FrameBackgroundResult:
+def _result(plan, frame_fact, background, body, cancelled, variance_factor=None, scale=None) -> FrameBackgroundResult:
     _poll(cancelled)
     if not np.isfinite(background).any(): raise ValueError("Background contains no finite pixels")
     _poll(cancelled); body["result_sha256"] = _array_digest(background, cancelled, np.float64)
@@ -791,8 +836,11 @@ def _result(plan, frame_fact, background, body, cancelled) -> FrameBackgroundRes
     cap = _MAX_RECEIPT if plan.mode in {"Series Average", "BG Directory"} else _MAX_DESCRIPTOR
     if len(raw) > cap: raise ValueError("Background descriptor exceeds cap")
     frozen = _bytes_array(background); _poll(cancelled)
+    if type(variance_factor) is np.ndarray:
+        variance_factor = _bytes_array(variance_factor)
     return FrameBackgroundResult("RESOLVED", frozen, raw,
-                                 hashlib.sha256(raw).hexdigest())
+                                 hashlib.sha256(raw).hexdigest(), (), variance_factor,
+                                 None if plan.dark_corrected else scale)
 def resolve_frame_background(
     plan: FrameBackgroundPlan, frame_fact: tuple[object, ...], *,
     cancelled: Event | Callable[[], bool] | None = None,
@@ -813,11 +861,12 @@ def resolve_frame_background(
             metadata, metadata_source = _metadata(Path(source["locator"]), plan,
                 tuple(key for key in (plan.normalization_key,) if key), cancelled)
             denominator = _target_metadata(metadata, plan.normalization_key)
-            image *= plan.scale * target_norm / denominator
+            factor = float(plan.scale * target_norm / denominator)
+            image *= factor
             return _result(plan, frame_fact, image, {"version": 1, "mode": plan.mode,
                 "policy": policy, "frame_fact": frame_fact, "source": source,
                 "metadata_items": metadata, "metadata_source": metadata_source,
-                "decoded": source["decoded"]}, cancelled)
+                "decoded": source["decoded"]}, cancelled, factor, factor)
         if plan.mode == "Series Average":
             members = _series_paths(plan.locator or "", cancelled)
             sums = np.zeros(shape, np.float64); counts = np.zeros(shape, np.uint64)
@@ -841,12 +890,19 @@ def resolve_frame_background(
                 manifest.update(struct.pack(">Q", len(raw))); manifest.update(raw); receipt_bytes += len(raw)
                 del image, finite, source, metadata, metadata_source, raw
             np.divide(sums, counts, out=sums, where=counts > 0); sums[counts == 0] = np.nan
-            denominator = norm_sum / len(members); sums *= plan.scale * target_norm / denominator
+            denominator = norm_sum / len(members); factor = float(plan.scale * target_norm / denominator)
+            sums *= factor
+            # var(f · mean of n counts) = f · (f · mean) / n: one scalar when every
+            # covered pixel has all members, else per pixel.
+            covered = counts[counts > 0]
+            variance_factor = (factor / float(covered[0]) if covered.size and np.all(covered == covered[0])
+                               else np.divide(factor, counts, out=np.zeros(shape), where=counts > 0))
             return _result(plan, frame_fact, sums, {"version": 1, "mode": plan.mode,
                 "policy": policy, "frame_fact": frame_fact, "manifest": {
                     "version": 1, "count": len(members), "receipt_bytes": receipt_bytes,
                     "sha256": manifest.hexdigest()}, "selected": str(Path(plan.locator or "").resolve()),
-                "normalization": {"target": _tag(target_norm), "denominator": _tag(denominator)}}, cancelled)
+                "normalization": {"target": _tag(target_norm), "denominator": _tag(denominator)}},
+                cancelled, variance_factor, factor)
         root = Path(plan.locator or "").resolve(strict=True)
         if not root.is_dir(): raise ValueError("Background Directory is not a directory")
         predicate = compile_filter(plan.filename_filter)
@@ -855,10 +911,23 @@ def resolve_frame_background(
         chosen = None
         target_tag = dict(target_items).get(plan.metadata_key) if plan.metadata_key else None
         target_match = _MEMBER.match(target_path.stem)
+        saved_before = None
+        if plan.match_rule == _LAST_SAVED:
+            # Each frame needs its own file time; frames in one container share one.
+            if target_selector is not None or target_path.suffix.casefold() in _CONTAINER_SUFFIXES:
+                raise ValueError("Last Saved Before Frame needs one image file per frame")
+            if root == target_path.parent and not plan.filename_filter.strip():
+                raise ValueError("Last Saved Before Frame: the Background folder holds the frames; "
+                                 "set a Filename Filter that selects only the Background files")
+            saved_before = target_path.stat().st_mtime_ns
+            candidates = _saved_by(candidates, saved_before, cancelled)
+            pick = _last_saved(_saved_times(candidates, cancelled), saved_before)
+            if pick is None: raise ValueError("no Background file was saved before this frame")
         for candidate in candidates:
             if _cancelled(cancelled): raise InterruptedError
             projected = (); metadata_source = None; match = False
-            if plan.match_rule == "Metadata Key":
+            if plan.match_rule == _LAST_SAVED: match = candidate == pick
+            elif plan.match_rule == "Metadata Key":
                 projected, metadata_source = _metadata(candidate, plan,
                     tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key))), cancelled)
                 match = dict(projected).get(plan.metadata_key) == target_tag
@@ -875,23 +944,26 @@ def resolve_frame_background(
         image, source = _read(str(chosen), plan, shape, cancelled)
         if plan.normalization_key and not projected:
             projected, metadata_source = _metadata(chosen, plan, (plan.normalization_key,), cancelled)
-        image *= plan.scale * target_norm / _target_metadata(projected, plan.normalization_key)
+        factor = float(plan.scale * target_norm / _target_metadata(projected, plan.normalization_key))
+        image *= factor
         prefix = b"XDART-FRAME-BG-DIRECTORY-MANIFEST-V1\0"
         selected_facts = (projected, metadata_source, source)
         first = _manifest(prefix, _directory_receipts(
             candidates, plan, target_tag, target_match, chosen, selected_facts,
-            shape, cancelled), cancelled); del candidates
+            shape, cancelled, saved_before), cancelled); del candidates
         fresh = _directory_paths(root, target_path, predicate, cancelled)
+        if saved_before is not None: fresh = _saved_by(fresh, saved_before, cancelled)
         second = _manifest(prefix, _directory_receipts(
             fresh, plan, target_tag, target_match, chosen, selected_facts,
-            shape, cancelled), cancelled); del fresh
+            shape, cancelled, saved_before), cancelled); del fresh
         if first != second: raise RuntimeError("Background Directory membership changed")
         count, receipt_bytes, digest = first
         return _result(plan, frame_fact, image, {"version": 1, "mode": plan.mode,
             "policy": policy, "frame_fact": frame_fact, "manifest": {"version": 1,
                 "count": count, "receipt_bytes": receipt_bytes, "sha256": digest},
             "selected": str(chosen), "metadata_items": projected,
-            "metadata_source": metadata_source, "decoded": source["decoded"]}, cancelled)
+            "metadata_source": metadata_source, "decoded": source["decoded"],
+            **({} if saved_before is None else {"frame_saved_ns": saved_before})}, cancelled, factor, factor)
     except InterruptedError:
         return FrameBackgroundResult("CANCELLED", None, None, None, ("cancelled",))
     except (FileNotFoundError, PermissionError, OSError, RuntimeError) as error:

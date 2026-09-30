@@ -323,6 +323,17 @@ class RunControlsBar(QtWidgets.QWidget):
         # had hidden it.
         self.set_run_row_visible(True)
 
+    def set_unavailable_modes(self, reasons) -> None:
+        """Grey out the modes a page cannot open, each with its reason as the tooltip."""
+        disabled = dict(reasons)
+        model = self.modeCombo.model()
+        for row in range(self.modeCombo.count()):
+            reason = disabled.get(self.modeCombo.itemText(row), "")
+            item = getattr(model, "item", lambda _row: None)(row)
+            if item is not None:
+                item.setEnabled(not reason)
+            self.modeCombo.setItemData(row, reason or None, QtCore.Qt.ItemDataRole.ToolTipRole)
+
     # ── value getters (read at run-setup) ──
     def get_cores(self):
         return int(self.coresSpin.value())

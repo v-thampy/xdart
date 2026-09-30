@@ -8,6 +8,7 @@ from pathlib import Path
 
 from xrd_tools.core.scan import SourceSpec
 from xrd_tools.core.filters import compile_filter
+from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
 from xrd_tools.reduction.background import FrameBackgroundPlan
 from xrd_tools.session.intent_store import (
     IntentCommitAccepted,
@@ -18,6 +19,9 @@ from xrd_tools.session.intent_store import (
 from xrd_tools.session.readiness import Tool, tool_from_mode_text
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.session.run_configuration import PoniV3OverrideIntent
+from xrd_tools.session.threshold_editing import (
+    ThresholdEditRefusal, ThresholdState, threshold_transition,
+)
 from xrd_tools.integrate.calibration import PONI_V3_SENSOR_MATERIALS
 from xrd_tools.sources.selection import DirectorySourceSpec
 
@@ -32,6 +36,7 @@ from .controls_inventory import (
     BACKGROUND_METADATA_KEY,
     BACKGROUND_NORMALIZE,
     BACKGROUND_SCALE,
+    BACKGROUND_DARK_CORRECTED,
     BACKGROUND_TYPE,
     GI_1D_AXES,
     GI_2D_AXES,
@@ -114,6 +119,9 @@ ADVANCED_METHODS_2D = (
 GI_HISTOGRAM_METHODS = ("cython", "python")
 DEFAULT_GI_HISTOGRAM_METHOD = "cython"
 DEFAULT_POLARIZATION_FACTOR = 0.99
+#: Error models the Advanced editor offers (None = no sigma). A persisted
+#: custom model is kept while it is left unchanged.
+ADVANCED_ERROR_MODELS = (None, "poisson")
 _ADVANCED_LEAVES = (
     "correctSolidAngle",
     "apply_polarization",
@@ -123,6 +131,7 @@ _ADVANCED_LEAVES = (
     "delta_dummy",
     "chi_offset",
     "safe",
+    "error_model",
 )
 ADVANCED_FIELD_PATHS = tuple(
     (root, leaf)
@@ -141,6 +150,7 @@ class AdvancedDimensionValues:
     delta_dummy: object
     chi_offset: object
     safe: object
+    error_model: object = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +163,11 @@ class AdvancedSettingsValues:
     poni_v3_material: object = "Si"
     poni_v3_thickness_m: object = 0.00045
     poni_v3_parallax: object = False
+    #: Detector corrections: dark-current and flat-field image files ("" = none),
+    #: and the fraction of the flat's median below which flat pixels are masked.
+    dark_file: object = ""
+    flat_file: object = ""
+    flat_min_fraction: object = DEFAULT_MIN_FLAT_FRACTION
 
 
 def advanced_settings_values(
@@ -181,6 +196,9 @@ def advanced_settings_values(
             0.00045 if override is None else override.thickness_m
         ),
         poni_v3_parallax=False if override is None else override.parallax,
+        dark_file=intent.dark_file,
+        flat_file=intent.flat_file,
+        flat_min_fraction=intent.flat_min_fraction,
     )
 
 
@@ -256,6 +274,11 @@ def reduce_advanced_settings(
         )
     if type(values.poni_v3_parallax) is not bool:
         return EditRefusal("PONI v3 parallax requires true or false.")
+    if type(values.dark_file) is not str or type(values.flat_file) is not str:
+        return EditRefusal("Dark and flat-field paths must be text.")
+    cutoff = _finite_float(values.flat_min_fraction)
+    if isinstance(cutoff, EditRefusal) or not 0.0 <= cutoff < 1.0:
+        return EditRefusal("The flat cutoff must be from 0 % to below 100 % of the median.")
     desired = AdvancedSettingsValues(
         one_d=one_d,
         two_d=two_d,
@@ -265,6 +288,9 @@ def reduce_advanced_settings(
         poni_v3_material=values.poni_v3_material,
         poni_v3_thickness_m=thickness,
         poni_v3_parallax=values.poni_v3_parallax,
+        dark_file=values.dark_file.strip(),
+        flat_file=values.flat_file.strip(),
+        flat_min_fraction=cutoff,
     )
     if desired == current:
         return EditNoChange()
@@ -295,6 +321,9 @@ def reduce_advanced_settings(
         )
         if desired.poni_v3_override_enabled else None
     )
+    candidate.dark_file = desired.dark_file
+    candidate.flat_file = desired.flat_file
+    candidate.flat_min_fraction = desired.flat_min_fraction
     return candidate
 
 
@@ -338,6 +367,7 @@ def _advanced_dimension_values(
         args.get("delta_dummy"),
         offset,
         bool(args.get("safe", True)),
+        args.get("error_model"),
     )
 
 
@@ -381,6 +411,9 @@ def _validate_advanced_dimension(
     chi_offset = _finite_float(values.chi_offset)
     if isinstance(chi_offset, EditRefusal):
         return EditRefusal(f"{root} chi offset must be finite.")
+    if (values.error_model not in ADVANCED_ERROR_MODELS
+            and values.error_model != current.error_model):
+        return EditRefusal(f"{root} error model is unsupported.")
     return AdvancedDimensionValues(
         values.correct_solid_angle,
         values.apply_polarization,
@@ -394,6 +427,7 @@ def _validate_advanced_dimension(
         delta_dummy,
         chi_offset,
         values.safe,
+        values.error_model,
     )
 
 
@@ -442,6 +476,11 @@ def _install_advanced_dimension(
         args["chi_offset"] = desired.chi_offset
     if desired.safe != current.safe:
         args["safe"] = desired.safe
+    if desired.error_model != current.error_model:
+        if desired.error_model is None:
+            args.pop("error_model", None)
+        else:
+            args["error_model"] = desired.error_model
 
 
 def reduce_control_edit(
@@ -489,38 +528,29 @@ def reduce_control_edit(
             reset_auto_gi_motor=reset_auto_gi_motor,
         )
     intent = snapshot.thaw()
+    if path in {THRESHOLD_MIN, THRESHOLD_MAX, THRESHOLD_ENABLED}:
+        threshold = intent.threshold
+        result = threshold_transition(
+            ThresholdState(threshold.apply_threshold, threshold.threshold_min,
+                           threshold.threshold_max, threshold.mask_saturation),
+            {THRESHOLD_MIN: "min", THRESHOLD_MAX: "max", THRESHOLD_ENABLED: "enabled"}[path],
+            value, observed_threshold_max(intent, observation))
+        if isinstance(result, ThresholdEditRefusal):
+            return EditRefusal(result.reason)
+        if result is None:
+            return EditNoChange()
+        threshold.apply_threshold = result.apply_threshold
+        threshold.threshold_min = result.threshold_min
+        threshold.threshold_max = result.threshold_max
+        threshold.mask_saturation = result.mask_saturation
+        return intent
     parsed = _control_value(intent, path, value)
     if isinstance(parsed, EditRefusal):
         return parsed
     current = _current_value(intent, path)
-    if (
-        path in {THRESHOLD_MIN, THRESHOLD_MAX}
-        and intent.threshold.mask_saturation
-        and not intent.threshold.apply_threshold
-    ):
-        # Focusing a projected default is not an explicit range edit.
-        current = 0.0 if path == THRESHOLD_MIN else observed_threshold_max(intent, observation)
-    # A touch of any threshold control must not absorb as EditNoChange while
-    # the active manual band's displayed defaults are still unmaterialized.
-    # The probe runs on a detached thawed copy.
-    noncanonical_threshold_touch = (
-        path in {
-            THRESHOLD_ENABLED, THRESHOLD_MIN, THRESHOLD_MAX,
-        }
-        and canonicalize_threshold_intent(snapshot.thaw())
-    )
-    if parsed == current and not noncanonical_threshold_touch:
+    if parsed == current:
         return EditNoChange()
-    if path in {THRESHOLD_MIN, THRESHOLD_MAX}:
-        automatic = intent.threshold.mask_saturation and not intent.threshold.apply_threshold
-        low = parsed if path == THRESHOLD_MIN else (0.0 if automatic else intent.threshold.threshold_min)
-        high = parsed if path == THRESHOLD_MAX else (observed_threshold_max(intent, observation) if automatic else intent.threshold.threshold_max)
-        if low is not None and high is not None and low > high:
-            return EditRefusal("Threshold minimum cannot exceed maximum.")
     candidate = snapshot.thaw()
-    if path in {THRESHOLD_MIN, THRESHOLD_MAX} and automatic:
-        # Old sessions may retain inactive manual values behind automatic mode.
-        candidate.threshold.threshold_min = candidate.threshold.threshold_max = None
     _install_value(candidate, path, parsed)
     prior_default_save_path = (
         str(Path(str(intent.project_root)).expanduser() / "xdart_processed_data")
@@ -543,30 +573,6 @@ def reduce_control_edit(
             candidate,
             was_enabled=intent.gi.enabled,
         )
-    elif path in {THRESHOLD_MIN, THRESHOLD_MAX}:
-        threshold = candidate.threshold
-        if path == THRESHOLD_MAX and parsed is None:
-            # Clearing the upper bound restores the entire automatic band.
-            threshold.threshold_min = threshold.threshold_max = None
-            threshold.apply_threshold = False
-            threshold.mask_saturation = True
-            return candidate
-        if threshold.threshold_max is None:
-            threshold.threshold_max = observed_threshold_max(candidate, observation)
-            if threshold.threshold_max is None:
-                return EditRefusal("Select an integer detector input or enter an upper threshold first.")
-        threshold.apply_threshold = True
-        threshold.mask_saturation = False
-        canonicalize_threshold_intent(candidate)
-        if threshold.threshold_min > threshold.threshold_max:
-            return EditRefusal("Threshold minimum cannot exceed maximum.")
-    elif path == THRESHOLD_ENABLED:
-        threshold = candidate.threshold
-        if not parsed and intent.threshold.mask_saturation and not intent.threshold.apply_threshold:
-            threshold.threshold_min = threshold.threshold_max = None
-        threshold.apply_threshold = bool(parsed and threshold.threshold_max is not None)
-        threshold.mask_saturation = bool(parsed and not threshold.apply_threshold)
-        canonicalize_threshold_intent(candidate)
     return candidate
 
 
@@ -582,7 +588,8 @@ def _reduce_background_edit(
             desired = replace(plan, mode=value, locator=None,
                 dataset_path=None, frame_index=None,
                 match_rule=("Scan Root + Frame Number" if value == "BG Directory" else None),
-                metadata_key=None, filename_filter="", scale=1.0, normalization_key=None)
+                metadata_key=None, filename_filter="", scale=1.0, normalization_key=None,
+                dark_corrected=False)
         elif path in {BACKGROUND_FILE, BACKGROUND_DIRECTORY}:
             if type(value) is not str or not value.strip():
                 return EditRefusal("A Background path is required.")
@@ -597,7 +604,7 @@ def _reduce_background_edit(
             desired = replace(plan, locator=str(Path(value).expanduser().absolute()))
         elif path == BACKGROUND_MATCH:
             if plan.mode != "BG Directory" or value not in {
-                "Scan Root + Frame Number", "Metadata Key"}:
+                "Scan Root + Frame Number", "Metadata Key", "Last Saved Before Frame"}:
                 return EditRefusal("Choose a supported Background match rule.")
             desired = replace(plan, match_rule=str(value),
                               metadata_key=None if value != "Metadata Key" else plan.metadata_key)
@@ -610,6 +617,10 @@ def _reduce_background_edit(
             if plan.mode != "BG Directory" or type(value) is not str:
                 return EditRefusal("Background Filter is available only for BG Directory.")
             compile_filter(value); desired = replace(plan, filename_filter=value.strip())
+        elif path == BACKGROUND_DARK_CORRECTED:
+            if plan.mode == "None" or type(value) is not bool:
+                return EditRefusal("Choose a Background, then mark whether it is dark-corrected.")
+            desired = replace(plan, dark_corrected=value)
         elif path == BACKGROUND_SCALE:
             if type(value) is bool:
                 return EditRefusal("Background Scale must be finite.")
@@ -1101,7 +1112,7 @@ def _control_value(
             if value in {"Overwrite", "Append"}
             else EditRefusal("Output mode must be Overwrite or Append.")
         )
-    if path in {GI_ENABLED, THRESHOLD_ENABLED, MASK_SATURATION}:
+    if path in {GI_ENABLED, MASK_SATURATION}:
         return (
             value
             if type(value) is bool
@@ -1120,10 +1131,6 @@ def _control_value(
                 "Sample orientation must be an integer from 1 through 8."
             )
         return parsed
-    if path in {THRESHOLD_MIN, THRESHOLD_MAX}:
-        if type(value) is str and not value.strip():
-            return None
-        return _finite_float(value)
     return EditRefusal("Unknown control.")
 
 
@@ -1161,9 +1168,6 @@ def _current_value(intent: RunIntent, path: tuple[str, ...]) -> object:
         GI_THETA: intent.gi.th_val,
         GI_ORIENTATION: intent.gi.sample_orientation,
         GI_TILT: intent.gi.tilt_angle,
-        THRESHOLD_ENABLED: intent.threshold.apply_threshold or intent.threshold.mask_saturation,
-        THRESHOLD_MIN: intent.threshold.threshold_min,
-        THRESHOLD_MAX: intent.threshold.threshold_max,
         MASK_SATURATION: intent.threshold.mask_saturation,
     }
     return values[path]
@@ -1194,11 +1198,5 @@ def _install_value(
         intent.gi.sample_orientation = value  # type: ignore[assignment]
     elif path == GI_TILT:
         intent.gi.tilt_angle = value  # type: ignore[assignment]
-    elif path == THRESHOLD_ENABLED:
-        intent.threshold.apply_threshold = value  # type: ignore[assignment]
-    elif path == THRESHOLD_MIN:
-        intent.threshold.threshold_min = value  # type: ignore[assignment]
-    elif path == THRESHOLD_MAX:
-        intent.threshold.threshold_max = value  # type: ignore[assignment]
     else:
         intent.threshold.mask_saturation = value  # type: ignore[assignment]

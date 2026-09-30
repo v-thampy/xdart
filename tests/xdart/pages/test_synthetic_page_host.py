@@ -294,7 +294,7 @@ def test_two_synthetic_pages_mount_lazily_and_route_selected_only(qapp, tmp_path
     try:
         assert built == ["synthetic-a"]
         assert window.selected_page_key == page_a.key
-        assert window.centralWidget() is window.main_widget
+        assert window.centralWidget().currentWidget() is window.main_widget
         assert provider_calls == [
             ("intent", page_a.key),
             ("executor", page_a.key),

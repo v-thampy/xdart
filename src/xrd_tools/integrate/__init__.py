@@ -43,12 +43,16 @@ from xrd_tools.integrate.refine import (
 )
 from xrd_tools.integrate.direct_beam import (
     DirectBeamResult,
+    DirectBeamScanInput,
+    open_direct_beam_scan,
     calibrate_direct_beam,
     calibrate_direct_beam_scan,
 )
 
 __all__ = [
     "DirectBeamResult",
+    "DirectBeamScanInput",
+    "open_direct_beam_scan",
     "calibrate_direct_beam",
     "calibrate_direct_beam_scan",
     "create_fiber_integrator",

@@ -47,6 +47,8 @@ class RectViewBox(pg.ViewBox):
 
     Mouse bindings:
       * Left-drag       — rubber-band zoom rectangle (RectMode default).
+      * Shift+left-drag — pan (also middle-drag, or a drag along an axis): a
+                          trackpad has no middle button.
       * Middle-click    — auto-range (zoom-out).  Bound here because the
                           right-click default was consuming the context
                           menu; middle-click is unmapped in pyqtgraph
@@ -90,10 +92,13 @@ class RectViewBox(pg.ViewBox):
         if ev.button() == QtCore.Qt.RightButton:
             ev.ignore()
         
-        elif ev.button() == QtCore.Qt.LeftButton:
-            pg.ViewBox.mouseDragEvent(self, ev)
+        elif (ev.button() == QtCore.Qt.LeftButton
+              and not ev.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier):
+            # the axis a drag on an AxisItem names: pyqtgraph pans along it, and draws the zoom
+            # box only for a drag in the plot area (axis None) (Codex R20-F1)
+            pg.ViewBox.mouseDragEvent(self, ev, axis=axis)
         
-        else:
+        else:  # Shift+left or middle: pan
             tr = dif*mask
             tr = self.mapToView(tr) - self.mapToView(Point(0,0))
             x = tr.x() if mask[0] == 1 else None

@@ -26,7 +26,7 @@ from xdart.gui.pages.catalog import (
     DEFAULT_PAGE_KEY,
     RSM_TOOL,
     SCATTERING_WORKSPACE_PAGE,
-    STITCH_TOOL,
+    STITCH_PAGE,
 )
 from xdart.gui.pages.registry import PageRegistry
 from xdart.gui.pages.values import (
@@ -61,17 +61,12 @@ def isolated_settings(tmp_path, monkeypatch):
 def test_catalog_registers_current_workspace_first_and_as_default():
     assert tuple(page.key for page in BUILTIN_PAGES) == (
         "scattering-workspace",
+        "stitch",
     )
     assert DEFAULT_PAGE_KEY == "scattering-workspace"
     assert BUILTIN_PAGES[0] is SCATTERING_WORKSPACE_PAGE
-    assert BUILTIN_DESCRIPTORS == (*BUILTIN_PAGES, STITCH_TOOL, RSM_TOOL)
-    assert STITCH_TOOL.key == STITCH_TOOL_KEY == "stitch"
-    assert (
-        STITCH_TOOL.label,
-        STITCH_TOOL.category,
-        STITCH_TOOL.order,
-        STITCH_TOOL.tool_kind,
-    ) == ("Stitching", "analysis", 100, "processing")
+    assert BUILTIN_DESCRIPTORS == (*BUILTIN_PAGES, RSM_TOOL)
+    assert STITCH_PAGE.key == STITCH_TOOL_KEY == "stitch"
     assert RSM_TOOL.key == RSM_TOOL_KEY == "rsm"
     assert (
         RSM_TOOL.label,
@@ -83,7 +78,7 @@ def test_catalog_registers_current_workspace_first_and_as_default():
 
 def test_scattering_descriptor_declares_the_frozen_adoption_ports():
     page = SCATTERING_WORKSPACE_PAGE
-    assert page.lifecycle is PageLifecycle.EXIT_ONLY
+    assert page.lifecycle is PageLifecycle.RETAINED
     assert page.order == 0
     assert page.capabilities == frozenset({
         PageCapability.OPEN_FOLDER,
@@ -93,6 +88,7 @@ def test_scattering_descriptor_declares_the_frozen_adoption_ports():
         PageCapability.SLICE_PIN,
         PageCapability.RUN_ACTIVITY,
         PageCapability.APP_MENU_HOSTS,
+        PageCapability.PROCESSING_MODE,  # another page's mode box selects a mode here (Codex audit G-F3)
     })
 
 
@@ -104,7 +100,7 @@ def test_default_selection_is_the_current_workspace():
     assert registry.select(
         "scattering-workspace", DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
     assert registry.select(
-        STITCH_TOOL_KEY, DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
+        STITCH_TOOL_KEY, DEFAULT_PAGE_KEY) is STITCH_PAGE
     assert registry.select(
         RSM_TOOL_KEY, DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
 
@@ -136,13 +132,13 @@ def test_catalog_import_does_not_import_the_scattering_package():
     assert "lazy-ok" in result.stdout
 
 
-def test_builtin_stitch_action_constructs_one_idle_tool_only_when_opened(
+def test_builtin_stitch_selection_retains_native_page_and_integration_workspace(
         qapp, isolated_settings):
     from xdart.gui.pages.values import ActionCompleted
 
     window = _mounted_host(None)
     try:
-        assert STITCH_TOOL.key not in window._tool_handles
+        assert STITCH_TOOL_KEY not in window._tool_handles
         assert window.ui.menuAnalysis is None
         page = window.page_handle.widget
         assert page.findChild(QtWidgets.QToolButton, "analysisMenuButton") is None
@@ -153,28 +149,92 @@ def test_builtin_stitch_action_constructs_one_idle_tool_only_when_opened(
         assert combo.findText("RSM") >= 0
         requested = []
         page.toolRequested.connect(requested.append)
+        prior_intent = page._intents.snapshot()
         combo.setCurrentText("Stitch 1D")
-        assert page._shell.run_controls.startButton.isEnabled()
-        page._shell.run_controls.startButton.click()
         qapp.processEvents()
-        handle = window._tool_handles[STITCH_TOOL.key]
-        assert handle.widget.objectName() == "stitchToolDialog"
-        assert handle.widget.parity_hold.text() == (
-            "Mode: 1-D only · 2-D held pending the scan-14 orientation parity oracle"
-        )
+        assert window.selected_page_key == STITCH_PAGE.key
+        handle = window._page_handles[STITCH_PAGE.key]
+        assert handle.widget.objectName() == "stitchPage"
+        assert not handle.widget.isWindow()
+        assert window.centralWidget().currentWidget() is handle.widget
+        assert handle.activity.active() is False
+        assert page._intents.snapshot() == prior_intent
+        handle.widget.set_field("scan", "14")
+        assert window.select_page(DEFAULT_PAGE_KEY) == ActionCompleted(str(DEFAULT_PAGE_KEY))
+        assert window.main_widget is page
+        assert combo.currentText() == prior_intent.thaw().processing_mode
+        combo.setCurrentText("Stitch 1D")
+        qapp.processEvents()
+        assert window.page_handle is handle
+        assert handle.activity.active() is False
+        assert window.select_page(DEFAULT_PAGE_KEY) == ActionCompleted(str(DEFAULT_PAGE_KEY))
         combo.setCurrentText("Stitch 2D")
         assert not page._shell.run_controls.startButton.isEnabled()
         page._shell.run_controls.startButton.click()
         qapp.processEvents()
-        assert requested == ["stitch"]
-        assert handle.widget.source_widget._external_execution is True
-        assert handle.widget.source_widget._probe_executor is None
+        assert requested == ["stitch", "stitch"]
         assert handle.activity.active() is False
-        assert window.open_tool(STITCH_TOOL.key) == ActionCompleted("stitch")
-        assert window._tool_handles[STITCH_TOOL.key] is handle
+        assert window.open_tool(STITCH_TOOL_KEY) == ActionCompleted("stitch")
+        assert window._page_handles[STITCH_PAGE.key] is handle
+        assert handle.widget._value("scan") == "14"
+        assert STITCH_TOOL_KEY not in window._tool_handles
         assert RSM_TOOL.key not in window._tool_handles
-        assert handle.close().status is PageCleanup.CLEAN
     finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+
+def test_a_mode_chosen_on_stitch_opens_the_integration_page_in_that_mode(qapp, isolated_settings):
+    """Codex audit G-F3: Int 1D/2D and the Viewers chosen on Stitch's mode box reach the integration
+    page as that mode (combo and intent), through its own mode command; the generic return keeps it."""
+    window = _mounted_host(None)
+    try:
+        page = window.page_handle.widget
+        combo = page._shell.run_controls.modeCombo
+        combo.setCurrentText("Stitch 1D")
+        qapp.processEvents()
+        stitch = window._page_handles[STITCH_PAGE.key].widget
+        for mode in ("1D Viewer", "2D Viewer", "Int 1D", "Int 2D"):
+            assert window.selected_page_key == STITCH_PAGE.key
+            stitch.run_bar.modeCombo.setCurrentText(mode)
+            qapp.processEvents()
+            assert window.selected_page_key == SCATTERING_WORKSPACE_PAGE.key, mode
+            assert combo.currentText() == mode
+            assert page._intents.snapshot().thaw().processing_mode == mode
+            assert stitch.run_bar.modeCombo.currentText() == "Stitch 1D"  # Stitch's own box is unchanged
+            combo.setCurrentText("Stitch 1D")
+            qapp.processEvents()
+        # the generic return (Stitch's menu entry) leaves the integration page's mode as it was
+        stitch.toolRequested.emit(str(SCATTERING_WORKSPACE_PAGE.key))
+        qapp.processEvents()
+        assert window.selected_page_key == SCATTERING_WORKSPACE_PAGE.key
+        assert page._intents.snapshot().thaw().processing_mode == "Int 2D"
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+
+def test_stitch_selection_obeys_active_integration_page_fence(
+        qapp, isolated_settings):
+    from xdart.gui.tabs.scattering.events import PreflightRefused
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+
+    window = _mounted_host(None)
+    page = window.main_widget
+    request = page._lifecycle.begin_start()
+    try:
+        assert page._lifecycle.phase is RunPhase.PREPARING
+        prior_intent = page._intents.snapshot()
+        page._shell.run_controls.modeCombo.setCurrentText("Stitch 1D")
+        qapp.processEvents()
+        assert window.main_widget is page
+        assert STITCH_PAGE.key not in window._page_handles
+        assert page._intents.snapshot() == prior_intent
+        assert page._lifecycle.phase is RunPhase.PREPARING
+    finally:
+        page._lifecycle.preflight_refused(PreflightRefused(request.request_id))
         window.close()
         window.deleteLater()
         qapp.processEvents()
@@ -210,7 +270,7 @@ def test_builtin_rsm_action_constructs_one_idle_tool_only_when_opened(
         assert window._tool_handles[RSM_TOOL.key].widget is dialog
         assert window.main_widget is page_widget
         assert window.selected_page_key == selected_page_key
-        assert STITCH_TOOL.key not in window._tool_handles
+        assert STITCH_TOOL_KEY not in window._tool_handles
     finally:
         window.close()
         window.deleteLater()
@@ -752,6 +812,28 @@ def test_default_cores_follow_the_small_ram_worker_cap(
         assert intent.max_cores == expected
         # What the run will resolve from that Cores value, on the same host.
         assert staging.reduction_worker_cap(intent.max_cores) == expected
+    finally:
+        assert handle.close().status is PageCleanup.CLEAN
+        handle.widget.deleteLater()
+        qapp.processEvents()
+
+
+def test_a_fresh_session_applies_polarization_by_default(
+        qapp, isolated_settings, monkeypatch):
+    """POL-1: SSRL beams are strongly horizontally polarized; fresh runs correct for it."""
+    from xdart.gui.tabs.scattering.controls_editing import advanced_settings_values
+
+    monkeypatch.setenv("XDART_SESSION_FRESH", "1")
+    handle = _build_mounted_workspace(None, SimpleNamespaceStatus())
+    try:
+        snapshot = handle.widget._intents.snapshot()
+        values = advanced_settings_values(snapshot)
+        for dimension in (values.one_d, values.two_d):
+            assert dimension.apply_polarization is True
+            assert dimension.polarization_factor == 0.99
+        frozen = snapshot.thaw().freeze()
+        assert frozen.bai_1d_args["polarization_factor"] == 0.99
+        assert frozen.bai_2d_args["polarization_factor"] == 0.99
     finally:
         assert handle.close().status is PageCleanup.CLEAN
         handle.widget.deleteLater()

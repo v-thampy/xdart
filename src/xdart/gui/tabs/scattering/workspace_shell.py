@@ -353,19 +353,7 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
             )
         ]
         self.run_controls.apply_profile(modes=state.modes)
-        disabled = dict(state.disabled_modes)
-        model = self.run_controls.modeCombo.model()
-        for row in range(self.run_controls.modeCombo.count()):
-            label = self.run_controls.modeCombo.itemText(row)
-            reason = disabled.get(label, "")
-            item = getattr(model, "item", lambda _row: None)(row)
-            if item is not None:
-                item.setEnabled(not reason)
-            self.run_controls.modeCombo.setItemData(
-                row,
-                reason or None,
-                QtCore.Qt.ItemDataRole.ToolTipRole,
-            )
+        self.run_controls.set_unavailable_modes(state.disabled_modes)
         index = self.run_controls.modeCombo.findText(state.mode)
         if index >= 0:
             self.run_controls.modeCombo.setCurrentIndex(index)

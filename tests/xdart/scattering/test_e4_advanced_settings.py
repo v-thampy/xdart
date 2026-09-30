@@ -632,3 +632,70 @@ def test_advanced_poni_v3_override_cas_does_not_overwrite_concurrent_revision(
     current = store.snapshot().thaw()
     assert current.project_root == "/concurrent"
     assert current.poni_v3_override is None
+
+
+def test_error_model_commits_to_bai_args_and_reaches_the_reduction_plan(
+    tmp_path: Path,
+) -> None:
+    store = RunIntentStore(_intent(tmp_path))
+    snapshot = store.snapshot()
+    values = advanced_settings_values(snapshot)
+    assert (values.one_d.error_model, values.two_d.error_model) == (None, None)
+    poisson = replace(
+        values,
+        one_d=replace(values.one_d, error_model="poisson"),
+        two_d=replace(values.two_d, error_model="poisson"),
+    )
+    candidate = reduce_advanced_settings(snapshot, poisson)
+    assert candidate.bai_1d_args["error_model"] == "poisson"
+    assert candidate.bai_2d_args["error_model"] == "poisson"
+    plan = build_native_int_reduction_plan_from_args(
+        candidate.bai_1d_args, candidate.bai_2d_args,
+    )
+    assert plan.integration_1d.error_model == "poisson"
+    assert plan.integration_2d.error_model == "poisson"
+
+    store = RunIntentStore(candidate)
+    cleared = reduce_advanced_settings(
+        store.snapshot(),
+        replace(
+            advanced_settings_values(store.snapshot()),
+            one_d=replace(poisson.one_d, error_model=None),
+        ),
+    )
+    assert "error_model" not in cleared.bai_1d_args
+    assert cleared.bai_2d_args["error_model"] == "poisson"
+
+
+def test_custom_error_model_is_kept_but_cannot_be_newly_chosen(
+    qapp: QtWidgets.QApplication,
+    tmp_path: Path,
+) -> None:
+    intent = _intent(tmp_path)
+    intent.bai_1d_args["error_model"] = "azimuthal"
+    snapshot = RunIntentStore(intent).snapshot()
+    values = advanced_settings_values(snapshot)
+    assert values.one_d.error_model == "azimuthal"
+    refused = reduce_advanced_settings(
+        snapshot,
+        replace(values, two_d=replace(values.two_d, error_model="hybrid")),
+    )
+    assert isinstance(refused, EditRefusal)
+    assert "error model" in refused.reason
+    dialog = AdvancedSettingsDialog()
+    try:
+        dialog.load_values(values)
+        assert dialog.one_d.error_model.currentData() == "azimuthal"
+        assert dialog.two_d.error_model.currentText() == "None"
+        assert isinstance(
+            reduce_advanced_settings(snapshot, dialog.values()),
+            EditNoChange,
+        )
+        dialog.two_d.error_model.setCurrentIndex(
+            dialog.two_d.error_model.findData("poisson")
+        )
+        committed = reduce_advanced_settings(snapshot, dialog.values())
+        assert committed.bai_2d_args["error_model"] == "poisson"
+        assert committed.bai_1d_args["error_model"] == "azimuthal"
+    finally:
+        dialog.close()

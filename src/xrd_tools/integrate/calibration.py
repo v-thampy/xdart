@@ -634,7 +634,8 @@ def poni_to_integrator(poni: PONI) -> AzimuthalIntegrator:
 
 def detector_calibration_to_integrator(
     cal, *, rot1: float | None = None, rot2: float | None = None,
-    rot3: float | None = None,
+    rot3: float | None = None, dist: float | None = None,
+    poni1: float | None = None, poni2: float | None = None,
 ) -> AzimuthalIntegrator:
     """Build a pyFAI integrator from a :class:`DetectorCalibration`, honouring
     its ``Detector_config`` (panel orientation) — unlike :func:`poni_to_integrator`,
@@ -643,6 +644,8 @@ def detector_calibration_to_integrator(
 
     ``rot1``/``rot2``/``rot3`` override the base rotations to build a *per-frame*
     integrator (base calibration ⊕ ``Diffractometer.to_pyfai_per_frame`` rotations).
+    ``dist``/``poni1``/``poni2`` override the base position for a frame whose
+    sample is off the rotation centre (a stacked arm with a sample offset).
 
     Parameters
     ----------
@@ -666,7 +669,9 @@ def detector_calibration_to_integrator(
     else:
         det = None
     integrator = AzimuthalIntegrator(
-        dist=float(p.dist), poni1=float(p.poni1), poni2=float(p.poni2),
+        dist=float(p.dist if dist is None else dist),
+        poni1=float(p.poni1 if poni1 is None else poni1),
+        poni2=float(p.poni2 if poni2 is None else poni2),
         rot1=float(p.rot1 if rot1 is None else rot1),
         rot2=float(p.rot2 if rot2 is None else rot2),
         rot3=float(p.rot3 if rot3 is None else rot3),

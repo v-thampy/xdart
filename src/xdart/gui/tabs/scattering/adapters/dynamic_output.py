@@ -31,6 +31,7 @@ from xrd_tools.reduction import (
     NexusSink,
     TransactionalXYESink,
 )
+from xrd_tools.reduction.core import result_1d_has_sigma
 from xrd_tools.session import (
     DynamicAccountingLimits,
     DynamicFrameIdentity,
@@ -495,7 +496,8 @@ def _light_policy_layout(
         tuple(
             Light1DModeLayout(
                 mode, buffer(mode, "coordinate"), buffer(mode, "intensity"),
-                buffer(mode, "uncertainty") if one_d.error_model else None,
+                # Only some 1-D outputs carry sigma under an error model.
+                buffer(mode, "uncertainty") if result_1d_has_sigma(plan) else None,
             )
             for mode in modes
         ),
@@ -577,7 +579,7 @@ def _science_projection(
         raise ValueError(
             "signed science mapping differs from the frozen run configuration"
         )
-    if type(assets) is not dict or set(assets) != {
+    if type(assets) is not dict or set(assets) - {"flat_sha256", "dark_sha256"} != {
         "poni_values", "poni_detector_config_json", "poni_sha256", "mask_sha256",
     }:
         raise TypeError("accepted scientific asset identity is malformed")
@@ -615,8 +617,10 @@ def _science_projection(
             raise ValueError(
                 "accepted PONI projection differs from frozen calibration"
             )
-    for key in ("poni_sha256", "mask_sha256"):
-        digest = assets[key]
+    for key in ("poni_sha256", "mask_sha256", "flat_sha256", "dark_sha256"):
+        digest = assets.get(key)
+        if key in {"flat_sha256", "dark_sha256"} and key in assets and digest is None:
+            raise TypeError(f"accepted {key} is malformed")
         if digest is not None and (
             type(digest) is not str
             or len(digest) != 64
@@ -648,6 +652,13 @@ def _science_projection(
         "poni_values": values["poni_values"],
         "accepted_scientific_assets": assets,
         **({"background": values["background"]} if "background" in values else {}),
+        # The flat's digest covers its file; a cutoff away from the default
+        # changes which pixels it masks, so Append must match it too.
+        **({"flat_min_fraction": values["flat_min_fraction"]}
+           if "flat_min_fraction" in values else {}),
+        # How a Background and a dark combine; unrecorded before 3b614512.
+        **({"background_dark": values["background_dark"]}
+           if "background_dark" in values else {}),
     }
 
 

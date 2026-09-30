@@ -188,6 +188,8 @@ _EXPORTS = {
     "read_frame_records": ("xrd_tools.io.frame_view", "read_frame_records"),
     "read_frame_preview": ("xrd_tools.io.frame_preview", "read_frame_preview"),
     "read_frame_view": ("xrd_tools.io.frame_view", "read_frame_view"),
+    "read_contributing_frame_view": ("xrd_tools.io.frame_view", "read_contributing_frame_view"),
+    "analysis_contributing_frame_members": ("xrd_tools.io.analysis_stitch_auxiliary", "analysis_contributing_frame_members"),
     "read_frame_views": ("xrd_tools.io.frame_view", "read_frame_views"),
     "read_image": ("xrd_tools.io.image", "read_image"),
     "read_image_metadata": ("xrd_tools.io.metadata", "read_image_metadata"),

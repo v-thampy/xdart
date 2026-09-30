@@ -3517,6 +3517,116 @@ class FrameViewReader:
         self._clear_open_state()
 
 
+def read_contributing_frame_view(
+    scan_file: str | Path,
+    frame: int,
+    *,
+    scan: str | None = None,
+    source_root: str | Path | None = None,
+    full_raw: bool = False,
+    artifact_payload=None,
+) -> FrameView:
+    """Read a strictly admitted Stitch source record through shared raw owners.
+
+    An unavailable or changed original leaves ``raw`` absent and the stored
+    ``thumbnail`` intact, with the reason in ``extra["raw_unavailable_reason"]``,
+    allowing the presenter to label fallback honestly. No integrated-frame rows
+    or display identities are fabricated for this scan-level result.
+    """
+    from xrd_tools.io.analysis_artifact import (
+        AnalysisArtifactKind, AnalysisArtifactInvalid, AnalysisArtifactPayload,
+        inspect_analysis_artifact,
+        _stat_revision, _opened_hdf_revision,
+    )
+    from xrd_tools.io.nexus_record import frame_record_key
+    from xrd_tools.io.stitch_record import STITCH_GROUP
+    from xrd_tools.io.read import (
+        _raw_frame_parts_from_entry, _frame_group_for_label,
+        _frame_source_read_options, _raw_frame_or_thumbnail, resolve_source_master,
+    )
+    from xrd_tools.sources.execution_graph import SourceFileState
+    import json
+    import os
+
+    if type(frame) is not int or frame < 0 or type(full_raw) is not bool:
+        raise TypeError("contributing frame selector is invalid")
+    path = Path(scan_file)
+    if artifact_payload is None:
+        inspection = inspect_analysis_artifact(path, expected_kind=AnalysisArtifactKind.STITCH_1D)
+    else:
+        if type(artifact_payload) is not AnalysisArtifactPayload:
+            raise TypeError("contributing frame payload must be strictly admitted")
+        inspection = artifact_payload.inspection
+        if inspection.path != str(path.expanduser().absolute()) or inspection.kind is not AnalysisArtifactKind.STITCH_1D:
+            raise ValueError("contributing frame payload belongs to another artifact")
+        if _stat_revision(os.stat(path)) != inspection.storage_revision:
+            raise AnalysisArtifactInvalid("artifact changed since detached admission")
+    if inspection.frame_manifest_json is None:
+        raise KeyError("this artifact has no contributing frame records")
+    key = frame_record_key(scan, frame)
+    frame_manifest = json.loads(inspection.frame_manifest_json)
+    rows = frame_manifest["records"]
+    selected = next((row for row in rows if row["key"] == key), None)
+    if selected is None:
+        raise KeyError(f"unknown contributing frame {key}")
+    with h5py.File(path, "r") as handle:
+        if _opened_hdf_revision(handle) != inspection.storage_revision:
+            raise AnalysisArtifactInvalid("artifact changed before frame hydration")
+        entry = handle["entry"]
+        # a stitched record keeps its contributors (and their source base) under entry/stitch
+        container = entry[STITCH_GROUP] if STITCH_GROUP in entry else entry
+        master, index, thumbnail = _raw_frame_parts_from_entry(
+            path, container, frame, scan=scan, source_root=source_root,
+        )
+        group = _frame_group_for_label(container, frame, scan=scan)
+        options = _frame_source_read_options(group)
+    raw = None
+    raw_reason = ""
+    if full_raw:
+        snapshot = selected["source_snapshot"]
+        expected = [(master, snapshot.get("size"), snapshot.get("mtime_ns"))]
+        if snapshot.get("self_contained") is False:
+            # The primary NeXus file can stay unchanged while its linked detector
+            # data changes. Reuse this exact member's existing dependency stamps
+            # and the same relocatable Project resolver as its raw link.
+            manifest = json.loads(inspection.provenance_json).get("source", {}).get("input_manifest", {})
+            member = next((item for item in manifest.get("members", (manifest,))
+                if item.get("source", {}).get("module_source_fingerprint") == selected["identity"]["source_id"]), None)
+            if member is None:
+                expected.append((None, None, None))
+            else:
+                expected.extend((resolve_source_master(item["relative_path"], scan_file=path,
+                    source_base=frame_manifest["source_base"], source_root=source_root),
+                    item["revision"][3], item["revision"][4])
+                    for item in member["files"] if item["revision"] is not None)
+        try:
+            states = []
+            for source_path, size, mtime_ns in expected:
+                if size is None or mtime_ns is None:
+                    raw_reason = "saved raw source identity unavailable"
+                    break
+                if source_path is None:
+                    raise FileNotFoundError("raw source unavailable")
+                state = SourceFileState.capture(Path(source_path))
+                if (state.size, state.mtime_ns) != (size, mtime_ns):
+                    raw_reason = "raw source changed since processing"
+                    break
+                states.append(state)
+            if not raw_reason:
+                raw = _raw_frame_or_thumbnail(path, frame, master, index, thumbnail,
+                    allow_thumbnail=False, preserve_dtype=True, raw_options=options)
+                if not all(state.matches_disk() for state in states):
+                    raw, raw_reason = None, "raw source changed during reading"
+        except (KeyError, OSError):
+            raw, raw_reason = None, "raw source unavailable"
+    if _stat_revision(os.stat(path)) != inspection.storage_revision:
+        raise AnalysisArtifactInvalid("artifact changed during frame hydration")
+    return FrameView(label=frame, raw=raw, thumbnail=thumbnail,
+        mask_baked=selected["mask_baked"], metadata_raw=selected["identity"],
+        source_path=None if master is None else str(master), source_frame_index=index,
+        extra={"raw_unavailable_reason": raw_reason} if raw_reason else {})
+
+
 def read_frame_view(
     scan_file: str | Path,
     frame: int,

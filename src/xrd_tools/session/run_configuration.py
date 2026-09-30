@@ -22,7 +22,7 @@ import json
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -33,6 +33,7 @@ from xrd_tools.corrections.grazing import (
     validate_gi_exit_angle_convention,
 )
 from xrd_tools.core.scan import SourceSpec
+from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
 from xrd_tools.reduction.provenance_config import jsonable_run_value
 from xrd_tools.session.gi_motor import pick_default_gi_motor
 from xrd_tools.sources.selection import (
@@ -83,6 +84,18 @@ class PoniV3OverrideIntent:
             value["thickness_m"],
             value["parallax"],
         )
+
+
+def background_dark_rule(background) -> str:
+    """How a run with both a Background and a dark combines them.
+
+    ``"subtracted"``: the reducer removes the dark from the Background images
+    (frame − dark − scale·(Background − dark)); ``"as_is"``: they are already
+    dark-corrected (frame − dark − scale·Background). Recorded with every run that
+    has both, so outputs from before the rule was recorded (which used "as_is")
+    are told apart.
+    """
+    return "as_is" if background.dark_corrected else "subtracted"
 
 
 def _default_background():
@@ -888,6 +901,12 @@ class FrozenRunConfiguration:
     threshold: FrozenThresholdPolicy
     poni_file: str = ""
     mask_file: str = ""
+    #: Flat-field image applied in the integration normalization ("" = none).
+    flat_file: str = ""
+    #: Flat pixels below this fraction of the flat's median are masked as dead.
+    flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
+    #: Dark-current image subtracted before integration ("" = none).
+    dark_file: str = ""
     poni_v3_override: PoniV3OverrideIntent | None = None
     background: Any = field(default_factory=_default_background)
     project_root: str = ""
@@ -1007,6 +1026,14 @@ class FrozenRunConfiguration:
         )
         if self.background.mode != "None":
             value += (("background", _freeze_value(self.background.to_mapping())),)
+        if self.flat_file:
+            value += (("flat_file", str(self.flat_file)),)
+            if self.flat_min_fraction != DEFAULT_MIN_FLAT_FRACTION:
+                value += (("flat_min_fraction", float(self.flat_min_fraction)),)
+        if self.dark_file:
+            value += (("dark_file", str(self.dark_file)),)
+            if self.background.mode != "None":
+                value += (("background_dark", background_dark_rule(self.background)),)
         if self.poni_v3_override is not None:
             value += ((
                 "poni_v3_override",
@@ -1124,6 +1151,14 @@ class FrozenRunConfiguration:
         }
         if self.background.mode != "None":
             values["background"] = self.background.to_mapping()
+        if self.flat_file:
+            values["flat_file"] = self.flat_file
+            if self.flat_min_fraction != DEFAULT_MIN_FLAT_FRACTION:
+                values["flat_min_fraction"] = float(self.flat_min_fraction)
+        if self.dark_file:
+            values["dark_file"] = self.dark_file
+            if self.background.mode != "None":
+                values["background_dark"] = background_dark_rule(self.background)
         if self.poni_v3_override is not None:
             values["poni_v3_override"] = self.poni_v3_override.as_dict()
         return values
@@ -1148,6 +1183,16 @@ class FrozenRunConfiguration:
         return values
 
 
+def _flat_min_fraction(value: object) -> float:
+    """The flat cutoff as a float from 0 to below 1."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("the flat cutoff must be a number")
+    fraction = float(value)
+    if not math.isfinite(fraction) or not 0.0 <= fraction < 1.0:
+        raise ValueError("the flat cutoff must be from 0 to below 1")
+    return fraction
+
+
 @dataclass(slots=True)
 class RunIntent:
     """Mutable Controls-owned intent that freezes into one run generation."""
@@ -1165,6 +1210,12 @@ class RunIntent:
     poni_file: str = ""
     poni_values: Mapping[Any, Any] | None = None
     mask_file: str = ""
+    #: Flat-field image applied in the integration normalization ("" = none).
+    flat_file: str = ""
+    #: Flat pixels below this fraction of the flat's median are masked as dead.
+    flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
+    #: Dark-current image subtracted before integration ("" = none).
+    dark_file: str = ""
     poni_v3_override: PoniV3OverrideIntent | None = None
     background: Any = field(default_factory=_default_background)
     project_root: str = ""
@@ -1250,8 +1301,14 @@ class RunIntent:
             threshold=self.threshold.freeze(),
             poni_file=str(self.poni_file or ""),
             mask_file=str(self.mask_file or ""),
+            flat_file=str(self.flat_file or ""),
+            flat_min_fraction=_flat_min_fraction(self.flat_min_fraction),
+            dark_file=str(self.dark_file or ""),
             poni_v3_override=self.poni_v3_override,
-            background=self.background,
+            # "Already dark-corrected" matters only with a dark; without one it is
+            # not recorded, so it cannot set two runs apart.
+            background=(self.background if self.dark_file or not self.background.dark_corrected
+                        else replace(self.background, dark_corrected=False)),
             project_root=str(self.project_root or ""),
             save_path=str(self.save_path or ""),
             _bai_1d_args=_mapping_value(self.bai_1d_args),
@@ -1342,6 +1399,9 @@ class RunIntent:
                 else _detached_value(dict(self.poni_values))
             ),
             mask_file=self.mask_file,
+            flat_file=self.flat_file,
+            flat_min_fraction=self.flat_min_fraction,
+            dark_file=self.dark_file,
             poni_v3_override=self.poni_v3_override,
             background=self.background,
             project_root=self.project_root,
@@ -1372,6 +1432,9 @@ class RunIntent:
             poni_file=value.poni_file,
             poni_values=value.poni_values,
             mask_file=value.mask_file,
+            flat_file=value.flat_file,
+            flat_min_fraction=value.flat_min_fraction,
+            dark_file=value.dark_file,
             poni_v3_override=value.poni_v3_override,
             background=value.background,
             project_root=value.project_root,

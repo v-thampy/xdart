@@ -1933,10 +1933,12 @@ def _source_fact(fact, *, raw_options=None, read=False, token=None,
     except Exception as error: raise (error if isinstance(error, ReintegrateCancelled) or type(error) is ValueError and str(error).startswith("REPLACEMENT_") else ValueError("REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED" if Path(str(fact.get("path", ""))).suffix.lower() in {".h5", ".hdf5", ".nxs", ".cxi"} else "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"))
 def _background_fact(fact, shared, shape, path, token):
     from xrd_tools.reduction.background import FrameBackgroundPlan, _frame, _one, _tag, resolve_frame_background; plan = FrameBackgroundPlan.from_mapping(_plain(shared["background"])); pair = fact["background_dependency"]
-    if plan.mode == "None": _reject(pair is not None, "replacement inactive Background differs"); return None, None
+    if plan.mode == "None": _reject(pair is not None, "replacement inactive Background differs"); return (None, None, None), None
     _reject(pair is None, "replacement active Background is absent"); keys = tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key))); items = tuple((key, _tag(_one(fact["metadata"], key))) for key in keys); current = _frame((fact["label"], str(path.resolve(strict=True)), fact["snapshot"]["dataset_path"] or None, fact["frame_index"], tuple(shape), items)); result = resolve_frame_background(plan, current, cancelled=token)
     if result.disposition == "CANCELLED": _event(token); raise RuntimeError("Background returned CANCELLED without requested cancellation")
-    _reject(result.disposition != "RESOLVED" or (result.descriptor_bytes, result.fingerprint) != pair, "replacement Background dependency differs"); return result.background, pair
+    _reject(result.disposition != "RESOLVED" or (result.descriptor_bytes, result.fingerprint) != pair, "replacement Background dependency differs")
+    # The reducer removes the dark from the Background only where the run recorded it did.
+    return (result.background, result.variance_factor, result.scale if shared.get("background_dark") == "subtracted" else None), pair
 def _fact_projection(selected, shared):
     from xrd_tools.reduction.background import FrameBackgroundPlan
     background = FrameBackgroundPlan.from_mapping(_plain(shared["background"]))
@@ -1984,7 +1986,15 @@ def _calibration(shared, incidence=None):
     )
     return calibration, ai, fi
 def _validated_shared_science(run: Mapping[str, Any], requested: Mapping[str, Any] | None = None, *, geometry=None):
-    outer = dict(run); signed = outer.pop("scientific_signature", None); _reject(type(signed) is not dict, "persisted scientific signature is missing"); signed = dict(signed); assets = signed.pop("accepted_scientific_assets", None); _reject(signed != outer, "persisted duplicated scientific signature differs"); expected = {"schema_version", "generation", "fingerprint", "source", "processing_mode", "output_mode", "live_mode", "batch_mode", "max_cores", "gi", "threshold", "poni_file", "poni_values", "mask_file", "project_root", "save_path", "bai_1d_args", "bai_2d_args", "run_options"}; optional = ({"background"} if "background" in outer else set()) | ({"poni_v3_override"} if "poni_v3_override" in outer else set()); _reject(set(outer) != expected | optional, "persisted run configuration has a noncanonical keyset")
+    outer = dict(run); signed = outer.pop("scientific_signature", None); _reject(type(signed) is not dict, "persisted scientific signature is missing"); signed = dict(signed); assets = signed.pop("accepted_scientific_assets", None); _reject(signed != outer, "persisted duplicated scientific signature differs"); expected = {"schema_version", "generation", "fingerprint", "source", "processing_mode", "output_mode", "live_mode", "batch_mode", "max_cores", "gi", "threshold", "poni_file", "poni_values", "mask_file", "project_root", "save_path", "bai_1d_args", "bai_2d_args", "run_options"}; optional = ({"background"} if "background" in outer else set()) | ({"poni_v3_override"} if "poni_v3_override" in outer else set()) | {key for key in ("flat_file", "flat_min_fraction", "dark_file", "background_dark") if key in outer}; _reject(set(outer) != expected | optional, "persisted run configuration has a noncanonical keyset")
+    background = outer.get("background", {"version": 1, "mode": "None"}); both = type(background) is dict and background.get("mode") != "None" and "dark_file" in outer
+    _reject("background_dark" in outer and (not both or outer["background_dark"] not in ("subtracted", "as_is") or (outer["background_dark"] == "as_is") != (background.get("dark_corrected") is True)), "persisted Background dark rule is malformed")
+    # Earlier test builds combined the two without recording how, and not all the same way.
+    _reject(both and "background_dark" not in outer, "this output combined its Background and dark without recording how (an earlier test build); re-run it")
+    _reject("flat_min_fraction" in outer and ("flat_file" not in outer or type(outer["flat_min_fraction"]) is not float or not 0.0 <= outer["flat_min_fraction"] < 1.0), "persisted flat cutoff is malformed")
+    for key, name in (("flat", "flat field"), ("dark", "dark current")):
+        _reject(f"{key}_file" in outer and (type(outer[f"{key}_file"]) is not str or not outer[f"{key}_file"]), f"persisted {name} is malformed")
+        _reject((f"{key}_file" in outer) != (type(assets) is dict and f"{key}_sha256" in assets), f"persisted {name} and its accepted digest must be paired")
     if "poni_v3_override" in outer:
         try: override = __import__("xrd_tools.session.run_configuration", fromlist=["PoniV3OverrideIntent"]).PoniV3OverrideIntent.from_mapping(outer["poni_v3_override"])
         except (TypeError, ValueError) as error: raise ValueError("persisted PONI v3 override is malformed") from error
@@ -1996,9 +2006,11 @@ def _validated_shared_science(run: Mapping[str, Any], requested: Mapping[str, An
     accepted_poni = assets.get("poni_values") if type(assets) is dict else None; persisted_poni = outer.get("poni_values"); _reject(persisted_poni is not None and persisted_poni != accepted_poni, "accepted scientific assets are malformed")
     gi_projection = {key: persisted_gi[key] for key in ("enabled", "incidence_motor", "resolved_motor", "th_val", "sample_orientation", "tilt_angle")}
     if decoded_gi.enabled: gi_projection["gi_exit_angle_convention"] = decoded_gi.gi_exit_angle_convention
-    projection = {"version": 1, "gi": gi_projection, "threshold": outer.get("threshold"), "poni_values": accepted_poni if persisted_poni is None else persisted_poni, "accepted_scientific_assets": assets, "geometry": geometry, "background": outer.get("background", {"version": 1, "mode": "None"})}; _reject(requested is not None and projection != _plain(requested), "requested shared science differs from acquisition"); return projection
+    projection = {"version": 1, "gi": gi_projection, "threshold": outer.get("threshold"), "poni_values": accepted_poni if persisted_poni is None else persisted_poni, "accepted_scientific_assets": assets, "geometry": geometry, "background": background}
+    if both: projection["background_dark"] = outer["background_dark"]
+    _reject(requested is not None and projection != _plain(requested), "requested shared science differs from acquisition"); return projection
 def _validate_science(selected, shared, dimension):
-    from xrd_tools.reduction.background import FrameBackgroundPlan; _keys(selected, {"version", "dimension", "bai_args", "gi_mode"}, "selected_plan"); _keys(shared, {"version", "gi", "threshold", "poni_values", "accepted_scientific_assets", "geometry", "background"}, "requested_shared_science")
+    from xrd_tools.reduction.background import FrameBackgroundPlan; _keys(selected, {"version", "dimension", "bai_args", "gi_mode"}, "selected_plan"); _keys(shared, {"version", "gi", "threshold", "poni_values", "accepted_scientific_assets", "geometry", "background"} | ({"background_dark"} if "background_dark" in shared else set()), "requested_shared_science"); _reject("background_dark" in shared and shared["background_dark"] not in ("subtracted", "as_is"), "Background dark rule is malformed")
     _reject(type(dimension) is not str or dimension not in {"1d", "2d"} or type(selected["version"]) is not int or selected["version"] != 1 or type(selected["dimension"]) is not str or selected["dimension"] != dimension or type(selected["bai_args"]) is not dict or {"gi_mode_1d", "gi_mode_2d"} & set(selected["bai_args"]) or type(shared["version"]) is not int or shared["version"] != 1, "preparation version/dimension")
     gi, threshold, assets = shared["gi"], shared["threshold"], shared["accepted_scientific_assets"]; geometry = shared["geometry"]
     if geometry is not None:
@@ -2007,7 +2019,7 @@ def _validate_science(selected, shared, dimension):
         except (TypeError, ValueError, KeyError) as error: raise ValueError("geometry science is malformed") from error
         _reject(parsed_geometry.to_json() != mapping_json or geometry["convention"] != getattr(parsed_geometry, "preset", getattr(parsed_geometry, "convention", None)) or geometry["motor_sources"] != {motor: motor for motor in parsed_geometry.all_referenced_motors()}, "geometry science is malformed")
     gi_keys = {"enabled", "incidence_motor", "resolved_motor", "th_val", "sample_orientation", "tilt_angle"}
-    _keys(gi, gi_keys | ({"gi_exit_angle_convention"} if gi.get("enabled") else set()), "gi"); _keys(threshold, {"apply_threshold", "threshold_min", "threshold_max", "mask_saturation"}, "threshold"); _keys(assets, {"poni_values", "poni_detector_config_json", "poni_sha256", "mask_sha256"}, "accepted_scientific_assets")
+    _keys(gi, gi_keys | ({"gi_exit_angle_convention"} if gi.get("enabled") else set()), "gi"); _keys(threshold, {"apply_threshold", "threshold_min", "threshold_max", "mask_saturation"}, "threshold"); _keys(assets, {"poni_values", "poni_detector_config_json", "poni_sha256", "mask_sha256"} | {key for key in ("flat_sha256", "dark_sha256") if key in assets}, "accepted_scientific_assets")
     finite = lambda value: type(value) is float and math.isfinite(value)
     if gi["enabled"]:
         from xrd_tools.corrections.grazing import validate_gi_exit_angle_convention
@@ -2015,7 +2027,7 @@ def _validate_science(selected, shared, dimension):
         except ValueError as error: raise ValueError("GI science is malformed") from error
     _reject(type(gi["enabled"]) is not bool or any(type(gi[k]) is not str or not gi[k] for k in ("incidence_motor", "resolved_motor")) or gi["enabled"] and gi["incidence_motor"] != gi["resolved_motor"] or not finite(gi["th_val"]) or type(gi["sample_orientation"]) is not int or not 1 <= gi["sample_orientation"] <= 8 or not finite(gi["tilt_angle"]), "GI science is malformed"); _reject(any(type(threshold[k]) is not bool for k in ("apply_threshold", "mask_saturation")) or any(v is not None and not finite(v) for v in (threshold["threshold_min"], threshold["threshold_max"])) or threshold["threshold_min"] is not None and threshold["threshold_max"] is not None and threshold["threshold_min"] > threshold["threshold_max"], "threshold science is malformed")
     digest = lambda value: value is None or type(value) is str and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
-    _reject(shared["poni_values"] != assets["poni_values"] or (assets["poni_values"] is None) != (assets["poni_detector_config_json"] is None) or not all(digest(assets[k]) for k in ("poni_sha256", "mask_sha256")), "accepted scientific assets are malformed")
+    _reject(shared["poni_values"] != assets["poni_values"] or (assets["poni_values"] is None) != (assets["poni_detector_config_json"] is None) or not all(digest(assets[k]) for k in ("poni_sha256", "mask_sha256")) or any(key in assets and (assets[key] is None or not digest(assets[key])) for key in ("flat_sha256", "dark_sha256")), "accepted scientific assets are malformed")
     if assets["poni_detector_config_json"] is not None:
         try: parsed = json.loads(assets["poni_detector_config_json"]); canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":"), allow_nan=False)
         except (TypeError, ValueError, json.JSONDecodeError) as error: raise ValueError("accepted detector config is malformed") from error
@@ -2027,7 +2039,7 @@ def _validate_science(selected, shared, dimension):
     domains = {"1d": {"q_total", "q_ip", "q_oop", "exit_angle", "chi_gi"}, "2d": {"qip_qoop", "q_chi", "exit_angles"}}; _reject(gi["enabled"] != (selected["gi_mode"] is not None) or selected["gi_mode"] is not None and selected["gi_mode"] not in domains[dimension] or normalized != selected["bai_args"], "selected GI mode/BAI differs"); return plan
 def _dimension_audit(*, dimension: str, operation_identity: str, science_identity: str, acquisition_fingerprint: str, requested_shared_science: Mapping[str, Any], selected_plan: Mapping[str, Any], append_lineage: bytes | None): return {"schema_version": 1, "operation": "existing_dimension_replacement", "dimension": dimension, "operation_identity": operation_identity, "science_identity": science_identity, "acquisition_fingerprint": acquisition_fingerprint, "shared_science_fingerprint": science_fingerprint(_plain(requested_shared_science)), "selected_plan": _plain(selected_plan), "selected_gi_mode": selected_plan.get("gi_mode"), "append_lineage_action": ("already_absent" if append_lineage is None else "preserved_append_disabled"), "append_lineage_sha256": (None if append_lineage is None else hashlib.sha256(append_lineage).hexdigest())}
 def _audit_identity(audit: Mapping[str, Any]) -> str: return hashlib.sha256(_canonical(audit)).hexdigest()
-def _scrub_frame(frame): frame.image = frame.background = frame.geometry = frame.source_identity = frame.source_path = frame.loader = frame.mask = None; frame.source_frame_index = frame.normalization_factor = None; frame.background_dependency_bytes = frame.background_dependency_fingerprint = None; frame.metadata.clear()
+def _scrub_frame(frame): frame.image = frame.background = frame.background_variance_factor = frame.background_scale = frame.geometry = frame.source_identity = frame.source_path = frame.loader = frame.mask = None; frame.source_frame_index = frame.normalization_factor = None; frame.background_dependency_bytes = frame.background_dependency_fingerprint = None; frame.metadata.clear()
 
 
 def _target_stat_revision(value):
@@ -2217,6 +2229,42 @@ def _persisted_mask(group, shape, *, read: bool):
     mask = np.zeros(shape, dtype=bool)
     mask.ravel()[flat.astype(np.intp, copy=False)] = True
     return spec, mask
+
+
+#: Persisted detector corrections: accepted digest key, dataset, and name.
+_PERSISTED_CORRECTIONS = {
+    "flat": ("flat_sha256", "flatfield", "flat field"),
+    "dark": ("dark_sha256", "darkcurrent", "dark current"),
+}
+
+
+def _load_persisted_correction(target, entry, shape, snapshot, target_revision, shared, role):
+    """Read and verify the output's persisted flat field or dark current, or None."""
+
+    import hashlib
+    import h5py
+    import numpy as np
+
+    key, dataset, name = _PERSISTED_CORRECTIONS[role]
+    assets = shared.get("accepted_scientific_assets")
+    if not isinstance(assets, Mapping) or assets.get(key) is None:
+        return None
+    with _open_target_hdf(target) as handle:
+        _target_hdf_fence(handle, target, snapshot, target_revision)
+        group = _replacement_hard_group(handle, entry)
+        _reject(group is None, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
+        node = _replacement_hard_group(group, f"instrument/detector/{dataset}", h5py.Dataset)
+        _reject(node is None, f"processed {name} is missing")
+        _reject(node.dtype != np.dtype(np.float32) or tuple(node.shape) != tuple(shape)
+                or set(node.attrs) != {"description", "sha256"},
+                f"processed {name} is malformed")
+        value = np.asarray(node[()], dtype=np.float32)
+        recorded = node.attrs["sha256"]
+        recorded = recorded.decode() if isinstance(recorded, bytes) else str(recorded)
+        _reject(hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest() != recorded,
+                f"processed {name} changed")
+        _target_hdf_fence(handle, target, snapshot, target_revision)
+    return value
 
 
 def _load_persisted_mask(target, entry, shape, snapshot, target_revision,
@@ -2414,10 +2462,10 @@ def _inspect_artifact(target: Path, entry: str, dimension: str,
         mask_spec, mask = _persisted_mask(group, shape, read=read_mask)
         _target_hdf_fence(handle, target, snapshot, target_revision)
     fingerprint = run.get("fingerprint"); _reject(type(fingerprint) is not str or len(fingerprint) != 64 or any(c not in "0123456789abcdef" for c in fingerprint), "processed acquisition identity is malformed"); return _ArtifactInspection(labels, shape, dtype, shared, selected, fingerprint, source_base, lineage, MappingProxyType(values), mask_spec, mask, raw, topology)
-def _core_plan(selected: Mapping[str, Any], shared: Mapping[str, Any], mask=None):
+def _core_plan(selected: Mapping[str, Any], shared: Mapping[str, Any], mask=None, flat=None, dark=None):
     from xrd_tools.session.readiness import build_native_int_reduction_plan_from_args; args = dict(selected["bai_args"]); dimension = selected["dimension"]; gi = shared["gi"]; threshold = shared["threshold"]
     if gi["enabled"]: args[f"gi_mode_{dimension}"] = selected["gi_mode"]
-    plan = build_native_int_reduction_plan_from_args(args if dimension == "1d" else None, args if dimension == "2d" else None, gi_enabled=gi["enabled"], gi_incident_angle=(gi["th_val"] if gi["enabled"] and gi["resolved_motor"] == "Manual" else None), incidence_motor=(None if not gi["enabled"] or gi["resolved_motor"] == "Manual" else gi["resolved_motor"]), tilt_angle=gi["tilt_angle"], sample_orientation=gi["sample_orientation"], gi_exit_angle_convention=gi.get("gi_exit_angle_convention", "xdart_reflection_qoop_v1"), integrate_1d=dimension == "1d", integrate_2d=dimension == "2d", threshold_min=(threshold["threshold_min"] if threshold["apply_threshold"] else None), threshold_max=(threshold["threshold_max"] if threshold["apply_threshold"] else None), mask_saturation=threshold["mask_saturation"]); plan.mask = mask; return plan
+    plan = build_native_int_reduction_plan_from_args(args if dimension == "1d" else None, args if dimension == "2d" else None, gi_enabled=gi["enabled"], gi_incident_angle=(gi["th_val"] if gi["enabled"] and gi["resolved_motor"] == "Manual" else None), incidence_motor=(None if not gi["enabled"] or gi["resolved_motor"] == "Manual" else gi["resolved_motor"]), tilt_angle=gi["tilt_angle"], sample_orientation=gi["sample_orientation"], gi_exit_angle_convention=gi.get("gi_exit_angle_convention", "xdart_reflection_qoop_v1"), integrate_1d=dimension == "1d", integrate_2d=dimension == "2d", threshold_min=(threshold["threshold_min"] if threshold["apply_threshold"] else None), threshold_max=(threshold["threshold_max"] if threshold["apply_threshold"] else None), mask_saturation=threshold["mask_saturation"]); plan.mask = mask; plan.flat = flat; plan.dark = dark; return plan
 def _prepare_gi_scouts(target, entry, observed, selected, shared, snapshot, target_revision, *, cancel_token=None):
     _event(cancel_token); gi = shared["gi"]
     if not gi["enabled"] or gi["resolved_motor"] == "Manual": return selected, None
@@ -2440,8 +2488,8 @@ def _prepare_gi_scouts(target, entry, observed, selected, shared, snapshot, targ
                 _target_hdf_fence(handle, target, snapshot, target_revision)
                 fact = _decode_replacement_fact(handle, label, entry=entry, context=(observed.source_base, observed.topology.lineage, observed.topology.execution), metadata_keys=metadata_keys, include_geometry=include_geometry)
                 _target_hdf_fence(handle, target, snapshot, target_revision)
-            path, image, background, pair = _load_fact(fact, observed.detector_shape, observed.native_dtype, shared, cancel_token, observed.raw_options, observed.topology)
-            current.source_path, current.source_frame_index, current.source_identity = path, fact["frame_index"], fact; current.metadata.update(fact["metadata"]); current.background = background; current.geometry = _geometry_fact(fact, shared)
+            path, image, (background, variance_factor, background_scale), pair = _load_fact(fact, observed.detector_shape, observed.native_dtype, shared, cancel_token, observed.raw_options, observed.topology)
+            current.source_path, current.source_frame_index, current.source_identity = path, fact["frame_index"], fact; current.metadata.update(fact["metadata"]); current.background = background; current.background_variance_factor = variance_factor; current.background_scale = background_scale; current.geometry = _geometry_fact(fact, shared)
             if pair is not None: current.background_dependency_bytes, current.background_dependency_fingerprint = pair
             holder["frame"] = current; return image
         frame.loader = load
@@ -2461,19 +2509,29 @@ def _requirements(shape, dtype, selected, shared):
         background_binding_bytes=terms[3],
     )
 def _allocation_recipe(allocation: SessionResourceAllocation) -> dict[str, Any]: return {"requirements": {f.name: getattr(allocation.requirements, f.name) for f in fields(SessionResourceRequirements)}, "envelope_bytes": allocation.envelope_bytes, "counts": dict(allocation.counts), "categories": dict(allocation.categories), "minimum_bytes": allocation.minimum_bytes, "floor_bytes": allocation.floor_bytes, "assigned_bytes": allocation.assigned_bytes, "origin": allocation.origin, "oversize_excess_bytes": allocation.oversize_excess_bytes}
-def _mask_owner_block_bytes(req, mask_spec):
-    """Return the exact frame-quantized owner needed at mask decode peak."""
+def _persisted_correction_bytes(shared, shape) -> int:
+    """The retained bytes of the persisted float32 flat field and dark current."""
+    assets = shared.get("accepted_scientific_assets") if isinstance(shared, Mapping) else None
+    if not isinstance(assets, Mapping):
+        return 0
+    count = sum(assets.get(key) is not None for key, _, _ in _PERSISTED_CORRECTIONS.values())
+    return 4 * int(shape[0]) * int(shape[1]) * count
 
-    if not mask_spec.retained_bytes:
+
+def _mask_owner_block_bytes(req, mask_spec, correction_bytes=0):
+    """Return the exact frame-quantized owner needed at mask decode peak,
+    including the retained flat field and dark current."""
+
+    if not mask_spec.retained_bytes and not correction_bytes:
         return None
-    peak = mask_spec.retained_bytes + mask_spec.decode_bytes
+    peak = mask_spec.retained_bytes + mask_spec.decode_bytes + int(correction_bytes)
     frame = req.native_frame_bytes
     return max(frame, ((peak + frame - 1) // frame) * frame)
 
 
-def _policy(req, spec: Mapping[str, Any], mask_spec=None) -> SessionPolicy:
+def _policy(req, spec: Mapping[str, Any], mask_spec=None, correction_bytes=0) -> SessionPolicy:
     mask_spec = mask_spec or _PersistedMaskSpec(0, 0)
-    owner = _mask_owner_block_bytes(req, mask_spec)
+    owner = _mask_owner_block_bytes(req, mask_spec, correction_bytes)
     _keys(spec, ({"version", "kind", "envelope_bytes", "requests"} if spec.get("kind") == "resolve" else {"version", "kind", "allocation"}), "resource_policy"); _reject(type(spec["version"]) is not int or spec["version"] != 1, "resource policy version")
     if spec["kind"] == "resolve":
         requests = spec["requests"]
@@ -2529,7 +2587,7 @@ class ReintegratePlan:
         _reject(expected_labels is not None and labels != expected_labels, "EXPECTED_LABELS_CHANGED")
         if persisted: shared = _plain(observed.persisted_shared_science); selected = _resolve_persisted_selected(selected, shared, dimension, None)
         else: _reject(_plain(observed.persisted_shared_science) != shared, "shared science differs")
-        req = _requirements(observed.detector_shape, observed.native_dtype, selected, shared); policy = _policy(req, preparation["resource_policy"], observed.mask_spec)
+        req = _requirements(observed.detector_shape, observed.native_dtype, selected, shared); policy = _policy(req, preparation["resource_policy"], observed.mask_spec, _persisted_correction_bytes(shared, observed.detector_shape))
         mask = _load_persisted_mask(path, entry, observed.detector_shape, snapshot, target_revision, observed.mask_spec) if observed.mask_spec.retained_bytes else None
         observed = observed._replace(mask=mask)
         selected, bootstrap = _prepare_gi_scouts(path, entry, observed, selected, shared, snapshot, target_revision, cancel_token=cancel_token); _event(cancel_token); _reject(capture_target_snapshot(path) != snapshot or _target_object_revision(path, snapshot) != target_revision, "TARGET_SNAPSHOT_CHANGED"); _event(cancel_token); return _make_plan(str(path), entry, observed.source_base, dimension, labels, observed.detector_shape, observed.native_dtype, selected, shared, bootstrap, observed.mask_spec.retained_bytes, observed.mask_spec.decode_bytes, policy, snapshot=snapshot)
@@ -2545,7 +2603,7 @@ class ReintegratePlan:
         _reject(session["flush"] != {"interval": 8, "cap": 64, "margin": 8}, "recipe flush policy")
         _reject(type(value["labels"]) is not list or type(value["detector_shape"]) is not list, "recipe tuple fields are not JSON arrays"); selected, shared = _plain(_freeze(value["selected_plan"])), _plain(_freeze(value["requested_shared_science"])); _validate_science(selected, shared, value["dimension"])
         mask_spec = _mask_spec(value["retained_mask_bytes"], value["mask_decode_bytes"], value["detector_shape"], "recipe persisted-mask resources")
-        req = _requirements(tuple(value["detector_shape"]), value["native_dtype"], selected, shared); policy = _policy(req, {"version": 1, "kind": "explicit", "allocation": session["allocation"]}, mask_spec)
+        req = _requirements(tuple(value["detector_shape"]), value["native_dtype"], selected, shared); policy = _policy(req, {"version": 1, "kind": "explicit", "allocation": session["allocation"]}, mask_spec, _persisted_correction_bytes(shared, value["detector_shape"]))
         return _make_plan(value["target"], value["entry"], value["source_root"], value["dimension"], tuple(value["labels"]), tuple(value["detector_shape"]), value["native_dtype"], selected, shared, value["gi_bootstrap_incidence"], value["retained_mask_bytes"], value["mask_decode_bytes"], policy, snapshot=snapshot, expected_science=value["science_identity"], expected_operation=value["operation_identity"])
 def _plan_mapping(plan: ReintegratePlan) -> dict[str, Any]: return {"api_version": _REINTEGRATE_PLAN_API_VERSION, "target": plan.target, "entry": plan.entry, "source_root": plan.source_root, "expected_target_snapshot": _snapshot_mapping(plan.expected_target_snapshot), "dimension": plan.dimension, "labels": list(plan.labels), "detector_shape": list(plan.detector_shape), "native_dtype": plan.native_dtype, "selected_plan": _plain(plan.selected_plan), "requested_shared_science": _plain(plan.requested_shared_science), "gi_bootstrap_incidence": plan.gi_bootstrap_incidence, "retained_mask_bytes": plan.retained_mask_bytes, "mask_decode_bytes": plan.mask_decode_bytes, "session_policy": {"flush": {"interval": 8, "cap": 64, "margin": 8}, "allocation": _allocation_recipe(plan.resource_allocation)}, "rollback_policy": plan.rollback_policy, "science_identity": plan.science_identity, "operation_identity": plan.operation_identity}
 def _make_plan(path, entry, source_root, dimension, labels, shape, dtype, selected, shared, bootstrap, retained_mask_bytes, mask_decode_bytes, policy, *, snapshot=None, expected_science=None, expected_operation=None):
@@ -2554,7 +2612,7 @@ def _make_plan(path, entry, source_root, dimension, labels, shape, dtype, select
     mask_spec = _mask_spec(retained_mask_bytes, mask_decode_bytes, shape,
                            "plan persisted-mask resources")
     expected_owner = _mask_owner_block_bytes(policy.allocation.requirements,
-                                             mask_spec)
+                                             mask_spec, _persisted_correction_bytes(shared, shape))
     _reject(expected_owner is not None
             and policy.allocation.owner_block_bytes != expected_owner,
             "REINTEGRATE_MASK_OWNER_BLOCK_GRANT_CHANGED")
@@ -2843,9 +2901,9 @@ class _ReintegrateFrameSource:
             _reject(self._topology is None,
                     "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
             _require_fact_topology(fact, self._topology)
-            path, image, background, pair = _load_fact(fact, self.plan.detector_shape, self.plan.native_dtype, self.plan.requested_shared_science, self.token, self.raw_options, self._topology, self._direct_hdf)
+            path, image, (background, variance_factor, background_scale), pair = _load_fact(fact, self.plan.detector_shape, self.plan.native_dtype, self.plan.requested_shared_science, self.token, self.raw_options, self._topology, self._direct_hdf)
             revision = int(fact["snapshot"]["mtime_ns"]); gi = self.plan.requested_shared_science["gi"]; incidence = fact["metadata"].get(gi["resolved_motor"]); _reject(gi["enabled"] and gi["resolved_motor"] != "Manual" and (type(incidence) is not float or not math.isfinite(incidence) or frame.index == self.plan.labels[0] and incidence != self.plan.gi_bootstrap_incidence), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
-            frame.source_path, frame.source_frame_index, frame.source_identity = path, fact["frame_index"], fact; frame.metadata.update(fact["metadata"]); frame.background = background
+            frame.source_path, frame.source_frame_index, frame.source_identity = path, fact["frame_index"], fact; frame.metadata.update(fact["metadata"]); frame.background = background; frame.background_variance_factor = variance_factor; frame.background_scale = background_scale
             frame.geometry = _geometry_fact(fact, self.plan.requested_shared_science)
             if pair is not None: frame.background_dependency_bytes, frame.background_dependency_fingerprint = pair
             geometry = None if frame.geometry is None else {key: getattr(frame.geometry, key) for key in ("rot1", "rot2", "rot3", "incident_angle")}; dependency = None if frame.background_dependency_bytes is None and frame.background_dependency_fingerprint is None else (frame.background_dependency_bytes, frame.background_dependency_fingerprint); _reject(frame.index != fact["label"] or frame.source_path != path or frame.source_frame_index != fact["frame_index"] or frame.source_identity is not fact or dict(frame.metadata) != dict(fact["metadata"]) or geometry != (None if not fact["geometry"] else dict(fact["geometry"])) or dependency != fact["background_dependency"], "replacement local JIT stub differs")

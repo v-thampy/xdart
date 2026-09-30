@@ -320,3 +320,22 @@ def test_embedded_spec_projection_respects_metadata_table_column_bound(
     )
     with pytest.raises(ValueError, match="exceeds the table column bound"):
         MetadataTablePlan(source)
+
+
+def test_motor_names_read_the_scan_header_alone(tmp_path, monkeypatch):
+    """Codex audit G-F2: the Stitch page's one source read (its incidence and tilt choices) is the
+    scan's #O header; the scan's data table is never read."""
+    from silx.io import specfile
+    from xrd_tools.io.spec import read_spec_scan_motor_names
+    path = tmp_path / "myscan"
+    path.write_text(_SPEC)
+    scans, init = [], specfile.Scan.__init__
+
+    def recording(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        scans.append(self)
+
+    monkeypatch.setattr(specfile.Scan, "__init__", recording)
+    monkeypatch.setattr(specfile.Scan, "data", property(lambda self: pytest.fail("the data table was read")))
+    assert read_spec_scan_motor_names(path) == ("th", "chi", "phi")
+    assert scans and all(scan._data is None for scan in scans)

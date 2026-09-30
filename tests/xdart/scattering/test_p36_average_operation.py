@@ -2197,3 +2197,30 @@ def test_a_published_unverified_average_is_not_shown_as_success_or_abort(
     # The operator is told WHICH file is now sitting there, unverified.
     assert result.target in terminal.diagnostic
     assert "could not be verified" in terminal.diagnostic
+
+
+def test_average_calibration_carries_an_admitted_flat_and_refuses_a_missing_one(tmp_path) -> None:
+    import hashlib
+    from xrd_tools.session.experiment_state import FactStatus
+    poni = tmp_path / "flat.poni"
+    poni.write_text(
+        "poni_version: 2.1\nDetector: Detector\n"
+        'Detector_config: {"pixel1": 0.0001, "pixel2": 0.0001, "max_shape": [4, 4], "orientation": 3}\n'
+        "Distance: 0.2\nPoni1: 0.001\nPoni2: 0.001\nRot1: 0.0\nRot2: 0.0\nRot3: 0.0\n"
+        "Wavelength: 1e-10\n"
+    )
+    flat = tmp_path / "flat.npy"
+    np.save(flat, np.full((4, 4), 2.0))
+    state = adapter._average_calibration(SimpleNamespace(
+        poni_file=str(poni), mask_file="", flat_file=str(flat),
+    ))
+    assert state.flat.status is FactStatus.PRESENT
+    assert state.flat.source_uri == str(flat) and state.flat.shape == (4, 4)
+    assert state.flat.sha256 == hashlib.sha256(flat.read_bytes()).hexdigest()
+    assert adapter._average_calibration(SimpleNamespace(
+        poni_file=str(poni), mask_file="",
+    )).flat.status is FactStatus.ABSENT
+    with pytest.raises(ValueError, match="flat field file is unavailable"):
+        adapter._average_calibration(SimpleNamespace(
+            poni_file=str(poni), mask_file="", flat_file=str(tmp_path / "missing.npy"),
+        ))

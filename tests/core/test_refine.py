@@ -38,8 +38,8 @@ def _synth_control_frames(truth, frames_dn, *, n_rings=24, tol=0.003,
     cal = truth.calibration
     wl = cal.poni.wavelength
     det = detector_factory("Pilatus300kw", config={"orientation": 3})
-    lab6 = get_calibrant("LaB6"); lab6.set_wavelength(wl)
-    q_ring = 2.0 * np.pi / np.asarray(lab6.get_dSpacing())
+    lab6 = get_calibrant("LaB6"); lab6.wavelength = wl
+    q_ring = 2.0 * np.pi / np.asarray(lab6.dspacing)
     rng = np.random.RandomState(seed)
 
     out = []

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 
 CONTROLS_CARD_CORNERS_SETTINGS_KEY = "appearance/controls_card_corners"
-DEFAULT_CONTROLS_CARD_CORNERS = True
+DEFAULT_CONTROLS_CARD_CORNERS = False
 
 _current_controls_card_corners = DEFAULT_CONTROLS_CARD_CORNERS
 

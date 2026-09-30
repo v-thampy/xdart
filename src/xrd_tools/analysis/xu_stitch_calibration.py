@@ -152,8 +152,9 @@ class XuStitchCalibrationProjection:
         if (
             _claim is not _PROJECTION_FACTORY
             or type(self.canonical_json) is not str
-            or self.raw_sha256 != _RESOURCE_SHA256
-            or self.semantic_fingerprint != _RESOURCE_SEMANTIC_FINGERPRINT
+            or self.raw_sha256 != hashlib.sha256(self.canonical_json.encode()).hexdigest()
+            or self.semantic_fingerprint != analysis_canonical_fingerprint(
+                "xu-stitch-calibration-asset-v1", json.loads(self.canonical_json))
             or not isinstance(self._value, MappingProxyType)
         ):
             raise TypeError("XU calibration projection is not factory-owned")
@@ -255,7 +256,11 @@ def parse_xu_stitch_calibration_bytes(
         "xu-stitch-calibration-asset-v1", value
     )
     raw_sha256 = hashlib.sha256(raw).hexdigest()
-    if (
+    if value.get("version") == 2 and type(value.get("version")) is int:
+        _validate_authored_surface(value)
+    elif value.get("version") == 3 and type(value.get("version")) is int:
+        _validate_extended_surface(value)
+    elif (
         len(raw) != _RESOURCE_BYTE_COUNT
         or raw_sha256 != _RESOURCE_SHA256
         or semantic != _RESOURCE_SEMANTIC_FINGERPRINT
@@ -275,6 +280,307 @@ def parse_xu_stitch_calibration_bytes(
         _freeze_projection(value),
         _PROJECTION_FACTORY,
     )
+
+
+def _validate_authored_surface(value):
+    """Version 2 permits fitted values under the same fixed SURFACE model.
+
+    V1 still requires its exact authenticated bytes. Authored calibrations
+    have a distinct version, strict key sets and actual fit diagnostics.
+    """
+    reference = json.loads(canonical_surface_resource_bytes())
+    def require(ok, message):
+        if not ok:
+            _refuse("XU_CALIBRATION_SCHEMA_UNSUPPORTED", message)
+    def number(v):
+        return type(v) in {int, float} and math.isfinite(v)
+    require(value['schema'] == reference['schema'] and value['preset'] == reference['preset'],
+            'unsupported authored calibration model')
+    require(value['xrayutilities'] == reference['xrayutilities'], 'SURFACE circle/camera/runtime conventions must match')
+    for section in ('detector', 'acquisition', 'corrections'):
+        require(type(value[section]) is dict and set(value[section]) == set(reference[section]),
+                f'authored {section} keys differ')
+    detector, acquisition, correction, validation = (value[k] for k in ('detector', 'acquisition', 'corrections', 'validation'))
+    for key in ('mask_policy', 'sensor_policy', 'sensor_material', 'sensor_thickness_m', 'parallax', 'pyfai_validated_version'):
+        require(detector[key] == reference['detector'][key], f'unsupported detector {key}')
+    shape = detector['shape']
+    require(type(shape) is list and len(shape) == 2 and all(type(v) is int and v > 0 for v in shape)
+            and math.prod(shape) <= 1 << 25, 'invalid detector shape')
+    for key in ('distance_m', 'pixel1_m', 'pixel2_m'):
+        require(number(detector[key]) and detector[key] > 0, f'invalid detector {key}')
+    require(0 < detector['distance_m'] < 100, 'implausible detector distance')
+    for key, size in zip(('cch1_px', 'cch2_px'), shape):
+        require(number(detector[key]) and -size <= detector[key] <= 2 * size, 'implausible detector centre')
+    require(type(detector['detector_factory_name']) is str and bool(detector['detector_factory_name']), 'detector name required')
+    cfg = detector['detector_config']
+    require(type(cfg) is dict and set(cfg) <= {'orientation', 'pixel1', 'pixel2', 'max_shape'}, 'unsupported authored detector configuration')
+    require(cfg.get('orientation') in (1, 2, 3, 4) and cfg.get('pixel1') == detector['pixel1_m']
+            and cfg.get('pixel2') == detector['pixel2_m'], 'detector configuration disagrees with pitch/orientation')
+    require('max_shape' not in cfg or cfg['max_shape'] == shape, 'detector max_shape differs')
+    require(type(detector['mask_count']) is int and 0 <= detector['mask_count'] < math.prod(shape), 'invalid intrinsic mask count')
+    for digest in (detector['mask_sha256'], correction['solid_angle_sha256']):
+        require(type(digest) is str and len(digest) == 64 and all(c in '0123456789abcdef' for c in digest), 'invalid correction digest')
+    mutable = {'detector_offsets_deg', 'energy_eV', 'image_rotation_quarter_turns', 'source_motors',
+               'xdart_wavelength_A', 'xu_mapping_wavelength_A'}
+    require(all(acquisition[k] == v for k, v in reference['acquisition'].items() if k not in mutable), 'unsupported acquisition policy')
+    require(type(acquisition['image_rotation_quarter_turns']) is int and acquisition['image_rotation_quarter_turns'] in range(4), 'invalid image rotation')
+    for key in ('source_motors', 'detector_offsets_deg'):
+        require(type(acquisition[key]) is dict and set(acquisition[key]) == {'del', 'nu'}, 'two detector motors required')
+    motors = acquisition['source_motors']
+    # a single 2θ arm (fourc, twoc) names no motor (null) for the circle it holds at zero:
+    # nu for a vertical arm, del for a horizontal one
+    held = [circle for circle, motor in motors.items() if motor is None]
+    require(len(held) <= 1 and all(type(motor) is str and motor for motor in motors.values() if motor is not None)
+            and len({motor for motor in motors.values() if motor is not None}) == 2 - len(held),
+            'distinct source motors required')
+    require(all(number(v) and abs(v) <= 5 for v in acquisition['detector_offsets_deg'].values()), 'motor offsets exceed fit bounds')
+    require(number(acquisition['energy_eV']) and acquisition['energy_eV'] > 0, 'positive energy required')
+    expected = 1.239841984e4 / acquisition['energy_eV']
+    require(number(acquisition['xdart_wavelength_A']) and math.isclose(acquisition['xdart_wavelength_A'], expected, rel_tol=1e-12), 'energy and wavelength disagree')
+    require(number(acquisition['xu_mapping_wavelength_A']) and math.isclose(acquisition['xu_mapping_wavelength_A'], expected, rel_tol=1e-6), 'XU energy and wavelength disagree')
+    require(all(correction[k] == v for k, v in reference['corrections'].items()
+                if k not in {'solid_angle_policy', 'solid_angle_sha256'}), 'unsupported correction policy')
+    require(correction['solid_angle_policy'] == 'calibrated_pyfai_detector_header_v1', 'authored solid-angle policy required')
+    keys = {'authoring_policy', 'control_domain_source_deg', 'validated_scan_domain_source_deg',
+            'geometry_control_frame_count', 'geometry_control_point_count', 'geometry_rms_q_A^-1', 'condition_number'}
+    require(type(validation) is dict and set(validation) == keys, 'authored diagnostics required')
+    require(validation['authoring_policy'] == 'surface_control_points_bounded_fit_v1', 'unsupported authoring policy')
+    require(type(validation['geometry_control_frame_count']) is int and 3 <= validation['geometry_control_frame_count'] <= 32
+            and type(validation['geometry_control_point_count']) is int and validation['geometry_control_point_count'] > 5, 'insufficient control points')
+    require(number(validation['geometry_rms_q_A^-1']) and 0 <= validation['geometry_rms_q_A^-1'] <= .03
+            and number(validation['condition_number']) and 1 <= validation['condition_number'] <= 1e8, 'unusable calibration fit')
+    for name in ('control_domain_source_deg', 'validated_scan_domain_source_deg'):
+        domain = validation[name]
+        require(type(domain) is dict and set(domain) == {'del', 'nu'}, 'invalid calibration domain')
+        for limits in domain.values():
+            require(type(limits) is list and len(limits) == 2 and all(number(v) for v in limits)
+                    and -360 <= limits[0] <= limits[1] <= 360, 'invalid angular limits')
+    require(all(validation['validated_scan_domain_source_deg'][motor][0] <= limits[0] <= limits[1]
+                <= validation['validated_scan_domain_source_deg'][motor][1]
+                for motor, limits in validation['control_domain_source_deg'].items()), 'run domain must enclose control coverage')
+    require(all(validation[name][circle] == [0, 0] for circle in held for name in (
+        'control_domain_source_deg', 'validated_scan_domain_source_deg')),
+        f'a single 2θ arm holds {" and ".join(held) or "a circle"} at zero')
+
+
+#: Version 3: the SURFACE model plus xrayutilities' detector tilt/rotation and sample
+#: displacement, transferred from a pyFAI extended arm, with that arm's per-frame solid angle.
+EXTENDED_SOLID_ANGLE_POLICY = "per_frame_pyfai_extended_arm_v1"
+EXTENDED_AUTHORING_POLICY = "pyfai_extended_arm_transfer_v1"
+EXTENDED_TRANSFER_GATE_A = 1e-8
+_EXTENDED_DETECTOR_KEYS = frozenset({"detrot_deg", "tilt_deg", "tiltazimuth_deg"})
+_EXTENDED_ARM_KEYS = frozenset({
+    "marker", "detector", "detector_config", "wavelength_m", "dist_m", "poni1_m", "poni2_m",
+    "nu_offset", "nu_scale", "del_offset", "del_scale", "beam_rotation", "mount_tilt",
+    "mount_roll", "sample_offset1", "sample_offset2", "sample_offset3", "source_motors",
+})
+_EXTENDED_VALIDATION_KEYS = frozenset({
+    "authoring_policy", "control_domain_source_deg", "validated_scan_domain_source_deg",
+    "transfer_frame_count", "validation_frame_count", "validation_pixel_count",
+    "transfer_max_abs_dq_A^-1", "transfer_gate_A^-1",
+})
+
+
+def extended_arm_digest(arm) -> str:
+    """The attested identity of a v3 asset's pyFAI arm (canonical JSON SHA-256)."""
+    return hashlib.sha256(_canonical_bytes(arm)).hexdigest()
+
+
+def _validate_extended_surface(value):
+    """Version 3: v2's fixed SURFACE conventions plus the transferred extension.
+
+    The asset carries the pyFAI extended arm it was transferred from (a compact
+    parameter record) and the transfer's exactness gate over its validation frames.
+    """
+    reference = json.loads(canonical_surface_resource_bytes())
+    def require(ok, message):
+        if not ok:
+            _refuse("XU_CALIBRATION_SCHEMA_UNSUPPORTED", message)
+    def number(v):
+        return type(v) in {int, float} and math.isfinite(v)
+    require(value['schema'] == reference['schema'] and value['preset'] == reference['preset'],
+            'unsupported extended calibration model')
+    require(value['xrayutilities'] == reference['xrayutilities'], 'SURFACE circle/camera/runtime conventions must match')
+    detector, acquisition, correction, validation = (value[k] for k in ('detector', 'acquisition', 'corrections', 'validation'))
+    require(type(detector) is dict and set(detector) == set(reference['detector']) | _EXTENDED_DETECTOR_KEYS,
+            'extended detector keys differ')
+    require(type(acquisition) is dict
+            and set(acquisition) - {'source_energy_eV'} == set(reference['acquisition']) | {'sampledis_mm'},
+            'extended acquisition keys differ')
+    # a refined energy keeps the recorded one, which the scans' energies are checked against
+    require('source_energy_eV' not in acquisition or (
+        number(acquisition['source_energy_eV']) and number(acquisition['energy_eV'])
+        and abs(acquisition['source_energy_eV'] - acquisition['energy_eV']) < .05 * acquisition['energy_eV']),
+        'the recorded energy must be within 5 % of the refined one')
+    require(type(correction) is dict and set(correction) == set(reference['corrections']) | {'solid_angle_arm'},
+            'extended correction keys differ')
+    for key in ('mask_policy', 'sensor_policy', 'sensor_material', 'sensor_thickness_m', 'parallax', 'pyfai_validated_version'):
+        require(detector[key] == reference['detector'][key], f'unsupported detector {key}')
+    shape = detector['shape']
+    require(type(shape) is list and len(shape) == 2 and all(type(v) is int and v > 0 for v in shape)
+            and math.prod(shape) <= 1 << 25, 'invalid detector shape')
+    for key in ('distance_m', 'pixel1_m', 'pixel2_m'):
+        require(number(detector[key]) and detector[key] > 0, f'invalid detector {key}')
+    require(0 < detector['distance_m'] < 100, 'implausible detector distance')
+    # A tilted detector moves XU's zero-angle centre pixel well off the panel.
+    for key, size in zip(('cch1_px', 'cch2_px'), shape):
+        require(number(detector[key]) and abs(detector[key]) <= 10 * size, 'implausible detector centre')
+    require(number(detector['detrot_deg']) and abs(detector['detrot_deg']) <= 10, 'implausible detector rotation')
+    require(number(detector['tilt_deg']) and 0 <= detector['tilt_deg'] <= 15, 'implausible detector tilt')
+    require(number(detector['tiltazimuth_deg']) and abs(detector['tiltazimuth_deg']) <= 720, 'invalid tilt azimuth')
+    require(type(detector['detector_factory_name']) is str and bool(detector['detector_factory_name']), 'detector name required')
+    cfg = detector['detector_config']
+    require(type(cfg) is dict and set(cfg) <= {'orientation', 'pixel1', 'pixel2', 'max_shape'}, 'unsupported detector configuration')
+    require(cfg.get('orientation') in (1, 2, 3, 4) and cfg.get('pixel1') == detector['pixel1_m']
+            and cfg.get('pixel2') == detector['pixel2_m'], 'detector configuration disagrees with pitch/orientation')
+    require('max_shape' not in cfg or cfg['max_shape'] == shape, 'detector max_shape differs')
+    require(type(detector['mask_count']) is int and 0 <= detector['mask_count'] < math.prod(shape), 'invalid intrinsic mask count')
+    for digest in (detector['mask_sha256'], correction['solid_angle_sha256']):
+        require(type(digest) is str and len(digest) == 64 and all(c in '0123456789abcdef' for c in digest), 'invalid correction digest')
+    mutable = {'detector_offsets_deg', 'energy_eV', 'image_rotation_quarter_turns', 'source_motors',
+               'xdart_wavelength_A', 'xu_mapping_wavelength_A'}
+    require(all(acquisition[k] == v for k, v in reference['acquisition'].items() if k not in mutable), 'unsupported acquisition policy')
+    require(type(acquisition['image_rotation_quarter_turns']) is int and acquisition['image_rotation_quarter_turns'] in range(4), 'invalid image rotation')
+    for key in ('source_motors', 'detector_offsets_deg'):
+        require(type(acquisition[key]) is dict and set(acquisition[key]) == {'del', 'nu'}, 'two detector motors required')
+    motors = acquisition['source_motors']
+    held = [circle for circle, motor in motors.items() if motor is None]  # a single 2θ arm, as in v2
+    require(len(held) <= 1 and all(type(motor) is str and motor for motor in motors.values() if motor is not None)
+            and len({motor for motor in motors.values() if motor is not None}) == 2 - len(held),
+            'distinct source motors required')
+    require(all(number(v) and abs(v) <= 10 for v in acquisition['detector_offsets_deg'].values()), 'motor offsets exceed fit bounds')
+    sampledis = acquisition['sampledis_mm']
+    require(type(sampledis) is list and len(sampledis) == 3 and all(number(v) and abs(v) <= 20 for v in sampledis),
+            'sample displacement must be three values within 20 mm')
+    require(number(acquisition['energy_eV']) and acquisition['energy_eV'] > 0, 'positive energy required')
+    expected = 1.239841984e4 / acquisition['energy_eV']
+    require(number(acquisition['xdart_wavelength_A']) and math.isclose(acquisition['xdart_wavelength_A'], expected, rel_tol=1e-12), 'energy and wavelength disagree')
+    require(number(acquisition['xu_mapping_wavelength_A']) and math.isclose(acquisition['xu_mapping_wavelength_A'], expected, rel_tol=1e-6), 'XU energy and wavelength disagree')
+    require(all(correction[k] == v for k, v in reference['corrections'].items()
+                if k not in {'solid_angle_policy', 'solid_angle_sha256'}), 'unsupported correction policy')
+    require(correction['solid_angle_policy'] == EXTENDED_SOLID_ANGLE_POLICY, 'per-frame extended solid-angle policy required')
+    arm = correction['solid_angle_arm']
+    require(type(arm) is dict and set(arm) == _EXTENDED_ARM_KEYS and arm['marker'] == 'xdart_stacked_arm_v2',
+            'the solid-angle arm must be a compact extended stacked arm')
+    require(all(number(arm[k]) for k in _EXTENDED_ARM_KEYS - {'marker', 'detector', 'detector_config', 'source_motors'}),
+            'the solid-angle arm has a non-numeric parameter')
+    require(arm['nu_scale'] == arm['del_scale'] == math.pi / 180 and arm['beam_rotation'] == 0,
+            'the transfer supports degree motor scales and no beam rotation')
+    require(arm['detector'] == detector['detector_factory_name'] and arm['detector_config'] == cfg,
+            'the solid-angle arm and the XU detector differ')
+    require(math.isclose(arm['wavelength_m'] * 1e10, acquisition['xdart_wavelength_A'], rel_tol=1e-9),
+            'the solid-angle arm and the XU energy differ')
+    require(type(arm['source_motors']) is dict and arm['source_motors'] == {
+        'del_angle': acquisition['source_motors']['del'], 'nu_angle': acquisition['source_motors']['nu']},
+        'the solid-angle arm and the XU source motors differ')
+    require(correction['solid_angle_sha256'] == extended_arm_digest(arm), 'solid-angle arm digest differs')
+    require(type(validation) is dict and set(validation) == _EXTENDED_VALIDATION_KEYS, 'extended diagnostics required')
+    require(validation['authoring_policy'] == EXTENDED_AUTHORING_POLICY, 'unsupported authoring policy')
+    # a five-parameter or single arm transfers by formula, fitted on no frame
+    for key, low in (('transfer_frame_count', 0), ('validation_frame_count', 3), ('validation_pixel_count', 1)):
+        require(type(validation[key]) is int and validation[key] >= low, f'insufficient {key}')
+    gate = validation['transfer_gate_A^-1']
+    require(number(gate) and 0 < gate <= EXTENDED_TRANSFER_GATE_A, 'transfer gate exceeds 1e-8 A^-1')
+    require(number(validation['transfer_max_abs_dq_A^-1']) and 0 <= validation['transfer_max_abs_dq_A^-1'] <= gate,
+            'the transfer did not pass its exactness gate')
+    for name in ('control_domain_source_deg', 'validated_scan_domain_source_deg'):
+        domain = validation[name]
+        require(type(domain) is dict and set(domain) == {'del', 'nu'}, 'invalid calibration domain')
+        for limits in domain.values():
+            require(type(limits) is list and len(limits) == 2 and all(number(v) for v in limits)
+                    and -360 <= limits[0] <= limits[1] <= 360, 'invalid angular limits')
+    require(all(validation['validated_scan_domain_source_deg'][motor][0] <= limits[0] <= limits[1]
+                <= validation['validated_scan_domain_source_deg'][motor][1]
+                for motor, limits in validation['control_domain_source_deg'].items()), 'run domain must enclose control coverage')
+    require(all(validation[name][circle] == [0, 0] for circle in held for name in (
+        'control_domain_source_deg', 'validated_scan_domain_source_deg')),
+        f'a single 2θ arm holds {" and ".join(held) or "a circle"} at zero')
+
+
+def extended_surface_calibration(*, detector, xu_parameters, arm, energy_eV, xu_wavelength_A,
+                                 source_motors, rotation, control_domain, domain, fit_frames,
+                                 validation_frames, validation_pixels, max_dq, source_energy_eV=None):
+    """Build and strictly admit a transferred SURFACE v3 asset (imports are lazy).
+
+    ``xu_parameters`` holds cch1/cch2 (px), distance_m, del/nu offsets (deg),
+    detrot/tilt/tiltazimuth (deg) and sampledis_mm; ``arm`` is the compact pyFAI arm.
+    """
+    import numpy as np
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    value = json.loads(canonical_surface_resource_bytes())
+    value['version'] = 3
+    shape = tuple(int(v) for v in detector.shape)
+    config = dict(detector.get_config())
+    config['orientation'] = int(config.get('orientation', 3))
+    config = json.loads(json.dumps(config))
+    mask = detector.calc_mask()
+    mask = np.zeros(shape, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    p = xu_parameters
+    value['detector'].update(cch1_px=p['cch1_px'], cch2_px=p['cch2_px'], distance_m=p['distance_m'],
+        detrot_deg=p['detrot_deg'], tilt_deg=p['tilt_deg'], tiltazimuth_deg=p['tiltazimuth_deg'],
+        detector_factory_name=detector.__class__.__name__, detector_config=config,
+        shape=list(shape), pixel1_m=float(detector.pixel1), pixel2_m=float(detector.pixel2),
+        mask_count=int(mask.sum()),
+        mask_sha256=hashlib.sha256(np.ascontiguousarray(mask, dtype='|u1').tobytes()).hexdigest())
+    value['acquisition'].update(energy_eV=energy_eV,
+        xdart_wavelength_A=energy_eV_to_wavelength_m(energy_eV) * 1e10,
+        xu_mapping_wavelength_A=xu_wavelength_A,
+        image_rotation_quarter_turns=rotation // 90, source_motors=source_motors,
+        detector_offsets_deg={'del': p['del_offset_deg'], 'nu': p['nu_offset_deg']},
+        sampledis_mm=[float(v) for v in p['sampledis_mm']])
+    if source_energy_eV is not None:  # a refined energy: the recorded one the scans are checked against
+        value['acquisition']['source_energy_eV'] = float(source_energy_eV)
+    arm = json.loads(json.dumps(arm))
+    arm['detector_config'] = config
+    value['corrections'].update(solid_angle_policy=EXTENDED_SOLID_ANGLE_POLICY,
+                                solid_angle_sha256=extended_arm_digest(arm), solid_angle_arm=arm)
+    value['validation'] = {
+        'authoring_policy': EXTENDED_AUTHORING_POLICY, 'control_domain_source_deg': control_domain,
+        'validated_scan_domain_source_deg': domain, 'transfer_frame_count': fit_frames,
+        'validation_frame_count': validation_frames, 'validation_pixel_count': validation_pixels,
+        'transfer_max_abs_dq_A^-1': max_dq, 'transfer_gate_A^-1': EXTENDED_TRANSFER_GATE_A}
+    parse_xu_stitch_calibration_bytes(_canonical_bytes(value))
+    return value
+
+
+def authored_surface_calibration(*, detector, cch1, cch2, distance_m,
+        del_offset_deg, nu_offset_deg, energy_eV, xu_wavelength_A, source_motors,
+        rotation, control_domain, domain, rms_q, condition, n_frames, n_points):
+    """Build and strictly admit a fitted SURFACE v2 asset (imports are lazy)."""
+    import numpy as np
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    from xrd_tools.core.geometry import DetectorHeader
+    from xrd_tools.corrections.stack import CorrectionStack
+    from xrd_tools.rsm.corrections import detector_header_to_ai
+    value = json.loads(canonical_surface_resource_bytes())
+    value['version'] = 2
+    shape = tuple(int(v) for v in detector.shape)
+    config = dict(detector.get_config())
+    config['orientation'] = int(config.get('orientation', 3))
+    config = json.loads(json.dumps(config))
+    mask = detector.calc_mask()
+    mask = np.zeros(shape, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    digest = lambda array, dtype: hashlib.sha256(np.ascontiguousarray(array, dtype=dtype).tobytes()).hexdigest()
+    value['detector'].update(cch1_px=cch1, cch2_px=cch2, distance_m=distance_m,
+        detector_factory_name=detector.__class__.__name__, detector_config=config,
+        shape=list(shape), pixel1_m=float(detector.pixel1), pixel2_m=float(detector.pixel2),
+        mask_count=int(mask.sum()), mask_sha256=digest(mask, '|u1'))
+    value['acquisition'].update(energy_eV=energy_eV,
+        xdart_wavelength_A=energy_eV_to_wavelength_m(energy_eV) * 1e10,
+        xu_mapping_wavelength_A=xu_wavelength_A,
+        image_rotation_quarter_turns=rotation // 90, source_motors=source_motors,
+        detector_offsets_deg={'del': del_offset_deg, 'nu': nu_offset_deg})
+    header = DetectorHeader(cch1=cch1, cch2=cch2, pwidth1=float(detector.pixel1) * 1e3,
+        pwidth2=float(detector.pixel2) * 1e3, distance=distance_m * 1e3, Nch1=shape[0], Nch2=shape[1])
+    solid = CorrectionStack().normalization(detector_header_to_ai(header), shape)
+    value['corrections'].update(solid_angle_policy='calibrated_pyfai_detector_header_v1',
+                                solid_angle_sha256=digest(solid, '<f8'))
+    value['validation'] = dict(authoring_policy='surface_control_points_bounded_fit_v1',
+        control_domain_source_deg=control_domain, validated_scan_domain_source_deg=domain,
+        geometry_control_frame_count=n_frames, geometry_control_point_count=n_points,
+        condition_number=condition, **{'geometry_rms_q_A^-1': rms_q})
+    parse_xu_stitch_calibration_bytes(_canonical_bytes(value))
+    return value
 
 
 def canonical_surface_resource_bytes() -> bytes:

@@ -38,7 +38,7 @@ from xrd_tools.analysis.canonical_fingerprint import (
     analysis_canonical_fingerprint,
 )
 from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
-from xrd_tools.core.scan import SourceCapabilities, SourceKind, SourceSpec, coerce_source_kind
+from xrd_tools.core.scan import ScanFrame, SourceCapabilities, SourceKind, SourceSpec, coerce_source_kind
 from xrd_tools.io.metadata import read_image_metadata_observed
 from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.sources.discover import discover_scans
@@ -712,6 +712,9 @@ class _CursorSource:
         try:
             self.descriptor = cursor.descriptor
             self.provider = cursor.metadata_provider()
+            self.path = self.descriptor.path
+            self.kind = self.descriptor.kind
+            self.name = self.descriptor.scan_name
             self.frame_indices = range(self.descriptor.frame_count)
             self.scanned_axes = tuple(self.provider.motors())
             self.capabilities = SourceCapabilities(supports_random_access=True, supports_chunks=True, has_metadata=True, has_raw_references=True)
@@ -721,6 +724,12 @@ class _CursorSource:
     def metadata_for(self, label, *, max_input_bytes=None):
         return self.provider.complete_metadata_for(label)
     def load_frame(self, label): return self.cursor.read_frame(label)
+    def load_native_frame(self, label): return self.cursor.read_frame(label)
+    def raw_locator_for(self, label): return self.path, int(label)
+    def frame_for(self, label):
+        return ScanFrame(index=int(label), metadata=dict(self.metadata_for(label)),
+                         source_path=self.path, source_frame_index=int(label),
+                         source_identity=self.name, loader=lambda frame: self.load_frame(frame.index))
     def close(self): self.cursor.close()
 def _snapshot(
     spec: SourceSpec, *, cancel_token: threading.Event | None = None,
@@ -776,6 +785,21 @@ def _snapshot(
         discovery_states: list[tuple[Path, FileRevision | None]] = []
         member_states: list[tuple[Path, FileRevision | None]] = []
         member_revisions: dict[Path, FileRevision | None] = {}
+        container_graph = None
+        if isinstance(source, _CursorSource):
+            from xrd_tools.sources.execution_graph import qualify_source_execution_graph
+            container_graph = qualify_source_execution_graph(
+                spec, cancelled=None if cancel_token is None else cancel_token.is_set,
+            )
+            stamp = container_graph.stamp
+            for state in (stamp.file, *stamp.members,
+                          *(member.file for member in stamp.external_members), *stamp.dependency_files):
+                path = Path(state.path)
+                revision = _path_revision(path)
+                if not state.matches_disk():
+                    raise _Refusal("SOURCE_REVISION_CHANGED")
+                member_states.append((path, revision))
+                member_revisions[path.resolve(strict=False)] = revision
         raw_facts: list[tuple[int, str | None, int | None, FileRevision | None]] = []
         options = dict(spec.options)
         metadata_format = getattr(
@@ -936,6 +960,8 @@ def _snapshot(
             tuple(discovery_states),
             tuple(member_states), tuple(raw_facts), dependency_revisions,
         )
+        if container_graph is not None:
+            source_identity += (container_graph.stamp.as_dict(), container_graph.dataset_paths)
         fingerprint = _digest(source_identity)
         receipt = AnalysisSourceReceipt(
             schema_version="analysis-source-v2", source_spec=spec,

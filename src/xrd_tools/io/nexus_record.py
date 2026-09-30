@@ -597,7 +597,8 @@ def _background_pair(descriptor_bytes, fingerprint) -> tuple[bytes, str]:
     def decoded(raw, shape): _background_require(type(raw) is dict and set(raw) == {"shape", "dtype", "sha256"} and type(raw["shape"]) is list and all(type(part) is int for part in raw["shape"]) and tuple(raw["shape"]) == shape and hex64(raw["sha256"]) and type(raw["dtype"]) is str and len(raw["dtype"]) == 3 and raw["dtype"][0] in "<>=|" and raw["dtype"][1] in "iuf" and raw["dtype"][2] in "1248", "background decoded fact is malformed"); dtype = np.dtype(raw["dtype"]); _background_require(dtype.str == raw["dtype"] and 1 <= dtype.itemsize <= 8, "background decoded dtype is malformed")
     def metadata_source(raw): _background_require(raw is None or type(raw) is dict and set(raw) == {"locator", "state", "sha256"} and path(raw["locator"]) and state(raw["state"]) and hex64(raw["sha256"]), "background metadata source is malformed")
     positive = lambda tagged: type(number := _untag(tagged)) is float and np.isfinite(number) and number > 0 and _tag(number) == tagged
-    keys = {"Single BG File": {"version", "mode", "policy", "frame_fact", "source", "metadata_items", "metadata_source", "decoded", "result_sha256"}, "Series Average": {"version", "mode", "policy", "frame_fact", "manifest", "selected", "normalization", "result_sha256"}, "BG Directory": {"version", "mode", "policy", "frame_fact", "manifest", "selected", "metadata_items", "metadata_source", "decoded", "result_sha256"}}; _background_require(value.get("mode") == mode and type(value.get("version")) is int and value["version"] == 1 and set(value) == keys[mode] and hex64(value["result_sha256"]), "background descriptor schema is invalid"); shape = fact[4]
+    keys = {"Single BG File": {"version", "mode", "policy", "frame_fact", "source", "metadata_items", "metadata_source", "decoded", "result_sha256"}, "Series Average": {"version", "mode", "policy", "frame_fact", "manifest", "selected", "normalization", "result_sha256"}, "BG Directory": {"version", "mode", "policy", "frame_fact", "manifest", "selected", "metadata_items", "metadata_source", "decoded", "result_sha256"}}; last_saved = mode == "BG Directory" and policy["match_rule"] == "Last Saved Before Frame"  # records the frame's file time
+    _background_require(value.get("mode") == mode and type(value.get("version")) is int and value["version"] == 1 and set(value) == keys[mode] | ({"frame_saved_ns"} if last_saved else set()) and hex64(value["result_sha256"]) and (not last_saved or type(value["frame_saved_ns"]) is int and value["frame_saved_ns"] >= 0), "background descriptor schema is invalid"); shape = fact[4]
     if mode == "Single BG File":
         source = value["source"]; _background_require(type(source) is dict and set(source) == {"locator", "state", "sha256", "hdf", "decoded"} and path(source["locator"]) and source["locator"] == policy["locator"] and state(source["state"]) and hex64(source["sha256"]), "background source fact is malformed"); decoded(source["decoded"], shape); hdf = source["hdf"]
         _background_require((hdf is None) == (policy["dataset_path"] is None) and (hdf is None or type(hdf) is dict and set(hdf) == {"dataset_path", "frame_index", "shape", "dtype"} and hdf["dataset_path"] == policy["dataset_path"] and type(hdf["frame_index"]) is int and hdf["frame_index"] == policy["frame_index"] and type(hdf["shape"]) is list and len(hdf["shape"]) in {2, 3} and all(type(part) is int and part > 0 for part in hdf["shape"]) and tuple(hdf["shape"][-2:]) == shape and (len(hdf["shape"]) == 2 and hdf["frame_index"] == 0 or len(hdf["shape"]) == 3 and 0 <= hdf["frame_index"] < hdf["shape"][0]) and type(hdf["dtype"]) is str and decoded({"shape": hdf["shape"][-2:], "dtype": hdf["dtype"], "sha256": "0" * 64}, shape) is None), "background HDF proof is malformed"); projected = items(value["metadata_items"]); norm = policy["normalization_key"]; _background_require(value["decoded"] == source["decoded"] and tuple(row[0] for row in projected) == tuple(key for key in (norm,) if key) and bool(projected) == (value["metadata_source"] is not None) and (norm is None or positive(dict(fact[5])[norm]) and positive(dict(projected)[norm])), "background Single projection differs"); metadata_source(value["metadata_source"])
@@ -674,14 +675,20 @@ def write_frame_source_ref(
         "frame_count": "frame_count",
         "dataset_path": "dataset_path",
         "self_contained": "self_contained",
+        "raw_shape": "raw_shape",
+        "raw_dtype": "raw_dtype",
+        "raw_header_bytes": "raw_header_bytes",
+        "rotation": "rotation",
     }
     for key, attr_name in attr_names.items():
         value = snapshot.get(key)
         if value is None:
             continue
         try:
-            if key in {"size", "mtime_ns", "frame_count"}:
+            if key in {"size", "mtime_ns", "frame_count", "raw_header_bytes", "rotation"}:
                 value = int(value)
+            elif key == "raw_shape":
+                value = tuple(int(n) for n in value)
             elif key == "self_contained":
                 value = bool(value)
             else:
@@ -812,7 +819,7 @@ def frame_record_key(scan_label, frame_index: int) -> str:
 
 
 def write_contributing_frames(entry_grp: h5py.Group, records, *,
-                              source_base=None) -> int:
+                              source_base=None, bounded: bool = False) -> int:
     """Write the per-frame **source records** for a Stitch/RSM result — the
     enabler for the raw-image popup (resolve a contributing frame from the saved
     ``.nexus``).  ``records`` is an iterable of mappings with ``frame_index`` and
@@ -832,11 +839,35 @@ def write_contributing_frames(entry_grp: h5py.Group, records, *,
                       if r.get("scan_label") is not None}, key=str):
         _nxcollection(frames, f"scan_{sl}")
     for r in records:
-        write_frame_record(
+        frame = write_frame_record(
             frames, frame_record_key(r.get("scan_label"), r["frame_index"]),
             source_path=r.get("source_path"),
             source_frame_index=int(r.get("source_frame_index") or 0),
-            thumbnail=r.get("thumbnail"), source_base=source_base)
+            thumbnail=r.get("thumbnail"), source_base=source_base,
+            source_snapshot=r.get("source_snapshot"),
+            thumbnail_dtype=r.get("thumbnail_dtype", "uint8"),
+            thumbnail_mask_baked=r.get("thumbnail_mask_baked", True),
+            mask_baked=r.get("mask_baked", True),
+            thumbnail_mask=r.get("thumbnail_mask"))
+        if "identity" in r:
+            frame.create_dataset("identity_json", data=np.bytes_(json.dumps(
+                r["identity"], sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False, allow_nan=False).encode()))
+    if bounded:
+        # Shared record encoding, with finite-artifact bounded text storage.
+        from xrd_tools.io.nexus import _bounded_text_attr
+        _bounded_text_attr(entry_grp, "source_base", str(entry_grp.attrs["source_base"]))
+        def bound_text(_name, obj):
+            for key, value in tuple(obj.attrs.items()):
+                if isinstance(value, str):
+                    _bounded_text_attr(obj, key, value)
+            if isinstance(obj, h5py.Group) and "path" in obj:
+                path = obj["path"]
+                value = path.asstr()[()]
+                del obj["path"]
+                obj.create_dataset("path", data=np.bytes_(value.encode()))
+        bound_text("", frames)
+        frames.visititems(bound_text)
     return len(records)
 
 

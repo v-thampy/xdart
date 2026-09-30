@@ -36,6 +36,13 @@ from xrd_tools.io.output_transaction import (
 from xrd_tools.io.finite_artifact import _FinitePublicationSession
 from xrd_tools.io.output_safety import check_output_not_source
 from xrd_tools.io.stat_identity import identity_ctime_ns
+from xrd_tools.io.stitch_record import (
+    FRAMES_JSON as _STITCH_FRAMES_JSON,
+    GI_MODES as _STITCH_GI_MODES,
+    STITCH_GROUP as _STITCH_GROUP,
+    is_stitch_record as _is_stitch_record,
+    read_stitch_record as _read_stitch_record,
+)
 
 
 ANALYSIS_SCHEMA_ATTR = "ssrl_schema"
@@ -46,8 +53,11 @@ ANALYSIS_SCHEMA_VERSION_V2 = 2
 ANALYSIS_SCHEMA_VERSION_V3 = 3
 ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL = 4
 ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL = 5
+ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE = 6
+ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE = 7
+_STITCH_NATIVE_VERSIONS = {6, 7}
 # Keep ordinary and attested science contracts distinct; only physical names change.
-_STITCH_NEUTRAL_CONTRACTS = {4: 1, 5: 2}
+_STITCH_NEUTRAL_CONTRACTS = {4: 1, 5: 2, 6: 1, 7: 2}
 ANALYSIS_KIND_ATTR = "analysis_kind"
 _ENTRY = "entry"
 _PROVENANCE = "provenance_json"
@@ -696,11 +706,13 @@ class AnalysisArtifactRequest:
             ANALYSIS_SCHEMA_VERSION_V3,
             ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
             ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
+            ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE,
+            ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE,
         }:
             raise TypeError("analysis artifact schema version is unsupported")
         if self.schema_version in _STITCH_NEUTRAL_CONTRACTS and (
             self.kind not in {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}
-            or (self.schema_version == ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL
+            or (self.schema_version in {ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL, *_STITCH_NATIVE_VERSIONS}
                 and self.kind is not AnalysisArtifactKind.STITCH_1D)
         ):
             raise ValueError("neutral analysis artifact requires its Stitch kind")
@@ -786,6 +798,18 @@ class AnalysisArtifactInspection:
     schema_version: int = ANALYSIS_SCHEMA_VERSION
     execution_attestation_digest: str | None = None
     execution_attestation_json: str | None = field(default=None, repr=False)
+    wavelength_A: float | None = None
+    frame_manifest_json: str | None = field(default=None, repr=False)
+
+
+def _gi_cuts_valid(cuts) -> bool:
+    """GI cuts as a projection or payload carries them: (mode, projection) pairs, distinct modes in
+    ``GI_MODES`` order."""
+    return (type(cuts) is tuple
+            and all(type(cut) is tuple and len(cut) == 2 and cut[0] in _STITCH_GI_MODES
+                    and type(cut[1]) is AnalysisArtifactResultProjection for cut in cuts)
+            and [mode for mode, _cut in cuts] == [mode for mode in _STITCH_GI_MODES
+                                                   if mode in {mode for mode, _cut in cuts}])
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -802,8 +826,15 @@ class AnalysisArtifactResultProjection:
     result_fingerprint: str
     policy: str = field(init=False, default=_STORED_RESULT_PROJECTION_POLICY)
     _claim: InitVar[object] = None
+    wavelength_A: float | None = None
+    frame_manifest_json: str | None = field(default=None, repr=False)
+    #: A GI Stitch 1D's cuts beside I(q), each (its mode, its own 1-D projection) in
+    #: ``GI_MODES`` order; () otherwise.
+    gi: tuple[tuple[str, "AnalysisArtifactResultProjection"], ...] = ()
 
     def __post_init__(self, _claim: object) -> None:
+        if not _gi_cuts_valid(self.gi):
+            raise TypeError("analysis artifact result projection is invalid")
         arrays = tuple(values for _name, values in self.axes) + (
             self.intensity,
         ) + (() if self.sigma is None else (self.sigma,)) + (
@@ -859,6 +890,9 @@ class AnalysisArtifactPayload:
     _sigma_buffer: bytes | None = field(init=False, repr=False)
     _coverage_buffer: bytes | None = field(init=False, repr=False)
     _normalization_buffer: bytes | None = field(init=False, repr=False)
+    #: A GI Stitch 1D's cuts beside I(q), each (its mode, its read-only projection) in
+    #: ``GI_MODES`` order; () otherwise.
+    gi: tuple[tuple[str, AnalysisArtifactResultProjection], ...] = ()
 
     def __post_init__(
         self,
@@ -869,6 +903,8 @@ class AnalysisArtifactPayload:
         _normalization_values: np.ndarray | None,
         _claim: object,
     ) -> None:
+        if not _gi_cuts_valid(self.gi) or (self.gi and self.inspection.group != _STITCH_RECORD_RESULT):
+            raise TypeError("analysis artifact payload GI cut is invalid")
         if (
             _claim is not _ANALYSIS_PAYLOAD_FACTORY
             or type(self.inspection) is not AnalysisArtifactInspection
@@ -1005,6 +1041,30 @@ class AnalysisArtifactPayload:
             )
             for index, (name, buffer) in enumerate(self._axis_buffers)
         )
+
+    @property
+    def wavelength_A(self) -> float | None:
+        return self.inspection.wavelength_A
+
+    @property
+    def native_unit(self) -> str | None:
+        return dict(self.inspection.axis_units).get("q")
+
+    @property
+    def contributing_frames(self) -> tuple[dict, ...]:
+        text = self.inspection.frame_manifest_json
+        return () if text is None else tuple(json.loads(text)["records"])
+
+    def radial_axis(self, unit: str) -> np.ndarray:
+        if self.kind is not AnalysisArtifactKind.STITCH_1D:
+            raise ValueError("radial coordinate switch requires Stitch 1D")
+        if unit == self.native_unit:
+            return self.axis("q")
+        from xrd_tools.io.analysis_stitch_auxiliary import native_stitch_companion
+        target, values = native_stitch_companion(self.axis("q"), self.native_unit, self.wavelength_A)
+        if unit != target:
+            raise ValueError("unsupported Stitch viewer coordinate")
+        return values
 
     @property
     def intensity(self) -> np.ndarray:
@@ -1587,8 +1647,18 @@ def project_analysis_artifact_result(
     coverage: np.ndarray | None,
     normalization: np.ndarray | None,
     _stored_v1_claim: object = None,
+    wavelength_A: float | None = None,
+    frame_records=None,
+    source_base=None,
+    _frame_manifest_json: str | None = None,
+    gi_cuts: tuple = (),
 ) -> AnalysisArtifactResultProjection:
     """Project one result exactly once to the bytes stored by the artifact.
+
+    ``gi_cuts`` are a GI Stitch 1D's cuts, each ``(mode, unit, axis, intensity, coverage,
+    normalization)`` with distinct modes in ``GI_MODES`` order: each is projected like a Stitch 1D
+    result and its fingerprint folds into this one in that order (only when present, so every other
+    result keeps its fingerprint, and a one-cut result the fingerprint it had).
 
     The function deliberately retains the v1 result-fingerprint framing.  It
     is shared by runners, writers, strict inspection, and payload hydration so
@@ -1775,6 +1845,48 @@ def project_analysis_artifact_result(
     if projected_coverage is not None:
         _digest_array(digest, "coverage", projected_coverage)
         _digest_array(digest, "normalization", projected_normalization)
+    frame_manifest_json = None
+    if wavelength_A is not None or frame_records is not None or _frame_manifest_json is not None:
+        from xrd_tools.io.analysis_stitch_auxiliary import (
+            native_stitch_companion, analysis_contributing_frames_manifest,
+            canonical_frame_manifest,
+        )
+        if kind is not AnalysisArtifactKind.STITCH_1D:
+            raise AnalysisArtifactProjectionInvalid("native auxiliary records require Stitch 1D")
+        target_unit, companion = native_stitch_companion(
+            projected_axes[0][1], axis_units[0][1], wavelength_A,
+        )
+        if frame_records is not None:
+            frame_manifest_json = canonical_frame_manifest(
+                analysis_contributing_frames_manifest(frame_records, source_base=source_base)
+            )
+        elif _frame_manifest_json is not None:
+            frame_manifest_json = _frame_manifest_json
+        else:
+            raise AnalysisArtifactProjectionInvalid("native Stitch requires contributing frames")
+        _digest_text(digest, "native-stitch-auxiliary-v1")
+        _digest_text(digest, float(wavelength_A).hex())
+        _digest_text(digest, frame_manifest_json)
+        _digest_array(digest, target_unit, companion)
+    if type(gi_cuts) is not tuple or (gi_cuts and kind is not AnalysisArtifactKind.STITCH_1D) or any(
+            type(cut) is not tuple or len(cut) != 6 for cut in gi_cuts) or [cut[0] for cut in gi_cuts] != [
+            mode for mode in _STITCH_GI_MODES if mode in {cut[0] for cut in gi_cuts}]:
+        raise AnalysisArtifactProjectionInvalid(
+            f"GI cuts are Stitch 1D's, distinct modes of {_STITCH_GI_MODES} in that order, each with its "
+            "unit, axis, intensity, coverage and normalization")
+    gi = []
+    for mode, unit, cut_axis, cut_intensity, cut_coverage, cut_normalization in gi_cuts:
+        if cut_coverage is None or cut_normalization is None:
+            raise AnalysisArtifactProjectionInvalid("a GI cut needs its coverage and normalization")
+        cut = project_analysis_artifact_result(
+            kind=kind, axes=(("q", cut_axis),), axis_units=(("q", unit),), intensity=cut_intensity,
+            sigma=None, coverage=cut_coverage, normalization=cut_normalization,
+            _stored_v1_claim=_stored_v1_claim,
+        )
+        _digest_text(digest, "stitch-gi-cut-v1")
+        _digest_text(digest, mode)
+        _digest_text(digest, cut.result_fingerprint)
+        gi.append((mode, cut))
     return AnalysisArtifactResultProjection(
         kind,
         tuple(projected_axes),
@@ -1785,6 +1897,9 @@ def project_analysis_artifact_result(
         projected_normalization,
         digest.hexdigest(),
         _ANALYSIS_PROJECTION_FACTORY,
+        wavelength_A=wavelength_A,
+        frame_manifest_json=frame_manifest_json,
+        gi=tuple(gi),
     )
 
 
@@ -1797,6 +1912,10 @@ def _project_analysis_artifact_result_v1_compat(
     sigma: np.ndarray | None,
     coverage: np.ndarray | None,
     normalization: np.ndarray | None,
+    wavelength_A: float | None = None,
+    frame_records=None,
+    source_base=None,
+    gi_cuts: tuple = (),
 ) -> AnalysisArtifactResultProjection:
     """Use the central projection for byte-compatible historical v1 Stitch."""
 
@@ -1809,6 +1928,10 @@ def _project_analysis_artifact_result_v1_compat(
         coverage=coverage,
         normalization=normalization,
         _stored_v1_claim=_ANALYSIS_V1_DECODE_PROJECTION,
+        wavelength_A=wavelength_A,
+        frame_records=frame_records,
+        source_base=source_base,
+        gi_cuts=gi_cuts,
     )
 
 
@@ -1854,6 +1977,187 @@ def _materialize_bounded_values(
 # Detached admission and later payload hydration deliberately retain separate
 # race seams even though both feed the same public stored-result projection.
 _materialize_inspection_values = _materialize_bounded_values
+
+
+#: A stitched Int record's result group (``stitch_record``).
+_STITCH_RECORD_RESULT = "integrated_1d"
+#: Every version a Stitch 1D request may carry (v3 is RSM's).
+_STITCH_RECORD_VERSIONS = frozenset({
+    ANALYSIS_SCHEMA_VERSION,
+    ANALYSIS_SCHEMA_VERSION_V2,
+    ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
+    ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
+    ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE,
+    ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE,
+})
+
+
+def _stitch_record_projection(handle: h5py.File, version: int):
+    """A stitched record's patterns, read through the admitted handle, projected by the one projection."""
+    native = version in _STITCH_NATIVE_VERSIONS
+    content = _read_stitch_record(handle, entry=_ENTRY)
+    carried = (content.wavelength_A is not None, content.frames_json is not None)
+    if carried != (native, native):
+        raise AnalysisArtifactInvalid(
+            "a native stitched record carries its wavelength and contributing frames, a neutral one neither"
+        )
+    pattern, gi = content.pattern, content.gi
+    try:
+        projection = project_analysis_artifact_result(
+            kind=AnalysisArtifactKind.STITCH_1D,
+            axes=(("q", pattern.axis),),
+            axis_units=(("q", pattern.unit),),
+            intensity=pattern.intensity,
+            sigma=pattern.sigma,
+            coverage=pattern.coverage,
+            normalization=pattern.normalization,
+            _stored_v1_claim=(
+                _ANALYSIS_V1_DECODE_PROJECTION
+                if _artifact_contract_version(version) == ANALYSIS_SCHEMA_VERSION
+                else None
+            ),
+            wavelength_A=content.wavelength_A,
+            _frame_manifest_json=content.frames_json,
+            gi_cuts=tuple((mode, cut.unit, cut.axis, cut.intensity, cut.coverage, cut.normalization)
+                          for mode, cut in gi),
+        )
+    except AnalysisArtifactProjectionInvalid as error:
+        raise AnalysisArtifactInvalid(str(error)) from error
+    return content, projection
+
+
+def _inspect_stitch_record(
+    entry: h5py.Group,
+    shown: str,
+    admitted_revision,
+    *,
+    expected_request: AnalysisArtifactRequest | None,
+    expected_kind: AnalysisArtifactKind | None,
+) -> AnalysisArtifactInspection:
+    """Admit a stitched Int record: the request envelope on ``entry/stitch``, and the result
+    fingerprint recomputed from the stored patterns."""
+    stitch = _direct(entry, _STITCH_GROUP, h5py.Group)
+    version_id = stitch.attrs.get_id(ANALYSIS_SCHEMA_VERSION_ATTR)
+    if (
+        version_id.shape != ()
+        or _hdf_type_class(version_id) != h5py.h5t.INTEGER
+        or version_id.dtype.itemsize > 8
+    ):
+        raise AnalysisArtifactInvalid("stitched record schema version is invalid")
+    version = int(stitch.attrs[ANALYSIS_SCHEMA_VERSION_ATTR])
+    if version not in _STITCH_RECORD_VERSIONS:
+        raise AnalysisArtifactInvalid("stitched record schema version is unsupported")
+    contract_version = _artifact_contract_version(version)
+    attested = contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}
+    native = version in _STITCH_NATIVE_VERSIONS
+    expected_attrs = {
+        "NX_class", ANALYSIS_SCHEMA_ATTR, ANALYSIS_SCHEMA_VERSION_ATTR, ANALYSIS_KIND_ATTR,
+        "request_fingerprint", "source_fingerprint", "plan_fingerprint", "provenance_digest", "file_name",
+    } | ({"source_base"} if native else set()) | ({_EXECUTION_ATTESTATION_DIGEST_ATTR} if attested else set())
+    if set(stitch.attrs) != expected_attrs:
+        raise AnalysisArtifactInvalid("stitched record envelope attributes are not exact")
+    if _bounded_attr_text(stitch, ANALYSIS_SCHEMA_ATTR) != ANALYSIS_SCHEMA_NAME:
+        raise AnalysisArtifactInvalid("stitched record envelope marker is wrong")
+    try:
+        kind = AnalysisArtifactKind(_bounded_attr_text(stitch, ANALYSIS_KIND_ATTR))
+    except ValueError as error:
+        raise AnalysisArtifactInvalid("stitched record kind is invalid") from error
+    expected = expected_request.kind if expected_request is not None else expected_kind
+    if kind is not AnalysisArtifactKind.STITCH_1D or (expected is not None and kind is not expected):
+        raise AnalysisArtifactInvalid("stitched record kind does not match request")
+    if expected_request is not None and version != expected_request.schema_version:
+        raise AnalysisArtifactInvalid("stitched record schema version changed")
+    fingerprints: dict[str, str] = {}
+    for attr in ("request_fingerprint", "source_fingerprint", "plan_fingerprint", "provenance_digest"):
+        fingerprints[attr] = _sha256(_bounded_attr_text(stitch, attr), attr)
+        if expected_request is not None and fingerprints[attr] != getattr(expected_request, attr):
+            raise AnalysisArtifactInvalid(f"stitched record {attr} changed")
+    if _bounded_attr_text(stitch, "file_name") != (
+        expected_request.target if expected_request is not None else shown
+    ):
+        raise AnalysisArtifactInvalid("stitched record records a private candidate path")
+    if _bounded_attr_text(stitch, "NX_class") != "NXcollection":
+        raise AnalysisArtifactInvalid("stitched record envelope is not an NXcollection")
+    provenance = _read_scalar_text(stitch, _PROVENANCE)
+    if expected_request is not None and provenance != expected_request.provenance_json:
+        raise AnalysisArtifactInvalid("stitched record provenance changed")
+    attestation_digest = attestation_json = None
+    if attested:
+        attestation_digest = _sha256(
+            _exact_sha256_attr_text(stitch, _EXECUTION_ATTESTATION_DIGEST_ATTR),
+            "execution attestation digest",
+        )
+        attestation_json = _read_scalar_execution_attestation(
+            stitch, _EXECUTION_ATTESTATION, kind=kind,
+            request_fingerprint=fingerprints["request_fingerprint"], expected_digest=attestation_digest,
+        )
+        if expected_request is not None and (
+            attestation_digest != expected_request.execution_attestation_digest
+            or attestation_json != expected_request.execution_attestation_json
+        ):
+            raise AnalysisArtifactInvalid("stitched record execution attestation changed")
+    content, projection = _stitch_record_projection(entry.file, version)
+    # exactly the stitch graph this record's modes and version call for (Codex review F6)
+    expected_children = {"coverage", "normalization", _PROVENANCE}
+    expected_children |= {"frames", _STITCH_FRAMES_JSON} if native else set()
+    expected_children |= {_EXECUTION_ATTESTATION} if attested else set()
+    expected_children |= {mode for mode, _cut in content.gi}
+    if set(stitch) != expected_children:
+        raise AnalysisArtifactInvalid("stitched record contains an unknown stitch graph")
+    for mode, _cut in content.gi:
+        cut = _direct(stitch, mode, h5py.Group)
+        if (set(cut) != {"coverage", "normalization"} or set(cut.attrs) != {"NX_class"}
+                or _bounded_attr_text(cut, "NX_class") != "NXcollection"):
+            raise AnalysisArtifactInvalid("stitched record's GI cut diagnostics are not exact")
+    if native:
+        from xrd_tools.io.analysis_stitch_auxiliary import inspect_contributing_frames
+
+        if inspect_contributing_frames(stitch, json.loads(provenance)) != content.frames_json:
+            raise AnalysisArtifactInvalid("contributing frame manifest differs")
+    if contract_version == ANALYSIS_SCHEMA_VERSION_V2 and (
+        projection.axis_units[0][1] not in ({"q_A^-1", "2th_deg"} if native else {"q_A^-1"})
+        or projection.sigma is not None
+    ):
+        raise AnalysisArtifactInvalid("analysis artifact v2 requires the exact XU Stitch result schema")
+    if attestation_json is not None:
+        attestation = json.loads(attestation_json)
+        if attestation.get("result_fingerprint") != projection.result_fingerprint:
+            raise AnalysisArtifactInvalid("analysis execution attestation result changed")
+        if native and len(json.loads(content.frames_json)["records"]) != attestation["selected_frame_count"]:
+            raise AnalysisArtifactInvalid("contributing frames differ from the science execution count")
+    if contract_version == ANALYSIS_SCHEMA_VERSION_V2:
+        for value in (projection, *(cut for _mode, cut in projection.gi)):
+            empty = value.coverage == 0
+            if (
+                not np.array_equal(empty, value.normalization == 0)
+                or not np.array_equal(empty, np.isnan(value.intensity))
+                or not np.isfinite(value.intensity[~empty]).all()
+            ):
+                raise AnalysisArtifactInvalid("stitched record empty and occupied bins disagree")
+    _require_local_graph(entry, set())
+    return AnalysisArtifactInspection(
+        path=shown,
+        storage_revision=admitted_revision,
+        kind=kind,
+        group=_STITCH_RECORD_RESULT,
+        shape=projection.intensity.shape,
+        axes=(("q", projection.axes[0][1].size),),
+        axis_units=projection.axis_units,
+        has_sigma=projection.sigma is not None,
+        has_stitch_diagnostics=True,
+        request_fingerprint=fingerprints["request_fingerprint"],
+        source_fingerprint=fingerprints["source_fingerprint"],
+        plan_fingerprint=fingerprints["plan_fingerprint"],
+        provenance_digest=fingerprints["provenance_digest"],
+        provenance_json=provenance,
+        provenance_sha256=hashlib.sha256(provenance.encode("utf-8")).hexdigest(),
+        result_fingerprint=projection.result_fingerprint,
+        schema_version=version,
+        wavelength_A=content.wavelength_A,
+        frame_manifest_json=content.frames_json,
+        execution_attestation_digest=attestation_digest,
+        execution_attestation_json=attestation_json,
+    )
 
 
 def inspect_analysis_artifact(
@@ -1904,6 +2208,20 @@ def inspect_analysis_artifact(
                 raise AnalysisArtifactInvalid(
                     "analysis artifact changed while opening detached admission"
                 )
+            record_entry = handle.get(_ENTRY)
+            if isinstance(record_entry, h5py.Group) and _is_stitch_record(record_entry):
+                inspection = _inspect_stitch_record(
+                    record_entry, shown, admitted_revision,
+                    expected_request=expected_request, expected_kind=expected_kind,
+                )
+                if (
+                    _opened_hdf_revision(handle) != admitted_revision
+                    or _stat_revision(os.stat(shown)) != admitted_revision
+                ):
+                    raise AnalysisArtifactInvalid(
+                        "analysis artifact changed during detached admission"
+                    )
+                return inspection
             if len(handle.attrs) != 0 or len(handle) != 1 or _ENTRY not in handle:
                 raise AnalysisArtifactInvalid("analysis artifact must contain only /entry")
             entry = _direct(handle, _ENTRY, h5py.Group)
@@ -1929,6 +2247,8 @@ def inspect_analysis_artifact(
                 ANALYSIS_SCHEMA_VERSION_V3,
                 ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
                 ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
+                ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE,
+                ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE,
             }:
                 raise AnalysisArtifactInvalid(
                     "analysis artifact schema version is unsupported"
@@ -1945,6 +2265,8 @@ def inspect_analysis_artifact(
                 "provenance_digest",
                 "file_name",
             }
+            if version in _STITCH_NATIVE_VERSIONS:
+                expected_entry_attrs.add("source_base")
             if contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
                 expected_entry_attrs.add(_EXECUTION_ATTESTATION_DIGEST_ATTR)
             if len(entry.attrs) != len(expected_entry_attrs) or any(
@@ -1961,6 +2283,10 @@ def inspect_analysis_artifact(
                 kind = AnalysisArtifactKind(_bounded_attr_text(entry, ANALYSIS_KIND_ATTR))
             except ValueError as error:
                 raise AnalysisArtifactInvalid("analysis artifact kind is invalid") from error
+            if kind is AnalysisArtifactKind.STITCH_1D:  # an Int record now (stitch_record, admitted above)
+                raise AnalysisArtifactInvalid(
+                    "a Stitch 1D result is an Int record; this older Stitch artifact is not read"
+                )
             if (
                 version == ANALYSIS_SCHEMA_VERSION_V3
                 and kind is not AnalysisArtifactKind.RSM
@@ -1970,7 +2296,7 @@ def inspect_analysis_artifact(
                 )
             if version in _STITCH_NEUTRAL_CONTRACTS and (
                 kind not in {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}
-                or (version == ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL
+                or (version in {ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL, *_STITCH_NATIVE_VERSIONS}
                     and kind is not AnalysisArtifactKind.STITCH_1D)
             ):
                 raise AnalysisArtifactInvalid("neutral analysis artifact requires its Stitch kind")
@@ -2023,6 +2349,8 @@ def inspect_analysis_artifact(
             expected_entry_children = 2 + int(
                 contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}
             )
+            if version in _STITCH_NATIVE_VERSIONS:
+                expected_entry_children += 2
             if len(entry) != expected_entry_children:
                 raise AnalysisArtifactInvalid(
                     "analysis artifact contains an unknown entry graph"
@@ -2038,6 +2366,8 @@ def inspect_analysis_artifact(
             # source identity meanwhile; an unbound raw-popup graph must not
             # acquire artifact authority merely by being local-hard HDF5.
             allowed = {kind.group, _PROVENANCE}
+            if version in _STITCH_NATIVE_VERSIONS:
+                allowed.update({"frames", "contributing_frames_json"})
             if contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
                 allowed.add(_EXECUTION_ATTESTATION)
             if any(name not in allowed for name in entry):
@@ -2131,6 +2461,8 @@ def inspect_analysis_artifact(
             if _bounded_attr_texts(result, "axes") != stored_axis_names:
                 raise AnalysisArtifactInvalid("analysis result axes are invalid")
             allowed_result = {"intensity", _PROVENANCE, *stored_axis_names}
+            if version in _STITCH_NATIVE_VERSIONS:
+                allowed_result.update({"wavelength_A", "companion_axis"})
             if kind in {
                 AnalysisArtifactKind.STITCH_1D,
                 AnalysisArtifactKind.STITCH_2D,
@@ -2154,6 +2486,8 @@ def inspect_analysis_artifact(
                 + int(has_sigma)
                 + 2 * int(has_stitch_diagnostics)
             )
+            if version in _STITCH_NATIVE_VERSIONS:
+                expected_result_size += 2
             if len(result) != expected_result_size:
                 raise AnalysisArtifactInvalid(
                     "analysis result contains an unknown graph"
@@ -2230,7 +2564,10 @@ def inspect_analysis_artifact(
             if contract_version == ANALYSIS_SCHEMA_VERSION_V2:
                 if kind is AnalysisArtifactKind.STITCH_1D:
                     if (
-                        axis_units != [("q", "q_A^-1")]
+                        axis_units[0][1] not in (
+                            {"q_A^-1", "2th_deg"} if version in _STITCH_NATIVE_VERSIONS
+                            else {"q_A^-1"}
+                        )
                         or has_sigma
                         or not has_stitch_diagnostics
                     ):
@@ -2332,7 +2669,10 @@ def inspect_analysis_artifact(
                     require_nonnegative=True,
                 )
             try:
+                wavelength_A = frame_manifest_json = None
                 projection = project_analysis_artifact_result(
+                    wavelength_A=wavelength_A,
+                    _frame_manifest_json=frame_manifest_json,
                     kind=kind,
                     axes=axes,
                     axis_units=tuple(axis_units),
@@ -2401,6 +2741,8 @@ def inspect_analysis_artifact(
                 ).hexdigest(),
                 result_fingerprint=projection.result_fingerprint,
                 schema_version=version,
+                wavelength_A=wavelength_A,
+                frame_manifest_json=frame_manifest_json,
                 execution_attestation_digest=execution_attestation_digest,
                 execution_attestation_json=execution_attestation_json,
             )
@@ -2478,6 +2820,33 @@ def read_analysis_artifact(
         admitted_revision = inspection.storage_revision
         if _stat_revision(os.stat(shown)) != admitted_revision:
             raise TargetChanged("analysis artifact changed before payload hydration")
+        if inspection.group == _STITCH_RECORD_RESULT:  # a stitched Int record
+            with h5py.File(shown, "r") as handle:
+                if (
+                    _opened_hdf_revision(handle) != admitted_revision
+                    or _stat_revision(os.stat(shown)) != admitted_revision
+                ):
+                    raise TargetChanged("analysis artifact changed while opening payload")
+                _content, projection = _stitch_record_projection(handle, inspection.schema_version)
+                if projection.result_fingerprint != inspection.result_fingerprint:
+                    raise TargetChanged("analysis payload changed after detached admission")
+                if (
+                    _opened_hdf_revision(handle) != admitted_revision
+                    or _stat_revision(os.stat(shown)) != admitted_revision
+                ):
+                    raise TargetChanged("analysis artifact changed during payload hydration")
+            if expected_receipt is not None:
+                revalidate_stream_terminal(shown, expected_receipt.terminal)
+            return AnalysisArtifactPayload(
+                inspection,
+                projection.axes,
+                projection.intensity,
+                projection.sigma,
+                projection.coverage,
+                projection.normalization,
+                _ANALYSIS_PAYLOAD_FACTORY,
+                gi=projection.gi,
+            )
 
         with h5py.File(shown, "r") as handle:
             if (
@@ -2568,6 +2937,8 @@ def read_analysis_artifact(
                         )
             try:
                 projection = project_analysis_artifact_result(
+                    wavelength_A=inspection.wavelength_A,
+                    _frame_manifest_json=inspection.frame_manifest_json,
                     kind=inspection.kind,
                     axes=axes,
                     axis_units=inspection.axis_units,
@@ -2686,14 +3057,32 @@ class AnalysisArtifactOutput:
         write_result: Callable[[h5py.Group], object],
     ) -> None:
         self._writer_started = True
-        handle = self._publication.open_document(lambda path: h5py.File(path, "w"))
-        entry = handle.create_group(_ENTRY)
-        entry.attrs.create("NX_class", np.bytes_(b"NXentry"))
-        entry.attrs.create(
+        # A Stitch 1D result is an Int record (``stitch_record``): the writer fills a fresh
+        # open_nexus_writer document first, and the request envelope then goes on its stitch group.
+        record = self.request.kind is AnalysisArtifactKind.STITCH_1D
+        if record:
+            from xrd_tools.io.nexus import open_nexus_writer
+
+            def open_record(path):
+                document = open_nexus_writer(path, entry=_ENTRY, compression="gzip", overwrite=True)
+                # This owner admits the candidate itself once the writer is done (_validate_candidate); a
+                # close-time re-admission would turn a failed writer's abort into a pending cleanup.
+                document._disable_terminal_admission()
+                return document
+
+            handle = self._publication.open_document(open_record)
+            entry = handle[_ENTRY]
+            write_result(entry)
+            envelope = _direct(entry, _STITCH_GROUP, h5py.Group)
+        else:
+            handle = self._publication.open_document(lambda path: h5py.File(path, "w"))
+            entry = envelope = handle.create_group(_ENTRY)
+            entry.attrs.create("NX_class", np.bytes_(b"NXentry"))
+        envelope.attrs.create(
             ANALYSIS_SCHEMA_ATTR,
             np.bytes_(ANALYSIS_SCHEMA_NAME.encode("utf-8")),
         )
-        entry.attrs[ANALYSIS_SCHEMA_VERSION_ATTR] = self.request.schema_version
+        envelope.attrs[ANALYSIS_SCHEMA_VERSION_ATTR] = self.request.schema_version
         for name, value in (
             (ANALYSIS_KIND_ATTR, self.request.kind.value),
             ("request_fingerprint", self.request.request_fingerprint),
@@ -2702,12 +3091,12 @@ class AnalysisArtifactOutput:
             ("provenance_digest", self.request.provenance_digest),
             ("file_name", self.request.target),
         ):
-            entry.attrs.create(name, np.bytes_(value.encode("utf-8")))
+            envelope.attrs.create(name, np.bytes_(value.encode("utf-8")))
         if _artifact_contract_version(self.request.schema_version) in {
             ANALYSIS_SCHEMA_VERSION_V2,
             ANALYSIS_SCHEMA_VERSION_V3,
         }:
-            entry.attrs.create(
+            envelope.attrs.create(
                 _EXECUTION_ATTESTATION_DIGEST_ATTR,
                 np.bytes_(
                     self.request.execution_attestation_digest.encode(
@@ -2715,7 +3104,7 @@ class AnalysisArtifactOutput:
                     )
                 ),
             )
-        entry.create_dataset(
+        envelope.create_dataset(
             _PROVENANCE,
             data=np.bytes_(self.request.provenance_json.encode("utf-8")),
         )
@@ -2723,13 +3112,14 @@ class AnalysisArtifactOutput:
             ANALYSIS_SCHEMA_VERSION_V2,
             ANALYSIS_SCHEMA_VERSION_V3,
         }:
-            entry.create_dataset(
+            envelope.create_dataset(
                 _EXECUTION_ATTESTATION,
                 data=np.bytes_(
                     self.request.execution_attestation_json.encode("utf-8")
                 ),
             )
-        write_result(entry)
+        if not record:
+            write_result(entry)
         handle.flush()
 
     def _validate_candidate(
@@ -2953,6 +3343,8 @@ __all__ = [
     "ANALYSIS_SCHEMA_VERSION_V3",
     "ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL",
     "ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL",
+    "ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE",
+    "ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE",
     "ANALYSIS_SCHEMA_VERSION_ATTR",
     "AnalysisArtifactCleanupPending",
     "AnalysisArtifactError",

@@ -363,6 +363,7 @@ class ContextProjection:
         browser_transient_frame: DisplayFrameKey | None = None,
         viewer_1d_current_path: str = "",
         viewer_1d_selected_paths: tuple[str, ...] = (),
+        viewer_2d_current_path: str = "",
         viewer_waterfall_active: bool = False,
         date_sorted: bool,
         auto_last: bool,
@@ -481,11 +482,17 @@ class ContextProjection:
                 selected_artifacts=(
                     viewer_1d_selected_paths if viewer_1d_selected else ()
                 ),
+                # The 2D Viewer's file intent leads, as 1-D intent does: while the
+                # next file's catalog loads (or the prior file clears) nothing is
+                # selected, and an empty current row sent the next arrow key to
+                # the list's top.
                 current_artifact=(
-                    next((os.path.abspath(context.original_path)
-                          for context in contexts
-                          if type(context) is Viewer2DContext
-                          and selection.names(context)), "")
+                    viewer_2d_current_path
+                    if tool is Tool.IMAGE_VIEWER and viewer_2d_current_path
+                    else next((os.path.abspath(context.original_path)
+                               for context in contexts
+                               if type(context) is Viewer2DContext
+                               and selection.names(context)), "")
                     if viewer_2d_selected else viewer_1d_current_path
                 ),
                 multi_artifact_selection=viewer_1d_selected or tool is Tool.XYE_VIEWER,

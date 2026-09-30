@@ -144,7 +144,7 @@ def test_fresh_settings_resolve_exact_production_appearance_defaults(settings):
     assert typography.resolve_font_scale(settings) == "small"
     assert themes.accent.resolve_accent_color(settings) == "periwinkle_muted"
     assert themes.spacing.resolve_spacing(settings) == "tight"
-    assert themes.corners.resolve_controls_card_corners(settings) is True
+    assert themes.corners.resolve_controls_card_corners(settings) is False
 
 
 def test_omitted_and_explicit_defaults_match_and_candidates_only_recolor_selection(
@@ -217,7 +217,7 @@ def test_each_candidate_reaches_every_selected_control_family(
 
 
 def test_buttons_are_square_while_panel_cards_remain_rounded():
-    qss = render_qss("dark")
+    qss = render_qss("dark", controls_card_corners=True)
     for selector in (
         "QPushButton",
         "QToolButton",
@@ -358,7 +358,7 @@ def test_config_menus_are_exclusive_persisted_and_apply_one_complete_appearance(
                 "font_scale": "small",
                 "accent_color": "mauve_grey",
                 "spacing": "tight",
-                "controls_card_corners": True,
+                "controls_card_corners": False,
             },
         )
         _trigger(window, "Spacing", "Spacious")
@@ -368,7 +368,7 @@ def test_config_menus_are_exclusive_persisted_and_apply_one_complete_appearance(
                 "font_scale": "small",
                 "accent_color": "mauve_grey",
                 "spacing": "spacious",
-                "controls_card_corners": True,
+                "controls_card_corners": False,
             },
         )
         window._set_theme("light")
@@ -379,7 +379,7 @@ def test_config_menus_are_exclusive_persisted_and_apply_one_complete_appearance(
                 "font_scale": "large",
                 "accent_color": "mauve_grey",
                 "spacing": "spacious",
-                "controls_card_corners": True,
+                "controls_card_corners": False,
             },
         )
         assert settings.value(themes.accent.ACCENT_COLOR_SETTINGS_KEY) == (

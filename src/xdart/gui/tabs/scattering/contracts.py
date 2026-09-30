@@ -206,8 +206,30 @@ class AcceptedScientificAssets:
     mask_sha256: str | None
     poni_detector_config_json: str | None = None
     poni_parallax: bool | None = None
+    #: The admitted flat field and dark as prepared float32 (unusable pixels NaN).
+    flat_shape: tuple[int, int] | None = None
+    flat_bytes: bytes | None = None
+    flat_sha256: str | None = None
+    dark_shape: tuple[int, int] | None = None
+    dark_bytes: bytes | None = None
+    dark_sha256: str | None = None
+    #: Readiness warnings about the flat or dark (see check_detector_image), shown
+    #: when the run starts; they change nothing about the science.
+    correction_warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        for role, name in (("flat", "flat field"), ("dark", "dark")):
+            shape, payload, digest = (getattr(self, f"{role}_{part}")
+                                      for part in ("shape", "bytes", "sha256"))
+            if any(value is not None for value in (shape, payload, digest)) and not (
+                    type(shape) is tuple and len(shape) == 2
+                    and all(type(value) is int and value > 0 for value in shape)
+                    and type(payload) is bytes and len(payload) == 4 * shape[0] * shape[1]
+                    and type(digest) is str and len(digest) == 64):
+                raise TypeError(f"accepted {name} is invalid")
+        if type(self.correction_warnings) is not tuple or not all(
+                type(item) is str for item in self.correction_warnings):
+            raise TypeError("accepted correction warnings are invalid")
         values = self.poni_values
         if values is not None and not (
                 type(values) is tuple and len(values) == 8
@@ -299,6 +321,16 @@ class AcceptedScientificAssets:
         return None if self.mask_bytes is None else np.frombuffer(
             self.mask_bytes, dtype=np.dtype(self.mask_dtype)).reshape(
                 self.mask_shape).copy()
+
+    @property
+    def flat(self) -> np.ndarray | None:
+        return None if self.flat_bytes is None else np.frombuffer(
+            self.flat_bytes, dtype=np.float32).reshape(self.flat_shape).copy()
+
+    @property
+    def dark(self) -> np.ndarray | None:
+        return None if self.dark_bytes is None else np.frombuffer(
+            self.dark_bytes, dtype=np.float32).reshape(self.dark_shape).copy()
 
 def _copy_source(value: SourceSelection) -> SourceSelection:
     if type(value) is SourceSpec:

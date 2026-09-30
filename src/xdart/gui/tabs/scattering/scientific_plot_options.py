@@ -32,6 +32,8 @@ class PlotOptionsDialog(QtWidgets.QDialog):
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
+        *,
+        show_waterfall: bool = True,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("e4PlotOptionsDialog")
@@ -41,6 +43,8 @@ class PlotOptionsDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
         waterfall = self._section(layout, "Waterfall")
+        self._waterfall_group = waterfall.parentWidget()
+        self._waterfall_group.setVisible(show_waterfall)
         waterfall.addWidget(QtWidgets.QLabel("Y-Axis"), 0, 0)
         waterfall.addWidget(QtWidgets.QLabel("Start"), 0, 1)
         waterfall.addWidget(QtWidgets.QLabel("Stop"), 0, 2)
@@ -108,6 +112,20 @@ class PlotOptionsDialog(QtWidgets.QDialog):
     @property
     def projection(self) -> ScientificPlotOptions:
         return self._projection
+
+    def set_waterfall_visible(self, visible: bool) -> None:
+        self._waterfall_group.setVisible(bool(visible))
+
+    def add_row(self, label: str, editor: QtWidgets.QWidget) -> None:
+        """A host's own option above the buttons. The host applies it on
+        ``ScientificView.plotOptionsAccepted`` and resets it on ``rejected``."""
+        row = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QtWidgets.QLabel(label))
+        layout.addWidget(editor)
+        outer = self.layout()
+        outer.insertWidget(outer.count() - 1, row)
 
     def reconcile(self, options: ScientificPlotOptions) -> None:
         if type(options) is not ScientificPlotOptions:

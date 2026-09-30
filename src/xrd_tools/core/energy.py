@@ -25,6 +25,7 @@ _HC_EV_M = 1.239841984e-6
 __all__ = [
     "energy_eV_to_wavelength_m",
     "wavelength_m_to_energy_eV",
+    "calibration_recorded_energy_eV",
     "check_energy_consistency",
     # X1 Slice 3a0 (R3-P1): the one headless wavelength vocabulary.
     "WavelengthUnit",
@@ -140,6 +141,29 @@ def energy_eV_to_wavelength_m(energy_eV: float) -> float:
 def wavelength_m_to_energy_eV(wavelength_m: float) -> float:
     """X-ray wavelength (m) → energy (eV)."""
     return _HC_EV_M / float(wavelength_m)
+
+
+def calibration_recorded_energy_eV(record) -> float | None:
+    """A goniometer calibration's recorded energy (``source_energy_eV``: kept when its energy was
+    refined, and what the scans' energies are checked against), or None when it has none.
+
+    Refused unless an actual finite positive number within 5 % of the calibration's own energy (its
+    wavelength's): a NaN or infinite reference would pass any floating comparison (Codex re-review
+    R2-F1).
+    """
+    import math
+    if not isinstance(record, dict) or "source_energy_eV" not in record:
+        return None
+    value, wavelength = record["source_energy_eV"], record.get("wavelength")
+    for number in (value, wavelength):
+        if type(number) not in (int, float) or not math.isfinite(number) or number <= 0:
+            raise ValueError("the calibration's recorded energy (source_energy_eV) and its wavelength must be "
+                             "finite positive numbers")
+    energy = wavelength_m_to_energy_eV(wavelength)
+    if not abs(value - energy) < .05 * energy:
+        raise ValueError(f"the calibration's recorded energy {value:g} eV is not within 5 % of its own "
+                         f"{energy:.1f} eV")
+    return float(value)
 
 
 def check_energy_consistency(
