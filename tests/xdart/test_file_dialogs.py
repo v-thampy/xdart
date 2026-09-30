@@ -1,16 +1,9 @@
-"""The SPEC file picker: folders and SPEC-named files only, until "All files" is chosen."""
-import time
-
+"""The SPEC file picker: the platform's own dialog, keeping the SPEC files picked."""
 import pytest
-from pyqtgraph.Qt import QtCore, QtWidgets
-from PySide6.QtTest import QTest
+from pyqtgraph.Qt import QtWidgets
 
 from xdart.gui.widgets import file_dialogs
-from xdart.gui.widgets.file_dialogs import ANY_FILTER, NEXUS_FILTER, is_spec_name, spec_dialog
-
-# a direct-beam folder as the beamline writes it: the SPEC file beside its images and notes
-FOLDER = ("direct_beam", "b_thampy_direct_beam_scan3_0094.raw", "b_thampy_direct_beam_scan3_0094.raw.pdi",
-          "direct_beam_scan1.csv", "run.spec")
+from xdart.gui.widgets.file_dialogs import ANY_FILTER, NEXUS_FILTER, browse_spec
 
 
 @pytest.fixture(scope="module")
@@ -18,44 +11,35 @@ def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-@pytest.mark.parametrize(("name", "spec"), [
-    ("direct_beam", True), ("b_thampy_LaB6_17keV", True), ("run.spec", True), ("RUN.SPEC", True),
-    ("b_thampy_direct_beam_scan3_0094.raw", False), ("b_thampy_direct_beam_scan3_0094.raw.pdi", False),
-    ("direct_beam_scan1.csv", False), ("frame_0000.edf", False), (".hidden", False)])
-def test_a_spec_file_has_no_extension_or_spec(name, spec):
-    assert is_spec_name(name) is spec
+@pytest.mark.parametrize("many", (True, False))
+def test_the_spec_picker_is_the_platform_dialog_and_refuses_what_is_not_spec(qapp, tmp_path, monkeypatch, many):
+    """Maintainer, 2026-09-30: "choosing the spec file still brings up this dialog. all others bring up
+    the native mac os style dialog". A beamline folder: the SPEC file beside its images and notes."""
+    spec = tmp_path / "direct_beam"
+    spec.write_text("#F direct_beam\n#E 1\n#S 1 ascan del 0 1 1 1\n")
+    image, notes = tmp_path / "direct_beam_scan1_0000.raw", tmp_path / "direct_beam_scan1_0000.raw.pdi"
+    image.write_bytes(b"\x00\x01" * 8)
+    notes.write_text("All Counters;del=1\n")
+    opened, warned = [], []
+    picks = [str(spec), str(image), str(notes)] if many else [str(image)]
 
-
-def _listed(dialog, folder, qapp, count):
-    """The names the dialog lists in ``folder`` once its file system model has read it."""
-    proxy = dialog.proxyModel()
-    model = proxy.sourceModel()
-    until = time.monotonic() + 10
-    while model.rowCount(model.index(str(folder))) < count and time.monotonic() < until:
-        qapp.processEvents()
-        time.sleep(.01)
-    root = proxy.mapFromSource(model.index(str(folder)))
-    return {proxy.index(row, 0, root).data() for row in range(proxy.rowCount(root))}
-
-
-def test_the_spec_picker_lists_folders_and_spec_files_until_all_files_is_chosen(qapp, tmp_path):
-    for name in FOLDER:
-        (tmp_path / name).write_text("x")
-    (tmp_path / "images").mkdir()
-    dialog = spec_dialog(None, "Select SPEC file", str(tmp_path), many=True)
-    try:
-        assert not dialog.testOption(QtWidgets.QFileDialog.Option.ShowDirsOnly)
-        assert _listed(dialog, tmp_path, qapp, len(FOLDER) + 1) == {"direct_beam", "run.spec", "images"}
-        types = dialog.findChild(QtWidgets.QComboBox, "fileTypeCombo")
-        QTest.keyClick(types, QtCore.Qt.Key.Key_Down)  # the user picks "All files"
-        qapp.processEvents()
-        assert dialog.selectedNameFilter() == ANY_FILTER
-        assert _listed(dialog, tmp_path, qapp, len(FOLDER) + 1) == {*FOLDER, "images"}
-        QTest.keyClick(types, QtCore.Qt.Key.Key_Up)  # and "SPEC files" again
-        qapp.processEvents()
-        assert _listed(dialog, tmp_path, qapp, len(FOLDER) + 1) == {"direct_beam", "run.spec", "images"}
-    finally:
-        dialog.deleteLater()
+    def static(parent, title, start, file_filter):
+        opened.append((title, start, file_filter))
+        return (picks, file_filter) if many else (picks[0], file_filter)
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileNames" if many else "getOpenFileName",
+                        staticmethod(static))
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", staticmethod(lambda *args: warned.append(args[2])))
+    kept = browse_spec(None, "Choose SPEC files", many=many, fallback=str(tmp_path))
+    # the static (native) dialog, listing every file; where it opens is browse()'s rule (the last pick)
+    assert [(title, file_filter) for title, _start, file_filter in opened] == [("Choose SPEC files", ANY_FILTER)]
+    if many:
+        assert kept == [str(spec)]
+        assert warned == [f"Not a SPEC file, so not added: {image.name}, {notes.name}"]
+    else:
+        assert kept == [] and warned == [f"Not a SPEC file, so not added: {image.name}"]
+    warned.clear()
+    picks[:] = [str(spec)]
+    assert browse_spec(None, "Choose SPEC files", many=many) == [str(spec)] and not warned
 
 
 def test_stitch_spec_sources_use_the_spec_picker_and_keep_every_pick(qapp, tmp_path, monkeypatch):
