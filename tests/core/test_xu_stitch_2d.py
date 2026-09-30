@@ -81,3 +81,39 @@ def test_the_maps_chi_is_pyfais_on_the_scan14_calibrations(tmp_path, delta, nu):
     assert float(np.max(np.abs(wrap(actual - expected)))) < 1.5
     mirrored = np.degrees(np.arctan2(qx, qz))
     assert delta == 0.0 or float(np.median(np.abs(wrap(mirrored - expected)))) > 90.0
+
+
+def test_a_native_xrayutilities_stitch_2d_is_an_attested_int_2d_record(tmp_path):
+    """The operation writes the map and I(q) as an Int 2D record (version 7, attested as a Stitch 1D is);
+    I(q) beside the map is the native xrayutilities Stitch 1D's."""
+    from dataclasses import replace
+    from xrd_tools.analysis.module_transaction import ModuleDisposition, ModuleOutputRequest
+    from xrd_tools.analysis.stitch_operation import prepare_stitch_operation, run_stitch_operation
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
+    from xrd_tools.io.output_path import resolve_finite_output_target
+    from tests.core.test_stitch_operation import _xu_prepared
+
+    original = _xu_prepared(tmp_path)
+
+    def native(mode):
+        grid = dict(npt_rad_2d=48, npt_azim_2d=32, azimuth_range=(-180.0, 180.0)) if mode == "2d" else {}
+        plan = replace(original.plan, native_records=True, q_min_A_inverse=None, q_max_A_inverse=None,
+                       radial_range=(1.0, 5.2), mode=mode, **grid)
+        kind = AnalysisArtifactKind.STITCH_2D if mode == "2d" else AnalysisArtifactKind.STITCH_1D
+        target = resolve_finite_output_target(tmp_path, f"xu-{mode}", operation_token=f"stitch-{mode}")
+        return prepare_stitch_operation(original.module.source, ModuleOutputRequest(
+            target, kind, artifact_family=f"xu-{mode}"), plan, project_root=tmp_path)
+
+    two, one = native("2d"), native("1d")
+    for request in (two, one):
+        result = run_stitch_operation(request)
+        assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    payload = read_analysis_artifact(two.module.output.target, expected_kind=AnalysisArtifactKind.STITCH_2D)
+    pattern = read_analysis_artifact(one.module.output.target, expected_kind=AnalysisArtifactKind.STITCH_1D)
+    assert payload.schema_version == 7 and payload.execution_attestation_digest is not None
+    assert payload.intensity.shape == payload.coverage.shape == (48, 32)
+    for name in ("intensity", "coverage", "normalization"):
+        np.testing.assert_array_equal(getattr(payload.profile, name), getattr(pattern, name))
+    np.testing.assert_array_equal(payload.profile.axes[0][1], pattern.axis("q"))
+    assert payload.coverage.sum() == pattern.coverage.sum()  # the same pixels, over (q, χ)
+    assert len(payload.contributing_frames) == len(pattern.contributing_frames)

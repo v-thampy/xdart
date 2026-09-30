@@ -400,8 +400,8 @@ class StitchToolForm:
         if self.mode not in {"1d", "2d"}:
             raise ValueError("Stitch mode must be 1d or 2d")
         if self.mode == "2d":
-            if not native or self.backend != "multigeometry":
-                raise ValueError("Stitch 2D uses the pyFAI MultiGeometry backend")
+            if not native:
+                raise ValueError("Stitch 2D writes a native record: choose its sources on the Stitch page")
             if self.gi is not None:
                 raise ValueError("Stitch 2D has no grazing cuts yet: turn Grazing off")
             for name in ("npt_rad_2d", "npt_azim_2d"):

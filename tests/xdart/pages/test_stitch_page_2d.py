@@ -4,6 +4,7 @@ accessible as in stitch 1d)"): Int 2D's layout without the raw pane, the map as 
 its slices and pins as Int 2D makes them from the same map, and the contributing frames as a Stitch 1D's.
 """
 import numpy as np
+import pytest
 
 from xdart.gui.pages.services import empty_host_services
 from xdart.gui.pages.values import PageCleanup
@@ -20,10 +21,11 @@ def _command(page, kind, value=None):
     page._view_command(ShellCommand(kind, value))
 
 
-def test_a_stitch_2d_shows_its_map_as_int_2d_without_the_raw_pane(qapp, tmp_path):
+@pytest.mark.parametrize("backend", ["multigeometry", "xu_hist"])
+def test_a_stitch_2d_shows_its_map_as_int_2d_without_the_raw_pane(qapp, tmp_path, backend):
     page = StitchPage(empty_host_services(_Status()))
     try:
-        page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        page.load_form(_native_form(tmp_path, backend, scans="1"))
         page.run_bar.modeCombo.setCurrentText("Stitch 2D")
         page.set_field("npt_rad_2d", "48")
         page.set_field("npt_azim_2d", "32")

@@ -57,9 +57,9 @@ ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL = 5
 ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE = 6
 ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE = 7
 _STITCH_NATIVE_VERSIONS = {6, 7}
-#: The Stitch versions written only as a Stitch 1D (a native MultiGeometry Stitch 2D is an Int 2D
-#: record, version 6).
-_STITCH_1D_ONLY_VERSIONS = {5, 7}
+#: The Stitch versions written only as a Stitch 1D (a native Stitch 2D is an Int 2D record: version 6,
+#: MultiGeometry's, or 7, xrayutilities').
+_STITCH_1D_ONLY_VERSIONS = {5}
 # Keep ordinary and attested science contracts distinct; only physical names change.
 _STITCH_NEUTRAL_CONTRACTS = {4: 1, 5: 2, 6: 1, 7: 2}
 ANALYSIS_KIND_ATTR = "analysis_kind"
@@ -578,7 +578,7 @@ def _validated_execution_attestation(
             raise ValueError("analysis execution attestation contract is invalid")
         return text, parsed
     if (
-        kind is not AnalysisArtifactKind.STITCH_1D
+        kind not in {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}
         or set(parsed) != top_keys
         or parsed.get("schema_version") != "analysis-execution-attestation-v1"
         or parsed.get("module_request_fingerprint") != request_fingerprint
@@ -620,7 +620,8 @@ def analysis_execution_attestation_digest(
     from xrd_tools.analysis.module_transaction import ModuleKind
     from xrd_tools.analysis.scan_operations import analysis_canonical_fingerprint
 
-    if kind is AnalysisArtifactKind.STITCH_1D:
+    if kind in {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}:
+        # a Stitch 2D's attestation binds its own request (module_request_fingerprint)
         module_kind = ModuleKind.STITCH
         domain = "analysis-artifact-execution-attestation-v1"
     elif kind is AnalysisArtifactKind.RSM:
@@ -2110,7 +2111,7 @@ def _inspect_stitch_record(
         raise AnalysisArtifactInvalid("stitched record kind is invalid") from error
     expected = expected_request.kind if expected_request is not None else expected_kind
     if (kind not in {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}
-            or (kind is AnalysisArtifactKind.STITCH_2D and version != ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE)
+            or (kind is AnalysisArtifactKind.STITCH_2D and version not in _STITCH_NATIVE_VERSIONS)
             or (expected is not None and kind is not expected)):
         raise AnalysisArtifactInvalid("stitched record kind does not match request")
     if expected_request is not None and version != expected_request.schema_version:
@@ -2177,7 +2178,8 @@ def _inspect_stitch_record(
         if native and len(json.loads(content.frames_json)["records"]) != attestation["selected_frame_count"]:
             raise AnalysisArtifactInvalid("contributing frames differ from the science execution count")
     if contract_version == ANALYSIS_SCHEMA_VERSION_V2:
-        for value in (projection, *(cut for _mode, cut in projection.gi)):
+        for value in (projection, *(cut for _mode, cut in projection.gi),
+                      *(() if projection.profile is None else (projection.profile,))):
             empty = value.coverage == 0
             if (
                 not np.array_equal(empty, value.normalization == 0)
@@ -3135,7 +3137,7 @@ class AnalysisArtifactOutput:
         # stitch group.
         record = self.request.kind is AnalysisArtifactKind.STITCH_1D or (
             self.request.kind is AnalysisArtifactKind.STITCH_2D
-            and self.request.schema_version == ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE)
+            and self.request.schema_version in _STITCH_NATIVE_VERSIONS)
         if record:
             from xrd_tools.io.nexus import open_nexus_writer
 

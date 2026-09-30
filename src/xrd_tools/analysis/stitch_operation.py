@@ -1462,11 +1462,15 @@ class XuStitchOperationPlan:
     flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
     #: Grazing incidence: a GI cut written beside I(q) (native Stitch 1D only).
     gi: StitchGI | None = None
+    #: '2d' (native records): the (radial, χ) map beside I(q), its points and χ range (°).
+    mode: str = "1d"
+    npt_rad_2d: int = 1000
+    npt_azim_2d: int = 360
+    azimuth_range: tuple[float, float] | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
     backend: str = field(init=False, default="xu_hist")
-    mode: str = field(init=False, default="1d")
     method: str = field(init=False, default="numpy_histogram_center_v1")
     use_detector_mask: bool = field(init=False, default=True)
     fingerprint: str = field(init=False)
@@ -1506,6 +1510,7 @@ class XuStitchOperationPlan:
             raise TypeError("XU Stitch operation plan is invalid")
         if not self.native_records and self.calibration.projection.value["version"] != 1:
             raise ValueError("non-native XU plans require canonical version 1 calibration")
+        _xu_map_fields(self)
         object.__setattr__(
             self,
             "fingerprint",
@@ -1531,9 +1536,36 @@ class XuStitchOperationPlan:
                     self.effective_geometry.fingerprint,
                     self.frame_screen.identity(),
                 ) + _xu_corrections_identity(self) + _gi_identity(self)
-                + (native_plan_identity(self) if self.native_records else ()),
+                + (native_plan_identity(self) if self.native_records else ())
+                # a 1-D plan keeps the identity it had
+                + (() if self.mode == "1d" else (("xu-map-v1",) + _xu_map_grid(self),)),
             ),
         )
+
+def _xu_map_fields(plan):
+    """A Stitch 2D's map (native records, no GI): its points and its χ range; a 1-D plan has none."""
+    if plan.mode not in {"1d", "2d"}:
+        raise ValueError("stitch mode must be '1d' or '2d'")
+    azimuth = _range(plan.azimuth_range, "azimuth range", required=plan.mode == "2d")
+    if plan.mode == "1d":
+        if azimuth is not None:
+            raise ValueError("a 1-D Stitch plan cannot carry an azimuth range")
+        return
+    if not plan.native_records:
+        raise ValueError("an xrayutilities Stitch 2D is a native record")
+    for name in ("npt_rad_2d", "npt_azim_2d"):
+        value = getattr(plan, name)
+        if type(value) is not int or not 1 <= value <= _MAX_AXIS_POINTS:
+            raise ValueError(f"{name} must be a bounded positive exact integer")
+    if plan.npt_rad_2d * plan.npt_azim_2d > _MAX_2D_POINTS:
+        raise ValueError("2-D Stitch output exceeds the bounded artifact point limit")
+    object.__setattr__(plan, "azimuth_range", azimuth)
+
+
+def _xu_map_grid(plan):
+    """The map's (radial points, χ points, χ range) of an xrayutilities Stitch 2D."""
+    return plan.npt_rad_2d, plan.npt_azim_2d, plan.azimuth_range
+
 
 def _xu_corrections_identity(plan):
     """Only a corrected XU plan changes its identity; an uncorrected one keeps the old one."""
@@ -1995,6 +2027,9 @@ def _xu_provenance(
             "asset_receipt_fingerprint": receipt.fingerprint,
             "effective_geometry_fingerprint": plan.effective_geometry.fingerprint,
             "plan_fingerprint": plan.fingerprint,
+            **({} if plan.mode == "1d" else {"map": {
+                "npt_rad_2d": plan.npt_rad_2d, "npt_azim_2d": plan.npt_azim_2d,
+                "azimuth_range": list(plan.azimuth_range)}}),
         },
         "observations": observed,
         "runtime_requirements": {
@@ -2169,7 +2204,7 @@ def prepare_stitch_operation(
         )
     expected_kind = (
         AnalysisArtifactKind.STITCH_1D
-        if type(plan) is XuStitchOperationPlan or plan.mode == "1d"
+        if plan.mode == "1d"
         else AnalysisArtifactKind.STITCH_2D
     )
     if output.kind is not expected_kind:
@@ -2268,7 +2303,8 @@ def prepare_stitch_operation(
             observations,
             energy_selector,
         )
-        module = xu_stitch_module_request(
+        # a native plan's request is the native one, below
+        module = None if plan.native_records else xu_stitch_module_request(
             source,
             output,
             plan.fingerprint,
@@ -2809,6 +2845,7 @@ class StitchOperationExecution:
                     cancel_token=cancel_token,
                     progress_callback=science_progress,
                     gi=plan.gi,
+                    map_grid=None if plan.mode == "1d" else _xu_map_grid(plan),
                 )
                 self._frame_screen = screen.summary()
                 _record_frame_screen(records, screen.verdicts)
@@ -2855,15 +2892,25 @@ class StitchOperationExecution:
             )
         payload = scientific.payload
         diagnostics = scientific.diagnostics
+        if (scientific.map is None) is not (plan.mode == "1d"):
+            return self._terminal(ModuleDisposition.FAILED, "INVALID_SCIENCE_RESULT")
         try:
+            if scientific.map is None:
+                result = dict(kind=AnalysisArtifactKind.STITCH_1D, axes=(("q", payload.radial),),
+                              axis_units=(("q", payload.unit),), intensity=payload.intensity,
+                              sigma=payload.sigma, coverage=diagnostics.coverage,
+                              normalization=diagnostics.normalization)
+            else:  # the map, and I(q) beside it
+                stitched, map_diagnostics = scientific.map
+                result = dict(kind=AnalysisArtifactKind.STITCH_2D,
+                              axes=(("q", stitched.radial), ("chi", stitched.azimuthal)),
+                              axis_units=(("q", stitched.unit), ("chi", stitched.azimuthal_unit)),
+                              intensity=stitched.intensity, sigma=stitched.sigma,
+                              coverage=map_diagnostics.coverage, normalization=map_diagnostics.normalization,
+                              profile=(payload.unit, payload.radial, payload.intensity, payload.sigma,
+                                       diagnostics.coverage, diagnostics.normalization))
             result_projection = project_analysis_artifact_result(
-                kind=AnalysisArtifactKind.STITCH_1D,
-                axes=(("q", payload.radial),),
-                axis_units=(("q", payload.unit),),
-                intensity=payload.intensity,
-                sigma=payload.sigma,
-                coverage=diagnostics.coverage,
-                normalization=diagnostics.normalization,
+                **result,
                 **_native_artifact_args(self.request, records),
                 gi_cuts=_gi_cuts(plan, scientific.gi_cuts),
             )

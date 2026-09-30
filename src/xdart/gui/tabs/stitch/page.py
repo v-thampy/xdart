@@ -1113,9 +1113,9 @@ class StitchPage(QtWidgets.QWidget):
                 ("npt_1d", "npt_rad_2d", "npt_azim_2d") if map_mode else ("npt_1d",)))
         except ValueError:
             processing_ready = False
-        # a map is pyFAI MultiGeometry's, without grazing cuts (items 2 and 3 of the deferred list)
-        map_problem = (None if not map_mode else "the pyFAI MultiGeometry backend" if xu
-                       else "Grazing off (a map has no grazing cuts yet)" if self._gi["enabled"] else None)
+        # a map has no grazing cuts yet (item 3 of the deferred list)
+        map_problem = ("Grazing off (a map has no grazing cuts yet)" if map_mode and self._gi["enabled"]
+                       else None)
         self.controls.processing_card.set_status_text(
             f"{self._mode.lower()} · " + ("xrayutilities" if xu else "multigeometry"))
         # What each input still needs, in a few words, as Int's "Needs …" (maintainer, 2026-09-30:

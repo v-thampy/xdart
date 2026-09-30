@@ -475,9 +475,10 @@ class ModuleOperationRequest:
             )
         if (xu_bound or native_bound) and (
             self.source.kind is not ModuleKind.STITCH
-            # a native MultiGeometry Stitch 2D is an Int 2D record; xrayutilities' is 1-D
-            or self.output.kind not in ({AnalysisArtifactKind.STITCH_1D} if xu_bound else
-                                        {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D})
+            # a native Stitch 2D is an Int 2D record
+            or self.output.kind not in {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}
+            or (xu_bound and _native_stitch_owner is None
+                and self.output.kind is not AnalysisArtifactKind.STITCH_1D)
         ):
             raise TypeError("XU Stitch request requires exact Stitch 1-D intent")
         if rsm_v2_bound and (
@@ -719,7 +720,7 @@ def _validate_xu_stitch_v2_intent(
         or type(corrections) is not dict
         or not corrections
         or type(plan) is not dict
-        or set(plan) - {"frame_screen", "corrections", "gi"}
+        or set(plan) - {"frame_screen", "corrections", "gi", "map"}
         != {
             "backend",
             "mode",
@@ -736,10 +737,15 @@ def _validate_xu_stitch_v2_intent(
         } | ({"native_records", "conditioning", "mask"} if native else set())
         or ("frame_screen" in plan and type(plan["frame_screen"]) is not dict)
         or ("gi" in plan and (not native or type(plan["gi"]) is not dict))
+        # a Stitch 2D's map: native, for its Stitch 2D output only
+        or ("map" in plan) is not (plan.get("mode") == "2d")
+        or (plan.get("mode") == "2d") is not (request.output.kind is AnalysisArtifactKind.STITCH_2D)
+        or ("map" in plan and (not native or type(plan["map"]) is not dict
+                               or set(plan["map"]) != {"npt_rad_2d", "npt_azim_2d", "azimuth_range"}))
         or ("corrections" in plan and (type(plan["corrections"]) is not dict
                                        or set(plan["corrections"]) != {"polarization_factor", "dark", "flat"}))
         or plan.get("backend") != "xu_hist"
-        or plan.get("mode") != "1d"
+        or plan.get("mode") not in {"1d", "2d"}
         or plan.get("unit") not in ({"q_A^-1", "2th_deg"} if native else {"q_A^-1"})
         or plan.get("method") != "numpy_histogram_center_v1"
         or plan.get("use_detector_mask") is not True
