@@ -2435,18 +2435,16 @@ class StitchPage(QtWidgets.QWidget):
                                   total=len(keys), detail="")
 
     def _view_command(self, command):
-        """The view's typed commands, for the Stitch results it shows; a map's image axis, slice and
-        pins follow Int 2D's rules (``scientific_axes``)."""
-        from xdart.gui.tabs.scattering.scientific_axes import (
-            share_plot_axis_for_image, shown_slice_pin, slice_pins_for_plot_axis,
-        )
-        from xdart.gui.tabs.scattering.scientific_plot_options import plot_option_update
+        """The view's typed commands for the Stitch results it shows: the preference fields each changes are
+        Int's reducer's (``scientific_preference_updates``: a pin lives in Overlay, a plot axis carries its
+        pins, Share axis follows the map shown), with this page's own side effects."""
+        from xdart.gui.tabs.scattering.scientific_axes import shown_slice_pin
+        from xdart.gui.tabs.scattering.scientific_preferences import scientific_preference_updates
         from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
-        kind, value = command.kind, command.value
-        view = self._view
+        kind, view = command.kind, self._view
+        role = QtCore.Qt.ItemDataRole.UserRole
         if kind in {ShellCommandKind.SELECT_FRAME, ShellCommandKind.HYDRATE_FRAME}:
             path = next((path for path, key in self._result_keys.items() if key is command.frame), None)
-            role = QtCore.Qt.ItemDataRole.UserRole
             row = next((row for row in range(self.results.count())
                         if self.results.item(row).data(role) == path), -1)
             if row >= 0 and row != self.results.currentRow():
@@ -2454,58 +2452,30 @@ class StitchPage(QtWidgets.QWidget):
                         if view.plot_mode == "Single" else QtCore.QItemSelectionModel.SelectionFlag.NoUpdate)
                 self.results.setCurrentRow(row, flag)
             return
-        if kind is ShellCommandKind.SET_PLOT_MODE:
-            # as Int: a pin lives in Overlay (and Waterfall) only
-            self._set_view(plot_mode=str(value),
-                           slice_pins=view.slice_pins if value in {"Overlay", "Waterfall"} else ())
-            if value == "Single":
-                self.results.setCurrentRow(self.results.currentRow(),
-                                           QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
-            self._update_residency()  # Overlay shows the selected results, Single the current one
-        elif kind is ShellCommandKind.SET_PLOT_AXIS and value in {"Q", "2theta", "chi", *_CUT_AXES}:
-            self._set_view(plot_axis=value, slice_pins=slice_pins_for_plot_axis(view.slice_pins, view.plot_axis, value))
-        elif kind is ShellCommandKind.SET_IMAGE_AXIS and value in {"Q-Chi", "2Th-Chi", "q_chi", "qip_qoop"}:
-            shared = share_plot_axis_for_image(value) if view.share_axis else None
-            self._set_view(image_axis=value, share_axis=shared is not None,
-                           **({} if shared is None else dict(plot_axis=shared, slice_pins=slice_pins_for_plot_axis(
-                               view.slice_pins, view.plot_axis, shared))))
-        elif kind is ShellCommandKind.SET_SHARE_AXIS and type(value) is bool:
-            shown = view.image_axis if self._last_map_state is None else self._last_map_state.image_axis
-            shared = share_plot_axis_for_image(shown) if value else None
-            self._set_view(share_axis=shared is not None,
-                           **({} if shared is None else dict(plot_axis=shared, slice_pins=slice_pins_for_plot_axis(
-                               view.slice_pins, view.plot_axis, shared))))
-        elif kind is ShellCommandKind.SET_SLICE_ENABLED:
-            self._set_view(slice_enabled=bool(value))
-        elif kind is ShellCommandKind.SET_SLICE_CENTER:
-            self._set_view(slice_center=float(value))
-        elif kind is ShellCommandKind.SET_SLICE_WIDTH:
-            self._set_view(slice_width=float(value))
-        elif kind is ShellCommandKind.PIN_SLICE:  # the slice shown, on the current result's map
+        if kind is ShellCommandKind.CLEAR_1D:
+            self.clear_plot()
+            return
+        if kind is ShellCommandKind.PIN_SLICE:  # the slice shown, on the current result's map
             pin = shown_slice_pin(self._last_map_state)
             current = self.results.currentItem()
-            if (pin is None or current is None
-                    or pin.frame is not self._result_key(current.data(QtCore.Qt.ItemDataRole.UserRole))
+            if (pin is None or current is None or pin.frame is not self._result_key(current.data(role))
                     or pin.projection_id in {other.projection_id for other in view.slice_pins}):
                 return
             self._set_view(slice_pins=(*view.slice_pins, pin))
-        elif kind is ShellCommandKind.SET_COLOR_MAP:
-            self._set_view(color_map=str(value))
-            self._render_raw()
-        elif kind is ShellCommandKind.SET_LOG_SCALE:  # as Int: the image and the curve
-            self._set_view(log_scale=bool(value),
-                           plot_options=replace(view.plot_options, intensity_scale="Log" if value else "Linear"))
-            self._render_raw()
-        elif kind is ShellCommandKind.SET_PLOT_OPTION:
-            options = plot_option_update(view.plot_options, command.path, value)
-            if options is None:
-                return
-            self._set_view(plot_options=options)
-        elif kind is ShellCommandKind.CLEAR_1D:
-            self.clear_plot()
+            self._draw()
             return
-        else:
+        updates = scientific_preference_updates(view, command, shown_image_axis=(
+            None if self._last_map_state is None else self._last_map_state.image_axis))
+        if updates is None:
             return
+        self._set_view(**updates)
+        if kind is ShellCommandKind.SET_PLOT_MODE:
+            if command.value == "Single":
+                self.results.setCurrentRow(self.results.currentRow(),
+                                           QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            self._update_residency()  # Overlay shows the selected results, Single the current one
+        elif kind in {ShellCommandKind.SET_COLOR_MAP, ShellCommandKind.SET_LOG_SCALE}:
+            self._render_raw()  # the raw popup's image too
         self._draw()
 
     def _install_diagnostic_option(self):

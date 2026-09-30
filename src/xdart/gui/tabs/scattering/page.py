@@ -175,7 +175,8 @@ from .scientific_axes import (
     shown_slice_pin,
     slice_pins_for_plot_axis as _slice_pins_for_plot_axis,
 )
-from .scientific_plot_options import plot_option_update, waterfall_should_be_active
+from .scientific_plot_options import waterfall_should_be_active
+from .scientific_preferences import scientific_preference_updates
 from .shell_values import (
     ArtifactProgress,
     DirectoryFileProgress,
@@ -7244,67 +7245,23 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 and type(value) is str and value in {"Average", "Sum"}):
             return False
         updates: dict[str, object] = {}
-        if kind is ShellCommandKind.SET_NORM_CHANNEL:
-            updates["norm_channel"] = str(value)
-        elif kind is ShellCommandKind.SET_COLOR_MAP:
-            updates["color_map"] = str(value)
-        elif kind is ShellCommandKind.SET_LOG_SCALE:
-            updates["log_scale"] = bool(value)
-            updates["plot_options"] = replace(
-                self._preferences.plot_options,
-                intensity_scale="Log" if value else "Linear",
-            )
-        elif kind is ShellCommandKind.SET_DETECTOR_MODE:
+        # The preference fields a plot command changes are the shared reducer's (Int's rules, the Stitch
+        # page's too); the workspace adds its own side effects.
+        shared = scientific_preference_updates(
+            self._preferences, command,
+            shown_image_axis=getattr(self, "_rendered_image_axis", self._preferences.image_axis),
+        )
+        if kind is ShellCommandKind.SET_DETECTOR_MODE:
             return self._set_detector_mode(str(value))
-        elif kind is ShellCommandKind.SET_IMAGE_AXIS:
-            if type(value) is not str or value not in {
-                "Q-Chi",
-                "2Th-Chi",
-                "qip_qoop",
-                "q_chi",
-                "q_chi_derived",
-                "exit_angles",
-            }:
-                return False
-            # A display preference only: choosing which available 2-D map the
-            # pane shows never edits the run intent or starts an integration.
-            updates["image_axis"] = value
-            if self._preferences.share_axis:
-                matching_plot_axis = share_plot_axis_for_image(value)
-                if matching_plot_axis is None:
-                    updates["share_axis"] = False
-                else:
-                    updates["plot_axis"] = matching_plot_axis
-                    updates["slice_pins"] = _slice_pins_for_plot_axis(
-                        self._preferences.slice_pins,
-                        self._preferences.plot_axis,
-                        matching_plot_axis,
-                    )
-        elif kind is ShellCommandKind.SET_PLOT_AXIS:
-            requested_axis = str(value)
-            updates["plot_axis"] = requested_axis
-            updates["slice_pins"] = _slice_pins_for_plot_axis(
-                self._preferences.slice_pins,
-                self._preferences.plot_axis,
-                requested_axis,
-            )
         elif kind is ShellCommandKind.SET_PLOT_MODE:
-            if type(value) is not str or value not in {
-                "Single",
-                "Overlay",
-                "Average",
-                "Sum",
-                "Waterfall",
-            }:
+            if shared is None:
                 return False
             prior_mode = self._preferences.plot_mode
             if value != prior_mode:
                 self._retire_batch_presentation()
             if not viewer_1d:
                 ScatteringWorkspace._clear_presentation_targets(self)
-            updates["plot_mode"] = value
-            if value not in {"Overlay", "Waterfall"}:
-                updates["slice_pins"] = ()
+            updates.update(shared)
             if value == "Single" and prior_mode != "Single" and not viewer_1d:
                 self._shell.browser.cancel_pending_frame_selection()
                 current = self._context_controller.navigation.current
@@ -7312,33 +7269,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._context_controller.select_navigation(
                         current, (current,),
                     )
-        elif kind is ShellCommandKind.SET_SHARE_AXIS:
-            if type(value) is not bool:
-                return False
-            matching_plot_axis = share_plot_axis_for_image(
-                getattr(
-                    self,
-                    "_rendered_image_axis",
-                    self._preferences.image_axis,
-                )
-            )
-            updates["share_axis"] = bool(
-                value and matching_plot_axis is not None
-            )
-            if value:
-                if matching_plot_axis is not None:
-                    updates["plot_axis"] = matching_plot_axis
-                    updates["slice_pins"] = _slice_pins_for_plot_axis(
-                        self._preferences.slice_pins,
-                        self._preferences.plot_axis,
-                        matching_plot_axis,
-                    )
-        elif kind is ShellCommandKind.SET_SLICE_ENABLED:
-            updates["slice_enabled"] = bool(value)
-        elif kind is ShellCommandKind.SET_SLICE_CENTER:
-            updates["slice_center"] = float(value)
-        elif kind is ShellCommandKind.SET_SLICE_WIDTH:
-            updates["slice_width"] = float(value)
         elif kind is ShellCommandKind.PIN_SLICE:
             pin = shown_slice_pin(self._last_scientific_projection)
             navigation = self._context_controller.navigation
@@ -7353,34 +7283,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if pin.projection_id in existing_ids:
                 return False
             updates["slice_pins"] = (*existing, pin)
-        elif kind is ShellCommandKind.SET_RANGE:
-            if type(value) not in {int, float}:
+        elif kind in {
+            ShellCommandKind.SET_NORM_CHANNEL, ShellCommandKind.SET_COLOR_MAP,
+            ShellCommandKind.SET_LOG_SCALE, ShellCommandKind.SET_IMAGE_AXIS,
+            ShellCommandKind.SET_PLOT_AXIS, ShellCommandKind.SET_SHARE_AXIS,
+            ShellCommandKind.SET_SLICE_ENABLED, ShellCommandKind.SET_SLICE_CENTER,
+            ShellCommandKind.SET_SLICE_WIDTH, ShellCommandKind.SET_RANGE,
+            ShellCommandKind.SET_PLOT_OPTION,
+        }:
+            if shared is None:
                 return False
-            if command.path == ("q", "low"):
-                updates["q_range"] = (
-                    float(value), self._preferences.q_range[1]
-                )
-            elif command.path == ("q", "high"):
-                updates["q_range"] = (
-                    self._preferences.q_range[0], float(value)
-                )
-            elif command.path == ("chi", "low"):
-                updates["chi_range"] = (
-                    float(value), self._preferences.chi_range[1]
-                )
-            elif command.path == ("chi", "high"):
-                updates["chi_range"] = (
-                    self._preferences.chi_range[0], float(value)
-                )
-            else:
-                return False
-        elif kind is ShellCommandKind.SET_PLOT_OPTION:
-            options = plot_option_update(
-                self._preferences.plot_options, command.path, value,
-            )
-            if options is None:
-                return False
-            updates["plot_options"] = options
+            updates.update(shared)
         elif kind is ShellCommandKind.SET_DATE_SORT:
             requested = bool(value)
             self._processed_browser.set_date_sorted(requested)
