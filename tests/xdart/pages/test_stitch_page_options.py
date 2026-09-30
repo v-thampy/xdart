@@ -613,10 +613,10 @@ def test_the_sections_show_after_a_project_and_the_run_config_holds_during_a_run
         _close(page, qapp)
 
 
-def test_cores_are_the_frames_pyfai_integrates_at_once(qapp, tmp_path, monkeypatch):
-    """PERF-STITCH-2 (maintainer, 2026-09-30: "implementing multiple workers like in int"): Int's Cores on the run
-    bar; a Run passes them to the operation; they hold during a run as the mode does; xrayutilities stitches on one
-    (its runtime is one per process); the settings keep them."""
+def test_cores_are_the_frames_stitched_at_once(qapp, tmp_path, monkeypatch):
+    """PERF-STITCH-2/3 (maintainer, 2026-09-30: "implementing multiple workers like in int"): Int's Cores on the run
+    bar; a Run passes them to the operation; they hold during a run as the mode does; both backends take them
+    (xrayutilities keeps its own work on one thread and bins the frames on the workers); the settings keep them."""
     from xrd_tools.analysis.stitch_operation import StitchOperationExecution
     from tests.xdart.tools.test_stitch_native_values import _native_form
     seen, real = [], StitchOperationExecution.run
@@ -641,9 +641,7 @@ def test_cores_are_the_frames_pyfai_integrates_at_once(qapp, tmp_path, monkeypat
         page.apply_settings(document)
         assert spin.value() == 3
         page.set_field("backend", "xrayutilities histogram")
-        assert not spin.isEnabled() and "one core" in spin.toolTip()
-        page.set_field("backend", "pyFAI MultiGeometry")
-        assert spin.isEnabled()
+        assert spin.isEnabled() and "fewer use less" in spin.toolTip()
     finally:
         _close(page, qapp)
 

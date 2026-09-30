@@ -2899,6 +2899,7 @@ class StitchOperationExecution:
         self,
         *,
         cancel_token: threading.Event | None,
+        workers: int = 1,
     ) -> StitchOperationResult:
         plan = self.request.plan
         if type(plan) is not XuStitchOperationPlan:
@@ -2961,6 +2962,7 @@ class StitchOperationExecution:
                     map_grid=None if plan.mode == "1d" else _xu_map_grid(plan),
                     **({} if plan.mode == "1d" else dict(map_unit=plan.map_unit,
                                                         map_radial_range=plan.map_radial_range)),
+                    workers=workers,
                 )
                 self._frame_screen = screen.summary()
                 _record_frame_screen(records, screen.verdicts)
@@ -3140,9 +3142,10 @@ class StitchOperationExecution:
         progress_callback: Callable[[ModuleProgress], object] | None = None,
         workers: int = 1,
     ) -> StitchOperationResult:
-        """``workers``: the frames pyFAI MultiGeometry integrates at once (Int's Cores, capped as Int
-        caps them: ``reduction_worker_cap``); the result is the same for any count, so it is no part of
-        the request. xrayutilities stitches on one thread (its runtime is one per process)."""
+        """``workers``: the frames integrated at once (Int's Cores, capped as Int caps them:
+        ``reduction_worker_cap``); the result is the same for any count, so it is no part of the request.
+        pyFAI MultiGeometry integrates them on the workers; xrayutilities keeps its own work on this
+        thread (its runtime is one per process) and bins them on the workers."""
         if self._state != "new":
             raise RuntimeError("Stitch execution is one-shot")
         if cancel_token is not None and type(cancel_token) is not threading.Event:
@@ -3154,7 +3157,7 @@ class StitchOperationExecution:
         self._state = "running"
         self._progress_callback = progress_callback
         if type(self.request.plan) is XuStitchOperationPlan:
-            return self._run_xu(cancel_token=cancel_token)
+            return self._run_xu(cancel_token=cancel_token, workers=reduction_worker_cap(workers))
         labels = self.request.module.source.selected_labels
         science_total = len(labels) + 1
         total = science_total + 3

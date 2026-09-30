@@ -27,6 +27,7 @@ from xrd_tools.core.containers import (
 )
 from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
 from xrd_tools.integrate import pyfai_numexpr
+from xrd_tools.integrate.frame_workers import parallel_frames
 from xrd_tools.integrate.detector_mask import mask_with_detector
 from xrd_tools.integrate.calibration import poni_to_integrator
 from xrd_tools.integrate.stitch_gi import GI_CUTS, GI_UNITS
@@ -199,14 +200,16 @@ def _streaming_multigeometry(
     profile_unit: str | None = None,
     profile_radial_range: tuple[float, float] | None = None,
     workers: int = 1,
+    progress: Callable[[int], object] | None = None,
 ):
     """Returns (pyFAI's merged result, each GI cut's [signal, normalization, count, axis] in the plan's
     order, or () without GI, and with ``profile_npt`` beside a 2-D map pyFAI's merged I(q) over every χ
     in that many bins, as a 1-D Stitch of the same frames makes it; else None).
 
-    ``workers`` above 1 integrates that many frames at once on threads (``_parallel_frames``): this
+    ``workers`` above 1 integrates that many frames at once on threads (``frame_workers``): this
     thread reads the frames and merges their sums in frame order, so the result is the same, bit for
     bit, as one worker's. It takes ``method="full"``, the method Stitch's operation runs.
+    ``progress`` is told how many frames are merged, after each one.
 
     The profile is integrated in the same pass as the map, from the same frame and integrator, whose
     geometry pyFAI computes once for both (one pass instead of two: the frames are read and the
@@ -443,9 +446,11 @@ def _streaming_multigeometry(
                 profile_aggregate = profile if profile_aggregate is None else profile_aggregate.union(profile)
         add_gi(gi_part)
 
+    merged = 0
+
     def merge(part):
         """Merge one frame's sums, in frame order."""
-        nonlocal radial, azimuthal
+        nonlocal radial, azimuthal, merged
         result, profile, gi_part, total, current_radial, current_azimuthal = part
         if radial is None:
             radial = current_radial.copy()
@@ -468,6 +473,9 @@ def _streaming_multigeometry(
                     total, (copy.deepcopy(result), gi_part, kept_profile)):
                 if not verdict.excluded:
                     absorb(held, held_gi, held_profile)
+        merged += 1
+        if progress is not None:
+            progress(merged)
 
     if workers == 1:
         for index in range(image_count):
@@ -477,7 +485,7 @@ def _streaming_multigeometry(
             # successor.  The aggregate retains only pyFAI's O(nbin) result arrays.
             del image, integrator
     else:
-        _parallel_frames(image_count, read, frame_part, merge, workers)
+        parallel_frames(image_count, read, frame_part, merge, workers)
     try:
         next(image_iterator)
     except StopIteration:
@@ -499,35 +507,6 @@ def _streaming_multigeometry(
     if aggregate is None or radial is None:
         raise ValueError("streaming Stitch produced no result")
     return aggregate, () if gi_totals is None else tuple(gi_totals), profile_aggregate
-
-
-def _parallel_frames(count, read, compute, merge, workers):
-    """``compute`` (one frame's sums) the ``count`` frames on ``workers`` threads while this thread
-    ``read``s them and ``merge``s their sums in frame order, as Int's reduction delivers its frames: one
-    reader, per-frame workers, an in-order drain. At most two frames a worker are read and not yet
-    merged. A failure (a frame's, a read's, a cancellation) cancels the frames not started, waits for
-    the running ones and is raised. Frames merge in order, so of two failing frames the earlier one's
-    error is raised; a read failure (or a cancellation) during read-ahead may come before an earlier
-    frame's own failure (Codex terminal review): either way the run ends with nothing merged after it."""
-    from collections import deque
-    from concurrent.futures import ThreadPoolExecutor
-
-    limit = 2 * workers
-    window = deque()
-    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="xdart-stitch-frame")
-    try:
-        for index in range(count):
-            image, integrator = read(index)
-            window.append(pool.submit(compute, index, image, integrator))
-            del image, integrator
-            while window and (len(window) >= limit or window[0].done()):
-                merge(window.popleft().result())
-        while window:
-            merge(window.popleft().result())
-    finally:
-        for future in window:
-            future.cancel()
-        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _drop_unsplit_bins(result):
@@ -710,6 +689,7 @@ def stitch_1d_streaming(
     gi=None,
     gi_angles: Sequence[tuple[float, float]] | None = None,
     workers: int = 1,
+    progress: Callable[[int], object] | None = None,
 ) -> tuple[IntegrationResult1D, StitchDiagnostics,
            tuple[tuple[IntegrationResult1D, StitchDiagnostics], ...]]:
     """Sequential MultiGeometry merge that retains only one detector frame per worker
@@ -743,6 +723,7 @@ def stitch_1d_streaming(
         gi=gi,
         gi_angles=gi_angles,
         workers=workers,
+        progress=progress,
     )
     payload, diagnostics = _stitch_1d_payload(result, unit)
     return payload, diagnostics, tuple(gi_cut_result(totals, GI_UNITS[cut])
@@ -814,6 +795,7 @@ def stitch_2d_streaming(
     flat: np.ndarray | None = None,
     flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
     workers: int = 1,
+    progress: Callable[[int], object] | None = None,
 ) -> tuple[IntegrationResult2D, StitchDiagnostics]:
     """Sequential 2-D MultiGeometry merge retaining one detector frame per worker (``workers`` as
     :func:`stitch_1d_streaming`)."""
@@ -839,6 +821,7 @@ def stitch_2d_streaming(
         flat=flat,
         flat_min_fraction=flat_min_fraction,
         workers=workers,
+        progress=progress,
     )
     return _stitch_2d_payload(result)
 
@@ -868,6 +851,7 @@ def stitch_2d_with_1d_streaming(
     unit_1d: str | None = None,
     radial_range_1d: tuple[float, float] | None = None,
     workers: int = 1,
+    progress: Callable[[int], object] | None = None,
 ) -> tuple:
     """The 2-D map and I(q) beside it, as an Int 2D record holds them, from one pass over the frames:
     the map as :func:`stitch_2d_streaming` makes it, and I(q) over every χ in ``npt_1d`` bins as
@@ -906,6 +890,7 @@ def stitch_2d_with_1d_streaming(
         profile_unit=unit_1d,
         profile_radial_range=radial_range_1d,
         workers=workers,
+        progress=progress,
     )
     cuts = tuple(gi_cut_result(totals, GI_UNITS[cut]) for cut, totals in zip(() if gi is None else gi.cuts, gi_totals))
     gi_map = None if gi is None else gi_map_result(gi_totals[-1])

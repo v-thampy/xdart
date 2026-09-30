@@ -577,7 +577,7 @@ def run_stitch(
 
     recorded_labels = set()
 
-    def _iter_images():
+    def _iter_images(report=True):
         nonlocal progress_done
         for label in labels:
             _stitch_cancelled(cancel_token)
@@ -592,8 +592,14 @@ def run_stitch(
             _stitch_cancelled(cancel_token)
             yield image
             _stitch_cancelled(cancel_token)
-            progress_done += 1
-            _stitch_progress(progress_callback, progress_done, progress_total)
+            if report:  # the streaming MultiGeometry stitch counts merged frames instead (``merged``)
+                progress_done += 1
+                _stitch_progress(progress_callback, progress_done, progress_total)
+
+    def merged(count):
+        nonlocal progress_done
+        progress_done = count
+        _stitch_progress(progress_callback, progress_done, progress_total)
 
     def _load_images_eager() -> list[np.ndarray]:
         images: list[np.ndarray] = []
@@ -780,14 +786,15 @@ def run_stitch(
             )
             if plan.stitch_profile:
                 payload, auxiliary, *profile, gi_cuts, gi_map = stitch_2d_with_1d_streaming(
-                    _iter_images(), len(labels), integrator_series.__iter__, npt_1d=plan.npt_1d,
-                    gi=plan.stitch_gi, gi_angles=gi_angles, workers=workers,
+                    _iter_images(report=False), len(labels), integrator_series.__iter__, npt_1d=plan.npt_1d,
+                    gi=plan.stitch_gi, gi_angles=gi_angles, workers=workers, progress=merged,
                     **(dict(unit_1d=plan.unit, radial_range_1d=plan.radial_range) if own_map else {}),
                     **arguments)
                 profile = tuple(profile)
             else:
                 payload, auxiliary = stitch_2d_streaming(
-                    _iter_images(), len(labels), integrator_series.__iter__, workers=workers, **arguments)
+                    _iter_images(report=False), len(labels), integrator_series.__iter__, workers=workers,
+                    progress=merged, **arguments)
         elif plan.mode == "2d":
             assert integrators is not None
             images = _load_images_eager()
@@ -800,12 +807,12 @@ def run_stitch(
         elif plan.streaming_multigeometry:
             gi_angles = _stitch_gi_angles(plan, src, labels)
             payload, auxiliary, gi_cuts = stitch_1d_streaming(
-                _iter_images(), len(labels), integrator_series.__iter__,
+                _iter_images(report=False), len(labels), integrator_series.__iter__,
                 npt=plan.npt_1d, unit=plan.unit, method=plan.method,
                 radial_range=plan.radial_range,
                 mask=plan.mask, normalization=normalization,
                 frame_screen=frame_screen, gi=plan.stitch_gi, gi_angles=gi_angles, workers=workers,
-                **corrections,
+                progress=merged, **corrections,
             )
         else:
             assert integrators is not None
