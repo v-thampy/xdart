@@ -1204,15 +1204,15 @@ class StitchPage(QtWidgets.QWidget):
             self._render_gi()  # the Geometry names the sample circles' motors
 
     def _adopt_mapping(self, pairs):
-        """Explicit position → motor pairs (a loaded form) become the geometry's motors."""
-        from xrd_tools.session.instrument import InstrumentGeometry
+        """Explicit position → motor pairs (a loaded form) become the geometry's motors (its plane
+        and motor zeros kept)."""
         geometry = self._instrument()
         motors = dict(geometry.motors)
         for position, motor in pairs:
             circle = geometry.circle_for_position(position)
             if circle is not None:
                 motors[circle] = motor
-        self._set_instrument(InstrumentGeometry(geometry.geometry, tuple(motors.items()), geometry.plane))
+        self._set_instrument(replace(geometry, motors=tuple(motors.items())))
 
     def _refresh_xu_geometry(self, *_args, calibration=None):
         """Present asset-owned settings through the existing strict admission owner."""

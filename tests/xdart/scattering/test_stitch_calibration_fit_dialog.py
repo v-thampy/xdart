@@ -83,6 +83,15 @@ def _horizontal_frames(tmp_path):
     return _frames(tmp_path / 'frames', controls, _calibration().poni)
 
 
+def _truth_bounds(dialog, sample_mm='5'):
+    """As a user would for TRUTH (ARM-ZERO-BOUNDS-20260929): its motor zeros typed beside the motors
+    (del 2.86°, nu −1.15°) and, its sample sitting 0.5–2.2 mm off the rotation centre, a displacement
+    limit under Advanced that allows it."""
+    dialog.geometry_editor.zero_edit('del').setText(f"{-np.rad2deg(TRUTH['del_offset']):.12g}")
+    dialog.geometry_editor.zero_edit('nu').setText(f"{-np.rad2deg(TRUTH['nu_offset']):.12g}")
+    dialog._fields['displacement_limit'].setText(sample_mm)
+
+
 def _save_to(monkeypatch, target):
     monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName',
                         staticmethod(lambda *args, **kwargs: (str(target), '')))
@@ -155,6 +164,7 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
     page, dialog = _page_with_dialog(tmp_path)
     try:
         dialog.set_instrument(InstrumentGeometry('twoc'))
+        dialog.geometry_editor.zero_edit('tth').setText(f'{np.rad2deg(.05):.12g}')  # the truth's del zero
         dialog.frames, dialog._frame_motors = frames, ('tth', None)
         dialog._render_frames()
         assert 'five-parameter arm; a single 2θ arm holds one circle at zero' in dialog.arm_note.text()
@@ -166,7 +176,8 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
                                       'needs both')
         provenance, record = dialog.fit.asset['provenance'], dialog.fit.asset['calibration']
         assert provenance['source_motors'] == {'del_angle': 'tth'}
-        assert provenance['instrument_geometry'] == InstrumentGeometry('twoc').to_record()
+        assert provenance['instrument_geometry'] == InstrumentGeometry(
+            'twoc', zeros=(('tth', float(f'{np.rad2deg(.05):.12g}')),)).to_record()
         assert is_single_arm(record) and record['pos_names'] == ['del_angle']
         fitted = dict(zip(record['param_names'], record['param']))
         assert fitted['nu_offset'] == pytest.approx(.02, abs=2e-3)  # the arm's yaw
@@ -180,7 +191,7 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
         _wait(dialog)
         assert Path(page._value("geometry_path")) == target
         assert page._value("mask_path") == str(mask)
-        assert page._instrument() == InstrumentGeometry('twoc')
+        assert page._instrument() == InstrumentGeometry('twoc', zeros=(('tth', float(f'{np.rad2deg(.05):.12g}')),))
         assert page._value("source_motors") == "del_angle=tth"
         assert page._arm_problem() is None
         partner = json.loads((tmp_path / 'calibration' / 'twoc.xu.json').read_text())
@@ -377,6 +388,7 @@ def test_automatic_refinement_from_the_pages_geometry_saves_and_is_adopted(qapp,
         dialog._fields['refine_seed_path'].setText(str(seed_path))
         assert not dialog.refine_seed_note.text()
         dialog._fields['refine_frames'].setText('12')
+        dialog._fields['displacement_limit'].setText('5')  # TRUTH's sample sits mm off the centre
         dialog.refine_button.click()  # no calibrant confirmation: the calibrant chosen says what it is
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
@@ -564,7 +576,9 @@ def test_automatic_refinement_can_start_from_the_direct_beam_geometry(qapp, tmp_
     page, dialog = _page_with_dialog(tmp_path, spec)
     try:
         ring_fit = _five_parameter_seed(_ROW_ANGLES)
-        beam = predict_frame_seed(ring_fit, _frame({'del': 0., 'nu': 0.})).integrator.getFit2D()
+        # the beam pixel at normal incidence: both circles at their motor zeros (typed below)
+        zeros = {'del': -np.rad2deg(TRUTH['del_offset']), 'nu': -np.rad2deg(TRUTH['nu_offset'])}
+        beam = predict_frame_seed(ring_fit, _frame(zeros)).integrator.getFit2D()
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         # a rough geometry: 2 % off in distance, a few pixels off in the beam spot
         for key, value in (('rough_distance', f"{beam['directDist'] * 1.02:.2f}"),
@@ -572,6 +586,7 @@ def test_automatic_refinement_can_start_from_the_direct_beam_geometry(qapp, tmp_
             dialog._fields[key].setText(value)
         dialog.refine_seed.setCurrentIndex(dialog.refine_seed.findData('rough'))
         dialog._fields['refine_frames'].setText('12')
+        _truth_bounds(dialog)
         dialog.refine_button.click()  # no wavelength typed and the scan records no energy: said at once
         _wait(dialog)
         assert 'wavelength' in dialog.status.text() and dialog.fit is None
@@ -629,6 +644,7 @@ def test_refine_energy_fits_the_energy_within_the_bound_and_saves_the_recorded_o
         dialog.frames = frames
         dialog._frame_motors = ('del', 'nu')
         dialog._render_frames()
+        _truth_bounds(dialog)  # or the energy absorbs the zero and offsets the default bounds hold back
         assert not dialog.refine_energy.isChecked() and not dialog._fields['energy_bound'].isEnabled()
         dialog.refine_energy.setChecked(True)
         assert dialog._fields['energy_bound'].isEnabled() and dialog._text('energy_bound') == '200'

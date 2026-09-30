@@ -273,7 +273,7 @@ def test_the_geometry_comes_first_and_names_the_arm_motors(tmp_path):
     assert dialog.settings()['instrument_geometry']['motors']['del'] == 'delta'
     dialog.geometry_editor.geometry.setCurrentIndex(dialog.geometry_editor.geometry.findData('twoc'))
     assert dialog.geometry_editor.value().stitch_arm() == ('tth', None)  # psic's arm, nu held at zero
-    label = dialog.geometry_editor._form.labelForField(dialog.geometry_editor._motors['tth']).text()
+    label = dialog.geometry_editor._form.labelForField(dialog.geometry_editor._rows['tth']).text()
     assert label == 'tth (detector) · z-  ·  used by Stitch'  # its axis: psic's del, vertical plane
     from xdart.gui.pages.values import PageCleanup
     assert dialog.shutdown().status is PageCleanup.CLEAN
@@ -602,6 +602,9 @@ def test_after_one_calibrated_frame_the_others_are_predicted_from_it(tmp_path):
     true_arm = StackedDetectorArm(**truth).to_pyfai_goniometer(_calibration())
     dialog = StitchCalibrationDialog(tmp_path)
     try:
+        # the truth's motor zeros (del 2.86°, nu −1.15°), typed beside the motors: every fit starts there
+        dialog.geometry_editor.zero_edit('del').setText(f'{np.rad2deg(.05):.12g}')
+        dialog.geometry_editor.zero_edit('nu').setText(f'{-np.rad2deg(.02):.12g}')
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         for key, value in (('rough_distance', '390'), ('beam_pixel', f'{.045 / 172e-6 + 200:.1f}, {.035 / 172e-6:.1f}')):
             dialog._set_field_text(key, value)

@@ -60,7 +60,7 @@ def _seed_record(seed, cancelled):
     if seed.get('frames'):
         from xrd_tools.integrate.calibration_seed import session_prediction
         record = session_prediction(seed['frames'], del_motor=seed['del_motor'], nu_motor=seed['nu_motor'],
-                                    cancelled=cancelled)
+                                    cancelled=cancelled, bounds=seed.get('bounds'))
         if record is not None:
             return record  # else the saved frames do not fit yet: the rough geometry or the file
     return seed.get('rough') if seed.get('rough') is not None else seed.get('file')
@@ -73,7 +73,7 @@ def _prediction_after(seed, adopted, cancelled):
     frames = tuple(frame for frame in seed.get('frames', ()) if frame.identity != adopted.identity)
     try:
         return session_prediction((*frames, adopted), del_motor=seed['del_motor'], nu_motor=seed['nu_motor'],
-                                  cancelled=cancelled)
+                                  cancelled=cancelled, bounds=seed.get('bounds'))
     except InterruptedError:
         return None
 
@@ -154,7 +154,7 @@ def _dispatch_job(request, cancelled, publish):
         key, seed = arguments
         from xrd_tools.integrate.calibration_seed import session_prediction
         return key, session_prediction(seed['frames'], del_motor=seed['del_motor'],
-                                       nu_motor=seed['nu_motor'], cancelled=cancelled)
+                                       nu_motor=seed['nu_motor'], cancelled=cancelled, bounds=seed.get('bounds'))
     if kind == 'fit':
         frames, options = arguments
         return fit_calibration(frames, cancelled=cancelled,
@@ -211,6 +211,7 @@ def fit_summary_text(fit):
              f'Control points: {fit.n_points}']
     if fit.message:
         lines.append(fit.message)
+    lines += fit_bounds_lines(provenance.get('fit_bounds'))
     errors = provenance.get('parameter_errors') or {}
     if provenance.get('arm_model') == 'stacked_extended' and errors:
         # An XU fit's calibration is the transferred asset; the fitted arm is in provenance.
@@ -252,6 +253,30 @@ def fit_summary_text(fit):
                                                      for item in excluded) or 'none'))
         lines.append(f"Rejected outlier points: {automatic.get('rejected_points', 0)}")
     return '\n'.join(lines) + '\n\n' + json.dumps(fit.asset['calibration'], indent=2)
+
+
+_BOUND_LABELS = {'distance_mm': ('distance', 'mm'), 'poni1_mm': ('PONI 1', 'mm'), 'poni2_mm': ('PONI 2', 'mm'),
+                 'del_zero_deg': ('del zero', '°'), 'nu_zero_deg': ('nu zero', '°'),
+                 'del_held_deg': ('held del (fixed pitch)', '°'), 'nu_held_deg': ('held nu (fixed yaw)', '°'),
+                 'mount_tilt_deg': ('mount tilt', '°'), 'mount_roll_deg': ('mount roll', '°'),
+                 'sample_offset1_mm': ('sample offset 1', 'mm'), 'sample_offset2_mm': ('sample offset 2', 'mm'),
+                 'sample_offset3_mm': ('sample offset 3', 'mm'), 'energy_eV': ('energy', 'eV')}
+
+
+def fit_bounds_lines(record):
+    """The fit's parameters as it reports them: initial → fitted (the correction), the bounds, and
+    those it left at a bound, which are never widened (ARM-ZERO-BOUNDS-20260929)."""
+    if not record or not record.get('parameters'):
+        return []
+    estimates = record.get('estimates') or {}
+    sources = ', '.join(f'{circle} from {source}' for circle, source in (estimates.get('zero_sources') or {}).items())
+    lines = ['Fit parameters (initial → fitted, correction; bounds)' + (f' — zeros: {sources}' if sources else '') + ':']
+    for name, row in record['parameters'].items():
+        label, unit = _BOUND_LABELS.get(name, (name, ''))
+        bounds = ('free' if row['lower'] is None else f"{row['lower']:.6g} to {row['upper']:.6g}")
+        lines.append(f"  {label}: {row['initial']:.6g} → {row['fitted']:.6g} {unit} "
+                     f"({row['fitted'] - row['initial']:+.3g}; {bounds})" + (' — AT BOUND' if row['at_bound'] else ''))
+    return lines
 
 
 def saved_pair_text(saved):
@@ -644,7 +669,19 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                    tip='Where the fit starts, e.g. the direct-beam distance. Blank: the first calibrated '
                        'frame\'s.')
         self._edit(options, 'distance_bounds', 'Distance bounds (min, max mm)', '',
-                   tip='Keeps the fitted distance between these. Blank: unbounded.')
+                   tip='Keeps the fitted distance between these. Blank: within the distance freedom below.')
+        # The freedom each fit keeps about its estimates (maintainer, 2026-09-29: "this is to make
+        # sure the sample displacement in particular doesn't go to unrealistic values")
+        for key, label, tip in self._BOUND_FIELDS:
+            self._edit(options, key, label, self._BOUND_DEFAULTS[key], tip=tip)
+        self.bounds_note = QtWidgets.QLabel()
+        self.bounds_note.setWordWrap(True)
+        options.addRow(self.bounds_note)
+        self.reset_bounds_button = QtWidgets.QPushButton('Reset defaults')
+        self.reset_bounds_button.setToolTip('The maintainer\'s defaults: ± 2° for the zeros and the mount, '
+                                            '± 0.05 mm for each sample displacement, ± 5 % for the distance.')
+        self.reset_bounds_button.clicked.connect(self._reset_bounds)
+        options.addRow(self.reset_bounds_button)
         range_tip = ('The {} angles Stitch with xrayutilities may use this calibration for: its xrayutilities '
                      'file is checked on every pixel over this range (with the calibrant frames and the scan\'s '
                      'frames), and Stitch refuses frames outside what was checked. Blank: the calibrant '
@@ -688,8 +725,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.save_button.setEnabled(False)
         self.save_button.clicked.connect(self._save)
         layout.addWidget(self.save_button)
-        for key in ('rms', 'distance_seed', 'distance_bounds', 'energy_bound'):
+        for key in ('rms', 'distance_seed', 'distance_bounds', 'energy_bound', *self._BOUND_DEFAULTS):
             self._fields[key].textChanged.connect(self._invalidate_fit)
+        for key in self._BOUND_DEFAULTS:
+            self._fields[key].textChanged.connect(self._bounds_edited)
         self.scales.toggled.connect(self._invalidate_fit)
         self.refine_energy.toggled.connect(self._invalidate_fit)
         self.refine_energy.toggled.connect(self._fields['energy_bound'].setEnabled)
@@ -697,6 +736,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.scales.toggled.connect(self._sync_arm_model)
         self._sync_arm_model()
         self._sync_refine_rows()
+        self._bounds_edited()
 
     def _sync_refine_rows(self, *_args):
         """Say at once whether the geometry file can seed the refinement (a detector arm, not an
@@ -735,6 +775,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         layout.insertLayout(0, top)
         self.geometry_editor.changed.connect(self._geometry_edited)
         self.geometry_editor.changed.connect(self.geometryChanged.emit)
+        self.geometry_editor.changed.connect(self._bounds_edited)
         # the arm's motors are these circles' (read by name as before)
         self._fields['del_motor'] = self.geometry_editor.motor_edit('del')
         self._fields['nu_motor'] = self.geometry_editor.motor_edit('nu')
@@ -766,11 +807,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._auto_placeholders('beam_')
         self._edit(form, 'beam_motor', 'Two-theta motor (degrees)', 'del',
                    tip='The motor that swings the detector in the direct-beam scan (del for psic\'s vertical arm).')
-        self._edit(form, 'beam_zero', 'Known normal-incidence zero (degrees)', '0',
-                   tip='That motor\'s reading when the detector faces the beam squarely; 0 unless it is offset.')
         self._edit(form, 'beam_pixel', 'Approximate beam pixel x, y (oriented image)', '',
-                   tip='Column, row of the pixel the direct beam hits with the detector facing it squarely (the '
-                       'motor at the zero above), in the image as displayed; it is not necessarily the centre. '
+                   tip='Column, row of the pixel the direct beam hits with the detector facing it squarely (each '
+                       'circle at its motor zero, beside its motor above), in the image as displayed; it is not '
+                       'necessarily the centre. '
                        'Blank with a direct-beam scan: found on the scan\'s frame nearest the zero (the '
                        'brightest spot, a lone hot pixel ignored). Typed: along the beam\'s motion it can be '
                        'rough; across it (the row for horizontal motion, the column for vertical) it must be '
@@ -818,8 +858,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         layout.addWidget(self.save_rough_button)
         layout.addStretch(1)
         self.rough_mode.currentIndexChanged.connect(self._sync_rough_rows)
-        for key in ('rough_distance', 'beam_pixel', 'beam_zero', 'beam_motor', 'rough_mount', 'rough_wavelength'):
+        for key in ('rough_distance', 'beam_pixel', 'beam_motor', 'rough_mount', 'rough_wavelength'):
             self._fields[key].editingFinished.connect(self._render_frames)
+        self._fields['rough_mount'].textChanged.connect(self._invalidate_fit)  # the fits' mount estimate
+        self._fields['rough_mount'].textChanged.connect(self._bounds_edited)
+        for circle in ('nu', 'del', 'tth'):  # the zeros place the rough arm and start every fit
+            self.geometry_editor.zero_edit(circle).editingFinished.connect(self._render_frames)
+            self.geometry_editor.zero_edit(circle).textChanged.connect(self._bounds_edited)
         for key in ('beam_detector', 'beam_orientation'):
             self._fields[key].currentIndexChanged.connect(self._render_frames)
         self._fields['beam_detector'].currentIndexChanged.connect(self._detector_chosen)
@@ -901,7 +946,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         'skip': 'No rough geometry: each frame\'s rings are predicted from a geometry file (3 · Calibrate and fit), '
                 'or from the first frame you calibrate.',
     }
-    _GEOMETRY_ROWS = ('beam_motor', 'beam_zero', 'beam_pixel', 'rough_mount', 'rough_wavelength')
+    _GEOMETRY_ROWS = ('beam_motor', 'beam_pixel', 'rough_mount', 'rough_wavelength')
 
     def _update_image_size(self, *_args):
         """The detector image's x × y size, as the beam pixel is read (after the Select-frames rotation)."""
@@ -973,8 +1018,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         else:
             return None
         # the Geometry shown owns tab 1's arm, not the arm frames were staged with (Codex review F4)
-        delta, nu = self.geometry_editor.value().stitch_arm()
-        zero = dict(zip(('del', 'nu'), (delta, nu))).get(self._beam_role()) or self._text('beam_motor')
+        geometry = self.geometry_editor.value()
+        delta, nu = geometry.stitch_arm()
         # blank with a measured scan: the pixel the fit found
         # a fitted scan says where the beam hits at the zero (the fit's intercept along the motion);
         # a typed or found pixel only placed its strips (Codex review F1)
@@ -989,8 +1034,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         wavelength = self._rough_wavelength_A()
         return rough_arm_record(
             distance_m=distance, detector=self._text('beam_detector'),
-            beam_px=beam,
-            zero_deg=float(self._text('beam_zero') or 0), zero_motor=zero,
+            beam_px=beam, zeros_deg=geometry.arm_zeros(),  # both moving circles at their zeros
             del_motor=delta, nu_motor=nu,
             orientation=int(self._text('beam_orientation')), mount_deg=mount,
             wavelength_m=wavelength * 1e-10 if wavelength is not None else 1e-10)
@@ -1036,6 +1080,25 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             self._fields[key].setText(str(value))
         self.rotation.setCurrentIndex(max(0, self.rotation.findData(image_rotation)))
 
+    #: The freedom every fit keeps about its estimates (maintainer, 2026-09-29), with defaults.
+    _BOUND_DEFAULTS = {'zero_freedom': '2', 'mount_freedom': '2', 'displacement_limit': '0.05',
+                       'distance_freedom': '5'}
+    _BOUND_FIELDS = (
+        ('zero_freedom', 'Zero freedom (± °)',
+         "Each moving circle's motor zero is fitted within this many degrees of its estimate (beside its motor "
+         "under 1 · Geometry ▸ Diffractometer; blank: 0, or the seed calibration's own when refining from "
+         "one), and a single arm's held angle within as many of its own."),
+        ('mount_freedom', 'Mount freedom (± °)',
+         "The detector mount's tilt and roll are fitted within this many degrees of the mount under "
+         "1 · Geometry (Detector mount tilt, roll)."),
+        ('displacement_limit', 'Sample displacement limit (± mm)',
+         "Each component of the sample's offset from the rotation centre is fitted within this of zero: "
+         "0.05 mm by default, 0.02 mm for a sample known to be well centred. A displacement resting on "
+         "its limit is reported, never widened."),
+        ('distance_freedom', 'Distance freedom (± %)',
+         'Without Distance bounds, the distance is fitted within this percentage of its seed.'),
+    )
+
     #: Choices saved with the Stitch settings. The calibrant-scan and same-detector
     #: confirmations are per use and never saved.
     _SAVED_CHOICES = ('source_kind', 'rotation', 'refine_calibrant', 'refine_seed', 'beam_source_kind',
@@ -1070,6 +1133,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         for old, new in (('beam_mask', 'mask'), ('beam_saturation', 'saturation'), ('refine_max_counts', 'saturation')):
             if fields.get(old) and not fields.get(new):  # an older window's field, now the Detector panel's
                 fields[new] = fields[old]
+        self._migrate_beam_zero(fields)
         for key, text in fields.items():
             if key in self._fields and isinstance(text, str):
                 self._set_field_text(key, text)
@@ -1092,6 +1156,70 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         if isinstance(values.get('refine_energy'), bool):
             self.refine_energy.setChecked(values['refine_energy'])
         self._sync_arm_model()
+
+    def _migrate_beam_zero(self, fields):
+        """An older window's 'Known normal-incidence zero' becomes its direct-beam motor's circle's
+        motor zero in the Diffractometer panel, unless that circle already has one."""
+        try:
+            zero = float(fields.get('beam_zero') or 0.)
+        except (TypeError, ValueError):
+            return
+        geometry = self.geometry_editor.value()
+        role = geometry.arm_role(str(fields.get('beam_motor') or 'del'))
+        if not zero or role is None or not math.isfinite(zero):
+            return
+        circle = role if geometry.geometry == 'psic' else 'tth'
+        if geometry.zero(circle) is None:
+            self.geometry_editor.zero_edit(circle).setText(f'{zero:.12g}')
+
+    def _bounds(self):
+        """The fits' estimates and freedom: each moving circle's zero from the Diffractometer panel
+        (blank: 0, or the seed's when refining), the mount from 1 · Geometry, the freedom under
+        Advanced. A malformed entry raises, naming it: a bound is never guessed."""
+        from xrd_tools.integrate.refine import ArmFitBounds
+        values = {}
+        for key, label, _tip in self._BOUND_FIELDS:
+            try:
+                values[key] = float(self._text(key))
+            except ValueError:
+                raise ValueError(f'type {label} as a positive number') from None
+        mount = tuple(float(v) for v in (self._text('rough_mount') or '0, 0').split(','))
+        if len(mount) != 2:
+            raise ValueError('type the mount tilt and roll as two numbers, e.g. 0, 0')
+        try:
+            return ArmFitBounds(zeros_deg=self.geometry_editor.value().arm_zeros(), mount_deg=mount,
+                                zero_freedom_deg=values['zero_freedom'], mount_freedom_deg=values['mount_freedom'],
+                                sample_offset_mm=values['displacement_limit'],
+                                distance_fraction=values['distance_freedom'] / 100)
+        except ValueError as error:
+            raise ValueError(f'fit bounds: {error}') from None
+
+    def _bounds_or_none(self):
+        """The fits' bounds, or None while an entry is malformed (or the window is being built)."""
+        try:
+            return self._bounds()
+        except (ValueError, KeyError):
+            return None
+
+    def _bounds_edited(self, *_args):
+        """Say which estimates the fits start from (the prediction's key follows the bounds)."""
+        if not hasattr(self, 'bounds_note'):  # still being built
+            return
+        bounds = self._bounds_or_none()
+        if bounds is None:
+            self.bounds_note.setText('Fit bounds: a value above is not a number; Fit and Refine say which.')
+            return
+        geometry = self.geometry_editor.value()
+        zeros = geometry.arm_zeros()
+        moving = [circle for circle, motor in zip(('del', 'nu'), geometry.stitch_arm()) if motor]
+        parts = [f'{circle} zero {zeros[circle]:g}°' if circle in zeros else f"{circle} zero blank (0, or the seed's)"
+                 for circle in moving]
+        self.bounds_note.setText('Fits start from: ' + ', '.join(parts)
+                                 + f"; mount tilt, roll {bounds.mount_deg[0]:g}, {bounds.mount_deg[1]:g}° (1 · Geometry)")
+
+    def _reset_bounds(self):
+        for key, value in self._BOUND_DEFAULTS.items():
+            self._fields[key].setText(value)
 
     def _text(self, key):
         field = self._fields[key]
@@ -1193,12 +1321,16 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         return dict(calibrant=self.refine_calibrant.currentText().strip() or 'LaB6',
                     del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1], prediction=prediction,
                     record=self.fit.asset.get('calibration') if self.fit is not None else None,
-                    frames=done, rough=self._rough_record(),
+                    frames=done, rough=self._rough_record(), bounds=self._bounds_or_none(),
                     file=str(Path(path).resolve()) if path and Path(path).is_file() else None,
                     detector=detector)
 
     def _calibrated_key(self):
-        return tuple((frame.identity, frame.poni_sha256) for frame in self.frames if frame.complete)
+        """The calibrated frames and the bounds the prediction was fitted with: editing a zero or
+        a bound leaves a prediction stale."""
+        bounds = self._bounds_or_none()
+        return (tuple((frame.identity, frame.poni_sha256) for frame in self.frames if frame.complete),
+                json.dumps(None if bounds is None else bounds.to_record(), sort_keys=True))
 
     def _expected_rings(self, frame):
         """The calibrant rings predicted on this frame (None without a calibration)."""
@@ -1285,7 +1417,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 fit_scales=self.scales.isChecked(), instrument_geometry=self.geometry_editor.value().to_record(),
                 arm_model='auto', distance_seed_m=seed, distance_bounds_m=bounds, max_rms_q=float(self._text('rms')),
                 distance_provenance=self._distance_provenance if hasattr(self, '_distance_provenance') else None,
-                energy_bound_eV=self._energy_bound())
+                energy_bound_eV=self._energy_bound(), bounds=self._bounds())
             self._invalidate_fit()
             self._start('fit', (frames, options))
         self._guard(go)
@@ -1335,7 +1467,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                            max_frames=int(self._text('refine_frames')),
                            max_counts=float(self._text('saturation')) if self._text('saturation') else None,
                            mask=self._oriented_mask() if self._text('mask') else None,
-                           max_rms_q=float(self._text('rms')), energy_bound_eV=self._energy_bound())
+                           max_rms_q=float(self._text('rms')), energy_bound_eV=self._energy_bound(),
+                           bounds=self._bounds())
             self._invalidate_fit()
             self._start('refine', (spec, seed, options))
         self._guard(go)
@@ -1400,6 +1533,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             'image_rotation': self.rotation.currentData(), 'direct_beam': direct,
             'calibration_kind': 'direct_beam_not_ring_fitted',
             'fixed_mount_deg': [float(v) for v in (self._text('rough_mount') or '0, 0').split(',')],
+            'motor_zeros_deg': self.geometry_editor.value().arm_zeros(),
             'instrument_geometry': self.geometry_editor.value().to_record(),
         }
         return CalibrationFit('multigeometry', {'calibration': record, 'provenance': provenance}, 0.0, 0.0, 0,
@@ -1479,7 +1613,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 beam_pixel=(tuple(float(v) for v in self._text('beam_pixel').split(','))
                             if self._text('beam_pixel') else None),  # blank: found at the zero
                 motion=self.motion.currentText(), strip_half_width=int(self._text('beam_strip')),
-                model='tangent', angle_zero_deg=float(self._text('beam_zero')),
+                model='tangent', angle_zero_deg=self.geometry_editor.value().arm_zeros().get(self._beam_role(), 0.),
                 rotation=self.rotation.currentData())
             if self._text('beam_roi'):
                 options['roi'] = tuple(int(v) for v in self._text('beam_roi').split(','))
