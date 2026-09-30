@@ -38,6 +38,7 @@ from xrd_tools.io.output_safety import check_output_not_source
 from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.io.stitch_record import (
     FRAMES_JSON as _STITCH_FRAMES_JSON,
+    GI_MAP as _STITCH_GI_MAP,
     GI_MODES as _STITCH_GI_MODES,
     MAP as _STITCH_MAP,
     STITCH_GROUP as _STITCH_GROUP,
@@ -814,6 +815,13 @@ def _profile_valid(profile, kind) -> bool:
                                and profile.kind is AnalysisArtifactKind.STITCH_1D)
 
 
+def _gi_map_valid(gi_map, kind, cuts) -> bool:
+    """A GI Stitch 2D's q_ip-q_oop map: None, or a 2-D projection beside a map with GI cuts."""
+    return gi_map is None or (type(gi_map) is AnalysisArtifactResultProjection
+                              and kind is AnalysisArtifactKind.STITCH_2D and bool(cuts)
+                              and gi_map.kind is AnalysisArtifactKind.STITCH_2D)
+
+
 def _gi_cuts_valid(cuts) -> bool:
     """GI cuts as a projection or payload carries them: (mode, projection) pairs, distinct modes in
     ``GI_MODES`` order."""
@@ -845,9 +853,13 @@ class AnalysisArtifactResultProjection:
     gi: tuple[tuple[str, "AnalysisArtifactResultProjection"], ...] = ()
     #: A native Stitch 2D's I(q) beside the map, its own 1-D projection; None otherwise.
     profile: "AnalysisArtifactResultProjection | None" = None
+    #: A GI Stitch 2D's q_ip-q_oop map, its own 2-D projection (the q_ip and q_oop axes in the q and chi
+    #: slots); None otherwise.
+    gi_map: "AnalysisArtifactResultProjection | None" = None
 
     def __post_init__(self, _claim: object) -> None:
-        if not _gi_cuts_valid(self.gi) or not _profile_valid(self.profile, self.kind):
+        if (not _gi_cuts_valid(self.gi) or not _profile_valid(self.profile, self.kind)
+                or not _gi_map_valid(self.gi_map, self.kind, self.gi)):
             raise TypeError("analysis artifact result projection is invalid")
         arrays = tuple(values for _name, values in self.axes) + (
             self.intensity,
@@ -909,6 +921,8 @@ class AnalysisArtifactPayload:
     gi: tuple[tuple[str, AnalysisArtifactResultProjection], ...] = ()
     #: A native Stitch 2D's I(q) beside the map, its read-only 1-D projection; None otherwise.
     profile: AnalysisArtifactResultProjection | None = None
+    #: A GI Stitch 2D's q_ip-q_oop map, its read-only 2-D projection; None otherwise.
+    gi_map: AnalysisArtifactResultProjection | None = None
 
     def __post_init__(
         self,
@@ -919,8 +933,11 @@ class AnalysisArtifactPayload:
         _normalization_values: np.ndarray | None,
         _claim: object,
     ) -> None:
-        if not _gi_cuts_valid(self.gi) or (self.gi and self.inspection.group != _STITCH_RECORD_RESULT):
+        if not _gi_cuts_valid(self.gi) or (
+                self.gi and self.inspection.group not in {_STITCH_RECORD_RESULT, _STITCH_RECORD_MAP}):
             raise TypeError("analysis artifact payload GI cut is invalid")
+        if not _gi_map_valid(self.gi_map, self.inspection.kind, self.gi):
+            raise TypeError("analysis artifact payload GI map is invalid")
         if not _profile_valid(self.profile, self.inspection.kind) or (
                 self.profile is not None and self.inspection.group != _STITCH_RECORD_MAP):
             raise TypeError("analysis artifact payload profile is invalid")
@@ -1672,6 +1689,7 @@ def project_analysis_artifact_result(
     _frame_manifest_json: str | None = None,
     gi_cuts: tuple = (),
     profile: tuple | None = None,
+    gi_map: tuple | None = None,
 ) -> AnalysisArtifactResultProjection:
     """Project one result exactly once to the bytes stored by the artifact.
 
@@ -1682,7 +1700,9 @@ def project_analysis_artifact_result(
 
     ``profile`` is a native Stitch 2D's I(q) beside the map, ``(unit, axis, intensity, sigma, coverage,
     normalization)``: projected like a Stitch 1D result, its fingerprint folds into this one after the
-    map's (only when present).
+    map's (only when present). ``gi_map`` is a GI Stitch 2D's q_ip-q_oop map, ``(q_ip unit, q_oop unit,
+    q_ip axis, q_oop axis, intensity (q_ip, q_oop), coverage, normalization)``: projected like a Stitch
+    2D map, its fingerprint folds in last (only when present).
 
     The function deliberately retains the v1 result-fingerprint framing.  It
     is shared by runners, writers, strict inspection, and payload hydration so
@@ -1892,7 +1912,8 @@ def project_analysis_artifact_result(
         _digest_text(digest, float(wavelength_A).hex())
         _digest_text(digest, frame_manifest_json)
         _digest_array(digest, target_unit, companion)
-    if type(gi_cuts) is not tuple or (gi_cuts and kind is not AnalysisArtifactKind.STITCH_1D) or any(
+    if type(gi_cuts) is not tuple or (gi_cuts and kind not in {AnalysisArtifactKind.STITCH_1D,
+                                                                AnalysisArtifactKind.STITCH_2D}) or any(
             type(cut) is not tuple or len(cut) != 6 for cut in gi_cuts) or [cut[0] for cut in gi_cuts] != [
             mode for mode in _STITCH_GI_MODES if mode in {cut[0] for cut in gi_cuts}]:
         raise AnalysisArtifactProjectionInvalid(
@@ -1903,8 +1924,8 @@ def project_analysis_artifact_result(
         if cut_coverage is None or cut_normalization is None:
             raise AnalysisArtifactProjectionInvalid("a GI cut needs its coverage and normalization")
         cut = project_analysis_artifact_result(
-            kind=kind, axes=(("q", cut_axis),), axis_units=(("q", unit),), intensity=cut_intensity,
-            sigma=None, coverage=cut_coverage, normalization=cut_normalization,
+            kind=AnalysisArtifactKind.STITCH_1D, axes=(("q", cut_axis),), axis_units=(("q", unit),),
+            intensity=cut_intensity, sigma=None, coverage=cut_coverage, normalization=cut_normalization,
             _stored_v1_claim=_stored_v1_claim,
         )
         _digest_text(digest, "stitch-gi-cut-v1")
@@ -1924,6 +1945,19 @@ def project_analysis_artifact_result(
         )
         _digest_text(digest, "stitch-profile-v1")
         _digest_text(digest, profile.result_fingerprint)
+    if gi_map is not None:
+        if (kind is not AnalysisArtifactKind.STITCH_2D or not gi or type(gi_map) is not tuple or len(gi_map) != 7
+                or gi_map[5] is None or gi_map[6] is None):
+            raise AnalysisArtifactProjectionInvalid(
+                "a GI map is a GI Stitch 2D's: its units, axes, intensity, coverage and normalization")
+        ip_unit, oop_unit, ip_axis, oop_axis, map_intensity, map_coverage, map_normalization = gi_map
+        gi_map = project_analysis_artifact_result(
+            kind=AnalysisArtifactKind.STITCH_2D, axes=(("q", ip_axis), ("chi", oop_axis)),
+            axis_units=(("q", ip_unit), ("chi", oop_unit)), intensity=map_intensity, sigma=None,
+            coverage=map_coverage, normalization=map_normalization, _stored_v1_claim=_stored_v1_claim,
+        )
+        _digest_text(digest, "stitch-gi-map-v1")
+        _digest_text(digest, gi_map.result_fingerprint)
     return AnalysisArtifactResultProjection(
         kind,
         tuple(projected_axes),
@@ -1938,6 +1972,7 @@ def project_analysis_artifact_result(
         frame_manifest_json=frame_manifest_json,
         gi=tuple(gi),
         profile=profile,
+        gi_map=gi_map,
     )
 
 
@@ -1955,6 +1990,7 @@ def _project_analysis_artifact_result_v1_compat(
     source_base=None,
     gi_cuts: tuple = (),
     profile: tuple | None = None,
+    gi_map: tuple | None = None,
 ) -> AnalysisArtifactResultProjection:
     """Use the central projection for byte-compatible historical v1 Stitch."""
 
@@ -1972,6 +2008,7 @@ def _project_analysis_artifact_result_v1_compat(
         source_base=source_base,
         gi_cuts=gi_cuts,
         profile=profile,
+        gi_map=gi_map,
     )
 
 
@@ -2047,14 +2084,18 @@ def _stitch_record_projection(handle: h5py.File, version: int):
         result = dict(kind=AnalysisArtifactKind.STITCH_1D, axes=(("q", pattern.axis),),
                       axis_units=(("q", pattern.unit),), intensity=pattern.intensity, sigma=pattern.sigma,
                       coverage=pattern.coverage, normalization=pattern.normalization)
-    else:  # a Stitch 2D: the map, and I(q) beside it
+    else:  # a Stitch 2D: the map, and I(q) beside it (a GI one's q_ip-q_oop map too)
+        gi_map = content.gi_map
         result = dict(kind=AnalysisArtifactKind.STITCH_2D,
                       axes=(("q", stitched_map.radial), ("chi", stitched_map.azimuthal)),
                       axis_units=(("q", stitched_map.unit), ("chi", stitched_map.azimuthal_unit)),
                       intensity=stitched_map.intensity, sigma=stitched_map.sigma,
                       coverage=stitched_map.coverage, normalization=stitched_map.normalization,
                       profile=(pattern.unit, pattern.axis, pattern.intensity, pattern.sigma, pattern.coverage,
-                               pattern.normalization))
+                               pattern.normalization),
+                      gi_map=None if gi_map is None else (
+                          gi_map.unit, gi_map.azimuthal_unit, gi_map.radial, gi_map.azimuthal, gi_map.intensity,
+                          gi_map.coverage, gi_map.normalization))
     try:
         projection = project_analysis_artifact_result(
             **result,
@@ -2154,9 +2195,11 @@ def _inspect_stitch_record(
     expected_children |= {_EXECUTION_ATTESTATION} if attested else set()
     expected_children |= {mode for mode, _cut in content.gi}
     expected_children |= set() if content.map is None else {_STITCH_MAP}
+    expected_children |= set() if content.gi_map is None else {_STITCH_GI_MAP}
     if set(stitch) != expected_children:
         raise AnalysisArtifactInvalid("stitched record contains an unknown stitch graph")
-    for mode, _cut in content.gi + ((() if content.map is None else ((_STITCH_MAP, None),))):
+    for mode, _cut in content.gi + tuple((name, None) for name, value in (
+            (_STITCH_MAP, content.map), (_STITCH_GI_MAP, content.gi_map)) if value is not None):
         cut = _direct(stitch, mode, h5py.Group)
         if (set(cut) != {"coverage", "normalization"} or set(cut.attrs) != {"NX_class"}
                 or _bounded_attr_text(cut, "NX_class") != "NXcollection"):
@@ -2179,7 +2222,7 @@ def _inspect_stitch_record(
             raise AnalysisArtifactInvalid("contributing frames differ from the science execution count")
     if contract_version == ANALYSIS_SCHEMA_VERSION_V2:
         for value in (projection, *(cut for _mode, cut in projection.gi),
-                      *(() if projection.profile is None else (projection.profile,))):
+                      *(value for value in (projection.profile, projection.gi_map) if value is not None)):
             empty = value.coverage == 0
             if (
                 not np.array_equal(empty, value.normalization == 0)
@@ -2921,6 +2964,7 @@ def read_analysis_artifact(
                 _ANALYSIS_PAYLOAD_FACTORY,
                 gi=projection.gi,
                 profile=projection.profile,
+                gi_map=projection.gi_map,
             )
 
         with h5py.File(shown, "r") as handle:

@@ -1354,7 +1354,7 @@ class StitchOperationPlan:
     flat_path: str | Path | None = None
     #: Flat pixels below this fraction of the flat's median are masked as dead.
     flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
-    #: Grazing incidence: a GI cut written beside I(q) (native Stitch 1D only).
+    #: Grazing incidence: GI cuts written beside I(q), and a Stitch 2D's q_ip-q_oop map (native, in Q).
     gi: StitchGI | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
@@ -1582,8 +1582,8 @@ def _gi_field(plan):
         return
     if type(plan.gi) is not StitchGI:
         raise TypeError("Stitch GI must be an exact StitchGI")
-    if not plan.native_records or plan.mode != "1d" or plan.unit != "q_A^-1":
-        raise ValueError("a GI cut is written beside I(q) by a native Stitch 1D in Q")
+    if not plan.native_records or plan.unit != "q_A^-1":
+        raise ValueError("a GI cut is written beside I(q) by a native Stitch in Q")
 
 
 def _gi_identity(plan):
@@ -2612,6 +2612,15 @@ def _gi_cuts(plan, cuts):
                  for mode, (cut, diagnostics) in zip(() if plan.gi is None else plan.gi.cuts, cuts))
 
 
+def _gi_map(gi_map):
+    """A GI Stitch 2D's q_ip-q_oop map as the projection takes it (None without one)."""
+    if gi_map is None:
+        return None
+    stitched, diagnostics = gi_map
+    return (stitched.unit, stitched.azimuthal_unit, stitched.radial, stitched.azimuthal, stitched.intensity,
+            diagnostics.coverage, diagnostics.normalization)
+
+
 def _write_record(entry, target, projection, native_args) -> None:
     """A Stitch 1D result, or a native Stitch 2D's map and I(q), as an Int record (``stitch_record``),
     from its exact projection."""
@@ -2913,6 +2922,7 @@ class StitchOperationExecution:
                 **result,
                 **_native_artifact_args(self.request, records),
                 gi_cuts=_gi_cuts(plan, scientific.gi_cuts),
+                gi_map=_gi_map(scientific.gi_map),
             )
         except AnalysisArtifactProjectionInvalid:
             return self._terminal(
@@ -3163,6 +3173,7 @@ class StitchOperationExecution:
                 normalization=diagnostics.normalization,
                 **_native_artifact_args(self.request, records),
                 gi_cuts=_gi_cuts(self.request.plan, scientific.gi_cuts),
+                gi_map=_gi_map(scientific.gi_map),
                 profile=None if not native_map else (
                     profile[0].unit, profile[0].radial, profile[0].intensity, profile[0].sigma,
                     profile[1].coverage, profile[1].normalization),

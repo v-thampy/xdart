@@ -81,9 +81,9 @@ def test_a_gi_stitch_binds_every_frames_sample_circles_and_changes_the_plan(tmp_
         prepare_stitch_tool(replace(form, gi=replace(gi, sample_orientation=7)))
 
 
-def test_a_gi_cut_needs_a_native_stitch_1d_in_q(tmp_path):
+def test_a_gi_cut_needs_a_native_stitch_in_q(tmp_path):
     form = _gi_form(tmp_path, "multigeometry", StitchGI(("q_oop",), incident_angle_deg=.2))
-    with pytest.raises(ValueError, match="native Stitch 1D in Q"):
+    with pytest.raises(ValueError, match="native Stitch in Q"):
         replace(form, unit="2th_deg")
 
 
@@ -150,6 +150,43 @@ def test_a_gi_stitch_publishes_i_of_q_and_its_cuts_as_one_int_record(tmp_path, b
     with h5py.File(target, "r") as handle:  # the record's own provenance names the cuts
         recorded = json.loads(handle["entry/stitch/provenance_json"][()])
     assert recorded["plan"]["gi"]["cuts"] == list(cuts)
+    assert result.payload.inspection.result_fingerprint == result.terminal.commit.result_fingerprint
+
+
+@pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
+def test_a_gi_stitch_2d_publishes_both_maps_i_of_q_and_the_cuts_as_one_int_record(tmp_path, backend):
+    """GI Stitch 2D (STITCH-2D-20260930 item 3): one Int record holds I(q) and the cuts (the 1-D modes
+    q_total, q_ip, q_oop) and the (chi, q) map with the q_ip-q_oop map (the 2-D modes q_chi, qip_qoop),
+    Int's reader reading each map as the exact float32 cast of the committed payload's."""
+    import numpy as np
+
+    from xrd_tools.analysis.module_transaction import ModuleDisposition
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation
+    from xrd_tools.core.frame_view import TwoDKind
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
+    from xrd_tools.io.frame_view import read_frame_view
+
+    form = replace(_gi_form(tmp_path, backend, StitchGI(("q_ip", "q_oop"), incidence_motor="eta", tilt_motor="chi",
+                                                        sample_motors=_SAMPLE)),
+                   mode="2d", npt_rad_2d=48, npt_azim_2d=32)
+    request = prepare_stitch_tool(form).request
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    target = request.module.output.target
+    assert Path(target).name == "sample_scan1_gi_stitch2d.nexus"
+    payload = read_analysis_artifact(target, expected_kind=AnalysisArtifactKind.STITCH_2D)
+    assert payload.intensity.shape == (48, 32) and payload.profile is not None
+    assert [mode for mode, _cut in payload.gi] == ["q_ip", "q_oop"]
+    gi_map = payload.gi_map
+    assert gi_map.intensity.shape == gi_map.coverage.shape == (48, 32) and gi_map.coverage.sum() > 0
+    assert [unit for _axis, unit in gi_map.axis_units] == [GI_UNITS["q_ip"], GI_UNITS["q_oop"]]
+    for mode, kind, shown in (("q_chi", TwoDKind.Q_CHI, payload), ("qip_qoop", TwoDKind.QIP_QOOP, gi_map)):
+        view = read_frame_view(target, 1, include_thumbnail=False, mode_2d=mode)
+        assert view.two_d_kind is kind
+        np.testing.assert_array_equal(view.intensity_2d, np.asarray(shown.intensity, dtype=float).T)
+    for mode, cut in payload.gi:
+        np.testing.assert_array_equal(read_frame_view(target, 1, include_thumbnail=False, mode_1d=mode).intensity_1d,
+                                      np.asarray(cut.intensity, dtype=float))
     assert result.payload.inspection.result_fingerprint == result.terminal.commit.result_fingerprint
 
 

@@ -77,3 +77,36 @@ def test_a_stitch_2d_shows_its_map_as_int_2d_without_the_raw_pane(qapp, tmp_path
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
         qapp.processEvents()
+
+
+@pytest.mark.parametrize("backend", ["multigeometry", "xu_hist"])
+def test_a_gi_stitch_2d_shows_both_maps_as_ints_gi_view(qapp, tmp_path, backend):
+    """Item 3: a GI Stitch 2D is a GI frame as Int's: the image axis offers the (chi, q) and the q_ip-q_oop
+    maps, the cake is the one chosen, and the plot axis offers the cuts, a cut showing as stored."""
+    from dataclasses import replace
+    from xrd_tools.integrate.stitch_gi import StitchGI
+    from tests.xdart.tools.test_stitch_native_gi import _SAMPLE, _gi_form
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(replace(_gi_form(tmp_path, backend, StitchGI(
+            ("q_ip", "q_oop"), incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE)),
+            mode="2d", npt_rad_2d=48, npt_azim_2d=32))
+        assert page._mode == "Stitch 2D" and page._gi["enabled"]
+        page.run_bar.startButton.click()
+        _wait(page, qapp)
+        payload = page._current_payload()
+        assert payload.kind is AnalysisArtifactKind.STITCH_2D and payload.gi_map is not None
+        state = page._last_map_state
+        assert state.measurement_mode == "GI" and tuple(state.gi_maps) == ("q_chi", "qip_qoop")
+        np.testing.assert_array_equal(state.heavy.cake, np.asarray(payload.intensity.T, dtype=float))
+        _command(page, ShellCommandKind.SET_IMAGE_AXIS, "qip_qoop")
+        np.testing.assert_array_equal(page._last_map_state.heavy.cake,
+                                      np.asarray(payload.gi_map.intensity.T, dtype=float))
+        choices = [page.scientific.plot_axis.itemData(row) for row in range(page.scientific.plot_axis.count())]
+        assert {"Q", "q_ip", "q_oop"} <= set(choices)
+        _command(page, ShellCommandKind.SET_PLOT_AXIS, "q_ip")
+        np.testing.assert_array_equal(page._last_map_state.traces[0].intensity, dict(payload.gi)["q_ip"].intensity)
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()

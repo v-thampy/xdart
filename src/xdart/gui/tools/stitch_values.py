@@ -270,7 +270,7 @@ class StitchToolForm:
     flat_path: str | None = None
     #: Flat pixels below this fraction of the flat's median are masked as dead.
     flat_min_fraction: float = 0.1
-    #: Grazing incidence: a GI cut written beside I(q) (native Stitch 1D in Q).
+    #: Grazing incidence: GI cuts written beside I(q), and a Stitch 2D's q_ip-q_oop map (native, in Q).
     gi: StitchGI | None = None
     #: Stitch 2D (``mode`` '2d', native pyFAI MultiGeometry): the map's radial and azimuthal points
     #: and its χ range (°), as Int 2D's; I(q) beside it takes ``npt_1d`` and the radial range.
@@ -305,7 +305,7 @@ class StitchToolForm:
             object.__setattr__(self, "mask_path", _absolute_path(self.mask_path, "mask path"))
         self._native_options(native)
         if self.gi is not None and (type(self.gi) is not StitchGI or not native or self.unit != "q_A^-1"):
-            raise ValueError("a GI cut needs a native Stitch 1D in Q")
+            raise ValueError("a GI cut needs a native Stitch in Q")
         if not native and Path(spec).suffix:
             raise ValueError("Stitch SPEC path must be extensionless")
         if Path(output).suffix.casefold() != ".nexus":
@@ -402,8 +402,6 @@ class StitchToolForm:
         if self.mode == "2d":
             if not native:
                 raise ValueError("Stitch 2D writes a native record: choose its sources on the Stitch page")
-            if self.gi is not None:
-                raise ValueError("Stitch 2D has no grazing cuts yet: turn Grazing off")
             for name in ("npt_rad_2d", "npt_azim_2d"):
                 value = getattr(self, name)
                 if type(value) is not int or not 1 <= value <= 1_000_000:

@@ -220,6 +220,12 @@ def _progress_text(stage, completed, total):
 _STITCH_MODES = ("Stitch 1D", "Stitch 2D")
 
 
+def _gi_motor(payload):
+    """A GI result's incidence motor as its plan recorded it ("Manual" for a typed angle)."""
+    gi = json.loads(payload.provenance_json).get("plan", {}).get("gi") or {}
+    return str(gi.get("incidence_motor") or "Manual")
+
+
 def _kind_name(payload):
     """A saved result's mode, as the run bar names it."""
     return ("Stitch 2D" if payload is not None and payload.kind is AnalysisArtifactKind.STITCH_2D
@@ -1113,9 +1119,7 @@ class StitchPage(QtWidgets.QWidget):
                 ("npt_1d", "npt_rad_2d", "npt_azim_2d") if map_mode else ("npt_1d",)))
         except ValueError:
             processing_ready = False
-        # a map has no grazing cuts yet (item 3 of the deferred list)
-        map_problem = ("Grazing off (a map has no grazing cuts yet)" if map_mode and self._gi["enabled"]
-                       else None)
+        map_problem = None
         self.controls.processing_card.set_status_text(
             f"{self._mode.lower()} · " + ("xrayutilities" if xu else "multigeometry"))
         # What each input still needs, in a few words, as Int's "Needs …" (maintainer, 2026-09-30:
@@ -2128,15 +2132,21 @@ class StitchPage(QtWidgets.QWidget):
     def _display_payload(self, item, payload):
         """A result as Int's frame (``StandardDisplayPayload``), through Int's conversion
         (``FrameView.from_results``): a Stitch 2D's map and the I(q) beside it, a Stitch 1D's I(q); the
-        Diagnostic shows their coverage or normalization instead."""
+        Diagnostic shows their coverage or normalization instead. A GI Stitch 2D is a GI frame, as Int's:
+        its q_ip-q_oop map beside the (χ, q) one, and the GI cut the plot axis chooses as its pattern."""
         from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
         from xrd_tools.core.frame_view import FrameView
         from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
         key = self._result_key(item.data(QtCore.Qt.ItemDataRole.UserRole))
         shown = self._diagnostic.lower()
-        map_result = None
+
+        def as_2d(projection):
+            (_q, x), (_chi, y) = projection.axes
+            (_q, x_unit), (_chi, y_unit) = projection.axis_units
+            return IntegrationResult2D(x, y, getattr(projection, shown), None, x_unit, y_unit)
+        map_result, cut = None, dict(payload.gi).get(self._view.plot_axis)
         if payload.kind is AnalysisArtifactKind.STITCH_2D:
-            pattern = payload.profile
+            pattern = payload.profile if cut is None else cut
             (_q, radial), = pattern.axes
             (_q, unit), = pattern.axis_units
             (_q, q), (_chi, chi) = payload.axes
@@ -2147,8 +2157,14 @@ class StitchPage(QtWidgets.QWidget):
         view = FrameView.from_results(label=key.local_frame_label,
                                       result_1d=IntegrationResult1D(radial, getattr(pattern, shown), None, unit),
                                       result_2d=map_result)
+        gi = {}
+        if payload.gi_map is not None:
+            extra = FrameView.from_results(label=key.local_frame_label, result_2d=as_2d(payload.gi_map))
+            gi = dict(measurement_mode="GI", gi_resolved_motor=_gi_motor(payload), gi_mode_2d="q_chi",
+                      gi_mode_1d="q_total" if cut is None else self._view.plot_axis,
+                      extra_views_2d={"qip_qoop": extra})
         return StandardDisplayPayload(0, key, item.text(), view, status="complete",
-            wavelength_m=None if payload.wavelength_A is None else float(payload.wavelength_A) * 1e-10)
+            wavelength_m=None if payload.wavelength_A is None else float(payload.wavelength_A) * 1e-10, **gi)
 
     def _draw_map(self):
         """Int 2D's layout for a Stitch 2D, from Int's own projection (``build_scientific_projection``):
@@ -2169,8 +2185,11 @@ class StitchPage(QtWidgets.QWidget):
         def named(trace):  # the result's name, as the patterns show it, before any slice note
             name, prefix = names[id(trace.frame)]
             return replace(trace, title=name + trace.title[len(prefix):]) if trace.title.startswith(prefix) else trace
+        cuts = tuple(mode for mode in _CUT_AXES
+                     if any(mode in dict(payload.gi) for _item, payload in items.values()))
         state = replace(state, traces=tuple(named(trace) for trace in state.traces),
                         pinned_traces=tuple(replace(pinned, trace=named(pinned.trace)) for pinned in state.pinned_traces),
+                        gi_modes_1d=("q_total", *cuts) if state.measurement_mode == "GI" else (),
                         title=current.text() if current is not None else "Current",
                         status=current.text() if current is not None else "")
         self._last_map_state = state
@@ -2276,7 +2295,7 @@ class StitchPage(QtWidgets.QWidget):
             self._update_residency()  # Overlay shows the selected results, Single the current one
         elif kind is ShellCommandKind.SET_PLOT_AXIS and value in {"Q", "2theta", "chi", *_CUT_AXES}:
             self._set_view(plot_axis=value, slice_pins=slice_pins_for_plot_axis(view.slice_pins, view.plot_axis, value))
-        elif kind is ShellCommandKind.SET_IMAGE_AXIS and value in {"Q-Chi", "2Th-Chi"}:
+        elif kind is ShellCommandKind.SET_IMAGE_AXIS and value in {"Q-Chi", "2Th-Chi", "q_chi", "qip_qoop"}:
             shared = share_plot_axis_for_image(value) if view.share_axis else None
             self._set_view(image_axis=value, share_axis=shared is not None,
                            **({} if shared is None else dict(plot_axis=shared, slice_pins=slice_pins_for_plot_axis(
