@@ -9,7 +9,6 @@ def test_nonaverage_paths_have_zero_average_reachability_and_allocations(
 ):
     from xrd_tools.io import nexus_record, read as read_module, record_writer
     from xrd_tools.reduction import average
-    from xrd_tools.sources import execution_graph
     from xdart.gui.tabs.scattering.adapters import external_operation
     from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadStatus
@@ -27,10 +26,11 @@ def test_nonaverage_paths_have_zero_average_reachability_and_allocations(
     hits = []
     def forbidden(*_a, _name="average", **_k):
         hits.append(_name); raise AssertionError(f"ordinary path reached {_name}")
+    # Decision 39: every run's admission reads its first image's recorded saturation
+    # (execution_graph.graph_saturation), so the image layout is no longer Average's alone.
     for owner, names in (
         (average, ("AverageScanRecipe", "AverageScanRunner",
                    "requirements_from", "resolve_session_policy")),
-        (execution_graph, ("read_detector_image_layout",)),
         (read_module, ("get_average_finite_counts",)),
         (nexus_record, ("write_average_finite_counts",)),
         (record_writer, ("write_average_finite_counts",)),
