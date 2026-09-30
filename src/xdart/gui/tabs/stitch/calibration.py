@@ -649,7 +649,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         layout.addWidget(self.arm_note)
         # The energy, refined within ± a bound of the recorded one (maintainer, 2026-09-29: "add a
         # refine energy toggle. If selected there should be an option to set the constraint - just
-        # one number for +-that number"); Fit and Refine both take it.
+        # one number for +-that number"); Fit and Refine both take it. On by default, ±100 eV
+        # (maintainer, 2026-09-29, D1: "+-100 and on by default"): with the sample held near the
+        # rotation centre, a fixed energy's error lands in the zeros and the sample offset.
         energy_row = QtWidgets.QWidget()
         energy_layout = QtWidgets.QHBoxLayout(energy_row)
         energy_layout.setContentsMargins(0, 0, 0, 0)
@@ -660,7 +662,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                       'summary gives its uncertainty. The saved calibration keeps the recorded energy, which '
                       'Stitch checks the scans\' energies against.')
         self.refine_energy.setToolTip(energy_tip)
-        bound = QtWidgets.QLineEdit('200')
+        self.refine_energy.setChecked(True)
+        bound = QtWidgets.QLineEdit('100')
         bound.setObjectName('energy_bound')
         bound.setMaximumWidth(64)
         bound.setToolTip('The refined energy stays within this many eV of the recorded one.')
@@ -753,7 +756,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.scales.toggled.connect(self._invalidate_fit)
         self.refine_energy.toggled.connect(self._invalidate_fit)
         self.refine_energy.toggled.connect(self._fields['energy_bound'].setEnabled)
-        self._fields['energy_bound'].setEnabled(False)
+        self._fields['energy_bound'].setEnabled(self.refine_energy.isChecked())
         self.scales.toggled.connect(self._sync_arm_model)
         self._sync_arm_model()
         self._sync_refine_rows()
@@ -1479,7 +1482,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         else:
             text = f'Arm model (automatic): the five-parameter arm; {reason}.'
         if self.scales.isChecked():
-            text += ' With fitted motor scales, Save writes no xrayutilities file.'
+            text += (' With fitted motor scales the energy stays at the recorded one (it is refined only with '
+                     'fixed scales) and Save writes no xrayutilities file.')
         self.arm_note.setText(text)
 
     def _fit(self):
@@ -1493,7 +1497,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 distance_provenance=(self._distance_provenance if getattr(self, '_distance_provenance_key', None)
                                      is not None and self._distance_provenance_key == self._direct_beam_key()
                                      else None),  # a direct-beam record only while its inputs hold
-                energy_bound_eV=self._energy_bound(), bounds=self._bounds())
+                # the solver refines the energy only with fixed scales: fitted ones hold it (arm note)
+                energy_bound_eV=None if self.scales.isChecked() else self._energy_bound(), bounds=self._bounds())
             self._invalidate_fit()
             self._start('fit', (frames, options))
         self._guard(go)

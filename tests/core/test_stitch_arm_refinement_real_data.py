@@ -35,9 +35,9 @@ from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifac
 _NPT_FRAMES = (0, 9, 18, 27, 35, 55, 65, 75, 130)
 #: 17-2's known del motor zero (maintainer, 2026-09-29): the fits start there and stay within ±2°;
 #: the default ±0.05 mm sample displacement holds the calibrant near the rotation centre, and the
-#: energy is refined within ±200 eV, as the bounded scan-14 investigation recommends
-#: (codex-calibrant-energy-investigation-20260929, ARM-ZERO-BOUNDS-20260929)
-_ENERGY_BOUND_EV = 200.
+#: energy is refined within ±100 eV, the window's default (maintainer, 2026-09-29, D1: "+-100 and on
+#: by default"; ARM-ZERO-BOUNDS-20260929)
+_ENERGY_BOUND_EV = 100.
 
 
 def _known():
@@ -45,11 +45,12 @@ def _known():
     return ArmFitBounds(zeros_deg={'del': 2.3, 'nu': 0.})
 
 
-#: D1, for the maintainer (ARM-ZERO-BOUNDS-20260929): the unbounded arm met these on scan 14 with a
-#: 2.6 mm beam-direction sample displacement; held within ±0.05 mm (energy ±200 eV) it does not.
-#: Strict: an unexpected pass means the fit, its extraction or its constraints changed; review that
-#: change (it is not by itself proof that a bound was widened).
-_D1 = 'D1 (maintainer): the ±0.05 mm displacement bound on scan 14: '
+#: D1 (ARM-ZERO-BOUNDS-20260929), decided by the maintainer on 2026-09-29: the ±0.05 mm displacement
+#: limit stays and the energy is refined within ±100 eV by default; the figures below are not re-pinned.
+#: The unbounded arm met these on scan 14 with a 2.6 mm beam-direction sample displacement; held within
+#: ±0.05 mm (energy ±100 eV) it does not. Strict: an unexpected pass means the fit, its extraction or
+#: its constraints changed; review that change (it is not by itself proof that a bound was widened).
+_D1 = 'D1 (decided: ±0.05 mm, energy ±100 eV): on scan 14 '
 
 
 @pytest.fixture(scope='module')
@@ -276,7 +277,7 @@ def test_scan14_automatic_fit_of_four_rows_places_the_other_three(held_out):
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(strict=True, reason=_D1 + 'held-out rows land within 0.0041 Å⁻¹ (O4 was 0.0025; unbounded 0.0020)')
+@pytest.mark.xfail(strict=True, reason=_D1 + 'held-out rows land within 0.0043 Å⁻¹ (O4 was 0.0025; unbounded 0.0020)')
 def test_scan14_automatic_fit_predicts_held_out_nu_rows(held_out):
     """The O4 oracle: rows never seen by the fit land within 0.0025 Å⁻¹.
 
@@ -304,9 +305,12 @@ def test_scan14_the_automatic_extension_improves_held_out_error_by_forty_percent
 
 
 @pytest.mark.slow
-def test_scan14_the_default_known_zero_with_a_fixed_energy(guided, tmp_path):
-    """D1's characterization: the product default once 17-2's zero is typed (energy fixed, ±0.05 mm).
-    Only stable facts are asserted; run with -s for the numbers the decision needs."""
+def test_scan14_a_fixed_energy_leaves_the_nu_rows_apart(guided, tmp_path):
+    """D1's reason (maintainer, 2026-09-29: the energy is refined within ±100 eV by default): held at the
+    recorded 17.000 keV under the same zero and ±0.05 mm, the extended fit parks the sample offsets at
+    their bound and its nu rows miss the 0.005 Å⁻¹ the refined default meets
+    (test_scan14_guided_arm_extension_aligns_the_nu_rows); measured: spread [0.0147, 0.0055, 0.0132], the
+    four-row automatic fit keeps the five-parameter arm, held-out 0.0138 Å⁻¹. Run with -s for the numbers."""
     from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
     from xrd_tools.integrate.stitch_calibration import fit_calibration, save_calibration_fit
     extended = fit_calibration(guided['frames'], arm_model='stacked_extended', bounds=_known())
@@ -326,11 +330,12 @@ def test_scan14_the_default_known_zero_with_a_fixed_energy(guided, tmp_path):
     held = Path(save_calibration_fit(fit, guided['root'] / 'fits/default-held-out.json'))
     centres = _row_centres(guided['root'], held, tmp_path / 'held', rows=(-3.5, 9.5, 22.5), count=6)
     errors = [value for ring in centres.values() for value in ring.values()]
-    print(f"D1 default (known zero, fixed energy, ±0.05 mm): guided extended rms {extended.rms_q:.5f}, "
+    print(f"D1, energy fixed (known zero, ±0.05 mm): guided extended rms {extended.rms_q:.5f}, "
           f"nu-row spread {np.round(spread, 4).tolist()}; four-row automatic fit chose {validation['chosen']} "
           f"(improvement {validation.get('improvement', float('nan')):.0%}), held-out max |error| "
           f"{max(abs(e) for e in errors):.4f} Å⁻¹ over {len(errors)} centres; {extended.message}")
     assert validation['chosen'] in ('stacked', 'stacked_extended')
+    assert max(spread) > 0.005, spread
 
 
 def _stitch(root, geometry_path, labels, target, **plan_fields):

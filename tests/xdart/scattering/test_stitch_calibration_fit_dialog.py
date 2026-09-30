@@ -109,6 +109,9 @@ def test_the_guided_fit_takes_the_extension_and_saves_both_files(qapp, tmp_path,
         dialog._frame_motors = ('del', 'nu')
         dialog._render_frames()
         assert 'the detector mount and sample offset, which the frames on 5 nu positions' in dialog.arm_note.text()
+        # TRUTH's sample sits 0.5-2.2 mm off the centre: held at the default ±0.05 mm, the energy (refined by
+        # default) takes up the misfit and moves the mount 0.5°; with a fixed energy it did not
+        _truth_bounds(dialog)
         dialog.fit_button.click()
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
@@ -171,9 +174,10 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
         dialog.fit_button.click()
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
-        assert dialog.fit.message == ('Converged; one detector arm, nu held at zero; motor scales fixed at degrees; '
-                                      'five-parameter arm: a single 2θ arm holds one circle at zero; the extension '
-                                      'needs both')
+        head, energy, tail = dialog.fit.message.partition('; energy ')  # refined by default (D1)
+        assert head == 'Converged; one detector arm, nu held at zero; motor scales fixed at degrees'
+        assert energy and 'eV (recorded ' in tail and tail.endswith(
+            '; five-parameter arm: a single 2θ arm holds one circle at zero; the extension needs both')
         provenance, record = dialog.fit.asset['provenance'], dialog.fit.asset['calibration']
         assert provenance['source_motors'] == {'del_angle': 'tth'}
         assert provenance['instrument_geometry'] == InstrumentGeometry(
@@ -360,7 +364,8 @@ def test_the_guided_save_equals_the_core_save(qapp, tmp_path, monkeypatch):
         dialog.save_button.click()
         _wait(dialog)
         geometry = dialog.geometry_editor.value().to_record()  # the window records its diffractometer
-        fit = fit_calibration(frames, instrument_geometry=geometry, arm_model='auto')
+        fit = fit_calibration(frames, instrument_geometry=geometry, arm_model='auto',
+                              energy_bound_eV=dialog._energy_bound())
         direct = save_calibration_pair(fit, tmp_path / 'calibration' / 'core.json',
                                        validation_angles=pair_validation_angles(fit))
         assert target.read_bytes() == Path(direct.pyfai_path).read_bytes()
@@ -645,9 +650,12 @@ def test_refine_energy_fits_the_energy_within_the_bound_and_saves_the_recorded_o
         dialog._frame_motors = ('del', 'nu')
         dialog._render_frames()
         _truth_bounds(dialog)  # or the energy absorbs the zero and offsets the default bounds hold back
-        assert not dialog.refine_energy.isChecked() and not dialog._fields['energy_bound'].isEnabled()
+        # on by default, ±100 eV (maintainer, 2026-09-29, D1: "+-100 and on by default")
+        assert dialog.refine_energy.isChecked() and dialog._fields['energy_bound'].isEnabled()
+        assert dialog._text('energy_bound') == '100' and dialog._energy_bound() == 100.
+        dialog.refine_energy.setChecked(False)
+        assert not dialog._fields['energy_bound'].isEnabled() and dialog._energy_bound() is None
         dialog.refine_energy.setChecked(True)
-        assert dialog._fields['energy_bound'].isEnabled() and dialog._text('energy_bound') == '200'
         dialog._set_field_text('energy_bound', 'many')
         dialog.fit_button.click()
         assert dialog.fit is None and 'energy bound' in dialog.status.text()
@@ -680,6 +688,28 @@ def test_refine_energy_fits_the_energy_within_the_bound_and_saves_the_recorded_o
     finally:
         dialog.close()
         page.shutdown()
+
+
+def test_fitted_motor_scales_hold_the_default_energy(qapp, tmp_path):
+    """The solver refines the energy only with fixed motor scales: with Fit motor scales ticked, the fit
+    holds the energy that is refined by default (D1) and says so, rather than refusing the fit."""
+    (tmp_path / 'frames').mkdir()
+    frames = _guided_frames(tmp_path)
+    dialog = StitchCalibrationDialog(tmp_path)
+    try:
+        dialog.frames = frames
+        dialog._frame_motors = ('del', 'nu')
+        dialog._render_frames()
+        assert dialog.refine_energy.isChecked()
+        dialog.scales.setChecked(True)
+        assert 'the energy stays at the recorded one' in dialog.arm_note.text()
+        dialog.fit_button.click()
+        _wait(dialog)
+        assert dialog.fit is not None, dialog.status.text()
+        assert 'energy_refinement' not in dialog.fit.asset['provenance']
+        assert dialog.refine_energy.isChecked()  # still the choice for Refine, which holds the scales
+    finally:
+        dialog.close()
 
 
 def test_a_twoc_arm_refines_the_energy_and_saves_its_xrayutilities_partner(qapp, tmp_path, monkeypatch):
