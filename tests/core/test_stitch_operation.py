@@ -1097,9 +1097,10 @@ def test_frame_bound_covers_float64_processing_representation(tmp_path):
     assert not Path(request.module.output.target).exists()
 
 
-@pytest.mark.parametrize("mode", ("1d", "2d"))
-def test_operation_commits_and_strictly_reloads_detached_payload(tmp_path, mode):
-    request = _prepared(tmp_path, mode=mode)
+def test_operation_commits_and_strictly_reloads_detached_payload(tmp_path):
+    """A Stitch 1D; a native Stitch 2D's commit and reload are test_native_stitch_2d's (the old Stitch 2D
+    layout was removed, 2026-09-30)."""
+    request = _prepared(tmp_path)
     progress = []
     result = run_stitch_operation(
         request,
@@ -1123,9 +1124,7 @@ def test_operation_commits_and_strictly_reloads_detached_payload(tmp_path, mode)
     assert result.payload.normalization.shape == result.payload.intensity.shape
     assert np.any(result.payload.coverage > 0)
     assert np.any(result.payload.normalization > 0)
-    assert result.payload.intensity.shape == (
-        (96,) if mode == "1d" else (48, 32)
-    )
+    assert result.payload.intensity.shape == (96,)
     totals = {item.total for item in progress}
     assert totals == {len(request.module.source.selected_labels) + 4}
     assert [item.completed for item in progress] == sorted(

@@ -1,10 +1,12 @@
 """Native Stitch 2D: the (χ, q) map and I(q) as an Int 2D record (STITCH-2D-20260930).
 
 Stage A0's frozen oracle, written before the product code: the native record carries the science the
-existing kernels make, bit for bit. The old layout's 2-D result is the reference while it exists; I(q)
-is native Stitch 1D's for the same inputs. The map is non-square (48 q × 32 χ), so a transposed map
-fails on its shape and its values.
+existing kernels make, bit for bit. The map's reference is the 2-D kernel alone (``stitch_2d_streaming``,
+the old layout's) run on the very frames and integrators the native one-pass kernel receives, stored by
+the artifact projection; I(q) is native Stitch 1D's for the same inputs. The map is non-square
+(48 q × 32 χ), so a transposed map fails on its shape and its values.
 """
+import copy
 from dataclasses import replace
 
 import numpy as np
@@ -16,17 +18,21 @@ from xrd_tools.analysis.module_transaction import ModuleDisposition, ModuleOutpu
 from xrd_tools.analysis.stitch_operation import (
     prepare_stitch_operation, run_stitch_operation, stitch_output_current,
 )
-from xrd_tools.io.analysis_artifact import AnalysisArtifactInvalid, AnalysisArtifactKind, read_analysis_artifact
+from xrd_tools.io.analysis_artifact import (
+    AnalysisArtifactInvalid, AnalysisArtifactKind, _project_analysis_artifact_result_v1_compat,
+    read_analysis_artifact,
+)
 from xrd_tools.io.frame_view import read_frame_view
 from xrd_tools.io.output_path import resolve_finite_output_target
 from tests.core.test_stitch_operation import _prepared
 
 
 def _native(tmp_path, original, *, mode):
-    """``original``'s plan as a native Int record of ``mode`` ('1d' or '2d'), in its stable slot; a map
-    on the old layout's axis (its own, as Int 2D's, is the plan's ``map_unit`` and ``map_radial_range``)."""
+    """``original``'s plan (a Stitch 1D's) as a native Int record of ``mode`` ('1d' or '2d'), in its stable
+    slot; a map over χ −90…90 on I(q)'s axis (its own, as Int 2D's, is the plan's ``map_unit`` and
+    ``map_radial_range``)."""
     plan = replace(original.plan, native_records=True, mode=mode,
-                   azimuth_range=original.plan.azimuth_range if mode == "2d" else None,
+                   azimuth_range=(-90.0, 90.0) if mode == "2d" else None,
                    **(dict(map_unit=original.plan.unit, map_radial_range=original.plan.radial_range)
                       if mode == "2d" else {}))
     kind = AnalysisArtifactKind.STITCH_2D if mode == "2d" else AnalysisArtifactKind.STITCH_1D
@@ -36,23 +42,47 @@ def _native(tmp_path, original, *, mode):
     return prepare_stitch_operation(original.module.source, output, plan, project_root=tmp_path)
 
 
-def test_a_native_stitch_2d_carries_the_old_layouts_map_and_stitch_1ds_pattern(tmp_path):
-    old = _prepared(tmp_path, mode="2d")
-    reference = run_stitch_operation(old)
-    assert reference.terminal.disposition is ModuleDisposition.COMMITTED, reference.terminal.diagnostic
-    native = _native(tmp_path, old, mode="2d")
+def _kernel_map(monkeypatch):
+    """The map the 2-D kernel alone (``stitch_2d_streaming``) makes from the frames and integrators the
+    native one-pass kernel (the map and I(q)) receives: an independent run of the old layout's kernel, so the
+    native map is checked against it rather than against itself."""
+    from xrd_tools.integrate import multi
+    captured = {}
+    one_pass = multi.stitch_2d_with_1d_streaming
+
+    def both(images, image_count, integrator_factory, **kwargs):
+        frames = [np.array(image, copy=True) for image in images]
+        alone = {key: value for key, value in kwargs.items()
+                 if key not in {"npt_1d", "gi", "gi_angles", "unit_1d", "radial_range_1d"}}
+        alone["frame_screen"] = copy.deepcopy(kwargs.get("frame_screen"))  # a fresh screen, as the pass's
+        captured["map"] = multi.stitch_2d_streaming(iter(frames), image_count, integrator_factory, **alone)
+        return one_pass(iter(frames), image_count, integrator_factory, **kwargs)
+    monkeypatch.setattr(multi, "stitch_2d_with_1d_streaming", both)
+    return captured
+
+
+def test_a_native_stitch_2d_carries_the_2d_kernels_map_and_stitch_1ds_pattern(tmp_path, monkeypatch):
+    base = _prepared(tmp_path)  # a Stitch 1D's plan and sources
+    kernel = _kernel_map(monkeypatch)
+    native = _native(tmp_path, base, mode="2d")
     result = run_stitch_operation(native)
     assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal.diagnostic
     payload = read_analysis_artifact(native.module.output.target, expected_kind=AnalysisArtifactKind.STITCH_2D)
-    # the map in the container's orientation, (q, χ) = (radial, azimuthal), bit for bit the old layout's
-    assert payload.intensity.shape == reference.payload.intensity.shape == (48, 32)
-    np.testing.assert_array_equal(payload.intensity, reference.payload.intensity)
-    for name in ("q", "chi"):
-        np.testing.assert_array_equal(payload.axis(name), reference.payload.axis(name))
-    np.testing.assert_array_equal(payload.coverage, reference.payload.coverage)
-    np.testing.assert_array_equal(payload.normalization, reference.payload.normalization)
+    value, diagnostics = kernel["map"]
+    # stored as the operation stores a MultiGeometry map (pixel splitting: fractional coverage)
+    reference = _project_analysis_artifact_result_v1_compat(
+        kind=AnalysisArtifactKind.STITCH_2D, axes=(("q", value.radial), ("chi", value.azimuthal)),
+        axis_units=(("q", value.unit), ("chi", value.azimuthal_unit)), intensity=value.intensity,
+        sigma=value.sigma, coverage=diagnostics.coverage, normalization=diagnostics.normalization)
+    # the map in the container's orientation, (q, χ) = (radial, azimuthal), bit for bit the 2-D kernel's
+    assert payload.intensity.shape == reference.intensity.shape == (48, 32)
+    np.testing.assert_array_equal(payload.intensity, reference.intensity)
+    for (name, values), (_name, expected) in zip(payload.axes, reference.axes, strict=True):
+        np.testing.assert_array_equal(values, expected, err_msg=name)
+    np.testing.assert_array_equal(payload.coverage, reference.coverage)
+    np.testing.assert_array_equal(payload.normalization, reference.normalization)
     # I(q) beside it, as Int 2D writes one: native Stitch 1D's for the same inputs
-    one = _native(tmp_path, old, mode="1d")
+    one = _native(tmp_path, base, mode="1d")
     assert run_stitch_operation(one).terminal.disposition is ModuleDisposition.COMMITTED
     pattern = read_analysis_artifact(one.module.output.target, expected_kind=AnalysisArtifactKind.STITCH_1D)
     np.testing.assert_array_equal(payload.profile.intensity, pattern.intensity)
@@ -64,7 +94,7 @@ def test_a_native_stitch_2d_carries_the_old_layouts_map_and_stitch_1ds_pattern(t
 def test_a_native_stitch_2d_record_is_an_int_2d_record(tmp_path):
     """A2/A3: Int's reader reads the record as an Int 2D row (I(q) in the 1-D mode, the map as (χ, q)),
     Append knows it, and a map without its coverage and normalization is refused."""
-    native = _native(tmp_path, _prepared(tmp_path, mode="2d"), mode="2d")
+    native = _native(tmp_path, _prepared(tmp_path), mode="2d")
     assert run_stitch_operation(native).terminal.disposition is ModuleDisposition.COMMITTED
     target = native.module.output.target
     payload = read_analysis_artifact(target, expected_kind=AnalysisArtifactKind.STITCH_2D)

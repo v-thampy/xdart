@@ -12,7 +12,7 @@ import h5py
 import numpy as np
 import pytest
 
-from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.core.containers import IntegrationResult1D
 from xrd_tools.io.image import read_image
 from xrd_tools.io.image_source import ImageSourceKind, classify_image_source
 from xrd_tools.io.analysis_artifact import (
@@ -43,7 +43,6 @@ from xrd_tools.io.stitch_record import StitchedPattern, write_stitch_projection,
 from xrd_tools.io.nexus import (
     find_nexus_image_dataset,
     write_rsm,
-    write_stitched,
 )
 from xrd_tools.io.output_transaction import (
     LeaseUnavailable,
@@ -240,21 +239,8 @@ def _writer(request: AnalysisArtifactRequest):
         value = StitchedPattern(q, "q_A^-1", np.linspace(1.0, 2.0, 7), np.linspace(0.1, 0.2, 7),
                                 np.arange(1.0, 8.0), np.linspace(1.0, 2.0, 7))
         return lambda entry: write_stitch_record(entry, request.target, value)
-    if request.kind is AnalysisArtifactKind.STITCH_2D:
-        chi = np.linspace(-10.0, 10.0, 5)
-        value = IntegrationResult2D(
-            radial=q,
-            azimuthal=chi,
-            intensity=np.arange(35, dtype=float).reshape(7, 5),
-            unit="q_A^-1",
-            azimuthal_unit="chi_deg",
-        )
-        return lambda entry: write_stitched(
-            entry,
-            stitched_2d=value,
-            provenance=request.provenance_json,
-            bounded_artifact=True,
-        )
+    if request.kind is not AnalysisArtifactKind.RSM:  # a Stitch 2D is a native record (its own rows)
+        raise ValueError("the generic artifact writer here is RSM's")
     volume = RSMVolume(
         h=np.linspace(-1, 1, 3),
         k=np.linspace(-2, 2, 4),
@@ -269,7 +255,7 @@ def _writer(request: AnalysisArtifactRequest):
     )
 
 
-@pytest.mark.parametrize("kind", tuple(AnalysisArtifactKind))
+@pytest.mark.parametrize("kind", (AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.RSM))
 def test_standalone_artifact_roundtrip_is_exact_and_raw_negative(tmp_path, kind):
     request = _request(tmp_path / f"{kind.value}.nexus", kind)
     output = admit_analysis_artifact(
@@ -310,7 +296,6 @@ def test_standalone_artifact_roundtrip_is_exact_and_raw_negative(tmp_path, kind)
     assert payload.provenance_json == request.provenance_json
     assert tuple(name for name, _values in payload.axes) == {
         AnalysisArtifactKind.STITCH_1D: ("q",),
-        AnalysisArtifactKind.STITCH_2D: ("q", "chi"),
         AnalysisArtifactKind.RSM: ("h", "k", "l"),
     }[kind]
     assert payload.intensity.shape == receipt.inspection.shape
@@ -362,52 +347,6 @@ def test_rsm_artifact_is_negative_at_every_raw_detector_front_door(tmp_path):
         find_nexus_image_dataset(request.target)
     with pytest.raises(ProcessedXdartInputError):
         read_image(request.target)
-
-
-def test_stitch_2d_preserves_sigma_and_non_q_units(tmp_path):
-    request = _request(
-        tmp_path / "stitched-2d-sigma.nexus",
-        AnalysisArtifactKind.STITCH_2D,
-    )
-    q = np.linspace(1.0, 5.0, 7)
-    chi = np.linspace(-0.2, 0.2, 5)
-    value = IntegrationResult2D(
-        radial=q,
-        azimuthal=chi,
-        intensity=np.arange(35, dtype=float).reshape(7, 5),
-        sigma=np.full((7, 5), 0.25),
-        unit="2th_deg",
-        azimuthal_unit="chi_rad",
-    )
-    receipt = admit_analysis_artifact(
-        request,
-        coordinator=OutputTransactionCoordinator(),
-    ).publish(
-        lambda entry: write_stitched(
-            entry,
-            stitched_2d=value,
-            provenance=request.provenance_json,
-            bounded_artifact=True,
-        )
-    )
-    assert receipt.inspection.shape == (7, 5)
-    assert receipt.inspection.axis_units == (
-        ("q", "2th_deg"),
-        ("chi", "chi_rad"),
-    )
-    assert receipt.inspection.has_sigma is True
-    payload = read_analysis_artifact(request.target, expected_receipt=receipt)
-    np.testing.assert_allclose(payload.axis("q"), q.astype(np.float32))
-    np.testing.assert_allclose(payload.axis("chi"), chi.astype(np.float32))
-    np.testing.assert_allclose(payload.intensity, value.intensity.astype(np.float32))
-    np.testing.assert_allclose(payload.sigma, 0.25)
-    assert payload.inspection.axis_units == receipt.inspection.axis_units
-    with h5py.File(request.target, "r") as handle:
-        result = handle["entry/stitched_2d"]
-        assert "sigma" in result
-        np.testing.assert_allclose(result["sigma"][()], 0.25)
-        assert bytes(result["q"].attrs["units"]).decode() == "2th_deg"
-        assert bytes(result["chi"].attrs["units"]).decode() == "chi_rad"
 
 
 def test_result_fingerprint_is_scientific_and_storage_independent(tmp_path):
@@ -1417,137 +1356,27 @@ def test_stitch_diagnostics_round_trip_and_bind_result_fingerprint(tmp_path):
             write_stitch_record(entry, tmp_path / "unpaired.nexus", StitchedPattern(
                 value.radial, value.unit, value.intensity, None, coverage, None))
 def test_bounded_writer_refuses_unbounded_inputs_before_hdf_mutation(tmp_path):
-    q = np.linspace(0.1, 1.0, 7)
-    value = IntegrationResult1D(q, q, None, "q_A^-1")
+    volume = RSMVolume(
+        h=np.linspace(-1, 1, 3),
+        k=np.linspace(-2, 2, 4),
+        l=np.linspace(0, 3, 5),
+        intensity=np.arange(60, dtype=float).reshape(3, 4, 5),
+    )
     path = tmp_path / "bounded-writer.h5"
     with h5py.File(path, "w") as handle:
         entry = handle.create_group("entry")
         with pytest.raises(TypeError, match="exact nonempty string"):
-            write_stitched(
-                entry,
-                stitched_1d=value,
-                provenance={"not": "canonical text"},
-                bounded_artifact=True,
-            )
+            write_rsm(entry, volume, provenance={"not": "canonical text"}, bounded_artifact=True)
         assert tuple(entry) == ()
-
-        value.unit = "u" * 4097
         with pytest.raises(ValueError, match="bounded artifact size"):
-            write_stitched(
-                entry,
-                stitched_1d=value,
-                provenance="{}",
-                bounded_artifact=True,
-            )
+            write_rsm(entry, volume, provenance="x" * ((1 << 20) + 1), bounded_artifact=True)
         assert tuple(entry) == ()
-
-        value.unit = "q_A^-1"
-        with pytest.raises(ValueError, match="bounded artifact size"):
-            write_stitched(
-                entry,
-                stitched_1d=value,
-                provenance="x" * ((1 << 20) + 1),
-                bounded_artifact=True,
-            )
+        source = tmp_path / "frame.tif"
+        source.write_bytes(b"raw")
+        with pytest.raises(ValueError, match="unbound"):
+            write_rsm(entry, volume, provenance="{}", bounded_artifact=True, source_base=tmp_path,
+                      frame_records=[{"frame_index": 1, "source_path": source, "source_frame_index": 0}])
         assert tuple(entry) == ()
-
-
-def test_v1_stitch_writer_preserves_accepted_raw_bytes(tmp_path):
-    q = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7], dtype=np.float64)
-    provenance = '{"schema_version":"compat-v1","x":1}'
-
-    intensity_1d = np.array(
-        [1.0, np.nan, 3.00000006, 4.0, 5.0, 6.0, 7.0],
-        dtype=np.float64,
-    )
-    sigma_1d = np.array(
-        [0.1, 0.2, np.nan, 0.4, 0.5, 0.6, 0.7],
-        dtype=np.float64,
-    )
-    coverage_1d = np.arange(7, dtype=np.float64)
-    normalization_1d = np.linspace(1, 7, 7, dtype=np.float64)
-    value_1d = IntegrationResult1D(
-        q,
-        intensity_1d,
-        sigma_1d,
-        "q_A^-1",
-    )
-    projection_1d = project_analysis_artifact_result(
-        kind=AnalysisArtifactKind.STITCH_1D,
-        axes=(("q", q),),
-        axis_units=(("q", "q_A^-1"),),
-        intensity=intensity_1d,
-        sigma=sigma_1d,
-        coverage=coverage_1d,
-        normalization=normalization_1d,
-    )
-
-    chi = np.array([-20.0, -10.0, 0.0, 10.0, 20.0])
-    intensity_2d = np.arange(35, dtype=np.float64).reshape(7, 5)
-    intensity_2d[2, 3] = np.nan
-    sigma_2d = np.linspace(0.1, 3.5, 35).reshape(7, 5)
-    coverage_2d = np.arange(35, dtype=np.float64).reshape(7, 5)
-    normalization_2d = np.linspace(1.0, 35.0, 35).reshape(7, 5)
-    value_2d = IntegrationResult2D(
-        q,
-        chi,
-        intensity_2d,
-        sigma_2d,
-        "q_A^-1",
-        "chi_deg",
-    )
-    projection_2d = project_analysis_artifact_result(
-        kind=AnalysisArtifactKind.STITCH_2D,
-        axes=(("q", q), ("chi", chi)),
-        axis_units=(("q", "q_A^-1"), ("chi", "chi_deg")),
-        intensity=intensity_2d,
-        sigma=sigma_2d,
-        coverage=coverage_2d,
-        normalization=normalization_2d,
-    )
-
-    cases = (
-        (
-            "1d",
-            {"stitched_1d": value_1d},
-            projection_1d,
-            11_432,
-            "5be323286c0ffd69b0226f254f0c93e49592de2117e02c57e67788952c8c735e",
-        ),
-        (
-            "2d",
-            {"stitched_2d": value_2d},
-            projection_2d,
-            11_880,
-            "b671b55c5c81dc3df85ed2b676c9eead38ee0fc4fcbdbc516b35eee1ac0fdeae",
-        ),
-    )
-    for label, legacy_value, projection, expected_size, expected_sha in cases:
-        baseline = tmp_path / f"v1-{label}-baseline.h5"
-        projected = tmp_path / f"v1-{label}-projected.h5"
-        with h5py.File(baseline, "w") as handle:
-            write_stitched(
-                handle.create_group("entry"),
-                **legacy_value,
-                provenance=provenance,
-                coverage=(coverage_1d if label == "1d" else coverage_2d),
-                normalization=(
-                    normalization_1d if label == "1d" else normalization_2d
-                ),
-                bounded_artifact=True,
-            )
-        with h5py.File(projected, "w") as handle:
-            write_stitched(
-                handle.create_group("entry"),
-                result_projection=projection,
-                legacy_v1_unit_layout=True,
-                provenance=provenance,
-                bounded_artifact=True,
-            )
-        baseline_bytes = baseline.read_bytes()
-        assert projected.read_bytes() == baseline_bytes
-        assert len(baseline_bytes) == expected_size
-        assert hashlib.sha256(baseline_bytes).hexdigest() == expected_sha
 
 
 def test_canonical_provenance_stops_oversized_structure_during_freeze():
@@ -1786,12 +1615,10 @@ def test_writer_or_readback_failure_rolls_back_and_releases(tmp_path, prior):
         request, coordinator=OutputTransactionCoordinator()
     )
 
-    def wrong_kind(entry):
-        stitch_request = _request(
-            target, AnalysisArtifactKind.STITCH_2D,
-            overwrite=AnalysisArtifactOverwrite.REPLACE,
-        )
-        _writer(stitch_request)(entry)
+    def wrong_kind(entry):  # a complete result that reads back as another kind
+        _writer(request)(entry)
+        del entry.attrs[ANALYSIS_KIND_ATTR]
+        entry.attrs.create(ANALYSIS_KIND_ATTR, np.bytes_(AnalysisArtifactKind.STITCH_1D.value.encode()))
 
     with pytest.raises(AnalysisArtifactInvalid):
         output.publish(wrong_kind)
@@ -1936,7 +1763,7 @@ def test_detached_inspection_refuses_path_replacement_during_read(
 
     request = _request(
         tmp_path / "detached-read-race.nexus",
-        AnalysisArtifactKind.STITCH_2D,
+        AnalysisArtifactKind.RSM,
     )
     admit_analysis_artifact(
         request,
@@ -1968,7 +1795,7 @@ def test_payload_reader_refuses_path_replacement_during_materialization(
 
     request = _request(
         tmp_path / "payload-read-race.nexus",
-        AnalysisArtifactKind.STITCH_2D,
+        AnalysisArtifactKind.RSM,
     )
     receipt = admit_analysis_artifact(
         request,
@@ -1993,7 +1820,7 @@ def test_payload_reader_refuses_path_replacement_during_materialization(
     )
     with pytest.raises(AnalysisArtifactInvalid, match="changed during payload"):
         read_analysis_artifact(request.target, expected_receipt=receipt)
-    assert replaced == ["/entry/stitched_2d/intensity"]
+    assert replaced == ["/entry/rsm/intensity"]
     assert Path(request.target).read_bytes() == b"foreign"
 
 
@@ -2005,7 +1832,7 @@ def test_detached_inspection_binds_the_opened_hdf_handle_during_symlink_swap(
 
     request = _request(
         tmp_path / "symlink-source-a.nexus",
-        AnalysisArtifactKind.STITCH_2D,
+        AnalysisArtifactKind.RSM,
     )
     admit_analysis_artifact(
         request,
@@ -2025,7 +1852,7 @@ def test_detached_inspection_binds_the_opened_hdf_handle_during_symlink_swap(
                 np.bytes_(str(alias).encode("utf-8")),
             )
     with h5py.File(source_b, "r+") as handle:
-        handle["entry/stitched_2d/intensity"][3] += 10.0
+        handle["entry/rsm/intensity"][1] += 10.0
 
     baseline = inspect_analysis_artifact(alias)
     real_file = artifact_api.h5py.File
@@ -2106,16 +1933,15 @@ def test_expected_request_requires_exact_path_and_consistent_kind(tmp_path):
         "extra",
         "file-name",
         "axis-cap",
-        "q-units",
         "result-attr",
-        "q-attr",
+        "h-attr",
         "intensity-attr",
     ),
 )
 def test_detached_admission_rejects_nonexact_schema(tmp_path, tamper):
     request = _request(
         tmp_path / f"strict-{tamper}.nexus",
-        AnalysisArtifactKind.STITCH_2D,
+        AnalysisArtifactKind.RSM,
     )
     admit_analysis_artifact(
         request,
@@ -2123,28 +1949,24 @@ def test_detached_admission_rejects_nonexact_schema(tmp_path, tamper):
     ).publish(_writer(request))
     with h5py.File(request.target, "r+") as handle:
         entry = handle["entry"]
-        result = entry["stitched_2d"]
+        result = entry["rsm"]
         if tamper == "signal":
-            result.attrs["signal"] = "q"
+            result.attrs["signal"] = "h"
         elif tamper == "axes":
             result.attrs["axes"] = ["wrong"]
         elif tamper == "extra":
             result.create_dataset("foreign", data=np.ones(1, dtype=np.float32))
         elif tamper == "file-name":
             entry.attrs["file_name"] = str(tmp_path / "foreign.nexus")
-        elif tamper == "q-units":
-            del result["q"].attrs["units"]
-            result["q"].attrs.create("units", np.bytes_(b""))
         elif tamper == "result-attr":
             result.attrs["foreign"] = 1
-        elif tamper == "q-attr":
-            result["q"].attrs["foreign"] = 1
+        elif tamper == "h-attr":
+            result["h"].attrs["foreign"] = 1
         elif tamper == "intensity-attr":
             result["intensity"].attrs["foreign"] = 1
         else:
-            del result["q"]
-            axis = result.create_dataset("q", shape=(1_000_001,), dtype=np.float32)
-            axis.attrs["units"] = "q_A^-1"
+            del result["h"]
+            result.create_dataset("h", shape=(1_000_001,), dtype=np.float32)
     with pytest.raises(AnalysisArtifactInvalid):
         inspect_analysis_artifact(request.target)
 
@@ -2162,11 +1984,7 @@ def test_detached_admission_rejects_nonexact_schema(tmp_path, tamper):
     ),
 )
 def test_detached_admission_enforces_numeric_schema_bounds(tmp_path, tamper):
-    kind = (
-        AnalysisArtifactKind.RSM
-        if tamper in {"result-element-cap", "contiguous-row-cap"}
-        else AnalysisArtifactKind.STITCH_2D
-    )
+    kind = AnalysisArtifactKind.RSM
     request = _request(tmp_path / f"numeric-{tamper}.nexus", kind)
     admit_analysis_artifact(
         request,
@@ -2175,15 +1993,15 @@ def test_detached_admission_enforces_numeric_schema_bounds(tmp_path, tamper):
     with h5py.File(request.target, "r+") as handle:
         result = handle[f"entry/{kind.group}"]
         if tamper == "decreasing-axis":
-            values = result["q"][()]
-            values[3] = values[2] - 0.01
-            result["q"][...] = values
+            values = result["h"][()]
+            values[2] = values[1] - 0.01
+            result["h"][...] = values
         elif tamper == "float64-intensity":
             values = result["intensity"][()].astype(np.float64)
             del result["intensity"]
             result.create_dataset("intensity", data=values)
         elif tamper == "infinite-intensity":
-            result["intensity"][3] = np.inf
+            result["intensity"][1] = np.inf
         elif tamper == "all-nan-intensity":
             result["intensity"][...] = np.nan
         elif tamper == "wrong-sigma-shape":
@@ -2224,7 +2042,7 @@ def test_detached_admission_enforces_numeric_schema_bounds(tmp_path, tamper):
 def test_detached_admission_rejects_vlen_schema_attribute_before_read(tmp_path):
     request = _request(
         tmp_path / "vlen-attribute.nexus",
-        AnalysisArtifactKind.STITCH_2D,
+        AnalysisArtifactKind.RSM,
     )
     admit_analysis_artifact(
         request,
@@ -2245,7 +2063,7 @@ def test_detached_admission_rejects_vlen_schema_attribute_before_read(tmp_path):
 def test_detached_admission_requires_exact_hdf5_type_classes(tmp_path, tamper):
     request = _request(
         tmp_path / f"hdf-type-{tamper}.nexus",
-        AnalysisArtifactKind.STITCH_2D,
+        AnalysisArtifactKind.RSM,
     )
     admit_analysis_artifact(
         request,
@@ -2253,19 +2071,19 @@ def test_detached_admission_requires_exact_hdf5_type_classes(tmp_path, tamper):
     ).publish(_writer(request))
     with h5py.File(request.target, "r+") as handle:
         entry = handle["entry"]
-        result = entry["stitched_2d"]
+        result = entry["rsm"]
         if tamper == "kind-opaque":
             del entry.attrs[ANALYSIS_KIND_ATTR]
             entry.attrs.create(
                 ANALYSIS_KIND_ATTR,
-                np.bytes_(b"stitch-1d"),
-                dtype=h5py.opaque_dtype(np.dtype("S9")),
+                np.bytes_(b"rsm"),
+                dtype=h5py.opaque_dtype(np.dtype("S3")),
             )
         elif tamper == "axes-opaque":
             del result.attrs["axes"]
             result.attrs.create(
                 "axes",
-                np.asarray([b"q"], dtype="S1"),
+                np.asarray([b"h", b"k", b"l"], dtype="S1"),
                 dtype=h5py.opaque_dtype(np.dtype("S1")),
             )
         elif tamper == "provenance-opaque":
@@ -2295,7 +2113,7 @@ def test_detached_admission_rejects_vlen_provenance_before_payload_read(
 ):
     request = _request(
         tmp_path / "vlen-provenance.nexus",
-        AnalysisArtifactKind.STITCH_2D,
+        AnalysisArtifactKind.RSM,
     )
     receipt = admit_analysis_artifact(
         request,
@@ -2311,7 +2129,7 @@ def test_detached_admission_rejects_vlen_provenance_before_payload_read(
         parent = (
             handle["entry"]
             if location == "entry"
-            else handle["entry/stitched_2d"]
+            else handle["entry/rsm"]
         )
         del parent["provenance_json"]
         parent.create_dataset(
@@ -2326,7 +2144,7 @@ def test_detached_admission_rejects_vlen_provenance_before_payload_read(
 def test_detached_admission_rejects_oversized_fixed_provenance(tmp_path):
     request = _request(
         tmp_path / "oversized-provenance.nexus",
-        AnalysisArtifactKind.STITCH_2D,
+        AnalysisArtifactKind.RSM,
     )
     admit_analysis_artifact(
         request,
@@ -2344,7 +2162,7 @@ def test_detached_admission_rejects_oversized_fixed_provenance(tmp_path):
 def test_detached_admission_normalizes_deep_json_to_schema_refusal(tmp_path):
     request = _request(
         tmp_path / "deep-provenance.nexus",
-        AnalysisArtifactKind.STITCH_2D,
+        AnalysisArtifactKind.RSM,
     )
     admit_analysis_artifact(
         request,
@@ -2395,24 +2213,23 @@ def test_detached_admission_rejects_oversized_compressed_chunk(tmp_path):
 def test_detached_admission_rejects_oversized_axis_chunk(tmp_path):
     request = _request(
         tmp_path / "oversized-axis-chunk.nexus",
-        AnalysisArtifactKind.STITCH_2D,
+        AnalysisArtifactKind.RSM,
     )
     admit_analysis_artifact(
         request,
         coordinator=OutputTransactionCoordinator(),
     ).publish(_writer(request))
     with h5py.File(request.target, "r+") as handle:
-        result = handle["entry/stitched_2d"]
-        del result["q"]
-        q = result.create_dataset(
-            "q",
-            shape=(7,),
+        result = handle["entry/rsm"]
+        del result["h"]
+        result.create_dataset(
+            "h",
+            shape=(3,),
             maxshape=(None,),
             chunks=(3_000_000,),
             dtype=np.float32,
             fillvalue=0.0,
         )
-        q.attrs["units"] = "q_A^-1"
     with pytest.raises(AnalysisArtifactInvalid, match="chunks exceed"):
         inspect_analysis_artifact(request.target)
 
@@ -2427,17 +2244,17 @@ def test_detached_admission_rejects_indirect_and_aliased_payloads(
 ):
     request = _request(
         tmp_path / f"indirect-{indirection}.nexus",
-        AnalysisArtifactKind.STITCH_2D,
+        AnalysisArtifactKind.RSM,
     )
     admit_analysis_artifact(
         request,
         coordinator=OutputTransactionCoordinator(),
     ).publish(_writer(request))
     with h5py.File(request.target, "r+") as handle:
-        result = handle["entry/stitched_2d"]
+        result = handle["entry/rsm"]
         if indirection == "soft":
-            del result["q"]
-            result["q"] = h5py.SoftLink("/entry/stitched_2d/intensity")
+            del result["h"]
+            result["h"] = h5py.SoftLink("/entry/rsm/intensity")
         elif indirection == "alias":
             del result["provenance_json"]
             result["provenance_json"] = handle["entry/provenance_json"]
@@ -2466,52 +2283,14 @@ def test_detached_admission_rejects_indirect_and_aliased_payloads(
             external = tmp_path / "external-link.h5"
             with h5py.File(external, "w") as external_handle:
                 external_handle.create_dataset(
-                    "q",
-                    data=np.linspace(0.1, 2.0, 7, dtype=np.float32),
+                    "h",
+                    data=np.linspace(-1.0, 1.0, 3, dtype=np.float32),
                 )
-            del result["q"]
-            result["q"] = h5py.ExternalLink(str(external), "/q")
+            del result["h"]
+            result["h"] = h5py.ExternalLink(str(external), "/h")
     match = "hard-link alias" if indirection == "alias" else None
     with pytest.raises(AnalysisArtifactInvalid, match=match):
         inspect_analysis_artifact(request.target)
-
-
-def test_unbound_frame_records_and_source_base_are_refused(tmp_path):
-    source = tmp_path / "raw" / "frame.tif"
-    source.parent.mkdir()
-    source.write_bytes(b"raw")
-    request = _request(
-        tmp_path / "frames.nexus",
-        AnalysisArtifactKind.STITCH_1D,
-    )
-    value = IntegrationResult1D(
-        np.linspace(0.1, 1.0, 7),
-        np.linspace(1.0, 2.0, 7),
-        None,
-        "q_A^-1",
-    )
-    output = admit_analysis_artifact(
-        request,
-        coordinator=OutputTransactionCoordinator(),
-    )
-    with pytest.raises(ValueError, match="unbound frame records"):
-        output.publish(
-            lambda entry: write_stitched(
-                entry,
-                stitched_1d=value,
-                provenance=request.provenance_json,
-                bounded_artifact=True,
-                frame_records=[{
-                    "frame_index": 1,
-                    "source_path": source,
-                    "source_frame_index": 0,
-                }],
-                source_base=tmp_path,
-            )
-        )
-    assert not output.snapshot.published and not output.snapshot.close_pending
-    assert not output.snapshot.slot_held
-    assert not Path(request.target).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -2560,14 +2339,15 @@ def test_win32_identity_inspects_and_reads_the_pathname_ctime_shape(
     assert payload.inspection == inspection
 
 
-def test_an_older_stitch_1d_artifact_is_refused(tmp_path):
-    """A Stitch 1D result is an Int record (maintainer, 2026-09-29: no compatibility with earlier
-    Stitch outputs); a file in the older artifact layout that says Stitch 1D is not read."""
-    request = _request(tmp_path / "older-stitch-1d.nexus", AnalysisArtifactKind.STITCH_2D)
+@pytest.mark.parametrize("kind", (AnalysisArtifactKind.STITCH_1D,))
+def test_an_older_stitch_artifact_is_refused(tmp_path, kind):
+    """A Stitch result is an Int record (maintainer, 2026-09-29: no compatibility with earlier Stitch outputs;
+    2026-09-30: "Remove old format"); a file in the older artifact layout that says Stitch is not read."""
+    request = _request(tmp_path / f"older-{kind.value}.nexus", AnalysisArtifactKind.RSM)
     admit_analysis_artifact(request, coordinator=OutputTransactionCoordinator()).publish(_writer(request))
     with h5py.File(request.target, "r+") as handle:
         entry = handle["entry"]
         del entry.attrs[ANALYSIS_KIND_ATTR]
-        entry.attrs.create(ANALYSIS_KIND_ATTR, np.bytes_(AnalysisArtifactKind.STITCH_1D.value.encode()))
+        entry.attrs.create(ANALYSIS_KIND_ATTR, np.bytes_(kind.value.encode()))
     with pytest.raises(AnalysisArtifactInvalid, match="Int record"):
         inspect_analysis_artifact(request.target)

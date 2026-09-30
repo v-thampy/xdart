@@ -22,7 +22,6 @@ from xrd_tools.io.nexus import (
     read_nexus,
     read_scan,
     read_scan_metadata,
-    read_stitched,
 )
 from xrd_tools.io.output_path import resolve_output_target
 from xrd_tools.io.processed_scan_id import (
@@ -607,7 +606,7 @@ def test_direct_processed_readers_reject_unstamped_historical_layout(
     with pytest.raises(ValueError, match="current xdart"):
         with FrameViewReader(path):
             pass
-    for reader in (read_scan, read_scan_metadata, read_stitched):
+    for reader in (read_scan, read_scan_metadata):
         with pytest.raises(ValueError, match="current xdart"):
             reader(path)
     experiment = ExperimentRecordReader().read(path)

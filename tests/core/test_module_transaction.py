@@ -51,8 +51,8 @@ from xrd_tools.io.analysis_artifact import (
 )
 from xrd_tools.io.output_transaction import StreamTerminal, TargetChanged
 from xrd_tools.io.output_transaction import OutputTransactionCoordinator
-from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from xrd_tools.io.nexus import write_rsm, write_stitched
+from xrd_tools.core.containers import IntegrationResult1D
+from xrd_tools.io.nexus import write_rsm
 from xrd_tools.io.stitch_record import StitchedPattern, write_stitch_record
 from xrd_tools.rsm.volume import RSMVolume
 from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
@@ -1558,11 +1558,11 @@ def test_module_commit_receipt_is_built_before_lower_lease_release(
 @pytest.mark.parametrize(
     ("module_kind", "artifact_kind"),
     (
-        (ModuleKind.STITCH, AnalysisArtifactKind.STITCH_2D),
+        (ModuleKind.STITCH, AnalysisArtifactKind.STITCH_1D),
         (ModuleKind.RSM, AnalysisArtifactKind.RSM),
     ),
 )
-def test_shared_module_commit_covers_stitch_2d_and_rsm(
+def test_shared_module_commit_covers_stitch_and_rsm(
     tmp_path,
     module_kind,
     artifact_kind,
@@ -1575,21 +1575,8 @@ def test_shared_module_commit_covers_stitch_2d_and_rsm(
         provenance,
         coordinator=OutputTransactionCoordinator(),
     )
-    if artifact_kind is AnalysisArtifactKind.STITCH_2D:
-        value = IntegrationResult2D(
-            radial=np.linspace(0.1, 1.0, 8),
-            azimuthal=np.linspace(-5.0, 5.0, 4),
-            intensity=np.arange(32, dtype=float).reshape(8, 4),
-            sigma=np.full((8, 4), 0.25),
-            unit="q_A^-1",
-            azimuthal_unit="chi_deg",
-        )
-        writer = lambda entry: write_stitched(
-            entry,
-            stitched_2d=value,
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
+    if artifact_kind is AnalysisArtifactKind.STITCH_1D:  # a Stitch result is an Int record
+        writer = lambda entry: _write_stitched_record(entry, request.output.target)
     else:
         volume = RSMVolume(
             h=np.linspace(-1.0, 1.0, 3),
