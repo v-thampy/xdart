@@ -751,6 +751,34 @@ def test_append_skips_the_outputs_already_stitched_and_replace_stitches_them_aga
         qapp.processEvents()
 
 
+def test_a_result_is_shown_once_when_it_is_mounted(qapp, tmp_path):
+    """Codex testing-fixes review (startup recommendation 2): mounting a result selected it, which rebuilt
+    the frame list and redrew through the list's signals, then did both again (287 frame items twice)."""
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        page.run_bar.startButton.click()
+        _wait(page, qapp)
+        target = page._owner.prepared.request.module.output.target
+        page.results.clear()  # a fresh list: the reopened result is new to it
+        rebuilds, draws = [], []
+        clear, draw = page.frames.clear, page._draw
+        page.frames.clear = lambda: (rebuilds.append(1), clear())[1]
+        page._draw = lambda *args: (draws.append(1), draw(*args))[1]
+        page.open_result(target)
+        _wait(page, qapp)
+        assert page.results.count() == 1 and page.frames.count() == 2
+        assert (len(rebuilds), len(draws)) == (1, 1)
+        page.open_result(target)  # already the current result: shown again, once
+        _wait(page, qapp)
+        assert (len(rebuilds), len(draws)) == (2, 2)
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
 def test_mask_exact_frame_staging_is_unrotated_and_page_shutdown_reaps_worker(qapp, tmp_path):
     from threading import Event
     import fabio

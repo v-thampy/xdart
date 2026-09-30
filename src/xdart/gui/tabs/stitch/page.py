@@ -1926,7 +1926,11 @@ class StitchPage(QtWidgets.QWidget):
                 self._plot_axis = chosen
             elif self._plot_axis not in modes:
                 self._plot_axis = payload.gi[0][0]
+        # shown once: selecting it would rebuild the frame list and redraw through the list's signals,
+        # and again here (Codex testing-fixes review, startup recommendation 2)
+        blocker = QtCore.QSignalBlocker(self.results)
         self.results.setCurrentItem(item)
+        del blocker
         self._current_result_changed()
 
     def _selected(self):
