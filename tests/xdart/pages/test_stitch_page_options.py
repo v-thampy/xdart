@@ -568,6 +568,30 @@ def test_inputs_view_follows_int(qapp, tmp_path):
         _close(page, qapp)
 
 
+def test_the_experiment_rows_and_action_buttons_are_ints(qapp):
+    """Int's EXPERIMENT, from its composer: Calibrate · Make Mask on top, a Detector subsection holding the
+    calibration and mask, then Configuration (Grazing); and Int's action buttons, Preview · Retry · Advanced."""
+    from xdart.gui.widgets.controls_panel import ActionButton, SubsectionCard
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        buttons = (page.calibrate_button, page.mask_button, page.preview_button, page.retry_button,
+                   page.advanced_button)
+        assert all(type(button) is ActionButton for button in buttons)
+        assert (page.calibrate_button.text(), page.mask_button.text()) == ("⌖ Calibrate", "▦ Make Mask")
+        cards = {card.title.text(): card for card in page.controls.experiment_card.body.findChildren(SubsectionCard)}
+        assert set(cards) == {"Detector", "Configuration"}
+        assert all(cards["Detector"].isAncestorOf(page._rows[key]) for key in ("geometry_path", "mask_path"))
+        page.set_field("mask_path", "mask.npy")  # Int's Detector status follows its rows
+        assert cards["Detector"].status.text() == "mask"
+        page.set_field("geometry_path", "geometry.json")
+        assert cards["Detector"].status.text() == "fitted"
+        page.advanced_button.click()  # Int's controlActionRequested, routed by the page
+        assert page.advanced.isVisible()
+    finally:
+        page.advanced.close()
+        _close(page, qapp)
+
+
 def test_the_selected_scans_frames_show_once_committed(qapp, tmp_path):
     """Maintainer, 2026-09-30: "display the number of images in a scan in the readiness tab the moment it is
     selected like in int ... only if it is quick, like in int. This could also be in the source readiness

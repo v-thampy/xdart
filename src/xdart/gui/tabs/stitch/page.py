@@ -46,9 +46,12 @@ from xrd_tools.analysis.stitch_operation import StitchGeometryKind
 from xrd_tools.analysis.stitch_sources import StitchSourceSelection
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifactPayload
-from xrd_tools.session.readiness import ControlFieldKind, ControlFormField, SectionId
+from xrd_tools.session.readiness import (
+    ControlAction, ControlActionSpec, ControlFieldKind, ControlFormField, SectionId,
+)
 from xdart.gui.tabs.scattering.controls_inventory import (
     GI_1D_AXES, GI_ENABLED, GI_MOTOR, GI_ORIENTATION, GI_THETA, INT_1D_AXIS, INT_1D_POINTS, INT_1D_RADIAL_AUTO,
+    MASK_FILE, PONI_FILE,
     INT_1D_RADIAL_HIGH, INT_1D_RADIAL_LOW, INT_2D_AXIS, INT_2D_AZIM_AUTO, INT_2D_AZIM_HIGH, INT_2D_AZIM_LOW,
     INT_2D_AZIM_POINTS, INT_2D_RADIAL_AUTO, INT_2D_RADIAL_HIGH, INT_2D_RADIAL_LOW, INT_2D_RADIAL_POINTS,
     SOURCE_DIRECTORY, SOURCE_FILTER, SOURCE_RECURSIVE, SOURCE_TYPE, STANDARD_1D_AXES, STANDARD_2D_AXES,
@@ -497,6 +500,12 @@ class StitchPage(QtWidgets.QWidget):
         self.splitter.setStretchFactor(2, 0)
         self.splitter.setSizes([230, 720, 360])
 
+    def _control_action(self, action):
+        """Int's action buttons on this page (``ControlsPanel.controlActionRequested``)."""
+        {ControlAction.CALIBRATE: self._calibrate, ControlAction.MAKE_MASK: self._make_mask,
+         ControlAction.PREVIEW: self.begin_preview, ControlAction.RETRY: self._retry,
+         ControlAction.ADVANCED_PROCESSING: self.advanced.show}.get(action, lambda: None)()
+
     def _write_mode_changed(self, _mode=None):
         self.run_bar.writeModeButton.setToolTip(
             "Append: skip each output already stitched from the same frames with the same settings, "
@@ -584,19 +593,26 @@ class StitchPage(QtWidgets.QWidget):
         self._field(project, SectionId.PROJECT, "project_root", "Folder", browse=True)
         self._rows["project_root"].valueChanged.connect(self._refresh_xu_geometry)
         self._field(project, SectionId.PROJECT, "output_path", "Save Path", browse=True)
-        authoring = QtWidgets.QWidget()
-        authoring_layout = QtWidgets.QHBoxLayout(authoring)
-        authoring_layout.setContentsMargins(0, 0, 0, 0)
-        self.calibrate_button = QtWidgets.QPushButton("⌖ Calibrate")
-        self.calibrate_button.clicked.connect(self._calibrate)
-        self.mask_button = QtWidgets.QPushButton("▦ Make Mask")
-        self.mask_button.clicked.connect(self._make_mask)
-        authoring_layout.addWidget(self.calibrate_button)
-        authoring_layout.addWidget(self.mask_button)
-        experiment.add_row(authoring)
-        self._field(experiment, SectionId.EXPERIMENT, "geometry_path", "Calibration", browse=True)
+        # Int's EXPERIMENT rows, from its composer: Calibrate · Make Mask on top, the Detector subsection (the
+        # calibration and mask), then Configuration (Grazing, below); every action button is Int's
+        detector = {"geometry_path": self._new_field(SectionId.EXPERIMENT, "geometry_path", "Calibration",
+                                                     browse=True, path=PONI_FILE),
+                    "mask_path": self._new_field(SectionId.EXPERIMENT, "mask_path", "Mask File", browse=True,
+                                                 path=MASK_FILE)}
+        built = self.controls.render_experiment_rows(experiment, tuple(detector.values()), (
+            ControlActionSpec(ControlAction.CALIBRATE, "Calibrate", SectionId.EXPERIMENT),
+            ControlActionSpec(ControlAction.MAKE_MASK, "Make Mask", SectionId.EXPERIMENT)))
+        for key, field in detector.items():
+            self._bind(key, field, built[field.path])
+        self._detector_card = self._rows["geometry_path"].parentWidget()
+        while not isinstance(self._detector_card, SubsectionCard):
+            self._detector_card = self._detector_card.parentWidget()
+        self.calibrate_button, self.mask_button = built[ControlAction.CALIBRATE], built[ControlAction.MAKE_MASK]
+        self.calibrate_button.setToolTip("Calibrate the detector arm from a calibrant scan: the pyFAI goniometer "
+                                         "file and its xrayutilities file.")
+        self.mask_button.setToolTip("Draw a detector mask on one of the scan's frames.")
+        self.controls.controlActionRequested.connect(self._control_action)
         self._rows["geometry_path"].valueChanged.connect(self._refresh_xu_geometry)
-        self._field(experiment, SectionId.EXPERIMENT, "mask_path", "Mask File", browse=True)
         # Grazing incidence as Int sets it, in the Experiment section (maintainer, 2026-09-29):
         # Int's own rows, rebuilt from this page's values (_render_gi).
         # tilt_motor None: the default (chi, gonchi, else Manual) once the scan's motors are known
@@ -784,18 +800,16 @@ class StitchPage(QtWidgets.QWidget):
         close = QtWidgets.QPushButton("Close")
         close.clicked.connect(self.advanced.close)
         advanced_layout.addWidget(close)
-        actions = QtWidgets.QWidget()
-        actions_layout = QtWidgets.QHBoxLayout(actions)
-        actions_layout.setContentsMargins(0, 0, 0, 0)
-        self.preview_button = QtWidgets.QPushButton("Preview")
-        self.preview_button.clicked.connect(self.begin_preview)
-        self.retry_button = QtWidgets.QPushButton("Retry")
-        self.retry_button.clicked.connect(self._retry)
-        self.advanced_button = QtWidgets.QPushButton("Advanced")
-        self.advanced_button.clicked.connect(self.advanced.show)
-        for button in (self.preview_button, self.retry_button, self.advanced_button):
-            actions_layout.addWidget(button)
-        processing.add_row(actions)
+        # Int's action row: Preview · Retry (after a failure) · Advanced
+        buttons = self.controls.render_actions(processing, tuple(
+            ControlActionSpec(action, label, SectionId.PROCESSING) for action, label in (
+                (ControlAction.PREVIEW, "Preview"), (ControlAction.RETRY, "Retry"),
+                (ControlAction.ADVANCED_PROCESSING, "Advanced"))), expand=True)
+        self.preview_button, self.retry_button, self.advanced_button = (
+            buttons[action] for action in (ControlAction.PREVIEW, ControlAction.RETRY, ControlAction.ADVANCED_PROCESSING))
+        self.preview_button.setToolTip("Check the inputs and list what a Run stitches, without stitching.")
+        self.retry_button.setToolTip("Retry the last result's saving or cleanup.")
+        self.advanced_button.setToolTip("The source, geometry, frame and correction settings.")
         self.preview_dialog = QtWidgets.QDialog(self)
         self.preview_dialog.setWindowTitle("Stitch preview")
         preview_layout = QtWidgets.QVBoxLayout(self.preview_dialog)
@@ -1279,6 +1293,10 @@ class StitchPage(QtWidgets.QWidget):
         calibration = str(value("geometry_path") or "").strip()
         mask = str(value("mask_path") or "").strip()
         experiment_ready = bool(calibration) and Path(calibration).is_file() and (not mask or Path(mask).is_file())
+        detector = ControlsPanel._detector_status(tuple(  # Int's Detector status: fitted, or a mask
+            replace(self._fields[key], value=value(key)) for key in ("geometry_path", "mask_path")))
+        self._detector_card.status.setText(detector)
+        self._detector_card.status.setVisible(bool(detector))
         xu = value("backend") == "xrayutilities histogram"
         arm_problem = (self._calibration_pair(calibration, xu) or self._arm_problem()) if experiment_ready else None
         experiment_ready = experiment_ready and arm_problem is None

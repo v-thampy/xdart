@@ -1836,9 +1836,28 @@ class ControlsPanel(QtWidgets.QWidget):
     ) -> None:
         if not fields:
             return
+        self.render_experiment_rows(
+            self.experiment_card, fields, self._experiment_producers(state),
+            detector_summary=state.detector_summary,
+        )
+
+    def render_experiment_rows(
+        self,
+        card: SectionCard,
+        fields: tuple[ControlFormField, ...],
+        producers: Sequence[ControlActionSpec] = (),
+        *,
+        detector_summary: str = "",
+    ) -> dict[object, QtWidgets.QWidget]:
+        """EXPERIMENT layout: the producer actions on top, then the Detector
+        subsection (calibration and mask) and the Sample & measurement one (GI).
+
+        Public for another page's own values (Stitch): returns each Detector
+        field's row by path and each producer's button by action. Edits emit
+        ``fieldValueChanged``; a button ``controlActionRequested``."""
+        built: dict[object, QtWidgets.QWidget] = {}
         # Producer actions (Calibrate / Refine / Make Mask) sit at the top of the
         # section they write into — co-located with §3 state, not a top bar.
-        producers = self._experiment_producers(state)
         if producers:
             row = QtWidgets.QWidget()
             row.setObjectName("controlsActionRow")
@@ -1846,10 +1865,10 @@ class ControlsPanel(QtWidgets.QWidget):
             prow.setContentsMargins(0, 0, 0, 3)
             prow.setSpacing(5)
             for spec in producers:
-                btn = ActionButton(spec)
+                built[spec.action] = btn = ActionButton(spec)
                 btn.actionRequested.connect(self.controlActionRequested)
                 prow.addWidget(btn, 1)
-            self.experiment_card.add_row(row)
+            card.add_row(row)
         detector_paths = {
             ("Signal", "poni_file"),
             ("Calibration", "poni_file"),
@@ -1872,7 +1891,7 @@ class ControlsPanel(QtWidgets.QWidget):
             (
                 "Detector",
                 tuple(field for field in fields if field.path in detector_paths),
-                self._detector_status(fields, state.detector_summary),
+                self._detector_status(fields, detector_summary),
             ),
             (
                 self._experiment_title,
@@ -1890,8 +1909,10 @@ class ControlsPanel(QtWidgets.QWidget):
                 self._render_sample_measurement_rows(group, group_fields)
             else:
                 for field in group_fields:
-                    self._add_bound_row(group, field)
-            self.experiment_card.add_row(group)
+                    built[field.path] = row = self._make_bound_row(field)
+                    group.add_row(row)
+            card.add_row(group)
+        return built
 
     @property
     def experiment_title(self) -> str:
@@ -2389,15 +2410,27 @@ class ControlsPanel(QtWidgets.QWidget):
             return "Background"
         return ""
 
+    def render_actions(
+        self,
+        card: SectionCard,
+        actions: tuple[ControlActionSpec, ...],
+        *,
+        expand: bool = False,
+    ) -> dict[object, ActionButton]:
+        """A section's action row (Int's Reintegrate · Advanced) for another page's
+        own actions (Stitch's Preview · Retry · Advanced): each button by action;
+        a click emits ``controlActionRequested``."""
+        return self._add_actions(card, actions, expand=expand)
+
     def _add_actions(
         self,
         card: SectionCard,
         actions: tuple[ControlActionSpec, ...],
         *,
         expand: bool = False,
-    ) -> None:
+    ) -> dict[object, ActionButton]:
         if not actions:
-            return
+            return {}
         row = QtWidgets.QWidget()
         row.setObjectName("controlsActionRow")
         lay = QtWidgets.QHBoxLayout(row)
@@ -2405,8 +2438,10 @@ class ControlsPanel(QtWidgets.QWidget):
         lay.setSpacing(5)
         if not expand:
             lay.addStretch(1)
+        built = {}
         for spec in actions:
-            btn = ActionButton(spec)
+            built[spec.action] = btn = ActionButton(spec)
             btn.actionRequested.connect(self.controlActionRequested)
             lay.addWidget(btn, 1 if expand else 0)
         card.add_row(row)
+        return built
