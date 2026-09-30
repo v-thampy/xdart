@@ -350,7 +350,7 @@ def test_streaming_multigeometry_matches_native_union_result(
         npt_rad = 80
         npt_azim = 36
 
-    streamed, _gi = _streaming_multigeometry(
+    streamed, _gi, _profile = _streaming_multigeometry(
         images,
         len(images),
         lambda: iter(_make_small_integrators(poni_fixture, angles)),
@@ -468,7 +468,7 @@ def test_streaming_multigeometry_preserves_native_mixed_variance_union(
         lambda _owner, *_args, **_kwargs: next(results),
     )
 
-    streamed, _gi = _streaming_multigeometry(
+    streamed, _gi, _profile = _streaming_multigeometry(
         images,
         len(images),
         lambda: iter(_make_small_integrators(poni_fixture, angles)),

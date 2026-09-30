@@ -91,6 +91,8 @@ class AnalysisResult:
     auxiliary: Any = field(default=None, repr=False, compare=False)
     #: a GI Stitch's cuts beside the payload, each (IntegrationResult1D, StitchDiagnostics).
     gi_cuts: tuple = field(default=(), repr=False, compare=False)
+    #: a Stitch 2D's I(q) beside the map, (IntegrationResult1D, StitchDiagnostics); None otherwise.
+    profile: Any = field(default=None, repr=False, compare=False)
 
     def to_dict(self, *, include_payload: bool = True) -> dict[str, Any]:
         data = {
@@ -181,6 +183,9 @@ class StitchPlan:
     #: streaming multigeometry 1-D only: native GI (``integrate.stitch_gi.StitchGI``), its cuts
     #: binned beside I(q) from the same frames; the result's ``gi_cuts``.
     stitch_gi: Any = None
+    #: streaming multigeometry 2-D only: I(q) over every χ in ``npt_1d`` bins beside the map, from the
+    #: same frames in the same pass (a Stitch 2D record's pattern); the result's ``profile``.
+    stitch_profile: bool = False
 
     def provenance(self) -> dict[str, Any]:
         """A JSON-safe record of this stitch for persistence (pass to
@@ -608,11 +613,14 @@ def run_stitch(
             f"grouped/composite source is NaN-padding a member that lacks this "
             f"monitor. Every member of a multi-source stitch must provide it.")
 
-    auxiliary, gi_cuts = None, ()
+    auxiliary, gi_cuts, profile = None, (), None
     diffractometer = plan.diffractometer or getattr(src, "diffractometer", None)
     if plan.stitch_gi is not None and (diffractometer is None or not plan.streaming_multigeometry
                                     or plan.mode != "1d"):
         raise ValueError("a GI cut needs the streaming 1-D Stitch with a Diffractometer")
+    if plan.stitch_profile and (diffractometer is None or not plan.streaming_multigeometry
+                                or plan.mode != "2d" or plan.backend != "multigeometry"):
+        raise ValueError("an I(q) profile needs the streaming 2-D Stitch with a Diffractometer")
     if diffractometer is not None:
         # GAP-A path: per-frame rotations from the calibrated Diffractometer.
         from xrd_tools.integrate.multi import (  # noqa: PLC0415
@@ -621,6 +629,7 @@ def run_stitch(
             stitch_1d_streaming,
             stitch_2d,
             stitch_2d_streaming,
+            stitch_2d_with_1d_streaming,
         )
         motors: dict[str, np.ndarray] = {}
         for m in diffractometer.all_referenced_motors():
@@ -733,8 +742,7 @@ def run_stitch(
                 unit=plan.unit, radial_range=plan.radial_range,
                 azimuth_range=plan.azimuth_range)
         elif plan.mode == "2d" and plan.streaming_multigeometry:
-            payload, auxiliary = stitch_2d_streaming(
-                _iter_images(), len(labels), integrator_series.__iter__,
+            arguments = dict(
                 npt_rad=plan.npt_rad_2d, npt_azim=plan.npt_azim_2d,
                 unit=plan.unit, method=plan.method,
                 radial_range=plan.radial_range,
@@ -742,6 +750,14 @@ def run_stitch(
                 mask=plan.mask, normalization=normalization,
                 frame_screen=frame_screen, **corrections,
             )
+            if plan.stitch_profile:
+                payload, auxiliary, *profile = stitch_2d_with_1d_streaming(
+                    _iter_images(), len(labels), integrator_series.__iter__, npt_1d=plan.npt_1d,
+                    **arguments)
+                profile = tuple(profile)
+            else:
+                payload, auxiliary = stitch_2d_streaming(
+                    _iter_images(), len(labels), integrator_series.__iter__, **arguments)
         elif plan.mode == "2d":
             assert integrators is not None
             images = _load_images_eager()
@@ -887,6 +903,7 @@ def run_stitch(
         ),
         auxiliary=auxiliary,
         gi_cuts=gi_cuts,
+        profile=profile,
     )
 
 

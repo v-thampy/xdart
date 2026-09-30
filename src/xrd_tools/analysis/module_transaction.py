@@ -475,7 +475,9 @@ class ModuleOperationRequest:
             )
         if (xu_bound or native_bound) and (
             self.source.kind is not ModuleKind.STITCH
-            or self.output.kind is not AnalysisArtifactKind.STITCH_1D
+            # a native MultiGeometry Stitch 2D is an Int 2D record; xrayutilities' is 1-D
+            or self.output.kind not in ({AnalysisArtifactKind.STITCH_1D} if xu_bound else
+                                        {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D})
         ):
             raise TypeError("XU Stitch request requires exact Stitch 1-D intent")
         if rsm_v2_bound and (
@@ -591,7 +593,8 @@ def _validate_native_stitch_intent(request, provenance):
         raise ModuleArtifactRefused("NATIVE_STITCH_INTENT_MISMATCH")
     plan, manifest, frozen = owner
     if (type(plan) not in {StitchOperationPlan, XuStitchOperationPlan}
-            or plan.native_records is not True or plan.mode != "1d"
+            or plan.native_records is not True
+            or plan.mode != ("2d" if request.output.kind is AnalysisArtifactKind.STITCH_2D else "1d")
             or plan.fingerprint != request.plan_fingerprint
             or manifest.module_source_fingerprint != request.source.fingerprint
             or request.output.artifact_family is None

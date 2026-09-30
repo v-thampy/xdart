@@ -340,6 +340,31 @@ def test_scan14_native_result_records_the_frame_check(isolated_scan14_project):
 
 
 @pytest.mark.slow
+def test_scan14_native_stitch_2d_merges_past_pyfais_unsplit_bins(isolated_scan14_project):
+    """All 287 frames in 2-D (STITCH-2D-20260930): pyFAI's pixel splitting leaves 12 frames a NaN last q
+    bin and many a bin of negative round-off. The map commits with every bin finite and nonnegative,
+    the last q bin holding the other frames' data, with I(q) beside it."""
+    project = isolated_scan14_project
+    legacy = _scan14_request(project, project / "map-legacy.nexus", tuple(range(287)))
+    plan = replace(legacy.plan, mode="2d", npt_rad_2d=1000, npt_azim_2d=360,
+                   azimuth_range=(-180.0, 180.0), native_records=True)
+    output = ModuleOutputRequest(
+        resolve_finite_output_target(project, "scan14-map", operation_token="stitch-2d"),
+        AnalysisArtifactKind.STITCH_2D, artifact_family="scan14-map",
+    )
+    result = run_stitch_operation(
+        prepare_stitch_operation(legacy.module.source, output, plan, project_root=project))
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    payload = read_analysis_artifact(output.target, expected_kind=AnalysisArtifactKind.STITCH_2D)
+    assert payload.intensity.shape == payload.coverage.shape == (1000, 360)
+    for values in (payload.coverage, payload.normalization):
+        assert np.isfinite(values).all() and (values >= 0).all()
+    covered = payload.coverage[-1] > 0
+    assert covered.sum() > 100 and np.isfinite(payload.intensity[-1][covered]).all()
+    assert payload.profile.intensity.shape == (1500,)
+
+
+@pytest.mark.slow
 def test_scan14_xu_polarization_tracks_multigeometry(isolated_scan14_project):
     """XU applies pyFAI's polarization: the XU/MultiGeometry ratio is unchanged by it."""
     project = isolated_scan14_project

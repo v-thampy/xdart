@@ -1606,8 +1606,6 @@ def _native_plan_fields(plan):
         raise TypeError("conditioning must be exact StitchConditioning")
     if not plan.native_records and (plan.conditioning is not None or plan.mask_path is not None):
         raise ValueError("native conditioning and mask require native_records")
-    if plan.native_records and plan.mode != "1d":
-        raise ValueError("native frame artifacts require Stitch 1-D")
     if plan.native_records and plan.conditioning is None:
         object.__setattr__(plan, "conditioning", StitchConditioning("off"))
     if plan.mask_path is not None:
@@ -2457,6 +2455,8 @@ def _runtime_plan(plan: StitchOperationPlan, diffractometer) -> StitchPlan:
         max_eager_bytes=None,
         streaming_multigeometry=True,
         stitch_gi=plan.gi,
+        # a native Stitch 2D is an Int 2D record: I(q) beside the map
+        stitch_profile=plan.native_records and plan.mode == "2d",
     )
 
 
@@ -2577,7 +2577,8 @@ def _gi_cuts(plan, cuts):
 
 
 def _write_record(entry, target, projection, native_args) -> None:
-    """A Stitch 1D result as an Int record (``stitch_record``), from its exact projection."""
+    """A Stitch 1D result, or a native Stitch 2D's map and I(q), as an Int record (``stitch_record``),
+    from its exact projection."""
     write_stitch_projection(entry, target, projection, frame_records=native_args.get("frame_records"),
                             source_base=native_args.get("source_base"))
 
@@ -3084,6 +3085,12 @@ class StitchOperationExecution:
                 ModuleDisposition.FAILED,
                 "INVALID_STITCH_DIAGNOSTICS",
             )
+        native_map = self.request.plan.native_records and self.request.plan.mode == "2d"
+        profile = scientific.profile
+        if native_map and (type(profile) is not tuple or len(profile) != 2
+                           or type(profile[0]) is not IntegrationResult1D
+                           or type(profile[1]) is not StitchDiagnostics):
+            return self._terminal(ModuleDisposition.FAILED, "INVALID_SCIENCE_RESULT")
         try:
             if self.request.plan.mode == "1d":
                 axes = (("q", payload.radial),)
@@ -3109,6 +3116,9 @@ class StitchOperationExecution:
                 normalization=diagnostics.normalization,
                 **_native_artifact_args(self.request, records),
                 gi_cuts=_gi_cuts(self.request.plan, scientific.gi_cuts),
+                profile=None if not native_map else (
+                    profile[0].unit, profile[0].radial, profile[0].intensity, profile[0].sigma,
+                    profile[1].coverage, profile[1].normalization),
             )
         except AnalysisArtifactProjectionInvalid:
             return self._terminal(
@@ -3143,7 +3153,7 @@ class StitchOperationExecution:
 
         def writer(entry) -> None:
             _revalidate_geometry(self.request.plan.geometry)
-            if self.request.plan.mode == "1d":
+            if self.request.plan.mode == "1d" or native_map:
                 _write_record(entry, self.request.module.output.target, result_projection,
                               _native_artifact_args(self.request, records))
             else:
