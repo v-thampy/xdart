@@ -42,12 +42,13 @@ def test_the_direct_beam_and_the_rough_arm_read_the_panels_zeros(qapp, tmp_path)
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('scan'))
         dialog._fields['beam_source'].setText(str(tmp_path / 'beam'))
         dialog._distance()
-        (kind, (_spec, motor, options)), = started
+        (kind, (_spec, motor, options, held)), = started
         assert kind == 'distance' and motor == 'del' and options['angle_zero_deg'] == 2.3
+        assert held == ('nu',)  # its reading during the scan places the beam (the other circle)
         dialog._fields['beam_motor'].setText('nu')  # a nu scan: nu's zero
         started.clear()
         dialog._distance()
-        assert started[0][1][2]['angle_zero_deg'] == -.8
+        assert started[0][1][2]['angle_zero_deg'] == -.8 and started[0][1][3] == ('del',)
     finally:
         dialog.close()
         page.shutdown()

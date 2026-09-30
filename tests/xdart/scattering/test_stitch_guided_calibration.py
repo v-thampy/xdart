@@ -440,8 +440,8 @@ def test_direct_beam_window_handoff_uses_actual_api_and_seed_not_bounds(tmp_path
     source = SourceSpec(spec, SourceKind.SPEC, options={'scan':'1','image_dir':str(tmp_path)})
     options = dict(detector='Detector', detector_config=config(), beam_pixel=beam,
                    angle_zero_deg=7., rotation=0)
-    result, energy = _run_job(('distance', (source,'del',options)), Event(), lambda *_:None)
-    assert energy is None  # the scan records no energy
+    result, energy, held = _run_job(('distance', (source, 'del', options, ())), Event(), lambda *_: None)
+    assert energy is None and held == {}  # the scan records no energy; no other circle is held
     expected = calibrate_direct_beam(angles, images, detector='Detector', detector_config=config(),
                                      beam_pixel=beam, angle_zero_deg=7.)
     assert result.distance_m == pytest.approx(expected.distance_m)
@@ -541,8 +541,8 @@ def test_a_direct_beam_fit_shows_its_distance_and_the_scan_supplies_the_waveleng
     angles = np.array([1., .5, 0., -.5, -1.])
     images, _, beam = beam_images(angles, shape=(65, 487), pitches=(516e-6, 172e-6), distance=.5, zero=0)
     spec = tmp_path / 'direct'
-    spec.write_text('#F direct\n#E 1\n#D today\n#C test\n#O0 del  energy\n#S 1 ascan del 1 -1 4 1\n#D today\n'
-                    '#P0 0 17000.018\n#N 1\n#L del\n' + '\n'.join(map(str, angles)) + '\n')
+    spec.write_text('#F direct\n#E 1\n#D today\n#C test\n#O0 del  nu  energy\n#S 1 ascan del 1 -1 4 1\n'
+                    '#D today\n#P0 0 0 17000.018\n#N 1\n#L del\n' + '\n'.join(map(str, angles)) + '\n')
     for index, array in enumerate(images):
         tifffile.imwrite(tmp_path / f'direct_scan1_{index:04d}.tif', array)
     dialog = StitchCalibrationDialog(tmp_path)
@@ -553,11 +553,22 @@ def test_a_direct_beam_fit_shows_its_distance_and_the_scan_supplies_the_waveleng
                                beam_detector='Pilatus100k', beam_pixel=', '.join(map(str, beam))).items():
             dialog._set_field_text(key, str(value))
         assert dialog._rough_wavelength_A() is None and not dialog.show_fit_button.isEnabled()
+        dialog.geometry_editor.zero_edit('nu').setText('1.5')  # nu held at 0 during the scan, off its zero
         _fit_direct_beam(dialog)
         result = dialog._distance_result
         assert result is not None, dialog.status.text()
         assert dialog.status.text().startswith(f'Direct-beam distance: {result.distance_mm:.6g} mm (regression SE')
-        assert dialog.status.text().endswith('the scan records 17000 eV')
+        assert dialog.status.text().endswith('nu held at 0° · the scan records 17000 eV')
+        assert dialog._distance_held == {'nu': 0.}
+        # the rough arm puts the beam on the fitted pixel where the scan saw it (del at its zero, nu at 0),
+        # not at the zero pose (nu at 1.5): the exact angles are the core row's
+        from xrd_tools.integrate.calibration_seed import _direct_beam_hit
+        seed = dialog._rough_arm()
+        x, y = result.zero_beam_pixel
+        (row, column), _ = _direct_beam_hit(seed, del_motor='del', nu_motor='nu', readings={'del': 0., 'nu': 0.})
+        assert (row, column) == pytest.approx((y, x), abs=1e-6)
+        (row, column), _ = _direct_beam_hit(seed, del_motor='del', nu_motor='nu', readings={'del': 0., 'nu': 1.5})
+        assert abs(column - x) > 10
         assert dialog.beam_summary.toPlainText().startswith('Distance: ')
         window = dialog._direct_beam_fit_window
         assert window is not None and window.isVisible() and dialog.show_fit_button.isEnabled()
@@ -614,10 +625,10 @@ def test_direct_beam_container_job_refuses_count_mismatch_and_honours_cancel(tmp
                         options={'scan': '8.1', 'image_file': str(nexus)})
     options = dict(detector='Pilatus100k', beam_pixel=(243, 32), angle_zero_deg=0., rotation=0)
     with pytest.raises(ValueError, match='count mismatch'):
-        _run_job(('distance', (source, 'del', options)), Event(), lambda *_: None)
+        _run_job(('distance', (source, 'del', options, ())), Event(), lambda *_: None)
     cancelled = Event(); cancelled.set()
     with pytest.raises(OperationCancelled):
-        _run_job(('distance', (source, 'del', options)), cancelled, lambda *_: None)
+        _run_job(('distance', (source, 'del', options, ())), cancelled, lambda *_: None)
 
 
 def test_the_detector_and_its_orientation_are_choices_saved_with_the_settings(tmp_path):

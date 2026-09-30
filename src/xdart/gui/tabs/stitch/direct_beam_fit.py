@@ -12,14 +12,16 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtWidgets
 
 
-def direct_beam_fit_text(result, energy_eV=None):
-    """One line for a direct-beam fit: its distance and uncertainty, where the beam hits at the zero and,
-    when the scan records one, its energy."""
+def direct_beam_fit_text(result, energy_eV=None, held=None):
+    """One line for a direct-beam fit: its distance and uncertainty, where the beam hits at the zero, the
+    other circle as the scan held it, and, when the scan records one, its energy."""
     text = (f'Direct-beam distance: {result.distance_mm:.6g} mm (regression SE '
             f'{result.distance_std_m * 1000:.3g} mm)')
     beam = result.zero_beam_pixel
     if beam is not None:
         text += f' · beam at the zero: {beam[0]:.2f}, {beam[1]:.2f} px'
+    for motor, reading in (held or {}).items():
+        text += f' · {motor} held at {reading:g}°'
     if energy_eV is not None:
         text += f' · the scan records {energy_eV:.6g} eV'
     return text
@@ -53,9 +55,9 @@ class DirectBeamFitWindow(QtWidgets.QDialog):
         layout.addWidget(self.plot, 3)
         layout.addWidget(self.residuals, 1)
 
-    def show_result(self, result, energy_eV=None):
+    def show_result(self, result, energy_eV=None, held=None):
         """Plot ``result`` (a ``DirectBeamResult``) and say its distance."""
-        self.summary.setText(direct_beam_fit_text(result, energy_eV)
+        self.summary.setText(direct_beam_fit_text(result, energy_eV, held)
                              + f' · {result.model} model, {int(np.count_nonzero(result.used))} of '
                                f'{len(result.angles_deg)} frames used')
         angles = np.asarray(result.angles_deg, dtype=float)

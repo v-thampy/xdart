@@ -237,6 +237,28 @@ def test_a_tilted_mount_keeps_the_direct_beam_on_its_pixel_at_the_given_distance
         assert integrator.getFit2D()['directDist'] == pytest.approx(500., abs=1e-6), mount
 
 
+@pytest.mark.parametrize('orientation', [3, 1, 2, 4])
+def test_a_direct_beam_seen_off_the_zero_pose_is_placed_where_it_was_seen(orientation):
+    """Maintainer, 2026-09-29: an automatic refinement from a direct-beam geometry "looks totally off".
+    17-2's direct-beam scan 3 turns nu and holds del at 0, while del's zero is 2.3°: the fitted pixel is
+    where the beam hit at that pose. Placed at the zero pose instead, the rough arm was 2.3° (about 92
+    pixels at 395 mm) off. Now the beam hits the pixel at the scan's pose, 2.3° from it at the zero
+    pose; with no pose given it hits at the zero pose, as before."""
+    from xrd_tools.integrate.calibration_seed import predict_frame_seed
+    x, y = 279.19, 97.
+    zeros, scan = {'del': 2.3, 'nu': 0.}, {'del': 0., 'nu': 0.}
+
+    def tth_at_beam(record, motors):
+        integrator = predict_frame_seed(record, _frame(motors)).integrator
+        return math.degrees(float(integrator.tth(np.array([y]), np.array([x]))[0]))
+
+    rough = dict(distance_m=.395, detector='Pilatus300kw', beam_px=(x, y), orientation=orientation, zeros_deg=zeros)
+    record = rough_arm_record(**rough, beam_readings={'del': 0.})
+    assert tth_at_beam(record, scan) == pytest.approx(0, abs=1e-7)
+    assert tth_at_beam(record, zeros) == pytest.approx(2.3, abs=1e-6)
+    assert tth_at_beam(rough_arm_record(**rough), zeros) == pytest.approx(0, abs=1e-7)
+
+
 def test_an_energy_refined_calibration_seeds_frames_at_the_recorded_energy():
     """CAL-2: frames are calibrated at the energy the scan recorded, so a seed from an energy-refined
     calibration uses its recorded energy (source_energy_eV) when the frame has none of its own."""

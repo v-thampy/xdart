@@ -162,7 +162,7 @@ def detector_shape(detector) -> tuple[int, int] | None:
 
 
 def rough_arm_record(*, distance_m, detector, beam_px, zeros_deg=None, del_motor='del', nu_motor='nu',
-                     wavelength_m=1e-10, orientation=3, mount_deg=(0., 0.)) -> dict:
+                     wavelength_m=1e-10, orientation=3, mount_deg=(0., 0.), beam_readings=None) -> dict:
     """A nominal stacked (del-on-nu) arm from a rough distance, for a new setup.
 
     ``zeros_deg`` gives each moving circle's motor-zero reading ('del', 'nu'; physical angle =
@@ -181,6 +181,10 @@ def rough_arm_record(*, distance_m, detector, beam_px, zeros_deg=None, del_motor
     arm has none), zero for a detector facing the beam squarely at every angle. With a tilted
     mount the beam still hits ``beam_px`` at the zero pose, and ``distance_m`` is the distance
     along the direct beam there (pyFAI's direct distance), not the PONI's.
+    ``beam_readings`` ({motor: reading}) is the pose the beam was seen at ``beam_px`` when it is
+    not the zero pose: a direct-beam scan turns one circle and holds the other where it read (17-2's
+    scan 3 holds del at 0, its zero 2.3°), so the PONI moves to put the beam on ``beam_px`` there
+    (maintainer, 2026-09-29: a refinement started from that geometry "looks totally off").
     """
     from pyFAI.detectors import detector_factory
     from xrd_tools.core.containers import PONI
@@ -218,6 +222,15 @@ def rough_arm_record(*, distance_m, detector, beam_px, zeros_deg=None, del_motor
         (hit1, hit2), _ = _direct_beam_hit(record, **pose)
         at1, at2, _ = pixels.calc_cartesian_positions(d1=np.array([hit1]), d2=np.array([hit2]))
         poni.poni1 += float(poni1[0] - at1[0])  # moving the PONI translates the pattern in the plane
+        poni.poni2 += float(poni2[0] - at2[0])
+        record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
+    if beam_readings:  # the beam was seen off the zero pose: put it on its pixel there
+        pose = dict(del_motor=del_motor, nu_motor=nu_motor,
+                    readings={**{moving[circle]: zero for circle, zero in zeros.items()},
+                              **{str(motor): float(value) for motor, value in beam_readings.items()}})
+        (hit1, hit2), _ = _direct_beam_hit(record, **pose)
+        at1, at2, _ = pixels.calc_cartesian_positions(d1=np.array([hit1]), d2=np.array([hit2]))
+        poni.poni1 += float(poni1[0] - at1[0])
         poni.poni2 += float(poni2[0] - at2[0])
         record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
     return record

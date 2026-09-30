@@ -169,11 +169,12 @@ def _dispatch_job(request, cancelled, publish):
         from xrd_tools.sources import open_source
         from xrd_tools.integrate.direct_beam import calibrate_direct_beam, open_direct_beam_scan
         from xrd_tools.core.geometry import ImageOrientation
-        spec, motor, options = arguments
+        spec, motor, options, held = arguments
         options = dict(options)
         if cancelled.is_set():
             raise OperationCancelled('direct-beam calibration cancelled')
         energy = None  # the scan's one recorded energy (SPEC image series), for the wavelength
+        held_readings = {}  # the other moving circle as the scan held it: the beam was seen there
         with ExitStack() as resources:
             source_options = dict(motor=motor, entry=spec.entry or 'entry')
             if spec.kind is SourceKind.SPEC:
@@ -184,9 +185,16 @@ def _dispatch_job(request, cancelled, publish):
                 else:
                     # Preserve the shared strict series discovery and exact
                     # path/frame references; the loader owns SPEC angle pairing.
-                    choices = source_frame_choices(spec, (motor,))
+                    try:
+                        choices = source_frame_choices(spec, (motor, *held))
+                    except ValueError:  # the scan does not record the held circle: taken at its zero
+                        choices = source_frame_choices(spec, (motor,))
                     energies = {value for _index, _motors, value in choices if value is not None}
                     energy = energies.pop() if len(energies) == 1 else None
+                    for name in held:
+                        values = {values[name] for _index, values, _energy in choices if name in values}
+                        if len(values) == 1:
+                            held_readings[name] = values.pop()
                     source = open_source(replace(spec, options={**spec.options,
                                                               'require_complete_images': True}))
                     if getattr(source, 'close', None) is not None:
@@ -205,7 +213,7 @@ def _dispatch_job(request, cancelled, publish):
                 frame_ids=inputs.frame_ids, point_ids=inputs.point_ids, **options)
             if cancelled.is_set():
                 raise OperationCancelled('direct-beam calibration cancelled')
-            return result, energy
+            return result, energy, held_readings
     raise ValueError('unknown calibration operation')
 
 
@@ -354,6 +362,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._close_pending = False
         self._distance_result = None
         self._distance_energy_eV = None  # the fitted direct-beam scan's recorded energy
+        self._distance_held = {}  # its other moving circle's recorded reading
         self._direct_beam_fit_window = None
         self._distance_key = self._distance_pending_key = None  # what the result was fitted from
         #: The arm the staged frames read: (del, nu), or (2θ, None) for fourc/twoc.
@@ -1073,12 +1082,16 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         if len(mount) != 2:
             raise ValueError('type the mount tilt and roll as two numbers, e.g. 0, 0')
         wavelength = self._rough_wavelength_A()
+        # a fitted scan saw the beam with its own circle at its zero and the other held where the scan
+        # read it (17-2's scan 3: del at 0, its zero 2.3°); a typed pixel is at both zeros
+        readings = dict(self._distance_held) if mode == 'scan' else None
         return rough_arm_record(
             distance_m=distance, detector=self._text('beam_detector'),
-            beam_px=beam, zeros_deg=self._zeros(),  # both moving circles at their zeros
+            beam_px=beam, zeros_deg=self._zeros(),
             del_motor=delta, nu_motor=nu,
             orientation=int(self._text('beam_orientation')), mount_deg=mount,
-            wavelength_m=wavelength * 1e-10 if wavelength is not None else 1e-10)
+            wavelength_m=wavelength * 1e-10 if wavelength is not None else 1e-10,
+            beam_readings=readings or None)
 
     def _rough_wavelength_A(self):
         """The typed wavelength (Å), else the calibrant scan's when every frame read records the same
@@ -1623,7 +1636,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         if self._rough_wavelength_A() is None:
             raise ValueError('type the wavelength to save this geometry as a calibration')
         delta, nu = self.geometry_editor.value().stitch_arm()  # as _rough_arm
-        direct = (self._distance_record(self._distance_result)
+        direct = ({**self._distance_record(self._distance_result),
+                   'held_motor_readings': dict(self._distance_held)}  # the pose the beam was seen at
                   if self.rough_mode.currentData() == 'scan' and self._distance_result is not None else None)
         provenance = {
             'frames': [], 'rms_q_A^-1': None, 'condition_number': None, 'n_points': 0,
@@ -1722,17 +1736,19 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             options['mask'] = self._oriented_mask() if with_mask else self._mask_state()
         if self._text('saturation'):
             options['saturation'] = float(self._text('saturation'))
-        motor = dict(zip(('del', 'nu'), self.geometry_editor.value().stitch_arm())).get(self._beam_role())
-        return self._spec(beam=True), motor or self._text('beam_motor'), options
+        arm = dict(zip(('del', 'nu'), self.geometry_editor.value().stitch_arm()))
+        motor = arm.get(self._beam_role())
+        held = tuple(name for circle, name in arm.items() if name and circle != self._beam_role())
+        return self._spec(beam=True), motor or self._text('beam_motor'), options, held
 
     def _direct_beam_key(self):
         """What a direct-beam result was fitted from (source, motor, zero, detector, extraction), or
         None when the window cannot say: a result is used only while this is unchanged (Codex review F5)."""
         try:
-            spec, motor, options = self._direct_beam_request(with_mask=False)
+            spec, motor, options, held = self._direct_beam_request(with_mask=False)
         except (ValueError, TypeError, KeyError, OSError):
             return None
-        return json.dumps([str(spec.uri), spec.kind.value, spec.entry, dict(spec.options), motor, options],
+        return json.dumps([str(spec.uri), spec.kind.value, spec.entry, dict(spec.options), motor, options, held],
                           sort_keys=True, default=str)
 
     def _distance_fresh(self):
@@ -1753,7 +1769,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             return
         if self._direct_beam_fit_window is None:
             self._direct_beam_fit_window = DirectBeamFitWindow(self)
-        self._direct_beam_fit_window.show_result(self._distance_result, self._distance_energy_eV)
+        self._direct_beam_fit_window.show_result(self._distance_result, self._distance_energy_eV,
+                                                 self._distance_held)
         self._direct_beam_fit_window.show()
         self._direct_beam_fit_window.raise_()
         self.show_fit_button.setEnabled(True)
@@ -1942,7 +1959,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     remember_browse_path(Path(result.pyfai_path))
                     self.fit_summary.appendPlainText('\n' + saved_pair_text(result))
                 elif kind == 'distance':
-                    result, self._distance_energy_eV = result
+                    result, self._distance_energy_eV, self._distance_held = result
                     self._distance_result, self._distance_key = result, self._distance_pending_key
                     rows = [f'Distance: {result.distance_mm:.6g} mm; regression SE: {result.distance_std_m * 1000:.3g} mm',
                             f'Beam pixel at the zero: {result.zero_beam_pixel[0]:.2f}, {result.zero_beam_pixel[1]:.2f} '
@@ -1963,7 +1980,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     self.status.setText(saved_pair_text(result))
                     self.calibrationSaved.emit(result.pyfai_path, 'multigeometry')  # once, with both files written
                 elif kind == 'distance':
-                    self.status.setText(direct_beam_fit_text(self._distance_result, self._distance_energy_eV))
+                    self.status.setText(direct_beam_fit_text(self._distance_result, self._distance_energy_eV,
+                                                             self._distance_held))
                 else:
                     self.status.setText('No PONI was saved; the frame remains unchanged.' if kind == 'calibrate' and result is None else f'{kind.capitalize()} complete.')
             except Exception as error:
