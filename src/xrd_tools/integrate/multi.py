@@ -506,8 +506,9 @@ def _parallel_frames(count, read, compute, merge, workers):
     ``read``s them and ``merge``s their sums in frame order, as Int's reduction delivers its frames: one
     reader, per-frame workers, an in-order drain. At most two frames a worker are read and not yet
     merged. A failure (a frame's, a read's, a cancellation) cancels the frames not started, waits for
-    the running ones and is raised; frames merge in order, so it is the first failing frame's error,
-    as with one worker."""
+    the running ones and is raised. Frames merge in order, so of two failing frames the earlier one's
+    error is raised; a read failure (or a cancellation) during read-ahead may come before an earlier
+    frame's own failure (Codex terminal review): either way the run ends with nothing merged after it."""
     from collections import deque
     from concurrent.futures import ThreadPoolExecutor
 

@@ -81,6 +81,8 @@ _GI_MAP_AXES = ("Qip-Qoop", "Q-χ")
 _LEGACY_AXES = {"Qip (Å⁻¹)": "Qip", "Qoop (Å⁻¹)": "Qoop"}
 #: Cores on the xrayutilities backend, whose runtime stitches on one thread a process
 _XU_ONE_CORE = "xrayutilities stitches on one core"
+#: Cores on the pyFAI backend: each worker holds its frame's geometry (Codex terminal review)
+_PYFAI_CORES = "Frames pyFAI integrates at once; each needs its frame's geometry in memory, so fewer use less"
 #: The Processing fields, in their rows' order: (group, key, path, default). Int's paths take Int's
 #: labels, rules and rows (``project_control_fields``, ``ControlsPanel.render_processing_rows``); Stitch's
 #: own are its GI ranges and Monitor.
@@ -2545,7 +2547,7 @@ class StitchPage(QtWidgets.QWidget):
         xu = self._value("backend") == "xrayutilities histogram"
         for widget in (self.run_bar.coresSpin, self.run_bar.coresLabel):
             widget.setEnabled(idle and not xu)
-            widget.setToolTip(_XU_ONE_CORE if xu else "")
+            widget.setToolTip(_XU_ONE_CORE if xu else _PYFAI_CORES)
         for dialog in self._authoring_dialogs:
             dialog.setEnabled(not busy and not self._closing and (not authoring or dialog.active()))
         if not any(dialog.isVisible() or dialog.active() for dialog in self._authoring_dialogs):

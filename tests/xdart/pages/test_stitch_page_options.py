@@ -629,7 +629,7 @@ def test_cores_are_the_frames_pyfai_integrates_at_once(qapp, tmp_path, monkeypat
     try:
         page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
         spin = page.run_bar.coresSpin
-        assert not spin.isHidden() and spin.isEnabled() and spin.toolTip() == ""
+        assert not spin.isHidden() and spin.isEnabled() and "fewer use less" in spin.toolTip()
         spin.setValue(3)
         page.begin_run()
         assert page._owner.busy and not spin.isEnabled()  # held, as the mode
