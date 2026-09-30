@@ -60,6 +60,21 @@ def read_spec_scan_motor_names(
     return tuple(str(name) for name in spec[key].motor_names)
 
 
+def read_spec_scan_counter_names(
+    spec_file: Path | str, scan_num: str | None = None
+) -> tuple[str, ...]:
+    """One scan's ``#L`` columns that are not its ``#O`` motors (its counters, the beam monitors among
+    them), from its header alone; ``scan_num`` None: the file's first scan. KeyError when there is no
+    such scan."""
+    spec = SpecFile(str(spec_file))
+    keys = spec.keys()
+    if scan_num is None and not len(keys):
+        raise KeyError("the SPEC file has no scans")
+    scan = spec[keys[0] if scan_num is None else scan_num]
+    motors = {str(name) for name in scan.motor_names}
+    return tuple(str(label) for label in scan.labels if str(label) not in motors)
+
+
 def count_spec_scan_points(
     spec_file: Path | str, scans: tuple[str, ...] | None = None
 ) -> dict[str, int | None]:

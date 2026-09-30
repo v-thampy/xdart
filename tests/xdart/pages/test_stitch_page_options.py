@@ -2,6 +2,8 @@
 reach the prepared plan through the page, and XU keeps only the frame check."""
 from dataclasses import replace
 import hashlib
+from pathlib import Path
+import re
 
 import numpy as np
 import pytest
@@ -642,6 +644,40 @@ def test_cores_are_the_frames_stitched_at_once(qapp, tmp_path, monkeypatch):
         assert spin.value() == 3
         page.set_field("backend", "xrayutilities histogram")
         assert spin.isEnabled() and "fewer use less" in spin.toolTip()
+    finally:
+        _close(page, qapp)
+
+
+def test_threshold_auto_shows_the_saturation_and_monitor_lists_the_scans_counters(qapp, tmp_path):
+    """Maintainer, 2026-09-30: "the threshold Auto doesn't show the saturation value" (Int shows it at once), and
+    "the Monitor should be a dropdown widget with all the metadata columns that could be beam monitors of any kind
+    listed (i0, i1, mon, monitor, bs, beamstop, pd, photod, etc). if in doubt, list it. if it clearly not a monitor
+    (like a motor name), it can be dropped"."""
+    from xdart.gui.tabs.stitch.page import monitor_choices
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    assert monitor_choices(("Two Theta", "H", "K", "L", "Epoch", "Seconds", "Seconds", "mon", "det", "I0",
+                            "pd1", "bstop", "Beamstop", "ic1", "temp")) == (
+        "None", "mon", "I0", "pd1", "bstop", "Beamstop", "ic1", "Two Theta", "Seconds", "det", "temp")
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    spec = Path(form.spec_path)
+    text = spec.read_text()
+    counters = "#L del  nu  Epoch  H  i0  Photod  Seconds"  # the native form's scans record del and nu
+    spec.write_text(re.sub(r"^#L del  nu$", counters, text, count=1, flags=re.M))
+    assert counters in spec.read_text()
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(form)
+        # the calibration's detector (Pilatus100k): its documented counter limit, before any Preview
+        assert page._fields["threshold"].placeholder == "Auto · 1048575 (saturation)"
+        combo = page._rows["monitor"]
+        assert page._fields["monitor"].choices == ("None", "i0", "Photod", "Seconds")  # motors, Epoch, H dropped
+        assert combo.current_value() == "None" and page.build_form().monitor_selector is None
+        page.set_field("monitor", "i0")
+        assert page.build_form().monitor_selector.name == "i0"
+        page.set_field("monitor", "ion_chamber")  # restored from settings, not in this scan: kept a choice
+        assert page._fields["monitor"].choices[-1] == "ion_chamber" and combo.current_value() == "ion_chamber"
+        page.set_field("monitor", "")  # older settings' blank: none
+        assert combo.current_value() == "None" and page.build_form().monitor_selector is None
     finally:
         _close(page, qapp)
 

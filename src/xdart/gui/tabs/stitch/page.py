@@ -109,7 +109,7 @@ _PROCESSING = (
     ("Conditioning", "threshold_enabled", THRESHOLD_ENABLED, True),
     ("Conditioning", "threshold_min", THRESHOLD_MIN, 0.0),
     ("Conditioning", "threshold", THRESHOLD_MAX, None),
-    ("Conditioning", "monitor", ("Stitch", "monitor"), ""),
+    ("Conditioning", "monitor", ("Stitch", "monitor"), "None"),
 )
 #: A GI range's label: (the rows' label, what it bins and windows).
 _GI_RANGES = {"gi_ip": ("Qip (Å⁻¹)", "Bins I(Qip) (Auto: the data's span) and is I(Qoop)'s window (Auto: every "
@@ -152,6 +152,51 @@ def _goniometer_record(path):
         return None
 
 
+def _calibration_detector(path):
+    """The calibration's detector (pyFAI's name), for decision 39's documented counter limit: a pyFAI
+    goniometer JSON's, else an xrayutilities calibration's; None when unknown (read through the
+    stat-keyed cache the readiness line uses)."""
+    record = _goniometer_record(path)
+    if record is None:
+        record = _xu_calibration_record(path)
+        detector = record.get("detector") if record is not None else None
+        name = detector.get("detector_factory_name") if isinstance(detector, dict) else None
+    else:
+        name = record.get("detector")
+    return name if isinstance(name, str) and name.strip() else None
+
+
+def _xu_calibration_record(path):
+    try:
+        file = Path(str(path or "").strip())
+        state = file.stat()
+        if file.suffix.lower() != ".json" or state.st_size > 1 << 20:
+            return None
+        return _read_json(str(file), state.st_mtime_ns, state.st_size)
+    except OSError:
+        return None
+
+
+@functools.lru_cache(maxsize=4)
+def _read_json(path, _mtime_ns, _size):
+    try:
+        record = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+@functools.lru_cache(maxsize=8)
+def _container_ceiling(path, _state):
+    """A NeXus container's (recorded saturation, data type), from its header alone; None unread."""
+    from xrd_tools.io.image import read_detector_image_layout
+    try:
+        layout = read_detector_image_layout(path)
+    except Exception:  # noqa: BLE001 - an unreadable container shows no hint
+        return None
+    return layout.saturation, layout.dtype
+
+
 @functools.lru_cache(maxsize=4)
 def _read_goniometer(path, _mtime_ns, _size):  # the readiness line asks on every edit
     try:
@@ -185,6 +230,31 @@ def _spec_motor_names(path, _state, scan):
     from xrd_tools.io.spec import read_spec_scan_motor_names
     try:
         return read_spec_scan_motor_names(path, scan)
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+
+
+#: Monitor lists every counter a scan records but what is clearly no monitor (maintainer, 2026-09-30:
+#: "all the metadata columns that could be beam monitors of any kind listed (i0, i1, mon, monitor, bs,
+#: beamstop, pd, photod, etc). if in doubt, list it"): the likely monitors first, in the file's order.
+_LIKELY_MONITOR = re.compile(r"^(i\d|io$|ic\d*$|ion|mon|bs|beam.?stop|pd|photo|diode|flux|norm)", re.IGNORECASE)
+_NOT_MONITORS = frozenset({"epoch", "h", "k", "l"})
+
+
+def monitor_choices(counters):
+    """"None" (no monitor), then ``counters`` without the clearly-not-monitors, likely monitors first."""
+    kept = list(dict.fromkeys(  # a file may name a column twice
+        name for name in counters if name.strip() and name.strip().lower() not in _NOT_MONITORS))
+    likely = [name for name in kept if _LIKELY_MONITOR.match(name.strip())]
+    return ("None", *likely, *(name for name in kept if name not in likely))
+
+
+@functools.lru_cache(maxsize=8)
+def _spec_counter_names(path, _state, scan):
+    """A SPEC scan's counters (``#L`` columns but its motors) from its header alone, or None unread."""
+    from xrd_tools.io.spec import read_spec_scan_counter_names
+    try:
+        return read_spec_scan_counter_names(path, scan)
     except (OSError, ValueError, KeyError, IndexError):
         return None
 
@@ -619,6 +689,7 @@ class StitchPage(QtWidgets.QWidget):
         self.mask_button.setToolTip("Draw a detector mask on one of the scan's frames.")
         self.controls.controlActionRequested.connect(self._control_action)
         self._rows["geometry_path"].valueChanged.connect(self._refresh_xu_geometry)
+        self._rows["geometry_path"].valueChanged.connect(self._show_early_ceiling)
         # Grazing incidence as Int sets it, in the Experiment section (maintainer, 2026-09-29):
         # Int's own rows, rebuilt from this page's values (_render_gi).
         # tilt_motor None: the default (chi, gonchi, else Manual) once the scan's motors are known
@@ -678,7 +749,8 @@ class StitchPage(QtWidgets.QWidget):
         self._axis_q = self._map_q = True  # each radial range's unit: Q (every axis but 2θ, 2θ-χ)
         self._gi_axis = "Q"  # the Grazing axis last chosen: the one a loaded GI form opens on
         for _group, key, path, value in _PROCESSING:
-            self._fields[key] = self._new_field(SectionId.PROCESSING, key, key, value, path=path)
+            self._fields[key] = self._new_field(SectionId.PROCESSING, key, key, value, path=path,
+                                                choices=("None",) if key == "monitor" else ())
             if path[-1].endswith(("_auto", "_low", "_high")) or path[0] == "Mask":
                 self._range_keys.add(key)
         fields = self._processing_fields()
@@ -829,13 +901,33 @@ class StitchPage(QtWidgets.QWidget):
     def _gi_catalog_now(self):
         """The real motors of the first selected SPEC scan (Int's incidence choices), or None when
         the source does not say (another source kind, or an unreadable file)."""
+        first = self._first_spec_scan()
+        return None if first is None else _spec_motor_names(first[0], _file_states(first[0]), first[1])
+
+    def _first_spec_scan(self):
+        """(the first SPEC file, the first selected scan's N.M key, None: the file's first), or None
+        for another source kind."""
         if self._value("source_kind") != "Spec" or not self._source_paths:
             return None
-        path = self._source_paths[0]
         first = re.search(r"\d+(?:\.\d+)?", str(self._value("scan") or ""))
-        scan = (None if self._value("scan_mode") == "Stitch All" or first is None
-                else first[0] if "." in first[0] else f"{first[0]}.1")  # SPEC's N.M key
-        return _spec_motor_names(path, _file_states(path), scan)
+        return self._source_paths[0], (None if self._value("scan_mode") == "Stitch All" or first is None
+                                       else first[0] if "." in first[0] else f"{first[0]}.1")  # SPEC's N.M key
+
+    def _monitor_choices(self, keep):
+        """Monitor's choices: the first selected SPEC scan's counters (``monitor_choices``), and ``keep``
+        (the value chosen or restored) whatever that scan records."""
+        first = self._first_spec_scan()
+        counters = (None if first is None else _spec_counter_names(first[0], _file_states(first[0]), first[1]))
+        choices = monitor_choices(counters or ())
+        keep = str(keep or "").strip() or "None"
+        return choices if keep in choices else (*choices, keep)
+
+    def _refresh_monitor_choices(self):
+        """On a committed source or scan edit (Codex audit G-F2): the new scan's counters."""
+        field = replace(self._fields["monitor"], value=self._value("monitor"),
+                        choices=self._monitor_choices(self._value("monitor")))
+        self._fields["monitor"] = field
+        self._rows["monitor"].apply_field(field)
 
     def _gi_sample_motors(self):
         """The Geometry's other sample circles (mu, phi) by its motor names: both backends read them
@@ -1021,7 +1113,8 @@ class StitchPage(QtWidgets.QWidget):
             if path in projected:
                 fields[key] = projected[path]
             elif key == "monitor":
-                fields[key] = replace(self._fields[key], label="Monitor", value=current(key))
+                fields[key] = replace(self._fields[key], label="Monitor", value=current(key),
+                                      choices=self._monitor_choices(current(key)))
             else:  # a GI range's bound or Auto, with Int's range rule
                 prefix, part = key.rsplit("_", 1)
                 label, auto = _GI_RANGES[prefix][0], bool(self._fields[f"{prefix}_auto"].value)
@@ -1178,6 +1271,9 @@ class StitchPage(QtWidgets.QWidget):
         if key == "unit":
             value = _LEGACY_AXES.get(value, value)
         field = replace(self._fields[key], value=value)
+        if key == "monitor":  # "" in older settings: none; any other name stays a choice
+            value = str(value or "").strip() or "None"
+            field = replace(field, value=value, choices=self._monitor_choices(value))
         self._fields[key] = field
         self._rows[key].apply_field(field)
         self._edited()
@@ -1195,6 +1291,8 @@ class StitchPage(QtWidgets.QWidget):
             self.set_field("output_path", str(Path(value) / "xdart_processed_data"))
         if key in {"geometry_path", "project_root"}:
             self._refresh_xu_geometry()
+        if key == "geometry_path":
+            self._show_early_ceiling()
         if key in {"geometry_path", "geometry_kind"}:
             self._sync_goniometer_mapping()
 
@@ -1221,6 +1319,25 @@ class StitchPage(QtWidgets.QWidget):
             self._refresh_inputs_view()
             self._status(self._readiness[0], ready=self._readiness[1])
         self._refresh_gi_catalog()
+        self._refresh_monitor_choices()
+        self._show_early_ceiling()
+
+    def _show_early_ceiling(self, *_args):
+        """Threshold Auto's ceiling as soon as the selection is committed, as Int shows it (maintainer,
+        2026-09-30: "the threshold Auto doesn't show the saturation value"): what the selection gives
+        without reading its images (Codex audit G-F2), a NeXus container's recorded value and data type,
+        else the calibration detector's documented counter limit. Preview's per-scan value replaces it."""
+        from xrd_tools.core.invalid import resolve_detector_saturation
+        recorded = dtype = None
+        if self._value("source_kind") == "NeXus" and self._source_paths:
+            first = self._source_paths[0]
+            read = _container_ceiling(first, _file_states(first))
+            if read is not None:
+                recorded, dtype = read
+        ceiling = resolve_detector_saturation(
+            recorded=recorded, detector=_calibration_detector(self._value("geometry_path")), dtype=dtype)
+        self._show_auto_ceiling(() if ceiling is None else (
+            (ceiling.value, "data type" if ceiling.source == "dtype" else "saturation"),))
 
     def _selection_key(self):
         return (self._value("source_kind"), self._source_paths, self._value("scan_mode"), str(self._value("scan")))
@@ -1634,6 +1751,7 @@ class StitchPage(QtWidgets.QWidget):
         kind = (StitchGeometryKind.PYFAI_GONIOMETER_JSON if value("geometry_kind") == "Goniometer JSON"
                 else StitchGeometryKind.PONI)
         monitor = str(value("monitor")).strip()
+        monitor = "" if monitor == "None" else monitor
         directory = value("source_kind") == "Directory"
         selection = StitchSourceSelection(value("source_kind"), self._source_paths,
             scans=str(value("scan")), stitch_all=value("scan_mode") == "Stitch All",
