@@ -254,14 +254,14 @@ def test_clearing_the_source_box_clears_the_selection_and_refuses_run(qapp, tmp_
         assert page._source_paths == () and "Spec" not in page.settings()["sources"]
         assert page._prepared_revision is None and not page._queued_jobs
         assert not page.run_bar.startButton.isEnabled()
-        assert page.run_bar.readinessLabel.full_text() == "Choose sources and scans"
+        assert page.run_bar.readinessLabel.full_text() == "Needs SPEC files"
         assert all(not widget.toolTip() for widget in (row, row.editor, row.label))
         page.preview_button.click()  # nothing is checked without a source
         assert "source path" in page.run_bar.readinessLabel.full_text() and not page._owner.busy
         # a typed path is the selection, and the readiness line follows it at once
         _commit_source_box(page, qapp, spec[0], key="Return")
         assert page._source_paths == spec and page.settings()["sources"]["Spec"] == list(spec)
-        assert page.run_bar.readinessLabel.full_text().startswith("Ready · Stitch 1D · 1 SPEC file")
+        assert page.run_bar.readinessLabel.full_text() == "Ready · Stitch 1D · sample, scan 1 · pyFAI MultiGeometry"
         assert page.run_bar.startButton.isEnabled() and row.toolTip() == spec[0]
         for kind, paths in (("NeXus", (str(tmp_path / "one.nxs"), str(tmp_path / "two.nxs"))),
                             ("Directory", (str(tmp_path),))):

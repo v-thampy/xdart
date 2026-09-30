@@ -1040,8 +1040,11 @@ class StitchPage(QtWidgets.QWidget):
         if kind == "Spec":
             text = f"{len(sources)} SPEC file{'s' * (len(sources) != 1)} · " + (
                 "all scans" if groups is None else f"{groups} output{'s' * (groups != 1)}")
+        elif kind == "Directory":
+            text = (f"{sources[0].name} + subfolders" if value("subdirs") else sources[0].name) if sources else ""
+            text += " · filtered" if sources and str(value("name_filter")).strip() else ""
         else:
-            text = f"{len(sources)} {kind} source{'s' * (len(sources) != 1)}"
+            text = f"{len(sources)} {'NeXus file' if kind == 'NeXus' else f'{kind} source'}{'s' * (len(sources) != 1)}"
         source_ready = present and groups != 0
         self.controls.source_card.set_status_text(text if sources else "")
         try:
@@ -1049,16 +1052,63 @@ class StitchPage(QtWidgets.QWidget):
         except ValueError:
             processing_ready = False
         self.controls.processing_card.set_status_text("stitch 1d · " + ("xrayutilities" if xu else "multigeometry"))
-        checks = ((self.controls.project_card, project_ready, "Choose an existing Project folder"),
-                  (self.controls.experiment_card, experiment_ready,
-                   arm_problem or "Choose an existing calibration (and mask)"),
-                  (self.controls.source_card, source_ready, "Choose sources and scans"),
-                  (self.controls.processing_card, processing_ready, "Enter the number of points"))
-        for card, ready, reason in checks:
-            card.set_valid_marker(ready, "" if ready else reason)
+        # What each input still needs, in a few words, as Int's "Needs …" (maintainer, 2026-09-30:
+        # "slightly more descriptive (but brief) messages")
+        needs = {}
+        if not project_ready:
+            needs["project"] = "an existing Project folder" if str(value("project_root")).strip() else "a Project folder"
+        if not experiment_ready and not arm_problem:
+            needs["experiment"] = ("a calibration" if not calibration else
+                                   f"the calibration {Path(calibration).name} (not found)"
+                                   if not Path(calibration).is_file() else f"the mask {Path(mask).name} (not found)")
+        if not source_ready:
+            gone = [path.name for path in sources if not path.exists()]
+            needs["source"] = ({"Spec": "SPEC files", "NeXus": "NeXus files", "Directory": "a source folder"}
+                               .get(kind, "a source") if not sources else f"{gone[0]} (not found)" if gone
+                               else "a scan selection such as 1,2,[3-5]")
+        if not processing_ready:
+            needs["processing"] = "Pts above 0"
+        checks = ((self.controls.project_card, "project"), (self.controls.experiment_card, "experiment"),
+                  (self.controls.source_card, "source"), (self.controls.processing_card, "processing"))
+        for card, key in checks:
+            problem = arm_problem if key == "experiment" and arm_problem else (
+                f"Needs {needs[key]}" if key in needs else "")
+            card.set_valid_marker(not problem, problem)
         # As Int's readiness line; Run then checks the inputs in full (Preview's preflight).
-        missing = [reason for _card, ready, reason in checks if not ready]
-        self._readiness = (missing[0], False) if missing else (f"Ready · Stitch 1D · {text}", True)
+        if arm_problem:  # the calibration's arm and the Geometry disagree: a sentence of its own
+            self._readiness = (arm_problem, False)
+        elif needs:
+            self._readiness = ("Needs " + ", ".join(needs.values()), False)
+        else:
+            self._readiness = (f"Ready · Stitch 1D · {self._ready_text(kind, sources, scans, groups)}", True)
+
+    def _ready_text(self, kind, sources, scans, groups):
+        """What a Run stitches, briefly: the SPEC file and scans (or the folder and its options, or the
+        NeXus files), the backend, and grazing incidence when it is on."""
+        value = self._value
+        if kind == "Spec":
+            label = sources[0].name if len(sources) == 1 else f"{len(sources)} SPEC files"
+            shown = scans.strip()
+            if groups is None:
+                text = f"{label}, all scans"
+            elif len(shown) <= 24:
+                text = f"{label}, scan{'s' * any(mark in shown for mark in ',-[')} {shown}"
+            else:
+                text = f"{label}, {groups} scan groups"
+            outputs = (groups or 0) * len(sources)
+            text += f" → {outputs} outputs" if outputs > 1 else ""
+        elif kind == "Directory":
+            text = f"every scan in {sources[0].name}" + (" and its subfolders" if value("subdirs") else "")
+            name_filter = str(value("name_filter")).strip()
+            text += f" matching “{name_filter}”" if name_filter else ""
+        elif kind == "NeXus":
+            text = (sources[0].name if len(sources) == 1 else f"{len(sources)} NeXus files") + " → 1 output"
+        else:  # a kind a settings file names that this version lacks (it is refused before a Run)
+            text = f"{len(sources)} {kind} source{'s' * (len(sources) != 1)}"
+        text += " · " + ("xrayutilities" if value("backend") == "xrayutilities histogram" else "pyFAI MultiGeometry")
+        if self._gi["enabled"] and value("unit") in _GI_AXES:
+            text += f" · grazing {str(value('unit')).split(' ')[0]}"
+        return text
 
     def _backend_changed(self, *_args):
         xu = self._value("backend") == "xrayutilities histogram"

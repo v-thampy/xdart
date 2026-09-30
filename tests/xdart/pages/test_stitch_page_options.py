@@ -484,7 +484,8 @@ def test_inputs_view_follows_int(qapp, tmp_path):
     page = StitchPage(empty_host_services(_Status()))
     try:
         # Int's readiness line gates Run; Run then checks the inputs in full itself
-        assert page.run_bar.readinessLabel.full_text() == "Choose an existing Project folder"
+        # what each input needs, in a few words, as Int's line (maintainer, 2026-09-30)
+        assert page.run_bar.readinessLabel.full_text() == "Needs a Project folder, a calibration, SPEC files"
         assert not page.run_bar.startButton.isEnabled()
         low, high = page.threshold_range._low, page.threshold_range._high
         page._range_edited(("Stitch", "threshold_enabled"), False)  # Threshold off: limits greyed
@@ -548,7 +549,8 @@ def test_inputs_view_follows_int(qapp, tmp_path):
         for card in (cards.project_card, cards.experiment_card, cards.source_card, cards.processing_card):
             assert not card.valid_marker.isHidden(), card.title.text()
         assert cards.source_card.status.text() == "1 SPEC file · 1 output"
-        assert page.run_bar.readinessLabel.full_text() == "Ready · Stitch 1D · 1 SPEC file · 1 output"
+        assert (page.run_bar.readinessLabel.full_text()
+                == "Ready · Stitch 1D · LaB6_17keV, scans [14,15] · pyFAI MultiGeometry")
         assert page.run_bar.startButton.isEnabled()
     finally:
         _close(page, qapp)
