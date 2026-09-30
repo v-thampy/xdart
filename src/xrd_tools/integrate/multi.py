@@ -651,10 +651,10 @@ def _stitch_1d_payload(result, unit: str) -> tuple[IntegrationResult1D, StitchDi
 
 
 #: pyFAI's 2-D pixel splitting can leave a bin a slightly negative coverage and weight, round-off of
-#: about a millionth of a pixel (LaB6 scan 14: 8 of 360,000 bins, coverage down to -8.5e-7 px and
-#: weight to -1.3e-13, where occupied bins hold 2.5 px and 4e-7 at their 1st percentile, 300 px and
-#: 4.7e-5 at most). A bin negative by no more than this fraction of the map's largest holds round-off
-#: only; a larger negative is still refused (``StitchDiagnostics``).
+#: about a millionth of a pixel (LaB6 scan 14, 287 frames merged: 2 of 360,000 bins, coverage down to
+#: -7.6e-7 px and weight to -1.3e-13, where the largest bins hold 1984 px and 3.0e-4). A bin negative
+#: by no more than this fraction of the map's largest holds round-off only; a larger negative is still
+#: refused (``StitchDiagnostics``).
 _SPLIT_ROUNDOFF = 1e-6
 
 

@@ -36,6 +36,8 @@ from .shell_values import (
     AxisProjection,
     FrameNavigationProjection,
     HeavyProjection,
+    ScientificProjection,
+    SlicePin,
     TraceProjection,
 )
 
@@ -506,6 +508,50 @@ def slice_recipe_axes_compatible(first: str, second: str) -> bool:
     return (
         first_key == second_key
         or {first_key, second_key} <= _CONVERTIBLE_RADIAL_AXIS_KEYS
+    )
+
+
+def slice_pins_for_plot_axis(
+    pins: tuple[SlicePin, ...],
+    prior_axis: str,
+    requested_axis: str,
+) -> tuple[SlicePin, ...]:
+    """Retarget compatible slice recipes and retire incompatible ones."""
+
+    if requested_axis == prior_axis:
+        return pins
+    if not slice_recipe_axes_compatible(prior_axis, requested_axis):
+        return ()
+    return tuple(
+        replace(pin, plot_axis=requested_axis)
+        for pin in pins
+    )
+
+
+def shown_slice_pin(state: ScientificProjection | None) -> SlicePin | None:
+    """The slice ``state`` shows, as a pin recipe on its current cake; None where there is none to
+    pin (not Overlay or Waterfall, no slice, no cake, or a plot axis the cake cannot cut). The host
+    page still decides whether it owns the frame."""
+
+    heavy = None if state is None else state.heavy
+    if (
+        state is None
+        or state.plot_mode not in {"Overlay", "Waterfall"}
+        or not state.slice_enabled
+        or heavy is None
+        or heavy.cake is None
+        or slice_region_orientation(
+            state.plot_axis,
+            heavy.cake_x,
+            heavy.cake_y,
+        ) is None
+    ):
+        return None
+    return SlicePin(
+        heavy.frame,
+        state.plot_axis,
+        float(state.slice_center),
+        float(state.slice_width),
     )
 
 

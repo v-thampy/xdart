@@ -2815,7 +2815,8 @@ class ScientificView(QtWidgets.QFrame):
             self._align_curve_under_cake()
 
     #: Top-bar tools a host page may leave out, by name.
-    _HOST_TOOLS = {"norm": "norm", "background": "background", "raw": "raw_popup_button"}
+    _HOST_TOOLS = {"norm": "norm", "background": "background", "raw": "raw_popup_button",
+                   "raw_pane": "raw"}
     _PLOT_MODES = ("Single", "Overlay", "Average", "Sum", "Waterfall")
 
     def set_plot_modes(self, *names: str) -> None:
@@ -2834,7 +2835,9 @@ class ScientificView(QtWidgets.QFrame):
 
     def set_hidden_tools(self, *names: str) -> None:
         """Leave out top-bar tools the host page has no operation for (Stitch: no
-        normalization channel, 1-D Background or raw popup). Int shows them all."""
+        normalization channel, 1-D Background or raw popup), and the raw detector pane
+        ('raw_pane': Stitch's map has no one detector image; Int 2D's layout keeps its cake).
+        Int shows them all."""
         unknown = set(names) - set(self._HOST_TOOLS)
         if unknown:
             raise ValueError(f"unknown scientific-view tools: {sorted(unknown)}")

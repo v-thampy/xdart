@@ -604,6 +604,42 @@ def test_the_stitch_display_is_ints_scientific_view(qapp):
         _close(page, qapp)
 
 
+def test_a_host_can_leave_out_the_raw_pane_of_int_2ds_layout(qapp):
+    """STITCH-2D-20260930 B1: Int 2D's layout without the raw detector pane (Stitch's map has no one
+    detector image), through every redraw; Int's own view keeps it."""
+    from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
+    from xdart.gui.tabs.scattering.events import RunIdentity
+    from xdart.gui.tabs.scattering.scientific_view import ScientificView
+    from xdart.gui.tabs.scattering.shell_values import (
+        AxisProjection, FrameNavigationProjection, HeavyProjection, ScientificProjection,
+    )
+
+    key = DisplayFrameKey(RunIdentity(1, "b1"), "map.nexus", "b1", 1, 1)
+    cake = np.arange(12.0).reshape(3, 4)
+    state = ScientificProjection(
+        heavy_available=frozenset({key}), processing_mode="Int 2D",
+        heavy=HeavyProjection(key, cake=cake, cake_x=AxisProjection(np.arange(4.0), "Q", "Å⁻¹"),
+                              cake_y=AxisProjection(np.arange(3.0), "χ", "°")))
+    navigation = FrameNavigationProjection(frames=(key,), current=key, selected=(key,))
+    views = ScientificView(), ScientificView()
+    try:
+        stitch, int_view = views
+        stitch.set_hidden_tools("raw_pane")
+        for view in views:
+            view.resize(900, 700)
+            view.show()
+        for _ in range(2):
+            for view in views:
+                view.reconcile(state, navigation, completed=1, total=1, detail="")
+            qapp.processEvents()
+            assert stitch.raw.isHidden() and stitch.cake.isVisible() and stitch.image_splitter.isVisible()
+            assert int_view.raw.isVisible() and int_view.cake.isVisible()
+    finally:
+        for view in views:
+            view.deleteLater()
+        qapp.processEvents()
+
+
 def test_backend_is_a_processing_choice_and_a_missing_partner_is_named(qapp, tmp_path):
     """Maintainer, 2026-09-29: one calibration serves both backends, so Backend sits under
     Processing; a pyFAI file with no xrayutilities partner says so for Backend xrayutilities."""

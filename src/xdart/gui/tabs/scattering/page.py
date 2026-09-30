@@ -173,8 +173,8 @@ from .scientific_axes import (
     native_1d_plot_axis,
     resolve_gi_display_axes,
     resolve_norm_presentation,
-    slice_recipe_axes_compatible,
-    slice_region_orientation,
+    shown_slice_pin,
+    slice_pins_for_plot_axis as _slice_pins_for_plot_axis,
 )
 from .scientific_plot_options import waterfall_should_be_active
 from .shell_values import (
@@ -185,7 +185,6 @@ from .shell_values import (
     ProgressProjection,
     ShellCommand,
     ShellCommandKind,
-    SlicePin,
 )
 from .shell_widgets import (
     experiment_header_projection,
@@ -330,23 +329,6 @@ def _drop_nexus_only_performance_options(intent: object) -> None:
         raise TypeError("run options must be one mutable mapping")
     for key in _NEXUS_ONLY_PERFORMANCE_KEYS:
         run_options.pop(key, None)
-
-
-def _slice_pins_for_plot_axis(
-    pins: tuple[SlicePin, ...],
-    prior_axis: str,
-    requested_axis: str,
-) -> tuple[SlicePin, ...]:
-    """Retarget compatible slice recipes and retire incompatible ones."""
-
-    if requested_axis == prior_axis:
-        return pins
-    if not slice_recipe_axes_compatible(prior_axis, requested_axis):
-        return ()
-    return tuple(
-        replace(pin, plot_axis=requested_axis)
-        for pin in pins
-    )
 
 
 def _linearized_frame_selection(navigation, command: ShellCommand):
@@ -7357,36 +7339,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         elif kind is ShellCommandKind.SET_SLICE_WIDTH:
             updates["slice_width"] = float(value)
         elif kind is ShellCommandKind.PIN_SLICE:
-            state = self._last_scientific_projection
+            pin = shown_slice_pin(self._last_scientific_projection)
             navigation = self._context_controller.navigation
-            heavy = None if state is None else state.heavy
             if (
-                state is None
-                or state.plot_mode not in {"Overlay", "Waterfall"}
-                or not state.slice_enabled
-                or heavy is None
-                or heavy.cake is None
-                or slice_region_orientation(
-                    state.plot_axis,
-                    heavy.cake_x,
-                    heavy.cake_y,
-                ) is None
-            ):
-                return False
-            frame = heavy.frame
-            if (
-                navigation.current is not frame
-                or not self._context_controller.owns_frame(frame)
+                pin is None
+                or navigation.current is not pin.frame
+                or not self._context_controller.owns_frame(pin.frame)
             ):
                 return False
             existing = self._preferences.slice_pins
             existing_ids = {pin.projection_id for pin in existing}
-            pin = SlicePin(
-                frame,
-                state.plot_axis,
-                float(state.slice_center),
-                float(state.slice_width),
-            )
             if pin.projection_id in existing_ids:
                 return False
             updates["slice_pins"] = (*existing, pin)
