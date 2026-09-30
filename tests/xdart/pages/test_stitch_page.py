@@ -727,6 +727,10 @@ def test_append_skips_the_outputs_already_stitched_and_replace_stitches_them_aga
         assert listed.startswith("2 stitched outputs · 2 already stitched with these settings (Append skips them)")
         assert listed.count(" · already stitched") == 2
         page.preview_dialog.close()
+        targets[0].unlink()  # removed after Preview: the Run that takes Preview's check stitches it again
+        page.run_bar.startButton.click()
+        _wait(page, qapp, timeout=60)
+        assert targets[0].is_file() and revisions()[1] == now[1], page.run_bar.readinessLabel.full_text()
         page.run_bar.writeModeButton.click()  # Replace: every output again
         assert page.run_bar.write_mode() == "Overwrite"
         assert page.run_bar.writeModeButton.toolTip().startswith("Replace: stitch every output again")

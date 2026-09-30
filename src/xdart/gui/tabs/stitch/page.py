@@ -1472,7 +1472,10 @@ class StitchPage(QtWidgets.QWidget):
             self._status("Nothing to stitch" + self._prepared_notes, ready=False)
             return
         self._prepared_revision = None  # a run uses its plan once: the next Run checks again
-        kept = prepared.unchanged if self.run_bar.write_mode() == "Append" else ()
+        # A Run right after Preview takes Preview's check: an output since removed is stitched again.
+        kept = tuple(index for index in prepared.unchanged
+                     if Path(prepared.requests[index].module.output.target).is_file()
+                     ) if self.run_bar.write_mode() == "Append" else ()
         self._queued_jobs = [index for index in range(count) if index not in kept]
         if not self._queued_jobs:
             self._status(f"Up to date · {count} {'output' if count == 1 else 'outputs'} already stitched "
