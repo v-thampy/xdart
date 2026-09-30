@@ -308,3 +308,36 @@ def test_an_edit_reads_no_scan_table_and_lists_no_image_folder(qapp, tmp_path, m
         assert page._rows["output_family"].editor.placeholderText() == "auto · as Int names the scan's images, with _gi"
     finally:
         _close(page, qapp)
+
+
+def test_a_geometry_edit_leaves_the_gi_card_and_a_rebuild_makes_no_window(qapp, tmp_path, monkeypatch):
+    """Maintainer, 2026-09-29: typing in the calibration window's Diffractometer panel, or Read metadata,
+    closed that window (macOS). Each geometry edit rebuilt the page's GI card: the old one deleted and a
+    new one created with no parent, a top-level window until laid out. The card shows nothing of the
+    geometry, so a geometry edit leaves it; a rebuild makes the card inside its host."""
+    from xdart.gui.widgets.controls_panel import SubsectionCard
+    parents = []
+    born = SubsectionCard.__init__
+
+    def recording(card, *args, **kwargs):
+        born(card, *args, **kwargs)
+        parents.append(card.parent())
+
+    monkeypatch.setattr(SubsectionCard, "__init__", recording)
+    page = _page(tmp_path, "multigeometry")
+    try:
+        _click(page, "Grazing")
+        page._calibrate()
+        dialog = page._calibration_dialog
+        card, parents[:] = page._gi_card, []
+        for circle, text in (("del", "2.3"), ("nu", "-0.5")):
+            dialog.geometry_editor.zero_edit(circle).setText(text)
+        dialog.geometry_editor.set_value(dialog.geometry_editor.value())  # as Read metadata sets it
+        qapp.processEvents()
+        assert page._gi_card is card and parents == []
+        _click(page, "Standard")  # a rebuild: the card is born in its host
+        assert parents and all(parent is page._gi_host for parent in parents)
+    finally:
+        if page._calibration_dialog is not None:
+            page._calibration_dialog.close()
+        _close(page, qapp)

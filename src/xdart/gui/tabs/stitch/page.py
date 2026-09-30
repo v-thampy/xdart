@@ -690,8 +690,9 @@ class StitchPage(QtWidgets.QWidget):
             if widget is not None:  # hidden, not orphaned: a parentless widget is a top-level window
                 widget.hide()
                 widget.deleteLater()
-        self._gi_card = group = SubsectionCard(self.controls.experiment_title, status=self._gi_status(),
-                                               accent="experiment")
+        # parented at birth: a parentless card is a top-level window until it is laid out
+        self._gi_card = group = SubsectionCard(self.controls.experiment_title, self._gi_host,
+                                               status=self._gi_status(), accent="experiment")
         self.controls.render_gi_rows(group, self._gi_fields())
         layout.addWidget(group)
         self._render_gi_axis()
@@ -1199,11 +1200,12 @@ class StitchPage(QtWidgets.QWidget):
 
     def _instrument_changed(self, *_args):
         """The mapping follows the new geometry, and readiness and any prepared plan are
-        rechecked: the calibration may no longer drive its arm."""
+        rechecked: the calibration may no longer drive its arm. The GI card shows nothing of the
+        geometry (Preview decides the sample circles, G-F2), so it is not rebuilt: rebuilding it on
+        every Diffractometer keystroke and on Read metadata closed the calibration window on macOS
+        (maintainer, 2026-09-29)."""
         self._sync_goniometer_mapping()
         self._edited()
-        if hasattr(self, "_gi_host"):
-            self._render_gi()  # the Geometry names the sample circles' motors
 
     def _adopt_mapping(self, pairs):
         """Explicit position → motor pairs (a loaded form) become the geometry's motors (its plane
