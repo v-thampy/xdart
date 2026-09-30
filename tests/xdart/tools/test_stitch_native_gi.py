@@ -190,6 +190,37 @@ def test_a_gi_stitch_2d_publishes_both_maps_i_of_q_and_the_cuts_as_one_int_recor
     assert result.payload.inspection.result_fingerprint == result.terminal.commit.result_fingerprint
 
 
+@pytest.mark.parametrize("backend, grazing", [("multigeometry", True), ("xu_hist", True),
+                                              ("multigeometry", False), ("xu_hist", False)])
+def test_a_non_square_stitch_2d_record_reads_back_as_int_2d(tmp_path, backend, grazing):
+    """Codex terminal review: 23 × 19 maps and a 37-point I(q) (a GI one's cuts too; a plain one in 2θ) read
+    back through Int's reader in their own shapes and orientation."""
+    import numpy as np
+
+    from xrd_tools.analysis.module_transaction import ModuleDisposition
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation
+    from xrd_tools.io.analysis_artifact import read_analysis_artifact
+    from xrd_tools.io.frame_view import read_frame_view
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+
+    form = (_gi_form(tmp_path, backend, StitchGI(("q_ip", "q_oop"), incidence_motor="eta", tilt_motor="chi",
+                                                 sample_motors=_SAMPLE)) if grazing
+            else _native_form(tmp_path, backend, scans="1", unit="2th_deg"))
+    request = prepare_stitch_tool(replace(form, mode="2d", npt_1d=37, npt_rad_2d=23, npt_azim_2d=19)).request
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    payload = read_analysis_artifact(request.module.output.target)
+    view = read_frame_view(request.module.output.target, 1, include_thumbnail=False)
+    np.testing.assert_array_equal(view.intensity_2d, payload.intensity.T)
+    np.testing.assert_array_equal(view.intensity_1d, payload.profile.intensity)
+    assert payload.intensity.shape == (23, 19) and payload.profile.intensity.shape == (37,)
+    if grazing:
+        assert payload.gi_map.intensity.shape == (23, 19)
+        assert all(cut.intensity.shape == (37,) for _mode, cut in payload.gi)
+    else:
+        assert view.axis_2d_x.unit == "2th_deg" and view.axis_1d.unit == "2th_deg"
+
+
 @pytest.mark.parametrize("tamper", ["gi-sigma", "other-cut", "cut-extra", "cut-class", "stitch-class", "plain-cut",
                                     "second-cut-extra", "second-cut-sigma"])
 def test_record_admission_takes_exactly_the_stitch_graph_the_record_calls_for(tmp_path, tamper):

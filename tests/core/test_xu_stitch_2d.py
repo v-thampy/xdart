@@ -11,6 +11,7 @@ from xrd_tools.integrate.xu_stitch import (
     XuPowderQProvider, resolve_xu_stitch_effective_geometry, run_xu_hist_stitch_1d,
 )
 from tests.core.test_xu_stitch import _OneFrameSource, _receipt
+from tests.core.test_xu_extended_arm import transferred  # noqa: F401 (the extended arm, transferred)
 
 SHAPE = (195, 1475)
 
@@ -117,3 +118,28 @@ def test_a_native_xrayutilities_stitch_2d_is_an_attested_int_2d_record(tmp_path)
     np.testing.assert_array_equal(payload.profile.axes[0][1], pattern.axis("q"))
     assert payload.coverage.sum() == pattern.coverage.sum()  # the same pixels, over (q, χ)
     assert len(payload.contributing_frames) == len(pattern.contributing_frames)
+
+
+def test_the_maps_chi_is_pyfais_exactly_on_one_geometry_at_combined_poses(tmp_path, transferred):  # noqa: F811
+    """Codex terminal review: on ONE geometry (the extended arm transferred to xrayutilities, and the same arm
+    as pyFAI's), xrayutilities' χ equals pyFAI's per pixel at combined poses outside the transfer's
+    validation set (the scan-14 pair above are two calibrations, which differ at combined poses)."""
+    from xrd_tools.core.geometry import Diffractometer
+    from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry
+    from tests.core.test_xu_extended_arm import _record, _receipt as _extended_receipt
+    diff = Diffractometer.from_pyfai_goniometer(_record(), source_motors={"del_angle": "del", "nu_angle": "nu"})
+    receipt = _extended_receipt(tmp_path, transferred[0])
+    with xu_runtime_session() as session:
+        geometry = resolve_xu_stitch_effective_geometry(receipt, session)
+        provider = XuPowderQProvider(geometry, receipt.projection.value["acquisition"])
+        for delta, nu in ((11., -13.), (23., 7.), (41., 29.)):
+            integrator, = create_multigeometry_integrators_from_geometry(
+                diff, {"del": np.array([delta]), "nu": np.array([nu])})
+            integrator.setChiDiscAtPi()
+            expected = np.degrees(integrator.center_array(SHAPE, unit="chi_rad"))
+            lease = provider.frame(nu=nu, del_=delta)
+            try:
+                wrapped = (lease.chi() - expected + 180.) % 360. - 180.
+            finally:
+                lease.release()
+            assert float(np.max(np.abs(wrapped))) < 1e-6

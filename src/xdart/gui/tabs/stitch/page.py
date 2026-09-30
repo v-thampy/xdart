@@ -2073,9 +2073,11 @@ class StitchPage(QtWidgets.QWidget):
                                 if path in resident and path not in self._payloads]
         if not self._reload_pending:
             return
-        path = self._reload_pending.pop(0)
+        path = self._reload_pending[0]
         self._reloading = path
-        if not self._start(f"Loading {Path(path).name}…", lambda: self._owner.begin_reopen(path)):
+        if self._start(f"Loading {Path(path).name}…", lambda: self._owner.begin_reopen(path)):
+            self._reload_pending.pop(0)
+        else:  # refused (an open editor, a pending finalization): tried again once Stitch is idle
             self._reloading = None
 
     def _restore_payload(self, path, payload):
@@ -2174,6 +2176,14 @@ class StitchPage(QtWidgets.QWidget):
         if current is not None and current.data(role) in self._payloads:
             items.setdefault(id(self._result_key(current.data(role))),
                              (current, self._payloads[current.data(role)]))
+        # a pinned result's map gives its pinned slice; Int's projection keeps it out of the selection
+        # (Codex terminal review F1: the pin stayed while its trace vanished)
+        pinned = {id(pin.frame) for pin in self._view.slice_pins}
+        for row in range(self.results.count()):
+            item = self.results.item(row)
+            key = self._result_key(item.data(role))
+            if id(key) in pinned and item.data(role) in self._payloads:
+                items.setdefault(id(key), (item, self._payloads[item.data(role)]))
         state = build_scientific_projection(
             tuple(self._display_payload(item, payload) for item, payload in items.values()),
             navigation, frozenset(keys), self._view, "", processing_mode="Int 2D")
@@ -2204,14 +2214,15 @@ class StitchPage(QtWidgets.QWidget):
         keys, navigation = self._navigation()
         selected = self._selected()
         # A GI result's cuts are its record's other 1-D modes; the plot axis chooses one, as Int's does.
+        # The axis shown falls back to Q where the shown results lack the one chosen (a result without it,
+        # or one being read back), and the choice stays (Codex terminal review F2: a reload reset it).
         cuts = {mode for _item, payload in selected for mode, _cut in payload.gi}
-        if self._view.plot_axis not in {"Q", "2theta", *cuts}:
-            self._set_view(plot_axis="Q")
         available = all(payload.wavelength_A is not None for _, payload in selected)
-        if not available and self._view.plot_axis == "2theta":
-            self._set_view(plot_axis="Q")
-        cut = self._view.plot_axis if self._view.plot_axis in cuts else None
-        unit = "q_A^-1" if self._view.plot_axis == "Q" else "2th_deg"
+        shown_axis = self._view.plot_axis
+        if shown_axis not in {"Q", "2theta", *cuts} or (shown_axis == "2theta" and not available):
+            shown_axis = "Q"
+        cut = shown_axis if shown_axis in cuts else None
+        unit = "q_A^-1" if shown_axis == "Q" else "2th_deg"
         axis_label, axis_unit = (_CUT_AXES[cut] if cut is not None
                                  else ("Q", "Å⁻¹") if unit == "q_A^-1" else ("2θ", "°"))
         traces = []
@@ -2256,7 +2267,7 @@ class StitchPage(QtWidgets.QWidget):
             title=current.text() if current else "Current", processing_mode="Int 1D",
             measurement_mode="GI" if gi_modes else "Standard",
             gi_mode_1d=(cut or "q_total") if gi_modes else "", gi_modes_1d=gi_modes,
-            plot_axis=view.plot_axis, plot_mode=view.plot_mode, plot_options=view.plot_options,
+            plot_axis=shown_axis, plot_mode=view.plot_mode, plot_options=view.plot_options,
             color_map=view.color_map, log_scale=view.log_scale, background_enabled=False,
             status=current.text() if current else "")
         self.scientific.reconcile(state, navigation, completed=self.results.currentRow() + 1,
@@ -2421,6 +2432,8 @@ class StitchPage(QtWidgets.QWidget):
             action is StitchOwnerAction.PREFLIGHT and self._after_prepare == "run"))
         self.retry_button.setVisible(final is not StitchOwnerFinalization.NONE)
         self.retry_button.setEnabled(not busy)
+        if idle and self._reload_pending and self._reloading is None and not self._queued_jobs:
+            QtCore.QTimer.singleShot(0, self._request_reload)
 
     def _authoring_active(self):
         return any(dialog.active() for dialog in self._authoring_dialogs)
