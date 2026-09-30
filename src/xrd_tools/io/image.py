@@ -189,7 +189,10 @@ def read_detector_image_layout(
                 shape = tuple(int(value) for value in dataset.shape[-2:])
                 dtype = np.dtype(dataset.dtype)
                 frame_count = int(dataset.shape[0]) if dataset.ndim == 3 else 1
-                saturation = _read_saturation(handle.get("entry"))
+                # the saturation the entry holding this image records: /entry, /entry1, ... (an image
+                # at the root: /entry's, as before; Codex terminal review F2)
+                parts = dataset.name.strip("/").split("/")
+                saturation = _read_saturation(handle.get(parts[0] if len(parts) > 1 else "entry"))
     elif suffix in {".tif", ".tiff"}:
         import tifffile
 

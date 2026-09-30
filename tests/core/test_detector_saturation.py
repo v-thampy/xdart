@@ -103,6 +103,32 @@ def test_the_nexus_reader_falls_back_to_the_count_cutoff_and_ignores_malformed_v
         assert _read_saturation(handle["entry"]) is None
 
 
+@pytest.mark.parametrize("entry", ("entry", "entry1"))
+def test_the_saturation_is_the_one_the_images_entry_records(tmp_path, entry):
+    """Codex terminal review F2: a NeXus stack under /entry1 records its detector's saturation_value there; the
+    layout reader, and so ROI, take it as under /entry (they read /entry and fell to the data type's rule)."""
+    from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
+    from xrd_tools.core.roi import RoiSpec
+    from xrd_tools.sources.nexus import NexusStackSource
+    raw = np.full((1, 4, 4), 100, np.uint32)
+    raw[0, 0, 0] = 425
+    path = tmp_path / f"{entry}.h5"
+    with h5py.File(path, "w") as handle:
+        group = handle.create_group(entry)
+        group.attrs["NX_class"] = "NXentry"
+        detector = group.create_group("instrument/detector")
+        detector.attrs["NX_class"] = "NXdetector"
+        detector["data"] = raw
+        detector["saturation_value"] = np.uint32(400)
+    assert read_detector_image_layout(path).saturation == 400
+    source = NexusStackSource(path, entry=entry)
+    try:
+        result = run_roi_signals((RoiSignal(RoiSpec.full_frame(), name="all"),), source, mask_saturation=True)
+    finally:
+        source.close()
+    assert (result.payload.valid_counts["all"].tolist(), result.payload.series["all"].tolist()) == ([15], [100.])
+
+
 def test_a_pilatus_header_records_its_count_cutoff(tmp_path):
     header = ("# Detector: PILATUS3 1M, S/N 10-0001\r\n# Exposure_time 1.0000000 s\r\n"
               "# Count_cutoff 1208517 counts\r\n# Threshold_setting: 6000 eV\r\n")

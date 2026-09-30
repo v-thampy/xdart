@@ -86,6 +86,41 @@ def test_the_int_hint_is_the_run_ceiling_and_never_the_value(tmp_path):
         assert observed_threshold_max(intent, observed) == 1048574.0
 
 
+def test_a_float_image_with_a_recorded_cutoff_keeps_its_raw_preview(tmp_path):
+    """Codex terminal review F1: float PILATUS TIFFs recording Count_cutoff 400. The run resolves and signs 400;
+    the FULL raw preview takes that ceiling (a float frame has no dtype one) and masks at and above it, rather
+    than reporting its detector projection unavailable."""
+    from tests.xdart.scattering.test_e4_preview_transport import _acquisition_identity, _typed_request
+    from xrd_tools.io.frame_preview import read_frame_preview
+    from xrd_tools.session.hydration import HydrationPurpose
+    for label in (1, 2):
+        raw = np.full((195, 487), 100, np.float32)
+        raw[90:110, 150:350] = 425
+        tifffile.imwrite(tmp_path / f"scan_{label:04}.tif", raw, description="# Count_cutoff 400 counts\n")
+    poni = tmp_path / "pilatus.poni"
+    write_poni(poni)
+    target = tmp_path / "out" / "output.nexus"
+    target.parent.mkdir()
+    executor, identity, events = _run_to_terminal(
+        _intent(tmp_path / "scan_0001.tif", target, poni, npt=32), request_value=9251)
+    try:
+        assert next(event for event in events if event.kind in _TERMINAL).kind is StandardEventKind.FINISHED
+        path = _written(target)
+        with h5py.File(path) as handle:
+            recorded = json.loads(handle["entry/reduction/config/run_configuration"][()])
+        assert recorded["threshold"]["saturation"] == 400
+        state = executor._exact_run(identity).display
+        owner = state.artifacts[str(path)]
+        assert (owner.saturation, owner.saturation_ceiling) == (400, 400.0)
+        live, gate = _acquisition_identity(state)
+        request = _typed_request(state, live, gate, path, 2, HydrationPurpose.FULL, 1)
+        projection, _key = state._derive_target(request)
+        preview = read_frame_preview(request.read_key, detector_projection=projection)
+        assert projection.mask_available and preview.raw is not None
+    finally:
+        assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+
+
 def test_the_live_preview_leaves_out_values_at_the_run_ceiling():
     from xrd_tools.io.frame_preview import DetectorPreviewProjection, _masked_detector
     from xdart.gui.tabs.scattering.display_runtime import DisplayArtifact, RunDisplayState

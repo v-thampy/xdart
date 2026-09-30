@@ -2341,7 +2341,8 @@ def test_win32_identity_inspects_and_reads_the_pathname_ctime_shape(
 
 
 def older_stitch_file(target: Path, kind: AnalysisArtifactKind) -> Path:
-    """A well-formed file in the older artifact layout that says Stitch (the layout's envelope, RSM's)."""
+    """A file whose older-layout envelope says Stitch (RSM's envelope relabelled: its result graph is not a
+    Stitch one, and nothing checks it)."""
     request = _request(target, AnalysisArtifactKind.RSM)
     admit_analysis_artifact(request, coordinator=OutputTransactionCoordinator()).publish(_writer(request))
     with h5py.File(target, "r+") as handle:

@@ -119,7 +119,8 @@ class DisplayArtifact:
     gi_mode_1d: str = ""
     gi_mode_2d: str = ""
     #: The accepted detector saturation ceiling, stamped ONCE from the first
-    #: live frame's native integer dtype (single writer:
+    #: live frame: its native integer dtype's, or the run's resolved saturation
+    #: when lower or when the frame is float (single writer:
     #: :meth:`RunDisplayState.stamp_saturation_ceiling`).  ``None`` means the
     #: accepted saturation input is unavailable and a toggle-ON preview
     #: fallback fails closed instead of guessing a ceiling.
@@ -1060,14 +1061,16 @@ class RunDisplayState:
     def stamp_saturation_ceiling(
         self, owner: DisplayArtifact, image: object
     ) -> None:
-        """Stamp the dtype-derived ceiling once from the exact live frame;
-        a float frame yields none and a toggle-ON fallback then fails closed
-        rather than inventing one. The run's resolved ceiling (decision 39),
-        when lower, is the one the preview leaves out at and above."""
+        """Stamp the ceiling once from the exact live frame: its integer dtype's,
+        or the run's resolved saturation (decision 39) when lower, and for a
+        float frame the resolved one alone (a recorded cutoff: Codex terminal
+        review F1). A float frame without one yields none, and a toggle-ON
+        fallback then fails closed rather than inventing one."""
         if owner.saturation_ceiling is None:
             ceiling = integer_saturation_ceiling(image)
-            if ceiling is not None and owner.saturation is not None:
-                ceiling = min(ceiling, float(owner.saturation))
+            if owner.saturation is not None:
+                resolved = float(owner.saturation)
+                ceiling = resolved if ceiling is None else min(ceiling, resolved)
             owner.saturation_ceiling = ceiling
 
     def _request_preview(

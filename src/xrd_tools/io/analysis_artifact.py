@@ -121,8 +121,11 @@ class AnalysisArtifactInvalid(AnalysisArtifactError):
 
 
 class OlderStitchArtifact(AnalysisArtifactInvalid):
-    """A well-formed Stitch file in the layout before Stitch results became Int records: not read,
-    but still that kind's result, so Replace may overwrite it ("stitch it again")."""
+    """A file in the layout before Stitch results became Int records, whose envelope says Stitch: a
+    regular bounded file holding only ``/entry``, a known schema version, the exact entry attributes, the
+    schema marker and a Stitch kind (nothing inside it is read or checked). Not read, but that kind's
+    result, so Replace may overwrite it ("stitch it again"; Codex terminal review R1: this is all the
+    check promises)."""
 
     def __init__(self, kind: AnalysisArtifactKind) -> None:
         super().__init__("a Stitch result is an Int record; this older Stitch file is not read: stitch it again")
