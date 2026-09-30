@@ -339,3 +339,96 @@ def test_a_resumed_session_fits_and_predicts_with_its_own_zeros_and_bounds(qapp,
     finally:
         dialog.close()
         page.shutdown()
+
+
+def test_a_session_records_the_choices_its_fit_took_and_a_resume_restores_them(qapp, tmp_path, monkeypatch):
+    """Combined Stitch review F1, F2: a completed Fit writes the session with the choices it took (zeros,
+    bounds, the energy choice and bound, the motor scales, the Diffractometer); a window set otherwise and
+    resumed takes them back before its next Fit, whose request carries them."""
+    from xrd_tools.integrate.stitch_calibration import load_calibration_session
+    (tmp_path / 'frames').mkdir()
+    frames = _guided_frames(tmp_path)
+    page, dialog = _page_with_dialog(tmp_path)
+    try:
+        dialog.frames, dialog._frame_motors = frames, ('del', 'nu')
+        dialog.session_dir = tmp_path / 'session-a'
+        dialog.session_dir.mkdir()
+        dialog._render_frames()
+        _type_zeros(dialog, TRUTH_ZEROS)
+        dialog._fields['displacement_limit'].setText('5')  # TRUTH's sample sits mm off the centre
+        dialog.refine_energy.setChecked(False)
+        dialog._set_field_text('energy_bound', '200')
+        dialog.fit_button.click()
+        _wait(dialog)
+        assert dialog.fit is not None, dialog.status.text()
+        path = dialog.session_dir / 'calibration-session.json'
+        _frames, arm, policy = load_calibration_session(path, with_arm=True, with_policy=True)
+        assert json.loads(path.read_text())['version'] == 5 and arm == ('del', 'nu')
+        assert (policy['refine_energy'], policy['energy_bound_eV'], policy['fit_motor_scales']) == (False, 200., False)
+        assert policy['bounds']['sample_offset_mm'] == 5.
+        assert policy['instrument_geometry'] == dialog.geometry_editor.value().to_record()
+        # another session's window
+        _type_zeros(dialog, {'del': 1., 'nu': .5})
+        dialog._fields['displacement_limit'].setText('0.05')
+        dialog.refine_energy.setChecked(True)
+        dialog._set_field_text('energy_bound', '100')
+        started = _captured(dialog)
+        monkeypatch.setattr('xdart.gui.widgets.file_dialogs.browse', lambda *args, **kwargs: [str(path)])
+        dialog._resume()
+        assert dialog.geometry_editor.value().arm_zeros() == pytest.approx(TRUTH_ZEROS)
+        assert not dialog.refine_energy.isChecked() and dialog._text('energy_bound') == '200'
+        assert dialog._text('displacement_limit') == '5'
+        started.clear()
+        dialog.fit_button.click()
+        (kind, (_frames, options)), = started
+        assert kind == 'fit' and options['energy_bound_eV'] is None and options['bounds'].sample_offset_mm == 5.
+        assert dict(options['bounds'].zeros_deg) == pytest.approx(TRUTH_ZEROS)
+    finally:
+        dialog.close()
+        page.shutdown()
+
+
+def test_a_horizontal_arm_session_reopens_with_its_nu_zero(qapp, tmp_path, monkeypatch):
+    """Combined Stitch review F3: a horizontal 2θ arm's zero is nu's. Reopened while the window shows a
+    vertical 2θ arm, a version-5 session brings its Diffractometer back first, so its zero reaches the
+    prediction and the Fit; a version-4 session whose arm the window does not show is refused, nothing
+    changed."""
+    from xrd_tools.integrate.stitch_calibration import save_calibration_session
+    from xrd_tools.session.instrument import InstrumentGeometry
+    from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _single_arm_frames
+    (tmp_path / 'frames').mkdir()
+    frames = _single_arm_frames(tmp_path)
+    horizontal = InstrumentGeometry('twoc', plane='horizontal', zeros=(('tth', 2.3),))
+    page, dialog = _page_with_dialog(tmp_path)
+    try:
+        dialog.set_instrument(horizontal)
+        policy = dialog._fit_policy()
+        assert policy['instrument_geometry'] == horizontal.to_record()
+        assert policy['bounds']['zeros_deg'] == {'nu': 2.3}
+        sessions = {}
+        for version, record in ((5, policy), (4, {key: policy[key] for key in
+                                                   ('bounds', 'distance_seed_m', 'distance_bounds_m')})):
+            (tmp_path / f'v{version}').mkdir()
+            sessions[version] = save_calibration_session(tmp_path / f'v{version}', frames, arm=(None, 'tth'),
+                                                         fit_policy=record)
+        dialog.set_instrument(InstrumentGeometry('twoc'))  # the window now shows a vertical 2θ arm
+        started = _captured(dialog)
+        monkeypatch.setattr('xdart.gui.widgets.file_dialogs.browse',
+                            lambda *args, **kwargs: [str(sessions[4])])
+        dialog._resume()
+        assert "this session's arm is del = held, nu = tth" in dialog.status.text()
+        assert dialog.frames == () and started == []  # refused before anything changed
+        monkeypatch.setattr('xdart.gui.widgets.file_dialogs.browse',
+                            lambda *args, **kwargs: [str(sessions[5])])
+        dialog._resume()
+        assert dialog.geometry_editor.value() == horizontal and dialog._frame_motors == (None, 'tth')
+        (kind, (_key, seed)), = started
+        assert kind == 'predict' and dict(seed['bounds'].zeros_deg) == {'nu': 2.3}
+        started.clear()
+        dialog.fit_button.click()
+        (kind, (_frames, options)), = started
+        assert kind == 'fit' and dict(options['bounds'].zeros_deg) == {'nu': 2.3}
+        assert (options['del_motor'], options['nu_motor']) == (None, 'tth')
+    finally:
+        dialog.close()
+        page.shutdown()

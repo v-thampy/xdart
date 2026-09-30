@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 from contextlib import ExitStack
 import json
+import logging
 import math
 from pathlib import Path
 import re
@@ -26,6 +27,8 @@ from xrd_tools.integrate.stitch_calibration import (
     scan_motor_names, source_frame_choices, suggested_frame_indices, validate_frame_files, xu_partner_path,
 )
 from .direct_beam_fit import DirectBeamFitWindow, direct_beam_fit_text
+
+_LOG = logging.getLogger(__name__)
 
 
 #: Share of the progress bar per automatic-refinement stage (the owner needs one fixed total).
@@ -363,6 +366,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._distance_result = None
         self._distance_energy_eV = None  # the fitted direct-beam scan's recorded energy
         self._distance_held = {}  # its other moving circle's recorded reading
+        self._job_policy = None  # the fit policy the running Fit or Refine took
         self._direct_beam_fit_window = None
         self._distance_key = self._distance_pending_key = None  # what the result was fitted from
         #: The arm the staged frames read: (del, nu), or (2θ, None) for fourc/twoc.
@@ -1277,18 +1281,43 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             return None
 
     def _fit_policy(self):
-        """The zeros, bounds and distance the fits take now, as a session records them (None while an
-        entry is malformed)."""
+        """What the fits take now, as a session records them: the zeros, bounds and distance, the energy
+        choice and bound, the motor-scale choice, and the Diffractometer the zeros are read by (None
+        while an entry is malformed)."""
         bounds, distance = self._bounds_or_none(), self._distance_or_none()
         if bounds is None or not distance:
             return None
+        try:
+            energy = float(self._text('energy_bound'))
+        except ValueError:
+            energy = math.nan
+        if not (math.isfinite(energy) and energy > 0):
+            if self.refine_energy.isChecked():
+                return None
+            energy = None
         limits = distance['distance_bounds_m']
         return {'bounds': bounds.to_record(), 'distance_seed_m': distance['distance_seed_m'],
-                'distance_bounds_m': None if limits is None else list(limits)}
+                'distance_bounds_m': None if limits is None else list(limits),
+                'refine_energy': self.refine_energy.isChecked(), 'energy_bound_eV': energy,
+                'fit_motor_scales': self.scales.isChecked(),
+                'instrument_geometry': self.geometry_editor.value().to_record()}
+
+    def _save_session(self, policy=None):
+        """Record the session's frames with the fit policy (combined Stitch review F2): when frames are
+        prepared, a row calibrated or imported, a Fit or Refine done (the policy that job took), and
+        at close. A malformed entry leaves the file as it was."""
+        policy = self._fit_policy() if policy is None else policy
+        if not self.frames or self._frame_motors is None or policy is None:
+            return
+        save_calibration_session(self.session_dir, self.frames, arm=self._frame_motors, fit_policy=policy)
 
     def _apply_fit_policy(self, policy):
-        """A session's recorded zeros, bounds, mount and distance, into the window."""
+        """A session's recorded choices into the window: its Diffractometer first, since the zeros are
+        read by its circles (a horizontal 2θ arm's is nu's; combined Stitch review F3), then the zeros,
+        bounds, mount and distance, the energy choice and bound and the motor-scale choice."""
         from xrd_tools.integrate.refine import ArmFitBounds
+        if 'instrument_geometry' in policy:
+            self.geometry_editor.set_value(InstrumentGeometry.from_record(policy['instrument_geometry']))
         bounds = ArmFitBounds.from_record(policy['bounds'])
         geometry, zeros = self.geometry_editor.value(), dict(bounds.zeros_deg)
         for role, motor in zip(('del', 'nu'), geometry.stitch_arm()):
@@ -1303,6 +1332,11 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         seed, limits = policy['distance_seed_m'], policy['distance_bounds_m']
         self._set_field_text('distance_seed', '' if seed is None else f'{seed * 1000:.12g}')
         self._set_field_text('distance_bounds', '' if limits is None else ', '.join(f'{v * 1000:.12g}' for v in limits))
+        if 'refine_energy' in policy:  # version 5 (combined Stitch review F1)
+            self.refine_energy.setChecked(policy['refine_energy'])
+            if policy['energy_bound_eV'] is not None:
+                self._set_field_text('energy_bound', f"{policy['energy_bound_eV']:g}")
+            self.scales.setChecked(policy['fit_motor_scales'])
 
     def _distance_or_none(self):
         try:
@@ -1532,6 +1566,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 # the solver refines the energy only with fixed scales: fitted ones hold it (arm note)
                 energy_bound_eV=None if self.scales.isChecked() else self._energy_bound(), bounds=self._bounds())
             self._invalidate_fit()
+            self._job_policy = self._fit_policy()
             self._start('fit', (frames, options))
         self._guard(go)
 
@@ -1583,6 +1618,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                            max_rms_q=float(self._text('rms')), energy_bound_eV=self._energy_bound(),
                            bounds=self._bounds(), **self._distance_options())
             self._invalidate_fit()
+            self._job_policy = self._fit_policy()
             self._start('refine', (spec, seed, options))
         self._guard(go)
 
@@ -1888,9 +1924,15 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                            fallback=str(self.project_root))
             path = picks[0] if picks else ''
             if path:
-                self.frames, arm, policy = load_calibration_session(path, with_arm=True, with_policy=True)
+                frames, arm, policy = load_calibration_session(path, with_arm=True, with_policy=True)
                 # an older session names no arm: del and nu in order, or a vertical 2θ arm
-                self._frame_motors = arm or (tuple(self.frames[0].motors) + (None,))[:2]
+                motors = arm or (tuple(frames[0].motors) + (None,))[:2]
+                if (policy is not None and 'instrument_geometry' not in policy
+                        and tuple(self.geometry_editor.value().stitch_arm()) != tuple(motors)):
+                    # a version-4 session's zeros are by circle of its arm: never read by another
+                    raise ValueError(f"this session's arm is del = {motors[0] or 'held'}, nu = {motors[1] or 'held'}: "
+                                     'choose that Diffractometer under 1 · Geometry, then open it again')
+                self.frames, self._frame_motors = frames, motors
                 self.session_dir = Path(path).parent
                 if policy is not None:  # its own zeros and bounds, before anything is predicted (Codex F6)
                     self._apply_fit_policy(policy)
@@ -1902,6 +1944,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     self._start('predict', (self._calibrated_key(), self._seed_options()))
                 if policy is None:
                     self.status.setText('This session records no fit bounds: the window\'s zeros and bounds are used.')
+                elif 'refine_energy' not in policy:
+                    self.status.setText('This session records no energy, motor-scale or Diffractometer choice: '
+                                        'the window\'s are used.')
         self._guard(go)
 
     def _cancel(self):
@@ -1945,14 +1990,14 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 elif kind == 'prepare':
                     self.frames = result
                     self._frame_motors = self._enumerated_motors
+                    self._save_session()  # the policy from the start (combined Stitch review F2)
                     self._render_frames()
                     self._show_tab('calibrate')
                 elif kind in ('calibrate', 'import') and result is not None:
                     result, prediction = result
                     self.frames = tuple(result if frame.identity == self._row_identity else frame for frame in self.frames)
                     self._prediction = (self._calibrated_key(), prediction)
-                    save_calibration_session(self.session_dir, self.frames, arm=self._frame_motors,
-                                             fit_policy=self._fit_policy())
+                    self._save_session()
                     self._invalidate_fit()
                     self._render_frames()
                     self._select_next_frame(result)
@@ -1962,6 +2007,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 elif kind in ('fit', 'refine'):
                     summary = fit_summary_text(result)  # before adopting: a failure leaves no fit
                     self.fit = result  # Start from keeps the person's choice (maintainer, 2026-09-29)
+                    self._save_session(self._job_policy)  # the policy this fit took
                     self._fit_instrument = result.asset['provenance'].get('instrument_geometry')
                     self.fit_summary.setPlainText(summary)
                     self.save_button.setEnabled(True)
@@ -2017,7 +2063,16 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             event.ignore()
         else:
             self._timer.stop()
+            self._save_session_quietly()
             event.accept()
+
+    def _save_session_quietly(self):
+        """At close: the session keeps the policy last shown (combined Stitch review F2); a failure to
+        write it never keeps the window open."""
+        try:
+            self._save_session()
+        except (OSError, ValueError) as error:
+            _LOG.warning('Could not record the calibration session: %s', error)
 
     def active(self):
         """Whether host navigation must retain this window's worker."""
@@ -2029,5 +2084,6 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._timer.stop()
         receipt = self._owner.close()
         if receipt.status is PageCleanup.CLEAN:
+            self._save_session_quietly()
             self.hide()
         return receipt
