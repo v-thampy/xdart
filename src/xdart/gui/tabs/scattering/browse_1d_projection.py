@@ -506,11 +506,17 @@ def _two_d_kind(scalar_row, heavy: _QualifiedHeavy | None) -> TwoDKind:
     return TwoDKind.Q_CHI
 
 
+#: The record modes only a grazing-incidence reduction writes (a standard one's are "default").
+_GI_MODE_KEYS = frozenset({"q_total", "q_ip", "q_oop", "exit_angle", "chi_gi", "qip_qoop", "q_chi", "exit_angles"})
+
+
 def _is_gi(scalar_row, kind: TwoDKind) -> bool:
     geometry = scalar_row.geometry
     return bool(
         kind is not TwoDKind.Q_CHI
         or geometry is not None and geometry.incident_angle is not None
+        # a record of GI modes without one incidence (a GI Stitch, merged from many frames)
+        or not _GI_MODE_KEYS.isdisjoint((*scalar_row.modes_1d, *scalar_row.modes_2d))
     )
 
 
