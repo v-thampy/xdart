@@ -568,6 +568,34 @@ def test_inputs_view_follows_int(qapp, tmp_path):
         _close(page, qapp)
 
 
+def test_the_selected_scans_frames_show_once_committed(qapp, tmp_path):
+    """Maintainer, 2026-09-30: "display the number of images in a scan in the readiness tab the moment it is
+    selected like in int ... only if it is quick, like in int. This could also be in the source readiness
+    sub panel". Int's "N frames", from each selected scan's SPEC points (measured about 0.5 ms a scan), read
+    on a committed selection; a draft shows none until it is committed. The fixture's scans 1-3 record two
+    points each; a scan in two results is stitched, and counted, twice."""
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        header, line = page.controls.source_card.status, page.run_bar.readinessLabel
+        assert header.text() == "1 SPEC file · 1 output · 2 frames"
+        assert line.full_text().startswith("Ready · Stitch 1D · ") and " · 2 frames · " in line.full_text()
+        editor = page._rows["scan"].editor
+        editor.setText("1,2,[1,2]")  # typed, not committed: no count yet
+        page._rows["scan"].draftChanged.emit(page._fields["scan"].path, "1,2,[1,2]")
+        assert header.text() == "1 SPEC file · 3 outputs" and "frames" not in line.full_text()
+        page.set_field("scan", "1,2,[1,2]")
+        assert header.text() == "1 SPEC file · 3 outputs · 8 frames" and " · 8 frames · " in line.full_text()
+        page.set_field("scan_mode", "Stitch All")
+        assert header.text() == "1 SPEC file · all scans · 6 frames"
+        page.set_field("scan_mode", "Select Scans")
+        page.set_field("scan", "1,9")  # a scan the file lacks: Preview says so; no count
+        assert "frames" not in header.text() + line.full_text()
+    finally:
+        _close(page, qapp)
+
+
 def test_run_progress_reads_as_words_and_frames():
     """The run bar showed the operation's step count under its stage name ("science · 317/319"
     for 315 frames, live); it now says what is happening, with frames while stitching."""

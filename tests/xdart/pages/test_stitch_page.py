@@ -263,7 +263,8 @@ def test_clearing_the_source_box_clears_the_selection_and_refuses_run(qapp, tmp_
         # a typed path is the selection, and the readiness line follows it at once
         _commit_source_box(page, qapp, spec[0], key="Return")
         assert page._source_paths == spec and page.settings()["sources"]["Spec"] == list(spec)
-        assert page.run_bar.readinessLabel.full_text() == "Ready · Stitch 1D · sample, scan 1 · pyFAI MultiGeometry"
+        assert (page.run_bar.readinessLabel.full_text()  # with its frames, as Int's (maintainer, 2026-09-30)
+                == "Ready · Stitch 1D · sample, scan 1 · 2 frames · pyFAI MultiGeometry")
         assert page.run_bar.startButton.isEnabled() and row.toolTip() == spec[0]
         for kind, paths in (("NeXus", (str(tmp_path / "one.nxs"), str(tmp_path / "two.nxs"))),
                             ("Directory", (str(tmp_path),))):

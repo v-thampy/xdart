@@ -138,6 +138,20 @@ def _spec_motor_names(path, _state, scan):
         return None
 
 
+@functools.lru_cache(maxsize=8)
+def _spec_frame_counts(path, _state, scans):
+    """Each selected scan's frames (its SPEC points; ``scans`` None: every scan's), or None when the file
+    cannot be read. On a committed source or scan edit only, as the incidence choices (maintainer,
+    2026-09-30: "display the number of images in a scan in the readiness tab the moment it is selected like
+    in int ... only if it is quick": measured about 0.5 ms a scan)."""
+    from silx.io.specfile import SfError
+    from xrd_tools.io.spec import count_spec_scan_points
+    try:
+        return count_spec_scan_points(path, scans)
+    except (OSError, ValueError, LookupError, SfError):
+        return None
+
+
 def _file_states(*paths):
     """Each file's (mtime, size), or None when it is absent: a cache key that follows edits."""
     states = []
@@ -288,6 +302,8 @@ class StitchPage(QtWidgets.QWidget):
         self._skip_note = ""
         #: Int's readiness line: (summary, ready) from the section checks.
         self._readiness = ("", False)
+        #: The committed SPEC selection and the frames its scans record (None: unknown), as Int's "N frames".
+        self._frames = None
         self._action_revision = None
         self._view_revision = 0
         self._action_view_revision = None
@@ -574,7 +590,7 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["source_kind"].valueChanged.connect(self._source_changed)
         self._rows["scan_mode"].valueChanged.connect(self._source_changed)
         self._rows["spec_path"].valueChanged.connect(self._source_path_edited)
-        self._rows["scan"].valueChanged.connect(self._refresh_gi_catalog)  # committed, not drafts
+        self._rows["scan"].valueChanged.connect(self._source_committed)  # committed, not drafts
         # A calibration serves both backends (its xrayutilities file is saved beside it), so the
         # backend is a processing choice (maintainer, 2026-09-29).
         self._field(processing, SectionId.PROCESSING, "backend", "Backend",
@@ -1006,7 +1022,7 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["spec_path"].apply_field(field)
         self._show_source_tip()
         self._edited()
-        self._refresh_gi_catalog()
+        self._source_committed()
 
     def _source_path_edited(self, _path, value):
         """A committed edit of the source box. Only a typed path is a selection: the box's own
@@ -1019,7 +1035,7 @@ class StitchPage(QtWidgets.QWidget):
         self._source_shown = text
         self._show_source_tip()
         self._edited()  # the row's own edit signal refreshed readiness before the selection changed
-        self._refresh_gi_catalog()
+        self._source_committed()
 
     def _adopt_sources(self, paths):
         """The selection Run, Preview and the saved settings use, with what depends on it."""
@@ -1047,7 +1063,7 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["spec_path"].label.setText({"Spec": "SPEC files", "NeXus": "NeXus files", "Directory": "Folder"}[kind])
         if _args and tuple(_args[0]) == self._fields["source_kind"].path:
             self.set_sources(self._paths_by_kind.get(kind, ()))
-        self._refresh_gi_catalog()
+        self._source_committed()
 
     def _processing_axis_changed(self, *_args):
         if self._value("unit") in _GI_AXES:
@@ -1077,7 +1093,7 @@ class StitchPage(QtWidgets.QWidget):
         elif key in {"source_kind", "scan_mode"}:
             self._source_changed(field.path, value)
         elif key == "scan":
-            self._refresh_gi_catalog()
+            self._source_committed()
         elif key == "unit":
             self._processing_axis_changed()
         elif key == "project_root" and not self._value("output_path"):
@@ -1100,6 +1116,47 @@ class StitchPage(QtWidgets.QWidget):
             self._refresh_inputs_view()
             self._status(self._readiness[0], ready=self._readiness[1])
             self._sync_actions()
+
+    def _source_committed(self, *_args):
+        """A committed source or scan edit, never a draft (Codex audit G-F2: the page's source reads):
+        the frames the selection's scans record, and the first scan's motors."""
+        frames = self._frames
+        self._frames = (self._selection_key(), self._selection_frames())
+        if self._frames != frames and hasattr(self, "run_bar"):  # the run bar is built after the sections
+            self._refresh_inputs_view()
+            self._status(self._readiness[0], ready=self._readiness[1])
+        self._refresh_gi_catalog()
+
+    def _selection_key(self):
+        return (self._value("source_kind"), self._source_paths, self._value("scan_mode"), str(self._value("scan")))
+
+    def _selection_frames(self):
+        """The frames a SPEC selection's scans record (a scan in two results counts twice, as it is
+        stitched twice), or None for another kind or a scan a file lacks."""
+        from xrd_tools.sources.grouping import parse_stitch_scan_groups
+        kind, paths, mode, scans = self._selection_key()
+        if kind != "Spec" or not paths:
+            return None
+        try:
+            groups = None if mode == "Stitch All" else parse_stitch_scan_groups(scans)
+        except ValueError:
+            return None
+        wanted = None if groups is None else tuple(sorted({scan for group in groups for scan in group}))
+        total = 0
+        for path in paths:
+            counts = _spec_frame_counts(path, _file_states(path), wanted)
+            if counts is None or None in counts.values():
+                return None
+            total += sum(counts.values()) if groups is None else sum(
+                sum(counts[scan] for scan in dict.fromkeys(group)) for group in groups)
+        return total
+
+    def _frames_text(self):
+        """" · N frames" for the committed selection shown, else "" (a draft, or unknown)."""
+        if self._frames is None or self._frames[0] != self._selection_key() or self._frames[1] is None:
+            return ""
+        count = self._frames[1]
+        return f" · {count} frame{'s' * (count != 1)}"
 
     def _refresh_gi_catalog(self, *_args):
         """On a committed source or scan edit, never a draft: another first scan's motors are the
@@ -1157,7 +1214,7 @@ class StitchPage(QtWidgets.QWidget):
             groups = 0
         if kind == "Spec":
             text = f"{len(sources)} SPEC file{'s' * (len(sources) != 1)} · " + (
-                "all scans" if groups is None else f"{groups} output{'s' * (groups != 1)}")
+                "all scans" if groups is None else f"{groups} output{'s' * (groups != 1)}") + self._frames_text()
         elif kind == "Directory":
             text = (f"{sources[0].name} + subfolders" if value("subdirs") else sources[0].name) if sources else ""
             text += " · filtered" if sources and str(value("name_filter")).strip() else ""
@@ -1217,7 +1274,7 @@ class StitchPage(QtWidgets.QWidget):
             else:
                 text = f"{label}, {groups} scan groups"
             outputs = (groups or 0) * len(sources)
-            text += f" → {outputs} outputs" if outputs > 1 else ""
+            text += (f" → {outputs} outputs" if outputs > 1 else "") + self._frames_text()
         elif kind == "Directory":
             text = f"every scan in {sources[0].name}" + (" and its subfolders" if value("subdirs") else "")
             name_filter = str(value("name_filter")).strip()

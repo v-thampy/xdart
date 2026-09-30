@@ -60,6 +60,26 @@ def read_spec_scan_motor_names(
     return tuple(str(name) for name in spec[key].motor_names)
 
 
+def count_spec_scan_points(
+    spec_file: Path | str, scans: tuple[str, ...] | None = None
+) -> dict[str, int | None]:
+    """Each scan's point count (its data lines), keyed as asked: ``scans`` as a Stitch selection names
+    them (``N`` is SPEC's ``N.1`` unless the file has an exact ``N.M`` key), None when the file lacks it;
+    ``scans`` None: every scan by its ``N.M`` key. About half a millisecond a scan (silx's parser)."""
+    spec = SpecFile(str(spec_file))
+    keys = spec.keys()
+    wanted = {key: key for key in keys} if scans is None else {
+        scan: scan if scan in keys else f"{scan}.1" for scan in scans}
+    counts: dict[str, int | None] = {}
+    for scan, key in wanted.items():
+        if key not in keys:
+            counts[scan] = None
+            continue
+        data = np.asarray(spec[key].data)
+        counts[scan] = int(data.shape[1]) if data.ndim == 2 else 0
+    return counts
+
+
 def read_spec_scan_table(
     spec_file: Path | str, scan_num: str
 ) -> tuple[dict[str, np.ndarray], dict[str, float], int]:

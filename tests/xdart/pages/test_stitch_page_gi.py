@@ -301,25 +301,28 @@ def test_a_sample_circle_recorded_per_point_is_bound_not_read_as_zero(qapp, tmp_
 
 def test_an_edit_reads_no_scan_table_and_lists_no_image_folder(qapp, tmp_path, monkeypatch):
     """Codex audit G-F2: the page's edits (drafts and commits, Grazing on, every scan, the form) read
-    no SPEC data table and list no image folder; Preview does that on the worker. The page's one
-    source read is the first scan's header (the incidence and tilt choices), on a committed source
-    or scan edit only."""
+    no SPEC data table and list no image folder; Preview does that on the worker. The page's source
+    reads are the first scan's header (the incidence and tilt choices) and the selected scans' point
+    counts (the frames, as Int's; maintainer, 2026-09-30), on a committed source or scan edit only."""
     import xrd_tools.io.image as image
     import xrd_tools.io.spec as spec_io
     from xdart.gui.tabs.stitch import page as page_module
     calls = []
     for module, name in ((spec_io, "read_spec_scan_columns"), (spec_io, "list_spec_scans"),
-                         (image, "find_image_files"), (spec_io, "read_spec_scan_motor_names")):
+                         (image, "find_image_files"), (spec_io, "read_spec_scan_motor_names"),
+                         (spec_io, "count_spec_scan_points")):
         real = getattr(module, name)
         monkeypatch.setattr(module, name, lambda *args, real=real, name=name, **kwargs:
                             (calls.append(name), real(*args, **kwargs))[1])
     page_module._spec_motor_names.cache_clear()
+    page_module._spec_frame_counts.cache_clear()
     page = _page(tmp_path, "multigeometry")
     try:
         _click(page, "Grazing")
         assert page._gi_catalog == _MOTORS
         calls.clear()
         page_module._spec_motor_names.cache_clear()  # a warm cache would hide a read on a draft
+        page_module._spec_frame_counts.cache_clear()
         page._rows["scan"].draftChanged.emit(("Stitch", "scan"), "1, 2")  # a draft: no read
         page.set_field("image_stem", "sample_scan{scan}_")
         page.set_field("unit", "Qip (Å⁻¹)")
@@ -327,7 +330,8 @@ def test_an_edit_reads_no_scan_table_and_lists_no_image_folder(qapp, tmp_path, m
         assert calls == []
         page.set_field("scan_mode", "Stitch All")  # a commit: the first scan's header, nothing else
         page.build_form()
-        assert calls == ["read_spec_scan_motor_names"] and page._gi_catalog == _MOTORS
+        assert sorted(calls) == ["count_spec_scan_points", "read_spec_scan_motor_names"]
+        assert page._gi_catalog == _MOTORS
         assert page._rows["output_family"].editor.placeholderText() == "auto · as Int names the scan's images, with _gi"
     finally:
         _close(page, qapp)
