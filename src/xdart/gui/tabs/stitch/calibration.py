@@ -86,7 +86,14 @@ def _prediction_after(seed, adopted, cancelled):
 
 def _pyfai_arguments(frame, seed, cancelled=None):
     """pyFAI-calib2 options for one guided frame: its calibrant and energy, and the frame's
-    predicted geometry when a calibration is at hand, so "extract rings" numbers the rings."""
+    predicted geometry when a calibration is at hand, so "extract rings" numbers the rings.
+
+    A frame whose scan records no energy takes the window's wavelength (typed, else the calibrant
+    scan's, else the direct-beam scan's: ``seed['wavelength_A']``), else a seed calibration's; never
+    pyFAI's default (the window refuses first: ``_frame_energy_known``)."""
+    if not frame.energy_eV and seed.get('wavelength_A'):
+        from xrd_tools.core.energy import wavelength_m_to_energy_eV
+        frame = replace(frame, energy_eV=float(wavelength_m_to_energy_eV(seed['wavelength_A'] * 1e-10)))
     arguments = ['-c', seed['calibrant']]
     if seed.get('mask'):  # the Detector panel's mask, turned as the staged frame is
         arguments += ['-m', seed['mask']]
@@ -106,6 +113,13 @@ def _pyfai_arguments(frame, seed, cancelled=None):
     if seed.get('detector'):
         arguments += ['-D', seed['detector']]
     return tuple(arguments)
+
+
+def _frame_energy_known(frame, seed):
+    """Whether pyFAI can calibrate the frame at a known wavelength: its scan's energy, the window's
+    wavelength, or a real calibration's (the rough geometry's is a placeholder without one)."""
+    return bool(frame.energy_eV or seed.get('wavelength_A') or any(
+        seed.get(key) is not None for key in ('record', 'prediction', 'file')) or seed.get('frames'))
 
 
 def _dispatch_job(request, cancelled, publish):
@@ -1455,8 +1469,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         return frame
 
     def _calibrate(self):
-        self._guard(lambda: self._start('calibrate', (self._selected_frame(),
-                                                      {**self._seed_options(), 'mask': self._pyfai_mask()})))
+        def start():
+            frame, seed = self._selected_frame(), {**self._seed_options(), 'mask': self._pyfai_mask()}
+            if not _frame_energy_known(frame, seed):
+                raise ValueError(f'frame {frame.identity}: its scan records no energy; type the wavelength '
+                                 '(Detector panel) so pyFAI calibrates it at the right one')
+            self._start('calibrate', (frame, seed))
+        self._guard(start)
 
     def _seed_options(self):
         """What pyFAI opens a frame with (see ``_pyfai_arguments``)."""
@@ -1473,13 +1492,14 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 break
         prediction = (self._prediction[1] if self._prediction is not None
                       and self._prediction[0] == self._calibrated_key() else None)
+        wavelength = self._rough_wavelength_A()
         return dict(calibrant=self.refine_calibrant.currentText().strip() or 'LaB6',
                     del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1], prediction=prediction,
                     record=self.fit.asset.get('calibration') if self.fit is not None else None,
                     frames=done, rough=self._rough_record(), bounds=self._bounds_or_none(),
                     distance=self._distance_or_none(),
                     file=str(Path(path).resolve()) if path and Path(path).is_file() else None,
-                    detector=detector)
+                    detector=detector, wavelength_A=wavelength)
 
     def _calibrated_key(self):
         """The calibrated frames and the bounds the prediction was fitted with: editing a zero or

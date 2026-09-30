@@ -201,6 +201,26 @@ def test_a_frame_opens_pyfai_with_its_calibrant_energy_and_predicted_geometry(tm
         '-c', 'LaB6', '-e', '17.000018', '-D', 'PilatusCdTe300kw')
 
 
+def test_a_frame_without_energy_takes_the_windows_wavelength_never_pyfais_default(tmp_path):
+    """Deferred item 9 (CAL-2): a frame whose scan records no energy is calibrated at the window's
+    wavelength (typed, else a scan's), else a seed calibration's; with neither, Calibrate refuses."""
+    from xdart.gui.tabs.stitch.calibration import _frame_energy_known, _pyfai_arguments
+    from tests.core.test_calibration_seed import _frame, _record
+    folder = tmp_path / 'frame-20'
+    folder.mkdir()
+    frame = replace(_frame({'del': 20., 'nu': 0.}), image_path=str(folder / 'scan14_0020.edf'), energy_eV=None)
+    bare = dict(calibrant='LaB6', del_motor='del', nu_motor='nu', record=None, prediction=None, frames=(),
+                file=None, rough=None, detector=None, wavelength_A=None)
+    assert not _frame_energy_known(frame, bare)  # pyFAI would take its default: refused instead
+    typed = dict(bare, wavelength_A=0.7293)
+    assert _frame_energy_known(frame, typed)
+    assert _pyfai_arguments(frame, typed) == ('-c', 'LaB6', '-e', '17.0004386')  # hc / 0.7293 Å
+    # a seed calibration: the frame's geometry at the window's wavelength, if it knows one
+    seeded = _pyfai_arguments(frame, dict(typed, file=str(_record(tmp_path))))
+    text = Path(seeded[3]).read_text()
+    assert seeded[:3] == ('-c', 'LaB6', '--poni') and 'Wavelength: 7.293' in text
+
+
 def test_the_frame_table_lists_each_frames_expected_rings(tmp_path):
     from tests.core.test_calibration_seed import _frame, _record
     dialog = StitchCalibrationDialog(tmp_path)
