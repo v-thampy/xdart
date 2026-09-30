@@ -2252,8 +2252,7 @@ class StitchPage(QtWidgets.QWidget):
         from xdart.gui.tabs.scattering.scientific_axes import (
             share_plot_axis_for_image, shown_slice_pin, slice_pins_for_plot_axis,
         )
-        from xdart.gui.tabs.scattering.scientific_view import _PLOT_OPTION_FIELDS
-        from xdart.gui.tabs.scattering.scientific_plot_options import PLOT_OPTION_COMMAND_PATHS
+        from xdart.gui.tabs.scattering.scientific_plot_options import plot_option_update
         from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
         kind, value = command.kind, command.value
         view = self._view
@@ -2310,10 +2309,10 @@ class StitchPage(QtWidgets.QWidget):
                            plot_options=replace(view.plot_options, intensity_scale="Log" if value else "Linear"))
             self._render_raw()
         elif kind is ShellCommandKind.SET_PLOT_OPTION:
-            field = dict(zip(PLOT_OPTION_COMMAND_PATHS, _PLOT_OPTION_FIELDS)).get(command.path)
-            if field is None:
+            options = plot_option_update(view.plot_options, command.path, value)
+            if options is None:
                 return
-            self._set_view(plot_options=replace(view.plot_options, **{field: value}))
+            self._set_view(plot_options=options)
         elif kind is ShellCommandKind.CLEAR_1D:
             self.clear_plot()
             return

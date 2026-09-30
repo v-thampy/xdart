@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from .scientific_waterfall_policy import waterfall_should_be_active
@@ -15,15 +17,31 @@ WATERFALL_Y_AXIS_CHOICES = (
 )
 INTENSITY_SCALE_CHOICES = ("Linear", "Sqrt", "Log")
 
-PLOT_OPTION_COMMAND_PATHS = (
-    ("waterfall", "y_axis"),
-    ("waterfall", "start"),
-    ("waterfall", "stop"),
-    ("waterfall", "step"),
-    ("overlay", "offset"),
-    ("other", "legend"),
-    ("other", "intensity_scale"),
+#: Every 1-D plot option: its command path and its ``ScientificPlotOptions`` field, the one table the
+#: view emits and every page applies (Codex general audit AUD-8).
+PLOT_OPTION_BINDINGS = (
+    (("waterfall", "y_axis"), "waterfall_y_axis"),
+    (("waterfall", "start"), "waterfall_start"),
+    (("waterfall", "stop"), "waterfall_stop"),
+    (("waterfall", "step"), "waterfall_step"),
+    (("overlay", "offset"), "overlay_offset"),
+    (("other", "legend"), "show_legend"),
+    (("other", "intensity_scale"), "intensity_scale"),
 )
+
+
+def plot_option_update(options: ScientificPlotOptions, path, value) -> ScientificPlotOptions | None:
+    """``options`` with the option at command ``path`` set to ``value``; None for an unknown path or a
+    value the option refuses (``ScientificPlotOptions`` validates each; an integer offset is a float)."""
+    field = dict(PLOT_OPTION_BINDINGS).get(path)
+    if field is None:
+        return None
+    if field == "overlay_offset" and type(value) is int:
+        value = float(value)
+    try:
+        return replace(options, **{field: value})
+    except (TypeError, ValueError):
+        return None
 
 
 class PlotOptionsDialog(QtWidgets.QDialog):
@@ -172,8 +190,9 @@ class PlotOptionsDialog(QtWidgets.QDialog):
 
 __all__ = [
     "INTENSITY_SCALE_CHOICES",
-    "PLOT_OPTION_COMMAND_PATHS",
+    "PLOT_OPTION_BINDINGS",
     "PlotOptionsDialog",
     "WATERFALL_Y_AXIS_CHOICES",
+    "plot_option_update",
     "waterfall_should_be_active",
 ]

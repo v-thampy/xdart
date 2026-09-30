@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, replace
 import logging
-import math
 import os
 from pathlib import Path
 import stat
@@ -176,7 +175,7 @@ from .scientific_axes import (
     shown_slice_pin,
     slice_pins_for_plot_axis as _slice_pins_for_plot_axis,
 )
-from .scientific_plot_options import waterfall_should_be_active
+from .scientific_plot_options import plot_option_update, waterfall_should_be_active
 from .shell_values import (
     ArtifactProgress,
     DirectoryFileProgress,
@@ -7376,46 +7375,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             else:
                 return False
         elif kind is ShellCommandKind.SET_PLOT_OPTION:
-            options = self._preferences.plot_options
-            option_updates: dict[str, object] = {}
-            if command.path == ("waterfall", "y_axis"):
-                if type(value) is not str or not value:
-                    return False
-                option_updates["waterfall_y_axis"] = value
-            elif command.path == ("waterfall", "start"):
-                if type(value) is not int or value < 1:
-                    return False
-                option_updates["waterfall_start"] = value
-            elif command.path == ("waterfall", "stop"):
-                if type(value) is not int or value < 0:
-                    return False
-                option_updates["waterfall_stop"] = value
-            elif command.path == ("waterfall", "step"):
-                if type(value) is not int or value < 1:
-                    return False
-                option_updates["waterfall_step"] = value
-            elif command.path == ("overlay", "offset"):
-                if (
-                    type(value) not in {int, float}
-                    or not math.isfinite(float(value))
-                ):
-                    return False
-                option_updates["overlay_offset"] = float(value)
-            elif command.path == ("other", "legend"):
-                if type(value) is not bool:
-                    return False
-                option_updates["show_legend"] = value
-            elif command.path == ("other", "intensity_scale"):
-                if type(value) is not str or value not in {
-                    "Linear",
-                    "Sqrt",
-                    "Log",
-                }:
-                    return False
-                option_updates["intensity_scale"] = value
-            else:
+            options = plot_option_update(
+                self._preferences.plot_options, command.path, value,
+            )
+            if options is None:
                 return False
-            updates["plot_options"] = replace(options, **option_updates)
+            updates["plot_options"] = options
         elif kind is ShellCommandKind.SET_DATE_SORT:
             requested = bool(value)
             self._processed_browser.set_date_sorted(requested)

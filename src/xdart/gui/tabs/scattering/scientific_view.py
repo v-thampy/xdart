@@ -42,7 +42,7 @@ from .scientific_axes import (
     trace_normalization_scope,
 )
 from .scientific_plot_options import (
-    PLOT_OPTION_COMMAND_PATHS,
+    PLOT_OPTION_BINDINGS,
     PlotOptionsDialog,
     waterfall_should_be_active,
 )
@@ -81,15 +81,6 @@ SCIENTIFIC_FOOTER_STATUS_LEFT_INSET = 8
 ONE_D_PLOT_BOTTOM_MARGIN = 6
 MAX_WATERFALL_DISPLAY_ROWS = 256
 MAX_VIEWER_LOADING_SNAPSHOT_PIXELS = 2_000_000
-_PLOT_OPTION_FIELDS = (
-    "waterfall_y_axis",
-    "waterfall_start",
-    "waterfall_stop",
-    "waterfall_step",
-    "overlay_offset",
-    "show_legend",
-    "intensity_scale",
-)
 _CONVERTIBLE_RADIAL_AXIS_KEYS = frozenset({"q_A^-1", "2th_deg"})
 _STANDARD_PLOT_AXIS_CHOICES = (
     ("Q (Å⁻¹)", "Q"),
@@ -860,11 +851,7 @@ class ScientificView(QtWidgets.QFrame):
         prior = self.plot_options_dialog.projection
         edited = self.plot_options_dialog.edited_options()
         self.plotOptionsAccepted.emit()
-        for field, path in zip(
-            _PLOT_OPTION_FIELDS,
-            PLOT_OPTION_COMMAND_PATHS,
-            strict=True,
-        ):
+        for path, field in PLOT_OPTION_BINDINGS:
             old_value = getattr(prior, field)
             new_value = getattr(edited, field)
             if new_value != old_value:
