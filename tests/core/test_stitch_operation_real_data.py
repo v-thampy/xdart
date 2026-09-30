@@ -347,7 +347,9 @@ def test_scan14_native_stitch_2d_merges_past_pyfais_unsplit_bins(isolated_scan14
     project = isolated_scan14_project
     legacy = _scan14_request(project, project / "map-legacy.nexus", tuple(range(287)))
     plan = replace(legacy.plan, mode="2d", npt_rad_2d=1000, npt_azim_2d=360,
-                   azimuth_range=(-180.0, 180.0), native_records=True)
+                   azimuth_range=(-180.0, 180.0), native_records=True,
+                   # the map over the plan's q range (its own is Auto otherwise): the last bin at its edge
+                   map_unit=legacy.plan.unit, map_radial_range=legacy.plan.radial_range)
     output = ModuleOutputRequest(
         resolve_finite_output_target(project, "scan14-map", operation_token="stitch-2d"),
         AnalysisArtifactKind.STITCH_2D, artifact_family="scan14-map",
