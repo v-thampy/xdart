@@ -1,8 +1,11 @@
-"""Stitch keeps only the results it shows in memory (STITCH-2D-20260930 C12; Codex general audit AUD-5,
-narrowed by architecture invariant 12: a processed file can always be read or stitched again). Measured on
-LaB6 scan 14 (287 frames): a Stitch 2D result holds 4.65 MB, a Stitch 1D 0.32 MB; every result stayed
-until the page closed. The others are listed by name and reloaded from their files when shown again.
+"""Stitch keeps the results it shows in memory, and the most recently shown others within a byte budget
+(STITCH-2D-20260930 C12; Codex general audit AUD-5, narrowed by architecture invariant 12: a processed file can
+always be read or stitched again; maintainer, 2026-09-30: "can we hold more than one, say abot 20, or even 48
+so browsing is smoother?"). Measured on LaB6 scan 14 (287 frames): a Stitch 2D result holds 4.65 MB, a Stitch
+1D 0.32 MB. The others are listed by name and reloaded from their files when shown again. Rows about reading
+back set the budget to 0, so only the shown results stay.
 """
+import pytest
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,7 +20,13 @@ from tests.xdart.pages.test_stitch_page import _Status, _wait, qapp  # noqa: F40
 from tests.xdart.tools.test_stitch_native_values import _native_form
 
 
-def test_only_the_shown_results_stay_in_memory_and_the_others_reload(qapp, tmp_path):
+@pytest.fixture
+def no_recent(monkeypatch):
+    from xdart.gui.tabs.stitch import page as module
+    monkeypatch.setattr(module, "_RECENT_BYTES", 0)
+
+
+def test_only_the_shown_results_stay_in_memory_and_the_others_reload(qapp, tmp_path, no_recent):
     page = StitchPage(empty_host_services(_Status()))
     select = QtCore.QItemSelectionModel.SelectionFlag
     role = QtCore.Qt.ItemDataRole.UserRole
@@ -81,7 +90,7 @@ def test_a_pin_survives_selecting_another_result(qapp, tmp_path):
         qapp.processEvents()
 
 
-def test_the_chosen_gi_axis_survives_reading_a_result_back(qapp, tmp_path):
+def test_the_chosen_gi_axis_survives_reading_a_result_back(qapp, tmp_path, no_recent):
     """Codex terminal review F2: selecting a result that is being read back keeps the plot axis the user chose
     (it was reset to Q while nothing was loaded); the result shows on it once back."""
     from xrd_tools.integrate.stitch_gi import StitchGI
@@ -138,6 +147,32 @@ def test_a_map_without_the_chosen_cut_shows_i_of_q_and_keeps_the_choice(qapp, tm
         _wait(page, qapp)
         (trace,) = page._last_map_state.traces
         np.testing.assert_array_equal(trace.intensity, dict(page._current_payload().gi)["q_oop"].intensity)
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
+def test_recently_shown_results_stay_within_the_budget_least_recent_first(qapp, tmp_path, monkeypatch):
+    from xdart.gui.tabs.stitch import page as module
+    page = StitchPage(empty_host_services(_Status()))
+    role = QtCore.Qt.ItemDataRole.UserRole
+    try:
+        page.load_form(_native_form(tmp_path, "multigeometry"))  # three outputs, each shown as it lands
+        page.run_bar.startButton.click()
+        _wait(page, qapp)
+        paths = [page.results.item(row).data(role) for row in range(page.results.count())]
+        assert set(page._payloads) == set(paths)  # all within the default budget: nothing to read back
+        page.results.setCurrentRow(0)
+        _wait(page, qapp)
+        assert set(page._payloads) == set(paths) and page._reloading is None
+        # a budget of one result keeps the shown one and the most recently shown other
+        sizes = {path: page._payload_bytes[path] for path in paths}
+        monkeypatch.setattr(module, "_RECENT_BYTES", max(sizes.values()))
+        page.results.setCurrentRow(1)
+        _wait(page, qapp)
+        assert set(page._payloads) == {paths[1], paths[0]}  # paths[2] was shown least recently
+        assert all(page._payload_bytes[path] == sizes[path] > 0 for path in page._payloads)
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()

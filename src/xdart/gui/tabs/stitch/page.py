@@ -232,6 +232,10 @@ def _kind_name(payload):
             else "Stitch 1D")
 
 
+#: Recently shown results stay in memory within this many bytes, beside the shown ones (C12): about 55 Stitch 2D
+#: results of 287 frames (4.65 MB each), far more Stitch 1D ones; least recently shown go first.
+_RECENT_BYTES = 256 * 1024 * 1024
+
 class StitchPage(QtWidgets.QWidget):
     """One retained page; one worker owns preview, science and strict reopen."""
 
@@ -288,9 +292,12 @@ class StitchPage(QtWidgets.QWidget):
         self._action_view_revision = None
         self._started = None
         self._closing = False
-        #: The results shown (current, selected, holding a pin), by path: the others are listed by name
-        #: and reloaded from their files when shown again (C12; a Stitch 2D of 287 frames holds 4.65 MB).
+        #: The results in memory, by path: the shown ones (current, selected, holding a pin) and the most
+        #: recently shown others within _RECENT_BYTES; the rest are listed by name and reloaded from their
+        #: files when shown again (C12; a Stitch 2D of 287 frames holds 4.65 MB).
         self._payloads = {}
+        #: Paths in the order they were last shown (the latest last), and each loaded result's bytes.
+        self._recent, self._payload_bytes = [], {}
         #: Shown results not in memory, to reload in order, and the one reloading.
         self._reload_pending = []
         self._reloading = None
@@ -2019,6 +2026,7 @@ class StitchPage(QtWidgets.QWidget):
             raise TypeError("Stitch page requires an admitted Stitch result")
         key = str(path)
         self._payloads[key] = payload
+        self._payload_bytes[key] = payload.resident_bytes
         item = next((self.results.item(i) for i in range(self.results.count())
                      if self.results.item(i).data(QtCore.Qt.ItemDataRole.UserRole) == key), None)
         if item is None:
@@ -2064,12 +2072,24 @@ class StitchPage(QtWidgets.QWidget):
         return paths | {path for path, key in self._result_keys.items() if id(key) in pinned}
 
     def _update_residency(self, *_args):
-        """C12 (STITCH-2D-20260930; Codex general audit AUD-5, narrowed by architecture invariant 12):
-        only the results shown stay in memory; another is dropped and read from its file again when
-        shown (a processed file can always be read, or stitched again)."""
+        """C12 (STITCH-2D-20260930; Codex general audit AUD-5, narrowed by architecture invariant 12): the
+        results shown stay in memory, and so do the most recently shown others within _RECENT_BYTES, so
+        going back to one is immediate (maintainer, 2026-09-30: "can we hold more than one, say abot 20, or
+        even 48 so browsing is smoother?"); another is dropped and read from its file again when shown (a
+        processed file can always be read, or stitched again)."""
         resident = self._resident_paths()
-        for path in [path for path in self._payloads if path not in resident]:
+        self._recent = [path for path in self._recent if path not in resident] + sorted(resident)
+        kept, used = set(resident), 0
+        for path in reversed(self._recent):  # the latest shown first
+            if path not in resident and path in self._payloads:
+                used += self._payload_bytes.get(path, 0)
+                if used > _RECENT_BYTES:
+                    break
+                kept.add(path)
+        for path in [path for path in self._payloads if path not in kept]:
             del self._payloads[path]
+            self._payload_bytes.pop(path, None)
+        self._recent = [path for path in self._recent if path in self._payloads or path in resident]
         role = QtCore.Qt.ItemDataRole.UserRole
         listed = [self.results.item(row).data(role) for row in range(self.results.count())]
         self._reload_pending = [path for path in dict.fromkeys(self._reload_pending + listed)
@@ -2097,6 +2117,7 @@ class StitchPage(QtWidgets.QWidget):
     def _restore_payload(self, path, payload):
         """A reloaded result back in memory: the list and its selection stay as they are."""
         self._payloads[path] = payload
+        self._payload_bytes[path] = payload.resident_bytes
         current = self.results.currentItem()
         if current is not None and current.data(QtCore.Qt.ItemDataRole.UserRole) == path:
             self._current_result_changed()  # its frames, and the view
@@ -2473,6 +2494,8 @@ class StitchPage(QtWidgets.QWidget):
                 dialog.close()
             self.curve.clear()
             self._payloads.clear()
+            self._payload_bytes.clear()
+            self._recent.clear()
         return receipt
 
     # -- saved settings (File ▸ Save/Load Settings and the last session) -----------------

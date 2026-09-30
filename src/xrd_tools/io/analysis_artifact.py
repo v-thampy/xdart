@@ -1087,6 +1087,23 @@ class AnalysisArtifactPayload:
         return dict(self.inspection.axis_units).get("q")
 
     @property
+    def resident_bytes(self) -> int:
+        """What this loaded result holds in memory: its stored arrays (the result, its axes and
+        diagnostics, a GI cut's, a Stitch 2D's I(q) and GI map) and its provenance and frame records."""
+        def arrays(projection):
+            values = [values for _name, values in projection.axes] + [
+                value for value in (projection.intensity, projection.sigma, projection.coverage,
+                                    projection.normalization) if value is not None]
+            return sum(int(np.asarray(value).nbytes) for value in values)
+        total = sum(len(buffer) for buffer in (self._intensity_buffer, self._sigma_buffer,
+                                               self._coverage_buffer, self._normalization_buffer) if buffer)
+        total += sum(len(buffer) for _name, buffer in self._axis_buffers)
+        total += sum(arrays(projection) for projection in (
+            self.profile, self.gi_map, *(projection for _mode, projection in self.gi)) if projection is not None)
+        texts = (self.inspection.provenance_json, self.inspection.frame_manifest_json)
+        return total + sum(len(text) for text in texts if text)
+
+    @property
     def contributing_frames(self) -> tuple[dict, ...]:
         text = self.inspection.frame_manifest_json
         return () if text is None else tuple(json.loads(text)["records"])
