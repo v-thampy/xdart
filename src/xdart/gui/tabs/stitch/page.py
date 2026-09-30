@@ -1119,7 +1119,6 @@ class StitchPage(QtWidgets.QWidget):
                 ("npt_1d", "npt_rad_2d", "npt_azim_2d") if map_mode else ("npt_1d",)))
         except ValueError:
             processing_ready = False
-        map_problem = None
         self.controls.processing_card.set_status_text(
             f"{self._mode.lower()} · " + ("xrayutilities" if xu else "multigeometry"))
         # What each input still needs, in a few words, as Int's "Needs …" (maintainer, 2026-09-30:
@@ -1138,8 +1137,6 @@ class StitchPage(QtWidgets.QWidget):
                                else "a scan selection such as 1,2,[3-5]")
         if not processing_ready:
             needs["processing"] = "Pts above 0"
-        elif map_problem:
-            needs["processing"] = map_problem
         checks = ((self.controls.project_card, "project"), (self.controls.experiment_card, "experiment"),
                   (self.controls.source_card, "source"), (self.controls.processing_card, "processing"))
         for card, key in checks:
