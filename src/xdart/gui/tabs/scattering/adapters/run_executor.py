@@ -1566,6 +1566,7 @@ class StandardRunExecutor:
                 mask_saturation=bool(
                     getattr(plan, "mask_saturation", False)
                 ),
+                saturation=getattr(plan, "saturation", None),
                 measurement_mode=(
                     "GI" if configuration.gi.enabled else "Standard"
                 ),

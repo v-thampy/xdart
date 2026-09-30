@@ -26,7 +26,7 @@ from .controls_editing import (
     reduce_advanced_settings,
     reduce_control_edit,
     reduce_source_selection,
-    observed_threshold_max,
+    observed_saturation,
 )
 from .controls_inventory import (
     AVERAGE_SCAN,
@@ -359,7 +359,9 @@ def project_controls(
 #: Detector-scope hover guard: rides every disabled reason for the manual
 #: max bound AND its enabled-state tooltip, so it is visible whichever state
 #: the row renders in.
-_MAX_BOUND_SCOPE_CAVEAT = " Automatic upper limit: native integer type maximum minus one. Clear this bound to restore the default 0-to-limit band."
+_MAX_BOUND_SCOPE_CAVEAT = (" Automatic upper limit: the detector's saturation (the value the input records, else the"
+                           " calibration detector's counter limit, else the data type's maximum); values at or above it"
+                           " are left out. Clear this bound to restore the automatic band.")
 
 
 def _threshold_fields(
@@ -379,12 +381,15 @@ def _threshold_fields(
             continue
         if candidate.path in {THRESHOLD_MIN, THRESHOLD_MAX}:
             value = candidate.value if manual_on or not enabled else None
-            if value is None:
-                value = (
-                    0.0
-                    if candidate.path == THRESHOLD_MIN
-                    else None if manual_on else observed_threshold_max(intent, observation)
-                )
+            if value is None and candidate.path == THRESHOLD_MIN:
+                value = 0.0
+            placeholder = None
+            if candidate.path == THRESHOLD_MAX:
+                # the automatic ceiling is a grey hint, never the field's value (decision 39)
+                ceiling = observed_saturation(intent, observation)
+                placeholder = "Auto" if ceiling is None else (
+                    f"Auto · {ceiling.value} "
+                    + ("(data type maximum)" if ceiling.source == "dtype" else "(saturation)"))
             # The disabled reason takes tooltip precedence, so the max
             # bound's detector-scope caveat must ride EVERY disabled reason
             # — Auto-on AND run-locked — or the hover guard silently
@@ -407,6 +412,7 @@ def _threshold_fields(
                 value=value,
                 enabled=unlocked and enabled,
                 reason=reason,
+                placeholder=placeholder,
             ))
             continue
         out.append(candidate)

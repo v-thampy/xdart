@@ -642,13 +642,31 @@ def _reduce_background_edit(
     return candidate
 
 
+def observed_saturation(intent: RunIntent, observation: SourceObservation | None):
+    """The selected input's automatic ceiling (decision 39), as its run's admission resolves it.
+
+    The value its header records, else the calibration detector's documented counter limit, else its
+    data type's maximum; a Directory takes the documented limit alone (its run shares one ceiling).
+    None when unknown, or when the observation is not this exact selected input's.
+    """
+    from xrd_tools.core.invalid import resolve_detector_saturation
+
+    from .detector_projection import poni_detector
+
+    if observation is None or observation.source != intent.source_spec:
+        return None
+    detector = poni_detector(intent.poni_file)
+    if type(intent.source_spec) is DirectorySourceSpec:
+        return resolve_detector_saturation(detector=detector, dtype=None)
+    return resolve_detector_saturation(recorded=observation.recorded_saturation,
+                                       detector=detector, dtype=observation.raw_dtype)
+
+
 def observed_threshold_max(intent: RunIntent, observation: SourceObservation | None) -> float | None:
-    """Only this selected input's header may provide a numeric default."""
-    return (
-        observation.default_threshold_max
-        if observation is not None and observation.source == intent.source_spec
-        else None
-    )
+    """The transitions' default maximum: the largest value the automatic ceiling keeps (one below it).
+    Only this selected input's header and calibration provide it."""
+    ceiling = observed_saturation(intent, observation)
+    return None if ceiling is None else float(ceiling.value - 1)
 
 
 def canonicalize_threshold_intent(intent: RunIntent) -> bool:

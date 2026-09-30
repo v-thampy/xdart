@@ -134,6 +134,7 @@ class RunIntentStore:
         *,
         expected_revision: int,
         gi_motor_choices: list[str] | tuple[str, ...] | None = None,
+        saturation: int | None = None,
     ) -> IntentFreezeAccepted | IntentRecaptureRequired:
         """Freeze the owned intent exactly once after a locked revision check."""
 
@@ -143,6 +144,7 @@ class RunIntentStore:
                 return self._recapture_locked(expected_revision)
             configuration = self._intent.freeze(
                 gi_motor_choices=gi_motor_choices,
+                saturation=saturation,
             )
             return IntentFreezeAccepted(
                 revision=self._revision,

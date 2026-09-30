@@ -503,7 +503,9 @@ class ThresholdIntent:
     threshold_max: float | None = None
     mask_saturation: bool = True
 
-    def freeze(self) -> "FrozenThresholdPolicy":
+    def freeze(self, *, saturation: int | None = None) -> "FrozenThresholdPolicy":
+        """``saturation`` is the admitted source's resolved automatic ceiling
+        (decision 39), never user intent; Auto keeps it, manual and off drop it."""
         return FrozenThresholdPolicy(
             apply_threshold=bool(self.apply_threshold),
             threshold_min=(
@@ -513,6 +515,7 @@ class ThresholdIntent:
                 None if self.threshold_max is None else float(self.threshold_max)
             ),
             mask_saturation=bool(self.mask_saturation),
+            saturation=saturation,
         )
 
     @classmethod
@@ -531,16 +534,30 @@ class ThresholdIntent:
 
 @dataclass(frozen=True, slots=True)
 class FrozenThresholdPolicy:
-    """Deeply immutable threshold/saturation policy for one run."""
+    """Deeply immutable threshold/saturation policy for one run.
+
+    ``saturation`` is the source's resolved automatic ceiling (decision 39)
+    when it is not the data type's maximum: Auto also leaves out native values
+    at or above it. Absent is the data type's rule, the rule of every earlier
+    run; it is recorded only when present, so their provenance and
+    fingerprints keep their bytes, and it is never re-resolved from them.
+    """
 
     apply_threshold: bool = False
     threshold_min: float | None = None
     threshold_max: float | None = None
     mask_saturation: bool = True
+    saturation: int | None = None
 
     def __post_init__(self) -> None:
         if self.apply_threshold:
             object.__setattr__(self, "mask_saturation", False)
+        if not self.mask_saturation:  # only Auto has a ceiling
+            object.__setattr__(self, "saturation", None)
+        if self.saturation is not None and (
+            type(self.saturation) is not int or self.saturation <= 0
+        ):
+            raise ValueError("saturation must be a positive whole count or None")
         for name in ("threshold_min", "threshold_max"):
             value = getattr(self, name)
             if value is not None and not math.isfinite(float(value)):
@@ -553,12 +570,15 @@ class FrozenThresholdPolicy:
             raise ValueError("threshold_min cannot exceed threshold_max")
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "apply_threshold": bool(self.apply_threshold),
             "threshold_min": self.threshold_min,
             "threshold_max": self.threshold_max,
             "mask_saturation": bool(self.mask_saturation),
         }
+        if self.saturation is not None:
+            value["saturation"] = int(self.saturation)
+        return value
 
 
 def _detached_value(value: Any) -> Any:
@@ -1014,6 +1034,10 @@ class FrozenRunConfiguration:
                     else _float_token(self.threshold.threshold_max)
                 ),
                 bool(self.threshold.mask_saturation),
+            ) + (
+                ()
+                if self.threshold.saturation is None
+                else (("saturation", int(self.threshold.saturation)),)
             ),
             str(self.poni_file),
             str(self.mask_file),
@@ -1264,12 +1288,15 @@ class RunIntent:
         *,
         generation: int | None = None,
         gi_motor_choices: "list[str] | tuple[str, ...] | None" = None,
+        saturation: int | None = None,
     ) -> FrozenRunConfiguration:
         """Freeze the current values and advance the monotonic run generation.
 
         ``gi_motor_choices`` is the source's real motor list, supplied by the
         caller (the GUI) so the effective GI motor is resolved ONCE here (R4B-8)
-        rather than independently by each run consumer.
+        rather than independently by each run consumer. ``saturation`` is the
+        admitted source's resolved automatic ceiling (decision 39), likewise
+        resolved once at admission.
         """
 
         heavy_residency_choice(self.run_options)
@@ -1298,7 +1325,7 @@ class RunIntent:
             batch_mode=bool(self.batch_mode),
             max_cores=int(self.max_cores),
             gi=self.gi.freeze(choices=gi_motor_choices),
-            threshold=self.threshold.freeze(),
+            threshold=self.threshold.freeze(saturation=saturation),
             poni_file=str(self.poni_file or ""),
             mask_file=str(self.mask_file or ""),
             flat_file=str(self.flat_file or ""),

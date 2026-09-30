@@ -58,7 +58,7 @@ def _prepared_run(tmp_path, *, frame_count=1, intent=None,
     executor = StandardRunExecutor()
     admission, capture, _token = _admit(executor, intent, request_value=1)
     assert type(admission) is AdmissionReceipt
-    configuration = intent.freeze()
+    configuration = intent.freeze(saturation=admission.saturation)  # as start_pipeline (decision 39)
     resources = executor._admission.transfer(admission)
     assert resources is not None
     executor._admission = None

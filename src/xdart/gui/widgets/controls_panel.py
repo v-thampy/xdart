@@ -70,14 +70,15 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
         "Average all frames in the series into one frame before integration."),
     ("Mask", "Threshold"): (
         "Exclude values outside the inclusive [min, max] band per frame. "
-        "Default: 0 to native integer maximum minus one. Off keeps all finite "
-        "values. The global mask always applies."),
+        "Automatic: values at or above the detector's saturation are left out. "
+        "Off keeps all finite values. The global mask always applies."),
     ("Mask", "min"): (
         "Manual threshold lower bound (pixels below are masked). Default 0."),
     ("Mask", "max"): (
-        "Upper threshold (pixels above are masked). The automatic default is "
-        "the native integer type maximum minus one, not the frame maximum. "
-        "Clear this bound to restore the default 0-to-limit band."),
+        "Upper threshold (pixels above are masked). Automatic upper limit: the "
+        "detector's saturation (the value the input records, else the "
+        "calibration detector's counter limit, else the data type's maximum), "
+        "never the frame maximum. Clear this bound to restore the automatic band."),
     # Source
     ("Signal", "inp_type"): (
         "Source kind: a numbered image series, a directory of images, or a "
@@ -953,6 +954,8 @@ class RangeRow(QtWidgets.QWidget):
         # Same tooltip rule as _apply_edit: a full render must not leave the
         # bounds without their hover text until the first state UPDATE.
         edit.setToolTip(_field_tooltip(path, spec.get("reason", "")))
+        if spec.get("placeholder") is not None:
+            edit.setPlaceholderText(spec["placeholder"])
         edit.editingFinished.connect(
             lambda e=edit, p=path: self.valueChanged.emit(
                 p, self._current_edit_value(e, p)
@@ -2200,9 +2203,11 @@ class ControlsPanel(QtWidgets.QWidget):
         row = RangeRow(
             label=label,
             low={"path": low_field.path, "value": low_field.value,
-                 "enabled": low_field.enabled, "reason": low_field.reason},
+                 "enabled": low_field.enabled, "reason": low_field.reason,
+                 "placeholder": low_field.placeholder},
             high={"path": high_field.path, "value": high_field.value,
-                  "enabled": high_field.enabled, "reason": high_field.reason},
+                  "enabled": high_field.enabled, "reason": high_field.reason,
+                  "placeholder": high_field.placeholder},
             toggle=toggle,
             display_decimals=display_decimals,
         )

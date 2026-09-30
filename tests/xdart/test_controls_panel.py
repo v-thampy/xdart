@@ -944,17 +944,17 @@ def test_max_bound_scope_caveat_survives_run_lock(qapp):
         locked = _row(panel)
         assert not locked._high.isEnabled()
         assert "locked" in locked._high.toolTip()
-        assert "native integer type maximum minus one" in locked._high.toolTip()
+        assert "Automatic upper limit: the detector's saturation" in locked._high.toolTip()
 
         # In-place unlock, then re-lock, through the update path.
         panel.reconcile(project_controls(
             store.snapshot(), None, RunPhase.IDLE))
-        assert "native integer type maximum minus one" in _row(panel)._high.toolTip()
+        assert "Automatic upper limit: the detector's saturation" in _row(panel)._high.toolTip()
         panel.reconcile(project_controls(
             store.snapshot(), None, RunPhase.RUNNING))
         relocked = _row(panel)
         assert "locked" in relocked._high.toolTip()
-        assert "native integer type maximum minus one" in relocked._high.toolTip()
+        assert "Automatic upper limit: the detector's saturation" in relocked._high.toolTip()
     finally:
         panel.close()
         panel.deleteLater()

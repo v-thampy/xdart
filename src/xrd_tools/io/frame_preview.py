@@ -6,7 +6,7 @@ import math
 from pathlib import Path, PurePosixPath
 import numpy as np
 from xrd_tools.core.frame_view import FrameView
-from xrd_tools.core.invalid import UINT32_CEILING, saturation_pixels
+from xrd_tools.core.invalid import UINT32_CEILING
 from xrd_tools.io.frame_view import FrameViewReader
 from xrd_tools.io.image import read_image
 from xrd_tools.io.read import _decode, resolve_source_master
@@ -178,7 +178,9 @@ def _masked_detector(raw, projection):
     mask = np.zeros(source.shape, dtype=bool)
     if projection.mask_saturation:
         mask |= (source < 0) | (source >= UINT32_CEILING)
-        mask |= saturation_pixels(source, ceiling=projection.saturation_ceiling)
+        # at and above the accepted ceiling: the dtype's own (nothing exceeds it) or
+        # the run's lower resolved one (decision 39)
+        mask |= source >= projection.saturation_ceiling
     static = projection.static_mask(source.shape)
     if static is not None: mask |= static
     if projection.apply_threshold:

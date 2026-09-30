@@ -437,7 +437,7 @@ def test_sidecar_alias_retarget_is_pending_before_every_output_side_effect(
 
     real_materialize = executor_module.materialize_live_directory_group
     attempts = []
-    configuration = intent.freeze()
+    configuration = intent.freeze(saturation=receipt.saturation)
     identity = RunIdentity.from_configuration(configuration)
 
     def capture_pending_attempt(*args, **kwargs):
@@ -562,7 +562,7 @@ def test_live_pending_identity_revalidates_before_equal_candidate_skip(
         capture_attempt,
     )
     monkeypatch.setattr(executor, "_construct", construct)
-    configuration = intent.freeze()
+    configuration = intent.freeze(saturation=receipt.saturation)
     identity = RunIdentity.from_configuration(configuration)
     assert type(executor.start(
         configuration,
@@ -690,7 +690,7 @@ def test_hdf_dependency_raw_alias_retarget_is_caught_before_decision(
     try:
         attempt = output_preflight.materialize_live_directory_group(
             receipt,
-            intent.freeze(),
+            intent.freeze(saturation=receipt.saturation),
             session,
             group,
             cancelled=lambda: False,
@@ -878,7 +878,7 @@ def test_nullable_metadata_absence_has_no_binding_and_appearance_is_pending(
     try:
         attempt = output_preflight.materialize_live_directory_group(
             receipt,
-            intent.freeze(),
+            intent.freeze(saturation=receipt.saturation),
             session,
             group,
             cancelled=lambda: False,
@@ -1114,7 +1114,7 @@ def test_stable_semantic_and_schema_failures_are_terminal_not_pending(
         with pytest.raises(ValueError, match="stable output configuration invalid") as error:
             output_preflight.materialize_live_directory_group(
                 receipt,
-                intent.freeze(),
+                intent.freeze(saturation=receipt.saturation),
                 session,
                 group,
                 cancelled=lambda: False,

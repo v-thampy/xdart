@@ -435,6 +435,9 @@ class AdmissionReceipt:
     deferred_directory: object | None = None
     directory_discovered_file_count: int = 0
     directory_discovered_paths: tuple[Path, ...] = ()
+    #: The resolved automatic ceiling admission bound into the candidate
+    #: (decision 39); the run's own freeze takes the same value.
+    saturation: int | None = None
 
     def __post_init__(self) -> None:
         from .output_preflight import (
@@ -469,6 +472,11 @@ class AdmissionReceipt:
                  == len(self.directory_discovered_paths)
                  and (choices is None or type(choices) is tuple
                       and all(type(value) is str for value in choices))
+                 and (self.saturation is None or type(self.saturation) is int
+                      and self.saturation > 0)
+                 and self.saturation == (
+                     None if self.candidate._configuration is None
+                     else self.candidate._configuration.threshold.saturation)
                  and type(self.display_retirement)
                  is DisplayRetirementReceipt
                  and self.display_retirement.cleanup_status
@@ -546,7 +554,10 @@ class SourceObservation:
     candidate_fingerprint: str = ""
     one_level_file_count: int | None = None
     file_count_scope: SourceCountScope = SourceCountScope.DIRECT_ONLY
-    default_threshold_max: float | None = None
+    #: The selected input's native data type and the detector saturation it
+    #: records (decision 39): header facts for the automatic ceiling's hint.
+    raw_dtype: str | None = None
+    recorded_saturation: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.observation_id) is not int or self.observation_id <= 0:
@@ -557,12 +568,12 @@ class SourceObservation:
             raise TypeError("status must be SourceObservationStatus")
         if type(self.file_count_scope) is not SourceCountScope:
             raise TypeError("file_count_scope must be SourceCountScope")
-        if self.default_threshold_max is not None and (
-            type(self.default_threshold_max) not in (float, int)
-            or not math.isfinite(self.default_threshold_max)
-            or self.default_threshold_max < 0
+        if self.raw_dtype is not None and type(self.raw_dtype) is not str:
+            raise TypeError("observed raw dtype must be a string")
+        if self.recorded_saturation is not None and (
+            type(self.recorded_saturation) is not int or self.recorded_saturation <= 0
         ):
-            raise ValueError("default threshold maximum must be finite and non-negative")
+            raise ValueError("observed saturation must be a positive whole count")
         for value in (self.exists, self.is_directory, self.subdirectories_deferred):
             if type(value) is not bool:
                 raise TypeError("observation flags must be booleans")

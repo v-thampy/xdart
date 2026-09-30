@@ -122,6 +122,7 @@ class OutputCandidate:
         cls, capture: StartCapture,
         assets: AcceptedScientificAssets | None = None,
         gi_motor_choices: tuple[str, ...] | None = None,
+        saturation: int | None = None,
     ) -> "OutputCandidate":
         intent = capture.intent_snapshot.thaw()
         if (
@@ -137,7 +138,7 @@ class OutputCandidate:
         accepted = assets or _load_scientific_assets(intent)
         if accepted.poni_parallax is not None:
             intent.poni_values = accepted.poni_projection
-        frozen = intent.freeze(gi_motor_choices=gi_motor_choices)
+        frozen = intent.freeze(gi_motor_choices=gi_motor_choices, saturation=saturation)
         processing = frozen.as_provenance()
         processing["accepted_scientific_assets"] = {
             "poni_values": accepted.poni_projection,
@@ -557,6 +558,13 @@ def prepare_output(
             candidate = OutputCandidate.from_start_capture(
                 capture, assets, choices
             )
+    automatic = intent.threshold.mask_saturation and not intent.threshold.apply_threshold
+    saturation = _admitted_saturation(source, items, assets) if automatic else None
+    if saturation is not None:
+        # signed with the resolved ceiling before any Append inspection (decision 39)
+        candidate = OutputCandidate.from_start_capture(
+            capture, assets, choices, saturation=saturation,
+        )
     if deferred is None:
         _validate_targets(
             candidate,
@@ -584,7 +592,45 @@ def prepare_output(
         deferred_directory=deferred,
         directory_discovered_file_count=len(directory_discovered_paths),
         directory_discovered_paths=directory_discovered_paths,
+        saturation=saturation,
     )
+
+
+def _admitted_saturation(
+    source: SourceSpec | DirectorySourceSpec,
+    items: tuple[PlannedOutput, ...],
+    assets: AcceptedScientificAssets,
+) -> int | None:
+    """The run's resolved automatic ceiling (decision 39), bound before signing.
+
+    A single source takes the value it records (its container, or its first
+    image's header: one scan's images share it), else the calibration detector's
+    documented counter limit for integer data. A Directory run shares one
+    science identity and qualifies its files only after it starts, so it takes
+    the documented limit alone. None: the data type's rule, as before.
+    """
+    from xrd_tools.core.invalid import resolve_detector_saturation
+
+    detector = None if assets.poni_values is None else assets.poni_values[7]
+    recorded = dtype = None
+    if type(source) is SourceSpec and items:
+        graph = items[0].graph
+        if graph.descriptor is not None:
+            recorded, dtype = graph.descriptor.saturation, graph.descriptor.dtype
+        elif graph.stamp.members:
+            options = dict(graph.execution_source.options)
+            layout = read_detector_image_layout(
+                graph.stamp.members[0].path,
+                raw_dtype=str(options.get("raw_dtype", "int32")),
+                raw_header_skip=int(options.get("raw_header_skip", 0)),
+                detector_shape=options.get("detector_shape"),
+                detector=options.get("detector"),
+            )
+            recorded, dtype = layout.saturation, layout.dtype
+    resolved = resolve_detector_saturation(
+        recorded=recorded, detector=detector, dtype=dtype,
+    )
+    return None if resolved is None or resolved.source == "dtype" else resolved.value
 def inspect_output(
     item: PlannedOutput,
     configuration: FrozenRunConfiguration | OutputCandidate,
@@ -1965,6 +2011,8 @@ def execution_plan_values(
             threshold.threshold_max if threshold.apply_threshold else None
         ),
         "mask_saturation": threshold.mask_saturation,
+        # the source's resolved ceiling (decision 39); absent: the data type's rule
+        "saturation": threshold.saturation,
     }
 
 

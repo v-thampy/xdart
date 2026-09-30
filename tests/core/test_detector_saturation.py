@@ -118,16 +118,16 @@ def test_a_pilatus_header_records_its_count_cutoff(tmp_path):
     assert pilatus_count_cutoff(None) is None
 
 
-def test_typing_the_hints_number_is_manual_and_keeps_it():
-    # R20 boundary row 1: Auto leaves out >= S and its default maximum is the largest value it keeps,
-    # S - 1; typing S is manual and keeps S (manual leaves out only > max).
+def test_the_hint_is_not_a_value_and_any_typed_number_is_manual():
+    # R20 boundary row 1: Auto leaves out >= S; under Auto the Max box is empty (the hint), so typing S
+    # is manual and keeps S (manual leaves out only > max), and so is any other number.
     auto = ThresholdState()
     hint = 1048575
     typed = threshold_transition(auto, "max", str(hint), float(hint - 1))
     assert typed == ThresholdState(True, 0.0, float(hint), False)
-    # the default itself keeps Auto: the same values are kept (a Run harvest of a shown default)
-    assert threshold_transition(auto, "max", str(hint - 1), float(hint - 1)) is None
-    # clearing the box keeps Auto; a minimum keeps Auto's ceiling as the largest kept value
-    assert threshold_transition(auto, "max", "", float(hint - 1)) == auto
+    assert threshold_transition(auto, "max", str(hint - 1), float(hint - 1)) == ThresholdState(
+        True, 0.0, float(hint - 1), False)
+    # the empty box (a Run harvest) keeps Auto; a minimum keeps Auto's largest kept value
+    assert threshold_transition(auto, "max", "", float(hint - 1)) is None
     assert threshold_transition(auto, "min", "4", float(hint - 1)) == ThresholdState(
         True, 4.0, float(hint - 1), False)

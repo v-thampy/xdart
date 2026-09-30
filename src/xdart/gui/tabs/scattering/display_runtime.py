@@ -110,6 +110,9 @@ class DisplayArtifact:
     light_unsubscribe: Callable[[], None] | None = None
     mask: np.ndarray | None = None
     mask_saturation: bool = True
+    #: The run's resolved automatic ceiling when it is not the data type's
+    #: maximum (decision 39); the stamped ceiling below never exceeds it.
+    saturation: int | None = None
     measurement_mode: str = "Standard"
     gi_incidence_motor: str = ""
     gi_resolved_motor: str = ""
@@ -290,6 +293,7 @@ class RunDisplayState:
         mask: np.ndarray | None,
         mask_saturation: bool,
         measurement_mode: str,
+        saturation: int | None = None,
         gi_incidence_motor: str = "",
         gi_resolved_motor: str = "",
         gi_mode_1d: str = "",
@@ -328,6 +332,7 @@ class RunDisplayState:
             source_base=source_base,
             mask=frozen_mask,
             mask_saturation=bool(mask_saturation),
+            saturation=saturation,
             measurement_mode=measurement_mode,
             gi_incidence_motor=gi_incidence_motor,
             gi_resolved_motor=gi_resolved_motor,
@@ -1057,9 +1062,13 @@ class RunDisplayState:
     ) -> None:
         """Stamp the dtype-derived ceiling once from the exact live frame;
         a float frame yields none and a toggle-ON fallback then fails closed
-        rather than inventing one."""
+        rather than inventing one. The run's resolved ceiling (decision 39),
+        when lower, is the one the preview leaves out at and above."""
         if owner.saturation_ceiling is None:
-            owner.saturation_ceiling = integer_saturation_ceiling(image)
+            ceiling = integer_saturation_ceiling(image)
+            if ceiling is not None and owner.saturation is not None:
+                ceiling = min(ceiling, float(owner.saturation))
+            owner.saturation_ceiling = ceiling
 
     def _request_preview(
         self,

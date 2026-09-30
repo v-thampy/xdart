@@ -7,7 +7,6 @@ import math
 from pathlib import Path
 
 from xrd_tools.core.containers import PONI
-from xrd_tools.session.detector_limits import detector_saturation_ceiling
 
 
 def detector_summary(poni_file: str, mask_file: str) -> str:
@@ -22,15 +21,9 @@ def detector_calibration_ready(poni_file: str) -> bool:
     return _detector_projection(poni_file, "")[1]
 
 
-def poni_saturation_ceiling(poni_file: str) -> float | None:
-    """The DISPLAY-DEFAULT ceiling for the PONI-declared detector family, or
-    ``None`` when no valid PONI is mounted or the family is unknown
-    (LV-UI-11: blank manual-threshold default rather than a guessed number).
-
-    This is the family's typical raw-stream ceiling used only to SEED the
-    manual-threshold inputs — not an acquisition fact: saturated-pixel
-    masking derives its ceiling from the acquired frame's own dtype at
-    reduction time (see ``xrd_tools.session.detector_limits``)."""
+def poni_detector(poni_file: str) -> str:
+    """The mounted PONI's detector name ("" when none or unreadable), for
+    decision 39's documented counter limits (``resolve_detector_saturation``)."""
 
     return _detector_projection(poni_file, "")[2]
 
@@ -38,7 +31,7 @@ def poni_saturation_ceiling(poni_file: str) -> float | None:
 def _detector_projection(
     poni_file: str,
     mask_file: str,
-) -> tuple[str, bool, float | None]:
+) -> tuple[str, bool, str]:
     path = Path(str(poni_file or "")).expanduser()
     if poni_file:
         try:
@@ -49,12 +42,12 @@ def _detector_projection(
         except Exception:
             # The production readiness contract fails closed for every parser
             # error (including PyYAML's non-ValueError syntax exceptions).
-            return f"{path.name} · selected", False, None
+            return f"{path.name} · selected", False, ""
     mask_name = Path(str(mask_file or "")).name
     return (
-        (f"{mask_name} · mask selected", False, None)
+        (f"{mask_name} · mask selected", False, "")
         if mask_name
-        else ("not configured", False, None)
+        else ("not configured", False, "")
     )
 
 
@@ -63,12 +56,11 @@ def _cached_poni_projection(
     path: str,
     _mtime_ns: int,
     _size: int,
-) -> tuple[str, bool, float | None]:
+) -> tuple[str, bool, str]:
     poni = PONI.from_poni_file(path)
     detector = str(poni.detector or "").strip()
     if detector.lower() in {"", "none", "detector"}:
         detector = ""
-    ceiling = detector_saturation_ceiling(detector)
     try:
         distance = float(poni.dist)
     except (TypeError, ValueError):
@@ -77,12 +69,12 @@ def _cached_poni_projection(
     if math.isfinite(distance) and distance > 0.0:
         parts.append(f"{distance * 1000.0:.1f}mm")
     if not parts:
-        return f"{Path(path).name} · selected", True, ceiling
-    return " · ".join((*parts, "fitted")), True, ceiling
+        return f"{Path(path).name} · selected", True, detector
+    return " · ".join((*parts, "fitted")), True, detector
 
 
 __all__ = [
     "detector_calibration_ready",
     "detector_summary",
-    "poni_saturation_ceiling",
+    "poni_detector",
 ]

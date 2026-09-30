@@ -606,6 +606,9 @@ class ReductionPlan:
     # Exclude all native ceiling values per frame. Manual thresholds take
     # precedence; only static masks determine integration geometry.
     mask_saturation: bool = False
+    #: The source's resolved automatic ceiling when it is not the data type's
+    #: maximum (decision 39): Auto also leaves out native values at or above it.
+    saturation: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
     #: Flat field applied in pyFAI's normalization; unusable pixels are NaN
     #: (see ``prepare_flatfield``), which pyFAI masks.
@@ -2752,6 +2755,7 @@ class NexusSink:
             resolved_mask = detector_value_mask(
                 static_mask, raw,
                 enabled=bool(plan is not None and plan.mask_saturation),
+                saturation=None if plan is None else plan.saturation,
             )
         return (
             make_thumbnail_array(
@@ -5697,6 +5701,7 @@ def _reduce_frame(
     if value_mask is None:
         value_mask = detector_value_mask(
             None, raw_image_arr, enabled=bool(plan.mask_saturation),
+            saturation=plan.saturation,
         )
     if value_mask is not None:
         # Like intensity thresholds, reject values in the owned working image.

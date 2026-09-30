@@ -585,7 +585,7 @@ def test_live_construct_source_revision_drift_reprobes_and_retries(
 
     monkeypatch.setattr(executor, "_construct", construct)
     receipt = _wait_for_admission(executor, capture)
-    configuration = intent.freeze()
+    configuration = intent.freeze(saturation=receipt.saturation)  # as start_pipeline (decision 39)
     identity = RunIdentity.from_configuration(configuration)
     assert type(executor.start(
         configuration,
@@ -661,7 +661,7 @@ def test_live_stable_construct_value_error_is_terminal_not_retried(
 
     monkeypatch.setattr(executor, "_construct", construct)
     receipt = _wait_for_admission(executor, capture)
-    configuration = intent.freeze()
+    configuration = intent.freeze(saturation=receipt.saturation)  # as start_pipeline (decision 39)
     identity = RunIdentity.from_configuration(configuration)
     assert type(executor.start(
         configuration,
@@ -1046,7 +1046,7 @@ def test_empty_directory_live_waits_for_one_stable_late_group_until_stop(
     monkeypatch.setattr(executor, "_construct", construct)
 
     receipt = _wait_for_admission(executor, capture)
-    configuration = intent.freeze()
+    configuration = intent.freeze(saturation=receipt.saturation)  # as start_pipeline (decision 39)
     identity = RunIdentity.from_configuration(configuration)
     assert type(executor.start(
         configuration,

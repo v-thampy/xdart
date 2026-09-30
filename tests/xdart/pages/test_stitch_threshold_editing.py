@@ -11,7 +11,7 @@ from xdart.gui.pages.services import empty_host_services
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.contracts import SourceObservationRequest
 from xdart.gui.tabs.scattering.controls_editing import (
-    EditNoChange, EditRefusal, reduce_control_edit,
+    EditNoChange, EditRefusal, observed_threshold_max, reduce_control_edit,
 )
 from xdart.gui.tabs.scattering.controls_inventory import (
     THRESHOLD_ENABLED, THRESHOLD_MAX, THRESHOLD_MIN,
@@ -58,21 +58,22 @@ def test_restoring_an_automatic_threshold_clears_a_prior_manual_band(qapp, tmp_p
 
 @pytest.mark.parametrize("dtype", ("int32", "uint32", "uint16", "float32"))
 @pytest.mark.parametrize("initial", ("auto", "touch-min", "touch-max", "touch-enabled", "disabled-touch"))
-def test_threshold_edit_sequences_match_int(qapp, tmp_path, dtype, initial, request):
-    if dtype in {"int32", "uint32"} or (dtype, initial) == ("uint16", "auto"):
-        # Decision 39, stage 1: Stitch shows its resolved ceiling as a hint and a typed maximum is
-        # manual; Int's threshold row follows in the next commit, which restores this parity.
-        request.applymarker(pytest.mark.xfail(strict=True, reason="Int's hint follows (decision 39)"))
+def test_threshold_edit_sequences_match_int(qapp, tmp_path, dtype, initial):
     form = replace(_native_form(tmp_path, "multigeometry", scans="1"), raw_dtype=dtype)
     for path in Path(form.image_dir).glob("*.raw"):
         np.fromfile(path, dtype=np.int32).astype(dtype).tofile(path)
     image = tmp_path / "observed_0001.tif"
     tifffile.imwrite(image, np.full((8, 8), 17, dtype=dtype))
-    intent = RunIntent(source_spec=image_series_spec(image))
+    # Int's calibration names the same PILATUS as Stitch's, so both resolve one ceiling (decision 39):
+    # its counter limit for int32/uint32, the data type's for uint16, none for float
+    poni = tmp_path / "pilatus.poni"
+    poni.write_text("poni_version: 2.1\nDetector: Pilatus100k\nDetector_config: {}\nDistance: 0.2\n"
+                    "Poni1: 0.01\nPoni2: 0.02\nRot1: 0.0\nRot2: 0.0\nRot3: 0.0\nWavelength: 1e-10\n")
+    intent = RunIntent(source_spec=image_series_spec(image), poni_file=str(poni))
     observation = FilesystemSourceAdapter().observe(
         SourceObservationRequest(1, 0, intent.source_spec))
-    limit = None if dtype == "float32" else float(np.iinfo(dtype).max - 1)
-    assert observation.default_threshold_max == limit
+    limit = {"int32": 1048574., "uint32": 1048574., "uint16": 65534.}.get(dtype)
+    assert observed_threshold_max(intent, observation) == limit
     state = {"intent": intent, "result": None}
     panel = ControlsPanel()
     page = StitchPage(empty_host_services(_Status()))
@@ -106,7 +107,7 @@ def test_threshold_edit_sequences_match_int(qapp, tmp_path, dtype, initial, requ
         if initial == "auto":
             sequences = [
                 ("min", "0", "same"),
-                ("max", "" if limit is None else str(limit), "same"),
+                ("max", "", "same"),  # the empty box: the hint is not a value
                 ("min", "4", "refuse" if limit is None else "change"),
                 ("max", "100", "change"),
                 ("min", "101", "refuse"),

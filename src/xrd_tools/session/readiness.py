@@ -769,6 +769,7 @@ def build_native_int_reduction_plan_from_args(
     threshold_min: Any = None,
     threshold_max: Any = None,
     mask_saturation: bool = False,
+    saturation: int | None = None,
     detector_mask: Any = None,
     detector_shape: tuple[int, int] | None = None,
 ):
@@ -925,6 +926,7 @@ def build_native_int_reduction_plan_from_args(
         threshold_min=threshold_min,
         threshold_max=threshold_max,
         mask_saturation=bool(mask_saturation),
+        saturation=saturation,
         extra=modes,
     )
 

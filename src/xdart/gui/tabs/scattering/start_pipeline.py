@@ -475,7 +475,8 @@ class StartPipeline:
         expected_revision = capture.intent_snapshot.revision
         try:
             result = self._intents.freeze(expected_revision=expected_revision,
-                                          gi_motor_choices=admission.gi_motor_choices)
+                                          gi_motor_choices=admission.gi_motor_choices,
+                                          saturation=admission.saturation)
         except (ValueError, TypeError) as error:
             return self._refuse(capture.request_id, StartRefusal.FREEZE_VALIDATION, error=error)
         except Exception as error:

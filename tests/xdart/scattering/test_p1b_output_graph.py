@@ -408,7 +408,8 @@ def _start(
         executor, intent, request_value=request_value,
     )
     receipt = await_admission(executor, capture, timeout=20.0)
-    configuration = intent.freeze()
+    # as start_pipeline: the run's freeze takes the ceiling admission resolved (decision 39)
+    configuration = intent.freeze(saturation=receipt.saturation)
     identity = RunIdentity.from_configuration(configuration)
     outcome = executor.start(
         configuration, source_capture, identity, receipt,
@@ -423,7 +424,7 @@ def _start_admitted(
     receipt: AdmissionReceipt,
     source_capture: SourceCapture,
 ) -> RunIdentity:
-    configuration = intent.freeze()
+    configuration = intent.freeze(saturation=receipt.saturation)
     identity = RunIdentity.from_configuration(configuration)
     outcome = executor.start(
         configuration, source_capture, identity, receipt,
