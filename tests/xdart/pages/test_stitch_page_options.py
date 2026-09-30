@@ -525,6 +525,13 @@ def test_inputs_view_follows_int(qapp, tmp_path):
         subdirs, name_filter = page._rows["subdirs"], page._rows["name_filter"]
         assert page.controls.source_card.isAncestorOf(subdirs) and not subdirs.isHidden()
         assert not name_filter.isHidden()
+        # Int's Source rows (its composer; maintainer, 2026-09-30: "the subdirs toggle button should be in the
+        # same row a the source like in int 1d/2d"): Subdirs beside the Source kind, then the folder and Filter
+        source_row = page._rows["source_kind"].parentWidget()
+        assert subdirs.parentWidget() is source_row is not page.controls.source_card.body
+        order = [page.controls.source_card.body_layout.itemAt(index).widget()
+                 for index in range(page.controls.source_card.body_layout.count())]
+        assert order.index(source_row) < order.index(page._rows["spec_path"]) < order.index(name_filter)
         selection = page.build_form().source_selection
         assert (selection.recursive, selection.name_filter) == (False, "")
         page.set_field("subdirs", True)

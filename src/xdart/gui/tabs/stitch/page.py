@@ -48,7 +48,8 @@ from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifactPayload
 from xrd_tools.session.readiness import ControlFieldKind, ControlFormField, SectionId
 from xdart.gui.tabs.scattering.controls_inventory import (
-    GI_ENABLED, GI_MOTOR, GI_ORIENTATION, GI_THETA,
+    GI_ENABLED, GI_MOTOR, GI_ORIENTATION, GI_THETA, SOURCE_DIRECTORY, SOURCE_FILTER, SOURCE_RECURSIVE,
+    SOURCE_TYPE,
 )
 from xrd_tools.session.threshold_editing import (
     ThresholdEditRefusal, ThresholdState, threshold_transition,
@@ -472,22 +473,38 @@ class StitchPage(QtWidgets.QWidget):
         return True
 
     def _field(self, card, section, key, label, value="", *, choices=(), browse=False):
+        field = self._new_field(section, key, label, value, choices=choices, browse=browse)
+        row = FormRow(label=label, path=field.path, value=value, kind=field.kind.value,
+                      choices=choices, browse=browse)
+        if card is not None:
+            card.add_row(row)
+        return self._bind(key, field, row)
+
+    @staticmethod
+    def _new_field(section, key, label, value="", *, choices=(), browse=False, path=None):
+        """One of this page's fields; ``path`` Int's for a row Int's composer lays out."""
         kind = (ControlFieldKind.COMBO if choices else ControlFieldKind.BOOL if isinstance(value, bool)
                 else ControlFieldKind.LINE)
-        path = ("Project", "project_folder") if key == "project_root" else ("Stitch", key)
-        field = ControlFormField(section, label, path, value, kind, tuple(choices), browse)
-        row = FormRow(label=label, path=path, value=value, kind=kind.value,
-                      choices=choices, browse=browse)
+        if path is None:
+            path = ("Project", "project_folder") if key == "project_root" else ("Stitch", key)
+        return ControlFormField(section, label, path, value, kind, tuple(choices), browse)
+
+    def _bind(self, key, field, row):
+        """A row this page reads and edits by ``key``, built here or by Int's composer."""
         # The editor keeps the shared Controls object name, so Int's styling (one height
         # for every box) applies here too.
         row.editor.setProperty("stitchField", key)
         row.valueChanged.connect(self._edited)
         row.draftChanged.connect(self._edited)
         row.browseRequested.connect(lambda _path, name=key: self._browse(name))
-        if card is not None:
-            card.add_row(row)
         self._fields[key], self._rows[key] = field, row
         return row
+
+    def _tip(self, key, text):
+        """A tooltip on the row and its editor and label (Int's composer sets its own on all three)."""
+        row = self._rows[key]
+        for widget in (row, row.editor, row.label):
+            widget.setToolTip(text)
 
     @staticmethod
     def _align_to_ranges(row):
@@ -525,28 +542,35 @@ class StitchPage(QtWidgets.QWidget):
         QtWidgets.QVBoxLayout(self._gi_host).setContentsMargins(0, 0, 0, 0)
         experiment.add_row(self._gi_host)
         self.controls.fieldValueChanged.connect(self._gi_edited)
-        self._field(source, SectionId.SOURCE, "source_kind", "Source", "Spec",
-                    choices=("Spec", "NeXus", "Directory"))
-        self._field(source, SectionId.SOURCE, "spec_path", "SPEC files", browse=True)
-        # Directory mode, as Int's Image Directory (maintainer, 2026-09-30: "Directory mode should have
-        # subfolders option as well as filters like in Int 2d")
-        self._field(source, SectionId.SOURCE, "subdirs", "Subdirs", False)
-        self._rows["subdirs"].setToolTip("Also the SPEC and NeXus files in the folder's subfolders.")
-        self._field(source, SectionId.SOURCE, "name_filter", "Filter")
-        self._rows["name_filter"].setToolTip(
-            "Only the files whose names match, as Int's Filter: every word must appear (any order), "
-            "| separates alternatives and -word excludes; case-insensitive. E.g. R1C -LaB6")
-        self._field(source, SectionId.SOURCE, "image_dir", "Images", browse=True)
-        # on the card, not in Advanced: a stem left from another dataset matches the wrong images
-        self._field(source, SectionId.SOURCE, "image_stem", "Image stem")
-        self._rows["image_stem"].setToolTip(
-            "The part of the image file names that identifies the scan; any prefix before it is "
-            "fine (b_thampy_R1C2_scan3_0000.raw has R1C2_scan3_). Blank: <SPEC name>_scan<N>_ for "
-            "each scan. {spec} and {scan} fill in the SPEC name and scan number.")
-        self._field(source, SectionId.SOURCE, "scan_mode", "Scans", "Select Scans",
-                    choices=("Stitch All", "Select Scans"))
-        self._field(source, SectionId.SOURCE, "scan", "Selection", "1")
-        self._rows["scan"].setToolTip("1,2,[2-5,8] produces three outputs. Brackets combine scans into one result.")
+        # Int's Source rows, from its composer: the kind and (Directory only) Subdirs on one row, then the
+        # files or folder and, as Int's Image Directory, the Filter (maintainer, 2026-09-30: "Directory mode
+        # should have subfolders option as well as filters like in Int 2d"; "the subdirs toggle button should
+        # be in the same row a the source like in int 1d/2d"). Every row is built once; a kind shows its own.
+        fields = {
+            "source_kind": self._new_field(SectionId.SOURCE, "source_kind", "Source", "Spec",
+                                           choices=("Spec", "NeXus", "Directory"), path=SOURCE_TYPE),
+            "spec_path": self._new_field(SectionId.SOURCE, "spec_path", "SPEC files", browse=True,
+                                         path=SOURCE_DIRECTORY),
+            "subdirs": self._new_field(SectionId.SOURCE, "subdirs", "Subdirs", False, path=SOURCE_RECURSIVE),
+            "name_filter": self._new_field(SectionId.SOURCE, "name_filter", "Filter", path=SOURCE_FILTER),
+            "image_dir": self._new_field(SectionId.SOURCE, "image_dir", "Images", browse=True),
+            # on the card, not in Advanced: a stem left from another dataset matches the wrong images
+            "image_stem": self._new_field(SectionId.SOURCE, "image_stem", "Image stem"),
+            "scan_mode": self._new_field(SectionId.SOURCE, "scan_mode", "Scans", "Select Scans",
+                                         choices=("Stitch All", "Select Scans")),
+            "scan": self._new_field(SectionId.SOURCE, "scan", "Selection", "1"),
+        }
+        rows = self.controls.render_source_rows(source, tuple(fields.values()))
+        for key, field in fields.items():
+            self._bind(key, field, rows[field.path])
+        self._tip("source_kind", "Source kind: SPEC files and their scans' images, NeXus files, or a folder "
+                                 "of both.")
+        self._tip("subdirs", "Also the SPEC and NeXus files in the folder's subfolders.")
+        self._tip("image_stem",
+                  "The part of the image file names that identifies the scan; any prefix before it is "
+                  "fine (b_thampy_R1C2_scan3_0000.raw has R1C2_scan3_). Blank: <SPEC name>_scan<N>_ for "
+                  "each scan. {spec} and {scan} fill in the SPEC name and scan number.")
+        self._tip("scan", "1,2,[2-5,8] produces three outputs. Brackets combine scans into one result.")
         self._rows["source_kind"].valueChanged.connect(self._source_changed)
         self._rows["scan_mode"].valueChanged.connect(self._source_changed)
         self._rows["spec_path"].valueChanged.connect(self._source_path_edited)
@@ -1021,7 +1045,7 @@ class StitchPage(QtWidgets.QWidget):
             self._rows[key].setVisible(kind == "Directory")
         self._rows["scan"].setVisible(kind == "Spec" and self._value("scan_mode") == "Select Scans")
         self._rows["spec_path"].label.setText({"Spec": "SPEC files", "NeXus": "NeXus files", "Directory": "Folder"}[kind])
-        if _args and _args[0][-1] == "source_kind":
+        if _args and tuple(_args[0]) == self._fields["source_kind"].path:
             self.set_sources(self._paths_by_kind.get(kind, ()))
         self._refresh_gi_catalog()
 

@@ -1691,12 +1691,23 @@ class ControlsPanel(QtWidgets.QWidget):
         self,
         fields: Iterable[ControlFormField],
     ) -> None:
+        self.render_source_rows(self.source_card, fields)
+
+    def render_source_rows(
+        self,
+        card: SectionCard,
+        fields: Iterable[ControlFormField],
+    ) -> dict[tuple[str, ...], FormRow]:
         """SOURCE layout with a few coalesced rows (Vivek): the mode combo + the
         directory-only Subdirs toggle share a row, and File Type + Meta Type share
-        a row.  Everything else renders one field per row, in field order."""
+        a row.  Everything else renders one field per row, in field order.
+
+        Public for another page's own source values (Stitch): returns each field's
+        row by path. Edits emit ``fieldValueChanged`` with the fields' paths."""
         fields = tuple(fields)
         by_path = {field.path: field for field in fields}
         rendered: set[tuple[str, ...]] = set()
+        built: dict[tuple[str, ...], FormRow] = {}
 
         def row_for(
                 *paths: tuple[str, ...],
@@ -1716,18 +1727,19 @@ class ControlsPanel(QtWidgets.QWidget):
                     lay.setSpacing(8)
                     lay.addStretch(1)
                     lay.addWidget(self._make_source_energy_button(energy_field))
-                    self.source_card.add_row(container)
+                    card.add_row(container)
                 return
             rendered.update(field.path for field in present)
             if len(present) == 1 and not tight and energy_field is None:
-                self._add_bound_row(self.source_card, present[0])
+                built[present[0].path] = row = self._make_bound_row(present[0])
+                card.add_row(row)
                 return
             container = QtWidgets.QWidget()
             lay = QtWidgets.QHBoxLayout(container)
             lay.setContentsMargins(0, 0, 0, 0)
             lay.setSpacing(8)
             for field in present:
-                sub = self._make_bound_row(field)
+                built[field.path] = sub = self._make_bound_row(field)
                 if field.path in tight:
                     # Paired labels use their text width instead of the full
                     # form's aligned label column.
@@ -1746,7 +1758,7 @@ class ControlsPanel(QtWidgets.QWidget):
                 lay.addWidget(sub, st)
             if energy_field is not None:
                 lay.addWidget(self._make_source_energy_button(energy_field), 0)
-            self.source_card.add_row(container)
+            card.add_row(container)
 
         # Mode combo + (directory-only) Subdirs toggle on one row.
         row_for(("Signal", "inp_type"), ("Signal", "include_subdir"))
@@ -1766,7 +1778,9 @@ class ControlsPanel(QtWidgets.QWidget):
         # Anything else (e.g. NeXus File / Entry) one per row, in order.
         for field in fields:
             if field.path not in rendered:
-                self._add_bound_row(self.source_card, field)
+                built[field.path] = row = self._make_bound_row(field)
+                card.add_row(row)
+        return built
 
     def _make_source_energy_button(
             self, field: ControlFormField) -> QtWidgets.QToolButton:
