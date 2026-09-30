@@ -1290,6 +1290,7 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["output_family"].editor.setPlaceholderText(self._automatic_names(kind, sources))
         project = Path(str(value("project_root") or ""))
         project_ready = bool(str(value("project_root")).strip()) and project.is_dir()
+        self.controls.apply_card_visibility(str(value("project_root") or ""))  # Int's gate: a Project first
         calibration = str(value("geometry_path") or "").strip()
         mask = str(value("mask_path") or "").strip()
         experiment_ready = bool(calibration) and Path(calibration).is_file() and (not mask or Path(mask).is_file())
@@ -2565,6 +2566,7 @@ class StitchPage(QtWidgets.QWidget):
         authoring = self._authoring_active()
         idle = not busy and not authoring and final is StitchOwnerFinalization.NONE and not self._closing
         self.controls.setEnabled(idle)
+        self.run_bar.set_mode_row_enabled(idle)  # as Int's: the mode and Append/Replace hold during a run
         for dialog in self._authoring_dialogs:
             dialog.setEnabled(not busy and not self._closing and (not authoring or dialog.active()))
         if not any(dialog.isVisible() or dialog.active() for dialog in self._authoring_dialogs):

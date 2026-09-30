@@ -11,7 +11,7 @@ from xdart.gui.pages.values import PageCleanup
 from xdart.gui.tabs.stitch.page import StitchPage, frame_screen_note
 from xdart.gui.tools.stitch_values import prepare_stitch_tool
 from xrd_tools.analysis.stitch_operation import XuStitchOperationPlan
-from tests.xdart.pages.test_stitch_page import _Status, _form, qapp  # noqa: F401
+from tests.xdart.pages.test_stitch_page import _Status, _form, _wait, qapp  # noqa: F401
 from tests.xdart.tools.test_stitch_native_values import _native_form
 
 
@@ -589,6 +589,27 @@ def test_the_experiment_rows_and_action_buttons_are_ints(qapp):
         assert page.advanced.isVisible()
     finally:
         page.advanced.close()
+        _close(page, qapp)
+
+
+def test_the_sections_show_after_a_project_and_the_run_config_holds_during_a_run(qapp, tmp_path):
+    """Int's panel rules: Source, Experiment and Processing show once a Project folder is named; the mode and
+    Append/Replace are locked while the page is busy (Int locks them during a run)."""
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        cards = page.controls
+        sections = (cards.source_card, cards.experiment_card, cards.processing_card)
+        assert all(card.isHidden() for card in sections) and not cards.project_card.isHidden()
+        page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        assert not any(card.isHidden() for card in sections)
+        page.begin_preview()
+        assert page._owner.busy
+        assert not page.run_bar.modeCombo.isEnabled() and not page.run_bar.writeModeButton.isEnabled()
+        _wait(page, qapp)
+        page.preview_dialog.close()
+        assert page.run_bar.modeCombo.isEnabled() and page.run_bar.writeModeButton.isEnabled()
+    finally:
         _close(page, qapp)
 
 

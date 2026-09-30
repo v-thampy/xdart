@@ -1664,19 +1664,29 @@ class ControlsPanel(QtWidgets.QWidget):
         self._apply_card_visibility(state)
 
     def _apply_card_visibility(self, state: ControlsProjection) -> None:
-        viewer_mode = state.processing_page is ProcessingPage.VIEWER
-        project_root = state.value_for(_PROJECT_ROOT_PATH, None)
+        self.apply_card_visibility(
+            state.value_for(_PROJECT_ROOT_PATH, None),
+            viewer_mode=state.processing_page is ProcessingPage.VIEWER,
+            experiment=bool(state.fields_for(SectionId.EXPERIMENT)),
+        )
+
+    def apply_card_visibility(
+        self,
+        project_root: object,
+        *,
+        viewer_mode: bool = False,
+        experiment: bool = True,
+    ) -> None:
+        """The section gate: Source, Experiment and Processing show once a
+        Project folder is named (None: no Project field), never in a viewer.
+        Public for another page's own Project value (Stitch)."""
         project_ready = (
             project_root is None
             or type(project_root) is str and bool(project_root.strip())
         )
         self.project_card.show()
         self.source_card.setVisible(not viewer_mode and project_ready)
-        self.experiment_card.setVisible(
-            bool(state.fields_for(SectionId.EXPERIMENT))
-            and not viewer_mode
-            and project_ready
-        )
+        self.experiment_card.setVisible(experiment and not viewer_mode and project_ready)
         self.processing_card.setVisible(not viewer_mode and project_ready)
 
     def _render_plain_bound_section(
