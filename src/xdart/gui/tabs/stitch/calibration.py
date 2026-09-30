@@ -22,7 +22,7 @@ from xrd_tools.integrate.calibration_seed import (
 )
 from xrd_tools.session.instrument import InstrumentGeometry
 from xrd_tools.integrate.stitch_calibration import (
-    adopt_calibration_pair, automatic_arm_reason, capture_calibration_frames, fit_calibration,
+    adopt_calibration_pair, automatic_arm_reason, capture_calibration_frames, direct_beam_pose, fit_calibration,
     load_calibration_session, pair_validation_angles, save_calibration_pair, save_calibration_session,
     scan_motor_names, source_frame_choices, suggested_frame_indices, validate_frame_files, xu_partner_path,
 )
@@ -178,8 +178,9 @@ def _dispatch_job(request, cancelled, publish):
         options = dict(options)
         if cancelled.is_set():
             raise OperationCancelled('direct-beam calibration cancelled')
-        energy = None  # the scan's one recorded energy (SPEC image series), for the wavelength
-        held_readings = {}  # the other moving circle as the scan held it: the beam was seen there
+        # the scan's one recorded energy (for the wavelength) and the other moving circle as the scan held
+        # it (the beam was seen there), from its metadata for every source kind
+        energy, held_readings = direct_beam_pose(spec, motor, held)
         with ExitStack() as resources:
             source_options = dict(motor=motor, entry=spec.entry or 'entry')
             if spec.kind is SourceKind.SPEC:
@@ -190,16 +191,7 @@ def _dispatch_job(request, cancelled, publish):
                 else:
                     # Preserve the shared strict series discovery and exact
                     # path/frame references; the loader owns SPEC angle pairing.
-                    try:
-                        choices = source_frame_choices(spec, (motor, *held))
-                    except ValueError:  # the scan does not record the held circle: taken at its zero
-                        choices = source_frame_choices(spec, (motor,))
-                    energies = {value for _index, _motors, value in choices if value is not None}
-                    energy = energies.pop() if len(energies) == 1 else None
-                    for name in held:
-                        values = {values[name] for _index, values, _energy in choices if name in values}
-                        if len(values) == 1:
-                            held_readings[name] = values.pop()
+                    choices = source_frame_choices(spec, (motor,))
                     source = open_source(replace(spec, options={**spec.options,
                                                               'require_complete_images': True}))
                     if getattr(source, 'close', None) is not None:

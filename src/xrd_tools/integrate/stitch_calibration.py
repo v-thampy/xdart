@@ -156,6 +156,65 @@ def source_frame_choices(spec: SourceSpec, motor_names=('del', 'nu')):
             close()
 
 
+#: A held circle's readings within this many degrees of each other (encoder noise) are one pose.
+_HELD_TOLERANCE_DEG = 1e-3
+
+
+def direct_beam_pose(spec: SourceSpec, motor: str, held=()) -> tuple[float | None, dict[str, float]]:
+    """A direct-beam scan's recorded energy (eV) and its other moving circles as it held them, from its
+    metadata, for every source kind the direct-beam fit reads (a SPEC image series or image container,
+    a NeXus stack): the one energy the scan records (None when it records none, or several), and each
+    ``held`` circle's reading. Kept apart from the fit, which uses the images alone (Codex testing-fixes
+    review F2). A circle the scan does not record is left out (it reads its zero); one recorded for
+    only some frames, not a number, or moving during the scan is refused, never read as zero."""
+    if spec.kind is SourceKind.SPEC:
+        from xrd_tools.sources import open_source
+        rows = source_frame_choices(spec, (motor,))  # the scan's admission and each frame's energy
+        count, energies = len(rows), [energy for _index, _motors, energy in rows]
+        seen: dict[str, list] = {name: [] for name in held}
+        if held:
+            source = open_source(_exact_source(spec))
+            try:
+                with _metadata_reader(source) as read_metadata:
+                    for index in source.frame_indices:
+                        metadata = read_metadata(index)
+                        for name in held:
+                            if name in metadata:
+                                seen[name].append(metadata[name])
+            finally:
+                close = getattr(source, 'close', None)
+                if close is not None:
+                    close()
+    else:  # as open_direct_beam_scan reads a NeXus stack's angles
+        from xrd_tools.io.nexus import read_nexus
+        metadata = read_nexus(spec.uri, spec.entry or 'entry', motor_names=[motor, *held, 'energy'],
+                              counter_names=[])
+        if motor not in metadata.angles:
+            raise ValueError(f'NeXus has no {motor!r} angle column')
+        count = len(metadata.angles[motor])
+        seen = {name: list(metadata.angles[name]) for name in held if name in metadata.angles}
+        energies = list(metadata.angles.get('energy', ()))
+        if not energies and metadata.energy and math.isfinite(metadata.energy) and metadata.energy > 0:
+            energies = [float(metadata.energy) * 1000.0]  # its instrument energy, in keV
+    readings: dict[str, float] = {}
+    for name, values in seen.items():
+        if not values:
+            continue
+        try:
+            values = [float(value) for value in values]
+        except (TypeError, ValueError):
+            raise ValueError(f'the direct-beam scan\'s {name} readings are not numbers') from None
+        if len(values) != count or not all(math.isfinite(value) for value in values):
+            raise ValueError(f'the direct-beam scan records {name} for only some frames, or not as a number')
+        if max(values) - min(values) > _HELD_TOLERANCE_DEG:
+            raise ValueError(f'{name} moves during the direct-beam scan ({min(values):g} to {max(values):g}°): '
+                             f'the scan should move {motor} alone')
+        readings[name] = float(np.mean(values))
+    energies = {float(value) for value in energies if value is not None}
+    energies = {value for value in energies if math.isfinite(value) and value > 0}
+    return (energies.pop() if len(energies) == 1 else None), readings
+
+
 def scan_motor_names(spec: SourceSpec) -> tuple[str, ...]:
     """The scan's motor names (SPEC #O/#P positioners, NeXus positioners), for choosing
     which motor drives which circle; () when the source does not list them."""

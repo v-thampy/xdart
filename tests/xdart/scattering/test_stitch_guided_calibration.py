@@ -811,3 +811,62 @@ def test_the_rough_geometry_puts_the_beam_where_the_fit_says_it_is_at_the_zero(t
         assert float(seed.integrator.tth(np.array([y]), np.array([x]))[0]) == pytest.approx(0, abs=1e-4)
     finally:
         dialog.close()
+
+
+def _beam_container(tmp_path, nu=(4.,) * 5, energy=16000.):
+    """A five-frame direct-beam NeXus stack (del 1 to -1, nu and energy recorded per frame) and its beam."""
+    import h5py
+    from tests.core.test_direct_beam import beam_images
+    angles = np.array([1., .5, 0., -.5, -1.])
+    images, _, beam = beam_images(angles, shape=(195, 487), pitches=(172e-6, 172e-6), distance=.5, zero=0)
+    nexus = tmp_path / 'beam.nxs'
+    with h5py.File(nexus, 'w') as handle:
+        handle.create_group('entry').attrs['NX_class'] = 'NXentry'
+        handle['entry/data/image'] = np.asarray(images).astype('uint32')
+        handle['entry/data/del'] = angles
+        if nu is not None:
+            handle['entry/data/nu'] = np.asarray(nu, dtype=float)
+        if energy is not None:
+            handle['entry/data/energy'] = np.full(5, energy)
+    return nexus, angles, beam
+
+
+@pytest.mark.parametrize('kind', ('nexus', 'spec_container'))
+def test_a_direct_beam_container_keeps_its_held_circle_and_energy(tmp_path, kind):
+    """Codex testing-fixes review F2: a NeXus stack, or SPEC metadata with an image container, fitted its
+    distance but returned no energy and no held reading, so the rough geometry put the beam at the held
+    circle's zero (4° from the direct beam here) and the scan's energy was not offered."""
+    from xdart.gui.tabs.stitch.calibration import _run_job
+    from xrd_tools.integrate.calibration_seed import predict_frame_seed, rough_arm_record
+    from tests.core.test_calibration_seed import _frame
+    nexus, angles, beam = _beam_container(tmp_path)
+    if kind == 'nexus':
+        source = SourceSpec(nexus, SourceKind.NEXUS_STACK, entry='entry')
+    else:
+        spec = tmp_path / 'beam.spec'
+        spec.write_text('#F beam\n#O0 nu  energy\n#S 8 ascan del 1 -1 4 1\n#P0 4 16000\n#N 1\n#L del\n'
+                        + '\n'.join(map(str, angles)) + '\n')
+        source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '8.1', 'image_file': str(nexus)})
+    result, energy, held = _run_job(('distance', (source, 'del', dict(
+        detector='Pilatus100k', beam_pixel=beam, angle_zero_deg=0., rotation=0), ('nu',))), Event(), lambda *_: None)
+    assert energy == 16000. and held == {'nu': 4.}
+    rough = rough_arm_record(distance_m=result.distance_m, detector='Pilatus100k', beam_px=result.zero_beam_pixel,
+                             beam_readings=held)
+    x, y = result.zero_beam_pixel
+    integrator = predict_frame_seed(rough, _frame({'del': 0., 'nu': 4.}, shape=(195, 487))).integrator
+    assert abs(np.degrees(integrator.tth(np.array([y]), np.array([x])))[0]) < 1e-9  # on the direct beam
+
+
+def test_the_direct_beam_pose_refuses_a_held_circle_that_moves_and_leaves_out_one_not_recorded(tmp_path):
+    from xrd_tools.integrate.stitch_calibration import direct_beam_pose
+    for name, nu, energy, expected in (('moving', (4., 4., 4.5, 4., 4.), 16000., 'nu moves during the direct-beam scan'),
+                                       ('nan', (4., 4., np.nan, 4., 4.), 16000., 'records nu for only some frames'),
+                                       ('absent', None, None, None)):
+        (tmp_path / name).mkdir()
+        nexus, _angles, _beam = _beam_container(tmp_path / name, nu=nu, energy=energy)
+        source = SourceSpec(nexus, SourceKind.NEXUS_STACK, entry='entry')
+        if expected is None:  # not recorded: nu reads its zero, and no energy is offered
+            assert direct_beam_pose(source, 'del', ('nu',)) == (None, {})
+        else:
+            with pytest.raises(ValueError, match=expected):
+                direct_beam_pose(source, 'del', ('nu',))
