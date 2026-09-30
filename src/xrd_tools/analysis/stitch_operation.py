@@ -64,6 +64,7 @@ from xrd_tools.analysis.xu_stitch_calibration import (
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.core.geometry import AngleMapping, Diffractometer, ImageOrientation
 from xrd_tools.core.scan import SourceKind
+from xrd_tools.core.staging import reduction_worker_cap
 from xrd_tools.sources.composite import CompositeFrameSource
 from xrd_tools.io.analysis_artifact import (
     ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL,
@@ -3137,13 +3138,19 @@ class StitchOperationExecution:
         *,
         cancel_token: threading.Event | None = None,
         progress_callback: Callable[[ModuleProgress], object] | None = None,
+        workers: int = 1,
     ) -> StitchOperationResult:
+        """``workers``: the frames pyFAI MultiGeometry integrates at once (Int's Cores, capped as Int
+        caps them: ``reduction_worker_cap``); the result is the same for any count, so it is no part of
+        the request. xrayutilities stitches on one thread (its runtime is one per process)."""
         if self._state != "new":
             raise RuntimeError("Stitch execution is one-shot")
         if cancel_token is not None and type(cancel_token) is not threading.Event:
             raise TypeError("Stitch cancellation token must be exact threading.Event")
         if progress_callback is not None and not callable(progress_callback):
             raise TypeError("Stitch progress callback must be callable")
+        if type(workers) is not int or workers < 1:
+            raise ValueError("Stitch workers must be a positive int")
         self._state = "running"
         self._progress_callback = progress_callback
         if type(self.request.plan) is XuStitchOperationPlan:
@@ -3214,6 +3221,7 @@ class StitchOperationExecution:
                     collect_frame_records=False,
                     frame_record_callback=frame_callback,
                     frame_screen=screen,
+                    workers=reduction_worker_cap(workers),
                 )
                 self._frame_screen = screen.summary()
                 _record_frame_screen(records, screen.verdicts)
@@ -3416,6 +3424,7 @@ def run_stitch_operation(
     cancel_token: threading.Event | None = None,
     progress_callback: Callable[[ModuleProgress], object] | None = None,
     coordinator=None,
+    workers: int = 1,
 ) -> StitchOperationResult:
     """Run one prepared Stitch operation, retaining cleanup in its exception."""
 
@@ -3423,6 +3432,7 @@ def run_stitch_operation(
     return execution.run(
         cancel_token=cancel_token,
         progress_callback=progress_callback,
+        workers=workers,
     )
 
 

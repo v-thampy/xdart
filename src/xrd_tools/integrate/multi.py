@@ -26,6 +26,7 @@ from xrd_tools.core.containers import (
     IntegrationResult2D,
 )
 from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
+from xrd_tools.integrate import pyfai_numexpr
 from xrd_tools.integrate.detector_mask import mask_with_detector
 from xrd_tools.integrate.calibration import poni_to_integrator
 from xrd_tools.integrate.stitch_gi import GI_CUTS, GI_UNITS
@@ -136,18 +137,19 @@ def _resolve_streaming_ranges(
             # which is then paired with -180..180 integration values, dropping
             # half the detector.
             integrator.setChiDiscAtPi()
-            if radial_range is None:
-                values = np.asarray(
-                    integrator.array_from_unit(unit=radial_unit), dtype=float
-                )
-                radial_min = min(radial_min, float(values.min()))
-                radial_max = max(radial_max, float(values.max()))
-            if azimuth_range is None:
-                values = np.asarray(
-                    integrator.array_from_unit(unit=units.CHI_DEG), dtype=float
-                )
-                azimuth_min = min(azimuth_min, float(values.min()))
-                azimuth_max = max(azimuth_max, float(values.max()))
+            with pyfai_numexpr.PYFAI_NUMEXPR_LOCK:  # the centre arrays are numexpr formulas
+                if radial_range is None:
+                    values = np.asarray(
+                        integrator.array_from_unit(unit=radial_unit), dtype=float
+                    )
+                    radial_min = min(radial_min, float(values.min()))
+                    radial_max = max(radial_max, float(values.max()))
+                if azimuth_range is None:
+                    values = np.asarray(
+                        integrator.array_from_unit(unit=units.CHI_DEG), dtype=float
+                    )
+                    azimuth_min = min(azimuth_min, float(values.min()))
+                    azimuth_max = max(azimuth_max, float(values.max()))
         finally:
             integrator.reset(collect_garbage=False)
     if observed != image_count:
@@ -196,10 +198,15 @@ def _streaming_multigeometry(
     gi_map_npt: tuple[int, int] | None = None,
     profile_unit: str | None = None,
     profile_radial_range: tuple[float, float] | None = None,
+    workers: int = 1,
 ):
     """Returns (pyFAI's merged result, each GI cut's [signal, normalization, count, axis] in the plan's
     order, or () without GI, and with ``profile_npt`` beside a 2-D map pyFAI's merged I(q) over every χ
     in that many bins, as a 1-D Stitch of the same frames makes it; else None).
+
+    ``workers`` above 1 integrates that many frames at once on threads (``_parallel_frames``): this
+    thread reads the frames and merges their sums in frame order, so the result is the same, bit for
+    bit, as one worker's. It takes ``method="full"``, the method Stitch's operation runs.
 
     The profile is integrated in the same pass as the map, from the same frame and integrator, whose
     geometry pyFAI computes once for both (one pass instead of two: the frames are read and the
@@ -209,6 +216,13 @@ def _streaming_multigeometry(
 
     if type(image_count) is not int or image_count < 1:
         raise ValueError("streaming Stitch image count must be positive")
+    if type(workers) is not int or workers < 1:
+        raise ValueError("Stitch frame workers must be a positive int")
+    if workers > 1 and method != "full":
+        # the one method whose pyFAI geometry is proven to reach numexpr only where the workers hold the
+        # lock (tests/core/test_stitch_frame_workers.py); Stitch's operation runs it
+        raise ValueError(f"Stitch's frame workers integrate with pyFAI's 'full' splitting; {method!r} "
+                         "takes one worker")
     if mode not in {"1d", "2d"}:
         raise ValueError(f"mode must be '1d' or '2d', got {mode!r}")
     factors = _normalization_factors(normalization, image_count)
@@ -262,7 +276,10 @@ def _streaming_multigeometry(
     integrator_iterator = iter(integrator_factory())
     aggregate = profile_aggregate = None
     radial = azimuthal = None
-    for index in range(image_count):
+    numexpr_lock = pyfai_numexpr.PYFAI_NUMEXPR_LOCK
+
+    def read(index):
+        """The next frame and its integrator, read in frame order."""
         try:
             image = np.asarray(next(image_iterator), dtype=float)
         except StopIteration as error:
@@ -276,18 +293,22 @@ def _streaming_multigeometry(
                 f"streaming Stitch received {index} integrators; "
                 f"expected {image_count}"
             ) from error
-        if image.ndim != 2:
-            integrator.reset(collect_garbage=False)
-            raise ValueError(
-                f"streaming Stitch image must be 2-D, got shape {image.shape}"
-            )
-        for name, value in (("dark", dark), ("flat", flat)):
-            if value is not None and value.shape != image.shape:
-                integrator.reset(collect_garbage=False)
-                raise ValueError(
-                    f"Stitch {name} shape {value.shape} does not match the frame {image.shape}"
-                )
+        return image, integrator
+
+    def frame_part(index, image, integrator):
+        """One frame's pyFAI sums, a frame worker's share: its integration result, I(q) beside a map,
+        its GI sums and, screening, its total, with its radial and azimuthal axes. Its numexpr work (the
+        polarization array, the GI sums) holds the pyFAI numexpr lock; the integrations run outside it."""
         try:
+            if image.ndim != 2:
+                raise ValueError(
+                    f"streaming Stitch image must be 2-D, got shape {image.shape}"
+                )
+            for name, value in (("dark", dark), ("flat", flat)):
+                if value is not None and value.shape != image.shape:
+                    raise ValueError(
+                        f"Stitch {name} shape {value.shape} does not match the frame {image.shape}"
+                    )
             frame_mask = (
                 None
                 if mask is None and invalid is None
@@ -297,15 +318,16 @@ def _streaming_multigeometry(
             )
             if dark is not None:
                 integrator.detector.darkcurrent = dark
-        except BaseException:
-            integrator.reset(collect_garbage=False)
-            raise
-        monitor = 1.0 if factors is None else float(factors[index])
-        variance = None
-        if dark is not None and error_model == "poisson":
-            variance = np.maximum(image, 1.0)
-            variance += np.clip(dark, 0.0, None)
-        try:
+            monitor = 1.0 if factors is None else float(factors[index])
+            variance = None
+            if dark is not None and error_model == "poisson":
+                variance = np.maximum(image, 1.0)
+                variance += np.clip(dark, 0.0, None)
+            if polarization_factor is not None:
+                # the integrations' one numexpr use: pyFAI keeps the array on the integrator, and both
+                # integrations below take this one
+                with numexpr_lock:
+                    integrator.polarization(image.shape, polarization_factor, with_checksum=True)
             multigeometry = MultiGeometry(
                 [integrator],
                 unit=unit,
@@ -313,10 +335,6 @@ def _streaming_multigeometry(
                 azimuth_range=fixed_azimuth,
                 threadpoolsize=0,
             )
-        except BaseException:
-            integrator.reset(collect_garbage=False)
-            raise
-        try:
             if mode == "1d":
                 result = multigeometry.integrate1d(
                     [image],
@@ -389,36 +407,18 @@ def _streaming_multigeometry(
                     raise ValueError(
                         f"pyFAI returned an unexpected Stitch {label} shape"
                     )
-            current_radial = np.asarray(result.radial, dtype=float)
-            if radial is None:
-                radial = current_radial.copy()
-            elif not np.array_equal(radial, current_radial):
-                raise ValueError("pyFAI returned inconsistent Stitch radial axes")
-            if mode == "2d":
-                current_azimuthal = np.asarray(result.azimuthal, dtype=float)
-                if azimuthal is None:
-                    azimuthal = current_azimuthal.copy()
-                elif not np.array_equal(azimuthal, current_azimuthal):
-                    raise ValueError("pyFAI returned inconsistent Stitch azimuth axes")
             # the cuts take I(q)'s points (a 2-D Stitch's I(q) beside its map); the GI map its own
-            gi_part = () if gi is None else _gi_frame_sums(
-                integrator, image, gi_angles[index], gi, gi_bins, npt_rad if mode == "1d" else profile_npt,
-                mask=frame_mask, correct_solid_angle=correct_solid_angle,
-                polarization_factor=polarization_factor, dark=dark, flat=flat, monitor=monitor,
-                map_npt=gi_map_npt)
-            if frame_screen is None:
-                aggregate = (
-                    copy.deepcopy(result)
-                    if aggregate is None
-                    else aggregate.union(result)
-                )
-                add_gi(gi_part)
-                if profile is not None:
-                    profile_aggregate = (copy.deepcopy(profile) if profile_aggregate is None
-                                         else profile_aggregate.union(profile))
-            else:
-                # Hold this frame until its row neighbours are known; merge the
-                # released frames in their original order.
+            gi_part = ()
+            if gi is not None:
+                with numexpr_lock:  # its fiber units compile and evaluate numexpr formulas
+                    gi_part = _gi_frame_sums(
+                        integrator, image, gi_angles[index], gi, gi_bins,
+                        npt_rad if mode == "1d" else profile_npt,
+                        mask=frame_mask, correct_solid_angle=correct_solid_angle,
+                        polarization_factor=polarization_factor, dark=dark, flat=flat, monitor=monitor,
+                        map_npt=gi_map_npt)
+            total = None
+            if frame_screen is not None:
                 # Whole-frame monitor-normalised total over valid pixels: the
                 # in-range signal legitimately shrinks at the output range edges.
                 valid = np.isfinite(image) & (image >= 0)
@@ -429,20 +429,55 @@ def _streaming_multigeometry(
                     # A dropped frame on a detector with a pedestal still holds the dark.
                     signal -= float(dark[valid].sum())
                 total = signal / monitor
-                kept_profile = None if profile is None else copy.deepcopy(profile)
-                for (held, held_gi, held_profile), verdict in frame_screen.push(
-                        total, (copy.deepcopy(result), gi_part, kept_profile)):
-                    if not verdict.excluded:
-                        aggregate = held if aggregate is None else aggregate.union(held)
-                        add_gi(held_gi)
-                        if held_profile is not None:
-                            profile_aggregate = (held_profile if profile_aggregate is None
-                                                 else profile_aggregate.union(held_profile))
+            return (result, profile, gi_part, total, np.asarray(result.radial, dtype=float),
+                    np.asarray(result.azimuthal, dtype=float) if mode == "2d" else None)
         finally:
             integrator.reset(collect_garbage=False)
-        # Release the detector-sized frame before asking the source for its
-        # successor.  The aggregate retains only pyFAI's O(nbin) result arrays.
-        del image
+
+    def absorb(result, gi_part, profile):
+        """Add one kept frame's sums to the merged ones."""
+        nonlocal aggregate, profile_aggregate
+        with numexpr_lock:  # pyFAI's union recomputes the means with numexpr
+            aggregate = result if aggregate is None else aggregate.union(result)
+            if profile is not None:
+                profile_aggregate = profile if profile_aggregate is None else profile_aggregate.union(profile)
+        add_gi(gi_part)
+
+    def merge(part):
+        """Merge one frame's sums, in frame order."""
+        nonlocal radial, azimuthal
+        result, profile, gi_part, total, current_radial, current_azimuthal = part
+        if radial is None:
+            radial = current_radial.copy()
+        elif not np.array_equal(radial, current_radial):
+            raise ValueError("pyFAI returned inconsistent Stitch radial axes")
+        if mode == "2d":
+            if azimuthal is None:
+                azimuthal = current_azimuthal.copy()
+            elif not np.array_equal(azimuthal, current_azimuthal):
+                raise ValueError("pyFAI returned inconsistent Stitch azimuth axes")
+        if frame_screen is None:
+            absorb(copy.deepcopy(result) if aggregate is None else result, gi_part,
+                   None if profile is None else
+                   copy.deepcopy(profile) if profile_aggregate is None else profile)
+        else:
+            # Hold this frame until its row neighbours are known; merge the
+            # released frames in their original order.
+            kept_profile = None if profile is None else copy.deepcopy(profile)
+            for (held, held_gi, held_profile), verdict in frame_screen.push(
+                    total, (copy.deepcopy(result), gi_part, kept_profile)):
+                if not verdict.excluded:
+                    absorb(held, held_gi, held_profile)
+
+    if workers == 1:
+        for index in range(image_count):
+            image, integrator = read(index)
+            merge(frame_part(index, image, integrator))
+            # Release the detector-sized frame before asking the source for its
+            # successor.  The aggregate retains only pyFAI's O(nbin) result arrays.
+            del image, integrator
+    else:
+        _parallel_frames(image_count, read, frame_part, merge, workers)
     try:
         next(image_iterator)
     except StopIteration:
@@ -458,16 +493,40 @@ def _streaming_multigeometry(
     if frame_screen is not None:
         for (held, held_gi, held_profile), verdict in frame_screen.finish():
             if not verdict.excluded:
-                aggregate = held if aggregate is None else aggregate.union(held)
-                add_gi(held_gi)
-                if held_profile is not None:
-                    profile_aggregate = (held_profile if profile_aggregate is None
-                                         else profile_aggregate.union(held_profile))
+                absorb(held, held_gi, held_profile)
         if aggregate is None:
             raise ValueError("every Stitch frame was excluded as a dropped frame")
     if aggregate is None or radial is None:
         raise ValueError("streaming Stitch produced no result")
     return aggregate, () if gi_totals is None else tuple(gi_totals), profile_aggregate
+
+
+def _parallel_frames(count, read, compute, merge, workers):
+    """``compute`` (one frame's sums) the ``count`` frames on ``workers`` threads while this thread
+    ``read``s them and ``merge``s their sums in frame order, as Int's reduction delivers its frames: one
+    reader, per-frame workers, an in-order drain. At most two frames a worker are read and not yet
+    merged. A failure (a frame's, a read's, a cancellation) cancels the frames not started, waits for
+    the running ones and is raised; frames merge in order, so it is the first failing frame's error,
+    as with one worker."""
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    limit = 2 * workers
+    window = deque()
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="xdart-stitch-frame")
+    try:
+        for index in range(count):
+            image, integrator = read(index)
+            window.append(pool.submit(compute, index, image, integrator))
+            del image, integrator
+            while window and (len(window) >= limit or window[0].done()):
+                merge(window.popleft().result())
+        while window:
+            merge(window.popleft().result())
+    finally:
+        for future in window:
+            future.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _drop_unsplit_bins(result):
@@ -581,22 +640,25 @@ def _gi_bins(integrator_factory, gi_angles, gi):
     low, high = dict.fromkeys(scouted, np.inf), dict.fromkeys(scouted, -np.inf)
     for integrator, (incidence, tilt) in zip(integrator_factory(), gi_angles):
         try:
-            fiber = _fiber_from_integrator(integrator, incident_angle=float(incidence), tilt_angle=float(tilt),
-                                           sample_orientation=gi.sample_orientation)
-            unit = dict(incident_angle=float(incidence), tilt_angle=float(tilt),
-                        sample_orientation=gi.sample_orientation, angle_unit="deg")
-            shape = fiber.detector.shape
-            q_ip = np.asarray(fiber.array_from_unit(shape, "center", get_unit_fiber("qip_A^-1", **unit), scale=True))
-            q_oop = np.asarray(fiber.array_from_unit(shape, "center", get_unit_fiber("qoop_A^-1", **unit), scale=True))
-            for cut in scouted:
-                values, other = (q_ip, q_oop) if cut == "q_ip" else (q_oop, q_ip)
-                inside = np.isfinite(values)
-                window = gi.window(cut)
-                if window is not None:
-                    inside &= (other >= window[0]) & (other <= window[1])
-                if inside.any():
-                    low[cut] = min(low[cut], float(values[inside].min()))
-                    high[cut] = max(high[cut], float(values[inside].max()))
+            with pyfai_numexpr.PYFAI_NUMEXPR_LOCK:  # fiber units compile and evaluate numexpr formulas
+                fiber = _fiber_from_integrator(integrator, incident_angle=float(incidence), tilt_angle=float(tilt),
+                                               sample_orientation=gi.sample_orientation)
+                unit = dict(incident_angle=float(incidence), tilt_angle=float(tilt),
+                            sample_orientation=gi.sample_orientation, angle_unit="deg")
+                shape = fiber.detector.shape
+                q_ip = np.asarray(fiber.array_from_unit(
+                    shape, "center", get_unit_fiber("qip_A^-1", **unit), scale=True))
+                q_oop = np.asarray(fiber.array_from_unit(
+                    shape, "center", get_unit_fiber("qoop_A^-1", **unit), scale=True))
+                for cut in scouted:
+                    values, other = (q_ip, q_oop) if cut == "q_ip" else (q_oop, q_ip)
+                    inside = np.isfinite(values)
+                    window = gi.window(cut)
+                    if window is not None:
+                        inside &= (other >= window[0]) & (other <= window[1])
+                    if inside.any():
+                        low[cut] = min(low[cut], float(values[inside].min()))
+                        high[cut] = max(high[cut], float(values[inside].max()))
         finally:
             integrator.reset(collect_garbage=False)
     for cut in scouted:
@@ -646,9 +708,11 @@ def stitch_1d_streaming(
     flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
     gi=None,
     gi_angles: Sequence[tuple[float, float]] | None = None,
+    workers: int = 1,
 ) -> tuple[IntegrationResult1D, StitchDiagnostics,
            tuple[tuple[IntegrationResult1D, StitchDiagnostics], ...]]:
-    """Sequential MultiGeometry merge that retains only one detector frame.
+    """Sequential MultiGeometry merge that retains only one detector frame per worker
+    (``workers`` frames integrated at once, merged in frame order: the same result).
 
     Returns (I(q), diagnostics, the GI cuts): with ``gi`` (a ``StitchGI``) and each frame's pyFAI
     (incident angle, tilt) in ``gi_angles``, each of its cuts (``gi_cut_result``, in ``gi.cuts`` order) is binned with ``npt`` points
@@ -677,6 +741,7 @@ def stitch_1d_streaming(
         flat_min_fraction=flat_min_fraction,
         gi=gi,
         gi_angles=gi_angles,
+        workers=workers,
     )
     payload, diagnostics = _stitch_1d_payload(result, unit)
     return payload, diagnostics, tuple(gi_cut_result(totals, GI_UNITS[cut])
@@ -747,8 +812,10 @@ def stitch_2d_streaming(
     dark: np.ndarray | None = None,
     flat: np.ndarray | None = None,
     flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
+    workers: int = 1,
 ) -> tuple[IntegrationResult2D, StitchDiagnostics]:
-    """Sequential 2-D MultiGeometry merge retaining one detector frame."""
+    """Sequential 2-D MultiGeometry merge retaining one detector frame per worker (``workers`` as
+    :func:`stitch_1d_streaming`)."""
 
     result, _gi, _profile = _streaming_multigeometry(
         images,
@@ -770,6 +837,7 @@ def stitch_2d_streaming(
         dark=dark,
         flat=flat,
         flat_min_fraction=flat_min_fraction,
+        workers=workers,
     )
     return _stitch_2d_payload(result)
 
@@ -798,6 +866,7 @@ def stitch_2d_with_1d_streaming(
     gi_angles: Sequence[tuple[float, float]] | None = None,
     unit_1d: str | None = None,
     radial_range_1d: tuple[float, float] | None = None,
+    workers: int = 1,
 ) -> tuple:
     """The 2-D map and I(q) beside it, as an Int 2D record holds them, from one pass over the frames:
     the map as :func:`stitch_2d_streaming` makes it, and I(q) over every χ in ``npt_1d`` bins as
@@ -805,7 +874,7 @@ def stitch_2d_with_1d_streaming(
     with ``unit_1d`` in its own and ``radial_range_1d`` (None: its frames' extent), as Int's two
     integrations. With ``gi`` and every frame's (incidence, tilt) in ``gi_angles``, also its cuts as
     :func:`stitch_1d_streaming` makes them and the q_ip-q_oop map (``npt_rad`` × ``npt_azim`` over the
-    cuts' ranges).
+    cuts' ranges). ``workers`` as :func:`stitch_1d_streaming`.
 
     Returns (map, its diagnostics, I(q), its diagnostics, the GI cuts or (), the GI map or None)."""
 
@@ -835,6 +904,7 @@ def stitch_2d_with_1d_streaming(
         gi_map_npt=None if gi is None else (npt_rad, npt_azim),
         profile_unit=unit_1d,
         profile_radial_range=radial_range_1d,
+        workers=workers,
     )
     cuts = tuple(gi_cut_result(totals, GI_UNITS[cut]) for cut, totals in zip(() if gi is None else gi.cuts, gi_totals))
     gi_map = None if gi is None else gi_map_result(gi_totals[-1])

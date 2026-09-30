@@ -477,6 +477,7 @@ def run_stitch(
     collect_frame_records: bool = True,
     frame_record_callback: Callable[[int, np.ndarray], None] | None = None,
     frame_screen: Any = None,
+    workers: int = 1,
 ) -> AnalysisResult:
     """Run MultiGeometry stitching over one headless frame source or a GROUP.
 
@@ -497,6 +498,9 @@ def run_stitch(
     radial/azimuthal range.
     ``frame_record_callback`` borrows each loaded raw array before conditioning;
     callers must detach thumbnails and must not retain the full frame.
+    ``workers`` integrates that many frames at once in the streaming MultiGeometry
+    stitch (read and merged in frame order on this thread: the same result); the
+    other paths take one.
     """
 
     if progress_callback is not None and not callable(progress_callback):
@@ -505,6 +509,8 @@ def run_stitch(
         raise TypeError("stitch cancellation token must be an exact threading.Event")
     if type(collect_frame_records) is not bool:
         raise TypeError("collect_frame_records must be an exact bool")
+    if type(workers) is not int or workers < 1:
+        raise ValueError("stitch workers must be a positive int")
     if frame_record_callback is not None and not callable(frame_record_callback):
         raise TypeError("stitch frame-record callback must be callable")
     if plan.conditioning is not None and type(plan.conditioning) is not StitchConditioning:
@@ -775,13 +781,13 @@ def run_stitch(
             if plan.stitch_profile:
                 payload, auxiliary, *profile, gi_cuts, gi_map = stitch_2d_with_1d_streaming(
                     _iter_images(), len(labels), integrator_series.__iter__, npt_1d=plan.npt_1d,
-                    gi=plan.stitch_gi, gi_angles=gi_angles,
+                    gi=plan.stitch_gi, gi_angles=gi_angles, workers=workers,
                     **(dict(unit_1d=plan.unit, radial_range_1d=plan.radial_range) if own_map else {}),
                     **arguments)
                 profile = tuple(profile)
             else:
                 payload, auxiliary = stitch_2d_streaming(
-                    _iter_images(), len(labels), integrator_series.__iter__, **arguments)
+                    _iter_images(), len(labels), integrator_series.__iter__, workers=workers, **arguments)
         elif plan.mode == "2d":
             assert integrators is not None
             images = _load_images_eager()
@@ -798,7 +804,8 @@ def run_stitch(
                 npt=plan.npt_1d, unit=plan.unit, method=plan.method,
                 radial_range=plan.radial_range,
                 mask=plan.mask, normalization=normalization,
-                frame_screen=frame_screen, gi=plan.stitch_gi, gi_angles=gi_angles, **corrections,
+                frame_screen=frame_screen, gi=plan.stitch_gi, gi_angles=gi_angles, workers=workers,
+                **corrections,
             )
         else:
             assert integrators is not None

@@ -58,6 +58,7 @@ from xrd_tools.io.finite_artifact import (
     FiniteSeedBinding,
 )
 from xrd_tools.io.image import read_image
+from xrd_tools.integrate.pyfai_numexpr import PYFAI_NUMEXPR_LOCK
 from xrd_tools.io.nexus import (
     open_nexus_writer,
     open_nexus_image_stack,
@@ -5112,7 +5113,8 @@ def _replace_integration_2d_ranges(
     return replace(plan, integration_2d=p2d)
 
 
-_PYFAI_COLD_GEOMETRY_LOCK = threading.Lock()
+# Shared with Stitch's frame workers: one lock for all pyFAI numexpr work in the process.
+_PYFAI_COLD_GEOMETRY_LOCK = PYFAI_NUMEXPR_LOCK
 
 
 class _ReductionIntegratorProvider:
