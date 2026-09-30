@@ -129,6 +129,128 @@ class RefineResult:
     param_correlations: Mapping[str, Any] = field(default_factory=dict)
     #: with the energy refined: recorded_eV, refined_eV, sigma_eV, bound_eV, at_bound
     energy_refinement: Mapping[str, Any] = field(default_factory=dict)
+    #: with ``bounds``: each parameter in public units (mm, degrees, eV) — its initial and fitted
+    #: value, its bounds (None: free) and whether it reached one
+    fit_bounds: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ArmFitBounds:
+    """A detector-arm fit's supplied estimates and its freedom about them (maintainer,
+    2026-09-29: "this is to make sure the sample displacement in particular doesn't go to
+    unrealistic values").
+
+    ``zeros_deg`` gives a moving circle's ('del', 'nu') motor-zero reading in degrees: physical
+    angle = motor readback − zero, so the arm's offset is −(signed scale) × zero. ``held_deg`` is a
+    single arm's held circle's fixed angle (its pitch or yaw; None: not supplied, 0). ``mount_deg``
+    is the detector mount's (tilt, roll). The fit starts at these and keeps each angle within
+    ±``zero_freedom_deg`` of its estimate, the mount within ±``mount_freedom_deg``, each sample
+    displacement within ±``sample_offset_mm`` of zero, and the distance within
+    ±``distance_fraction`` of its seed unless explicit distance bounds are given. The PONI stays
+    free. ``zero_sources`` records where each zero came from (:meth:`resolved`).
+    """
+
+    zeros_deg: Any = ()
+    held_deg: float | None = None
+    mount_deg: tuple[float, float] = (0., 0.)
+    zero_freedom_deg: float = 2.
+    mount_freedom_deg: float = 2.
+    sample_offset_mm: float = .05
+    distance_fraction: float = .05
+    zero_sources: Any = ()
+
+    def __post_init__(self):
+        zeros, sources = dict(self.zeros_deg), dict(self.zero_sources)
+        if set(zeros) - {'del', 'nu'} or set(sources) - set(zeros):
+            raise ValueError("motor zeros are given for the arm's circles, 'del' and 'nu'")
+        numbers = (*zeros.values(), *self.mount_deg, *(() if self.held_deg is None else (self.held_deg,)),
+                   self.zero_freedom_deg, self.mount_freedom_deg, self.sample_offset_mm, self.distance_fraction)
+        if len(tuple(self.mount_deg)) != 2 or any(isinstance(value, (bool, str)) or not math.isfinite(float(value))
+                                                   for value in numbers):
+            raise ValueError('fit estimates and bounds must be finite numbers')
+        if min(self.zero_freedom_deg, self.mount_freedom_deg, self.sample_offset_mm) <= 0 \
+                or not 0 < self.distance_fraction < 1:
+            raise ValueError('each fit bound must be positive (the distance fraction below 1)')
+        object.__setattr__(self, 'zeros_deg', tuple(sorted((c, float(v)) for c, v in zeros.items())))
+        object.__setattr__(self, 'zero_sources', tuple(sorted((c, str(v)) for c, v in sources.items())))
+        object.__setattr__(self, 'mount_deg', tuple(float(v) for v in self.mount_deg))
+        for name in ('zero_freedom_deg', 'mount_freedom_deg', 'sample_offset_mm', 'distance_fraction'):
+            object.__setattr__(self, name, float(getattr(self, name)))
+        if self.held_deg is not None:
+            object.__setattr__(self, 'held_deg', float(self.held_deg))
+
+    def zero(self, circle) -> float:
+        return dict(self.zeros_deg).get(circle, 0.)
+
+    def resolved(self, moving, *, seed_zeros=None, seed_held=None) -> 'ArmFitBounds':
+        """These estimates for the circles an arm moves: a typed zero first, then the seed
+        calibration's own, then 0 (each zero's source recorded); a held angle not supplied is
+        the seed's, else 0. Zeros of circles the arm does not move are dropped."""
+        typed, seeded, known = dict(self.zeros_deg), dict(seed_zeros or {}), dict(self.zero_sources)
+        zeros, sources = {}, {}
+        for circle in moving:  # a zero resolved before keeps its source
+            zeros[circle], sources[circle] = ((typed[circle], known.get(circle, 'typed')) if circle in typed else
+                                              (seeded[circle], 'seed') if circle in seeded else (0., 'default'))
+        held = self.held_deg if self.held_deg is not None else seed_held
+        return replace(self, zeros_deg=zeros, zero_sources=sources, held_deg=held)
+
+    def to_record(self) -> dict:
+        return {'zeros_deg': dict(self.zeros_deg), 'zero_sources': dict(self.zero_sources),
+                'held_deg': self.held_deg, 'mount_deg': list(self.mount_deg),
+                'zero_freedom_deg': self.zero_freedom_deg, 'mount_freedom_deg': self.mount_freedom_deg,
+                'sample_offset_mm': self.sample_offset_mm, 'distance_fraction': self.distance_fraction}
+
+
+def _arm_box(bounds, *, distance, poni1, poni2, nu_motor, del_motor, nu_sign, del_sign,
+             distance_bounds_m, extended):
+    """The fit's start and box, in its internal units, for [dist, poni1, poni2, nu_offset,
+    del_offset] and, extended, the mount and the sample offsets; and each parameter's row
+    (name, factor to public units, initial, lower, upper in public units)."""
+    lo, hi = (distance_bounds_m if distance_bounds_m is not None
+              else (distance * (1 - bounds.distance_fraction), distance * (1 + bounds.distance_fraction)))
+    start, lower, upper = [distance, poni1, poni2], [lo, -np.inf, -np.inf], [hi, np.inf, np.inf]
+    rows = [('distance_mm', 1e3, distance * 1e3, lo * 1e3, hi * 1e3),
+            ('poni1_mm', 1e3, poni1 * 1e3, None, None), ('poni2_mm', 1e3, poni2 * 1e3, None, None)]
+    half = bounds.zero_freedom_deg * _DEG2RAD
+    for circle, motor, sign in (('nu', nu_motor, nu_sign), ('del', del_motor, del_sign)):
+        scale = sign * _DEG2RAD
+        if motor is None:  # a held circle's fixed angle: offset = scale × angle
+            estimate, name, factor = bounds.held_deg or 0., f'{circle}_held_deg', 1 / scale
+            centre = scale * estimate
+        else:  # a motor zero: offset = −scale × zero
+            estimate, name, factor = bounds.zero(circle), f'{circle}_zero_deg', -1 / scale
+            centre = -scale * estimate
+        start.append(centre)
+        lower.append(centre - half)
+        upper.append(centre + half)
+        rows.append((name, factor, estimate, estimate - bounds.zero_freedom_deg,
+                     estimate + bounds.zero_freedom_deg))
+    if extended:
+        for name, estimate in zip(('mount_tilt_deg', 'mount_roll_deg'), bounds.mount_deg):
+            start.append(estimate * _DEG2RAD)
+            lower.append((estimate - bounds.mount_freedom_deg) * _DEG2RAD)
+            upper.append((estimate + bounds.mount_freedom_deg) * _DEG2RAD)
+            rows.append((name, 1 / _DEG2RAD, estimate, estimate - bounds.mount_freedom_deg,
+                         estimate + bounds.mount_freedom_deg))
+        limit = bounds.sample_offset_mm * 1e-3
+        for k in (1, 2, 3):
+            start.append(0.)
+            lower.append(-limit)
+            upper.append(limit)
+            rows.append((f'sample_offset{k}_mm', 1e3, 0., -bounds.sample_offset_mm, bounds.sample_offset_mm))
+    return np.array(start), np.array(lower), np.array(upper), rows
+
+
+def _fit_table(rows, fitted, lower, upper):
+    """Each parameter in public units: its initial and fitted value, its bounds (None: free) and
+    whether it reached one (within a millionth of its box)."""
+    table = {}
+    for (name, factor, initial, low, high), x, lo, hi in zip(rows, fitted, lower, upper):
+        bounded = bool(np.isfinite(lo) and np.isfinite(hi))
+        table[name] = {'initial': float(initial), 'fitted': float(x * factor),
+                       'lower': None if low is None else float(low), 'upper': None if high is None else float(high),
+                       'at_bound': bounded and bool(min(x - lo, hi - x) <= 1e-6 * (hi - lo))}
+    return table
 
 
 def _resolve_calibrant_q(calibrant: Any, wavelength_m: float,
@@ -226,6 +348,7 @@ def refine_goniometer(
     model: str = 'affine',
     beam_rotation: float | None = None,
     energy_bound_eV: float | None = None,
+    bounds: ArmFitBounds | None = None,
 ) -> RefineResult:
     """Fit affine or exact del-on-nu geometry to powder control points.
 
@@ -274,6 +397,10 @@ def refine_goniometer(
         The pinned rotation about the beam (``rot3``'s offset, radians); |q|
         cannot see it. ``None`` keeps the base PONI's ``rot3`` (the extended
         model: zero).
+    bounds : ArmFitBounds, optional
+        Start at these estimates and keep the distance and the circles' angles
+        within their freedom (see :class:`ArmFitBounds`); the result's
+        ``fit_bounds`` reports each parameter. ``None`` fits unbounded, as before.
 
     Returns
     -------
@@ -294,7 +421,7 @@ def refine_goniometer(
             distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
             max_nfev=max(max_nfev, 2000), cancelled=cancelled,
             beam_rotation=0. if beam_rotation is None else float(beam_rotation),
-            energy_bound_eV=energy_bound_eV)
+            energy_bound_eV=energy_bound_eV, bounds=bounds)
     if model not in {'affine', 'stacked_del_on_nu'}:
         raise ValueError('unknown goniometer model')
     if rot1_motor is None and rot2_motor is None:
@@ -356,6 +483,12 @@ def refine_goniometer(
         seed.append(r1_nominal)
     if fit_r2s:
         seed.append(r2_nominal)
+    box = None
+    if bounds is not None:  # start at the estimates, within their freedom
+        box = _arm_box(bounds, distance=distance, poni1=base_poni.poni1, poni2=base_poni.poni2,
+                       nu_motor=rot1_motor, del_motor=rot2_motor, nu_sign=r1_sign, del_sign=r2_sign,
+                       distance_bounds_m=None if distance_bounds_m is None else (lo, hi), extended=False)
+        seed[:5] = box[0]
     seed = np.asarray(seed, dtype=float)
     r3_pinned = float(base_poni.rot3 if beam_rotation is None else beam_rotation)
 
@@ -391,16 +524,23 @@ def refine_goniometer(
             out.append(q_pred - q_ring[f.rings])
         return np.concatenate(out)
 
-    bounds = (-np.inf, np.inf)
-    if distance_bounds_m is not None:
-        lower, upper = np.full(len(seed), -np.inf), np.full(len(seed), np.inf)
+    lower, upper = np.full(len(seed), -np.inf), np.full(len(seed), np.inf)
+    if box is not None:
+        lower[:5], upper[:5] = box[1], box[2]
+    elif distance_bounds_m is not None:
         lower[0], upper[0] = lo, hi
-        bounds = (lower, upper)
-    res = least_squares(_residual, seed,
-                        method="lm" if distance_bounds_m is None else "trf",
-                        bounds=bounds, max_nfev=max_nfev, x_scale="jac")
+    bounded = box is not None or distance_bounds_m is not None
+    res = least_squares(_residual, seed, method="trf" if bounded else "lm",
+                        bounds=(lower, upper) if bounded else (-np.inf, np.inf),
+                        max_nfev=max_nfev, x_scale="jac")
     rms = float(np.sqrt(np.mean(res.fun ** 2)))
     dist, poni1, poni2, r1o, r2o, r3o, r1s, r2s = _unpack(res.x)
+    fit_bounds = {}
+    if box is not None:
+        fit_bounds = _fit_table(box[3], res.x[:5], box[1], box[2])
+        for circle, offset, scale in (('nu', r1o, r1s), ('del', r2o, r2s)):  # a fitted scale reads the zero
+            if f'{circle}_zero_deg' in fit_bounds:
+                fit_bounds[f'{circle}_zero_deg']['fitted'] = float(-offset / scale)
 
     # --- conditioning (the Jacobian least_squares already returns) ---------
     try:
@@ -482,6 +622,7 @@ def refine_goniometer(
         diffractometer=diff, rms_q=rms, n_points=n_points,
         params=dict(zip(param_names, param)), success=ok,
         condition_number=condition, frozen_scales=tuple(frozen), message=message,
+        fit_bounds=fit_bounds,
     )
 
 
@@ -520,6 +661,7 @@ def refine_stacked_arm(
     max_nfev: int = 2000,
     cancelled=None,
     energy_bound_eV: float | None = None,
+    bounds: ArmFitBounds | None = None,
 ) -> RefineResult:
     """Fit the del-on-nu arm at sub-pixel control-point positions.
 
@@ -549,6 +691,11 @@ def refine_stacked_arm(
     (maintainer, 2026-09-29). Each predicted q scales as E / E₀; the result's
     ``energy_refinement`` gives the refined energy, its one-sigma error and whether the bound
     held it.
+
+    ``bounds`` (:class:`ArmFitBounds`) starts every solve — the five-parameter one, the extended one
+    and each outlier refit — at the supplied estimates and keeps the distance, the circles' angles,
+    the mount and the sample offsets within their freedom; ``fit_bounds`` reports each parameter.
+    ``None`` fits unbounded from zero offsets, as before.
     """
     from scipy.optimize import least_squares  # noqa: PLC0415
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator  # noqa: PLC0415
@@ -592,7 +739,6 @@ def refine_stacked_arm(
     distance = base_poni.dist if distance_seed_m is None else float(distance_seed_m)
     if not np.isfinite(distance) or distance <= 0:
         raise ValueError("distance seed must be finite and positive metres")
-    bounds = (-np.inf, np.inf)
     if distance_bounds_m is not None:
         lo, hi = (float(v) for v in distance_bounds_m)
         if not (np.isfinite([lo, hi]).all() and 0 < lo < hi and lo <= distance <= hi):
@@ -607,6 +753,22 @@ def refine_stacked_arm(
         if not math.isfinite(bound_eV) or not 0 < bound_eV < .05 * recorded_eV:
             raise ValueError("the energy bound must be positive eV, under 5 % of the energy")
         span = bound_eV / recorded_eV
+    box = None if bounds is None else _arm_box(
+        bounds, distance=distance, poni1=base_poni.poni1, poni2=base_poni.poni2, nu_motor=nu_motor,
+        del_motor=del_motor, nu_sign=nu_sign, del_sign=del_sign, extended=extended,
+        distance_bounds_m=None if distance_bounds_m is None else (lo, hi))
+
+    def box_for(size):
+        """The (lower, upper) bounds of a parameter vector of this size."""
+        lower, upper = np.full(size, -np.inf), np.full(size, np.inf)
+        arm = size - int(fit_energy)
+        if box is not None:
+            lower[:arm], upper[:arm] = box[1][:arm], box[2][:arm]
+        elif distance_bounds_m is not None:
+            lower[0], upper[0] = lo, hi
+        if fit_energy:
+            lower[-1], upper[-1] = 1.0 - span, 1.0 + span
+        return lower, upper
 
     def energy_split(p):
         """(the arm's parameters, the energy scale E / E₀)."""
@@ -640,23 +802,20 @@ def refine_stacked_arm(
             if cancelled is not None and cancelled.is_set():
                 raise InterruptedError("goniometer refinement cancelled")
             return predicted(p, keep)
-        if distance_bounds_m is None and not fit_energy:
+        if box is None and distance_bounds_m is None and not fit_energy:
             return least_squares(residual, p0, method="lm", x_scale="jac", max_nfev=max_nfev)
-        lower, upper = np.full(len(p0), -np.inf), np.full(len(p0), np.inf)
-        if distance_bounds_m is not None:
-            lower[0], upper[0] = lo, hi
-        if fit_energy:
-            lower[-1], upper[-1] = 1.0 - span, 1.0 + span
-        return least_squares(residual, p0, method="trf", bounds=(lower, upper),
+        return least_squares(residual, p0, method="trf", bounds=box_for(len(p0)),
                              x_scale="jac", max_nfev=max_nfev)
 
     keep = [np.ones(len(f.rows), dtype=bool) for f in frames]
     energy = [1.0] if fit_energy else []
-    p0 = np.array([distance, base_poni.poni1, base_poni.poni2, 0.0, 0.0, *energy])
-    res = solve(p0, keep)
+    start = (np.array([distance, base_poni.poni1, base_poni.poni2, 0.0, 0.0]) if box is None
+             else box[0][:5])  # the estimates, not zero offsets
+    res = solve(np.r_[start, energy], keep)
     if extended:
         core, scale = energy_split(res.x)
-        res = solve(np.r_[core, np.zeros(len(_EXTENSION_NAMES)), [scale] if fit_energy else []], keep)
+        extension = np.zeros(len(_EXTENSION_NAMES)) if box is None else box[0][5:]
+        res = solve(np.r_[core, extension, [scale] if fit_energy else []], keep)
     rejected = 0
     if reject_outliers is not None:
         for _ in range(2):
@@ -668,6 +827,11 @@ def refine_stacked_arm(
             rejected = int(sum((~k).sum() for k in keep))
             res = solve(res.x, keep)
     p = res.x
+    fit_bounds = {}
+    if box is not None:
+        rows = box[3] + ([('energy_eV', recorded_eV, recorded_eV, recorded_eV - bound_eV, recorded_eV + bound_eV)]
+                         if fit_energy else [])
+        fit_bounds = _fit_table(rows, p, *box_for(len(p)))
     rms = float(np.sqrt(np.mean(res.fun ** 2)))
     n_points = int(len(res.fun))
     jac = np.asarray(res.jac)
@@ -733,7 +897,8 @@ def refine_stacked_arm(
         condition_number=condition, frozen_scales=(), message=message,
         param_errors=param_errors, rejected_points=rejected,
         param_correlations=param_correlations, energy_refinement=energy_refinement,
+        fit_bounds=fit_bounds,
     )
 
 
-__all__ = ["ControlFrame", "RefineResult", "refine_goniometer", "refine_stacked_arm"]
+__all__ = ["ArmFitBounds", "ControlFrame", "RefineResult", "refine_goniometer", "refine_stacked_arm"]

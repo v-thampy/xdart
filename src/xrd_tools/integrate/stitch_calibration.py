@@ -425,8 +425,15 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                     fit_scales=False, distance_seed_m=None, distance_bounds_m=None,
                     max_rms_q=0.03, domain=None, distance_provenance=None, cancelled=None,
                     arm_model='stacked', validation_angles=None, progress=None,
-                    instrument_geometry=None, min_frames=3, energy_bound_eV=None):
+                    instrument_geometry=None, min_frames=3, energy_bound_eV=None, bounds=None):
     """Fit the matched rows and refuse unconverged, degenerate or poor fits.
+
+    ``bounds`` (:class:`~xrd_tools.integrate.refine.ArmFitBounds`; None: its defaults) gives the
+    moving circles' motor-zero estimates, the mount's and the freedom about them (maintainer,
+    2026-09-29): every solve starts at the estimates and stays within ±2° of each zero and of the
+    mount, ±0.05 mm of each sample displacement and ±5 % of the distance seed unless
+    ``distance_bounds_m`` is given. The provenance's ``fit_bounds`` records the estimates (and
+    where each zero came from) and each parameter's initial and fitted value, bounds and contact.
 
     ``energy_bound_eV`` also refines the energy within that many eV of the frames' recorded one
     (maintainer, 2026-09-29: "add a refine energy toggle … just one number for +-that number"):
@@ -448,13 +455,16 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     (:func:`automatic_arm_reason`) and the five-parameter arm otherwise, or when the
     extension is refused; the message and provenance say which, and why.
     """
+    from xrd_tools.integrate.refine import ArmFitBounds
+    bounds = (ArmFitBounds() if bounds is None else bounds).resolved(
+        [circle for circle, motor in (('del', del_motor), ('nu', nu_motor)) if motor is not None])
     if arm_model == 'auto':
         options = dict(backend=backend, del_motor=del_motor, nu_motor=nu_motor, fit_scales=fit_scales,
                        distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m, max_rms_q=max_rms_q,
                        domain=domain, distance_provenance=distance_provenance, cancelled=cancelled,
                        validation_angles=validation_angles, progress=progress,
                        instrument_geometry=instrument_geometry, min_frames=min_frames,
-                       energy_bound_eV=energy_bound_eV)
+                       energy_bound_eV=energy_bound_eV, bounds=bounds)
         reason = automatic_arm_reason(frames, del_motor=del_motor, nu_motor=nu_motor, fit_scales=fit_scales)
         if not reason:
             try:
@@ -481,7 +491,8 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                                 distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
                                 max_rms_q=max_rms_q, domain=domain, distance_provenance=distance_provenance,
                                 cancelled=cancelled, validation_angles=validation_angles, progress=progress,
-                                instrument_geometry=instrument_geometry, energy_bound_eV=energy_bound_eV)
+                                instrument_geometry=instrument_geometry, energy_bound_eV=energy_bound_eV,
+                                bounds=bounds)
     if energy_bound_eV is not None and backend == 'xu_hist':
         raise ValueError('the energy is refined on the pyFAI arm (and carried to its xrayutilities '
                          'partner); fit with pyFAI MultiGeometry')
@@ -509,7 +520,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                                   model='stacked_del_on_nu' if arm_model == 'stacked'
                                   else 'stacked_del_on_nu_extended',
                                   beam_rotation=0.,  # the design geometry; |q| cannot measure it
-                                  energy_bound_eV=energy_bound_eV)
+                                  energy_bound_eV=energy_bound_eV, bounds=bounds)
         if not result.success or result.rms_q > max_rms_q:
             raise ValueError(result.message or f'fit RMS {result.rms_q:.5g} exceeds {max_rms_q:g} Å⁻¹')
         asset = result.diffractometer.stacked_arm.to_pyfai_goniometer(
@@ -530,6 +541,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
             message += (f"; energy {energy['refined_eV']:.1f} ± {energy['sigma_eV']:.1f} eV (recorded "
                         f"{energy['recorded_eV']:.1f}" + (f", held at ±{energy['bound_eV']:g} eV)"
                                                            if energy['at_bound'] else ")"))
+        message += bound_contact_note(result.fit_bounds)
     elif backend == 'xu_hist':
         asset, rms, condition, count = _fit_xu(frames, loaded, del_motor, nu_motor,
             distance_seed_m, distance_bounds_m, max_rms_q, domain, cancelled)
@@ -547,6 +559,10 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                   'direct_beam': distance_provenance}
     if instrument_geometry is not None:  # which motor drives which circle, for RSM and later reads
         provenance['instrument_geometry'] = dict(instrument_geometry)
+    # the estimates and freedom the fit took, and where each parameter ended (the xrayutilities
+    # five-parameter fit takes none)
+    provenance['fit_bounds'] = ({'estimates': bounds.to_record(), 'parameters': dict(result.fit_bounds)}
+                                if backend == 'multigeometry' else None)
     if arm_model == 'stacked_extended' or (backend == 'multigeometry' and energy):
         provenance['arm_model'] = arm_model
         provenance['parameter_errors'] = dict(result.param_errors)
@@ -560,6 +576,12 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
         raise InterruptedError('calibration fit cancelled')
     # Provenance is a separate adjacent document for standard pyFAI files.
     return CalibrationFit(backend, {'calibration': asset, 'provenance': provenance}, rms, condition, count, message)
+
+
+def bound_contact_note(table) -> str:
+    """'; at a fit bound: …' naming the parameters a fit left at a bound ('' when none)."""
+    names = [name for name, row in (table or {}).items() if row.get('at_bound')]
+    return f"; at a fit bound: {', '.join(names)}" if names else ''
 
 
 def automatic_arm_reason(frames, *, del_motor='del', nu_motor='nu', fit_scales=False) -> str:
@@ -652,14 +674,15 @@ def _fit_xu(frames, loaded, del_motor, nu_motor, distance_seed_m, distance_bound
 
 def _fit_xu_extended(frames, *, del_motor, nu_motor, distance_seed_m, distance_bounds_m, max_rms_q,
                      domain, distance_provenance, cancelled, validation_angles, progress,
-                     instrument_geometry=None, energy_bound_eV=None):
+                     instrument_geometry=None, energy_bound_eV=None, bounds=None):
     """The extended pyFAI arm, transferred to an XU SURFACE v3 asset."""
     from xrd_tools.integrate.xu_transfer import transfer_arm_to_xu
     extended = fit_calibration(frames, backend='multigeometry', del_motor=del_motor, nu_motor=nu_motor,
                                distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
                                max_rms_q=max_rms_q, distance_provenance=distance_provenance,
                                cancelled=cancelled, arm_model='stacked_extended',
-                               instrument_geometry=instrument_geometry, energy_bound_eV=energy_bound_eV)
+                               instrument_geometry=instrument_geometry, energy_bound_eV=energy_bound_eV,
+                               bounds=bounds)
     if validation_angles is None:
         limits = domain or {key: [min(f.motors[motor] for f in frames), max(f.motors[motor] for f in frames)]
                             for key, motor in (('del', del_motor), ('nu', nu_motor))}

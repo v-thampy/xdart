@@ -100,10 +100,11 @@ def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_m
     return FrameSeed(integrator, expected_rings(integrator, calibrant, frame.shape, mask))
 
 
-def session_prediction(frames, *, del_motor='del', nu_motor='nu', cancelled=None):
+def session_prediction(frames, *, del_motor='del', nu_motor='nu', cancelled=None, bounds=None):
     """The arm fitted to this session's calibrated frames, to predict the others' rings and
     seed pyFAI with them: one calibrated frame is enough to place the rest (a saved
     calibration still needs three). None without a calibrated frame, or when they do not fit.
+    ``bounds``: the motor-zero estimates and fit freedom the saved fit takes (fit_calibration's).
     """
     from xrd_tools.integrate.stitch_calibration import fit_calibration
     done = tuple(frame for frame in frames if frame.complete)
@@ -111,7 +112,7 @@ def session_prediction(frames, *, del_motor='del', nu_motor='nu', cancelled=None
         return None
     try:
         return fit_calibration(done, backend='multigeometry', del_motor=del_motor, nu_motor=nu_motor,
-                               cancelled=cancelled, min_frames=1).asset['calibration']
+                               cancelled=cancelled, min_frames=1, bounds=bounds).asset['calibration']
     except (ValueError, RuntimeError, KeyError):
         return None
 
@@ -157,15 +158,16 @@ def detector_shape(detector) -> tuple[int, int] | None:
         return None
 
 
-def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='del',
-                     del_motor='del', nu_motor='nu', wavelength_m=1e-10, orientation=3,
-                     mount_deg=(0., 0.)) -> dict:
+def rough_arm_record(*, distance_m, detector, beam_px, zeros_deg=None, del_motor='del', nu_motor='nu',
+                     wavelength_m=1e-10, orientation=3, mount_deg=(0., 0.)) -> dict:
     """A nominal stacked (del-on-nu) arm from a rough distance, for a new setup.
 
-    At normal incidence (``zero_motor`` at ``zero_deg``, the other angle at 0) the direct
-    beam hits ``beam_px`` (x, y in the oriented image) with the detector ``distance_m``
-    from the sample; the angles move the detector as a del-on-nu arm, one degree per
-    degree. Good enough to predict which rings a frame shows; the fit refines it.
+    ``zeros_deg`` gives each moving circle's motor-zero reading ('del', 'nu'; physical angle =
+    motor readback − zero; a circle not given reads 0 at its zero). With both moving circles at
+    their zero readings the detector faces the beam, and the direct beam hits ``beam_px`` (x, y
+    in the oriented image) with the detector ``distance_m`` from the sample; the angles move the
+    detector as a del-on-nu arm, one degree per degree. Good enough to predict which rings a frame
+    shows; the fit refines it.
     ``nu_motor=None`` or ``del_motor=None`` is a single arm (a fourc/twoc 2θ): that
     circle is held at zero. ``orientation`` is pyFAI's detector orientation: the PONI is
     the beam pixel's centre as that oriented detector places it (1, 2 and 4 reflect the
@@ -186,14 +188,16 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
     config = {} if int(orientation) == 3 else {'orientation': int(orientation)}
     pixels = detector_factory(detector, config=config or None)
     x, y = (float(value) for value in beam_px)
-    present = tuple(motor for motor in (del_motor, nu_motor) if motor is not None)
-    if zero_motor is None or zero_motor not in present:
-        raise ValueError(f'the normal-incidence zero names {zero_motor!r}, '
-                         + (f'not {present[0]!r}' if len(present) == 1 else f'neither {del_motor!r} nor {nu_motor!r}'))
+    moving = {circle: motor for circle, motor in (('del', del_motor), ('nu', nu_motor)) if motor is not None}
+    held = set(zeros_deg or {}) - set(moving)
+    if held:
+        raise ValueError(f'{sorted(held)[0]} is held at zero by this arm: it has no motor zero')
+    zeros = {circle: float((zeros_deg or {}).get(circle, 0.)) for circle in moving}
+    if not all(math.isfinite(value) for value in zeros.values()):
+        raise ValueError('the motor zeros must be finite numbers of degrees')
     nu_sign, del_sign = orientation_signs(pixels.orientation)
     scales = dict(nu_scale=nu_sign * math.pi / 180, del_scale=del_sign * math.pi / 180)
-    zero_circle = 'del' if zero_motor == del_motor else 'nu'
-    offset = {f'{zero_circle}_offset': -scales[f'{zero_circle}_scale'] * float(zero_deg)}
+    offset = {f'{circle}_offset': -scales[f'{circle}_scale'] * zero for circle, zero in zeros.items()}
     # the configured detector's own conversion; for orientation 3 it is (y + .5, x + .5) pitches exactly
     poni1, poni2, _ = pixels.calc_cartesian_positions(d1=np.array([y]), d2=np.array([x]))
     poni = PONI(dist=float(distance_m), poni1=float(poni1[0]), poni2=float(poni2[0]),
@@ -203,7 +207,8 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
                              mount_tilt=tilt, mount_roll=roll)
     record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
     if tilt or roll:  # the tilted plane moves the beam off its pixel (Codex review F2): put it back
-        pose = dict(del_motor=del_motor, nu_motor=nu_motor, zero_motor=zero_motor, zero_deg=zero_deg)
+        pose = dict(del_motor=del_motor, nu_motor=nu_motor,
+                    readings={moving[circle]: zero for circle, zero in zeros.items()})
         along = _direct_beam_hit(record, **pose)[1]
         poni.dist *= float(distance_m) / along  # the plane's distance scales the one along the beam
         record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
@@ -215,13 +220,13 @@ def rough_arm_record(*, distance_m, detector, beam_px, zero_deg=0., zero_motor='
     return record
 
 
-def _direct_beam_hit(record, *, del_motor, nu_motor, zero_motor, zero_deg):
-    """Where the direct beam meets the detector at the zero pose: its (row, column) pixel
-    coordinate, and its distance from the sample along the beam (m)."""
+def _direct_beam_hit(record, *, del_motor, nu_motor, readings):
+    """Where the direct beam meets the detector with the motors at these readings (the zero
+    pose): its (row, column) pixel coordinate, and its distance from the sample along the beam (m)."""
     from xrd_tools.core.geometry import Diffractometer
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
     bound = _source_motors(record, del_motor, nu_motor)
-    motors = {motor: np.array([float(zero_deg) if motor == zero_motor else 0.]) for motor in bound.values()}
+    motors = {motor: np.array([float(readings.get(motor, 0.))]) for motor in bound.values()}
     integrator = next(iter(create_multigeometry_integrator_series_from_geometry(
         Diffractometer.from_pyfai_goniometer(record, source_motors=bound), motors)))
     # lab positions are affine in the pixel coordinates (a flat detector): solve for x = y = 0

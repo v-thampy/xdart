@@ -18,6 +18,7 @@ preset here.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import re
 
 from xrd_tools.session.gi_motor import GI_MOTOR_PREFERENCE
@@ -78,6 +79,9 @@ class InstrumentGeometry:
     motors: tuple[tuple[str, str], ...] = ()
     #: fourc and twoc: the 2θ arm's scattering plane (psic moves both detector circles)
     plane: str = 'vertical'
+    #: known motor-zero readings (degrees) by circle: physical angle = motor readback − zero.
+    #: Only circles given here have one (the Diffractometer panel's blank box: none).
+    zeros: tuple[tuple[str, float], ...] = ()
 
     def __post_init__(self):
         if self.geometry not in GEOMETRIES:
@@ -92,6 +96,13 @@ class InstrumentGeometry:
             raise ValueError(f'{self.geometry} has no circle {sorted(set(given) - set(circles))}')
         motors = tuple((circle, str(given.get(circle) or circle).strip() or circle) for circle in circles)
         object.__setattr__(self, 'motors', motors)
+        zeros = dict(self.zeros)
+        if set(zeros) - set(circles):
+            raise ValueError(f'{self.geometry} has no circle {sorted(set(zeros) - set(circles))}')
+        if any(isinstance(value, (bool, str)) or not math.isfinite(float(value)) for value in zeros.values()):
+            raise ValueError('a motor zero must be a finite number of degrees')
+        object.__setattr__(self, 'zeros', tuple((circle, float(zeros[circle])) for circle in circles
+                                                if circle in zeros))
 
     @property
     def circles(self) -> tuple[str, ...]:
@@ -102,6 +113,17 @@ class InstrumentGeometry:
 
     def role(self, circle) -> str:
         return dict(GEOMETRIES[self.geometry])[circle]
+
+    def zero(self, circle) -> float | None:
+        """A circle's known motor-zero reading (degrees), or None when none is given."""
+        return dict(self.zeros).get(circle)
+
+    def arm_zeros(self) -> dict[str, float]:
+        """The given motor zeros of Stitch's detector arm, by the psic circle each plays
+        ('del', 'nu'): a fourc or twoc 2θ is del in the vertical plane and nu in the horizontal."""
+        played = self.as_psic()
+        return {played.get(circle, circle): zero for circle, zero in self.zeros
+                if played.get(circle, circle) in ('del', 'nu')}
 
     def as_psic(self) -> dict[str, str]:
         """The psic circle each renamed circle of this geometry plays (none for psic)."""
@@ -183,14 +205,17 @@ class InstrumentGeometry:
         record = {'geometry': self.geometry, 'motors': dict(self.motors)}
         if self.geometry != 'psic':  # older records have no plane: vertical
             record['plane'] = self.plane
+        if self.zeros:  # older records have none
+            record['zeros'] = dict(self.zeros)
         return record
 
     @classmethod
     def from_record(cls, record) -> 'InstrumentGeometry':
-        if not isinstance(record, dict) or not isinstance(record.get('motors', {}), dict):
+        if (not isinstance(record, dict) or not isinstance(record.get('motors', {}), dict)
+                or not isinstance(record.get('zeros', {}), dict)):
             raise ValueError('an instrument geometry is {"geometry": ..., "motors": {circle: motor}}')
         return cls(str(record.get('geometry', 'psic')), tuple(record.get('motors', {}).items()),
-                   str(record.get('plane', 'vertical')))
+                   str(record.get('plane', 'vertical')), tuple(record.get('zeros', {}).items()))
 
     @classmethod
     def pick(cls, geometry, available, *, keep=None, plane=None) -> 'InstrumentGeometry':
@@ -216,7 +241,7 @@ class InstrumentGeometry:
             if match is None and circle == INCIDENCE_CIRCLE[geometry]:  # the incidence rule Int uses
                 match = next((lower[name] for name in GI_MOTOR_PREFERENCE if name in lower), None)
             chosen.append((circle, match or kept.get(circle) or circle))
-        return cls(geometry, tuple(chosen), plane)
+        return cls(geometry, tuple(chosen), plane, keep.zeros if same else ())
 
 
 __all__ = ['GEOMETRIES', 'GEOMETRY_LABELS', 'INCIDENCE_CIRCLE', 'InstrumentGeometry', 'PLANES',
