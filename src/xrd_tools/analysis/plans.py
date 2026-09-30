@@ -81,9 +81,9 @@ class AnalysisResult:
     payload: Any
     provenance: dict[str, Any] = field(default_factory=dict)
     #: per-frame source records for a grouped/single Stitch/RSM result — the
-    #: raw-popup enabler the whole-result writer persists via
-    #: ``write_stitched(frame_records=…)`` / ``write_rsm(frame_records=…)``.  Not
-    #: provenance (it can carry binary thumbnails); excluded from to_dict/to_json.
+    #: raw-popup enabler the whole-result writer persists (a Stitch record's
+    #: contributing frames, ``write_rsm(frame_records=…)``).  Not provenance (it
+    #: can carry binary thumbnails); excluded from to_dict/to_json.
     frame_records: list[dict[str, Any]] | None = field(
         default=None, repr=False, compare=False)
     #: detached non-primary data for an operation-specific persistence layer
@@ -198,8 +198,8 @@ class StitchPlan:
     map_radial_range: tuple[float, float] | None = None
 
     def provenance(self) -> dict[str, Any]:
-        """A JSON-safe record of this stitch for persistence (pass to
-        ``write_stitched(provenance=…)``).
+        """A JSON-safe record of this stitch for persistence (a Stitch record's
+        plan provenance).
 
         The merge parameters + the applied corrections — NOT the binary ``mask``
         nor the full Diffractometer blob (that round-trips separately under

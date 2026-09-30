@@ -938,7 +938,7 @@ def harvest_frame_records(source, *, scan_labels=None, selected_labels=None,
     """Build the ``frame_records`` list for a Stitch/RSM result from its source(s).
 
     Mirrors what :class:`~xrd_tools.reduction.NexusSink` writes per frame, but for
-    a *whole-result* writer (:func:`write_stitched` / :func:`write_rsm` via
+    a *whole-result* writer (a Stitch record / :func:`write_rsm` via
     :func:`write_contributing_frames`).  ``source`` may be a single FrameSource, a
     sequence of them (the ``run_rsm`` grouping), or a
     :class:`~xrd_tools.sources.composite.CompositeFrameSource` (the ``run_stitch``

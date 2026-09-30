@@ -34,7 +34,6 @@ from xrd_tools.io.nexus import (
     validate_integrated_stack_write,
     write_diffractometer,
     write_integrated_stack,
-    write_stitched,
 )
 from xrd_tools.io.nexus_record import (
     _PreparedThumbnail,
@@ -273,9 +272,6 @@ class WriterFinalization:
     flatfield: Any | None = None
     #: The subtracted dark current (unusable pixels NaN), persisted for Reintegrate.
     darkcurrent: Any | None = None
-    stitched_1d: Any | None = None
-    stitched_2d: Any | None = None
-    stitched_provenance: Mapping[str, Any] | str | None = None
     average_finite_counts: Any | None = None
 
 
@@ -6073,14 +6069,6 @@ class NexusRecordWriter:
         if finalization.average_finite_counts is not None:
             write_average_finite_counts(
                 self._entry_group(), finalization.average_finite_counts,
-            )
-        if finalization.stitched_1d is not None or finalization.stitched_2d is not None:
-            write_stitched(
-                self._entry_group(),
-                stitched_1d=finalization.stitched_1d,
-                stitched_2d=finalization.stitched_2d,
-                provenance=finalization.stitched_provenance,
-                compression=self.compression,
             )
         if finalization.provenance_config is not None:
             inputs = finalization.provenance_inputs

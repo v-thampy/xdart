@@ -114,8 +114,8 @@ class Mode(Enum):
     IMAGE_VIEWER = "image_viewer"
     XYE_VIEWER = "xye_viewer"
     NEXUS_VIEWER = "nexus_viewer"
-    STITCH_1D = "stitch_1d"      # whole-scan merged 1D pattern (scan.stitched_1d)
-    STITCH_2D = "stitch_2d"      # whole-scan merged 2D cake (scan.stitched_2d)
+    STITCH_1D = "stitch_1d"      # whole-scan merged 1D pattern (a Stitch 1D record)
+    STITCH_2D = "stitch_2d"      # whole-scan merged 2D map (a Stitch 2D record)
 
 
 # ── Panel layout table (Stage 4/5 step 1) ────────────────────────────
