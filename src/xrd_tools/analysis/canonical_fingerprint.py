@@ -59,6 +59,167 @@ def _canonical_array(value: Any, *, allow_missing: bool):
     return array
 
 
+_pack_size = struct.Struct(">Q").pack
+_pack_float = struct.Struct(">d").pack
+_NONE_FRAME = b"\x00" + _pack_size(0)
+_FALSE_FRAME = b"\x01" + _pack_size(1) + b"\x00"
+_TRUE_FRAME = b"\x01" + _pack_size(1) + b"\x01"
+_FLOAT_HEADER = b"\x03" + _pack_size(8)
+
+
+def _int_payload(value: int) -> bytes:
+    magnitude = abs(value)
+    raw = b"" if magnitude == 0 else magnitude.to_bytes(
+        (magnitude.bit_length() + 7) // 8, "big"
+    )
+    return (b"\x01" if value < 0 else b"\x00") + raw
+
+
+class _Encoding:
+    """One canonical encoding of a value, in two passes.
+
+    Frames are length-prefixed, so a container's size is needed before its
+    items. ``measure`` validates the value and records each container's size
+    (with a mapping's sorted items, an enum's identity or an array's
+    normalized copy) once; ``emit`` then streams the frames from those
+    records. Every value is visited twice whatever its depth: measuring
+    again inside every emitting container re-measured each subtree once per
+    level of nesting, which made a 287-frame scan's input check take seconds.
+    """
+
+    __slots__ = ("allow_missing", "array_type", "records")
+
+    def __init__(self, allow_missing: bool) -> None:
+        self.allow_missing = allow_missing
+        self.array_type = _numpy_array_type()
+        self.records: dict[int, Any] = {}
+
+    def measure(self, value: Any, active: set[int]) -> int:
+        kind = type(value)
+        if kind is float:
+            if not math.isfinite(value):
+                raise InvalidCanonicalValue("nonfinite canonical float")
+            return 17
+        if kind is str:
+            return 9 + (len(value) if value.isascii() else len(value.encode("utf-8")))
+        if kind is int:
+            return 10 + (abs(value).bit_length() + 7) // 8
+        if value is None:
+            return 9
+        if kind is bool:
+            return 10
+        if kind is tuple or kind is list:
+            marker = self._enter(value, active)
+            if marker is None:  # measured before: a shared, not a cyclic, reference
+                return 9 + self.records[id(value)]
+            try:
+                size = 8
+                for item in value:
+                    size += self.measure(item, active)
+            finally:
+                active.discard(marker)
+            self.records[marker] = size
+            return 9 + size
+        if kind is bytes:
+            return 9 + len(value)
+        if isinstance(value, Enum):
+            marker = self._enter(value, active)
+            if marker is None:
+                return 9 + self.records[id(value)][0]
+            try:
+                identity = f"{type(value).__module__}.{type(value).__qualname__}"
+                size = self.measure(identity, active) + self.measure(value.value, active)
+            finally:
+                active.discard(marker)
+            self.records[marker] = (size, identity)
+            return 9 + size
+        if isinstance(value, Path):
+            return 9 + len(os.fspath(value).encode("utf-8"))
+        if isinstance(value, Mapping):
+            marker = self._enter(value, active)
+            if marker is None:
+                return 9 + self.records[id(value)][0]
+            try:
+                if any(type(key) is not str for key in value):
+                    raise InvalidCanonicalValue(
+                        "canonical mapping keys must be exact str"
+                    )
+                items = sorted(value.items(), key=lambda item: item[0].encode("utf-8"))
+                size = 8
+                for key, item in items:
+                    size += self.measure(key, active) + self.measure(item, active)
+            finally:
+                active.discard(marker)
+            self.records[marker] = (size, items)
+            return 9 + size
+        if self.array_type is not None and kind is self.array_type:
+            marker = self._enter(value, active)
+            if marker is None:
+                return 9 + self.records[id(value)][0]
+            try:
+                array = _canonical_array(value, allow_missing=self.allow_missing)
+                size = (self.measure(array.dtype.str, active) + 8 + 8 * array.ndim
+                        + array.nbytes)
+            finally:
+                active.discard(marker)
+            self.records[marker] = (size, array)
+            return 9 + size
+        raise InvalidCanonicalValue(f"unsupported canonical value {type(value)!r}")
+
+    def _enter(self, value: Any, active: set[int]) -> int | None:
+        """Track a container on the current path: its marker, or None when it was measured before."""
+        marker = id(value)
+        if marker in active:
+            raise InvalidCanonicalValue("cyclic canonical value")
+        if marker in self.records:
+            return None
+        active.add(marker)
+        return marker
+
+    def emit(self, value: Any, write) -> None:
+        """Stream the frames of a value ``measure`` accepted."""
+        kind = type(value)
+        if kind is float:
+            write(_FLOAT_HEADER + _pack_float(value))
+        elif kind is str:
+            raw = value.encode("utf-8")
+            write(b"\x04" + _pack_size(len(raw)) + raw)
+        elif kind is int:
+            payload = _int_payload(value)
+            write(b"\x02" + _pack_size(len(payload)) + payload)
+        elif value is None:
+            write(_NONE_FRAME)
+        elif kind is bool:
+            write(_TRUE_FRAME if value else _FALSE_FRAME)
+        elif kind is tuple or kind is list:
+            write(b"\x08" + _pack_size(self.records[id(value)]) + _pack_size(len(value)))
+            for item in value:
+                self.emit(item, write)
+        elif kind is bytes:
+            write(b"\x05" + _pack_size(len(value)))
+            write(value)
+        elif isinstance(value, Enum):
+            size, identity = self.records[id(value)]
+            write(b"\x07" + _pack_size(size))
+            self.emit(identity, write)
+            self.emit(value.value, write)
+        elif isinstance(value, Path):
+            raw = os.fspath(value).encode("utf-8")
+            write(b"\x06" + _pack_size(len(raw)) + raw)
+        elif isinstance(value, Mapping):
+            size, items = self.records[id(value)]
+            write(b"\x09" + _pack_size(size) + _pack_size(len(items)))
+            for key, item in items:
+                self.emit(key, write)
+                self.emit(item, write)
+        else:  # an ndarray
+            size, array = self.records[id(value)]
+            write(b"\x0a" + _pack_size(size))
+            self.emit(array.dtype.str, write)
+            write(_pack_size(array.ndim) + b"".join(_pack_size(dimension) for dimension in array.shape))
+            write(memoryview(array).cast("B"))
+
+
 def _canonical_frame(
     value: Any,
     active: set[int],
@@ -66,102 +227,12 @@ def _canonical_frame(
     *,
     allow_missing: bool = False,
 ) -> int:
-    recursive = (
-        isinstance(value, (tuple, list, Mapping, Enum))
-        or _is_numpy_array(value)
-    )
-    marker = id(value)
-    if recursive:
-        if marker in active:
-            raise InvalidCanonicalValue("cyclic canonical value")
-        active.add(marker)
-    try:
-        if value is None:
-            tag, payload = 0x00, b""
-        elif type(value) is bool:
-            tag, payload = 0x01, b"\x01" if value else b"\x00"
-        elif isinstance(value, Enum):
-            identity = f"{type(value).__module__}.{type(value).__qualname__}"
-            size = _canonical_frame(identity, active, allow_missing=allow_missing)
-            size += _canonical_frame(value.value, active, allow_missing=allow_missing)
-            if emit is not None:
-                emit(b"\x07" + struct.pack(">Q", size))
-                _canonical_frame(identity, active, emit, allow_missing=allow_missing)
-                _canonical_frame(value.value, active, emit, allow_missing=allow_missing)
-            return 9 + size
-        elif type(value) is int:
-            magnitude = abs(value)
-            raw = b"" if magnitude == 0 else magnitude.to_bytes(
-                (magnitude.bit_length() + 7) // 8, "big"
-            )
-            tag, payload = 0x02, (b"\x01" if value < 0 else b"\x00") + raw
-        elif type(value) is float:
-            if not math.isfinite(value):
-                raise InvalidCanonicalValue("nonfinite canonical float")
-            tag, payload = 0x03, struct.pack(">d", value)
-        elif type(value) is str:
-            tag, payload = 0x04, value.encode("utf-8")
-        elif type(value) is bytes:
-            tag, payload = 0x05, value
-        elif isinstance(value, Path):
-            tag, payload = 0x06, os.fspath(value).encode("utf-8")
-        elif type(value) in {list, tuple}:
-            items = tuple(value) if type(value) is list else value
-            size = 8 + sum(
-                _canonical_frame(item, active, allow_missing=allow_missing)
-                for item in items
-            )
-            if emit is not None:
-                emit(b"\x08" + struct.pack(">Q", size))
-                emit(struct.pack(">Q", len(items)))
-                for item in items:
-                    _canonical_frame(item, active, emit, allow_missing=allow_missing)
-            return 9 + size
-        elif isinstance(value, Mapping):
-            if any(type(key) is not str for key in value):
-                raise InvalidCanonicalValue(
-                    "canonical mapping keys must be exact str"
-                )
-            items = sorted(value.items(), key=lambda item: item[0].encode("utf-8"))
-            size = 8 + sum(
-                _canonical_frame(key, active, allow_missing=allow_missing)
-                + _canonical_frame(item, active, allow_missing=allow_missing)
-                for key, item in items
-            )
-            if emit is not None:
-                emit(b"\x09" + struct.pack(">Q", size))
-                emit(struct.pack(">Q", len(items)))
-                for key, item in items:
-                    _canonical_frame(key, active, emit, allow_missing=allow_missing)
-                    _canonical_frame(item, active, emit, allow_missing=allow_missing)
-            return 9 + size
-        elif _is_numpy_array(value):
-            array = _canonical_array(value, allow_missing=allow_missing)
-            dtype_size = _canonical_frame(
-                array.dtype.str, active, allow_missing=allow_missing
-            )
-            size = dtype_size + 8 + 8 * array.ndim + array.nbytes
-            if emit is not None:
-                emit(b"\x0a" + struct.pack(">Q", size))
-                _canonical_frame(
-                    array.dtype.str, active, emit, allow_missing=allow_missing
-                )
-                emit(struct.pack(">Q", array.ndim))
-                for dimension in array.shape:
-                    emit(struct.pack(">Q", dimension))
-                emit(memoryview(array).cast("B"))
-            return 9 + size
-        else:
-            raise InvalidCanonicalValue(
-                f"unsupported canonical value {type(value)!r}"
-            )
-        if emit is not None:
-            emit(bytes((tag,)) + struct.pack(">Q", len(payload)))
-            emit(payload)
-        return 9 + len(payload)
-    finally:
-        if recursive:
-            active.discard(marker)
+    """The size of ``value``'s canonical frame, validating it; with ``emit``, also stream its bytes."""
+    encoding = _Encoding(allow_missing)
+    size = encoding.measure(value, active)
+    if emit is not None:
+        encoding.emit(value, emit)
+    return size
 
 
 def _canonical_stream(value: Any, emit, *, allow_missing: bool = False) -> int:
