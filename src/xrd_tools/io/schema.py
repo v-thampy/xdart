@@ -565,28 +565,6 @@ def _integrated_datasets(axes: tuple[str, ...]) -> "Mapping[str, DatasetSpec]":
     return MappingProxyType(specs)
 
 
-def _stitched_datasets(axes: tuple[str, ...]) -> "Mapping[str, DatasetSpec]":
-    """The stitched_1d/2d dataset family — a single MERGED pattern (no per-frame
-    leading dim, so nothing is row-aligned).  The ``provenance_json`` blob (the
-    StitchPlan + CorrectionStack) is written by hand as a vlen-UTF8 string, like
-    the diffractometer ``config_json`` — not declared here (additive extra)."""
-    two_d = len(axes) == 2
-    specs = {
-        "intensity": DatasetSpec(
-            "intensity", "float32", "signal", row_aligned=False, compressed=True),
-        axes[0]: DatasetSpec(
-            axes[0], "float32", "axis", row_aligned=False, units_from="radial_unit"),
-    }
-    if two_d:
-        specs[axes[1]] = DatasetSpec(
-            axes[1], "float32", "axis", row_aligned=False,
-            units_from="azimuthal_unit")
-    specs["sigma"] = DatasetSpec(
-        "sigma", "float32", "error", row_aligned=False, required=False,
-        compressed=True)
-    return MappingProxyType(specs)
-
-
 _GEOMETRY_DATASETS: "Mapping[str, DatasetSpec]" = MappingProxyType({
     "frame_index": DatasetSpec("frame_index", "int64", "row_label",
                                row_aligned=True, chunk_style="labels"),
@@ -680,28 +658,6 @@ class ProcessedScanSchema:
                 "diffractometer",
                 nx_attrs=MappingProxyType({"NX_class": "NXcollection"}),
             ),
-            # Scan-level MERGED stitch outputs (one pattern, not a per-frame
-            # stack): the offline stitch/RSM result + its provenance_json blob
-            # (the StitchPlan + applied CorrectionStack). Capability-gated;
-            # written by write_stitched, read by read_stitched.
-            "stitched_1d": GroupSchema(
-                "stitched_1d", axes=("q",),
-                datasets=_stitched_datasets(("q",)),
-                nx_attrs=MappingProxyType({
-                    "NX_class": "NXdata",
-                    "signal": "intensity",
-                    "axes": ("q",),
-                }),
-            ),
-            "stitched_2d": GroupSchema(
-                "stitched_2d", axes=("q", "chi"),
-                datasets=_stitched_datasets(("q", "chi")),
-                nx_attrs=MappingProxyType({
-                    "NX_class": "NXdata",
-                    "signal": "intensity",
-                    "axes": ("q", "chi"),
-                }),
-            ),
             # The gridded RSM volume (one 3D H-K-L grid; not a per-frame stack):
             # h/k/l axes + the 3D intensity + a provenance_json blob. Scan-level,
             # capability-gated; written by write_rsm, read by read_rsm.
@@ -776,14 +732,6 @@ CAPABILITIES = MappingProxyType({
         "ub_matrix", "sample", "dataset",
         "UB sample orientation matrix (the dataset already round-trips; this "
         "only advertises its presence)"),
-    "stitched_1d": CapabilityAttr(
-        "stitched_1d", "", "group",
-        "merged 1D stitch pattern (offline stitch/RSM) + provenance_json "
-        "(StitchPlan + applied CorrectionStack)"),
-    "stitched_2d": CapabilityAttr(
-        "stitched_2d", "", "group",
-        "merged 2D (q,χ) stitch pattern + provenance_json (StitchPlan + "
-        "applied CorrectionStack)"),
     "stitch": CapabilityAttr(
         "stitch", "", "group",
         "a stitched record's coverage and normalization (a GI cut's under stitch/<cut>/), its "
@@ -825,19 +773,3 @@ def is_known_schema_name(value) -> bool:
 
 #: the singleton consumers import.
 SCHEMA = ProcessedScanSchema()
-
-# Stitch uses a separate physical layout while retaining logical q/chi APIs.
-# The preceding layouts stay available for exact old artifact/embedded reads.
-STITCH_NEUTRAL_AXIS_NAMES = MappingProxyType({"q": "axis_1", "chi": "axis_2"})
-STITCH_NEUTRAL_GROUPS = MappingProxyType({
-    name: GroupSchema(
-        name, axes=axes, datasets=_stitched_datasets(axes),
-        nx_attrs=MappingProxyType({
-            "NX_class": "NXdata", "signal": "intensity", "axes": axes,
-        }),
-    )
-    for name, axes in (
-        ("stitched_1d", ("axis_1",)),
-        ("stitched_2d", ("axis_1", "axis_2")),
-    )
-})
