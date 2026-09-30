@@ -276,7 +276,8 @@ class StitchToolForm:
     #: and its χ range (°), as Int 2D's; I(q) beside it takes ``npt_1d`` and the radial range.
     npt_rad_2d: int = 1000
     npt_azim_2d: int = 360
-    chi_range: tuple[float, float] = (-180.0, 180.0)
+    #: The map's χ range; None (Auto): the frames' own χ extent, as Int 2D's (the data, not −180 to 180).
+    chi_range: tuple[float, float] | None = None
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -408,7 +409,8 @@ class StitchToolForm:
                     raise ValueError("2-D point counts must be bounded positive integers")
             if self.npt_rad_2d * self.npt_azim_2d > 64_000_000:
                 raise ValueError("a 2-D map may hold at most 64 million points")
-            object.__setattr__(self, "chi_range", _ordered_range(self.chi_range, "χ range"))
+            if self.chi_range is not None:
+                object.__setattr__(self, "chi_range", _ordered_range(self.chi_range, "χ range"))
         if not native and self.backend == "xu_hist" and (
             self.geometry_kind is not StitchGeometryKind.PYFAI_GONIOMETER_JSON
             or self.expected_geometry_sha256 is not None

@@ -1499,7 +1499,7 @@ class StitchPage(QtWidgets.QWidget):
         output = str(directory / ("stitch_stitch2d.nexus" if map_mode else "stitch_stitch1d.nexus"))
         if map_mode:
             native.update(mode="2d", npt_rad_2d=int(value("npt_rad_2d")), npt_azim_2d=int(value("npt_azim_2d")),
-                          chi_range=(-180.0, 180.0) if value("chi_auto")
+                          chi_range=None if value("chi_auto")  # Auto: the frames' own χ extent
                           else (float(value("chi_min")), float(value("chi_max"))))
         return StitchToolForm(
             project_root=value("project_root"),
@@ -1554,9 +1554,12 @@ class StitchPage(QtWidgets.QWidget):
         if form.q_range is not None:
             fields.update(q_min=form.q_range[0], q_max=form.q_range[1])
         if form.mode == "2d":
+            # Auto was (−180, 180) before the frames' own extent (settings saved then read as Auto)
+            chi = form.chi_range
             fields.update(npt_rad_2d=form.npt_rad_2d, npt_azim_2d=form.npt_azim_2d,
-                          chi_auto=form.chi_range == (-180.0, 180.0),
-                          chi_min=form.chi_range[0], chi_max=form.chi_range[1])
+                          chi_auto=chi is None or chi == (-180.0, 180.0))
+            if chi is not None:
+                fields.update(chi_min=chi[0], chi_max=chi[1])
         self.select_mode("Stitch 2D" if form.mode == "2d" else "Stitch 1D")
         for key, value in fields.items():
             self.set_field(key, value)

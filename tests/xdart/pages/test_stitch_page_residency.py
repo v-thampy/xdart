@@ -74,6 +74,8 @@ def test_a_pin_survives_selecting_another_result(qapp, tmp_path):
         assert page.results.count() == 3
         command(ShellCommandKind.SET_PLOT_MODE, "Overlay")
         command(ShellCommandKind.SET_SLICE_ENABLED, True)
+        # inside the map: χ Auto spans the frames' own χ (here about -157 to -80°), as Int 2D's
+        command(ShellCommandKind.SET_SLICE_CENTER, -120.0)
         command(ShellCommandKind.PIN_SLICE)
         (pinned,) = page._last_map_state.pinned_traces
         pinned_path = page.results.currentItem().data(QtCore.Qt.ItemDataRole.UserRole)

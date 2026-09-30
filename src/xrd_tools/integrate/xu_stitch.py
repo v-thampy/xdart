@@ -750,6 +750,26 @@ def _radial_coordinates(q, unit, wavelength_A):
     return convert_radial_axis(q, "q_A^-1", "2th_deg", wavelength_A)
 
 
+def _scout_chi_range(provider, frame_inputs, cancel_token):
+    """A Stitch 2D's Auto χ range: every selected angle's χ extent, without image rereads (as
+    ``_scout_radial_range``); a single value widens by half a degree each way."""
+    low, high = math.inf, -math.inf
+    for _label, del_value, nu_value, _monitor in frame_inputs:
+        if cancel_token is not None and cancel_token.is_set():
+            raise XuStitchCancelled("CANCELLED")
+        lease = provider.frame(nu=nu_value, del_=del_value)
+        try:
+            chi = lease.chi()
+            finite = chi[np.isfinite(chi)]
+            if finite.size:
+                low, high = min(low, float(finite.min())), max(high, float(finite.max()))
+        finally:
+            lease.release()
+    if not low <= high:
+        raise XuStitchScienceRefused("STITCH_Q_GRID_INVALID", "no finite χ on the detector")
+    return (low, high) if low < high else (low - 0.5, high + 0.5)
+
+
 def _scout_radial_range(provider, frame_inputs, unit, wavelength_A, cancel_token):
     """Full geometry extent over every selected angle, without image rereads."""
     low, high = math.inf, -math.inf
@@ -1141,9 +1161,10 @@ def run_xu_hist_stitch_1d(
     if map_grid is not None and (
             type(map_grid) is not tuple or len(map_grid) != 3
             or any(type(points) is not int or not 1 <= points <= 1_000_000 for points in map_grid[:2])
-            or type(map_grid[2]) is not tuple or len(map_grid[2]) != 2
-            or any(type(value) not in {int, float} or not math.isfinite(value) for value in map_grid[2])
-            or map_grid[2][0] >= map_grid[2][1]):
+            or map_grid[2] is not None and (
+                type(map_grid[2]) is not tuple or len(map_grid[2]) != 2
+                or any(type(value) not in {int, float} or not math.isfinite(value) for value in map_grid[2])
+                or map_grid[2][0] >= map_grid[2][1])):
         raise ValueError("a Stitch 2D map needs its radial and χ points, a finite increasing χ range")
     if gi is not None and (type(gi) is not StitchGI or unit != "q_A^-1"):
         raise TypeError("an XU GI cut needs an exact StitchGI beside I(q) in Q")
@@ -1388,8 +1409,10 @@ def run_xu_hist_stitch_1d(
             if not str(asset["xrayutilities"].get("chi_validation_convention", "")).startswith("minus_atan2_qx_qz"):
                 raise XuStitchScienceRefused("XU_CHI_CONVENTION_UNSUPPORTED",
                                              "a Stitch 2D map takes the SURFACE asset's χ convention")
+            chi_range = map_grid[2] if map_grid[2] is not None else _scout_chi_range(
+                provider, frame_inputs, cancel_token)  # Auto: the frames' own χ extent
             map_edges = (np.linspace(*bounds, map_grid[0] + 1, dtype=np.float64),
-                         np.linspace(*map_grid[2], map_grid[1] + 1, dtype=np.float64))
+                         np.linspace(*chi_range, map_grid[1] + 1, dtype=np.float64))
         gi_cuts = [None] * len(frame_inputs)
         if gi is not None:
             frame = asset["xrayutilities"]

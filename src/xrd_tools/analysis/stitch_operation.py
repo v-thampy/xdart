@@ -1384,7 +1384,8 @@ class StitchOperationPlan:
         azimuth = _range(
             self.azimuth_range,
             "azimuth range",
-            required=self.mode == "2d",
+            # a native map's None: its frames' own χ extent, scouted as the radial one is
+            required=self.mode == "2d" and not self.native_records,
         )
 
         if self.mode == "1d" and azimuth is not None:
@@ -1551,7 +1552,7 @@ def _xu_map_fields(plan):
     """A Stitch 2D's map (native records, no GI): its points and its χ range; a 1-D plan has none."""
     if plan.mode not in {"1d", "2d"}:
         raise ValueError("stitch mode must be '1d' or '2d'")
-    azimuth = _range(plan.azimuth_range, "azimuth range", required=plan.mode == "2d")
+    azimuth = _range(plan.azimuth_range, "azimuth range", required=False)  # None: the frames' χ extent
     if plan.mode == "1d":
         if azimuth is not None:
             raise ValueError("a 1-D Stitch plan cannot carry an azimuth range")
@@ -2038,7 +2039,8 @@ def _xu_provenance(
             "plan_fingerprint": plan.fingerprint,
             **({} if plan.mode == "1d" else {"map": {
                 "npt_rad_2d": plan.npt_rad_2d, "npt_azim_2d": plan.npt_azim_2d,
-                "azimuth_range": list(plan.azimuth_range)}}),
+                # None (Auto): the frames' own χ extent, scouted when stitching
+                "azimuth_range": None if plan.azimuth_range is None else list(plan.azimuth_range)}}),
         },
         "observations": observed,
         "runtime_requirements": {
