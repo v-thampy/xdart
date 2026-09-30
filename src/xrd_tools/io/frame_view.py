@@ -3575,9 +3575,8 @@ def read_contributing_frame_view(
     with h5py.File(path, "r") as handle:
         if _opened_hdf_revision(handle) != inspection.storage_revision:
             raise AnalysisArtifactInvalid("artifact changed before frame hydration")
-        entry = handle["entry"]
         # a stitched record keeps its contributors (and their source base) under entry/stitch
-        container = entry[STITCH_GROUP] if STITCH_GROUP in entry else entry
+        container = handle["entry"][STITCH_GROUP]
         master, index, thumbnail = _raw_frame_parts_from_entry(
             path, container, frame, scan=scan, source_root=source_root,
         )

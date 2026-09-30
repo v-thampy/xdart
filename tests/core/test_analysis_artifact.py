@@ -2339,7 +2339,7 @@ def test_win32_identity_inspects_and_reads_the_pathname_ctime_shape(
     assert payload.inspection == inspection
 
 
-@pytest.mark.parametrize("kind", (AnalysisArtifactKind.STITCH_1D,))
+@pytest.mark.parametrize("kind", (AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D))
 def test_an_older_stitch_artifact_is_refused(tmp_path, kind):
     """A Stitch result is an Int record (maintainer, 2026-09-29: no compatibility with earlier Stitch outputs;
     2026-09-30: "Remove old format"); a file in the older artifact layout that says Stitch is not read."""
@@ -2351,3 +2351,10 @@ def test_an_older_stitch_artifact_is_refused(tmp_path, kind):
         entry.attrs.create(ANALYSIS_KIND_ATTR, np.bytes_(kind.value.encode()))
     with pytest.raises(AnalysisArtifactInvalid, match="Int record"):
         inspect_analysis_artifact(request.target)
+
+
+def test_a_stitch_2d_request_is_a_native_records():
+    """The old Stitch 2D layout was removed (2026-09-30): a Stitch 2D artifact is a native record (version 6
+    or 7), never the older layout's request."""
+    with pytest.raises(ValueError, match="native record"):
+        _request(Path("/tmp/older-stitch-2d.nexus"), AnalysisArtifactKind.STITCH_2D)

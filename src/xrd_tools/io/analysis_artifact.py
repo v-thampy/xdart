@@ -93,14 +93,6 @@ def _artifact_contract_version(version: int) -> int:
     return _STITCH_NEUTRAL_CONTRACTS.get(version, version)
 
 
-def _artifact_axis_name(version: int, logical_name: str) -> str:
-    if version in _STITCH_NEUTRAL_CONTRACTS:
-        from xrd_tools.io.schema import STITCH_NEUTRAL_AXIS_NAMES
-
-        return STITCH_NEUTRAL_AXIS_NAMES[logical_name]
-    return logical_name
-
-
 class AnalysisArtifactKind(str, Enum):
     STITCH_1D = "stitch-1d"
     STITCH_2D = "stitch-2d"
@@ -722,6 +714,9 @@ class AnalysisArtifactRequest:
                 and self.kind is not AnalysisArtifactKind.STITCH_1D)
         ):
             raise ValueError("neutral analysis artifact requires its Stitch kind")
+        # the old Stitch 2D layout was removed (2026-09-30): a Stitch 2D is a native record
+        if self.kind is AnalysisArtifactKind.STITCH_2D and self.schema_version not in _STITCH_NATIVE_VERSIONS:
+            raise ValueError("a Stitch 2D artifact is a native record (version 6 or 7)")
         contract_version = _artifact_contract_version(self.schema_version)
         if contract_version == ANALYSIS_SCHEMA_VERSION:
             if (
@@ -2399,8 +2394,6 @@ def inspect_analysis_artifact(
                 "provenance_digest",
                 "file_name",
             }
-            if version in _STITCH_NATIVE_VERSIONS:
-                expected_entry_attrs.add("source_base")
             if contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
                 expected_entry_attrs.add(_EXECUTION_ATTESTATION_DIGEST_ATTR)
             if len(entry.attrs) != len(expected_entry_attrs) or any(
@@ -2417,22 +2410,14 @@ def inspect_analysis_artifact(
                 kind = AnalysisArtifactKind(_bounded_attr_text(entry, ANALYSIS_KIND_ATTR))
             except ValueError as error:
                 raise AnalysisArtifactInvalid("analysis artifact kind is invalid") from error
-            if kind is AnalysisArtifactKind.STITCH_1D:  # an Int record now (stitch_record, admitted above)
+            # A Stitch result is an Int record (stitch_record, admitted above): this layout is RSM's
+            # (maintainer, 2026-09-29: no compatibility with earlier Stitch outputs; 2026-09-30:
+            # "Remove old format")
+            if kind is not AnalysisArtifactKind.RSM:
                 raise AnalysisArtifactInvalid(
-                    "a Stitch 1D result is an Int record; this older Stitch artifact is not read"
+                    "a Stitch result is an Int record; this older Stitch file is not read: stitch it again"
                 )
-            if (
-                version == ANALYSIS_SCHEMA_VERSION_V3
-                and kind is not AnalysisArtifactKind.RSM
-            ):
-                raise AnalysisArtifactInvalid(
-                    "analysis artifact v3 is reserved for frame-aware RSM"
-                )
-            if version in _STITCH_NEUTRAL_CONTRACTS and (
-                kind not in {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}
-                or (version in {ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL, *_STITCH_NATIVE_VERSIONS}
-                    and kind is not AnalysisArtifactKind.STITCH_1D)
-            ):
+            if version in _STITCH_NEUTRAL_CONTRACTS:
                 raise AnalysisArtifactInvalid("neutral analysis artifact requires its Stitch kind")
             expected = expected_request.kind if expected_request is not None else expected_kind
             if expected is not None and kind is not expected:
@@ -2483,8 +2468,6 @@ def inspect_analysis_artifact(
             expected_entry_children = 2 + int(
                 contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}
             )
-            if version in _STITCH_NATIVE_VERSIONS:
-                expected_entry_children += 2
             if len(entry) != expected_entry_children:
                 raise AnalysisArtifactInvalid(
                     "analysis artifact contains an unknown entry graph"
@@ -2500,8 +2483,6 @@ def inspect_analysis_artifact(
             # source identity meanwhile; an unbound raw-popup graph must not
             # acquire artifact authority merely by being local-hard HDF5.
             allowed = {kind.group, _PROVENANCE}
-            if version in _STITCH_NATIVE_VERSIONS:
-                allowed.update({"frames", "contributing_frames_json"})
             if contract_version in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}:
                 allowed.add(_EXECUTION_ATTESTATION)
             if any(name not in allowed for name in entry):
@@ -2586,54 +2567,24 @@ def inspect_analysis_artifact(
                     )
                 axis_names = coordinate_frame.axis_names
             else:
-                axis_names = {
-                    AnalysisArtifactKind.STITCH_1D: ("q",),
-                    AnalysisArtifactKind.STITCH_2D: ("q", "chi"),
-                    AnalysisArtifactKind.RSM: ("h", "k", "l"),
-                }[kind]
-            stored_axis_names = tuple(_artifact_axis_name(version, name) for name in axis_names)
-            if _bounded_attr_texts(result, "axes") != stored_axis_names:
+                axis_names = ("h", "k", "l")
+            if _bounded_attr_texts(result, "axes") != axis_names:
                 raise AnalysisArtifactInvalid("analysis result axes are invalid")
-            allowed_result = {"intensity", _PROVENANCE, *stored_axis_names}
-            if version in _STITCH_NATIVE_VERSIONS:
-                allowed_result.update({"wavelength_A", "companion_axis"})
-            if kind in {
-                AnalysisArtifactKind.STITCH_1D,
-                AnalysisArtifactKind.STITCH_2D,
-            }:
-                allowed_result.update({"sigma", "coverage", "normalization"})
+            allowed_result = {"intensity", _PROVENANCE, *axis_names}
             if any(name not in allowed_result for name in result):
                 raise AnalysisArtifactInvalid(
                     "analysis result contains an unknown graph"
                 )
-            has_sigma = "sigma" in result
-            has_stitch_diagnostics = (
-                "coverage" in result and "normalization" in result
-            )
-            if ("coverage" in result) != ("normalization" in result):
-                raise AnalysisArtifactInvalid(
-                    "stitched coverage and normalization must be paired"
-                )
-            expected_result_size = (
-                2
-                + len(axis_names)
-                + int(has_sigma)
-                + 2 * int(has_stitch_diagnostics)
-            )
-            if version in _STITCH_NATIVE_VERSIONS:
-                expected_result_size += 2
-            if len(result) != expected_result_size:
+            has_sigma = has_stitch_diagnostics = False  # an RSM has neither
+            if len(result) != 2 + len(axis_names):
                 raise AnalysisArtifactInvalid(
                     "analysis result contains an unknown graph"
                 )
-            axes = tuple((name, _axis(result, _artifact_axis_name(version, name))) for name in axis_names)
+            axes = tuple((name, _axis(result, name)) for name in axis_names)
             for name, _values in axes:
-                axis = _direct(result, _artifact_axis_name(version, name), h5py.Dataset)
+                axis = _direct(result, name, h5py.Dataset)
                 expected_axis_attrs = set()
-                if kind in {
-                    AnalysisArtifactKind.STITCH_1D,
-                    AnalysisArtifactKind.STITCH_2D,
-                } or (
+                if (
                     coordinate_frame is not None
                     and dict(
                         zip(
@@ -2645,13 +2596,6 @@ def inspect_analysis_artifact(
                     is not None
                 ):
                     expected_axis_attrs.add("units")
-                if version in _STITCH_NEUTRAL_CONTRACTS:
-                    from xrd_tools.io.schema import axis_display_metadata
-
-                    expected_axis_attrs.add("long_name")
-                    expected_label = axis_display_metadata(_bounded_attr_text(axis, "units"))["long_name"]
-                    if _bounded_attr_text(axis, "long_name") != expected_label:
-                        raise AnalysisArtifactInvalid(f"analysis axis {name} display label is invalid")
                 if len(axis.attrs) != len(expected_axis_attrs) or any(
                     attr not in expected_axis_attrs for attr in axis.attrs
                 ):
@@ -2661,21 +2605,6 @@ def inspect_analysis_artifact(
             axis_units: list[tuple[str, str | None]] = [
                 (name, None) for name, _values in axes
             ]
-            if kind in {
-                AnalysisArtifactKind.STITCH_1D,
-                AnalysisArtifactKind.STITCH_2D,
-            }:
-                q = _direct(result, _artifact_axis_name(version, "q"), h5py.Dataset)
-                q_units = _bounded_attr_text(q, "units")
-                if not q_units:
-                    raise AnalysisArtifactInvalid("stitched q units are invalid")
-                axis_units[0] = ("q", q_units)
-            if kind is AnalysisArtifactKind.STITCH_2D:
-                chi = _direct(result, _artifact_axis_name(version, "chi"), h5py.Dataset)
-                chi_units = _bounded_attr_text(chi, "units")
-                if not chi_units:
-                    raise AnalysisArtifactInvalid("stitched chi units are invalid")
-                axis_units[1] = ("chi", chi_units)
             if coordinate_frame is not None:
                 for index, (name, expected_units) in enumerate(
                     zip(
@@ -2696,33 +2625,10 @@ def inspect_analysis_artifact(
                         )
                     axis_units[index] = (name, observed_units)
             if contract_version == ANALYSIS_SCHEMA_VERSION_V2:
-                if kind is AnalysisArtifactKind.STITCH_1D:
-                    if (
-                        axis_units[0][1] not in (
-                            {"q_A^-1", "2th_deg"} if version in _STITCH_NATIVE_VERSIONS
-                            else {"q_A^-1"}
-                        )
-                        or has_sigma
-                        or not has_stitch_diagnostics
-                    ):
-                        raise AnalysisArtifactInvalid(
-                            "analysis artifact v2 requires the exact XU Stitch "
-                            "result schema"
-                        )
-                elif kind is AnalysisArtifactKind.RSM:
-                    if (
-                        axis_units
-                        != [("h", None), ("k", None), ("l", None)]
-                        or has_sigma
-                        or has_stitch_diagnostics
-                    ):
-                        raise AnalysisArtifactInvalid(
-                            "analysis artifact v2 requires the exact RSM result "
-                            "schema"
-                        )
-                else:
+                if axis_units != [("h", None), ("k", None), ("l", None)]:
                     raise AnalysisArtifactInvalid(
-                        "analysis artifact v2 kind is unsupported"
+                        "analysis artifact v2 requires the exact RSM result "
+                        "schema"
                     )
             elif version == ANALYSIS_SCHEMA_VERSION_V3:
                 try:
@@ -2772,36 +2678,6 @@ def inspect_analysis_artifact(
             if intensity.shape != expected_shape:
                 raise AnalysisArtifactInvalid("analysis intensity shape does not match axes")
             intensity_values = _materialize_inspection_values(intensity)
-            sigma_values = None
-            if has_sigma:
-                sigma = _direct(result, "sigma", h5py.Dataset)
-                if len(sigma.attrs) != 0:
-                    raise AnalysisArtifactInvalid(
-                        "stitched sigma attributes are not exact"
-                    )
-                if sigma.shape != expected_shape:
-                    raise AnalysisArtifactInvalid(
-                        "stitched sigma shape does not match axes"
-                    )
-                sigma_values = _materialize_inspection_values(sigma)
-            coverage_values = normalization_values = None
-            if has_stitch_diagnostics:
-                for name in ("coverage", "normalization"):
-                    values = _direct(result, name, h5py.Dataset)
-                    if len(values.attrs) != 0 or values.shape != expected_shape:
-                        raise AnalysisArtifactInvalid(
-                            f"stitched {name} must be an exact result-shaped dataset"
-                        )
-                coverage_values = _materialize_inspection_values(
-                    _direct(result, "coverage", h5py.Dataset),
-                    require_finite=True,
-                    require_nonnegative=True,
-                )
-                normalization_values = _materialize_inspection_values(
-                    _direct(result, "normalization", h5py.Dataset),
-                    require_finite=True,
-                    require_nonnegative=True,
-                )
             try:
                 wavelength_A = frame_manifest_json = None
                 projection = project_analysis_artifact_result(
@@ -2811,9 +2687,9 @@ def inspect_analysis_artifact(
                     axes=axes,
                     axis_units=tuple(axis_units),
                     intensity=intensity_values,
-                    sigma=sigma_values,
-                    coverage=coverage_values,
-                    normalization=normalization_values,
+                    sigma=None,
+                    coverage=None,
+                    normalization=None,
                     _stored_v1_claim=(
                         _ANALYSIS_V1_DECODE_PROJECTION
                         if contract_version == ANALYSIS_SCHEMA_VERSION
@@ -2822,27 +2698,6 @@ def inspect_analysis_artifact(
                 )
             except AnalysisArtifactProjectionInvalid as error:
                 raise AnalysisArtifactInvalid(str(error)) from error
-            if (
-                contract_version == ANALYSIS_SCHEMA_VERSION_V2
-                and kind is AnalysisArtifactKind.STITCH_1D
-            ):
-                empty_coverage = projection.coverage == 0
-                empty_normalization = projection.normalization == 0
-                empty_intensity = np.isnan(projection.intensity)
-                if (
-                    not np.array_equal(empty_coverage, empty_normalization)
-                    or not np.array_equal(empty_coverage, empty_intensity)
-                    or not np.isfinite(
-                        projection.intensity[~empty_coverage]
-                    ).all()
-                    or np.any(projection.coverage[~empty_coverage] <= 0)
-                    or np.any(
-                        projection.normalization[~empty_coverage] <= 0
-                    )
-                ):
-                    raise AnalysisArtifactInvalid(
-                        "analysis artifact v2 empty and occupied bins disagree"
-                    )
             if (
                 execution_attestation_json is not None
                 and json.loads(execution_attestation_json).get(
@@ -2993,11 +2848,8 @@ def read_analysis_artifact(
                     "analysis artifact changed while opening payload"
                 )
             entry = _direct(handle, _ENTRY, h5py.Group)
-            result = _direct(entry, inspection.group, h5py.Group)
-            axes = tuple(
-                (name, _axis(result, _artifact_axis_name(inspection.schema_version, name)))
-                for name, _length in inspection.axes
-            )
+            result = _direct(entry, inspection.group, h5py.Group)  # an RSM (a Stitch is a record)
+            axes = tuple((name, _axis(result, name)) for name, _length in inspection.axes)
             intensity = _materialize_bounded_values(
                 _direct(result, "intensity", h5py.Dataset)
             )
@@ -3005,61 +2857,7 @@ def read_analysis_artifact(
                 raise AnalysisArtifactInvalid(
                     "analysis payload shape changed after admission"
                 )
-            sigma = None
-            if inspection.has_sigma:
-                sigma = _materialize_bounded_values(
-                    _direct(result, "sigma", h5py.Dataset)
-                )
-                if sigma.shape != inspection.shape:
-                    raise AnalysisArtifactInvalid(
-                        "analysis sigma shape changed after admission"
-                    )
-            coverage = normalization = None
-            if inspection.has_stitch_diagnostics:
-                coverage = _materialize_bounded_values(
-                    _direct(result, "coverage", h5py.Dataset),
-                    require_finite=True,
-                    require_nonnegative=True,
-                )
-                normalization = _materialize_bounded_values(
-                    _direct(result, "normalization", h5py.Dataset),
-                    require_finite=True,
-                    require_nonnegative=True,
-                )
-                if (
-                    coverage.shape != inspection.shape
-                    or normalization.shape != inspection.shape
-                ):
-                    raise AnalysisArtifactInvalid(
-                        "stitched diagnostics changed shape after admission"
-                    )
-
-            units = dict(inspection.axis_units)
-            if inspection.kind in {
-                AnalysisArtifactKind.STITCH_1D,
-                AnalysisArtifactKind.STITCH_2D,
-            }:
-                q_units = _bounded_attr_text(
-                    _direct(result, _artifact_axis_name(inspection.schema_version, "q"), h5py.Dataset),
-                    "units",
-                )
-                if q_units != units["q"]:
-                    raise AnalysisArtifactInvalid(
-                        "analysis q units changed after admission"
-                    )
-            if inspection.kind is AnalysisArtifactKind.STITCH_2D:
-                chi_units = _bounded_attr_text(
-                    _direct(result, _artifact_axis_name(inspection.schema_version, "chi"), h5py.Dataset),
-                    "units",
-                )
-                if chi_units != units["chi"]:
-                    raise AnalysisArtifactInvalid(
-                        "analysis chi units changed after admission"
-                    )
-            if (
-                inspection.kind is AnalysisArtifactKind.RSM
-                and inspection.schema_version == ANALYSIS_SCHEMA_VERSION_V3
-            ):
+            if inspection.schema_version == ANALYSIS_SCHEMA_VERSION_V3:
                 for name, expected_units in inspection.axis_units:
                     axis = _direct(result, name, h5py.Dataset)
                     if expected_units is None:
@@ -3079,9 +2877,9 @@ def read_analysis_artifact(
                     axes=axes,
                     axis_units=inspection.axis_units,
                     intensity=intensity,
-                    sigma=sigma,
-                    coverage=coverage,
-                    normalization=normalization,
+                    sigma=None,
+                    coverage=None,
+                    normalization=None,
                     _stored_v1_claim=(
                         _ANALYSIS_V1_DECODE_PROJECTION
                         if _artifact_contract_version(inspection.schema_version)
@@ -3193,13 +2991,9 @@ class AnalysisArtifactOutput:
         write_result: Callable[[h5py.Group], object],
     ) -> None:
         self._writer_started = True
-        # A Stitch 1D result, or a native Stitch 2D's, is an Int record (``stitch_record``): the writer
-        # fills a fresh open_nexus_writer document first, and the request envelope then goes on its
-        # stitch group.
-        record = self.request.kind is AnalysisArtifactKind.STITCH_1D or (
-            self.request.kind is AnalysisArtifactKind.STITCH_2D
-            and self.request.schema_version in _STITCH_NATIVE_VERSIONS)
-        if record:
+        # A Stitch result is an Int record (``stitch_record``): the writer fills a fresh open_nexus_writer
+        # document first, and the request envelope then goes on its stitch group. An RSM is this layout.
+        if self.request.kind is not AnalysisArtifactKind.RSM:
             from xrd_tools.io.nexus import open_nexus_writer
 
             def open_record(path):
@@ -3257,7 +3051,7 @@ class AnalysisArtifactOutput:
                     self.request.execution_attestation_json.encode("utf-8")
                 ),
             )
-        if not record:
+        if self.request.kind is AnalysisArtifactKind.RSM:  # a record's writer ran first
             write_result(entry)
         handle.flush()
 

@@ -746,3 +746,25 @@ def test_backend_is_a_processing_choice_and_a_missing_partner_is_named(qapp, tmp
         assert "partner" not in page._readiness[0]
     finally:
         _close(page, qapp)
+
+
+def test_an_older_stitch_file_says_to_stitch_it_again(qapp, tmp_path):
+    """The old Stitch layout was removed (maintainer, 2026-09-30: "Remove old format"): opening a file in it
+    says what to do, not a bare refusal."""
+    import h5py
+    from xrd_tools.io.analysis_artifact import ANALYSIS_KIND_ATTR, AnalysisArtifactKind, admit_analysis_artifact
+    from xrd_tools.io.output_transaction import OutputTransactionCoordinator
+    from tests.core.test_analysis_artifact import _request, _writer
+    request = _request(tmp_path / "older-stitch.nexus", AnalysisArtifactKind.RSM)  # the old layout's shape
+    admit_analysis_artifact(request, coordinator=OutputTransactionCoordinator()).publish(_writer(request))
+    with h5py.File(request.target, "r+") as handle:
+        entry = handle["entry"]
+        del entry.attrs[ANALYSIS_KIND_ATTR]
+        entry.attrs.create(ANALYSIS_KIND_ATTR, np.bytes_(AnalysisArtifactKind.STITCH_2D.value.encode()))
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.open_result(request.target)
+        _wait(page, qapp)
+        assert "stitch it again" in page.run_bar.readinessLabel.full_text()
+    finally:
+        _close(page, qapp)
