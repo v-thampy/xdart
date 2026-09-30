@@ -93,6 +93,8 @@ class AnalysisResult:
     gi_cuts: tuple = field(default=(), repr=False, compare=False)
     #: a Stitch 2D's I(q) beside the map, (IntegrationResult1D, StitchDiagnostics); None otherwise.
     profile: Any = field(default=None, repr=False, compare=False)
+    #: a GI Stitch 2D's q_ip-q_oop map, (IntegrationResult2D, StitchDiagnostics); None otherwise.
+    gi_map: Any = field(default=None, repr=False, compare=False)
 
     def to_dict(self, *, include_payload: bool = True) -> dict[str, Any]:
         data = {
@@ -613,11 +615,11 @@ def run_stitch(
             f"grouped/composite source is NaN-padding a member that lacks this "
             f"monitor. Every member of a multi-source stitch must provide it.")
 
-    auxiliary, gi_cuts, profile = None, (), None
+    auxiliary, gi_cuts, profile, gi_map = None, (), None, None
     diffractometer = plan.diffractometer or getattr(src, "diffractometer", None)
     if plan.stitch_gi is not None and (diffractometer is None or not plan.streaming_multigeometry
-                                    or plan.mode != "1d"):
-        raise ValueError("a GI cut needs the streaming 1-D Stitch with a Diffractometer")
+                                    or (plan.mode == "2d" and not plan.stitch_profile)):
+        raise ValueError("a GI cut needs the streaming Stitch with a Diffractometer (in 2-D, I(q) beside the map)")
     if plan.stitch_profile and (diffractometer is None or not plan.streaming_multigeometry
                                 or plan.mode != "2d" or plan.backend != "multigeometry"):
         raise ValueError("an I(q) profile needs the streaming 2-D Stitch with a Diffractometer")
@@ -742,6 +744,7 @@ def run_stitch(
                 unit=plan.unit, radial_range=plan.radial_range,
                 azimuth_range=plan.azimuth_range)
         elif plan.mode == "2d" and plan.streaming_multigeometry:
+            gi_angles = _stitch_gi_angles(plan, src, labels)
             arguments = dict(
                 npt_rad=plan.npt_rad_2d, npt_azim=plan.npt_azim_2d,
                 unit=plan.unit, method=plan.method,
@@ -751,9 +754,9 @@ def run_stitch(
                 frame_screen=frame_screen, **corrections,
             )
             if plan.stitch_profile:
-                payload, auxiliary, *profile = stitch_2d_with_1d_streaming(
+                payload, auxiliary, *profile, gi_cuts, gi_map = stitch_2d_with_1d_streaming(
                     _iter_images(), len(labels), integrator_series.__iter__, npt_1d=plan.npt_1d,
-                    **arguments)
+                    gi=plan.stitch_gi, gi_angles=gi_angles, **arguments)
                 profile = tuple(profile)
             else:
                 payload, auxiliary = stitch_2d_streaming(
@@ -768,12 +771,7 @@ def run_stitch(
                 mask=plan.mask, normalization=normalization, **extra)
             auxiliary = None
         elif plan.streaming_multigeometry:
-            gi_angles = None
-            if plan.stitch_gi is not None:  # every frame's pyFAI incidence and tilt, from psic's circles
-                gi = plan.stitch_gi
-                series = {name: _metadata_series(src, labels, name) for name in gi.metadata_names()}
-                gi_angles = [gi.pyfai_angles(gi.normal({name: values[i] for name, values in series.items()}))
-                             for i in range(len(labels))]
+            gi_angles = _stitch_gi_angles(plan, src, labels)
             payload, auxiliary, gi_cuts = stitch_1d_streaming(
                 _iter_images(), len(labels), integrator_series.__iter__,
                 npt=plan.npt_1d, unit=plan.unit, method=plan.method,
@@ -904,7 +902,18 @@ def run_stitch(
         auxiliary=auxiliary,
         gi_cuts=gi_cuts,
         profile=profile,
+        gi_map=gi_map,
     )
+
+
+def _stitch_gi_angles(plan, src, labels):
+    """Every frame's pyFAI incidence and tilt, from psic's circles (None without GI)."""
+    gi = plan.stitch_gi
+    if gi is None:
+        return None
+    series = {name: _metadata_series(src, labels, name) for name in gi.metadata_names()}
+    return [gi.pyfai_angles(gi.normal({name: values[i] for name, values in series.items()}))
+            for i in range(len(labels))]
 
 
 @dataclass(frozen=True, slots=True)

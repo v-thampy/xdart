@@ -798,9 +798,12 @@ def _checked_frame_histograms(
     and polarization weight the normalization next to the solid angle.
     ``gi_cuts`` (normal, axis, ((cut, window, edges), …)) also bins the frame's GI
     cuts from the same pixels and weights, the GI coordinates computed once; their
-    histograms, one triple per cut, are the fifth value. ``map_edges`` (radial,
-    χ) also bins the frame's pixels over the (radial, χ) map from the same pixels
-    and weights; its triple (radial, azimuthal) is the sixth value, else None.
+    histograms, one triple per cut, are the fifth value; with ``gi_cuts``'
+    optional fourth item, the (q_ip edges, q_oop edges) of a GI Stitch 2D's map,
+    the frame's q_ip-q_oop map (q_ip, q_oop) is one more triple after the cuts'.
+    ``map_edges`` (radial, χ) also bins the frame's pixels over the (radial, χ)
+    map from the same pixels and weights; its triple (radial, azimuthal) is the
+    sixth value, else None.
     """
 
     raw_image = image = q = valid = weights = factor = solid = None
@@ -877,7 +880,7 @@ def _checked_frame_histograms(
             copy=False,
         )
         if gi_cuts is not None:
-            normal, axis, cuts = gi_cuts
+            normal, axis, cuts, *gi_map_edges = gi_cuts
             q_ip, q_oop = lease.gi_coordinates(normal, axis)
             owned_refs.extend((weakref.ref(q_ip), weakref.ref(q_oop)))
             histograms = []
@@ -889,6 +892,13 @@ def _checked_frame_histograms(
                 histograms.append((np.histogram(cut[inside], gi_edges, weights=image[inside])[0],
                                    np.histogram(cut[inside], gi_edges, weights=weights[inside])[0],
                                    np.histogram(cut[inside], gi_edges)[0].astype(np.float64, copy=False)))
+                inside = None
+            if gi_map_edges:  # inside both ranges, as each cut keeps the pixels in the other's
+                inside = np.logical_and(valid, np.isfinite(q_ip))
+                np.logical_and(inside, np.isfinite(q_oop), out=inside)
+                histograms.append(tuple(
+                    np.histogram2d(q_ip[inside], q_oop[inside], gi_map_edges[0], weights=values)[0]
+                    for values in (image[inside], weights[inside], None)))
                 inside = None
             gi_histograms = tuple(histograms)
             cut = other = q_ip = q_oop = None
@@ -1052,12 +1062,15 @@ class XuStitchScienceResult:
     gi_cuts: tuple[tuple[IntegrationResult1D, StitchDiagnostics], ...] = ()
     #: A Stitch 2D's (radial, χ) map beside I(q), (result, diagnostics); None otherwise.
     map: tuple[IntegrationResult2D, StitchDiagnostics] | None = None
+    #: A GI Stitch 2D's q_ip-q_oop map, (result, diagnostics); None otherwise.
+    gi_map: tuple[IntegrationResult2D, StitchDiagnostics] | None = None
 
     def __post_init__(self) -> None:
-        if self.map is not None and (type(self.map) is not tuple or len(self.map) != 2
-                                     or type(self.map[0]) is not IntegrationResult2D
-                                     or type(self.map[1]) is not StitchDiagnostics):
-            raise TypeError("XU Stitch map is invalid")
+        for value in (self.map, self.gi_map):
+            if value is not None and (type(value) is not tuple or len(value) != 2
+                                      or type(value[0]) is not IntegrationResult2D
+                                      or type(value[1]) is not StitchDiagnostics):
+                raise TypeError("XU Stitch map is invalid")
         if type(self.gi_cuts) is not tuple or any(
                 type(cut) is not tuple or len(cut) != 2 or type(cut[0]) is not IntegrationResult1D
                 or type(cut[1]) is not StitchDiagnostics for cut in self.gi_cuts):
@@ -1119,7 +1132,8 @@ def run_xu_hist_stitch_1d(
     for the SURFACE asset), and the result carries them as ``gi_cuts``.
     ``map_grid`` (radial points, χ points, χ range in degrees) also bins a Stitch 2D's
     (radial, χ) map over the radial range from the same pixels and weights as I(q),
-    χ as pyFAI's (``XuPowderQFrameLease.chi``); the result carries it as ``map``.
+    χ as pyFAI's (``XuPowderQFrameLease.chi``); the result carries it as ``map``. With
+    ``gi`` too, the q_ip-q_oop map (the same points over the cuts' ranges) is ``gi_map``.
     """
     from xrd_tools.integrate.stitch_gi import GI_UNITS, StitchGI
     if map_grid is not None and (
@@ -1127,8 +1141,8 @@ def run_xu_hist_stitch_1d(
             or any(type(points) is not int or not 1 <= points <= 1_000_000 for points in map_grid[:2])
             or type(map_grid[2]) is not tuple or len(map_grid[2]) != 2
             or any(type(value) not in {int, float} or not math.isfinite(value) for value in map_grid[2])
-            or map_grid[2][0] >= map_grid[2][1] or gi is not None):
-        raise ValueError("a Stitch 2D map needs its radial and χ points, a finite increasing χ range, no GI")
+            or map_grid[2][0] >= map_grid[2][1]):
+        raise ValueError("a Stitch 2D map needs its radial and χ points, a finite increasing χ range")
     if gi is not None and (type(gi) is not StitchGI or unit != "q_A^-1"):
         raise TypeError("an XU GI cut needs an exact StitchGI beside I(q) in Q")
     if type(receipt) is not XuStitchCalibrationReceipt:
@@ -1307,6 +1321,8 @@ def run_xu_hist_stitch_1d(
     totals = [np.zeros(npt, dtype=np.float64) for _ in range(3)]
     gi_totals = () if gi is None else tuple([np.zeros(npt, dtype=np.float64) for _ in range(3)]
                                             for _cut in gi.cuts)
+    if gi is not None and map_grid is not None:  # the GI map, after the cuts
+        gi_totals += ([np.zeros(map_grid[:2], dtype=np.float64) for _ in range(3)],)
     map_totals = None if map_grid is None else [np.zeros(map_grid[:2], dtype=np.float64) for _ in range(3)]
     release_count = 0
 
@@ -1383,7 +1399,10 @@ def run_xu_hist_stitch_1d(
             gi_edges = {cut: np.linspace(*gi_bins[cut], npt + 1, dtype=np.float64) for cut in gi.cuts}
             other = {"q_ip": "q_oop", "q_oop": "q_ip"}
             cuts = tuple((cut, gi_bins[other[cut]], gi_edges[cut]) for cut in gi.cuts)
-            gi_cuts = [(normal, axis, cuts) for normal, axis in zip(normals, axes)]
+            gi_map_edges = () if map_grid is None else ((
+                np.linspace(*gi_bins["q_ip"], map_grid[0] + 1, dtype=np.float64),
+                np.linspace(*gi_bins["q_oop"], map_grid[1] + 1, dtype=np.float64)),)
+            gi_cuts = [(normal, axis, cuts, *gi_map_edges) for normal, axis in zip(normals, axes)]
         for index, (label, del_value, nu_value, monitor) in enumerate(frame_inputs):
             if cancel_token is not None and cancel_token.is_set():
                 raise XuStitchCancelled("CANCELLED")
@@ -1443,6 +1462,12 @@ def run_xu_hist_stitch_1d(
         gi_results = tuple(
             _normalized((gi_edges[cut][:-1] + gi_edges[cut][1:]) * 0.5, *cut_totals, GI_UNITS[cut])
             for cut, cut_totals in zip(() if gi is None else gi.cuts, gi_totals))
+        gi_map_result = None
+        if gi is not None and map_grid is not None:
+            (ip_edges, oop_edges), = gi_map_edges
+            gi_map_result = _normalized_map((ip_edges[:-1] + ip_edges[1:]) * 0.5,
+                                            (oop_edges[:-1] + oop_edges[1:]) * 0.5, *gi_totals[-1],
+                                            GI_UNITS["q_ip"], GI_UNITS["q_oop"])
         map_result = None
         if map_grid is not None:
             radial_edges, chi_edges = map_edges
@@ -1463,13 +1488,15 @@ def run_xu_hist_stitch_1d(
         release_count,
         gi_results,
         map_result,
+        gi_map_result,
     )
 
 
-def _normalized_map(radial, chi, signal, normalization, count, unit):
-    """A Stitch 2D's map as ``_normalized`` makes I(q), in the (radial, azimuthal) orientation."""
-    return IntegrationResult2D(radial, chi, _normalized_intensity(signal, normalization), None, unit,
-                               "chi_deg"), StitchDiagnostics(count, normalization)
+def _normalized_map(radial, azimuthal, signal, normalization, count, unit, azimuthal_unit="chi_deg"):
+    """A Stitch 2D's map as ``_normalized`` makes I(q), in the (radial, azimuthal) orientation: the
+    (radial, χ) map, or the (q_ip, q_oop) one of a GI Stitch 2D."""
+    return IntegrationResult2D(radial, azimuthal, _normalized_intensity(signal, normalization), None, unit,
+                               azimuthal_unit), StitchDiagnostics(count, normalization)
 
 
 def _normalized(centres, signal, normalization, count, unit):

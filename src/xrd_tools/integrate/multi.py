@@ -193,6 +193,7 @@ def _streaming_multigeometry(
     gi=None,
     gi_angles: Sequence[tuple[float, float]] | None = None,
     profile_npt: int | None = None,
+    gi_map_npt: tuple[int, int] | None = None,
 ):
     """Returns (pyFAI's merged result, each GI cut's [signal, normalization, count, axis] in the plan's
     order, or () without GI, and with ``profile_npt`` beside a 2-D map pyFAI's merged I(q) over every χ
@@ -223,10 +224,15 @@ def _streaming_multigeometry(
         radial_range=radial_range,
         azimuth_range=azimuth_range,
     )
-    if gi is not None and (mode != "1d" or gi_angles is None or len(gi_angles) != image_count):
-        raise ValueError("a GI cut needs a 1-D Stitch and one (incidence, tilt) per frame")
+    if gi is not None and (gi_angles is None or len(gi_angles) != image_count
+                           or (mode == "2d" and (profile_npt is None or gi_map_npt is None))):
+        raise ValueError("a GI cut needs one (incidence, tilt) per frame, and in 2-D I(q) and the GI map")
     if profile_npt is not None and (mode != "2d" or type(profile_npt) is not int or profile_npt < 1):
         raise ValueError("an I(q) profile goes beside a 2-D Stitch, with a positive point count")
+    if gi_map_npt is not None and (gi is None or mode != "2d" or type(gi_map_npt) is not tuple
+                                   or len(gi_map_npt) != 2
+                                   or any(type(points) is not int or points < 1 for points in gi_map_npt)):
+        raise ValueError("a GI map goes beside a 2-D GI Stitch, with its q_ip and q_oop points")
     # a 1-D Stitch's ranges: the same radial range, and every χ (scouted as a 1-D Stitch scouts it)
     profile_azimuth = (fixed_azimuth if azimuth_range is None else _resolve_streaming_ranges(
         integrator_factory, image_count, unit=unit, radial_range=fixed_radial, azimuth_range=None,
@@ -383,10 +389,12 @@ def _streaming_multigeometry(
                     azimuthal = current_azimuthal.copy()
                 elif not np.array_equal(azimuthal, current_azimuthal):
                     raise ValueError("pyFAI returned inconsistent Stitch azimuth axes")
+            # the cuts take I(q)'s points (a 2-D Stitch's I(q) beside its map); the GI map its own
             gi_part = () if gi is None else _gi_frame_sums(
-                integrator, image, gi_angles[index], gi, gi_bins, npt_rad, mask=frame_mask,
-                correct_solid_angle=correct_solid_angle, polarization_factor=polarization_factor,
-                dark=dark, flat=flat, monitor=monitor)
+                integrator, image, gi_angles[index], gi, gi_bins, npt_rad if mode == "1d" else profile_npt,
+                mask=frame_mask, correct_solid_angle=correct_solid_angle,
+                polarization_factor=polarization_factor, dark=dark, flat=flat, monitor=monitor,
+                map_npt=gi_map_npt)
             if frame_screen is None:
                 aggregate = (
                     copy.deepcopy(result)
@@ -468,7 +476,7 @@ def _drop_unsplit_bins(result):
 
 
 def _gi_frame_sums(integrator, image, angles, gi, bins, npt, *, mask, correct_solid_angle,
-                   polarization_factor, dark, flat, monitor):
+                   polarization_factor, dark, flat, monitor, map_npt=None):
     """One frame's GI cuts as pyFAI's fiber sums, each [signal, normalization × pixel area/dist²,
     count, axis] in ``gi.cuts`` order, accumulated across frames as pyFAI's MultiGeometryFiber does.
 
@@ -480,6 +488,10 @@ def _gi_frame_sums(integrator, image, angles, gi, bins, npt, *, mask, correct_so
     whenever its angles change, so both passes and the window take these rather than each parsing
     its own. ``angles`` are the frame's (incident angle, tilt) in degrees
     (``StitchGI.pyfai_angles``); ``bins`` both coordinates' ranges.
+
+    ``map_npt`` (q_ip points, q_oop points) also sums a GI Stitch 2D's q_ip-q_oop map, pyFAI's full
+    2-D fiber histogram over the same ranges, window and weights, as the last sums [signal,
+    normalization × pixel area/dist², count, (q_ip axis, q_oop axis)] in the (q_ip, q_oop) orientation.
     """
     from pyFAI.units import get_unit_fiber
     from xrd_tools.integrate.gid import _effective_gi_params, _fiber_from_integrator
@@ -507,6 +519,18 @@ def _gi_frame_sums(integrator, image, angles, gi, bins, npt, *, mask, correct_so
                      np.asarray(result._sum_normalization, dtype=np.float64).sum(axis=axis) * scale,
                      np.asarray(result.count, dtype=np.float64).sum(axis=axis),
                      np.asarray(result.inplane if in_plane else result.outofplane, dtype=np.float64)])
+    if map_npt is not None:
+        result = fiber.integrate2d_fiber(
+            image, npt_ip=map_npt[0], unit_ip=units["q_ip"], ip_range=bins["q_ip"],
+            npt_oop=map_npt[1], unit_oop=units["q_oop"], oop_range=bins["q_oop"],
+            correctSolidAngle=correct_solid_angle, mask=mask, polarization_factor=polarization_factor,
+            dark=dark, flat=flat, method=("no", "histogram", "cython"), normalization_factor=monitor,
+            incident_angle=angle, tilt_angle=tilt, sample_orientation=orientation)
+        # pyFAI's (q_oop, q_ip), the container's (q_ip, q_oop)
+        sums.append([np.asarray(result.sum_signal, dtype=np.float64).T,
+                     np.asarray(result._sum_normalization, dtype=np.float64).T * scale,
+                     np.asarray(result.count, dtype=np.float64).T,
+                     (np.asarray(result.inplane, dtype=np.float64), np.asarray(result.outofplane, dtype=np.float64))])
     return tuple(sums)
 
 
@@ -569,6 +593,17 @@ def _gi_bins(integrator_factory, gi_angles, gi):
             raise ValueError("no pixel lies inside the GI window")
         bins[cut] = (low[cut], high[cut])
     return bins
+
+
+def gi_map_result(totals):
+    """A GI Stitch 2D's q_ip-q_oop map, (q_ip, q_oop): Σ signal / Σ normalization where a bin has weight
+    (NaN elsewhere, as the cuts), and its diagnostics."""
+    signal, normalization, count, (q_ip, q_oop) = totals
+    intensity = np.full(normalization.shape, np.nan, dtype=np.float64)
+    occupied = normalization > 0
+    intensity[occupied] = signal[occupied] / normalization[occupied]
+    return (IntegrationResult2D(q_ip, q_oop, intensity, None, GI_UNITS["q_ip"], GI_UNITS["q_oop"]),
+            StitchDiagnostics(count, normalization))
 
 
 def gi_cut_result(totals, unit):
@@ -748,12 +783,18 @@ def stitch_2d_with_1d_streaming(
     dark: np.ndarray | None = None,
     flat: np.ndarray | None = None,
     flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
-) -> tuple[IntegrationResult2D, StitchDiagnostics, IntegrationResult1D, StitchDiagnostics]:
+    gi=None,
+    gi_angles: Sequence[tuple[float, float]] | None = None,
+) -> tuple:
     """The 2-D map and I(q) beside it, as an Int 2D record holds them, from one pass over the frames:
     the map as :func:`stitch_2d_streaming` makes it, and I(q) over every χ in ``npt_1d`` bins as
-    :func:`stitch_1d_streaming` makes it from the same frames."""
+    :func:`stitch_1d_streaming` makes it from the same frames. With ``gi`` and every frame's
+    (incidence, tilt) in ``gi_angles``, also its cuts as :func:`stitch_1d_streaming` makes them and
+    the q_ip-q_oop map (``npt_rad`` × ``npt_azim`` over the cuts' ranges).
 
-    result, _gi, profile = _streaming_multigeometry(
+    Returns (map, its diagnostics, I(q), its diagnostics, the GI cuts or (), the GI map or None)."""
+
+    result, gi_totals, profile = _streaming_multigeometry(
         images,
         image_count,
         integrator_factory,
@@ -774,8 +815,13 @@ def stitch_2d_with_1d_streaming(
         flat=flat,
         flat_min_fraction=flat_min_fraction,
         profile_npt=npt_1d,
+        gi=gi,
+        gi_angles=gi_angles,
+        gi_map_npt=None if gi is None else (npt_rad, npt_azim),
     )
-    return (*_stitch_2d_payload(result), *_stitch_1d_payload(profile, unit))
+    cuts = tuple(gi_cut_result(totals, GI_UNITS[cut]) for cut, totals in zip(() if gi is None else gi.cuts, gi_totals))
+    gi_map = None if gi is None else gi_map_result(gi_totals[-1])
+    return (*_stitch_2d_payload(result), *_stitch_1d_payload(profile, unit), cuts, gi_map)
 
 
 @dataclass(frozen=True, slots=True)
