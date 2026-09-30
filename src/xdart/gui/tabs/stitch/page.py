@@ -39,9 +39,9 @@ from xdart.gui.widgets.controls_panel import (
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xdart.gui.widgets.scientific_plot import scaled_intensity_label
 from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
-from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
+from xrd_tools.analysis.stitch_native import native_ceilings
 from xrd_tools.analysis.stitch_operation import StitchGeometryKind
 from xrd_tools.analysis.stitch_sources import StitchSourceSelection
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
@@ -900,6 +900,21 @@ class StitchPage(QtWidgets.QWidget):
         for row in self._range_rows:
             row.apply_fields(values)
 
+    def _show_auto_ceiling(self, ceilings):
+        """The automatic ceiling (decision 39) as the Max box's grey hint, never its value: the one
+        value every scan shares, else "per scan". The transitions' default maximum is the largest
+        value it keeps; typing any number makes the threshold manual."""
+        values = {ceiling[0] for ceiling in ceilings if ceiling is not None}
+        if len(ceilings) and None not in ceilings and len(values) == 1:
+            value = values.pop()
+            source = ("saturation" if any(ceiling[1] == "saturation" for ceiling in ceilings)
+                      else "data type maximum")
+            self._auto_threshold_max, hint = float(value - 1), f"Auto · {value} ({source})"
+        else:
+            self._auto_threshold_max, hint = None, "Auto · per scan" if values else "Auto"
+        self._fields["threshold"] = replace(self._fields["threshold"], placeholder=hint)
+        self._render_ranges()
+
     @property
     def _threshold_mode(self):
         state = self._threshold_state
@@ -926,7 +941,7 @@ class StitchPage(QtWidgets.QWidget):
             self._threshold_state = result
             for name, projected in (
                     ("threshold_min", 0.0 if result.threshold_min is None else result.threshold_min),
-                    ("threshold", result.threshold_max if result.threshold_max is not None or result.apply_threshold else self._auto_threshold_max),
+                    ("threshold", result.threshold_max if result.threshold_max is not None or result.apply_threshold else None),
                     ("threshold_enabled", result.apply_threshold or result.mask_saturation)):
                 self._fields[name] = replace(self._fields[name], value=projected)
             self._render_ranges()
@@ -971,7 +986,7 @@ class StitchPage(QtWidgets.QWidget):
 
     def _adopt_sources(self, paths):
         """The selection Run, Preview and the saved settings use, with what depends on it."""
-        self._auto_threshold_max = None
+        self._show_auto_ceiling(())
         if not self._threshold_manual:
             self._fields["threshold"] = replace(self._fields["threshold"], value=None)
             self._render_ranges()
@@ -1724,15 +1739,8 @@ class StitchPage(QtWidgets.QWidget):
             preflight = outcome.preflight
             if preflight.requests and preflight.form.backend == "xu_hist":
                 self._refresh_xu_geometry(calibration=preflight.requests[0].plan.calibration)
-            bounds = []
-            for members in preflight.preview_members:
-                for member in members:
-                    dtype = np.dtype(member["source_snapshot"]["raw_dtype"])
-                    bounds.append(FilesystemSourceAdapter._threshold_max_for_dtype(dtype))
-            self._auto_threshold_max = bounds[0] if bounds and all(value == bounds[0] for value in bounds) else None
-            if not self._threshold_manual:
-                self._fields["threshold"] = replace(self._fields["threshold"], value=self._auto_threshold_max)
-                self._render_ranges()
+            self._show_auto_ceiling({ceiling for request, members in zip(preflight.requests, preflight.preview_members)
+                                     for ceiling in native_ceilings(request, members)})
             done = len(preflight.unchanged)
             lines = [f"{len(preflight.requests)} stitched outputs"
                      + (f" · {done} already stitched with these settings (Append skips them)" if done else "")]

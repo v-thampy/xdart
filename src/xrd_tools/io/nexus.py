@@ -5014,6 +5014,36 @@ def _read_wavelength(grp: h5py.Group, energy: float) -> float:
     return float(np.nan)
 
 
+#: Where a NeXus/Eiger file records its detector's saturation (decision 39): the
+#: standard NXdetector field, then the Eiger's count-rate correction cutoff.
+_SATURATION_PATHS = (
+    "instrument/detector/saturation_value",
+    "instrument/detector/detectorSpecific/countrate_correction_count_cutoff",
+)
+
+
+def _read_saturation(grp: h5py.Group | None) -> int | None:
+    """The detector saturation the entry records, as a positive whole count, else None.
+
+    The first readable path wins; a missing or malformed value falls to the next
+    (``xrd_tools.core.invalid.saturation_count``), never raising.
+    """
+    from xrd_tools.core.invalid import saturation_count
+
+    if grp is None:
+        return None
+    for name in _SATURATION_PATHS:
+        try:
+            item = grp.get(name)
+            value = (saturation_count(item[()])
+                     if isinstance(item, h5py.Dataset) and item.shape == () else None)
+        except Exception:  # noqa: BLE001 - an unreadable value falls to the next rule
+            value = None
+        if value is not None:
+            return value
+    return None
+
+
 def _read_ub_matrix(grp: h5py.Group) -> np.ndarray | None:
     """Extract the 3×3 UB matrix from the sample group, or None."""
     for path in ("sample/ub_matrix", "sample/orientation_matrix"):

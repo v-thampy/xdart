@@ -784,6 +784,7 @@ def _checked_frame_histograms(
     unit: str = "q_A^-1",
     wavelength_A: float | None = None,
     conditioning: StitchConditioning | None = None,
+    saturation: int | None = None,
     mask: np.ndarray | None = None,
     frame_record_callback: Callable[[int, np.ndarray], None] | None = None,
     polarization: tuple | None = None,
@@ -822,7 +823,7 @@ def _checked_frame_histograms(
             )
         if frame_record_callback is not None:
             frame_record_callback(label, raw_image)
-        image = condition_stitch_frame(raw_image, conditioning)
+        image = condition_stitch_frame(raw_image, conditioning, saturation)
         owned_refs.append(weakref.ref(image))
         raw_image = None
         if (
@@ -1105,6 +1106,7 @@ def run_xu_hist_stitch_1d(
     unit: str = "q_A^-1",
     radial_range: tuple[float, float] | None = None,
     conditioning: StitchConditioning | None = None,
+    saturation: Mapping[int, int] | None = None,
     mask: np.ndarray | None = None,
     frame_record_callback: Callable[[int, np.ndarray], None] | None = None,
     frame_screen: object = None,
@@ -1419,6 +1421,7 @@ def run_xu_hist_stitch_1d(
                 unit=unit,
                 wavelength_A=wavelength_A,
                 conditioning=conditioning,
+                saturation=None if saturation is None else saturation.get(label),
                 mask=mask,
                 frame_record_callback=frame_record_callback,
                 polarization=polarization,

@@ -1064,6 +1064,8 @@ class RangeRow(QtWidgets.QWidget):
     ) -> None:
         edit.setEnabled(bool(field.enabled))
         edit.setToolTip(_field_tooltip(field.path, field.reason))
+        if field.placeholder is not None:
+            edit.setPlaceholderText(field.placeholder)
         path = tuple(field.path)
         self._model_text_by_path[path] = self._model_text(field.value)
         value = self._display_text(field.value)

@@ -10,6 +10,7 @@ Masks come from pyFAI's detector registry, not hardcoded arrays.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +42,31 @@ class DetectorImageLayout:
     shape: tuple[int, int]
     dtype: str
     frame_count: int
+    #: The detector saturation the file's header records (decision 39), or None.
+    saturation: int | None = None
+
+
+_COUNT_CUTOFF = re.compile(r"Count_cutoff\s+(\d+)\s*counts", re.IGNORECASE)
+
+
+def pilatus_count_cutoff(header: object) -> int | None:
+    """The ``Count_cutoff <n> counts`` a PILATUS header records, else None.
+
+    ``header`` is the header text (a TIFF ImageDescription, a CBF
+    ``_array_data.header_contents``) or a mapping of header values, which are
+    searched in order. Two different cutoffs in one header are ambiguous: None.
+    """
+    from xrd_tools.core.invalid import saturation_count
+
+    texts = header.values() if isinstance(header, dict) else (header,)
+    found = set()
+    for text in texts:
+        if isinstance(text, bytes):
+            text = text.decode("latin-1", errors="replace")
+        if isinstance(text, str):
+            found.update(saturation_count(int(match)) for match in _COUNT_CUTOFF.findall(text[:65536]))
+    found.discard(None)
+    return found.pop() if len(found) == 1 else None
 
 # Established detector layouts for headerless binary frames.  This table is a
 # headless I/O capability shared by the GUI and every FrameSource; matching is
@@ -143,8 +169,11 @@ def read_detector_image_layout(
     raw_header_skip: int = 0,
 ) -> DetectorImageLayout:
     """Read only detector header/layout facts, never a pixel allocation."""
+    from xrd_tools.io.nexus import _read_saturation
+
     selected = Path(path)
     suffix = selected.suffix.lower()
+    saturation = None
     if suffix in _HDF5_READ_EXTS:
         if suffix in {".h5", ".hdf5"} and _is_eiger_master(selected):
             from xrd_tools.io.nexus import open_nexus_image_stack
@@ -152,12 +181,15 @@ def read_detector_image_layout(
                 shape = tuple(int(value) for value in stack.shape[1:])
                 dtype = np.dtype(stack.dtype)
                 frame_count = int(stack.shape[0])
+            with h5py.File(selected, "r") as handle:
+                saturation = _read_saturation(handle.get("entry"))
         else:
             with h5py.File(selected, "r") as handle:
                 dataset = _find_hdf5_image_dataset(handle)
                 shape = tuple(int(value) for value in dataset.shape[-2:])
                 dtype = np.dtype(dataset.dtype)
                 frame_count = int(dataset.shape[0]) if dataset.ndim == 3 else 1
+                saturation = _read_saturation(handle.get("entry"))
     elif suffix in {".tif", ".tiff"}:
         import tifffile
 
@@ -169,6 +201,7 @@ def read_detector_image_layout(
             shape = tuple(int(value) for value in first.shape)
             dtype = np.dtype(first.dtype)
             frame_count = len(pages)
+            saturation = pilatus_count_cutoff(first.description)
     elif suffix == ".raw":
         dtype = np.dtype(raw_dtype)
         shape_value = detector_shape or resolve_detector_shape(detector)
@@ -190,13 +223,14 @@ def read_detector_image_layout(
             shape = tuple(int(value) for value in image.shape)
             dtype = np.dtype(image.dtype)
             frame_count = int(getattr(image, "nframes", 1))
+            saturation = pilatus_count_cutoff(dict(getattr(image, "header", None) or {}))
         finally:
             image.close()
     if len(shape) != 2 or any(value <= 0 for value in shape):
         raise ValueError("detector image layout must be exactly two-dimensional")
     if frame_count <= 0:
         raise ValueError("detector image layout has an invalid frame count")
-    return DetectorImageLayout((shape[0], shape[1]), dtype.str, frame_count)
+    return DetectorImageLayout((shape[0], shape[1]), dtype.str, frame_count, saturation)
 
 
 def get_detector_mask(detector_name: str) -> np.ndarray | None:

@@ -58,7 +58,11 @@ def test_restoring_an_automatic_threshold_clears_a_prior_manual_band(qapp, tmp_p
 
 @pytest.mark.parametrize("dtype", ("int32", "uint32", "uint16", "float32"))
 @pytest.mark.parametrize("initial", ("auto", "touch-min", "touch-max", "touch-enabled", "disabled-touch"))
-def test_threshold_edit_sequences_match_int(qapp, tmp_path, dtype, initial):
+def test_threshold_edit_sequences_match_int(qapp, tmp_path, dtype, initial, request):
+    if dtype in {"int32", "uint32"} or (dtype, initial) == ("uint16", "auto"):
+        # Decision 39, stage 1: Stitch shows its resolved ceiling as a hint and a typed maximum is
+        # manual; Int's threshold row follows in the next commit, which restores this parity.
+        request.applymarker(pytest.mark.xfail(strict=True, reason="Int's hint follows (decision 39)"))
     form = replace(_native_form(tmp_path, "multigeometry", scans="1"), raw_dtype=dtype)
     for path in Path(form.image_dir).glob("*.raw"):
         np.fromfile(path, dtype=np.int32).astype(dtype).tofile(path)

@@ -83,6 +83,8 @@ class ContainerDescriptor:
     motor_names: tuple[str, ...] | None = None
     is_bluesky: bool = False
     finalized: bool = True
+    #: The detector saturation the file records (decision 39), or None.
+    saturation: int | None = None
 
     @property
     def version_stamp(self) -> tuple[int, int] | None:
@@ -432,6 +434,7 @@ def describe_container_from_open(
     from xrd_tools.io.nexus import (
         UnsupportedDetectorRankError,
         _read_energy,
+        _read_saturation,
         _read_wavelength,
     )
     from xrd_tools.io.processed_scan_id import (
@@ -598,7 +601,7 @@ def describe_container_from_open(
         dtype=facts["dtype"], dataset_shape=facts["dataset_shape"],
         chunks=facts["chunks"], compression=facts["compression"], is_2d=facts["is_2d"],
         self_contained=_stack_is_self_contained(h5f, paths),
-        wavelength=wavelength, **common)
+        wavelength=wavelength, saturation=_read_saturation(entry_grp), **common)
 
 
 def _describe_container_from_open_with_binding(
@@ -618,7 +621,8 @@ def _describe_container_from_open_with_binding(
     import h5py
 
     from xrd_tools.io.nexus import (
-        _bind_nexus_stack_from_entry, _read_energy, _read_wavelength,
+        _bind_nexus_stack_from_entry, _read_energy, _read_saturation,
+        _read_wavelength,
     )
     from xrd_tools.io.image import _is_eiger_master
 
@@ -686,6 +690,7 @@ def _describe_container_from_open_with_binding(
             ),
             wavelength=wavelength, motor_names=all_names,
             is_bluesky=is_bluesky, finalized=finalized,
+            saturation=_read_saturation(resolved_entry_group),
         )
         return descriptor, binding
     except BaseException as primary:

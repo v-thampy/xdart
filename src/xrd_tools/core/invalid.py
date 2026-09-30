@@ -10,24 +10,122 @@ Deliberately dtype-derived and **never hardcodes 65535**: a float frame whose
 integer dtype was lost upstream returns ``None`` from
 :func:`integer_saturation_ceiling`, leaving the fallback (if any) to the caller
 — the GUI keeps its legacy 65535 fallback in xdart, out of core.
+
+The automatic ceiling (decision 39, :func:`resolve_detector_saturation`) is the
+value the file records, else the detector's documented counter limit, else the
+data type's maximum. A caller passes a resolved non-dtype value as
+``saturation`` and Auto then also leaves out ``raw >= saturation``; the native
+exclusions above stay, so a uint16 65535 stays out under a higher cutoff.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
+import math
 
 import numpy as np
 
 #: uint32 max — the unambiguous dead/hot-pixel dummy (Eiger masters etc.).
 UINT32_CEILING = 4294967295.0
 
+#: The PILATUS2/PILATUS3 20-bit counter's largest count: the documented
+#: saturation of PILATUS frames whose file records none (the 17-2 ``.raw``).
+#: A header's own ``Count_cutoff`` comes first: after count-rate correction it
+#: can be higher (DECTRIS: 1,208,517 on a PILATUS3, 1,280,469 on a PILATUS2).
+PILATUS_COUNTER_LIMIT = 1_048_575
+
+#: Where an automatic ceiling came from, in the order decision 39 applies them.
+SATURATION_SOURCES = ("recorded", "detector", "dtype")
+
 __all__ = [
+    "PILATUS_COUNTER_LIMIT",
+    "SATURATION_SOURCES",
     "UINT32_CEILING",
+    "DetectorSaturation",
     "combine_detector_masks",
     "detector_value_mask",
+    "documented_saturation",
     "integer_saturation_ceiling",
+    "resolve_detector_saturation",
+    "saturation_count",
     "saturation_pixels",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class DetectorSaturation:
+    """An automatic ceiling (decision 39): Auto leaves out pixels at or above ``value``."""
+
+    value: int
+    source: str
+
+    def __post_init__(self) -> None:
+        if saturation_count(self.value) != self.value or type(self.value) is not int:
+            raise ValueError("a saturation value is a positive whole count")
+        if self.source not in SATURATION_SOURCES:
+            raise ValueError(f"saturation source must be one of {SATURATION_SOURCES}")
+
+
+def saturation_count(value) -> int | None:
+    """``value`` as a positive whole count, else ``None``.
+
+    A recorded value that is missing, not a scalar, not finite, not a whole
+    number or not positive is ignored, and the next rule applies.
+    """
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    try:
+        array = np.asarray(value)
+    except Exception:  # noqa: BLE001 - any unreadable value falls to the next rule
+        return None
+    if array.shape != ():
+        return None
+    if array.dtype.kind in "iu":
+        number = int(array)
+    elif array.dtype.kind == "f" and math.isfinite(float(array)) and float(array).is_integer():
+        number = int(float(array))
+    else:
+        return None
+    return number if 0 < number < 2**63 else None
+
+
+def documented_saturation(detector: object) -> int | None:
+    """The documented counter limit for a detector name: PILATUS2/3 only.
+
+    Names are matched lowercase and alphanumeric (``Pilatus 300kw`` ->
+    ``pilatus300kw``). PILATUS4 (``pilatus4...``), whose counter this code does
+    not know, and every other detector return ``None``.
+    """
+    name = "".join(ch for ch in ("" if detector is None else str(detector)).lower() if ch.isalnum())
+    if name.startswith("pilatus") and not name.startswith("pilatus4"):
+        return PILATUS_COUNTER_LIMIT
+    return None
+
+
+def resolve_detector_saturation(
+    *,
+    recorded: object = None,
+    detector: object = None,
+    dtype: object = None,
+) -> DetectorSaturation | None:
+    """The automatic ceiling, in decision 39's order.
+
+    First the value the file records (a PILATUS header's ``Count_cutoff``, a
+    NeXus ``saturation_value``); else the detector's documented counter limit,
+    for integer data; else the integer data type's maximum. A value at or above
+    that maximum changes nothing (the maximum is always left out), so the data
+    type's rule stands. ``None`` when none is known (float data with nothing
+    recorded).
+    """
+    kind = None if dtype is None else np.dtype(dtype).kind
+    ceiling = None if dtype is None else _integer_dtype_saturation_ceiling(np.dtype(dtype))
+    native = None if ceiling is None else DetectorSaturation(int(ceiling), "dtype")
+    for value, source in ((saturation_count(recorded), "recorded"),
+                          (documented_saturation(detector) if kind in {None, "i", "u"} else None, "detector")):
+        if value is not None:
+            return native if native is not None and value >= native.value else DetectorSaturation(value, source)
+    return native
 
 
 def combine_detector_masks(
@@ -67,13 +165,18 @@ def detector_value_mask(
     raw_image,
     *,
     enabled: bool,
+    saturation: int | None = None,
 ) -> np.ndarray | None:
     """Union the accepted detector-value policy with an existing static mask.
 
     The operator toggle controls value masking only.  An existing static mask
     remains authoritative when value masking is disabled.  Enabled masking
-    adds negative values, the UINT32 dummy, and every native integer ceiling.
+    adds negative values, the UINT32 dummy, and every native integer ceiling,
+    and with a resolved ``saturation`` (not the dtype rule) every native value
+    at or above it.
     """
+    if saturation is not None and (type(saturation) is not int or saturation <= 0):
+        raise TypeError("saturation must be a positive whole count or absent")
     if not enabled:
         return mask
     raw = np.asarray(raw_image)
@@ -82,6 +185,8 @@ def detector_value_mask(
         raw,
         ceiling=integer_saturation_ceiling(raw),
     )
+    if saturation is not None:
+        bad |= raw >= saturation
     if mask is None:
         return bad if bad.any() else None
     static = np.asarray(mask, dtype=bool)

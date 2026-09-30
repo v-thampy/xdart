@@ -595,6 +595,9 @@ class ControlFormField:
     enabled: bool = True
     reason: str = ""
     parameter_group: str = ""
+    #: The grey hint an empty range bound shows (None leaves the renderer's own), e.g. the
+    #: automatic threshold ceiling, which is never the field's value (decision 39).
+    placeholder: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

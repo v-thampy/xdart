@@ -323,13 +323,16 @@ def test_native_minimum_only_threshold_edit_excludes_native_ceiling(qapp, tmp_pa
         _wait(page, qapp)
         assert page._owner.prepared is not None, page.run_bar.readinessLabel.full_text()
         ceiling = np.iinfo(dtype).max
-        assert page._value("threshold") == ceiling - 1
+        # Decision 39: the PILATUS calibration's counter limit is Auto's ceiling, shown as a hint only
+        assert page._value("threshold") is None
+        assert page.threshold_range._high.placeholderText() == "Auto · 1048575 (saturation)"
         page.set_field("threshold_min", "4")
         policy = page.build_form().conditioning
-        raw = np.array([[3, 4, ceiling - 1, ceiling]], dtype=dtype)
+        assert policy == StitchConditioning("manual", 4.0, 1048574.0)  # Auto's kept values, from 4
+        raw = np.array([[3, 4, 1048574, 1048575, ceiling - 1, ceiling]], dtype=dtype)
         original = raw.copy()
         actual = condition_stitch_frame(raw, policy)
-        np.testing.assert_array_equal(np.isfinite(actual), [[False, True, True, False]])
+        np.testing.assert_array_equal(np.isfinite(actual), [[False, True, True, False, False, False]])
         np.testing.assert_array_equal(raw, original)
     finally:
         page.shutdown()
@@ -648,8 +651,10 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
         assert "No detector images" in page.preview_text.toPlainText()
         status = page.run_bar.readinessLabel.full_text()  # skips and warnings stay on the status line
         assert "· 1 scan skipped" in status and status.endswith("(Preview lists them)")
-        assert page._value("threshold") == np.iinfo(np.int32).max - 1
-        assert page.build_form().conditioning.mode == "auto"
+        # the calibration's PILATUS counter limit, a hint and never the field's value (decision 39)
+        assert page._value("threshold") is None and page.build_form().threshold is None
+        assert page.threshold_range._high.placeholderText() == "Auto · 1048575 (saturation)"
+        assert page.build_form().conditioning == StitchConditioning("auto")
         page.run_bar.startButton.click()
         _wait(page, qapp, timeout=60)
         assert page.results.count() == 2, page.run_bar.readinessLabel.full_text()
@@ -666,7 +671,7 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
         page.scientific.plot_axis.setCurrentIndex(page.scientific.plot_axis.findData("2theta"))
         np.testing.assert_array_equal(page.curve.listDataItems()[0].xData, grouped.radial_axis("2th_deg"))
         page.set_field("threshold_min", "4")
-        assert page.build_form().conditioning == StitchConditioning("manual", 4., float(np.iinfo(np.int32).max - 1))
+        assert page.build_form().conditioning == StitchConditioning("manual", 4., 1048574.)  # Auto's kept values
         page.set_field("output_path", str(tmp_path / "cancelled"))
         page.begin_preview()
         _wait(page, qapp)

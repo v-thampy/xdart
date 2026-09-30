@@ -1,7 +1,7 @@
 """Finite native Stitch mask and raw-preview facts; no detector image decoding."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -238,6 +238,7 @@ def _snapshot(path, manifest, rotation):
         if not desc.frame_shape or desc.dtype is None or desc.frame_count < 1:
             _refuse("RAW_LAYOUT_UNAVAILABLE", "detector container has no exact layout")
         shape, dtype, count = tuple(desc.frame_shape), np.dtype(desc.dtype), desc.frame_count
+        recorded = desc.saturation
         snapshot.update(adapter_id=desc.adapter_id or "nexus_hdf5",
                         self_contained=bool(desc.self_contained))
         if len(desc.segment_paths) > 1:
@@ -253,22 +254,52 @@ def _snapshot(path, manifest, rotation):
         layout = read_detector_image_layout(path, **raw_options)
         shape, dtype, count = layout.shape, np.dtype(layout.dtype), layout.frame_count
         snapshot.update(adapter_id="image_file", self_contained=True)
+        recorded = layout.saturation
     snapshot.update(frame_count=int(count), raw_shape=list(shape), raw_dtype=dtype.str,
                     raw_header_bytes=int(raw_options.get("raw_header_skip", 0)))
     if _state(path) != before:
         _refuse("SOURCE_IDENTITY_MISMATCH", "raw layout changed during Preview")
-    return snapshot, before
+    return snapshot, before, recorded
+
+
+def calibration_detector(plan):
+    """The calibration's detector name (pyFAI's), for decision 39's documented counter limits."""
+    from xrd_tools.analysis.stitch_operation import XuStitchOperationPlan, _runtime_geometry
+    if type(plan) is XuStitchOperationPlan:
+        return plan.calibration.projection.value["detector"].get("detector_factory_name")
+    diff, _orientation = _runtime_geometry(plan.geometry, plan.geometry.content)
+    return getattr(diff.calibration.poni, "detector", None)
+
+
+def _manifest_members(manifest):
+    from xrd_tools.analysis.stitch_operation import StitchGroupManifestReceipt
+    return manifest.members if type(manifest) is StitchGroupManifestReceipt else (manifest,)
 
 
 def frame_seeds(source, manifest, plan):
     """Bind layout and original identities before science, without decoding pixels."""
-    from xrd_tools.analysis.stitch_operation import StitchGroupManifestReceipt, _source_members
-    members = manifest.members if type(manifest) is StitchGroupManifestReceipt else (manifest,)
+    return _frame_facts(source, manifest, plan)[0]
+
+
+def _frame_facts(source, manifest, plan):
+    """The frame seeds and each member's automatic ceiling (decision 39), from one layout read per file.
+
+    A member's ceiling is the value its files record, else the calibration detector's documented counter
+    limit, else its data type's maximum (None for float data with nothing recorded). The files of one
+    member must agree on what they record.
+    """
+    from xrd_tools.analysis.stitch_operation import _source_members
+    from xrd_tools.core.invalid import resolve_detector_saturation
+    members = _manifest_members(manifest)
     source_members = _source_members(source)
     _wavelength, expected_shape, orientation = geometry_facts(plan)
+    detector = calibration_detector(plan)
     records = []
+    ceilings = []
     cache = {}
     for member_index, member in enumerate(members):
+        recorded = set()
+        dtypes = set()
         original_scan = member.source_scan or member.source_entry or Path(member.source_relative_path).stem
         # Member ordinal prevents address collisions without discarding original scan identity.
         scan_label = f"{member_index + 1}-{original_scan}".replace("/", "_")
@@ -278,7 +309,9 @@ def frame_seeds(source, manifest, plan):
             cache_key = (str(path), member.source_options_json, member.source_entry)
             if cache_key not in cache:
                 cache[cache_key] = _snapshot(path, member, orientation.rotation)
-            snapshot, state = cache[cache_key]
+            snapshot, state, file_recorded = cache[cache_key]
+            recorded.add(file_recorded)
+            dtypes.add(snapshot["raw_dtype"])
             shape = tuple(snapshot["raw_shape"])
             if orientation.rotation in {90, 270}:
                 shape = shape[::-1]
@@ -293,7 +326,59 @@ def frame_seeds(source, manifest, plan):
                     "scan_id": str(original_scan), "frame_index": contribution.label,
                     "contribution_index": len(records),
                 }})
-    return records
+        if len(recorded) > 1:
+            _refuse("STITCH_SATURATION_DIFFERS",
+                    f"the files of scan {original_scan} record different detector saturations")
+        # Files of mixed data types leave only a recorded or documented value; each frame keeps
+        # its own data type's rule in the mask either way.
+        ceilings.append(resolve_detector_saturation(recorded=recorded.pop(), detector=detector,
+                                                    dtype=dtypes.pop() if len(dtypes) == 1 else None))
+    return records, tuple(ceilings)
+
+
+def member_saturation(ceilings):
+    """The per-member values a record keeps: None for the data type's rule; None when all take it."""
+    values = tuple(None if ceiling is None or ceiling.source == "dtype" else ceiling.value
+                   for ceiling in ceilings)
+    return None if all(value is None for value in values) else values
+
+
+def native_ceilings(request, frames):
+    """Each member's automatic ceiling, for the Stitch page's hint: ``(value, "saturation")`` for the
+    resolved value the output records, else ``(value, "data type")`` for its frames' data type maximum,
+    or None when neither is known (float data). ``frames`` are the request's preview members."""
+    from xrd_tools.core.invalid import integer_saturation_ceiling
+    recorded = request.provenance["plan"].get("conditioning") or {}
+    members = _manifest_members(request.manifest)
+    values = recorded.get("saturation") or [None] * len(members)
+    ceilings, start = [], 0
+    for member, value in zip(members, values, strict=True):
+        count = len(member.contributions)
+        if value is not None:
+            ceilings.append((int(value), "saturation"))
+        else:
+            native = {integer_saturation_ceiling(np.empty(0, np.dtype(frame["source_snapshot"]["raw_dtype"])))
+                      for frame in frames[start:start + count]}
+            ceiling = native.pop() if len(native) == 1 else None
+            ceilings.append(None if ceiling is None else (int(ceiling), "data type"))
+        start += count
+    return tuple(ceilings)
+
+
+def label_saturation(request):
+    """Each selected frame's resolved automatic ceiling, from the prepared request's conditioning (the
+    values Preview resolved and the output records), by the frame labels the kernels read; None when
+    every member takes its data type's rule."""
+    conditioning = request.plan.conditioning
+    recorded = request.provenance["plan"].get("conditioning") if request.plan.native_records else None
+    values = None if conditioning is None or conditioning.mode != "auto" or not recorded else recorded.get("saturation")
+    if values is None:
+        return None
+    members = _manifest_members(request.manifest)
+    per_frame = [value for member, value in zip(members, values, strict=True)
+                 for _contribution in member.contributions]
+    return {label: value for label, value in zip(request.module.source.selected_labels, per_frame, strict=True)
+            if value is not None}
 
 
 def native_provenance(value, source, output, plan, manifest):
@@ -320,8 +405,13 @@ def native_provenance(value, source, output, plan, manifest):
         value["plan"]["gi"] = plan.gi.to_provenance()
     value["wavelength_A"] = wavelength
     value["source_energy_checks"] = source_energy_checks(source, wavelength, recorded_energy_eV(plan))
+    seeds, ceilings = _frame_facts(source, manifest, plan)
+    saturation = member_saturation(ceilings)
+    if plan.conditioning is not None and plan.conditioning.mode == "auto" and saturation is not None:
+        # each member's resolved automatic ceiling (decision 39), recorded with the policy it serves
+        value["plan"]["conditioning"] = replace(plan.conditioning, saturation=saturation).to_dict()
     value["frame_members"] = analysis_contributing_frame_binding(analysis_contributing_frame_members(
-        frame_seeds(source, manifest, plan), source_base=manifest.project_root))
+        seeds, source_base=manifest.project_root))
     value["output"]["artifact_family"] = output.artifact_family
     return value
 

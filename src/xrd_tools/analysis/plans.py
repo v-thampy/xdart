@@ -6,7 +6,7 @@ import json
 import logging
 import threading
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
-from typing import TYPE_CHECKING, Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -173,6 +173,9 @@ class StitchPlan:
     streaming_multigeometry: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
     conditioning: StitchConditioning | None = None
+    #: Each frame label's resolved automatic ceiling (decision 39) where it is not the data type's:
+    #: Auto also leaves out native values at or above it. Runtime only, never in the provenance.
+    saturation: Mapping[int, int] | None = field(default=None, repr=False, compare=False)
     #: streaming multigeometry only: pyFAI error model ("poisson" gives sigma),
     #: and detector dark / flat images in the frames' orientation. pyFAI
     #: subtracts the dark and applies the flat in the normalization; with a dark,
@@ -565,7 +568,8 @@ def run_stitch(
                 frame_record_callback(label, raw)
                 recorded_labels.add(label)
             image = (np.asarray(raw, dtype=float) if plan.conditioning is None
-                     else condition_stitch_frame(raw, plan.conditioning))
+                     else condition_stitch_frame(raw, plan.conditioning,
+                                                 None if plan.saturation is None else plan.saturation.get(label)))
             raw = None
             _stitch_cancelled(cancel_token)
             yield image

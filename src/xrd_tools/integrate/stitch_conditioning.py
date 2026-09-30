@@ -11,15 +11,30 @@ from xrd_tools.core.invalid import detector_value_mask
 
 @dataclass(frozen=True, slots=True)
 class StitchConditioning:
-    """Explicit Int policy; absence at a caller preserves its legacy reader."""
+    """Explicit Int policy; absence at a caller preserves its legacy reader.
+
+    ``saturation`` is a prepared request's resolved automatic ceiling per member
+    (decision 39), in member order: a member's recorded or documented value, or
+    None where its data type's maximum applies (the rule before). Absent in a
+    form, and whenever every member takes its data type's.
+    """
 
     mode: str = "off"
     threshold_min: float | None = None
     threshold_max: float | None = None
+    saturation: tuple[int | None, ...] | None = None
 
     def __post_init__(self):
         if self.mode not in {"off", "auto", "manual"}:
             raise ValueError("threshold mode must be off, auto or manual")
+        if self.saturation is not None:
+            if type(self.saturation) is list:  # a record's JSON
+                object.__setattr__(self, "saturation", tuple(self.saturation))
+            if (self.mode != "auto" or type(self.saturation) is not tuple or not self.saturation
+                    or any(value is not None and (type(value) is not int or value <= 0)
+                           for value in self.saturation)
+                    or all(value is None for value in self.saturation)):
+                raise ValueError("a saturation is Auto's, one positive whole count or None per member")
         for name in ("threshold_min", "threshold_max"):
             value = getattr(self, name)
             if value is not None and (type(value) not in {int, float} or not math.isfinite(value)):
@@ -34,14 +49,22 @@ class StitchConditioning:
                 raise ValueError("threshold minimum cannot exceed maximum")
 
     def to_dict(self):
-        return asdict(self)
+        """The record's policy: without ``saturation`` when absent, as before decision 39."""
+        value = asdict(self)
+        if self.saturation is None:
+            del value["saturation"]
+        else:
+            value["saturation"] = list(self.saturation)
+        return value
 
 
-def condition_stitch_frame(raw_image, conditioning: StitchConditioning | None):
+def condition_stitch_frame(raw_image, conditioning: StitchConditioning | None, saturation: int | None = None):
     """Return an owning float64 frame, preserving native values for Int policy.
 
     No orientation or static masking occurs here. Those remain geometry inputs;
     disabling value conditioning never disables a detector or external mask.
+    ``saturation`` is this frame's resolved automatic ceiling (decision 39); Auto
+    also leaves out native values at or above it. Absent: the data type's rule.
     """
     if conditioning is not None and type(conditioning) is not StitchConditioning:
         raise TypeError("conditioning must be exact StitchConditioning or absent")
@@ -52,7 +75,7 @@ def condition_stitch_frame(raw_image, conditioning: StitchConditioning | None):
     if conditioning is None or conditioning.mode == "off":
         return image
     if conditioning.mode == "auto":
-        bad = detector_value_mask(None, raw, enabled=True)
+        bad = detector_value_mask(None, raw, enabled=True, saturation=saturation)
     else:
         # Reuse the same inclusive comparison owner as native Int, including
         # comparisons against native integer values before float conversion.

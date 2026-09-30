@@ -88,7 +88,7 @@ from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xrd_tools.integrate.stitch_gi import StitchGI
 from xrd_tools.analysis.stitch_native import (
     capture_mask, revalidate_mask, native_mask, native_plan_identity,
-    native_provenance, capture_callback, geometry_facts,
+    native_provenance, capture_callback, geometry_facts, label_saturation,
     capture_detector_image, native_detector_image,
 )
 from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
@@ -2460,7 +2460,7 @@ def _sample_positioned(plan: StitchOperationPlan, diffractometer):
     return diffractometer
 
 
-def _runtime_plan(plan: StitchOperationPlan, diffractometer) -> StitchPlan:
+def _runtime_plan(plan: StitchOperationPlan, diffractometer, saturation=None) -> StitchPlan:
     diffractometer = _sample_positioned(plan, diffractometer)
     mask = _detector_mask(diffractometer) if plan.use_detector_mask else None
     external = native_mask(plan)
@@ -2488,6 +2488,7 @@ def _runtime_plan(plan: StitchOperationPlan, diffractometer) -> StitchPlan:
         ),
         mask=mask,
         conditioning=plan.conditioning,
+        saturation=saturation,
         max_eager_bytes=None,
         streaming_multigeometry=True,
         stitch_gi=plan.gi,
@@ -2837,6 +2838,7 @@ class StitchOperationExecution:
                     unit=plan.unit,
                     radial_range=plan.radial_range,
                     conditioning=plan.conditioning,
+                    saturation=label_saturation(self.request),
                     mask=external_mask,
                     frame_record_callback=frame_callback,
                     polarization_factor=plan.polarization_factor,
@@ -3083,7 +3085,7 @@ class StitchOperationExecution:
                     "GEOMETRY_EFFECTIVE_CALIBRATION_MISMATCH",
                     "runtime calibration differs from the receipt-bound projection",
                 )
-            runtime_plan = _runtime_plan(self.request.plan, diffractometer)
+            runtime_plan = _runtime_plan(self.request.plan, diffractometer, label_saturation(self.request))
             self._emit("geometry", 1, total)
             with _requalified_stitch_source(
                 self.request.module.source,
@@ -3294,19 +3296,26 @@ def stitch_output_current(request: StitchOperationRequest) -> bool:
     File revisions are left out, so a SPEC file that grew by later scans leaves an earlier scan's
     stitch standing; so does an image rewritten under the same name, which this does not detect. It
     reads the file's envelope only (``stitch_record_identity``): a processed file can always be stitched
-    again, with Replace. A missing, unreadable or foreign file at the target is not current."""
+    again, with Replace. A missing, unreadable or foreign file at the target is not current.
+
+    The recorded threshold policy must also match: it holds each member's resolved automatic ceiling
+    (decision 39), which the plan does not, so an output made under the data-type rule is redone."""
     target = Path(request.module.output.target)
     identity = stitch_record_identity(target) if target.is_file() else None
     if identity is None:
         return False
     plan_fingerprint, provenance = identity
     try:
-        stored = json.loads(provenance)["source"]["input_manifest"]
+        stored_provenance = json.loads(provenance)
+        stored = stored_provenance["source"]["input_manifest"]
         planned = json.loads(json.dumps(request.manifest.to_provenance()))
-    except (ValueError, KeyError, TypeError):
+        conditioning = (stored_provenance["plan"].get("conditioning"),
+                        request.provenance["plan"].get("conditioning"))
+    except (ValueError, KeyError, TypeError, AttributeError):
         return False
     return (plan_fingerprint == request.module.plan_fingerprint
-            and _without_revisions(stored) == _without_revisions(planned))
+            and _without_revisions(stored) == _without_revisions(planned)
+            and conditioning[0] == conditioning[1])
 
 
 def run_stitch_operation(
