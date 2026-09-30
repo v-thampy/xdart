@@ -312,6 +312,11 @@ def test_a_resumed_session_fits_and_predicts_with_its_own_zeros_and_bounds(qapp,
         dialog._prediction = (dialog._calibrated_key(), {'predicted': True})
         dialog._fields['distance_bounds'].setText('380, 381')  # the prediction's box changed: stale
         assert dialog._seed_options()['prediction'] is None
+        dialog._fields['distance_bounds'].setText('385, 395')
+        dialog._prediction = (dialog._calibrated_key(), {'predicted': True})
+        dialog._fields['distance_seed'].setText('390')  # and its distance seed: stale too
+        assert dialog._seed_options()['prediction'] is None
+        dialog._fields['distance_seed'].setText('')
         started.clear()
         dialog._fields['distance_bounds'].setText('385, 395')
         dialog.refine_seed.setCurrentIndex(dialog.refine_seed.findData('file'))
