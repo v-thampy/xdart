@@ -22,14 +22,22 @@ _ZERO = (130, 130, 140)
 _ROWS = ((31, 119, 180), (255, 127, 14), (44, 160, 44), (214, 39, 40), (148, 103, 189),
          (140, 86, 75), (227, 119, 194), (188, 189, 34), (23, 190, 207), (127, 127, 127))
 
-#: The fitted parameters as the window names them, with their units (fit_bounds' public names).
+#: The fitted parameters in plain words, with their units (fit_bounds' public names; maintainer,
+#: 2026-09-29: "the zero hold etc are not very descriptive and helpful"). pyFAI's axes: 1 vertical
+#: (up), 2 horizontal, 3 along the beam.
 PARAMETER_LABELS = {
     'distance_mm': ('distance', 'mm'), 'poni1_mm': ('PONI 1', 'mm'), 'poni2_mm': ('PONI 2', 'mm'),
     'del_zero_deg': ('del zero', '°'), 'nu_zero_deg': ('nu zero', '°'),
-    'del_held_deg': ('held del (fixed pitch)', '°'), 'nu_held_deg': ('held nu (fixed yaw)', '°'),
-    'mount_tilt_deg': ('mount tilt', '°'), 'mount_roll_deg': ('mount roll', '°'),
-    'sample_offset1_mm': ('sample offset 1', 'mm'), 'sample_offset2_mm': ('sample offset 2', 'mm'),
-    'sample_offset3_mm': ('sample offset 3', 'mm'), 'energy_eV': ('energy', 'eV')}
+    'del_held_deg': ('del angle (held, not scanned)', '°'), 'nu_held_deg': ('nu angle (held, not scanned)', '°'),
+    'mount_tilt_deg': ('detector tilt on the arm', '°'), 'mount_roll_deg': ('detector roll on the arm', '°'),
+    'sample_offset1_mm': ('sample offset, vertical', 'mm'), 'sample_offset2_mm': ('sample offset, horizontal', 'mm'),
+    'sample_offset3_mm': ('sample offset, along the beam', 'mm'), 'energy_eV': ('energy', 'eV')}
+#: A calibration record's parameter names in the same words (its angles are pyFAI's offsets, not zeros).
+RECORD_LABELS = {
+    'dist': 'distance', 'poni1': 'PONI 1', 'poni2': 'PONI 2', 'nu_offset': 'nu offset', 'del_offset': 'del offset',
+    'mount_tilt': 'detector tilt on the arm', 'mount_roll': 'detector roll on the arm',
+    'sample_offset1': 'sample offset, vertical', 'sample_offset2': 'sample offset, horizontal',
+    'sample_offset3': 'sample offset, along the beam', 'energy_eV': 'energy', 'beam_rotation': 'beam rotation'}
 
 
 def direct_beam_fit_text(result, energy_eV=None, held=None):

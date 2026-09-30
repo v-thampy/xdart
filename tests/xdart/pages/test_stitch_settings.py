@@ -80,7 +80,7 @@ def test_calibration_dialog_settings_are_kept_but_not_its_confirmations(qapp, tm
         # the arm model is automatic (decision 40): nothing to save; the note follows the frames
         dialog.frames = _three_nu_rows()
         dialog._sync_arm_model()
-        assert 'the detector mount and sample offset, which the frames on 3 nu positions' in dialog.arm_note.text()
+        assert 'which the frames on 3 nu positions can determine' in dialog.arm_note.text()
         dialog.refine_calibrant.setCurrentIndex(dialog.refine_calibrant.count() - 1)
         dialog._set_field_text("rms", ".02")
         saved = page.settings()["calibration"]

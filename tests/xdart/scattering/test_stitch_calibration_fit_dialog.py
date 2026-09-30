@@ -130,11 +130,13 @@ def test_the_guided_fit_takes_the_extension_and_saves_both_files(qapp, tmp_path,
     frames = _guided_frames(tmp_path)
     page, dialog = _page_with_dialog(tmp_path)
     try:
-        assert 'five-parameter arm; the extension needs frames on at least 3 nu positions' in dialog.arm_note.text()
+        assert 'without the extension' in dialog.arm_note.text()
+        assert 'the extension needs frames on at least 3 nu positions' in dialog.arm_note.text()
         dialog.frames = frames
         dialog._frame_motors = ('del', 'nu')
         dialog._render_frames()
-        assert 'the detector mount and sample offset, which the frames on 5 nu positions' in dialog.arm_note.text()
+        assert "the detector's tilt and roll on the arm, the sample's offset from the rotation centre), which the " \
+               'frames on 5 nu positions can determine' in dialog.arm_note.text()
         # TRUTH's sample sits 0.5-2.2 mm off the centre: held at the default ±0.05 mm, the energy (refined by
         # default) takes up the misfit and moves the mount 0.5°; with a fixed energy it did not
         _truth_bounds(dialog)
@@ -143,14 +145,15 @@ def test_the_guided_fit_takes_the_extension_and_saves_both_files(qapp, tmp_path,
         assert dialog.fit is not None, dialog.status.text()
         assert dialog.fit.asset['provenance']['arm_model'] == 'stacked_extended'
         summary = dialog.fit_summary.toPlainText()
-        assert 'Parameters (± 1σ):' in summary and 'mount_tilt' in summary and 'sample_offset3' in summary
+        assert 'Fitted arm parameters (± 1σ):' in summary and '  detector tilt on the arm: ' in summary
+        assert '  sample offset, along the beam: ' in summary
         _assert_fit_shown(dialog, 'fit', len(frames))
         window = dialog._calibration_fit_window
         dialog.scales.setChecked(True)  # a changed option invalidates the fit and says what it changes
         assert dialog.fit is None and not dialog.fit_summary.toPlainText()
         assert not dialog.save_button.isEnabled()
         assert not window.isVisible() and not dialog.show_calibration_fit_button.isEnabled()
-        assert ('five-parameter arm; motor scales are fitted' in dialog.arm_note.text()
+        assert ('without the extension' in dialog.arm_note.text() and 'motor scales are fitted' in dialog.arm_note.text()
                 and 'Save writes no xrayutilities file' in dialog.arm_note.text())
         dialog.scales.setChecked(False)
         dialog.fit_button.click()
@@ -199,7 +202,8 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
         dialog.geometry_editor.zero_edit('tth').setText(f'{np.rad2deg(.05):.12g}')  # the truth's del zero
         dialog.frames, dialog._frame_motors = frames, ('tth', None)
         dialog._render_frames()
-        assert 'five-parameter arm; a single 2θ arm holds one circle at zero' in dialog.arm_note.text()
+        assert 'without the extension' in dialog.arm_note.text()
+        assert 'a single 2θ arm holds one circle at zero' in dialog.arm_note.text()
         dialog.fit_button.click()
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
@@ -493,9 +497,9 @@ def test_the_arm_note_says_which_model_and_why(qapp, tmp_path):
         dialog.frames = frames
         dialog._frame_motors = ('del', 'nu')
         dialog._render_frames()
-        assert 'the detector mount and sample offset' in dialog.arm_note.text()
+        assert "with the extension (the detector's tilt and roll on the arm" in dialog.arm_note.text()
         dialog.scales.setChecked(True)
-        assert 'five-parameter arm; motor scales are fitted' in dialog.arm_note.text()
+        assert 'without the extension' in dialog.arm_note.text() and 'motor scales are fitted' in dialog.arm_note.text()
         assert 'no xrayutilities file' in dialog.arm_note.text()
         dialog.scales.setChecked(False)
         dialog.frames = tuple(frame for frame in frames if frame.motors['nu'] in (-10., -3.))

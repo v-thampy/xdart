@@ -92,13 +92,13 @@ def test_the_advanced_bounds_reach_the_fit_and_its_summary_reports_contact(qapp,
         assert all(abs(table[f'sample_offset{k}_mm']['fitted']) <= .02 * (1 + 1e-9) for k in (1, 2, 3))
         assert any(table[f'sample_offset{k}_mm']['at_bound'] for k in (1, 2, 3))
         summary = dialog.fit_summary.toPlainText()
-        assert 'Fit parameters (initial → fitted, correction; bounds)' in summary and 'AT BOUND' in summary
-        assert 'sample offset 1: 0 →' in summary and 'del zero: 2.86479' in summary
+        assert 'Fitted values (start → fitted, change; allowed range)' in summary and 'stopped at its limit' in summary
+        assert 'sample offset, vertical: 0 →' in summary and 'del zero: 2.86479' in summary
         assert 'at a fit bound: ' in dialog.fit.message
         dialog._fields['zero_freedom'].setText('x')  # a malformed bound is refused, never guessed
         dialog.fit_button.click()
         _wait(dialog)
-        assert dialog.fit is None and 'Zero freedom' in dialog.status.text()
+        assert dialog.fit is None and 'Motor zeros (± °)' in dialog.status.text()
         dialog.reset_bounds_button.click()
         assert {key: dialog._text(key) for key in dialog._BOUND_DEFAULTS} == dialog._BOUND_DEFAULTS
         settings = dialog.settings()
@@ -159,7 +159,7 @@ def test_refine_starts_from_the_seed_calibrations_zeros_unless_one_is_typed(qapp
             assert estimates['zero_sources'] == {'del': 'seed', 'nu': 'seed'}
             assert estimates['zeros_deg'] == pytest.approx(seed_zeros)
         assert estimates['sample_offset_mm'] == 5.
-        assert 'Fit parameters (initial → fitted' in dialog.fit_summary.toPlainText()
+        assert 'Fitted values (start → fitted' in dialog.fit_summary.toPlainText()
     finally:
         dialog.close()
         page.shutdown()

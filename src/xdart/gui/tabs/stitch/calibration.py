@@ -27,7 +27,7 @@ from xrd_tools.integrate.stitch_calibration import (
     scan_motor_names, source_frame_choices, suggested_frame_indices, validate_frame_files, xu_partner_path,
 )
 from .fit_windows import (
-    PARAMETER_LABELS, CalibrationFitWindow, DirectBeamFitWindow, calibration_fit_text, direct_beam_fit_text,
+    PARAMETER_LABELS, RECORD_LABELS, CalibrationFitWindow, DirectBeamFitWindow, calibration_fit_text, direct_beam_fit_text,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -234,19 +234,21 @@ def fit_summary_text(fit):
     if provenance.get('arm_model') == 'stacked_extended' and errors:
         # An XU fit's calibration is the transferred asset; the fitted arm is in provenance.
         record = provenance.get('pyfai_extended_arm') or fit.asset['calibration']
-        lines.append('Parameters (± 1σ):')
+        lines.append('Fitted arm parameters (± 1σ):')
         for name, value in zip(record['param_names'], record['param']):
             if name not in errors:
                 continue
             scale, unit = ((1e3, 'mm') if name.startswith(('dist', 'poni', 'sample_offset'))
                            else (180 / math.pi, '°'))
-            lines.append(f'  {name}: {value * scale:.6g} ± {errors[name] * scale:.2g} {unit}')
+            lines.append(f'  {RECORD_LABELS.get(name, name)}: {value * scale:.6g} ± {errors[name] * scale:.2g} {unit}')
         correlations = provenance.get('parameter_correlations') or {}
-        names, matrix = correlations.get('names', []), correlations.get('matrix', [])
-        strong = [f'{names[i]}–{names[j]} {matrix[i][j]:+.2f}' for i in range(len(names))
+        names = [RECORD_LABELS.get(name, name) for name in correlations.get('names', [])]
+        matrix = correlations.get('matrix', [])
+        strong = [f'{names[i]} and {names[j]} {matrix[i][j]:+.2f}' for i in range(len(names))
                   for j in range(i + 1, len(names)) if abs(matrix[i][j]) > .9]
         if strong:
-            lines.append('Strong correlations (|r| > 0.9): ' + ', '.join(strong))
+            lines.append('Strongly correlated, so each is less certain than its σ says (|r| > 0.9): '
+                         + ', '.join(strong))
     transfer = provenance.get('xu_transfer')
     if transfer:
         lines.append(f"Transferred to xrayutilities: max |Δq| {transfer['max_abs_dq_A^-1']:.3g} Å⁻¹ over every "
@@ -273,19 +275,27 @@ def fit_summary_text(fit):
     return '\n'.join(lines) + '\n\n' + json.dumps(fit.asset['calibration'], indent=2)
 
 
+#: Where a fit's starting zero came from (ArmFitBounds.zero_sources), in the window's words.
+_ZERO_SOURCES = {'typed': 'as typed under 1 · Geometry', 'seed': "the starting geometry's",
+                 'default': '0, none typed'}
+
+
 def fit_bounds_lines(record):
-    """The fit's parameters as it reports them: initial → fitted (the correction), the bounds, and
-    those it left at a bound, which are never widened (ARM-ZERO-BOUNDS-20260929)."""
+    """The fit's parameters as it reports them: where each started → where it ended (the change), the
+    range it could move in, and those that stopped at a limit, which is never widened
+    (ARM-ZERO-BOUNDS-20260929)."""
     if not record or not record.get('parameters'):
         return []
     estimates = record.get('estimates') or {}
-    sources = ', '.join(f'{circle} from {source}' for circle, source in (estimates.get('zero_sources') or {}).items())
-    lines = ['Fit parameters (initial → fitted, correction; bounds)' + (f' — zeros: {sources}' if sources else '') + ':']
+    sources = '; '.join(f'{circle} zero {_ZERO_SOURCES.get(source, source)}'
+                        for circle, source in (estimates.get('zero_sources') or {}).items())
+    lines = ['Fitted values (start → fitted, change; allowed range)' + (f' — {sources}' if sources else '') + ':']
     for name, row in record['parameters'].items():
         label, unit = PARAMETER_LABELS.get(name, (name, ''))
-        bounds = ('free' if row['lower'] is None else f"{row['lower']:.6g} to {row['upper']:.6g}")
+        bounds = ('any' if row['lower'] is None else f"{row['lower']:.6g} to {row['upper']:.6g}")
         lines.append(f"  {label}: {row['initial']:.6g} → {row['fitted']:.6g} {unit} "
-                     f"({row['fitted'] - row['initial']:+.3g}; {bounds})" + (' — AT BOUND' if row['at_bound'] else ''))
+                     f"({row['fitted'] - row['initial']:+.3g}; {bounds})"
+                     + (' — stopped at its limit' if row['at_bound'] else ''))
     return lines
 
 
@@ -702,21 +712,24 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                                'degree, which is right for almost every diffractometer. A calibration with '
                                'fitted scales has no xrayutilities file: xrayutilities takes angles in degrees.')
         options.addRow(self.scales)
-        self._edit(options, 'rms', 'Maximum RMS |q| (Å⁻¹)', '.03',
+        self._edit(options, 'rms', 'Largest accepted RMS |q| (Å⁻¹)', '.03',
                    tip='A fit whose RMS ring-position error, in |q|, exceeds this is refused.')
-        self._edit(options, 'distance_seed', 'Distance seed (mm)', '',
+        self._edit(options, 'distance_seed', 'Starting distance (mm)', '',
                    tip='Where the fit starts, e.g. the direct-beam distance. Blank: the first calibrated '
                        'frame\'s.')
-        self._edit(options, 'distance_bounds', 'Distance bounds (min, max mm)', '',
-                   tip='Keeps the fitted distance between these. Blank: within the distance freedom below.')
-        # The freedom each fit keeps about its estimates (maintainer, 2026-09-29: "this is to make
+        self._edit(options, 'distance_bounds', 'Distance range (min, max mm)', '',
+                   tip='Keeps the fitted distance between these. Blank: within ± the Distance percentage below.')
+        # How far each fit may move from where it starts (maintainer, 2026-09-29: "this is to make
         # sure the sample displacement in particular doesn't go to unrealistic values")
+        heading = QtWidgets.QLabel('How far the fit may move each value from where it starts:')
+        heading.setWordWrap(True)
+        options.addRow(heading)
         for key, label, tip in self._BOUND_FIELDS:
             self._edit(options, key, label, self._BOUND_DEFAULTS[key], tip=tip)
         self.bounds_note = QtWidgets.QLabel()
         self.bounds_note.setWordWrap(True)
         options.addRow(self.bounds_note)
-        self.reset_bounds_button = QtWidgets.QPushButton('Reset defaults')
+        self.reset_bounds_button = QtWidgets.QPushButton('Reset to defaults')
         self.reset_bounds_button.setToolTip('The maintainer\'s defaults: ± 2° for the zeros and the mount, '
                                             '± 0.05 mm for each sample displacement, ± 5 % for the distance.')
         self.reset_bounds_button.clicked.connect(self._reset_bounds)
@@ -725,8 +738,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                      'file is checked on every pixel over this range (with the calibrant frames and the scan\'s '
                      'frames), and Stitch refuses frames outside what was checked. Blank: the calibrant '
                      'scan\'s span. pyFAI MultiGeometry has no such limit.')
-        self._edit(options, 'del_domain', 'Supported del range (min, max °)', '', tip=range_tip.format('del'))
-        self._edit(options, 'nu_domain', 'Supported nu range (min, max °)', '', tip=range_tip.format('nu'))
+        self._edit(options, 'del_domain', 'del range for xrayutilities (min, max °)', '', tip=range_tip.format('del'))
+        self._edit(options, 'nu_domain', 'nu range for xrayutilities (min, max °)', '', tip=range_tip.format('nu'))
         self._refine_card, auto = self._card(layout, 'Refine from the whole scan (optional)')
         self.refine_seed = self._combo(auto, 'Start from', [('Current fit (unsaved)', 'fit'), ('Geometry file', 'file'),
                                                             ('Rough geometry (1 · Geometry)', 'rough')],
@@ -1152,19 +1165,19 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
     _BOUND_DEFAULTS = {'zero_freedom': '2', 'mount_freedom': '2', 'displacement_limit': '0.05',
                        'distance_freedom': '5'}
     _BOUND_FIELDS = (
-        ('zero_freedom', 'Zero freedom (± °)',
-         "Each moving circle's motor zero is fitted within this many degrees of its estimate (beside its motor "
-         "under 1 · Geometry ▸ Diffractometer; blank: 0, or the seed calibration's own when refining from "
-         "one), and a single arm's held angle within as many of its own."),
-        ('mount_freedom', 'Mount freedom (± °)',
-         "The detector mount's tilt and roll are fitted within this many degrees of the mount under "
+        ('zero_freedom', 'Motor zeros (± °)',
+         "Each moving circle's motor zero is fitted within this many degrees of where it starts: the zero "
+         "typed beside its motor under 1 · Geometry ▸ Diffractometer (none typed: 0°, or, when refining "
+         "from a geometry, that geometry's). A single arm's held angle likewise."),
+        ('mount_freedom', 'Detector tilt and roll (± °)',
+         "The detector's tilt and roll on the arm are fitted within this many degrees of the values under "
          "1 · Geometry (Detector mount tilt, roll)."),
-        ('displacement_limit', 'Sample displacement limit (± mm)',
+        ('displacement_limit', 'Sample offset from the rotation centre (± mm)',
          "Each component of the sample's offset from the rotation centre is fitted within this of zero: "
-         "0.05 mm by default, 0.02 mm for a sample known to be well centred. A displacement resting on "
-         "its limit is reported, never widened."),
-        ('distance_freedom', 'Distance freedom (± %)',
-         'Without Distance bounds, the distance is fitted within this percentage of its seed.'),
+         "0.05 mm by default, 0.02 mm for a sample known to be well centred. An offset stopped at this "
+         "limit is reported, never widened."),
+        ('distance_freedom', 'Distance (± %)',
+         'Without a Distance range, the distance is fitted within this percentage of where it starts.'),
     )
 
     #: Choices saved with the Stitch settings. The calibrant-scan and same-detector
@@ -1266,14 +1279,14 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         try:
             seed = float(self._text('distance_seed')) / 1000 if self._text('distance_seed') else None
         except ValueError:
-            raise ValueError('type the Distance seed in mm, or leave it blank') from None
+            raise ValueError('type the Starting distance in mm, or leave it blank') from None
         try:
             bounds = (tuple(float(v) / 1000 for v in self._text('distance_bounds').split(','))
                       if self._text('distance_bounds') else None)
         except ValueError:
             bounds = ()
         if bounds is not None and len(bounds) != 2:
-            raise ValueError('type the Distance bounds as min, max in mm, or leave them blank')
+            raise ValueError('type the Distance range as min, max in mm, or leave it blank')
         return {'distance_seed_m': seed, 'distance_bounds_m': bounds}
 
     def _bounds_or_none(self):
@@ -1358,10 +1371,14 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         geometry = self.geometry_editor.value()
         zeros = geometry.arm_zeros()
         moving = [circle for circle, motor in zip(('del', 'nu'), geometry.stitch_arm()) if motor]
-        parts = [f'{circle} zero {zeros[circle]:g}°' if circle in zeros else f"{circle} zero blank (0, or the seed's)"
-                 for circle in moving]
+        parts = [f'{circle} zero {zeros[circle]:g}°' for circle in moving if circle in zeros]
+        untyped = [circle for circle in moving if circle not in zeros]
+        if untyped:
+            parts.append(f"{' and '.join(untyped)} zero{'s' if len(untyped) > 1 else ''} 0° (none typed; a Refine "
+                         "from a geometry file starts from its own)")
         self.bounds_note.setText('Fits start from: ' + ', '.join(parts)
-                                 + f"; mount tilt, roll {bounds.mount_deg[0]:g}, {bounds.mount_deg[1]:g}° (1 · Geometry)")
+                                 + f"; detector tilt {bounds.mount_deg[0]:g}°, roll {bounds.mount_deg[1]:g}° "
+                                   "(both under 1 · Geometry)")
 
     def _reset_bounds(self):
         for key, value in self._BOUND_DEFAULTS.items():
@@ -1548,11 +1565,14 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         done = tuple(frame for frame in self.frames if frame.complete)
         reason = automatic_arm_reason(done, del_motor=delta, nu_motor=nu, fit_scales=self.scales.isChecked())
         if not reason:
-            text = ('Arm model (automatic): the detector mount and sample offset, which the frames on '
-                    f'{len({round(float(frame.motors[nu]), 6) for frame in done})} nu positions determine; the '
-                    'five-parameter arm if that fit is refused.')
+            text = ('Model (chosen for you): the five-parameter arm (distance, beam centre, motor zeros) with '
+                    "the extension (the detector's tilt and roll on the arm, the sample's offset from the rotation "
+                    f'centre), which the frames on {len({round(float(frame.motors[nu]), 6) for frame in done})} '
+                    'nu positions can determine; without it if that fit is refused.')
         else:
-            text = f'Arm model (automatic): the five-parameter arm; {reason}.'
+            text = ('Model (chosen for you): the five-parameter arm (distance, beam centre, motor zeros), without '
+                    "the extension (the detector's tilt and roll on the arm, the sample's offset from the rotation "
+                    f'centre): {reason}.')
         if self.scales.isChecked():
             text += (' With fitted motor scales the energy stays at the recorded one (it is refined only with '
                      'fixed scales) and Save writes no xrayutilities file.')
@@ -1605,7 +1625,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     raise ValueError('type the wavelength in 1 · Geometry: the rings are predicted with it')
             else:
                 if not self._text('refine_seed_path'):
-                    raise ValueError('choose the seed geometry JSON')
+                    raise ValueError('choose the geometry file to start from')
                 seed = str(Path(self._text('refine_seed_path')).resolve())
             record = seed if isinstance(seed, dict) else json.loads(Path(seed).read_text(encoding='utf-8'))
             source_motors = tuple((position, motor) for position, motor in (('del_angle', delta), ('nu_angle', nu))
