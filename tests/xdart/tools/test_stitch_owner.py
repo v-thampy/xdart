@@ -159,7 +159,7 @@ def test_latest_progress_and_cleanup_retry_never_replay_science(
     release = Event()
     calls = []
 
-    def held_run(self, *, cancel_token=None, progress_callback=None):
+    def held_run(self, *, cancel_token=None, progress_callback=None, workers=1):
         calls.append("run")
         progress_callback(ModuleProgress(self.request.module, 1, "science", 1, 3))
         progress_callback(ModuleProgress(self.request.module, 2, "science", 2, 3))
@@ -226,10 +226,30 @@ def test_published_inspection_failure_reaches_owner_with_publication_truth(monke
     assert owner.close().status is PageCleanup.CLEAN
 
 
+def test_a_run_takes_its_frame_workers_from_the_caller(monkeypatch, preflight):
+    """The page passes the run bar's Cores (PERF-STITCH-2); the execution runs with them and nothing else
+    about the run changes (a command other than a Run carries none)."""
+    seen = []
+
+    def run(self, *, cancel_token=None, progress_callback=None, workers=1):
+        seen.append(workers)
+        return _refused_result(self)
+
+    monkeypatch.setattr(StitchOperationExecution, "run", run)
+    owner = _prepare_owner(preflight)
+    for bad in (0, 1.5):
+        with pytest.raises(TypeError, match="positive int"):
+            owner.begin_run(workers=bad)
+    assert owner.begin_run(workers=3) is not None
+    assert _poll_terminal(owner).outcome.kind is StitchOwnerOutcomeKind.RESULT
+    assert seen == [3]
+    assert owner.close().status is PageCleanup.CLEAN
+
+
 def test_verification_retry_uses_retained_execution_only(monkeypatch, preflight):
     calls = []
 
-    def run(self, *, cancel_token=None, progress_callback=None):
+    def run(self, *, cancel_token=None, progress_callback=None, workers=1):
         calls.append("run")
         raise StitchOperationVerificationError(self, "held reload")
 
@@ -261,7 +281,7 @@ def test_close_drains_terminal_then_auto_retries_exact_cleanup(
     release = Event()
     calls = []
 
-    def held_run(self, *, cancel_token=None, progress_callback=None):
+    def held_run(self, *, cancel_token=None, progress_callback=None, workers=1):
         calls.append(("run", self))
         entered.set()
         assert release.wait(2)
@@ -296,7 +316,7 @@ def test_close_drains_terminal_then_auto_retries_exact_verification(
 ):
     calls = []
 
-    def run(self, *, cancel_token=None, progress_callback=None):
+    def run(self, *, cancel_token=None, progress_callback=None, workers=1):
         calls.append(("run", self))
         raise StitchOperationVerificationError(self, "held reload")
 
@@ -333,7 +353,7 @@ def test_close_drains_terminal_then_auto_retries_exact_verification(
 def test_cancel_only_targets_active_science(monkeypatch, preflight):
     entered = Event()
 
-    def run(self, *, cancel_token=None, progress_callback=None):
+    def run(self, *, cancel_token=None, progress_callback=None, workers=1):
         entered.set()
         assert cancel_token.wait(2)
         return _refused_result(self)

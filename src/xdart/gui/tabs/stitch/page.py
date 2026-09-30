@@ -79,6 +79,8 @@ _STANDARD_MAP_AXES = tuple(STANDARD_2D_AXES)
 _GI_MAP_AXES = ("Qip-Qoop", "Q-χ")
 #: Axis names settings saved before Stitch took Int's GI names.
 _LEGACY_AXES = {"Qip (Å⁻¹)": "Qip", "Qoop (Å⁻¹)": "Qoop"}
+#: Cores on the xrayutilities backend, whose runtime stitches on one thread a process
+_XU_ONE_CORE = "xrayutilities stitches on one core"
 #: The Processing fields, in their rows' order: (group, key, path, default). Int's paths take Int's
 #: labels, rules and rows (``project_control_fields``, ``ControlsPanel.render_processing_rows``); Stitch's
 #: own are its GI ranges and Monitor.
@@ -482,7 +484,8 @@ class StitchPage(QtWidgets.QWidget):
         from xdart.gui.tabs.scattering.run_mode_projection import (
             RUN_MODE_CHOICES, UNOWNED_RUN_MODE_REASONS,
         )
-        self.run_bar.apply_profile(modes=RUN_MODE_CHOICES, live=False, batch=False, cores=False)
+        # Int's Cores: the frames pyFAI integrates at once (xrayutilities takes one; _sync_actions)
+        self.run_bar.apply_profile(modes=RUN_MODE_CHOICES, live=False, batch=False, cores=True)
         self.run_bar.set_unavailable_modes(UNOWNED_RUN_MODE_REASONS)
         self.run_bar.modeCombo.setCurrentText("Stitch 1D")
         self.run_bar.modeChanged.connect(self._mode_chosen)
@@ -1853,7 +1856,7 @@ class StitchPage(QtWidgets.QWidget):
         index = self._queued_jobs.pop(0)
         position = self._job_total - len(self._queued_jobs)
         if not self._start(f"Running · {self._mode} · {position}/{self._job_total}{self._skip_note}{self._prepared_notes}",
-                           lambda: self._owner.begin_run(job_index=index)):
+                           lambda: self._owner.begin_run(job_index=index, workers=self.run_bar.get_cores())):
             self._queued_jobs.clear()
             self._prepared_revision = None  # the next Run prepares again
 
@@ -2539,6 +2542,10 @@ class StitchPage(QtWidgets.QWidget):
         idle = not busy and not authoring and final is StitchOwnerFinalization.NONE and not self._closing
         self.controls.setEnabled(idle)
         self.run_bar.set_mode_row_enabled(idle)  # as Int's: the mode and Append/Replace hold during a run
+        xu = self._value("backend") == "xrayutilities histogram"
+        for widget in (self.run_bar.coresSpin, self.run_bar.coresLabel):
+            widget.setEnabled(idle and not xu)
+            widget.setToolTip(_XU_ONE_CORE if xu else "")
         for dialog in self._authoring_dialogs:
             dialog.setEnabled(not busy and not self._closing and (not authoring or dialog.active()))
         if not any(dialog.isVisible() or dialog.active() for dialog in self._authoring_dialogs):

@@ -53,6 +53,8 @@ def page_settings(page) -> dict[str, Any]:
         "write_mode": page.run_bar.write_mode(),
         # Stitch 1D or Stitch 2D
         "mode": page._mode,
+        # Int's Cores: the frames pyFAI integrates at once
+        "cores": page.run_bar.get_cores(),
     }
 
 
@@ -108,6 +110,9 @@ def apply_page_settings(page, document: Any) -> None:
         page._write_mode_changed()
     if document.get("mode") in ("Stitch 1D", "Stitch 2D"):
         page.select_mode(document["mode"])
+    if type(document.get("cores")) is int:
+        spin = page.run_bar.coresSpin
+        spin.setValue(max(spin.minimum(), min(document["cores"], spin.maximum())))
     gi = document.get("gi", {})
     page._gi.update({key: bool(value) if key == "enabled" else None if value is None else str(value)
                      for key, value in gi.items() if key in page._gi})

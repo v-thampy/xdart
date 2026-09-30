@@ -229,10 +229,14 @@ class _WorkerCommand:
     frame_request: _FrameReadRequest | None = None
     metadata_payload: AnalysisArtifactPayload | None = None
     source_root: str | None = None
+    #: a Run's frame workers (the run bar's Cores): the result is the same for any count
+    workers: int = 1
 
     def __post_init__(self) -> None:
         if (
             type(self.action) is not StitchOwnerAction
+            or type(self.workers) is not int
+            or self.workers < 1
             or type(self.form_fingerprint) is not str
             or not self.form_fingerprint
             or type(self.form_revision) is not int
@@ -272,7 +276,8 @@ class _WorkerCommand:
             )
         if (not valid or (self.action not in {StitchOwnerAction.REOPEN, StitchOwnerAction.FRAME_READ, StitchOwnerAction.METADATA} and self.artifact_path)
             or (self.action is not StitchOwnerAction.FRAME_READ and self.frame_request is not None)
-            or (self.action is not StitchOwnerAction.METADATA and (self.metadata_payload is not None or self.source_root is not None))):
+            or (self.action is not StitchOwnerAction.METADATA and (self.metadata_payload is not None or self.source_root is not None))
+            or (self.action is not StitchOwnerAction.RUN and self.workers != 1)):
             raise TypeError("Stitch worker command fields disagree")
 
 
@@ -467,7 +472,10 @@ class StitchToolOwner:
                 source_root=None if source_root is None else str(source_root),
             ))
 
-    def begin_run(self, job_index: int = 0) -> OperationIdentity | None:
+    def begin_run(self, job_index: int = 0, workers: int = 1) -> OperationIdentity | None:
+        """Run the prepared output ``job_index`` with ``workers`` frame workers (the run bar's Cores)."""
+        if type(workers) is not int or workers < 1:
+            raise TypeError("Stitch workers must be a positive int")
         with self._lock:
             preflight = self._prepared
             if (
@@ -495,6 +503,7 @@ class StitchToolOwner:
                 self._prepared_revision,
                 preflight=preflight,
                 execution=execution,
+                workers=workers,
             )
             identity = self._begin_locked(command)
             if identity is not None:
@@ -612,6 +621,7 @@ class StitchToolOwner:
                     progress_callback=lambda progress: publish(
                         progress.stage, progress.completed, progress.total
                     ),
+                    workers=request.workers,
                 )
             elif request.action is StitchOwnerAction.RETRY_CLEANUP:
                 publish("cleanup", 0, 1)
