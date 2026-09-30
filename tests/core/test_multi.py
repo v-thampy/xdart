@@ -864,3 +864,141 @@ def test_a_gi_cuts_scratch_grows_with_its_points_not_their_square():
         tracemalloc.stop()
         assert [len(values[0]) for values in sums] == [npt, npt]
     assert peaks[640] < 2 * peaks[160], peaks  # O(npt): the square grew 12x
+
+
+def _window_probe_integrator(detector_mask=None):
+    """Codex final review F1's geometry: a generic 29 × 43 detector (100 × 120 µm pixels) at 81 mm,
+    off-centre PONI, three rotations, 0.76 Å."""
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+    detector = Detector(pixel1=100e-6, pixel2=120e-6, max_shape=(29, 43))
+    if detector_mask is not None:
+        detector.mask = detector_mask
+    return AzimuthalIntegrator(dist=.081, poni1=11.3 * 100e-6, poni2=26.7 * 120e-6, rot1=.047, rot2=-.032,
+                               rot3=.081, wavelength=7.6e-11, detector=detector)
+
+
+def _window_probe_coordinates(angles):
+    """Every pixel's (Qip, Qoop) in Å⁻¹ at pyFAI's (incidence, tilt) in degrees, orientation 4, from pyFAI's
+    own FiberIntegrator and fiber units rather than the kernel's."""
+    from pyFAI.integrator.fiber import FiberIntegrator
+    from pyFAI.units import get_unit_fiber
+    source = _window_probe_integrator()
+    fiber = FiberIntegrator(dist=source.dist, poni1=source.poni1, poni2=source.poni2, rot1=source.rot1,
+                            rot2=source.rot2, rot3=source.rot3, wavelength=source.wavelength,
+                            detector=source.detector)
+    angle = dict(incident_angle=angles[0], tilt_angle=angles[1], sample_orientation=4, angle_unit="deg")
+    return tuple(np.asarray(fiber.array_from_unit((29, 43), "center", get_unit_fiber(name, **angle), scale=True))
+                 for name in ("qip_A^-1", "qoop_A^-1"))
+
+
+def _window_sums(gi, bins, mask, image=None, integrator=None, **corrections):
+    from xrd_tools.integrate.multi import _gi_frame_sums
+    options = dict(correct_solid_angle=False, polarization_factor=None, dark=None, flat=None, monitor=1.)
+    return _gi_frame_sums(integrator or _window_probe_integrator(), np.full((29, 43), 100.) if image is None
+                          else image, (.37, 1.8), gi, bins, 37, mask=mask, **{**options, **corrections})
+
+
+def test_codex_f1_a_pixel_below_the_other_window_counts_in_neither_gi_cut():
+    """Codex final review F1: a thin pass's one-bin coordinate admitted pixels up to the whole window
+    width below it (pyFAI's histogram truncates a bin index in (-1, 0) to bin 0). Its row: only pixel
+    (28, 0) unmasked, its Qip 0.0907 inside the (-0.4, 0.4) window and its Qoop -0.4357 below it; the Qip
+    cut counted it once (signal 100), the 37 × 37 square not at all. It counts in neither cut."""
+    from xrd_tools.integrate.stitch_gi import StitchGI
+    q_ip, q_oop = _window_probe_coordinates((.37, 1.8))
+    assert -.4 < q_ip[28, 0] < .4 and q_oop[28, 0] < -.4
+    gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_chi_deg=88.2, ip_range=(-.4, .4),
+                  oop_range=(-.4, .4))
+    mask = np.ones((29, 43), dtype=np.int8)
+    mask[28, 0] = 0
+    sums = _window_sums(gi, {"q_ip": (-.4, .4), "q_oop": (-.4, .4)}, mask)
+    assert [(values[0].sum(), values[2].sum()) for values in sums] == [(0., 0.), (0., 0.)]
+
+
+@pytest.mark.parametrize("side", ["low", "high"])
+@pytest.mark.parametrize("coordinate", ["q_ip", "q_oop"])
+def test_a_gi_pixel_counts_in_both_cuts_only_inside_the_closed_window(coordinate, side):
+    """The GI window is the closed rectangle of the explicit Qip and Qoop ranges, for a cut's own
+    coordinate and the other alike. One unmasked pixel a hair (1e-9 relative) outside one bound counts
+    in neither cut; a hair inside, in both. Below a minimum pyFAI's truncation admitted it (within a bin
+    on the cut's own axis, within the whole window on the other's one bin); above a maximum, the top
+    edge pyFAI stretches to take the maximum."""
+    from xrd_tools.integrate.stitch_gi import StitchGI
+    pixel = (14, 21)
+    coordinates = {name: float(values[pixel]) for name, values in
+                   zip(("q_ip", "q_oop"), _window_probe_coordinates((.37, 1.8)))}
+    assert min(abs(value) for value in coordinates.values()) > .05
+    mask = np.ones((29, 43), dtype=np.int8)
+    mask[pixel] = 0
+    for outside in (True, False):
+        ranges = {name: (value - .3, value + .3) for name, value in coordinates.items()}
+        value = coordinates[coordinate]
+        hair = abs(value) * 1e-9 * (1 if outside else -1)
+        ranges[coordinate] = (value + hair, value + .3) if side == "low" else (value - .3, value - hair)
+        gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_chi_deg=88.2, ip_range=ranges["q_ip"],
+                      oop_range=ranges["q_oop"])
+        counted = 0. if outside else 1.
+        sums = _window_sums(gi, ranges, mask)
+        assert [(values[0].sum(), values[2].sum()) for values in sums] == [(100. * counted, counted)] * 2, ranges
+
+
+@pytest.mark.parametrize("solid_angle", [False, True])
+@pytest.mark.parametrize("ranges", [{}, {"ip_range": (.2, .45)}, {"oop_range": (-.35, -.2)},
+                                    {"ip_range": (.2, .45), "oop_range": (-.35, -.2)}],
+                         ids=["auto", "explicit_ip", "explicit_oop", "explicit_both"])
+def test_the_gi_window_holds_for_auto_and_explicit_ranges_under_every_correction(ranges, solid_angle):
+    """Each Auto/explicit combination, with an asymmetric mask, dark, flat, polarization, a monitor and
+    solid angle on or off: each thin cut counts exactly the valid pixels inside the window and equals
+    pyFAI's full Qip × Qoop square over the same window (applied as a mask, so the square's own
+    one-bin edge leak is out too) summed over the other axis."""
+    from xrd_tools.integrate.gid import _fiber_from_integrator
+    from xrd_tools.integrate.multi import _gi_bins
+    from xrd_tools.integrate.stitch_gi import StitchGI
+    rng = np.random.default_rng(194)
+    shape = (29, 43)
+    image, dark, flat = rng.uniform(3., 180., shape), rng.uniform(.1, 1., shape), rng.uniform(.5, 1.6, shape)
+    mask = np.zeros(shape, dtype=np.int8)
+    mask[1::4, 2::7] = 1
+    angles = (.37, 1.8)
+    gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_chi_deg=88.2, **ranges)
+    bins = _gi_bins(lambda: iter((_window_probe_integrator(),)), (angles,), gi)
+    inside = mask == 0
+    for values, window in zip(_window_probe_coordinates(angles), (gi.ip_range, gi.oop_range)):
+        if window is not None:
+            inside &= (values >= window[0]) & (values <= window[1])
+    assert bool(0 < inside.sum() < (mask == 0).sum()) == bool(ranges)  # the window bites unless Auto
+    corrections = dict(polarization_factor=.67, dark=dark, flat=flat)
+    thin = _window_sums(gi, bins, mask, image, correct_solid_angle=solid_angle, monitor=3.7, **corrections)
+    fiber = _fiber_from_integrator(_window_probe_integrator(), incident_angle=angles[0], tilt_angle=angles[1],
+                                   sample_orientation=4)
+    square = fiber.integrate2d_fiber(
+        image, npt_ip=37, unit_ip="qip_A^-1", ip_range=bins["q_ip"], npt_oop=37, unit_oop="qoop_A^-1",
+        oop_range=bins["q_oop"], correctSolidAngle=solid_angle, mask=~inside, normalization_factor=3.7,
+        method=("no", "histogram", "cython"), incident_angle=angles[0], tilt_angle=angles[1],
+        sample_orientation=4, angle_unit="deg", **corrections)
+    scale = fiber.pixel1 * fiber.pixel2 / fiber.dist ** 2 if solid_angle else 1.
+    for (signal, normalization, count, axis), cut in zip(thin, gi.cuts):
+        other = -2 if cut == "q_ip" else -1
+        assert count.sum() == inside.sum()
+        np.testing.assert_array_equal(count, np.asarray(square.count, dtype=np.float64).sum(axis=other))
+        np.testing.assert_array_equal(axis, square.inplane if cut == "q_ip" else square.outofplane)
+        np.testing.assert_allclose(signal, np.asarray(square.sum_signal, dtype=np.float64).sum(axis=other),
+                                   rtol=1e-12, atol=0)
+        np.testing.assert_allclose(
+            normalization, np.asarray(square._sum_normalization, dtype=np.float64).sum(axis=other) * scale,
+            rtol=1e-12, atol=0)
+
+
+def test_the_gi_window_keeps_the_detectors_own_mask():
+    """pyFAI falls back to the detector's mask only when handed none: the window mask joins the
+    detector's, so a detector-masked pixel inside the window stays out of both cuts."""
+    from xrd_tools.integrate.stitch_gi import StitchGI
+    detector_mask = np.zeros((29, 43), dtype=np.int8)
+    detector_mask[::3, ::5] = 1
+    q_ip, q_oop = _window_probe_coordinates((.37, 1.8))
+    window = (q_ip >= .2) & (q_ip <= .45) & (q_oop >= -.35) & (q_oop <= -.2)
+    assert (window & (detector_mask == 1)).any()
+    gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_chi_deg=88.2, ip_range=(.2, .45),
+                  oop_range=(-.35, -.2))
+    sums = _window_sums(gi, {"q_ip": (.2, .45), "q_oop": (-.35, -.2)}, None,
+                        integrator=_window_probe_integrator(detector_mask))
+    assert [values[2].sum() for values in sums] == [float((window & (detector_mask == 0)).sum())] * 2

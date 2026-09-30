@@ -413,23 +413,31 @@ def _gi_frame_sums(integrator, image, angles, gi, bins, npt, *, mask, correct_so
 
     pyFAI's own 1-D fiber cut sums its 2-D q_ip × q_oop histogram over one axis. Here each cut is a
     thin 2-D pass, its own axis in ``npt`` bins and the other coordinate's range in ONE bin, so the
-    scratch is O(npt), not npt² (Codex audit G-F1: an unbounded square), and the sums equal the
-    square's bit for bit. Both passes share one fiber integrator, which keeps its per-pixel
-    coordinates. ``angles`` are the frame's (incident angle, tilt) in degrees
+    scratch is O(npt), not npt² (Codex audit G-F1: an unbounded square). A pixel counts in a cut
+    only inside the GI window (``_gi_window_mask``). Both passes share one fiber integrator, which
+    keeps its per-pixel coordinates, and one pair of fiber units: pyFAI compiles a unit's formula
+    whenever its angles change, so both passes and the window take these rather than each parsing
+    its own. ``angles`` are the frame's (incident angle, tilt) in degrees
     (``StitchGI.pyfai_angles``); ``bins`` both coordinates' ranges.
     """
+    from pyFAI.units import get_unit_fiber
     from xrd_tools.integrate.gid import _effective_gi_params, _fiber_from_integrator
     incidence, tilt = angles
     fiber = _fiber_from_integrator(integrator, incident_angle=incidence, tilt_angle=tilt,
                                    sample_orientation=gi.sample_orientation)
     angle, tilt, orientation = _effective_gi_params(fiber, None, None, None)
+    units = {cut: get_unit_fiber(GI_UNITS[cut], incident_angle=angle, tilt_angle=tilt,
+                                 sample_orientation=orientation) for cut in GI_CUTS}
+    # The configuration integrate2d_fiber sets (its angles modulo a turn), so it keeps the geometry.
+    fiber.reset_integrator(**units["q_ip"].get_config_shared())
     scale = fiber.pixel1 * fiber.pixel2 / fiber.dist ** 2 if correct_solid_angle else 1.0
+    mask = _gi_window_mask(fiber, image.shape, gi, units, mask)
     sums = []
     for cut in gi.cuts:
         in_plane = cut == "q_ip"
         result = fiber.integrate2d_fiber(
-            image, npt_ip=npt if in_plane else 1, unit_ip="qip_A^-1", ip_range=bins["q_ip"],
-            npt_oop=1 if in_plane else npt, unit_oop="qoop_A^-1", oop_range=bins["q_oop"],
+            image, npt_ip=npt if in_plane else 1, unit_ip=units["q_ip"], ip_range=bins["q_ip"],
+            npt_oop=1 if in_plane else npt, unit_oop=units["q_oop"], oop_range=bins["q_oop"],
             correctSolidAngle=correct_solid_angle, mask=mask, polarization_factor=polarization_factor,
             dark=dark, flat=flat, method=("no", "histogram", "cython"), normalization_factor=monitor,
             incident_angle=angle, tilt_angle=tilt, sample_orientation=orientation)
@@ -439,6 +447,29 @@ def _gi_frame_sums(integrator, image, angles, gi, bins, npt, *, mask, correct_so
                      np.asarray(result.count, dtype=np.float64).sum(axis=axis),
                      np.asarray(result.inplane if in_plane else result.outofplane, dtype=np.float64)])
     return tuple(sums)
+
+
+def _gi_window_mask(fiber, shape, gi, units, mask):
+    """``mask`` (None: the detector's) with every pixel outside the GI window masked: a pixel counts
+    only when each coordinate with an explicit range lies inside it, bounds included, as the xu_hist
+    kernel windows its cuts.
+
+    pyFAI's histogram truncates a fractional bin index in (-1, 0) to bin 0 and stretches the top edge
+    to take the maximum, so a range admits pixels up to one bin below it (a thin pass's one-bin
+    coordinate: its whole width) and a hair above it (Codex final review F1). An Auto range is the
+    span of every pixel inside the other window (``_gi_bins``), so it needs no mask and an Auto cut is
+    unchanged. ``units`` are the passes' fiber units: the coordinates are the ones they bin, and
+    pyFAI's geometry cache keeps them for the passes rather than recomputing.
+    """
+    windows = [(cut, gi.bins(cut)) for cut in GI_CUTS if gi.bins(cut) is not None]
+    if not windows:
+        return mask
+    outside = np.zeros(shape, dtype=bool)
+    for cut, (low, high) in windows:
+        values = fiber.array_from_unit(shape, "center", units[cut], scale=True)
+        outside |= ~((values >= low) & (values <= high))
+    return np.asarray(mask_with_detector(fiber, outside if mask is None else np.logical_or(mask, outside)),
+                      dtype=bool)
 
 
 def _gi_bins(integrator_factory, gi_angles, gi):
