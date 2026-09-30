@@ -120,6 +120,15 @@ class AnalysisArtifactInvalid(AnalysisArtifactError):
     pass
 
 
+class OlderStitchArtifact(AnalysisArtifactInvalid):
+    """A well-formed Stitch file in the layout before Stitch results became Int records: not read,
+    but still that kind's result, so Replace may overwrite it ("stitch it again")."""
+
+    def __init__(self, kind: AnalysisArtifactKind) -> None:
+        super().__init__("a Stitch result is an Int record; this older Stitch file is not read: stitch it again")
+        self.kind = kind
+
+
 class AnalysisArtifactProjectionInvalid(AnalysisArtifactError, ValueError):
     """A scientific result cannot be represented by the stored artifact schema."""
 
@@ -2414,9 +2423,7 @@ def inspect_analysis_artifact(
             # (maintainer, 2026-09-29: no compatibility with earlier Stitch outputs; 2026-09-30:
             # "Remove old format")
             if kind is not AnalysisArtifactKind.RSM:
-                raise AnalysisArtifactInvalid(
-                    "a Stitch result is an Int record; this older Stitch file is not read: stitch it again"
-                )
+                raise OlderStitchArtifact(kind)
             if version in _STITCH_NEUTRAL_CONTRACTS:
                 raise AnalysisArtifactInvalid("neutral analysis artifact requires its Stitch kind")
             expected = expected_request.kind if expected_request is not None else expected_kind
@@ -2960,7 +2967,11 @@ class AnalysisArtifactOutput:
             ):
                 raise FileExistsError(request.target)
             if self._expected_target.exists:
-                inspect_analysis_artifact(request.target, expected_kind=request.kind)
+                try:
+                    inspect_analysis_artifact(request.target, expected_kind=request.kind)
+                except OlderStitchArtifact as older:  # Replace stitches it again, as its refusal says
+                    if older.kind is not request.kind:
+                        raise
                 if capture_target_snapshot(request.target) != self._expected_target:
                     raise TargetChanged("previous analysis changed during admission")
         except BaseException:
@@ -3283,6 +3294,7 @@ __all__ = [
     "AnalysisArtifactError",
     "AnalysisArtifactInspection",
     "AnalysisArtifactInvalid",
+    "OlderStitchArtifact",
     "AnalysisArtifactKind",
     "AnalysisArtifactOutput",
     "AnalysisArtifactOutputSnapshot",

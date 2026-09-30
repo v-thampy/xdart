@@ -19,6 +19,7 @@ from xrd_tools.io.analysis_artifact import (
     ANALYSIS_KIND_ATTR,
     ANALYSIS_SCHEMA_ATTR,
     ANALYSIS_SCHEMA_NAME,
+    ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE,
     ANALYSIS_SCHEMA_VERSION_V2,
     ANALYSIS_SCHEMA_VERSION_V3,
     AnalysisArtifactCleanupPending,
@@ -2339,18 +2340,46 @@ def test_win32_identity_inspects_and_reads_the_pathname_ctime_shape(
     assert payload.inspection == inspection
 
 
+def older_stitch_file(target: Path, kind: AnalysisArtifactKind) -> Path:
+    """A well-formed file in the older artifact layout that says Stitch (the layout's envelope, RSM's)."""
+    request = _request(target, AnalysisArtifactKind.RSM)
+    admit_analysis_artifact(request, coordinator=OutputTransactionCoordinator()).publish(_writer(request))
+    with h5py.File(target, "r+") as handle:
+        entry = handle["entry"]
+        del entry.attrs[ANALYSIS_KIND_ATTR]
+        entry.attrs.create(ANALYSIS_KIND_ATTR, np.bytes_(kind.value.encode()))
+    return target
+
+
 @pytest.mark.parametrize("kind", (AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D))
 def test_an_older_stitch_artifact_is_refused(tmp_path, kind):
     """A Stitch result is an Int record (maintainer, 2026-09-29: no compatibility with earlier Stitch outputs;
     2026-09-30: "Remove old format"); a file in the older artifact layout that says Stitch is not read."""
-    request = _request(tmp_path / f"older-{kind.value}.nexus", AnalysisArtifactKind.RSM)
-    admit_analysis_artifact(request, coordinator=OutputTransactionCoordinator()).publish(_writer(request))
-    with h5py.File(request.target, "r+") as handle:
-        entry = handle["entry"]
-        del entry.attrs[ANALYSIS_KIND_ATTR]
-        entry.attrs.create(ANALYSIS_KIND_ATTR, np.bytes_(kind.value.encode()))
+    target = older_stitch_file(tmp_path / f"older-{kind.value}.nexus", kind)
     with pytest.raises(AnalysisArtifactInvalid, match="Int record"):
-        inspect_analysis_artifact(request.target)
+        inspect_analysis_artifact(target)
+
+
+@pytest.mark.parametrize("kind", (AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D))
+def test_replace_admits_an_older_stitch_file_of_its_kind(tmp_path, kind):
+    """The refusal says "stitch it again", and Replace may: it admits an older Stitch file of its kind as
+    the target it overwrites (after the old layout's removal it refused its own remedy; a Stitch 1D's since
+    the records). An older file of the other Stitch kind is still not replaced. The whole run onto one:
+    ``tests/xdart/tools/test_stitch_native_values.py``."""
+    target = older_stitch_file(tmp_path / "older.nexus", kind)
+
+    def native(request_kind):
+        return AnalysisArtifactRequest(
+            target, request_kind, AnalysisArtifactOverwrite.REPLACE, _digest("request"), _digest("source"),
+            _digest("plan"), _digest("provenance"), {"kind": request_kind.value},
+            schema_version=ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE)
+    other = (AnalysisArtifactKind.STITCH_2D if kind is AnalysisArtifactKind.STITCH_1D
+             else AnalysisArtifactKind.STITCH_1D)
+    with pytest.raises(AnalysisArtifactInvalid, match="Int record"):
+        admit_analysis_artifact(native(other), coordinator=OutputTransactionCoordinator())
+    admit_analysis_artifact(native(kind), coordinator=OutputTransactionCoordinator()).abort()
+    with pytest.raises(AnalysisArtifactInvalid, match="Int record"):  # untouched
+        inspect_analysis_artifact(target)
 
 
 def test_a_stitch_2d_request_is_a_native_records():

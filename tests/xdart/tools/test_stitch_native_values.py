@@ -303,6 +303,27 @@ def _native_form(tmp_path, backend, *, scans="1,2,[1,2]", unit="q_A^-1"):
         output_family="combined" if "[" in scans and "," in scans else None)
 
 
+@pytest.mark.parametrize("mode", ("1d", "2d"))
+def test_replace_stitches_an_older_stitch_file_again(tmp_path, mode):
+    """Opening a Stitch file in the older layout says "stitch it again" (maintainer, 2026-09-30: "Remove old
+    format"); a Run with Replace does, writing the record in its place (it was refused: the check of the
+    file it replaces refused the older layout too)."""
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
+    from tests.core.test_analysis_artifact import older_stitch_file
+    form = replace(_native_form(tmp_path, "multigeometry", scans="1"), mode=mode, npt_1d=41, npt_rad_2d=23,
+                   npt_azim_2d=19)
+    target = Path(prepare_stitch_tool(form).request.module.output.target)
+    kind = AnalysisArtifactKind.STITCH_2D if mode == "2d" else AnalysisArtifactKind.STITCH_1D
+    target.parent.mkdir(parents=True, exist_ok=True)
+    older_stitch_file(target, kind)
+    prepared = prepare_stitch_tool(form)
+    assert prepared.unchanged == ()  # Append would stitch it too
+    result = run_stitch_operation(prepared.request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    assert read_analysis_artifact(target).kind is kind
+
+
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
 @pytest.mark.parametrize("unit", ("q_A^-1", "2th_deg"))
 def test_native_preflight_run_jobs_raw_and_stable_replacement(tmp_path, backend, unit):
