@@ -293,3 +293,22 @@ def test_share_uses_the_truthfully_rendered_radial_identity():
     assert state.heavy.cake_x is not None
     assert state.heavy.cake_x.unit == "q_A^-1"
     assert state.traces[0].axis.unit == "q_A^-1"
+
+
+def test_int_1d_shows_the_pattern_with_a_slice_left_on_from_int_2d():
+    """Int 1D has no cake, so a slice (Int 2D's, still on after the mode changed) cannot apply: the frame's
+    I(q) shows, where the slice's rule (never the full row for a cut) left the plot empty."""
+    base = make_shell_projection(frame_count=1, selected_index=0, plot_mode="Single")
+    frame = base.navigation.current
+    q = np.linspace(0.5, 5.0, 4)
+    payload = StandardDisplayPayload(0, frame, "frame", FrameView(
+        frame.local_frame_label, axis_1d=Axis("radial", "q_A^-1", values=q),
+        intensity_1d=np.linspace(1.0, 2.0, q.size), raw=np.ones((2, 2))))
+    preferences = ScientificPreferences(plot_axis="Q", plot_mode="Single", slice_enabled=True)
+    state = build_scientific_projection((payload,), base.navigation, frozenset({frame}), preferences, "",
+                                        processing_mode="Int 1D")
+    (trace,) = state.traces
+    np.testing.assert_array_equal(trace.intensity, payload.view.intensity_1d)
+    # Int 2D keeps the rule: a slice of a frame without a cake shows nothing
+    assert build_scientific_projection((payload,), base.navigation, frozenset({frame}), preferences, "",
+                                       processing_mode="Int 2D").traces == ()

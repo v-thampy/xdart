@@ -2330,10 +2330,7 @@ class StitchPage(QtWidgets.QWidget):
         (a Stitch 2D result's I(q), as Int 1D shows a 2-D record's)."""
         if not hasattr(self, "scientific"):
             return
-        if self._mode == "Stitch 2D":
-            self._draw_map()
-        else:
-            self._draw_patterns()
+        self._draw_projection("Int 2D" if self._mode == "Stitch 2D" else "Int 1D")
         self.curve.setLabel("left", scaled_intensity_label(self._diagnostic,
                                                            self._view.plot_options.intensity_scale))
         blocker = QtCore.QSignalBlocker(self._diagnostic_combo)
@@ -2350,7 +2347,7 @@ class StitchPage(QtWidgets.QWidget):
             frames=keys, current=None if current is None else self._result_key(current.data(role)),
             selected=tuple(self._result_key(item.data(role)) for item, _ in self._selected()))
 
-    def _display_payload(self, item, payload):
+    def _display_payload(self, item, payload, with_map=True):
         """A result as Int's frame (``StandardDisplayPayload``), through Int's conversion
         (``FrameView.from_results``): a Stitch 2D's map and the I(q) beside it, a Stitch 1D's I(q); the
         Diagnostic shows their coverage or normalization instead. A GI result is a GI frame, as Int's: the
@@ -2367,9 +2364,10 @@ class StitchPage(QtWidgets.QWidget):
             return IntegrationResult2D(x, y, getattr(projection, shown), None, x_unit, y_unit)
         map_result, cut = None, dict(payload.gi).get(self._view.plot_axis)
         if payload.kind is AnalysisArtifactKind.STITCH_2D:
-            (_q, q), (_chi, chi) = payload.axes
-            (_q, q_unit), (_chi, chi_unit) = payload.inspection.axis_units
-            map_result = IntegrationResult2D(q, chi, getattr(payload, shown), None, q_unit, chi_unit)
+            if with_map:  # Int 1D's layout shows a map's I(q) alone
+                (_q, q), (_chi, chi) = payload.axes
+                (_q, q_unit), (_chi, chi_unit) = payload.inspection.axis_units
+                map_result = IntegrationResult2D(q, chi, getattr(payload, shown), None, q_unit, chi_unit)
             pattern = payload.profile if cut is None else cut
         else:
             pattern = payload if cut is None else cut
@@ -2386,16 +2384,20 @@ class StitchPage(QtWidgets.QWidget):
             gi = dict(measurement_mode="GI", gi_resolved_motor=_gi_motor(payload),
                       gi_mode_2d="" if map_result is None else "q_chi",
                       gi_mode_1d="q_total" if cut is None else self._view.plot_axis)
-        if payload.gi_map is not None:
+        if payload.gi_map is not None and map_result is not None:
             gi["extra_views_2d"] = {"qip_qoop": FrameView.from_results(
                 label=key.local_frame_label, result_2d=as_2d(payload.gi_map))}
         return StandardDisplayPayload(0, key, item.text(), view, status="complete",
             wavelength_m=None if payload.wavelength_A is None else float(payload.wavelength_A) * 1e-10, **gi)
 
-    def _draw_map(self):
-        """Int 2D's layout for a Stitch 2D, from Int's own projection (``build_scientific_projection``):
-        the map as the cake, I(q) below, its slices and pins as Int 2D makes them from the same map."""
+    def _draw_projection(self, processing_mode):
+        """Int's projection of the selected results (``build_scientific_projection``) in Int 2D's layout
+        (the map as the cake, I(q) below, its slices and pins as Int 2D makes them from the same map) or
+        Int 1D's (each result's I(q), or the GI cut the plot axis chooses), with Int's axis rules: Q and 2θ
+        from one axis and the wavelength, and the Q the shown results have when they lack the axis chosen
+        (the choice stays, Codex terminal review F2)."""
         from xdart.gui.tabs.scattering.shell_projection import build_scientific_projection
+        map_mode = processing_mode == "Int 2D"
         role = QtCore.Qt.ItemDataRole.UserRole
         keys, navigation = self._navigation()
         items = {id(self._result_key(item.data(role))): (item, payload) for item, payload in self._selected()}
@@ -2403,20 +2405,21 @@ class StitchPage(QtWidgets.QWidget):
         if current is not None and current.data(role) in self._payloads:
             items.setdefault(id(self._result_key(current.data(role))),
                              (current, self._payloads[current.data(role)]))
-        # a pinned result's map gives its pinned slice; Int's projection keeps it out of the selection
-        # (Codex terminal review F1: the pin stayed while its trace vanished)
-        pinned = {id(pin.frame) for pin in self._view.slice_pins}
-        for row in range(self.results.count()):
-            item = self.results.item(row)
-            key = self._result_key(item.data(role))
-            if id(key) in pinned and item.data(role) in self._payloads:
-                items.setdefault(id(key), (item, self._payloads[item.data(role)]))
+        if map_mode:
+            # a pinned result's map gives its pinned slice; Int's projection keeps it out of the selection
+            # (Codex terminal review F1: the pin stayed while its trace vanished)
+            pinned = {id(pin.frame) for pin in self._view.slice_pins}
+            for row in range(self.results.count()):
+                item = self.results.item(row)
+                key = self._result_key(item.data(role))
+                if id(key) in pinned and item.data(role) in self._payloads:
+                    items.setdefault(id(key), (item, self._payloads[item.data(role)]))
         state = build_scientific_projection(
-            tuple(self._display_payload(item, payload) for item, payload in items.values()),
-            navigation, frozenset(keys), self._view, "", processing_mode="Int 2D")
+            tuple(self._display_payload(item, payload, with_map=map_mode) for item, payload in items.values()),
+            navigation, frozenset(keys), self._view, "", processing_mode=processing_mode)
         names = {id(key): (key.source_scan, f"{key.source_scan}_{key.local_frame_label}") for key in keys}
 
-        def named(trace):  # the result's name, as the patterns show it, before any slice note
+        def named(trace):  # the result's name, as the list shows it, before any slice note
             name, prefix = names[id(trace.frame)]
             return replace(trace, title=name + trace.title[len(prefix):]) if trace.title.startswith(prefix) else trace
         cuts = tuple(mode for mode in _CUT_AXES
@@ -2426,77 +2429,7 @@ class StitchPage(QtWidgets.QWidget):
                         gi_modes_1d=("q_total", *cuts) if state.measurement_mode == "GI" else (),
                         title=current.text() if current is not None else "Current",
                         status=current.text() if current is not None else "")
-        self._last_map_state = state
-        self.scientific.reconcile(state, navigation, completed=self.results.currentRow() + 1,
-                                  total=len(keys), detail="")
-
-    def _draw_patterns(self):
-        """Int 1D's layout: each selected result's I(q) (a Stitch 2D's, the one beside its map), or the
-        GI cut the plot axis chooses."""
-        from xdart.gui.tabs.scattering.shell_values import (
-            AxisProjection, ScientificProjection, TraceProjection,
-        )
-        self._last_map_state = None
-        role = QtCore.Qt.ItemDataRole.UserRole
-        keys, navigation = self._navigation()
-        selected = self._selected()
-        # A GI result's cuts are its record's other 1-D modes; the plot axis chooses one, as Int's does.
-        # The axis shown falls back to Q where the shown results lack the one chosen (a result without it,
-        # or one being read back), and the choice stays (Codex terminal review F2: a reload reset it).
-        cuts = {mode for _item, payload in selected for mode, _cut in payload.gi}
-        available = all(payload.wavelength_A is not None for _, payload in selected)
-        shown_axis = self._view.plot_axis
-        if shown_axis not in {"Q", "2theta", *cuts} or (shown_axis == "2theta" and not available):
-            shown_axis = "Q"
-        cut = shown_axis if shown_axis in cuts else None
-        unit = "q_A^-1" if shown_axis == "Q" else "2th_deg"
-        axis_label, axis_unit = (_CUT_AXES[cut] if cut is not None
-                                 else ("Q", "Å⁻¹") if unit == "q_A^-1" else ("2θ", "°"))
-        traces = []
-        for item, payload in selected:
-            if cut is not None:
-                shown = dict(payload.gi).get(cut)
-                if shown is None:
-                    continue
-                radial = shown.axes[0][1]
-            elif payload.kind is AnalysisArtifactKind.STITCH_2D:
-                shown = payload.profile
-            else:
-                shown = payload
-            values = {"Intensity": shown.intensity, "Coverage": shown.coverage,
-                      "Normalization": shown.normalization}[self._diagnostic]
-            if values is None:
-                continue
-            if cut is None and shown is not payload:  # the I(q) beside a map, in the axis chosen
-                (_q, radial), = shown.axes
-                (_q, native), = shown.axis_units
-                if native != unit:
-                    from xrd_tools.io.analysis_stitch_auxiliary import native_stitch_companion
-                    target, radial = native_stitch_companion(radial, native, payload.wavelength_A)
-                    if target != unit:
-                        continue
-            elif cut is None:
-                try:
-                    radial = payload.radial_axis(unit)
-                except ValueError:
-                    if payload.native_unit != unit:
-                        continue
-                    radial = payload.axis("q")
-            traces.append(TraceProjection(
-                self._result_key(item.data(role)),
-                AxisProjection(np.asarray(radial, dtype=float), axis_label, axis_unit),
-                np.asarray(values, dtype=float), title=item.text()))
-        gi_modes = ("q_total", *(mode for mode in _CUT_AXES if mode in cuts)) if cuts else ()
-        current = self.results.currentItem()
-        view = self._view
-        state = ScientificProjection(
-            heavy_available=frozenset(keys), traces=tuple(traces),
-            title=current.text() if current else "Current", processing_mode="Int 1D",
-            measurement_mode="GI" if gi_modes else "Standard",
-            gi_mode_1d=(cut or "q_total") if gi_modes else "", gi_modes_1d=gi_modes,
-            plot_axis=shown_axis, plot_mode=view.plot_mode, plot_options=view.plot_options,
-            color_map=view.color_map, log_scale=view.log_scale, background_enabled=False,
-            status=current.text() if current else "")
+        self._last_map_state = state if map_mode else None
         self.scientific.reconcile(state, navigation, completed=self.results.currentRow() + 1,
                                   total=len(keys), detail="")
 
