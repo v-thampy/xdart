@@ -417,7 +417,8 @@ class StitchPage(QtWidgets.QWidget):
             self.modeRequested.emit(str(SCATTERING_PAGE_KEY), str(mode))
 
     def _field(self, card, section, key, label, value="", *, choices=(), browse=False):
-        kind = ControlFieldKind.COMBO if choices else ControlFieldKind.LINE
+        kind = (ControlFieldKind.COMBO if choices else ControlFieldKind.BOOL if isinstance(value, bool)
+                else ControlFieldKind.LINE)
         path = ("Project", "project_folder") if key == "project_root" else ("Stitch", key)
         field = ControlFormField(section, label, path, value, kind, tuple(choices), browse)
         row = FormRow(label=label, path=path, value=value, kind=kind.value,
@@ -472,6 +473,14 @@ class StitchPage(QtWidgets.QWidget):
         self._field(source, SectionId.SOURCE, "source_kind", "Source", "Spec",
                     choices=("Spec", "NeXus", "Directory"))
         self._field(source, SectionId.SOURCE, "spec_path", "SPEC files", browse=True)
+        # Directory mode, as Int's Image Directory (maintainer, 2026-09-30: "Directory mode should have
+        # subfolders option as well as filters like in Int 2d")
+        self._field(source, SectionId.SOURCE, "subdirs", "Subdirs", False)
+        self._rows["subdirs"].setToolTip("Also the SPEC and NeXus files in the folder's subfolders.")
+        self._field(source, SectionId.SOURCE, "name_filter", "Filter")
+        self._rows["name_filter"].setToolTip(
+            "Only the files whose names match, as Int's Filter: every word must appear (any order), "
+            "| separates alternatives and -word excludes; case-insensitive. E.g. R1C -LaB6")
         self._field(source, SectionId.SOURCE, "image_dir", "Images", browse=True)
         # on the card, not in Advanced: a stem left from another dataset matches the wrong images
         self._field(source, SectionId.SOURCE, "image_stem", "Image stem")
@@ -914,6 +923,8 @@ class StitchPage(QtWidgets.QWidget):
         # hidden value governs them (Codex R20-F2); NeXus sources have no stem
         for key in ("image_dir", "image_stem", "scan_mode", "scan"):
             self._rows[key].setVisible(kind != "NeXus" and (key in ("image_dir", "image_stem") or kind == "Spec"))
+        for key in ("subdirs", "name_filter"):
+            self._rows[key].setVisible(kind == "Directory")
         self._rows["scan"].setVisible(kind == "Spec" and self._value("scan_mode") == "Select Scans")
         self._rows["spec_path"].label.setText({"Spec": "SPEC files", "NeXus": "NeXus files", "Directory": "Folder"}[kind])
         if _args and _args[0][-1] == "source_kind":
@@ -1295,9 +1306,12 @@ class StitchPage(QtWidgets.QWidget):
         kind = (StitchGeometryKind.PYFAI_GONIOMETER_JSON if value("geometry_kind") == "Goniometer JSON"
                 else StitchGeometryKind.PONI)
         monitor = str(value("monitor")).strip()
+        directory = value("source_kind") == "Directory"
         selection = StitchSourceSelection(value("source_kind"), self._source_paths,
             scans=str(value("scan")), stitch_all=value("scan_mode") == "Stitch All",
-            image_dir=str(value("image_dir")), image_stem=str(value("image_stem")))
+            image_dir=str(value("image_dir")), image_stem=str(value("image_stem")),
+            recursive=directory and bool(value("subdirs")),
+            name_filter=str(value("name_filter")).strip() if directory else "")
         conditioning = StitchConditioning(self._threshold_mode,
             value("threshold_min") if self._threshold_mode == "manual" else None,
             value("threshold") if self._threshold_mode == "manual" else None)
@@ -1402,6 +1416,8 @@ class StitchPage(QtWidgets.QWidget):
         self.set_field("output_path", str(Path(form.output_path).parent))
         self.set_field("image_dir", selection.image_dir)
         self.set_field("image_stem", selection.image_stem)
+        self.set_field("subdirs", selection.recursive)
+        self.set_field("name_filter", selection.name_filter)
         policy = form.conditioning or StitchConditioning()
         self._threshold_state = ThresholdState(policy.mode == "manual",
             policy.threshold_min, policy.threshold_max, policy.mode == "auto")

@@ -87,6 +87,43 @@ def test_native_selection_brackets_all_and_directory_mixed_formats(tmp_path):
     assert directory.skipped == all_spec.skipped
 
 
+def test_a_directory_takes_its_subfolders_and_a_name_filter_as_int_does(tmp_path, monkeypatch):
+    """Maintainer, 2026-09-30: "Directory mode should have subfolders option as well as filters like in
+    Int 2d". The SPEC files a Directory takes show in the scans it skips for want of images."""
+    from xrd_tools.analysis.stitch_sources import StitchSourceSelection, resolve_stitch_sources
+    from xrd_tools.io import spec as spec_io
+    header = ("#F {}\n#E 1\n#D today\n#O0 del  nu\n\n#S 1 ascan del 14 15 1 1\n#D today\n#P0 14 -10\n#N 2\n"
+              "#L del  nu\n14 -10\n15 -10\n")
+    for relative in ("R1C1", "R1C2", "LaB6_17keV", "sub/R2C1", "sub/deeper/R2C2_LaB6"):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(header.format(path.name))
+    (tmp_path / "images").mkdir()
+    for name in ("other_scan1_0000.raw", "other_scan1_0000.raw.pdi"):
+        (tmp_path / "images" / name).write_bytes(b"#S not a SPEC file\n")
+    decode = {"detector_shape": (2, 2), "raw_dtype": "uint16"}
+
+    def taken(**options):
+        resolution = resolve_stitch_sources(StitchSourceSelection("Directory", (str(tmp_path),), **options), decode)
+        return sorted(Path(path).relative_to(tmp_path).as_posix() for path, _scan, _reason in resolution.skipped)
+
+    assert taken() == ["LaB6_17keV", "R1C1", "R1C2"]  # the folder alone, as before
+    assert taken(recursive=True) == ["LaB6_17keV", "R1C1", "R1C2", "sub/R2C1", "sub/deeper/R2C2_LaB6"]
+    assert taken(recursive=True, name_filter="R1C | R2C -LaB6") == ["R1C1", "R1C2", "sub/R2C1"]
+    assert taken(name_filter="lab6") == ["LaB6_17keV"]  # case-insensitive
+    with pytest.raises(ValueError, match="^Filter: "):
+        StitchSourceSelection("Directory", (str(tmp_path),), name_filter="R1C NOT")
+    opened = []  # an image is never opened to learn whether it is a SPEC file, even in subfolders
+    original = spec_io.is_spec_file
+    monkeypatch.setattr(spec_io, "is_spec_file", lambda path: opened.append(Path(path).name) or original(path))
+    taken(recursive=True)
+    assert "images" not in {Path(name).parent.name for name in opened}
+    assert not any(name.startswith("other_scan1") for name in opened) and "R2C1" in opened
+    # a selection without the options keeps its identity (its form's fingerprint)
+    assert StitchSourceSelection("Directory", (str(tmp_path),)).fingerprint_value == (
+        "Directory", (str(tmp_path),), "", False, "", "")
+
+
 @pytest.mark.parametrize("mode,alias", (("NeXus", False), ("Directory", False), ("Directory", True)))
 def test_eiger_master_selection_keeps_identity_and_admits_metadata_once(tmp_path, mode, alias):
     from xrd_tools.analysis.scan_operations import AnalysisDisposition, MetadataTablePlan, run_metadata_table

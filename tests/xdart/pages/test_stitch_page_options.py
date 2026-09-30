@@ -514,9 +514,29 @@ def test_inputs_view_follows_int(qapp, tmp_path):
         assert not stem.isHidden() and stem.current_value() == "not_this_scan_"
         assert page.build_form().source_selection.image_stem == "not_this_scan_"
         assert stem.editor.placeholderText() == "auto · <SPEC name>_scan<N>_"  # no hidden Selection
+        # a Directory takes its subfolders and a name filter, as Int's Image Directory (maintainer,
+        # 2026-09-30: "Directory mode should have subfolders option as well as filters like in Int 2d")
+        subdirs, name_filter = page._rows["subdirs"], page._rows["name_filter"]
+        assert page.controls.source_card.isAncestorOf(subdirs) and not subdirs.isHidden()
+        assert not name_filter.isHidden()
+        selection = page.build_form().source_selection
+        assert (selection.recursive, selection.name_filter) == (False, "")
+        page.set_field("subdirs", True)
+        page.set_field("name_filter", " LaB6 -12keV ")
+        selection = page.build_form().source_selection
+        assert (selection.recursive, selection.name_filter) == (True, "LaB6 -12keV")
+        fields = page.settings()["fields"]  # kept with the page's settings
+        assert fields["subdirs"] is True and fields["name_filter"] == " LaB6 -12keV "
+        page.set_field("name_filter", "LaB6 NOT")
+        with pytest.raises(ValueError, match="^Filter: "):
+            page.build_form()
+        page.set_field("name_filter", "LaB6 -12keV")
         page.set_field("image_stem", "")
         page.set_field("source_kind", "Spec")
         page.set_sources([str(spec)])
+        assert subdirs.isHidden() and name_filter.isHidden()  # a SPEC selection takes neither
+        selection = page.build_form().source_selection
+        assert (selection.recursive, selection.name_filter) == (False, "")
         names = page._rows["output_family"]  # an optional override under Advanced
         assert names.window() is page.advanced
         # named as Int names these images' results (maintainer, 2026-09-29): Preview lists the images

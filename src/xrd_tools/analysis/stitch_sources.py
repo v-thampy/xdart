@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from xrd_tools.core.filters import compile_filter
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.io.nexus import list_entries
 from xrd_tools.io.spec import list_spec_scans
@@ -20,6 +21,11 @@ class StitchSourceSelection:
     stitch_all: bool = False
     image_dir: str = ""
     image_stem: str = ""
+    #: Directory mode, as Int's Image Directory (maintainer, 2026-09-30): its subfolders too, and a
+    #: file-name filter in the shared grammar (``xrd_tools.core.filters``: space = and, ``|`` = or,
+    #: ``-term`` = not; case-insensitive substrings of the name without its extension)
+    recursive: bool = False
+    name_filter: str = ""
 
     def __post_init__(self):
         if self.kind not in {"Spec", "NeXus", "Directory"} or type(self.paths) is not tuple or not self.paths:
@@ -33,10 +39,37 @@ class StitchSourceSelection:
             parse_stitch_scan_groups(self.scans)
         if "\0" in self.image_dir or any(c in self.image_stem for c in ("/", "\\", "\0")):
             raise ValueError("Image directory or stem is invalid")
+        if type(self.recursive) is not bool or type(self.name_filter) is not str:
+            raise ValueError("Directory subfolders and filter are invalid")
+        try:
+            compile_filter(self.name_filter)
+        except ValueError as error:
+            raise ValueError(f"Filter: {error}") from None
 
     @property
     def fingerprint_value(self):
-        return self.kind, self.paths, self.scans, self.stitch_all, self.image_dir, self.image_stem
+        value = (self.kind, self.paths, self.scans, self.stitch_all, self.image_dir, self.image_stem)
+        # the Directory options only when set: a selection without them keeps its identity
+        return value + (("recursive",) if self.recursive else ()) + (
+            ("filter", self.name_filter) if self.name_filter else ())
+
+
+#: Files a Directory's SPEC search never opens: detector images, their notes, containers, results.
+_NOT_SPEC = frozenset({".raw", ".tif", ".tiff", ".edf", ".cbf", ".img", ".mar3450", ".pdi", ".metadata",
+                       ".npy", ".npz", ".png", ".jpg", ".jpeg", ".h5", ".hdf5", ".nxs", ".nexus", ".cxi",
+                       ".poni", ".npt", ".json", ".csv"})
+#: A NeXus container's suffixes, which Int's filter leaves out of the name it matches.
+_CONTAINER_SUFFIXES = frozenset({".nxs", ".h5", ".hdf5", ".nexus", ".cxi"})
+
+
+def _directory_spec_files(directory, recursive, name_ok):
+    """The SPEC files in a Directory (its subfolders' too) whose names pass the filter, in discovery
+    order. A known image or data file is never opened to find out: with subfolders, an images folder
+    of thousands of frames would otherwise each be read."""
+    from xrd_tools.io.spec import is_spec_file
+    from xrd_tools.sources.discover import _walk_files
+    return [path for path in _walk_files(directory, recursive)
+            if path.suffix.lower() not in _NOT_SPEC and name_ok(path.name) and is_spec_file(path)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,13 +162,15 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
         directory = Path(selection.paths[0])
         if not directory.is_dir():
             raise ValueError("Source directory is unavailable")
-        specs = discover_scans(directory, SourceKind.SPEC)
-        for path in dict.fromkeys(str(spec.uri) for spec in specs):
-            spec_file(Path(path), True)
+        name_ok = compile_filter(selection.name_filter)
+        for path in _directory_spec_files(directory, selection.recursive, name_ok):
+            spec_file(path, True)
         seen_nexus = set()
         for kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER):
-            for spec in discover_scans(directory, kind):
+            for spec in discover_scans(directory, kind, recursive=selection.recursive):
                 path = Path(spec.uri)
+                if not name_ok(path.stem if path.suffix.lower() in _CONTAINER_SUFFIXES else path.name):
+                    continue
                 resolved = path.resolve()
                 if resolved not in seen_nexus:
                     seen_nexus.add(resolved)
