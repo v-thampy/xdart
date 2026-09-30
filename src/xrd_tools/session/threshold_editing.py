@@ -23,12 +23,11 @@ def threshold_transition(
     """Edit ``min``, ``max`` or ``enabled``; None means an unchanged intent.
 
     The default is supplied by native source metadata: the largest value the
-    automatic ceiling keeps. Automatic display values are not stored bounds,
-    while disabled manual bounds survive a toggle. Legacy manual states may carry
-    an implicit zero minimum; a touch materializes it. A maximum typed under
-    Auto is always manual, even the number Auto's hint shows (decision 39: Auto
-    leaves out values at or above its ceiling, a manual maximum only those
-    above it).
+    automatic ceiling keeps (one below it). Automatic display values are not
+    stored bounds, while disabled manual bounds survive a toggle. Legacy manual
+    states may carry an implicit zero minimum; a touch materializes it. Typing
+    the ceiling itself is therefore manual and keeps it (decision 39: Auto leaves
+    out values at or above its ceiling, a manual maximum only those above it).
     """
     if field == "enabled":
         if type(value) is not bool:
@@ -52,8 +51,7 @@ def threshold_transition(
         (0.0 if automatic else state.threshold_min) if field == "min" else
         (default_max if automatic else state.threshold_max))
     noncanonical_touch = state.apply_threshold and state.threshold_min is None
-    typed_over_auto = field == "max" and automatic and parsed is not None
-    if parsed == current and not noncanonical_touch and not typed_over_auto:
+    if parsed == current and not noncanonical_touch:
         return None
 
     if field in {"min", "max"}:

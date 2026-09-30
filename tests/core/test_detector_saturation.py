@@ -118,15 +118,15 @@ def test_a_pilatus_header_records_its_count_cutoff(tmp_path):
     assert pilatus_count_cutoff(None) is None
 
 
-def test_a_number_typed_over_auto_is_manual_even_the_hints():
-    # R20 boundary row 1: Auto leaves out >= S; typing S keeps S (manual is > max).
+def test_typing_the_hints_number_is_manual_and_keeps_it():
+    # R20 boundary row 1: Auto leaves out >= S and its default maximum is the largest value it keeps,
+    # S - 1; typing S is manual and keeps S (manual leaves out only > max).
     auto = ThresholdState()
     hint = 1048575
     typed = threshold_transition(auto, "max", str(hint), float(hint - 1))
     assert typed == ThresholdState(True, 0.0, float(hint), False)
-    # the default itself is a typed number too
-    assert threshold_transition(auto, "max", str(hint - 1), float(hint - 1)) == ThresholdState(
-        True, 0.0, float(hint - 1), False)
+    # the default itself keeps Auto: the same values are kept (a Run harvest of a shown default)
+    assert threshold_transition(auto, "max", str(hint - 1), float(hint - 1)) is None
     # clearing the box keeps Auto; a minimum keeps Auto's ceiling as the largest kept value
     assert threshold_transition(auto, "max", "", float(hint - 1)) == auto
     assert threshold_transition(auto, "min", "4", float(hint - 1)) == ThresholdState(
