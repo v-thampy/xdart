@@ -38,7 +38,9 @@ def qapp():
 def _wait(page, qapp, timeout=30):
     until = time.monotonic() + timeout
     qapp.processEvents()
-    while (page._owner.busy or page._raw_pending or page._queued_jobs) and time.monotonic() < until:
+    # a shown result the page dropped from memory is reloaded between its other work (C12)
+    while (page._owner.busy or page._raw_pending or page._queued_jobs
+           or getattr(page, "_reload_pending", None)) and time.monotonic() < until:
         qapp.processEvents()
         time.sleep(.005)
     qapp.processEvents()
@@ -427,6 +429,7 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
         _wait(reopened, qapp)
         reopened.scientific.plot_mode.setCurrentText("Overlay")
         reopened.results.selectAll()
+        _wait(reopened, qapp)  # the result Single let go is read back (C12)
         assert len(reopened.curve.listDataItems()) == 2
         assert reopened.curve.listDataItems()[0].opts["pen"].color().getRgb() == (31, 119, 180, 255)
         reopened.scientific.previous_frame.click()
@@ -509,6 +512,7 @@ def test_selecting_existing_result_fences_pending_reopen(qapp, tmp_path, monkeyp
         _wait(page, qapp)
         page.open_result(second)
         _wait(page, qapp)
+        expected_y = page.curve.listDataItems()[0].yData.copy()  # the second result's
         page.results.setCurrentRow(0)
 
         def delayed(*args, **kwargs):
@@ -519,8 +523,7 @@ def test_selecting_existing_result_fences_pending_reopen(qapp, tmp_path, monkeyp
         monkeypatch.setattr(stitch_owner, "read_analysis_artifact", delayed)
         page.open_result(first)
         assert entered.wait(5)
-        page.results.setCurrentRow(1)
-        expected_y = page.curve.listDataItems()[0].yData.copy()
+        page.results.setCurrentRow(1)  # read back once the pending reopen is done (C12)
         release.set()
         _wait(page, qapp)
         assert page._current_payload().inspection.path == str(second)

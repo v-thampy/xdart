@@ -282,7 +282,12 @@ class StitchPage(QtWidgets.QWidget):
         self._action_view_revision = None
         self._started = None
         self._closing = False
+        #: The results shown (current, selected, holding a pin), by path: the others are listed by name
+        #: and reloaded from their files when shown again (C12; a Stitch 2D of 287 frames holds 4.65 MB).
         self._payloads = {}
+        #: Shown results not in memory, to reload in order, and the one reloading.
+        self._reload_pending = []
+        self._reloading = None
         self._diagnostic = "Intensity"
         #: One display key per result, created once: the view compares keys by identity.
         self._result_keys = {}
@@ -335,6 +340,8 @@ class StitchPage(QtWidgets.QWidget):
         self.results = QtWidgets.QListWidget()
         self.results.setObjectName("stitchResults")
         self.results.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.results.itemSelectionChanged.connect(self._update_residency)
+        self.results.currentItemChanged.connect(self._update_residency)
         self.results.itemSelectionChanged.connect(self._draw)
         self.results.currentItemChanged.connect(self._current_result_changed)
         self.frames = QtWidgets.QListWidget()
@@ -1674,7 +1681,10 @@ class StitchPage(QtWidgets.QWidget):
             elif update.terminal_status is OperationTerminalStatus.FAILED:
                 self._queued_jobs.clear()
                 self._after_prepare = None
-                self._status(update.failure_message or update.failure_type, ready=False)
+                reloading, self._reloading = self._reloading, None
+                self._status((f"Could not reload {Path(reloading).name}: " if update.action is StitchOwnerAction.REOPEN
+                              and reloading is not None else "") + (update.failure_message or update.failure_type),
+                             ready=False)
                 if update.action is StitchOwnerAction.METADATA and self._metadata_current():
                     self._metadata_dialog.status.setText(update.failure_message or update.failure_type)
                 if update.action is StitchOwnerAction.FRAME_READ and self._raw_popup is not None and self._raw_request_revision == self._raw_revision:
@@ -1682,6 +1692,7 @@ class StitchPage(QtWidgets.QWidget):
             elif update.terminal_status is OperationTerminalStatus.CANCELLED:
                 self._queued_jobs.clear()
                 self._after_prepare = None
+                self._reloading = None
                 self._status("Cancelled")
             elif update.outcome is not None:
                 self._accept_outcome(update)
@@ -1689,6 +1700,8 @@ class StitchPage(QtWidgets.QWidget):
             self._timer.stop()
             if self._raw_pending and not self._queued_jobs:
                 QtCore.QTimer.singleShot(0, self._request_raw)
+            if self._reload_pending and not self._queued_jobs:
+                QtCore.QTimer.singleShot(0, self._request_reload)
         self._sync_actions()
 
     def _accept_outcome(self, update):
@@ -1754,6 +1767,11 @@ class StitchPage(QtWidgets.QWidget):
                 self._raw_frame_view = outcome.frame_view
                 self._render_raw()
                 self._status(f"Ready · saved {_kind_name(self._current_payload())} result")
+        elif outcome.kind is StitchOwnerOutcomeKind.REOPENED and self._reloading is not None:
+            path, self._reloading = self._reloading, None
+            if not self._closing and path in self._resident_paths():
+                self._restore_payload(path, outcome.payload)
+                self._status(f"Ready · saved {_kind_name(outcome.payload)} result")
         elif outcome.kind is StitchOwnerOutcomeKind.REOPENED:
             if self._action_view_revision == self._view_revision and not self._closing:
                 self._mount_payload(outcome.artifact_path, outcome.payload)
@@ -2006,14 +2024,67 @@ class StitchPage(QtWidgets.QWidget):
         blocker = QtCore.QSignalBlocker(self.results)
         self.results.setCurrentItem(item)
         del blocker
+        self._update_residency()  # a run's outputs replace each other in memory as they are shown
         self._current_result_changed()
 
     def _selected(self):
+        """The selected results in memory (a reloading one joins when it is back)."""
         items = self.results.selectedItems()
         if self._view.plot_mode == "Single":
             item = self.results.currentItem()
             items = [] if item is None else [item]
-        return [(item, self._payloads[item.data(QtCore.Qt.ItemDataRole.UserRole)]) for item in items]
+        role = QtCore.Qt.ItemDataRole.UserRole
+        return [(item, self._payloads[item.data(role)]) for item in items if item.data(role) in self._payloads]
+
+    def _resident_paths(self):
+        """The results shown: the current one, the selected ones (Single shows the current one only)
+        and those holding a slice pin."""
+        role = QtCore.Qt.ItemDataRole.UserRole
+        paths = ({item.data(role) for item in self.results.selectedItems()}
+                 if self._view.plot_mode != "Single" else set())
+        current = self.results.currentItem()
+        if current is not None:
+            paths.add(current.data(role))
+        pinned = {id(pin.frame) for pin in self._view.slice_pins}
+        return paths | {path for path, key in self._result_keys.items() if id(key) in pinned}
+
+    def _update_residency(self, *_args):
+        """C12 (STITCH-2D-20260930; Codex general audit AUD-5, narrowed by architecture invariant 12):
+        only the results shown stay in memory; another is dropped and read from its file again when
+        shown (a processed file can always be read, or stitched again)."""
+        resident = self._resident_paths()
+        for path in [path for path in self._payloads if path not in resident]:
+            del self._payloads[path]
+        role = QtCore.Qt.ItemDataRole.UserRole
+        listed = [self.results.item(row).data(role) for row in range(self.results.count())]
+        self._reload_pending = [path for path in dict.fromkeys(self._reload_pending + listed)
+                                if path in resident and path not in self._payloads]
+        if self._reload_pending:
+            QtCore.QTimer.singleShot(0, self._request_reload)
+
+    def _request_reload(self):
+        """Read the next shown result back from its file, through the owner, between its other work:
+        never inside a run's queue of outputs (a refused start would end the run's queue)."""
+        if self._closing or self._owner.busy or self._queued_jobs or self._reloading is not None:
+            return
+        resident = self._resident_paths()
+        self._reload_pending = [path for path in self._reload_pending
+                                if path in resident and path not in self._payloads]
+        if not self._reload_pending:
+            return
+        path = self._reload_pending.pop(0)
+        self._reloading = path
+        if not self._start(f"Loading {Path(path).name}…", lambda: self._owner.begin_reopen(path)):
+            self._reloading = None
+
+    def _restore_payload(self, path, payload):
+        """A reloaded result back in memory: the list and its selection stay as they are."""
+        self._payloads[path] = payload
+        current = self.results.currentItem()
+        if current is not None and current.data(QtCore.Qt.ItemDataRole.UserRole) == path:
+            self._current_result_changed()  # its frames, and the view
+        else:
+            self._draw()
 
     def _result_key(self, path):
         """The result's display key (one object per result; results share one run and one
@@ -2087,7 +2158,7 @@ class StitchPage(QtWidgets.QWidget):
         keys, navigation = self._navigation()
         items = {id(self._result_key(item.data(role))): (item, payload) for item, payload in self._selected()}
         current = self.results.currentItem()
-        if current is not None:
+        if current is not None and current.data(role) in self._payloads:
             items.setdefault(id(self._result_key(current.data(role))),
                              (current, self._payloads[current.data(role)]))
         state = build_scientific_projection(
@@ -2203,6 +2274,7 @@ class StitchPage(QtWidgets.QWidget):
             if value == "Single":
                 self.results.setCurrentRow(self.results.currentRow(),
                                            QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            self._update_residency()  # Overlay shows the selected results, Single the current one
         elif kind is ShellCommandKind.SET_PLOT_AXIS and value in {"Q", "2theta", "chi", *_CUT_AXES}:
             self._set_view(plot_axis=value, slice_pins=slice_pins_for_plot_axis(view.slice_pins, view.plot_axis, value))
         elif kind is ShellCommandKind.SET_IMAGE_AXIS and value in {"Q-Chi", "2Th-Chi"}:
@@ -2344,6 +2416,7 @@ class StitchPage(QtWidgets.QWidget):
     def shutdown(self):
         self._closing = True
         self._queued_jobs.clear()
+        self._reload_pending.clear()
         self._raw_closed()
         self._view_revision += 1
         self._timer.stop()
