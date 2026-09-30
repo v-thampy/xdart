@@ -6,6 +6,7 @@ until the page closed. The others are listed by name and reloaded from their fil
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 from pyqtgraph.Qt import QtCore
 
 from xdart.gui.pages.services import empty_host_services
@@ -99,6 +100,44 @@ def test_the_chosen_gi_axis_survives_reading_a_result_back(qapp, tmp_path):
         assert page._view.plot_axis == "q_oop"  # while it is read back
         _wait(page, qapp)
         assert page._view.plot_axis == "q_oop" and page._last_map_state.plot_axis == "q_oop"
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
+def test_a_map_without_the_chosen_cut_shows_i_of_q_and_keeps_the_choice(qapp, tmp_path):
+    """With a GI Stitch 2D's cut chosen, a plain Stitch 2D shows its I(q) (the axis falls back to Q for it),
+    and the GI result shows the cut again: the choice is the user's, as Codex's F2 asks of a read-back."""
+    from xrd_tools.integrate.stitch_gi import StitchGI
+    from tests.xdart.tools.test_stitch_native_gi import _SAMPLE, _gi_form
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        form = replace(_gi_form(tmp_path, "multigeometry", StitchGI(
+            ("q_ip", "q_oop"), incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE)),
+            mode="2d", npt_rad_2d=48, npt_azim_2d=32)
+        page.load_form(form)
+        page.run_bar.startButton.click()  # the GI Stitch 2D
+        _wait(page, qapp)
+        page.load_form(replace(form, gi=None, output_family="plain"))
+        page.run_bar.startButton.click()  # a plain Stitch 2D beside it
+        _wait(page, qapp)
+        assert page.results.count() == 2
+        page.results.setCurrentRow(0)
+        _wait(page, qapp)
+        page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_AXIS, "q_oop"))
+        gi_payload = page._current_payload()
+        assert gi_payload.gi_map is not None and page._last_map_state.plot_axis == "q_oop"
+        page.results.setCurrentRow(1)
+        _wait(page, qapp)
+        plain = page._current_payload()
+        assert plain.gi_map is None and page._view.plot_axis == "q_oop"
+        (trace,) = page._last_map_state.traces
+        np.testing.assert_array_equal(trace.intensity, plain.profile.intensity)
+        page.results.setCurrentRow(0)
+        _wait(page, qapp)
+        (trace,) = page._last_map_state.traces
+        np.testing.assert_array_equal(trace.intensity, dict(page._current_payload().gi)["q_oop"].intensity)
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
