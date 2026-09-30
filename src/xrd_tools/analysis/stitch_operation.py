@@ -1361,6 +1361,10 @@ class StitchOperationPlan:
     flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
     #: Grazing incidence: GI cuts written beside I(q), and a Stitch 2D's q_ip-q_oop map (native, in Q).
     gi: StitchGI | None = None
+    #: A native Stitch 2D's map axis, as Int 2D's: its radial unit and range (None: its frames' extent);
+    #: ``unit`` and ``radial_range`` are I(q)'s beside it.
+    map_unit: str = "q_A^-1"
+    map_radial_range: tuple[float, float] | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
@@ -1410,6 +1414,7 @@ class StitchOperationPlan:
             raise ValueError("max_frame_bytes must be a bounded positive exact integer")
         _correction_fields(self)
         _gi_field(self)
+        _map_axis_fields(self)
         object.__setattr__(self, "radial_range", radial)
         object.__setattr__(self, "azimuth_range", azimuth)
         object.__setattr__(
@@ -1442,7 +1447,7 @@ class StitchOperationPlan:
              self.error_model,
              None if self._dark_receipt is None else self._dark_receipt.fingerprint,
              None if self._flat_receipt is None else self._flat_receipt.fingerprint),
-        ) + _flat_cutoff_identity(self) + _gi_identity(self)
+        ) + _flat_cutoff_identity(self) + _gi_identity(self) + _map_axis_identity(self)
         return value + native_plan_identity(self) if self.native_records else value
 
 
@@ -1473,6 +1478,9 @@ class XuStitchOperationPlan:
     npt_rad_2d: int = 1000
     npt_azim_2d: int = 360
     azimuth_range: tuple[float, float] | None = None
+    #: The map's radial unit and range (None: its frames' extent), as Int 2D's; I(q)'s are ``unit``, ``radial_range``.
+    map_unit: str = "q_A^-1"
+    map_radial_range: tuple[float, float] | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
@@ -1517,6 +1525,7 @@ class XuStitchOperationPlan:
         if not self.native_records and self.calibration.projection.value["version"] != 1:
             raise ValueError("non-native XU plans require canonical version 1 calibration")
         _xu_map_fields(self)
+        _map_axis_fields(self)
         object.__setattr__(
             self,
             "fingerprint",
@@ -1544,7 +1553,8 @@ class XuStitchOperationPlan:
                 ) + _xu_corrections_identity(self) + _gi_identity(self)
                 + (native_plan_identity(self) if self.native_records else ())
                 # a 1-D plan keeps the identity it had
-                + (() if self.mode == "1d" else (("xu-map-v1",) + _xu_map_grid(self),)),
+                + (() if self.mode == "1d" else (("xu-map-v1",) + _xu_map_grid(self),))
+                + _map_axis_identity(self),
             ),
         )
 
@@ -1595,6 +1605,26 @@ def _gi_field(plan):
 def _gi_identity(plan):
     """Only a GI plan changes its identity; every other plan keeps the one it had."""
     return () if plan.gi is None else (plan.gi.identity(),)
+
+
+def _map_axis_fields(plan):
+    """A native Stitch 2D's map axis (Q or 2θ; Q with GI) and its range; any other plan has none."""
+    if type(plan.map_unit) is not str:
+        raise TypeError("the map unit must be a string")
+    if not (plan.native_records and plan.mode == "2d"):
+        if (plan.map_unit, plan.map_radial_range) != ("q_A^-1", None):
+            raise ValueError("only a native Stitch 2D has a map axis of its own")
+        return
+    if plan.map_unit not in {"q_A^-1", "2th_deg"} or (plan.gi is not None and plan.map_unit != "q_A^-1"):
+        raise ValueError("a Stitch 2D map is binned in Q or 2theta (Q with GI)")
+    object.__setattr__(plan, "map_radial_range", _range(plan.map_radial_range, "map radial range", required=False))
+
+
+def _map_axis_identity(plan):
+    """A native Stitch 2D's map axis; a 1-D plan keeps the identity it had."""
+    if not (plan.native_records and plan.mode == "2d"):
+        return ()
+    return (("map-axis-v1", plan.map_unit, plan.map_radial_range),)
 
 
 def _flat_cutoff_identity(plan):
@@ -1920,6 +1950,9 @@ def _provenance(
                 None if plan.azimuth_range is None else list(plan.azimuth_range)
             ),
             "unit": plan.unit,
+            **({} if not (plan.native_records and plan.mode == "2d") else {
+                "map_unit": plan.map_unit,
+                "map_radial_range": None if plan.map_radial_range is None else list(plan.map_radial_range)}),
             "method": plan.method,
             "monitor_selector": (
                 None
@@ -2040,7 +2073,9 @@ def _xu_provenance(
             **({} if plan.mode == "1d" else {"map": {
                 "npt_rad_2d": plan.npt_rad_2d, "npt_azim_2d": plan.npt_azim_2d,
                 # None (Auto): the frames' own χ extent, scouted when stitching
-                "azimuth_range": None if plan.azimuth_range is None else list(plan.azimuth_range)}}),
+                "azimuth_range": None if plan.azimuth_range is None else list(plan.azimuth_range),
+                "unit": plan.map_unit,
+                "radial_range": None if plan.map_radial_range is None else list(plan.map_radial_range)}}),
         },
         "observations": observed,
         "runtime_requirements": {
@@ -2559,8 +2594,10 @@ def _runtime_plan(plan: StitchOperationPlan, diffractometer, saturation=None) ->
         max_eager_bytes=None,
         streaming_multigeometry=True,
         stitch_gi=plan.gi,
-        # a native Stitch 2D is an Int 2D record: I(q) beside the map
+        # a native Stitch 2D is an Int 2D record: I(q) beside the map, each on its own axis
         stitch_profile=plan.native_records and plan.mode == "2d",
+        **({} if not (plan.native_records and plan.mode == "2d") else dict(
+            map_unit=plan.map_unit, map_radial_range=plan.map_radial_range)),
     )
 
 
@@ -2924,6 +2961,8 @@ class StitchOperationExecution:
                     progress_callback=science_progress,
                     gi=plan.gi,
                     map_grid=None if plan.mode == "1d" else _xu_map_grid(plan),
+                    **({} if plan.mode == "1d" else dict(map_unit=plan.map_unit,
+                                                        map_radial_range=plan.map_radial_range)),
                 )
                 self._frame_screen = screen.summary()
                 _record_frame_screen(records, screen.verdicts)

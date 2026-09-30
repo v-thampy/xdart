@@ -205,7 +205,7 @@ def test_a_non_square_stitch_2d_record_reads_back_as_int_2d(tmp_path, backend, g
 
     form = (_gi_form(tmp_path, backend, StitchGI(("q_ip", "q_oop"), incidence_motor="eta", tilt_motor="chi",
                                                  sample_motors=_SAMPLE)) if grazing
-            else _native_form(tmp_path, backend, scans="1", unit="2th_deg"))
+            else replace(_native_form(tmp_path, backend, scans="1", unit="2th_deg"), map_unit="2th_deg"))
     request = prepare_stitch_tool(replace(form, mode="2d", npt_1d=37, npt_rad_2d=23, npt_azim_2d=19)).request
     result = run_stitch_operation(request)
     assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal

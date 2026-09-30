@@ -194,6 +194,8 @@ def _streaming_multigeometry(
     gi_angles: Sequence[tuple[float, float]] | None = None,
     profile_npt: int | None = None,
     gi_map_npt: tuple[int, int] | None = None,
+    profile_unit: str | None = None,
+    profile_radial_range: tuple[float, float] | None = None,
 ):
     """Returns (pyFAI's merged result, each GI cut's [signal, normalization, count, axis] in the plan's
     order, or () without GI, and with ``profile_npt`` beside a 2-D map pyFAI's merged I(q) over every χ
@@ -201,7 +203,8 @@ def _streaming_multigeometry(
 
     The profile is integrated in the same pass as the map, from the same frame and integrator, whose
     geometry pyFAI computes once for both (one pass instead of two: the frames are read and the
-    integrators built once)."""
+    integrators built once). It takes the map's unit and radial range, or with ``profile_unit`` its own
+    unit and ``profile_radial_range`` (None: its frames' extent), as Int's 1-D and 2-D integrations do."""
     from pyFAI.multi_geometry import MultiGeometry
 
     if type(image_count) is not int or image_count < 1:
@@ -233,10 +236,18 @@ def _streaming_multigeometry(
                                    or len(gi_map_npt) != 2
                                    or any(type(points) is not int or points < 1 for points in gi_map_npt)):
         raise ValueError("a GI map goes beside a 2-D GI Stitch, with its q_ip and q_oop points")
-    # a 1-D Stitch's ranges: the same radial range, and every χ (scouted as a 1-D Stitch scouts it)
-    profile_azimuth = (fixed_azimuth if azimuth_range is None else _resolve_streaming_ranges(
-        integrator_factory, image_count, unit=unit, radial_range=fixed_radial, azimuth_range=None,
-    )[1]) if profile_npt is not None else None
+    # a 1-D Stitch's ranges: its radial range (the map's unless it has its own), and every χ (scouted
+    # as a 1-D Stitch scouts it); scouted with the map's when both are the frames' extent
+    profile_radial = profile_azimuth = None
+    if profile_npt is not None:
+        shared = profile_unit is None or (profile_unit, profile_radial_range) == (unit, radial_range)
+        profile_unit = unit if profile_unit is None else profile_unit
+        profile_radial = fixed_radial if shared else profile_radial_range
+        profile_azimuth = fixed_azimuth if azimuth_range is None else None
+        if profile_radial is None or profile_azimuth is None:
+            profile_radial, profile_azimuth = _resolve_streaming_ranges(
+                integrator_factory, image_count, unit=profile_unit, radial_range=profile_radial,
+                azimuth_range=profile_azimuth)
     gi_bins = {} if gi is None else _gi_bins(integrator_factory, gi_angles, gi)
     gi_totals = None
 
@@ -339,7 +350,7 @@ def _streaming_multigeometry(
             profile = None
             if profile_npt is not None:
                 profile = MultiGeometry(
-                    [integrator], unit=unit, radial_range=fixed_radial, azimuth_range=profile_azimuth,
+                    [integrator], unit=profile_unit, radial_range=profile_radial, azimuth_range=profile_azimuth,
                     threadpoolsize=0,
                 ).integrate1d(
                     [image],
@@ -785,12 +796,16 @@ def stitch_2d_with_1d_streaming(
     flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
     gi=None,
     gi_angles: Sequence[tuple[float, float]] | None = None,
+    unit_1d: str | None = None,
+    radial_range_1d: tuple[float, float] | None = None,
 ) -> tuple:
     """The 2-D map and I(q) beside it, as an Int 2D record holds them, from one pass over the frames:
     the map as :func:`stitch_2d_streaming` makes it, and I(q) over every χ in ``npt_1d`` bins as
-    :func:`stitch_1d_streaming` makes it from the same frames. With ``gi`` and every frame's
-    (incidence, tilt) in ``gi_angles``, also its cuts as :func:`stitch_1d_streaming` makes them and
-    the q_ip-q_oop map (``npt_rad`` × ``npt_azim`` over the cuts' ranges).
+    :func:`stitch_1d_streaming` makes it from the same frames, in the map's unit and radial range, or
+    with ``unit_1d`` in its own and ``radial_range_1d`` (None: its frames' extent), as Int's two
+    integrations. With ``gi`` and every frame's (incidence, tilt) in ``gi_angles``, also its cuts as
+    :func:`stitch_1d_streaming` makes them and the q_ip-q_oop map (``npt_rad`` × ``npt_azim`` over the
+    cuts' ranges).
 
     Returns (map, its diagnostics, I(q), its diagnostics, the GI cuts or (), the GI map or None)."""
 
@@ -818,10 +833,13 @@ def stitch_2d_with_1d_streaming(
         gi=gi,
         gi_angles=gi_angles,
         gi_map_npt=None if gi is None else (npt_rad, npt_azim),
+        profile_unit=unit_1d,
+        profile_radial_range=radial_range_1d,
     )
     cuts = tuple(gi_cut_result(totals, GI_UNITS[cut]) for cut, totals in zip(() if gi is None else gi.cuts, gi_totals))
     gi_map = None if gi is None else gi_map_result(gi_totals[-1])
-    return (*_stitch_2d_payload(result), *_stitch_1d_payload(profile, unit), cuts, gi_map)
+    return (*_stitch_2d_payload(result), *_stitch_1d_payload(profile, unit if unit_1d is None else unit_1d),
+            cuts, gi_map)
 
 
 @dataclass(frozen=True, slots=True)

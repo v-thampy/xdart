@@ -1579,10 +1579,12 @@ class StitchPage(QtWidgets.QWidget):
             directory = Path(value("project_root")) / directory
         map_mode = self._mode == "Stitch 2D"
         output = str(directory / ("stitch_stitch2d.nexus" if map_mode else "stitch_stitch1d.nexus"))
-        if map_mode:
+        if map_mode:  # the map on the 1-D axis and range
             native.update(mode="2d", npt_rad_2d=int(value("npt_rad_2d")), npt_azim_2d=int(value("npt_azim_2d")),
                           chi_range=None if value("chi_auto")  # Auto: the frames' own χ extent
-                          else (float(value("chi_min")), float(value("chi_max"))))
+                          else (float(value("chi_min")), float(value("chi_max"))),
+                          map_unit=native["unit"],
+                          map_radial_range=None if value("radial_auto") else (float(value("q_min")), float(value("q_max"))))
         return StitchToolForm(
             project_root=value("project_root"),
             spec_path=self._source_paths[0], scan=value("scan"),

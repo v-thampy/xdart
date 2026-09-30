@@ -191,6 +191,11 @@ class StitchPlan:
     #: streaming multigeometry 2-D only: I(q) over every χ in ``npt_1d`` bins beside the map, from the
     #: same frames in the same pass (a Stitch 2D record's pattern); the result's ``profile``.
     stitch_profile: bool = False
+    #: with ``stitch_profile``: the map's own radial unit and range (None: its frames' extent), I(q)
+    #: beside it keeping ``unit`` and ``radial_range``, as Int's 2-D and 1-D integrations; None
+    #: (``map_unit``): the map shares them.
+    map_unit: str | None = None
+    map_radial_range: tuple[float, float] | None = None
 
     def provenance(self) -> dict[str, Any]:
         """A JSON-safe record of this stitch for persistence (pass to
@@ -214,6 +219,10 @@ class StitchPlan:
             "radial_range": list(self.radial_range) if self.radial_range else None,
             "azimuth_range": (list(self.azimuth_range)
                               if self.azimuth_range else None),
+            # the map's own axis, only when it has one (older records share I(q)'s)
+            **({} if self.map_unit is None else {
+                "map_unit": self.map_unit,
+                "map_radial_range": None if self.map_radial_range is None else list(self.map_radial_range)}),
             "monitor_key": self.monitor_key,
             "streaming_multigeometry": self.streaming_multigeometry,
             "corrections": _ser(self.corrections),
@@ -258,6 +267,7 @@ class StitchPlan:
         gi = prov.get("gi")
         rr = prov.get("radial_range")
         ar = prov.get("azimuth_range")
+        mr = prov.get("map_radial_range")
         streaming_multigeometry = prov.get("streaming_multigeometry", False)
         if type(streaming_multigeometry) is not bool:
             raise TypeError(
@@ -275,6 +285,8 @@ class StitchPlan:
             npt_azim_2d=int(prov.get("npt_azim_2d", 720)),
             radial_range=tuple(rr) if rr else None,
             azimuth_range=tuple(ar) if ar else None,
+            map_unit=prov.get("map_unit"),
+            map_radial_range=tuple(mr) if mr else None,
             monitor_key=prov.get("monitor_key"),
             streaming_multigeometry=streaming_multigeometry,
             conditioning=(StitchConditioning(**prov["conditioning"])
@@ -627,6 +639,8 @@ def run_stitch(
     if plan.stitch_profile and (diffractometer is None or not plan.streaming_multigeometry
                                 or plan.mode != "2d" or plan.backend != "multigeometry"):
         raise ValueError("an I(q) profile needs the streaming 2-D Stitch with a Diffractometer")
+    if (plan.map_unit is not None or plan.map_radial_range is not None) and not plan.stitch_profile:
+        raise ValueError("a map's own radial axis goes beside I(q) (stitch_profile)")
     if diffractometer is not None:
         # GAP-A path: per-frame rotations from the calibrated Diffractometer.
         from xrd_tools.integrate.multi import (  # noqa: PLC0415
@@ -749,10 +763,11 @@ def run_stitch(
                 azimuth_range=plan.azimuth_range)
         elif plan.mode == "2d" and plan.streaming_multigeometry:
             gi_angles = _stitch_gi_angles(plan, src, labels)
+            own_map = plan.stitch_profile and plan.map_unit is not None  # else I(q) shares the map's axis
             arguments = dict(
                 npt_rad=plan.npt_rad_2d, npt_azim=plan.npt_azim_2d,
-                unit=plan.unit, method=plan.method,
-                radial_range=plan.radial_range,
+                unit=plan.map_unit if own_map else plan.unit, method=plan.method,
+                radial_range=plan.map_radial_range if own_map else plan.radial_range,
                 azimuth_range=plan.azimuth_range,
                 mask=plan.mask, normalization=normalization,
                 frame_screen=frame_screen, **corrections,
@@ -760,7 +775,9 @@ def run_stitch(
             if plan.stitch_profile:
                 payload, auxiliary, *profile, gi_cuts, gi_map = stitch_2d_with_1d_streaming(
                     _iter_images(), len(labels), integrator_series.__iter__, npt_1d=plan.npt_1d,
-                    gi=plan.stitch_gi, gi_angles=gi_angles, **arguments)
+                    gi=plan.stitch_gi, gi_angles=gi_angles,
+                    **(dict(unit_1d=plan.unit, radial_range_1d=plan.radial_range) if own_map else {}),
+                    **arguments)
                 profile = tuple(profile)
             else:
                 payload, auxiliary = stitch_2d_streaming(

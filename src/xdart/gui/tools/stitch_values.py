@@ -278,6 +278,10 @@ class StitchToolForm:
     npt_azim_2d: int = 360
     #: The map's χ range; None (Auto): the frames' own χ extent, as Int 2D's (the data, not −180 to 180).
     chi_range: tuple[float, float] | None = None
+    #: The map's radial axis, as Int 2D's own: Q or 2θ (Q with GI), over its range (None, Auto: the
+    #: frames' extent); ``unit`` and ``q_range`` are I(q)'s beside it.
+    map_unit: str = "q_A^-1"
+    map_radial_range: tuple[float, float] | None = None
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -411,6 +415,12 @@ class StitchToolForm:
                 raise ValueError("a 2-D map may hold at most 64 million points")
             if self.chi_range is not None:
                 object.__setattr__(self, "chi_range", _ordered_range(self.chi_range, "χ range"))
+            if self.map_unit not in {"q_A^-1", "2th_deg"}:
+                raise ValueError("Choose Q-χ or 2θ-χ for the map")
+            if self.gi is not None and self.map_unit != "q_A^-1":
+                raise ValueError("a grazing-incidence map is binned in Q")
+            if self.map_radial_range is not None:
+                object.__setattr__(self, "map_radial_range", _ordered_range(self.map_radial_range, "map range"))
         if not native and self.backend == "xu_hist" and (
             self.geometry_kind is not StitchGeometryKind.PYFAI_GONIOMETER_JSON
             or self.expected_geometry_sha256 is not None
@@ -512,7 +522,8 @@ class StitchToolForm:
                          + (() if self.gi is None else (self.gi.identity(),))
                          # a 1-D form keeps the identity it had
                          + (() if self.mode == "1d" else
-                            (("stitch-2d-v1", self.npt_rad_2d, self.npt_azim_2d, self.chi_range),)))
+                            (("stitch-2d-v2", self.npt_rad_2d, self.npt_azim_2d, self.chi_range,
+                              self.map_unit, self.map_radial_range),)))
         object.__setattr__(
             self,
             "fingerprint",

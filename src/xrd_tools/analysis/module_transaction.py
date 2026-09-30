@@ -746,7 +746,8 @@ def _validate_xu_stitch_v2_intent(
         or ("map" in plan) is not (plan.get("mode") == "2d")
         or (plan.get("mode") == "2d") is not (request.output.kind is AnalysisArtifactKind.STITCH_2D)
         or ("map" in plan and (not native or type(plan["map"]) is not dict
-                               or set(plan["map"]) != {"npt_rad_2d", "npt_azim_2d", "azimuth_range"}))
+                               or set(plan["map"]) != {"npt_rad_2d", "npt_azim_2d", "azimuth_range",
+                                                        "unit", "radial_range"}))
         or ("corrections" in plan and (type(plan["corrections"]) is not dict
                                        or set(plan["corrections"]) != {"polarization_factor", "dark", "flat"}))
         or plan.get("backend") != "xu_hist"

@@ -198,9 +198,10 @@ def prepare_native_stitch_tool(form, project):
                   monitor_selector=form.monitor_selector, max_frame_bytes=form.max_frame_bytes,
                   native_records=True, conditioning=form.conditioning, mask_path=form.mask_path,
                   frame_screen=FrameScreenPolicy(exclude=form.frame_screen), gi=gi)
-    if form.mode == "2d":  # the map as Int 2D's, and I(q) beside it (pyFAI MultiGeometry only: the form)
+    if form.mode == "2d":  # the map on its own axis as Int 2D's, and I(q) beside it on the 1-D one
         common.update(mode="2d", npt_rad_2d=form.npt_rad_2d, npt_azim_2d=form.npt_azim_2d,
-                      azimuth_range=form.chi_range)
+                      azimuth_range=form.chi_range, map_unit=form.map_unit,
+                      map_radial_range=form.map_radial_range)
     kind = AnalysisArtifactKind.STITCH_2D if form.mode == "2d" else AnalysisArtifactKind.STITCH_1D
     if form.backend == "multigeometry":
         geometry = capture_stitch_geometry(StitchGeometryInput(

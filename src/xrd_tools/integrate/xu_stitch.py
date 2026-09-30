@@ -812,6 +812,7 @@ def _checked_frame_histograms(
     flat: np.ndarray | None = None,
     gi_cuts: tuple | None = None,
     map_edges: tuple[np.ndarray, np.ndarray] | None = None,
+    map_unit: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Produce one frame's 1-D contributions and prove frame release.
 
@@ -824,11 +825,11 @@ def _checked_frame_histograms(
     the frame's q_ip-q_oop map (q_ip, q_oop) is one more triple after the cuts'.
     ``map_edges`` (radial, χ) also bins the frame's pixels over the (radial, χ)
     map from the same pixels and weights; its triple (radial, azimuthal) is the
-    sixth value, else None.
+    sixth value, else None. The map's radial coordinate is ``map_unit``'s (None: ``unit``'s).
     """
 
     raw_image = image = q = valid = weights = factor = solid = None
-    cut = other = inside = q_ip = q_oop = chi = None
+    cut = other = inside = q_ip = q_oop = chi = radial = magnitude = None
     gi_histograms = ()
     map_histograms = None
     lease: XuPowderQFrameLease | None = None
@@ -865,8 +866,14 @@ def _checked_frame_histograms(
                 "monitor normalization overflowed a finite signal",
             ) from error
         lease = provider.frame(nu=nu_value, del_=del_value)
-        q = _radial_coordinates(lease.q_magnitude(), unit, wavelength_A)
+        magnitude = lease.q_magnitude()
+        owned_refs.append(weakref.ref(magnitude))
+        q = _radial_coordinates(magnitude, unit, wavelength_A)
         owned_refs.append(weakref.ref(q))
+        if map_edges is not None and map_unit is not None and map_unit != unit:  # the map's own axis
+            radial = _radial_coordinates(magnitude, map_unit, wavelength_A)
+            owned_refs.append(weakref.ref(radial))
+        magnitude = None
         valid = np.logical_not(geometry.mask)
         owned_refs.append(weakref.ref(valid))
         if mask is not None:
@@ -927,12 +934,16 @@ def _checked_frame_histograms(
             chi = lease.chi()
             owned_refs.append(weakref.ref(chi))
             inside = np.logical_and(valid, np.isfinite(chi))
+            if radial is None:
+                radial = q
+            else:
+                np.logical_and(inside, np.isfinite(radial), out=inside)
             map_histograms = (
-                np.histogram2d(q[inside], chi[inside], map_edges, weights=image[inside])[0],
-                np.histogram2d(q[inside], chi[inside], map_edges, weights=weights[inside])[0],
-                np.histogram2d(q[inside], chi[inside], map_edges)[0],
+                np.histogram2d(radial[inside], chi[inside], map_edges, weights=image[inside])[0],
+                np.histogram2d(radial[inside], chi[inside], map_edges, weights=weights[inside])[0],
+                np.histogram2d(radial[inside], chi[inside], map_edges)[0],
             )
-            inside = chi = None
+            inside = chi = radial = None
         # Whole-frame monitor-normalised total: the dropped-frame statistic. Not
         # the in-range histogram, which legitimately shrinks at the range edges.
         d_total = float(image[valid].sum())
@@ -940,7 +951,7 @@ def _checked_frame_histograms(
         pending = error.with_traceback(None)
     finally:
         raw_image = image = q = valid = weights = factor = solid = None
-        cut = other = inside = q_ip = q_oop = chi = None
+        cut = other = inside = q_ip = q_oop = chi = radial = magnitude = None
         release_error: BaseException | None = None
         if lease is not None:
             try:
@@ -1136,6 +1147,8 @@ def run_xu_hist_stitch_1d(
     flat_min_fraction: float = 0.1,
     gi=None,
     map_grid: tuple[int, int, tuple[float, float]] | None = None,
+    map_unit: str | None = None,
+    map_radial_range: tuple[float, float] | None = None,
 ) -> XuStitchScienceResult:
     """Run native Q or 2theta histogram bins; omitted bounds scout all geometry.
 
@@ -1156,6 +1169,8 @@ def run_xu_hist_stitch_1d(
     (radial, χ) map over the radial range from the same pixels and weights as I(q),
     χ as pyFAI's (``XuPowderQFrameLease.chi``); the result carries it as ``map``. With
     ``gi`` too, the q_ip-q_oop map (the same points over the cuts' ranges) is ``gi_map``.
+    ``map_unit`` gives the map its own radial unit and ``map_radial_range`` its own range (None:
+    its frames' extent), as Int's 2-D integration beside its 1-D one; None shares I(q)'s.
     """
     from xrd_tools.integrate.stitch_gi import GI_UNITS, StitchGI
     if map_grid is not None and (
@@ -1168,6 +1183,14 @@ def run_xu_hist_stitch_1d(
         raise ValueError("a Stitch 2D map needs its radial and χ points, a finite increasing χ range")
     if gi is not None and (type(gi) is not StitchGI or unit != "q_A^-1"):
         raise TypeError("an XU GI cut needs an exact StitchGI beside I(q) in Q")
+    if map_unit is not None and (map_grid is None or map_unit not in {"q_A^-1", "2th_deg"}
+                                 or (gi is not None and map_unit != "q_A^-1")):
+        raise ValueError("a Stitch 2D map's own axis is Q or 2theta (Q with GI)")
+    if map_radial_range is not None and (
+            map_unit is None or type(map_radial_range) is not tuple or len(map_radial_range) != 2
+            or any(type(v) not in {int, float} or not math.isfinite(v) for v in map_radial_range)
+            or map_radial_range[0] >= map_radial_range[1]):
+        raise ValueError("a Stitch 2D map's radial range must be finite and increasing, with its unit")
     if type(receipt) is not XuStitchCalibrationReceipt:
         raise TypeError("XU Stitch science requires exact calibration receipt")
     if unit not in {"q_A^-1", "2th_deg"}:
@@ -1411,7 +1434,11 @@ def run_xu_hist_stitch_1d(
                                              "a Stitch 2D map takes the SURFACE asset's χ convention")
             chi_range = map_grid[2] if map_grid[2] is not None else _scout_chi_range(
                 provider, frame_inputs, cancel_token)  # Auto: the frames' own χ extent
-            map_edges = (np.linspace(*bounds, map_grid[0] + 1, dtype=np.float64),
+            # the map's own radial axis (Auto: its frames' extent), else I(q)'s
+            map_bounds = bounds if map_unit is None or (map_unit, map_radial_range) == (unit, radial_range) else (
+                map_radial_range if map_radial_range is not None else _scout_radial_range(
+                    provider, frame_inputs, map_unit, wavelength_A, cancel_token))
+            map_edges = (np.linspace(*map_bounds, map_grid[0] + 1, dtype=np.float64),
                          np.linspace(*chi_range, map_grid[1] + 1, dtype=np.float64))
         gi_cuts = [None] * len(frame_inputs)
         if gi is not None:
@@ -1452,6 +1479,7 @@ def run_xu_hist_stitch_1d(
                 flat=flat,
                 gi_cuts=gi_cuts[index],
                 map_edges=map_edges,
+                map_unit=map_unit,
             )
             release_count += 1
             if (
@@ -1498,7 +1526,8 @@ def run_xu_hist_stitch_1d(
         if map_grid is not None:
             radial_edges, chi_edges = map_edges
             map_result = _normalized_map((radial_edges[:-1] + radial_edges[1:]) * 0.5,
-                                         (chi_edges[:-1] + chi_edges[1:]) * 0.5, *map_totals, unit)
+                                         (chi_edges[:-1] + chi_edges[1:]) * 0.5, *map_totals,
+                                         unit if map_unit is None else map_unit)
         effective_projection = geometry.projection
     if runtime_owner.execution_record is None:
         raise XuStitchScienceRefused(

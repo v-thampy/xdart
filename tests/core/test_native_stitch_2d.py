@@ -23,9 +23,12 @@ from tests.core.test_stitch_operation import _prepared
 
 
 def _native(tmp_path, original, *, mode):
-    """``original``'s plan as a native Int record of ``mode`` ('1d' or '2d'), in its stable slot."""
+    """``original``'s plan as a native Int record of ``mode`` ('1d' or '2d'), in its stable slot; a map
+    on the old layout's axis (its own, as Int 2D's, is the plan's ``map_unit`` and ``map_radial_range``)."""
     plan = replace(original.plan, native_records=True, mode=mode,
-                   azimuth_range=original.plan.azimuth_range if mode == "2d" else None)
+                   azimuth_range=original.plan.azimuth_range if mode == "2d" else None,
+                   **(dict(map_unit=original.plan.unit, map_radial_range=original.plan.radial_range)
+                      if mode == "2d" else {}))
     kind = AnalysisArtifactKind.STITCH_2D if mode == "2d" else AnalysisArtifactKind.STITCH_1D
     family = f"native-{mode}"
     target = resolve_finite_output_target(tmp_path, family, operation_token=f"stitch-{mode}")
