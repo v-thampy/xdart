@@ -231,7 +231,10 @@ class ModuleSourceReceipt:
         kind: ModuleKind,
         selected_labels: tuple[int, ...] | None = None,
         resolved_selectors: tuple[MetadataColumnSelector, ...] = (),
+        fresh: bool = False,
     ) -> "ModuleSourceReceipt":
+        """``fresh``: the caller read ``table`` within this same preparation, so it is not read again
+        (PERF-STITCH-1); the operation re-verifies its sources when it runs."""
         if (
             type(table) is not MetadataTableResult
             or table.disposition is not AnalysisDisposition.COMPLETED
@@ -247,7 +250,9 @@ class ModuleSourceReceipt:
             for selector in resolved_selectors
         ):
             raise TypeError("resolved selectors must be an exact selector tuple")
-        current = run_metadata_table(MetadataTablePlan(table.receipt.source_spec))
+        if type(fresh) is not bool:
+            raise TypeError("fresh must be an exact bool")
+        current = table if fresh else run_metadata_table(MetadataTablePlan(table.receipt.source_spec))
         if (
             current.disposition is not AnalysisDisposition.COMPLETED
             or type(current.receipt) is not AnalysisSourceReceipt

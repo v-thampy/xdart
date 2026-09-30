@@ -1,6 +1,7 @@
 """Finite native Stitch mask and raw-preview facts; no detector image decoding."""
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -381,7 +382,9 @@ def label_saturation(request):
             if value is not None}
 
 
-def native_provenance(value, source, output, plan, manifest):
+def native_provenance(value, source, output, plan, manifest, *, preparation=None):
+    """``preparation``: the calling preparation's admitted facts: its metadata tables (reused, not read
+    again) and, filled here, the contributing frames' display facts from this one layout read."""
     from xrd_tools.io.analysis_stitch_auxiliary import (
         analysis_contributing_frame_binding, analysis_contributing_frame_members,
     )
@@ -404,14 +407,18 @@ def native_provenance(value, source, output, plan, manifest):
     if plan.gi is not None:  # how the GI cuts were made, as the record's reader sees it
         value["plan"]["gi"] = plan.gi.to_provenance()
     value["wavelength_A"] = wavelength
-    value["source_energy_checks"] = source_energy_checks(source, wavelength, recorded_energy_eV(plan))
+    value["source_energy_checks"] = source_energy_checks(
+        source, wavelength, recorded_energy_eV(plan),
+        tables=None if preparation is None else preparation.get("tables"))
     seeds, ceilings = _frame_facts(source, manifest, plan)
     saturation = member_saturation(ceilings)
     if plan.conditioning is not None and plan.conditioning.mode == "auto" and saturation is not None:
         # each member's resolved automatic ceiling (decision 39), recorded with the policy it serves
         value["plan"]["conditioning"] = replace(plan.conditioning, saturation=saturation).to_dict()
-    value["frame_members"] = analysis_contributing_frame_binding(analysis_contributing_frame_members(
-        seeds, source_base=manifest.project_root))
+    members = analysis_contributing_frame_members(seeds, source_base=manifest.project_root)
+    if preparation is not None:
+        preparation["members"] = members
+    value["frame_members"] = analysis_contributing_frame_binding(members)
     value["output"]["artifact_family"] = output.artifact_family
     return value
 
@@ -435,7 +442,9 @@ def recorded_energy_eV(plan):
     return None if value is None else float(value)
 
 
-def source_energy_checks(source, wavelength_A, recorded_eV=None):
+def source_energy_checks(source, wavelength_A, recorded_eV=None, *, tables=None):
+    """``tables``: the members' metadata tables a preparation already admitted (in member order);
+    absent, each is read."""
     from xrd_tools.analysis.module_transaction import MetadataColumnSelector
     from xrd_tools.analysis.stitch_operation import _fresh_table, _source_members, _manifest_numeric_lookup
     from xrd_tools.core.energy import wavelength_m_to_energy_eV
@@ -443,8 +452,9 @@ def source_energy_checks(source, wavelength_A, recorded_eV=None):
     from xrd_tools.sources.descriptor import describe_container
     expected = wavelength_m_to_energy_eV(wavelength_A * 1e-10) if recorded_eV is None else float(recorded_eV)
     checks = []
-    for member in _source_members(source):
-        table = _fresh_table(member)
+    members = _source_members(source)
+    for index, member in enumerate(members):
+        table = _fresh_table(member) if tables is None else tables[index]
         names = [column.name for column in table.columns]
         energies = []
         if names.count("energy") > 1:
@@ -482,7 +492,10 @@ def _validated_native_members(request, seeds):
 
 
 def native_frame_members(request):
-    """Detach display facts on the worker after checking the frozen Preview binding."""
+    """Detach display facts on the worker after checking the frozen Preview binding. A prepared request
+    keeps the ones its preparation bound, from the same layout read (PERF-STITCH-1)."""
+    if request._preview_members is not None:
+        return copy.deepcopy(list(request._preview_members))  # detached, as a fresh read returns them
     return _validated_native_members(request, frame_seeds(request.module.source, request.manifest, request.plan))
 
 

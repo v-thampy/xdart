@@ -52,6 +52,7 @@ from xrd_tools.analysis.scan_operations import (
     AnalysisDisposition,
     AnalysisSourceLeaseRefused,
     MetadataTablePlan,
+    MetadataTableResult,
     requalified_analysis_source,
     run_metadata_table,
 )
@@ -119,6 +120,10 @@ _MAX_AXIS_POINTS = 1_000_000
 _MAX_2D_POINTS = 64_000_000
 _GEOMETRY_FACTORY = object()
 _REQUEST_FACTORY = object()
+#: prepare_stitch_operation's own claim: it derived the manifest and provenance from the same receipt and
+#: admitted tables just before, so the request does not derive them again (PERF-STITCH-1). Any other
+#: construction re-derives them.
+_PREPARED_REQUEST_FACTORY = object()
 #: Where the sample sits relative to a stacked arm's calibrated sample offset.
 SAMPLE_POSITIONS = ("calibrated", "rotation_axis")
 #: pyFAI error models a MultiGeometry Stitch may request (None = no sigma).
@@ -1860,6 +1865,8 @@ def _provenance(
     plan: StitchOperationPlan,
     manifest: StitchInputManifestReceipt,
     geometry_relative_path: str,
+    *,
+    preparation: dict | None = None,
 ) -> dict[str, object]:
     geometry = plan.geometry
     geometry_request = geometry.request
@@ -1941,7 +1948,7 @@ def _provenance(
             "gi-corrections",
         ],
     }
-    return native_provenance(value, source, output, plan, manifest)
+    return native_provenance(value, source, output, plan, manifest, preparation=preparation)
 
 
 def _xu_provenance(
@@ -1951,6 +1958,8 @@ def _xu_provenance(
     manifest: StitchInputManifestReceipt,
     observations: XuStitchScienceObservations,
     energy_selector: MetadataColumnSelector | None,
+    *,
+    preparation: dict | None = None,
 ) -> dict[str, object]:
     receipt = plan.calibration
     asset = receipt.projection.value
@@ -2063,7 +2072,7 @@ def _xu_provenance(
             "unvalidated-platforms-and-live-gates",
         ],
     }
-    return native_provenance(value, source, output, plan, manifest)
+    return native_provenance(value, source, output, plan, manifest, preparation=preparation)
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -2073,10 +2082,13 @@ class StitchOperationRequest:
     manifest: StitchInputManifestReceipt
     provenance_json: str
     _claim: InitVar[object] = None
+    #: The contributing frames' display facts its preparation bound, from the same layout read
+    #: (``stitch_native.native_frame_members`` returns them); None: read them again.
+    _preview_members: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self, _claim: object) -> None:
         if (
-            _claim is not _REQUEST_FACTORY
+            _claim not in (_REQUEST_FACTORY, _PREPARED_REQUEST_FACTORY)
             or type(self.module) is not ModuleOperationRequest
             or self.module.kind is not ModuleKind.STITCH
             or type(self.plan) not in {StitchOperationPlan, XuStitchOperationPlan}
@@ -2089,6 +2101,9 @@ class StitchOperationRequest:
             != self.module.source.selected_labels
         ):
             raise TypeError("stitch operation request is invalid")
+        if _claim is _PREPARED_REQUEST_FACTORY:
+            self._prepared_checks()
+            return
         table = _fresh_table(self.module.source)
         table_names = _table_names(table)
         required = _required_stitch_selectors(self.plan, table_names)
@@ -2149,6 +2164,24 @@ class StitchOperationRequest:
         if provenance != expected:
             raise ValueError("stitch provenance is not the exact request projection")
 
+    def _prepared_checks(self) -> None:
+        """What a prepared request still checks without reading its sources again."""
+        try:
+            provenance = json.loads(self.provenance_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise TypeError("stitch operation provenance is invalid") from error
+        if (
+            type(provenance) is not dict
+            or module_provenance_digest(ModuleKind.STITCH, provenance)
+            != self.module.provenance_digest
+        ):
+            raise ValueError("stitch provenance does not match module request")
+        if type(self.plan) is XuStitchOperationPlan and (
+            self.module._xu_stitch_v2_bound is not True
+            or self.plan.calibration.project_root != self.manifest.project_root
+        ):
+            raise ValueError("XU Stitch request lacks exact Project authority")
+
     @property
     def provenance(self) -> dict[str, object]:
         return json.loads(self.provenance_json)
@@ -2158,6 +2191,26 @@ class StitchOperationRequest:
 
     def __deepcopy__(self, _memo):
         raise TypeError("stitch operation request is not copyable")
+
+
+def _admitted_tables(source: ModuleSourceReceipt, tables):
+    """The metadata tables this preparation already read for ``source``, without reading them again: each
+    must be the exact table its receipt was made from (PERF-STITCH-1). Operations re-verify their sources
+    when they run."""
+    members = _source_members(source)
+    values = tables if type(tables) is tuple else (tables,)
+    if len(values) != len(members) or any(
+        type(table) is not MetadataTableResult
+        or table.disposition is not AnalysisDisposition.COMPLETED
+        or table.receipt != member.analysis
+        or table.table_fingerprint != member.table_fingerprint
+        or table.labels != member.analysis.labels
+        for member, table in zip(members, values)
+    ):
+        raise StitchOperationRefused(
+            "SOURCE_IDENTITY_MISMATCH", "admitted metadata differs from the source receipt"
+        )
+    return values if type(source) is ModuleSourceGroupReceipt else values[0]
 
 
 def _fresh_table(source: ModuleSourceReceipt):
@@ -2182,8 +2235,13 @@ def prepare_stitch_operation(
     plan: StitchOperationPlan | XuStitchOperationPlan,
     *,
     project_root: str | Path,
+    tables=None,
 ) -> StitchOperationRequest:
-    """Bind exact source, geometry, plan, provenance, and output intent."""
+    """Bind exact source, geometry, plan, provenance, and output intent.
+
+    ``tables`` are the metadata tables the caller just read and made ``source`` from (one per member):
+    reused, not read again (PERF-STITCH-1); absent, they are read here.
+    """
 
     if (
         type(source) not in {ModuleSourceReceipt, ModuleSourceGroupReceipt}
@@ -2211,7 +2269,9 @@ def prepare_stitch_operation(
         raise StitchOperationRefused(
             "OUTPUT_KIND_MISMATCH", "Stitch mode and output artifact kind differ"
         )
-    table = _fresh_table(source)
+    table = _fresh_table(source) if tables is None else _admitted_tables(source, tables)
+    # this preparation's admitted facts (its tables, then its frame facts), never kept past it
+    preparation = {"tables": table if type(table) is tuple else (table,)}
     names = _table_names(table)
     required = _required_stitch_selectors(plan, names)
     tables = table if type(table) is tuple else (table,)
@@ -2256,6 +2316,7 @@ def prepare_stitch_operation(
             plan,
             manifest,
             geometry_relative,
+            preparation=preparation,
         )
         module = ModuleOperationRequest(
             source,
@@ -2302,6 +2363,7 @@ def prepare_stitch_operation(
             manifest,
             observations,
             energy_selector,
+            preparation=preparation,
         )
         # a native plan's request is the native one, below
         module = None if plan.native_records else xu_stitch_module_request(
@@ -2314,13 +2376,16 @@ def prepare_stitch_operation(
         native_mask(plan)  # Admit mask orientation/shape before any detector read.
         module = _native_stitch_module_request(source, output, plan, manifest, provenance)
     canonical = module_artifact_request(module, provenance).provenance_json
-    return StitchOperationRequest(
+    request = StitchOperationRequest(
         module,
         plan,
         manifest,
         canonical,
-        _REQUEST_FACTORY,
+        _PREPARED_REQUEST_FACTORY,
     )
+    if "members" in preparation:
+        object.__setattr__(request, "_preview_members", tuple(preparation["members"]))
+    return request
 
 
 class _SelectedStitchSource(BaseFrameSource):

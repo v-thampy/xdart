@@ -260,7 +260,8 @@ def prepare_native_stitch_tool(form, project):
                         f"{spec.uri} (entry {spec.entry or '-'}, scan {spec.options.get('scan', '-')}): "
                         f"missing required column(s): {', '.join(missing)}")
                 cached[cache_key] = ModuleSourceReceipt.from_metadata_table(table,
-                    kind=ModuleKind.STITCH, selected_labels=selected, resolved_selectors=selectors)
+                    kind=ModuleKind.STITCH, selected_labels=selected, resolved_selectors=selectors,
+                    fresh=True)  # read just above, in this check
             receipt = cached[cache_key]
             receipts.append(receipt)
         target = resolve_finite_output_target(output_dir, family, operation_token=f"stitch-{form.mode}")
@@ -268,7 +269,10 @@ def prepare_native_stitch_tool(form, project):
         try:
             source = receipts[0] if len(receipts) == 1 else ModuleSourceGroupReceipt.from_members(
                 tuple(receipts), kind=ModuleKind.STITCH)
-            request = prepare_stitch_operation(source, output, plan, project_root=project)
+            # the tables this check admitted, reused rather than read again (PERF-STITCH-1)
+            admitted = tuple(tables[(str(spec.uri), spec.entry, str(spec.options))][1] for spec in group)
+            request = prepare_stitch_operation(source, output, plan, project_root=project,
+                                               tables=admitted if len(admitted) > 1 else admitted[0])
             from xrd_tools.analysis.stitch_native import native_frame_members
             members = tuple(native_frame_members(request))
             if gi is not None:  # every frame's sample normal suits the pyFAI sample orientation
