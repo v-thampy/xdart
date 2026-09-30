@@ -1590,17 +1590,34 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         def go():
             if self.fit is None:
                 raise ValueError('fit the current controls before saving')
-            selected = self._save_path()
+            selected = self._save_path(beam=False)
             if selected is not None:
                 self._saving = self.fit
                 self._start('save', (self.fit, selected, pair_validation_angles(
                     self.fit, scan_angles=self._scan_angles(self.fit), domain=self._typed_domain())))
         self._guard(go)
 
-    def _save_path(self):
+    def _default_name(self, beam):
+        """The calibration's default file name, as Stitch names its results (maintainer, 2026-09-29:
+        "spec_name_scan_no.json"): the calibrant scan's (the direct-beam scan's for a direct-beam
+        geometry) SPEC file and scan, or its NeXus file; the first free name, since a saved calibration
+        is never overwritten."""
+        prefix = 'beam_' if beam else ''
+        source = Path(self._text(prefix + 'source') or 'calibration')
+        scan = re.match(r'\d+', self._text(prefix + 'scan') or '')
+        stem = (f'{source.stem}_scan{scan[0]}' if scan and not (beam and self.beam_source_kind.currentData() == 'nexus')
+                else source.stem)
+        folder = self.project_root / 'calibration'
+        for count in range(1, 1000):
+            name = folder / (f'{stem}.json' if count == 1 else f'{stem}_{count}.json')
+            if not name.exists() and not xu_partner_path(name).exists():
+                return name
+        return folder / f'{stem}-{uuid.uuid4().hex[:8]}.json'
+
+    def _save_path(self, *, beam=False):
         """The new calibration file the person chooses inside the project, or None."""
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Save calibrated geometry',
-            str(self.project_root / 'calibration' / f'multigeometry-{uuid.uuid4().hex[:8]}.json'), 'JSON (*.json)')
+            str(self._default_name(beam)), 'JSON (*.json)')
         if not path:
             return None
         selected = Path(path).resolve()
@@ -1614,7 +1631,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         """Save step 1's geometry as the calibration pair, without a ring fit."""
         def go():
             fit = self._rough_fit()
-            selected = self._save_path()
+            selected = self._save_path(beam=self.rough_mode.currentData() == 'scan')
             if selected is not None:
                 angles = self._scan_angles(fit)
                 if self.rough_mode.currentData() == 'scan' and self._distance_result is not None:
@@ -1944,8 +1961,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     self._render_frames()
                 elif kind in ('fit', 'refine'):
                     summary = fit_summary_text(result)  # before adopting: a failure leaves no fit
-                    self.fit = result
-                    self.refine_seed.setCurrentIndex(self.refine_seed.findData('fit'))  # it starts from this
+                    self.fit = result  # Start from keeps the person's choice (maintainer, 2026-09-29)
                     self._fit_instrument = result.asset['provenance'].get('instrument_geometry')
                     self.fit_summary.setPlainText(summary)
                     self.save_button.setEnabled(True)

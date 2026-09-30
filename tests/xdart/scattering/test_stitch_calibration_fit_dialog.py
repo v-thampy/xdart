@@ -397,7 +397,7 @@ def test_automatic_refinement_from_the_pages_geometry_saves_and_is_adopted(qapp,
         dialog.refine_button.click()  # no calibrant confirmation: the calibrant chosen says what it is
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
-        assert dialog.refine_seed.currentData() == 'fit'  # a further refinement starts from this one
+        assert dialog.refine_seed.currentData() == 'file'  # the person's choice stays (maintainer, 2026-09-29)
         automatic = dialog.fit.asset['provenance']['automatic_refinement']
         assert automatic['calibrant'] == 'LaB6' and automatic['validation']['chosen'] == 'stacked_extended'
         # as the guided fit, it records which motor drives which circle (Codex round 11 residual)
@@ -602,6 +602,9 @@ def test_automatic_refinement_can_start_from_the_direct_beam_geometry(qapp, tmp_
         automatic = dialog.fit.asset['provenance']['automatic_refinement']
         assert automatic['validation']['chosen'] == 'stacked_extended'
         assert automatic['validation']['coverage'] == {'nu_rows_available': 4, 'nu_rows_selected': 4}
+        # maintainer, 2026-09-29: "every time i would go to the fit window, the previous setting (choose
+        # rough geometry for example) would be lost"
+        assert dialog.refine_seed.currentData() == 'rough'
         refined = dict(zip(dialog.fit.asset['calibration']['param_names'], dialog.fit.asset['calibration']['param']))
         assert refined['dist'] == pytest.approx(_calibration().poni.dist, abs=1e-3)
         assert refined['nu_offset'] == pytest.approx(TRUTH['nu_offset'], abs=2e-3)
@@ -743,3 +746,27 @@ def test_a_twoc_arm_refines_the_energy_and_saves_its_xrayutilities_partner(qapp,
     finally:
         dialog.close()
         page.shutdown()
+
+
+def test_a_saved_calibration_is_named_after_its_scan_and_never_over_another(qapp, tmp_path, monkeypatch):
+    """Maintainer, 2026-09-29: "the default json/poni file names … should be named like the nexus files …
+    (spec_name_scan_no.json/poni)": the calibrant scan's SPEC file and scan (the direct-beam scan's for a
+    direct-beam geometry), the first free name, since a saved calibration is never overwritten."""
+    dialog = StitchCalibrationDialog(tmp_path)
+    try:
+        for key, value in (('source', tmp_path / 'LaB6_17keV'), ('scan', '14'),
+                           ('beam_source', tmp_path / 'direct_beam'), ('beam_scan', '3.1')):
+            dialog._set_field_text(key, str(value))
+        folder = tmp_path / 'calibration'
+        assert dialog._default_name(False) == folder / 'LaB6_17keV_scan14.json'
+        assert dialog._default_name(True) == folder / 'direct_beam_scan3.json'
+        folder.mkdir()
+        (folder / 'LaB6_17keV_scan14.json').write_text('{}')
+        (folder / 'LaB6_17keV_scan14_2.xu.json').write_text('{}')  # its partner taken: that name too
+        assert dialog._default_name(False) == folder / 'LaB6_17keV_scan14_3.json'
+        proposed = []
+        monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName',
+                            staticmethod(lambda _parent, _title, start, _filter: proposed.append(start) or ('', '')))
+        assert dialog._save_path() is None and proposed == [str(folder / 'LaB6_17keV_scan14_3.json')]
+    finally:
+        dialog.close()
