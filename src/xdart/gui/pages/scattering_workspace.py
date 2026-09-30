@@ -58,6 +58,7 @@ class _WorkspaceMenus:
             _tool_button_menu(self.widget, "configMenuButton"),
             _tool_button_menu(self.widget, "helpMenuButton"),
             tool_requested=self.widget.toolRequested,
+            mode_requested=self.widget.modeRequested,
         )
 
 

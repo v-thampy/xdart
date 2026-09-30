@@ -440,9 +440,14 @@ def test_the_mode_box_lists_int_modes_and_leaves_for_them(qapp):
         combo = page.run_bar.modeCombo
         assert tuple(combo.itemText(row) for row in range(combo.count())) == RUN_MODE_CHOICES
         assert combo.currentText() == "Stitch 1D"
-        assert not combo.model().item(combo.findText("Stitch 2D")).isEnabled()  # as on Int
+        # Stitch 2D stays on this page, with Int 2D's rows for the map (STITCH-2D-20260930)
+        assert combo.model().item(combo.findText("Stitch 2D")).isEnabled()
+        combo.setCurrentText("Stitch 2D")
+        assert page._mode == "Stitch 2D" and not page._map_card.isHidden() and modes == []
         combo.setCurrentText("Int 2D")  # the integration workspace, in that mode; the box stays
-        assert modes == [(str(SCATTERING_PAGE_KEY), "Int 2D")] and combo.currentText() == "Stitch 1D"
+        assert modes == [(str(SCATTERING_PAGE_KEY), "Int 2D")] and combo.currentText() == "Stitch 2D"
+        combo.setCurrentText("Stitch 1D")
+        assert page._mode == "Stitch 1D" and page._map_card.isHidden()
         combo.setCurrentText("RSM")
         assert requested == [str(RSM_TOOL_KEY)] and combo.currentText() == "Stitch 1D"
     finally:

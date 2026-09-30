@@ -38,7 +38,7 @@ from xdart.gui.widgets.controls_panel import (
 )
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xdart.gui.widgets.scientific_plot import scaled_intensity_label
-from xdart.gui.tabs.scattering.shell_values import ScientificPlotOptions
+from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
@@ -216,6 +216,16 @@ def _progress_text(stage, completed, total):
         return f"Stitching · frame {max(0, min(completed - 1, total - 4))} of {total - 4}"
     return f"{_STAGE_TEXT.get(stage, stage)}…"
 
+#: The run bar's modes this page runs.
+_STITCH_MODES = ("Stitch 1D", "Stitch 2D")
+
+
+def _kind_name(payload):
+    """A saved result's mode, as the run bar names it."""
+    return ("Stitch 2D" if payload is not None and payload.kind is AnalysisArtifactKind.STITCH_2D
+            else "Stitch 1D")
+
+
 class StitchPage(QtWidgets.QWidget):
     """One retained page; one worker owns preview, science and strict reopen."""
 
@@ -273,12 +283,16 @@ class StitchPage(QtWidgets.QWidget):
         self._started = None
         self._closing = False
         self._payloads = {}
-        self._plot_options = ScientificPlotOptions()
         self._diagnostic = "Intensity"
         #: One display key per result, created once: the view compares keys by identity.
         self._result_keys = {}
-        self._plot_mode, self._plot_axis = "Single", "Q"
-        self._color_map, self._log_scale = "Default", False
+        #: The view's settings as Int keeps them: plot mode and axis, plot options, color map and log
+        #: scale, and for a map its image axis, slice and pins.
+        self._view = ScientificPreferences()
+        #: The last map projection shown (a pin takes its slice); None while a pattern shows.
+        self._last_map_state = None
+        #: What a Run stitches: 'Stitch 1D' or 'Stitch 2D' (the run bar's modes).
+        self._mode = "Stitch 1D"
         self._build_ui()
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(50)
@@ -352,9 +366,10 @@ class StitchPage(QtWidgets.QWidget):
         # Int's scientific display, fed Stitch results: one pane for both pages, not a copy.
         from xdart.gui.tabs.scattering.scientific_view import ScientificView
         self.scientific = ScientificView()
-        # Stitch results are integrated 1-D curves (Int 1D's layout: Q or 2θ); Stitch has no
-        # normalization channel, 1-D Background or raw popup on this pane.
-        self.scientific.set_hidden_tools("norm", "background", "raw")
+        # A Stitch 1D shows in Int 1D's layout (Q or 2θ), a Stitch 2D in Int 2D's without the raw
+        # detector pane (the map has no one detector image; the contributing frames open in the raw
+        # popup). Stitch has no normalization channel, 1-D Background or raw popup on this pane.
+        self.scientific.set_hidden_tools("norm", "background", "raw", "raw_pane")
         self.scientific.set_plot_modes("Single", "Overlay")
         self.scientific.commandRequested.connect(self._view_command)
         self.curve = self.scientific.curve
@@ -405,16 +420,35 @@ class StitchPage(QtWidgets.QWidget):
             "Replace: stitch every output again; each file is replaced once its new stitch is written")
 
     def _mode_chosen(self, mode):
-        """Leave for the chosen mode's page (the host refuses while Stitch runs)."""
-        if mode == "Stitch 1D":
+        """Stitch 1D or 2D here; another mode leaves for its page (the host refuses while Stitch runs)."""
+        if mode in _STITCH_MODES and self.select_mode(mode):
             return
         blocker = QtCore.QSignalBlocker(self.run_bar.modeCombo)
-        self.run_bar.modeCombo.setCurrentText("Stitch 1D")
+        self.run_bar.modeCombo.setCurrentText(self._mode)
         del blocker
+        if mode in _STITCH_MODES:
+            self._status("Stitch is busy · change the mode once it is done", ready=False)
+            return
         if mode == "RSM":
             self.toolRequested.emit(str(RSM_TOOL_KEY))
         else:  # the integration page, in the mode chosen here
             self.modeRequested.emit(str(SCATTERING_PAGE_KEY), str(mode))
+
+    def select_mode(self, mode):
+        """Stitch 1D or Stitch 2D (maintainer, 2026-09-29: a Stitch 2D shows as Int 2D does, without
+        the raw pane): what a Run stitches, with Int 2D's rows for a map. Refused while Stitch is busy;
+        returns whether the page took the mode."""
+        if mode not in _STITCH_MODES or (mode != self._mode and self.active()):
+            return False
+        blocker = QtCore.QSignalBlocker(self.run_bar.modeCombo)
+        self.run_bar.modeCombo.setCurrentText(mode)
+        del blocker
+        if mode != self._mode:
+            self._mode = mode
+            self._map_card.setVisible(mode == "Stitch 2D")
+            self.advanced.setWindowTitle(f"Advanced — {mode}")
+            self._edited()  # a prepared plan is another mode's; readiness checks this one
+        return True
 
     def _field(self, card, section, key, label, value="", *, choices=(), browse=False):
         kind = (ControlFieldKind.COMBO if choices else ControlFieldKind.BOOL if isinstance(value, bool)
@@ -530,6 +564,25 @@ class StitchPage(QtWidgets.QWidget):
         self._gi_rows[0].setToolTip("Bins I(Qip) (Auto: the data's span) and is I(Qoop)'s window (Auto: every pixel).")
         self._gi_rows[1].setToolTip("Bins I(Qoop) (Auto: the data's span) and is I(Qip)'s window (Auto: every pixel).")
         self._render_gi()
+        # Stitch 2D: Int 2D's rows for the map, its points and χ range; the Axis and the radial range
+        # above are the map's too, and I(q) beside it takes Pts
+        self._map_card = SubsectionCard("2-D", accent="processing")
+        processing.add_row(self._map_card)
+        points_label = QtWidgets.QLabel("Pts")
+        points_label.setObjectName("controlsHeaderLabel")
+        self._map_card.add_header_widget(points_label)
+        for key, value, tip in (("npt_rad_2d", "1000", "The map's radial points"),
+                                ("npt_azim_2d", "360", "The map's χ points")):
+            row = self._field(None, SectionId.PROCESSING, key, "Pts", value)
+            row.label.hide()
+            row.setMaximumWidth(72)
+            row.setToolTip(tip)
+            self._map_card.add_header_widget(row)
+        self.chi_range = self._range(self._map_card, "χ (°)", ("chi_min", "chi_max", "chi_auto"),
+                                     (-180., 180., True))
+        self.chi_range.setToolTip("The map's χ range (Auto: every χ). I(q) beside it takes every χ, as a "
+                                  "Stitch 1D.")
+        self._map_card.setVisible(False)
         conditioning = SubsectionCard("Conditioning", accent="processing")
         processing.add_row(conditioning)
         self.threshold_range = self._range(conditioning, "Threshold", ("threshold_min", "threshold", "threshold_enabled"), (0., None, True),
@@ -822,7 +875,7 @@ class StitchPage(QtWidgets.QWidget):
     def _render_ranges(self):
         values = {field.path: field for key, field in self._fields.items() if key in self._range_keys}
         for low, high, toggle in (("q_min", "q_max", "radial_auto"), ("gi_ip_min", "gi_ip_max", "gi_ip_auto"),
-                                  ("gi_oop_min", "gi_oop_max", "gi_oop_auto")):
+                                  ("gi_oop_min", "gi_oop_max", "gi_oop_auto"), ("chi_min", "chi_max", "chi_auto")):
             auto = bool(self._fields[toggle].value)
             for key in (low, high):
                 values[("Stitch", key)] = replace(self._fields[key], enabled=not auto,
@@ -1047,11 +1100,17 @@ class StitchPage(QtWidgets.QWidget):
             text = f"{len(sources)} {'NeXus file' if kind == 'NeXus' else f'{kind} source'}{'s' * (len(sources) != 1)}"
         source_ready = present and groups != 0
         self.controls.source_card.set_status_text(text if sources else "")
+        map_mode = self._mode == "Stitch 2D"
         try:
-            processing_ready = int(str(value("npt_1d"))) > 0
+            processing_ready = all(int(str(value(key))) > 0 for key in (
+                ("npt_1d", "npt_rad_2d", "npt_azim_2d") if map_mode else ("npt_1d",)))
         except ValueError:
             processing_ready = False
-        self.controls.processing_card.set_status_text("stitch 1d · " + ("xrayutilities" if xu else "multigeometry"))
+        # a map is pyFAI MultiGeometry's, without grazing cuts (items 2 and 3 of the deferred list)
+        map_problem = (None if not map_mode else "the pyFAI MultiGeometry backend" if xu
+                       else "Grazing off (a map has no grazing cuts yet)" if self._gi["enabled"] else None)
+        self.controls.processing_card.set_status_text(
+            f"{self._mode.lower()} · " + ("xrayutilities" if xu else "multigeometry"))
         # What each input still needs, in a few words, as Int's "Needs …" (maintainer, 2026-09-30:
         # "slightly more descriptive (but brief) messages")
         needs = {}
@@ -1068,6 +1127,8 @@ class StitchPage(QtWidgets.QWidget):
                                else "a scan selection such as 1,2,[3-5]")
         if not processing_ready:
             needs["processing"] = "Pts above 0"
+        elif map_problem:
+            needs["processing"] = map_problem
         checks = ((self.controls.project_card, "project"), (self.controls.experiment_card, "experiment"),
                   (self.controls.source_card, "source"), (self.controls.processing_card, "processing"))
         for card, key in checks:
@@ -1080,7 +1141,7 @@ class StitchPage(QtWidgets.QWidget):
         elif needs:
             self._readiness = ("Needs " + ", ".join(needs.values()), False)
         else:
-            self._readiness = (f"Ready · Stitch 1D · {self._ready_text(kind, sources, scans, groups)}", True)
+            self._readiness = (f"Ready · {self._mode} · {self._ready_text(kind, sources, scans, groups)}", True)
 
     def _ready_text(self, kind, sources, scans, groups):
         """What a Run stitches, briefly: the SPEC file and scans (or the folder and its options, or the
@@ -1398,7 +1459,12 @@ class StitchPage(QtWidgets.QWidget):
         directory = Path(output)
         if not directory.is_absolute():
             directory = Path(value("project_root")) / directory
-        output = str(directory / "stitch_stitch1d.nexus")
+        map_mode = self._mode == "Stitch 2D"
+        output = str(directory / ("stitch_stitch2d.nexus" if map_mode else "stitch_stitch1d.nexus"))
+        if map_mode:
+            native.update(mode="2d", npt_rad_2d=int(value("npt_rad_2d")), npt_azim_2d=int(value("npt_azim_2d")),
+                          chi_range=(-180.0, 180.0) if value("chi_auto")
+                          else (float(value("chi_min")), float(value("chi_max"))))
         return StitchToolForm(
             project_root=value("project_root"),
             spec_path=self._source_paths[0], scan=value("scan"),
@@ -1451,6 +1517,11 @@ class StitchPage(QtWidgets.QWidget):
             flat_cutoff=f"{100 * form.flat_min_fraction:g}")
         if form.q_range is not None:
             fields.update(q_min=form.q_range[0], q_max=form.q_range[1])
+        if form.mode == "2d":
+            fields.update(npt_rad_2d=form.npt_rad_2d, npt_azim_2d=form.npt_azim_2d,
+                          chi_auto=form.chi_range == (-180.0, 180.0),
+                          chi_min=form.chi_range[0], chi_max=form.chi_range[1])
+        self.select_mode("Stitch 2D" if form.mode == "2d" else "Stitch 1D")
         for key, value in fields.items():
             self.set_field(key, value)
         # the form's own mapping and references, as saved: an earlier field change may have
@@ -1560,7 +1631,7 @@ class StitchPage(QtWidgets.QWidget):
             return
         index = self._queued_jobs.pop(0)
         position = self._job_total - len(self._queued_jobs)
-        if not self._start(f"Running · Stitch 1D · {position}/{self._job_total}{self._skip_note}{self._prepared_notes}",
+        if not self._start(f"Running · {self._mode} · {position}/{self._job_total}{self._skip_note}{self._prepared_notes}",
                            lambda: self._owner.begin_run(job_index=index)):
             self._queued_jobs.clear()
             self._prepared_revision = None  # the next Run prepares again
@@ -1625,7 +1696,7 @@ class StitchPage(QtWidgets.QWidget):
         if outcome.kind is StitchOwnerOutcomeKind.METADATA:
             if self._metadata_current():
                 self._metadata_dialog.adopt_sources(outcome.metadata)
-            self._status("Ready · saved Stitch 1D result")
+            self._status(f"Ready · saved {_kind_name(self._current_payload())} result")
         elif outcome.kind is StitchOwnerOutcomeKind.PREFLIGHT_READY:
             then, self._after_prepare = self._after_prepare, None
             if then == "stopped":
@@ -1672,7 +1743,7 @@ class StitchPage(QtWidgets.QWidget):
                 self._run_prepared()
                 return
             self.preview_dialog.show()
-            self._status(f"Ready · Stitch 1D · {len(preflight.requests)} outputs"
+            self._status(f"Ready · {self._mode} · {len(preflight.requests)} outputs"
                          + (f" · {done} already stitched" if done else "") + self._prepared_notes,
                          ready=bool(preflight.requests))
         elif outcome.kind is StitchOwnerOutcomeKind.FRAME_READ:
@@ -1682,12 +1753,12 @@ class StitchPage(QtWidgets.QWidget):
                     and outcome.artifact_path == self._current_payload().inspection.path):
                 self._raw_frame_view = outcome.frame_view
                 self._render_raw()
-                self._status("Ready · saved Stitch 1D result")
+                self._status(f"Ready · saved {_kind_name(self._current_payload())} result")
         elif outcome.kind is StitchOwnerOutcomeKind.REOPENED:
             if self._action_view_revision == self._view_revision and not self._closing:
                 self._mount_payload(outcome.artifact_path, outcome.payload)
                 note = saved_frame_screen_note(outcome.payload.contributing_frames)
-                self._status("Ready · saved Stitch 1D result" + (f" · {note}" if note else ""))
+                self._status(f"Ready · saved {_kind_name(outcome.payload)} result" + (f" · {note}" if note else ""))
         elif outcome.kind is StitchOwnerOutcomeKind.RESULT:
             result = outcome.result
             if result.terminal.disposition is ModuleDisposition.COMMITTED:
@@ -1801,7 +1872,7 @@ class StitchPage(QtWidgets.QWidget):
         item = self.frames.currentItem()
         if self._raw_popup is not None and self._raw_popup.isVisible() and self._raw_frame_view is not None and item is not None:
             self._raw_popup.render(self._raw_frame_view, label=item.text(),
-                color_map=self._color_map, log=self._log_scale)
+                color_map=self._view.color_map, log=self._view.log_scale)
 
     def _raw_closed(self):
         self._raw_revision += 1
@@ -1906,9 +1977,13 @@ class StitchPage(QtWidgets.QWidget):
         except (TypeError, ValueError, OSError) as error:
             self._status(str(error), ready=False)
 
+    def _set_view(self, **changes):
+        self._view = replace(self._view, **changes)
+
     def _mount_payload(self, path, payload):
-        if type(payload) is not AnalysisArtifactPayload or payload.inspection.kind is not AnalysisArtifactKind.STITCH_1D:
-            raise TypeError("Stitch page requires an admitted 1D artifact")
+        if type(payload) is not AnalysisArtifactPayload or payload.inspection.kind not in {
+                AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}:
+            raise TypeError("Stitch page requires an admitted Stitch result")
         key = str(path)
         self._payloads[key] = payload
         item = next((self.results.item(i) for i in range(self.results.count())
@@ -1923,9 +1998,9 @@ class StitchPage(QtWidgets.QWidget):
             modes = {mode for mode, _cut in payload.gi}
             chosen = _GI_AXES.get(self._value("unit"))
             if chosen in modes:
-                self._plot_axis = chosen
-            elif self._plot_axis not in modes:
-                self._plot_axis = payload.gi[0][0]
+                self._set_view(plot_axis=chosen)
+            elif self._view.plot_axis not in modes:
+                self._set_view(plot_axis=payload.gi[0][0])
         # shown once: selecting it would rebuild the frame list and redraw through the list's signals,
         # and again here (Codex testing-fixes review, startup recommendation 2)
         blocker = QtCore.QSignalBlocker(self.results)
@@ -1935,7 +2010,7 @@ class StitchPage(QtWidgets.QWidget):
 
     def _selected(self):
         items = self.results.selectedItems()
-        if self._plot_mode == "Single":
+        if self._view.plot_mode == "Single":
             item = self.results.currentItem()
             items = [] if item is None else [item]
         return [(item, self._payloads[item.data(QtCore.Qt.ItemDataRole.UserRole)]) for item in items]
@@ -1954,25 +2029,102 @@ class StitchPage(QtWidgets.QWidget):
         return key
 
     def _draw(self, *_args):
-        """Project the selected results into Int's scientific view."""
+        """Project the selected results into Int's scientific view: a Stitch 2D current result in Int
+        2D's layout (the map, with I(q) and its slices below), else Int 1D's."""
         if not hasattr(self, "scientific"):
             return
-        from xdart.gui.tabs.scattering.shell_values import (
-            AxisProjection, FrameNavigationProjection, ScientificProjection, TraceProjection,
-        )
+        current = self._current_payload()
+        if current is not None and current.kind is AnalysisArtifactKind.STITCH_2D:
+            self._draw_map()
+        else:
+            self._draw_patterns()
+        self.curve.setLabel("left", scaled_intensity_label(self._diagnostic,
+                                                           self._view.plot_options.intensity_scale))
+        blocker = QtCore.QSignalBlocker(self._diagnostic_combo)
+        self._diagnostic_combo.setCurrentText(self._diagnostic)
+        del blocker
+
+    def _navigation(self):
+        """Every result's key, the current result's and the selected results' (the view's footer)."""
+        from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
         role = QtCore.Qt.ItemDataRole.UserRole
-        items = [self.results.item(row) for row in range(self.results.count())]
-        keys = tuple(self._result_key(item.data(role)) for item in items)
+        keys = tuple(self._result_key(self.results.item(row).data(role)) for row in range(self.results.count()))
+        current = self.results.currentItem()
+        return keys, FrameNavigationProjection(
+            frames=keys, current=None if current is None else self._result_key(current.data(role)),
+            selected=tuple(self._result_key(item.data(role)) for item, _ in self._selected()))
+
+    def _display_payload(self, item, payload):
+        """A result as Int's frame (``StandardDisplayPayload``), through Int's conversion
+        (``FrameView.from_results``): a Stitch 2D's map and the I(q) beside it, a Stitch 1D's I(q); the
+        Diagnostic shows their coverage or normalization instead."""
+        from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+        from xrd_tools.core.frame_view import FrameView
+        from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
+        key = self._result_key(item.data(QtCore.Qt.ItemDataRole.UserRole))
+        shown = self._diagnostic.lower()
+        map_result = None
+        if payload.kind is AnalysisArtifactKind.STITCH_2D:
+            pattern = payload.profile
+            (_q, radial), = pattern.axes
+            (_q, unit), = pattern.axis_units
+            (_q, q), (_chi, chi) = payload.axes
+            (_q, q_unit), (_chi, chi_unit) = payload.inspection.axis_units
+            map_result = IntegrationResult2D(q, chi, getattr(payload, shown), None, q_unit, chi_unit)
+        else:
+            pattern, radial, unit = payload, payload.axis("q"), payload.native_unit
+        view = FrameView.from_results(label=key.local_frame_label,
+                                      result_1d=IntegrationResult1D(radial, getattr(pattern, shown), None, unit),
+                                      result_2d=map_result)
+        return StandardDisplayPayload(0, key, item.text(), view, status="complete",
+            wavelength_m=None if payload.wavelength_A is None else float(payload.wavelength_A) * 1e-10)
+
+    def _draw_map(self):
+        """Int 2D's layout for a Stitch 2D, from Int's own projection (``build_scientific_projection``):
+        the map as the cake, I(q) below, its slices and pins as Int 2D makes them from the same map."""
+        from xdart.gui.tabs.scattering.shell_projection import build_scientific_projection
+        role = QtCore.Qt.ItemDataRole.UserRole
+        keys, navigation = self._navigation()
+        items = {id(self._result_key(item.data(role))): (item, payload) for item, payload in self._selected()}
+        current = self.results.currentItem()
+        if current is not None:
+            items.setdefault(id(self._result_key(current.data(role))),
+                             (current, self._payloads[current.data(role)]))
+        state = build_scientific_projection(
+            tuple(self._display_payload(item, payload) for item, payload in items.values()),
+            navigation, frozenset(keys), self._view, "", processing_mode="Int 2D")
+        names = {id(key): (key.source_scan, f"{key.source_scan}_{key.local_frame_label}") for key in keys}
+
+        def named(trace):  # the result's name, as the patterns show it, before any slice note
+            name, prefix = names[id(trace.frame)]
+            return replace(trace, title=name + trace.title[len(prefix):]) if trace.title.startswith(prefix) else trace
+        state = replace(state, traces=tuple(named(trace) for trace in state.traces),
+                        pinned_traces=tuple(replace(pinned, trace=named(pinned.trace)) for pinned in state.pinned_traces),
+                        title=current.text() if current is not None else "Current",
+                        status=current.text() if current is not None else "")
+        self._last_map_state = state
+        self.scientific.reconcile(state, navigation, completed=self.results.currentRow() + 1,
+                                  total=len(keys), detail="")
+
+    def _draw_patterns(self):
+        """Int 1D's layout: each selected result's I(q) (a Stitch 2D's, the one beside its map), or the
+        GI cut the plot axis chooses."""
+        from xdart.gui.tabs.scattering.shell_values import (
+            AxisProjection, ScientificProjection, TraceProjection,
+        )
+        self._last_map_state = None
+        role = QtCore.Qt.ItemDataRole.UserRole
+        keys, navigation = self._navigation()
         selected = self._selected()
         # A GI result's cuts are its record's other 1-D modes; the plot axis chooses one, as Int's does.
         cuts = {mode for _item, payload in selected for mode, _cut in payload.gi}
-        if self._plot_axis in _CUT_AXES and self._plot_axis not in cuts:
-            self._plot_axis = "Q"
+        if self._view.plot_axis not in {"Q", "2theta", *cuts}:
+            self._set_view(plot_axis="Q")
         available = all(payload.wavelength_A is not None for _, payload in selected)
-        if not available and self._plot_axis == "2theta":
-            self._plot_axis = "Q"
-        cut = self._plot_axis if self._plot_axis in cuts else None
-        unit = "q_A^-1" if self._plot_axis == "Q" else "2th_deg"
+        if not available and self._view.plot_axis == "2theta":
+            self._set_view(plot_axis="Q")
+        cut = self._view.plot_axis if self._view.plot_axis in cuts else None
+        unit = "q_A^-1" if self._view.plot_axis == "Q" else "2th_deg"
         axis_label, axis_unit = (_CUT_AXES[cut] if cut is not None
                                  else ("Q", "Å⁻¹") if unit == "q_A^-1" else ("2θ", "°"))
         traces = []
@@ -1982,13 +2134,23 @@ class StitchPage(QtWidgets.QWidget):
                 if shown is None:
                     continue
                 radial = shown.axes[0][1]
+            elif payload.kind is AnalysisArtifactKind.STITCH_2D:
+                shown = payload.profile
             else:
                 shown = payload
             values = {"Intensity": shown.intensity, "Coverage": shown.coverage,
                       "Normalization": shown.normalization}[self._diagnostic]
             if values is None:
                 continue
-            if cut is None:
+            if cut is None and shown is not payload:  # the I(q) beside a map, in the axis chosen
+                (_q, radial), = shown.axes
+                (_q, native), = shown.axis_units
+                if native != unit:
+                    from xrd_tools.io.analysis_stitch_auxiliary import native_stitch_companion
+                    target, radial = native_stitch_companion(radial, native, payload.wavelength_A)
+                    if target != unit:
+                        continue
+            elif cut is None:
                 try:
                     radial = payload.radial_axis(unit)
                 except ValueError:
@@ -2001,31 +2163,29 @@ class StitchPage(QtWidgets.QWidget):
                 np.asarray(values, dtype=float), title=item.text()))
         gi_modes = ("q_total", *(mode for mode in _CUT_AXES if mode in cuts)) if cuts else ()
         current = self.results.currentItem()
+        view = self._view
         state = ScientificProjection(
             heavy_available=frozenset(keys), traces=tuple(traces),
             title=current.text() if current else "Current", processing_mode="Int 1D",
             measurement_mode="GI" if gi_modes else "Standard",
             gi_mode_1d=(cut or "q_total") if gi_modes else "", gi_modes_1d=gi_modes,
-            plot_axis=self._plot_axis, plot_mode=self._plot_mode, plot_options=self._plot_options,
-            color_map=self._color_map, log_scale=self._log_scale, background_enabled=False,
+            plot_axis=view.plot_axis, plot_mode=view.plot_mode, plot_options=view.plot_options,
+            color_map=view.color_map, log_scale=view.log_scale, background_enabled=False,
             status=current.text() if current else "")
-        navigation = FrameNavigationProjection(
-            frames=keys, current=None if current is None else self._result_key(current.data(role)),
-            selected=tuple(self._result_key(item.data(role)) for item, _ in selected))
         self.scientific.reconcile(state, navigation, completed=self.results.currentRow() + 1,
                                   total=len(keys), detail="")
-        self.curve.setLabel("left", scaled_intensity_label(self._diagnostic,
-                                                           self._plot_options.intensity_scale))
-        blocker = QtCore.QSignalBlocker(self._diagnostic_combo)
-        self._diagnostic_combo.setCurrentText(self._diagnostic)
-        del blocker
 
     def _view_command(self, command):
-        """The view's typed commands, for the Stitch results it shows."""
+        """The view's typed commands, for the Stitch results it shows; a map's image axis, slice and
+        pins follow Int 2D's rules (``scientific_axes``)."""
+        from xdart.gui.tabs.scattering.scientific_axes import (
+            share_plot_axis_for_image, shown_slice_pin, slice_pins_for_plot_axis,
+        )
         from xdart.gui.tabs.scattering.scientific_view import _PLOT_OPTION_FIELDS
         from xdart.gui.tabs.scattering.scientific_plot_options import PLOT_OPTION_COMMAND_PATHS
         from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
         kind, value = command.kind, command.value
+        view = self._view
         if kind in {ShellCommandKind.SELECT_FRAME, ShellCommandKind.HYDRATE_FRAME}:
             path = next((path for path, key in self._result_keys.items() if key is command.frame), None)
             role = QtCore.Qt.ItemDataRole.UserRole
@@ -2033,28 +2193,55 @@ class StitchPage(QtWidgets.QWidget):
                         if self.results.item(row).data(role) == path), -1)
             if row >= 0 and row != self.results.currentRow():
                 flag = (QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
-                        if self._plot_mode == "Single" else QtCore.QItemSelectionModel.SelectionFlag.NoUpdate)
+                        if view.plot_mode == "Single" else QtCore.QItemSelectionModel.SelectionFlag.NoUpdate)
                 self.results.setCurrentRow(row, flag)
             return
         if kind is ShellCommandKind.SET_PLOT_MODE:
-            self._plot_mode = str(value)
-            if self._plot_mode == "Single":
+            # as Int: a pin lives in Overlay (and Waterfall) only
+            self._set_view(plot_mode=str(value),
+                           slice_pins=view.slice_pins if value in {"Overlay", "Waterfall"} else ())
+            if value == "Single":
                 self.results.setCurrentRow(self.results.currentRow(),
                                            QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
-        elif kind is ShellCommandKind.SET_PLOT_AXIS and value in {"Q", "2theta", *_CUT_AXES}:
-            self._plot_axis = value
+        elif kind is ShellCommandKind.SET_PLOT_AXIS and value in {"Q", "2theta", "chi", *_CUT_AXES}:
+            self._set_view(plot_axis=value, slice_pins=slice_pins_for_plot_axis(view.slice_pins, view.plot_axis, value))
+        elif kind is ShellCommandKind.SET_IMAGE_AXIS and value in {"Q-Chi", "2Th-Chi"}:
+            shared = share_plot_axis_for_image(value) if view.share_axis else None
+            self._set_view(image_axis=value, share_axis=shared is not None,
+                           **({} if shared is None else dict(plot_axis=shared, slice_pins=slice_pins_for_plot_axis(
+                               view.slice_pins, view.plot_axis, shared))))
+        elif kind is ShellCommandKind.SET_SHARE_AXIS and type(value) is bool:
+            shown = view.image_axis if self._last_map_state is None else self._last_map_state.image_axis
+            shared = share_plot_axis_for_image(shown) if value else None
+            self._set_view(share_axis=shared is not None,
+                           **({} if shared is None else dict(plot_axis=shared, slice_pins=slice_pins_for_plot_axis(
+                               view.slice_pins, view.plot_axis, shared))))
+        elif kind is ShellCommandKind.SET_SLICE_ENABLED:
+            self._set_view(slice_enabled=bool(value))
+        elif kind is ShellCommandKind.SET_SLICE_CENTER:
+            self._set_view(slice_center=float(value))
+        elif kind is ShellCommandKind.SET_SLICE_WIDTH:
+            self._set_view(slice_width=float(value))
+        elif kind is ShellCommandKind.PIN_SLICE:  # the slice shown, on the current result's map
+            pin = shown_slice_pin(self._last_map_state)
+            current = self.results.currentItem()
+            if (pin is None or current is None
+                    or pin.frame is not self._result_key(current.data(QtCore.Qt.ItemDataRole.UserRole))
+                    or pin.projection_id in {other.projection_id for other in view.slice_pins}):
+                return
+            self._set_view(slice_pins=(*view.slice_pins, pin))
         elif kind is ShellCommandKind.SET_COLOR_MAP:
-            self._color_map = str(value)
+            self._set_view(color_map=str(value))
             self._render_raw()
         elif kind is ShellCommandKind.SET_LOG_SCALE:  # as Int: the image and the curve
-            self._log_scale = bool(value)
-            self._plot_options = replace(self._plot_options, intensity_scale="Log" if value else "Linear")
+            self._set_view(log_scale=bool(value),
+                           plot_options=replace(view.plot_options, intensity_scale="Log" if value else "Linear"))
             self._render_raw()
         elif kind is ShellCommandKind.SET_PLOT_OPTION:
             field = dict(zip(PLOT_OPTION_COMMAND_PATHS, _PLOT_OPTION_FIELDS)).get(command.path)
             if field is None:
                 return
-            self._plot_options = replace(self._plot_options, **{field: value})
+            self._set_view(plot_options=replace(view.plot_options, **{field: value}))
         elif kind is ShellCommandKind.CLEAR_1D:
             self.clear_plot()
             return
@@ -2080,6 +2267,7 @@ class StitchPage(QtWidgets.QWidget):
 
     def clear_plot(self):
         self._view_revision += 1
+        self._set_view(slice_pins=())
         self.results.clearSelection()
         self.results.setCurrentRow(-1)
         self._draw()
@@ -2294,9 +2482,23 @@ class StitchPage(QtWidgets.QWidget):
         return ActionAccepted("stitch-run")
 
 
+class _StitchProcessingMode:
+    """Another page's request for Stitch 1D or 2D (Int's run bar), through the page's own mode choice;
+    completed only when the page took it."""
+
+    def __init__(self, page):
+        self._page = page
+
+    def select(self, mode):
+        from xdart.gui.pages.values import MODE_REFUSED
+        if self._page.select_mode(str(mode)):
+            return ActionCompleted(f"processing-mode-{mode}")
+        return ActionRefused(MODE_REFUSED)
+
+
 def build_stitch_page(services, parent):
     page = StitchPage(services, parent)
     page.restore_last_settings()
     return PageHandle(key=STITCH_TOOL_KEY, widget=page, close=page.close_and_remember,
                       open_folder=page, settings_io=page, run_control=page, activity=page,
-                      app_menus=page)
+                      app_menus=page, processing_mode=_StitchProcessingMode(page))

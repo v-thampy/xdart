@@ -23,9 +23,7 @@ RUN_MODE_CHOICES = (
 )
 # These choices route to existing tools when their owner is available.  Stitch
 # 2D remains visible but cannot open the current 1-D-only Stitch owner.
-UNOWNED_RUN_MODE_REASONS = (
-    ("Stitch 2D", "Stitch 2D is not available yet"),
-)
+UNOWNED_RUN_MODE_REASONS = ()
 _NATIVE_RUN_MODES = frozenset(("Int 1D", "Int 2D", "Int 1D (XYE)"))
 
 

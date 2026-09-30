@@ -577,9 +577,11 @@ class StitchToolOwner:
                 frame_view=view, artifact_path=request.artifact_path)
         if request.action is StitchOwnerAction.REOPEN:
             publish("reopen", 0, 1)
-            payload = read_analysis_artifact(
-                request.artifact_path, expected_kind=AnalysisArtifactKind.STITCH_1D,
-            )
+            payload = read_analysis_artifact(request.artifact_path)
+            if payload.kind not in {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}:
+                raise ValueError("not a Stitch result")
+            if payload.kind is AnalysisArtifactKind.STITCH_2D and payload.profile is None:
+                raise ValueError("an older Stitch 2D file, without I(q) beside its map: stitch it again")
             publish("reopen", 1, 1)
             return StitchOwnerOutcome(
                 StitchOwnerOutcomeKind.REOPENED,

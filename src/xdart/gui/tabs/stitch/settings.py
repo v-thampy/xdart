@@ -51,6 +51,8 @@ def page_settings(page) -> dict[str, Any]:
         "gi": dict(page._gi),
         # Append skips an output already stitched with these settings; "Overwrite" is Replace
         "write_mode": page.run_bar.write_mode(),
+        # Stitch 1D or Stitch 2D
+        "mode": page._mode,
     }
 
 
@@ -104,6 +106,8 @@ def apply_page_settings(page, document: Any) -> None:
     if document.get("write_mode") in ("Append", "Overwrite"):
         page.run_bar.set_write_mode(document["write_mode"])
         page._write_mode_changed()
+    if document.get("mode") in ("Stitch 1D", "Stitch 2D"):
+        page.select_mode(document["mode"])
     gi = document.get("gi", {})
     page._gi.update({key: bool(value) if key == "enabled" else None if value is None else str(value)
                      for key, value in gi.items() if key in page._gi})

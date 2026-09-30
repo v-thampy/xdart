@@ -520,6 +520,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     sourceSelectionRequested = QtCore.Signal(object)
     browseRequested = QtCore.Signal(object)
     toolRequested = QtCore.Signal(str)
+    #: (page key, processing mode): open that page in that mode (Stitch 1D or 2D on the Stitch page)
+    modeRequested = QtCore.Signal(str, str)
     noticeChanged = QtCore.Signal(str)
     _observationFinished = QtCore.Signal(object)
     _browserCatalogFinished = QtCore.Signal(object)
@@ -6914,12 +6916,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if kind is ShellCommandKind.SET_PROCESSING_MODE:
             if type(value) is not str or not value:
                 return
-            if value == "Stitch 1D":
-                # This selection navigates to its retained page. Keep the
-                # integration intent intact for return navigation; the host
+            if value in {"Stitch 1D", "Stitch 2D"}:
+                # This selection navigates to its retained page, in that mode. Keep
+                # the integration intent intact for return navigation; the host
                 # owns the active-operation and pending-cleanup fences.
                 self._refresh_shell()
-                self.toolRequested.emit("stitch")
+                self.modeRequested.emit("stitch", value)
                 return
             controller = self._context_controller
             target_tool = tool_from_mode_text(value)

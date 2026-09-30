@@ -24,11 +24,12 @@ from xrd_tools.analysis.xu_stitch_calibration import canonical_surface_resource_
 from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
 
 
-def test_form_is_canonical_fingerprinted_and_keeps_2d_held(stitch_form):
+def test_form_is_canonical_fingerprinted_and_keeps_2d_native(stitch_form):
     assert stitch_form.raw_dtype == np.dtype("int32").str
     assert len(stitch_form.fingerprint) == 64
     assert replace(stitch_form, threshold=700_000).fingerprint != stitch_form.fingerprint
-    with pytest.raises(ValueError, match="2-D Stitch remains held"):
+    # Stitch 2D is a native pyFAI MultiGeometry record (STITCH-2D-20260930); this form is the old one
+    with pytest.raises(ValueError, match="Stitch 2D uses the pyFAI MultiGeometry backend"):
         replace(stitch_form, mode="2d")
     assert stitch_form.overwrite is AnalysisArtifactOverwrite.REPLACE
     assert replace(stitch_form, overwrite=AnalysisArtifactOverwrite.CREATE_NEW).fingerprint != stitch_form.fingerprint

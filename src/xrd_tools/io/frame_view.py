@@ -3551,13 +3551,16 @@ def read_contributing_frame_view(
     if type(frame) is not int or frame < 0 or type(full_raw) is not bool:
         raise TypeError("contributing frame selector is invalid")
     path = Path(scan_file)
+    stitched = {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}
     if artifact_payload is None:
-        inspection = inspect_analysis_artifact(path, expected_kind=AnalysisArtifactKind.STITCH_1D)
+        inspection = inspect_analysis_artifact(path)
+        if inspection.kind not in stitched:
+            raise ValueError("contributing frames belong to a Stitch result")
     else:
         if type(artifact_payload) is not AnalysisArtifactPayload:
             raise TypeError("contributing frame payload must be strictly admitted")
         inspection = artifact_payload.inspection
-        if inspection.path != str(path.expanduser().absolute()) or inspection.kind is not AnalysisArtifactKind.STITCH_1D:
+        if inspection.path != str(path.expanduser().absolute()) or inspection.kind not in stitched:
             raise ValueError("contributing frame payload belongs to another artifact")
         if _stat_revision(os.stat(path)) != inspection.storage_revision:
             raise AnalysisArtifactInvalid("artifact changed since detached admission")

@@ -272,6 +272,11 @@ class StitchToolForm:
     flat_min_fraction: float = 0.1
     #: Grazing incidence: a GI cut written beside I(q) (native Stitch 1D in Q).
     gi: StitchGI | None = None
+    #: Stitch 2D (``mode`` '2d', native pyFAI MultiGeometry): the map's radial and azimuthal points
+    #: and its χ range (°), as Int 2D's; I(q) beside it takes ``npt_1d`` and the radial range.
+    npt_rad_2d: int = 1000
+    npt_azim_2d: int = 360
+    chi_range: tuple[float, float] = (-180.0, 180.0)
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -392,8 +397,20 @@ class StitchToolForm:
             raise ValueError("max frame bytes must be a bounded positive integer")
         if math.prod(self.detector_shape) * 8 > self.max_frame_bytes:
             raise ValueError("float64 detector frame exceeds max frame bytes")
-        if self.mode != "1d":
-            raise ValueError("2-D Stitch remains held pending orientation parity")
+        if self.mode not in {"1d", "2d"}:
+            raise ValueError("Stitch mode must be 1d or 2d")
+        if self.mode == "2d":
+            if not native or self.backend != "multigeometry":
+                raise ValueError("Stitch 2D uses the pyFAI MultiGeometry backend")
+            if self.gi is not None:
+                raise ValueError("Stitch 2D has no grazing cuts yet: turn Grazing off")
+            for name in ("npt_rad_2d", "npt_azim_2d"):
+                value = getattr(self, name)
+                if type(value) is not int or not 1 <= value <= 1_000_000:
+                    raise ValueError("2-D point counts must be bounded positive integers")
+            if self.npt_rad_2d * self.npt_azim_2d > 64_000_000:
+                raise ValueError("a 2-D map may hold at most 64 million points")
+            object.__setattr__(self, "chi_range", _ordered_range(self.chi_range, "χ range"))
         if not native and self.backend == "xu_hist" and (
             self.geometry_kind is not StitchGeometryKind.PYFAI_GONIOMETER_JSON
             or self.expected_geometry_sha256 is not None
@@ -492,7 +509,10 @@ class StitchToolForm:
                          # a cutoff away from 10 % changes the form; the default keeps it
                          + (() if self.flat_min_fraction == 0.1
                             else (("flat-min-fraction", self.flat_min_fraction),))
-                         + (() if self.gi is None else (self.gi.identity(),)))
+                         + (() if self.gi is None else (self.gi.identity(),))
+                         # a 1-D form keeps the identity it had
+                         + (() if self.mode == "1d" else
+                            (("stitch-2d-v1", self.npt_rad_2d, self.npt_azim_2d, self.chi_range),)))
         object.__setattr__(
             self,
             "fingerprint",

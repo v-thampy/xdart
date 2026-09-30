@@ -148,7 +148,7 @@ def test_builtin_stitch_selection_retains_native_page_and_integration_workspace(
         assert combo.findText("Stitch 2D") >= 0
         assert combo.findText("RSM") >= 0
         requested = []
-        page.toolRequested.connect(requested.append)
+        page.modeRequested.connect(lambda key, mode: requested.append((key, mode)))
         prior_intent = page._intents.snapshot()
         combo.setCurrentText("Stitch 1D")
         qapp.processEvents()
@@ -168,11 +168,10 @@ def test_builtin_stitch_selection_retains_native_page_and_integration_workspace(
         assert window.page_handle is handle
         assert handle.activity.active() is False
         assert window.select_page(DEFAULT_PAGE_KEY) == ActionCompleted(str(DEFAULT_PAGE_KEY))
-        combo.setCurrentText("Stitch 2D")
-        assert not page._shell.run_controls.startButton.isEnabled()
-        page._shell.run_controls.startButton.click()
+        combo.setCurrentText("Stitch 2D")  # the Stitch page, in Stitch 2D (STITCH-2D-20260930)
         qapp.processEvents()
-        assert requested == ["stitch", "stitch"]
+        assert window.page_handle is handle and handle.widget._mode == "Stitch 2D"
+        assert requested == [("stitch", "Stitch 1D"), ("stitch", "Stitch 1D"), ("stitch", "Stitch 2D")]
         assert handle.activity.active() is False
         assert window.open_tool(STITCH_TOOL_KEY) == ActionCompleted("stitch")
         assert window._page_handles[STITCH_PAGE.key] is handle

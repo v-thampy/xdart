@@ -438,8 +438,8 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
         assert len(reopened.results.selectedItems()) == 2
         reopened.scientific.color_map.setCurrentText("viridis")
         reopened.scientific.log_scale.click()  # as on Int: the image and the curve's intensity scale
-        assert reopened._log_scale is True and reopened._color_map == "viridis"
-        assert reopened._plot_options.intensity_scale == "Log"
+        assert reopened._view.log_scale is True and reopened._view.color_map == "viridis"
+        assert reopened._view.plot_options.intensity_scale == "Log"
         assert len(reopened.curve.listDataItems()) == 2
         options = reopened.scientific.plot_options_dialog  # Int's dialog, with Stitch's Diagnostic
         assert options.isAncestorOf(reopened._diagnostic_combo)
@@ -451,7 +451,7 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
         options.intensity_scale.setCurrentText("Sqrt")  # accepted together
         options.accept_button.click()
         assert reopened._diagnostic == "Coverage"  # the plot follows, not a cached trace
-        assert reopened._plot_options.intensity_scale == "Sqrt"
+        assert reopened._view.plot_options.intensity_scale == "Sqrt"
         assert reopened._diagnostic_combo.currentText() == "Coverage"
         np.testing.assert_array_equal(reopened.curve.listDataItems()[0].yData,
                                       scaled_intensity(shown.coverage, "Sqrt"))

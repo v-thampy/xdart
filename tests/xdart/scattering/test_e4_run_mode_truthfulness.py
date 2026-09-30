@@ -35,9 +35,7 @@ _EXPECTED_MODES = (
     "1D Viewer",
     "2D Viewer",
 )
-_EXPECTED_DISABLED_REASONS = (
-    ("Stitch 2D", "Stitch 2D is not available yet"),
-)
+_EXPECTED_DISABLED_REASONS = ()
 
 
 def _configured_intent(mode: str) -> RunIntent:
@@ -132,7 +130,7 @@ def test_analysis_modes_preserve_their_existing_owner_availability() -> None:
     expected = {
         "Stitch": ("Stitch 1D", True),
         "Stitch 1D": ("Stitch 1D", True),
-        "Stitch 2D": ("Stitch 2D", False),
+        "Stitch 2D": ("Stitch 2D", True),  # the Stitch page's (STITCH-2D-20260930)
         "RSM": ("RSM", True),
     }
     for mode, (normalized, enabled) in expected.items():
@@ -142,8 +140,6 @@ def test_analysis_modes_preserve_their_existing_owner_availability() -> None:
         assert projected.disabled_modes == UNOWNED_RUN_MODE_REASONS
         assert projected.ready is enabled
         assert projected.run_enabled is enabled
-        if not enabled:
-            assert projected.readiness == "Stitch 2D is not available yet"
 
 
 def test_directory_strip_qualifies_paused_and_failed_file_progress() -> None:

@@ -198,6 +198,10 @@ def prepare_native_stitch_tool(form, project):
                   monitor_selector=form.monitor_selector, max_frame_bytes=form.max_frame_bytes,
                   native_records=True, conditioning=form.conditioning, mask_path=form.mask_path,
                   frame_screen=FrameScreenPolicy(exclude=form.frame_screen), gi=gi)
+    if form.mode == "2d":  # the map as Int 2D's, and I(q) beside it (pyFAI MultiGeometry only: the form)
+        common.update(mode="2d", npt_rad_2d=form.npt_rad_2d, npt_azim_2d=form.npt_azim_2d,
+                      azimuth_range=form.chi_range)
+    kind = AnalysisArtifactKind.STITCH_2D if form.mode == "2d" else AnalysisArtifactKind.STITCH_1D
     if form.backend == "multigeometry":
         geometry = capture_stitch_geometry(StitchGeometryInput(
             form.geometry_path, form.geometry_kind,
@@ -259,9 +263,8 @@ def prepare_native_stitch_tool(form, project):
                     kind=ModuleKind.STITCH, selected_labels=selected, resolved_selectors=selectors)
             receipt = cached[cache_key]
             receipts.append(receipt)
-        target = resolve_finite_output_target(output_dir, family, operation_token="stitch-1d")
-        output = ModuleOutputRequest(target, AnalysisArtifactKind.STITCH_1D,
-                                     form.overwrite, artifact_family=family)
+        target = resolve_finite_output_target(output_dir, family, operation_token=f"stitch-{form.mode}")
+        output = ModuleOutputRequest(target, kind, form.overwrite, artifact_family=family)
         try:
             source = receipts[0] if len(receipts) == 1 else ModuleSourceGroupReceipt.from_members(
                 tuple(receipts), kind=ModuleKind.STITCH)
