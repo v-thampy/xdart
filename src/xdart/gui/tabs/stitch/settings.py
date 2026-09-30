@@ -18,7 +18,7 @@ SETTINGS_VERSION = 1
 #: Where the last session's settings live in the session file.
 SESSION_KEY = "stitch_settings"
 #: Applied first, in this order: each resets other fields to its own defaults.
-_FIRST = ("backend", "source_kind", "unit")
+_FIRST = ("backend", "source_kind", "unit", "map_axis")
 #: Shown from the source selection, not an input of its own.
 _DERIVED = frozenset({"spec_path"})
 #: Restored as one threshold policy, not field by field.
@@ -117,8 +117,14 @@ def apply_page_settings(page, document: Any) -> None:
     page._sync_advanced()
     page._refresh_xu_geometry()
     page._render_gi()
-    if fields.get("unit") in page._fields["unit"].choices:  # a GI axis exists once Grazing is back
-        page.set_field("unit", fields["unit"])
+    from xdart.gui.tabs.stitch.page import _LEGACY_AXES
+    for key in ("unit", "map_axis"):  # Grazing's axes exist once Grazing is back
+        value = _LEGACY_AXES.get(fields.get(key), fields.get(key))
+        if value in page._fields[key].choices:
+            page.set_field(key, value)
+    for key in ("q_min", "q_max", "map_min", "map_max"):  # an axis's range, after the axis that resets it
+        if key in fields:
+            page.set_field(key, fields[key])
 
 
 def dump_settings(document: dict[str, Any]) -> str:

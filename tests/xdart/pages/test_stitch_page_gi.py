@@ -72,23 +72,22 @@ def test_grazing_shows_ints_rows_with_the_scans_motors_and_eta_first(qapp, tmp_p
         tilt, chi = page._tilt_rows
         assert [tilt.editor.itemText(index) for index in range(tilt.editor.count())] == ["Manual", *_MOTORS]
         assert tilt.editor.currentText() == "chi" and chi.isHidden()  # Stitch's tilt order: chi, gonchi, …
-        # the maintainer's axes (2026-09-29): Q and 2θ stay plain; a GI axis writes I(q) and both cuts
-        # ("it will be good to save both by default along with I(q)"), opening on the one chosen
-        assert _axes(page) == ["Q (Å⁻¹)", "2θ (°)", "Qip (Å⁻¹)", "Qoop (Å⁻¹)"]
-        # Int's fixed statuses (a longer one widened the panel); the hint is on the eliding readiness line
-        assert page.build_form().gi is None and page._gi_card.status.text() == "grazing"
-        assert page.controls.experiment_card.status.text() == "grazing"
-        assert "choose Qip or Qoop" in page.run_bar.readinessLabel.full_text()
-        assert all(row.isHidden() for row in page._gi_rows)
-        page.set_field("unit", "Qip (Å⁻¹)")
-        assert not any(row.isHidden() for row in page._gi_rows)
-        assert "choose" not in page.run_bar.readinessLabel.full_text() + _status(page)
+        # Int's Grazing axes (maintainer, 2026-09-30: "in general 1d and 2d should be like int 1d and 2d"): Grazing
+        # is a GI run whichever axis, each writing I(q) and both cuts ("it will be good to save both by default
+        # along with I(q)", 2026-09-29) and opening on the one chosen; the GI ranges show in Grazing
+        assert _axes(page) == ["Q", "Qip", "Qoop"] and page._value("unit") == "Q"
         # both backends read psic's circles: the incidence as eta, the tilt as chi, and mu and phi
         both = StitchGI(("q_ip", "q_oop"), incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE)
-        assert page.build_form().gi == both
-        page.set_field("unit", "Qoop (Å⁻¹)")
-        assert page.build_form().gi == both
-        assert page.build_form().unit == "q_A^-1"
+        assert page.build_form().gi == both and page.build_form().unit == "q_A^-1"
+        # Int's fixed statuses (a longer one widened the panel)
+        assert page._gi_card.status.text() == page.controls.experiment_card.status.text() == "grazing"
+        assert page.run_bar.readinessLabel.full_text().endswith(" · grazing Q")
+        assert not any(row.isHidden() for row in page._gi_rows)
+        for axis in ("Qip", "Qoop"):
+            page.set_field("unit", axis)
+            assert page.build_form().gi == both and page.build_form().unit == "q_A^-1"
+        page.set_field("unit", "Qip (Å⁻¹)")  # settings saved before Int's names
+        assert page._value("unit") == "Qip"
         _click(page, "Standard")
         assert page.build_form().gi is None and all(row.isHidden() for row in page._gi_rows)
         assert _axes(page) == ["Q (Å⁻¹)", "2θ (°)"] and page._value("unit") == "Q (Å⁻¹)"
@@ -115,7 +114,7 @@ def test_grazing_keeps_the_controls_width_as_ints(qapp, tmp_path):
         _close(page, qapp)
 
 
-@pytest.mark.parametrize("axis", ["Qoop (Å⁻¹)", "Qip (Å⁻¹)"])
+@pytest.mark.parametrize("axis", ["Qoop", "Qip"])
 def test_a_manual_angle_axis_and_ranges_reach_the_form_and_round_trip(qapp, tmp_path, axis):
     cuts = ("q_ip", "q_oop")  # either GI axis writes both cuts
     page = _page(tmp_path, "multigeometry")

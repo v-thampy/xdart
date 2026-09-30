@@ -2041,15 +2041,27 @@ class ControlsPanel(QtWidgets.QWidget):
             expand=True,
         )
 
+    def render_processing_rows(
+        self,
+        sub: SubsectionCard,
+        fields: Sequence[ControlFormField],
+    ) -> dict[tuple[str, ...], QtWidgets.QWidget]:
+        """Int's rows of one Processing group (1-D, 2-D, Conditioning) for another page's own
+        values (Stitch): the Axis row with its Pts, a RangeRow per low/high/auto triple and the
+        Threshold, pills for toggles. Returns each field's row by path (a range's three paths
+        its RangeRow). Edits emit ``fieldValueChanged`` with the fields' paths."""
+        return self._render_processing_group_rows(sub, fields)
+
     def _render_processing_group_rows(
         self,
         sub: SubsectionCard,
         fields: Sequence[ControlFormField],
-    ) -> None:
+    ) -> dict[tuple[str, ...], QtWidgets.QWidget]:
         """Render a Processing group, coalescing low/high(/auto) triples and the
         Threshold min/max into one compact :class:`RangeRow` each (mockup)."""
         by_path = {field.path: field for field in fields}
         consumed: set[tuple[str, ...]] = set()
+        built: dict[tuple[str, ...], QtWidgets.QWidget] = {}
         # The point-count field(s) park on the Axis row, right of the dropdown —
         # NOT their own body row, and no longer in the subsection header (which
         # stays clear for a status line).  Collected here; attached when the Axis
@@ -2068,6 +2080,7 @@ class ControlsPanel(QtWidgets.QWidget):
         def flush_pills() -> None:
             if pending_pills:
                 row = PillRow(list(pending_pills))
+                built.update(dict.fromkeys((field.path for field in pending_pills), row))
                 if any(
                     field.path in {
                         ("Signal", "series_average"),
@@ -2097,7 +2110,9 @@ class ControlsPanel(QtWidgets.QWidget):
                 low_f, high_f = by_path.get(low_p), by_path.get(high_p)
                 if low_f is not None and high_f is not None:
                     flush_pills()
-                    sub.add_row(self._make_range_row(low_f, high_f, by_path.get(auto_p)))
+                    row = self._make_range_row(low_f, high_f, by_path.get(auto_p))
+                    sub.add_row(row)
+                    built.update(dict.fromkeys((p for p in (low_p, high_p, auto_p) if p in by_path), row))
                     consumed.update({low_p, high_p, auto_p})
                     continue
             # A bare _high / _auto whose _low partner is in this group is folded
@@ -2110,9 +2125,12 @@ class ControlsPanel(QtWidgets.QWidget):
             if path == ("Mask", "min") and ("Mask", "max") in by_path:
                 flush_pills()
                 toggle_field = by_path.get(("Mask", "Threshold"))
-                sub.add_row(self._make_range_row(
+                row = self._make_range_row(
                     field, by_path[("Mask", "max")], toggle_field,
-                    label="Threshold", display_decimals=0))
+                    label="Threshold", display_decimals=0)
+                sub.add_row(row)
+                built.update(dict.fromkeys((p for p in (("Mask", "min"), ("Mask", "max"), ("Mask", "Threshold"))
+                                            if p in by_path), row))
                 consumed.update({("Mask", "min"), ("Mask", "max"), ("Mask", "Threshold")})
                 continue
             if path in {("Mask", "max"), ("Mask", "Threshold")} and ("Mask", "min") in by_path:
@@ -2132,22 +2150,25 @@ class ControlsPanel(QtWidgets.QWidget):
                 row.label.setMinimumWidth(PROCESSING_ROW_LABEL_WIDTH)
                 row.layout().setSpacing(PROCESSING_ROW_GAP)
                 if point_fields:
-                    self._attach_points_to_row(row, point_fields)
+                    built.update(self._attach_points_to_row(row, point_fields))
                     points_attached = True
                 sub.add_row(row)
+                built[path] = row
                 continue
-            self._add_bound_row(sub, field)
+            built[path] = row = self._make_bound_row(field)
+            sub.add_row(row)
         flush_pills()
         # Safety net: never drop the point fields if a group has them but no
         # Axis row to host them.
         if point_fields and not points_attached:
-            self._add_points_header(sub, point_fields)
+            built.update(self._add_points_header(sub, point_fields))
+        return built
 
     def _add_points_header(
         self,
         sub: SubsectionCard,
         point_fields: Sequence[ControlFormField],
-    ) -> None:
+    ) -> dict[tuple[str, ...], FormRow]:
         """Put the point-count field(s) on the subsection header as ``Pts [n] …``.
 
         Reuses :class:`FormRow` (label hidden) so the editors stay harvestable by
@@ -2155,6 +2176,7 @@ class ControlsPanel(QtWidgets.QWidget):
         label = QtWidgets.QLabel("Pts")
         label.setObjectName("controlsHeaderLabel")
         sub.add_header_widget(label)
+        built = {}
         for field in point_fields:
             row = FormRow(
                 label="",
@@ -2169,6 +2191,8 @@ class ControlsPanel(QtWidgets.QWidget):
             row.valueChanged.connect(self.fieldValueChanged)
             row.draftChanged.connect(self.fieldDraftChanged)
             sub.add_header_widget(row)
+            built[field.path] = row
+        return built
 
     @staticmethod
     def _range_low_path(path: tuple[str, ...]) -> tuple[str, ...]:
@@ -2320,7 +2344,7 @@ class ControlsPanel(QtWidgets.QWidget):
         self,
         row: FormRow,
         point_fields: Sequence[ControlFormField],
-    ) -> None:
+    ) -> dict[tuple[str, ...], FormRow]:
         """Park the compact ``Pts [n] …`` cluster on the right of an Axis row.
 
         Reuses :class:`FormRow` (label hidden) so the editors stay harvestable by
@@ -2328,6 +2352,7 @@ class ControlsPanel(QtWidgets.QWidget):
         label = QtWidgets.QLabel("Pts")
         label.setObjectName("controlsHeaderLabel")
         row.add_trailing_widget(label)
+        built = {}
         for field in point_fields:
             pr = FormRow(
                 label="",
@@ -2342,6 +2367,8 @@ class ControlsPanel(QtWidgets.QWidget):
             pr.valueChanged.connect(self.fieldValueChanged)
             pr.draftChanged.connect(self.fieldDraftChanged)
             row.add_trailing_widget(pr)
+            built[field.path] = pr
+        return built
 
     @staticmethod
     def _processing_group_for_path(path: tuple[str, ...]) -> str:

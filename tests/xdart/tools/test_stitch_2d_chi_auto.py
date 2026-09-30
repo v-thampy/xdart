@@ -35,13 +35,15 @@ def test_chi_auto_spans_the_frames_own_chi_and_a_typed_range_is_kept(tmp_path, b
     assert typed.max() + (typed[1] - typed[0]) / 2 == pytest.approx(180.0, abs=1e-3)
 
 
-def test_the_page_builds_auto_and_reads_an_old_full_range_as_auto(qapp, tmp_path):  # noqa: F811
+def test_the_page_builds_auto_and_keeps_an_explicit_range(qapp, tmp_path):  # noqa: F811
+    """Auto is None both ways (a form's Auto loads as Auto, and an explicit −180 to 180 stays explicit)."""
     form = replace(_native_form(tmp_path, "multigeometry", scans="1"), mode="2d")
     page = StitchPage(empty_host_services(_Status()))
     try:
-        page.load_form(replace(form, chi_range=(-180.0, 180.0)))  # Auto, as forms saved it before
+        page.load_form(form)
         assert page._value("chi_auto") is True and page.build_form().chi_range is None
-        page.load_form(replace(form, chi_range=(-150.0, -60.0)))
-        assert page._value("chi_auto") is False and page.build_form().chi_range == (-150.0, -60.0)
+        for explicit in ((-180.0, 180.0), (-150.0, -60.0)):
+            page.load_form(replace(form, chi_range=explicit))
+            assert page._value("chi_auto") is False and page.build_form().chi_range == explicit
     finally:
         page.shutdown()

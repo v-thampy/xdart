@@ -48,8 +48,11 @@ from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifactPayload
 from xrd_tools.session.readiness import ControlFieldKind, ControlFormField, SectionId
 from xdart.gui.tabs.scattering.controls_inventory import (
-    GI_ENABLED, GI_MOTOR, GI_ORIENTATION, GI_THETA, SOURCE_DIRECTORY, SOURCE_FILTER, SOURCE_RECURSIVE,
-    SOURCE_TYPE,
+    GI_1D_AXES, GI_ENABLED, GI_MOTOR, GI_ORIENTATION, GI_THETA, INT_1D_AXIS, INT_1D_POINTS, INT_1D_RADIAL_AUTO,
+    INT_1D_RADIAL_HIGH, INT_1D_RADIAL_LOW, INT_2D_AXIS, INT_2D_AZIM_AUTO, INT_2D_AZIM_HIGH, INT_2D_AZIM_LOW,
+    INT_2D_AZIM_POINTS, INT_2D_RADIAL_AUTO, INT_2D_RADIAL_HIGH, INT_2D_RADIAL_LOW, INT_2D_RADIAL_POINTS,
+    SOURCE_DIRECTORY, SOURCE_FILTER, SOURCE_RECURSIVE, SOURCE_TYPE, STANDARD_1D_AXES, STANDARD_2D_AXES,
+    THRESHOLD_ENABLED, THRESHOLD_MAX, THRESHOLD_MIN,
 )
 from xrd_tools.session.threshold_editing import (
     ThresholdEditRefusal, ThresholdState, threshold_transition,
@@ -63,8 +66,50 @@ _CUT_AXES = {"q_ip": ("Qᵢₚ", "Å⁻¹"), "q_oop": ("Qₒₒₚ", "Å⁻¹")}
 #: The Axis choices: Q and 2θ, and in Grazing the GI cuts (named as Int's GI axes). A GI axis writes
 #: I(q) and both cuts, which one pass gives (maintainer, 2026-09-29: "it will be good to save both by
 #: default along with I(q)"); the choice is the cut a result opens on.
-_STANDARD_AXES = ("Q (Å⁻¹)", "2θ (°)")
-_GI_AXES = {"Qip (Å⁻¹)": "q_ip", "Qoop (Å⁻¹)": "q_oop"}
+_STANDARD_AXES = tuple(label for label in STANDARD_1D_AXES if label != "χ (°)")  # Stitch makes no I(χ)
+#: Grazing's Axis, Int's GI axes a Stitch makes: every Grazing Stitch writes I(q) and both cuts; the choice
+#: is the one a result opens on.
+_GI_AXES = {label: GI_1D_AXES[label] for label in ("Q", "Qip", "Qoop")}
+#: The 2-D Axis, as Int's: Standard's Q-χ and 2θ-χ bin the map in Q or 2θ; a Grazing Stitch 2D writes
+#: the (χ, q) and q_ip-q_oop maps, and the choice is the one a result opens on.
+_STANDARD_MAP_AXES = tuple(STANDARD_2D_AXES)
+_GI_MAP_AXES = ("Qip-Qoop", "Q-χ")
+#: Axis names settings saved before Stitch took Int's GI names.
+_LEGACY_AXES = {"Qip (Å⁻¹)": "Qip", "Qoop (Å⁻¹)": "Qoop"}
+#: The Processing fields, in their rows' order: (group, key, path, default). Int's paths take Int's
+#: labels, rules and rows (``project_control_fields``, ``ControlsPanel.render_processing_rows``); Stitch's
+#: own are its GI ranges and Monitor.
+_PROCESSING = (
+    ("1-D", "unit", INT_1D_AXIS, "Q (Å⁻¹)"),
+    ("1-D", "npt_1d", INT_1D_POINTS, "1500"),
+    ("1-D", "radial_auto", INT_1D_RADIAL_AUTO, True),
+    ("1-D", "q_min", INT_1D_RADIAL_LOW, 0.0),
+    ("1-D", "q_max", INT_1D_RADIAL_HIGH, 6.2),
+    ("1-D", "gi_ip_auto", ("Stitch", "gi_ip_auto"), True),
+    ("1-D", "gi_ip_min", ("Stitch", "gi_ip_low"), -2.0),
+    ("1-D", "gi_ip_max", ("Stitch", "gi_ip_high"), 2.0),
+    ("1-D", "gi_oop_auto", ("Stitch", "gi_oop_auto"), True),
+    ("1-D", "gi_oop_min", ("Stitch", "gi_oop_low"), 0.0),
+    ("1-D", "gi_oop_max", ("Stitch", "gi_oop_high"), 1.0),
+    ("2-D", "map_axis", INT_2D_AXIS, "Q-χ"),
+    ("2-D", "npt_rad_2d", INT_2D_RADIAL_POINTS, "1000"),
+    ("2-D", "npt_azim_2d", INT_2D_AZIM_POINTS, "360"),
+    ("2-D", "map_auto", INT_2D_RADIAL_AUTO, True),
+    ("2-D", "map_min", INT_2D_RADIAL_LOW, 0.0),
+    ("2-D", "map_max", INT_2D_RADIAL_HIGH, 6.2),
+    ("2-D", "chi_auto", INT_2D_AZIM_AUTO, True),
+    ("2-D", "chi_min", INT_2D_AZIM_LOW, -180.0),
+    ("2-D", "chi_max", INT_2D_AZIM_HIGH, 180.0),
+    ("Conditioning", "threshold_enabled", THRESHOLD_ENABLED, True),
+    ("Conditioning", "threshold_min", THRESHOLD_MIN, 0.0),
+    ("Conditioning", "threshold", THRESHOLD_MAX, None),
+    ("Conditioning", "monitor", ("Stitch", "monitor"), ""),
+)
+#: A GI range's label: (the rows' label, what it bins and windows).
+_GI_RANGES = {"gi_ip": ("Qip (Å⁻¹)", "Bins I(Qip) (Auto: the data's span) and is I(Qoop)'s window (Auto: every "
+                                     "pixel); a Stitch 2D's q_ip-q_oop map spans both."),
+              "gi_oop": ("Qoop (Å⁻¹)", "Bins I(Qoop) (Auto: the data's span) and is I(Qip)'s window (Auto: every "
+                                       "pixel); a Stitch 2D's q_ip-q_oop map spans both.")}
 
 
 _LOG = logging.getLogger(__name__)
@@ -268,6 +313,8 @@ class StitchPage(QtWidgets.QWidget):
         self._paths_by_kind = {}
         self._range_rows = []
         self._range_keys = set()
+        #: Each field's key by its path (Int's for the rows Int's composer builds).
+        self._keys_by_path = {}
         self._threshold_state = ThresholdState()
         self._auto_threshold_max = None
         self._queued_jobs = []
@@ -514,6 +561,7 @@ class StitchPage(QtWidgets.QWidget):
         row.draftChanged.connect(self._edited)
         row.browseRequested.connect(lambda _path, name=key: self._browse(name))
         self._fields[key], self._rows[key] = field, row
+        self._keys_by_path[field.path] = key
         return row
 
     def _tip(self, key, text):
@@ -600,56 +648,60 @@ class StitchPage(QtWidgets.QWidget):
             "xrayutilities file saved beside it (<name>.xu.json), or an xrayutilities calibration chosen "
             "directly.")
         self._rows["backend"].valueChanged.connect(self._backend_changed)
-        grid = SubsectionCard("1-D", accent="processing")
-        processing.add_row(grid)
-        axis = self._field(grid, SectionId.PROCESSING, "unit", "Axis", "Q (Å⁻¹)", choices=_STANDARD_AXES)
-        axis.setToolTip("Grazing adds Qip and Qoop: I(q), I(Qip) and I(Qoop) are written (one pass gives "
-                        "both cuts), and the result opens on the one chosen.")
-        self._axis_q = True  # the Q range's unit (every axis but 2θ bins I(q))
-        self._gi_axis = "Qip (Å⁻¹)"  # the GI axis last chosen: the cut a loaded GI form opens on
-        self._rows["unit"].valueChanged.connect(self._processing_axis_changed)
-        # As Int: the Pts cluster sits on the Axis row (ControlsPanel._attach_points_to_row).
-        self._align_to_ranges(axis)
-        points_label = QtWidgets.QLabel("Pts")
-        points_label.setObjectName("controlsHeaderLabel")
-        axis.add_trailing_widget(points_label)
-        points = self._field(None, SectionId.PROCESSING, "npt_1d", "Pts", "1500")
-        points.label.hide()
-        points.setMaximumWidth(58)
-        axis.add_trailing_widget(points)
-        self.radial_range = self._range(grid, "Q (Å⁻¹)", ("q_min", "q_max", "radial_auto"), (0., 6.2, True))
-        # A GI axis's two ranges, as Int's: Qip first, Qoop second. Each cut is binned over its own
-        # range (Auto: the data's span) and keeps the pixels inside the other one (Auto: every pixel).
-        self._gi_rows = (self._range(grid, "Qip (Å⁻¹)", ("gi_ip_min", "gi_ip_max", "gi_ip_auto"), (-2., 2., True)),
-                         self._range(grid, "Qoop (Å⁻¹)", ("gi_oop_min", "gi_oop_max", "gi_oop_auto"), (0., 1., True)))
-        self._gi_rows[0].setToolTip("Bins I(Qip) (Auto: the data's span) and is I(Qoop)'s window (Auto: every pixel).")
-        self._gi_rows[1].setToolTip("Bins I(Qoop) (Auto: the data's span) and is I(Qip)'s window (Auto: every pixel).")
+        # Int's Processing rows, from its composer (maintainer, 2026-09-30: "it still feels like the conventions
+        # and rules that were implemented in int 2d for display etc are not being uniformly applied"): each
+        # group's Axis with its Pts, a RangeRow per range and the Threshold, on Int's paths with Int's labels and
+        # rules; Stitch's GI ranges and Monitor beside them. Built once: the mode shows the 2-D group (the map on
+        # its own axis and ranges, as Int 2D's), Grazing the GI ranges.
+        self._axis_q = self._map_q = True  # each radial range's unit: Q (every axis but 2θ, 2θ-χ)
+        self._gi_axis = "Q"  # the Grazing axis last chosen: the one a loaded GI form opens on
+        for _group, key, path, value in _PROCESSING:
+            self._fields[key] = self._new_field(SectionId.PROCESSING, key, key, value, path=path)
+            if path[-1].endswith(("_auto", "_low", "_high")) or path[0] == "Mask":
+                self._range_keys.add(key)
+        fields = self._processing_fields()
+        self._processing_cards = {}
+        for name in ("1-D", "2-D", "Conditioning"):
+            card = self._processing_cards[name] = SubsectionCard(name, accent="processing")
+            processing.add_row(card)
+            rows = self.controls.render_processing_rows(
+                card, tuple(fields[key] for group, key, _path, _value in _PROCESSING if group == name))
+            for group, key, path, _value in _PROCESSING:
+                if group != name:
+                    continue
+                self._keys_by_path[path] = key
+                row = rows[path]
+                if key in self._range_keys:
+                    if row not in self._range_rows:
+                        row.valueChanged.connect(self._range_edited)
+                        row.draftChanged.connect(self._edited)
+                        self._range_rows.append(row)
+                else:  # its projected field (a combo's kind and choices), which set_field applies
+                    self._bind(key, fields[key], row)
+        self._map_card = self._processing_cards["2-D"]
+        range_row = {key: row for row in self._range_rows for path, key in self._keys_by_path.items()
+                     if key in self._range_keys and path in (row._low_path, row._high_path)}
+        self.radial_range, self.map_range, self.chi_range, self.threshold_range = (
+            range_row[key] for key in ("q_min", "map_min", "chi_min", "threshold_min"))
+        self._gi_rows = (range_row["gi_ip_min"], range_row["gi_oop_min"])
+        for row, prefix in zip(self._gi_rows, _GI_RANGES):
+            row.setToolTip(_GI_RANGES[prefix][1])
+        self._tip("unit", "Grazing's Q, Qip and Qoop each write I(q) and both cuts (one pass gives both); the "
+                          "result opens on the one chosen.")
+        self._tip("map_axis", "The map's axes, as Int 2D's: Q-χ or 2θ-χ over the ranges below. Grazing writes "
+                              "the (χ, q) map and the q_ip-q_oop map (over the Qip and Qoop ranges above); the "
+                              "result opens on the one chosen.")
+        self._tip("npt_rad_2d", "The map's radial points")
+        self._tip("npt_azim_2d", "The map's χ points")
+        self.map_range.setToolTip("The map's radial range (Auto: its frames' extent), its own as Int 2D's; "
+                                  "I(q) beside it keeps the 1-D range.")
+        self.chi_range.setToolTip("The map's χ range (Auto: its frames' extent). I(q) beside it takes every χ, "
+                                  "as a Stitch 1D.")
+        self._align_to_ranges(self._rows["monitor"])
+        for key in ("unit", "map_axis"):
+            self._rows[key].valueChanged.connect(self._processing_axis_changed)
         self._render_gi()
-        # Stitch 2D: Int 2D's rows for the map, its points and χ range; the Axis and the radial range
-        # above are the map's too, and I(q) beside it takes Pts
-        self._map_card = SubsectionCard("2-D", accent="processing")
-        processing.add_row(self._map_card)
-        points_label = QtWidgets.QLabel("Pts")
-        points_label.setObjectName("controlsHeaderLabel")
-        self._map_card.add_header_widget(points_label)
-        for key, value, tip in (("npt_rad_2d", "1000", "The map's radial points"),
-                                ("npt_azim_2d", "360", "The map's χ points")):
-            row = self._field(None, SectionId.PROCESSING, key, "Pts", value)
-            row.label.hide()
-            row.setMaximumWidth(72)
-            row.setToolTip(tip)
-            self._map_card.add_header_widget(row)
-        self.chi_range = self._range(self._map_card, "χ (°)", ("chi_min", "chi_max", "chi_auto"),
-                                     (-180., 180., True))
-        self.chi_range.setToolTip("The map's χ range (Auto: every χ). I(q) beside it takes every χ, as a "
-                                  "Stitch 1D.")
         self._map_card.setVisible(False)
-        conditioning = SubsectionCard("Conditioning", accent="processing")
-        processing.add_row(conditioning)
-        self.threshold_range = self._range(conditioning, "Threshold", ("threshold_min", "threshold", "threshold_enabled"), (0., None, True),
-                                           display_decimals=0)  # as Int's threshold row
-        self.threshold_range._high.setPlaceholderText("Auto")
-        self._align_to_ranges(self._field(conditioning, SectionId.PROCESSING, "monitor", "Monitor"))
         self.advanced = QtWidgets.QDialog(self)
         self.advanced.setWindowTitle("Advanced — Stitch 1D")
         advanced_layout = QtWidgets.QVBoxLayout(self.advanced)
@@ -847,21 +899,26 @@ class StitchPage(QtWidgets.QWidget):
         self._edited()
 
     def _render_gi_axis(self):
-        """The Axis choices (Grazing adds the GI cuts), the GI ranges when a GI axis is chosen, and
-        the Experiment status that follows the axis."""
-        field, current = self._fields["unit"], self._value("unit")
-        choices = _STANDARD_AXES + (tuple(_GI_AXES) if self._gi["enabled"] else ())
-        if field.choices != choices or current not in choices:
-            value = current if current in choices else "Q (Å⁻¹)"  # Standard: a GI axis becomes Q
-            self._fields["unit"] = replace(field, choices=choices, value=value)
-            self._rows["unit"].apply_field(self._fields["unit"])
+        """The Axis choices, as Int's: Standard's Q and 2θ (the 2-D Q-χ and 2θ-χ), Grazing's Q, Qip and
+        Qoop (the 2-D Qip-Qoop and Q-χ); a choice Grazing lacks becomes its Q (its last axis for the 1-D), the
+        GI ranges in Grazing, and the Experiment status."""
+        grazing = self._gi["enabled"]
+        for key, choices, fallback in (
+                ("unit", tuple(_GI_AXES) if grazing else _STANDARD_AXES,
+                 (self._gi_axis if self._gi_axis in _GI_AXES else "Q") if grazing else "Q (Å⁻¹)"),
+                ("map_axis", _GI_MAP_AXES if grazing else _STANDARD_MAP_AXES, "Q-χ")):
+            field, current = self._fields[key], self._value(key)
+            if field.choices != choices or current not in choices:
+                self._fields[key] = replace(field, choices=choices, value=current if current in choices else fallback)
+                self._rows[key].apply_field(self._fields[key])
         for row in self._gi_rows:
-            row.setVisible(self._gi["enabled"] and self._value("unit") in _GI_AXES)
+            row.setVisible(grazing)
         status = self._gi_status()
         if getattr(self, "_gi_card", None) is not None:
             self._gi_card.status.setText(status)
             self._gi_card.status.setVisible(bool(status))
         self.controls.experiment_card.set_status_text(status)  # as Int's EXPERIMENT header
+        self._processing_axis_changed()
 
     def _gi_edited(self, path, value):
         key = self._GI_KEYS.get(tuple(path))
@@ -876,10 +933,10 @@ class StitchPage(QtWidgets.QWidget):
         self._edited()
 
     def _gi_value(self):
-        """The form's grazing incidence: a StitchGI for a GI axis in Grazing, else None (Standard, or
-        Grazing with Q or 2θ: a plain result)."""
+        """The form's grazing incidence in Grazing (I(q) and both cuts, whichever axis it opens on, as Int's
+        Grazing is a GI run), else None."""
         value = self._value
-        if not self._gi["enabled"] or value("unit") not in _GI_AXES:
+        if not self._gi["enabled"]:
             return None
         from xrd_tools.integrate.stitch_gi import GI_CUTS, StitchGI
         motor, tilt = self._gi["motor"] or "Manual", self._gi["tilt_motor"] or "Manual"
@@ -912,8 +969,7 @@ class StitchPage(QtWidgets.QWidget):
             if gi.tilt_chi_deg is not None:
                 self._gi["tilt_chi"] = f"{gi.tilt_chi_deg:g}"
             self._render_gi()  # Grazing's axis choices, before choosing one
-            if self._value("unit") not in _GI_AXES:  # the cut it opens on: the one last chosen
-                self.set_field("unit", self._gi_axis)
+            self.set_field("unit", self._gi_axis)  # the one it opens on: the Grazing axis last chosen
             for prefix, bounds in (("gi_ip", gi.ip_range), ("gi_oop", gi.oop_range)):
                 self.set_field(f"{prefix}_auto", bounds is None)
                 if bounds is not None:
@@ -922,36 +978,52 @@ class StitchPage(QtWidgets.QWidget):
         self._render_gi()
         self._edited()
 
-    def _range(self, card, label, keys, values, *, display_decimals=None):
-        specs = []
-        for key, value in zip(keys, values):
-            field = ControlFormField(SectionId.PROCESSING, label, ("Stitch", key), value,
-                ControlFieldKind.BOOL if isinstance(value, bool) else ControlFieldKind.LINE)
-            self._fields[key] = field
-            self._range_keys.add(key)
-            specs.append(dict(path=field.path, value=value))
-        row = RangeRow(label=label, low=specs[0], high=specs[1], toggle=specs[2],
-                       display_decimals=display_decimals)
-        row.valueChanged.connect(self._range_edited)
-        row.draftChanged.connect(self._edited)
-        self._range_rows.append(row)
-        card.add_row(row)
-        return row
+    def _processing_fields(self):
+        """This page's Processing fields by key, as Int projects them (``project_control_fields``: its labels,
+        the range rows' following the axes, and its rules: a range's bounds are greyed under Auto, the
+        Threshold's limits when it is off); Stitch's GI ranges and Monitor with Int's range rule."""
+        from xdart.gui.tabs.scattering.controls_inventory import project_control_fields
+
+        def current(key):
+            return self._value(key) if key in self._rows else self._fields[key].value
+        values = {path: current(key) for _group, key, path, _value in _PROCESSING if path[0] != "Stitch"}
+        # the 1-D range is I(q)'s whatever the Grazing axis; the 2-D ranges the (χ, q) map's
+        values.update({("Int1D", "unit"): "2th_deg" if current("unit") == "2θ (°)" else "q_A^-1",
+                       ("Int1D", "gi_mode"): "q_total",
+                       ("Int2D", "unit"): STANDARD_2D_AXES.get(current("map_axis"), "q_A^-1"),
+                       ("Int2D", "gi_mode"): "q_chi"})
+        grazing = self._gi["enabled"]
+        projected = {field.path: field for field in project_control_fields(values, {
+            INT_1D_AXIS: tuple(_GI_AXES) if grazing else _STANDARD_AXES,
+            INT_2D_AXIS: _GI_MAP_AXES if grazing else _STANDARD_MAP_AXES})}
+        fields = {}
+        for _group, key, path, _value in _PROCESSING:
+            if path in projected:
+                fields[key] = projected[path]
+            elif key == "monitor":
+                fields[key] = replace(self._fields[key], label="Monitor", value=current(key))
+            else:  # a GI range's bound or Auto, with Int's range rule
+                prefix, part = key.rsplit("_", 1)
+                label, auto = _GI_RANGES[prefix][0], bool(self._fields[f"{prefix}_auto"].value)
+                fields[key] = replace(
+                    self._fields[key], value=current(key),
+                    label=f"{label} {dict(min='Low', max='High', auto='Auto')[part]}",
+                    kind=ControlFieldKind.BOOL if part == "auto" else ControlFieldKind.LINE,
+                    enabled=part == "auto" or not auto, reason="Disable Auto to edit this range." if (
+                        part != "auto" and auto) else "")
+        # the decision-39 hint: the automatic ceiling is the Max box's grey text, never its value
+        fields["threshold"] = replace(fields["threshold"], placeholder=self._fields["threshold"].placeholder)
+        return fields
 
     def _render_ranges(self):
-        values = {field.path: field for key, field in self._fields.items() if key in self._range_keys}
-        for low, high, toggle in (("q_min", "q_max", "radial_auto"), ("gi_ip_min", "gi_ip_max", "gi_ip_auto"),
-                                  ("gi_oop_min", "gi_oop_max", "gi_oop_auto"), ("chi_min", "chi_max", "chi_auto")):
-            auto = bool(self._fields[toggle].value)
-            for key in (low, high):
-                values[("Stitch", key)] = replace(self._fields[key], enabled=not auto,
-                                                  reason="Disable Auto to edit this range." if auto else "")
-        off = self._threshold_mode == "off"  # Int's rule: the limits follow the Threshold toggle
-        for key in ("threshold_min", "threshold"):
-            values[("Stitch", key)] = replace(self._fields[key], enabled=not off,
-                                              reason="Enable Threshold to edit this limit." if off else "")
+        """Int's projection of the Processing fields onto their rows in place (Int's same-schema update):
+        values, what is greyed, and the range rows' labels following the axes."""
+        fields = self._processing_fields()
+        by_path = {field.path: field for field in fields.values()}
         for row in self._range_rows:
-            row.apply_fields(values)
+            row.apply_fields(by_path)
+            label = by_path[row._low_path].label
+            row.label.setText("Threshold" if row._low_path == THRESHOLD_MIN else label.removesuffix(" Low"))
 
     def _show_auto_ceiling(self, ceilings):
         """The automatic ceiling (decision 39) as the Max box's grey hint, never its value: the one
@@ -979,7 +1051,7 @@ class StitchPage(QtWidgets.QWidget):
         return state.apply_threshold or state.threshold_min is not None or state.threshold_max is not None
 
     def _range_edited(self, path, value):
-        key = path[-1]
+        key = self._keys_by_path.get(tuple(path), path[-1])
         if key in {"threshold_min", "threshold", "threshold_enabled"}:
             result = threshold_transition(self._threshold_state,
                 {"threshold_min": "min", "threshold": "max", "threshold_enabled": "enabled"}[key],
@@ -1066,22 +1138,25 @@ class StitchPage(QtWidgets.QWidget):
         self._source_committed()
 
     def _processing_axis_changed(self, *_args):
-        if self._value("unit") in _GI_AXES:
+        """An Axis choice: a change of unit resets its range to the unit's defaults (every 1-D axis but 2θ
+        bins I(q); a map Q-χ or 2θ-χ), and the range rows' labels follow."""
+        if self._gi["enabled"] and self._value("unit") in _GI_AXES:
             self._gi_axis = self._value("unit")
-        q = self._value("unit") != "2θ (°)"
-        if q != self._axis_q:  # only a change of unit resets the range: every GI axis bins I(q) too
-            self._axis_q = q
-            self.radial_range.label.setText("Q (Å⁻¹)" if q else "2θ (°)")
-            self._fields["q_min"] = replace(self._fields["q_min"], value=0.)
-            self._fields["q_max"] = replace(self._fields["q_max"], value=6.2 if q else 90.)
-            self._render_ranges()
-        if hasattr(self, "_gi_rows"):
-            self._render_gi_axis()
+        for axis, q, low, high in (("unit", self._value("unit") != "2θ (°)", "q_min", "q_max"),
+                                   ("map_axis", self._value("map_axis") != "2θ-χ", "map_min", "map_max")):
+            attribute = "_axis_q" if axis == "unit" else "_map_q"
+            if q != getattr(self, attribute):
+                setattr(self, attribute, q)
+                self._fields[low] = replace(self._fields[low], value=0.)
+                self._fields[high] = replace(self._fields[high], value=6.2 if q else 90.)
+        self._render_ranges()
 
     def set_field(self, key, value):
         if key in self._range_keys:
-            self._range_edited(("Stitch", key), value)
+            self._range_edited(self._fields[key].path, value)
             return
+        if key == "unit":
+            value = _LEGACY_AXES.get(value, value)
         field = replace(self._fields[key], value=value)
         self._fields[key] = field
         self._rows[key].apply_field(field)
@@ -1094,7 +1169,7 @@ class StitchPage(QtWidgets.QWidget):
             self._source_changed(field.path, value)
         elif key == "scan":
             self._source_committed()
-        elif key == "unit":
+        elif key in {"unit", "map_axis"}:
             self._processing_axis_changed()
         elif key == "project_root" and not self._value("output_path"):
             self.set_field("output_path", str(Path(value) / "xdart_processed_data"))
@@ -1171,7 +1246,7 @@ class StitchPage(QtWidgets.QWidget):
         only Preview reads (Codex audit G-F2: no folder is listed on an edit)."""
         from xrd_tools.analysis.stitch_sources import int_scan_name
         from xrd_tools.io.output_path import generated_artifact_family, scan_family
-        gi = self._gi["enabled"] and self._value("unit") in _GI_AXES
+        gi = self._gi["enabled"]
         if kind == "Spec":
             return "auto · as Int names the scan's images" + (", with _gi" if gi else "")
         if kind != "NeXus" or not sources:
@@ -1285,8 +1360,7 @@ class StitchPage(QtWidgets.QWidget):
             text = f"{len(sources)} {kind} source{'s' * (len(sources) != 1)}"
         text += " · " + ("xrayutilities" if value("backend") == "xrayutilities histogram" else "pyFAI MultiGeometry")
         if self._gi["enabled"]:
-            text += (f" · grazing {str(value('unit')).split(' ')[0]}" if value("unit") in _GI_AXES
-                     else " · no grazing cuts: choose Qip or Qoop as the Axis")
+            text += f" · grazing {value('unit')}"
         return text
 
     def _backend_changed(self, *_args):
@@ -1579,12 +1653,12 @@ class StitchPage(QtWidgets.QWidget):
             directory = Path(value("project_root")) / directory
         map_mode = self._mode == "Stitch 2D"
         output = str(directory / ("stitch_stitch2d.nexus" if map_mode else "stitch_stitch1d.nexus"))
-        if map_mode:  # the map on the 1-D axis and range
+        if map_mode:  # the map on its own axis and ranges, as Int 2D's (Auto: the frames' own extent)
             native.update(mode="2d", npt_rad_2d=int(value("npt_rad_2d")), npt_azim_2d=int(value("npt_azim_2d")),
-                          chi_range=None if value("chi_auto")  # Auto: the frames' own χ extent
-                          else (float(value("chi_min")), float(value("chi_max"))),
-                          map_unit=native["unit"],
-                          map_radial_range=None if value("radial_auto") else (float(value("q_min")), float(value("q_max"))))
+                          chi_range=None if value("chi_auto") else (float(value("chi_min")), float(value("chi_max"))),
+                          map_unit=STANDARD_2D_AXES.get(value("map_axis"), "q_A^-1"),  # Grazing's maps: Q
+                          map_radial_range=None if value("map_auto")
+                          else (float(value("map_min")), float(value("map_max"))))
         return StitchToolForm(
             project_root=value("project_root"),
             spec_path=self._source_paths[0], scan=value("scan"),
@@ -1637,13 +1711,16 @@ class StitchPage(QtWidgets.QWidget):
             flat_cutoff=f"{100 * form.flat_min_fraction:g}")
         if form.q_range is not None:
             fields.update(q_min=form.q_range[0], q_max=form.q_range[1])
-        if form.mode == "2d":
-            # Auto was (−180, 180) before the frames' own extent (settings saved then read as Auto)
-            chi = form.chi_range
+        if form.mode == "2d":  # Auto is None, as saved: an explicit −180 to 180 stays explicit
+            chi, radial = form.chi_range, form.map_radial_range
+            if form.gi is None:  # a Grazing map's 2-D Axis is the one it opens on: the page's
+                fields.update(map_axis="2θ-χ" if form.map_unit == "2th_deg" else "Q-χ")
             fields.update(npt_rad_2d=form.npt_rad_2d, npt_azim_2d=form.npt_azim_2d,
-                          chi_auto=chi is None or chi == (-180.0, 180.0))
+                          chi_auto=chi is None, map_auto=radial is None)
             if chi is not None:
                 fields.update(chi_min=chi[0], chi_max=chi[1])
+            if radial is not None:
+                fields.update(map_min=radial[0], map_max=radial[1])
         self.select_mode("Stitch 2D" if form.mode == "2d" else "Stitch 1D")
         for key, value in fields.items():
             self.set_field(key, value)
@@ -2122,13 +2199,17 @@ class StitchPage(QtWidgets.QWidget):
             item.setToolTip(key)
             self.results.addItem(item)
             self._result_key(key)
-        if payload.gi:  # a GI result opens on the cut the Axis chose, else on a cut it has
+        if payload.gi:  # a GI result opens on the axis Grazing chose (I(q) or a cut), else on a cut it has
             modes = {mode for mode, _cut in payload.gi}
-            chosen = _GI_AXES.get(self._value("unit"))
-            if chosen in modes:
+            chosen = _GI_AXES.get(self._value("unit")) if self._gi["enabled"] else None
+            if chosen == "q_total":
+                self._set_view(plot_axis="Q")
+            elif chosen in modes:
                 self._set_view(plot_axis=chosen)
             elif self._view.plot_axis not in modes:
                 self._set_view(plot_axis=payload.gi[0][0])
+            if payload.gi_map is not None and self._gi["enabled"]:  # and on the map the 2-D Axis chose
+                self._set_view(image_axis="qip_qoop" if self._value("map_axis") == "Qip-Qoop" else "q_chi")
         # shown once: selecting it would rebuild the frame list and redraw through the list's signals,
         # and again here (Codex testing-fixes review, startup recommendation 2)
         blocker = QtCore.QSignalBlocker(self.results)

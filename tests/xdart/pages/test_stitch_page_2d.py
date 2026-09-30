@@ -126,6 +126,75 @@ def test_the_layout_is_the_modes_as_int_2ds(qapp):
         qapp.processEvents()
 
 
+def test_the_2d_rows_are_int_2ds_and_reach_the_form_and_back(qapp, tmp_path):
+    """Maintainer, 2026-09-30: "like int 1d/2d the Processing panel in Stitch should also have the capability of
+    selecting a range for both axes in the 2d ... there is no choice to select the 2d integration axes". Int 2D's
+    rows, from Int's composer: the 2-D Axis (Q-χ, 2θ-χ) with its Pts on it, and the map's radial and χ ranges,
+    the radial one's label and defaults following the Axis; they reach the form (the map's own axis, I(q)
+    keeping the 1-D one) and come back from it and from the settings."""
+    from dataclasses import replace
+    from xdart.gui.tabs.stitch.settings import apply_page_settings, page_settings
+    page, other = StitchPage(empty_host_services(_Status())), StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(replace(_native_form(tmp_path, "multigeometry", scans="1"), mode="2d"))
+        axis = page._rows["map_axis"]
+        assert not page._map_card.isHidden() and page._map_card.isAncestorOf(axis) and axis.label.text() == "Axis"
+        assert [axis.editor.itemText(index) for index in range(axis.editor.count())] == ["Q-χ", "2θ-χ"]
+        assert all(axis.isAncestorOf(page._rows[key]) for key in ("npt_rad_2d", "npt_azim_2d"))  # Int's Pts
+        assert page._rows["npt_1d"].maximumWidth() == page._rows["npt_rad_2d"].maximumWidth() == 58
+        assert (page.map_range.label.text(), page.chi_range.label.text()) == ("Q (Å⁻¹)", "χ (°)")
+        form = page.build_form()
+        assert (form.map_unit, form.map_radial_range, form.chi_range) == ("q_A^-1", None, None)
+        page.set_field("map_axis", "2θ-χ")
+        assert page.map_range.label.text() == "2θ (°)" and page._fields["map_max"].value == 90.0
+        page.set_field("map_auto", False)
+        assert page.map_range._low.isEnabled()
+        page.set_field("map_min", 12.0)
+        page.set_field("map_max", 48.0)
+        page.set_field("chi_auto", False)
+        page.set_field("chi_min", -150.0)
+        page.set_field("chi_max", -10.0)
+        form = page.build_form()
+        assert (form.map_unit, form.map_radial_range, form.chi_range) == ("2th_deg", (12.0, 48.0), (-150.0, -10.0))
+        assert (form.unit, form.q_range) == ("q_A^-1", None)  # I(q) keeps the 1-D axis and range
+        other.load_form(form)
+        assert other._value("map_axis") == "2θ-χ" and other.build_form().fingerprint == form.fingerprint
+        other.load_form(replace(form, map_unit="q_A^-1", map_radial_range=None, chi_range=None))
+        apply_page_settings(other, page_settings(page))
+        assert other.build_form().fingerprint == form.fingerprint
+    finally:
+        for each in (page, other):
+            assert each.shutdown().status is PageCleanup.CLEAN
+            each.deleteLater()
+        qapp.processEvents()
+
+
+def test_grazing_2d_axis_is_the_map_a_result_opens_on(qapp, tmp_path):
+    """Int's Grazing 2-D axes (Qip-Qoop, Q-χ): a Grazing Stitch 2D writes both maps, in Q, and opens on the one
+    chosen, as Grazing's 1-D Axis chooses the cut a result opens on."""
+    from dataclasses import replace
+    from xrd_tools.integrate.stitch_gi import StitchGI
+    from tests.xdart.tools.test_stitch_native_gi import _SAMPLE, _gi_form
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(replace(_gi_form(tmp_path, "multigeometry", StitchGI(
+            ("q_ip", "q_oop"), incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE)),
+            mode="2d", npt_rad_2d=24, npt_azim_2d=16))
+        axis = page._rows["map_axis"]
+        assert [axis.editor.itemText(index) for index in range(axis.editor.count())] == ["Qip-Qoop", "Q-χ"]
+        page.set_field("map_axis", "Qip-Qoop")
+        assert page.build_form().map_unit == "q_A^-1"
+        page.run_bar.startButton.click()
+        _wait(page, qapp)
+        payload = page._current_payload()
+        assert payload.gi_map is not None and page._view.image_axis == "qip_qoop"
+        np.testing.assert_array_equal(page._last_map_state.heavy.cake, np.asarray(payload.gi_map.intensity.T, dtype=float))
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
 @pytest.mark.parametrize("backend", ["multigeometry", "xu_hist"])
 def test_a_gi_stitch_2d_shows_both_maps_as_ints_gi_view(qapp, tmp_path, backend):
     """Item 3: a GI Stitch 2D is a GI frame as Int's: the image axis offers the (chi, q) and the q_ip-q_oop
