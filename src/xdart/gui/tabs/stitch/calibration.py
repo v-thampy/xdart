@@ -25,6 +25,7 @@ from xrd_tools.integrate.stitch_calibration import (
     load_calibration_session, pair_validation_angles, save_calibration_pair, save_calibration_session,
     scan_motor_names, source_frame_choices, suggested_frame_indices, validate_frame_files, xu_partner_path,
 )
+from .direct_beam_fit import DirectBeamFitWindow, direct_beam_fit_text
 
 
 #: Share of the progress bar per automatic-refinement stage (the owner needs one fixed total).
@@ -172,6 +173,7 @@ def _dispatch_job(request, cancelled, publish):
         options = dict(options)
         if cancelled.is_set():
             raise OperationCancelled('direct-beam calibration cancelled')
+        energy = None  # the scan's one recorded energy (SPEC image series), for the wavelength
         with ExitStack() as resources:
             source_options = dict(motor=motor, entry=spec.entry or 'entry')
             if spec.kind is SourceKind.SPEC:
@@ -183,6 +185,8 @@ def _dispatch_job(request, cancelled, publish):
                     # Preserve the shared strict series discovery and exact
                     # path/frame references; the loader owns SPEC angle pairing.
                     choices = source_frame_choices(spec, (motor,))
+                    energies = {value for _index, _motors, value in choices if value is not None}
+                    energy = energies.pop() if len(energies) == 1 else None
                     source = open_source(replace(spec, options={**spec.options,
                                                               'require_complete_images': True}))
                     if getattr(source, 'close', None) is not None:
@@ -201,7 +205,7 @@ def _dispatch_job(request, cancelled, publish):
                 frame_ids=inputs.frame_ids, point_ids=inputs.point_ids, **options)
             if cancelled.is_set():
                 raise OperationCancelled('direct-beam calibration cancelled')
-            return result
+            return result, energy
     raise ValueError('unknown calibration operation')
 
 
@@ -349,6 +353,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._row_identity = None
         self._close_pending = False
         self._distance_result = None
+        self._distance_energy_eV = None  # the fitted direct-beam scan's recorded energy
+        self._direct_beam_fit_window = None
         self._distance_key = self._distance_pending_key = None  # what the result was fitted from
         #: The arm the staged frames read: (del, nu), or (2θ, None) for fourc/twoc.
         self._frame_motors = ('del', 'nu')
@@ -844,10 +850,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._edit(form, 'rough_mount', 'Detector mount tilt, roll (°)', '0, 0',
                    tip='The detector mount\'s tilt and roll, held fixed (the arm\'s mount extension; a '
                        'single 2θ arm has none). 0, 0: the detector faces the beam squarely at every angle.')
-        self._edit(form, 'rough_wavelength', 'Wavelength (Å)', '', placeholder="blank: the calibrant scan's energy",
+        self._edit(form, 'rough_wavelength', 'Wavelength (Å)', '',
+                   placeholder="blank: the calibrant scan's energy, else the direct-beam scan's",
                    tip='The X-ray wavelength of this geometry. Blank: the calibrant scan\'s recorded energy (2 · '
-                       'Select frames), when it has one. Save as calibration and a refinement started from this '
-                       'geometry need it (Stitch checks each scan\'s energy against it).')
+                       'Select frames), else the direct-beam scan\'s once it is fitted, when they record one. '
+                       'Save as calibration and a refinement started from this geometry need it (Stitch checks '
+                       'each scan\'s energy against it).')
         self._fit_options, options = self._card(layout, 'Fit options')
         self._edit(options, 'beam_strip', 'Strip half width (pixels)', '2',
                    tip='The beam spot is searched in a strip this many pixels either side of its path.')
@@ -865,6 +873,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.beam_summary.setReadOnly(True)
         self.beam_summary.setMaximumHeight(self.beam_summary.fontMetrics().lineSpacing() * 9)
         layout.addWidget(self.beam_summary)
+        self.show_fit_button = QtWidgets.QPushButton('Show the fit…')
+        self.show_fit_button.setToolTip('The beam centre against the motor angle, the fitted model and its '
+                                        'residuals, with the distance (it opens after every fit).')
+        self.show_fit_button.clicked.connect(self._show_direct_beam_fit)
+        self.show_fit_button.setEnabled(False)
+        layout.addWidget(self.show_fit_button)
         self.apply_distance_button = QtWidgets.QPushButton('Use result as distance seed')
         self.apply_distance_button.setToolTip('Starts the final fit (3 · Calibrate and fit) from this distance.')
         self.apply_distance_button.clicked.connect(self._apply_distance)
@@ -1016,7 +1030,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             self._show(key, shown)
         form.setRowVisible(self.beam_source_kind, scan)
         form.setRowVisible(self.motion, scan)
-        for widget in (self._fit_options, self.beam_button, self.beam_summary, self.apply_distance_button):
+        for widget in (self._fit_options, self.beam_button, self.beam_summary, self.show_fit_button,
+                       self.apply_distance_button):
             widget.setVisible(scan)
         self.save_rough_button.setVisible(mode != 'skip')
         self._label('beam_source').setText('NeXus file' if kind == 'nexus' else 'SPEC file')
@@ -1067,14 +1082,18 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _rough_wavelength_A(self):
         """The typed wavelength (Å), else the calibrant scan's when every frame read records the same
-        energy, else None."""
+        energy, else the direct-beam scan's (maintainer, 2026-09-29: "why doesn't it get it from the
+        spec file?") while its fit is current, else None."""
         if self._text('rough_wavelength'):
             return float(self._text('rough_wavelength'))
-        energies = {energy for _index, _values, energy in self._choices if energy is not None}
-        if len(energies) != 1:
-            return None
         from xrd_tools.core.energy import energy_eV_to_wavelength_m
-        return float(energy_eV_to_wavelength_m(energies.pop())) * 1e10
+        energies = {energy for _index, _values, energy in self._choices if energy is not None}
+        if len(energies) == 1:
+            return float(energy_eV_to_wavelength_m(energies.pop())) * 1e10
+        if (not energies and self.rough_mode.currentData() == 'scan' and self._distance_fresh()
+                and self._distance_energy_eV is not None):
+            return float(energy_eV_to_wavelength_m(self._distance_energy_eV)) * 1e10
+        return None
 
     def _beam_role(self):
         """The arm circle the direct-beam motor names ("del", "tth", or a motor), by the
@@ -1727,6 +1746,32 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             self._start('distance', request)
         self._guard(go)
 
+    def _show_direct_beam_fit(self):
+        """The direct-beam fit in its own window, with the distance (opened after every fit)."""
+        if self._distance_result is None:
+            self.status.setText('Fit a direct-beam scan first.')
+            return
+        if self._direct_beam_fit_window is None:
+            self._direct_beam_fit_window = DirectBeamFitWindow(self)
+        self._direct_beam_fit_window.show_result(self._distance_result, self._distance_energy_eV)
+        self._direct_beam_fit_window.show()
+        self._direct_beam_fit_window.raise_()
+        self.show_fit_button.setEnabled(True)
+
+    def hideEvent(self, event):
+        """The fit window goes with this window (closed, hidden, or shut down by the host)."""
+        if self._direct_beam_fit_window is not None:
+            self._direct_beam_fit_window.close()
+        super().hideEvent(event)
+
+    def keyPressEvent(self, event):
+        """Return or Enter commits the box being typed in and presses no button: with many boxes and
+        buttons, the dialog's default button (Fit direct-beam distance) would start a job."""
+        if event.key() in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter):
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def _apply_distance(self):
         if self._distance_result is None:
             self.status.setText('Fit a direct-beam scan first.')
@@ -1897,6 +1942,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     remember_browse_path(Path(result.pyfai_path))
                     self.fit_summary.appendPlainText('\n' + saved_pair_text(result))
                 elif kind == 'distance':
+                    result, self._distance_energy_eV = result
                     self._distance_result, self._distance_key = result, self._distance_pending_key
                     rows = [f'Distance: {result.distance_mm:.6g} mm; regression SE: {result.distance_std_m * 1000:.3g} mm',
                             f'Beam pixel at the zero: {result.zero_beam_pixel[0]:.2f}, {result.zero_beam_pixel[1]:.2f} '
@@ -1905,8 +1951,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                             'Frame · angle (°) · centre (px) · residual (px) · status']
                     rows += [f'{result.point_ids[i]} · {result.angles_deg[i]:.6g} · {result.centres_px[i]:.5g} · {result.residuals_px[i]:.4g} · {"used" if result.used[i] else result.rejection_reasons[i]}' for i in range(len(result.angles_deg))]
                     self.beam_summary.setPlainText('\n'.join(rows))
+                    self.beam_summary.verticalScrollBar().setValue(0)  # the distance, first
                     self._beam_pixel_hint()
                     self._render_frames()  # the measured distance now predicts the rings
+                    self._show_direct_beam_fit()
                 if kind == 'calibrate' and result is not None:
                     pending = [frame for frame in self.frames if not frame.complete]
                     self.status.setText(f'Frame {result.index} saved. ' + (
@@ -1914,6 +1962,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 elif kind == 'save':
                     self.status.setText(saved_pair_text(result))
                     self.calibrationSaved.emit(result.pyfai_path, 'multigeometry')  # once, with both files written
+                elif kind == 'distance':
+                    self.status.setText(direct_beam_fit_text(self._distance_result, self._distance_energy_eV))
                 else:
                     self.status.setText('No PONI was saved; the frame remains unchanged.' if kind == 'calibrate' and result is None else f'{kind.capitalize()} complete.')
             except Exception as error:

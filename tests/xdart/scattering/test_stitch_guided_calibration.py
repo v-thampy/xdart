@@ -440,7 +440,8 @@ def test_direct_beam_window_handoff_uses_actual_api_and_seed_not_bounds(tmp_path
     source = SourceSpec(spec, SourceKind.SPEC, options={'scan':'1','image_dir':str(tmp_path)})
     options = dict(detector='Detector', detector_config=config(), beam_pixel=beam,
                    angle_zero_deg=7., rotation=0)
-    result = _run_job(('distance', (source,'del',options)), Event(), lambda *_:None)
+    result, energy = _run_job(('distance', (source,'del',options)), Event(), lambda *_:None)
+    assert energy is None  # the scan records no energy
     expected = calibrate_direct_beam(angles, images, detector='Detector', detector_config=config(),
                                      beam_pixel=beam, angle_zero_deg=7.)
     assert result.distance_m == pytest.approx(expected.distance_m)
@@ -516,6 +517,86 @@ def test_direct_beam_fit_button_reads_container_sources(tmp_path, source_kind):
     # The saved fit provenance must remain JSON serializable for NeXus path IDs.
     json.dumps(dialog._distance_provenance)
     dialog.close()
+
+
+def _fit_direct_beam(dialog):
+    from pyqtgraph.Qt import QtWidgets, QtTest
+    dialog.beam_button.click()
+    for _ in range(1500):
+        QtWidgets.QApplication.processEvents()
+        if not dialog.active():
+            break
+        QtTest.QTest.qWait(20)
+    assert not dialog.active(), dialog.status.text()
+
+
+def test_a_direct_beam_fit_shows_its_distance_and_the_scan_supplies_the_wavelength(tmp_path):
+    """Maintainer, 2026-09-29: "for Direct beam distance fit, it will be good to pop up a window with the
+    fit that also shows the fit distance. also the fit distance should show in the output message box.
+    also why the message to type in wavelength to save calibration. why doesn't it get it from the spec
+    file?" A SPEC image series recording the energy: the fit opens its window with the distance, the
+    status line says it, and with no calibrant scan read the wavelength is the direct-beam scan's."""
+    from tests.core.test_direct_beam import beam_images
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    angles = np.array([1., .5, 0., -.5, -1.])
+    images, _, beam = beam_images(angles, shape=(65, 487), pitches=(516e-6, 172e-6), distance=.5, zero=0)
+    spec = tmp_path / 'direct'
+    spec.write_text('#F direct\n#E 1\n#D today\n#C test\n#O0 del  energy\n#S 1 ascan del 1 -1 4 1\n#D today\n'
+                    '#P0 0 17000.018\n#N 1\n#L del\n' + '\n'.join(map(str, angles)) + '\n')
+    for index, array in enumerate(images):
+        tifffile.imwrite(tmp_path / f'direct_scan1_{index:04d}.tif', array)
+    dialog = StitchCalibrationDialog(tmp_path)
+    try:
+        dialog.show()  # as the page opens it
+        dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('spec_series'))
+        for key, value in dict(beam_source=spec, beam_scan='1', beam_images=tmp_path,
+                               beam_detector='Pilatus100k', beam_pixel=', '.join(map(str, beam))).items():
+            dialog._set_field_text(key, str(value))
+        assert dialog._rough_wavelength_A() is None and not dialog.show_fit_button.isEnabled()
+        _fit_direct_beam(dialog)
+        result = dialog._distance_result
+        assert result is not None, dialog.status.text()
+        assert dialog.status.text().startswith(f'Direct-beam distance: {result.distance_mm:.6g} mm (regression SE')
+        assert dialog.status.text().endswith('the scan records 17000 eV')
+        assert dialog.beam_summary.toPlainText().startswith('Distance: ')
+        window = dialog._direct_beam_fit_window
+        assert window is not None and window.isVisible() and dialog.show_fit_button.isEnabled()
+        assert window.summary.text().startswith(f'Direct-beam distance: {result.distance_mm:.6g} mm')
+        assert 'of 5 frames used' in window.summary.text()
+        wavelength = float(energy_eV_to_wavelength_m(17000.018))
+        assert dialog._rough_wavelength_A() == pytest.approx(wavelength * 1e10, rel=1e-12, abs=0)
+        fit = dialog._rough_fit()  # Save as calibration no longer asks for it
+        assert fit.asset['calibration']['wavelength'] == pytest.approx(wavelength, rel=1e-12, abs=0)
+        dialog._set_field_text('beam_scan', '2')  # the fit no longer matches its inputs: typed again
+        assert dialog._rough_wavelength_A() is None
+        dialog.hide()  # the fit window goes with the calibration window
+        assert not window.isVisible()
+    finally:
+        dialog.close()
+
+
+def test_return_in_a_box_commits_it_and_presses_no_button(tmp_path):
+    """Return or Enter in any box of the calibration window pressed its default button, "Fit direct-beam
+    distance", and started a job; now it only commits the box."""
+    from pyqtgraph.Qt import QtCore, QtWidgets, QtTest
+    dialog = StitchCalibrationDialog(tmp_path)
+    try:
+        dialog.show()
+        clicked = []
+        for button in dialog.findChildren(QtWidgets.QPushButton):
+            button.clicked.connect(lambda *_a, text=button.text(): clicked.append(text))
+        edit = dialog._fields['beam_pixel']
+        committed = []
+        edit.editingFinished.connect(lambda: committed.append(edit.text()))
+        edit.setFocus()
+        QtTest.QTest.keyClicks(edit, '280, 97')
+        for key in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter):
+            QtTest.QTest.keyClick(edit, key)
+            QtWidgets.QApplication.processEvents()
+        assert clicked == [] and not dialog.active() and dialog.isVisible()
+        assert committed and committed[0] == '280, 97'
+    finally:
+        dialog.close()
 
 
 def test_direct_beam_container_job_refuses_count_mismatch_and_honours_cancel(tmp_path):
