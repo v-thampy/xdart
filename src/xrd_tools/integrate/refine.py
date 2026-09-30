@@ -194,6 +194,15 @@ class ArmFitBounds:
         held = self.held_deg if self.held_deg is not None else seed_held
         return replace(self, zeros_deg=zeros, zero_sources=sources, held_deg=held)
 
+    @classmethod
+    def from_record(cls, record) -> 'ArmFitBounds':
+        """The value :meth:`to_record` wrote (checked as the constructor checks it)."""
+        names = ('zeros_deg', 'zero_sources', 'held_deg', 'mount_deg', 'zero_freedom_deg', 'mount_freedom_deg',
+                 'sample_offset_mm', 'distance_fraction')
+        if not isinstance(record, Mapping) or set(record) != set(names):
+            raise ValueError('fit bounds are a recorded ArmFitBounds')
+        return cls(**{name: record[name] for name in names})
+
     def to_record(self) -> dict:
         return {'zeros_deg': dict(self.zeros_deg), 'zero_sources': dict(self.zero_sources),
                 'held_deg': self.held_deg, 'mount_deg': list(self.mount_deg),
@@ -483,11 +492,22 @@ def refine_goniometer(
         seed.append(r1_nominal)
     if fit_r2s:
         seed.append(r2_nominal)
-    box = None
+    box, public = None, False
     if bounds is not None:  # start at the estimates, within their freedom
         box = _arm_box(bounds, distance=distance, poni1=base_poni.poni1, poni2=base_poni.poni2,
                        nu_motor=rot1_motor, del_motor=rot2_motor, nu_sign=r1_sign, del_sign=r2_sign,
                        distance_bounds_m=None if distance_bounds_m is None else (lo, hi), extended=False)
+        # A fitted motor scale would stretch a box on the offset: the circles' own angles (a motor
+        # zero, or a held angle) are fitted instead, in radians, so their bounds hold (Codex review F2)
+        public = fit_r1s or fit_r2s
+        if public:
+            start, low, high, rows = (box[0].copy(), box[1].copy(), box[2].copy(), list(box[3]))
+            for index in (3, 4):
+                name, _factor, estimate, lower_deg, upper_deg = rows[index]
+                start[index], low[index], high[index] = (estimate * _DEG2RAD, lower_deg * _DEG2RAD,
+                                                         upper_deg * _DEG2RAD)
+                rows[index] = (name, 1 / _DEG2RAD, estimate, lower_deg, upper_deg)
+            box = (start, low, high, rows)
         seed[:5] = box[0]
     seed = np.asarray(seed, dtype=float)
     r3_pinned = float(base_poni.rot3 if beam_rotation is None else beam_rotation)
@@ -498,6 +518,9 @@ def refine_goniometer(
         r1s = p[i] if fit_r1s else r1_nominal
         i += int(fit_r1s)
         r2s = p[i] if fit_r2s else r2_nominal
+        if public:  # the circles' angles in radians: offset = −scale × zero, or +scale × a held angle
+            r1o = (-r1s if rot1_motor is not None else r1_nominal) / _DEG2RAD * r1o
+            r2o = (-r2s if rot2_motor is not None else r2_nominal) / _DEG2RAD * r2o
         return dist, poni1, poni2, r1o, r2o, r3_pinned, r1s, r2s
 
     def _residual(p):
@@ -535,12 +558,7 @@ def refine_goniometer(
                         max_nfev=max_nfev, x_scale="jac")
     rms = float(np.sqrt(np.mean(res.fun ** 2)))
     dist, poni1, poni2, r1o, r2o, r3o, r1s, r2s = _unpack(res.x)
-    fit_bounds = {}
-    if box is not None:
-        fit_bounds = _fit_table(box[3], res.x[:5], box[1], box[2])
-        for circle, offset, scale in (('nu', r1o, r1s), ('del', r2o, r2s)):  # a fitted scale reads the zero
-            if f'{circle}_zero_deg' in fit_bounds:
-                fit_bounds[f'{circle}_zero_deg']['fitted'] = float(-offset / scale)
+    fit_bounds = {} if box is None else _fit_table(box[3], res.x[:5], box[1], box[2])
 
     # --- conditioning (the Jacobian least_squares already returns) ---------
     try:

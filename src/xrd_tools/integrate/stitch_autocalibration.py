@@ -333,7 +333,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                          max_counts=None, frame_screen=_CALIBRATION_SCREEN, reject_outliers=4.5,
                          min_improvement=0.2, max_rms_q=0.03, cancelled=None,
                          progress=None, instrument_geometry=None, mask=None,
-                         energy_bound_eV=None, bounds=None) -> CalibrationFit:
+                         energy_bound_eV=None, bounds=None, distance_seed_m=None,
+                         distance_bounds_m=None) -> CalibrationFit:
     """Refine a stacked-arm calibration from its calibrant scan, automatically.
 
     Returns a MultiGeometry :class:`CalibrationFit` for :func:`save_calibration_fit`.
@@ -350,6 +351,9 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
     every validation fold and the final fit alike. A zero not typed there is the seed
     calibration's own (not 0), and a single arm's held angle is the seed's; the provenance's
     ``fit_bounds`` records them, where each came from, and where each parameter ended.
+    ``distance_seed_m`` / ``distance_bounds_m`` (metres) replace the seed calibration's distance and
+    its ±``bounds.distance_fraction`` box in every fit, as the guided fit takes them (Codex review F3);
+    bounds that exclude the seed are refused, never widened.
     """
     from xrd_tools.core.geometry.stacked_arm import orientation_signs
     from xrd_tools.integrate.refine import ArmFitBounds
@@ -378,7 +382,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                                   calibrant=points.calibrant, detector_config=config,
                                   extended=extended, reject_outliers=reject_outliers,
                                   beam_rotation=0., cancelled=cancelled,  # never the seed's: |q| cannot measure it
-                                  energy_bound_eV=energy_bound_eV, bounds=bounds)
+                                  energy_bound_eV=energy_bound_eV, bounds=bounds,
+                                  distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m)
 
     controls = points.controls
     row_of = _row_of(arm.nu_motor, arm.del_motor)
@@ -434,7 +439,9 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
               'options': json.loads(json.dumps(dict(spec.options), default=str))}
     provenance = {'frames': list(points.frames), 'rms_q_A^-1': result.rms_q,
                   'condition_number': result.condition_number, 'n_points': result.n_points,
-                  'distance_seed_m': None, 'distance_bounds_m': None, 'fit_motor_scales': False,
+                  'distance_seed_m': distance_seed_m,
+                  'distance_bounds_m': None if distance_bounds_m is None else list(distance_bounds_m),
+                  'fit_motor_scales': False,
                   'source_motors': {name: motor for name, motor in (('nu_angle', arm.nu_motor),
                                                                     ('del_angle', arm.del_motor))
                                     if motor is not None},

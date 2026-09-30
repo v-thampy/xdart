@@ -446,7 +446,10 @@ def test_direct_beam_window_handoff_uses_actual_api_and_seed_not_bounds(tmp_path
     assert result.distance_m == pytest.approx(expected.distance_m)
     assert result.point_ids == tuple(('1.1', index) for index in range(7))
     dialog = StitchCalibrationDialog(tmp_path)
-    dialog._distance_result = result
+    for key, value in (('beam_source', spec), ('beam_scan', '1'), ('beam_images', tmp_path)):
+        dialog._set_field_text(key, str(value))
+    # as the window's own job records it: the result and the inputs it was fitted from (Codex F5)
+    dialog._distance_result, dialog._distance_key = result, dialog._direct_beam_key()
     dialog._apply_distance()  # no confirmation: the result applies
     assert float(dialog._text('distance_seed')) == pytest.approx(80., rel=2e-5)
     assert dialog._text('distance_bounds') == ''

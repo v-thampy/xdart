@@ -9,6 +9,8 @@ box gives none.
 """
 from __future__ import annotations
 
+import math
+
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xdart.gui.widgets.controls_panel import ControlsComboBox
@@ -92,15 +94,32 @@ class GeometryEditor(QtWidgets.QWidget):
         """The box of a detector circle's motor-zero reading (blank: none given)."""
         return self._zeros[circle]
 
+    def _zero_text(self, circle):
+        """A shown circle's zero: None when blank, a finite number, or the text itself when malformed."""
+        edit = self._zeros.get(circle)
+        text = edit.text().strip() if edit is not None else ''
+        if not text:
+            return None
+        try:
+            zero = float(text)
+        except ValueError:
+            return text
+        return zero if math.isfinite(zero) else text
+
+    def invalid_zeros(self) -> tuple[str, ...]:
+        """The shown circles whose zero box holds text that is not a number (blank gives none): an
+        operation refuses them rather than read them as blank (Codex review F4)."""
+        return tuple(circle for circle, _role in GEOMETRIES[self.geometry.currentData()]
+                     if isinstance(self._zero_text(circle), str))
+
     def value(self) -> InstrumentGeometry:
         geometry = self.geometry.currentData()
         circles = [circle for circle, _role in GEOMETRIES[geometry]]
         zeros = []
-        for circle in circles:
-            try:  # a blank or half-typed box gives none
-                zeros.append((circle, float(self._zeros[circle].text())))
-            except (KeyError, ValueError):
-                pass
+        for circle in circles:  # a blank or half-typed box gives none here; invalid_zeros() says which
+            zero = self._zero_text(circle)
+            if isinstance(zero, float):
+                zeros.append((circle, zero))
         return InstrumentGeometry(geometry, tuple((circle, self._motors[circle].currentText()) for circle in circles),
                                   'vertical' if geometry == 'psic' else self.plane.currentData(), tuple(zeros))
 

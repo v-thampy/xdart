@@ -100,11 +100,13 @@ def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_m
     return FrameSeed(integrator, expected_rings(integrator, calibrant, frame.shape, mask))
 
 
-def session_prediction(frames, *, del_motor='del', nu_motor='nu', cancelled=None, bounds=None):
+def session_prediction(frames, *, del_motor='del', nu_motor='nu', cancelled=None, bounds=None,
+                       distance_seed_m=None, distance_bounds_m=None):
     """The arm fitted to this session's calibrated frames, to predict the others' rings and
     seed pyFAI with them: one calibrated frame is enough to place the rest (a saved
     calibration still needs three). None without a calibrated frame, or when they do not fit.
-    ``bounds``: the motor-zero estimates and fit freedom the saved fit takes (fit_calibration's).
+    ``bounds``, ``distance_seed_m`` and ``distance_bounds_m``: the estimates and freedom the saved fit
+    takes (fit_calibration's).
     """
     from xrd_tools.integrate.stitch_calibration import fit_calibration
     done = tuple(frame for frame in frames if frame.complete)
@@ -112,7 +114,8 @@ def session_prediction(frames, *, del_motor='del', nu_motor='nu', cancelled=None
         return None
     try:
         return fit_calibration(done, backend='multigeometry', del_motor=del_motor, nu_motor=nu_motor,
-                               cancelled=cancelled, min_frames=1, bounds=bounds).asset['calibration']
+                               cancelled=cancelled, min_frames=1, bounds=bounds, distance_seed_m=distance_seed_m,
+                               distance_bounds_m=distance_bounds_m).asset['calibration']
     except (ValueError, RuntimeError, KeyError):
         return None
 

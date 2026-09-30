@@ -47,7 +47,8 @@ def _known():
 
 #: D1, for the maintainer (ARM-ZERO-BOUNDS-20260929): the unbounded arm met these on scan 14 with a
 #: 2.6 mm beam-direction sample displacement; held within ±0.05 mm (energy ±200 eV) it does not.
-#: Strict: a pass means a bound was widened somewhere.
+#: Strict: an unexpected pass means the fit, its extraction or its constraints changed; review that
+#: change (it is not by itself proof that a bound was widened).
 _D1 = 'D1 (maintainer): the ±0.05 mm displacement bound on scan 14: '
 
 

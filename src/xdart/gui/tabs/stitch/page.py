@@ -1163,13 +1163,15 @@ class StitchPage(QtWidgets.QWidget):
 
     def _instrument(self):
         """The diffractometer and motor names: Calibrate ▸ 1 · Geometry (saved with the
-        settings); older settings name the del and nu motors, or the Angle mapping does."""
+        settings); older settings name the del and nu motors, or the Angle mapping does. An older
+        window's normal-incidence zero becomes its circle's motor zero (Codex review F1)."""
         from xrd_tools.session.instrument import InstrumentGeometry
+        from .calibration import migrated_instrument
         if self._calibration_dialog is not None:
             return self._calibration_dialog.geometry_editor.value()
         saved = self._calibration_settings or {}
         try:
-            return InstrumentGeometry.from_record(saved["instrument_geometry"])
+            return migrated_instrument(InstrumentGeometry.from_record(saved["instrument_geometry"]), saved)
         except (KeyError, ValueError, TypeError):
             pass
         fields = saved.get("fields") or {}
@@ -1183,7 +1185,7 @@ class StitchPage(QtWidgets.QWidget):
             default = InstrumentGeometry()
             motors = {circle: motor for position, motor in pairs
                       if (circle := default.circle_for_position(position)) in ("del", "nu")}
-        return InstrumentGeometry("psic", tuple(motors.items()))
+        return migrated_instrument(InstrumentGeometry("psic", tuple(motors.items())), saved)
 
     def _set_instrument(self, geometry):
         """Keep one geometry: the calibration window's, or the settings it will open with."""

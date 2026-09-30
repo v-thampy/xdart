@@ -368,3 +368,63 @@ def test_a_zero_keeps_its_source_through_every_fit_path(tmp_path):
     for arm_model in ('auto', 'stacked'):
         fit = fit_calibration(frames, arm_model=arm_model, bounds=ArmFitBounds(zeros_deg={'del': 2.}))
         assert fit.asset['provenance']['fit_bounds']['estimates']['zero_sources'] == {'del': 'typed', 'nu': 'default'}
+
+
+def test_a_fitted_motor_scale_keeps_the_motor_zero_within_its_bounds():
+    """Codex review F2: with the motor scales fitted the box was on the offset, so a 0.8 scale let the
+    motor zero reach +2.3° past its ±2°, reported inside. The fitted-scale fit now bounds the zero."""
+    from xrd_tools.integrate.refine import refine_goniometer
+    controls, calibrant = _ring_controls({'nu_offset': 0., 'del_offset': 0.}, _calibration(), ANGLES)
+    # a del motor turning 0.8° per reading degree, zero at +2.3: rotation = 0.8 (reading − 2.3) degrees
+    controls = [ControlFrame(c.row_positions, c.col_positions, c.rings,
+                             {'nu': c.motors['nu'], 'del': c.motors['del'] / .8 + 2.3}) for c in controls]
+    fit = refine_goniometer(_seed(3), controls, rot1_motor='nu', rot2_motor='del', calibrant=calibrant,
+                            detector_config={'orientation': 3}, fit_scales=True, model='stacked_del_on_nu',
+                            bounds=ArmFitBounds(zeros_deg={'del': 0., 'nu': 0.}))
+    row = fit.fit_bounds['del_zero_deg']
+    assert (row['lower'], row['upper']) == pytest.approx((-2., 2.))
+    assert row['fitted'] == pytest.approx(2., abs=1e-9) and row['at_bound']
+    arm = fit.diffractometer.stacked_arm
+    assert -arm.del_offset / arm.del_scale == pytest.approx(row['fitted'], abs=1e-9)  # the saved zero is the bounded one
+
+
+def test_the_automatic_refinement_and_the_prediction_take_an_explicit_distance_box(tmp_path, monkeypatch):
+    """Codex review F3: explicit distance bounds reach every fold and the final fit of the automatic
+    refinement and the prediction, and are recorded; bounds excluding the seed are refused."""
+    from tests.core.test_stitch_autocalibration import ROW_ANGLES, five_parameter_seed, ring_scan
+    from xrd_tools.integrate.calibration_seed import session_prediction
+    from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
+    seed, spec = five_parameter_seed(ROW_ANGLES), ring_scan(tmp_path / 'scan')
+    calls = _least_squares_calls(monkeypatch)
+    fit = refine_arm_from_scan(spec, seed, bounds=ArmFitBounds(sample_offset_mm=5.), distance_bounds_m=(.385, .395))
+    assert calls and all((lower[0], upper[0]) == (.385, .395) for _start, lower, upper in calls)
+    assert fit.asset['provenance']['distance_bounds_m'] == [.385, .395]
+    assert fit.asset['provenance']['fit_bounds']['parameters']['distance_mm']['lower'] == pytest.approx(385.)
+    with pytest.raises(ValueError, match='seed inside them'):  # the seed's .39 m lies outside: refused
+        refine_arm_from_scan(spec, seed, bounds=ArmFitBounds(sample_offset_mm=5.), distance_bounds_m=(.30, .31))
+    calls.clear()
+    controls, _ = _ring_controls(_offsets(), _calibration(), ANGLES[::2])
+    frames = _subpixel_frames(tmp_path / 'frames', controls, _seed(3))
+    assert session_prediction(frames[:3], bounds=ArmFitBounds(zeros_deg=ZEROS), distance_bounds_m=(.385, .395))
+    assert calls and all((lower[0], upper[0]) == (.385, .395) for _start, lower, upper in calls)
+
+
+def test_a_session_records_its_fit_policy_and_older_sessions_still_read(tmp_path):
+    """Codex review F6: version 4 keeps the zeros, bounds and distance the session fitted with."""
+    from xrd_tools.integrate.stitch_calibration import load_calibration_session, save_calibration_session
+    controls, _ = _ring_controls(_offsets(), _calibration(), ANGLES[:3])
+    frames = _subpixel_frames(tmp_path / 'frames', controls, _seed(3))
+    policy = {'bounds': ArmFitBounds(zeros_deg={'del': 2.3}, sample_offset_mm=.02).to_record(),
+              'distance_seed_m': .39, 'distance_bounds_m': [.385, .395]}
+    path = save_calibration_session(tmp_path, frames, arm=('del', 'nu'), fit_policy=policy)
+    loaded, arm, recorded = load_calibration_session(path, with_arm=True, with_policy=True)
+    assert json.loads(Path(path).read_text())['version'] == 4 and arm == ('del', 'nu') and len(loaded) == 3
+    assert recorded == policy and ArmFitBounds.from_record(recorded['bounds']).sample_offset_mm == .02
+    (tmp_path / 'older').mkdir()
+    older = save_calibration_session(tmp_path / 'older', frames, arm=('del', 'nu'))  # version 3
+    assert load_calibration_session(older, with_arm=True, with_policy=True)[1:] == (('del', 'nu'), None)
+    broken = json.loads(Path(path).read_text())
+    broken['fit_policy']['bounds']['sample_offset_mm'] = -1.
+    Path(path).write_text(json.dumps(broken))
+    with pytest.raises(ValueError, match='positive'):
+        load_calibration_session(path, with_policy=True)

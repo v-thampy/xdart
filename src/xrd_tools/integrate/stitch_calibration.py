@@ -290,29 +290,55 @@ def _session_arm(value, frames):
     return arm['del'], arm['nu']
 
 
-def save_calibration_session(directory, frames, *, arm=None):
+def save_calibration_session(directory, frames, *, arm=None, fit_policy=None):
     """``arm`` (del, nu motors; None for a held circle) makes it version 3: a resumed
-    session then knows which circle a single arm's one motor is (vertical or horizontal)."""
+    session then knows which circle a single arm's one motor is (vertical or horizontal).
+    ``fit_policy`` ({'bounds': ArmFitBounds record, 'distance_seed_m', 'distance_bounds_m'}) makes it
+    version 4: a resumed session fits and predicts from its own estimates and bounds (Codex review F6)."""
     path = Path(directory) / 'calibration-session.json'
     payload = {'schema': 'xdart.stitch_calibration_session', 'version': 2,
                'frames': [asdict(frame) for frame in frames]}
     if arm is not None:
         payload.update(version=3, arm={'del': arm[0], 'nu': arm[1]})
+    if fit_policy is not None:
+        if arm is None:
+            raise ValueError('a session records its fit policy with its arm')
+        payload.update(version=4, fit_policy=_session_policy(fit_policy))
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(payload, indent=2, allow_nan=False))
     temporary.replace(path)
     return path
 
 
-def load_calibration_session(path, *, with_arm=False):
-    """The session's frames; with ``with_arm``, also its arm (None before version 3)."""
+def _session_policy(policy):
+    """A session's fit policy, checked: an ArmFitBounds record and the distance seed and bounds."""
+    from xrd_tools.integrate.refine import ArmFitBounds
+    if not isinstance(policy, dict) or set(policy) != {'bounds', 'distance_seed_m', 'distance_bounds_m'}:
+        raise ValueError('unsupported calibration session fit policy')
+    bounds = ArmFitBounds.from_record(policy['bounds']).to_record()
+    seed, limits = policy['distance_seed_m'], policy['distance_bounds_m']
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, (int, float)) or not 0 < seed < math.inf):
+        raise ValueError('unsupported calibration session fit policy')
+    if limits is not None and (not isinstance(limits, (list, tuple)) or len(limits) != 2
+                               or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in limits)):
+        raise ValueError('unsupported calibration session fit policy')
+    return {'bounds': bounds, 'distance_seed_m': None if seed is None else float(seed),
+            'distance_bounds_m': None if limits is None else [float(v) for v in limits]}
+
+
+def load_calibration_session(path, *, with_arm=False, with_policy=False):
+    """The session's frames; with ``with_arm``, also its arm (None before version 3); with
+    ``with_policy``, also its fit policy (None before version 4)."""
     path = Path(path)
     if path.stat().st_size > 1 << 20:
         raise ValueError('calibration session exceeds the size limit')
     value = json.loads(path.read_text())
-    keys = {'schema', 'version', 'frames'} | ({'arm'} if value.get('version') == 3 else set())
-    if set(value) != keys or value['schema'] != 'xdart.stitch_calibration_session' or value['version'] not in (1, 2, 3):
+    version = value.get('version')
+    keys = ({'schema', 'version', 'frames'} | ({'arm'} if version in (3, 4) else set())
+            | ({'fit_policy'} if version == 4 else set()))
+    if set(value) != keys or value['schema'] != 'xdart.stitch_calibration_session' or version not in (1, 2, 3, 4):
         raise ValueError('unsupported calibration session')
+    policy = _session_policy(value['fit_policy']) if version == 4 else None
     if not 1 <= len(value['frames']) <= 32:
         raise ValueError('invalid calibration frame count')
     frames = tuple(CalibrationFrame(**{**row, 'shape': tuple(row['shape'])}) for row in value['frames'])
@@ -320,9 +346,10 @@ def load_calibration_session(path, *, with_arm=False):
         # Legacy rows retain their files, but absent model/image binding means
         # they are incomplete until the user recalibrates or explicitly imports.
         validate_frame_files(frame, require_points=frame.complete)
-    if not with_arm:
-        return frames
-    return frames, (_session_arm(value, frames) if value['version'] == 3 else None)
+    arm = _session_arm(value, frames) if version in (3, 4) else None
+    if with_policy:
+        return frames, arm, policy
+    return (frames, arm) if with_arm else frames
 
 
 def validate_frame_files(frame, *, require_points=True):
