@@ -31,7 +31,7 @@ from xrd_tools.core.geometry import Diffractometer, ImageOrientation
 from xrd_tools.integrate.frame_screen import FrameScreenPolicy, screen_totals
 from xrd_tools.integrate.refine import ControlFrame, refine_stacked_arm
 from xrd_tools.integrate.stitch_calibration import (
-    CalibrationFit, _exact_source, _mg_detector_config, calibration_image_identity,
+    CalibrationFit, _exact_source, _mg_detector_config, bound_contact_note, calibration_image_identity,
     source_frame_choices,
 )
 
@@ -333,7 +333,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                          max_counts=None, frame_screen=_CALIBRATION_SCREEN, reject_outliers=4.5,
                          min_improvement=0.2, max_rms_q=0.03, cancelled=None,
                          progress=None, instrument_geometry=None, mask=None,
-                         energy_bound_eV=None) -> CalibrationFit:
+                         energy_bound_eV=None, bounds=None, distance_seed_m=None,
+                         distance_bounds_m=None) -> CalibrationFit:
     """Refine a stacked-arm calibration from its calibrant scan, automatically.
 
     Returns a MultiGeometry :class:`CalibrationFit` for :func:`save_calibration_fit`.
@@ -345,9 +346,25 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
     ``mask`` (True: left out, in the oriented image) is kept out of the ring search;
     its SHA-256 is recorded. ``energy_bound_eV`` also refines the energy within that many eV
     of the scans' recorded one (as :func:`fit_calibration`).
+
+    ``bounds`` (:class:`~xrd_tools.integrate.refine.ArmFitBounds`; None: its defaults) is taken by
+    every validation fold and the final fit alike. A zero not typed there is the seed
+    calibration's own (not 0), and a single arm's held angle is the seed's; the provenance's
+    ``fit_bounds`` records them, where each came from, and where each parameter ended.
+    ``distance_seed_m`` / ``distance_bounds_m`` (metres) replace the seed calibration's distance and
+    its ±``bounds.distance_fraction`` box in every fit, as the guided fit takes them (Codex review F3);
+    bounds that exclude the seed are refused, never widened.
     """
+    from xrd_tools.core.geometry.stacked_arm import orientation_signs
+    from xrd_tools.integrate.refine import ArmFitBounds
     record, diff, digest = _seed(geometry, source_motors)
     arm = diff.stacked_arm
+    held = None
+    if arm.held is not None:  # its fixed pitch or yaw: offset = (signed scale) × angle
+        signs = dict(zip(('nu', 'del'), orientation_signs(diff.calibration.detector_config.get('orientation', 3))))
+        held = getattr(arm, f'{arm.held}_offset') / (signs[arm.held] * math.pi / 180)
+    bounds = (ArmFitBounds() if bounds is None else bounds).resolved(
+        list(arm.motor_zeros()), seed_zeros=arm.motor_zeros(), seed_held=held)
     points = extract_scan_ring_points(
         spec, record, source_motors=source_motors, image_rotation=image_rotation,
         calibrant=calibrant, frame_indices=frame_indices, max_frames=max_frames,
@@ -365,7 +382,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                                   calibrant=points.calibrant, detector_config=config,
                                   extended=extended, reject_outliers=reject_outliers,
                                   beam_rotation=0., cancelled=cancelled,  # never the seed's: |q| cannot measure it
-                                  energy_bound_eV=energy_bound_eV)
+                                  energy_bound_eV=energy_bound_eV, bounds=bounds,
+                                  distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m)
 
     controls = points.controls
     row_of = _row_of(arm.nu_motor, arm.del_motor)
@@ -381,7 +399,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
             reason += (f" (the frame budget reached {points.coverage['nu_rows_selected']} of "
                        f"{points.coverage['nu_rows_available']} nu rows)")
     else:
-        held = {'stacked': [], 'stacked_extended': []}
+        held_out = {'stacked': [], 'stacked_extended': []}
         folds = []
         for row in rows:
             if progress is not None:
@@ -392,10 +410,11 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
             for name, extended in (('stacked', False), ('stacked_extended', True)):
                 trained = fit(train, extended)
                 residual = _held_out(trained, test, points.calibrant, arm.nu_motor, arm.del_motor)
-                held[name].append(residual)
-                fold[name] = {'held_out_sigma_A^-1': _robust_sigma(residual), 'success': trained.success}
+                held_out[name].append(residual)
+                fold[name] = {'held_out_sigma_A^-1': _robust_sigma(residual), 'success': trained.success,
+                              'at_bound': [key for key, row in trained.fit_bounds.items() if row['at_bound']]}
             folds.append(fold)
-        sigma = {name: _robust_sigma(np.concatenate(parts)) for name, parts in held.items()}
+        sigma = {name: _robust_sigma(np.concatenate(parts)) for name, parts in held_out.items()}
         improvement = 1.0 - sigma['stacked_extended'] / sigma['stacked'] if sigma['stacked'] > 0 else 0.0
         validation.update({'held_out_sigma_A^-1': sigma, 'improvement': improvement, 'folds': folds})
         if improvement >= min_improvement:
@@ -420,12 +439,15 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
               'options': json.loads(json.dumps(dict(spec.options), default=str))}
     provenance = {'frames': list(points.frames), 'rms_q_A^-1': result.rms_q,
                   'condition_number': result.condition_number, 'n_points': result.n_points,
-                  'distance_seed_m': None, 'distance_bounds_m': None, 'fit_motor_scales': False,
+                  'distance_seed_m': distance_seed_m,
+                  'distance_bounds_m': None if distance_bounds_m is None else list(distance_bounds_m),
+                  'fit_motor_scales': False,
                   'source_motors': {name: motor for name, motor in (('nu_angle', arm.nu_motor),
                                                                     ('del_angle', arm.del_motor))
                                     if motor is not None},
                   'image_rotation': int(image_rotation), 'direct_beam': None,
                   'arm_model': chosen, 'parameter_errors': dict(result.param_errors),
+                  'fit_bounds': {'estimates': bounds.to_record(), 'parameters': dict(result.fit_bounds)},
                   'parameter_correlations': dict(result.param_correlations),
                   'automatic_refinement': {
                       'method': 'pyFAI SingleGeometry.extract_cp seeded by a stacked calibration',
@@ -444,6 +466,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
     provenance = json.loads(json.dumps(provenance, default=float))
     message = ('Automatic refinement: detector mount and sample offset refined'
                if chosen == 'stacked_extended' else f'Automatic refinement: five-parameter arm kept ({reason})')
+    message += bound_contact_note(result.fit_bounds)
     if energy:
         message += (f"; energy {energy['refined_eV']:.1f} ± {energy['sigma_eV']:.1f} eV (recorded "
                     f"{energy['recorded_eV']:.1f}" + (f", held at ±{energy['bound_eV']:g} eV)"

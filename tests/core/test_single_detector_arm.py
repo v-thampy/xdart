@@ -174,8 +174,8 @@ def test_the_fit_and_seeds_take_a_horizontal_arm():
     assert _worst([seeded.integrator], [reference.integrator]) == 0 and seeded.rings == reference.rings
     with pytest.raises(ValueError, match='holds del at zero'):  # a horizontal calibration, del moved
         predict_frame_seed(record, _frame({'tth': 20., 'del': 3.}), del_motor='del', nu_motor='tth')
-    rough = rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(737, 97), zero_deg=2.,
-                             zero_motor='tth', del_motor=None, nu_motor='tth')
+    rough = rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(737, 97), zeros_deg={'nu': 2.},
+                             del_motor=None, nu_motor='tth')
     assert rough['pos_names'] == ['nu_angle']
     assert dict(zip(rough['param_names'], rough['param']))['nu_offset'] == pytest.approx(-math.radians(2.))
 
@@ -318,12 +318,12 @@ def test_frame_seeds_and_the_rough_geometry_take_a_single_arm():
     # a 2θ-arm calibration cannot place a frame whose nu moved
     with pytest.raises(ValueError, match='holds nu at zero'):
         predict_frame_seed(single, _frame({'tth': 20., 'nu': 3.}), del_motor='tth', nu_motor='nu')
-    rough = rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(737, 97), zero_deg=1.5,
-                             zero_motor='tth', del_motor='tth', nu_motor=None)
+    rough = rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(737, 97), zeros_deg={'del': 1.5},
+                             del_motor='tth', nu_motor=None)
     assert is_single_arm(rough) and rough['pos_names'] == ['del_angle']
     assert dict(zip(rough['param_names'], rough['param']))['del_offset'] == pytest.approx(-math.radians(1.5))
-    with pytest.raises(ValueError, match="not 'tth'"):
-        rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(737, 97), zero_motor='nu',
+    with pytest.raises(ValueError, match='nu is held at zero by this arm: it has no motor zero'):
+        rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(737, 97), zeros_deg={'nu': 1.},
                          del_motor='tth', nu_motor=None)
 
 

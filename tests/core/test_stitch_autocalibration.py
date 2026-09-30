@@ -108,17 +108,22 @@ def test_the_automatic_refinement_refines_the_energy_within_its_bound(tmp_path):
     recorded energy, not the refined one."""
     import pytest
     from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    from xrd_tools.integrate.refine import ArmFitBounds
     from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
     recorded = float(wavelength_m_to_energy_eV(.7293e-10))
     spec = ring_scan(tmp_path / 'scan', energy_ratio=(recorded + 40.) / recorded)
-    fit = refine_arm_from_scan(spec, five_parameter_seed(ROW_ANGLES), max_frames=12, energy_bound_eV=200.)
+    # TRUTH's sample sits 0.5–2.2 mm off the rotation centre: allow it, or the energy absorbs the
+    # displacement the default ±0.05 mm holds back (ARM-ZERO-BOUNDS-20260929)
+    wide = ArmFitBounds(sample_offset_mm=5.)
+    fit = refine_arm_from_scan(spec, five_parameter_seed(ROW_ANGLES), max_frames=12, energy_bound_eV=200.,
+                               bounds=wide)
     energy = fit.asset['provenance']['energy_refinement']
     assert abs(energy['refined_eV'] - (recorded + 40.)) < max(3 * energy['sigma_eV'], 1.), energy
     assert fit.asset['calibration']['source_energy_eV'] == pytest.approx(recorded)
     assert f"energy {energy['refined_eV']:.1f}" in fit.message
-    again = refine_arm_from_scan(spec, fit.asset['calibration'], max_frames=12, energy_bound_eV=200.)
+    again = refine_arm_from_scan(spec, fit.asset['calibration'], max_frames=12, energy_bound_eV=200., bounds=wide)
     assert again.asset['provenance']['energy_refinement']['recorded_eV'] == pytest.approx(recorded)
     assert again.asset['calibration']['source_energy_eV'] == pytest.approx(recorded)
-    kept = refine_arm_from_scan(spec, fit.asset['calibration'], max_frames=12)  # not refined: the energy stays
+    kept = refine_arm_from_scan(spec, fit.asset['calibration'], max_frames=12, bounds=wide)  # the energy stays
     assert 'energy_refinement' not in kept.asset['provenance']
     assert kept.asset['calibration']['source_energy_eV'] == pytest.approx(recorded)

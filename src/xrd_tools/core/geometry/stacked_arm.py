@@ -175,6 +175,14 @@ class StackedDetectorArm:
     def has_sample_offset(self):
         return any(getattr(self, name) != 0 for name in _EXTENDED_NAMES[2:])
 
+    def motor_zeros(self) -> dict:
+        """Each moving circle's motor-zero reading in degrees ('del', 'nu'): its readback where the
+        circle is at zero, physical angle = readback − zero. The internal offset is
+        −scale × zero, the scale carrying the detector orientation's sign (a held circle has no
+        motor: its offset is a fixed angle, not a zero)."""
+        return {circle: -getattr(self, f'{circle}_offset') / getattr(self, f'{circle}_scale')
+                for circle, motor in (('del', self.del_motor), ('nu', self.nu_motor)) if motor is not None}
+
     def _pose(self, delta, nu):
         """M0 = R1(n) R2(d) R3(roll) R1(tilt) for each frame, shape (..., 3, 3)."""
         delta, nu = np.broadcast_arrays(np.asarray(delta, dtype=float), np.asarray(nu, dtype=float))

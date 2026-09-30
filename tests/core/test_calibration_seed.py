@@ -147,7 +147,7 @@ def test_every_orientation_predicts_orientation_3s_geometry_with_the_arm_tilted(
     # a known normal-incidence zero on a reversed circle still puts the beam on its pixel
     for circle in ('del', 'nu'):
         at_zero = seed(orientation, {'del': 4. if circle == 'del' else 0., 'nu': 4. if circle == 'nu' else 0.},
-                       zero_deg=4., zero_motor=circle)
+                       zeros_deg={circle: 4.})
         assert float(at_zero.integrator.tth(np.array([y]), np.array([x]))[0]) == pytest.approx(0, abs=1e-12)
 
 
@@ -227,7 +227,7 @@ def test_a_tilted_mount_keeps_the_direct_beam_on_its_pixel_at_the_given_distance
 
     def seed(**mount):
         record = rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(x, y), orientation=orientation,
-                                  zero_deg=zero_deg, zero_motor=zero_motor, **mount)
+                                  zeros_deg={zero_motor: zero_deg}, **mount)
         motors = {'del': 0., 'nu': 0., zero_motor: zero_deg}
         return predict_frame_seed(record, _frame(motors)).integrator
 
@@ -243,8 +243,8 @@ def test_an_energy_refined_calibration_seeds_frames_at_the_recorded_energy():
     from pyFAI import units
     from xrd_tools.core.energy import energy_eV_to_wavelength_m
     from xrd_tools.integrate.calibration_seed import predict_frame_seed
-    record = rough_arm_record(distance_m=.4, detector='Pilatus300kw', beam_px=(200., 90.), zero_deg=0.,
-                              zero_motor='del', wavelength_m=energy_eV_to_wavelength_m(17100.))
+    record = rough_arm_record(distance_m=.4, detector='Pilatus300kw', beam_px=(200., 90.),
+                              wavelength_m=energy_eV_to_wavelength_m(17100.))
     frame = _frame({'del': 20., 'nu': 0.}, energy_eV=None)  # a scan without an energy column
     assert predict_frame_seed(record, frame).integrator.wavelength == pytest.approx(
         energy_eV_to_wavelength_m(17100.), rel=1e-12, abs=0)  # metres: no default 1e-12 abs

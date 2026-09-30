@@ -290,29 +290,55 @@ def _session_arm(value, frames):
     return arm['del'], arm['nu']
 
 
-def save_calibration_session(directory, frames, *, arm=None):
+def save_calibration_session(directory, frames, *, arm=None, fit_policy=None):
     """``arm`` (del, nu motors; None for a held circle) makes it version 3: a resumed
-    session then knows which circle a single arm's one motor is (vertical or horizontal)."""
+    session then knows which circle a single arm's one motor is (vertical or horizontal).
+    ``fit_policy`` ({'bounds': ArmFitBounds record, 'distance_seed_m', 'distance_bounds_m'}) makes it
+    version 4: a resumed session fits and predicts from its own estimates and bounds (Codex review F6)."""
     path = Path(directory) / 'calibration-session.json'
     payload = {'schema': 'xdart.stitch_calibration_session', 'version': 2,
                'frames': [asdict(frame) for frame in frames]}
     if arm is not None:
         payload.update(version=3, arm={'del': arm[0], 'nu': arm[1]})
+    if fit_policy is not None:
+        if arm is None:
+            raise ValueError('a session records its fit policy with its arm')
+        payload.update(version=4, fit_policy=_session_policy(fit_policy))
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(payload, indent=2, allow_nan=False))
     temporary.replace(path)
     return path
 
 
-def load_calibration_session(path, *, with_arm=False):
-    """The session's frames; with ``with_arm``, also its arm (None before version 3)."""
+def _session_policy(policy):
+    """A session's fit policy, checked: an ArmFitBounds record and the distance seed and bounds."""
+    from xrd_tools.integrate.refine import ArmFitBounds
+    if not isinstance(policy, dict) or set(policy) != {'bounds', 'distance_seed_m', 'distance_bounds_m'}:
+        raise ValueError('unsupported calibration session fit policy')
+    bounds = ArmFitBounds.from_record(policy['bounds']).to_record()
+    seed, limits = policy['distance_seed_m'], policy['distance_bounds_m']
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, (int, float)) or not 0 < seed < math.inf):
+        raise ValueError('unsupported calibration session fit policy')
+    if limits is not None and (not isinstance(limits, (list, tuple)) or len(limits) != 2
+                               or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in limits)):
+        raise ValueError('unsupported calibration session fit policy')
+    return {'bounds': bounds, 'distance_seed_m': None if seed is None else float(seed),
+            'distance_bounds_m': None if limits is None else [float(v) for v in limits]}
+
+
+def load_calibration_session(path, *, with_arm=False, with_policy=False):
+    """The session's frames; with ``with_arm``, also its arm (None before version 3); with
+    ``with_policy``, also its fit policy (None before version 4)."""
     path = Path(path)
     if path.stat().st_size > 1 << 20:
         raise ValueError('calibration session exceeds the size limit')
     value = json.loads(path.read_text())
-    keys = {'schema', 'version', 'frames'} | ({'arm'} if value.get('version') == 3 else set())
-    if set(value) != keys or value['schema'] != 'xdart.stitch_calibration_session' or value['version'] not in (1, 2, 3):
+    version = value.get('version')
+    keys = ({'schema', 'version', 'frames'} | ({'arm'} if version in (3, 4) else set())
+            | ({'fit_policy'} if version == 4 else set()))
+    if set(value) != keys or value['schema'] != 'xdart.stitch_calibration_session' or version not in (1, 2, 3, 4):
         raise ValueError('unsupported calibration session')
+    policy = _session_policy(value['fit_policy']) if version == 4 else None
     if not 1 <= len(value['frames']) <= 32:
         raise ValueError('invalid calibration frame count')
     frames = tuple(CalibrationFrame(**{**row, 'shape': tuple(row['shape'])}) for row in value['frames'])
@@ -320,9 +346,10 @@ def load_calibration_session(path, *, with_arm=False):
         # Legacy rows retain their files, but absent model/image binding means
         # they are incomplete until the user recalibrates or explicitly imports.
         validate_frame_files(frame, require_points=frame.complete)
-    if not with_arm:
-        return frames
-    return frames, (_session_arm(value, frames) if value['version'] == 3 else None)
+    arm = _session_arm(value, frames) if version in (3, 4) else None
+    if with_policy:
+        return frames, arm, policy
+    return (frames, arm) if with_arm else frames
 
 
 def validate_frame_files(frame, *, require_points=True):
@@ -425,8 +452,15 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                     fit_scales=False, distance_seed_m=None, distance_bounds_m=None,
                     max_rms_q=0.03, domain=None, distance_provenance=None, cancelled=None,
                     arm_model='stacked', validation_angles=None, progress=None,
-                    instrument_geometry=None, min_frames=3, energy_bound_eV=None):
+                    instrument_geometry=None, min_frames=3, energy_bound_eV=None, bounds=None):
     """Fit the matched rows and refuse unconverged, degenerate or poor fits.
+
+    ``bounds`` (:class:`~xrd_tools.integrate.refine.ArmFitBounds`; None: its defaults) gives the
+    moving circles' motor-zero estimates, the mount's and the freedom about them (maintainer,
+    2026-09-29): every solve starts at the estimates and stays within ±2° of each zero and of the
+    mount, ±0.05 mm of each sample displacement and ±5 % of the distance seed unless
+    ``distance_bounds_m`` is given. The provenance's ``fit_bounds`` records the estimates (and
+    where each zero came from) and each parameter's initial and fitted value, bounds and contact.
 
     ``energy_bound_eV`` also refines the energy within that many eV of the frames' recorded one
     (maintainer, 2026-09-29: "add a refine energy toggle … just one number for +-that number"):
@@ -448,13 +482,16 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     (:func:`automatic_arm_reason`) and the five-parameter arm otherwise, or when the
     extension is refused; the message and provenance say which, and why.
     """
+    from xrd_tools.integrate.refine import ArmFitBounds
+    bounds = (ArmFitBounds() if bounds is None else bounds).resolved(
+        [circle for circle, motor in (('del', del_motor), ('nu', nu_motor)) if motor is not None])
     if arm_model == 'auto':
         options = dict(backend=backend, del_motor=del_motor, nu_motor=nu_motor, fit_scales=fit_scales,
                        distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m, max_rms_q=max_rms_q,
                        domain=domain, distance_provenance=distance_provenance, cancelled=cancelled,
                        validation_angles=validation_angles, progress=progress,
                        instrument_geometry=instrument_geometry, min_frames=min_frames,
-                       energy_bound_eV=energy_bound_eV)
+                       energy_bound_eV=energy_bound_eV, bounds=bounds)
         reason = automatic_arm_reason(frames, del_motor=del_motor, nu_motor=nu_motor, fit_scales=fit_scales)
         if not reason:
             try:
@@ -481,7 +518,8 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                                 distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
                                 max_rms_q=max_rms_q, domain=domain, distance_provenance=distance_provenance,
                                 cancelled=cancelled, validation_angles=validation_angles, progress=progress,
-                                instrument_geometry=instrument_geometry, energy_bound_eV=energy_bound_eV)
+                                instrument_geometry=instrument_geometry, energy_bound_eV=energy_bound_eV,
+                                bounds=bounds)
     if energy_bound_eV is not None and backend == 'xu_hist':
         raise ValueError('the energy is refined on the pyFAI arm (and carried to its xrayutilities '
                          'partner); fit with pyFAI MultiGeometry')
@@ -509,7 +547,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                                   model='stacked_del_on_nu' if arm_model == 'stacked'
                                   else 'stacked_del_on_nu_extended',
                                   beam_rotation=0.,  # the design geometry; |q| cannot measure it
-                                  energy_bound_eV=energy_bound_eV)
+                                  energy_bound_eV=energy_bound_eV, bounds=bounds)
         if not result.success or result.rms_q > max_rms_q:
             raise ValueError(result.message or f'fit RMS {result.rms_q:.5g} exceeds {max_rms_q:g} Å⁻¹')
         asset = result.diffractometer.stacked_arm.to_pyfai_goniometer(
@@ -530,6 +568,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
             message += (f"; energy {energy['refined_eV']:.1f} ± {energy['sigma_eV']:.1f} eV (recorded "
                         f"{energy['recorded_eV']:.1f}" + (f", held at ±{energy['bound_eV']:g} eV)"
                                                            if energy['at_bound'] else ")"))
+        message += bound_contact_note(result.fit_bounds)
     elif backend == 'xu_hist':
         asset, rms, condition, count = _fit_xu(frames, loaded, del_motor, nu_motor,
             distance_seed_m, distance_bounds_m, max_rms_q, domain, cancelled)
@@ -547,6 +586,10 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                   'direct_beam': distance_provenance}
     if instrument_geometry is not None:  # which motor drives which circle, for RSM and later reads
         provenance['instrument_geometry'] = dict(instrument_geometry)
+    # the estimates and freedom the fit took, and where each parameter ended (the xrayutilities
+    # five-parameter fit takes none)
+    provenance['fit_bounds'] = ({'estimates': bounds.to_record(), 'parameters': dict(result.fit_bounds)}
+                                if backend == 'multigeometry' else None)
     if arm_model == 'stacked_extended' or (backend == 'multigeometry' and energy):
         provenance['arm_model'] = arm_model
         provenance['parameter_errors'] = dict(result.param_errors)
@@ -560,6 +603,12 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
         raise InterruptedError('calibration fit cancelled')
     # Provenance is a separate adjacent document for standard pyFAI files.
     return CalibrationFit(backend, {'calibration': asset, 'provenance': provenance}, rms, condition, count, message)
+
+
+def bound_contact_note(table) -> str:
+    """'; at a fit bound: …' naming the parameters a fit left at a bound ('' when none)."""
+    names = [name for name, row in (table or {}).items() if row.get('at_bound')]
+    return f"; at a fit bound: {', '.join(names)}" if names else ''
 
 
 def automatic_arm_reason(frames, *, del_motor='del', nu_motor='nu', fit_scales=False) -> str:
@@ -652,14 +701,15 @@ def _fit_xu(frames, loaded, del_motor, nu_motor, distance_seed_m, distance_bound
 
 def _fit_xu_extended(frames, *, del_motor, nu_motor, distance_seed_m, distance_bounds_m, max_rms_q,
                      domain, distance_provenance, cancelled, validation_angles, progress,
-                     instrument_geometry=None, energy_bound_eV=None):
+                     instrument_geometry=None, energy_bound_eV=None, bounds=None):
     """The extended pyFAI arm, transferred to an XU SURFACE v3 asset."""
     from xrd_tools.integrate.xu_transfer import transfer_arm_to_xu
     extended = fit_calibration(frames, backend='multigeometry', del_motor=del_motor, nu_motor=nu_motor,
                                distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
                                max_rms_q=max_rms_q, distance_provenance=distance_provenance,
                                cancelled=cancelled, arm_model='stacked_extended',
-                               instrument_geometry=instrument_geometry, energy_bound_eV=energy_bound_eV)
+                               instrument_geometry=instrument_geometry, energy_bound_eV=energy_bound_eV,
+                               bounds=bounds)
     if validation_angles is None:
         limits = domain or {key: [min(f.motors[motor] for f in frames), max(f.motors[motor] for f in frames)]
                             for key, motor in (('del', del_motor), ('nu', nu_motor))}
