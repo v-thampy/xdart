@@ -132,6 +132,18 @@ class RefineResult:
     #: with ``bounds``: each parameter in public units (mm, degrees, eV) — its initial and fitted
     #: value, its bounds (None: free) and whether it reached one
     fit_bounds: Mapping[str, Any] = field(default_factory=dict)
+    #: every control point at the fit, for display: "q" (its ring, Å⁻¹), "dq" (its |q| residual,
+    #: Å⁻¹), "frame" (its frame's position in the control frames) and "kept" (False: rejected as
+    #: an outlier); ``rms_q`` is over the kept points
+    point_residuals: Mapping[str, Any] = field(default_factory=dict, compare=False, repr=False)
+
+
+def _point_residuals(targets, residuals, frames, keep=None):
+    """``RefineResult.point_residuals`` from each frame's ring targets and the residual of every point."""
+    counts = [len(f.rows) for f in frames]
+    return {"q": np.concatenate(targets).astype(float), "dq": np.asarray(residuals, dtype=float),
+            "frame": np.repeat(np.arange(len(frames)), counts),
+            "kept": np.ones(sum(counts), dtype=bool) if keep is None else np.concatenate(keep)}
 
 
 @dataclass(frozen=True)
@@ -641,6 +653,7 @@ def refine_goniometer(
         params=dict(zip(param_names, param)), success=ok,
         condition_number=condition, frozen_scales=tuple(frozen), message=message,
         fit_bounds=fit_bounds,
+        point_residuals=_point_residuals([q_ring[f.rings] for f in frames], res.fun, frames),
     )
 
 
@@ -845,6 +858,8 @@ def refine_stacked_arm(
             rejected = int(sum((~k).sum() for k in keep))
             res = solve(res.x, keep)
     p = res.x
+    everything = _point_residuals(targets, predicted(p, [np.ones(len(f.rows), dtype=bool) for f in frames]),
+                                  frames, keep)
     fit_bounds = {}
     if box is not None:
         rows = box[3] + ([('energy_eV', recorded_eV, recorded_eV, recorded_eV - bound_eV, recorded_eV + bound_eV)]
@@ -915,7 +930,7 @@ def refine_stacked_arm(
         condition_number=condition, frozen_scales=(), message=message,
         param_errors=param_errors, rejected_points=rejected,
         param_correlations=param_correlations, energy_refinement=energy_refinement,
-        fit_bounds=fit_bounds,
+        fit_bounds=fit_bounds, point_residuals=everything,
     )
 
 

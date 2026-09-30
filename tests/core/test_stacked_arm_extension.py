@@ -243,6 +243,36 @@ def test_outlier_rejection_keeps_near_perfect_points():
     assert fit.n_points == sum(len(c.rows) for c in controls)
 
 
+def test_a_fit_reports_every_control_point_and_marks_the_outliers_it_rejected():
+    """What the calibration window's fit window plots (maintainer, 2026-09-29: "the results of the
+    refinement should also be displayed in the message box, and also a popup"): each control point's
+    ring q, |q| residual at the fit and frame, and whether the fit kept it; the RMS is the kept ones'."""
+    from xrd_tools.integrate.refine import refine_goniometer
+    truth = _calibration()
+    controls, calibrant = _ring_controls(TRUTH, truth, ANGLES[::2])
+    counts = [len(c.rows) for c in controls]
+    q_ring = np.concatenate([2 * np.pi / np.asarray(calibrant.dspacing)[c.rings] for c in controls])
+    fit = refine_goniometer(truth.poni, controls, rot1_motor='nu', rot2_motor='del', calibrant=calibrant,
+                            detector_config={'orientation': 3}, model='stacked_del_on_nu')
+    residuals = fit.point_residuals  # the MultiGeometry fit: every point kept
+    np.testing.assert_array_equal(residuals['frame'], np.repeat(np.arange(len(controls)), counts))
+    np.testing.assert_allclose(residuals['q'], q_ring, rtol=1e-12)
+    assert residuals['kept'].all() and len(residuals['dq']) == fit.n_points
+    assert np.sqrt(np.mean(residuals['dq'] ** 2)) == pytest.approx(fit.rms_q, rel=1e-9)
+    moved = controls[1]
+    shifted = moved.row_positions.copy()
+    shifted[:3] = np.minimum(shifted[:3] + 20, 194)  # three points far off their ring
+    controls[1] = ControlFrame(shifted, moved.col_positions, moved.rings, moved.motors)
+    fit = refine_stacked_arm(truth.poni, controls, nu_motor='nu', del_motor='del', calibrant=calibrant,
+                             detector_config={'orientation': 3}, reject_outliers=4.5)
+    residuals = fit.point_residuals  # the sub-pixel arm fit rejects them
+    assert fit.rejected_points == 3 and fit.n_points == sum(counts) - 3
+    np.testing.assert_array_equal(np.flatnonzero(~residuals['kept']), counts[0] + np.arange(3))
+    assert np.abs(residuals['dq'][~residuals['kept']]).min() > 1e-3
+    np.testing.assert_allclose(residuals['q'], q_ring, rtol=1e-12)
+    assert np.sqrt(np.mean(residuals['dq'][residuals['kept']] ** 2)) == pytest.approx(fit.rms_q, rel=1e-9)
+
+
 def test_arm_extension_needs_three_nu_positions():
     truth = _calibration()
     controls, calibrant = _ring_controls(TRUTH, truth, [(10., 0.), (30., 0.), (20., 5.)])

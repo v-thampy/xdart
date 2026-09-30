@@ -26,7 +26,9 @@ from xrd_tools.integrate.stitch_calibration import (
     load_calibration_session, pair_validation_angles, save_calibration_pair, save_calibration_session,
     scan_motor_names, source_frame_choices, suggested_frame_indices, validate_frame_files, xu_partner_path,
 )
-from .direct_beam_fit import DirectBeamFitWindow, direct_beam_fit_text
+from .fit_windows import (
+    PARAMETER_LABELS, CalibrationFitWindow, DirectBeamFitWindow, calibration_fit_text, direct_beam_fit_text,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -271,14 +273,6 @@ def fit_summary_text(fit):
     return '\n'.join(lines) + '\n\n' + json.dumps(fit.asset['calibration'], indent=2)
 
 
-_BOUND_LABELS = {'distance_mm': ('distance', 'mm'), 'poni1_mm': ('PONI 1', 'mm'), 'poni2_mm': ('PONI 2', 'mm'),
-                 'del_zero_deg': ('del zero', '°'), 'nu_zero_deg': ('nu zero', '°'),
-                 'del_held_deg': ('held del (fixed pitch)', '°'), 'nu_held_deg': ('held nu (fixed yaw)', '°'),
-                 'mount_tilt_deg': ('mount tilt', '°'), 'mount_roll_deg': ('mount roll', '°'),
-                 'sample_offset1_mm': ('sample offset 1', 'mm'), 'sample_offset2_mm': ('sample offset 2', 'mm'),
-                 'sample_offset3_mm': ('sample offset 3', 'mm'), 'energy_eV': ('energy', 'eV')}
-
-
 def fit_bounds_lines(record):
     """The fit's parameters as it reports them: initial → fitted (the correction), the bounds, and
     those it left at a bound, which are never widened (ARM-ZERO-BOUNDS-20260929)."""
@@ -288,7 +282,7 @@ def fit_bounds_lines(record):
     sources = ', '.join(f'{circle} from {source}' for circle, source in (estimates.get('zero_sources') or {}).items())
     lines = ['Fit parameters (initial → fitted, correction; bounds)' + (f' — zeros: {sources}' if sources else '') + ':']
     for name, row in record['parameters'].items():
-        label, unit = _BOUND_LABELS.get(name, (name, ''))
+        label, unit = PARAMETER_LABELS.get(name, (name, ''))
         bounds = ('free' if row['lower'] is None else f"{row['lower']:.6g} to {row['upper']:.6g}")
         lines.append(f"  {label}: {row['initial']:.6g} → {row['fitted']:.6g} {unit} "
                      f"({row['fitted'] - row['initial']:+.3g}; {bounds})" + (' — AT BOUND' if row['at_bound'] else ''))
@@ -368,6 +362,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._distance_held = {}  # its other moving circle's recorded reading
         self._job_policy = None  # the fit policy the running Fit or Refine took
         self._direct_beam_fit_window = None
+        self._calibration_fit_window = None
+        self._fit_kind = 'fit'  # the job the current fit came from: 'fit' or 'refine'
         self._distance_key = self._distance_pending_key = None  # what the result was fitted from
         #: The arm the staged frames read: (del, nu), or (2θ, None) for fourc/twoc.
         self._frame_motors = ('del', 'nu')
@@ -760,6 +756,13 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.fit_summary.setReadOnly(True)
         self.fit_summary.setMinimumHeight(self.fit_summary.fontMetrics().lineSpacing() * 8)
         layout.addWidget(self.fit_summary, 1)
+        self.show_calibration_fit_button = QtWidgets.QPushButton('Show the fit…')
+        self.show_calibration_fit_button.setToolTip('The fit\'s control points in their own window: each '
+                                                    'one\'s |q| residual across the arm\'s angles and against '
+                                                    'its ring (opened after every Fit or Refine).')
+        self.show_calibration_fit_button.clicked.connect(self._show_calibration_fit)
+        self.show_calibration_fit_button.setEnabled(False)
+        layout.addWidget(self.show_calibration_fit_button)
         self.save_button = QtWidgets.QPushButton('Save geometry and use in Stitch')
         self.save_button.setToolTip('Saves the fitted geometry inside the project as a pyFAI goniometer JSON and, '
                                     'beside it, the same calibration for xrayutilities (<name>.xu.json, checked '
@@ -1517,6 +1520,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._fit_instrument = None
         self.save_button.setEnabled(False)
         self.fit_summary.clear()
+        self.show_calibration_fit_button.setEnabled(False)
+        if self._calibration_fit_window is not None:  # it showed the fit that is gone
+            self._calibration_fit_window.close()
 
     def _geometry_edited(self):
         """A fit belongs to the instrument it recorded: any other value leaves it unsaveable."""
@@ -1828,10 +1834,23 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._direct_beam_fit_window.raise_()
         self.show_fit_button.setEnabled(True)
 
+    def _show_calibration_fit(self):
+        """The ring fit (Fit or Refine) in its own window, with what it found (opened after every fit)."""
+        if self.fit is None:
+            self.status.setText('Fit the calibrated frames or refine first.')
+            return
+        if self._calibration_fit_window is None:
+            self._calibration_fit_window = CalibrationFitWindow(self)
+        self._calibration_fit_window.show_result(self.fit, self._fit_kind)
+        self._calibration_fit_window.show()
+        self._calibration_fit_window.raise_()
+        self.show_calibration_fit_button.setEnabled(True)
+
     def hideEvent(self, event):
-        """The fit window goes with this window (closed, hidden, or shut down by the host)."""
-        if self._direct_beam_fit_window is not None:
-            self._direct_beam_fit_window.close()
+        """The fit windows go with this window (closed, hidden, or shut down by the host)."""
+        for window in (self._direct_beam_fit_window, self._calibration_fit_window):
+            if window is not None:
+                window.close()
         super().hideEvent(event)
 
     def keyPressEvent(self, event):
@@ -2007,10 +2026,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 elif kind in ('fit', 'refine'):
                     summary = fit_summary_text(result)  # before adopting: a failure leaves no fit
                     self.fit = result  # Start from keeps the person's choice (maintainer, 2026-09-29)
-                    self._save_session(self._job_policy)  # the policy this fit took
+                    self._fit_kind = kind
                     self._fit_instrument = result.asset['provenance'].get('instrument_geometry')
                     self.fit_summary.setPlainText(summary)
                     self.save_button.setEnabled(True)
+                    self._save_session_quietly(self._job_policy)  # the policy it took; never unadopts it
+                    self._show_calibration_fit()
                 elif kind == 'save':  # the ring fit, or the direct-beam geometry (_save_rough)
                     provenance = self._saving.asset['provenance']
                     self.saved_source_motors = provenance['source_motors']
@@ -2044,6 +2065,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 elif kind == 'distance':
                     self.status.setText(direct_beam_fit_text(self._distance_result, self._distance_energy_eV,
                                                              self._distance_held))
+                elif kind in ('fit', 'refine'):  # what it found, as the direct-beam fit says its distance
+                    self.status.setText(calibration_fit_text(result, kind))
                 else:
                     self.status.setText('No PONI was saved; the frame remains unchanged.' if kind == 'calibrate' and result is None else f'{kind.capitalize()} complete.')
             except Exception as error:
@@ -2066,11 +2089,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             self._save_session_quietly()
             event.accept()
 
-    def _save_session_quietly(self):
-        """At close: the session keeps the policy last shown (combined Stitch review F2); a failure to
-        write it never keeps the window open, nor the page from closing."""
+    def _save_session_quietly(self, policy=None):
+        """After a Fit or Refine (the policy it took) and at close (the policy last shown; combined Stitch
+        review F2): a failure to write the session never takes back a fit, keeps the window open or the
+        page from closing."""
         try:
-            self._save_session()
+            self._save_session(policy)
         except Exception:  # noqa: BLE001 - a close-time record; the log keeps what went wrong
             _LOG.warning('Could not record the calibration session', exc_info=True)
 

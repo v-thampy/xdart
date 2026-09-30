@@ -6,7 +6,7 @@ image/PONI/NPT hashes; fitting never guesses a filename-to-angle association.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from contextlib import contextmanager
 import hashlib
 import json
@@ -446,6 +446,18 @@ class CalibrationFit:
     condition_number: float
     n_points: int
     message: str
+    #: the fit's control points, for display only (never saved): ``RefineResult.point_residuals``
+    #: and "frames", each control frame's scan index and circle readings
+    point_residuals: dict = field(default_factory=dict, compare=False, repr=False)
+
+
+def fit_point_residuals(result, controls, indices) -> dict:
+    """``CalibrationFit.point_residuals`` from a refinement over ``controls``, the scan frames ``indices``."""
+    if not result.point_residuals:
+        return {}
+    return {**result.point_residuals,
+            'frames': tuple((int(index), {str(name): float(value) for name, value in control.motors.items()})
+                            for index, control in zip(indices, controls))}
 
 
 def _mg_detector_config(calibration):
@@ -581,6 +593,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
         if energy:  # the refined wavelength; the recorded energy the scans are checked against
             asset['source_energy_eV'] = energy['recorded_eV']
         rms, condition, count = result.rms_q, result.condition_number, result.n_points
+        residuals = fit_point_residuals(result, controls, [frame.index for frame in frames])
         arm = f'one detector arm, {held} held at zero' if single else 'del mounted on nu'
         message = (f'{arm[0].upper()}{arm[1:]}; frozen motor scales: ' + ', '.join(result.frozen_scales)
                    if result.frozen_scales else f'Converged; {arm}')
@@ -596,6 +609,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     elif backend == 'xu_hist':
         asset, rms, condition, count = _fit_xu(frames, loaded, del_motor, nu_motor,
             distance_seed_m, distance_bounds_m, max_rms_q, domain, cancelled)
+        residuals = {}
         message = 'Converged; fixed SURFACE camera x−, z+ and PSIC circle convention'
     else:
         raise ValueError('unknown calibration backend')
@@ -626,7 +640,8 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     if cancelled is not None and cancelled.is_set():
         raise InterruptedError('calibration fit cancelled')
     # Provenance is a separate adjacent document for standard pyFAI files.
-    return CalibrationFit(backend, {'calibration': asset, 'provenance': provenance}, rms, condition, count, message)
+    return CalibrationFit(backend, {'calibration': asset, 'provenance': provenance}, rms, condition, count, message,
+                          point_residuals=residuals)
 
 
 def bound_contact_note(table) -> str:

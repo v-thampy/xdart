@@ -32,7 +32,7 @@ from xrd_tools.integrate.frame_screen import FrameScreenPolicy, screen_totals
 from xrd_tools.integrate.refine import ControlFrame, refine_stacked_arm
 from xrd_tools.integrate.stitch_calibration import (
     CalibrationFit, _exact_source, _mg_detector_config, bound_contact_note, calibration_image_identity,
-    source_frame_choices,
+    fit_point_residuals, source_frame_choices,
 )
 
 _SOURCE_MOTORS = (('del_angle', 'del'), ('nu_angle', 'nu'))
@@ -472,7 +472,9 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                     f"{energy['recorded_eV']:.1f}" + (f", held at ±{energy['bound_eV']:g} eV)"
                                                        if energy['at_bound'] else ")"))
     return CalibrationFit('multigeometry', {'calibration': asset, 'provenance': provenance},
-                          result.rms_q, result.condition_number, result.n_points, message)
+                          result.rms_q, result.condition_number, result.n_points, message,
+                          point_residuals=fit_point_residuals(result, controls,
+                                                              [frame['index'] for frame in points.frames]))
 
 
 __all__ = ['ScanRingPoints', 'extract_scan_ring_points', 'refine_arm_from_scan',

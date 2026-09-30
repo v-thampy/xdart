@@ -97,6 +97,32 @@ def _save_to(monkeypatch, target):
                         staticmethod(lambda *args, **kwargs: (str(target), '')))
 
 
+def _assert_fit_shown(dialog, kind, frames):
+    """A Fit or Refine says what it found in the message box and in its own window, which plots each
+    control point's residual (maintainer, 2026-09-29: "the results of the refinement should also be
+    displayed in the message box, and also a popup")."""
+    fit, status = dialog.fit, dialog.status.text()
+    assert status.startswith(f"{kind.capitalize()} complete: RMS |q| {fit.rms_q:.3g} Å⁻¹ over "
+                             f"{fit.n_points} points on {frames} frames"), status
+    parameters = fit.asset['provenance']['fit_bounds']['parameters']
+    assert f" · distance {parameters['distance_mm']['fitted']:.6g} mm" in status
+    assert f" · del zero {parameters['del_zero_deg']['fitted']:.6g}°" in status
+    assert ' · detector mount and sample offset refined' in status
+    window = dialog._calibration_fit_window
+    assert window is not None and window.isVisible() and dialog.show_calibration_fit_button.isEnabled()
+    assert window.summary.text().splitlines()[0] == status
+    residuals = fit.point_residuals
+    kept = residuals['kept']
+    assert len(residuals['frames']) == frames and kept.sum() == fit.n_points
+    shown = [item for item in window.plot.listDataItems() if item.name() != 'rejected']
+    assert len(shown) == len({round(motors['nu'], 6) for _index, motors in residuals['frames']})  # one per nu row
+    np.testing.assert_array_equal(np.sort(np.concatenate([item.yData for item in shown])),
+                                  np.sort(residuals['dq'][kept] * 1e3))
+    np.testing.assert_array_equal(np.sort(np.concatenate([item.xData for item in shown])),
+                                  np.sort([residuals['frames'][i][1]['del'] for i in residuals['frame'][kept]]))
+    assert np.sqrt(np.mean(residuals['dq'][kept] ** 2)) == pytest.approx(fit.rms_q, rel=1e-9)
+
+
 def test_the_guided_fit_takes_the_extension_and_saves_both_files(qapp, tmp_path, monkeypatch):
     """Decision 40 and always-both: the extension whenever the frames determine it (no model
     choice), and Save writes the pyFAI file and its xrayutilities partner before adopting."""
@@ -118,9 +144,12 @@ def test_the_guided_fit_takes_the_extension_and_saves_both_files(qapp, tmp_path,
         assert dialog.fit.asset['provenance']['arm_model'] == 'stacked_extended'
         summary = dialog.fit_summary.toPlainText()
         assert 'Parameters (± 1σ):' in summary and 'mount_tilt' in summary and 'sample_offset3' in summary
+        _assert_fit_shown(dialog, 'fit', len(frames))
+        window = dialog._calibration_fit_window
         dialog.scales.setChecked(True)  # a changed option invalidates the fit and says what it changes
         assert dialog.fit is None and not dialog.fit_summary.toPlainText()
         assert not dialog.save_button.isEnabled()
+        assert not window.isVisible() and not dialog.show_calibration_fit_button.isEnabled()
         assert ('five-parameter arm; motor scales are fitted' in dialog.arm_note.text()
                 and 'Save writes no xrayutilities file' in dialog.arm_note.text())
         dialog.scales.setChecked(False)
@@ -405,6 +434,15 @@ def test_automatic_refinement_from_the_pages_geometry_saves_and_is_adopted(qapp,
         summary = dialog.fit_summary.toPlainText()
         assert 'Automatic refinement chose the detector mount and sample offset' in summary
         assert 'Held-out σ: five-parameter' in summary and 'nu rows used: 4 of 4' in summary
+        _assert_fit_shown(dialog, 'refine', len(dialog.fit.asset['provenance']['frames']))
+        window = dialog._calibration_fit_window
+        assert window.windowTitle() == 'Automatic refinement'
+        assert 'Each nu row predicted from the others: σ ' in window.summary.text()
+        assert ([index for index, _motors in dialog.fit.point_residuals['frames']]
+                == [frame['index'] for frame in dialog.fit.asset['provenance']['frames']])
+        dialog.hide()  # the fit window goes with the calibration window
+        assert not window.isVisible()
+        dialog.show()
         target = (tmp_path / 'calibration' / 'refined.json').resolve()
         _save_to(monkeypatch, target)
         dialog.save_button.click()
