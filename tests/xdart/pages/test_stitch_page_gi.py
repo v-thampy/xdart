@@ -310,6 +310,39 @@ def test_an_edit_reads_no_scan_table_and_lists_no_image_folder(qapp, tmp_path, m
         _close(page, qapp)
 
 
+def test_append_commits_a_manual_angle_being_typed_before_it_skips(qapp, tmp_path):
+    """Codex testing-fixes review F1: after Preview found the output already stitched, a manual incidence
+    angle typed without Return (a click on Run leaves the focus in the field on macOS) was ignored:
+    Append reused Preview's check and skipped. The typing is committed first, so the Run checks again."""
+    from PySide6.QtTest import QTest
+    from tests.xdart.pages.test_stitch_page import _wait
+    page = _page(tmp_path, "multigeometry", StitchGI(("q_ip", "q_oop"), incident_angle_deg=.3))
+    try:
+        page.show()
+        qapp.processEvents()
+        page.begin_run()
+        _wait(page, qapp)
+        page.begin_preview()
+        _wait(page, qapp)
+        assert page._owner.prepared.unchanged == (0,)
+        page.preview_dialog.close()
+        page.activateWindow()
+        qapp.processEvents()
+        angle = _row(page, GI_THETA).editor
+        angle.setFocus()
+        qapp.processEvents()
+        angle.selectAll()
+        QTest.keyClicks(angle, "0.6")
+        assert QtWidgets.QApplication.focusWidget() is angle
+        page.begin_run()
+        _wait(page, qapp)
+        assert page.build_form().gi.incident_angle_deg == .6
+        assert page.run_bar.readinessLabel.full_text().startswith("Complete · "), (
+            page.run_bar.readinessLabel.full_text())
+    finally:
+        _close(page, qapp)
+
+
 def test_a_geometry_edit_leaves_the_gi_card_and_a_rebuild_makes_no_window(qapp, tmp_path, monkeypatch):
     """Maintainer, 2026-09-29: typing in the calibration window's Diffractometer panel, or Read metadata,
     closed that window (macOS). Each geometry edit rebuilt the page's GI card: the old one deleted and a

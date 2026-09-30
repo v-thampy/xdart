@@ -1525,6 +1525,9 @@ class StitchPage(QtWidgets.QWidget):
             self._after_prepare = None
 
     def begin_run(self):
+        # Typing still in a field is part of this Run's inputs: committed first, it makes the check
+        # below run again instead of Append reusing Preview's (Codex testing-fixes review F1).
+        self._commit_typing()
         if self._prepared_revision != self._revision or self._owner.prepared is None:
             # As Int's Run: the inputs are checked on the way (Preview's preflight), then run.
             self._prepare("Checking the inputs…", then="run")
