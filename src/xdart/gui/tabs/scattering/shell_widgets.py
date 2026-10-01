@@ -1059,26 +1059,93 @@ def frame_caption(
     return str(frame.local_frame_label)
 
 
+#: Curves on different grids are folded on one grid of at most this many points (display only), and at most
+#: _FOLD_WORK interpolated values in all; never fewer points than the longest curve's.
+_FOLD_GRID_POINTS = 50_000
+_FOLD_WORK = 20_000_000
+
+
+def _on_one_grid(traces: tuple[TraceProjection, ...]) -> bool:
+    """The traces share the first's grid: equal, or equal to rounding (a billionth of each value)."""
+    first = traces[0].axis.values
+    return all(
+        trace.axis.values.shape == first.shape
+        and (np.array_equal(trace.axis.values, first)
+             or np.allclose(trace.axis.values, first, rtol=1e-9, atol=0.0))
+        for trace in traces
+    )
+
+
+def _fold_grid(traces: tuple[TraceProjection, ...]) -> np.ndarray | None:
+    """One grid for curves on different grids of one axis: from the lowest point of any to the highest, as
+    fine as the finest (its mean spacing), within ``_FOLD_GRID_POINTS`` and ``_FOLD_WORK``; None when the
+    axes differ (Q and 2θ) or one is not finite and strictly monotonic with two points or more."""
+    first = traces[0].axis
+    lows, highs, steps, sizes = [], [], [], []
+    for trace in traces:
+        if (trace.axis.label, trace.axis.unit) != (first.label, first.unit):
+            return None
+        values = np.asarray(trace.axis.values, dtype=float)
+        if values.size < 2 or not np.all(np.isfinite(values)):
+            return None
+        step = np.diff(values)
+        if not (np.all(step > 0.0) or np.all(step < 0.0)):
+            return None
+        lows.append(float(values.min()))
+        highs.append(float(values.max()))
+        steps.append((highs[-1] - lows[-1]) / (values.size - 1))
+        sizes.append(values.size)
+    low, high = min(lows), max(highs)
+    points = int(math.ceil((high - low) / min(steps))) + 1
+    points = max(max(sizes), min(points, _FOLD_GRID_POINTS, _FOLD_WORK // len(traces)))
+    return np.linspace(low, high, points)
+
+
+def foldable(traces: tuple[TraceProjection, ...]) -> bool:
+    """Whether Average and Sum fold these traces (one grid, or grids of one axis), else they show the first."""
+    return not traces or _on_one_grid(traces) or _fold_grid(traces) is not None
+
+
 def aggregate_traces(
     traces: tuple[TraceProjection, ...], mode: str
 ) -> tuple[TraceProjection, ...]:
+    """The traces' Average or Sum, for display. On one grid, point by point. On different grids of one axis
+    (maintainer, 2026-09-30: "can this be changed and made more flexible, at least for sum? This is only for
+    display" -- "bin them together on a common grid"), each is interpolated linearly onto ``_fold_grid``'s
+    and every point takes the curves that reach it (none: no value); a curve that alone reaches a stretch
+    is shown there as it is. On different axes the first is shown."""
     if not traces:
         return ()
     first = traces[0]
-    if not all(
-        trace.axis.values.shape == first.axis.values.shape
-        and np.array_equal(trace.axis.values, first.axis.values)
-        for trace in traces
-    ):
+    if _on_one_grid(traces):
+        values = np.stack([trace.intensity for trace in traces])
+        intensity = (
+            np.nanmean(values, axis=0)
+            if mode == "Average"
+            else np.nansum(values, axis=0)
+        )
+        return (
+            TraceProjection(first.frame, first.axis, intensity, mode),
+        )
+    grid = _fold_grid(traces)
+    if grid is None:
         return (first,)
-    values = np.stack([trace.intensity for trace in traces])
-    intensity = (
-        np.nanmean(values, axis=0)
-        if mode == "Average"
-        else np.nansum(values, axis=0)
-    )
+    total = np.zeros(grid.shape)
+    count = np.zeros(grid.shape, dtype=np.int64)
+    for trace in traces:  # one curve at a time: the fold holds the grid's arrays only
+        values = np.asarray(trace.axis.values, dtype=float)
+        intensity = np.asarray(trace.intensity, dtype=float)
+        if values[0] > values[-1]:
+            values, intensity = values[::-1], intensity[::-1]
+        row = np.interp(grid, values, intensity, left=np.nan, right=np.nan)
+        reached = ~np.isnan(row)
+        total[reached] += row[reached]
+        count += reached
+    intensity = np.full(grid.shape, np.nan)
+    reached = count > 0
+    intensity[reached] = total[reached] / count[reached] if mode == "Average" else total[reached]
     return (
-        TraceProjection(first.frame, first.axis, intensity, mode),
+        TraceProjection(first.frame, AxisProjection(grid, first.axis.label, first.axis.unit), intensity, mode),
     )
 
 
@@ -1087,6 +1154,7 @@ __all__ = [
     "apply_vnext_controls_readiness",
     "axis_extent",
     "aggregate_traces",
+    "foldable",
     "ContentFitComboBox",
     "experiment_header_projection",
     "frame_caption",

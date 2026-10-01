@@ -39,6 +39,7 @@ from xdart.gui.widgets.controls_panel import (
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xdart.gui.widgets.scientific_plot import scaled_intensity_label
 from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
+from xdart.gui.tabs.scattering.shell_widgets import foldable
 from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
 from xrd_tools.analysis.stitch_native import native_ceilings
@@ -2675,11 +2676,10 @@ class StitchPage(QtWidgets.QWidget):
                      if any(mode in dict(payload.gi) for _item, payload in items.values()))
         traces = tuple(named(trace) for trace in state.traces)
         status = current.text() if current is not None else ""
-        if (self._view.plot_mode in {"Average", "Sum"} and len(traces) > 1 and any(
-                not np.array_equal(trace.axis.values, traces[0].axis.values) for trace in traces[1:])):
-            # Int's view folds only results on one grid, else shows the first: said, not silent
-            status = (f"{self._view.plot_mode} needs the results on one grid (the same range and Pts): "
-                      f"showing {traces[0].title}")
+        if self._view.plot_mode in {"Average", "Sum"} and not foldable(traces):
+            # Int's view folds results on one axis (on different grids, on one grid spanning them), else
+            # shows the first: said, not silent
+            status = f"{self._view.plot_mode} needs the results on one axis: showing {traces[0].title}"
         state = replace(state, traces=traces,
                         pinned_traces=tuple(replace(pinned, trace=named(pinned.trace)) for pinned in state.pinned_traces),
                         gi_modes_1d=("q_total", *cuts) if state.measurement_mode == "GI" else (),

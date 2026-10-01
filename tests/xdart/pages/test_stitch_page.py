@@ -472,9 +472,20 @@ def test_average_sum_and_waterfall_show_the_selected_results_as_ints(qapp, tmp_p
         view.plot_mode.setCurrentText("Waterfall")
         _wait(page, qapp)
         assert view.bottom_stack.currentWidget() is view.waterfall
-        view.plot_mode.setCurrentText("Average")
-        _wait(page, qapp)
-        assert "Average needs the results on one grid" in view.status.text()
+        # Maintainer, 2026-09-30: "can this be changed and made more flexible, at least for sum? This is only
+        # for display" -- "bin them together on a common grid": on one grid spanning them, each interpolated
+        curves = [(np.asarray(payload.axes[0][1], dtype=float), np.asarray(payload.intensity, dtype=float))
+                  for payload in payloads]
+        for mode in ("Average", "Sum"):
+            view.plot_mode.setCurrentText(mode)
+            _wait(page, qapp)
+            (curve,) = page.curve.listDataItems()
+            x = np.asarray(curve.xData, dtype=float)
+            assert x.size == max(radial.size for radial, _values in curves)  # as fine as the finest
+            rows = np.stack([np.interp(x, radial, values, left=np.nan, right=np.nan) for radial, values in curves])
+            expected = np.nanmean(rows, axis=0) if mode == "Average" else np.nansum(rows, axis=0)
+            np.testing.assert_allclose(curve.yData, expected, rtol=1e-6)
+            assert "one axis" not in view.status.text()
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
