@@ -99,7 +99,7 @@ from xrd_tools.io.analysis_artifact import (
 )
 from xrd_tools.io.nexus import write_rsm
 from xrd_tools.io.stat_identity import identity_ctime_ns
-from xrd_tools.io.spec import get_UB, get_energy, get_energy_and_UB
+from xrd_tools.io.spec import get_UB, get_energy, get_energy_and_UB, get_orientation_header
 from xrd_tools.rsm.gridding import (
     RSMGridChunkLease,
     RSMGridChunkReleaseError,
@@ -1605,6 +1605,85 @@ class _RSMCapturedMemberFacts:
     source_fingerprint: str
     module_source_fingerprint: str
     table_fingerprint: str
+    #: where the UB came from, for Preview only (decision 2): never part of an identity
+    ub_origin: str | None = None
+
+
+_STANDARD_PSIC_AXES = ("x+", "z-", "y+", "z-", "x+", "z-")  # mu, eta, chi, phi, nu, del
+
+
+def _rsm_reversed_circles(mapper: PixelQMap) -> tuple[str, ...]:
+    """The psic circles a map turns other than psic's standard way (by role)."""
+    from xrd_tools.rsm.orientation import ROLE_ORDER
+    axes = tuple(mapper.diff_config.sample_circles) + tuple(mapper.diff_config.detector_circles)
+    if len(axes) != len(_STANDARD_PSIC_AXES):
+        return ()
+    return tuple(role for role, axis, plain in zip(ROLE_ORDER, axes, _STANDARD_PSIC_AXES) if axis != plain)
+
+
+def _rsm_orientation_ub(analysis, g3, mapper: PixelQMap, runtime_session) -> tuple[np.ndarray, str]:
+    """A SPEC member's UB in the model RSM maps with (AUD-9 stage 2b decision 2; the maintainer: "Xu provides a
+    way to specify the actual circle directions on the instrument. Shouldn't that be used?"). SPEC stores no circle
+    directions, and ``#G3`` was computed in its own psic convention from the header's two orientation reflections
+    (``#G1``); the UB is recomputed from them in the map's directions and zero offsets.
+
+    ``#G3`` is the cross-check, twice. The header's reflections must reproduce ``#G3`` in psic's standard model to
+    its rounding, or they cannot be trusted in another: psic's standard model then keeps ``#G3`` (with a warning),
+    any other refuses. And a recompute within the rounding of ``#G3`` is ``#G3`` itself, so its bytes and every
+    identity are unchanged. A model other than psic's standard needs the reflections
+    (``RSM_ORIENTATION_REFLECTIONS_MISSING``)."""
+    from dataclasses import replace
+
+    from xrd_tools.rsm.orientation import ROLE_ORDER, ROUNDING, relative_difference, spec_orientation
+
+    g3 = np.asarray(g3, dtype=np.float64)
+    reversed_roles = _rsm_reversed_circles(mapper)
+    plain = not reversed_roles and not any(mapper.angle_offsets)
+    try:
+        orientation = spec_orientation(
+            get_orientation_header(analysis.resolved_root, analysis.resolved_scan))
+    except KeyError:
+        orientation = None
+    if orientation is None:
+        if plain:
+            return g3, "#G3 (the header holds no orientation reflections to recompute it from)"
+        raise RSMOperationRefused(
+            "RSM_ORIENTATION_REFLECTIONS_MISSING",
+            "this scan's header holds no orientation reflections (#G1) to recompute its UB in the instrument's "
+            "directions; give a UB, or map in Q coordinates",
+        )
+    named = " and ".join(
+        "(" + " ".join(f"{value:g}" for value in item.hkl) + ")" for item in orientation.reflections)
+    standard = mapper if plain else replace(
+        mapper,
+        diff_config=replace(
+            mapper.diff_config,
+            sample_circles=_STANDARD_PSIC_AXES[:4],
+            detector_circles=_STANDARD_PSIC_AXES[4:],
+        ),
+        angle_offsets=(),
+    )
+    self_check = relative_difference(standard.orientation_ub(orientation, runtime_session=runtime_session), g3)
+    if self_check > ROUNDING:
+        if plain:
+            return g3, (f"#G3, kept; ⚠ its own reflections {named} give it only to {self_check:.3g} (relative) in "
+                        "psic's standard directions, so they are not a psic #G1 this RSM can check it by")
+        raise RSMOperationRefused(
+            "RSM_ORIENTATION_REFLECTIONS_MISSING",
+            f"this scan's reflections {named} do not reproduce its own #G3 in psic's standard directions "
+            f"({self_check:.3g}, relative), so its UB cannot be recomputed in the instrument's; give a UB",
+        )
+    if plain:
+        return g3, f"#G3; recomputed from {named} in the instrument's directions it agrees to {self_check:.2g}"
+    recomputed = mapper.orientation_ub(orientation, runtime_session=runtime_session)
+    difference = relative_difference(recomputed, g3)
+    if difference <= ROUNDING:
+        return g3, f"#G3; recomputed from {named} in the instrument's directions it agrees to {difference:.2g}"
+    moved = sorted({role for role in reversed_roles for item in orientation.reflections
+                    if abs(math.remainder(item.angles[ROLE_ORDER.index(role)], 180.0)) > 1e-6})
+    note = "" if not moved else "; reversed circles away from 0° or 180° there: " + ", ".join(moved)
+    return recomputed, (f"recomputed from {named} in the instrument's directions; #G3 differs by "
+                        f"{difference:.3g} (relative){note}")
 
 
 def _capture_preflight_facts(
@@ -1778,6 +1857,7 @@ def _capture_preflight_facts(
                         "RSM_MEMBER_IDENTITY_MISMATCH",
                         "member detector shape differs from effective geometry",
                     )
+            ub_origin = None
             try:
                 if nexus:
                     energy, ub_value = _rsm_nexus_energy_and_ub(
@@ -1789,11 +1869,15 @@ def _capture_preflight_facts(
                         analysis.resolved_scan,
                     )
                     ub_value = ub_override.array()
+                    ub_origin = "given (typed, or from a named SPEC scan), used as given"
                 elif coordinate_frame is RSMCoordinateFrame.HKL:
                     energy, ub_value = get_energy_and_UB(
                         analysis.resolved_root,
                         analysis.resolved_scan,
                     )
+                    if mapper is not None:  # decision 2: the UB in the model RSM maps with
+                        ub_value, ub_origin = _rsm_orientation_ub(
+                            analysis, ub_value, mapper, active_runtime_session)
                 else:
                     energy = get_energy(
                         analysis.resolved_root,
@@ -1967,6 +2051,7 @@ def _capture_preflight_facts(
         analysis.source_fingerprint,
         source.fingerprint,
         source.table_fingerprint,
+        ub_origin=ub_origin,
     )
 
 
@@ -2243,6 +2328,8 @@ class RSMPreflightMemberV2:
     mask_policy_intent: tuple[object, ...]
     fingerprint: str
     _claim: InitVar[object] = None
+    #: where the UB came from, for Preview only (decision 2): outside the fingerprint
+    ub_origin: str | None = field(default=None, repr=False)
 
     def __post_init__(self, _claim: object) -> None:
         try:
@@ -2556,6 +2643,7 @@ def _make_rsm_preflight_member_v2(
         mask_intent,
         fingerprint,
         _RSM_V2_FACTORY,
+        ub_origin=facts.ub_origin,
     )
 
 

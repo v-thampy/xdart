@@ -187,6 +187,9 @@ def test_row_b_a_calibration_encoding_the_canonical_geometry_agrees_with_the_ref
                 assert any(line.startswith("Geometry: the calibration on the Calibration row, refinement on")
                            for line in lines)
                 assert "  energy: recorded 13000.007 eV, offset +0 eV, used 13000.007 eV" in lines
+                # decision 2: #G3 checked against its own reflections in the instrument's (here standard) model
+                assert any(line.startswith("  UB: #G3; recomputed from (1 1 4) and (-1 0 4) in the instrument's "
+                                           "directions it agrees to") for line in lines)
             result = run_rsm_operation_v2(request)
             assert result.terminal.disposition is ModuleDisposition.COMMITTED
             payloads.append(result.payload)

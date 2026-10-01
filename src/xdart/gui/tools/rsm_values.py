@@ -1474,6 +1474,8 @@ class RSMToolPreflightMemberSummaryV2:
     _claim: InitVar[object] = None
     #: a NeXus member's entry, where a SPEC member has its scan (AUD-9 stage 2b C5c); None for SPEC
     source_entry: str | None = None
+    #: where the UB came from (decision 2: #G3, or recomputed in the instrument's directions); None in Q
+    ub_origin: str | None = None
 
     def __post_init__(self, _claim: object) -> None:
         hashes = (
@@ -1992,6 +1994,7 @@ def prepare_rsm_tool_v2(
             ),
             _PREFLIGHT_V2_FACTORY,
             json.loads(item.source_options_json).get("entry"),
+            item.ub_origin,
         )
         for item, source in zip(
             request.preflight.members,
@@ -2156,6 +2159,8 @@ def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]
                 *(() if member.source_entry is None or frame is not RSMCoordinateFrame.HKL else (
                     "  UB: the NeXus entry's own, read in SPEC's #G3 convention (2π included, as xdart writes "
                     "it), unless one is given",)),
+                *(() if member.ub_origin is None or frame is not RSMCoordinateFrame.HKL else (
+                    f"  UB: {member.ub_origin}",)),
                 f"  labels: {member.selected_labels}",
                 f"  form: {member.member_form_fingerprint}",
                 f"  module source: {member.module_source_fingerprint}",

@@ -272,6 +272,41 @@ class PixelQMap:
         """The energy mapped: the caller's plus the calibration's energy offset (unchanged without one)."""
         return energy if not self.energy_offset_eV else float(energy) + float(self.energy_offset_eV)
 
+    def orientation_ub(self, orientation, *, runtime_session: object | None = None) -> np.ndarray:
+        """A SPEC source's UB recomputed from its ``#G1`` orientation reflections in this map's own model (its
+        circle directions; the calibration's zero offsets subtracted from the reflections' angles as from every
+        frame's), by Busing and Levy (``xrd_tools.rsm.orientation``; AUD-9 stage 2b decision 2). The energy offset
+        and the mount do not enter: U uses only the reflections' directions, and a reflection is centred on the
+        beam pixel."""
+        from xrd_tools.core.geometry.xu_runtime import (
+            XuRuntimeSession,
+            require_active_xu_runtime_session,
+            xu_runtime_session,
+        )
+        from xrd_tools.rsm.orientation import busing_levy_ub
+
+        offsets = tuple(self.angle_offsets)
+
+        def compute(active_session):
+            require_active_xu_runtime_session(active_session)
+            hxrd = self.diff_config.make_hxrd(12398.419843320026 / orientation.reflections[0].wavelength_A)
+
+            def point(angles, wavelength):
+                values = (angles if not any(offsets)
+                          else tuple(angle - offset for angle, offset in zip(angles, offsets, strict=True)))
+                require_active_xu_runtime_session(active_session)
+                return np.asarray(hxrd.Ang2Q.point(*values, UB=np.identity(3), wl=float(wavelength)),
+                                  dtype=np.float64)
+
+            return busing_levy_ub(point, orientation)
+
+        if runtime_session is None:
+            with xu_runtime_session() as active_session:
+                return compute(active_session)
+        if type(runtime_session) is not XuRuntimeSession:
+            raise TypeError("orientation_ub runtime session must be exact")
+        return compute(runtime_session)
+
     def pixel_q(
         self,
         angles: list[np.ndarray] | tuple[np.ndarray, ...],
