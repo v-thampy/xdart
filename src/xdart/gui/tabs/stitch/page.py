@@ -33,6 +33,7 @@ from xdart.gui.tools.stitch_owner import (
     StitchToolOwner,
 )
 from xdart.gui.tools import normalization_values as normalization
+from xdart.gui.tools.correction_values import correction_rows
 from xdart.gui.tools.stitch_values import StitchFrameSelector, StitchToolForm
 from xdart.gui.widgets.controls_panel import (
     PROCESSING_ROW_GAP, PROCESSING_ROW_LABEL_WIDTH, ControlsPanel, FormRow, RangeRow, SubsectionCard,
@@ -130,6 +131,9 @@ _GI_RANGES = {"gi_ip": ("Qip (Å⁻¹)", "Bins I(Qip) (Auto: the data's span) an
                                      "pixel); a Stitch 2D's q_ip-q_oop map spans both."),
               "gi_oop": ("Qoop (Å⁻¹)", "Bins I(Qoop) (Auto: the data's span) and is I(Qip)'s window (Auto: every "
                                        "pixel); a Stitch 2D's q_ip-q_oop map spans both.")}
+#: Stitch's own sentence on the shared Corrections rows' tips (``correction_values``).
+_CORRECTION_NOTES = {"solid_angle": "Keep on for a stacked-arm calibration with a sample offset: its frames sit "
+                                    "at different distances."}
 
 
 _LOG = logging.getLogger(__name__)
@@ -885,21 +889,14 @@ class StitchPage(QtWidgets.QWidget):
         self._render_tilt(self._gi_catalog)
         self.corrections_card = self.advanced.add_group("Corrections")
         card = self.corrections_card
-        self._field(card, SectionId.PROCESSING, "solid_angle", "Solid angle", "On", choices=("On", "Off"))
-        self._rows["solid_angle"].setToolTip(
-            "Keep on for a stacked-arm calibration with a sample offset: its frames sit at "
-            "different distances.")
-        self._field(card, SectionId.PROCESSING, "polarization", "Polarization", "0.99")
-        self._rows["polarization"].setToolTip("Polarization factor from -1 to 1; leave blank for none.")
-        self._field(card, SectionId.PROCESSING, "error_model", "Error model", "None",
-                    choices=("None", "Poisson"))
-        self._field(card, SectionId.PROCESSING, "dark_path", "Dark", browse=True)
-        self._field(card, SectionId.PROCESSING, "flat_path", "Flat field", browse=True)
-        self._field(card, SectionId.PROCESSING, "flat_cutoff", "Flat cutoff (% of median)", "10")
-        self._rows["flat_cutoff"].setToolTip(
-            "Flat pixels below this share of the flat's median are treated as dead and masked. "
-            "Raise it to mask a region shadowed in the flat; lower it to keep weak but "
-            "working pixels. 0 masks only zero, negative and non-finite pixels.")
+        # the shared Corrections rows, RSM's too (``correction_values``); Stitch's own Error model after Polarization
+        for spec in correction_rows(_CORRECTION_NOTES):
+            self._field(card, SectionId.PROCESSING, spec.key, spec.label, spec.value, choices=spec.choices,
+                        browse=spec.browse)
+            self._rows[spec.key].setToolTip(spec.tip)
+            if spec.key == "polarization":
+                self._field(card, SectionId.PROCESSING, "error_model", "Error model", "None",
+                            choices=("None", "Poisson"))
         # Int's action row: Preview · Retry (after a failure) · Advanced
         buttons = self.controls.render_actions(processing, tuple(
             ControlActionSpec(action, label, SectionId.PROCESSING) for action, label in (

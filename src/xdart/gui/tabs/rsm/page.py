@@ -57,6 +57,7 @@ from xdart.gui.tools.rsm_values import (
     rsm_preflight_summary_lines, rsm_tool_preset,
 )
 from xdart.gui.tools import normalization_values as normalization
+from xdart.gui.tools.correction_values import correction_rows
 from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow, SubsectionCard
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
@@ -553,21 +554,21 @@ class RSMPage(QtWidgets.QWidget):
     def _correction_values(self):
         """Advanced Corrections' solid angle, polarization factor and flat cutoff (a fraction), read as Stitch's
         rows are (a blank polarization is none, a blank cutoff Int's 10 %); ValueError names a refused one."""
-        text = str(self._value("adv_polarization")).strip()
+        text = str(self._value("polarization")).strip()
         try:
             factor = None if not text else float(text)
         except ValueError:
             factor = math.nan
         if factor is not None and not (math.isfinite(factor) and -1 <= factor <= 1):
             raise ValueError("Polarization (a number from -1 to 1, or blank for none)")
-        text = str(self._value("adv_flat_cutoff")).strip()
+        text = str(self._value("flat_cutoff")).strip()
         try:
             cutoff = float(text) / 100 if text else 0.1
         except ValueError:
             cutoff = math.nan
         if not (math.isfinite(cutoff) and 0 <= cutoff < 1):
             raise ValueError("Flat cutoff (a percentage from 0 to below 100)")
-        return self._value("adv_solid_angle") == "On", factor, cutoff
+        return self._value("solid_angle") == "On", factor, cutoff
 
     def _corrections(self, root):
         """The run's per-frame corrections (C4): the Mask File, Int's threshold, Advanced's dark, flat and
@@ -724,6 +725,7 @@ class RSMPage(QtWidgets.QWidget):
         and one frame range for every scan, as Stitch's."""
         preset = rsm_tool_preset()
         self.advanced = AdvancedDialog(self, title="Advanced — RSM", object_name="rsmAdvancedDialog")
+        corrections = correction_rows()  # Stitch's Corrections rows (``correction_values``), on by default (decision 5)
         groups = (
             ("Source and geometry", SectionId.SOURCE, (
                 ("adv_rows", "Rows", str(preset.detector_shape[0]), ()),
@@ -738,36 +740,26 @@ class RSMPage(QtWidgets.QWidget):
                 ("adv_foil_occurrence", "Foil column occurrence", "0", ()),
                 ("adv_exposure_occurrence", "Exposure column occurrence", "0", ()),
                 ("adv_monitor_occurrence", "Monitor column occurrence", "0", ()))),
-            ("Corrections", SectionId.PROCESSING, (
-                ("adv_solid_angle", "Solid angle", "On", ("On", "Off")),
-                ("adv_polarization", "Polarization", "0.99", ()),
-                ("dark_path", "Dark", "", ()),
-                ("flat_path", "Flat field", "", ()),
-                ("adv_flat_cutoff", "Flat cutoff (% of median)", "10", ()))),
+            ("Corrections", SectionId.PROCESSING, tuple(
+                (spec.key, spec.label, spec.value, spec.choices) for spec in corrections)),
             ("Chunk and memory", SectionId.PROCESSING, (
                 ("adv_chunk", "Frames per chunk", str(preset.chunk_size), ()),
                 ("adv_max_frame_mib", "Max frame MiB", str(preset.max_frame_bytes // _MIB), ()),
                 ("adv_max_chunk_mib", "Max chunk MiB", "", ()))),
         )
+        browse = {spec.key for spec in corrections if spec.browse}
         for title, section, rows in groups:
             self.advanced.add_group(title, tuple(
-                self._row(section, key, label, value, choices, key in {"dark_path", "flat_path"})
+                self._row(section, key, label, value, choices, key in browse)
                 for key, label, value, choices in rows))
+        for spec in corrections:
+            self._tip(spec.key, spec.tip)
         self._tip("adv_rows", "The raw images' rows (a NeXus stack's frames are this shape too).")
         self._tip("adv_header", "Bytes before the pixels in each raw image file.")
         self._tip("adv_angle_mapping", "Which source column each psic circle reads, as role=column: mu, eta, chi, "
                                        "phi, nu and del, each once. A column the scan repeats takes its "
                                        "occurrence after # (nu=Nu#1 is the second Nu; #0, the first, is the "
                                        "default).")
-        # the Corrections rows are Stitch's (its labels, defaults and tips); on by default (decision 5)
-        self._tip("adv_solid_angle", "Each pixel's solid angle, as pyFAI's: on by default.")
-        self._tip("adv_polarization", "Polarization factor from -1 to 1; leave blank for none.")
-        self._tip("dark_path", "A dark image subtracted from every frame (Int's dark check admits it).")
-        self._tip("flat_path", "A flat field dividing every frame (Int's flat check admits it).")
-        self._tip("adv_flat_cutoff", "Flat pixels below this share of the flat's median are treated as dead and "
-                                     "masked. Raise it to mask a region shadowed in the flat; lower it to keep "
-                                     "weak but working pixels. 0 masks only zero, negative and non-finite "
-                                     "pixels.")
         self._tip("frame_first", "The first frame of every scan (0 is the first).")
         self._tip("frame_last", "The last frame of every scan; blank is each scan's last.")
         self._tip("frame_step", "Every n-th frame from the first.")

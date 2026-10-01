@@ -1430,8 +1430,8 @@ def test_advanced_corrections_reach_the_runs_frame_corrections(qapp, tmp_path):
                 corrections.dark_path, corrections.flat_path) == (True, 0.99, 0.1, None, None)
         np.save(tmp_path / "dark.npy", np.zeros((4, 5)))
         np.save(tmp_path / "flat.npy", np.ones((4, 5)))
-        for key, value in (("dark_path", "dark.npy"), ("flat_path", "flat.npy"), ("adv_flat_cutoff", "20"),
-                           ("adv_polarization", ""), ("adv_solid_angle", "Off")):
+        for key, value in (("dark_path", "dark.npy"), ("flat_path", "flat.npy"), ("flat_cutoff", "20"),
+                           ("polarization", ""), ("solid_angle", "Off")):
             page.set_field(key, value)
         assert page._readiness[1], page._readiness
         corrections = page.build_form().corrections
@@ -1439,14 +1439,46 @@ def test_advanced_corrections_reach_the_runs_frame_corrections(qapp, tmp_path):
                                                                   str(tmp_path / "flat.npy"))
         assert (corrections.flat_min_fraction, corrections.polarization_factor, corrections.solid_angle) == (
             0.2, None, False)
-        page.set_field("adv_polarization", "2")
+        page.set_field("polarization", "2")
         assert "Advanced Polarization" in page._headers["processing"].detail and not page._readiness[1]
         with pytest.raises(ValueError, match="Polarization"):
             page.build_form()
-        page.set_field("adv_polarization", "0.5")
+        page.set_field("polarization", "0.5")
         page.set_field("dark_path", "missing.npy")
         assert "the Dark (missing.npy not found)" in page._headers["processing"].detail
     finally:
+        page.close_page()
+
+
+def test_stitch_and_rsm_lay_out_one_corrections_group(qapp):
+    """G8d (G8c unit 4c): Stitch's and RSM's Advanced Corrections rows are one shared group (``correction_values``):
+    the same keys, labels, defaults, choices, file rows and tips, in one order. Stitch keeps its own Error model
+    after Polarization and its stacked-arm sentence on Solid angle."""
+    from xdart.gui.tabs.stitch.page import StitchPage
+    from xdart.gui.widgets.controls_panel import SubsectionCard
+
+    def shown(page, card):  # each row in the card's order: its field's label, default, choices, browse, and tip
+        layout, keys = card.body_layout, {row: key for key, row in page._rows.items()}
+        rows = (layout.itemAt(index).widget() for index in range(layout.count()))
+        return {keys[row]: (page._fields[keys[row]].label, page._fields[keys[row]].value,
+                            page._fields[keys[row]].choices, page._fields[keys[row]].browse, row.toolTip())
+                for row in rows}
+    stitch, page = StitchPage(empty_host_services(_Status())), _page(qapp)
+    try:
+        cards = {card.title.text(): card for card in page.advanced.findChildren(SubsectionCard)}
+        mine, theirs = shown(page, cards["Corrections"]), shown(stitch, stitch.corrections_card)
+        assert list(theirs) == ["solid_angle", "polarization", "error_model", "dark_path", "flat_path",
+                                "flat_cutoff"]
+        assert theirs.pop("error_model")[:3] == ("Error model", "None", ("None", "Poisson"))
+        stacked = " Keep on for a stacked-arm calibration with a sample offset: its frames sit at different distances."
+        assert theirs["solid_angle"][4].endswith(stacked)
+        theirs["solid_angle"] = (*theirs["solid_angle"][:4], theirs["solid_angle"][4][:-len(stacked)])
+        assert list(mine) == list(theirs) and mine == theirs
+        assert mine["solid_angle"][1:3] == ("On", ("On", "Off")) and mine["dark_path"][3] and mine["flat_path"][3]
+        assert all(entry[4] for entry in mine.values())  # every row says what it does
+    finally:
+        stitch.shutdown()
+        stitch.deleteLater()
         page.close_page()
 
 
@@ -1601,7 +1633,7 @@ def test_the_preview_names_the_solid_angle_the_detector_mask_and_a_given_ub_besi
         page.set_field("ub_from", "Typed")
         for number, row in enumerate(("2 0 0", "0 2 0", "0 0 2"), 1):
             page.set_field(f"ub_row{number}", row)
-        page.set_field("adv_solid_angle", "Off")
+        page.set_field("solid_angle", "Off")
         page.begin_preview()
         _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text())
         shown = page.preview_text.toPlainText()
