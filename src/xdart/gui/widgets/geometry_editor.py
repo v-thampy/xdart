@@ -24,7 +24,7 @@ _ALL_CIRCLES = ('mu', 'eta', 'th', 'chi', 'phi', 'nu', 'del', 'tth')
 _ZERO_CIRCLES = ('nu', 'del', 'tth')
 _ZERO_TIP = ("{circle}'s motor-zero reading (degrees): the motor's readback where the circle is at zero, "
              "so its physical angle = readback − this. The fits start here and stay within ± the zero "
-             "freedom under 3 · Calibrate and fit ▸ Advanced. Blank: 0, or the seed calibration's own "
+             "freedom under 4 · Calibrate and fit ▸ Advanced. Blank: 0, or the seed calibration's own "
              "zero when refining from one.")
 #: The sample's circles: their motor-zero readings correct the angles Stitch's grazing incidence reads
 #: (maintainer, 2026-09-30: "a place to enter a zero offset for each angle ... set to 0 by default").

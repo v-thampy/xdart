@@ -164,17 +164,17 @@ class InstrumentGeometry:
             if moving == {'del', 'nu'}:
                 return (f"This calibration is psic's del-on-nu arm; {self.geometry} has one detector circle "
                         f"(a {self.plane} 2θ). Calibrate its 2θ arm, or choose psic under Calibrate ▸ "
-                        "1 · Geometry.")
+                        "1 · Instrument.")
             other = next(iter(moving - mine))
             return (f"This calibration's arm moves psic's {other} (a {_PLANE_OF[other]} 2θ); {self.geometry}'s "
                     f"2θ arm is {self.plane} here. Choose the {_PLANE_OF[other]} scattering plane under "
-                    "Calibrate ▸ 1 · Geometry, or calibrate this arm.")
+                    "Calibrate ▸ 1 · Instrument, or calibrate this arm.")
         if holds & mine:
             held = next(iter(holds & mine))
             plane = _PLANE_OF[next(iter(moving))] if len(moving) == 1 else 'matching'
             return (f"This calibration is a single 2θ arm ({held} held at zero), but {self.geometry} moves "
                     f"{held}. Choose fourc or twoc (the {plane} scattering plane) under Calibrate ▸ "
-                    "1 · Geometry, or calibrate psic's arm.")
+                    "1 · Instrument, or calibrate psic's arm.")
         return None
 
     def circle_for_position(self, name) -> str | None:

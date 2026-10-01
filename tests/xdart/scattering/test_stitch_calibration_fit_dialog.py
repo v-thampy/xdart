@@ -348,7 +348,7 @@ def test_a_fit_belongs_to_the_instrument_its_frames_were_staged_with(qapp, tmp_p
         dialog.set_instrument(InstrumentGeometry('psic', (('del', 'delta'), ('nu', 'gamma'))))
         dialog.fit_button.click()
         assert dialog.fit is None and not dialog.active()
-        assert 'staged reading del and nu; the Geometry now names delta and gamma' in dialog.status.text()
+        assert 'staged reading del and nu; the Diffractometer now names delta and gamma' in dialog.status.text()
         dialog.set_instrument(InstrumentGeometry('psic'))
         dialog.fit_button.click()
         _wait(dialog)
@@ -615,7 +615,7 @@ def test_a_direct_beam_geometry_saves_as_the_calibration_pair_without_a_ring_fit
 
 def test_automatic_refinement_can_start_from_the_direct_beam_geometry(qapp, tmp_path):
     """Maintainer, 2026-09-29: can the refinement run "just with the rough poni file made with the
-    direct beam scan"? It starts from 1 · Geometry's distance and beam pixel, no frame calibrated
+    direct beam scan"? It starts from 2 · Rough geometry's distance and beam pixel, no frame calibrated
     (on 17-2's LaB6 scan 14: held-out σ 0.0045 Å⁻¹ from the direct-beam arm, 0.0039 from a ring fit)."""
     from xrd_tools.integrate.calibration_seed import predict_frame_seed
     from tests.core.test_calibration_seed import _frame

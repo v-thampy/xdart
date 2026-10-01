@@ -147,7 +147,7 @@ def test_modeless_window_exposes_guided_source_controls_and_preserves_session(tm
     source = SourceSpec(tmp_path/'beam', SourceKind.SPEC, options={'scan':'14', 'image_dir':str(tmp_path/'images')})
     dialog.set_source_context(source, image_rotation=180, del_motor='delta', nu_motor='gamma')
     assert not dialog.isModal()
-    assert dialog.tabs.count() == 3  # 3 · Calibrate and fit holds the fit (maintainer, 2026-09-29)
+    assert dialog.tabs.count() == 4  # 4 · Calibrate and fit holds the fit (maintainer, 2026-09-29, -30)
     assert dialog._spec().options['scan'] == '14'
     assert dialog.rotation.currentData() == 180
     assert not dialog.scales.isChecked()
@@ -243,7 +243,7 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     from tests.core.test_calibration_seed import _frame, _record
     dialog = StitchCalibrationDialog(tmp_path)
     assert [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())] == [
-        '1 · Geometry', '2 · Select frames', '3 · Calibrate and fit']
+        '1 · Instrument', '2 · Rough geometry', '3 · Calibrant scan', '4 · Calibrate and fit']
     visible = dialog._row_visible
     assert visible('beam_source') and not visible('rough_distance')  # a direct-beam scan by default
     dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
@@ -285,8 +285,8 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
 
 def test_the_geometry_comes_first_and_names_the_arm_motors(tmp_path):
     dialog = StitchCalibrationDialog(tmp_path)
-    assert dialog.tabs.tabText(0) == '1 · Geometry'
-    assert dialog._tab_pages['rough'].isAncestorOf(dialog.geometry_editor)
+    assert dialog.tabs.tabText(0) == '1 · Instrument'
+    assert dialog._tab_pages['instrument'].isAncestorOf(dialog.geometry_editor)
     source = SourceSpec(tmp_path/'beam', SourceKind.SPEC, options={'scan': '14'})
     dialog.set_source_context(source, del_motor='delta', nu_motor='nu')
     assert dialog.geometry_editor.value().stitch_arm() == ('delta', 'nu')
@@ -295,6 +295,33 @@ def test_the_geometry_comes_first_and_names_the_arm_motors(tmp_path):
     assert dialog.geometry_editor.value().stitch_arm() == ('tth', None)  # psic's arm, nu held at zero
     label = dialog.geometry_editor._form.labelForField(dialog.geometry_editor._rows['tth']).text()
     assert label == 'tth (detector) · z-  ·  used by Stitch'  # its axis: psic's del, vertical plane
+    from xdart.gui.pages.values import PageCleanup
+    assert dialog.shutdown().status is PageCleanup.CLEAN
+    dialog.close()
+
+
+def test_the_tabs_hold_the_instrument_then_advanced_above_the_fits_and_the_ranges_beside_save(tmp_path):
+    """The maintainer's four tabs (2026-09-30): the Diffractometer above the Detector; Advanced, collapsed
+    and holding the energy option, above both fits; Refine from the whole scan open; the xrayutilities
+    ranges, which only the saves read, beside Save."""
+    dialog = StitchCalibrationDialog(tmp_path)
+    instrument = dialog._tab_pages['instrument'].widget().layout()
+    assert instrument.indexOf(dialog._diffractometer_box) < instrument.indexOf(dialog._detector_box)
+    assert dialog._diffractometer_box.isAncestorOf(dialog.geometry_editor)
+    assert dialog._detector_box.isAncestorOf(dialog._fields['beam_detector'])
+    calibrate = dialog._calibrate_layout
+    assert (calibrate.indexOf(dialog._advanced_card) < calibrate.indexOf(dialog.fit_button)
+            < calibrate.indexOf(dialog._refine_card))
+    assert all(dialog._advanced_card.isAncestorOf(widget)
+               for widget in (dialog.refine_energy, dialog._fields['energy_bound'], dialog.scales))
+    assert dialog._advanced_card.body.isHidden() and not dialog._refine_card.body.isHidden()
+    assert calibrate.indexOf(dialog._xu_ranges) == calibrate.indexOf(dialog.save_button) - 1
+    for key in ('del_domain', 'nu_domain'):
+        assert dialog._xu_ranges.isAncestorOf(dialog._fields[key])
+        assert not dialog._advanced_card.isAncestorOf(dialog._fields[key])
+    # Skip keeps the wavelength: a frame whose scan records no energy is calibrated at it
+    dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
+    assert dialog._row_visible('rough_wavelength') and not dialog._row_visible('beam_pixel')
     from xdart.gui.pages.values import PageCleanup
     assert dialog.shutdown().status is PageCleanup.CLEAN
     dialog.close()
@@ -347,7 +374,7 @@ def test_a_twoc_scan_is_read_and_staged_as_one_2theta_arm(tmp_path):
         # renaming the 2θ motor after staging: the frames read tth, so Fit refuses
         dialog.set_instrument(InstrumentGeometry('twoc', (('tth', 'ttheta'),)))
         dialog._fit()
-        assert ('staged reading tth as a vertical 2θ arm; the Geometry now names ttheta as a vertical 2θ arm'
+        assert ('staged reading tth as a vertical 2θ arm; the Diffractometer now names ttheta as a vertical 2θ arm'
                 in dialog.status.text())
         assert dialog.fit is None
     finally:
@@ -398,7 +425,7 @@ def test_a_horizontal_twoc_scan_is_staged_and_resumed_as_nu(tmp_path, monkeypatc
         assert other.geometry_editor.value() == dialog.geometry_editor.value()
         other.set_instrument(InstrumentGeometry('twoc'))  # the vertical plane again: the staged arm refuses
         other._fit()
-        assert ('staged reading tth as a horizontal 2θ arm; the Geometry now names tth as a vertical 2θ arm'
+        assert ('staged reading tth as a horizontal 2θ arm; the Diffractometer now names tth as a vertical 2θ arm'
                 in other.status.text())
     finally:
         from xdart.gui.pages.values import PageCleanup
@@ -474,8 +501,10 @@ def test_direct_beam_window_handoff_uses_actual_api_and_seed_not_bounds(tmp_path
         dialog._set_field_text(key, str(value))
     # as the window's own job records it: the result and the inputs it was fitted from (Codex F5)
     dialog._distance_result, dialog._distance_key = result, dialog._direct_beam_key()
+    assert dialog._advanced_card.body.isHidden()
     dialog._apply_distance()  # no confirmation: the result applies
     assert float(dialog._text('distance_seed')) == pytest.approx(80., rel=2e-5)
+    assert not dialog._advanced_card.body.isHidden()  # opened where the seed landed
     assert dialog._text('distance_bounds') == ''
     assert dialog._distance_provenance['regression_std_m'] >= 0
     assert 'residuals_px' in dialog._distance_provenance

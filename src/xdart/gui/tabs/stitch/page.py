@@ -826,7 +826,7 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["source_motors"].setToolTip(
             "Which motor each calibration position reads. A position naming a circle (del_angle, "
             "nu_value; in fourc or twoc, del is the 2θ circle) follows that circle's motor under "
-            "Calibrate ▸ 1 · Geometry, and editing it here renames that motor there. Any other "
+            "Calibrate ▸ 1 · Instrument, and editing it here renames that motor there. Any other "
             "position keeps the motor given here. An XU calibration defines its own.")
         frames_card = SubsectionCard("Frames and sample")
         advanced_layout.addWidget(frames_card)
@@ -1625,10 +1625,10 @@ class StitchPage(QtWidgets.QWidget):
             return None  # psic holds no circle: the operation reads the calibration itself
         return (f"This calibration's detector arm cannot be established ({found[1]}), and "
                 f"{geometry.geometry} holds a detector circle at zero. Choose psic under Calibrate ▸ "
-                "1 · Geometry, or calibrate its 2θ arm.")
+                "1 · Instrument, or calibrate its 2θ arm.")
 
     def _instrument(self):
-        """The diffractometer and motor names: Calibrate ▸ 1 · Geometry (saved with the
+        """The diffractometer and motor names: Calibrate ▸ 1 · Instrument (saved with the
         settings); older settings name the del and nu motors, or the Angle mapping does. An older
         window's normal-incidence zero becomes its circle's motor zero (Codex review F1)."""
         from xrd_tools.session.instrument import InstrumentGeometry
