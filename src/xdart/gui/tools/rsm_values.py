@@ -598,12 +598,7 @@ class RSMToolFormV2:
         ):
             raise TypeError("RSM v2 tool form is invalid")
         normalization_keys = {
-            (selector.name, selector.occurrence)
-            for selector in (
-                self.normalization.foil_selector,
-                self.normalization.exposure_selector,
-            )
-            if selector is not None
+            (selector.name, selector.occurrence) for selector in self.normalization.selectors
         }
         for member in self.members:
             motor_keys = {
@@ -1107,12 +1102,12 @@ class RSMToolPreflightSummary:
                 for item in self.absorption_lengths
             )
             or (
-                self.normalization_mode is RSMNormalizationMode.IDENTITY
+                self.normalization_mode in {RSMNormalizationMode.IDENTITY, RSMNormalizationMode.MONITOR}
                 and self.absorption_lengths != (0.0, 0.0, 0.0, 0.0)
             )
             or (
-                self.normalization_mode
-                is RSMNormalizationMode.FOIL_TRANSMISSION_EXPOSURE
+                self.normalization_mode in {RSMNormalizationMode.FOIL_TRANSMISSION_EXPOSURE,
+                                            RSMNormalizationMode.MONITOR_FOIL_TRANSMISSION}
                 and not any(item > 0 for item in self.absorption_lengths)
             )
             or type(self.overwrite) is not AnalysisArtifactOverwrite
@@ -1859,7 +1854,8 @@ def prepare_rsm_tool_v2(
                     )
                 # the normalization's columns too (a whole table, not a SPEC projection that refuses them)
                 for name, selector in (("foil", form.normalization.foil_selector),
-                                       ("exposure", form.normalization.exposure_selector)):
+                                       ("exposure", form.normalization.exposure_selector),
+                                       ("monitor", form.normalization.monitor_selector)):
                     if selector is not None and _missing_role_in_table(table, ((name, selector),)) is not None:
                         raise RSMToolPreflightRefused(
                             "RSM_NORMALIZATION_COLUMN_MISSING",

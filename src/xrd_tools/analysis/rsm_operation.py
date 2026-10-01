@@ -146,8 +146,15 @@ _RSM_V2_HOLDS = (
 
 
 class RSMNormalizationMode(str, Enum):
+    """Decision 4 (the maintainer, 2026-10-01: "There are monitors both before and after the foil. So add the
+    4th choice"): a monitor after the foils already counts their attenuation (``MONITOR``); one before them does
+    not, so its counts are multiplied by the foils' transmission (``MONITOR_FOIL_TRANSMISSION``). An exposure is
+    never combined with a monitor, which already counts over it."""
+
     IDENTITY = "identity"
     FOIL_TRANSMISSION_EXPOSURE = "foil-transmission-exposure"
+    MONITOR = "monitor"
+    MONITOR_FOIL_TRANSMISSION = "monitor-foil-transmission"
 
 
 def _rsm_coordinate_matrix(
@@ -269,12 +276,15 @@ def _canonical_roi(
 
 @dataclass(frozen=True, slots=True)
 class RSMNormalizationPolicy:
-    """Mandatory per-frame numerator normalization for one RSM plan."""
+    """Mandatory per-frame numerator normalization for one RSM plan: the shared beam divisor
+    (``corrections.normalization.frame_divisors``) of the mode's columns. ``monitor_selector`` is set only for
+    the two monitor modes, so the two original modes keep their canonical value and every fingerprint over it."""
 
     mode: RSMNormalizationMode
     foil_selector: MetadataColumnSelector | None
     exposure_selector: MetadataColumnSelector | None
     absorption_lengths: tuple[float, float, float, float]
+    monitor_selector: MetadataColumnSelector | None = None
 
     def __post_init__(self) -> None:
         if type(self.mode) is not RSMNormalizationMode:
@@ -290,28 +300,31 @@ class RSMNormalizationPolicy:
         )
         if any(value < 0 for value in lengths):
             raise ValueError("RSM absorption lengths must be non-negative")
-        if self.mode is RSMNormalizationMode.IDENTITY:
-            if (
-                self.foil_selector is not None
-                or self.exposure_selector is not None
-                or lengths != (0.0, 0.0, 0.0, 0.0)
-            ):
-                raise ValueError(
-                    "identity RSM normalization requires no selectors and zero lengths"
-                )
-        else:
-            if (
-                type(self.foil_selector) is not MetadataColumnSelector
-                or type(self.exposure_selector) is not MetadataColumnSelector
-            ):
-                raise TypeError(
-                    "foil/exposure RSM normalization requires exact selectors"
-                )
-            if self.foil_selector == self.exposure_selector:
-                raise ValueError("foil and exposure selectors must be distinct")
-            if not any(value > 0 for value in lengths):
-                raise ValueError("foil absorption lengths cannot all be zero")
+        mode = self.mode
+        foil = mode in {RSMNormalizationMode.FOIL_TRANSMISSION_EXPOSURE,
+                        RSMNormalizationMode.MONITOR_FOIL_TRANSMISSION}
+        exposure = mode is RSMNormalizationMode.FOIL_TRANSMISSION_EXPOSURE
+        monitor = mode in {RSMNormalizationMode.MONITOR, RSMNormalizationMode.MONITOR_FOIL_TRANSMISSION}
+        for name, value, wanted in (("foil", self.foil_selector, foil),
+                                    ("exposure", self.exposure_selector, exposure),
+                                    ("monitor", self.monitor_selector, monitor)):
+            if wanted and type(value) is not MetadataColumnSelector:
+                raise TypeError(f"{mode.value} RSM normalization requires an exact {name} selector")
+            if not wanted and value is not None:
+                raise ValueError(f"{mode.value} RSM normalization takes no {name} selector")
+        if foil and not any(value > 0 for value in lengths):
+            raise ValueError("foil absorption lengths cannot all be zero")
+        if not foil and lengths != (0.0, 0.0, 0.0, 0.0):
+            raise ValueError(f"{mode.value} RSM normalization requires zero absorption lengths")
+        if len(set(self.selectors)) != len(self.selectors):
+            raise ValueError("RSM normalization selectors must be distinct")
         object.__setattr__(self, "absorption_lengths", lengths)
+
+    @property
+    def selectors(self) -> tuple[MetadataColumnSelector, ...]:
+        """The metadata columns this normalization reads: foil, exposure, monitor (those set)."""
+        return tuple(selector for selector in (self.foil_selector, self.exposure_selector, self.monitor_selector)
+                     if selector is not None)
 
     @classmethod
     def identity(cls) -> "RSMNormalizationPolicy":
@@ -323,12 +336,13 @@ class RSMNormalizationPolicy:
         )
 
     def _canonical_value(self) -> tuple[object, ...]:
-        return (
+        value = (
             self.mode,
             _selector_value(self.foil_selector),
             _selector_value(self.exposure_selector),
             self.absorption_lengths,
         )
+        return value if self.monitor_selector is None else value + (_selector_value(self.monitor_selector),)
 
 
 @dataclass(frozen=True, slots=True)
@@ -762,10 +776,7 @@ def required_rsm_selectors(
     if type(plan) is not RSMOperationPlan:
         raise TypeError("RSM selector projection requires exact plan")
     requested = [selector for _role, selector in plan.geometry.motor_selectors]
-    if plan.normalization.foil_selector is not None:
-        requested.append(plan.normalization.foil_selector)
-    if plan.normalization.exposure_selector is not None:
-        requested.append(plan.normalization.exposure_selector)
+    requested.extend(plan.normalization.selectors)
     unique = {
         (selector.name, selector.occurrence): selector for selector in requested
     }
@@ -1821,18 +1832,16 @@ def _capture_preflight_facts(
             "SOURCE_IDENTITY_MISMATCH",
             "selected RSM label is outside the exact metadata table",
         ) from error
-    foil = exposure = None
-    if normalization.foil_selector is not None:
-        selector = normalization.foil_selector
-        foil = selected_by_key[(selector.name, selector.occurrence)][rows]
-    if normalization.exposure_selector is not None:
-        selector = normalization.exposure_selector
-        exposure = selected_by_key[(selector.name, selector.occurrence)][rows]
+    foil, exposure, monitor = (
+        None if selector is None else selected_by_key[(selector.name, selector.occurrence)][rows]
+        for selector in (normalization.foil_selector, normalization.exposure_selector,
+                         normalization.monitor_selector))
     divisors = rsm_normalization_divisors(
         normalization,
         len(source.selected_labels),
         foil_status=foil,
         exposure_seconds=exposure,
+        monitor_counts=monitor,
     )
     angles = tuple(
         np.asarray(
@@ -2169,6 +2178,9 @@ def _normalization_provenance(
         ),
         "absorption_lengths": list(normalization.absorption_lengths),
         "placement": "conditioned-numerator-before-grid",
+        **({} if normalization.monitor_selector is None else {"monitor_selector": {
+            "name": normalization.monitor_selector.name,
+            "occurrence": normalization.monitor_selector.occurrence}}),
     }
 
 
@@ -4305,10 +4317,7 @@ def required_rsm_selectors_v2(
     if type(motor_selectors) is not tuple or type(normalization) is not RSMNormalizationPolicy:
         raise TypeError("RSM v2 selector projection requires exact values")
     requested = [selector for _role, selector in motor_selectors]
-    if normalization.foil_selector is not None:
-        requested.append(normalization.foil_selector)
-    if normalization.exposure_selector is not None:
-        requested.append(normalization.exposure_selector)
+    requested.extend(normalization.selectors)
     unique = {
         (selector.name, selector.occurrence): selector for selector in requested
     }
@@ -4835,6 +4844,9 @@ def _provenance(
             ),
             "absorption_lengths": list(normalization.absorption_lengths),
             "placement": "conditioned-numerator-before-grid",
+            **({} if normalization.monitor_selector is None else {"monitor_selector": {
+                "name": normalization.monitor_selector.name,
+                "occurrence": normalization.monitor_selector.occurrence}}),
         },
         "plan": {
             "bins": list(plan.bins),
@@ -5039,31 +5051,39 @@ def rsm_normalization_divisors(
     *,
     foil_status: np.ndarray | None = None,
     exposure_seconds: np.ndarray | None = None,
+    monitor_counts: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Compute finite positive per-frame divisors for numerator normalization."""
+    """Compute finite positive per-frame divisors for numerator normalization: the shared beam divisor
+    (Stitch's too) of the mode's columns, byte for byte as before for foil transmission × exposure."""
 
     if type(policy) is not RSMNormalizationPolicy:
         raise TypeError("RSM normalization policy must be exact")
     if type(frame_count) is not int or frame_count < 1:
         raise ValueError("RSM normalization frame count must be positive")
+    given = {"foil": foil_status, "exposure": exposure_seconds, "monitor": monitor_counts}
+    wanted = {name for name, selector in (("foil", policy.foil_selector), ("exposure", policy.exposure_selector),
+                                          ("monitor", policy.monitor_selector)) if selector is not None}
     if policy.mode is RSMNormalizationMode.IDENTITY:
-        if foil_status is not None or exposure_seconds is not None:
+        if any(value is not None for value in given.values()):
             raise ValueError("identity normalization does not accept metadata arrays")
         result = np.ones(frame_count, dtype=np.float64)
         result.setflags(write=False)
         return result
-    if foil_status is None or exposure_seconds is None:
+    if any(given[name] is None for name in wanted):
         raise RSMOperationRefused(
             "NORMALIZATION_METADATA_MISSING",
-            "foil and exposure metadata are required",
+            f"{policy.mode.value} normalization requires its "
+            + " and ".join(sorted(wanted)) + " metadata",
         )
-    # the shared beam divisor (Stitch's too): foil transmission × exposure, byte for byte as before
+    if any(value is not None for name, value in given.items() if name not in wanted):
+        raise ValueError(f"{policy.mode.value} normalization takes only its own metadata arrays")
     try:
         return frame_divisors(
             frame_count,
+            monitor=monitor_counts,
             foil=foil_status,
             exposure=exposure_seconds,
-            absorption_lengths=policy.absorption_lengths,
+            absorption_lengths=None if foil_status is None else policy.absorption_lengths,
         )
     except BeamNormalizationRefused as error:
         raise RSMOperationRefused(error.code, str(error)) from None
