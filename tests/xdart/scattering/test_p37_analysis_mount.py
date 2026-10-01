@@ -2679,3 +2679,29 @@ def test_p37b_legacy_dialog_defaults_remain_reachable_only_for_canonical_callers
     finally:
         for dialog in dialogs: dialog.close()
         qapp.processEvents()
+
+
+def test_metadata_dialog_selects_among_a_results_sources(qapp):
+    """Codex's Stitch/Int reuse audit R3: a result read from several sources (a grouped Stitch result's member
+    scans) gets the shared dialog's own source selector, not a page-built one. The first source shows at once
+    with its note; another replaces it; a source whose table is not complete shows its code."""
+    from dataclasses import replace
+    from xdart.gui.tabs.scattering.analysis_mount import MetadataResultDialog, MetadataSource
+    first, second = _table(), _table(fingerprint="other")
+    missing = replace(_table(), disposition=AnalysisDisposition.REFUSED, code="SOURCE_CHANGED")
+    dialog = MetadataResultDialog()
+    try:
+        assert dialog.source_selector is None  # a one-table result has none
+        dialog.adopt_sources((MetadataSource("scan 1", first, (1, 2), ("1-0", "1-1"), "2 contributing frames"),
+                              MetadataSource("scan 2", second, (3,), ("2-0",)),
+                              MetadataSource("scan 3", missing)))
+        assert dialog.source_selector.count() == 3 and dialog.layout().indexOf(dialog.source_selector) == 0
+        assert dialog.table.rowCount() == 2 and dialog.table.verticalHeaderItem(0).text() == "1-0"
+        assert dialog.status.text() == "2 contributing frames"
+        dialog.source_selector.setCurrentIndex(1)
+        assert dialog.table.rowCount() == 1 and dialog.table.verticalHeaderItem(0).text() == "2-0"
+        assert dialog.status.text() == "OK"
+        dialog.source_selector.setCurrentIndex(2)
+        assert dialog.table.rowCount() == 0 and dialog.status.text() == "SOURCE_CHANGED"
+    finally:
+        dialog.close()

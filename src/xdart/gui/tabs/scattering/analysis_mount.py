@@ -264,6 +264,19 @@ def render_table_rows(table, headers, rows):
     for row, values in enumerate(rows):
         for column, value in enumerate(values):
             table.setItem(row, column, QtWidgets.QTableWidgetItem(str(value)))
+@dataclass(frozen=True, slots=True)
+class MetadataSource:
+    """One source of a result's metadata table, for ``MetadataResultDialog.adopt_sources`` (a grouped
+    Stitch result's member scans): its label, its table (a ``MetadataTableResult``), the rows it shows and
+    their labels, and the status shown when its table is complete."""
+
+    label: str
+    table: object
+    selected_labels: tuple | None = None
+    row_labels: tuple | None = None
+    note: str = ""
+
+
 class MetadataResultDialog(QtWidgets.QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -271,6 +284,34 @@ class MetadataResultDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         self.table = QtWidgets.QTableWidget(0, 0, self); self.status = QtWidgets.QLabel("")
         layout.addWidget(self.table); layout.addWidget(self.status)
+        #: Built by ``adopt_sources`` only, for a result read from several sources.
+        self.source_selector = None
+        self._sources: tuple[MetadataSource, ...] = ()
+    def adopt_sources(self, sources) -> None:
+        """Several sources of one result (Codex's Stitch/Int reuse audit R3): a selector above the table
+        shows one source's table at a time, the first at once; a source whose table is not complete shows
+        its code."""
+        if self.source_selector is None:
+            self.source_selector = QtWidgets.QComboBox(self)
+            self.source_selector.setObjectName("p37MetadataSourceSelector")
+            self.source_selector.currentIndexChanged.connect(self._select_source)
+            self.layout().insertWidget(0, self.source_selector)
+        self._sources = tuple(sources)
+        self.source_selector.clear()
+        self.source_selector.addItems([source.label for source in self._sources])
+    def _select_source(self, index: int) -> None:
+        from xrd_tools.analysis.scan_operations import AnalysisDisposition
+        self.clear_result()
+        if not 0 <= index < len(self._sources):
+            return
+        source = self._sources[index]
+        if source.table.disposition is AnalysisDisposition.COMPLETED:
+            self.adopt_result(source.table, selected_labels=source.selected_labels,
+                              row_labels=source.row_labels)
+            if source.note:
+                self.status.setText(source.note)
+        else:
+            self.status.setText(source.table.code)
     def clear_result(self) -> None:
         self.table.clear()
         self.table.setRowCount(0)
