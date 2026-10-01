@@ -1,5 +1,7 @@
 """Bounded, Qt-free display-background aggregation."""
 from __future__ import annotations
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -386,6 +388,121 @@ class _PreparedSingleFrameBackground:
     source_receipt: bytes
     metadata_items_receipt: bytes
     metadata_source_receipt: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSeriesFrameBackground:
+    """A Series Average resolved once a run (BG-SERIES-REREAD; maintainer, 2026-09-30, on the per-frame proof:
+    "Stat check ... yes"): its members' mean before any scale (read-only, NaN where none covers), their counts
+    where uneven (read-only, else None: one count everywhere covered), the manifest and normalization
+    denominator, and the state of every member and metadata file read. A later frame rebinds it after a stat
+    proof (the member set listed again, each file's ``_source_state`` unchanged) instead of reading, decoding
+    and hashing every member again; its own normalization scales the mean as the full resolution does
+    (``_series_result``), and the same normalization as the last frame's reuses that result."""
+
+    plan: FrameBackgroundPlan
+    frame_shape: tuple[int, int]
+    members: tuple[str, ...]
+    states: tuple[tuple[str, tuple[int, ...]], ...]
+    mean: np.ndarray
+    counts: np.ndarray | None
+    most: int
+    denominator: float
+    manifest: tuple[int, int, str]
+    selected: str
+    #: [(the last frame's normalization tag, its result)]: one slot, used on the run's one resolving thread.
+    last: list
+
+
+#: Set by the run executor around a resolution (``series_capsule_requested``): a resolved Series Average then
+#: also leaves its capsule in the holder. Any other caller resolves as before.
+_SERIES_CAPSULE: ContextVar[dict | None] = ContextVar("xdart_series_capsule", default=None)
+
+
+@contextmanager
+def series_capsule_requested(holder: dict):
+    """Within it, a resolved Series Average also leaves its ``_PreparedSeriesFrameBackground`` in
+    ``holder["series"]`` for later frames (``_rebind_series_frame_background``)."""
+    token = _SERIES_CAPSULE.set(holder)
+    try:
+        yield holder
+    finally:
+        _SERIES_CAPSULE.reset(token)
+
+
+def _series_result(series: _PreparedSeriesFrameBackground, frame_fact, target_norm: float, cancelled, *,
+                   in_place: bool = False) -> FrameBackgroundResult:
+    """One frame's Series Average from its unscaled mean: the full resolution's and a rebind's one
+    computation, so their background, variance factor and descriptor agree byte for byte. ``in_place``
+    scales the mean itself (a resolution that keeps no capsule)."""
+    plan = series.plan
+    factor = float(plan.scale * target_norm / series.denominator)
+    if in_place:
+        background = series.mean
+        background *= factor
+    else:
+        background = series.mean * factor
+    # var(f · mean of n counts) = f · (f · mean) / n: one scalar when every covered pixel has all
+    # members, else per pixel (AUD-7: checked once, without a compacted copy of the covered counts).
+    variance_factor = (factor / float(series.most) if series.counts is None
+                       else np.divide(factor, series.counts, out=np.zeros(series.frame_shape),
+                                      where=series.counts > 0))
+    count, receipt_bytes, manifest = series.manifest
+    return _result(plan, frame_fact, background, {"version": 1, "mode": plan.mode,
+        "policy": plan.to_mapping(), "frame_fact": frame_fact, "manifest": {
+            "version": 1, "count": count, "receipt_bytes": receipt_bytes, "sha256": manifest},
+        "selected": series.selected,
+        "normalization": {"target": _tag(target_norm), "denominator": _tag(series.denominator)}},
+        cancelled, variance_factor, factor)
+
+
+def _rebind_series_frame_background(
+    prepared: _PreparedSeriesFrameBackground,
+    plan: FrameBackgroundPlan,
+    frame_fact: tuple[object, ...],
+    *,
+    cancelled: Event | Callable[[], bool] | None = None,
+) -> FrameBackgroundResult | None:
+    """Reuse one Series Average for another frame after a stat proof: the same members (listed again: a
+    member added or removed resolves in full) and every member and metadata file's state unchanged. None:
+    resolve in full."""
+    if type(prepared) is not _PreparedSeriesFrameBackground:
+        raise TypeError("prepared Series capsule must be exact")
+    if type(plan) is not FrameBackgroundPlan:
+        raise TypeError("frame-background plan must be exact")
+    if plan != prepared.plan or plan.mode != "Series Average":
+        return None
+    try:
+        _poll(cancelled)
+        _label, _target, _selector, _index, shape, target_items = _frame(frame_fact)
+        active_keys = tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key)))
+        if shape != prepared.frame_shape or tuple(name for name, _tagged in target_items) != active_keys:
+            return None
+        if tuple(str(member) for member in _series_paths(plan.locator or "", cancelled)) != prepared.members:
+            return None
+        for path, state in prepared.states:
+            if _source_state(Path(path), cancelled) != state:
+                return None
+        target_norm = _target_metadata(target_items, plan.normalization_key)
+        tag = _tag(target_norm)
+        if prepared.last and prepared.last[0][0] == tag:  # the last frame's normalization: its result
+            previous = prepared.last[0][1]
+            body = json.loads(previous.descriptor_bytes.decode("utf-8", "strict"))
+            body["frame_fact"] = frame_fact
+            raw = _json(body)
+            if len(raw) > _MAX_RECEIPT:
+                return None
+            return FrameBackgroundResult("RESOLVED", previous.background, raw, hashlib.sha256(raw).hexdigest(),
+                                         previous.diagnostics, previous.variance_factor, previous.scale)
+        result = _series_result(prepared, frame_fact, target_norm, cancelled)
+        prepared.last[:] = [(tag, result)]
+        return result
+    except InterruptedError:
+        return FrameBackgroundResult("CANCELLED", None, None, None, ("cancelled",))
+    except (FileNotFoundError, PermissionError, OSError, RuntimeError, TypeError, ValueError, KeyError,
+            IndexError, AttributeError, json.JSONDecodeError):
+        return None
+
 
 def _cancelled(value: Event | Callable[[], bool] | None) -> bool:
     if value is None: return False
@@ -872,6 +989,7 @@ def resolve_frame_background(
             sums = np.zeros(shape, np.float64); counts = np.zeros(shape, np.uint64)
             manifest = hashlib.sha256(b"XDART-FRAME-BG-SERIES-MANIFEST-V1\0")
             receipt_bytes = 0; norm_sum = 0.0; itemsize = None
+            states = {}  # every file read and its state: a later frame's stat proof (BG-SERIES-REREAD)
             for ordinal, member in enumerate(members):
                 if _cancelled(cancelled): raise InterruptedError
                 member = member.resolve(strict=True)
@@ -881,6 +999,9 @@ def resolve_frame_background(
                 itemsize = observed_itemsize
                 metadata, metadata_source = _metadata(member, plan,
                     tuple(key for key in (plan.normalization_key,) if key), cancelled)
+                states[source["locator"]] = tuple(source["state"])
+                if metadata_source is not None:
+                    states[metadata_source["locator"]] = tuple(metadata_source["state"])
                 norm_sum += _target_metadata(metadata, plan.normalization_key)
                 finite = np.isfinite(image); np.add(sums, image, out=sums, where=finite); np.add(counts, finite, out=counts)
                 raw = _json({"ordinal": ordinal, "source": source,
@@ -889,23 +1010,25 @@ def resolve_frame_background(
                     raise ValueError("Background Series receipt stream exceeds cap")
                 manifest.update(struct.pack(">Q", len(raw))); manifest.update(raw); receipt_bytes += len(raw)
                 del image, finite, source, metadata, metadata_source, raw
-            covered = counts > 0  # one mask for the mean, the empty pixels and the variance factor
+            covered = counts > 0  # one mask for the mean, the empty pixels and the uniform check
             np.divide(sums, counts, out=sums, where=covered); sums[~covered] = np.nan
-            denominator = norm_sum / len(members); factor = float(plan.scale * target_norm / denominator)
-            sums *= factor
-            # var(f · mean of n counts) = f · (f · mean) / n: one scalar when every
-            # covered pixel has all members, else per pixel. Uniform: every covered pixel's count
-            # is the largest, checked without a compacted copy of the covered counts (AUD-7).
+            # uniform: every covered pixel's count is the largest (AUD-7: no compacted copy)
             most = int(counts.max())
-            variance_factor = (factor / float(most)
-                               if most and np.count_nonzero(counts == most) == np.count_nonzero(covered)
-                               else np.divide(factor, counts, out=np.zeros(shape), where=covered))
-            return _result(plan, frame_fact, sums, {"version": 1, "mode": plan.mode,
-                "policy": policy, "frame_fact": frame_fact, "manifest": {
-                    "version": 1, "count": len(members), "receipt_bytes": receipt_bytes,
-                    "sha256": manifest.hexdigest()}, "selected": str(Path(plan.locator or "").resolve()),
-                "normalization": {"target": _tag(target_norm), "denominator": _tag(denominator)}},
-                cancelled, variance_factor, factor)
+            uniform = most and np.count_nonzero(counts == most) == np.count_nonzero(covered)
+            requested = _SERIES_CAPSULE.get()
+            series = _PreparedSeriesFrameBackground(
+                plan, shape, tuple(str(member) for member in members), tuple(states.items()), sums,
+                None if uniform else counts.astype(np.uint16), most, norm_sum / len(members),
+                (len(members), receipt_bytes, manifest.hexdigest()), str(Path(plan.locator or "").resolve()), [])
+            if requested is None:  # no capsule kept: the mean is scaled in place, as before
+                return _series_result(series, frame_fact, target_norm, cancelled, in_place=True)
+            sums.setflags(write=False)
+            if series.counts is not None:
+                series.counts.setflags(write=False)
+            result = _series_result(series, frame_fact, target_norm, cancelled)
+            series.last[:] = [(_tag(target_norm), result)]
+            requested["series"] = series
+            return result
         root = Path(plan.locator or "").resolve(strict=True)
         if not root.is_dir(): raise ValueError("Background Directory is not a directory")
         predicate = compile_filter(plan.filename_filter)

@@ -18,9 +18,12 @@ from xrd_tools.core.scan import SourceKind
 from xrd_tools.io.append import AppendRefused
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.reduction.background import (
+    _PreparedSeriesFrameBackground,
     _PreparedSingleFrameBackground,
     _prepare_single_frame_background,
+    _rebind_series_frame_background,
     _rebind_single_frame_background,
+    series_capsule_requested,
 )
 from xrd_tools.integrate.calibration import (
     apply_sensor_parallax,
@@ -116,14 +119,24 @@ def _resolve_background_before_submit(frame, plan: FrameBackgroundPlan, binding,
             prepared, plan, fact, cancelled=cancelled,
         )
         if type(prepared) is _PreparedSingleFrameBackground
+        else _rebind_series_frame_background(
+            prepared, plan, fact, cancelled=cancelled,
+        )
+        if type(prepared) is _PreparedSeriesFrameBackground
         else None
     )
     candidate = None
     if result is None:
         if capsule_owner is not None:
             capsule_owner.background_capsule = None
-        result = resolve_frame_background(plan, fact, cancelled=cancelled)
-        candidate = _prepare_single_frame_background(plan, fact, result)
+        if capsule_owner is not None and plan.mode == "Series Average":
+            # resolved once a run: later frames rebind it after a stat proof (BG-SERIES-REREAD)
+            with series_capsule_requested({}) as requested:
+                result = resolve_frame_background(plan, fact, cancelled=cancelled)
+            candidate = requested.get("series")
+        else:
+            result = resolve_frame_background(plan, fact, cancelled=cancelled)
+            candidate = _prepare_single_frame_background(plan, fact, result)
     if result.disposition == "RETRYABLE" and retryable: return False
     if result.disposition == "CANCELLED": raise RuntimeError("admission cancelled")
     if result.disposition != "RESOLVED" or result.background is None:
@@ -493,7 +506,7 @@ class _StandardRun:
     resource_facts: list[Any] = field(default_factory=list)
     pending_partition_count: int = 1
     terminal_commit_identity: StreamTerminal | None = None
-    background_capsule: _PreparedSingleFrameBackground | None = None
+    background_capsule: _PreparedSingleFrameBackground | _PreparedSeriesFrameBackground | None = None
 
     def __post_init__(self) -> None:
         self.perf_quartiles_enabled = (

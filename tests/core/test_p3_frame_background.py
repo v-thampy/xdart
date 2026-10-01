@@ -813,3 +813,61 @@ def test_the_dark_comes_off_the_background_before_scale_and_normalization(
                   background_scale=result.scale)
     corrected = _dark_corrected_background(frame, ReductionPlan(dark=np.full((2, 2), 10.0)))
     np.testing.assert_array_equal(corrected, np.full((2, 2), 60.0))  # 3 × (30 − 10)
+
+
+def test_a_series_capsule_rebinds_by_stat_byte_for_byte_and_resolves_again_on_any_change(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """BG-SERIES-REREAD (maintainer, 2026-09-30, on the per-frame proof: "Stat check (my recommendation): yes"):
+    a run resolves its Series Average once; a later frame rebinds it after a stat proof (the member set listed
+    again; every member's and metadata file's state) and scales the mean by its own normalization. Byte for
+    byte the full resolution's result, for the same and for other normalizations; any member or metadata
+    change, or a member added, resolves in full."""
+    from xrd_tools.reduction import background as module
+    one, two, three, target = _files(tmp_path, ("bg_1.tif", "bg_2.tif", "bg_3.tif", "target_1.tif"))
+    calls = _decoder(monkeypatch, {one.name: np.array([[1., np.nan], [3., 5.]]),  # uneven counts
+                                   two.name: np.array([[3., 7.], [np.nan, 7.]]),
+                                   three.name: np.array([[5., 9.], [9., np.nan]])})
+    sidecars = {path.resolve(): path.with_suffix(".txt") for path in (one, two, three)}
+    for value in sidecars.values():
+        value.write_text("stable")
+    monitors = {one.resolve(): 2.0, two.resolve(): 4.0, three.resolve(): 6.0}
+    monkeypatch.setattr(module, "read_image_metadata_observed", lambda path, **kwargs: ImageMetadataRead(
+        {"monitor": monitors[Path(path).resolve()]}, sidecars[Path(path).resolve()]))
+    plan = FrameBackgroundPlan(mode="Series Average", locator=str(two), normalization_key="monitor",
+                               metadata_format="txt")
+
+    def fact(label, monitor):
+        return _fact(target, label=label, metadata=(("monitor", ("number", float(monitor).hex())),))
+    with module.series_capsule_requested({}) as held:
+        first = resolve_frame_background(plan, fact(0, 6.0))
+    capsule = held["series"]
+    assert first.disposition == "RESOLVED" and len(calls) == 3  # each member read once
+    previous = None
+    for label, monitor in ((1, 6.0), (2, 3.0), (3, 3.0), (4, 6.0)):
+        rebound = module._rebind_series_frame_background(capsule, plan, fact(label, monitor))
+        reads = len(calls)
+        full = resolve_frame_background(plan, fact(label, monitor))
+        assert len(calls) == reads + 3 and rebound.disposition == "RESOLVED"
+        assert (rebound.descriptor_bytes, rebound.fingerprint) == (full.descriptor_bytes, full.fingerprint)
+        np.testing.assert_array_equal(rebound.background, full.background)
+        np.testing.assert_array_equal(np.asarray(rebound.variance_factor), np.asarray(full.variance_factor))
+        assert rebound.scale == full.scale
+        if label == 3:  # the last frame's normalization: its result again
+            assert rebound.background is previous.background
+        previous = rebound
+    assert len(calls) == 3 + 3 * 4  # the rebinds read nothing; each full resolution reads every member
+    assert module._rebind_series_frame_background(capsule, plan, fact(5, 6.0)).disposition == "RESOLVED"
+    os.utime(sidecars[three.resolve()], ns=(1, 1))  # a metadata file touched
+    assert module._rebind_series_frame_background(capsule, plan, fact(6, 6.0)) is None
+    with module.series_capsule_requested({}) as held:
+        resolve_frame_background(plan, fact(7, 6.0))
+    capsule = held["series"]
+    three.write_bytes(b"source-changed")  # a member rewritten
+    assert module._rebind_series_frame_background(capsule, plan, fact(8, 6.0)) is None
+    with module.series_capsule_requested({}) as held:
+        resolve_frame_background(plan, fact(9, 6.0))
+    capsule = held["series"]
+    (tmp_path / "bg_4.tif").write_bytes(b"source-new")  # a member added
+    assert module._rebind_series_frame_background(capsule, plan, fact(10, 6.0)) is None
+    assert resolve_frame_background(plan, fact(11, 6.0)).disposition != "RESOLVED"  # bg_4 has no decoder value
