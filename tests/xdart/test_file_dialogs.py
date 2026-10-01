@@ -168,3 +168,73 @@ def test_every_stitch_and_rsm_chooser_goes_through_the_shared_rule(qapp, tmp_pat
         page.shutdown()
         rsm.close_page()
         rsm.deleteLater()
+
+
+def test_ask_opens_the_dialog_as_given_and_remembers_nothing(qapp, tmp_path, monkeypatch):
+    """`file_dialogs.ask` is the one place a dialog opens (Codex's Stitch/Int reuse audit R5): the start folder
+    and filter exactly as given, [] when cancelled, and no last folder remembered. `browse` keeps the shared
+    rule around it."""
+    from xdart.utils.browse import last_browse_dir, remember_browse_path
+    monkeypatch.setenv("XDART_SESSION_FILE", str(tmp_path / "session.json"))
+    last = tmp_path / "last"
+    last.mkdir()
+    remember_browse_path(last)
+    asked, answer = [], [str(tmp_path / "picked.tif")]
+
+    def open_file(parent, title, start, file_filter):
+        asked.append(("open", title, start, file_filter))
+        return answer[0], file_filter
+
+    def folder(parent, title, start):
+        asked.append(("folder", title, start))
+        return answer[0]
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", staticmethod(open_file))
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getExistingDirectory", staticmethod(folder))
+    assert file_dialogs.ask(None, "Pick", start="/given", file_filter=NEXUS_FILTER) == answer
+    assert asked[-1] == ("open", "Pick", "/given", NEXUS_FILTER) and last_browse_dir() == str(last)
+    assert file_dialogs.ask(None, "Folder", start="/given", folder=True) == answer
+    assert asked[-1] == ("folder", "Folder", "/given")
+    answer[0] = ""
+    assert file_dialogs.ask(None, "Pick", start="/given") == [] and last_browse_dir() == str(last)
+
+
+def test_ints_own_choosers_open_through_the_shared_dialog_owner(qapp, monkeypatch):
+    """Int's workspace choosers (Controls paths, standalone Calibrate / Make Mask sources, the Live source) open
+    their dialogs through `file_dialogs.ask`, with their own titles, the page's start folder and their own
+    filters as before. The page keeps the Browse rule itself, so they remember nothing."""
+    from xdart.gui.pages import scattering_workspace as workspace
+    from xdart.gui.tabs.scattering.controls_projection import (
+        BACKGROUND_DIRECTORY, BACKGROUND_FILE, MASK_FILE, PONI_FILE, PROJECT_ROOT, SAVE_PATH, SOURCE_DIRECTORY,
+    )
+    from xrd_tools.sources.selection import DirectorySourceSpec
+    asked = []
+
+    def ask(parent, title, **options):
+        asked.append((title, options))
+        return ["/picked/frame.tif"]
+    monkeypatch.setattr(file_dialogs, "ask", ask)
+    paths = workspace._control_path_chooser(None)
+    for path in (PROJECT_ROOT, SOURCE_DIRECTORY, BACKGROUND_DIRECTORY):
+        assert paths(path, "", "/start") == "/picked/frame.tif"
+        assert asked[-1] == ("Choose folder", {"start": "/start", "folder": True})
+    assert paths(SAVE_PATH, "", "/start") == "/picked/frame.tif"
+    assert asked[-1] == ("Choose processed-data folder", {"start": "/start", "folder": True})
+    for path, title, file_filter in ((BACKGROUND_FILE, "Choose Background detector image",
+                                      file_dialogs.BACKGROUND_IMAGE_FILTER),
+                                     (PONI_FILE, "Choose PONI calibration", file_dialogs.PONI_FILTER),
+                                     (MASK_FILE, "Choose detector mask", file_dialogs.MASK_FILTER)):
+        assert paths(path, "", "/start") == "/picked/frame.tif"
+        assert asked[-1] == (title, {"start": "/start", "file_filter": file_filter})
+    sources = workspace._authoring_source_chooser(None)
+    assert sources("poni", "/start") == "/picked/frame.tif"
+    assert asked[-1][0] == "Choose calibration source image" and asked[-1][1]["start"] == "/start"
+    assert sources("mask", "/start") == "/picked/frame.tif"  # a TIFF: no HDF frame dialog
+    assert asked[-1] == ("Choose TIFF or HDF5/NeXus source for mask", {
+        "start": "/start", "file_filter": "Mask sources (*.tif *.tiff *.h5 *.hdf5 *.nxs *.nexus)"})
+    live = workspace._source_selection_chooser(None)
+    chosen = live(None, "Image Directory", "/start")
+    assert type(chosen) is DirectorySourceSpec and str(chosen.root) == "/picked/frame.tif"
+    assert asked[-1] == ("Choose image directory", {"start": "/start", "folder": True})
+    live(None, "Single Image", "/start")
+    assert asked[-1][0] == "Choose one detector image" and asked[-1][1]["start"] == "/start"
+    assert len(asked) == 11  # all seven of the module's dialog call sites, each through the owner

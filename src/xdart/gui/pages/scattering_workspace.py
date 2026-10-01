@@ -217,8 +217,7 @@ class _WorkspaceSlicePin:
 
 def _control_path_chooser(widget):
     """File-dialog chooser for Controls path fields (from the live launcher)."""
-    from pyqtgraph.Qt import QtWidgets
-
+    from xdart.gui.widgets import file_dialogs as dialogs
     from xdart.gui.widgets.file_dialogs import (
         BACKGROUND_IMAGE_FILTER, MASK_FILTER, PONI_FILTER,
     )
@@ -232,14 +231,13 @@ def _control_path_chooser(widget):
     )
 
     def choose(path, current, start_directory):
+        # the shared dialog owner, with the page's own start (the page keeps the Browse rule itself)
         if path in {PROJECT_ROOT, SOURCE_DIRECTORY, BACKGROUND_DIRECTORY}:
-            selected = QtWidgets.QFileDialog.getExistingDirectory(
-                widget, "Choose folder", start_directory)
-            return selected or None
+            return (dialogs.ask(widget, "Choose folder", start=start_directory, folder=True)
+                    or [None])[0]
         if path == SAVE_PATH:
-            selected = QtWidgets.QFileDialog.getExistingDirectory(
-                widget, "Choose processed-data folder", start_directory)
-            return selected or None
+            return (dialogs.ask(widget, "Choose processed-data folder", start=start_directory,
+                                folder=True) or [None])[0]
         title, file_filter = (
             ("Choose Background detector image", BACKGROUND_IMAGE_FILTER)
             if path == BACKGROUND_FILE
@@ -247,9 +245,8 @@ def _control_path_chooser(widget):
             ("Choose PONI calibration", PONI_FILTER)
             if path == PONI_FILE
             else ("Choose detector mask", MASK_FILTER))
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            widget, title, start_directory, file_filter)
-        return selected or None
+        return (dialogs.ask(widget, title, start=start_directory, file_filter=file_filter)
+                or [None])[0]
 
     return choose
 
@@ -356,6 +353,8 @@ def _authoring_source_chooser(widget):
     """Dedicated source chooser for standalone Calibrate and Make Mask."""
     from pyqtgraph.Qt import QtWidgets
 
+    from xdart.gui.widgets import file_dialogs as dialogs
+
     def choose(asset, start_directory):
         if asset == "poni":
             title = "Choose calibration source image"
@@ -364,11 +363,11 @@ def _authoring_source_chooser(widget):
                 "*.nexus *.edf *.cbf *.img *.mar3450 *.raw);;All files (*)"
             )
         elif asset == "mask":
-            selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            selected = (dialogs.ask(
                 widget, "Choose TIFF or HDF5/NeXus source for mask",
-                start_directory,
-                "Mask sources (*.tif *.tiff *.h5 *.hdf5 *.nxs *.nexus)",
-            )
+                start=start_directory,
+                file_filter="Mask sources (*.tif *.tiff *.h5 *.hdf5 *.nxs *.nexus)",
+            ) or [None])[0]
             if not selected:
                 return None
             suffix = os.path.splitext(selected)[1].casefold()
@@ -388,10 +387,8 @@ def _authoring_source_chooser(widget):
             return exact
         else:
             return None
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            widget, title, start_directory, file_filter,
-        )
-        return selected or None
+        return (dialogs.ask(widget, title, start=start_directory, file_filter=file_filter)
+                or [None])[0]
 
     return choose
 
@@ -400,8 +397,7 @@ def _source_selection_chooser(widget):
     """Source chooser (directory/single/series) from the live launcher."""
     from pathlib import Path
 
-    from pyqtgraph.Qt import QtWidgets
-
+    from xdart.gui.widgets import file_dialogs as dialogs
     from xrd_tools.core.scan import SourceSpec
     from xrd_tools.sources.selection import (
         DirectorySourceSpec,
@@ -440,8 +436,8 @@ def _source_selection_chooser(widget):
                     metadata_format=metadata_format(current),
                 )
             )
-            selected = QtWidgets.QFileDialog.getExistingDirectory(
-                widget, "Choose image directory", start_directory)
+            selected = (dialogs.ask(widget, "Choose image directory", start=start_directory,
+                                    folder=True) or [None])[0]
             if not selected:
                 return None
             return DirectorySourceSpec(
@@ -452,15 +448,15 @@ def _source_selection_chooser(widget):
                 generation=prior.generation + 1,
                 metadata_format=prior.metadata_format,
             )
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
+        selected = (dialogs.ask(
             widget,
             (
                 "Choose one detector image"
                 if mode == "Single Image"
                 else "Choose an image-series member"
             ),
-            start_directory,
-            (
+            start=start_directory,
+            file_filter=(
                 "Detector image files (*.tif *.tiff *.cbf *.edf *.img "
                 "*.mar3450 *.raw)"
                 if mode == "Single Image"
@@ -468,7 +464,7 @@ def _source_selection_chooser(widget):
                 "Detector images (*.tif *.tiff *.h5 *.hdf5 *.nxs *.cxi "
                 "*.cbf *.edf *.img *.mar3450 *.raw);;All files (*)"
             ),
-        )
+        ) or [None])[0]
         if not selected:
             return None
         if mode == "Single Image":

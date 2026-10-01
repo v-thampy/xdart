@@ -26,6 +26,28 @@ SETTINGS_FILTER = "Settings (*.json);;All files (*)"
 ANY_FILTER = "All files (*)"
 
 
+def ask(parent, title: str, *, start: str = "", folder: bool = False, many: bool = False,
+        save: bool = False, file_filter: str = ANY_FILTER) -> list[str]:
+    """The one place a file dialog opens (Codex's Stitch/Int reuse audit R5): ask for a folder, a file or
+    files, or (``save``) a file to write, starting in ``start`` exactly as given; [] when cancelled.
+    Nothing is remembered: :func:`browse` applies the shared Browse rule around it, and a caller that
+    keeps that rule itself (Int's workspace seeds from ``browse_start_dir`` and remembers a pick only
+    once it is accepted) calls this."""
+    from pyqtgraph.Qt import QtWidgets
+
+    if save:
+        chosen, _filter = QtWidgets.QFileDialog.getSaveFileName(parent, title, start, file_filter)
+        return [chosen] if chosen else []
+    if folder:
+        chosen = QtWidgets.QFileDialog.getExistingDirectory(parent, title, start)
+        return [chosen] if chosen else []
+    if many:
+        picks, _filter = QtWidgets.QFileDialog.getOpenFileNames(parent, title, start, file_filter)
+        return list(picks or ())
+    chosen, _filter = QtWidgets.QFileDialog.getOpenFileName(parent, title, start, file_filter)
+    return [chosen] if chosen else []
+
+
 def browse(parent, title: str, *, folder: bool = False, many: bool = False, save: bool = False,
            file_filter: str = ANY_FILTER, current: str = "", fallback: str = "",
            default_name: str = "") -> list[str]:
@@ -37,24 +59,13 @@ def browse(parent, title: str, *, folder: bool = False, many: bool = False, save
     """
     from os.path import isabs, join
 
-    from pyqtgraph.Qt import QtWidgets
-
     start = browse_start_dir(current, fallback=fallback)
-    picks: list[str]
     if save:
         offered = (default_name if isabs(default_name or "")
                    else join(start, default_name) if start and default_name else default_name or start)
-        chosen, _filter = QtWidgets.QFileDialog.getSaveFileName(parent, title, offered, file_filter)
-        picks = [chosen] if chosen else []
-    elif folder:
-        chosen = QtWidgets.QFileDialog.getExistingDirectory(parent, title, start)
-        picks = [chosen] if chosen else []
-    elif many:
-        picks, _filter = QtWidgets.QFileDialog.getOpenFileNames(parent, title, start, file_filter)
-        picks = list(picks or ())
+        picks = ask(parent, title, start=offered, save=True, file_filter=file_filter)
     else:
-        chosen, _filter = QtWidgets.QFileDialog.getOpenFileName(parent, title, start, file_filter)
-        picks = [chosen] if chosen else []
+        picks = ask(parent, title, start=start, folder=folder, many=many, file_filter=file_filter)
     if picks:
         remember_browse_path(picks[0])
     return picks
@@ -83,5 +94,5 @@ def browse_spec(parent, title: str, *, many: bool = False, current: str = "",
 __all__ = [
     "ANY_FILTER", "BACKGROUND_IMAGE_FILTER", "CALIBRATION_FILTER", "CORRECTION_FILTER",
     "DETECTOR_SOURCE_FILTER", "MASK_FILTER", "NEXUS_FILTER", "PONI_FILTER", "SETTINGS_FILTER",
-    "browse", "browse_spec",
+    "ask", "browse", "browse_spec",
 ]

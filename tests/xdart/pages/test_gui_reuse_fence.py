@@ -80,8 +80,7 @@ _DEBT: dict[str, dict[str, int]] = {
         "QLineEdit": 7,
     },
     "pages/scattering_workspace.py": {
-        "QCheckBox": 1, "QFileDialog.getExistingDirectory": 3, "QFileDialog.getOpenFileName": 4, "QLineEdit": 1,
-        "QSpinBox": 1, "str:configMenuButton": 1, "str:helpMenuButton": 1,
+        "QCheckBox": 1, "QLineEdit": 1, "QSpinBox": 1, "str:configMenuButton": 1, "str:helpMenuButton": 1,
     },
     "tabs/stitch/calibration.py": {"QCheckBox": 2, "QLineEdit": 4},
     "tabs/stitch/fit_windows.py": {"PlotWidget": 2},
