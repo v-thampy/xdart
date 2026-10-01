@@ -1407,6 +1407,94 @@ def test_a_save_path_changed_while_the_scans_were_found_asks_for_another_run(qap
         _close(page, qapp)
 
 
+def _own_ubs(root, ubs):
+    """The synthetic source's SPEC file again, each scan with its own #G3 (None: the scan records no UB)."""
+    _spec_file(root / "source" / "RSM_synth", [
+        _spec_scan(scan, 9 + scan).replace(
+            "#G3 1 0 0 0 1 0 0 0 1\n", "" if ub is None else "#G3 " + " ".join(f"{value:g}" for value in ub) + "\n")
+        for scan, ub in zip((1, 2), ubs, strict=True)])
+
+
+def _gridded_ubs(monkeypatch):
+    """The committing stand-in, recording each gridded RSM's members' UBs (nine numbers each) by output name."""
+    _commit_instead_of_gridding(monkeypatch, _values())
+    committed, used = RSMOperationExecutionV2.run, {}
+
+    def gridding(self, **kwargs):
+        used[Path(self.request.module.output.target).name] = [
+            tuple(float(value) for value in np.asarray(member.ub, dtype=float).ravel())
+            for member in self.request.preflight.members]
+        return committed(self, **kwargs)
+    monkeypatch.setattr(RSMOperationExecutionV2, "run", gridding)
+    return used
+
+
+def test_a_queued_run_grids_each_rsm_with_its_members_own_ub_and_waits_for_any_missing_one(
+        qapp, tmp_path, monkeypatch):
+    """G8b's UB rule over G8c's queue (the choices compilation's item 52, G8b's choice 10: "the page grids one RSM
+    per run" no longer holds). In HKL with the source's own UB, each queued RSM is gridded with its own members'
+    UB; a member of any RSM that records none (RSM 2's, then RSM 1's) holds the whole queue, warned, before any
+    gridding."""
+    used = _gridded_ubs(monkeypatch)
+    own = ((1, 0, 0, 0, 1, 0, 0, 0, 1), (2, 0, 0, 0, 2, 0, 0, 0, 2))
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _own_ubs(tmp_path, own)
+        _with_source(page, tmp_path, scans="1,2")
+        first, second = (Path(form.output_path).name for form in page.build_forms())
+        page.begin_run()
+        _wait(page, qapp, lambda: "Saved 2 of 2 RSMs" in label.full_text())
+        assert used == {first: [tuple(map(float, own[0]))], second: [tuple(map(float, own[1]))]}
+        for ubs in ((own[0], None), (None, own[1])):
+            used.clear()
+            _own_ubs(tmp_path, own)
+            page.resolve_source()  # every member records one again: ready
+            assert page._readiness[1], page._readiness
+            _own_ubs(tmp_path, ubs)
+            page.begin_run()  # the scans are found again, the member recording none with them
+            _wait(page, qapp, lambda: not page.active())
+            assert label.full_text() == _NO_UB and used == {} and page._jobs == []
+            assert page._headers["source"].detail == _NO_UB and not page._readiness[1]
+            page.begin_run()  # and Run waits while it records none
+            assert label.full_text() == "Needs a UB matrix" and not page.active() and used == {}
+    finally:
+        _close(page, qapp)
+
+
+def test_a_ub_given_for_a_queued_run_is_every_rsms_and_the_preview_names_each_members_own(
+        qapp, tmp_path, monkeypatch):
+    """A UB given (typed, or a SPEC scan's) is the run's, as the design's override rule has it ("An override is
+    shown in the Preview beside the source's own UB"): every queued RSM is gridded with it, the one whose member
+    records its own UB too, and each RSM's Preview names its members' own beside it."""
+    used = _gridded_ubs(monkeypatch)
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _own_ubs(tmp_path, ((2, 0, 0, 0, 2, 0, 0, 0, 2), None))
+        _with_source(page, tmp_path, scans="1,2")
+        assert page._headers["source"].detail == _NO_UB
+        page.set_field("ub_from", "Typed")
+        for number, row in enumerate(("3 0 0", "0 3 0", "0 0 3"), 1):
+            page.set_field(f"ub_row{number}", row)
+        assert page._readiness[1], page._readiness
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview ready · 2 RSMs" in label.full_text())
+        shown = page.preview_text.toPlainText()
+        assert shown.count("UB given: typed, in SPEC's #G3 convention: 3 0 0; 0 3 0; 0 0 3, in place of the "
+                           "sources' own (each member's below)") == 2
+        assert shown.index("UB the source records: 2 0 0; 0 2 0; 0 0 2") < shown.index("RSM 2 of 2") \
+            < shown.index("UB the source records: none recorded")
+        names = [Path(form.output_path).name for form in page.build_forms()]
+        page.begin_run()
+        _wait(page, qapp, lambda: "Saved 2 of 2 RSMs" in label.full_text())
+        assert used == dict.fromkeys(names, [(3.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 3.0)])
+    finally:
+        _close(page, qapp)
+
+
 def test_relative_source_files_and_images_are_the_projects(qapp, tmp_path):
     """A relative SPEC file and Images folder are the Project's (Stitch's selection would take them from the
     working directory), in readiness and in the members found."""
