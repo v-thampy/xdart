@@ -196,6 +196,9 @@ class StitchPlan:
     #: (``map_unit``): the map shares them.
     map_unit: str | None = None
     map_radial_range: tuple[float, float] | None = None
+    #: streaming multigeometry with a Diffractometer: I(q)'s χ window (°), as Int 1D's azimuthal range (a
+    #: 1-D Stitch's, or I(q)'s beside a 2-D map); None: every χ. ``azimuth_range`` is the map's.
+    azimuth_range_1d: tuple[float, float] | None = None
 
     def provenance(self) -> dict[str, Any]:
         """A JSON-safe record of this stitch for persistence (a Stitch record's
@@ -223,6 +226,8 @@ class StitchPlan:
             **({} if self.map_unit is None else {
                 "map_unit": self.map_unit,
                 "map_radial_range": None if self.map_radial_range is None else list(self.map_radial_range)}),
+            # I(q)'s χ window, only when it has one (every χ otherwise, as older records)
+            **({} if self.azimuth_range_1d is None else {"azimuth_range_1d": list(self.azimuth_range_1d)}),
             "monitor_key": self.monitor_key,
             "streaming_multigeometry": self.streaming_multigeometry,
             "corrections": _ser(self.corrections),
@@ -268,6 +273,7 @@ class StitchPlan:
         rr = prov.get("radial_range")
         ar = prov.get("azimuth_range")
         mr = prov.get("map_radial_range")
+        ar1 = prov.get("azimuth_range_1d")
         streaming_multigeometry = prov.get("streaming_multigeometry", False)
         if type(streaming_multigeometry) is not bool:
             raise TypeError(
@@ -287,6 +293,7 @@ class StitchPlan:
             azimuth_range=tuple(ar) if ar else None,
             map_unit=prov.get("map_unit"),
             map_radial_range=tuple(mr) if mr else None,
+            azimuth_range_1d=tuple(ar1) if ar1 else None,
             monitor_key=prov.get("monitor_key"),
             streaming_multigeometry=streaming_multigeometry,
             conditioning=(StitchConditioning(**prov["conditioning"])
@@ -300,6 +307,11 @@ class StitchPlan:
             error_model=prov.get("error_model"),
             flat_min_fraction=float(prov.get("flat_min_fraction", 0.1)),
         )
+
+
+def _chi_window(plan: StitchPlan, name: str) -> dict[str, tuple[float, float]]:
+    """I(q)'s χ window as the kernel's ``name`` argument, only when the plan has one (every χ: as before)."""
+    return {} if plan.azimuth_range_1d is None else {name: plan.azimuth_range_1d}
 
 
 def _flat_cutoff_record(plan: StitchPlan) -> dict[str, float]:
@@ -653,6 +665,11 @@ def run_stitch(
         raise ValueError("an I(q) profile needs the streaming 2-D Stitch with a Diffractometer")
     if (plan.map_unit is not None or plan.map_radial_range is not None) and not plan.stitch_profile:
         raise ValueError("a map's own radial axis goes beside I(q) (stitch_profile)")
+    if plan.azimuth_range_1d is not None and (
+            diffractometer is None or not plan.streaming_multigeometry or plan.backend != "multigeometry"
+            or (plan.mode == "2d" and not plan.stitch_profile)):
+        raise ValueError("I(q)'s χ window needs the streaming Stitch with a Diffractometer "
+                         "(in 2-D, I(q) beside the map)")
     if diffractometer is not None:
         # GAP-A path: per-frame rotations from the calibrated Diffractometer.
         from xrd_tools.integrate.multi import (  # noqa: PLC0415
@@ -789,6 +806,7 @@ def run_stitch(
                     _iter_images(report=False), len(labels), integrator_series.__iter__, npt_1d=plan.npt_1d,
                     gi=plan.stitch_gi, gi_angles=gi_angles, workers=workers, progress=merged,
                     **(dict(unit_1d=plan.unit, radial_range_1d=plan.radial_range) if own_map else {}),
+                    **_chi_window(plan, "azimuth_range_1d"),
                     **arguments)
                 profile = tuple(profile)
             else:
@@ -812,7 +830,7 @@ def run_stitch(
                 radial_range=plan.radial_range,
                 mask=plan.mask, normalization=normalization,
                 frame_screen=frame_screen, gi=plan.stitch_gi, gi_angles=gi_angles, workers=workers,
-                progress=merged, **corrections,
+                progress=merged, **_chi_window(plan, "azimuth_range"), **corrections,
             )
         else:
             assert integrators is not None

@@ -52,7 +52,8 @@ from xrd_tools.session.readiness import (
     ControlAction, ControlActionSpec, ControlFieldKind, ControlFormField, SectionId,
 )
 from xdart.gui.tabs.scattering.controls_inventory import (
-    GI_1D_AXES, GI_ENABLED, GI_MOTOR, GI_ORIENTATION, GI_THETA, INT_1D_AXIS, INT_1D_POINTS, INT_1D_RADIAL_AUTO,
+    GI_1D_AXES, GI_ENABLED, GI_MOTOR, GI_ORIENTATION, GI_THETA, INT_1D_AXIS, INT_1D_AZIM_AUTO, INT_1D_AZIM_HIGH,
+    INT_1D_AZIM_LOW, INT_1D_POINTS, INT_1D_RADIAL_AUTO,
     MASK_FILE, PONI_FILE,
     INT_1D_RADIAL_HIGH, INT_1D_RADIAL_LOW, INT_2D_AXIS, INT_2D_AZIM_AUTO, INT_2D_AZIM_HIGH, INT_2D_AZIM_LOW,
     INT_2D_AZIM_POINTS, INT_2D_RADIAL_AUTO, INT_2D_RADIAL_HIGH, INT_2D_RADIAL_LOW, INT_2D_RADIAL_POINTS,
@@ -93,6 +94,9 @@ _PROCESSING = (
     ("1-D", "radial_auto", INT_1D_RADIAL_AUTO, True),
     ("1-D", "q_min", INT_1D_RADIAL_LOW, 0.0),
     ("1-D", "q_max", INT_1D_RADIAL_HIGH, 6.2),
+    ("1-D", "chi1d_auto", INT_1D_AZIM_AUTO, True),
+    ("1-D", "chi1d_min", INT_1D_AZIM_LOW, -180.0),
+    ("1-D", "chi1d_max", INT_1D_AZIM_HIGH, 180.0),
     ("1-D", "gi_ip_auto", ("Stitch", "gi_ip_auto"), True),
     ("1-D", "gi_ip_min", ("Stitch", "gi_ip_low"), -2.0),
     ("1-D", "gi_ip_max", ("Stitch", "gi_ip_high"), 2.0),
@@ -821,8 +825,8 @@ class StitchPage(QtWidgets.QWidget):
         self._map_card = self._processing_cards["2-D"]
         range_row = {key: row for row in self._range_rows for path, key in self._keys_by_path.items()
                      if key in self._range_keys and path in (row._low_path, row._high_path)}
-        self.radial_range, self.map_range, self.chi_range, self.threshold_range = (
-            range_row[key] for key in ("q_min", "map_min", "chi_min", "threshold_min"))
+        self.radial_range, self.chi_range_1d, self.map_range, self.chi_range, self.threshold_range = (
+            range_row[key] for key in ("q_min", "chi1d_min", "map_min", "chi_min", "threshold_min"))
         self._gi_rows = (range_row["gi_ip_min"], range_row["gi_oop_min"])
         for row, prefix in zip(self._gi_rows, _GI_RANGES):
             row.setToolTip(_GI_RANGES[prefix][1])
@@ -835,8 +839,11 @@ class StitchPage(QtWidgets.QWidget):
         self._tip("npt_azim_2d", "The map's χ points")
         self.map_range.setToolTip("The map's radial range (Auto: its frames' extent), its own as Int 2D's; "
                                   "I(q) beside it keeps the 1-D range.")
-        self.chi_range.setToolTip("The map's χ range (Auto: its frames' extent). I(q) beside it takes every χ, "
-                                  "as a Stitch 1D.")
+        self.chi_range.setToolTip("The map's χ range (Auto: its frames' extent). I(q) beside it takes the 1-D "
+                                  "χ range, as a Stitch 1D.")
+        self.chi_range_1d.setToolTip("I(q)'s χ window, as Int 1D's (Auto: every χ), in pyFAI's χ, which "
+                                     "xrayutilities shares pixel for pixel. Grazing's cuts keep their Qip and "
+                                     "Qoop windows; a Stitch 2D's map its own χ range.")
         self._align_to_ranges(self._rows["monitor"])
         for key in ("unit", "map_axis"):
             self._rows[key].valueChanged.connect(self._processing_axis_changed)
@@ -1923,6 +1930,7 @@ class StitchPage(QtWidgets.QWidget):
             image_rotation=orientation.rotation, image_flip=orientation.flip_horizontal,
             threshold=None if value("threshold") is None or not str(value("threshold")).strip() else float(value("threshold")),
             q_range=None if value("radial_auto") else (float(value("q_min")), float(value("q_max"))), npt_1d=int(value("npt_1d")),
+            chi_range_1d=None if value("chi1d_auto") else (float(value("chi1d_min")), float(value("chi1d_max"))),
             output_path=output, monitor_selector=MetadataColumnSelector(monitor) if monitor else None,
             backend="xu_hist" if value("backend") == "xrayutilities histogram" else "multigeometry",
             max_frame_bytes=int(value("max_frame_mib")) * 1024 * 1024,
@@ -1961,6 +1969,9 @@ class StitchPage(QtWidgets.QWidget):
             flat_cutoff=f"{100 * form.flat_min_fraction:g}")
         if form.q_range is not None:
             fields.update(q_min=form.q_range[0], q_max=form.q_range[1])
+        fields.update(chi1d_auto=form.chi_range_1d is None)  # Auto is None: an explicit −180 to 180 stays
+        if form.chi_range_1d is not None:
+            fields.update(chi1d_min=form.chi_range_1d[0], chi1d_max=form.chi_range_1d[1])
         if form.mode == "2d":  # Auto is None, as saved: an explicit −180 to 180 stays explicit
             chi, radial = form.chi_range, form.map_radial_range
             if form.gi is None:  # a Grazing map's 2-D Axis is the one it opens on: the page's

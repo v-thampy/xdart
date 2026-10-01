@@ -36,7 +36,7 @@ def test_each_camera_is_one_turn_and_mirror_into_stitchs_frame():
     for rotation in (0, 90, 180, 270):  # an image rotation saved before the camera: its unmirrored camera
         assert stitch_orientation(stitch_camera(ImageOrientation(rotation=rotation))) == ImageOrientation(rotation=rotation)
     # half a turn from the pyFAI-frame table (DetectorCamera.image_orientation, pinned against xrayutilities and
-    # pyFAI untilted): Stitch's pyFAI χ is 180° from its xrayutilities χ, a gap this records rather than hides
+    # pyFAI untilted); Stitch's arm is fitted in Stitch's frame, so its two backends' χ agree (test_xu_stitch_2d)
     for camera in CAMERAS:
         np.testing.assert_array_equal(stitch_orientation(camera).apply(raw),
                                       ImageOrientation(rotation=180).apply(camera.image_orientation().apply(raw)))

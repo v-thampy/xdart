@@ -740,6 +740,33 @@ def test_the_selected_scans_frames_show_once_committed(qapp, tmp_path):
         _close(page, qapp)
 
 
+def test_the_1d_chi_range_is_int_1ds_and_reaches_the_form(qapp, tmp_path):
+    """Maintainer, 2026-09-30: "a 1-D χ range" -- "yes, mirror Int": Int 1D's χ row (its label, Auto greying
+    the bounds) below the radial range; Auto is every χ (None), an explicit window reaches the form and comes
+    back from it, in both modes (a Stitch 2D's I(q) beside the map takes it; the map keeps its own row)."""
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    page, again = StitchPage(empty_host_services(_Status())), StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(form)
+        row = page.chi_range_1d
+        assert row.label.text() == "χ (°)" and row is not page.chi_range
+        assert page.build_form().chi_range_1d is None and not row._low.isEnabled()  # Auto: greyed
+        page.set_field("chi1d_auto", False)
+        assert row._low.isEnabled() and row._high.isEnabled()
+        page.set_field("chi1d_min", -60.0)
+        page.set_field("chi1d_max", 45.0)
+        built = page.build_form()
+        assert built.chi_range_1d == (-60.0, 45.0)
+        again.load_form(built)
+        assert again.build_form().fingerprint == built.fingerprint
+        page.select_mode("Stitch 2D")
+        assert page.build_form().chi_range_1d == (-60.0, 45.0) and page.build_form().chi_range is None
+        page.set_field("chi1d_auto", True)
+        assert page.build_form().chi_range_1d is None
+    finally:
+        _close(page, qapp)
+        _close(again, qapp)
+
 def test_hovering_the_frame_count_lists_each_scans_frames(qapp, tmp_path):
     """Maintainer, 2026-09-30: "It will be good if a tooltip when hovering over it shows the number of images
     per scan as well". The readiness line keeps the total (a scan in two results counted twice); hovered, it

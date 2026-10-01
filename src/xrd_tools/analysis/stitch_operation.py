@@ -1370,6 +1370,9 @@ class StitchOperationPlan:
     #: ``unit`` and ``radial_range`` are I(q)'s beside it.
     map_unit: str = "q_A^-1"
     map_radial_range: tuple[float, float] | None = None
+    #: A native Stitch's I(q) χ window (°), as Int 1D's azimuthal range (a Stitch 2D's I(q) beside the
+    #: map too); None: every χ. ``azimuth_range`` is the map's.
+    azimuth_range_1d: tuple[float, float] | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
@@ -1418,6 +1421,7 @@ class StitchOperationPlan:
         _correction_fields(self)
         _gi_field(self)
         _map_axis_fields(self)
+        _chi_window_field(self)
         object.__setattr__(self, "radial_range", radial)
         object.__setattr__(self, "azimuth_range", azimuth)
         object.__setattr__(
@@ -1450,7 +1454,7 @@ class StitchOperationPlan:
              self.error_model,
              None if self._dark_receipt is None else self._dark_receipt.fingerprint,
              None if self._flat_receipt is None else self._flat_receipt.fingerprint),
-        ) + _flat_cutoff_identity(self) + _gi_identity(self) + _map_axis_identity(self)
+        ) + _flat_cutoff_identity(self) + _gi_identity(self) + _map_axis_identity(self) + _chi_window_identity(self)
         return value + native_plan_identity(self) if self.native_records else value
 
 
@@ -1484,6 +1488,8 @@ class XuStitchOperationPlan:
     #: The map's radial unit and range (None: its frames' extent), as Int 2D's; I(q)'s are ``unit``, ``radial_range``.
     map_unit: str = "q_A^-1"
     map_radial_range: tuple[float, float] | None = None
+    #: I(q)'s χ window (°; native records), as ``StitchOperationPlan``'s; None: every χ.
+    azimuth_range_1d: tuple[float, float] | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
@@ -1529,6 +1535,7 @@ class XuStitchOperationPlan:
             raise ValueError("non-native XU plans require canonical version 1 calibration")
         _xu_map_fields(self)
         _map_axis_fields(self)
+        _chi_window_field(self)
         object.__setattr__(
             self,
             "fingerprint",
@@ -1557,7 +1564,7 @@ class XuStitchOperationPlan:
                 + (native_plan_identity(self) if self.native_records else ())
                 # a 1-D plan keeps the identity it had
                 + (() if self.mode == "1d" else (("xu-map-v1",) + _xu_map_grid(self),))
-                + _map_axis_identity(self),
+                + _map_axis_identity(self) + _chi_window_identity(self),
             ),
         )
 
@@ -1628,6 +1635,20 @@ def _map_axis_identity(plan):
     if not (plan.native_records and plan.mode == "2d"):
         return ()
     return (("map-axis-v1", plan.map_unit, plan.map_radial_range),)
+
+
+def _chi_window_field(plan):
+    """A native Stitch's I(q) χ window (°), as Int 1D's azimuthal range: a finite ordered pair, in each
+    backend's χ (xrayutilities' is pyFAI's, pixel for pixel); None: every χ."""
+    window = _range(plan.azimuth_range_1d, "I(q) χ window", required=False)
+    if window is not None and not plan.native_records:
+        raise ValueError("I(q)'s χ window goes with a native Stitch")
+    object.__setattr__(plan, "azimuth_range_1d", window)
+
+
+def _chi_window_identity(plan):
+    """Only a χ-windowed plan changes its identity; every χ keeps the one it had."""
+    return () if plan.azimuth_range_1d is None else (("i-q-chi-window-v1", plan.azimuth_range_1d),)
 
 
 def _flat_cutoff_identity(plan):
@@ -1956,6 +1977,8 @@ def _provenance(
             **({} if not (plan.native_records and plan.mode == "2d") else {
                 "map_unit": plan.map_unit,
                 "map_radial_range": None if plan.map_radial_range is None else list(plan.map_radial_range)}),
+            # I(q)'s χ window, only when it has one (every χ otherwise, as before)
+            **({} if plan.azimuth_range_1d is None else {"azimuth_range_1d": list(plan.azimuth_range_1d)}),
             "method": plan.method,
             "monitor_selector": (
                 None
@@ -2073,6 +2096,8 @@ def _xu_provenance(
             "asset_receipt_fingerprint": receipt.fingerprint,
             "effective_geometry_fingerprint": plan.effective_geometry.fingerprint,
             "plan_fingerprint": plan.fingerprint,
+            # I(q)'s χ window, only when it has one (every χ otherwise, as before)
+            **({} if plan.azimuth_range_1d is None else {"azimuth_range_1d": list(plan.azimuth_range_1d)}),
             **({} if plan.mode == "1d" else {"map": {
                 "npt_rad_2d": plan.npt_rad_2d, "npt_azim_2d": plan.npt_azim_2d,
                 # None (Auto): the frames' own χ extent, scouted when stitching
@@ -2588,6 +2613,7 @@ def _runtime_plan(plan: StitchOperationPlan, diffractometer, saturation=None) ->
         method=plan.method,
         radial_range=plan.radial_range,
         azimuth_range=plan.azimuth_range,
+        azimuth_range_1d=plan.azimuth_range_1d,
         monitor_key=(
             None if plan.monitor_selector is None else plan.monitor_selector.name
         ),
@@ -2967,6 +2993,7 @@ class StitchOperationExecution:
                     map_grid=None if plan.mode == "1d" else _xu_map_grid(plan),
                     **({} if plan.mode == "1d" else dict(map_unit=plan.map_unit,
                                                         map_radial_range=plan.map_radial_range)),
+                    **({} if plan.azimuth_range_1d is None else dict(azimuth_range_1d=plan.azimuth_range_1d)),
                     workers=workers,
                 )
                 self._frame_screen = screen.summary()

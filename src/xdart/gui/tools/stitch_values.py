@@ -285,6 +285,9 @@ class StitchToolForm:
     #: The frames are also mirrored left-right after ``image_rotation``: a mirrored detector camera's
     #: transform into Stitch's frame (``camera.stitch_orientation``).
     image_flip: bool = False
+    #: I(q)'s χ window (°), as Int 1D's azimuthal range (native; a Stitch 2D's I(q) beside the map too);
+    #: None (Auto): every χ. ``chi_range`` is the map's.
+    chi_range_1d: tuple[float, float] | None = None
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -390,6 +393,10 @@ class StitchToolForm:
         if type(self.image_flip) is not bool:
             raise ValueError("image flip must be an exact boolean")
         q_range = None if native and self.q_range is None else _ordered_range(self.q_range, "radial range")
+        if self.chi_range_1d is not None:
+            if not native:
+                raise ValueError("I(q)'s χ range goes with a native Stitch: choose its sources on the Stitch page")
+            object.__setattr__(self, "chi_range_1d", _ordered_range(self.chi_range_1d, "χ range"))
         if type(self.npt_1d) is not int or not 1 <= self.npt_1d <= 1_000_000:
             raise ValueError("1-D bin count must be a bounded positive integer")
         if self.monitor_selector is not None and type(
@@ -532,6 +539,8 @@ class StitchToolForm:
                               self.map_unit, self.map_radial_range),)))
         if self.image_flip:  # a mirrored camera's; an unmirrored form keeps the identity it had
             canonical = (canonical, ("image-flip", True))
+        if self.chi_range_1d is not None:  # a χ-windowed I(q)'s; every χ keeps the identity it had
+            canonical = (canonical, ("i-q-chi-window", self.chi_range_1d))
         object.__setattr__(
             self,
             "fingerprint",

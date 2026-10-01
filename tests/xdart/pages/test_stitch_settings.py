@@ -42,14 +42,16 @@ def test_settings_round_trip_every_input(qapp, tmp_path, backend, manual):
     page = _edited_page(tmp_path, backend)
     restored = StitchPage(empty_host_services(_Status()))
     try:
-        if manual:  # a 2θ axis with a manual range and a manual intensity threshold
+        if manual:  # a 2θ axis with a manual range and χ window and a manual intensity threshold
             for key, value in (("unit", "2θ (°)"), ("radial_auto", False), ("q_min", 10.0),
-                               ("q_max", 60.0), ("threshold", 700000.0)):
+                               ("q_max", 60.0), ("chi1d_auto", False), ("chi1d_min", -60.0),
+                               ("chi1d_max", 45.0), ("threshold", 700000.0)):
                 page.set_field(key, value)
             assert page._threshold_mode == "manual"
         built = page.build_form()
         if manual:
             assert built.unit == "2th_deg" and built.q_range == (10.0, 60.0)
+            assert built.chi_range_1d == (-60.0, 45.0)
             assert built.conditioning.mode == "manual" and built.conditioning.threshold_max == 700000.0
         document = load_settings(dump_settings(page.settings()))
         assert document["sources"]["Spec"] == [str(path) for path in built.source_selection.paths]

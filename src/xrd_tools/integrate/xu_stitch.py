@@ -815,6 +815,7 @@ def _xu_frame_arrays(
     gi_cuts: tuple | None = None,
     map_edges: tuple[np.ndarray, np.ndarray] | None = None,
     map_unit: str | None = None,
+    chi_window: tuple[float, float] | None = None,
 ) -> tuple[dict, list]:
     """One frame's pixels and coordinates for its histograms (``_xu_frame_histograms``): every
     xrayutilities call of the frame, made on the thread its runtime session belongs to, whose lease is
@@ -823,8 +824,9 @@ def _xu_frame_arrays(
 
     As in pyFAI, a dark is subtracted from the conditioned frame, and the flat and polarization weight
     the normalization next to the solid angle. With ``gi_cuts`` (normal, axis, …) the frame's GI
-    coordinates, and with ``map_edges`` its χ (and the map's radial coordinate, in ``map_unit`` when it is
-    not ``unit``), are computed once for the cuts' and the maps' histograms.
+    coordinates, and with ``map_edges`` or ``chi_window`` its χ (and with ``map_edges`` the map's radial
+    coordinate, in ``map_unit`` when it is not ``unit``), are computed once for the cuts', the maps' and
+    I(q)'s histograms.
     """
 
     raw_image = image = q = valid = weights = factor = solid = None
@@ -897,7 +899,7 @@ def _xu_frame_arrays(
         if gi_cuts is not None:
             q_ip, q_oop = lease.gi_coordinates(gi_cuts[0], gi_cuts[1])
             owned_refs.extend((weakref.ref(q_ip), weakref.ref(q_oop)))
-        if map_edges is not None:
+        if map_edges is not None or chi_window is not None:
             chi = lease.chi()
             owned_refs.append(weakref.ref(chi))
         arrays = dict(image=image, q=q, valid=valid, weights=weights, q_ip=q_ip, q_oop=q_oop, chi=chi,
@@ -939,9 +941,12 @@ def _xu_frame_histograms(
     q_edges: np.ndarray,
     gi_cuts: tuple | None = None,
     map_edges: tuple[np.ndarray, np.ndarray] | None = None,
+    chi_window: tuple[float, float] | None = None,
 ) -> tuple:
     """One frame's 1-D contributions from its ``_xu_frame_arrays`` (NumPy only: a frame worker's share
     with several workers), emptying ``arrays`` and proving the frame released before it returns.
+    ``chi_window`` (°) bins I(q) from the pixels whose χ (their centre's) is inside it, ends included; the
+    cuts and the map keep every pixel (their own windows and ranges).
 
     ``gi_cuts`` (normal, axis, ((cut, window, edges), …)) also bins the frame's GI cuts from the same pixels
     and weights; their histograms, one triple per cut, are the fifth value; with ``gi_cuts``' optional
@@ -951,23 +956,31 @@ def _xu_frame_histograms(
     value, else None.
     """
     image = q = valid = weights = None
-    cut = other = inside = q_ip = q_oop = chi = radial = None
+    cut = other = inside = q_ip = q_oop = chi = radial = profile = None
     gi_histograms = ()
     map_histograms = None
     pending: BaseException | None = None
     d_signal = d_normalization = d_count = None
     try:
         image, q, valid, weights = arrays["image"], arrays["q"], arrays["valid"], arrays["weights"]
+        profile = valid  # I(q)'s pixels: every valid one, or those inside its χ window
+        if chi_window is not None:
+            chi = arrays["chi"]
+            profile = np.logical_and(valid, np.isfinite(chi))
+            np.logical_and(profile, chi >= chi_window[0], out=profile)
+            np.logical_and(profile, chi <= chi_window[1], out=profile)
+            chi = None
         d_signal = np.histogram(
-            q[valid], q_edges, weights=image[valid]
+            q[profile], q_edges, weights=image[profile]
         )[0]
         d_normalization = np.histogram(
-            q[valid], q_edges, weights=weights[valid]
+            q[profile], q_edges, weights=weights[profile]
         )[0]
-        d_count = np.histogram(q[valid], q_edges)[0].astype(
+        d_count = np.histogram(q[profile], q_edges)[0].astype(
             np.float64,
             copy=False,
         )
+        profile = None
         if gi_cuts is not None:
             _normal, _axis, cuts, *gi_map_edges = gi_cuts
             q_ip, q_oop = arrays["q_ip"], arrays["q_oop"]
@@ -1011,7 +1024,7 @@ def _xu_frame_histograms(
         pending = error.with_traceback(None)
     finally:
         image = q = valid = weights = None
-        cut = other = inside = q_ip = q_oop = chi = radial = None
+        cut = other = inside = q_ip = q_oop = chi = radial = profile = None
         arrays.clear()
         released = not any(reference() is not None for reference in owned_refs)
         owned_refs.clear()
@@ -1203,6 +1216,7 @@ def run_xu_hist_stitch_1d(
     map_unit: str | None = None,
     map_radial_range: tuple[float, float] | None = None,
     workers: int = 1,
+    azimuth_range_1d: tuple[float, float] | None = None,
 ) -> XuStitchScienceResult:
     """Run native Q or 2theta histogram bins; omitted bounds scout all geometry.
 
@@ -1229,6 +1243,9 @@ def run_xu_hist_stitch_1d(
     ``gi`` too, the q_ip-q_oop map (the same points over the cuts' ranges) is ``gi_map``.
     ``map_unit`` gives the map its own radial unit and ``map_radial_range`` its own range (None:
     its frames' extent), as Int's 2-D integration beside its 1-D one; None shares I(q)'s.
+    ``azimuth_range_1d`` (°) is I(q)'s χ window, as pyFAI's (None: every χ): the pixels whose χ is
+    inside it, where pyFAI's pixel splitting also takes a pixel that only reaches into it. The GI cuts and
+    the map keep their own windows and ranges.
     """
     from xrd_tools.integrate.stitch_gi import GI_UNITS, StitchGI
     if map_grid is not None and (
@@ -1249,6 +1266,11 @@ def run_xu_hist_stitch_1d(
             or any(type(v) not in {int, float} or not math.isfinite(v) for v in map_radial_range)
             or map_radial_range[0] >= map_radial_range[1]):
         raise ValueError("a Stitch 2D map's radial range must be finite and increasing, with its unit")
+    if azimuth_range_1d is not None and (
+            type(azimuth_range_1d) is not tuple or len(azimuth_range_1d) != 2
+            or any(type(v) not in {int, float} or not math.isfinite(v) for v in azimuth_range_1d)
+            or azimuth_range_1d[0] >= azimuth_range_1d[1]):
+        raise ValueError("I(q)'s χ window must be finite and increasing")
     if type(receipt) is not XuStitchCalibrationReceipt:
         raise TypeError("XU Stitch science requires exact calibration receipt")
     if unit not in {"q_A^-1", "2th_deg"}:
@@ -1488,10 +1510,11 @@ def run_xu_hist_stitch_1d(
                 or (centres.size > 1 and np.any(np.diff(centres) <= 0))):
             raise XuStitchScienceRefused("STITCH_Q_GRID_INVALID", "radial grid is not finite and strictly increasing")
         map_edges = None
+        if (map_grid is not None or azimuth_range_1d is not None) and not str(
+                asset["xrayutilities"].get("chi_validation_convention", "")).startswith("minus_atan2_qx_qz"):
+            raise XuStitchScienceRefused("XU_CHI_CONVENTION_UNSUPPORTED",
+                                         "a Stitch 2D map or χ window takes the SURFACE asset's χ convention")
         if map_grid is not None:
-            if not str(asset["xrayutilities"].get("chi_validation_convention", "")).startswith("minus_atan2_qx_qz"):
-                raise XuStitchScienceRefused("XU_CHI_CONVENTION_UNSUPPORTED",
-                                             "a Stitch 2D map takes the SURFACE asset's χ convention")
             chi_range = map_grid[2] if map_grid[2] is not None else _scout_chi_range(
                 provider, frame_inputs, cancel_token)  # Auto: the frames' own χ extent
             # the map's own radial axis (Auto: its frames' extent), else I(q)'s
@@ -1543,12 +1566,13 @@ def run_xu_hist_stitch_1d(
                 gi_cuts=gi_cuts[index],
                 map_edges=map_edges,
                 map_unit=map_unit,
+                chi_window=azimuth_range_1d,
             )
 
         def compute(index, arrays, owned_refs):
             """The frame's histograms (NumPy only: a frame worker's share)."""
             return _xu_frame_histograms(arrays, owned_refs, q_edges=q_edges, gi_cuts=gi_cuts[index],
-                                        map_edges=map_edges)
+                                        map_edges=map_edges, chi_window=azimuth_range_1d)
 
         def merge(histograms):
             """Add one frame's histograms, in frame order (the screen holds a frame until its row

@@ -83,8 +83,9 @@ class DetectorCamera:
 #: swings the detector, to the right, so its camera is ('x-', 'z-'), and with the maintainer's senses (nu x-,
 #: del z-) the arm fits only with the columns mirrored, as this frame says. (A fit fixes only a circle's
 #: sense times the image's mirror, and the asset's camera was checked on |q| alone, which no mirror changes:
-#: the absolute frame rests on those images.) It is 180° from ``_PYFAI_TRANSFORM``'s ('x+', 'z-'): Stitch's
-#: pyFAI χ is 180° from its xrayutilities χ (a pre-existing gap; 2θ and |q| agree).
+#: the absolute frame rests on those images.) It is 180° from ``_PYFAI_TRANSFORM``'s ('x+', 'z-'), the frame
+#: an untilted pyFAI geometry takes; Stitch's arm is fitted in this one, so its pyFAI χ is its xrayutilities
+#: χ pixel for pixel (``test_xu_stitch_2d``; a χ window takes the same side on both, ``test_stitch_chi_window``).
 STITCH_CAMERA = DetectorCamera('x-', 'z+')
 
 
