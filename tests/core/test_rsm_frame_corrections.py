@@ -142,24 +142,26 @@ def test_row_a_scan_43_with_every_correction_off_is_the_reference_and_the_correc
 @pytest.mark.slow
 def test_the_corrections_are_charged_in_the_memory_plan(rsm_r2_project):
     """S2: the per-frame corrections' allocations are charged with each science chunk, at or above what the run
-    allocates. Measured with tracemalloc at Pilatus 100K, every correction on (probe s2_weights_peak.py): one
-    frame at one pose 6,899,301 B; four frames at four poses 9,159,084 B. A chunk cap between the plain and the
-    corrected charge refuses the corrected plan only."""
+    allocates. Measured with tracemalloc at Pilatus 100K, every correction on: one frame at one pose 6,899,301 B,
+    four frames at four poses 9,159,084 B (S2.2, probe s2_weights_peak.py); with S2.3's banded weights (probe
+    s23_weights_peak.py, ``logs/s23-weights-peak.log``) 7,654,033 B and 9,912,980 B (one band covers the crop
+    there; the weight array is allocated before the band). A chunk cap between the plain and the corrected
+    charge refuses the corrected plan only."""
     from types import SimpleNamespace
     from xrd_tools.analysis.rsm_operation import RSMBoundCorrections, _rsm_v2_correction_bytes
     member = SimpleNamespace(detector_shape=(195, 487), cropped_shape=(194, 486))
     full = RSMBoundCorrections(RSMFrameCorrections(solid_angle=True, polarization_factor=0.99), None, object(),
                                object())
     plan = SimpleNamespace(corrections=full)
-    assert _rsm_v2_correction_bytes(plan, 1, member) >= 6_899_301
-    assert _rsm_v2_correction_bytes(plan, 4, member) >= 9_159_084
+    assert _rsm_v2_correction_bytes(plan, 1, member) >= 7_654_033
+    assert _rsm_v2_correction_bytes(plan, 4, member) >= 9_912_980
     assert _rsm_v2_correction_bytes(SimpleNamespace(corrections=None), 4, member) == 0
     plain = _request(rsm_r2_project, "mem-plain")
     from xrd_tools.analysis.rsm_operation import _require_rsm_v2_memory_plan
     _require_rsm_v2_memory_plan(plain)
     corrected = _request(rsm_r2_project, "mem-on", RSMFrameCorrections(solid_angle=True, polarization_factor=0.99))
     _require_rsm_v2_memory_plan(corrected)
-    cap = 56 * 1024 * 1024  # the preset chunk of 8 frames: plain 49,381,800 B, corrected 63,867,861 B
+    cap = 56 * 1024 * 1024  # the preset chunk of 8 frames: plain 49,381,800 B, corrected 63,813,381 B (S2.3)
     tight_plain = _request(rsm_r2_project, "mem-plain-tight", None, max_chunk_bytes=cap)
     _require_rsm_v2_memory_plan(tight_plain)
     tight_on = _request(rsm_r2_project, "mem-on-tight",
@@ -168,3 +170,96 @@ def test_the_corrections_are_charged_in_the_memory_plan(rsm_r2_project):
     with pytest.raises(RSMOperationRefused) as refused:  # the run's memory plan, before any decode
         _require_rsm_v2_memory_plan(tight_on)
     assert refused.value.code == "Q_MEMORY_LIMIT_EXCEEDED"
+
+
+@pytest.mark.slow
+def test_banded_polarization_weights_are_bit_identical_to_one_whole_detector_call(rsm_r2_project, monkeypatch):
+    """S2.3: the polarization is computed in bands of rows, each through ``pixel_q``'s ``rows`` (xrayutilities'
+    own per-call roi, the crop's beam centre unchanged), so every weight equals the unbanded formula's (C4's:
+    the whole crop's q, ``polarization_weight``, ``frame_weights``) bit for bit. A non-integer beam centre (an
+    integer one would pass by any shifting), crops with an offset and with negative ends, and a chunk whose
+    poses repeat."""
+    from xrd_tools.analysis import rsm_operation
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_effective_pixel_q_map
+    from xrd_tools.corrections.frame_preparation import frame_weights, polarization_weight
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+    flat = Path(rsm_r2_project) / "s23-flat.npy"
+    np.save(flat, 1.0 + 0.01 * np.arange(195 * 487, dtype=np.float64).reshape(195, 487) / (195 * 487))
+    request = _request(rsm_r2_project, "band", RSMFrameCorrections(solid_angle=True, polarization_factor=0.99,
+                                                                   flat_path=str(flat)))
+    effective = request.plan.effective_geometry
+    state = rsm_operation._rsm_correction_state(request.plan, effective.detector_header,
+                                                effective.diffractometer_projection)
+    mapper = rsm_effective_pixel_q_map(effective)
+    mapper = replace(mapper, header=replace(mapper.header, cch1=mapper.header.cch1 + 0.37,
+                                            cch2=mapper.header.cch2 + 0.61))
+    angles = tuple(np.zeros(3) for _ in range(4)) + (np.array([0.0, 2.5, 0.0]), np.array([20.0, 20.0, 20.0]))
+    monkeypatch.setattr(rsm_operation, "_RSM_WEIGHT_BAND_PIXELS", 1000)  # two or three rows a band
+    with xu_runtime_session(effective.runtime_requirements) as session:
+        xu_module, _numpy = session.active_modules()
+        wavelength = float(xu_module.en2lam(13000.007))
+        for roi in (None, (5, 190, 7, 480), (0, -1, 0, -1)):
+            banded = rsm_operation._rsm_chunk_weights(state, mapper, session, angles, 13000.007, roi)
+            r0, r1, c0, c1 = roi if roi is not None else (0, 195, 0, 487)
+            r1, c1 = 195 + r1 if r1 < 0 else r1, 487 + c1 if c1 < 0 else c1
+            whole = []
+            for nu, delta in zip(angles[4], angles[5]):
+                lab = tuple(np.zeros(1) for _ in range(4)) + (np.array([nu]), np.array([delta]))
+                qx, qy, qz = mapper.pixel_q(lab, 13000.007, UB=np.eye(3), roi=roi, runtime_session=session)
+                polarization = polarization_weight(np.asarray(qx)[0], np.asarray(qy)[0], np.asarray(qz)[0],
+                                                   factor=0.99, wavelength_A=wavelength, beam=state.axes[0],
+                                                   vertical=state.axes[1])
+                whole.append(frame_weights(state.solid[r0:r1, c0:c1], polarization=polarization,
+                                           flat=state.flat[r0:r1, c0:c1]))
+            assert banded.shape == (3, r1 - r0, c1 - c0) and not banded.flags.writeable, roi
+            assert banded.tobytes() == np.stack(whole).tobytes(), roi
+            assert banded[0].tobytes() == banded[2].tobytes()  # a repeated pose, computed once
+
+
+@pytest.mark.slow
+def test_weights_without_polarization_are_one_array_for_every_pose(rsm_r2_project):
+    """S2.3: the solid angle and the flat do not depend on the detector pose, so a chunk at several poses takes
+    one detector array (the gridder broadcasts it), not one copy per frame."""
+    from xrd_tools.analysis import rsm_operation
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_effective_pixel_q_map
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+    from xrd_tools.rsm.gridding import RSMGridChunkLease, StreamingGridder
+    request = _request(rsm_r2_project, "nopol", RSMFrameCorrections(solid_angle=True))
+    effective = request.plan.effective_geometry
+    header = effective.detector_header
+    state = rsm_operation._rsm_correction_state(request.plan, header, effective.diffractometer_projection)
+    mapper = rsm_effective_pixel_q_map(effective)
+    angles = tuple(np.zeros(2) for _ in range(4)) + (np.array([0.0, 2.5]), np.array([20.0, 30.0]))
+    with xu_runtime_session(effective.runtime_requirements) as session:
+        weights = rsm_operation._rsm_chunk_weights(state, mapper, session, angles, 13000.007, None)
+        assert weights.shape == (195, 487) and not weights.flags.writeable and weights.flags.c_contiguous
+        assert weights.tobytes() == state.solid.tobytes() and weights is not state.solid
+        gridder = StreamingGridder(mapper, (4, 4, 4), runtime_session=session,
+                                   coordinate_frame=request.plan.coordinate_frame)
+        gridder.set_bounds((-8.0, 8.0), (-8.0, 8.0), (-8.0, 8.0))
+        frames = np.ones((2, int(header.Nch1), int(header.Nch2)))
+        lease = RSMGridChunkLease.from_arrays(frames.copy(), frames.copy(), 2)
+        gridder.add_leased(lease, angles, 13000.007, UB=np.eye(3), weight=weights)
+        assert gridder.n_frames_processed == 2
+
+
+def test_the_default_corrections_charge_one_band_not_the_detector_at_eiger_size():
+    """S2.3: at an Eiger-4M-size detector (2167 x 2070) the default corrections (solid angle, polarization 0.99)
+    charge the resident solid angle and mask, one weight array and ONE band of the polarization's working set
+    (``_RSM_WEIGHT_BAND_PIXELS``), not the detector: 97,122,330 B for one frame, where S2.2's charge was
+    435,111,930 B (``logs/s23-eiger-charge-*.log``). Measured (``logs/s23-weights-peak.log``): the banded
+    weights' traced peak 54,962,644 B, with the resident solid angle 35,885,520 B. The plain one-frame chunk alone
+    is 296,055,540 B there, above the preset's 256 MiB cap: an Eiger-4M RSM needs Max chunk MiB raised whatever
+    the corrections."""
+    from types import SimpleNamespace
+    from xrd_tools.analysis.rsm_operation import _RSM_WEIGHT_BAND_PIXELS, _rsm_v2_correction_bytes
+    shape = (2167, 2070)
+    pixels = shape[0] * shape[1]
+    member = SimpleNamespace(detector_shape=shape, cropped_shape=shape)
+    default = RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
+    plan = SimpleNamespace(corrections=SimpleNamespace(corrections=default, dark_receipt=None, flat_receipt=None))
+    one = _rsm_v2_correction_bytes(plan, 1, member)
+    resident_and_weights = 9 * pixels + 8 * pixels  # the mask and solid angle, one weight array
+    assert one - resident_and_weights <= 80 * _RSM_WEIGHT_BAND_PIXELS
+    assert one <= 100_000_000
+    assert one >= 54_962_644 + 35_885_520  # the measured peak, with the resident solid angle

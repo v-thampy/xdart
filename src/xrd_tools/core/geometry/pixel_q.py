@@ -253,6 +253,7 @@ class PixelQMap:
         roi: tuple[int, int, int, int] | None = None,
         image_shape: tuple[int, ...] | None = None,
         runtime_session: object | None = None,
+        rows: tuple[int, int] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute per-pixel ``(qx, qy, qz)`` arrays for a frame stack.
 
@@ -279,11 +280,17 @@ class PixelQMap:
         runtime_session : XuRuntimeSession, optional
             Exact already-active shared XU owner.  When omitted, this call
             creates and restores its own one-shot owner as before.
+        rows : (start, stop), optional
+            Only these rows of the (``roi``-cropped) detector, through
+            xrayutilities' own per-call ``roi`` with the header's beam centre
+            unchanged, so each pixel's q is bit-identical to the whole call's.
+            A caller bounds its memory with bands (AUD-9 stage 2b S2.3).
 
         Returns
         -------
         qx, qy, qz : ndarray
-            Each shaped ``(N_frame, Nch1, Nch2)``.
+            Each shaped ``(N_frame, Nch1, Nch2)``; ``(N_frame, stop - start,
+            Nch2)`` with ``rows``.
         """
         # NOTE: ``xrayutilities`` is imported lazily inside
         # ``DiffractometerConfig.make_hxrd``; we don't import it here so
@@ -299,6 +306,20 @@ class PixelQMap:
                 f"Nch2={header.Nch2}); pass image_shape= or fill in "
                 f"DetectorHeader.Nch1/Nch2 explicitly."
             )
+        area_kwargs = dict(self.diff_config.ang2q_kwargs)
+        band_rows = int(header.Nch1)
+        if rows is not None:
+            start, stop = rows
+            if (
+                type(start) is not int
+                or type(stop) is not int
+                or not 0 <= start < stop <= int(header.Nch1)
+                or "roi" in area_kwargs
+                or "Nav" in area_kwargs  # a binned detector's roi counts binned rows
+            ):
+                raise ValueError("pixel_q rows must be one band of the detector's rows")
+            area_kwargs["roi"] = [start, stop, 0, int(header.Nch2)]
+            band_rows = stop - start
 
         from xrd_tools.core.geometry.xu_runtime import (
             XuRuntimeSession,
@@ -336,7 +357,7 @@ class PixelQMap:
             qx, qy, qz = hxrd.Ang2Q.area(
                 *angles,
                 UB=matrix,
-                **self.diff_config.ang2q_kwargs,
+                **area_kwargs,
             )
             require_active_xu_runtime_session(active_session)
             if not angles:
@@ -344,7 +365,7 @@ class PixelQMap:
                     "pixel_q requires at least one per-frame angle array"
                 )
             frame_count = len(np.asarray(angles[0]))
-            expected = (frame_count, int(header.Nch1), int(header.Nch2))
+            expected = (frame_count, band_rows, int(header.Nch2))
             values: list[np.ndarray] = []
             for value in (qx, qy, qz):
                 array = np.asarray(value)

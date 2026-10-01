@@ -3293,11 +3293,14 @@ def _rsm_v2_chunk_owned_bytes(
 def _rsm_v2_correction_bytes(plan, frame_count: int, member) -> int:
     """A plan's per-frame corrections, charged with each science chunk (AUD-9 stage 2b S2).
 
-    Measured 2026-10-01 with tracemalloc at Pilatus 100K, every correction on (``logs/s2-2-weights-peak.log``):
-    72.7 B per detector pixel at one detector pose (the polarization's lab-frame q and terms, the weights), and
-    8 B per cropped pixel for each further pose. Charged: 80 B per pixel for the polarization's working set (9 B
-    for Int's threshold alone: a float64 frame and its mask), 8 B per cropped pixel per frame for the weights,
-    and the run's decoded mask, dark, flat and solid angle. None: 0, the charge unchanged."""
+    Measured 2026-10-01 with tracemalloc, every correction on: 72.7 B per detector pixel at Pilatus 100K, one
+    pose (S2.2, ``logs/s2-2-weights-peak.log``: the polarization's lab-frame q and terms over the whole crop, and
+    the weights). S2.3 bands the polarization (``_rsm_weight_band_rows``), so its working set is one band:
+    charged 80 B per band pixel, or Int's threshold's 9 B per detector pixel (a float64 frame and its mask)
+    when larger (they run at different moments). Also charged: one weight array of 8 B per cropped pixel (one
+    per frame when the polarization follows the pose), and the run's decoded mask, dark, flat and solid angle.
+    S2.3 measured (``logs/s23-weights-peak.log``): Pilatus 100K 80.6 B/px at one pose (one band covers that
+    crop); a 2167 x 2070 detector 12.3 B/px with its weight array. None: 0, the charge unchanged."""
     bound = plan.corrections
     if bound is None:
         return 0
@@ -3306,9 +3309,15 @@ def _rsm_v2_correction_bytes(plan, frame_count: int, member) -> int:
     cropped = math.prod(member.cropped_shape)
     resident = full * (1 + 8 * ((bound.dark_receipt is not None) + (bound.flat_receipt is not None)
                                 + int(value.solid_angle)))
-    working = 80 * full if value.polarization_factor is not None else 9 * full if value.threshold is not None else 0
-    weighted = value.solid_angle or value.polarization_factor is not None or bound.flat_receipt is not None
-    return resident + working + (8 * cropped * frame_count if weighted else 0)
+    polarized = value.polarization_factor is not None
+    # S2.3: the polarization's working set is one band of rows (``_rsm_weight_band_rows``), not the detector;
+    # Int's threshold works on whole frames at another moment, so the larger of the two is charged
+    rows, columns = member.cropped_shape
+    band = min(int(rows), _rsm_weight_band_rows(columns)) * int(columns)
+    working = max(80 * band if polarized else 0, 9 * full if value.threshold is not None else 0)
+    weighted = value.solid_angle or polarized or bound.flat_receipt is not None
+    # the weights: one detector array, or one per frame when the polarization follows the pose
+    return resident + working + (8 * cropped * (frame_count if polarized else 1) if weighted else 0)
 
 
 def _load_rsm_v2_raw_chunk(
@@ -3498,39 +3507,75 @@ def _rsm_correction_state(plan, header, diffractometer) -> _RSMCorrectionState |
     return _RSMCorrectionState(bound, invalid, images["dark"], images["flat"], solid, axes)
 
 
+#: The rows of one band of the polarization's lab-frame q and terms, in detector pixels: its working set (about
+#: 64 B a pixel, measured) is bounded by this whatever the detector, where an unbanded Eiger 4M needed 359 MB
+#: (AUD-9 stage 2b S2.3).
+_RSM_WEIGHT_BAND_PIXELS = 1 << 18
+
+
+def _rsm_weight_band_rows(cropped_columns: int) -> int:
+    return max(1, _RSM_WEIGHT_BAND_PIXELS // max(1, int(cropped_columns)))
+
+
 def _rsm_chunk_weights(state, mapper, session, angles, energy, roi):
     """One chunk's normalization weights (solid angle × polarization × flat), cropped to the ROI: one detector
-    array for a chunk at one detector pose, one per frame otherwise; None: no weight (1, as before)."""
+    array for every frame when they do not depend on the detector pose (no polarization, or one pose), one per
+    frame otherwise; None: no weight (1, as before).
+
+    The polarization is computed in bands of rows (``_rsm_weight_band_rows``), each through ``pixel_q``'s
+    ``rows`` with the crop's own beam centre, so every weight is bit-identical to one whole-detector call;
+    ``frame_weights``' order (solid × polarization, then × flat) is kept band by band, and each distinct pose
+    is computed once."""
     from xrd_tools.corrections.frame_preparation import frame_weights, polarization_weight
     if state is None or (state.solid is None and state.axes is None and state.flat is None):
         return None
-    r0, r1, c0, c1 = roi if roi is not None else (0, int(mapper.header.Nch1), 0, int(mapper.header.Nch2))
+    rows, columns = int(mapper.header.Nch1), int(mapper.header.Nch2)
+    r0, r1, c0, c1 = roi if roi is not None else (0, rows, 0, columns)
+    r1, c1 = rows + r1 if r1 < 0 else r1, columns + c1 if c1 < 0 else c1  # as DetectorHeader.with_roi
     shape = (r1 - r0, c1 - c0)
-    base = np.ones(shape) if state.solid is None else state.solid[r0:r1, c0:c1]
+    base = None if state.solid is None else state.solid[r0:r1, c0:c1]
     flat = None if state.flat is None else state.flat[r0:r1, c0:c1]
+    if state.axes is None:  # no polarization: the same weights at every pose
+        weights = frame_weights(np.ones(shape) if base is None else base, flat=flat)
+        if weights is base or weights.base is not None or weights is state.solid:
+            weights = np.array(weights, copy=True)
+        weights = np.ascontiguousarray(weights, dtype=np.float64)
+        weights.setflags(write=False)
+        return weights
     nu, delta = (np.asarray(angles[index], dtype=np.float64) for index in (4, 5))
-    poses = sorted({(float(a), float(b)) for a, b in zip(nu, delta)})
-    weights_by_pose = {}
-    for pose in poses:
-        polarization = None
-        if state.axes is not None:
-            # the detector pose alone, in the lab frame (the sample circles at zero, an identity UB): the
-            # elastic scattered direction of each pixel
-            lab = tuple(np.zeros(1) for _ in range(4)) + (np.array([pose[0]]), np.array([pose[1]]))
-            qx, qy, qz = mapper.pixel_q(lab, float(energy), UB=np.eye(3), roi=roi, runtime_session=session)
-            xu_module, _numpy = session.active_modules()
+    poses = [(float(a), float(b)) for a, b in zip(nu, delta)]
+    weights = np.empty(shape if len(set(poses)) == 1 else (len(poses), *shape), dtype=np.float64)
+    xu_module, _numpy = session.active_modules()
+    wavelength = float(xu_module.en2lam(float(energy)))
+    factor = state.bound.corrections.polarization_factor
+    band = _rsm_weight_band_rows(shape[1])
+    first = {}
+    for index, pose in enumerate(poses):
+        target = weights if weights.ndim == 2 else weights[index]
+        if pose in first:
+            if weights.ndim == 3:
+                target[...] = weights[first[pose]]
+            continue
+        first[pose] = index
+        # the detector pose alone, in the lab frame (the sample circles at zero, an identity UB): the elastic
+        # scattered direction of each pixel
+        lab = tuple(np.zeros(1) for _ in range(4)) + (np.array([pose[0]]), np.array([pose[1]]))
+        for start in range(0, shape[0], band):
+            stop = min(start + band, shape[0])
+            qx, qy, qz = mapper.pixel_q(lab, float(energy), UB=np.eye(3), roi=roi, runtime_session=session,
+                                        rows=(start, stop))
             polarization = polarization_weight(
-                np.asarray(qx)[0], np.asarray(qy)[0], np.asarray(qz)[0],
-                factor=state.bound.corrections.polarization_factor,
-                wavelength_A=float(xu_module.en2lam(float(energy))), beam=state.axes[0], vertical=state.axes[1])
-        weights_by_pose[pose] = frame_weights(base, polarization=polarization, flat=flat)
-    if len(poses) == 1:
-        weights = np.ascontiguousarray(weights_by_pose[poses[0]], dtype=np.float64)
-    else:
-        weights = np.ascontiguousarray(np.stack([weights_by_pose[(float(a), float(b))]
-                                                 for a, b in zip(nu, delta)]), dtype=np.float64)
-    if weights is base or weights.base is not None or weights is state.solid:
-        weights = np.array(weights, copy=True)
+                np.asarray(qx)[0], np.asarray(qy)[0], np.asarray(qz)[0], factor=factor,
+                wavelength_A=wavelength, beam=state.axes[0], vertical=state.axes[1])
+            qx = qy = qz = None
+            block = target[start:stop]
+            if base is None:
+                block[...] = polarization  # frame_weights' 1 × polarization
+            else:
+                np.multiply(base[start:stop], polarization, out=block)
+            if flat is not None:
+                np.multiply(block, flat[start:stop], out=block)
+            polarization = None
     weights.setflags(write=False)
     return weights
 
