@@ -67,6 +67,28 @@ def test_settings_round_trip_every_input(qapp, tmp_path, backend, manual):
         _close(restored, qapp)
 
 
+def test_a_blank_save_path_stays_blank_when_its_file_is_loaded_again(qapp, tmp_path):
+    """G13 unit 3a (found in G12): the fields apply in the page's order, as RSM's do, not in the file's sorted
+    order, in which the Save Path ("output_path") came before the Project ("project_root"), whose change fills a
+    blank Save Path with <Project>/xdart_processed_data. The document is unchanged: it round-trips byte for byte."""
+    page = StitchPage(empty_host_services(_Status()))
+    restored = StitchPage(empty_host_services(_Status()))
+    try:
+        page.set_field("project_root", str(tmp_path))
+        assert page._value("output_path") == str(tmp_path / "xdart_processed_data")  # a Project fills a blank one
+        page.set_field("output_path", "")
+        text = dump_settings(page.settings())
+        assert '"output_path": ""' in text
+        restored.apply_settings(load_settings(text))
+        assert (restored._value("project_root"), restored._value("output_path")) == (str(tmp_path), "")
+        assert dump_settings(restored.settings()) == text
+        page.apply_settings(load_settings(text))  # the page's own file, loaded again
+        assert page._value("output_path") == ""
+    finally:
+        _close(page, qapp)
+        _close(restored, qapp)
+
+
 def _three_nu_rows():
     return tuple(type("Frame", (), {"complete": True, "motors": {"del": 5., "nu": nu}})()
                  for nu in (-10., 3., 16.))

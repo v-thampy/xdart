@@ -61,9 +61,10 @@ def apply_page_settings(page, document: Any) -> None:
         if key in fields:
             page.set_field(key, fields[key])
     restore_sources(page, document)
-    for key, value in fields.items():
-        if key not in _FIRST and key not in _THRESHOLD and key != "normalization":
-            page.set_field(key, value)
+    for key in page._fields:  # the page's own order, as RSM's: a document's (sorted in its file) is no order of the
+        # page's, and in it a blank Save Path came before the Project that fills it
+        if key in fields and key not in _FIRST and key not in _THRESHOLD and key != "normalization":
+            page.set_field(key, fields[key])
     if "normalization" in fields:  # last: the saved choice wins over a monitor's implied one
         page.set_field("normalization", fields["normalization"])
     saved = document.get("fields", {})
