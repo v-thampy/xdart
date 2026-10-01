@@ -3015,7 +3015,16 @@ def _effective_geometry_provenance(
         "runtime_requirements": list(
             xu_runtime_requirements_projection(effective.runtime_requirements)
         ),
-        **({} if effective.source == "asset" else {"source": effective.source}),
+        **({} if effective.source == "asset" else {
+            "source": effective.source,
+            "refinement": {
+                "applied": bool(effective.refinement),
+                "angle_offsets_deg": list(effective.angle_offsets),
+                "mount_deg": dict(zip(("detrot", "tilt", "tiltazimuth"), effective.area_mount)),
+                "energy_offset_eV": effective.energy_offset_eV,
+                "calibration_energy_eV": effective.calibration_energy_eV,
+            },
+        }),
         "fingerprint": effective.fingerprint,
     }
 
@@ -3846,7 +3855,8 @@ def _rsm_chunk_weights(state, mapper, session, angles, energy, roi):
     poses = [(float(a), float(b)) for a, b in zip(nu, delta)]
     weights = np.empty(shape if len(set(poses)) == 1 else (len(poses), *shape), dtype=np.float64)
     xu_module, _numpy = session.active_modules()
-    wavelength = float(xu_module.en2lam(float(energy)))
+    # the energy q is mapped with: a refined calibration's offset included (C7b), so the scatter is elastic
+    wavelength = float(xu_module.en2lam(float(mapper.mapped_energy(energy))))
     factor = state.bound.corrections.polarization_factor
     band = _rsm_weight_band_rows(shape[1])
     first = {}
@@ -4207,7 +4217,8 @@ def _resolve_exact_rsm_q_bounds_active(
         )
     session.require_active()
     try:
-        hxrd = mapper.diff_config.make_hxrd(energy)
+        # a refined calibration's energy offset, mount and zero offsets (AUD-9 stage 2b C7b), as pixel_q takes them
+        hxrd = mapper.diff_config.make_hxrd(mapper.mapped_energy(energy))
     except (RSMOperationRefused, XuRuntimeUnsupported):
         raise
     except Exception:
@@ -4224,6 +4235,7 @@ def _resolve_exact_rsm_q_bounds_active(
             distance=float(header.distance),
             Nch1=int(header.Nch1),
             Nch2=int(header.Nch2),
+            **mapper.init_area_extra(),
         )
     except (RSMOperationRefused, XuRuntimeUnsupported):
         raise
@@ -4231,6 +4243,7 @@ def _resolve_exact_rsm_q_bounds_active(
         raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID") from None
     lows = np.full(3, np.inf, dtype=np.float64)
     highs = np.full(3, -np.inf, dtype=np.float64)
+    values = mapper.area_angles(values)
     for start in range(0, frame_count, chunk_size):
         if cancel_token is not None and cancel_token.is_set():
             raise RSMOperationRefused("CANCELLED")

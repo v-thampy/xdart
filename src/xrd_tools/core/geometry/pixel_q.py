@@ -243,6 +243,34 @@ class PixelQMap:
     #: ``make_hxrd`` + ``init_area_detrot``/``init_area_tiltazimuth``.
     diff_config: "Diffractometer | DiffractometerConfig"
     header: DetectorHeader
+    #: A refined calibration's detector mount (AUD-9 stage 2b C7b): xrayutilities' ``detrot``, ``tilt`` and
+    #: ``tiltazimuth`` (degrees), passed to ``init_area`` only when not all zero.
+    area_mount: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    #: One zero offset per circle, in the angles' order (sample circles, then detector circles): each angle is
+    #: taken minus its offset, as Stitch's xrayutilities path takes its arm's. Empty: none.
+    angle_offsets: tuple[float, ...] = ()
+    #: Added to the energy a caller passes (a refined calibration's energy offset, eV).
+    energy_offset_eV: float = 0.0
+
+    def init_area_extra(self) -> dict[str, float]:
+        """``init_area``'s mount keywords: none for an unmounted detector, so its call is unchanged."""
+        if not any(self.area_mount):
+            return {}
+        detrot, tilt, azimuth = self.area_mount
+        return {"detrot": float(detrot), "tilt": float(tilt), "tiltazimuth": float(azimuth)}
+
+    def area_angles(self, angles):
+        """The angles ``Ang2Q.area`` takes: each minus its circle's zero offset (unchanged without offsets)."""
+        if not any(self.angle_offsets):
+            return angles
+        if len(angles) != len(self.angle_offsets):
+            raise ValueError("pixel_q angle offsets must name every circle")
+        return tuple(np.asarray(angle, dtype=np.float64) - float(offset) if offset else angle
+                     for angle, offset in zip(angles, self.angle_offsets))
+
+    def mapped_energy(self, energy: float) -> float:
+        """The energy mapped: the caller's plus the calibration's energy offset (unchanged without one)."""
+        return energy if not self.energy_offset_eV else float(energy) + float(self.energy_offset_eV)
 
     def pixel_q(
         self,
@@ -333,7 +361,7 @@ class PixelQMap:
         # NTHREADS=1/restore lifecycle.
         def map_active(active_session):
             require_active_xu_runtime_session(active_session)
-            hxrd = self.diff_config.make_hxrd(energy)
+            hxrd = self.diff_config.make_hxrd(self.mapped_energy(energy))
             require_active_xu_runtime_session(active_session)
             hxrd.Ang2Q.init_area(
                 self.diff_config.init_area_detrot,
@@ -345,6 +373,7 @@ class PixelQMap:
                 distance=float(header.distance),
                 Nch1=int(header.Nch1),
                 Nch2=int(header.Nch2),
+                **self.init_area_extra(),
             )
             require_active_xu_runtime_session(active_session)
             matrix = (
@@ -355,7 +384,7 @@ class PixelQMap:
             if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
                 raise ValueError("pixel_q UB must be one finite 3x3 matrix")
             qx, qy, qz = hxrd.Ang2Q.area(
-                *angles,
+                *self.area_angles(angles),
                 UB=matrix,
                 **area_kwargs,
             )

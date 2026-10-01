@@ -621,7 +621,7 @@ class RSMToolFormV2:
             project,
             # a calibration (AUD-9 stage 2b C7b) is tagged; the asset's locator stays as it was
             (self.geometry_asset.locator if type(self.geometry_asset) is RSMGeometryAssetInput
-             else ("calibration", self.geometry_asset.locator)),
+             else ("calibration", self.geometry_asset.locator, self.geometry_asset.refinement)),
             tuple(item.fingerprint for item in self.members),
             self.conditioning._canonical_value(),
             self.normalization._canonical_value(),
@@ -1542,6 +1542,9 @@ class RSMToolPreflightSummaryV2:
     normalization_divisor_range: tuple[float, float]
     mask_intent: str
     holds: tuple[str, ...]
+    #: A calibration-sourced geometry (AUD-9 stage 2b C7b): (refinement applied, the energy offset in eV, the
+    #: calibration's recorded energy in eV). None for the canonical asset.
+    calibration: tuple[bool, float, float] | None = None
     fingerprint: str = field(init=False)
     _claim: InitVar[object] = None
 
@@ -1652,6 +1655,7 @@ class RSMToolPreflightSummaryV2:
             self.normalization_divisor_range,
             self.mask_intent,
             self.holds,
+            *(() if self.calibration is None else (("calibration", self.calibration),)),
         )
         object.__setattr__(
             self,
@@ -1768,7 +1772,8 @@ def prepare_rsm_tool_v2(
     # makes the folder, as Stitch's does (AUD-9 stage 2); Preview creates nothing.
     try:
         if type(form.geometry_asset) is RSMCalibrationGeometryInput:
-            asset = capture_rsm_calibration_geometry(form.geometry_asset.locator, project_root=project)
+            asset = capture_rsm_calibration_geometry(form.geometry_asset.locator, project_root=project,
+                                                     refinement=form.geometry_asset.refinement)
             header = lower_rsm_effective_geometry(asset).detector_header  # the raw frame's shape
             expected_shape = (header.Nch1, header.Nch2)
         else:
@@ -1988,11 +1993,30 @@ def prepare_rsm_tool_v2(
             else "derived during Run"
         ),
         tuple(holds_value),
-        _PREFLIGHT_V2_FACTORY,
+        calibration=(
+            None if request.preflight.effective_geometry.source != "calibration"
+            else (request.preflight.effective_geometry.refinement,
+                  request.preflight.effective_geometry.energy_offset_eV,
+                  request.preflight.effective_geometry.calibration_energy_eV)),
+        _claim=_PREFLIGHT_V2_FACTORY,
     )
     return RSMToolPreflightV2(
         form, request, summary, rsm_output_current(request), _PREFLIGHT_V2_FACTORY
     )
+
+
+def _rsm_member_energy_lines(recorded: float, calibration) -> tuple[str, ...]:
+    """A member's energy: with a calibration's refinement, the recorded energy, the offset and the energy used,
+    and a warning when the scan was recorded more than 2 % from the calibration's energy: a constant offset is
+    exact at the calibration's energy, and a monochromator angle error grows roughly as E² away from it."""
+    if calibration is None or not calibration[0]:
+        return (f"  energy: {recorded:.12g} eV",)
+    _refined, offset, calibration_energy = calibration
+    lines = [f"  energy: recorded {recorded:.12g} eV, offset {offset:+.6g} eV, used {recorded + offset:.12g} eV"]
+    if calibration_energy and abs(recorded - calibration_energy) > 0.02 * calibration_energy:
+        lines.append(f"  ⚠ recorded {100 * abs(recorded - calibration_energy) / calibration_energy:.1f} % from the "
+                     f"calibration's {calibration_energy:.12g} eV: the energy offset is exact only near it")
+    return tuple(lines)
 
 
 def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]:
@@ -2039,6 +2063,9 @@ def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]
             f"Ordered members: {len(summary.members)} · total frames "
             f"{summary.total_selected_frames}"
         ),
+        *(() if summary.calibration is None else (
+            "Geometry: the calibration on the Calibration row, refinement "
+            + ("on (its del/nu offsets, mount and energy offset)" if summary.calibration[0] else "off"),)),
         f"Asset raw: {summary.geometry_asset_raw_sha256}",
         f"Asset semantic: {summary.geometry_asset_semantic_fingerprint}",
         f"Asset receipt: {summary.geometry_asset_receipt_fingerprint}",
@@ -2096,7 +2123,7 @@ def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]
                 f"  table: {member.table_fingerprint}",
                 f"  member preflight: {member.member_preflight_fingerprint}",
                 f"  geometry binding: {member.geometry_binding_fingerprint}",
-                f"  energy: {member.energy_eV:.12g} eV",
+                *_rsm_member_energy_lines(member.energy_eV, summary.calibration),
                 f"  xrayutilities matrix: {coordinate_matrix}",
                 f"  coordinate bounds: {bounds}",
                 (

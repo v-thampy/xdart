@@ -82,9 +82,9 @@ def test_the_beam_pixel_maps_back_to_the_raw_frame_for_every_camera(camera):
             assert _raw_frame_pixel(orientation, raw_shape, (i, j)) == (turned_rows[i, j], turned_columns[i, j])
 
 
-def _row_e(tmp_path, rotation, cch):
+def _row_e(tmp_path, rotation, cch, refinement=True):
     pyfai = _write_partner(tmp_path, rotation=rotation, cch=cch)
-    receipt = capture_rsm_calibration_geometry(pyfai.name, project_root=tmp_path)
+    receipt = capture_rsm_calibration_geometry(pyfai.name, project_root=tmp_path, refinement=refinement)
     effective = lower_rsm_effective_geometry(receipt)
     assert effective.source == "calibration"
     mapper = rsm_effective_pixel_q_map(effective)
@@ -99,8 +99,9 @@ def _row_e(tmp_path, rotation, cch):
         for delta, nu in ANGLES:
             with stitch.frame(nu=nu, del_=delta) as lease:
                 reference = np.stack(lease._values)
-            raw = mapper.pixel_q([np.zeros(1)] * 4 + [np.array([nu - offsets["nu"]]),
-                                                      np.array([delta - offsets["del"]])],
+            # with the refinement the map takes the motors' angles and subtracts the offsets itself
+            shift = (0.0, 0.0) if refinement else (offsets["nu"], offsets["del"])
+            raw = mapper.pixel_q([np.zeros(1)] * 4 + [np.array([nu - shift[0]]), np.array([delta - shift[1]])],
                                  ENERGY, runtime_session=session)
             turned = np.stack([orientation.apply(component[0]) for component in raw])
             assert turned.shape == reference.shape
@@ -110,16 +111,17 @@ def _row_e(tmp_path, rotation, cch):
     return worst
 
 
+@pytest.mark.parametrize("refinement", [True, False])
 @pytest.mark.parametrize("rotation", [0, 90, 180, 270])
 @pytest.mark.parametrize("cch", [(4.0, 6.0), (3.25, 7.5)])
-def test_row_e_rsm_q_equals_stitch_q_at_the_same_physical_pixel(tmp_path, rotation, cch):
+def test_row_e_rsm_q_equals_stitch_q_at_the_same_physical_pixel(tmp_path, rotation, cch, refinement):
     """Row E (design §3.3): RSM's raw-frame q equals Stitch's xrayutilities backend's at the same physical pixel,
     within 1e-12 Å⁻¹. Measured: bit for bit at whole-number beam pixels for the 0° and 90° turns; at 180° and 270°
     xrayutilities' arithmetic along a reversed camera direction differs in the last place (the design expected
-    bit-for-bit there too). Unit 1 (no refinement): the angles carry the calibration's offsets explicitly; unit 2
-    applies them itself."""
-    worst = _row_e(tmp_path, rotation, cch)
-    print("row E", rotation, cch, "max |dq|", worst)
+    bit-for-bit there too). With the refinement (on by default) the map applies the calibration's del/nu offsets
+    itself; with it off the motors' angles carry them explicitly, which is the plain geometry."""
+    worst = _row_e(tmp_path, rotation, cch, refinement)
+    print("row E", rotation, cch, refinement, "max |dq|", worst)
     assert worst <= 1e-12
 
 
@@ -177,7 +179,14 @@ def test_row_b_a_calibration_encoding_the_canonical_geometry_agrees_with_the_ref
     payloads = []
     try:
         for form in (canonical_form, calibration_form):
-            request = prepare_rsm_tool_v2(form).request
+            prepared = prepare_rsm_tool_v2(form)
+            request = prepared.request
+            if form is calibration_form:  # the Preview names the source and the energy it maps with
+                from xdart.gui.tools.rsm_values import rsm_preflight_summary_lines
+                lines = rsm_preflight_summary_lines(prepared.summary)
+                assert any(line.startswith("Geometry: the calibration on the Calibration row, refinement on")
+                           for line in lines)
+                assert "  energy: recorded 13000.007 eV, offset +0 eV, used 13000.007 eV" in lines
             result = run_rsm_operation_v2(request)
             assert result.terminal.disposition is ModuleDisposition.COMMITTED
             payloads.append(result.payload)
@@ -198,3 +207,128 @@ def test_row_b_a_calibration_encoding_the_canonical_geometry_agrees_with_the_ref
           "fingerprint", calibrated.result_fingerprint)
     assert int(differ.sum()) == 0
     assert calibrated.result_fingerprint == canonical.result_fingerprint  # measured: bit for bit
+
+
+# The refinement on a version-3 transfer (a real pyFAI extended arm, tilted mount and offsets), on every one of
+# the 8 cameras (a turn and a mirror), with an energy offset: RSM's raw-frame q equals Stitch's own xrayutilities
+# path at the same physical pixel. The calibrant's sample offset is never taken by RSM, so the comparison zeroes
+# it in the asset (Stitch would apply it).
+from tests.core.test_xu_extended_arm import _record  # noqa: E402
+from tests.core.test_stacked_arm_extension import ANGLES as ARM_ANGLES  # noqa: E402
+
+ENERGY_OFFSET = 3.0
+
+
+@pytest.fixture(scope="module")
+def v3_asset():
+    from xrd_tools.integrate.xu_transfer import transfer_arm_to_xu
+    asset, _diagnostics = transfer_arm_to_xu(_record(), validation_angles=ARM_ANGLES)
+    return asset
+
+
+def _v3_partner(root: Path, asset, quarter: int, flip: bool) -> tuple[Path, dict]:
+    from xrd_tools.analysis.xu_stitch_calibration import _canonical_bytes, parse_xu_stitch_calibration_bytes
+    value = json.loads(json.dumps(asset))
+    acquisition = value["acquisition"]
+    acquisition["image_rotation_quarter_turns"] = quarter
+    acquisition.pop("image_flip", None)
+    if flip:
+        acquisition["image_flip"] = True
+    acquisition["sampledis_mm"] = [0.0, 0.0, 0.0]
+    acquisition["source_energy_eV"] = acquisition["energy_eV"] - ENERGY_OFFSET
+    raw = _canonical_bytes(value)
+    parse_xu_stitch_calibration_bytes(raw)
+    name = f"arm_{quarter}_{int(flip)}"
+    (root / f"{name}.xu.json").write_bytes(raw)
+    (root / f"{name}.json").write_text("{}")
+    return root / f"{name}.json", value
+
+
+@pytest.mark.parametrize("quarter", [0, 1, 2, 3])
+@pytest.mark.parametrize("flip", [False, True])
+def test_row_e_the_refinement_matches_stitch_on_every_camera(tmp_path, v3_asset, quarter, flip):
+    """Rows D and E: the offsets, the mount (its azimuth carried to the raw camera) and the energy offset apply,
+    and RSM's q then equals Stitch's at the same physical pixel within 1e-12 Å⁻¹, for all 8 cameras."""
+    pyfai, value = _v3_partner(tmp_path, v3_asset, quarter, flip)
+    receipt = capture_rsm_calibration_geometry(pyfai.name, project_root=tmp_path)
+    effective = lower_rsm_effective_geometry(receipt)
+    assert effective.refinement and any(effective.area_mount) and any(effective.angle_offsets)
+    assert effective.energy_offset_eV == pytest.approx(ENERGY_OFFSET, abs=1e-9)
+    mapper = rsm_effective_pixel_q_map(effective)
+    acquisition = value["acquisition"]
+    orientation = ImageOrientation(rotation=90 * quarter, flip_horizontal=flip)
+    recorded = acquisition["source_energy_eV"]  # the scan's recorded energy; used = recorded + offset
+    worst = 0.0
+    with xu_runtime_session() as session:
+        stitch = XuPowderQProvider(resolve_xu_stitch_effective_geometry(receipt.calibration, session),
+                                   acquisition)
+        for delta, nu in ANGLES:
+            with stitch.frame(nu=nu, del_=delta) as lease:
+                reference = np.stack(lease._values)
+            raw = mapper.pixel_q([np.zeros(1)] * 4 + [np.array([nu]), np.array([delta])], recorded,
+                                 runtime_session=session)
+            turned = np.stack([orientation.apply(component[0]) for component in raw])
+            worst = max(worst, float(np.max(np.abs(turned - reference))))
+            # row D: without the refinement the q differs (the mount, offsets and energy offset all apply)
+            plain = rsm_effective_pixel_q_map(lower_rsm_effective_geometry(capture_rsm_calibration_geometry(
+                pyfai.name, project_root=tmp_path, refinement=False)))
+            unrefined = plain.pixel_q([np.zeros(1)] * 4 + [np.array([nu]), np.array([delta])], recorded,
+                                      runtime_session=session)
+            assert float(np.max(np.abs(np.stack(unrefined) - np.stack(raw)))) > 1e-4
+    print("row E v3", quarter, flip, "max |dq|", worst)
+    assert worst <= 1e-12
+
+
+def test_the_energy_offset_scales_q_as_its_energy(tmp_path, v3_asset):
+    """The energy-offset known answer: a scan recorded at E0 maps with E0 + offset, so with the geometry fixed
+    every |q| scales by (E0 + offset) / E0."""
+    from dataclasses import replace
+    pyfai, value = _v3_partner(tmp_path, v3_asset, 0, False)
+    mapper = rsm_effective_pixel_q_map(lower_rsm_effective_geometry(
+        capture_rsm_calibration_geometry(pyfai.name, project_root=tmp_path)))
+    recorded = 13_000.0
+    angles = [np.zeros(1)] * 4 + [np.array([7.0]), np.array([21.0])]
+    with xu_runtime_session() as session:
+        used = np.stack(mapper.pixel_q(angles, recorded, runtime_session=session))
+        explicit = np.stack(replace(mapper, energy_offset_eV=0.0).pixel_q(
+            angles, recorded + mapper.energy_offset_eV, runtime_session=session))
+        base = np.stack(replace(mapper, energy_offset_eV=0.0).pixel_q(angles, recorded, runtime_session=session))
+    assert np.array_equal(used, explicit)
+    ratio = np.linalg.norm(used, axis=0) / np.linalg.norm(base, axis=0)
+    np.testing.assert_allclose(ratio, (recorded + ENERGY_OFFSET) / recorded, rtol=1e-12, atol=0)
+
+
+def test_the_preview_energy_lines_and_the_far_energy_warning():
+    """The Preview carries each scan's recorded energy, the offset and the energy used, and warns when a scan was
+    recorded more than 2 % from the calibration's energy (the maintainer's offset decision; design §3.2)."""
+    from xdart.gui.tools.rsm_values import _rsm_member_energy_lines
+    assert _rsm_member_energy_lines(13_000.0, None) == ("  energy: 13000 eV",)
+    assert _rsm_member_energy_lines(13_000.0, (False, 3.0, 13_000.0)) == ("  energy: 13000 eV",)
+    near = _rsm_member_energy_lines(13_100.0, (True, 3.0, 13_000.0))
+    assert near == ("  energy: recorded 13100 eV, offset +3 eV, used 13103 eV",)
+    far = _rsm_member_energy_lines(8_000.0, (True, 3.0, 13_000.0))
+    assert far[0] == "  energy: recorded 8000 eV, offset +3 eV, used 8003 eV"
+    assert far[1].startswith("  ⚠ recorded 38.5 % from the calibration's 13000 eV")
+
+
+def test_the_polarization_weight_uses_the_energy_q_is_mapped_with(tmp_path, v3_asset):
+    """A refined energy offset maps q at E0 + offset; the polarization weight's wavelength must be that energy's
+    too, or the scatter is not elastic (found by the S3b self-review: the weights took the recorded energy)."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from xrd_tools.analysis.rsm_operation import _rsm_chunk_weights
+    from xrd_tools.corrections.frame_preparation import polarization_axes
+    pyfai, value = _v3_partner(tmp_path, v3_asset, 0, False)
+    effective = lower_rsm_effective_geometry(capture_rsm_calibration_geometry(pyfai.name, project_root=tmp_path))
+    mapper = rsm_effective_pixel_q_map(effective)
+    diffractometer = effective.diffractometer_projection
+    state = SimpleNamespace(
+        bound=SimpleNamespace(corrections=SimpleNamespace(polarization_factor=0.99)), solid=None, flat=None,
+        axes=polarization_axes(diffractometer.r_i, diffractometer.detector_circles[0]))
+    angles = [np.zeros(1)] * 4 + [np.array([7.0]), np.array([21.0])]
+    with xu_runtime_session() as session:
+        refined = _rsm_chunk_weights(state, mapper, session, angles, 13_000.0, (0, -1, 0, -1))
+        explicit = _rsm_chunk_weights(state, replace(mapper, energy_offset_eV=0.0), session, angles,
+                                      13_000.0 + mapper.energy_offset_eV, (0, -1, 0, -1))
+    assert np.array_equal(refined, explicit)

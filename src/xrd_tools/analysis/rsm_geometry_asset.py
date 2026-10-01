@@ -408,10 +408,12 @@ class RSMCalibrationGeometryInput:
     relative: RSM's geometry from the reused calibration (AUD-9 stage 2b C7b)."""
 
     locator: str | Path
+    #: Use the calibration's refinement (offsets, mount, energy offset): on by default, optional.
+    refinement: bool = True
     _claim: InitVar[object] = None
 
     def __post_init__(self, _claim: object) -> None:
-        if _claim is not _INPUT_FACTORY:
+        if _claim is not _INPUT_FACTORY or type(self.refinement) is not bool:
             raise TypeError("RSM calibration input is not factory-owned")
         try:
             shown = os.fspath(self.locator)
@@ -436,10 +438,10 @@ class RSMCalibrationGeometryInput:
         raise TypeError("RSM calibration input is not replaceable")
 
 
-def rsm_calibration_geometry_input(locator: str | Path) -> RSMCalibrationGeometryInput:
+def rsm_calibration_geometry_input(locator: str | Path, *, refinement: bool = True) -> RSMCalibrationGeometryInput:
     """Create one immutable, factory-owned Calibration-row locator request."""
 
-    return RSMCalibrationGeometryInput(locator, _INPUT_FACTORY)
+    return RSMCalibrationGeometryInput(locator, refinement, _INPUT_FACTORY)
 
 
 def _project_path(project_root: str | Path) -> str:
@@ -849,6 +851,15 @@ class RSMEffectiveGeometry:
     #: "asset": the canonical geometry asset; "calibration": a calibration window's xrayutilities partner
     #: (``RSMCalibrationGeometryReceipt``, AUD-9 stage 2b C7b), whose semantic fingerprint is its own.
     source: str = "asset"
+    #: A calibration's refinement, applied (AUD-9 stage 2b C7b; the maintainer: "when the refinement is done it
+    #: should be used, but it should remain optional"): xrayutilities' mount (detrot, tilt, tiltazimuth in the
+    #: raw frame), each circle's zero offset (mu, eta, chi, phi, nu, del) and the energy offset; zeros otherwise.
+    area_mount: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    angle_offsets: tuple[float, ...] = ()
+    energy_offset_eV: float = 0.0
+    refinement: bool = False
+    #: The calibration's recorded energy (its source energy where it refined one), for the Preview's 2 % warning.
+    calibration_energy_eV: float | None = None
     _claim: InitVar[object] = None
 
     def __post_init__(self, _claim: object) -> None:
@@ -1144,6 +1155,9 @@ def rsm_effective_pixel_q_map(effective_geometry: RSMEffectiveGeometry):
     return PixelQMap(
         effective_geometry.diffractometer_projection,
         effective_geometry.detector_header,
+        area_mount=effective_geometry.area_mount,
+        angle_offsets=effective_geometry.angle_offsets,
+        energy_offset_eV=effective_geometry.energy_offset_eV,
     )
 
 
@@ -1163,12 +1177,14 @@ class RSMCalibrationGeometryReceipt:
     raw_sha256: str
     semantic_fingerprint: str
     receipt_fingerprint: str
+    refinement: bool = True
     _claim: InitVar[object] = None
 
     def __post_init__(self, _claim: object) -> None:
         from xrd_tools.analysis.xu_stitch_calibration import XuStitchCalibrationReceipt
         if (
             _claim is not _CALIBRATION_FACTORY
+            or type(self.refinement) is not bool
             or type(self.calibration) is not XuStitchCalibrationReceipt
             or self.project_root != self.calibration.project_root
             or self.byte_count != self.calibration.byte_count
@@ -1196,6 +1212,7 @@ def capture_rsm_calibration_geometry(
     locator: str | Path,
     *,
     project_root: str | Path,
+    refinement: bool = True,
 ) -> RSMCalibrationGeometryReceipt:
     """Capture the calibration on RSM's Calibration row: the pyFAI file's xrayutilities partner
     (``xu_partner_path``), or the partner named directly. Refused (``RSM_CALIBRATION_UNSUPPORTED``): a pyFAI file
@@ -1231,9 +1248,11 @@ def capture_rsm_calibration_geometry(
             "RSM_CALIBRATION_UNSUPPORTED",
             f"{partner.name} is a single 2θ arm (one detector circle held at zero); RSM needs psic's two",
         )
+    if type(refinement) is not bool:
+        raise TypeError("RSM calibration refinement must be an exact bool")
     fingerprint = analysis_canonical_fingerprint(
         "rsm-calibration-geometry-receipt-v1",
-        (calibration.fingerprint, calibration.semantic_fingerprint, calibration.raw_sha256),
+        (calibration.fingerprint, calibration.semantic_fingerprint, calibration.raw_sha256, refinement),
     )
     return RSMCalibrationGeometryReceipt(
         calibration,
@@ -1244,7 +1263,8 @@ def capture_rsm_calibration_geometry(
         calibration.raw_sha256,
         calibration.semantic_fingerprint,
         fingerprint,
-        _CALIBRATION_FACTORY,
+        refinement,
+        _claim=_CALIBRATION_FACTORY,
     )
 
 
@@ -1272,6 +1292,32 @@ def _raw_frame_pixel(orientation, raw_shape: tuple[int, int], point: tuple[float
         origin = float(grid[0, 0])
         raw.append(origin + float(grid[1, 0] - origin) * i + float(grid[0, 1] - origin) * j)
     return raw[0], raw[1]
+
+
+_CAMERA_VECTORS = {"x+": (1.0, 0.0, 0.0), "x-": (-1.0, 0.0, 0.0), "z+": (0.0, 0.0, 1.0), "z-": (0.0, 0.0, -1.0)}
+
+
+def _raw_tiltazimuth(turned_camera, raw_camera, azimuth_deg: float, beam) -> float:
+    """xrayutilities' ``tiltazimuth`` for the raw camera, given the turned camera's. The tilt vector lies in the
+    detector plane at ``azimuth`` from the rows' direction toward the columns'; re-expressed in the raw camera's
+    directions, plus 180° when the raw camera is mirrored against the turned one. ``detrot`` and ``tilt`` carry
+    over unchanged. Found and pinned for all 8 cameras against xrayutilities itself (S3b probe 1: within 2.7e-13
+    Å⁻¹; row E)."""
+
+    import numpy as np
+
+    if tuple(raw_camera) == tuple(turned_camera):
+        return float(azimuth_deg)
+    rows_t, columns_t = (np.array(_CAMERA_VECTORS[axis]) for axis in turned_camera)
+    rows_r, columns_r = (np.array(_CAMERA_VECTORS[axis]) for axis in raw_camera)
+    angle = math.radians(float(azimuth_deg))
+    vector = math.cos(angle) * rows_t + math.sin(angle) * columns_t
+    raw = math.degrees(math.atan2(float(vector @ columns_r), float(vector @ rows_r)))
+    beam = np.asarray(beam, dtype=np.float64)
+    handed = lambda first, second: np.sign(np.linalg.det(np.array([first, second, beam])))
+    if handed(rows_r, columns_r) != handed(rows_t, columns_t):
+        raw += 180.0
+    return raw % 360.0
 
 
 def _lower_calibration_geometry(receipt: RSMCalibrationGeometryReceipt) -> RSMEffectiveGeometry:
@@ -1341,12 +1387,30 @@ def _lower_calibration_geometry(receipt: RSMCalibrationGeometryReceipt) -> RSMEf
         object.__setattr__(
             diffractometer, name, MappingProxyType(dict(getattr(diffractometer, name))),
         )
+    # The refinement (the maintainer's decision: used when the fit has one, optional): del/nu zero offsets, as
+    # Stitch subtracts them; the mount of a version-3 transfer, its azimuth carried to the raw camera; the energy
+    # OFFSET (refined minus recorded), never the energy itself. The calibrant's sample offset is never taken.
+    calibration_energy = float(acquisition.get("source_energy_eV", acquisition["energy_eV"]))
+    area_mount, angle_offsets, energy_offset = (0.0, 0.0, 0.0), (), 0.0
+    if receipt.refinement:
+        offsets = acquisition["detector_offsets_deg"]
+        angle_offsets = (0.0, 0.0, 0.0, 0.0, float(offsets["nu"]), float(offsets["del"]))
+        if "detrot_deg" in detector:
+            area_mount = (
+                float(detector["detrot_deg"]),
+                float(detector["tilt_deg"]),
+                _raw_tiltazimuth(STITCH_CAMERA.to_xu(), camera.to_xu(), float(detector["tiltazimuth_deg"]),
+                                 xu_value["incident_beam"]),
+            )
+        if "source_energy_eV" in acquisition:
+            energy_offset = float(acquisition["energy_eV"]) - float(acquisition["source_energy_eV"])
     image_orientation = ImageOrientation()
     roi = (0, -1, 0, -1)
     requirements = XuRuntimeRequirements()
     identity = (
         receipt.receipt_fingerprint,
         receipt.semantic_fingerprint,
+        (receipt.refinement, area_mount, angle_offsets, energy_offset, calibration_energy),
         _effective_diffractometer_value(diffractometer),
         (
             detector_header.cch1,
@@ -1373,6 +1437,11 @@ def _lower_calibration_geometry(receipt: RSMCalibrationGeometryReceipt) -> RSMEf
         requirements,
         fingerprint,
         source="calibration",
+        area_mount=area_mount,
+        angle_offsets=angle_offsets,
+        energy_offset_eV=energy_offset,
+        refinement=receipt.refinement,
+        calibration_energy_eV=calibration_energy,
         _claim=_EFFECTIVE_FACTORY,
     )
 

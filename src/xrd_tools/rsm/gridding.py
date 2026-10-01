@@ -25,7 +25,7 @@ import logging
 import math
 import threading
 import weakref
-from dataclasses import InitVar, dataclass, field
+from dataclasses import InitVar, dataclass, field, replace
 
 import numpy as np
 
@@ -578,7 +578,8 @@ def _corner_pixel_q(
         Nch1=s1,
         Nch2=s2,
     )
-    tiny_mapper = PixelQMap(mapper.diff_config, tiny)
+    # the mapper's own mount, offsets and energy offset come along (AUD-9 stage 2b C7b)
+    tiny_mapper = replace(mapper, header=tiny)
     return tiny_mapper.pixel_q(angles, energy, UB=UB)
 
 
