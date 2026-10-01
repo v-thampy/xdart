@@ -166,7 +166,9 @@ class XuStitchEffectiveGeometryProjection:
                 self.energy_eV, self.xdart_wavelength_A, self.xu_mapping_wavelength_A,
             ))
             or self.sample_axes != ("x+", "z-", "y+", "z-")
-            or self.detector_axes != ("x+", "z-")
+            # psic's nu x+ and del z-, either reversed for a circle turning the other way
+            or self.detector_axes not in {(nu, delta) for nu in ("x+", "x-") for delta in ("z-", "z+")}
+            or (self.asset_version != 3 and self.detector_axes != ("x+", "z-"))
             or self.camera != ("x-", "z+")
         ):
             raise TypeError("XU effective geometry projection is invalid")

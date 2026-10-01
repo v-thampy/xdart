@@ -66,7 +66,8 @@ def _seed_record(seed, cancelled):
     if seed.get('frames'):
         from xrd_tools.integrate.calibration_seed import session_prediction
         record = session_prediction(seed['frames'], del_motor=seed['del_motor'], nu_motor=seed['nu_motor'],
-                                    cancelled=cancelled, bounds=seed.get('bounds'), **seed.get('distance', {}))
+                                    cancelled=cancelled, bounds=seed.get('bounds'),
+                                    instrument_geometry=seed.get('instrument'), **seed.get('distance', {}))
         if record is not None:
             return record  # else the saved frames do not fit yet: the rough geometry or the file
     return seed.get('rough') if seed.get('rough') is not None else seed.get('file')
@@ -79,7 +80,8 @@ def _prediction_after(seed, adopted, cancelled):
     frames = tuple(frame for frame in seed.get('frames', ()) if frame.identity != adopted.identity)
     try:
         return session_prediction((*frames, adopted), del_motor=seed['del_motor'], nu_motor=seed['nu_motor'],
-                                  cancelled=cancelled, bounds=seed.get('bounds'), **seed.get('distance', {}))
+                                  cancelled=cancelled, bounds=seed.get('bounds'),
+                                  instrument_geometry=seed.get('instrument'), **seed.get('distance', {}))
     except InterruptedError:
         return None
 
@@ -175,7 +177,7 @@ def _dispatch_job(request, cancelled, publish):
         from xrd_tools.integrate.calibration_seed import session_prediction
         return key, session_prediction(seed['frames'], del_motor=seed['del_motor'],
                                        nu_motor=seed['nu_motor'], cancelled=cancelled, bounds=seed.get('bounds'),
-                                       **seed.get('distance', {}))
+                                       instrument_geometry=seed.get('instrument'), **seed.get('distance', {}))
     if kind == 'fit':
         frames, options = arguments
         return fit_calibration(frames, cancelled=cancelled,
@@ -860,9 +862,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         # the arm's motors are these circles' (read by name as before)
         self._fields['del_motor'] = self.geometry_editor.motor_edit('del')
         self._fields['nu_motor'] = self.geometry_editor.motor_edit('nu')
-        for circle in ('nu', 'del', 'tth'):  # the zeros place the rough arm and start every fit
+        for circle in ('nu', 'del', 'tth'):  # the zeros and senses place the rough arm and start every fit
             self.geometry_editor.zero_edit(circle).editingFinished.connect(self._render_frames)
             self.geometry_editor.zero_edit(circle).textChanged.connect(self._bounds_edited)
+            self.geometry_editor.axis_box(circle).currentIndexChanged.connect(self._render_frames)
 
     def _build_distance(self):
         layout, form = self._form('2 · Rough geometry', 'rough')
@@ -1140,7 +1143,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             del_motor=delta, nu_motor=nu,
             orientation=int(self._text('beam_orientation')), mount_deg=mount,
             wavelength_m=wavelength * 1e-10 if wavelength is not None else 1e-10,
-            beam_readings=readings or None)
+            beam_readings=readings or None, senses=geometry.arm_senses())
 
     def _rough_wavelength_A(self):
         """The typed wavelength (Å), else the calibrant scan's when every frame read records the same
@@ -1522,15 +1525,17 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     frames=done, rough=self._rough_record(), bounds=self._bounds_or_none(),
                     distance=self._distance_or_none(),
                     file=str(Path(path).resolve()) if path and Path(path).is_file() else None,
-                    detector=detector, wavelength_A=wavelength)
+                    detector=detector, wavelength_A=wavelength,
+                    instrument=self.geometry_editor.value().to_record())  # its circles' senses
 
     def _calibrated_key(self):
-        """The calibrated frames and the bounds the prediction was fitted with: editing a zero or
-        a bound leaves a prediction stale."""
+        """The calibrated frames and the bounds and senses the prediction was fitted with: editing a
+        zero, a bound or a circle's sense leaves a prediction stale."""
         bounds = self._bounds_or_none()
         return (tuple((frame.identity, frame.poni_sha256) for frame in self.frames if frame.complete),
                 json.dumps([None if bounds is None else bounds.to_record(),
-                            self._text('distance_seed'), self._text('distance_bounds')], sort_keys=True))
+                            self._text('distance_seed'), self._text('distance_bounds'),
+                            self.geometry_editor.value().arm_senses()], sort_keys=True))
 
     def _expected_rings(self, frame):
         """The calibrant rings predicted on this frame (None without a calibration)."""

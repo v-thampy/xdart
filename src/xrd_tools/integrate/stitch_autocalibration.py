@@ -342,7 +342,9 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
     held-out validation that chose between the five-parameter arm and the
     detector-mount/sample-offset extension. ``progress(stage, done, total)``
     reports frames read, frames searched and validation folds.
-    ``instrument_geometry`` (which motor drives which circle) is recorded as given.
+    ``instrument_geometry`` (which motor drives which circle) is recorded as given; a seed whose
+    detector circles turn otherwise than its senses say is refused (the seed's motor scales carry
+    the senses it was fitted with, and the refinement keeps them).
     ``mask`` (True: left out, in the oriented image) is kept out of the ring search;
     its SHA-256 is recorded. ``energy_bound_eV`` also refines the energy within that many eV
     of the scans' recorded one (as :func:`fit_calibration`).
@@ -355,10 +357,20 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
     its ±``bounds.distance_fraction`` box in every fit, as the guided fit takes them (Codex review F3);
     bounds that exclude the seed are refused, never widened.
     """
-    from xrd_tools.core.geometry.stacked_arm import orientation_signs
+    from xrd_tools.core.geometry.stacked_arm import arm_senses, orientation_signs
     from xrd_tools.integrate.refine import ArmFitBounds
+    from xrd_tools.session.instrument import PSIC_AXES, InstrumentGeometry, signed_axis
     record, diff, digest = _seed(geometry, source_motors)
     arm = diff.stacked_arm
+    senses = arm_senses(arm, diff.calibration.detector_config.get('orientation', 3))
+    if instrument_geometry is not None:
+        wanted = InstrumentGeometry.from_record(dict(instrument_geometry)).arm_senses()
+        differ = [circle for circle, sense in senses.items() if wanted.get(circle, 1) != sense]
+        if differ:
+            raise ValueError('; '.join(
+                f"the starting geometry turns {circle} about {signed_axis(PSIC_AXES[circle], senses[circle])}, "
+                f"the Diffractometer about {signed_axis(PSIC_AXES[circle], wanted.get(circle, 1))}"
+                for circle in differ) + ': start from a geometry fitted with these senses')
     held = None
     if arm.held is not None:  # its fixed pitch or yaw: offset = (signed scale) × angle
         signs = dict(zip(('nu', 'del'), orientation_signs(diff.calibration.detector_config.get('orientation', 3))))
@@ -382,7 +394,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                                   calibrant=points.calibrant, detector_config=config,
                                   extended=extended, reject_outliers=reject_outliers,
                                   beam_rotation=0., cancelled=cancelled,  # never the seed's: |q| cannot measure it
-                                  energy_bound_eV=energy_bound_eV, bounds=bounds,
+                                  energy_bound_eV=energy_bound_eV, bounds=bounds, senses=senses,
                                   distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m)
 
     controls = points.controls

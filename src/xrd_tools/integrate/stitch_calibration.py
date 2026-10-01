@@ -576,8 +576,13 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     ``arm_model='auto'`` fits the extended arm whenever it applies
     (:func:`automatic_arm_reason`) and the five-parameter arm otherwise, or when the
     extension is refused; the message and provenance say which, and why.
+    ``instrument_geometry`` (an ``InstrumentGeometry`` record) also gives the circles' senses:
+    a detector circle turning opposite to psic's fits with its motor scale reversed.
     """
     from xrd_tools.integrate.refine import ArmFitBounds
+    from xrd_tools.session.instrument import InstrumentGeometry
+    senses = ({} if instrument_geometry is None
+              else InstrumentGeometry.from_record(dict(instrument_geometry)).arm_senses())
     bounds = (ArmFitBounds() if bounds is None else bounds).resolved(
         [circle for circle, motor in (('del', del_motor), ('nu', nu_motor)) if motor is not None])
     if arm_model == 'auto':
@@ -615,6 +620,9 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                                 cancelled=cancelled, validation_angles=validation_angles, progress=progress,
                                 instrument_geometry=instrument_geometry, energy_bound_eV=energy_bound_eV,
                                 bounds=bounds)
+    if backend == 'xu_hist' and -1 in senses.values():
+        raise ValueError("the xrayutilities fit takes psic's circle senses; fit with pyFAI MultiGeometry, "
+                         'whose xrayutilities file takes a reversed circle')
     if energy_bound_eV is not None and backend == 'xu_hist':
         raise ValueError('the energy is refined on the pyFAI arm (and carried to its xrayutilities '
                          'partner); fit with pyFAI MultiGeometry')
@@ -642,7 +650,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                                   model='stacked_del_on_nu' if arm_model == 'stacked'
                                   else 'stacked_del_on_nu_extended',
                                   beam_rotation=0.,  # the design geometry; |q| cannot measure it
-                                  energy_bound_eV=energy_bound_eV, bounds=bounds)
+                                  energy_bound_eV=energy_bound_eV, bounds=bounds, senses=senses)
         if not result.success or result.rms_q > max_rms_q:
             raise ValueError(result.message or f'fit RMS {result.rms_q:.5g} exceeds {max_rms_q:g} Å⁻¹')
         asset = result.diffractometer.stacked_arm.to_pyfai_goniometer(

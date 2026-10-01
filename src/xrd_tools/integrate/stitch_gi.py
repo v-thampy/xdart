@@ -102,6 +102,8 @@ class StitchGI:
     the frame pyFAI's incidence and tilt are taken in, and the q_ip sign of both backends.
     ``motor_zeros`` are the Diffractometer panel's motor-zero readings of the motors read here:
     a circle's angle is its motor's reading minus its zero (a Manual angle is already one).
+    ``reversed_motors`` are the motors read here whose circles turn opposite to psic's (the
+    Diffractometer panel's senses): their angles are negated, a turn about the reversed axis.
     """
 
     cuts: tuple[str, ...]
@@ -114,6 +116,7 @@ class StitchGI:
     ip_range: tuple[float, float] | None = None
     oop_range: tuple[float, float] | None = None
     motor_zeros: tuple[tuple[str, float], ...] = ()
+    reversed_motors: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         cuts = self.cuts
@@ -149,6 +152,11 @@ class StitchGI:
         object.__setattr__(self, "motor_zeros", tuple(
             (motor, _finite(zeros[motor], f"{motor}'s motor zero")) for motor in self.metadata_names()
             if motor in zeros and float(zeros[motor]) != 0.0))
+        flipped = self.reversed_motors
+        if type(flipped) not in (tuple, list) or any(type(motor) is not str or motor not in read for motor in flipped):
+            raise ValueError("GI reversed motors must name motors this GI reads")
+        object.__setattr__(self, "reversed_motors", tuple(
+            motor for motor in self.metadata_names() if motor in flipped))
 
     def bins(self, cut: str) -> tuple[float, float] | None:
         """The range ``cut`` is binned over (None: the data's span)."""
@@ -168,7 +176,8 @@ class StitchGI:
         """Canonical value for a plan fingerprint."""
         return ("stitch-gi-v3", self.cuts, self.incidence_motor, self.incident_angle_deg, self.tilt_motor,
                 self.tilt_chi_deg, self.sample_orientation, self.sample_motors, self.ip_range, self.oop_range) + (
-            (("motor-zeros", self.motor_zeros),) if self.motor_zeros else ())
+            (("motor-zeros", self.motor_zeros),) if self.motor_zeros else ()) + (
+            (("reversed-motors", self.reversed_motors),) if self.reversed_motors else ())
 
     def to_provenance(self) -> dict[str, object]:
         return {"cuts": list(self.cuts), "units": {cut: GI_UNITS[cut] for cut in self.cuts},
@@ -179,14 +188,16 @@ class StitchGI:
                 "ip_range": None if self.ip_range is None else list(self.ip_range),
                 "oop_range": None if self.oop_range is None else list(self.oop_range),
                 # the motor zeros read here, only when there are some (older records have none)
-                **({"motor_zeros": dict(self.motor_zeros)} if self.motor_zeros else {})}
+                **({"motor_zeros": dict(self.motor_zeros)} if self.motor_zeros else {}),
+                **({"reversed_motors": list(self.reversed_motors)} if self.reversed_motors else {})}
 
     def circles(self, metadata) -> tuple[float, float, float, float]:
         """This frame's psic sample circles (mu, eta, chi, phi) in degrees."""
         motors, zeros = dict(self.sample_motors), dict(self.motor_zeros)
         values = tuple(
             manual if motor is None and manual is not None else 0.0 if motor is None
-            else float(metadata[motor]) - zeros.get(motor, 0.0)  # physical angle = reading - zero
+            # physical angle = reading - zero, negated for a circle turning about psic's reversed axis
+            else (-1.0 if motor in self.reversed_motors else 1.0) * (float(metadata[motor]) - zeros.get(motor, 0.0))
             for motor, manual in ((motors["mu"], None), (self.incidence_motor, self.incident_angle_deg),
                                   (self.tilt_motor, self.tilt_chi_deg), (motors["phi"], None)))
         return tuple(_finite(value, "sample angle") for value in values)

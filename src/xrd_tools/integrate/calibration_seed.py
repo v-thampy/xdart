@@ -101,12 +101,12 @@ def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_m
 
 
 def session_prediction(frames, *, del_motor='del', nu_motor='nu', cancelled=None, bounds=None,
-                       distance_seed_m=None, distance_bounds_m=None):
+                       distance_seed_m=None, distance_bounds_m=None, instrument_geometry=None):
     """The arm fitted to this session's calibrated frames, to predict the others' rings and
     seed pyFAI with them: one calibrated frame is enough to place the rest (a saved
     calibration still needs three). None without a calibrated frame, or when they do not fit.
     ``bounds``, ``distance_seed_m`` and ``distance_bounds_m``: the estimates and freedom the saved fit
-    takes (fit_calibration's).
+    takes (fit_calibration's); ``instrument_geometry`` its circles' senses.
     """
     from xrd_tools.integrate.stitch_calibration import fit_calibration
     done = tuple(frame for frame in frames if frame.complete)
@@ -115,7 +115,8 @@ def session_prediction(frames, *, del_motor='del', nu_motor='nu', cancelled=None
     try:
         return fit_calibration(done, backend='multigeometry', del_motor=del_motor, nu_motor=nu_motor,
                                cancelled=cancelled, min_frames=1, bounds=bounds, distance_seed_m=distance_seed_m,
-                               distance_bounds_m=distance_bounds_m).asset['calibration']
+                               distance_bounds_m=distance_bounds_m,
+                               instrument_geometry=instrument_geometry).asset['calibration']
     except (ValueError, RuntimeError, KeyError):
         return None
 
@@ -162,7 +163,8 @@ def detector_shape(detector) -> tuple[int, int] | None:
 
 
 def rough_arm_record(*, distance_m, detector, beam_px, zeros_deg=None, del_motor='del', nu_motor='nu',
-                     wavelength_m=1e-10, orientation=3, mount_deg=(0., 0.), beam_readings=None) -> dict:
+                     wavelength_m=1e-10, orientation=3, mount_deg=(0., 0.), beam_readings=None,
+                     senses=None) -> dict:
     """A nominal stacked (del-on-nu) arm from a rough distance, for a new setup.
 
     ``zeros_deg`` gives each moving circle's motor-zero reading ('del', 'nu'; physical angle =
@@ -176,7 +178,8 @@ def rough_arm_record(*, distance_m, detector, beam_px, zeros_deg=None, del_motor
     the beam pixel's centre as that oriented detector places it (1, 2 and 4 reflect the
     row, the column or both), and a non-default one travels in the detector
     config (the seed PONI pyFAI opens with, and so its saved PONIs). The motor scales
-    take its signs (``orientation_signs``), so every orientation predicts the same rings.
+    take its signs (``orientation_signs``), so every orientation predicts the same rings, and
+    each circle's sense (``senses``: {'nu': -1} for a nu turning opposite to psic's; ``arm_signs``).
     ``mount_deg`` holds the detector mount's tilt and roll fixed (the arm's extension; a single
     arm has none), zero for a detector facing the beam squarely at every angle. With a tilted
     mount the beam still hits ``beam_px`` at the zero pose, and ``distance_m`` is the distance
@@ -189,7 +192,7 @@ def rough_arm_record(*, distance_m, detector, beam_px, zeros_deg=None, del_motor
     from pyFAI.detectors import detector_factory
     from xrd_tools.core.containers import PONI
     from xrd_tools.core.geometry import DetectorCalibration
-    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm, orientation_signs
+    from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm, arm_signs
     if not math.isfinite(float(distance_m)) or float(distance_m) <= 0:
         raise ValueError('the rough distance must be a positive number')
     config = {} if int(orientation) == 3 else {'orientation': int(orientation)}
@@ -202,7 +205,7 @@ def rough_arm_record(*, distance_m, detector, beam_px, zeros_deg=None, del_motor
     zeros = {circle: float((zeros_deg or {}).get(circle, 0.)) for circle in moving}
     if not all(math.isfinite(value) for value in zeros.values()):
         raise ValueError('the motor zeros must be finite numbers of degrees')
-    nu_sign, del_sign = orientation_signs(pixels.orientation)
+    nu_sign, del_sign = arm_signs(pixels.orientation, senses)
     scales = dict(nu_scale=nu_sign * math.pi / 180, del_scale=del_sign * math.pi / 180)
     offset = {f'{circle}_offset': -scales[f'{circle}_scale'] * zero for circle, zero in zeros.items()}
     # the configured detector's own conversion; for orientation 3 it is (y + .5, x + .5) pitches exactly

@@ -51,14 +51,43 @@ def test_fourc_and_twoc_take_a_scattering_plane(qapp):
 
 
 def test_the_editor_states_the_lab_frame_and_each_circles_axis(qapp):
-    editor = GeometryEditor()
+    """Each circle's axis box: psic's axis for the circle it plays, or its reverse (maintainer, 2026-09-30:
+    "the sense of rotation for each motor should be selectable"; "let's just stick with swapping the signs
+    for now"; "yes default to standard now")."""
+    editor = GeometryEditor(used=('nu', 'del', 'tth'), used_by='Stitch')
     label = lambda circle: editor._form.labelForField(editor._rows[circle]).text()  # noqa: E731
+    axis = lambda circle: editor.axis_box(circle).currentText()  # noqa: E731
+    choices = lambda circle: [editor.axis_box(circle).itemText(i) for i in range(2)]  # noqa: E731
     assert 'x up, y along the beam' in editor.frame_note.text()
-    assert label('mu').startswith('mu (sample) · x+') and label('del').startswith('del (detector) · z-')
+    assert [axis(c) for c in ('mu', 'eta', 'chi', 'phi', 'nu', 'del')] == ['x+', 'z-', 'y+', 'z-', 'x+', 'z-']
+    assert choices('nu') == ['x+', 'x-'] and choices('del') == ['z-', 'z+'] and choices('chi') == ['y+', 'y-']
+    assert label('mu') == 'mu (sample)' and label('del') == 'del (detector)  ·  used by Stitch'
+    assert 'xrayutilities' in editor.axis_box('nu').toolTip() and 'grazing' in editor.axis_box('chi').toolTip()
     editor.set_value(InstrumentGeometry('twoc', plane='horizontal'))
-    assert label('th').startswith('th (sample) · x+') and label('tth').startswith('tth (detector) · x+')
+    assert (axis('th'), axis('tth')) == ('x+', 'x+')
     editor.set_value(InstrumentGeometry('twoc'))
-    assert label('tth').startswith('tth (detector) · z-')
+    assert axis('tth') == 'z-'
+    # 17-2's psic until November 2026: [x-, z-, y-, z-], [x-, z-]
+    editor.set_value(InstrumentGeometry())
+    changed = []
+    editor.changed.connect(lambda: changed.append(True))
+    for circle in ('mu', 'chi', 'nu'):
+        editor.axis_box(circle).setCurrentIndex(editor.axis_box(circle).findData(-1))
+    beamline = editor.value()
+    assert changed and beamline.reversed_circles == ('mu', 'chi', 'nu')
+    assert [value for _circle, value in beamline.circle_axes()] == ['x-', 'z-', 'y-', 'z-', 'x-', 'z-']
+    editor.set_value(InstrumentGeometry())  # psic's again
+    assert editor.value().reversed_circles == () and axis('nu') == 'x+'
+    editor.set_value(beamline)
+    assert editor.value() == beamline and axis('chi') == 'y-'
+    editor.set_available_motors(['mu', 'chi', 'nu', 'del'])  # a scan's motors keep the senses
+    assert editor.value().reversed_circles == ('mu', 'chi', 'nu')
+    # a 2θ arm keeps its sense when its plane changes the axis it turns about
+    editor.set_value(InstrumentGeometry('twoc', reversed_circles=('tth',)))
+    assert axis('tth') == 'z+'
+    editor.plane.setCurrentIndex(editor.plane.findData('horizontal'))
+    assert axis('tth') == 'x-' and editor.value().arm_senses() == {'nu': -1}
+    editor.deleteLater()
 
 
 def test_each_detector_circle_takes_its_motor_zero_beside_its_motor(qapp):

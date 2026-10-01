@@ -3,9 +3,9 @@
 
 Every page that needs to know which motor is which mounts this (Stitch and its
 calibration window now, RSM next). The value is
-:class:`xrd_tools.session.instrument.InstrumentGeometry`. Beside each detector circle's
-motor is its known motor-zero reading (physical angle = motor readback − zero); a blank
-box gives none.
+:class:`xrd_tools.session.instrument.InstrumentGeometry`. Each circle's row gives the axis it
+turns about (psic's, or reversed for a circle turning the other way), its motor and its known
+motor-zero reading (physical angle = motor readback − zero); a blank box gives none.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xdart.gui.widgets.controls_panel import ControlsComboBox
 from xrd_tools.session.instrument import (
-    GEOMETRIES, GEOMETRY_LABELS, LAB_FRAME, PLANE_LABELS, InstrumentGeometry,
+    GEOMETRIES, GEOMETRY_LABELS, LAB_FRAME, PLANE_LABELS, PSIC_AXES, InstrumentGeometry, signed_axis,
 )
 
 #: Every circle any geometry has, in display order (a row each; a geometry shows its own).
@@ -30,6 +30,12 @@ _ZERO_TIP = ("{circle}'s motor-zero reading (degrees): the motor's readback wher
 #: (maintainer, 2026-09-30: "a place to enter a zero offset for each angle ... set to 0 by default").
 _SAMPLE_ZERO_TIP = ("{circle}'s motor-zero reading (degrees): the motor's readback where the circle is at "
                     "zero, so its physical angle = readback − this (grazing incidence reads it). Blank: 0.")
+#: The axis box (maintainer, 2026-09-30: "the sense of rotation for each motor should be selectable";
+#: "let's just stick with swapping the signs for now"; "default to standard").
+_AXIS_TIP = ("The axis {circle} turns about, right-handed, for a positive angle: {standard} is psic's, "
+             "{reverse} a circle that turns the other way. {readers}")
+_AXIS_READERS = {"detector": "Stitch's detector-arm fits and its xrayutilities file take it.",
+                 "sample": "Stitch's grazing incidence takes it."}
 
 
 class GeometryEditor(QtWidgets.QWidget):
@@ -54,7 +60,7 @@ class GeometryEditor(QtWidgets.QWidget):
                               'horizontal axis, as psic\'s del. Horizontal: about the vertical axis, as '
                               'psic\'s nu. The other psic detector circle is held at zero.')
         self._form.addRow('Scattering plane', self.plane)
-        self._motors, self._zeros, self._rows = {}, {}, {}
+        self._motors, self._zeros, self._rows, self._axes = {}, {}, {}, {}
         for circle in _ALL_CIRCLES:
             combo = ControlsComboBox()
             combo.setEditable(True)
@@ -62,9 +68,14 @@ class GeometryEditor(QtWidgets.QWidget):
             combo.setEditText(circle)
             combo.editTextChanged.connect(self._edited)
             self._motors[circle] = combo
-            row = QtWidgets.QWidget()  # the motor, and beside it its zero
+            row = QtWidgets.QWidget()  # the axis, the motor, and beside it its zero
             layout = QtWidgets.QHBoxLayout(row)
             layout.setContentsMargins(0, 0, 0, 0)
+            axis = ControlsComboBox()  # psic's axis or its reverse, filled by _show_rows
+            axis.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+            axis.currentIndexChanged.connect(self._edited)
+            self._axes[circle] = axis
+            layout.addWidget(axis)
             layout.addWidget(combo, 1)
             # every circle's zero: the arm's seed the fits, the sample's correct grazing incidence
             zero = QtWidgets.QLineEdit()
@@ -125,7 +136,8 @@ class GeometryEditor(QtWidgets.QWidget):
             if isinstance(zero, float):
                 zeros.append((circle, zero))
         return InstrumentGeometry(geometry, tuple((circle, self._motors[circle].currentText()) for circle in circles),
-                                  'vertical' if geometry == 'psic' else self.plane.currentData(), tuple(zeros))
+                                  'vertical' if geometry == 'psic' else self.plane.currentData(), tuple(zeros),
+                                  tuple(circle for circle in circles if self._axes[circle].currentData() == -1))
 
     def set_value(self, value: InstrumentGeometry):
         blockers = [QtCore.QSignalBlocker(widget)
@@ -139,6 +151,10 @@ class GeometryEditor(QtWidgets.QWidget):
             edit.setText('' if zero is None else f'{zero:.12g}')
         del blockers
         self._show_rows()
+        blockers = [QtCore.QSignalBlocker(combo) for combo in self._axes.values()]
+        for circle, combo in self._axes.items():  # every circle a value does not reverse turns as psic's
+            combo.setCurrentIndex(combo.findData(value.sense(circle) if circle in value.circles else 1))
+        del blockers
         self.changed.emit()
 
     def set_available_motors(self, names):
@@ -166,15 +182,34 @@ class GeometryEditor(QtWidgets.QWidget):
         circles = dict(GEOMETRIES[geometry])
         self._form.setRowVisible(self.plane, geometry != 'psic')
         shown = InstrumentGeometry(geometry, plane='vertical' if geometry == 'psic' else self.plane.currentData())
-        plays, axes = shown.as_psic(), dict(shown.circle_axes())
+        plays = shown.as_psic()
         for circle, combo in self._motors.items():
             self._form.setRowVisible(self._rows[circle], circle in circles)
             label = self._form.labelForField(self._rows[circle])
             if circle in circles:
                 used = f'  ·  used by {self._used_by}' if circle in self._used and self._used_by else ''
-                label.setText(f'{circle} ({circles[circle]}) · {axes[circle]}{used}')
+                label.setText(f'{circle} ({circles[circle]}){used}')
                 combo.setToolTip(f'The scan motor that drives the {circle} circle'
                                  + (f" (it plays psic's {plays[circle]})" if circle in plays else ''))
+                self._fill_axis(circle, PSIC_AXES[plays.get(circle, circle)], circles[circle])
+
+    def _fill_axis(self, circle, standard, role):
+        """The circle's axis box: psic's axis for the circle it plays, and its reverse; the sense
+        chosen stays when the geometry or plane changes the axis."""
+        combo = self._axes[circle]
+        sense = combo.currentData() if combo.count() else 1
+        blocker = QtCore.QSignalBlocker(combo)
+        combo.clear()
+        for value in (1, -1):
+            combo.addItem(signed_axis(standard, value), value)
+        combo.setCurrentIndex(combo.findData(sense))
+        del blocker
+        combo.setToolTip(_AXIS_TIP.format(circle=circle, standard=standard, reverse=signed_axis(standard, -1),
+                                          readers=_AXIS_READERS[role]))
+
+    def axis_box(self, circle) -> QtWidgets.QComboBox:
+        """A circle's axis box (its data: 1 for psic's sense, −1 reversed)."""
+        return self._axes[circle]
 
     def _edited(self, *_args):
         self.changed.emit()

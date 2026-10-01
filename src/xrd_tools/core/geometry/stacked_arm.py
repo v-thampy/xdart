@@ -53,6 +53,28 @@ def orientation_signs(orientation=3) -> tuple[int, int]:
     if orientation not in (1, 2, 3, 4):
         raise ValueError(f"pyFAI's detector orientation is 1 to 4, not {orientation}")
     return (-1 if orientation in (1, 4) else 1), (-1 if orientation in (1, 2) else 1)
+
+
+def arm_signs(orientation=3, senses=None) -> tuple[int, int]:
+    """The signs of nu's and del's motor scales: the detector orientation's
+    (:func:`orientation_signs`), each reversed for a circle that turns opposite to psic's
+    (``senses``: {'nu': -1, 'del': -1}, as ``InstrumentGeometry.arm_senses`` gives them; a
+    circle not named turns as psic's, nu about x+ and del about z-)."""
+    senses = dict(senses or {})
+    if set(senses) - {'nu', 'del'} or any(value not in (1, -1) for value in senses.values()):
+        raise ValueError(f"a circle's sense is 1 or -1 for nu and del, not {senses}")
+    nu, delta = orientation_signs(orientation)
+    return nu * senses.get('nu', 1), delta * senses.get('del', 1)
+
+
+def arm_senses(arm, orientation=3) -> dict[str, int]:
+    """The senses an arm's moving circles turn with (:func:`arm_signs`'s ``senses``), read from
+    its motor scales' signs in this detector orientation."""
+    signs = dict(zip(('nu', 'del'), orientation_signs(orientation)))
+    return {circle: (1 if getattr(arm, f'{circle}_scale') > 0 else -1) * signs[circle]
+            for circle, motor in (('nu', arm.nu_motor), ('del', arm.del_motor)) if motor is not None}
+
+
 #: A single arm's moving position and parameters, by the circle it holds at zero.
 _SINGLE = {'nu': ('del_angle', _SINGLE_NAMES), 'del': ('nu_angle', _SINGLE_NU_NAMES)}
 _EXTENDED_NAMES = ('mount_tilt', 'mount_roll',

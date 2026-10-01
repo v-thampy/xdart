@@ -42,7 +42,7 @@ import numpy as np
 
 from xrd_tools.core.containers import PONI
 from xrd_tools.core.geometry import Diffractometer, DetectorCalibration, StackedDetectorArm
-from xrd_tools.core.geometry.stacked_arm import orientation_signs
+from xrd_tools.core.geometry.stacked_arm import arm_signs
 
 logger = logging.getLogger(__name__)
 
@@ -370,6 +370,7 @@ def refine_goniometer(
     beam_rotation: float | None = None,
     energy_bound_eV: float | None = None,
     bounds: ArmFitBounds | None = None,
+    senses: Mapping[str, int] | None = None,
 ) -> RefineResult:
     """Fit affine or exact del-on-nu geometry to powder control points.
 
@@ -399,7 +400,9 @@ def refine_goniometer(
         scales at ``deg2rad`` and fits only the motor-zero offsets + base.
         ``deg2rad`` carries the detector orientation's sign for that rotation
         (:func:`~xrd_tools.core.geometry.stacked_arm.orientation_signs`), so a
-        motor turns the detector the same way in every pyFAI orientation.
+        motor turns the detector the same way in every pyFAI orientation, and
+        each circle's sense (``senses``: {'nu': -1} for a nu turning opposite to
+        psic's; :func:`~xrd_tools.core.geometry.stacked_arm.arm_signs`).
     base : Diffractometer
         Donates the xrayutilities half (circle stacks, ``camera``, HXRD refs).
     distance_seed_m, distance_bounds_m
@@ -442,7 +445,7 @@ def refine_goniometer(
             distance_seed_m=distance_seed_m, distance_bounds_m=distance_bounds_m,
             max_nfev=max(max_nfev, 2000), cancelled=cancelled,
             beam_rotation=0. if beam_rotation is None else float(beam_rotation),
-            energy_bound_eV=energy_bound_eV, bounds=bounds)
+            energy_bound_eV=energy_bound_eV, bounds=bounds, senses=senses)
     if model not in {'affine', 'stacked_del_on_nu'}:
         raise ValueError('unknown goniometer model')
     if rot1_motor is None and rot2_motor is None:
@@ -498,7 +501,7 @@ def refine_goniometer(
                 and lo <= distance <= hi):
             raise ValueError("distance bounds require 0 < low < high and a seed inside them")
     seed = [distance, base_poni.poni1, base_poni.poni2, 0.0, 0.0]
-    r1_sign, r2_sign = orientation_signs(det.orientation)
+    r1_sign, r2_sign = arm_signs(det.orientation, senses)
     r1_nominal, r2_nominal = r1_sign * _DEG2RAD, r2_sign * _DEG2RAD
     if fit_r1s:
         seed.append(r1_nominal)
@@ -693,6 +696,7 @@ def refine_stacked_arm(
     cancelled=None,
     energy_bound_eV: float | None = None,
     bounds: ArmFitBounds | None = None,
+    senses: Mapping[str, int] | None = None,
 ) -> RefineResult:
     """Fit the del-on-nu arm at sub-pixel control-point positions.
 
@@ -702,8 +706,8 @@ def refine_stacked_arm(
     pitch) is still fitted, and it has no extension.
     ``extended=True`` adds the detector mount on the arm (tilt, roll)
     and the sample offset from the rotation centre. Motor scales stay at one
-    degree per degree (signed for the detector orientation, see
-    :func:`~xrd_tools.core.geometry.stacked_arm.orientation_signs`) and the beam rotation is pinned at zero, because |q|
+    degree per degree (signed for the detector orientation and each circle's sense, ``senses``, see
+    :func:`~xrd_tools.core.geometry.stacked_arm.arm_signs`) and the beam rotation is pinned at zero, because |q|
     cannot see either; a mount rotation about the del axis is excluded because
     it duplicates the del offset. The extension needs frames from at least
     three nu positions, and a fit whose extension is implausible or poorly
@@ -775,7 +779,7 @@ def refine_stacked_arm(
         if not (np.isfinite([lo, hi]).all() and 0 < lo < hi and lo <= distance <= hi):
             raise ValueError("distance bounds require 0 < low < high and a seed inside them")
 
-    nu_sign, del_sign = orientation_signs(det.orientation)
+    nu_sign, del_sign = arm_signs(det.orientation, senses)
     from xrd_tools.core.energy import wavelength_m_to_energy_eV  # noqa: PLC0415
     fit_energy = energy_bound_eV is not None
     recorded_eV = float(wavelength_m_to_energy_eV(wl_m))

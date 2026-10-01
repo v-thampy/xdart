@@ -294,7 +294,8 @@ def test_the_geometry_comes_first_and_names_the_arm_motors(tmp_path):
     dialog.geometry_editor.geometry.setCurrentIndex(dialog.geometry_editor.geometry.findData('twoc'))
     assert dialog.geometry_editor.value().stitch_arm() == ('tth', None)  # psic's arm, nu held at zero
     label = dialog.geometry_editor._form.labelForField(dialog.geometry_editor._rows['tth']).text()
-    assert label == 'tth (detector) · z-  ·  used by Stitch'  # its axis: psic's del, vertical plane
+    assert label == 'tth (detector)  ·  used by Stitch'
+    assert dialog.geometry_editor.axis_box('tth').currentText() == 'z-'  # psic's del, vertical plane
     from xdart.gui.pages.values import PageCleanup
     assert dialog.shutdown().status is PageCleanup.CLEAN
     dialog.close()

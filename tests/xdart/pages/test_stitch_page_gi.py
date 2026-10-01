@@ -436,6 +436,10 @@ def test_the_diffractometer_panels_sample_zeros_reach_grazing_incidence(qapp, tm
         _click(page, "Grazing")
         page.set_field("unit", "Qip (Å⁻¹)")
         gi = page.build_form().gi
-        assert dict(gi.motor_zeros) == {"eta": 0.5, "phi": -1.0}
+        assert dict(gi.motor_zeros) == {"eta": 0.5, "phi": -1.0} and gi.reversed_motors == ()
+        # and its senses (maintainer, 2026-09-30): a circle turning opposite to psic's turns the sample back
+        page._set_instrument(InstrumentGeometry(geometry.geometry, geometry.motors, geometry.plane,
+                                                (("eta", 0.5), ("phi", -1.0)), ("phi", "nu")))
+        assert page.build_form().gi.reversed_motors == ("phi",)  # nu is no motor grazing incidence reads
     finally:
         _close(page, qapp)

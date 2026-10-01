@@ -11,6 +11,10 @@ in the horizontal plane 2θ plays nu and θ plays mu. Stitch's detector arm is p
 with the other detector circle held at zero. (For RSM, the sample side of the
 horizontal mapping is not validated yet.)
 
+A circle may turn the other way from psic's standard (``reversed_circles``): its axis is psic's
+reversed, as 17-2's mu, chi and nu are until November 2026. Stitch's detector arm and its
+xrayutilities file take the detector circles' senses, its grazing incidence the sample's.
+
 ``halpha`` is a motor name (for the incidence circle, ``eta`` or ``th``), not a geometry.
 xdart's ``sixc`` is an alias of psic; SPEC's own sixc is a different geometry and has no
 preset here.
@@ -46,6 +50,13 @@ LAB_FRAME = 'x up, y along the beam, z = x × y (left, looking downstream)'
 #: psic's rotation axes (a positive angle turns right-handed about it); the same lists as
 #: ``Diffractometer.psic`` and the RSM notebooks: sample (mu, eta, chi, phi), detector (nu, del).
 PSIC_AXES = {'mu': 'x+', 'eta': 'z-', 'chi': 'y+', 'phi': 'z-', 'nu': 'x+', 'del': 'z-'}
+
+
+def signed_axis(axis, sense) -> str:
+    """``axis`` ('x+', 'z-', ...) as is for ``sense`` 1, reversed for −1."""
+    return axis if sense > 0 else axis[0] + ('-' if axis[1] == '+' else '+')
+
+
 #: Other names beamlines give a circle's motor (matched whole, ignoring case).
 _ALIASES = {'del': ('delta',), 'tth': ('2theta', 'twotheta', 'two_theta', 'tt'),
             'th': ('theta', 'om', 'omega')}
@@ -82,6 +93,10 @@ class InstrumentGeometry:
     #: known motor-zero readings (degrees) by circle: physical angle = motor readback − zero.
     #: Only circles given here have one (the Diffractometer panel's blank box: none).
     zeros: tuple[tuple[str, float], ...] = ()
+    #: the circles that turn opposite to psic's standard sense, about the reversed axis
+    #: (maintainer, 2026-09-30: 17-2's "[x-, z-, y-, z-], [x-, z-]" against the standard
+    #: "[x+, z-, y+, z-], [x+, z-]"; "let's just stick with swapping the signs for now").
+    reversed_circles: tuple[str, ...] = ()
 
     def __post_init__(self):
         if self.geometry not in GEOMETRIES:
@@ -103,6 +118,12 @@ class InstrumentGeometry:
             raise ValueError('a motor zero must be a finite number of degrees')
         object.__setattr__(self, 'zeros', tuple((circle, float(zeros[circle])) for circle in circles
                                                 if circle in zeros))
+        flipped = self.reversed_circles
+        if isinstance(flipped, str) or any(not isinstance(circle, str) for circle in flipped):
+            raise ValueError('the reversed circles are a list of circle names')
+        if set(flipped) - set(circles):
+            raise ValueError(f'{self.geometry} has no circle {sorted(set(flipped) - set(circles))}')
+        object.__setattr__(self, 'reversed_circles', tuple(circle for circle in circles if circle in flipped))
 
     @property
     def circles(self) -> tuple[str, ...]:
@@ -113,6 +134,17 @@ class InstrumentGeometry:
 
     def role(self, circle) -> str:
         return dict(GEOMETRIES[self.geometry])[circle]
+
+    def sense(self, circle) -> int:
+        """1 when the circle turns as psic's circle it plays (``PSIC_AXES``), −1 when reversed."""
+        return -1 if circle in self.reversed_circles else 1
+
+    def arm_senses(self) -> dict[str, int]:
+        """The senses of Stitch's detector arm by the psic circle each plays ('del', 'nu'), as
+        :meth:`arm_zeros`: −1 for a circle turning opposite to psic's."""
+        played = self.as_psic()
+        return {played.get(circle, circle): self.sense(circle) for circle in self.circles
+                if played.get(circle, circle) in ('del', 'nu')}
 
     def zero(self, circle) -> float | None:
         """A circle's known motor-zero reading (degrees), or None when none is given."""
@@ -131,9 +163,10 @@ class InstrumentGeometry:
 
     def circle_axes(self) -> tuple[tuple[str, str], ...]:
         """Each circle's rotation axis in the lab frame (``LAB_FRAME``): the axis of the psic
-        circle it plays, as xrayutilities writes it."""
+        circle it plays, reversed for a reversed circle, as xrayutilities writes it."""
         played = self.as_psic()
-        return tuple((circle, PSIC_AXES[played.get(circle, circle)]) for circle in self.circles)
+        return tuple((circle, signed_axis(PSIC_AXES[played.get(circle, circle)], self.sense(circle)))
+                     for circle in self.circles)
 
     def stitch_arm(self) -> tuple[str | None, str | None]:
         """The (del, nu) motors of Stitch's del-on-nu detector arm. fourc and twoc have one
@@ -207,15 +240,18 @@ class InstrumentGeometry:
             record['plane'] = self.plane
         if self.zeros:  # older records have none
             record['zeros'] = dict(self.zeros)
+        if self.reversed_circles:  # nor these: every circle turns as psic's
+            record['reversed'] = list(self.reversed_circles)
         return record
 
     @classmethod
     def from_record(cls, record) -> 'InstrumentGeometry':
         if (not isinstance(record, dict) or not isinstance(record.get('motors', {}), dict)
-                or not isinstance(record.get('zeros', {}), dict)):
+                or not isinstance(record.get('zeros', {}), dict) or not isinstance(record.get('reversed', []), list)):
             raise ValueError('an instrument geometry is {"geometry": ..., "motors": {circle: motor}}')
         return cls(str(record.get('geometry', 'psic')), tuple(record.get('motors', {}).items()),
-                   str(record.get('plane', 'vertical')), tuple(record.get('zeros', {}).items()))
+                   str(record.get('plane', 'vertical')), tuple(record.get('zeros', {}).items()),
+                   tuple(record.get('reversed', ())))
 
     @classmethod
     def pick(cls, geometry, available, *, keep=None, plane=None) -> 'InstrumentGeometry':
@@ -241,8 +277,9 @@ class InstrumentGeometry:
             if match is None and circle == INCIDENCE_CIRCLE[geometry]:  # the incidence rule Int uses
                 match = next((lower[name] for name in GI_MOTOR_PREFERENCE if name in lower), None)
             chosen.append((circle, match or kept.get(circle) or circle))
-        return cls(geometry, tuple(chosen), plane, keep.zeros if same else ())
+        return cls(geometry, tuple(chosen), plane, keep.zeros if same else (),
+                   keep.reversed_circles if same else ())
 
 
 __all__ = ['GEOMETRIES', 'GEOMETRY_LABELS', 'INCIDENCE_CIRCLE', 'InstrumentGeometry', 'PLANES',
-           'PLANE_LABELS', 'calibration_arm']
+           'PLANE_LABELS', 'calibration_arm', 'signed_axis']

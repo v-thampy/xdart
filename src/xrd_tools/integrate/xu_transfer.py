@@ -93,7 +93,8 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
 
     ``geometry`` is a pyFAI goniometer record (mapping or path) of a stacked arm: the
     five-parameter arm, the extended arm, or a single 2θ arm, with degree motor
-    scales, no beam rotation, no parallax and pyFAI's default detector orientation.
+    scales, no beam rotation, no parallax and pyFAI's default detector orientation. A
+    negative scale is a circle turning opposite to psic's: its XU axis is reversed.
     ``source_motors`` is (del motor, nu motor), None for the circle a single arm
     holds at zero. ``validation_angles`` are (del, nu) circle angles (a held circle
     at 0), normally every frame the asset will serve; ``fit_angles`` (an extended
@@ -109,6 +110,7 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
     from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
     from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry
     from xrd_tools.integrate.xu_stitch import XuStitchScienceRefused
+    from xrd_tools.session.instrument import signed_axis
 
     gate = EXTENDED_TRANSFER_GATE_A if gate is None else float(gate)
     del_motor, nu_motor = source_motors
@@ -128,8 +130,11 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
     if int(dict(calibration.detector_config).get('orientation', 3)) != 3:  # as the XU fit refuses it
         raise XuTransferRefused('XU_TRANSFER_UNSUPPORTED', "the XU model takes pyFAI's default detector "
                                 'orientation (3): fit the arm in orientation 3 to transfer it')
-    if arm.nu_scale != math.pi / 180 or arm.del_scale != math.pi / 180:
+    if abs(arm.nu_scale) != math.pi / 180 or abs(arm.del_scale) != math.pi / 180:
         raise XuTransferRefused('XU_TRANSFER_UNSUPPORTED', 'XU takes angles in degrees: fitted motor scales cannot be transferred')
+    # psic's nu x+ and del z-, each reversed for a circle that turns the other way (a negative scale)
+    detector_axes = [signed_axis(axis, 1 if scale > 0 else -1)
+                     for axis, scale in (('x+', arm.nu_scale), ('z-', arm.del_scale))]
     if arm.beam_rotation != 0:
         raise XuTransferRefused('XU_TRANSFER_UNSUPPORTED', "XU's azimuth reference is fixed: a beam rotation cannot be transferred")
     if calibration.parallax is not None:
@@ -159,15 +164,16 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
             raise InterruptedError('XU transfer cancelled')
 
     rows_sub, cols_sub = np.arange(0, shape[0], _SUBGRID[0]), np.arange(0, shape[1], _SUBGRID[1])
+    zeros = arm.motor_zeros()  # −offset/scale, whichever way the circle turns; a held circle's fixed angle
     formula = [poni.poni1 / pitch1 - 0.5, poni.poni2 / pitch2 - 0.5, poni.dist * 1e3,
-               -math.degrees(arm.del_offset), -math.degrees(arm.nu_offset)]
+               zeros.get('del', -math.degrees(arm.del_offset)), zeros.get('nu', -math.degrees(arm.nu_offset))]
     attempts, params = [], None
     with xu_runtime_session() as runtime:
         xu = runtime.xu
 
         def area(params, coarse=False):
             c1, c2, dist, _d0, _n0, detrot, tilt, azimuth = params[:8]
-            qconv = xu.QConversion(['x+', 'z-', 'y+', 'z-'], ['x+', 'z-'], [0, 1, 0])
+            qconv = xu.QConversion(['x+', 'z-', 'y+', 'z-'], detector_axes, [0, 1, 0])
             hxrd = xu.HXRD([0, 1, 0], [0, 0, 1], geometry='real', en=energy, qconv=qconv)
             # the coarse detector's pixel i is the full detector's pixel i·step, exactly
             step1, step2 = _SUBGRID if coarse else (1, 1)
@@ -257,7 +263,7 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
                            'del_offset_deg': params[3], 'nu_offset_deg': params[4], 'detrot_deg': params[5],
                            'tilt_deg': params[6], 'tiltazimuth_deg': params[7],
                            'sampledis_mm': list(params[8:11])},
-            arm=compact, energy_eV=energy, xu_wavelength_A=xu_wavelength,
+            arm=compact, energy_eV=energy, xu_wavelength_A=xu_wavelength, detector_axes=detector_axes,
             source_energy_eV=calibration_recorded_energy_eV(record),
             source_motors={'del': del_motor, 'nu': nu_motor}, rotation=int(image_rotation),
             control_domain=domain(fit if fitted else validation), domain=domain(validation),
