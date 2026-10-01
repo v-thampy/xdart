@@ -2288,6 +2288,93 @@ def test_custom_slice_in_q_coordinates_takes_qx_qy_qz_vectors(qapp, monkeypatch)
         _close(page, qapp)
 
 
+_HKL_CAVEAT = (" In HKL the normal and the thickness are r.l.u. ones, H, K and L taken as orthonormal: for a "
+               "non-orthogonal lattice they are not the reciprocal-space normal and distance.")
+
+
+def test_custom_slice_thickness_averages_a_slab_and_the_note_names_it(qapp, monkeypatch):
+    """G11 (the maintainer, 2026-10-01: "Do you want the Thickness option? Yes"): a shared Thickness row, 0 by
+    default, in the volume's units. A thickness draws ``custom_slice``'s slab (its planes' finite mean, and the
+    slab's projections); the note names the planes and, in HKL, that the normal and the thickness are r.l.u.
+    ones; 0 (or blank) is the plane alone again. In Q the note has no HKL caveat."""
+    from xdart.gui.widgets.controls_panel import FormRow
+    from xrd_tools.rsm.custom_slice import custom_slice
+    values = {"A": _grid_values(1.0)}
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/a_rsm.nexus", "A")
+        page.view.page_tool("custom").click()
+        window = page._tool_windows["custom"]
+        row = window.rows["thickness"]
+        assert type(row) is FormRow and row.current_value() == "0"
+        assert row.label.text() == "Thickness (r.l.u.)"
+        plane = window.custom
+        assert plane.thickness == 0.0 and "averaged" not in window.note.text() and "In HKL" not in window.note.text()
+        axes = tuple(axis for _name, axis in values["A"].axes)
+        expected = custom_slice(values["A"].intensity, axes, thickness=0.5)
+        _type(row.editor, "0.5")
+        slab, drawn = window.custom, window.view.keyed_projection
+        assert (slab.thickness, slab.planes) == (0.5, expected.planes) and expected.planes > 3
+        np.testing.assert_array_equal(drawn.panels[0].image, expected.values.T)
+        np.testing.assert_array_equal(drawn.panels[1].intensity, expected.projection_t)
+        np.testing.assert_array_equal(drawn.panels[2].intensity, expected.projection_s)
+        assert not np.array_equal(expected.values, plane.values, equal_nan=True)
+        assert window.note.text() == (f"The plane is {plane.note}; averaged over {expected.planes} planes, ±0.25 "
+                                      "along [1 −1 0]." + _HKL_CAVEAT)
+        assert window.card.status.isHidden() and not window.card.valid_marker.isHidden()
+        for no_thickness in ("0", ""):
+            _type(row.editor, no_thickness)
+            assert window.custom.thickness == 0.0 and window.note.text() == f"The plane is {plane.note}."
+            np.testing.assert_array_equal(window.view.keyed_projection.panels[0].image, plane.values.T)
+    finally:
+        _close(page, qapp)
+    names = ("qx", "qy", "qz")
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, project_analysis_artifact_result
+    from xrd_tools.session.rsm_viewer_model import make_rsm_viewer_values
+    q_axes = tuple((name, np.linspace(index, index + 1.0, size))
+                   for index, (name, size) in enumerate(zip(names, (5, 7, 9), strict=True)))
+    values["Q"] = make_rsm_viewer_values(project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.RSM, axes=q_axes, axis_units=tuple((name, "q_A^-1") for name in names),
+        intensity=np.arange(5 * 7 * 9, dtype=np.float64).reshape(5, 7, 9) + 1.0, sigma=None, coverage=None,
+        normalization=None))
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/q_rsm.nexus", "Q")
+        page.view.page_tool("custom").click()
+        window = page._tool_windows["custom"]
+        assert window.rows["thickness"].label.text() == "Thickness (Å⁻¹)"
+        _type(window.rows["thickness"].editor, "0.5")
+        assert window.custom.planes > 3 and window.note.text().endswith(" along [1 −1 0].")
+        assert "In HKL" not in window.note.text()
+    finally:
+        _close(page, qapp)
+
+
+def test_a_custom_slice_thickness_that_is_no_number_0_or_more_is_named_in_its_card(qapp, monkeypatch):
+    """The Thickness row's readiness: a negative, non-finite or unreadable thickness is refused in the card and
+    the view, nothing drawn, the typed text kept; a readable one is drawn again."""
+    values = {"A": _grid_values(1.0)}
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/a_rsm.nexus", "A")
+        page.view.page_tool("custom").click()
+        window = page._tool_windows["custom"]
+        editor = window.rows["thickness"].editor
+        reason = "Thickness (r.l.u.): a number, 0 or more"
+        for refused in ("-0.1", "thick", "nan", "inf", "-inf"):
+            _type(editor, refused)
+            assert window.card.status.text() == reason and not window.card.status.isHidden(), refused
+            assert window.card.valid_marker.isHidden() and window.custom is None and window.note.text() == ""
+            assert window.view.keyed_projection is None and reason in window.view.status.text()
+            assert editor.text() == refused
+            _type(editor, "0.2")
+            assert window.custom is not None and window.custom.thickness == 0.2 and window.card.status.isHidden()
+    finally:
+        _close(page, qapp)
+
+
 @pytest.mark.parametrize("message", (
     "analysis artifact published; verification remains pending",
     "analysis artifact document close remains pending",

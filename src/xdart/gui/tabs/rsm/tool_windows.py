@@ -65,6 +65,11 @@ def _setting(name: str) -> tuple[str, str]:
     return ("custom_slice", name)
 
 
+def _unit(frame) -> str:
+    """The frame's coordinates' unit, as the plane's axes are labelled."""
+    return "r.l.u." if frame is RSMCoordinateFrame.HKL else "Å⁻¹"
+
+
 def _numbers(text: str, what: str) -> tuple[float, float, float]:
     parts = str(text).replace(",", " ").split()
     try:
@@ -84,7 +89,11 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
     projections, with Int's colour map and Log. Beside it a ``SectionCard`` of Int's rows, written through
     (``valueChanged``) to this window's settings; a plane ``custom_slice`` refuses is named in the card's
     readiness. The axes and the ranges are coordinates along the directions (``plane_offsets``): H and K on an
-    H–K plane, HH and L on HH–L. In Q coordinates the directions and the point are Qx Qy Qz."""
+    H–K plane, HH and L on HH–L. In Q coordinates the directions and the point are Qx Qy Qz.
+
+    Thickness (the maintainer, 2026-10-01: "Do you want the Thickness option? Yes"), 0 by default, averages the
+    slab across ±Thickness/2 along the plane's normal (``custom_slice``'s ``thickness``); the note names its
+    planes, and in HKL that the normal and the thickness are r.l.u. ones (H, K and L taken as orthonormal)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -109,6 +118,7 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
             "first": FormRow(label="Direction 1", path=_setting("first"), value="1 1 0"),
             "second": FormRow(label="Direction 2", path=_setting("second"), value="0 0 1"),
             "through": FormRow(label="Through", path=_setting("through"), value=""),
+            "thickness": FormRow(label="Thickness", path=_setting("thickness"), value="0"),
             "first_range": RangeRow(label="Along 1", low=bounds("first_low"), high=bounds("first_high")),
             "second_range": RangeRow(label="Along 2", low=bounds("second_low"), high=bounds("second_high")),
             "first_points": FormRow(label="Points along 1", path=_setting("first_points"), value="", kind="int",
@@ -117,6 +127,10 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
                                      minimum=2, maximum=_MAX_POINTS, allow_blank=True),
         }
         self.rows["through"].editor.setPlaceholderText("Auto: the volume's centre")
+        self.rows["thickness"].editor.setPlaceholderText("0: the plane alone")
+        self.rows["thickness"].editor.setToolTip(
+            "The slab averaged across ±Thickness/2 along the plane's normal (Direction 1 × Direction 2), in the "
+            "volume's units; 0 is the plane alone")
         for name in ("first_points", "second_points"):
             self.rows[name].editor.setPlaceholderText("Auto")
         #: the rows' committed text, by path: what the plane is cut from
@@ -155,6 +169,7 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
         symbols = "h k l" if frame is RSMCoordinateFrame.HKL else " ".join(frame.axis_symbols)
         for key, label in (("first", "Direction 1"), ("second", "Direction 2"), ("through", "Through")):
             self.rows[key].label.setText(f"{label} ({symbols})")
+        self.rows["thickness"].label.setText(f"Thickness ({_unit(frame)})")
         centre = volume_centre(axis for _axis_name, axis in values.axes)
         self.rows["through"].editor.setPlaceholderText("Auto: " + " ".join(f"{item:.6g}" for item in centre))
         self.recompute()
@@ -181,8 +196,7 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
             ranges = [self._range(name, offset) for name, offset in zip(("first", "second"), offsets, strict=True)]
             points = tuple(self._points(name, max(values.intensity.shape)) for name in ("first", "second"))
             cut = custom_slice(values.intensity, axes, through, first, second, ranges[0], ranges[1], points,
-                               symbols=frame.axis_symbols,
-                               unit="r.l.u." if frame is RSMCoordinateFrame.HKL else "Å⁻¹")
+                               symbols=frame.axis_symbols, unit=_unit(frame), thickness=self._thickness())
             projection = self._projection(cut, offsets)
         except CustomSliceRefused as refused:
             self._slice = None
@@ -194,7 +208,10 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
         self._slice, self._offsets = cut, offsets
         self.card.set_status_text("")
         self.card.set_valid_marker(True, "The plane is drawn")
-        self.note.setText(f"The plane is {cut.note}.")
+        self.note.setText(f"The plane is {cut.note}." + (
+            " In HKL the normal and the thickness are r.l.u. ones, H, K and L taken as orthonormal: for a "
+            "non-orthogonal lattice they are not the reciprocal-space normal and distance."
+            if cut.thickness and frame is RSMCoordinateFrame.HKL else ""))
         self.view.reconcile_keyed(projection)
 
     def _range(self, name: str, offset: float):
@@ -209,6 +226,18 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
             return tuple(float(text) + offset for text in texts)
         except ValueError:
             raise CustomSliceRefused("CUSTOM_SLICE_RANGE_INVALID", f"{label} needs two numbers") from None
+
+    def _thickness(self) -> float:
+        """The typed Thickness, blank 0 (the plane alone); refused unless a finite number, 0 or more."""
+        row = self.rows["thickness"]
+        text = self._settings[row.path].strip()
+        try:
+            value = float(text) if text else 0.0
+        except ValueError:
+            value = float("nan")
+        if not (np.isfinite(value) and value >= 0.0):
+            raise CustomSliceRefused("CUSTOM_SLICE_TEXT_INVALID", f"{row.label.text()}: a number, 0 or more")
+        return value
 
     def _points(self, name: str, longest: int) -> int:
         row = self.rows[f"{name}_points"]
