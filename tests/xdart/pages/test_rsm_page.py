@@ -1057,21 +1057,29 @@ def test_the_source_is_stitchs_rows_and_the_member_table_is_gone(qapp, tmp_path)
         _close(page, qapp)
 
 
-def test_a_bracket_selection_is_one_rsm_and_more_are_named_before_preview(qapp, tmp_path):
-    """Stitch's Selection: brackets combine scans into one RSM ([1-2]); 1,2 would be two RSMs and the page grids
-    one per run for now, so readiness names it before any Preview. All Scans makes each scan its own RSM, known
-    once the scans are found: the form refuses it with the same reason."""
+def test_a_bracket_selection_is_one_rsm_and_a_comma_selection_is_queued(qapp, tmp_path):
+    """Stitch's Selection: brackets combine scans into one RSM ([1-2]); 1,2 makes two RSMs, which Preview and Run
+    queue one at a time (G8c; G8a refused them), each in its own family's stable slot in the Save Path's folder, so
+    each records its family. All Scans makes each scan its own RSM, known once the scans are found."""
     page = _page(qapp)
     try:
         _synthetic_source(tmp_path)
         _with_source(page, tmp_path, scans="1,2")
-        assert not page._readiness[1] and "one RSM (2 selected; one RSM per run for now" in page._readiness[0]
-        with pytest.raises(ValueError, match="2 RSMs in the Source: one RSM per run for now"):
+        assert page._readiness[1], page._readiness
+        assert page.controls.source_card.status.text() == "1 SPEC file · 2 RSMs"
+        with pytest.raises(ValueError, match="2 RSMs in the Source: Preview and Run queue them"):
             page.build_form()
+        forms = page.build_forms()
+        assert [[member.scan for member in form.members] for form in forms] == [["1.1"], ["2.1"]]
+        assert all(form.output_family and Path(form.output_path).name == f"{form.output_family}_rsm.nexus"
+                   for form in forms)
+        assert len({form.output_path for form in forms}) == 2
+        assert {Path(form.output_path).parent for form in forms} == {Path(page._value("output_path")).parent}
         page.set_field("scan", "[1-2]")
         assert page._readiness[1], page._readiness
         page.resolve_source()
         assert [member.scan for member in page.build_form().members] == ["1.1", "2.1"]
+        assert [form.fingerprint for form in page.build_forms()] == [page.build_form().fingerprint]
         page.set_field("scan", "2")
         page.resolve_source()
         assert [member.scan for member in page.build_form().members] == ["2.1"]
@@ -1080,6 +1088,109 @@ def test_a_bracket_selection_is_one_rsm_and_more_are_named_before_preview(qapp, 
         page.resolve_source()
         with pytest.raises(ValueError, match="2 RSMs in the Source"):
             page.build_form()
+        assert len(page.build_forms()) == 2
+    finally:
+        _close(page, qapp)
+
+
+def _counting_grids(monkeypatch):
+    """The committing stand-in, recording each gridded output's name in order."""
+    _commit_instead_of_gridding(monkeypatch, _values())
+    committed, grids = RSMOperationExecutionV2.run, []
+
+    def counted(self, **kwargs):
+        grids.append(Path(self.request.module.output.target).name)
+        return committed(self, **kwargs)
+    monkeypatch.setattr(RSMOperationExecutionV2, "run", counted)
+    return grids
+
+
+def test_a_comma_selection_previews_every_rsm_and_grids_each_in_turn(qapp, tmp_path, monkeypatch):
+    """G8c: Preview prepares each RSM through the one owner (its real preflight) and lists them all under their
+    own headings; Run prepares and grids each in turn into its own output, and lists both results."""
+    grids = _counting_grids(monkeypatch)
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1,2")
+        names = [Path(form.output_path).name for form in page.build_forms()]
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview ready · 2 RSMs" in label.full_text())
+        shown = page.preview_text.toPlainText()
+        assert shown.startswith("2 RSMs") and f"RSM 1 of 2 · {names[0]}" in shown
+        assert f"RSM 2 of 2 · {names[1]}" in shown and grids == []
+        page.begin_run()
+        _wait(page, qapp, lambda: "Saved 2 of 2 RSMs" in label.full_text())
+        assert grids == names and page.results.count() == 2 and not page.active()
+    finally:
+        _close(page, qapp)
+
+
+def test_stop_mid_queue_cancels_the_rsm_gridding_and_starts_no_other(qapp, tmp_path, monkeypatch):
+    """Stop stops the queue: the RSM being gridded is cancelled and the next is never prepared."""
+    started = []
+
+    def run(self, *, cancel_token=None, progress_callback=None):
+        started.append(Path(self.request.module.output.target).name)
+        deadline = time.monotonic() + 10
+        while not cancel_token.is_set():
+            if time.monotonic() > deadline:
+                raise AssertionError("Stop never reached the operation")
+            time.sleep(0.005)
+        return RSMOperationResultV2(self.request, ModuleTerminalResult(
+            self.request.module, ModuleDisposition.CANCELLED, "CANCELLED"))
+    monkeypatch.setattr(RSMOperationExecutionV2, "run", run)
+    page = _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1,2")
+        page.begin_run()
+        _wait(page, qapp, lambda: bool(started))
+        page.stop()
+        _wait(page, qapp, lambda: not page.active() and page.run_bar.readinessLabel.full_text() == "RSM stopped")
+        for _ in range(20):  # nothing further starts
+            qapp.processEvents()
+            page._poll()
+        assert len(started) == 1 and page._jobs == [] and page.results.count() == 0
+    finally:
+        _close(page, qapp)
+
+
+def test_append_skips_the_up_to_date_rsm_of_a_queue_and_grids_the_other(qapp, tmp_path, monkeypatch):
+    """Each queued RSM has its own Append check: in Append the one whose output already holds it is skipped and
+    named, the other is gridded."""
+    from xdart.gui.tools import rsm_values
+    grids = _counting_grids(monkeypatch)
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1,2")
+        first, second = (Path(form.output_path) for form in page.build_forms())
+        first.parent.mkdir()
+        first.write_bytes(b"")  # RSM 1's output already there, holding this request
+        monkeypatch.setattr(rsm_values, "rsm_output_current",
+                            lambda request: Path(request.module.output.target) == first)
+        assert page.run_bar.write_mode() == "Append"
+        page.begin_run()
+        _wait(page, qapp, lambda: "Saved 1 of 2 RSMs" in label.full_text())
+        assert label.full_text() == "Saved 1 of 2 RSMs · 1 already gridded with these settings, skipped"
+        assert grids == [second.name]
+    finally:
+        _close(page, qapp)
+
+
+def test_two_queued_rsms_naming_one_slot_are_refused(qapp, tmp_path, monkeypatch):
+    """Two RSMs whose families name one stable slot would write one file: the queue refuses them with the
+    remedy, before any Preview."""
+    page = _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1,2")
+        monkeypatch.setattr(page_module, "suggested_family", lambda _project, _members: "same")
+        with pytest.raises(ValueError, match="RSMs 1 and 2 would both write same_rsm.nexus"):
+            page.build_forms()
     finally:
         _close(page, qapp)
 

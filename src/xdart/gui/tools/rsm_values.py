@@ -72,7 +72,9 @@ _SCAN = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 _PREFLIGHT_FACTORY = object()
 _PREFLIGHT_V2_FACTORY = object()
 _MAX_SELECTED_FRAMES = 4096
-_MAX_RSM_MEMBERS = 16
+#: The most scans one RSM grids (a page refuses more, naming this bound).
+MAX_RSM_MEMBERS = 16
+_MAX_RSM_MEMBERS = MAX_RSM_MEMBERS
 _MAX_RSM_AXIS_POINTS = 1_000_000
 _MAX_RSM_VOXELS = 8_000_000
 _MAX_CHUNK_SIZE = 1024
@@ -2276,6 +2278,7 @@ def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]
 
 
 __all__ = [
+    "MAX_RSM_MEMBERS",
     "RSMFrameSelector",
     "RSMMemberDraft",
     "RSMPreflightMember",
