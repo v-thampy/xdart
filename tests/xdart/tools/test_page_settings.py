@@ -152,6 +152,9 @@ def test_save_and_load_through_the_chooser_never_confirm_and_roll_back_what_cann
     asked = len(other.asked)
     assert loader.load() == ActionRefused("Demo is busy; load settings when it is idle")
     assert len(other.asked) == asked  # refused before any chooser
+    other.busy = "Demo's window is working; load settings when it is done"  # G13 3b: busy with its reason
+    assert loader.load() == ActionRefused("Demo's window is working; load settings when it is done")
+    assert len(other.asked) == asked
     other.busy = False
     before = dict(other.values)
     for document, reason in (({"kind": "xdart-run-intent-profile"}, "not an xdart Demo settings file"),

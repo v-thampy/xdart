@@ -457,7 +457,7 @@ class StitchPage(QtWidgets.QWidget):
         self._settings_path_chooser = self._choose_settings_path
         # File ▸ Save/Load Settings and the last session: the shared owner over Stitch's own part (.settings)
         self._saved_settings = PageSettings(self, STITCH_SETTINGS, document=page_settings,
-                                            apply=apply_page_settings, busy=lambda: self._owner.busy,
+                                            apply=apply_page_settings, busy=self._settings_busy,
                                             close=self.shutdown)
         self._metadata_dialog = None
         self._metadata_request_dialog = None
@@ -2956,6 +2956,17 @@ class StitchPage(QtWidgets.QWidget):
 
     def _authoring_active(self):
         return any(dialog.active() for dialog in self._authoring_dialogs)
+
+    def _settings_busy(self):
+        """Whether a settings load waits, and why (the shared owner's ``busy``): while a run works, and while the
+        calibration or mask window works, whose inputs the load would change mid-job (G12's finding: a fit)."""
+        if self._owner.busy:
+            return True
+        for dialog in self._authoring_dialogs:
+            if dialog.active():
+                what = "calibration" if dialog is self._calibration_dialog else "mask"
+                return f"Stitch's {what} window is working; load settings when it is done"
+        return False
 
     def active(self):
         return self._owner.busy or self._owner.finalization is not StitchOwnerFinalization.NONE or self._closing or self._authoring_active()

@@ -167,13 +167,14 @@ class PageSettings:
     """One page's File ▸ Save/Load Settings and last session (the module docstring).
 
     ``document(page)`` is the page's document now and ``apply(page, document)`` checks one and restores it in the
-    page's order; ``busy()`` refuses a load while the page works, and ``close()`` is the page's own close. The
-    page keeps the surface both pages have: ``_status(text, ready=)``, ``_readiness``, ``_value("project_root")``
-    (where the chooser starts without a remembered folder), ``_closing``, and ``_settings_path_chooser(action,
-    start)``, which returns the path chosen or None (tests replace it)."""
+    page's order; ``busy()`` refuses a load while the page works (True, or why as text: Stitch's calibration window
+    working), and ``close()`` is the page's own close. The page keeps the surface both pages have: ``_status(text,
+    ready=)``, ``_readiness``, ``_value("project_root")`` (where the chooser starts without a remembered folder),
+    ``_closing``, and ``_settings_path_chooser(action, start)``, which returns the path chosen or None (tests
+    replace it)."""
 
     def __init__(self, page, kind: SettingsKind, *, document: Callable, apply: Callable,
-                 busy: Callable[[], bool], close: Callable[[], CloseReceipt]):
+                 busy: Callable[[], bool | str], close: Callable[[], CloseReceipt]):
         self._page = page
         self.kind = kind
         self._document, self._apply, self._busy, self._close = document, apply, busy, close
@@ -234,8 +235,9 @@ class PageSettings:
     def load(self) -> ActionOutcome:
         """File ▸ Load Settings."""
         label = self.kind.label
-        if self._busy():
-            return ActionRefused(f"{label} is busy; load settings when it is idle")
+        busy = self._busy()
+        if busy:
+            return ActionRefused(busy if type(busy) is str else f"{label} is busy; load settings when it is idle")
         path = self._path("load")
         if path is None:
             return ActionCompleted(f"{self.kind.outcome}-load-cancelled")

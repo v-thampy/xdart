@@ -131,6 +131,27 @@ def test_calibration_dialog_settings_are_kept_but_not_its_confirmations(qapp, tm
         _close(restored, qapp)
 
 
+def test_a_load_waits_while_the_calibration_window_works(qapp, tmp_path):
+    """G13 unit 3b (found in G12): a settings load waited for Stitch's own run only, so it could change the
+    calibration window's inputs while a fit ran. It now waits for the window too, saying why, before any chooser;
+    once the window is idle the load goes on."""
+    page = _edited_page(tmp_path)
+    asked = []
+    try:
+        page._calibrate()
+        dialog = page._calibration_dialog
+        assert dialog is not None and not page._owner.busy
+        page._settings_path_chooser = lambda action, start: asked.append(action)  # then cancelled
+        dialog.active = lambda: True  # a fit running
+        assert page.load() == ActionRefused(
+            "Stitch's calibration window is working; load settings when it is done")
+        assert asked == []
+        del dialog.active  # the fit done
+        assert page.load() == ActionCompleted("stitch-settings-load-cancelled") and asked == ["load"]
+    finally:
+        _close(page, qapp)
+
+
 def test_file_save_and_load_through_the_settings_port(qapp, tmp_path):
     assert PageCapability.SETTINGS_PERSISTENCE in STITCH_PAGE.capabilities
     page = _edited_page(tmp_path)
