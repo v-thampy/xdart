@@ -20,7 +20,7 @@ import re
 import numpy as np
 
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.pages.handle import AppMenuHosts, PageHandle
 from xdart.gui.pages.operation_owner import OperationTerminalStatus
@@ -531,60 +531,20 @@ class StitchPage(QtWidgets.QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         outer.addWidget(self.splitter)
-        left = QtWidgets.QWidget()
-        left_layout = QtWidgets.QVBoxLayout(left)
-        left_layout.setContentsMargins(5, 5, 5, 5)
-        menus = QtWidgets.QHBoxLayout()
-        for title, name in (("File", "fileMenuButton"), ("Config", "configMenuButton"),
-                            ("Help", "helpMenuButton")):
-            button = QtWidgets.QToolButton()
-            button.setObjectName(name)
-            button.setText(title)
-            button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
-            menu = QtWidgets.QMenu(button)
-            button.setMenu(menu)
-            setattr(self, title.lower() + "_menu", menu)
-            menus.addWidget(button)
-        left_layout.addLayout(menus)
-        self.file_menu.addAction("Open result…", self.open_result)
-        self.file_menu.addAction(
-            "Integration workspace", lambda: self.toolRequested.emit(str(SCATTERING_PAGE_KEY)),
-        )
-        heading = QtWidgets.QLabel("DATA BROWSER")
-        heading.setObjectName("browserHeading")
-        left_layout.addWidget(heading)
-        self.results = QtWidgets.QListWidget()
-        self.results.setObjectName("stitchResults")
-        self.results.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.results.itemSelectionChanged.connect(self._update_residency)
-        self.results.currentItemChanged.connect(self._update_residency)
-        self.results.itemSelectionChanged.connect(self._draw)
-        self.results.currentItemChanged.connect(self._current_result_changed)
-        self.frames = QtWidgets.QListWidget()
-        self.frames.setObjectName("stitchFrames")
-        self.frames.currentItemChanged.connect(self._frame_changed)
-        browser = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        for caption, widget in (("Results", self.results), ("Frames", self.frames)):
-            pane = QtWidgets.QWidget()
-            layout = QtWidgets.QVBoxLayout(pane)
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.addWidget(QtWidgets.QLabel(caption))
-            layout.addWidget(widget, 1)
-            browser.addWidget(pane)
-        browser.setSizes([160, 70])
-        left_layout.addWidget(browser, 1)
-        browse_actions = QtWidgets.QHBoxLayout()
-        self.open_button = QtWidgets.QPushButton("Open…")
-        self.open_button.clicked.connect(self.open_result)
-        self.metadata_button = QtWidgets.QPushButton("Metadata")
-        self.metadata_button.clicked.connect(self._show_metadata)
-        browse_actions.addWidget(self.open_button)
-        browse_actions.addWidget(self.metadata_button)
-        self.raw_button = QtWidgets.QPushButton("Raw image")
-        self.raw_button.clicked.connect(self._show_raw)
-        left_layout.addWidget(self.raw_button)
-        left_layout.addLayout(browse_actions)
-        self.splitter.addWidget(left)
+        # Int's Data Browser (hard rule 14; Codex's Stitch/Int reuse audit R1): Stitch's File actions, Config and
+        # Help for the host's menus, the Results (several selected for an overlay), each result's contributing
+        # Frames, and Open… · Metadata · Raw image. Stitch publishes its results and frames to it and acts on
+        # its commands, as the lists' own signals did.
+        from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserView
+        self.browser = BrowserView(profile=BrowserProfile(
+            menus=(("File", ("Open result…", "Integration workspace")), ("Config", ()), ("Help", ())),
+            raw_resolution_menus=False, list_caption="Results", directory=False, frames=True,
+            frames_caption="Frames", actions=("Open…", "Metadata", "Raw image"), date_sort=False, refresh=False,
+            results=True, result_selection="extended", result_frames=True,
+        ))
+        self.browser.commandRequested.connect(self._browser_command)
+        self._listed = []  # the results listed, in the order they came
+        self.splitter.addWidget(self.browser)
 
         # Int's scientific display, fed Stitch results: one pane for both pages, not a copy.
         from xdart.gui.tabs.scattering.scientific_view import ScientificView
@@ -637,7 +597,6 @@ class StitchPage(QtWidgets.QWidget):
         right_layout.addWidget(self.run_bar)
         self.splitter.addWidget(right)
         # Int's columns (workspace_shell): the same proportions, so the two pages switch in place
-        left.setMinimumWidth(255)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 3)
         self.splitter.setStretchFactor(2, 1)
@@ -2319,9 +2278,61 @@ class StitchPage(QtWidgets.QWidget):
             self._queued_jobs.clear()
             self._status(outcome.finalization_message or "Output retained · finalization retry required", ready=False)
 
+    @property
+    def results(self):
+        """The Data Browser's Results list, Int's own widget. The rows read it and choose in it as a user
+        does; the page fills it only through ``reconcile_results`` and moves it through the browser."""
+        return self.browser.scans
+
+    @property
+    def frames(self):
+        """The Data Browser's Frames pane for the current result, Int's own widget (``reconcile_result_frames``)."""
+        return self.browser.result_frames
+
+    @property
+    def open_button(self):
+        return self.browser.open_result
+
+    @property
+    def metadata_button(self):
+        return self.browser.metadata
+
+    @property
+    def raw_button(self):
+        return self.browser.raw_image
+
+    def _browser_command(self, command):
+        """The Data Browser's commands, as the lists' and buttons' own signals were handled: a new current result
+        (its frames and the view), a new selection (the overlay), a frame for the raw image, the actions."""
+        from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
+        kind, value = command.kind, command.value
+        if kind is ShellCommandKind.SELECT_RESULT:
+            self._update_residency()
+            self._current_result_changed()
+        elif kind is ShellCommandKind.SELECT_RESULTS:
+            self._update_residency()
+            self._draw()
+        elif kind is ShellCommandKind.SELECT_RESULT_FRAME:
+            self._frame_changed()
+        elif kind is ShellCommandKind.SHOW_METADATA:
+            self._show_metadata()
+        elif kind is ShellCommandKind.SHOW_RAW_IMAGE:
+            self._show_raw()
+        elif kind is ShellCommandKind.OPEN_RESULT or (
+                kind is ShellCommandKind.MENU and value == "File:Open result…"):
+            self.open_result()
+        elif kind is ShellCommandKind.MENU and value == "File:Integration workspace":
+            self.toolRequested.emit(str(SCATTERING_PAGE_KEY))
+
+    def _publish_results(self, current):
+        """The Data Browser's Results: every result listed, ``current`` current (silent, as a blocked list)."""
+        from xdart.gui.tabs.scattering.browser_view import BrowserResult
+        self.browser.reconcile_results(
+            tuple(BrowserResult(path, Path(path).name, path) for path in self._listed), current)
+
     def _current_payload(self):
-        item = self.results.currentItem()
-        return None if item is None else self._payloads.get(item.data(QtCore.Qt.ItemDataRole.UserRole))
+        key = self.browser.current_result()
+        return None if key is None else self._payloads.get(key)
 
     def _current_result_changed(self, *_args):
         if self._metadata_dialog is not None:
@@ -2329,7 +2340,8 @@ class StitchPage(QtWidgets.QWidget):
         self._view_revision += 1
         self._raw_revision += 1
         self._raw_frame_view = None
-        self.frames.clear()
+        from xdart.gui.tabs.scattering.browser_view import BrowserResult
+        entries = []
         payload = self._current_payload()
         if payload is not None:
             records = payload.contributing_frames
@@ -2355,18 +2367,16 @@ class StitchPage(QtWidgets.QWidget):
                     label += " · excluded"
                 elif screen == "partial":
                     label += " · partial"
-                item = QtWidgets.QListWidgetItem(label)
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, (storage_scan, frame))
-                if record.get("excluded"):
-                    item.setForeground(self.frames.palette().color(
-                        QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.Text))
                 check = ("not recorded" if screen is None
                          else f"{screen}, excluded from the result" if record["excluded"] else screen)
-                item.setToolTip(f"{record['source_path']}\nscan {identity['scan_id']} · frame {frame}"
-                                f"\nFrame check: {check}")
-                self.frames.addItem(item)
-        if self.frames.count():
-            self.frames.setCurrentRow(0)
+                # its identity is the (storage scan, frame) the raw read takes
+                entries.append(BrowserResult(
+                    json.dumps([storage_scan, frame]), label,
+                    f"{record['source_path']}\nscan {identity['scan_id']} · frame {frame}\nFrame check: {check}",
+                    muted=bool(record.get("excluded"))))
+        self.browser.reconcile_result_frames(tuple(entries), entries[0].identifier if entries else None)
+        if entries:
+            self._frame_changed()  # the first frame current, as the list's own signal did
         elif self._raw_popup is not None:
             self._raw_popup.image.clear_image_buffers()
         self._draw()
@@ -2398,11 +2408,11 @@ class StitchPage(QtWidgets.QWidget):
             return
         if self._owner.busy or self._queued_jobs:
             return
-        item, payload = self.frames.currentItem(), self._current_payload()
-        if item is None or payload is None:
+        identifier, payload = self.browser.current_result_frame(), self._current_payload()
+        if identifier is None or payload is None:
             self._raw_pending = False
             return
-        scan, frame = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        scan, frame = json.loads(identifier)
         self._raw_request_revision = self._raw_revision
         self._raw_pending = False
         self._start("Loading contributing frame…", lambda: self._owner.begin_frame_read(
@@ -2410,9 +2420,9 @@ class StitchPage(QtWidgets.QWidget):
             full_raw=self._raw_popup.mode.currentText() == "Full Raw"))
 
     def _render_raw(self):
-        item = self.frames.currentItem()
-        if self._raw_popup is not None and self._raw_popup.isVisible() and self._raw_frame_view is not None and item is not None:
-            self._raw_popup.render(self._raw_frame_view, label=item.text(),
+        if (self._raw_popup is not None and self._raw_popup.isVisible() and self._raw_frame_view is not None
+                and self.browser.current_result_frame() is not None):
+            self._raw_popup.render(self._raw_frame_view, label=self.browser.current_result_frame_label(),
                 color_map=self._view.color_map, log=self._view.log_scale)
 
     def _raw_closed(self):
@@ -2536,20 +2546,15 @@ class StitchPage(QtWidgets.QWidget):
                 AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}:
             raise TypeError("Stitch page requires an admitted Stitch result")
         key = str(path)
-        item = next((self.results.item(i) for i in range(self.results.count())
-                     if self.results.item(i).data(QtCore.Qt.ItemDataRole.UserRole) == key), None)
-        if item is not None and self._background.phase not in {"EMPTY", "RELEASED"}:
+        if key in self._listed and self._background.phase not in {"EMPTY", "RELEASED"}:
             # this result replaces one listed under its key (a run that replaced the output, or the file
             # opened again): a background made from the earlier one would show its arrays in place of the
             # new ones (Codex round-2 review F1)
             self._release_background()
         self._payloads[key] = payload
         self._payload_bytes[key] = payload.resident_bytes
-        if item is None:
-            item = QtWidgets.QListWidgetItem(Path(key).name)
-            item.setData(QtCore.Qt.ItemDataRole.UserRole, key)
-            item.setToolTip(key)
-            self.results.addItem(item)
+        if key not in self._listed:
+            self._listed.append(key)
             self._result_key(key)
         if payload.gi:  # a GI result opens on the axis Grazing chose (I(q) or a cut), else on a cut it has
             modes = {mode for mode, _cut in payload.gi}
@@ -2564,30 +2569,25 @@ class StitchPage(QtWidgets.QWidget):
                 self._set_view(image_axis="qip_qoop" if self._value("map_axis") == "Qip-Qoop" else "q_chi")
         # shown once: selecting it would rebuild the frame list and redraw through the list's signals,
         # and again here (Codex testing-fixes review, startup recommendation 2)
-        blocker = QtCore.QSignalBlocker(self.results)
-        self.results.setCurrentItem(item)
-        del blocker
+        self._publish_results(key)
         self._update_residency()  # a run's outputs replace each other in memory as they are shown
         self._current_result_changed()
 
     def _selected(self):
         """The selected results in memory (a reloading one joins when it is back)."""
-        items = self.results.selectedItems()
+        keys = self.browser.selected_results()
         if self._view.plot_mode == "Single":
-            item = self.results.currentItem()
-            items = [] if item is None else [item]
-        role = QtCore.Qt.ItemDataRole.UserRole
-        return [(item, self._payloads[item.data(role)]) for item in items if item.data(role) in self._payloads]
+            current = self.browser.current_result()
+            keys = () if current is None else (current,)
+        return [(key, self._payloads[key]) for key in keys if key in self._payloads]
 
     def _resident_paths(self):
         """The results shown: the current one, the selected ones (Single shows the current one only)
         and those holding a slice pin."""
-        role = QtCore.Qt.ItemDataRole.UserRole
-        paths = ({item.data(role) for item in self.results.selectedItems()}
-                 if self._view.plot_mode != "Single" else set())
-        current = self.results.currentItem()
+        paths = set(self.browser.selected_results()) if self._view.plot_mode != "Single" else set()
+        current = self.browser.current_result()
         if current is not None:
-            paths.add(current.data(role))
+            paths.add(current)
         pinned = {id(pin.frame) for pin in self._view.slice_pins}
         return paths | {path for path, key in self._result_keys.items() if id(key) in pinned}
 
@@ -2610,9 +2610,7 @@ class StitchPage(QtWidgets.QWidget):
             del self._payloads[path]
             self._payload_bytes.pop(path, None)
         self._recent = [path for path in self._recent if path in self._payloads or path in resident]
-        role = QtCore.Qt.ItemDataRole.UserRole
-        listed = [self.results.item(row).data(role) for row in range(self.results.count())]
-        self._reload_pending = [path for path in dict.fromkeys(self._reload_pending + listed)
+        self._reload_pending = [path for path in dict.fromkeys(self._reload_pending + self._listed)
                                 if path in resident and path not in self._payloads]
         if self._reload_pending:
             QtCore.QTimer.singleShot(0, self._request_reload)
@@ -2638,8 +2636,7 @@ class StitchPage(QtWidgets.QWidget):
         """A reloaded result back in memory: the list and its selection stay as they are."""
         self._payloads[path] = payload
         self._payload_bytes[path] = payload.resident_bytes
-        current = self.results.currentItem()
-        if current is not None and current.data(QtCore.Qt.ItemDataRole.UserRole) == path:
+        if self.browser.current_result() == path:
             self._current_result_changed()  # its frames, and the view
         else:
             self._draw()
@@ -2674,14 +2671,13 @@ class StitchPage(QtWidgets.QWidget):
     def _navigation(self):
         """Every result's key, the current result's and the selected results' (the view's footer)."""
         from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
-        role = QtCore.Qt.ItemDataRole.UserRole
-        keys = tuple(self._result_key(self.results.item(row).data(role)) for row in range(self.results.count()))
-        current = self.results.currentItem()
+        keys = tuple(self._result_key(path) for path in self._listed)
+        current = self.browser.current_result()
         return keys, FrameNavigationProjection(
-            frames=keys, current=None if current is None else self._result_key(current.data(role)),
-            selected=tuple(self._result_key(item.data(role)) for item, _ in self._selected()))
+            frames=keys, current=None if current is None else self._result_key(current),
+            selected=tuple(self._result_key(path) for path, _ in self._selected()))
 
-    def _display_payload(self, item, payload, with_map=True):
+    def _display_payload(self, path, payload, with_map=True):
         """A result as Int's frame (``StandardDisplayPayload``), through Int's conversion
         (``FrameView.from_results``): a Stitch 2D's map and the I(q) beside it, a Stitch 1D's I(q); the
         Diagnostic shows their coverage or normalization instead. A GI result is a GI frame, as Int's: the
@@ -2689,7 +2685,7 @@ class StitchPage(QtWidgets.QWidget):
         from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
         from xrd_tools.core.frame_view import FrameView
         from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
-        key = self._result_key(item.data(QtCore.Qt.ItemDataRole.UserRole))
+        key = self._result_key(path)
         shown = self._diagnostic.lower()
 
         def as_2d(projection):
@@ -2721,7 +2717,7 @@ class StitchPage(QtWidgets.QWidget):
         if payload.gi_map is not None and map_result is not None:
             gi["extra_views_2d"] = {"qip_qoop": FrameView.from_results(
                 label=key.local_frame_label, result_2d=as_2d(payload.gi_map))}
-        return StandardDisplayPayload(0, key, item.text(), view, status="complete",
+        return StandardDisplayPayload(0, key, Path(path).name, view, status="complete",
             wavelength_m=None if payload.wavelength_A is None else float(payload.wavelength_A) * 1e-10, **gi)
 
     def _draw_projection(self, processing_mode):
@@ -2732,26 +2728,23 @@ class StitchPage(QtWidgets.QWidget):
         (the choice stays, Codex terminal review F2)."""
         from xdart.gui.tabs.scattering.shell_projection import build_scientific_projection
         map_mode = processing_mode == "Int 2D"
-        role = QtCore.Qt.ItemDataRole.UserRole
         keys, navigation = self._navigation()
-        items = {id(self._result_key(item.data(role))): (item, payload) for item, payload in self._selected()}
-        current = self.results.currentItem()
-        if current is not None and current.data(role) in self._payloads:
-            items.setdefault(id(self._result_key(current.data(role))),
-                             (current, self._payloads[current.data(role)]))
+        items = {id(self._result_key(path)): (path, payload) for path, payload in self._selected()}
+        current = self.browser.current_result()
+        if current is not None and current in self._payloads:
+            items.setdefault(id(self._result_key(current)), (current, self._payloads[current]))
         if map_mode:
             # a pinned result's map gives its pinned slice; Int's projection keeps it out of the selection
             # (Codex terminal review F1: the pin stayed while its trace vanished)
             pinned = {id(pin.frame) for pin in self._view.slice_pins}
-            for row in range(self.results.count()):
-                item = self.results.item(row)
-                key = self._result_key(item.data(role))
-                if id(key) in pinned and item.data(role) in self._payloads:
-                    items.setdefault(id(key), (item, self._payloads[item.data(role)]))
+            for path in self._listed:
+                key = self._result_key(path)
+                if id(key) in pinned and path in self._payloads:
+                    items.setdefault(id(key), (path, self._payloads[path]))
         if self._background.phase == "ACTIVE" and self._background_scope(navigation) != self._background_context:
             self._release_background()  # as Int's: another selection, result, mode or view releases it
         state = build_scientific_projection(
-            tuple(self._display_payload(item, payload, with_map=map_mode) for item, payload in items.values()),
+            tuple(self._display_payload(path, payload, with_map=map_mode) for path, payload in items.values()),
             navigation, frozenset(keys), self._view, "", processing_mode=processing_mode)
         names = {id(key): (key.source_scan, f"{key.source_scan}_{key.local_frame_label}") for key in keys}
 
@@ -2759,9 +2752,10 @@ class StitchPage(QtWidgets.QWidget):
             name, prefix = names[id(trace.frame)]
             return replace(trace, title=name + trace.title[len(prefix):]) if trace.title.startswith(prefix) else trace
         cuts = tuple(mode for mode in _CUT_AXES
-                     if any(mode in dict(payload.gi) for _item, payload in items.values()))
+                     if any(mode in dict(payload.gi) for _path, payload in items.values()))
         traces = tuple(named(trace) for trace in state.traces)
-        status = current.text() if current is not None else ""
+        label = self.browser.current_result_label()  # the current result's name, as the list shows it
+        status = label
         if self._view.plot_mode in {"Average", "Sum"} and not foldable(traces):
             # Int's view folds results on one axis (on different grids, on one grid spanning them), else
             # shows the first: said, not silent
@@ -2769,12 +2763,12 @@ class StitchPage(QtWidgets.QWidget):
         state = replace(state, traces=traces,
                         pinned_traces=tuple(replace(pinned, trace=named(pinned.trace)) for pinned in state.pinned_traces),
                         gi_modes_1d=("q_total", *cuts) if state.measurement_mode == "GI" else (),
-                        title=current.text() if current is not None else "Current", status=status)
+                        title=label or "Current", status=status)
         from xdart.gui.tabs.scattering.context_projection import apply_presentation_background
         state = apply_presentation_background(state, self._background.projection())
         self._last_map_state = state if map_mode else None
         self.scientific.expect_display_background(self._background.active_key)
-        self.scientific.reconcile(state, navigation, completed=self.results.currentRow() + 1,
+        self.scientific.reconcile(state, navigation, completed=self.browser.current_result_row() + 1,
                                   total=len(keys), detail="")
 
     def _background_scope(self, navigation):
@@ -2798,7 +2792,7 @@ class StitchPage(QtWidgets.QWidget):
         map_mode = self._mode == "Stitch 2D"
         domain = "integrated_2d" if map_mode else "integrated_1d"
         keys, navigation = self._navigation()
-        payloads = tuple(self._display_payload(item, payload, with_map=map_mode) for item, payload in self._selected())
+        payloads = tuple(self._display_payload(path, payload, with_map=map_mode) for path, payload in self._selected())
         prepared = (None if not payloads or navigation.current is None else
                     prepare_background_plan(payloads, domain, navigation.current, contributor_count=len(payloads)))
         if prepared is None:
@@ -2843,15 +2837,11 @@ class StitchPage(QtWidgets.QWidget):
         from xdart.gui.tabs.scattering.scientific_preferences import scientific_preference_updates
         from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
         kind, view = command.kind, self._view
-        role = QtCore.Qt.ItemDataRole.UserRole
         if kind in {ShellCommandKind.SELECT_FRAME, ShellCommandKind.HYDRATE_FRAME}:
             path = next((path for path, key in self._result_keys.items() if key is command.frame), None)
-            row = next((row for row in range(self.results.count())
-                        if self.results.item(row).data(role) == path), -1)
-            if row >= 0 and row != self.results.currentRow():
-                flag = (QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
-                        if view.plot_mode == "Single" else QtCore.QItemSelectionModel.SelectionFlag.NoUpdate)
-                self.results.setCurrentRow(row, flag)
+            if path in self._listed and path != self.browser.current_result():
+                # Single: the result alone; an overlay steps through its selection, which stays
+                self.browser.set_current_result(path, keep_selection=view.plot_mode != "Single")
             return
         if kind is ShellCommandKind.SET_BACKGROUND:
             self._toggle_background()
@@ -2861,8 +2851,8 @@ class StitchPage(QtWidgets.QWidget):
             return
         if kind is ShellCommandKind.PIN_SLICE:  # the slice shown, on the current result's map
             pin = shown_slice_pin(self._last_map_state)
-            current = self.results.currentItem()
-            if (pin is None or current is None or pin.frame is not self._result_key(current.data(role))
+            current = self.browser.current_result()
+            if (pin is None or current is None or pin.frame is not self._result_key(current)
                     or pin.projection_id in {other.projection_id for other in view.slice_pins}):
                 return
             self._set_view(slice_pins=(*view.slice_pins, pin))
@@ -2875,8 +2865,7 @@ class StitchPage(QtWidgets.QWidget):
         self._set_view(**updates)
         if kind is ShellCommandKind.SET_PLOT_MODE:
             if command.value == "Single":
-                self.results.setCurrentRow(self.results.currentRow(),
-                                           QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                self.browser.set_current_result(self.browser.current_result(), keep_selection=False)
             self._update_residency()  # Overlay shows the selected results, Single the current one
         elif kind in {ShellCommandKind.SET_COLOR_MAP, ShellCommandKind.SET_LOG_SCALE}:
             self._render_raw()  # the raw popup's image too
@@ -2901,8 +2890,7 @@ class StitchPage(QtWidgets.QWidget):
     def clear_plot(self):
         self._view_revision += 1
         self._set_view(slice_pins=())
-        self.results.clearSelection()
-        self.results.setCurrentRow(-1)
+        self.browser.clear_result_selection()
         self._draw()
 
     def _show_metadata(self):
@@ -2960,10 +2948,10 @@ class StitchPage(QtWidgets.QWidget):
             row.setEnabled(idle)
         self.calibrate_button.setEnabled(idle)
         self.mask_button.setEnabled(idle)
-        self.raw_button.setEnabled(self.frames.count() > 0 and not self._closing)
+        self.browser.set_action_enabled("Raw image", self.browser.result_frame_count() > 0 and not self._closing)
         self.advanced.setEnabled(idle)
-        self.open_button.setEnabled(idle)
-        self.metadata_button.setEnabled(idle and self._current_payload() is not None)
+        self.browser.set_action_enabled("Open…", idle)
+        self.browser.set_action_enabled("Metadata", idle and self._current_payload() is not None)
         self.preview_button.setEnabled(idle)
         self.advanced_button.setEnabled(idle)
         self.run_bar.startButton.setEnabled(idle and self._readiness[1])  # Run prepares the inputs itself
@@ -3112,8 +3100,8 @@ class StitchPage(QtWidgets.QWidget):
         return receipt
 
     def mount_points(self):
-        return AppMenuHosts(self.config_menu, self.help_menu, tool_requested=self.toolRequested,
-                            mode_requested=self.modeRequested)
+        return AppMenuHosts(self.browser.menus["Config"], self.browser.menus["Help"],
+                            tool_requested=self.toolRequested, mode_requested=self.modeRequested)
 
     def request(self):
         self.open_result()
