@@ -3290,6 +3290,27 @@ def _rsm_v2_chunk_owned_bytes(
     return 2 * raw_bytes + float_bytes + mask_state_bytes
 
 
+def _rsm_v2_correction_bytes(plan, frame_count: int, member) -> int:
+    """A plan's per-frame corrections, charged with each science chunk (AUD-9 stage 2b S2).
+
+    Measured 2026-10-01 with tracemalloc at Pilatus 100K, every correction on (``logs/s2-2-weights-peak.log``):
+    72.7 B per detector pixel at one detector pose (the polarization's lab-frame q and terms, the weights), and
+    8 B per cropped pixel for each further pose. Charged: 80 B per pixel for the polarization's working set (9 B
+    for Int's threshold alone: a float64 frame and its mask), 8 B per cropped pixel per frame for the weights,
+    and the run's decoded mask, dark, flat and solid angle. None: 0, the charge unchanged."""
+    bound = plan.corrections
+    if bound is None:
+        return 0
+    value = bound.corrections
+    full = math.prod(member.detector_shape)
+    cropped = math.prod(member.cropped_shape)
+    resident = full * (1 + 8 * ((bound.dark_receipt is not None) + (bound.flat_receipt is not None)
+                                + int(value.solid_angle)))
+    working = 80 * full if value.polarization_factor is not None else 9 * full if value.threshold is not None else 0
+    weighted = value.solid_angle or value.polarization_factor is not None or bound.flat_receipt is not None
+    return resident + working + (8 * cropped * frame_count if weighted else 0)
+
+
 def _load_rsm_v2_raw_chunk(
     source: object,
     labels: tuple[int, ...],
@@ -3337,7 +3358,7 @@ def _load_rsm_v2_raw_chunk(
                 pixel_count=len(frames) * pixels_per_frame,
                 mask_state_bytes=mask_state_bytes,
                 science=science,
-            )
+            ) + (_rsm_v2_correction_bytes(plan, len(frames), member) if science else 0)
             if required > plan.max_chunk_bytes:
                 raise RSMOperationRefused("Q_MEMORY_LIMIT_EXCEEDED")
         if cancel_token is not None and cancel_token.is_set():
@@ -3735,7 +3756,7 @@ def _require_rsm_v2_memory_plan(request: RSMOperationRequestV2) -> None:
             pixel_count=pixels,
             mask_state_bytes=cropped_mask_bytes,
             science=True,
-        )
+        ) + _rsm_v2_correction_bytes(plan, frame_count, member)
         mask_state_bytes = max(
             full_pixels
             * (

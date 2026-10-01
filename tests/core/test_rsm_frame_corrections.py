@@ -137,3 +137,34 @@ def test_row_a_scan_43_with_every_correction_off_is_the_reference_and_the_correc
     assert 0 < np.isfinite(np.asarray(results["mask"].intensity)).sum() < np.isfinite(off).sum()
     assert results["on"].result_fingerprint != REFERENCE
     assert json.loads(results["on"].provenance_json)["plan"]["frame_corrections"]["solid_angle"] is True
+
+
+@pytest.mark.slow
+def test_the_corrections_are_charged_in_the_memory_plan(rsm_r2_project):
+    """S2: the per-frame corrections' allocations are charged with each science chunk, at or above what the run
+    allocates. Measured with tracemalloc at Pilatus 100K, every correction on (probe s2_weights_peak.py): one
+    frame at one pose 6,899,301 B; four frames at four poses 9,159,084 B. A chunk cap between the plain and the
+    corrected charge refuses the corrected plan only."""
+    from types import SimpleNamespace
+    from xrd_tools.analysis.rsm_operation import RSMBoundCorrections, _rsm_v2_correction_bytes
+    member = SimpleNamespace(detector_shape=(195, 487), cropped_shape=(194, 486))
+    full = RSMBoundCorrections(RSMFrameCorrections(solid_angle=True, polarization_factor=0.99), None, object(),
+                               object())
+    plan = SimpleNamespace(corrections=full)
+    assert _rsm_v2_correction_bytes(plan, 1, member) >= 6_899_301
+    assert _rsm_v2_correction_bytes(plan, 4, member) >= 9_159_084
+    assert _rsm_v2_correction_bytes(SimpleNamespace(corrections=None), 4, member) == 0
+    plain = _request(rsm_r2_project, "mem-plain")
+    from xrd_tools.analysis.rsm_operation import _require_rsm_v2_memory_plan
+    _require_rsm_v2_memory_plan(plain)
+    corrected = _request(rsm_r2_project, "mem-on", RSMFrameCorrections(solid_angle=True, polarization_factor=0.99))
+    _require_rsm_v2_memory_plan(corrected)
+    cap = 56 * 1024 * 1024  # the preset chunk of 8 frames: plain 49,381,800 B, corrected 63,867,861 B
+    tight_plain = _request(rsm_r2_project, "mem-plain-tight", None, max_chunk_bytes=cap)
+    _require_rsm_v2_memory_plan(tight_plain)
+    tight_on = _request(rsm_r2_project, "mem-on-tight",
+                        RSMFrameCorrections(solid_angle=True, polarization_factor=0.99), max_chunk_bytes=cap)
+    from xrd_tools.analysis.rsm_operation import RSMOperationRefused
+    with pytest.raises(RSMOperationRefused) as refused:  # the run's memory plan, before any decode
+        _require_rsm_v2_memory_plan(tight_on)
+    assert refused.value.code == "Q_MEMORY_LIMIT_EXCEEDED"
