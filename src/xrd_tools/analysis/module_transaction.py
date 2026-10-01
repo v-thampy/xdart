@@ -728,7 +728,7 @@ def _validate_xu_stitch_v2_intent(
         or type(corrections) is not dict
         or not corrections
         or type(plan) is not dict
-        or set(plan) - {"frame_screen", "corrections", "gi", "map", "azimuth_range_1d"}
+        or set(plan) - {"frame_screen", "corrections", "gi", "map", "azimuth_range_1d", "foil_normalization"}
         != {
             "backend",
             "mode",
@@ -748,6 +748,11 @@ def _validate_xu_stitch_v2_intent(
         # I(q)'s χ window: native, only when it has one
         or ("azimuth_range_1d" in plan and (not native or type(plan["azimuth_range_1d"]) is not list
                                             or len(plan["azimuth_range_1d"]) != 2))
+        # decision 4's foil choices, only when the plan has one
+        or ("foil_normalization" in plan and (
+            type(plan["foil_normalization"]) is not dict
+            or set(plan["foil_normalization"]) != {"mode", "foil_selector", "exposure_selector", "absorption_lengths"}
+            or plan["foil_normalization"]["mode"] not in {"foil-transmission-exposure", "monitor-foil-transmission"}))
         # a Stitch 2D's map: native, for its Stitch 2D output only
         or ("map" in plan) is not (plan.get("mode") == "2d")
         or (plan.get("mode") == "2d") is not (request.output.kind is AnalysisArtifactKind.STITCH_2D)

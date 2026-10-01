@@ -24,6 +24,7 @@ import threading
 
 import numpy as np
 
+from xrd_tools.corrections.normalization import BeamNormalizationRefused, frame_divisors
 from xrd_tools.analysis.module_transaction import (
     MetadataColumnSelector,
     ModuleArtifactOutput,
@@ -1334,6 +1335,35 @@ def _capture_input_manifest(
 
 
 @dataclass(frozen=True, slots=True)
+class StitchFoilNormalization:
+    """Decision 4's foil choices (maintainer, 2026-10-01: "There are monitors both before and after the foil. So
+    add the 4th choice"): each frame divided by its foils' transmission, with its exposure when the plan has no
+    monitor (Foil transmission × exposure), or with a monitor before the foils (Monitor × foil transmission; a
+    monitor after the foils already includes their attenuation, and is the plan's monitor alone). The divisor is
+    the shared ``xrd_tools.corrections.normalization.frame_divisors``, RSM's too."""
+
+    foil_selector: MetadataColumnSelector
+    absorption_lengths: tuple[float, float, float, float]
+    exposure_selector: MetadataColumnSelector | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.foil_selector) is not MetadataColumnSelector or (
+                self.exposure_selector is not None and type(self.exposure_selector) is not MetadataColumnSelector):
+            raise TypeError("a foil correction's columns must be exact MetadataColumnSelectors")
+        if type(self.absorption_lengths) is not tuple or len(self.absorption_lengths) != 4:
+            raise TypeError("foil absorption lengths must be an exact four-tuple")
+        lengths = tuple(float(value) for value in self.absorption_lengths)
+        if not all(math.isfinite(value) and value >= 0 for value in lengths) or not any(lengths):
+            raise ValueError("foil absorption lengths must be finite, non-negative and not all zero")
+        if self.exposure_selector == self.foil_selector:
+            raise ValueError("the foil and exposure columns must be distinct")
+        object.__setattr__(self, "absorption_lengths", lengths)
+
+    def mode(self) -> str:
+        return "monitor-foil-transmission" if self.exposure_selector is None else "foil-transmission-exposure"
+
+
+@dataclass(frozen=True, slots=True)
 class StitchOperationPlan:
     geometry: StitchGeometryReceipt
     backend: str = "multigeometry"
@@ -1373,6 +1403,8 @@ class StitchOperationPlan:
     #: A native Stitch's I(q) χ window (°), as Int 1D's azimuthal range (a Stitch 2D's I(q) beside the
     #: map too); None: every χ. ``azimuth_range`` is the map's.
     azimuth_range_1d: tuple[float, float] | None = None
+    #: Decision 4's foil choices (``StitchFoilNormalization``); None: the monitor alone, or none.
+    foil_normalization: StitchFoilNormalization | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
@@ -1422,6 +1454,7 @@ class StitchOperationPlan:
         _gi_field(self)
         _map_axis_fields(self)
         _chi_window_field(self)
+        _foil_normalization_field(self)
         object.__setattr__(self, "radial_range", radial)
         object.__setattr__(self, "azimuth_range", azimuth)
         object.__setattr__(
@@ -1454,7 +1487,8 @@ class StitchOperationPlan:
              self.error_model,
              None if self._dark_receipt is None else self._dark_receipt.fingerprint,
              None if self._flat_receipt is None else self._flat_receipt.fingerprint),
-        ) + _flat_cutoff_identity(self) + _gi_identity(self) + _map_axis_identity(self) + _chi_window_identity(self)
+        ) + _flat_cutoff_identity(self) + _gi_identity(self) + _map_axis_identity(self) + _chi_window_identity(self) \
+            + _foil_normalization_identity(self)
         return value + native_plan_identity(self) if self.native_records else value
 
 
@@ -1490,6 +1524,8 @@ class XuStitchOperationPlan:
     map_radial_range: tuple[float, float] | None = None
     #: I(q)'s χ window (°; native records), as ``StitchOperationPlan``'s; None: every χ.
     azimuth_range_1d: tuple[float, float] | None = None
+    #: Decision 4's foil choices (``StitchFoilNormalization``); None: the monitor alone, or none.
+    foil_normalization: StitchFoilNormalization | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
@@ -1536,6 +1572,7 @@ class XuStitchOperationPlan:
         _xu_map_fields(self)
         _map_axis_fields(self)
         _chi_window_field(self)
+        _foil_normalization_field(self)
         object.__setattr__(
             self,
             "fingerprint",
@@ -1564,7 +1601,8 @@ class XuStitchOperationPlan:
                 + (native_plan_identity(self) if self.native_records else ())
                 # a 1-D plan keeps the identity it had
                 + (() if self.mode == "1d" else (("xu-map-v1",) + _xu_map_grid(self),))
-                + _map_axis_identity(self) + _chi_window_identity(self),
+                + _map_axis_identity(self) + _chi_window_identity(self)
+                + _foil_normalization_identity(self),
             ),
         )
 
@@ -1651,6 +1689,77 @@ def _chi_window_identity(plan):
     return () if plan.azimuth_range_1d is None else (("i-q-chi-window-v1", plan.azimuth_range_1d),)
 
 
+def _foil_normalization_field(plan):
+    """A foil correction divides by the exposure with no monitor, or by a monitor before the foils with no
+    exposure: an exposure is never combined with a monitor, which already counts over it."""
+    foil = plan.foil_normalization
+    if foil is None:
+        return
+    if type(foil) is not StitchFoilNormalization:
+        raise TypeError("a foil correction must be an exact StitchFoilNormalization")
+    if (foil.exposure_selector is None) is (plan.monitor_selector is None):
+        raise ValueError(
+            "a foil correction takes the exposure with no monitor (Foil transmission × exposure), or a monitor "
+            "before the foils with no exposure (Monitor × foil transmission)")
+    if plan.monitor_selector == foil.foil_selector:
+        raise ValueError("the monitor and foil columns must be distinct")
+
+
+def _foil_normalization_identity(plan):
+    """Only a foil-corrected plan changes its identity; None and the monitor alone keep the one they had."""
+    foil = plan.foil_normalization
+    if foil is None:
+        return ()
+    return (("beam-normalization-v1", foil.mode(), (foil.foil_selector.name, foil.foil_selector.occurrence),
+             None if foil.exposure_selector is None
+             else (foil.exposure_selector.name, foil.exposure_selector.occurrence),
+             foil.absorption_lengths),)
+
+
+def _foil_normalization_record(plan):
+    foil = plan.foil_normalization
+    return {
+        "mode": foil.mode(),
+        "foil_selector": {"name": foil.foil_selector.name, "occurrence": foil.foil_selector.occurrence},
+        "exposure_selector": (None if foil.exposure_selector is None else
+                              {"name": foil.exposure_selector.name,
+                               "occurrence": foil.exposure_selector.occurrence}),
+        "absorption_lengths": list(foil.absorption_lengths),
+    }
+
+
+def _foil_backend_kwargs(plan) -> dict:
+    """The backends' foil keywords, only when the plan has a foil correction (a default call is unchanged)."""
+    foil = plan.foil_normalization
+    if foil is None:
+        return {}
+    return dict(foil_key=foil.foil_selector.name,
+                exposure_key=None if foil.exposure_selector is None else foil.exposure_selector.name,
+                absorption_lengths=foil.absorption_lengths)
+
+
+def _foil_divisors(plan, manifest) -> np.ndarray | None:
+    """The run's per-frame divisors under its foil correction, from the exact input manifest, so a bad column
+    refuses before any integration (the backends compute each frame's again, with the same function)."""
+    foil = plan.foil_normalization
+    if foil is None:
+        return None
+    rows = [{(name, occurrence): value for name, occurrence, value in contribution.values}
+            for contribution in manifest.contributions]
+
+    def column(selector):
+        return None if selector is None else [row[(selector.name, selector.occurrence)] for row in rows]
+    try:
+        return frame_divisors(len(rows), monitor=column(plan.monitor_selector), foil=column(foil.foil_selector),
+                              exposure=column(foil.exposure_selector),
+                              absorption_lengths=foil.absorption_lengths)
+    except BeamNormalizationRefused as error:
+        names = ", ".join(f"{label} {selector.name!r}" for label, selector in (
+            ("monitor", plan.monitor_selector), ("foil", foil.foil_selector),
+            ("exposure", foil.exposure_selector)) if selector is not None)
+        raise StitchOperationRefused(error.code, f"{error} ({names})") from None
+
+
 def _flat_cutoff_identity(plan):
     """A flat cutoff away from 10 % changes the identity; the default keeps the old one."""
     if plan._flat_receipt is None or plan.flat_min_fraction == DEFAULT_MIN_FLAT_FRACTION:
@@ -1734,6 +1843,10 @@ def _required_stitch_selectors(
     else:
         raise TypeError("stitch selectors require an exact Stitch plan")
     requested += (() if plan.monitor_selector is None else (plan.monitor_selector,))
+    if plan.foil_normalization is not None:  # decision 4's foil choices: the foil status and any exposure
+        requested += tuple(selector for selector in (plan.foil_normalization.foil_selector,
+                                                     plan.foil_normalization.exposure_selector)
+                           if selector is not None)
     if plan.gi is not None:  # the incidence (and xrayutilities' sample circles), per frame
         requested += tuple(MetadataColumnSelector(name, 0) for name in plan.gi.metadata_names())
     return tuple(
@@ -1979,6 +2092,8 @@ def _provenance(
                 "map_radial_range": None if plan.map_radial_range is None else list(plan.map_radial_range)}),
             # I(q)'s χ window, only when it has one (every χ otherwise, as before)
             **({} if plan.azimuth_range_1d is None else {"azimuth_range_1d": list(plan.azimuth_range_1d)}),
+            # decision 4's foil choices, only when the plan has one
+            **({} if plan.foil_normalization is None else {"foil_normalization": _foil_normalization_record(plan)}),
             "method": plan.method,
             "monitor_selector": (
                 None
@@ -2098,6 +2213,8 @@ def _xu_provenance(
             "plan_fingerprint": plan.fingerprint,
             # I(q)'s χ window, only when it has one (every χ otherwise, as before)
             **({} if plan.azimuth_range_1d is None else {"azimuth_range_1d": list(plan.azimuth_range_1d)}),
+            # decision 4's foil choices, only when the plan has one
+            **({} if plan.foil_normalization is None else {"foil_normalization": _foil_normalization_record(plan)}),
             **({} if plan.mode == "1d" else {"map": {
                 "npt_rad_2d": plan.npt_rad_2d, "npt_azim_2d": plan.npt_azim_2d,
                 # None (Auto): the frames' own χ extent, scouted when stitching
@@ -2370,6 +2487,7 @@ def prepare_stitch_operation(
                         "INVALID_MONITOR_VALUE",
                         "Stitch monitor values must be finite and strictly positive",
                     )
+        _foil_divisors(plan, manifest)
         geometry_relative = _relative_locator(
             plan.geometry.resolved_path,
             Path(manifest.project_root),
@@ -2397,6 +2515,7 @@ def prepare_stitch_operation(
             )
         energy_selector = _xu_energy_selector(plan, names)
         observations = _xu_observations(plan, manifest, energy_selector)
+        _foil_divisors(plan, manifest)
         try:
             revalidate_xu_stitch_calibration(plan.calibration)
             runtime_owner = xu_runtime_session()
@@ -2617,6 +2736,7 @@ def _runtime_plan(plan: StitchOperationPlan, diffractometer, saturation=None) ->
         monitor_key=(
             None if plan.monitor_selector is None else plan.monitor_selector.name
         ),
+        **_foil_backend_kwargs(plan),
         mask=mask,
         conditioning=plan.conditioning,
         saturation=saturation,
@@ -2985,6 +3105,7 @@ class StitchOperationExecution:
                         if plan.monitor_selector is None
                         else plan.monitor_selector.name
                     ),
+                    **_foil_backend_kwargs(plan),
                     source_energy_key=energy_key,
                     max_frame_bytes=plan.max_frame_bytes,
                     cancel_token=cancel_token,
@@ -3473,6 +3594,7 @@ def run_stitch_operation(
 
 __all__ = [
     "StitchContribution",
+    "StitchFoilNormalization",
     "StitchGeometryInput",
     "StitchGeometryKind",
     "StitchGeometryReceipt",

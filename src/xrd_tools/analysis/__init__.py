@@ -100,6 +100,7 @@ _EXPORTS = {
     "module_provenance_digest": ("xrd_tools.analysis.module_transaction", "module_provenance_digest"),
     # S1 exact standalone Stitch operation.
     "StitchContribution": ("xrd_tools.analysis.stitch_operation", "StitchContribution"),
+    "StitchFoilNormalization": ("xrd_tools.analysis.stitch_operation", "StitchFoilNormalization"),
     "StitchGeometryInput": ("xrd_tools.analysis.stitch_operation", "StitchGeometryInput"),
     "StitchGeometryKind": ("xrd_tools.analysis.stitch_operation", "StitchGeometryKind"),
     "StitchGeometryReceipt": ("xrd_tools.analysis.stitch_operation", "StitchGeometryReceipt"),

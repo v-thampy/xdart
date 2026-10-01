@@ -16,6 +16,7 @@ from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D, 
 from xrd_tools.core.energy import energy_eV_to_wavelength_m
 from xrd_tools.core.roi import RoiSpec, invalid_pixel_mask, roi_reduce
 from xrd_tools.core.scan import FrameSource, MaskSpec
+from xrd_tools.corrections.normalization import BeamNormalizationRefused, frame_divisors
 from xrd_tools.sources import ensure_frame_source
 from xrd_tools.integrate.stitch_conditioning import (
     StitchConditioning,
@@ -199,6 +200,12 @@ class StitchPlan:
     #: streaming multigeometry with a Diffractometer: I(q)'s χ window (°), as Int 1D's azimuthal range (a
     #: 1-D Stitch's, or I(q)'s beside a 2-D map); None: every χ. ``azimuth_range`` is the map's.
     azimuth_range_1d: tuple[float, float] | None = None
+    #: decision 4's foil choices: the foil-status column with its four ``absorption_lengths``, and the exposure
+    #: column with no monitor (Foil transmission × exposure) or none with a monitor before the foils (Monitor ×
+    #: foil transmission). Each frame's divisor is ``frame_divisors`` (RSM's too). None: the monitor alone.
+    foil_key: str | None = None
+    exposure_key: str | None = None
+    absorption_lengths: tuple[float, float, float, float] | None = None
 
     def provenance(self) -> dict[str, Any]:
         """A JSON-safe record of this stitch for persistence (a Stitch record's
@@ -229,6 +236,10 @@ class StitchPlan:
             # I(q)'s χ window, only when it has one (every χ otherwise, as older records)
             **({} if self.azimuth_range_1d is None else {"azimuth_range_1d": list(self.azimuth_range_1d)}),
             "monitor_key": self.monitor_key,
+            # decision 4's foil choices, only when the plan has one
+            **({} if self.foil_key is None else {
+                "foil_key": self.foil_key, "exposure_key": self.exposure_key,
+                "absorption_lengths": list(self.absorption_lengths)}),
             "streaming_multigeometry": self.streaming_multigeometry,
             "corrections": _ser(self.corrections),
             "error_model": self.error_model,
@@ -295,6 +306,10 @@ class StitchPlan:
             map_radial_range=tuple(mr) if mr else None,
             azimuth_range_1d=tuple(ar1) if ar1 else None,
             monitor_key=prov.get("monitor_key"),
+            foil_key=prov.get("foil_key"),
+            exposure_key=prov.get("exposure_key"),
+            absorption_lengths=(None if prov.get("absorption_lengths") is None
+                                else tuple(float(value) for value in prov["absorption_lengths"])),
             streaming_multigeometry=streaming_multigeometry,
             conditioning=(StitchConditioning(**prov["conditioning"])
                           if prov.get("conditioning") is not None else None),
@@ -634,10 +649,21 @@ def run_stitch(
             images.append(image)
         return images
 
-    normalization = (
-        _metadata_series(src, labels, plan.monitor_key)
-        if plan.monitor_key is not None else None
-    )
+    if plan.foil_key is not None:  # decision 4's foil choices: the shared divisor, RSM's too
+        try:
+            normalization = frame_divisors(
+                len(labels),
+                monitor=None if plan.monitor_key is None else _metadata_series(src, labels, plan.monitor_key),
+                foil=_metadata_series(src, labels, plan.foil_key),
+                exposure=None if plan.exposure_key is None else _metadata_series(src, labels, plan.exposure_key),
+                absorption_lengths=plan.absorption_lengths)
+        except BeamNormalizationRefused as error:
+            raise ValueError(f"stitch foil correction ({plan.foil_key!r}): {error}") from None
+    else:
+        normalization = (
+            _metadata_series(src, labels, plan.monitor_key)
+            if plan.monitor_key is not None else None
+        )
     _stitch_cancelled(cancel_token)
     if normalization is not None and (
         not np.all(np.isfinite(normalization))

@@ -27,6 +27,7 @@ from xrd_tools.core.geometry.xu_runtime import (
     XuRuntimeSession,
     xu_runtime_session,
 )
+from xrd_tools.corrections.normalization import BeamNormalizationRefused, frame_divisors
 from xrd_tools.corrections.stack import CorrectionStack
 from xrd_tools.integrate.frame_workers import parallel_frames
 from xrd_tools.integrate.multi import StitchDiagnostics
@@ -1196,6 +1197,9 @@ def run_xu_hist_stitch_1d(
     q_max_A_inverse: float | None = None,
     npt: int,
     monitor_key: str | None,
+    foil_key: str | None = None,
+    exposure_key: str | None = None,
+    absorption_lengths: tuple[float, float, float, float] | None = None,
     source_energy_key: str | None = None,
     max_frame_bytes: int,
     cancel_token: threading.Event | None = None,
@@ -1301,6 +1305,11 @@ def run_xu_hist_stitch_1d(
         or type(npt) is not int
         or not 1 <= npt <= 1_000_000
         or (monitor_key is not None and (type(monitor_key) is not str or not monitor_key))
+        # decision 4's foil choices: a foil column with its lengths, with an exposure or a monitor, never both
+        or (foil_key is not None and (type(foil_key) is not str or not foil_key or absorption_lengths is None
+                                      or (exposure_key is None) is (monitor_key is None)))
+        or (foil_key is None and (exposure_key is not None or absorption_lengths is not None))
+        or (exposure_key is not None and (type(exposure_key) is not str or not exposure_key))
         or (
             source_energy_key is not None
             and source_energy_key != "energy"
@@ -1398,6 +1407,26 @@ def run_xu_hist_stitch_1d(
                 raise XuStitchScienceRefused(
                     "INVALID_MONITOR_VALUE", "monitor must be finite and positive"
                 )
+        if foil_key is not None:  # decision 4's foil choices: the shared divisor, RSM's too
+            try:
+                foil_value = float(metadata[foil_key])
+            except (KeyError, TypeError, ValueError) as error:
+                raise XuStitchScienceRefused(
+                    "FOIL_STATUS_INVALID", "foil status is unavailable"
+                ) from error
+            try:
+                exposure_value = None if exposure_key is None else float(metadata[exposure_key])
+            except (KeyError, TypeError, ValueError) as error:
+                raise XuStitchScienceRefused(
+                    "EXPOSURE_INVALID", "exposure is unavailable"
+                ) from error
+            try:
+                monitor = float(frame_divisors(
+                    1, monitor=None if monitor_key is None else [monitor], foil=[foil_value],
+                    exposure=None if exposure_value is None else [exposure_value],
+                    absorption_lengths=absorption_lengths)[0])
+            except BeamNormalizationRefused as error:
+                raise XuStitchScienceRefused(error.code, str(error)) from None
         if source_energy_key is not None:
             try:
                 energy = float(metadata[source_energy_key])
