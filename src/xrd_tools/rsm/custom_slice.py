@@ -14,20 +14,36 @@ to it, so a plane through voxel centres reproduces those voxels exactly, float32
 
 The slice is interpolated from the gridded volume, not re-gridded from the frames; ``CustomSlice.interpolated``
 says so, and the window shows ``CustomSlice.note``.
+
+A Thickness above 0 averages a slab (the maintainer, 2026-10-01: "Do you want the Thickness option? Yes"): the
+planes parallel to the plane across ±thickness/2 along its unit normal n = u×v/|u×v|, in the volume's own
+coordinates (in HKL, r.l.u. taken as orthogonal axes: for a non-orthogonal lattice neither n nor the thickness is
+the reciprocal-space one, which the window says). The planes are an odd count, the plane itself in the middle,
+spaced at no more than the voxel spacing along n; each is sampled as the plane is, and its finite samples are
+summed and counted a block of rows at a time, so no planes × points array is made. Each value is the finite mean
+of its planes' samples and each projection the finite mean of every sample of the slab at its coordinate: an
+empty voxel counts in no mean, and a slab's value is NaN only where none of its planes has data. Thickness 0 is
+the plane alone, by the same code as before the slab.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import numpy as np
 
 
 #: A slice above this many samples is refused (a 2000 × 2000 plane is 16 MB of float32).
 MAX_SLICE_POINTS = 4_000_000
+#: A slab above this many samples (planes × points) is refused. The window cuts on the GUI thread, and a sample
+#: costs about 0.1 µs on an M3 Max (G11 probes 1 and 3), so the largest slab takes about 2 s there, four times
+#: the largest plane; its memory is the plane's (a block of rows of sums and counts at a time).
+MAX_SLAB_SAMPLES = 4 * MAX_SLICE_POINTS
 _SNAP = 1e-6  # index units: a float32 axis' rounding (about 1e-7 of a voxel) still snaps
 _MIN_COVERAGE = 0.5
 _CHUNK_POINTS = 1 << 16
 _NOTE = "interpolated from the gridded volume (trilinear), not re-gridded from the frames"
+_SPACING_ROUNDING = 1e-9  # voxel spacings: a half-thickness a whole number of them, up to rounding, adds no planes
 
 
 class CustomSliceRefused(ValueError):
@@ -40,7 +56,9 @@ class CustomSliceRefused(ValueError):
 
 @dataclass(frozen=True)
 class CustomSlice:
-    """One plane of an RSM volume: ``values[i, j]`` at ``origin + t[i]·u + s[j]·v``."""
+    """One plane of an RSM volume: ``values[i, j]`` at ``origin + t[i]·u + s[j]·v``; for a ``thickness`` above 0,
+    the finite mean of its ``planes`` parallel planes at ``origin + o·normal + t[i]·u + s[j]·v``, with ``o`` across
+    ±thickness/2 (``normal`` the plane's unit normal u×v/|u×v|, in the volume's coordinates)."""
 
     t: np.ndarray
     s: np.ndarray
@@ -52,8 +70,11 @@ class CustomSlice:
     origin: tuple[float, float, float]
     u: tuple[float, float, float]
     v: tuple[float, float, float]
+    normal: tuple[float, float, float]
     interpolated: bool = True
     note: str = _NOTE
+    thickness: float = 0.0
+    planes: int = 1
 
 
 def direction_label(direction, symbols=("H", "K", "L"), unit="r.l.u.") -> str:
@@ -123,16 +144,19 @@ def _sample_chunk(volume: np.ndarray, centres, flat: np.ndarray) -> np.ndarray:
 
 
 def custom_slice(values, axes, origin=None, u=(1.0, 1.0, 0.0), v=(0.0, 0.0, 1.0), u_range=None, v_range=None,
-                 points=None, *, symbols=("H", "K", "L"), unit="r.l.u.") -> CustomSlice:
+                 points=None, *, symbols=("H", "K", "L"), unit="r.l.u.", thickness=0.0) -> CustomSlice:
     """The plane ``origin + t·u + s·v`` of the volume (HH–L by default: u = (1, 1, 0), v = (0, 0, 1)).
 
     ``origin`` defaults to the volume's centre; each range defaults to the volume's extent along its direction
-    from the origin; ``points`` (t, s) defaults to the volume's longest axis in each direction. A zero or
-    parallel direction, a plane that misses the volume, a bad range or more than ``MAX_SLICE_POINTS`` samples
-    are refused with a reason."""
+    from the origin; ``points`` (t, s) defaults to the volume's longest axis in each direction. ``thickness``
+    above 0 averages the slab across ±thickness/2 along the plane's unit normal (the module's docstring). A zero
+    or parallel direction, a plane that misses the volume, a bad range, more than ``MAX_SLICE_POINTS`` samples a
+    plane, a negative or non-finite thickness or a slab of more than ``MAX_SLAB_SAMPLES`` are refused with a
+    reason."""
     volume = np.asarray(values)
     centres = _checked_axes(volume, axes)
     first, second = _directions(u, v)
+    width = _thickness(thickness)
     low = np.array([centre[0] for centre in centres])
     high = np.array([centre[-1] for centre in centres])
     centre_point = _origin(volume_centre(centres) if origin is None else origin)
@@ -145,18 +169,29 @@ def custom_slice(values, axes, origin=None, u=(1.0, 1.0, 0.0), v=(0.0, 0.0, 1.0)
     if count_t * count_s > MAX_SLICE_POINTS:
         raise CustomSliceRefused("CUSTOM_SLICE_TOO_LARGE",
                                  f"{count_t} × {count_s} samples is above Custom Slice's {MAX_SLICE_POINTS:,}")
+    across = np.cross(first, second)
+    normal = across / np.linalg.norm(across)
+    planes = _slab_planes(centres, normal, width, count_t * count_s)
     t = np.linspace(t_low, t_high, count_t)
     s = np.linspace(s_low, s_high, count_s)
-    # the displayed values, float32 as the viewer's; sampled a block of rows at a time, so no (t, s, 3) grid of
-    # coordinates is ever whole
-    shown = np.empty((count_t, count_s), dtype=np.float32)
-    rows = max(1, _CHUNK_POINTS // count_s)
-    for begin in range(0, count_t, rows):
-        block = centre_point + t[begin:begin + rows, None, None] * first + s[None, :, None] * second
-        shown[begin:begin + rows] = sample_volume(volume, centres, block)
+    if width == 0.0:
+        # the displayed values, float32 as the viewer's; sampled a block of rows at a time, so no (t, s, 3) grid
+        # of coordinates is ever whole
+        shown = np.empty((count_t, count_s), dtype=np.float32)
+        rows = max(1, _CHUNK_POINTS // count_s)
+        for begin in range(0, count_t, rows):
+            block = centre_point + t[begin:begin + rows, None, None] * first + s[None, :, None] * second
+            shown[begin:begin + rows] = sample_volume(volume, centres, block)
+        projection_t, projection_s = _finite_mean(shown, axis=1), _finite_mean(shown, axis=0)
+        note = _NOTE
+    else:
+        offsets = np.linspace(-width / 2.0, width / 2.0, planes)
+        shown, projection_t, projection_s = _slab(volume, centres, centre_point, first, second, normal, offsets,
+                                                  t, s)
+        note = f"{_NOTE}; averaged over {planes} planes, ±{width / 2.0:g} along [{_vector_text(across)}]"
     if not np.isfinite(shown).any():
         raise CustomSliceRefused("CUSTOM_SLICE_OUTSIDE", "the plane does not cross the volume's data")
-    arrays = (t, s, shown, _finite_mean(shown, axis=1), _finite_mean(shown, axis=0))
+    arrays = (t, s, shown, projection_t, projection_s)
     for array in arrays:
         array.setflags(write=False)
     return CustomSlice(
@@ -165,7 +200,77 @@ def custom_slice(values, axes, origin=None, u=(1.0, 1.0, 0.0), v=(0.0, 0.0, 1.0)
         projection_t=arrays[3], projection_s=arrays[4],
         origin=tuple(float(item) for item in centre_point),
         u=tuple(float(item) for item in first), v=tuple(float(item) for item in second),
+        normal=tuple(float(item) for item in normal), note=note, thickness=width, planes=planes,
     )
+
+
+def _slab(volume, centres, centre_point, first, second, normal, offsets, t, s):
+    """A slab's finite means, float32 out: each (t, s) over its planes, and each t (each s) over every sample of
+    the slab at it. Each plane is sampled as the plane alone is; float64 sums and counts are kept a block of rows
+    at a time, so neither a planes × points array nor a grid of coordinates is ever whole."""
+    count_t, count_s = t.size, s.size
+    shown = np.empty((count_t, count_s), dtype=np.float32)
+    sums_t, counts_t = np.zeros(count_t), np.zeros(count_t, dtype=np.int64)
+    sums_s, counts_s = np.zeros(count_s), np.zeros(count_s, dtype=np.int64)
+    rows = max(1, _CHUNK_POINTS // count_s)
+    for begin in range(0, count_t, rows):
+        sums = np.zeros((min(rows, count_t - begin), count_s))
+        counts = np.zeros(sums.shape, dtype=np.int64)
+        for offset in offsets:
+            plane = centre_point + offset * normal
+            block = plane + t[begin:begin + rows, None, None] * first + s[None, :, None] * second
+            sampled = sample_volume(volume, centres, block)
+            finite = np.isfinite(sampled)
+            sums += np.where(finite, sampled, 0.0)
+            counts += finite
+        sums_t[begin:begin + rows], counts_t[begin:begin + rows] = sums.sum(axis=1), counts.sum(axis=1)
+        sums_s += sums.sum(axis=0)
+        counts_s += counts.sum(axis=0)
+        shown[begin:begin + rows] = _mean(sums, counts)
+    return shown, _mean(sums_t, counts_t), _mean(sums_s, counts_s)
+
+
+def _mean(sums: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """Sums over counts as float32, NaN where nothing was counted."""
+    out = np.full(sums.shape, np.nan, dtype=np.float32)
+    present = counts > 0
+    out[present] = sums[present] / counts[present]
+    return out
+
+
+def _slab_planes(centres, normal: np.ndarray, width: float, samples: int) -> int:
+    """How many planes a slab of ``width`` samples: 1 for none; else the least odd count whose spacing,
+    width / (count − 1), is no more than the voxel spacing along ``normal`` (the least step_k / |n_k|: one voxel
+    along the axis the normal crosses fastest). Refused above ``MAX_SLAB_SAMPLES`` planes × ``samples``."""
+    if width == 0.0:
+        return 1
+    spacing = min((float(np.min(np.diff(centre))) / abs(component)
+                   for centre, component in zip(centres, normal) if component != 0.0 and centre.size > 1),
+                  default=math.inf)
+    halves = width / 2.0 / spacing  # voxel spacings in half the slab
+    if not halves < MAX_SLAB_SAMPLES:
+        raise CustomSliceRefused("CUSTOM_SLICE_TOO_LARGE", f"a slab {width:g} thick needs more than "
+                                 f"{MAX_SLAB_SAMPLES:,} planes: a thinner slab")
+    planes = 2 * max(1, math.ceil(halves - _SPACING_ROUNDING)) + 1
+    if planes * samples > MAX_SLAB_SAMPLES:
+        raise CustomSliceRefused("CUSTOM_SLICE_TOO_LARGE", f"{planes} planes × {samples:,} samples is above Custom "
+                                 f"Slice's {MAX_SLAB_SAMPLES:,}: a thinner slab, or fewer points")
+    return planes
+
+
+def _thickness(value) -> float:
+    try:
+        width = float(value)
+    except (TypeError, ValueError):
+        width = math.nan
+    if not (math.isfinite(width) and width >= 0.0):
+        raise CustomSliceRefused("CUSTOM_SLICE_THICKNESS_INVALID", "the thickness must be a finite number, 0 or more")
+    return width + 0.0  # -0.0 is no thickness
+
+
+def _vector_text(vector) -> str:
+    """A direction as the note writes it, "1 −1 0": a true minus, no negative zero."""
+    return " ".join(f"{float(item) + 0.0:g}".replace("-", "−") for item in vector)
 
 
 def volume_centre(axes) -> tuple[float, float, float]:
