@@ -594,8 +594,9 @@ def _holds_its_pixels(path: Path) -> bool:
     decodes every non-container member through fabio, which detects EDF by content, so an EDF named ``.img``
     or ``.tif`` also reads its pixels from the file its header names in ``EDF_BinaryFileName``, and no stat
     of the member proves that file (Codex BG-SERIES F2 and its re-review F1). Header only (about 0.3 ms). A
-    multi-frame EDF counts as not proven, and so does a header fabio cannot read, except a ``.raw`` member:
-    ``read_image`` decodes what fabio cannot open as raw binary, whose bytes are its pixels."""
+    multi-frame EDF counts as not proven. A header fabio cannot read is not an EDF's: the member decoded, so
+    fabio read it as another, self-contained format, or ``read_image`` decoded it as raw binary (``.raw``),
+    whose bytes are its pixels."""
     import fabio
     try:
         with fabio.openheader(str(path)) as image:
@@ -603,7 +604,7 @@ def _holds_its_pixels(path: Path) -> bool:
                 return True
             return int(image.nframes) == 1 and "EDF_BinaryFileName" not in image.header
     except Exception:
-        return path.suffix.casefold() == ".raw"
+        return True
 
 
 def _metadata(path: Path, plan: FrameBackgroundPlan, keys: tuple[str, ...], cancelled, *,
