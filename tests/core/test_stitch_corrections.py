@@ -324,3 +324,29 @@ def test_the_flat_cutoff_is_recorded_and_joins_the_plan_identity(tmp_path):
         == replace(plan, flat_path=None).fingerprint  # no flat: the cutoff changes nothing
     with pytest.raises(ValueError, match="flat cutoff"):
         replace(plan, flat_min_fraction=1.)
+
+
+def test_dark_and_flat_are_admitted_by_ints_detector_image_check(tmp_path):
+    """Codex's Stitch/Int reuse audit R4: Stitch admits a dark or flat as Int's preflight does (`prepare_dark` or
+    `prepare_flatfield`, then `check_detector_image`). An all-NaN dark was accepted (and became a fully masked
+    neutral dark) where Int refuses it; a flat [[0, 0], [0, 1]] got the median 0 of its finite pixels where Int's
+    check takes 1, the median of its positive ones. A partly invalid dark is still admitted: its non-finite
+    pixels join the frame mask at the run, as before."""
+    from xrd_tools.analysis.stitch_native import capture_detector_image
+    from xrd_tools.corrections.detector import check_detector_image, prepare_dark
+    dark = tmp_path / 'dark.npy'
+    np.save(dark, np.full((2, 2), np.nan))
+    with pytest.raises(ValueError, match='no finite pixel'):
+        prepare_dark(np.load(dark))  # Int's verdict
+    with pytest.raises(StitchOperationRefused) as refused:
+        capture_detector_image(dark, 'dark', 1 << 20)
+    assert refused.value.code == 'DARK_UNUSABLE' and 'no finite pixel' in str(refused.value)
+    flat = tmp_path / 'flat.npy'
+    np.save(flat, np.array([[0., 0.], [0., 1.]]))
+    receipt, _pixels = capture_detector_image(flat, 'flat', 1 << 20)
+    assert receipt.flat_median == check_detector_image(np.load(flat), 'flat').median == 1.0
+    assert receipt.flat_masked_pixels == 3  # the zeros, below the cutoff
+    partial = tmp_path / 'partial.npy'
+    np.save(partial, np.array([[np.nan, 2.], [3., 4.]]))
+    receipt, pixels = capture_detector_image(partial, 'dark', 1 << 20)
+    assert receipt.shape == (2, 2) and np.isnan(pixels[0, 0]) and pixels[1, 1] == 4.0

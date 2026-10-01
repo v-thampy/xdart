@@ -13,7 +13,9 @@ import stat
 import numpy as np
 
 from xrd_tools.core.geometry import ImageOrientation
-from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION, prepare_flatfield
+from xrd_tools.corrections.detector import (
+    DEFAULT_MIN_FLAT_FRACTION, check_detector_image, prepare_dark, prepare_flatfield,
+)
 from xrd_tools.io.stat_identity import identity_ctime_ns
 
 
@@ -161,14 +163,21 @@ def capture_detector_image(path, role, max_bytes, min_fraction=DEFAULT_MIN_FLAT_
             raise
         _refuse(f"{code}_UNAVAILABLE", str(error))
     pixels.setflags(write=False)
+    # Int's admission (corrections/detector.py, as output_preflight does): one prepared copy serves the
+    # usability check, an unusable dark or flat is refused, and the flat's median is the check's (its
+    # positive finite pixels) (Codex Stitch/Int reuse audit R4: an all-NaN dark was accepted here)
+    name = "flat field" if role == "flat" else "dark"
+    try:
+        prepared = prepare_flatfield(pixels, min_fraction) if role == "flat" else prepare_dark(pixels)
+    except ValueError as error:
+        _refuse(f"{code}_UNUSABLE", f"the {name} is unusable: {error}")
+    check = check_detector_image(pixels, role, min_fraction=min_fraction, prepared=prepared)
+    if check.errors:
+        _refuse(f"{code}_UNUSABLE", check.errors[0])
     masked = median = None
     if role == "flat":
-        finite = pixels[np.isfinite(pixels)]
-        median = float(np.median(finite)) if finite.size else None
-        try:
-            masked = int(np.isnan(prepare_flatfield(pixels, min_fraction)).sum())
-        except ValueError:
-            _refuse("FLAT_UNUSABLE", "the flat field has no usable pixels")
+        masked, median = int(np.isnan(prepared).sum()), check.median
+    del prepared
     receipt = StitchImageReceipt(role, str(lexical), str(resolved), after, digest,
                                  tuple(pixels.shape), hashlib.sha256(pixels.tobytes()).hexdigest(),
                                  masked, median,
