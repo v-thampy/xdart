@@ -440,6 +440,8 @@ class StitchPage(QtWidgets.QWidget):
         self._rows = {}
         self._revision = 0
         self._prepared_revision = None
+        # What the readiness line last asked the disk, reused while a value is typed (AUD-3R)
+        self._drafting, self._disk_facts = False, None
         #: What follows the preflight: "preview" shows the plan, "run" continues into the jobs
         #: (Run prepares changed inputs itself), "stopped" does neither (Stop while preparing).
         self._after_prepare = None
@@ -667,7 +669,7 @@ class StitchPage(QtWidgets.QWidget):
         # for every box) applies here too.
         row.editor.setProperty("stitchField", key)
         row.valueChanged.connect(self._edited)
-        row.draftChanged.connect(self._edited)
+        row.draftChanged.connect(self._draft_edited)
         row.browseRequested.connect(lambda _path, name=key: self._browse(name))
         self._fields[key], self._rows[key] = field, row
         self._keys_by_path[field.path] = key
@@ -1344,6 +1346,30 @@ class StitchPage(QtWidgets.QWidget):
             self._status(self._readiness[0], ready=self._readiness[1])
             self._sync_actions()
 
+    def _draft_edited(self, *_args):
+        """A keystroke: an edit like any other, except that the readiness line asks the disk nothing (AUD-3R,
+        maintainer 2026-09-30: "yes for cheap fix"): its file checks and calibration reads stay those of
+        the last committed values until the typed one is committed."""
+        self._drafting = True
+        try:
+            self._edited()
+        finally:
+            self._drafting = False
+
+    def _ask_disk(self, project, calibration, mask, sources, xu):
+        """The readiness line's disk facts: (the Project exists, the calibration exists, the mask exists, why
+        the calibration cannot drive the arm or None, the sources not found). A draft reuses the last ones."""
+        if self._drafting and self._disk_facts is not None:
+            return self._disk_facts
+        project_ready = bool(str(project).strip()) and Path(str(project)).is_dir()
+        calibration_found = bool(calibration) and Path(calibration).is_file()
+        mask_found = not mask or Path(mask).is_file()
+        arm_problem = ((self._calibration_pair(calibration, xu) or self._arm_problem())
+                       if calibration_found and mask_found else None)
+        gone = tuple(path.name for path in sources if not path.exists())
+        self._disk_facts = (project_ready, calibration_found, mask_found, arm_problem, gone)
+        return self._disk_facts
+
     def _source_committed(self, *_args):
         """A committed source or scan edit, never a draft (Codex audit G-F2: the page's source reads):
         the frames the selection's scans record, and the first scan's motors."""
@@ -1445,20 +1471,20 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["image_stem"].editor.setPlaceholderText(
             f"auto · {spec.stem if spec else '<SPEC name>'}_scan{first[1] if first else '<N>'}_")
         self._rows["output_family"].editor.setPlaceholderText(self._automatic_names(kind, sources))
-        project = Path(str(value("project_root") or ""))
-        project_ready = bool(str(value("project_root")).strip()) and project.is_dir()
         self.controls.apply_card_visibility(str(value("project_root") or ""))  # Int's gate: a Project first
         calibration = str(value("geometry_path") or "").strip()
         mask = str(value("mask_path") or "").strip()
-        experiment_ready = bool(calibration) and Path(calibration).is_file() and (not mask or Path(mask).is_file())
+        xu = value("backend") == "xrayutilities histogram"
+        project_ready, calibration_found, mask_found, arm_problem, gone = self._ask_disk(
+            value("project_root") or "", calibration, mask, sources, xu)
+        experiment_ready = bool(calibration) and calibration_found and mask_found
         detector = ControlsPanel._detector_status(tuple(  # Int's Detector status: fitted, or a mask
             replace(self._fields[key], value=value(key)) for key in ("geometry_path", "mask_path")))
         self._detector_card.status.setText(detector)
         self._detector_card.status.setVisible(bool(detector))
-        xu = value("backend") == "xrayutilities histogram"
-        arm_problem = (self._calibration_pair(calibration, xu) or self._arm_problem()) if experiment_ready else None
+        arm_problem = arm_problem if experiment_ready else None
         experiment_ready = experiment_ready and arm_problem is None
-        present = bool(sources) and all(path.exists() for path in sources)
+        present = bool(sources) and not gone
         try:
             groups = len(parse_stitch_scan_groups(scans)) if kind == "Spec" and value("scan_mode") != "Stitch All" else None
         except ValueError:
@@ -1489,9 +1515,9 @@ class StitchPage(QtWidgets.QWidget):
         if not experiment_ready and not arm_problem:
             needs["experiment"] = ("a calibration" if not calibration else
                                    f"the calibration {Path(calibration).name} (not found)"
-                                   if not Path(calibration).is_file() else f"the mask {Path(mask).name} (not found)")
+                                   if not calibration_found
+                                   else f"the mask {Path(mask).name} (not found)")
         if not source_ready:
-            gone = [path.name for path in sources if not path.exists()]
             needs["source"] = ({"Spec": "SPEC files", "NeXus": "NeXus files", "Directory": "a source folder"}
                                .get(kind, "a source") if not sources else f"{gone[0]} (not found)" if gone
                                else "a scan selection such as 1,2,[3-5]")

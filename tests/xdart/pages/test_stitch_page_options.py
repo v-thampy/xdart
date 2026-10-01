@@ -740,6 +740,31 @@ def test_the_selected_scans_frames_show_once_committed(qapp, tmp_path):
         _close(page, qapp)
 
 
+def test_a_typed_path_asks_the_disk_nothing_until_it_is_committed(qapp, tmp_path, monkeypatch):
+    """AUD-3R (maintainer, 2026-09-30: "yes for cheap fix"): the readiness line's file checks and calibration
+    reads run on a committed value; a keystroke reuses the last ones (a slow share is not asked per key)."""
+    import os
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        line = page.run_bar.readinessLabel
+        assert line.full_text().startswith("Ready")
+        asked, real = [], os.stat
+        monkeypatch.setattr(os, "stat", lambda *args, **kwargs: (asked.append(str(args[0])), real(*args, **kwargs))[1])
+        row = page._rows["geometry_path"]
+        typed = str(tmp_path / "missing.json")
+        row.editor.setText(typed)
+        row.draftChanged.emit(row._path, typed)  # a keystroke
+        assert asked == [] and line.full_text().startswith("Ready")  # the last committed calibration's facts
+        page.set_field("geometry_path", typed)  # committed: asked
+        assert any(path.endswith("missing.json") for path in asked)
+        assert "the calibration missing.json (not found)" in line.full_text()
+    finally:
+        monkeypatch.undo()
+        _close(page, qapp)
+
+
 def test_run_progress_reads_as_words_and_frames():
     """The run bar showed the operation's step count under its stage name ("science · 317/319"
     for 315 frames, live); it now says what is happening, with frames while stitching."""
