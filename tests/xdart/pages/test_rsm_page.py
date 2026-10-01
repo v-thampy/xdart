@@ -25,6 +25,7 @@ from xdart.gui.tools.rsm_values import RSMMemberDraft
 from xrd_tools.analysis.module_transaction import ModuleDisposition, ModuleTerminalResult
 from xrd_tools.analysis.rsm_geometry_asset import install_canonical_rsm_geometry_asset
 from xrd_tools.analysis.rsm_operation import RSMOperationExecutionV2, RSMOperationResultV2
+from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
 from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 from tests.core.test_rsm_operation_r2_real_data import _SCIENCE, rsm_r2_project  # noqa: F401
 from tests.xdart.tools.test_rsm_tool_dialog import (  # noqa: F401
@@ -55,7 +56,9 @@ def _wait(page, qapp, done, seconds=20.0):
 
 def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
     """The page and the RSM dialog it replaces make the same exact RSM v2 form from the same inputs (its
-    fingerprint names every member, selector, grid, frame and the output), for HKL and for Cartesian Q."""
+    fingerprint names every member, selector, grid, frame and the output), for HKL and for Cartesian Q; the
+    page's replaces its own result (stage 2), the dialog's creates a new one."""
+    from dataclasses import replace as replaced
     page = _page(qapp, owner=_Owner())
     dialog = RSMToolDialog(empty_host_services(_Status()), owner=_Owner())
     try:
@@ -65,7 +68,8 @@ def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
         dialog.project_edit.setText(str(tmp_path))
         dialog._apply_scan43_preset()
         dialog.output_edit.setText(str(output))
-        assert page.build_form().fingerprint == dialog._build_form().fingerprint
+        assert page.build_form().fingerprint == replaced(
+            dialog._build_form(), overwrite=AnalysisArtifactOverwrite.REPLACE).fingerprint
         page.set_field("coordinates", RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name)
         page.set_field("grid", "Full 200×200×200")
         page.set_field("normalization", "Identity")
@@ -73,7 +77,8 @@ def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
             dialog.coordinate_frame_combo.findData(RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU))
         dialog.grid_combo.setCurrentIndex(1)
         dialog.normalization_combo.setCurrentIndex(1)
-        assert page.build_form().fingerprint == dialog._build_form().fingerprint
+        assert page.build_form().fingerprint == replaced(
+            dialog._build_form(), overwrite=AnalysisArtifactOverwrite.REPLACE).fingerprint
     finally:
         _close(page, qapp)
         dialog.shutdown()
@@ -125,8 +130,8 @@ def _commit_instead_of_gridding(monkeypatch, values):
 def test_preview_lists_every_identity_and_run_paints_the_committed_six(qapp, tmp_path, monkeypatch):
     """Preview through the one RSM v2 owner (its real preflight on two ordered synthetic members) lists
     every member and identity and creates no folder (stage 2: the run makes the output's); Run previews,
-    grids and paints the committed result's six products on the shared panes, lists it, and the readiness
-    line then names the existing output."""
+    grids and paints the committed result's six products on the shared panes and lists it. An existing
+    output leaves Run available: Append ⇄ Replace decides (stage 2)."""
     _commit_instead_of_gridding(monkeypatch, _values())
     page = _page(qapp)
     try:
@@ -157,10 +162,7 @@ def test_preview_lists_every_identity_and_run_paints_the_committed_six(qapp, tmp
         assert page.run_bar.readinessLabel.full_text() == f"Saved {output.name}"
         output.parent.mkdir()
         output.write_bytes(b"")  # the run's file, as a real commit leaves it
-        page.set_field("grid", "Full 200×200×200")  # a repeat: the next edit names the existing file
-        assert page._readiness == (f"Output exists · choose another name ({output.name})", False)
-        assert not page.run_bar.startButton.isEnabled()
-        page.set_field("output_path", str(tmp_path / "again.nexus"))  # a repeat names another file
+        page.set_field("grid", "Full 200×200×200")  # a repeat over the existing output
         assert page._readiness[1] and page.run_bar.startButton.isEnabled()
     finally:
         _close(page, qapp)
@@ -477,3 +479,131 @@ def test_a_late_read_does_not_override_the_newer_selection(qapp, tmp_path):
         _wait(page, qapp, lambda: page.close_page().status is PageCleanup.CLEAN)
         page.deleteLater()
         qapp.processEvents()
+
+
+
+# AUD-9 stage 2: Append ⇄ Replace like Stitch's (the maintainer, 2026-10-01: "This should have the same
+# replace append option like stitch")
+
+
+def _terminal_instead_of_gridding(monkeypatch, disposition, code, *, until_stopped=False):
+    """The execution ends at once (or once stopped) with the given terminal, no payload."""
+    def run(self, *, cancel_token=None, progress_callback=None):
+        deadline = time.monotonic() + 10
+        while until_stopped and not cancel_token.is_set():
+            if time.monotonic() > deadline:
+                raise AssertionError("Stop never reached the operation")
+            time.sleep(0.005)
+        result = _Committed()
+        result.request = self.request
+        result.terminal = SimpleNamespace(disposition=disposition, code=code, diagnostic=None)
+        result.payload = None
+        return result
+    monkeypatch.setattr(RSMOperationExecutionV2, "run", run)
+
+
+def _leaving_the_file(monkeypatch):
+    """The execution stand-in leaves its output file, as a real commit does."""
+    stand_in = RSMOperationExecutionV2.run
+
+    def run(self, **kwargs):
+        target = Path(self.request.module.output.target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"")
+        return stand_in(self, **kwargs)
+    monkeypatch.setattr(RSMOperationExecutionV2, "run", run)
+
+
+def test_append_skips_an_up_to_date_output_and_replace_grids_it_again(qapp, tmp_path, monkeypatch):
+    """Stitch's semantics: the run bar's toggle (Append by default) is live. In Append a Run skips an output
+    whose stored result is this request's (the preflight's rsm_output_current) and says so; a stale one is
+    gridded again; in Replace every Run grids. The form is REPLACE throughout: Append is the page's skip."""
+    from xdart.gui.tools import rsm_values
+    _commit_instead_of_gridding(monkeypatch, _values())
+    committed_run, runs = RSMOperationExecutionV2.run, []
+
+    def counted(self, **kwargs):
+        runs.append(self.request.module.output.overwrite)
+        return committed_run(self, **kwargs)
+    monkeypatch.setattr(RSMOperationExecutionV2, "run", counted)
+    current = [True]
+    monkeypatch.setattr(rsm_values, "rsm_output_current", lambda _request: current[0])
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        output = Path(page._value("output_path"))
+        output.parent.mkdir()
+        output.write_bytes(b"")  # a result already there
+        toggle = page.run_bar.writeModeButton
+        assert toggle.isEnabled() and page.run_bar.write_mode() == "Append"
+        assert toggle.toolTip().startswith("Append: skip the output")
+        page.begin_run()
+        _wait(page, qapp, lambda: "Up to date" in label.full_text())
+        assert runs == [] and label.full_text() == (
+            f"Up to date · {output.name} already gridded with these settings (Replace ⇄ grids again)")
+        assert "already gridded with these settings (Append skips it)" in page.preview_text.toPlainText()
+        current[0] = False  # stale: Append grids it again
+        page.begin_run()
+        _wait(page, qapp, lambda: len(runs) == 1 and not page.active())
+        current[0] = True
+        toggle.click()  # Replace
+        assert page.run_bar.write_mode() == "Overwrite" and toggle.toolTip().startswith("Replace: grid again")
+        page.begin_run()
+        _wait(page, qapp, lambda: len(runs) == 2 and not page.active())
+        assert runs == [AnalysisArtifactOverwrite.REPLACE] * 2
+    finally:
+        _close(page, qapp)
+
+
+def test_a_replace_repaints_the_new_result_under_the_same_name(qapp, tmp_path, monkeypatch):
+    """A Run that replaces the output shows its new result in place of the old one, under the one listed
+    name."""
+    first, second = _values(), _values(offset=7.0)
+    _commit_instead_of_gridding(monkeypatch, first)
+    _leaving_the_file(monkeypatch)
+    page = _page(qapp)
+    try:
+        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        page.run_bar.writeModeButton.click()  # Replace
+        page.begin_run()
+        _wait(page, qapp, lambda: page.view.shown is not None)
+        assert page.view.shown[0] is first
+        assert Path(page._value("output_path")).is_file()
+        monkeypatch.setattr(page_module, "make_rsm_viewer_values", {"payload": second}.__getitem__)
+        page.begin_run()
+        _wait(page, qapp, lambda: page.view.shown[0] is second and not page.active())
+        assert page.results.count() == 1
+        np.testing.assert_array_equal(page.view.slices[0].canvas.raw_image,
+                                      np.asarray(page.view.shown[1].products[0].values).T)
+    finally:
+        _close(page, qapp)
+
+
+def test_a_refused_or_stopped_replace_keeps_the_prior_result_shown(qapp, tmp_path, monkeypatch):
+    """A replace the publisher refuses (a foreign or other-kind file at the target) or one stopped while
+    gridding leaves the prior result listed and shown (its file is replaced only at commit)."""
+    _commit_instead_of_gridding(monkeypatch, _values())
+    _leaving_the_file(monkeypatch)
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        page.run_bar.writeModeButton.click()  # Replace
+        page.begin_run()
+        _wait(page, qapp, lambda: page.view.shown is not None and not page.active())
+        prior = page.view.shown
+        assert Path(page._value("output_path")).is_file()
+        _terminal_instead_of_gridding(monkeypatch, ModuleDisposition.REFUSED, "OUTPUT_NOT_PREVIOUS_ANALYSIS")
+        page.begin_run()
+        _wait(page, qapp, lambda: "refused" in label.full_text() and not page.active())
+        assert label.full_text() == "RSM refused: OUTPUT_NOT_PREVIOUS_ANALYSIS"
+        assert page.view.shown is prior and page.results.count() == 1
+        _terminal_instead_of_gridding(monkeypatch, ModuleDisposition.CANCELLED, "CANCELLED", until_stopped=True)
+        page.begin_run()
+        _wait(page, qapp, lambda: page._owner.busy and page.run_bar.stopButton.isEnabled())
+        page.stop()
+        _wait(page, qapp, lambda: "stopped" in label.full_text() and not page.active())
+        assert page.view.shown is prior and page.results.count() == 1
+    finally:
+        _close(page, qapp)

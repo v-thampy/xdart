@@ -3414,11 +3414,11 @@ _REVISION_KEYS = frozenset({"fingerprint", "revision", "primary_revision",
                             "module_source_fingerprint", "source_fingerprint"})
 
 
-def _without_revisions(value):
+def _without_revisions(value, keys=_REVISION_KEYS):
     if type(value) is dict:
-        return {key: _without_revisions(item) for key, item in value.items() if key not in _REVISION_KEYS}
+        return {key: _without_revisions(item, keys) for key, item in value.items() if key not in keys}
     if type(value) is list:
-        return [_without_revisions(item) for item in value]
+        return [_without_revisions(item, keys) for item in value]
     return value
 
 

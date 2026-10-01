@@ -43,6 +43,7 @@ from xrd_tools.analysis.rsm_operation import (
     prepare_rsm_operation_v2,
     required_rsm_selectors,
     required_rsm_selectors_v2,
+    rsm_output_current,
 )
 from xrd_tools.analysis.scan_operations import (
     AnalysisDisposition,
@@ -393,6 +394,9 @@ class RSMToolFormV2:
     output_path: str | Path
     overwrite: AnalysisArtifactOverwrite = AnalysisArtifactOverwrite.CREATE_NEW
     coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL
+    #: The family of the stable slot ``<family>_rsm.nexus`` that ``output_path`` is, when it is one the
+    #: page suggested; persisted with the result as native Stitch persists its own (AUD-9 stage 2).
+    output_family: str | None = None
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -400,6 +404,11 @@ class RSMToolFormV2:
         output = _absolute_path(self.output_path, "RSM v2 output path")
         if Path(output).suffix.casefold() != ".nexus":
             raise ValueError("RSM v2 output path must end in .nexus")
+        if self.output_family is not None:
+            from xrd_tools.io.output_path import resolve_finite_output_target
+            if type(self.output_family) is not str or os.path.normcase(str(resolve_finite_output_target(
+                    Path(output).parent, self.output_family, operation_token="rsm"))) != output:
+                raise ValueError("RSM v2 output family does not name its output's stable slot")
         if (
             type(self.geometry_asset) is not RSMGeometryAssetInput
             or type(self.members) is not tuple
@@ -426,8 +435,6 @@ class RSMToolFormV2:
             or type(self.coordinate_frame) is not RSMCoordinateFrame
         ):
             raise TypeError("RSM v2 tool form is invalid")
-        if self.overwrite is not AnalysisArtifactOverwrite.CREATE_NEW:
-            raise ValueError("RSM v2 output policy must create a new artifact")
         normalization_keys = {
             (selector.name, selector.occurrence)
             for selector in (
@@ -464,7 +471,7 @@ class RSMToolFormV2:
             self.coordinate_frame.axis_names,
             self.coordinate_frame.axis_units,
             self.coordinate_frame.matrix_policy,
-        )
+        ) + (() if self.output_family is None else (self.output_family,))
         object.__setattr__(
             self,
             "fingerprint",
@@ -1506,11 +1513,14 @@ class RSMToolPreflightV2:
     form: RSMToolFormV2
     request: RSMOperationRequestV2
     summary: RSMToolPreflightSummaryV2
+    #: The output already holds this request's RSM (``rsm_output_current``): a Run in Append skips it.
+    output_current: bool = False
     _claim: InitVar[object] = None
 
     def __post_init__(self, _claim: object) -> None:
         if (
             _claim is not _PREFLIGHT_V2_FACTORY
+            or type(self.output_current) is not bool
             or type(self.form) is not RSMToolFormV2
             or type(self.request) is not RSMOperationRequestV2
             or type(self.summary) is not RSMToolPreflightSummaryV2
@@ -1668,6 +1678,7 @@ def prepare_rsm_tool_v2(
             project / output_relative,
             AnalysisArtifactKind.RSM,
             form.overwrite,
+            form.output_family,
         )
         request = prepare_rsm_operation_v2(
             group,
@@ -1772,7 +1783,9 @@ def prepare_rsm_tool_v2(
         tuple(holds_value),
         _PREFLIGHT_V2_FACTORY,
     )
-    return RSMToolPreflightV2(form, request, summary, _PREFLIGHT_V2_FACTORY)
+    return RSMToolPreflightV2(
+        form, request, summary, rsm_output_current(request), _PREFLIGHT_V2_FACTORY
+    )
 
 
 def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]:

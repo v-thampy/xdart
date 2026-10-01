@@ -87,6 +87,7 @@ from xrd_tools.io.analysis_artifact import (
     canonical_analysis_provenance,
     project_analysis_artifact_result,
     read_analysis_artifact,
+    rsm_record_identity,
 )
 from xrd_tools.io.nexus import write_rsm
 from xrd_tools.io.stat_identity import identity_ctime_ns
@@ -651,7 +652,9 @@ def _bind_project_output(
         raise RSMOperationRefused(
             "OUTPUT_PATH_INVALID", "RSM output has no bounded Project path"
         )
-    return ModuleOutputRequest(resolved, output.kind, output.overwrite)
+    return ModuleOutputRequest(
+        resolved, output.kind, output.overwrite, output.artifact_family
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2781,6 +2784,12 @@ def _rsm_v2_provenance(
             "overwrite": output.overwrite.value,
             "output_fingerprint": output.fingerprint,
             **output_authority.to_provenance(),
+            # the stable slot's family, persisted as native Stitch persists its own
+            **(
+                {}
+                if output.artifact_family is None
+                else {"artifact_family": output.artifact_family}
+            ),
         },
         "holds": list(_RSM_V2_HOLDS),
     }
@@ -3717,11 +3726,8 @@ def prepare_rsm_operation_v2(
         or type(coordinate_frame) is not RSMCoordinateFrame
     ):
         raise TypeError("RSM v2 preparation requires exact grouped values")
-    if output.overwrite is not AnalysisArtifactOverwrite.CREATE_NEW:
-        raise RSMOperationRefused(
-            "RSM_OUTPUT_POLICY_UNSUPPORTED",
-            "RSM v2 must create one new immutable artifact",
-        )
+    # REPLACE regenerates a same-kind RSM result in place; the publisher refuses a
+    # foreign or other-kind file at the target (AUD-9 stage 2, Stitch's Replace).
     if len(set(member_form_fingerprints)) != len(member_form_fingerprints):
         raise RSMOperationRefused(
             "RSM_SOURCE_GROUP_INVALID",
@@ -5850,6 +5856,39 @@ def run_rsm_operation_v2(
     )
 
 
+def rsm_output_current(request: RSMOperationRequestV2) -> bool:
+    """Whether ``request``'s output already holds its RSM: the same plan (geometry,
+    grid, conditioning, normalization, frame) over the same members and frames
+    (sources, scans, images and motor readings). A Run in Append mode skips such an
+    output, as Stitch's skips one (``stitch_output_current``, AUD-9 stage 2).
+
+    File revisions are left out as Stitch leaves them out, and with them the
+    metadata table's fingerprint, which carries its SPEC file's revision (probe 2:
+    a SPEC file grown by a later scan changes it and nothing else of the member):
+    an earlier scan's RSM stays standing. The file's envelope alone is read
+    (``rsm_record_identity``); a missing, unreadable or foreign file is not current.
+    """
+
+    from xrd_tools.analysis.stitch_operation import _REVISION_KEYS, _without_revisions
+
+    if type(request) is not RSMOperationRequestV2:
+        raise TypeError("RSM v2 output currency requires an exact request")
+    target = Path(request.module.output.target)
+    identity = rsm_record_identity(target) if target.is_file() else None
+    if identity is None:
+        return False
+    plan_fingerprint, provenance = identity
+    keys = _REVISION_KEYS | {"table_fingerprint"}
+    try:
+        stored = json.loads(provenance)["members"]
+        planned = json.loads(json.dumps(request.provenance["members"]))
+    except (ValueError, KeyError, TypeError):
+        return False
+    return plan_fingerprint == request.plan.fingerprint and _without_revisions(
+        stored, keys
+    ) == _without_revisions(planned, keys)
+
+
 __all__ = [
     "RSMCommonGrid",
     "RSMContribution",
@@ -5886,5 +5925,6 @@ __all__ = [
     "run_rsm_operation",
     "run_rsm_operation_v2",
     "rsm_normalization_divisors",
+    "rsm_output_current",
     "rsm_static_hot_mask",
 ]

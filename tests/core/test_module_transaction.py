@@ -2109,3 +2109,18 @@ def test_mismatched_provenance_is_refused_before_output_admission(tmp_path):
         )
     assert raised.value.code == "PROVENANCE_MISMATCH"
     assert not Path(request.output.target).exists()
+
+
+def test_an_rsm_family_names_its_stable_slot_also_where_paths_fold_case(tmp_path, monkeypatch):
+    """AUD-9 stage 2: an RSM output carries the family of its stable slot ``<family>_rsm.nexus``, as Stitch's
+    outputs carry theirs. Windows folds a target's case and not the family's: the slot is compared folded."""
+    output = ModuleOutputRequest(
+        tmp_path / "STO_43_rsm.nexus", AnalysisArtifactKind.RSM, AnalysisArtifactOverwrite.REPLACE, "STO_43")
+    assert output.artifact_family == "STO_43"
+    with pytest.raises(ValueError, match="stable slot"):
+        ModuleOutputRequest(
+            tmp_path / "STO_43.nexus", AnalysisArtifactKind.RSM, AnalysisArtifactOverwrite.REPLACE, "STO_43")
+    monkeypatch.setattr(os.path, "normcase", str.lower)  # as ntpath.normcase folds
+    folded = ModuleOutputRequest(
+        tmp_path / "STO_43_rsm.nexus", AnalysisArtifactKind.RSM, AnalysisArtifactOverwrite.REPLACE, "STO_43")
+    assert folded.target == str(tmp_path / "STO_43_rsm.nexus").lower()

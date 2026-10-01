@@ -2301,6 +2301,23 @@ def stitch_record_identity(path: str | Path) -> tuple[str, str] | None:
         return None
 
 
+def rsm_record_identity(path: str | Path) -> tuple[str, str] | None:
+    """A saved RSM result's plan fingerprint and provenance JSON, as ``stitch_record_identity`` reads a
+    Stitch record's: from the envelope alone, on the entry where an RSM keeps it (None when the file is
+    not one). Its stored volume is not read or verified."""
+    try:
+        with h5py.File(_absolute_path(path), "r") as handle:
+            entry = handle.get(_ENTRY)
+            if (not isinstance(entry, h5py.Group)
+                    or _bounded_attr_text(entry, ANALYSIS_SCHEMA_ATTR) != ANALYSIS_SCHEMA_NAME
+                    or _bounded_attr_text(entry, ANALYSIS_KIND_ATTR) != AnalysisArtifactKind.RSM.value):
+                return None
+            return (_sha256(_bounded_attr_text(entry, "plan_fingerprint"), "plan_fingerprint"),
+                    _read_scalar_text(entry, _PROVENANCE))
+    except (OSError, KeyError, ValueError, TypeError, AnalysisArtifactError):
+        return None
+
+
 def inspect_analysis_artifact(
     path: str | Path,
     *,
@@ -3313,6 +3330,7 @@ __all__ = [
     "canonical_analysis_provenance",
     "inspect_analysis_artifact",
     "stitch_record_identity",
+    "rsm_record_identity",
     "project_analysis_artifact_result",
     "read_analysis_artifact",
 ]

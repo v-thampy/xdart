@@ -7,8 +7,10 @@ products. The RSM v2 owner (``tools.rsm_owner.RSMToolOwner.v2``) is the one oper
 its exact ``RSMToolFormV2`` and shows what the owner returns; it holds no operation state or science of
 its own. A saved result is reopened on the shared single-worker owner, off the GUI thread.
 
-Stage 1 keeps the operation's create-new output (a repeat names another file); the stable same-kind
-``_rsm.nexus`` replacement is stage 2. Preview creates no folder: the run makes the output's (stage 2).
+Stage 2 (the maintainer, 2026-10-01: "This should have the same replace append option like stitch"): the
+run bar's Append ⇄ Replace is Stitch's. The operation replaces its same-kind ``_rsm.nexus`` in place (a
+foreign or other-kind file there stays refused), and a Run in Append skips an output already gridded with
+the same settings over the same frames. Preview creates no folder: the run makes the output's.
 """
 from __future__ import annotations
 
@@ -109,9 +111,9 @@ def _progress_text(stage, completed, total):
     return f"{_STAGE_TEXT.get(stage, stage)}…"
 
 
-def suggested_output(project_root, members):
-    """The output a page suggests for its ordered members: ``<Project>/xdart_processed_data/<family>_rsm
-    .nexus``, the family as the slot policy derives it from the members (``rsm`` when it cannot)."""
+def suggested_family(project_root, members):
+    """The family a page suggests for its ordered members, as the slot policy derives it from them (``rsm``
+    when it cannot)."""
     from xrd_tools.io.output_path import automatic_artifact_family, is_artifact_family
     root = Path(project_root)
     try:
@@ -119,9 +121,15 @@ def suggested_output(project_root, members):
             tuple((root / member.spec_path, member.scan) for member in members), root)
     except (ValueError, OSError):
         family = ""
-    if not is_artifact_family(family):
-        family = "rsm"
-    return str(root / "xdart_processed_data" / f"{family}_rsm.nexus")
+    return family if is_artifact_family(family) else "rsm"
+
+
+def suggested_output(project_root, members):
+    """The output a page suggests for its ordered members: the stable slot ``<Project>/xdart_processed_data/
+    <family>_rsm.nexus`` of ``suggested_family``."""
+    from xrd_tools.io.output_path import resolve_finite_output_target
+    return str(resolve_finite_output_target(Path(project_root) / "xdart_processed_data",
+                                            suggested_family(project_root, members), operation_token="rsm"))
 
 
 class RSMPage(QtWidgets.QWidget):
@@ -220,10 +228,10 @@ class RSMPage(QtWidgets.QWidget):
         self.run_bar.set_unavailable_modes(UNOWNED_RUN_MODE_REASONS)
         self.run_bar.modeCombo.setCurrentText("RSM")
         self.run_bar.modeChanged.connect(self._mode_chosen)
-        # Stage 1 writes a new file only (the operation refuses one that exists): the toggle says so
-        self.run_bar.writeModeButton.setEnabled(False)
-        self.run_bar.writeModeButton.setToolTip(
-            "RSM writes a new result: name another Output to repeat (replacing comes later)")
+        # Stitch's Append ⇄ Replace: Append skips an output already gridded with these settings, Replace
+        # grids it again (the maintainer, 2026-10-01: "the same replace append option like stitch")
+        self.run_bar.writeModeChanged.connect(self._write_mode_changed)
+        self._write_mode_changed()
         self.run_bar.actionClicked.connect(self.begin_run)
         self.run_bar.stopClicked.connect(self.stop)
         right_layout.addWidget(self.run_bar)
@@ -233,6 +241,12 @@ class RSMPage(QtWidgets.QWidget):
         self.splitter.setStretchFactor(1, 3)
         self.splitter.setStretchFactor(2, 1)
         self.splitter.setSizes([289, 868, 323])  # Int's columns, so the pages switch in place
+
+    def _write_mode_changed(self, _mode=None):
+        self.run_bar.writeModeButton.setToolTip(
+            "Append: skip the output when it was already gridded from the same frames with the same settings"
+            if self.run_bar.write_mode() == "Append" else
+            "Replace: grid again; the output is replaced once its new result is written")
 
     def _row(self, section, key, label, value, choices, browse):
         kind = ControlFieldKind.COMBO if choices else ControlFieldKind.LINE
@@ -519,13 +533,17 @@ class RSMPage(QtWidgets.QWidget):
         def optional(key):
             text = str(self._value(key)).strip()
             return None if not text else float(text)
+        output = self._inside(project, str(self._value("output_path")).strip(), "output path")
+        # the suggested output is its family's stable slot, and the result records that family
+        family = (suggested_family(project, self._members)
+                  if str(output) == suggested_output(project, self._members) else None)
         return RSMToolFormV2(
             project_text, rsm_geometry_asset_input(str(self._value("geometry_asset")).strip()), tuple(members),
             RSMImageConditioning(float(self._value("offset")), optional("high_threshold"), optional("static_hot")),
             normalization, tuple(_GRIDS[self._value("grid")]), self.chunk_size.value(),
-            self.max_frame_mib.value() * _MIB, self.max_chunk_mib.value() * _MIB,
-            self._inside(project, str(self._value("output_path")).strip(), "output path"),
-            AnalysisArtifactOverwrite.CREATE_NEW, coordinate_frame=_FRAMES[self._value("coordinates")])
+            self.max_frame_mib.value() * _MIB, self.max_chunk_mib.value() * _MIB, output,
+            AnalysisArtifactOverwrite.REPLACE,  # Append is the page's skip, as Stitch's (_start_run)
+            coordinate_frame=_FRAMES[self._value("coordinates")], output_family=family)
 
     # ── readiness ──
     def _edited(self, *_args):
@@ -572,8 +590,6 @@ class RSMPage(QtWidgets.QWidget):
         output = str(self._value("output_path")).strip()
         if not output.endswith(".nexus"):
             needs.append("an Output ending in .nexus")
-        elif self._inside(root, output, "output").exists():
-            return f"Output exists · choose another name ({Path(output).name})", False
         if needs:
             return "Needs " + ", ".join(needs), False
         grid = "×".join(str(size) for size in _GRIDS[self._value("grid")])
@@ -672,6 +688,14 @@ class RSMPage(QtWidgets.QWidget):
         self._sync_actions()
 
     def _start_run(self, form):
+        prepared = self._owner.prepared
+        if (self.run_bar.write_mode() == "Append" and prepared is not None and prepared.is_current(form)
+                and prepared.output_current and Path(form.output_path).is_file()):
+            # Stitch's Append: the output already holds this RSM; the next Run checks again
+            self._prepared_fingerprint = None
+            self._status(f"Up to date · {Path(form.output_path).name} already gridded with these settings "
+                         "(Replace ⇄ grids again)")
+            return
         self._owner.set_form(form)
         if self._owner.begin_run() is None:
             self._prepared_fingerprint = None
@@ -737,7 +761,11 @@ class RSMPage(QtWidgets.QWidget):
                 return
             self._prepared_fingerprint = preflight.form.fingerprint
             summary = preflight.summary
-            self.preview_text.setPlainText("\n".join(rsm_preflight_summary_lines(summary)))
+            lines = rsm_preflight_summary_lines(summary)
+            if preflight.output_current:  # as Stitch's Preview says it
+                lines.append(f"Output {Path(preflight.form.output_path).name}: already gridded with these "
+                             "settings (Append skips it)")
+            self.preview_text.setPlainText("\n".join(lines))
             self.identity.setText(f"raw {summary.geometry_asset_raw_sha256[:12]} · semantic "
                                   f"{summary.geometry_asset_semantic_fingerprint[:12]}")
             if self._run_requested:
@@ -766,7 +794,7 @@ class RSMPage(QtWidgets.QWidget):
             target = str(result.request.module.output.target)
             current = not update.stale and self._active_revision == self._form_revision
             self._add_result(target, result.payload, show=current)
-            self._edited()  # the output now exists: Run waits for another name
+            self._edited()  # the next Run checks again: in Append it finds this output up to date
             if current:
                 self._status(f"Saved {Path(target).name}", ready=True)
             else:

@@ -720,14 +720,7 @@ def test_core_v2_rejects_duplicate_forms_and_limits_before_runtime(
         prepare_rsm_operation_v2(**duplicate)
     assert refused.value.code == "RSM_SOURCE_GROUP_INVALID"
 
-    replace_output = dict(common)
-    replace_output["output"] = replace(
-        request.module.output,
-        overwrite=AnalysisArtifactOverwrite.REPLACE,
-    )
-    with pytest.raises(RSMOperationRefused) as refused:
-        prepare_rsm_operation_v2(**replace_output)
-    assert refused.value.code == "RSM_OUTPUT_POLICY_UNSUPPORTED"
+    # REPLACE is no longer an invalid intent (AUD-9 stage 2): test_v2_replace_regenerates_*
 
     invalid_cases = (
         ("bins", (1_000_001, 2, 2), "RSM_COMMON_GRID_INVALID"),
@@ -2301,14 +2294,18 @@ def test_mutated_mask_receipt_reload_failure_retains_exact_execution(
     assert counts == {"science": 2, "writer": 1, "read": 2}
 
 
-def test_v2_refuses_the_retired_replace_output_policy(tmp_path):
+def test_v2_takes_replace_for_its_own_result(tmp_path):
+    """AUD-9 stage 2 (the maintainer, 2026-10-01: "the same replace append option like stitch"): the v2 form
+    and preparation take REPLACE, which the request and its provenance carry; v1 still refuses it
+    (test_rsm_operation.py)."""
     member = _write_member(tmp_path, 0)
-    initial = _form(tmp_path, (member,))
-    with pytest.raises(ValueError, match="must create a new artifact"):
-        replace(initial, overwrite=AnalysisArtifactOverwrite.REPLACE)
+    form = replace(_form(tmp_path, (member,)), overwrite=AnalysisArtifactOverwrite.REPLACE)
+    request = prepare_rsm_tool_v2(form).request
+    assert request.module.output.overwrite is AnalysisArtifactOverwrite.REPLACE
+    assert request.provenance["output"]["overwrite"] == "replace"
 
 
-# AUD-9 stage 2: the output folder made by the run
+# AUD-9 stage 2: Replace and Append like Stitch, and the output folder made by the run
 
 
 def _runnable(monkeypatch, level=10):
@@ -2382,3 +2379,116 @@ def test_v2_a_folder_swapped_for_a_link_after_preview_is_refused(tmp_path, monke
     assert result.terminal.disposition is ModuleDisposition.REFUSED
     assert result.terminal.code == "OUTPUT_IDENTITY_MISMATCH"
     assert not any(outside.iterdir())
+
+
+def test_v2_replace_regenerates_its_own_result_and_append_knows_a_current_one(tmp_path, monkeypatch):
+    """Replace grids again and replaces the same-kind result at the same path (new data, read back from the
+    file). The Append check (rsm_output_current, Stitch's stitch_output_current for RSM) finds a result
+    current for the same plan over the same frames, also after the SPEC file grows by a later scan (probe
+    2: only revisions change), and stale for another plan."""
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
+
+    _runnable(monkeypatch, level=10)
+    member = _write_member(tmp_path, 0)
+    form = replace(_form(tmp_path, (member,)), overwrite=AnalysisArtifactOverwrite.REPLACE)
+    first = prepare_rsm_tool_v2(form)
+    assert first.output_current is False
+    committed = run_rsm_operation_v2(first.request)
+    assert committed.terminal.disposition is ModuleDisposition.COMMITTED
+    with Path(member.spec_path).open("a", encoding="utf-8") as spec:
+        spec.write(
+            "\n#S 2 ascan eta 0 1 1 1\n#D Mon Jan 15 10:31:00 2024\n#P0 13000.007 10 20 30 40 50\n"
+            "#G3 1.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 1.0\n#N 4\n#L eta  Seconds  Seconds  foil status\n"
+            "0.0 1 10 101\n1.0 2 20 110\n"
+        )
+    again = prepare_rsm_tool_v2(form)
+    assert again.output_current is True
+    assert prepare_rsm_tool_v2(replace(form, bins=(5, 5, 6))).output_current is False
+    _runnable(monkeypatch, level=1000)  # the same frames read again with other counts: Replace grids anew
+    replaced = run_rsm_operation_v2(again.request)
+    assert replaced.terminal.disposition is ModuleDisposition.COMMITTED, replaced.terminal.code
+    assert replaced.payload.result_fingerprint != committed.payload.result_fingerprint
+    target = Path(replaced.request.module.output.target)
+    assert target == Path(committed.request.module.output.target)
+    reread = read_analysis_artifact(target, expected_kind=AnalysisArtifactKind.RSM)
+    assert reread.result_fingerprint == replaced.payload.result_fingerprint
+
+
+def test_v2_replace_refuses_a_foreign_or_other_kind_file(tmp_path, monkeypatch):
+    """Only an RSM result is replaced: a Stitch result (another kind) or a file that is no analysis result
+    at the target refuses the run, and the file stays as it was."""
+    from tests.core.test_module_transaction import _provenance, _request, _write_stitched_record
+    from xrd_tools.analysis.module_transaction import admit_module_artifact
+    from xrd_tools.io.output_transaction import OutputTransactionCoordinator
+
+    stitch = _request(tmp_path)
+    published = admit_module_artifact(
+        stitch, _provenance(stitch), coordinator=OutputTransactionCoordinator()
+    ).publish(lambda entry: _write_stitched_record(entry, stitch.output.target))
+    assert published.disposition is ModuleDisposition.COMMITTED
+    other_kind = Path(stitch.output.target)
+    foreign = other_kind.with_name("foreign.nexus")
+    foreign.write_bytes(b"not an analysis result")
+    _runnable(monkeypatch)
+    form = replace(
+        _form(tmp_path, (_write_member(tmp_path, 0),)),
+        overwrite=AnalysisArtifactOverwrite.REPLACE,
+    )
+    for target in (other_kind, foreign):
+        before = target.read_bytes()
+        prepared = prepare_rsm_tool_v2(replace(form, output_path=target))
+        assert prepared.output_current is False
+        result = run_rsm_operation_v2(prepared.request)
+        assert (result.terminal.disposition, result.terminal.code) == (
+            ModuleDisposition.REFUSED,
+            "OUTPUT_NOT_PREVIOUS_ANALYSIS",
+        ), target.name
+        assert target.read_bytes() == before
+
+
+def test_v2_a_cancelled_replace_keeps_the_prior_result(tmp_path, monkeypatch):
+    """The publisher writes the new result beside the old one and swaps only at commit: a replace stopped
+    while gridding leaves the prior file as it was."""
+    _runnable(monkeypatch)
+    form = replace(
+        _form(tmp_path, (_write_member(tmp_path, 0),)),
+        overwrite=AnalysisArtifactOverwrite.REPLACE,
+    )
+    committed = run_rsm_operation_v2(prepare_rsm_tool_v2(form).request)
+    assert committed.terminal.disposition is ModuleDisposition.COMMITTED
+    target = Path(committed.request.module.output.target)
+    before = target.read_bytes()
+    cancel = threading.Event()
+
+    def stop_while_gridding(progress):
+        if progress.stage == "science":
+            cancel.set()
+
+    result = run_rsm_operation_v2(
+        prepare_rsm_tool_v2(form).request,
+        cancel_token=cancel,
+        progress_callback=stop_while_gridding,
+    )
+    assert result.terminal.disposition is ModuleDisposition.CANCELLED
+    assert target.read_bytes() == before
+
+
+def test_v2_persists_its_slot_family_as_native_stitch_does(tmp_path, monkeypatch):
+    """The output provenance records the stable slot's family (provenance output.artifact_family, where
+    native Stitch records its own); a family that does not name the output's slot is refused."""
+    from xrd_tools.io.analysis_artifact import rsm_record_identity
+
+    _runnable(monkeypatch)
+    target = tmp_path / "xdart_processed_data" / "sto_43_rsm.nexus"
+    form = replace(
+        _form(tmp_path, (_write_member(tmp_path, 0),)),
+        output_path=target,
+        overwrite=AnalysisArtifactOverwrite.REPLACE,
+        output_family="sto_43",
+    )
+    result = run_rsm_operation_v2(prepare_rsm_tool_v2(form).request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal.code
+    _plan, provenance = rsm_record_identity(target)
+    assert json.loads(provenance)["output"]["artifact_family"] == "sto_43"
+    with pytest.raises(ValueError, match="stable slot"):
+        replace(form, output_path=target.with_name("other.nexus"))

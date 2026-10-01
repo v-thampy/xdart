@@ -374,10 +374,12 @@ class ModuleOutputRequest:
         if self.artifact_family is not None:
             from xrd_tools.io.output_path import resolve_finite_output_target
             token = {AnalysisArtifactKind.STITCH_1D: "stitch-1d",
-                     AnalysisArtifactKind.STITCH_2D: "stitch-2d"}.get(self.kind)
-            if token is None or str(resolve_finite_output_target(
+                     AnalysisArtifactKind.STITCH_2D: "stitch-2d",
+                     AnalysisArtifactKind.RSM: "rsm"}.get(self.kind)
+            # normcase: the target is case-folded on Windows, the family keeps its case
+            if token is None or os.path.normcase(str(resolve_finite_output_target(
                 Path(target).parent, self.artifact_family, operation_token=token,
-            )) != target:
+            ))) != target:
                 raise ValueError("module output family does not match its stable slot")
         object.__setattr__(self, "target", target)
         object.__setattr__(
@@ -474,6 +476,7 @@ class ModuleOperationRequest:
         if (
             self.source.kind is ModuleKind.RSM
             and self.output.overwrite is not AnalysisArtifactOverwrite.CREATE_NEW
+            and not rsm_v2_bound  # an RSM v2 replaces its same-kind result (AUD-9 stage 2)
         ):
             raise ValueError(
                 "standalone module output must create one new immutable artifact"
