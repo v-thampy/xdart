@@ -37,6 +37,9 @@ from xdart.gui.pages.values import (
 from xdart.gui.tabs.rsm.display import rsm_keyed_projection, rsm_slice_normals
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView
+from xdart.gui.tabs.scattering.context_projection import apply_keyed_presentation_background
+from xdart.gui.tabs.scattering.operation_values import OperationContextStamp
+from xdart.gui.tabs.scattering.presentation_background import PresentationBackgroundOwner
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.controls_inventory import (
     MASK_FILE, PONI_FILE, SOURCE_DIRECTORY, SOURCE_FILTER, SOURCE_RECURSIVE, SOURCE_TYPE,
@@ -270,6 +273,12 @@ class RSMPage(QtWidgets.QWidget):
         self._shown = None  # (values, snapshot) drawn now
         self._color_map = "Default"  # Int's top bar: viridis
         self._log_scale = False
+        # Set BG (the maintainer: "Other quick toggles like switching to log scale set bg, etc should also be
+        # there"): Int's background owner, its keyed path. The background is a result (its path, its viewer
+        # values and its own viewer model), drawn minus at every draw until Clear BG, the result re-admitted,
+        # or the page closed
+        self._background = PresentationBackgroundOwner(capacity_bytes=536_870_912)
+        self._background_revision = 0
         self._closing = False
         # the shared calibration and mask windows (tabs/calibration), opened with RSM's context
         self._authoring_dialogs = []
@@ -299,7 +308,7 @@ class RSMPage(QtWidgets.QWidget):
         # Int's top bar (colour map, Log); the tools RSM has no operation for are left out
         self.view = ScientificView()
         self.view.setObjectName("rsmPageView")
-        self.view.set_hidden_tools("norm", "background", "raw", "raw_pane", "slice")
+        self.view.set_hidden_tools("norm", "raw", "raw_pane", "slice")
         # the maintainer's two extra tools, "as extra tools that pop up separate windows to keep the scientific
         # view clean for now"; their windows come with G9
         self.view.set_page_tools(
@@ -1819,6 +1828,8 @@ class RSMPage(QtWidgets.QWidget):
         (the one asked to be shown stays: a late read kept beside it does not push it out)."""
         if show:
             self._requested = path
+        if self._background_path() == path:  # the background's result admitted again: let it go (Stitch's
+            self._release_background()       # 30f74f29: its identity is the data it was set from)
         self._results[path] = payload
         self._viewers.pop(path, None)  # a result admitted again (Replace, a read back) is drawn from itself
         self._results.move_to_end(path)
@@ -1870,10 +1881,67 @@ class RSMPage(QtWidgets.QWidget):
 
     def _draw(self, values, snapshot, path=None):
         path = self._shown_path if path is None else path
-        self.view.reconcile_keyed(rsm_keyed_projection(
+        state = rsm_keyed_projection(
             values, snapshot, color_map=self._color_map, log_scale=self._log_scale,
-            title=Path(path).name if path else ""))
+            title=Path(path).name if path else "", background_enabled=True)
+        source = self._background.keyed_source()
+        background = name = None
+        if source is not None:
+            background_path, _payload, background_values, model = source
+            name = f"the background {Path(background_path).name}"
+            if background_path == path:
+                name += " (this result: every panel is zero)"
+            background = self._background_panels(background_values, model, snapshot)
+        state = apply_keyed_presentation_background(state, background, name or "")
+        self.view.expect_display_background(self._background.active_key)
+        self.view.reconcile_keyed(state)
         self._shown = (values, snapshot)
+
+    def _background_panels(self, values, model, snapshot):
+        """The background's panels at the indices ``snapshot`` draws, from its own viewer model (the same
+        projection authority as the result shown, so a result against itself draws zeros); None when its grid
+        cannot take those indices (``apply_keyed_presentation_background`` then says why)."""
+        indices = snapshot.state.axis_indices
+        if any(index >= size for index, size in zip(indices, values.shape, strict=True)):
+            return rsm_keyed_projection(values, model.current_snapshot)  # another grid: refused, not sliced
+        return rsm_keyed_projection(values, model.snapshot(values, h_index=indices[0], k_index=indices[1],
+                                                           l_index=indices[2]))
+
+    def _background_path(self):
+        source = self._background.keyed_source()
+        return None if source is None else source[0]
+
+    def _toggle_background(self):
+        """Int's Set BG and Clear BG, display only, for the six panels: Set BG takes the result shown as the
+        background, and every result shown is then drawn minus it, panel by panel (each slice minus the
+        background's at the same index); one on another grid is drawn as it is, and says why. Clear BG drops
+        it; so do the background's result admitted again and the page closing."""
+        if self._background.phase not in {"EMPTY", "RELEASED"}:
+            self._release_background()
+            self._redraw()
+            return
+        path = self._shown_path
+        viewer = self._viewers.get(path) if path else None
+        if viewer is None:
+            self._notice("Show a result first: Set BG takes the result shown as the background")
+            return
+        payload, values, _model = viewer
+        model = RSMViewerModel()  # the background's own, so the result's cache can drop it without loss
+        model.snapshot(values)
+        self._background_revision += 1
+        key = ("rsm-background", self._background_revision, "keyed", path, id(payload))
+        if not self._background.activate_keyed(
+                (path, payload, values, model), stamp=OperationContextStamp(self._form_revision),
+                active_key=key, nbytes=int(values.intensity.nbytes)):
+            self._notice("The background exceeds its 512 MiB display allowance")
+            return
+        self._redraw()
+
+    def _release_background(self):
+        """Drop the display background: the view lets go of what it drew with it, then its owner."""
+        key = self._background.active_key
+        receipt = None if key is None else self.view.release_display_background(key)
+        self._background.release(receipt)
 
     def _redraw(self):
         shown = self.shown
@@ -1894,6 +1962,8 @@ class RSMPage(QtWidgets.QWidget):
             self._step_slice(command.path[0] if command.path else "", command.value)
         elif kind is ShellCommandKind.PAGE_TOOL:
             self._page_tool(str(command.value))
+        elif kind is ShellCommandKind.SET_BACKGROUND:
+            self._toggle_background()
 
     def _page_tool(self, name):
         """The 3D Viewer and Custom Slice buttons: their windows come with stage 2b's G9."""
@@ -1999,6 +2069,7 @@ class RSMPage(QtWidgets.QWidget):
         if pending:
             self._closing = False
             return pending[0]
+        self._release_background()  # before the panels go (Stitch's 30f74f29: a CLEAN close lets it go)
         self.view.clear_keyed("No RSM result shown")
         self._viewers.clear()
         self._shown_path = self._shown = None

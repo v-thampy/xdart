@@ -385,6 +385,8 @@ class KeyedPanelsProjection:
     log_scale: bool = False
     background_enabled: bool = False
     background_set: bool = False
+    #: why the background is (or is not) drawn, for the Set BG button's tip (``apply_keyed_presentation_background``)
+    background_note: str = ""
 
     def __post_init__(self) -> None:
         keys = [key for row in self.layout for key in row]

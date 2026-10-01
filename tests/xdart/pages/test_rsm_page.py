@@ -1612,3 +1612,115 @@ def test_the_preview_names_the_solid_angle_the_detector_mask_and_a_given_ub_besi
         assert "Solid angle: off" in shown
     finally:
         _close(page, qapp)
+
+
+# AUD-9 stage 2b G8d: Set BG on the keyed 2×3 layout (the maintainer: "Other quick toggles like switching to log
+# scale set bg, etc should also be there")
+
+
+def _grid_values(scale, *, shape=(5, 7, 9), axis_offset=0.0):
+    """Viewer values on one grid (``axis_offset`` moves it), their intensity scaled by ``scale``, one voxel NaN."""
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, project_analysis_artifact_result
+    from xrd_tools.session.rsm_viewer_model import make_rsm_viewer_values
+    axes = tuple((name, np.linspace(axis_offset + index, axis_offset + index + 1.0, size))
+                 for index, (name, size) in enumerate(zip(("h", "k", "l"), shape, strict=True)))
+    intensity = (np.arange(np.prod(shape), dtype=np.float64).reshape(shape) ** 1.5) * scale + scale
+    intensity[1, 2, 3] = np.nan
+    return make_rsm_viewer_values(project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.RSM, axes=axes, axis_units=(("h", None), ("k", None), ("l", None)),
+        intensity=intensity, sigma=None, coverage=None, normalization=None))
+
+
+def _panels_at(values, indices):
+    """``values``' six panels at ``indices``, as an independent RSMViewerModel draws them."""
+    from xrd_tools.session.rsm_viewer_model import RSMViewerModel
+    model = RSMViewerModel()
+    model.snapshot(values)
+    return rsm_keyed_projection(values, model.snapshot(values, h_index=indices[0], k_index=indices[1],
+                                                       l_index=indices[2])).panels
+
+
+def _drawn_arrays(view):
+    return [panel.image if hasattr(panel, "image") else panel.intensity for panel in view.keyed_projection.panels]
+
+
+def test_set_bg_draws_every_panel_minus_the_background_at_the_same_indices(qapp, monkeypatch):
+    """Set BG takes the result shown as the background; every result then drawn is minus it panel by panel,
+    each slice minus the background's slice at the same index (also after a step), each projection minus its
+    projection; a result against itself draws zeros, and says so. Display only."""
+    values = {"A": _grid_values(1.0), "B": _grid_values(3.0)}
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    page = _page(qapp, owner=_Owner())
+    try:
+        assert not page.view.background.isHidden() and page.view.background.text() == "Set BG"
+        page._add_result("/tmp/a_rsm.nexus", "A")
+        page.view.background.click()
+        drawn = page.view.keyed_projection
+        assert drawn.background_set and page.view.background.text() == "Clear BG"
+        assert "every panel is zero" in drawn.status
+        for array in _drawn_arrays(page.view):
+            finite = np.isfinite(array)
+            assert finite.any() and np.all(array[finite] == 0)
+        page._add_result("/tmp/b_rsm.nexus", "B")
+        indices = page.shown[1].state.axis_indices
+        expected = [np.subtract(*(getattr(p, "image", None) if hasattr(p, "image") else p.intensity
+                                  for p in pair))
+                    for pair in zip(_panels_at(values["B"], indices), _panels_at(values["A"], indices))]
+        for got, want in zip(_drawn_arrays(page.view), expected, strict=True):
+            np.testing.assert_array_equal(got, want)
+        assert "minus the background a_rsm.nexus" in page.view.keyed_projection.status
+        instance = _keys(page.view)[0].instance  # the HK slice, stepped along L
+        page._step_slice(instance, 2)
+        stepped = page.shown[1].state.axis_indices
+        assert stepped[2] == 2
+        want = np.subtract(_panels_at(values["B"], stepped)[0].image, _panels_at(values["A"], stepped)[0].image)
+        np.testing.assert_array_equal(page.view.keyed_projection.panels[0].image, want)
+    finally:
+        _close(page, qapp)
+
+
+def test_a_background_on_another_grid_is_drawn_unsubtracted_and_says_why(qapp, monkeypatch):
+    """A result on another grid (axes or bins) is not subtracted: its panels are drawn as they are, the status
+    and the button's tip say why, and Clear BG stays usable."""
+    values = {"A": _grid_values(1.0), "C": _grid_values(2.0, axis_offset=0.5)}
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/a_rsm.nexus", "A")
+        page.view.background.click()
+        page._add_result("/tmp/c_rsm.nexus", "C")
+        drawn = page.view.keyed_projection
+        assert drawn.background_set and "another grid" in drawn.status
+        assert "another grid" in page.view.background.toolTip()
+        assert page.view.background.isEnabled() and page.view.background.text() == "Clear BG"
+        own = _panels_at(values["C"], page.shown[1].state.axis_indices)
+        for got, panel in zip(_drawn_arrays(page.view), own, strict=True):
+            np.testing.assert_array_equal(got, panel.image if hasattr(panel, "image") else panel.intensity)
+    finally:
+        _close(page, qapp)
+
+
+def test_the_background_is_released_by_clear_bg_by_its_result_admitted_again_and_by_close(qapp, monkeypatch):
+    """Each release path lets go of the background through Int's handshake (the view's receipt, then the
+    owner): Clear BG; the background's result admitted again under its name (Stitch's 30f74f29: its identity is
+    the data it was set from); and a CLEAN close, before the panels go."""
+    values = {"A": _grid_values(1.0), "A2": _grid_values(5.0), "B": _grid_values(3.0)}
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/a_rsm.nexus", "A")
+        page.view.background.click()
+        assert page._background.phase == "ACTIVE" and page.view._rendered_background_key is not None
+        page.view.background.click()  # Clear BG
+        assert page._background.phase == "RELEASED" and page.view._rendered_background_key is None
+        assert not page.view.keyed_projection.background_set and page.view.background.text() == "Set BG"
+        page.view.background.click()
+        page._add_result("/tmp/b_rsm.nexus", "B")
+        assert page.view.keyed_projection.background_set
+        page._add_result("/tmp/a_rsm.nexus", "A2")  # the background's result admitted again
+        assert page._background.phase == "RELEASED" and not page.view.keyed_projection.background_set
+        page.view.background.click()
+        assert page._background.phase == "ACTIVE"
+    finally:
+        _close(page, qapp)
+    assert page._background.phase == "RELEASED" and page._background.keyed_source() is None

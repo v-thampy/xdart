@@ -141,6 +141,9 @@ class PresentationBackgroundOwner:
         self._reserved_bytes = 0
         self._active_bytes = 0
         self._last_finalize: tuple[int, str] | None = None
+        #: a keyed layout's background (``activate_keyed``): its page's own immutable source, re-sliced at
+        #: every draw, so it outlives slice steps and a change of the result shown
+        self._keyed_source: object | None = None
 
     @property
     def capacity_bytes(self) -> int:
@@ -237,6 +240,38 @@ class PresentationBackgroundOwner:
                 return None
             self._contributors = copied
         return reservation
+
+    def activate_keyed(self, source: object, *, stamp: OperationContextStamp,
+                       active_key: tuple[object, ...], nbytes: int) -> bool:
+        """Take a keyed layout's background (RSM's six panels; AUD-9 stage 2b G8d): ``source`` is its page's
+        own immutable background (RSM: the result's viewer values, sharing the payload's read-only buffer, and
+        its viewer model), charged ``nbytes`` against this owner's one grant. Unlike a frame background there
+        is nothing to average (one result), so it goes from EMPTY or RELEASED straight to ACTIVE; the page
+        builds the background's panels at the indices drawn from it (``keyed_source``), and
+        ``apply_keyed_presentation_background`` subtracts them. Released as every background is: ``release``
+        with the view's receipt. ``active_key[2]`` is "keyed", the view's release domain."""
+        if (source is None or type(stamp) is not OperationContextStamp or type(active_key) is not tuple
+                or len(active_key) < 3 or active_key[2] != "keyed"
+                or type(nbytes) is not int or not 0 <= nbytes <= self._capacity):
+            return False
+        try:
+            stamp.__post_init__()
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            if self._phase not in {"EMPTY", "RELEASED"}:
+                return False
+            self._reservation = self._next_reservation
+            self._next_reservation += 1
+            self._stamp, self._active_key, self._keyed_source = stamp, active_key, source
+            self._active_bytes = nbytes
+            self._phase = "ACTIVE"
+        return True
+
+    def keyed_source(self) -> object | None:
+        """The ACTIVE keyed background's source, or None (none, or a frame background)."""
+        with self._lock:
+            return self._keyed_source if self._phase == "ACTIVE" else None
 
     def run_and_stage(self, reservation: int, cancelled) -> DisplayBackgroundTransferReceipt:
         with self._lock:
@@ -349,6 +384,7 @@ class PresentationBackgroundOwner:
             self.abort(reservation, outcome)
 
     def _drop_locked(self) -> None:
+        self._keyed_source = None
         self._contributors = (); self._result = None; self._display_values = ()
         self._plan = None; self._stamp = None; self._active_key = None
         self._projection_keys = (); self._projection_indices = (); self._projection_shapes = ()

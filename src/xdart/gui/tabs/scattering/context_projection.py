@@ -44,7 +44,8 @@ from .shell_projection import (
 )
 from .shell_values import (
     AxisProjection, BrowserScanIndex, FrameNavigationProjection, HeavyProjection,
-    ProgressProjection, ScientificProjection, ShellProjection, TraceProjection,
+    KeyedImageProjection, KeyedPanelsProjection, ProgressProjection, ScientificProjection,
+    ShellProjection, TraceProjection,
 )
 from .state_machine import RunPhase
 from .scientific_waterfall_policy import waterfall_should_be_active
@@ -108,6 +109,54 @@ def apply_presentation_background(
           and value.shape == heavy.cake.shape):
         heavy = replace(heavy, cake=value)
     return replace(state, heavy=heavy, background_set=True)
+
+
+def _same_keyed_grid(shown, background) -> bool:
+    """Whether two keyed panels sit on one grid: the same key, axes (values and edges) and, for a slice,
+    the same index of the same count."""
+    if shown.key != background.key or type(shown) is not type(background):
+        return False
+    pairs = ((shown.x_axis, background.x_axis), (shown.y_axis, background.y_axis)) \
+        if type(shown) is KeyedImageProjection else ((shown.axis, background.axis),)
+    for left, right in pairs:
+        if (left.values.shape != right.values.shape or not np.array_equal(left.values, right.values)
+                or (left.edges is None) != (right.edges is None)
+                or left.edges is not None and tuple(left.edges) != tuple(right.edges)):
+            return False
+    return (type(shown) is not KeyedImageProjection
+            or (shown.index == background.index
+                and len(shown.index_captions) == len(background.index_captions)))
+
+
+def apply_keyed_presentation_background(
+    shown: KeyedPanelsProjection, background: KeyedPanelsProjection | None, name: str = "",
+) -> KeyedPanelsProjection:
+    """A keyed layout drawn minus its presentation background, panel by panel (AUD-9 stage 2b G8d): each
+    slice minus the background's slice at the same index, each 1-D panel minus the background's. Display
+    only. ``background`` is the background result's own panels, built by the same projection authority at the
+    indices ``shown`` draws, so a result shown against itself draws zeros. A background on another grid (other
+    keys, axes, edges or index count) is not subtracted: the panels are drawn as they are, and the status and
+    the button's tip say why. None: no background."""
+    if background is None:
+        return replace(shown, background_set=False)
+    label = name or "the background"
+    by_key = {panel.key: panel for panel in background.panels}
+    if set(by_key) != {panel.key for panel in shown.panels} or not all(
+            _same_keyed_grid(panel, by_key[panel.key]) for panel in shown.panels):
+        reason = f"{label} is on another grid: not subtracted (Clear BG to drop it)"
+        return replace(shown, background_set=True, background_note=reason,
+                       status=f"{shown.status} · {reason}" if shown.status else reason)
+    panels = []
+    for panel in shown.panels:
+        other = by_key[panel.key]
+        if type(panel) is KeyedImageProjection:
+            panels.append(replace(panel, image=np.subtract(panel.image, other.image)))
+        else:
+            panels.append(replace(panel, intensity=np.subtract(panel.intensity, other.intensity),
+                                  title=f"{panel.title} − background"))
+    note = f"minus {label}"
+    return replace(shown, panels=tuple(panels), background_set=True, background_note=note,
+                   status=f"{shown.status} · {note}" if shown.status else note)
 
 
 def _terminal_timing_tooltip(progress: ProgressProjection) -> str:

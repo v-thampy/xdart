@@ -710,6 +710,10 @@ class ScientificView(QtWidgets.QFrame):
                 if self.raw_popup_image is not None: self.raw_popup_image.clear_image_buffers()
             elif domain == "integrated_2d":
                 self.cake.clear_image_buffers(); self._rendered_cake_x_axis = self._rendered_cake_y_axis = self._rendered_cake_axis_key = self._rendered_image_axis = None
+            elif domain == "keyed":  # a keyed layout drawn minus its background: every panel let go of
+                for widgets in self._keyed_panels.values():
+                    widgets.clear()
+                self._keyed_shown = None
             else:
                 self.curve.clear(); self.waterfall.clear(); self._trace_history_by_identity.clear(); self._pinned_trace_by_id.clear()
                 self._rendered_trace_keys = self._trace_history_keys = self._waterfall_source_keys = ()
@@ -3022,6 +3026,9 @@ class ScientificView(QtWidgets.QFrame):
         del blockers
         self.background.setEnabled(state.background_enabled)
         self.background.setText(("Clear" if state.background_set else "Set") + " BG")
+        self.background.setToolTip(state.background_note)
+        # the background drawn now, which ``release_display_background`` lets go of (as ``reconcile`` does)
+        self._rendered_background_key = self._expected_background_key if state.background_set else None
         self.title.setText(state.title)
         self.status.setText(state.status)
 
