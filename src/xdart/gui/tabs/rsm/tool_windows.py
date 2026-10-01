@@ -153,7 +153,7 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
         self._values = self._slice = None
         self._offsets = (0.0, 0.0)
         self._name = ""
-        self._color_map, self._log_scale = "Default", False
+        self._color_map, self._log_scale, self._share_axis = "Default", False, False
         self.resize(1100, 720)
 
     @property
@@ -267,13 +267,15 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
         return KeyedPanelsProjection(
             ((_PLANE,), (_ALONG_FIRST, _ALONG_SECOND)), (image, *traces), title=self._name,
             status=f"Through {through}; interpolated from the gridded volume", color_map=self._color_map,
-            log_scale=self._log_scale)
+            log_scale=self._log_scale, share_axis=self._share_axis)
 
     def _view_command(self, command) -> None:
         if command.kind is ShellCommandKind.SET_COLOR_MAP:
             self._color_map = str(command.value)
         elif command.kind is ShellCommandKind.SET_LOG_SCALE:
             self._log_scale = bool(command.value)
+        elif command.kind is ShellCommandKind.SET_SHARE_AXIS:  # the plane's two directions with their projections
+            self._share_axis = bool(command.value)
         else:
             return
         if self._slice is not None:  # the plane drawn again under the new presentation

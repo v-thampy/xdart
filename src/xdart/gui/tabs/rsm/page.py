@@ -350,6 +350,7 @@ class RSMPage(QtWidgets.QWidget):
         self._shown = None  # (values, snapshot) drawn now
         self._color_map = "Default"  # Int's top bar: viridis
         self._log_scale = False
+        self._share_axis = False  # Int's Share Axis: the panels drawing one coordinate pan and zoom together
         # Set BG (the maintainer: "Other quick toggles like switching to log scale set bg, etc should also be
         # there"): Int's background owner, its keyed path. The background is a result (its path, its viewer
         # values and its own viewer model), drawn minus at every draw until Clear BG, the result re-admitted,
@@ -2017,7 +2018,7 @@ class RSMPage(QtWidgets.QWidget):
         path = self._shown_path if path is None else path
         state = rsm_keyed_projection(
             values, snapshot, color_map=self._color_map, log_scale=self._log_scale,
-            title=Path(path).name if path else "", background_enabled=True)
+            title=Path(path).name if path else "", background_enabled=True, share_axis=self._share_axis)
         source = self._background.keyed_source()
         background = name = None
         if source is not None:
@@ -2083,14 +2084,17 @@ class RSMPage(QtWidgets.QWidget):
             self._draw(*shown)
 
     def _view_command(self, command):
-        """Int's view's commands for the RSM drawn: its colour map and Log (as Int's top bar sets them), and a
-        slice stepped along its normal."""
+        """Int's view's commands for the RSM drawn: its colour map, Log and Share Axis (as Int's bars set them),
+        and a slice stepped along its normal."""
         kind = command.kind
         if kind is ShellCommandKind.SET_COLOR_MAP:
             self._color_map = str(command.value)
             self._redraw()
         elif kind is ShellCommandKind.SET_LOG_SCALE:
             self._log_scale = bool(command.value)
+            self._redraw()
+        elif kind is ShellCommandKind.SET_SHARE_AXIS:
+            self._share_axis = bool(command.value)
             self._redraw()
         elif kind is ShellCommandKind.SET_PANEL_INDEX:
             self._step_slice(command.path[0] if command.path else "", command.value)

@@ -977,6 +977,35 @@ def test_ints_colour_map_and_log_redraw_the_six(qapp, monkeypatch):
         _close(page, qapp)
 
 
+def test_ints_intensity_controls_and_share_axis_drive_the_six(qapp, monkeypatch):
+    """G13 unit 1 (decision 1's toolbar: "colour map, Log, intensity, Set BG ... and Share Axis"): under the six,
+    Int's intensity controls set one set of levels for the three slices, and Share Axis, a command the page keeps
+    and draws back, links each coordinate across the panels: H on the HK and HL slices and the H projection."""
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", {"payload": _values()}.__getitem__)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/x_rsm.nexus", "payload")
+        view = page.view
+        levels = {tuple(pane.canvas.histogram.levels()) for pane in _slices(view)}
+        assert len(levels) == 1 and tuple(view.viewer_intensity.values()) == levels.pop()
+        assert not view.viewer_intensity.isHidden() and not view.share_axis.isHidden()
+        assert not view.keyed_projection.share_axis
+        view.share_axis.click()
+        assert view.keyed_projection.share_axis and view.share_axis.isChecked()
+        hk, hl, _kl = _slices(view)
+        hk.canvas.imageViewBox.setXRange(0.2, 0.6, padding=0)
+        h_projection = next(panel for panel in view.keyed_projection.panels if not hasattr(panel, "image"))
+        h_plot = view.keyed_panel(h_projection.key).plot.getViewBox()
+        for box in (hl.canvas.imageViewBox, h_plot):
+            np.testing.assert_allclose(box.viewRange()[0], (0.2, 0.6))
+        view.share_axis.click()
+        assert not view.keyed_projection.share_axis
+        hk.canvas.imageViewBox.setXRange(0.3, 0.5, padding=0)
+        np.testing.assert_allclose(hl.canvas.imageViewBox.viewRange()[0], (0.2, 0.6))
+    finally:
+        _close(page, qapp)
+
+
 def test_the_3d_viewer_and_custom_slice_buttons_reach_the_page(qapp, monkeypatch):
     """The maintainer's two extra tools, "as extra tools that pop up separate windows to keep the scientific
     view clean for now": two buttons in Int's top bar whose presses reach the page (their windows come with
@@ -2248,6 +2277,13 @@ def test_custom_slice_opens_on_hh_l_through_the_centre_follows_the_result_and_cl
         np.testing.assert_array_equal(along_hh.intensity, expected.projection_t)
         np.testing.assert_array_equal(along_l.intensity, expected.projection_s)
         assert "interpolated from the gridded volume" in window.note.text()
+        window.view.share_axis.click()  # G13 unit 1: the plane's HH with the HH projection, its L with the L one
+        assert window.view.keyed_projection.share_axis
+        plane_box = window.view.keyed_panel(plane.key).pane.canvas.imageViewBox
+        plane_box.setRange(xRange=(-0.2, 0.1), yRange=(-0.3, 0.4), padding=0)
+        for key, expected_range in ((along_hh.key, (-0.2, 0.1)), (along_l.key, (-0.3, 0.4))):
+            np.testing.assert_allclose(window.view.keyed_panel(key).plot.getViewBox().viewRange()[0], expected_range)
+        window.view.share_axis.click()
         assert window.card.status.isHidden() and not window.card.valid_marker.isHidden()
         assert window._values is values["A"]  # the volume shared, not copied
         window.view.log_scale.click()  # Int's Log (and colour map) draw the plane again

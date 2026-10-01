@@ -319,7 +319,10 @@ class ScientificImagePane(QtWidgets.QWidget):
         level_scan_token: object | None = None,
         view_range: QtCore.QRectF | None = None,
         autorange_finite_y: bool = False,
-    ) -> None:
+    ) -> bool:
+        """Draw ``data``; False when the identical immutable image is already drawn (only ``view_range`` is
+        applied), True when it is drawn again: its colour bar's levels and limits are then the image's own, unless
+        it has no finite value (the canvas leaves the colour bar as it was)."""
         source = np.asarray(data)
         render_contract = ScientificImagePane._image_render_contract(
             source,
@@ -354,7 +357,7 @@ class ScientificImagePane(QtWidgets.QWidget):
         if immutable and getattr(self, "_render_contract", None) == render_contract:
             if view_range is not None:
                 self.canvas.imageViewBox.setRange(view_range, padding=0.0)
-            return
+            return False
         # A failed repaint may already have changed pixels, range, or labels.
         # Retire the prior identity contract before the first mutation so a
         # later request for the old immutable source cannot incorrectly fast
@@ -450,6 +453,7 @@ class ScientificImagePane(QtWidgets.QWidget):
         self._render_contract = render_contract if immutable else None
         self._geometry_contract = geometry_contract
         self._axis_presentation_contract = axis_presentation
+        return True
 
 
 class CompactFrameSelector(QtWidgets.QComboBox):

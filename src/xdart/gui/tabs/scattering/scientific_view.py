@@ -11,6 +11,7 @@ from xdart.gui.widgets.scientific_plot import (
 )
 
 from dataclasses import dataclass, replace
+import functools
 import math
 import os
 import time
@@ -314,8 +315,13 @@ class _KeyedImagePanel:
             self.selector.setCurrentIndex(index)
 
     def draw(self, panel: KeyedImageProjection, color_map: str, log_scale: bool) -> None:
-        self.pane.render(panel.image, x_axis=panel.x_axis, y_axis=panel.y_axis, color_map=color_map,
-                         log_scale=log_scale)
+        if self.pane.render(panel.image, x_axis=panel.x_axis, y_axis=panel.y_axis, color_map=color_map,
+                            log_scale=log_scale):  # drawn again (not kept): its own levels and range, for the view's
+            # intensity controls (``_refresh_keyed_intensity``); none for a slice with no finite value, whose colour
+            # bar the pane leaves as it was
+            histogram = self.pane.canvas.histogram
+            self.levels = (((histogram.lo_lim, histogram.hi_lim), tuple(histogram.levels()))
+                           if np.isfinite(panel.image).any() else None)
         self.pane.plot.setTitle(panel.title)
         for widget in (self.previous, self.selector, self.next):  # a plane with no index to step has none
             widget.setVisible(panel.navigation)
@@ -336,6 +342,8 @@ class _KeyedImagePanel:
     def clear(self) -> None:
         self.pane.clear_image_buffers()
         self.pane.plot.setTitle("")
+        #: the slice's own (range, automatic levels) as last drawn, in what the pane draws (log10 with Log)
+        self.levels: tuple[tuple[float, float], tuple[float, float]] | None = None
         blocker = QtCore.QSignalBlocker(self.selector)
         self.selector.clear()
         del blocker
@@ -390,6 +398,12 @@ class ScientificView(QtWidgets.QFrame):
         self._keyed_panels: dict[PanelKey, _KeyedImagePanel | _KeyedTracePanel] = {}
         self._keyed_shown: KeyedPanelsProjection | None = None
         self._keyed_hidden: tuple[QtWidgets.QWidget, ...] = ()
+        # Share Axis over it: the axes drawing each coordinate shared by two or more, the range links made, and
+        # where Share Axis sits in Int's plot bar while the keyed row borrows it
+        self._keyed_coordinates: dict[tuple[str, str], tuple[tuple[pg.ViewBox, int], ...]] = {}
+        self._keyed_links: list[tuple[object, object]] = []
+        self._keyed_share_on = False
+        self._share_axis_home = -1
         self._heavy_available: frozenset[DisplayFrameKey] = frozenset()
         self._frame_keys: tuple[DisplayFrameKey, ...] = ()
         self._current_key: DisplayFrameKey | None = None
@@ -2972,9 +2986,11 @@ class ScientificView(QtWidgets.QFrame):
         """Draw a keyed layout: ``state.layout``'s rows of ``PanelKey``s, a SLICE_2D key on Int's image pane
         over the frame navigation's own widgets (stepping its slice along its normal: ``SET_PANEL_INDEX``),
         a PROJ_1D key on a 1-D plot styled as Int's. The top bar's colour map, Log and Set BG drive every
-        panel; Int's own layout is hidden while it is shown, and ``_apply_mode_layout`` brings it back for
-        Int's modes. All or nothing: on a failure the prior panels are drawn again (or cleared) and the
-        error raised."""
+        panel; below the panels, Int's intensity controls set one set of levels for every slice
+        (``_refresh_keyed_intensity``) and Share Axis (``state.share_axis``) links the panels drawing one
+        coordinate (``_link_keyed_axes``). Int's own layout is hidden while it is shown, and
+        ``_apply_mode_layout`` brings it back for Int's modes. All or nothing: on a failure the prior panels are
+        drawn again (or cleared) and the error raised."""
         if type(state) is not KeyedPanelsProjection:
             raise TypeError("a keyed layout is drawn from a KeyedPanelsProjection")
         prior = self._keyed_shown
@@ -3008,10 +3024,12 @@ class ScientificView(QtWidgets.QFrame):
         if self._layout_mode == "keyed":
             self.title.setText("")
             self.status.setText(str(detail))
+            self._refresh_keyed_intensity()
         self._keyed_shown = None
 
     def _paint_keyed(self, state: KeyedPanelsProjection) -> None:
         self._enter_keyed_layout()
+        self._unlink_keyed_axes()  # linked again below, on this draw's axes
         if state.layout != self._keyed_layout:
             self._build_keyed(state.layout)
         color = trace_colors(state.color_map, 1)[0]
@@ -3021,9 +3039,10 @@ class ScientificView(QtWidgets.QFrame):
                 widgets.draw(panel, state.color_map, state.log_scale)
             else:
                 widgets.draw(panel, color)
-        blockers = [QtCore.QSignalBlocker(widget) for widget in (self.color_map, self.log_scale)]
+        blockers = [QtCore.QSignalBlocker(widget) for widget in (self.color_map, self.log_scale, self.share_axis)]
         set_combo_value(self.color_map, state.color_map, fallback="Default")
         self.log_scale.setChecked(state.log_scale)
+        self.share_axis.setChecked(state.share_axis)
         del blockers
         self.background.setEnabled(state.background_enabled)
         self.background.setText(("Clear" if state.background_set else "Set") + " BG")
@@ -3032,6 +3051,103 @@ class ScientificView(QtWidgets.QFrame):
         self._rendered_background_key = self._expected_background_key if state.background_set else None
         self.title.setText(state.title)
         self.status.setText(state.status)
+        self._keyed_coordinates = self._keyed_axes(state)
+        self.share_axis.setEnabled(bool(self._keyed_coordinates))
+        self._set_share_link(state.share_axis)
+        self._refresh_keyed_intensity()
+
+    def _keyed_axes(self, state: KeyedPanelsProjection) -> dict[tuple[str, str], tuple[tuple[pg.ViewBox, int], ...]]:
+        """The keyed panels' axes (view box, 0 for x or 1 for y) by the coordinate each draws, its label and unit,
+        in the layout's order: those drawn by two or more, which Share Axis links. Not ``_axis_key``: Int's
+        canonical key takes the Q frame's Qx, Qy and Qz alike as Q."""
+        coordinates: dict[tuple[str, str], list[tuple[pg.ViewBox, int]]] = {}
+        for row in state.layout:
+            for key in row:
+                panel, widgets = state.panel(key), self._keyed_panels[key]
+                if type(panel) is KeyedImageProjection:
+                    box = widgets.pane.canvas.imageViewBox
+                    drawn = ((box, 0, panel.x_axis), (box, 1, panel.y_axis))
+                else:
+                    drawn = ((widgets.plot.getViewBox(), 0, panel.axis),)
+                for box, axis, projection in drawn:
+                    coordinates.setdefault((projection.label, projection.unit), []).append((box, axis))
+        return {coordinate: tuple(axes) for coordinate, axes in coordinates.items() if len(axes) > 1}
+
+    def _link_keyed_axes(self, on: bool) -> None:
+        """Share Axis over a keyed layout (``_set_share_link``'s keyed side; Int's own links stay off): the axes
+        drawing one coordinate (RSM's H on the HK and HL slices and the H projection) take the first one's range,
+        then follow each other's pan and zoom along it. Off, they are independent, and the 1-D panels follow their
+        data again, as Int's 1-D plot does when Share Axis goes off."""
+        self._unlink_keyed_axes()
+        if on:
+            for axes in self._keyed_coordinates.values():
+                first, axis = axes[0]
+                self._sync_keyed_axis(axes, tuple(first.viewRange()[axis]), axes[0])
+                for member in axes:
+                    signal = member[0].sigXRangeChanged if member[1] == 0 else member[0].sigYRangeChanged
+                    slot = functools.partial(self._on_keyed_range_changed, axes, member)
+                    signal.connect(slot)
+                    self._keyed_links.append((signal, slot))
+        elif self._keyed_share_on:
+            for widgets in self._keyed_panels.values():
+                if type(widgets) is _KeyedTracePanel:
+                    widgets.plot.getViewBox().enableAutoRange(axis=pg.ViewBox.XAxis, enable=True)
+        self._keyed_share_on = bool(on and self._keyed_coordinates)
+
+    def _unlink_keyed_axes(self) -> None:
+        for signal, slot in self._keyed_links:
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        self._keyed_links = []
+
+    def _on_keyed_range_changed(self, axes, source, _box, view_range) -> None:
+        if not self._keyed_share_on or self._share_axis_syncing:
+            return
+        self._sync_keyed_axis(axes, tuple(view_range), source)
+
+    def _sync_keyed_axis(self, axes, view_range, source) -> None:
+        """Every axis of ``axes`` but ``source`` to ``view_range``, under Int's share guard."""
+        prior = self._share_axis_syncing
+        self._share_axis_syncing = True
+        try:
+            for box, axis in axes:
+                if box is not source[0] or axis != source[1]:
+                    (box.setXRange if axis == 0 else box.setYRange)(*view_range, padding=0)
+        finally:
+            self._share_axis_syncing = prior
+
+    def _refresh_keyed_intensity(self) -> None:
+        """Int's intensity controls over a keyed layout's slices: one set of levels for them all, in what each
+        pane draws (log10 with Log, as Int's viewer's). Autoscale spans the slices' own automatic levels (each
+        Int's rule over its finite values), and the controls' range their values; typed or dragged levels are
+        kept across draws. A slice's own colour bar stays, for a look at it alone until the next draw."""
+        controls = self.viewer_intensity
+        drawn = [widgets.levels for widgets in self._keyed_panels.values()
+                 if type(widgets) is _KeyedImagePanel and widgets.levels is not None]
+        if not drawn:
+            self._viewer_intensity_domain = self._viewer_auto_levels = None
+            controls.sync(None, None)
+            return
+        self._viewer_intensity_domain = (min(found[0] for found, _levels in drawn),
+                                         max(found[1] for found, _levels in drawn))
+        self._viewer_auto_levels = (min(levels[0] for _found, levels in drawn),
+                                    max(levels[1] for _found, levels in drawn))
+        controls.sync(self._viewer_intensity_domain, self._viewer_auto_levels)
+        self._set_keyed_levels(self._viewer_auto_levels if controls.autoscale.isChecked() else controls.values())
+
+    def _set_keyed_levels(self, levels) -> None:
+        """Every drawn slice's colour bar to ``levels``, its limits widened to take them."""
+        if levels is None or not np.isfinite(levels).all() or levels[1] <= levels[0]:
+            return
+        low, high = levels
+        for widgets in self._keyed_panels.values():
+            if type(widgets) is _KeyedImagePanel and widgets.levels is not None:
+                histogram = widgets.pane.canvas.histogram
+                (own_low, own_high), _automatic = widgets.levels
+                histogram.lo_lim, histogram.hi_lim = min(own_low, low), max(own_high, high)
+                histogram.setLevels((low, high))
 
     def _build_keyed(self, layout: tuple[tuple[PanelKey, ...], ...]) -> None:
         for widgets in self._keyed_panels.values():
@@ -3069,21 +3185,34 @@ class ScientificView(QtWidgets.QFrame):
         if self.raw_popup_dialog is not None and not self._raw_popup_host:
             self.raw_popup_dialog.close()
         hidden = tuple(widget for widget in (
-            self.vertical_splitter, self.viewer_intensity_row, self.previous_frame, self.frame_selector,
+            self.vertical_splitter, self.previous_frame, self.frame_selector,
             self.next_frame, self.progress, self.raw_popup_button,
         ) if not widget.isHidden())
         for widget in hidden:
             widget.setVisible(False)
         self._keyed_hidden = hidden
-        self._keyed_area.setVisible(True)
+        # Share Axis and the intensity controls on the 2D Viewer's intensity row, below the panels; an Int mode
+        # gives them back (``_leave_keyed_layout``, ``_apply_mode_layout``)
+        self._share_axis_home = self.plot_bar.indexOf(self.share_axis)
+        self.viewer_intensity_row_layout.addWidget(self.share_axis)
+        self.viewer_intensity_row_layout.addWidget(self.viewer_intensity)
+        self.viewer_intensity.sync(None, None, reset=True)
+        self._viewer_intensity_contract = None
+        self._viewer_intensity_domain = self._viewer_auto_levels = None
+        for widget in (self.share_axis, self.viewer_intensity, self.viewer_intensity_row, self._keyed_area):
+            widget.setVisible(True)
         self._layout_mode = self._processing_mode = "keyed"
 
     def _leave_keyed_layout(self) -> None:
+        self._link_keyed_axes(False)
         if self._keyed_area is not None:
             self._keyed_area.setVisible(False)
         for widget in self._keyed_hidden:
             widget.setVisible(True)
         self._keyed_hidden = ()
+        if self._share_axis_home >= 0:  # back where Int's plot bar keeps it; the controls go where the mode does
+            self.plot_bar.insertWidget(self._share_axis_home, self.share_axis)
+        self.viewer_intensity_row.setVisible(False)
 
     def _emit_panel_index(self, key: PanelKey, index: int) -> None:
         self.commandRequested.emit(ShellCommand(ShellCommandKind.SET_PANEL_INDEX, int(index), (key.instance,)))
@@ -3297,6 +3426,9 @@ class ScientificView(QtWidgets.QFrame):
         controls.sync(domain, plot.viewRange()[1])
 
     def _set_viewer_intensity(self, lo, hi) -> None:
+        if self._layout_mode == "keyed":  # the keyed slices' one set of levels
+            self._set_keyed_levels((lo, hi))
+            return
         if (self._processing_mode not in {"1D Viewer", "2D Viewer"}
                 or not np.isfinite((lo, hi)).all() or hi <= lo):
             return
@@ -3311,6 +3443,9 @@ class ScientificView(QtWidgets.QFrame):
             histogram.setLevels((lo, hi))
 
     def _toggle_viewer_autoscale(self, enabled) -> None:
+        if self._layout_mode == "keyed":  # Autoscale's span of the keyed slices, or the levels shown, kept
+            self._set_keyed_levels(self._viewer_auto_levels if enabled else self.viewer_intensity.values())
+            return
         if not enabled:
             self._set_viewer_intensity(*self.viewer_intensity.values())
             return
@@ -3322,6 +3457,9 @@ class ScientificView(QtWidgets.QFrame):
         self._refresh_viewer_intensity()
 
     def _set_share_link(self, on: bool) -> None:
+        if self._layout_mode == "keyed":  # the keyed panels' coordinates (``_link_keyed_axes``)
+            self._link_keyed_axes(on)
+            return
         cake_view = self.cake.canvas.imageViewBox
         curve_view = self.curve.getPlotItem().getViewBox()
         waterfall_view = self.waterfall.canvas.imageViewBox

@@ -383,7 +383,8 @@ class KeyedTraceProjection:
 @dataclass(frozen=True, slots=True)
 class KeyedPanelsProjection:
     """A keyed layout for ``ScientificView.reconcile_keyed``: rows of ``PanelKey``s (``DisplayState.layout``),
-    each drawn from its one panel, under the view's own top bar (colour map, Log, Set BG)."""
+    each drawn from its one panel, under the view's own top bar (colour map, Log, Set BG), with the view's own
+    intensity controls and Share Axis (``share_axis``: the panels drawing one coordinate pan and zoom together)."""
 
     layout: tuple[tuple[PanelKey, ...], ...]
     panels: tuple[KeyedImageProjection | KeyedTraceProjection, ...]
@@ -395,8 +396,11 @@ class KeyedPanelsProjection:
     background_set: bool = False
     #: why the background is (or is not) drawn, for the Set BG button's tip (``apply_keyed_presentation_background``)
     background_note: str = ""
+    share_axis: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.share_axis) is not bool:
+            raise TypeError("a keyed layout's share_axis is a bool")
         keys = [key for row in self.layout for key in row]
         if (type(self.layout) is not tuple or not keys
                 or any(type(row) is not tuple for row in self.layout)

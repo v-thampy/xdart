@@ -4,8 +4,9 @@ The page builds a ``KeyedPanelsProjection`` from the headless ``RSMViewerModel``
 authority (its slices and finite mean projections unchanged), and ``ScientificView.reconcile_keyed`` draws
 it: the viewer model's 2×3 layout (``rsm_viewer_layout``: the three slices through the selected indices,
 then the three mean projections) on Int's image panes and 1-D plots, under Int's own top bar (colour map,
-Log). Each slice spans its bins' outer edges (``rsm_axis_bounds``), so each pixel sits at its bin centre
-(Codex's stage-1 review F3). No widget is built here (hard rule 14).
+Log), with Int's intensity controls and Share Axis (each coordinate's axes named alike, so the view links H,
+K and L, or Qx, Qy and Qz, across the panels). Each slice spans its bins' outer edges (``rsm_axis_bounds``),
+so each pixel sits at its bin centre (Codex's stage-1 review F3). No widget is built here (hard rule 14).
 """
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ def rsm_slice_normals(values) -> dict[str, int]:
 
 def rsm_keyed_projection(values, snapshot, *, color_map: str = "Default", log_scale: bool = False,
                          title: str = "", background_enabled: bool = False,
-                         background_set: bool = False) -> KeyedPanelsProjection:
+                         background_set: bool = False, share_axis: bool = False) -> KeyedPanelsProjection:
     """The six products of ``snapshot`` (``values``' viewer-model snapshot) as a keyed layout."""
     labels = values.coordinate_frame.axis_labels
     symbols = values.coordinate_frame.axis_symbols
@@ -74,7 +75,7 @@ def rsm_keyed_projection(values, snapshot, *, color_map: str = "Default", log_sc
                            for symbol, axis in zip(symbols, axes, strict=True)))
     return KeyedPanelsProjection(layout, tuple(panels), title=title, status=status, color_map=color_map,
                                  log_scale=bool(log_scale), background_enabled=background_enabled,
-                                 background_set=background_set)
+                                 background_set=background_set, share_axis=bool(share_axis))
 
 
 __all__ = ["rsm_keyed_projection", "rsm_slice_normals", "slice_normal"]
