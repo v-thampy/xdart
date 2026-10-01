@@ -11,7 +11,7 @@ from pyqtgraph.Qt import QtWidgets
 
 from xdart.gui.gui_utils import RectViewBox
 from xdart.gui.tabs.scattering.fit_view import FitView
-from xdart.gui.tabs.stitch.fit_windows import CalibrationFitWindow, DirectBeamFitWindow
+from xdart.gui.tabs.calibration.fit_windows import CalibrationFitWindow, DirectBeamFitWindow
 from xdart.gui.widgets.scientific_plot import trace_colors
 
 

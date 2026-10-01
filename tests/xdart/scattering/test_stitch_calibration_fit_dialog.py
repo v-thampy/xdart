@@ -11,7 +11,7 @@ from pyqtgraph.Qt import QtWidgets
 from xdart.gui.pages.operation_owner import OperationCancelled
 from xdart.gui.pages.services import empty_host_services
 from xdart.gui.pages.values import PageCleanup
-from xdart.gui.tabs.stitch.calibration import StitchCalibrationDialog, _run_job
+from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog, _run_job
 from xdart.gui.tabs.stitch.page import StitchPage
 from xrd_tools.core.geometry.stacked_arm import EXTENDED_ARM_MARKER
 from xrd_tools.core.scan import SourceKind, SourceSpec
@@ -400,7 +400,7 @@ def test_the_guided_save_equals_the_core_save(qapp, tmp_path, monkeypatch):
     )
     (tmp_path / 'frames').mkdir()
     frames = _guided_frames(tmp_path)
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog.frames = frames
         dialog._frame_motors = ('del', 'nu')
@@ -493,7 +493,7 @@ def test_cancelled_refinement_ends_cancelled_and_a_refusal_saves_nothing(qapp, t
 
     seed_path = tmp_path / 'five.json'
     seed_path.write_text(json.dumps(seed))
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog.set_source_context(spec, geometry_path=seed_path)
         dialog._fields['refine_frames'].setText('2')
@@ -508,7 +508,7 @@ def test_cancelled_refinement_ends_cancelled_and_a_refusal_saves_nothing(qapp, t
 def test_the_arm_note_says_which_model_and_why(qapp, tmp_path):
     (tmp_path / 'frames').mkdir()
     frames = _guided_frames(tmp_path)
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog.frames = frames
         dialog._frame_motors = ('del', 'nu')
@@ -539,7 +539,7 @@ def test_an_independent_angle_page_geometry_does_not_become_the_refinement_seed(
     keeps starting from the current fit instead of refusing later."""
     older = tmp_path / 'older.json'
     older.write_text(json.dumps({'trans_function': {'constants': {'pi': 3.141592653589793}}}))
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog.set_source_context(SourceSpec(tmp_path / 'scan', SourceKind.SPEC, options={'scan': '1'}),
                                   geometry_path=older)
@@ -555,7 +555,7 @@ def test_the_xrayutilities_file_is_checked_over_the_scan_and_a_refusal_keeps_the
     whose metadata was read; a fit xrayutilities cannot take is saved and adopted without one."""
     (tmp_path / 'frames').mkdir()
     frames = _guided_frames(tmp_path)
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog.frames = frames
         dialog._frame_motors = ('del', 'nu')
@@ -679,7 +679,7 @@ def test_the_quick_save_builds_the_arm_the_geometry_shows(qapp, tmp_path, plane,
     direct-beam calibration is that arm, not the default del-on-nu one."""
     from xrd_tools.core.geometry.stacked_arm import is_single_arm
     from xrd_tools.session.instrument import InstrumentGeometry, calibration_arm
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         geometry = InstrumentGeometry('twoc', (('tth', 'two_theta'),), plane)
         dialog.set_instrument(geometry)
@@ -756,7 +756,7 @@ def test_fitted_motor_scales_hold_the_default_energy(qapp, tmp_path):
     holds the energy that is refined by default (D1) and says so, rather than refusing the fit."""
     (tmp_path / 'frames').mkdir()
     frames = _guided_frames(tmp_path)
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog.frames = frames
         dialog._frame_motors = ('del', 'nu')
@@ -810,7 +810,7 @@ def test_a_saved_calibration_is_named_after_its_scan_and_never_over_another(qapp
     """Maintainer, 2026-09-29: "the default json/poni file names … should be named like the nexus files …
     (spec_name_scan_no.json/poni)": the calibrant scan's SPEC file and scan (the direct-beam scan's for a
     direct-beam geometry), the first free name, since a saved calibration is never overwritten."""
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         for key, value in (('source', tmp_path / 'LaB6_17keV'), ('scan', '14'),
                            ('beam_source', tmp_path / 'direct_beam'), ('beam_scan', '3.1')):
@@ -847,7 +847,7 @@ def test_a_frame_staged_with_another_camera_is_not_calibrated(qapp, tmp_path, mo
     mask = np.zeros(shape, bool)
     mask[0, 0] = True
     np.save(tmp_path / "mask.npy", mask)
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     started = []
     monkeypatch.setattr(dialog, "_start", lambda kind, payload: started.append(kind))
     try:

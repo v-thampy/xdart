@@ -1758,7 +1758,7 @@ class StitchPage(QtWidgets.QWidget):
         settings); older settings name the del and nu motors, or the Angle mapping does. An older
         window's normal-incidence zero becomes its circle's motor zero (Codex review F1)."""
         from xrd_tools.session.instrument import InstrumentGeometry
-        from .calibration import migrated_instrument
+        from xdart.gui.tabs.calibration.dialog import migrated_instrument
         if self._calibration_dialog is not None:
             return self._calibration_dialog.geometry_editor.value()
         saved = self._calibration_settings or {}
@@ -2456,7 +2456,7 @@ class StitchPage(QtWidgets.QWidget):
                 raw_dtype=str(self._value("raw_dtype")), raw_header_skip=int(self._value("raw_header_skip")))})
 
     def _calibrate(self):
-        from .calibration import StitchCalibrationDialog
+        from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
         if self._owner.busy or self._closing or self._authoring_active():
             return
         try:
@@ -2472,7 +2472,8 @@ class StitchPage(QtWidgets.QWidget):
             unconfigured = False
             if self._calibration_dialog is None:
                 geometry = self._instrument()  # before the window exists: settings, or migrated
-                self._calibration_dialog = StitchCalibrationDialog(str(self._value("project_root")), parent=self)
+                self._calibration_dialog = CalibrationDialog(
+                    CalibrationContext("Stitch", str(self._value("project_root"))), parent=self)
                 saved = self._calibration_settings or {}
                 if saved:
                     self._calibration_dialog.apply_settings(saved)
@@ -2527,12 +2528,12 @@ class StitchPage(QtWidgets.QWidget):
             return ImageOrientation()
 
     def _make_mask(self):
-        from .mask import StitchMaskDialog
+        from xdart.gui.tabs.calibration.mask import MaskDialog
         if self._owner.busy or self._closing or self._authoring_active():
             return
         try:
             source = self._source_spec_for_tools()
-            dialog = StitchMaskDialog(str(self._value("project_root")), source=source,
+            dialog = MaskDialog(str(self._value("project_root")), source=source,
                 rotation=self._image_orientation().rotation, reader_options=dict(
                     detector_shape=(int(self._value("detector_rows")), int(self._value("detector_cols"))),
                     raw_dtype=str(self._value("raw_dtype")), raw_header_skip=int(self._value("raw_header_skip")),

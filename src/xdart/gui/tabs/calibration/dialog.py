@@ -1,7 +1,8 @@
-"""Modeless guided Stitch calibration, using the shared child-process owner."""
+"""The modeless guided calibration window every page opens with its own context (Stitch, RSM), using the
+shared child-process owner."""
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from contextlib import ExitStack
 import json
 import logging
@@ -343,7 +344,18 @@ def _plain_choice(value):
     return value if value is None or isinstance(value, (bool, int, float, str)) else None
 
 
-class StitchCalibrationDialog(QtWidgets.QDialog):
+@dataclass(frozen=True)
+class CalibrationContext:
+    """The page a calibration window serves: its name, in the window's title and buttons ("Save geometry and
+    use in RSM"), and its Project, where the window keeps its sessions and saves. Each page opens its own
+    window with its own context, from its own Project and source (``set_source_context``), and adopts only
+    its own window's saves. The page, not the window, keeps the window's settings."""
+
+    page: str
+    project_root: str | Path
+
+
+class CalibrationDialog(QtWidgets.QDialog):
     """Retained window. ``calibrationSaved(path, backend)`` adopts a saved pyFAI calibration
     (``backend`` 'multigeometry'); its xrayutilities partner, when one was made, is beside it
     (``xu_partner_path``).
@@ -357,13 +369,16 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
     #: The diffractometer or a circle's motor changed (the page keeps the same geometry).
     geometryChanged = QtCore.Signal()
 
-    def __init__(self, project_root: str | Path, *, parent=None):
+    def __init__(self, context: CalibrationContext, *, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Stitch calibration')
-        self.setObjectName('stitchCalibrationDialog')
+        if type(context) is not CalibrationContext:
+            raise TypeError('a calibration window needs its page\'s CalibrationContext')
+        self.context = context
+        self.setWindowTitle(f'{context.page} calibration')
+        self.setObjectName('calibrationDialog')
         self.setModal(False)
         self.resize(940, 730)
-        self.project_root = Path(project_root).resolve()
+        self.project_root = Path(context.project_root).resolve()
         self.session_dir = self.project_root / 'calibration' / f'session-{uuid.uuid4().hex[:12]}'
         self.frames = ()
         self.fit = None
@@ -812,11 +827,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._edit(ranges, 'del_domain', 'del range for xrayutilities (min, max °)', '', tip=range_tip.format('del'))
         self._edit(ranges, 'nu_domain', 'nu range for xrayutilities (min, max °)', '', tip=range_tip.format('nu'))
         layout.addWidget(self._xu_ranges)
-        self.save_button = QtWidgets.QPushButton('Save geometry and use in Stitch')
+        self.save_button = QtWidgets.QPushButton(f'Save geometry and use in {self.context.page}')
         self.save_button.setToolTip('Saves the fitted geometry inside the project as a pyFAI goniometer JSON and, '
                                     'beside it, the same calibration for xrayutilities (<name>.xu.json, checked '
-                                    'against pyFAI on every pixel), and makes it Stitch\'s calibration: the Backend '
-                                    'under Processing chooses which of the two Stitch uses.')
+                                    'against pyFAI on every pixel), and makes it '
+                                    f'{self.context.page}\'s calibration: the Backend under Processing chooses '
+                                    'which of the two Stitch uses.')
         self.save_button.setEnabled(False)
         self.save_button.clicked.connect(self._save)
         layout.addWidget(self.save_button)
@@ -863,7 +879,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         from xdart.gui.widgets.geometry_editor import GeometryEditor
         self._diffractometer_box = QtWidgets.QGroupBox('Diffractometer')
         box = QtWidgets.QVBoxLayout(self._diffractometer_box)
-        self.geometry_editor = GeometryEditor(used=('nu', 'del', 'tth'), used_by='Stitch')
+        self.geometry_editor = GeometryEditor(used=('nu', 'del', 'tth'), used_by=self.context.page)
         box.addWidget(self.geometry_editor)
         self._detector_box = self._build_detector()
         layout.insertWidget(0, self._diffractometer_box)
@@ -962,7 +978,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         # calibration json file from just the sample detector distance, and direct beam pixel")
         self.save_rough_button = QtWidgets.QPushButton('Save as calibration…')
         self.save_rough_button.setToolTip(
-            'Saves this geometry, with no ring fit, as Stitch\'s calibration: the distance and beam pixel '
+            f'Saves this geometry, with no ring fit, as {self.context.page}\'s calibration: the distance and beam '
+            'pixel '
             'above, the rotations held as typed, one degree per degree. As Save does, it writes the pyFAI '
             'file and, beside it, the xrayutilities file, checked on the direct-beam scan\'s angles, the '
             'calibrant scan\'s and the xrayutilities ranges beside Save (4 · Calibrate and fit). Useful when '
@@ -1044,7 +1061,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                    tip='Pixels to leave out everywhere in this calibration: the direct-beam fit, pyFAI-calib2 '
                        '(its mask), the automatic refinement\'s ring search and the expected rings. Drawn on '
                        'the stored image (before the camera\'s turn), as the Stitch Mask File is; saving the '
-                       'calibration makes it Stitch\'s Mask File.')
+                       f'calibration makes it {self.context.page}\'s Mask File.')
         self._fields['mask'].editingFinished.connect(self._render_frames)
         return panel
 
@@ -1804,7 +1821,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             return None
         selected = Path(path).resolve()
         if not selected.is_relative_to(self.project_root):
-            raise ValueError('save the geometry inside the Stitch project')
+            raise ValueError(f'save the geometry inside the {self.context.page} project')
         if selected.exists() or xu_partner_path(selected).exists():
             raise ValueError(f'{selected.name} or {xu_partner_path(selected).name} exists: choose a new name')
         return selected

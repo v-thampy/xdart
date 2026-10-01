@@ -1,4 +1,5 @@
-"""Stitch mask authoring through the established exact-frame child workflow."""
+"""Mask authoring through the established exact-frame child workflow: the window every page opens to
+draw a detector mask on one of its original frames."""
 from pathlib import Path
 
 from pyqtgraph.Qt import QtCore, QtWidgets
@@ -8,7 +9,7 @@ from xdart.gui.pages.values import PageCleanup
 from xdart.gui.widgets.controls_panel import FormRow
 
 
-class StitchMaskDialog(QtWidgets.QDialog):
+class MaskDialog(QtWidgets.QDialog):
     maskSaved = QtCore.Signal(str)
 
     def __init__(self, project_root, *, source=None, rotation=0, reader_options=None, parent=None):

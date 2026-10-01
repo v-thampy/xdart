@@ -11,7 +11,7 @@ import tifffile
 
 from xdart.gui.tabs.scattering.experiment_authoring import prepare_calibration_request, run_calibration
 from xdart.gui.tabs.scattering.operation_values import OperationIdentity, OperationTerminalStatus
-from xdart.gui.tabs.stitch.calibration import StitchCalibrationDialog
+from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
 from xrd_tools.core.scan import SourceSpec, SourceKind
 
 
@@ -143,7 +143,7 @@ qt.QApplication.exec = automated_exec
 
 
 def test_modeless_window_exposes_guided_source_controls_and_preserves_session(tmp_path):
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     source = SourceSpec(tmp_path/'beam', SourceKind.SPEC, options={'scan':'14', 'image_dir':str(tmp_path/'images')})
     dialog.set_source_context(source, image_rotation=180, del_motor='delta', nu_motor='gamma')
     assert not dialog.isModal()
@@ -163,7 +163,7 @@ def test_modeless_window_exposes_guided_source_controls_and_preserves_session(tm
 
 def test_calibration_rows_name_their_source_image_and_a_save_selects_the_next_frame(tmp_path):
     from xrd_tools.integrate.stitch_calibration import CalibrationFrame
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
 
     def frame(index, raw, within=0):
         return CalibrationFrame(f'frame-{index}', str(tmp_path/'beam'), 'spec', {}, index,
@@ -186,7 +186,7 @@ def test_calibration_rows_name_their_source_image_and_a_save_selects_the_next_fr
 
 
 def test_a_frame_opens_pyfai_with_its_calibrant_energy_and_predicted_geometry(tmp_path):
-    from xdart.gui.tabs.stitch.calibration import _pyfai_arguments
+    from xdart.gui.tabs.calibration.dialog import _pyfai_arguments
     from tests.core.test_calibration_seed import _frame, _record
     folder = tmp_path / 'frame-20'
     folder.mkdir()
@@ -204,7 +204,7 @@ def test_a_frame_opens_pyfai_with_its_calibrant_energy_and_predicted_geometry(tm
 def test_a_frame_without_energy_takes_the_windows_wavelength_never_pyfais_default(tmp_path):
     """Deferred item 9 (CAL-2): a frame whose scan records no energy is calibrated at the window's
     wavelength (typed, else a scan's), else a seed calibration's; with neither, Calibrate refuses."""
-    from xdart.gui.tabs.stitch.calibration import _frame_energy_known, _pyfai_arguments
+    from xdart.gui.tabs.calibration.dialog import _frame_energy_known, _pyfai_arguments
     from tests.core.test_calibration_seed import _frame, _record
     folder = tmp_path / 'frame-20'
     folder.mkdir()
@@ -223,7 +223,7 @@ def test_a_frame_without_energy_takes_the_windows_wavelength_never_pyfais_defaul
 
 def test_the_frame_table_lists_each_frames_expected_rings(tmp_path):
     from tests.core.test_calibration_seed import _frame, _record
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     dialog.frames = (replace(_frame({'del': 20., 'nu': 0.}), identity='frame-20'),)
     dialog._render_frames()
     assert dialog.frame_table.item(0, 5).text() == '—'  # nothing to predict from yet
@@ -238,10 +238,10 @@ def test_the_frame_table_lists_each_frames_expected_rings(tmp_path):
 
 
 def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
-    from xdart.gui.tabs.stitch.calibration import _pyfai_arguments
+    from xdart.gui.tabs.calibration.dialog import _pyfai_arguments
     from pyFAI.io.ponifile import PoniFile
     from tests.core.test_calibration_seed import _frame, _record
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     assert [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())] == [
         '1 · Instrument', '2 · Rough geometry', '3 · Calibrant scan', '4 · Calibrate and fit']
     visible = dialog._row_visible
@@ -284,7 +284,7 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
 
 
 def test_the_geometry_comes_first_and_names_the_arm_motors(tmp_path):
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     assert dialog.tabs.tabText(0) == '1 · Instrument'
     assert dialog._tab_pages['instrument'].isAncestorOf(dialog.geometry_editor)
     source = SourceSpec(tmp_path/'beam', SourceKind.SPEC, options={'scan': '14'})
@@ -305,7 +305,7 @@ def test_the_tabs_hold_the_instrument_then_advanced_above_the_fits_and_the_range
     """The maintainer's four tabs (2026-09-30): the Diffractometer above the Detector; Advanced, collapsed
     and holding the energy option, above both fits; Refine from the whole scan open; the xrayutilities
     ranges, which only the saves read, beside Save."""
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     instrument = dialog._tab_pages['instrument'].widget().layout()
     assert instrument.indexOf(dialog._diffractometer_box) < instrument.indexOf(dialog._detector_box)
     assert dialog._diffractometer_box.isAncestorOf(dialog.geometry_editor)
@@ -353,7 +353,7 @@ def test_a_twoc_scan_is_read_and_staged_as_one_2theta_arm(tmp_path):
         (images / f'powder_scan1_{index:04d}.raw').write_bytes(np.zeros((4, 6), '<i4').tobytes())
     source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(images),
         'image_stem': 'powder_scan1_', 'read_image_kwargs': {'detector_shape': (4, 6), 'raw_dtype': '<i4'}})
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog.set_instrument(InstrumentGeometry('twoc'))
         dialog.set_source_context(source)
@@ -397,8 +397,8 @@ def test_a_horizontal_twoc_scan_is_staged_and_resumed_as_nu(tmp_path, monkeypatc
         (images / f'powder_scan1_{index:04d}.raw').write_bytes(np.zeros((4, 6), '<i4').tobytes())
     source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(images),
         'image_stem': 'powder_scan1_', 'read_image_kwargs': {'detector_shape': (4, 6), 'raw_dtype': '<i4'}})
-    dialog = StitchCalibrationDialog(tmp_path)
-    other = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    other = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog.set_instrument(InstrumentGeometry('twoc', plane='horizontal'))
         dialog.set_source_context(source)
@@ -436,7 +436,7 @@ def test_a_horizontal_twoc_scan_is_staged_and_resumed_as_nu(tmp_path, monkeypatc
 
 
 def test_reading_metadata_takes_each_circles_motor_from_the_scan(tmp_path):
-    from xdart.gui.tabs.stitch.calibration import _dispatch_job
+    from xdart.gui.tabs.calibration.dialog import _dispatch_job
     from xrd_tools.session.instrument import InstrumentGeometry
     spec = tmp_path / 'beam'
     spec.write_text('#F beam\n#E 1\n#D Thu Jan 1 00:00:00 1970\n#C test\n'
@@ -479,7 +479,7 @@ def test_staged_frames_survive_pyfai_ring_extraction(tmp_path):
 
 def test_direct_beam_window_handoff_uses_actual_api_and_seed_not_bounds(tmp_path):
     from tests.core.test_direct_beam import beam_images, config
-    from xdart.gui.tabs.stitch.calibration import _run_job
+    from xdart.gui.tabs.calibration.dialog import _run_job
     from xrd_tools.integrate.direct_beam import calibrate_direct_beam
     angles = np.array([5.5,6.,6.5,7.,7.5,8.,8.5])
     images, _, beam = beam_images(angles)
@@ -497,7 +497,7 @@ def test_direct_beam_window_handoff_uses_actual_api_and_seed_not_bounds(tmp_path
                                      beam_pixel=beam, angle_zero_deg=7.)
     assert result.distance_m == pytest.approx(expected.distance_m)
     assert result.point_ids == tuple(('1.1', index) for index in range(7))
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     for key, value in (('beam_source', spec), ('beam_scan', '1'), ('beam_images', tmp_path)):
         dialog._set_field_text(key, str(value))
     # as the window's own job records it: the result and the inputs it was fitted from (Codex F5)
@@ -533,7 +533,7 @@ def test_direct_beam_fit_button_reads_container_sources(tmp_path, source_kind):
         handle.create_group('measurement').attrs['NX_class'] = 'NXentry'
         handle['measurement/data/data_000001'] = h5py.ExternalLink(nexus.name, '/measurement/data/image')
         handle['measurement/instrument/detector/detectorSpecific/nimages'] = 1
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData(source_kind))
     # the NeXus case leaves the beam pixel blank: it is found on the frame at the zero
     typed = ', '.join(map(str, beam)) if source_kind == 'spec_container' else ''
@@ -598,7 +598,7 @@ def test_a_direct_beam_fit_shows_its_distance_and_the_scan_supplies_the_waveleng
                     '#D today\n#P0 0 0 17000.018\n#N 1\n#L del\n' + '\n'.join(map(str, angles)) + '\n')
     for index, array in enumerate(images):
         tifffile.imwrite(tmp_path / f'direct_scan1_{index:04d}.tif', array)
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog.show()  # as the page opens it
         dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('spec_series'))
@@ -643,7 +643,7 @@ def test_return_in_a_box_commits_it_and_presses_no_button(tmp_path):
     """Return or Enter in any box of the calibration window pressed its default button, "Fit direct-beam
     distance", and started a job; now it only commits the box."""
     from pyqtgraph.Qt import QtCore, QtWidgets, QtTest
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog.show()
         clicked = []
@@ -666,7 +666,7 @@ def test_return_in_a_box_commits_it_and_presses_no_button(tmp_path):
 def test_direct_beam_container_job_refuses_count_mismatch_and_honours_cancel(tmp_path):
     import h5py
     from xdart.gui.pages.operation_owner import OperationCancelled
-    from xdart.gui.tabs.stitch.calibration import _run_job
+    from xdart.gui.tabs.calibration.dialog import _run_job
     spec = tmp_path / 'direct.spec'
     spec.write_text('#F direct\n#O0 eta\n#S 8 ascan del 1 -1 4 1\n'
         '#P0 0\n#N 1\n#L del\n1\n.5\n0\n-.5\n-1\n')
@@ -686,8 +686,8 @@ def test_direct_beam_container_job_refuses_count_mismatch_and_honours_cancel(tmp
 
 def test_the_detector_and_its_orientation_are_choices_saved_with_the_settings(tmp_path):
     from pyqtgraph.Qt import QtWidgets
-    dialog = StitchCalibrationDialog(tmp_path)
-    again = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    again = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         detector, orientation = dialog._fields['beam_detector'], dialog._fields['beam_orientation']
         assert isinstance(detector, QtWidgets.QComboBox) and isinstance(orientation, QtWidgets.QComboBox)
@@ -741,7 +741,7 @@ def test_after_one_calibrated_frame_the_others_are_predicted_from_it(tmp_path):
     import time
     from pyFAI.io.ponifile import PoniFile
     from pyqtgraph.Qt import QtWidgets
-    from xdart.gui.tabs.stitch.calibration import _pyfai_arguments
+    from xdart.gui.tabs.calibration.dialog import _pyfai_arguments
     from tests.core.test_stacked_arm_extension import _calibration, _ring_controls
     from tests.core.test_stitch_guided_calibration import _frames
     from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
@@ -753,7 +753,7 @@ def test_after_one_calibrated_frame_the_others_are_predicted_from_it(tmp_path):
     waiting = tuple(replace(frame, poni_path='', poni_sha256='', npt_path='', npt_sha256='', pairing_policy='',
                             control_image_sha256='') for frame in calibrated[1:])
     true_arm = StackedDetectorArm(**truth).to_pyfai_goniometer(_calibration())
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         # the truth's motor zeros (del 2.86°, nu −1.15°), typed beside the motors: every fit starts there
         dialog.geometry_editor.zero_edit('del').setText(f'{np.rad2deg(.05):.12g}')
@@ -784,7 +784,7 @@ def test_after_one_calibrated_frame_the_others_are_predicted_from_it(tmp_path):
 def test_a_cancel_during_the_prediction_keeps_the_frame_pyfai_saved(tmp_path):
     """The prediction runs after the frame's PONI and points are adopted: a cancel there drops
     only the prediction, never the calibrated frame (Codex round 16)."""
-    from xdart.gui.tabs.stitch.calibration import _run_job
+    from xdart.gui.tabs.calibration.dialog import _run_job
     from tests.core.test_stacked_arm_extension import _calibration, _ring_controls
     from tests.core.test_stitch_guided_calibration import _frames
     (tmp_path / 'frames').mkdir()
@@ -805,12 +805,12 @@ def test_a_cancel_during_the_prediction_keeps_the_frame_pyfai_saved(tmp_path):
 
 def test_the_detector_mask_reaches_pyfai_turned_as_the_frames_are(tmp_path):
     import fabio
-    from xdart.gui.tabs.stitch.calibration import _pyfai_arguments
+    from xdart.gui.tabs.calibration.dialog import _pyfai_arguments
     from tests.core.test_calibration_seed import _frame
     mask = np.zeros((195, 1475), bool)
     mask[:10, :20] = True  # drawn on the stored image
     np.save(tmp_path / 'mask.npy', mask)
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog._fields['mask'].setText(str(tmp_path / 'mask.npy'))
         from xrd_tools.core.geometry.camera import DetectorCamera
@@ -844,7 +844,7 @@ def test_the_rough_geometry_puts_the_beam_where_the_fit_says_it_is_at_the_zero(t
         handle.create_group('measurement').attrs['NX_class'] = 'NXentry'
         handle['measurement/data/image'] = np.asarray(images).astype('uint32')
         handle['measurement/data/del'] = angles
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('nexus'))
         for key, value in dict(beam_source=nexus, beam_entry='measurement', beam_detector='Pilatus100k',
@@ -892,7 +892,7 @@ def test_a_direct_beam_container_keeps_its_held_circle_and_energy(tmp_path, kind
     """Codex testing-fixes review F2: a NeXus stack, or SPEC metadata with an image container, fitted its
     distance but returned no energy and no held reading, so the rough geometry put the beam at the held
     circle's zero (4° from the direct beam here) and the scan's energy was not offered."""
-    from xdart.gui.tabs.stitch.calibration import _run_job
+    from xdart.gui.tabs.calibration.dialog import _run_job
     from xrd_tools.integrate.calibration_seed import predict_frame_seed, rough_arm_record
     from tests.core.test_calibration_seed import _frame
     nexus, angles, beam = _beam_container(tmp_path)
@@ -934,7 +934,7 @@ def test_the_calibration_windows_fields_are_ints_rows(tmp_path):
     the full path; the energy and motor-scale options are Int's toggles; the RAW reader and the energy bound
     are rows too."""
     from pyqtgraph.Qt import QtWidgets
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog.show()
         QtWidgets.QApplication.processEvents()
@@ -957,3 +957,31 @@ def test_the_calibration_windows_fields_are_ints_rows(tmp_path):
     finally:
         dialog.close()
         dialog.deleteLater()
+
+
+def test_each_page_opens_the_shared_calibration_window_with_its_own_context(tmp_path):
+    """AUD-9 stage 2b G6 (the maintainer: "RSM should have a calibration page just like stitch" and "the idea is
+    to reuse what was developed for stitch, not use the calibration that was done in stitch"): the calibration
+    window is one shared component that each page opens with its own ``CalibrationContext``. Its title, Save
+    button and the instrument's "used by" name the page; a save reaches only the page whose window it is."""
+    from pyqtgraph.Qt import QtWidgets
+    stitch = CalibrationDialog(CalibrationContext('Stitch', tmp_path / 'stitch'))
+    rsm = CalibrationDialog(CalibrationContext('RSM', tmp_path / 'rsm'))
+    try:
+        assert stitch.windowTitle() == 'Stitch calibration' and rsm.windowTitle() == 'RSM calibration'
+        assert stitch.save_button.text() == 'Save geometry and use in Stitch'
+        assert rsm.save_button.text() == 'Save geometry and use in RSM'
+        assert rsm.geometry_editor._used_by == 'RSM' and rsm.project_root == (tmp_path / 'rsm').resolve()
+        assert rsm.session_dir.parent == (tmp_path / 'rsm').resolve() / 'calibration'
+        adopted = {'Stitch': [], 'RSM': []}
+        stitch.calibrationSaved.connect(lambda path, backend: adopted['Stitch'].append(path))
+        rsm.calibrationSaved.connect(lambda path, backend: adopted['RSM'].append(path))
+        rsm.calibrationSaved.emit(str(tmp_path / 'rsm' / 'geometry.json'), 'multigeometry')
+        QtWidgets.QApplication.processEvents()
+        assert adopted == {'Stitch': [], 'RSM': [str(tmp_path / 'rsm' / 'geometry.json')]}
+        with pytest.raises(TypeError):
+            CalibrationDialog(tmp_path)  # a bare Project is not a page's context
+    finally:
+        for dialog in (stitch, rsm):
+            dialog.close()
+            dialog.deleteLater()

@@ -907,7 +907,7 @@ def test_a_result_is_shown_once_when_it_is_mounted(qapp, tmp_path):
 def test_mask_exact_frame_staging_is_unrotated_and_page_shutdown_reaps_worker(qapp, tmp_path):
     from threading import Event
     import fabio
-    from xdart.gui.tabs.stitch.mask import StitchMaskDialog
+    from xdart.gui.tabs.calibration.mask import MaskDialog
     form = _form(tmp_path, "multigeometry")
     page = StitchPage(empty_host_services(_Status()))
     try:
@@ -917,7 +917,7 @@ def test_mask_exact_frame_staging_is_unrotated_and_page_shutdown_reaps_worker(qa
         cancel = Event()
         cancel.set()
         staging = tmp_path / "mask-source"
-        assert StitchMaskDialog._run((source, 1, str(staging), 180), cancel, lambda *args: None) is None
+        assert MaskDialog._run((source, 1, str(staging), 180), cancel, lambda *args: None) is None
         images = tuple(staging.glob("frame-*/sample_scan1_0001.edf"))  # named after its source image
         assert len(images) == 1
         original = np.fromfile(Path(form.image_dir) / "sample_scan1_0001.raw", dtype="int32").reshape(form.detector_shape)
@@ -944,7 +944,7 @@ def test_mask_exact_frame_staging_is_unrotated_and_page_shutdown_reaps_worker(qa
 def test_directory_mask_picker_retains_the_declared_raw_decoder(qapp, tmp_path):
     from threading import Event
     import fabio
-    from xdart.gui.tabs.stitch.mask import StitchMaskDialog
+    from xdart.gui.tabs.calibration.mask import MaskDialog
     form = _form(tmp_path, "xu_hist")
     page = StitchPage(empty_host_services(_Status()))
     try:
@@ -958,7 +958,7 @@ def test_directory_mask_picker_retains_the_declared_raw_decoder(qapp, tmp_path):
         cancelled = Event()
         cancelled.set()
         output = tmp_path / "directory-mask-staging"
-        assert StitchMaskDialog._run((dialog._source, 0, str(output), 0), cancelled, lambda *args: None) is None
+        assert MaskDialog._run((dialog._source, 0, str(output), 0), cancelled, lambda *args: None) is None
         staged, = output.glob("frame-*/sample_scan1_0001.edf")  # named after its source image
         assert fabio.open(staged).data.shape == (195, 1475)
         np.testing.assert_array_equal(fabio.open(staged).data, np.full((195, 1475), 11))
@@ -1172,10 +1172,10 @@ def test_the_mask_windows_fields_are_ints_rows_and_a_refused_frame_launches_noth
     ``FormRow``s. The image is chosen with the row's 📁 and shown by name, and the frame is a whole number
     from 0: a refused frame is named and nothing launches."""
     import tifffile
-    from xdart.gui.tabs.stitch.mask import StitchMaskDialog
+    from xdart.gui.tabs.calibration.mask import MaskDialog
     image = tmp_path / "frame_0001.tif"
     tifffile.imwrite(image, np.zeros((4, 5), dtype=np.uint16))
-    dialog = StitchMaskDialog(tmp_path)
+    dialog = MaskDialog(tmp_path)
     try:
         assert dialog._image_row.objectName() == "controlsFormRow" and dialog.choose is dialog._image_row.browse_button
         assert dialog.frame.objectName() == "controlsLineEdit" and dialog.frame.text() == "0"
@@ -1187,3 +1187,20 @@ def test_the_mask_windows_fields_are_ints_rows_and_a_refused_frame_launches_noth
     finally:
         dialog.shutdown()
         dialog.deleteLater()
+
+
+def test_stitch_opens_the_shared_calibration_window_with_its_context(qapp, tmp_path):
+    """AUD-9 stage 2b G6: Stitch's Calibrate opens the shared calibration window (``tabs/calibration``) with
+    Stitch's context, from its own Project."""
+    from xdart.gui.tabs.calibration.dialog import CalibrationDialog
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.set_field("project_root", str(tmp_path))
+        page._calibrate()
+        dialog = page._calibration_dialog
+        assert type(dialog) is CalibrationDialog and dialog.context.page == "Stitch"
+        assert dialog.project_root == tmp_path.resolve() and dialog.windowTitle() == "Stitch calibration"
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()

@@ -67,11 +67,11 @@ def test_stitch_spec_sources_use_the_spec_picker_and_keep_every_pick(qapp, tmp_p
 
 
 def test_calibration_source_fields_pick_spec_or_nexus_by_their_source_type(qapp, tmp_path, monkeypatch):
-    from xdart.gui.tabs.stitch.calibration import StitchCalibrationDialog
+    from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
     calls = []
     monkeypatch.setattr(file_dialogs, "browse_spec", lambda *a, **k: calls.append("spec") or [])
     monkeypatch.setattr(file_dialogs, "browse", lambda *a, **k: calls.append(k.get("file_filter")) or [])
-    dialog = StitchCalibrationDialog(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         def click(key):
             dialog._rows[key][1].findChild(QtWidgets.QAbstractButton).click()
@@ -117,8 +117,8 @@ def test_every_stitch_and_rsm_chooser_goes_through_the_shared_rule(qapp, tmp_pat
     had no file types. Through ``file_dialogs`` each remembers its pick, and a cancel changes nothing."""
     from xdart.gui.pages.services import empty_host_services
     from xdart.gui.tabs.rsm.page import RSMPage
-    from xdart.gui.tabs.stitch.calibration import StitchCalibrationDialog
-    from xdart.gui.tabs.stitch.mask import StitchMaskDialog
+    from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
+    from xdart.gui.tabs.calibration.mask import MaskDialog
     from xdart.gui.tabs.stitch.page import StitchPage
     from xdart.utils.browse import last_browse_dir
 
@@ -138,8 +138,8 @@ def test_every_stitch_and_rsm_chooser_goes_through_the_shared_rule(qapp, tmp_pat
     picked = tmp_path / "picked"
     picked.mkdir()
     (tmp_path / "calibration").mkdir()
-    mask = StitchMaskDialog(tmp_path)
-    calibration = StitchCalibrationDialog(tmp_path)
+    mask = MaskDialog(tmp_path)
+    calibration = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     page = StitchPage(empty_host_services(Status()))
     rsm = RSMPage(empty_host_services(Status()))
     try:
