@@ -73,9 +73,11 @@ class ProjectionRequest:
             raise TypeError("context projection request is invalid")
 
 
-def _apply_presentation_background(
+def apply_presentation_background(
     state: ScientificProjection, projection,
 ) -> ScientificProjection:
+    """A projection with the presentation background's values in place of its traces' (1-D) or its
+    image's (raw, 2-D), for the frames the background was promoted for; Int's pages and Stitch's."""
     if projection is None:
         return replace(state, background_set=False)
     try:
@@ -465,7 +467,7 @@ class ContextProjection:
                     intent.processing_mode
                 ),
                 norm_aggregate=norm_aggregate))
-        scientific = _apply_presentation_background(
+        scientific = apply_presentation_background(
             scientific, presentation_background)
         return ShellProjection(
             revision,
@@ -773,4 +775,4 @@ def _browse_wavelength(context: BrowseContext) -> float | None:
     return canonical_wavelength_m(value, WavelengthUnit.METRE)
 
 
-__all__ = ["ContextProjection", "ProjectionRequest"]
+__all__ = ["ContextProjection", "ProjectionRequest", "apply_presentation_background"]

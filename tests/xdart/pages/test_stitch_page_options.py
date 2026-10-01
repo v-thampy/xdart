@@ -787,9 +787,10 @@ def test_the_stitch_display_is_ints_scientific_view(qapp):
     try:
         view = page.scientific
         assert type(view) is ScientificView and page.curve is view.curve
-        # Int 1D's layout without the tools Stitch has no operation for, through every redraw
+        # Int 1D's layout without the tools Stitch has no operation for, through every redraw; Set BG shows
+        # (maintainer, 2026-09-30: Int's plot-only background in Stitch)
         for _ in range(2):
-            assert view.norm.isHidden() and view.background.isHidden()
+            assert view.norm.isHidden() and not view.background.isHidden()
             assert view.raw_popup_button.isHidden() and view.image_splitter.isHidden()
             page._draw()
         choices = [view.plot_axis.itemData(row) for row in range(view.plot_axis.count())]
@@ -797,10 +798,10 @@ def test_the_stitch_display_is_ints_scientific_view(qapp):
         assert view.title.text() == "Current"
         with pytest.raises(ValueError, match="unknown scientific-view tools"):
             view.set_hidden_tools("slice")
-        # Stitch offers Single and Overlay only, and no Waterfall options; Int keeps them all
+        # every plot mode Int has, Waterfall's options too (maintainer, 2026-09-30: Average/Sum/Waterfall)
         modes = lambda combo: [combo.itemText(row) for row in range(combo.count())]  # noqa: E731
-        assert modes(view.plot_mode) == ["Single", "Overlay"]
-        assert view.plot_options_dialog._waterfall_group.isHidden()
+        assert modes(view.plot_mode) == ["Single", "Overlay", "Average", "Sum", "Waterfall"]
+        assert not view.plot_options_dialog._waterfall_group.isHidden()
         with pytest.raises(ValueError, match="unknown plot modes"):
             view.set_plot_modes("Stack")
         int_view = ScientificView()

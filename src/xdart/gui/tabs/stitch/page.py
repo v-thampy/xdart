@@ -554,9 +554,13 @@ class StitchPage(QtWidgets.QWidget):
         self.scientific = ScientificView()
         # A Stitch 1D shows in Int 1D's layout (Q or 2θ), a Stitch 2D in Int 2D's without the raw
         # detector pane (the map has no one detector image; the contributing frames open in the raw
-        # popup). Stitch has no normalization channel, 1-D Background or raw popup on this pane.
-        self.scientific.set_hidden_tools("norm", "background", "raw", "raw_pane")
-        self.scientific.set_plot_modes("Single", "Overlay")
+        # popup). Stitch has no normalization channel or raw popup on this pane. Every plot mode Int has
+        # (maintainer, 2026-09-30: Average/Sum/Waterfall "this should be straighforward"), and Int's display
+        # background, Set BG ("would the plot only -set as background like in Int work here easily?": yes).
+        self.scientific.set_hidden_tools("norm", "raw", "raw_pane")
+        from xdart.gui.tabs.scattering.presentation_background import PresentationBackgroundOwner
+        self._background = PresentationBackgroundOwner(capacity_bytes=536_870_912)
+        self._background_context = None  # what the background was set on (_background_scope)
         self.scientific.commandRequested.connect(self._view_command)
         self.curve = self.scientific.curve
         self._install_diagnostic_option()
@@ -2615,6 +2619,8 @@ class StitchPage(QtWidgets.QWidget):
                 key = self._result_key(item.data(role))
                 if id(key) in pinned and item.data(role) in self._payloads:
                     items.setdefault(id(key), (item, self._payloads[item.data(role)]))
+        if self._background.phase == "ACTIVE" and self._background_scope(navigation) != self._background_context:
+            self._release_background()  # as Int's: another selection, result, mode or view releases it
         state = build_scientific_projection(
             tuple(self._display_payload(item, payload, with_map=map_mode) for item, payload in items.values()),
             navigation, frozenset(keys), self._view, "", processing_mode=processing_mode)
@@ -2625,14 +2631,81 @@ class StitchPage(QtWidgets.QWidget):
             return replace(trace, title=name + trace.title[len(prefix):]) if trace.title.startswith(prefix) else trace
         cuts = tuple(mode for mode in _CUT_AXES
                      if any(mode in dict(payload.gi) for _item, payload in items.values()))
-        state = replace(state, traces=tuple(named(trace) for trace in state.traces),
+        traces = tuple(named(trace) for trace in state.traces)
+        status = current.text() if current is not None else ""
+        if (self._view.plot_mode in {"Average", "Sum"} and len(traces) > 1 and any(
+                not np.array_equal(trace.axis.values, traces[0].axis.values) for trace in traces[1:])):
+            # Int's view folds only results on one grid, else shows the first: said, not silent
+            status = (f"{self._view.plot_mode} needs the results on one grid (the same range and Pts): "
+                      f"showing {traces[0].title}")
+        state = replace(state, traces=traces,
                         pinned_traces=tuple(replace(pinned, trace=named(pinned.trace)) for pinned in state.pinned_traces),
                         gi_modes_1d=("q_total", *cuts) if state.measurement_mode == "GI" else (),
-                        title=current.text() if current is not None else "Current",
-                        status=current.text() if current is not None else "")
+                        title=current.text() if current is not None else "Current", status=status)
+        from xdart.gui.tabs.scattering.context_projection import apply_presentation_background
+        state = apply_presentation_background(state, self._background.projection())
         self._last_map_state = state if map_mode else None
+        self.scientific.expect_display_background(self._background.active_key)
         self.scientific.reconcile(state, navigation, completed=self.results.currentRow() + 1,
                                   total=len(keys), detail="")
+
+    def _background_scope(self, navigation):
+        """What a display background belongs to: the layout, the selected and current results, the Diagnostic
+        and the plot axis (Int releases its background at every such boundary)."""
+        return (self._mode, tuple(id(key) for key in navigation.selected), id(navigation.current),
+                self._diagnostic, self._view.plot_axis)
+
+    def _toggle_background(self):
+        """Int's Set BG and Clear BG, display only: the selected results' mean subtracted from the results
+        shown (a pattern on another grid takes it interpolated, as Int's; in Stitch 2D the current map, from
+        the selected maps of its shape), through Int's background owner, run here at once (Stitch's results
+        are small). Clear BG drops it; so does another selection, result, mode, Diagnostic or plot axis."""
+        from xdart.gui.tabs.scattering.operation_values import OperationContextStamp
+        from xdart.gui.tabs.scattering.presentation_background import prepare_background_plan
+        owner = self._background
+        if owner.phase not in {"EMPTY", "RELEASED"}:
+            self._release_background()
+            self._draw()
+            return
+        map_mode = self._mode == "Stitch 2D"
+        domain = "integrated_2d" if map_mode else "integrated_1d"
+        keys, navigation = self._navigation()
+        payloads = tuple(self._display_payload(item, payload, with_map=map_mode) for item, payload in self._selected())
+        prepared = (None if not payloads or navigation.current is None else
+                    prepare_background_plan(payloads, domain, navigation.current, contributor_count=len(payloads)))
+        if prepared is None:
+            self._status("Select the results to take as the background: Overlay, then the results"
+                         + (" (maps of one shape, the current among them)" if map_mode else ""))
+            return
+        plan, contributors, projection_keys, targets, facts = prepared
+        reservation = owner.reserve(plan, contributors, stamp=OperationContextStamp(self._revision),
+                                    active_key=("stitch-background", self._view_revision, domain,
+                                                plan.contributor_ids, facts),
+                                    projection_keys=projection_keys,
+                                    projection_shapes=tuple(target[0].shape for target in targets))
+        if reservation is None:
+            self._status("The background exceeds its 512 MiB display allowance")
+            return
+        try:
+            receipt = owner.run_and_stage(reservation, None)
+        except (ValueError, RuntimeError) as error:
+            owner.abort(reservation, "FAILED")
+            self._status(f"The background was not set: {error}")
+            return
+        if not owner.promote(receipt, targets):
+            owner.abort(reservation, "ADOPTION_FAILED")
+            self._status("The background was not set: the results shown changed")
+            return
+        self._background_context = self._background_scope(navigation)
+        self._draw()
+
+    def _release_background(self):
+        """Drop the display background: the view lets go of what it drew with it, then the owner of it."""
+        owner = self._background
+        key = owner.active_key
+        receipt = None if key is None else self.scientific.release_display_background(key)
+        owner.release(receipt)
+        self._background_context = None
 
     def _view_command(self, command):
         """The view's typed commands for the Stitch results it shows: the preference fields each changes are
@@ -2651,6 +2724,9 @@ class StitchPage(QtWidgets.QWidget):
                 flag = (QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
                         if view.plot_mode == "Single" else QtCore.QItemSelectionModel.SelectionFlag.NoUpdate)
                 self.results.setCurrentRow(row, flag)
+            return
+        if kind is ShellCommandKind.SET_BACKGROUND:
+            self._toggle_background()
             return
         if kind is ShellCommandKind.CLEAR_1D:
             self.clear_plot()

@@ -375,6 +375,111 @@ def test_native_saved_frame_popup_keeps_curve_and_shows_thumbnail_fallback(qapp,
         page.shutdown()
 
 
+def _stitched_variants(tmp_path):
+    """Four Stitch 1D results of the fixture's scan: a; b and d with other polarization factors (a's grid);
+    c with 80 points (another grid). Returns their paths and payloads."""
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    paths, payloads = [], []
+    for name, options in (("a", {}), ("b", {"polarization_factor": .5}), ("c", {"npt_1d": 80}),
+                          ("d", {"polarization_factor": .7})):
+        (tmp_path / name).mkdir()
+        request = prepare_stitch_tool(replace(form, output_path=tmp_path / name / f"{name}_stitch1d.nexus",
+                                              **options)).request
+        result = run_stitch_operation(request)
+        assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+        paths.append(request.module.output.target)
+        payloads.append(result.payload)
+    return paths, payloads
+
+
+def test_set_bg_subtracts_the_selected_results_mean_until_cleared_or_another_selection(qapp, tmp_path):
+    """Maintainer, 2026-09-30: Int's plot-only Set BG in Stitch ("would the plot only -set as background like in
+    Int work here easily?" -- "Yes"): the selected results' mean subtracted from each shown; Clear BG, or
+    another selection, drops it (as Int's at every boundary); the records are untouched."""
+    paths, payloads = _stitched_variants(tmp_path)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        for path in paths:
+            page.open_result(path)
+            _wait(page, qapp)
+        view, button = page.scientific, page.scientific.background
+        view.plot_mode.setCurrentText("Overlay")
+        page.results.setCurrentRow(0)
+        page.results.clearSelection()
+        for row in (0, 1):  # a and b
+            page.results.item(row).setSelected(True)
+        _wait(page, qapp)
+        assert not button.isHidden() and button.text() == "Set 1D BG"
+        raw = [np.asarray(payload.intensity, dtype=np.float64) for payload in payloads[:2]]
+        first = lambda: np.asarray(page.curve.listDataItems()[0].yData, dtype=np.float64)  # noqa: E731 (Overlay
+        # stacks the others with an offset)
+        button.click()
+        assert button.text() == "Clear 1D BG", page.run_bar.readinessLabel.full_text()
+        domain, rows, _key = page._background.projection()  # what the view is given
+        mean = (raw[0] + raw[1]) / 2
+        assert domain == "integrated_1d" and len(rows) == 2
+        subtracted = sorted((values for _frame, values in rows), key=lambda values: values[0])
+        for values, expected in zip(subtracted, sorted((row - mean for row in raw), key=lambda row: row[0])):
+            np.testing.assert_allclose(values, expected, rtol=0, atol=1e-9 * np.abs(mean).max())
+        assert any(np.array_equal(first(), values) for values in subtracted)  # and shows them
+        button.click()  # Clear BG
+        assert button.text() == "Set 1D BG" and page._background.projection() is None
+        assert any(np.array_equal(first(), row) for row in raw)
+        button.click()
+        assert button.text() == "Clear 1D BG"
+        page.results.item(2).setSelected(True)  # another selection releases it
+        _wait(page, qapp)
+        assert button.text() == "Set 1D BG" and page._background.phase in {"EMPTY", "RELEASED"}
+        stored = read_analysis_artifact(paths[0], expected_kind=AnalysisArtifactKind.STITCH_1D)
+        np.testing.assert_array_equal(stored.intensity, payloads[0].intensity)  # display only
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+
+
+def test_average_sum_and_waterfall_show_the_selected_results_as_ints(qapp, tmp_path):
+    """Maintainer, 2026-09-30: Average/Sum/Waterfall in Stitch ("this should be straighforward"): Int's view
+    modes on the selected results. Average and Sum fold results on one grid; on several they say so (Int's
+    view then shows the first), while Waterfall takes each on the first's axis from the fourth result on, as
+    Int's."""
+    paths, payloads = _stitched_variants(tmp_path)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        for path in paths:
+            page.open_result(path)
+            _wait(page, qapp)
+        view = page.scientific
+        view.plot_mode.setCurrentText("Overlay")
+        page.results.clearSelection()
+        for row in (0, 1):  # a and b: one grid
+            page.results.item(row).setSelected(True)
+        _wait(page, qapp)
+        first, second = payloads[0].intensity, payloads[1].intensity
+        assert not np.array_equal(first, second)  # b's polarization factor changed it
+        view.plot_mode.setCurrentText("Average")
+        _wait(page, qapp)
+        (curve,) = page.curve.listDataItems()
+        both = np.stack([first, second]).astype(np.float64)  # the record's float32, folded as the view does
+        np.testing.assert_allclose(curve.yData, np.nanmean(both, axis=0), rtol=1e-6)
+        view.plot_mode.setCurrentText("Sum")
+        _wait(page, qapp)
+        (curve,) = page.curve.listDataItems()
+        np.testing.assert_allclose(curve.yData, np.nansum(both, axis=0), rtol=1e-6)
+        assert "one grid" not in view.status.text()
+        for row in (2, 3):  # c (80 points) and d
+            page.results.item(row).setSelected(True)
+        view.plot_mode.setCurrentText("Waterfall")
+        _wait(page, qapp)
+        assert view.bottom_stack.currentWidget() is view.waterfall
+        view.plot_mode.setCurrentText("Average")
+        _wait(page, qapp)
+        assert "Average needs the results on one grid" in view.status.text()
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+
+
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
 def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_path, backend):
     from tests.xdart.tools.test_stitch_native_values import _native_form

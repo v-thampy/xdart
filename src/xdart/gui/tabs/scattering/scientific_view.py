@@ -2807,8 +2807,8 @@ class ScientificView(QtWidgets.QFrame):
     _PLOT_MODES = ("Single", "Overlay", "Average", "Sum", "Waterfall")
 
     def set_plot_modes(self, *names: str) -> None:
-        """Offer only the plot modes the host can show (Stitch: Single and Overlay); Int
-        offers all. Without Waterfall, the options dialog leaves out its Waterfall section."""
+        """Offer only the plot modes the host can show (Int and Stitch offer all). Without Waterfall,
+        the options dialog leaves out its Waterfall section."""
         unknown = set(names) - set(self._PLOT_MODES)
         if not names or unknown:
             raise ValueError(f"unknown plot modes: {sorted(unknown) or 'none given'}")
