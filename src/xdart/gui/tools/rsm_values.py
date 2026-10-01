@@ -452,7 +452,10 @@ class RSMToolFormV2:
     bins: tuple[int, int, int]
     chunk_size: int
     max_frame_bytes: int
-    max_chunk_bytes: int
+    #: None is Auto (AUD-9 stage 2b S3a, ``rsm_v2_auto_chunking``): the preset's 256 MiB, or one frame's charge
+    #: when larger, the chunk then holding as many frames as fit (at most ``chunk_size``). A number is the
+    #: user's cap, refused at Preview when a chunk cannot fit it, with what it needs.
+    max_chunk_bytes: int | None
     output_path: str | Path
     overwrite: AnalysisArtifactOverwrite = AnalysisArtifactOverwrite.CREATE_NEW
     coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL
@@ -499,8 +502,9 @@ class RSMToolFormV2:
             or not 1 <= self.chunk_size <= _MAX_CHUNK_SIZE
             or type(self.max_frame_bytes) is not int
             or not 1 <= self.max_frame_bytes <= _MAX_FRAME_OR_CHUNK_BYTES
-            or type(self.max_chunk_bytes) is not int
-            or not 1 <= self.max_chunk_bytes <= _MAX_FRAME_OR_CHUNK_BYTES
+            or (self.max_chunk_bytes is not None and (
+                type(self.max_chunk_bytes) is not int
+                or not 1 <= self.max_chunk_bytes <= _MAX_FRAME_OR_CHUNK_BYTES))
             or type(self.overwrite) is not AnalysisArtifactOverwrite
             or type(self.coordinate_frame) is not RSMCoordinateFrame
             or (self.corrections is not None and type(self.corrections) is not RSMFrameCorrections)

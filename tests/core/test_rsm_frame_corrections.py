@@ -164,12 +164,11 @@ def test_the_corrections_are_charged_in_the_memory_plan(rsm_r2_project):
     cap = 56 * 1024 * 1024  # the preset chunk of 8 frames: plain 49,381,800 B, corrected 63,813,381 B (S2.3)
     tight_plain = _request(rsm_r2_project, "mem-plain-tight", None, max_chunk_bytes=cap)
     _require_rsm_v2_memory_plan(tight_plain)
-    tight_on = _request(rsm_r2_project, "mem-on-tight",
-                        RSMFrameCorrections(solid_angle=True, polarization_factor=0.99), max_chunk_bytes=cap)
-    from xrd_tools.analysis.rsm_operation import RSMOperationRefused
-    with pytest.raises(RSMOperationRefused) as refused:  # the run's memory plan, before any decode
-        _require_rsm_v2_memory_plan(tight_on)
+    with pytest.raises(RSMToolPreflightRefused) as refused:  # the memory plan at Preview (S3a), before any decode
+        _request(rsm_r2_project, "mem-on-tight", RSMFrameCorrections(solid_angle=True, polarization_factor=0.99),
+                 max_chunk_bytes=cap)
     assert refused.value.code == "Q_MEMORY_LIMIT_EXCEEDED"
+    assert "one chunk of 8 frames needs 61 MiB; Max chunk MiB is 56" in str(refused.value)
 
 
 @pytest.mark.slow
@@ -295,3 +294,69 @@ def test_pixel_q_rows_is_the_whole_calls_band_byte_for_byte(rsm_r2_project):
                          (DiffractometerConfig(ang2q_kwargs={"roi": [0, 4, 0, 9]}), (0, 4))):
         with pytest.raises(ValueError, match="one band"):
             PixelQMap(config, header).pixel_q([np.array([0.0])], 12000.0, rows=rows)
+
+
+def test_auto_chunking_is_the_preset_at_pilatus_and_one_frame_at_eiger_size():
+    """S3a: Auto Max chunk MiB is the preset's 256 MiB, or one frame's charge rounded up to the next MiB when that
+    is larger, and the chunk then holds as many frames as fit (at most Chunk). Scan 43's Pilatus 100K crop keeps
+    the preset (eight frames, 256 MiB) whatever the corrections; an Eiger 4M (2167 x 2070) takes one frame a chunk
+    and a cap sized to it, where the 256 MiB preset refused even a plain frame (282.3 MiB with all-frame hot).
+    Figures from ``logs/s3a-auto-chunking.log``."""
+    from xrd_tools.analysis.rsm_operation import rsm_v2_auto_chunking, rsm_v2_chunk_bytes
+    default = RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
+    mib = 1024 * 1024
+    for corrections in (None, default):
+        for static_hot in (True, False):
+            assert rsm_v2_auto_chunking((195, 487), (194, 486), 8, static_hot=static_hot,
+                                        corrections=corrections) == (8, 256 * mib)
+    cases = {(True, None): 283, (True, True): 375, (False, None): 279, (False, True): 371}
+    for (static_hot, corrected), expected_mib in cases.items():
+        corrections = default if corrected else None
+        frames, cap = rsm_v2_auto_chunking((2167, 2070), (2167, 2070), 8, static_hot=static_hot,
+                                           corrections=corrections)
+        one = rsm_v2_chunk_bytes((2167, 2070), (2167, 2070), 1, static_hot=static_hot, corrections=corrections)
+        two = rsm_v2_chunk_bytes((2167, 2070), (2167, 2070), 2, static_hot=static_hot, corrections=corrections)
+        assert (frames, cap) == (1, expected_mib * mib) and one <= cap < two
+
+
+@pytest.mark.slow
+def test_auto_at_preview_is_the_presets_plan_at_pilatus_and_a_small_cap_names_its_need(rsm_r2_project):
+    """S3a: Auto (``max_chunk_bytes=None``) resolves at Preview to the same plan as the preset's explicit 256 MiB
+    at Pilatus size (plan fingerprints equal), so a default Pilatus run is unchanged; a user's cap below what a
+    chunk needs is refused at Preview, not after the sources open, naming the MiB it needs."""
+    from xrd_tools.analysis.rsm_operation import rsm_v2_chunk_bytes
+    explicit = _request(rsm_r2_project, "auto-explicit")
+    auto = _request(rsm_r2_project, "auto", max_chunk_bytes=None)
+    assert (auto.plan.chunk_size, auto.plan.max_chunk_bytes) == (8, 256 * 1024 * 1024)
+    assert auto.plan.fingerprint == explicit.plan.fingerprint
+    member, bound = auto.preflight.members[0], auto.plan.corrections
+    one = rsm_v2_chunk_bytes(member.detector_shape, member.cropped_shape, 1,
+                             static_hot=auto.plan.conditioning.static_hot_threshold is not None,
+                             corrections=None if bound is None else bound.corrections)
+    with pytest.raises(RSMToolPreflightRefused) as refused:  # before any member is read
+        _request(rsm_r2_project, "tiny", max_chunk_bytes=1024 * 1024)
+    assert refused.value.code == "Q_MEMORY_LIMIT_EXCEEDED"
+    assert f"one frame needs {-(-one // (1024 * 1024))} MiB; Max chunk MiB is 1" in str(refused.value)
+
+
+@pytest.mark.slow
+def test_the_correction_states_charge_bounds_what_the_run_allocates_before_the_chunks(rsm_r2_project):
+    """S3a: the run decodes its mask, dark and flat and computes pyFAI's solid angle once, before the chunks
+    (``_rsm_correction_state``); that transient is not a chunk's, so the memory plan charges it in the run's
+    resident peak (``_rsm_v2_correction_state_bytes``). Measured here with tracemalloc on the real state at
+    scan 43's Pilatus 100K: the charge is at or above it (the solid angle alone measured 48.1 B/px there and
+    48.0 at 2167 x 2070, ``logs/s3a-solid-angle-transient.log``; charged 49)."""
+    import tracemalloc
+    from xrd_tools.analysis.rsm_operation import _rsm_correction_state, _rsm_v2_correction_state_bytes
+    request = _request(rsm_r2_project, "state", RSMFrameCorrections(solid_angle=True, polarization_factor=0.99))
+    effective = request.plan.effective_geometry
+    _rsm_correction_state(request.plan, effective.detector_header, effective.diffractometer_projection)  # warm
+    tracemalloc.start()
+    state = _rsm_correction_state(request.plan, effective.detector_header, effective.diffractometer_projection)
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert state.solid is not None
+    charged = _rsm_v2_correction_state_bytes(request.plan, request.preflight.members)
+    assert charged >= peak, (charged, peak)
+    assert _rsm_v2_correction_state_bytes(_request(rsm_r2_project, "state-off").plan,
+                                          request.preflight.members) == 0

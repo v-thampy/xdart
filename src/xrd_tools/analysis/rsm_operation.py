@@ -3438,20 +3438,105 @@ def _rsm_v2_correction_bytes(plan, frame_count: int, member) -> int:
     bound = plan.corrections
     if bound is None:
         return 0
-    value = bound.corrections
-    full = math.prod(member.detector_shape)
-    cropped = math.prod(member.cropped_shape)
-    resident = full * (1 + 8 * ((bound.dark_receipt is not None) + (bound.flat_receipt is not None)
-                                + int(value.solid_angle)))
+    return _rsm_v2_correction_charge(bound.corrections, bound.dark_receipt is not None,
+                                     bound.flat_receipt is not None, member.detector_shape,
+                                     member.cropped_shape, frame_count)
+
+
+def _rsm_v2_correction_charge(value, dark: bool, flat: bool, detector_shape, cropped_shape,
+                              frame_count: int) -> int:
+    """``_rsm_v2_correction_bytes`` in shapes and flags, so the Preview charges a form before its plan exists
+    (AUD-9 stage 2b S3a): ``value`` the ``RSMFrameCorrections``, ``dark``/``flat`` whether each is bound."""
+    full = math.prod(detector_shape)
+    cropped = math.prod(cropped_shape)
+    resident = full * (1 + 8 * (bool(dark) + bool(flat) + int(value.solid_angle)))
     polarized = value.polarization_factor is not None
     # S2.3: the polarization's working set is one band of rows (``_rsm_weight_band_rows``), not the detector;
     # Int's threshold works on whole frames at another moment, so the larger of the two is charged
-    rows, columns = member.cropped_shape
+    rows, columns = cropped_shape
     band = min(int(rows), _rsm_weight_band_rows(columns)) * int(columns)
     working = max(80 * band if polarized else 0, 9 * full if value.threshold is not None else 0)
-    weighted = value.solid_angle or polarized or bound.flat_receipt is not None
+    weighted = value.solid_angle or polarized or bool(flat)
     # the weights: one detector array, or one per frame when the polarization follows the pose
     return resident + working + (8 * cropped * (frame_count if polarized else 1) if weighted else 0)
+
+
+def rsm_v2_chunk_bytes(detector_shape, cropped_shape, frame_count: int, *, static_hot: bool,
+                       corrections=None, dark: bool = False, flat: bool = False) -> int:
+    """The bytes a run charges one chunk of ``frame_count`` frames of one member against Max chunk MiB, in
+    shapes and flags (AUD-9 stage 2b S3a): the larger of the science pass (decoded and conditioned frames, q,
+    the feed and the per-frame corrections) and, with all-frame hot masking, the mask pass. The memory plan
+    (``_require_rsm_v2_memory_plan``) and the Preview's Auto cap both charge through it."""
+    full = math.prod(detector_shape)
+    cropped = math.prod(cropped_shape)
+    pixels = frame_count * full
+    raw_bytes = pixels * np.dtype(np.float64).itemsize
+    float_bytes = pixels * np.dtype(np.float64).itemsize
+    science = _rsm_v2_chunk_owned_bytes(
+        raw_bytes=raw_bytes,
+        float_bytes=float_bytes,
+        pixel_count=pixels,
+        mask_state_bytes=cropped * np.dtype(bool).itemsize if static_hot else 0,
+        science=True,
+    ) + (0 if corrections is None
+         else _rsm_v2_correction_charge(corrections, dark, flat, detector_shape, cropped_shape, frame_count))
+    if not static_hot:
+        return science
+    mask_state_bytes = max(
+        full * (np.dtype(np.float64).itemsize + 3 * np.dtype(bool).itemsize),
+        full * np.dtype(bool).itemsize + cropped * np.dtype(bool).itemsize,
+    )
+    return max(science, _rsm_v2_chunk_owned_bytes(
+        raw_bytes=raw_bytes,
+        float_bytes=float_bytes,
+        pixel_count=pixels,
+        mask_state_bytes=mask_state_bytes,
+        science=False,
+    ))
+
+
+def _rsm_v2_correction_state_bytes(plan, members) -> int:
+    """The run's one-off correction state, before the chunks (``_rsm_correction_state``, with the grid
+    resident): the decoded mask, dark and flat, and pyFAI's solid angle with its transient, which is not a
+    chunk's but bounds the run's peak too (AUD-9 stage 2b S3a). 0 with no corrections."""
+    bound = plan.corrections
+    if bound is None:
+        return 0
+    full = max(math.prod(member.detector_shape) for member in members)
+    held = full * (1 + 8 * ((bound.dark_receipt is not None) + (bound.flat_receipt is not None)))
+    return held + (full * _RSM_SOLID_ANGLE_TRANSIENT_BYTES_PER_PIXEL if bound.corrections.solid_angle else 0)
+
+
+#: Auto Max chunk MiB's floor: the preset's 256 MiB (AUD-9 stage 2b S3a).
+_RSM_AUTO_CHUNK_FLOOR_BYTES = 256 * 1024 * 1024
+
+
+def rsm_v2_auto_chunking(detector_shape, cropped_shape, chunk_size: int, *, static_hot: bool,
+                         corrections=None) -> tuple[int, int]:
+    """Auto Max chunk MiB (AUD-9 stage 2b S3a): the preset's 256 MiB, or one frame's charge rounded up to the
+    next MiB when that is larger, so a default run never refuses for memory on a large detector (an Eiger 4M's
+    plain frame alone charges 282.3 MiB); and the chunk holds as many frames as that cap fits, at most
+    ``chunk_size`` and at least one. ``corrections``: the form's ``RSMFrameCorrections`` (its dark and flat
+    charged when their paths are set). Returns (chunk_size, max_chunk_bytes)."""
+    flags = {
+        "static_hot": static_hot,
+        "corrections": corrections,
+        "dark": corrections is not None and corrections.dark_path is not None,
+        "flat": corrections is not None and corrections.flat_path is not None,
+    }
+    mib = 1024 * 1024
+    one = rsm_v2_chunk_bytes(detector_shape, cropped_shape, 1, **flags)
+    cap = max(_RSM_AUTO_CHUNK_FLOOR_BYTES, -(-one // mib) * mib)
+    frames = int(chunk_size)
+    while frames > 1 and rsm_v2_chunk_bytes(detector_shape, cropped_shape, frames, **flags) > cap:
+        frames -= 1
+    return frames, cap
+
+
+#: pyFAI's solid angle, computed once a run before the chunks (``_rsm_correction_state``) and not banded,
+#: since banding would change its weights: its traced peak, output included, measured 2026-10-01
+#: (``logs/s3a-solid-angle-transient.log``): 48.1 B/px at Pilatus 100K, 48.0 B/px at 2167 x 2070. Charged at 49.
+_RSM_SOLID_ANGLE_TRANSIENT_BYTES_PER_PIXEL = 49
 
 
 def _load_rsm_v2_raw_chunk(
@@ -3922,46 +4007,30 @@ def _require_rsm_v2_memory_plan(request: RSMOperationRequestV2) -> None:
             or float_bytes // frame_count > plan.max_frame_bytes
         ):
             raise RSMOperationRefused("FRAME_MEMORY_LIMIT_EXCEEDED")
-        full_pixels = math.prod(member.detector_shape)
-        cropped_pixels = math.prod(member.cropped_shape)
-        cropped_mask_bytes = (
-            cropped_pixels * np.dtype(bool).itemsize
-            if plan.conditioning.static_hot_threshold is not None
-            else 0
-        )
-        science_bytes = _rsm_v2_chunk_owned_bytes(
-            raw_bytes=raw_bytes,
-            float_bytes=float_bytes,
-            pixel_count=pixels,
-            mask_state_bytes=cropped_mask_bytes,
-            science=True,
-        ) + _rsm_v2_correction_bytes(plan, frame_count, member)
-        mask_state_bytes = max(
-            full_pixels
-            * (
-                np.dtype(np.float64).itemsize
-                + 3 * np.dtype(bool).itemsize
-            ),
-            full_pixels * np.dtype(bool).itemsize
-            + cropped_pixels * np.dtype(bool).itemsize,
-        )
-        mask_bytes = _rsm_v2_chunk_owned_bytes(
-            raw_bytes=raw_bytes,
-            float_bytes=float_bytes,
-            pixel_count=pixels,
-            mask_state_bytes=mask_state_bytes,
-            science=False,
-        )
-        required = max(
-            science_bytes,
-            mask_bytes if plan.conditioning.static_hot_threshold is not None else 0,
+        bound = plan.corrections
+        required = rsm_v2_chunk_bytes(
+            member.detector_shape,
+            member.cropped_shape,
+            frame_count,
+            static_hot=plan.conditioning.static_hot_threshold is not None,
+            corrections=None if bound is None else bound.corrections,
+            dark=bound is not None and bound.dark_receipt is not None,
+            flat=bound is not None and bound.flat_receipt is not None,
         )
         if required > plan.max_chunk_bytes:
-            raise RSMOperationRefused("Q_MEMORY_LIMIT_EXCEEDED")
+            mib = 1024 * 1024
+            raise RSMOperationRefused(
+                "Q_MEMORY_LIMIT_EXCEEDED",
+                f"one chunk of {frame_count} frame{'s' if frame_count != 1 else ''} needs "
+                f"{-(-required // mib)} MiB; Max chunk MiB is {plan.max_chunk_bytes // mib}: raise it, lower "
+                "Chunk, or leave Max chunk MiB on Auto",
+            )
         peak_chunk_bytes = max(peak_chunk_bytes, required)
+    transient_bytes = fixed_grid_bytes + _rsm_v2_correction_state_bytes(plan, request.preflight.members)
     resident_bytes = max(
         fixed_grid_bytes + peak_chunk_bytes,
         finalization_bytes,
+        transient_bytes,
     )
     if resident_bytes >= _MAX_RSM_RESIDENT_BYTES:
         raise RSMOperationRefused("Q_MEMORY_LIMIT_EXCEEDED")
@@ -4167,7 +4236,7 @@ def prepare_rsm_operation_v2(
         or type(bins) is not tuple
         or type(chunk_size) is not int
         or type(max_frame_bytes) is not int
-        or type(max_chunk_bytes) is not int
+        or (max_chunk_bytes is not None and type(max_chunk_bytes) is not int)
         or type(coordinate_frame) is not RSMCoordinateFrame
     ):
         raise TypeError("RSM v2 preparation requires exact grouped values")
@@ -4200,7 +4269,7 @@ def prepare_rsm_operation_v2(
             "FRAME_MEMORY_LIMIT_EXCEEDED",
             "RSM v2 frame byte limit is outside the absolute bound",
         )
-    if not 1 <= max_chunk_bytes <= _MAX_CHUNK_BYTES:
+    if max_chunk_bytes is not None and not 1 <= max_chunk_bytes <= _MAX_CHUNK_BYTES:
         raise RSMOperationRefused(
             "Q_MEMORY_LIMIT_EXCEEDED",
             "RSM v2 chunk byte limit is outside the absolute bound",
@@ -4220,8 +4289,37 @@ def prepare_rsm_operation_v2(
 
     from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
 
+    # the corrections the plan will bind (every field at its default is none, as _bind_rsm_corrections says),
+    # so the Preview charges a chunk exactly as the run's memory plan will
+    charged = None if corrections is None or corrections == RSMFrameCorrections() else corrections
     with xu_runtime_session() as runtime_session:
         effective = lower_rsm_effective_geometry(geometry_asset_receipt)
+        if max_chunk_bytes is None:  # Auto: sized from the detector before any member is charged (S3a)
+            header = effective.detector_header
+            cropped = header if effective.roi is None else header.with_roi(effective.roi)
+            chunk_size, max_chunk_bytes = rsm_v2_auto_chunking(
+                (int(header.Nch1), int(header.Nch2)), (int(cropped.Nch1), int(cropped.Nch2)), chunk_size,
+                static_hot=conditioning.static_hot_threshold is not None, corrections=charged)
+            if max_chunk_bytes > _MAX_CHUNK_BYTES:
+                raise RSMOperationRefused(
+                    "Q_MEMORY_LIMIT_EXCEEDED",
+                    "one frame of this detector exceeds the absolute chunk bound",
+                )
+        else:  # the user's cap: one frame must fit it, said with what it needs before any member is read (S3a)
+            header = effective.detector_header
+            cropped = header if effective.roi is None else header.with_roi(effective.roi)
+            one = rsm_v2_chunk_bytes(
+                (int(header.Nch1), int(header.Nch2)), (int(cropped.Nch1), int(cropped.Nch2)), 1,
+                static_hot=conditioning.static_hot_threshold is not None, corrections=charged,
+                dark=charged is not None and charged.dark_path is not None,
+                flat=charged is not None and charged.flat_path is not None)
+            if one > max_chunk_bytes:
+                mib = 1024 * 1024
+                raise RSMOperationRefused(
+                    "Q_MEMORY_LIMIT_EXCEEDED",
+                    f"one frame needs {-(-one // mib)} MiB; Max chunk MiB is {max_chunk_bytes // mib}: raise it, "
+                    "or leave Max chunk MiB on Auto",
+                )
         mapper = rsm_effective_pixel_q_map(effective)
         bindings = tuple(
             bind_rsm_member_geometry(
@@ -4364,7 +4462,7 @@ def prepare_rsm_operation_v2(
         preflight_owner=preflight,
         output_authority_owner=output_authority,
     )
-    return RSMOperationRequestV2(
+    request = RSMOperationRequestV2(
         module,
         plan,
         preflight,
@@ -4372,6 +4470,10 @@ def prepare_rsm_operation_v2(
         canonical,
         _RSM_V2_FACTORY,
     )
+    # the run's memory plan, at Preview too: a chunk its cap cannot hold is refused here, naming what it needs,
+    # not after the sources are opened (AUD-9 stage 2b S3a)
+    _require_rsm_v2_memory_plan(request)
+    return request
 
 
 def _engine_version() -> str:
