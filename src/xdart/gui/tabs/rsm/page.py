@@ -29,7 +29,9 @@ from xdart.gui.pages.values import (
 )
 from xdart.gui.tabs.rsm.result_view import RSMResultView
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
+from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView
 from xdart.gui.tabs.scattering.controls_readiness import SectionHeaderProjection
+from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
 from xdart.gui.tabs.scattering.shell_widgets import apply_section_header
 from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
 from xdart.gui.tools.rsm_owner import (
@@ -65,6 +67,13 @@ _NORMALIZATIONS = {"Foil transmission / exposure": RSMNormalizationMode.FOIL_TRA
 _FRAMES = {frame.display_name: frame for frame in RSMCoordinateFrame}
 #: The run bar's modes this page runs.
 _RSM_MODES = ("RSM",)
+#: Int's Data Browser as a results profile: the page's File actions, Config and Help for the host's menus, the
+#: Results list and Open… (hard rule 14; Codex's RSM reuse audit R1)
+_BROWSER = BrowserProfile(
+    menus=(("File", ("Open result…", "Integration workspace")), ("Config", ()), ("Help", ())),
+    raw_resolution_menus=False, list_caption="Results", directory=False, frames=False, actions=("Open…",),
+    date_sort=False, refresh=False, results=True,
+)
 #: The operation's stages in words (its progress counts frames plus the masks and four steps).
 _STAGE_TEXT = {"revalidate": "Checking the inputs", "static-mask": "Masking hot pixels", "science": "Gridding",
                "projection": "Projecting", "publish": "Saving", "reload": "Checking the saved result"}
@@ -177,6 +186,7 @@ class RSMPage(QtWidgets.QWidget):
         self._active_revision = None
         self._prepared_fingerprint = None
         self._results = OrderedDict()  # path → payload, the most recent last
+        self._listed = []  # the Results list's paths, in the order they were first listed
         self._requested = None  # the result last asked to be shown: a late read shows only it (Codex F4)
         self._model = None
         self._closing = False
@@ -193,36 +203,9 @@ class RSMPage(QtWidgets.QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         outer.addWidget(self.splitter)
-        left = QtWidgets.QWidget()
-        left_layout = QtWidgets.QVBoxLayout(left)
-        left_layout.setContentsMargins(5, 5, 5, 5)
-        menus = QtWidgets.QHBoxLayout()
-        for title, name in (("File", "fileMenuButton"), ("Config", "configMenuButton"),
-                            ("Help", "helpMenuButton")):
-            button = QtWidgets.QToolButton()
-            button.setObjectName(name)
-            button.setText(title)
-            button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
-            menu = QtWidgets.QMenu(button)
-            button.setMenu(menu)
-            setattr(self, title.lower() + "_menu", menu)
-            menus.addWidget(button)
-        left_layout.addLayout(menus)
-        self.file_menu.addAction("Open result…", self.open_result)
-        self.file_menu.addAction("Integration workspace",
-                                 lambda: self.toolRequested.emit(str(SCATTERING_PAGE_KEY)))
-        heading = QtWidgets.QLabel("DATA BROWSER")
-        heading.setObjectName("browserHeading")
-        left_layout.addWidget(heading)
-        left_layout.addWidget(QtWidgets.QLabel("Results"))
-        self.results = QtWidgets.QListWidget()
-        self.results.setObjectName("rsmResults")
-        self.results.currentItemChanged.connect(self._result_selected)
-        left_layout.addWidget(self.results, 1)
-        self.open_button = QtWidgets.QPushButton("Open…")
-        self.open_button.clicked.connect(self.open_result)
-        left_layout.addWidget(self.open_button)
-        self.splitter.addWidget(left)
+        self.browser = BrowserView(profile=_BROWSER)  # Int's Data Browser (hard rule 14)
+        self.browser.commandRequested.connect(self._browser_command)
+        self.splitter.addWidget(self.browser)
 
         self.view = RSMResultView()
         self.view.indicesChanged.connect(self._indices_changed)
@@ -256,8 +239,7 @@ class RSMPage(QtWidgets.QWidget):
         self.run_bar.actionClicked.connect(self.begin_run)
         self.run_bar.stopClicked.connect(self.stop)
         right_layout.addWidget(self.run_bar)
-        self.splitter.addWidget(right)
-        left.setMinimumWidth(255)
+        self.splitter.addWidget(right)  # the browser keeps Int's own minimum width (255)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 3)
         self.splitter.setStretchFactor(2, 1)
@@ -657,7 +639,7 @@ class RSMPage(QtWidgets.QWidget):
         self.run_bar.set_mode_row_enabled(idle)
         self.member_table.setEnabled(idle)
         self.advanced.setEnabled(idle)
-        self.open_button.setEnabled(not busy and not reading and not self._closing)
+        self.browser.set_action_enabled("Open…", not busy and not reading and not self._closing)
         self.preview_button.setEnabled(idle)
         self.advanced_button.setEnabled(idle)
         self.retry_button.setEnabled(not busy and final is not RSMOwnerFinalization.NONE and not self._closing)
@@ -844,6 +826,26 @@ class RSMPage(QtWidgets.QWidget):
             self._notice(f"RSM {terminal.disposition.value}: {terminal.code}{detail}")
 
     # ── results ──
+    @property
+    def results(self):
+        """The Data Browser's Results list, Int's own widget. The rows read it and choose in it as a user
+        does; the page fills it only through ``reconcile_results``."""
+        return self.browser.scans
+
+    def _browser_command(self, command):
+        if command.kind is ShellCommandKind.SELECT_RESULT:
+            self._result_selected(command.value)
+        elif command.kind is ShellCommandKind.OPEN_RESULT or (
+                command.kind is ShellCommandKind.MENU and command.value == "File:Open result…"):
+            self.open_result()
+        elif command.kind is ShellCommandKind.MENU and command.value == "File:Integration workspace":
+            self.toolRequested.emit(str(SCATTERING_PAGE_KEY))
+
+    def _publish_results(self):
+        self.browser.reconcile_results(
+            tuple(BrowserResult(path, Path(path).name, path) for path in self._listed),
+            self._requested if self._requested in self._listed else None)
+
     def open_result(self):
         from xdart.gui.widgets import file_dialogs as dialogs
         picks = dialogs.browse(self, "Open RSM result", file_filter=dialogs.NEXUS_FILTER,
@@ -880,12 +882,16 @@ class RSMPage(QtWidgets.QWidget):
             self._add_result(path, terminal.payload, show=shown)
             if shown:
                 self._status(f"Opened {Path(path).name}", ready=True)
-            else:  # the selection moved on while this was read: the selected one is read now
+            else:
                 self._show_readiness()
-                if self._requested in self._results and self._results[self._requested] is None:
-                    self.reopen(self._requested)
         elif terminal.status is OperationTerminalStatus.FAILED:
             self._notice(f"Could not open {Path(path).name}: {terminal.failure_message or terminal.failure_type}")
+        # The selection moved on while this was read: the result now asked for is read next, after a failed
+        # read as well (Codex's stage-2 review S2-F1). Never the same failed record again, never while closing.
+        latest = self._requested
+        if (latest != path and not self._closing and latest in self._results
+                and self._results[latest] is None):
+            self.reopen(latest)
 
     def _add_result(self, path, payload, *, show=True):
         """List a result and keep its payload; the oldest beyond the newest few are read again when shown
@@ -900,25 +906,13 @@ class RSMPage(QtWidgets.QWidget):
             if excess > 0 and key != self._requested:
                 self._results[key] = None
                 excess -= 1
-        for row in range(self.results.count()):
-            if self.results.item(row).data(QtCore.Qt.ItemDataRole.UserRole) == path:
-                item = self.results.item(row)
-                break
-        else:
-            item = QtWidgets.QListWidgetItem(Path(path).name)
-            item.setData(QtCore.Qt.ItemDataRole.UserRole, path)
-            item.setToolTip(path)
-            self.results.addItem(item)
+        if path not in self._listed:
+            self._listed.append(path)
+        self._publish_results()
         if show:
-            blocker = QtCore.QSignalBlocker(self.results)
-            self.results.setCurrentItem(item)
-            del blocker
             self._show(payload)
 
-    def _result_selected(self, current, _previous):
-        if current is None:
-            return
-        path = current.data(QtCore.Qt.ItemDataRole.UserRole)
+    def _result_selected(self, path):
         self._requested = path
         payload = self._results.get(path)
         if payload is None:
@@ -1003,7 +997,8 @@ class RSMPage(QtWidgets.QWidget):
                     or self._owner.finalization is not RSMOwnerFinalization.NONE)
 
     def mount_points(self):
-        return AppMenuHosts(self.config_menu, self.help_menu, tool_requested=self.toolRequested,
+        return AppMenuHosts(self.browser.menus["Config"], self.browser.menus["Help"],
+                            tool_requested=self.toolRequested,
                             mode_requested=self.modeRequested)
 
     def request(self):

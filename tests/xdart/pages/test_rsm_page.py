@@ -481,6 +481,53 @@ def test_each_slice_pixel_sits_at_its_bin_centre(qapp, frame):
         qapp.processEvents()
 
 
+def test_a_failed_older_read_still_reads_the_newer_selection(qapp, tmp_path):
+    """Codex's stage-2 review S2-F1, its reproduction with real strict records and the real reader: seven
+    records evict the first two from the five kept; an evicted A is selected (its read held back), then an
+    evicted B; A's record is removed, so its read fails. The newer B must be read after the failure, as it is
+    after a success, and A is not read again."""
+    from threading import Event
+    from tests.core.test_analysis_artifact import (
+        test_analysis_artifact_v2_rsm_round_trip_is_a_closed_exact_branch as write_record,
+    )
+    paths = []
+    for index in range(7):
+        root = tmp_path / str(index)
+        root.mkdir()
+        write_record(root, False)
+        paths.append(str(root / "rsm-artifact-v2.nexus"))
+    started, release, hold, reads = Event(), Event(), [], []
+
+    def read(path, cancel, progress):
+        reads.append(path)
+        if hold and path == paths[0]:
+            started.set()
+            assert release.wait(10)
+        return page_module._read_rsm_record(path, cancel, progress)
+
+    page = _page(qapp, owner=_Owner(), reader=SingleWorkerOwner(read))
+    try:
+        for path in paths:
+            assert page.reopen(path)
+            _wait(page, qapp, lambda: not page.active())
+        assert page._results[paths[0]] is page._results[paths[1]] is None
+        hold.append(True)
+        page.results.setCurrentRow(0)
+        assert started.wait(3)
+        page.results.setCurrentRow(1)
+        Path(paths[0]).unlink()  # a real missing record: the held read fails
+        release.set()
+        _wait(page, qapp, lambda: not page.active())
+        assert reads.count(paths[1]) == 2, "the latest selection was never read"
+        assert page._results[paths[1]] is not None
+        assert reads.count(paths[0]) == 2  # its first open and the failed read: not retried
+    finally:
+        release.set()
+        _wait(page, qapp, lambda: page.close_page().status is PageCleanup.CLEAN)
+        page.deleteLater()
+        qapp.processEvents()
+
+
 def test_a_late_read_does_not_override_the_newer_selection(qapp, tmp_path):
     """F4: real saved records on the shared single-worker reader. An evicted result A is selected (its
     read held back, as a slow disk would), then a kept B: A's read, when it returns, is kept but neither
