@@ -332,3 +332,101 @@ def test_the_polarization_weight_uses_the_energy_q_is_mapped_with(tmp_path, v3_a
         explicit = _rsm_chunk_weights(state, replace(mapper, energy_offset_eV=0.0), session, angles,
                                       13_000.0 + mapper.energy_offset_eV, (0, -1, 0, -1))
     assert np.array_equal(refined, explicit)
+
+
+# Unit 3: an Auto threshold's ceiling from the calibrated detector (decision 39, as Stitch passes it). RSM decodes
+# every frame to float64, so the data type's rule had nothing to find there (C4's disclosure): Auto left out only
+# negatives and the UINT32 dummy.
+def _members(*options):
+    from types import SimpleNamespace
+    return tuple(SimpleNamespace(detector_shape=(2, 3), source_options_json=json.dumps(value)) for value in options)
+
+
+def test_an_auto_threshold_takes_the_calibrated_detectors_counter_limit():
+    from types import SimpleNamespace
+
+    from xrd_tools.analysis.rsm_operation import (
+        RSMBoundCorrections, RSMFrameCorrections, _apply_rsm_frame_corrections, _bind_rsm_corrections,
+    )
+    from xrd_tools.core.invalid import PILATUS_COUNTER_LIMIT
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+
+    spec, narrow, nexus = ({"read_image_kwargs": {"raw_dtype": "<i4"}},
+                           {"read_image_kwargs": {"raw_dtype": "<u2"}},  # 65535 < the limit: its own rule
+                           {"entry": "entry1"})  # learned only at the run: unknown, so the limit applies
+    auto = RSMFrameCorrections(threshold=StitchConditioning(mode="auto"))
+    bound = _bind_rsm_corrections(auto, _members(spec, narrow, nexus), 1 << 20, detector="Pilatus300kw")
+    limit = PILATUS_COUNTER_LIMIT
+    assert bound.saturation == (limit, None, limit)
+    assert bound.to_provenance()["threshold"]["saturation"] == [limit, None, limit]
+    assert bound.identity()[-1] == ("saturation", (limit, None, limit))
+    plain = RSMBoundCorrections(auto, None, None, None).identity()
+    for detector, options, corrections in (
+            (None, (spec,), auto),  # the canonical asset names no detector
+            ("Eiger2CdTe_1M", (spec,), auto),  # no documented limit
+            ("Pilatus300kw", (narrow,), auto),  # the data type's own rule
+            ("Pilatus300kw", (spec,), RSMFrameCorrections(threshold=StitchConditioning(mode="off")))):
+        other = _bind_rsm_corrections(corrections, _members(*options), 1 << 20, detector=detector)
+        assert other.saturation is None and "saturation" not in other.to_provenance()["threshold"]
+        if corrections is auto:
+            assert other.identity() == plain  # an identity without a ceiling is the one it was
+    raw = np.array([[[0.0, limit - 1.0, limit], [5.0, -1.0, 2.0e6]]])
+    for saturation, expected in ((None, [False, False, False, False, True, False]),
+                                 (limit, [False, False, True, False, True, True])):
+        conditioned = raw.copy()
+        _apply_rsm_frame_corrections(raw, conditioned, SimpleNamespace(bound=bound, invalid=None, dark=None),
+                                     np.ones(1), saturation)
+        assert np.isnan(conditioned[0]).ravel().tolist() == expected
+
+
+def test_the_calibration_names_its_detector(tmp_path):
+    """(The canonical asset's None is the run row's, on its real receipt.)"""
+    from xrd_tools.analysis.rsm_operation import _rsm_calibration_detector
+    receipt = capture_rsm_calibration_geometry(_write_partner(tmp_path, rotation=0, cch=(4., 6.)).name,
+                                               project_root=tmp_path)
+    assert _rsm_calibration_detector(receipt) == "Detector"  # pyFAI's name for the partner's detector
+
+
+@pytest.mark.slow
+def test_the_run_applies_each_members_ceiling_from_the_calibration(rsm_r2_project, monkeypatch):
+    """Preview passes the calibration's detector to the binding, and each chunk its member's ceiling (row B's
+    calibration, its detector named a Pilatus so that one applies; the name's lookup is the row above)."""
+    from dataclasses import replace
+
+    from xrd_tools.analysis import rsm_operation
+    from xrd_tools.analysis.module_transaction import ModuleDisposition
+    from xrd_tools.analysis.rsm_geometry_asset import RSMCalibrationGeometryReceipt, rsm_calibration_geometry_input
+    from xrd_tools.analysis.rsm_operation import RSMFrameCorrections, run_rsm_operation_v2
+    from xrd_tools.core.invalid import PILATUS_COUNTER_LIMIT
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+
+    looked_up, applied = [], []
+    original_lookup, original_apply = rsm_operation._rsm_calibration_detector, rsm_operation._apply_rsm_frame_corrections
+
+    def lookup(receipt):
+        looked_up.append((type(receipt).__name__, original_lookup(receipt)))
+        return "Pilatus100k" if type(receipt) is RSMCalibrationGeometryReceipt else None
+
+    def apply(raw, conditioned, state, divisors, saturation=None):
+        applied.append(saturation)
+        return original_apply(raw, conditioned, state, divisors, saturation)
+
+    monkeypatch.setattr(rsm_operation, "_rsm_calibration_detector", lookup)
+    monkeypatch.setattr(rsm_operation, "_apply_rsm_frame_corrections", apply)
+    auto = RSMFrameCorrections(threshold=StitchConditioning(mode="auto"))
+    canonical = replace(_form(rsm_r2_project, (43,), 40), corrections=auto,
+                        output_path=rsm_r2_project / "rsm-s3b-saturation-canonical.nexus")
+    calibrated = replace(canonical, geometry_asset=rsm_calibration_geometry_input(_canonical_partner(rsm_r2_project)),
+                         output_path=rsm_r2_project / "rsm-s3b-saturation-calibration.nexus")
+    assert prepare_rsm_tool_v2(canonical).request.plan.corrections.saturation is None
+    request = prepare_rsm_tool_v2(calibrated).request
+    assert request.plan.corrections.saturation == (PILATUS_COUNTER_LIMIT,)
+    assert looked_up == [("RSMGeometryAssetReceipt", None), ("RSMCalibrationGeometryReceipt", "Detector")]
+    try:
+        result = run_rsm_operation_v2(request)
+    finally:
+        if Path(calibrated.output_path).exists():
+            Path(calibrated.output_path).unlink()
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED
+    assert applied and set(applied) == {PILATUS_COUNTER_LIMIT}

@@ -371,22 +371,27 @@ class RSMFrameCorrections:
 
 @dataclass(frozen=True, slots=True)
 class RSMBoundCorrections:
-    """``RSMFrameCorrections`` bound at Preview: the mask, dark and flat receipts (Stitch's own captures)."""
+    """``RSMFrameCorrections`` bound at Preview: the mask, dark and flat receipts (Stitch's own captures), and
+    ``saturation``, each member's automatic ceiling from the calibrated detector (decision 39, Stitch's
+    ``member_saturation``): None for the data type's rule, and None when every member takes it."""
 
     corrections: RSMFrameCorrections
     mask_receipt: object
     dark_receipt: object
     flat_receipt: object
+    saturation: tuple[int | None, ...] | None = None
 
     def identity(self) -> tuple[object, ...]:
         value = self.corrections
-        return ("frame-corrections-v1",
+        identity = ("frame-corrections-v1",
                 None if self.mask_receipt is None else (self.mask_receipt.sha256, self.mask_receipt.shape),
                 None if value.threshold is None else (value.threshold.mode, value.threshold.threshold_min,
                                                       value.threshold.threshold_max),
                 None if self.dark_receipt is None else self.dark_receipt.fingerprint,
                 None if self.flat_receipt is None else (self.flat_receipt.fingerprint, value.flat_min_fraction),
                 value.solid_angle, value.polarization_factor)
+        # a resolved ceiling only when one applies: an identity without it is the one it was
+        return identity if self.saturation is None else (*identity, ("saturation", self.saturation))
 
     def to_provenance(self) -> dict[str, object]:
         value = self.corrections
@@ -396,7 +401,8 @@ class RSMBoundCorrections:
                 "shape": list(self.mask_receipt.shape)},
             "threshold": None if value.threshold is None else {
                 "mode": value.threshold.mode, "threshold_min": value.threshold.threshold_min,
-                "threshold_max": value.threshold.threshold_max},
+                "threshold_max": value.threshold.threshold_max,
+                **({} if self.saturation is None else {"saturation": list(self.saturation)})},
             "dark": None if self.dark_receipt is None else {
                 "name": Path(self.dark_receipt.lexical_path).name, "fingerprint": self.dark_receipt.fingerprint},
             "flat": None if self.flat_receipt is None else {
@@ -3722,9 +3728,39 @@ def _rsm_v2_contribution_angles(
     return tuple(values)
 
 
-def _bind_rsm_corrections(corrections, members, max_frame_bytes):
+def _rsm_calibration_detector(receipt) -> str | None:
+    """The calibration's detector name (pyFAI's), as Stitch's ``calibration_detector``; None for the
+    canonical asset, which names none."""
+    if type(receipt) is not RSMCalibrationGeometryReceipt:
+        return None
+    return receipt.calibration.projection.value["detector"].get("detector_factory_name")
+
+
+def _rsm_member_saturation(threshold, members, detector):
+    """Each member's automatic ceiling (decision 39), resolved as Stitch's ``_frame_facts`` does without a
+    recorded value: the calibrated detector's documented counter limit for integer data, else the data type's
+    rule (None; ``member_saturation``). A SPEC member's data type is its authenticated on-disk encoding; a
+    NeXus stack's is learned only at the run (its declared float64 is a byte charge), so it is unknown here
+    and the documented limit applies, as the resolver does for an unknown type."""
+    if threshold is None or threshold.mode != "auto" or detector is None:
+        return None
+    from xrd_tools.analysis.stitch_native import member_saturation
+    from xrd_tools.core.invalid import resolve_detector_saturation
+    ceilings = []
+    for member in members:
+        try:
+            options = json.loads(member.source_options_json)
+            dtype = None if "entry" in options else np.dtype(options["read_image_kwargs"]["raw_dtype"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            dtype = None
+        ceilings.append(resolve_detector_saturation(detector=detector, dtype=dtype))
+    return member_saturation(ceilings)
+
+
+def _bind_rsm_corrections(corrections, members, max_frame_bytes, *, detector=None):
     """Bind a plan's corrections at Preview: Stitch's mask capture and Int-admitted dark and flat
-    (``capture_detector_image``), each the members' full detector shape. None: None."""
+    (``capture_detector_image``), each the members' full detector shape, and an Auto threshold's ceilings
+    from ``detector``, the calibrated detector's name (``_rsm_member_saturation``). None: None."""
     if type(corrections) not in {RSMFrameCorrections, type(None)}:
         raise TypeError("RSM corrections must be exact RSMFrameCorrections")
     if corrections is None or corrections == RSMFrameCorrections():  # every field at its default: none
@@ -3759,7 +3795,8 @@ def _bind_rsm_corrections(corrections, members, max_frame_bytes):
             dark = receipt
         else:
             flat = receipt
-    return RSMBoundCorrections(corrections, mask, dark, flat)
+    return RSMBoundCorrections(corrections, mask, dark, flat,
+                               _rsm_member_saturation(corrections.threshold, members, detector))
 
 
 @dataclass(frozen=True, slots=True)
@@ -3890,17 +3927,17 @@ def _rsm_chunk_weights(state, mapper, session, angles, energy, roi):
     return weights
 
 
-def _apply_rsm_frame_corrections(raw, conditioned, state, divisors):
+def _apply_rsm_frame_corrections(raw, conditioned, state, divisors, saturation=None):
     """A chunk's per-frame corrections, in place on its conditioned float64 frames: Int's threshold on the
-    native values, the static invalid pixels, then the dark and the frame's divisor (the shared
-    ``prepare_frame_signal``, Stitch's)."""
+    native values (Auto with the member's resolved ``saturation``, as Stitch passes it), the static invalid
+    pixels, then the dark and the frame's divisor (the shared ``prepare_frame_signal``, Stitch's)."""
     from xrd_tools.corrections.frame_preparation import FramePreparationRefused, prepare_frame_signal
     from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
     threshold = state.bound.corrections.threshold
     for index in range(conditioned.shape[0]):
         frame = conditioned[index]
         if threshold is not None:
-            frame[np.isnan(condition_stitch_frame(raw[index], threshold))] = np.nan
+            frame[np.isnan(condition_stitch_frame(raw[index], threshold, saturation))] = np.nan
         if state.invalid is not None:
             frame[state.invalid] = np.nan
         try:
@@ -3958,7 +3995,9 @@ def _make_rsm_v2_chunk_lease(
         dtype=np.float64,
     )
     if corrections is not None:  # the shared per-frame corrections (AUD-9 stage 2b)
-        _apply_rsm_frame_corrections(raw, conditioned, corrections, divisors)
+        saturation = corrections.bound.saturation
+        _apply_rsm_frame_corrections(raw, conditioned, corrections, divisors,
+                                     None if saturation is None else saturation[member.ordinal])
     else:
         with np.errstate(over="ignore", invalid="ignore"):
             conditioned /= divisors[:, None, None]
@@ -4517,7 +4556,8 @@ def prepare_rsm_operation_v2(
             chunk_size=chunk_size,
             max_frame_bytes=max_frame_bytes,
             max_chunk_bytes=max_chunk_bytes,
-            corrections=_bind_rsm_corrections(corrections, member_tuple, max_frame_bytes),
+            corrections=_bind_rsm_corrections(corrections, member_tuple, max_frame_bytes,
+                                              detector=_rsm_calibration_detector(geometry_asset_receipt)),
             ub_override=bound_ub,
         )
         preflight = _make_rsm_group_preflight_v2(
