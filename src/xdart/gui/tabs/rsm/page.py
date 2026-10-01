@@ -35,7 +35,7 @@ from xdart.gui.pages.values import (
     RSM_TOOL_KEY, SCATTERING_PAGE_KEY, STITCH_TOOL_KEY,
 )
 from xdart.gui.tabs.rsm.display import rsm_keyed_projection, rsm_slice_normals
-from xdart.gui.tabs.rsm.tool_windows import RSMVolumeWindow
+from xdart.gui.tabs.rsm.tool_windows import RSMCustomSliceWindow, RSMVolumeWindow
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView
 from xdart.gui.tabs.scattering.context_projection import apply_keyed_presentation_background
@@ -271,8 +271,9 @@ class RSMPage(QtWidgets.QWidget):
         # each resident result's viewer values and model, built once (Codex's reuse audit rec. 3): showing it
         # again recomputes nothing; dropped with its payload when it leaves the five resident
         self._viewers = {}  # path → (payload, values, model)
-        #: the page tools' windows ("3d": the 3D Viewer), built on their first press; they follow the result
-        #: shown. The 3D Viewer holds the shown volume (shared, not copied) and its RGBA (32 MB at Full 200³).
+        #: the page tools' windows ("3d": the 3D Viewer; "custom": Custom Slice), built on their first press; they
+        #: follow the result shown. While open, each holds the shown volume (shared, not copied); the 3D Viewer adds
+        #: its RGBA (32 MB at Full 200³), Custom Slice its plane (float32, at most 2000 × 2000: 16 MB).
         self._tool_windows = {}
         self._shown_path = None
         self._shown = None  # (values, snapshot) drawn now
@@ -1972,9 +1973,9 @@ class RSMPage(QtWidgets.QWidget):
             self._toggle_background()
 
     def _page_tool(self, name):
-        """The 3D Viewer (and, with G9's unit 3, Custom Slice): non-modal windows built on their first press and
-        raised on later ones, kept on the result shown."""
-        factory = {"3d": RSMVolumeWindow}.get(name)
+        """The 3D Viewer and Custom Slice: non-modal windows built on their first press and raised on later
+        ones, kept on the result shown."""
+        factory = {"3d": RSMVolumeWindow, "custom": RSMCustomSliceWindow}.get(name)
         if factory is None:
             _LOG.info("RSM page tool %r pressed; its window is not built yet", name)
             return

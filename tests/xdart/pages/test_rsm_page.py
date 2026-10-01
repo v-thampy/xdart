@@ -12,7 +12,7 @@ import pytest
 
 pytest.importorskip("pyqtgraph")
 
-from pyqtgraph.Qt import QtCore
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 from xdart.gui.pages.operation_owner import SingleWorkerOwner
 from xdart.gui.pages.services import empty_host_services
 from xdart.gui.pages.values import PageCleanup
@@ -1830,6 +1830,13 @@ def test_another_calibration_returns_the_auto_hint_to_its_default(qapp, tmp_path
 # scientific view clean for now"
 
 
+class _Minimised(QtGui.QHideEvent):
+    """The hide event a window gets when it is minimised: spontaneous (the window system's), not a close."""
+
+    def spontaneous(self):
+        return True
+
+
 def test_the_3d_viewer_opens_on_the_result_shown_follows_it_and_closes_with_the_page(qapp, monkeypatch):
     """"A button to bring up a 3d viewer for the entire 3d RSM volume": the 3D Viewer button opens a non-modal
     window on the result shown (its volume shared, not copied), which follows the result shown; closing the page
@@ -1852,6 +1859,8 @@ def test_the_3d_viewer_opens_on_the_result_shown_follows_it_and_closes_with_the_
         assert np.shares_memory(window.view.projection.values, values["B"].intensity)
         page.view.page_tool("3d").click()  # a later press raises the same window
         assert page._tool_windows["3d"] is window
+        window.hideEvent(_Minimised())  # minimised, not closed: the window keeps its volume
+        assert np.shares_memory(window.view.projection.values, values["B"].intensity)
         window.close()  # closed by the user: its volume and RGBA go until it is shown again
         assert window.view.projection is None and window.view.rgba is None
         page.view.page_tool("3d").click()
@@ -1859,3 +1868,161 @@ def test_the_3d_viewer_opens_on_the_result_shown_follows_it_and_closes_with_the_
     finally:
         _close(page, qapp)
     assert window.view.projection is None and window.view.rgba is None and not page._tool_windows
+
+
+def _type(editor, text):
+    """Type ``text`` into a row's line editor as a user does: the edit commits on ``editingFinished``."""
+    editor.setText(text)
+    editor.setModified(True)
+    editor.editingFinished.emit()
+
+
+def test_custom_slice_opens_on_hh_l_through_the_centre_follows_the_result_and_closes_with_the_page(
+        qapp, monkeypatch):
+    """"So say HH and l": the Custom Slice button opens a non-modal window on the result shown, cutting HH–L
+    through the volume's centre (``custom_slice``'s defaults) on Int's view, its axes the coordinates along HH
+    and L, saying the plane is interpolated; Int's Log draws it again; it follows the result shown, and closing
+    the window or the page lets the volume go."""
+    from xrd_tools.rsm.custom_slice import custom_slice, volume_centre
+    values = {"A": _grid_values(1.0), "B": _grid_values(3.0)}
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page.view.page_tool("custom").click()  # nothing shown yet: the page says what the tool needs
+        assert "custom" not in page._tool_windows
+        page._add_result("/tmp/a_rsm.nexus", "A")
+        page.view.page_tool("custom").click()
+        window = page._tool_windows["custom"]
+        assert window.isVisible() and not window.isModal()
+        assert window.windowTitle() == "RSM Custom Slice — a_rsm.nexus"
+        assert window.rows["first"].current_value() == "1 1 0" and window.rows["second"].current_value() == "0 0 1"
+        assert window.rows["first"].label.text() == "Direction 1 (h k l)"
+        axes = tuple(axis for _name, axis in values["A"].axes)
+        centre = volume_centre(axes)
+        expected = custom_slice(values["A"].intensity, axes)  # HH–L through the centre
+        drawn = window.view.keyed_projection
+        plane, along_hh, along_l = drawn.panels
+        assert drawn.layout == ((plane.key,), (along_hh.key, along_l.key)) and not plane.navigation
+        np.testing.assert_array_equal(plane.image, expected.values.T)
+        assert (plane.x_axis.label, plane.y_axis.label) == ("HH (r.l.u.)", "L (r.l.u.)")
+        np.testing.assert_allclose(plane.x_axis.values, expected.t + (centre[0] + centre[1]) / 2.0, rtol=0,
+                                   atol=1e-12)
+        np.testing.assert_allclose(plane.y_axis.values, expected.s + centre[2], rtol=0, atol=1e-12)
+        np.testing.assert_array_equal(along_hh.intensity, expected.projection_t)
+        np.testing.assert_array_equal(along_l.intensity, expected.projection_s)
+        assert "interpolated from the gridded volume" in window.note.text()
+        assert window.card.status.isHidden() and not window.card.valid_marker.isHidden()
+        assert window._values is values["A"]  # the volume shared, not copied
+        window.view.log_scale.click()  # Int's Log (and colour map) draw the plane again
+        assert window.view.keyed_projection.log_scale
+        page._add_result("/tmp/b_rsm.nexus", "B")  # the window follows the result shown
+        assert window.windowTitle() == "RSM Custom Slice — b_rsm.nexus"
+        np.testing.assert_array_equal(window.view.keyed_projection.panels[0].image,
+                                      custom_slice(values["B"].intensity, axes).values.T)
+        assert window.view.keyed_projection.log_scale
+        page.view.page_tool("custom").click()  # a later press raises the same window
+        assert page._tool_windows["custom"] is window
+        window.hideEvent(_Minimised())  # minimised, not closed: the window keeps its plane
+        assert window._values is values["B"] and window.custom is not None
+        window.close()  # closed by the user: the volume and the plane go until it is shown again
+        assert window._values is None and window.custom is None and window.view.keyed_projection is None
+        page.view.page_tool("custom").click()
+        assert window._values is values["B"] and window.custom is not None
+    finally:
+        _close(page, qapp)
+    assert window._values is None and window.custom is None and not page._tool_windows
+
+
+def test_an_axis_aligned_custom_slice_is_the_main_views_hk_slice(qapp, monkeypatch):
+    """Directions 1 0 0 and 0 1 0 through the centre, one point per voxel: the plane, its axes and its
+    orientation are the main view's H–K slice at that L."""
+    from xrd_tools.session.rsm_viewer_model import RSM_HK
+    values = {"A": _grid_values(1.0)}
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/a_rsm.nexus", "A")
+        page.view.page_tool("custom").click()
+        window = page._tool_windows["custom"]
+        for name, text in (("first", "1 0 0"), ("second", "0 1 0"), ("first_points", "5"), ("second_points", "7")):
+            _type(window.rows[name].editor, text)
+        plane = window.view.keyed_projection.panels[0]
+        hk = next(panel for panel in _panels_at(values["A"], (0, 0, 4)) if panel.key == RSM_HK)
+        assert plane.image.shape == hk.image.shape == (7, 5)
+        # the viewer's axes are float32 (K = 1 + 5/6 is 1.8333334), the plane's coordinates float64
+        np.testing.assert_allclose(plane.x_axis.values, hk.x_axis.values, rtol=0, atol=1e-6)
+        np.testing.assert_allclose(plane.y_axis.values, hk.y_axis.values, rtol=0, atol=1e-6)
+        np.testing.assert_array_equal(plane.image, hk.image)
+        assert (plane.x_axis.label, plane.y_axis.label) == ("H (r.l.u.)", "K (r.l.u.)")
+        low, high = window.rows["first_range"].findChildren(QtWidgets.QLineEdit)
+        _type(low, "0.25")
+        _type(high, "0.75")  # a range is H itself, not an offset from the point
+        ranged = window.view.keyed_projection.panels[0]
+        np.testing.assert_allclose(ranged.x_axis.values, np.linspace(0.25, 0.75, 5), rtol=0, atol=1e-12)
+        np.testing.assert_array_equal(ranged.image[:, ::2], hk.image[:, 1:4])  # H 0.25, 0.5, 0.75: voxels 1–3
+    finally:
+        _close(page, qapp)
+
+
+def test_each_plane_custom_slice_refuses_is_named_in_its_card(qapp, monkeypatch):
+    """Zero and parallel directions, an all-empty plane, unreadable text and a half-typed range are refused:
+    the card's readiness and the view say why and nothing is drawn; a readable plane is drawn again."""
+    values = {"A": _grid_values(1.0)}
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/a_rsm.nexus", "A")
+        page.view.page_tool("custom").click()
+        window = page._tool_windows["custom"]
+        low, high = window.rows["first_range"].findChildren(QtWidgets.QLineEdit)
+        cases = (
+            (window.rows["first"].editor, "0 0 0", "1 1 0", "the first direction must be non-zero"),
+            (window.rows["second"].editor, "2 2 0", "0 0 1", "the two directions are parallel"),
+            (window.rows["through"].editor, "1 x 0", "", "Through needs three numbers"),
+            (window.rows["first_points"].editor, "1", "", "Points along 1"),
+            (low, "50", "", "Along 1 needs both bounds, or neither (Auto)"),
+        )
+        for editor, refused, readable, reason in cases:
+            _type(editor, refused)
+            assert reason in window.card.status.text() and not window.card.status.isHidden(), reason
+            assert window.card.valid_marker.isHidden() and window.custom is None
+            assert window.view.keyed_projection is None and reason in window.view.status.text()
+            _type(editor, readable)
+            assert window.custom is not None and window.card.status.isHidden(), reason
+        _type(low, "50")
+        _type(high, "60")  # HH from 50 to 60: the plane holds no data
+        assert "the plane does not cross the volume's data" in window.card.status.text()
+        assert window.custom is None and window.view.keyed_projection is None
+    finally:
+        _close(page, qapp)
+
+
+def test_custom_slice_in_q_coordinates_takes_qx_qy_qz_vectors(qapp, monkeypatch):
+    """In the Q frame the directions and the point are Qx Qy Qz vectors, the axes in Å⁻¹."""
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, project_analysis_artifact_result
+    from xrd_tools.rsm.custom_slice import custom_slice
+    from xrd_tools.session.rsm_viewer_model import make_rsm_viewer_values
+    names = ("qx", "qy", "qz")
+    axes = tuple((name, np.linspace(index, index + 1.0, size))
+                 for index, (name, size) in enumerate(zip(names, (5, 7, 9), strict=True)))
+    values = {"Q": make_rsm_viewer_values(project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.RSM, axes=axes, axis_units=tuple((name, "q_A^-1") for name in names),
+        intensity=np.arange(5 * 7 * 9, dtype=np.float64).reshape(5, 7, 9) + 1.0, sigma=None, coverage=None,
+        normalization=None))}
+    assert values["Q"].coordinate_frame is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/q_rsm.nexus", "Q")
+        page.view.page_tool("custom").click()
+        window = page._tool_windows["custom"]
+        assert [window.rows[name].label.text() for name in ("first", "second", "through")] == [
+            "Direction 1 (Qx Qy Qz)", "Direction 2 (Qx Qy Qz)", "Through (Qx Qy Qz)"]
+        plane = window.view.keyed_projection.panels[0]
+        assert (plane.x_axis.label, plane.y_axis.label) == ("t·[1 1 0] (Å⁻¹)", "Qz (Å⁻¹)")
+        expected = custom_slice(values["Q"].intensity, tuple(axis for _name, axis in values["Q"].axes),
+                                symbols=("Qx", "Qy", "Qz"), unit="Å⁻¹")
+        np.testing.assert_array_equal(plane.image, expected.values.T)
+    finally:
+        _close(page, qapp)
+

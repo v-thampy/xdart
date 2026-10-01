@@ -15,7 +15,9 @@ from xrd_tools.rsm.custom_slice import (
     CustomSliceRefused,
     custom_slice,
     direction_label,
+    plane_offsets,
     sample_volume,
+    volume_centre,
 )
 
 
@@ -105,6 +107,31 @@ def test_hh_l_labels_axes_and_defaults() -> None:
     assert direction_label((0, 0, 1), ("Qx", "Qy", "Qz"), "Å⁻¹") == "Qz (Å⁻¹)"
     assert direction_label((1, -1, 0)) == "t·[1 -1 0] (r.l.u.)"
     assert direction_label((1, 1, 0), ("Qx", "Qy", "Qz"), "Å⁻¹") == "t·[1 1 0] (Å⁻¹)"
+
+
+def test_plane_offsets_give_the_coordinates_along_the_directions() -> None:
+    """The window's axes (G9): a sample at (t, s) lies at the plane's point nearest the reciprocal-space origin
+    + (t − a)·u + (s − b)·v, so on an H–K plane t − a and s − b are H and K, and on HH–L through any point
+    (H + K)/2 and L; oblique directions too. The centre is custom_slice's default origin."""
+    axes = _axes()
+    assert volume_centre(axes) == custom_slice(_linear(axes), axes).origin == (0.0, 1.0, 2.0)
+    a, b = plane_offsets((0.25, 0.75, 2.0), (1, 0, 0), (0, 1, 0))
+    assert (a, b) == (-0.25, -0.75)
+    origin = np.array([1.5, 0.5, 1.25])  # HH–L through a point off the H = K plane
+    a, b = plane_offsets(origin)
+    assert (a, b) == ((origin[0] + origin[1]) / -2.0, -origin[2])
+    t, s = 0.375, -0.5
+    point = origin + t * np.array([1.0, 1.0, 0.0]) + s * np.array([0.0, 0.0, 1.0])
+    assert ((point[0] + point[1]) / 2.0, point[2]) == (t - a, s - b)
+    u, v = np.array([1.0, 0.0, 0.0]), np.array([1.0, 1.0, 0.5])  # oblique: the foot point is normal to both
+    a, b = plane_offsets(origin, u, v)
+    foot = origin + a * u + b * v
+    assert abs(foot @ u) < 1e-12 and abs(foot @ v) < 1e-12
+    for kwargs, code in ((dict(u=(0, 0, 0)), "CUSTOM_SLICE_DIRECTION_ZERO"),
+                         (dict(u=(1, 1, 0), v=(2, 2, 0)), "CUSTOM_SLICE_DIRECTIONS_PARALLEL")):
+        with pytest.raises(CustomSliceRefused) as refused:
+            plane_offsets(origin, **kwargs)
+        assert refused.value.code == code, kwargs
 
 
 def test_the_projections_follow_the_viewers_finite_mean() -> None:

@@ -132,15 +132,10 @@ def custom_slice(values, axes, origin=None, u=(1.0, 1.0, 0.0), v=(0.0, 0.0, 1.0)
     are refused with a reason."""
     volume = np.asarray(values)
     centres = _checked_axes(volume, axes)
-    first, second = _direction(u, "first"), _direction(v, "second")
-    cross = np.cross(first, second)
-    if np.linalg.norm(cross) <= 1e-12 * np.linalg.norm(first) * np.linalg.norm(second):
-        raise CustomSliceRefused("CUSTOM_SLICE_DIRECTIONS_PARALLEL", "the two directions are parallel")
+    first, second = _directions(u, v)
     low = np.array([centre[0] for centre in centres])
     high = np.array([centre[-1] for centre in centres])
-    centre_point = (low + high) / 2.0 if origin is None else np.asarray(origin, dtype=np.float64)
-    if centre_point.shape != (3,) or not np.all(np.isfinite(centre_point)):
-        raise CustomSliceRefused("CUSTOM_SLICE_RANGE_INVALID", "the plane's origin needs three finite coordinates")
+    centre_point = _origin(volume_centre(centres) if origin is None else origin)
     t_low, t_high = _span(first, centre_point, low, high) if u_range is None else _range(u_range)
     s_low, s_high = _span(second, centre_point, low, high) if v_range is None else _range(v_range)
     longest = max(volume.shape)
@@ -171,6 +166,39 @@ def custom_slice(values, axes, origin=None, u=(1.0, 1.0, 0.0), v=(0.0, 0.0, 1.0)
         origin=tuple(float(item) for item in centre_point),
         u=tuple(float(item) for item in first), v=tuple(float(item) for item in second),
     )
+
+
+def volume_centre(axes) -> tuple[float, float, float]:
+    """The volume's centre, midway between its first and last bin centres on each axis: Custom Slice's default
+    origin."""
+    return tuple(float((axis[0] + axis[-1]) / 2.0) for axis in (np.asarray(item, dtype=np.float64) for item in axes))
+
+
+def plane_offsets(origin, u=(1.0, 1.0, 0.0), v=(0.0, 0.0, 1.0)) -> tuple[float, float]:
+    """Where the plane's own coordinates start: ``(a, b)``, with ``origin + a·u + b·v`` the plane's point nearest
+    the reciprocal-space origin. ``CustomSlice.t`` and ``s`` are offsets from ``origin``; a sample lies at that
+    point ``+ (t − a)·u + (s − b)·v``, so ``t − a`` and ``s − b`` are its coordinates along the two directions:
+    H and K themselves on an H–K plane; L and the HH coordinate (H + K)/2 on HH–L, through any point. Zero and
+    parallel directions are refused as ``custom_slice`` refuses them."""
+    first, second = _directions(u, v)
+    point = _origin(origin)
+    gram = np.array([[first @ first, first @ second], [first @ second, second @ second]])
+    a, b = np.linalg.solve(gram, -np.array([point @ first, point @ second]))
+    return float(a), float(b)
+
+
+def _directions(u, v) -> tuple[np.ndarray, np.ndarray]:
+    first, second = _direction(u, "first"), _direction(v, "second")
+    if np.linalg.norm(np.cross(first, second)) <= 1e-12 * np.linalg.norm(first) * np.linalg.norm(second):
+        raise CustomSliceRefused("CUSTOM_SLICE_DIRECTIONS_PARALLEL", "the two directions are parallel")
+    return first, second
+
+
+def _origin(value) -> np.ndarray:
+    point = np.asarray(value, dtype=np.float64)
+    if point.shape != (3,) or not np.all(np.isfinite(point)):
+        raise CustomSliceRefused("CUSTOM_SLICE_RANGE_INVALID", "the plane's origin needs three finite coordinates")
+    return point
 
 
 def _checked_axes(volume: np.ndarray, axes) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
