@@ -85,8 +85,6 @@ _RESIDENT_RESULTS = 5
 _FIELDS = (
     (SectionId.PROJECT, "project_root", "Folder", "", (), True),
     (SectionId.PROJECT, "output_path", "Save Path", "", (), True),
-    (SectionId.EXPERIMENT, "coordinates", "Coordinates", RSMCoordinateFrame.HKL.display_name, tuple(_FRAMES),
-     False),
     (SectionId.SOURCE, "member_spec", "SPEC", "", (), True),
     (SectionId.SOURCE, "member_scan", "Scan", "", (), False),
     (SectionId.SOURCE, "member_images", "Images", "", (), True),
@@ -94,6 +92,8 @@ _FIELDS = (
     (SectionId.SOURCE, "member_first", "First frame", "0", (), False),
     (SectionId.SOURCE, "member_last", "Last frame", "", (), False),
     (SectionId.SOURCE, "member_step", "Frame step", "1", (), False),
+    (SectionId.PROCESSING, "coordinates", "Coordinates", RSMCoordinateFrame.HKL.display_name, tuple(_FRAMES),
+     False),
     (SectionId.PROCESSING, "grid", "Grid", "Quick 40×40×40", tuple(_GRIDS), False),
     (SectionId.PROCESSING, "normalization", "Normalization", "Foil transmission / exposure",
      tuple(_NORMALIZATIONS), False),
@@ -113,7 +113,7 @@ _INTEGER_FIELDS = {"member_first": (0, None, False), "member_last": (0, None, Tr
                    **{f"adv_occurrence_{role}": (0, 1024, False) for role in _PSIC_ROLES},
                    "adv_foil_occurrence": (0, 1024, False), "adv_exposure_occurrence": (0, 1024, False),
                    "adv_chunk": (1, 1024, False), "adv_max_frame_mib": (1, 4096, False),
-                   "adv_max_chunk_mib": (1, 4096, False)}
+                   "adv_max_chunk_mib": (1, 4096, True)}
 _MEMBER_KEYS = ("member_spec", "member_scan", "member_images", "member_stem", "member_first", "member_last",
                 "member_step")
 #: The Advanced rows that are the selected member's (its raw decoder and psic motor columns), stored into its
@@ -299,9 +299,8 @@ class RSMPage(QtWidgets.QWidget):
     def _build_controls(self):
         cards = {SectionId.PROJECT: self.controls.project_card, SectionId.EXPERIMENT: self.controls.experiment_card,
                  SectionId.SOURCE: self.controls.source_card, SectionId.PROCESSING: self.controls.processing_card}
+        self._build_experiment()  # Stitch's Experiment rows (the maintainer: its control panel)
         for section, key, label, value, choices, browse in _FIELDS:
-            if key == "coordinates":  # Stitch's Experiment rows first (the maintainer: its control panel)
-                self._build_experiment()
             row = self._row(section, key, label, value, choices, browse)
             if key == "member_spec":  # the ordered members above the selected one's rows
                 cards[section].add_row(self._member_panel())
@@ -405,12 +404,15 @@ class RSMPage(QtWidgets.QWidget):
             ("Chunk and memory", SectionId.PROCESSING, (
                 ("adv_chunk", "Frames per chunk", str(preset.chunk_size), ()),
                 ("adv_max_frame_mib", "Max frame MiB", str(preset.max_frame_bytes // _MIB), ()),
-                ("adv_max_chunk_mib", "Max chunk MiB", str(preset.max_chunk_bytes // _MIB), ()))),
+                ("adv_max_chunk_mib", "Max chunk MiB", "", ()))),
         )
         for title, section, rows in groups:
             self.advanced.add_group(title, tuple(self._row(section, key, label, value, choices, False)
                                                  for key, label, value, choices in rows))
         self._tip("adv_header", "Bytes before the pixels in each raw image file.")
+        self._tip("adv_max_chunk_mib", "Blank is Auto: 256 MiB, or one frame's need when larger (an Eiger 4M), "
+                                       "the chunk then holding as many frames as fit. A number is your cap; one "
+                                       "below a frame's need is named.")
         for role in _PSIC_ROLES:
             self._tip(f"adv_occurrence_{role}", "Which of the SPEC columns with this name (0 is the first), "
                                                 "when the scan repeats a column name.")
@@ -565,6 +567,29 @@ class RSMPage(QtWidgets.QWidget):
         text = str(self._value("mask_path")).strip()
         return None if not text else str(self._inside(root, text, "Mask File"))
 
+    def _max_chunk_bytes(self):
+        """Advanced Max chunk MiB in bytes; None (blank) is Auto."""
+        text = str(self._value("adv_max_chunk_mib")).strip()
+        return None if not text else int(text) * _MIB
+
+    def _chunk_cap_refusal(self):
+        """The Max chunk MiB a user set below one frame's need, named as the run would refuse it ("" when
+        Auto or enough). Arithmetic only (``rsm_v2_chunk_bytes``): no file is read; each member's raw decoder
+        stands for its frame, uncropped, so the need named is an upper bound."""
+        from xrd_tools.analysis.rsm_operation import rsm_v2_chunk_bytes
+        if self._rows["adv_max_chunk_mib"].refusal():
+            return ""  # the row's own refusal names it
+        cap = self._max_chunk_bytes()
+        if cap is None:
+            return ""
+        static_hot = bool(str(self._value("static_hot")).strip())
+        corrections = RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
+        need = max(rsm_v2_chunk_bytes((draft.detector_rows, draft.detector_columns),
+                                      (draft.detector_rows, draft.detector_columns), 1, static_hot=static_hot,
+                                      corrections=corrections) for draft in self._members)
+        mib = -(-need // _MIB)
+        return "" if cap >= need else f"Max chunk MiB of {mib} or more (one frame needs {mib} MiB), or blank for Auto"
+
     def build_form(self):
         """The exact RSM v2 form of the page's inputs: the dialog's form for the same inputs, with the
         Calibration row's geometry (AUD-9 stage 2b C7b) and the Mask File (C4)."""
@@ -613,7 +638,7 @@ class RSMPage(QtWidgets.QWidget):
             project_text, geometry, tuple(members),
             RSMImageConditioning(float(self._value("offset")), optional("high_threshold"), optional("static_hot")),
             normalization, tuple(_GRIDS[self._value("grid")]), int(self._value("adv_chunk")),
-            int(self._value("adv_max_frame_mib")) * _MIB, int(self._value("adv_max_chunk_mib")) * _MIB, output,
+            int(self._value("adv_max_frame_mib")) * _MIB, self._max_chunk_bytes(), output,
             AnalysisArtifactOverwrite.REPLACE,  # Append is the page's skip, as Stitch's (_start_run)
             coordinate_frame=_FRAMES[self._value("coordinates")], output_family=family, corrections=corrections)
 
@@ -686,14 +711,19 @@ class RSMPage(QtWidgets.QWidget):
             refused = self._advanced_refusal(section)
             if refused:
                 need(key, f"Advanced {refused}")
+        cap = self._chunk_cap_refusal()
+        if cap:
+            need("processing", f"Advanced {cap}")
         members = len(self._members)
         grid = "×".join(str(size) for size in _GRIDS[self._value("grid")])
         ready_detail = {"project": "Project folder and Output are ready.",
                         "experiment": "The Calibration (and any Mask File) is ready.",
                         "source": "Every member's SPEC file, images and frames are ready.",
-                        "processing": "The grid and normalization are set."}
-        texts = {"project": "", "experiment": str(self._value("coordinates")),
-                 "source": f"{members} member{'s' * (members != 1)}", "processing": f"grid {grid}"}
+                        "processing": "The coordinates, grid and normalization are set."}
+        calibration = str(self._value("geometry_path")).strip()
+        texts = {"project": "", "experiment": Path(calibration).name if calibration else "",
+                 "source": f"{members} member{'s' * (members != 1)}",
+                 "processing": f"{self._value('coordinates')} · grid {grid}"}
         self._headers = {key: SectionHeaderProjection(
             texts[key], not sections[key],
             ready_detail[key] if not sections[key] else "Needs " + ", ".join(sections[key]))

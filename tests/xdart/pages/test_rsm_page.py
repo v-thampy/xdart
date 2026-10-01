@@ -80,8 +80,9 @@ def _wait(page, qapp, done, seconds=20.0):
 def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
     """The page and the RSM dialog it replaces make the same exact RSM v2 form from the same inputs (its
     fingerprint names every member, selector, grid, frame and the output), for HKL and for Cartesian Q; the
-    page's replaces its own result (stage 2), the dialog's creates a new one, and the page's geometry is its
-    Calibration row's where the dialog installs the canonical asset (stage 2b C7b)."""
+    page's replaces its own result (stage 2), the dialog's creates a new one, the page's geometry is its
+    Calibration row's where the dialog installs the canonical asset (stage 2b C7b), and the page's Max chunk
+    MiB is Auto where the dialog's is the preset's 256 (stage 2b S3a)."""
     from dataclasses import replace as replaced
     page = _page(qapp, owner=_Owner())
     dialog = RSMToolDialog(empty_host_services(_Status()), owner=_Owner())
@@ -95,7 +96,8 @@ def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
         dialog.output_edit.setText(str(output))
         geometry = page.build_form().geometry_asset
         assert page.build_form().fingerprint == replaced(
-            dialog._build_form(), overwrite=AnalysisArtifactOverwrite.REPLACE, geometry_asset=geometry).fingerprint
+            dialog._build_form(), overwrite=AnalysisArtifactOverwrite.REPLACE, geometry_asset=geometry,
+            max_chunk_bytes=None).fingerprint
         page.set_field("coordinates", RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name)
         page.set_field("grid", "Full 200×200×200")
         page.set_field("normalization", "Identity")
@@ -104,7 +106,8 @@ def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
         dialog.grid_combo.setCurrentIndex(1)
         dialog.normalization_combo.setCurrentIndex(1)
         assert page.build_form().fingerprint == replaced(
-            dialog._build_form(), overwrite=AnalysisArtifactOverwrite.REPLACE, geometry_asset=geometry).fingerprint
+            dialog._build_form(), overwrite=AnalysisArtifactOverwrite.REPLACE, geometry_asset=geometry,
+            max_chunk_bytes=None).fingerprint
     finally:
         _close(page, qapp)
         dialog.shutdown()
@@ -764,7 +767,9 @@ def test_each_section_header_shows_its_readiness_as_ints_do(qapp, tmp_path):
         _with_members(page, tmp_path, _synthetic_members(tmp_path))
         assert page.run_bar.readinessLabel.full_text().startswith("Ready · RSM · 2 members")
         assert all(card.valid_marker.isVisibleTo(page) for card in cards.values())
-        assert cards["source"].status.text() == "2 members" and cards["processing"].status.text().startswith("grid ")
+        assert cards["source"].status.text() == "2 members"
+        assert cards["processing"].status.text().endswith(" · grid 40×40×40")  # Coordinates is Processing's (G8a)
+        assert cards["experiment"].status.text() == "rsm_canonical.json"
         page._members[1].spec_path = "missing.spec"
         page._edited()
         assert not cards["source"].valid_marker.isVisibleTo(page)
@@ -925,5 +930,24 @@ def test_a_calibration_outside_the_project_is_named_before_any_preview(qapp, tmp
         page.set_field("geometry_path", "../calibration/rsm_canonical.json")
         assert not page._readiness[1] and "a Calibration inside the Project" in page._readiness[0]
         assert page._rows["refinement"].editor.isEnabled()  # a Calibration is named: the toggle stays usable
+    finally:
+        _close(page, qapp)
+
+
+def test_coordinates_is_a_processing_choice_and_max_chunk_mib_defaults_to_auto(qapp, tmp_path):
+    """Design §2: Coordinates moves from Experiment to Processing. Advanced Max chunk MiB is blank, Auto (stage 2b
+    S3a: 256 MiB, or one frame's need when larger), and the form passes None; a cap below one frame's need is
+    named by readiness with the MiB it needs, before any Preview; a sufficient one reaches the form."""
+    page = _page(qapp)
+    try:
+        assert page.controls.processing_card.isAncestorOf(page._rows["coordinates"])
+        assert not page.controls.experiment_card.isAncestorOf(page._rows["coordinates"])
+        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        assert page._value("adv_max_chunk_mib") == "" and page.build_form().max_chunk_bytes is None
+        page.set_field("adv_max_chunk_mib", "1")
+        assert not page._readiness[1] and "one frame needs" in page._readiness[0], page._readiness
+        assert "Max chunk MiB" in page._headers["processing"].detail
+        page.set_field("adv_max_chunk_mib", "256")
+        assert page._readiness[1] and page.build_form().max_chunk_bytes == 256 * 1024 * 1024
     finally:
         _close(page, qapp)
