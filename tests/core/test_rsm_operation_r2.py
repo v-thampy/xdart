@@ -2420,7 +2420,8 @@ def test_v2_replace_regenerates_its_own_result_and_append_knows_a_current_one(tm
 
 def test_v2_replace_refuses_a_foreign_or_other_kind_file(tmp_path, monkeypatch):
     """Only an RSM result is replaced: a Stitch result (another kind) or a file that is no analysis result
-    at the target refuses the run, and the file stays as it was."""
+    at the target is refused by Preview (G8c unit 2, before any gridding) and, when it appears only after
+    Preview, by the run; the file stays as it was."""
     from tests.core.test_module_transaction import _provenance, _request, _write_stitched_record
     from xrd_tools.analysis.module_transaction import admit_module_artifact
     from xrd_tools.io.output_transaction import OutputTransactionCoordinator
@@ -2440,8 +2441,15 @@ def test_v2_replace_refuses_a_foreign_or_other_kind_file(tmp_path, monkeypatch):
     )
     for target in (other_kind, foreign):
         before = target.read_bytes()
+        with pytest.raises(RSMToolPreflightRefused) as refused:
+            prepare_rsm_tool_v2(replace(form, output_path=target))
+        assert refused.value.code == "OUTPUT_NOT_PREVIOUS_ANALYSIS", target.name
+        assert target.read_bytes() == before
+        aside = target.with_name(f"{target.name}.aside")  # absent at Preview, there again for the run
+        target.rename(aside)
         prepared = prepare_rsm_tool_v2(replace(form, output_path=target))
         assert prepared.output_current is False
+        aside.rename(target)
         result = run_rsm_operation_v2(prepared.request)
         assert (result.terminal.disposition, result.terminal.code) == (
             ModuleDisposition.REFUSED,
