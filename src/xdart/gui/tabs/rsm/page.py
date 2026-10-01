@@ -157,8 +157,42 @@ _RAW_DTYPES = ("int32", "uint16", "float32", "float64")
 #: or a SPEC scan's ``#G3``; ``RSMToolFormV2.ub``, for an HKL map only.
 _UB_SOURCE, _UB_TYPED, _UB_SPEC = "The source's", "Typed", "A SPEC scan's"
 _UB_KEYS = ("ub_from", "ub_row1", "ub_row2", "ub_row3", "ub_spec_path", "ub_scan")
-#: The Source header's warning for an HKL map of a source with no UB (the brief's words; design "A source with no UB").
-_NO_UB = "This source records no UB matrix. Enter one, or take it from a SPEC scan, or choose Q coordinates."
+#: What an HKL map of a source with no UB needs (the brief's words; design "A source with no UB"), after the members
+#: that record none (``no_ub_warning``)
+_NO_UB_CHOICES = "Enter one, or take it from a SPEC scan, or choose Q coordinates."
+#: The members a no-UB warning names before it counts the rest
+_NO_UB_NAMED = 3
+
+
+def no_ub_warning(members) -> str:
+    """The Source header's warning for an HKL map of ``members`` that record no UB, in order, naming them (the
+    maintainer, 2026-10-01: "will be better if it does name the scan"): a SPEC scan as a selection names it, as
+    Stitch's frame counts do (N for its first run, N.2 for a later one), with its file's name when the scans named
+    come from several files; a NeXus stack by its file's name, with its entry when not ``entry``; the first three,
+    then how many more. One SPEC scan: "Scan 44 records no UB matrix. Enter one, or take it from a SPEC scan, or
+    choose Q coordinates" (the maintainer's example)."""
+    members = tuple(members)
+    if not members:
+        raise ValueError("a no-UB warning names the members that record none")
+    files = {Path(member.spec_path).name for member in members if not hasattr(member, "nexus_path")}
+    spec_only = not any(hasattr(member, "nexus_path") for member in members)
+    names = []
+    for member in members:
+        if hasattr(member, "nexus_path"):
+            entry = "" if member.entry == "entry" else f" ({member.entry})"
+            names.append(f"{Path(member.nexus_path).name}{entry}")
+        else:
+            number = member.scan[:-2] if member.scan.endswith(".1") else member.scan
+            of = f" of {Path(member.spec_path).name}" if len(files) > 1 else ""
+            names.append(f"{'' if spec_only else 'scan '}{number}{of}")
+    more = len(names) - _NO_UB_NAMED
+    items = [*names[:_NO_UB_NAMED], f"{more} more"] if more > 0 else names
+    listed = items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
+    if spec_only:
+        listed = ("Scans " if len(names) > 1 else "Scan ") + listed
+    elif listed.startswith("scan "):
+        listed = "S" + listed[1:]
+    return f"{listed} {'records' if len(names) == 1 else 'record'} no UB matrix. {_NO_UB_CHOICES}"
 
 
 def _resolve_rsm_groups(arguments, cancel, _progress):
@@ -758,16 +792,21 @@ class RSMPage(QtWidgets.QWidget):
                                  scan=scan)
         return None
 
-    def _ub_wanted(self):
-        """True when an HKL map takes the source's own UB and a found member records none: the Source header's
-        warning, and Preview and Run wait for a UB (or Q)."""
+    def _ub_missing(self):
+        """The found members, of every queued RSM in order, that record no UB when an HKL map takes the source's own:
+        the Source header's warning names them (``no_ub_warning``), and Preview and Run wait for a UB (or Q)."""
         if (self._value("coordinates") != RSMCoordinateFrame.HKL.display_name
                 or self._value("ub_from") != _UB_SOURCE):
-            return False
+            return ()
         found = self._groups
         if found is None or found[0] != self._group_key():
-            return False
-        return any(ub is None for ub in found[3])
+            return ()
+        members = (member for group in found[1] for member in group)
+        return tuple(member for member, ub in zip(members, found[3]) if ub is None)
+
+    def _ub_wanted(self):
+        """True when a found member records no UB an HKL map needs (``_ub_missing``)."""
+        return bool(self._ub_missing())
 
     def _build_advanced(self):
         """The rarely changed settings: Int's Advanced dialog, its groups the page's shared rows (Codex's reuse
@@ -1224,7 +1263,8 @@ class RSMPage(QtWidgets.QWidget):
             else:
                 if given is not None and given.spec_path is not None and not Path(given.spec_path).is_file():
                     need("source", f"the UB's SPEC file ({Path(given.spec_path).name} not found)")
-        warned = self._ub_wanted()
+        missing = self._ub_missing()
+        warned = bool(missing)
         if warned:  # an HKL map of a found source with no UB: Run waits (design "A source with no UB")
             needs.append("a UB matrix")
         for key, section in (("source", SectionId.SOURCE), ("processing", SectionId.PROCESSING)):
@@ -1259,8 +1299,9 @@ class RSMPage(QtWidgets.QWidget):
                  "processing": f"{self._value('coordinates')} · grid {grid}"}
         details = {key: ready_detail[key] if not sections[key] else "Needs " + ", ".join(sections[key])
                    for key in sections}
-        if warned:  # the Source header warns in the brief's words, whatever else it needs
-            details["source"] = _NO_UB if not sections["source"] else f"{_NO_UB} {details['source']}"
+        if warned:  # the Source header warns in the brief's words, naming the scans, whatever else it needs
+            warning = no_ub_warning(missing)
+            details["source"] = warning if not sections["source"] else f"{warning} {details['source']}"
             texts["source"] = " · ".join(part for part in (texts["source"], "⚠ no UB matrix") if part)
         self._headers = {key: SectionHeaderProjection(
             texts[key], not sections[key] and not (warned and key == "source"), details[key])
@@ -1581,8 +1622,9 @@ class RSMPage(QtWidgets.QWidget):
         """Preview, or Run, on the member groups just found; an HKL map of a source with no UB waits for one.
         Several RSMs are queued (``build_forms``): each is prepared, and on Run gridded, before the next; a
         Run first checks every output (``_queue_outputs_writable``)."""
-        if self._ub_wanted():
-            self._notice(_NO_UB)
+        missing = self._ub_missing()
+        if missing:
+            self._notice(no_ub_warning(missing))
             return
         try:
             forms = self.build_forms()
@@ -2260,4 +2302,4 @@ def build_rsm_page(services, parent):
                       processing_mode=_RSMProcessingMode(page), write_mode=RunBarWriteMode(page.run_bar))
 
 
-__all__ = ["RSMPage", "build_rsm_page", "suggested_output"]
+__all__ = ["RSMPage", "build_rsm_page", "no_ub_warning", "suggested_output"]

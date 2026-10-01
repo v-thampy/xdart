@@ -1475,16 +1475,17 @@ def test_a_queued_run_grids_each_rsm_with_its_members_own_ub_and_waits_for_any_m
         page.begin_run()
         _wait(page, qapp, lambda: "Saved 2 of 2 RSMs" in label.full_text())
         assert used == {first: [tuple(map(float, own[0]))], second: [tuple(map(float, own[1]))]}
-        for ubs in ((own[0], None), (None, own[1])):
+        for ubs, warning in (((own[0], None), "Scan 2 records no UB matrix. " + _NO_UB_CHOICES),
+                             ((None, own[1]), "Scan 1 records no UB matrix. " + _NO_UB_CHOICES)):
             used.clear()
             _own_ubs(tmp_path, own)
             page.resolve_source()  # every member records one again: ready
             assert page._readiness[1], page._readiness
             _own_ubs(tmp_path, ubs)
-            page.begin_run()  # the scans are found again, the member recording none with them
+            page.begin_run()  # the scans are found again, the member recording none with them, which is named
             _wait(page, qapp, lambda: not page.active())
-            assert label.full_text() == _NO_UB and used == {} and page._jobs == []
-            assert page._headers["source"].detail == _NO_UB and not page._readiness[1]
+            assert label.full_text() == warning and used == {} and page._jobs == []
+            assert page._headers["source"].detail == warning and not page._readiness[1]
             page.begin_run()  # and Run waits while it records none
             assert label.full_text() == "Needs a UB matrix" and not page.active() and used == {}
     finally:
@@ -1503,7 +1504,7 @@ def test_a_ub_given_for_a_queued_run_is_every_rsms_and_the_preview_names_each_me
         _synthetic_source(tmp_path)
         _own_ubs(tmp_path, ((2, 0, 0, 0, 2, 0, 0, 0, 2), None))
         _with_source(page, tmp_path, scans="1,2")
-        assert page._headers["source"].detail == _NO_UB
+        assert page._headers["source"].detail == "Scan 2 records no UB matrix. " + _NO_UB_CHOICES
         page.set_field("ub_from", "Typed")
         for number, row in enumerate(("3 0 0", "0 3 0", "0 0 3"), 1):
             page.set_field(f"ub_row{number}", row)
@@ -1822,7 +1823,53 @@ def test_preview_shows_stitchs_auto_ceiling_hint_on_the_threshold_row(qapp, tmp_
         _close(page, qapp)
 
 
-_NO_UB = "This source records no UB matrix. Enter one, or take it from a SPEC scan, or choose Q coordinates."
+_NO_UB_CHOICES = "Enter one, or take it from a SPEC scan, or choose Q coordinates."
+
+
+def test_the_no_ub_warning_names_the_scans_that_record_none(qapp, tmp_path):
+    """G13 unit 2 (the maintainer, 2026-10-01: "will be better if it does name the scan"): the Source header's
+    warning, and Preview's, name the members that record no UB. One RSM of both scans names both; once one records
+    a UB, the other alone."""
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _own_ubs(tmp_path, (None, None))
+        _with_source(page, tmp_path)  # [1-2]: one RSM of both scans
+        both = "Scans 1 and 2 record no UB matrix. " + _NO_UB_CHOICES
+        assert page._headers["source"].detail == both and not page._readiness[1]
+        page.begin_preview()  # found again, and waits
+        _wait(page, qapp, lambda: not page.active())
+        assert label.full_text() == both and page._owner.prepared is None
+        _own_ubs(tmp_path, ((1, 0, 0, 0, 1, 0, 0, 0, 1), None))
+        page.resolve_source()
+        assert page._headers["source"].detail == "Scan 2 records no UB matrix. " + _NO_UB_CHOICES
+    finally:
+        _close(page, qapp)
+
+
+def test_the_no_ub_warning_names_three_then_counts_and_tells_files_and_entries_apart():
+    """G13 unit 2: a scan is named as a selection names it; past three members the warning counts the rest; scans
+    from several SPEC files carry their file's name; a NeXus stack is named by its file, with its entry when it is
+    not ``entry``."""
+    from types import SimpleNamespace
+    from xdart.gui.tabs.rsm.page import no_ub_warning
+
+    def scan(number, name="a.spec"):
+        return SimpleNamespace(spec_path=f"/data/{name}", scan=number)
+
+    def stack(name, entry="entry"):
+        return SimpleNamespace(nexus_path=f"/data/{name}", entry=entry)
+
+    for members, named in (
+            ((scan("44"),), "Scan 44 records"),
+            ((scan("44.1"), scan("45.2")), "Scans 44 and 45.2 record"),  # a selection's names: N, then N.2
+            ((scan("41"), scan("42"), scan("43")), "Scans 41, 42 and 43 record"),
+            (tuple(scan(str(number)) for number in range(41, 46)), "Scans 41, 42, 43 and 2 more record"),
+            ((scan("44"), scan("44", "b.spec")), "Scans 44 of a.spec and 44 of b.spec record"),
+            ((stack("member_noub.nxs"),), "member_noub.nxs records"),
+            ((scan("44"), stack("s.nxs", "entry2")), "Scan 44 and s.nxs (entry2) record")):
+        assert no_ub_warning(members) == f"{named} no UB matrix. {_NO_UB_CHOICES}"
 
 
 def test_a_ub_less_nexus_member_is_warned_and_waits_in_hkl_and_is_ready_in_q(qapp, tmp_path):
@@ -1844,15 +1891,16 @@ def test_a_ub_less_nexus_member_is_warned_and_waits_in_hkl_and_is_ready_in_q(qap
         assert page._readiness[1] and page.ub_card._collapsed  # not known until the Source is found
         page.begin_preview()  # finds the member, then waits for a UB: nothing is prepared
         _wait(page, qapp, lambda: not page.active())
-        assert page.run_bar.readinessLabel.full_text() == _NO_UB and page._owner.prepared is None
+        warning = "member_noub.nxs records no UB matrix. " + _NO_UB_CHOICES  # the member named (G13 unit 2)
+        assert page.run_bar.readinessLabel.full_text() == warning and page._owner.prepared is None
         header = page._headers["source"]
-        assert header.detail == _NO_UB and not header.ready and "⚠ no UB matrix" in header.text
+        assert header.detail == warning and not header.ready and "⚠ no UB matrix" in header.text
         assert not page._readiness[1] and "a UB matrix" in page._readiness[0]
         assert not page.ub_card._collapsed  # the UB rows show
         page.begin_run()  # Run waits too
         assert not page.active() and page._owner.prepared is None
         page.set_field("coordinates", RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name)
-        assert page._readiness[1] and page._headers["source"].ready and _NO_UB not in page._headers["source"].detail
+        assert page._readiness[1] and page._headers["source"].ready and "no UB" not in page._headers["source"].detail
         assert page.build_form().ub is None
         page.set_field("coordinates", RSMCoordinateFrame.HKL.display_name)
         assert not page._readiness[1]
@@ -1876,7 +1924,7 @@ def test_a_typed_or_spec_scan_ub_reaches_the_form_and_a_refused_one_is_named(qap
         _synthetic_source(tmp_path)
         _with_source(page, tmp_path)
         assert page._readiness[1] and page.build_form().ub is None  # the source's own (#G3)
-        assert _NO_UB not in page._headers["source"].detail
+        assert "no UB" not in page._headers["source"].detail
         assert not page._rows["ub_row1"].editor.isEnabled()  # rows the choice does not read are greyed
         page.set_field("ub_from", "Typed")
         for number, row in enumerate(("2, 0, 0", "0 2 0", "0 0 2"), 1):
