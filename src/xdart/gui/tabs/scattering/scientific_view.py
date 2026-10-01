@@ -270,9 +270,11 @@ def _pixmap_pixel_count(pixmap) -> int:
 class ScientificView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
     #: The plot-options dialog was accepted. Emitted after the view has read its own options
-    #: and before it emits their commands, so a host reads the rows it added
-    #: (``plot_options_dialog.add_row``) before any of its own redraws resets them.
+    #: and before it emits their commands, so a host reads the choices it added
+    #: (``plot_options_dialog.add_choice``) before any of its own redraws resets them.
     plotOptionsAccepted = QtCore.Signal()
+    #: A host page's raw pop-up (``show_raw_popup``) was closed; its image is already cleared.
+    rawPopupClosed = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -328,6 +330,8 @@ class ScientificView(QtWidgets.QFrame):
         self._expected_background_key = self._rendered_background_key = None
         self.raw_popup_dialog = None
         self.raw_popup_image = None
+        #: True while a host page (Stitch) owns the raw pop-up; Int's own (its Raw button, Int 1D) when False
+        self._raw_popup_host = False
         self._rendered_image_axis: str | None = None
         self._rendered_cake_axis_key: str | None = None
         self._rendered_cake_x_axis: AxisProjection | None = None
@@ -689,6 +693,8 @@ class ScientificView(QtWidgets.QFrame):
         if not self.raw_popup_button.isEnabled():
             return
         self._ensure_raw_popup()
+        self._raw_popup_host = False
+        self.raw_popup_dialog.setWindowTitle("Raw Image")
         self.raw_popup_dialog.show(); self.raw_popup_dialog.raise_()
         self._emit(ShellCommandKind.SET_DETECTOR_MODE, "thumbnail", ("popup",))
         self.raw_popup_full.setChecked(True)
@@ -698,10 +704,58 @@ class ScientificView(QtWidgets.QFrame):
         if self.raw_popup_image is not None:
             self.raw_popup_image.clear_image_buffers()
         if hasattr(self, "raw_popup_status"): self.raw_popup_status.setText("")
-        if self._processing_mode == "Int 1D":
+        if self._raw_popup_host:
+            self.rawPopupClosed.emit()
+        elif self._processing_mode == "Int 1D":
             self._emit(ShellCommandKind.SET_DETECTOR_MODE, "thumbnail", ("popup",))
 
+    # -- the raw pop-up for a host page's image (Codex's Stitch/Int reuse audit R2: Stitch's contributing
+    # frame opens here, not in a page-built dialog). Int's own pop-up path above is unchanged.
+    def show_raw_popup(self, title: str, *, mode: str = "thumbnail") -> None:
+        """Open the view's raw pop-up for a host page's image, which the host then fills with
+        ``show_raw_image`` and ``show_raw_status``. Its Thumbnail / Full Raw buttons emit
+        ``SET_DETECTOR_MODE`` (path ``("popup",)``) for the host to read its image again in that
+        mode; closing it clears the image and emits ``rawPopupClosed``. The host's image stays through
+        the view's own reconciles and layout changes (Int's pop-up follows Int 1D only)."""
+        if mode not in {"thumbnail", "full"}:
+            raise ValueError("the raw pop-up mode is 'thumbnail' or 'full'")
+        self._ensure_raw_popup()
+        self._raw_popup_host = True
+        self.raw_popup_dialog.setWindowTitle(title)
+        (self.raw_popup_full if mode == "full" else self.raw_popup_thumbnail).setChecked(True)
+        self.raw_popup_full.setEnabled(True)
+        self.raw_popup_dialog.show(); self.raw_popup_dialog.raise_()
+
+    def raw_popup_shown(self) -> bool:
+        """Whether a host page's raw pop-up is open."""
+        return (self._raw_popup_host and self.raw_popup_dialog is not None
+                and self.raw_popup_dialog.isVisible())
+
+    def raw_popup_mode(self) -> str:
+        """The raw pop-up's mode: 'full' when Full Raw is checked, else 'thumbnail'."""
+        return ("full" if self.raw_popup_dialog is not None and self.raw_popup_full.isChecked()
+                else "thumbnail")
+
+    def show_raw_image(self, image, *, status: str, color_map: str, log_scale: bool,
+                       detector_shape: tuple[int, int] | None = None) -> None:
+        """A host page's image in its open raw pop-up, with the line below it."""
+        if not self.raw_popup_shown():
+            return
+        self.raw_popup_image.render(image, detector_shape=detector_shape, color_map=color_map,
+                                    log_scale=log_scale)
+        self.raw_popup_status.setText(status)
+
+    def show_raw_status(self, status: str, *, clear_image: bool = False) -> None:
+        """The line below a host page's open raw pop-up; ``clear_image`` empties the image too."""
+        if not self.raw_popup_shown():
+            return
+        if clear_image:
+            self.raw_popup_image.clear_image_buffers()
+        self.raw_popup_status.setText(status)
+
     def _reconcile_raw_popup(self, state: ScientificProjection) -> None:
+        if self._raw_popup_host:  # a host page's image: Int's frame does not replace it
+            return
         heavy = state.heavy
         dialog = self.raw_popup_dialog
         if dialog is None or not dialog.isVisible():
@@ -2869,7 +2923,8 @@ class ScientificView(QtWidgets.QFrame):
             self._viewer_intensity_domain = self._viewer_auto_levels = None
             self.curve.getViewBox().enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
         self.raw_popup_button.setVisible(normalized == "Int 1D")
-        if normalized != "Int 1D" and self.raw_popup_dialog is not None:
+        if (normalized != "Int 1D" and self.raw_popup_dialog is not None
+                and not self._raw_popup_host):
             self.raw_popup_dialog.close()
         aggregate_enabled = normalized != "1D Viewer"
         combo = getattr(self, "plot_mode", None)

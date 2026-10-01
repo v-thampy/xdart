@@ -89,7 +89,6 @@ _DEBT: dict[str, dict[str, int]] = {
     "tabs/stitch/metadata.py": {"QComboBox": 1},
     # the browser chrome and lists moved onto Int's BrowserView (G3b); the Diagnostic combo is G4's
     "tabs/stitch/page.py": {"QComboBox": 1},
-    "tabs/stitch/raw_popup.py": {"QComboBox": 1, "ScientificImagePane": 1},
     # The classic RSM dialog, retired with AUD-9's last stage.
     "tools/rsm_tool.py": {
         "ImageItem": 2, "PlotDataItem": 2, "PlotWidget": 1, "QComboBox": 4, "QFileDialog.getExistingDirectory": 1,

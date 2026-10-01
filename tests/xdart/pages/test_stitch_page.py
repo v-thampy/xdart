@@ -354,23 +354,23 @@ def test_native_saved_frame_popup_keeps_curve_and_shows_thumbnail_fallback(qapp,
         page._show_raw()
         _wait(page, qapp)
         assert page._raw_frame_view.thumbnail is not None
-        page._raw_popup.mode.setCurrentText("Full Raw")
+        page.scientific.raw_popup_full.click()
         _wait(page, qapp)
         np.testing.assert_array_equal(page._raw_frame_view.raw, raw)
         page.frames.setCurrentRow(2)
-        assert page._raw_popup.image.canvas.raw_image.size == 0
-        assert page._raw_popup.caption.text() == "Loading selected frame…"
+        assert page.scientific.raw_popup_image.canvas.raw_image.size == 0
+        assert page.scientific.raw_popup_status.text() == "Loading selected frame…"
         _wait(page, qapp)
-        assert "3-0" in page._raw_popup.caption.text()
+        assert "3-0" in page.scientific.raw_popup_status.text()
         np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, original_y)
         project.rename(tmp_path / "unavailable")
         page.frames.setCurrentRow(1)
         _wait(page, qapp)
         assert page._raw_frame_view.raw is None
-        assert "Thumbnail · raw source unavailable" in page._raw_popup.caption.text()
-        page._raw_popup.close()
+        assert "Thumbnail · raw source unavailable" in page.scientific.raw_popup_status.text()
+        page.scientific.raw_popup_dialog.close()
         assert page._raw_frame_view is None
-        assert page._raw_popup.image.canvas.raw_image.size == 0
+        assert page.scientific.raw_popup_image.canvas.raw_image.size == 0
     finally:
         page.shutdown()
 
@@ -982,10 +982,10 @@ def test_changed_original_frame_is_labelled_thumbnail_in_popup(qapp, tmp_path):
         (raw + 100).tofile(source)
         os.utime(source, ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))
         page._show_raw()
-        page._raw_popup.mode.setCurrentText("Full Raw")
+        page.scientific.raw_popup_full.click()
         _wait(page, qapp)
         assert page._raw_frame_view.raw is None
-        assert "Thumbnail · raw source changed since processing" in page._raw_popup.caption.text()
+        assert "Thumbnail · raw source changed since processing" in page.scientific.raw_popup_status.text()
         np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, original_y)
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN

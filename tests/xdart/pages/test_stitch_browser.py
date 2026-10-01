@@ -5,6 +5,7 @@ keeps one item of Codex's preservation list, now through the owner."""
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 from pyqtgraph.Qt import QtCore, QtWidgets
 
@@ -73,10 +74,10 @@ def test_stitch_frames_keep_identities_grouped_labels_and_excluded_marks_in_ints
         _wait(page, qapp)
         page.frames.setCurrentRow(2)  # a user choosing a frame: the raw read follows it
         assert page.browser.current_result_frame() == frames.item(2).data(_ROLE)
-        assert page._raw_popup.caption.text() == "Loading selected frame…"
+        assert page.scientific.raw_popup_status.text() == "Loading selected frame…"
         _wait(page, qapp)
-        assert "3-0" in page._raw_popup.caption.text() and page.browser.current_result_frame_label() == "3-0"
-        page._raw_popup.close()
+        assert "3-0" in page.scientific.raw_popup_status.text() and page.browser.current_result_frame_label() == "3-0"
+        page.scientific.raw_popup_dialog.close()
         page.open_result(test_grouped_scans_are_screened_only_against_themselves(screened))
         _wait(page, qapp)
         items = [frames.item(i) for i in range(frames.count())]
@@ -120,5 +121,34 @@ def test_stitch_overlay_selection_stepping_and_read_back_live_in_ints_browser(qa
         page.clear_plot()
         assert page.browser.current_result() is None and page.browser.selected_results() == ()
         assert page.frames.count() == 0 and not page.raw_button.isEnabled()
+    finally:
+        _close(page, qapp)
+
+
+def test_a_contributing_frame_opens_in_the_views_own_raw_popup(qapp, tmp_path):
+    """Codex's Stitch/Int reuse audit R2a: the browser's Raw image opens the scientific view's own raw pop-up,
+    not a page-built dialog of its own. The frame stays through the page's own redraws, Full Raw reads it
+    again, and closing it releases the page's frame."""
+    from tests.core.test_analysis_stitch_auxiliary import _publish
+    path, raw, _project, _receipt = _publish(tmp_path)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.open_result(path)
+        _wait(page, qapp)
+        page.raw_button.click()
+        _wait(page, qapp)
+        view = page.scientific
+        assert view.raw_popup_shown() and view.raw_popup_dialog.windowTitle() == "Stitch contributing frame"
+        assert view.raw_popup_image.image.image is not None
+        assert view.raw_popup_status.text() == "2-0 · Thumbnail"
+        page._draw()  # the page's own redraw reconciles the view (Int 1D, no heavy frame)
+        assert view.raw_popup_image.image.image is not None
+        view.raw_popup_full.click()
+        _wait(page, qapp)
+        assert view.raw_popup_status.text() == "2-0 · Full Raw"
+        np.testing.assert_array_equal(page._raw_frame_view.raw, raw)
+        view.raw_popup_dialog.close()
+        qapp.processEvents()
+        assert page._raw_frame_view is None and view.raw_popup_image.canvas.raw_image.size == 0
     finally:
         _close(page, qapp)

@@ -460,7 +460,6 @@ class StitchPage(QtWidgets.QWidget):
         self._raw_revision = 0
         self._raw_request_revision = None
         self._raw_pending = False
-        self._raw_popup = None
         self._raw_frame_view = None
         self._calibration_dialog = None
         # Saved calibration-dialog inputs, applied when the dialog is created.
@@ -559,6 +558,8 @@ class StitchPage(QtWidgets.QWidget):
         self._background = PresentationBackgroundOwner(capacity_bytes=536_870_912)
         self._background_context = None  # what the background was set on (_background_scope)
         self.scientific.commandRequested.connect(self._view_command)
+        # a contributing frame opens in the view's own raw pop-up (Codex's Stitch/Int reuse audit R2)
+        self.scientific.rawPopupClosed.connect(self._raw_closed)
         self.curve = self.scientific.curve
         self._install_diagnostic_option()
         self.splitter.addWidget(self.scientific)
@@ -2176,8 +2177,8 @@ class StitchPage(QtWidgets.QWidget):
                              ready=False)
                 if update.action is StitchOwnerAction.METADATA and self._metadata_current():
                     self._metadata_dialog.status.setText(update.failure_message or update.failure_type)
-                if update.action is StitchOwnerAction.FRAME_READ and self._raw_popup is not None and self._raw_request_revision == self._raw_revision:
-                    self._raw_popup.caption.setText("Image unavailable · " + (update.failure_message or update.failure_type))
+                if update.action is StitchOwnerAction.FRAME_READ and self._raw_request_revision == self._raw_revision:
+                    self.scientific.show_raw_status("Image unavailable · " + (update.failure_message or update.failure_type))
             elif update.terminal_status is OperationTerminalStatus.CANCELLED:
                 self._queued_jobs.clear()
                 self._after_prepare = None
@@ -2243,7 +2244,7 @@ class StitchPage(QtWidgets.QWidget):
                          ready=bool(preflight.requests))
         elif outcome.kind is StitchOwnerOutcomeKind.FRAME_READ:
             if (self._raw_request_revision == self._raw_revision and not self._closing
-                    and self._raw_popup is not None and self._raw_popup.isVisible()
+                    and self.scientific.raw_popup_shown()
                     and self._current_payload() is not None
                     and outcome.artifact_path == self._current_payload().inspection.path):
                 self._raw_frame_view = outcome.frame_view
@@ -2377,8 +2378,8 @@ class StitchPage(QtWidgets.QWidget):
         self.browser.reconcile_result_frames(tuple(entries), entries[0].identifier if entries else None)
         if entries:
             self._frame_changed()  # the first frame current, as the list's own signal did
-        elif self._raw_popup is not None:
-            self._raw_popup.image.clear_image_buffers()
+        else:
+            self.scientific.show_raw_status("", clear_image=True)
         self._draw()
         if hasattr(self, "run_bar"):
             self._sync_actions()
@@ -2386,24 +2387,19 @@ class StitchPage(QtWidgets.QWidget):
     def _frame_changed(self, *_args):
         self._raw_revision += 1
         self._raw_frame_view = None
-        if self._raw_popup is not None and self._raw_popup.isVisible():
-            self._raw_popup.image.clear_image_buffers()
-            self._raw_popup.caption.setText("Loading selected frame…")
+        if self.scientific.raw_popup_shown():
+            self.scientific.show_raw_status("Loading selected frame…", clear_image=True)
             self._raw_pending = True
             QtCore.QTimer.singleShot(0, self._request_raw)
 
     def _show_raw(self):
-        from .raw_popup import StitchRawPopup
-        if self._raw_popup is None:
-            self._raw_popup = StitchRawPopup(self)
-            self._raw_popup.modeChanged.connect(self._frame_changed)
-            self._raw_popup.closed.connect(self._raw_closed)
-        self._raw_popup.show()
-        self._raw_popup.raise_()
+        """The current contributing frame in the view's own raw pop-up, in the mode it was last left in
+        (Thumbnail at first)."""
+        self.scientific.show_raw_popup("Stitch contributing frame", mode=self.scientific.raw_popup_mode())
         self._frame_changed()
 
     def _request_raw(self):
-        if self._closing or self._raw_popup is None or not self._raw_popup.isVisible():
+        if self._closing or not self.scientific.raw_popup_shown():
             self._raw_pending = False
             return
         if self._owner.busy or self._queued_jobs:
@@ -2417,13 +2413,26 @@ class StitchPage(QtWidgets.QWidget):
         self._raw_pending = False
         self._start("Loading contributing frame…", lambda: self._owner.begin_frame_read(
             payload, frame, scan=scan, source_root=str(self._value("project_root")) or None,
-            full_raw=self._raw_popup.mode.currentText() == "Full Raw"))
+            full_raw=self.scientific.raw_popup_mode() == "full"))
 
     def _render_raw(self):
-        if (self._raw_popup is not None and self._raw_popup.isVisible() and self._raw_frame_view is not None
-                and self.browser.current_result_frame() is not None):
-            self._raw_popup.render(self._raw_frame_view, label=self.browser.current_result_frame_label(),
-                color_map=self._view.color_map, log=self._view.log_scale)
+        """The read frame in the raw pop-up: its full raw image when Full Raw is chosen and the original is
+        readable, else its thumbnail, named with the reason."""
+        if (not self.scientific.raw_popup_shown() or self._raw_frame_view is None
+                or self.browser.current_result_frame() is None):
+            return
+        frame_view, label = self._raw_frame_view, self.browser.current_result_frame_label()
+        full = self.scientific.raw_popup_mode() == "full"
+        raw = frame_view.raw if full else None
+        image = raw if raw is not None else frame_view.thumbnail
+        if image is None:
+            self.scientific.show_raw_status(f"{label} · Image unavailable", clear_image=True)
+            return
+        mode = "Full Raw" if raw is not None else (
+            "Thumbnail · " + frame_view.extra.get("raw_unavailable_reason", "raw source unavailable") if full
+            else "Thumbnail")
+        self.scientific.show_raw_image(image, status=f"{label} · {mode}", color_map=self._view.color_map,
+                                       log_scale=self._view.log_scale)
 
     def _raw_closed(self):
         self._raw_revision += 1
@@ -2845,6 +2854,10 @@ class StitchPage(QtWidgets.QWidget):
             return
         if kind is ShellCommandKind.SET_BACKGROUND:
             self._toggle_background()
+            return
+        if kind is ShellCommandKind.SET_DETECTOR_MODE:  # the raw pop-up's Thumbnail / Full Raw
+            if command.path == ("popup",):
+                self._frame_changed()  # read the frame again in that mode
             return
         if kind is ShellCommandKind.CLEAR_1D:
             self.clear_plot()
