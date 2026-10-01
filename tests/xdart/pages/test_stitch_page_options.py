@@ -594,6 +594,36 @@ def test_the_experiment_rows_and_action_buttons_are_ints(qapp):
         _close(page, qapp)
 
 
+def test_stitchs_advanced_is_ints_advanced_dialog_with_its_three_groups(qapp):
+    """Codex's reuse audits (2026-10-01): Stitch's Advanced was its own QDialog of cards and a Close button, a
+    copy of Int's Advanced dialog. It is now Int's AdvancedDialog: its three groups of the page's shared rows,
+    non-modal, Close, retitled for the mode, locked while the page is busy."""
+    from pyqtgraph.Qt import QtWidgets
+    from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
+    from xdart.gui.widgets.controls_panel import SubsectionCard
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        assert isinstance(page.advanced, AdvancedDialog) and not page.advanced.isModal()
+        assert page.advanced.buttons.standardButtons() == QtWidgets.QDialogButtonBox.StandardButton.Close
+        cards = {card.title.text(): card for card in page.advanced.findChildren(SubsectionCard)}
+        assert set(cards) == {"Source and geometry", "Frames and sample", "Corrections"}
+        assert cards["Corrections"] is page.corrections_card
+        for title, keys in (("Source and geometry", ("geometry_kind", "detector_rows", "raw_dtype", "camera",
+                                                     "frame_step", "max_frame_mib", "output_family")),
+                            ("Frames and sample", ("frame_check", "sample_position")),
+                            ("Corrections", ("solid_angle", "polarization", "dark_path", "flat_cutoff"))):
+            assert all(cards[title].isAncestorOf(page._rows[key]) for key in keys), title
+        assert page.select_mode("Stitch 2D") and page.advanced.windowTitle() == "Advanced — Stitch 2D"
+        page.advanced_button.click()
+        qapp.processEvents()
+        assert page.advanced.isVisible()
+        page.advanced.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Close).click()
+        qapp.processEvents()
+        assert not page.advanced.isVisible()
+    finally:
+        _close(page, qapp)
+
+
 def test_the_sections_show_after_a_project_and_the_run_config_holds_during_a_run(qapp, tmp_path):
     """Int's panel rules: Source, Experiment and Processing show once a Project folder is named; the mode and
     Append/Replace are locked while the page is busy (Int locks them during a run)."""

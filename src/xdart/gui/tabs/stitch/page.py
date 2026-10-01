@@ -39,6 +39,7 @@ from xdart.gui.widgets.controls_panel import (
 )
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xdart.gui.widgets.scientific_plot import scaled_intensity_label
+from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
 from xdart.gui.tabs.scattering.shell_widgets import foldable
 from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
@@ -873,11 +874,9 @@ class StitchPage(QtWidgets.QWidget):
             self._rows[key].valueChanged.connect(self._processing_axis_changed)
         self._render_gi()
         self._map_card.setVisible(False)
-        self.advanced = QtWidgets.QDialog(self)
-        self.advanced.setWindowTitle("Advanced — Stitch 1D")
-        advanced_layout = QtWidgets.QVBoxLayout(self.advanced)
-        advanced_card = SubsectionCard("Source and geometry")
-        advanced_layout.addWidget(advanced_card)
+        # Int's Advanced dialog, its groups the page's shared rows (Codex's reuse audits, 2026-10-01)
+        self.advanced = AdvancedDialog(self, title="Advanced — Stitch 1D", object_name="stitchAdvancedDialog")
+        advanced_card = self.advanced.add_group("Source and geometry")
         fields = (
             ("detector_rows", "Rows", "195"), ("detector_cols", "Columns", "1475"),
             ("raw_dtype", "Data type", "int32"), ("raw_header_skip", "Header bytes", "0"),
@@ -911,8 +910,7 @@ class StitchPage(QtWidgets.QWidget):
             "nu_value; in fourc or twoc, del is the 2θ circle) follows that circle's motor under "
             "Calibrate ▸ 1 · Instrument, and editing it here renames that motor there. Any other "
             "position keeps the motor given here. An XU calibration defines its own.")
-        frames_card = SubsectionCard("Frames and sample")
-        advanced_layout.addWidget(frames_card)
+        frames_card = self.advanced.add_group("Frames and sample")
         self._field(frames_card, SectionId.PROCESSING, "frame_check", "Frame check",
                     "Exclude empty frames", choices=tuple(_FRAME_CHECKS))
         self._rows["frame_check"].setToolTip(
@@ -941,8 +939,7 @@ class StitchPage(QtWidgets.QWidget):
             row.draftChanged.connect(self._edited)
             frames_card.add_row(row)
         self._render_tilt(self._gi_catalog)
-        self.corrections_card = SubsectionCard("Corrections")
-        advanced_layout.addWidget(self.corrections_card)
+        self.corrections_card = self.advanced.add_group("Corrections")
         card = self.corrections_card
         self._field(card, SectionId.PROCESSING, "solid_angle", "Solid angle", "On", choices=("On", "Off"))
         self._rows["solid_angle"].setToolTip(
@@ -959,9 +956,6 @@ class StitchPage(QtWidgets.QWidget):
             "Flat pixels below this share of the flat's median are treated as dead and masked. "
             "Raise it to mask a region shadowed in the flat; lower it to keep weak but "
             "working pixels. 0 masks only zero, negative and non-finite pixels.")
-        close = QtWidgets.QPushButton("Close")
-        close.clicked.connect(self.advanced.close)
-        advanced_layout.addWidget(close)
         # Int's action row: Preview · Retry (after a failure) · Advanced
         buttons = self.controls.render_actions(processing, tuple(
             ControlActionSpec(action, label, SectionId.PROCESSING) for action, label in (
