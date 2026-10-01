@@ -18,6 +18,7 @@ from .controls_editing import (
     advanced_settings_values,
 )
 from xrd_tools.integrate.calibration import PONI_V3_SENSOR_MATERIALS
+from xdart.gui.widgets.controls_panel import SubsectionCard
 from xdart.gui.widgets.file_dialogs import CORRECTION_FILTER as _CORRECTION_FILTER
 
 #: Browse titles for the detector-correction images, by role.
@@ -37,7 +38,59 @@ class _DimensionEditors:
     error_model: QtWidgets.QComboBox
 
 
-class AdvancedSettingsDialog(QtWidgets.QDialog):
+class AdvancedDialog(QtWidgets.QDialog):
+    """Int's Advanced dialog for any page: the rarely changed settings, in titled groups.
+
+    The canonical owner of a page's Advanced settings (the architecture catalogue; Codex's reuse
+    audits, 2026-10-01). A page builds each group from the shared Controls rows (``FormRow``,
+    ``RangeRow``, the whole-number kind) and adds it with ``add_group``. Its rows commit as they are
+    edited, so the dialog has no values of its own and closes with Close. Int's integration editor
+    (``AdvancedSettingsDialog``) is the modal consumer: it adds its own groups with ``add_section``,
+    and returns its values only on OK.
+    """
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        title: str,
+        object_name: str = "advancedDialog",
+        accept_buttons: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName(object_name)
+        self.setWindowTitle(title)
+        layout = QtWidgets.QVBoxLayout(self)
+        self._sections = QtWidgets.QVBoxLayout()
+        layout.addLayout(self._sections)
+        self.buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+            if accept_buttons
+            else QtWidgets.QDialogButtonBox.StandardButton.Close
+        )
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def add_group(self, title: str, rows=()) -> SubsectionCard:
+        """A titled group of shared rows, below the groups before it; returns its card, to which
+        more rows can be added."""
+        card = SubsectionCard(title)
+        for row in rows:
+            card.add_row(row)
+        self._sections.addWidget(card)
+        return card
+
+    def add_section(self, item: QtWidgets.QWidget | QtWidgets.QLayout) -> None:
+        """An owner's own group (a widget or a layout), below the groups before it."""
+        if isinstance(item, QtWidgets.QLayout):
+            self._sections.addLayout(item)
+        else:
+            self._sections.addWidget(item)
+
+
+class AdvancedSettingsDialog(AdvancedDialog):
     """A combined 1D/2D editor containing values, not legacy widgets."""
 
     def __init__(
@@ -47,9 +100,12 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         path_chooser: Callable[[str, str], str | None] | None = None,
         correction_inspector: Callable[[str, str, float], object] | None = None,
     ) -> None:
-        super().__init__(parent)
-        self.setObjectName("vnextAdvancedSettingsDialog")
-        self.setWindowTitle("Integration — Advanced Settings")
+        super().__init__(
+            parent,
+            title="Integration — Advanced Settings",
+            object_name="vnextAdvancedSettingsDialog",
+            accept_buttons=True,
+        )
         self.setModal(True)
         self._gi_enabled: object = False
         self._path_chooser = (
@@ -57,7 +113,6 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         )
         # (role, path, flat cutoff) -> DetectorImageCheck, for the status lines.
         self._correction_inspector = correction_inspector
-        layout = QtWidgets.QVBoxLayout(self)
         self.gi_group = QtWidgets.QGroupBox(
             "Grazing-incidence Fiber integration"
         )
@@ -89,7 +144,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         )
         gi_form.addRow("Histogram backend", self.gi_method)
         self.gi_group.setVisible(False)
-        layout.addWidget(self.gi_group)
+        self.add_section(self.gi_group)
         self.poni_v3_group = QtWidgets.QGroupBox(
             "Detector sensor / parallax (PONI v3)"
         )
@@ -123,7 +178,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
             self._set_poni_v3_enabled
         )
         self._set_poni_v3_enabled(False)
-        layout.addWidget(self.poni_v3_group)
+        self.add_section(self.poni_v3_group)
         self.corrections_group = QtWidgets.QGroupBox("Detector corrections")
         self.corrections_group.setObjectName("vnextDetectorCorrectionsGroup")
         corrections_form = QtWidgets.QFormLayout(self.corrections_group)
@@ -156,7 +211,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
             lambda _value: self._refresh_status("flat")
         )
         corrections_form.addRow("Mask flat pixels below", self.flat_min_percent)
-        layout.addWidget(self.corrections_group)
+        self.add_section(self.corrections_group)
         forms = QtWidgets.QHBoxLayout()
         forms.setSpacing(12)
         self.one_d = self._dimension_group(
@@ -169,14 +224,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
             "Integrate 2D",
             ADVANCED_METHODS_2D,
         )
-        layout.addLayout(forms)
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok
-            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self.add_section(forms)
         self.resize(700, 720)
 
     def _correction_row(
@@ -469,4 +517,4 @@ def _optional_text(value: object) -> str:
     return "" if value is None else str(value)
 
 
-__all__ = ["AdvancedSettingsDialog"]
+__all__ = ["AdvancedDialog", "AdvancedSettingsDialog"]
