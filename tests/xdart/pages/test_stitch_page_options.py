@@ -713,7 +713,7 @@ def test_threshold_auto_shows_the_saturation_and_monitor_lists_the_scans_counter
     "the Monitor should be a dropdown widget with all the metadata columns that could be beam monitors of any kind
     listed (i0, i1, mon, monitor, bs, beamstop, pd, photod, etc). if in doubt, list it. if it clearly not a monitor
     (like a motor name), it can be dropped"."""
-    from xdart.gui.tabs.stitch.page import monitor_choices
+    from xdart.gui.tools.normalization_values import monitor_choices  # the shared group's (G8b)
     from tests.xdart.tools.test_stitch_native_values import _native_form
     assert monitor_choices(("Two Theta", "H", "K", "L", "Epoch", "Seconds", "Seconds", "mon", "det", "I0",
                             "pd1", "bstop", "Beamstop", "ic1", "temp")) == (

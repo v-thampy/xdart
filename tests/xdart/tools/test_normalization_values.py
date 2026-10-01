@@ -58,3 +58,24 @@ def test_the_projected_fields_grey_what_the_choice_does_not_read_and_list_the_sc
     assert [key for key, field in projected.items() if not field.enabled] == ["monitor"]
     assert projected["monitor"].reason == "Monitor is not read by Foil transmission × exposure."
     assert {key: field.label for key, field in projected.items()} == normalization.LABELS
+
+
+def test_the_groups_columns_are_the_scans_counters_from_its_header_cached_by_the_files_state(tmp_path):
+    """The group's columns for Stitch and RSM alike (G8b moved them from Stitch's page): a scan's ``#L``
+    counters but its ``#O`` motors, from the header alone; the file's (mtime, size) keys the cache, so an edited
+    file is read again; a file that cannot be read gives None, and Monitor's choices are then "None" alone."""
+    spec = tmp_path / "scans.spec"
+    header = "#F scans.spec\n#O0 eta  nu\n\n#S 1  a2scan eta 1 2 nu 3 4  1 1\n#P0 1 3\n"
+    spec.write_text(header + "#L eta  nu  I0  Seconds\n1 3 100 1\n")
+    state = spec.stat().st_mtime_ns, spec.stat().st_size
+    assert normalization.spec_counter_names(str(spec), state, None) == ("I0", "Seconds")
+    assert normalization.spec_counter_names(str(spec), state, "1.1") == ("I0", "Seconds")
+    spec.write_text(header + "#L eta  nu  mon  Seconds  det\n1 3 100 1 5\n")  # edited: a new state, read again
+    edited = spec.stat().st_mtime_ns, spec.stat().st_size
+    assert normalization.spec_counter_names(str(spec), edited, None) == ("mon", "Seconds", "det")
+    assert normalization.spec_counter_names(str(spec), state, None) == ("I0", "Seconds")  # the old key's
+    missing = tmp_path / "absent.spec"
+    assert normalization.spec_counter_names(str(missing), None, None) is None
+    assert normalization.spec_counter_names(str(spec), edited, "7.1") is None  # a scan the file lacks
+    assert normalization.monitor_choices(()) == ("None",)
+    assert normalization.monitor_choices(("Seconds", " ", "mon", "H")) == ("None", "mon", "Seconds")

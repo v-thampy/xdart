@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
+import functools
 import math
 
 from xrd_tools.session.readiness import ControlFieldKind, ControlFormField
@@ -43,6 +44,25 @@ TIPS = {
         "exp(−Σ count × length). They depend on the energy; the example notebook uses "
         "(1.06, 3.04, 4.64, 13.22) and (1.06, 3.04, 4.65, 9.5)."),
 }
+
+
+def monitor_choices(counters: Iterable[str]) -> tuple[str, ...]:
+    """"None" (no monitor), then the scan's counters as beam-monitor choices: likely monitors first, the
+    time stamp and H, K, L left out (``core.metadata.monitor_candidates``, which Int's Norm channel takes)."""
+    from xrd_tools.core.metadata import monitor_candidates
+    return (NONE, *monitor_candidates(name for name in counters if str(name).strip()))
+
+
+@functools.lru_cache(maxsize=8)
+def spec_counter_names(path: str, state: object, scan: str | None) -> tuple[str, ...] | None:
+    """A SPEC scan's counters (``#L`` columns but its motors) from its header alone, the group's columns;
+    ``state`` (the file's mtime and size) keys the cache so an edited file is read again. None when the file
+    cannot be read (silx's ``SfError`` is an ``OSError``)."""
+    from xrd_tools.io.spec import read_spec_scan_counter_names
+    try:
+        return tuple(read_spec_scan_counter_names(path, scan))
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
 
 
 def rows_in_use(choice: str) -> dict[str, bool]:
@@ -141,6 +161,6 @@ def normalization_fields(fields: Mapping[str, ControlFormField], values: Mapping
 __all__ = [
     "DEFAULT_EXPOSURE_COLUMN", "DEFAULT_FOIL_COLUMN", "DEFAULT_FOIL_LENGTHS", "FOIL_EXPOSURE", "LABELS",
     "MONITOR", "MONITOR_FOIL", "NONE", "NORMALIZATION_CHOICES", "NORMALIZATION_KEYS", "NormalizationSelection",
-    "TIPS", "choice_from", "normalization_fields", "normalization_selection", "parse_foil_lengths",
-    "rows_in_use",
+    "TIPS", "choice_from", "monitor_choices", "normalization_fields", "normalization_selection",
+    "parse_foil_lengths", "rows_in_use", "spec_counter_names",
 ]

@@ -260,13 +260,6 @@ _INTEGER_FIELDS = {
 }
 
 
-def monitor_choices(counters):
-    """"None" (no monitor), then the scan's counters as beam-monitor choices: likely monitors first, the
-    time stamp and H, K, L left out (``core.metadata.monitor_candidates``, which Int's Norm channel takes)."""
-    from xrd_tools.core.metadata import monitor_candidates
-    return ("None", *monitor_candidates(name for name in counters if name.strip()))
-
-
 #: The detector camera's eight values, "rows, columns" (xrayutilities' detectorDir1, detectorDir2), Stitch's
 #: frame first: an image rotation of 0 before the camera (maintainer, 2026-09-30).
 CAMERAS = tuple(f"{rows}, {columns}" for rows, columns in (
@@ -293,16 +286,6 @@ def camera_orientation(text) -> ImageOrientation:
     if len(parts) != 2:
         raise ValueError("choose the detector camera (Advanced): its rows' and columns' directions, e.g. x-, z+")
     return stitch_orientation(DetectorCamera(*parts))
-
-
-@functools.lru_cache(maxsize=8)
-def _spec_counter_names(path, _state, scan):
-    """A SPEC scan's counters (``#L`` columns but its motors) from its header alone, or None unread."""
-    from xrd_tools.io.spec import read_spec_scan_counter_names
-    try:
-        return read_spec_scan_counter_names(path, scan)
-    except (OSError, ValueError, KeyError, IndexError):
-        return None
 
 
 @functools.lru_cache(maxsize=8)
@@ -952,19 +935,20 @@ class StitchPage(QtWidgets.QWidget):
                                        else first[0] if "." in first[0] else f"{first[0]}.1")  # SPEC's N.M key
 
     def _monitor_choices(self, keep):
-        """Monitor's choices: the first selected SPEC scan's counters (``monitor_choices``), and ``keep``
-        (the value chosen or restored) whatever that scan records."""
+        """Monitor's choices: the first selected SPEC scan's counters (the shared group's
+        ``monitor_choices``), and ``keep`` (the value chosen or restored) whatever that scan records."""
         first = self._first_spec_scan()
-        counters = (None if first is None else _spec_counter_names(first[0], _file_states(first[0]), first[1]))
-        choices = monitor_choices(counters or ())
+        counters = (None if first is None
+                    else normalization.spec_counter_names(first[0], _file_states(first[0]), first[1]))
+        choices = normalization.monitor_choices(counters or ())
         keep = str(keep or "").strip() or "None"
         return choices if keep in choices else (*choices, keep)
 
     def _scan_columns(self):
         """The first selected SPEC scan's counters, for the foil and exposure columns (all of them)."""
         first = self._first_spec_scan()
-        return tuple((None if first is None else _spec_counter_names(first[0], _file_states(first[0]),
-                                                                      first[1])) or ())
+        return tuple((None if first is None else normalization.spec_counter_names(
+            first[0], _file_states(first[0]), first[1])) or ())
 
     def _refresh_monitor_choices(self):
         """On a committed source or scan edit (Codex audit G-F2): the new scan's counters, for the whole
