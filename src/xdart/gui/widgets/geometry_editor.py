@@ -91,9 +91,9 @@ class GeometryEditor(QtWidgets.QWidget):
             self._zeros[circle] = zero
             self._rows[circle] = row
             self._form.addRow(QtWidgets.QLabel(), row)
-        # the frame the axes below are given in (a small schematic can replace this line later)
-        self.frame_note = QtWidgets.QLabel(f'Lab frame: {LAB_FRAME}. Each circle turns right-handed about '
-                                           'the axis beside it for a positive angle.')
+        # the frame the axes below are given in, and the geometry's standard axes (a small schematic can
+        # replace this line later); _show_rows writes it
+        self.frame_note = QtWidgets.QLabel()
         self.frame_note.setObjectName('geometryFrameNote')
         self.frame_note.setWordWrap(True)
         self._form.addRow(self.frame_note)
@@ -183,6 +183,12 @@ class GeometryEditor(QtWidgets.QWidget):
         self._form.setRowVisible(self.plane, geometry != 'psic')
         shown = InstrumentGeometry(geometry, plane='vertical' if geometry == 'psic' else self.plane.currentData())
         plays = shown.as_psic()
+        # the selected geometry's standard axes (maintainer, 2026-09-30: "add the default directions for the
+        # different motors as per standard psic, or fourc or twoc when they are selected")
+        name = geometry if geometry == 'psic' else f'{geometry} ({shown.plane} plane)'
+        standard = ', '.join(f'{circle} {axis}' for circle, axis in shown.circle_axes())
+        self.frame_note.setText(f'Lab frame: {LAB_FRAME}. Each circle turns right-handed about the axis beside '
+                                f'it for a positive angle; standard {name}: {standard}.')
         for circle, combo in self._motors.items():
             self._form.setRowVisible(self._rows[circle], circle in circles)
             label = self._form.labelForField(self._rows[circle])

@@ -58,15 +58,22 @@ def test_the_editor_states_the_lab_frame_and_each_circles_axis(qapp):
     label = lambda circle: editor._form.labelForField(editor._rows[circle]).text()  # noqa: E731
     axis = lambda circle: editor.axis_box(circle).currentText()  # noqa: E731
     choices = lambda circle: [editor.axis_box(circle).itemText(i) for i in range(2)]  # noqa: E731
-    assert 'x up, y along the beam' in editor.frame_note.text()
+    note = editor.frame_note.text
+    assert 'x up, y along the beam' in note()
+    # the selected geometry's standard axes (maintainer, 2026-09-30: "add the default directions for the
+    # different motors as per standard psic, or fourc or twoc when they are selected")
+    assert note().endswith('standard psic: mu x+, eta z-, chi y+, phi z-, nu x+, del z-.')
     assert [axis(c) for c in ('mu', 'eta', 'chi', 'phi', 'nu', 'del')] == ['x+', 'z-', 'y+', 'z-', 'x+', 'z-']
     assert choices('nu') == ['x+', 'x-'] and choices('del') == ['z-', 'z+'] and choices('chi') == ['y+', 'y-']
     assert label('mu') == 'mu (sample)' and label('del') == 'del (detector)  ·  used by Stitch'
     assert 'xrayutilities' in editor.axis_box('nu').toolTip() and 'grazing' in editor.axis_box('chi').toolTip()
     editor.set_value(InstrumentGeometry('twoc', plane='horizontal'))
     assert (axis('th'), axis('tth')) == ('x+', 'x+')
+    assert note().endswith('standard twoc (horizontal plane): th x+, tth x+.')
     editor.set_value(InstrumentGeometry('twoc'))
-    assert axis('tth') == 'z-'
+    assert axis('tth') == 'z-' and note().endswith('standard twoc (vertical plane): th z-, tth z-.')
+    editor.geometry.setCurrentIndex(editor.geometry.findData('fourc'))  # selected in the box, as he would
+    assert note().endswith('standard fourc (vertical plane): th z-, chi y+, phi z-, tth z-.')
     # 17-2's psic until November 2026: [x-, z-, y-, z-], [x-, z-]
     editor.set_value(InstrumentGeometry())
     changed = []
@@ -75,6 +82,7 @@ def test_the_editor_states_the_lab_frame_and_each_circles_axis(qapp):
         editor.axis_box(circle).setCurrentIndex(editor.axis_box(circle).findData(-1))
     beamline = editor.value()
     assert changed and beamline.reversed_circles == ('mu', 'chi', 'nu')
+    assert note().endswith('standard psic: mu x+, eta z-, chi y+, phi z-, nu x+, del z-.')  # psic's, whatever chosen
     assert [value for _circle, value in beamline.circle_axes()] == ['x-', 'z-', 'y-', 'z-', 'x-', 'z-']
     editor.set_value(InstrumentGeometry())  # psic's again
     assert editor.value().reversed_circles == () and axis('nu') == 'x+'
