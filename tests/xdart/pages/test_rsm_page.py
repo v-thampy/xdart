@@ -330,13 +330,29 @@ def test_each_pane_carries_the_frames_own_axis_labels(qapp, make, names):
 @pytest.mark.slow
 def test_scan43_through_the_page_commits_and_reopens_the_reference_result(qapp, rsm_r2_project):  # noqa: F811
     """Real data: STO scan 43 at 40³ run from the page (its preset member, the canonical asset, the
-    suggested output) commits the independent oracle's pinned result (test_rsm_operation_r2_real_data),
-    paints it, and Open… reads the same result back from the file."""
-    expected = _SCIENCE[((43,), 40)]["result"]
+    suggested output) commits the same result as the headless run of the page's own form, paints it, and
+    Open… reads the same result back from the file.
+
+    The page's form carries decision 5's defaults (solid angle and polarization on), so its result is not the
+    independent oracle's pinned one (test_rsm_operation_r2_real_data, every correction off): with them off, the
+    form reproduces it. A default-on scan-43 reference is pinned after C7's integer-HKL row (decision 2)."""
+    from dataclasses import replace
+    from xrd_tools.analysis.rsm_operation import RSMFrameCorrections, run_rsm_operation_v2
+    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
     page = _page(qapp)
     try:
         page.set_field("project_root", str(rsm_r2_project))
         assert page._readiness[1], page._readiness
+        form = page.build_form()
+        assert form.corrections == RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
+        headless = Path(rsm_r2_project) / "rsm-page-headless.nexus"
+        off = run_rsm_operation_v2(prepare_rsm_tool_v2(replace(
+            form, output_path=headless, output_family=None, corrections=RSMFrameCorrections())).request)
+        assert off.payload.result_fingerprint == _SCIENCE[((43,), 40)]["result"]
+        on = run_rsm_operation_v2(prepare_rsm_tool_v2(replace(
+            form, output_path=headless.with_name("rsm-page-headless-on.nexus"), output_family=None)).request)
+        expected = on.payload.result_fingerprint
+        assert expected != off.payload.result_fingerprint
         page.begin_run()
         _wait(page, qapp, lambda: not page.active(), seconds=600)
         output = page._value("output_path")

@@ -399,7 +399,9 @@ class RSMToolFormV2:
     #: page suggested; persisted with the result as native Stitch persists its own (AUD-9 stage 2).
     output_family: str | None = None
     #: The per-frame corrections RSM shares with Stitch (``RSMFrameCorrections``; AUD-9 stage 2b); None: none.
-    corrections: RSMFrameCorrections | None = None
+    #: Decision 5 (maintainer, 2026-10-01, "turn on by default"): the solid angle and polarization, at
+    #: Stitch's 0.99.
+    corrections: RSMFrameCorrections | None = RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:

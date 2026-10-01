@@ -9,6 +9,7 @@ import shutil
 import numpy as np
 import pytest
 
+from xrd_tools.analysis.rsm_operation import RSMFrameCorrections
 from xdart.gui.tools.rsm_values import (
     RSMFrameSelector,
     RSMScanMemberForm,
@@ -186,6 +187,9 @@ def _form(
         preset.max_frame_bytes,
         preset.max_chunk_bytes,
         project / f"rsm-r2-{'-'.join(str(item) for item in scans)}-{bins}.nexus",
+        # the references were made before the solid angle and polarization (decision 5, on by default in the
+        # form): every correction explicitly off, as row A (test_rsm_frame_corrections)
+        corrections=RSMFrameCorrections(),
     )
 
 

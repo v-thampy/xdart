@@ -32,6 +32,7 @@ from xrd_tools.analysis.rsm_geometry_asset import (
     install_canonical_rsm_geometry_asset,
     rsm_geometry_asset_input,
 )
+from xrd_tools.analysis.rsm_operation import RSMFrameCorrections
 from xrd_tools.analysis.rsm_operation import (
     RSMImageConditioning,
     RSMNormalizationPolicy,
@@ -122,6 +123,9 @@ def _form(root: Path, members: tuple[RSMScanMemberForm, ...]) -> RSMToolFormV2:
         16 * 1024 * 1024,
         output / "rsm-v2.nexus",
         AnalysisArtifactOverwrite.CREATE_NEW,
+        # these rows pin the grid, attestation and q-call contracts without corrections; the default form's
+        # header-shaped weights are test_the_default_form_grids_with_header_shaped_weights
+        corrections=RSMFrameCorrections(),
     )
 
 
@@ -2492,3 +2496,42 @@ def test_v2_persists_its_slot_family_as_native_stitch_does(tmp_path, monkeypatch
     assert json.loads(provenance)["output"]["artifact_family"] == "sto_43"
     with pytest.raises(ValueError, match="stable slot"):
         replace(form, output_path=target.with_name("other.nexus"))
+
+
+def test_the_default_form_grids_with_header_shaped_weights(tmp_path, monkeypatch):
+    """Decision 5 (maintainer, 2026-10-01: "turn on by default"): the form's default corrections, the solid angle
+    and polarization at Stitch's 0.99, grid the synthetic two-member fixture with the detector header's shape
+    (the canonical Pilatus 100K) and commit; the same members with every correction off commit another volume."""
+    from dataclasses import replace
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+    monkeypatch.setattr(rsm_operation, "_resolve_exact_rsm_q_bounds_active",
+                        lambda *_args, **_kwargs: ((-8.0, 8.0), (-8.0, 8.0), (-8.0, 8.0)))
+
+    def full_detector_frame(self, index):  # as the science rows above: the canonical detector's frames
+        ordinal = int(str(self.name).split(" [", 1)[0].rsplit("_", 1)[-1])
+        return np.full((195, 487), 10 + ordinal + int(index), dtype=np.float64)
+    monkeypatch.setattr(SpecSource, "load_frame", full_detector_frame)
+    members = (_write_member(tmp_path, 0), _write_member(tmp_path, 1))
+    form = replace(_form(tmp_path, members), corrections=RSMToolFormV2.__dataclass_fields__["corrections"].default)
+    assert form.corrections == RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
+    shapes = []
+    real = rsm_operation._rsm_chunk_weights
+
+    def spy(*args, **kwargs):
+        weights = real(*args, **kwargs)
+        if weights is not None:  # every correction off: no weight, as before
+            shapes.append(weights.shape)
+        return weights
+    monkeypatch.setattr(rsm_operation, "_rsm_chunk_weights", spy)
+    on = rsm_operation.run_rsm_operation_v2(prepare_rsm_tool_v2(form).request)
+    weighted = len(shapes)
+    assert on.terminal.disposition is ModuleDisposition.COMMITTED, on.terminal
+    roi = prepare_rsm_tool_v2(form).request.plan.effective_geometry.roi
+    cropped = np.empty((195, 487))[roi[0]:roi[1], roi[2]:roi[3]].shape  # the ROI as the gridder crops it
+    assert shapes and all(shape[-2:] == cropped for shape in shapes), (shapes, roi)
+    off = rsm_operation.run_rsm_operation_v2(prepare_rsm_tool_v2(replace(
+        form, output_path=Path(form.output_path).with_name("rsm-v2-off.nexus"),
+        corrections=RSMFrameCorrections())).request)
+    assert off.terminal.disposition is ModuleDisposition.COMMITTED, off.terminal
+    assert on.payload.result_fingerprint != off.payload.result_fingerprint
+    assert len(shapes) == weighted  # the off run took no weight
