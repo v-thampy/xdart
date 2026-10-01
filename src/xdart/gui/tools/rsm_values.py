@@ -764,6 +764,66 @@ def rsm_tool_preset(
     )
 
 
+def rsm_frame_selector(first, last, step) -> RSMFrameSelector:
+    """The frame labels as typed (the RSM page's one range for every member, as Stitch's): First a whole number
+    from 0, Step one from 1 and Last blank (to the source's end) or a whole number from First. A ValueError
+    names the first field that is not."""
+    numbers = []
+    for name, value in (("First frame", first), ("Frame step", step)):
+        try:
+            numbers.append(value if type(value) is int else int(str(value).strip()))
+        except ValueError:
+            raise ValueError(f"{name} must be a whole number, not {str(value).strip()!r}") from None
+    start, step = numbers
+    text = str(last if last is not None else "").strip()
+    try:
+        stop = None if not text else int(text)
+    except ValueError:
+        raise ValueError(f"Last frame must be blank or a whole number, not {text!r}") from None
+    if start < 0:
+        raise ValueError("First frame must be 0 or more")
+    if step < 1:
+        raise ValueError("Frame step must be 1 or more")
+    if stop is not None and stop < start:
+        raise ValueError("Last frame must not come before First frame")
+    return RSMFrameSelector(start, stop, step)
+
+
+def format_rsm_angle_mapping(motor_selectors) -> str:
+    """The six psic roles' columns as the Angle mapping row shows them: ``mu=Mu, eta=Theta, ...``, a repeated
+    SPEC column's occurrence as ``#n`` (``nu=Nu#1``)."""
+    return ", ".join(f"{role}={selector.name}" + (f"#{selector.occurrence}" if selector.occurrence else "")
+                     for role, selector in motor_selectors)
+
+
+def parse_rsm_angle_mapping(text) -> tuple[tuple[str, MetadataColumnSelector], ...]:
+    """The Angle mapping row's ``role=column[#n]`` pairs (commas, semicolons or lines), every psic role exactly
+    once, in psic's order. A ValueError names what is wrong."""
+    pairs = {}
+    for part in re.split(r"[,;\n]+", str(text or "")):
+        if not part.strip():
+            continue
+        role, sep, column = (item.strip() for item in part.partition("="))
+        if not sep or not role or not column:
+            raise ValueError(f"Angle mapping: {part.strip()!r} is not role=column")
+        if role not in _PSIC_ROLES:
+            raise ValueError(f"Angle mapping: {role!r} is not a psic circle ({', '.join(_PSIC_ROLES)})")
+        if role in pairs:
+            raise ValueError(f"Angle mapping: {role} is given twice")
+        name, hash_mark, occurrence = column.partition("#")
+        try:
+            index = int(occurrence) if hash_mark else 0
+        except ValueError:
+            raise ValueError(f"Angle mapping: {column!r} has no whole-number occurrence after #") from None
+        if not name.strip() or index < 0:
+            raise ValueError(f"Angle mapping: {column!r} is not a column")
+        pairs[role] = MetadataColumnSelector(name.strip(), index)
+    missing = [role for role in _PSIC_ROLES if role not in pairs]
+    if missing:
+        raise ValueError(f"Angle mapping: {', '.join(missing)} not given")
+    return tuple((role, pairs[role]) for role in _PSIC_ROLES)
+
+
 @dataclass(slots=True)
 class RSMMemberDraft:
     """One ordered RSM member as an editor holds it (text and numbers, not yet a validated
@@ -822,28 +882,8 @@ class RSMMemberDraft:
         )
 
     def frame_selector(self) -> RSMFrameSelector:
-        """The member's frame labels as typed: First a whole number from 0, Step one from 1 and Last
-        blank (to the source's end) or a whole number from First. A ValueError names the first field
-        that is not."""
-        numbers = []
-        for name, value in (("First frame", self.frame_start), ("Frame step", self.frame_step)):
-            try:
-                numbers.append(value if type(value) is int else int(str(value).strip()))
-            except ValueError:
-                raise ValueError(f"{name} must be a whole number, not {str(value).strip()!r}") from None
-        start, step = numbers
-        last = str(self.frame_stop).strip()
-        try:
-            stop = None if not last else int(last)
-        except ValueError:
-            raise ValueError(f"Last frame must be blank or a whole number, not {last!r}") from None
-        if start < 0:
-            raise ValueError("First frame must be 0 or more")
-        if step < 1:
-            raise ValueError("Frame step must be 1 or more")
-        if stop is not None and stop < start:
-            raise ValueError("Last frame must not come before First frame")
-        return RSMFrameSelector(start, stop, step)
+        """The member's frame labels as typed (``rsm_frame_selector``)."""
+        return rsm_frame_selector(self.frame_start, self.frame_stop, self.frame_step)
 
     def selected_count_text(self) -> str:
         try:

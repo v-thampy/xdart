@@ -22,7 +22,6 @@ from xdart.gui.tabs.rsm.display import rsm_keyed_projection
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tools import rsm_owner
 from xdart.gui.tools.rsm_tool import RSMToolDialog
-from xdart.gui.tools.rsm_values import RSMMemberDraft
 from xrd_tools.analysis.module_transaction import ModuleDisposition, ModuleTerminalResult
 from xrd_tools.analysis.rsm_operation import RSMOperationExecutionV2, RSMOperationResultV2
 from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
@@ -30,7 +29,7 @@ from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 from tests.core.test_rsm_calibration_geometry import _canonical_partner
 from tests.core.test_rsm_operation_r2_real_data import _SCIENCE, rsm_r2_project  # noqa: F401
 from tests.xdart.tools.test_rsm_tool_dialog import (  # noqa: F401
-    _Owner, _Status, _q_values, _values, _write_member, qapp,
+    _Owner, _Status, _q_values, _values, qapp,
 )
 
 
@@ -88,9 +87,15 @@ def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
     dialog = RSMToolDialog(empty_host_services(_Status()), owner=_Owner())
     try:
         output = tmp_path / "rsm.nexus"
+        _sto_align(tmp_path)  # the preset's scan on disk: the page finds its member through Stitch's Source
         page.set_field("project_root", str(tmp_path))
         page.set_field("geometry_path", _canonical_partner(tmp_path))
         page.set_field("output_path", str(output))
+        page.set_sources(["STO_align"])  # Project relative, as the preset names it
+        for key, value in (("scan", "43"), ("image_dir", "images"), ("image_stem", "b_thampy_STO_align_scan43_"),
+                           ("frame_last", "60")):
+            page.set_field(key, value)
+        page.resolve_source()
         dialog.project_edit.setText(str(tmp_path))
         dialog._apply_scan43_preset()
         dialog.output_edit.setText(str(output))
@@ -113,30 +118,61 @@ def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
         dialog.shutdown()
 
 
-def _synthetic_members(root):
-    """Two ordered synthetic SPEC members on disk (the RSM dialog tests' fixture) and a calibration encoding the
-    canonical geometry (row B's, AUD-9 stage 2b C7b: the page's geometry is its Calibration row's)."""
+def _spec_scan(number, mu):
+    """One scan of the RSM dialog tests' synthetic member (two points; eta and the normalization columns, a
+    repeated Seconds among them)."""
+    return (f"#S {number} ascan eta {number - 1} {number} 1 1\n#D Mon Jan 15 10:30:00 2024\n"
+            f"#P0 13000.007 {mu} 20 30 40 50\n#G3 1 0 0 0 1 0 0 0 1\n#N 4\n#L eta  Seconds  Seconds  foil status\n"
+            f"{number - 1}.0 1 10 101\n{number}.0 2 20 110\n")
+
+
+def _spec_file(path, scans):
+    path.write_text(f"#F {path.name}\n#E 1\n#D Mon Jan 15 10:30:00 2024\n#O0 energy  mu  chi  phi  nu  del\n\n"
+                    + "\n".join(scans), encoding="utf-8")
+
+
+def _synthetic_source(root, *, full=False):
+    """One synthetic SPEC file with two scans and their images (the RSM dialog tests' member, read through Stitch's
+    Source: groups never span files), named for the blank Image stem (<SPEC name>_scan<N>_), and a calibration
+    encoding the canonical geometry (row B's, AUD-9 stage 2b C7b: the page's geometry is its Calibration row's).
+    ``full``: frames of the calibrated detector's shape, for a real gridding."""
+    import tifffile
     _canonical_partner(root)
-    drafts = []
-    for ordinal in range(2):
-        form = _write_member(root, ordinal)
-        selectors = tuple(selector for _role, selector in form.motor_selectors)
-        drafts.append(RSMMemberDraft(
-            str(Path(form.spec_path).relative_to(root)), form.scan, str(Path(form.image_dir).relative_to(root)),
-            form.image_stem, 0, "1", 1, form.detector_shape[0], form.detector_shape[1], "uint16", 0,
-            tuple(selector.name for selector in selectors), tuple(selector.occurrence for selector in selectors)))
-    return drafts
+    images = root / "source" / "images"
+    images.mkdir(parents=True)
+    _spec_file(root / "source" / "RSM_synth", [_spec_scan(scan, 9 + scan) for scan in (1, 2)])
+    for scan in (1, 2):
+        for label in range(2):
+            frame = (np.full((195, 487), 9 + scan + label, dtype=np.uint16) if full
+                     else np.arange(20, dtype=np.uint16).reshape(4, 5) + scan - 1 + label)
+            tifffile.imwrite(images / f"RSM_synth_scan{scan}_{label:04d}.tif", frame)
+    return root / "source" / "RSM_synth"
 
 
-def _with_members(page, root, drafts):
+def _sto_align(root):
+    """The scan-43 preset's SPEC file, scan and image names, two frames: the dialog's preset member on disk."""
+    import tifffile
+    (root / "images").mkdir()
+    _spec_file(root / "STO_align", [_spec_scan(43, 10)])
+    for label in range(2):
+        tifffile.imwrite(root / "images" / f"b_thampy_STO_align_scan43_{label:04d}.tif",
+                         np.arange(20, dtype=np.uint16).reshape(4, 5) + label)
+
+
+def _with_source(page, root, scans="[1-2]"):
+    """The page on the synthetic source: its two scans one RSM (Stitch's Selection), the Images folder Project
+    relative, and the scans found as Preview and Run find them (``resolve_source``)."""
     page.set_field("project_root", str(root))
     page.set_field("geometry_path", "calibration/rsm_canonical.json")
-    page._members = drafts
-    page._load_member(0)
+    page.set_sources([str(root / "source" / "RSM_synth")])
+    page.set_field("scan", scans)
+    page.set_field("image_dir", "source/images")
+    page.set_field("adv_dtype", "uint16")
     page.set_field("normalization", "Identity")
     page.set_field("offset", "0")
     page.set_field("high_threshold", "")
     page.set_field("static_hot", "")
+    page.resolve_source()
 
 
 class _Committed:
@@ -166,10 +202,11 @@ def test_preview_lists_every_identity_and_run_paints_the_committed_six(qapp, tmp
     _commit_instead_of_gridding(monkeypatch, _values())
     page = _page(qapp)
     try:
-        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
         assert page._readiness[1], page._readiness
         output = Path(page._value("output_path"))
-        assert str(output) == suggested_output(tmp_path, page._members)
+        assert str(output) == suggested_output(tmp_path, page.build_form().members)
         page.begin_preview()
         _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text())
         assert not output.parent.exists()  # Preview creates nothing (stage 2)
@@ -208,7 +245,8 @@ def test_typing_in_a_field_then_run_runs_the_typed_inputs(qapp, tmp_path, monkey
     page = _page(qapp)
     page.show()
     try:
-        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
         page.activateWindow()
         editor = page._rows["output_path"].editor
         editor.setFocus()
@@ -239,7 +277,8 @@ def test_stop_cancels_a_run(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(RSMOperationExecutionV2, "run", run)
     page = _page(qapp)
     try:
-        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
         page.begin_run()
         _wait(page, qapp, lambda: bool(started))
         assert page.active() and page.run_bar.stopButton.isEnabled()
@@ -352,7 +391,11 @@ def test_scan43_through_the_page_commits_and_reopens_the_reference_result(qapp, 
     try:
         page.set_field("project_root", str(rsm_r2_project))
         page.set_field("geometry_path", _canonical_partner(rsm_r2_project))
+        page.set_sources(["STO_align"])  # the preset's scan as Stitch's Source rows (design §2)
+        page.set_field("scan", "43")
+        page.set_field("image_dir", "images")  # the stem blank (STO_align_scan43_) and Last blank (to 60)
         assert page._readiness[1], page._readiness
+        page.resolve_source()
         form = page.build_form()
         assert form.corrections == RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
         headless = Path(rsm_r2_project) / "rsm-page-headless.nexus"
@@ -383,19 +426,20 @@ def test_scan43_through_the_page_commits_and_reopens_the_reference_result(qapp, 
 # Codex's stage-1 review (2026-10-01, REWORK), its reproductions adapted
 
 
-@pytest.mark.parametrize("key", ("member_first", "member_step"))
-def test_invalid_frame_text_stays_as_typed_and_is_refused(qapp, tmp_path, key):
+@pytest.mark.parametrize(("key", "label"), (("frame_first", "First frame"), ("frame_step", "Frame step")))
+def test_invalid_frame_text_stays_as_typed_and_is_refused(qapp, tmp_path, key, label):
     """F1: a First or Step that is not a whole number stays as typed, and readiness and the form refuse it;
-    the member's earlier numbers no longer run unseen."""
+    the earlier numbers never run unseen. Stitch's one frame range, in Advanced (design §2)."""
     page = _page(qapp)
     try:
-        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
         assert page._readiness[1], page._readiness
         page.set_field(key, "invalid")
-        assert page._value(key) == "invalid" and page.member_table.item(0, 3).text() == "invalid"
-        assert not page._readiness[1] and "member 1's frames" in page._readiness[0]
+        assert page._value(key) == "invalid"
+        assert not page._readiness[1] and f"Advanced {label} ('invalid' is not a whole number)" in page._readiness[0]
         assert not page.run_bar.startButton.isEnabled()
-        with pytest.raises(ValueError, match="must be a whole number"):
+        with pytest.raises(ValueError, match="is not a whole number"):
             page.build_form()
     finally:
         _close(page, qapp)
@@ -403,25 +447,25 @@ def test_invalid_frame_text_stays_as_typed_and_is_refused(qapp, tmp_path, key):
 
 def test_the_advanced_settings_are_ints_advanced_dialog_of_shared_rows(qapp, tmp_path):
     """Codex's reuse audits (2026-10-01): RSM's Advanced was its own dialog of raw spin boxes, a combo and line
-    edits. It is Int's AdvancedDialog of shared rows: the selected member's raw decoder and psic motor columns,
-    the column occurrences, and the chunk and memory. A refused whole number is named by readiness and refused
-    by the form, so the member's earlier number never runs unseen (Codex F1); a valid one reaches the member and
-    the form; each member shows its own."""
+    edits. It is Int's AdvancedDialog of shared rows: Stitch's Source and geometry (one raw decoder, Angle
+    mapping and frame range for every scan, design §2), the column occurrences, and the chunk and memory. A
+    refused whole number is named by readiness and refused by the form, so an earlier number never runs unseen
+    (Codex F1); a valid one reaches every member once the scans are found again."""
     from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
     from xdart.gui.widgets.controls_panel import FormRow, SubsectionCard
     page = _page(qapp)
     try:
-        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
         assert isinstance(page.advanced, AdvancedDialog) and not page.advanced.isModal()
         cards = {card.title.text(): card for card in page.advanced.findChildren(SubsectionCard)}
-        assert set(cards) == {"Raw decoder (selected member)", "psic motor columns (selected member)",
-                              "Motor column occurrences (selected member)", "Normalization column occurrences",
-                              "Chunk and memory"}
+        assert set(cards) == {"Source and geometry", "Normalization column occurrences", "Chunk and memory"}
         page.set_field("adv_foil_occurrence", "-1")  # a normalization occurrence is Processing's
         assert "Advanced Foil column occurrence" in page._headers["processing"].detail
         page.set_field("adv_foil_occurrence", "0")
-        assert all(type(page._rows[key]) is FormRow and cards["Raw decoder (selected member)"].isAncestorOf(
-            page._rows[key]) for key in ("adv_rows", "adv_columns", "adv_dtype", "adv_header"))
+        assert all(type(page._rows[key]) is FormRow and cards["Source and geometry"].isAncestorOf(page._rows[key])
+                   for key in ("adv_rows", "adv_columns", "adv_dtype", "adv_header", "adv_angle_mapping",
+                               "frame_first", "frame_last", "frame_step"))
         assert page._readiness[1], page._readiness
         page.set_field("adv_rows", "abc")
         assert page._value("adv_rows") == "abc" and not page._readiness[1]
@@ -429,33 +473,38 @@ def test_the_advanced_settings_are_ints_advanced_dialog_of_shared_rows(qapp, tmp
         assert not page.run_bar.startButton.isEnabled()
         with pytest.raises(ValueError, match=r"Advanced: Rows \('abc' is not a whole number\)"):
             page.build_form()
-        page.set_field("adv_rows", str(page._members[0].detector_rows))
+        page.set_field("adv_rows", "195")
         page.set_field("adv_chunk", "0")  # below the row's minimum, in Processing
         assert "Advanced Frames per chunk" in page._readiness[0]
         page.set_field("adv_chunk", "4")
         page.set_field("adv_header", "16")
         assert page._readiness[1], page._readiness
+        with pytest.raises(ValueError, match="not found yet"):  # a decoder edit: the scans are found again
+            page.build_form()
+        page.resolve_source()
         form = page.build_form()
-        assert form.chunk_size == 4 and form.members[0].raw_header_skip == 16
-        second = page._members[1].raw_header_skip
-        page._load_member(1)  # each member shows its own decoder
-        assert page._value("adv_header") == str(second)
-        page._load_member(0)
-        assert page._value("adv_header") == "16"
+        assert form.chunk_size == 4 and [member.raw_header_skip for member in form.members] == [16, 16]
     finally:
         _close(page, qapp)
 
 
-def test_a_zero_frame_step_is_refused_without_a_table_exception(qapp, tmp_path):
-    """F1: Step 0 divided in the member table's frame count before anything refused it."""
+def test_a_zero_frame_step_or_a_last_before_the_first_is_refused(qapp, tmp_path):
+    """F1: Step 0 divided in the member table's frame count before anything refused it. The one range refuses
+    it as a row, and a Last before the First by ``rsm_frame_selector``, in readiness and in the form."""
     page = _page(qapp)
     try:
-        _with_members(page, tmp_path, _synthetic_members(tmp_path))
-        page.set_field("member_step", "0")
-        assert page.member_table.item(0, 3).text() == "invalid"
-        assert not page._readiness[1] and "Frame step must be 1 or more" in page._readiness[0]
-        with pytest.raises(ValueError, match="Frame step must be 1 or more"):
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        page.set_field("frame_step", "0")
+        assert not page._readiness[1] and "Advanced Frame step (must be at least 1)" in page._readiness[0]
+        with pytest.raises(ValueError, match=r"Frame step \(must be at least 1\)"):
             page.build_form()
+        page.set_field("frame_step", "1")
+        page.set_field("frame_first", "1")
+        page.set_field("frame_last", "0")
+        assert not page._readiness[1] and "Last frame must not come before First frame" in page._readiness[0]
+        with pytest.raises(ValueError, match="Last frame must not come before First frame"):
+            page.resolve_source()
     finally:
         _close(page, qapp)
 
@@ -464,7 +513,6 @@ def test_a_pending_verification_keeps_a_clickable_retry(qapp, tmp_path, monkeypa
     """F2: the real owner, preflight, gridding and publisher; one transient failure of the strict reload
     leaves the saved result VERIFICATION_PENDING. The Controls editors lock, its action row does not: Retry
     is clickable and verifies the saved result."""
-    import tifffile
     import xrd_tools.analysis.rsm_operation as operation
     page = _page(qapp)
     real_read = operation.read_analysis_artifact
@@ -477,13 +525,8 @@ def test_a_pending_verification_keeps_a_clickable_retry(qapp, tmp_path, monkeypa
         return real_read(*args, **kwargs)
 
     try:
-        drafts = _synthetic_members(tmp_path)
-        for ordinal in range(2):
-            images = tmp_path / drafts[ordinal].image_dir
-            for label in range(2):
-                tifffile.imwrite(images / f"member{ordinal}_{label:04d}.tif",
-                                 np.full((195, 487), 10 + ordinal + label, dtype=np.uint16))
-        _with_members(page, tmp_path, drafts)
+        _synthetic_source(tmp_path, full=True)
+        _with_source(page, tmp_path)
         monkeypatch.setattr(operation, "read_analysis_artifact", fail_once)
         page.begin_run()
         _wait(page, qapp, lambda: page._owner.finalization is rsm_owner.RSMOwnerFinalization.VERIFICATION_PENDING)
@@ -675,7 +718,8 @@ def test_append_skips_an_up_to_date_output_and_replace_grids_it_again(qapp, tmp_
     page = _page(qapp)
     label = page.run_bar.readinessLabel
     try:
-        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
         output = Path(page._value("output_path"))
         output.parent.mkdir()
         output.write_bytes(b"")  # a result already there
@@ -708,7 +752,8 @@ def test_a_replace_repaints_the_new_result_under_the_same_name(qapp, tmp_path, m
     _leaving_the_file(monkeypatch)
     page = _page(qapp)
     try:
-        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
         page.run_bar.writeModeButton.click()  # Replace
         page.begin_run()
         _wait(page, qapp, lambda: page.shown is not None)
@@ -732,7 +777,8 @@ def test_a_refused_or_stopped_replace_keeps_the_prior_result_shown(qapp, tmp_pat
     page = _page(qapp)
     label = page.run_bar.readinessLabel
     try:
-        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
         page.run_bar.writeModeButton.click()  # Replace
         page.begin_run()
         _wait(page, qapp, lambda: page.shown is not None and not page.active())
@@ -764,16 +810,16 @@ def test_each_section_header_shows_its_readiness_as_ints_do(qapp, tmp_path):
         page.set_field("project_root", "")
         assert not cards["project"].valid_marker.isVisibleTo(page)
         assert cards["project"].valid_marker.toolTip() == "Needs a Project folder"
-        _with_members(page, tmp_path, _synthetic_members(tmp_path))
-        assert page.run_bar.readinessLabel.full_text().startswith("Ready · RSM · 2 members")
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        assert page.run_bar.readinessLabel.full_text().startswith("Ready · RSM · 1 SPEC file · 1 RSM")
         assert all(card.valid_marker.isVisibleTo(page) for card in cards.values())
-        assert cards["source"].status.text() == "2 members"
+        assert cards["source"].status.text() == "1 SPEC file · 1 RSM"  # Stitch's Source status
         assert cards["processing"].status.text().endswith(" · grid 40×40×40")  # Coordinates is Processing's (G8a)
         assert cards["experiment"].status.text() == "rsm_canonical.json"
-        page._members[1].spec_path = "missing.spec"
-        page._edited()
+        page.set_sources([str(tmp_path / "missing.spec")])
         assert not cards["source"].valid_marker.isVisibleTo(page)
-        assert cards["source"].valid_marker.toolTip() == "Needs member 2's SPEC file"
+        assert cards["source"].valid_marker.toolTip() == "Needs the source (missing.spec not found)"
         assert cards["project"].valid_marker.isVisibleTo(page) and cards["experiment"].valid_marker.isVisibleTo(page)
     finally:
         _close(page, qapp)
@@ -870,7 +916,8 @@ def test_the_experiment_section_is_stitchs_calibration_and_mask_rows(qapp, tmp_p
                         if sub.isAncestorOf(page._rows["geometry_path"]))
         assert detector.isAncestorOf(page._rows["mask_path"])
         assert not page._fields["refinement"].enabled  # greyed until a Calibration is named
-        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
         assert page._fields["refinement"].enabled and page._readiness[1], page._readiness
         form = page.build_form()
         assert type(form.geometry_asset) is RSMCalibrationGeometryInput
@@ -901,7 +948,8 @@ def test_calibrate_and_make_mask_open_the_shared_windows_with_rsms_context(qapp,
     from xrd_tools.session.readiness import ControlAction
     page = _page(qapp)
     try:
-        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
         page._control_action(ControlAction.CALIBRATE)
         dialog = page._calibration_dialog
         assert dialog is not None and dialog.windowTitle() == "RSM calibration"
@@ -926,7 +974,8 @@ def test_a_calibration_outside_the_project_is_named_before_any_preview(qapp, tmp
     it is, rather than by the form at Preview."""
     page = _page(qapp)
     try:
-        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
         page.set_field("geometry_path", "../calibration/rsm_canonical.json")
         assert not page._readiness[1] and "a Calibration inside the Project" in page._readiness[0]
         assert page._rows["refinement"].editor.isEnabled()  # a Calibration is named: the toggle stays usable
@@ -942,12 +991,209 @@ def test_coordinates_is_a_processing_choice_and_max_chunk_mib_defaults_to_auto(q
     try:
         assert page.controls.processing_card.isAncestorOf(page._rows["coordinates"])
         assert not page.controls.experiment_card.isAncestorOf(page._rows["coordinates"])
-        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
         assert page._value("adv_max_chunk_mib") == "" and page.build_form().max_chunk_bytes is None
         page.set_field("adv_max_chunk_mib", "1")
         assert not page._readiness[1] and "one frame needs" in page._readiness[0], page._readiness
         assert "Max chunk MiB" in page._headers["processing"].detail
         page.set_field("adv_max_chunk_mib", "256")
         assert page._readiness[1] and page.build_form().max_chunk_bytes == 256 * 1024 * 1024
+    finally:
+        _close(page, qapp)
+
+
+# AUD-9 stage 2b G8a, commit 3: Source is Stitch's rows over its owner (design §2)
+
+
+def test_the_source_is_stitchs_rows_and_the_member_table_is_gone(qapp, tmp_path):
+    """Design §2 (the maintainer: "nexus files as source as well. And directory mode just like stitch"): the
+    Source card is Stitch's rows from Int's composer (the kind with Directory's Subdirs on its row, the files or
+    folder, Filter, Images, Image stem, Scans and Selection), each kind showing its own and keeping its own files.
+    The member table, its Add/Remove/Up/Down and the Scan 43 preset are gone; one raw decoder, Angle mapping and
+    frame range are Advanced's, the range from the first frame to each scan's last."""
+    from xdart.gui.tabs.scattering.controls_inventory import SOURCE_RECURSIVE, SOURCE_TYPE
+    page = _page(qapp)
+    try:
+        assert not hasattr(page, "member_table") and not any(
+            hasattr(page, f"member_{name}_button") for name in ("add", "remove", "up", "down", "preset"))
+        keys = ("source_kind", "spec_path", "subdirs", "name_filter", "image_dir", "image_stem", "scan_mode", "scan")
+        assert all(page.controls.source_card.isAncestorOf(page._rows[key]) for key in keys)
+        assert (page._fields["source_kind"].path, page._fields["subdirs"].path) == (SOURCE_TYPE, SOURCE_RECURSIVE)
+        assert page._rows["source_kind"].parentWidget() is page._rows["subdirs"].parentWidget()  # one row
+        assert page._fields["source_kind"].choices == ("Spec", "NeXus", "Directory")
+        assert page._source_paths == () and page._value("scan") == "1"  # no preset: Stitch's empty Source
+
+        def shown():
+            return {key for key in keys if not page._rows[key].isHidden()}
+        assert shown() == {"source_kind", "spec_path", "image_dir", "image_stem", "scan_mode", "scan"}
+        page.set_field("scan_mode", "All Scans")
+        assert "scan" not in shown()
+        page.set_field("source_kind", "Directory")
+        assert shown() == {"source_kind", "spec_path", "subdirs", "name_filter", "image_dir", "image_stem"}
+        assert page._rows["spec_path"].label.text() == "Folder"
+        page.set_field("source_kind", "NeXus")
+        assert shown() == {"source_kind", "spec_path"} and page._rows["spec_path"].label.text() == "NeXus files"
+        page.set_sources([str(tmp_path / "a.nxs"), str(tmp_path / "b.nxs")])
+        assert page._value("spec_path") == "2 files selected"
+        page.set_field("source_kind", "Spec")  # each kind keeps its own files
+        assert page._source_paths == () and page._value("spec_path") == ""
+        page.set_field("source_kind", "NeXus")
+        assert page._source_paths == (str(tmp_path / "a.nxs"), str(tmp_path / "b.nxs"))
+        assert page._value("adv_angle_mapping") == "mu=mu, eta=eta, chi=chi, phi=phi, nu=nu, del=del"
+        assert [str(page._value(key)) for key in ("frame_first", "frame_last", "frame_step")] == ["0", "", "1"]
+    finally:
+        _close(page, qapp)
+
+
+def test_a_bracket_selection_is_one_rsm_and_more_are_named_before_preview(qapp, tmp_path):
+    """Stitch's Selection: brackets combine scans into one RSM ([1-2]); 1,2 would be two RSMs and the page grids
+    one per run for now, so readiness names it before any Preview. All Scans makes each scan its own RSM, known
+    once the scans are found: the form refuses it with the same reason."""
+    page = _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1,2")
+        assert not page._readiness[1] and "one RSM (2 selected; one RSM per run for now" in page._readiness[0]
+        with pytest.raises(ValueError, match="2 RSMs in the Source: one RSM per run for now"):
+            page.build_form()
+        page.set_field("scan", "[1-2]")
+        assert page._readiness[1], page._readiness
+        page.resolve_source()
+        assert [member.scan for member in page.build_form().members] == ["1.1", "2.1"]
+        page.set_field("scan", "2")
+        page.resolve_source()
+        assert [member.scan for member in page.build_form().members] == ["2.1"]
+        page.set_field("scan_mode", "All Scans")
+        assert page._readiness[1] and page.controls.source_card.status.text() == "1 SPEC file · all scans"
+        page.resolve_source()
+        with pytest.raises(ValueError, match="2 RSMs in the Source"):
+            page.build_form()
+    finally:
+        _close(page, qapp)
+
+
+def test_relative_source_files_and_images_are_the_projects(qapp, tmp_path):
+    """A relative SPEC file and Images folder are the Project's (Stitch's selection would take them from the
+    working directory), in readiness and in the members found."""
+    page = _page(qapp)
+    try:
+        spec = _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        page.set_sources(["source/RSM_synth"])
+        assert page._readiness[1], page._readiness
+        page.resolve_source()
+        assert {(member.spec_path, member.image_dir) for member in page.build_form().members} == {
+            (str(spec), str(tmp_path / "source" / "images"))}
+    finally:
+        _close(page, qapp)
+
+
+def test_a_directory_source_finds_its_spec_scans_as_stitch_does(qapp, tmp_path, monkeypatch):
+    """Directory mode, as Stitch's: the folder's SPEC files (its subfolders' with Subdirs), each scan its own
+    RSM; Filter matches file names; the Images folder blank is each SPEC file's own. A scan without images is
+    skipped, and the Preview lists it; the one scan found is one RSM."""
+    import tifffile
+    _commit_instead_of_gridding(monkeypatch, _values())
+    page = _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        page.set_field("source_kind", "Directory")
+        page.set_sources([str(tmp_path)])
+        assert page._readiness[1], page._readiness  # how many RSMs a folder makes is known once found
+        assert page.resolve_source()[0] == ()  # the SPEC file is in a subfolder
+        page.set_field("subdirs", True)
+        groups, _skipped = page.resolve_source()
+        assert [[member.scan for member in group] for group in groups] == [["1.1"], ["2.1"]]
+        with pytest.raises(ValueError, match="2 RSMs in the Source"):
+            page.build_form()
+        page.set_field("name_filter", "nothing")
+        assert page.resolve_source()[0] == ()
+        with pytest.raises(ValueError, match="no scan to grid"):
+            page.build_form()
+        single = tmp_path / "single"
+        single.mkdir()
+        _spec_file(single / "half_imaged", [_spec_scan(1, 10), _spec_scan(2, 11)])  # scan 2 has no images
+        for label in range(2):
+            tifffile.imwrite(single / f"half_imaged_scan1_{label:04d}.tif",
+                             np.arange(20, dtype=np.uint16).reshape(4, 5))
+        page.set_field("name_filter", "")
+        page.set_field("subdirs", False)
+        page.set_field("image_dir", "")
+        page.set_sources([str(single)])
+        page.resolve_source()
+        member, = page.build_form().members
+        assert (member.spec_path, member.scan, member.image_dir) == (str(single / "half_imaged"), "1.1",
+                                                                     str(single))
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text())
+        assert "Skipped half_imaged 2.1: No detector images named *half_imaged_scan2_*" in (
+            page.preview_text.toPlainText())
+    finally:
+        _close(page, qapp)
+
+
+def test_a_raw_nexus_source_is_one_rsm_named_by_its_entry(qapp, tmp_path):
+    """NeXus files as the Source (the maintainer: "nexus files as source as well"): a raw NeXus stack is a member
+    by its entry (C5c), the suggested output is named from the file, and the Preview, through the one owner,
+    names the entry. Its run commits, and Append finds the output up to date."""
+    from tests.core.test_rsm_nexus_members import _write_rsm_nexus
+    from xdart.gui.tools.rsm_values import RSMNexusMemberForm
+    page = _page(qapp)
+    try:
+        _canonical_partner(tmp_path)
+        nexus = _write_rsm_nexus(tmp_path / "member_ub.nxs", ub=True)
+        page.set_field("project_root", str(tmp_path))
+        page.set_field("geometry_path", "calibration/rsm_canonical.json")
+        page.set_field("source_kind", "NeXus")
+        page.set_sources([str(nexus)])
+        page.set_field("normalization", "Identity")
+        assert page._readiness[1], page._readiness
+        assert Path(page._value("output_path")).name == "member_ub_rsm.nexus"
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text())
+        member, = page.build_form().members
+        assert type(member) is RSMNexusMemberForm and member.entry == "entry"
+        assert "member_ub.nxs · NeXus entry entry · 5 frames" in page.preview_text.toPlainText()
+        page.begin_run()  # gridded for real: five frames
+        _wait(page, qapp, lambda: page.shown is not None and not page.active(), seconds=300)
+        output = Path(page._value("output_path"))
+        assert page.run_bar.readinessLabel.full_text() == f"Saved {output.name}" and output.is_file()
+        page.begin_run()  # Append: the output already holds this RSM
+        _wait(page, qapp, lambda: "Up to date" in page.run_bar.readinessLabel.full_text() and not page.active())
+    finally:
+        _close(page, qapp)
+
+
+def test_preview_and_run_find_the_scans_off_the_gui_thread(qapp, tmp_path, monkeypatch):
+    """S2: finding the scans reads the SPEC files and lists the images, so Preview and Run find them on the shared
+    single worker, the controls held meanwhile; Stop drops what it finds."""
+    import threading
+    from xdart.gui.tools import rsm_values
+    _commit_instead_of_gridding(monkeypatch, _values())
+    real, threads, gate = rsm_values.rsm_member_groups, [], threading.Event()
+
+    def recorded(*args, **kwargs):
+        threads.append(threading.current_thread())
+        assert gate.wait(10)
+        return real(*args, **kwargs)
+    page = _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        monkeypatch.setattr(rsm_values, "rsm_member_groups", recorded)
+        page.begin_preview()
+        qapp.processEvents()
+        assert page.active() and not page.preview_button.isEnabled()
+        assert not page._rows["scan"].editor.isEnabled() and page.run_bar.stopButton.isEnabled()
+        page.stop()  # finding the scans has no stop point: what it finds is dropped
+        gate.set()
+        _wait(page, qapp, lambda: not page.active())
+        assert page.run_bar.readinessLabel.full_text() == "RSM stopped" and page._owner.prepared is None
+        assert page._rows["scan"].editor.isEnabled()
+        page.begin_run()
+        _wait(page, qapp, lambda: page.shown is not None and not page.active())
+        assert len(threads) == 2 and all(thread is not threading.main_thread() for thread in threads)
     finally:
         _close(page, qapp)

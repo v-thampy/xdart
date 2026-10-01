@@ -11,6 +11,11 @@ Stage 2 (the maintainer, 2026-10-01: "This should have the same replace append o
 run bar's Append ⇄ Replace is Stitch's. The operation replaces its same-kind ``_rsm.nexus`` in place (a
 foreign or other-kind file there stays refused), and a Run in Append skips an output already gridded with
 the same settings over the same frames. Preview creates no folder: the run makes the output's.
+
+Stage 2b (design §2; the maintainer, 2026-10-01: "the control panel can be almost identical to the stitch control
+panel"): Experiment is Stitch's (Calibrate · Make Mask in the shared windows, Calibration, Mask File), and Source
+is Stitch's rows over Stitch's own source owner (``rsm_member_groups``), its scans found on the shared single
+worker before Preview and Run.
 """
 from __future__ import annotations
 
@@ -18,6 +23,7 @@ from collections import OrderedDict
 from dataclasses import replace
 import logging
 from pathlib import Path
+import re
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
@@ -31,7 +37,9 @@ from xdart.gui.tabs.rsm.display import rsm_keyed_projection, rsm_slice_normals
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
-from xdart.gui.tabs.scattering.controls_inventory import MASK_FILE, PONI_FILE
+from xdart.gui.tabs.scattering.controls_inventory import (
+    MASK_FILE, PONI_FILE, SOURCE_DIRECTORY, SOURCE_FILTER, SOURCE_RECURSIVE, SOURCE_TYPE,
+)
 from xdart.gui.tabs.scattering.controls_readiness import SectionHeaderProjection
 from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
 from xdart.gui.tabs.scattering.shell_widgets import apply_section_header
@@ -40,7 +48,8 @@ from xdart.gui.tools.rsm_owner import (
     RSMOwnerAction, RSMOwnerFinalization, RSMOwnerOutcomeKind, RSMOwnerUpdate, RSMToolOwner,
 )
 from xdart.gui.tools.rsm_values import (
-    RSMMemberDraft, RSMScanMemberForm, RSMToolFormV2, rsm_preflight_summary_lines, rsm_tool_preset,
+    RSMToolFormV2, format_rsm_angle_mapping, parse_rsm_angle_mapping, rsm_frame_selector,
+    rsm_preflight_summary_lines, rsm_tool_preset,
 )
 from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow
 from xdart.gui.widgets.run_controls import RunControlsBar
@@ -57,7 +66,6 @@ from xrd_tools.session.readiness import (
 from xrd_tools.session.rsm_viewer_model import RSMViewerModel, make_rsm_viewer_values
 
 _LOG = logging.getLogger(__name__)
-_PSIC_ROLES = ("mu", "eta", "chi", "phi", "nu", "del")
 _MIB = 1024 * 1024
 #: The grids the RSM dialog offers (the scan-43 preset's quick and full).
 _GRIDS = {"Quick 40×40×40": (40, 40, 40), "Full 200×200×200": (200, 200, 200)}
@@ -85,13 +93,6 @@ _RESIDENT_RESULTS = 5
 _FIELDS = (
     (SectionId.PROJECT, "project_root", "Folder", "", (), True),
     (SectionId.PROJECT, "output_path", "Save Path", "", (), True),
-    (SectionId.SOURCE, "member_spec", "SPEC", "", (), True),
-    (SectionId.SOURCE, "member_scan", "Scan", "", (), False),
-    (SectionId.SOURCE, "member_images", "Images", "", (), True),
-    (SectionId.SOURCE, "member_stem", "Image stem", "", (), False),
-    (SectionId.SOURCE, "member_first", "First frame", "0", (), False),
-    (SectionId.SOURCE, "member_last", "Last frame", "", (), False),
-    (SectionId.SOURCE, "member_step", "Frame step", "1", (), False),
     (SectionId.PROCESSING, "coordinates", "Coordinates", RSMCoordinateFrame.HKL.display_name, tuple(_FRAMES),
      False),
     (SectionId.PROCESSING, "grid", "Grid", "Quick 40×40×40", tuple(_GRIDS), False),
@@ -104,24 +105,31 @@ _FIELDS = (
     (SectionId.PROCESSING, "high_threshold", "High → NaN", "20000000000", (), False),
     (SectionId.PROCESSING, "static_hot", "All-frame hot", "100", (), False),
 )
-#: The member's whole-number rows (FormRow kind "int"): (minimum, maximum, blank allowed). The row outlines a
-#: refused text; ``rsm_values`` stays the authority that refuses it (Codex's stage-1 review F1).
-_INTEGER_FIELDS = {"member_first": (0, None, False), "member_last": (0, None, True), "member_step": (1, None, False),
+#: The whole-number rows (FormRow kind "int"): (minimum, maximum, blank allowed). The row outlines a refused
+#: text; ``rsm_values`` stays the authority that refuses it (Codex's stage-1 review F1). The frame range is
+#: Stitch's one range for every member, in Advanced (design §2).
+_INTEGER_FIELDS = {"frame_first": (0, None, False), "frame_last": (0, None, True), "frame_step": (1, None, False),
                    # Advanced (the dialog's spin boxes' ranges, as rows)
                    "adv_rows": (2, 1_000_000, False), "adv_columns": (2, 1_000_000, False),
                    "adv_header": (0, 1 << 30, False),
-                   **{f"adv_occurrence_{role}": (0, 1024, False) for role in _PSIC_ROLES},
                    "adv_foil_occurrence": (0, 1024, False), "adv_exposure_occurrence": (0, 1024, False),
                    "adv_chunk": (1, 1024, False), "adv_max_frame_mib": (1, 4096, False),
                    "adv_max_chunk_mib": (1, 4096, True)}
-_MEMBER_KEYS = ("member_spec", "member_scan", "member_images", "member_stem", "member_first", "member_last",
-                "member_step")
-#: The Advanced rows that are the selected member's (its raw decoder and psic motor columns), stored into its
-#: draft on each commit as the member rows are.
-_MEMBER_ADVANCED_KEYS = ("adv_rows", "adv_columns", "adv_dtype", "adv_header",
-                         *(f"adv_motor_{role}" for role in _PSIC_ROLES),
-                         *(f"adv_occurrence_{role}" for role in _PSIC_ROLES))
+#: Stitch's Source kinds (the maintainer: "nexus files as source as well. And directory mode just like stitch").
+_SOURCE_KINDS = ("Spec", "NeXus", "Directory")
+#: One RSM per run for now (Stitch queues one output per group; the RSM page does not yet).
+_ONE_GROUP = "one RSM per run for now: brackets combine scans into one RSM, as [42-44]"
 _RAW_DTYPES = ("int32", "uint16", "float32", "float64")
+
+
+def _resolve_rsm_groups(arguments, cancel, _progress):
+    """The member groups of a source selection (``rsm_member_groups``: Stitch's own discovery, the Selection
+    syntax and Directory mode), off the GUI thread: it reads SPEC files and lists images."""
+    from xdart.gui.tools.rsm_values import rsm_member_groups
+    if cancel.is_set():
+        return None
+    selection, options = arguments
+    return rsm_member_groups(selection, **options)
 
 
 def _read_rsm_record(path, cancel, _progress):
@@ -139,14 +147,27 @@ def _progress_text(stage, completed, total):
     return f"{_STAGE_TEXT.get(stage, stage)}…"
 
 
+def _family_pair(root, member):
+    """A member's (source path, scan or None) as the slot policy names one: a SPEC scan's file and key, a NeXus
+    stack's file alone (stage 2b C5c)."""
+    if isinstance(member, tuple):
+        path, scan = member
+    elif hasattr(member, "nexus_path"):
+        path, scan = member.nexus_path, None
+    else:
+        path, scan = member.spec_path, member.scan
+    return Path(root) / path, scan
+
+
 def suggested_family(project_root, members):
-    """The family a page suggests for its ordered members, as the slot policy derives it from them (``rsm``
-    when it cannot)."""
+    """The family a page suggests for its ordered members (forms of either kind, or (path, scan) pairs), as the
+    slot policy derives it from them (``rsm`` when it cannot)."""
     from xrd_tools.io.output_path import automatic_artifact_family, is_artifact_family
     root = Path(project_root)
+    if not members:
+        return "rsm"
     try:
-        family = automatic_artifact_family(
-            tuple((root / member.spec_path, member.scan) for member in members), root)
+        family = automatic_artifact_family(tuple(_family_pair(root, member) for member in members), root)
     except (ValueError, OSError):
         family = ""
     return family if is_artifact_family(family) else "rsm"
@@ -167,18 +188,24 @@ class RSMPage(QtWidgets.QWidget):
     #: (page key, processing mode): open that page in that mode
     modeRequested = QtCore.Signal(str, str)
 
-    def __init__(self, services, parent=None, *, owner=None, reader=None):
+    def __init__(self, services, parent=None, *, owner=None, reader=None, resolver=None):
         super().__init__(parent)
         self.setObjectName("rsmPage")
         self._services = services
         self._owner = RSMToolOwner.v2() if owner is None else owner
         self._reader = SingleWorkerOwner(_read_rsm_record) if reader is None else reader
         self._reading = None  # (identity, path) of the record being read
+        # the Source's member groups, found on the shared single worker before Preview and Run (it reads the
+        # SPEC files and lists the images): (identity, action, key) while found; (key, groups, skipped) after
+        self._resolver = SingleWorkerOwner(_resolve_rsm_groups) if resolver is None else resolver
+        self._resolving = None
+        self._groups = None
         self._fields, self._rows = {}, {}
-        self._members = [RSMMemberDraft.from_scan43()]
-        self._selected = 0
+        self._source_paths = ()  # Stitch's selection: the SPEC or NeXus files, or the folder, as chosen
+        self._source_shown = ""  # the SPEC files row's text for them ("3 files selected")
+        self._paths_by_kind = {}
         self._readiness = ("", False)
-        self._output_suggested = True  # the output follows the members until the user names one
+        self._output_suggested = True  # the output follows the Source until the user names one
         self._run_requested = False
         self._form_revision = 0
         self._active_revision = None
@@ -205,7 +232,7 @@ class RSMPage(QtWidgets.QWidget):
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(50)
         self._timer.timeout.connect(self._poll)
-        self._load_member(0)
+        self._source_changed()
         self._edited()
 
     # ── layout ──
@@ -300,11 +327,9 @@ class RSMPage(QtWidgets.QWidget):
         cards = {SectionId.PROJECT: self.controls.project_card, SectionId.EXPERIMENT: self.controls.experiment_card,
                  SectionId.SOURCE: self.controls.source_card, SectionId.PROCESSING: self.controls.processing_card}
         self._build_experiment()  # Stitch's Experiment rows (the maintainer: its control panel)
+        self._build_source()  # and its Source rows
         for section, key, label, value, choices, browse in _FIELDS:
-            row = self._row(section, key, label, value, choices, browse)
-            if key == "member_spec":  # the ordered members above the selected one's rows
-                cards[section].add_row(self._member_panel())
-            cards[section].add_row(row)
+            cards[section].add_row(self._row(section, key, label, value, choices, browse))
         buttons = self.controls.render_actions(self.controls.processing_card, tuple(
             ControlActionSpec(action, label, SectionId.PROCESSING) for action, label in (
                 (ControlAction.PREVIEW, "Preview"), (ControlAction.RETRY, "Retry"),
@@ -354,50 +379,59 @@ class RSMPage(QtWidgets.QWidget):
                               "offset). Never the calibrant's sample offset.")
         experiment.add_row(refinement)
 
-    def _member_panel(self):
-        panel = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.member_table = QtWidgets.QTableWidget(0, 5)
-        self.member_table.setObjectName("rsmPageMembers")
-        self.member_table.setHorizontalHeaderLabels(("#", "SPEC", "scan", "frames", "stem"))
-        self.member_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.member_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
-        self.member_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.member_table.verticalHeader().setVisible(False)
-        self.member_table.horizontalHeader().setStretchLastSection(True)
-        self.member_table.setMaximumHeight(130)
-        self.member_table.currentCellChanged.connect(lambda row, *_rest: self._load_member(row))
-        layout.addWidget(self.member_table)
-        buttons = QtWidgets.QHBoxLayout()
-        for name, text, slot in (("add", "Add", self._add_member), ("remove", "Remove", self._remove_member),
-                                 ("up", "Up", lambda: self._move_member(-1)),
-                                 ("down", "Down", lambda: self._move_member(1)),
-                                 ("preset", "Scan 43", self._apply_preset)):
-            button = QtWidgets.QPushButton(text)
-            button.setObjectName(f"rsmPageMember_{name}")
-            button.clicked.connect(slot)
-            setattr(self, f"member_{name}_button", button)
-            buttons.addWidget(button)
-        self.member_preset_button.setToolTip("Reset to the scan-43 STO preset (one member)")
-        layout.addLayout(buttons)
-        return panel
+    def _build_source(self):
+        """Stitch's Source rows, from Int's composer (design §2; the maintainer, 2026-10-01: "nexus files as
+        source as well. And directory mode just like stitch"): the kind with Directory's Subdirs on its row, the
+        SPEC or NeXus files or the folder, Directory's Filter, the Images folder, the Image stem, and the Scans
+        with their Selection. The Selection's syntax is Stitch's: ``[42-44]`` makes one RSM of three scans.
+        Every row is built once; a kind shows its own (``_source_changed``)."""
+        fields = {
+            "source_kind": self._new_field(SectionId.SOURCE, "source_kind", "Source", "Spec", _SOURCE_KINDS,
+                                           path=SOURCE_TYPE),
+            "spec_path": self._new_field(SectionId.SOURCE, "spec_path", "SPEC files", "", browse=True,
+                                         path=SOURCE_DIRECTORY),
+            "subdirs": self._new_field(SectionId.SOURCE, "subdirs", "Subdirs", False, path=SOURCE_RECURSIVE),
+            "name_filter": self._new_field(SectionId.SOURCE, "name_filter", "Filter", "", path=SOURCE_FILTER),
+            "image_dir": self._new_field(SectionId.SOURCE, "image_dir", "Images", "", browse=True),
+            # on the card, not in Advanced: a stem left from another dataset matches the wrong images
+            "image_stem": self._new_field(SectionId.SOURCE, "image_stem", "Image stem", ""),
+            "scan_mode": self._new_field(SectionId.SOURCE, "scan_mode", "Scans", "Select Scans",
+                                         ("All Scans", "Select Scans")),
+            "scan": self._new_field(SectionId.SOURCE, "scan", "Selection", "1"),
+        }
+        rows = self.controls.render_source_rows(self.controls.source_card, tuple(fields.values()))
+        for key, field in fields.items():
+            self._bind(key, field, rows[field.path])
+        self._tip("source_kind", "Source kind: SPEC files and their scans' images, raw NeXus files, or a folder "
+                                 "of both.")
+        self._tip("subdirs", "Also the SPEC and NeXus files in the folder's subfolders.")
+        self._tip("name_filter", "Only the files whose names match: a space is and, | is or, -term is not.")
+        self._tip("image_dir", "The folder of the scans' detector images. Blank: the SPEC file's folder.")
+        self._tip("image_stem",
+                  "The part of the image file names that identifies the scan; any prefix before it is "
+                  "fine (b_thampy_R1C2_scan3_0000.raw has R1C2_scan3_). Blank: <SPEC name>_scan<N>_ for "
+                  "each scan. {spec} and {scan} fill in the SPEC name and scan number.")
+        self._tip("scan_mode", "All Scans: each scan of the files is its own RSM. Select Scans: the Selection.")
+        self._tip("scan", "Scan numbers, as Stitch's Selection: brackets combine scans into one RSM ([42-44] "
+                          "is one RSM of three scans); 42,43 would be two RSMs, and the page grids one RSM per "
+                          "run for now.")
 
     def _build_advanced(self):
-        """The rarely changed member and memory settings: Int's Advanced dialog, its groups the page's shared
-        rows (Codex's reuse audits, 2026-10-01: this was a dialog of raw spin boxes, a combo and line edits)."""
+        """The rarely changed settings: Int's Advanced dialog, its groups the page's shared rows (Codex's reuse
+        audits, 2026-10-01). Stitch's Source and geometry rows (design §2): one raw decoder, one Angle mapping
+        and one frame range for every scan, as Stitch's."""
         preset = rsm_tool_preset()
         self.advanced = AdvancedDialog(self, title="Advanced — RSM", object_name="rsmAdvancedDialog")
         groups = (
-            ("Raw decoder (selected member)", SectionId.SOURCE, (
+            ("Source and geometry", SectionId.SOURCE, (
                 ("adv_rows", "Rows", str(preset.detector_shape[0]), ()),
                 ("adv_columns", "Columns", str(preset.detector_shape[1]), ()),
                 ("adv_dtype", "Data type", preset.raw_dtype, _RAW_DTYPES),
-                ("adv_header", "Header bytes", str(preset.raw_header_skip), ()))),
-            ("psic motor columns (selected member)", SectionId.SOURCE, tuple(
-                (f"adv_motor_{role}", f"{role} column", "", ()) for role in _PSIC_ROLES)),
-            ("Motor column occurrences (selected member)", SectionId.SOURCE, tuple(
-                (f"adv_occurrence_{role}", f"{role} occurrence", "0", ()) for role in _PSIC_ROLES)),
+                ("adv_header", "Header bytes", str(preset.raw_header_skip), ()),
+                ("adv_angle_mapping", "Angle mapping", format_rsm_angle_mapping(preset.motor_selectors), ()),
+                ("frame_first", "First frame", "0", ()),
+                ("frame_last", "Last frame", "", ()),
+                ("frame_step", "Frame step", "1", ()))),
             ("Normalization column occurrences", SectionId.PROCESSING, (
                 ("adv_foil_occurrence", "Foil column occurrence", "0", ()),
                 ("adv_exposure_occurrence", "Exposure column occurrence", "0", ()))),
@@ -409,26 +443,26 @@ class RSMPage(QtWidgets.QWidget):
         for title, section, rows in groups:
             self.advanced.add_group(title, tuple(self._row(section, key, label, value, choices, False)
                                                  for key, label, value, choices in rows))
+        self._tip("adv_rows", "The raw images' rows (a NeXus stack's frames are this shape too).")
         self._tip("adv_header", "Bytes before the pixels in each raw image file.")
+        self._tip("adv_angle_mapping", "Which source column each psic circle reads, as role=column: mu, eta, chi, "
+                                       "phi, nu and del, each once. A column the scan repeats takes its "
+                                       "occurrence after # (nu=Nu#1 is the second Nu; #0, the first, is the "
+                                       "default).")
+        self._tip("frame_first", "The first frame of every scan (0 is the first).")
+        self._tip("frame_last", "The last frame of every scan; blank is each scan's last.")
+        self._tip("frame_step", "Every n-th frame from the first.")
         self._tip("adv_max_chunk_mib", "Blank is Auto: 256 MiB, or one frame's need when larger (an Eiger 4M), "
                                        "the chunk then holding as many frames as fit. A number is your cap; one "
                                        "below a frame's need is named.")
-        for role in _PSIC_ROLES:
-            self._tip(f"adv_occurrence_{role}", "Which of the SPEC columns with this name (0 is the first), "
-                                                "when the scan repeats a column name.")
 
     def _tip(self, key, text):
         self._rows[key].setToolTip(text)
 
-    def _whole(self, key, fallback):
-        """An Advanced whole-number row's value; ``fallback`` (the draft's) while its text is refused, which
-        readiness names and ``build_form`` refuses, so the older value is never run (Codex's F1)."""
-        return int(str(self._value(key)).strip()) if not self._rows[key].refusal() else fallback
-
     def _advanced_refusal(self, section=None):
         """The first refused Advanced whole-number row, as readiness and ``build_form`` name it ("" if none)."""
         for key in _INTEGER_FIELDS:
-            if (key.startswith("adv_") and (section is None or self._fields[key].section is section)
+            if (key.startswith(("adv_", "frame_")) and (section is None or self._fields[key].section is section)
                     and self._rows[key].refusal()):
                 return f"{self._fields[key].label} ({self._rows[key].refusal()})"
         return ""
@@ -443,100 +477,170 @@ class RSMPage(QtWidgets.QWidget):
         self._committed(key)
 
     def _committed(self, key):
-        """A committed edit: the selected member's rows go into its draft; the output follows the members
-        until a name is chosen."""
-        if key in _MEMBER_KEYS or key in _MEMBER_ADVANCED_KEYS:
-            self._store_member()
+        """A committed edit: a typed source path is the selection, a kind shows its own rows; the output
+        follows the Source until a name is chosen."""
+        if key == "spec_path":
+            text = str(self._value("spec_path") or "").strip()
+            if text != self._source_shown:  # the row's own display of the selection is not a path (Stitch's)
+                self._adopt_sources((text,) if text else ())
+                self._source_shown = text
+                self._show_source_tip()
+        elif key in {"source_kind", "scan_mode"}:
+            self._source_changed(key)
         if key == "output_path":
             self._output_suggested = not str(self._value("output_path")).strip()
         self._edited()
 
-    def _store_member(self):
-        if getattr(self, "_loading", False) or not 0 <= self._selected < len(self._members):
-            return
-        draft = self._members[self._selected]
-        draft.spec_path = str(self._value("member_spec")).strip()
-        draft.scan = str(self._value("member_scan")).strip()
-        draft.image_dir = str(self._value("member_images")).strip()
-        draft.image_stem = str(self._value("member_stem")).strip()
-        # the frame fields as typed: readiness and the form refuse what is not a frame range (Codex F1)
-        draft.frame_start = str(self._value("member_first")).strip()
-        draft.frame_stop = str(self._value("member_last")).strip()
-        draft.frame_step = str(self._value("member_step")).strip()
-        draft.detector_rows = self._whole("adv_rows", draft.detector_rows)
-        draft.detector_columns = self._whole("adv_columns", draft.detector_columns)
-        draft.raw_dtype = str(self._value("adv_dtype"))
-        draft.raw_header_skip = self._whole("adv_header", draft.raw_header_skip)
-        draft.selector_names = tuple(str(self._value(f"adv_motor_{role}")).strip() for role in _PSIC_ROLES)
-        draft.selector_occurrences = tuple(self._whole(f"adv_occurrence_{role}", occurrence) for role, occurrence
-                                           in zip(_PSIC_ROLES, draft.selector_occurrences, strict=True))
-        self._refresh_members()
+    # ── the Source (Stitch's rows and owner) ──
+    def set_sources(self, paths):
+        """The SPEC or NeXus files, or the folder (Directory), as Stitch's ``set_sources``: one is shown, more
+        as "N files selected"."""
+        self._adopt_sources(paths)
+        count = len(self._source_paths)
+        self._source_shown = ("" if not count else self._source_paths[0] if count == 1
+                              else f"{count} files selected")
+        self._fields["spec_path"] = replace(self._fields["spec_path"], value=self._source_shown)
+        self._rows["spec_path"].apply_field(self._fields["spec_path"])
+        self._show_source_tip()
+        self._edited()
 
-    def _load_member(self, index):
-        """Show member ``index`` in the selected-member rows and the Advanced decoder and motor columns."""
-        if not 0 <= index < len(self._members):
-            return
-        self._selected = index
-        draft = self._members[index]
-        self._loading = True
+    def _adopt_sources(self, paths):
+        self._source_paths = tuple(str(path) for path in paths if str(path).strip())
+        self._paths_by_kind[self._value("source_kind")] = self._source_paths
+
+    def _show_source_tip(self):
+        row = self._rows["spec_path"]
+        for widget in (row, row.editor, row.label):
+            widget.setToolTip("\n".join(self._source_paths))
+
+    def _source_changed(self, key=None):
+        """A kind shows its own rows (Stitch's): Images and the stem for SPEC scans (a Directory's too), the
+        Scans and Selection for SPEC files, Subdirs and Filter for a folder. A new kind takes back its own
+        files."""
+        kind = self._value("source_kind")
+        for name in ("image_dir", "image_stem"):
+            self._rows[name].setVisible(kind != "NeXus")
+        self._rows["scan_mode"].setVisible(kind == "Spec")
+        self._rows["scan"].setVisible(kind == "Spec" and self._value("scan_mode") == "Select Scans")
+        for name in ("subdirs", "name_filter"):
+            self._rows[name].setVisible(kind == "Directory")
+        self._rows["spec_path"].label.setText({"Spec": "SPEC files", "NeXus": "NeXus files",
+                                               "Directory": "Folder"}[kind])
+        if key == "source_kind":
+            self.set_sources(self._paths_by_kind.get(kind, ()))
+
+    def _source_files(self, root):
+        """The chosen files or folder, a relative one inside the Project (the selection would take it from
+        the working directory)."""
+        return tuple(str(self._inside(root, path, "source")) for path in self._source_paths)
+
+    def _group_key(self):
+        """Everything the Source's member groups are found from, as committed (the cache's key)."""
+        return (str(self._value("project_root")).strip(), self._source_paths,
+                *(str(self._value(key)) for key in (
+                    "source_kind", "scan_mode", "scan", "image_dir", "image_stem", "subdirs", "name_filter",
+                    "frame_first", "frame_last", "frame_step", "adv_rows", "adv_columns", "adv_dtype",
+                    "adv_header", "adv_angle_mapping")))
+
+    def _resolution_request(self):
+        """(Stitch's source selection, the members' options) for ``rsm_member_groups``: the Project's paths
+        absolute, one raw decoder, frame range and Angle mapping for every scan. ValueError names the row."""
+        from xrd_tools.analysis.stitch_sources import StitchSourceSelection
+        project = str(self._value("project_root")).strip()
+        if not project:
+            raise ValueError("Project root is required")
+        root = Path(project).expanduser()
+        refused = self._advanced_refusal(SectionId.SOURCE)
+        if refused:
+            raise ValueError(f"Advanced {refused}")
+        kind = self._value("source_kind")
+        if not self._source_paths:
+            raise ValueError({"Spec": "SPEC files", "NeXus": "NeXus files", "Directory": "a source folder"}[kind]
+                             + " to read")
+        images = str(self._value("image_dir")).strip()
+        directory = kind == "Directory"
+        selection = StitchSourceSelection(
+            kind, self._source_files(root), scans=str(self._value("scan")),
+            stitch_all=self._value("scan_mode") == "All Scans",
+            image_dir=str(self._inside(root, images, "Images")) if images and kind != "NeXus" else "",
+            image_stem=str(self._value("image_stem")).strip() if kind != "NeXus" else "",
+            recursive=directory and bool(self._value("subdirs")),
+            name_filter=str(self._value("name_filter")).strip() if directory else "")
+        options = dict(
+            frame_selector=rsm_frame_selector(self._value("frame_first"), self._value("frame_last"),
+                                              self._value("frame_step")),
+            detector_shape=(int(self._value("adv_rows")), int(self._value("adv_columns"))),
+            raw_dtype=str(self._value("adv_dtype")), raw_header_skip=int(self._value("adv_header")),
+            motor_selectors=parse_rsm_angle_mapping(self._value("adv_angle_mapping")))
+        return selection, options
+
+    def resolve_source(self):
+        """The Source's member groups found now, on the calling thread (scripts and rows; Preview and Run find
+        them on the shared single worker first): (groups, skipped). ``build_form`` reads them."""
+        from xdart.gui.tools.rsm_values import rsm_member_groups
+        key = self._group_key()
+        selection, options = self._resolution_request()
+        groups, skipped = rsm_member_groups(selection, **options)
+        self._found(key, groups, skipped)
+        return groups, skipped
+
+    def _found(self, key, groups, skipped):
+        """Member groups found for ``key``: kept for ``build_form``, and the suggested output follows them."""
+        self._groups = (key, tuple(groups), tuple(skipped))
+        if self._apply_suggestion():
+            self._edited()
+
+    def _group_members(self):
+        """The one RSM's ordered members, from the groups found for the Source as it stands (ValueError
+        naming what is missing or why it is not one RSM)."""
+        from xdart.gui.tools.rsm_values import _MAX_RSM_MEMBERS
+        found = self._groups
+        if found is None or found[0] != self._group_key():
+            raise ValueError("the Source's scans are not found yet (Preview finds them)")
+        _key, groups, skipped = found
+        if not groups:
+            reason = ""
+            if skipped:  # the first skip's file, scan and why (Stitch's skips)
+                path, scan, why = skipped[0]
+                reason = f" ({' '.join(part for part in (Path(path).name, str(scan)) if part)}: {why})"
+            raise ValueError("the Source has no scan to grid" + reason)
+        if len(groups) > 1:
+            raise ValueError(f"{len(groups)} RSMs in the Source: {_ONE_GROUP}")
+        if len(groups[0]) > _MAX_RSM_MEMBERS:
+            raise ValueError(f"{len(groups[0])} scans in one RSM: at most {_MAX_RSM_MEMBERS}")
+        return groups[0]
+
+    def _suggestion_members(self, root):
+        """The (path, scan) pairs the suggested output's family is named from: the found group's members when
+        the Source was found as it stands, else the rows' own without reading (one SPEC file's selected group,
+        or the NeXus files); none (the family ``rsm``) until then."""
+        from xrd_tools.sources.grouping import parse_stitch_scan_groups
+        found = self._groups
+        if found is not None and found[0] == self._group_key():
+            return found[1][0] if len(found[1]) == 1 else ()
+        kind = self._value("source_kind")
         try:
-            for key, value in (("member_spec", draft.spec_path), ("member_scan", draft.scan),
-                               ("member_images", draft.image_dir), ("member_stem", draft.image_stem),
-                               ("member_first", draft.frame_start), ("member_last", draft.frame_stop),
-                               ("member_step", draft.frame_step)):
-                self._fields[key] = replace(self._fields[key], value=str(value))
-                self._rows[key].apply_field(self._fields[key])
-            values = {"adv_rows": draft.detector_rows, "adv_columns": draft.detector_columns,
-                      "adv_dtype": draft.raw_dtype, "adv_header": draft.raw_header_skip}
-            for role, name, occurrence in zip(_PSIC_ROLES, draft.selector_names, draft.selector_occurrences,
-                                              strict=True):
-                values[f"adv_motor_{role}"], values[f"adv_occurrence_{role}"] = name, occurrence
-            for key, value in values.items():
-                self._fields[key] = replace(self._fields[key], value=str(value))
-                self._rows[key].apply_field(self._fields[key])
-        finally:
-            self._loading = False
-        self._refresh_members()
+            files = self._source_files(root)
+            if kind == "NeXus":
+                return tuple((path, None) for path in files)
+            if kind == "Spec" and len(files) == 1 and self._value("scan_mode") == "Select Scans":
+                groups = parse_stitch_scan_groups(str(self._value("scan")))
+                return tuple((files[0], token) for token in groups[0]) if len(groups) == 1 else ()
+        except ValueError:
+            pass
+        return ()
 
-    def _refresh_members(self):
-        table = self.member_table
-        blocker = QtCore.QSignalBlocker(table)
-        table.setRowCount(len(self._members))
-        for row, draft in enumerate(self._members):
-            for column, text in enumerate((str(row + 1), draft.spec_path, draft.scan, draft.selected_count_text(),
-                                           draft.image_stem)):
-                table.setItem(row, column, QtWidgets.QTableWidgetItem(text))
-        table.setCurrentCell(self._selected, 0)
-        del blocker
-        self.member_remove_button.setEnabled(len(self._members) > 1)
-        self.member_up_button.setEnabled(self._selected > 0)
-        self.member_down_button.setEnabled(self._selected < len(self._members) - 1)
-
-    def _add_member(self):
-        self._store_member()
-        self._members.append(self._members[self._selected].clone())
-        self._load_member(len(self._members) - 1)
-        self._edited()
-
-    def _remove_member(self):
-        if len(self._members) > 1:
-            del self._members[self._selected]
-            self._load_member(min(self._selected, len(self._members) - 1))
-            self._edited()
-
-    def _move_member(self, offset):
-        target = self._selected + offset
-        if 0 <= target < len(self._members):
-            self._store_member()
-            members = self._members
-            members[self._selected], members[target] = members[target], members[self._selected]
-            self._load_member(target)
-            self._edited()
-
-    def _apply_preset(self):
-        self._members = [RSMMemberDraft.from_scan43()]
-        self._load_member(0)
-        self._edited()
+    def _apply_suggestion(self):
+        """The suggested output while the user has named none; True when it changed."""
+        project = str(self._value("project_root")).strip()
+        if not (self._output_suggested and project):
+            return False
+        suggestion = suggested_output(project, self._suggestion_members(Path(project).expanduser()))
+        if suggestion == self._value("output_path"):
+            return False
+        self._fields["output_path"] = replace(self._fields["output_path"], value=suggestion)
+        self._rows["output_path"].apply_field(self._fields["output_path"])
+        return True
 
     @staticmethod
     def _inside(project, text, name):
@@ -574,26 +678,26 @@ class RSMPage(QtWidgets.QWidget):
 
     def _chunk_cap_refusal(self):
         """The Max chunk MiB a user set below one frame's need, named as the run would refuse it ("" when
-        Auto or enough). Arithmetic only (``rsm_v2_chunk_bytes``): no file is read; each member's raw decoder
-        stands for its frame, uncropped, so the need named is an upper bound."""
+        Auto or enough). Arithmetic only (``rsm_v2_chunk_bytes``): no file is read; the raw decoder's shape
+        stands for every frame, uncropped, so the need named is an upper bound."""
         from xrd_tools.analysis.rsm_operation import rsm_v2_chunk_bytes
-        if self._rows["adv_max_chunk_mib"].refusal():
+        if any(self._rows[key].refusal() for key in ("adv_max_chunk_mib", "adv_rows", "adv_columns")):
             return ""  # the row's own refusal names it
         cap = self._max_chunk_bytes()
         if cap is None:
             return ""
         static_hot = bool(str(self._value("static_hot")).strip())
         corrections = RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
-        need = max(rsm_v2_chunk_bytes((draft.detector_rows, draft.detector_columns),
-                                      (draft.detector_rows, draft.detector_columns), 1, static_hot=static_hot,
-                                      corrections=corrections) for draft in self._members)
+        shape = (int(self._value("adv_rows")), int(self._value("adv_columns")))
+        need = rsm_v2_chunk_bytes(shape, shape, 1, static_hot=static_hot, corrections=corrections)
         mib = -(-need // _MIB)
         return "" if cap >= need else f"Max chunk MiB of {mib} or more (one frame needs {mib} MiB), or blank for Auto"
 
     def build_form(self):
-        """The exact RSM v2 form of the page's inputs: the dialog's form for the same inputs, with the
-        Calibration row's geometry (AUD-9 stage 2b C7b) and the Mask File (C4)."""
-        self._store_member()
+        """The exact RSM v2 form of the page's inputs: the Source's one member group as found for it
+        (``rsm_member_groups``: Preview and Run find it on the shared worker first, ``resolve_source`` on the
+        calling thread; this never reads), the Calibration row's geometry (AUD-9 stage 2b C7b) and the Mask
+        File (C4)."""
         refused = self._advanced_refusal()
         if refused:
             raise ValueError(f"Advanced: {refused}")
@@ -601,15 +705,7 @@ class RSMPage(QtWidgets.QWidget):
         if not project_text:
             raise ValueError("Project root is required")
         project = Path(project_text).expanduser()
-        members = []
-        for draft in self._members:
-            members.append(RSMScanMemberForm(
-                self._inside(project, draft.spec_path, "SPEC path"), draft.scan,
-                self._inside(project, draft.image_dir, "image directory"), draft.image_stem,
-                draft.frame_selector(),
-                (draft.detector_rows, draft.detector_columns), draft.raw_dtype, draft.raw_header_skip,
-                tuple((role, MetadataColumnSelector(name, occurrence)) for role, name, occurrence in zip(
-                    _PSIC_ROLES, draft.selector_names, draft.selector_occurrences, strict=True))))
+        members = self._group_members()
         mode = _NORMALIZATIONS[self._value("normalization")]
         if mode is RSMNormalizationMode.IDENTITY:
             normalization = RSMNormalizationPolicy.identity()
@@ -627,15 +723,15 @@ class RSMPage(QtWidgets.QWidget):
             return None if not text else float(text)
         output = self._inside(project, str(self._value("output_path")).strip(), "output path")
         # the suggested output is its family's stable slot, and the result records that family
-        family = (suggested_family(project, self._members)
-                  if str(output) == suggested_output(project, self._members) else None)
+        family = (suggested_family(project, members)
+                  if str(output) == suggested_output(project, members) else None)
         geometry = rsm_calibration_geometry_input(self._calibration_locator(project),
                                                   refinement=bool(self._value("refinement")))
         # decision 5's defaults (solid angle, polarization 0.99) with the Mask File
         corrections = RSMFrameCorrections(mask_path=self._mask_path(project), solid_angle=True,
                                           polarization_factor=0.99)
         return RSMToolFormV2(
-            project_text, geometry, tuple(members),
+            project_text, geometry, members,
             RSMImageConditioning(float(self._value("offset")), optional("high_threshold"), optional("static_hot")),
             normalization, tuple(_GRIDS[self._value("grid")]), int(self._value("adv_chunk")),
             int(self._value("adv_max_frame_mib")) * _MIB, self._max_chunk_bytes(), output,
@@ -647,13 +743,10 @@ class RSMPage(QtWidgets.QWidget):
         """Any edit: the output suggestion, the section gate and the readiness line (Int's)."""
         self._form_revision += 1
         self._prepared_fingerprint = None
+        self._apply_suggestion()
         project = str(self._value("project_root")).strip()
-        if self._output_suggested and project:
-            suggestion = suggested_output(project, self._members)
-            if suggestion != self._value("output_path"):
-                self._fields["output_path"] = replace(self._fields["output_path"], value=suggestion)
-                self._rows["output_path"].apply_field(self._fields["output_path"])
         self.controls.apply_card_visibility(project)
+        self._source_hints(project)
         named = bool(str(self._value("geometry_path")).strip())
         refinement = self._fields["refinement"]
         if refinement.enabled != named:
@@ -691,19 +784,8 @@ class RSMPage(QtWidgets.QWidget):
             mask = str(self._value("mask_path")).strip()
             if mask and not self._inside(root, mask, "Mask File").is_file():
                 need("experiment", f"the Mask File ({Path(mask).name} not found)")
-            for number, draft in enumerate(self._members, 1):
-                spec = self._inside(root, draft.spec_path, "SPEC") if draft.spec_path else None
-                images = self._inside(root, draft.image_dir, "images") if draft.image_dir else None
-                if spec is None or not spec.is_file():
-                    need("source", f"member {number}'s SPEC file")
-                elif images is None or not images.is_dir():
-                    need("source", f"member {number}'s image folder")
-                elif not draft.scan or not draft.image_stem:
-                    need("source", f"member {number}'s scan and image stem")
-                try:
-                    draft.frame_selector()
-                except ValueError as error:
-                    need("source", f"member {number}'s frames ({error})")
+            for text in self._source_needs(root):
+                need("source", text)
             output = str(self._value("output_path")).strip()
             if not output.endswith(".nexus"):
                 need("project", "an Output ending in .nexus")
@@ -714,15 +796,14 @@ class RSMPage(QtWidgets.QWidget):
         cap = self._chunk_cap_refusal()
         if cap:
             need("processing", f"Advanced {cap}")
-        members = len(self._members)
         grid = "×".join(str(size) for size in _GRIDS[self._value("grid")])
         ready_detail = {"project": "Project folder and Output are ready.",
                         "experiment": "The Calibration (and any Mask File) is ready.",
-                        "source": "Every member's SPEC file, images and frames are ready.",
+                        "source": "The source, its Selection and the frames are ready; Preview finds the scans.",
                         "processing": "The coordinates, grid and normalization are set."}
         calibration = str(self._value("geometry_path")).strip()
         texts = {"project": "", "experiment": Path(calibration).name if calibration else "",
-                 "source": f"{members} member{'s' * (members != 1)}",
+                 "source": self._source_text(),
                  "processing": f"{self._value('coordinates')} · grid {grid}"}
         self._headers = {key: SectionHeaderProjection(
             texts[key], not sections[key],
@@ -730,8 +811,87 @@ class RSMPage(QtWidgets.QWidget):
             for key in sections}
         if needs:
             return "Needs " + ", ".join(needs), False
-        return (f"Ready · RSM · {members} member{'s' * (members != 1)} · {self._value('coordinates')} · "
-                f"grid {grid}"), True
+        return f"Ready · RSM · {texts['source']} · {self._value('coordinates')} · grid {grid}", True
+
+    def _selected_groups(self):
+        """How many RSMs a SPEC Selection makes (Stitch's syntax; groups never span files), None when it is
+        known only once the scans are found (All Scans, NeXus, a Directory). ValueError: not a Selection."""
+        from xrd_tools.sources.grouping import parse_stitch_scan_groups
+        if self._value("source_kind") != "Spec" or self._value("scan_mode") != "Select Scans":
+            return None
+        return len(parse_stitch_scan_groups(str(self._value("scan")))) * max(len(self._source_paths), 1)
+
+    def _source_text(self):
+        """The Source header's status, as Stitch's: the files and what they make."""
+        kind, count = self._value("source_kind"), len(self._source_paths)
+        if not count:
+            return ""
+        if kind == "Directory":
+            return (Path(self._source_paths[0]).name + (" + subfolders" if self._value("subdirs") else "")
+                    + (" · filtered" if str(self._value("name_filter")).strip() else ""))
+        if kind == "NeXus":
+            return f"{count} NeXus file{'s' * (count != 1)}"
+        try:
+            groups = self._selected_groups()
+        except ValueError:
+            groups = 0
+        return f"{count} SPEC file{'s' * (count != 1)} · " + (
+            "all scans" if groups is None else f"{groups} RSM{'s' * (groups != 1)}")
+
+    def _source_needs(self, root):
+        """What the Source still needs, without reading a file (the disk is asked only whether the chosen
+        files and folders exist): its files, the Images folder, an Image stem and Selection that parse, one RSM
+        (a SPEC Selection's count is known here, All Scans' and a Directory's once Preview finds the scans),
+        and the Advanced frame range and Angle mapping."""
+        kind = self._value("source_kind")
+        needs = []
+        files = [Path(path) for path in self._source_files(root)]
+        if not files:
+            needs.append({"Spec": "SPEC files", "NeXus": "NeXus files", "Directory": "a source Folder"}[kind])
+        gone = [path.name for path in files if not (path.is_dir() if kind == "Directory" else path.is_file())]
+        if gone:
+            needs.append(f"the source ({', '.join(gone[:3])}{' …' * (len(gone) > 3)} not found)")
+        if kind != "NeXus":
+            images = str(self._value("image_dir")).strip()
+            if images and not self._inside(root, images, "Images").is_dir():
+                needs.append(f"the Images folder ({Path(images).name} not found)")
+            stem = str(self._value("image_stem")).strip()
+            try:
+                stem.format(spec="spec", scan="1", occurrence="1.1")
+                if any(mark in stem for mark in ("/", "\\", "\0")):
+                    raise ValueError
+            except (KeyError, IndexError, ValueError):
+                needs.append("an Image stem of a file name, its braces {spec}, {scan} or {occurrence}")
+        try:
+            groups = self._selected_groups()
+        except ValueError as error:
+            needs.append(f"a Selection ({error})")
+        else:
+            if groups is not None and groups > 1:
+                needs.append(f"one RSM ({groups} selected; {_ONE_GROUP})")
+        if not any(self._rows[key].refusal() for key in ("frame_first", "frame_last", "frame_step")):
+            try:  # the rows' own refusals are named as Advanced's; here, a Last before the First
+                rsm_frame_selector(self._value("frame_first"), self._value("frame_last"), self._value("frame_step"))
+            except ValueError as error:
+                needs.append(f"Advanced frames ({error})")
+        try:
+            parse_rsm_angle_mapping(self._value("adv_angle_mapping"))
+        except ValueError as error:
+            needs.append(f"Advanced {error}")
+        return needs
+
+    def _source_hints(self, project):
+        """Stitch's placeholders: the automatic Images folder and Image stem of the first SPEC file and scan."""
+        kind = self._value("source_kind")
+        spec = None
+        if kind == "Spec" and self._source_paths:
+            spec = Path(self._source_paths[0]).expanduser()
+            spec = spec if spec.is_absolute() or not project else Path(project).expanduser() / spec
+        first = re.match(r"\s*\[?\s*(\d+)", str(self._value("scan") or "")) if kind == "Spec" else None
+        self._rows["image_dir"].editor.setPlaceholderText(
+            f"auto · {spec.parent}" if spec else "auto · the SPEC file's folder")
+        self._rows["image_stem"].editor.setPlaceholderText(
+            f"auto · {spec.stem if spec else '<SPEC name>'}_scan{first[1] if first else '<N>'}_")
 
     def _show_readiness(self):
         text, ready = self._readiness
@@ -756,8 +916,9 @@ class RSMPage(QtWidgets.QWidget):
         final = self._owner.finalization
         reading = self._reading is not None
         authoring = self._authoring_active()
-        idle = (not busy and not reading and not authoring and final is RSMOwnerFinalization.NONE
-                and not self._closing)
+        resolving = self._resolving is not None
+        idle = (not busy and not reading and not authoring and not resolving
+                and final is RSMOwnerFinalization.NONE and not self._closing)
         self.controls.set_editors_enabled(idle)  # the action row stays usable: Retry (Codex F2)
         self.calibrate_button.setEnabled(idle)
         self.mask_button.setEnabled(idle)
@@ -766,7 +927,6 @@ class RSMPage(QtWidgets.QWidget):
         if not any(dialog.isVisible() or dialog.active() for dialog in self._authoring_dialogs):
             self._authoring_timer.stop()
         self.run_bar.set_mode_row_enabled(idle)
-        self.member_table.setEnabled(idle)
         self.advanced.setEnabled(idle)
         self.browser.set_action_enabled("Open…", not busy and not reading and not self._closing)
         self.preview_button.setEnabled(idle)
@@ -775,8 +935,9 @@ class RSMPage(QtWidgets.QWidget):
         # Stitch's: "▶ Run" throughout (RSM has no pause), enabled while idle and ready
         self.run_bar.startButton.setEnabled(idle and self._readiness[1])
         identity = self._owner.current_identity if busy else None
-        self.run_bar.set_stop_enabled(identity is not None and identity.request.action in {
-            RSMOwnerAction.PREFLIGHT, RSMOwnerAction.RUN})  # what the owner cancels
+        self.run_bar.set_stop_enabled((resolving and self._resolving[1] is not None) or (
+            identity is not None and identity.request.action in {
+                RSMOwnerAction.PREFLIGHT, RSMOwnerAction.RUN}))  # what the owner cancels, or finding the scans
 
     # ── the owner ──
     def _control_action(self, action):
@@ -788,21 +949,38 @@ class RSMPage(QtWidgets.QWidget):
     def _authoring_active(self):
         return any(dialog.active() for dialog in self._authoring_dialogs)
 
+    def _reader_options(self):
+        """The raw decoder as the calibration and mask windows read a frame with it (ValueError naming a refused
+        Advanced row)."""
+        refused = self._advanced_refusal(SectionId.SOURCE)
+        if refused:
+            raise ValueError(f"Advanced {refused}")
+        return dict(detector_shape=(int(self._value("adv_rows")), int(self._value("adv_columns"))),
+                    raw_dtype=str(self._value("adv_dtype")), raw_header_skip=int(self._value("adv_header")))
+
     def _source_spec_for_tools(self):
-        """The selected member's scan, for the calibration and mask windows (None without one)."""
+        """The first selected scan (or NeXus file), for the calibration and mask windows, from the Source rows
+        without reading (Stitch's ``_source_spec_for_tools``); None for a folder or without a source."""
         from xrd_tools.core.scan import SourceKind, SourceSpec
+        from xrd_tools.sources.grouping import parse_stitch_scan_groups
         project = str(self._value("project_root")).strip()
-        if not project or not 0 <= self._selected < len(self._members):
-            return None
-        draft = self._members[self._selected]
-        if not draft.spec_path or not draft.image_dir:
+        kind = self._value("source_kind")
+        if not project or not self._source_paths or kind == "Directory":
             return None
         root = Path(project).expanduser()
-        return SourceSpec(str(self._inside(root, draft.spec_path, "SPEC path")), SourceKind.SPEC, options={
-            "scan": draft.scan, "image_dir": str(self._inside(root, draft.image_dir, "image directory")),
-            "image_stem": draft.image_stem or None,
-            "read_image_kwargs": dict(detector_shape=(draft.detector_rows, draft.detector_columns),
-                                      raw_dtype=draft.raw_dtype, raw_header_skip=draft.raw_header_skip)})
+        path = Path(self._source_files(root)[0])
+        if kind == "NeXus":
+            return SourceSpec(str(path), SourceKind.NEXUS_STACK)
+        try:  # a Selection or stem readiness refuses opens the window without a scan
+            scan = parse_stitch_scan_groups(str(self._value("scan") or "1"))[0][0]
+            stem = str(self._value("image_stem")).strip().format(spec=path.stem, scan=scan.split(".")[0],
+                                                                  occurrence=scan)
+        except (KeyError, IndexError, ValueError):
+            return None
+        images = str(self._value("image_dir")).strip()
+        return SourceSpec(str(path), SourceKind.SPEC, options={
+            "scan": scan, "image_dir": str(self._inside(root, images, "Images")) if images else str(path.parent),
+            "image_stem": stem or None, "read_image_kwargs": self._reader_options()})
 
     def _calibrate(self):
         """Calibrate: the shared calibration window with RSM's context ("Save geometry and use in RSM"), so RSM
@@ -843,17 +1021,13 @@ class RSMPage(QtWidgets.QWidget):
             self.set_field("mask_path", dialog.saved_mask)
 
     def _make_mask(self):
-        """Make Mask: the shared mask window on the selected member's scan; its saved mask fills Mask File."""
+        """Make Mask: the shared mask window on the first selected scan; its saved mask fills Mask File."""
         from xdart.gui.tabs.calibration.mask import MaskDialog
         if self._owner.busy or self._closing or self._authoring_active():
             return
         try:
-            draft = self._members[self._selected]
             dialog = MaskDialog(str(self._value("project_root")), source=self._source_spec_for_tools(), rotation=0,
-                                reader_options=dict(detector_shape=(draft.detector_rows, draft.detector_columns),
-                                                    raw_dtype=draft.raw_dtype,
-                                                    raw_header_skip=draft.raw_header_skip, rotation=0),
-                                parent=self)
+                                reader_options=dict(self._reader_options(), rotation=0), parent=self)
             self._authoring_dialogs.append(dialog)
             revision = self._form_revision
             dialog.maskSaved.connect(lambda path: self.set_field("mask_path", str(path))
@@ -865,11 +1039,12 @@ class RSMPage(QtWidgets.QWidget):
         except (TypeError, ValueError, OSError) as error:
             self._notice(str(error))
 
-    def _current_form(self):
+    def _current_form(self, *, quiet=False):
         try:
             return self.build_form()
         except (TypeError, ValueError, OverflowError) as error:
-            self._notice(f"Invalid RSM request: {error}")
+            if not quiet:
+                self._notice(f"Invalid RSM request: {error}")
             return None
 
     def _commit_typing(self):
@@ -882,23 +1057,72 @@ class RSMPage(QtWidgets.QWidget):
             focused.clearFocus()  # the row commits on the focus-out, as Return or Tab would
 
     def begin_preview(self):
-        """Preview: check the inputs and list every exact identity, without gridding."""
+        """Preview: find the Source's scans, check the inputs and list every exact identity, without
+        gridding."""
         self._commit_typing()
-        self._begin_preflight(run=False)
+        self._find_scans("preview")
 
     def begin_run(self):
-        """Run: Preview the inputs, then grid them (as Stitch's Run prepares first)."""
+        """Run: find the Source's scans again, then grid them, Previewing first unless the prepared Preview is
+        still the current form (as Stitch's Run prepares first)."""
         self._commit_typing()
         if not self._readiness[1]:
             self._notice(self._readiness[0])
             return
+        self._find_scans("run")
+
+    def _find_scans(self, action):
+        """Find the Source's member groups on the shared single worker (``rsm_member_groups`` reads the SPEC
+        files and lists the images, off the GUI thread; S2), then go on to ``action`` (``_continue``)."""
+        if self._owner.busy or self._resolving is not None:  # a running result keeps its form
+            self._notice("RSM is busy · try again once it is done")
+            return
+        try:
+            request = self._resolution_request()
+        except (TypeError, ValueError) as error:
+            self._notice(f"Invalid RSM request: {error}")
+            return
+        identity = self._resolver.begin(request)
+        if identity is None:
+            self._notice("RSM is busy · try again once it is done")
+            return
+        self._resolving = (identity, action, self._group_key())
+        self._status("Finding the source's scans…")
+        self._timer.start()
+        self._sync_actions()
+
+    def _poll_resolver(self):
+        if self._resolving is None:
+            return
+        identity, action, key = self._resolving
+        update = self._resolver.poll(identity)
+        if update is None or update.terminal is None:
+            return
+        self._resolving = None
+        terminal = update.terminal
+        if action is None:  # stopped: whatever was found is dropped
+            self._notice("RSM stopped")
+        elif terminal.status is OperationTerminalStatus.FAILED:
+            self._notice(f"Source refused: {terminal.failure_message or terminal.failure_type}")
+        elif terminal.status is OperationTerminalStatus.RETURNED and terminal.payload is not None:
+            groups, skipped = terminal.payload
+            if key != self._group_key():
+                self._notice("The scans were found, but the Source changed: Preview again")
+                return
+            self._found(key, groups, skipped)
+            self._continue(action)
+        else:
+            self._notice("RSM stopped")
+
+    def _continue(self, action):
+        """Preview, or Run, on the member groups just found."""
         form = self._current_form()
         if form is None:
             return
-        if self._prepared_fingerprint == form.fingerprint and self._owner.prepared is not None:
+        if action == "run" and self._prepared_fingerprint == form.fingerprint and self._owner.prepared is not None:
             self._start_run(form)
         else:
-            self._begin_preflight(run=True, form=form)
+            self._begin_preflight(run=action == "run", form=form)
 
     def _begin_preflight(self, *, run, form=None):
         if self._owner.busy:  # a running result keeps its form
@@ -938,7 +1162,13 @@ class RSMPage(QtWidgets.QWidget):
         self._sync_actions()
 
     def stop(self):
-        if self._owner.cancel():
+        if self._resolving is not None and self._resolving[1] is not None:
+            identity, _action, key = self._resolving
+            self._resolver.cancel(identity)
+            self._resolving = (identity, None, key)  # finding the scans has no stop point: its result is dropped
+            self._status("Stopping…")
+            self._sync_actions()
+        elif self._owner.cancel():
             self._status("Stopping…")
         return ActionAccepted("rsm-stop")
 
@@ -960,10 +1190,11 @@ class RSMPage(QtWidgets.QWidget):
             if update is not None:
                 self._accept(update)
             self._poll_reader()
+            self._poll_resolver()
         except Exception as error:
             _LOG.exception("RSM page update failed")
             self._notice(f"RSM_VIEW_PRESENTATION_FAILED: {error}")
-        if not self._owner.busy and self._reading is None:
+        if not self._owner.busy and self._reading is None and self._resolving is None:
             self._timer.stop()
         self._sync_actions()
 
@@ -983,7 +1214,7 @@ class RSMPage(QtWidgets.QWidget):
         outcome = update.outcome
         if outcome.kind is RSMOwnerOutcomeKind.PREFLIGHT_READY:
             preflight = outcome.preflight
-            current = self._current_form()
+            current = self._current_form(quiet=True)
             if update.stale or self._active_revision != self._form_revision or current is None \
                     or not preflight.is_current(current):
                 self._run_requested = False
@@ -992,6 +1223,8 @@ class RSMPage(QtWidgets.QWidget):
             self._prepared_fingerprint = preflight.form.fingerprint
             summary = preflight.summary
             lines = rsm_preflight_summary_lines(summary)
+            for path, scan, reason in (self._groups[2] if self._groups else ()):  # what the Source skipped
+                lines.append(f"Skipped {' '.join(part for part in (Path(path).name, str(scan)) if part)}: {reason}")
             if preflight.output_current:  # as Stitch's Preview says it
                 lines.append(f"Output {Path(preflight.form.output_path).name}: already gridded with these "
                              "settings (Append skips it)")
@@ -1206,12 +1439,27 @@ class RSMPage(QtWidgets.QWidget):
 
     # ── paths ──
     def _browse(self, key):
+        """Browse as Int and Stitch do: the last folder picked, the same file types for the same inputs; the
+        Source's files by its kind (SPEC files, NeXus files, or a folder)."""
         from xdart.gui.widgets import file_dialogs as dialogs
-        common = dict(current=str(self._value(key) or ""), fallback=str(self._value("project_root") or ""))
-        if key in {"project_root", "member_images"}:
-            picks = dialogs.browse(self, "Choose folder", folder=True, **common)
-        elif key == "member_spec":
-            picks = dialogs.browse_spec(self, "Choose SPEC file", **common)
+        kind = self._value("source_kind")
+        current = self._source_paths[0] if key == "spec_path" and self._source_paths else self._value(key)
+        common = dict(current=str(current or ""), fallback=str(self._value("project_root") or ""))
+        if key in {"project_root", "image_dir"} or key == "spec_path" and kind == "Directory":
+            picks = dialogs.browse(self, {"image_dir": "Choose images folder"}.get(key, "Choose folder"),
+                                   folder=True, **common)
+            if picks and key == "spec_path":
+                self.set_sources(picks[:1])
+                return
+        elif key == "spec_path":
+            if kind == "Spec":  # SPEC files have no extension: only they are listed
+                picks = dialogs.browse_spec(self, "Choose SPEC files", many=True, **common)
+            else:
+                picks = dialogs.browse(self, "Choose NeXus files", many=True, file_filter=dialogs.NEXUS_FILTER,
+                                       **common)
+            if picks:
+                self.set_sources(picks)
+            return
         elif key in {"geometry_path", "mask_path"}:  # Int's file types for the same inputs
             title, file_filter = (("Choose calibration", dialogs.CALIBRATION_FILTER) if key == "geometry_path"
                                   else ("Choose detector mask", dialogs.MASK_FILTER))
@@ -1239,7 +1487,7 @@ class RSMPage(QtWidgets.QWidget):
             self.modeRequested.emit(str(SCATTERING_PAGE_KEY), str(mode))
 
     def active(self):
-        return bool(self._owner.busy or self._reading is not None
+        return bool(self._owner.busy or self._reading is not None or self._resolving is not None
                     or self._owner.finalization is not RSMOwnerFinalization.NONE or self._authoring_active())
 
     def mount_points(self):
@@ -1260,7 +1508,7 @@ class RSMPage(QtWidgets.QWidget):
         self._closing = True
         self._timer.stop()
         self._authoring_timer.stop()
-        receipts = (self._owner.close(), self._reader.close(),
+        receipts = (self._owner.close(), self._reader.close(), self._resolver.close(),
                     *(dialog.shutdown() for dialog in self._authoring_dialogs))
         pending = [receipt for receipt in receipts if receipt.status is not PageCleanup.CLEAN]
         if pending:
