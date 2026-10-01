@@ -2432,6 +2432,24 @@ class ControlsPanel(QtWidgets.QWidget):
         a click emits ``controlActionRequested``."""
         return self._add_actions(card, actions, expand=expand)
 
+    def set_editors_enabled(self, enabled: bool) -> None:
+        """Lock or unlock every row of the four sections except their action rows,
+        whose buttons keep their own availability: Int locks its rows field by field
+        through its projection; a page that renders its own rows and actions (Stitch,
+        RSM) locks them here, not by disabling the panel, whose disabled ancestry
+        would also disable an action that must stay usable (a pending result's Retry,
+        Codex's RSM stage-1 review F2)."""
+        for card in (
+            self.project_card,
+            self.experiment_card,
+            self.source_card,
+            self.processing_card,
+        ):
+            for index in range(card.body_layout.count()):
+                row = card.body_layout.itemAt(index).widget()
+                if row is not None and row.objectName() != "controlsActionRow":
+                    row.setEnabled(bool(enabled))
+
     def _add_actions(
         self,
         card: SectionCard,

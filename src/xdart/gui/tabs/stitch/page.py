@@ -2869,7 +2869,8 @@ class StitchPage(QtWidgets.QWidget):
         busy, final = self._owner.busy, self._owner.finalization
         authoring = self._authoring_active()
         idle = not busy and not authoring and final is StitchOwnerFinalization.NONE and not self._closing
-        self.controls.setEnabled(idle)
+        # the editors lock and the action row stays usable: a pending result's Retry (Codex's RSM review F2)
+        self.controls.set_editors_enabled(idle)
         self.run_bar.set_mode_row_enabled(idle)  # as Int's: the mode and Append/Replace hold during a run
         for widget in (self.run_bar.coresSpin, self.run_bar.coresLabel):
             widget.setToolTip(_CORES_TIP)
@@ -2894,6 +2895,7 @@ class StitchPage(QtWidgets.QWidget):
         self.open_button.setEnabled(idle)
         self.metadata_button.setEnabled(idle and self._current_payload() is not None)
         self.preview_button.setEnabled(idle)
+        self.advanced_button.setEnabled(idle)
         self.run_bar.startButton.setEnabled(idle and self._readiness[1])  # Run prepares the inputs itself
         action = self._owner.current_identity.request.action if busy else None
         self.run_bar.set_stop_enabled(action is StitchOwnerAction.RUN or (

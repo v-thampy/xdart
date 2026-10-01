@@ -16,6 +16,7 @@ from xdart.gui.tabs.scattering.shell_values import AxisProjection
 from xdart.gui.tabs.scattering.shell_widgets import ScientificImagePane
 from xdart.gui.widgets.scientific_plot import PlotCursorReadout
 from xrd_tools.session.display_logic import PanelRole
+from xrd_tools.session.rsm_viewer_model import rsm_axis_bounds
 
 
 def _labels(values):
@@ -122,9 +123,11 @@ class RSMResultView(QtWidgets.QWidget):
             if product.panel_key.role is PanelRole.SLICE_2D:
                 y_label = labels[vertical]
                 pane = self.slices[index]
+                # the pane's image spans its axes' first to last values: the bins' outer edges, so each
+                # pixel sits at its bin centre, as in the RSM dialog (Codex's stage-1 review F3)
                 pane.render(np.asarray(product.values),
-                            x_axis=AxisProjection(np.asarray(product.x_axis, dtype=float), x_label, ""),
-                            y_axis=AxisProjection(np.asarray(product.y_axis_or_none, dtype=float), y_label, ""),
+                            x_axis=AxisProjection(np.array(rsm_axis_bounds(product.x_axis)), x_label, ""),
+                            y_axis=AxisProjection(np.array(rsm_axis_bounds(product.y_axis_or_none)), y_label, ""),
                             color_map=color_map, log_scale=log_scale)
                 pane.plot.setTitle(titles[index])
             else:

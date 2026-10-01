@@ -73,6 +73,26 @@ def rsm_viewer_layout(
     raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
 
 
+def rsm_axis_bounds(values: object) -> tuple[float, float]:
+    """The outer edges of a slice axis's bins, from their centres: half a bin
+    beyond the first and last centre, where an image of the slice begins and ends
+    so that each pixel sits at its bin's centre (the RSM dialog's and the RSM
+    page's slices)."""
+
+    axis = np.asarray(values, dtype=np.float64)
+    if (
+        axis.ndim != 1
+        or axis.size < 2
+        or not np.all(np.isfinite(axis))
+        or not np.all(np.diff(axis) > 0)
+    ):
+        raise ValueError("strict RSM display axis is invalid")
+    return (
+        float(axis[0] - (axis[1] - axis[0]) / 2),
+        float(axis[-1] + (axis[-1] - axis[-2]) / 2),
+    )
+
+
 def _rsm_viewer_panel_order(
     coordinate_frame: RSMCoordinateFrame,
 ) -> tuple[PanelKey, ...]:
@@ -1223,5 +1243,6 @@ __all__ = [
     "RSMViewerValues",
     "make_rsm_viewer_state",
     "make_rsm_viewer_values",
+    "rsm_axis_bounds",
     "rsm_viewer_layout",
 ]

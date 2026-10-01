@@ -12,6 +12,7 @@ import pytest
 
 pytest.importorskip("pyqtgraph")
 
+from pyqtgraph.Qt import QtCore
 from xdart.gui.pages.operation_owner import SingleWorkerOwner
 from xdart.gui.pages.services import empty_host_services
 from xdart.gui.pages.values import PageCleanup
@@ -321,3 +322,156 @@ def test_scan43_through_the_page_commits_and_reopens_the_reference_result(qapp, 
         np.testing.assert_array_equal(page.view.shown[0].intensity, committed.intensity)
     finally:
         _close(page, qapp)
+
+
+# Codex's stage-1 review (2026-10-01, REWORK), its reproductions adapted
+
+
+@pytest.mark.parametrize("key", ("member_first", "member_step"))
+def test_invalid_frame_text_stays_as_typed_and_is_refused(qapp, tmp_path, key):
+    """F1: a First or Step that is not a whole number stays as typed, and readiness and the form refuse it;
+    the member's earlier numbers no longer run unseen."""
+    page = _page(qapp)
+    try:
+        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        assert page._readiness[1], page._readiness
+        page.set_field(key, "invalid")
+        assert page._value(key) == "invalid" and page.member_table.item(0, 3).text() == "invalid"
+        assert not page._readiness[1] and "member 1's frames" in page._readiness[0]
+        assert not page.run_bar.startButton.isEnabled()
+        with pytest.raises(ValueError, match="must be a whole number"):
+            page.build_form()
+    finally:
+        _close(page, qapp)
+
+
+def test_a_zero_frame_step_is_refused_without_a_table_exception(qapp, tmp_path):
+    """F1: Step 0 divided in the member table's frame count before anything refused it."""
+    page = _page(qapp)
+    try:
+        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        page.set_field("member_step", "0")
+        assert page.member_table.item(0, 3).text() == "invalid"
+        assert not page._readiness[1] and "Frame step must be 1 or more" in page._readiness[0]
+        with pytest.raises(ValueError, match="Frame step must be 1 or more"):
+            page.build_form()
+    finally:
+        _close(page, qapp)
+
+
+def test_a_pending_verification_keeps_a_clickable_retry(qapp, tmp_path, monkeypatch):
+    """F2: the real owner, preflight, gridding and publisher; one transient failure of the strict reload
+    leaves the saved result VERIFICATION_PENDING. The Controls editors lock, its action row does not: Retry
+    is clickable and verifies the saved result."""
+    import tifffile
+    import xrd_tools.analysis.rsm_operation as operation
+    page = _page(qapp)
+    real_read = operation.read_analysis_artifact
+    reads = []
+
+    def fail_once(*args, **kwargs):
+        reads.append(str(args[0]))
+        if len(reads) == 1:
+            raise OSError("transient read failure")
+        return real_read(*args, **kwargs)
+
+    try:
+        drafts = _synthetic_members(tmp_path)
+        for ordinal in range(2):
+            images = tmp_path / drafts[ordinal].image_dir
+            for label in range(2):
+                tifffile.imwrite(images / f"member{ordinal}_{label:04d}.tif",
+                                 np.full((195, 487), 10 + ordinal + label, dtype=np.uint16))
+        _with_members(page, tmp_path, drafts)
+        monkeypatch.setattr(operation, "read_analysis_artifact", fail_once)
+        page.begin_run()
+        _wait(page, qapp, lambda: page._owner.finalization is rsm_owner.RSMOwnerFinalization.VERIFICATION_PENDING)
+        assert Path(page._value("output_path")).is_file()
+        assert not page._rows["output_path"].isEnabled() and page.retry_button.isEnabled()
+        page.retry_button.click()
+        qapp.processEvents()
+        assert page._owner.busy, "the Retry click did not start the retained verification"
+        _wait(page, qapp, lambda: not page.active())
+        assert page.view.shown is not None and len(reads) == 2
+    finally:
+        monkeypatch.setattr(operation, "read_analysis_artifact", real_read)
+        _wait(page, qapp, lambda: page.close_page().status is PageCleanup.CLEAN)
+        page.deleteLater()
+        qapp.processEvents()
+
+
+@pytest.mark.parametrize("frame", tuple(RSMCoordinateFrame), ids=lambda frame: frame.value)
+def test_each_slice_pixel_sits_at_its_bin_centre(qapp, frame):
+    """F3: the shared pane spans an image over its axes' first and last values, so the slices give it their
+    bins' outer edges (the dialog's half-bin bounds, now one headless helper): each pixel centre is its bin
+    centre, as the projections plot them. Codex's example: H 10..30, K 100..106."""
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, project_analysis_artifact_result
+    from xrd_tools.session.rsm_viewer_model import RSMViewerModel, make_rsm_viewer_values
+    axes = (np.array([10, 20, 30.]), np.array([100, 102, 104, 106.]), np.array([-2, -1.5, -1, -.5, 0.]))
+    values = make_rsm_viewer_values(project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.RSM, axes=tuple(zip(frame.axis_names, axes, strict=True)),
+        axis_units=tuple(zip(frame.axis_names, frame.axis_units, strict=True)),
+        intensity=np.arange(60, dtype=np.float64).reshape(3, 4, 5) + 1, sigma=None, coverage=None,
+        normalization=None))
+    view = RSMResultView()
+    try:
+        snapshot = RSMViewerModel().snapshot(values, h_index=1, k_index=2, l_index=3)
+        view.show_snapshot(values, snapshot)
+        for pane, product in zip(view.slices, snapshot.products[:3], strict=True):
+            x, y = np.asarray(product.x_axis), np.asarray(product.y_axis_or_none)
+            first = pane.image.mapToParent(QtCore.QPointF(.5, .5))
+            last = pane.image.mapToParent(QtCore.QPointF(x.size - .5, y.size - .5))
+            assert (first.x(), first.y(), last.x(), last.y()) == pytest.approx(
+                (x[0], y[0], x[-1], y[-1]), abs=1e-9)
+        first = view.slices[0].image.mapToParent(QtCore.QPointF(.5, .5))
+        last = view.slices[0].image.mapToParent(QtCore.QPointF(2.5, 3.5))
+        assert (first.x(), first.y(), last.x(), last.y()) == pytest.approx((10, 100, 30, 106), abs=1e-9)
+    finally:
+        view.deleteLater()
+        qapp.processEvents()
+
+
+def test_a_late_read_does_not_override_the_newer_selection(qapp, tmp_path):
+    """F4: real saved records on the shared single-worker reader. An evicted result A is selected (its
+    read held back, as a slow disk would), then a kept B: A's read, when it returns, is kept but neither
+    selected nor painted over B."""
+    from threading import Event
+    from tests.core.test_analysis_artifact import (
+        test_analysis_artifact_v2_rsm_round_trip_is_a_closed_exact_branch as write_record,
+    )
+    paths = []
+    for index in range(page_module._RESIDENT_RESULTS + 1):  # the first is evicted
+        root = tmp_path / f"r{index}"
+        root.mkdir()
+        write_record(root, False)
+        paths.append(str(root / "rsm-artifact-v2.nexus"))
+    started, released, hold = Event(), Event(), []
+
+    def read(path, cancel, progress):
+        if hold and path == paths[0]:
+            started.set()
+            assert released.wait(10), "the held read was not released"
+        return page_module._read_rsm_record(path, cancel, progress)
+
+    page = _page(qapp, owner=_Owner(), reader=SingleWorkerOwner(read))
+    role = QtCore.Qt.ItemDataRole.UserRole
+    try:
+        for path in paths:
+            assert page.reopen(path)
+            _wait(page, qapp, lambda: not page.active())
+        assert page._results[paths[0]] is None and page._results[paths[1]] is not None
+        hold.append(True)
+        page.results.setCurrentRow(0)
+        assert started.wait(3)
+        page.results.setCurrentRow(1)
+        shown = page.view.shown
+        assert page.results.currentItem().data(role) == paths[1]
+        released.set()
+        _wait(page, qapp, lambda: not page.active())
+        assert page.results.currentItem().data(role) == paths[1] and page.view.shown is shown
+        assert page._results[paths[0]] is not None  # kept for its next selection
+    finally:
+        released.set()
+        _wait(page, qapp, lambda: page.close_page().status is PageCleanup.CLEAN)
+        page.deleteLater()
+        qapp.processEvents()

@@ -36,6 +36,7 @@ from xrd_tools.session.rsm_viewer_model import (
     RSMViewerSnapshot,
     RSMViewerValues,
     make_rsm_viewer_values,
+    rsm_axis_bounds,
 )
 
 from .rsm_owner import (
@@ -46,7 +47,6 @@ from .rsm_owner import (
     RSMToolOwner,
 )
 from .rsm_values import (
-    RSMFrameSelector,
     RSMMemberDraft,
     RSMScanMemberForm,
     RSMToolFormV2,
@@ -819,17 +819,12 @@ class RSMToolDialog(QtWidgets.QDialog):
         return path if path.is_absolute() else project_path / path
 
     def _member_form(self, member, project_path):
-        stop = member.frame_stop.strip()
         return RSMScanMemberForm(
             self._inside_project(project_path, member.spec_path, "SPEC path"),
             member.scan,
             self._inside_project(project_path, member.image_dir, "image directory"),
             member.image_stem,
-            RSMFrameSelector(
-                member.frame_start,
-                None if not stop else int(stop),
-                member.frame_step,
-            ),
+            member.frame_selector(),
             (member.detector_rows, member.detector_columns),
             member.raw_dtype,
             member.raw_header_skip,
@@ -1104,27 +1099,12 @@ class RSMToolDialog(QtWidgets.QDialog):
             summary.geometry_asset_receipt_fingerprint,
         )
 
-    @staticmethod
-    def _axis_edges(values):
-        axis = np.asarray(values, dtype=np.float64)
-        if (
-            axis.ndim != 1
-            or axis.size < 2
-            or not np.all(np.isfinite(axis))
-            or not np.all(np.diff(axis) > 0)
-        ):
-            raise ValueError("strict RSM display axis is invalid")
-        return (
-            float(axis[0] - (axis[1] - axis[0]) / 2),
-            float(axis[-1] + (axis[-1] - axis[-2]) / 2),
-        )
-
     def _stage_surface(self, snapshot):
         staged = []
         for product in snapshot.products:
             if product.panel_key.role is PanelRole.SLICE_2D:
-                x0, x1 = self._axis_edges(product.x_axis)
-                y0, y1 = self._axis_edges(product.y_axis_or_none)
+                x0, x1 = rsm_axis_bounds(product.x_axis)
+                y0, y1 = rsm_axis_bounds(product.y_axis_or_none)
                 item = pg.ImageItem(axisOrder="row-major")
                 item.setImage(np.asarray(product.values), autoLevels=True)
                 item.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))

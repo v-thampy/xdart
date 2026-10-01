@@ -31,8 +31,7 @@ from xdart.gui.tools.rsm_owner import (
     RSMOwnerAction, RSMOwnerFinalization, RSMOwnerOutcomeKind, RSMOwnerUpdate, RSMToolOwner,
 )
 from xdart.gui.tools.rsm_values import (
-    RSMFrameSelector, RSMMemberDraft, RSMScanMemberForm, RSMToolFormV2, rsm_preflight_summary_lines,
-    rsm_tool_preset,
+    RSMMemberDraft, RSMScanMemberForm, RSMToolFormV2, rsm_preflight_summary_lines, rsm_tool_preset,
 )
 from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow
 from xdart.gui.widgets.run_controls import RunControlsBar
@@ -149,6 +148,7 @@ class RSMPage(QtWidgets.QWidget):
         self._active_revision = None
         self._prepared_fingerprint = None
         self._results = OrderedDict()  # path → payload, the most recent last
+        self._requested = None  # the result last asked to be shown: a late read shows only it (Codex F4)
         self._model = None
         self._closing = False
         self._build_ui()
@@ -404,12 +404,10 @@ class RSMPage(QtWidgets.QWidget):
         draft.scan = str(self._value("member_scan")).strip()
         draft.image_dir = str(self._value("member_images")).strip()
         draft.image_stem = str(self._value("member_stem")).strip()
-        for attribute, key in (("frame_start", "member_first"), ("frame_step", "member_step")):
-            try:
-                setattr(draft, attribute, int(str(self._value(key)).strip()))
-            except ValueError:
-                pass  # readiness names it
+        # the frame fields as typed: readiness and the form refuse what is not a frame range (Codex F1)
+        draft.frame_start = str(self._value("member_first")).strip()
         draft.frame_stop = str(self._value("member_last")).strip()
+        draft.frame_step = str(self._value("member_step")).strip()
         draft.detector_rows, draft.detector_columns = self.detector_rows.value(), self.detector_columns.value()
         draft.raw_dtype = self.raw_dtype.currentText()
         draft.raw_header_skip = self.raw_header.value()
@@ -501,11 +499,10 @@ class RSMPage(QtWidgets.QWidget):
         project = Path(project_text).expanduser()
         members = []
         for draft in self._members:
-            stop = draft.frame_stop.strip()
             members.append(RSMScanMemberForm(
                 self._inside(project, draft.spec_path, "SPEC path"), draft.scan,
                 self._inside(project, draft.image_dir, "image directory"), draft.image_stem,
-                RSMFrameSelector(draft.frame_start, None if not stop else int(stop), draft.frame_step),
+                draft.frame_selector(),
                 (draft.detector_rows, draft.detector_columns), draft.raw_dtype, draft.raw_header_skip,
                 tuple((role, MetadataColumnSelector(name, occurrence)) for role, name, occurrence in zip(
                     _PSIC_ROLES, draft.selector_names, draft.selector_occurrences, strict=True))))
@@ -568,6 +565,10 @@ class RSMPage(QtWidgets.QWidget):
                 needs.append(f"member {number}'s image folder")
             elif not draft.scan or not draft.image_stem:
                 needs.append(f"member {number}'s scan and image stem")
+            try:
+                draft.frame_selector()
+            except ValueError as error:
+                needs.append(f"member {number}'s frames ({error})")
         output = str(self._value("output_path")).strip()
         if not output.endswith(".nexus"):
             needs.append("an Output ending in .nexus")
@@ -599,12 +600,13 @@ class RSMPage(QtWidgets.QWidget):
         final = self._owner.finalization
         reading = self._reading is not None
         idle = not busy and not reading and final is RSMOwnerFinalization.NONE and not self._closing
-        self.controls.setEnabled(idle)
+        self.controls.set_editors_enabled(idle)  # the action row stays usable: Retry (Codex F2)
         self.run_bar.set_mode_row_enabled(idle)
         self.member_table.setEnabled(idle)
         self.advanced.setEnabled(idle)
         self.open_button.setEnabled(not busy and not reading and not self._closing)
         self.preview_button.setEnabled(idle)
+        self.advanced_button.setEnabled(idle)
         self.retry_button.setEnabled(not busy and final is not RSMOwnerFinalization.NONE and not self._closing)
         # Stitch's: "▶ Run" throughout (RSM has no pause), enabled while idle and ready
         self.run_bar.startButton.setEnabled(idle and self._readiness[1])
@@ -809,6 +811,7 @@ class RSMPage(QtWidgets.QWidget):
             self._notice("A result is still being read")
             return False
         self._reading = (identity, str(path))
+        self._requested = str(path)
         self._status(f"Reading {Path(path).name}…")
         self._timer.start()
         self._sync_actions()
@@ -824,18 +827,31 @@ class RSMPage(QtWidgets.QWidget):
         self._reading = None
         terminal = update.terminal
         if terminal.status is OperationTerminalStatus.RETURNED and terminal.payload is not None:
-            self._add_result(path, terminal.payload)
-            self._status(f"Opened {Path(path).name}", ready=True)
+            # kept either way; shown only if it is still the result asked for (Codex's stage-1 review F4)
+            shown = path == self._requested
+            self._add_result(path, terminal.payload, show=shown)
+            if shown:
+                self._status(f"Opened {Path(path).name}", ready=True)
+            else:  # the selection moved on while this was read: the selected one is read now
+                self._show_readiness()
+                if self._requested in self._results and self._results[self._requested] is None:
+                    self.reopen(self._requested)
         elif terminal.status is OperationTerminalStatus.FAILED:
             self._notice(f"Could not open {Path(path).name}: {terminal.failure_message or terminal.failure_type}")
 
     def _add_result(self, path, payload, *, show=True):
-        """List a result and keep its payload; the oldest beyond the newest few are read again when shown."""
+        """List a result and keep its payload; the oldest beyond the newest few are read again when shown
+        (the one asked to be shown stays: a late read kept beside it does not push it out)."""
+        if show:
+            self._requested = path
         self._results[path] = payload
         self._results.move_to_end(path)
         resident = [key for key, value in self._results.items() if value is not None]
-        for key in resident[:-_RESIDENT_RESULTS]:
-            self._results[key] = None
+        excess = len(resident) - _RESIDENT_RESULTS
+        for key in resident:
+            if excess > 0 and key != self._requested:
+                self._results[key] = None
+                excess -= 1
         for row in range(self.results.count()):
             if self.results.item(row).data(QtCore.Qt.ItemDataRole.UserRole) == path:
                 item = self.results.item(row)
@@ -855,9 +871,11 @@ class RSMPage(QtWidgets.QWidget):
         if current is None:
             return
         path = current.data(QtCore.Qt.ItemDataRole.UserRole)
+        self._requested = path
         payload = self._results.get(path)
         if payload is None:
-            self.reopen(path)
+            if self._reading is None:  # else it is read once the read in flight returns (_poll_reader)
+                self.reopen(path)
             return
         try:
             self._show(payload)

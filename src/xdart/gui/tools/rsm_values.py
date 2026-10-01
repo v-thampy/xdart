@@ -593,15 +593,16 @@ def rsm_tool_preset(
 @dataclass(slots=True)
 class RSMMemberDraft:
     """One ordered RSM member as an editor holds it (text and numbers, not yet a validated
-    ``RSMScanMemberForm``): the RSM dialog's and the RSM page's member draft."""
+    ``RSMScanMemberForm``): the RSM dialog's and the RSM page's member draft. The page's frame fields
+    hold the text as typed (the dialog's spin boxes, numbers): ``frame_selector`` reads and refuses it."""
 
     spec_path: str
     scan: str
     image_dir: str
     image_stem: str
-    frame_start: int
+    frame_start: int | str
     frame_stop: str
-    frame_step: int
+    frame_step: int | str
     detector_rows: int
     detector_columns: int
     raw_dtype: str
@@ -646,14 +647,38 @@ class RSMMemberDraft:
             tuple(self.selector_occurrences),
         )
 
+    def frame_selector(self) -> RSMFrameSelector:
+        """The member's frame labels as typed: First a whole number from 0, Step one from 1 and Last
+        blank (to the source's end) or a whole number from First. A ValueError names the first field
+        that is not."""
+        numbers = []
+        for name, value in (("First frame", self.frame_start), ("Frame step", self.frame_step)):
+            try:
+                numbers.append(value if type(value) is int else int(str(value).strip()))
+            except ValueError:
+                raise ValueError(f"{name} must be a whole number, not {str(value).strip()!r}") from None
+        start, step = numbers
+        last = str(self.frame_stop).strip()
+        try:
+            stop = None if not last else int(last)
+        except ValueError:
+            raise ValueError(f"Last frame must be blank or a whole number, not {last!r}") from None
+        if start < 0:
+            raise ValueError("First frame must be 0 or more")
+        if step < 1:
+            raise ValueError("Frame step must be 1 or more")
+        if stop is not None and stop < start:
+            raise ValueError("Last frame must not come before First frame")
+        return RSMFrameSelector(start, stop, step)
+
     def selected_count_text(self) -> str:
         try:
-            stop = int(self.frame_stop)
+            selector = self.frame_selector()
         except ValueError:
-            return "open"
-        if stop < self.frame_start:
             return "invalid"
-        return str((stop - self.frame_start) // self.frame_step + 1)
+        if selector.stop_label is None:
+            return "open"
+        return str((selector.stop_label - selector.start_label) // selector.step + 1)
 
 
 @dataclass(frozen=True, slots=True)

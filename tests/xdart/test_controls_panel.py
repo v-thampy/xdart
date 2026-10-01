@@ -1216,3 +1216,29 @@ def test_form_row_combo_restores_a_previously_blocked_signal_state(qapp):
     finally:
         row.close()
         row.deleteLater()
+
+
+def test_set_editors_enabled_locks_every_row_but_the_action_rows(qapp):
+    """A page that renders its own rows and actions (Stitch, RSM) locks the editors through the panel and
+    keeps its action row usable, each button with its own availability: disabling the panel itself also
+    disabled a pending result's Retry (Codex's RSM stage-1 review F2)."""
+    from xrd_tools.session.readiness import ControlActionSpec
+    panel = ControlsPanel(show_section_numbers=False)
+    rows = {}
+    for section, card in ((SectionId.PROJECT, panel.project_card), (SectionId.PROCESSING, panel.processing_card)):
+        rows[section] = FormRow(label="Folder", path=("Project", str(section)), value="", kind="line")
+        card.add_row(rows[section])
+    loose = QtWidgets.QPushButton("Install")
+    panel.experiment_card.add_row(loose)
+    buttons = panel.render_actions(panel.processing_card, tuple(
+        ControlActionSpec(action, label, SectionId.PROCESSING)
+        for action, label in ((ControlAction.PREVIEW, "Preview"), (ControlAction.RETRY, "Retry"))))
+    buttons[ControlAction.PREVIEW].setEnabled(False)  # its own availability, kept
+    panel.set_editors_enabled(False)
+    assert not any(row.isEnabled() for row in rows.values()) and not loose.isEnabled()
+    assert buttons[ControlAction.RETRY].isEnabled() and not buttons[ControlAction.PREVIEW].isEnabled()
+    assert panel.isEnabled()
+    panel.set_editors_enabled(True)
+    assert all(row.isEnabled() for row in rows.values()) and loose.isEnabled()
+    assert buttons[ControlAction.RETRY].isEnabled() and not buttons[ControlAction.PREVIEW].isEnabled()
+    panel.deleteLater()

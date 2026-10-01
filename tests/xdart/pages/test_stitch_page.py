@@ -1116,3 +1116,28 @@ def test_clean_shutdown_releases_the_background(qapp, tmp_path):
         page._release_background()
         page.shutdown()
         page.deleteLater()
+
+
+def test_a_pending_result_keeps_its_retry_clickable(qapp, monkeypatch):
+    """Codex's RSM stage-1 review F2, on Stitch's page too: Retry sits in the Controls panel's action row, and
+    disabling the whole panel while a result's saving or check was pending disabled Retry with the editors.
+    The editors lock and the action row does not (``ControlsPanel.set_editors_enabled``): Retry reaches the
+    owner."""
+    from xdart.gui.tools.stitch_owner import StitchOwnerFinalization, StitchToolOwner
+    retried = []
+    monkeypatch.setattr(StitchToolOwner, "finalization",
+                        property(lambda _owner: StitchOwnerFinalization.CLEANUP_PENDING))
+    monkeypatch.setattr(StitchToolOwner, "begin_retry_cleanup", lambda _owner: retried.append(True))
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page._sync_actions()
+        assert page.retry_button.isEnabled()
+        assert not page.preview_button.isEnabled() and not page.advanced_button.isEnabled()
+        assert not page._rows["spec_path"].isEnabled()
+        page.retry_button.click()
+        assert retried == [True]
+    finally:
+        monkeypatch.undo()
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
