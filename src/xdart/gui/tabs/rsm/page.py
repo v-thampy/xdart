@@ -35,6 +35,7 @@ from xdart.gui.pages.values import (
     RSM_TOOL_KEY, SCATTERING_PAGE_KEY, STITCH_TOOL_KEY,
 )
 from xdart.gui.tabs.rsm.display import rsm_keyed_projection, rsm_slice_normals
+from xdart.gui.tabs.rsm.tool_windows import RSMVolumeWindow
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView
 from xdart.gui.tabs.scattering.context_projection import apply_keyed_presentation_background
@@ -270,6 +271,9 @@ class RSMPage(QtWidgets.QWidget):
         # each resident result's viewer values and model, built once (Codex's reuse audit rec. 3): showing it
         # again recomputes nothing; dropped with its payload when it leaves the five resident
         self._viewers = {}  # path → (payload, values, model)
+        #: the page tools' windows ("3d": the 3D Viewer), built on their first press; they follow the result
+        #: shown. The 3D Viewer holds the shown volume (shared, not copied) and its RGBA (32 MB at Full 200³).
+        self._tool_windows = {}
         self._shown_path = None
         self._shown = None  # (values, snapshot) drawn now
         self._color_map = "Default"  # Int's top bar: viridis
@@ -1879,6 +1883,7 @@ class RSMPage(QtWidgets.QWidget):
         _payload, values, model = self._viewer(path, payload)
         self._draw(values, model.current_snapshot, path)
         self._shown_path = path
+        self._follow_tools()
 
     def _draw(self, values, snapshot, path=None):
         path = self._shown_path if path is None else path
@@ -1967,8 +1972,35 @@ class RSMPage(QtWidgets.QWidget):
             self._toggle_background()
 
     def _page_tool(self, name):
-        """The 3D Viewer and Custom Slice buttons: their windows come with stage 2b's G9."""
-        _LOG.info("RSM page tool %r pressed; its window is not built yet (stage 2b G9)", name)
+        """The 3D Viewer (and, with G9's unit 3, Custom Slice): non-modal windows built on their first press and
+        raised on later ones, kept on the result shown."""
+        factory = {"3d": RSMVolumeWindow}.get(name)
+        if factory is None:
+            _LOG.info("RSM page tool %r pressed; its window is not built yet", name)
+            return
+        if self._shown_path is None or self._viewers.get(self._shown_path) is None:
+            self._notice("Show a result first: the 3D Viewer and Custom Slice draw the result shown")
+            return
+        window = self._tool_windows.get(name)
+        if window is None:
+            window = self._tool_windows[name] = factory(self)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        self._follow_tools()
+
+    def _follow_tools(self):
+        """Keep each open tool window on the result shown."""
+        viewer = self._viewers.get(self._shown_path) if self._shown_path else None
+        if viewer is None:
+            return
+        for window in self._tool_windows.values():
+            if window.isVisible():
+                try:
+                    window.show_result(Path(self._shown_path).name, viewer[1])
+                except Exception as error:  # the page's own six stay drawn
+                    _LOG.exception("RSM tool window presentation failed")
+                    self._notice(f"RSM_TOOL_PRESENTATION_FAILED: {error}")
 
     def _step_slice(self, instance, index):
         shown = self._viewers.get(self._shown_path) if self._shown_path else None
@@ -2071,6 +2103,11 @@ class RSMPage(QtWidgets.QWidget):
             self._closing = False
             return pending[0]
         self._release_background()  # before the panels go (Stitch's 30f74f29: a CLEAN close lets it go)
+        for window in self._tool_windows.values():  # their volumes go with the page's
+            window.release()
+            window.close()
+            window.deleteLater()
+        self._tool_windows.clear()
         self.view.clear_keyed("No RSM result shown")
         self._viewers.clear()
         self._shown_path = self._shown = None

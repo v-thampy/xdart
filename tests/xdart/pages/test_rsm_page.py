@@ -1824,3 +1824,38 @@ def test_another_calibration_returns_the_auto_hint_to_its_default(qapp, tmp_path
         assert "Auto · the detector's saturation" in hints() and page._auto_threshold_max is None
     finally:
         _close(page, qapp)
+
+
+# AUD-9 stage 2b G9: the maintainer's two extra tools, "as extra tools that pop up separate windows to keep the
+# scientific view clean for now"
+
+
+def test_the_3d_viewer_opens_on_the_result_shown_follows_it_and_closes_with_the_page(qapp, monkeypatch):
+    """"A button to bring up a 3d viewer for the entire 3d RSM volume": the 3D Viewer button opens a non-modal
+    window on the result shown (its volume shared, not copied), which follows the result shown; closing the page
+    releases it."""
+    values = {"A": _grid_values(1.0), "B": _grid_values(3.0)}
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page.view.page_tool("3d").click()  # nothing shown yet: the page says what the tool needs
+        assert "3d" not in page._tool_windows
+        page._add_result("/tmp/a_rsm.nexus", "A")
+        page.view.page_tool("3d").click()
+        window = page._tool_windows["3d"]
+        assert window.isVisible() and not window.isModal()
+        assert window.windowTitle() == "RSM 3D Viewer — a_rsm.nexus"
+        assert np.shares_memory(window.view.projection.values, values["A"].intensity)
+        assert window.view.projection.labels == tuple(values["A"].coordinate_frame.axis_labels)
+        page._add_result("/tmp/b_rsm.nexus", "B")  # the window follows the result shown
+        assert window.windowTitle() == "RSM 3D Viewer — b_rsm.nexus"
+        assert np.shares_memory(window.view.projection.values, values["B"].intensity)
+        page.view.page_tool("3d").click()  # a later press raises the same window
+        assert page._tool_windows["3d"] is window
+        window.close()  # closed by the user: its volume and RGBA go until it is shown again
+        assert window.view.projection is None and window.view.rgba is None
+        page.view.page_tool("3d").click()
+        assert np.shares_memory(window.view.projection.values, values["B"].intensity)
+    finally:
+        _close(page, qapp)
+    assert window.view.projection is None and window.view.rgba is None and not page._tool_windows
