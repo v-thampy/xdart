@@ -263,3 +263,35 @@ def test_the_default_corrections_charge_one_band_not_the_detector_at_eiger_size(
     assert one - resident_and_weights <= 80 * _RSM_WEIGHT_BAND_PIXELS
     assert one <= 100_000_000
     assert one >= 54_962_644 + 35_885_520  # the measured peak, with the resident solid angle
+
+
+@pytest.mark.slow
+def test_pixel_q_rows_is_the_whole_calls_band_byte_for_byte(rsm_r2_project):
+    """S2.3's ``PixelQMap.pixel_q(rows=...)`` contract, for any caller: a band of rows equals the same rows of
+    the whole call byte for byte (a non-integer beam centre, an offset crop, two frames at two detector poses),
+    and a band that is empty or out of range, or a configured ``roi`` or ``Nav``, is refused."""
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_effective_pixel_q_map
+    from xrd_tools.core.geometry import DetectorHeader, DiffractometerConfig, PixelQMap
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+    request = _request(rsm_r2_project, "rows")
+    effective = request.plan.effective_geometry
+    mapper = rsm_effective_pixel_q_map(effective)
+    mapper = replace(mapper, header=replace(mapper.header, cch1=mapper.header.cch1 + 0.37,
+                                            cch2=mapper.header.cch2 + 0.61))
+    angles = (np.array([1.0, 2.0]), np.array([10.0, 11.0]), np.array([90.0, 91.0]), np.array([0.0, 5.0]),
+              np.array([0.0, 2.5]), np.array([20.0, 30.0]))
+    roi = (5, 190, 7, 480)
+    with xu_runtime_session(effective.runtime_requirements) as session:
+        whole = mapper.pixel_q(angles, 13000.007, UB=np.eye(3), roi=roi, runtime_session=session)
+        for start, stop in ((0, 3), (40, 41), (100, 185)):
+            band = mapper.pixel_q(angles, 13000.007, UB=np.eye(3), roi=roi, runtime_session=session,
+                                  rows=(start, stop))
+            for axis, (part, full) in enumerate(zip(band, whole)):
+                assert part.shape == (2, stop - start, 473), (start, axis)
+                assert part.tobytes() == np.ascontiguousarray(full[:, start:stop]).tobytes(), (start, axis)
+    header = DetectorHeader(2.5, 3.5, 0.1, 0.1, 100.0, 8, 9)
+    for config, rows in ((DiffractometerConfig(), (3, 3)), (DiffractometerConfig(), (0, 9)),
+                         (DiffractometerConfig(ang2q_kwargs={"Nav": (2, 2)}), (0, 4)),
+                         (DiffractometerConfig(ang2q_kwargs={"roi": [0, 4, 0, 9]}), (0, 4))):
+        with pytest.raises(ValueError, match="one band"):
+            PixelQMap(config, header).pixel_q([np.array([0.0])], 12000.0, rows=rows)
