@@ -83,7 +83,6 @@ _DEBT: dict[str, dict[str, int]] = {
         "QCheckBox": 1, "QLineEdit": 1, "QSpinBox": 1, "str:configMenuButton": 1, "str:helpMenuButton": 1,
     },
     "tabs/stitch/calibration.py": {"QCheckBox": 2, "QLineEdit": 4},
-    "tabs/stitch/fit_windows.py": {"PlotWidget": 2},
     "tabs/stitch/mask.py": {"QLineEdit": 1, "QSpinBox": 1},
     # The classic RSM dialog, retired with AUD-9's last stage.
     "tools/rsm_tool.py": {

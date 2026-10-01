@@ -2,25 +2,21 @@
 beam distance fit, it will be good to pop up a window with the fit that also shows the fit distance";
 "the results of the refinement should also be displayed in the message box, and also a popup").
 
-A summary above two plots, as the analysis fit dialogs plot data, fit and residuals. The direct-beam
-fit: the beam spot's centre along the motion against the motor angle, the fitted model through the
-frames it used, and the residuals below. A ring fit (Fit or Refine): each control point's |q|
-residual across the arm's angles, and against its ring's q below.
+Each window mounts the shared fit display (``tabs/scattering/fit_view.FitView``; Codex's Stitch/Int reuse
+audit R2): a summary above two panels, as the analysis fit dialogs show data, fit and residuals. The
+direct-beam fit: the beam spot's centre along the motion against the motor angle, the fitted model through
+the frames it used, and the residuals below. A ring fit (Fit or Refine): each control point's |q| residual
+across the arm's angles, one group per row of the other circle, and against its ring's q below.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
-import pyqtgraph as pg
 from pyqtgraph.Qt import QtWidgets
 
-_USED = (189, 147, 249)
-_LEFT_OUT = (230, 110, 110)
-_FIT = (80, 200, 160)
-_ZERO = (130, 130, 140)
-#: One colour per row of the other circle (nu rows under a del arm), as Stitch's overlay colours.
-_ROWS = ((31, 119, 180), (255, 127, 14), (44, 160, 44), (214, 39, 40), (148, 103, 189),
-         (140, 86, 75), (227, 119, 194), (188, 189, 34), (23, 190, 207), (127, 127, 127))
+from xdart.gui.tabs.scattering.fit_view import FitPanel, FitProjection, FitSeries, FitView
 
 #: The fitted parameters in plain words, with their units (fit_bounds' public names; maintainer,
 #: 2026-09-29: "the zero hold etc are not very descriptive and helpful"). pyFAI's axes: 1 vertical
@@ -83,78 +79,62 @@ def calibration_fit_text(fit, kind='fit'):
 
 
 class FitWindow(QtWidgets.QDialog):
-    """A fit in its own window: a selectable summary above an upper and a lower plot."""
+    """A fit in its own window: the shared fit display, its summary selectable above two panels.
+    ``summary``, ``plot`` and ``residuals`` are the display's own (read by the calibration rows)."""
 
-    def __init__(self, parent, name, title, *, stretch=(1, 1)):
+    def __init__(self, parent, name, title, *, stretch=(1, 1), lower_max_height=None, link_x=False):
         super().__init__(parent)
         self.setObjectName(name)
         self.setWindowTitle(title)
         self.setModal(False)
         self.resize(640, 520)
         layout = QtWidgets.QVBoxLayout(self)
-        self.summary = QtWidgets.QLabel()
-        self.summary.setObjectName(f'{name[:-len("Window")]}Summary')
-        self.summary.setWordWrap(True)
-        self.summary.setTextInteractionFlags(self.summary.textInteractionFlags()
-                                             | pg.QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.summary)
-        self.plot = pg.PlotWidget()
-        self.plot.setMinimumHeight(240)
-        self.plot.addLegend(offset=(-10, 10))
-        self.residuals = pg.PlotWidget()
-        layout.addWidget(self.plot, stretch[0])
-        layout.addWidget(self.residuals, stretch[1])
-
-    def _clear(self, *zero):
-        """Empty both plots; draw the zero line on the ``zero`` ones (residual plots)."""
-        for plot in (self.plot, self.residuals):
-            plot.clear()
-        for plot in zero:
-            plot.addLine(y=0, pen=pg.mkPen(_ZERO, width=1))
+        self.view = FitView(self, name=name[:-len('Window')], stretch=stretch, upper_min_height=240,
+                            lower_max_height=lower_max_height, link_x=link_x)
+        layout.addWidget(self.view)
+        self.summary, self.plot, self.residuals = self.view.summary, self.view.plot, self.view.residuals
 
 
 class DirectBeamFitWindow(FitWindow):
     """The fit behind a direct-beam distance: centres, the model through the used frames, residuals."""
 
+    _UPPER = FitPanel(y_label='Beam centre along the motion (px)')
+    _LOWER = FitPanel(x_label='Motor angle (°)', y_label='Residual (px)', zero_line=True)
+
     def __init__(self, parent=None):
-        super().__init__(parent, 'directBeamFitWindow', 'Direct-beam fit', stretch=(3, 1))
-        self.residuals.setMaximumHeight(140)
-        self.plot.setLabel('left', 'Beam centre along the motion (px)')
-        self.residuals.setXLink(self.plot)
-        self.residuals.setLabel('left', 'Residual (px)')
-        self.residuals.setLabel('bottom', 'Motor angle (°)')
+        super().__init__(parent, 'directBeamFitWindow', 'Direct-beam fit', stretch=(3, 1), lower_max_height=140,
+                         link_x=True)
+        self.view.reconcile(FitProjection(self._UPPER, self._LOWER))
 
     def show_result(self, result, energy_eV=None, held=None):
         """Plot ``result`` (a ``DirectBeamResult``) and say its distance."""
-        self.summary.setText(direct_beam_fit_text(result, energy_eV, held)
-                             + f' · {result.model} model, {int(np.count_nonzero(result.used))} of '
-                               f'{len(result.angles_deg)} frames used')
         angles = np.asarray(result.angles_deg, dtype=float)
         centres = np.asarray(result.centres_px, dtype=float)
         used = np.asarray(result.used, dtype=bool)
         order = np.argsort(angles[used])
-        self._clear(self.residuals)
-        self.plot.plot(angles[used], centres[used], pen=None, symbol='o', symbolSize=7,
-                       symbolBrush=_USED, symbolPen=None, name='used frames')
+        upper = [FitSeries(angles[used], centres[used], 'data', 'used frames')]
         if (~used).any():
             finite = ~used & np.isfinite(centres)
-            self.plot.plot(angles[finite], centres[finite], pen=None, symbol='x', symbolSize=8,
-                           symbolPen=pg.mkPen(_LEFT_OUT), name='left out')
-        self.plot.plot(angles[used][order], np.asarray(result.predictions_px, dtype=float)[used][order],
-                       pen=pg.mkPen(_FIT, width=2), name=f'{result.model} fit')
-        self.residuals.plot(angles[used], np.asarray(result.residuals_px, dtype=float)[used], pen=None,
-                            symbol='o', symbolSize=6, symbolBrush=_USED, symbolPen=None)
+            upper.append(FitSeries(angles[finite], centres[finite], 'rejected', 'left out'))
+        upper.append(FitSeries(angles[used][order], np.asarray(result.predictions_px, dtype=float)[used][order],
+                               'fit', f'{result.model} fit'))
+        residuals = FitSeries(angles[used], np.asarray(result.residuals_px, dtype=float)[used], 'residual_points')
+        summary = (direct_beam_fit_text(result, energy_eV, held)
+                   + f' · {result.model} model, {int(np.count_nonzero(used))} of {len(result.angles_deg)} frames used')
+        self.view.reconcile(FitProjection(replace(self._UPPER, series=tuple(upper)),
+                                          replace(self._LOWER, series=(residuals,)), summary))
 
 
 class CalibrationFitWindow(FitWindow):
-    """A ring fit (Fit or Refine): each control point's |q| residual across the arm's angles, coloured
-    by the other circle's row, and against its ring's q; the points the fit rejected are crosses."""
+    """A ring fit (Fit or Refine): each control point's |q| residual across the arm's angles, grouped by
+    the other circle's row, and against its ring's q; the points the fit rejected are crosses."""
+
+    _UPPER = FitPanel(y_label='|q| residual (10⁻³ Å⁻¹)', zero_line=True)
+    _LOWER = FitPanel(x_label='Ring q (Å⁻¹)', y_label='|q| residual (10⁻³ Å⁻¹)', zero_line=True)
 
     def __init__(self, parent=None):
         super().__init__(parent, 'calibrationFitWindow', 'Calibration fit')
-        self.plot.setLabel('left', '|q| residual (10⁻³ Å⁻¹)')
-        self.residuals.setLabel('left', '|q| residual (10⁻³ Å⁻¹)')
-        self.residuals.setLabel('bottom', 'Ring q (Å⁻¹)')
+        self.view.reconcile(FitProjection(self._UPPER, self._LOWER))
 
     def show_result(self, fit, kind='fit'):
         """Plot ``fit`` (a ``CalibrationFit``; ``kind`` 'fit' or 'refine') and say what it found."""
@@ -169,13 +149,12 @@ class CalibrationFitWindow(FitWindow):
                          "and sample offset")
         if fit.message:
             lines.append(fit.message)
-        self.summary.setText('\n'.join(lines))
-        self._clear(self.plot, self.residuals)
         residuals = fit.point_residuals
         if not residuals:
-            self.plot.setTitle('This fit reports no control points to plot')
+            self.view.reconcile(FitProjection(
+                replace(self._UPPER, title='This fit reports no control points to plot'), self._LOWER,
+                '\n'.join(lines)))
             return
-        self.plot.setTitle(None)
         motors = provenance.get('source_motors') or {}  # a pyFAI fit's: nu_angle and del_angle
         along = motors.get('del_angle') or motors.get('nu_angle')  # del, or a single arm's one circle
         other = motors.get('nu_angle') if along == motors.get('del_angle') else None  # its rows
@@ -185,17 +164,15 @@ class CalibrationFitWindow(FitWindow):
         dq = np.asarray(residuals['dq'], dtype=float) * 1e3
         q = np.asarray(residuals['q'], dtype=float)
         x = np.array([readings[i].get(along, 0.) for i in frame]) if along else frame.astype(float)
-        self.plot.setLabel('bottom', f'{along} (°)' if along else 'Frame')
         rows = np.array([round(readings[i].get(other, 0.), 6) for i in frame]) if other else np.zeros(len(frame))
+        upper, below = [], []
         for n, row in enumerate(np.unique(rows)):
             chosen = kept & (rows == row)
-            colour = _ROWS[n % len(_ROWS)]
-            name = f'{other} {row:g}°' if other else 'control points'
-            self.plot.plot(x[chosen], dq[chosen], pen=None, symbol='o', symbolSize=5,
-                           symbolBrush=colour, symbolPen=None, name=name)
-            self.residuals.plot(q[chosen], dq[chosen], pen=None, symbol='o', symbolSize=5,
-                                symbolBrush=colour, symbolPen=None)
+            upper.append(FitSeries(x[chosen], dq[chosen], 'group', f'{other} {row:g}°' if other else 'control points', n))
+            below.append(FitSeries(q[chosen], dq[chosen], 'group', None, n))
         if (~kept).any():
-            for plot, values in ((self.plot, x), (self.residuals, q)):
-                plot.plot(values[~kept], dq[~kept], pen=None, symbol='x', symbolSize=7,
-                          symbolPen=pg.mkPen(_ZERO), name='rejected' if plot is self.plot else None)
+            upper.append(FitSeries(x[~kept], dq[~kept], 'rejected', 'rejected'))
+            below.append(FitSeries(q[~kept], dq[~kept], 'rejected'))
+        self.view.reconcile(FitProjection(
+            replace(self._UPPER, series=tuple(upper), x_label=f'{along} (°)' if along else 'Frame'),
+            replace(self._LOWER, series=tuple(below)), '\n'.join(lines)))
