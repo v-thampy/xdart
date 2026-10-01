@@ -78,10 +78,12 @@ class DetectorCamera:
 
 #: The camera of the image Stitch calibrates and integrates in, its xrayutilities asset's: rows run down
 #: (x-), columns to the left looking downstream (z+). A raw image from another camera is turned into it
-#: first (:func:`stitch_orientation`); this one needs nothing (an image rotation of 0, as before). Scan 14
-#: settled it (2026-09-30): 17-2's rows run down and its columns the way +nu swings the detector, to the
-#: right, so its camera is ('x-', 'z-'), and with the maintainer's senses (nu x-, del z-) the arm fits only
-#: with the columns mirrored, as this frame says. It is 180° from ``_PYFAI_TRANSFORM``'s ('x+', 'z-'): Stitch's
+#: first (:func:`stitch_orientation`); this one needs nothing (an image rotation of 0, as before). Scan 14 is
+#: consistent with it (2026-09-30): 17-2's direct-beam images put its rows down and its columns the way +nu
+#: swings the detector, to the right, so its camera is ('x-', 'z-'), and with the maintainer's senses (nu x-,
+#: del z-) the arm fits only with the columns mirrored, as this frame says. (A fit fixes only a circle's
+#: sense times the image's mirror, and the asset's camera was checked on |q| alone, which no mirror changes:
+#: the absolute frame rests on those images.) It is 180° from ``_PYFAI_TRANSFORM``'s ('x+', 'z-'): Stitch's
 #: pyFAI χ is 180° from its xrayutilities χ (a pre-existing gap; 2θ and |q| agree).
 STITCH_CAMERA = DetectorCamera('x-', 'z+')
 

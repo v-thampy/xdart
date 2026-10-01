@@ -355,6 +355,21 @@ def test_a_fit_belongs_to_the_instrument_its_frames_were_staged_with(qapp, tmp_p
         assert dialog.fit is not None and dialog.save_button.isEnabled(), dialog.status.text()
         dialog.set_instrument(InstrumentGeometry('psic'))  # the same instrument keeps the fit
         assert dialog.fit is not None
+        # the camera too (maintainer, 2026-09-30): frames staged unmirrored are not fitted with a mirrored one,
+        # and the fit made from them is not kept
+        from xrd_tools.core.geometry.camera import STITCH_CAMERA, DetectorCamera
+        dialog.camera.set_value(DetectorCamera('x-', 'z-'))
+        assert dialog.fit is None and not dialog.save_button.isEnabled()
+        dialog.fit_button.click()
+        assert dialog.fit is None and not dialog.active()
+        assert ('staged with the camera rows x-, columns z+; the Detector panel now says rows x-, columns z-'
+                in dialog.status.text())
+        dialog.camera.set_value(STITCH_CAMERA)
+        dialog.fit_button.click()
+        _wait(dialog)
+        assert dialog.fit is not None, dialog.status.text()
+        dialog.camera.set_value(STITCH_CAMERA)  # the same camera keeps the fit
+        assert dialog.fit is not None
         dialog.set_instrument(InstrumentGeometry('fourc'))  # another one leaves it unsaveable
         assert dialog.fit is None and not dialog.save_button.isEnabled()
         dialog.set_instrument(InstrumentGeometry('psic', (('eta', 'halpha'),)))  # any circle counts

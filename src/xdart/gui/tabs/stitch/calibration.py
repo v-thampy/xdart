@@ -969,6 +969,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._fields['beam_detector'].currentIndexChanged.connect(self._detector_chosen)
         self._fields['beam_detector'].currentIndexChanged.connect(self._update_image_size)
         self.camera.changed.connect(self._update_image_size)  # the beam pixel's image turns
+        self.camera.changed.connect(self._camera_edited)
         self._update_image_size()
 
     def _build_detector(self):
@@ -1622,6 +1623,31 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             self._invalidate_fit()
         self._sync_arm_model()
 
+    def _staged_camera_message(self):
+        """Why the staged frames no longer match the Detector panel's camera, or None: each was turned and
+        mirrored as the camera said when it was staged, and its points are in that image."""
+        from xrd_tools.core.geometry import ImageOrientation
+        from xrd_tools.core.geometry.camera import stitch_camera
+        orientation = self._orientation()
+        if not self.frames or (self.frames[0].rotation, self.frames[0].flip) == (orientation.rotation,
+                                                                                orientation.flip_horizontal):
+            return None
+        staged = stitch_camera(ImageOrientation(rotation=self.frames[0].rotation,
+                                                flip_horizontal=self.frames[0].flip))
+        now = self.camera.value()
+        return (f'The frames were staged with the camera rows {staged.rows}, columns {staged.columns}; the '
+                f'Detector panel now says rows {now.rows}, columns {now.columns}. Restore it, or start a New '
+                'session to stage and calibrate frames with this camera.')
+
+    def _camera_edited(self, *_args):
+        """A fit belongs to the camera its frames were staged with: another leaves it unsaveable."""
+        if not hasattr(self, 'save_button') or self.fit is None:  # still being built, or nothing to keep
+            return
+        provenance, orientation = self.fit.asset['provenance'], self._orientation()
+        if (provenance.get('image_rotation', 0), provenance.get('image_flip', False)) != (
+                orientation.rotation, orientation.flip_horizontal):
+            self._invalidate_fit()
+
     def _staged_arm_message(self, arm):
         def described(pair):  # a single arm's one motor, with the plane that says which circle it is
             delta, nu = pair
@@ -1655,6 +1681,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         def go():
             if self.frames and self.geometry_editor.value().stitch_arm() != self._frame_motors:
                 raise ValueError(self._staged_arm_message(self.geometry_editor.value().stitch_arm()))
+            if self._staged_camera_message():
+                raise ValueError(self._staged_camera_message())
             frames = tuple(frame for frame in self.frames if frame.complete)
             options = dict(del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1],
                 fit_scales=self.scales.isChecked(), instrument_geometry=self.geometry_editor.value().to_record(),
