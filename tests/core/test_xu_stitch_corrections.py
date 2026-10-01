@@ -176,3 +176,45 @@ def test_the_flat_cutoff_reaches_the_xu_kernel(tmp_path):
     expected = _run(receipt, flat=premasked)
     assert np.array_equal(cut.payload.intensity, expected.payload.intensity, equal_nan=True)
     assert cut.diagnostics.coverage.sum() < kept.diagnostics.coverage.sum()
+
+
+def test_xu_stitch_checks_its_flat_against_its_calibrations_detector_mask(tmp_path):
+    """AUD-9 stage 2b S3c unit 4d: a Pilatus 300K partner turned 90°, its flat 0 in the detector's own gaps (file
+    orientation). Preview's capture leaves the gaps out of the masked count and the warnings, as Int's preflight
+    passes the mask (and RSM), and the run's re-capture, given the mask bound at Preview, is Preview's."""
+    import json
+
+    from pyFAI.detectors import Pilatus300k
+
+    from xrd_tools.analysis.stitch_native import capture_detector_image, native_detector_image, native_detector_mask
+    from xrd_tools.analysis.stitch_operation import XuStitchOperationPlan
+    from xrd_tools.analysis.xu_stitch_calibration import (
+        XuStitchCalibrationInput, authored_surface_calibration, capture_xu_stitch_calibration,
+    )
+    from xrd_tools.core.geometry.diffractometer import ImageOrientation
+
+    with xu_runtime_session() as session:
+        wavelength = float(session.xu.en2lam(17000.0))
+    domain = {"del": [-50., 50.], "nu": [-35., 35.]}
+    detector = Pilatus300k()
+    value = authored_surface_calibration(
+        detector=detector, cch1=300., cch2=240., distance_m=.39, del_offset_deg=0., nu_offset_deg=0.,
+        energy_eV=17000.0, xu_wavelength_A=wavelength, source_motors={"del": "del", "nu": "nu"}, rotation=90,
+        control_domain=domain, domain=domain, rms_q=.001, condition=10., n_frames=5, n_points=40)
+    (tmp_path / "p300k.xu.json").write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
+    receipt = capture_xu_stitch_calibration(XuStitchCalibrationInput("p300k.xu.json"), project_root=tmp_path)
+    with xu_runtime_session() as session:
+        effective = resolve_xu_stitch_effective_geometry(receipt, session).projection
+    gaps = ImageOrientation(rotation=90).unapply(np.asarray(detector.calc_mask(), dtype=bool))
+    flat = tmp_path / "flat.npy"
+    np.save(flat, np.where(gaps, 0.0, 1.0))
+    plan = XuStitchOperationPlan(receipt, effective, 1.0, 5.2, npt_1d=64, native_records=True, flat_path=flat)
+    np.testing.assert_array_equal(plan._detector_mask, gaps)
+    assert not plan._detector_mask.flags.writeable
+    np.testing.assert_array_equal(native_detector_mask(plan), gaps)
+    blind, _pixels = capture_detector_image(flat, "flat", plan.max_frame_bytes)
+    assert blind.flat_masked_pixels == int(gaps.sum())  # without the mask the gaps count as dead
+    assert any("masks 5.5 %" in item for item in blind.warnings)  # and warn
+    assert (plan._flat_receipt.flat_masked_pixels, plan._flat_receipt.warnings) == (0, ())
+    assert plan._flat_receipt.fingerprint == blind.fingerprint  # the identity is the file's, not its counts'
+    assert native_detector_image(plan, plan._flat_receipt).shape == detector.shape  # the re-capture is Preview's

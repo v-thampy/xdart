@@ -1361,34 +1361,21 @@ def _raw_tiltazimuth(turned_camera, raw_camera, azimuth_deg: float, beam) -> flo
 
 
 def rsm_calibration_detector_mask(receipt) -> np.ndarray | None:
-    """The calibrated detector's own mask (module gaps) in the raw frame RSM reads, read-only: pyFAI's detector
-    rebuilt from the partner as Stitch's xrayutilities backend rebuilds it (its count and digest checked), then
-    mapped back by the inverse turn. None for the canonical asset, which names no detector, or a detector
-    without one."""
+    """The calibrated detector's own mask (module gaps) in the raw frame RSM reads, read-only: Stitch's rebuild
+    (``calibration_detector_mask``: pyFAI's detector from the partner, its count and digest checked), mapped back
+    by the inverse turn. None for the canonical asset, which names no detector, or a detector without one."""
     if type(receipt) is not RSMCalibrationGeometryReceipt:
         return None
-    import numpy as np
-    from pyFAI.detectors import detector_factory
-
-    from xrd_tools.integrate.xu_stitch import _sha256_array
+    from xrd_tools.analysis.stitch_native import calibration_detector_mask
 
     value = receipt.calibration.projection.value
-    detector, acquisition = value["detector"], value["acquisition"]
-    config = dict(detector["detector_config"])
-    if "max_shape" in config:
-        config["max_shape"] = tuple(config["max_shape"])
     try:
-        turned = detector_factory(detector["detector_factory_name"], config).calc_mask()
-    except Exception as error:  # noqa: BLE001 - pyFAI's own failure, by name
-        _refuse("RSM_CALIBRATION_UNSUPPORTED", f"the calibration's detector cannot be rebuilt: {error}")
-    shape = tuple(int(item) for item in detector["shape"])
-    turned = np.zeros(shape, dtype=bool) if turned is None else np.ascontiguousarray(turned, dtype=bool)
-    if (turned.shape != shape or int(turned.sum()) != detector["mask_count"]
-            or _sha256_array(turned, "|u1") != detector["mask_sha256"]):
-        _refuse("RSM_CALIBRATION_UNSUPPORTED", "the calibration's detector mask differs from its record")
-    if not turned.any():
+        turned = calibration_detector_mask(value)
+    except ValueError as error:
+        _refuse("RSM_CALIBRATION_UNSUPPORTED", str(error))
+    if turned is None:
         return None
-    raw = _partner_orientation(acquisition).unapply(turned)
+    raw = _partner_orientation(value["acquisition"]).unapply(turned)
     raw.setflags(write=False)
     return raw
 

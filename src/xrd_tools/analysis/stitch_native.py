@@ -194,13 +194,63 @@ def capture_detector_image(path, role, max_bytes, min_fraction=DEFAULT_MIN_FLAT_
     return receipt, pixels
 
 
+def calibration_detector_mask(value):
+    """An xrayutilities calibration's detector mask (module gaps) in the calibration's own turned frame, as Stitch's
+    XU backend rebuilds it: pyFAI's detector from the partner's factory name and config, its count and digest
+    checked against the record. None: a detector without one. ValueError: not rebuildable, or not the record's."""
+    from pyFAI.detectors import detector_factory
+
+    from xrd_tools.integrate.xu_stitch import _sha256_array
+
+    detector = value["detector"]
+    config = dict(detector["detector_config"])
+    if "max_shape" in config:
+        config["max_shape"] = tuple(config["max_shape"])
+    try:
+        mask = detector_factory(detector["detector_factory_name"], config).calc_mask()
+    except Exception as error:  # noqa: BLE001 - pyFAI's own failure, by name
+        raise ValueError(f"the calibration's detector cannot be rebuilt: {error}") from None
+    shape = tuple(int(item) for item in detector["shape"])
+    mask = np.zeros(shape, dtype=bool) if mask is None else np.ascontiguousarray(mask, dtype=bool)
+    if (mask.shape != shape or int(mask.sum()) != detector["mask_count"]
+            or _sha256_array(mask, "|u1") != detector["mask_sha256"]):
+        raise ValueError("the calibration's detector mask differs from its record")
+    return mask if mask.any() else None
+
+
+def native_detector_mask(plan):
+    """The calibrated detector's own mask (module gaps) in file orientation, read-only, which a dark's and a flat's
+    usability checks leave out of their counts, as Int's preflight passes it (AUD-9 stage 2b S3c): the XU
+    partner's rebuilt detector, or the pyFAI geometry's when the plan masks with it. None: no gaps, or a plan that
+    does not mask them (its run grids them, so its checks count them)."""
+    from xrd_tools.analysis.stitch_operation import XuStitchOperationPlan, _detector_mask, _runtime_geometry
+    if type(plan) is XuStitchOperationPlan:
+        try:
+            turned = calibration_detector_mask(plan.calibration.projection.value)
+        except ValueError as error:
+            _refuse("XU_DETECTOR_MASK_MISMATCH", str(error))
+        _wavelength, _shape, orientation = geometry_facts(plan)
+    else:
+        if not plan.use_detector_mask:
+            return None
+        diffractometer, orientation = _runtime_geometry(plan.geometry, plan.geometry.content)
+        turned = _detector_mask(diffractometer)
+    if turned is None or not turned.any():
+        return None
+    raw = orientation.unapply(turned)
+    raw.setflags(write=False)
+    return raw
+
+
 def native_detector_image(plan, receipt):
-    """Re-decode a bound dark or flat image and orient it into the calibrated frame."""
+    """Re-decode a bound dark or flat image and orient it into the calibrated frame (its check given the
+    detector's own mask bound at Preview, so the re-capture is Preview's)."""
     if receipt is None:
         return None
     current, pixels = capture_detector_image(
         receipt.lexical_path, receipt.role, plan.max_frame_bytes,
-        DEFAULT_MIN_FLAT_FRACTION if receipt.flat_min_fraction is None else receipt.flat_min_fraction)
+        DEFAULT_MIN_FLAT_FRACTION if receipt.flat_min_fraction is None else receipt.flat_min_fraction,
+        detector_mask=plan._detector_mask)
     if current != receipt:
         _refuse(f"{receipt.role.upper()}_IDENTITY_MISMATCH", f"{receipt.role} no longer matches Preview")
     _wavelength, shape, orientation = geometry_facts(plan)

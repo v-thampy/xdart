@@ -91,7 +91,7 @@ from xrd_tools.integrate.stitch_gi import StitchGI
 from xrd_tools.analysis.stitch_native import (
     capture_mask, revalidate_mask, native_mask, native_plan_identity,
     native_provenance, capture_callback, geometry_facts, label_saturation,
-    capture_detector_image, native_detector_image,
+    capture_detector_image, native_detector_image, native_detector_mask,
 )
 from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
 from xrd_tools.corrections.stack import CorrectionStack
@@ -1408,6 +1408,8 @@ class StitchOperationPlan:
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
+    #: the detector's own mask the dark and flat checks left out (``native_detector_mask``); not identity
+    _detector_mask: object = field(init=False, default=None, repr=False, compare=False)
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1529,6 +1531,8 @@ class XuStitchOperationPlan:
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
+    #: the detector's own mask the dark and flat checks left out (``native_detector_mask``); not identity
+    _detector_mask: object = field(init=False, default=None, repr=False, compare=False)
     backend: str = field(init=False, default="xu_hist")
     method: str = field(init=False, default="numpy_histogram_center_v1")
     use_detector_mask: bool = field(init=False, default=True)
@@ -1791,11 +1795,14 @@ def _detector_image_fields(plan):
             or not math.isfinite(fraction) or not 0.0 <= fraction < 1.0):
         raise ValueError("the flat cutoff must be a number from 0 to below 1")
     object.__setattr__(plan, "flat_min_fraction", float(fraction))
+    # the calibrated detector's own mask, left out of the checks' counts here and again at the run (S3c)
+    mask = (native_detector_mask(plan) if plan.dark_path is not None or plan.flat_path is not None else None)
+    object.__setattr__(plan, "_detector_mask", mask)
     for role in ("dark", "flat"):
         path = getattr(plan, f"{role}_path")
         if path is not None:
             receipt, _pixels = capture_detector_image(path, role, plan.max_frame_bytes,
-                                                      plan.flat_min_fraction)
+                                                      plan.flat_min_fraction, detector_mask=mask)
             object.__setattr__(plan, f"{role}_path", receipt.lexical_path)
             object.__setattr__(plan, f"_{role}_receipt", receipt)
 

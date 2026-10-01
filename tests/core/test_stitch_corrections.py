@@ -350,3 +350,33 @@ def test_dark_and_flat_are_admitted_by_ints_detector_image_check(tmp_path):
     np.save(partial, np.array([[np.nan, 2.], [3., 4.]]))
     receipt, pixels = capture_detector_image(partial, 'dark', 1 << 20)
     assert receipt.shape == (2, 2) and np.isnan(pixels[0, 0]) and pixels[1, 1] == 4.0
+
+
+def test_stitch_checks_its_flat_against_its_detectors_own_mask(tmp_path, monkeypatch):
+    """AUD-9 stage 2b S3c unit 4d, the pyFAI plan: its geometry's detector given a 12-row gap, turned 90° (the
+    file is 487 x 195), and a flat 0 there. While the plan masks with its detector the check leaves the gaps out,
+    and the run's re-capture is Preview's; a plan that does not mask them counts them, as its run grids them."""
+    from xrd_tools.analysis import stitch_operation
+    from xrd_tools.analysis.stitch_native import native_detector_image
+    from xrd_tools.analysis.stitch_operation import (
+        StitchGeometryInput, StitchGeometryKind, capture_stitch_geometry,
+    )
+    from xrd_tools.core.geometry.diffractometer import ImageOrientation
+
+    plan = _prepared(tmp_path).plan
+    geometry = capture_stitch_geometry(StitchGeometryInput(
+        plan.geometry.lexical_path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
+        source_motors=(('del_angle', 'del'), ('nu_angle', 'nu')), image_rotation=90))
+    gaps = np.zeros((195, 487), dtype=bool)
+    gaps[60:72] = True
+    monkeypatch.setattr(stitch_operation, '_detector_mask', lambda diffractometer: gaps)
+    raw = ImageOrientation(rotation=90).unapply(gaps)
+    np.save(tmp_path / 'flat.npy', np.where(raw, 0., 1.))
+    masked = replace(plan, geometry=geometry, native_records=True, radial_range=None,
+                     flat_path=tmp_path / 'flat.npy')
+    np.testing.assert_array_equal(masked._detector_mask, raw)
+    assert (masked._flat_receipt.flat_masked_pixels, masked._flat_receipt.warnings) == (0, ())
+    assert native_detector_image(masked, masked._flat_receipt).shape == (195, 487)
+    blind = replace(masked, use_detector_mask=False)
+    assert blind._detector_mask is None and blind._flat_receipt.flat_masked_pixels == int(gaps.sum())
+    assert blind._flat_receipt.fingerprint == masked._flat_receipt.fingerprint
