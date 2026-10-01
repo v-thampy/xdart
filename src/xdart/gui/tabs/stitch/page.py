@@ -297,6 +297,21 @@ def _spec_frame_counts(path, _state, scans):
         return None
 
 
+#: The frames-per-scan tooltip's most lines; a longer selection's (Stitch All over a long file) ends "… N more".
+_FRAME_TIP_LINES = 40
+
+
+def _output_frames(members, counts):
+    """One output's line in the frames-per-scan tooltip: its scan's frames, or a bracketed group's scans,
+    each one's frames and their sum. A scan is named as a selection names it (N for its first run, N.1)."""
+    names = [scan[:-2] if scan.endswith(".1") else scan for scan in members]
+    frames = sum(counts[scan] for scan in members)
+    if len(members) == 1:
+        return f"scan {names[0]}: {frames} frame{'s' * (frames != 1)}"
+    return (f"scans {', '.join(names)} (one output): "
+            f"{' + '.join(str(counts[scan]) for scan in members)} = {frames} frames")
+
+
 def _file_states(*paths):
     """Each file's (mtime, size), or None when it is absent: a cache key that follows edits."""
     states = []
@@ -485,7 +500,7 @@ class StitchPage(QtWidgets.QWidget):
         self._authoring_timer.setInterval(50)
         self._authoring_timer.timeout.connect(self._sync_actions)
         self._refresh_inputs_view()
-        self._status(self._readiness[0], ready=self._readiness[1])
+        self._show_readiness()
         self._sync_actions()
         self._draw()  # the view takes Stitch's layout before the first result
 
@@ -1348,7 +1363,7 @@ class StitchPage(QtWidgets.QWidget):
         self._queued_jobs.clear()
         if hasattr(self, "run_bar"):
             self._refresh_inputs_view()
-            self._status(self._readiness[0], ready=self._readiness[1])
+            self._show_readiness()
             self._sync_actions()
 
     def _draft_edited(self, *_args):
@@ -1382,7 +1397,7 @@ class StitchPage(QtWidgets.QWidget):
         self._frames = (self._selection_key(), self._selection_frames())
         if self._frames != frames and hasattr(self, "run_bar"):  # the run bar is built after the sections
             self._refresh_inputs_view()
-            self._status(self._readiness[0], ready=self._readiness[1])
+            self._show_readiness()
         self._refresh_gi_catalog()
         self._refresh_monitor_choices()
         self._show_early_ceiling()
@@ -1409,7 +1424,8 @@ class StitchPage(QtWidgets.QWidget):
 
     def _selection_frames(self):
         """The frames a SPEC selection's scans record (a scan in two results counts twice, as it is
-        stitched twice), or None for another kind or a scan a file lacks."""
+        stitched twice) and each output's line for the frames-per-scan tooltip (a file's name above its
+        own when there are several): (total, lines), or None for another kind or a scan a file lacks."""
         from xrd_tools.sources.grouping import parse_stitch_scan_groups
         kind, paths, mode, scans = self._selection_key()
         if kind != "Spec" or not paths:
@@ -1419,21 +1435,40 @@ class StitchPage(QtWidgets.QWidget):
         except ValueError:
             return None
         wanted = None if groups is None else tuple(sorted({scan for group in groups for scan in group}))
-        total = 0
+        total, lines = 0, []
         for path in paths:
             counts = _spec_frame_counts(path, _file_states(path), wanted)
             if counts is None or None in counts.values():
                 return None
-            total += sum(counts.values()) if groups is None else sum(
-                sum(counts[scan] for scan in dict.fromkeys(group)) for group in groups)
-        return total
+            lines += [f"{Path(path).name}:"] * (len(paths) > 1)
+            for group in ([(scan,) for scan in counts] if groups is None else groups):
+                members = tuple(dict.fromkeys(group))
+                total += sum(counts[scan] for scan in members)
+                lines.append(("  " if len(paths) > 1 else "") + _output_frames(members, counts))
+        return total, tuple(lines)
+
+    def _committed_frames(self):
+        """(total, lines) of the committed selection shown, else None (a draft, or unknown)."""
+        if self._frames is None or self._frames[0] != self._selection_key():
+            return None
+        return self._frames[1]
 
     def _frames_text(self):
         """" · N frames" for the committed selection shown, else "" (a draft, or unknown)."""
-        if self._frames is None or self._frames[0] != self._selection_key() or self._frames[1] is None:
+        frames = self._committed_frames()
+        if frames is None:
             return ""
-        count = self._frames[1]
-        return f" · {count} frame{'s' * (count != 1)}"
+        return f" · {frames[0]} frame{'s' * (frames[0] != 1)}"
+
+    def _frames_tooltip(self):
+        """Each output's frames for the committed selection shown (maintainer, 2026-09-30: "a tooltip when
+        hovering over it shows the number of images per scan"), else ""."""
+        frames = self._committed_frames()
+        if frames is None:
+            return ""
+        lines = frames[1][:_FRAME_TIP_LINES]
+        more = len(frames[1]) - len(lines)
+        return "\n".join(["Frames per scan:", *lines] + [f"… {more} more"] * (more > 0))
 
     def _refresh_gi_catalog(self, *_args):
         """On a committed source or scan edit, never a draft: another first scan's motors are the
@@ -1504,6 +1539,7 @@ class StitchPage(QtWidgets.QWidget):
             text = f"{len(sources)} {'NeXus file' if kind == 'NeXus' else f'{kind} source'}{'s' * (len(sources) != 1)}"
         source_ready = present and groups != 0
         self.controls.source_card.set_status_text(text if sources else "")
+        self.controls.source_card.status.setToolTip(self._frames_tooltip() if sources else "")
         map_mode = self._mode == "Stitch 2D"
         try:
             processing_ready = all(int(str(value(key))) > 0 for key in (
@@ -2075,8 +2111,14 @@ class StitchPage(QtWidgets.QWidget):
                  else self._owner.begin_retry_verification)
         self._start("Retrying finalization…", begin)
 
-    def _status(self, text, *, ready=True):
-        self.run_bar.set_readiness_summary(str(text), ready=ready)
+    def _status(self, text, *, ready=True, tooltip=""):
+        self.run_bar.set_readiness_summary(str(text), ready=ready, tooltip=tooltip)
+
+    def _show_readiness(self):
+        """The readiness line; hovered, the full line and, when it counts the selection's frames, each scan's."""
+        text, ready = self._readiness
+        frames = self._frames_tooltip() if ready else ""
+        self._status(text, ready=ready, tooltip=f"{text}\n\n{frames}" if frames else "")
 
     def _poll(self):
         update = self._owner.poll()

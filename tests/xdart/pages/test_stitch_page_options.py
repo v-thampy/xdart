@@ -740,6 +740,50 @@ def test_the_selected_scans_frames_show_once_committed(qapp, tmp_path):
         _close(page, qapp)
 
 
+def test_hovering_the_frame_count_lists_each_scans_frames(qapp, tmp_path):
+    """Maintainer, 2026-09-30: "It will be good if a tooltip when hovering over it shows the number of images
+    per scan as well". The readiness line keeps the total (a scan in two results counted twice); hovered, it
+    and the Source section's status list each output's frames: a scan's, or a bracketed group's scans, each
+    one's frames and their sum. The fixture's scans 1-3 record two points; scan 4, added here, three."""
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    spec = Path(form.source_selection.paths[0])
+    text = spec.read_text()
+    block = text[text.index("#S 1"):text.index("#S 2")].rstrip("\n")
+    last = [row for row in block.splitlines() if row.strip() and not row.startswith("#")][-1]
+    spec.write_text(text.rstrip("\n") + "\n\n" + block.replace("#S 1", "#S 4", 1) + "\n" + last + "\n")
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(form)
+        header, line = page.controls.source_card.status, page.run_bar.readinessLabel
+        page.set_field("scan", "1,4,[2,4]")
+        frames = "Frames per scan:\nscan 1: 2 frames\nscan 4: 3 frames\nscans 2, 4 (one output): 2 + 3 = 5 frames"
+        assert header.text() == "1 SPEC file · 3 outputs · 10 frames" and " · 10 frames · " in line.full_text()
+        assert header.toolTip() == frames and line.toolTip() == f"{line.full_text()}\n\n{frames}"
+        page.set_field("scan_mode", "Stitch All")  # every scan by itself
+        assert header.toolTip() == "Frames per scan:\n" + "\n".join(
+            f"scan {scan}: {points} frames" for scan, points in ((1, 2), (2, 2), (3, 2), (4, 3)))
+        page.set_field("scan_mode", "Select Scans")
+        page.set_field("scan", ",".join(["4"] * 45))  # a long selection: its first 40 outputs
+        assert header.toolTip().splitlines()[1:] == ["scan 4: 3 frames"] * 40 + ["… 5 more"]
+        page.set_field("project_root", "")  # not ready: the line counts no frames, so lists none
+        assert line.toolTip() == line.full_text() and line.full_text().startswith("Needs ")
+        assert header.toolTip().startswith("Frames per scan:\nscan 4: 3 frames")
+        page.set_field("project_root", str(form.project_root))
+        page._rows["scan"].editor.setText("1")  # typed, not committed: no count and no list
+        page._rows["scan"].draftChanged.emit(page._fields["scan"].path, "1")
+        assert header.toolTip() == "" and line.toolTip() == line.full_text()
+        other = spec.with_name("other.spec")
+        other.write_bytes(spec.read_bytes())
+        page.load_form(replace(form, source_selection=replace(form.source_selection, paths=(str(spec), str(other)),
+                                                              scans="1,[2,4]")))
+        assert header.toolTip() == ("Frames per scan:\n"
+                                    + f"{spec.name}:\n  scan 1: 2 frames\n  scans 2, 4 (one output): 2 + 3 = 5 frames\n"
+                                    + "other.spec:\n  scan 1: 2 frames\n  scans 2, 4 (one output): 2 + 3 = 5 frames")
+        assert " · 14 frames · " in line.full_text()
+    finally:
+        _close(page, qapp)
+
+
 def test_a_typed_path_asks_the_disk_nothing_until_it_is_committed(qapp, tmp_path, monkeypatch):
     """AUD-3R (maintainer, 2026-09-30: "yes for cheap fix"): the readiness line's file checks and calibration
     reads run on a committed value; a keystroke reuses the last ones (a slow share is not asked per key)."""
