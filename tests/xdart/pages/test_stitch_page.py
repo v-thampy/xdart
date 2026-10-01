@@ -1063,3 +1063,56 @@ def test_a_gi_result_opens_on_its_cut_and_offers_its_cuts_beside_q_and_two_theta
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
         qapp.processEvents()
+
+
+def _published(form):
+    request = prepare_stitch_tool(form).request
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    return request.module.output.target, result.payload
+
+
+def test_background_does_not_show_old_values_when_the_same_output_is_replaced(qapp, tmp_path):
+    """Codex's round-2 review F1 reproduction: a background set on a result, the output replaced (another
+    polarization) and opened again under the same key: the page shows the new result, not the arrays the
+    background was made from (the background is released)."""
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    path, original = _published(form)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.open_result(path)
+        _wait(page, qapp)
+        page.scientific.background.click()
+        assert page._background.phase == "ACTIVE"
+        np.testing.assert_allclose(page.curve.listDataItems()[0].yData, 0., atol=1e-12)
+        replaced_path, replacement = _published(replace(form, polarization_factor=.75))
+        assert replaced_path == path
+        assert not np.array_equal(original.intensity, replacement.intensity, equal_nan=True)
+        page.open_result(path)
+        _wait(page, qapp)
+        assert page._background.phase in {"EMPTY", "RELEASED"}
+        np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, replacement.intensity)
+    finally:
+        page._release_background()
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+
+
+def test_clean_shutdown_releases_the_background(qapp, tmp_path):
+    """Codex's round-2 review F2 reproduction: a CLEAN shutdown releases the display background."""
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    path, _payload = _published(_native_form(tmp_path, "multigeometry", scans="1"))
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.open_result(path)
+        _wait(page, qapp)
+        page.scientific.background.click()
+        assert page._background.phase == "ACTIVE" and page._background.active_bytes > 0
+        assert page.shutdown().status is PageCleanup.CLEAN
+        assert page._background.phase in {"EMPTY", "RELEASED"}
+        assert page._background.active_bytes == 0
+    finally:
+        page._release_background()
+        page.shutdown()
+        page.deleteLater()

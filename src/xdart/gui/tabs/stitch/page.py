@@ -2466,10 +2466,15 @@ class StitchPage(QtWidgets.QWidget):
                 AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}:
             raise TypeError("Stitch page requires an admitted Stitch result")
         key = str(path)
-        self._payloads[key] = payload
-        self._payload_bytes[key] = payload.resident_bytes
         item = next((self.results.item(i) for i in range(self.results.count())
                      if self.results.item(i).data(QtCore.Qt.ItemDataRole.UserRole) == key), None)
+        if item is not None and self._background.phase not in {"EMPTY", "RELEASED"}:
+            # this result replaces one listed under its key (a run that replaced the output, or the file
+            # opened again): a background made from the earlier one would show its arrays in place of the
+            # new ones (Codex round-2 review F1)
+            self._release_background()
+        self._payloads[key] = payload
+        self._payload_bytes[key] = payload.resident_bytes
         if item is None:
             item = QtWidgets.QListWidgetItem(Path(key).name)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, key)
@@ -2918,6 +2923,7 @@ class StitchPage(QtWidgets.QWidget):
             from xdart.gui.pages.values import CloseReceipt
             return CloseReceipt(PageCleanup.PENDING, "Calibration or mask editor is closing")
         if receipt.status is PageCleanup.CLEAN:
+            self._release_background()  # its owner and the view's hold on it (Codex round-2 review F2)
             for dialog in self.findChildren(QtWidgets.QDialog):
                 dialog.close()
             self.curve.clear()
