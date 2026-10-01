@@ -135,3 +135,21 @@ def test_a_host_pages_tools_sit_in_the_top_bar_and_the_slice_tool_can_be_left_ou
     finally:
         view.deleteLater()
         qapp.processEvents()
+
+
+def test_the_colour_map_and_log_controls_are_built_once_for_every_intensity_view(qapp):
+    """Int's colour-map list and Log toggle come from one shared builder (``color_map_combo``, ``log_toggle``),
+    which ``ScientificView``'s top bar and the 3D Viewer's ``VolumeView`` both mount (AUD-9 stage 2b G9; hard
+    rule 14: reuse by extraction, never a re-declared list)."""
+    from xdart.gui.tabs.scattering.shell_widgets import color_map_choices, color_map_combo, log_toggle
+    view = ScientificView()
+    try:
+        items = tuple(view.color_map.itemText(index) for index in range(view.color_map.count()))
+        assert items == color_map_choices() and items[0] == "Default" and "viridis" in items
+        assert view.log_scale.isCheckable() and view.log_scale.text() == "Log"
+        combo, log = color_map_combo(), log_toggle()
+        assert tuple(combo.itemText(index) for index in range(combo.count())) == items
+        assert type(combo) is type(view.color_map) and log.isCheckable() and log.text() == "Log"
+    finally:
+        view.deleteLater()
+        qapp.processEvents()

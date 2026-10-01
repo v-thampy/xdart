@@ -15,7 +15,6 @@ import math
 import os
 import time
 
-from matplotlib import colormaps as matplotlib_colormaps
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
@@ -53,9 +52,12 @@ from .processed_browser import TerminalRebindAuthorization
 from .shell_widgets import (
     _axis_presentation,
     aggregate_traces,
+    color_map_choices,
+    color_map_combo,
     CompactFrameSelector,
     ContentFitComboBox,
     frame_caption,
+    log_toggle,
     same_grid,
     ScientificImagePane,
     scrollable_toolbar,
@@ -734,14 +736,9 @@ class ScientificView(QtWidgets.QFrame):
         self.background = QtWidgets.QPushButton("Set BG")
         self.title = QtWidgets.QLabel("Current")
         self.title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.color_map = ContentFitComboBox()
-        self._color_map_choices = (
-            "Default",
-            *tuple(matplotlib_colormaps),
-        )
-        self.color_map.addItems(self._color_map_choices)
-        self.log_scale = QtWidgets.QPushButton("Log")
-        self.log_scale.setCheckable(True)
+        self.color_map = color_map_combo()  # Int's list, shared with the 3D Viewer (shell_widgets)
+        self._color_map_choices = color_map_choices()
+        self.log_scale = log_toggle()
         self.raw_popup_button = QtWidgets.QPushButton("Raw")
         row.addWidget(self.norm)
         row.addWidget(self.background)

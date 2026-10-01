@@ -1156,16 +1156,41 @@ def aggregate_traces(
     )
 
 
+def color_map_choices() -> tuple[str, ...]:
+    """Int's colour-map list: "Default" (viridis) first, then every matplotlib map."""
+    from matplotlib import colormaps  # lazy: importing this module loads no plotting library
+
+    return ("Default", *tuple(colormaps))
+
+
+def color_map_combo() -> ContentFitComboBox:
+    """Int's colour-map selector, the one its scientific view's top bar shows: built here once for every view
+    that draws an intensity (``ScientificView``, the 3D Viewer's ``VolumeView``)."""
+    combo = ContentFitComboBox()
+    combo.addItems(color_map_choices())
+    return combo
+
+
+def log_toggle() -> QtWidgets.QPushButton:
+    """Int's Log toggle, shared as ``color_map_combo`` is."""
+    button = QtWidgets.QPushButton("Log")
+    button.setCheckable(True)
+    return button
+
+
 __all__ = [
     "apply_section_header",
     "apply_vnext_controls_readiness",
     "axis_extent",
     "axis_span",
     "aggregate_traces",
+    "color_map_choices",
+    "color_map_combo",
     "foldable",
     "ContentFitComboBox",
     "experiment_header_projection",
     "frame_caption",
+    "log_toggle",
     "processing_header_projection",
     "project_header_projection",
     "repeated_labels",
