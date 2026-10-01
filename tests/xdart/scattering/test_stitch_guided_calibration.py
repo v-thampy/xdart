@@ -142,6 +142,27 @@ qt.QApplication.exec = automated_exec
     assert not list(tmp_path.glob('.xdart-calibration-*'))
 
 
+def test_the_window_s_tips_name_the_page_it_serves(tmp_path):
+    """G6 choice 4 (G8c): the window is shared, so its tips say what its own page does with a calibration: an RSM
+    window names no Stitch behaviour, and a Stitch window keeps its own."""
+    from pyqtgraph import QtWidgets
+
+    def tips(page):
+        dialog = CalibrationDialog(CalibrationContext(page, tmp_path))
+        found = [widget.toolTip() for widget in dialog.findChildren(QtWidgets.QWidget) if widget.toolTip()]
+        dialog.close()
+        return found
+    rsm = tips('RSM')
+    assert not [tip for tip in rsm if 'Stitch' in tip]
+    assert any("RSM adds their difference to each scan's own energy" in tip for tip in rsm)
+    assert any(tip.endswith("RSM's gridding (its xrayutilities geometry) takes it.") for tip in rsm)
+    assert any(tip.endswith("RSM's calibration: RSM grids with the xrayutilities one.") for tip in rsm)
+    stitch = tips('Stitch')
+    assert any(tip.endswith("which Stitch checks the scans' energies against.") for tip in stitch)
+    assert any("and Stitch refuses frames outside what was checked." in tip for tip in stitch)
+    assert any(tip.endswith("Stitch's grazing incidence takes it.") for tip in stitch)
+
+
 def test_modeless_window_exposes_guided_source_controls_and_preserves_session(tmp_path):
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     source = SourceSpec(tmp_path/'beam', SourceKind.SPEC, options={'scan':'14', 'image_dir':str(tmp_path/'images')})

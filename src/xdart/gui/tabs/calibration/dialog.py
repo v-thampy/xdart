@@ -344,6 +344,26 @@ def _plain_choice(value):
     return value if value is None or isinstance(value, (bool, int, float, str)) else None
 
 
+#: What the page a window serves does with what it saves, in the window's tips (G6 choice 4): the window is
+#: shared, so each tip names its own page's use, and claims none for a page it does not know.
+_PAGE_USE = {
+    "Stitch": {
+        "energy": " The saved calibration keeps the recorded energy, which Stitch checks the scans' energies against.",
+        "energy_field": " (Stitch checks each scan's energy against it)",
+        "range": ", and Stitch refuses frames outside what was checked",
+        "backend": ": the Backend under Processing chooses which of the two Stitch uses",
+    },
+    "RSM": {
+        "energy": (" The saved calibration keeps the recorded energy and the refined one: RSM adds their difference "
+                   "to each scan's own energy when it applies the refinement, and warns of a scan recorded more "
+                   "than 2 % from it."),
+        "energy_field": " (RSM warns of a scan recorded more than 2 % from it)",
+        "range": "",
+        "backend": ": RSM grids with the xrayutilities one",
+    },
+}
+
+
 @dataclass(frozen=True)
 class CalibrationContext:
     """The page a calibration window serves: its name, in the window's title and buttons ("Save geometry and
@@ -723,11 +743,11 @@ class CalibrationDialog(QtWidgets.QDialog):
         energy_layout.setContentsMargins(0, 0, 0, 0)
         refine_row = FormRow(label='Refine energy', path=('Calibration', 'refine_energy'), value=True, kind='bool')
         self.refine_energy = refine_row.editor
+        use = _PAGE_USE.get(self.context.page, {})
         energy_tip = ('Also fits the beam energy, within ± the bound of the frames\' recorded energy. The arm\'s '
                       'known angles give an absolute 2θ scale, so the calibrant rings can fix it; with frames on only '
                       'one side of zero it trades off against the zero offsets and the sample offset, and the fit '
-                      'summary gives its uncertainty. The saved calibration keeps the recorded energy, which '
-                      'Stitch checks the scans\' energies against.')
+                      'summary gives its uncertainty.' + use.get('energy', ''))
         self.refine_energy.setToolTip(energy_tip)
         bound_row = FormRow(label='±', path=('Calibration', 'energy_bound'), value='100')
         bound_row.label.setMinimumWidth(0)
@@ -820,10 +840,11 @@ class CalibrationDialog(QtWidgets.QDialog):
         ranges.setContentsMargins(0, 0, 0, 0)
         ranges.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         ranges.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
-        range_tip = ('The {} angles Stitch with xrayutilities may use this calibration for: its xrayutilities '
-                     'file is checked on every pixel over this range (with the calibrant frames and the scan\'s '
-                     'frames), and Stitch refuses frames outside what was checked. Blank: the calibrant '
-                     'scan\'s span. pyFAI MultiGeometry has no such limit.')
+        use = _PAGE_USE.get(self.context.page, {})
+        range_tip = (f'The {{}} angles {self.context.page} may use this calibration\'s xrayutilities file for: it is '
+                     'checked on every pixel over this range (with the calibrant frames and the scan\'s '
+                     f'frames){use.get("range", "")}. Blank: the calibrant scan\'s span. pyFAI MultiGeometry has no '
+                     'such limit.')
         self._edit(ranges, 'del_domain', 'del range for xrayutilities (min, max °)', '', tip=range_tip.format('del'))
         self._edit(ranges, 'nu_domain', 'nu range for xrayutilities (min, max °)', '', tip=range_tip.format('nu'))
         layout.addWidget(self._xu_ranges)
@@ -831,8 +852,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.save_button.setToolTip('Saves the fitted geometry inside the project as a pyFAI goniometer JSON and, '
                                     'beside it, the same calibration for xrayutilities (<name>.xu.json, checked '
                                     'against pyFAI on every pixel), and makes it '
-                                    f'{self.context.page}\'s calibration: the Backend under Processing chooses '
-                                    'which of the two Stitch uses.')
+                                    f'{self.context.page}\'s calibration{use.get("backend", "")}.')
         self.save_button.setEnabled(False)
         self.save_button.clicked.connect(self._save)
         layout.addWidget(self.save_button)
@@ -944,8 +964,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                    placeholder="blank: the calibrant scan's energy, else the direct-beam scan's",
                    tip='The X-ray wavelength of this geometry. Blank: the calibrant scan\'s recorded energy (3 · '
                        'Calibrant scan), else the direct-beam scan\'s once it is fitted, when they record one. '
-                       'Save as calibration and a refinement started from this geometry need it (Stitch checks '
-                       'each scan\'s energy against it).')
+                       'Save as calibration and a refinement started from this geometry need it'
+                       + _PAGE_USE.get(self.context.page, {}).get('energy_field', '') + '.')
         self._fit_options, options = self._card(layout, 'Fit options')
         self._edit(options, 'beam_strip', 'Strip half width (pixels)', '2',
                    tip='The beam spot is searched in a strip this many pixels either side of its path.')
@@ -1060,8 +1080,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._edit(form, 'mask', 'Mask file', chooser='Masks (*.edf *.tif *.tiff *.npy);;All files (*)',
                    tip='Pixels to leave out everywhere in this calibration: the direct-beam fit, pyFAI-calib2 '
                        '(its mask), the automatic refinement\'s ring search and the expected rings. Drawn on '
-                       'the stored image (before the camera\'s turn), as the Stitch Mask File is; saving the '
-                       f'calibration makes it {self.context.page}\'s Mask File.')
+                       f'the stored image (before the camera\'s turn), as {self.context.page}\'s Mask File is; saving '
+                       f'the calibration makes it {self.context.page}\'s Mask File.')
         self._fields['mask'].editingFinished.connect(self._render_frames)
         return panel
 
@@ -1083,7 +1103,7 @@ class CalibrationDialog(QtWidgets.QDialog):
     _CAMERA_TIP = ('The lab directions the stored image\'s rows (top to bottom) and columns (left to right) run '
                    'along with every circle at zero, the detector facing the beam: x up, z to the left looking '
                    'downstream (xrayutilities\' detectorDir1, detectorDir2). Every image is turned and mirrored '
-                   'into Stitch\'s frame, rows x−, columns z+, once before calibration; that is the default (an '
+                   'into the calibration\'s frame, rows x−, columns z+, once before calibration; that is the default (an '
                    'image rotation of 0 before). 17-2\'s Pilatus 300K-W is rows x−, columns z−, with nu x−.')
 
     def _orientation(self):

@@ -34,8 +34,12 @@ _SAMPLE_ZERO_TIP = ("{circle}'s motor-zero reading (degrees): the motor's readba
 #: "let's just stick with swapping the signs for now"; "default to standard").
 _AXIS_TIP = ("The axis {circle} turns about, right-handed, for a positive angle: {standard} is psic's, "
              "{reverse} a circle that turns the other way. {readers}")
-_AXIS_READERS = {"detector": "Stitch's detector-arm fits and its xrayutilities file take it.",
-                 "sample": "Stitch's grazing incidence takes it."}
+#: Who reads a circle's axis, by the page the editor serves (``used_by``; G6 choice 4): none claimed for a page
+#: it does not know.
+_AXIS_READERS = {"Stitch": {"detector": "Stitch's detector-arm fits and its xrayutilities file take it.",
+                            "sample": "Stitch's grazing incidence takes it."},
+                 "RSM": {"detector": "RSM's gridding (its xrayutilities geometry) takes it.",
+                         "sample": "RSM's gridding (its xrayutilities geometry) takes it."}}
 
 
 class GeometryEditor(QtWidgets.QWidget):
@@ -211,7 +215,7 @@ class GeometryEditor(QtWidgets.QWidget):
         combo.setCurrentIndex(combo.findData(sense))
         del blocker
         combo.setToolTip(_AXIS_TIP.format(circle=circle, standard=standard, reverse=signed_axis(standard, -1),
-                                          readers=_AXIS_READERS[role]))
+                                          readers=_AXIS_READERS.get(self._used_by, {}).get(role, "")).rstrip())
 
     def axis_box(self, circle) -> QtWidgets.QComboBox:
         """A circle's axis box (its data: 1 for psic's sense, −1 reversed)."""
