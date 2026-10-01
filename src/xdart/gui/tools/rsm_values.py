@@ -312,13 +312,40 @@ def _missing_motor_role(source_spec, motor_selectors, cancel_token):
     )
     if full.disposition is not AnalysisDisposition.COMPLETED:
         return None
+    return _missing_role_in_table(full, motor_selectors)
+
+
+def _missing_role_in_table(table, motor_selectors):
+    """The first psic role whose column a whole metadata table lacks: (role, selector), or None."""
     counts: dict[str, int] = {}
-    for column in full.columns:
+    for column in table.columns:
         counts[column.name] = counts.get(column.name, 0) + 1
     for role, selector in motor_selectors:
         if counts.get(selector.name, 0) <= selector.occurrence:
             return role, selector
     return None
+
+
+def _append_rsm_member_source(sources, table, member, selectors) -> None:
+    """One admitted member's module source: its frames by the member's selector, its selectors bound."""
+    selected = member.frame_selector.select(table.labels)
+    try:
+        sources.append(
+            ModuleSourceReceipt.from_metadata_table(
+                table,
+                kind=ModuleKind.RSM,
+                selected_labels=selected,
+                resolved_selectors=selectors,
+            )
+        )
+    except ValueError as error:
+        if str(error) != "metadata table is no longer an exact source fact":
+            raise
+        raise RSMToolPreflightRefused(
+            "SOURCE_REVISION_CHANGED",
+            "the source changed while binding the RSM v2 Preview",
+            diagnostics=(str(error),),
+        ) from error
 
 
 def rsm_member_groups(
@@ -333,9 +360,9 @@ def rsm_member_groups(
     """Stitch's source selection, resolved by Stitch's own owner (``resolve_stitch_sources``: discovery, the
     Selection syntax, Directory mode and its skips), as RSM member groups: one RSM per group, each SPEC scan one
     member with the run's one frame range, raw decoder and angle mapping (design §2: ``[42-44]`` one RSM from
-    three scans, ``42,43`` two). Returns (groups, skipped). Until RSM reads NeXus sources (stage 2b C5c) a NeXus
-    selection is refused (``SOURCE_KIND_UNSUPPORTED``), and in Directory mode a folder's NeXus files are skipped
-    with that reason, so its SPEC scans still map."""
+    three scans, ``42,43`` two). Returns (groups, skipped). A raw NeXus stack is a member too (stage 2b C5c:
+    ``RSMNexusMemberForm``, its path, kind and entry), in an explicit selection and in Directory mode; any other
+    kind is refused, or skipped in Directory mode."""
     from xrd_tools.analysis.stitch_sources import StitchSourceSelection, resolve_stitch_sources
     if type(selection) is not StitchSourceSelection:
         raise TypeError("RSM members come from an exact Stitch source selection")
@@ -346,8 +373,12 @@ def rsm_member_groups(
     for group in resolution.groups:
         members = []
         for spec in group:
+            if spec.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:  # a raw NeXus stack (C5c)
+                members.append(RSMNexusMemberForm(Path(spec.uri), spec.kind, spec.entry or "entry",
+                                                  frame_selector, tuple(detector_shape), motor_selectors))
+                continue
             if spec.kind is not SourceKind.SPEC:
-                reason = "RSM reads SPEC scans here; NeXus sources come next (stage 2b C5c)"
+                reason = "RSM reads SPEC scans and raw NeXus stacks"
                 if selection.kind == "Directory":
                     skipped.append((str(spec.uri), str(spec.entry or ""), reason))
                     continue
@@ -441,12 +472,64 @@ class RSMScanMemberForm:
 
 
 @dataclass(frozen=True, slots=True)
+class RSMNexusMemberForm:
+    """One visible ordered raw NeXus member for an RSM v2 group (AUD-9 stage 2b C5c): the stack's path, its kind
+    (``NEXUS_STACK`` or ``EIGER_MASTER``) and entry, the frame range and the six-role angle mapping, whose
+    columns are the entry's positioners (a Dectris goniometer's ``omega``/``kappa``/``phi``/``chi`` are named
+    as any column). No raw decoder: the stack carries its own dtype, decoded to float64."""
+
+    nexus_path: str | Path
+    kind: SourceKind
+    entry: str
+    frame_selector: RSMFrameSelector
+    detector_shape: tuple[int, int]
+    motor_selectors: tuple[tuple[str, MetadataColumnSelector], ...]
+    fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        path = _absolute_path(self.nexus_path, "RSM member NeXus path")
+        if self.kind not in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
+            raise ValueError("RSM NeXus member kind must be a raw NeXus stack or Eiger master")
+        if (
+            type(self.entry) is not str
+            or not self.entry
+            or self.entry.strip() != self.entry
+            or any(mark in self.entry for mark in ("\0", "\\"))
+        ):
+            raise ValueError("RSM NeXus member entry is invalid")
+        if type(self.frame_selector) is not RSMFrameSelector:
+            raise TypeError("RSM member frame selector must be exact")
+        if (
+            type(self.detector_shape) is not tuple
+            or len(self.detector_shape) != 2
+            or any(type(item) is not int or item < 2 for item in self.detector_shape)
+        ):
+            raise ValueError("RSM member detector shape is invalid")
+        motors = _rsm_member_motor_selectors(self.motor_selectors)
+        object.__setattr__(self, "nexus_path", path)
+        object.__setattr__(self, "motor_selectors", motors)
+        canonical = (
+            path,
+            self.kind.value,
+            self.entry,
+            self.frame_selector.fingerprint_value,
+            tuple(self.detector_shape),
+            tuple((role, selector.name, selector.occurrence) for role, selector in motors),
+        )
+        object.__setattr__(
+            self,
+            "fingerprint",
+            analysis_canonical_fingerprint("rsm-nexus-member-form-v1", canonical),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class RSMToolFormV2:
     """Complete ordered RSM v2 Preview intent; R1 form stays unchanged."""
 
     project_root: str | Path
     geometry_asset: RSMGeometryAssetInput
-    members: tuple[RSMScanMemberForm, ...]
+    members: tuple[RSMScanMemberForm | RSMNexusMemberForm, ...]
     conditioning: RSMImageConditioning
     normalization: RSMNormalizationPolicy
     bins: tuple[int, int, int]
@@ -486,7 +569,7 @@ class RSMToolFormV2:
             type(self.geometry_asset) is not RSMGeometryAssetInput
             or type(self.members) is not tuple
             or not 1 <= len(self.members) <= _MAX_RSM_MEMBERS
-            or any(type(item) is not RSMScanMemberForm for item in self.members)
+            or any(type(item) not in {RSMScanMemberForm, RSMNexusMemberForm} for item in self.members)
             or len({item.fingerprint for item in self.members}) != len(self.members)
             or type(self.conditioning) is not RSMImageConditioning
             or type(self.normalization) is not RSMNormalizationPolicy
@@ -1344,6 +1427,8 @@ class RSMToolPreflightMemberSummaryV2:
     q_bounds: tuple[tuple[float, float], ...]
     normalization_divisor_range: tuple[float, float]
     _claim: InitVar[object] = None
+    #: a NeXus member's entry, where a SPEC member has its scan (AUD-9 stage 2b C5c); None for SPEC
+    source_entry: str | None = None
 
     def __post_init__(self, _claim: object) -> None:
         hashes = (
@@ -1362,7 +1447,8 @@ class RSMToolPreflightMemberSummaryV2:
             or type(self.source_relative_path) is not str
             or not self.source_relative_path
             or type(self.source_scan) is not str
-            or _SCAN.fullmatch(self.source_scan) is None
+            or (_SCAN.fullmatch(self.source_scan) is None if self.source_entry is None
+                else self.source_scan != "" or type(self.source_entry) is not str or not self.source_entry)
             or type(self.selected_labels) is not tuple
             or not self.selected_labels
             or any(type(item) is not int or item < 0 for item in self.selected_labels)
@@ -1694,15 +1780,37 @@ def prepare_rsm_tool_v2(
     for member in form.members:
         if cancel_token is not None and cancel_token.is_set():
             raise RSMToolPreflightRefused("CANCELLED")
+        selectors = required_rsm_selectors_v2(
+            member.motor_selectors,
+            form.normalization,
+        )
+        if type(member) is RSMNexusMemberForm:  # a raw NeXus stack (AUD-9 stage 2b C5c)
+            nexus_relative = _inside_project(member.nexus_path, project, "nexus")
+            source_spec = SourceSpec(project / nexus_relative, member.kind, entry=member.entry)
+            table = run_metadata_table(MetadataTablePlan(source_spec), cancel_token=cancel_token)
+            if table.disposition is AnalysisDisposition.COMPLETED:
+                missing = _missing_role_in_table(table, member.motor_selectors)
+                if missing is not None:
+                    role, selector = missing
+                    raise RSMToolPreflightRefused(
+                        "RSM_MOTOR_MISSING",
+                        f"entry {member.entry} of {Path(member.nexus_path).name}: the psic role {role} maps to "
+                        f"column {selector.name!r} (occurrence {selector.occurrence}), which the entry does not "
+                        "record; map it in Angle mapping",
+                    )
+            if table.disposition is not AnalysisDisposition.COMPLETED:
+                raise RSMToolPreflightRefused(
+                    table.code or "SOURCE_PREFLIGHT_REFUSED",
+                    "NeXus source could not be admitted for RSM v2",
+                    diagnostics=table.diagnostics,
+                )
+            _append_rsm_member_source(sources, table, member, selectors)
+            continue
         spec_relative = _inside_project(member.spec_path, project, "spec")
         image_relative = _inside_project(
             member.image_dir,
             project,
             "image_directory",
-        )
-        selectors = required_rsm_selectors_v2(
-            member.motor_selectors,
-            form.normalization,
         )
         source_spec = SourceSpec(
             project / spec_relative,
@@ -1746,24 +1854,7 @@ def prepare_rsm_tool_v2(
                 "SPEC source could not be admitted for RSM v2",
                 diagnostics=table.diagnostics,
             )
-        selected = member.frame_selector.select(table.labels)
-        try:
-            sources.append(
-                ModuleSourceReceipt.from_metadata_table(
-                    table,
-                    kind=ModuleKind.RSM,
-                    selected_labels=selected,
-                    resolved_selectors=selectors,
-                )
-            )
-        except ValueError as error:
-            if str(error) != "metadata table is no longer an exact source fact":
-                raise
-            raise RSMToolPreflightRefused(
-                "SOURCE_REVISION_CHANGED",
-                "SPEC source changed while binding the RSM v2 Preview",
-                diagnostics=(str(error),),
-            ) from error
+        _append_rsm_member_source(sources, table, member, selectors)
     try:
         group = ModuleSourceGroupReceipt.from_members(tuple(sources))
         output = ModuleOutputRequest(
@@ -1835,6 +1926,7 @@ def prepare_rsm_tool_v2(
                 ),
             ),
             _PREFLIGHT_V2_FACTORY,
+            json.loads(item.source_options_json).get("entry"),
         )
         for item, source in zip(
             request.preflight.members,
@@ -1969,10 +2061,14 @@ def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]
             (
                 (
                     f"Member {member.ordinal + 1}: "
-                    f"{member.source_relative_path} · scan "
-                    f"{member.source_scan} · "
-                    f"{member.selected_frame_count} frames"
+                    f"{member.source_relative_path} · "
+                    + (f"scan {member.source_scan}" if member.source_entry is None
+                       else f"NeXus entry {member.source_entry}")
+                    + f" · {member.selected_frame_count} frames"
                 ),
+                *(() if member.source_entry is None or frame is not RSMCoordinateFrame.HKL else (
+                    "  UB: the NeXus entry's own, read in SPEC's #G3 convention (2π included, as xdart writes "
+                    "it), unless one is given",)),
                 f"  labels: {member.selected_labels}",
                 f"  form: {member.member_form_fingerprint}",
                 f"  module source: {member.module_source_fingerprint}",

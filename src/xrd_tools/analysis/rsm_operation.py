@@ -118,6 +118,8 @@ _MAX_PROVENANCE_BYTES = 1024 * 1024
 _MAX_JSON_DEPTH = 32
 _MAX_RSM_RESIDENT_BYTES = 1024 * 1024 * 1024
 _PSIC_ROLES = ("mu", "eta", "chi", "phi", "nu", "del")
+#: The raw NeXus stacks an RSM member may be (AUD-9 stage 2b C5c); processed xdart members stay held.
+_RSM_NEXUS_KINDS = frozenset({SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER})
 _REQUEST_FACTORY = object()
 _RSM_V2_FACTORY = object()
 _RSM_V2_HOLDS = (
@@ -128,7 +130,7 @@ _RSM_V2_HOLDS = (
     "volume-rendering-isosurfaces-vtk-ui-and-gpu-opencl",
     "non-psic-custom-fourc-two-circle-and-sixc-geometry-assets",
     "non-identity-raw-image-orientation",
-    "nexus-tiled-and-processed-scan-members",
+    "tiled-and-processed-xdart-scan-members",
     "heterogeneous-detector-geometry-or-roi",
     "windows-smb-unc-linux-and-intel-macos-validation",
     "broad-test-battery-launcher-replacement-canonical-merge-push-tag-and-release",
@@ -1414,6 +1416,24 @@ def _project_source_options(
             "SOURCE_SPEC_UNSUPPORTED",
             "R1 RSM does not accept SourceSpec.metadata_uri",
         )
+    if analysis.resolved_kind in _RSM_NEXUS_KINDS:
+        # a raw NeXus stack (AUD-9 stage 2b C5c): one exact entry, no scan and no reader overrides, as Stitch
+        # admits it; its frames, energy, motors and UB come from the entry, the UB read in SPEC's #G3
+        # convention (2π included), which xdart's own NeXus writer stores there
+        if (
+            analysis.source_spec.options
+            or not analysis.resolved_entry
+            or analysis.resolved_scan
+        ):
+            raise RSMOperationRefused(
+                "SOURCE_SPEC_UNSUPPORTED",
+                "a NeXus member needs one exact entry and no reader overrides",
+            )
+        return json.dumps(
+            {"entry": analysis.resolved_entry, "kind": analysis.resolved_kind.value,
+             "ub_convention": "spec-g3"},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        )
     if analysis.resolved_kind is not SourceKind.SPEC:
         raise RSMOperationRefused("SOURCE_KIND_UNSUPPORTED")
     options = dict(analysis.source_spec.options)
@@ -1489,6 +1509,27 @@ def _project_source_options(
         separators=(",", ":"),
         ensure_ascii=False,
     )
+
+
+def _rsm_nexus_energy_and_ub(analysis, coordinate_frame, ub_override):
+    """A raw NeXus member's energy (eV) and UB, from its entry through xdart's NeXus reader (AUD-9 stage 2b
+    C5c): the energy in keV there; the UB from ``sample/ub_matrix`` or ``orientation_matrix``, read in SPEC's
+    #G3 convention (2π included, as xdart's writer stores it), else a UB given at Preview, else, in HKL,
+    ``RSM_UB_MISSING``. Q coordinates need no UB."""
+    from xrd_tools.io.nexus import read_nexus
+    metadata = read_nexus(analysis.resolved_root, entry=analysis.resolved_entry)
+    energy = float(metadata.energy) * 1000.0
+    if coordinate_frame is not RSMCoordinateFrame.HKL:
+        return energy, None
+    if ub_override is not None:
+        return energy, ub_override.array()
+    if metadata.ub_matrix is None:
+        raise RSMOperationRefused(
+            "RSM_UB_MISSING",
+            "this NeXus entry records no UB matrix (sample/ub_matrix or orientation_matrix); enter one, take it "
+            "from a SPEC scan, or choose Q coordinates",
+        )
+    return energy, np.asarray(metadata.ub_matrix, dtype=np.float64)
 
 
 def _numeric_lookup(
@@ -1591,7 +1632,8 @@ def _capture_preflight_facts(
         )
     source_relative = _relative_locator(analysis.resolved_root, root, "source")
     source_options_json = _project_source_options(analysis, root, selectors)
-    if expected_detector_shape is not None:
+    nexus = analysis.resolved_kind in _RSM_NEXUS_KINDS
+    if expected_detector_shape is not None and not nexus:
         try:
             read_options = json.loads(source_options_json)["read_image_kwargs"]
         except (KeyError, TypeError, json.JSONDecodeError) as error:
@@ -1605,10 +1647,12 @@ def _capture_preflight_facts(
                 "RSM_MEMBER_IDENTITY_MISMATCH",
                 "member detector shape differs from effective geometry",
             )
-    if analysis.primary_post_state is None or not analysis.resolved_scan:
+    if analysis.primary_post_state is None or not (
+        analysis.resolved_entry if nexus else analysis.resolved_scan
+    ):
         raise RSMOperationRefused(
             "SOURCE_IDENTITY_MISMATCH",
-            "SPEC source has no exact primary revision or scan",
+            "source has no exact primary revision, scan or entry",
         )
     dependency_rows = (
         (analysis.lexical_root, analysis.resolved_root, analysis.primary_post_state),
@@ -1707,8 +1751,22 @@ def _capture_preflight_facts(
             analysis,
             cancel_token=cancel_token,
         ) as opened:
+            if nexus and expected_detector_shape is not None:
+                # the open entry's pixel-free descriptor (the lease's cursor source, or the source's own)
+                descriptor = getattr(opened, "descriptor", None)
+                if descriptor is None and callable(getattr(opened, "container_descriptor", None)):
+                    descriptor = opened.container_descriptor()
+                frame_shape = None if descriptor is None else descriptor.frame_shape
+                if tuple(frame_shape or ()) != tuple(expected_detector_shape):
+                    raise RSMOperationRefused(
+                        "RSM_MEMBER_IDENTITY_MISMATCH",
+                        "member detector shape differs from effective geometry",
+                    )
             try:
-                if coordinate_frame is RSMCoordinateFrame.HKL and ub_override is not None:
+                if nexus:
+                    energy, ub_value = _rsm_nexus_energy_and_ub(
+                        analysis, coordinate_frame, ub_override)
+                elif coordinate_frame is RSMCoordinateFrame.HKL and ub_override is not None:
                     # a UB given at Preview replaces the source's (AUD-9 stage 2b C5); the energy is the source's
                     energy = get_energy(
                         analysis.resolved_root,
@@ -1726,6 +1784,8 @@ def _capture_preflight_facts(
                         analysis.resolved_scan,
                     )
                     ub_value = None
+            except RSMOperationRefused:  # already named (a NeXus member's RSM_UB_MISSING, C5c)
+                raise
             except KeyError as error:
                 if normalize_source_fact_errors:
                     missing_ub = (
@@ -1877,7 +1937,7 @@ def _capture_preflight_facts(
     return _RSMCapturedMemberFacts(
         str(root),
         source_relative,
-        analysis.resolved_scan,
+        "" if nexus else analysis.resolved_scan,
         source_options_json,
         analysis.primary_post_state,
         tuple(files),
@@ -2200,7 +2260,7 @@ class RSMPreflightMemberV2:
             or canonical_options != self.source_options_json
             or type(options) is not dict
             or type(self.source_scan) is not str
-            or not self.source_scan
+            or bool(self.source_scan) == ("entry" in options)  # a SPEC scan, or a NeXus entry (C5c)
             or type(self.dependency_files) is not tuple
             or not self.dependency_files
             or len(self.dependency_files) > _MAX_MANIFEST_FILES
@@ -3554,6 +3614,11 @@ def _load_rsm_v2_raw_chunk(
     # SpecSource's admitted decoder contract returns owned float64 frames even
     # when the authenticated on-disk raw encoding is an integer dtype.
     expected_decoded_dtype = np.dtype(np.float64)
+    try:
+        nexus = "entry" in json.loads(member.source_options_json)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RSMOperationRefused("RSM_MEMBER_IDENTITY_MISMATCH") from error
+    native_dtype = None
     frames: list[np.ndarray] = []
     raw_bytes = 0
     pixels_per_frame = math.prod(member.detector_shape)
@@ -3567,10 +3632,19 @@ def _load_rsm_v2_raw_chunk(
                 or observed.shape != member.detector_shape
             ):
                 raise RSMOperationRefused("FRAME_LAYOUT_INVALID")
-            owned = np.array(observed, copy=True, order="C")
+            if nexus:
+                # a NeXus stack hands its dataset's native dtype, the same for every frame (C5c): decoded to
+                # float64 here, exactly for integers
+                if native_dtype is None:
+                    native_dtype = observed.dtype
+                elif observed.dtype != native_dtype:
+                    raise RSMOperationRefused("FRAME_LAYOUT_INVALID")
+                owned = np.array(observed, dtype=expected_decoded_dtype, copy=True, order="C")
+            else:
+                owned = np.array(observed, copy=True, order="C")
+                if owned.dtype != expected_decoded_dtype:  # SPEC's decoder contract: float64 every frame
+                    raise RSMOperationRefused("FRAME_LAYOUT_INVALID")
             observed = None
-            if owned.dtype != expected_decoded_dtype:
-                raise RSMOperationRefused("FRAME_LAYOUT_INVALID")
             float_frame_bytes = pixels_per_frame * np.dtype(np.float64).itemsize
             if (
                 owned.nbytes > plan.max_frame_bytes
@@ -3991,8 +4065,9 @@ def _require_rsm_v2_memory_plan(request: RSMOperationRequestV2) -> None:
     for member in request.preflight.members:
         try:
             options = json.loads(member.source_options_json)
-            declared_raw_dtype = np.dtype(
-                options["read_image_kwargs"]["raw_dtype"]
+            declared_raw_dtype = (
+                np.dtype(np.float64) if "entry" in options  # a NeXus member (C5c)
+                else np.dtype(options["read_image_kwargs"]["raw_dtype"])
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise RSMOperationRefused("RSM_MEMBER_IDENTITY_MISMATCH") from error
@@ -4379,9 +4454,11 @@ def prepare_rsm_operation_v2(
                 ub_override=bound_ub,
             )
             try:
-                read_options = json.loads(facts.source_options_json)[
-                    "read_image_kwargs"
-                ]
+                projected = json.loads(facts.source_options_json)
+                read_options = (
+                    {"detector_shape": facts.detector_shape} if "entry" in projected  # NeXus (C5c)
+                    else projected["read_image_kwargs"]
+                )
             except (KeyError, TypeError, json.JSONDecodeError) as error:
                 raise RSMOperationRefused("RSM_MEMBER_IDENTITY_MISMATCH") from error
             if (
