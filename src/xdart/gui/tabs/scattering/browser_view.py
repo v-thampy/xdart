@@ -23,6 +23,7 @@ from .shell_values import (
 
 _USER_ROLE = int(QtCore.Qt.ItemDataRole.UserRole)
 _DIRECTORY_ROLE = _USER_ROLE + 1
+_MUTED_ROLE = _USER_ROLE + 2
 _ACCUMULATING_PLOT_MODES = frozenset(
     {"Overlay", "Waterfall", "Sum", "Average"}
 )
@@ -334,20 +335,28 @@ class BrowserProfile:
     directory: bool = True
     frames: bool = True
     frames_caption: str = "Frames"
-    #: which actions show, of "Show All", "Metadata", "Auto Last" and "Open…"
+    #: which actions show, of "Show All", "Metadata", "Auto Last", "Open…" and "Raw image"
     actions: tuple[str, ...] = ("Show All", "Metadata", "Auto Last")
     date_sort: bool = True
     refresh: bool = True
     results: bool = False
+    #: a results list's selection: "single" (one result, ``SELECT_RESULT``) or "extended" (several, for an
+    #: overlay: ``SELECT_RESULT`` when the current one changes and ``SELECT_RESULTS`` when the selection does)
+    result_selection: str = "single"
+    #: a results list's second pane: the current result's own entries (Stitch's contributing frames), filled
+    #: through :meth:`BrowserView.reconcile_result_frames`; choosing one emits ``SELECT_RESULT_FRAME``
+    result_frames: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class BrowserResult:
-    """One entry of a results profile's list: its identity, the text shown and the tooltip."""
+    """One entry of a results profile's list: its identity, the text shown and the tooltip; ``muted`` shows it
+    in the disabled text colour (a contributing frame the result excluded)."""
 
     identifier: str
     label: str
     detail: str = ""
+    muted: bool = False
 
 
 class BrowserView(QtWidgets.QFrame):
@@ -363,6 +372,10 @@ class BrowserView(QtWidgets.QFrame):
         self.profile = BrowserProfile() if profile is None else profile
         if type(self.profile) is not BrowserProfile:
             raise TypeError("profile must be an exact BrowserProfile")
+        if self.profile.result_selection not in {"single", "extended"}:
+            raise ValueError("result_selection must be 'single' or 'extended'")
+        if self.profile.result_frames and not self.profile.results:
+            raise ValueError("result_frames needs a results profile")
         self._results: tuple[BrowserResult, ...] = ()
         self.setObjectName("e3BrowserView")
         self.setMinimumWidth(255)
@@ -454,6 +467,13 @@ class BrowserView(QtWidgets.QFrame):
         )
         frame_pane_layout.addWidget(self.frames_label)
         frame_pane_layout.addWidget(self.frames, 1)
+        #: a results profile's second list: the current result's entries (``reconcile_result_frames``)
+        self.result_frames = None
+        if self.profile.result_frames:
+            self.result_frames = QtWidgets.QListWidget()
+            self.result_frames.setObjectName("e3BrowserResultFrames")
+            self.frames.hide()  # Int's frame list keeps Int's frame identities; this pane lists the result's
+            frame_pane_layout.addWidget(self.result_frames, 1)
 
         lists.addWidget(scan_pane)
         lists.addWidget(frame_pane)
@@ -486,9 +506,33 @@ class BrowserView(QtWidgets.QFrame):
             self.open_result.clicked.connect(
                 lambda: self._emit(ShellCommandKind.OPEN_RESULT)
             )
+        self.raw_image = None
+        if "Raw image" in self.profile.actions:
+            self.raw_image = QtWidgets.QPushButton("Raw image")
+            self.raw_image.setObjectName("e3BrowserCompactButton")
+            self._action_buttons["Raw image"] = self.raw_image
+            actions.addWidget(self.raw_image)
+            self.raw_image.clicked.connect(
+                lambda: self._emit(ShellCommandKind.SHOW_RAW_IMAGE)
+            )
         layout.addLayout(actions)
 
-        if self.profile.results:
+        if self.profile.results and self.profile.result_selection == "extended":
+            self.scans.setSelectionMode(
+                QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+            )
+            # as the list's own signals: the current result, then the selection, each as Qt reports it
+            self.scans.currentItemChanged.connect(
+                lambda current, _previous: self._emit(
+                    ShellCommandKind.SELECT_RESULT,
+                    None if current is None else current.data(_USER_ROLE),
+                )
+            )
+            self.scans.itemSelectionChanged.connect(
+                lambda: self.commandRequested.emit(ShellCommand(
+                    ShellCommandKind.SELECT_RESULTS, artifacts=self.selected_results()))
+            )
+        elif self.profile.results:
             self.scans.currentItemChanged.connect(self._result_selected)
         else:
             self.scans.itemSelectionChanged.connect(self._scan_selected)
@@ -497,6 +541,13 @@ class BrowserView(QtWidgets.QFrame):
         self.frames.selectionModel().selectionChanged.connect(
             self._frames_selected
         )
+        if self.result_frames is not None:
+            self.result_frames.currentItemChanged.connect(
+                lambda current, _previous: self._emit(
+                    ShellCommandKind.SELECT_RESULT_FRAME,
+                    None if current is None else current.data(_USER_ROLE),
+                )
+            )
         self.show_all.clicked.connect(
             lambda: self._emit(ShellCommandKind.SHOW_ALL)
         )
@@ -671,14 +722,10 @@ class BrowserView(QtWidgets.QFrame):
         if any(type(entry) is not BrowserResult for entry in entries):
             raise TypeError("results must be exact BrowserResult entries")
         blocker = QtCore.QSignalBlocker(self.scans)
-        if entries != self._results:
-            self.scans.clear()
-            for entry in entries:
-                item = QtWidgets.QListWidgetItem(entry.label)
-                item.setData(_USER_ROLE, entry.identifier)
-                item.setToolTip(entry.detail)
-                self.scans.addItem(item)
-            self._results = entries
+        # against the list itself, not what was last published: a list cleared from outside is filled again
+        if _listed_entries(self.scans) != entries:
+            _fill(self.scans, entries)
+        self._results = entries
         target = next((self.scans.item(index) for index in range(self.scans.count())
                        if self.scans.item(index).data(_USER_ROLE) == current), None)
         if self.scans.currentItem() is not target:
@@ -689,8 +736,72 @@ class BrowserView(QtWidgets.QFrame):
         if current is not None:
             self._emit(ShellCommandKind.SELECT_RESULT, current.data(_USER_ROLE))
 
+    def current_result(self) -> str | None:
+        """A results list's current entry's identity (None: none)."""
+        item = self.scans.currentItem()
+        return None if item is None else item.data(_USER_ROLE)
+
+    def current_result_row(self) -> int:
+        """A results list's current row (-1: none)."""
+        return self.scans.currentRow()
+
+    def current_result_label(self) -> str:
+        """The text the list shows for its current entry ("" for none)."""
+        item = self.scans.currentItem()
+        return "" if item is None else item.text()
+
+    def selected_results(self) -> tuple[str, ...]:
+        """A results list's selected entries' identities, in the order Qt reports them (an overlay's order)."""
+        return tuple(item.data(_USER_ROLE) for item in self.scans.selectedItems())
+
+    def set_current_result(self, identifier: str | None, *, keep_selection: bool) -> None:
+        """Make an entry current as a user would (its commands are emitted): ``keep_selection`` keeps the other
+        selected entries (an overlay stepping through them), else the selection becomes this entry alone.
+        None, or an entry not listed: no current entry."""
+        row = next((index for index in range(self.scans.count())
+                    if self.scans.item(index).data(_USER_ROLE) == identifier), -1)
+        flag = (QtCore.QItemSelectionModel.SelectionFlag.NoUpdate if keep_selection
+                else QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        self.scans.setCurrentRow(row, flag)
+
+    def clear_result_selection(self) -> None:
+        """No entry selected or current, as a user clearing the list would (its commands are emitted)."""
+        self.scans.clearSelection()
+        self.scans.setCurrentRow(-1)
+
+    def reconcile_result_frames(
+        self, entries: tuple[BrowserResult, ...], current: str | None,
+    ) -> None:
+        """The second pane's entries (a results profile with ``result_frames``), rebuilt on every call: the
+        page calls it when it shows a result. Neither the rebuild nor the current entry emits."""
+        if self.result_frames is None:
+            raise RuntimeError("reconcile_result_frames needs a result_frames profile")
+        entries = tuple(entries)
+        if any(type(entry) is not BrowserResult for entry in entries):
+            raise TypeError("result frames must be exact BrowserResult entries")
+        blocker = QtCore.QSignalBlocker(self.result_frames)
+        _fill(self.result_frames, entries)
+        target = next((self.result_frames.item(index) for index in range(self.result_frames.count())
+                       if self.result_frames.item(index).data(_USER_ROLE) == current), None)
+        self.result_frames.setCurrentItem(target)
+        del blocker
+
+    def current_result_frame(self) -> str | None:
+        """The second pane's current entry's identity (None: none)."""
+        item = None if self.result_frames is None else self.result_frames.currentItem()
+        return None if item is None else item.data(_USER_ROLE)
+
+    def current_result_frame_label(self) -> str:
+        """The text the second pane shows for its current entry ("" for none)."""
+        item = None if self.result_frames is None else self.result_frames.currentItem()
+        return "" if item is None else item.text()
+
+    def result_frame_count(self) -> int:
+        return 0 if self.result_frames is None else self.result_frames.count()
+
     def set_action_enabled(self, action: str, enabled: bool) -> None:
-        """Enable or disable one of the profile's actions ("Show All", "Metadata", "Auto Last", "Open…")."""
+        """Enable or disable one of the profile's actions ("Show All", "Metadata", "Auto Last", "Open…",
+        "Raw image")."""
         self._action_buttons[action].setEnabled(bool(enabled))
 
     def reconcile(
@@ -1254,6 +1365,29 @@ class BrowserView(QtWidgets.QFrame):
         self, kind: ShellCommandKind, value=None, *, path: tuple[str, ...] = (),
     ) -> None:
         self.commandRequested.emit(ShellCommand(kind, value, path=path))
+
+
+def _listed_entries(widget: QtWidgets.QListWidget) -> tuple[BrowserResult, ...]:
+    """What a results list shows, as entries (its identities, texts, tooltips and muted marks)."""
+    return tuple(
+        BrowserResult(item.data(_USER_ROLE), item.text(), item.toolTip(),
+                      item.data(_MUTED_ROLE) is True)
+        for item in (widget.item(index) for index in range(widget.count()))
+    )
+
+
+def _fill(widget: QtWidgets.QListWidget, entries: tuple[BrowserResult, ...]) -> None:
+    """A results list's entries, from scratch (one ``clear``)."""
+    widget.clear()
+    muted = widget.palette().color(QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.Text)
+    for entry in entries:
+        item = QtWidgets.QListWidgetItem(entry.label)
+        item.setData(_USER_ROLE, entry.identifier)
+        item.setToolTip(entry.detail)
+        if entry.muted:
+            item.setData(_MUTED_ROLE, True)
+            item.setForeground(muted)
+        widget.addItem(item)
 
 
 def _same_frame_identities(

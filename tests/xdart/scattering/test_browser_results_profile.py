@@ -100,3 +100,101 @@ def test_reconcile_results_is_only_for_a_results_profile(qapp):
             BrowserView(profile=object())
     finally:
         _close(qapp, browser)
+
+
+_STITCH_LIKE = BrowserProfile(
+    menus=(("File", ("Open result…",)), ("Config", ()), ("Help", ())), raw_resolution_menus=False,
+    list_caption="Results", directory=False, actions=("Open…", "Metadata", "Raw image"), date_sort=False,
+    refresh=False, results=True, result_selection="extended", result_frames=True,
+)
+
+
+def test_an_extended_results_list_reports_the_current_result_and_the_selection(qapp):
+    """G3b (Codex's Stitch/Int reuse audit R1): Stitch's results list selects several results for an overlay.
+    The owner reports the current result and the selection as the list's own signals do, and lets the page move
+    the current result keeping or replacing the selection, as a user would."""
+    from pyqtgraph.Qt import QtCore
+    browser = BrowserView(profile=_STITCH_LIKE)
+    commands = []
+    browser.commandRequested.connect(commands.append)
+    try:
+        browser.reconcile_results(tuple(BrowserResult(key, key.upper()) for key in "abc"), "a")
+        assert commands == [] and browser.current_result() == "a" and browser.selected_results() == ("a",)
+        select = QtCore.QItemSelectionModel.SelectionFlag
+        browser.scans.setCurrentRow(2, select.ClearAndSelect)
+        browser.scans.setCurrentRow(0, select.Select)  # a user extending the selection
+        kinds = {command.kind for command in commands}
+        assert kinds == {ShellCommandKind.SELECT_RESULT, ShellCommandKind.SELECT_RESULTS}
+        assert [command.value for command in commands if command.kind is ShellCommandKind.SELECT_RESULT] == [
+            "c", "a"]
+        latest = [command for command in commands if command.kind is ShellCommandKind.SELECT_RESULTS][-1]
+        assert set(latest.artifacts) == {"a", "c"} == set(browser.selected_results())
+        commands.clear()
+        browser.set_current_result("b", keep_selection=True)  # an overlay stepping: the selection stays
+        assert browser.current_result() == "b" and set(browser.selected_results()) == {"a", "c"}
+        assert [command.value for command in commands] == ["b"]
+        browser.set_current_result("b", keep_selection=False)  # Single: the current result alone
+        assert browser.selected_results() == ("b",) and browser.current_result_label() == "B"
+        assert browser.current_result_row() == 1
+        commands.clear()
+        browser.clear_result_selection()
+        assert browser.current_result() is None and browser.selected_results() == ()
+        assert ShellCommandKind.SELECT_RESULTS in {command.kind for command in commands}
+        assert [command.value for command in commands if command.kind is ShellCommandKind.SELECT_RESULT] == [
+            None]
+    finally:
+        _close(qapp, browser)
+
+
+def test_a_results_list_cleared_from_outside_is_filled_again(qapp):
+    browser = BrowserView(profile=_RESULTS)
+    try:
+        entries = (BrowserResult("one", "one.nexus"),)
+        browser.reconcile_results(entries, "one")
+        browser.scans.clear()
+        browser.reconcile_results(entries, "one")
+        assert browser.scans.count() == 1 and browser.current_result() == "one"
+    finally:
+        _close(qapp, browser)
+
+
+def test_the_result_frames_pane_lists_a_results_entries_muted_and_rebuilt_on_every_call(qapp):
+    """Stitch's contributing frames: their texts, tooltips and excluded marks, the pane rebuilt each time the
+    page shows a result (one ``clear``), its current entry set silently and a user's choice reported."""
+    browser = BrowserView(profile=_STITCH_LIKE)
+    commands = []
+    browser.commandRequested.connect(commands.append)
+    try:
+        assert browser.frames.isHidden() and not browser.result_frames.isHidden()
+        assert browser.frames_label.text() == "Frames"
+        clears = []
+        clear = browser.result_frames.clear
+        browser.result_frames.clear = lambda: (clears.append(1), clear())[1]
+        entries = (BrowserResult("f0", "2-0", "scan 2 · frame 0"),
+                   BrowserResult("f1", "2-1 · excluded", "scan 2 · frame 1", muted=True))
+        browser.reconcile_result_frames(entries, "f0")
+        assert commands == [] and clears == [1] and browser.current_result_frame() == "f0"
+        assert browser.result_frame_count() == 2 and browser.current_result_frame_label() == "2-0"
+        items = [browser.result_frames.item(index) for index in range(2)]
+        assert [item.text() for item in items] == ["2-0", "2-1 · excluded"]
+        assert items[1].toolTip() == "scan 2 · frame 1"
+        assert items[1].foreground().color() != items[0].foreground().color()
+        browser.reconcile_result_frames(entries, "f0")
+        assert clears == [1, 1]
+        browser.result_frames.setCurrentRow(1)
+        assert [(command.kind, command.value) for command in commands] == [
+            (ShellCommandKind.SELECT_RESULT_FRAME, "f1")]
+        commands.clear()
+        browser.raw_image.click()
+        browser.set_action_enabled("Raw image", False)
+        assert not browser.raw_image.isEnabled()
+        assert [command.kind for command in commands] == [ShellCommandKind.SHOW_RAW_IMAGE]
+    finally:
+        _close(qapp, browser)
+
+
+def test_a_profile_refuses_an_unknown_selection_and_frames_without_results(qapp):
+    with pytest.raises(ValueError):
+        BrowserView(profile=BrowserProfile(results=True, result_selection="multiple"))
+    with pytest.raises(ValueError):
+        BrowserView(profile=BrowserProfile(result_frames=True))

@@ -69,6 +69,11 @@ class ShellCommandKind(str, Enum):
     #: a results-profile Data Browser (another page's results list): one result chosen, or Open… pressed
     SELECT_RESULT = "select_result"
     OPEN_RESULT = "open_result"
+    #: an extended results list's selection changed (its value: the selected identities); a result's own
+    #: entry chosen in the second pane (Stitch's contributing frame); its Raw image action pressed
+    SELECT_RESULTS = "select_results"
+    SELECT_RESULT_FRAME = "select_result_frame"
+    SHOW_RAW_IMAGE = "show_raw_image"
 
 
 class FrameSelectionIntent(str, Enum):
