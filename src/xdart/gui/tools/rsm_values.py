@@ -26,9 +26,12 @@ from xrd_tools.analysis.module_transaction import (
     ModuleSourceReceipt,
 )
 from xrd_tools.analysis.rsm_geometry_asset import (
+    RSMCalibrationGeometryInput,
     RSMGeometryAssetInput,
     RSMGeometryAssetRefused,
+    capture_rsm_calibration_geometry,
     capture_rsm_geometry_asset,
+    lower_rsm_effective_geometry,
 )
 from xrd_tools.analysis.rsm_operation import (
     RSMDetectorGeometry,
@@ -528,7 +531,7 @@ class RSMToolFormV2:
     """Complete ordered RSM v2 Preview intent; R1 form stays unchanged."""
 
     project_root: str | Path
-    geometry_asset: RSMGeometryAssetInput
+    geometry_asset: RSMGeometryAssetInput | RSMCalibrationGeometryInput
     members: tuple[RSMScanMemberForm | RSMNexusMemberForm, ...]
     conditioning: RSMImageConditioning
     normalization: RSMNormalizationPolicy
@@ -566,7 +569,7 @@ class RSMToolFormV2:
                     Path(output).parent, self.output_family, operation_token="rsm"))) != output:
                 raise ValueError("RSM v2 output family does not name its output's stable slot")
         if (
-            type(self.geometry_asset) is not RSMGeometryAssetInput
+            type(self.geometry_asset) not in {RSMGeometryAssetInput, RSMCalibrationGeometryInput}
             or type(self.members) is not tuple
             or not 1 <= len(self.members) <= _MAX_RSM_MEMBERS
             or any(type(item) not in {RSMScanMemberForm, RSMNexusMemberForm} for item in self.members)
@@ -616,7 +619,9 @@ class RSMToolFormV2:
         canonical = (
             "rsm-tool-form-v2",
             project,
-            self.geometry_asset.locator,
+            # a calibration (AUD-9 stage 2b C7b) is tagged; the asset's locator stays as it was
+            (self.geometry_asset.locator if type(self.geometry_asset) is RSMGeometryAssetInput
+             else ("calibration", self.geometry_asset.locator)),
             tuple(item.fingerprint for item in self.members),
             self.conditioning._canonical_value(),
             self.normalization._canonical_value(),
@@ -1762,14 +1767,19 @@ def prepare_rsm_tool_v2(
     # The output's folder need not exist: the operation qualifies its existing ancestry and its run
     # makes the folder, as Stitch's does (AUD-9 stage 2); Preview creates nothing.
     try:
-        asset = capture_rsm_geometry_asset(
-            form.geometry_asset,
-            project_root=project,
-        )
+        if type(form.geometry_asset) is RSMCalibrationGeometryInput:
+            asset = capture_rsm_calibration_geometry(form.geometry_asset.locator, project_root=project)
+            header = lower_rsm_effective_geometry(asset).detector_header  # the raw frame's shape
+            expected_shape = (header.Nch1, header.Nch2)
+        else:
+            asset = capture_rsm_geometry_asset(
+                form.geometry_asset,
+                project_root=project,
+            )
+            detector = asset.projection.value["detector"]["header"]
+            expected_shape = (detector["Nch1"], detector["Nch2"])
     except RSMGeometryAssetRefused as error:
         raise RSMToolPreflightRefused(error.code, str(error)) from error
-    detector = asset.projection.value["detector"]["header"]
-    expected_shape = (detector["Nch1"], detector["Nch2"])
     if any(member.detector_shape != expected_shape for member in form.members):
         raise RSMToolPreflightRefused(
             "RSM_MEMBER_IDENTITY_MISMATCH",

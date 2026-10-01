@@ -47,6 +47,7 @@ from xrd_tools.analysis.module_transaction import (
     _rsm_v2_module_request,
 )
 from xrd_tools.analysis.rsm_geometry_asset import (
+    RSMCalibrationGeometryReceipt,
     RSMEffectiveGeometry,
     RSMGeometryAssetRefused,
     RSMGeometryAssetReceipt,
@@ -54,8 +55,13 @@ from xrd_tools.analysis.rsm_geometry_asset import (
     bind_rsm_member_geometry,
     lower_rsm_effective_geometry,
     revalidate_rsm_geometry_asset,
+    revalidate_rsm_geometry_source,
     rsm_effective_pixel_q_map,
 )
+
+#: RSM v2's geometry sources: the canonical asset, or a calibration window's xrayutilities partner
+#: (AUD-9 stage 2b C7b). Both name the same custody facts (project root, paths, digests, receipt fingerprint).
+_RSM_GEOMETRY_RECEIPTS = (RSMGeometryAssetReceipt, RSMCalibrationGeometryReceipt)
 from xrd_tools.analysis.plans import RSMPlan, run_rsm
 from xrd_tools.analysis.scan_operations import (
     AnalysisDisposition,
@@ -2758,7 +2764,7 @@ class RSMGroupPreflightReceiptV2:
     """Ordered group preflight with exact contribution and grid identity."""
 
     project_root: str
-    geometry_asset_receipt: RSMGeometryAssetReceipt
+    geometry_asset_receipt: RSMGeometryAssetReceipt | RSMCalibrationGeometryReceipt
     effective_geometry: RSMEffectiveGeometry
     ordered_geometry_bindings: tuple[RSMMemberGeometryBinding, ...]
     ordered_members: tuple[RSMPreflightMemberV2, ...]
@@ -2773,7 +2779,7 @@ class RSMGroupPreflightReceiptV2:
             _claim is not _RSM_V2_FACTORY
             or type(self.project_root) is not str
             or not Path(self.project_root).is_absolute()
-            or type(self.geometry_asset_receipt) is not RSMGeometryAssetReceipt
+            or type(self.geometry_asset_receipt) not in _RSM_GEOMETRY_RECEIPTS
             or self.geometry_asset_receipt.project_root != self.project_root
             or type(self.effective_geometry) is not RSMEffectiveGeometry
             or self.effective_geometry.asset_receipt_fingerprint
@@ -2871,7 +2877,7 @@ class RSMGroupPreflightReceiptV2:
 def _make_rsm_group_preflight_v2(
     *,
     project_root: Path,
-    asset: RSMGeometryAssetReceipt,
+    asset: RSMGeometryAssetReceipt | RSMCalibrationGeometryReceipt,
     effective: RSMEffectiveGeometry,
     bindings: tuple[RSMMemberGeometryBinding, ...],
     members: tuple[RSMPreflightMemberV2, ...],
@@ -3009,6 +3015,7 @@ def _effective_geometry_provenance(
         "runtime_requirements": list(
             xu_runtime_requirements_projection(effective.runtime_requirements)
         ),
+        **({} if effective.source == "asset" else {"source": effective.source}),
         "fingerprint": effective.fingerprint,
     }
 
@@ -3017,7 +3024,7 @@ def _rsm_v2_provenance(
     group: ModuleSourceGroupReceipt,
     output: ModuleOutputRequest,
     output_authority: RSMOutputAuthorityReceipt,
-    asset: RSMGeometryAssetReceipt,
+    asset: RSMGeometryAssetReceipt | RSMCalibrationGeometryReceipt,
     effective: RSMEffectiveGeometry,
     plan: RSMOperationPlanV2,
     preflight: RSMGroupPreflightReceiptV2,
@@ -4268,7 +4275,7 @@ def _resolve_exact_rsm_q_bounds_active(
 def prepare_rsm_operation_v2(
     source_group: ModuleSourceGroupReceipt,
     output: ModuleOutputRequest,
-    geometry_asset_receipt: RSMGeometryAssetReceipt,
+    geometry_asset_receipt: RSMGeometryAssetReceipt | RSMCalibrationGeometryReceipt,
     member_form_fingerprints: tuple[str, ...],
     member_motor_selectors: tuple[
         tuple[tuple[str, MetadataColumnSelector], ...], ...
@@ -4295,7 +4302,7 @@ def prepare_rsm_operation_v2(
         or source_group.kind is not ModuleKind.RSM
         or type(output) is not ModuleOutputRequest
         or output.kind is not AnalysisArtifactKind.RSM
-        or type(geometry_asset_receipt) is not RSMGeometryAssetReceipt
+        or type(geometry_asset_receipt) not in _RSM_GEOMETRY_RECEIPTS
         or type(member_form_fingerprints) is not tuple
         or type(member_motor_selectors) is not tuple
         or len(member_form_fingerprints) != len(source_group.members)
@@ -4511,7 +4518,7 @@ def prepare_rsm_operation_v2(
             plan=plan,
         )
 
-    revalidate_rsm_geometry_asset(geometry_asset_receipt)
+    revalidate_rsm_geometry_source(geometry_asset_receipt)
     for source in source_group.members:
         _fresh_table(source, cancel_token=cancel_token)
     _requalify_project_output(output, root, output_authority, folders_made=False)
@@ -5708,7 +5715,7 @@ def _revalidate_rsm_v2_geometry(request: RSMOperationRequestV2) -> None:
     if type(request) is not RSMOperationRequestV2:
         raise TypeError("RSM v2 revalidation requires an exact request")
     try:
-        revalidate_rsm_geometry_asset(request.preflight.geometry_asset_receipt)
+        revalidate_rsm_geometry_source(request.preflight.geometry_asset_receipt)
         current_effective = lower_rsm_effective_geometry(
             request.preflight.geometry_asset_receipt
         )
