@@ -56,6 +56,7 @@ from xrd_tools.analysis.rsm_geometry_asset import (
     lower_rsm_effective_geometry,
     revalidate_rsm_geometry_asset,
     revalidate_rsm_geometry_source,
+    rsm_calibration_detector_mask,
     rsm_effective_pixel_q_map,
 )
 
@@ -373,13 +374,16 @@ class RSMFrameCorrections:
 class RSMBoundCorrections:
     """``RSMFrameCorrections`` bound at Preview: the mask, dark and flat receipts (Stitch's own captures), and
     ``saturation``, each member's automatic ceiling from the calibrated detector (decision 39, Stitch's
-    ``member_saturation``): None for the data type's rule, and None when every member takes it."""
+    ``member_saturation``): None for the data type's rule, and None when every member takes it. ``detector_mask``:
+    the calibrated detector's own mask in the raw frame, which the dark and flat captures leave out of their
+    counts at Preview and again at the run (so the run's capture is Preview's); not identity, the geometry's."""
 
     corrections: RSMFrameCorrections
     mask_receipt: object
     dark_receipt: object
     flat_receipt: object
     saturation: tuple[int | None, ...] | None = None
+    detector_mask: np.ndarray | None = field(default=None, compare=False, repr=False)
 
     def identity(self) -> tuple[object, ...]:
         value = self.corrections
@@ -3757,10 +3761,11 @@ def _rsm_member_saturation(threshold, members, detector):
     return member_saturation(ceilings)
 
 
-def _bind_rsm_corrections(corrections, members, max_frame_bytes, *, detector=None):
+def _bind_rsm_corrections(corrections, members, max_frame_bytes, *, detector=None, detector_mask=None):
     """Bind a plan's corrections at Preview: Stitch's mask capture and Int-admitted dark and flat
     (``capture_detector_image``), each the members' full detector shape, and an Auto threshold's ceilings
-    from ``detector``, the calibrated detector's name (``_rsm_member_saturation``). None: None."""
+    from ``detector``, the calibrated detector's name (``_rsm_member_saturation``). ``detector_mask``, its own
+    mask in the raw frame, is left out of the dark's and flat's usability counts, as Int passes it. None: None."""
     if type(corrections) not in {RSMFrameCorrections, type(None)}:
         raise TypeError("RSM corrections must be exact RSMFrameCorrections")
     if corrections is None or corrections == RSMFrameCorrections():  # every field at its default: none
@@ -3770,6 +3775,9 @@ def _bind_rsm_corrections(corrections, members, max_frame_bytes, *, detector=Non
     if len(shapes) != 1:
         raise RSMOperationRefused("RSM_CORRECTION_IMAGE_INVALID", "the members' detectors differ")
     shape, = shapes
+    if detector_mask is not None and tuple(detector_mask.shape) != shape:
+        raise RSMOperationRefused("RSM_CORRECTION_IMAGE_INVALID",
+                                  f"the calibration's detector is {detector_mask.shape}, the members' {shape}")
     mask = dark = flat = None
     try:
         if corrections.mask_path is not None:
@@ -3785,7 +3793,8 @@ def _bind_rsm_corrections(corrections, members, max_frame_bytes, *, detector=Non
         if path is None:
             continue
         try:
-            receipt, pixels = capture_detector_image(path, role, max_frame_bytes, corrections.flat_min_fraction)
+            receipt, pixels = capture_detector_image(path, role, max_frame_bytes, corrections.flat_min_fraction,
+                                                     detector_mask=detector_mask)
         except ValueError as error:
             raise RSMOperationRefused("RSM_CORRECTION_IMAGE_INVALID", str(error)) from None
         if tuple(pixels.shape) != shape:
@@ -3796,7 +3805,8 @@ def _bind_rsm_corrections(corrections, members, max_frame_bytes, *, detector=Non
         else:
             flat = receipt
     return RSMBoundCorrections(corrections, mask, dark, flat,
-                               _rsm_member_saturation(corrections.threshold, members, detector))
+                               _rsm_member_saturation(corrections.threshold, members, detector),
+                               None if dark is None and flat is None else detector_mask)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3833,7 +3843,8 @@ def _rsm_correction_state(plan, header, diffractometer) -> _RSMCorrectionState |
             images[role] = None
             continue
         current, pixels = capture_detector_image(receipt.lexical_path, role, plan.max_frame_bytes,
-                                                 bound.corrections.flat_min_fraction)
+                                                 bound.corrections.flat_min_fraction,
+                                                 detector_mask=bound.detector_mask)
         if current != receipt:
             raise RSMOperationRefused("RSM_CORRECTION_IMAGE_INVALID", f"the {role} no longer matches Preview")
         values, unusable = correction_image(pixels, role, min_fraction=bound.corrections.flat_min_fraction)
@@ -4556,8 +4567,13 @@ def prepare_rsm_operation_v2(
             chunk_size=chunk_size,
             max_frame_bytes=max_frame_bytes,
             max_chunk_bytes=max_chunk_bytes,
-            corrections=_bind_rsm_corrections(corrections, member_tuple, max_frame_bytes,
-                                              detector=_rsm_calibration_detector(geometry_asset_receipt)),
+            corrections=_bind_rsm_corrections(
+                corrections, member_tuple, max_frame_bytes,
+                detector=_rsm_calibration_detector(geometry_asset_receipt),
+                # built only for a dark or flat to check
+                detector_mask=(rsm_calibration_detector_mask(geometry_asset_receipt)
+                               if getattr(corrections, "dark_path", None) or getattr(corrections, "flat_path", None)
+                               else None)),
             ub_override=bound_ub,
         )
         preflight = _make_rsm_group_preflight_v2(

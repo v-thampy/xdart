@@ -430,3 +430,93 @@ def test_the_run_applies_each_members_ceiling_from_the_calibration(rsm_r2_projec
             Path(calibrated.output_path).unlink()
     assert result.terminal.disposition is ModuleDisposition.COMMITTED
     assert applied and set(applied) == {PILATUS_COUNTER_LIMIT}
+
+
+# Unit 4, the R4 residual: the dark and flat usability check leaves out the detector's own mask (module gaps), as
+# Int's preflight passes ``detector_mask``, in the capture Stitch and RSM share; RSM passes its calibration's.
+def test_a_gap_masked_flat_raises_no_false_masked_fraction_warning(tmp_path):
+    from xrd_tools.analysis.stitch_native import capture_detector_image
+    from xrd_tools.corrections.detector import check_detector_image
+
+    gaps = np.zeros((20, 10), dtype=bool)
+    gaps[8:10] = True  # two module-gap rows: 10 % of the detector
+    for role, image in (("flat", np.where(gaps, 0.0, 1.0)), ("dark", np.where(gaps, np.nan, 3.0))):
+        path = tmp_path / f"{role}.npy"
+        np.save(path, image)
+        blind, _pixels = capture_detector_image(path, role, 1 << 20)
+        aware, _pixels = capture_detector_image(path, role, 1 << 20, detector_mask=gaps)
+        assert any("masks 10.0 %" in warning for warning in blind.warnings)  # the gaps counted as masked
+        assert aware.warnings == () == check_detector_image(image, role, detector_mask=gaps).warnings
+        assert aware.fingerprint == blind.fingerprint  # the identity is the file's, not its counts'
+        if role == "flat":
+            assert (blind.flat_masked_pixels, aware.flat_masked_pixels) == (20, 0)
+            assert aware.flat_median == blind.flat_median == 1.0
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_the_calibrations_detector_mask_maps_back_to_the_raw_frame(tmp_path, rotation):
+    from pyFAI.detectors import Pilatus300k
+
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_detector_mask
+
+    with xu_runtime_session() as session:
+        wavelength = float(session.xu.en2lam(ENERGY))
+    domain = {"del": [-50., 50.], "nu": [-35., 35.]}
+    detector = Pilatus300k()
+    value = authored_surface_calibration(
+        detector=detector, cch1=300., cch2=240., distance_m=.39, del_offset_deg=0., nu_offset_deg=0.,
+        energy_eV=ENERGY, xu_wavelength_A=wavelength, source_motors={"del": "del", "nu": "nu"},
+        rotation=rotation, control_domain=domain, domain=domain, rms_q=.001, condition=10., n_frames=5,
+        n_points=40)
+    (tmp_path / "p300k.xu.json").write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
+    (tmp_path / "p300k.json").write_text("{}")
+    raw = rsm_calibration_detector_mask(capture_rsm_calibration_geometry("p300k.json", project_root=tmp_path))
+    turned = np.asarray(detector.calc_mask(), dtype=bool)
+    assert raw.shape == (turned.shape[::-1] if rotation in (90, 270) else turned.shape)
+    assert not raw.flags.writeable and 0 < int(raw.sum()) == int(turned.sum())
+    np.testing.assert_array_equal(ImageOrientation(rotation=rotation).apply(raw), turned)
+    generic = _write_partner(tmp_path, rotation=rotation, cch=(4., 6.))  # pyFAI's generic detector: no mask
+    assert rsm_calibration_detector_mask(capture_rsm_calibration_geometry(generic.name, project_root=tmp_path)) is None
+
+
+@pytest.mark.slow
+def test_rsm_checks_its_flat_against_the_calibrations_mask_and_the_run_recaptures_it_alike(
+        rsm_r2_project, tmp_path, monkeypatch):
+    """Row B's calibration (scan 43), its detector given a 12-row gap and a flat that is 0 there: Preview's
+    capture leaves the gap out, and the run's re-capture, with the bound mask, is Preview's (no false refusal)."""
+    from dataclasses import replace
+
+    from xrd_tools.analysis import rsm_operation
+    from xrd_tools.analysis.module_transaction import ModuleDisposition
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
+    from xrd_tools.analysis.rsm_operation import RSMFrameCorrections, run_rsm_operation_v2
+    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+
+    gaps = np.zeros((195, 487), dtype=bool)
+    gaps[60:72] = True  # 6.2 % of the detector
+    gaps.setflags(write=False)
+    flat = tmp_path / "gap-flat.npy"
+    np.save(flat, np.where(gaps, 0.0, 1.0))
+    form = replace(_form(rsm_r2_project, (43,), 40),
+                   geometry_asset=rsm_calibration_geometry_input(_canonical_partner(rsm_r2_project)),
+                   corrections=RSMFrameCorrections(flat_path=str(flat)),
+                   output_path=rsm_r2_project / "rsm-s3b-gap-flat.nexus")
+    blind = prepare_rsm_tool_v2(form).request.plan.corrections  # row B's generic detector has no mask
+    assert blind.detector_mask is None and any("masks 6.2 %" in item for item in blind.flat_receipt.warnings)
+    built = []
+
+    def mask(receipt):
+        built.append(type(receipt).__name__)
+        return gaps
+
+    monkeypatch.setattr(rsm_operation, "rsm_calibration_detector_mask", mask)
+    request = prepare_rsm_tool_v2(form).request
+    bound = request.plan.corrections
+    assert built == ["RSMCalibrationGeometryReceipt"] and bound.detector_mask is gaps
+    assert bound.flat_receipt.warnings == () and bound.flat_receipt.flat_masked_pixels == 0
+    try:
+        result = run_rsm_operation_v2(request)
+    finally:
+        if Path(form.output_path).exists():
+            Path(form.output_path).unlink()
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED

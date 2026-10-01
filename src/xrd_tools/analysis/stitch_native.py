@@ -104,6 +104,9 @@ class StitchImageReceipt:
     flat_median: float | None = None
     #: flats only: the cutoff those masked pixels were counted with
     flat_min_fraction: float | None = None
+    #: Int's check's warnings (``check_detector_image``): its counts leave out the detector's own mask when the
+    #: capture is given it, and count its gaps otherwise
+    warnings: tuple[str, ...] = ()
 
     @property
     def fingerprint(self):
@@ -126,10 +129,12 @@ class StitchImageReceipt:
                     "median": self.flat_median})}
 
 
-def capture_detector_image(path, role, max_bytes, min_fraction=DEFAULT_MIN_FLAT_FRACTION):
+def capture_detector_image(path, role, max_bytes, min_fraction=DEFAULT_MIN_FLAT_FRACTION, *, detector_mask=None):
     """Decode a single-image dark or flat file and bind its exact revision.
 
-    Returns the receipt and the decoded float64 pixels in file orientation.
+    Returns the receipt and the decoded float64 pixels in file orientation. ``detector_mask``, the detector's
+    own mask (module gaps) in file orientation, is left out of the usability check's counts, as Int's
+    preflight passes it; absent, every pixel counts.
     """
     from xrd_tools.io.image import read_detector_image_layout, read_image
     code = role.upper()
@@ -171,17 +176,21 @@ def capture_detector_image(path, role, max_bytes, min_fraction=DEFAULT_MIN_FLAT_
         prepared = prepare_flatfield(pixels, min_fraction) if role == "flat" else prepare_dark(pixels)
     except ValueError as error:
         _refuse(f"{code}_UNUSABLE", f"the {name} is unusable: {error}")
-    check = check_detector_image(pixels, role, min_fraction=min_fraction, prepared=prepared)
+    check = check_detector_image(pixels, role, detector_mask=detector_mask, min_fraction=min_fraction,
+                                 prepared=prepared)
     if check.errors:
         _refuse(f"{code}_UNUSABLE", check.errors[0])
     masked = median = None
     if role == "flat":
-        masked, median = int(np.isnan(prepared).sum()), check.median
+        unusable = np.isnan(prepared)
+        if detector_mask is not None and np.shape(detector_mask) == unusable.shape:  # as the check counts
+            unusable &= ~np.asarray(detector_mask, dtype=bool)
+        masked, median = int(unusable.sum()), check.median
     del prepared
     receipt = StitchImageReceipt(role, str(lexical), str(resolved), after, digest,
                                  tuple(pixels.shape), hashlib.sha256(pixels.tobytes()).hexdigest(),
                                  masked, median,
-                                 float(min_fraction) if role == "flat" else None)
+                                 float(min_fraction) if role == "flat" else None, check.warnings)
     return receipt, pixels
 
 

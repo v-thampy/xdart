@@ -1320,6 +1320,46 @@ def _raw_tiltazimuth(turned_camera, raw_camera, azimuth_deg: float, beam) -> flo
     return raw % 360.0
 
 
+def rsm_calibration_detector_mask(receipt) -> np.ndarray | None:
+    """The calibrated detector's own mask (module gaps) in the raw frame RSM reads, read-only: pyFAI's detector
+    rebuilt from the partner as Stitch's xrayutilities backend rebuilds it (its count and digest checked), then
+    mapped back by the inverse turn. None for the canonical asset, which names no detector, or a detector
+    without one."""
+    if type(receipt) is not RSMCalibrationGeometryReceipt:
+        return None
+    import numpy as np
+    from pyFAI.detectors import detector_factory
+
+    from xrd_tools.core.geometry.diffractometer import ImageOrientation
+    from xrd_tools.integrate.xu_stitch import _sha256_array
+
+    value = receipt.calibration.projection.value
+    detector, acquisition = value["detector"], value["acquisition"]
+    config = dict(detector["detector_config"])
+    if "max_shape" in config:
+        config["max_shape"] = tuple(config["max_shape"])
+    try:
+        turned = detector_factory(detector["detector_factory_name"], config).calc_mask()
+    except Exception as error:  # noqa: BLE001 - pyFAI's own failure, by name
+        _refuse("RSM_CALIBRATION_UNSUPPORTED", f"the calibration's detector cannot be rebuilt: {error}")
+    shape = tuple(int(item) for item in detector["shape"])
+    turned = np.zeros(shape, dtype=bool) if turned is None else np.ascontiguousarray(turned, dtype=bool)
+    if (turned.shape != shape or int(turned.sum()) != detector["mask_count"]
+            or _sha256_array(turned, "|u1") != detector["mask_sha256"]):
+        _refuse("RSM_CALIBRATION_UNSUPPORTED", "the calibration's detector mask differs from its record")
+    if not turned.any():
+        return None
+    orientation = ImageOrientation(rotation=90 * int(acquisition["image_rotation_quarter_turns"]),
+                                   flip_horizontal=bool(acquisition.get("image_flip", False)))
+    raw_shape = shape[::-1] if orientation.swaps_axes else shape
+    index = np.asarray(orientation.apply(np.arange(turned.size).reshape(raw_shape)))  # each turned pixel's raw
+    raw = np.zeros(turned.size, dtype=bool)
+    raw[index.ravel()] = turned.ravel()
+    raw = raw.reshape(raw_shape)
+    raw.setflags(write=False)
+    return raw
+
+
 def _lower_calibration_geometry(receipt: RSMCalibrationGeometryReceipt) -> RSMEffectiveGeometry:
     """The calibration partner as RSM's raw-frame geometry. The partner describes the image Stitch turns into
     its camera (``STITCH_CAMERA``, by ``image_rotation_quarter_turns`` and ``image_flip``); RSM reads raw images,
