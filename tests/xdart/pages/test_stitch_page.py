@@ -1165,3 +1165,25 @@ def test_a_refused_advanced_whole_number_holds_run_and_says_why(qapp, tmp_path):
         page.shutdown()
         page.deleteLater()
         qapp.processEvents()
+
+
+def test_the_mask_windows_fields_are_ints_rows_and_a_refused_frame_launches_nothing(qapp, tmp_path):
+    """Codex's Stitch/Int reuse audit R3 (AUD-9 stage 2b G6): the mask window's image and frame are Int's
+    ``FormRow``s. The image is chosen with the row's 📁 and shown by name, and the frame is a whole number
+    from 0: a refused frame is named and nothing launches."""
+    import tifffile
+    from xdart.gui.tabs.stitch.mask import StitchMaskDialog
+    image = tmp_path / "frame_0001.tif"
+    tifffile.imwrite(image, np.zeros((4, 5), dtype=np.uint16))
+    dialog = StitchMaskDialog(tmp_path)
+    try:
+        assert dialog._image_row.objectName() == "controlsFormRow" and dialog.choose is dialog._image_row.browse_button
+        assert dialog.frame.objectName() == "controlsLineEdit" and dialog.frame.text() == "0"
+        dialog.set_source_path(image)
+        assert dialog._image_row.current_value() == str(image)
+        dialog.frame.setText("-1")
+        dialog.begin()
+        assert not dialog.active() and dialog.status.text().startswith("Frame: ")
+    finally:
+        dialog.shutdown()
+        dialog.deleteLater()

@@ -926,3 +926,34 @@ def test_the_direct_beam_pose_refuses_a_held_circle_that_moves_and_leaves_out_on
         else:
             with pytest.raises(ValueError, match=expected):
                 direct_beam_pose(source, 'del', ('nu',))
+
+
+def test_the_calibration_windows_fields_are_ints_rows(tmp_path):
+    """Codex's Stitch/Int reuse audit R3 (AUD-9 stage 2b G6): the calibration window's fields are Int's
+    ``FormRow``s, in Int's look. A file field shows its file's name, the full path on hover, and reads back
+    the full path; the energy and motor-scale options are Int's toggles; the RAW reader and the energy bound
+    are rows too."""
+    from pyqtgraph.Qt import QtWidgets
+    dialog = StitchCalibrationDialog(tmp_path)
+    try:
+        dialog.show()
+        QtWidgets.QApplication.processEvents()
+        mask = tmp_path / 'masks' / 'detector_mask.npy'
+        dialog._fields['mask'].clearFocus()
+        QtWidgets.QApplication.processEvents()
+        dialog._fields['mask'].setText(str(mask))
+        QtWidgets.QApplication.processEvents()
+        assert dialog._text('mask') == str(mask) and dialog.settings()['fields']['mask'] == str(mask)
+        assert dialog._fields['mask'].text() == 'detector_mask.npy'
+        assert dialog._fields['mask'].toolTip() == str(mask)
+        for key in ('source', 'scan', 'images', 'stem', 'shape', 'dtype', 'header', 'energy_bound', 'mask',
+                    'rms', 'beam_pixel'):
+            assert dialog._fields[key].objectName() == 'controlsLineEdit', key
+            assert dialog._formrows[key].objectName() == 'controlsFormRow', key
+        for key in ('beam_detector', 'beam_orientation'):
+            assert dialog._formrows[key].objectName() == 'controlsFormRow', key
+        assert dialog.scales.objectName() == dialog.refine_energy.objectName() == 'controlsToggleButton'
+        assert dialog._label('source').objectName() == 'controlsFieldLabel'
+    finally:
+        dialog.close()
+        dialog.deleteLater()

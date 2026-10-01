@@ -755,11 +755,12 @@ class FormRow(QtWidgets.QWidget):
             if widget.toolTip() != tip:
                 widget.setToolTip(tip)
 
-    def add_trailing_widget(self, widget: QtWidgets.QWidget) -> None:
+    def add_trailing_widget(self, widget: QtWidgets.QWidget, stretch: int = 0) -> None:
         """Append a widget to the right of the row (after the editor).  Used to
         park the compact 'Pts' cluster on the Axis row — the editor stretches, so
-        trailing widgets pin to the right."""
-        self.layout().addWidget(widget)
+        trailing widgets pin to the right; a ``stretch`` shares the width instead
+        (a second field on a file row, e.g. the calibration window's image stem)."""
+        self.layout().addWidget(widget, stretch)
 
     def current_value(self):
         if self._kind == "bool":

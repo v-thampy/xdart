@@ -14,7 +14,7 @@ import numpy as np
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.pages.operation_owner import SingleWorkerOwner, OperationCancelled, OperationTerminalStatus
-from xdart.gui.widgets.controls_panel import ControlsComboBox, browse_button
+from xdart.gui.widgets.controls_panel import FormRow
 from xdart.gui.widgets.file_dialogs import NEXUS_FILTER
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.integrate.calibration_seed import (
@@ -395,6 +395,10 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.saved_mask = ''
         self._owner = SingleWorkerOwner(_run_job)
         self._fields = {}
+        #: key -> its Int ``FormRow``: the field is the row's editor, its value read through the row
+        self._formrows = {}
+        #: a combo editor -> its FormRow (the form's row)
+        self._row_of = {}
         #: key -> (form, row widget); a field sharing another's row is in _parts instead
         self._rows = {}
         self._parts = {}
@@ -465,72 +469,76 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 widget.setToolTip(tip)
 
     def _combo(self, form, label, items, *, tip=''):
-        """A Controls combo (readable popup rows) of ``(text, data)`` items, as one form row."""
-        combo = ControlsComboBox()
+        """One Controls combo row (Int's ``FormRow``) of ``(text, data)`` items; returns its editor. The
+        items are added here with their data (a factory name, a code), which FormRow's text choices do
+        not carry: this window drives its rows directly, never through ``apply_field``. The row's label
+        sits in the form's label column, so every row aligns."""
+        row = FormRow(label=label, path=('Calibration', label), value=None, kind='combo')
+        combo = row.editor
         for text, value in items:
             combo.addItem(text, value)
-        form.addRow(label, combo)
-        self._tip(tip, combo, form.labelForField(combo))
+        form.addRow(row.label, row)
+        self._row_of[combo] = row
+        self._tip(tip, combo, row.label)
         return combo
 
     def _choice(self, form, key, label, items, default, *, tip=''):
         """A Controls combo read and saved like a text field (its data: a factory name, a code)."""
         combo = self._combo(form, label, items, tip=tip)
         self._fields[key] = combo
-        self._rows[key] = (form, combo)
+        self._formrows[key] = self._row_of[combo]
+        self._rows[key] = (form, self._row_of[combo])
         self._set_field_text(key, default)
         return combo
 
     def _edit(self, form, key, label, default='', *, chooser=None, tip='', placeholder=''):
-        """One text field, with the Controls 📁 button when ``chooser`` names a file filter,
-        'directory' or 'spec' (SPEC files only), or is a function returning one at the click."""
-        edit = QtWidgets.QLineEdit(str(default))
-        edit.setObjectName(key)
+        """One text row (Int's ``FormRow``), with its 📁 button when ``chooser`` names a file filter,
+        'directory' or 'spec' (SPEC files only), or is a function returning one at the click. A file row
+        shows its file's name, the full path on hover and while editing, as Int's Controls do; its value is
+        read through the row (``_text``). The row's label sits in the form's label column."""
+        row = FormRow(label=label, path=('Calibration', key), value=str(default), browse=chooser is not None)
+        edit = row.editor
         edit.setPlaceholderText(placeholder)
-        self._fields[key] = edit
-        row = edit
         if chooser is not None:
-            row = QtWidgets.QWidget()
-            layout = QtWidgets.QHBoxLayout(row)
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.addWidget(edit, 1)
-            button = browse_button(label)
-            button.clicked.connect(lambda: self._browse(edit, chooser))
-            layout.addWidget(button)
-        form.addRow(label, row)
+            row.browseRequested.connect(lambda _path: self._browse(key, chooser))
+        form.addRow(row.label, row)
+        self._fields[key] = edit
+        self._formrows[key] = row
         self._rows[key] = (form, row)
-        self._tip(tip, edit, form.labelForField(row))
+        self._tip(tip, edit, row.label)
         return edit
 
     def _attach(self, key, host, label, default='', *, tip='', placeholder='', width=None):
-        """A second field on a file row (the scan beside its SPEC file, the stem beside its folder)."""
-        caption = QtWidgets.QLabel(label)
-        edit = QtWidgets.QLineEdit(str(default))
-        edit.setObjectName(key)
+        """A second field on a file row (the scan beside its SPEC file, the stem beside its folder): a compact
+        ``FormRow``, its label a caption, after the host row's editor."""
+        row = FormRow(label=label, path=('Calibration', key), value=str(default))
+        row.label.setMinimumWidth(0)
+        edit = row.editor
         edit.setPlaceholderText(placeholder)
         if width:
             edit.setMaximumWidth(width)
-        layout = self._rows[host][1].layout()
-        layout.addWidget(caption)
-        layout.addWidget(edit, 0 if width else 1)
+        self._formrows[host].add_trailing_widget(row, 0 if width else 1)
         self._fields[key] = edit
-        self._parts[key] = (host, caption, edit)
-        self._tip(tip, caption, edit)
+        self._formrows[key] = row
+        self._parts[key] = (host, row)
+        self._tip(tip, row.label, edit)
         return edit
 
     def _show(self, key, shown):
-        """Show or hide a field: its form row, or itself when it shares another field's row."""
+        """Show or hide a field: its form row, or its compact row when it shares another field's row. The
+        editor itself follows too, so the field says whether it is shown."""
         if key in self._parts:
-            for widget in self._parts[key][1:]:
-                widget.setVisible(shown)
+            self._parts[key][1].setVisible(shown)
         else:
             form, row = self._rows[key]
             form.setRowVisible(row, shown)
+        if key in self._formrows:
+            self._fields[key].setVisible(shown)
 
     def _row_visible(self, key):
         if key in self._parts:
-            host, _caption, edit = self._parts[key]
-            return self._row_visible(host) and not edit.isHidden()
+            host, row = self._parts[key]
+            return self._row_visible(host) and not row.isHidden()
         form, row = self._rows[key]
         return form.isRowVisible(row)
 
@@ -548,18 +556,19 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._fields[prefix + 'stem'].setPlaceholderText(
             f"auto · {path.stem if path else '<SPEC name>'}_scan{first[1] if first else '<N>'}_")
 
-    def _browse(self, edit, chooser):
+    def _browse(self, key, chooser):
         from xdart.gui.widgets.file_dialogs import browse, browse_spec
         chooser = chooser() if callable(chooser) else chooser
         folder = chooser == 'directory'
+        current = self._text(key)
         if chooser == 'spec':
-            picks = browse_spec(self, 'Select SPEC file', current=edit.text(), fallback=str(self.project_root))
+            picks = browse_spec(self, 'Select SPEC file', current=current, fallback=str(self.project_root))
         else:
             picks = browse(self, 'Select images directory' if folder else 'Select file', folder=folder,
-                           file_filter='All files (*)' if folder else chooser, current=edit.text(),
+                           file_filter='All files (*)' if folder else chooser, current=current,
                            fallback=str(self.project_root))
         if picks and picks[0]:
-            edit.setText(picks[0])
+            self._set_field_text(key, picks[0])
 
     def _set_field_text(self, key, value):
         field, value = self._fields[key], str(value)
@@ -697,32 +706,34 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         energy_row = QtWidgets.QWidget()
         energy_layout = QtWidgets.QHBoxLayout(energy_row)
         energy_layout.setContentsMargins(0, 0, 0, 0)
-        self.refine_energy = QtWidgets.QCheckBox('Refine energy')
+        refine_row = FormRow(label='Refine energy', path=('Calibration', 'refine_energy'), value=True, kind='bool')
+        self.refine_energy = refine_row.editor
         energy_tip = ('Also fits the beam energy, within ± the bound of the frames\' recorded energy. The arm\'s '
                       'known angles give an absolute 2θ scale, so the calibrant rings can fix it; with frames on only '
                       'one side of zero it trades off against the zero offsets and the sample offset, and the fit '
                       'summary gives its uncertainty. The saved calibration keeps the recorded energy, which '
                       'Stitch checks the scans\' energies against.')
         self.refine_energy.setToolTip(energy_tip)
-        self.refine_energy.setChecked(True)
-        bound = QtWidgets.QLineEdit('100')
-        bound.setObjectName('energy_bound')
+        bound_row = FormRow(label='±', path=('Calibration', 'energy_bound'), value='100')
+        bound_row.label.setMinimumWidth(0)
+        bound = bound_row.editor
         bound.setMaximumWidth(64)
         bound.setToolTip('The refined energy stays within this many eV of the recorded one.')
         self._fields['energy_bound'] = bound
-        energy_layout.addWidget(self.refine_energy)
-        energy_layout.addWidget(QtWidgets.QLabel('±'))
-        energy_layout.addWidget(bound)
+        self._formrows['energy_bound'] = bound_row
+        energy_layout.addWidget(refine_row)
+        energy_layout.addWidget(bound_row)
         energy_layout.addWidget(QtWidgets.QLabel('eV'))
         energy_layout.addStretch(1)
         options.addRow(energy_row)
-        self.scales = QtWidgets.QCheckBox('Fit motor scales')
-        self.scales.setChecked(False)
+        scales_row = FormRow(label='Fit motor scales', path=('Calibration', 'fit_motor_scales'), value=False,
+                             kind='bool')
+        self.scales = scales_row.editor
         self.scales.setToolTip('Also fits each motor\'s scale (degrees of arm rotation per motor degree), '
                                'where the frames span enough angle to tell. Off: exactly one degree per '
                                'degree, which is right for almost every diffractometer. A calibration with '
                                'fitted scales has no xrayutilities file: xrayutilities takes angles in degrees.')
-        options.addRow(self.scales)
+        options.addRow(scales_row)
         self._edit(options, 'rms', 'Largest accepted RMS |q| (Å⁻¹)', '.03',
                    tip='A fit whose RMS ring-position error, in |q|, exceeds this is refused.')
         self._edit(options, 'distance_seed', 'Starting distance (mm)', '',
@@ -987,14 +998,14 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                    'and columns (set from the model), pixel type and header size.')
         for key, label, default, stretch in [('shape', 'rows, cols', '195, 1475', 3), ('dtype', 'type', 'int32', 2),
                                              ('header', 'header', '0', 1)]:
-            caption = QtWidgets.QLabel(label)
-            edit = QtWidgets.QLineEdit(default)
-            edit.setObjectName(key)
+            part = FormRow(label=label, path=('Calibration', key), value=default)
+            part.label.setMinimumWidth(0)
+            edit = part.editor
             edit.setMinimumWidth(edit.fontMetrics().horizontalAdvance(default + '0'))
             self._fields[key] = edit
-            self._tip(raw_tip, caption, edit)
-            row.addWidget(caption)
-            row.addWidget(edit, stretch)
+            self._formrows[key] = part
+            self._tip(raw_tip, part.label, edit)
+            row.addWidget(part, stretch)
         form.addRow('RAW images', reader)
         self._rows['raw'] = (form, reader)
         self._tip(raw_tip, form.labelForField(reader))
@@ -1119,8 +1130,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         form = self._beam_form
         for key, shown in visible.items():
             self._show(key, shown)
-        form.setRowVisible(self.beam_source_kind, scan)
-        form.setRowVisible(self.motion, scan)
+        form.setRowVisible(self._row_of[self.beam_source_kind], scan)
+        form.setRowVisible(self._row_of[self.motion], scan)
         for widget in (self._fit_options, self.beam_button, self.beam_summary, self.show_fit_button,
                        self.apply_distance_button):
             widget.setVisible(scan)
@@ -1455,7 +1466,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         if isinstance(field, QtWidgets.QComboBox):
             data = field.currentData()
             return str(field.currentText() if data is None else data).strip()
-        return field.text().strip()
+        row = self._formrows.get(key)  # a file row shows its file's name: its value is the row's
+        return str(field.text() if row is None else row.current_value()).strip()
 
     def _reader(self):
         return {'detector_shape': tuple(int(v) for v in self._text('shape').split(',')),

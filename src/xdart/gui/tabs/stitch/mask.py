@@ -5,6 +5,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.pages.operation_owner import SingleWorkerOwner, OperationTerminalStatus
 from xdart.gui.pages.values import PageCleanup
+from xdart.gui.widgets.controls_panel import FormRow
 
 
 class StitchMaskDialog(QtWidgets.QDialog):
@@ -22,20 +23,19 @@ class StitchMaskDialog(QtWidgets.QDialog):
         self._worker = SingleWorkerOwner(self._run)
         self._identity = None
         layout = QtWidgets.QVBoxLayout(self)
-        row = QtWidgets.QHBoxLayout()
-        self.source_label = QtWidgets.QLineEdit("" if source is None else str(source.uri))
+        # Int's rows (Codex Stitch/Int reuse audit R3): the image, chosen with its 📁 and shown by name, and
+        # the frame, a whole number from 0
+        self._image_row = FormRow(label="Image", path=("Mask", "image"),
+                                  value="" if source is None else str(source.uri), browse=True)
+        self.source_label = self._image_row.editor
         self.source_label.setReadOnly(True)
-        row.addWidget(self.source_label, 1)
-        self.choose = choose = QtWidgets.QPushButton("Choose image…")
-        choose.clicked.connect(self._choose)
-        row.addWidget(choose)
-        layout.addLayout(row)
-        frame_row = QtWidgets.QHBoxLayout()
-        frame_row.addWidget(QtWidgets.QLabel("Frame"))
-        self.frame = QtWidgets.QSpinBox()
-        self.frame.setRange(0, 2**31 - 1)
-        frame_row.addWidget(self.frame)
-        layout.addLayout(frame_row)
+        self.source_label.setToolTip("The original detector image or raw NeXus file the mask is drawn on.")
+        self.choose = self._image_row.browse_button
+        self._image_row.browseRequested.connect(lambda _path: self._choose())
+        layout.addWidget(self._image_row)
+        self._frame_row = FormRow(label="Frame", path=("Mask", "frame"), value="0", kind="int", minimum=0)
+        self.frame = self._frame_row.editor
+        layout.addWidget(self._frame_row)
         self.status = QtWidgets.QLabel("The selected original frame opens in detector coordinates. The mask follows the processing orientation when used.")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
@@ -102,8 +102,13 @@ class StitchMaskDialog(QtWidgets.QDialog):
         if self._source is None or not self._project_root:
             self.status.setText("Choose a Project folder and an original detector image first.")
             return
+        refusal = self._frame_row.refusal()
+        if refusal:
+            self.status.setText(f"Frame: {refusal}")
+            return
         folder = str(Path(self._project_root) / "xdart_calibration" / "masks")
-        self._identity = self._worker.begin((self._source, self.frame.value(), folder, self._rotation))
+        frame = int(str(self._frame_row.current_value()).strip() or 0)
+        self._identity = self._worker.begin((self._source, frame, folder, self._rotation))
         if self._identity is not None:
             self.launch.setEnabled(False)
             self.choose.setEnabled(False)
