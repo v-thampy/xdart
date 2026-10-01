@@ -64,7 +64,7 @@ _DEBT: dict[str, dict[str, int]] = {
         "LinearRegionItem": 1, "PlotWidget": 2, "QCheckBox": 2, "QComboBox": 2, "QLineEdit": 4, "QSpinBox": 2,
     },
     "analysis/phase_fit_dialog.py": {
-        "PlotWidget": 2, "QComboBox": 3, "QFileDialog.getOpenFileName": 1, "QFileDialog.getOpenFileNames": 1,
+        "QComboBox": 3, "QFileDialog.getOpenFileName": 1, "QFileDialog.getOpenFileNames": 1,
         "QLineEdit": 2, "QListWidget": 1, "QSpinBox": 1,
     },
     "analysis/plot_axes.py": {"PlotDataItem": 1},

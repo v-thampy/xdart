@@ -16,9 +16,12 @@ the dialog shows a friendly install hint instead.
 import logging
 import os
 
+from dataclasses import replace
+
 import numpy as np
-import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+
+from xdart.gui.tabs.scattering.fit_view import FitPanel, FitProjection, FitSeries, FitView
 
 from .param_trend import ParamTrendMixin
 
@@ -186,16 +189,13 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
 
-        # Data + fit (top) and residual (below).
-        self.plot = pg.PlotWidget()
-        self.plot.setMinimumHeight(220)
-        self.plot.addLegend(offset=(-10, 10))
-        self.resid_plot = pg.PlotWidget()
-        self.resid_plot.setMaximumHeight(110)
-        self.resid_plot.setXLink(self.plot)
-        self.resid_plot.addLine(y=0, pen=pg.mkPen((130, 130, 140), width=1))
-        lay.addWidget(self.plot, 3)
-        lay.addWidget(self.resid_plot, 1)
+        # Data + fit (top) and residual (below), on the shared fit display (Codex's Stitch/Int reuse
+        # audit R2); plot and resid_plot are the display's own widgets, which only its reconcile draws on.
+        self.fit_view = FitView(self, name="phaseFitView", summary=False, stretch=(3, 1),
+                                upper_min_height=220, lower_max_height=110, link_x=True)
+        self.plot, self.resid_plot = self.fit_view.plot, self.fit_view.residuals
+        self.fit_view.reconcile(FitProjection(lower=FitPanel(zero_line=True)))
+        lay.addWidget(self.fit_view, 4)
 
         # Row 3: parameters (fractions / lattice) vs frame (shared trend).
         self._build_param_trend_row(lay)
@@ -304,7 +304,7 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         if not data:
             self._x = self._y = None
             self.status.setText("No frame selected — pick a frame, then Reload.")
-            self.plot.clear()
+            self.fit_view.reconcile(replace(self.fit_view.projection, upper=FitPanel()))
             return
         x, y, x_label = data
         self._show_pattern(x, y, x_label)
@@ -321,15 +321,16 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self._x = np.asarray(x, dtype=float)
         self._y = np.asarray(y, dtype=float)
         self._x_label = x_label or "q"
-        self.plot.clear()
-        self.plot.setLabel("bottom", self._x_label)
-        self.plot.setLabel("left", "Intensity")
-        self.plot.plot(self._x, self._y, pen=pg.mkPen((210, 210, 220), width=1),
-                       name="data")
+        self.fit_view.reconcile(replace(self.fit_view.projection, upper=self._pattern_panel()))
+
+    def _pattern_panel(self, *series, markers=()):
+        """The upper panel: the pattern as a line ("data"), then ``series`` (fit, background,
+        components) and the peak ``markers``."""
+        return FitPanel((FitSeries(self._x, self._y, "data_line", "data"), *series),
+                        self._x_label, "Intensity", markers=markers)
 
     def _clear_fit(self):
-        self.resid_plot.clear()
-        self.resid_plot.addLine(y=0, pen=pg.mkPen((130, 130, 140), width=1))
+        self.fit_view.reconcile(replace(self.fit_view.projection, lower=FitPanel(zero_line=True)))
         self.table.setRowCount(0)
 
     def build_fit_request(self):
@@ -429,15 +430,14 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self.status.setText("Displayed trace captured. Add CIFs and click Fit.")
 
     def set_vnext_result(self, result):
-        self.plot.clear()
-        self.plot.plot(self._x, self._y, pen=pg.mkPen((210, 210, 220), width=1),
-                       name="data")
         fit_x = self._x[np.isfinite(self._x) & np.isfinite(self._y)]
         from xdart.gui.tabs.scattering.analysis_mount import (
-            render_fit_projection, render_table_rows)
-        render_fit_projection(self.plot, self.resid_plot, fit_x, result,
+            fit_result_series, render_table_rows)
+        upper, markers, lower = fit_result_series(fit_x, result,
             tuple((receipt.phase_name, values) for receipt, values in zip(
                 result.cif_receipts, result.phase_components, strict=True)))
+        self.fit_view.reconcile(FitProjection(self._pattern_panel(*upper, markers=markers),
+                                              FitPanel(lower, zero_line=True)))
         for index, receipt in enumerate(result.cif_receipts):
             item = self.cif_list.item(index)
             if item is not None:
@@ -469,19 +469,14 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
 
     def _draw_outcome(self, outcome, auto=False):
         overlay = outcome.overlay
-        self.plot.clear()
-        self.plot.setLabel("bottom", self._x_label)
-        self.plot.setLabel("left", "Intensity")
-        self.plot.plot(self._x, self._y, pen=pg.mkPen((210, 210, 220), width=1),
-                       name="data")
-        if overlay is not None and "fit" in overlay.traces:
-            self.plot.plot(overlay.x, overlay.traces["fit"],
-                           pen=pg.mkPen((189, 147, 249), width=2), name="fit")
-        self._clear_fit()
-        if overlay is not None and "residual" in overlay.traces:
-            self.resid_plot.plot(overlay.x, overlay.traces["residual"],
-                                 pen=pg.mkPen((230, 133, 151), width=1))
-            self.resid_plot.setLabel("left", "resid")
+        traces = {} if overlay is None else overlay.traces
+        fit = (FitSeries(overlay.x, traces["fit"], "fit", "fit"),) if "fit" in traces else ()
+        residual = ((FitSeries(overlay.x, traces["residual"], "residual"),)
+                    if "residual" in traces else ())
+        self.fit_view.reconcile(FitProjection(
+            self._pattern_panel(*fit),
+            FitPanel(residual, y_label="resid" if residual else "", zero_line=True)))
+        self.table.setRowCount(0)
 
         self._fill_phase_table(outcome)
 

@@ -241,23 +241,29 @@ def analysis_result_matches(payload: object, facts: object) -> bool:
         DisplayedPhaseFitResult if kind == "phase" else None)
     return bool(expected is not None and type(payload) is expected
                 and (payload.trace_fingerprint, payload.trace_receipt) == echo)
-def render_fit_projection(plot, residual_plot, x, result, components=()):
-    import pyqtgraph as pg; from pyqtgraph.Qt import QtCore
+def fit_result_series(x, result, components=()):
+    """A displayed fit result as the shared fit display's series (``tabs/scattering/fit_view``): its fit,
+    background and named ``components`` above, the peak markers, and its residual below."""
+    from xdart.gui.tabs.scattering.fit_view import FitSeries
+    upper = []
     if result.fit is not None:
-        plot.plot(x, result.fit, pen=pg.mkPen((189, 147, 249), width=2), name="fit")
+        upper.append(FitSeries(x, result.fit, "fit", "fit"))
     if result.background is not None:
-        plot.plot(x, result.background, pen=pg.mkPen((130, 200, 160), width=1.3,
-            style=QtCore.Qt.PenStyle.DashLine), name="background")
-    for name, values in components: plot.plot(x, values, pen=pg.mkPen(
-        width=1, style=QtCore.Qt.PenStyle.DashLine), name=name)
-    for position in (() if result.marker_positions is None else result.marker_positions):
-        plot.addItem(pg.InfiniteLine(float(position), angle=90,
-            pen=pg.mkPen((240, 200, 90), width=1)))
-    residual_plot.clear(); residual_plot.addLine(
-        y=0, pen=pg.mkPen((130, 130, 140), width=1))
-    if result.residual is not None:
-        residual_plot.plot(x, result.residual,
-                           pen=pg.mkPen((230, 133, 151), width=1))
+        upper.append(FitSeries(x, result.background, "background", "background"))
+    upper += [FitSeries(x, values, "component", name) for name, values in components]
+    markers = (() if result.marker_positions is None
+               else tuple(float(position) for position in result.marker_positions))
+    lower = () if result.residual is None else (FitSeries(x, result.residual, "residual"),)
+    return tuple(upper), markers, lower
+def render_fit_projection(plot, residual_plot, x, result, components=()):
+    """Draw ``fit_result_series`` on a dialog's own two plots, through the fit display's own primitives
+    (the peak-fit dialog's path until it mounts ``FitView``, as the phase-fit dialog does)."""
+    from xdart.gui.tabs.scattering.fit_view import draw_marker, draw_series, draw_zero_line
+    upper, markers, lower = fit_result_series(x, result, components)
+    for series in upper: draw_series(plot, series)
+    for position in markers: draw_marker(plot, position)
+    residual_plot.clear(); draw_zero_line(residual_plot)
+    for series in lower: draw_series(residual_plot, series)
 def render_table_rows(table, headers, rows):
     table.setColumnCount(len(headers)); table.setHorizontalHeaderLabels(headers)
     table.setRowCount(len(rows))
