@@ -3253,7 +3253,13 @@ class ReductionSession:
     only a blocking, no-argument ``result()``.  That is not structurally
     probeable, so an inline executor is unsupported for streaming (use chunked
     execution or an async adapter), not rejected up front.  An ``accept_cb``
-    has shape ``(frame, publisher) -> int`` and publishes that exact attempt."""
+    has shape ``(frame, publisher) -> int`` and publishes that exact attempt.
+
+    The plan's flat and dark are read as they are at each frame (only the mask is
+    snapshotted at construction).  Arrays the session derives from them once (the
+    dark clipped for the Poisson variance, AUD-7) follow them at every ``process()``
+    call and at a ``submit()`` with no frame in flight; changing a correction while
+    frames are in flight is unsupported."""
 
     plan: ReductionPlan
     source: Scan | FrameSource
@@ -3330,8 +3336,10 @@ class ReductionSession:
     _frame_masks: dict[tuple[int, tuple[int, int]], tuple[Any, np.ndarray | None]] = field(
         default_factory=dict, init=False, repr=False,
     )
-    # AUD-7: the plan's arrays derived once a session (the dark clipped for the
-    # Poisson variance), shared with the pool workers as _plan_masks is.
+    # AUD-7: the plan's arrays derived once (the dark clipped for the Poisson
+    # variance), shared with the pool workers as _plan_masks is; cleared at each
+    # process() and at a submit() with nothing in flight, the boundaries where a
+    # caller may change the plan's dark (Codex AUD-7 review F1).
     _plan_derived: dict[str, tuple[np.ndarray, np.ndarray]] = field(
         default_factory=dict, init=False, repr=False,
     )
@@ -3596,6 +3604,8 @@ class ReductionSession:
             )
         if self._finished:
             raise RuntimeError("ReductionSession.process called after finish().")
+        # the plan's dark may have changed since the last call: derive again (AUD-7 F1)
+        self._plan_derived.clear()
         if self._paused:
             raise RuntimeError(
                 "ReductionSession.process called while paused; call resume() first"
@@ -3710,6 +3720,10 @@ class ReductionSession:
             return False
         label = int(frame.index)
         ticket = _StreamPublication(frame)
+        if self._inflight.idle():
+            # nothing in flight, so no worker reads the derived arrays: the plan's
+            # dark may have changed since the last frame (AUD-7 F1)
+            self._plan_derived.clear()
         try:
             while not self._inflight.try_acquire(ticket, 0.1):
                 if self._is_cancelled():
@@ -5393,6 +5407,10 @@ class _InFlightWindow:
         self._changed.wait(timeout)
         self._changed.clear()
         return False
+
+    def idle(self) -> bool:
+        """No frame in flight (read by the one orchestrating thread before it submits)."""
+        return not self._members
 
     def release(self, ticket: _StreamPublication) -> bool:
         first: BaseException | None = None

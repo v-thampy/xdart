@@ -241,3 +241,58 @@ def test_a_runs_frames_share_one_clipped_dark_and_their_variance_is_unchanged(mo
         reduced = result.frames[index].result_1d
         np.testing.assert_allclose(reduced.intensity, direct.intensity, rtol=1e-12)
         np.testing.assert_allclose(reduced.sigma, direct.sigma, rtol=1e-12)
+
+
+def test_writable_dark_edits_between_chunks_keep_sigma_current():
+    """Codex's AUD-7 review F1 reproduction, as written: a caller edits the plan's (writable, uncopied) dark
+    between ``process()`` calls; pyFAI subtracts the edited dark, and the Poisson variance must follow it too
+    (the clipped dark derived once is derived again at each call)."""
+    from xrd_tools.integrate.single import integrate_1d
+    from xrd_tools.reduction import MemorySink, ReductionSession
+    dark = prepare_dark(np.full(SHAPE, 3.))
+    plan = ReductionPlan(integration_1d=Integration1DPlan(npt=60, error_model='poisson'), dark=dark)
+    frames = [Frame(index, image=_IMAGE.copy()) for index in (0, 1)]
+    memory = MemorySink()
+    session = ReductionSession(plan, Scan('mutable', frames, poni=_PONI,
+        integrator=poni_to_integrator(_PONI)), sink=memory, executor=1)
+    try:
+        session.process([frames[0]])
+        assert session.plan.dark is dark and dark.flags.writeable
+        dark[:] = 30.
+        session.process([frames[1]])
+        result = session.finish()
+        assert not result.failed
+        expected = integrate_1d(_IMAGE, poni_to_integrator(_PONI), npt=60, method='csr',
+            dark=dark, variance=np.maximum(_IMAGE, 1.) + dark)
+        reduced = memory.frames[1].result_1d
+        np.testing.assert_array_equal(reduced.intensity, expected.intensity)
+        np.testing.assert_array_equal(reduced.sigma, expected.sigma)
+    finally:
+        session.finish(raise_on_failure=False)
+
+
+def test_a_streaming_dark_edited_after_a_drain_keeps_sigma_current():
+    """The streaming twin of Codex's F1: with nothing in flight (after ``drain()``), the next ``submit()``
+    derives the clipped dark again, so an edit made meanwhile reaches the variance as it reaches pyFAI."""
+    from xrd_tools.integrate.single import integrate_1d
+    from xrd_tools.reduction import MemorySink, ReductionSession
+    dark = prepare_dark(np.full(SHAPE, 3.))
+    plan = ReductionPlan(integration_1d=Integration1DPlan(npt=60, error_model='poisson'), dark=dark)
+    frames = [Frame(index, image=_IMAGE.copy()) for index in (0, 1)]
+    memory = MemorySink()
+    session = ReductionSession(plan, Scan('mutable-stream', frames, poni=_PONI,
+        integrator=poni_to_integrator(_PONI)), sink=memory, execution='streaming')
+    try:
+        assert session.submit(frames[0])
+        assert session.drain(timeout=60)
+        dark[:] = 30.
+        assert session.submit(frames[1])
+        result = session.finish()
+        assert not result.failed
+        expected = integrate_1d(_IMAGE, poni_to_integrator(_PONI), npt=60, method='csr',
+            dark=dark, variance=np.maximum(_IMAGE, 1.) + dark)
+        reduced = memory.frames[1].result_1d
+        np.testing.assert_array_equal(reduced.intensity, expected.intensity)
+        np.testing.assert_array_equal(reduced.sigma, expected.sigma)
+    finally:
+        session.finish(raise_on_failure=False)
