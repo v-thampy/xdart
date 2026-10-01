@@ -27,6 +27,7 @@ import weakref
 
 import numpy as np
 
+from xrd_tools.corrections.normalization import BeamNormalizationRefused, frame_divisors
 from xrd_tools.analysis.module_transaction import (
     MetadataColumnSelector,
     ModuleArtifactOutput,
@@ -4231,55 +4232,16 @@ def rsm_normalization_divisors(
             "NORMALIZATION_METADATA_MISSING",
             "foil and exposure metadata are required",
         )
-    foil = np.asarray(foil_status, dtype=np.float64)
-    exposure = np.asarray(exposure_seconds, dtype=np.float64)
-    expected = (frame_count,)
-    if foil.shape != expected or exposure.shape != expected:
-        raise RSMOperationRefused(
-            "NORMALIZATION_METADATA_SHAPE_INVALID",
-            "normalization metadata does not match frame membership",
+    # the shared beam divisor (Stitch's too): foil transmission × exposure, byte for byte as before
+    try:
+        return frame_divisors(
+            frame_count,
+            foil=foil_status,
+            exposure=exposure_seconds,
+            absorption_lengths=policy.absorption_lengths,
         )
-    if not np.all(np.isfinite(foil)) or not np.all(foil == np.floor(foil)):
-        raise RSMOperationRefused(
-            "FOIL_STATUS_INVALID",
-            "foil status must be finite integral values",
-        )
-    if np.any((foil < 0) | (foil > 9999)):
-        raise RSMOperationRefused(
-            "FOIL_STATUS_INVALID",
-            "foil status must be between 0 and 9999",
-        )
-    if not np.all(np.isfinite(exposure)) or np.any(exposure <= 0):
-        raise RSMOperationRefused(
-            "EXPOSURE_INVALID",
-            "exposure seconds must be finite and strictly positive",
-        )
-    codes = foil.astype(np.int64)
-    digits = np.column_stack(
-        (
-            codes // 1000,
-            (codes // 100) % 10,
-            (codes // 10) % 10,
-            codes % 10,
-        )
-    )
-    transmission = np.exp(
-        -(digits @ np.asarray(policy.absorption_lengths, dtype=np.float64))
-    )
-    divisors = transmission * exposure
-    if not np.all(np.isfinite(transmission)) or np.any(transmission <= 0):
-        raise RSMOperationRefused(
-            "TRANSMISSION_INVALID",
-            "foil transmission is non-finite or non-positive",
-        )
-    if not np.all(np.isfinite(divisors)) or np.any(divisors <= 0):
-        raise RSMOperationRefused(
-            "NORMALIZATION_DIVISOR_INVALID",
-            "foil/exposure divisor is non-finite or non-positive",
-        )
-    result = np.array(divisors, dtype=np.float64, copy=True, order="C")
-    result.setflags(write=False)
-    return result
+    except BeamNormalizationRefused as error:
+        raise RSMOperationRefused(error.code, str(error)) from None
 
 
 def condition_rsm_images(

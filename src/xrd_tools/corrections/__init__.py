@@ -21,6 +21,9 @@ from xrd_tools.corrections.detector import (
     subtract_dark,
 )
 from xrd_tools.corrections.normalization import (
+    BeamNormalizationRefused,
+    foil_transmission,
+    frame_divisors,
     normalize_monitor,
     normalize_stack,
     normalize_time,
@@ -67,6 +70,9 @@ __all__ = [
     "correct_image",
     "subtract_dark",
     # normalization
+    "BeamNormalizationRefused",
+    "foil_transmission",
+    "frame_divisors",
     "normalize_monitor",
     "normalize_stack",
     "normalize_time",
