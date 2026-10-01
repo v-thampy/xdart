@@ -704,6 +704,8 @@ class FormRow(QtWidgets.QWidget):
         self.editor.setEnabled(self._enabled)
         if self._file_name_only:
             self.editor.installEventFilter(self)
+            # connected first, so a host's own ``textChanged`` slot reads the adopted value
+            self.editor.textChanged.connect(self._adopt_set_text)
         # Path/browse fields should show the root of long paths by default; the
         # full value is still available on hover via the row tooltip.
         if browse and isinstance(self.editor, QtWidgets.QLineEdit):
@@ -864,6 +866,22 @@ class FormRow(QtWidgets.QWidget):
                 # is committed first and never replaced by its basename.
                 QtCore.QTimer.singleShot(0, self._collapse_path_editor)
         return super().eventFilter(watched, event)
+
+    def _adopt_set_text(self, text: str) -> None:
+        """A file row's text set by code while it is unfocused is the row's value: a window that drives
+        its rows directly rather than through a projection (the calibration window) reads back what it
+        set. It is shown collapsed, with the full path as the tooltip, and makes no draft and no commit
+        (§19.9: a programmatic set is a projection, never user intent). ``apply_field`` and this row's
+        own display swaps block signals, so they never arrive here."""
+        if self.editor.hasFocus() or self._editor_dirty:
+            return
+        self._model_value = text
+        tip = text if text and not self._reason else _field_tooltip(self._path, self._reason)
+        for widget in (self, self.editor, self.label):
+            if widget.toolTip() != tip:
+                widget.setToolTip(tip)
+        # the row as the context: the collapse is dropped if the row is destroyed first
+        QtCore.QTimer.singleShot(0, self, self._collapse_path_editor)
 
     def _collapse_path_editor(self) -> None:
         if not self._file_name_only or self.editor.hasFocus():

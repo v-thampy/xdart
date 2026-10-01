@@ -1276,3 +1276,35 @@ def test_an_integer_row_keeps_refused_text_marks_it_and_names_why(qapp):
         line.deleteLater()
     finally:
         row.deleteLater()
+
+
+def test_a_file_row_set_by_code_while_unfocused_takes_the_value_without_a_draft_or_commit(qapp):
+    """A window that drives its rows directly rather than through a projection (the shared calibration window,
+    AUD-9 stage 2b G6) sets a file row's text in code and reads the value back: the row adopts it, shows it
+    collapsed with the full path as the tooltip, and makes no draft and no commit (§19.9: a programmatic
+    set is a projection, never user intent). A projected field (``apply_field``) is still exactly the
+    projected value."""
+    path = ("Calibration", "mask")
+    row = FormRow(label="Mask file", path=path, value="/data/old/mask.edf", browse=True)
+    row.show()
+    qapp.processEvents()
+    row.editor.clearFocus()
+    qapp.processEvents()
+    drafts, edits = [], []
+    row.draftChanged.connect(lambda changed, text: drafts.append(text))
+    row.valueChanged.connect(lambda changed, text: edits.append(text))
+    try:
+        row.editor.setText("/data/new/other_mask.npy")
+        assert row.current_value() == "/data/new/other_mask.npy"
+        qapp.processEvents()
+        assert row.editor.text() == "other_mask.npy" and row.editor.toolTip() == "/data/new/other_mask.npy"
+        assert row.current_value() == "/data/new/other_mask.npy" and drafts == [] and edits == []
+        row.apply_field(ControlFormField(SectionId.SOURCE, "Mask file", path, "/data/projected/mask.tif",
+                                         browse=True))
+        qapp.processEvents()
+        assert row.current_value() == "/data/projected/mask.tif" and row.editor.text() == "mask.tif"
+        assert drafts == [] and edits == []
+    finally:
+        row.close()
+        row.deleteLater()
+
