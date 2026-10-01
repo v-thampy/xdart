@@ -68,7 +68,37 @@ def test_a_preflight_marks_the_outputs_already_stitched_from_the_same_frames_wit
     spec.write_text(text[:start] + text[start:end].replace("\n15 -10", "\n15.5 -10", 1) + text[end:])
     assert prepare_stitch_tool(form).unchanged == (0,)  # scan 2 read another angle: its output changed
     Path(first.module.output.target).write_bytes(b"not a stitch")
-    assert prepare_stitch_tool(form).unchanged == ()  # an unreadable file is stitched again
+    from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
+    with pytest.raises(StitchToolPreflightRefused, match="is not a Stitch 1D result"):
+        prepare_stitch_tool(form)  # a foreign file: refused at Preview, as its run's Replace refuses it (G8c)
+
+
+def test_a_preview_refuses_a_foreign_or_other_kind_file_at_an_output(tmp_path):
+    """G8c (Codex's RSM stage-2 review, question 1): each output's existing file is checked at Preview as its
+    run's Replace checks it, from the header: a foreign file or another kind's result is refused there and left
+    untouched, before anything is integrated; the output's own earlier result is not."""
+    from xdart.gui.tools.stitch_values import StitchToolPreflightRefused
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, admit_analysis_artifact
+    from tests.core.test_analysis_artifact import _request, _writer
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    first = prepare_stitch_tool(form).request
+    target = Path(first.module.output.target)
+    target.write_bytes(b"an operator's own file")
+    with pytest.raises(StitchToolPreflightRefused) as refused:
+        prepare_stitch_tool(form)
+    assert refused.value.code == "OUTPUT_NOT_PREVIOUS_ANALYSIS"
+    assert ("Output 1 (sample_scan1): sample_scan1_stitch1d.nexus is not a Stitch 1D result that Replace can "
+            "overwrite (") in str(refused.value)
+    assert target.read_bytes() == b"an operator's own file"
+    target.unlink()
+    other = _request(target, AnalysisArtifactKind.RSM)
+    admit_analysis_artifact(other).publish(_writer(other))
+    with pytest.raises(StitchToolPreflightRefused, match="analysis artifact is a rsm result, not stitch-1d"):
+        prepare_stitch_tool(form)
+    target.unlink()
+    assert run_stitch_operation(first).terminal.disposition is ModuleDisposition.COMMITTED
+    assert prepare_stitch_tool(form).unchanged == (0,)  # its own result: Replace may overwrite it
 
 
 @pytest.mark.parametrize("rows, first_only, expected", [

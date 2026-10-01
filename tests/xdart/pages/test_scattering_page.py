@@ -74,7 +74,7 @@ def test_catalog_registers_current_workspace_first_and_as_default():
         "RSM", "workspace", 200, PageLifecycle.RETAINED)
     assert RSM_PAGE.capabilities == frozenset({
         PageCapability.OPEN_FOLDER, PageCapability.RUN_CONTROL, PageCapability.RUN_ACTIVITY,
-        PageCapability.APP_MENU_HOSTS, PageCapability.PROCESSING_MODE,
+        PageCapability.APP_MENU_HOSTS, PageCapability.PROCESSING_MODE, PageCapability.WRITE_MODE_TOGGLE,
     })
 
 
@@ -279,6 +279,30 @@ def test_builtin_rsm_selection_mounts_the_native_page_from_every_mode_box(
         page.toolRequested.emit("rsm")  # Int's Run on an RSM intent (an older session's)
         qapp.processEvents()
         assert window.page_handle is handle and window._tool_handles == {}
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_the_write_mode_shortcut_toggles_stitch_and_rsm_append_and_replace(qapp, isolated_settings):
+    """G8c (Codex's RSM stage-2 review, question 4): Stitch and RSM declare the host's write-mode capability
+    through one shared port (``RunBarWriteMode``): the shortcut flips their run bar's Append/Replace as a click
+    does (the page's tooltip follows), and is refused while a run holds the toggle."""
+    from xdart.gui.pages.values import ActionCompleted, ActionRefused
+
+    window = _mounted_host(None)
+    try:
+        for key in (STITCH_PAGE.key, RSM_PAGE.key):
+            assert window.select_page(key) == ActionCompleted(str(key))
+            bar = window.page_handle.widget.run_bar
+            before, tip = bar.write_mode(), bar.writeModeButton.toolTip()
+            after = "Append" if before == "Overwrite" else "Overwrite"
+            assert window._shortcut_toggle_write_mode() == ActionCompleted(f"write-mode-{after.casefold()}"), key
+            assert bar.write_mode() == after and bar.writeModeButton.toolTip() != tip, key
+            bar.set_mode_row_enabled(False)  # a run holds it
+            assert type(window._shortcut_toggle_write_mode()) is ActionRefused and bar.write_mode() == after
+            bar.set_mode_row_enabled(True)
+            assert window._shortcut_toggle_write_mode() == ActionCompleted(f"write-mode-{before.casefold()}")
     finally:
         window.close()
         window.deleteLater()

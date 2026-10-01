@@ -28,7 +28,7 @@ import re
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from xdart.gui.pages.handle import AppMenuHosts, PageHandle
+from xdart.gui.pages.handle import AppMenuHosts, PageHandle, RunBarWriteMode
 from xdart.gui.pages.operation_owner import OperationTerminalStatus, SingleWorkerOwner
 from xdart.gui.pages.values import (
     ActionAccepted, ActionCompleted, ActionRefused, CloseReceipt, PageCleanup,
@@ -2001,7 +2001,8 @@ class _RSMProcessingMode:
 def build_rsm_page(services, parent):
     page = RSMPage(services, parent)
     return PageHandle(key=RSM_TOOL_KEY, widget=page, close=page.close_page, open_folder=page,
-                      run_control=page, activity=page, app_menus=page, processing_mode=_RSMProcessingMode(page))
+                      run_control=page, activity=page, app_menus=page, processing_mode=_RSMProcessingMode(page),
+                      write_mode=RunBarWriteMode(page.run_bar))
 
 
 __all__ = ["RSMPage", "build_rsm_page", "suggested_output"]

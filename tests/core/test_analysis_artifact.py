@@ -1426,6 +1426,64 @@ def test_replace_refuses_unrecognized_or_different_analysis_kind(tmp_path, prior
     assert not tuple(tmp_path.glob(".*xdart-*"))
 
 
+@pytest.mark.parametrize("kind", (AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.RSM))
+def test_replace_admits_the_existing_result_from_its_header_alone(tmp_path, monkeypatch, kind):
+    """G8c (Codex's RSM stage-2 review, question 2): Replace checks the existing result's kind and identity from
+    its envelope and never reads its volume, curves or provenance (processed outputs are regenerable,
+    architecture invariant 12); the header admission reads the same identity the strict one does."""
+    from xrd_tools.io import analysis_artifact
+    from xrd_tools.io.analysis_artifact import inspect_analysis_artifact_header
+
+    target = tmp_path / "prior.nexus"
+    initial = _request(target, kind)
+    admit_analysis_artifact(initial).publish(_writer(initial))
+    strict = inspect_analysis_artifact(target, expected_kind=kind)
+    header = inspect_analysis_artifact_header(target, expected_kind=kind)
+    assert (header.path, header.kind) == (strict.path, kind)
+    assert [getattr(header, name) for name in ("request_fingerprint", "source_fingerprint", "plan_fingerprint",
+                                                 "provenance_digest")] == [
+        getattr(strict, name) for name in ("request_fingerprint", "source_fingerprint", "plan_fingerprint",
+                                           "provenance_digest")]
+    reads = []
+    for name in ("inspect_analysis_artifact", "read_analysis_artifact", "_inspect_stitch_record",
+                 "_read_stitch_record", "_read_scalar_text"):
+        original = getattr(analysis_artifact, name)
+        monkeypatch.setattr(analysis_artifact, name,
+                            lambda *args, _name=name, _original=original, **kwargs: (
+                                reads.append(_name), _original(*args, **kwargs))[1])
+    replacement = _request(target, kind, overwrite=AnalysisArtifactOverwrite.REPLACE)
+    output = admit_analysis_artifact(replacement)
+    assert reads == []  # the old result's header only
+    monkeypatch.undo()
+    output.publish(_writer(replacement))
+    assert inspect_analysis_artifact(target, expected_request=replacement).path == str(target)
+
+
+def test_an_output_refusal_names_a_foreign_or_other_kind_file_and_passes_its_own(tmp_path):
+    """G8c (Codex's RSM stage-2 review, question 1): what a Preview refuses at an output before any work is
+    what Replace refuses there; no file, the output's own kind, or its older Stitch layout pass."""
+    from xrd_tools.io.analysis_artifact import analysis_output_refusal
+
+    target = tmp_path / "out.nexus"
+    assert analysis_output_refusal(target, AnalysisArtifactKind.RSM) is None
+    target.write_bytes(b"an operator's own file")
+    refusal = analysis_output_refusal(target, AnalysisArtifactKind.RSM)
+    assert refusal.startswith("out.nexus is not an RSM result that Replace can overwrite (")
+    assert refusal.endswith("): choose another output, or move that file")
+    target.unlink()
+    initial = _request(target, AnalysisArtifactKind.RSM)
+    admit_analysis_artifact(initial).publish(_writer(initial))
+    assert analysis_output_refusal(target, AnalysisArtifactKind.RSM) is None
+    assert analysis_output_refusal(target, AnalysisArtifactKind.STITCH_1D) == (
+        "out.nexus is not a Stitch 1D result that Replace can overwrite (analysis artifact is a rsm result, "
+        "not stitch-1d): choose another output, or move that file")
+    with h5py.File(target, "r+") as handle:  # a Stitch 1D result in the layout before Stitch records
+        handle["entry"].attrs[ANALYSIS_KIND_ATTR] = np.bytes_(b"stitch-1d")
+    assert analysis_output_refusal(target, AnalysisArtifactKind.STITCH_1D) is None
+    assert "it is an older stitch-1d result" in analysis_output_refusal(target, AnalysisArtifactKind.STITCH_2D)
+    assert "it is an older stitch-1d result" in analysis_output_refusal(target, AnalysisArtifactKind.RSM)
+
+
 @pytest.mark.parametrize("alias", ("same_path", "symlink", "hardlink"))
 def test_replace_refuses_selected_input_alias_before_content_recognition(tmp_path, alias):
     from xrd_tools.io.output_safety import OutputCollisionError

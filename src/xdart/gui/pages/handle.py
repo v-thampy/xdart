@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Protocol, TYPE_CHECKING
 
-from .values import ActionOutcome, CloseReceipt, PageCapability, PageKey
+from .values import ActionCompleted, ActionOutcome, ActionRefused, CloseReceipt, PageCapability, PageKey
 
 if TYPE_CHECKING:
     from pyqtgraph import QtWidgets
@@ -28,6 +28,22 @@ class RunControlPort(Protocol):
 
 class WriteModePort(Protocol):
     def toggle(self) -> ActionOutcome: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RunBarWriteMode:
+    """The write-mode port of a page whose ``RunControlsBar`` holds its Append/Replace choice (Stitch, RSM): the
+    shortcut clicks the bar's own toggle, so the page hears it as any click; refused while the bar holds the
+    toggle locked (a run)."""
+
+    run_bar: object
+
+    def toggle(self) -> ActionOutcome:
+        button = self.run_bar.writeModeButton
+        if not button.isEnabled():
+            return ActionRefused("Append/Replace cannot change during a run")
+        button.click()
+        return ActionCompleted(f"write-mode-{self.run_bar.write_mode().casefold()}")
 
 
 class SlicePinPort(Protocol):

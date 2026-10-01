@@ -62,7 +62,7 @@ STITCH_PAGE = PageDescriptor(
     capabilities=frozenset({
         PageCapability.OPEN_FOLDER, PageCapability.SETTINGS_PERSISTENCE,
         PageCapability.RUN_CONTROL, PageCapability.RUN_ACTIVITY, PageCapability.APP_MENU_HOSTS,
-        PageCapability.PROCESSING_MODE,
+        PageCapability.PROCESSING_MODE, PageCapability.WRITE_MODE_TOGGLE,
     }),
     build=_build_stitch_page,
 )
@@ -80,7 +80,7 @@ RSM_PAGE = PageDescriptor(
     lifecycle=PageLifecycle.RETAINED,
     capabilities=frozenset({
         PageCapability.OPEN_FOLDER, PageCapability.RUN_CONTROL, PageCapability.RUN_ACTIVITY,
-        PageCapability.APP_MENU_HOSTS, PageCapability.PROCESSING_MODE,
+        PageCapability.APP_MENU_HOSTS, PageCapability.PROCESSING_MODE, PageCapability.WRITE_MODE_TOGGLE,
     }),
     build=_build_rsm_page,
 )

@@ -63,6 +63,7 @@ from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactKind,
     AnalysisArtifactOverwrite,
+    analysis_output_refusal,
 )
 from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 
@@ -1868,6 +1869,10 @@ def prepare_rsm_tool_v2(
             "OUTPUT_SYMLINK_UNSUPPORTED",
             "RSM output target must not be a symbolic link",
         )
+    refusal = (analysis_output_refusal(form.output_path, AnalysisArtifactKind.RSM)
+               if form.overwrite is AnalysisArtifactOverwrite.REPLACE else None)
+    if refusal is not None:  # what the run's Replace would refuse, before any gridding
+        raise RSMToolPreflightRefused("OUTPUT_NOT_PREVIOUS_ANALYSIS", refusal)
     # The output's folder need not exist: the operation qualifies its existing ancestry and its run
     # makes the folder, as Stitch's does (AUD-9 stage 2); Preview creates nothing.
     try:

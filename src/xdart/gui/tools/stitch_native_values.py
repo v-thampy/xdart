@@ -22,7 +22,9 @@ from xrd_tools.analysis.xu_stitch_calibration import (
 from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
 from xrd_tools.integrate.frame_screen import FrameScreenPolicy
 from xrd_tools.integrate.xu_stitch import resolve_xu_stitch_effective_geometry
-from xrd_tools.io.analysis_artifact import AnalysisArtifactKind
+from xrd_tools.io.analysis_artifact import (
+    AnalysisArtifactKind, AnalysisArtifactOverwrite, analysis_output_refusal,
+)
 from xrd_tools.io.output_path import (
     generated_artifact_family, is_artifact_family, resolve_finite_output_target, scan_family,
 )
@@ -273,6 +275,11 @@ def prepare_native_stitch_tool(form, project):
             receipt = cached[cache_key]
             receipts.append(receipt)
         target = resolve_finite_output_target(output_dir, family, operation_token=f"stitch-{form.mode}")
+        refusal = (analysis_output_refusal(target, kind)
+                   if form.overwrite is AnalysisArtifactOverwrite.REPLACE else None)
+        if refusal is not None:  # what the run's Replace would refuse, before any integration
+            raise StitchToolPreflightRefused("OUTPUT_NOT_PREVIOUS_ANALYSIS",
+                                             f"Output {len(requests) + 1} ({family}): {refusal}")
         output = ModuleOutputRequest(target, kind, form.overwrite, artifact_family=family)
         try:
             source = receipts[0] if len(receipts) == 1 else ModuleSourceGroupReceipt.from_members(

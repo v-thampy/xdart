@@ -2788,6 +2788,158 @@ def inspect_analysis_artifact(
         raise AnalysisArtifactInvalid(f"analysis artifact admission failed: {error}") from error
 
 
+@dataclass(frozen=True, slots=True)
+class AnalysisArtifactHeader:
+    """An existing analysis record's kind and identity, admitted from its envelope alone: no result array,
+    provenance or attestation is read (``inspect_analysis_artifact_header``)."""
+
+    path: str
+    kind: AnalysisArtifactKind
+    schema_version: int
+    request_fingerprint: str
+    source_fingerprint: str
+    plan_fingerprint: str
+    provenance_digest: str
+
+
+def _header_version(envelope, versions) -> int:
+    """An envelope's schema version, as the strict admission checks it."""
+    try:
+        version_id = envelope.attrs.get_id(ANALYSIS_SCHEMA_VERSION_ATTR)
+    except KeyError as error:
+        raise AnalysisArtifactInvalid("analysis artifact schema version is missing") from error
+    if (
+        version_id.shape != ()
+        or _hdf_type_class(version_id) != h5py.h5t.INTEGER
+        or version_id.dtype.kind not in "iu"
+        or version_id.dtype.itemsize > 8
+    ):
+        raise AnalysisArtifactInvalid("analysis artifact schema version is invalid")
+    version = int(envelope.attrs[ANALYSIS_SCHEMA_VERSION_ATTR])
+    if version not in versions:
+        raise AnalysisArtifactInvalid("analysis artifact schema version is unsupported")
+    return version
+
+
+def inspect_analysis_artifact_header(
+    path: str | Path,
+    *,
+    expected_kind: AnalysisArtifactKind,
+) -> AnalysisArtifactHeader:
+    """The bounded kind and identity admission of an existing analysis record: what Replace and a Preview's
+    check of an existing target need, without reading the volume, curves, provenance or attestation (Codex's
+    RSM stage-2 review, questions 1 and 2). It admits what the strict ``inspect_analysis_artifact`` admits of
+    the envelope: a regular bounded file, opened revision-stable; an Int Stitch record's ``/entry/stitch``, or
+    the analysis schema's ``/entry`` alone; the envelope's exact attribute names, NX class, schema marker,
+    supported version and kind (``expected_kind``); its four identity fingerprints; and its recorded file name
+    equal to its path. A Stitch result in the layout before Stitch records raises ``OlderStitchArtifact``, as
+    the strict admission does. AnalysisArtifactInvalid: a foreign file, another kind, or a damaged envelope."""
+    shown = _absolute_path(path)
+    if Path(shown).suffix.casefold() != ".nexus":
+        raise ValueError("analysis artifact path must end in .nexus")
+    if type(expected_kind) is not AnalysisArtifactKind:
+        raise TypeError("expected kind must be exact AnalysisArtifactKind")
+    try:
+        admitted_state = os.stat(shown)
+        if (
+            not stat.S_ISREG(admitted_state.st_mode)
+            or admitted_state.st_size < 1
+            or admitted_state.st_size > _MAX_ARTIFACT_FILE_BYTES
+        ):
+            raise AnalysisArtifactInvalid("analysis artifact must be a regular bounded file")
+        admitted_revision = _stat_revision(admitted_state)
+        with h5py.File(shown, "r") as handle:
+            if (_opened_hdf_revision(handle) != admitted_revision
+                    or _stat_revision(os.stat(shown)) != admitted_revision):
+                raise AnalysisArtifactInvalid("analysis artifact changed while opening its header admission")
+            entry = handle.get(_ENTRY)
+            record = isinstance(entry, h5py.Group) and _is_stitch_record(entry)
+            if record:
+                envelope = _direct(entry, _STITCH_GROUP, h5py.Group)
+                version = _header_version(envelope, _STITCH_RECORD_VERSIONS)
+                nx_class = "NXcollection"
+                native = {"source_base"} if version in _STITCH_NATIVE_VERSIONS else set()
+            else:
+                if len(handle.attrs) != 0 or len(handle) != 1 or _ENTRY not in handle:
+                    raise AnalysisArtifactInvalid("analysis artifact must contain only /entry")
+                envelope = _direct(handle, _ENTRY, h5py.Group)
+                version = _header_version(envelope, {
+                    ANALYSIS_SCHEMA_VERSION, ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3,
+                    ANALYSIS_SCHEMA_VERSION_STITCH_NEUTRAL, ANALYSIS_SCHEMA_VERSION_XU_STITCH_NEUTRAL,
+                    ANALYSIS_SCHEMA_VERSION_STITCH_NATIVE, ANALYSIS_SCHEMA_VERSION_XU_STITCH_NATIVE,
+                })
+                nx_class = "NXentry"
+                native = set()
+            attested = _artifact_contract_version(version) in {ANALYSIS_SCHEMA_VERSION_V2, ANALYSIS_SCHEMA_VERSION_V3}
+            if set(envelope.attrs) != {
+                "NX_class", ANALYSIS_SCHEMA_ATTR, ANALYSIS_SCHEMA_VERSION_ATTR, ANALYSIS_KIND_ATTR,
+                "request_fingerprint", "source_fingerprint", "plan_fingerprint", "provenance_digest", "file_name",
+            } | native | ({_EXECUTION_ATTESTATION_DIGEST_ATTR} if attested else set()):
+                raise AnalysisArtifactInvalid("analysis artifact envelope attributes are not exact")
+            if _bounded_attr_text(envelope, "NX_class") != nx_class:
+                raise AnalysisArtifactInvalid(f"analysis artifact envelope is not an {nx_class}")
+            if _bounded_attr_text(envelope, ANALYSIS_SCHEMA_ATTR) != ANALYSIS_SCHEMA_NAME:
+                raise AnalysisArtifactInvalid("analysis artifact schema marker is wrong")
+            try:
+                kind = AnalysisArtifactKind(_bounded_attr_text(envelope, ANALYSIS_KIND_ATTR))
+            except ValueError as error:
+                raise AnalysisArtifactInvalid("analysis artifact kind is invalid") from error
+            if record:
+                if (kind not in {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}
+                        or (kind is AnalysisArtifactKind.STITCH_2D and not native)):
+                    raise AnalysisArtifactInvalid("stitched record kind is invalid")
+            else:
+                if kind is not AnalysisArtifactKind.RSM:  # the layout before Stitch records
+                    raise OlderStitchArtifact(kind)
+                if version in _STITCH_NEUTRAL_CONTRACTS:
+                    raise AnalysisArtifactInvalid("neutral analysis artifact requires its Stitch kind")
+            if kind is not expected_kind:
+                raise AnalysisArtifactInvalid(
+                    f"analysis artifact is a {kind.value} result, not {expected_kind.value}")
+            fingerprints = {
+                attr: _sha256(_bounded_attr_text(envelope, attr), attr)
+                for attr in ("request_fingerprint", "source_fingerprint", "plan_fingerprint", "provenance_digest")
+            }
+            if _bounded_attr_text(envelope, "file_name") != shown:
+                raise AnalysisArtifactInvalid("analysis artifact records a private candidate path")
+            if (_opened_hdf_revision(handle) != admitted_revision
+                    or _stat_revision(os.stat(shown)) != admitted_revision):
+                raise AnalysisArtifactInvalid("analysis artifact changed during its header admission")
+    except AnalysisArtifactInvalid:
+        raise
+    except (OSError, KeyError, TypeError, ValueError, UnicodeError) as error:
+        raise AnalysisArtifactInvalid(f"analysis artifact header admission failed: {error}") from error
+    return AnalysisArtifactHeader(shown, kind, version, **fingerprints)
+
+
+_RESULT_NAMES = {
+    AnalysisArtifactKind.STITCH_1D: "a Stitch 1D result",
+    AnalysisArtifactKind.STITCH_2D: "a Stitch 2D result",
+    AnalysisArtifactKind.RSM: "an RSM result",
+}
+
+
+def analysis_output_refusal(target: str | Path, kind: AnalysisArtifactKind) -> str | None:
+    """Why the file at an analysis output's target cannot be replaced by a ``kind`` result, or None: no file,
+    that kind's record, or that kind's result in the layout before Stitch records (Replace computes it again).
+    Replace's own header admission (``inspect_analysis_artifact_header``), so a Preview refuses a foreign or
+    other-kind target before any gridding or integration (Codex's RSM stage-2 review, question 1)."""
+    if not os.path.lexists(target):
+        return None
+    try:
+        inspect_analysis_artifact_header(target, expected_kind=kind)
+    except OlderStitchArtifact as older:
+        if older.kind is kind:
+            return None
+        reason = f"it is an older {older.kind.value} result"
+    except AnalysisArtifactInvalid as error:
+        reason = str(error)
+    else:
+        return None
+    return (f"{Path(target).name} is not {_RESULT_NAMES[kind]} that Replace can overwrite ({reason}): "
+            "choose another output, or move that file")
+
+
 def read_analysis_artifact(
     path: str | Path,
     *,
@@ -2987,8 +3139,10 @@ class AnalysisArtifactOutput:
             ):
                 raise FileExistsError(request.target)
             if self._expected_target.exists:
+                # Its kind and identity from its header alone: Replace never reads the volume or curves it
+                # replaces (Codex's RSM stage-2 review, rec. 3); the alias and snapshot checks stand
                 try:
-                    inspect_analysis_artifact(request.target, expected_kind=request.kind)
+                    inspect_analysis_artifact_header(request.target, expected_kind=request.kind)
                 except OlderStitchArtifact as older:  # Replace stitches it again, as its refusal says
                     if older.kind is not request.kind:
                         raise
@@ -3312,6 +3466,7 @@ __all__ = [
     "ANALYSIS_SCHEMA_VERSION_ATTR",
     "AnalysisArtifactCleanupPending",
     "AnalysisArtifactError",
+    "AnalysisArtifactHeader",
     "AnalysisArtifactInspection",
     "AnalysisArtifactInvalid",
     "OlderStitchArtifact",
@@ -3325,10 +3480,12 @@ __all__ = [
     "AnalysisArtifactResultProjection",
     "AnalysisArtifactRequest",
     "admit_analysis_artifact",
+    "analysis_output_refusal",
     "analysis_execution_attestation_digest",
     "canonical_analysis_execution_attestation",
     "canonical_analysis_provenance",
     "inspect_analysis_artifact",
+    "inspect_analysis_artifact_header",
     "stitch_record_identity",
     "rsm_record_identity",
     "project_analysis_artifact_result",

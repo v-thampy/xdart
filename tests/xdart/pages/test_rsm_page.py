@@ -700,14 +700,22 @@ def _terminal_instead_of_gridding(monkeypatch, disposition, code, *, until_stopp
     monkeypatch.setattr(RSMOperationExecutionV2, "run", run)
 
 
+def _rsm_result_at(target):
+    """An RSM result's record at ``target`` (its envelope what Replace's header check admits, G8c)."""
+    from tests.core.test_analysis_artifact import _request, _writer
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, admit_analysis_artifact
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.unlink(missing_ok=True)
+    request = _request(target, AnalysisArtifactKind.RSM)
+    admit_analysis_artifact(request).publish(_writer(request))
+
+
 def _leaving_the_file(monkeypatch):
-    """The execution stand-in leaves its output file, as a real commit does."""
+    """The execution stand-in leaves its output's record, as a real commit does."""
     stand_in = RSMOperationExecutionV2.run
 
     def run(self, **kwargs):
-        target = Path(self.request.module.output.target)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(b"")
+        _rsm_result_at(Path(self.request.module.output.target))
         return stand_in(self, **kwargs)
     monkeypatch.setattr(RSMOperationExecutionV2, "run", run)
 
@@ -732,8 +740,7 @@ def test_append_skips_an_up_to_date_output_and_replace_grids_it_again(qapp, tmp_
         _synthetic_source(tmp_path)
         _with_source(page, tmp_path)
         output = Path(page._value("output_path"))
-        output.parent.mkdir()
-        output.write_bytes(b"")  # a result already there
+        _rsm_result_at(output)  # a result already there
         toggle = page.run_bar.writeModeButton
         assert toggle.isEnabled() and page.run_bar.write_mode() == "Append"
         assert toggle.toolTip().startswith("Append: skip the output")
@@ -1127,6 +1134,39 @@ def test_a_comma_selection_previews_every_rsm_and_grids_each_in_turn(qapp, tmp_p
         _close(page, qapp)
 
 
+def test_preview_refuses_a_foreign_file_at_an_output_before_any_gridding(qapp, tmp_path, monkeypatch):
+    """G8c (Codex's RSM stage-2 review, question 1): the file at an RSM's output is checked at Preview as its
+    run's Replace checks it, from the header: a foreign file is refused there, left untouched, and nothing is
+    gridded, by Preview or by Run; in a queue the refusal names the RSM whose output it is."""
+    grids = _counting_grids(monkeypatch)
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1")
+        target = Path(page.build_form().output_path)
+        target.parent.mkdir()
+        target.write_bytes(b"an operator's own file")
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview refused" in label.full_text())
+        assert label.full_text().startswith("Preview refused: OUTPUT_NOT_PREVIOUS_ANALYSIS: ")
+        assert f"{target.name} is not an RSM result that Replace can overwrite (" in label.full_text()
+        page.begin_run()
+        _wait(page, qapp, lambda: not page.active())
+        assert "Preview refused: " in label.full_text() and grids == []
+        _with_source(page, tmp_path, scans="1,2")
+        second = Path(page.build_forms()[1].output_path)
+        target.unlink()
+        second.write_bytes(b"an operator's own file")
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview refused" in label.full_text())
+        assert label.full_text().startswith("Preview refused (RSM 2 of 2): ")
+        assert f"{second.name} is not an RSM result" in label.full_text()
+        assert grids == [] and second.read_bytes() == b"an operator's own file"
+    finally:
+        _close(page, qapp)
+
+
 def test_stop_mid_queue_cancels_the_rsm_gridding_and_starts_no_other(qapp, tmp_path, monkeypatch):
     """Stop stops the queue: the RSM being gridded is cancelled and the next is never prepared."""
     started = []
@@ -1168,8 +1208,7 @@ def test_append_skips_the_up_to_date_rsm_of_a_queue_and_grids_the_other(qapp, tm
         _synthetic_source(tmp_path)
         _with_source(page, tmp_path, scans="1,2")
         first, second = (Path(form.output_path) for form in page.build_forms())
-        first.parent.mkdir()
-        first.write_bytes(b"")  # RSM 1's output already there, holding this request
+        _rsm_result_at(first)  # RSM 1's output already there, holding this request
         monkeypatch.setattr(rsm_values, "rsm_output_current",
                             lambda request: Path(request.module.output.target) == first)
         assert page.run_bar.write_mode() == "Append"
