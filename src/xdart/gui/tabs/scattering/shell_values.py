@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from enum import Enum
 from os.path import normcase
@@ -306,10 +308,19 @@ class AxisProjection:
     values: np.ndarray
     label: str
     unit: str = ""
+    #: The image's outer edges along this axis, when they are not its first and last values: an axis of bin
+    #: centres gives its bins' outer edges (half a bin beyond the first and last centre), so each pixel sits
+    #: at its bin's centre (an RSM slice: Codex's RSM stage-1 review F3). None: the first and last values.
+    edges: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         if type(self.values) is not np.ndarray or self.values.ndim != 1:
             raise TypeError("axis values must be a one-dimensional ndarray")
+        if self.edges is not None:
+            if (type(self.edges) is not tuple or len(self.edges) != 2
+                    or any(type(value) is not float or not math.isfinite(value) for value in self.edges)
+                    or not self.edges[0] < self.edges[1]):
+                raise TypeError("axis edges must be two finite increasing floats")
 
 
 @dataclass(frozen=True, slots=True)

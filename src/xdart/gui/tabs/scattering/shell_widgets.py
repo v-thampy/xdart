@@ -224,7 +224,7 @@ class ScientificImagePane(QtWidgets.QWidget):
             None
             if axis is None
             else (
-                id(axis.values), axis.label, axis.unit, axis.values.shape,
+                id(axis.values), axis.label, axis.unit, axis.values.shape, axis.edges,
             )
         )
 
@@ -257,8 +257,8 @@ class ScientificImagePane(QtWidgets.QWidget):
     ) -> tuple[object, ...]:
         source = np.asarray(data)
         if x_axis is not None and y_axis is not None:
-            x0, x1 = axis_extent(x_axis.values)
-            y0, y1 = axis_extent(y_axis.values)
+            x0, x1 = axis_span(x_axis)
+            y0, y1 = axis_span(y_axis)
             return (
                 "axes", source.shape, x_axis.values.shape, y_axis.values.shape,
                 x0, x1, y0, y1,
@@ -367,8 +367,8 @@ class ScientificImagePane(QtWidgets.QWidget):
         self._axis_presentation_contract = None
         image = source.T
         if x_axis is not None and y_axis is not None:
-            x0, x1 = axis_extent(x_axis.values)
-            y0, y1 = axis_extent(y_axis.values)
+            x0, x1 = axis_span(x_axis)
+            y0, y1 = axis_span(y_axis)
             rect = QtCore.QRectF(x0, y0, x1 - x0, y1 - y0)
             linear_percentiles = (0.5, 99.5)
             expand_degenerate = True
@@ -1037,6 +1037,11 @@ def axis_extent(values: np.ndarray) -> tuple[float, float]:
     return min(first, last), max(first, last)
 
 
+def axis_span(axis: AxisProjection) -> tuple[float, float]:
+    """Where an image spans along ``axis``: its ``edges`` when given, else its first and last values."""
+    return axis.edges if axis.edges is not None else axis_extent(axis.values)
+
+
 def repeated_labels(
     frames: tuple[DisplayFrameKey, ...],
 ) -> frozenset[int]:
@@ -1155,6 +1160,7 @@ __all__ = [
     "apply_section_header",
     "apply_vnext_controls_readiness",
     "axis_extent",
+    "axis_span",
     "aggregate_traces",
     "foldable",
     "ContentFitComboBox",

@@ -1499,3 +1499,28 @@ def test_e3_ui2_status_fallback_and_non_string_rejection_are_exact(
         shell.close()
         shell.deleteLater()
         qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_an_image_spans_its_axes_edges_so_each_pixel_sits_at_its_bin_centre(qapp) -> None:
+    """``AxisProjection.edges`` (Codex's RSM stage-1 review F3, now in Int's pane): an axis of bin centres
+    with its bins' outer edges draws each pixel at its bin's centre; without them the image spans the first
+    to last centre, as Int's cake always has."""
+    from xdart.gui.tabs.scattering.shell_widgets import ScientificImagePane
+    x = np.array([10.0, 20.0, 30.0])
+    y = np.array([100.0, 102.0, 104.0, 106.0])
+    data = np.arange(12, dtype=float).reshape(4, 3)  # (y, x), as Int's cake
+    pane = ScientificImagePane(lock_aspect=False)
+    try:
+        pane.render(data, x_axis=AxisProjection(x, "H", "", edges=(5.0, 35.0)),
+                    y_axis=AxisProjection(y, "K", "", edges=(99.0, 107.0)))
+        first = pane.image.mapToParent(QtCore.QPointF(0.5, 0.5))
+        last = pane.image.mapToParent(QtCore.QPointF(2.5, 3.5))
+        assert (first.x(), first.y()) == pytest.approx((10.0, 100.0), abs=1e-9)
+        assert (last.x(), last.y()) == pytest.approx((30.0, 106.0), abs=1e-9)
+        pane.render(data, x_axis=AxisProjection(x, "H", ""), y_axis=AxisProjection(y, "K", ""))
+        first = pane.image.mapToParent(QtCore.QPointF(0.5, 0.5))
+        assert (first.x(), first.y()) == pytest.approx((10 + 20 / 3 / 2, 100 + 6 / 4 / 2), abs=1e-9)
+    finally:
+        pane.deleteLater()
+    with pytest.raises(TypeError):
+        AxisProjection(x, "H", "", edges=(35.0, 5.0))
