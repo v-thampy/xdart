@@ -16,6 +16,10 @@ Stage 2b (design §2; the maintainer, 2026-10-01: "the control panel can be almo
 panel"): Experiment is Stitch's (Calibrate · Make Mask in the shared windows, Calibration, Mask File), and Source
 is Stitch's rows over Stitch's own source owner (``rsm_member_groups``), its scans found on the shared single
 worker before Preview and Run. The classic dialog was retired at the end of stage 2b (G10).
+
+Saved settings (G12, as Stitch's): File ▸ Save/Load Settings and the last session keep every input, the threshold
+policy, the calibration window's settings and Append ⇄ Replace, through the shared settings owner
+(``tools/page_settings``) over RSM's own part (``settings``). A fresh start neither reads nor writes them.
 """
 from __future__ import annotations
 
@@ -36,6 +40,7 @@ from xdart.gui.pages.values import (
     RSM_TOOL_KEY, SCATTERING_PAGE_KEY, STITCH_TOOL_KEY,
 )
 from xdart.gui.tabs.rsm.display import rsm_keyed_projection, rsm_slice_normals
+from xdart.gui.tabs.rsm.settings import RSM_SETTINGS, apply_page_settings, page_settings
 from xdart.gui.tabs.rsm.tool_windows import RSMCustomSliceWindow, RSMVolumeWindow
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView
@@ -60,6 +65,7 @@ from xdart.gui.tools.rsm_values import (
 )
 from xdart.gui.tools import normalization_values as normalization
 from xdart.gui.tools.correction_values import correction_rows
+from xdart.gui.tools.page_settings import PageSettings
 from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow, SubsectionCard
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
@@ -321,6 +327,14 @@ class RSMPage(QtWidgets.QWidget):
         self._authoring_dialogs = []
         self._calibration_dialog = None
         self._calibration_project = None
+        # the calibration window's saved inputs (File ▸ Load Settings, the last session, or the window a Project
+        # change closed), applied when the window is created
+        self._calibration_settings = None
+        # (action, start directory) -> path for File ▸ Save/Load Settings; tests replace it
+        self._settings_path_chooser = self._choose_settings_path
+        # File ▸ Save/Load Settings and the last session: the shared owner over RSM's own part (.settings)
+        self._saved_settings = PageSettings(self, RSM_SETTINGS, document=page_settings, apply=apply_page_settings,
+                                            busy=self.active, close=self.close_page)
         self._build_ui()
         self._authoring_timer = QtCore.QTimer(self)
         self._authoring_timer.setInterval(50)
@@ -1424,7 +1438,10 @@ class RSMPage(QtWidgets.QWidget):
 
     def _calibrate(self):
         """Calibrate: the shared calibration window with RSM's context ("Save geometry and use in RSM"), so RSM
-        calibrates its own data; its saved file becomes the Calibration row's."""
+        calibrates its own data; its saved file becomes the Calibration row's. As Stitch's: a new window opens on
+        the saved settings (File ▸ Load Settings, the last session, or the window a Project change closed), and the
+        first selected scan fills only one with no calibration source of its own (the calibrant scan is usually
+        another scan)."""
         from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
         if self._owner.busy or self._closing or self._authoring_active():
             return
@@ -1433,15 +1450,20 @@ class RSMPage(QtWidgets.QWidget):
             if not project:
                 raise ValueError("Choose a Project folder first")
             if self._calibration_dialog is not None and self._calibration_project != project:
+                self._calibration_settings = self._calibration_dialog.settings()
                 self._calibration_dialog.hide()
                 self._calibration_dialog = None
-            fresh = self._calibration_dialog is None
-            if fresh:
+            unconfigured = False
+            if self._calibration_dialog is None:
                 self._calibration_dialog = CalibrationDialog(CalibrationContext("RSM", project), parent=self)
+                saved = self._calibration_settings or {}
+                if saved:
+                    self._calibration_dialog.apply_settings(saved)
+                unconfigured = not (saved.get("fields") or {}).get("source")
                 self._calibration_project = project
                 self._calibration_dialog.calibrationSaved.connect(self._adopt_calibration)
                 self._authoring_dialogs.append(self._calibration_dialog)
-            source = self._source_spec_for_tools() if fresh else None
+            source = self._source_spec_for_tools() if unconfigured else None
             if source is not None:  # RSM reads raw images: no turn or mirror of its own
                 self._calibration_dialog.set_source_context(source, image_rotation=0, image_flip=False)
             self._calibration_dialog.show()
@@ -2142,6 +2164,45 @@ class RSMPage(QtWidgets.QWidget):
                     or self._job_form is not None  # a queue between its RSMs
                     or self._owner.finalization is not RSMOwnerFinalization.NONE or self._authoring_active())
 
+    # ── saved settings (File ▸ Save/Load Settings and the last session: the shared owner) ──
+    def settings(self):
+        """Every input, the source files, the threshold policy, the calibration window and Append ⇄ Replace."""
+        return self._saved_settings.settings()
+
+    def apply_settings(self, document):
+        """Restore a settings document; one that cannot apply leaves the inputs as they were."""
+        self._saved_settings.apply(document)
+
+    def _calibration_settings_now(self):
+        """The calibration window's settings: its own while it exists, else those it will open with."""
+        dialog = self._calibration_dialog
+        return dialog.settings() if dialog is not None else self._calibration_settings
+
+    def _set_calibration_settings(self, values):
+        self._calibration_settings = values if isinstance(values, dict) else None
+        if self._calibration_dialog is not None and self._calibration_settings:
+            self._calibration_dialog.apply_settings(self._calibration_settings)
+
+    def _choose_settings_path(self, action, start):
+        return self._saved_settings.choose_path(action, start)
+
+    def save(self):
+        """File ▸ Save Settings."""
+        return self._saved_settings.save()
+
+    def load(self):
+        """File ▸ Load Settings (refused while the page works: a run, a read, finding the scans, a queue between
+        its RSMs, a result's retry, or a calibration or mask window's job)."""
+        return self._saved_settings.load()
+
+    def restore_last_settings(self):
+        """Restore the settings the last session left (nothing in a fresh session)."""
+        self._saved_settings.restore_last()
+
+    def close_and_remember(self):
+        """Close the page and keep its settings for the next session once it is clean."""
+        return self._saved_settings.close_and_remember()
+
     def mount_points(self):
         return AppMenuHosts(self.browser.menus["Config"], self.browser.menus["Help"],
                             tool_requested=self.toolRequested,
@@ -2193,9 +2254,10 @@ class _RSMProcessingMode:
 
 def build_rsm_page(services, parent):
     page = RSMPage(services, parent)
-    return PageHandle(key=RSM_TOOL_KEY, widget=page, close=page.close_page, open_folder=page,
-                      run_control=page, activity=page, app_menus=page, processing_mode=_RSMProcessingMode(page),
-                      write_mode=RunBarWriteMode(page.run_bar))
+    page.restore_last_settings()
+    return PageHandle(key=RSM_TOOL_KEY, widget=page, close=page.close_and_remember, open_folder=page,
+                      settings_io=page, run_control=page, activity=page, app_menus=page,
+                      processing_mode=_RSMProcessingMode(page), write_mode=RunBarWriteMode(page.run_bar))
 
 
 __all__ = ["RSMPage", "build_rsm_page", "suggested_output"]

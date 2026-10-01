@@ -209,6 +209,35 @@ def test_the_last_session_is_restored_and_remembered_once_clean_and_a_fresh_star
     assert session.read_bytes() == before  # neither the settings nor the remembered folder written
 
 
+def test_a_saved_field_its_row_cannot_hold_is_refused_naming_the_row():
+    """``check_fields`` (RSM's, G12 unit 2): a choice among its row's choices unless they are a source's own
+    names, a toggle true or false, and text or a number in a text row; else a ValueError naming the row."""
+    from types import SimpleNamespace
+    from xdart.gui.tools.page_settings import check_fields
+    from xrd_tools.session.readiness import ControlFieldKind, ControlFormField, SectionId
+
+    def field(label, kind, choices=()):
+        return ControlFormField(SectionId.PROCESSING, label, ("Demo", label), "", kind, choices)
+    page = SimpleNamespace(_fields={
+        "grid": field("Grid", ControlFieldKind.COMBO, ("Quick", "Full")),
+        "monitor": field("Monitor", ControlFieldKind.COMBO, ("None",)),
+        "subdirs": field("Subdirs", ControlFieldKind.BOOL),
+        "scan": field("Selection", ControlFieldKind.LINE), "rows": field("Rows", ControlFieldKind.INT)})
+    check_fields(page, {"grid": "Full", "monitor": "I0", "subdirs": False, "scan": "43", "rows": 195},
+                 open_choices={"monitor"})
+    check_fields(page, {"scan": None, "rows": 1.5})
+    for fields, reason in (({"grid": "Huge"}, "Grid: 'Huge' is not one of its choices"),
+                           ({"monitor": "I0"}, "Monitor: 'I0' is not one of its choices"),
+                           ({"subdirs": "false"}, "Subdirs: 'false' is not on or off"),
+                           ({"subdirs": 0}, "Subdirs: 0 is not on or off"),
+                           ({"scan": [43]}, "Selection: [43] is not text or a number"),
+                           ({"rows": True}, "Rows: True is not text or a number"),
+                           ({"rows": {"n": 1}}, "Rows: {'n': 1} is not text or a number")):
+        with pytest.raises(ValueError) as refused:
+            check_fields(page, fields)
+        assert str(refused.value) == reason
+
+
 def test_stitch_keeps_its_settings_on_the_shared_owner(qapp):
     """Stitch's document is the shared owner's (G12 unit 1): its kind, and the page's owner."""
     from xdart.gui.pages.services import empty_host_services

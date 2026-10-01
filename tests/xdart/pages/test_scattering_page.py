@@ -72,9 +72,10 @@ def test_catalog_registers_current_workspace_first_and_as_default():
     assert RSM_PAGE.key == RSM_TOOL_KEY == "rsm"
     assert (RSM_PAGE.label, RSM_PAGE.category, RSM_PAGE.order, RSM_PAGE.lifecycle) == (
         "RSM", "workspace", 200, PageLifecycle.RETAINED)
-    assert RSM_PAGE.capabilities == frozenset({
-        PageCapability.OPEN_FOLDER, PageCapability.RUN_CONTROL, PageCapability.RUN_ACTIVITY,
-        PageCapability.APP_MENU_HOSTS, PageCapability.PROCESSING_MODE, PageCapability.WRITE_MODE_TOGGLE,
+    assert RSM_PAGE.capabilities == frozenset({  # File ▸ Save/Load Settings as Stitch's (G12)
+        PageCapability.OPEN_FOLDER, PageCapability.SETTINGS_PERSISTENCE, PageCapability.RUN_CONTROL,
+        PageCapability.RUN_ACTIVITY, PageCapability.APP_MENU_HOSTS, PageCapability.PROCESSING_MODE,
+        PageCapability.WRITE_MODE_TOGGLE,
     })
 
 
@@ -303,6 +304,39 @@ def test_the_write_mode_shortcut_toggles_stitch_and_rsm_append_and_replace(qapp,
             assert type(window._shortcut_toggle_write_mode()) is ActionRefused and bar.write_mode() == after
             bar.set_mode_row_enabled(True)
             assert window._shortcut_toggle_write_mode() == ActionCompleted(f"write-mode-{before.casefold()}")
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_the_file_menus_save_and_load_settings_reach_stitch_and_rsm(qapp, isolated_settings, tmp_path):
+    """G12 (ledger row 3: "File ▸ Save/Load Settings ... mirror the Stitch page"): the host's File ▸ Save
+    Settings and Load Settings (Ctrl+S, Ctrl+O) are enabled on Stitch and RSM and reach each page's own settings
+    through its settings port; a document saved by one page is refused by the other, naming the page."""
+    import json
+    from xdart.gui.pages.values import ActionCompleted, ActionRefused
+
+    window = _mounted_host(None)
+    try:
+        saved = {}
+        for key, label in ((STITCH_PAGE.key, "Stitch"), (RSM_PAGE.key, "RSM")):
+            assert window.select_page(key) == ActionCompleted(str(key))
+            assert window.actionSaveSettings.isEnabled() and window.actionLoadSettings.isEnabled(), key
+            page = window.page_handle.widget
+            page.set_field("project_root", str(tmp_path))
+            path = tmp_path / f"{key}-settings.json"
+            page._settings_path_chooser = lambda action, start, path=path: str(path)
+            outcome = label.casefold()
+            assert window._shortcut_save_settings() == ActionCompleted(f"{outcome}-settings-saved"), key
+            assert json.loads(path.read_text())["kind"] == f"xdart-{outcome}-settings"
+            before = page.settings()
+            assert window._shortcut_load_settings() == ActionCompleted(f"{outcome}-settings-loaded"), key
+            assert page.settings() == before
+            saved[key] = path
+        for key, other, label in ((STITCH_PAGE.key, RSM_PAGE.key, "Stitch"), (RSM_PAGE.key, STITCH_PAGE.key, "RSM")):
+            assert window.select_page(key) == ActionCompleted(str(key))
+            window.page_handle.widget._settings_path_chooser = lambda action, start, path=saved[other]: str(path)
+            assert window._shortcut_load_settings() == ActionRefused(f"not an xdart {label} settings file"), key
     finally:
         window.close()
         window.deleteLater()

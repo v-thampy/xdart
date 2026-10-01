@@ -12,7 +12,8 @@ keeps the rest:
 - the document (``SettingsKind``): its kind and version checked (a foreign file, or one from a newer xdart, is
   refused with the reason), the shared sections' shapes, and its text (indented, keys sorted);
 - the shared sections, read and restored alike on every page: the fields as plain values, the source files by
-  source kind, Int's threshold policy as one state, and the run bar's Append ⇄ Replace;
+  source kind, Int's threshold policy as one state, and the run bar's Append ⇄ Replace; and the check that each
+  saved field fits its row (``check_fields``: a choice among its choices, a toggle on or off), RSM's so far;
 - File ▸ Save and Load (``PageSettings``, behind the page's ``settings_io``): the chooser through
   ``file_dialogs``, the remembered folder, ``.json`` added to a bare name, an atomic write, a load refused while the
   page is busy, and a document that cannot apply rolled back to the inputs before it. Never a confirmation;
@@ -114,6 +115,25 @@ def saved_fields(page, document: dict[str, Any], skip=frozenset()) -> dict[str, 
     policy)."""
     return {key: value for key, value in document.get("fields", {}).items()
             if key in page._fields and key not in skip}
+
+
+def check_fields(page, fields: dict[str, Any], open_choices=frozenset()) -> None:
+    """Refuse a saved field its row cannot hold, naming the row (ValueError), before anything applies: a choice
+    outside its row's choices (unless they are a source's own names, ``open_choices``), a toggle that is not true
+    or false, or a list or an object in a text row. A newer or hand-edited document is so refused, never half
+    read: a Coordinates the page cannot grid would otherwise wait for Preview to fail."""
+    from xrd_tools.session.readiness import ControlFieldKind
+
+    for key, value in fields.items():
+        field = page._fields[key]
+        if field.kind == ControlFieldKind.COMBO and key not in open_choices:
+            if value not in field.choices:
+                raise ValueError(f"{field.label}: {value!r} is not one of its choices")
+        elif field.kind == ControlFieldKind.BOOL:
+            if type(value) is not bool:
+                raise ValueError(f"{field.label}: {value!r} is not on or off")
+        elif value is not None and (type(value) is bool or not isinstance(value, (str, int, float))):
+            raise ValueError(f"{field.label}: {value!r} is not text or a number")
 
 
 def restore_sources(page, document: dict[str, Any]) -> None:
@@ -260,6 +280,6 @@ class PageSettings:
 
 
 __all__ = [
-    "PageSettings", "SettingsKind", "plain", "restore_sources", "restore_write_mode", "saved_fields",
-    "saved_threshold",
+    "PageSettings", "SettingsKind", "check_fields", "plain", "restore_sources", "restore_write_mode",
+    "saved_fields", "saved_threshold",
 ]

@@ -79,8 +79,9 @@ RSM_PAGE = PageDescriptor(
     order=200,
     lifecycle=PageLifecycle.RETAINED,
     capabilities=frozenset({
-        PageCapability.OPEN_FOLDER, PageCapability.RUN_CONTROL, PageCapability.RUN_ACTIVITY,
-        PageCapability.APP_MENU_HOSTS, PageCapability.PROCESSING_MODE, PageCapability.WRITE_MODE_TOGGLE,
+        PageCapability.OPEN_FOLDER, PageCapability.SETTINGS_PERSISTENCE, PageCapability.RUN_CONTROL,
+        PageCapability.RUN_ACTIVITY, PageCapability.APP_MENU_HOSTS, PageCapability.PROCESSING_MODE,
+        PageCapability.WRITE_MODE_TOGGLE,
     }),
     build=_build_rsm_page,
 )

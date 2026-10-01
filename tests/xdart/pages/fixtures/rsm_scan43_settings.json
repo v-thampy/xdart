@@ -1,0 +1,62 @@
+{
+  "fields": {
+    "adv_angle_mapping": "mu=mu, eta=eta, chi=chi, phi=phi, nu=nu, del=del",
+    "adv_chunk": "8",
+    "adv_columns": "487",
+    "adv_dtype": "int32",
+    "adv_exposure_occurrence": "0",
+    "adv_foil_occurrence": "0",
+    "adv_header": "0",
+    "adv_max_chunk_mib": "",
+    "adv_max_frame_mib": "64",
+    "adv_monitor_occurrence": "0",
+    "adv_rows": "195",
+    "coordinates": "HKL (crystal reciprocal coordinates)",
+    "dark_path": "",
+    "exposure_column": "Seconds",
+    "flat_cutoff": "10",
+    "flat_path": "",
+    "foil_column": "foil status",
+    "foil_lengths": "1.06, 3.04, 4.65, 9.5",
+    "frame_first": "0",
+    "frame_last": "60",
+    "frame_step": "1",
+    "geometry_path": "calibration/rsm_canonical.json",
+    "grid": "Quick 40\u00d740\u00d740",
+    "image_dir": "images",
+    "image_stem": "b_thampy_STO_align_scan43_",
+    "mask_path": "",
+    "monitor": "None",
+    "name_filter": "",
+    "normalization": "Foil transmission \u00d7 exposure",
+    "offset": "1e-06",
+    "output_path": "",
+    "polarization": "0.99",
+    "refinement": true,
+    "scan": "43",
+    "scan_mode": "Select Scans",
+    "solid_angle": "On",
+    "source_kind": "Spec",
+    "static_hot": "100",
+    "subdirs": false,
+    "ub_from": "The source's",
+    "ub_row1": "",
+    "ub_row2": "",
+    "ub_row3": "",
+    "ub_scan": "",
+    "ub_spec_path": ""
+  },
+  "kind": "xdart-rsm-settings",
+  "sources": {
+    "Spec": [
+      "STO_align"
+    ]
+  },
+  "threshold": {
+    "apply_threshold": false,
+    "mask_saturation": true,
+    "threshold_max": null,
+    "threshold_min": null
+  },
+  "version": 1
+}
