@@ -12,7 +12,6 @@ from pathlib import Path
 import functools
 import json
 import logging
-import os
 import time
 
 import re
@@ -34,6 +33,7 @@ from xdart.gui.tools.stitch_owner import (
 )
 from xdart.gui.tools import normalization_values as normalization
 from xdart.gui.tools.correction_values import correction_rows
+from xdart.gui.tools.page_settings import PageSettings
 from xdart.gui.tools.stitch_values import StitchFrameSelector, StitchToolForm
 from xdart.gui.widgets.controls_panel import (
     PROCESSING_ROW_GAP, PROCESSING_ROW_LABEL_WIDTH, ControlsPanel, FormRow, RangeRow, SubsectionCard,
@@ -44,6 +44,7 @@ from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
 from xdart.gui.tabs.scattering.shell_widgets import foldable
 from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
+from xdart.gui.tabs.stitch.settings import STITCH_SETTINGS, apply_page_settings, page_settings
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
 from xrd_tools.analysis.stitch_native import native_ceilings
 from xrd_tools.analysis.stitch_operation import StitchFoilNormalization, StitchGeometryKind
@@ -454,8 +455,10 @@ class StitchPage(QtWidgets.QWidget):
         self._calibration_settings = None
         # (action, start directory) -> path for File ▸ Save/Load Settings; tests replace it.
         self._settings_path_chooser = self._choose_settings_path
-        self._closing_settings = None
-        self._settings_remembered = False
+        # File ▸ Save/Load Settings and the last session: the shared owner over Stitch's own part (.settings)
+        self._saved_settings = PageSettings(self, STITCH_SETTINGS, document=page_settings,
+                                            apply=apply_page_settings, busy=lambda: self._owner.busy,
+                                            close=self.shutdown)
         self._metadata_dialog = None
         self._metadata_request_dialog = None
         self._metadata_view_revision = None
@@ -2984,18 +2987,11 @@ class StitchPage(QtWidgets.QWidget):
 
     def settings(self):
         """Every input, the source files, the threshold policy and the calibration dialog."""
-        from .settings import page_settings
-        return page_settings(self)
+        return self._saved_settings.settings()
 
     def apply_settings(self, document):
         """Restore a settings document; one that cannot apply leaves the inputs as they were."""
-        from .settings import apply_page_settings
-        before = self.settings()
-        try:
-            apply_page_settings(self, document)
-        except Exception:
-            apply_page_settings(self, before)
-            raise
+        self._saved_settings.apply(document)
 
     def _calibration_settings_now(self):
         dialog = self._calibration_dialog
@@ -3007,85 +3003,23 @@ class StitchPage(QtWidgets.QWidget):
             self._calibration_dialog.apply_settings(self._calibration_settings)
 
     def _choose_settings_path(self, action, start):
-        from xdart.gui.widgets import file_dialogs
-        picks = file_dialogs.browse(self, ("Save " if action == "save" else "Load ") + "Stitch settings",
-                                    save=action == "save", file_filter=file_dialogs.SETTINGS_FILTER, current=start)
-        return picks[0] if picks else None
-
-    def _settings_path(self, action):
-        from xdart.utils.browse import browse_start_dir, remember_browse_path
-        selected = self._settings_path_chooser(action, browse_start_dir("", fallback=self._value("project_root")))
-        if not selected:
-            return None
-        path = Path(selected).expanduser()
-        if action == "save" and not path.suffix:
-            path = path.with_suffix(".json")
-        remember_browse_path(path)
-        return path
+        return self._saved_settings.choose_path(action, start)
 
     def save(self):
         """File ▸ Save Settings."""
-        from .settings import dump_settings
-        path = self._settings_path("save")
-        if path is None:
-            return ActionCompleted("stitch-settings-save-cancelled")
-        try:
-            text = dump_settings(self.settings())
-            temporary = path.with_name(f".{path.name}.tmp")
-            temporary.write_text(text, encoding="utf-8")
-            os.replace(temporary, path)
-        except (OSError, ValueError) as error:
-            self._status(f"Could not save the Stitch settings: {error}", ready=False)
-            return ActionRefused(str(error))
-        self._status(f"Stitch settings saved: {path.name}")
-        return ActionCompleted("stitch-settings-saved")
+        return self._saved_settings.save()
 
     def load(self):
         """File ▸ Load Settings."""
-        from .settings import load_settings
-        if self._owner.busy:
-            return ActionRefused("Stitch is busy; load settings when it is idle")
-        path = self._settings_path("load")
-        if path is None:
-            return ActionCompleted("stitch-settings-load-cancelled")
-        try:
-            self.apply_settings(load_settings(path.read_text(encoding="utf-8")))
-        except Exception as error:  # noqa: BLE001 - a settings file is user input
-            reason = str(error) if isinstance(error, (OSError, ValueError)) else (
-                f"these Stitch settings cannot be applied here ({type(error).__name__}: {error})")
-            self._status(f"Could not load the Stitch settings: {reason}", ready=False)
-            return ActionRefused(reason)
-        self._status(f"Stitch settings loaded: {path.name}", ready=self._readiness[1])
-        return ActionCompleted("stitch-settings-loaded")
+        return self._saved_settings.load()
 
     def restore_last_settings(self):
         """Restore the settings the last session left (nothing in a fresh session)."""
-        from xdart.utils.session import load_session
-        from .settings import SESSION_KEY
-        document = load_session().get(SESSION_KEY)
-        if document is None:
-            return
-        try:
-            self.apply_settings(document)
-        except Exception:  # noqa: BLE001 - saved settings are a convenience
-            _LOG.warning("Could not restore the last Stitch settings", exc_info=True)
-            self._status("Could not restore the last Stitch settings", ready=False)
+        self._saved_settings.restore_last()
 
     def close_and_remember(self):
         """Close the page and keep its settings for the next session once it is clean."""
-        if self._closing_settings is None and not self._closing:
-            try:
-                self._closing_settings = self.settings()
-            except Exception:  # noqa: BLE001
-                _LOG.warning("Could not capture the Stitch settings", exc_info=True)
-        receipt = self.shutdown()
-        if (receipt.status is PageCleanup.CLEAN and not self._settings_remembered
-                and self._closing_settings is not None):
-            from xdart.utils.session import save_session
-            from .settings import SESSION_KEY
-            save_session({SESSION_KEY: self._closing_settings})
-            self._settings_remembered = True
-        return receipt
+        return self._saved_settings.close_and_remember()
 
     def mount_points(self):
         return AppMenuHosts(self.browser.menus["Config"], self.browser.menus["Help"],

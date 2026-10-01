@@ -2,21 +2,28 @@
 and the calibration dialog, as one versioned JSON document.
 
 File ▸ Save/Load Settings writes and reads it, and the page restores the last
-session's document at start-up. Per-use confirmations in the calibration dialog
-are never kept. Unknown keys are ignored and missing ones keep their defaults, so
-a document from another version restores what it can.
+session's document at start-up, through the shared settings owner
+(``xdart.gui.tools.page_settings``: the document's checks and text, the file and
+the session). This module is Stitch's own part: what it saves and the order it
+applies in. Per-use confirmations in the calibration dialog are never kept.
+Unknown keys are ignored and missing ones keep their defaults, so a document
+from another version restores what it can.
 """
 from __future__ import annotations
 
 from dataclasses import replace
-import json
-import math
 from typing import Any
 
-SETTINGS_KIND = "xdart-stitch-settings"
-SETTINGS_VERSION = 1
+from xdart.gui.tools.page_settings import (
+    SettingsKind, restore_sources, restore_write_mode, saved_fields, saved_threshold,
+)
+
+#: The document's kind and version, its key in the session file, and its own object section.
+STITCH_SETTINGS = SettingsKind("xdart-stitch-settings", 1, "stitch_settings", "Stitch", sections=("gi",))
+SETTINGS_KIND = STITCH_SETTINGS.kind
+SETTINGS_VERSION = STITCH_SETTINGS.version
 #: Where the last session's settings live in the session file.
-SESSION_KEY = "stitch_settings"
+SESSION_KEY = STITCH_SETTINGS.session_key
 #: Applied first, in this order: each resets other fields to its own defaults.
 _FIRST = ("backend", "source_kind", "unit", "map_axis")
 #: Shown from the source selection, not an input of its own.
@@ -25,70 +32,35 @@ _DERIVED = frozenset({"spec_path"})
 _THRESHOLD = frozenset({"threshold_min", "threshold", "threshold_enabled"})
 
 
-def _plain(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, str)):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    return str(value)
-
-
 def page_settings(page) -> dict[str, Any]:
     """The page's current settings document."""
-    state = page._threshold_state
-    return {
-        "kind": SETTINGS_KIND,
-        "version": SETTINGS_VERSION,
-        "fields": {key: _plain(page._value(key)) for key in page._fields if key not in _DERIVED},
-        "sources": {str(kind): [str(path) for path in paths]
-                    for kind, paths in page._paths_by_kind.items() if paths},
-        "threshold": {"apply_threshold": bool(state.apply_threshold),
-                      "threshold_min": _plain(state.threshold_min),
-                      "threshold_max": _plain(state.threshold_max),
-                      "mask_saturation": bool(state.mask_saturation)},
-        "calibration": page._calibration_settings_now(),
+    return STITCH_SETTINGS.document(
+        page, (key for key in page._fields if key not in _DERIVED),
         # grazing incidence as Int sets it (its axis and ranges are fields above)
-        "gi": dict(page._gi),
+        gi=dict(page._gi),
         # Append skips an output already stitched with these settings; "Overwrite" is Replace
-        "write_mode": page.run_bar.write_mode(),
+        write_mode=page.run_bar.write_mode(),
         # Stitch 1D or Stitch 2D
-        "mode": page._mode,
+        mode=page._mode,
         # Int's Cores: the frames pyFAI integrates at once
-        "cores": page.run_bar.get_cores(),
-    }
+        cores=page.run_bar.get_cores(),
+    )
 
 
-def validate_settings(document: Any) -> dict[str, Any]:
-    """Return the document if it is Stitch settings this version can read."""
-    if (type(document) is not dict or document.get("kind") != SETTINGS_KIND
-            or type(document.get("version")) is not int):
-        raise ValueError("not an xdart Stitch settings file")
-    if document["version"] > SETTINGS_VERSION:
-        raise ValueError("these Stitch settings come from a newer xdart")
-    for key, kind in (("fields", dict), ("sources", dict), ("threshold", dict), ("gi", dict)):
-        if type(document.get(key, {})) is not kind:
-            raise ValueError(f"Stitch settings {key} are malformed")
-    calibration = document.get("calibration")
-    if calibration is not None and (type(calibration) is not dict or any(
-            type(calibration.get(key, {})) is not dict for key in ("fields", "choices"))):
-        raise ValueError("Stitch settings calibration is malformed")
-    return document
+#: Return the document if it is Stitch settings this version can read.
+validate_settings = STITCH_SETTINGS.validate
+dump_settings = STITCH_SETTINGS.dump
+load_settings = STITCH_SETTINGS.load
 
 
 def apply_page_settings(page, document: Any) -> None:
     """Restore a settings document onto the page (see the module docstring)."""
-    from xrd_tools.session.threshold_editing import ThresholdState
-
     document = validate_settings(document)
-    fields = {key: value for key, value in document.get("fields", {}).items()
-              if key in page._fields and key not in _DERIVED}
+    fields = saved_fields(page, document, _DERIVED)
     for key in _FIRST:
         if key in fields:
             page.set_field(key, fields[key])
-    page._paths_by_kind = {str(kind): tuple(str(path) for path in paths)
-                           for kind, paths in document.get("sources", {}).items()
-                           if type(paths) is list}
-    page.set_sources(page._paths_by_kind.get(page._value("source_kind"), ()))
+    restore_sources(page, document)
     for key, value in fields.items():
         if key not in _FIRST and key not in _THRESHOLD and key != "normalization":
             page.set_field(key, value)
@@ -99,11 +71,8 @@ def apply_page_settings(page, document: Any) -> None:
         from xrd_tools.core.geometry import ImageOrientation  # older settings: the rotation's unmirrored camera
         from .page import camera_text
         page.set_field("camera", camera_text(ImageOrientation(rotation=int(saved["image_rotation"]))))
-    threshold = document.get("threshold")
-    if threshold:
-        state = ThresholdState(bool(threshold.get("apply_threshold")),
-                               threshold.get("threshold_min"), threshold.get("threshold_max"),
-                               bool(threshold.get("mask_saturation")))
+    state = saved_threshold(document)
+    if state is not None:
         page._threshold_state = state
         mode = page._threshold_mode
         for key, value in (("threshold_min", state.threshold_min if mode == "manual" else 0.),
@@ -112,9 +81,7 @@ def apply_page_settings(page, document: Any) -> None:
             page._fields[key] = replace(page._fields[key], value=value)
         page._render_ranges()
     page._set_calibration_settings(document.get("calibration"))
-    if document.get("write_mode") in ("Append", "Overwrite"):
-        page.run_bar.set_write_mode(document["write_mode"])
-        page._write_mode_changed()
+    restore_write_mode(page, document)
     if document.get("mode") in ("Stitch 1D", "Stitch 2D"):
         page.select_mode(document["mode"])
     if type(document.get("cores")) is int:
@@ -145,19 +112,7 @@ def apply_page_settings(page, document: Any) -> None:
             page.set_field(key, fields[key])
 
 
-def dump_settings(document: dict[str, Any]) -> str:
-    return json.dumps(validate_settings(document), indent=2, sort_keys=True)
-
-
-def load_settings(text: str) -> dict[str, Any]:
-    try:
-        document = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise ValueError("not an xdart Stitch settings file") from error
-    return validate_settings(document)
-
-
 __all__ = [
-    "SESSION_KEY", "SETTINGS_KIND", "SETTINGS_VERSION", "apply_page_settings",
+    "SESSION_KEY", "SETTINGS_KIND", "SETTINGS_VERSION", "STITCH_SETTINGS", "apply_page_settings",
     "dump_settings", "load_settings", "page_settings", "validate_settings",
 ]
