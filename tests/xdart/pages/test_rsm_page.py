@@ -1380,3 +1380,34 @@ def test_a_typed_or_spec_scan_ub_reaches_the_form_and_a_refused_one_is_named(qap
         assert page._fields["ub_spec_path"].reason == "Q coordinates use no UB"
     finally:
         _close(page, qapp)
+
+
+def test_the_preview_names_the_solid_angle_the_detector_mask_and_a_given_ub_beside_the_sources(qapp, tmp_path):
+    """G8b: the Preview names where the solid angle comes from (the canonical asset: the untilted formula about the
+    beam pixel; off when it is off) and the detector mask, keeps each member's #G3 line (S3c's cross-check), and
+    shows a UB given for an HKL map beside each member's own (the design: "An override is shown in the Preview
+    beside the source's own UB"), the given one the matrix used."""
+    page = _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text())
+        shown = page.preview_text.toPlainText()
+        assert "Solid angle: the untilted formula about the beam pixel" in shown
+        assert "Detector mask: none" in shown and "UB given" not in shown and "UB the source records" not in shown
+        assert shown.count("  UB: #G3 (the header holds no orientation reflections to recompute it from)") == 2
+        page.set_field("ub_from", "Typed")
+        for number, row in enumerate(("2 0 0", "0 2 0", "0 0 2"), 1):
+            page.set_field(f"ub_row{number}", row)
+        page.set_field("adv_solid_angle", "Off")
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text())
+        shown = page.preview_text.toPlainText()
+        assert ("UB given: typed, in SPEC's #G3 convention: 2 0 0; 0 2 0; 0 0 2, in place of the sources' own "
+                "(each member's below)") in shown
+        assert shown.count("  UB the source records: 1 0 0; 0 1 0; 0 0 1") == 2  # each member's own #G3
+        assert shown.count("  xrayutilities matrix: 2 0 0; 0 2 0; 0 0 2") == 2  # the given one is used
+        assert "Solid angle: off" in shown
+    finally:
+        _close(page, qapp)

@@ -1388,6 +1388,27 @@ def _partner_orientation(acquisition):
                             flip_horizontal=bool(acquisition.get("image_flip", False)))
 
 
+def _calibration_arm_corrections(receipt):
+    """A refined version-3 calibration's corrections, whose attested pyFAI arm gives RSM's solid angle
+    (``EXTENDED_SOLID_ANGLE_POLICY``); None where the untilted formula about the beam pixel applies (the canonical
+    asset, the refinement off, or a version-2 partner, which records no arm)."""
+    if type(receipt) is not RSMCalibrationGeometryReceipt or not receipt.refinement:
+        return None
+    from xrd_tools.analysis.xu_stitch_calibration import EXTENDED_SOLID_ANGLE_POLICY
+    from xrd_tools.integrate.xu_stitch import _thaw
+
+    corrections = _thaw(receipt.calibration.projection.value["corrections"])
+    return corrections if corrections.get("solid_angle_policy") == EXTENDED_SOLID_ANGLE_POLICY else None
+
+
+def rsm_calibration_solid_angle_source(receipt) -> str:
+    """Where RSM's solid angle comes from, in words, for the Preview (``rsm_calibration_solid_angle``'s own rule):
+    the refined calibration's arm, or the untilted formula about the beam pixel."""
+    if _calibration_arm_corrections(receipt) is not None:
+        return "the refined calibration's arm (its mount, as Stitch's weight), the same at every pose"
+    return "the untilted formula about the beam pixel"
+
+
 def rsm_calibration_solid_angle(receipt) -> np.ndarray | None:
     """The solid-angle weight of a refined version-3 calibration, in the raw frame RSM reads, read-only: Stitch's
     own per-frame weight from the attested pyFAI arm (``_extended_solid_angle``), with the calibrant's sample
@@ -1398,15 +1419,12 @@ def rsm_calibration_solid_angle(receipt) -> np.ndarray | None:
     about which the untilted formula is centred (the arm's tilt and roll themselves leave the weight unchanged;
     measured, ``logs/s3c-solid-angle-arm.log``). None (the untilted formula applies): the canonical asset, the
     refinement off, or a version-2 partner, which records no arm."""
-    if type(receipt) is not RSMCalibrationGeometryReceipt or not receipt.refinement:
+    corrections = _calibration_arm_corrections(receipt)
+    if corrections is None:
         return None
-    from xrd_tools.analysis.xu_stitch_calibration import EXTENDED_SOLID_ANGLE_POLICY
-    from xrd_tools.integrate.xu_stitch import XuStitchScienceRefused, _extended_solid_angle, _thaw
+    from xrd_tools.integrate.xu_stitch import XuStitchScienceRefused, _extended_solid_angle
 
     value = receipt.calibration.projection.value
-    corrections = _thaw(value["corrections"])
-    if corrections.get("solid_angle_policy") != EXTENDED_SOLID_ANGLE_POLICY:
-        return None
     shape = tuple(int(item) for item in value["detector"]["shape"])
     try:
         turned = _extended_solid_angle(corrections, shape, sample_offset=False)(0.0, 0.0)

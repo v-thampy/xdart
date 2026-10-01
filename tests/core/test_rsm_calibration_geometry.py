@@ -375,6 +375,11 @@ def test_the_solid_angle_follows_the_calibrations_mount_as_stitchs_arm(tmp_path,
     v2 = capture_rsm_calibration_geometry(_write_partner(tmp_path, rotation=0, cch=(4., 6.)).name,
                                           project_root=tmp_path)
     assert all(rsm_calibration_solid_angle(item) is None for item in (off, v2, None))
+    # the Preview names the same source (G8b), by the same rule
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_solid_angle_source
+    assert rsm_calibration_solid_angle_source(receipt).startswith("the refined calibration's arm")
+    assert {rsm_calibration_solid_angle_source(item) for item in (off, v2, None)} == {
+        "the untilted formula about the beam pixel"}
     off_state = _rsm_correction_state(plan, lower_rsm_effective_geometry(off).detector_header,
                                       effective.diffractometer_projection, off)
     assert np.array_equal(off_state.solid, untilted)

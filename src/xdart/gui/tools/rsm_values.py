@@ -32,6 +32,7 @@ from xrd_tools.analysis.rsm_geometry_asset import (
     capture_rsm_calibration_geometry,
     capture_rsm_geometry_asset,
     lower_rsm_effective_geometry,
+    rsm_calibration_solid_angle_source,
 )
 from xrd_tools.analysis.rsm_operation import (
     RSMDetectorGeometry,
@@ -1520,6 +1521,9 @@ class RSMToolPreflightMemberSummaryV2:
     source_entry: str | None = None
     #: where the UB came from (decision 2: #G3, or recomputed in the instrument's directions); None in Q
     ub_origin: str | None = None
+    #: beside a UB given for an HKL map, the member's own as its source records it (the Preview shows both): its
+    #: nine numbers, or what it lacks; None when no UB is given. Display only, outside the summary's identity.
+    source_ub: str | None = None
 
     def __post_init__(self, _claim: object) -> None:
         hashes = (
@@ -1633,6 +1637,12 @@ class RSMToolPreflightSummaryV2:
     calibration: tuple[bool, float, float] | None = None
     #: where the circle directions came from (decision 2): a calibration's instrument record, or psic's standard
     circle_directions: str | None = None
+    #: Display only, outside the summary's identity (G8b): where the solid angle comes from
+    #: (``rsm_calibration_solid_angle_source``; None when it is off), the calibrated detector's own mask as
+    #: (masked pixels, detector pixels) (None when it has none), and a UB given for an HKL map, in words.
+    solid_angle: str | None = None
+    detector_mask: tuple[int, int] | None = None
+    ub_given: str | None = None
     fingerprint: str = field(init=False)
     _claim: InitVar[object] = None
 
@@ -2010,6 +2020,7 @@ def prepare_rsm_tool_v2(
             str(error),
         ) from error
 
+    given = request.plan.ub_override  # a UB given for an HKL map (RSMBoundUB), None for the sources' own
     member_summaries = tuple(
         RSMToolPreflightMemberSummaryV2(
             item.ordinal,
@@ -2042,10 +2053,12 @@ def prepare_rsm_tool_v2(
             _PREFLIGHT_V2_FACTORY,
             json.loads(item.source_options_json).get("entry"),
             item.ub_origin,
+            source_ub=None if given is None else _source_ub_text(member),
         )
-        for item, source in zip(
+        for item, source, member in zip(
             request.preflight.members,
             request.module.source.members,
+            form.members,
             strict=True,
         )
     )
@@ -2089,6 +2102,13 @@ def prepare_rsm_tool_v2(
                   request.preflight.effective_geometry.energy_offset_eV,
                   request.preflight.effective_geometry.calibration_energy_eV)),
         circle_directions=request.preflight.effective_geometry.circle_directions,
+        solid_angle=(None if form.corrections is None or not form.corrections.solid_angle
+                     else rsm_calibration_solid_angle_source(request.preflight.geometry_asset_receipt)),
+        detector_mask=(None if request.plan.detector_mask is None
+                       else (int(np.count_nonzero(request.plan.detector_mask)), int(request.plan.detector_mask.size))),
+        ub_given=None if given is None else (
+            "typed, in SPEC's #G3 convention" if given.spec_receipt is None
+            else f"scan {given.spec_receipt[4]} of {given.spec_receipt[0]} (its #G3)") + f": {_ub_text(given.matrix)}",
         _claim=_PREFLIGHT_V2_FACTORY,
     )
     return RSMToolPreflightV2(
@@ -2108,6 +2128,20 @@ def _rsm_member_energy_lines(recorded: float, calibration) -> tuple[str, ...]:
         lines.append(f"  ⚠ recorded {100 * abs(recorded - calibration_energy) / calibration_energy:.1f} % from the "
                      f"calibration's {calibration_energy:.12g} eV: the energy offset is exact only near it")
     return tuple(lines)
+
+
+def _ub_text(values) -> str:
+    """Nine numbers row by row, as the Preview writes a matrix ("a b c; d e f; g h i")."""
+    return "; ".join(" ".join(f"{float(value):.10g}" for value in values[row:row + 3]) for row in (0, 3, 6))
+
+
+def _source_ub_text(member) -> str:
+    """A member's own UB beside a given one, in the Preview's words (``rsm_member_source_ub``)."""
+    try:
+        own = rsm_member_source_ub(member)
+    except (OSError, KeyError, ValueError) as error:
+        return f"unreadable ({error})"
+    return "none recorded" if own is None else "a #G3 that does not parse" if not own else _ub_text(own)
 
 
 def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]:
@@ -2176,6 +2210,12 @@ def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]
             f"{summary.normalization_divisor_range[1]:.12g}"
         ),
         f"Mask intent: {summary.mask_intent}",
+        f"Solid angle: {summary.solid_angle or 'off'}",
+        ("Detector mask: none" if summary.detector_mask is None else
+         f"Detector mask: the calibrated detector's own, {summary.detector_mask[0]} of {summary.detector_mask[1]} "
+         "pixels (its gaps), on every frame"),
+        *(() if summary.ub_given is None or frame is not RSMCoordinateFrame.HKL else (
+            f"UB given: {summary.ub_given}, in place of the sources' own (each member's below)",)),
         f"Group source: {summary.group_source_fingerprint}",
         f"Group preflight: {summary.group_preflight_fingerprint}",
         f"Plan: {summary.plan_fingerprint}",
@@ -2209,7 +2249,9 @@ def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]
                     "  UB: the NeXus entry's own, read in SPEC's #G3 convention (2π included, as xdart writes "
                     "it), unless one is given",)),
                 *(() if member.ub_origin is None or frame is not RSMCoordinateFrame.HKL else (
-                    f"  UB: {member.ub_origin}",)),
+                    f"  UB: {member.ub_origin}",)),  # #G3, and its cross-check (decision 2)
+                *(() if member.source_ub is None or frame is not RSMCoordinateFrame.HKL else (
+                    f"  UB the source records: {member.source_ub}",)),
                 f"  labels: {member.selected_labels}",
                 f"  form: {member.member_form_fingerprint}",
                 f"  module source: {member.module_source_fingerprint}",
