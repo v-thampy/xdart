@@ -10,6 +10,7 @@ from pyqtgraph.Qt import QtWidgets
 
 from xdart.gui.pages.operation_owner import OperationCancelled
 from xdart.gui.pages.services import empty_host_services
+from xdart.gui.pages.values import PageCleanup
 from xdart.gui.tabs.stitch.calibration import StitchCalibrationDialog, _run_job
 from xdart.gui.tabs.stitch.page import StitchPage
 from xrd_tools.core.geometry.stacked_arm import EXTENDED_ARM_MARKER
@@ -827,3 +828,38 @@ def test_a_saved_calibration_is_named_after_its_scan_and_never_over_another(qapp
         assert dialog._save_path() is None and proposed == [str(folder / 'LaB6_17keV_scan14_3.json')]
     finally:
         dialog.close()
+
+
+def test_a_frame_staged_with_another_camera_is_not_calibrated(qapp, tmp_path, monkeypatch):
+    """Codex's round-2 review F3: after a camera change, calibrating a frame staged with the old camera would
+    hand pyFAI the mask turned for the new camera beside the image turned for the old one (Codex's fixture:
+    mask pixel (0, 0) arrives at (0, 9) under camera (x-, z-)). It is refused before anything launches, with
+    the Fit's own message."""
+    import tifffile
+    from xrd_tools.core.geometry.camera import DetectorCamera
+    from xrd_tools.integrate.stitch_calibration import CalibrationFrame, calibration_image_identity
+    pixels = np.ones((8, 10), dtype=np.uint16)
+    path = tmp_path / "staged.tif"
+    tifffile.imwrite(path, pixels)
+    shape, digest = calibration_image_identity(pixels)
+    frame = CalibrationFrame("one", str(path), "image_file", {}, 0, str(path), 0,
+                             str(path), digest, shape, 0, {"del": 0., "nu": 0.}, 12000.)
+    mask = np.zeros(shape, bool)
+    mask[0, 0] = True
+    np.save(tmp_path / "mask.npy", mask)
+    dialog = StitchCalibrationDialog(tmp_path)
+    started = []
+    monkeypatch.setattr(dialog, "_start", lambda kind, payload: started.append(kind))
+    try:
+        dialog.frames = (frame,)
+        dialog._frame_motors = ("del", "nu")
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData("skip"))
+        dialog._set_field_text("mask", str(tmp_path / "mask.npy"))
+        dialog.camera.set_value(DetectorCamera("x-", "z-"))
+        assert dialog._staged_camera_message()
+        dialog._calibrate()
+        assert started == [] and dialog.status.text() == dialog._staged_camera_message()
+    finally:
+        assert dialog.shutdown().status is PageCleanup.CLEAN
+        dialog.close()
+        dialog.deleteLater()

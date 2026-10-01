@@ -1530,6 +1530,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _calibrate(self):
         def start():
+            if self._staged_camera_message():  # the mask would be turned for this camera, the frame for its own
+                raise ValueError(self._staged_camera_message())  # (Codex round-2 review F3; the Fit's refusal)
             frame, seed = self._selected_frame(), {**self._seed_options(), 'mask': self._pyfai_mask()}
             if not _frame_energy_known(frame, seed):
                 raise ValueError(f'frame {frame.identity}: its scan records no energy; type the wavelength '
