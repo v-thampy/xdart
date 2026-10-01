@@ -20,6 +20,7 @@ from xdart.gui.tabs.rsm import page as page_module
 from xdart.gui.tabs.rsm.page import RSMPage, suggested_output
 from xdart.gui.tabs.rsm.display import rsm_keyed_projection
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
+from xdart.gui.tabs.scattering.controls_inventory import THRESHOLD_ENABLED, THRESHOLD_MAX, THRESHOLD_MIN
 from xdart.gui.tools import rsm_owner
 from xdart.gui.tools.rsm_tool import RSMToolDialog
 from xrd_tools.analysis.module_transaction import ModuleDisposition, ModuleTerminalResult
@@ -81,8 +82,15 @@ def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
     fingerprint names every member, selector, grid, frame and the output), for HKL and for Cartesian Q; the
     page's replaces its own result (stage 2), the dialog's creates a new one, the page's geometry is its
     Calibration row's where the dialog installs the canonical asset (stage 2b C7b), and the page's Max chunk
-    MiB is Auto where the dialog's is the preset's 256 (stage 2b S3a)."""
+    MiB is Auto where the dialog's is the preset's 256 (stage 2b S3a). The page's threshold is Int's (Auto by
+    default, as Stitch's), its "High → NaN" retired into Int's Manual High (G8b): the dialog's form takes the
+    same in ``_as_page``."""
     from dataclasses import replace as replaced
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+
+    def _as_page(form, **fields):
+        return replaced(form, conditioning=replaced(form.conditioning, high_threshold=None),
+                        corrections=replaced(form.corrections, threshold=StitchConditioning("auto")), **fields)
     page = _page(qapp, owner=_Owner())
     dialog = RSMToolDialog(empty_host_services(_Status()), owner=_Owner())
     try:
@@ -100,17 +108,17 @@ def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
         dialog._apply_scan43_preset()
         dialog.output_edit.setText(str(output))
         geometry = page.build_form().geometry_asset
-        assert page.build_form().fingerprint == replaced(
+        assert page.build_form().fingerprint == _as_page(
             dialog._build_form(), overwrite=AnalysisArtifactOverwrite.REPLACE, geometry_asset=geometry,
             max_chunk_bytes=None).fingerprint
         page.set_field("coordinates", RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name)
         page.set_field("grid", "Full 200×200×200")
-        page.set_field("normalization", "Identity")
+        page.set_field("normalization", "None")
         dialog.coordinate_frame_combo.setCurrentIndex(
             dialog.coordinate_frame_combo.findData(RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU))
         dialog.grid_combo.setCurrentIndex(1)
         dialog.normalization_combo.setCurrentIndex(1)
-        assert page.build_form().fingerprint == replaced(
+        assert page.build_form().fingerprint == _as_page(
             dialog._build_form(), overwrite=AnalysisArtifactOverwrite.REPLACE, geometry_asset=geometry,
             max_chunk_bytes=None).fingerprint
     finally:
@@ -168,9 +176,9 @@ def _with_source(page, root, scans="[1-2]"):
     page.set_field("scan", scans)
     page.set_field("image_dir", "source/images")
     page.set_field("adv_dtype", "uint16")
-    page.set_field("normalization", "Identity")
+    page.set_field("normalization", "None")  # the Normalization group's None (decision 4)
     page.set_field("offset", "0")
-    page.set_field("high_threshold", "")
+    page._threshold_edited(THRESHOLD_ENABLED, False)  # Int's threshold off ("High → NaN" blank before)
     page.set_field("static_hot", "")
     page.resolve_source()
 
@@ -397,7 +405,9 @@ def test_scan43_through_the_page_commits_and_reopens_the_reference_result(qapp, 
         assert page._readiness[1], page._readiness
         page.resolve_source()
         form = page.build_form()
-        assert form.corrections == RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
+        from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+        assert form.corrections == RSMFrameCorrections(threshold=StitchConditioning("auto"), solid_angle=True,
+                                                       polarization_factor=0.99)
         headless = Path(rsm_r2_project) / "rsm-page-headless.nexus"
         off = run_rsm_operation_v2(prepare_rsm_tool_v2(replace(
             form, output_path=headless, output_family=None, corrections=RSMFrameCorrections())).request)
@@ -459,7 +469,8 @@ def test_the_advanced_settings_are_ints_advanced_dialog_of_shared_rows(qapp, tmp
         _with_source(page, tmp_path)
         assert isinstance(page.advanced, AdvancedDialog) and not page.advanced.isModal()
         cards = {card.title.text(): card for card in page.advanced.findChildren(SubsectionCard)}
-        assert set(cards) == {"Source and geometry", "Normalization column occurrences", "Chunk and memory"}
+        assert set(cards) == {"Source and geometry", "Normalization column occurrences", "Corrections",
+                              "Chunk and memory"}
         page.set_field("adv_foil_occurrence", "-1")  # a normalization occurrence is Processing's
         assert "Advanced Foil column occurrence" in page._headers["processing"].detail
         page.set_field("adv_foil_occurrence", "0")
@@ -1148,7 +1159,7 @@ def test_a_raw_nexus_source_is_one_rsm_named_by_its_entry(qapp, tmp_path):
         page.set_field("geometry_path", "calibration/rsm_canonical.json")
         page.set_field("source_kind", "NeXus")
         page.set_sources([str(nexus)])
-        page.set_field("normalization", "Identity")
+        page.set_field("normalization", "None")
         assert page._readiness[1], page._readiness
         assert Path(page._value("output_path")).name == "member_ub_rsm.nexus"
         page.begin_preview()
@@ -1197,3 +1208,93 @@ def test_preview_and_run_find_the_scans_off_the_gui_thread(qapp, tmp_path, monke
         assert len(threads) == 2 and all(thread is not threading.main_thread() for thread in threads)
     finally:
         _close(page, qapp)
+
+
+def test_processing_takes_ints_threshold_and_the_shared_normalization_group(qapp, tmp_path):
+    """G8b (design §2; the maintainer, 2026-10-01: "Other processing options like thresholding, monitor etc should
+    also apply"): the Conditioning rows are laid out by Int's processing composer. Int's Threshold is its RangeRow
+    driven by Int's transitions, Auto by default as Stitch's, and it is the run's ``RSMFrameCorrections.threshold``;
+    "High → NaN" is its Manual High now, so the conditioning's own high threshold is None. The one Normalization
+    group Stitch has (decision 4's four choices) maps onto RSM's policy: its columns are the first scan's counters,
+    the occurrences Advanced's, the rows a choice does not read greyed, and a missing column is named."""
+    from xdart.gui.tools import normalization_values as normalization
+    from xdart.gui.widgets.controls_panel import RangeRow
+    from xrd_tools.analysis.module_transaction import MetadataColumnSelector
+    from xrd_tools.analysis.rsm_operation import RSMNormalizationMode, RSMNormalizationPolicy
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    page = _page(qapp)
+    try:
+        assert isinstance(page.threshold_range, RangeRow)  # Int's composer's row
+        assert page._threshold_policy() == StitchConditioning("auto")  # Auto by default, as Stitch's
+        default = page._normalization_policy()  # the preset's foil transmission × exposure
+        assert (default.mode, default.foil_selector, default.exposure_selector, default.absorption_lengths) == (
+            RSMNormalizationMode.FOIL_TRANSMISSION_EXPOSURE, MetadataColumnSelector("foil status", 0),
+            MetadataColumnSelector("Seconds", 0), (1.06, 3.04, 4.65, 9.5))
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)  # Normalization None, the threshold off
+        form = page.build_form()
+        assert form.normalization == RSMNormalizationPolicy.identity()
+        assert form.corrections.threshold is None and form.conditioning.high_threshold is None
+        page._threshold_edited(THRESHOLD_MAX, 50000.0)  # a High makes it manual, as Int's
+        threshold = page.build_form().corrections.threshold
+        assert (threshold.mode, threshold.threshold_max) == ("manual", 50000.0)
+        assert page.build_form().conditioning.high_threshold is None
+        assert "Seconds" in page._fields["monitor"].choices  # the first scan's counters
+        page.set_sources([])  # a Browse pick refreshes them (Stitch's _source_committed)
+        assert "Seconds" not in page._fields["monitor"].choices
+        page.set_sources(["source/RSM_synth"])  # a relative SPEC file is the Project's, as the run reads it
+        assert "Seconds" in page._fields["monitor"].choices
+        page.resolve_source()
+        page.set_field("normalization", normalization.MONITOR)
+        assert "Normalization: a monitor column" in page._headers["processing"].detail
+        assert not page._fields["foil_column"].enabled  # the rows the choice does not read, greyed
+        page.controls.set_editors_enabled(False)  # a run locks the rows and unlocks them (Codex's F2) ...
+        page.controls.set_editors_enabled(True)
+        foil, monitor = page._rows["foil_column"].editor, page._rows["monitor"].editor
+        assert not foil.isEnabled() and monitor.isEnabled()  # ... the greyed row stays greyed
+        page.set_field("monitor", "Seconds")
+        page.set_field("adv_monitor_occurrence", "1")
+        assert page._readiness[1], page._readiness
+        assert page.build_form().normalization == RSMNormalizationPolicy(
+            RSMNormalizationMode.MONITOR, None, None, (0.0, 0.0, 0.0, 0.0),
+            monitor_selector=MetadataColumnSelector("Seconds", 1))
+        page.set_field("normalization", normalization.MONITOR_FOIL)  # a monitor before the foils
+        policy = page.build_form().normalization
+        assert (policy.mode, policy.foil_selector, policy.exposure_selector, policy.monitor_selector) == (
+            RSMNormalizationMode.MONITOR_FOIL_TRANSMISSION, MetadataColumnSelector("foil status", 0), None,
+            MetadataColumnSelector("Seconds", 1))
+    finally:
+        page.close_page()
+
+
+def test_advanced_corrections_reach_the_runs_frame_corrections(qapp, tmp_path):
+    """G8b: Advanced's Corrections group of shared rows: solid angle and polarization (0.99) on by default
+    (decision 5), the dark, the flat and its cutoff, each reaching the run's ``RSMFrameCorrections``; a refused
+    value, or a named file that is not there, is named in the Processing header."""
+    page = _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        corrections = page.build_form().corrections
+        assert (corrections.solid_angle, corrections.polarization_factor, corrections.flat_min_fraction,
+                corrections.dark_path, corrections.flat_path) == (True, 0.99, 0.1, None, None)
+        np.save(tmp_path / "dark.npy", np.zeros((4, 5)))
+        np.save(tmp_path / "flat.npy", np.ones((4, 5)))
+        for key, value in (("dark_path", "dark.npy"), ("flat_path", "flat.npy"), ("adv_flat_cutoff", "20"),
+                           ("adv_polarization", ""), ("adv_solid_angle", "Off")):
+            page.set_field(key, value)
+        assert page._readiness[1], page._readiness
+        corrections = page.build_form().corrections
+        assert (corrections.dark_path, corrections.flat_path) == (str(tmp_path / "dark.npy"),
+                                                                  str(tmp_path / "flat.npy"))
+        assert (corrections.flat_min_fraction, corrections.polarization_factor, corrections.solid_angle) == (
+            0.2, None, False)
+        page.set_field("adv_polarization", "2")
+        assert "Advanced Polarization" in page._headers["processing"].detail and not page._readiness[1]
+        with pytest.raises(ValueError, match="Polarization"):
+            page.build_form()
+        page.set_field("adv_polarization", "0.5")
+        page.set_field("dark_path", "missing.npy")
+        assert "the Dark (missing.npy not found)" in page._headers["processing"].detail
+    finally:
+        page.close_page()

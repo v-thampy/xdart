@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import replace
 import logging
+import math
 from pathlib import Path
 import re
 
@@ -39,6 +40,7 @@ from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.controls_inventory import (
     MASK_FILE, PONI_FILE, SOURCE_DIRECTORY, SOURCE_FILTER, SOURCE_RECURSIVE, SOURCE_TYPE,
+    THRESHOLD_ENABLED, THRESHOLD_MAX, THRESHOLD_MIN,
 )
 from xdart.gui.tabs.scattering.controls_readiness import SectionHeaderProjection
 from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
@@ -51,7 +53,8 @@ from xdart.gui.tools.rsm_values import (
     RSMToolFormV2, format_rsm_angle_mapping, parse_rsm_angle_mapping, rsm_frame_selector,
     rsm_preflight_summary_lines, rsm_tool_preset,
 )
-from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow
+from xdart.gui.tools import normalization_values as normalization
+from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow, SubsectionCard
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
 from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
@@ -64,13 +67,12 @@ from xrd_tools.session.readiness import (
     ControlAction, ControlActionSpec, ControlFieldKind, ControlFormField, SectionId,
 )
 from xrd_tools.session.rsm_viewer_model import RSMViewerModel, make_rsm_viewer_values
+from xrd_tools.session.threshold_editing import ThresholdEditRefusal, ThresholdState, threshold_transition
 
 _LOG = logging.getLogger(__name__)
 _MIB = 1024 * 1024
 #: The grids the RSM dialog offers (the scan-43 preset's quick and full).
 _GRIDS = {"Quick 40×40×40": (40, 40, 40), "Full 200×200×200": (200, 200, 200)}
-_NORMALIZATIONS = {"Foil transmission / exposure": RSMNormalizationMode.FOIL_TRANSMISSION_EXPOSURE,
-                   "Identity": RSMNormalizationMode.IDENTITY}
 _FRAMES = {frame.display_name: frame for frame in RSMCoordinateFrame}
 #: The run bar's modes this page runs.
 _RSM_MODES = ("RSM",)
@@ -96,15 +98,28 @@ _FIELDS = (
     (SectionId.PROCESSING, "coordinates", "Coordinates", RSMCoordinateFrame.HKL.display_name, tuple(_FRAMES),
      False),
     (SectionId.PROCESSING, "grid", "Grid", "Quick 40×40×40", tuple(_GRIDS), False),
-    (SectionId.PROCESSING, "normalization", "Normalization", "Foil transmission / exposure",
-     tuple(_NORMALIZATIONS), False),
-    (SectionId.PROCESSING, "foil", "Foil column", "foil status", (), False),
-    (SectionId.PROCESSING, "exposure", "Exposure column", "Seconds", (), False),
-    (SectionId.PROCESSING, "absorption", "Foil absorption", "1.06, 3.04, 4.65, 9.5", (), False),
-    (SectionId.PROCESSING, "offset", "Offset", "1e-06", (), False),
-    (SectionId.PROCESSING, "high_threshold", "High → NaN", "20000000000", (), False),
-    (SectionId.PROCESSING, "static_hot", "All-frame hot", "100", (), False),
 )
+#: The Conditioning rows Int's processing composer lays out (design §2; the maintainer: "Other processing
+#: options like thresholding, monitor etc should also apply"): Int's Threshold (its RangeRow; "High → NaN" is
+#: its Manual maximum now), RSM's Offset and All-frame hot, and the one Normalization group Stitch has
+#: (``normalization_values``; decision 4's four choices). (key, path, label, default).
+_CONDITIONING = (
+    ("threshold_enabled", THRESHOLD_ENABLED, "Threshold", True),
+    ("threshold_min", THRESHOLD_MIN, "Threshold Low", 0.0),
+    ("threshold", THRESHOLD_MAX, "Threshold High", None),
+    ("offset", ("RSM", "offset"), "Offset", "1e-06"),
+    ("static_hot", ("RSM", "static_hot"), "All-frame hot", "100"),
+    ("normalization", ("RSM", "normalization"), "Normalization", normalization.FOIL_EXPOSURE),
+    ("monitor", ("RSM", "monitor"), "Monitor", "None"),
+    ("foil_column", ("RSM", "foil_column"), "Foil column", normalization.DEFAULT_FOIL_COLUMN),
+    ("exposure_column", ("RSM", "exposure_column"), "Exposure column", normalization.DEFAULT_EXPOSURE_COLUMN),
+    ("foil_lengths", ("RSM", "foil_lengths"), "Foil absorption", normalization.DEFAULT_FOIL_LENGTHS),
+)
+#: The Normalization group's choices as RSM's modes (decision 4).
+_NORMALIZATION_MODES = {normalization.NONE: RSMNormalizationMode.IDENTITY,
+                        normalization.MONITOR: RSMNormalizationMode.MONITOR,
+                        normalization.FOIL_EXPOSURE: RSMNormalizationMode.FOIL_TRANSMISSION_EXPOSURE,
+                        normalization.MONITOR_FOIL: RSMNormalizationMode.MONITOR_FOIL_TRANSMISSION}
 #: The whole-number rows (FormRow kind "int"): (minimum, maximum, blank allowed). The row outlines a refused
 #: text; ``rsm_values`` stays the authority that refuses it (Codex's stage-1 review F1). The frame range is
 #: Stitch's one range for every member, in Advanced (design §2).
@@ -113,6 +128,7 @@ _INTEGER_FIELDS = {"frame_first": (0, None, False), "frame_last": (0, None, True
                    "adv_rows": (2, 1_000_000, False), "adv_columns": (2, 1_000_000, False),
                    "adv_header": (0, 1 << 30, False),
                    "adv_foil_occurrence": (0, 1024, False), "adv_exposure_occurrence": (0, 1024, False),
+                   "adv_monitor_occurrence": (0, 1024, False),
                    "adv_chunk": (1, 1024, False), "adv_max_frame_mib": (1, 4096, False),
                    "adv_max_chunk_mib": (1, 4096, True)}
 #: Stitch's Source kinds (the maintainer: "nexus files as source as well. And directory mode just like stitch").
@@ -330,6 +346,7 @@ class RSMPage(QtWidgets.QWidget):
         self._build_source()  # and its Source rows
         for section, key, label, value, choices, browse in _FIELDS:
             cards[section].add_row(self._row(section, key, label, value, choices, browse))
+        self._build_conditioning()
         buttons = self.controls.render_actions(self.controls.processing_card, tuple(
             ControlActionSpec(action, label, SectionId.PROCESSING) for action, label in (
                 (ControlAction.PREVIEW, "Preview"), (ControlAction.RETRY, "Retry"),
@@ -347,6 +364,171 @@ class RSMPage(QtWidgets.QWidget):
         self.preview_text.setReadOnly(True)
         preview_layout.addWidget(self.preview_text)
         self.preview_dialog.resize(760, 560)
+
+    def _build_conditioning(self):
+        """Int's Conditioning rows, laid out by Int's processing composer: the Threshold (Int's RangeRow, driven by
+        Int's transitions; Auto by default, as Stitch's: the calibrated detector's saturation), RSM's Offset and
+        All-frame hot, and the one Normalization group Stitch has (decision 4's four choices, the rows a choice
+        does not read greyed)."""
+        self._threshold_state = ThresholdState()  # Auto: the saturation mask, Stitch's default
+        for key, path, label, value in _CONDITIONING:
+            self._fields[key] = self._new_field(
+                SectionId.PROCESSING, key, label, value,
+                normalization.NORMALIZATION_CHOICES if key == "normalization"
+                else ("None",) if key in ("monitor", "foil_column", "exposure_column") else (), path=path)
+        card = SubsectionCard("Conditioning", accent="processing")
+        self.controls.processing_card.add_row(card)
+        fields = self._conditioning_fields()
+        rows = self.controls.render_processing_rows(card, tuple(fields[key] for key, *_rest in _CONDITIONING))
+        self.threshold_range = rows[THRESHOLD_MIN]
+        self.threshold_range.valueChanged.connect(self._threshold_edited)
+        for key, path, _label, _value in _CONDITIONING:
+            if path not in (THRESHOLD_ENABLED, THRESHOLD_MIN, THRESHOLD_MAX):
+                self._bind(key, fields[key], rows[path])
+        self._render_threshold()
+        self.threshold_range.setToolTip(
+            "Int's Threshold: Auto masks each frame's saturated pixels (the calibrated detector's ceiling); a "
+            "Low or High makes it manual, masking what lies outside; off masks nothing.")
+        self._tip("offset", "Added to every pixel before the threshold and the divisor (the notebook's step).")
+        self._tip("static_hot", "Masks a pixel hot in every selected frame (counts above this in all of them); "
+                                "blank: none.")
+        for key in normalization.NORMALIZATION_KEYS:
+            self._tip(key, normalization.TIPS[key])
+
+    def _conditioning_fields(self):
+        """The Conditioning fields as Int's composer and rows take them: the Threshold from Int's transitions'
+        state, and the Normalization group projected (``normalization_fields``) over the first selected scan's
+        counters, the value chosen kept whatever that scan records."""
+        state = self._threshold_state
+        fields = {key: self._fields[key] for key, *_rest in _CONDITIONING}
+        fields["threshold_enabled"] = replace(fields["threshold_enabled"],
+                                              value=state.apply_threshold or state.mask_saturation)
+        fields["threshold_min"] = replace(fields["threshold_min"],
+                                          value=0.0 if state.threshold_min is None else state.threshold_min)
+        fields["threshold"] = replace(
+            fields["threshold"], placeholder="Auto · the detector's saturation",
+            value=(state.threshold_max if state.threshold_max is not None or state.apply_threshold else None))
+        values = {key: (self._value(key) if key in self._rows else self._fields[key].value)
+                  for key in normalization.NORMALIZATION_KEYS}
+        columns = self._scan_columns()
+        keep = str(values["monitor"] or "").strip() or normalization.NONE
+        monitors = normalization.monitor_choices(columns)  # the shared group's, as Stitch's
+        base = {**self._fields, "monitor": replace(
+            self._fields["monitor"], choices=monitors if keep in monitors else (*monitors, keep))}
+        fields.update(normalization.normalization_fields(base, values, columns))
+        return fields
+
+    def _render_threshold(self):
+        """The Threshold row from Int's transitions' state (Int's same-schema update)."""
+        self.threshold_range.apply_fields({field.path: field for field in self._conditioning_fields().values()})
+        self.threshold_range.label.setText("Threshold")
+
+    def _threshold_edited(self, path, value):
+        """Int's threshold transitions (``threshold_editing``), as Stitch's: the Low, High or toggle."""
+        field = {THRESHOLD_MIN: "min", THRESHOLD_MAX: "max", THRESHOLD_ENABLED: "enabled"}.get(tuple(path))
+        if field is None:
+            return
+        result = threshold_transition(self._threshold_state, field, value, None)
+        if isinstance(result, ThresholdEditRefusal):
+            self._render_threshold()
+            self._status(result.reason, ready=False)
+            return
+        if result is not None:
+            self._threshold_state = result
+        self._render_threshold()
+        if result is not None:
+            self._edited()
+
+    def _threshold_policy(self):
+        """Int's threshold policy for the run (``RSMFrameCorrections.threshold``): None when off."""
+        from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+        state = self._threshold_state
+        if state.apply_threshold:
+            return StitchConditioning("manual", state.threshold_min, state.threshold_max)
+        return StitchConditioning("auto") if state.mask_saturation else None
+
+    def _first_spec_scan(self):
+        """(the first SPEC file, a relative one inside the Project as the run reads it, the first selected scan's
+        N.M key, None: the file's first), or None for another source kind (Stitch's rule)."""
+        if self._value("source_kind") != "Spec" or not self._source_paths:
+            return None
+        path = Path(self._source_paths[0]).expanduser()
+        project = str(self._value("project_root")).strip()
+        if not path.is_absolute() and project:
+            path = Path(project).expanduser() / path
+        first = re.search(r"\d+(?:\.\d+)?", str(self._value("scan") or ""))
+        return str(path), (None if self._value("scan_mode") == "All Scans" or first is None
+                           else first[0] if "." in first[0] else f"{first[0]}.1")
+
+    def _scan_columns(self):
+        """The first selected SPEC scan's counters (the shared group's header read, cached by the file's state),
+        for the Normalization group's columns; none for a NeXus or Directory source (the value chosen stays its
+        one choice)."""
+        first = self._first_spec_scan()
+        if first is None:
+            return ()
+        try:
+            state = Path(first[0]).stat()
+        except OSError:
+            return ()
+        return normalization.spec_counter_names(first[0], (state.st_mtime_ns, state.st_size), first[1]) or ()
+
+    def _refresh_normalization(self):
+        """A committed Source or Normalization edit: the group's columns and what its choice greys."""
+        fields = self._conditioning_fields()
+        for key in normalization.NORMALIZATION_KEYS:
+            self._fields[key] = fields[key]
+            self._rows[key].apply_field(fields[key])
+
+    def _normalization_policy(self):
+        """The Normalization group's choice as RSM's policy (decision 4); the columns' occurrences are Advanced's.
+        ValueError names what the choice still needs."""
+        value = self._value
+        chosen = normalization.normalization_selection(value("normalization"), value("monitor"),
+                                                       value("foil_column"), value("exposure_column"),
+                                                       value("foil_lengths"))
+        mode = _NORMALIZATION_MODES[chosen.choice]
+        if mode is RSMNormalizationMode.IDENTITY:
+            return RSMNormalizationPolicy.identity()
+
+        def column(name, key):
+            return None if name is None else MetadataColumnSelector(name, int(value(key)))
+        return RSMNormalizationPolicy(
+            mode, column(chosen.foil, "adv_foil_occurrence"), column(chosen.exposure, "adv_exposure_occurrence"),
+            chosen.lengths or (0.0, 0.0, 0.0, 0.0),
+            monitor_selector=column(chosen.monitor, "adv_monitor_occurrence"))
+
+    def _correction_values(self):
+        """Advanced Corrections' solid angle, polarization factor and flat cutoff (a fraction), read as Stitch's
+        rows are (a blank polarization is none, a blank cutoff Int's 10 %); ValueError names a refused one."""
+        text = str(self._value("adv_polarization")).strip()
+        try:
+            factor = None if not text else float(text)
+        except ValueError:
+            factor = math.nan
+        if factor is not None and not (math.isfinite(factor) and -1 <= factor <= 1):
+            raise ValueError("Polarization (a number from -1 to 1, or blank for none)")
+        text = str(self._value("adv_flat_cutoff")).strip()
+        try:
+            cutoff = float(text) / 100 if text else 0.1
+        except ValueError:
+            cutoff = math.nan
+        if not (math.isfinite(cutoff) and 0 <= cutoff < 1):
+            raise ValueError("Flat cutoff (a percentage from 0 to below 100)")
+        return self._value("adv_solid_angle") == "On", factor, cutoff
+
+    def _corrections(self, root):
+        """The run's per-frame corrections (C4): the Mask File, Int's threshold, Advanced's dark, flat and
+        cutoff, the solid angle and the polarization (decision 5: both on by default)."""
+        solid_angle, factor, cutoff = self._correction_values()
+
+        def inside(key, what):
+            text = str(self._value(key)).strip()
+            return None if not text else str(self._inside(root, text, what))
+        return RSMFrameCorrections(mask_path=self._mask_path(root), threshold=self._threshold_policy(),
+                                   dark_path=inside("dark_path", "Dark"),
+                                   flat_path=inside("flat_path", "Flat field"), flat_min_fraction=cutoff,
+                                   solid_angle=solid_angle, polarization_factor=factor)
 
     def _build_experiment(self):
         """Stitch's Experiment rows, from Int's composer (no Grazing: the maintainer): Calibrate · Make Mask on
@@ -434,21 +616,38 @@ class RSMPage(QtWidgets.QWidget):
                 ("frame_step", "Frame step", "1", ()))),
             ("Normalization column occurrences", SectionId.PROCESSING, (
                 ("adv_foil_occurrence", "Foil column occurrence", "0", ()),
-                ("adv_exposure_occurrence", "Exposure column occurrence", "0", ()))),
+                ("adv_exposure_occurrence", "Exposure column occurrence", "0", ()),
+                ("adv_monitor_occurrence", "Monitor column occurrence", "0", ()))),
+            ("Corrections", SectionId.PROCESSING, (
+                ("adv_solid_angle", "Solid angle", "On", ("On", "Off")),
+                ("adv_polarization", "Polarization", "0.99", ()),
+                ("dark_path", "Dark", "", ()),
+                ("flat_path", "Flat field", "", ()),
+                ("adv_flat_cutoff", "Flat cutoff (% of median)", "10", ()))),
             ("Chunk and memory", SectionId.PROCESSING, (
                 ("adv_chunk", "Frames per chunk", str(preset.chunk_size), ()),
                 ("adv_max_frame_mib", "Max frame MiB", str(preset.max_frame_bytes // _MIB), ()),
                 ("adv_max_chunk_mib", "Max chunk MiB", "", ()))),
         )
         for title, section, rows in groups:
-            self.advanced.add_group(title, tuple(self._row(section, key, label, value, choices, False)
-                                                 for key, label, value, choices in rows))
+            self.advanced.add_group(title, tuple(
+                self._row(section, key, label, value, choices, key in {"dark_path", "flat_path"})
+                for key, label, value, choices in rows))
         self._tip("adv_rows", "The raw images' rows (a NeXus stack's frames are this shape too).")
         self._tip("adv_header", "Bytes before the pixels in each raw image file.")
         self._tip("adv_angle_mapping", "Which source column each psic circle reads, as role=column: mu, eta, chi, "
                                        "phi, nu and del, each once. A column the scan repeats takes its "
                                        "occurrence after # (nu=Nu#1 is the second Nu; #0, the first, is the "
                                        "default).")
+        # the Corrections rows are Stitch's (its labels, defaults and tips); on by default (decision 5)
+        self._tip("adv_solid_angle", "Each pixel's solid angle, as pyFAI's: on by default.")
+        self._tip("adv_polarization", "Polarization factor from -1 to 1; leave blank for none.")
+        self._tip("dark_path", "A dark image subtracted from every frame (Int's dark check admits it).")
+        self._tip("flat_path", "A flat field dividing every frame (Int's flat check admits it).")
+        self._tip("adv_flat_cutoff", "Flat pixels below this share of the flat's median are treated as dead and "
+                                     "masked. Raise it to mask a region shadowed in the flat; lower it to keep "
+                                     "weak but working pixels. 0 masks only zero, negative and non-finite "
+                                     "pixels.")
         self._tip("frame_first", "The first frame of every scan (0 is the first).")
         self._tip("frame_last", "The last frame of every scan; blank is each scan's last.")
         self._tip("frame_step", "Every n-th frame from the first.")
@@ -489,6 +688,8 @@ class RSMPage(QtWidgets.QWidget):
             self._source_changed(key)
         if key == "output_path":
             self._output_suggested = not str(self._value("output_path")).strip()
+        if key in {"project_root", "spec_path", "scan_mode", "scan", "normalization"} and "normalization" in self._rows:
+            self._refresh_normalization()  # a kind's own files come through set_sources
         self._edited()
 
     # ── the Source (Stitch's rows and owner) ──
@@ -502,6 +703,8 @@ class RSMPage(QtWidgets.QWidget):
         self._fields["spec_path"] = replace(self._fields["spec_path"], value=self._source_shown)
         self._rows["spec_path"].apply_field(self._fields["spec_path"])
         self._show_source_tip()
+        if "normalization" in self._rows:  # the new first scan's counters (Stitch's _source_committed)
+            self._refresh_normalization()
         self._edited()
 
     def _adopt_sources(self, paths):
@@ -687,9 +890,16 @@ class RSMPage(QtWidgets.QWidget):
         if cap is None:
             return ""
         static_hot = bool(str(self._value("static_hot")).strip())
-        corrections = RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
+        try:
+            solid_angle, factor, _cutoff = self._correction_values()
+        except ValueError:
+            return ""  # readiness names it
+        corrections = RSMFrameCorrections(threshold=self._threshold_policy(), solid_angle=solid_angle,
+                                          polarization_factor=factor)  # the run's charge: Int's threshold too
         shape = (int(self._value("adv_rows")), int(self._value("adv_columns")))
-        need = rsm_v2_chunk_bytes(shape, shape, 1, static_hot=static_hot, corrections=corrections)
+        need = rsm_v2_chunk_bytes(shape, shape, 1, static_hot=static_hot, corrections=corrections,
+                                  dark=bool(str(self._value("dark_path")).strip()),
+                                  flat=bool(str(self._value("flat_path")).strip()))
         mib = -(-need // _MIB)
         return "" if cap >= need else f"Max chunk MiB of {mib} or more (one frame needs {mib} MiB), or blank for Auto"
 
@@ -706,17 +916,10 @@ class RSMPage(QtWidgets.QWidget):
             raise ValueError("Project root is required")
         project = Path(project_text).expanduser()
         members = self._group_members()
-        mode = _NORMALIZATIONS[self._value("normalization")]
-        if mode is RSMNormalizationMode.IDENTITY:
-            normalization = RSMNormalizationPolicy.identity()
-        else:
-            normalization = RSMNormalizationPolicy(
-                mode, MetadataColumnSelector(str(self._value("foil")).strip(),
-                                             int(self._value("adv_foil_occurrence"))),
-                MetadataColumnSelector(str(self._value("exposure")).strip(),
-                                       int(self._value("adv_exposure_occurrence"))),
-                tuple(float(part) for part in str(self._value("absorption")).replace(";", ",").split(",")
-                      if part.strip()))
+        try:
+            policy = self._normalization_policy()
+        except ValueError as error:
+            raise ValueError(f"Normalization: {error}") from None
 
         def optional(key):
             text = str(self._value(key)).strip()
@@ -727,13 +930,15 @@ class RSMPage(QtWidgets.QWidget):
                   if str(output) == suggested_output(project, members) else None)
         geometry = rsm_calibration_geometry_input(self._calibration_locator(project),
                                                   refinement=bool(self._value("refinement")))
-        # decision 5's defaults (solid angle, polarization 0.99) with the Mask File
-        corrections = RSMFrameCorrections(mask_path=self._mask_path(project), solid_angle=True,
-                                          polarization_factor=0.99)
+        try:
+            corrections = self._corrections(project)  # the Mask File, Int's threshold, Advanced's corrections
+        except ValueError as error:
+            raise ValueError(f"Advanced: {error}") from None
         return RSMToolFormV2(
             project_text, geometry, members,
-            RSMImageConditioning(float(self._value("offset")), optional("high_threshold"), optional("static_hot")),
-            normalization, tuple(_GRIDS[self._value("grid")]), int(self._value("adv_chunk")),
+            # "High → NaN" is Int's threshold's Manual High now (design §2)
+            RSMImageConditioning(float(self._value("offset")), None, optional("static_hot")),
+            policy, tuple(_GRIDS[self._value("grid")]), int(self._value("adv_chunk")),
             int(self._value("adv_max_frame_mib")) * _MIB, self._max_chunk_bytes(), output,
             AnalysisArtifactOverwrite.REPLACE,  # Append is the page's skip, as Stitch's (_start_run)
             coordinate_frame=_FRAMES[self._value("coordinates")], output_family=family, corrections=corrections)
@@ -796,6 +1001,20 @@ class RSMPage(QtWidgets.QWidget):
         cap = self._chunk_cap_refusal()
         if cap:
             need("processing", f"Advanced {cap}")
+        if not self._advanced_refusal(SectionId.PROCESSING):
+            try:
+                self._normalization_policy()
+            except ValueError as error:
+                need("processing", f"Normalization: {error}")
+        try:
+            self._correction_values()
+        except ValueError as error:
+            need("processing", f"Advanced {error}")
+        if root is not None and root.is_dir():  # Advanced's dark and flat, as the Mask File
+            for key, what in (("dark_path", "Dark"), ("flat_path", "Flat field")):
+                text = str(self._value(key)).strip()
+                if text and not self._inside(root, text, what).is_file():
+                    need("processing", f"the {what} ({Path(text).name} not found)")
         grid = "×".join(str(size) for size in _GRIDS[self._value("grid")])
         ready_detail = {"project": "Project folder and Output are ready.",
                         "experiment": "The Calibration (and any Mask File) is ready.",
@@ -1464,6 +1683,9 @@ class RSMPage(QtWidgets.QWidget):
             title, file_filter = (("Choose calibration", dialogs.CALIBRATION_FILTER) if key == "geometry_path"
                                   else ("Choose detector mask", dialogs.MASK_FILTER))
             picks = dialogs.browse(self, title, file_filter=file_filter, **common)
+        elif key in {"dark_path", "flat_path"}:  # Int's file types for the correction images
+            picks = dialogs.browse(self, {"dark_path": "Choose dark", "flat_path": "Choose flat field"}[key],
+                                   file_filter=dialogs.CORRECTION_FILTER, **common)
         elif key == "output_path":  # the shared save: the last folder, the current output's name
             picks = dialogs.browse(self, "Choose RSM output", save=True, file_filter="NeXus result (*.nexus)",
                                    default_name=Path(common["current"]).name if common["current"] else "",
