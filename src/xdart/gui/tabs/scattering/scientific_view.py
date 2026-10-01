@@ -54,6 +54,7 @@ from .shell_widgets import (
     CompactFrameSelector,
     ContentFitComboBox,
     frame_caption,
+    same_grid,
     ScientificImagePane,
     scrollable_toolbar,
     set_combo,
@@ -1764,8 +1765,8 @@ class ScientificView(QtWidgets.QFrame):
         return all(
             _is_readonly_array(trace.axis.values)
             and _is_readonly_array(trace.intensity)
-            and trace.axis.values.shape == reference.shape
-            and np.array_equal(trace.axis.values, reference)
+            # a grid equal to rounding is the same grid, as aggregate_traces folds it
+            and same_grid(trace.axis.values, reference)
             for _key, trace in rows
         )
 

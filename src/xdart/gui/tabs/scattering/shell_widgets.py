@@ -1065,15 +1065,17 @@ _FOLD_GRID_POINTS = 50_000
 _FOLD_WORK = 20_000_000
 
 
+def same_grid(values: np.ndarray, reference: np.ndarray) -> bool:
+    """One grid: equal, or equal to rounding (a billionth of each value; live integrators can publish
+    numerically equivalent grids a few ulps apart)."""
+    return values.shape == reference.shape and (
+        np.array_equal(values, reference) or np.allclose(values, reference, rtol=1e-9, atol=0.0))
+
+
 def _on_one_grid(traces: tuple[TraceProjection, ...]) -> bool:
-    """The traces share the first's grid: equal, or equal to rounding (a billionth of each value)."""
+    """The traces share the first's grid (``same_grid``)."""
     first = traces[0].axis.values
-    return all(
-        trace.axis.values.shape == first.shape
-        and (np.array_equal(trace.axis.values, first)
-             or np.allclose(trace.axis.values, first, rtol=1e-9, atol=0.0))
-        for trace in traces
-    )
+    return all(same_grid(trace.axis.values, first) for trace in traces)
 
 
 def _fold_grid(traces: tuple[TraceProjection, ...]) -> np.ndarray | None:
@@ -1161,6 +1163,7 @@ __all__ = [
     "processing_header_projection",
     "project_header_projection",
     "repeated_labels",
+    "same_grid",
     "ScientificImagePane",
     "SectionHeaderProjection",
     "scrollable_toolbar",
