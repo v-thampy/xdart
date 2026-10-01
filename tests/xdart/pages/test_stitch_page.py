@@ -559,20 +559,20 @@ def test_native_xu_displays_admitted_mapping_and_rotation_read_only(qapp, tmp_pa
         _fill_native(page, form)
         page.set_field("geometry_path", str(asset_path))
         assert page._value("source_motors") == "del=gamma, nu=delta"
-        assert int(page._value("image_rotation")) == 180
-        for key in ("source_motors", "image_rotation", "geometry_kind", "poni_references"):
+        assert page._value("camera") == "x+, z-"  # the asset's rotation of 180°: its unmirrored camera
+        for key in ("source_motors", "camera", "geometry_kind", "poni_references"):
             assert not page._rows[key].isEnabled()
         # Raw decoding is still an actual input, independent of the fitted asset.
         assert page._rows["raw_dtype"].isEnabled()
         page.set_field("geometry_path", "")
         assert page._value("source_motors") == ""
-        assert page._value("image_rotation") == ""
+        assert page._value("camera") == ""
         page._calibrate()
         assert page._calibration_dialog.isVisible()
         page._calibration_dialog.close()
         page.set_field("backend", "pyFAI MultiGeometry")
         assert page._rows["source_motors"].isEnabled()
-        assert page._rows["image_rotation"].isEnabled()
+        assert page._rows["camera"].isEnabled()
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
@@ -796,7 +796,7 @@ def test_mask_exact_frame_staging_is_unrotated_and_page_shutdown_reaps_worker(qa
     page = StitchPage(empty_host_services(_Status()))
     try:
         _fill_native(page, form)
-        page.set_field("image_rotation", "180")
+        page.set_field("camera", "x+, z-")  # turned 180° into Stitch's frame
         source = page._source_spec_for_tools()
         cancel = Event()
         cancel.set()

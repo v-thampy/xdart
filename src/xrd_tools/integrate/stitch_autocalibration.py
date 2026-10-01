@@ -210,13 +210,14 @@ def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen
 def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_rotation=0,
                              calibrant='LaB6', frame_indices=None, max_frames=48,
                              points_per_degree=2.0, max_counts=None, frame_screen=_CALIBRATION_SCREEN,
-                             cancelled=None, progress=None, mask=None) -> ScanRingPoints:
+                             cancelled=None, progress=None, mask=None, image_flip=False) -> ScanRingPoints:
     """Extract calibrant ring points from frames across the scan's angle grid.
 
     Every frame of the scan is screened for dropped frames first, then frames
     are chosen among the rest. ``progress(stage, done, total)`` reports the
     screened frames and each frame's ring search. ``mask`` (True: left out) is
-    the calibration's mask in the oriented image, applied with the detector's.
+    the calibration's mask in the oriented image, applied with the detector's. Each image is turned by
+    ``image_rotation`` and mirrored left-right by ``image_flip`` (its camera's transform into Stitch's frame).
     """
     from pyFAI.goniometer import SingleGeometry  # noqa: PLC0415
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
@@ -229,7 +230,7 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
     rows = source_frame_choices(spec, _arm_motors(arm))
     row_of = _row_of(arm.nu_motor, arm.del_motor)
     by_index = {row[0]: row for row in rows}
-    orientation = ImageOrientation(rotation=image_rotation)
+    orientation = ImageOrientation(rotation=image_rotation, flip_horizontal=bool(image_flip))
     exact = _exact_source(spec)
     # Screen every frame of the scan (cheap totals) before choosing, so each frame
     # is compared with all of its nu-row neighbours, not with a sparse selection.
@@ -334,7 +335,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                          min_improvement=0.2, max_rms_q=0.03, cancelled=None,
                          progress=None, instrument_geometry=None, mask=None,
                          energy_bound_eV=None, bounds=None, distance_seed_m=None,
-                         distance_bounds_m=None) -> CalibrationFit:
+                         distance_bounds_m=None, image_flip=False) -> CalibrationFit:
     """Refine a stacked-arm calibration from its calibrant scan, automatically.
 
     Returns a MultiGeometry :class:`CalibrationFit` for :func:`save_calibration_fit`.
@@ -378,7 +379,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
     bounds = (ArmFitBounds() if bounds is None else bounds).resolved(
         list(arm.motor_zeros()), seed_zeros=arm.motor_zeros(), seed_held=held)
     points = extract_scan_ring_points(
-        spec, record, source_motors=source_motors, image_rotation=image_rotation,
+        spec, record, source_motors=source_motors, image_rotation=image_rotation, image_flip=image_flip,
         calibrant=calibrant, frame_indices=frame_indices, max_frames=max_frames,
         points_per_degree=points_per_degree, max_counts=max_counts,
         frame_screen=frame_screen, cancelled=cancelled, progress=progress, mask=mask)
@@ -457,7 +458,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                   'source_motors': {name: motor for name, motor in (('nu_angle', arm.nu_motor),
                                                                     ('del_angle', arm.del_motor))
                                     if motor is not None},
-                  'image_rotation': int(image_rotation), 'direct_beam': None,
+                  'image_rotation': int(image_rotation), **({'image_flip': True} if image_flip else {}),
+                  'direct_beam': None,
                   'arm_model': chosen, 'parameter_errors': dict(result.param_errors),
                   'fit_bounds': {'estimates': bounds.to_record(), 'parameters': dict(result.fit_bounds)},
                   'parameter_correlations': dict(result.param_correlations),

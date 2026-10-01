@@ -74,3 +74,54 @@ class DetectorCamera:
             if _signature(ImageOrientation(rotation=rotation, flip_horizontal=flip)) == signature:
                 return cls(rows, columns)
         raise ValueError('not an image transform')  # the eight above are every flip and turn
+
+
+#: The camera of the image Stitch calibrates and integrates in, its xrayutilities asset's: rows run down
+#: (x-), columns to the left looking downstream (z+). A raw image from another camera is turned into it
+#: first (:func:`stitch_orientation`); this one needs nothing (an image rotation of 0, as before). Scan 14
+#: settled it (2026-09-30): 17-2's rows run down and its columns the way +nu swings the detector, to the
+#: right, so its camera is ('x-', 'z-'), and with the maintainer's senses (nu x-, del z-) the arm fits only
+#: with the columns mirrored, as this frame says. It is 180° from ``_PYFAI_TRANSFORM``'s ('x+', 'z-'): Stitch's
+#: pyFAI χ is 180° from its xrayutilities χ (a pre-existing gap; 2θ and |q| agree).
+STITCH_CAMERA = DetectorCamera('x-', 'z+')
+
+
+def _in_stitch_frame(array: np.ndarray, camera: DetectorCamera) -> np.ndarray:
+    """A raw ``camera`` array with its rows along x- and its columns along z+ (a view)."""
+    rows, columns = camera.rows, camera.columns
+    if rows[0] == 'z':  # its rows run along z: transposed, they run along x
+        array, rows, columns = array.T, columns, rows
+    if rows == 'x+':
+        array = array[::-1, :]
+    if columns == 'z-':
+        array = array[:, ::-1]
+    return array
+
+
+def _effect(transform) -> tuple[tuple[int, ...], bytes]:
+    """What a transform does to a small non-square array (its shape and values)."""
+    out = np.ascontiguousarray(transform(np.arange(6).reshape(2, 3)))
+    return out.shape, out.tobytes()
+
+
+#: Every image transform Stitch applies: a counterclockwise turn, then a horizontal flip.
+_STITCH_TRANSFORMS = tuple(ImageOrientation(rotation=rotation, flip_horizontal=flip)
+                           for flip in (False, True) for rotation in (0, 90, 180, 270))
+
+
+def stitch_orientation(camera: DetectorCamera) -> ImageOrientation:
+    """The image transform (a turn, then a horizontal flip) bringing a raw image from ``camera`` into
+    Stitch's frame (``STITCH_CAMERA``)."""
+    effect = _effect(lambda array: _in_stitch_frame(array, camera))
+    return next(orientation for orientation in _STITCH_TRANSFORMS if _effect(orientation.apply) == effect)
+
+
+def stitch_camera(orientation: ImageOrientation) -> DetectorCamera:
+    """The camera whose raw images Stitch turns by ``orientation``: an image rotation saved before the
+    camera existed is ``stitch_camera(ImageOrientation(rotation=R))`` (R = 0: ``STITCH_CAMERA``)."""
+    effect = _effect(orientation.apply)
+    for rows in CAMERA_AXES:
+        for columns in CAMERA_AXES:
+            if rows[0] != columns[0] and _effect(stitch_orientation(DetectorCamera(rows, columns)).apply) == effect:
+                return DetectorCamera(rows, columns)
+    raise ValueError('not an image transform')  # a transpose alone, say: no camera is one

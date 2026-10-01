@@ -199,8 +199,9 @@ def geometry_facts(plan):
     if type(plan) is XuStitchOperationPlan:
         asset = plan.calibration.projection.value
         rotation = int(asset["acquisition"]["image_rotation_quarter_turns"]) * 90
+        flip = asset["acquisition"].get("image_flip", False)  # a mirrored camera's (written only then)
         return (float(asset["acquisition"]["xdart_wavelength_A"]),
-                tuple(asset["detector"]["shape"]), ImageOrientation(rotation=rotation))
+                tuple(asset["detector"]["shape"]), ImageOrientation(rotation=rotation, flip_horizontal=flip))
     from xrd_tools.integrate.calibration import detector_calibration_to_integrator
     diff, orientation = _runtime_geometry(plan.geometry, plan.geometry.content)
     ai = detector_calibration_to_integrator(diff.calibration)
@@ -224,7 +225,7 @@ def native_plan_identity(plan):
             None if plan._mask_receipt is None else plan._mask_receipt.fingerprint)
 
 
-def _snapshot(path, manifest, rotation):
+def _snapshot(path, manifest, rotation, flip=False):
     from xrd_tools.io.image import read_detector_image_layout
     from xrd_tools.sources.descriptor import describe_container
     options = json.loads(manifest.source_options_json)
@@ -233,7 +234,8 @@ def _snapshot(path, manifest, rotation):
         "detector_shape", "detector", "raw_dtype", "raw_header_skip",
     ) if key in read_options}
     before = _state(path)
-    snapshot = {"size": before[3], "mtime_ns": before[4], "rotation": rotation}
+    snapshot = {"size": before[3], "mtime_ns": before[4], "rotation": rotation,
+                **({"flip_horizontal": True} if flip else {})}  # a mirrored camera's, only then
     if path.suffix.lower() in {".h5", ".hdf5", ".nxs", ".nexus", ".cxi"}:
         desc = describe_container(path, entry=manifest.source_entry or "entry")
         if not desc.frame_shape or desc.dtype is None or desc.frame_count < 1:
@@ -309,7 +311,7 @@ def _frame_facts(source, manifest, plan):
             path = Path(manifest.project_root) / file.relative_path
             cache_key = (str(path), member.source_options_json, member.source_entry)
             if cache_key not in cache:
-                cache[cache_key] = _snapshot(path, member, orientation.rotation)
+                cache[cache_key] = _snapshot(path, member, orientation.rotation, orientation.flip_horizontal)
             snapshot, state, file_recorded = cache[cache_key]
             recorded.add(file_recorded)
             dtypes.add(snapshot["raw_dtype"])

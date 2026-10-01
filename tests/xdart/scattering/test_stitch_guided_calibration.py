@@ -149,7 +149,7 @@ def test_modeless_window_exposes_guided_source_controls_and_preserves_session(tm
     assert not dialog.isModal()
     assert dialog.tabs.count() == 4  # 4 · Calibrate and fit holds the fit (maintainer, 2026-09-29, -30)
     assert dialog._spec().options['scan'] == '14'
-    assert dialog.rotation.currentData() == 180
+    assert dialog.camera.value().to_xu() == ('x+', 'z-') and dialog._orientation().rotation == 180  # turned half
     assert not dialog.scales.isChecked()
     assert dialog._text('del_motor') == 'delta'
     previous = dialog.session_dir
@@ -694,7 +694,8 @@ def test_the_detector_and_its_orientation_are_choices_saved_with_the_settings(tm
         assert [detector.itemData(row) for row in range(3)] == ['Pilatus100k', 'Pilatus300kw', 'Eiger1M']
         assert dialog._text('beam_detector') == 'Pilatus300kw' and dialog._text('beam_orientation') == '3'
         # the image the beam pixel is read in: width (x, columns) × height (y, rows)
-        assert dialog._image_size.text() == '1475 × 195 px (x × y): x 0–1474, y 0–194 · image rotation 0°'
+        assert (dialog._image_size.text()
+                == '1475 × 195 px (x × y): x 0–1474, y 0–194 · camera rows x-, columns z+')
         # the hint does not suggest the centre: the beam need not be there (the 17-2 nu scan's is at 279, 97)
         assert dialog._row_visible('beam_size') and 'direct beam' in dialog._fields['beam_pixel'].placeholderText()
         # the first-pixel corner is not a rotation: it never swaps x and y
@@ -705,9 +706,13 @@ def test_the_detector_and_its_orientation_are_choices_saved_with_the_settings(tm
         dialog._set_field_text('beam_detector', 'Pilatus100k')
         assert dialog._text('shape') == '195, 487'  # the RAW reader follows the detector
         assert dialog._image_size.text().startswith('487 × 195 px')
-        dialog.rotation.setCurrentIndex(dialog.rotation.findData(90))  # a turned image swaps x and y
-        assert dialog._image_size.text().startswith('195 × 487 px') and 'image rotation 90°' in dialog._image_size.text()
-        dialog.rotation.setCurrentIndex(dialog.rotation.findData(0))
+        from xrd_tools.core.geometry.camera import STITCH_CAMERA, DetectorCamera
+        dialog.camera.set_value(DetectorCamera('z+', 'x+'))  # rows along z: a turned image swaps x and y
+        assert (dialog._image_size.text().startswith('195 × 487 px')
+                and 'camera rows z+, columns x+' in dialog._image_size.text())
+        dialog.camera.set_value(DetectorCamera('x-', 'z-'))  # a mirror does not
+        assert dialog._image_size.text().startswith('487 × 195 px')
+        dialog.camera.set_value(STITCH_CAMERA)
         dialog._set_field_text('beam_orientation', '2')
         for key, value in (('rough_distance', '400'), ('beam_pixel', '240, 97')):
             dialog._set_field_text(key, value)
@@ -808,7 +813,8 @@ def test_the_detector_mask_reaches_pyfai_turned_as_the_frames_are(tmp_path):
     dialog = StitchCalibrationDialog(tmp_path)
     try:
         dialog._fields['mask'].setText(str(tmp_path / 'mask.npy'))
-        dialog.rotation.setCurrentIndex(dialog.rotation.findData(90))
+        from xrd_tools.core.geometry.camera import DetectorCamera
+        dialog.camera.set_value(DetectorCamera('z+', 'x+'))  # turned 90° counterclockwise into Stitch's frame
         path = dialog._pyfai_mask()
         np.testing.assert_array_equal(fabio.open(path).data.astype(bool), np.rot90(mask))  # 90° counterclockwise
         np.testing.assert_array_equal(dialog._loaded_mask(), np.rot90(mask))  # the expected rings' mask too

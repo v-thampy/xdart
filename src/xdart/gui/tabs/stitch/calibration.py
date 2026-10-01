@@ -140,9 +140,9 @@ def _dispatch_job(request, cancelled, publish):
         motors = tuple(motor for motor in geometry.stitch_arm() if motor)  # a 2θ arm reads one
         return source_frame_choices(spec, motors), names, geometry.to_record()
     if kind == 'prepare':
-        spec, indices, directory, rotation, arm = arguments
-        return capture_calibration_frames(spec, indices, directory, rotation=rotation,
-                                           arm=arm, cancelled=cancelled)
+        spec, indices, directory, orientation, arm = arguments
+        return capture_calibration_frames(spec, indices, directory, rotation=orientation.rotation,
+                                           flip=orientation.flip_horizontal, arm=arm, cancelled=cancelled)
     if kind == 'calibrate':
         from xdart.gui.tabs.scattering.experiment_authoring import prepare_calibration_request, run_calibration
         from xdart.gui.tabs.scattering.operation_values import OperationIdentity, OperationTerminalStatus as ChildStatus
@@ -222,7 +222,8 @@ def _dispatch_job(request, cancelled, publish):
                         raise OperationCancelled('direct-beam calibration cancelled')
                     yield frame
             result = calibrate_direct_beam(inputs.angles_deg, images(),
-                orientation=ImageOrientation(rotation=options.pop('rotation')),
+                orientation=ImageOrientation(rotation=options.pop('rotation'),
+                                             flip_horizontal=options.pop('flip', False)),
                 frame_ids=inputs.frame_ids, point_ids=inputs.point_ids, **options)
             if cancelled.is_set():
                 raise OperationCancelled('direct-beam calibration cancelled')
@@ -390,6 +391,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self.saved_source_motors = {}
         self.saved_instrument_geometry = None
         self.saved_image_rotation = 0
+        self.saved_image_flip = False  # with the rotation: the camera's transform into Stitch's frame
         self.saved_mask = ''
         self._owner = SingleWorkerOwner(_run_job)
         self._fields = {}
@@ -966,7 +968,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             self._fields[key].currentIndexChanged.connect(self._render_frames)
         self._fields['beam_detector'].currentIndexChanged.connect(self._detector_chosen)
         self._fields['beam_detector'].currentIndexChanged.connect(self._update_image_size)
-        self.rotation.currentIndexChanged.connect(self._update_image_size)  # the beam pixel's image turns
+        self.camera.changed.connect(self._update_image_size)  # the beam pixel's image turns
         self._update_image_size()
 
     def _build_detector(self):
@@ -995,28 +997,30 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         form.addRow('RAW images', reader)
         self._rows['raw'] = (form, reader)
         self._tip(raw_tip, form.labelForField(reader))
-        self.rotation = self._combo(form, 'Image rotation (applied once)',
-                                    [(f'{value}° counterclockwise', value) for value in (0, 90, 180, 270)],
-                                    tip='Rotates every image once before calibration; use it when the stored '
-                                        'images are turned relative to the detector view you calibrate in.')
+        # The detector's camera, as xrayutilities gives it (maintainer, 2026-09-30: "two drop-down boxes
+        # linked together ... x+, x-, z+, z-"): it turns and mirrors every image into Stitch's frame.
+        from xdart.gui.widgets.camera_editor import CameraEditor
+        self.camera = CameraEditor()
+        form.addRow('Camera', self.camera)
+        self._tip(self._CAMERA_TIP, self.camera.rows, self.camera.columns, form.labelForField(self.camera))
         self._image_size = QtWidgets.QLabel()
         self._image_size.setWordWrap(True)
         form.addRow('Image size', self._image_size)
         self._rows['beam_size'] = (form, self._image_size)
         self._tip('The detector image\'s width (x, columns) and height (y, rows) in pixels, as the beam '
-                  'pixel is read: the detector\'s own layout, turned by the image rotation above (90° and '
-                  '270° swap x and y). The first-pixel corner below does not change it.',
+                  'pixel is read: the detector\'s own layout, turned as the camera above says (a camera '
+                  'whose rows run along z swaps x and y). The first-pixel corner below does not change it.',
                   self._image_size, form.labelForField(self._image_size))
         corners = {3: 'bottom right (pyFAI default)', 1: 'top left', 2: 'top right', 4: 'bottom left'}
         self._choice(form, 'beam_orientation', 'First pixel (pyFAI orientation)',
                      [(f'{code} · first pixel {corners[code]}', code) for code, _name in DETECTOR_ORIENTATIONS], 3,
                      tip='pyFAI\'s detector orientation: the corner holding the image\'s first pixel, seen '
                          'from behind the detector looking at the sample. It is not a rotation: it never turns '
-                         'the image or swaps x and y (the image rotation above does). It changes how the PONIs '
+                         'the image or swaps x and y (the camera above does). It changes how the PONIs '
                          'are written, not the geometry: the arm\'s motor scales take its signs. Keep 3, '
                          'pyFAI\'s default, unless pyFAI shows this detector\'s images mirrored. It is saved '
                          'with every PONI and fit.')
-        for combo in (self._fields['beam_detector'], self.rotation, self._fields['beam_orientation']):
+        for combo in (self._fields['beam_detector'], self._fields['beam_orientation']):
             # long entries elide instead of widening the window
             combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(12)
@@ -1027,7 +1031,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         self._edit(form, 'mask', 'Mask file', chooser='Masks (*.edf *.tif *.tiff *.npy);;All files (*)',
                    tip='Pixels to leave out everywhere in this calibration: the direct-beam fit, pyFAI-calib2 '
                        '(its mask), the automatic refinement\'s ring search and the expected rings. Drawn on '
-                       'the stored image (before the image rotation), as the Stitch Mask File is; saving the '
+                       'the stored image (before the camera\'s turn), as the Stitch Mask File is; saving the '
                        'calibration makes it Stitch\'s Mask File.')
         self._fields['mask'].editingFinished.connect(self._render_frames)
         return panel
@@ -1035,7 +1039,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
     _ROUGH_NOTES = {
         'scan': 'A direct-beam scan: SPEC supplies the angles for an image series or an Eiger/NeXus container; '
                 'standalone NeXus supplies both. Angle and image counts must match. Uses the Detector panel\'s '
-                'image rotation, RAW settings, saturation and mask (1 · Instrument). Its distance, with the beam '
+                'camera, RAW settings, saturation and mask (1 · Instrument). Its distance, with the beam '
                 'pixel and zero, predicts each frame\'s rings; the regression uncertainty excludes motor, zero and '
                 'pitch systematics.',
         'manual': 'The distance, the pixel the direct beam hits at normal incidence and that zero predict each '
@@ -1047,18 +1051,43 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
     #: Hidden by Skip. The wavelength stays: a frame whose scan records no energy is calibrated at it.
     _GEOMETRY_ROWS = ('beam_motor', 'beam_pixel', 'rough_mount')
 
+    _CAMERA_TIP = ('The lab directions the stored image\'s rows (top to bottom) and columns (left to right) run '
+                   'along with every circle at zero, the detector facing the beam: x up, z to the left looking '
+                   'downstream (xrayutilities\' detectorDir1, detectorDir2). Every image is turned and mirrored '
+                   'into Stitch\'s frame, rows x−, columns z+, once before calibration; that is the default (an '
+                   'image rotation of 0 before). 17-2\'s Pilatus 300K-W is rows x−, columns z−, with nu x−.')
+
+    def _orientation(self):
+        """The camera's transform into Stitch's frame: a turn, then a left-right mirror."""
+        from xrd_tools.core.geometry.camera import stitch_orientation
+        return stitch_orientation(self.camera.value())
+
+    def _apply_camera(self, values):
+        """The saved camera, else an older window's image rotation (its unmirrored camera)."""
+        from xrd_tools.core.geometry import ImageOrientation
+        from xrd_tools.core.geometry.camera import DetectorCamera, stitch_camera
+        camera = values.get('camera')
+        rotation = ((values.get('choices') or {}).get('rotation') or {}).get('data')
+        try:
+            if isinstance(camera, list) and len(camera) == 2:
+                self.camera.set_value(DetectorCamera(*map(str, camera)))
+            elif rotation in (0, 90, 180, 270):
+                self.camera.set_value(stitch_camera(ImageOrientation(rotation=rotation)))
+        except (ValueError, TypeError):
+            pass  # an unknown camera: the default stays
+
     def _update_image_size(self, *_args):
-        """The detector image's x × y size, as the beam pixel is read (after the Detector panel's rotation)."""
+        """The detector image's x × y size, as the beam pixel is read (turned by the Detector panel's camera)."""
         shape = detector_shape(self._text('beam_detector'))
         if shape is None:
             self._image_size.setText('unknown detector')
             self._fields['beam_pixel'].setPlaceholderText('column, row')
             return
         rows, columns = shape
-        rotation = int(self.rotation.currentData() or 0)
-        width, height = (rows, columns) if rotation in (90, 270) else (columns, rows)
+        width, height = (rows, columns) if self._orientation().swaps_axes else (columns, rows)
+        camera = self.camera.value()
         self._image_size.setText(f'{width} × {height} px (x × y): x 0–{width - 1}, y 0–{height - 1} · '
-                                 f'image rotation {rotation}°')
+                                 f'camera rows {camera.rows}, columns {camera.columns}')
         self._beam_pixel_hint()
 
     def _beam_pixel_hint(self, *_args):
@@ -1170,7 +1199,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         return role
 
     def set_source_context(self, source: SourceSpec, *, image_rotation=0, del_motor=None, nu_motor=None,
-                           geometry_path=None):
+                           geometry_path=None, image_flip=False):
         if self._owner.busy:
             return
         if geometry_path:
@@ -1188,7 +1217,9 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         for key, value in [('shape', ', '.join(map(str, reader.get('detector_shape', (195, 1475))))),
                            ('dtype', reader.get('raw_dtype', 'int32')), ('header', reader.get('raw_header_skip', 0))]:
             self._fields[key].setText(str(value))
-        self.rotation.setCurrentIndex(max(0, self.rotation.findData(image_rotation)))
+        from xrd_tools.core.geometry import ImageOrientation
+        from xrd_tools.core.geometry.camera import stitch_camera
+        self.camera.set_value(stitch_camera(ImageOrientation(rotation=image_rotation, flip_horizontal=image_flip)))
 
     _STALE_DISTANCE = ('The direct-beam fit was made with other inputs (a motor zero, its motor, the source, the '
                        'detector or the search settings changed since): fit the direct-beam distance again.')
@@ -1214,7 +1245,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     #: Choices saved with the Stitch settings. The calibrant-scan and same-detector
     #: confirmations are per use and never saved.
-    _SAVED_CHOICES = ('source_kind', 'rotation', 'refine_calibrant', 'refine_seed', 'beam_source_kind',
+    _SAVED_CHOICES = ('source_kind', 'refine_calibrant', 'refine_seed', 'beam_source_kind',
                       'motion', 'rough_mode')
 
     def settings(self):
@@ -1228,6 +1259,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             'fit_motor_scales': self.scales.isChecked(),
             'refine_energy': self.refine_energy.isChecked(),
             'instrument_geometry': self.geometry_editor.value().to_record(),
+            'camera': list(self.camera.value().to_xu()),
         }
 
     def set_instrument(self, geometry: InstrumentGeometry):
@@ -1267,6 +1299,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             self.scales.setChecked(values['fit_motor_scales'])
         if isinstance(values.get('refine_energy'), bool):
             self.refine_energy.setChecked(values['refine_energy'])
+        self._apply_camera(values)
         # after the del/nu fields an older file names its arm with: its normal-incidence zero
         self.geometry_editor.set_value(migrated_instrument(self.geometry_editor.value(), values))
         self._sync_arm_model()
@@ -1482,7 +1515,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                             if self.selection.item(row, 0).checkState() == QtCore.Qt.CheckState.Checked)
             if self.frames:
                 raise ValueError('this session already has staged frames; open another calibration window for a new selection')
-            self._start('prepare', (self._enumerated_spec, indices, self.session_dir, self.rotation.currentData(),
+            self._start('prepare', (self._enumerated_spec, indices, self.session_dir, self._orientation(),
                                    self._enumerated_motors))
         self._guard(go)
 
@@ -1676,7 +1709,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                 raise ValueError(problem.replace('This calibration', 'The seed geometry', 1))
             options = dict(source_motors=source_motors,
                            instrument_geometry=geometry.to_record(),
-                           image_rotation=self.rotation.currentData(),
+                           image_rotation=self._orientation().rotation,
+                           image_flip=self._orientation().flip_horizontal,
                            calibrant=self.refine_calibrant.currentText().strip() or 'LaB6',
                            max_frames=int(self._text('refine_frames')),
                            max_counts=float(self._text('saturation')) if self._text('saturation') else None,
@@ -1763,7 +1797,8 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
             'distance_seed_m': None, 'distance_bounds_m': None, 'fit_motor_scales': False,
             'source_motors': {name: motor for name, motor in (('nu_angle', nu), ('del_angle', delta))
                               if motor is not None},
-            'image_rotation': self.rotation.currentData(), 'direct_beam': direct,
+            'image_rotation': self._orientation().rotation,
+            **({'image_flip': True} if self._orientation().flip_horizontal else {}), 'direct_beam': direct,
             'calibration_kind': 'direct_beam_not_ring_fitted',
             'fixed_mount_deg': [float(v) for v in (self._text('rough_mount') or '0, 0').split(',')],
             'motor_zeros_deg': self.geometry_editor.value().arm_zeros(),
@@ -1793,21 +1828,19 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
         return domain
 
     def _oriented_mask(self):
-        """The Detector panel's mask, drawn on the stored image, turned as the images are."""
-        from xrd_tools.core.geometry import ImageOrientation
+        """The Detector panel's mask, drawn on the stored image, turned and mirrored as the images are."""
         from xrd_tools.io.image import load_mask
-        return ImageOrientation(rotation=int(self.rotation.currentData() or 0)).apply(
-            load_mask(self._text('mask'))).astype(bool)
+        return self._orientation().apply(load_mask(self._text('mask'))).astype(bool)
 
     def _mask_state(self):
-        """The mask as used: its file's state and the rotation (None without a mask)."""
+        """The mask as used: its file's state and the camera (None without a mask)."""
         if not self._text('mask'):
             return None
         try:
             state = Path(self._text('mask')).stat()
         except OSError:
             return (self._text('mask'), None)
-        return (self._text('mask'), state.st_mtime_ns, state.st_size, self.rotation.currentData())
+        return (self._text('mask'), state.st_mtime_ns, state.st_size, self.camera.value().to_xu())
 
     def _loaded_mask(self):
         """The turned mask for the expected rings, loaded once per mask state (None when it
@@ -1848,7 +1881,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                         if self._text('beam_pixel') else None),  # blank: found at the zero
             motion=self.motion.currentText(), strip_half_width=int(self._text('beam_strip')),
             model='tangent', angle_zero_deg=self._zeros().get(self._beam_role(), 0.),
-            rotation=self.rotation.currentData())
+            rotation=self._orientation().rotation, flip=self._orientation().flip_horizontal)
         if self._text('beam_roi'):
             options['roi'] = tuple(int(v) for v in self._text('beam_roi').split(','))
         if self._text('mask'):
@@ -2098,6 +2131,7 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
                     self.saved_source_motors = provenance['source_motors']
                     self.saved_instrument_geometry = provenance.get('instrument_geometry')
                     self.saved_image_rotation = provenance['image_rotation']
+                    self.saved_image_flip = provenance.get('image_flip', False)
                     self.saved_mask = self._text('mask')  # becomes Stitch's Mask File when set
                     from xdart.utils.browse import remember_browse_path
                     remember_browse_path(Path(result.pyfai_path))

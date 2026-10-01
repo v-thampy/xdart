@@ -200,20 +200,21 @@ def test_settings_that_cannot_apply_are_refused_and_leave_the_inputs(qapp, tmp_p
 
 
 def _calibration_source(dialog):
-    return dialog._text("source"), dialog._text("scan"), dialog.rotation.currentData()
+    return dialog._text("source"), dialog._text("scan"), dialog.camera.value().to_xu()
 
 
 def test_calibrate_keeps_a_calibration_source_other_than_the_processing_scan(qapp, tmp_path):
     page = _edited_page(tmp_path)
     restored, sourceless = (StitchPage(empty_host_services(_Status())) for _ in range(2))
-    calibrant = (str(tmp_path / "powder-calibration.spec"), "2", 90)
+    calibrant = (str(tmp_path / "powder-calibration.spec"), "2", ("x-", "z-"))  # 17-2's mirrored camera
     try:
         page._calibrate()  # a new dialog starts from the processing scan
         dialog = page._calibration_dialog
-        assert _calibration_source(dialog)[1:] == ("1", 0)
+        assert _calibration_source(dialog)[1:] == ("1", ("x-", "z+"))  # Stitch's frame, the default
         dialog._set_field_text("source", calibrant[0])
         dialog._set_field_text("scan", calibrant[1])
-        dialog.rotation.setCurrentIndex(dialog.rotation.findData(calibrant[2]))
+        from xrd_tools.core.geometry.camera import DetectorCamera
+        dialog.camera.set_value(DetectorCamera(*calibrant[2]))
         page._calibrate()  # opening it again keeps the calibrant scan
         assert _calibration_source(dialog) == calibrant
 
@@ -224,7 +225,7 @@ def test_calibrate_keeps_a_calibration_source_other_than_the_processing_scan(qap
         unnamed["calibration"]["fields"]["source"] = ""  # saved without a calibration source
         sourceless.apply_settings(unnamed)
         sourceless._calibrate()
-        assert _calibration_source(sourceless._calibration_dialog)[1:] == ("1", 0)
+        assert _calibration_source(sourceless._calibration_dialog)[1:] == ("1", ("x-", "z+"))
     finally:
         _close(page, qapp)
         _close(restored, qapp)

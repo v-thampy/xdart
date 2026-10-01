@@ -412,8 +412,10 @@ def _validate_extended_surface(value):
     require(type(detector) is dict and set(detector) == set(reference['detector']) | _EXTENDED_DETECTOR_KEYS,
             'extended detector keys differ')
     require(type(acquisition) is dict
-            and set(acquisition) - {'source_energy_eV'} == set(reference['acquisition']) | {'sampledis_mm'},
+            and set(acquisition) - {'source_energy_eV', 'image_flip'} == set(reference['acquisition']) | {'sampledis_mm'},
             'extended acquisition keys differ')
+    # a mirrored camera's images are also flipped left-right after the rotation (written only when they are)
+    require(acquisition.get('image_flip', True) is True, 'invalid image flip')
     # a refined energy keeps the recorded one, which the scans' energies are checked against
     require('source_energy_eV' not in acquisition or (
         number(acquisition['source_energy_eV']) and number(acquisition['energy_eV'])
@@ -508,12 +510,13 @@ def _validate_extended_surface(value):
 def extended_surface_calibration(*, detector, xu_parameters, arm, energy_eV, xu_wavelength_A,
                                  source_motors, rotation, control_domain, domain, fit_frames,
                                  validation_frames, validation_pixels, max_dq, source_energy_eV=None,
-                                 detector_axes=None):
+                                 detector_axes=None, flip=False):
     """Build and strictly admit a transferred SURFACE v3 asset (imports are lazy).
 
     ``xu_parameters`` holds cch1/cch2 (px), distance_m, del/nu offsets (deg),
     detrot/tilt/tiltazimuth (deg) and sampledis_mm; ``arm`` is the compact pyFAI arm.
     ``detector_axes`` (nu's, del's; None: psic's x+, z-) reverses a circle that turns the other way.
+    ``flip``: the frames are also mirrored left-right after the rotation (a mirrored camera).
     """
     import numpy as np
     from xrd_tools.core.energy import energy_eV_to_wavelength_m
@@ -542,6 +545,8 @@ def extended_surface_calibration(*, detector, xu_parameters, arm, energy_eV, xu_
         sampledis_mm=[float(v) for v in p['sampledis_mm']])
     if source_energy_eV is not None:  # a refined energy: the recorded one the scans are checked against
         value['acquisition']['source_energy_eV'] = float(source_energy_eV)
+    if flip:
+        value['acquisition']['image_flip'] = True
     arm = json.loads(json.dumps(arm))
     arm['detector_config'] = config
     value['corrections'].update(solid_angle_policy=EXTENDED_SOLID_ANGLE_POLICY,

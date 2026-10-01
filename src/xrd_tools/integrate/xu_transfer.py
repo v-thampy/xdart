@@ -88,7 +88,7 @@ def _stitch_path_gate(asset, validation, integrators, shape, cancelled, progress
 
 
 def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_motors=('del', 'nu'),
-                       image_rotation=0, gate=None, cancelled=None, progress=None):
+                       image_rotation=0, gate=None, cancelled=None, progress=None, image_flip=False):
     """Transfer a pyFAI stacked arm to an XU SURFACE v3 asset; return (asset, diagnostics).
 
     ``geometry`` is a pyFAI goniometer record (mapping or path) of a stacked arm: the
@@ -164,9 +164,11 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
             raise InterruptedError('XU transfer cancelled')
 
     rows_sub, cols_sub = np.arange(0, shape[0], _SUBGRID[0]), np.arange(0, shape[1], _SUBGRID[1])
-    zeros = arm.motor_zeros()  # −offset/scale, whichever way the circle turns; a held circle's fixed angle
+    # the motor zeros, −offset/scale in degrees: a reversed circle's scale is negative (a held circle's offset is
+    # its fixed angle, at the nominal scale)
+    senses = {circle: 1 if getattr(arm, f'{circle}_scale') > 0 else -1 for circle in ('del', 'nu')}
     formula = [poni.poni1 / pitch1 - 0.5, poni.poni2 / pitch2 - 0.5, poni.dist * 1e3,
-               zeros.get('del', -math.degrees(arm.del_offset)), zeros.get('nu', -math.degrees(arm.nu_offset))]
+               -senses['del'] * math.degrees(arm.del_offset), -senses['nu'] * math.degrees(arm.nu_offset)]
     attempts, params = [], None
     with xu_runtime_session() as runtime:
         xu = runtime.xu
@@ -265,7 +267,7 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
                            'sampledis_mm': list(params[8:11])},
             arm=compact, energy_eV=energy, xu_wavelength_A=xu_wavelength, detector_axes=detector_axes,
             source_energy_eV=calibration_recorded_energy_eV(record),
-            source_motors={'del': del_motor, 'nu': nu_motor}, rotation=int(image_rotation),
+            source_motors={'del': del_motor, 'nu': nu_motor}, rotation=int(image_rotation), flip=bool(image_flip),
             control_domain=domain(fit if fitted else validation), domain=domain(validation),
             fit_frames=len(fit) if fitted else 0, validation_frames=len(validation),
             validation_pixels=len(validation) * shape[0] * shape[1], max_dq=worst_dq)

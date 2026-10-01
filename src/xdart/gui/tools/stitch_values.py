@@ -282,6 +282,9 @@ class StitchToolForm:
     #: frames' extent); ``unit`` and ``q_range`` are I(q)'s beside it.
     map_unit: str = "q_A^-1"
     map_radial_range: tuple[float, float] | None = None
+    #: The frames are also mirrored left-right after ``image_rotation``: a mirrored detector camera's
+    #: transform into Stitch's frame (``camera.stitch_orientation``).
+    image_flip: bool = False
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -384,6 +387,8 @@ class StitchToolForm:
             270,
         }:
             raise ValueError("image rotation must be 0, 90, 180, or 270")
+        if type(self.image_flip) is not bool:
+            raise ValueError("image flip must be an exact boolean")
         q_range = None if native and self.q_range is None else _ordered_range(self.q_range, "radial range")
         if type(self.npt_1d) is not int or not 1 <= self.npt_1d <= 1_000_000:
             raise ValueError("1-D bin count must be a bounded positive integer")
@@ -427,6 +432,7 @@ class StitchToolForm:
             or motors != (("del", "del"), ("nu", "nu"))
             or references
             or self.image_rotation != 0
+            or self.image_flip
             or self.detector_shape != (195, 1475)
             or dtype.str != "<i4"
             or self.raw_header_skip != 0
@@ -524,6 +530,8 @@ class StitchToolForm:
                          + (() if self.mode == "1d" else
                             (("stitch-2d-v2", self.npt_rad_2d, self.npt_azim_2d, self.chi_range,
                               self.map_unit, self.map_radial_range),)))
+        if self.image_flip:  # a mirrored camera's; an unmirrored form keeps the identity it had
+            canonical = (canonical, ("image-flip", True))
         object.__setattr__(
             self,
             "fingerprint",
@@ -641,6 +649,7 @@ class StitchPreflightSummary:
     backend: str = "multigeometry"
     asset_semantic_fingerprint: str | None = None
     effective_geometry_fingerprint: str | None = None
+    image_flip: bool = False
     fingerprint: str = field(init=False)
     _claim: InitVar[object] = None
 
@@ -670,6 +679,7 @@ class StitchPreflightSummary:
             or type(self.poni_references) is not tuple
             or type(self.image_rotation) is not int
             or self.image_rotation not in {0, 90, 180, 270}
+            or type(self.image_flip) is not bool
             or type(self.selected_labels) is not tuple
             or not self.selected_labels
             or type(self.members) is not tuple
@@ -784,6 +794,8 @@ class StitchPreflightSummary:
                 self.asset_semantic_fingerprint,
                 self.effective_geometry_fingerprint,
             )
+        if self.image_flip:  # a mirrored camera's; an unmirrored summary keeps the identity it had
+            canonical = (canonical, ("image-flip", True))
         object.__setattr__(
             self,
             "fingerprint",
@@ -979,6 +991,7 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
                     source_motors=form.source_motors,
                     reference_motor_positions=form.poni_references,
                     image_rotation=form.image_rotation,
+                    image_flip=form.image_flip,
                 )
             )
             plan = StitchOperationPlan(
@@ -1080,6 +1093,7 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
         source_motors=form.source_motors,
         poni_references=form.poni_references,
         image_rotation=form.image_rotation,
+        image_flip=form.image_flip,
         output_relative_path=output_relative,
         selected_labels=request.module.source.selected_labels,
         members=members,

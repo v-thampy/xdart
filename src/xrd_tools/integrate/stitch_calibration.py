@@ -81,6 +81,9 @@ class CalibrationFrame:
     npt_sha256: str = ''
     pairing_policy: str = ''
     control_image_sha256: str = ''
+    #: the staged image is also mirrored left-right (after ``rotation``): the detector camera's
+    #: transform into Stitch's frame (``camera.stitch_orientation``); saved only when True
+    flip: bool = False
 
     @property
     def complete(self) -> bool:
@@ -249,8 +252,9 @@ def suggested_frame_indices(rows, count=5):
 
 
 def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
-                               rotation=0, motor_names=('del', 'nu'), cancelled=None, arm=None):
-    """Persist the exact selected detector pixels and their source angles.
+                               rotation=0, motor_names=('del', 'nu'), cancelled=None, arm=None, flip=False):
+    """Persist the exact selected detector pixels and their source angles, turned by ``rotation`` and
+    mirrored left-right by ``flip`` (the detector camera's transform into Stitch's frame).
 
     ``arm`` is the detector arm's (del, nu) motors, ``None`` for a circle a single arm
     holds at zero; it names the angles read and is recorded with the session.
@@ -296,7 +300,7 @@ def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
             original = source.frame_for(index)
             before = Path(original.source_path or spec.uri).stat()
             loader = getattr(source, 'load_native_frame', source.load_frame)
-            pixels = ImageOrientation(rotation=rotation).apply(loader(index))
+            pixels = ImageOrientation(rotation=rotation, flip_horizontal=bool(flip)).apply(loader(index))
             if graph is not None:
                 requalify_source_execution_graph(spec, graph,
                     cancelled=None if cancelled is None else cancelled.is_set)
@@ -324,7 +328,7 @@ def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
                 json.loads(json.dumps(source_options, default=str)), int(index),
                 str(Path(original.source_path or spec.uri).resolve()),
                 original.source_frame_index, str(image), _sha(image), tuple(pixels.shape),
-                int(rotation), dict(motors), energy))
+                int(rotation), dict(motors), energy, flip=bool(flip)))
             current = Path(spec.uri).stat()
             if (current.st_ino, current.st_size, current.st_mtime_ns) != (source_state.st_ino, source_state.st_size, source_state.st_mtime_ns):
                 raise ValueError('scan metadata changed during preparation')
@@ -349,6 +353,14 @@ def _session_arm(value, frames):
     return arm['del'], arm['nu']
 
 
+def _session_row(frame):
+    """A frame as the session saves it: an unmirrored frame as before (no 'flip')."""
+    row = asdict(frame)
+    if not row['flip']:
+        del row['flip']
+    return row
+
+
 def save_calibration_session(directory, frames, *, arm=None, fit_policy=None):
     """``arm`` (del, nu motors; None for a held circle) makes it version 3: a resumed
     session then knows which circle a single arm's one motor is (vertical or horizontal).
@@ -359,7 +371,7 @@ def save_calibration_session(directory, frames, *, arm=None, fit_policy=None):
     session fits with its own choices and circles (combined Stitch review F1, F3)."""
     path = Path(directory) / 'calibration-session.json'
     payload = {'schema': 'xdart.stitch_calibration_session', 'version': 2,
-               'frames': [asdict(frame) for frame in frames]}
+               'frames': [_session_row(frame) for frame in frames]}
     if arm is not None:
         payload.update(version=3, arm={'del': arm[0], 'nu': arm[1]})
     if fit_policy is not None:
@@ -620,6 +632,9 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                                 cancelled=cancelled, validation_angles=validation_angles, progress=progress,
                                 instrument_geometry=instrument_geometry, energy_bound_eV=energy_bound_eV,
                                 bounds=bounds)
+    if backend == 'xu_hist' and frames and frames[0].flip:
+        raise ValueError('the xrayutilities fit takes an unmirrored camera; fit with pyFAI MultiGeometry, '
+                         'whose xrayutilities file takes a mirrored one')
     if backend == 'xu_hist' and -1 in senses.values():
         raise ValueError("the xrayutilities fit takes psic's circle senses; fit with pyFAI MultiGeometry, "
                          'whose xrayutilities file takes a reversed circle')
@@ -630,7 +645,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     controls, calibrants, calibrations = zip(*loaded)
     base = calibrations[0]
     for frame, cal, calibrant in zip(frames, calibrations, calibrants):
-        if frame.shape != frames[0].shape or frame.rotation != frames[0].rotation:
+        if (frame.shape, frame.rotation, frame.flip) != (frames[0].shape, frames[0].rotation, frames[0].flip):
             raise ValueError('all calibration frames must share shape and orientation')
         if dict(cal.detector_config) != dict(base.detector_config) or cal.poni.detector != base.poni.detector:
             raise ValueError('calibration frames have different detector configurations')
@@ -680,7 +695,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
         message = 'Converged; fixed SURFACE camera x−, z+ and PSIC circle convention'
     else:
         raise ValueError('unknown calibration backend')
-    provenance = {'frames': [asdict(frame) for frame in frames], 'rms_q_A^-1': rms,
+    provenance = {'frames': [_session_row(frame) for frame in frames], 'rms_q_A^-1': rms,
                   'condition_number': condition, 'n_points': count,
                   'distance_seed_m': distance_seed_m, 'distance_bounds_m': distance_bounds_m,
                   'fit_motor_scales': bool(fit_scales) if backend == 'multigeometry' else False,
@@ -688,6 +703,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                                      if motor is not None}
                                     if backend == 'multigeometry' else {'nu': nu_motor, 'del': del_motor}),
                   'image_rotation': frames[0].rotation,
+                  **({'image_flip': True} if frames[0].flip else {}),  # older provenance: not mirrored
                   'direct_beam': distance_provenance}
     if instrument_geometry is not None:  # which motor drives which circle, for RSM and later reads
         provenance['instrument_geometry'] = dict(instrument_geometry)
@@ -822,7 +838,7 @@ def _fit_xu_extended(frames, *, del_motor, nu_motor, distance_seed_m, distance_b
         validation_angles = [(d, n) for d in np.linspace(*limits['del'], 7) for n in np.linspace(*limits['nu'], 7)]
     asset, transfer = transfer_arm_to_xu(
         extended.asset['calibration'], validation_angles=validation_angles,
-        source_motors=(del_motor, nu_motor), image_rotation=frames[0].rotation,
+        source_motors=(del_motor, nu_motor), image_rotation=frames[0].rotation, image_flip=frames[0].flip,
         cancelled=cancelled, progress=progress)
     provenance = {**extended.asset['provenance'], 'source_motors': {'nu': nu_motor, 'del': del_motor},
                   'xu_transfer': transfer, 'pyfai_extended_arm': extended.asset['calibration']}
@@ -873,7 +889,8 @@ def save_calibration_fit(fit: CalibrationFit, path):
         )
         capture_stitch_geometry(StitchGeometryInput(path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
             source_motors=tuple(sorted(fit.asset['provenance']['source_motors'].items())),
-            image_rotation=fit.asset['provenance']['image_rotation']))
+            image_rotation=fit.asset['provenance']['image_rotation'],
+            image_flip=fit.asset['provenance'].get('image_flip', False)))
     with provenance.open('x') as stream:
         json.dump(fit.asset['provenance'], stream, indent=2, allow_nan=False)
     return str(path)
@@ -942,7 +959,8 @@ def save_calibration_pair(fit: CalibrationFit, path, *, validation_angles, cance
     try:
         asset, transfer = transfer_arm_to_xu(
             fit.asset['calibration'], validation_angles=validation_angles, source_motors=(del_motor, nu_motor),
-            image_rotation=provenance['image_rotation'], cancelled=cancelled, progress=progress)
+            image_rotation=provenance['image_rotation'], image_flip=provenance.get('image_flip', False),
+            cancelled=cancelled, progress=progress)
     except XuTransferRefused as refusal:
         return SavedCalibration(saved, None, f'no xrayutilities file: {refusal}')
     except InterruptedError:

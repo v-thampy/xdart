@@ -43,6 +43,7 @@ from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
 from xrd_tools.analysis.stitch_native import native_ceilings
 from xrd_tools.analysis.stitch_operation import StitchGeometryKind
+from xrd_tools.core.geometry import ImageOrientation
 from xrd_tools.analysis.stitch_sources import StitchSourceSelection
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifactPayload
@@ -247,6 +248,34 @@ def monitor_choices(counters):
         name for name in counters if name.strip() and name.strip().lower() not in _NOT_MONITORS))
     likely = [name for name in kept if _LIKELY_MONITOR.match(name.strip())]
     return ("None", *likely, *(name for name in kept if name not in likely))
+
+
+#: The detector camera's eight values, "rows, columns" (xrayutilities' detectorDir1, detectorDir2), Stitch's
+#: frame first: an image rotation of 0 before the camera (maintainer, 2026-09-30).
+CAMERAS = tuple(f"{rows}, {columns}" for rows, columns in (
+    ("x-", "z+"), ("x-", "z-"), ("x+", "z-"), ("x+", "z+"),
+    ("z-", "x-"), ("z-", "x+"), ("z+", "x+"), ("z+", "x-")))
+
+
+def camera_text(orientation) -> str:
+    """The camera ("rows, columns") whose images Stitch turns and mirrors by ``orientation``."""
+    from xrd_tools.core.geometry.camera import stitch_camera
+    camera = stitch_camera(orientation)
+    return f"{camera.rows}, {camera.columns}"
+
+
+def _camera_field(field, value):
+    """The camera field showing ``value``: a value no camera is (an invalid xrayutilities file's blank) stays shown."""
+    return replace(field, value=value, choices=CAMERAS + (() if value in CAMERAS else (str(value),)))
+
+
+def camera_orientation(text) -> ImageOrientation:
+    """The turn and mirror bringing a camera's ("rows, columns") images into Stitch's frame."""
+    from xrd_tools.core.geometry.camera import DetectorCamera, stitch_orientation
+    parts = tuple(part.strip() for part in str(text or "").split(","))
+    if len(parts) != 2:
+        raise ValueError("choose the detector camera (Advanced): its rows' and columns' directions, e.g. x-, z+")
+    return stitch_orientation(DetectorCamera(*parts))
 
 
 @functools.lru_cache(maxsize=8)
@@ -806,14 +835,20 @@ class StitchPage(QtWidgets.QWidget):
             ("raw_dtype", "Data type", "int32"), ("raw_header_skip", "Header bytes", "0"),
             ("source_motors", "Angle mapping", "del_angle=del, nu_angle=nu"),
             ("poni_references", "PONI reference", "del=0, nu=0"),
-            ("image_rotation", "Rotation (°)", "0"),
+            ("camera", "Camera (rows, columns)", CAMERAS[0]),
             ("frame_start", "First frame", "0"), ("frame_stop", "Last frame", ""),
             ("frame_step", "Frame step", "1"), ("max_frame_mib", "Max frame MiB", "256"),
         )
         self._field(advanced_card, SectionId.EXPERIMENT, "geometry_kind", "Geometry",
                     "Goniometer JSON", choices=("Goniometer JSON", "PONI + offsets"))
         for key, label, value in fields:
-            self._field(advanced_card, SectionId.SOURCE, key, label, value)
+            self._field(advanced_card, SectionId.SOURCE, key, label, value,
+                        choices=CAMERAS if key == "camera" else ())
+        self._rows["camera"].setToolTip(
+            "The detector's camera, as Calibrate ▸ 1 · Instrument ▸ Detector gives it: the lab directions the "
+            "stored images' rows and columns run along (x up, z to the left looking downstream). Stitch turns "
+            "and mirrors every frame, its mask, dark and flat into its frame (x-, z+, the default) as the "
+            "calibration was made.")
         self._field(advanced_card, SectionId.SOURCE, "output_family", "Result names")
         self._rows["output_family"].setToolTip(
             "Blank names are automatic: <file>-<scan> for one scan, and the scans listed for a "
@@ -1273,6 +1308,8 @@ class StitchPage(QtWidgets.QWidget):
         if key == "unit":
             value = _LEGACY_AXES.get(value, value)
         field = replace(self._fields[key], value=value)
+        if key == "camera":
+            field = _camera_field(field, value)
         if key == "monitor":  # "" in older settings: none; any other name stays a choice
             value = str(value or "").strip() or "None"
             field = replace(field, value=value, choices=self._monitor_choices(value))
@@ -1511,8 +1548,8 @@ class StitchPage(QtWidgets.QWidget):
         xu = self._value("backend") == "xrayutilities histogram"
         self._sync_advanced()
         self.set_field("source_motors", "del=del, nu=nu" if xu else "del_angle=del, nu_angle=nu")
-        if not xu and not str(self._value("image_rotation")).strip():
-            self.set_field("image_rotation", "0")
+        if not xu and not str(self._value("camera")).strip():
+            self.set_field("camera", CAMERAS[0])
         self.set_field("q_max", "5.2" if xu else "6.2")
         self._refresh_xu_geometry()
         self._sync_goniometer_mapping()
@@ -1701,16 +1738,19 @@ class StitchPage(QtWidgets.QWidget):
                     project_root=project)
             acquisition = calibration.projection.value["acquisition"]
         except (ValueError, TypeError, OSError):
-            values = {"source_motors": "", "image_rotation": ""}
-            tip = "Select a valid XU calibration to inspect its angle mapping and rotation."
+            values = {"source_motors": "", "camera": ""}
+            tip = "Select a valid XU calibration to inspect its angle mapping and camera."
         else:
             values = dict(source_motors=", ".join(  # a single 2θ arm's asset names no nu motor
                 f"{name}={source}" for name, source in acquisition["source_motors"].items() if source),
-                image_rotation=90 * acquisition["image_rotation_quarter_turns"])
+                camera=camera_text(ImageOrientation(rotation=90 * acquisition["image_rotation_quarter_turns"],
+                                                    flip_horizontal=acquisition.get("image_flip", False))))
             tip = "Defined by the selected XU calibration; change it in Calibrate."
         values.update(geometry_kind="Goniometer JSON", poni_references="")
         for key, value in values.items():
             field = replace(self._fields[key], value=value)
+            if key == "camera":
+                field = _camera_field(field, value)
             self._fields[key] = field
             self._rows[key].apply_field(field)
             self._rows[key].setToolTip(tip)
@@ -1752,6 +1792,7 @@ class StitchPage(QtWidgets.QWidget):
         value = self._value
         kind = (StitchGeometryKind.PYFAI_GONIOMETER_JSON if value("geometry_kind") == "Goniometer JSON"
                 else StitchGeometryKind.PONI)
+        orientation = camera_orientation(value("camera"))  # the detector camera's turn and mirror
         monitor = str(value("monitor")).strip()
         monitor = "" if monitor == "None" else monitor
         directory = value("source_kind") == "Directory"
@@ -1816,7 +1857,7 @@ class StitchPage(QtWidgets.QWidget):
             source_motors=_parse_pairs(value("source_motors")),
             poni_references=(_parse_references(value("poni_references"))
                              if kind is StitchGeometryKind.PONI else ()),
-            image_rotation=int(value("image_rotation")),
+            image_rotation=orientation.rotation, image_flip=orientation.flip_horizontal,
             threshold=None if value("threshold") is None or not str(value("threshold")).strip() else float(value("threshold")),
             q_range=None if value("radial_auto") else (float(value("q_min")), float(value("q_max"))), npt_1d=int(value("npt_1d")),
             output_path=output, monitor_selector=MetadataColumnSelector(monitor) if monitor else None,
@@ -1844,7 +1885,8 @@ class StitchPage(QtWidgets.QWidget):
             backend="xrayutilities histogram" if form.backend == "xu_hist" else "pyFAI MultiGeometry",
             detector_rows=form.detector_shape[0], detector_cols=form.detector_shape[1],
             source_motors=", ".join(f"{key}={value}" for key, value in form.source_motors),
-            image_rotation=form.image_rotation, frame_start=form.frame_selector.start_label,
+            camera=camera_text(ImageOrientation(rotation=form.image_rotation, flip_horizontal=form.image_flip)),
+            frame_start=form.frame_selector.start_label,
             frame_stop="" if form.frame_selector.stop_label is None else form.frame_selector.stop_label,
             frame_step=form.frame_selector.step, radial_auto=form.q_range is None,
             frame_check=_choice(_FRAME_CHECKS, form.frame_screen),
@@ -2273,7 +2315,9 @@ class StitchPage(QtWidgets.QWidget):
                 self._authoring_dialogs.append(self._calibration_dialog)
             source = self._source_spec_for_tools() if unconfigured else None
             if source is not None:  # the window names the motors from the geometry it was given
-                self._calibration_dialog.set_source_context(source, image_rotation=int(self._value("image_rotation") or 0),
+                orientation = self._image_orientation()
+                self._calibration_dialog.set_source_context(source, image_rotation=orientation.rotation,
+                    image_flip=orientation.flip_horizontal,
                     geometry_path=(self._value("geometry_path") or None
                                    if self._value("geometry_kind") == "Goniometer JSON" else None))
             self._calibration_dialog.show()
@@ -2302,8 +2346,16 @@ class StitchPage(QtWidgets.QWidget):
             # the pyFAI side always (Backend may change later); xrayutilities then shows its partner's
             self._adopt_mapping(tuple(dialog.saved_source_motors.items()))
             self._sync_goniometer_mapping()
-            self.set_field("image_rotation", dialog.saved_image_rotation)
+            self.set_field("camera", camera_text(ImageOrientation(rotation=dialog.saved_image_rotation,
+                                                                  flip_horizontal=dialog.saved_image_flip)))
             self._refresh_xu_geometry()
+
+    def _image_orientation(self):
+        """The camera's turn and mirror into Stitch's frame (none while it is blank or malformed)."""
+        try:
+            return camera_orientation(self._value("camera"))
+        except ValueError:
+            return ImageOrientation()
 
     def _make_mask(self):
         from .mask import StitchMaskDialog
@@ -2312,7 +2364,7 @@ class StitchPage(QtWidgets.QWidget):
         try:
             source = self._source_spec_for_tools()
             dialog = StitchMaskDialog(str(self._value("project_root")), source=source,
-                rotation=int(self._value("image_rotation")), reader_options=dict(
+                rotation=self._image_orientation().rotation, reader_options=dict(
                     detector_shape=(int(self._value("detector_rows")), int(self._value("detector_cols"))),
                     raw_dtype=str(self._value("raw_dtype")), raw_header_skip=int(self._value("raw_header_skip")),
                     rotation=0), parent=self)
@@ -2672,7 +2724,7 @@ class StitchPage(QtWidgets.QWidget):
         for row in self._rows.values():
             row.setEnabled(idle)
         if self._value("backend") == "xrayutilities histogram":
-            locked = ("geometry_kind", "source_motors", "poni_references", "image_rotation")
+            locked = ("geometry_kind", "source_motors", "poni_references", "camera")
             for key in locked:
                 self._rows[key].setEnabled(False)
         elif self._value("geometry_kind") != "PONI + offsets":

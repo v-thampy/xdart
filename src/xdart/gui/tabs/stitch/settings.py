@@ -92,6 +92,11 @@ def apply_page_settings(page, document: Any) -> None:
     for key, value in fields.items():
         if key not in _FIRST and key not in _THRESHOLD:
             page.set_field(key, value)
+    saved = document.get("fields", {})
+    if "camera" not in saved and str(saved.get("image_rotation", "")).strip() in ("0", "90", "180", "270"):
+        from xrd_tools.core.geometry import ImageOrientation  # older settings: the rotation's unmirrored camera
+        from .page import camera_text
+        page.set_field("camera", camera_text(ImageOrientation(rotation=int(saved["image_rotation"]))))
     threshold = document.get("threshold")
     if threshold:
         state = ThresholdState(bool(threshold.get("apply_threshold")),

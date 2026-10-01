@@ -383,6 +383,9 @@ class StitchGeometryInput:
     reference_motor_positions: tuple[tuple[str, float], ...] = ()
     image_rotation: int = 0
     base_preset: str = "psic"
+    #: the frames are also mirrored left-right after the rotation: a mirrored detector camera's
+    #: transform into Stitch's frame (``camera.stitch_orientation``)
+    image_flip: bool = False
 
     def __post_init__(self) -> None:
         if type(self.kind) is not StitchGeometryKind:
@@ -418,6 +421,8 @@ class StitchGeometryInput:
             )
         if type(self.image_rotation) is not int or self.image_rotation not in {0, 90, 180, 270}:
             raise ValueError("image rotation must be an exact 0/90/180/270 integer")
+        if type(self.image_flip) is not bool:
+            raise ValueError("image flip must be an exact boolean")
         if self.base_preset != "psic":
             raise ValueError("S1 supports only the canonical psic base preset")
         object.__setattr__(self, "path", path)
@@ -472,7 +477,7 @@ class StitchGeometryReceipt:
                 self.request.reference_motor_positions,
                 self.request.image_rotation,
                 self.request.base_preset,
-            ),
+            ) + ((("image-flip", True),) if self.request.image_flip else ()),  # unmirrored: as before
         )
         object.__setattr__(self, "_content", bytes(_content_input))
         object.__setattr__(self, "fingerprint", fingerprint)
@@ -1914,7 +1919,7 @@ def _provenance(
         "image_orientation": {
             "rotation": geometry_request.image_rotation,
             "flip_vertical": False,
-            "flip_horizontal": False,
+            "flip_horizontal": geometry_request.image_flip,
             "transpose": False,
         },
         "base_preset": geometry_request.base_preset,
@@ -2510,7 +2515,7 @@ class _OrientedSource(BaseFrameSource):
 
 def _runtime_geometry(receipt: StitchGeometryReceipt, raw: bytes):
     request = receipt.request
-    orientation = ImageOrientation(rotation=request.image_rotation)
+    orientation = ImageOrientation(rotation=request.image_rotation, flip_horizontal=request.image_flip)
     if request.kind is StitchGeometryKind.PYFAI_GONIOMETER_JSON:
         base = Diffractometer.psic()
         diffractometer = Diffractometer.from_pyfai_goniometer(

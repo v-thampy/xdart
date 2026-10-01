@@ -208,6 +208,7 @@ def prepare_native_stitch_tool(form, project):
             form.geometry_path, form.geometry_kind,
             expected_sha256=form.expected_geometry_sha256, source_motors=form.source_motors,
             reference_motor_positions=form.poni_references, image_rotation=form.image_rotation,
+            image_flip=form.image_flip,
         ))
         plan = StitchOperationPlan(
             geometry, use_detector_mask=form.use_detector_mask,
