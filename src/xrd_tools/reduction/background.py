@@ -400,7 +400,7 @@ class _PreparedSeriesFrameBackground:
     and hashing every member again; its own normalization scales the mean as the full resolution does
     (``_series_result``), and the same normalization as the last frame's reuses that result. None is kept
     where a stat cannot prove an input: a metadata file reached through a link, or an EDF whose pixels live
-    in another file (Codex BG-SERIES F1, F2)."""
+    in another file, whatever its name (Codex BG-SERIES F1, F2 and the re-review's F1)."""
 
     plan: FrameBackgroundPlan
     frame_shape: tuple[int, int]
@@ -589,16 +589,21 @@ def _frame(value: tuple[object, ...], *, persisted=False) -> tuple[int, str, str
     if len(_json(value)) > _MAX_FRAME_FACT or len(_json(metadata)) > 12_288:
         raise ValueError("frame_fact exceeds its bounded encoding")
     return label, locator, selector, index, shape, metadata
-def _edf_holds_its_pixels(path: Path) -> bool:
-    """Whether a one-frame EDF stores its own pixels. Fabio reads them from another file when the header
-    names ``EDF_BinaryFileName``, and no stat of the EDF proves that file (Codex BG-SERIES F2). Header only
-    (about 0.3 ms); a multi-frame or unreadable header counts as not proven."""
+def _holds_its_pixels(path: Path) -> bool:
+    """Whether a Series member provably stores its own pixels, by its content, not its name. ``read_image``
+    decodes every non-container member through fabio, which detects EDF by content, so an EDF named ``.img``
+    or ``.tif`` also reads its pixels from the file its header names in ``EDF_BinaryFileName``, and no stat
+    of the member proves that file (Codex BG-SERIES F2 and its re-review F1). Header only (about 0.3 ms). A
+    multi-frame EDF counts as not proven, and so does a header fabio cannot read, except a ``.raw`` member:
+    ``read_image`` decodes what fabio cannot open as raw binary, whose bytes are its pixels."""
     import fabio
     try:
         with fabio.openheader(str(path)) as image:
+            if not isinstance(image, fabio.edfimage.EdfImage):
+                return True
             return int(image.nframes) == 1 and "EDF_BinaryFileName" not in image.header
     except Exception:
-        return False
+        return path.suffix.casefold() == ".raw"
 
 
 def _metadata(path: Path, plan: FrameBackgroundPlan, keys: tuple[str, ...], cancelled, *,
@@ -1012,7 +1017,8 @@ def resolve_frame_background(
             receipt_bytes = 0; norm_sum = 0.0; itemsize = None
             states = {}  # every file read and its state: a later frame's stat proof (BG-SERIES-REREAD)
             # a capsule only when those states prove every input (Codex BG-SERIES F1, F2): no metadata file
-            # reached through a link, no EDF whose pixels live in another file; else each frame resolves in full
+            # reached through a link, no member whose pixels live in another file (an EDF, by its content);
+            # else each frame resolves in full
             requested = _SERIES_CAPSULE.get()
             aliased = None if requested is None else []
             for ordinal, member in enumerate(members):
@@ -1024,8 +1030,7 @@ def resolve_frame_background(
                 itemsize = observed_itemsize
                 metadata, metadata_source = _metadata(member, plan,
                     tuple(key for key in (plan.normalization_key,) if key), cancelled, aliased=aliased)
-                if aliased is not None and (any(aliased) or (
-                        member.suffix.casefold() == ".edf" and not _edf_holds_its_pixels(member))):
+                if aliased is not None and (any(aliased) or not _holds_its_pixels(member)):
                     aliased = requested = None
                 states[source["locator"]] = tuple(source["state"])
                 if metadata_source is not None:

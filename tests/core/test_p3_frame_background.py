@@ -914,22 +914,24 @@ def test_a_series_whose_metadata_is_reached_through_a_link_keeps_no_capsule(tmp_
     assert retargeted.fingerprint != initial.fingerprint
 
 
-def test_a_series_with_an_edf_whose_pixels_live_in_another_file_keeps_no_capsule(tmp_path: Path) -> None:
-    """Codex BG-SERIES F2, its reproduction with the real EDF reader: fabio reads an EDF's pixels from the
-    file its header names in ``EDF_BinaryFileName``, which no stat of the EDF proves, so rewriting only that
-    file left the rebind on the old pixels. No capsule is kept for such a member; an EDF holding its own
-    pixels keeps one."""
+@pytest.mark.parametrize("suffix", [".edf", ".img", ".tif"])
+def test_a_series_whose_pixels_live_in_another_file_keeps_no_capsule(tmp_path: Path, suffix: str) -> None:
+    """Codex BG-SERIES F2 and its re-review F1, with the real readers: fabio reads an EDF's pixels from the file
+    its header names in ``EDF_BinaryFileName``, which no stat of the member proves, so rewriting only that file
+    left the rebind on the old pixels. Fabio detects EDF by content, so the same holds for an EDF named
+    ``.img`` or ``.tif``, which the first fix (an ``.edf`` suffix test) missed. No capsule is kept for such a
+    member; an EDF holding its own pixels, under the same name, keeps one."""
     import fabio
     from xrd_tools.reduction import background as module
     shape = (3, 4)
-    own = tmp_path / "own_1.edf"
+    own = tmp_path / f"own_1{suffix}"
     fabio.edfimage.EdfImage(data=np.full(shape, 5, dtype="<u2")).write(str(own))
     fact = _fact(tmp_path / "target_1.tif", shape=shape)
     with module.series_capsule_requested({}) as held:
         assert resolve_frame_background(FrameBackgroundPlan(mode="Series Average", locator=str(own)),
                                         fact).disposition == "RESOLVED"
     assert "series" in held  # the control
-    member, payload = tmp_path / "bg_1.edf", tmp_path / "pixels.bin"
+    member, payload = tmp_path / f"bg_1{suffix}", tmp_path / "pixels.bin"
     payload.write_bytes(np.full(shape, 3, dtype="<u2").tobytes())
     fabio.edfimage.EdfImage(data=np.zeros(shape, dtype="<u2"), header={
         "EDF_BinaryFileName": payload.name, "EDF_BinaryFileSize": "24", "EDF_BinaryFilePosition": "0",
@@ -941,3 +943,18 @@ def test_a_series_with_an_edf_whose_pixels_live_in_another_file_keeps_no_capsule
     assert "series" not in held
     payload.write_bytes(np.full(shape, 9, dtype="<u2").tobytes())
     np.testing.assert_array_equal(resolve_frame_background(plan, fact).background, np.full(shape, 9.0))
+
+
+def test_a_raw_binary_series_keeps_its_capsule(tmp_path: Path) -> None:
+    """The control for the content check: a ``.raw`` member fabio cannot open is decoded as raw binary, whose
+    bytes are its pixels, so its Series keeps the capsule (the 17-2 Pilatus case)."""
+    from xrd_tools.reduction import background as module
+    shape = (3, 4)
+    for index in (1, 2):
+        (tmp_path / f"bg_{index}.raw").write_bytes(np.full(shape, index, dtype="<i4").tobytes())
+    plan = FrameBackgroundPlan(mode="Series Average", locator=str(tmp_path / "bg_1.raw"))
+    fact = _fact(tmp_path / "target_1.tif", shape=shape)
+    with module.series_capsule_requested({}) as held:
+        result = resolve_frame_background(plan, fact)
+    assert result.disposition == "RESOLVED" and "series" in held
+    np.testing.assert_array_equal(result.background, np.full(shape, 1.5))
