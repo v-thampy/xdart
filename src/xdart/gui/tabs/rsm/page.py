@@ -8,7 +8,7 @@ its exact ``RSMToolFormV2`` and shows what the owner returns; it holds no operat
 its own. A saved result is reopened on the shared single-worker owner, off the GUI thread.
 
 Stage 1 keeps the operation's create-new output (a repeat names another file); the stable same-kind
-``_rsm.nexus`` replacement is stage 2.
+``_rsm.nexus`` replacement is stage 2. Preview creates no folder: the run makes the output's (stage 2).
 """
 from __future__ import annotations
 
@@ -654,29 +654,12 @@ class RSMPage(QtWidgets.QWidget):
         else:
             self._begin_preflight(run=True, form=form)
 
-    def _output_folder(self, form):
-        """The Output's folder, made inside the Project as Int's and Stitch's runs make theirs (the RSM
-        operation pins a folder that exists); one outside the Project the operation refuses itself."""
-        try:  # resolved, as the preflight reads them
-            folder = Path(form.output_path).resolve(strict=False).parent
-            inside = folder.is_relative_to(Path(form.project_root).resolve(strict=False))
-        except (OSError, RuntimeError):
-            return True
-        if folder.is_dir() or not inside:
-            return True
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-        except OSError as error:
-            self._notice(f"Could not make the Output folder {folder.name}: {error}")
-            return False
-        return True
-
     def _begin_preflight(self, *, run, form=None):
         if self._owner.busy:  # a running result keeps its form
             self._notice("RSM is busy · try again once it is done")
             return
         form = self._current_form() if form is None else form
-        if form is None or not self._output_folder(form):
+        if form is None:
             return
         self._owner.set_form(form)
         if self._owner.begin_preflight() is None:

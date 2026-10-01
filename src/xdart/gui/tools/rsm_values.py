@@ -1584,11 +1584,8 @@ def prepare_rsm_tool_v2(
             "OUTPUT_SYMLINK_UNSUPPORTED",
             "RSM output target must not be a symbolic link",
         )
-    if not (project / output_relative).parent.is_dir():
-        raise RSMToolPreflightRefused(
-            "OUTPUT_PARENT_UNAVAILABLE",
-            "RSM output parent directory must already exist",
-        )
+    # The output's folder need not exist: the operation qualifies its existing ancestry and its run
+    # makes the folder, as Stitch's does (AUD-9 stage 2); Preview creates nothing.
     try:
         asset = capture_rsm_geometry_asset(
             form.geometry_asset,

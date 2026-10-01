@@ -656,10 +656,17 @@ def _bind_project_output(
 
 @dataclass(frozen=True, slots=True)
 class RSMOutputAuthorityReceipt:
-    """Preview-time identity of the canonical directory owning RSM output."""
+    """Preview-time identity of the canonical directory owning RSM output.
+
+    ``created_relative_path`` (RSM v2 only) is set when the output's folder did
+    not exist at Preview: the identity is then the deepest existing directory on
+    its path, and the run creates the folders below it (as Stitch's run creates
+    its output folder, AUD-9 stage 2), so Preview creates nothing.
+    """
 
     parent_relative_path: str
     parent_identity: tuple[int, int, int]
+    created_relative_path: str | None = None
 
     def __post_init__(self) -> None:
         relative = self.parent_relative_path
@@ -668,9 +675,13 @@ class RSMOutputAuthorityReceipt:
                 relative,
                 "RSM output parent path",
             )
+        created = self.created_relative_path
+        if created is not None:
+            created = _manifest_relative_path(created, "RSM output folder path")
         if (
             type(self.parent_relative_path) is not str
             or relative != self.parent_relative_path
+            or created != self.created_relative_path
             or type(self.parent_identity) is not tuple
             or len(self.parent_identity) != 3
             or any(type(item) is not int for item in self.parent_identity)
@@ -680,7 +691,7 @@ class RSMOutputAuthorityReceipt:
 
     def to_provenance(self) -> dict[str, object]:
         mode, device, inode = self.parent_identity
-        return {
+        value: dict[str, object] = {
             "parent_relative_path": self.parent_relative_path,
             "parent_identity": {
                 "mode": mode,
@@ -688,17 +699,26 @@ class RSMOutputAuthorityReceipt:
                 "inode": inode,
             },
         }
+        if self.created_relative_path is not None:
+            value["created_relative_path"] = self.created_relative_path
+        return value
 
 
 def _capture_output_authority(
     output: ModuleOutputRequest,
     project_root: str | Path,
+    *,
+    allow_absent_parent: bool = False,
 ) -> RSMOutputAuthorityReceipt:
     root = _project_root(project_root)
     parent = Path(output.target).parent
+    authority, created = parent, ()
+    if allow_absent_parent:  # the deepest existing directory on the folder's path
+        while authority != root and not os.path.lexists(authority):
+            authority, created = authority.parent, (authority.name, *created)
     try:
-        relative = parent.relative_to(root)
-        observed = os.stat(parent, follow_symlinks=False)
+        relative = authority.relative_to(root)
+        observed = os.stat(authority, follow_symlinks=False)
     except (OSError, ValueError) as error:
         raise RSMOperationRefused(
             "OUTPUT_PARENT_UNAVAILABLE",
@@ -713,25 +733,112 @@ def _capture_output_authority(
     return RSMOutputAuthorityReceipt(
         relative_path,
         (int(observed.st_mode), int(observed.st_dev), int(observed.st_ino)),
+        "/".join(created) if created else None,
     )
+
+
+def _created_output_folders(
+    output: ModuleOutputRequest,
+    root: Path,
+    authority: RSMOutputAuthorityReceipt,
+) -> tuple[Path, ...]:
+    """The folders below a Preview-time authority that the run creates, from the
+    outermost; the authority must be the directory Preview qualified."""
+
+    anchor = (
+        root
+        if authority.parent_relative_path == "."
+        else root / authority.parent_relative_path
+    )
+    folders = []
+    for part in Path(authority.created_relative_path).parts:
+        folders.append((folders[-1] if folders else anchor) / part)
+    observed = os.stat(anchor, follow_symlinks=False)
+    if (
+        folders[-1] != Path(output.target).parent
+        or not stat.S_ISDIR(observed.st_mode)
+        or (int(observed.st_mode), int(observed.st_dev), int(observed.st_ino))
+        != authority.parent_identity
+    ):
+        raise RSMOperationRefused(
+            "OUTPUT_IDENTITY_MISMATCH",
+            "RSM output path authority changed after Preview",
+        )
+    return tuple(folders)
+
+
+def _create_rsm_v2_output_folder(request: RSMOperationRequestV2) -> None:
+    """Make the output's folder Preview qualified without creating it (at the
+    start of a run, as Stitch's run makes its output folder): each folder below
+    the unchanged authority is made, or must already be, one ordinary directory."""
+
+    authority = request.output_authority
+    if authority.created_relative_path is None:
+        return
+    root = _project_root(request.preflight.project_root)
+    try:
+        folders = _created_output_folders(request.module.output, root, authority)
+    except OSError as error:
+        raise RSMOperationRefused(
+            "OUTPUT_IDENTITY_MISMATCH",
+            "RSM output path authority changed after Preview",
+        ) from error
+    for folder in folders:
+        try:
+            os.mkdir(folder)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise RSMOperationRefused(
+                "OUTPUT_PARENT_UNAVAILABLE",
+                f"RSM output folder could not be made: {error}",
+            ) from error
+        try:
+            ordinary = stat.S_ISDIR(os.lstat(folder).st_mode)
+        except OSError:
+            ordinary = False
+        if not ordinary:
+            raise RSMOperationRefused(
+                "OUTPUT_IDENTITY_MISMATCH",
+                "RSM output path authority changed after Preview",
+            )
 
 
 def _requalify_project_output(
     output: ModuleOutputRequest,
     project_root: str | Path,
     authority: RSMOutputAuthorityReceipt,
+    *,
+    folders_made: bool = True,
 ) -> None:
     """Refuse completed namespace changes under the trusted-Project boundary.
 
     This is deliberately not a descriptor-bound publication claim.  Concurrent
     mutation by an untrusted actor in a shared-writable Project remains held for
     the common Stitch/RSM output namespace owner.
+
+    Below an authority captured without the output's folder, each folder must be
+    one ordinary directory once the run has made them (``folders_made``), and
+    absent or one before.
     """
 
     try:
         current = _bind_project_output(output, project_root)
-        current_authority = _capture_output_authority(current, project_root)
-    except RSMOperationRefused as error:
+        if (
+            type(authority) is RSMOutputAuthorityReceipt
+            and authority.created_relative_path is not None
+        ):
+            for folder in _created_output_folders(
+                current, _project_root(project_root), authority
+            ):
+                if not folders_made and not os.path.lexists(folder):
+                    break
+                if not stat.S_ISDIR(os.lstat(folder).st_mode):
+                    raise RSMOperationRefused("OUTPUT_IDENTITY_MISMATCH")
+            current_authority = authority
+        else:
+            current_authority = _capture_output_authority(current, project_root)
+    except (RSMOperationRefused, OSError) as error:
         raise RSMOperationRefused(
             "OUTPUT_IDENTITY_MISMATCH",
             "RSM output path authority changed after Preview",
@@ -3656,7 +3763,8 @@ def prepare_rsm_operation_v2(
             "geometry asset is not bound to the selected Project",
         )
     output = _bind_project_output(output, root)
-    output_authority = _capture_output_authority(output, root)
+    # Preview creates no folder: the run makes it (_create_rsm_v2_output_folder)
+    output_authority = _capture_output_authority(output, root, allow_absent_parent=True)
 
     from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
 
@@ -3776,7 +3884,7 @@ def prepare_rsm_operation_v2(
     revalidate_rsm_geometry_asset(geometry_asset_receipt)
     for source in source_group.members:
         _fresh_table(source, cancel_token=cancel_token)
-    _requalify_project_output(output, root, output_authority)
+    _requalify_project_output(output, root, output_authority, folders_made=False)
     provenance = _rsm_v2_provenance(
         source_group,
         output,
@@ -5391,6 +5499,7 @@ class RSMOperationExecutionV2:
             return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
         try:
             _require_rsm_v2_memory_plan(self.request)
+            _create_rsm_v2_output_folder(self.request)
             _revalidate_rsm_v2_authorities(
                 self.request,
                 cancel_token=cancel_token,

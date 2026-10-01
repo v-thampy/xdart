@@ -124,8 +124,9 @@ def _commit_instead_of_gridding(monkeypatch, values):
 
 def test_preview_lists_every_identity_and_run_paints_the_committed_six(qapp, tmp_path, monkeypatch):
     """Preview through the one RSM v2 owner (its real preflight on two ordered synthetic members) lists
-    every member and identity; Run previews, grids and paints the committed result's six products on the
-    shared panes, lists it, and the readiness line then names the existing output."""
+    every member and identity and creates no folder (stage 2: the run makes the output's); Run previews,
+    grids and paints the committed result's six products on the shared panes, lists it, and the readiness
+    line then names the existing output."""
     _commit_instead_of_gridding(monkeypatch, _values())
     page = _page(qapp)
     try:
@@ -133,9 +134,9 @@ def test_preview_lists_every_identity_and_run_paints_the_committed_six(qapp, tmp
         assert page._readiness[1], page._readiness
         output = Path(page._value("output_path"))
         assert str(output) == suggested_output(tmp_path, page._members)
-        assert not output.parent.exists()  # Preview makes the Output folder the operation pins
         page.begin_preview()
         _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text())
+        assert not output.parent.exists()  # Preview creates nothing (stage 2)
         shown = page.preview_text.toPlainText()
         assert "Ordered members: 2 · total frames 4" in shown and "Member 2:" in shown
         page.begin_run()
@@ -154,6 +155,7 @@ def test_preview_lists_every_identity_and_run_paints_the_committed_six(qapp, tmp
         np.testing.assert_array_equal(page.view.slices[2].canvas.raw_image, np.asarray(moved.products[2].values).T)
         assert page.results.count() == 1 and page.results.item(0).text() == output.name
         assert page.run_bar.readinessLabel.full_text() == f"Saved {output.name}"
+        output.parent.mkdir()
         output.write_bytes(b"")  # the run's file, as a real commit leaves it
         page.set_field("grid", "Full 200×200×200")  # a repeat: the next edit names the existing file
         assert page._readiness == (f"Output exists · choose another name ({output.name})", False)

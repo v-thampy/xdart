@@ -2306,3 +2306,79 @@ def test_v2_refuses_the_retired_replace_output_policy(tmp_path):
     initial = _form(tmp_path, (member,))
     with pytest.raises(ValueError, match="must create a new artifact"):
         replace(initial, overwrite=AnalysisArtifactOverwrite.REPLACE)
+
+
+# AUD-9 stage 2: the output folder made by the run
+
+
+def _runnable(monkeypatch, level=10):
+    """Synthetic members that grid: their exact q bounds fixed, and each frame one (195, 487) image of
+    ``level`` plus its label."""
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+
+    monkeypatch.setattr(
+        rsm_operation,
+        "_resolve_exact_rsm_q_bounds_active",
+        lambda *_args, **_kwargs: ((-8.0, 8.0), (-8.0, 8.0), (-8.0, 8.0)),
+    )
+    monkeypatch.setattr(
+        SpecSource,
+        "load_frame",
+        lambda _self, index: np.full((195, 487), level + int(index), dtype=np.float64),
+    )
+
+
+def test_v2_preview_creates_no_folder_and_the_run_makes_it(tmp_path, monkeypatch):
+    """A fresh Project's Preview qualifies the output folder's existing ancestry and creates nothing; the run
+    makes the folder below the unchanged authority, then commits (Stitch's run makes its folder too)."""
+    _runnable(monkeypatch)
+    folder = tmp_path / "xdart_processed_data"
+    form = replace(
+        _form(tmp_path, (_write_member(tmp_path, 0),)),
+        output_path=folder / "sample_rsm.nexus",
+    )
+    request = prepare_rsm_tool_v2(form).request
+    assert not folder.exists()
+    authority = request.output_authority
+    assert (authority.parent_relative_path, authority.created_relative_path) == (
+        ".",
+        "xdart_processed_data",
+    )
+    assert request.provenance["output"]["created_relative_path"] == "xdart_processed_data"
+    result = run_rsm_operation_v2(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal.code
+    assert folder.is_dir() and (folder / "sample_rsm.nexus").is_file()
+
+
+def test_v2_an_existing_output_folder_keeps_its_exact_authority_and_provenance(tmp_path):
+    """A folder that exists at Preview is pinned as before: no created path, and the output provenance keeps
+    exactly its earlier keys (no family when none is named)."""
+    request = prepare_rsm_tool_v2(_form(tmp_path, (_write_member(tmp_path, 0),))).request
+    assert request.output_authority.created_relative_path is None
+    assert set(request.provenance["output"]) == {
+        "kind",
+        "target",
+        "overwrite",
+        "output_fingerprint",
+        "parent_relative_path",
+        "parent_identity",
+    }
+
+
+def test_v2_a_folder_swapped_for_a_link_after_preview_is_refused(tmp_path, monkeypatch):
+    """The run makes only ordinary folders below the authority Preview qualified: one made meanwhile as a
+    link out of the Project refuses the run, and nothing is written through it."""
+    _runnable(monkeypatch)
+    project, outside = tmp_path / "project", tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    form = replace(
+        _form(project, (_write_member(project, 0),)),
+        output_path=project / "xdart_processed_data" / "sample_rsm.nexus",
+    )
+    request = prepare_rsm_tool_v2(form).request
+    (project / "xdart_processed_data").symlink_to(outside, target_is_directory=True)
+    result = run_rsm_operation_v2(request)
+    assert result.terminal.disposition is ModuleDisposition.REFUSED
+    assert result.terminal.code == "OUTPUT_IDENTITY_MISMATCH"
+    assert not any(outside.iterdir())
