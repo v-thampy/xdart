@@ -4,7 +4,7 @@
 A dialog opens in the directory of the last successful pick, then the field's own
 folder, then the page's fallback (the Project folder); a pick is remembered for the
 next one (:mod:`xdart.utils.browse`). Int and Stitch offer the same file types for
-the same kinds of input.
+the same kinds of input. A save offers its default file name in that folder.
 """
 from __future__ import annotations
 
@@ -18,17 +18,35 @@ BACKGROUND_IMAGE_FILTER = "Detector images (*.tif *.tiff *.cbf *.edf *.img *.mar
 #: A Stitch calibration: a PONI or a goniometer / XU calibration JSON.
 CALIBRATION_FILTER = "Calibrations (*.poni *.json);;All files (*)"
 NEXUS_FILTER = "NeXus / HDF5 (*.nexus *.nxs *.h5 *.hdf5);;All files (*)"
+#: An original detector frame to draw a mask on: an image file, or a raw NeXus / Eiger master.
+DETECTOR_SOURCE_FILTER = ("Detector images and raw NeXus (*.tif *.tiff *.cbf *.edf *.img *.mar3450 *.raw "
+                          "*.nxs *.h5 *.hdf5);;All files (*)")
+#: A page's saved settings (Stitch's File ▸ Save / Load Settings).
+SETTINGS_FILTER = "Settings (*.json);;All files (*)"
 ANY_FILTER = "All files (*)"
 
 
-def browse(parent, title: str, *, folder: bool = False, many: bool = False,
-           file_filter: str = ANY_FILTER, current: str = "", fallback: str = "") -> list[str]:
-    """Ask for a folder, a file or files; return the picks ([] when cancelled)."""
+def browse(parent, title: str, *, folder: bool = False, many: bool = False, save: bool = False,
+           file_filter: str = ANY_FILTER, current: str = "", fallback: str = "",
+           default_name: str = "") -> list[str]:
+    """Ask for a folder, a file or files, or (``save``) a file to write; return the picks ([] when
+    cancelled, and nothing is remembered then).
+
+    A save offers ``default_name`` in the start folder. An absolute ``default_name`` is offered as it
+    is: a managed location the caller then checks (Stitch's calibration save, inside its Project).
+    """
+    from os.path import isabs, join
+
     from pyqtgraph.Qt import QtWidgets
 
     start = browse_start_dir(current, fallback=fallback)
     picks: list[str]
-    if folder:
+    if save:
+        offered = (default_name if isabs(default_name or "")
+                   else join(start, default_name) if start and default_name else default_name or start)
+        chosen, _filter = QtWidgets.QFileDialog.getSaveFileName(parent, title, offered, file_filter)
+        picks = [chosen] if chosen else []
+    elif folder:
         chosen = QtWidgets.QFileDialog.getExistingDirectory(parent, title, start)
         picks = [chosen] if chosen else []
     elif many:
@@ -64,5 +82,6 @@ def browse_spec(parent, title: str, *, many: bool = False, current: str = "",
 
 __all__ = [
     "ANY_FILTER", "BACKGROUND_IMAGE_FILTER", "CALIBRATION_FILTER", "CORRECTION_FILTER",
-    "MASK_FILTER", "NEXUS_FILTER", "PONI_FILTER", "browse", "browse_spec",
+    "DETECTOR_SOURCE_FILTER", "MASK_FILTER", "NEXUS_FILTER", "PONI_FILTER", "SETTINGS_FILTER",
+    "browse", "browse_spec",
 ]

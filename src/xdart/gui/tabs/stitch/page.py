@@ -2978,12 +2978,10 @@ class StitchPage(QtWidgets.QWidget):
             self._calibration_dialog.apply_settings(self._calibration_settings)
 
     def _choose_settings_path(self, action, start):
-        caption, file_filter = "Stitch settings", "Stitch settings (*.json);;All files (*)"
-        if action == "save":
-            selected, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save " + caption, start, file_filter)
-        else:
-            selected, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load " + caption, start, file_filter)
-        return selected or None
+        from xdart.gui.widgets import file_dialogs
+        picks = file_dialogs.browse(self, ("Save " if action == "save" else "Load ") + "Stitch settings",
+                                    save=action == "save", file_filter=file_dialogs.SETTINGS_FILTER, current=start)
+        return picks[0] if picks else None
 
     def _settings_path(self, action):
         from xdart.utils.browse import browse_start_dir, remember_browse_path

@@ -934,10 +934,10 @@ class RSMPage(QtWidgets.QWidget):
             picks = dialogs.browse(self, "Choose folder", folder=True, **common)
         elif key == "member_spec":
             picks = dialogs.browse_spec(self, "Choose SPEC file", **common)
-        elif key == "output_path":
-            chosen, _filter = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Choose RSM output", common["current"] or common["fallback"], "NeXus result (*.nexus)")
-            picks = [chosen] if chosen else []
+        elif key == "output_path":  # the shared save: the last folder, the current output's name
+            picks = dialogs.browse(self, "Choose RSM output", save=True, file_filter="NeXus result (*.nexus)",
+                                   default_name=Path(common["current"]).name if common["current"] else "",
+                                   **common)
         else:
             picks = dialogs.browse(self, "Choose " + self._fields[key].label, **common)
         if picks:

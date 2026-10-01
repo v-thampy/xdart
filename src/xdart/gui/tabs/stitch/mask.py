@@ -63,7 +63,12 @@ class StitchMaskDialog(QtWidgets.QDialog):
         self.source_label.setText(str(selected))
 
     def _choose(self):
-        selected, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose original detector image", self._project_root)
+        from xdart.gui.widgets import file_dialogs
+        picks = file_dialogs.browse(self, "Choose original detector image",
+                                    file_filter=file_dialogs.DETECTOR_SOURCE_FILTER,
+                                    current=str(getattr(self._source, "uri", "") or ""),
+                                    fallback=str(self._project_root or ""))
+        selected = picks[0] if picks else ""
         if selected:
             try:
                 self.set_source_path(selected)

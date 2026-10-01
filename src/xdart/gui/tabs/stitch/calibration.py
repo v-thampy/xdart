@@ -1782,8 +1782,12 @@ class StitchCalibrationDialog(QtWidgets.QDialog):
 
     def _save_path(self, *, beam=False):
         """The new calibration file the person chooses inside the project, or None."""
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Save calibrated geometry',
-            str(self._default_name(beam)), 'JSON (*.json)')
+        from xdart.gui.widgets import file_dialogs
+        # the managed name in the Project's calibration folder, offered as it is (the checks below keep a
+        # save inside the Project and new); the pick joins the shared last-folder rule
+        picks = file_dialogs.browse(self, 'Save calibrated geometry', save=True, file_filter='JSON (*.json)',
+                                    default_name=str(self._default_name(beam)))
+        path = picks[0] if picks else ''
         if not path:
             return None
         selected = Path(path).resolve()
