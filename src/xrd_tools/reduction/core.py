@@ -641,9 +641,15 @@ class _WorkerThumbnailPrep:
     """Transient worker-only thumbnail facts resolved during reduction."""
 
     resolved_mask: np.ndarray | None
+    #: The background the reduction subtracted (``_dark_corrected_background``) and the plan it was
+    #: resolved with: the thumbnail takes it rather than computing it again (AUD-7), only while the frame
+    #: holds it (the prep is released after the worker's thumbnail).
+    background: np.ndarray | None = None
+    plan: object = None
 
 
 _THUMBNAIL_MASK_UNSET = object()
+_THUMBNAIL_BACKGROUND_UNSET = object()
 
 
 @dataclass(slots=True)
@@ -2711,6 +2717,10 @@ class NexusSink:
                 if worker_prep is None
                 else worker_prep.resolved_mask
             ),
+            # the background the reduction subtracted, resolved with this sink's plan (AUD-7)
+            **({} if worker_prep is None or worker_prep.background is None
+               or worker_prep.plan is not self._plan
+               else {"background": worker_prep.background}),
         )
         reduction.thumbnail, reduction._thumbnail_mask_baked = prepared
 
@@ -2720,6 +2730,7 @@ class NexusSink:
         *,
         corrected_image: np.ndarray | None = None,
         resolved_mask: np.ndarray | None | object = _THUMBNAIL_MASK_UNSET,
+        background: np.ndarray | None | object = _THUMBNAIL_BACKGROUND_UNSET,
     ) -> tuple[np.ndarray | None, bool]:
         from xrd_tools.io.nexus_record import make_thumbnail_array
 
@@ -2728,10 +2739,12 @@ class NexusSink:
         raw = np.asarray(frame.image)
         if corrected_image is None:
             # The worker skips the corrected copy for this sink, so apply the
-            # plan's flat and dark here as the reduction does.
+            # plan's flat and dark here as the reduction does, with the
+            # background the reduction subtracted when it is given (AUD-7).
             plan = self._plan
-            background = (frame.background if plan is None
-                          else _dark_corrected_background(frame, plan))
+            if background is _THUMBNAIL_BACKGROUND_UNSET:
+                background = (frame.background if plan is None
+                              else _dark_corrected_background(frame, plan))
             if background is not None:
                 bg = np.asarray(background)
                 if bg.shape != () and bg.shape != raw.shape:
@@ -3317,6 +3330,11 @@ class ReductionSession:
     _frame_masks: dict[tuple[int, tuple[int, int]], tuple[Any, np.ndarray | None]] = field(
         default_factory=dict, init=False, repr=False,
     )
+    # AUD-7: the plan's arrays derived once a session (the dark clipped for the
+    # Poisson variance), shared with the pool workers as _plan_masks is.
+    _plan_derived: dict[str, tuple[np.ndarray, np.ndarray]] = field(
+        default_factory=dict, init=False, repr=False,
+    )
     # S8: per-SCAN monitor warn-once state (shared with pool workers like
     # _plan_masks; set.add is GIL-atomic).  Session-owned so a dead monitor
     # warns again on the next scan and concurrent sessions don't cross-talk.
@@ -3842,6 +3860,7 @@ class ReductionSession:
                 frame, image, self.plan, self._integrators, self._plan_masks,
                 self._frame_masks,
                 self.cancel_token, self._warned_monitor_keys,
+                plan_derived=self._plan_derived,
                 include_corrected_image=(
                     has_worker_process
                     and _worker_process_requires_corrected_image(self._sink)
@@ -4461,6 +4480,7 @@ class ReductionSession:
                         self._frame_masks,
                         cancel_token=self.cancel_token,
                         warned_monitor_keys=self._warned_monitor_keys,
+                        plan_derived=self._plan_derived,
                         strict=self.strict,
                     )
                 except _ReductionCancelled:
@@ -4494,6 +4514,7 @@ class ReductionSession:
                         self._frame_masks,
                         self.cancel_token,
                         self._warned_monitor_keys,
+                        plan_derived=self._plan_derived,
                         strict=self.strict,
                     ),
                 ))
@@ -5663,6 +5684,7 @@ def _reduce_frame(
     include_corrected_image: bool = False,
     include_worker_thumbnail_prep: bool = False,
     strict: StrictPolicy | None = None,
+    plan_derived: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> FrameReduction:
     if _cancel_requested(cancel_token):
         raise _ReductionCancelled
@@ -5710,7 +5732,7 @@ def _reduce_frame(
     variance = None
     if not use_float32_csr:
         image = _apply_thresholds_owned(image, plan)
-        variance = _poisson_variance(image, frame, plan)
+        variance = _poisson_variance(image, frame, plan, plan_derived)
         image = _subtract_background(image, background)
     # Poisson plans with a dark or background integrate with an explicit variance.
     p1_frame = _with_variance(plan.integration_1d, variance)
@@ -5950,11 +5972,11 @@ def _reduce_frame(
             else value_mask if mask is None
             else mask | value_mask
         )
-        reduction._worker_thumbnail_prep = _WorkerThumbnailPrep(thumbnail_mask)
+        reduction._worker_thumbnail_prep = _WorkerThumbnailPrep(thumbnail_mask, background, plan)
     return reduction
 
 
-def _poisson_variance(image, frame, plan: ReductionPlan) -> np.ndarray | None:
+def _poisson_variance(image, frame, plan: ReductionPlan, derived=None) -> np.ndarray | None:
     """Poisson variance of raw − dark − background, for plans that ask for Poisson sigma.
 
     pyFAI's Poisson model sees only the image it integrates and treats a dark as
@@ -5964,7 +5986,7 @@ def _poisson_variance(image, frame, plan: ReductionPlan) -> np.ndarray | None:
     times the background). A dark-corrected background (see
     ``_dark_corrected_background``) returns part of the dark, so the dark's
     counts are weighted by (1 − scale)². A NaN dark pixel gives NaN, a pixel pyFAI
-    masks.
+    masks. The dark's counts are clipped at 0 once a session (``_clipped_dark``).
     """
     factor = getattr(frame, "background_variance_factor", None)
     background = None if factor is None else frame.background
@@ -5978,11 +6000,28 @@ def _poisson_variance(image, frame, plan: ReductionPlan) -> np.ndarray | None:
         scale = (None if frame.background is None
                  else getattr(frame, "background_scale", None))
         weight = 1.0 if scale is None else (1.0 - float(scale)) ** 2
-        if weight:
-            variance += weight * np.clip(plan.dark, 0.0, None)
+        if weight == 1.0:
+            variance += _clipped_dark(plan, derived)
+        elif weight:
+            variance += weight * _clipped_dark(plan, derived)
     if background is not None:
         variance += np.clip(np.asarray(factor) * np.asarray(background, dtype=float), 0.0, None)
     return variance
+
+
+def _clipped_dark(plan: ReductionPlan, derived) -> np.ndarray:
+    """The plan's dark clipped at 0 counts (a negative dark adds no variance), once a session (AUD-7): kept
+    in the session's ``derived`` arrays, which its workers share as they share its mask cache (a concurrent
+    first use computes the same array), for the dark it was clipped from. Without ``derived`` (a direct
+    ``_reduce_frame`` call), clipped each time."""
+    if derived is None:
+        return np.clip(plan.dark, 0.0, None)
+    held = derived.get("dark_clipped")
+    if held is None or held[0] is not plan.dark:
+        clipped = np.clip(plan.dark, 0.0, None)
+        clipped.setflags(write=False)
+        held = derived["dark_clipped"] = (plan.dark, clipped)
+    return held[1]
 
 
 def _dark_corrected_background(frame, plan: ReductionPlan):

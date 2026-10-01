@@ -206,3 +206,38 @@ def test_a_run_with_background_and_dark_records_how_they_combine(tmp_path):
     unmarked = RunIntent(background=replace(plain, dark_corrected=True)).freeze()
     assert "dark_corrected" not in unmarked.as_provenance()["background"]
     assert unmarked.fingerprint == RunIntent(background=plain).freeze().fingerprint
+
+
+def test_a_runs_frames_share_one_clipped_dark_and_their_variance_is_unchanged(monkeypatch):
+    """AUD-7 (maintainer, 2026-09-30: "fix", measured first): the dark's counts in the Poisson variance are
+    clipped once a session (a negative dark adds no variance; a NaN pixel stays NaN) rather than every frame;
+    every frame's sigma is the integrator's with that variance, as before."""
+    import xrd_tools.reduction.core as reduction_core
+    from xrd_tools.integrate.single import integrate_1d
+    raw = np.random.default_rng(3).uniform(-3.0, 15.0, SHAPE)  # some negative counts
+    raw[5, 7] = np.inf
+    dark = prepare_dark(raw)  # the non-finite pixel is NaN
+    held = []
+    original = reduction_core._poisson_variance
+
+    def spy(image, frame, plan, derived=None):
+        variance = original(image, frame, plan, *(() if derived is None else (derived,)))
+        held.append(None if derived is None else derived.get("dark_clipped"))
+        return variance
+    monkeypatch.setattr(reduction_core, "_poisson_variance", spy)
+    images = [_IMAGE + 10 * index for index in range(3)]
+    scan = Scan("dark", [Frame(index, image=image.copy(), metadata={}) for index, image in enumerate(images)],
+                poni=_PONI, integrator=poni_to_integrator(_PONI))
+    result = run_reduction(ReductionPlan(integration_1d=Integration1DPlan(npt=60, error_model="poisson"),
+                                         integration_2d=None, dark=dark), scan, executor=2)
+    assert not result.failed, result.error
+    assert len(held) == 3 and held[0] is not None and all(entry is held[0] for entry in held)
+    clipped = held[0][1]
+    assert not clipped.flags.writeable
+    np.testing.assert_array_equal(clipped, np.clip(dark, 0.0, None))
+    for index, image in enumerate(images):
+        direct = integrate_1d(image, poni_to_integrator(_PONI), npt=60, method="csr", dark=dark,
+                              variance=np.maximum(image, 1.0) + np.clip(dark, 0.0, None))
+        reduced = result.frames[index].result_1d
+        np.testing.assert_allclose(reduced.intensity, direct.intensity, rtol=1e-12)
+        np.testing.assert_allclose(reduced.sigma, direct.sigma, rtol=1e-12)

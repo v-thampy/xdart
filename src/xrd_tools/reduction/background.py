@@ -889,14 +889,17 @@ def resolve_frame_background(
                     raise ValueError("Background Series receipt stream exceeds cap")
                 manifest.update(struct.pack(">Q", len(raw))); manifest.update(raw); receipt_bytes += len(raw)
                 del image, finite, source, metadata, metadata_source, raw
-            np.divide(sums, counts, out=sums, where=counts > 0); sums[counts == 0] = np.nan
+            covered = counts > 0  # one mask for the mean, the empty pixels and the variance factor
+            np.divide(sums, counts, out=sums, where=covered); sums[~covered] = np.nan
             denominator = norm_sum / len(members); factor = float(plan.scale * target_norm / denominator)
             sums *= factor
             # var(f · mean of n counts) = f · (f · mean) / n: one scalar when every
-            # covered pixel has all members, else per pixel.
-            covered = counts[counts > 0]
-            variance_factor = (factor / float(covered[0]) if covered.size and np.all(covered == covered[0])
-                               else np.divide(factor, counts, out=np.zeros(shape), where=counts > 0))
+            # covered pixel has all members, else per pixel. Uniform: every covered pixel's count
+            # is the largest, checked without a compacted copy of the covered counts (AUD-7).
+            most = int(counts.max())
+            variance_factor = (factor / float(most)
+                               if most and np.count_nonzero(counts == most) == np.count_nonzero(covered)
+                               else np.divide(factor, counts, out=np.zeros(shape), where=covered))
             return _result(plan, frame_fact, sums, {"version": 1, "mode": plan.mode,
                 "policy": policy, "frame_fact": frame_fact, "manifest": {
                     "version": 1, "count": len(members), "receipt_bytes": receipt_bytes,

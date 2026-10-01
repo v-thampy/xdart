@@ -133,3 +133,33 @@ def test_a_subtracted_background_propagates_its_variance_in_2d():
     assert finite.any()
     np.testing.assert_allclose(reduced.sigma[finite], direct.sigma[finite], rtol=1e-12)
     np.testing.assert_allclose(reduced.intensity[finite], direct.intensity[finite], rtol=1e-12)
+
+
+def test_a_series_checks_its_uniform_count_without_a_compacted_copy(tmp_path):
+    """AUD-7 (maintainer, 2026-09-30: "fix", measured first): the Series Average's uniform-count check reads
+    the counts in place (one mask, no compacted copy of the covered counts); the per-pixel factor is the same.
+    Measured at 2048² × 3 (probes/aud7/series_peak.py): peak 192.0 → 164.0 MiB with a member missing a
+    corner, 128.0 → 112.0 MiB uniform; at 512² × 3 with the corner missing, 48.0 → 41.0 B/px."""
+    import tracemalloc
+    shape = (512, 512)
+    target = tmp_path / "target.tif"
+    series = tmp_path / "series"
+    series.mkdir()
+    rng = np.random.default_rng(5)
+    for index in range(3):
+        image = rng.poisson(20, shape).astype(np.float32)
+        if index == 0:
+            image[:16, :16] = np.nan  # this member lacks a corner: two counts
+        tifffile.imwrite(series / f"bg_{index:04d}.tif", image)
+    plan = FrameBackgroundPlan(mode="Series Average", locator=str(series / "bg_0000.tif"))
+    resolve_frame_background(plan, _fact(target, shape))
+    tracemalloc.start()
+    result = resolve_frame_background(plan, _fact(target, shape))
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak / (shape[0] * shape[1]) < 45.0, peak  # 48 B/px with the compacted copy
+    factor = np.frombuffer(result.variance_factor, np.float64).reshape(shape) \
+        if isinstance(result.variance_factor, (bytes, bytearray, memoryview)) else np.asarray(result.variance_factor)
+    expected = np.full(shape, 1 / 3)
+    expected[:16, :16] = 1 / 2
+    np.testing.assert_array_equal(factor, expected)
