@@ -86,8 +86,6 @@ _DEBT: dict[str, dict[str, int]] = {
     "tabs/stitch/calibration.py": {"QCheckBox": 2, "QLineEdit": 4},
     "tabs/stitch/fit_windows.py": {"PlotWidget": 2},
     "tabs/stitch/mask.py": {"QLineEdit": 1, "QSpinBox": 1},
-    # the browser chrome and lists moved onto Int's BrowserView (G3b); the Diagnostic combo is G4's
-    "tabs/stitch/page.py": {"QComboBox": 1},
     # The classic RSM dialog, retired with AUD-9's last stage.
     "tools/rsm_tool.py": {
         "ImageItem": 2, "PlotDataItem": 2, "PlotWidget": 1, "QComboBox": 4, "QFileDialog.getExistingDirectory": 1,

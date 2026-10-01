@@ -2888,9 +2888,8 @@ class StitchPage(QtWidgets.QWidget):
         """Stitch's Diagnostic (Intensity, Coverage or Normalization) as a row of the view's
         own plot-options dialog."""
         dialog = self.scientific.plot_options_dialog
-        self._diagnostic_combo = QtWidgets.QComboBox()
-        self._diagnostic_combo.addItems(("Intensity", "Coverage", "Normalization"))
-        dialog.add_row("Diagnostic", self._diagnostic_combo)
+        self._diagnostic_combo = dialog.add_choice(
+            "Diagnostic", ("Intensity", "Coverage", "Normalization"), self._diagnostic)
         # read before the view's own option commands redraw (and so reset) the row
         self.scientific.plotOptionsAccepted.connect(self._diagnostic_accepted)
         dialog.rejected.connect(lambda: self._diagnostic_combo.setCurrentText(self._diagnostic))

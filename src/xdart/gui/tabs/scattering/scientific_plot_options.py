@@ -134,9 +134,16 @@ class PlotOptionsDialog(QtWidgets.QDialog):
     def set_waterfall_visible(self, visible: bool) -> None:
         self._waterfall_group.setVisible(bool(visible))
 
-    def add_row(self, label: str, editor: QtWidgets.QWidget) -> None:
-        """A host's own option above the buttons. The host applies it on
-        ``ScientificView.plotOptionsAccepted`` and resets it on ``rejected``."""
+    def add_choice(self, label: str, choices: tuple[str, ...], value: str) -> QtWidgets.QComboBox:
+        """A host's own choice among ``choices``, built here above the buttons (Codex's Stitch/Int reuse
+        audit R3: Stitch's Diagnostic was a combo box the page built). Returns the editor; the host
+        applies its value on ``ScientificView.plotOptionsAccepted`` and resets it on ``rejected``."""
+        if not choices or value not in choices:
+            raise ValueError("a plot-options choice needs its choices and a value among them")
+        editor = QtWidgets.QComboBox()
+        editor.setObjectName("e4PlotOptionsHostChoice")
+        editor.addItems(choices)
+        editor.setCurrentText(value)
         row = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -144,6 +151,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         layout.addWidget(editor)
         outer = self.layout()
         outer.insertWidget(outer.count() - 1, row)
+        return editor
 
     def reconcile(self, options: ScientificPlotOptions) -> None:
         if type(options) is not ScientificPlotOptions:

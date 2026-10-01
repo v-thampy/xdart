@@ -615,3 +615,25 @@ def test_left_drag_zooms_the_1d_plot_into_a_box_and_shift_drag_pans(qapp):
     finally:
         view.close()
         view.deleteLater()
+
+
+def test_a_hosts_plot_option_is_a_choice_the_dialog_builds() -> None:
+    """Codex's Stitch/Int reuse audit R3: a host's own plot option (Stitch's Diagnostic) is a choice the
+    plot-options dialog builds, above its buttons, from the host's choices and value. A host hands in no
+    widget of its own (``add_row`` is gone)."""
+    from xdart.gui.tabs.scattering.scientific_plot_options import PlotOptionsDialog
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    dialog = PlotOptionsDialog()
+    try:
+        assert not hasattr(dialog, "add_row")
+        editor = dialog.add_choice("Diagnostic", ("Intensity", "Coverage", "Normalization"), "Coverage")
+        assert isinstance(editor, QtWidgets.QComboBox) and dialog.isAncestorOf(editor)
+        assert [editor.itemText(i) for i in range(editor.count())] == ["Intensity", "Coverage", "Normalization"]
+        assert editor.currentText() == "Coverage" and editor.objectName() == "e4PlotOptionsHostChoice"
+        layout = dialog.layout()
+        assert layout.itemAt(layout.count() - 2).widget().isAncestorOf(editor)  # just above the buttons
+        with pytest.raises(ValueError):
+            dialog.add_choice("Diagnostic", ("Intensity",), "Coverage")
+    finally:
+        dialog.close()
+        app.processEvents()
