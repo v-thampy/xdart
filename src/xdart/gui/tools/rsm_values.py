@@ -1798,6 +1798,16 @@ def prepare_rsm_tool_v2(
                         f"column {selector.name!r} (occurrence {selector.occurrence}), which the entry does not "
                         "record; map it in Angle mapping",
                     )
+                # the normalization's columns too (a whole table, not a SPEC projection that refuses them)
+                for name, selector in (("foil", form.normalization.foil_selector),
+                                       ("exposure", form.normalization.exposure_selector)):
+                    if selector is not None and _missing_role_in_table(table, ((name, selector),)) is not None:
+                        raise RSMToolPreflightRefused(
+                            "RSM_NORMALIZATION_COLUMN_MISSING",
+                            f"entry {member.entry} of {Path(member.nexus_path).name}: the normalization's {name} "
+                            f"column {selector.name!r} (occurrence {selector.occurrence}) is not recorded; "
+                            "choose its column or another normalization",
+                        )
             if table.disposition is not AnalysisDisposition.COMPLETED:
                 raise RSMToolPreflightRefused(
                     table.code or "SOURCE_PREFLIGHT_REFUSED",

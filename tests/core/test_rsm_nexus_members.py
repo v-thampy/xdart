@@ -133,3 +133,16 @@ def test_the_preview_names_a_nexus_members_entry_and_its_ub_convention(nexus_pro
     member = next(line for line in lines if line.startswith("Member 1:"))
     assert "member_ub.nxs · NeXus entry entry · 5 frames" in member
     assert any("read in SPEC's #G3 convention" in line for line in lines)
+
+
+@pytest.mark.slow
+def test_a_normalization_column_the_entry_lacks_is_refused_by_name(nexus_project):
+    """A NeXus member's whole table is checked for the normalization's columns as well as the roles: the SPEC
+    path's projection refuses a missing column, and without this check a NeXus entry raised a bare ValueError
+    ("resolved metadata selector is outside the exact table") from the module source, not a refusal."""
+    from dataclasses import replace
+    form = replace(_form(nexus_project, "member_ub.nxs"), normalization=rsm_tool_preset().normalization)
+    with pytest.raises(RSMToolPreflightRefused) as refused:
+        prepare_rsm_tool_v2(form)
+    assert refused.value.code == "RSM_NORMALIZATION_COLUMN_MISSING"
+    assert "the normalization's foil column 'foil status'" in str(refused.value)
